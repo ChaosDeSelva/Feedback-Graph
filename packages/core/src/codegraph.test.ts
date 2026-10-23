@@ -1,0 +1,108 @@
+import { expect, test } from 'vitest';
+import { expandDependents, hotspotScore, pathMatches, repoRelative, sessionFiles, suggestLessonPaths, touchedAround } from './codegraph.ts';
+import { hostRepoPath } from './projects.ts';
+import type { ParsedSession, ToolCall } from './types.ts';
+
+test('repoRelative keeps paths inside the repo, normalized, and refuses everything outside it', () => {
+  expect(repoRelative('/h/vibe/demo/src/a.ts', '/h/vibe/demo')).toBe('src/a.ts');
+  expect(repoRelative('/h/vibe/demo/src/../lib/./b.ts', '/h/vibe/demo/')).toBe('lib/b.ts');
+  expect(repoRelative('src/a.ts', '/h/vibe/demo', '/h/vibe/demo/packages/x')).toBe('packages/x/src/a.ts');
+  expect(repoRelative('/h/vibe/demo/../other/a.ts', '/h/vibe/demo')).toBeNull();
+  expect(repoRelative('../../etc/passwd', '/h/vibe/demo', '/h/vibe/demo/src')).toBeNull();
+  expect(repoRelative('/h/vibe/demo-two/a.ts', '/h/vibe/demo')).toBeNull();
+  expect(repoRelative('/h/vibe/demo', '/h/vibe/demo')).toBeNull();
+  expect(repoRelative('/h/vibe/demo/a\0.ts', '/h/vibe/demo')).toBeNull();
+  expect(repoRelative('', '/h/vibe/demo')).toBeNull();
+});
+
+test('hostRepoPath is the host folder of the project a cwd is in', () => {
+  const roots = [{ host: '/Users/me/Vibe', container: '/projects' }];
+  expect(hostRepoPath('/Users/me/Vibe/demo/packages/api', roots)).toBe('/Users/me/Vibe/demo');
+  expect(hostRepoPath('/elsewhere/demo', roots)).toBeNull();
+});
+
+const call = (name: string, filePath: string, ts = '2026-10-01T10:00:00Z'): ToolCall => ({ name, ts, filePath });
+
+test('sessionFiles records which repo files a session read and edited, with the first and last edit time', () => {
+  const s: ParsedSession = {
+    sessionId: 's', sourceFile: 'f', cwd: '/h/demo/src', gitBranch: null, startedAt: '', endedAt: '', turns: [],
+    toolCalls: [
+      call('Read', '/h/demo/src/a.ts'),
+      call('Edit', '/h/demo/src/a.ts', '2026-10-01T10:05:00+02:00'),
+      call('Write', 'b.ts', '2026-10-01T10:01:00Z'),
+      call('MultiEdit', '/h/demo/src/a.ts', '2026-10-01T10:09:00Z'),
+      call('Delete', '/h/demo/old.ts'),
+      call('Read', '/etc/hosts'),
+      call('Edit', '/h/demo/.env'),
+      { name: 'Bash', ts: '2026-10-01T10:00:00Z', command: 'ls' },
+    ],
+  };
+  expect(sessionFiles(s, '/h/demo')).toEqual([
+    { path: 'old.ts', read: false, edited: true, firstEditAt: '2026-10-01T10:00:00.000Z', lastEditAt: '2026-10-01T10:00:00.000Z' },
+    { path: 'src/a.ts', read: true, edited: true, firstEditAt: '2026-10-01T08:05:00.000Z', lastEditAt: '2026-10-01T10:09:00.000Z' },
+    { path: 'src/b.ts', read: false, edited: true, firstEditAt: '2026-10-01T10:01:00.000Z', lastEditAt: '2026-10-01T10:01:00.000Z' },
+  ]);
+});
+
+test('pathMatches: plain paths match the file or the folder under it; globs follow gitignore-like rules', () => {
+  expect(pathMatches('src/db.ts', 'src/db.ts')).toBe(true);
+  expect(pathMatches('./src/db', 'src/db/pool.ts')).toBe(true);
+  expect(pathMatches('src/db', 'src/dbx.ts')).toBe(false);
+  expect(pathMatches('src/**/*.sql', 'src/a/b/c.sql')).toBe(true);
+  expect(pathMatches('src/**/*.sql', 'src/c.sql')).toBe(true);
+  expect(pathMatches('src/*.ts', 'src/a/b.ts')).toBe(false);
+  expect(pathMatches('*.sql', 'migrations/0001.sql')).toBe(true);
+  expect(pathMatches('migrations/**', 'migrations/0001.sql')).toBe(true);
+  expect(pathMatches('', 'a.ts')).toBe(false);
+  expect(pathMatches('**', 'a.ts')).toBe(true);
+});
+
+test('hotspotScore weighs misses most, then churn and dependents on a log scale', () => {
+  expect(hotspotScore({ churn: 0, misses: 0, dependents: 0 })).toBe(0);
+  expect(hotspotScore({ churn: 3, misses: 0, dependents: 1 })).toBe(3);
+  expect(hotspotScore({ churn: 3, misses: 2, dependents: 1 })).toBe(11);
+  expect(hotspotScore({ churn: 2, misses: 0, dependents: 0 })).toBe(1.58);
+  expect(hotspotScore({ churn: 0, misses: 1, dependents: 0 })).toBeGreaterThan(hotspotScore({ churn: 7, misses: 0, dependents: 0 }));
+});
+
+test('expandDependents walks importers breadth first up to a depth, nearest first, each file once', async () => {
+  const importers: Record<string, string[]> = { 'db.ts': ['repo.ts', 'cli.ts'], 'repo.ts': ['api.ts', 'db.ts'], 'api.ts': ['main.ts'], 'cli.ts': [] };
+  const asked: string[][] = [];
+  const of = async (paths: string[]) => {
+    asked.push(paths);
+    return new Map(paths.map((p) => [p, importers[p] ?? []]));
+  };
+  expect(await expandDependents(['db.ts'], 2, of)).toEqual([
+    { path: 'cli.ts', depth: 1 }, { path: 'repo.ts', depth: 1 }, { path: 'api.ts', depth: 2 },
+  ]);
+  expect(asked).toEqual([['db.ts'], ['cli.ts', 'repo.ts']]);
+  expect(await expandDependents(['db.ts'], 0, of)).toEqual([]);
+});
+
+test('suggestLessonPaths keeps model paths the evidence supports, else the narrowest scope the edits show', () => {
+  const touched = { edited: ['src/db/pool.ts', 'src/db/query.ts', 'src/api/orders.ts'], fixed: ['src/db/pool.ts'] };
+  // the model's own globs survive when they cover a file the session edited
+  expect(suggestLessonPaths(['src/db/**', 'docs/**'], touched)).toEqual(['src/db/**']);
+  // none supported: the files edited to fix it
+  expect(suggestLessonPaths(['docs/**'], touched)).toEqual(['src/db/pool.ts']);
+  // many fix files in one folder: that folder
+  const many = { edited: [], fixed: ['src/db/a.ts', 'src/db/b.ts', 'src/db/c.ts', 'src/db/d.ts'] };
+  expect(suggestLessonPaths([], many)).toEqual(['src/db/**']);
+  // fixes everywhere: no narrower scope than the project
+  const spread = { edited: [], fixed: ['a.ts', 'b/b.ts', 'c/c.ts', 'd/d.ts'] };
+  expect(suggestLessonPaths([], spread)).toEqual([]);
+  // no fix edits: what was edited before the feedback
+  expect(suggestLessonPaths([], { edited: ['src/x.ts'], fixed: [] })).toEqual(['src/x.ts']);
+  // no evidence at all: the model's paths, cleaned
+  expect(suggestLessonPaths(['./src/y.ts', '/abs/z.ts', '../up.ts'], { edited: [], fixed: [] })).toEqual(['src/y.ts']);
+});
+
+test('touchedAround splits a session\'s edits into before the feedback and the fix after it', () => {
+  const f = (path: string, first: string | null, last: string | null, edited = true) => ({ path, read: !edited, edited, firstEditAt: first, lastEditAt: last });
+  expect(touchedAround([
+    f('a.ts', '2026-10-01T10:00:00.000Z', '2026-10-01T10:00:00.000Z'),
+    f('b.ts', '2026-10-01T10:00:00.000Z', '2026-10-01T10:05:00.000Z'),
+    f('c.ts', '2026-10-01T10:05:00.000Z', '2026-10-01T10:06:00.000Z'),
+    f('d.ts', null, null, false),
+  ], '2026-10-01T12:02:00+02:00')).toEqual({ edited: ['a.ts', 'b.ts'], fixed: ['b.ts', 'c.ts'] });
+});

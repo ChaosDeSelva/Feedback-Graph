@@ -1,0 +1,12 @@
+{"timestamp":"2026-10-01T10:00:00.000Z","type":"session_meta","ordinal":0,"payload":{"id":"codex-unknown-0005","session_id":"codex-unknown-0005","timestamp":"2026-10-01T10:00:00.000Z","cwd":"/work/demo-shop","originator":"Codex Desktop","cli_version":"0.162.0-alpha.17.2","source":"vscode","thread_source":"user","model_provider":"openai","base_instructions":{"text":"You are a coding agent."},"history_mode":"full","context_window":258400,"runtime_workspace_roots":["/work/demo-shop"]}}
+{"timestamp":"2026-10-01T10:00:01.000Z","type":"world_state","ordinal":1,"payload":{"full":true,"state":{}}}
+{"timestamp":"2026-10-01T10:00:01.000Z","type":"token_usage_record","ordinal":2,"payload":{"session_id":"s","usage":{}}}
+{"timestamp":"2026-10-01T10:00:01.000Z","type":"inter_agent_communication_metadata","ordinal":3,"payload":{"trigger_turn":true}}
+{"timestamp":"2026-10-01T10:00:01.000Z","type":"hologram_v9","ordinal":4,"payload":{"role":"user","content":[{"type":"input_text","text":"Not a real record type"}]}}
+{"timestamp":"2026-10-01T10:00:01.000Z","type":"response_item","ordinal":5,"payload":{"type":"telepathy","role":"user","content":[{"type":"input_text","text":"Not a real item type"}]}}
+{"timestamp":"2026-10-01T10:00:01.000Z","type":"event_msg","ordinal":6,"payload":{"type":"item_completed","item":{"type":"QuantumEdit","id":"q1","path":"/work/demo-shop/x.ts"}}}
+{"timestamp":"2026-10-01T10:00:01.000Z","type":"event_msg","ordinal":7,"payload":{"type":"user_message","message":"Event copies are not turns"}}
+{"timestamp":"2026-10-01T10:00:02.000Z","type":"response_item","ordinal":8,"payload":{"type":"message","id":"msg_8","role":"user","content":[{"type":"input_audio","data":"AAAA"}]},"metadata":{"client_authored":true}}
+"a bare string line"
+[1,2,3]
+{"timestamp":"2026-10-01T10:00:03.000Z","type":"response_item","ordinal":9,"payload":{"type":"message","id":"msg_9","role":"user","content":[{"type":"input_text","text":"The only real turn"}]},"metadata":{"client_authored":true}}

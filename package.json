@@ -1,0 +1,22 @@
+{
+  "name": "feedback-tool",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "vitest run --project unit --project ui",
+    "test:int": "vitest run --project integration --no-file-parallelism",
+    "test:int:postgres": "TEST_STORES=postgres vitest run --project integration --no-file-parallelism",
+    "typecheck": "pnpm -r typecheck",
+    "build": "pnpm -r build",
+    "check": "./scripts/check.sh",
+    "reembed": "docker compose run --rm worker node src/reembed.ts",
+    "backup": "./scripts/backup.sh"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.8.0",
+    "vitest": "^3.2.0"
+  },
+  "version": "0.3.0",
+  "license": "Apache-2.0"
+}

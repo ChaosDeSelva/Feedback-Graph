@@ -1,0 +1,266 @@
+import { parseGithubRepos } from './integrations/github.ts';
+import type { Root } from './projects.ts';
+
+/** Bumped with each release; reported by /api/status and the worker heartbeat. */
+export const VERSION = '0.3.0';
+
+export class ConfigError extends Error {
+  readonly problems: string[];
+  constructor(problems: string[]) {
+    super(`invalid configuration:\n${problems.map((p) => `  - ${p}`).join('\n')}`);
+    this.problems = problems;
+  }
+}
+
+const PROVIDERS = new Set(['ollama', 'openai', 'openrouter', 'groq', 'anthropic', 'claude-cli', 'codex-cli', 'jev']);
+const NEEDS_MODEL = new Set(['openrouter', 'groq']);
+const LOOPBACK = /^(127(\.\d{1,3}){3}|localhost|::1|\[::1\])$/i;
+
+/** Where everything is stored. Neo4j is the default; Postgres (with pgvector) runs the same code. */
+export type StoreChoice = 'neo4j' | 'postgres';
+const STORES: readonly StoreChoice[] = ['neo4j', 'postgres'];
+
+const SECRET_PARAM = /pass|secret|token|key/i;
+
+/**
+ * A connection URL with its password masked, for messages and logs: the userinfo password and any query parameter
+ * that names one (pg reads `?password=` too). Unparseable input is not echoed at all.
+ */
+export function redactUrl(raw: string): string {
+  try {
+    const u = new URL(raw);
+    if (u.password) u.password = '***';
+    if (u.search) {
+      u.search = u.search
+        .slice(1)
+        .split('&')
+        .map((kv) => {
+          const k = kv.split('=')[0];
+          return kv.includes('=') && SECRET_PARAM.test(decodeURIComponent(k)) ? `${k}=***` : kv;
+        })
+        .join('&');
+    }
+    return u.toString();
+  } catch {
+    return '(unparseable URL)';
+  }
+}
+
+export type Config = {
+  store: StoreChoice;
+  /** Set when store is 'neo4j'. */
+  neo4j: { url: string; user: string; password: string } | null;
+  /** Set when store is 'postgres'. Never log `url`: it carries the password (see redactUrl). */
+  postgres: { url: string } | null;
+  roots: Root[];
+  transcriptsDir: string;
+  /** Codex CLI / Desktop rollout files (~/.codex/sessions on the host), mounted read-only. */
+  codexSessionsDir: string;
+  stateDb: string;
+  ollama: { url: string; model: string; embedModel: string };
+  llm: { classify: string | null; postmortem: string | null; scan: string | null; check: string | null };
+  pollSeconds: number;
+  classifyBatch: number;
+  scanMaxBytes: number;
+  scanMaxFiles: number;
+  /** Seeds the project selection on its first start only; from then on the selection (Settings) decides. */
+  ingestProjects: string[];
+  /** Never ingested, scanned or served, even when INGEST_PROJECTS is empty. */
+  excludeProjects: string[];
+  /** Text of turns nobody flagged is removed after this many days; null keeps it. */
+  turnRetentionDays: number | null;
+  /** MEMORY_AUTO_APPROVE: import Claude Code feedback memories as approved lessons instead of proposed ones. */
+  memoryAutoApprove: boolean;
+  github: { token: string; repos: Map<string, string>; syncHours: number } | null;
+  apiToken: string | null;
+  publicHosts: string[];
+  /** Feedback Graph Cloud sync; null (the default) sends nothing anywhere. Never log `token`. */
+  cloud: CloudConfig | null;
+  /** Where the API is reachable from (API_BIND, the address compose publishes it on). Not loopback needs API_TOKEN. */
+  apiBind: string;
+  /** The interface the server listens on: API_LISTEN (0.0.0.0 inside the container), else API_BIND. */
+  apiListen: string;
+  port: number;
+};
+
+export type CloudConfig = {
+  /** Base URL, no trailing slash: https, or http on this machine only. */
+  url: string;
+  token: string;
+  /** Minutes between automatic syncs; null syncs only when you press Sync now. */
+  intervalMinutes: number | null;
+  /** Projects to sync; empty means the projects selected in Settings. */
+  projects: string[];
+  /**
+   * SYNC_SUGGESTIONS=true: also send lessons you have not approved (proposed ones arrive as suggestions for an admin).
+   * false (the default): only approved lessons leave, plus the new status of any lesson the cloud already has.
+   */
+  suggestions: boolean;
+};
+
+/** fgc_pat_<16 hex lookup id>_<43 base64url chars>: what the cloud issues. */
+export const CLOUD_TOKEN_RE = /^fgc_pat_[0-9a-f]{16}_[A-Za-z0-9_-]{43}$/;
+const CLOUD_LOOPBACK = new Set(['localhost', '127.0.0.1', '[::1]']);
+
+/** The problem with a cloud base URL, or null: https anywhere, plain http only to this machine, no credentials. */
+export function cloudUrlProblem(raw: string): string | null {
+  let u: URL;
+  try {
+    u = new URL(raw);
+  } catch {
+    return 'CLOUD_URL is not a URL (https://cloud.example.com)';
+  }
+  if (u.username || u.password) return 'CLOUD_URL must not carry a user name or password (the token goes in CLOUD_TOKEN)';
+  if (u.protocol === 'https:') return null;
+  if (u.protocol === 'http:' && CLOUD_LOOPBACK.has(u.hostname)) return null;
+  return `CLOUD_URL must be https:// (plain http is allowed only for localhost); got ${u.protocol}//${u.host}`;
+}
+
+type Env = Record<string, string | undefined>;
+
+const list = (s: string | undefined) => (s ?? '').split(',').map((x) => x.trim()).filter(Boolean);
+
+/** Read and check every setting; throws one ConfigError naming each problem so a bad .env fails fast and clearly. */
+export function loadConfig(env: Env): Config {
+  const problems: string[] = [];
+  const str = (k: string, d?: string) => {
+    const v = env[k]?.trim() || d;
+    if (v === undefined) problems.push(`${k} is required`);
+    return v ?? '';
+  };
+  const num = (k: string, d: number, min = 1) => {
+    const raw = env[k]?.trim();
+    if (!raw) return d;
+    const n = Number(raw);
+    if (!Number.isFinite(n) || n < min) {
+      problems.push(`${k} must be a number of at least ${min} (got ${JSON.stringify(raw)})`);
+      return d;
+    }
+    return n;
+  };
+  const spec = (k: string, classifyOnly = false) => {
+    const v = env[k]?.trim();
+    if (!v) return null;
+    const i = v.indexOf(':');
+    const kind = i < 0 ? v : v.slice(0, i);
+    if (!PROVIDERS.has(kind)) problems.push(`${k}: unknown provider ${JSON.stringify(kind)} (use ${[...PROVIDERS].join(', ')})`);
+    else if (NEEDS_MODEL.has(kind) && (i < 0 || !v.slice(i + 1))) problems.push(`${k}: ${kind} needs a model, e.g. ${kind}:<model>`);
+    else if (kind === 'jev' && !classifyOnly) problems.push(`${k}: jev is a classification model; use it for CLASSIFY_LLM only`);
+    return v;
+  };
+
+  const containers = list(str('PROJECT_ROOTS', '/vibe'));
+  const hosts = list(str('HOST_PROJECT_ROOTS'));
+  if (hosts.length && hosts.length !== containers.length) {
+    problems.push(`HOST_PROJECT_ROOTS has ${hosts.length} entries but PROJECT_ROOTS has ${containers.length}; they pair up in order`);
+  }
+
+  let github: Config['github'] = null;
+  const repoSpec = env.GITHUB_REPOS?.trim();
+  if (repoSpec) {
+    try {
+      const repos = parseGithubRepos(repoSpec);
+      if (!env.GITHUB_TOKEN?.trim()) problems.push('GITHUB_REPOS is set but GITHUB_TOKEN is empty');
+      else github = { token: env.GITHUB_TOKEN.trim(), repos, syncHours: num('GITHUB_SYNC_HOURS', 6) };
+    } catch (e) {
+      problems.push((e as Error).message);
+    }
+  }
+
+  const apiToken = env.API_TOKEN?.trim() || null;
+  if (apiToken && apiToken.length < 24) problems.push('API_TOKEN must be at least 24 characters (try: openssl rand -hex 24)');
+  const publicHosts = list(env.PUBLIC_HOSTS);
+  if (publicHosts.length && !apiToken) problems.push('PUBLIC_HOSTS needs API_TOKEN: other machines must not reach the API unauthenticated');
+  const apiBind = env.API_BIND?.trim() || '127.0.0.1';
+  // Without a token the Host check is the only guard, and any client can send `Host: localhost`.
+  if (!apiToken && !LOOPBACK.test(apiBind)) {
+    problems.push(`API_BIND=${apiBind} exposes the API beyond this machine, which needs API_TOKEN (openssl rand -hex 24); or set API_BIND=127.0.0.1`);
+  }
+  for (const k of ['CLASSIFY_LLM', 'POSTMORTEM_LLM', 'SCAN_LLM']) {
+    if (/^codex-cli(:|$)/.test(env[k]?.trim() ?? '') && env.ALLOW_UNCONFINED_CODEX?.trim() !== '1') {
+      problems.push(`${k}: codex-cli can read every file the worker can (all transcripts, every project's .env, the worker's secrets); set ALLOW_UNCONFINED_CODEX=1 to accept that, or use claude-cli (SECURITY.md)`);
+    }
+  }
+
+  const storeRaw = env.STORE?.trim().toLowerCase() || 'neo4j';
+  const store: StoreChoice = (STORES as readonly string[]).includes(storeRaw) ? (storeRaw as StoreChoice) : 'neo4j';
+  if (store !== storeRaw) problems.push(`STORE: unknown store ${JSON.stringify(env.STORE?.trim())} (use ${STORES.join(', ')})`);
+  let postgres: Config['postgres'] = null;
+  if (storeRaw === 'postgres') {
+    const url = env.DATABASE_URL?.trim();
+    if (!url) problems.push('DATABASE_URL is required when STORE=postgres (postgres://user:password@host:5432/database)');
+    else {
+      let u: URL | null = null;
+      try {
+        u = new URL(url);
+      } catch {
+        problems.push('DATABASE_URL is not a URL (postgres://user:password@host:5432/database)');
+      }
+      if (u && !['postgres:', 'postgresql:'].includes(u.protocol)) problems.push(`DATABASE_URL must start with postgres:// (got ${redactUrl(url)})`);
+      else if (u && (!u.hostname || u.pathname.length < 2)) problems.push(`DATABASE_URL needs a host and a database name (got ${redactUrl(url)})`);
+      // The bundled service (docker-compose.yml builds this URL) always needs a password; your own server may not.
+      else if (u && u.hostname === 'postgres' && !u.password) problems.push('POSTGRES_PASSWORD is empty: the bundled postgres service needs one (letters and digits, e.g. openssl rand -hex 18) in .env, or set DATABASE_URL to your own server');
+      else if (u) postgres = { url };
+    }
+  }
+
+  const syncSuggestions = env.SYNC_SUGGESTIONS?.trim().toLowerCase() || 'false';
+  if (syncSuggestions !== 'true' && syncSuggestions !== 'false') problems.push(`SYNC_SUGGESTIONS must be true or false (got ${JSON.stringify(env.SYNC_SUGGESTIONS)})`);
+  const cloudUrl = env.CLOUD_URL?.trim() || '';
+  const cloudToken = env.CLOUD_TOKEN?.trim() || '';
+  let cloud: Config['cloud'] = null;
+  if (cloudUrl || cloudToken) {
+    const before = problems.length;
+    if (!cloudUrl) problems.push('CLOUD_URL is required when CLOUD_TOKEN is set');
+    if (!cloudToken) problems.push('CLOUD_TOKEN is required when CLOUD_URL is set (create a token with the sync scope in the cloud web app)');
+    const urlProblem = cloudUrl ? cloudUrlProblem(cloudUrl) : null;
+    if (urlProblem) problems.push(urlProblem);
+    // Never echo the value: a mistyped token is still most of a secret.
+    if (cloudToken && !CLOUD_TOKEN_RE.test(cloudToken)) problems.push('CLOUD_TOKEN is not a Feedback Graph Cloud token (fgc_pat_<16 hex>_<43 characters>)');
+    const interval = env.SYNC_INTERVAL_MINUTES?.trim() ? num('SYNC_INTERVAL_MINUTES', 60, 5) : null;
+    if (problems.length === before) {
+      cloud = { url: cloudUrl.replace(/\/+$/, ''), token: cloudToken, intervalMinutes: interval, projects: list(env.SYNC_PROJECTS), suggestions: syncSuggestions === 'true' };
+    }
+  } else {
+    if (syncSuggestions === 'true') problems.push('SYNC_SUGGESTIONS needs CLOUD_URL and CLOUD_TOKEN');
+    if (env.SYNC_INTERVAL_MINUTES?.trim()) problems.push('SYNC_INTERVAL_MINUTES needs CLOUD_URL and CLOUD_TOKEN');
+    if (env.SYNC_PROJECTS?.trim()) problems.push('SYNC_PROJECTS needs CLOUD_URL and CLOUD_TOKEN');
+  }
+  const autoApproveRaw = env.MEMORY_AUTO_APPROVE?.trim().toLowerCase() || 'false';
+  if (autoApproveRaw !== 'true' && autoApproveRaw !== 'false') problems.push(`MEMORY_AUTO_APPROVE must be true or false (got ${JSON.stringify(env.MEMORY_AUTO_APPROVE)})`);
+
+  const retention = env.TURN_RETENTION_DAYS?.trim() ? num('TURN_RETENTION_DAYS', 0) : null;
+
+  const config: Config = {
+    store,
+    neo4j: store === 'neo4j' ? { url: str('NEO4J_URL', 'bolt://neo4j:7687'), user: str('NEO4J_USER', 'neo4j'), password: str('NEO4J_PASSWORD') } : null,
+    postgres,
+    roots: containers.map((container, i) => ({ container, host: hosts[i] ?? '' })),
+    transcriptsDir: str('TRANSCRIPTS_DIR', '/transcripts'),
+    codexSessionsDir: str('CODEX_SESSIONS_DIR', '/codex-sessions'),
+    stateDb: str('STATE_DB', '/state/worker.sqlite'),
+    ollama: {
+      url: str('OLLAMA_URL', 'http://host.docker.internal:11434'),
+      model: str('OLLAMA_MODEL', 'gemma4'),
+      embedModel: str('OLLAMA_EMBED_MODEL', 'nomic-embed-text'),
+    },
+    llm: { classify: spec('CLASSIFY_LLM', true), postmortem: spec('POSTMORTEM_LLM'), scan: spec('SCAN_LLM'), check: spec('CHECK_LLM') },
+    pollSeconds: num('POLL_SECONDS', 30),
+    classifyBatch: num('CLASSIFY_BATCH', 50),
+    scanMaxBytes: num('SCAN_MAX_BYTES', 80_000),
+    scanMaxFiles: num('SCAN_MAX_FILES', 400),
+    ingestProjects: list(env.INGEST_PROJECTS),
+    excludeProjects: list(env.EXCLUDE_PROJECTS),
+    turnRetentionDays: retention,
+    memoryAutoApprove: autoApproveRaw === 'true',
+    github,
+    apiToken,
+    publicHosts,
+    cloud,
+    apiBind,
+    apiListen: env.API_LISTEN?.trim() || apiBind,
+    port: num('PORT', 8787),
+  };
+  if (problems.length) throw new ConfigError(problems);
+  return config;
+}

@@ -1,0 +1,181 @@
+@import "tailwindcss";
+@import "@fontsource-variable/instrument-sans/wdth.css";
+@import "@fontsource-variable/jetbrains-mono/wght.css";
+
+/*
+ * Every color the UI uses lives here. Light values are the default; the dark set below replaces them
+ * when the system asks for dark (and the viewer has not picked light) or the viewer picks dark.
+ * Components only ever use these names, never a raw hex.
+ */
+@theme static {
+  --color-canvas: #f2f1ec;
+  --color-surface: #ffffff;
+  --color-sunken: #f7f6f2;
+  --color-hover: #efeee8;
+  --color-line: #e2e0d8;
+  --color-line-strong: #cbc8bd;
+  --color-text: #1d1e20;
+  --color-muted: #66675f;
+  /* Icons, list markers and chevrons only (3:1 on surface and canvas); text that must be read uses muted. */
+  --color-faint: #8a897f;
+  /* Borders of inputs, selects and secondary buttons, and chart strokes: 3:1 against surface. */
+  --color-field: #929084;
+  /* The selected row in a list. */
+  --color-selected: #fef7e5;
+
+  --color-accent: #f2ae0c;
+  --color-accent-edge: #c58a00;
+  --color-accent-ink: #1d1e20;
+  --color-accent-text: #8d5c00;
+  --color-accent-soft: #fdf2d3;
+
+  --color-ok: #1f9d55;
+  --color-ok-soft: #e2f3e8;
+  --color-ok-text: #16703c;
+  --color-bad: #d23a36;
+  --color-bad-soft: #fbe5e3;
+  --color-bad-text: #a92a27;
+  --color-info: #2f6bd8;
+  --color-info-soft: #e3ecfb;
+  --color-info-text: #1f52b0;
+  --color-neutral-soft: #ecebe5;
+
+  --color-focus: #2f6bd8;
+  --color-on-strong: #ffffff;
+
+  /* Evidence graph node kinds and links (the canvas reads these at runtime). */
+  --color-node-feedback: #e09a00;
+  --color-node-miss: #d23a36;
+  --color-node-cause: #8b5cf6;
+  --color-node-lesson: #1f9d55;
+  --color-node-context: #2f6bd8;
+  --color-node-task: #8a8a82;
+  --color-node-commit: #4b4c47;
+  --color-graph-link: #929084;
+
+  --font-sans: "Instrument Sans Variable", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "JetBrains Mono Variable", ui-monospace, SFMono-Regular, Menlo, monospace;
+
+  --radius-sm: 4px;
+  --radius-md: 6px;
+  --radius-lg: 8px;
+
+  --shadow-card: 0 1px 0 0 rgb(0 0 0 / 0.04);
+  --shadow-pop: 0 6px 24px -8px rgb(0 0 0 / 0.18);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --color-canvas: #161615;
+    --color-surface: #1e1e1c;
+    --color-sunken: #1a1a19;
+    --color-hover: #282826;
+    --color-line: #2f2f2c;
+    --color-line-strong: #43433f;
+    --color-text: #ecebe5;
+    --color-muted: #a3a299;
+    --color-faint: #77766f;
+    --color-field: #6a6a64;
+    --color-selected: #2a2a27;
+    --color-accent: #f2ae0c;
+    --color-accent-edge: #a87400;
+    --color-accent-ink: #1d1e20;
+    --color-accent-text: #f5c143;
+    --color-accent-soft: #2f2814;
+    --color-ok: #34ad69;
+    --color-ok-soft: #16301f;
+    --color-ok-text: #63cf91;
+    --color-bad: #c8403c;
+    --color-bad-soft: #3b1b1a;
+    --color-bad-text: #f38d89;
+    --color-info: #4f84e6;
+    --color-info-soft: #172642;
+    --color-info-text: #91b3f3;
+    --color-neutral-soft: #2a2a27;
+    --color-focus: #6f9cf0;
+    --color-node-feedback: #e0a200;
+    --color-node-miss: #e25552;
+    --color-node-cause: #9b7cf0;
+    --color-node-lesson: #36ad6a;
+    --color-node-context: #5585e6;
+    --color-node-task: #85847c;
+    --color-node-commit: #c9c8c0;
+    --color-graph-link: #6a6a64;
+    --shadow-card: 0 1px 0 0 rgb(0 0 0 / 0.3);
+    --shadow-pop: 0 8px 28px -8px rgb(0 0 0 / 0.6);
+  }
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --color-canvas: #161615;
+  --color-surface: #1e1e1c;
+  --color-sunken: #1a1a19;
+  --color-hover: #282826;
+  --color-line: #2f2f2c;
+  --color-line-strong: #43433f;
+  --color-text: #ecebe5;
+  --color-muted: #a3a299;
+  --color-faint: #77766f;
+  --color-field: #6a6a64;
+  --color-selected: #2a2a27;
+  --color-accent: #f2ae0c;
+  --color-accent-edge: #a87400;
+  --color-accent-ink: #1d1e20;
+  --color-accent-text: #f5c143;
+  --color-accent-soft: #2f2814;
+  --color-ok: #34ad69;
+  --color-ok-soft: #16301f;
+  --color-ok-text: #63cf91;
+  --color-bad: #c8403c;
+  --color-bad-soft: #3b1b1a;
+  --color-bad-text: #f38d89;
+  --color-info: #4f84e6;
+  --color-info-soft: #172642;
+  --color-info-text: #91b3f3;
+  --color-neutral-soft: #2a2a27;
+  --color-focus: #6f9cf0;
+  --color-node-feedback: #e0a200;
+  --color-node-miss: #e25552;
+  --color-node-cause: #9b7cf0;
+  --color-node-lesson: #36ad6a;
+  --color-node-context: #5585e6;
+  --color-node-task: #85847c;
+  --color-node-commit: #c9c8c0;
+  --color-graph-link: #6a6a64;
+  --shadow-card: 0 1px 0 0 rgb(0 0 0 / 0.3);
+  --shadow-pop: 0 8px 28px -8px rgb(0 0 0 / 0.6);
+}
+
+:root[data-theme="light"] { color-scheme: light; }
+
+html, body, #root { height: 100%; }
+body {
+  background: var(--color-canvas);
+  color: var(--color-text);
+  font-family: var(--font-sans);
+  font-size: 13px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  font-feature-settings: "ss01", "cv11";
+}
+
+:focus-visible { outline: 2px solid var(--color-focus); outline-offset: 1px; border-radius: var(--radius-sm); }
+::selection { background: var(--color-accent-soft); }
+
+/* Loading placeholders: a soft sweep, still when the viewer asks for less motion. */
+.skeleton {
+  background: linear-gradient(90deg, var(--color-hover) 0%, var(--color-sunken) 50%, var(--color-hover) 100%);
+  background-size: 200% 100%;
+  animation: skeleton-sweep 1.4s ease-in-out infinite;
+}
+@keyframes skeleton-sweep { from { background-position: 100% 0; } to { background-position: -100% 0; } }
+
+@media (prefers-reduced-motion: reduce) {
+  .skeleton { animation: none; }
+  * { transition-duration: 0s !important; }
+}
+
+/* Thin, quiet scrollbars inside panes. */
+* { scrollbar-width: thin; scrollbar-color: var(--color-line-strong) transparent; }

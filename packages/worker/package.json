@@ -1,0 +1,18 @@
+{
+  "name": "@fb/worker",
+  "version": "0.3.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc -p .",
+    "start": "node src/main.ts"
+  },
+  "dependencies": {
+    "@fb/core": "workspace:*",
+    "@fb/store-postgres": "workspace:*",
+    "@repomix/tree-sitter-wasms": "0.1.17",
+    "web-tree-sitter": "0.26.13",
+    "zod": "^3.25.0"
+  },
+  "license": "Apache-2.0"
+}

@@ -1,0 +1,43 @@
+# Security
+
+Feedback Graph reads every Claude Code session transcript on your machine. This page says what it does with them, what leaves the machine, and where the limits are.
+
+## Reporting a vulnerability
+
+Report it privately through GitHub: open the [Security tab](https://github.com/ChaosDeSelva/Feedback-Graph/security) of https://github.com/ChaosDeSelva/Feedback-Graph and choose **Report a vulnerability** ([private vulnerability reporting](https://github.com/ChaosDeSelva/Feedback-Graph/security/advisories/new)). Include the version or commit, your setup (store, model providers) and steps to reproduce. Please do not open a public issue, pull request or discussion for a vulnerability.
+
+You will get a first answer within 5 working days. Once the report is confirmed, we agree a disclosure date with you, normally within 90 days, and credit you in the advisory unless you prefer not to be named.
+
+## What leaves your machine
+
+Nothing, unless you configure it:
+
+| Destination | When | What is sent |
+|---|---|---|
+| A model provider (OpenAI, Anthropic, OpenRouter, Groq, TypeSafe) | Only if you set that provider for a job | The redacted prompt for that job: the turn being classified, the post-mortem evidence, a file being scanned, or the work being checked |
+| Claude / Codex via their CLIs | Only if you choose `claude-cli` / `codex-cli` (Codex also needs `ALLOW_UNCONFINED_CODEX=1`) | The same prompts, plus whatever the agent reads while it explores read-only (see below for what each can reach) |
+| GitHub | Only with `GITHUB_TOKEN` + `GITHUB_REPOS` | API reads of pull requests and comments |
+| Linear | Only with `LINEAR_API_KEY` | A search query built from the feedback text |
+| Feedback Graph Cloud (your team's org) | Only with `CLOUD_URL` + `CLOUD_TOKEN`, when you press Sync now or every `SYNC_INTERVAL_MINUTES` | Per selected project: key and git remote, approved lessons, plus the new status of any lesson the cloud already has (a rejected, superseded or deleted one, or one moved back to proposed, demotes or withdraws the team copy); a lesson you never approved only with `SYNC_SUGGESTIONS=true`, as a suggestion for an admin, misses without the quoted feedback or excerpts, current code facts, document titles and links, code map paths with hotspot numbers. Redacted again on the way out, over https only. Never transcripts, source, document text or embeddings |
+
+The default setup uses Ollama on your own machine for everything, so nothing leaves it.
+
+## Protections
+
+- **Redaction.** Credentials are removed before anything is stored or sent to a model: API keys of the common providers, GitHub/GitLab/Slack/Hugging Face/npm/Linear tokens, JWTs, private keys, bearer tokens, passwords in URLs, `KEY=value` secrets, quoted config secrets, and any value whose key names a secret. Patterns live in `packages/core/src/redact.ts`; add yours there.
+- **Secret files are never read.** `.env*`, `.mcp.json`, `.npmrc`, `.netrc`, `.pypirc`, `.git/config`, SSH keys, certificates and keystores, Terraform state and vars, and files named for secrets, credentials or passwords (`packages/core/src/secrets.ts`). The scanner skips them; Claude Code is denied them with `Read()` rules, inside the repository and anywhere else; Codex explores a copy of the repository that does not contain them. Symlinks are never followed.
+- **Agents get least privilege.** CLI agents run read-only (no shell, edits or web), with an allowlisted environment: no other provider keys, no GitHub/Linear tokens, no database password. They run in their own process group and are killed on timeout or shutdown.
+- **Claude Code is confined to the repository.** `claude-cli` runs with only the Read, Grep and Glob tools and `--restricted`, which keeps them inside the project folder it was started in and ignores that repository's own `.claude` settings, so a repository cannot grant itself more. Nothing outside the folder is pre-approved, and anything that would need approval is denied. On top of that, deny rules name the worker's own folders by absolute path (`/transcripts`, `/codex-sessions`, `/state`, `/codex`, `/proc`) and the secret files anywhere on disk. It cannot read other projects, the transcripts, the state database, the Codex login or any process environment.
+- **External text is fenced.** PR comments, tickets, uploaded docs, past misses and code facts reach agents marked as data, not instructions, and cannot inject headings or code fences into the context.
+- **You decide what is learned.** Flagged feedback waits for your confirmation; lessons are served only after you approve them. Decisions must come from the UI (a request without a browser Origin is refused), so an agent cannot approve its own lessons by accident.
+- **Network exposure.** By default the API is published on 127.0.0.1 only and refuses other Host headers (DNS rebinding). A client that reaches the port can send any Host header, so the Host check is not access control: setting `API_BIND` to anything but a loopback address without `API_TOKEN` stops the API at startup with a configuration error. Cross-site and form-encoded writes are refused. Set `API_TOKEN` and `PUBLIC_HOSTS` to reach it from elsewhere: every API and MCP call then needs the token (Bearer header, or an HttpOnly, SameSite=Strict session cookie from the sign-in page), compared in constant time. Responses carry a strict Content-Security-Policy, `X-Frame-Options: DENY`, `nosniff` and `no-referrer`.
+- **Team sync sends a fixed list of fields.** The sync bundle is rebuilt field by field from the export (`packages/core/src/cloud.ts`), so a field added to the store later does not leave until the sync is changed to send it. The cloud token is redacted from logs, errors and `/api/status`, is never passed to agent CLIs, and only goes to `CLOUD_URL` (redirects are refused; plain http only to localhost).
+- **Containers** run as an unprivileged user, mount transcripts and projects read-only, and only mount the Codex login file (not all of `~/.codex`).
+
+## Known limits
+
+- **Redaction is pattern based.** It catches credential formats, not customer names, personal data or proprietary code quoted in feedback. Do not point the tool at projects whose transcripts must never reach a hosted model; use `EXCLUDE_PROJECTS`, or keep every job on the local model.
+- **The owner check is a guard, not a boundary.** Any process that can run as you can forge an Origin header, and could read `.env` and the database anyway.
+- **`codex-cli` is not confined, so it is off unless you accept that.** Codex's read-only sandbox can read the whole filesystem, and the worker has no way to narrow it to the repository: the worker cannot pass Codex per-path read rules the way it does for Claude Code, and Docker's default seccomp profile blocks the namespaces a wrapper like bubblewrap would need. Codex starts in a copy of the repository without secret files, but by absolute path it can read everything the worker can: every Claude Code and Codex transcript (`/transcripts`, `/codex-sessions`, including projects you did not select or excluded), every project folder under `/vibe` with its `.env` files, `/state` (the worker's database), the Codex login in `/codex`, and the worker's environment through `/proc` (database password, GitHub and Linear tokens, API keys). Its sandbox has no network, so it cannot send anything out directly, but a prompt injection in a transcript or repository could make it quote what it read into a lesson draft, a fact or an error, which are stored and shown to you. So any job set to `codex-cli` (including a scan you start from the UI) refuses to run unless you set `ALLOW_UNCONFINED_CODEX=1`. Prefer `claude-cli` or an API provider.
+- **Neo4j** listens on localhost ports 7476/7689 with the password from `.env`. Anyone who can reach those ports with the password has full access to the graph.
+- **Transcript format.** Claude Code's JSONL format is undocumented and may change; parsing failures are logged and skipped, never guessed at.

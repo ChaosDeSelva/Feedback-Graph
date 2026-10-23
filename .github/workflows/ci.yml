@@ -1,0 +1,47 @@
+name: ci
+on:
+  push: { branches: [main] }
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      neo4j:
+        image: neo4j:5.26-community
+        env:
+          NEO4J_AUTH: neo4j/testpassword
+        ports: ["7688:7687"]
+        options: >-
+          --health-cmd "wget -qO- http://localhost:7474 >/dev/null || exit 1"
+          --health-interval 5s --health-retries 40
+      postgres:
+        image: pgvector/pgvector:0.8.7-pg17
+        env:
+          POSTGRES_USER: fg
+          POSTGRES_PASSWORD: fg
+          POSTGRES_DB: fg_test
+        ports: ["5433:5432"]
+        options: >-
+          --health-cmd "pg_isready -U fg -d fg_test"
+          --health-interval 2s --health-retries 40
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 } # the history check below reads every commit
+      - uses: pnpm/action-setup@v4
+        with: { version: 11.13.1 }
+      - uses: actions/setup-node@v4
+        with: { node-version: 26.5.0, cache: pnpm }
+      - run: pnpm install --frozen-lockfile
+      # A push publishes every commit: no real home folders, planning documents or private names anywhere in history.
+      - run: ./scripts/check-public-history.sh HEAD
+      - run: pnpm typecheck
+      - run: pnpm test
+      # The contract suites, once per backend: both must pass the same tests.
+      - run: pnpm test:int
+        env: { TEST_STORES: 'neo4j,postgres', NEO4J_TEST_URL: bolt://127.0.0.1:7688, TEST_PG_URL: 'postgres://fg:fg@127.0.0.1:5433/fg_test' }
+      - run: pnpm -F @fb/ui build
+      - name: Docker images build
+        run: docker build --target worker -t fg-worker . && docker build --target api -t fg-api .

@@ -1,0 +1,8 @@
+**/node_modules
+**/dist
+.git
+.superpowers
+state
+.env
+backups
+docker-compose.override.yml

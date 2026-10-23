@@ -1,0 +1,35 @@
+Feedback Graph
+Copyright 2026 Jacob Lashley
+
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+Third-party components
+----------------------
+
+This repository contains no third-party code or assets. The components below are installed by the package
+manager (pnpm) at build time and are included in the built web UI (packages/ui/dist) or the api and worker
+runtimes, under their own licenses. None of them ships a NOTICE file of its own; each one's full license text
+is in its folder under node_modules after `pnpm install`.
+
+Fonts served by the web UI, under the SIL Open Font License 1.1 (https://openfontlicense.org):
+- Instrument Sans, Copyright 2022 The Instrument Sans Project Authors
+  (https://github.com/Instrument/instrument-sans), via @fontsource-variable/instrument-sans
+- JetBrains Mono, Copyright 2020 The JetBrains Mono Project Authors
+  (https://github.com/JetBrains/JetBrainsMono), via @fontsource-variable/jetbrains-mono
+
+Code parsing in the worker:
+- web-tree-sitter, MIT License, Copyright (c) 2018 Max Brunsfeld
+- @repomix/tree-sitter-wasms, The Unlicense: prebuilt WebAssembly builds of tree-sitter grammars. The worker
+  loads those for TypeScript and TSX, JavaScript, Python, Go, Rust, C# (https://github.com/tree-sitter) and
+  Swift (https://github.com/alex-pinkus/tree-sitter-swift), each under the MIT License of its authors.
+
+Web UI bundle: React and React DOM (MIT), react-force-graph-2d, force-graph, kapsule, float-tooltip,
+accessor-fn, canvas-color-tracker, index-array-by, jerrypick, d3-force-3d, d3-octree, d3-binarytree (MIT),
+the d3 modules (ISC), preact, lodash-es, tinycolor2, bezier-js (MIT), Tailwind CSS (MIT).
+
+api and worker: neo4j-driver (Apache-2.0), pg, pgvector, hono, @hono/node-server,
+@modelcontextprotocol/sdk, zod (MIT).
+
+Container images: the worker image installs the Claude Code CLI (@anthropic-ai/claude-code, under
+Anthropic's own terms) and the Codex CLI (@openai/codex, Apache-2.0) when it is built. They are not part of
+this repository, and the images are built on your machine.

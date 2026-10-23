@@ -1,0 +1,9 @@
+node_modules
+dist
+.env
+state/
+.superpowers/
+coverage
+backups/
+.claude/
+docker-compose.override.yml

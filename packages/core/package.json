@@ -1,0 +1,20 @@
+{
+  "name": "@fb/core",
+  "version": "0.3.0",
+  "private": true,
+  "type": "module",
+  "main": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts",
+    "./types": "./src/types.ts",
+    "./testing": "./src/testing/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc -p ."
+  },
+  "dependencies": {
+    "neo4j-driver": "^5.28.0",
+    "zod": "^3.25.0"
+  },
+  "license": "Apache-2.0"
+}

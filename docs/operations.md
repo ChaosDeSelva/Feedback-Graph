@@ -1,0 +1,193 @@
+# Operating Feedback Graph
+
+## Install
+
+```sh
+./scripts/setup.sh            # asks for your projects folder(s), writes .env, checks Ollama and its models
+docker compose up -d --build
+open http://localhost:8787
+./scripts/install-agent.sh    # MCP server + guidance for Claude Code and Codex (README: Connect your agents)
+```
+
+`setup.sh` is safe to re-run; it never overwrites an existing `.env`. It:
+
+- **asks which folders hold your projects** (one folder per project inside), suggesting the folders your Claude Code sessions ran in. In a script, answer ahead: `PROJECTS_DIRS=~/code,~/work ./scripts/setup.sh`; without a terminal and without that, it takes its best guess and says which.
+- **mounts every projects folder** read-only. The first is `PROJECTS_DIR`; with more than one (`PROJECTS_DIRS`, comma-separated, in `.env`) it writes `docker-compose.override.yml`, which `docker compose` reads automatically, so `docker-compose.yml` stays as shipped and `git pull` never conflicts. After changing `PROJECTS_DIRS`, run `setup.sh` again (it rewrites the override, or removes it when `PROJECTS_DIRS` is empty). It never touches an override you wrote yourself (one without its header line); add the mounts there by hand: each extra folder mounted read-only for `worker` and `api` at `/roots/2`, `/roots/3`…, with `PROJECT_ROOTS` and `HOST_PROJECT_ROOTS` listing every root (container and host paths, in the same order, `/examples` last).
+- **creates the folders Docker would otherwise create, owned by root**: `./state`, `~/.claude/projects` and the Codex sessions folder (`CODEX_SESSIONS_DIR`, default `~/.codex/sessions`).
+- **checks Ollama** on the host (`/api/tags`) and both models (`OLLAMA_MODEL`, default `gemma4`, and `OLLAMA_EMBED_MODEL`, default `nomic-embed-text`), and says which `ollama pull` is missing. Ollama is needed for embeddings always, and for the other jobs unless each uses another provider.
+
+### Linux
+
+- **Ollama must listen beyond localhost:** the containers reach it through the Docker bridge (`host.docker.internal`). Run `sudo systemctl edit ollama`, add `[Service]` and `Environment="OLLAMA_HOST=0.0.0.0"`, then `sudo systemctl restart ollama`. Keep port 11434 closed to other machines with your firewall.
+- **File ownership:** the api and worker run as uid 1000 (`node`). If your uid is not 1000 (`id -u`; `setup.sh` warns), the worker cannot write `./state`, and cannot read transcripts that only you may read. Either give uid 1000 access (`sudo chown -R 1000:1000 state`, and make `~/.claude/projects` readable), or run both services as yourself in `docker-compose.override.yml`:
+
+  ```yaml
+  services:
+    worker: { user: "1001:1001", environment: { HOME: /tmp } }   # your id -u and id -g
+    api: { user: "1001:1001" }
+  ```
+
+  (`HOME: /tmp` gives the agent CLIs a writable home.) The Codex provider's login volume (`codex-home`) stays owned by uid 1000, so if you use that provider, take the `chown` route instead. An override that `setup.sh` generated is rewritten on the next run: keep this in your own override, or add it again.
+
+## Health
+
+| Check | Meaning |
+|---|---|
+| `GET /api/health` | The API process is up (no dependencies). Open without `API_TOKEN`. |
+| `GET /api/ready` | The API can reach its store (Neo4j or Postgres). 503 otherwise. The body names the store: `{"ok": true, "store": "neo4j"}`. Used by the container health check, so it is open without `API_TOKEN` (it says nothing else). |
+| `GET /api/status` | Version, `store` (`neo4j` or `postgres`), whether it answers (`graph`), the worker's last heartbeat, last cycle, last error and models. `models` gives each job's model (`classify`, `postmortem`, `scan`) with `ok` and, when it could not be asked, the `reason`; `givenUpTurns` counts turns the classifier gave up on. `ollama` says whether Ollama answers at `OLLAMA_URL` with the embedding model pulled (`url`, `ok`, `reason`); every embedding needs it, and while it does not answer each `ollama:` model is reported unavailable. The UI header shows the same as a badge. |
+| `POST /api/turns/requeue` | Gives the turns the classifier gave up on another try (`{"requeued": n}`). Yours only, from the UI (Inbox, when it is empty); logged in Activity as **turns re-queued**. |
+| `docker compose ps` | Worker health comes from a heartbeat file the worker writes every 30 s (a timer, so long post-mortems do not look like a hang). |
+
+Logs are one JSON object per line (`docker compose logs -f worker api`). The API logs method, path, status and duration, never query strings or bodies.
+
+## Running it for more than one machine
+
+1. Put it behind a TLS reverse proxy (Caddy, nginx, a cloud load balancer) that forwards `X-Forwarded-Proto`.
+2. In `.env`: `API_TOKEN=$(openssl rand -hex 24)`, `PUBLIC_HOSTS=feedback.example.com`, `API_BIND=0.0.0.0`. The API refuses to start with a non-loopback `API_BIND` and no `API_TOKEN`.
+3. People sign in once in the browser with the token. Agents: `FEEDBACK_GRAPH_URL=https://feedback.example.com ./scripts/install-agent.sh` registers the MCP server with the token, for Claude Code and for Codex (in `~/.codex/config.toml` as a static `Authorization` header in `http_headers`; the file is then made readable by you only).
+
+Without a token the API refuses every host name except localhost, by design. This is still one person's graph; see [Editions](editions.md) for the team edition.
+
+## Running on Postgres
+
+Neo4j is the default store. The same api and worker run on Postgres 17 with pgvector instead:
+
+1. In `.env`: `STORE=postgres` and `POSTGRES_PASSWORD=$(openssl rand -hex 18)` (letters and digits only: it is placed in a URL). `setup.sh` writes a password for new installs; startup refuses an empty one with the bundled service.
+2. Also `COMPOSE_PROFILES=postgres` in `.env`, so every `docker compose` command (up, down, logs, ps, and the backup scripts) includes the database without `--profile postgres`. Then `docker compose up -d --build`. The profile starts the `postgres` service (`pgvector/pgvector:0.8.7-pg17`, bound to `127.0.0.1:${POSTGRES_PORT:-5434}`, data in the `postgres-data` volume). The Neo4j container still starts, because it is the default service, but nothing connects to it.
+3. `curl localhost:8787/api/ready` answers `{"ok":true,"store":"postgres"}`.
+
+Your own server instead of the container: `DATABASE_URL=postgres://user:password@host:5432/db` (the `vector` extension, pgvector 0.8.0 or newer, must be installable by that user) and no profile (`COMPOSE_PROFILES` empty). An older pgvector is refused at startup with the version found: the searches need its iterative HNSW scans, and older versions fail every search once the extension is loaded. `DATABASE_URL` is checked at startup with every other setting; its password never appears in a log or error message, whether it is in the userinfo or a `?password=` parameter.
+
+Migrations (`packages/store-postgres/migrations`) run at startup under an advisory lock, so the api and the worker can start together; `0002_codegraph.sql` adds the code map tables. Vector searches use the HNSW indexes when the project has enough rows for that to pay, with iterative scans so a project's rows are still found when closer rows belong to other projects; small projects get an exact scan, and vectors of another length (an older embedding model) always do, so any embedding model works. The embedding-model check and `reembed` behave as on Neo4j. Text containing NUL characters (it happens in transcripts) is stored without them, since Postgres text cannot hold them; Neo4j keeps them.
+
+Switching backend starts with an empty store: data is not copied between them. Carry lessons and code facts over with Export on the old backend and **Import bundle** on the new one (see [Data controls](#data-controls)); misses and their evidence come back as the worker re-reads the selected projects' transcripts. Keep the old backend's backup until you are happy.
+
+## Backups
+
+```sh
+./scripts/backup.sh                          # backups/<UTC timestamp>/{neo4j.dump or postgres.dump, state.tgz, STORE, SHA256SUMS}
+./scripts/restore.sh backups/20261022T120000Z
+```
+
+Both scripts read `STORE` from `.env` and back up that store with the worker's `state/`:
+
+- **Neo4j** (the default): Neo4j Community can only dump a stopped database, so the stack stops for the minute a backup takes. Schedule it with cron or launchd at a quiet hour.
+- **Postgres** (`STORE=postgres`): `pg_dump --format=custom` takes a consistent snapshot while everything keeps running. With `DATABASE_URL` empty it dumps the bundled `postgres` service (starting it if needed); with `DATABASE_URL` set it dumps your own server, from a throwaway `pgvector/pgvector:0.8.7-pg17` container on the stack's network (the URL is passed through the environment, never on a command line). Your server must be Postgres 17 or older for that `pg_dump`.
+
+`restore.sh` checks the checksums, refuses a backup of the other store (a `postgres.dump` with `STORE=neo4j`, or the reverse), asks you to type `restore` (`FORCE=1` skips that), and replaces the current store and worker state. On Postgres it stops the api and worker, replaces the whole `public` schema in one transaction (so tables a later migration added go too, and a failed restore leaves the database as it was), and starts again what was running. Either script stops with a message, before touching anything, when `.env` is missing, `STORE` is neither `neo4j` nor `postgres`, or `STORE=postgres` has neither `DATABASE_URL` nor `POSTGRES_PASSWORD`.
+
+## Upgrades
+
+```sh
+./scripts/backup.sh
+git pull && docker compose up -d --build
+```
+
+The schema is created idempotently at startup. Read `CHANGELOG.md` for anything that needs a step.
+
+After upgrading to the version with the code map, the worker reads the selected projects' transcripts once more (to record which files each session touched; re-reading is idempotent) and maps each selected project's code. Both run beside ingest; expect the first cycle to take longer.
+
+## Changing the embedding model
+
+The graph records which model embedded it. If you change `OLLAMA_EMBED_MODEL`, the services refuse to start and say so. Re-embed everything:
+
+```sh
+docker compose stop worker api
+docker compose run --rm worker node src/reembed.ts
+docker compose up -d
+```
+
+It is resumable: if it stops part way (a crash, Ollama going away), run it again with the same `OLLAMA_EMBED_MODEL` and it embeds only what is left. Running it with a different model starts over.
+
+## Data controls
+
+- **Project selection:** you choose which project folders are read; nothing is read until you do. The choice is stored in the graph (`ProjectSelection`), so it survives restarts and both services see it. The worker lists every top-level folder under the roots each cycle (`GET /api/settings/projects`): whether it exists, is a git repo, its remote, how many Claude Code and Codex sessions ran in it and when it was last active. A Claude Code session counts from its file's first lines; a Codex session counts in every folder it was in, from its first lines and each later cwd switch (only `turn_context` lines are parsed, and only the bytes added since the last pass are scanned). Folders that sessions ran in but that are gone are listed as missing; sessions outside every root are only counted (add a root to make them selectable). Selecting a folder reads its sessions from the next cycle; unselecting stops reading it and keeps its data. The selection gates ingest (Claude Code and Codex, per session, so a Codex session that moved into a selected folder is read from there), memory import, scans, GitHub sync and MCP context. A second clone of a project (an alias folder, or a folder whose remote an existing project already has) follows that project: it is read when that project is selected, ticking it selects that project, and it is never made an alias of a project you have not selected. A folder saved in your selection that has since become a clone, or been excluded, is dropped from the list when you next save (Activity says so) instead of blocking the save.
+  - `INGEST_PROJECTS` only seeds the selection on the first start of a version with selection (an install with `INGEST_PROJECTS=demo-shop` keeps reading exactly demo-shop). With it empty, an **upgrade** selects the projects you invested in: those holding approved lessons, confirmed feedback, docs or scans (never one in `EXCLUDE_PROJECTS`), so agents keep getting the lessons you approved; Activity (**projects selected**) lists them and says why. Review the choice in Settings. A new install, or an upgrade with none of those, selects nothing, logs that in Activity, and the header says **no projects selected**. After that `INGEST_PROJECTS` is ignored (the worker logs so if it differs).
+  - **Global lessons reach every folder you have not excluded.** An agent working in a folder under a root that is not selected still gets the approved lessons scoped **global** from `get_task_context` and `check_before_done` (and nothing of that folder's own: its sessions are not read, so it has no misses, facts or code map). The answer says the folder is not selected and that it can be selected in Settings. A folder in `EXCLUDE_PROJECTS`, or a clone of an excluded project, gets nothing at all. The other MCP tools answer only for selected projects; outside them they say the folder is not tracked and point to Settings.
+  - `EXCLUDE_PROJECTS` is a hard deny on top: an excluded folder is never read, scanned or served, cannot be selected, and an alias of an excluded project is excluded too.
+  - **Remove unselected data:** `POST /api/settings/cleanup` with `{"confirm": "remove-unselected"}` (from the UI) deletes everything learned from projects that hold data but are not selected, and logs it; data filed under a clone of a selected project is kept. It is refused until a selection has been made. Cleanup and project delete wait for the worker to finish the transcript it is writing, and the worker checks the selection again before writing each one, so a cycle part way never writes a deleted project back. The worker then forgets which of those folders' transcripts and memory files it read, so selecting one again reads its whole history again (deleting a project that is still selected does not: only new sessions are read).
+- **Codex sessions:** `~/.codex/sessions` (or `CODEX_SESSIONS_DIR`) is mounted read-only at `/codex-sessions`. Rollout files are streamed line by line (they can pass 800 MB); a large file that keeps growing is re-read at most every 10 minutes. Sessions run by Codex's own reviewer or sub-agents are skipped. Each session is recorded with `source: codex` and goes through the same redaction, classification, Inbox and post-mortem as a Claude Code session. Agent CLIs (post-mortems, scans) are denied `/codex-sessions` like `/transcripts`.
+- **Code map:** for each selected project, the worker parses the code (tree-sitter in the worker, no model, nothing sent anywhere) into files, symbols, import edges, the tests covering each file, and commits per file over 90 days. It runs beside ingest and never holds it up: a project's repo is looked at no more than every five minutes and rebuilt only when it changed (git HEAD, `git status` and the size and mtime of uncommitted files; a folder that is not a git repo is rebuilt every five minutes). Unchanged files are not parsed again. It is bounded by `SCAN_MAX_FILES` and `SCAN_MAX_BYTES`, skips `.gitignore`d, vendor and secret files, never follows symlinks, and stores no source: paths, symbol names and line ranges only. A **Scan** maps its project first. Each build logs a **code mapped** Activity entry with its size and duration.
+- **Reading the code map:** the Projects page shows each project's map (files, symbols, edges, last build) and its hotspots, scored `4 × misses + log2(1 + churn) + log2(1 + dependents)` (misses: confirmed misses whose session edited the file; churn: commits in 90 days; dependents: files importing it). Patterns lists the top hotspots across the selected projects. The same data over HTTP, read-only: `GET /api/projects/<key>/codemap/hotspots?limit=50` (`{meta, hotspots}`; `meta` is null before the first build), `GET /api/projects/<key>/codemap/module?path=<repo path>` (404 when the file is not mapped), `GET /api/projects/<key>/codemap/impact?path=<a>&path=<b>&depth=3` (depth 1 to 5) and `GET /api/codemap/hotspots?limit=10[&project=<key>]`. All of them answer for selected projects only: any other key, or one in `EXCLUDE_PROJECTS`, is a 404 that says to choose it in Settings. Agents get it through MCP: `get_module_context`, `impact`, the code map section of `get_task_context` when they pass `files`, and the `files_changed` check of `check_before_done`. Each of those calls is logged in Activity as **context served** (or **pre-done check**) with the tool and paths.
+- **Agent reports and the detector:** an agent's `report_feedback` (from `/postmortem`, or a miss the developer did not put in words) and the detector can flag the same miss. A report within 60 minutes of a flagged turn in the same project, whose words mostly match that turn's or that comes from the same session (`session_id`, optional), is merged into one Inbox item: reported after the detector, it is added to the detector's item; reported before, the detector moves the report's item onto the real turn (so the post-mortem sees the whole session) and drops the report's stand-in session. A report you already confirmed or rejected stays as it is, and the detector is recorded as a second source; a detector item you rejected is never merged into. Each Inbox item carries `origins` (`detector`, `agent`, or both) and the agent's `agentReport` (its words, what it had done, when, and its session id).
+- **Memory import:** Claude Code feedback memories (`type: feedback` notes in a selected project's memory folder) become project lessons with source `memory`. By default they are **proposed**: they wait in Lessons for your approval and are not served to agents until you approve them. `MEMORY_AUTO_APPROVE=true` approves them on import. A file that changes is imported again and updates its lesson until you edit, approve or reject that lesson; from then on the lesson is yours and a new version of the file never changes it. Each import is logged in Activity as **memory imported**.
+- **Instruction files in post-mortems:** a post-mortem reads `CLAUDE.md` and `AGENTS.md` in the project folder and in each parent folder up to the project root it is mounted under (folders above the mount are not visible to the worker), plus the session's Claude Code memory notes. Each is labelled by kind and by whether the session's agent loads it: Claude Code sessions load CLAUDE.md and memory, Codex sessions load AGENTS.md, and that agent's files are listed first. Only a loaded file counts as context the agent had (`context_available_ignored`). Codex's personal `~/.codex/AGENTS.md` is not mounted into the worker, so post-mortems do not see it. AGENTS.md is cited with its own kind (`agents_md`).
+- **Files touched by sessions:** ingest records which repo files each session read and edited (from Read, Edit, Write, MultiEdit, NotebookEdit and Codex patch calls), as paths relative to the project folder; paths outside it and secret files are dropped. A miss is linked to the files its session edited, and to where the fix landed (files edited after the feedback). That is what ranks a project's hotspots and scopes a post-mortem's lesson to files.
+- **Retention:** `TURN_RETENTION_DAYS=90` removes the text of classified turns older than 90 days, except in sessions that hold flagged feedback (their post-mortems need every turn).
+- **Export:** Projects page → Export, or `GET /api/export?project=<key>` (`&approved=1` for approved lessons only). A versioned JSON bundle of lessons, misses with their evidence, current facts, document metadata, the code map's file paths with their hotspot numbers (`codeFiles`: churn, misses, dependents, score; no source, symbols or edges) and each project's git remote (`projects: [{key, remote}]`, so clones in differently named folders can be matched). No raw transcripts, no vectors. Readers must ignore fields they do not know: added fields keep `schemaVersion: 1`.
+- **Import:** Projects page → **Import bundle**, or `POST /api/import` with the bundle as the JSON body (`?keepApproved=1` keeps approved lessons approved). Yours only, from the UI, like every other write that teaches agents. The bundle must be `format: "feedback-graph-export"` with `schemaVersion: 1` (a newer one is refused with a message; fields this version does not know are ignored), is validated field by field, may be at most 50 MB, and is redacted again before anything is stored. It works across machines and backends:
+  - **Lessons** are matched by id and re-embedded with the current `OLLAMA_EMBED_MODEL`. A lesson whose id is already here is left alone, so importing twice changes nothing and never overrides your decision. They arrive **proposed** and reach agents only once you approve them, unless you tick **keep approved** (`?keepApproved=1`): then approved lessons stay approved. Rejected and superseded lessons are not imported.
+  - **Facts** go, re-embedded, into a project that has no facts yet (a project scanned here keeps its own). They are attributed to `import:<the model that found them>`, so the first scan here reads every file again and replaces them.
+  - **Not imported:** misses (their evidence is the transcript, which a bundle never holds; they come back when the project's sessions are read), document metadata (the bundle has no text; upload the doc again) and the code map (rebuilt from the code). The response counts them.
+  - Projects in `EXCLUDE_PROJECTS` are never imported. Each import is logged in Activity as **bundle imported**, with what came in and what was skipped.
+- **Projects by git remote:** each project records its `origin` remote, normalized (`github.com/org/repo`, or `local/<name>` for a bare repo on disk; credentials, scheme, port and `.git` dropped). Only a folder that is itself the root of a git repo has one: a folder inside another repo does not inherit it. Existing projects get theirs on the next worker cycle, without re-reading transcripts. A folder that is not yet a project and has the same remote as an existing one is recorded as that project's alias: its sessions, and MCP calls from it, go to the existing project, and Activity logs a **project alias** entry. Projects that already existed separately are never merged. A folder with no remote works as before.
+- **Delete:** Projects page → Delete project data (type the name). Removes every session, flag, decision, post-mortem, lesson, fact, code map, document and log entry for the project. Unselect it in Settings (or add it to `EXCLUDE_PROJECTS`) so new sessions are not read again.
+
+## Team sync
+
+Optional and off by default: with `CLOUD_URL` and `CLOUD_TOKEN` unset, no code path sends anything. Set both to
+push project knowledge to a Feedback Graph Cloud org.
+
+- **Settings.** `CLOUD_URL` is the cloud's base URL: `https://` (plain `http://` only to `localhost`, `127.0.0.1`
+  or `[::1]`; inside Docker that is the container itself, so use https), with no user name or password in it.
+  `CLOUD_TOKEN` is a personal access token from the cloud (`fgc_pat_<16 hex>_<43 characters>`, scope `sync`, a
+  member role or above); create it in the cloud web app under Access tokens. `SYNC_INTERVAL_MINUTES` (5 or more)
+  turns on automatic sync in the worker; empty means only **Sync now** (Settings, which the api runs).
+  `SYNC_PROJECTS=a,b` narrows the projects sent; it never adds one: only projects selected in Settings, and never
+  one in `EXCLUDE_PROJECTS`. `SYNC_SUGGESTIONS` (`false` by default) decides whether lessons you have not approved
+  leave at all (below). All five are checked at startup with every other setting; a bad token is reported without
+  being echoed.
+- **What is sent.** One `POST <CLOUD_URL>/api/v1/sync` per project, `Authorization: Bearer <token>`, with the export
+  bundle of that project (`format: feedback-graph-export`, `schemaVersion: 1`) rebuilt field by field: the project's
+  key and normalized git remote, its lessons (below), misses (what was missed, the cause and its
+  explanation, but an empty `feedbackText` and context items without their excerpts), current code facts, document
+  metadata (title, link, no text) and `codeFiles` (paths and hotspot numbers). Everything passes redaction again on
+  the way out. No transcripts, no source, no excerpts, no vectors.
+- **Which lessons.** Nothing is shared without your approval. By default a bundle carries the lessons you approved,
+  plus, with its current status, any lesson the cloud already received from you (so revoking, superseding or moving
+  one back to proposed demotes the team copy). A lesson you never approved (proposed, or rejected before it was ever
+  sent) stays on this machine. `SYNC_SUGGESTIONS=true` sends every lesson with its status: proposed ones then arrive
+  as suggestions for an admin. The record of what the cloud received is kept by each process (the worker's schedule
+  and the api's Sync now) and starts empty after a restart; a once-approved lesson that is no longer approved is then
+  left out, and the complete bundle withdraws it on the cloud instead, which demotes the team copy too.
+- **Your decisions follow.** Each bundle is the whole project and says `complete: true`: on the cloud, whatever you
+  sent for that project before and it leaves out now is withdrawn (kept there, not served). It also lists in
+  `withdrawn` the lessons, misses, docs and fact files sent before and gone now. Leaving unapproved lessons out never
+  withdraws anything: what was never sent has nothing to withdraw. Approved lessons become team lessons (or wait for
+  an admin when the org reviews them), proposed ones (sent because the cloud had them, or with `SYNC_SUGGESTIONS`)
+  are suggestions for an admin, and a lesson you reject or that is superseded demotes the team copy. A decision an admin made on the cloud is never overwritten: the
+  cloud flags it instead. A selected project that now holds nothing (its data deleted) is sent once as an empty
+  complete bundle under its last remote. The cloud files a project with a shareable remote under the
+  team; one with no remote, or a `local/` one, stays in your personal space in the org.
+- **Retries.** 429 (another sync of the org is running), 5xx and network errors are retried: up to four attempts per
+  project, never sooner than `Retry-After` (seconds or a date; a wait longer than a minute fails that project until the
+  next run), otherwise 2, 4, 8 seconds. 413 (too large) and 422 (rejected) fail that project and the sync moves on
+  to the next; 401 (bad, revoked or expired token) and 403 (no `sync` scope, or a viewer) stop the run. Redirects are
+  refused, so the token only goes to `CLOUD_URL`. After a failed scheduled run the next one waits twice as long,
+  up to a day, and a success resets it. A scheduled run skips a project whose bundle has not changed since it was
+  last sent (re-sending would change nothing on the cloud either); Sync now always sends.
+- **What is recorded.** Each run that sent or failed something logs one **cloud sync** Activity entry: the cloud's
+  host, the projects, the counts sent, where the cloud filed each project and the first error. The worker's
+  heartbeat (`/api/status` → `worker.cloudSync`) carries the last scheduled result and the next run; `/api/status`
+  → `cloud` says whether sync is on, with the token shown as `[REDACTED]`. The token is never logged, stored in the
+  graph or passed to agent CLIs.
+- **REST.** `GET /api/cloud` (the card: host, schedule, projects, counts a sync would send, last result) and
+  `POST /api/cloud/sync` (Sync now; from the UI only, like other decisions; 409 when sync is off or already running).
+- **End-to-end check.** `./scripts/cloud-sync-e2e.sh <cloud repo>` starts the cloud's docker compose under its own
+  project name and port, makes an org and token through dev login, syncs a seeded project from throwaway test stores
+  on both backends and checks the lesson arrived, then removes the cloud project and its volumes.
+
+## Troubleshooting
+
+| Symptom | Look at |
+|---|---|
+| Badge says "worker offline" | `docker compose logs worker`: a config error is printed with every problem named. |
+| Post-mortems never finish | Inbox → Confirmed: each item says whether it is waiting, failed (with the error) or gave up, with a Retry button. |
+| "No approved lessons" for every task | `/api/status` and the logs: an embedding model mismatch stops the services with instructions. |
+| Ingest seems stuck on history | It classifies newest first; selecting fewer projects narrows it. Turns the model answers but cannot label are given up after 3 tries; the empty Inbox offers to re-queue them. |
+| Badge says "classifier unavailable" | The classifier's model could not be asked (not running, not pulled, unreachable, signed out, rate limited, timed out); the tooltip and `/api/status` give the reason. Classification pauses until it answers again, and no turn is charged a try for it. Fix the model (for Ollama: `ollama pull <model>`); the next cycle carries on. "post-mortem model unavailable" and "scan model unavailable" mean the same for those jobs: a post-mortem is not charged an attempt (and the rest of the batch waits), and a scan goes back in the queue (its error says why) instead of failing, then runs once the model answers. An embedding model that is down counts the same way. |
+| An agent hears "not in the code map" | The file is new, ignored, generated, not source, or past `SCAN_MAX_FILES`; the map is rebuilt within five minutes of a repo change. Activity → **code mapped** shows the last build. |
+| Cloud sync says error | The card's message names it: 401 means `CLOUD_TOKEN` is wrong, revoked or expired; 403 means it lacks the `sync` scope or you are a viewer; 413 means narrow `SYNC_PROJECTS`. Activity → **cloud sync** has each run. |
+| Badge says "no projects selected" | Nothing is being read. Choose the folders to include in Settings. |
+| A folder's sessions are not listed | Its sessions ran outside every project root (see `outsideRoots`), or under a root that is not mounted. Add its parent folder to `PROJECTS_DIRS` in `.env` and re-run `./scripts/setup.sh` (see Install). |

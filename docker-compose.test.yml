@@ -1,0 +1,32 @@
+services:
+  neo4j-test:
+    image: neo4j:5.26-community
+    environment:
+      NEO4J_AUTH: neo4j/testpassword
+    ports:
+      - "127.0.0.1:7688:7687"
+    tmpfs:
+      - /data
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:7474 >/dev/null || exit 1"]
+      interval: 3s
+      timeout: 3s
+      retries: 40
+
+  # The Postgres backend (@fb/store-postgres): pgvector 0.8.7 on Postgres 17. Throwaway: data lives in tmpfs.
+  # Each contract-test run may use its own database name (TEST_PG_URL); the harness creates it when missing.
+  postgres-test:
+    image: pgvector/pgvector:0.8.7-pg17
+    environment:
+      POSTGRES_USER: fg
+      POSTGRES_PASSWORD: fg
+      POSTGRES_DB: fg_test
+    ports:
+      - "127.0.0.1:5433:5432"
+    tmpfs:
+      - /var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U fg -d fg_test"]
+      interval: 2s
+      timeout: 3s
+      retries: 40

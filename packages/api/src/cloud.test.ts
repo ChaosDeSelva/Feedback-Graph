@@ -1,0 +1,125 @@
+import { EXPORT_FORMAT, type Activity, type ActivityInput, type CloudConfig, type ExportBundle, type WorkerStatus } from '@fb/core';
+import { expect, test, vi } from 'vitest';
+import { createApp, type ApiRepo } from './app.ts';
+import type { CloudDeps } from './cloud.ts';
+
+const TOKEN = `fgc_pat_0123456789abcdef_${'Q'.repeat(43)}`;
+const cloud: CloudConfig = { url: 'https://cloud.example.com', token: TOKEN, intervalMinutes: 60, projects: [], suggestions: false };
+const repo = { listCandidates: async () => [], candidateDetail: async () => null, decide: async () => {}, stats: async () => [] } as ApiRepo;
+
+const bundle = (key: string): ExportBundle => ({
+  format: EXPORT_FORMAT, schemaVersion: 1, toolVersion: '0.2.0', exportedAt: '2026-10-23T10:00:00Z', projectKey: key,
+  projects: [{ key, remote: `github.com/acme/${key}` }],
+  lessons: [{ id: `lesson:${key}`, projectKey: key, title: 'T', rule: 'R', appliesWhen: '', scope: 'project', paths: [], status: 'approved', source: 'postmortem', cause: null, missId: null, createdAt: 't', decidedAt: 't' }],
+  misses: [], facts: [], docs: [], codeFiles: [],
+});
+
+const syncOk = { syncId: 's1', org: 'acme', projects: [{ localKey: 'shop', key: 'github.com/acme/shop', remote: 'github.com/acme/shop', namespace: 'team' }], lessons: { team: 1, suggested: 0, skipped: 0 }, misses: 0, facts: { files: 0, unchanged: 0 }, docs: 0 };
+
+function deps(o: Partial<CloudDeps> = {}) {
+  const log: Activity[] = [];
+  const fetchCalls: string[] = [];
+  const d: CloudDeps = {
+    cloud,
+    portability: { exportData: async (q) => bundle(q?.projectKey ?? '') },
+    activity: {
+      record: async (a: ActivityInput) => { log.unshift({ ...a, details: a.details ?? {}, targets: a.targets ?? [], id: `a${log.length}`, ts: '2026-10-23T10:00:00.000Z' }); },
+      list: async (q) => log.filter((a) => !q.kind || a.kind === q.kind).slice(0, q.limit ?? 100),
+    },
+    projects: async () => ['shop'],
+    worker: async () => null,
+    fetch: (async (url: string) => { fetchCalls.push(url); return Response.json(syncOk); }) as unknown as typeof fetch,
+    ...o,
+  };
+  return { d, log, fetchCalls };
+}
+
+const post = (origin?: string) => ({ method: 'POST', body: '{}', headers: { 'content-type': 'application/json', ...(origin ? { origin } : {}) } });
+
+test('with cloud sync off, the card says so and Sync now refuses; nothing is sent', async () => {
+  const { d, fetchCalls } = deps({ cloud: null });
+  const app = createApp(repo, { cloud: d });
+  const info = await (await app.request('/api/cloud')).json();
+  expect(info).toMatchObject({ enabled: false, host: null, last: null, preview: null });
+  expect(info.neverSent).toMatch(/transcripts/);
+  const res = await app.request('/api/cloud/sync', post('http://localhost'));
+  expect(res.status).toBe(409);
+  expect((await res.json()).error).toMatch(/CLOUD_URL/);
+  expect(fetchCalls).toHaveLength(0);
+});
+
+test('the card shows the host, schedule, projects and what a sync would send; never the token', async () => {
+  const { d } = deps();
+  const app = createApp(repo, { cloud: d });
+  const res = await app.request('/api/cloud');
+  const text = await res.text();
+  expect(text).not.toContain(TOKEN);
+  const info = JSON.parse(text);
+  expect(info).toMatchObject({ enabled: true, host: 'cloud.example.com', intervalMinutes: 60, suggestions: false, projects: ['shop'], last: null });
+  expect(info.preview.total).toMatchObject({ projects: 1, lessons: 1 });
+});
+
+test('Sync now is yours only: a request without a browser Origin is refused', async () => {
+  const { d, fetchCalls } = deps();
+  const app = createApp(repo, { cloud: d });
+  expect((await app.request('/api/cloud/sync', post())).status).toBe(403);
+  expect(fetchCalls).toHaveLength(0);
+});
+
+test('Sync now from the UI sends, records Activity, and the card then shows the last sync', async () => {
+  const { d, log, fetchCalls } = deps();
+  const app = createApp(repo, { cloud: d });
+  const res = await app.request('/api/cloud/sync', post('http://localhost'));
+  expect(res.status).toBe(200);
+  const r = await res.json();
+  expect(r).toMatchObject({ ok: true, host: 'cloud.example.com', sent: { lessons: 1 } });
+  expect(fetchCalls).toEqual(['https://cloud.example.com/api/v1/sync']);
+  expect(log.map((a) => [a.kind, a.actor])).toEqual([['cloud_synced', 'you']]);
+  const info = await (await app.request('/api/cloud')).json();
+  expect(info.last).toMatchObject({ at: '2026-10-23T10:00:00.000Z', ok: true, trigger: 'manual', error: null, sent: { lessons: 1 }, projects: ['shop'] });
+});
+
+test('a failed sync is reported with its reason, and the card shows the error', async () => {
+  const { d } = deps({ fetch: (async () => new Response('', { status: 401 })) as unknown as typeof fetch });
+  const app = createApp(repo, { cloud: d });
+  const r = await (await app.request('/api/cloud/sync', post('http://localhost'))).json();
+  expect(r.ok).toBe(false);
+  expect(r.error).toMatch(/refused the token/);
+  expect((await (await app.request('/api/cloud')).json()).last).toMatchObject({ ok: false, error: expect.stringMatching(/refused the token/) });
+});
+
+test('one Sync now at a time', async () => {
+  let release!: () => void;
+  const gate = new Promise<void>((r) => { release = r; });
+  const { d } = deps({ fetch: (async () => { await gate; return Response.json(syncOk); }) as unknown as typeof fetch });
+  const app = createApp(repo, { cloud: d });
+  const first = app.request('/api/cloud/sync', post('http://localhost'));
+  await new Promise((r) => setTimeout(r, 5));
+  expect((await app.request('/api/cloud/sync', post('http://localhost'))).status).toBe(409);
+  release();
+  expect((await first).status).toBe(200);
+});
+
+test('the card shows when the worker syncs next', async () => {
+  const worker = { cloudSync: { host: 'cloud.example.com', intervalMinutes: 60, lastAt: null, lastOk: null, lastError: null, lastSent: null, nextAt: '2026-10-23T11:00:00.000Z', failures: 0 } } as unknown as WorkerStatus;
+  const { d } = deps({ worker: async () => worker });
+  const info = await (await createApp(repo, { cloud: d }).request('/api/cloud')).json();
+  expect(info.nextAt).toBe('2026-10-23T11:00:00.000Z');
+});
+
+test('/api/status says whether cloud sync is on, with the token redacted', async () => {
+  const { d } = deps();
+  const app = createApp(repo, { cloud: d, system: { version: '0.2.0', ping: async () => true, worker: async () => null } });
+  const text = await (await app.request('/api/status')).text();
+  expect(text).not.toContain(TOKEN);
+  expect(JSON.parse(text).cloud).toEqual({ host: 'cloud.example.com', token: '[REDACTED]', intervalMinutes: 60 });
+  const off = createApp(repo, { cloud: deps({ cloud: null }).d, system: { version: '0.2.0', ping: async () => true, worker: async () => null } });
+  expect((await (await off.request('/api/status')).json()).cloud).toBeNull();
+});
+
+test('preview errors do not break the card', async () => {
+  const { d } = deps({ portability: { exportData: vi.fn(async () => { throw new Error('store down'); }) } });
+  const res = await createApp(repo, { cloud: d }).request('/api/cloud');
+  expect(res.status).toBe(200);
+  expect((await res.json()).preview).toBeNull();
+});

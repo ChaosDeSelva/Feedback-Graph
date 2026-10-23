@@ -1,0 +1,9 @@
+{"id":"codex-legacy-0009","timestamp":"2025-06-01T09:00:00.000Z","instructions":null,"git":{"branch":"main","commit_hash":"aaa"}}
+{"record_type":"state"}
+{"type":"message","role":"user","content":[{"type":"input_text","text":"<environment_context>\n  <cwd>/work/demo-shop</cwd>\n  <shell>zsh</shell>\n  <current_date>2026-10-01</current_date>\n</environment_context>"}]}
+{"type":"message","role":"user","content":[{"type":"input_text","text":"List the routes"}]}
+{"type":"function_call","name":"shell","arguments":"{\"command\":[\"bash\",\"-lc\",\"ls src/routes\"]}","call_id":"call_1"}
+{"type":"function_call_output","call_id":"call_1","output":"{\"output\":\"a.ts\"}"}
+{"record_type":"state"}
+{"type":"message","role":"assistant","content":[{"type":"output_text","text":"There is one route."}]}
+{"type":"message","role":"user","content":[{"type":"input_text","text":"There are two, look again"}]}
