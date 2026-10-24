@@ -8,7 +8,7 @@ import type { StoredFact } from './graph/facts.ts';
 import type { ExportCodeFile } from './graph/portability.ts';
 import { redactSecrets } from './redact.ts';
 import { isSecretPath } from './secrets.ts';
-import type { Cause, Lesson, ParsedSession } from './types.ts';
+import type { Cause, Lesson, ParsedSession, ToolCall } from './types.ts';
 
 export const SYMBOL_KINDS = ['function', 'class', 'interface', 'type', 'const', 'method', 'other'] as const;
 export type SymbolKind = (typeof SYMBOL_KINDS)[number];
@@ -135,6 +135,32 @@ const isoOf = (ts: string): string | null => {
   const d = new Date(ts);
   return Number.isFinite(d.getTime()) ? d.toISOString() : null;
 };
+
+/** `git commit` as a command of its own in a shell line (after git's global options such as -C dir or -c k=v). */
+const GIT_COMMIT = /(?:^|[;&|(\n])\s*git(?:\s+(?:-[cC]\s+\S+|--?[\w-]+(?:=\S+)?))*\s+commit(?![\w-])/;
+
+export const isGitCommit = (command: string): boolean => GIT_COMMIT.test(command);
+
+/**
+ * Evidence that a session did work rather than only read: its file edits (Edit, Write, MultiEdit, NotebookEdit; Codex
+ * apply_patch and file changes arrive as Edit / Write / Delete) and git commits it ran, with the times of the first and
+ * last of them (ISO; null when none had a readable time). A review or a Q&A session has none.
+ */
+export type SessionWork = { edits: number; commits: number; firstAt: string | null; lastAt: string | null };
+
+export function sessionWork(calls: ToolCall[]): SessionWork {
+  const w: SessionWork = { edits: 0, commits: 0, firstAt: null, lastAt: null };
+  for (const c of calls) {
+    if (EDIT_TOOLS.has(c.name)) w.edits++;
+    else if (c.name === 'Bash' && c.command && isGitCommit(c.command)) w.commits++;
+    else continue;
+    const at = isoOf(c.ts);
+    if (!at) continue;
+    if (!w.firstAt || at < w.firstAt) w.firstAt = at;
+    if (!w.lastAt || at > w.lastAt) w.lastAt = at;
+  }
+  return w;
+}
 
 /**
  * The repo files a session read and edited, from its tool calls (Claude Code and Codex alike). Only paths inside

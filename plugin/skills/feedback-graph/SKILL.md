@@ -21,6 +21,10 @@ Call `get_task_context` with your current working directory (`cwd`), a one or tw
 - A file you do not know well: call `get_module_context` with `cwd` and its `path`. It says what the file is, its exported symbols, who imports it, what it imports, the tests that cover it, and the lessons and past misses tied to it.
 - A file other code depends on (an exported function, a shared module, a type): call `impact` with `cwd` and the `paths` you will change. It lists every file that depends on them, the tests to run, and lessons and misses on all of them. Check those dependents and run those tests.
 
+## When you write tests or do QA
+
+Use the test-from-feedback skill: it turns the lessons and past misses for the code you touched into test cases.
+
 ## Before you say "done"
 
 Call `check_before_done` with `cwd`, the task, a summary of what you built **and how you verified it** (include a diff if it is small), and `files_changed`: the files you changed.

@@ -93,11 +93,12 @@ test('CODEX_HOME is respected', () => {
   expect(existsSync(s.config)).toBe(false);
 });
 
-test('Claude Code: links both skills and registers the MCP server with the token', () => {
+test('Claude Code: links the three skills and registers the MCP server with the token', () => {
   const s = sandbox(['claude']);
   s.run([], { API_TOKEN: TOKEN });
-  expect(readlinkSync(join(s.home, '.claude', 'skills', 'feedback-graph'))).toBe(join(repoRoot, 'skill', 'feedback-graph'));
-  expect(readlinkSync(join(s.home, '.claude', 'skills', 'postmortem'))).toBe(join(repoRoot, 'skill', 'postmortem'));
+  expect(readlinkSync(join(s.home, '.claude', 'skills', 'feedback-graph'))).toBe(join(repoRoot, 'plugin', 'skills', 'feedback-graph'));
+  expect(readlinkSync(join(s.home, '.claude', 'skills', 'postmortem'))).toBe(join(repoRoot, 'plugin', 'skills', 'postmortem'));
+  expect(readlinkSync(join(s.home, '.claude', 'skills', 'test-from-feedback'))).toBe(join(repoRoot, 'plugin', 'skills', 'test-from-feedback'));
   expect(readFileSync(s.calls, 'utf8')).toContain(`mcp add --transport http --scope user feedback-graph http://localhost:8787/mcp --header Authorization: Bearer ${TOKEN}`);
   expect(existsSync(s.codexDir)).toBe(false);
 });
@@ -166,8 +167,8 @@ test('--dry-run says what it would change and changes nothing: no files, no link
   // The stand-in claude logs its calls to a file of its own; everything else is untouched.
   const { [s.calls]: _log, ...after } = snapshot(s.home);
   expect(after).toEqual(before);
-  // claude was asked whether the server exists (read-only), never to add it.
-  expect(readFileSync(s.calls, 'utf8').trim().split('\n')).toEqual(['mcp get feedback-graph']);
+  // claude was asked whether the plugin is installed and the server exists (both read-only), never to add it.
+  expect(readFileSync(s.calls, 'utf8').trim().split('\n')).toEqual(['plugin list', 'mcp get feedback-graph']);
   expect(out).toContain('would: link ~/.claude/skills/feedback-graph');
   expect(out).toContain('would: claude mcp add --transport http --scope user feedback-graph http://localhost:8787/mcp');
   expect(out).toContain(`would: add [mcp_servers.feedback-graph] with url = "http://localhost:8787/mcp"`);
@@ -193,4 +194,14 @@ test('a bare ~/.codex/sessions (setup.sh creates it for the Docker mount) does n
   mkdirSync(t.codexDir);
   writeFileSync(t.config, 'model = "o4"\n');
   expect(t.run()).toMatch(/Codex: registered/);
+});
+
+test('Claude Code with the feedback-graph plugin installed: nothing is registered or linked, so the tools are not doubled', () => {
+  const s = sandbox(['claude']);
+  // `claude plugin list` names the plugin.
+  writeFileSync(join(s.home, 'bin', 'claude'), `#!/bin/sh\necho "$*" >> '${s.calls}'\n[ "$1" = plugin ] && echo '  ❯ feedback-graph@feedback-graph'\n[ "$2" = get ] && exit 1\nexit 0\n`);
+  const out = s.run(['claude']);
+  expect(out).toMatch(/plugin/);
+  expect(readFileSync(s.calls, 'utf8')).not.toContain('mcp add');
+  expect(existsSync(join(s.home, '.claude', 'skills', 'feedback-graph'))).toBe(false);
 });

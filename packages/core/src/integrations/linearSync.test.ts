@@ -75,4 +75,30 @@ describe('fetchLinearComments', () => {
     expect(bodies[0].variables).toEqual({ teamId: 'team-1', since: '2026-10-01T00:00:00Z', after: null });
     expect(bodies[1].variables.after).toBe('cur1');
   });
+
+  test('reads the ticket itself: description, state, priority, labels and assignee', async () => {
+    const ticket = {
+      description: '## Goal\nPrices are integers in cents.',
+      state: { name: 'In Progress' },
+      priorityLabel: 'High',
+      labels: { nodes: [{ name: 'billing' }, { name: 'bug' }] },
+      assignee: { name: 'Jo Smith', displayName: 'jo' },
+    };
+    const { fetchImpl, bodies } = stub(() =>
+      Response.json({
+        data: {
+          issues: {
+            pageInfo: { hasNextPage: false, endCursor: null },
+            nodes: [issue('1', [comment('c1', '2026-10-02T00:00:00Z')], ticket), issue('2', [comment('c2', '2026-10-03T00:00:00Z')], { description: null, state: null, priorityLabel: null, labels: null, assignee: null })],
+          },
+        },
+      }),
+    );
+    const [one, two] = await fetchLinearComments({ apiKey: 'k', teamId: 'team-1', since: '2026-10-01T00:00:00Z', fetchImpl });
+    expect(one.issue).toMatchObject({ description: '## Goal\nPrices are integers in cents.', state: 'In Progress', priority: 'High', labels: ['billing', 'bug'], assignee: 'jo' });
+    expect(two.issue).toMatchObject({ description: '', state: null, priority: null, labels: [], assignee: null });
+    expect(bodies[0].query).toMatch(/description/);
+    expect(bodies[0].query).toMatch(/priorityLabel/);
+    expect(bodies[0].query).toMatch(/assignee \{/);
+  });
 });

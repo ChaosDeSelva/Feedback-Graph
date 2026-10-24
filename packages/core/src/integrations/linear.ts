@@ -133,21 +133,38 @@ export async function listLinearTeams(o: { apiKey: string; fetchImpl?: typeof fe
   return [...data.teams.nodes].sort((a, b) => a.name.localeCompare(b.name));
 }
 
-/** A comment on an issue of a team (fetchLinearComments). `branch` is the issue's suggested git branch. */
+/**
+ * A comment on an issue of a team (fetchLinearComments). `branch` is the issue's suggested git branch; `description`
+ * the ticket's markdown ('' when it has none), read with its state, priority, labels and assignee for context.
+ */
 export type LinearComment = {
   id: string;
   author: string;
   body: string;
   url: string;
   createdAt: string;
-  issue: { id: string; identifier: string; title: string; url: string; branch: string | null };
+  issue: {
+    id: string;
+    identifier: string;
+    title: string;
+    url: string;
+    branch: string | null;
+    description: string;
+    state: string | null;
+    priority: string | null;
+    labels: string[];
+    assignee: string | null;
+  };
 };
 
 const TEAM_COMMENTS = `query TeamComments($teamId: ID!, $since: DateTimeOrDuration!, $after: String) {
   issues(first: 50, after: $after, orderBy: updatedAt, filter: { team: { id: { eq: $teamId } }, updatedAt: { gt: $since } }) {
     pageInfo { hasNextPage endCursor }
     nodes {
-      id identifier title url branchName
+      id identifier title url branchName description priorityLabel
+      state { name }
+      labels(first: 20) { nodes { name } }
+      assignee { name displayName }
       comments(first: 100) { nodes { id body url createdAt user { name displayName } botActor { name } } }
     }
   }
@@ -165,6 +182,11 @@ const CommentsPage = z.object({
         title: z.string(),
         url: z.string(),
         branchName: z.string().nullable().optional(),
+        description: z.string().nullable().optional(),
+        priorityLabel: z.string().nullable().optional(),
+        state: z.object({ name: z.string() }).nullable().optional(),
+        labels: z.object({ nodes: z.array(z.object({ name: z.string() })) }).nullable().optional(),
+        assignee: z.object({ name: z.string(), displayName: z.string().nullable().optional() }).nullable().optional(),
         comments: z.object({
           nodes: z.array(
             z.object({
@@ -192,6 +214,18 @@ export async function fetchLinearComments(o: { apiKey: string; teamId: string; s
   for (let page = 0; page < MAX_LINEAR_PAGES; page++) {
     const data = CommentsPage.parse(await linearRequest(o.apiKey, TEAM_COMMENTS, { teamId: o.teamId, since: o.since, after }, o.fetchImpl ?? fetch));
     for (const i of data.issues.nodes) {
+      const issue: LinearComment['issue'] = {
+        id: i.id,
+        identifier: i.identifier,
+        title: i.title,
+        url: i.url,
+        branch: i.branchName ?? null,
+        description: i.description ?? '',
+        state: i.state?.name ?? null,
+        priority: i.priorityLabel ?? null,
+        labels: (i.labels?.nodes ?? []).map((l) => l.name),
+        assignee: i.assignee ? i.assignee.displayName || i.assignee.name : null,
+      };
       for (const c of i.comments.nodes) {
         if (!c.user || c.botActor || !c.body?.trim()) continue;
         out.push({
@@ -200,7 +234,7 @@ export async function fetchLinearComments(o: { apiKey: string; teamId: string; s
           body: c.body,
           url: c.url ?? i.url,
           createdAt: c.createdAt,
-          issue: { id: i.id, identifier: i.identifier, title: i.title, url: i.url, branch: i.branchName ?? null },
+          issue,
         });
       }
     }

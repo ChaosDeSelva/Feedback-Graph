@@ -1,5 +1,5 @@
 import { expect, test } from 'vitest';
-import { expandDependents, hotspotScore, pathMatches, repoRelative, sessionFiles, suggestLessonPaths, touchedAround } from './codegraph.ts';
+import { expandDependents, hotspotScore, isGitCommit, pathMatches, repoRelative, sessionFiles, sessionWork, suggestLessonPaths, touchedAround } from './codegraph.ts';
 import { hostRepoPath } from './projects.ts';
 import type { ParsedSession, ToolCall } from './types.ts';
 
@@ -105,4 +105,28 @@ test('touchedAround splits a session\'s edits into before the feedback and the f
     f('c.ts', '2026-10-01T10:05:00.000Z', '2026-10-01T10:06:00.000Z'),
     f('d.ts', null, null, false),
   ], '2026-10-01T12:02:00+02:00')).toEqual({ edited: ['a.ts', 'b.ts'], fixed: ['b.ts', 'c.ts'] });
+});
+
+test('isGitCommit spots a git commit inside a shell command, and nothing else', () => {
+  for (const c of ['git commit -m "x"', 'git add . && git commit -am fix', 'cd /r; git -C /r commit --amend', 'git -c user.name=a commit', 'git --no-pager commit']) expect(isGitCommit(c), c).toBe(true);
+  for (const c of ['git status', 'git log --grep commit', 'echo git commit', 'gh pr view', 'git commit-tree abc', 'npm run commit']) expect(isGitCommit(c), c).toBe(false);
+});
+
+test('sessionWork counts the edits and commits a session made, and when; reading and other commands are not work', () => {
+  const calls: ToolCall[] = [
+    { name: 'Read', ts: '2026-10-01T09:00:00Z', filePath: '/r/a.ts' },
+    { name: 'Bash', ts: '2026-10-01T09:01:00Z', command: 'git diff' },
+    { name: 'Grep', ts: '2026-10-01T09:02:00Z' },
+  ];
+  expect(sessionWork(calls)).toEqual({ edits: 0, commits: 0, firstAt: null, lastAt: null });
+  const work: ToolCall[] = [
+    ...calls,
+    { name: 'Edit', ts: '2026-10-01T10:00:00+02:00', filePath: '/r/a.ts' },
+    { name: 'Write', ts: '2026-10-01T09:30:00Z', filePath: '/r/b.ts' },
+    { name: 'MultiEdit', ts: 'not a time', filePath: '/r/c.ts' },
+    { name: 'NotebookEdit', ts: '2026-10-01T09:40:00Z', filePath: '/r/n.ipynb' },
+    { name: 'Delete', ts: '2026-10-01T09:45:00Z', filePath: '/r/d.ts' },
+    { name: 'Bash', ts: '2026-10-01T11:00:00Z', command: 'git commit -m done' },
+  ];
+  expect(sessionWork(work)).toEqual({ edits: 5, commits: 1, firstAt: '2026-10-01T08:00:00.000Z', lastAt: '2026-10-01T11:00:00.000Z' });
 });

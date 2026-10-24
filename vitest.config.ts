@@ -7,7 +7,7 @@ export default defineConfig({
         extends: true,
         test: {
           name: 'unit',
-          include: ['packages/{core,worker,api,store-postgres}/src/**/*.test.ts'],
+          include: ['packages/{core,worker,api,store-postgres}/src/**/*.test.ts', 'plugin/hooks/**/*.test.mjs'],
           exclude: ['**/*.int.test.ts', '**/node_modules/**'],
         },
       },

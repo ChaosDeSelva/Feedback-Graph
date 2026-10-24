@@ -90,6 +90,12 @@ async function resolveGlobalOnly(q: ProjectRef, d: ContextDeps): Promise<Project
   return (await d.servesGlobal(folder.key)) && (await d.servesGlobal(p.key)) ? p : null;
 }
 
+/** The selected project a folder is in (alias resolved), for the plugin hooks: they only speak up inside one. */
+export async function trackedProject(q: ProjectRef, d: ContextDeps): Promise<{ project: string | null; tracked: boolean }> {
+  const p = q.cwd || q.project ? await resolveIn(q, d) : null;
+  return { project: p?.key ?? null, tracked: !!p };
+}
+
 const GLOBAL_ONLY = (key: string) =>
   `${key} is not selected in the Feedback Graph, so only lessons that apply to every project are served here. The developer can select it in the Feedback Graph's Settings to have its sessions read and get its own lessons, past misses and code facts.`;
 

@@ -117,13 +117,39 @@ describe('syncExternalFeedback', () => {
   test('Linear comments of the mapped team become one thread per issue', async () => {
     const comment = (id: string, issue: string, createdAt: string): LinearComment => ({
       id, author: 'Pat', body: `c ${id}`, url: `https://linear.app/c/${id}`, createdAt,
-      issue: { id: issue, identifier: `ENG-${issue}`, title: `Issue ${issue}`, url: `https://linear.app/i/${issue}`, branch: `pat/eng-${issue}` },
+      issue: {
+        id: issue, identifier: `ENG-${issue}`, title: `Issue ${issue}`, url: `https://linear.app/i/${issue}`, branch: `pat/eng-${issue}`,
+        description: `Prices are integers in cents. key ghp_${'a'.repeat(36)}\n${'x'.repeat(5000)}`, state: 'In Progress', priority: 'High', labels: ['billing'], assignee: 'jo',
+      },
     });
     const s = setup({ env: { LINEAR_API_KEY: 'lin' }, linear: async () => [comment('a', '1', '2026-10-21T00:00:00Z'), comment('b', '2', '2026-10-21T01:00:00Z'), comment('c', '1', '2026-10-21T02:00:00Z')] });
     await s.integrations.setLink('shop', { linearTeamId: 'team-1', linearTeamName: 'Web' });
     expect(await syncExternalFeedback(s.deps)).toEqual({ github: 0, linear: 3 });
     expect(s.threads.map((t) => [t.id, t.items.map((i) => i.index)])).toEqual([['linear:ENG-1', [1, 2]], ['linear:ENG-2', [1]]]);
     expect(s.threads[0].items[0].external).toMatchObject({ source: 'linear', kind: 'linear_comment', thread: 'ENG-1', branch: 'pat/eng-1' });
+    // The ticket itself rides along, for the Inbox card and the post-mortem: redacted, clipped, with its details.
+    const ext = s.threads[0].items[0].external;
+    expect(ext.ticket).toEqual({ state: 'In Progress', priority: 'High', labels: ['billing'], assignee: 'jo' });
+    expect(ext.description).toMatch(/^Prices are integers in cents\./);
+    expect(ext.description).not.toContain('ghp_');
+    expect(ext.description!.length).toBeLessThanOrEqual(4001);
+  });
+
+  test('a ticket\'s details are redacted and capped like its description', async () => {
+    const long = 'y'.repeat(1000);
+    const s = setup({ env: { LINEAR_API_KEY: 'lin' }, linear: async () => [{
+      id: 'a', author: 'Pat', body: 'c', url: 'https://linear.app/c/a', createdAt: '2026-10-21T00:00:00Z',
+      issue: { id: '1', identifier: 'ENG-1', title: 'T', url: 'https://linear.app/i/1', branch: null, description: '',
+        state: long, priority: `ghp_${'a'.repeat(36)}`, labels: Array.from({ length: 50 }, (_, i) => `l${i}${'z'.repeat(200)}`), assignee: long },
+    }] });
+    await s.integrations.setLink('shop', { linearTeamId: 'team-1', linearTeamName: 'Web' });
+    await syncExternalFeedback(s.deps);
+    const t = s.threads[0].items[0].external.ticket!;
+    expect(t.state!.length).toBeLessThanOrEqual(201);
+    expect(t.assignee!.length).toBeLessThanOrEqual(201);
+    expect(t.priority).not.toContain('ghp_');
+    expect(t.labels).toHaveLength(20);
+    expect(Math.max(...t.labels.map((l) => l.length))).toBeLessThanOrEqual(61);
     expect(s.activity[0].subject).toContain('Linear team Web');
   });
 });
@@ -139,15 +165,37 @@ describe('prThread', () => {
 });
 
 describe('linkWorkSessions', () => {
-  const ws = (id: string, gitBranch: string | null): WorkSession => ({ id, source: 'claude', gitBranch, cwd: '/x', startedAt: null, lastActivityAt: null });
+  const ws = (id: string, gitBranch: string | null, edits = 1, commits = 0): WorkSession => ({ id, source: 'claude', gitBranch, cwd: '/x', startedAt: null, lastActivityAt: null, edits, commits });
+  const graph = (list: WorkSession[]) => ({
+    upsertExternalThread: async () => 0,
+    workSessions: async (q: { branch: string | null }) => list.filter((s) => (q.branch ? s.gitBranch === q.branch : true)),
+  });
 
   test('sessions on the branch win; else exactly one session in the window; several is none', async () => {
-    const graph = (list: WorkSession[]) => ({
-      upsertExternalThread: async () => 0,
-      workSessions: async (q: { branch: string | null }) => list.filter((s) => (q.branch ? s.gitBranch === q.branch : true)),
-    });
     expect(await linkWorkSessions(graph([ws('a', 'feat'), ws('b', 'main')]), 'shop', 'feat', NOW.toISOString())).toEqual(['a']);
     expect(await linkWorkSessions(graph([ws('b', 'main')]), 'shop', 'feat', NOW.toISOString())).toEqual(['b']);
     expect(await linkWorkSessions(graph([ws('b', 'main'), ws('c', 'x')]), 'shop', 'feat', NOW.toISOString())).toEqual([]);
   });
+
+  test('a session that only read (a security review on the branch) is never linked; one that only committed is', async () => {
+    expect(await linkWorkSessions(graph([ws('review', 'feat', 0, 0)]), 'shop', 'feat', NOW.toISOString())).toEqual([]);
+    expect(await linkWorkSessions(graph([ws('review', 'feat', 0, 0), ws('coder', 'main')]), 'shop', 'feat', NOW.toISOString())).toEqual(['coder']);
+    expect(await linkWorkSessions(graph([ws('review', 'feat', 0, 0), ws('commit', 'feat', 0, 1)]), 'shop', 'feat', NOW.toISOString())).toEqual(['commit']);
+  });
+});
+
+test('a PR comment carries the PR description, redacted and clipped; a PR without one has none', () => {
+  const p = { ...pr(7, [{ id: '1', createdAt: '2026-10-22T10:00:00Z' }]), body: `## Why\nCheckout must keep cents. token ghp_${'b'.repeat(36)}\n${'y'.repeat(5000)}` };
+  const ext = prThread(p, 0, []).items[0].external;
+  expect(ext.description).toMatch(/^## Why\nCheckout must keep cents\./);
+  expect(ext.description).not.toContain('ghp_');
+  expect(ext.description!.length).toBeLessThanOrEqual(4001);
+  expect(ext.ticket ?? null).toBeNull();
+  expect(prThread({ ...p, body: '  ' }, 0, []).items[0].external.description).toBeNull();
+});
+
+test('a PR whose branch only had a review session syncs with no work session linked', async () => {
+  const s = setup({ sessions: [{ id: 'review', source: 'claude', gitBranch: 'feat/cart', cwd: '/x', startedAt: null, lastActivityAt: null, edits: 0, commits: 0 }] });
+  await syncExternalFeedback(s.deps);
+  expect(s.threads[0].items[0].external.linkedSessionIds).toEqual([]);
 });

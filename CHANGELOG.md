@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.4.4 (2026-10-24)
+
+### Added
+- **Claude Code plugin** (`plugin/`, with a marketplace at the repo root: `/plugin marketplace add ChaosDeSelva/Feedback-Graph`, then `/plugin install feedback-graph@feedback-graph`). It bundles the MCP server, the skills and four hooks: on each request the task's lessons, past misses and code map are added as context (once per session, then only for lessons not yet shown); before the first edit of a file, its lessons and misses when it has any; before Claude stops, once, a request to run `check_before_done` if it changed files or committed since the last check; after `/clear` or a compaction, what was shown is forgotten. Hooks act only in selected projects, only read, and stay silent when the Feedback Graph is unreachable. `FEEDBACK_GRAPH_URL`, `FEEDBACK_GRAPH_TOKEN`, `FEEDBACK_GRAPH_HOOKS=off`.
+- **`test-from-feedback` skill:** turns the approved lessons and past misses on the code being changed into test cases, runs them with the tests `impact` lists, and reports which lesson each guards.
+- `GET /api/agent/project?cwd=`: whether a folder is a selected project (read-only; for the hooks).
+
+### Changed
+- The skills moved from `skill/` to `plugin/skills/`. `install-agent.sh claude` links them from there (and links the new skill); re-run it once after pulling so the old links are replaced. With the plugin installed, it leaves Claude Code alone, so the tools are never registered twice.
+- **PR descriptions and Linear tickets are read as context.** A comment's Inbox item and its post-mortem show the pull request's description, or the ticket's description, state, priority, labels and assignee.
+
+### Fixed
+- A comment is linked only to an agent session that did the work (edited files or ran `git commit`), not one that only read the repo. Transcripts are re-read once to record this.
+- **Ticket and PR text cannot pose as instructions to the post-mortem.** Descriptions are fenced as untrusted, and lines in them (or in comments) that start like the prompt's own section markers are quoted. Ticket state, priority, assignee and labels are redacted and capped like the description.
+
 ## 0.4.3 (2026-10-24)
 
 ### Added

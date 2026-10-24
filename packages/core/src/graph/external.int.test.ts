@@ -1,7 +1,7 @@
 import { beforeAll, describe, expect, test } from 'vitest';
 import type { ExternalThread, Store } from '../store.ts';
 import { describeStores } from '../testing/index.ts';
-import type { Classification, ExternalRef, ParsedSession, Project } from '../types.ts';
+import type { Classification, ExternalRef, ParsedSession, Project, ToolCall } from '../types.ts';
 
 const project: Project = { key: 'shop', name: 'shop', repoPath: '/vibe/shop' };
 const pushback: Classification = { label: 'pushback', confidence: 0.9, summary: 'missing null check', signals: [] };
@@ -36,7 +36,8 @@ const thread = (n: number): ExternalThread => ({
   })),
 });
 
-function work(id: string, branch: string | null, startedAt: string, endedAt: string): ParsedSession {
+/** An agent session; by default it edited one file as it started. `calls` replaces its tool calls. */
+function work(id: string, branch: string | null, startedAt: string, endedAt: string, calls?: ToolCall[]): ParsedSession {
   return {
     sessionId: id,
     sourceFile: `/t/${id}.jsonl`,
@@ -45,9 +46,13 @@ function work(id: string, branch: string | null, startedAt: string, endedAt: str
     startedAt,
     endedAt,
     turns: [{ uuid: `${id}-t1`, sessionId: id, ts: startedAt, index: 0, text: 'build checkout', precedingAssistantText: '', precedingToolCalls: [] }],
-    toolCalls: [],
+    toolCalls: calls ?? [edit(startedAt)],
   };
 }
+
+const edit = (ts: string, name = 'Edit'): ToolCall => ({ name, ts, filePath: '/Users/j/shop/src/cart.ts' });
+const read = (ts: string): ToolCall => ({ name: 'Read', ts, filePath: '/Users/j/shop/src/cart.ts' });
+const bash = (ts: string, command: string): ToolCall => ({ name: 'Bash', ts, command });
 
 describeStores('external feedback threads', (h) => {
   let store: Store;
@@ -70,6 +75,18 @@ describeStores('external feedback threads', (h) => {
     const d = await store.graph.candidateDetail(c.id);
     expect(d?.turn.external?.author).toBe('reviewer');
     expect(d?.after.map((t) => t.index)).toEqual([2]);
+  });
+
+  test('a comment keeps its ticket: description (redacted) and details reach the Inbox item', async () => {
+    const ticket = { state: 'In Review', priority: 'High', labels: ['billing'], assignee: 'jo' };
+    const t = thread(1);
+    t.items[0].external = { ...ref(1), source: 'linear', kind: 'linear_comment', description: `Keep cents. ghp_${'c'.repeat(36)}`, ticket };
+    await store.graph.upsertExternalThread(project, t);
+    await store.graph.saveClassification('github:acme/shop#7/c1', pushback, true);
+    const d = await store.graph.candidateDetail('github:acme/shop#7/c1');
+    expect(d?.turn.external).toMatchObject({ ticket });
+    expect(d?.turn.external?.description).toMatch(/^Keep cents\./);
+    expect(d?.turn.external?.description).not.toContain('ghp_');
   });
 
   test('syncing the thread again adds only new comments and keeps classifications', async () => {
@@ -117,14 +134,54 @@ describeStores('external feedback threads', (h) => {
       await store.graph.upsertExternalThread(project, thread(1));
       const found = await store.graph.workSessions({ projectKey: 'shop', branch: 'feat/checkout', before: '2026-10-02T10:01:00Z', limit: 5 });
       expect(found.map((s) => s.id)).toEqual(['b', 'a']);
-      expect(found[0]).toMatchObject({ source: 'claude', gitBranch: 'feat/checkout', cwd: '/Users/j/shop' });
+      expect(found[0]).toMatchObject({ source: 'claude', gitBranch: 'feat/checkout', cwd: '/Users/j/shop', edits: 1, commits: 0 });
     });
 
-    test('without a branch, finds sessions active in the time window', async () => {
+    test('a session that only read on the branch (a review, a question) is never the work session', async () => {
+      const at = '2026-10-01T11:00:00Z';
+      const review = [read(at), bash(at, 'git diff main...HEAD'), bash(at, 'git log --grep commit')];
+      await store.graph.upsertSession(project, work('review', 'feat/checkout', at, '2026-10-01T12:00:00Z', review), []);
+      const q = { projectKey: 'shop', branch: 'feat/checkout', before: '2026-10-02T10:01:00Z', limit: 5 };
+      expect(await store.graph.workSessions(q)).toEqual([]);
+      await store.graph.upsertSession(project, work('coder', 'feat/checkout', '2026-10-01T09:00:00Z', '2026-10-01T10:00:00Z'), []);
+      expect((await store.graph.workSessions(q)).map((s) => s.id)).toEqual(['coder']);
+      // Read in the window, nothing else: not a candidate without a branch either.
+      expect((await store.graph.workSessions({ ...q, branch: null, after: '2026-09-30T00:00:00Z' })).map((s) => s.id)).toEqual(['coder']);
+    });
+
+    test('a git commit counts as work; the session with the most edits comes first, then the most recent', async () => {
+      const t = (h: number) => `2026-10-01T${String(h).padStart(2, '0')}:00:00Z`;
+      await store.graph.upsertSession(project, work('many', 'feat/checkout', t(8), t(9), [edit(t(8)), edit(t(8), 'Write'), edit(t(8), 'MultiEdit')]), []);
+      await store.graph.upsertSession(project, work('few', 'feat/checkout', t(10), t(11), [edit(t(10))]), []);
+      await store.graph.upsertSession(project, work('committer', 'feat/checkout', t(12), t(13), [bash(t(12), 'git add -A && git commit -m wip')]), []);
+      const found = await store.graph.workSessions({ projectKey: 'shop', branch: 'feat/checkout', before: '2026-10-02T10:01:00Z', limit: 5 });
+      expect(found.map((s) => s.id)).toEqual(['many', 'few', 'committer']);
+      expect(found[2]).toMatchObject({ edits: 0, commits: 1 });
+    });
+
+    test('work done only after the comment does not count', async () => {
+      await store.graph.upsertSession(project, work('later', 'feat/checkout', '2026-10-02T09:00:00Z', '2026-10-02T12:00:00Z', [read('2026-10-02T09:00:00Z'), edit('2026-10-02T11:00:00Z')]), []);
+      expect(await store.graph.workSessions({ projectKey: 'shop', branch: 'feat/checkout', before: '2026-10-02T10:01:00Z', limit: 5 })).toEqual([]);
+      expect(await store.graph.workSessions({ projectKey: 'shop', branch: 'feat/checkout', before: '2026-10-02T11:30:00Z', limit: 5 })).toHaveLength(1);
+    });
+
+    test('re-ingesting a session updates its work', async () => {
+      const at = '2026-10-01T09:00:00Z';
+      await store.graph.upsertSession(project, work('s', 'feat/checkout', at, at, [read(at)]), []);
+      const q = { projectKey: 'shop', branch: 'feat/checkout', before: '2026-10-02T10:01:00Z', limit: 5 };
+      expect(await store.graph.workSessions(q)).toEqual([]);
+      await store.graph.upsertSession(project, work('s', 'feat/checkout', at, '2026-10-01T10:00:00Z', [read(at), edit('2026-10-01T10:00:00Z')]), []);
+      expect(await store.graph.workSessions(q)).toMatchObject([{ id: 's', edits: 1 }]);
+    });
+
+    test('without a branch, finds sessions that did work in the time window', async () => {
       await store.graph.upsertSession(project, work('old', null, '2026-09-01T09:00:00Z', '2026-09-01T10:00:00Z'), []);
       await store.graph.upsertSession(project, work('recent', null, '2026-10-01T09:00:00Z', '2026-10-01T10:00:00Z'), []);
+      await store.graph.upsertSession(project, work('reader', null, '2026-10-01T09:00:00Z', '2026-10-01T11:00:00Z', [read('2026-10-01T09:00:00Z')]), []);
+      // Started long before, but its edits were in the window.
+      await store.graph.upsertSession(project, work('long', null, '2026-09-01T09:00:00Z', '2026-10-01T08:00:00Z', [read('2026-09-01T09:00:00Z'), edit('2026-10-01T08:00:00Z')]), []);
       const found = await store.graph.workSessions({ projectKey: 'shop', branch: null, after: '2026-09-30T00:00:00Z', before: '2026-10-02T00:00:00Z', limit: 5 });
-      expect(found.map((s) => s.id)).toEqual(['recent']);
+      expect(found.map((s) => s.id)).toEqual(['recent', 'long']);
       expect(await store.graph.workSessions({ projectKey: 'shop', branch: null, before: '2026-10-02T00:00:00Z', limit: 5 })).toEqual([]);
     });
   });

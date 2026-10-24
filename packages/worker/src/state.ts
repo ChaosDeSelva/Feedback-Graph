@@ -14,9 +14,10 @@ function list(json: string | null | undefined): string[] {
 
 /**
  * Bump when ingest starts storing something new about a session, so transcripts read before are read once more
- * (re-ingesting is idempotent). 1: touched files (recordSessionFiles).
+ * (re-ingesting is idempotent). 1: touched files (recordSessionFiles). 2: a session's work (edits and git commits,
+ * sessionWork()), without which it is never linked to a GitHub or Linear comment.
  */
-export const INGEST_VERSION = 1;
+export const INGEST_VERSION = 2;
 
 /**
  * The worker's own bookkeeping (never in the graph): which memory files and session transcripts were read

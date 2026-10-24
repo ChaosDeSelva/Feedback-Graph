@@ -1,6 +1,6 @@
 import { shownProjects, type ActivityInput, type Lesson } from '@fb/core';
 import { describe, expect, test } from 'vitest';
-import { checkBeforeDone, getImpact, getModuleContext, getTaskContext, makeJudge, reportFeedback, resolveProject, taskFiles, type ContextDeps } from './context.ts';
+import { checkBeforeDone, getImpact, getModuleContext, getTaskContext, makeJudge, reportFeedback, resolveProject, taskFiles, trackedProject, type ContextDeps } from './context.ts';
 
 const roots = [{ host: '/Users/j/Vibe', container: '/vibe' }];
 const lesson = (id: string, title: string, over: Partial<Lesson> = {}): Lesson => ({
@@ -417,4 +417,13 @@ describe('lessons learned in a project that is not selected are never served to 
     expect((await getModuleContext({ project: 'demo', path: 'src/a.ts' }, d)).module!.lessons.map((l) => l.id)).toEqual(['l1']);
     expect((await getImpact({ project: 'demo', paths: ['src/a.ts'] }, d)).impact!.lessons.map((l) => l.id)).toEqual(['l1']);
   });
+});
+
+test('trackedProject names the selected project a folder is in, and nothing for any other folder', async () => {
+  const d = deps({ inScope: (k) => k === 'demo' });
+  expect(await trackedProject({ cwd: '/Users/j/Vibe/demo/src' }, d)).toEqual({ project: 'demo', tracked: true });
+  // Under a root but not selected: hooks stay quiet there.
+  expect(await trackedProject({ cwd: '/Users/j/Vibe/other' }, d)).toEqual({ project: null, tracked: false });
+  expect(await trackedProject({ cwd: '/tmp/x' }, d)).toEqual({ project: null, tracked: false });
+  expect(await trackedProject({}, d)).toEqual({ project: null, tracked: false });
 });

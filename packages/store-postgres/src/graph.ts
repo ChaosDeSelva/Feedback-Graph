@@ -7,6 +7,7 @@ import {
   REPORT_MERGE_MINUTES,
   postmortemState,
   redactSecrets,
+  sessionWork,
   type Candidate,
   type CandidateDetail,
   type CandidateFilter,
@@ -63,6 +64,7 @@ export class PgGraphStore implements GraphStore {
   }
 
   async upsertSession(project: Project, s: ParsedSession, commits: Commit[]): Promise<void> {
+    const work = sessionWork(s.toolCalls ?? []);
     await tx(this.db, async (c) => {
       await c.query(UTC);
       await c.query(
@@ -72,17 +74,21 @@ export class PgGraphStore implements GraphStore {
         [project.key, project.name ?? null, project.repoPath ?? null, project.remote ?? null],
       );
       await c.query(
-        `INSERT INTO sessions (id, project_key, source, source_file, cwd, git_branch, started_at, ended_at, final_reply_text, final_reply_ts)
-         VALUES ($1, $2, $3, $4, $5, $6, $7::timestamptz, $8::timestamptz, $9, $10)
+        `INSERT INTO sessions (id, project_key, source, source_file, cwd, git_branch, started_at, ended_at, final_reply_text, final_reply_ts,
+                               work_edits, work_commits, first_work_at, last_work_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7::timestamptz, $8::timestamptz, $9, $10, $11, $12, $13::timestamptz, $14::timestamptz)
          ON CONFLICT (id) DO UPDATE SET project_key = EXCLUDED.project_key, source = EXCLUDED.source,
            source_file = EXCLUDED.source_file, cwd = EXCLUDED.cwd, git_branch = EXCLUDED.git_branch,
            started_at = EXCLUDED.started_at, ended_at = EXCLUDED.ended_at,
-           final_reply_text = EXCLUDED.final_reply_text, final_reply_ts = EXCLUDED.final_reply_ts`,
+           final_reply_text = EXCLUDED.final_reply_text, final_reply_ts = EXCLUDED.final_reply_ts,
+           work_edits = EXCLUDED.work_edits, work_commits = EXCLUDED.work_commits,
+           first_work_at = EXCLUDED.first_work_at, last_work_at = EXCLUDED.last_work_at`,
         [
           s.sessionId, project.key, s.source ?? 'claude', s.sourceFile ?? null, s.cwd ?? null, s.gitBranch ?? null, maybeTime(s.startedAt), maybeTime(s.endedAt),
           // Redacted by the parser, and again here: it is stored like a turn's text.
           s.finalReply ? redactSecrets(s.finalReply.text) : null,
           s.finalReply?.ts ?? null,
+          work.edits, work.commits, work.firstAt, work.lastAt,
         ],
       );
       if (s.turns.length) {
@@ -361,13 +367,15 @@ export class PgGraphStore implements GraphStore {
 
   async workSessions(q: { projectKey: string; branch: string | null; before: string; after?: string | null; limit: number }): Promise<WorkSession[]> {
     const { rows } = await this.q(
-      `SELECT s.id, s.source, s.git_branch, s.cwd, s.started_at, coalesce(s.last_activity_at, s.ended_at) AS last_at
+      `SELECT s.id, s.source, s.git_branch, s.cwd, s.started_at, coalesce(s.last_activity_at, s.ended_at) AS last_at,
+              s.work_edits, s.work_commits
        FROM sessions s
        WHERE s.project_key = $1 AND NOT s.manual AND s.started_at IS NOT NULL AND s.started_at <= $3::timestamptz
+         AND s.work_edits + s.work_commits > 0 AND s.first_work_at <= $3::timestamptz
          AND CASE WHEN $2::text IS NULL
-               THEN $4::timestamptz IS NOT NULL AND coalesce(s.last_activity_at, s.ended_at, s.started_at) >= $4::timestamptz
+               THEN $4::timestamptz IS NOT NULL AND s.last_work_at >= $4::timestamptz
                ELSE s.git_branch = $2 END
-       ORDER BY coalesce(s.last_activity_at, s.ended_at, s.started_at) DESC, s.id LIMIT $5`,
+       ORDER BY s.work_edits DESC, s.last_work_at DESC, s.id LIMIT $5`,
       [q.projectKey, q.branch, q.before, q.after ?? null, q.limit],
     );
     return rows.map((r) => ({
@@ -377,6 +385,8 @@ export class PgGraphStore implements GraphStore {
       cwd: r.cwd ?? null,
       startedAt: iso(r.started_at),
       lastActivityAt: iso(r.last_at),
+      edits: Number(r.work_edits),
+      commits: Number(r.work_commits),
     }));
   }
 

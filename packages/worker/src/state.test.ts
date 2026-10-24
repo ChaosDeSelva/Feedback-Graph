@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { expect, test } from 'vitest';
-import { FileState } from './state.ts';
+import { FileState, INGEST_VERSION } from './state.ts';
 
 test('changed() is true until marked, and again when size or mtime moves', () => {
   const st = new FileState(':memory:');
@@ -90,12 +90,14 @@ test('a state file from before folder keys opens and keeps its marks', () => {
   raw.exec('CREATE TABLE files (path TEXT PRIMARY KEY, size INTEGER, mtime REAL)');
   raw.exec(`INSERT INTO files VALUES ('/m/x.md', 1, 1)`);
   raw.exec('CREATE TABLE ingested (path TEXT PRIMARY KEY, size INTEGER, mtime REAL, read_at REAL, version INTEGER NOT NULL DEFAULT 0)');
-  raw.exec(`INSERT INTO ingested VALUES ('/t/a.jsonl', 1, 1, 5, 1)`);
+  raw.exec(`INSERT INTO ingested VALUES ('/t/a.jsonl', 1, 1, 5, ${INGEST_VERSION})`);
+  raw.exec(`INSERT INTO ingested VALUES ('/t/old.jsonl', 1, 1, 5, ${INGEST_VERSION - 1})`);
   raw.exec('CREATE TABLE heads (path TEXT PRIMARY KEY, size INTEGER, cwd TEXT, human INTEGER)');
   raw.close();
   const s = new FileState(path);
   expect(s.changed('/m/x.md', 1, 1)).toBe(false);
   expect(s.ingestState('/t/a.jsonl', 1, 1)).toEqual({ changed: false, readAt: 5, skipped: [] });
+  expect(s.ingestState('/t/old.jsonl', 1, 1).changed).toBe(true); // read by an older ingest: read again
   expect(s.getCwds('/c/r.jsonl')).toBeNull();
 });
 

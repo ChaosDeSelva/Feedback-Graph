@@ -1,5 +1,6 @@
 import type { CandidateDetail as Detail, ExternalRef, FeedbackSource } from './api.ts';
 import type { HumanTurn } from '@fb/core';
+import { Fragment } from 'react';
 import { sessionHref } from './links.ts';
 import { Badge, Card, SectionLabel, StatusBadge, tableClass, tdClass, type Tone } from './ui/display.tsx';
 import { Markdown } from './ui/Markdown.tsx';
@@ -41,13 +42,21 @@ function TurnBlock({ turn, flagged }: { turn: HumanTurn; flagged?: boolean }) {
   );
 }
 
-/** The PR or issue a comment was on, the code it was about, and the agent session that did the work. */
+/**
+ * The PR or issue a comment was on (for a Linear ticket its state, priority, labels and assignee), its description,
+ * the code the comment was about, and the agent session that did the work.
+ */
 function ExternalContext({ ext }: { ext: ExternalRef }) {
   const where = ext.source === 'github' ? 'Pull request' : 'Linear issue';
+  const t = ext.ticket;
+  const facts: [string, string | null | undefined][] = t
+    ? [['State', t.state], ['Priority', t.priority], ['Labels', t.labels?.length ? t.labels.join(', ') : null], ['Assignee', t.assignee]]
+    : [];
   return (
     <Card title={`${where} ${ext.thread}`} actions={<a href={ext.threadUrl} target="_blank" rel="noreferrer noopener" className="text-xs font-medium text-accent-text underline underline-offset-2">Open on {ext.source === 'github' ? 'GitHub' : 'Linear'}</a>} bodyClass="grid gap-2 px-3 py-2.5">
       <p className="font-medium [overflow-wrap:anywhere]">{ext.title}</p>
       <dl className="grid gap-x-4 gap-y-0.5 text-[12.5px] sm:grid-cols-[auto_1fr]">
+        {facts.filter(([, v]) => v).map(([k, v]) => (<Fragment key={k}><dt className="text-muted">{k}</dt><dd className="[overflow-wrap:anywhere]">{v}</dd></Fragment>))}
         {ext.branch && (<><dt className="text-muted">Branch</dt><dd className="font-mono text-[12px] [overflow-wrap:anywhere]">{ext.branch}</dd></>)}
         <dt className="text-muted">Work session</dt>
         <dd>
@@ -56,7 +65,13 @@ function ExternalContext({ ext }: { ext: ExternalRef }) {
             : <span className="text-muted">none found yet; the post-mortem looks again, and works from the comment alone if there is none</span>}
         </dd>
       </dl>
-      {ext.diffHunk && <pre className="max-h-48 overflow-auto rounded-sm bg-sunken px-2 py-1.5 font-mono text-[11.5px] leading-snug whitespace-pre">{ext.diffHunk}</pre>}
+      {ext.description?.trim() && (
+        <div className="grid gap-1 border-t border-line pt-2">
+          <SectionLabel>Description</SectionLabel>
+          <div className="max-h-64 overflow-auto"><Markdown text={ext.description} className="text-[13px] leading-relaxed" /></div>
+        </div>
+      )}
+      {ext.diffHunk &&<pre className="max-h-48 overflow-auto rounded-sm bg-sunken px-2 py-1.5 font-mono text-[11.5px] leading-snug whitespace-pre">{ext.diffHunk}</pre>}
     </Card>
   );
 }

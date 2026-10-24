@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "feedback-graph": {
+      "type": "http",
+      "url": "${FEEDBACK_GRAPH_URL:-http://localhost:8787}/mcp",
+      "headers": { "Authorization": "Bearer ${FEEDBACK_GRAPH_TOKEN:-none}" }
+    }
+  }
+}

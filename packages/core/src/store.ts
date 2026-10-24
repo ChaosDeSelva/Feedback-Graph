@@ -39,8 +39,20 @@ export type ExternalThread = {
   items: { uuid: string; ts: string; index: number; text: string; context: string; external: ExternalRef }[];
 };
 
-/** An agent session that may have done the work a comment is about (GraphStore.workSessions). */
-export type WorkSession = { id: string; source: SessionSource; gitBranch: string | null; cwd: string | null; startedAt: string | null; lastActivityAt: string | null };
+/**
+ * An agent session that did work a comment may be about (GraphStore.workSessions): `edits` file edits and `commits`
+ * git commits over the whole session (sessionWork()).
+ */
+export type WorkSession = {
+  id: string;
+  source: SessionSource;
+  gitBranch: string | null;
+  cwd: string | null;
+  startedAt: string | null;
+  lastActivityAt: string | null;
+  edits: number;
+  commits: number;
+};
 
 export type StoreKind = 'neo4j' | 'postgres';
 export const STORE_KINDS: readonly StoreKind[] = ['neo4j', 'postgres'];
@@ -77,8 +89,10 @@ export interface GraphStore {
    */
   upsertExternalThread(project: Project, t: ExternalThread): Promise<number>;
   /**
-   * Agent sessions of a project (stand-in sessions never) that may have done some work: those on `branch` that started
-   * before `before`, or with no branch, those active between `after` and `before`. Newest activity first.
+   * Agent sessions of a project (stand-in sessions never) that did the work: a session counts only when it edited files
+   * or ran a git commit (sessionWork(), recorded by upsertSession), so a review or a Q&A session never does. Those on
+   * `branch` whose first work was before `before`; with no branch, those whose work overlaps `after`..`before`. Most
+   * edits first, then the most recent work.
    */
   workSessions(q: { projectKey: string; branch: string | null; before: string; after?: string | null; limit: number }): Promise<WorkSession[]>;
   heartbeat(s: WorkerStatus): Promise<void>;

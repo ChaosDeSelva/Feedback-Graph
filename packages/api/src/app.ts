@@ -2,7 +2,7 @@ import { Hono, type Context, type Next } from 'hono';
 import { serveStatic } from '@hono/node-server/serve-static';
 import { z } from 'zod';
 import { ACTIVITY_KINDS, chunkText, MODEL_JOBS, cleanLessonPath, cmp, FACT_KINDS, redactSecrets, selectionNote, type ActivityStore, type CodeGraphStore, type DocsStore, type FactsStore, type GraphStore, type InsightsStore, type ModelHealth, type ModelJob, type OllamaHealth, type KnowledgeStore, type Lesson, type PortabilityStore, type Project, type ProjectSelection, type ProjectSummary, type ShownProjects, type StoreKind, type SystemStatus, type WorkerStatus } from '@fb/core';
-import type { ContextDeps } from './context.ts';
+import { trackedProject, type ContextDeps } from './context.ts';
 import { authenticated, needsAuth, SECURITY_HEADERS, sessionCookie, tokenMatches, type AuthOpts } from './auth.ts';
 import { cloudRoutes, cloudStatus, type CloudDeps } from './cloud.ts';
 import { handleMcp } from './mcp.ts';
@@ -331,6 +331,8 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
   });
 
   if (context) app.all('/mcp', (c) => handleMcp(c.req.raw, context));
+  // Read-only, for the Claude Code plugin's hooks: is this folder a selected project?
+  if (context) app.get('/api/agent/project', async (c) => c.json(await trackedProject({ cwd: c.req.query('cwd') ?? undefined }, context)));
 
   if (facts && projectDirs) {
     // Every page's project list. Settings lists every folder (GET /api/settings/projects); this lists the shown ones.

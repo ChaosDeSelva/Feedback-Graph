@@ -49,17 +49,21 @@ export function githubTarget(p: SyncProject, override?: Map<string, string>): st
   return override?.get(p.key) ?? githubRepoOfRemote(p.remote);
 }
 
+/** A session that edited files or committed; one that only read (a review, a question) never did the work. */
+const didWork = (s: WorkSession) => s.edits + s.commits > 0;
+
 /**
- * The agent sessions that most likely did the work: those of the project on the work's branch that started before
- * the comment; with none, the one session active in the two days before it (several: none, rather than a wrong one).
+ * The agent sessions that most likely did the work: those of the project on the work's branch that edited files or
+ * committed before the comment, most edits first; with none, the one session that did work in the two days before it
+ * (several: none, rather than a wrong one). The store already leaves read-only sessions out; checked again here.
  */
 export async function findWorkSessions(graph: Pick<GraphStore, 'workSessions'>, projectKey: string, branch: string | null, before: string): Promise<WorkSession[]> {
   if (branch) {
-    const onBranch = await graph.workSessions({ projectKey, branch, before, limit: 3 });
+    const onBranch = (await graph.workSessions({ projectKey, branch, before, limit: 3 })).filter(didWork);
     if (onBranch.length) return onBranch;
   }
   const after = new Date(Date.parse(before) - WINDOW_MS).toISOString();
-  const near = await graph.workSessions({ projectKey, branch: null, before, after, limit: 2 });
+  const near = (await graph.workSessions({ projectKey, branch: null, before, after, limit: 2 })).filter(didWork);
   return near.length === 1 ? near : [];
 }
 
@@ -69,10 +73,23 @@ export async function linkWorkSessions(graph: Pick<GraphStore, 'workSessions'>, 
 
 const clip = (s: string, n = CONTEXT_CAP) => (s.length > n ? `${s.slice(0, n)}…` : s);
 
+/** As much of a PR or ticket description as is kept: the cap a PR body has as a docs chunk (github.ts). */
+const DESCRIPTION_CAP = 4000;
+
+/** A ticket's short details (state, priority, assignee), its labels and how many: redacted and capped like the body. */
+const FIELD_CAP = 200;
+const LABEL_CAP = 60;
+const MAX_LABELS = 20;
+const field = (text: string | null | undefined): string | null => (text?.trim() ? clip(redactSecrets(text.trim()), FIELD_CAP) : null);
+
+/** A PR's or ticket's description as stored on its comments: redacted, clipped; null when it has none. */
+const description = (text: string | null | undefined): string | null => (text?.trim() ? clip(redactSecrets(text.trim()), DESCRIPTION_CAP) : null);
+
 /** A PR's comments as a thread: indexes follow creation order over all of them, so they stay put between syncs. */
 export function prThread(pr: PrContext, floorMs: number, linked: string[]): ExternalThread {
   const ordered = [...pr.comments].filter((c) => c.createdAt).sort((a, b) => a.createdAt.localeCompare(b.createdAt));
   const header = `PR ${pr.repo}#${pr.number} "${pr.title}" by ${pr.author} (${pr.state}${pr.headBranch ? `, branch ${pr.headBranch}` : ''})`;
+  const body = description(pr.body);
   return {
     id: `github:${pr.repo}#${pr.number}`,
     source: 'github',
@@ -82,16 +99,24 @@ export function prThread(pr: PrContext, floorMs: number, linked: string[]): Exte
       const external: ExternalRef = {
         source: 'github', kind: c.kind, author: c.author, url: c.url, thread: `${pr.repo}#${pr.number}`, title: pr.title, threadUrl: pr.url,
         path: c.path, line: c.line, diffHunk: c.diffHunk, branch: pr.headBranch, createdAt: c.createdAt, linkedSessionIds: linked,
+        description: body,
       };
       return [{ uuid: `github:${pr.repo}#${pr.number}/${c.kind}/${c.id}`, ts: c.createdAt, index: i + 1, text: c.body, context: clip(`${header}${where}`), external }];
     }),
   };
 }
 
-/** One Linear issue's comments as a thread. */
+/** One Linear issue's comments as a thread, each carrying the ticket: its description, state, priority, labels, assignee. */
 export function linearThread(comments: LinearComment[], floorMs: number, linked: string[]): ExternalThread {
   const ordered = [...comments].sort((a, b) => a.createdAt.localeCompare(b.createdAt));
   const issue = ordered[0].issue;
+  const body = description(issue.description);
+  const ticket = {
+    state: field(issue.state),
+    priority: field(issue.priority),
+    labels: (issue.labels ?? []).slice(0, MAX_LABELS).map((l) => clip(redactSecrets(l), LABEL_CAP)),
+    assignee: field(issue.assignee),
+  };
   return {
     id: `linear:${issue.identifier}`,
     source: 'linear',
@@ -100,6 +125,7 @@ export function linearThread(comments: LinearComment[], floorMs: number, linked:
       const external: ExternalRef = {
         source: 'linear', kind: 'linear_comment', author: c.author, url: c.url, thread: issue.identifier, title: issue.title, threadUrl: issue.url,
         path: null, line: null, diffHunk: null, branch: issue.branch, createdAt: c.createdAt, linkedSessionIds: linked,
+        description: body, ticket,
       };
       return [{ uuid: `linear:${issue.identifier}/${c.id}`, ts: c.createdAt, index: i + 1, text: c.body, context: `Linear ${issue.identifier} "${issue.title}"`, external }];
     }),

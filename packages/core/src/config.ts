@@ -2,7 +2,7 @@ import { parseGithubRepos } from './integrations/github.ts';
 import type { Root } from './projects.ts';
 
 /** Bumped with each release; reported by /api/status and the worker heartbeat. */
-export const VERSION = '0.4.3';
+export const VERSION = '0.4.4';
 
 export class ConfigError extends Error {
   readonly problems: string[];

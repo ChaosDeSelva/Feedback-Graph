@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Connect your coding agents to the Feedback Graph.
-#   Claude Code: the MCP server at user scope, and the feedback-graph and postmortem skills linked into ~/.claude/skills.
+#   Claude Code: the MCP server at user scope, and the feedback-graph, postmortem and test-from-feedback skills linked
+#                into ~/.claude/skills. (Or install the Claude Code plugin in plugin/ instead, which adds hooks; see
+#                plugin/README.md. Use one or the other, not both.)
 #   Codex:       the MCP server in $CODEX_HOME/config.toml (default ~/.codex) over streamable HTTP, and the same
 #                guidance in $CODEX_HOME/AGENTS.md, between markers.
 #
@@ -27,7 +29,7 @@ Connect Claude Code and Codex to the Feedback Graph's MCP server.
   (no agent)   every agent found: Claude Code when `claude` is on PATH; Codex when `codex` is on PATH or
                $CODEX_HOME (default ~/.codex) has config.toml or auth.json
   claude       Claude Code only: `claude mcp add --transport http --scope user feedback-graph <url>/mcp`, and the
-               feedback-graph and postmortem skills linked into ~/.claude/skills (links into this folder)
+               feedback-graph, postmortem and test-from-feedback skills linked into ~/.claude/skills (links into this folder)
   codex        Codex only: [mcp_servers.feedback-graph] in $CODEX_HOME/config.toml, and the guidance in
                $CODEX_HOME/AGENTS.md between BEGIN/END feedback-graph markers
   --dry-run    print what would change and change nothing (no files, no links, no claude mcp add)
@@ -100,16 +102,21 @@ backup() {
 }
 
 install_claude() {
-  for s in feedback-graph postmortem; do
+  # The plugin (plugin/) brings the same MCP server and skills, plus hooks: registering them again would double the tools.
+  if claude plugin list 2>/dev/null | grep -q 'feedback-graph@'; then
+    echo "Claude Code: the feedback-graph plugin is installed and already provides the MCP server and skills; nothing to do"
+    return
+  fi
+  for s in feedback-graph postmortem test-from-feedback; do
     local link="$HOME/.claude/skills/$s"
-    if [ "$(readlink "$link" 2>/dev/null || true)" = "$here/skill/$s" ]; then
+    if [ "$(readlink "$link" 2>/dev/null || true)" = "$here/plugin/skills/$s" ]; then
       echo "skill already linked: ~/.claude/skills/$s"
     elif [ "$dry" = 1 ]; then
-      if [ -e "$link" ] || [ -L "$link" ]; then would "replace ~/.claude/skills/$s with a link to $here/skill/$s"
-      else would "link ~/.claude/skills/$s -> $here/skill/$s"; fi
+      if [ -e "$link" ] || [ -L "$link" ]; then would "replace ~/.claude/skills/$s with a link to $here/plugin/skills/$s"
+      else would "link ~/.claude/skills/$s -> $here/plugin/skills/$s"; fi
     else
       mkdir -p "$HOME/.claude/skills"
-      ln -sfn "$here/skill/$s" "$link"
+      ln -sfn "$here/plugin/skills/$s" "$link"
       echo "linked skill: ~/.claude/skills/$s"
     fi
   done

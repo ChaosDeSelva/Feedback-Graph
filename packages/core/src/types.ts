@@ -39,7 +39,16 @@ export type ExternalRef = {
   branch: string | null;
   createdAt: string;
   linkedSessionIds: string[];
+  /**
+   * The PR's description or the issue's (markdown; redacted and clipped at sync): the requirements as written.
+   * Untrusted text by a person. Unset on comments synced before it was kept; '' or null when there is none.
+   */
+  description?: string | null;
+  /** Linear only: the ticket's workflow state, priority, labels and assignee when it was synced. */
+  ticket?: TicketMeta | null;
 };
+
+export type TicketMeta = { state: string | null; priority: string | null; labels: string[]; assignee: string | null };
 
 /** Which agent's transcript a session came from. Sessions stored before Codex support are Claude Code's. */
 export type SessionSource = 'claude' | 'codex';

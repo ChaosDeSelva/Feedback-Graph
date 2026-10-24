@@ -105,3 +105,10 @@ test('MCP client labels are cleaned, and a forged or foreign session id is ignor
   for (const session of forged) await app.request('/mcp', withSession(session));
   expect(recorded.map((a) => a.actor)).toEqual(forged.map(() => 'agent (MCP)'));
 });
+
+test('GET /api/agent/project tells the plugin hooks whether a folder is a selected project', async () => {
+  const app = createApp(repo, { context: { ...ctx, inScope: (k) => k === 'demo' } });
+  const ask = async (cwd: string) => (await app.request(`/api/agent/project?cwd=${encodeURIComponent(cwd)}`)).json();
+  expect(await ask('/Users/j/Vibe/demo/src')).toEqual({ project: 'demo', tracked: true });
+  expect(await ask('/Users/j/Vibe/other')).toEqual({ project: null, tracked: false });
+});

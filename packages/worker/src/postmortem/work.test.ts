@@ -8,7 +8,7 @@ const external = {
   diffHunk: null, branch: 'feat/search', createdAt: '2026-10-02T10:00:00Z', linkedSessionIds: ['b'],
 };
 const input: PostMortemInput = { feedbackId: 'c1', projectKey: 'demo', repoPath: '/vibe/demo', cwd: '', sessionId: 'github:acme/demo#9', feedback: { ...turn, external }, turns: [turn], note: null, source: 'github' };
-const ws = (id: string): WorkSession => ({ id, source: 'codex', gitBranch: 'feat/search', cwd: `/Users/j/${id}`, startedAt: null, lastActivityAt: null });
+const ws = (id: string, edits = 2): WorkSession => ({ id, source: 'codex', gitBranch: 'feat/search', cwd: `/Users/j/${id}`, startedAt: null, lastActivityAt: null, edits, commits: 0 });
 
 test('a transcript item is left alone', async () => {
   const plain = { ...input, feedback: turn };
@@ -19,6 +19,13 @@ test('the linked session is preferred; its turns, cwd and agent stand in for the
   const work = [{ ...turn, uuid: 'w1', sessionId: 'b', index: 0, text: 'build search' }];
   const out = await attachWorkSession(input, { graph: { workSessions: async () => [ws('a'), ws('b')] }, sessions: { turns: async (id) => (id === 'b' ? work : []) } });
   expect(out).toMatchObject({ sessionId: 'b', cwd: '/Users/j/b', source: 'codex', work: { sessionId: 'b', turns: work } });
+});
+
+test('a link stored before to a session that only read is not followed: no work session, the comment alone', async () => {
+  const stale = { ...input, feedback: { ...turn, external: { ...external, linkedSessionIds: ['review'] } } };
+  const out = await attachWorkSession(stale, { graph: { workSessions: async () => [ws('review', 0)] }, sessions: { turns: async () => [turn] } });
+  expect(out.work).toBeNull();
+  expect(out.sessionId).toBe('github:acme/demo#9');
 });
 
 test('no session found: work is null', async () => {

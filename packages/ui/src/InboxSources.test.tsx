@@ -1,5 +1,6 @@
 import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, beforeEach, expect, test, vi } from 'vitest';
+import { CandidateDetail } from './CandidateDetail.tsx';
 import { Inbox } from './Inbox.tsx';
 
 const external = {
@@ -56,4 +57,45 @@ test('a review comment shows the reviewer, the file and diff, links out, and lin
   expect(screen.getByRole('link', { name: 'sess-123' }).getAttribute('href')).toBe('#sessions/sess-1234abcd');
   expect(screen.getByText('fixed')).toBeTruthy();
   expect(screen.queryByText('right before')).toBeNull();
+});
+
+const detailOf = (ext: object) => ({
+  candidate: { ...list[1], external: ext },
+  turn: { uuid: 'g1', sessionId: 'x', ts: '2026-10-02T10:00:00Z', index: 1, text: 'prices must be integers in cents', precedingAssistantText: '', precedingToolCalls: [], external: ext },
+  before: [], after: [], commits: [], postmortem: null,
+}) as never;
+
+test('a PR comment card shows the PR description', () => {
+  render(<CandidateDetail detail={detailOf({ ...external, description: '## Why\nCheckout must keep **cents**.' })} />);
+  expect(screen.getByText('Description')).toBeTruthy();
+  expect(screen.getByText('Why')).toBeTruthy();
+  expect(screen.getByText(/Checkout must keep/)).toBeTruthy();
+});
+
+test('a Linear comment card shows the ticket: state, priority, labels, assignee and description', () => {
+  const linear = {
+    ...external, source: 'linear', kind: 'linear_comment', thread: 'ENG-42', title: 'Cents everywhere', threadUrl: 'https://linear.app/acme/issue/ENG-42', path: null, line: null, diffHunk: null,
+    description: 'Store every price as integer cents.', ticket: { state: 'In Review', priority: 'Urgent', labels: ['billing', 'bug'], assignee: 'jo' },
+  };
+  render(<CandidateDetail detail={detailOf(linear)} />);
+  expect(screen.getByText('Linear issue ENG-42')).toBeTruthy();
+  expect(screen.getByText('In Review')).toBeTruthy();
+  expect(screen.getByText('Urgent')).toBeTruthy();
+  expect(screen.getByText('billing, bug')).toBeTruthy();
+  expect(screen.getByText('jo')).toBeTruthy();
+  expect(screen.getByText('Store every price as integer cents.')).toBeTruthy();
+});
+
+test('a card without a description shows no description section', () => {
+  render(<CandidateDetail detail={detailOf(external)} />);
+  expect(screen.queryByText('Description')).toBeNull();
+});
+
+test('a comment with no work session found links none, and says the post-mortem works from the comment', () => {
+  const ext = { ...external, linkedSessionIds: [] };
+  const turn = { uuid: 'g1', sessionId: 'github:acme/shop#7', ts: '2026-10-02T10:00:00Z', index: 1, text: 'prices must be integers in cents', precedingAssistantText: '', precedingToolCalls: [], external: ext };
+  render(<CandidateDetail detail={{ candidate: { ...list[1], external: ext }, turn, before: [], after: [], commits: [], postmortem: null } as never} />);
+  expect(screen.getByText('Work session')).toBeTruthy();
+  expect(screen.getByText(/none found yet/)).toBeTruthy();
+  expect(screen.queryAllByRole('link').map((a) => a.getAttribute('href')).filter((h) => h?.startsWith('#sessions/'))).toEqual([]);
 });

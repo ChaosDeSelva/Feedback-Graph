@@ -1,0 +1,23 @@
+{
+  "description": "Feedback Graph: lessons from past feedback on each request and file, and a check before claiming done",
+  "hooks": {
+    "UserPromptSubmit": [
+      { "hooks": [{ "type": "command", "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/feedback-graph.mjs\" prompt", "timeout": 15 }] }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit|NotebookEdit",
+        "hooks": [{ "type": "command", "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/feedback-graph.mjs\" edit", "timeout": 10 }]
+      }
+    ],
+    "Stop": [
+      { "hooks": [{ "type": "command", "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/feedback-graph.mjs\" stop", "timeout": 10 }] }
+    ],
+    "SessionStart": [
+      {
+        "matcher": "clear|compact",
+        "hooks": [{ "type": "command", "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/feedback-graph.mjs\" session", "timeout": 5 }]
+      }
+    ]
+  }
+}

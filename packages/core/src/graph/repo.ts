@@ -17,6 +17,7 @@ import { MAX_POSTMORTEM_ATTEMPTS } from './knowledge.ts';
 import { SCHEMA } from './schema.ts';
 import { redactSecrets } from '../redact.ts';
 import { latestTime } from '../sessions.ts';
+import { sessionWork } from '../codegraph.ts';
 import { refreshSessionStats } from './sessions.ts';
 
 export type ClassifiableTurn = HumanTurn & { projectKey: string };
@@ -100,7 +101,8 @@ export class GraphRepo implements GraphStore {
        MERGE (s:Session {id: $s.sessionId})
          SET s.sourceFile = $s.sourceFile, s.source = $source, s.cwd = $s.cwd, s.gitBranch = $s.gitBranch,
              s.startedAt = $s.startedAt, s.endedAt = $s.endedAt,
-             s.finalReplyText = $finalReply.text, s.finalReplyTs = $finalReply.ts
+             s.finalReplyText = $finalReply.text, s.finalReplyTs = $finalReply.ts,
+             s.workEdits = $work.edits, s.workCommits = $work.commits, s.firstWorkAt = $work.firstAt, s.lastWorkAt = $work.lastAt
        MERGE (s)-[:IN]->(p)
        WITH s
        UNWIND $turns AS t
@@ -112,6 +114,7 @@ export class GraphRepo implements GraphStore {
         project: { ...project, remote: project.remote ?? null },
         s: { ...s, turns: undefined, toolCalls: undefined, finalReply: undefined },
         source: s.source ?? 'claude',
+        work: sessionWork(s.toolCalls ?? []),
         // Redacted by the parser, and again here: it is stored like a turn's text.
         finalReply: s.finalReply ? { text: redactSecrets(s.finalReply.text), ts: s.finalReply.ts } : { text: null, ts: null },
         turns: s.turns.map((t) => ({ ...t, toolCalls: JSON.stringify(t.precedingToolCalls), precedingToolCalls: undefined })),
@@ -403,10 +406,12 @@ export class GraphRepo implements GraphStore {
     const rows = await this.run(
       `MATCH (p:Project {key: $key})<-[:IN]-(s:Session)
        WHERE NOT coalesce(s.manual, false) AND s.startedAt IS NOT NULL AND datetime(s.startedAt) <= datetime($before)
+         AND coalesce(s.workEdits, 0) + coalesce(s.workCommits, 0) > 0
+         AND s.firstWorkAt IS NOT NULL AND datetime(s.firstWorkAt) <= datetime($before)
          AND CASE WHEN $branch IS NULL
-               THEN $after IS NOT NULL AND datetime(coalesce(s.lastActivityAt, s.endedAt, s.startedAt)) >= datetime($after)
+               THEN $after IS NOT NULL AND datetime(s.lastWorkAt) >= datetime($after)
                ELSE s.gitBranch = $branch END
-       RETURN s ORDER BY coalesce(s.lastActivityAt, s.endedAt, s.startedAt) DESC LIMIT $limit`,
+       RETURN s ORDER BY s.workEdits DESC, datetime(s.lastWorkAt) DESC, s.id LIMIT $limit`,
       { key: q.projectKey, branch: q.branch, before: q.before, after: q.after ?? null, limit: neo4j.int(q.limit) },
     );
     return rows.map((r) => {
@@ -418,6 +423,8 @@ export class GraphRepo implements GraphStore {
         cwd: s.cwd ?? null,
         startedAt: s.startedAt ?? null,
         lastActivityAt: s.lastActivityAt ?? s.endedAt ?? null,
+        edits: Number(s.workEdits ?? 0),
+        commits: Number(s.workCommits ?? 0),
       };
     });
   }

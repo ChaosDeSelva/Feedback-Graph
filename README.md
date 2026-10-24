@@ -37,9 +37,27 @@ open http://localhost:8787                     # 8787 unless you set API_PORT (s
 
 ## Connect your agents
 
+### Claude Code plugin (recommended for Claude Code)
+
+The plugin in [`plugin/`](plugin/README.md) bundles the MCP server, the skills and hooks that use the graph without being asked:
+
+```
+/plugin marketplace add ChaosDeSelva/Feedback-Graph
+/plugin install feedback-graph@feedback-graph
+```
+
+- **On each request**, the task's approved lessons, past misses and code map are added to the prompt (the first time in a session, then only when a lesson not yet shown applies).
+- **Before the first edit of a file**, that file's lessons and past misses, when it has any.
+- **Before it stops**, once: if it changed files and has not run `check_before_done` since, it is asked to.
+- **Skills:** `feedback-graph`, `/postmortem`, and `test-from-feedback`, which turns lessons and past misses into test cases for QA.
+
+Hooks only act in folders you selected in Settings and stay silent when the Feedback Graph is unreachable. Set `FEEDBACK_GRAPH_URL` and `FEEDBACK_GRAPH_TOKEN` (your `API_TOKEN`) in your shell for a non-default install; `FEEDBACK_GRAPH_HOOKS=off` turns the hooks off. Use the plugin **or** `install-agent.sh claude`, not both: with the plugin installed, `install-agent.sh` leaves Claude Code alone. Switching to the plugin from an earlier `install-agent.sh` setup: `claude mcp remove feedback-graph --scope user` and `rm ~/.claude/skills/{feedback-graph,postmortem,test-from-feedback}` first.
+
+### install-agent.sh (Codex, or Claude Code without hooks)
+
 `./scripts/install-agent.sh` sets up every coding agent it finds; `./scripts/install-agent.sh claude` or `... codex` sets up one. It registers `http://localhost:<API_PORT>/mcp` from `.env` (8787 by default); point it at another install with `FEEDBACK_GRAPH_URL=https://feedback.example.com`; when `.env` sets `API_TOKEN`, the MCP server is registered with it as a Bearer header.
 
-- **Claude Code** (`claude` on your PATH): the `feedback-graph` MCP server at user scope (`claude mcp add --transport http`), and the `feedback-graph` and `postmortem` skills linked into `~/.claude/skills`. Type `/postmortem what it missed` to record a miss. The skills are symlinks into this folder, so a `git pull` updates them; if you move or delete this folder, re-run the script (or remove the two links).
+- **Claude Code** (`claude` on your PATH): the `feedback-graph` MCP server at user scope (`claude mcp add --transport http`), and the `feedback-graph`, `postmortem` and `test-from-feedback` skills linked into `~/.claude/skills`. Type `/postmortem what it missed` to record a miss. The skills are symlinks into this folder, so a `git pull` updates them; if you move or delete this folder, re-run the script (or remove the links).
 - **Codex** (`codex` on your PATH, or a `config.toml` or `auth.json` in `~/.codex`; `CODEX_HOME` is respected): a `[mcp_servers.feedback-graph]` table in `~/.codex/config.toml` with the streamable HTTP `url` (and `http_headers` carrying the token, after which the file is made readable by you only), and the same guidance as the skill in `~/.codex/AGENTS.md` between `<!-- BEGIN feedback-graph -->` and `<!-- END feedback-graph -->` markers. Ask Codex to record a miss for the post-mortem path.
 
 `--dry-run` prints what it would change and changes nothing; `--help` lists the options. Re-running is safe: a server already registered is left alone, the guidance block is rewritten only when it changed (the rest of your AGENTS.md is untouched), and a Codex file is copied to `<file>.bak.<time>` before it changes. To change the URL or token, remove the server (`claude mcp remove feedback-graph --scope user`, or delete the table from config.toml) and re-run.
