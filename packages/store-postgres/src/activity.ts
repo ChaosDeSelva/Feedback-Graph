@@ -36,15 +36,16 @@ export class PgActivityStore implements ActivityStore {
     );
   }
 
-  async list(q: { projectKey?: string; kind?: ActivityKind; target?: string; limit?: number }): Promise<Activity[]> {
+  async list(q: { projectKey?: string; projectKeys?: string[]; kind?: ActivityKind; target?: string; limit?: number }): Promise<Activity[]> {
     const { rows } = await this.db.pool.query<Row>(
       `SELECT id, ts, kind, actor, project_key, subject, why, details, targets
          FROM activity
         WHERE ($1::text IS NULL OR project_key = $1) AND ($2::text IS NULL OR kind = $2)
           AND ($3::text IS NULL OR targets @> ARRAY[$3::text])
+          AND ($5::text[] IS NULL OR project_key IS NULL OR project_key = ANY($5))
         ORDER BY seq DESC
         LIMIT $4`,
-      [q.projectKey ?? null, q.kind ?? null, q.target ?? null, q.limit ?? 200],
+      [q.projectKey ?? null, q.kind ?? null, q.target ?? null, q.limit ?? 200, q.projectKeys ?? null],
     );
     return rows.map((r) => ({
       id: r.id, ts: iso(r.ts)!, kind: r.kind, actor: r.actor, projectKey: r.project_key ?? null,

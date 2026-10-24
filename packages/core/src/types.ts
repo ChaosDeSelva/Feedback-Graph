@@ -11,10 +11,41 @@ export type HumanTurn = {
   precedingAssistantText: string;
   /** Tool calls since the previous human turn. */
   precedingToolCalls: ToolCall[];
+  /** Set on a comment synced from GitHub or Linear (its stand-in thread holds one turn per comment). */
+  external?: ExternalRef;
+};
+
+/** Where a piece of feedback came from outside the agent's transcript. */
+export type ExternalSource = 'github' | 'linear';
+export const EXTERNAL_SOURCES: readonly ExternalSource[] = ['github', 'linear'];
+
+/**
+ * A comment from a pull request (GitHub) or an issue (Linear), stored on its turn. `thread` is the PR or issue
+ * (owner/repo#12, ENG-42); `branch` the PR's head branch or the issue's suggested branch, used to find the agent
+ * session that did the work; `linkedSessionIds` those sessions, newest first (empty: none found).
+ */
+export type ExternalRef = {
+  source: ExternalSource;
+  kind: 'review_comment' | 'review' | 'issue_comment' | 'linear_comment';
+  author: string;
+  url: string;
+  thread: string;
+  title: string;
+  threadUrl: string;
+  path: string | null;
+  line: number | null;
+  /** The diff lines a review comment is attached to (GitHub's diff_hunk), clipped. */
+  diffHunk: string | null;
+  branch: string | null;
+  createdAt: string;
+  linkedSessionIds: string[];
 };
 
 /** Which agent's transcript a session came from. Sessions stored before Codex support are Claude Code's. */
 export type SessionSource = 'claude' | 'codex';
+/** Where an Inbox item came from: an agent's transcript, or a comment synced from GitHub or Linear. */
+export type FeedbackSource = SessionSource | ExternalSource;
+export const FEEDBACK_SOURCES: readonly FeedbackSource[] = ['claude', 'codex', 'github', 'linear'];
 
 export type ParsedSession = {
   sessionId: string;
@@ -57,8 +88,10 @@ export type Candidate = {
   turnUuid: string;
   sessionId: string;
   projectKey: string;
-  /** The agent the flagged session ran in. */
-  source: SessionSource;
+  /** The agent the flagged session ran in, or github / linear for a synced comment. */
+  source: FeedbackSource;
+  /** The comment's details, when source is github or linear. */
+  external?: ExternalRef | null;
   classification: Classification;
   status: CandidateStatus;
   createdAt: string;
@@ -109,7 +142,10 @@ export type LessonSource = 'postmortem' | 'memory' | 'manual';
 
 export type Lesson = {
   id: string;
+  /** Who it is served to: its project, or null for a global lesson. */
   projectKey: string | null;
+  /** The project it was learned in (a global lesson keeps it here); null when it has none. Set by the stores. */
+  origin?: string | null;
   title: string;
   rule: string;
   appliesWhen: string;
@@ -131,7 +167,12 @@ export type PostMortemInput = {
   cwd: string;
   sessionId: string;
   /** The agent the session ran in; it decides which instruction files (CLAUDE.md or AGENTS.md) the agent had loaded. Unset: 'claude'. */
-  source?: SessionSource;
+  source?: FeedbackSource;
+  /**
+   * For a comment from GitHub or Linear (feedback.external is set): the agent session that most likely did the work,
+   * filled in by the worker. Absent: no session was found, and the post-mortem works from the comment alone.
+   */
+  work?: { sessionId: string; source: SessionSource; cwd: string; turns: HumanTurn[] } | null;
   feedback: HumanTurn;
   /** All human turns in the session, in order (the flagged one included). */
   turns: HumanTurn[];
@@ -215,6 +256,9 @@ export const ACTIVITY_KINDS = [
   'turns_requeued',
   'bundle_imported',
   'session_summarized',
+  'roots_saved',
+  'integration_changed',
+  'feedback_synced',
 ] as const;
 export type ActivityKind = (typeof ACTIVITY_KINDS)[number];
 
@@ -262,6 +306,17 @@ export type ModelHealth = { provider: string | null; ok: boolean; reason: string
 /** Whether Ollama answers at `url` with the models it is asked for; `reason` says why not. */
 export type OllamaHealth = { url: string; ok: boolean; reason: string | null };
 
+/** Everything Feedback Graph talks to outside the machine or beside it, as the app shell's connections list shows it. */
+export const CONNECTION_NAMES = ['github', 'linear', 'claude', 'codex', 'ollama', 'cloud'] as const;
+export type ConnectionName = (typeof CONNECTION_NAMES)[number];
+export type ConnectionState = 'connected' | 'not_connected' | 'error';
+/**
+ * One connection: its state, where its credential comes from (.env or saved in the app; null when none or not
+ * applicable), one plain sentence (the account, the last sync, or what is wrong and how to fix it) and the Settings
+ * link that manages it. Never a token.
+ */
+export type Connection = { state: ConnectionState; source: 'env' | 'app' | null; detail: string; href: string };
+
 export type SystemStatus = {
   version: string;
   /** The backend everything is stored in (STORE); null when unknown. */
@@ -272,8 +327,11 @@ export type SystemStatus = {
   /** The worker beat within the last few minutes. */
   workerHealthy: boolean;
   authRequired: boolean;
-  /** How many project folders are selected for reading; `note` says plainly when none are. Null when unknown. */
-  selection: { initialized: boolean; tracked: number; note: string | null } | null;
+  /**
+   * How many project folders are selected for reading, and how many project roots are mounted (unset from older APIs);
+   * `note` says plainly when nothing can be read. Null when unknown.
+   */
+  selection: { initialized: boolean; tracked: number; roots?: number; note: string | null } | null;
   /** Feedback Graph Cloud sync: null when off. The token is always shown as [REDACTED]. */
   cloud?: { host: string; token: '[REDACTED]'; intervalMinutes: number | null } | null;
   /** Each job's model from the worker's heartbeat; null when the worker has not reported. */
@@ -282,6 +340,8 @@ export type SystemStatus = {
   givenUpTurns?: number | null;
   /** Ollama, which every embedding (search, get_task_context, check_before_done) needs: null when not checked. */
   ollama?: OllamaHealth | null;
+  /** GitHub, Linear, Claude, Codex, Ollama and cloud sync; null when unknown (an older api leaves it out). */
+  connections?: Record<ConnectionName, Connection> | null;
 };
 
 // ── Session summaries ──────────────────────────────────────────────────

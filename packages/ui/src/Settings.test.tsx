@@ -20,8 +20,10 @@ function body(o: { initialized?: boolean; tracked?: string[] } = {}) {
       row('gone', { path: '', exists: false, git: false, claudeSessions: 2 }),
       row('empty', { git: false }),
     ],
-    outsideRoots: { claudeSessions: 37, codexSessions: 41 },
+    outsideRoots: { claudeSessions: 37, codexSessions: 41, folders: [{ path: '/Users/me/work', claudeSessions: 30, codexSessions: 6 }, { path: '/Users/me/games', claudeSessions: 7, codexSessions: 0 }] },
     roots: ['/Users/me/Vibe'],
+    pendingRoots: null as string[] | null,
+    rootsEditable: true,
     builtAt: '2026-10-22T10:05:00Z',
     codexSessionsFound: true,
   };
@@ -48,6 +50,12 @@ beforeEach(() => {
       const tracked = (JSON.parse(init!.body as string) as { tracked: string[] }).tracked;
       if (failPut) return Response.json({ error: failPut }, { status: 400 });
       state = body({ tracked });
+      return Response.json(state);
+    }
+    if (url === '/api/settings/roots' && method === 'PUT') {
+      const roots = (JSON.parse(init!.body as string) as { roots: string[] }).roots;
+      if (failPut) return Response.json({ error: failPut }, { status: 400 });
+      state = { ...state, pendingRoots: roots.join() === state.roots.join() ? null : roots };
       return Response.json(state);
     }
     if (url === '/api/settings/cleanup') return Response.json({ removed: ['other'], nodesRemoved: 12 });
@@ -146,15 +154,27 @@ test('clean up lists unselected projects with data and needs the typed confirm',
   const section = within(screen.getByRole('region', { name: 'Clean up' }));
   expect(section.getByText('other')).toBeTruthy();
   fireEvent.click(section.getByRole('button', { name: 'Remove data for 1 unselected project' }));
-  const confirm = section.getByRole('button', { name: 'Remove data' }) as HTMLButtonElement;
+  const ask = within(await screen.findByRole('alertdialog', { name: /remove the data of 1 unselected project/i }));
+  expect(ask.getByRole('list', { name: 'will be removed' }).textContent).toBe('other');
+  expect(document.activeElement).toBe(ask.getByRole('button', { name: 'Cancel' }));
+  const confirm = ask.getByRole('button', { name: 'Remove data' }) as HTMLButtonElement;
   expect(confirm.disabled).toBe(true);
-  fireEvent.change(section.getByLabelText(/type remove-unselected/), { target: { value: 'remove' } });
+  fireEvent.change(ask.getByLabelText(/type remove-unselected/), { target: { value: 'remove' } });
   expect(confirm.disabled).toBe(true);
-  fireEvent.change(section.getByLabelText(/type remove-unselected/), { target: { value: 'remove-unselected' } });
+  fireEvent.change(ask.getByLabelText(/type remove-unselected/), { target: { value: 'remove-unselected' } });
   expect(confirm.disabled).toBe(false);
   fireEvent.click(confirm);
   await waitFor(() => expect(calls).toContainEqual({ url: '/api/settings/cleanup', method: 'POST', body: { confirm: 'remove-unselected' } }));
   expect(await section.findByText(/Removed data for other/)).toBeTruthy();
+});
+
+test('cancelling clean up removes nothing', async () => {
+  render(<Settings />);
+  await screen.findByRole('row', { name: 'demo-shop' });
+  fireEvent.click(within(screen.getByRole('region', { name: 'Clean up' })).getByRole('button', { name: 'Remove data for 1 unselected project' }));
+  fireEvent.click(within(await screen.findByRole('alertdialog')).getByRole('button', { name: 'Cancel' }));
+  await waitFor(() => expect(screen.queryByRole('alertdialog')).toBeNull());
+  expect(calls.some((c) => c.url === '/api/settings/cleanup')).toBe(false);
 });
 
 test('clean up is disabled when every project with data is selected', async () => {
@@ -183,8 +203,74 @@ test('with nothing chosen, a callout says nothing is being read', async () => {
 test('sessions outside the roots and the roots themselves are shown', async () => {
   render(<Settings />);
   expect(await screen.findByText(/37 Claude Code and 41 Codex sessions ran outside your project folders/)).toBeTruthy();
-  expect(screen.getByText(/PROJECTS_DIR/)).toBeTruthy();
-  expect(screen.getByText('/Users/me/Vibe')).toBeTruthy();
+  expect(screen.queryByText(/PROJECTS_DIR/)).toBeNull();
+  const roots = within(screen.getByRole('list', { name: 'project roots' }));
+  expect(roots.getByText('/Users/me/Vibe')).toBeTruthy();
+});
+
+const rootsPut = () => calls.filter((c) => c.url === '/api/settings/roots').map((c) => c.body);
+
+test('a folder typed in Add folder is saved as a root, and the banner says how to mount it', async () => {
+  const writeText = vi.fn(async () => {});
+  vi.stubGlobal('navigator', { ...navigator, clipboard: { writeText } });
+  render(<Settings />);
+  fireEvent.change(await screen.findByRole('textbox', { name: 'folder to add' }), { target: { value: '/Users/me/code' } });
+  fireEvent.click(screen.getByRole('button', { name: 'Add folder' }));
+  await waitFor(() => expect(rootsPut()).toEqual([{ roots: ['/Users/me/Vibe', '/Users/me/code'] }]));
+  const banner = await screen.findByRole('status', { name: 'roots not mounted yet' });
+  expect(banner.textContent).toContain('Saved. Run ./scripts/setup.sh to mount these folders (restarts the containers).');
+  expect(within(screen.getByRole('list', { name: 'project roots' })).getByText('not mounted yet')).toBeTruthy();
+  fireEvent.click(within(banner).getByRole('button', { name: /copy/i }));
+  await waitFor(() => expect(writeText).toHaveBeenCalledWith('./scripts/setup.sh'));
+});
+
+test('removing a root asks first in the confirm dialog, then saves the rest', async () => {
+  render(<Settings />);
+  fireEvent.click(await screen.findByRole('button', { name: 'remove /Users/me/Vibe' }));
+  expect(rootsPut()).toEqual([]);
+  const ask = screen.getByRole('alertdialog', { name: 'Remove /Users/me/Vibe from the project roots?' });
+  expect(ask.textContent).toMatch(/no longer listed/);
+  expect(document.activeElement?.textContent).toBe('Cancel');
+  fireEvent.click(within(ask).getByRole('button', { name: 'Cancel' }));
+  expect(screen.queryByRole('alertdialog')).toBeNull();
+  fireEvent.click(screen.getByRole('button', { name: 'remove /Users/me/Vibe' }));
+  fireEvent.click(within(screen.getByRole('alertdialog')).getByRole('button', { name: 'Remove folder' }));
+  await waitFor(() => expect(rootsPut()).toEqual([{ roots: [] }]));
+  expect((await screen.findByRole('status', { name: 'roots not mounted yet' })).textContent).toContain('Run ./scripts/setup.sh');
+  expect(screen.getByText(/Still mounted until then/)).toBeTruthy();
+});
+
+test('the folders outside sessions ran in are suggested with their counts, each one click from being a root', async () => {
+  render(<Settings />);
+  const list = within(await screen.findByRole('list', { name: 'suggested folders' }));
+  expect(list.getByText('/Users/me/work')).toBeTruthy();
+  expect(list.getByText(/30 Claude Code, 6 Codex/)).toBeTruthy();
+  fireEvent.click(list.getByRole('button', { name: 'add /Users/me/games as a root' }));
+  await waitFor(() => expect(rootsPut()).toEqual([{ roots: ['/Users/me/Vibe', '/Users/me/games'] }]));
+});
+
+test('a refused root shows the server reason', async () => {
+  failPut = 'code: give an absolute path';
+  render(<Settings />);
+  fireEvent.change(await screen.findByRole('textbox', { name: 'folder to add' }), { target: { value: 'code' } });
+  fireEvent.click(screen.getByRole('button', { name: 'Add folder' }));
+  expect(await screen.findByText('code: give an absolute path')).toBeTruthy();
+});
+
+test('with no project folder at all, the page says to add one first', async () => {
+  state = { ...body(), roots: [], candidates: [] };
+  render(<Settings />);
+  expect(await screen.findByText('No project folders yet')).toBeTruthy();
+  expect(screen.getAllByText(/Add a project folder/).length).toBeGreaterThan(0);
+});
+
+test('when roots cannot be saved here, it says how to change them instead', async () => {
+  state = { ...body(), rootsEditable: false };
+  render(<Settings />);
+  await screen.findByRole('list', { name: 'project roots' });
+  expect(screen.queryByRole('textbox', { name: 'folder to add' })).toBeNull();
+  expect(screen.queryByRole('button', { name: /remove \// })).toBeNull();
+  expect(screen.getByText(/PROJECTS_DIRS/)).toBeTruthy();
 });
 
 test('server errors are shown in an alert', async () => {

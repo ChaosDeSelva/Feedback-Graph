@@ -1,4 +1,4 @@
-import { act, cleanup, render, screen } from '@testing-library/react';
+import { act, cleanup, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, beforeEach, expect, test, vi } from 'vitest';
 import { App } from './App.tsx';
 
@@ -24,7 +24,7 @@ test('a link to one item (#lessons/<id>) opens its page and keeps the id in the 
   expect(location.hash).toBe('#lessons/l1');
 });
 
-function server(o: { authRequired?: boolean; token?: string; workerHealthy?: boolean; tracked?: number; models?: object; ollama?: object }) {
+function server(o: { authRequired?: boolean; token?: string; workerHealthy?: boolean; tracked?: number; roots?: number; models?: object; ollama?: object }) {
   let signedIn = !o.authRequired;
   const posts: unknown[] = [];
   vi.stubGlobal('fetch', vi.fn(async (url: string, init?: RequestInit) => {
@@ -37,7 +37,7 @@ function server(o: { authRequired?: boolean; token?: string; workerHealthy?: boo
     }
     if (url === '/api/session') return Response.json({ authRequired: !!o.authRequired, authenticated: signedIn });
     if (!signedIn) return Response.json({ error: 'sign in required' }, { status: 401 });
-    if (url === '/api/status') return Response.json({ version: '0.2.0', graph: true, worker: null, workerHealthy: o.workerHealthy ?? true, authRequired: !!o.authRequired, selection: o.tracked === undefined ? null : { initialized: true, tracked: o.tracked, note: o.tracked ? null : 'No projects are selected yet, so no sessions are being read.' }, models: o.models ?? null, ollama: o.ollama ?? null });
+    if (url === '/api/status') return Response.json({ version: '0.2.0', graph: true, worker: null, workerHealthy: o.workerHealthy ?? true, authRequired: !!o.authRequired, selection: o.tracked === undefined ? null : { initialized: true, tracked: o.tracked, roots: o.roots, note: o.roots === 0 ? 'No project folders yet: add a project folder in Settings first.' : o.tracked ? null : 'No projects are selected yet, so no sessions are being read.' }, models: o.models ?? null, ollama: o.ollama ?? null });
     return Response.json([]);
   }));
   return { posts };
@@ -68,6 +68,30 @@ test('the header says plainly when no projects are selected, so nothing is being
   render(<App />);
   const badge = await screen.findByText(/no projects selected/i);
   expect(badge.closest('[title]')?.getAttribute('title')).toMatch(/no sessions are being read/);
+});
+
+test('with no project folder at all, the header points to Settings to add one', async () => {
+  server({ tracked: 0, roots: 0 });
+  render(<App />);
+  const badge = await screen.findByText(/no project folders/i);
+  expect(badge.closest('[title]')?.getAttribute('title')).toMatch(/add a project folder in Settings first/);
+});
+
+test('with no projects selected, every page but Settings says nothing is shown and links to Settings', async () => {
+  server({ tracked: 0 });
+  render(<App />);
+  const note = await screen.findByRole('status', { name: 'no projects selected' });
+  expect(note.textContent).toMatch(/only the projects you select in Settings are shown/i);
+  expect(within(note).getByRole('link', { name: 'Settings' }).getAttribute('href')).toBe('#settings');
+  await act(async () => { screen.getByRole('button', { name: 'Settings' }).click(); });
+  expect(screen.queryByRole('status', { name: 'no projects selected' })).toBeNull();
+});
+
+test('with projects selected there is no such note', async () => {
+  server({ tracked: 1 });
+  render(<App />);
+  await screen.findByText(/worker running/i);
+  expect(screen.queryByRole('status', { name: 'no projects selected' })).toBeNull();
 });
 
 test('the header names an unavailable model in its label, with the reason in the tooltip', async () => {
@@ -136,16 +160,19 @@ function settingsServer() {
   }));
 }
 
-test('leaving Settings with an unsaved selection asks first, from the sidebar or a link', async () => {
+test('leaving Settings with an unsaved selection asks first in a dialog, from the sidebar or a link', async () => {
   const { fireEvent } = await import('@testing-library/react');
   settingsServer();
   location.hash = '#settings';
-  const confirm = vi.spyOn(window, 'confirm').mockReturnValue(false);
+  const browserConfirm = vi.spyOn(window, 'confirm');
   try {
     render(<App />);
     fireEvent.click(await screen.findByRole('checkbox', { name: 'read other' }));
     await act(async () => { screen.getByRole('button', { name: 'Inbox' }).click(); });
-    expect(confirm).toHaveBeenCalledTimes(1);
+    const ask = await screen.findByRole('alertdialog', { name: /leave without saving/i });
+    expect(ask.textContent).toContain('Your folder selection is not saved.');
+    fireEvent.click(within(ask).getByRole('button', { name: 'Cancel' }));
+    await waitFor(() => expect(screen.queryByRole('alertdialog')).toBeNull());
     expect(screen.getByRole('button', { name: 'Settings' }).getAttribute('aria-current')).toBe('page');
     expect((screen.getByRole('checkbox', { name: 'read other' }) as HTMLInputElement).checked).toBe(true);
 
@@ -153,7 +180,10 @@ test('leaving Settings with an unsaved selection asks first, from the sidebar or
       location.hash = 'activity';
       window.dispatchEvent(new HashChangeEvent('hashchange'));
     });
-    expect(confirm).toHaveBeenCalledTimes(2);
+    // The address goes back at once; the page stays until you answer.
+    expect(location.hash).toBe('#settings');
+    fireEvent.keyDown(await screen.findByRole('alertdialog'), { key: 'Escape' });
+    await waitFor(() => expect(screen.queryByRole('alertdialog')).toBeNull());
     expect(screen.getByRole('button', { name: 'Settings' }).getAttribute('aria-current')).toBe('page');
     expect(location.hash).toBe('#settings');
 
@@ -162,26 +192,22 @@ test('leaving Settings with an unsaved selection asks first, from the sidebar or
     window.dispatchEvent(unload);
     expect(unload.defaultPrevented).toBe(true);
 
-    confirm.mockReturnValue(true);
     await act(async () => { screen.getByRole('button', { name: 'Inbox' }).click(); });
-    expect(screen.getByRole('button', { name: 'Inbox' }).getAttribute('aria-current')).toBe('page');
+    fireEvent.click(await screen.findByRole('button', { name: 'Discard changes' }));
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Inbox' }).getAttribute('aria-current')).toBe('page'));
     const after = new Event('beforeunload', { cancelable: true });
     window.dispatchEvent(after);
     expect(after.defaultPrevented).toBe(false);
+    expect(browserConfirm).not.toHaveBeenCalled();
   } finally {
-    confirm.mockRestore();
+    browserConfirm.mockRestore();
   }
 });
 
 test('with nothing unsaved, moving between pages never asks', async () => {
-  const confirm = vi.spyOn(window, 'confirm').mockReturnValue(false);
-  try {
-    render(<App />);
-    await act(async () => { screen.getByRole('button', { name: 'Settings' }).click(); });
-    await act(async () => { screen.getByRole('button', { name: 'Inbox' }).click(); });
-    expect(screen.getByRole('button', { name: 'Inbox' }).getAttribute('aria-current')).toBe('page');
-    expect(confirm).not.toHaveBeenCalled();
-  } finally {
-    confirm.mockRestore();
-  }
+  render(<App />);
+  await act(async () => { screen.getByRole('button', { name: 'Settings' }).click(); });
+  await act(async () => { screen.getByRole('button', { name: 'Inbox' }).click(); });
+  expect(screen.getByRole('button', { name: 'Inbox' }).getAttribute('aria-current')).toBe('page');
+  expect(screen.queryByRole('alertdialog')).toBeNull();
 });

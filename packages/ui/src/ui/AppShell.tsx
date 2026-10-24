@@ -18,11 +18,13 @@ const focusables = (root: HTMLElement | null) =>
  * The frame around every page: a sidebar with the product, grouped pages and the worker's health,
  * collapsible to icons on wide screens and folded into a top bar with a menu on phones.
  */
-export function AppShell<K extends string>({ groups, current, onNavigate, health, children }: {
+export function AppShell<K extends string>({ groups, current, onNavigate, health, connections, children }: {
   groups: NavGroup<K>[];
   current: K;
   onNavigate: (k: K) => void;
   health: Health | null;
+  /** The connections indicator, shown above the health badge; given whether the sidebar is collapsed. */
+  connections?: (collapsed: boolean) => ReactNode;
   children: ReactNode;
 }) {
   const [collapsed, setCollapsed] = useState(() => loadPref(COLLAPSED) === '1');
@@ -116,6 +118,7 @@ export function AppShell<K extends string>({ groups, current, onNavigate, health
           </nav>
 
           <div className="grid shrink-0 gap-1 border-t border-line p-2">
+            {connections?.(collapsed)}
             {health && <HealthBadge health={health} collapsed={collapsed} />}
             <div className={`flex gap-1 ${collapsed ? 'md:flex-col' : ''}`}>
               <button

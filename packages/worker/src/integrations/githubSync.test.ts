@@ -4,8 +4,8 @@ import { reposInScope, syncGithub, type GithubSyncDeps } from './githubSync.ts';
 
 const pr = (n: number, body = 'adds orders'): PrContext => ({
   repo: 'acme/shop', number: n, title: `PR ${n}`, url: `https://github.com/acme/shop/pull/${n}`, author: 'dev', state: 'merged',
-  updatedAt: `2026-10-2${n}T10:00:00Z`, body,
-  comments: [{ author: 'lead', body: `scope every list by org; token ghp_${'a'.repeat(36)}`, path: 'src/routes/orders.ts', line: 4, url: `https://github.com/acme/shop/pull/${n}#discussion_r1`, createdAt: 't', kind: 'review_comment' }],
+  updatedAt: `2026-10-2${n}T10:00:00Z`, headBranch: null, body,
+  comments: [{ author: 'lead', body: `scope every list by org; token ghp_${'a'.repeat(36)}`, path: 'src/routes/orders.ts', line: 4, url: `https://github.com/acme/shop/pull/${n}#discussion_r1`, createdAt: 't', kind: 'review_comment', id: '1', diffHunk: null }],
 });
 
 function setup(over: Partial<GithubSyncDeps> = {}) {

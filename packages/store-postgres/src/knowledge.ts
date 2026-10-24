@@ -25,7 +25,7 @@ import {
 } from '@fb/core';
 import { iso, toJson, toVector, tx, type Db } from './db.ts';
 import { commitOf, turnOf } from './graph.ts';
-import { relatedMissesQuery, runSearch, searchLessonsQuery } from './vector.ts';
+import { learnedIn, relatedMissesQuery, runSearch, searchLessonsQuery } from './vector.ts';
 
 type Row = Record<string, any>;
 
@@ -174,12 +174,13 @@ export class PgKnowledgeStore implements KnowledgeStore {
     });
   }
 
-  async listLessons(f: { status?: LessonStatus; projectKey?: string; limit?: number }): Promise<Lesson[]> {
+  async listLessons(f: { status?: LessonStatus; projectKey?: string; projectKeys?: string[]; limit?: number }): Promise<Lesson[]> {
     const { rows } = await this.q(
       `SELECT * FROM lessons
        WHERE ($1::text IS NULL OR status = $1) AND ($2::text IS NULL OR project_key = $2 OR project_key IS NULL)
+         AND ${learnedIn('lessons', '$4')}
        ORDER BY created_at DESC, id LIMIT $3`,
-      [f.status ?? null, f.projectKey ?? null, f.limit ?? 500],
+      [f.status ?? null, f.projectKey ?? null, f.limit ?? 500, f.projectKeys ?? null],
     );
     return rows.map(lessonOf);
   }
@@ -298,7 +299,7 @@ export class PgKnowledgeStore implements KnowledgeStore {
     });
   }
 
-  async searchLessons(q: { embedding: number[]; projectKey: string | null; k: number; status?: LessonStatus }): Promise<LessonHit[]> {
+  async searchLessons(q: { embedding: number[]; projectKey: string | null; k: number; status?: LessonStatus; projectKeys?: string[] }): Promise<LessonHit[]> {
     // This project's and the global lessons, nearest first, through the HNSW index when it pays (see vector.ts).
     const rows = await runSearch(this.db, searchLessonsQuery(this.db, q), q.k);
     return rows.map((r) => ({ lesson: lessonOf(r), score: r.score }));
@@ -324,7 +325,7 @@ export class PgKnowledgeStore implements KnowledgeStore {
     const report = toJson({ text: o.text, whatWasDone: o.whatWasDone, reportedAt: now.toISOString(), sessionId: o.sessionId ?? null });
     const { rows: flagged } = await this.q(
       `SELECT k.id, k.session_id, t.ts, t.text FROM candidates k JOIN turns t ON t.uuid = k.turn_uuid
-       WHERE k.project_key = $1 AND NOT k.manual AND k.agent_report IS NULL AND k.status <> 'rejected'
+       WHERE k.project_key = $1 AND NOT k.manual AND k.agent_report IS NULL AND k.status <> 'rejected' AND t.external IS NULL
          AND t.ts BETWEEN $2::timestamptz - make_interval(mins => $3) AND $2::timestamptz + make_interval(mins => $3)`,
       [o.project.key, now, REPORT_MERGE_MINUTES],
     );
@@ -406,6 +407,7 @@ function lessonOf(r: Row): Lesson {
   return {
     id: r.id,
     projectKey: r.project_key ?? null,
+    origin: r.project_key ?? r.origin_project_key ?? null,
     title: r.title,
     rule: r.rule,
     appliesWhen: r.applies_when ?? '',

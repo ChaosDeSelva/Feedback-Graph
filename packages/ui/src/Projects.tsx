@@ -4,6 +4,7 @@ import { ActivityEntry } from './Activity.tsx';
 import { CodeMap } from './CodeMap.tsx';
 import { ImportBundle } from './ImportBundle.tsx';
 import { api, type Activity, type DocSummary, type ProjectSummary, type StoredFact } from './api.ts';
+import { ConfirmDialog } from './ui/ConfirmDialog.tsx';
 import { PageHeader } from './ui/PageHeader.tsx';
 import { ListRow, SplitPane } from './ui/SplitPane.tsx';
 import { Button, buttonClass, Input, Select } from './ui/controls.tsx';
@@ -269,12 +270,20 @@ function Docs({ projectKey, onError }: { projectKey: string; onError: (e: string
     }
   }
 
+  const [removing, setRemoving] = useState<DocSummary | null>(null);
+  const [busyRemoving, setBusyRemoving] = useState(false);
+  useEffect(() => setRemoving(null), [projectKey]);
+
   async function remove(id: string) {
+    setBusyRemoving(true);
     try {
       await api.deleteDoc(id);
       setDocs((ds) => ds.filter((d) => d.id !== id));
     } catch (e) {
       onError(String(e));
+    } finally {
+      setBusyRemoving(false);
+      setRemoving(null);
     }
   }
 
@@ -299,28 +308,44 @@ function Docs({ projectKey, onError }: { projectKey: string; onError: (e: string
               </span>
               <span className="shrink-0 text-xs text-muted tabular-nums">{d.chunks} chunks</span>
             </span>
-            <Button size="sm" variant="ghost" aria-label={`remove ${d.title}`} onClick={() => remove(d.id)} className="hover:text-bad-text">remove</Button>
+            <Button size="sm" variant="ghost" aria-label={`remove ${d.title}`} onClick={() => setRemoving(d)} className="hover:text-bad-text">remove</Button>
           </li>
         ))}
         {docs.length === 0 && <li className="px-3 py-3 text-muted">No docs yet. Upload specs or notes; agents get matching excerpts with their task context.</li>}
       </ul>
+      <ConfirmDialog
+        open={!!removing}
+        title="Remove this document?"
+        confirmLabel="Remove document"
+        busyLabel="Removing…"
+        busy={busyRemoving}
+        items={removing ? [removing.title] : []}
+        onCancel={() => setRemoving(null)}
+        onConfirm={() => { if (removing) void remove(removing.id); }}
+      >
+        {removing && <>Its {plural(removing.chunks, 'chunk')} are deleted from <b>{projectKey}</b> and agents stop getting excerpts from it. {removing.source === 'upload' ? 'Upload it again to bring it back.' : 'The next sync may bring it back while the integration is on.'}</>}
+      </ConfirmDialog>
     </Card>
   );
 }
 
-/** Take the project's knowledge with you (export), or remove all of it (delete, confirmed by typing the name). */
+/** Take the project's knowledge with you (export), or remove all of it (delete, in a dialog, confirmed by typing the name). */
 function DataControls({ projectKey, onDeleted, onError }: { projectKey: string; onDeleted: () => void; onError: (e: string) => void }) {
   const [open, setOpen] = useState(false);
-  const [typed, setTyped] = useState('');
   const [busy, setBusy] = useState(false);
-  useEffect(() => { setOpen(false); setTyped(''); }, [projectKey]);
+  const [failed, setFailed] = useState<string | null>(null);
+  useEffect(() => { setOpen(false); setFailed(null); }, [projectKey]);
   async function remove() {
     setBusy(true);
+    setFailed(null);
     try {
       await api.deleteProject(projectKey);
+      setOpen(false);
       onDeleted();
     } catch (e) {
-      onError(e instanceof Error ? e.message : String(e));
+      const why = e instanceof Error ? e.message : String(e);
+      setFailed(why);
+      onError(why);
     } finally {
       setBusy(false);
     }
@@ -329,20 +354,22 @@ function DataControls({ projectKey, onDeleted, onError }: { projectKey: string; 
     <Card title="Your data" bodyClass="grid gap-3 p-3">
       <div className="flex flex-wrap items-center gap-2">
         <a href={api.exportUrl(projectKey)} className={buttonClass('secondary', 'sm')}><DownloadIcon size={13} />Export lessons, misses and facts (JSON)</a>
-        <Button size="sm" variant="danger-outline" aria-expanded={open} onClick={() => setOpen(!open)}>Delete project data…</Button>
+        <Button size="sm" variant="danger-outline" aria-haspopup="dialog" onClick={() => { setFailed(null); setOpen(true); }}>Delete project data…</Button>
       </div>
-      {open && (
-        <div className="grid gap-2.5 rounded-md border border-bad/50 bg-bad-soft p-3 text-xs">
-          <p>
-            This removes every session, flag, decision, post-mortem, lesson, fact, document and log entry for <b>{projectKey}</b>. It cannot be undone.
-            New sessions in this folder will be read again unless you add it to <code className="font-mono">EXCLUDE_PROJECTS</code>.
-          </p>
-          <Input aria-label="type the project name to confirm" value={typed} onChange={(e) => setTyped(e.target.value)} placeholder={projectKey} className="max-w-xs" />
-          <Button variant="danger" onClick={remove} disabled={typed !== projectKey || busy} className="justify-self-start">
-            {busy ? 'deleting…' : `Delete everything learned from ${projectKey}`}
-          </Button>
-        </div>
-      )}
+      <ConfirmDialog
+        open={open}
+        title={`Delete everything learned from ${projectKey}?`}
+        confirmLabel={`Delete everything learned from ${projectKey}`}
+        busyLabel="Deleting…"
+        busy={busy}
+        error={failed}
+        typeToConfirm={projectKey}
+        onCancel={() => setOpen(false)}
+        onConfirm={() => void remove()}
+      >
+        This removes every session, flag, decision, post-mortem, lesson, fact, document and log entry for <b>{projectKey}</b>. It cannot be undone.
+        New sessions in this folder will be read again while it is selected in Settings, unless you add it to <code className="font-mono">EXCLUDE_PROJECTS</code>.
+      </ConfirmDialog>
     </Card>
   );
 }

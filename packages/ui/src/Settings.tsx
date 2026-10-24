@@ -1,7 +1,9 @@
 import { useEffect, useMemo, useState, type ReactNode } from 'react';
 import { CloudSync } from './CloudSync.tsx';
+import { Integrations } from './Integrations.tsx';
 import { api, CLEANUP_CONFIRM, type ProjectCandidate, type ProjectSettings } from './api.ts';
 import { useUnsavedChanges } from './unsaved.ts';
+import { ConfirmDialog } from './ui/ConfirmDialog.tsx';
 import { PageHeader } from './ui/PageHeader.tsx';
 import { Button, Input, Select } from './ui/controls.tsx';
 import { ago, Alert, Badge, EmptyState, plural, Skeleton, SkeletonList, tdClass, thClass } from './ui/display.tsx';
@@ -210,7 +212,11 @@ export function Settings() {
 
               {/* Its own scroll box, so the header stays put and the sections below are a short scroll away even with a hundred folders. */}
               <div className="max-h-[70dvh] overflow-y-auto overscroll-contain rounded-md border border-line bg-surface shadow-card lg:max-h-[min(40rem,68vh)]">
-                {data.candidates.length === 0 ? (
+                {data.candidates.length === 0 && data.roots.length === 0 ? (
+                  <EmptyState icon={<FolderIcon />} title="No project folders yet">
+                    Add a project folder below (Where folders come from): the folder that holds your projects, one folder per project inside it.
+                  </EmptyState>
+                ) : data.candidates.length === 0 ? (
                   <EmptyState icon={<FolderIcon />} title="No project folders found">
                     Folders under your project roots appear here once they exist. The roots are listed below.
                   </EmptyState>
@@ -242,7 +248,8 @@ export function Settings() {
             </section>
           )}
 
-          {data && <Sources data={data} />}
+          {data && <Sources data={data} onSaved={setData} onError={setError} />}
+          {data && <Integrations />}
           {data && <CloudSync />}
           {data && <Cleanup data={data} dirty={dirty} onDone={load} onError={setError} />}
         </div>
@@ -345,20 +352,109 @@ function FolderRow({ c, checked, locked, stale, change, onToggle }: {
   );
 }
 
-function Sources({ data }: { data: ProjectSettings }) {
+/** The command that mounts saved roots: they are Docker bind mounts, so a change needs a restart. */
+const APPLY_ROOTS = './scripts/setup.sh';
+
+const sessionCounts = (claude: number, codex: number) => `${claude} Claude Code, ${codex} Codex`;
+
+/** The project roots: edited here, saved to a file, mounted by ./scripts/setup.sh. Plus the folders outside sessions ran in. */
+function Sources({ data, onSaved, onError }: { data: ProjectSettings; onSaved: (d: ProjectSettings) => void; onError: (e: string | null) => void }) {
   const { claudeSessions, codexSessions } = data.outsideRoots;
+  const suggestions = data.outsideRoots.folders ?? [];
+  const editable = !!data.rootsEditable;
+  // What you are editing: the saved roots when they wait to be mounted, else the mounted ones.
+  const roots = data.pendingRoots ?? data.roots;
+  const unmounting = data.pendingRoots ? data.roots.filter((r) => !roots.includes(r)) : [];
+  const [adding, setAdding] = useState('');
+  const [confirming, setConfirming] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [copied, setCopied] = useState(false);
+
+  async function save(next: string[]) {
+    setBusy(true);
+    onError(null);
+    try {
+      onSaved(await api.saveProjectRoots(next));
+      setAdding('');
+      setConfirming(null);
+      setCopied(false);
+    } catch (e) {
+      onError(message(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function copy() {
+    try {
+      await navigator.clipboard.writeText(APPLY_ROOTS);
+      setCopied(true);
+    } catch {
+      onError(`Could not copy; run ${APPLY_ROOTS} in the Feedback Graph folder on the host.`);
+    }
+  }
+
   return (
     <section aria-labelledby="settings-sources" className="grid gap-2.5">
-      <SectionHead id="settings-sources" title="Where folders come from" />
+      <SectionHead id="settings-sources" title="Where folders come from">
+        A project root is a folder that holds your projects, one folder per project inside. Containers see only these folders, read-only.
+      </SectionHead>
+      {data.pendingRoots && (
+        <div role="status" aria-label="roots not mounted yet" className="flex flex-wrap items-center gap-2 rounded-md border border-accent-edge/50 bg-accent-soft px-3 py-2">
+          <span className="min-w-0 flex-1">
+            Saved. Run <code className="font-mono font-semibold">{APPLY_ROOTS}</code> to mount these folders (restarts the containers).
+          </span>
+          <Button size="sm" onClick={copy}>{copied ? 'Copied' : 'Copy command'}</Button>
+        </div>
+      )}
       <div className="grid gap-3 rounded-md border border-line bg-surface p-4 shadow-card md:grid-cols-2">
         <div className="min-w-0">
           <div className="text-[11px] font-semibold tracking-[0.06em] text-muted uppercase">Project roots</div>
-          {data.roots.length ? (
-            <ul className="mt-1 grid gap-0.5">
-              {data.roots.map((r) => <li key={r} className="font-mono text-xs [overflow-wrap:anywhere]">{r}</li>)}
+          {roots.length ? (
+            <ul aria-label="project roots" className="mt-1 grid gap-1">
+              {roots.map((r) => (
+                <li key={r} className="grid gap-1">
+                  <div className="flex items-center gap-2">
+                    <span className="min-w-0 flex-1 font-mono text-xs [overflow-wrap:anywhere]">{r}</span>
+                    {!data.roots.includes(r) && <Badge tone="accent">not mounted yet</Badge>}
+                    {editable && (
+                      <Button size="sm" variant="ghost" aria-label={`remove ${r}`} disabled={busy} onClick={() => setConfirming(r)}>Remove</Button>
+                    )}
+                  </div>
+                </li>
+              ))}
             </ul>
           ) : (
-            <p className="mt-1 text-xs text-muted">No roots configured.</p>
+            <p className="mt-1 text-xs text-muted">No project folders yet. Add a project folder to choose projects from it.</p>
+          )}
+          <ConfirmDialog
+            open={confirming !== null}
+            title={`Remove ${confirming ?? ''} from the project roots?`}
+            message={<>Its projects are no longer listed or read once <code className="font-mono">{APPLY_ROOTS}</code> remounts. What was learned from them is kept.</>}
+            confirmLabel="Remove folder"
+            busyLabel="Removing…"
+            busy={busy}
+            onConfirm={() => { if (confirming) void save(roots.filter((x) => x !== confirming)); }}
+            onCancel={() => setConfirming(null)}
+          />
+          {unmounting.length > 0 && (
+            <p className="mt-1 text-xs text-muted">Still mounted until then: <span className="font-mono">{unmounting.join(', ')}</span></p>
+          )}
+          {editable ? (
+            <form
+              className="mt-2 flex flex-wrap gap-2"
+              onSubmit={(e) => {
+                e.preventDefault();
+                if (adding.trim()) save([...roots, adding.trim()]);
+              }}
+            >
+              <Input aria-label="folder to add" placeholder="/Users/you/code or ~/code" value={adding} onChange={(e) => setAdding(e.target.value)} className="min-w-0 flex-1 font-mono" />
+              <Button type="submit" disabled={busy || !adding.trim()}>Add folder</Button>
+            </form>
+          ) : (
+            <p className="mt-1 text-xs text-muted">
+              Set <code className="font-mono">PROJECTS_DIRS</code> in <code className="font-mono">.env</code> (comma-separated) and run <code className="font-mono">{APPLY_ROOTS}</code> to change them.
+            </p>
           )}
           <p className="mt-1 text-xs text-muted">Each folder directly inside a root is listed above.</p>
         </div>
@@ -367,7 +463,22 @@ function Sources({ data }: { data: ProjectSettings }) {
           {claudeSessions + codexSessions > 0 ? (
             <>
               <p className="mt-1 font-medium">{claudeSessions} Claude Code and {codexSessions} Codex sessions ran outside your project folders.</p>
-              <p className="mt-0.5 text-xs text-muted">They are never read. Add a root (<code className="font-mono">PROJECTS_DIR</code> in <code className="font-mono">.env</code>) to bring them in.</p>
+              <p className="mt-0.5 text-xs text-muted">They are never read. Add the folder they ran in as a root to bring them in.</p>
+              {suggestions.length > 0 && (
+                <ul aria-label="suggested folders" className="mt-2 grid gap-1">
+                  {suggestions.map((f) => (
+                    <li key={f.path} className="flex items-center gap-2">
+                      <span className="min-w-0 flex-1">
+                        <span className="block font-mono text-xs [overflow-wrap:anywhere]">{f.path}</span>
+                        <span className="text-xs text-muted">{sessionCounts(f.claudeSessions, f.codexSessions)} sessions</span>
+                      </span>
+                      {editable && (
+                        <Button size="sm" aria-label={`add ${f.path} as a root`} disabled={busy} onClick={() => save([...roots, f.path])}>Add as root</Button>
+                      )}
+                    </li>
+                  ))}
+                </ul>
+              )}
             </>
           ) : (
             <p className="mt-1 text-muted">No sessions ran outside your project folders.</p>
@@ -383,8 +494,8 @@ function Cleanup({ data, dirty, onDone, onError }: { data: ProjectSettings; dirt
   // Data filed under a clone's folder belongs to the project it follows.
   const keys = data.candidates.filter((c) => c.hasData && !data.tracked.includes(c.key) && !(c.aliasOf && data.tracked.includes(c.aliasOf))).map((c) => c.key);
   const [confirming, setConfirming] = useState(false);
-  const [typed, setTyped] = useState('');
   const [busy, setBusy] = useState(false);
+  const [failed, setFailed] = useState<string | null>(null);
   const [result, setResult] = useState<string | null>(null);
   const [showAll, setShowAll] = useState(false);
   const SHOW = 24;
@@ -392,14 +503,15 @@ function Cleanup({ data, dirty, onDone, onError }: { data: ProjectSettings; dirt
 
   async function run() {
     setBusy(true);
+    setFailed(null);
     onError(null);
     try {
       const r = await api.cleanupUnselected();
       setResult(r.removed.length ? `Removed data for ${r.removed.join(', ')} (${plural(r.nodesRemoved, 'node')}).` : 'Nothing to remove: every project with data is selected.');
       setConfirming(false);
-      setTyped('');
       onDone();
     } catch (e) {
+      setFailed(message(e));
       onError(message(e));
     } finally {
       setBusy(false);
@@ -427,24 +539,26 @@ function Cleanup({ data, dirty, onDone, onError }: { data: ProjectSettings; dirt
         )}
         {result && <p role="status" className="text-ok-text">{result}</p>}
         {blocked && keys.length > 0 && <p className="text-xs text-muted">{blocked}</p>}
-        {confirming && !blocked ? (
-          <div className="grid gap-2 rounded-md border border-bad/40 bg-bad-soft p-3">
-            <p className="text-bad-text">
-              This permanently deletes the data of {plural(keys.length, 'project')}. Type <code className="font-mono font-semibold">{CLEANUP_CONFIRM}</code> to confirm.
-            </p>
-            <div className="flex flex-wrap gap-2">
-              <Input aria-label={`type ${CLEANUP_CONFIRM} to confirm`} autoFocus value={typed} onChange={(e) => setTyped(e.target.value)} placeholder={CLEANUP_CONFIRM} className="w-full font-mono sm:w-56" />
-              <Button variant="danger" disabled={typed !== CLEANUP_CONFIRM || busy} onClick={run}>{busy ? 'Removing' : 'Remove data'}</Button>
-              <Button variant="ghost" onClick={() => { setConfirming(false); setTyped(''); }}>Cancel</Button>
-            </div>
-          </div>
-        ) : (
-          <div>
-            <Button variant="danger-outline" disabled={!keys.length || !!blocked} onClick={() => { setResult(null); setConfirming(true); }}>
-              Remove data for {plural(keys.length, 'unselected project')}
-            </Button>
-          </div>
-        )}
+        <div>
+          <Button variant="danger-outline" aria-haspopup="dialog" disabled={!keys.length || !!blocked} onClick={() => { setResult(null); setFailed(null); setConfirming(true); }}>
+            Remove data for {plural(keys.length, 'unselected project')}
+          </Button>
+        </div>
+        <ConfirmDialog
+          open={confirming && !blocked}
+          title={`Remove the data of ${plural(keys.length, 'unselected project')}?`}
+          confirmLabel="Remove data"
+          busyLabel="Removing…"
+          busy={busy}
+          error={failed}
+          items={keys}
+          typeToConfirm={CLEANUP_CONFIRM}
+          onCancel={() => setConfirming(false)}
+          onConfirm={() => void run()}
+        >
+          This permanently deletes everything stored for these projects: sessions, feedback, lessons, facts and docs. It cannot be undone. Your
+          selected projects are not touched.
+        </ConfirmDialog>
       </div>
     </section>
   );

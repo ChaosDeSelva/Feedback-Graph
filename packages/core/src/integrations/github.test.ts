@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'vitest';
-import { fetchPullRequestContext, parseGithubRepos, prContextToChunks, type PrContext } from './github.ts';
+import { IntegrationError } from './errors.ts';
+import { fetchPullRequestContext, githubRepoOfRemote, githubViewer, parseGithubRepos, prContextToChunks, type PrContext } from './github.ts';
 
 describe('parseGithubRepos', () => {
   test('parses project=owner/repo pairs, trimming and skipping blanks', () => {
@@ -58,9 +59,9 @@ function pr(n: number, updated: string, extra: Record<string, unknown> = {}) {
 describe('fetchPullRequestContext', () => {
   test('sends GitHub headers and collects review, issue, and review-body comments without bots or empties', async () => {
     const { fetchImpl, calls } = mockFetch({
-      '/repos/acme/demo/pulls': [pr(7, '2026-10-20T00:00:00Z')],
+      '/repos/acme/demo/pulls': [pr(7, '2026-10-20T00:00:00Z', { head: { ref: 'feat/dark' } })],
       '/repos/acme/demo/pulls/7/comments': [
-        { id: 1, user: human('bob'), body: 'use the existing helper', path: 'src/a.ts', line: 12, original_line: 10, html_url: 'u1', created_at: '2026-10-19T00:00:00Z' },
+        { id: 1, diff_hunk: '@@ -1 +1 @@', user: human('bob'), body: 'use the existing helper', path: 'src/a.ts', line: 12, original_line: 10, html_url: 'u1', created_at: '2026-10-19T00:00:00Z' },
         { id: 2, user: { login: 'renovate[bot]', type: 'User' }, body: 'bump', path: 'x', line: 1, html_url: 'u2', created_at: '2026-10-19T00:00:00Z' },
         { id: 3, user: human('bob'), body: '   ', path: 'x', line: 1, html_url: 'u3', created_at: '2026-10-19T00:00:00Z' },
       ],
@@ -81,11 +82,11 @@ describe('fetchPullRequestContext', () => {
     expect(h['user-agent']).toBe('feedback-graph');
     expect(calls[0].url).toContain('https://api.github.com/repos/acme/demo/pulls?state=all&sort=updated&direction=desc&per_page=');
     expect(out).toHaveLength(1);
-    expect(out[0]).toMatchObject({ repo: 'acme/demo', number: 7, title: 'PR 7', author: 'alice', state: 'open', body: 'body 7' });
+    expect(out[0]).toMatchObject({ repo: 'acme/demo', number: 7, title: 'PR 7', author: 'alice', state: 'open', body: 'body 7', headBranch: 'feat/dark' });
     expect(out[0].comments).toEqual([
-      { author: 'bob', body: 'use the existing helper', path: 'src/a.ts', line: 12, url: 'u1', createdAt: '2026-10-19T00:00:00Z', kind: 'review_comment' },
-      { author: 'carol', body: 'we need dark mode too', path: null, line: null, url: 'u5', createdAt: '2026-10-19T01:00:00Z', kind: 'issue_comment' },
-      { author: 'dave', body: 'changes requested: no new deps', path: null, line: null, url: 'u6', createdAt: '2026-10-19T02:00:00Z', kind: 'review' },
+      { id: '1', author: 'bob', body: 'use the existing helper', path: 'src/a.ts', line: 12, url: 'u1', createdAt: '2026-10-19T00:00:00Z', kind: 'review_comment', diffHunk: '@@ -1 +1 @@' },
+      { id: '5', author: 'carol', body: 'we need dark mode too', path: null, line: null, url: 'u5', createdAt: '2026-10-19T01:00:00Z', kind: 'issue_comment', diffHunk: null },
+      { id: '6', author: 'dave', body: 'changes requested: no new deps', path: null, line: null, url: 'u6', createdAt: '2026-10-19T02:00:00Z', kind: 'review', diffHunk: null },
     ]);
   });
 
@@ -196,11 +197,12 @@ describe('prContextToChunks', () => {
     author: 'alice',
     state: 'merged',
     updatedAt: '2026-10-20T00:00:00Z',
+    headBranch: 'feat/checkout',
     body: 'Implements checkout',
     comments: [
-      { author: 'bob', body: 'keep prices in cents', path: 'src/cart.ts', line: 40, url: 'https://github.com/acme/demo-shop/pull/12#discussion_r991', createdAt: 'c', kind: 'review_comment' },
-      { author: 'carol', body: 'y'.repeat(9000), path: null, line: null, url: 'https://github.com/acme/demo-shop/pull/12#issuecomment-55', createdAt: 'c', kind: 'issue_comment' },
-      { author: 'dave', body: 'lgtm', path: null, line: null, url: '', createdAt: 'c', kind: 'review' },
+      { id: '991', author: 'bob', body: 'keep prices in cents', path: 'src/cart.ts', line: 40, url: 'https://github.com/acme/demo-shop/pull/12#discussion_r991', createdAt: 'c', kind: 'review_comment', diffHunk: null },
+      { id: '55', author: 'carol', body: 'y'.repeat(9000), path: null, line: null, url: 'https://github.com/acme/demo-shop/pull/12#issuecomment-55', createdAt: 'c', kind: 'issue_comment', diffHunk: null },
+      { id: '2', author: 'dave', body: 'lgtm', path: null, line: null, url: '', createdAt: 'c', kind: 'review', diffHunk: null },
     ],
   };
 
@@ -225,5 +227,35 @@ describe('prContextToChunks', () => {
     for (const c of chunks) expect(c.text.length).toBeLessThanOrEqual(4000);
     expect(chunks[0].text.length).toBe(4000);
     expect(chunks[2].text.length).toBe(4000);
+  });
+});
+
+describe('githubViewer', () => {
+  test('one GET /user call returns the login', async () => {
+    const { fetchImpl, calls } = mockFetch({ '/user': { login: 'octo', id: 1 } });
+    expect(await githubViewer({ token: 'tok', fetchImpl })).toEqual({ login: 'octo' });
+    expect(calls.map((c) => c.url)).toEqual(['https://api.github.com/user']);
+  });
+
+  test('a revoked token is an auth error; a rate limit carries when it lifts', async () => {
+    const revoked = mockFetch({ '/user': () => new Response('{"message":"Bad credentials"}', { status: 401 }) });
+    const err = await githubViewer({ token: 'sekrit-value', fetchImpl: revoked.fetchImpl }).catch((e) => e);
+    expect(err).toBeInstanceOf(IntegrationError);
+    expect(err).toMatchObject({ kind: 'auth' });
+    expect(String(err)).not.toContain('sekrit-value');
+    const limited = mockFetch({ '/user': () => new Response('slow down', { status: 429, headers: { 'retry-after': '60' } }) });
+    const e2 = await githubViewer({ token: 'tok', fetchImpl: limited.fetchImpl }).catch((e) => e);
+    expect(e2).toMatchObject({ kind: 'rate_limit' });
+    expect(Date.parse(e2.retryAt)).toBeGreaterThan(Date.now());
+  });
+});
+
+describe('githubRepoOfRemote', () => {
+  test('only github.com remotes map to owner/repo', () => {
+    expect(githubRepoOfRemote('github.com/acme/shop')).toBe('acme/shop');
+    expect(githubRepoOfRemote('gitlab.com/acme/shop')).toBeNull();
+    expect(githubRepoOfRemote('local/shop')).toBeNull();
+    expect(githubRepoOfRemote('github.com/acme/group/shop')).toBeNull();
+    expect(githubRepoOfRemote(null)).toBeNull();
   });
 });

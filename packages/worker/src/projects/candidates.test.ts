@@ -62,7 +62,8 @@ test('every top-level folder is a candidate, with its git remote and Claude Code
     { key: 'gone', path: `${vibe}/gone`, exists: false, git: false, remote: null, claudeSessions: 1, codexSessions: 0, lastActivity: '2026-10-19T00:00:00.000Z' },
     { key: 'plain', path: `${vibe}/plain`, exists: true, git: false, remote: null, claudeSessions: 0, codexSessions: 0, lastActivity: null },
   ]);
-  expect(snap.outsideRoots).toEqual({ claudeSessions: 1, codexSessions: 0 });
+  // /somewhere/else: its parent /somewhere is too near the top of the disk to suggest as a root.
+  expect(snap.outsideRoots).toEqual({ claudeSessions: 1, codexSessions: 0, folders: [] });
   expect(snap.codexSessionsFound).toBe(true);
 });
 
@@ -153,4 +154,77 @@ test('repos nested in a folder that is not a repo are candidates of their own; s
     ['plain', `${host}/plain`, true, false, null, 0],
   ]);
   expect([...snap.folderOf.values()]).toEqual(['github.com__org__repo', 'client__app', 'client']);
+});
+
+test('sessions outside every root suggest their parent folders as roots, most sessions first, never a dot-folder, home, temp or worktree folder; nested ones fold into the folder above', async () => {
+  const base = mkdtempSync(join(tmpdir(), 'fb-cand-outside-'));
+  const vibe = join(base, 'vibe');
+  mkdirSync(vibe);
+  const claude = join(base, 'claude');
+  let n = 0;
+  const session = (cwd: string, source: 'claude' | 'codex' = 'claude') => {
+    const name = `s${n++}`;
+    mkdirSync(join(claude, name), { recursive: true });
+    const p = join(claude, name, 's.jsonl');
+    writeFileSync(p, source === 'claude'
+      ? JSON.stringify({ type: 'user', sessionId: name, cwd, timestamp: '2026-10-01T10:00:00Z', message: { content: 'hi' } }) + '\n'
+      : readFileSync(fx('codex/normal.jsonl'), 'utf8').replaceAll('/work/demo-shop', cwd));
+    return { path: p, size: readFileSync(p).length, mtimeMs: 1, source };
+  };
+  const files = [
+    session('/Users/me/work/api'),
+    session('/Users/me/work/web/src'), // parent of the cwd itself: /Users/me/work/web
+    session('/Users/me/work/site'),
+    session('/Users/me/games/tetris'),
+    session('/Users/me/games/tetris', 'codex'),
+    session('/Users/me/work/api/.claude/worktrees/agent-1'), // inside a dot-folder
+    session('/Users/me/notes'), // its parent is the home folder
+    session('/Users/me'), // the home folder itself
+    session('/tmp/x'), // too near the top
+    session('/tmp/acceptance-run/repo'), // temporary
+    session('/private/tmp/claude-501/run/scratchpad'), // temporary (macOS)
+    session('/private/var/folders/ab/T/job'), // temporary (macOS)
+    session('/Users/me/Codex/2026-10-14/work/worktrees/prj_1'), // an agent's worktree
+    session(`${vibe}/inside`), // under a root: not outside
+  ];
+  const snap = await buildCandidates({ roots: [{ host: vibe, container: vibe }], files, state: new FileState(':memory:'), codexSessionsFound: true, hostHome: '/Users/me', remote: async () => null });
+  expect(snap.outsideRoots.claudeSessions).toBe(12);
+  expect(snap.outsideRoots.codexSessions).toBe(1);
+  expect(snap.outsideRoots.folders).toEqual([
+    // /Users/me/work/web is inside /Users/me/work: one root there brings in both, so it is one suggestion.
+    { path: '/Users/me/work', claudeSessions: 3, codexSessions: 0 },
+    { path: '/Users/me/games', claudeSessions: 1, codexSessions: 1 },
+  ]);
+});
+
+test('three or more suggested folders side by side become one suggestion: the folder holding them', async () => {
+  const base = mkdtempSync(join(tmpdir(), 'fb-cand-siblings-'));
+  const claude = join(base, 'claude');
+  const cwds = ['/Users/me/Codex/2026-10-14/a', '/Users/me/Codex/2026-10-15/b', '/Users/me/Codex/2026-10-16/c', '/Users/me/pair/one/x', '/Users/me/pair/two/y'];
+  const files = cwds.map((cwd, i) => {
+    mkdirSync(join(claude, `s${i}`), { recursive: true });
+    const p = join(claude, `s${i}`, 's.jsonl');
+    writeFileSync(p, JSON.stringify({ type: 'user', sessionId: `s${i}`, cwd, timestamp: '2026-10-01T10:00:00Z', message: { content: 'hi' } }) + '\n');
+    return { path: p, size: readFileSync(p).length, mtimeMs: 1, source: 'claude' as const };
+  });
+  const snap = await buildCandidates({ roots: [], files, state: new FileState(':memory:'), codexSessionsFound: true, hostHome: '/Users/me' });
+  expect(snap.outsideRoots.folders).toEqual([
+    { path: '/Users/me/Codex', claudeSessions: 3, codexSessions: 0 },
+    // Two side by side stay as they are.
+    { path: '/Users/me/pair/one', claudeSessions: 1, codexSessions: 0 },
+    { path: '/Users/me/pair/two', claudeSessions: 1, codexSessions: 0 },
+  ]);
+});
+
+test('at most eight suggested folders', async () => {
+  const base = mkdtempSync(join(tmpdir(), 'fb-cand-many-'));
+  const claude = join(base, 'claude');
+  const files = Array.from({ length: 12 }, (_, i) => {
+    mkdirSync(join(claude, `s${i}`), { recursive: true });
+    const p = join(claude, `s${i}`, 's.jsonl');
+    writeFileSync(p, JSON.stringify({ type: 'user', sessionId: `s${i}`, cwd: `/srv/area${String(i).padStart(2, '0')}/proj`, timestamp: '2026-10-01T10:00:00Z', message: { content: 'hi' } }) + '\n');
+    return { path: p, size: readFileSync(p).length, mtimeMs: 1, source: 'claude' as const };
+  });
+  const snap = await buildCandidates({ roots: [], files, state: new FileState(':memory:'), codexSessionsFound: true });
+  expect(snap.outsideRoots.folders?.map((f) => f.path)).toEqual(Array.from({ length: 8 }, (_, i) => `/srv/area${String(i).padStart(2, '0')}`));
 });

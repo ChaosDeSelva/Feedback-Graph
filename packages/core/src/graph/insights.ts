@@ -150,32 +150,33 @@ export class InsightsRepo implements InsightsStore {
     return { nodes: [...nodes.values()], links };
   }
 
-  async patterns(q: { projectKey?: string; threshold?: number }): Promise<PatternReport> {
+  async patterns(q: { projectKey?: string; projectKeys?: string[]; threshold?: number }): Promise<PatternReport> {
     const projectKey = q.projectKey ?? null;
+    const projectKeys = q.projectKeys ?? null;
     const [causeRows, missRows, feedbackRows, [pre]] = await Promise.all([
       this.g.run(
-        `MATCH (m:Miss) WHERE $projectKey IS NULL OR m.projectKey = $projectKey
+        `MATCH (m:Miss) WHERE ($projectKey IS NULL OR m.projectKey = $projectKey) AND ($projectKeys IS NULL OR m.projectKey IN $projectKeys)
          RETURN m.cause AS cause, count(*) AS count ORDER BY count DESC, cause`,
-        { projectKey },
+        { projectKey, projectKeys },
       ),
       this.g.run(
         `MATCH (m:Miss)-[:EXPLAINS]->(:Feedback)-[:FROM_TURN]->(t:Turn)
-         WHERE ($projectKey IS NULL OR m.projectKey = $projectKey) AND m.embedding IS NOT NULL
+         WHERE ($projectKey IS NULL OR m.projectKey = $projectKey) AND ($projectKeys IS NULL OR m.projectKey IN $projectKeys) AND m.embedding IS NOT NULL
          // Repeat detection compares every pair, so only the most recent misses are loaded.
          WITH m, t ORDER BY t.ts DESC LIMIT $cap
          RETURN m.missed AS missed, m.cause AS cause, m.projectKey AS projectKey, m.embedding AS embedding, t.ts AS ts
          ORDER BY ts`,
-        { projectKey, cap: neo4j.int(REPEAT_WINDOW) },
+        { projectKey, projectKeys, cap: neo4j.int(REPEAT_WINDOW) },
       ),
       this.g.run(
-        `MATCH (f:Feedback)-[:FROM_TURN]->(t:Turn) WHERE $projectKey IS NULL OR f.projectKey = $projectKey
+        `MATCH (f:Feedback)-[:FROM_TURN]->(t:Turn) WHERE ($projectKey IS NULL OR f.projectKey = $projectKey) AND ($projectKeys IS NULL OR f.projectKey IN $projectKeys)
          RETURN t.ts AS ts`,
-        { projectKey },
+        { projectKey, projectKeys },
       ),
       this.g.run(
-        `MATCH (x:PreDoneCheck) WHERE $projectKey IS NULL OR x.projectKey = $projectKey
+        `MATCH (x:PreDoneCheck) WHERE ($projectKey IS NULL OR x.projectKey = $projectKey) AND ($projectKeys IS NULL OR x.projectKey IN $projectKeys)
          RETURN count(x) AS checks, sum(CASE WHEN x.gaps > 0 THEN 1 ELSE 0 END) AS withGaps, coalesce(sum(x.gaps), 0) AS gapsFound`,
-        { projectKey },
+        { projectKey, projectKeys },
       ),
     ]);
 

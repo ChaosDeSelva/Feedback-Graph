@@ -14,3 +14,15 @@ test('every key in .env.example is used by docker-compose.yml', () => {
   const missing = keys.filter((k) => !NOT_INTERPOLATED.has(k) && !compose.includes(`\${${k}`));
   expect(missing).toEqual([]);
 });
+
+test('docker-compose.yml mounts no project folder: the roots come only from the override setup.sh generates', () => {
+  const compose = readFileSync(join(repo, 'docker-compose.yml'), 'utf8');
+  for (const gone of ['${PROJECTS_DIR', '${FEEDBACK_TOOL_DIR', '/examples', ':/vibe', 'PROJECT_ROOTS:', '${HOME}/code']) {
+    expect(compose, gone).not.toContain(gone);
+  }
+  // The api saves the roots chosen in Settings in a folder of its own, never next to the worker's database or logins.
+  const api = compose.slice(compose.indexOf('\n  api:'), compose.indexOf('\n  postgres:'));
+  expect(api).toContain('- ./state/settings:/settings');
+  expect(api).toContain('ROOTS_FILE: /settings/project-roots.json');
+  expect(api).not.toContain('./state:/state');
+});

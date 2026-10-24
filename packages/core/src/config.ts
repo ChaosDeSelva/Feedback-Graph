@@ -2,7 +2,7 @@ import { parseGithubRepos } from './integrations/github.ts';
 import type { Root } from './projects.ts';
 
 /** Bumped with each release; reported by /api/status and the worker heartbeat. */
-export const VERSION = '0.4.2';
+export const VERSION = '0.4.3';
 
 export class ConfigError extends Error {
   readonly problems: string[];
@@ -52,7 +52,14 @@ export type Config = {
   neo4j: { url: string; user: string; password: string } | null;
   /** Set when store is 'postgres'. Never log `url`: it carries the password (see redactUrl). */
   postgres: { url: string } | null;
+  /** The mounted project roots (PROJECT_ROOTS / HOST_PROJECT_ROOTS from the generated override); empty when none. */
   roots: Root[];
+  /** ROOTS_FILE: where Settings saves the owner's roots (host paths) for scripts/setup.sh to mount. Null: not editable. */
+  rootsFile: string | null;
+  /** Where tokens pasted in Settings (GitHub, Linear) are kept, mode 600; null: only .env tokens. */
+  integrationsFile: string | null;
+  /** HOST_HOME: the host's home folder, never suggested as a root. */
+  hostHome: string | null;
   transcriptsDir: string;
   /** Codex CLI / Desktop rollout files (~/.codex/sessions on the host), mounted read-only. */
   codexSessionsDir: string;
@@ -73,7 +80,13 @@ export type Config = {
   memoryAutoApprove: boolean;
   /** Session summaries (the worker's summarize stage). */
   summary: SummaryConfig;
-  github: { token: string; repos: Map<string, string>; syncHours: number } | null;
+  /**
+   * GITHUB_REPOS (project=owner/repo), which overrides the repository a project's github.com remote names, and the
+   * hours between PR-as-context syncs. The token is resolved per cycle (Integrations: .env, else Settings).
+   */
+  github: { repos: Map<string, string>; syncHours: number };
+  /** Minutes between syncs of review comments and Linear comments into the Inbox, per project (INTEGRATION_SYNC_MINUTES). */
+  integrationSyncMinutes: number;
   apiToken: string | null;
   publicHosts: string[];
   /** Feedback Graph Cloud sync; null (the default) sends nothing anywhere. Never log `token`. */
@@ -166,23 +179,22 @@ export function loadConfig(env: Env): Config {
     return v;
   };
 
-  const containers = list(str('PROJECT_ROOTS', '/vibe'));
-  const hosts = list(str('HOST_PROJECT_ROOTS'));
-  if (hosts.length && hosts.length !== containers.length) {
+  // No roots is valid: the owner adds folders in Settings, and scripts/setup.sh mounts them (docker-compose.override.yml).
+  const containers = list(env.PROJECT_ROOTS);
+  const hosts = list(env.HOST_PROJECT_ROOTS);
+  if (containers.length && !hosts.length) problems.push('HOST_PROJECT_ROOTS is required when PROJECT_ROOTS is set');
+  else if (hosts.length !== containers.length) {
     problems.push(`HOST_PROJECT_ROOTS has ${hosts.length} entries but PROJECT_ROOTS has ${containers.length}; they pair up in order`);
   }
 
-  let github: Config['github'] = null;
-  const repoSpec = env.GITHUB_REPOS?.trim();
-  if (repoSpec) {
-    try {
-      const repos = parseGithubRepos(repoSpec);
-      if (!env.GITHUB_TOKEN?.trim()) problems.push('GITHUB_REPOS is set but GITHUB_TOKEN is empty');
-      else github = { token: env.GITHUB_TOKEN.trim(), repos, syncHours: num('GITHUB_SYNC_HOURS', 6) };
-    } catch (e) {
-      problems.push((e as Error).message);
-    }
+  // The token can also be pasted in Settings, so GITHUB_REPOS no longer needs GITHUB_TOKEN here.
+  let repos = new Map<string, string>();
+  try {
+    repos = parseGithubRepos(env.GITHUB_REPOS?.trim() ?? '');
+  } catch (e) {
+    problems.push((e as Error).message);
   }
+  const github: Config['github'] = { repos, syncHours: num('GITHUB_SYNC_HOURS', 6) };
 
   const apiToken = env.API_TOKEN?.trim() || null;
   if (apiToken && apiToken.length < 24) problems.push('API_TOKEN must be at least 24 characters (try: openssl rand -hex 24)');
@@ -282,6 +294,9 @@ export function loadConfig(env: Env): Config {
     neo4j: store === 'neo4j' ? { url: str('NEO4J_URL', 'bolt://neo4j:7687'), user: str('NEO4J_USER', 'neo4j'), password: str('NEO4J_PASSWORD') } : null,
     postgres,
     roots: containers.map((container, i) => ({ container, host: hosts[i] ?? '' })),
+    rootsFile: env.ROOTS_FILE?.trim() || null,
+    integrationsFile: env.INTEGRATIONS_FILE?.trim() || null,
+    hostHome: env.HOST_HOME?.trim().replace(/\/+$/, '') || null,
     transcriptsDir: str('TRANSCRIPTS_DIR', '/transcripts'),
     codexSessionsDir: str('CODEX_SESSIONS_DIR', '/codex-sessions'),
     stateDb: str('STATE_DB', '/state/worker.sqlite'),
@@ -301,6 +316,7 @@ export function loadConfig(env: Env): Config {
     memoryAutoApprove: autoApproveRaw === 'true',
     summary,
     github,
+    integrationSyncMinutes: num('INTEGRATION_SYNC_MINUTES', 10),
     apiToken,
     publicHosts,
     cloud,

@@ -1,7 +1,7 @@
 import { Hono, type Context, type Next } from 'hono';
 import { serveStatic } from '@hono/node-server/serve-static';
 import { z } from 'zod';
-import { ACTIVITY_KINDS, chunkText, MODEL_JOBS, cleanLessonPath, cmp, FACT_KINDS, redactSecrets, selectionNote, type ActivityStore, type CodeGraphStore, type DocsStore, type FactsStore, type GraphStore, type InsightsStore, type ModelHealth, type ModelJob, type OllamaHealth, type KnowledgeStore, type PortabilityStore, type Project, type ProjectSelection, type ProjectSummary, type StoreKind, type SystemStatus, type WorkerStatus } from '@fb/core';
+import { ACTIVITY_KINDS, chunkText, MODEL_JOBS, cleanLessonPath, cmp, FACT_KINDS, redactSecrets, selectionNote, type ActivityStore, type CodeGraphStore, type DocsStore, type FactsStore, type GraphStore, type InsightsStore, type ModelHealth, type ModelJob, type OllamaHealth, type KnowledgeStore, type Lesson, type PortabilityStore, type Project, type ProjectSelection, type ProjectSummary, type ShownProjects, type StoreKind, type SystemStatus, type WorkerStatus } from '@fb/core';
 import type { ContextDeps } from './context.ts';
 import { authenticated, needsAuth, SECURITY_HEADERS, sessionCookie, tokenMatches, type AuthOpts } from './auth.ts';
 import { cloudRoutes, cloudStatus, type CloudDeps } from './cloud.ts';
@@ -9,6 +9,7 @@ import { handleMcp } from './mcp.ts';
 import { deleteProjects, settingsRoutes, type SettingsDeps } from './settings.ts';
 import { importRoutes, type ImportDeps } from './import.ts';
 import { sessionRoutes, type SessionsDeps } from './sessions.ts';
+import { connectionsStatus, integrationRoutes, type IntegrationsDeps } from './integrations.ts';
 
 export type { SettingsDeps } from './settings.ts';
 
@@ -59,6 +60,7 @@ export type AppOpts = {
     ping(): Promise<boolean>;
     worker(): Promise<WorkerStatus | null>;
     selection?(): Promise<ProjectSelection>;
+    /** How many project roots are mounted: with none, the status note points to Settings to add one. */ roots?: number;
     /** Turns the classifier gave up on. */ givenUpTurns?(): Promise<number>;
     /** Whether Ollama answers (embeddings always need it; so do ollama:<model> jobs). */ ollama?(): Promise<OllamaHealth>;
   };
@@ -76,7 +78,28 @@ export type AppOpts = {
   importer?: ImportDeps;
   /** Session summaries: the Sessions page. */
   sessions?: SessionsDeps;
+  /**
+   * What every page but Settings shows: the selected projects and their clone folders (shownProjects). Lists ask the
+   * store for these keys only, and an item of any other project is not found. Unset: everything is shown.
+   */
+  shown?: () => Promise<ShownProjects> | ShownProjects;
+  /** Settings > Integrations (GitHub, Linear) and the connections in /api/status. */
+  integrations?: IntegrationsDeps;
 };
+
+/** The store's projectKeys for a list: every shown key, or for ?project= that one if it is shown (else none). */
+function keysFor(v: ShownProjects | null, project?: string): string[] | undefined {
+  if (!v) return undefined;
+  return project ? (v.has(project) ? [project] : []) : v.keys;
+}
+
+/** A lesson belongs to the project it serves, else the one it was learned in; one with neither is shown everywhere. */
+function showsLesson(v: ShownProjects | null, l: Pick<Lesson, 'projectKey' | 'origin'>): boolean {
+  const key = l.projectKey ?? l.origin ?? null;
+  return !v || key === null || v.has(key);
+}
+
+const NOT_SHOWN = { error: 'not found: this project is not selected (choose it in Settings to see it)' };
 
 const MAX_DEPTH = 5;
 /** A repo-relative path as the map holds it: no absolute paths, no `..`. */
@@ -151,7 +174,13 @@ function modelHealth(w: WorkerStatus, ollama: OllamaHealth | null): Record<Model
 }
 
 export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
-  const { staticDir, context, knowledge, embed, facts, projectDirs, insights, activity, docs, auth = {}, system, portability, settings, log, codegraph, classifyQueue, inScope, importer, cloud, sessions } = opts;
+  const { staticDir, context, knowledge, embed, facts, projectDirs, insights, activity, docs, auth = {}, system, portability, settings, log, codegraph, classifyQueue, inScope, importer, cloud, sessions, shown, integrations } = opts;
+  /** null: no selection to apply (everything is shown). */
+  const view = async (): Promise<ShownProjects | null> => (shown ? await shown() : null);
+  const shows = async (key: string) => {
+    const v = await view();
+    return !v || v.has(key);
+  };
   const app = new Hono();
   // Other host names are only safe once a token stands between them and the API.
   const hosts = new Set([...LOCAL_HOSTS, ...(auth.token ? (auth.publicHosts ?? []).map((h) => h.toLowerCase()) : [])]);
@@ -202,11 +231,16 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
     ['DELETE', '/api/projects/:key'],
     ['POST', '/api/feedback/:id/retry'],
     ['PUT', '/api/settings/projects'],
+    ['PUT', '/api/settings/roots'],
     ['POST', '/api/settings/cleanup'],
     ['POST', '/api/cloud/sync'],
     ['POST', '/api/turns/requeue'],
     ['POST', '/api/import'],
     ['POST', '/api/sessions/:id/resummarize'],
+    ['PUT', '/api/settings/integrations/:kind'],
+    ['POST', '/api/settings/integrations/:kind/test'],
+    ['DELETE', '/api/settings/integrations/:kind'],
+    ['PUT', '/api/settings/integrations/projects/:key'],
   ] as const) app.on(method, path, ownerOnly);
 
   app.get('/api/health', (c) => c.json({ ok: true }));
@@ -229,11 +263,12 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
       worker,
       workerHealthy: !!worker && Date.now() - Date.parse(worker.lastBeat) < WORKER_STALE_MS,
       authRequired: !!auth.token,
-      selection: sel && { initialized: sel.initialized, tracked: sel.tracked.length, note: selectionNote(sel) },
+      selection: sel && { initialized: sel.initialized, tracked: sel.tracked.length, ...(system?.roots === undefined ? {} : { roots: system.roots }), note: selectionNote(sel, system?.roots) },
       cloud: cloudStatus(cloud?.cloud ?? null),
       models: worker ? modelHealth(worker, ollama) : null,
       givenUpTurns,
       ollama,
+      connections: await connectionsStatus({ integrations: graph ? (integrations?.integrations ?? null) : null, worker, ollama, cloud: cloud?.cloud ?? null }).catch(() => null),
     };
     return c.json(s);
   });
@@ -255,11 +290,18 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
   app.get('/api/candidates', async (c) => {
     const q = ListQuery.safeParse(c.req.query());
     if (!q.success) return c.json({ error: q.error.flatten() }, 400);
-    return c.json(await repo.listCandidates({ status: q.data.status, projectKey: q.data.project, limit: q.data.limit }));
+    const projectKeys = keysFor(await view(), q.data.project);
+    return c.json(await repo.listCandidates({ status: q.data.status, projectKey: q.data.project, limit: q.data.limit, ...(projectKeys && { projectKeys }) }));
   });
 
+  /** An Inbox item, if it belongs to a shown project. */
+  const shownCandidate = async (id: string) => {
+    const d = await repo.candidateDetail(id);
+    return d && (await shows(d.candidate.projectKey)) ? d : null;
+  };
+
   app.get('/api/candidates/:id', async (c) => {
-    const d = await repo.candidateDetail(c.req.param('id'));
+    const d = await shownCandidate(c.req.param('id'));
     return d ? c.json(d) : c.json({ error: 'not found' }, 404);
   });
 
@@ -267,7 +309,7 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
     const body = Decision.safeParse(await c.req.json().catch(() => null));
     if (!body.success) return c.json({ error: body.error.flatten() }, 400);
     const id = c.req.param('id');
-    const detail = await repo.candidateDetail(id);
+    const detail = await shownCandidate(id);
     if (!detail) return c.json({ error: 'not found' }, 404);
     await repo.decide(id, body.data.status, body.data.note ?? null);
     const text = detail.turn.text ?? '';
@@ -283,17 +325,22 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
     return c.body(null, 204);
   });
 
-  app.get('/api/stats', async (c) => c.json(await repo.stats()));
+  app.get('/api/stats', async (c) => {
+    const v = await view();
+    return c.json((await repo.stats()).filter((r) => !v || v.has(r.projectKey)));
+  });
 
   if (context) app.all('/mcp', (c) => handleMcp(c.req.raw, context));
 
   if (facts && projectDirs) {
+    // Every page's project list. Settings lists every folder (GET /api/settings/projects); this lists the shown ones.
     app.get('/api/projects', async (c) => {
-      const known = await facts.listProjects();
+      const v = await view();
+      const known = (await facts.listProjects()).filter((p) => !v || v.has(p.key));
       // An alias folder is a second clone: its sessions are its project's, so it is not listed as one of its own.
       const keys = new Set(known.flatMap((p) => [p.key, ...p.aliases]));
       const fresh: ProjectSummary[] = (await projectDirs())
-        .filter((d) => !keys.has(d.key))
+        .filter((d) => !keys.has(d.key) && (!v || v.has(d.key)))
         .map((d) => ({ key: d.key, repoPath: d.repoPath, remote: null, aliases: [], sessions: 0, feedback: 0, lessons: 0, facts: 0, lastScan: null }));
       return c.json([...known, ...fresh].sort((a, b) => a.key.localeCompare(b.key)));
     });
@@ -310,6 +357,7 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
       const q = FactsQuery.safeParse(c.req.query());
       if (!q.success) return c.json({ error: q.error.flatten() }, 400);
       const projectKey = c.req.param('key');
+      if (!(await shows(projectKey))) return c.json(NOT_SHOWN, 404);
       if (q.data.q && embed) {
         const [embedding] = await embed([q.data.q]);
         return c.json(await facts.searchFacts({ embedding, projectKey, k: 30 }));
@@ -319,7 +367,10 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
   }
 
   if (docs && embed && projectDirs) {
-    app.get('/api/projects/:key/docs', async (c) => c.json(await docs.listDocs(c.req.param('key'))));
+    app.get('/api/projects/:key/docs', async (c) => {
+      const key = c.req.param('key');
+      return (await shows(key)) ? c.json(await docs.listDocs(key)) : c.json(NOT_SHOWN, 404);
+    });
 
     app.post('/api/projects/:key/docs', async (c) => {
       const body = DocUpload.safeParse(await c.req.json().catch(() => null));
@@ -346,6 +397,8 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
 
     app.delete('/api/docs/:id', async (c) => {
       const id = c.req.param('id');
+      // ids are doc:<project>:<source>:<ref>
+      if (!(await shows(id.split(':')[1] ?? ''))) return c.json({ error: 'not found' }, 404);
       if (!(await docs.deleteDoc(id))) return c.json({ error: 'not found' }, 404);
       // ids are doc:<project>:<source>:<ref>
       await activity?.record({
@@ -357,6 +410,10 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
   }
 
   if (codegraph) {
+    app.use('/api/projects/:key/codemap/*', async (c, next) => {
+      if (!(await shows(c.req.param('key')!))) return c.json(NOT_SHOWN, 404);
+      await next();
+    });
     if (inScope) {
       app.use('/api/projects/:key/codemap/*', async (c, next) => {
         if (!(await inScope(c.req.param('key')!))) return c.json({ error: 'not a selected project: choose it in Settings to see its code map' }, 404);
@@ -375,26 +432,36 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
       app.get('/api/projects/:key/codemap/graph', async (c) => {
         const q = MapGraphQuery.safeParse(c.req.query());
         if (!q.success) return c.json({ error: q.error.flatten() }, 400);
-        return c.json(await mapGraph(c.req.param('key'), { limit: q.data.limit, includeTests: q.data.tests }));
+        const g = await mapGraph(c.req.param('key'), { limit: q.data.limit, includeTests: q.data.tests });
+        const v = await view();
+        if (!v || !knowledge || !g.lessons.length) return c.json(g);
+        // The map holds ids only: the shown approved lessons say which of them were learned in a selected project.
+        const ok = new Set((await knowledge.listLessons({ status: 'approved', projectKeys: v.keys, limit: 5000 })).filter((l) => showsLesson(v, l)).map((l) => l.id));
+        return c.json({ ...g, lessons: g.lessons.filter((l) => ok.has(l.id)) });
       });
     }
     app.get('/api/projects/:key/codemap/module', async (c) => {
       const path = RepoPath.safeParse(c.req.query('path'));
       if (!path.success) return c.json({ error: 'path must be a repo-relative file path' }, 400);
       const m = await codegraph.moduleContext(c.req.param('key'), path.data);
-      return m ? c.json(m) : c.json({ error: 'not in the code map' }, 404);
+      if (!m) return c.json({ error: 'not in the code map' }, 404);
+      const v = await view();
+      return c.json({ ...m, lessons: m.lessons.filter((l) => showsLesson(v, l)) });
     });
     app.get('/api/projects/:key/codemap/impact', async (c) => {
       const q = ImpactQuery.safeParse({ path: c.req.queries('path') ?? [], depth: c.req.query('depth') });
       if (!q.success) return c.json({ error: q.error.flatten() }, 400);
-      return c.json(await codegraph.impact(c.req.param('key'), [...new Set(q.data.path)], q.data.depth));
+      const r = await codegraph.impact(c.req.param('key'), [...new Set(q.data.path)], q.data.depth);
+      const v = await view();
+      return c.json({ ...r, lessons: r.lessons.filter((l) => showsLesson(v, l)) });
     });
     if (projectDirs) {
       // The Patterns page: where agents struggle across the selected projects (or in one of them).
       app.get('/api/codemap/hotspots', async (c) => {
         const q = TopHotspotQuery.safeParse(c.req.query());
         if (!q.success) return c.json({ error: q.error.flatten() }, 400);
-        const keys = (await projectDirs()).map((p) => p.key).filter((k) => !q.data.project || k === q.data.project);
+        const v = await view();
+        const keys = (await projectDirs()).map((p) => p.key).filter((k) => (!q.data.project || k === q.data.project) && (!v || v.has(k)));
         if (q.data.project && !keys.length) return c.json({ error: 'no such selected project' }, 404);
         const per = await Promise.all(keys.map(async (k) => (await codegraph.hotspots(k, q.data.limit, { includeTests: q.data.tests })).map((h) => ({ projectKey: k, ...h }))));
         const all = per.flat().sort((a, b) => b.score - a.score || cmp(a.projectKey, b.projectKey) || cmp(a.path, b.path));
@@ -408,6 +475,7 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
     app.get('/api/export', async (c) => {
       const q = ExportQuery.safeParse(c.req.query());
       if (!q.success) return c.json({ error: q.error.flatten() }, 400);
+      if (q.data.project && !(await shows(q.data.project))) return c.json(NOT_SHOWN, 404);
       const bundle = await portability.exportData({ projectKey: q.data.project, approvedOnly: !!q.data.approved });
       const name = `feedback-graph-${(q.data.project ?? 'all').replace(/[^\w.-]/g, '_')}-${bundle.exportedAt.slice(0, 10)}.json`;
       c.header('content-disposition', `attachment; filename="${name}"`);
@@ -433,6 +501,7 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
 
   if (settings) settingsRoutes(app, settings, { activity, portability });
   if (cloud) cloudRoutes(app, cloud);
+  if (integrations) integrationRoutes(app, integrations);
   if (importer) importRoutes(app, importer);
   if (sessions) sessionRoutes(app, sessions);
 
@@ -441,7 +510,8 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
       const q = ActivityQuery.safeParse(c.req.query());
       if (!q.success) return c.json({ error: q.error.flatten() }, 400);
       const { project, ...rest } = q.data;
-      return c.json(await activity.list({ projectKey: project, ...rest }));
+      const projectKeys = keysFor(await view(), project);
+      return c.json(await activity.list({ projectKey: project, ...rest, ...(projectKeys && { projectKeys }) }));
     });
   }
 
@@ -449,11 +519,14 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
     app.get('/api/graph', async (c) => {
       const q = ProjectParam.safeParse(c.req.query());
       if (!q.success) return c.json({ error: 'project is required' }, 400);
+      if (!(await shows(q.data.project))) return c.json(NOT_SHOWN, 404);
       return c.json(await insights.projectGraph(q.data.project));
     });
     app.get('/api/patterns', async (c) => {
       const project = ProjectParam.safeParse(c.req.query());
-      return c.json(await insights.patterns(project.success ? { projectKey: project.data.project } : {}));
+      const key = project.success ? project.data.project : undefined;
+      const projectKeys = keysFor(await view(), key);
+      return c.json(await insights.patterns({ ...(key && { projectKey: key }), ...(projectKeys && { projectKeys }) }));
     });
   }
 
@@ -478,18 +551,30 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
 
   if (knowledge?.retryPostmortem) {
     const retry = knowledge.retryPostmortem.bind(knowledge);
-    app.post('/api/feedback/:id/retry', async (c) => ((await retry(c.req.param('id'))) ? c.json({ queued: true }, 202) : c.json({ error: 'not found or already done' }, 404)));
+    app.post('/api/feedback/:id/retry', async (c) => {
+      const id = c.req.param('id');
+      // Feedback ids are the Inbox item's.
+      if (shown && !(await shownCandidate(id))) return c.json({ error: 'not found' }, 404);
+      return (await retry(id)) ? c.json({ queued: true }, 202) : c.json({ error: 'not found or already done' }, 404);
+    });
   }
 
   if (knowledge) {
     app.get('/api/lessons', async (c) => {
       const q = LessonQuery.safeParse(c.req.query());
       if (!q.success) return c.json({ error: q.error.flatten() }, 400);
-      return c.json(await knowledge.listLessons({ status: q.data.status, projectKey: q.data.project }));
+      const projectKeys = keysFor(await view(), q.data.project);
+      return c.json(await knowledge.listLessons({ status: q.data.status, projectKey: q.data.project, ...(projectKeys && { projectKeys }) }));
     });
 
+    /** A lesson, if it was learned in (or serves) a shown project, or has no project. */
+    const shownLesson = async (id: string) => {
+      const d = await knowledge.lessonDetail(id);
+      return d && showsLesson(await view(), d.lesson) ? d : null;
+    };
+
     app.get('/api/lessons/:id', async (c) => {
-      const d = await knowledge.lessonDetail(c.req.param('id'));
+      const d = await shownLesson(c.req.param('id'));
       return d ? c.json(d) : c.json({ error: 'not found' }, 404);
     });
 
@@ -497,7 +582,7 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
       const body = LessonPatch.safeParse(await c.req.json().catch(() => null));
       if (!body.success) return c.json({ error: body.error.flatten() }, 400);
       const id = c.req.param('id');
-      const current = await knowledge.lessonDetail(id);
+      const current = await shownLesson(id);
       if (!current) return c.json({ error: 'not found' }, 404);
       const p = body.data;
       let reembed: number[] | undefined;
@@ -506,7 +591,7 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
         [reembed] = await embed([`${l.title}\n${l.rule}\nApplies when: ${l.appliesWhen}`]);
       }
       if (p.supersedes === id) return c.json({ error: 'a lesson cannot supersede itself' }, 400);
-      if (p.supersedes !== undefined && !(await knowledge.lessonDetail(p.supersedes))) return c.json({ error: `no lesson ${p.supersedes} to supersede` }, 400);
+      if (p.supersedes !== undefined && !(await shownLesson(p.supersedes))) return c.json({ error: `no lesson ${p.supersedes} to supersede` }, 400);
       const { unscoped } = await knowledge.updateLesson(id, p, { reembed });
       if (unscoped) return c.json({ error: 'this lesson has no known project, so it cannot be narrowed; it was set back to proposed. Make it global or reject it.' }, 409);
       const changed = Object.fromEntries(

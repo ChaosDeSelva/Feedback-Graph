@@ -24,8 +24,23 @@ import type { EvidenceGraph, PatternReport } from './graph/insights.ts';
 import type { ExportBundle } from './graph/portability.ts';
 import type { CandidateSnapshot } from './graph/selection.ts';
 import type { CodeMapMeta, CodeMapStats, CodeMapWrite, Hotspot, HotspotOpts, Impact, MapGraph, ModuleContext, SessionFile, StoredCodeMap } from './codegraph.ts';
-import type { HumanTurn, SessionDetail, SessionListItem, SessionState } from './types.ts';
+import type { ExternalRef, ExternalSource, SessionSource, HumanTurn, SessionDetail, SessionListItem, SessionState } from './types.ts';
 import type { SessionCursor, SummaryWork, SummaryWorkQuery, SummaryWrite } from './sessions.ts';
+
+/**
+ * A pull request's or Linear issue's comments as one stand-in session (`id`, e.g. `github:acme/shop#12`): never
+ * listed or summarized, one turn per comment (index from 1, oldest first). The classifier labels the turns like any
+ * other; pushback and corrections become Inbox items with the thread's source. `context` is what the comment answers
+ * (title, file and diff lines), shown where an agent's last message would be.
+ */
+export type ExternalThread = {
+  id: string;
+  source: ExternalSource;
+  items: { uuid: string; ts: string; index: number; text: string; context: string; external: ExternalRef }[];
+};
+
+/** An agent session that may have done the work a comment is about (GraphStore.workSessions). */
+export type WorkSession = { id: string; source: SessionSource; gitBranch: string | null; cwd: string | null; startedAt: string | null; lastActivityAt: string | null };
 
 export type StoreKind = 'neo4j' | 'postgres';
 export const STORE_KINDS: readonly StoreKind[] = ['neo4j', 'postgres'];
@@ -56,6 +71,16 @@ export interface GraphStore {
   decide(id: string, status: 'confirmed' | 'rejected', note: string | null): Promise<void>;
   /** keepUnsummarized: only turns a session summary already covers lose their text (summaries stay either way). */
   pruneTurnText(before: Date, limit?: number, o?: { keepUnsummarized?: boolean }): Promise<number>;
+  /**
+   * Store (or update) a synced PR or issue thread under a project (redacted here too). A comment already stored keeps
+   * its classification. Returns how many of its comments were new.
+   */
+  upsertExternalThread(project: Project, t: ExternalThread): Promise<number>;
+  /**
+   * Agent sessions of a project (stand-in sessions never) that may have done some work: those on `branch` that started
+   * before `before`, or with no branch, those active between `after` and `before`. Newest activity first.
+   */
+  workSessions(q: { projectKey: string; branch: string | null; before: string; after?: string | null; limit: number }): Promise<WorkSession[]>;
   heartbeat(s: WorkerStatus): Promise<void>;
   workerStatus(): Promise<WorkerStatus | null>;
   stats(): Promise<StatsRow[]>;
@@ -67,10 +92,14 @@ export interface KnowledgeStore {
   recordPostmortemFailure(feedbackId: string, error: string, now?: Date): Promise<{ attempts: number; retryAt: string | null }>;
   retryPostmortem(feedbackId: string): Promise<boolean>;
   savePostmortem(feedbackId: string, raw: PostMortem, embeddings: { miss: number[]; lesson: number[] }): Promise<void>;
-  listLessons(f: { status?: LessonStatus; projectKey?: string; limit?: number }): Promise<Lesson[]>;
+  /**
+   * projectKeys (here and in searchLessons): only lessons learned in these projects (a global lesson by its origin);
+   * lessons with no project at all stay. An empty list leaves only those.
+   */
+  listLessons(f: { status?: LessonStatus; projectKey?: string; projectKeys?: string[]; limit?: number }): Promise<Lesson[]>;
   lessonDetail(id: string): Promise<LessonDetail | null>;
   updateLesson(id: string, patch: LessonPatch, o: { reembed?: number[] }): Promise<{ unscoped: boolean }>;
-  searchLessons(q: { embedding: number[]; projectKey: string | null; k: number; status?: LessonStatus }): Promise<LessonHit[]>;
+  searchLessons(q: { embedding: number[]; projectKey: string | null; k: number; status?: LessonStatus; projectKeys?: string[] }): Promise<LessonHit[]>;
   relatedMisses(q: { embedding: number[]; projectKey: string | null; k: number }): Promise<RelatedMiss[]>;
   /**
    * An agent's report_feedback. Returns the Inbox item's id: a new `manual:<uuid>`, or the id of the detector's item
@@ -120,13 +149,15 @@ export interface DocsStore {
 /** The provenance log: append-only, newest first. */
 export interface ActivityStore {
   record(a: ActivityInput): Promise<void>;
-  list(q: { projectKey?: string; kind?: ActivityKind; target?: string; limit?: number }): Promise<Activity[]>;
+  /** projectKeys: entries of other projects are left out; entries with no project stay. */
+  list(q: { projectKey?: string; projectKeys?: string[]; kind?: ActivityKind; target?: string; limit?: number }): Promise<Activity[]>;
 }
 
 /** Read-only views: one project's evidence graph, and patterns across misses. */
 export interface InsightsStore {
   projectGraph(projectKey: string, limit?: number): Promise<EvidenceGraph>;
-  patterns(q: { projectKey?: string; threshold?: number }): Promise<PatternReport>;
+  /** projectKeys: only these projects (an empty list: an empty report). */
+  patterns(q: { projectKey?: string; projectKeys?: string[]; threshold?: number }): Promise<PatternReport>;
 }
 
 /** Export of derived knowledge, and deleting a project with everything learned from it. */

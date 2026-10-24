@@ -200,7 +200,8 @@ export async function runCycle(deps: CycleDeps): Promise<CycleResult> {
   for (const turn of await deps.repo.unclassifiedTurns(deps.classifyBatch * 20, deps.onlyProjects, deps.excludeProjects)) {
     let c: Classification | null = NEUTRAL;
     const pre = prefilterPushback(turn.text);
-    if (pre.hit) {
+    // A review or issue comment is feedback on finished work by nature, and reviewers word it politely: always ask the model.
+    if (pre.hit || turn.external) {
       if (unavailable || modelCalls >= deps.classifyBatch || failuresInRow >= MAX_CONSECUTIVE_FAILURES) continue;
       modelCalls++;
       try {

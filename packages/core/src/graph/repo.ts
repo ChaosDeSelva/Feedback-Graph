@@ -9,7 +9,9 @@ import type {
   Project,
   WorkerStatus,
 } from '../types.ts';
-import type { GraphStore } from '../store.ts';
+import type { ExternalThread, GraphStore, WorkSession } from '../store.ts';
+import { EXTERNAL_SOURCES, type ExternalRef, type SessionSource } from '../types.ts';
+import { redactDeep } from '../redact.ts';
 import { candidateProvenance, matchReport, REPORT_MERGE_MINUTES } from '../dedupe.ts';
 import { MAX_POSTMORTEM_ATTEMPTS } from './knowledge.ts';
 import { SCHEMA } from './schema.ts';
@@ -31,7 +33,8 @@ export type CandidateDetail = {
 
 export type StatsRow = { projectKey: string; week: string; humanTurns: number; pushback: number };
 
-export type CandidateFilter = { status?: CandidateStatus; projectKey?: string; limit?: number };
+/** projectKeys: only these projects (an empty list finds nothing); the limit counts what is left. */
+export type CandidateFilter = { status?: CandidateStatus; projectKey?: string; projectKeys?: string[]; limit?: number };
 
 const CANDIDATE_LABELS = ['pushback', 'correction'];
 export const MAX_CLASSIFY_ATTEMPTS = 3;
@@ -235,9 +238,9 @@ export class GraphRepo implements GraphStore {
   private async mergeIntoReport(turnUuid: string): Promise<string | null> {
     const [turn] = await this.run(
       `MATCH (p:Project)<-[:IN]-(s:Session)-[:HAS_TURN]->(t:Turn {uuid: $uuid})
-       WHERE NOT EXISTS { MATCH (:Candidate {id: t.uuid}) } AND t.ts IS NOT NULL
+       WHERE NOT EXISTS { MATCH (:Candidate {id: t.uuid}) } AND t.ts IS NOT NULL AND NOT coalesce(s.source, 'claude') IN $external
        RETURN t.ts AS ts, t.text AS text, s.id AS sessionId, p.key AS projectKey`,
-      { uuid: turnUuid },
+      { uuid: turnUuid, external: EXTERNAL_SOURCES },
     );
     if (!turn || Number.isNaN(Date.parse(turn.get('ts')))) return null;
     const t0 = Date.parse(turn.get('ts'));
@@ -285,8 +288,9 @@ export class GraphRepo implements GraphStore {
     const rows = await this.run(
       `MATCH (k:Candidate)-[:FLAGS]->(t:Turn)
        WHERE ($status IS NULL OR k.status = $status) AND ($projectKey IS NULL OR k.projectKey = $projectKey)
+         AND ($projectKeys IS NULL OR k.projectKey IN $projectKeys)
        RETURN k, t ORDER BY t.ts DESC LIMIT $limit`,
-      { status: f.status ?? null, projectKey: f.projectKey ?? null, limit: neo4j.int(f.limit ?? 200) },
+      { status: f.status ?? null, projectKey: f.projectKey ?? null, projectKeys: f.projectKeys ?? null, limit: neo4j.int(f.limit ?? 200) },
     );
     return rows.map((r) => toCandidate(r.get('k').properties, r.get('t').properties));
   }
@@ -371,6 +375,53 @@ export class GraphRepo implements GraphStore {
     return r?.get('n') ?? 0;
   }
 
+  async upsertExternalThread(project: Project, t: ExternalThread): Promise<number> {
+    if (!t.items.length) return 0;
+    const items = redactDeep(t.items).map((i) => ({ ...i, external: JSON.stringify(i.external) }));
+    const times = t.items.map((i) => i.ts).sort();
+    const [r] = await this.run(
+      `MERGE (p:Project {key: $project.key}) ON CREATE SET p.name = $project.name, p.repoPath = $project.repoPath
+       MERGE (s:Session {id: $id})
+         ON CREATE SET s.startedAt = $first, s.manual = true, s.sourceFile = $source, s.source = $source
+       SET s.endedAt = CASE WHEN s.endedAt IS NULL OR s.endedAt < $last THEN $last ELSE s.endedAt END
+       MERGE (s)-[:IN]->(p)
+       WITH s
+       UNWIND $items AS i
+         OPTIONAL MATCH (old:Turn {uuid: i.uuid})
+         WITH s, i, old IS NULL AS isNew
+         MERGE (turn:Turn {uuid: i.uuid})
+           SET turn.sessionId = $id, turn.ts = i.ts, turn.index = i.index, turn.text = i.text,
+               turn.precedingAssistantText = i.context, turn.toolCalls = '[]', turn.external = i.external
+         MERGE (s)-[:HAS_TURN]->(turn)
+       RETURN sum(CASE WHEN isNew THEN 1 ELSE 0 END) AS added`,
+      { project: { key: project.key, name: project.name, repoPath: project.repoPath }, id: t.id, source: t.source, first: times[0], last: times.at(-1), items },
+    );
+    return Number(r?.get('added') ?? 0);
+  }
+
+  async workSessions(q: { projectKey: string; branch: string | null; before: string; after?: string | null; limit: number }): Promise<WorkSession[]> {
+    const rows = await this.run(
+      `MATCH (p:Project {key: $key})<-[:IN]-(s:Session)
+       WHERE NOT coalesce(s.manual, false) AND s.startedAt IS NOT NULL AND datetime(s.startedAt) <= datetime($before)
+         AND CASE WHEN $branch IS NULL
+               THEN $after IS NOT NULL AND datetime(coalesce(s.lastActivityAt, s.endedAt, s.startedAt)) >= datetime($after)
+               ELSE s.gitBranch = $branch END
+       RETURN s ORDER BY coalesce(s.lastActivityAt, s.endedAt, s.startedAt) DESC LIMIT $limit`,
+      { key: q.projectKey, branch: q.branch, before: q.before, after: q.after ?? null, limit: neo4j.int(q.limit) },
+    );
+    return rows.map((r) => {
+      const s = r.get('s').properties;
+      return {
+        id: s.id,
+        source: (s.source as SessionSource) ?? 'claude',
+        gitBranch: s.gitBranch ?? null,
+        cwd: s.cwd ?? null,
+        startedAt: s.startedAt ?? null,
+        lastActivityAt: s.lastActivityAt ?? s.endedAt ?? null,
+      };
+    });
+  }
+
   async ping(): Promise<boolean> {
     try {
       await this.run('RETURN 1');
@@ -391,13 +442,13 @@ export class GraphRepo implements GraphStore {
 
   async stats(): Promise<StatsRow[]> {
     const rows = await this.run(
-      `MATCH (p:Project)<-[:IN]-(:Session)-[:HAS_TURN]->(t:Turn) WHERE t.index > 0
+      `MATCH (p:Project)<-[:IN]-(s:Session)-[:HAS_TURN]->(t:Turn) WHERE t.index > 0 AND NOT coalesce(s.source, 'claude') IN $external
        WITH p.key AS projectKey, date(datetime(t.ts)) AS d, t
        WITH projectKey, toString(d.weekYear) + '-W' + right('0' + toString(d.week), 2) AS week, t
        RETURN projectKey, week, count(t) AS humanTurns,
               sum(CASE WHEN t.label IN $labels THEN 1 ELSE 0 END) AS pushback
        ORDER BY week, projectKey`,
-      { labels: CANDIDATE_LABELS },
+      { labels: CANDIDATE_LABELS, external: EXTERNAL_SOURCES },
     );
     return rows.map((r) => ({
       projectKey: r.get('projectKey'),
@@ -430,6 +481,7 @@ function toTurn(p: Record<string, unknown>): HumanTurn {
     text: p.text as string,
     precedingAssistantText: (p.precedingAssistantText as string) ?? '',
     precedingToolCalls: JSON.parse((p.toolCalls as string) ?? '[]'),
+    ...(p.external ? { external: JSON.parse(p.external as string) as ExternalRef } : {}),
   };
 }
 
@@ -448,6 +500,7 @@ function toCandidate(k: Record<string, unknown>, t: Record<string, unknown>): Ca
     sessionId: k.sessionId as string,
     projectKey: k.projectKey as string,
     source: (k.source as Candidate['source']) ?? 'claude',
+    ...(t.external ? { external: JSON.parse(t.external as string) as ExternalRef } : {}),
     classification: {
       label: t.label as Classification['label'],
       confidence: t.confidence as number,

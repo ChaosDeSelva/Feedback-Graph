@@ -19,18 +19,18 @@ You need Docker, git and [Ollama](https://ollama.com) on the host; Node is not n
 git clone https://github.com/ChaosDeSelva/Feedback-Graph.git feedback-graph
 cd feedback-graph
 ollama pull gemma4 && ollama pull nomic-embed-text   # with Ollama running
-./scripts/setup.sh                             # asks one question (your projects folders), writes .env with generated passwords, checks Ollama
+./scripts/setup.sh                             # asks which folders hold your projects, writes .env with generated passwords, checks Ollama, offers to fix and start
 docker compose up -d --build
-open http://localhost:8787                     # 8787 unless you set API_PORT (setup.sh prints the address); Settings: choose the project folders to read
+open http://localhost:8787                     # 8787 unless you set API_PORT (setup.sh prints the address); Settings: add project folders, choose the projects to read
 ./scripts/install-agent.sh                     # connect Claude Code and Codex (see below); --dry-run shows what it would change
 ```
 
-`setup.sh` asks only one thing: *Project folders, comma-separated*, with its best guess in brackets (Enter takes it). It asks on a first run in a terminal; when `PROJECTS_DIRS` or `PROJECTS_DIR` is already set (in the environment or `.env`), or there is no terminal, it uses that or its guess without asking, and it ends by printing the next commands. It never overwrites an existing `.env`: to change the folders later, edit `PROJECTS_DIRS` in `.env` (comma-separated) and re-run `./scripts/setup.sh`, which regenerates the mounts. Then work as usual: push back on your agent when it misses something, confirm the flagged moment in the Inbox, and approve the lesson. To see the whole loop without your own projects, [try the demo project](#try-it-on-the-demo-project).
+`setup.sh` asks only one thing: *Project folders, comma-separated*, listing the folders your Claude Code sessions ran in as suggestions. There is no default: Enter mounts none, and you add them later in Settings. It asks on a first run in a terminal; when the folders are already known (saved in Settings, or `PROJECTS_DIRS` in the environment or `.env`) it uses those, and without a terminal and without any it mounts none and says how to add one. It ends by printing the next commands. In a terminal it then offers, each as a yes/no question: to pull any missing Ollama model; when `claude` is installed and no token is set, to save a pasted `claude setup-token` token (hidden as you type) so post-mortems run on your Claude subscription while classifying, summaries and embeddings stay on Ollama; to start the stack and wait until it answers; and to run `install-agent.sh`. Without a terminal it only reports. Apart from that token and `PROJECTS_DIRS`, it never changes an existing `.env`. To change the folders later, add or remove them in **Settings** (Where folders come from), then run `./scripts/setup.sh`: it mounts exactly those folders and restarts the containers (Settings shows the command until you do). Then work as usual: push back on your agent when it misses something, confirm the flagged moment in the Inbox, and approve the lesson. To see the whole loop without your own projects, [try the demo project](#try-it-on-the-demo-project).
 
-- `setup.sh` suggests the folders your Claude Code sessions ran in (`PROJECTS_DIRS=~/code,~/work ./scripts/setup.sh` answers it ahead on a first run). Several folders are mounted through a generated `docker-compose.override.yml`, so `docker-compose.yml` stays as shipped. It also creates `./state`, `~/.claude/projects` (or `CLAUDE_PROJECTS_DIR`) and `~/.codex/sessions` (or `CODEX_SESSIONS_DIR`) if missing (Docker would create them owned by root); an empty `~/.codex/sessions` does not count as Codex being installed. On Linux it sets `HOST_UID`/`HOST_GID` so the containers run as you; see [docs/operations.md](docs/operations.md#linux) for that and Ollama's `OLLAMA_HOST`.
+- `setup.sh` suggests the folders your Claude Code sessions ran in (`PROJECTS_DIRS=~/code,~/work ./scripts/setup.sh` answers it ahead). `docker-compose.yml` mounts no project folder: `setup.sh` writes a generated `docker-compose.override.yml` with exactly the folders you chose (none is fine: everything starts, with nothing to read), so `docker-compose.yml` stays as shipped. It also creates `./state`, `~/.claude/projects` (or `CLAUDE_PROJECTS_DIR`) and `~/.codex/sessions` (or `CODEX_SESSIONS_DIR`) if missing (Docker would create them owned by root); an empty `~/.codex/sessions` does not count as Codex being installed. On Linux it sets `HOST_UID`/`HOST_GID` so the containers run as you; see [docs/operations.md](docs/operations.md#linux) for that and Ollama's `OLLAMA_HOST`.
 - Port 8787 taken? Set `API_PORT` in `.env`: the UI is then at `http://localhost:<API_PORT>` and the MCP server at `http://localhost:<API_PORT>/mcp`. `setup.sh` prints the right address, and `install-agent.sh` registers it (re-run it after a change, removing the old registration as it tells you).
 - Neo4j browser: http://localhost:7476, bolt on 7689 (`NEO4J_HTTP_PORT` and `NEO4J_BOLT_PORT` in `.env` move them; both bound to 127.0.0.1).
-- Transcripts (`~/.claude/projects` and Codex's `~/.codex/sessions`), your projects folders and `./examples` are mounted read-only.
+- Transcripts (`~/.claude/projects` and Codex's `~/.codex/sessions`) and the project folders you chose are mounted read-only; nothing else from your home folder. The bundled `./examples` folder is a project root only if you add it.
 - **Nothing is read until you choose which project folders to include** (Settings). The worker lists every folder under your project roots with how many Claude Code and Codex sessions ran in it, and reads only the ones you select. A folder that is not a git repo but holds repos (`~/src/github.com/org/repo`, `~/code/client/app`) lists each repo as its own project (`github.com__org__repo`); sessions belong to the deepest repo they ran in.
 - Secrets are redacted before anything is stored or sent to a model, and secret files are never read (see [SECURITY.md](SECURITY.md)).
 - Health, backups, upgrades, running it behind TLS with a token: [docs/operations.md](docs/operations.md).
@@ -60,7 +60,7 @@ open http://localhost:8787                     # 8787 unless you set API_PORT (s
 
 | Page | What |
 |---|---|
-| Inbox | Flagged feedback to confirm or reject (`j`/`k`, `c`, `r`) |
+| Inbox | Flagged feedback to confirm or reject (`j`/`k`, `c`, `r`), from sessions (Claude, Codex) and from GitHub and Linear comments, filterable by source |
 | Lessons | Evidence chain per lesson, edit and approve, plus its history |
 | Graph | Clickable map from feedback to miss, cause, lesson, context and fix commits; **Code** mode draws a project's code map (hotspot files, imports, tests, and the misses and lessons on them), and a file opens its module panel |
 | Patterns | Misses by cause, repeated misses, weekly trend, pre-done catch rate, where agents struggle (top hotspots) |
@@ -68,13 +68,13 @@ open http://localhost:8787                     # 8787 unless you set API_PORT (s
 | Projects | Code map (stats, sortable hotspots with an include-tests toggle, a module panel per file linking to its lessons and Inbox items), scan code into facts (choose the model), browse facts with "how was this created?", upload docs |
 | Activity | The provenance log, filterable by project and kind |
 
-The header shows whether the worker is running. Projects also has **Export** (a versioned JSON bundle), **Import bundle** (its lessons arrive proposed unless you keep them approved) and **Delete project data**. Settings picks the project folders to read and, when team sync is configured, shows the **Cloud sync** card.
+The sidebar shows whether the worker is running, and a connections list (GitHub, Linear, Claude, Codex, Ollama, cloud sync) with each one's state and a link to where it is set. Projects also has **Export** (a versioned JSON bundle), **Import bundle** (its lessons arrive proposed unless you keep them approved) and **Delete project data**. Settings picks the project folders to read and, when team sync is configured, shows the **Cloud sync** card.
 
 ## Configuration (`.env`)
 
 | Variable | Purpose |
 |---|---|
-| `PROJECTS_DIR`, `PROJECTS_DIRS`, `FEEDBACK_TOOL_DIR` | Host folders: your projects folder (or several, comma-separated in `PROJECTS_DIRS`; re-run `setup.sh` after changing it), and this repo (for the examples). `setup.sh` fills them in. |
+| `PROJECTS_DIRS` | The project folders that are mounted, comma-separated. `setup.sh` keeps it in step with the folders you add in Settings (editing it here and re-running `setup.sh` also works). No default. |
 | `POLL_SECONDS`, `CLASSIFY_BATCH`, `SCAN_MAX_FILES`, `SCAN_MAX_BYTES` | Worker pace and bounds: seconds between cycles (30), turns classified per cycle (50), files per project (400) and bytes per file (80000) the code map and scans read. Empty: the default. |
 | `INGEST_PROJECTS` | Seeds the project selection on the very first start only (e.g. `demo-shop`); after that, the selection in Settings decides. Empty: nothing is read until you choose (an upgrade selects the projects that already hold your approved lessons, confirmed feedback, docs or scans). Global lessons reach every folder under a root that is not excluded, selected or not. |
 | `EXCLUDE_PROJECTS` | Never read, scan or serve these projects, whatever is selected. Settings shows them as excluded and cannot select them. |
@@ -90,14 +90,46 @@ The header shows whether the worker is running. Projects also has **Export** (a 
 | `CLAUDE_CODE_OAUTH_TOKEN` | From `claude setup-token`. Post-mortems then run on your Claude subscription (otherwise gemma4). |
 | `CLASSIFY_LLM`, `POSTMORTEM_LLM`, `SCAN_LLM`, `CHECK_LLM` | Model per job: `ollama:<model>`, `claude-cli`, `codex-cli`, `openai:<model>`, `openrouter:<model>`, `groq:<model>`, `anthropic:<model>`, `jev` (classification only). `CHECK_LLM` (the `check_before_done` judge, which runs in the api) takes neither CLI. |
 | `OPENAI_API_KEY`, `OPENAI_BASE_URL`, `OPENROUTER_API_KEY`, `GROQ_API_KEY`, `ANTHROPIC_API_KEY`, `TYPESAFE_API_KEY` | Bring-your-own keys |
-| `GITHUB_TOKEN`, `GITHUB_REPOS` | PR discussions as context: `GITHUB_REPOS=demo-shop=me/demo-shop,other=me/other` |
-| `LINEAR_API_KEY` | Linear tickets searched during post-mortems |
+| `GITHUB_TOKEN`, `LINEAR_API_KEY` | GitHub and Linear tokens. Optional: you can paste them in Settings instead; one set here wins and Settings shows it as "set in .env". See [GitHub and Linear](#github-and-linear-optional). |
+| `GITHUB_REPOS` | Optional override of the repository a project's PR comments come from (`demo-shop=me/demo-shop,other=me/other`). Without it, each selected project's github.com remote is used. |
+| `INTEGRATION_SYNC_MINUTES`, `GITHUB_SYNC_HOURS` | How often each project's review comments and Linear comments are read into the Inbox (10), and how often PR discussions are refreshed as context (6). |
 | `STORE`, `DATABASE_URL`, `POSTGRES_PASSWORD`, `COMPOSE_PROFILES` | Storage backend: `neo4j` (default) or `postgres`. With the bundled Postgres, `COMPOSE_PROFILES=postgres` includes it in every `docker compose` command. See [Storage](#storage). |
 | `CLOUD_URL`, `CLOUD_TOKEN`, `SYNC_INTERVAL_MINUTES`, `SYNC_PROJECTS`, `SYNC_SUGGESTIONS` | Optional team sync to a Feedback Graph Cloud org. Off unless the first two are set. See [Team sync](#team-sync-optional). |
 
 The Codex provider uses your ChatGPT login: `CODEX_AUTH_FILE` (only that file is mounted). It explores a copy of the repository without secret files, in the codex-runner container when `CODEX_RUNNER_URL` is set.
 
 `OLLAMA_EMBED_MODEL` is recorded in the graph; changing it later needs `pnpm reembed` (the services tell you).
+
+## GitHub and Linear (optional)
+
+Pushback does not only happen in a session: reviewers push back in pull request reviews, and in comments on Linear issues.
+Connect GitHub or Linear and those comments are read into the **Inbox** like pushback in a transcript: the same classifier
+labels each one, and pushback or a correction becomes an Inbox item marked **GitHub** or **Linear**, with the author, a link
+to the comment, the PR or issue title, and for a review comment the file, line and diff lines. You confirm or reject it as usual;
+a confirmed one gets a post-mortem.
+
+1. **Settings > Integrations.** Paste a token and press **Connect**: it is checked with one read-only call (the account it
+   belongs to is shown) and saved only if it works. Or set `GITHUB_TOKEN` / `LINEAR_API_KEY` in `.env`, which wins and is shown
+   as "set in .env". **Test connection** checks it again; **Disconnect** (after a confirm) deletes a token saved in the app.
+   - GitHub: a [fine-grained personal access token](https://github.com/settings/personal-access-tokens/new) with access to
+     only your projects' repositories, and **Pull requests** and **Issues** set to **Read-only**. Nothing is ever written to GitHub.
+   - Linear: a personal API key from [Settings, Security and access](https://linear.app/settings/account/security).
+2. **Repositories are found for you.** Each selected project whose origin is on github.com is linked to that repository
+   (`GITHUB_REPOS` overrides it). Turn one off in the project table. For Linear, choose the team for each project.
+3. **What is read.** Every `INTEGRATION_SYNC_MINUTES` (10), per project: review comments, review bodies and conversation
+   comments on pull requests updated since the last sync, and comments on the mapped team's issues. Bots and integrations are
+   skipped. The first sync reads the last 14 days only. Only selected projects are read.
+4. **The work behind a comment.** A comment is linked to the agent session that most likely did the work: a session of that
+   project on the PR's head branch (or the Linear issue's branch) that started before the comment, or else the only session
+   active in the two days before it. Its post-mortem then reads that session (its turns, edited files and summary) beside the
+   comment; with no session found it works from the comment and the diff lines alone.
+
+A token pasted in Settings is kept in `state/settings/integrations.json` (mode 600, `INTEGRATIONS_FILE`): never in the
+database, never returned by the API, logged, exported or synced. Comment text is redacted before it is stored or sent to a
+model, and calls go only to `api.github.com` and `api.linear.app`. A rejected token (revoked or expired) pauses that service
+until you replace it, and a rate limit pauses it until the limit lifts; both show in Settings and in the sidebar's
+connections list, which shows GitHub, Linear, Claude, Codex, Ollama and cloud sync at a glance. PR discussions are also kept
+as project context for post-mortems and `get_task_context`, as before.
 
 ## Team sync (optional)
 
@@ -139,7 +171,8 @@ The `postgres` profile adds a pgvector/Postgres 17 container (`127.0.0.1:5434`, 
 `examples/demo-shop` is a small multi-tenant API with rules in its CLAUDE.md.
 
 ```sh
-# select demo-shop in Settings (or, on a fresh install, set INGEST_PROJECTS=demo-shop in .env first), then: docker compose up -d
+# add this repo's examples folder as a project root in Settings and run ./scripts/setup.sh,
+# then select demo-shop in Settings (or, on a fresh install, set INGEST_PROJECTS=demo-shop in .env first)
 ./scripts/demo-pushback.sh   # a real Claude session plus a pushback turn; demo-shop is restored afterwards
 ```
 

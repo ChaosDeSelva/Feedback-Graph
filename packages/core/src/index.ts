@@ -11,6 +11,8 @@ export * from './graph/insights.ts';
 export * from './graph/activity.ts';
 export * from './integrations/github.ts';
 export * from './integrations/linear.ts';
+export * from './integrations/errors.ts';
+export * from './integrations/connections.ts';
 export * from './graph/docs.ts';
 export * from './redact.ts';
 export * from './config.ts';

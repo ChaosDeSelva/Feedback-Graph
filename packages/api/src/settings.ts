@@ -1,6 +1,7 @@
 import type { Hono } from 'hono';
 import { z } from 'zod';
-import { projectScope, type ActivityStore, type FolderCandidate, type PortabilityStore, type ProjectScope, type SelectionStore } from '@fb/core';
+import { projectScope, type ActivityStore, type FolderCandidate, type OutsideFolder, type PortabilityStore, type ProjectScope, type SelectionStore } from '@fb/core';
+import { MAX_ROOTS, normalizeRoots, type RootsStore } from './roots.ts';
 
 export type SettingsDeps = {
   selection: Pick<SelectionStore, 'current' | 'setTracked' | 'candidates' | 'aliases' | 'keysWithData' | 'exclusive' | 'forgetReads'>;
@@ -8,9 +9,16 @@ export type SettingsDeps = {
   folders(): Promise<{ key: string; path: string }[]>;
   /** EXCLUDE_PROJECTS: shown, never selectable. */
   excluded: string[];
-  /** The configured roots as host paths, for when the worker has not built its list yet. */
+  /** The mounted roots as host paths (HOST_PROJECT_ROOTS), for when the worker has not built its list yet. */
   roots: string[];
+  /** Where Settings saves the roots for scripts/setup.sh to mount (ROOTS_FILE). Unset: roots are not editable here. */
+  savedRoots?: RootsStore;
+  /** The host's home folder (HOST_HOME), for `~` in a typed root. */
+  hostHome?: string | null;
 };
+
+/** The command that mounts saved roots and restarts the containers. */
+export const APPLY_ROOTS = './scripts/setup.sh';
 
 /** One row of GET /api/settings/projects. */
 export type ProjectCandidate = FolderCandidate & {
@@ -29,8 +37,13 @@ export type ProjectSettings = {
   initialized: boolean;
   tracked: string[];
   candidates: ProjectCandidate[];
-  outsideRoots: { claudeSessions: number; codexSessions: number };
+  /** Sessions outside every root, and the folders they ran in that could be added as roots (none already chosen). */
+  outsideRoots: { claudeSessions: number; codexSessions: number; folders: OutsideFolder[] };
   roots: string[];
+  /** Roots saved in Settings that differ from the mounted ones: they take effect once ./scripts/setup.sh is run. */
+  pendingRoots: string[] | null;
+  /** Roots can be saved from Settings (ROOTS_FILE is set). */
+  rootsEditable: boolean;
   /** When the worker last counted sessions; null before its first pass. */
   builtAt: string | null;
   codexSessionsFound: boolean | null;
@@ -40,10 +53,16 @@ export const CLEANUP_CONFIRM = 'remove-unselected';
 
 const Selection = z.object({ tracked: z.array(z.string().min(1).max(200)).max(2000) }).strict();
 const Cleanup = z.object({ confirm: z.string() }).strict();
+const Roots = z.object({ roots: z.array(z.string().max(2048)).max(MAX_ROOTS * 5) }).strict();
+
+const sameSet = (a: string[], b: string[]) => a.length === b.length && [...a].sort().join('\n') === [...b].sort().join('\n');
+/** The folder is this root or inside it. */
+const within = (path: string, root: string) => path === root || path.startsWith(`${root.replace(/\/+$/, '')}/`);
 
 async function settingsBody(d: SettingsDeps): Promise<ProjectSettings> {
-  const [sel, snap, aliases, dataKeys, folders] = await Promise.all([
+  const [sel, snap, aliases, dataKeys, folders, saved] = await Promise.all([
     d.selection.current(), d.selection.candidates(), d.selection.aliases(), d.selection.keysWithData(), d.folders(),
+    d.savedRoots?.read() ?? null,
   ]);
   const scope = projectScope(sel, { excludeProjects: d.excluded }, aliases);
   const excluded = new Set(d.excluded);
@@ -71,12 +90,20 @@ async function settingsBody(d: SettingsDeps): Promise<ProjectSettings> {
         inScope: scope.folder(c.key),
       };
     });
+  const chosen = [...d.roots, ...(saved?.roots ?? [])];
+  const out = snap?.outsideRoots;
   return {
     initialized: sel.initialized,
     tracked: sel.tracked,
     candidates,
-    outsideRoots: snap?.outsideRoots ?? { claudeSessions: 0, codexSessions: 0 },
+    outsideRoots: {
+      claudeSessions: out?.claudeSessions ?? 0,
+      codexSessions: out?.codexSessions ?? 0,
+      folders: (out?.folders ?? []).filter((f) => !chosen.some((r) => within(f.path, r))),
+    },
     roots: snap?.roots ?? d.roots,
+    pendingRoots: saved && !sameSet(saved.roots, d.roots) ? saved.roots : null,
+    rootsEditable: !!d.savedRoots,
     builtAt: snap?.builtAt ?? null,
     codexSessionsFound: snap?.codexSessionsFound ?? null,
   };
@@ -164,6 +191,32 @@ export function settingsRoutes(
         : 'no projects selected: no sessions are read',
       why: `you chose them in Settings. Added folders are read from the next cycle; stopped ones are no longer read and keep their data.${dropped.length ? ` Not kept in the list: ${dropped.map((x) => x.why).join('; ')}.` : ''}`,
       details: { added, removed, tracked: next, ...(dropped.length ? { dropped: dropped.map((x) => x.key) } : {}) },
+    });
+    return c.json(await settingsBody(d));
+  });
+
+  app.put('/api/settings/roots', async (c) => {
+    if (!d.savedRoots) return c.json({ error: `project roots cannot be saved here (ROOTS_FILE is not set): set PROJECTS_DIRS in .env and run ${APPLY_ROOTS}` }, 501);
+    const body = Roots.safeParse(await c.req.json().catch(() => null));
+    if (!body.success) return c.json({ error: 'send { "roots": ["/absolute/host/path", ...] }' }, 400);
+    const norm = normalizeRoots(body.data.roots, d.hostHome ?? null);
+    if ('error' in norm) return c.json({ error: norm.error }, 400);
+    const before = (await d.savedRoots.read())?.roots ?? d.roots;
+    const { roots } = await d.savedRoots.write(norm.roots);
+    const added = roots.filter((r) => !before.includes(r));
+    const removed = before.filter((r) => !roots.includes(r));
+    const mounted = sameSet(roots, d.roots);
+    await o.activity?.record({
+      kind: 'roots_saved',
+      actor: 'you',
+      projectKey: null,
+      subject: roots.length
+        ? `project roots saved: ${list(roots)}${added.length ? `; added ${list(added)}` : ''}${removed.length ? `; removed ${list(removed)}` : ''}`
+        : 'project roots saved: none (no project folder is mounted)',
+      why: mounted
+        ? 'you saved them in Settings; they are the folders already mounted, so nothing needs to restart'
+        : `you saved them in Settings. They are mounted when you run ${APPLY_ROOTS} on the host (it restarts the containers); until then the old roots stay in use`,
+      details: { roots, added, removed },
     });
     return c.json(await settingsBody(d));
   });

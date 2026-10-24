@@ -10,7 +10,8 @@ import { Patterns } from './Patterns.tsx';
 import { Projects } from './Projects.tsx';
 import { Sessions } from './Sessions.tsx';
 import { Settings } from './Settings.tsx';
-import { confirmDiscard } from './unsaved.ts';
+import { afterDiscard } from './unsaved.ts';
+import { ConnectionsBadge } from './Connections.tsx';
 import { AppShell, type Health, type NavGroup } from './ui/AppShell.tsx';
 import { Button, Input } from './ui/controls.tsx';
 import { Alert } from './ui/display.tsx';
@@ -47,17 +48,22 @@ export function App() {
   const viewRef = useRef(view);
   viewRef.current = view;
   const lastHash = useRef(location.hash);
-  const navigate = (next: View) => { if (next !== view && confirmDiscard()) setView(next); };
+  const navigate = (next: View) => { if (next !== view) afterDiscard(() => setView(next)); };
   useEffect(() => {
     const onHash = () => {
       const next = fromHash();
-      if (next !== viewRef.current && !confirmDiscard()) {
-        // Stay put: put the address back without adding a history entry or firing another hashchange.
-        history.replaceState(history.state, '', lastHash.current || `#${viewRef.current}`);
-        return;
+      const target = location.hash;
+      if (next === viewRef.current) {
+        lastHash.current = target;
+        return setView(next);
       }
-      lastHash.current = location.hash;
-      setView(next);
+      // Stay put until the answer: put the address back without adding a history entry or firing another hashchange.
+      history.replaceState(history.state, '', lastHash.current || `#${viewRef.current}`);
+      afterDiscard(() => {
+        history.replaceState(history.state, '', target);
+        lastHash.current = target;
+        setView(next);
+      });
     };
     window.addEventListener('hashchange', onHash);
     return () => window.removeEventListener('hashchange', onHash);
@@ -80,8 +86,15 @@ export function App() {
 
   if (needsSignIn) return <SignIn onDone={() => setNeedsSignIn(false)} />;
   return (
-    <AppShell groups={GROUPS} current={view} onNavigate={navigate} health={health(status)}>
-      {VIEWS[view].el}
+    <AppShell
+      groups={GROUPS}
+      current={view}
+      onNavigate={navigate}
+      health={health(status)}
+      connections={status?.connections ? (collapsed) => <ConnectionsBadge connections={status.connections!} collapsed={collapsed} /> : undefined}
+    >
+      {view !== 'settings' && view !== 'docs' && status?.selection && (!status.selection.initialized || status.selection.tracked === 0) && <NothingSelected />}
+      <div className="flex min-h-0 flex-1 flex-col">{VIEWS[view].el}</div>
     </AppShell>
   );
 }
@@ -103,12 +116,22 @@ function health(status: SystemStatus | null): Health | null {
   const ollamaDetail = ollama && `${ollama.reason ?? `Ollama at ${ollama.url} is not answering`}; search, get_task_context and check_before_done need it`;
   return {
     ok: !!status.graph && status.workerHealthy && !idle && !down && !ollama,
-    label: !status.graph ? 'graph unreachable' : !status.workerHealthy ? 'worker offline' : idle ? 'no projects selected' : ollamaLabel || modelDown || 'worker running',
+    label: !status.graph ? 'graph unreachable' : !status.workerHealthy ? 'worker offline' : idle ? (status.selection?.roots === 0 ? 'no project folders' : 'no projects selected') : ollamaLabel || modelDown || 'worker running',
     version: status.version,
     title: idle ?? [ollamaDetail, detail, w
       ? `worker ${w.version}, last heartbeat ${new Date(w.lastBeat).toLocaleTimeString()}${w.lastError ? `, last error: ${w.lastError}` : ''}`
       : 'the worker has not reported yet'].filter(Boolean).join('; '),
   };
+}
+
+/** Opt-in: before any project is selected every list is empty, so say why and where to choose. */
+function NothingSelected() {
+  return (
+    <div role="status" aria-label="no projects selected" className="shrink-0 border-b border-line bg-info-soft px-4 py-2 text-[13px] text-info-text md:px-6">
+      No projects are selected. Only the projects you select in Settings are shown here (and read).{' '}
+      <a href="#settings" className="font-semibold underline underline-offset-2">Settings</a>
+    </div>
+  );
 }
 
 function SignIn({ onDone }: { onDone: () => void }) {

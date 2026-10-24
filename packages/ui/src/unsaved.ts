@@ -1,4 +1,5 @@
 import { useEffect } from 'react';
+import { askConfirm } from './ui/ConfirmDialog.tsx';
 
 /** What would be lost, for each page that has edits not saved yet. */
 const pending = new Map<symbol, string>();
@@ -10,7 +11,7 @@ const warnOnUnload = (e: BeforeUnloadEvent) => {
 
 /**
  * While `dirty`, leaving asks first: closing or reloading the tab (the browser's own prompt),
- * and moving to another page or item in the app (confirmDiscard).
+ * and moving to another page or item in the app (afterDiscard).
  */
 export function useUnsavedChanges(dirty: boolean, what: string) {
   useEffect(() => {
@@ -25,8 +26,15 @@ export function useUnsavedChanges(dirty: boolean, what: string) {
   }, [dirty, what]);
 }
 
-/** True when nothing unsaved would be lost, or the person agrees to lose it. */
-export function confirmDiscard(): boolean {
-  if (!pending.size) return true;
-  return window.confirm(`${[...new Set(pending.values())].join(' ')} Leave without saving?`);
+/**
+ * Run `go` now when nothing unsaved would be lost; otherwise only once the person agrees, in the app's dialog, to
+ * discard the edits. Staying (Cancel, Escape, a click outside) keeps them and never runs `go`.
+ */
+export function afterDiscard(go: () => void): void {
+  if (!pending.size) return go();
+  void askConfirm({
+    title: 'Leave without saving?',
+    message: `${[...new Set(pending.values())].join(' ')} Leaving discards these changes.`,
+    confirmLabel: 'Discard changes',
+  }).then((ok) => { if (ok) go(); });
 }

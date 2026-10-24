@@ -1,6 +1,6 @@
-import type { Activity, ActivityKind, CloudSyncResult, SyncCounts, SyncTrigger, Candidate, CodeMapMeta, Hotspot, MapGraph, ModuleContext, FolderCandidate, DocSummary, CandidateDetail, CandidateStatus, EvidenceGraph, FactHit, FactKind, Lesson, LessonDetail, LessonStatus, PatternReport, ProjectSummary, ScanJob, SessionDetail, SessionListItem, SessionState, StatsRow, StoredFact, SystemStatus } from '@fb/core';
+import type { Activity, ActivityKind, Connection, ConnectionName, ExternalRef, FeedbackSource, CloudSyncResult, SyncCounts, SyncTrigger, Candidate, CodeMapMeta, Hotspot, MapGraph, ModuleContext, FolderCandidate, OutsideFolder, DocSummary, CandidateDetail, CandidateStatus, EvidenceGraph, FactHit, FactKind, Lesson, LessonDetail, LessonStatus, PatternReport, ProjectSummary, ScanJob, SessionDetail, SessionListItem, SessionState, StatsRow, StoredFact, SystemStatus } from '@fb/core';
 
-export type { CloudSyncResult, SyncCounts, Activity, Candidate, CodeMapMeta, Hotspot, MapGraph, ModuleContext, DocSummary, CandidateDetail, CandidateStatus, EvidenceGraph, Lesson, LessonDetail, LessonStatus, PatternReport, ProjectSummary, ScanJob, SessionDetail, SessionListItem, SessionState, StatsRow, StoredFact, SystemStatus };
+export type { Connection, ConnectionName, ExternalRef, FeedbackSource, CloudSyncResult, SyncCounts, Activity, Candidate, CodeMapMeta, Hotspot, MapGraph, ModuleContext, DocSummary, CandidateDetail, CandidateStatus, EvidenceGraph, Lesson, LessonDetail, LessonStatus, PatternReport, ProjectSummary, ScanJob, SessionDetail, SessionListItem, SessionState, StatsRow, StoredFact, SystemStatus };
 
 /** One folder on the Settings page (GET /api/settings/projects). */
 export type ProjectCandidate = FolderCandidate & {
@@ -20,8 +20,14 @@ export type ProjectSettings = {
   initialized: boolean;
   tracked: string[];
   candidates: ProjectCandidate[];
-  outsideRoots: { claudeSessions: number; codexSessions: number };
+  /** Sessions outside every root, and the folders they ran in that could be added as roots. `folders`: unset from older APIs. */
+  outsideRoots: { claudeSessions: number; codexSessions: number; folders?: OutsideFolder[] };
+  /** The mounted roots, as host paths. */
   roots: string[];
+  /** Roots saved here that are not mounted yet (./scripts/setup.sh mounts them); null when nothing is waiting. */
+  pendingRoots?: string[] | null;
+  /** Roots can be saved from Settings. Unset from older APIs (then they cannot). */
+  rootsEditable?: boolean;
   /** When the worker last counted sessions; null before its first pass. */
   builtAt: string | null;
   /** false: no Codex sessions folder is mounted; null: the worker has not reported. */
@@ -139,6 +145,7 @@ export const api = {
     request<{ id: string; chunks: number }>(`/api/projects/${enc(key)}/docs`, { method: 'POST', body: doc }),
   projectSettings: () => request<ProjectSettings>('/api/settings/projects'),
   saveProjectSelection: (tracked: string[]) => request<ProjectSettings>('/api/settings/projects', { method: 'PUT', body: { tracked } }),
+  saveProjectRoots: (roots: string[]) => request<ProjectSettings>('/api/settings/roots', { method: 'PUT', body: { roots } }),
   cleanupUnselected: () => request<{ removed: string[]; nodesRemoved: number }>('/api/settings/cleanup', { method: 'POST', body: { confirm: CLEANUP_CONFIRM } }),
 
   cloud: () => request<CloudInfo>('/api/cloud'),
@@ -151,6 +158,40 @@ export const api = {
   sessionDetail: (id: string) => request<SessionDetail>(`/api/sessions/${enc(id)}`),
   /** Rebuild a session's summary from its first turn (owner-only). */
   resummarize: (id: string) => request<{ queued: boolean }>(`/api/sessions/${enc(id)}/resummarize`, { method: 'POST', body: {} }),
+};
+
+/** One service on Settings > Integrations (GET /api/settings/integrations). Never carries a token. */
+export type ServiceView = {
+  connection: Connection;
+  envSet: boolean;
+  envVar: string;
+  savedInApp: boolean;
+  account: string | null;
+  checkedAt: string | null;
+  lastSyncAt: string | null;
+  lastError: string | null;
+  errorKind: 'auth' | 'rate_limit' | 'not_found' | 'network' | 'other' | null;
+  rateLimitedUntil: string | null;
+};
+
+export type ProjectIntegrations = {
+  key: string;
+  github: { repo: string | null; from: 'remote' | 'GITHUB_REPOS' | null; enabled: boolean; lastSyncAt: string | null; items: number; error: string | null };
+  linear: { teamId: string | null; teamName: string | null; lastSyncAt: string | null; items: number; error: string | null };
+};
+
+export type IntegrationsView = { canSave: boolean; syncMinutes: number; github: ServiceView; linear: ServiceView; projects: ProjectIntegrations[] };
+export type IntegrationKind = 'github' | 'linear';
+export type LinearTeam = { id: string; key: string; name: string };
+
+export const integrationsApi = {
+  get: () => request<IntegrationsView>('/api/settings/integrations'),
+  connect: (kind: IntegrationKind, token: string) => request<IntegrationsView>(`/api/settings/integrations/${kind}`, { method: 'PUT', body: { token } }),
+  test: (kind: IntegrationKind) => request<{ ok: boolean; account: string | null; error: string | null; view: IntegrationsView }>(`/api/settings/integrations/${kind}/test`, { method: 'POST', body: {} }),
+  disconnect: (kind: IntegrationKind) => request<IntegrationsView>(`/api/settings/integrations/${kind}`, { method: 'DELETE', body: {} }),
+  linearTeams: () => request<LinearTeam[]>('/api/settings/integrations/linear/teams'),
+  setProject: (key: string, patch: { github?: boolean; linearTeamId?: string | null; linearTeamName?: string | null }) =>
+    request<IntegrationsView>(`/api/settings/integrations/projects/${enc(key)}`, { method: 'PUT', body: patch }),
 };
 
 /** GET /api/sessions: one page, newest first; `next` asks for the following one. */

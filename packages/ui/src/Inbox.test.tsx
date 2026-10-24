@@ -150,6 +150,14 @@ test('an empty inbox with nothing selected points to Settings', async () => {
   expect(screen.getByRole('link', { name: /open settings/i }).getAttribute('href')).toBe('#settings');
 });
 
+test('an empty inbox with no project folder at all says to add one in Settings first', async () => {
+  emptyServer({ selection: { initialized: true, tracked: 0, roots: 0, note: 'No project folders yet: add a project folder in Settings first.' }, givenUpTurns: 0 });
+  render(<Inbox />);
+  expect(await screen.findByText('No project folders yet')).toBeTruthy();
+  expect(screen.getByText(/add a project folder in Settings first/i)).toBeTruthy();
+  expect(screen.getByRole('link', { name: /open settings/i }).getAttribute('href')).toBe('#settings');
+});
+
 test('an empty inbox offers to re-queue turns the classifier gave up on', async () => {
   emptyServer({ selection: { initialized: true, tracked: 2, note: null }, givenUpTurns: 3 });
   render(<Inbox />);

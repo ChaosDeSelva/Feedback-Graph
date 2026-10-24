@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { askPromptOnly, cleanLessonPath, hostRepoPath, MODULE_TESTS_DEPTH, projectFromCwd, redactSecrets, relOfKey, repoRelative, type ActivityStore, type CodeGraphStore, type SessionListItem, type SessionsStore, type DocHit, type FileMiss, type Impact, type ModuleContext, type DocsStore, type FactHit, type FactsStore, type KnowledgeStore, type Lesson, type LessonHit, type LlmProvider, type Project, type RelatedMiss, type Root } from '@fb/core';
+import { askPromptOnly, cleanLessonPath, hostRepoPath, MODULE_TESTS_DEPTH, projectFromCwd, redactSecrets, relOfKey, repoRelative, type ActivityStore, type CodeGraphStore, type SessionListItem, type SessionsStore, type DocHit, type FileMiss, type Impact, type ModuleContext, type DocsStore, type FactHit, type FactsStore, type KnowledgeStore, type Lesson, type LessonHit, type LlmProvider, type Project, type RelatedMiss, type Root, type ShownProjects } from '@fb/core';
 
 export type Verdict = { lessonId: string; status: 'addressed' | 'not_addressed' | 'not_applicable'; why: string };
 export type Gap = { lessonId: string; title: string; rule: string; why: string };
@@ -33,7 +33,28 @@ export type ContextDeps = {
   codegraph?: Pick<CodeGraphStore, 'lessonsForPaths'> & Partial<Pick<CodeGraphStore, 'moduleContext' | 'impact' | 'codeMapMeta'>>;
   /** Session summaries (SessionsStore.list): get_recent_sessions, and the recent sessions in get_task_context. */
   sessions?: Pick<SessionsStore, 'list' | 'detail'>;
+  /**
+   * The selected projects (shownProjects). A lesson learned in any other project, a global one included, is never
+   * served: searches ask for these keys, and lessons from the code map are filtered by where they were learned.
+   */
+  shown?: () => Promise<ShownProjects> | ShownProjects;
 };
+
+/** The searches' projectKeys: undefined when there is no selection to apply. */
+async function shownKeys(d: ContextDeps): Promise<string[] | undefined> {
+  return d.shown ? (await d.shown()).keys : undefined;
+}
+
+/** Keep the lessons learned in a selected project (by where they serve, else where they were learned), or nowhere. */
+async function shownLessons<T>(d: ContextDeps, items: T[], lessonOf: (x: T) => Lesson): Promise<T[]> {
+  if (!d.shown || !items.length) return items;
+  const v = await d.shown();
+  return items.filter((x) => {
+    const l = lessonOf(x);
+    const key = l.projectKey ?? l.origin ?? null;
+    return key === null || v.has(key);
+  });
+}
 
 /** A lesson served as context. files: the files the agent named that it bears on (by its paths or its misses). */
 export type TaskLesson = LessonHit & { files?: string[] };
@@ -140,9 +161,10 @@ export async function getTaskContext(
   const own = !!selected;
   const [embedding] = await d.embed([q.task]);
   const files = own ? taskFiles(q, d.roots) : [];
+  const projectKeys = await shownKeys(d);
   const [hits, byFile, misses, facts, docs, recent] = await Promise.all([
-    d.k.searchLessons({ embedding, projectKey: own ? project.key : null, k: LESSON_K }),
-    files.length && d.codegraph ? d.codegraph.lessonsForPaths(project.key, files) : Promise.resolve([]),
+    d.k.searchLessons({ embedding, projectKey: own ? project.key : null, k: LESSON_K, ...(projectKeys && { projectKeys }) }),
+    files.length && d.codegraph ? d.codegraph.lessonsForPaths(project.key, files).then((x) => shownLessons(d, x, (y) => y.lesson)) : Promise.resolve([]),
     own ? d.k.relatedMisses({ embedding, projectKey: project.key, k: MISS_K }) : Promise.resolve([]),
     own && d.facts ? d.facts.searchFacts({ embedding, projectKey: project.key, k: FACT_K }) : Promise.resolve([]),
     own && d.docs ? d.docs.searchDocs({ embedding, projectKey: project.key, k: DOC_K }) : Promise.resolve([]),
@@ -225,7 +247,7 @@ export async function checkBeforeDone(
   const changed = selected && q.filesChanged?.length ? taskFiles({ ...q, files: q.filesChanged }, d.roots) : [];
   const [embedding] = await d.embed([`${q.task}\n${q.summary}`]);
   const [lessons, codeGaps] = await Promise.all([
-    d.k.searchLessons({ embedding, projectKey: selected ? project.key : null, k: LESSON_K }),
+    d.k.searchLessons({ embedding, projectKey: selected ? project.key : null, k: LESSON_K, ...(await shownKeys(d).then((projectKeys) => projectKeys && { projectKeys })) }),
     codeGapsFor(project.key, changed, d),
   ]);
   const codePart = codeGapLines(codeGaps);
@@ -393,7 +415,8 @@ export async function getModuleContext(q: ProjectRef & { path: string }, d: Cont
   if (!cg?.moduleContext) return { markdown: NO_CODEGRAPH, module: null };
   const path = onePath(q, q.path, d.roots);
   if (!path) return { markdown: `${code(q.path)} is not a file in ${project.key}: give a path relative to your cwd, or an absolute path inside the project.`, module: null };
-  const m = await cg.moduleContext(project.key, path);
+  const found = await cg.moduleContext(project.key, path);
+  const m = found && { ...found, lessons: await shownLessons(d, found.lessons, (l) => l) };
   const markdown = m ? moduleMarkdown(project.key, m) : await notMapped(project.key, [path], d);
   await d.activity?.record({
     kind: 'context_served',
@@ -453,7 +476,8 @@ export async function getImpact(q: ProjectRef & { paths: string[]; depth?: numbe
   const paths = taskFiles({ ...q, files: q.paths }, d.roots);
   if (!paths.length) return { markdown: `None of these paths is a file in ${project.key}: give paths relative to your cwd, or absolute paths inside the project.`, impact: null };
   const depth = Math.min(MAX_DEPTH, Math.max(1, Math.floor(q.depth ?? DEFAULT_DEPTH)));
-  const r = await cg.impact(project.key, paths, depth);
+  const all = await cg.impact(project.key, paths, depth);
+  const r = { ...all, lessons: await shownLessons(d, all.lessons, (l) => l) };
   const missing = paths.filter((p) => !r.paths.includes(p));
   let markdown: string;
   if (!r.paths.length) markdown = await notMapped(project.key, paths, d);

@@ -38,13 +38,35 @@ test('session summaries default to the local model, can be tuned, and can be tur
 
 test('every problem is reported at once, by name', () => {
   try {
-    loadConfig({ PROJECT_ROOTS: '/vibe', POLL_SECONDS: 'soon', CLASSIFY_LLM: 'gpt5', GITHUB_REPOS: 'demo=me/demo' });
+    loadConfig({ PROJECT_ROOTS: '/vibe', POLL_SECONDS: 'soon', CLASSIFY_LLM: 'gpt5', GITHUB_REPOS: 'demo' });
     expect.unreachable();
   } catch (e) {
     expect(e).toBeInstanceOf(ConfigError);
     const msg = (e as Error).message;
-    for (const name of ['NEO4J_PASSWORD', 'HOST_PROJECT_ROOTS', 'POLL_SECONDS', 'CLASSIFY_LLM', 'GITHUB_TOKEN']) expect(msg).toContain(name);
+    for (const name of ['NEO4J_PASSWORD', 'HOST_PROJECT_ROOTS', 'POLL_SECONDS', 'CLASSIFY_LLM', 'GITHUB_REPOS']) expect(msg).toContain(name);
   }
+});
+
+test('no project roots is a valid setup: nothing is mounted until you add a folder in Settings', () => {
+  const c = loadConfig({ NEO4J_PASSWORD: 'pw' });
+  expect(c.roots).toEqual([]);
+  expect(loadConfig({ NEO4J_PASSWORD: 'pw', PROJECT_ROOTS: '', HOST_PROJECT_ROOTS: '' }).roots).toEqual([]);
+  expect(c.rootsFile).toBeNull();
+  expect(c.hostHome).toBeNull();
+});
+
+test('ROOTS_FILE is where Settings saves the roots, HOST_HOME is never suggested as one', () => {
+  const c = loadConfig({ ...base, ROOTS_FILE: '/settings/project-roots.json', HOST_HOME: '/Users/a' });
+  expect(c.rootsFile).toBe('/settings/project-roots.json');
+  expect(c.hostHome).toBe('/Users/a');
+});
+
+test('GitHub and Linear tokens can come from Settings: GITHUB_REPOS needs no GITHUB_TOKEN; sync paces have defaults', () => {
+  const c = loadConfig({ ...base, GITHUB_REPOS: 'demo=me/demo' });
+  expect([...c.github.repos]).toEqual([['demo', 'me/demo']]);
+  expect(c.github.syncHours).toBe(6);
+  expect(c.integrationSyncMinutes).toBe(10);
+  expect(loadConfig({ ...base, INTEGRATION_SYNC_MINUTES: '30' }).integrationSyncMinutes).toBe(30);
 });
 
 test('host and container roots must pair up', () => {

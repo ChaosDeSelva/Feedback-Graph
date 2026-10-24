@@ -99,11 +99,32 @@ test('lists the project docs and uploads a text file as context', async () => {
   await waitFor(() => expect(calls).toContainEqual({ url: '/api/projects/demo-shop/docs', body: { title: 'spec.md', name: 'spec.md', text: '# Spec\n\nLists are paginated.' } }));
 });
 
-test('a doc can be removed', async () => {
+const removedDoc = () => calls.some((c) => c.url === '/api/docs/doc%3Ademo-shop%3Agithub%3Agithub%3Ame%2Fshop%233');
+
+test('removing a doc asks first, naming it; Cancel or Escape keeps it', async () => {
   render(<Projects />);
   await screen.findByText('me/shop#3: Orders');
   fireEvent.click(screen.getByRole('button', { name: 'remove me/shop#3: Orders' }));
-  await waitFor(() => expect(calls.some((c) => c.url === '/api/docs/doc%3Ademo-shop%3Agithub%3Agithub%3Ame%2Fshop%233')).toBe(true));
+  const ask = await screen.findByRole('alertdialog', { name: /remove this document/i });
+  expect(within(ask).getByRole('list', { name: 'will be removed' }).textContent).toBe('me/shop#3: Orders');
+  expect(document.activeElement).toBe(within(ask).getByRole('button', { name: 'Cancel' }));
+  fireEvent.keyDown(ask, { key: 'Escape' });
+  await waitFor(() => expect(screen.queryByRole('alertdialog')).toBeNull());
+  fireEvent.click(screen.getByRole('button', { name: 'remove me/shop#3: Orders' }));
+  fireEvent.click(within(await screen.findByRole('alertdialog')).getByRole('button', { name: 'Cancel' }));
+  await waitFor(() => expect(screen.queryByRole('alertdialog')).toBeNull());
+  expect(removedDoc()).toBe(false);
+  expect(screen.getByText('me/shop#3: Orders')).toBeTruthy();
+});
+
+test('a doc can be removed once you confirm', async () => {
+  render(<Projects />);
+  await screen.findByText('me/shop#3: Orders');
+  fireEvent.click(screen.getByRole('button', { name: 'remove me/shop#3: Orders' }));
+  fireEvent.click(within(await screen.findByRole('alertdialog')).getByRole('button', { name: 'Remove document' }));
+  await waitFor(() => expect(removedDoc()).toBe(true));
+  await waitFor(() => expect(screen.queryByText('me/shop#3: Orders')).toBeNull());
+  expect(screen.queryByRole('alertdialog')).toBeNull();
 });
 
 test('facts reload by themselves when a running scan finishes', async () => {
@@ -121,15 +142,27 @@ test('facts reload by themselves when a running scan finishes', async () => {
   expect(await screen.findByText('Fresh fact from the new scan')).toBeTruthy();
 });
 
-test('deleting a project asks you to type its name first', async () => {
+test('deleting a project opens a dialog that says what goes and wants its name typed', async () => {
   render(<Projects />);
   await screen.findByText('Use sendError for all errors');
   fireEvent.click(screen.getByRole('button', { name: /delete project data/i }));
-  const confirm = screen.getByRole('button', { name: /delete everything learned/i }) as HTMLButtonElement;
+  const ask = await screen.findByRole('alertdialog', { name: 'Delete everything learned from demo-shop?' });
+  expect(ask.textContent).toMatch(/every session, flag, decision, post-mortem, lesson, fact, document and log entry/);
+  expect(document.activeElement).toBe(within(ask).getByRole('button', { name: 'Cancel' }));
+  const confirm = within(ask).getByRole('button', { name: /delete everything learned/i }) as HTMLButtonElement;
   expect(confirm.disabled).toBe(true);
-  fireEvent.change(screen.getByLabelText('type the project name to confirm'), { target: { value: 'demo-shop' } });
+  fireEvent.change(within(ask).getByLabelText('type demo-shop to confirm'), { target: { value: 'demo-shop' } });
   fireEvent.click(confirm);
   await waitFor(() => expect(calls.some((c) => c.url === '/api/projects/demo-shop' && (c.body as { confirm?: string })?.confirm === 'demo-shop')).toBe(true));
+});
+
+test('cancelling the project delete removes nothing', async () => {
+  render(<Projects />);
+  await screen.findByText('Use sendError for all errors');
+  fireEvent.click(screen.getByRole('button', { name: /delete project data/i }));
+  fireEvent.mouseDown(await screen.findByTestId('confirm-backdrop'));
+  await waitFor(() => expect(screen.queryByRole('alertdialog')).toBeNull());
+  expect(calls.some((c) => c.url === '/api/projects/demo-shop' && c.body)).toBe(false);
 });
 
 test('export downloads the project bundle', async () => {

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { api, type Candidate, type CandidateDetail as Detail, type CandidateStatus } from './api.ts';
+import { api, type Candidate, type CandidateDetail as Detail, type CandidateStatus, type FeedbackSource } from './api.ts';
+import { SOURCE_LABEL, SourceBadge } from './CandidateDetail.tsx';
 import { CandidateDetail } from './CandidateDetail.tsx';
 import { hashFocus } from './links.ts';
 import { PageHeader } from './ui/PageHeader.tsx';
@@ -13,7 +14,11 @@ const TABS: CandidateStatus[] = ['pending', 'confirmed', 'rejected'];
 export function Inbox() {
   const [status, setStatus] = useState<CandidateStatus>('pending');
   const [project, setProject] = useState('');
-  const [items, setItems] = useState<Candidate[]>([]);
+  const [all, setItems] = useState<Candidate[]>([]);
+  // Where the feedback came from: a Claude Code or Codex session, or a comment on GitHub or Linear. Filtered here.
+  const [source, setSource] = useState<FeedbackSource | ''>('');
+  const items = source ? all.filter((c) => (c.source ?? 'claude') === source) : all;
+  useEffect(() => { setSelected(0); setOpen(false); }, [source]);
   const [selected, setSelected] = useState(0);
   const [detail, setDetail] = useState<Detail | null>(null);
   const [note, setNote] = useState('');
@@ -105,12 +110,18 @@ export function Inbox() {
     <div className="flex h-full min-h-0 flex-col">
       <PageHeader
         title="Inbox"
-        description="Possible pushback from your sessions. Confirm the real misses; only those are learned from."
+        description="Possible pushback from your sessions and from comments on your pull requests and Linear issues. Confirm the real misses; only those are learned from."
         actions={
-          <Select aria-label="project" value={project} onChange={(e) => setProject(e.target.value)} className="w-44">
-            <option value="">all projects</option>
-            {projects.map((p) => <option key={p}>{p}</option>)}
-          </Select>
+          <>
+            <Select aria-label="source" value={source} onChange={(e) => setSource(e.target.value as FeedbackSource | '')} className="w-36">
+              <option value="">all sources</option>
+              {(Object.keys(SOURCE_LABEL) as FeedbackSource[]).map((s) => <option key={s} value={s}>{SOURCE_LABEL[s]}</option>)}
+            </Select>
+            <Select aria-label="project" value={project} onChange={(e) => setProject(e.target.value)} className="w-44">
+              <option value="">all projects</option>
+              {projects.map((p) => <option key={p}>{p}</option>)}
+            </Select>
+          </>
         }
       />
       <SplitPane
@@ -135,7 +146,7 @@ export function Inbox() {
                 <li key={c.id}>
                   <ListRow selected={i === selected} onClick={() => { setSelected(i); setOpen(true); }}>
                     <div className="flex items-center justify-between gap-2 text-xs text-muted">
-                      <span className="truncate">{c.projectKey}</span>
+                      <span className="flex min-w-0 items-center gap-1.5"><SourceBadge source={c.source} /><span className="truncate">{c.projectKey}</span></span>
                       <span className="tabular-nums">{Math.round(c.classification.confidence * 100)}%</span>
                     </div>
                     <div className="mt-0.5 line-clamp-2 text-[13px] leading-snug">{c.classification.summary || '(no summary)'}</div>
@@ -205,11 +216,11 @@ const EMPTY: Record<CandidateStatus, { title: string; children: string }> = {
  * (say, while its model was missing), which can be re-queued.
  */
 function PendingEmpty() {
-  const [st, setSt] = useState<{ tracked: number | null; givenUp: number } | null>(null);
+  const [st, setSt] = useState<{ tracked: number | null; roots: number | null; givenUp: number } | null>(null);
   const [requeued, setRequeued] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);
   useEffect(() => {
-    api.status().then((s) => setSt({ tracked: s.selection?.tracked ?? null, givenUp: s.givenUpTurns ?? 0 }), () => setSt(null));
+    api.status().then((s) => setSt({ tracked: s.selection?.tracked ?? null, roots: s.selection?.roots ?? null, givenUp: s.givenUpTurns ?? 0 }), () => setSt(null));
   }, []);
   async function requeue() {
     try {
@@ -217,6 +228,13 @@ function PendingEmpty() {
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     }
+  }
+  if (st?.roots === 0) {
+    return (
+      <EmptyState compact icon={<InboxIcon />} title="No project folders yet" action={<a href="#settings" className={buttonClass('secondary', 'sm')}>Open Settings</a>}>
+        Nothing can be read until a folder holding your projects is mounted. Add a project folder in Settings first.
+      </EmptyState>
+    );
   }
   if (st?.tracked === 0) {
     return (

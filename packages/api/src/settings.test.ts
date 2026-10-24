@@ -1,6 +1,7 @@
 import type { ActivityInput, CandidateSnapshot, ProjectSelection } from '@fb/core';
 import { expect, test } from 'vitest';
 import { createApp, type ApiRepo, type SettingsDeps } from './app.ts';
+import type { SavedRoots } from './roots.ts';
 
 const repo = { listCandidates: async () => [], candidateDetail: async () => null, decide: async () => {}, stats: async () => [] } as ApiRepo;
 
@@ -17,7 +18,8 @@ const snapshot: CandidateSnapshot = {
   codexSessionsFound: true,
 };
 
-function setup(o: { selection?: ProjectSelection; snapshot?: CandidateSnapshot | null; dataKeys?: string[]; aliases?: [string, string][] } = {}) {
+function setup(o: { roots?: number; selection?: ProjectSelection; snapshot?: CandidateSnapshot | null; dataKeys?: string[]; aliases?: [string, string][]; saved?: SavedRoots | null; editable?: boolean } = {}) {
+  let saved: SavedRoots | null = o.saved ?? null;
   let sel: ProjectSelection = o.selection ?? { tracked: ['demo-shop'], initialized: true, updatedAt: '2026-10-23T00:00:00Z' };
   const log: ActivityInput[] = [];
   const deleted: string[] = [];
@@ -51,14 +53,21 @@ function setup(o: { selection?: ProjectSelection; snapshot?: CandidateSnapshot |
     folders: async () => [{ key: 'brand-new', path: '/Users/me/Vibe/brand-new' }, { key: 'demo-shop', path: '/Users/me/Vibe/demo-shop' }],
     excluded: ['client'],
     roots: ['/Users/me/Vibe'],
+    hostHome: '/Users/me',
+    ...(o.editable === false ? {} : {
+      savedRoots: {
+        read: async () => saved,
+        write: async (roots: string[]) => (saved = { roots, updatedAt: '2026-10-24T00:00:00Z' }),
+      },
+    }),
   };
   const app = createApp(repo, {
     settings,
     activity: { record: async (a) => { log.push(a); }, list: async () => [] },
     portability: { exportData: async () => { throw new Error('unused'); }, deleteProject: async (k) => { deleted.push(k); locked.push(inSection ? `delete ${k}` : `delete ${k} OUTSIDE`); return 10; } },
-    system: { version: '0.3.0', ping: async () => true, worker: async () => null, selection: async () => sel },
+    system: { version: '0.3.0', ping: async () => true, worker: async () => null, selection: async () => sel, ...(o.roots === undefined ? {} : { roots: o.roots }) },
   });
-  return { app, log, deleted, locked, forgotten, sel: () => sel };
+  return { app, log, deleted, locked, forgotten, sel: () => sel, saved: () => saved };
 }
 
 const ui = { origin: 'http://localhost', 'content-type': 'application/json' };
@@ -89,7 +98,7 @@ test('before the worker has built the list, the folders on disk are still offere
   const body = await (await app.request('/api/settings/projects')).json();
   expect(body.builtAt).toBeNull();
   expect(body.candidates.map((c: { key: string }) => c.key)).toEqual(['brand-new', 'client', 'demo-shop', 'old-one']);
-  expect(body.outsideRoots).toEqual({ claudeSessions: 0, codexSessions: 0 });
+  expect(body.outsideRoots).toEqual({ claudeSessions: 0, codexSessions: 0, folders: [] });
 });
 
 test('PUT is yours alone: from the UI, as JSON', async () => {
@@ -216,4 +225,78 @@ test('status says how many projects are selected, and says plainly when none are
   const none = setup({ selection: { tracked: [], initialized: false, updatedAt: null } });
   const s2 = await (await none.app.request('/api/status')).json();
   expect(s2.selection).toMatchObject({ initialized: false, tracked: 0, note: expect.stringMatching(/no projects are selected/i) });
+  const noRoots = setup({ roots: 0 });
+  expect((await (await noRoots.app.request('/api/status')).json()).selection).toEqual({ initialized: true, tracked: 1, roots: 0, note: 'No project folders yet: add a project folder in Settings first.' });
+});
+
+const outside: CandidateSnapshot['outsideRoots'] = {
+  claudeSessions: 9, codexSessions: 2,
+  folders: [
+    { path: '/Users/me/work', claudeSessions: 4, codexSessions: 1 },
+    { path: '/Users/me/Vibe/old', claudeSessions: 2, codexSessions: 0 }, // under a mounted root since: not suggested
+    { path: '/Users/me/games', claudeSessions: 2, codexSessions: 1 },
+    { path: '/Users/me/games/retro', claudeSessions: 1, codexSessions: 0 }, // under a saved root: not suggested
+  ],
+};
+
+test('GET says which roots are saved but not mounted yet, and suggests the folders outside sessions ran in', async () => {
+  const { app } = setup({ snapshot: { ...snapshot, outsideRoots: outside }, saved: { roots: ['/Users/me/Vibe', '/Users/me/games'], updatedAt: 'x' } });
+  const body = await (await app.request('/api/settings/projects')).json();
+  expect(body.roots).toEqual(['/Users/me/Vibe']);
+  expect(body.pendingRoots).toEqual(['/Users/me/Vibe', '/Users/me/games']);
+  expect(body.rootsEditable).toBe(true);
+  expect(body.outsideRoots).toEqual({ claudeSessions: 9, codexSessions: 2, folders: [{ path: '/Users/me/work', claudeSessions: 4, codexSessions: 1 }] });
+});
+
+test('nothing is pending when the saved roots are the mounted ones (in any order), or nothing was saved', async () => {
+  expect((await (await setup({ saved: { roots: ['/Users/me/Vibe'], updatedAt: 'x' } }).app.request('/api/settings/projects')).json()).pendingRoots).toBeNull();
+  expect((await (await setup().app.request('/api/settings/projects')).json()).pendingRoots).toBeNull();
+  const off = await (await setup({ editable: false }).app.request('/api/settings/projects')).json();
+  expect(off).toMatchObject({ pendingRoots: null, rootsEditable: false });
+});
+
+test('PUT /api/settings/roots saves the roots for setup.sh to mount, and logs it', async () => {
+  const { app, log, saved } = setup();
+  const res = await app.request('/api/settings/roots', put({ roots: ['/Users/me/Vibe', '/Users/me/work/', '~/games', '/Users/me/work'] }));
+  expect(res.status).toBe(200);
+  expect(saved()?.roots).toEqual(['/Users/me/Vibe', '/Users/me/work', '/Users/me/games']);
+  const body = await res.json();
+  expect(body.pendingRoots).toEqual(['/Users/me/Vibe', '/Users/me/work', '/Users/me/games']);
+  expect(log).toEqual([expect.objectContaining({
+    kind: 'roots_saved', actor: 'you', projectKey: null,
+    details: { roots: ['/Users/me/Vibe', '/Users/me/work', '/Users/me/games'], added: ['/Users/me/work', '/Users/me/games'], removed: [] },
+  })]);
+  expect(log[0].why).toContain('./scripts/setup.sh');
+});
+
+test('PUT /api/settings/roots: no roots at all is allowed', async () => {
+  const { app, saved } = setup();
+  const res = await app.request('/api/settings/roots', put({ roots: [] }));
+  expect(res.status).toBe(200);
+  expect(saved()?.roots).toEqual([]);
+  expect((await res.json()).pendingRoots).toEqual([]);
+});
+
+test('PUT /api/settings/roots refuses what cannot be a mount, and is yours alone', async () => {
+  const { app, saved } = setup();
+  const bad = async (roots: unknown, why: RegExp) => {
+    const res = await app.request('/api/settings/roots', put({ roots }));
+    expect(res.status).toBe(400);
+    expect((await res.json()).error).toMatch(why);
+  };
+  await bad(['code'], /absolute/);
+  await bad(['/'], /whole disk/);
+  for (const c of [':', '|', '\\', '"', '$', ',']) await bad([`/Users/me/a${c}b`], /cannot contain/);
+  await bad(['/Users/me/a\nb'], /cannot contain/);
+  await bad(['/Users/me/../etc'], /\.\./);
+  await bad(Array.from({ length: 21 }, (_, i) => `/r/${i}`), /at most 20/);
+  await bad('nope', /roots/);
+  expect(saved()).toBeNull();
+  expect((await app.request('/api/settings/roots', put({ roots: [] }, { 'content-type': 'application/json' }))).status).toBe(403);
+});
+
+test('PUT /api/settings/roots without a roots file to write says how to change them instead', async () => {
+  const res = await setup({ editable: false }).app.request('/api/settings/roots', put({ roots: ['/a/b'] }));
+  expect(res.status).toBe(501);
+  expect((await res.json()).error).toContain('ROOTS_FILE');
 });

@@ -74,37 +74,38 @@ export class PgInsightsStore implements InsightsStore {
     return { nodes: [...nodes.values()], links };
   }
 
-  async patterns(q: { projectKey?: string; threshold?: number }): Promise<PatternReport> {
+  async patterns(q: { projectKey?: string; projectKeys?: string[]; threshold?: number }): Promise<PatternReport> {
     const projectKey = q.projectKey ?? null;
+    const projectKeys = q.projectKeys ?? null;
     const pool = this.db.pool;
     const [causeRows, missRows, feedbackRows, preRows] = await Promise.all([
       pool.query<{ cause: Cause; count: number }>(
-        `SELECT cause, count(*) AS count FROM misses WHERE $1::text IS NULL OR project_key = $1
+        `SELECT cause, count(*) AS count FROM misses WHERE ($1::text IS NULL OR project_key = $1) AND ($2::text[] IS NULL OR project_key = ANY($2))
           GROUP BY cause ORDER BY count DESC, cause COLLATE "C"`,
-        [projectKey],
+        [projectKey, projectKeys],
       ),
       pool.query<{ missed: string; cause: Cause; project_key: string; embedding: string; ts: string }>(
         // Repeat detection compares every pair, so only the most recent misses are loaded, then oldest first.
         `SELECT missed, cause, project_key, embedding, ts FROM (
            SELECT m.id, m.missed, m.cause, m.project_key, m.embedding::text AS embedding, t.ts_text AS ts, t.ts AS at
              FROM misses m JOIN feedback f ON f.id = m.feedback_id JOIN turns t ON t.uuid = f.turn_uuid
-            WHERE ($1::text IS NULL OR m.project_key = $1) AND m.embedding IS NOT NULL
+            WHERE ($1::text IS NULL OR m.project_key = $1) AND ($3::text[] IS NULL OR m.project_key = ANY($3)) AND m.embedding IS NOT NULL
             ORDER BY t.ts DESC, m.id DESC
             LIMIT $2
          ) recent
          ORDER BY at, id`,
-        [projectKey, REPEAT_WINDOW],
+        [projectKey, REPEAT_WINDOW, projectKeys],
       ),
       pool.query<{ ts: string }>(
         `SELECT t.ts_text AS ts FROM feedback f JOIN turns t ON t.uuid = f.turn_uuid
-          WHERE $1::text IS NULL OR f.project_key = $1`,
-        [projectKey],
+          WHERE ($1::text IS NULL OR f.project_key = $1) AND ($2::text[] IS NULL OR f.project_key = ANY($2))`,
+        [projectKey, projectKeys],
       ),
       pool.query<{ checks: number; with_gaps: number; gaps_found: number }>(
         `SELECT count(*) AS checks, coalesce(sum(CASE WHEN gaps > 0 THEN 1 ELSE 0 END), 0) AS with_gaps,
                 coalesce(sum(gaps), 0) AS gaps_found
-           FROM predone_checks WHERE $1::text IS NULL OR project_key = $1`,
-        [projectKey],
+           FROM predone_checks WHERE ($1::text IS NULL OR project_key = $1) AND ($2::text[] IS NULL OR project_key = ANY($2))`,
+        [projectKey, projectKeys],
       ),
     ]);
     const pre = preRows.rows[0];

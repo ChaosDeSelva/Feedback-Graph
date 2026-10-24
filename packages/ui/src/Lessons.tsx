@@ -2,7 +2,8 @@ import { useEffect, useState, type ReactNode } from 'react';
 import { ActivityEntry } from './Activity.tsx';
 import { hashFocus } from './links.ts';
 import { api, type Activity, type Lesson, type LessonDetail, type LessonEdit, type LessonStatus } from './api.ts';
-import { confirmDiscard, useUnsavedChanges } from './unsaved.ts';
+import { afterDiscard, useUnsavedChanges } from './unsaved.ts';
+import { ConfirmDialog } from './ui/ConfirmDialog.tsx';
 import { PageHeader } from './ui/PageHeader.tsx';
 import { ListRow, SplitPane } from './ui/SplitPane.tsx';
 import { Button, Input, Select, Tabs, Textarea } from './ui/controls.tsx';
@@ -77,6 +78,8 @@ export function Lessons() {
   const edited = !!detail && !!draft && detail.lesson.id === current?.id &&
     (['title', 'rule', 'appliesWhen', 'scope'] as const).some((k) => draft[k] !== detail.lesson[k]);
   useUnsavedChanges(edited, 'Your edits to this lesson are not saved.');
+  const [revoking, setRevoking] = useState(false);
+  useEffect(() => setRevoking(false), [current?.id]);
 
   async function decide(next: 'approved' | 'rejected' | 'proposed') {
     if (!current || !detail || !draft || detail.lesson.id !== current.id) return;
@@ -104,7 +107,7 @@ export function Lessons() {
         listWidth="24rem"
         listHeader={
           <>
-            <Tabs label="status" value={status} options={TABS} onChange={(s) => { if (s !== status && confirmDiscard()) setStatus(s); }} />
+            <Tabs label="status" value={status} options={TABS} onChange={(s) => { if (s !== status) afterDiscard(() => setStatus(s)); }} />
             {loaded && <span className="ml-auto text-xs text-muted tabular-nums">{plural(items.length, 'lesson')}</span>}
           </>
         }
@@ -118,7 +121,7 @@ export function Lessons() {
             <ul>
               {items.map((l, i) => (
                 <li key={l.id}>
-                  <ListRow selected={i === selected} onClick={() => { if (i === selected || confirmDiscard()) { setSelected(i); setOpen(true); } }}>
+                  <ListRow selected={i === selected} onClick={() => { const go = () => { setSelected(i); setOpen(true); }; if (i === selected) go(); else afterDiscard(go); }}>
                     <div className="flex items-center justify-between gap-2 text-xs text-muted">
                       <span className="truncate">{l.projectKey ?? 'global'} · {l.source}</span>
                       {l.cause && (
@@ -248,7 +251,17 @@ export function Lessons() {
                 )}
                 {status === 'approved' && (
                   <>
-                    <Button variant="danger-outline" onClick={() => decide('rejected')}>Revoke</Button>
+                    <Button variant="danger-outline" onClick={() => setRevoking(true)}>Revoke</Button>
+                    <ConfirmDialog
+                      open={revoking}
+                      title="Revoke this lesson?"
+                      confirmLabel="Revoke lesson"
+                      items={[detail.lesson.title]}
+                      onCancel={() => setRevoking(false)}
+                      onConfirm={() => { setRevoking(false); void decide('rejected'); }}
+                    >
+                      Agents stop getting it straight away. It moves to Rejected, where you can put it back up for review.
+                    </ConfirmDialog>
                     <span className="text-xs text-muted">Agents stop getting it straight away. Edits above are saved with Approve on the proposed tab.</span>
                   </>
                 )}

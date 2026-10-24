@@ -68,6 +68,9 @@ export const MenuIcon = (p: P) => (
 export const CloseIcon = (p: P) => (
   <Icon {...p}><path d="m4 4 8 8M12 4l-8 8" /></Icon>
 );
+export const TrashIcon = (p: P) => (
+  <Icon {...p}><path d="M2.5 4.5h11M6.5 4.5V2.8h3v1.7M4 4.5l.7 9h6.6l.7-9M6.7 7v4M9.3 7v4" /></Icon>
+);
 export const SearchIcon = (p: P) => (
   <Icon {...p}><circle cx="7" cy="7" r="4.2" /><path d="m10.2 10.2 3.3 3.3" /></Icon>
 );

@@ -10,3 +10,17 @@ envval() {
   fi
   printf '%s' "$v"
 }
+
+# Set KEY=VALUE in .env: its KEY= line replaced in place (later duplicates dropped), else appended. Every other line is
+# kept as it was, the value is never printed, and the file stays readable by you only.
+setenv() {
+  local tmp=".env.tmp.$$"
+  KEY="$1" VAL="$2" awk '
+    BEGIN { k = ENVIRON["KEY"] "="; v = ENVIRON["VAL"] }
+    index($0, k) == 1 { if (!done) print k v; done = 1; next }
+    { print }
+    END { if (!done) print k v }
+  ' .env >"$tmp"
+  chmod 600 "$tmp"
+  mv "$tmp" .env
+}

@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, beforeEach, expect, test, vi } from 'vitest';
 import { Lessons } from './Lessons.tsx';
 
@@ -62,11 +62,25 @@ test('lesson history shows how the lesson was produced', async () => {
   expect(screen.getByText(/claude-cli/)).toBeTruthy();
 });
 
+test('revoking an approved lesson asks first, naming the lesson, and Cancel keeps it', async () => {
+  render(<Lessons />);
+  fireEvent.click(await screen.findByRole('button', { name: 'approved' }));
+  fireEvent.click(await screen.findByRole('button', { name: /^revoke$/i }));
+  const ask = await screen.findByRole('alertdialog', { name: /revoke this lesson/i });
+  expect(ask.textContent).toContain('Server search');
+  expect(document.activeElement).toBe(within(ask).getByRole('button', { name: 'Cancel' }));
+  fireEvent.click(within(ask).getByRole('button', { name: 'Cancel' }));
+  await waitFor(() => expect(screen.queryByRole('alertdialog')).toBeNull());
+  expect(patches).toEqual([]);
+});
+
 test('an approved lesson can be revoked, so agents stop getting it', async () => {
   render(<Lessons />);
   fireEvent.click(await screen.findByRole('button', { name: 'approved' }));
-  fireEvent.click(await screen.findByRole('button', { name: /revoke/i }));
+  fireEvent.click(await screen.findByRole('button', { name: /^revoke$/i }));
+  fireEvent.click(within(await screen.findByRole('alertdialog')).getByRole('button', { name: 'Revoke lesson' }));
   await waitFor(() => expect(patches).toEqual([{ url: '/api/lessons/l1', body: { status: 'rejected' } }]));
+  await waitFor(() => expect(screen.queryByRole('alertdialog')).toBeNull());
 });
 
 test('a rejected lesson can be put back up for review', async () => {
@@ -121,31 +135,31 @@ test('a #lessons/<id> link opens that lesson, in the tab of its status', async (
   }
 });
 
-test('moving to another lesson or tab with unsaved edits asks first, and keeps them if you stay', async () => {
-  const confirm = vi.spyOn(window, 'confirm').mockReturnValue(false);
-  try {
-    render(<Lessons />);
-    const rule = (await screen.findByLabelText('rule')) as HTMLTextAreaElement;
-    await waitFor(() => expect(rule.value).toBe('Server search rule'));
-    fireEvent.change(rule, { target: { value: 'Always filter on the server' } });
-    fireEvent.click(screen.getByText('Auth checks'));
-    expect(confirm).toHaveBeenCalledTimes(1);
-    expect((screen.getByLabelText('rule') as HTMLTextAreaElement).value).toBe('Always filter on the server');
-    fireEvent.click(screen.getByRole('button', { name: 'approved' }));
-    expect(confirm).toHaveBeenCalledTimes(2);
-    expect(screen.getByRole('button', { name: 'proposed' }).getAttribute('aria-pressed')).toBe('true');
-    expect((screen.getByLabelText('rule') as HTMLTextAreaElement).value).toBe('Always filter on the server');
+test('moving to another lesson or tab with unsaved edits asks first in a dialog, and keeps them if you stay', async () => {
+  render(<Lessons />);
+  const rule = (await screen.findByLabelText('rule')) as HTMLTextAreaElement;
+  await waitFor(() => expect(rule.value).toBe('Server search rule'));
+  fireEvent.change(rule, { target: { value: 'Always filter on the server' } });
+  const stay = async () => {
+    fireEvent.click(await screen.findByRole('button', { name: 'Cancel' }));
+    await waitFor(() => expect(screen.queryByRole('alertdialog')).toBeNull());
+  };
+  fireEvent.click(screen.getByText('Auth checks'));
+  expect((await screen.findByRole('alertdialog')).textContent).toMatch(/not saved/i);
+  await stay();
+  expect((screen.getByLabelText('rule') as HTMLTextAreaElement).value).toBe('Always filter on the server');
+  fireEvent.click(screen.getByRole('button', { name: 'approved' }));
+  await stay();
+  expect(screen.getByRole('button', { name: 'proposed' }).getAttribute('aria-pressed')).toBe('true');
+  expect((screen.getByLabelText('rule') as HTMLTextAreaElement).value).toBe('Always filter on the server');
 
-    confirm.mockReturnValue(true);
-    fireEvent.click(screen.getByText('Auth checks'));
-    await waitFor(() => expect((screen.getByLabelText('title') as HTMLInputElement).value).toBe('Auth checks'));
-    // No edits now: moving on does not ask.
-    fireEvent.click(screen.getByText('Server search'));
-    await waitFor(() => expect((screen.getByLabelText('title') as HTMLInputElement).value).toBe('Server search'));
-    expect(confirm).toHaveBeenCalledTimes(3);
-  } finally {
-    confirm.mockRestore();
-  }
+  fireEvent.click(screen.getByText('Auth checks'));
+  fireEvent.click(await screen.findByRole('button', { name: 'Discard changes' }));
+  await waitFor(() => expect((screen.getByLabelText('title') as HTMLInputElement).value).toBe('Auth checks'));
+  // No edits now: moving on does not ask.
+  fireEvent.click(screen.getByText('Server search'));
+  expect(screen.queryByRole('alertdialog')).toBeNull();
+  await waitFor(() => expect((screen.getByLabelText('title') as HTMLInputElement).value).toBe('Server search'));
 });
 
 test('an error goes away once the next change succeeds', async () => {

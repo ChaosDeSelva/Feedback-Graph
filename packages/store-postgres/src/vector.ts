@@ -83,15 +83,19 @@ export function searchDocsQuery(db: Db, q: { embedding: number[]; projectKey: st
   };
 }
 
-export function searchLessonsQuery(db: Db, q: { embedding: number[]; projectKey: string | null; k: number; status?: string }): SqlQuery {
+/** `param` (a text[], null: any): the lesson was learned in one of these projects, or has no project at all. */
+export const learnedIn = (t: string, param: string) =>
+  `(${param}::text[] IS NULL OR coalesce(${t}.project_key, ${t}.origin_project_key) IS NULL OR coalesce(${t}.project_key, ${t}.origin_project_key) = ANY(${param}))`;
+
+export function searchLessonsQuery(db: Db, q: { embedding: number[]; projectKey: string | null; k: number; status?: string; projectKeys?: string[] }): SqlQuery {
   const v = vectorTerms(db, 'l.embedding', '$1', q.embedding.length);
   return {
     sql: `SELECT x.*, 1 - x.distance / 2 AS score
           FROM (SELECT l.*, ${v.distance} AS distance FROM lessons l
-                WHERE l.status = $2 AND (l.project_key IS NULL OR l.project_key = $3) AND ${v.where}
+                WHERE l.status = $2 AND (l.project_key IS NULL OR l.project_key = $3) AND ${learnedIn('l', '$5')} AND ${v.where}
                 ORDER BY ${v.distance}, l.id LIMIT $4) x
           ORDER BY score DESC, x.id`,
-    params: [vectorParam(q.embedding), q.status ?? 'approved', q.projectKey, q.k],
+    params: [vectorParam(q.embedding), q.status ?? 'approved', q.projectKey, q.k, q.projectKeys ?? null],
   };
 }
 

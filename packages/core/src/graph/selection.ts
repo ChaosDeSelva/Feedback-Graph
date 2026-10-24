@@ -25,13 +25,23 @@ export type FolderCandidate = {
   cloneOf?: string | null;
 };
 
+/** A folder to suggest as a root: the parent folder of out-of-root session cwds, with how many sessions ran there. */
+export type OutsideFolder = { path: string; claudeSessions: number; codexSessions: number };
+
+export type OutsideRoots = {
+  claudeSessions: number;
+  codexSessions: number;
+  /** The parent folders those sessions ran in, most sessions first (at most 8). Unset in snapshots from older workers. */
+  folders?: OutsideFolder[];
+};
+
 export type CandidateSnapshot = {
   builtAt: string;
   /** The configured roots, as host paths. */
   roots: string[];
   candidates: FolderCandidate[];
   /** Sessions whose cwd is outside every root: add a root to make them selectable. */
-  outsideRoots: { claudeSessions: number; codexSessions: number };
+  outsideRoots: OutsideRoots;
   /** Whether the Codex sessions folder was there to read. */
   codexSessionsFound: boolean;
 };

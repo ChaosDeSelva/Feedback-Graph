@@ -54,6 +54,33 @@ export function initialSelection(env: Pick<Config, 'ingestProjects' | 'excludePr
 }
 
 /** A plain warning when nothing is being read, for /api/status and the worker log. */
-export function selectionNote(sel: Pick<ProjectSelection, 'tracked'>): string | null {
+export const NO_ROOTS_NOTE = 'No project folders yet: add a project folder in Settings first.';
+
+/** `roots`: how many project roots are mounted, when known. With none, nothing can be read whatever is selected. */
+export function selectionNote(sel: Pick<ProjectSelection, 'tracked'>, roots?: number): string | null {
+  if (roots === 0) return NO_ROOTS_NOTE;
   return sel.tracked.length ? null : 'No projects are selected yet, so no sessions are being read. Choose the folders to include in Settings.';
+}
+
+/**
+ * What the app shows outside Settings: the selected projects (not excluded) and the clone folders that follow them,
+ * whose old data may still be filed under their own key. Before a selection is saved nothing is shown (opt-in).
+ */
+export type ShownProjects = {
+  initialized: boolean;
+  /** Sorted. Empty: nothing is shown. */
+  keys: string[];
+  has(key: string): boolean;
+};
+
+export function shownProjects(
+  sel: Pick<ProjectSelection, 'tracked' | 'initialized'>,
+  env: Pick<Config, 'excludeProjects'>,
+  aliases: ReadonlyMap<string, string> = new Map(),
+): ShownProjects {
+  const scope = projectScope(sel.initialized ? sel : { tracked: [] }, env, aliases);
+  const keys = new Set(scope.projects);
+  for (const alias of aliases.keys()) if (scope.folder(alias)) keys.add(alias);
+  const sorted = [...keys].sort();
+  return { initialized: sel.initialized, keys: sorted, has: (key) => keys.has(key) };
 }

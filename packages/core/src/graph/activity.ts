@@ -41,13 +41,14 @@ export class ActivityRepo implements ActivityStore {
     );
   }
 
-  async list(q: { projectKey?: string; kind?: ActivityKind; target?: string; limit?: number }): Promise<Activity[]> {
+  async list(q: { projectKey?: string; projectKeys?: string[]; kind?: ActivityKind; target?: string; limit?: number }): Promise<Activity[]> {
     const rows = await this.g.run(
       `MATCH (x:Activity)
        WHERE ($projectKey IS NULL OR x.projectKey = $projectKey) AND ($kind IS NULL OR x.kind = $kind)
+         AND ($projectKeys IS NULL OR x.projectKey IS NULL OR x.projectKey IN $projectKeys)
          AND ($target IS NULL OR $target IN x.targets)
        RETURN x ORDER BY x.order DESC LIMIT $limit`,
-      { projectKey: q.projectKey ?? null, kind: q.kind ?? null, target: q.target ?? null, limit: neo4j.int(q.limit ?? 200) },
+      { projectKey: q.projectKey ?? null, projectKeys: q.projectKeys ?? null, kind: q.kind ?? null, target: q.target ?? null, limit: neo4j.int(q.limit ?? 200) },
     );
     return rows.map((r) => {
       const p = r.get('x').properties;

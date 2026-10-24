@@ -2,7 +2,7 @@ import { lstat, readdir, readFile, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import {
   ConfigError, fetchPullRequestContext, projectFolders, refreshLayout, relOfKey, killRunningCommands, loadConfig, makeProvider, ollamaEmbed, projectScope, providerUnavailableReason, ProviderUnavailableError, redactSecrets, runCloudSync, syncProjects,
-  searchLinearIssues, selectionNote, storedSyncMemory, touchedAround, VERSION, withHealth, type KnowledgeStore, type LlmProvider, type ModelJob, type ProjectScope, type SyncMemory, type WorkerStatus,
+  credentialFile, fetchLinearComments, Integrations, searchLinearIssues, selectionNote, storedSyncMemory, touchedAround, VERSION, withHealth, type KnowledgeStore, type LlmProvider, type ModelJob, type ProjectScope, type SyncMemory, type WorkerStatus,
 } from '@fb/core';
 import { openStore } from '@fb/store-postgres';
 import { CloudSyncSchedule } from './cloud/schedule.ts';
@@ -17,7 +17,9 @@ import { importMemories, memoryProjectKey } from './memory/memory.ts';
 import { forgetDeleted } from './forget.ts';
 import { loadStandingContext, memoryDirFor, runPostMortem } from './postmortem/postmortem.ts';
 import { huntContext } from './postmortem/hunt.ts';
-import { reposInScope, syncGithub } from './integrations/githubSync.ts';
+import { syncGithub } from './integrations/githubSync.ts';
+import { githubTarget, syncExternalFeedback, type SyncProject } from './integrations/feedbackSync.ts';
+import { attachWorkSession } from './postmortem/work.ts';
 import { runPostmortems } from './postmortem/step.ts';
 import { runScan } from './scan/scan.ts';
 import { SummarizeStage } from './summarize/stage.ts';
@@ -171,10 +173,16 @@ async function main() {
     codegraph: store.codegraph,
   };
 
+  // GitHub and Linear: a token in .env, else one pasted in Settings (re-read every cycle, so connecting needs no restart).
+  const integrations = new Integrations(docs, process.env, config.integrationsFile ? credentialFile(config.integrationsFile) : null);
+  let linearKey: string | null = null;
+
   const pmDeps = postmortemLlm && {
     k: knowledge,
-    postmortem: (input: Parameters<typeof runPostMortem>[0]) =>
-      runPostMortem(input, {
+    // A comment from GitHub or Linear is worked out against the agent session that did the work, when one is found.
+    postmortem: async (raw: Parameters<typeof runPostMortem>[0]) => {
+      const input = await attachWorkSession(raw, { graph: repo, sessions: store.sessions });
+      return runPostMortem(input, {
         llm: postmortemLlm,
         touched: async (i) => touchedAround(await store.codegraph.sessionFiles(i.sessionId), i.feedback.ts),
         sessionSummary: async (i) => (await store.sessions.detail(i.sessionId))?.summary?.markdown ?? null,
@@ -191,10 +199,11 @@ async function main() {
             embed,
             facts,
             docs,
-            linear: process.env.LINEAR_API_KEY ? { apiKey: process.env.LINEAR_API_KEY, search: searchLinearIssues } : undefined,
+            linear: linearKey ? { apiKey: linearKey, search: searchLinearIssues } : undefined,
             log,
           }),
-      }),
+      });
+    },
     embed,
     batch: 1,
     log,
@@ -289,19 +298,42 @@ async function main() {
     return !!r;
   }
 
-  const githubDeps = config.github
-    ? {
-        repos: new Map<string, string>(),
-        token: config.github.token,
-        fetchPrs: fetchPullRequestContext,
-        docs,
-        embed,
-        activity,
-        minIntervalMs: config.github.syncHours * 3600_000,
-        log,
-      }
-    : null;
-  log('github sync', { enabled: !!githubDeps, repos: [...(config.github?.repos.keys() ?? [])] });
+  /** The selected projects with their remotes: the only ones whose PRs and issues are read. */
+  async function syncProjectsList(): Promise<SyncProject[]> {
+    return Promise.all((await selectedFolders()).map(async (f) => ({ key: f.key, name: f.key, repoPath: f.repoPath, remote: await cycleDeps.remote(f.repoPath) })));
+  }
+
+  /** PR discussions as project context (docs), every GITHUB_SYNC_HOURS, for every selected project linked to a repository. */
+  async function syncGithubDocs() {
+    const cred = await integrations.credential('github');
+    if (!cred) return;
+    const repos = new Map<string, string>();
+    for (const p of await syncProjectsList()) {
+      const target = (await integrations.link(p.key)).github ? githubTarget(p, config.github.repos) : null;
+      if (target) repos.set(p.key, target);
+    }
+    const g = await syncGithub({ repos, token: cred.token, fetchPrs: fetchPullRequestContext, docs, embed, activity, minIntervalMs: config.github.syncHours * 3600_000, log });
+    if (g.prs) log('github synced', g);
+  }
+
+  /** Review comments and Linear comments into the Inbox (see feedbackSync.ts). */
+  async function syncFeedback() {
+    linearKey = (await integrations.credential('linear'))?.token ?? null;
+    const r = await syncExternalFeedback({
+      integrations,
+      graph: repo,
+      cursors: docs,
+      projects: syncProjectsList,
+      githubOverride: config.github.repos,
+      fetchPrs: fetchPullRequestContext,
+      fetchLinear: fetchLinearComments,
+      activity,
+      minIntervalMs: config.integrationSyncMinutes * 60_000,
+      log,
+    });
+    if (r.github || r.linear) log('comments synced', r);
+  }
+  log('integrations', { github: integrations.envSet('github') ? 'env' : 'settings', linear: integrations.envSet('linear') ? 'env' : 'settings', overrides: [...config.github.repos.keys()], everyMinutes: config.integrationSyncMinutes });
 
   // Feedback Graph Cloud: off (and nothing is sent) unless CLOUD_URL and CLOUD_TOKEN are set.
   const cloud = config.cloud;
@@ -339,7 +371,6 @@ async function main() {
   async function refreshScope() {
     scope = await selection.scope(config);
     cycleDeps.onlyProjects = scope.projects;
-    if (githubDeps && config.github) githubDeps.repos = reposInScope(config.github.repos, scope.folder);
     const note = selectionNote({ tracked: scope.projects });
     if (note !== lastNote) {
       if (note) log('nothing to read', { note });
@@ -391,6 +422,7 @@ async function main() {
         files: (await cycleDeps.listFiles()).map((f) => ({ ...f, source: f.source ?? 'claude' })),
         state,
         codexSessionsFound: codexFound,
+        hostHome: config.hostHome ?? undefined,
         remote: cycleDeps.remote,
         cloneOf: async (f) => (await repo.canonicalProject({ key: f.key, name: f.key, repoPath: f.repoPath, remote: f.remote }, { dryRun: true })).project.key,
       });
@@ -409,10 +441,9 @@ async function main() {
       mapStage.kick();
       await refreshCandidates();
       await forgetDeletedReads();
-      if (githubDeps) {
-        const g = await syncGithub(githubDeps);
-        if (g.prs) log('github synced', g);
-      }
+      // Each fails on its own: GitHub or Linear being down never holds up reading transcripts.
+      await syncGithubDocs().catch((err) => log('github sync failed', { error: redactSecrets(String(err)) }));
+      await syncFeedback().catch((err) => log('comment sync failed', { error: redactSecrets(String(err)) }));
       const imported = await importMemories(memDeps);
       if (imported) log('memory lessons imported', { imported });
       await retention();

@@ -1,6 +1,6 @@
-import type { ActivityInput, Lesson } from '@fb/core';
+import { shownProjects, type ActivityInput, type Lesson } from '@fb/core';
 import { describe, expect, test } from 'vitest';
-import { checkBeforeDone, getTaskContext, makeJudge, reportFeedback, resolveProject, taskFiles, type ContextDeps } from './context.ts';
+import { checkBeforeDone, getImpact, getModuleContext, getTaskContext, makeJudge, reportFeedback, resolveProject, taskFiles, type ContextDeps } from './context.ts';
 
 const roots = [{ host: '/Users/j/Vibe', container: '/vibe' }];
 const lesson = (id: string, title: string, over: Partial<Lesson> = {}): Lesson => ({
@@ -375,4 +375,46 @@ test('without files, or without a code graph, lessons rank by the search alone',
   expect(r.lessons.map((h) => h.lesson.id)).toEqual(['l1']);
   const r2 = await getTaskContext({ cwd: '/Users/j/Vibe/demo', task: 'search', files: ['a.ts'] }, deps());
   expect(r2.lessons.map((h) => h.lesson.id)).toEqual(['l1']);
+});
+
+describe('lessons learned in a project that is not selected are never served to agents', () => {
+  const shown = shownProjects({ tracked: ['demo'], initialized: true }, { excludeProjects: [] });
+  const fromOld = lesson('g-old', 'Old global rule', { projectKey: null, origin: 'old', scope: 'global', paths: ['src/**'] });
+  const mine = lesson('l1', 'Server-side search', { origin: 'demo', paths: ['src/**'] });
+  const noOrigin = lesson('g-any', 'Imported rule', { projectKey: null, origin: null, scope: 'global' });
+
+  function scoped() {
+    const asked: unknown[] = [];
+    const d = deps({
+      inScope: (k) => k === 'demo',
+      servesGlobal: () => true,
+      shown: async () => shown,
+      codegraph: {
+        lessonsForPaths: async () => [{ lesson: fromOld, paths: ['src/a.ts'] }, { lesson: mine, paths: ['src/a.ts'] }],
+        moduleContext: async (_k, path) => ({ file: { path, lang: 'typescript', hash: 'h', loc: 1, isTest: false, churn: null }, symbols: [], importers: [], imports: [], tests: [], facts: [], misses: [], lessons: [fromOld, mine] }) as never,
+        impact: async (_k, paths) => ({ paths, dependents: [], tests: [], misses: [], lessons: [fromOld, mine] }),
+      },
+    });
+    d.k = {
+      ...d.k,
+      searchLessons: async (q) => { asked.push(q.projectKeys); return [{ lesson: mine, score: 0.9 }, { lesson: noOrigin, score: 0.8 }]; },
+    };
+    return { d, asked };
+  }
+
+  test('get_task_context and check_before_done search only lessons learned in the selected projects', async () => {
+    const { d, asked } = scoped();
+    const r = await getTaskContext({ cwd: '/Users/j/Vibe/demo', task: 't', files: ['src/a.ts'] }, d);
+    expect(r.lessons.map((h) => h.lesson.id)).toEqual(['l1', 'g-any']);
+    await checkBeforeDone({ project: 'demo', task: 't', summary: 's' }, d);
+    // A folder that is not selected gets global lessons, still only ones learned in a selected project.
+    await getTaskContext({ cwd: '/Users/j/Vibe/elsewhere', task: 't' }, d);
+    expect(asked).toEqual([['demo'], ['demo'], ['demo']]);
+  });
+
+  test('get_module_context and impact leave such lessons out', async () => {
+    const { d } = scoped();
+    expect((await getModuleContext({ project: 'demo', path: 'src/a.ts' }, d)).module!.lessons.map((l) => l.id)).toEqual(['l1']);
+    expect((await getImpact({ project: 'demo', paths: ['src/a.ts'] }, d)).impact!.lessons.map((l) => l.id)).toEqual(['l1']);
+  });
 });

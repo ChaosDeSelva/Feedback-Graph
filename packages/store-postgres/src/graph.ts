@@ -1,6 +1,8 @@
 import {
   candidateProvenance,
+  EXTERNAL_SOURCES,
   matchReport,
+  redactDeep,
   MAX_CLASSIFY_ATTEMPTS,
   REPORT_MERGE_MINUTES,
   postmortemState,
@@ -10,6 +12,9 @@ import {
   type CandidateFilter,
   type CandidateStatus,
   type ClassifiableTurn,
+  type ExternalThread,
+  type SessionSource,
+  type WorkSession,
   type Classification,
   type Commit,
   type GraphStore,
@@ -227,8 +232,9 @@ export class PgGraphStore implements GraphStore {
       `SELECT ${CANDIDATE_COLUMNS}
        FROM candidates k JOIN turns t ON t.uuid = k.turn_uuid
        WHERE ($1::text IS NULL OR k.status = $1) AND ($2::text IS NULL OR k.project_key = $2)
+         AND ($4::text[] IS NULL OR k.project_key = ANY($4))
        ORDER BY t.ts DESC, k.id LIMIT $3`,
-      [f.status ?? null, f.projectKey ?? null, f.limit ?? 200],
+      [f.status ?? null, f.projectKey ?? null, f.limit ?? 200, f.projectKeys ?? null],
     );
     return rows.map(candidateOf);
   }
@@ -324,6 +330,56 @@ export class PgGraphStore implements GraphStore {
     return rowCount ?? 0;
   }
 
+  async upsertExternalThread(project: Project, t: ExternalThread): Promise<number> {
+    if (!t.items.length) return 0;
+    const items = redactDeep(lastOf(t.items, (i) => i.uuid));
+    const times = items.map((i) => i.ts).sort();
+    return tx(this.db, async (c) => {
+      await c.query(UTC);
+      await c.query('INSERT INTO projects (key, name, repo_path) VALUES ($1, $2, $3) ON CONFLICT (key) DO NOTHING', [
+        project.key, project.name ?? null, project.repoPath ?? null,
+      ]);
+      await c.query(
+        `INSERT INTO sessions (id, project_key, source, source_file, started_at, ended_at, manual)
+         VALUES ($1, $2, $3, $3, $4::timestamptz, $5::timestamptz, true)
+         ON CONFLICT (id) DO UPDATE SET ended_at = greatest(sessions.ended_at, EXCLUDED.ended_at)`,
+        [t.id, project.key, t.source, times[0], times.at(-1)],
+      );
+      // A comment already stored keeps its label and classification; (xmax = 0) tells a new row from an updated one.
+      const { rows } = await c.query(
+        `INSERT INTO turns (uuid, session_id, project_key, ts, ts_text, idx, text, preceding_assistant_text, tool_calls, external)
+         SELECT i.uuid, $2, $3, i.ts::timestamptz, i.ts, i.idx, i.text, i.context, '[]'::jsonb, i.external
+         FROM jsonb_to_recordset($1::jsonb) AS i(uuid text, ts text, idx integer, text text, context text, external jsonb)
+         ON CONFLICT (uuid) DO UPDATE SET ts = EXCLUDED.ts, ts_text = EXCLUDED.ts_text, idx = EXCLUDED.idx, text = EXCLUDED.text,
+           preceding_assistant_text = EXCLUDED.preceding_assistant_text, external = EXCLUDED.external
+         RETURNING (xmax = 0) AS inserted`,
+        [toJson(items.map((i) => ({ uuid: i.uuid, ts: i.ts, idx: i.index, text: i.text, context: i.context, external: i.external }))), t.id, project.key],
+      );
+      return rows.filter((r) => r.inserted).length;
+    });
+  }
+
+  async workSessions(q: { projectKey: string; branch: string | null; before: string; after?: string | null; limit: number }): Promise<WorkSession[]> {
+    const { rows } = await this.q(
+      `SELECT s.id, s.source, s.git_branch, s.cwd, s.started_at, coalesce(s.last_activity_at, s.ended_at) AS last_at
+       FROM sessions s
+       WHERE s.project_key = $1 AND NOT s.manual AND s.started_at IS NOT NULL AND s.started_at <= $3::timestamptz
+         AND CASE WHEN $2::text IS NULL
+               THEN $4::timestamptz IS NOT NULL AND coalesce(s.last_activity_at, s.ended_at, s.started_at) >= $4::timestamptz
+               ELSE s.git_branch = $2 END
+       ORDER BY coalesce(s.last_activity_at, s.ended_at, s.started_at) DESC, s.id LIMIT $5`,
+      [q.projectKey, q.branch, q.before, q.after ?? null, q.limit],
+    );
+    return rows.map((r) => ({
+      id: r.id,
+      source: (r.source as SessionSource) ?? 'claude',
+      gitBranch: r.git_branch ?? null,
+      cwd: r.cwd ?? null,
+      startedAt: iso(r.started_at),
+      lastActivityAt: iso(r.last_at),
+    }));
+  }
+
   async heartbeat(s: WorkerStatus): Promise<void> {
     await this.q(
       `INSERT INTO worker_status (id, status, updated_at) VALUES ('worker', $1::jsonb, now())
@@ -342,9 +398,9 @@ export class PgGraphStore implements GraphStore {
       `SELECT p.key AS project_key, to_char(${LOCAL_TIME('t')}, 'IYYY-"W"IW') AS week,
               count(*) AS human_turns, count(*) FILTER (WHERE t.label = ANY ($1::text[])) AS pushback
        FROM turns t JOIN sessions s ON s.id = t.session_id JOIN projects p ON p.key = s.project_key
-       WHERE t.idx > 0
+       WHERE t.idx > 0 AND NOT (coalesce(s.source, 'claude') = ANY ($2::text[]))
        GROUP BY 1, 2 ORDER BY week, project_key`,
-      [CANDIDATE_LABELS],
+      [CANDIDATE_LABELS, EXTERNAL_SOURCES],
     );
     return rows.map((r) => ({ projectKey: r.project_key, week: r.week, humanTurns: r.human_turns, pushback: r.pushback }));
   }
@@ -359,7 +415,7 @@ async function mergeIntoReport(x: { query: (sql: string, params?: unknown[]) => 
   const { rows: [turn] } = await x.query(
     `SELECT t.ts, t.ts_text, t.text, s.id AS session_id, s.project_key, coalesce(s.source, 'claude') AS source
      FROM turns t JOIN sessions s ON s.id = t.session_id
-     WHERE t.uuid = $1 AND NOT EXISTS (SELECT 1 FROM candidates WHERE id = $1)`,
+     WHERE t.uuid = $1 AND NOT EXISTS (SELECT 1 FROM candidates WHERE id = $1) AND t.external IS NULL`,
     [turnUuid],
   );
   if (!turn) return null;
@@ -396,7 +452,7 @@ async function mergeIntoReport(x: { query: (sql: string, params?: unknown[]) => 
 /** What candidateOf reads: the candidate's columns and the flagged turn's classification and words. */
 const CANDIDATE_COLUMNS = `k.id, k.turn_uuid, k.session_id, k.project_key, k.source, k.status, k.created_at, k.decided_at, k.note,
   k.manual, k.detected, k.agent_report, t.text AS turn_text, t.preceding_assistant_text AS turn_done,
-  t.label, t.confidence, t.summary, t.signals`;
+  t.label, t.confidence, t.summary, t.signals, t.external`;
 
 type Row = Record<string, any>;
 
@@ -410,6 +466,7 @@ export function turnOf(r: Row): HumanTurn {
     text: r.text ?? undefined,
     precedingAssistantText: r.preceding_assistant_text ?? '',
     precedingToolCalls: r.tool_calls ?? [],
+    ...(r.external ? { external: r.external } : {}),
   };
 }
 
@@ -420,6 +477,7 @@ function candidateOf(r: Row): Candidate {
     sessionId: r.session_id,
     projectKey: r.project_key,
     source: r.source ?? 'claude',
+    ...(r.external ? { external: r.external } : {}),
     classification: {
       label: r.label ?? undefined,
       confidence: r.confidence ?? undefined,

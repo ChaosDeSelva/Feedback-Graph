@@ -29,6 +29,9 @@ const KIND_LABEL: Record<ActivityKind, string> = {
   turns_requeued: 'turns re-queued',
   bundle_imported: 'bundle imported',
   session_summarized: 'session summarized',
+  roots_saved: 'project roots saved',
+  integration_changed: 'connection changed',
+  feedback_synced: 'comments synced',
 };
 
 const KIND_TONE: Partial<Record<ActivityKind, Tone>> = {

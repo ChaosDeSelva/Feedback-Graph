@@ -54,6 +54,10 @@ export function Docs() {
 
         <Section title="Your first hour">
           <ol className="list-decimal space-y-1.5 pl-5 marker:font-semibold marker:text-muted">
+            <li>
+              No project folder is mounted until you choose one. If <SettingsLink /> lists none, add the folder that holds your projects under{' '}
+              <b>Where folders come from</b>, then run <Code>./scripts/setup.sh</Code> on the host: it mounts exactly the folders you chose, read-only, and restarts the containers.
+            </li>
             <li>Open <SettingsLink /> and tick the project folders to read, then press <b>Save selection</b>.</li>
             <li>Check the badge at the bottom of the sidebar says <b>worker running</b>. If it says offline, run <Code>docker compose logs worker</Code>: config problems are listed by name.</li>
             <li>Open <b>Inbox</b> and go through the pending items. Use <Kbd>j</Kbd>/<Kbd>k</Kbd> to move, <Kbd>c</Kbd> to confirm real pushback, <Kbd>r</Kbd> to reject anything else (a new request, a question, a false alarm).</li>
@@ -145,9 +149,12 @@ export function Docs() {
             </Page>
             <Page name="Activity">The log of everything the tool created or changed, who or what did it, and why, including each <b>code mapped</b> build with its size and duration.</Page>
             <Page name="Settings">
-              Which project folders are read. Tick folders and press <b>Save selection</b>; sessions outside your project roots are counted so you know
-              whether to add a root. A folder that is not a git repo but holds repos one or two levels down is not one project: each git repo inside it is a
-              project of its own. <b>Clean up</b> deletes the data of projects you have not selected.
+              Which project folders are read. Tick folders and press <b>Save selection</b>. <b>Where folders come from</b> holds the project roots: add
+              or remove them there (there is none by default), and the folders sessions ran in outside them are suggested with their session counts, each
+              one click from being a root. A saved change is mounted when you run <Code>./scripts/setup.sh</Code>, which restarts the containers. A folder
+              that is not a git repo but holds repos one or two levels down is not one project: each git repo inside it is a project of its own.{' '}
+              <b>Clean up</b> deletes the data of projects you have not selected. Every other page shows only the selected
+              projects; Settings is the one place that lists every folder.
             </Page>
           </dl>
         </Section>
@@ -173,12 +180,38 @@ export function Docs() {
 
         <Section title="Limit what it reads">
           <ul className="list-disc space-y-1.5 pl-5 marker:text-faint">
-            <li>You choose the project folders to read in <SettingsLink />: tick them and press <b>Save selection</b>. Each folder shows how many Claude Code and Codex sessions ran in it. Unselecting a folder stops reading it and keeps what was learned; <b>Clean up</b> on the same page removes the data of every unselected project.</li>
+            <li>The containers see only the project roots you add in <SettingsLink /> (read-only), never your whole home folder.</li>
+            <li>You choose the project folders to read in <SettingsLink />: tick them and press <b>Save selection</b>. Each folder shows how many Claude Code and Codex sessions ran in it. Unselecting a folder stops reading it and hides it everywhere but Settings (agents stop getting its lessons too); what was learned is kept until <b>Clean up</b> on the same page removes the data of every unselected project.</li>
             <li><Code>EXCLUDE_PROJECTS</Code>: never these, whatever is selected. <Code>INGEST_PROJECTS</Code> only sets the selection on the very first start.</li>
             <li><Code>TURN_RETENTION_DAYS</Code>: drop old message text after that many days. A turn keeps its text until its session summary covers it; summaries are never dropped.</li>
             <li>Secrets are redacted before anything is stored or sent to a model, and secret files are never read. See <Code>SECURITY.md</Code> for details.</li>
           </ul>
           <p className="mt-2 text-muted">Restart after changing <Code>.env</Code>: <Code>docker compose up -d</Code>.</p>
+        </Section>
+
+        <Section title="GitHub and Linear">
+          <p>
+            Reviewers push back too. Connect GitHub or Linear and comments on your pull requests and Linear issues arrive in the <b>Inbox</b>, marked{' '}
+            <b>GitHub</b> or <b>Linear</b>, with the author, a link to the comment and, for a review comment, the file, line and diff lines. The same
+            classifier as for sessions picks out pushback and corrections; you confirm or reject them as usual.
+          </p>
+          <ol className="mt-2 list-decimal space-y-1.5 pl-5 marker:font-semibold marker:text-muted">
+            <li>
+              In <SettingsLink />, under <b>Integrations</b>, paste a token and press <b>Connect</b>. It is checked with one read-only call and saved only if
+              it works. For GitHub use a fine-grained token with only your projects' repositories and <b>Pull requests</b> and <b>Issues</b> read-only; for
+              Linear a personal API key. A token in <Code>.env</Code> (<Code>GITHUB_TOKEN</Code>, <Code>LINEAR_API_KEY</Code>) wins and shows as "set in .env".
+            </li>
+            <li>Each selected project with a github.com remote is linked to its repository (<Code>GITHUB_REPOS</Code> overrides it). For Linear, pick each project's team.</li>
+            <li>Every 10 minutes (<Code>INTEGRATION_SYNC_MINUTES</Code>) new comments are read; the first sync goes back 14 days. Bots are skipped.</li>
+          </ol>
+          <p className="mt-2">
+            A confirmed comment's post-mortem reads the agent session that did the work: one on the pull request's branch, or the only one just before the
+            comment. With none, it works from the comment and its diff lines.
+          </p>
+          <p className="mt-2 text-muted">
+            Tokens stay on this machine (a mode 600 file, never the database) and are never shown again. A revoked token or a rate limit pauses that
+            service and says so in Settings and in the connections list in the sidebar.
+          </p>
         </Section>
 
         <Section title="Share with a team">

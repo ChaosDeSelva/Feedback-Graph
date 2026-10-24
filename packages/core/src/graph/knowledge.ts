@@ -183,13 +183,14 @@ export class KnowledgeRepo implements KnowledgeStore {
     );
   }
 
-  async listLessons(f: { status?: LessonStatus; projectKey?: string; limit?: number }): Promise<Lesson[]> {
+  async listLessons(f: { status?: LessonStatus; projectKey?: string; projectKeys?: string[]; limit?: number }): Promise<Lesson[]> {
     const rows = await this.g.run(
       `MATCH (l:Lesson)
        WHERE ($status IS NULL OR l.status = $status)
          AND ($projectKey IS NULL OR l.projectKey = $projectKey OR l.projectKey IS NULL)
+         AND ${LEARNED_IN('l')}
        RETURN l ORDER BY l.createdAt DESC LIMIT $limit`,
-      { status: f.status ?? null, projectKey: f.projectKey ?? null, limit: neo4j.int(f.limit ?? 500) },
+      { status: f.status ?? null, projectKey: f.projectKey ?? null, projectKeys: f.projectKeys ?? null, limit: neo4j.int(f.limit ?? 500) },
     );
     return rows.map((r) => lessonOf(r.get('l').properties));
   }
@@ -271,13 +272,14 @@ export class KnowledgeRepo implements KnowledgeStore {
     return { unscoped: rows[0]?.get('unscoped') ?? false };
   }
 
-  async searchLessons(q: { embedding: number[]; projectKey: string | null; k: number; status?: LessonStatus }): Promise<LessonHit[]> {
+  async searchLessons(q: { embedding: number[]; projectKey: string | null; k: number; status?: LessonStatus; projectKeys?: string[] }): Promise<LessonHit[]> {
     const rows = await this.g.run(
       `MATCH (node:Lesson {status: $status})
-       WHERE (node.projectKey IS NULL OR node.projectKey = $projectKey) AND node.embedding IS NOT NULL AND size(node.embedding) = size($embedding)
+       WHERE (node.projectKey IS NULL OR node.projectKey = $projectKey) AND ${LEARNED_IN('node')}
+         AND node.embedding IS NOT NULL AND size(node.embedding) = size($embedding)
        WITH node, vector.similarity.cosine(node.embedding, $embedding) AS score
        RETURN node, score ORDER BY score DESC LIMIT $k`,
-      { embedding: q.embedding, k: neo4j.int(q.k), projectKey: q.projectKey, status: q.status ?? 'approved' },
+      { embedding: q.embedding, k: neo4j.int(q.k), projectKey: q.projectKey, status: q.status ?? 'approved', projectKeys: q.projectKeys ?? null },
     );
     return rows.map((r) => ({ lesson: lessonOf(r.get('node').properties), score: r.get('score') }));
   }
@@ -305,6 +307,7 @@ export class KnowledgeRepo implements KnowledgeStore {
     const flagged = await this.g.run(
       `MATCH (k:Candidate {projectKey: $key})-[:FLAGS]->(t:Turn)
        WHERE NOT coalesce(k.manual, false) AND k.agentReport IS NULL AND k.status <> 'rejected' AND t.ts IS NOT NULL
+         AND t.external IS NULL
          AND datetime(t.ts) >= datetime($from) AND datetime(t.ts) <= datetime($to)
        RETURN k.id AS id, k.sessionId AS sessionId, t.ts AS ts, t.text AS text`,
       {
@@ -375,13 +378,18 @@ function turnOf(p: Record<string, unknown>): HumanTurn {
     text: p.text as string,
     precedingAssistantText: (p.precedingAssistantText as string) ?? '',
     precedingToolCalls: JSON.parse((p.toolCalls as string) ?? '[]'),
+    ...(p.external ? { external: JSON.parse(p.external as string) } : {}),
   };
 }
+
+/** $projectKeys (null: any): the lesson was learned in one of them, or has no project at all. */
+const LEARNED_IN = (v: string) => `($projectKeys IS NULL OR coalesce(${v}.projectKey, ${v}.originProjectKey) IS NULL OR coalesce(${v}.projectKey, ${v}.originProjectKey) IN $projectKeys)`;
 
 function lessonOf(p: Record<string, unknown>): Lesson {
   return {
     id: p.id as string,
     projectKey: (p.projectKey as string) ?? null,
+    origin: ((p.projectKey ?? p.originProjectKey) as string) ?? null,
     title: p.title as string,
     rule: p.rule as string,
     appliesWhen: (p.appliesWhen as string) ?? '',

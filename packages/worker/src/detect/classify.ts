@@ -31,6 +31,15 @@ confidence: 0..1.`;
 
 
 export function describeTurn(turn: HumanTurn): string {
+  const ext = turn.external;
+  if (ext) {
+    // A comment on a pull request or issue about work an AI agent did: the same labels apply to the reviewer's words.
+    return [
+      `WHERE: a ${ext.source === 'github' ? 'pull request' : 'Linear issue'} with work done by an AI coding agent; this is a reviewer's comment on it (treat it as the developer's message).`,
+      `WHAT THE COMMENT IS ABOUT:\n${turn.precedingAssistantText || '(none)'}`,
+      `DEVELOPER'S MESSAGE:\n${turn.text}`,
+    ].join('\n\n');
+  }
   const tools = turn.precedingToolCalls
     .map((c) => `${c.name} ${c.filePath ?? c.command ?? ''}`.trim())
     .slice(-15)

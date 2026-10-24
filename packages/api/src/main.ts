@@ -1,9 +1,10 @@
 import { existsSync } from 'node:fs';
 import { serve } from '@hono/node-server';
-import { ConfigError, loadConfig, makeProviderOr, redactSecrets, ollamaEmbed, ollamaPing, projectFolders, refreshLayout, storedSyncMemory, syncProjects, VERSION, type Project } from '@fb/core';
+import { ConfigError, credentialFile, Integrations, loadConfig, makeProviderOr, redactSecrets, ollamaEmbed, ollamaPing, projectFolders, refreshLayout, shownProjects, storedSyncMemory, syncProjects, VERSION, type Project } from '@fb/core';
 import { openStore } from '@fb/store-postgres';
 import { createApp } from './app.ts';
 import { makeJudge } from './context.ts';
+import { rootsFile } from './roots.ts';
 
 const log = (msg: string, extra: object = {}) => console.log(JSON.stringify({ ts: new Date().toISOString(), msg, ...extra }));
 
@@ -42,6 +43,11 @@ const roots = config.roots;
 await selection.ensure(config, activity);
 /** Read per request: the selection changes from Settings at any time. */
 const scope = () => selection.scope(config);
+/** What every page but Settings shows, and what agents may be served: the selected projects and their clones. */
+const shown = async () => {
+  const [sel, aliases] = await Promise.all([selection.current(), selection.aliases()]);
+  return shownProjects(sel, config, aliases);
+};
 
 /**
  * Which folders are projects, by the worker's rule: top-level folders, and the git repos nested in one that is not a
@@ -71,6 +77,15 @@ async function projectDirs(): Promise<Project[]> {
   return (await allFolders()).filter((f) => s.folder(f.key)).map(({ path: _, ...p }) => p);
 }
 
+// GitHub and Linear: .env wins; otherwise the token pasted in Settings, kept in INTEGRATIONS_FILE (mode 600).
+const integrations = new Integrations(store.docs, process.env, config.integrationsFile ? credentialFile(config.integrationsFile) : null);
+/** The selected projects with their remotes as the worker last read them (its candidate list). */
+async function integrationProjects(): Promise<{ key: string; remote: string | null }[]> {
+  const [s, snap] = await Promise.all([scope(), selection.candidates()]);
+  const remotes = new Map((snap?.candidates ?? []).map((c) => [c.key, c.remote]));
+  return s.projects.map((key) => ({ key, remote: remotes.get(key) ?? null }));
+}
+
 const app = createApp(store.graph, {
   staticDir: process.env.STATIC_DIR,
   knowledge,
@@ -91,14 +106,22 @@ const app = createApp(store.graph, {
     worker: () => store.graph.workerStatus(),
   },
   inScope: async (key: string) => (await scope()).project(key),
+  shown,
   importer: { knowledge, facts, embed, activity, excluded: config.excludeProjects },
+  integrations: {
+    integrations,
+    projects: integrationProjects,
+    githubOverride: config.github.repos,
+    syncMinutes: config.integrationSyncMinutes,
+    activity,
+  },
   sessions: {
     store: store.sessions,
-    projects: async () => (await scope()).projects,
-    inScope: async (key: string) => (await scope()).project(key),
+    projects: async () => (await shown()).keys,
+    inScope: async (key: string) => (await shown()).has(key),
   },
   auth: { token: config.apiToken ?? undefined, publicHosts: config.publicHosts },
-  system: { version: VERSION, store: store.kind, ping: () => store.ping(), worker: () => store.graph.workerStatus(), selection: () => selection.current(), givenUpTurns: () => store.graph.givenUpTurns(),
+  system: { version: VERSION, store: store.kind, roots: roots.length, ping: () => store.ping(), worker: () => store.graph.workerStatus(), selection: () => selection.current(), givenUpTurns: () => store.graph.givenUpTurns(),
     // The embedding model always; the local chat model too when the api's check_before_done judge uses it.
     ollama: () => ollamaPing({ url: config.ollama.url, models: [config.ollama.embedModel, ...(judgeLlm.id.startsWith('ollama:') ? [judgeLlm.id.slice(7)] : [])], timeoutMs: 2000 }),
   },
@@ -108,6 +131,8 @@ const app = createApp(store.graph, {
     folders: async () => (await allFolders()).map((f) => ({ key: f.key, path: f.path })),
     excluded: config.excludeProjects,
     roots: roots.map((r) => (r.host || r.container).replace(/\/+$/, '')),
+    savedRoots: config.rootsFile ? rootsFile(config.rootsFile) : undefined,
+    hostHome: config.hostHome,
   },
   context: {
     roots,
@@ -125,6 +150,7 @@ const app = createApp(store.graph, {
     aliasOf: (key: string) => store.graph.projectByAlias(key),
     codegraph: store.codegraph,
     sessions: store.sessions,
+    shown,
   },
   log,
 });

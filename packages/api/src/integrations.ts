@@ -1,0 +1,281 @@
+import type { Hono } from 'hono';
+import { z } from 'zod';
+import {
+  DEFAULT_LINK, ENV_VAR, githubRepoOfRemote, githubViewer, integrationErrorKind, linearViewer, listLinearTeams, redactSecrets, tokenFingerprint,
+  type ActivityStore, type CloudConfig, type Connection, type ConnectionName, type IntegrationCheck, type IntegrationKind, type Integrations,
+  type IntegrationSyncState, type LinearTeam, type OllamaHealth, type WorkerStatus,
+} from '@fb/core';
+
+/**
+ * Settings > Integrations: connect GitHub and Linear (paste a token, or set it in .env, which wins), see each
+ * selected project's repository and Linear team, and the sync state. Tokens go in, never out: no response carries one.
+ */
+export type IntegrationsDeps = {
+  integrations: Integrations;
+  /** The selected projects with their git remotes (canonical, e.g. github.com/acme/shop). */
+  projects(): Promise<{ key: string; remote: string | null }[]>;
+  /** GITHUB_REPOS overrides. */
+  githubOverride: Map<string, string>;
+  syncMinutes: number;
+  activity?: Pick<ActivityStore, 'record'>;
+  /** Test seams for the one call that checks a token. */
+  viewer?: { github(token: string): Promise<string>; linear(token: string): Promise<string> };
+  teams?(apiKey: string): Promise<LinearTeam[]>;
+};
+
+export type ServiceView = {
+  connection: Connection;
+  /** The token is set in .env (it wins; Settings cannot change it). */
+  envSet: boolean;
+  envVar: string;
+  /** A token is saved in the app (used only when .env sets none). */
+  savedInApp: boolean;
+  account: string | null;
+  checkedAt: string | null;
+  lastSyncAt: string | null;
+  lastError: string | null;
+  errorKind: IntegrationSyncState['errorKind'];
+  rateLimitedUntil: string | null;
+};
+
+export type ProjectIntegrations = {
+  key: string;
+  github: { repo: string | null; from: 'remote' | 'GITHUB_REPOS' | null; enabled: boolean; lastSyncAt: string | null; items: number; error: string | null };
+  linear: { teamId: string | null; teamName: string | null; lastSyncAt: string | null; items: number; error: string | null };
+};
+
+export type IntegrationsView = {
+  /** Tokens can be saved in the app (INTEGRATIONS_FILE is set); false: only .env works. */
+  canSave: boolean;
+  syncMinutes: number;
+  github: ServiceView;
+  linear: ServiceView;
+  projects: ProjectIntegrations[];
+};
+
+const NAME: Record<IntegrationKind, string> = { github: 'GitHub', linear: 'Linear' };
+export const integrationHref = (kind: IntegrationKind) => `#settings/integrations-${kind}`;
+
+const Token = z.object({ token: z.string().trim().min(8, 'paste the whole token').max(500) }).strict();
+const Kind = z.enum(['github', 'linear']);
+const LinkPatch = z
+  .object({ github: z.boolean().optional(), linearTeamId: z.string().min(1).max(100).nullable().optional(), linearTeamName: z.string().max(200).nullable().optional() })
+  .strict();
+
+const when = (iso: string | null) => (iso ? new Date(iso).toISOString().replace('T', ' ').slice(0, 16) + ' UTC' : null);
+
+/**
+ * A service's state from its token, the last check and the worker's last sync: not connected (no token), error (the
+ * check or the worker found the token rejected, or a rate limit is in force), or connected.
+ */
+export function serviceConnection(
+  kind: IntegrationKind,
+  o: { source: 'env' | 'app' | null; fingerprint: string | null; check: IntegrationCheck | null; sync: IntegrationSyncState; canSave: boolean },
+  now = Date.now(),
+): Connection {
+  const href = integrationHref(kind);
+  if (!o.source || !o.fingerprint) {
+    const how = o.canSave ? `paste a token in Settings or set ${ENV_VAR[kind]} in .env` : `set ${ENV_VAR[kind]} in .env`;
+    return { state: 'not_connected', source: null, detail: `Not connected: ${how}.`, href };
+  }
+  const check = o.check?.fingerprint === o.fingerprint ? o.check : null;
+  const from = o.source === 'env' ? ' (set in .env)' : '';
+  if (check && !check.ok) return { state: 'error', source: o.source, detail: `${NAME[kind]} refused the token${from}: ${check.error}`, href };
+  if (o.sync.authFailedFor === o.fingerprint) {
+    return { state: 'error', source: o.source, detail: `${NAME[kind]} rejected the token${from} (revoked, expired or missing access). Syncing is paused until you replace it.`, href };
+  }
+  if (o.sync.rateLimitedUntil && Date.parse(o.sync.rateLimitedUntil) > now) {
+    return { state: 'error', source: o.source, detail: `Rate limited by ${NAME[kind]}: syncing resumes on its own at ${when(o.sync.rateLimitedUntil)}.`, href };
+  }
+  const who = check?.account ? `as ${check.account}` : 'token not checked yet';
+  const synced = o.sync.lastSyncAt ? `last sync ${when(o.sync.lastSyncAt)}` : 'not synced yet';
+  return { state: 'connected', source: o.source, detail: `Connected ${who}${from}; ${synced}.`, href };
+}
+
+async function service(d: IntegrationsDeps, kind: IntegrationKind): Promise<ServiceView> {
+  const i = d.integrations;
+  const [cred, check, sync, savedInApp] = await Promise.all([i.credential(kind), i.check(kind), i.sync(kind), i.savedInApp(kind)]);
+  const current = check && cred && check.fingerprint === cred.fingerprint ? check : null;
+  return {
+    connection: serviceConnection(kind, { source: cred?.source ?? null, fingerprint: cred?.fingerprint ?? null, check, sync, canSave: i.canSave }),
+    envSet: i.envSet(kind),
+    envVar: ENV_VAR[kind],
+    savedInApp,
+    account: current?.ok ? current.account : null,
+    checkedAt: current?.at ?? null,
+    lastSyncAt: sync.lastSyncAt,
+    lastError: sync.lastError,
+    errorKind: sync.errorKind,
+    rateLimitedUntil: sync.rateLimitedUntil,
+  };
+}
+
+export async function integrationsView(d: IntegrationsDeps): Promise<IntegrationsView> {
+  const [github, linear, projects, links, ghSync, linSync] = await Promise.all([
+    service(d, 'github'), service(d, 'linear'), d.projects(), d.integrations.links(), d.integrations.sync('github'), d.integrations.sync('linear'),
+  ]);
+  return {
+    canSave: d.integrations.canSave,
+    syncMinutes: d.syncMinutes,
+    github,
+    linear,
+    projects: projects.map((p) => {
+      const link = { ...DEFAULT_LINK, ...links[p.key] };
+      const override = d.githubOverride.get(p.key) ?? null;
+      const repo = override ?? githubRepoOfRemote(p.remote);
+      const gs = ghSync.projects[p.key];
+      const ls = linSync.projects[p.key];
+      return {
+        key: p.key,
+        github: { repo, from: override ? 'GITHUB_REPOS' : repo ? 'remote' : null, enabled: link.github, lastSyncAt: gs?.lastSyncAt ?? null, items: gs?.items ?? 0, error: gs?.error ?? null },
+        linear: { teamId: link.linearTeamId, teamName: link.linearTeamName, lastSyncAt: ls?.lastSyncAt ?? null, items: ls?.items ?? 0, error: ls?.error ?? null },
+      };
+    }),
+  };
+}
+
+/** One cheap call with the token: the account it belongs to, or why it was refused (never the token itself). */
+async function checkToken(d: IntegrationsDeps, kind: IntegrationKind, token: string, source: 'env' | 'app'): Promise<IntegrationCheck> {
+  const at = new Date().toISOString();
+  const fingerprint = tokenFingerprint(token);
+  try {
+    const account = kind === 'github'
+      ? await (d.viewer?.github ?? (async (t: string) => (await githubViewer({ token: t })).login))(token)
+      : await (d.viewer?.linear ?? (async (t: string) => { const v = await linearViewer({ apiKey: t }); return v.organization ? `${v.name} (${v.organization})` : v.name; }))(token);
+    return { ok: true, account, error: null, errorKind: null, at, source, fingerprint };
+  } catch (err) {
+    const errorKind = integrationErrorKind(err);
+    const raw = err instanceof Error ? err.message : String(err);
+    const error = redactSecrets(raw.split(token).join('[REDACTED]')).slice(0, 300);
+    const reason = errorKind === 'network' ? `could not reach ${NAME[kind]}: ${error}` : error;
+    return { ok: false, account: null, error: reason, errorKind, at, source, fingerprint };
+  }
+}
+
+/** Routes behind Settings > Integrations. Writes are owner-only (guarded in createApp). */
+export function integrationRoutes(app: Hono, d: IntegrationsDeps) {
+  const i = d.integrations;
+  const record = (kind: IntegrationKind, subject: string, why: string, details: Record<string, unknown> = {}) =>
+    d.activity?.record({ kind: 'integration_changed', actor: 'you', projectKey: null, subject, why, details: { service: kind, ...details } });
+
+  app.get('/api/settings/integrations', async (c) => c.json(await integrationsView(d)));
+
+  app.put('/api/settings/integrations/:kind', async (c) => {
+    const kind = Kind.safeParse(c.req.param('kind'));
+    if (!kind.success) return c.json({ error: 'unknown service: github or linear' }, 404);
+    const k = kind.data;
+    if (i.envSet(k)) return c.json({ error: `${ENV_VAR[k]} is set in .env, which wins over a token saved here. Change it there and restart.` }, 409);
+    if (!i.canSave) return c.json({ error: `tokens cannot be saved here (no INTEGRATIONS_FILE): set ${ENV_VAR[k]} in .env instead` }, 501);
+    const body = Token.safeParse(await c.req.json().catch(() => null));
+    if (!body.success) return c.json({ error: body.error.issues[0]?.message ?? 'send { "token": "..." }' }, 400);
+    const check = await checkToken(d, k, body.data.token, 'app');
+    if (!check.ok) return c.json({ error: `${NAME[k]} did not accept this token, so it was not saved: ${check.error}` }, 400);
+    await i.saveCredential(k, body.data.token);
+    await i.saveCheck(k, check);
+    await record(k, `connected ${NAME[k]} as ${check.account}`, 'you saved a token in Settings; it was checked with one call');
+    return c.json(await integrationsView(d));
+  });
+
+  app.post('/api/settings/integrations/:kind/test', async (c) => {
+    const kind = Kind.safeParse(c.req.param('kind'));
+    if (!kind.success) return c.json({ error: 'unknown service: github or linear' }, 404);
+    const cred = await i.credential(kind.data);
+    if (!cred) return c.json({ error: `${NAME[kind.data]} is not connected` }, 409);
+    const check = await checkToken(d, kind.data, cred.token, cred.source);
+    await i.saveCheck(kind.data, check);
+    return c.json({ ok: check.ok, account: check.account, error: check.error, view: await integrationsView(d) });
+  });
+
+  app.delete('/api/settings/integrations/:kind', async (c) => {
+    const kind = Kind.safeParse(c.req.param('kind'));
+    if (!kind.success) return c.json({ error: 'unknown service: github or linear' }, 404);
+    const k = kind.data;
+    if (i.envSet(k) && !(await i.savedInApp(k))) return c.json({ error: `${ENV_VAR[k]} is set in .env: remove it there and restart to disconnect.` }, 409);
+    await i.removeCredential(k);
+    await record(k, `disconnected ${NAME[k]}`, 'you removed the token saved in Settings; comments already in the Inbox stay');
+    return c.json(await integrationsView(d));
+  });
+
+  app.get('/api/settings/integrations/linear/teams', async (c) => {
+    const cred = await i.credential('linear');
+    if (!cred) return c.json({ error: 'Linear is not connected' }, 409);
+    try {
+      return c.json(await (d.teams ?? ((apiKey: string) => listLinearTeams({ apiKey })))(cred.token));
+    } catch (err) {
+      const msg = redactSecrets((err instanceof Error ? err.message : String(err)).split(cred.token).join('[REDACTED]')).slice(0, 300);
+      return c.json({ error: `could not list Linear teams: ${msg}` }, 502);
+    }
+  });
+
+  app.put('/api/settings/integrations/projects/:key', async (c) => {
+    const key = c.req.param('key');
+    if (!(await d.projects()).some((p) => p.key === key)) return c.json({ error: `${key} is not a selected project` }, 404);
+    const body = LinkPatch.safeParse(await c.req.json().catch(() => null));
+    if (!body.success) return c.json({ error: 'send { "github"?: boolean, "linearTeamId"?: string | null, "linearTeamName"?: string | null }' }, 400);
+    const patch = { ...body.data, ...(body.data.linearTeamId === null ? { linearTeamName: null } : {}) };
+    const next = await i.setLink(key, patch);
+    const what = [
+      body.data.github !== undefined ? `GitHub ${next.github ? 'on' : 'off'}` : null,
+      body.data.linearTeamId !== undefined ? (next.linearTeamId ? `Linear team ${next.linearTeamName ?? next.linearTeamId}` : 'no Linear team') : null,
+    ].filter(Boolean).join(', ');
+    await d.activity?.record({ kind: 'integration_changed', actor: 'you', projectKey: key, subject: `${key}: ${what}`, why: 'you changed it in Settings > Integrations', details: next });
+    return c.json(await integrationsView(d));
+  });
+}
+
+/** Model connections from the worker's heartbeat: which jobs use Claude or Codex, and whether they answered. */
+function agentConnection(name: 'claude' | 'codex', w: WorkerStatus | null): Connection {
+  const href = '#settings/connections';
+  const label = name === 'claude' ? 'Claude' : 'Codex';
+  if (!w) return { state: 'not_connected', source: null, detail: 'The worker has not reported yet.', href };
+  const match = (p: string | null | undefined) => !!p && (name === 'claude' ? p.startsWith('claude-cli') || p.startsWith('anthropic:') : p.startsWith('codex-cli'));
+  const jobs = Object.entries(w.providers).filter(([, p]) => match(p)).map(([job]) => job);
+  if (!jobs.length) {
+    const how = name === 'claude' ? 'set CLAUDE_CODE_OAUTH_TOKEN (./scripts/setup.sh) or ANTHROPIC_API_KEY, or POSTMORTEM_LLM=claude-cli' : 'set POSTMORTEM_LLM or SCAN_LLM to codex-cli';
+    return { state: 'not_connected', source: null, detail: `No job uses ${label}: ${how}.`, href };
+  }
+  const down = jobs.map((j) => w.health?.[j as keyof NonNullable<WorkerStatus['health']>]).find((h) => h && !h.ok);
+  if (down) return { state: 'error', source: 'env', detail: `${label} did not answer: ${down.reason}`, href };
+  return { state: 'connected', source: 'env', detail: `${label} runs: ${jobs.join(', ')}.`, href };
+}
+
+function ollamaConnection(o: OllamaHealth | null): Connection {
+  const href = '#settings/connections';
+  if (!o) return { state: 'not_connected', source: null, detail: 'Ollama was not checked.', href };
+  return o.ok ? { state: 'connected', source: 'env', detail: `Ollama answers at ${o.url}.`, href } : { state: 'error', source: 'env', detail: `Ollama: ${o.reason}`, href };
+}
+
+function cloudConnection(cloud: CloudConfig | null, w: WorkerStatus | null): Connection {
+  const href = '#settings/connections';
+  if (!cloud) return { state: 'not_connected', source: null, detail: 'Cloud sync is off: nothing is sent anywhere.', href };
+  const host = new URL(cloud.url).host;
+  const s = w?.cloudSync;
+  if (s?.lastOk === false) return { state: 'error', source: 'env', detail: `Sync to ${host} failed: ${s.lastError ?? 'unknown error'}`, href };
+  return { state: 'connected', source: 'env', detail: s?.lastAt ? `Syncing to ${host}; last sync ${when(s.lastAt)}.` : `Set up for ${host}; not synced yet.`, href };
+}
+
+/** Every connection for /api/status. Each one fails on its own: a broken one never hides the others. */
+export async function connectionsStatus(o: {
+  integrations: Integrations | null;
+  worker: WorkerStatus | null;
+  ollama: OllamaHealth | null;
+  cloud: CloudConfig | null;
+}): Promise<Record<ConnectionName, Connection>> {
+  const one = async (kind: IntegrationKind): Promise<Connection> => {
+    if (!o.integrations) return { state: 'not_connected', source: null, detail: 'Not available in this setup.', href: integrationHref(kind) };
+    try {
+      return (await service({ integrations: o.integrations } as IntegrationsDeps, kind)).connection;
+    } catch (err) {
+      return { state: 'error', source: null, detail: `Could not read the ${NAME[kind]} state: ${redactSecrets(String(err)).slice(0, 200)}`, href: integrationHref(kind) };
+    }
+  };
+  const [github, linear] = await Promise.all([one('github'), one('linear')]);
+  return {
+    github,
+    linear,
+    claude: agentConnection('claude', o.worker),
+    codex: agentConnection('codex', o.worker),
+    ollama: ollamaConnection(o.ollama),
+    cloud: cloudConnection(o.cloud, o.worker),
+  };
+}

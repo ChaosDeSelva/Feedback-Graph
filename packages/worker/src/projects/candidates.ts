@@ -1,5 +1,6 @@
 import { lstat } from 'node:fs/promises';
-import { isGitDir, projectFolders, projectFromCwd, type CandidateSnapshot, type FolderCandidate, type Root } from '@fb/core';
+import { posix } from 'node:path';
+import { isGitDir, projectFolders, projectFromCwd, type CandidateSnapshot, type FolderCandidate, type OutsideFolder, type Root } from '@fb/core';
 import { projectRemote } from '../ingest/git.ts';
 import type { FileState } from '../state.ts';
 import { cachedHead, codexCwds, readSessionHead, type HeadFile, type SessionHead } from './heads.ts';
@@ -18,7 +19,64 @@ export type CandidateOpts = {
    */
   cloneOf?: (folder: { key: string; repoPath: string; remote: string }) => Promise<string | null>;
   now?: () => string;
+  /** The host's home folder (HOST_HOME): never suggested as a root. */
+  hostHome?: string;
 };
+
+/** How many parent folders of out-of-root sessions are suggested as roots. */
+export const MAX_SUGGESTED_ROOTS = 8;
+
+/** Temporary folders: sessions there are throwaway runs, never a projects folder. */
+const TEMP = /^\/(private\/)?(tmp|var)(\/|$)/;
+
+/**
+ * The folder to suggest as a root for a session that ran outside every root: its cwd's parent, so the cwd becomes a
+ * project under it. Null for a parent inside a dot-folder (~/.config) or an agent's worktrees, a temporary folder, the
+ * home folder itself, and folders too near the top of the disk to be a projects folder (/, /Users, /tmp).
+ */
+export function suggestedRoot(cwd: string, hostHome = ''): string | null {
+  const parent = posix.dirname(trim(cwd) || '/');
+  const parts = parent.split('/').filter(Boolean);
+  if (parts.length < 2 || parts.some((p) => p.startsWith('.') || p === 'worktrees') || TEMP.test(parent)) return null;
+  if (parent === trim(hostHome) || /^\/(Users|home)\/[^/]+$/.test(parent)) return null;
+  return parent;
+}
+
+/**
+ * A suggestion inside another suggestion is covered by it (one root there brings in both): its sessions count toward
+ * the outermost one, and it is not suggested on its own.
+ */
+function foldNested(folders: OutsideFolder[]): OutsideFolder[] {
+  const outer = folders.filter((f) => !folders.some((o) => o !== f && f.path.startsWith(`${o.path}/`)));
+  return outer.map((o) => {
+    const inside = folders.filter((f) => f === o || f.path.startsWith(`${o.path}/`));
+    return {
+      path: o.path,
+      claudeSessions: inside.reduce((n, f) => n + f.claudeSessions, 0),
+      codexSessions: inside.reduce((n, f) => n + f.codexSessions, 0),
+    };
+  });
+}
+
+/** Side-by-side suggestions from this many up are offered as the folder holding them (dated Codex workspaces...). */
+const SIBLINGS = 3;
+
+/** Three or more suggestions in one folder become that folder, when it could be a root itself. */
+function groupSiblings(folders: OutsideFolder[], hostHome = ''): OutsideFolder[] {
+  const byParent = new Map<string, OutsideFolder[]>();
+  for (const f of folders) {
+    const parent = posix.dirname(f.path);
+    byParent.set(parent, [...(byParent.get(parent) ?? []), f]);
+  }
+  return [...byParent].flatMap(([parent, group]) =>
+    group.length >= SIBLINGS && suggestedRoot(`${parent}/x`, hostHome) === parent
+      ? [{
+        path: parent,
+        claudeSessions: group.reduce((n, f) => n + f.claudeSessions, 0),
+        codexSessions: group.reduce((n, f) => n + f.codexSessions, 0),
+      }]
+      : group);
+}
 
 /**
  * The snapshot to store, plus each file's folder key for the ingest step: null when there is nothing in it to
@@ -53,6 +111,7 @@ export async function buildCandidates(o: CandidateOpts): Promise<CandidateBuild>
   }
 
   const outsideRoots = { claudeSessions: 0, codexSessions: 0 };
+  const outside = new Map<string, OutsideFolder>();
   const folderOf = new Map<string, string | string[] | null>();
   for (const f of o.files) {
     const head = await cachedHead(o.state, f, readHead);
@@ -72,6 +131,12 @@ export async function buildCandidates(o: CandidateOpts): Promise<CandidateBuild>
     const count = f.source === 'codex' ? 'codexSessions' : 'claudeSessions';
     if (!keys.length) {
       outsideRoots[count]++;
+      const parent = suggestedRoot(head.cwd, o.hostHome);
+      if (parent) {
+        const row = outside.get(parent) ?? { path: parent, claudeSessions: 0, codexSessions: 0 };
+        row[count]++;
+        outside.set(parent, row);
+      }
       continue;
     }
     for (const { key, rel, root } of at.values()) {
@@ -106,7 +171,12 @@ export async function buildCandidates(o: CandidateOpts): Promise<CandidateBuild>
     builtAt: o.now?.() ?? new Date().toISOString(),
     roots: o.roots.map(shown),
     candidates,
-    outsideRoots,
+    outsideRoots: {
+      ...outsideRoots,
+      folders: foldNested(groupSiblings(foldNested([...outside.values()]), o.hostHome))
+        .sort((a, b) => b.claudeSessions + b.codexSessions - (a.claudeSessions + a.codexSessions) || a.path.localeCompare(b.path))
+        .slice(0, MAX_SUGGESTED_ROOTS),
+    },
     codexSessionsFound: o.codexSessionsFound,
     folderOf,
   };
