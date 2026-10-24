@@ -2,7 +2,7 @@ import { parseGithubRepos } from './integrations/github.ts';
 import type { Root } from './projects.ts';
 
 /** Bumped with each release; reported by /api/status and the worker heartbeat. */
-export const VERSION = '0.3.0';
+export const VERSION = '0.4.2';
 
 export class ConfigError extends Error {
   readonly problems: string[];
@@ -71,6 +71,8 @@ export type Config = {
   turnRetentionDays: number | null;
   /** MEMORY_AUTO_APPROVE: import Claude Code feedback memories as approved lessons instead of proposed ones. */
   memoryAutoApprove: boolean;
+  /** Session summaries (the worker's summarize stage). */
+  summary: SummaryConfig;
   github: { token: string; repos: Map<string, string>; syncHours: number } | null;
   apiToken: string | null;
   publicHosts: string[];
@@ -81,6 +83,21 @@ export type Config = {
   /** The interface the server listens on: API_LISTEN (0.0.0.0 inside the container), else API_BIND. */
   apiListen: string;
   port: number;
+};
+
+export type SummaryConfig = {
+  /** SUMMARY_LLM=off turns summaries off. */
+  enabled: boolean;
+  /** SUMMARY_LLM: a provider spec; null uses the local Ollama model. */
+  llm: string | null;
+  /** A session's new turns are summarized once it has been quiet this long (SUMMARY_QUIET_MINUTES, 10)... */
+  quietMinutes: number;
+  /** ...or at once when this many are waiting (SUMMARY_MAX_DELTA_TURNS, 40). */
+  maxDeltaTurns: number;
+  /** Quiet this long, and summarized to its last turn: idle, "complete for now" (SESSION_IDLE_MINUTES, 30). */
+  idleMinutes: number;
+  /** Existing sessions summarized per cycle, newest first (SUMMARY_BACKFILL_PER_CYCLE, 3; 0 stops the backfill). */
+  backfillPerCycle: number;
 };
 
 export type CloudConfig = {
@@ -176,10 +193,26 @@ export function loadConfig(env: Env): Config {
   if (!apiToken && !LOOPBACK.test(apiBind)) {
     problems.push(`API_BIND=${apiBind} exposes the API beyond this machine, which needs API_TOKEN (openssl rand -hex 24); or set API_BIND=127.0.0.1`);
   }
-  for (const k of ['CLASSIFY_LLM', 'POSTMORTEM_LLM', 'SCAN_LLM']) {
-    if (/^codex-cli(:|$)/.test(env[k]?.trim() ?? '') && env.ALLOW_UNCONFINED_CODEX?.trim() !== '1') {
-      problems.push(`${k}: codex-cli can read every file the worker can (all transcripts, every project's .env, the worker's secrets); set ALLOW_UNCONFINED_CODEX=1 to accept that, or use claude-cli (SECURITY.md)`);
+  const runnerUrl = env.CODEX_RUNNER_URL?.trim() || '';
+  if (runnerUrl) {
+    let u: URL | null = null;
+    try {
+      u = new URL(runnerUrl);
+    } catch {
+      problems.push('CODEX_RUNNER_URL is not a URL (http://codex-runner:8790)');
     }
+    if (u && u.protocol !== 'http:' && u.protocol !== 'https:') problems.push(`CODEX_RUNNER_URL must be http:// or https:// (got ${u.protocol})`);
+    else if (u && (u.username || u.password)) problems.push('CODEX_RUNNER_URL must not carry a user name or password (the runner token is in the scratch volume)');
+  }
+  for (const k of ['CLASSIFY_LLM', 'POSTMORTEM_LLM', 'SCAN_LLM', 'SUMMARY_LLM']) {
+    if (/^codex-cli(:|$)/.test(env[k]?.trim() ?? '') && !runnerUrl && env.ALLOW_UNCONFINED_CODEX?.trim() !== '1') {
+      problems.push(`${k}: codex-cli inside the worker can read every file the worker can (all transcripts, every project's .env, the worker's secrets); run it in the codex-runner sidecar (CODEX_RUNNER_URL with docker compose --profile codex), set ALLOW_UNCONFINED_CODEX=1 to accept that, or use claude-cli (SECURITY.md)`);
+    }
+  }
+  // check_before_done is judged inside the api, which has no agent CLIs (and should not hold their logins: it is the
+  // service other machines can reach). The judge reads only the summary and diff it is sent, so it needs no repo access.
+  if (/^(claude|codex)-cli(:|$)/.test(env.CHECK_LLM?.trim() ?? '')) {
+    problems.push('CHECK_LLM: claude-cli and codex-cli run in the worker, not the api, so they cannot judge check_before_done; use ollama:<model> or an API model (openai:, anthropic:, openrouter:, groq:), or leave it empty for the local model');
   }
 
   const storeRaw = env.STORE?.trim().toLowerCase() || 'neo4j';
@@ -231,6 +264,19 @@ export function loadConfig(env: Env): Config {
 
   const retention = env.TURN_RETENTION_DAYS?.trim() ? num('TURN_RETENTION_DAYS', 0) : null;
 
+  const summaryOff = env.SUMMARY_LLM?.trim().toLowerCase() === 'off';
+  const summary: SummaryConfig = {
+    enabled: !summaryOff,
+    llm: summaryOff ? null : spec('SUMMARY_LLM'),
+    quietMinutes: num('SUMMARY_QUIET_MINUTES', 10),
+    maxDeltaTurns: num('SUMMARY_MAX_DELTA_TURNS', 40, 2),
+    idleMinutes: num('SESSION_IDLE_MINUTES', 30),
+    backfillPerCycle: num('SUMMARY_BACKFILL_PER_CYCLE', 3, 0),
+  };
+  if (summary.idleMinutes < summary.quietMinutes) {
+    problems.push(`SESSION_IDLE_MINUTES (${summary.idleMinutes}) must be at least SUMMARY_QUIET_MINUTES (${summary.quietMinutes}): a session is summarized before it is called idle`);
+  }
+
   const config: Config = {
     store,
     neo4j: store === 'neo4j' ? { url: str('NEO4J_URL', 'bolt://neo4j:7687'), user: str('NEO4J_USER', 'neo4j'), password: str('NEO4J_PASSWORD') } : null,
@@ -253,6 +299,7 @@ export function loadConfig(env: Env): Config {
     excludeProjects: list(env.EXCLUDE_PROJECTS),
     turnRetentionDays: retention,
     memoryAutoApprove: autoApproveRaw === 'true',
+    summary,
     github,
     apiToken,
     publicHosts,

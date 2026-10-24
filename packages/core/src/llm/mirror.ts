@@ -37,10 +37,11 @@ async function listFiles(repo: string): Promise<string[]> {
  * A throwaway copy of `repo` for agents that cannot be denied individual files (Codex's read-only sandbox reads
  * anything): no secret files, no heavy or generated folders, no git metadata. The caller removes it with `dispose`.
  * This only keeps secrets out of the agent's cwd; it confines nothing. Absolute paths stay readable, which is why
- * codex-cli needs ALLOW_UNCONFINED_CODEX=1 (CODEX_UNCONFINED in providers.ts).
+ * codex-cli runs in the codex-runner sidecar (`parent` is its scratch volume, codexRunner.ts) or, inside the worker,
+ * only with ALLOW_UNCONFINED_CODEX=1 (CODEX_UNCONFINED in providers.ts).
  */
-export async function mirrorForAgent(repo: string): Promise<{ dir: string; files: number; dispose(): Promise<void> }> {
-  const dir = await mkdtemp(join(tmpdir(), 'fb-mirror-'));
+export async function mirrorForAgent(repo: string, parent: string = tmpdir()): Promise<{ dir: string; files: number; dispose(): Promise<void> }> {
+  const dir = await mkdtemp(join(parent, 'fb-mirror-'));
   let total = 0;
   let files = 0;
   for (const rel of (await listFiles(repo)).slice(0, MAX_FILES)) {

@@ -12,12 +12,14 @@ export type CloudDeps = {
   /** The projects a sync sends (the selection, narrowed by SYNC_PROJECTS, never an excluded one). */
   projects: () => Promise<string[]>;
   worker: () => Promise<WorkerStatus | null>;
+  /** What the cloud last accepted (storedSyncMemory: the same record the worker's schedule uses). Default: in memory. */
+  memory?: SyncMemory;
   fetch?: typeof fetch;
 };
 
 /** The plain sentence the Settings card and the Docs page show. */
 export const NEVER_SENT =
-  'Never sent: session transcripts (including the feedback you typed), source code, file excerpts, document text, embeddings, or anything from a project you have not selected.';
+  'Never sent: session transcripts (including the feedback you typed), source code, file excerpts, document text, embeddings, or anything new from a project you have not selected (one synced before gets a last bundle that takes it back out).';
 
 /** GET /api/cloud: the Settings card. */
 export type CloudInfo = {
@@ -40,8 +42,8 @@ export const cloudStatus = (cloud: CloudConfig | null) => cloud && { host: new U
 /** The card and Sync now. POST /api/cloud/sync is owner-only (guarded in createApp). */
 export function cloudRoutes(app: Hono, d: CloudDeps) {
   let running: Promise<unknown> | null = null;
-  // What the cloud last accepted per project, for `withdrawn` on the next Sync now (the worker keeps its own).
-  const memory: SyncMemory = new Map();
+  // What the cloud last accepted per project, for `withdrawn` on the next Sync now; shared with the worker's schedule.
+  const memory: SyncMemory = d.memory ?? new Map();
 
   app.get('/api/cloud', async (c) => {
     const cloud = d.cloud;

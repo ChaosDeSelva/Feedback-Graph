@@ -23,7 +23,9 @@ import type { DocHit, DocInput, DocSummary } from './graph/docs.ts';
 import type { EvidenceGraph, PatternReport } from './graph/insights.ts';
 import type { ExportBundle } from './graph/portability.ts';
 import type { CandidateSnapshot } from './graph/selection.ts';
-import type { CodeMapMeta, CodeMapStats, CodeMapWrite, Hotspot, Impact, ModuleContext, SessionFile, StoredCodeMap } from './codegraph.ts';
+import type { CodeMapMeta, CodeMapStats, CodeMapWrite, Hotspot, HotspotOpts, Impact, MapGraph, ModuleContext, SessionFile, StoredCodeMap } from './codegraph.ts';
+import type { HumanTurn, SessionDetail, SessionListItem, SessionState } from './types.ts';
+import type { SessionCursor, SummaryWork, SummaryWorkQuery, SummaryWrite } from './sessions.ts';
 
 export type StoreKind = 'neo4j' | 'postgres';
 export const STORE_KINDS: readonly StoreKind[] = ['neo4j', 'postgres'];
@@ -52,7 +54,8 @@ export interface GraphStore {
   listCandidates(f?: CandidateFilter): Promise<Candidate[]>;
   candidateDetail(id: string): Promise<CandidateDetail | null>;
   decide(id: string, status: 'confirmed' | 'rejected', note: string | null): Promise<void>;
-  pruneTurnText(before: Date, limit?: number): Promise<number>;
+  /** keepUnsummarized: only turns a session summary already covers lose their text (summaries stay either way). */
+  pruneTurnText(before: Date, limit?: number, o?: { keepUnsummarized?: boolean }): Promise<number>;
   heartbeat(s: WorkerStatus): Promise<void>;
   workerStatus(): Promise<WorkerStatus | null>;
   stats(): Promise<StatsRow[]>;
@@ -91,7 +94,14 @@ export interface FactsStore {
   searchFacts(q: { embedding: number[]; projectKey: string; k: number }): Promise<FactHit[]>;
   requestScan(project: Project, provider: string | null): Promise<ScanJob>;
   scanJob(id: string): Promise<ScanJob | null>;
-  nextScanJob(): Promise<ScanJob | null>;
+  /** The oldest queued job that is due (its retryAt, if any, has passed). */
+  nextScanJob(now?: Date): Promise<ScanJob | null>;
+  /**
+   * A run that did not finish. `counted` (a real failure): one more attempt, queued again after scanRetryAt, or
+   * failed for good after MAX_SCAN_ATTEMPTS. Not counted (the model could not be asked): queued again after
+   * SCAN_UNAVAILABLE_WAIT_MS, attempts unchanged. Returns the job's attempts and when it runs next (null: failed).
+   */
+  recordScanFailure(id: string, error: string, o: { counted: boolean }, now?: Date): Promise<{ attempts: number; retryAt: string | null }>;
   updateScanJob(id: string, patch: Partial<Pick<ScanJob, 'filesScanned' | 'factsAdded' | 'error'>> & { status?: ScanStatus }): Promise<void>;
   requeueStaleScans(): Promise<void>;
   listProjects(): Promise<ProjectSummary[]>;
@@ -174,10 +184,34 @@ export interface CodeGraphStore {
   moduleContext(projectKey: string, path: string): Promise<ModuleContext | null>;
   /** What changing these files touches: dependents up to `depth`, tests to run, misses and lessons on them. */
   impact(projectKey: string, paths: string[], depth: number): Promise<Impact>;
-  /** Mapped files by score (misses, churn, dependents), highest first, ties by path. */
-  hotspots(projectKey: string, limit: number): Promise<Hotspot[]>;
+  /** Mapped files by score (misses, churn, dependents), highest first, ties by path. Test files only with includeTests. */
+  hotspots(projectKey: string, limit: number, opts?: HotspotOpts): Promise<Hotspot[]>;
+  /** The map as a graph: the top files by score, their neighbours, the edges among them, and their misses and lessons. */
+  mapGraph(projectKey: string, opts: HotspotOpts & { limit: number }): Promise<MapGraph>;
   /** Approved lessons (global ones included) whose paths cover one of these files or whose miss edited one. */
   lessonsForPaths(projectKey: string, paths: string[]): Promise<{ lesson: Lesson; paths: string[] }[]>;
+}
+
+/**
+ * Running summaries of sessions (see sessions.ts): the summary, the cursor of the last turn it covers, its update
+ * history, and whether the session is active or idle. Manual sessions (agent reports) are never listed or summarized.
+ * Summaries are redacted before they are stored and are never part of an export or a sync.
+ */
+export interface SessionsStore {
+  /** Newest activity first. projectKeys: only these (an empty list finds nothing); summarizedOnly: with a summary. */
+  list(q: { projectKeys: string[]; state?: SessionState; limit: number; after?: SessionCursor | null; summarizedOnly?: boolean }): Promise<{ sessions: SessionListItem[]; next: SessionCursor | null }>;
+  detail(id: string): Promise<SessionDetail | null>;
+  /** Sessions the summarize stage has something to do for, newest activity first (see SummaryWorkQuery). */
+  work(q: SummaryWorkQuery): Promise<SummaryWork[]>;
+  /** The session's turns with index > afterIndex, in order, at most limit. */
+  turns(sessionId: string, afterIndex: number, limit: number): Promise<HumanTurn[]>;
+  /** Store one update (redacted) and append it to the history. False when the session moved on meanwhile (not applied). */
+  save(sessionId: string, w: SummaryWrite): Promise<boolean>;
+  /** A failed update: the summary and cursor stay, and the session waits (summaryRetryAt) before it is tried again. */
+  recordFailure(sessionId: string, error: string, now?: Date): Promise<{ attempts: number; retryAt: string }>;
+  setState(sessionId: string, state: SessionState): Promise<void>;
+  /** The next update rebuilds the summary from the first turn. The current one is served until then. False: no such session. */
+  requestRebuild(sessionId: string): Promise<boolean>;
 }
 
 /** One backend, opened: every repository over one connection, plus the lifecycle the services need. */
@@ -193,6 +227,7 @@ export interface Store {
   readonly embeddings: EmbeddingsStore;
   readonly selection: SelectionStore;
   readonly codegraph: CodeGraphStore;
+  readonly sessions: SessionsStore;
   /** Create or upgrade the schema (Neo4j constraints and indexes; Postgres migrations). Safe from two services at once. */
   ensureSchema(): Promise<void>;
   /** Whether the database answers. Never throws. */

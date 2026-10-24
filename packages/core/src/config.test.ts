@@ -26,6 +26,16 @@ test('feedback memories are imported as proposed lessons unless MEMORY_AUTO_APPR
   expect(() => loadConfig({ ...base, MEMORY_AUTO_APPROVE: 'yes please' })).toThrow(/MEMORY_AUTO_APPROVE.*true or false/);
 });
 
+test('session summaries default to the local model, can be tuned, and can be turned off', () => {
+  expect(loadConfig(base).summary).toEqual({ enabled: true, llm: null, quietMinutes: 10, maxDeltaTurns: 40, idleMinutes: 30, backfillPerCycle: 3 });
+  const c = loadConfig({ ...base, SUMMARY_LLM: 'anthropic:claude-haiku', SUMMARY_QUIET_MINUTES: '5', SUMMARY_MAX_DELTA_TURNS: '20', SESSION_IDLE_MINUTES: '60', SUMMARY_BACKFILL_PER_CYCLE: '0' });
+  expect(c.summary).toEqual({ enabled: true, llm: 'anthropic:claude-haiku', quietMinutes: 5, maxDeltaTurns: 20, idleMinutes: 60, backfillPerCycle: 0 });
+  expect(loadConfig({ ...base, SUMMARY_LLM: 'off' }).summary).toMatchObject({ enabled: false, llm: null });
+  expect(() => loadConfig({ ...base, SUMMARY_LLM: 'gpt' })).toThrow(/SUMMARY_LLM: unknown provider/);
+  expect(() => loadConfig({ ...base, SUMMARY_QUIET_MINUTES: '45' })).toThrow(/SESSION_IDLE_MINUTES \(30\) must be at least SUMMARY_QUIET_MINUTES \(45\)/);
+  expect(() => loadConfig({ ...base, SUMMARY_LLM: 'codex-cli' })).toThrow(/SUMMARY_LLM.*ALLOW_UNCONFINED_CODEX=1/);
+});
+
 test('every problem is reported at once, by name', () => {
   try {
     loadConfig({ PROJECT_ROOTS: '/vibe', POLL_SECONDS: 'soon', CLASSIFY_LLM: 'gpt5', GITHUB_REPOS: 'demo=me/demo' });
@@ -185,12 +195,26 @@ test('the API refuses to listen beyond this machine without a token', () => {
 });
 
 test('codex-cli for a worker job needs the owner to accept that it is not confined', () => {
-  for (const k of ['POSTMORTEM_LLM', 'SCAN_LLM', 'CLASSIFY_LLM']) {
+  for (const k of ['POSTMORTEM_LLM', 'SCAN_LLM', 'CLASSIFY_LLM', 'SUMMARY_LLM']) {
     expect(() => loadConfig({ ...base, [k]: 'codex-cli:gpt-5' })).toThrow(new RegExp(`${k}.*ALLOW_UNCONFINED_CODEX=1`));
     expect(() => loadConfig({ ...base, [k]: 'codex-cli', ALLOW_UNCONFINED_CODEX: '1' })).not.toThrow();
   }
-  // The api never runs a CLI provider (it falls back to the local model), so CHECK_LLM is not refused.
-  expect(() => loadConfig({ ...base, CHECK_LLM: 'codex-cli' })).not.toThrow();
+});
+
+test('codex-cli needs no acknowledgement when it runs in the codex-runner sidecar', () => {
+  for (const k of ['POSTMORTEM_LLM', 'SCAN_LLM', 'CLASSIFY_LLM', 'SUMMARY_LLM']) {
+    expect(() => loadConfig({ ...base, [k]: 'codex-cli', CODEX_RUNNER_URL: 'http://codex-runner:8790' })).not.toThrow();
+  }
+  expect(() => loadConfig({ ...base, CODEX_RUNNER_URL: 'codex-runner:8790' })).toThrow(/CODEX_RUNNER_URL must be http/);
+  expect(() => loadConfig({ ...base, CODEX_RUNNER_URL: 'not a url' })).toThrow(/CODEX_RUNNER_URL is not a URL/);
+  expect(() => loadConfig({ ...base, CODEX_RUNNER_URL: 'http://u:p@codex-runner:8790' })).toThrow(/user name or password/);
+});
+
+test('CHECK_LLM refuses the CLI providers: the api judges check_before_done and has no agent CLIs', () => {
+  for (const v of ['claude-cli', 'claude-cli:opus', 'codex-cli', 'codex-cli:gpt-5']) {
+    expect(() => loadConfig({ ...base, CHECK_LLM: v, ALLOW_UNCONFINED_CODEX: '1', CODEX_RUNNER_URL: 'http://codex-runner:8790' })).toThrow(/CHECK_LLM: claude-cli and codex-cli run in the worker/);
+  }
+  for (const v of ['ollama:gemma4', 'anthropic:claude-haiku-5-5', 'openai:gpt-5-nano']) expect(loadConfig({ ...base, CHECK_LLM: v }).llm.check).toBe(v);
 });
 
 test('STORE=postgres with the bundled service and an empty POSTGRES_PASSWORD is refused with the fix named', () => {

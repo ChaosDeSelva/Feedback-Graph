@@ -30,7 +30,7 @@ export type ChatJsonOpts = {
 
 /** One non-streaming Ollama chat call constrained to a JSON schema. */
 export async function ollamaChatJson<T>(o: ChatJsonOpts): Promise<T> {
-  const fix = `${START}, or choose another provider for this job (CLASSIFY_LLM, POSTMORTEM_LLM, SCAN_LLM, CHECK_LLM)`;
+  const fix = `${START}, or choose another provider for this job (CLASSIFY_LLM, POSTMORTEM_LLM, SCAN_LLM, CHECK_LLM, SUMMARY_LLM)`;
   const res = await ollamaFetch(o.url, o.model, '/api/chat', fix, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },

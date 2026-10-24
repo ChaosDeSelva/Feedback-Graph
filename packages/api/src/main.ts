@@ -1,7 +1,6 @@
 import { existsSync } from 'node:fs';
-import { readdir } from 'node:fs/promises';
 import { serve } from '@hono/node-server';
-import { ConfigError, loadConfig, makeProvider, makeProviderOr, redactSecrets, ollamaEmbed, ollamaPing, syncProjects, VERSION, type Project } from '@fb/core';
+import { ConfigError, loadConfig, makeProviderOr, redactSecrets, ollamaEmbed, ollamaPing, projectFolders, refreshLayout, storedSyncMemory, syncProjects, VERSION, type Project } from '@fb/core';
 import { openStore } from '@fb/store-postgres';
 import { createApp } from './app.ts';
 import { makeJudge } from './context.ts';
@@ -34,12 +33,9 @@ const { knowledge, facts, activity, docs, selection } = store;
 const embed = (input: string[]) => ollamaEmbed({ url: config.ollama.url, model: config.ollama.embedModel, input });
 
 const localModel = `ollama:${config.ollama.model}`;
-// The api image has no claude/codex CLIs: a CLI CHECK_LLM falls back to the local model instead of crashing.
-const isCli = (spec: string) => /^(claude|codex)-cli/.test(spec);
+// A CLI CHECK_LLM never gets here: loadConfig refuses it (the api has no agent CLIs). A missing key still falls back.
 const checkSpec = config.llm.check ?? localModel;
-const { provider: judgeLlm, fellBack } = isCli(checkSpec)
-  ? { provider: makeProvider(localModel, process.env), fellBack: `${checkSpec}: CLI providers run in the worker, not the api` }
-  : makeProviderOr(checkSpec, localModel, process.env);
+const { provider: judgeLlm, fellBack } = makeProviderOr(checkSpec, localModel, process.env);
 if (fellBack) log('check provider unavailable, using fallback', { fellBack, using: judgeLlm.id });
 const roots = config.roots;
 // The worker normally seeds the selection first; whichever service starts first does it, and only once.
@@ -47,18 +43,26 @@ await selection.ensure(config, activity);
 /** Read per request: the selection changes from Settings at any time. */
 const scope = () => selection.scope(config);
 
-/** Every top-level folder under each root (no dot-folders, no symlinks), with its host path. */
-async function allFolders(): Promise<(Project & { path: string })[]> {
-  const out: (Project & { path: string })[] = [];
-  const seen = new Set<string>();
-  for (const r of roots) {
-    for (const d of await readdir(r.container, { withFileTypes: true }).catch(() => [])) {
-      if (!d.isDirectory() || d.name.startsWith('.') || seen.has(d.name)) continue;
-      seen.add(d.name);
-      out.push({ key: d.name, name: d.name, repoPath: `${r.container}/${d.name}`, path: `${(r.host || r.container).replace(/\/+$/, '')}/${d.name}` });
-    }
+/**
+ * Which folders are projects, by the worker's rule: top-level folders, and the git repos nested in one that is not a
+ * repo (a top-level folder already selected or excluded as a whole stays one project). Set on the roots in place, so
+ * MCP context resolves a cwd to the same project the worker recorded its sessions under.
+ */
+async function refreshProjectLayout() {
+  try {
+    const whole = new Set([...(await scope()).projects, ...config.excludeProjects]);
+    await refreshLayout(roots, { keepWhole: (k) => whole.has(k) });
+  } catch (err) {
+    log('project layout failed', { error: String(err) });
   }
-  return out;
+}
+await refreshProjectLayout();
+setInterval(refreshProjectLayout, 60_000).unref();
+
+/** Every project folder under each root (no dot-folders, no symlinks), with its host path. */
+async function allFolders(): Promise<(Project & { path: string })[]> {
+  await refreshProjectLayout();
+  return (await projectFolders(roots)).map((f) => ({ key: f.key, name: f.rel, repoPath: f.container, path: f.host }));
 }
 
 /** The folders that are in scope: selected in Settings and not in EXCLUDE_PROJECTS. */
@@ -80,6 +84,7 @@ const app = createApp(store.graph, {
   codegraph: store.codegraph,
   cloud: {
     cloud: config.cloud,
+    memory: config.cloud ? storedSyncMemory(store.docs, config.cloud) : undefined,
     portability: store.portability,
     activity,
     projects: async () => syncProjects({ configured: config.cloud?.projects ?? [], selected: (await scope()).projects, excluded: config.excludeProjects }),
@@ -87,6 +92,11 @@ const app = createApp(store.graph, {
   },
   inScope: async (key: string) => (await scope()).project(key),
   importer: { knowledge, facts, embed, activity, excluded: config.excludeProjects },
+  sessions: {
+    store: store.sessions,
+    projects: async () => (await scope()).projects,
+    inScope: async (key: string) => (await scope()).project(key),
+  },
   auth: { token: config.apiToken ?? undefined, publicHosts: config.publicHosts },
   system: { version: VERSION, store: store.kind, ping: () => store.ping(), worker: () => store.graph.workerStatus(), selection: () => selection.current(), givenUpTurns: () => store.graph.givenUpTurns(),
     // The embedding model always; the local chat model too when the api's check_before_done judge uses it.
@@ -114,6 +124,7 @@ const app = createApp(store.graph, {
     exists: existsSync,
     aliasOf: (key: string) => store.graph.projectByAlias(key),
     codegraph: store.codegraph,
+    sessions: store.sessions,
   },
   log,
 });

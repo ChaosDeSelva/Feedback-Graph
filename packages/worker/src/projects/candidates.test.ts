@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { expect, test } from 'vitest';
 import { FileState } from '../state.ts';
+import { refreshLayout, type Root } from '@fb/core';
 import { buildCandidates } from './candidates.ts';
 
 const fx = (name: string) => join(import.meta.dirname, '../../../../fixtures', name);
@@ -117,4 +118,39 @@ test('a Codex session that moved into another folder counts there too, and inges
   const again = await build();
   expect(again.folderOf.get(path)).toEqual(['demo-shop', 'admin-panel', 'third']);
   expect(state.getCwds(path)?.scanned).toBe(readFileSync(path).length);
+});
+
+test('repos nested in a folder that is not a repo are candidates of their own; sessions count at the deepest repo', async () => {
+  const base = mkdtempSync(join(tmpdir(), 'fb-cand-nested-'));
+  const src = join(base, 'src');
+  for (const rel of ['github.com/org/repo', 'client/app']) {
+    mkdirSync(join(src, rel), { recursive: true });
+    execFileSync('git', ['init', '-q', join(src, rel)]);
+  }
+  execFileSync('git', ['-C', join(src, 'github.com/org/repo'), 'remote', 'add', 'origin', 'https://github.com/org/repo.git']);
+  mkdirSync(join(src, 'client', 'notes'), { recursive: true });
+  mkdirSync(join(src, 'plain'));
+  const claude = join(base, 'claude');
+  const host = '/Users/me/src';
+  const session = (name: string, cwd: string) => {
+    mkdirSync(join(claude, name), { recursive: true });
+    const p = join(claude, name, 's.jsonl');
+    writeFileSync(p, JSON.stringify({ type: 'user', sessionId: name, cwd, timestamp: '2026-10-01T10:00:00Z', message: { content: 'hi' } }) + '\n');
+    return { path: p, size: readFileSync(p).length, mtimeMs: Date.parse('2026-10-20T00:00:00Z'), source: 'claude' as const };
+  };
+  const files = [
+    session('a', `${host}/github.com/org/repo/pkg`),
+    session('b', `${host}/client/app`),
+    session('c', `${host}/client/notes`), // inside the holding folder, outside its repos: that folder is the project
+  ];
+  const roots: Root[] = [{ host, container: src }];
+  await refreshLayout(roots);
+  const snap = await buildCandidates({ roots, files, state: new FileState(':memory:'), codexSessionsFound: false });
+  expect(snap.candidates.map((c) => [c.key, c.path, c.exists, c.git, c.remote, c.claudeSessions])).toEqual([
+    ['client', `${host}/client`, true, false, null, 1],
+    ['client__app', `${host}/client/app`, true, true, null, 1],
+    ['github.com__org__repo', `${host}/github.com/org/repo`, true, true, 'github.com/org/repo', 1],
+    ['plain', `${host}/plain`, true, false, null, 0],
+  ]);
+  expect([...snap.folderOf.values()]).toEqual(['github.com__org__repo', 'client__app', 'client']);
 });

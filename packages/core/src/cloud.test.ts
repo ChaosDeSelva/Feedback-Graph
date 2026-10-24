@@ -1,5 +1,5 @@
 import { expect, test, vi } from 'vitest';
-import { bundleCounts, CloudSyncError, nextSyncDelayMs, previewCloudSync, pushBundle, runCloudSync, syncBundle, syncProjects, type SyncResponse } from './cloud.ts';
+import { bundleCounts, CloudSyncError, nextSyncDelayMs, previewCloudSync, pushBundle, runCloudSync, storedSyncMemory, syncBundle, syncMemoryCursor, syncProjects, type SyncResponse } from './cloud.ts';
 import type { CloudConfig } from './config.ts';
 import { EXPORT_FORMAT, type ExportBundle } from './graph/portability.ts';
 import type { ActivityInput } from './types.ts';
@@ -388,4 +388,92 @@ test('a 429 is retried only after the Retry-After the cloud asked for (seconds o
   expect(err).toBeInstanceOf(CloudSyncError);
   expect(err.status).toBe(429);
   expect(err.message).toMatch(/another sync of this org is running.*300 s/);
+});
+
+/** A DocsStore's cursors, in memory: what storedSyncMemory keeps its record in. */
+function cursors() {
+  const m = new Map<string, string>();
+  return { m, getCursor: async (k: string) => m.get(k) ?? null, setCursor: async (k: string, v: string) => { m.set(k, v); } };
+}
+
+test('what the cloud last accepted is kept in the store: a restarted process (or the other service) still withdraws what is gone', async () => {
+  const docs = cursors();
+  const bundles = { shop: bundle('shop') };
+  await runCloudSync({ cloud, portability: store(bundles), projects: async () => ['shop'], trigger: 'schedule', fetch: fakeFetch([]).f, sleep: noSleep, memory: storedSyncMemory(docs, cloud) });
+  // One record, keyed without the token in it.
+  expect([...docs.m.keys()]).toEqual([syncMemoryCursor(cloud)]);
+  expect([...docs.m.keys(), ...docs.m.values()].join(' ')).not.toContain(TOKEN);
+  bundles.shop = bundle('shop', { docs: [] });
+  // A new process: a fresh memory over the same store.
+  const next = fakeFetch([]);
+  await runCloudSync({ cloud, portability: store(bundles), projects: async () => ['shop'], trigger: 'manual', fetch: next.f, sleep: noSleep, memory: storedSyncMemory(docs, cloud) });
+  expect(sentBody(next.calls[0]).withdrawn).toEqual([{ kind: 'doc', id: 'doc:shop:upload:a.md' }]);
+});
+
+test('the stored record belongs to one cloud org: another URL or token starts empty, so it is sent nothing it never had', async () => {
+  const docs = cursors();
+  const bundles = { shop: bundle('shop') };
+  await runCloudSync({ cloud, portability: store(bundles), projects: async () => ['shop'], trigger: 'manual', fetch: fakeFetch([]).f, sleep: noSleep, memory: storedSyncMemory(docs, cloud) });
+  const other = { ...cloud, token: `fgc_pat_fedcba9876543210_${'B'.repeat(43)}` };
+  bundles.shop = bundle('shop', { lessons: [{ ...bundle('shop').lessons[0], status: 'rejected' }], docs: [] });
+  const sent = fakeFetch([]);
+  await runCloudSync({ cloud: other, portability: store(bundles), projects: async () => ['shop'], trigger: 'manual', fetch: sent.f, sleep: noSleep, memory: storedSyncMemory(docs, other) });
+  const body = sentBody(sent.calls[0]);
+  expect(body.withdrawn).toEqual([]);
+  expect(body.lessons).toEqual([]); // the rejected lesson was never this org's, so its status stays home
+});
+
+test('each write changes only its own project, so two services syncing at once do not undo each other', async () => {
+  const docs = cursors();
+  const a = storedSyncMemory(docs, cloud);
+  const b = storedSyncMemory(docs, cloud);
+  const rec = (fingerprint: string) => ({ fingerprint, remote: null, lessons: [], misses: [], docs: [], files: [] });
+  await a.set('one', rec('1'));
+  await b.set('two', rec('2'));
+  await a.delete('one');
+  expect([...(await b.keys())]).toEqual(['two']);
+  expect(await a.get('two')).toEqual(rec('2'));
+  // A damaged record reads as none, never as an error that stops sync.
+  docs.m.set(syncMemoryCursor(cloud), 'not json');
+  expect([...(await a.keys())]).toEqual([]);
+});
+
+test('a project synced before and no longer in the list gets one last, empty bundle that withdraws what was sent, then is forgotten', async () => {
+  const docs = cursors();
+  const memory = storedSyncMemory(docs, cloud);
+  const bundles = { shop: bundle('shop'), blog: bundle('blog', { projects: [{ key: 'blog', remote: 'github.com/acme/blog' }] }) };
+  await runCloudSync({ cloud, portability: store(bundles), projects: async () => ['shop', 'blog'], trigger: 'schedule', fetch: fakeFetch([]).f, sleep: noSleep, memory });
+  const activity: ActivityInput[] = [];
+  // blog is unselected (or excluded, or left out of SYNC_PROJECTS); it still holds its data locally.
+  const run = fakeFetch([]);
+  const r = await runCloudSync({ cloud, portability: store(bundles), activity: { record: async (a) => { activity.push(a); } }, projects: async () => ['shop'], trigger: 'schedule', fetch: run.f, sleep: noSleep, memory });
+  expect(run.calls).toHaveLength(1); // shop is unchanged; only blog's withdrawal goes
+  const body = sentBody(run.calls[0]);
+  expect(body).toMatchObject({ projectKey: 'blog', complete: true, projects: [{ key: 'blog', remote: 'github.com/acme/blog' }], lessons: [], misses: [], facts: [], docs: [], codeFiles: [] });
+  expect((body.withdrawn ?? []).map((w: { kind: string }) => w.kind).sort()).toEqual(['doc', 'file', 'lesson', 'miss']);
+  for (const never of ['Run the checkout tests', TRANSCRIPT, SOURCE, 'Architecture']) expect(JSON.stringify(body)).not.toContain(never);
+  expect(r.projects.map((p) => [p.key, p.status])).toEqual([['shop', 'unchanged'], ['blog', 'withdrawn']]);
+  expect(r.ok).toBe(true);
+  expect(activity).toHaveLength(1);
+  expect(activity[0].subject).toContain('took blog back out');
+  expect(activity[0].details).toMatchObject({ withdrawnProjects: ['blog'] });
+  expect([...(await memory.keys())]).toEqual(['shop']);
+  // Once only.
+  const again = fakeFetch([]);
+  await runCloudSync({ cloud, portability: store(bundles), projects: async () => ['shop'], trigger: 'schedule', fetch: again.f, sleep: noSleep, memory });
+  expect(again.calls).toHaveLength(0);
+});
+
+test('a withdrawal that fails is kept and tried again on the next sync', async () => {
+  const memory = new Map();
+  const bundles = { shop: bundle('shop') };
+  await runCloudSync({ cloud, portability: store(bundles), projects: async () => ['shop'], trigger: 'manual', fetch: fakeFetch([]).f, sleep: noSleep, memory });
+  const failed = await runCloudSync({ cloud, portability: store(bundles), projects: async () => [], trigger: 'manual', fetch: fakeFetch([new Response('', { status: 422 })]).f, sleep: noSleep, memory });
+  expect(failed.ok).toBe(false);
+  expect(failed.projects[0]).toMatchObject({ key: 'shop', status: 'failed', error: expect.stringContaining('withdrawing it') });
+  expect([...memory.keys()]).toEqual(['shop']);
+  const retry = fakeFetch([]);
+  const r = await runCloudSync({ cloud, portability: store(bundles), projects: async () => [], trigger: 'manual', fetch: retry.f, sleep: noSleep, memory });
+  expect(r.projects[0]).toMatchObject({ key: 'shop', status: 'withdrawn' });
+  expect([...memory.keys()]).toEqual([]);
 });

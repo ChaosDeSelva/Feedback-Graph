@@ -2,7 +2,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { WebStandardStreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js';
 import { z } from 'zod';
 import { VERSION } from '@fb/core';
-import { checkBeforeDone, getImpact, getModuleContext, getTaskContext, MAX_DEPTH, reportFeedback, type ContextDeps } from './context.ts';
+import { checkBeforeDone, getImpact, getModuleContext, getRecentSessions, getTaskContext, MAX_DEPTH, RECENT_MAX, reportFeedback, type ContextDeps } from './context.ts';
 
 const where = {
   cwd: z.string().optional().describe('Absolute path of the directory you are working in (preferred)'),
@@ -11,7 +11,7 @@ const where = {
 
 const text = (markdown: string) => ({ content: [{ type: 'text' as const, text: markdown }] });
 
-function buildServer(ctx: ContextDeps) {
+function buildServer(ctx: ContextDeps, client: string | undefined) {
   const server = new McpServer({ name: 'feedback-graph', version: VERSION });
 
   server.registerTool(
@@ -25,7 +25,7 @@ function buildServer(ctx: ContextDeps) {
         files: z.array(z.string()).max(50).optional().describe('Files you expect to read or change (repo-relative, or absolute inside the project)'),
       },
     },
-    async (a) => text((await getTaskContext(a, ctx)).markdown),
+    async (a) => text((await getTaskContext({ ...a, client }, ctx)).markdown),
   );
 
   server.registerTool(
@@ -41,7 +41,7 @@ function buildServer(ctx: ContextDeps) {
         files_changed: z.array(z.string()).max(50).optional().describe('Files you changed (repo-relative, or absolute inside the project)'),
       },
     },
-    async ({ files_changed, ...a }) => text((await checkBeforeDone({ ...a, filesChanged: files_changed }, ctx)).markdown),
+    async ({ files_changed, ...a }) => text((await checkBeforeDone({ ...a, filesChanged: files_changed, client }, ctx)).markdown),
   );
 
   server.registerTool(
@@ -54,7 +54,7 @@ function buildServer(ctx: ContextDeps) {
         path: z.string().max(1000).describe('The file (repo-relative, relative to cwd, or absolute inside the project)'),
       },
     },
-    async (a) => text((await getModuleContext(a, ctx)).markdown),
+    async (a) => text((await getModuleContext({ ...a, client }, ctx)).markdown),
   );
 
   server.registerTool(
@@ -68,7 +68,7 @@ function buildServer(ctx: ContextDeps) {
         depth: z.number().int().min(1).max(MAX_DEPTH).optional().describe('How many import hops to follow (default 3)'),
       },
     },
-    async (a) => text((await getImpact(a, ctx)).markdown),
+    async (a) => text((await getImpact({ ...a, client }, ctx)).markdown),
   );
 
   server.registerTool(
@@ -83,7 +83,20 @@ function buildServer(ctx: ContextDeps) {
         session_id: z.string().optional().describe('Your session id, if you know it: lets the report join the same pushback flagged from this session'),
       },
     },
-    async (a) => text((await reportFeedback({ ...a, whatWasDone: a.what_was_done, sessionId: a.session_id }, ctx)).markdown),
+    async (a) => text((await reportFeedback({ ...a, whatWasDone: a.what_was_done, sessionId: a.session_id, client }, ctx)).markdown),
+  );
+
+  server.registerTool(
+    'get_recent_sessions',
+    {
+      description:
+        'When picking up work in a project, or to see what earlier sessions did: the newest session summaries (goal, what was done and decided, open threads, pushback, files touched, outcome), newest first.',
+      inputSchema: {
+        ...where,
+        limit: z.number().int().min(1).max(RECENT_MAX).optional().describe(`How many sessions (default 5, at most ${RECENT_MAX})`),
+      },
+    },
+    async (a) => text((await getRecentSessions(a, ctx)).markdown),
   );
 
   server.registerTool(
@@ -92,19 +105,57 @@ function buildServer(ctx: ContextDeps) {
       description: 'Search lessons and past misses in the feedback graph by meaning.',
       inputSchema: { ...where, query: z.string() },
     },
-    async (a) => text((await getTaskContext({ ...a, task: a.query }, ctx)).markdown),
+    async (a) => text((await getTaskContext({ ...a, task: a.query, client }, ctx)).markdown),
   );
 
   return server;
 }
 
+const SESSION_PREFIX = 'fg1.';
+const clean = (v: unknown, max: number) => (typeof v === 'string' ? v.replace(/[^\w .@/+-]/g, '').replace(/\s+/g, ' ').trim().slice(0, max) : '');
+
+/** The Activity actor for an MCP client's `clientInfo` (`claude-code 2.1.309 (MCP)`), or undefined without a name. */
+export function mcpClientLabel(info: unknown): string | undefined {
+  const i = (info && typeof info === 'object' ? info : {}) as { name?: unknown; version?: unknown };
+  const name = clean(i.name, 64);
+  if (!name) return undefined;
+  const version = clean(i.version, 32);
+  return `${version ? `${name} ${version}` : name} (MCP)`;
+}
+
+/**
+ * The server is stateless (a fresh one per request), so the client's name from `initialize` would be gone by its first
+ * tool call. It rides along in the session id instead: the client echoes `Mcp-Session-Id` on every later request, the
+ * stateless transport does not check it, and nothing is kept in memory, so it survives a restart. It is only a label
+ * for the provenance log, claimed by the client like `clientInfo` itself, and is cleaned again when read.
+ */
+const encodeClient = (label: string) => SESSION_PREFIX + Buffer.from(label, 'utf8').toString('base64url');
+function decodeClient(header: string | null): string | undefined {
+  if (!header?.startsWith(SESSION_PREFIX) || header.length > 200) return undefined;
+  const label = Buffer.from(header.slice(SESSION_PREFIX.length), 'base64url').toString('utf8');
+  return /^[\w.@/+-][\w .@/+-]{0,96} \(MCP\)$/.test(label) ? label : undefined;
+}
+
+async function initializeClient(req: Request): Promise<string | undefined> {
+  if (req.method !== 'POST') return undefined;
+  const body = (await req.clone().json().catch(() => null)) as unknown;
+  const msgs = (Array.isArray(body) ? body : [body]) as { method?: unknown; params?: { clientInfo?: unknown } }[];
+  const init = msgs.find((m) => m && typeof m === 'object' && m.method === 'initialize');
+  return init ? mcpClientLabel(init.params?.clientInfo) : undefined;
+}
+
 /** Stateless Streamable HTTP: a fresh server + transport per request. */
 export async function handleMcp(req: Request, ctx: ContextDeps): Promise<Response> {
-  const server = buildServer(ctx);
+  const initialized = await initializeClient(req);
+  const server = buildServer(ctx, initialized ?? decodeClient(req.headers.get('mcp-session-id')));
   const transport = new WebStandardStreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true });
   await server.connect(transport);
   try {
-    return await transport.handleRequest(req);
+    const res = await transport.handleRequest(req);
+    if (!initialized || !res.ok) return res;
+    const headers = new Headers(res.headers);
+    headers.set('mcp-session-id', encodeClient(initialized));
+    return new Response(res.body, { status: res.status, statusText: res.statusText, headers });
   } finally {
     void server.close();
   }

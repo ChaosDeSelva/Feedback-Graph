@@ -48,6 +48,19 @@ test('ingests, sends only prefilter hits to the model, and flags candidates', as
   expect(f.saved.find((s) => s.uuid === 'u2')).toMatchObject({ cand: false, c: { label: 'neutral', confidence: 0 } });
 });
 
+test("the agent's final reply reaches the store with the session but is never classified, so it never becomes an Inbox item", async () => {
+  const upserted: ParsedSession[] = [];
+  const withReply = transcript + '\n' + line({ type: 'assistant', uuid: 'a3', timestamp: '2026-10-01T10:05:00Z', message: { content: [{ type: 'text', text: 'No, this is still broken: I could not add the footer.' }] } });
+  const f = fakes({ readFile: async () => withReply });
+  const upsert = f.deps.repo.upsertSession;
+  f.deps.repo.upsertSession = async (p, s, c) => { upserted.push(s); return upsert(p, s, c); };
+  const r = await runCycle(f.deps);
+  expect(upserted[0].finalReply).toEqual({ text: 'No, this is still broken: I could not add the footer.', ts: '2026-10-01T10:05:00Z' });
+  expect(upserted[0].turns).toHaveLength(3);
+  expect(r).toEqual({ filesIngested: 1, turnsClassified: 2, candidates: 1 });
+  expect(f.classifyCalls).toEqual(['u1']);
+});
+
 test('the candidate_flagged activity points at the Inbox item the turn was filed under (a merged agent report keeps its id)', async () => {
   const recorded: ActivityInput[] = [];
   const f = fakes({ activity: { record: async (a) => { recorded.push(a); } } });

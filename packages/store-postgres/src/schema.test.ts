@@ -1,5 +1,5 @@
 import { readdirSync, readFileSync } from 'node:fs';
-import { ACTIVITY_KINDS, CAUSES, FACT_KINDS, SYMBOL_KINDS, TURN_LABELS, type CandidateStatus, type ContextKind, type DocSource, type FeedbackStatus, type LessonScope, type LessonSource, type LessonStatus, type Outcome, type ScanStatus, type SessionSource } from '@fb/core';
+import { ACTIVITY_KINDS, CAUSES, FACT_KINDS, SESSION_STATES, SYMBOL_KINDS, TURN_LABELS, type CandidateStatus, type ContextKind, type DocSource, type FeedbackStatus, type LessonScope, type LessonSource, type LessonStatus, type Outcome, type ScanStatus, type SessionSource } from '@fb/core';
 import { expect, test } from 'vitest';
 import { renderMigration } from './migrate.ts';
 
@@ -26,6 +26,7 @@ test('CHECK constraints allow exactly the values the TypeScript types allow (add
   expect(allowed('lessons_cause_check')).toEqual([...CAUSES].sort());
   expect(allowed('turns_label_check')).toEqual([...TURN_LABELS].sort());
   expect(allowed('sessions_source_check')).toEqual(all<SessionSource>()(['claude', 'codex']));
+  expect(allowed('sessions_state_check')).toEqual([...SESSION_STATES].sort());
   expect(allowed('candidates_source_check')).toEqual(all<SessionSource>()(['claude', 'codex']));
   expect(allowed('candidates_status_check')).toEqual(all<CandidateStatus>()(['pending', 'confirmed', 'rejected']));
   expect(allowed('feedback_status_check')).toEqual(all<FeedbackStatus>()(['open', 'addressed', 'verified', 'approved', 'rejected', 'reopened', 'superseded', 'unknown']));

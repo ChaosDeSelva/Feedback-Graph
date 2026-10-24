@@ -36,6 +36,8 @@ type RawRecord = {
 type SessionState = {
   session: ParsedSession;
   lastAssistantText: string;
+  /** When lastAssistantText was written. */
+  lastAssistantTs: string;
   pendingToolCalls: ToolCall[];
 };
 
@@ -73,7 +75,11 @@ export function parseTranscript(text: string, sourceFile: string): ParsedSession
     }
   }
 
-  return [...sessions.values()].map((st) => st.session);
+  // What the agent said after the last human turn: nothing takes it in as preceding text, so it is kept on the session.
+  return [...sessions.values()].map((st) => ({
+    ...st.session,
+    finalReply: st.session.turns.length && st.lastAssistantText ? { text: st.lastAssistantText, ts: st.lastAssistantTs } : null,
+  }));
 }
 
 function parseLine(line: string): RawRecord | null {
@@ -101,6 +107,7 @@ function sessionFor(sessions: Map<string, SessionState>, rec: RawRecord, sourceF
         toolCalls: [],
       },
       lastAssistantText: '',
+      lastAssistantTs: '',
       pendingToolCalls: [],
     };
     sessions.set(rec.sessionId!, st);
@@ -114,6 +121,7 @@ function readAssistant(rec: RawRecord, state: SessionState) {
   for (const part of content) {
     if (part.type === 'text' && part.text?.trim()) {
       state.lastAssistantText = redactSecrets(part.text.trim()).slice(-MAX_ASSISTANT_CHARS);
+      state.lastAssistantTs = rec.timestamp!;
     } else if (part.type === 'tool_use' && part.name) {
       const call = toolCallOf(part, rec.timestamp!);
       state.pendingToolCalls.push(call);

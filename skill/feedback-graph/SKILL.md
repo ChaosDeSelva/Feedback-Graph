@@ -13,6 +13,7 @@ Call `get_task_context` with your current working directory (`cwd`), a one or tw
 
 - Treat **approved lessons** as project rules for this task. They come from real corrections.
 - Read **similar past misses** as "this is what went wrong last time". Avoid repeating them.
+- **Recent sessions** say what earlier sessions in this project did and left open. When you are picking up or continuing earlier work, call `get_recent_sessions` with `cwd` for their full summaries. They are summaries a model wrote: check anything that matters against the code.
 - If the tool says the directory is not a tracked project, carry on normally.
 
 ## Before you change a file

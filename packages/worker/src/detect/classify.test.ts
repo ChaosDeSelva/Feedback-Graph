@@ -56,3 +56,18 @@ test('ollamaChatJson throws on a non-2xx response', async () => {
   const fetchImpl = (async () => new Response('nope', { status: 500 })) as unknown as typeof fetch;
   await expect(ollamaChatJson({ url: 'http://o', model: 'm', system: '', user: '', schema: {}, fetchImpl })).rejects.toThrow();
 });
+
+test('an agentic classifier (claude-cli, codex-cli) runs in a fresh empty folder, never the worker folder, removed afterwards', async () => {
+  const { readdir, stat } = await import('node:fs/promises');
+  const seen: { cwd?: string; files: string[] }[] = [];
+  const llm = { id: 'claude-cli', agentic: true, json: async (t: { cwd?: string }) => {
+    seen.push({ cwd: t.cwd, files: t.cwd ? await readdir(t.cwd) : [] });
+    return { label: 'neutral', confidence: 0.9, summary: '' };
+  } } as never;
+  await classifyTurn(turn, llm);
+  expect(seen).toHaveLength(1);
+  expect(seen[0].cwd).toBeTruthy();
+  expect(seen[0].cwd).not.toBe(process.cwd());
+  expect(seen[0].files).toEqual([]);
+  await expect(stat(seen[0].cwd!)).rejects.toThrow();
+});

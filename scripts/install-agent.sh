@@ -1,19 +1,56 @@
 #!/usr/bin/env bash
 # Connect your coding agents to the Feedback Graph.
-#   Claude Code: the MCP server at user scope, and the feedback-graph and postmortem skills in ~/.claude/skills.
+#   Claude Code: the MCP server at user scope, and the feedback-graph and postmortem skills linked into ~/.claude/skills.
 #   Codex:       the MCP server in $CODEX_HOME/config.toml (default ~/.codex) over streamable HTTP, and the same
 #                guidance in $CODEX_HOME/AGENTS.md, between markers.
 #
-#   ./scripts/install-agent.sh            # every agent found (claude on PATH; codex on PATH or ~/.codex present)
+#   ./scripts/install-agent.sh            # every agent found (claude or codex on PATH, or a Codex config or login)
 #   ./scripts/install-agent.sh codex      # only Codex (or: claude)
+#   ./scripts/install-agent.sh --dry-run  # print what would change, change nothing
+#   ./scripts/install-agent.sh --help
 #   FEEDBACK_GRAPH_URL=https://feedback.example.com ./scripts/install-agent.sh
 #   (default http://localhost:<API_PORT>, API_PORT from .env or the environment, 8787 when unset; an API_BIND other
 #   than loopback or 0.0.0.0 is used as the host)
 #
 # When .env (or the environment) sets API_TOKEN, the MCP server is registered with it as a Bearer header.
 # Safe to re-run: a server already registered is left alone, the guidance block is only rewritten when it changed, and
-# a Codex file is copied to <file>.bak.<time> before it is changed.
+# a Codex file is copied to <file>.bak.<time> before it is changed. The skills are symlinks into this folder, so a
+# git pull updates them; after moving or deleting this folder, re-run the script (or remove the links).
 set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+usage: ./scripts/install-agent.sh [--dry-run] [claude|codex]
+
+Connect Claude Code and Codex to the Feedback Graph's MCP server.
+
+  (no agent)   every agent found: Claude Code when `claude` is on PATH; Codex when `codex` is on PATH or
+               $CODEX_HOME (default ~/.codex) has config.toml or auth.json
+  claude       Claude Code only: `claude mcp add --transport http --scope user feedback-graph <url>/mcp`, and the
+               feedback-graph and postmortem skills linked into ~/.claude/skills (links into this folder)
+  codex        Codex only: [mcp_servers.feedback-graph] in $CODEX_HOME/config.toml, and the guidance in
+               $CODEX_HOME/AGENTS.md between BEGIN/END feedback-graph markers
+  --dry-run    print what would change and change nothing (no files, no links, no claude mcp add)
+  -h, --help   this text
+
+The URL is FEEDBACK_GRAPH_URL, else http://localhost:<API_PORT> (API_PORT from the environment or .env, 8787 when
+unset). With API_TOKEN set, the server is registered with it as a Bearer header (never printed). Re-running is safe.
+EOF
+}
+
+dry=0
+args=()
+for a in "$@"; do
+  case "$a" in
+    -h | --help) usage; exit 0 ;;
+    -n | --dry-run) dry=1 ;;
+    -*) echo "unknown option: $a" >&2; usage >&2; exit 1 ;;
+    *) args+=("$a") ;;
+  esac
+done
+set -- "${args[@]+"${args[@]}"}"
+# In a dry run, say what would happen instead of doing it.
+would() { echo "would: $*"; }
 here="$(cd "$(dirname "$0")/.." && pwd)"
 env_file="${FEEDBACK_GRAPH_ENV:-$here/.env}"
 # KEY's value: the environment's when set, else the last KEY= line of the env file, surrounding quotes removed.
@@ -49,21 +86,37 @@ case "$url" in *[\"\\[:space:]]*) echo "FEEDBACK_GRAPH_URL must not contain quot
 case "$token" in *[!A-Za-z0-9._~+/=-]*) echo "API_TOKEN has characters other than letters, digits and ._~+/=-; use e.g. openssl rand -hex 24" >&2; exit 1 ;; esac
 
 has_claude() { command -v claude >/dev/null 2>&1; }
-has_codex() { command -v codex >/dev/null 2>&1 || [ -d "$codex_home" ]; }
+# The CLI, or a config or login Codex itself wrote. Not the folder alone: setup.sh creates ~/.codex/sessions so Docker
+# does not create it as root, and that says nothing about Codex being installed.
+has_codex() { command -v codex >/dev/null 2>&1 || [ -f "$codex_home/config.toml" ] || [ -f "$codex_home/auth.json" ]; }
 
 # The blank line(s) that separate appended text from a file's existing content, then an "x" so $(...) keeps them.
 separator() { if [ -s "$1" ]; then [ -n "$(tail -c1 "$1")" ] && echo; echo; fi; echo x; }
 
-backup() { [ -f "$1" ] && cp -p "$1" "$1.bak.$(date +%Y%m%d%H%M%S)" && echo "backed up $1"; return 0; }
+backup() {
+  [ -f "$1" ] || return 0
+  if [ "$dry" = 1 ]; then would "copy $1 to $1.bak.<time>"; return 0; fi
+  cp -p "$1" "$1.bak.$(date +%Y%m%d%H%M%S)" && echo "backed up $1"
+}
 
 install_claude() {
-  mkdir -p "$HOME/.claude/skills"
   for s in feedback-graph postmortem; do
-    ln -sfn "$here/skill/$s" "$HOME/.claude/skills/$s"
-    echo "linked skill: ~/.claude/skills/$s"
+    local link="$HOME/.claude/skills/$s"
+    if [ "$(readlink "$link" 2>/dev/null || true)" = "$here/skill/$s" ]; then
+      echo "skill already linked: ~/.claude/skills/$s"
+    elif [ "$dry" = 1 ]; then
+      if [ -e "$link" ] || [ -L "$link" ]; then would "replace ~/.claude/skills/$s with a link to $here/skill/$s"
+      else would "link ~/.claude/skills/$s -> $here/skill/$s"; fi
+    else
+      mkdir -p "$HOME/.claude/skills"
+      ln -sfn "$here/skill/$s" "$link"
+      echo "linked skill: ~/.claude/skills/$s"
+    fi
   done
   if claude mcp get feedback-graph >/dev/null 2>&1; then
     echo "Claude Code: MCP server feedback-graph already registered (remove it with: claude mcp remove feedback-graph --scope user, then re-run)"
+  elif [ "$dry" = 1 ]; then
+    would "claude mcp add --transport http --scope user feedback-graph $url/mcp${token:+ --header 'Authorization: Bearer <API_TOKEN>'}"
   elif [ -n "$token" ]; then
     claude mcp add --transport http --scope user feedback-graph "$url/mcp" --header "Authorization: Bearer $token"
     echo "Claude Code: registered $url/mcp with your API_TOKEN"
@@ -78,11 +131,14 @@ END_MARK='<!-- END feedback-graph -->'
 
 install_codex() {
   local cfg="$codex_home/config.toml" md="$codex_home/AGENTS.md"
-  mkdir -p "$codex_home"
+  [ "$dry" = 1 ] || mkdir -p "$codex_home"
 
   # Codex config keys for a streamable HTTP MCP server: url, and static http_headers for the token.
   if grep -Eq '^[[:space:]]*\[mcp_servers\.("feedback-graph"|feedback-graph)\][[:space:]]*$' "$cfg" 2>/dev/null; then
     echo "Codex: MCP server feedback-graph already in $cfg (delete its [mcp_servers.feedback-graph] table, then re-run, to change it)"
+  elif [ "$dry" = 1 ]; then
+    backup "$cfg"
+    would "add [mcp_servers.feedback-graph] with url = \"$url/mcp\"${token:+ and the API_TOKEN as a Bearer header (then make it readable by you only)} to $cfg"
   else
     backup "$cfg"
     local sep
@@ -111,6 +167,7 @@ install_codex() {
       return
     fi
     backup "$md"
+    if [ "$dry" = 1 ]; then would "update the Feedback Graph guidance between its markers in $md"; return; fi
     local tmp="$md.tmp.$$"
     BLOCK="$block" awk '
       /^<!-- BEGIN feedback-graph/ { if (!done) print ENVIRON["BLOCK"]; done = 1; skip = 1; next }
@@ -121,6 +178,7 @@ install_codex() {
     echo "Codex: updated the Feedback Graph guidance in $md"
   else
     backup "$md"
+    if [ "$dry" = 1 ]; then would "add the Feedback Graph guidance to $md"; return; fi
     local sep
     sep="$(separator "$md")"
     printf '%s%s\n' "${sep%x}" "$block" >>"$md"
@@ -135,11 +193,12 @@ case "$want" in
     if has_claude; then install_claude; found=1; fi
     if has_codex; then install_codex; found=1; fi
     if [ "$found" = 0 ]; then
-      echo "neither Claude Code nor Codex found (no claude or codex on PATH, no $codex_home); install one, or name it: $0 claude|codex" >&2
+      echo "neither Claude Code nor Codex found (no claude or codex on PATH, no $codex_home/config.toml or auth.json); install one, or name it: $0 claude|codex" >&2
       exit 1
     fi
     ;;
   claude) has_claude || { echo "claude not found on PATH" >&2; exit 1; }; install_claude ;;
   codex) install_codex ;;
-  *) echo "usage: $0 [claude|codex]" >&2; exit 1 ;;
+  *) usage >&2; exit 1 ;;
 esac
+[ "$dry" = 0 ] || echo "dry run: nothing was changed"

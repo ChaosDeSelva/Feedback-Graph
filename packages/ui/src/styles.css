@@ -52,6 +52,9 @@
   --color-node-task: #8a8a82;
   --color-node-commit: #4b4c47;
   --color-graph-link: #929084;
+  /* Code mode: source files, test files (misses tint a file with node-miss). */
+  --color-node-file: #5b7083;
+  --color-node-test: #9aa9b5;
 
   --font-sans: "Instrument Sans Variable", ui-sans-serif, system-ui, sans-serif;
   --font-mono: "JetBrains Mono Variable", ui-monospace, SFMono-Regular, Menlo, monospace;
@@ -102,6 +105,8 @@
     --color-node-task: #85847c;
     --color-node-commit: #c9c8c0;
     --color-graph-link: #6a6a64;
+    --color-node-file: #8ea3b6;
+    --color-node-test: #5c6b77;
     --shadow-card: 0 1px 0 0 rgb(0 0 0 / 0.3);
     --shadow-pop: 0 8px 28px -8px rgb(0 0 0 / 0.6);
   }
@@ -144,6 +149,8 @@
   --color-node-task: #85847c;
   --color-node-commit: #c9c8c0;
   --color-graph-link: #6a6a64;
+  --color-node-file: #8ea3b6;
+  --color-node-test: #5c6b77;
   --shadow-card: 0 1px 0 0 rgb(0 0 0 / 0.3);
   --shadow-pop: 0 8px 28px -8px rgb(0 0 0 / 0.6);
 }

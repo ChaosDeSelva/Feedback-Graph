@@ -10,9 +10,10 @@ import type { BuildOpts, CodeFile, CodeImport, CodeMap, CodeSymbol, RawImport } 
 
 const DEFAULT_CONCURRENCY = 16;
 
-/** Files whose content the resolver reads: package manifests, tsconfigs, go.mod, Cargo.toml. */
-const RESOLVER_INPUT = /(^|\/)(package\.json|go\.mod|Cargo\.toml|[tj]sconfig[^/]*\.json)$/;
+/** Files whose content the resolver reads: package manifests, tsconfigs, go.mod, Cargo.toml, Package.swift. */
+const RESOLVER_INPUT = /(^|\/)(package\.json|go\.mod|Cargo\.toml|Package\.swift|[tj]sconfig[^/]*\.json)$/;
 const CS_NAMESPACE = /^\s*namespace\s+[A-Za-z_][\w.]*/gm;
+const GD_CLASS_NAME = /^class_name\s+[A-Za-z_]\w*/gm;
 
 const countLines = (s: string) => (s ? s.split('\n').length - (s.endsWith('\n') ? 1 : 0) : 0);
 
@@ -70,7 +71,7 @@ export async function buildCodeMap(repoPath: string, opts: BuildOpts, prev?: Cod
   const resolverInput = new Map<string, string>();
   const parsed = new Map<string, Parsed>();
   await pool(listed, opts.concurrency ?? DEFAULT_CONCURRENCY, async ({ path }) => {
-    if (isSecretPath(path)) return;
+    if (opts.signal?.aborted || isSecretPath(path)) return;
     const abs = join(repoPath, path);
     // Re-checked here: the file may have been swapped for a symlink since it was listed.
     const st = await lstat(abs).catch(() => null);
@@ -82,9 +83,11 @@ export async function buildCodeMap(repoPath: string, opts: BuildOpts, prev?: Cod
     const file: CodeFile = { path, lang, hash: createHash('sha256').update(buf).digest('hex'), loc: countLines(content), isTest: isTestPath(path) };
     if (RESOLVER_INPUT.test(path)) resolverInput.set(path, content);
     else if (lang === 'csharp') resolverInput.set(path, (content.match(CS_NAMESPACE) ?? []).join('\n'));
+    else if (lang === 'gdscript') resolverInput.set(path, (content.match(GD_CLASS_NAME) ?? []).join('\n'));
 
     const old = prevFiles.get(path);
-    const reused = old?.hash === file.hash ? rawFromPrev(prevImports.get(path) ?? []) : null;
+    // GDScript refers to classes by class_name, which no stem check can see coming; its line reader is cheap.
+    const reused = old?.hash === file.hash && lang !== 'gdscript' ? rawFromPrev(prevImports.get(path) ?? []) : null;
     if (reused && !addedStems.some((s) => content.includes(s))) {
       parsed.set(path, { file, symbols: prevSymbols.get(path) ?? [], raw: reused });
       return;
@@ -97,6 +100,7 @@ export async function buildCodeMap(repoPath: string, opts: BuildOpts, prev?: Cod
     parsed.set(path, { file, symbols, raw: ex?.imports ?? [] });
   });
 
+  opts.signal?.throwIfAborted();
   const entries = listed.map((f) => parsed.get(f.path)).filter((p): p is Parsed => !!p);
   const resolve = makeResolver(entries.map((e) => e.file.path), (p) => resolverInput.get(p));
   const imports: CodeImport[] = [];

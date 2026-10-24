@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import { api, type PatternReport, type ProjectHotspot, type ProjectSummary } from './api.ts';
+import { IncludeTests } from './CodeMap.tsx';
 import { PageHeader } from './ui/PageHeader.tsx';
 import { Select } from './ui/controls.tsx';
 import { Alert, Card, causeLabel, causeTone, StatGrid, StatTile, StatTileSkeleton, tableClass, tdClass, thClass, TONE_FILL } from './ui/display.tsx';
@@ -99,11 +100,12 @@ export function Patterns() {
     return () => { stale = true; };
   }, [project]);
   const [hot, setHot] = useState<ProjectHotspot[] | null>(null);
+  const [tests, setTests] = useState(false);
   useEffect(() => {
     let stale = false;
-    api.topHotspots(project || undefined).then((h) => { if (!stale) setHot(h); }, () => { if (!stale) setHot([]); });
+    api.topHotspots(project || undefined, 10, tests).then((h) => { if (!stale) setHot(h); }, () => { if (!stale) setHot([]); });
     return () => { stale = true; };
-  }, [project]);
+  }, [project, tests]);
 
   const feedback = report?.weekly.reduce((n, w) => n + w.feedback, 0) ?? 0;
   const repeats = report?.weekly.reduce((n, w) => n + w.repeats, 0) ?? 0;
@@ -162,7 +164,7 @@ export function Patterns() {
                 {report.weekly.length > 0 ? <WeeklyChart weekly={report.weekly} /> : <p className="p-3 py-6 text-muted">No confirmed feedback yet. Confirm items in the Inbox to start the trend.</p>}
               </Card>
 
-              <Struggle hot={hot} />
+              <Struggle hot={hot} tests={tests} onTests={setTests} />
 
               <Card title="Repeated misses: the same kind of miss more than once">
                 <ul>
@@ -184,9 +186,17 @@ export function Patterns() {
 }
 
 /** The files agents keep getting wrong: the top code map hotspots across the selected projects. */
-function Struggle({ hot }: { hot: ProjectHotspot[] | null }) {
+function Struggle({ hot, tests, onTests }: { hot: ProjectHotspot[] | null; tests: boolean; onTests: (v: boolean) => void }) {
   return (
-    <Card title="Where agents struggle" actions={<span className="text-xs text-muted">score = 4 × misses + log2(1 + churn) + log2(1 + dependents)</span>}>
+    <Card
+      title="Where agents struggle"
+      actions={
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+          <IncludeTests checked={tests} onChange={onTests} />
+          <span className="text-xs text-muted">score = 4 × misses + log2(1 + churn) + log2(1 + dependents)</span>
+        </div>
+      }
+    >
       {hot && hot.length > 0 ? (
         <div className="overflow-x-auto">
           <table className={`${tableClass} text-[13px]`}>

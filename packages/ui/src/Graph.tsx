@@ -1,11 +1,17 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import ForceGraph2D, { type ForceGraphMethods } from 'react-force-graph-2d';
 import { api, type EvidenceGraph, type ProjectSummary } from './api.ts';
+import { CodeGraph } from './CodeGraph.tsx';
 import { PageHeader } from './ui/PageHeader.tsx';
-import { Select } from './ui/controls.tsx';
+import { Select, Tabs } from './ui/controls.tsx';
 import { Alert, EmptyState, SectionLabel, Skeleton } from './ui/display.tsx';
+import { MAX_FIT_ZOOM, useSize } from './ui/graphCanvas.ts';
+import { evidenceLinkLabel, evidenceNodeLabel } from './ui/graphLabels.ts';
 import { GraphIcon } from './ui/icons.tsx';
 import { readToken, useTheme } from './ui/theme.ts';
+
+const MODES = ['evidence', 'code'] as const;
+type Mode = (typeof MODES)[number];
 
 type Node = EvidenceGraph['nodes'][number];
 type Kind = Node['kind'];
@@ -25,21 +31,6 @@ function usePalette() {
   }), [theme]);
 }
 
-function useSize<T extends HTMLElement>() {
-  const ref = useRef<T>(null);
-  const [size, setSize] = useState({ width: 800, height: 600 });
-  useEffect(() => {
-    if (!ref.current || typeof ResizeObserver === 'undefined') return;
-    const ro = new ResizeObserver(([e]) => setSize({ width: e.contentRect.width, height: e.contentRect.height }));
-    ro.observe(ref.current);
-    return () => ro.disconnect();
-  }, []);
-  return [ref, size] as const;
-}
-
-/** How far fitting the graph to the canvas may zoom in. */
-const MAX_FIT_ZOOM = 3;
-
 const size = (n: Node) => (n.kind === 'cause' ? 6 : n.kind === 'miss' ? 4 : 2);
 
 export function Graph() {
@@ -49,6 +40,7 @@ export function Graph() {
   const [selected, setSelected] = useState<Node | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loadedProjects, setLoadedProjects] = useState(false);
+  const [mode, setMode] = useState<Mode>('evidence');
   const [box, area] = useSize<HTMLDivElement>();
   const palette = usePalette();
   const fg = useRef<ForceGraphMethods<any, any>>(undefined);
@@ -64,7 +56,7 @@ export function Graph() {
   }, []);
 
   useEffect(() => {
-    if (!project) return;
+    if (!project || mode !== 'evidence') return;
     setSelected(null);
     setGraph(null);
     fitted.current = false;
@@ -72,7 +64,7 @@ export function Graph() {
     let stale = false;
     api.graph(project).then((g) => { if (!stale) setGraph(g); }, (e) => { if (!stale) setError(String(e)); });
     return () => { stale = true; };
-  }, [project]);
+  }, [project, mode]);
 
   // force-graph rewrites link endpoints into node objects, so it gets its own copy.
   const data = useMemo(() => graph && { nodes: graph.nodes.map((n) => ({ ...n })), links: graph.links.map((l) => ({ ...l })) }, [graph]);
@@ -93,14 +85,23 @@ export function Graph() {
     <div className="flex h-full min-h-0 flex-col">
       <PageHeader
         title="Graph"
-        description="How each piece of feedback links to its miss, cause, lesson and the context behind it."
+        description={mode === 'code'
+          ? 'The code map: the files agents struggle with most, what they import, the tests that cover them, and the misses and lessons on them.'
+          : 'How each piece of feedback links to its miss, cause, lesson and the context behind it.'}
         actions={
-          <Select aria-label="project" value={project ?? ''} onChange={(e) => setProject(e.target.value)} className="w-56">
-            {projects.map((p) => <option key={p.key} value={p.key}>{p.key} ({p.feedback} feedback)</option>)}
-          </Select>
+          <div className="flex flex-wrap items-center gap-2">
+            <Tabs label="view" value={mode} options={MODES} onChange={setMode} />
+            <Select aria-label="project" value={project ?? ''} onChange={(e) => setProject(e.target.value)} className="w-56">
+              {projects.map((p) => <option key={p.key} value={p.key}>{p.key} ({p.feedback} feedback)</option>)}
+            </Select>
+          </div>
         }
       />
-      <div className="grid min-h-0 flex-1 grid-cols-1 grid-rows-[minmax(22rem,1fr)_auto] overflow-y-auto md:grid-cols-[minmax(0,1fr)_20rem] md:grid-rows-1 md:overflow-hidden">
+      {mode === 'code' && (project ? <CodeGraph projectKey={project} /> : loadedProjects && (
+        <EmptyState icon={<GraphIcon />} title="No project yet" className="pt-24">Choose project folders in Settings; the worker maps their code.</EmptyState>
+      ))}
+      {/* Hidden rather than unmounted in Code mode, so its canvas keeps its size observer. */}
+      <div hidden={mode === 'code'} className="grid min-h-0 flex-1 grid-cols-1 grid-rows-[minmax(22rem,1fr)_auto] overflow-y-auto md:grid-cols-[minmax(0,1fr)_20rem] md:grid-rows-1 md:overflow-hidden">
         <div ref={box} className="relative min-h-0 overflow-hidden bg-surface">
           {error && <Alert className="absolute top-3 right-3 left-3 z-10">{error}</Alert>}
           <ul aria-label="legend" className="absolute top-3 left-3 z-10 flex max-w-[calc(100%-1.5rem)] flex-wrap gap-x-3 gap-y-1 rounded-md border border-line bg-surface/90 px-2.5 py-1.5 text-xs text-muted shadow-card backdrop-blur">
@@ -130,7 +131,7 @@ export function Graph() {
               height={area.height}
               backgroundColor={palette.surface}
               nodeId="id"
-              nodeLabel={(n: Node) => `${n.kind}: ${n.label}`}
+              nodeLabel={evidenceNodeLabel}
               nodeColor={(n: Node) => palette.node[n.kind]}
               nodeVal={size}
               nodeCanvasObject={(n: Node & { x?: number; y?: number }, ctx: CanvasRenderingContext2D, scale: number) => {
@@ -146,7 +147,7 @@ export function Graph() {
               }}
               linkColor={() => palette.link}
               linkWidth={1}
-              linkLabel={(l: { type: string }) => l.type}
+              linkLabel={evidenceLinkLabel}
               linkDirectionalArrowLength={3}
               linkDirectionalArrowRelPos={1}
               onNodeClick={(n: Node) => setSelected(byId.get(n.id) ?? null)}

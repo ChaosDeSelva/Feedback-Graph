@@ -20,7 +20,7 @@ test('langOf maps extensions to grammars and everything else to its extension or
 test('isTestPath recognises test naming conventions and test directories', () => {
   for (const p of [
     'src/a.test.ts', 'src/a.spec.tsx', 'src/repo.int.test.ts', 'test_api.py', 'pkg/api_test.py', 'cmd/main_test.go',
-    'src/__tests__/a.ts', 'tests/conftest.py', 'pkg/tests/helpers/x.py', 'test/setup.js', 'App.Tests/FooTests.cs', 'Tests/AppTests/ViewTests.swift',
+    'src/__tests__/a.ts', 'tests/conftest.py', 'pkg/tests/helpers/x.py', 'test/setup.js', 'App.Tests/FooTests.cs', 'Tests/AppTests/ViewTests.swift', 'game/test_player.gd',
   ]) expect(isTestPath(p), p).toBe(true);
   for (const p of ['src/latest.ts', 'src/testing.ts', 'contest.py', 'src/attest/a.ts', 'testdata.go', 'src/protest_x.py', 'Sources/Testable.swift']) {
     expect(isTestPath(p), p).toBe(false);

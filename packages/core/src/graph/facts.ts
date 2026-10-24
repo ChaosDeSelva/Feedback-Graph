@@ -13,6 +13,18 @@ export type EmbeddedFact = CodeFact & { embedding: number[] };
 /** The path facts about the whole project (not one file) are filed under. */
 export const PROJECT_PATH = '.';
 
+/** Real failures a scan job gets before it is failed for good. */
+export const MAX_SCAN_ATTEMPTS = 3;
+/** Wait 5, then 10 minutes between attempts, so a passing problem does not use them up. */
+const SCAN_BACKOFF_MINUTES = 5;
+/** A model that could not be asked is tried again after this, without counting an attempt. */
+export const SCAN_UNAVAILABLE_WAIT_MS = 2 * 60_000;
+
+/** When a scan that has now failed `attempts` times is due again, or null when it has given up. */
+export function scanRetryAt(attempts: number, now: Date): string | null {
+  return attempts >= MAX_SCAN_ATTEMPTS ? null : new Date(now.getTime() + SCAN_BACKOFF_MINUTES * 2 ** (attempts - 1) * 60_000).toISOString();
+}
+
 export class FactsRepo implements FactsStore {
   readonly g: GraphRepo;
 
@@ -138,13 +150,17 @@ export class FactsRepo implements FactsStore {
       `MATCH (j:ScanJob {projectKey: $key}) WHERE j.status IN ['queued', 'running'] RETURN j.id AS id ORDER BY j.requestedAt DESC LIMIT 1`,
       { key: project.key },
     );
-    if (open) return (await this.scanJob(open.get('id')))!;
+    // Asking again is the owner saying "now": a queued job waiting out a backoff runs at the next poll.
+    if (open) {
+      await this.g.run(`MATCH (j:ScanJob {id: $id}) WHERE j.status = 'queued' SET j.retryAt = null`, { id: open.get('id') });
+      return (await this.scanJob(open.get('id')))!;
+    }
     const id = `scan:${randomUUID()}`;
     const now = new Date().toISOString();
     await this.g.run(
       `MERGE (p:Project {key: $project.key}) ON CREATE SET p.name = $project.name, p.repoPath = $project.repoPath
        CREATE (j:ScanJob {id: $id, projectKey: $project.key, repoPath: $project.repoPath, provider: $provider,
-                          status: 'queued', requestedAt: $now, filesScanned: 0, factsAdded: 0})-[:FOR]->(p)`,
+                          status: 'queued', requestedAt: $now, filesScanned: 0, factsAdded: 0, attempts: 0})-[:FOR]->(p)`,
       { id, project, provider, now },
     );
     return (await this.scanJob(id))!;
@@ -155,11 +171,25 @@ export class FactsRepo implements FactsStore {
     return r ? jobOf(r.get('j').properties) : null;
   }
 
-  async nextScanJob(): Promise<ScanJob | null> {
+  async nextScanJob(now = new Date()): Promise<ScanJob | null> {
     const [r] = await this.g.run(
-      `MATCH (j:ScanJob {status: 'queued'}) RETURN j ORDER BY j.requestedAt LIMIT 1`,
+      `MATCH (j:ScanJob {status: 'queued'}) WHERE coalesce(j.retryAt, '') <= $now RETURN j ORDER BY j.requestedAt LIMIT 1`,
+      { now: now.toISOString() },
     );
     return r ? jobOf(r.get('j').properties) : null;
+  }
+
+  async recordScanFailure(id: string, error: string, o: { counted: boolean }, now = new Date()): Promise<{ attempts: number; retryAt: string | null }> {
+    const [r] = await this.g.run('MATCH (j:ScanJob {id: $id}) RETURN coalesce(j.attempts, 0) AS attempts', { id });
+    const attempts: number = (r?.get('attempts') ?? 0) + (o.counted ? 1 : 0);
+    const retryAt = o.counted ? scanRetryAt(attempts, now) : new Date(now.getTime() + SCAN_UNAVAILABLE_WAIT_MS).toISOString();
+    await this.g.run(
+      `MATCH (j:ScanJob {id: $id})
+       SET j.attempts = $attempts, j.retryAt = $retryAt, j.error = $error, j.status = $status
+       FOREACH (_ IN CASE WHEN $status = 'failed' THEN [1] ELSE [] END | SET j.finishedAt = $now)`,
+      { id, attempts, retryAt, error: redactSecrets(error), status: retryAt ? 'queued' : 'failed', now: now.toISOString() },
+    );
+    return { attempts, retryAt };
   }
 
   async updateScanJob(id: string, patch: Partial<Pick<ScanJob, 'filesScanned' | 'factsAdded' | 'error'>> & { status?: ScanStatus }) {
@@ -241,5 +271,7 @@ function jobOf(p: Record<string, unknown>): ScanJob {
     filesScanned: (p.filesScanned as number) ?? 0,
     factsAdded: (p.factsAdded as number) ?? 0,
     error: (p.error as string) ?? null,
+    attempts: Number(p.attempts ?? 0),
+    retryAt: (p.retryAt as string) ?? null,
   };
 }

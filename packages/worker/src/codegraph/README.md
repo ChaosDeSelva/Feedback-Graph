@@ -29,11 +29,19 @@ Parsing uses tree-sitter through `web-tree-sitter` (WASM, no native build) with 
 | Go | yes | packages inside a `go.mod` module (an edge to each non-test file of the package) |
 | Rust | yes | `mod x;`, `crate::`/`self::`/`super::` paths, workspace crates by name |
 | C# | yes | `using` of a namespace declared in the repo (an edge to each declaring file) |
-| Swift | yes | none: modules are `pkg:` |
-| GDScript and everything else | no | file-level node only (no maintained prebuilt GDScript grammar) |
+| Swift | yes | `import` of a local module: a `Package.swift` target (its `path:`, else `Sources/<name>`, `Tests/<name>` for a test target) or any `Sources/<Module>/` folder (an edge to each `.swift` file of the module) |
+| GDScript | yes, line-based (`gdscript.ts`) | `preload`/`load`/`extends` paths (`res://` is the folder holding the nearest `project.godot`, or a path relative to the file), and class_name references (an edge to the file declaring that class_name, preferring the same Godot project) |
+| everything else | no | file-level node only |
+
+GDScript has no maintained prebuilt tree-sitter grammar, so `.gd` files are read line by line: top-level `class_name`,
+`class`, `enum`, `func`, `signal`, `const` and `var` (annotations, `static` and Godot 3 keywords stripped), each
+spanning the indented lines under it; exported unless the name starts with `_`. Every capitalized identifier outside
+strings and comments is a candidate class_name reference; one that names no class_name in the repo (an engine class)
+makes no edge. `.gd` files are always reparsed (it is cheap) because a class_name added elsewhere changes what an
+unchanged file refers to.
 
 Anything that does not resolve inside the repo becomes `pkg:<name>` (the npm package, Python top-level module, Rust
-crate, Go import path or C# namespace). A relative import that points at nothing is dropped.
+crate, Go import path, C# namespace or Swift module). A relative import that points at nothing is dropped.
 
 ## Incremental builds
 

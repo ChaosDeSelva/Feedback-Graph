@@ -4,6 +4,7 @@ import {
   MAX_CLASSIFY_ATTEMPTS,
   REPORT_MERGE_MINUTES,
   postmortemState,
+  redactSecrets,
   type Candidate,
   type CandidateDetail,
   type CandidateFilter,
@@ -19,6 +20,7 @@ import {
   type WorkerStatus,
 } from '@fb/core';
 import { iso, toJson, tx, type Db } from './db.ts';
+import { refreshSessionStats } from './sessions.ts';
 
 /** Labels that count as pushback in stats (repo.ts CANDIDATE_LABELS). */
 const CANDIDATE_LABELS = ['pushback', 'correction'];
@@ -65,12 +67,18 @@ export class PgGraphStore implements GraphStore {
         [project.key, project.name ?? null, project.repoPath ?? null, project.remote ?? null],
       );
       await c.query(
-        `INSERT INTO sessions (id, project_key, source, source_file, cwd, git_branch, started_at, ended_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7::timestamptz, $8::timestamptz)
+        `INSERT INTO sessions (id, project_key, source, source_file, cwd, git_branch, started_at, ended_at, final_reply_text, final_reply_ts)
+         VALUES ($1, $2, $3, $4, $5, $6, $7::timestamptz, $8::timestamptz, $9, $10)
          ON CONFLICT (id) DO UPDATE SET project_key = EXCLUDED.project_key, source = EXCLUDED.source,
            source_file = EXCLUDED.source_file, cwd = EXCLUDED.cwd, git_branch = EXCLUDED.git_branch,
-           started_at = EXCLUDED.started_at, ended_at = EXCLUDED.ended_at`,
-        [s.sessionId, project.key, s.source ?? 'claude', s.sourceFile ?? null, s.cwd ?? null, s.gitBranch ?? null, maybeTime(s.startedAt), maybeTime(s.endedAt)],
+           started_at = EXCLUDED.started_at, ended_at = EXCLUDED.ended_at,
+           final_reply_text = EXCLUDED.final_reply_text, final_reply_ts = EXCLUDED.final_reply_ts`,
+        [
+          s.sessionId, project.key, s.source ?? 'claude', s.sourceFile ?? null, s.cwd ?? null, s.gitBranch ?? null, maybeTime(s.startedAt), maybeTime(s.endedAt),
+          // Redacted by the parser, and again here: it is stored like a turn's text.
+          s.finalReply ? redactSecrets(s.finalReply.text) : null,
+          s.finalReply?.ts ?? null,
+        ],
       );
       if (s.turns.length) {
         // Re-upserting overwrites what the transcript says, never the label, classification, attempts or pruning.
@@ -112,6 +120,7 @@ export class PgGraphStore implements GraphStore {
           [rows, s.sessionId],
         );
       }
+      await refreshSessionStats(c, s.sessionId, s.endedAt ?? null, s.turns.at(-1)?.ts ?? null);
     });
   }
 
@@ -289,15 +298,28 @@ export class PgGraphStore implements GraphStore {
    * TURN_RETENTION_DAYS: drop the words of classified turns older than the cutoff that nothing points at.
    * Flagged turns and the turns around them stay (they are the evidence for candidates, feedback and post-mortems).
    */
-  async pruneTurnText(before: Date, limit = 5000): Promise<number> {
+  async pruneTurnText(before: Date, limit = 5000, o: { keepUnsummarized?: boolean } = {}): Promise<number> {
     const { rowCount } = await this.q(
       `UPDATE turns SET text = NULL, preceding_assistant_text = NULL, tool_calls = '[]', pruned_at = $3
        WHERE uuid IN (
-         SELECT t.uuid FROM turns t
+         SELECT t.uuid FROM turns t JOIN sessions s ON s.id = t.session_id
          WHERE t.ts < $1 AND (t.label IS NOT NULL OR t.idx = 0) AND t.text IS NOT NULL
            AND NOT EXISTS (SELECT 1 FROM turns o JOIN candidates k ON k.turn_uuid = o.uuid WHERE o.session_id = t.session_id)
+           AND (NOT $4 OR (t.idx <= s.summarized_through_idx AND NOT s.summary_rebuild))
          LIMIT $2)`,
-      [before, limit, new Date()],
+      [before, limit, new Date(), !!o.keepUnsummarized],
+    );
+    // The agent's final reply goes with the session's turns: once the whole session is older than the cutoff, nothing
+    // flagged it, and (keepUnsummarized) a summary covers its last turn.
+    await this.q(
+      `UPDATE sessions SET final_reply_text = NULL, final_reply_ts = NULL
+       WHERE id IN (
+         SELECT s.id FROM sessions s
+         WHERE s.final_reply_text IS NOT NULL AND s.last_activity_at < $1
+           AND NOT EXISTS (SELECT 1 FROM turns o JOIN candidates k ON k.turn_uuid = o.uuid WHERE o.session_id = s.id)
+           AND (NOT $3 OR (s.last_turn_idx <= s.summarized_through_idx AND NOT s.summary_rebuild))
+         LIMIT $2)`,
+      [before, limit, !!o.keepUnsummarized],
     );
     return rowCount ?? 0;
   }

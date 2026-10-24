@@ -1,6 +1,5 @@
-import { lstat, readdir } from 'node:fs/promises';
-import { join } from 'node:path';
-import type { CandidateSnapshot, FolderCandidate, Root } from '@fb/core';
+import { lstat } from 'node:fs/promises';
+import { isGitDir, projectFolders, projectFromCwd, type CandidateSnapshot, type FolderCandidate, type Root } from '@fb/core';
 import { projectRemote } from '../ingest/git.ts';
 import type { FileState } from '../state.ts';
 import { cachedHead, codexCwds, readSessionHead, type HeadFile, type SessionHead } from './heads.ts';
@@ -29,27 +28,19 @@ export type CandidateBuild = CandidateSnapshot & { folderOf: Map<string, string 
 
 const trim = (p: string) => p.replace(/\/+$/, '');
 
-/** The top-level folder a cwd is in, by the same rule as projectFromCwd, and the root it is under. */
-function folderOfCwd(cwd: string, roots: Root[]): { key: string; root: Root } | null {
-  for (const root of [...roots].sort((a, b) => b.host.length - a.host.length)) {
-    const prefix = trim(root.host) + '/';
-    if (!cwd.startsWith(prefix)) continue;
-    const key = cwd.slice(prefix.length).split('/')[0];
-    return key ? { key, root } : null;
-  }
-  return null;
+/** The project folder a cwd is in, by projectFromCwd (nested repos included), and the root it is under. */
+function folderOfCwd(cwd: string, roots: Root[]): { key: string; rel: string; root: Root } | null {
+  const p = projectFromCwd(cwd, roots);
+  if (!p) return null;
+  const root = [...roots].sort((a, b) => b.host.length - a.host.length).find((r) => cwd.startsWith(trim(r.host) + '/'))!;
+  return { key: p.key, rel: p.name, root };
 }
 
 const shown = (root: Root) => trim(root.host || root.container);
 
-async function isGit(dir: string): Promise<boolean> {
-  // A worktree or submodule has a .git file; either counts. Never followed if it is a link.
-  const s = await lstat(join(dir, '.git')).catch(() => null);
-  return !!s && (s.isDirectory() || s.isFile());
-}
-
 /**
- * Every top-level folder under the roots, plus folders sessions ran in that are gone, each with its session counts.
+ * Every project folder under the roots (top-level folders, and the git repos nested in folders that are not repos,
+ * by the layout the roots carry), plus folders sessions ran in that are gone, each with its session counts.
  * Cheap: a file's cwd comes from its head, read once and cached. Sessions outside every root are only counted.
  */
 export async function buildCandidates(o: CandidateOpts): Promise<CandidateBuild> {
@@ -57,13 +48,8 @@ export async function buildCandidates(o: CandidateOpts): Promise<CandidateBuild>
   const readHead = o.readHead ?? readSessionHead;
   const rows = new Map<string, FolderCandidate & { container: string }>();
 
-  for (const root of o.roots) {
-    for (const d of await readdir(root.container, { withFileTypes: true }).catch(() => [])) {
-      // Dirent types come from lstat: a symlinked folder is not a directory here.
-      if (!d.isDirectory() || d.name.startsWith('.') || rows.has(d.name)) continue;
-      const container = `${trim(root.container)}/${d.name}`;
-      rows.set(d.name, { key: d.name, path: `${shown(root)}/${d.name}`, exists: true, git: false, remote: null, claudeSessions: 0, codexSessions: 0, lastActivity: null, container });
-    }
+  for (const f of await projectFolders(o.roots)) {
+    rows.set(f.key, { key: f.key, path: f.host, exists: true, git: false, remote: null, claudeSessions: 0, codexSessions: 0, lastActivity: null, container: f.container });
   }
 
   const outsideRoots = { claudeSessions: 0, codexSessions: 0 };
@@ -88,10 +74,13 @@ export async function buildCandidates(o: CandidateOpts): Promise<CandidateBuild>
       outsideRoots[count]++;
       continue;
     }
-    for (const { key, root } of at.values()) {
+    for (const { key, rel, root } of at.values()) {
       let row = rows.get(key);
       if (!row) {
-        row = { key, path: `${shown(root)}/${key}`, exists: false, git: false, remote: null, claudeSessions: 0, codexSessions: 0, lastActivity: null, container: `${trim(root.container)}/${key}` };
+        // Gone, or a folder that holds nested repos where a session ran outside all of them (it is still a project).
+        const container = `${trim(root.container)}/${rel}`;
+        const exists = !!(await lstat(container).catch(() => null))?.isDirectory();
+        row = { key, path: `${shown(root)}/${rel}`, exists, git: false, remote: null, claudeSessions: 0, codexSessions: 0, lastActivity: null, container };
         rows.set(key, row);
       }
       row[count]++;
@@ -103,7 +92,7 @@ export async function buildCandidates(o: CandidateOpts): Promise<CandidateBuild>
   const candidates: FolderCandidate[] = [];
   for (const { container, ...row } of [...rows.values()].sort((a, b) => a.key.localeCompare(b.key))) {
     if (row.exists) {
-      row.git = await isGit(container);
+      row.git = await isGitDir(container);
       row.remote = row.git ? await remote(container) : null;
     }
     if (o.cloneOf) {

@@ -122,7 +122,7 @@ test('Rust: mod declarations, crate/self/super paths, bare module paths, workspa
   expect(at('src/a.rs', 'mod missing')).toEqual([]);
 });
 
-test('C#: a using of an in-repo namespace links the files that declare it; Swift modules are packages', () => {
+test('C#: a using of an in-repo namespace links the files that declare it; Swift system modules are packages', () => {
   const r = resolver({
     'A/Foo.cs': 'namespace App.Core {\n class Foo {}\n}', 'A/Bar.cs': 'namespace App.Core;\nclass Bar {}', 'B/Use.cs': 'using App.Core;',
     'C/Other.cs': 'namespace App.Core.Sub { }',
@@ -131,4 +131,56 @@ test('C#: a using of an in-repo namespace links the files that declare it; Swift
   expect(tos(r('B/Use.cs', 'csharp', { spec: 'System.Text', names: ['*'] }))).toEqual(['pkg:System.Text']);
   expect(tos(r('A/Foo.cs', 'csharp', { spec: 'App.Core', names: ['*'] }))).toEqual(['A/Bar.cs']);
   expect(tos(resolver({ 'a.swift': '' })('a.swift', 'swift', { spec: 'Foundation', names: ['*'] }))).toEqual(['pkg:Foundation']);
+});
+
+test('Swift: an import of a Package.swift target or a Sources/<Module> folder links every file of that module', () => {
+  const r = resolver({
+    'Package.swift': [
+      '// swift-tools-version:5.9',
+      'let package = Package(name: "App", targets: [',
+      '  .executableTarget(name: "App", dependencies: ["Core", .product(name: "Collections", package: "swift-collections")]),',
+      '  .target(name: "Core", dependencies: []),',
+      '  .target(name: "Net", path: "Lib/Networking"),',
+      '  // .target(name: "Old"),',
+      '  .testTarget(name: "CoreTests", dependencies: ["Core"]),',
+      '])',
+    ].join('\n'),
+    'Sources/App/main.swift': '', 'Sources/Core/Model.swift': '', 'Sources/Core/Store/Disk.swift': '', 'Sources/Core/notes.md': '',
+    'Lib/Networking/Client.swift': '', 'Tests/CoreTests/ModelTests.swift': '', 'ios/Sources/Widget/W.swift': '',
+  });
+  const at = (from: string, spec: string) => tos(r(from, 'swift', { spec, names: ['*'] }));
+  expect(at('Sources/App/main.swift', 'Core')).toEqual(['Sources/Core/Model.swift', 'Sources/Core/Store/Disk.swift']);
+  expect(at('Sources/App/main.swift', 'Net')).toEqual(['Lib/Networking/Client.swift']);
+  expect(at('Tests/CoreTests/ModelTests.swift', 'Core')).toEqual(['Sources/Core/Model.swift', 'Sources/Core/Store/Disk.swift']);
+  expect(at('Sources/App/main.swift', 'CoreTests')).toEqual(['Tests/CoreTests/ModelTests.swift']);
+  expect(at('Sources/App/main.swift', 'Core.Model')).toEqual(['Sources/Core/Model.swift', 'Sources/Core/Store/Disk.swift']); // import struct Core.Model
+  expect(at('Sources/Core/Model.swift', 'Core')).toEqual(['Sources/Core/Store/Disk.swift']); // never itself
+  // No Package.swift entry: the Sources/<Module> convention.
+  expect(at('Sources/App/main.swift', 'Widget')).toEqual(['ios/Sources/Widget/W.swift']);
+  expect(at('Sources/App/main.swift', 'Old')).toEqual(['pkg:Old']); // commented out
+  expect(at('Sources/App/main.swift', 'Foundation')).toEqual(['pkg:Foundation']);
+  expect(at('Sources/App/main.swift', 'Collections')).toEqual(['pkg:Collections']);
+});
+
+test('GDScript: res:// paths from the folder holding project.godot, relative paths, and class_name references', () => {
+  const r = resolver({
+    'game/project.godot': '', 'game/actors/player.gd': 'class_name Player\nextends CharacterBody2D', 'game/actors/actor.gd': 'class_name Actor',
+    'game/weapons/bullet.gd': '', 'game/main.gd': '', 'game/ui/hud.gd': '',
+    'tools/project.godot': '', 'tools/editor.gd': '', 'tools/player.gd': 'class_name Player',
+    'loose.gd': '',
+  });
+  const at = (from: string, spec: string) => tos(r(from, 'gdscript', { spec, names: ['*'] }));
+  expect(at('game/main.gd', 'res://weapons/bullet.gd')).toEqual(['game/weapons/bullet.gd']);
+  expect(at('game/ui/hud.gd', 'res://actors/player.gd')).toEqual(['game/actors/player.gd']);
+  expect(at('game/ui/hud.gd', '../weapons/bullet.gd')).toEqual(['game/weapons/bullet.gd']);
+  expect(at('game/main.gd', 'res://missing.gd')).toEqual([]);
+  expect(at('game/main.gd', 'uid://b2x4')).toEqual([]);
+  expect(at('game/main.gd', 'Actor')).toEqual(['game/actors/actor.gd']);
+  // Both projects declare Player: each file gets its own project's.
+  expect(at('game/main.gd', 'Player')).toEqual(['game/actors/player.gd']);
+  expect(at('tools/editor.gd', 'Player')).toEqual(['tools/player.gd']);
+  expect(at('game/main.gd', 'Node2D')).toEqual([]); // an engine class: no edge
+  expect(at('game/actors/player.gd', 'Player')).toEqual([]); // never itself
+  // Without a project.godot above it, res:// is the repo root.
+  expect(at('loose.gd', 'res://game/main.gd')).toEqual(['game/main.gd']);
 });

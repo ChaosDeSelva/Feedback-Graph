@@ -144,15 +144,20 @@ export function codexSessionParser(file: string): CodexSessionParser {
       precedingAssistantText: human.questions.length ? human.questions.join('\n').slice(-MAX_ASSISTANT_CHARS) : lastAssistantText,
       precedingToolCalls: pending,
     } satisfies HumanTurn);
+    s.finalReply = null;
     lastAssistantText = '';
     pending = [];
   }
 
-  function readAssistant(payload: Obj) {
+  function readAssistant(payload: Obj, ts: string) {
     for (const part of arr(payload.content)) {
       const p = obj(part);
       const text = p && p.type === 'output_text' ? str(p.text)?.trim() : undefined;
-      if (text) lastAssistantText = redactSecrets(text).slice(-MAX_ASSISTANT_CHARS);
+      if (!text) continue;
+      lastAssistantText = redactSecrets(text).slice(-MAX_ASSISTANT_CHARS);
+      // After the segment's last human turn, this is its final reply (until another human turn takes it in).
+      const s = current();
+      if (s.turns.length) s.finalReply = { text: lastAssistantText, ts };
     }
   }
 
@@ -224,7 +229,7 @@ export function codexSessionParser(file: string): CodexSessionParser {
     if (norm.type === 'response_item') {
       if (payload.type === 'message') {
         if (payload.role === 'user') readUser(payload, ts, norm.ordinal);
-        else if (payload.role === 'assistant') readAssistant(payload);
+        else if (payload.role === 'assistant') readAssistant(payload, ts);
       } else if (payload.type === 'function_call' || payload.type === 'custom_tool_call' || payload.type === 'local_shell_call') {
         readCall(payload, ts);
       }
@@ -236,7 +241,7 @@ export function codexSessionParser(file: string): CodexSessionParser {
 
   return {
     push,
-    finish: () => (human ? segments.map((s) => ({ ...s, turns: [...s.turns], toolCalls: [...s.toolCalls] })) : []),
+    finish: () => (human ? segments.map((s) => ({ ...s, turns: [...s.turns], toolCalls: [...s.toolCalls], finalReply: s.finalReply ?? null })) : []),
   };
 }
 

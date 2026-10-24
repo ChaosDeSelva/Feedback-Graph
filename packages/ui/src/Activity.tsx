@@ -28,6 +28,7 @@ const KIND_LABEL: Record<ActivityKind, string> = {
   cloud_synced: 'cloud sync',
   turns_requeued: 'turns re-queued',
   bundle_imported: 'bundle imported',
+  session_summarized: 'session summarized',
 };
 
 const KIND_TONE: Partial<Record<ActivityKind, Tone>> = {

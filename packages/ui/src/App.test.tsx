@@ -85,6 +85,18 @@ test('a post-mortem model that is down is named in the label too', async () => {
   expect(await screen.findByText(/post-mortem model unavailable/i)).toBeTruthy();
 });
 
+test('the header warns when session summaries are paused, and not when SUMMARY_LLM=off', async () => {
+  const ok = { provider: 'claude-cli', ok: true, reason: null };
+  server({ tracked: 2, models: { classify: ok, postmortem: ok, scan: ok, summary: { provider: 'ollama:gemma4', ok: false, reason: 'model not found (ollama 404)' } } });
+  render(<App />);
+  const badge = await screen.findByText(/summaries paused/i);
+  expect(badge.closest('[title]')?.getAttribute('title')).toMatch(/summaries paused: ollama:gemma4: model not found \(ollama 404\)/);
+  cleanup();
+  server({ tracked: 2, models: { classify: ok, postmortem: ok, scan: ok, summary: { provider: null, ok: true, reason: null, off: true } } });
+  render(<App />);
+  expect(await screen.findByText(/worker running/i)).toBeTruthy();
+});
+
 test('the header says Ollama is unreachable, with the reason, even when no job model uses it', async () => {
   const ok = { provider: 'claude-cli', ok: true, reason: null };
   const reason = 'Ollama is not reachable at http://host.docker.internal:11434: start it (ollama serve)';

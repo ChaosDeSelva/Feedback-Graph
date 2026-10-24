@@ -132,3 +132,65 @@ test('without FEEDBACK_GRAPH_URL, the URL follows API_PORT and API_BIND from .en
   expect(urlFor('API_PORT=18787\n', { FEEDBACK_GRAPH_URL: 'https://fg.example.com' })).toBe('https://fg.example.com/mcp');
   expect(() => urlFor('API_PORT=80;rm\n')).toThrow(/API_PORT/);
 });
+
+/** Every file and link under a folder, with its content or target, to compare before and after. */
+function snapshot(dir: string): Record<string, string> {
+  const out: Record<string, string> = {};
+  const walk = (d: string) => {
+    for (const e of readdirSync(d, { withFileTypes: true })) {
+      const p = join(d, e.name);
+      if (e.isSymbolicLink()) out[p] = `-> ${readlinkSync(p)}`;
+      else if (e.isDirectory()) walk(p);
+      else out[p] = readFileSync(p, 'utf8');
+    }
+  };
+  walk(dir);
+  return out;
+}
+
+test('--help prints the usage and exits 0; an unknown option is an error', () => {
+  const s = sandbox([]);
+  const out = s.run(['--help']);
+  expect(out).toMatch(/^usage: .*install-agent\.sh \[--dry-run\] \[claude\|codex\]/);
+  expect(out).toContain('--dry-run');
+  expect(s.run(['-h'])).toBe(out);
+  expect(() => s.run(['--bogus'])).toThrow(/unknown option/);
+});
+
+test('--dry-run says what it would change and changes nothing: no files, no links, no claude mcp add', () => {
+  const s = sandbox(['claude', 'codex']);
+  mkdirSync(s.codexDir);
+  writeFileSync(s.agentsMd, '# Mine\n');
+  const before = snapshot(s.home);
+  const out = s.run(['--dry-run'], { API_TOKEN: TOKEN });
+  // The stand-in claude logs its calls to a file of its own; everything else is untouched.
+  const { [s.calls]: _log, ...after } = snapshot(s.home);
+  expect(after).toEqual(before);
+  // claude was asked whether the server exists (read-only), never to add it.
+  expect(readFileSync(s.calls, 'utf8').trim().split('\n')).toEqual(['mcp get feedback-graph']);
+  expect(out).toContain('would: link ~/.claude/skills/feedback-graph');
+  expect(out).toContain('would: claude mcp add --transport http --scope user feedback-graph http://localhost:8787/mcp');
+  expect(out).toContain(`would: add [mcp_servers.feedback-graph] with url = "http://localhost:8787/mcp"`);
+  expect(out).toContain(`would: copy ${s.agentsMd} to`);
+  expect(out).toContain(`would: add the Feedback Graph guidance to ${s.agentsMd}`);
+  expect(out).toContain('dry run: nothing was changed');
+  expect(out).not.toContain(TOKEN);
+  // Then for real, and a dry run after that has nothing left to do.
+  s.run([], { API_TOKEN: TOKEN });
+  const again = s.run(['--dry-run', 'codex'], { API_TOKEN: TOKEN });
+  expect(again).not.toContain('would:');
+  expect(again).toMatch(/already/);
+});
+
+test('a bare ~/.codex/sessions (setup.sh creates it for the Docker mount) does not count as Codex; a config or login does', () => {
+  const s = sandbox([]);
+  mkdirSync(join(s.codexDir, 'sessions'), { recursive: true });
+  expect(() => s.run()).toThrow(/neither Claude Code nor Codex/i);
+  expect(existsSync(s.config)).toBe(false);
+  writeFileSync(join(s.codexDir, 'auth.json'), '{}');
+  expect(s.run()).toMatch(/Codex: registered/);
+  const t = sandbox([]);
+  mkdirSync(t.codexDir);
+  writeFileSync(t.config, 'model = "o4"\n');
+  expect(t.run()).toMatch(/Codex: registered/);
+});

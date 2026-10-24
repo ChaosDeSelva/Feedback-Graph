@@ -60,6 +60,9 @@ services:
 
   worker:
     build: { context: ., target: worker }
+    # Linux: setup.sh sets HOST_UID/HOST_GID in .env to your id -u / id -g, so the worker can write ./state and read
+    # transcripts only you may read. Default 1000 (the image's node user); macOS and Windows need nothing.
+    user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
     init: true # reaps the CLI agents' child processes and forwards SIGTERM for a clean shutdown
     stop_grace_period: 30s
     environment:
@@ -68,7 +71,11 @@ services:
       CODEX_SESSIONS_DIR: /codex-sessions
       CLASSIFY_LLM: ${CLASSIFY_LLM:-}
       POSTMORTEM_LLM: ${POSTMORTEM_LLM:-}
-      # codex-cli can read everything this container can (SECURITY.md); it runs only with ALLOW_UNCONFINED_CODEX=1.
+      # codex-cli runs confined in the codex-runner service below when CODEX_RUNNER_URL is set (http://codex-runner:8790,
+      # with --profile codex). Without it, inside this container it can read everything this container can (SECURITY.md)
+      # and runs only with ALLOW_UNCONFINED_CODEX=1.
+      CODEX_RUNNER_URL: ${CODEX_RUNNER_URL:-}
+      CODEX_RUNNER_SCRATCH: /scratch
       ALLOW_UNCONFINED_CODEX: ${ALLOW_UNCONFINED_CODEX:-}
       SCAN_LLM: ${SCAN_LLM:-}
       CODEX_HOME: /codex
@@ -91,8 +98,15 @@ services:
       CLASSIFY_BATCH: ${CLASSIFY_BATCH:-}
       SCAN_MAX_FILES: ${SCAN_MAX_FILES:-}
       SCAN_MAX_BYTES: ${SCAN_MAX_BYTES:-}
+      # Session summaries: the model (empty = the local one; off = no summaries) and when a session is summarized.
+      SUMMARY_LLM: ${SUMMARY_LLM:-}
+      SUMMARY_QUIET_MINUTES: ${SUMMARY_QUIET_MINUTES:-}
+      SUMMARY_MAX_DELTA_TURNS: ${SUMMARY_MAX_DELTA_TURNS:-}
+      SESSION_IDLE_MINUTES: ${SESSION_IDLE_MINUTES:-}
+      SUMMARY_BACKFILL_PER_CYCLE: ${SUMMARY_BACKFILL_PER_CYCLE:-}
     volumes:
-      - ${HOME}/.claude/projects:/transcripts:ro
+      # Claude Code session transcripts (and its memory notes); CLAUDE_PROJECTS_DIR when they are elsewhere.
+      - ${CLAUDE_PROJECTS_DIR:-${HOME}/.claude/projects}:/transcripts:ro
       # Codex CLI / Desktop session transcripts. Read only for the folders you select.
       - ${CODEX_SESSIONS_DIR:-${HOME}/.codex/sessions}:/codex-sessions:ro
       - ${PROJECTS_DIR:-${HOME}/code}:/vibe:ro
@@ -102,16 +116,56 @@ services:
       # CODEX_AUTH_FILE=~/.codex/auth.json (set by scripts/setup.sh when you use Codex); the default is an empty placeholder.
       - ${CODEX_AUTH_FILE:-./state/codex-auth.json}:/codex/auth.json
       - ./state:/state
+      # Shared with codex-runner only: the per-job repository mirrors and the runner's token.
+      - codex-scratch:/scratch
     extra_hosts:
       - host.docker.internal:host-gateway
     depends_on:
       neo4j: { condition: service_healthy }
       # Only with --profile postgres; without it this dependency is skipped.
       postgres: { condition: service_healthy, required: false }
+      # Only with --profile codex.
+      codex-runner: { condition: service_healthy, required: false }
+    restart: unless-stopped
+
+  # Runs codex-cli where there is nothing else to read: the Codex CLI, your Codex login and the scratch volume the
+  # worker writes each job's repository mirror into. No transcripts, no projects, no state, no secrets in its
+  # environment. Off unless you ask for it:
+  #   COMPOSE_PROFILES=codex and CODEX_RUNNER_URL=http://codex-runner:8790 in .env, then docker compose up -d
+  # Not published on any host port; the worker reaches it on the compose network with a token the runner writes into
+  # the scratch volume at startup.
+  codex-runner:
+    build: { context: ., target: codex-runner }
+    profiles: ["codex"]
+    # The same uid as the worker: the runner's token (mode 0600) and the worker's mirrors (mode 0700) are each readable
+    # only by their owner.
+    user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
+    init: true # codex runs in its own process group; a timeout kills the group, and init reaps what is left
+    environment:
+      CODEX_HOME: /codex
+      RUNNER_SCRATCH: /scratch
+      RUNNER_PORT: "8790"
+      HOME: /tmp
+    volumes:
+      - codex-scratch:/scratch
+      # Its own CODEX_HOME (not the worker's), with only the login file from the host in it.
+      - codex-runner-home:/codex
+      - ${CODEX_AUTH_FILE:-./state/codex-auth.json}:/codex/auth.json
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+      # Codex's own read-only sandbox (bubblewrap: no writes, no network for the commands codex runs) needs an
+      # unprivileged user namespace, which Docker's default seccomp profile refuses. Without it every command codex
+      # runs fails. This container holds nothing but the mirror and the Codex login (SECURITY.md).
+      - seccomp=unconfined
     restart: unless-stopped
 
   api:
     build: { context: ., target: api }
+    user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
     init: true
     environment:
       <<: *env
@@ -178,3 +232,5 @@ volumes:
   postgres-data:
   ollama-models:
   codex-home:
+  codex-scratch:
+  codex-runner-home:

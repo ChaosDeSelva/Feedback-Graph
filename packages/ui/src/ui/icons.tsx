@@ -41,6 +41,9 @@ export const FolderIcon = (p: P) => (
 export const ActivityIcon = (p: P) => (
   <Icon {...p}><path d="M1.5 8.5h3l1.8-4.5 3.2 8 1.8-3.5h3.2" /></Icon>
 );
+export const SessionIcon = (p: P) => (
+  <Icon {...p}><path d="M2.5 3.5h11v7h-6l-3 2.5v-2.5h-2Z" /><path d="M5 6h6M5 8.2h4" /></Icon>
+);
 export const DocIcon = (p: P) => (
   <Icon {...p}><path d="M4 1.8h5.3L12.5 5v9.2H4Z" /><path d="M9 1.8V5.3h3.5M6 8.5h4.5M6 11h4.5" /></Icon>
 );

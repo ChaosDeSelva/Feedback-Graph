@@ -1,4 +1,5 @@
 import type { Node } from 'web-tree-sitter';
+import { extractGdscript } from './gdscript.ts';
 import { loadParser } from './lang.ts';
 import type { Extracted, RawImport, SymbolKind } from './types.ts';
 
@@ -444,8 +445,9 @@ const EXTRACTORS: Record<string, (root: Node) => Extracted> = {
   typescript: extractJs, tsx: extractJs, javascript: extractJs, python: extractPython, go: extractGo, rust: extractRust, csharp: extractCsharp, swift: extractSwift,
 };
 
-/** Symbols and raw imports of one file; null when the language has no grammar. */
+/** Symbols and raw imports of one file; null when the language has no grammar (GDScript is read line by line). */
 export async function extract(lang: string, source: string): Promise<Extracted | null> {
+  if (lang === 'gdscript') return extractGdscript(source);
   const fn = Object.hasOwn(EXTRACTORS, lang) ? EXTRACTORS[lang] : undefined;
   const parser = fn ? await loadParser(lang) : null;
   if (!fn || !parser) return null;

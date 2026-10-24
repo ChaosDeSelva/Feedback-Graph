@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import { TURN_LABELS, type Classification, type HumanTurn } from '@fb/core';
-import { ProviderUnavailableError, providerUnavailableReason, type LlmProvider } from '@fb/core';
+import { askPromptOnly, ProviderUnavailableError, providerUnavailableReason, type LlmProvider } from '@fb/core';
 import { prefilterPushback } from './prefilter.ts';
 
 const Result = z.object({
@@ -49,7 +49,8 @@ export function describeTurn(turn: HumanTurn): string {
 export async function classifyTurn(turn: HumanTurn, llm: LlmProvider): Promise<Classification | null> {
   let raw: unknown;
   try {
-    raw = await llm.json({ system: SYSTEM, user: describeTurn(turn), schema: SCHEMA, timeoutMs: 120_000 });
+    // Only the turn is sent: an agentic classifier gets an empty folder, not the worker's.
+    raw = await askPromptOnly(llm, { system: SYSTEM, user: describeTurn(turn), schema: SCHEMA, timeoutMs: 120_000 });
   } catch (err) {
     const unavailable = providerUnavailableReason(err);
     if (unavailable) throw err instanceof ProviderUnavailableError ? err : new ProviderUnavailableError(unavailable);

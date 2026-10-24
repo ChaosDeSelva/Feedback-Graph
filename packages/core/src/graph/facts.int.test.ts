@@ -2,6 +2,7 @@ import { beforeAll, expect, test } from 'vitest';
 import type { FactsStore } from '../store.ts';
 import { describeStores, type StoreProbe } from '../testing/index.ts';
 import type { CodeFact } from '../types.ts';
+import { MAX_SCAN_ATTEMPTS, SCAN_UNAVAILABLE_WAIT_MS } from './facts.ts';
 
 const vec = (axis: number) => Array.from({ length: 768 }, (_, i) => (i === axis ? 1 : 0));
 const fact = (statement: string, path = 'src/a.ts'): CodeFact & { embedding: number[] } => ({
@@ -97,6 +98,34 @@ describeStores('FactsStore', (h) => {
     await f.saveFileFacts('noise', { path: 'n.ts', hash: 'h', summary: '' }, Array.from({ length: 250 }, (_, i) => fact(`noise ${i}`, 'n.ts')), 'p');
     await f.saveFileFacts('demo', { path: 'src/a.ts', hash: 'h', summary: '' }, [{ ...fact('mine'), embedding: vec(2) }], 'p');
     expect((await f.searchFacts({ embedding: vec(1), projectKey: 'demo', k: 10 })).map((h) => h.fact.statement)).toEqual(['mine']);
+  });
+
+  test('a failed scan backs off and gives up after MAX_SCAN_ATTEMPTS; an unreachable model waits without counting', async () => {
+    const p = { key: 'demo', name: 'demo', repoPath: '/vibe/demo' };
+    const job = await f.requestScan(p, 'ollama:gemma4');
+    expect(job).toMatchObject({ attempts: 0, retryAt: null });
+    const t0 = new Date('2026-10-23T10:00:00Z');
+    const at = (min: number) => new Date(t0.getTime() + min * 60_000);
+
+    // The model could not be asked: queued, no attempt used, due again after a short wait.
+    const down = await f.recordScanFailure(job.id, 'model unavailable: ECONNREFUSED', { counted: false }, t0);
+    expect(down).toEqual({ attempts: 0, retryAt: new Date(t0.getTime() + SCAN_UNAVAILABLE_WAIT_MS).toISOString() });
+    expect(await f.nextScanJob(at(1))).toBeNull();
+    expect((await f.nextScanJob(at(3)))?.id).toBe(job.id);
+
+    // Real failures count: 5 then 10 minutes, then failed for good.
+    expect(await f.recordScanFailure(job.id, `Error: boom ghp_${'C'.repeat(36)}`, { counted: true }, t0)).toEqual({ attempts: 1, retryAt: at(5).toISOString() });
+    expect(await f.nextScanJob(at(4))).toBeNull();
+    expect(await f.nextScanJob(at(5))).toMatchObject({ id: job.id, status: 'queued', attempts: 1, retryAt: at(5).toISOString(), error: expect.stringContaining('[REDACTED]') });
+    expect(await f.recordScanFailure(job.id, 'Error: boom', { counted: true }, t0)).toEqual({ attempts: 2, retryAt: at(10).toISOString() });
+    // Asking for the scan again runs it at the next poll (same job, attempts kept).
+    expect(await f.requestScan(p, 'ollama:gemma4')).toMatchObject({ id: job.id, attempts: 2, retryAt: null });
+    expect(await f.recordScanFailure(job.id, 'Error: boom', { counted: true }, t0)).toEqual({ attempts: MAX_SCAN_ATTEMPTS, retryAt: null });
+    expect(await f.scanJob(job.id)).toMatchObject({ status: 'failed', attempts: 3, error: 'Error: boom' });
+    expect((await f.scanJob(job.id))?.finishedAt).not.toBeNull();
+    expect(await f.nextScanJob(at(60))).toBeNull();
+    // A failed job is closed: a new request queues a fresh one.
+    expect((await f.requestScan(p, 'ollama:gemma4')).id).not.toBe(job.id);
   });
 
   test('asking for a scan while one is queued or running returns that one instead of queueing another', async () => {

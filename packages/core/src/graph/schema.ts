@@ -43,6 +43,7 @@ export const SCHEMA = [
   'CREATE INDEX symbol_project_path IF NOT EXISTS FOR (n:Symbol) ON (n.projectKey, n.path)',
   'CREATE CONSTRAINT module_id IF NOT EXISTS FOR (n:Module) REQUIRE n.id IS UNIQUE',
   'CREATE CONSTRAINT codemap_project IF NOT EXISTS FOR (n:CodeMap) REQUIRE n.projectKey IS UNIQUE',
+  'CREATE INDEX session_activity IF NOT EXISTS FOR (n:Session) ON (n.lastActivityAt)',
   `CREATE VECTOR INDEX chunk_embedding IF NOT EXISTS FOR (n:Chunk) ON n.embedding
      OPTIONS {indexConfig: {\`vector.dimensions\`: 768, \`vector.similarity_function\`: 'cosine'}}`,
 ];

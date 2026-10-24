@@ -27,7 +27,15 @@ export type ParsedSession = {
   endedAt: string;
   turns: HumanTurn[];
   toolCalls: ToolCall[];
+  /**
+   * The agent's last text after the last human turn (redacted, the last 2,000 chars), with its time; null when the
+   * session ends on a human turn. Not a turn: it is never classified, so it never becomes an Inbox item. Summaries
+   * take it in with the delta that reaches the last turn.
+   */
+  finalReply?: FinalReply | null;
 };
+
+export type FinalReply = { text: string; ts: string };
 
 /**
  * key = top-level dir name under a project root: the local handle. remote = normalizeRemote(origin), the same for
@@ -162,6 +170,10 @@ export type ScanJob = {
   filesScanned: number;
   factsAdded: number;
   error: string | null;
+  /** Failed runs so far (a model that could not be asked never counts); MAX_SCAN_ATTEMPTS of them and it is failed. */
+  attempts: number;
+  /** Queued but not to run before this (ISO): backing off after a failure or an unreachable model. */
+  retryAt: string | null;
 };
 
 export type ProjectSummary = {
@@ -202,6 +214,7 @@ export const ACTIVITY_KINDS = [
   'cloud_synced',
   'turns_requeued',
   'bundle_imported',
+  'session_summarized',
 ] as const;
 export type ActivityKind = (typeof ACTIVITY_KINDS)[number];
 
@@ -231,18 +244,20 @@ export type WorkerStatus = {
   providers: Record<string, string | null>;
   /** Feedback Graph Cloud sync; absent or null when CLOUD_URL is not set. */
   cloudSync?: CloudSyncStatus | null;
-  /** How each job's model last fared (classify, postmortem, scan); missing until it is first asked. */
+  /** How each job's model last fared (classify, postmortem, scan, summary); missing until it is first asked. */
   health?: Partial<Record<ModelJob, ProviderHealth>>;
+  /** Jobs turned off on purpose (SUMMARY_LLM=off), so a missing model is not reported as broken. */
+  off?: ModelJob[];
 };
 
 /** How a provider last fared: `reason` says why it could not be asked, null while it answers. */
 export type ProviderHealth = { provider: string; ok: boolean; reason: string | null; at: string };
 
-export const MODEL_JOBS = ['classify', 'postmortem', 'scan'] as const;
+export const MODEL_JOBS = ['classify', 'postmortem', 'scan', 'summary'] as const;
 export type ModelJob = (typeof MODEL_JOBS)[number];
 /** A job's model as /api/status reports it: ok until it was last found unavailable (or, for an Ollama model, while
  * Ollama does not answer), with the reason. */
-export type ModelHealth = { provider: string | null; ok: boolean; reason: string | null };
+export type ModelHealth = { provider: string | null; ok: boolean; reason: string | null; off?: true };
 
 /** Whether Ollama answers at `url` with the models it is asked for; `reason` says why not. */
 export type OllamaHealth = { url: string; ok: boolean; reason: string | null };
@@ -267,4 +282,83 @@ export type SystemStatus = {
   givenUpTurns?: number | null;
   /** Ollama, which every embedding (search, get_task_context, check_before_done) needs: null when not checked. */
   ollama?: OllamaHealth | null;
+};
+
+// ── Session summaries ──────────────────────────────────────────────────
+
+/**
+ * active: turns are still coming in (or came in within SESSION_IDLE_MINUTES); idle: quiet for that long and summarized
+ * to its last turn ("complete for now"). A new turn makes an idle session active again.
+ */
+export const SESSION_STATES = ['active', 'idle'] as const;
+export type SessionState = (typeof SESSION_STATES)[number];
+
+/** A model's running summary of one session, merged as new turns arrive. `markdown` is rendered from the rest. */
+export type SessionSummary = {
+  goal: string;
+  done: string[];
+  decisions: string[];
+  openThreads: string[];
+  /** Repo-relative where known. */
+  filesTouched: string[];
+  /** What the developer pushed back on, in a few words each. */
+  pushback: string[];
+  outcome: string;
+  markdown: string;
+};
+
+/** How far a summary reaches: the last turn it covers, by index in its session and by that turn's time (as stored). */
+export type SummaryCursor = { index: number; ts: string };
+
+/** One change to a session's summary: which turns it took in (after `from`, up to `to`), with what, when. */
+export type SummaryUpdate = {
+  version: number;
+  /** Null: built from the session's first turn (a first summary, or a rebuild). */
+  from: SummaryCursor | null;
+  to: SummaryCursor;
+  deltaTurns: number;
+  model: string;
+  at: string;
+  /** The owner asked for it to be rebuilt from scratch. */
+  rebuild: boolean;
+};
+
+/** A session in the Sessions list. */
+export type SessionListItem = {
+  id: string;
+  projectKey: string;
+  source: SessionSource;
+  cwd: string | null;
+  gitBranch: string | null;
+  startedAt: string | null;
+  /** The newest of its last event and its last turn (ISO); null when neither could be read. */
+  lastActivityAt: string | null;
+  turnCount: number;
+  state: SessionState;
+  /** The summary's goal, for the list; null before the first summary. */
+  snippet: string | null;
+  summarizedThrough: SummaryCursor | null;
+  summaryUpdatedAt: string | null;
+  /** How many updates built the current summary. */
+  summaryVersion: number;
+  /** Turns after the cursor, not summarized yet. */
+  pendingTurns: number;
+};
+
+/** An Inbox item flagged in a session, with the lesson its post-mortem proposed, if any. */
+export type SessionInboxItem = { id: string; status: CandidateStatus; label: string | null; summary: string | null; lessonId: string | null; lessonStatus: LessonStatus | null };
+
+export type SessionDetail = SessionListItem & {
+  summary: SessionSummary | null;
+  summaryModel: string | null;
+  /** Oldest first. */
+  history: SummaryUpdate[];
+  /** The owner asked for a rebuild that has not run yet. */
+  rebuildRequested: boolean;
+  /** Turns whose text TURN_RETENTION_DAYS removed: a rebuild could not see them. */
+  prunedTurns: number;
+  /** Why the last attempt failed, and when the next is due (null while it is not backing off). */
+  summaryError: string | null;
+  summaryRetryAt: string | null;
+  inbox: SessionInboxItem[];
 };

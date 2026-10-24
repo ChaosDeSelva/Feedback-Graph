@@ -1,12 +1,18 @@
-import { spawn } from 'node:child_process';
 import { PRIVATE_DIRS, SECRET_GLOBS } from '../secrets.ts';
 import { mirrorForAgent } from './mirror.ts';
+import { codexArgs, runOnRunner, RunnerUnavailableError } from './codexRunner.ts';
+import { ProviderUnavailableError } from './unavailable.ts';
+import { basename } from 'node:path';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { ollamaChatJson } from '../ollama.ts';
+import { inEmptyFolder } from './promptOnly.ts';
 
-/** One structured-output request. `cwd` lets agentic providers read the repo themselves. */
+/**
+ * One structured-output request. `cwd` lets agentic providers read the repo themselves; without one they run in a fresh
+ * empty folder (never the process's own). Prompt-only jobs go through askPromptOnly (promptOnly.ts).
+ */
 export type JsonTask = { system: string; user: string; schema: object; cwd?: string; timeoutMs?: number };
 
 export interface LlmProvider {
@@ -17,74 +23,18 @@ export interface LlmProvider {
   json(task: JsonTask): Promise<unknown>;
 }
 
-export type ExecResult = { code: number; stdout: string; stderr: string };
-export type Exec = (
-  cmd: string,
-  args: string[],
-  o: { cwd: string; stdin: string; env: NodeJS.ProcessEnv; timeoutMs: number; killGraceMs?: number },
-) => Promise<ExecResult>;
+export type { Exec, ExecResult } from './exec.ts';
+export { execCommand, killRunningCommands } from './exec.ts';
+import { execCommand, type Exec } from './exec.ts';
 
 export type ProviderEnv = Record<string, string | undefined>;
 export type ProviderOpts = { fetchImpl?: typeof fetch; exec?: Exec };
 
 const DEFAULT_TIMEOUT = 15 * 60_000;
 
-/** Process groups of running CLI agents, so shutdown can stop them (they are detached and would outlive the worker). */
-const running = new Set<number>();
-export function killRunningCommands() {
-  for (const pid of running) {
-    try {
-      process.kill(-pid, 'SIGKILL');
-    } catch {
-      // already exited
-    }
-  }
-  running.clear();
-}
+/** `fn` in the task's folder, or in a fresh empty one when it names none (never the process's own folder). */
+const inTaskFolder = <T>(t: JsonTask, fn: (cwd: string) => Promise<T>): Promise<T> => (t.cwd ? fn(t.cwd) : inEmptyFolder(fn));
 
-export const execCommand: Exec = (cmd, args, o) =>
-  new Promise((resolve, reject) => {
-    // Its own process group, so a timeout takes down the tools it spawned too (they hold the pipes open).
-    const child = spawn(cmd, args, { cwd: o.cwd, env: o.env, stdio: ['pipe', 'pipe', 'pipe'], detached: true });
-    const pid = child.pid;
-    const exited = () => child.exitCode !== null || child.signalCode !== null;
-    const killGroup = (sig: NodeJS.Signals) => {
-      if (exited()) return; // never signal a group id the OS may already have reused
-      try {
-        if (pid) process.kill(-pid, sig);
-      } catch {
-        child.kill(sig); // group already gone
-      }
-    };
-    let stdout = '';
-    let stderr = '';
-    let timedOut = false;
-    let killer: NodeJS.Timeout | undefined;
-    // SIGTERM first so the CLI can clean up; SIGKILL if it ignores that, so a stuck agent can never hang the worker.
-    const timer = setTimeout(() => {
-      timedOut = true;
-      killGroup('SIGTERM');
-      killer = setTimeout(() => killGroup('SIGKILL'), o.killGraceMs ?? 10_000);
-    }, o.timeoutMs);
-    if (pid) running.add(pid);
-    const done = () => {
-      clearTimeout(timer);
-      clearTimeout(killer);
-      if (pid) running.delete(pid);
-    };
-    child.stdout.on('data', (d) => (stdout += d));
-    child.stderr.on('data', (d) => (stderr += d));
-    child.on('error', (err) => {
-      done();
-      reject(err);
-    });
-    child.on('close', (code) => {
-      done();
-      if (timedOut) stderr += `\n${cmd} timed out after ${o.timeoutMs}ms`;
-      resolve({ code: timedOut ? 124 : (code ?? 1), stdout, stderr });
-    });
-    child.stdin.end(o.stdin);
-  });
 
 /** OpenAI-style strict schemas: every object closed, every property required. */
 export function strictSchema(schema: unknown): unknown {
@@ -225,7 +175,7 @@ function claudeCli(id: string, model: string | undefined, token: string, o: Prov
       const args = claudeArgs(t.schema, model);
       // Subscription only: no ANTHROPIC_API_KEY, so it never falls back to paid API billing.
       const env = cliEnv({ CLAUDE_CODE_OAUTH_TOKEN: token });
-      const r = await (o.exec ?? execCommand)('claude', args, { cwd: t.cwd ?? process.cwd(), stdin: cliPrompt(t), env, timeoutMs: t.timeoutMs ?? DEFAULT_TIMEOUT });
+      const r = await inTaskFolder(t, (cwd) => (o.exec ?? execCommand)('claude', args, { cwd, stdin: cliPrompt(t), env, timeoutMs: t.timeoutMs ?? DEFAULT_TIMEOUT }));
       if (r.code !== 0) throw new Error(`claude exit ${r.code}: ${(r.stderr || r.stdout).slice(0, 500)}`);
       const out = JSON.parse(r.stdout) as { is_error?: boolean; result?: string; structured_output?: unknown };
       if (out.is_error) throw new Error(`claude error: ${String(out.result).slice(0, 500)}`);
@@ -236,30 +186,34 @@ function claudeCli(id: string, model: string | undefined, token: string, o: Prov
 
 /**
  * Codex's read-only sandbox can read the whole filesystem, and the worker image cannot narrow that (no per-path read
- * rules the worker can pass it; Docker's default seccomp profile blocks the namespaces bwrap would need). The repo mirror only keeps
- * secret files out of the cwd. So codex-cli runs only when the owner has accepted that, by name.
+ * rules the worker can pass it; Docker's default seccomp profile blocks the namespaces bwrap would need). The repo mirror
+ * only keeps secret files out of the cwd. So inside the worker codex-cli runs only when the owner has accepted that, by
+ * name; the confined way is the codex-runner sidecar (CODEX_RUNNER_URL), which has nothing else to read.
  */
 export const CODEX_UNCONFINED =
   'codex-cli is not confined to the repository: its read-only sandbox can read every file the worker can, including every ' +
   'transcript in /transcripts and /codex-sessions (projects you did not select too), every project under /vibe with its ' +
   '.env files, /state, the Codex login in /codex, and the worker\'s environment (database password, GitHub and Linear ' +
-  'tokens, API keys) through /proc. Use claude-cli or an API model instead, or set ALLOW_UNCONFINED_CODEX=1 to accept this (see SECURITY.md).';
+  'tokens, API keys) through /proc. Run it in the codex-runner sidecar instead (CODEX_RUNNER_URL, docker compose --profile codex), ' +
+  'use claude-cli or an API model, or set ALLOW_UNCONFINED_CODEX=1 to accept this (see SECURITY.md).';
 
+/** Where the worker mounts the scratch volume it shares with the codex-runner sidecar. */
+export const DEFAULT_RUNNER_SCRATCH = '/scratch';
+
+/** Inside the worker, unconfined: only with ALLOW_UNCONFINED_CODEX=1. */
 function codexCli(id: string, model: string | undefined, o: ProviderOpts): LlmProvider {
   return {
     id,
     agentic: true,
-    async json(t) {
+    json: (t) => inTaskFolder(t, async (cwd) => {
       const dir = await mkdtemp(join(tmpdir(), 'fb-codex-'));
       // Codex's sandbox has no per-file deny list, so it explores a copy without secret files.
-      const mirror = await mirrorForAgent(t.cwd ?? process.cwd());
+      const mirror = await mirrorForAgent(cwd);
       try {
         const schemaPath = join(dir, 'schema.json');
         const outPath = join(dir, 'out.json');
         await writeFile(schemaPath, JSON.stringify(strictSchema(t.schema)));
-        const args = ['exec', '-s', 'read-only', '-C', mirror.dir, '--skip-git-repo-check', '--ephemeral', '--ignore-user-config', '--ignore-rules', '--output-schema', schemaPath, '-o', outPath];
-        if (model) args.push('-m', model);
-        args.push('-');
+        const args = codexArgs({ dir: mirror.dir, schemaPath, outPath, model });
         const r = await (o.exec ?? execCommand)('codex', args, { cwd: mirror.dir, stdin: cliPrompt(t), env: cliEnv({ CODEX_HOME: process.env.CODEX_HOME }), timeoutMs: t.timeoutMs ?? DEFAULT_TIMEOUT });
         if (r.code !== 0) throw new Error(`codex exit ${r.code}: ${(r.stderr || r.stdout).slice(-500)}`);
         return extractJson(await readFile(outPath, 'utf8'));
@@ -267,7 +221,34 @@ function codexCli(id: string, model: string | undefined, o: ProviderOpts): LlmPr
         await rm(dir, { recursive: true, force: true });
         await mirror.dispose();
       }
-    },
+    }),
+  };
+}
+
+/** Confined: the mirror goes into the scratch volume and the codex-runner sidecar runs codex on it (codexRunner.ts). */
+function codexRunnerCli(id: string, model: string | undefined, url: string, scratch: string, o: ProviderOpts): LlmProvider {
+  return {
+    id,
+    agentic: true,
+    json: (t) => inTaskFolder(t, async (cwd) => {
+      const mirror = await mirrorForAgent(cwd, scratch);
+      try {
+        const r = await runOnRunner({
+          url,
+          scratch,
+          fetchImpl: o.fetchImpl,
+          // The runner mounts the volume at its own path: the mirror is named relative to it.
+          job: { prompt: cliPrompt(t), mirror: basename(mirror.dir), schema: strictSchema(t.schema) as object, model, timeoutMs: t.timeoutMs ?? DEFAULT_TIMEOUT },
+        }).catch((err: unknown) => {
+          throw err instanceof RunnerUnavailableError ? new ProviderUnavailableError(err.message) : err;
+        });
+        if (r.code !== 0) throw new Error(`codex exit ${r.code}: ${(r.stderr || r.stdout).slice(-500)}`);
+        if (r.output === null) throw new Error('codex exit 0: it wrote no answer');
+        return extractJson(r.output);
+      } finally {
+        await mirror.dispose();
+      }
+    }),
   };
 }
 
@@ -336,6 +317,7 @@ export function makeProvider(spec: string, env: ProviderEnv, o: ProviderOpts = {
     case 'claude-cli':
       return claudeCli(spec, model, need(env, 'CLAUDE_CODE_OAUTH_TOKEN'), o);
     case 'codex-cli':
+      if (env.CODEX_RUNNER_URL) return codexRunnerCli(spec, model, env.CODEX_RUNNER_URL, env.CODEX_RUNNER_SCRATCH || DEFAULT_RUNNER_SCRATCH, o);
       if (env.ALLOW_UNCONFINED_CODEX !== '1') throw new Error(CODEX_UNCONFINED);
       return codexCli(spec, model, o);
     case 'jev':

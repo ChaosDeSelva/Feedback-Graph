@@ -9,6 +9,7 @@ import {
   type CodeMapWrite,
   type FileChurn,
   type FileMissRow,
+  type HotspotOpts,
   type MapFile,
   type MapSymbol,
   type SessionFile,
@@ -47,6 +48,7 @@ export class PgCodeGraphStore implements CodeGraphStore {
       importersOf: (key, paths) => this.importersOf(key, paths),
       testsOf: (key, paths) => this.testsOf(key, paths),
       importerCounts: (key) => this.importerCounts(key),
+      edgesTouching: (key, paths) => this.edgesTouching(key, paths),
       missesOn: (key, paths) => this.missesOn(key, paths),
       approvedLessons: (key) => knowledge.listLessons({ status: 'approved', projectKey: key, limit: LESSON_LIMIT }),
       currentFacts: (key, path) => facts.listFacts({ projectKey: key, path }),
@@ -186,8 +188,12 @@ export class PgCodeGraphStore implements CodeGraphStore {
     return this.views.impact(projectKey, paths, depth);
   }
 
-  hotspots(projectKey: string, limit: number) {
-    return this.views.hotspots(projectKey, limit);
+  hotspots(projectKey: string, limit: number, opts?: HotspotOpts) {
+    return this.views.hotspots(projectKey, limit, opts);
+  }
+
+  mapGraph(projectKey: string, opts: HotspotOpts & { limit: number }) {
+    return this.views.mapGraph(projectKey, opts);
   }
 
   lessonsForPaths(projectKey: string, paths: string[]) {
@@ -250,6 +256,29 @@ export class PgCodeGraphStore implements CodeGraphStore {
       [paths.map((p) => fileId(projectKey, p))],
     );
     return rows.map((r) => r.path);
+  }
+
+  private async edgesTouching(projectKey: string, paths: string[]) {
+    if (!paths.length) return { imports: [], tests: [] };
+    const ids = paths.map((p) => fileId(projectKey, p));
+    const [imports, tests] = await Promise.all([
+      this.q(
+        `SELECT DISTINCT a.path COLLATE "C" AS a, b.path COLLATE "C" AS b
+         FROM code_imports i JOIN code_files a ON a.id = i.from_file_id JOIN code_files b ON b.id = i.to_file_id
+         WHERE i.project_key = $1 AND (i.from_file_id = ANY($2::text[]) OR i.to_file_id = ANY($2::text[])) ORDER BY a, b`,
+        [projectKey, ids],
+      ),
+      this.q(
+        `SELECT DISTINCT a.path COLLATE "C" AS a, b.path COLLATE "C" AS b
+         FROM code_tests t JOIN code_files a ON a.id = t.test_file_id JOIN code_files b ON b.id = t.target_file_id
+         WHERE t.project_key = $1 AND (t.test_file_id = ANY($2::text[]) OR t.target_file_id = ANY($2::text[])) ORDER BY a, b`,
+        [projectKey, ids],
+      ),
+    ]);
+    return {
+      imports: imports.rows.map((r) => ({ from: r.a as string, to: r.b as string })),
+      tests: tests.rows.map((r) => ({ test: r.a as string, target: r.b as string })),
+    };
   }
 
   private async importerCounts(projectKey: string): Promise<Map<string, number>> {

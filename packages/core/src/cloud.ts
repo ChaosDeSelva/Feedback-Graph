@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import { cloudUrlProblem, VERSION, type CloudConfig } from './config.ts';
 import { EXPORT_FORMAT, type ExportBundle } from './graph/portability.ts';
 import { redactDeep, redactSecrets } from './redact.ts';
-import type { ActivityStore, PortabilityStore } from './store.ts';
+import type { ActivityStore, DocsStore, PortabilityStore } from './store.ts';
 
 /*
  * Feedback Graph Cloud sync: push your project knowledge to a team org. Off unless CLOUD_URL and CLOUD_TOKEN are set
@@ -19,8 +19,10 @@ import type { ActivityStore, PortabilityStore } from './store.ts';
  * The cloud's sync contract (POST /api/v1/sync): each bundle is one whole project and says `complete: true`, so the
  * cloud treats it as a tombstone set: what this member sent for the project before and leaves out now is withdrawn
  * from the team graph. Leaving unapproved lessons out is safe under it: what was never sent has nothing to withdraw.
- * A process that has lost its memory of what was sent (a restart) leaves out a once-approved lesson that is no longer
- * approved; the tombstone then withdraws it, which demotes the team copy as well. Approved lessons become team lessons
+ * What the cloud last accepted is kept in the store (storedSyncMemory), so it survives restarts and the worker's
+ * schedule and the api's Sync now share it. A project that was synced and is no longer in the sync list (unselected,
+ * excluded, or left out of SYNC_PROJECTS) gets one last, empty bundle that withdraws what was sent for it, so the
+ * team copy does not linger; it then leaves the record. Approved lessons become team lessons
  * (or wait for an admin when the org reviews them), and rejected or superseded ones demote the team copy. `withdrawn`
  * also names what was sent before and is gone now. 429 means another sync of the org is running: wait the Retry-After.
  */
@@ -47,8 +49,49 @@ export type SyncBundle = ExportBundle & { complete: boolean; withdrawn: Withdraw
 /** What the cloud last accepted for a project: enough to name what has since gone, and to skip an unchanged bundle. */
 export type SentRecord = { fingerprint: string; remote: string | null; lessons: string[]; misses: string[]; docs: string[]; files: string[] };
 
-/** Per project key. Kept by the caller (the worker's schedule, the api's Sync now) across runs. */
-export type SyncMemory = Map<string, SentRecord>;
+/**
+ * What the cloud last accepted, per project key. A Map works (tests, a one-off run); the services use
+ * storedSyncMemory, one record in the store shared by the worker's schedule and the api's Sync now.
+ */
+export type SyncMemory = {
+  get(key: string): SentRecord | undefined | Promise<SentRecord | undefined>;
+  set(key: string, r: SentRecord): unknown;
+  delete(key: string): unknown;
+  keys(): Iterable<string> | Promise<Iterable<string>>;
+};
+
+/** The store cursor holding what one cloud org (URL and token; the token itself is never stored) last accepted. */
+export const syncMemoryCursor = (cloud: Pick<CloudConfig, 'url' | 'token'>) =>
+  `cloud-sync-sent:${createHash('sha256').update(`${cloud.url.replace(/\/+$/, '')}\0${cloud.token}`).digest('hex').slice(0, 24)}`;
+
+/**
+ * SyncMemory kept in the store (a DocsStore cursor), so it survives restarts and is the one record both services use.
+ * Keyed by the cloud URL and token: another org (or a new token) starts with no record, so nothing it never received
+ * is withdrawn from it and no lesson's status is sent to it just because an earlier org had the lesson. Each write
+ * re-reads the record and changes only its own project, so a sync running in the other service is not overwritten.
+ */
+export function storedSyncMemory(docs: Pick<DocsStore, 'getCursor' | 'setCursor'>, cloud: Pick<CloudConfig, 'url' | 'token'>): SyncMemory {
+  const cursor = syncMemoryCursor(cloud);
+  const read = async (): Promise<Record<string, SentRecord>> => {
+    try {
+      const v = JSON.parse((await docs.getCursor(cursor)) ?? '{}');
+      return v && typeof v === 'object' && !Array.isArray(v) ? v : {};
+    } catch {
+      return {};
+    }
+  };
+  const change = async (fn: (all: Record<string, SentRecord>) => void) => {
+    const all = await read();
+    fn(all);
+    await docs.setCursor(cursor, JSON.stringify(all));
+  };
+  return {
+    get: async (key) => (await read())[key],
+    set: (key, r) => change((all) => { all[key] = r; }),
+    delete: (key) => change((all) => { delete all[key]; }),
+    keys: async () => Object.keys(await read()),
+  };
+}
 
 export type SyncCounts = { projects: number; lessons: number; misses: number; facts: number; docs: number; codeFiles: number };
 
@@ -56,8 +99,11 @@ export type SyncTrigger = 'manual' | 'schedule';
 
 export type ProjectSyncResult = {
   key: string;
-  /** sent; empty (nothing stored); unchanged (same bundle as the last send, scheduled runs only); failed; not sent (an earlier 401/403 stopped the run). */
-  status: 'sent' | 'empty' | 'unchanged' | 'failed' | 'not sent';
+  /**
+   * sent; empty (nothing stored); unchanged (same bundle as the last send, scheduled runs only); failed; not sent (an
+   * earlier 401/403 stopped the run); withdrawn (no longer synced: its last, empty bundle took back what was sent).
+   */
+  status: 'sent' | 'empty' | 'unchanged' | 'failed' | 'not sent' | 'withdrawn';
   counts: SyncCounts | null;
   /** Where the cloud filed it. */
   cloudKey?: string;
@@ -199,7 +245,7 @@ export async function previewCloudSync(p: Pick<PortabilityStore, 'exportData'>, 
   const total = zero();
   const projects: { key: string; counts: SyncCounts | null }[] = [];
   for (const key of keys) {
-    const b = await syncBundle(p, key, o.memory?.get(key), o);
+    const b = await syncBundle(p, key, await o.memory?.get(key), o);
     const counts = b && bundleCounts(b);
     if (counts) for (const k of Object.keys(total) as (keyof SyncCounts)[]) total[k] += counts[k];
     projects.push({ key, counts });
@@ -326,11 +372,12 @@ const plural = (n: number, w: string, many = `${w}s`) => `${n} ${n === 1 ? w : m
 
 /**
  * Sync the given projects, one request each, and record one Activity entry for the run (what was sent: counts,
- * project keys, the cloud's host; never the token). `memory` (kept by the caller) holds what the cloud last accepted
- * per project: it names what has gone since in `withdrawn`, turns a project that now holds nothing into a tombstone,
- * and lets a scheduled run skip a project whose bundle has not changed; Sync now always sends. It is updated only on
- * success, so a failed send's withdrawals go with the next one. Without it (a fresh process), `complete: true` still
- * withdraws on the cloud whatever the bundle leaves out. A run that sent nothing and failed nothing logs nothing.
+ * project keys, the cloud's host; never the token). `memory` holds what the cloud last accepted per project: it names
+ * what has gone since in `withdrawn`, turns a project that now holds nothing into a tombstone, lets a scheduled run
+ * skip a project whose bundle has not changed (Sync now always sends), and names the projects synced before that are
+ * no longer in the list: each gets a last, empty bundle that withdraws everything sent for it. It is updated only on
+ * success, so a failed send's withdrawals go with the next one. Without it, `complete: true` still withdraws on the
+ * cloud whatever a bundle leaves out. A run that sent nothing and failed nothing logs nothing.
  */
 export async function runCloudSync(d: {
   cloud: CloudConfig;
@@ -348,12 +395,13 @@ export async function runCloudSync(d: {
   const results: ProjectSyncResult[] = [];
   let error: string | null = null;
   let stopped = false;
-  for (const key of [...new Set(await d.projects())]) {
+  const keys = [...new Set(await d.projects())];
+  for (const key of keys) {
     if (stopped) {
       results.push({ key, status: 'not sent', counts: null });
       continue;
     }
-    const previous = d.memory?.get(key);
+    const previous = await d.memory?.get(key);
     const stored = await syncBundle(d.portability, key, previous, { suggestions: d.cloud.suggestions });
     if (!stored && !previous) {
       results.push({ key, status: 'empty', counts: null });
@@ -368,8 +416,8 @@ export async function runCloudSync(d: {
     }
     try {
       const r = await pushBundle({ cloud: d.cloud, bundle, fetch: d.fetch, sleep: d.sleep, baseDelayMs: d.baseDelayMs });
-      if (stored) d.memory?.set(key, record(key, bundle, print));
-      else d.memory?.delete(key);
+      if (stored) await d.memory?.set(key, record(key, bundle, print));
+      else await d.memory?.delete(key);
       for (const k of Object.keys(sent) as (keyof SyncCounts)[]) sent[k] += counts[k];
       const filed = r.projects?.find((p) => p.localKey === key) ?? r.projects?.[0];
       results.push({ key, status: 'sent', counts, cloudKey: filed?.key, namespace: filed?.namespace, lessons: r.lessons, syncId: r.syncId, withdrawn: bundle.withdrawn.length });
@@ -380,16 +428,38 @@ export async function runCloudSync(d: {
       if (e.fatal) stopped = true;
     }
   }
+  // Synced before, not in the list now (unselected, excluded, or left out of SYNC_PROJECTS): take it back out of the
+  // team graph once, so the team copy does not linger. Only ids already sent go, and the remote it was filed under.
+  const listed = new Set(keys);
+  for (const key of d.memory ? [...(await d.memory.keys())].filter((k) => !listed.has(k)).sort() : []) {
+    if (stopped) break;
+    const previous = await d.memory!.get(key);
+    if (!previous) continue;
+    const bundle = tombstone(key, previous);
+    try {
+      const r = await pushBundle({ cloud: d.cloud, bundle, fetch: d.fetch, sleep: d.sleep, baseDelayMs: d.baseDelayMs });
+      await d.memory!.delete(key);
+      const filed = r.projects?.find((p) => p.localKey === key) ?? r.projects?.[0];
+      results.push({ key, status: 'withdrawn', counts: bundleCounts(bundle), cloudKey: filed?.key, namespace: filed?.namespace, syncId: r.syncId, withdrawn: bundle.withdrawn.length });
+    } catch (err) {
+      const e = err instanceof CloudSyncError ? err : new CloudSyncError(String(err), 0);
+      results.push({ key, status: 'failed', counts: null, error: `withdrawing it: ${e.message}` });
+      error ??= `${key}: withdrawing it: ${e.message}`;
+      if (e.fatal) stopped = true;
+    }
+  }
   const result: CloudSyncResult = { at: new Date().toISOString(), trigger: d.trigger, host, ok: error === null, sent, projects: results, error };
   const sentKeys = results.filter((r) => r.status === 'sent').map((r) => r.key);
   const failedKeys = results.filter((r) => r.status === 'failed').map((r) => r.key);
-  if (d.activity && (sentKeys.length || failedKeys.length)) {
+  const withdrawnKeys = results.filter((r) => r.status === 'withdrawn').map((r) => r.key);
+  if (d.activity && (sentKeys.length || failedKeys.length || withdrawnKeys.length)) {
     const what = `${plural(sent.lessons, 'lesson')}, ${plural(sent.misses, 'miss', 'misses')}, ${plural(sent.facts, 'fact')}, ${plural(sent.docs, 'doc')}`;
-    const attempted = sentKeys.length + failedKeys.length;
+    const attempted = sentKeys.length + failedKeys.length + withdrawnKeys.length;
+    const took = withdrawnKeys.length ? `; took ${list(withdrawnKeys)} back out (no longer synced)` : '';
     const subject = !failedKeys.length
-      ? `sent ${plural(sentKeys.length, 'project')} to ${host}: ${what}`
-      : sentKeys.length
-        ? `${failedKeys.length} of ${plural(attempted, 'project')} failed to sync to ${host}; sent ${list(sentKeys)} (${what})`
+      ? (sentKeys.length ? `sent ${plural(sentKeys.length, 'project')} to ${host}: ${what}${took}` : `took ${list(withdrawnKeys)} back out of ${host}: no longer synced`)
+      : sentKeys.length || withdrawnKeys.length
+        ? `${failedKeys.length} of ${plural(attempted, 'project')} failed to sync to ${host}; sent ${list(sentKeys) || 'nothing'} (${what})${took}`
         : `sync to ${host} failed: ${error}`;
     await d.activity.record({
       kind: 'cloud_synced',
@@ -405,6 +475,7 @@ export async function runCloudSync(d: {
         trigger: d.trigger,
         projects: sentKeys,
         failed: failedKeys,
+        withdrawnProjects: withdrawnKeys,
         sent,
         results: results.map(({ key, status, counts, cloudKey, namespace, lessons, syncId, withdrawn, error: e }) => ({ key, status, counts, cloudKey, namespace, lessons, syncId, withdrawn, error: e })),
         error,

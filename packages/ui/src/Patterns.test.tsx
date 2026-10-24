@@ -61,6 +61,18 @@ test('where agents struggle: the top hotspots across the selected projects, resc
   await waitFor(() => expect(urls).toContain('/api/codemap/hotspots?project=shop&limit=10'));
 });
 
+test('where agents struggle: test files are left out until "include tests" is ticked', async () => {
+  render(<Patterns />);
+  const card = await screen.findByRole('region', { name: /where agents struggle/i });
+  await within(card).findByText('src/db/pool.ts');
+  const box = within(card).getByLabelText(/include tests/i) as HTMLInputElement;
+  expect(box.checked).toBe(false);
+  fireEvent.click(box);
+  await waitFor(() => expect(urls).toContain('/api/codemap/hotspots?limit=10&tests=1'));
+  fireEvent.change(screen.getByLabelText('project'), { target: { value: 'shop' } });
+  await waitFor(() => expect(urls).toContain('/api/codemap/hotspots?project=shop&limit=10&tests=1'));
+});
+
 test('a slow all-projects report never replaces the one for the project you picked', async () => {
   const shopOnly = { ...report, repeatGroups: [{ ...report.repeatGroups[0], examples: ['only in shop'] }] };
   vi.stubGlobal('fetch', vi.fn(async (url: string) => {

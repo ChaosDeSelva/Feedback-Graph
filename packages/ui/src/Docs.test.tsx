@@ -28,12 +28,15 @@ test('the Docs page explains cloud sync: off by default, what is sent and what n
   expect(screen.getByRole('button', { name: 'Share with a team' })).toBeTruthy();
 });
 
-test('the Docs page says what each CLI agent can read, and that codex-cli needs an explicit acknowledgement', () => {
+test('the Docs page says what each CLI agent can read, how codex-cli runs confined, and that it needs an acknowledgement without that', () => {
   render(<Docs />);
   const section = within(screen.getByRole('region', { name: 'Choosing models' }));
   expect(section.getByText(/only the project folder it is working on/)).toBeTruthy();
+  expect(section.getByText('CODEX_RUNNER_URL=http://codex-runner:8790')).toBeTruthy();
+  expect(section.getByText(/holds only the Codex CLI, your Codex login and a copy of the project/)).toBeTruthy();
   expect(section.getByText('ALLOW_UNCONFINED_CODEX=1')).toBeTruthy();
   expect(section.getByText(/every transcript, every project folder with its \.env files/)).toBeTruthy();
+  expect(section.getByText(/judges/).textContent).toMatch(/CHECK_LLM judges check_before_done inside the api, which has no agent CLIs/);
 });
 
 test('the Docs page explains an unavailable-model badge and re-queueing given-up turns', () => {
@@ -41,4 +44,23 @@ test('the Docs page explains an unavailable-model badge and re-queueing given-up
   const section = within(screen.getByRole('region', { name: 'When something looks wrong' }));
   expect(section.getByText(/classifier unavailable/)).toBeTruthy();
   expect(section.getByText(/Re-queue/)).toBeTruthy();
+});
+
+test('the Docs page covers the Graph page Code mode, hotspots without tests, GDScript and Swift imports, and nested repos', () => {
+  render(<Docs />);
+  const map = within(screen.getByRole('region', { name: 'The code map' }));
+  expect(map.getByText(/Test files are left out of the hotspots unless you tick include tests/)).toBeTruthy();
+  expect(map.getByText(/GDScript preload, load and extends paths/)).toBeTruthy();
+  expect(map.queryByText(/Imports are not resolved for\s+GDScript and Swift/)).toBeNull();
+  const pages = within(screen.getByRole('region', { name: 'Each page' }));
+  expect(pages.getByText(/mode draws one project's code map/).textContent).toMatch(/Code mode draws one project's code map/);
+  expect(pages.getByText(/each git repo inside it is a project of its own/)).toBeTruthy();
+});
+
+test('the Docs page names SUMMARY_LLM as a job model and says retention keeps text a summary has not covered', () => {
+  render(<Docs />);
+  const models = within(screen.getByRole('region', { name: 'Choosing models' }));
+  expect(models.getByText('SUMMARY_LLM')).toBeTruthy();
+  const limit = within(screen.getByRole('region', { name: 'Limit what it reads' }));
+  expect(limit.getByText(/until its session summary covers it/)).toBeTruthy();
 });

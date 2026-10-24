@@ -227,3 +227,58 @@ test('a project unselected or deleted while its map was being built is not writt
   expect(f.activity).toEqual([]);
   expect(f.logs).toContain('code map skipped');
 });
+
+test('stop() during a parse abandons it: the build is told to stop, nothing is written, and nothing new starts', async () => {
+  let seen: AbortSignal | undefined;
+  let entered!: () => void;
+  const started = new Promise<void>((r) => { entered = r; });
+  let builds = 0;
+  const f = fakes({
+    build: async (_repo, opts) => {
+      builds++;
+      seen = opts.signal;
+      entered();
+      // A parse that only ends when it is told to stop.
+      await new Promise<void>((_, reject) => opts.signal!.addEventListener('abort', () => reject(opts.signal!.reason)));
+      return map;
+    },
+  });
+  const stage = new MapStage(f.deps);
+  stage.kick();
+  await started;
+  await stage.stop();
+  expect(seen?.aborted).toBe(true);
+  expect(f.writes).toEqual([]);
+  expect(f.activity).toEqual([]);
+  expect(f.logs).toContain('code map skipped');
+  expect(f.logs).not.toContain('code map failed');
+  stage.kick();
+  expect(await stage.mapProject({ key: 'demo', repoPath: '/vibe/demo' }, 'a scan was requested')).toBeNull();
+  await stage.idle();
+  expect(builds).toBe(1);
+});
+
+test('stop() during the write waits for it to finish, so the store is never closed under a map write', async () => {
+  let release!: () => void;
+  const gate = new Promise<void>((r) => { release = r; });
+  let writing!: () => void;
+  const inWrite = new Promise<void>((r) => { writing = r; });
+  const f = fakes();
+  const inner = f.deps.store.replaceCodeMap;
+  f.deps.store.replaceCodeMap = async (k, w) => {
+    writing();
+    await gate;
+    return inner(k, w);
+  };
+  const stage = new MapStage(f.deps);
+  stage.kick();
+  await inWrite;
+  let stopped = false;
+  const stop = stage.stop().then(() => { stopped = true; });
+  await new Promise((r) => setTimeout(r, 10));
+  expect(stopped).toBe(false);
+  release();
+  await stop;
+  expect(f.writes).toHaveLength(1);
+  expect(f.activity.map((a) => a.kind)).toEqual(['code_mapped']);
+});

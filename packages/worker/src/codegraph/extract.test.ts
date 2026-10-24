@@ -278,7 +278,7 @@ test('Swift: types, protocols, functions, methods; imports', async () => {
 });
 
 test('a language without a grammar yields null; duplicate names (overloads) merge into one symbol', async () => {
-  expect(await extract('gdscript', 'extends Node\n')).toBeNull();
+  expect(await extract('ruby', 'class A; end\n')).toBeNull();
   const r = await extract('typescript', 'export function o(a: string): void;\nexport function o(a: number): void;\nexport function o(a: any) {\n}\n');
   expect(r!.symbols).toEqual([{ name: 'o', kind: 'function', exported: true, lines: '1-4' }]);
 });

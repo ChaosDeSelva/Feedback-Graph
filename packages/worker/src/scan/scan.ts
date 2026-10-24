@@ -5,7 +5,7 @@ import { extname, join } from 'node:path';
 import { promisify } from 'node:util';
 import { z } from 'zod';
 import { GIT_SAFE } from '../ingest/git.ts';
-import { FACT_KINDS, isSecretPath, ProviderUnavailableError, providerUnavailableReason, redactSecrets, type ActivityStore, type CodeFact, type FactsStore, type LlmProvider, type ScanJob } from '@fb/core';
+import { askPromptOnly, FACT_KINDS, isSecretPath, ProviderUnavailableError, providerUnavailableReason, redactSecrets, type ActivityStore, type CodeFact, type FactsStore, type LlmProvider, type ScanJob } from '@fb/core';
 
 const run = promisify(execFile);
 
@@ -14,7 +14,8 @@ const CODE_EXT = new Set([
   '.lua', '.gd', '.php', '.sql', '.graphql', '.proto', '.vue', '.svelte', '.css', '.scss', '.html', '.md', '.mdx', '.json',
   '.yaml', '.yml', '.toml', '.sh', '.tf', '.prisma',
 ]);
-const CODE_NAMES = new Set(['Dockerfile', 'Makefile', '.gitignore', '.env.example']);
+// project.godot marks where a Godot project's res:// starts (codegraph resolves GDScript paths against it).
+const CODE_NAMES = new Set(['Dockerfile', 'Makefile', '.gitignore', '.env.example', 'project.godot']);
 const SKIP_DIRS = new Set(['node_modules', 'dist', 'build', '.git', '.next', 'out', 'coverage', 'vendor', '.venv', '__pycache__', 'target', '.turbo', '.cache']);
 const LOCKFILES = new Set(['pnpm-lock.yaml', 'package-lock.json', 'yarn.lock', 'bun.lockb', 'Cargo.lock', 'poetry.lock', 'Gemfile.lock', 'composer.lock']);
 /** Files that hold credentials are never read, whatever their extension (the list lives in core). */
@@ -130,7 +131,8 @@ Skip anything trivial or obvious from a file name. Prefer fewer, higher-value fa
 const FileResult = z.object({ summary: z.string(), facts: z.array(FactSchema).max(15) });
 
 export async function extractFileFacts(llm: LlmProvider, path: string, content: string): Promise<{ summary: string; facts: CodeFact[] }> {
-  const raw = await llm.json({
+  // The file's text is the whole input: an agentic model gets an empty folder, not the worker's.
+  const raw = await askPromptOnly(llm, {
     system: `You analyse one source file from a codebase. ${WHAT_TO_KEEP} At most 10 facts.`,
     user: `FILE: ${path}\n\n${redactSecrets(content.slice(0, MAX_FILE_CHARS))}`,
     schema: {
@@ -163,7 +165,7 @@ Return 20 to 80 facts. Every fact must cite the file it comes from (repo-relativ
 }
 
 export type ScanDeps = {
-  facts: Pick<FactsStore, 'fileHashes' | 'saveFileFacts' | 'markFilesRemoved' | 'replaceProjectFacts' | 'updateScanJob' | 'currentSources'>;
+  facts: Pick<FactsStore, 'fileHashes' | 'saveFileFacts' | 'markFilesRemoved' | 'replaceProjectFacts' | 'updateScanJob' | 'currentSources' | 'recordScanFailure'>;
   llm: LlmProvider;
   embed(texts: string[]): Promise<number[][]>;
   maxBytes: number;
@@ -270,12 +272,17 @@ export async function runScan(job: ScanJob, d: ScanDeps): Promise<ScanResult> {
   } catch (err) {
     const unavailable = providerUnavailableReason(err);
     if (unavailable) {
-      // Not the job's fault: it goes back in the queue (files already saved are not redone) and runs once the model
-      // answers. The caller treats this as no progress, so the worker does not spin on it.
-      await d.facts.updateScanJob(job.id, { status: 'queued', error: `model unavailable: ${unavailable}; the scan runs again once it answers` });
+      // Not the job's fault: it goes back in the queue (files already saved are not redone) without counting an
+      // attempt, and waits a little before asking the model again, so an outage costs one call every few minutes.
+      const next = await d.facts.recordScanFailure(job.id, `model unavailable: ${unavailable}; the scan runs again once it answers`, { counted: false });
+      d.log?.('scan waiting for its model', { project: job.projectKey, retryAt: next.retryAt });
       throw err instanceof ProviderUnavailableError ? err : new ProviderUnavailableError(unavailable);
     }
-    await d.facts.updateScanJob(job.id, { status: 'failed', error: redactSecrets(String(err)) });
+    // A real failure counts: retried after a backoff, failed for good after MAX_SCAN_ATTEMPTS.
+    const error = redactSecrets(String(err));
+    const next = await d.facts.recordScanFailure(job.id, error, { counted: true });
+    await note('scan_finished', `scan failed (attempt ${next.attempts}); ${next.retryAt ? `retrying at ${next.retryAt}` : 'gave up, request a new scan to try again'}`,
+      error, { attempts: next.attempts, retryAt: next.retryAt });
     throw err;
   }
 }

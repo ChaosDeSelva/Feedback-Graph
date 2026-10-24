@@ -98,6 +98,8 @@ export class MapStage {
   private running: Promise<void> | null = null;
   /** One build per project at a time: a scan's map waits for the background one on the same project. */
   private readonly building = new Map<string, Promise<MapResult | null>>();
+  /** Aborted by stop(): parsing stops, nothing new starts, and a map not yet being written is not written. */
+  private readonly stopping = new AbortController();
 
   constructor(d: MapStageDeps) {
     this.d = d;
@@ -105,7 +107,7 @@ export class MapStage {
 
   /** Start a pass over the selected projects unless one is running. Never throws; nothing waits for it. */
   kick(): void {
-    if (this.running) return;
+    if (this.running || this.stopping.signal.aborted) return;
     this.running = this.pass()
       .catch((err) => this.d.log?.('code map pass failed', { error: String(err) }))
       .finally(() => {
@@ -118,10 +120,21 @@ export class MapStage {
     while (this.running) await this.running;
   }
 
+  /**
+   * Graceful shutdown: a map being parsed is abandoned (nothing of it is written), a map being written is waited for,
+   * so the store is never closed under a write. Resolves when nothing runs; nothing starts after it.
+   */
+  async stop(): Promise<void> {
+    this.stopping.abort(new Error('the worker is shutting down'));
+    await this.idle();
+    while (this.building.size) await Promise.all([...this.building.values()].map((b) => b.catch(() => null)));
+  }
+
   /** Map every selected project whose repo was not looked at within the interval and has changed since its map. */
   async pass(): Promise<void> {
     const now = this.d.now ?? Date.now;
     for (const p of await this.d.projects()) {
+      if (this.stopping.signal.aborted) return;
       const last = this.checkedAt.get(p.key);
       if (last !== undefined && now() - last < (this.d.minIntervalMs ?? MAP_INTERVAL_MS)) continue;
       this.checkedAt.set(p.key, now());
@@ -136,6 +149,7 @@ export class MapStage {
   async mapProject(p: { key: string; repoPath: string }, why: string | null): Promise<MapResult | null> {
     const pending = this.building.get(p.key);
     if (pending) await pending.catch(() => null);
+    if (this.stopping.signal.aborted) return null;
     const job = this.build(p, why);
     this.building.set(p.key, job);
     try {
@@ -153,17 +167,20 @@ export class MapStage {
       const meta = await d.store.codeMapMeta(p.key);
       if (meta && fingerprint !== null && meta.fingerprint === fingerprint) return null;
       const prev = meta ? await d.store.codeMap(p.key) : null;
-      const map = await (d.build ?? buildCodeMap)(p.repoPath, { maxFiles: d.maxFiles, maxBytes: d.maxBytes }, prev ?? undefined);
+      const signal = this.stopping.signal;
+      const map = await (d.build ?? buildCodeMap)(p.repoPath, { maxFiles: d.maxFiles, maxBytes: d.maxBytes, signal }, prev ?? undefined);
       const commits = await (d.churn ?? gitChurn)(p.repoPath, CHURN_DAYS);
       const tests = map.files.filter((f) => !f.isTest).flatMap((f) => testsFor(map, f.path).map((test) => ({ test, target: f.path })));
       const exclusive = d.exclusive ?? (<T>(fn: () => Promise<T>) => fn());
       const stats = await exclusive(async () => {
+        // Shutting down before the write began: the old map stays as it was, and the next start maps it again.
+        if (signal.aborted) return 'stopped' as const;
         // Unselected, cleaned up or deleted while it was being parsed: writing now would bring its map back.
         if (d.inScope && !(await d.inScope(p.key))) return null;
         return d.store.replaceCodeMap(p.key, { ...map, tests, churn: Object.fromEntries(commits), fingerprint });
       });
-      if (!stats) {
-        d.log?.('code map skipped', { project: p.key, reason: 'no longer selected' });
+      if (!stats || stats === 'stopped') {
+        d.log?.('code map skipped', { project: p.key, reason: stats ? 'the worker is shutting down' : 'no longer selected' });
         return null;
       }
       const durationMs = Date.now() - t0;
@@ -178,7 +195,8 @@ export class MapStage {
       d.log?.('code map built', { project: p.key, ...stats, durationMs });
       return { ...stats, durationMs };
     } catch (err) {
-      d.log?.('code map failed', { project: p.key, error: String(err) });
+      if (this.stopping.signal.aborted) d.log?.('code map skipped', { project: p.key, reason: 'the worker is shutting down' });
+      else d.log?.('code map failed', { project: p.key, error: String(err) });
       return null;
     }
   }

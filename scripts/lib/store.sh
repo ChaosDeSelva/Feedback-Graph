@@ -3,6 +3,7 @@
 # reach Postgres. Values from .env are never printed: DATABASE_URL carries a password.
 
 . scripts/lib/env.sh
+. scripts/lib/json.sh
 
 [ -f .env ] || { echo "no .env here: run ./scripts/setup.sh first" >&2; exit 1; }
 STORE="$(envval STORE | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
@@ -45,7 +46,7 @@ pg_run() {
   else
     # From the stack's network when it exists, so DATABASE_URL resolves as it does for the api and the worker.
     local name net=()
-    name="$(docker compose config --format json | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>console.log(JSON.parse(s).name))')"
+    name="$(docker compose config --format json | json_field name)"
     docker network inspect "${name}_default" >/dev/null 2>&1 && net=(--network "${name}_default")
     # The URL goes in through the environment, never on a command line.
     PGURL="$PG_URL" docker run --rm -i -e PGURL ${net[@]+"${net[@]}"} --add-host host.docker.internal:host-gateway \

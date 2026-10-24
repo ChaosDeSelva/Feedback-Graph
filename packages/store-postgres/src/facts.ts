@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import type pg from 'pg';
-import { PROJECT_PATH, redactDeep, redactSecrets } from '@fb/core';
+import { PROJECT_PATH, redactDeep, redactSecrets, SCAN_UNAVAILABLE_WAIT_MS, scanRetryAt } from '@fb/core';
 import type { EmbeddedFact, FactHit, FactKind, FactsStore, Project, ProjectSummary, ScanJob, ScanStatus, StoredFact } from '@fb/core';
 import { iso, toVector, tx, type Db } from './db.ts';
 import { runSearch, searchFactsQuery } from './vector.ts';
@@ -134,7 +134,11 @@ export class PgFactsStore implements FactsStore {
          ORDER BY requested_at DESC, id DESC LIMIT 1`,
         [project.key],
       );
-      if (open) return open.id as string;
+      // Asking again is the owner saying "now": a queued job waiting out a backoff runs at the next poll.
+      if (open) {
+        await c.query(`UPDATE scan_jobs SET retry_at = NULL WHERE id = $1 AND status = 'queued'`, [open.id]);
+        return open.id as string;
+      }
       const fresh = `scan:${randomUUID()}`;
       await c.query('INSERT INTO projects (key, name, repo_path) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING', [project.key, project.name, project.repoPath]);
       await c.query(
@@ -152,9 +156,27 @@ export class PgFactsStore implements FactsStore {
     return r ? jobOf(r) : null;
   }
 
-  async nextScanJob(): Promise<ScanJob | null> {
-    const { rows: [r] } = await this.db.pool.query(`SELECT * FROM scan_jobs WHERE status = 'queued' ORDER BY requested_at, id LIMIT 1`);
+  async nextScanJob(now = new Date()): Promise<ScanJob | null> {
+    const { rows: [r] } = await this.db.pool.query(
+      `SELECT * FROM scan_jobs WHERE status = 'queued' AND (retry_at IS NULL OR retry_at <= $1) ORDER BY requested_at, id LIMIT 1`,
+      [now],
+    );
     return r ? jobOf(r) : null;
+  }
+
+  async recordScanFailure(id: string, error: string, o: { counted: boolean }, now = new Date()): Promise<{ attempts: number; retryAt: string | null }> {
+    return tx(this.db, async (c) => {
+      const { rows: [r] } = await c.query('SELECT attempts FROM scan_jobs WHERE id = $1 FOR UPDATE', [id]);
+      const attempts: number = (r?.attempts ?? 0) + (o.counted ? 1 : 0);
+      const retryAt = o.counted ? scanRetryAt(attempts, now) : new Date(now.getTime() + SCAN_UNAVAILABLE_WAIT_MS).toISOString();
+      await c.query(
+        `UPDATE scan_jobs SET attempts = $2, retry_at = $3, error = $4, status = $5::text,
+           finished_at = CASE WHEN $5::text = 'failed' THEN $6::timestamptz ELSE finished_at END
+         WHERE id = $1`,
+        [id, attempts, retryAt, redactSecrets(error), retryAt ? 'queued' : 'failed', now],
+      );
+      return { attempts, retryAt };
+    });
   }
 
   async updateScanJob(id: string, patch: Partial<Pick<ScanJob, 'filesScanned' | 'factsAdded' | 'error'>> & { status?: ScanStatus }): Promise<void> {
@@ -270,5 +292,7 @@ function jobOf(r: Record<string, any>): ScanJob {
     filesScanned: r.files_scanned ?? 0,
     factsAdded: r.facts_added ?? 0,
     error: r.error ?? null,
+    attempts: r.attempts ?? 0,
+    retryAt: t(r.retry_at),
   };
 }

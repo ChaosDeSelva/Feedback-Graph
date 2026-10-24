@@ -100,6 +100,57 @@ for (const git of [true, false]) {
   });
 }
 
+test('a Godot project: .gd symbols, and preload/load/extends paths and class_name references become edges', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'fbcodemap-godot-'));
+  dirs.push(dir);
+  const w = (p: string, c: string) => { mkdirSync(join(dir, p, '..'), { recursive: true }); writeFileSync(join(dir, p), c); };
+  w('game/project.godot', '[application]\nconfig/name="Demo"\n');
+  w('game/actors/actor.gd', 'class_name Actor\nextends CharacterBody2D\n\nvar hp := 3\n');
+  w('game/actors/player.gd', 'class_name Player\nextends Actor\n\nconst Bullet = preload("res://weapons/bullet.gd")\n\nfunc shoot():\n\tvar b = Bullet.new()\n');
+  w('game/weapons/bullet.gd', 'extends "res://actors/actor.gd"\n\nfunc _process(delta):\n\tpass\n');
+  w('game/main.gd', 'extends Node2D\n\nfunc _ready():\n\tvar p: Player = load("actors/player.gd").new()\n');
+  w('game/test/test_player.gd', 'extends GutTest\n\nfunc test_shoot():\n\tPlayer.new().shoot()\n');
+  execFileSync('git', ['-C', dir, 'init', '-q']);
+
+  const m = await buildCodeMap(dir, OPTS);
+  expect(paths(m)).toEqual(['game/actors/actor.gd', 'game/actors/player.gd', 'game/main.gd', 'game/project.godot', 'game/test/test_player.gd', 'game/weapons/bullet.gd']);
+  expect(m.files.find((f) => f.path === 'game/test/test_player.gd')?.isTest).toBe(true);
+  expect(m.symbols.filter((s) => s.path === 'game/actors/player.gd').map((s) => [s.name, s.kind, s.exported])).toEqual([
+    ['Player', 'class', true], ['Bullet', 'const', true], ['shoot', 'function', true],
+  ]);
+  const targets = (from: string) => m.imports.filter((i) => i.from === from).map((i) => i.to).sort();
+  expect(targets('game/actors/player.gd')).toEqual(['game/actors/actor.gd', 'game/weapons/bullet.gd']);
+  expect(targets('game/weapons/bullet.gd')).toEqual(['game/actors/actor.gd']);
+  expect(targets('game/main.gd')).toEqual(['game/actors/player.gd']);
+  expect(targets('game/actors/actor.gd')).toEqual([]); // CharacterBody2D is the engine's
+  expect(edge(m, 'game/main.gd', 'game/actors/player.gd')!.names.sort()).toEqual(['*', 'Player']);
+  expect(testsFor(m, 'game/actors/player.gd')).toEqual(['game/test/test_player.gd']);
+  expect(testsFor(m, 'game/weapons/bullet.gd')).toEqual(['game/test/test_player.gd']); // through player.gd
+
+  // A class_name that appears later is picked up by an unchanged file that already referred to it.
+  w('game/ui/hud.gd', 'extends Control\n\nfunc show_hp():\n\tScore.add(1)\n');
+  const second = await buildCodeMap(dir, OPTS, m);
+  w('game/ui/score.gd', 'class_name Score\n');
+  const third = await buildCodeMap(dir, OPTS, second);
+  expect(edge(third, 'game/ui/hud.gd', 'game/ui/score.gd')).toBeTruthy();
+});
+
+test('a Swift package: an import of a local module links to that module\'s files', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'fbcodemap-swift-'));
+  dirs.push(dir);
+  const w = (p: string, c: string) => { mkdirSync(join(dir, p, '..'), { recursive: true }); writeFileSync(join(dir, p), c); };
+  w('Package.swift', 'let package = Package(name: "App", targets: [\n  .executableTarget(name: "App", dependencies: ["Core"]),\n  .target(name: "Core"),\n  .testTarget(name: "CoreTests", dependencies: ["Core"]),\n])\n');
+  w('Sources/App/main.swift', 'import Foundation\nimport Core\n\nlet s = Store()\n');
+  w('Sources/Core/Store.swift', 'public struct Store {}\n');
+  w('Sources/Core/Model.swift', 'public struct Model {}\n');
+  w('Tests/CoreTests/StoreTests.swift', 'import XCTest\n@testable import Core\n\nfinal class StoreTests: XCTestCase {}\n');
+  const m = await buildCodeMap(dir, OPTS);
+  const targets = (from: string) => m.imports.filter((i) => i.from === from).map((i) => i.to).sort();
+  expect(targets('Sources/App/main.swift')).toEqual(['Sources/Core/Model.swift', 'Sources/Core/Store.swift', 'pkg:Foundation']);
+  expect(targets('Tests/CoreTests/StoreTests.swift')).toEqual(['Sources/Core/Model.swift', 'Sources/Core/Store.swift', 'pkg:XCTest']);
+  expect(testsFor(m, 'Sources/Core/Store.swift')).toEqual(['Tests/CoreTests/StoreTests.swift']);
+});
+
 test('maxFiles and maxBytes bound the map', async () => {
   const dir = fixture(true);
   writeFileSync(join(dir, 'packages/app/src/huge.ts'), `export const big = '${'x'.repeat(5000)}';\n`);
@@ -154,4 +205,11 @@ test('smoke: maps this repo\'s packages/core with sane counts, and graph/repo.ts
   expect(m.symbols.find((s) => s.id === 'src/graph/repo.ts#GraphRepo')).toMatchObject({ kind: 'class', exported: true });
   expect(testsFor(m, 'src/graph/repo.ts').length).toBeGreaterThan(0);
   expect(ms).toBeLessThan(20_000);
+});
+
+test('an aborted signal stops the build: it rejects instead of returning a partial map', async () => {
+  const dir = fixture(false);
+  const ac = new AbortController();
+  ac.abort(new Error('the worker is shutting down'));
+  await expect(buildCodeMap(dir, { ...OPTS, signal: ac.signal })).rejects.toThrow('shutting down');
 });

@@ -9,6 +9,7 @@ import { KnowledgeRepo } from './knowledge.ts';
 import { PortabilityRepo } from './portability.ts';
 import { GraphRepo } from './repo.ts';
 import { SelectionRepo } from './selection.ts';
+import { backfillSessionStats, SessionsRepo } from './sessions.ts';
 
 export type Neo4jConfig = { url: string; user: string; password: string };
 
@@ -26,7 +27,11 @@ export function neo4jStore(g: GraphRepo): Store {
     embeddings: new EmbeddingsRepo(g),
     selection: new SelectionRepo(g),
     codegraph: new CodeGraphRepo(g),
-    ensureSchema: () => g.ensureSchema(),
+    sessions: new SessionsRepo(g),
+    ensureSchema: async () => {
+      await g.ensureSchema();
+      await backfillSessionStats(g);
+    },
     ping: () => g.ping(),
     close: () => g.close(),
   };

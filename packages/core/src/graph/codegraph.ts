@@ -8,6 +8,7 @@ import {
   type CodeMapWrite,
   type FileChurn,
   type FileMissRow,
+  type HotspotOpts,
   type MapFile,
   type MapSymbol,
   type SessionFile,
@@ -51,6 +52,7 @@ export class CodeGraphRepo implements CodeGraphStore {
       importersOf: (key, paths) => this.importersOf(key, paths),
       testsOf: (key, paths) => this.testsOf(key, paths),
       importerCounts: (key) => this.importerCounts(key),
+      edgesTouching: (key, paths) => this.edgesTouching(key, paths),
       missesOn: (key, paths) => this.missesOn(key, paths),
       approvedLessons: (key) => knowledge.listLessons({ status: 'approved', projectKey: key, limit: LESSON_LIMIT }),
       currentFacts: (key, path) => facts.listFacts({ projectKey: key, path }),
@@ -203,8 +205,12 @@ export class CodeGraphRepo implements CodeGraphStore {
     return this.views.impact(projectKey, paths, depth);
   }
 
-  hotspots(projectKey: string, limit: number) {
-    return this.views.hotspots(projectKey, limit);
+  hotspots(projectKey: string, limit: number, opts?: HotspotOpts) {
+    return this.views.hotspots(projectKey, limit, opts);
+  }
+
+  mapGraph(projectKey: string, opts: HotspotOpts & { limit: number }) {
+    return this.views.mapGraph(projectKey, opts);
   }
 
   lessonsForPaths(projectKey: string, paths: string[]) {
@@ -271,6 +277,21 @@ export class CodeGraphRepo implements CodeGraphStore {
       { ids: paths.map((p) => `${projectKey}:${p}`) },
     );
     return rows.map((r) => r.get('path'));
+  }
+
+  private async edgesTouching(projectKey: string, paths: string[]) {
+    if (!paths.length) return { imports: [], tests: [] };
+    const rows = await this.g.run(
+      `MATCH (a:CodeFile {projectKey: $key})-[r:IMPORTS|TESTS]->(b:CodeFile {projectKey: $key})
+       WHERE a.path IN $paths OR b.path IN $paths
+       RETURN DISTINCT type(r) AS type, a.path AS from, b.path AS to ORDER BY from, to`,
+      { key: projectKey, paths },
+    );
+    const of = (t: string) => rows.filter((r) => r.get('type') === t).map((r) => [r.get('from') as string, r.get('to') as string] as const);
+    return {
+      imports: of('IMPORTS').map(([from, to]) => ({ from, to })),
+      tests: of('TESTS').map(([test, target]) => ({ test, target })),
+    };
   }
 
   private async importerCounts(projectKey: string): Promise<Map<string, number>> {

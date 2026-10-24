@@ -1,6 +1,6 @@
-import type { Activity, ActivityKind, CloudSyncResult, SyncCounts, SyncTrigger, Candidate, CodeMapMeta, Hotspot, ModuleContext, FolderCandidate, DocSummary, CandidateDetail, CandidateStatus, EvidenceGraph, FactHit, FactKind, Lesson, LessonDetail, LessonStatus, PatternReport, ProjectSummary, ScanJob, StatsRow, StoredFact, SystemStatus } from '@fb/core';
+import type { Activity, ActivityKind, CloudSyncResult, SyncCounts, SyncTrigger, Candidate, CodeMapMeta, Hotspot, MapGraph, ModuleContext, FolderCandidate, DocSummary, CandidateDetail, CandidateStatus, EvidenceGraph, FactHit, FactKind, Lesson, LessonDetail, LessonStatus, PatternReport, ProjectSummary, ScanJob, SessionDetail, SessionListItem, SessionState, StatsRow, StoredFact, SystemStatus } from '@fb/core';
 
-export type { CloudSyncResult, SyncCounts, Activity, Candidate, CodeMapMeta, Hotspot, ModuleContext, DocSummary, CandidateDetail, CandidateStatus, EvidenceGraph, Lesson, LessonDetail, LessonStatus, PatternReport, ProjectSummary, ScanJob, StatsRow, StoredFact, SystemStatus };
+export type { CloudSyncResult, SyncCounts, Activity, Candidate, CodeMapMeta, Hotspot, MapGraph, ModuleContext, DocSummary, CandidateDetail, CandidateStatus, EvidenceGraph, Lesson, LessonDetail, LessonStatus, PatternReport, ProjectSummary, ScanJob, SessionDetail, SessionListItem, SessionState, StatsRow, StoredFact, SystemStatus };
 
 /** One folder on the Settings page (GET /api/settings/projects). */
 export type ProjectCandidate = FolderCandidate & {
@@ -127,9 +127,12 @@ export const api = {
   activity: (o: { project?: string; kind?: ActivityKind; target?: string; limit?: number }) =>
     request<Activity[]>(`/api/activity${qs({ target: o.target, project: o.project, kind: o.kind, limit: String(o.limit ?? 100) })}`),
 
-  codeMap: (key: string, limit = 200) => request<CodeMapReport>(`/api/projects/${enc(key)}/codemap/hotspots${qs({ limit: String(limit) })}`),
+  codeMap: (key: string, limit = 200, includeTests = false) =>
+    request<CodeMapReport>(`/api/projects/${enc(key)}/codemap/hotspots${qs({ limit: String(limit), tests: includeTests ? '1' : undefined })}`),
+  codeGraph: (key: string, includeTests = false) => request<MapGraph>(`/api/projects/${enc(key)}/codemap/graph${qs({ tests: includeTests ? '1' : undefined })}`),
   codeModule: (key: string, path: string) => request<ModuleContext>(`/api/projects/${enc(key)}/codemap/module${qs({ path })}`),
-  topHotspots: (project?: string, limit = 10) => request<ProjectHotspot[]>(`/api/codemap/hotspots${qs({ project, limit: String(limit) })}`),
+  topHotspots: (project?: string, limit = 10, includeTests = false) =>
+    request<ProjectHotspot[]>(`/api/codemap/hotspots${qs({ project, limit: String(limit), tests: includeTests ? '1' : undefined })}`),
 
   docs: (key: string) => request<DocSummary[]>(`/api/projects/${enc(key)}/docs`),
   uploadDoc: (key: string, doc: { title: string; name: string; text: string }) =>
@@ -142,4 +145,13 @@ export const api = {
   syncCloud: () => request<CloudSyncResult>('/api/cloud/sync', { method: 'POST', body: {} }),
 
   deleteDoc: (id: string) => request(`/api/docs/${enc(id)}`, { method: 'DELETE', body: {} }),
+
+  sessions: (o: { project?: string; state?: SessionState; cursor?: string }) =>
+    request<SessionPage>(`/api/sessions${qs({ project: o.project, state: o.state, cursor: o.cursor })}`),
+  sessionDetail: (id: string) => request<SessionDetail>(`/api/sessions/${enc(id)}`),
+  /** Rebuild a session's summary from its first turn (owner-only). */
+  resummarize: (id: string) => request<{ queued: boolean }>(`/api/sessions/${enc(id)}/resummarize`, { method: 'POST', body: {} }),
 };
+
+/** GET /api/sessions: one page, newest first; `next` asks for the following one. */
+export type SessionPage = { sessions: SessionListItem[]; next: string | null };

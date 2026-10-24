@@ -284,6 +284,52 @@ describeStores('CodeGraphStore', (h) => {
     expect(await store.codegraph.hotspots('other', 10)).toEqual([]);
   });
 
+  test('hotspots leave test files out unless asked to include them', async () => {
+    await store.codegraph.replaceCodeMap('demo', codeMap({ churn: { 'test/db.test.ts': { commits: 31, lastTs: '2026-10-20T10:00:00.000Z' } } }));
+    expect((await store.codegraph.hotspots('demo', 100)).map((h) => h.path)).toEqual(['src/db.ts', 'src/api.ts', 'src/cli.ts', 'src/main.ts']);
+    expect(await store.codegraph.hotspots('demo', 2, { includeTests: true })).toEqual([
+      { path: 'test/db.test.ts', churn: 31, misses: 0, dependents: 0, score: 5 },
+      { path: 'src/db.ts', churn: 0, misses: 0, dependents: 3, score: 2 },
+    ]);
+    // The export carries every file's numbers, tests included.
+    expect((await store.portability.exportData({ projectKey: 'demo' })).codeFiles.find((f) => f.path === 'test/db.test.ts')?.score).toBe(5);
+  });
+
+  test('mapGraph: the top files by score, their hottest neighbours, the edges among them, and their misses and lessons', async () => {
+    await store.codegraph.replaceCodeMap('demo', codeMap());
+    const fid = await miss('s1', [edit('src/api.ts', '2026-10-01T10:03:00Z')]);
+    await miss('s2', [edit('src/api.ts', '2026-10-01T10:03:00Z'), edit('src/main.ts', '2026-10-01T10:03:00Z')]);
+    await store.knowledge.updateLesson(`lesson:${fid}`, { status: 'approved' }, {});
+    await store.knowledge.upsertLesson({ id: 'mem:db', projectKey: 'demo', title: 'DB', rule: 'r', appliesWhen: 'a', scope: 'project', paths: ['src/db.ts'], status: 'approved', source: 'memory', embedding: vec(3) });
+
+    const g = await store.codegraph.mapGraph('demo', { limit: 2 });
+    // Top: api (misses) and db (churn, dependents). Neighbours by edge: main, cli and both tests; the two hottest stay.
+    expect(g.files.map((f) => [f.path, f.top])).toEqual([['src/api.ts', true], ['src/db.ts', true], ['src/main.ts', false], ['src/cli.ts', false]]);
+    expect(g.files[0]).toEqual({ path: 'src/api.ts', churn: 1, misses: 2, dependents: 2, score: 10.58, lang: 'typescript', loc: 10, isTest: false, top: true });
+    expect(g.imports).toEqual([
+      { from: 'src/api.ts', to: 'src/db.ts' }, { from: 'src/cli.ts', to: 'src/db.ts' }, { from: 'src/main.ts', to: 'src/api.ts' },
+    ]);
+    expect(g.tests).toEqual([]);
+    expect(g.misses.map((m) => [m.sessionId, m.paths])).toEqual([['s1', ['src/api.ts']], ['s2', ['src/api.ts', 'src/main.ts']]]);
+    expect(g.lessons).toEqual([
+      { id: `lesson:${fid}`, title: 'lesson for missed in s1', paths: ['src/api.ts'] },
+      { id: 'mem:db', title: 'DB', paths: ['src/db.ts'] },
+    ]);
+    expect(g.cap).toEqual({ limit: 2, eligible: 4, neighbors: 2, neighborsFound: 4 });
+
+    const all = await store.codegraph.mapGraph('demo', { limit: 50, includeTests: true });
+    expect(all.files.map((f) => f.path).sort()).toEqual(['src/api.ts', 'src/cli.ts', 'src/db.ts', 'src/main.ts', 'test/api.test.ts', 'test/db.test.ts']);
+    expect(all.files.every((f) => f.top)).toBe(true);
+    expect(all.tests).toEqual([
+      { test: 'test/api.test.ts', target: 'src/api.ts' }, { test: 'test/api.test.ts', target: 'src/db.ts' }, { test: 'test/db.test.ts', target: 'src/db.ts' },
+    ]);
+    expect(all.imports).toHaveLength(5); // pkg:pg is not a file
+    expect(all.cap).toEqual({ limit: 50, eligible: 6, neighbors: 0, neighborsFound: 0 });
+    expect(await store.codegraph.mapGraph('other', { limit: 10 })).toEqual({
+      files: [], imports: [], tests: [], misses: [], lessons: [], cap: { limit: 10, eligible: 0, neighbors: 0, neighborsFound: 0 },
+    });
+  });
+
   test('export carries file paths and hotspot numbers only; deleting the project removes the map and session files', async () => {
     await store.codegraph.replaceCodeMap('demo', codeMap());
     await store.codegraph.replaceCodeMap('other', codeMap({ fingerprint: null }));

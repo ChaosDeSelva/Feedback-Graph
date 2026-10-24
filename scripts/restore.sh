@@ -33,8 +33,8 @@ if [ "$kind" = postgres ]; then
   # shellcheck disable=SC2086 # one service name per word
   [ -z "$running" ] || docker compose up -d $running >/dev/null
 else
-  project="$(docker compose config --format json | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>console.log(JSON.parse(s).name))')"
-  image="$(docker compose config --format json | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>console.log(JSON.parse(s).services.neo4j.image))')"
+  project="$(docker compose config --format json | json_field name)"
+  image="$(docker compose config --format json | json_field services.neo4j.image)"
   docker compose stop api worker neo4j >/dev/null
   docker run --rm -v "${project}_neo4j-data:/data" -v "$PWD/$src:/backups:ro" "$image" \
     neo4j-admin database load neo4j --from-path=/backups --overwrite-destination=true >/dev/null

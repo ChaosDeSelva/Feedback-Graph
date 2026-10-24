@@ -1,4 +1,4 @@
-import type { ActivityInput, CodeGraphStore, FileMiss, Hotspot, Impact, Lesson, ModuleContext } from '@fb/core';
+import type { ActivityInput, CodeGraphStore, FileMiss, Hotspot, HotspotOpts, Impact, Lesson, MapGraph, ModuleContext } from '@fb/core';
 import { expect, test } from 'vitest';
 import { createApp, type ApiRepo } from './app.ts';
 import { checkBeforeDone, getImpact, getModuleContext, getTaskContext, type ContextDeps } from './context.ts';
@@ -215,14 +215,20 @@ test('MCP serves get_module_context and impact, and check_before_done takes file
 // ── REST for the UI ─────────────────────────────────────────────────────
 
 const hot = (path: string, score: number): Hotspot => ({ path, churn: 3, misses: 1, dependents: 2, score });
+const graphOf = (k: string): MapGraph => ({
+  files: [{ ...hot('src/db/pool.ts', 7.5), lang: 'typescript', loc: 120, isTest: false, top: true }],
+  imports: [], tests: [], misses: [miss()], lessons: [{ id: 'l1', title: `lesson in ${k}`, paths: ['src/db/pool.ts'] }],
+  cap: { limit: 60, eligible: 1, neighbors: 0, neighborsFound: 0 },
+});
 
 function restApp(over: Record<string, unknown> = {}) {
   const asked: unknown[][] = [];
   const store = {
     ...codegraph().cg,
-    hotspots: async (k: string, limit: number) => { asked.push(['hotspots', k, limit]); return k === 'demo' ? [hot('src/db/pool.ts', 7.5), hot('src/a.ts', 2)] : k === 'beta' ? [hot('lib/b.ts', 5)] : []; },
+    hotspots: async (k: string, limit: number, opts?: HotspotOpts) => { asked.push(['hotspots', k, limit, opts]); return k === 'demo' ? [hot('src/db/pool.ts', 7.5), hot('src/a.ts', 2)] : k === 'beta' ? [hot('lib/b.ts', 5)] : []; },
     moduleContext: async (k: string, p: string) => { asked.push(['module', k, p]); return p === 'src/db/pool.ts' ? pool : null; },
     impact: async (k: string, paths: string[], depth: number) => { asked.push(['impact', k, paths, depth]); return { paths, dependents: [], tests: [], misses: [], lessons: [] }; },
+    mapGraph: async (k: string, opts: HotspotOpts & { limit: number }) => { asked.push(['mapGraph', k, opts]); return graphOf(k); },
     codeMapMeta: async (k: string) => (k === 'demo' ? { fingerprint: 'x', builtAt: '2026-10-22T12:00:00Z', stats: { files: 40, symbols: 200, imports: 90, tests: 12 } } : null),
     ...over,
   };
@@ -238,8 +244,11 @@ test('GET /api/projects/:key/codemap/hotspots returns the map stats and the hots
   const res = await app.request('/api/projects/demo/codemap/hotspots?limit=5');
   expect(res.status).toBe(200);
   expect(await res.json()).toEqual({ meta: { fingerprint: 'x', builtAt: '2026-10-22T12:00:00Z', stats: { files: 40, symbols: 200, imports: 90, tests: 12 } }, hotspots: [hot('src/db/pool.ts', 7.5), hot('src/a.ts', 2)] });
-  expect(asked).toEqual([['hotspots', 'demo', 5]]);
+  expect(asked).toEqual([['hotspots', 'demo', 5, { includeTests: false }]]);
   expect((await app.request('/api/projects/demo/codemap/hotspots?limit=0')).status).toBe(400);
+  await app.request('/api/projects/demo/codemap/hotspots?tests=1');
+  expect(asked.at(-1)).toEqual(['hotspots', 'demo', 50, { includeTests: true }]);
+  expect((await app.request('/api/projects/demo/codemap/hotspots?tests=maybe')).status).toBe(400);
   expect(await (await app.request('/api/projects/none/codemap/hotspots')).json()).toEqual({ meta: null, hotspots: [] });
 });
 
@@ -271,6 +280,23 @@ test('GET /api/codemap/hotspots ranks hotspots across the selected projects, or 
   expect((await app.request('/api/codemap/hotspots?project=elsewhere')).status).toBe(404);
 });
 
+test('GET /api/codemap/hotspots passes the include-tests toggle to every project', async () => {
+  const { app, asked } = restApp();
+  await app.request('/api/codemap/hotspots?tests=true');
+  expect(asked).toEqual([['hotspots', 'demo', 10, { includeTests: true }], ['hotspots', 'beta', 10, { includeTests: true }]]);
+});
+
+test('GET /api/projects/:key/codemap/graph returns the map graph with a limit and the include-tests toggle', async () => {
+  const { app, asked } = restApp();
+  const res = await app.request('/api/projects/demo/codemap/graph');
+  expect(res.status).toBe(200);
+  expect(await res.json()).toEqual(graphOf('demo'));
+  expect(asked).toEqual([['mapGraph', 'demo', { limit: 60, includeTests: false }]]);
+  await app.request('/api/projects/demo/codemap/graph?limit=20&tests=1');
+  expect(asked.at(-1)).toEqual(['mapGraph', 'demo', { limit: 20, includeTests: true }]);
+  for (const bad of ['limit=0', 'limit=301', 'tests=2']) expect((await app.request(`/api/projects/demo/codemap/graph?${bad}`)).status).toBe(400);
+});
+
 test('the per-project code map routes answer only for projects in scope (selected, not excluded)', async () => {
   const asked: string[] = [];
   const app = createApp(repo, {
@@ -279,11 +305,12 @@ test('the per-project code map routes answer only for projects in scope (selecte
       hotspots: async (k) => { asked.push(k); return []; },
       moduleContext: async (k) => { asked.push(k); return pool; },
       impact: async (k, paths) => { asked.push(k); return { paths, dependents: [], tests: [], misses: [], lessons: [] }; },
+      mapGraph: async (k) => { asked.push(k); return graphOf(k); },
       codeMapMeta: async (k) => { asked.push(k); return null; },
     },
     inScope: async (k) => k === 'demo',
   });
-  for (const path of ['hotspots', 'module?path=src%2Fa.ts', 'impact?path=src%2Fa.ts']) {
+  for (const path of ['hotspots', 'module?path=src%2Fa.ts', 'impact?path=src%2Fa.ts', 'graph']) {
     const res = await app.request(`/api/projects/secret/codemap/${path}`);
     expect(res.status).toBe(404);
     expect(((await res.json()) as { error: string }).error).toMatch(/Settings/);

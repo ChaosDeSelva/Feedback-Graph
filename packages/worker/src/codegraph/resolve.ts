@@ -333,6 +333,72 @@ export function makeResolver(paths: string[], read: (path: string) => string | u
     return m;
   });
 
+  // ---------- Swift ----------
+
+  // A module is a Package.swift target (its `path:`, else Sources/<name>, or Tests/<name> for a test target), or by
+  // convention any Sources/<Module>/ folder. Its files are the .swift files under that folder.
+  const swiftModules = lazy(() => {
+    const m = new Map<string, string[]>();
+    const add = (name: string, dir: string | null) => {
+      if (dir === null) return;
+      if (!m.has(name)) m.set(name, []);
+      if (!m.get(name)!.includes(dir)) m.get(name)!.push(dir);
+    };
+    for (const p of named('Package.swift')) {
+      const text = (read(p) ?? '').replace(/\/\/[^\n]*/g, '');
+      // split with a capture group: [before, kind, body, kind, body, ...]; each body runs to the next target.
+      const parts = text.split(/\.(target|executableTarget|testTarget|macro)\s*\(/);
+      for (let i = 1; i + 1 < parts.length; i += 2) {
+        const body = parts[i + 1];
+        const name = body.match(/^\s*name:\s*"([^"]+)"/)?.[1];
+        if (!name) continue;
+        const path = body.match(/\bpath:\s*"([^"]+)"/)?.[1];
+        add(name, join(dirOf(p), path ?? `${parts[i] === 'testTarget' ? 'Tests' : 'Sources'}/${name}`));
+      }
+    }
+    for (const d of dirs) {
+      const name = d.match(/(?:^|\/)Sources\/([^/]+)$/)?.[1];
+      if (name && !m.has(name)) add(name, d);
+    }
+    return m;
+  });
+  const swiftFiles = lazy(() => paths.filter((p) => p.endsWith('.swift')));
+  /** The module's files; null when no module of that name is in the repo. */
+  const resolveSwift = (spec: string): string[] | null => {
+    const roots = swiftModules().get(spec.split('.')[0]);
+    if (!roots) return null;
+    return swiftFiles().filter((f) => roots.some((d) => !d || f.startsWith(`${d}/`))).sort();
+  };
+
+  // ---------- GDScript ----------
+
+  // res:// is the folder holding the nearest project.godot above the file (the repo root without one).
+  const godotRoots = lazy(() => named('project.godot').map(dirOf).sort((a, b) => b.length - a.length));
+  const godotRootOf = (path: string) => godotRoots().find((r) => !r || path.startsWith(`${r}/`)) ?? '';
+  const classNames = lazy(() => {
+    const m = new Map<string, string[]>();
+    for (const p of paths.filter((x) => x.endsWith('.gd'))) {
+      for (const [, name] of (read(p) ?? '').matchAll(/^class_name\s+([A-Za-z_]\w*)/gm)) {
+        if (!m.has(name)) m.set(name, []);
+        m.get(name)!.push(p);
+      }
+    }
+    return m;
+  });
+  const resolveGdscript = (from: string, spec: string): string[] => {
+    if (/^[A-Za-z_]\w*$/.test(spec)) {
+      const declared = classNames().get(spec) ?? [];
+      // Two Godot projects in one repo may both declare it: the one in this file's project wins.
+      const same = declared.filter((p) => godotRootOf(p) === godotRootOf(from));
+      return (same.length ? same : declared).sort();
+    }
+    const p = spec.startsWith('res://')
+      ? join(godotRootOf(from), spec.slice('res://'.length))
+      : /^[a-z]+:\/\//.test(spec) ? null // uid://, user://: nothing in the repo by path
+        : join(dirOf(from), spec);
+    return p !== null && files.has(p) ? [p] : [];
+  };
+
   return (from, lang, raw) => {
     const { spec, names } = raw;
     const one = (to: string | null | undefined, external: string): Resolved[] =>
@@ -355,6 +421,9 @@ export function makeResolver(paths: string[], read: (path: string) => string | u
         const r = namespaces().get(spec);
         return many(r ? [...r].sort() : null, spec);
       }
+      case 'swift': return many(resolveSwift(spec), spec);
+      // A class_name or path that names nothing in the repo is an engine class or a missing file: no edge.
+      case 'gdscript': return many(resolveGdscript(from, spec), spec);
       default: return [{ to: `pkg:${spec}`, names }];
     }
   };

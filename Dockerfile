@@ -18,14 +18,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends git ca-certific
   && git config --system --add safe.directory '*'
 WORKDIR /app
 COPY --from=build --chown=node:node /app /app
-ENV NODE_ENV=production
+# The services run as uid 1000 (node) by default, or as your own uid on Linux (HOST_UID/HOST_GID in .env, which
+# docker-compose.yml passes as `user:`). A uid with no account here gets HOME=/ from Docker, which it cannot write, so
+# HOME is a folder any uid can write: the agent CLIs keep their settings there.
+RUN mkdir -p /home/fg && chmod 1777 /home/fg
+ENV NODE_ENV=production HOME=/home/fg
 
 FROM runtime AS worker
 # Pinned, like everything else in this image: a rebuild never picks up an agent CLI nobody has tried with this version.
 # claude-code in particular: the worker relies on its --restricted and dontAsk flags to keep agents inside the repo.
 RUN npm i -g @anthropic-ai/claude-code@2.1.309 @openai/codex@0.162.0 \
-  # CODEX_HOME lives on a named volume; created here so the volume starts owned by the unprivileged user.
-  && mkdir -p /codex && chown node:node /codex
+  # CODEX_HOME and the codex-runner scratch live on named volumes, which start as a copy of these folders: writable by
+  # whichever uid runs the worker (the default node, or HOST_UID), sticky so one uid cannot remove another's files.
+  && mkdir -p /codex /scratch && chown node:node /codex /scratch && chmod 1777 /codex /scratch
 WORKDIR /app/packages/worker
 USER node
 HEALTHCHECK --interval=60s --timeout=5s --start-period=120s --retries=3 \
@@ -38,3 +43,23 @@ ENV STATIC_DIR=/app/packages/ui/dist PORT=8787
 EXPOSE 8787
 USER node
 CMD ["node", "src/main.ts"]
+
+# The codex-runner sidecar (docker-compose.yml, profile "codex"): only the Codex CLI, the runner script and Node. No
+# repo, no other packages, nothing mounted but the scratch volume and the Codex login. Built from the plain Node image,
+# not from runtime, so none of the app is in it.
+FROM node:26.5.0-slim AS codex-runner
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
+  && rm -rf /var/lib/apt/lists/* \
+  && npm i -g @openai/codex@0.162.0 \
+  && npm cache clean --force \
+  # Runs as the worker's uid (HOST_UID in docker-compose.yml): the token it writes is readable only by that uid.
+  && mkdir -p /codex /scratch /runner && chown node:node /codex /scratch && chmod 1777 /codex /scratch
+WORKDIR /runner
+COPY packages/core/src/llm/exec.ts packages/core/src/llm/codexRunner.ts packages/core/src/llm/codexRunnerMain.ts ./
+RUN echo '{"type":"module","private":true}' > package.json
+ENV CODEX_HOME=/codex RUNNER_SCRATCH=/scratch RUNNER_PORT=8790 NODE_ENV=production
+EXPOSE 8790
+USER node
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+  CMD node -e "fetch('http://localhost:8790/health').then(r=>process.exit(r.ok?0:1),()=>process.exit(1))"
+CMD ["node", "codexRunnerMain.ts"]

@@ -144,6 +144,12 @@ export function Projects({ pollMs = 5000 }: { pollMs?: number } = {}) {
                   <span className="font-mono text-muted">{current.lastScan.provider ?? 'default'}</span>
                   <span className="text-muted tabular-nums">{current.lastScan.filesScanned} files</span>
                   <span className="text-muted tabular-nums">{current.lastScan.factsAdded} facts</span>
+                  {current.lastScan.status === 'queued' && current.lastScan.retryAt && (
+                    <span className="text-muted">
+                      retrying {new Date(current.lastScan.retryAt).toLocaleTimeString()}
+                      {current.lastScan.attempts ? ` (attempt ${current.lastScan.attempts + 1})` : ''}
+                    </span>
+                  )}
                   {current.lastScan.error && <div className="w-full text-bad-text">{current.lastScan.error}</div>}
                 </div>
               )}

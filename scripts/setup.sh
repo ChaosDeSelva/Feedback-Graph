@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# First-time setup, safe to re-run: write .env (your project folders, generated Neo4j and Postgres passwords) unless it
-# exists, mount every folder in PROJECTS_DIRS (docker-compose.override.yml, generated: docker-compose.yml stays as
-# shipped), create the folders Docker would otherwise create as root, and check Ollama and its models.
+# First-time setup, safe to re-run: write .env (your project folders, generated Neo4j and Postgres passwords, on Linux
+# your uid and gid) unless it exists, mount every folder in PROJECTS_DIRS (docker-compose.override.yml, generated:
+# docker-compose.yml stays as shipped), create the folders Docker would otherwise create as root, and check Ollama and
+# its models.
 #   PROJECTS_DIRS=~/code,~/work ./scripts/setup.sh     (or answer the question)
 set -euo pipefail
 here="$(cd "$(dirname "$0")/.." && pwd)"
@@ -14,12 +15,16 @@ need openssl "used to generate passwords"
 
 expand() { local p="${1/#\~/$HOME}"; p="${p%/}"; printf '%s' "${p:-/}"; }
 
+# Claude Code's transcripts (CLAUDE_PROJECTS_DIR, default ~/.claude/projects).
+claude_projects="$(expand "$(envval CLAUDE_PROJECTS_DIR)")"
+[ "$claude_projects" = / ] && claude_projects="$HOME/.claude/projects"
+
 # A projects folder is a folder holding one folder per project. Suggest the folders holding the most distinct folders
 # Claude Code ran in (never one inside a dot-folder, such as an agent's worktrees), then the usual places.
 suggest() {
   {
-    if [ -d "$HOME/.claude/projects" ]; then
-      find "$HOME/.claude/projects" -name '*.jsonl' -type f 2>/dev/null | head -n 500 |
+    if [ -d "$claude_projects" ]; then
+      find "$claude_projects" -name '*.jsonl' -type f 2>/dev/null | head -n 500 |
         while IFS= read -r f; do grep -m 1 -o '"cwd":"[^"]*"' "$f" 2>/dev/null | head -n 1; done |
         sed -e 's/^"cwd":"//' -e 's/"$//' | grep -v '/\.' | sort -u | while IFS= read -r c; do dirname "$c"; done |
         sort | uniq -c | sort -rn | awk '{ $1 = ""; sub(/^ /, ""); print }'
@@ -62,33 +67,46 @@ done
 [ ${#dirs[@]} -gt 0 ] || { echo "no projects folder given"; exit 1; }
 joined="$(IFS=,; printf '%s' "${dirs[*]}")"
 
-# Bind-mount sources Docker would otherwise create, owned by root, on first start.
-mkdir -p state "$HOME/.claude/projects"
+# Bind-mount sources Docker would otherwise create, owned by root, on first start. (An empty ~/.codex/sessions does not
+# make install-agent.sh think Codex is installed: it looks for the CLI or Codex's own config or login.)
+mkdir -p state "$claude_projects"
 codex_sessions="$(expand "$(envval CODEX_SESSIONS_DIR)")"
 [ "$codex_sessions" = / ] && codex_sessions="$HOME/.codex/sessions"
 mkdir -p "$codex_sessions"
 # Placeholder for the Codex login mount, so Docker never creates a directory in its place.
 [ -e state/codex-auth.json ] || : > state/codex-auth.json
 
+# Linux: the containers run as you (HOST_UID/HOST_GID; docker-compose.yml passes them as `user:`), so they can write
+# ./state and read transcripts only you may read. Elsewhere Docker Desktop maps file ownership: 1000 is fine.
+run_uid="" run_gid=""
+if [ "$(uname -s)" = Linux ] && [ "$(id -u)" != 1000 ]; then run_uid="$(id -u)" run_gid="$(id -g)"; fi
+
 if [ -f .env ]; then
   echo ".env exists; leaving it alone."
   env_dirs="$(grep -E '^PROJECTS_DIRS=' .env | tail -n 1 | cut -d= -f2- || true)"
   [ -z "$(printenv PROJECTS_DIRS)" ] || [ "$(printenv PROJECTS_DIRS)" = "$env_dirs" ] ||
     echo "note: put PROJECTS_DIRS=$joined in .env too, or the next ./scripts/setup.sh run goes back to what .env says"
+  if [ -n "$run_uid" ] && ! grep -qE '^HOST_UID=.' .env; then
+    echo "Linux: you are uid $run_uid, and the containers run as uid 1000 unless .env says otherwise. Add these two lines to .env"
+    echo "  (then docker compose up -d), so they can write ./state and read your transcripts:"
+    echo "    HOST_UID=$run_uid"
+    echo "    HOST_GID=$run_gid"
+  fi
 else
   codex=""
   [ -f "$HOME/.codex/auth.json" ] && codex="$HOME/.codex/auth.json"
-  multi=""
-  [ ${#dirs[@]} -gt 1 ] && multi="$joined"
+  # The folders as given (one or several), so .env says what was asked for; PROJECTS_DIR is the first.
   sed -e "s|^NEO4J_PASSWORD=.*|NEO4J_PASSWORD=$(openssl rand -hex 18)|" \
       -e "s|^POSTGRES_PASSWORD=.*|POSTGRES_PASSWORD=$(openssl rand -hex 18)|" \
       -e "s|^PROJECTS_DIR=.*|PROJECTS_DIR=${dirs[0]}|" \
-      -e "s|^PROJECTS_DIRS=.*|PROJECTS_DIRS=$multi|" \
+      -e "s|^PROJECTS_DIRS=.*|PROJECTS_DIRS=$joined|" \
       -e "s|^FEEDBACK_TOOL_DIR=.*|FEEDBACK_TOOL_DIR=$here|" \
       -e "s|^CODEX_AUTH_FILE=.*|CODEX_AUTH_FILE=$codex|" \
+      -e "s|^HOST_UID=.*|HOST_UID=$run_uid|" \
+      -e "s|^HOST_GID=.*|HOST_GID=$run_gid|" \
       .env.example > .env
   chmod 600 .env
-  echo "wrote .env (projects: $joined${codex:+; codex login found})"
+  echo "wrote .env (projects: $joined${codex:+; codex login found}${run_uid:+; containers run as uid $run_uid})"
 fi
 
 # Every projects folder is mounted read-only. One folder needs nothing beyond docker-compose.yml (PROJECTS_DIR);
@@ -96,11 +114,13 @@ fi
 override=docker-compose.override.yml
 mark='# Generated by scripts/setup.sh from PROJECTS_DIRS in .env.'
 generated() { [ -f "$override" ] && head -n 1 "$override" | grep -qF "$mark"; }
+# Needed only when PROJECTS_DIRS says more than PROJECTS_DIR does: several folders, or another one.
 multi_env="$(envval PROJECTS_DIRS)"
+[ -n "$multi_env" ] && [ ${#dirs[@]} -eq 1 ] && [ "${dirs[0]}" = "$(expand "$(envval PROJECTS_DIR)")" ] && multi_env=""
 if [ -f "$override" ] && ! generated; then
   [ -n "$multi_env" ] && echo "note: $override is your own, so PROJECTS_DIRS was not applied to it; see docs/operations.md (Install)"
 elif [ -z "$multi_env" ]; then
-  generated && rm -f "$override" && echo "removed the generated $override (PROJECTS_DIRS is empty)"
+  generated && rm -f "$override" && echo "removed the generated $override (one projects folder: docker-compose.yml mounts it)"
 else
   # Inside YAML single quotes: ' doubled, and $ doubled so docker compose takes it literally.
   esc() { printf '%s' "$1" | sed -e "s/'/''/g" -e 's/\$/$$/g'; }
@@ -129,11 +149,6 @@ else
     done
   } > "$override"
   echo "mounted ${#dirs[@]} projects folders ($override)"
-fi
-
-if [ "$(uname -s)" = Linux ] && [ "$(id -u)" != 1000 ]; then
-  echo "Linux: the containers run as uid 1000 and you are uid $(id -u). Make ./state writable and your transcripts readable for them,"
-  echo "  or run them as you (user: \"$(id -u):$(id -g)\" for worker and api): see docs/operations.md (Linux)."
 fi
 
 # Ollama on the host, with both models, unless every job uses another provider. OLLAMA_URL is what the containers

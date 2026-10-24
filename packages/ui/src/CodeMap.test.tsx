@@ -88,6 +88,17 @@ test('an importer in the module panel opens that file', async () => {
   await waitFor(() => expect(urls).toContain('/api/projects/demo/codemap/module?path=src%2Fapi%2Forders.ts'));
 });
 
+test('hotspots leave test files out until "include tests" is ticked', async () => {
+  render(<CodeMap projectKey="demo" />);
+  await screen.findByText('src/db/pool.ts');
+  expect(urls).toEqual(['/api/projects/demo/codemap/hotspots?limit=200']);
+  const box = screen.getByLabelText('include tests') as HTMLInputElement;
+  expect(box.checked).toBe(false);
+  fireEvent.click(box);
+  await waitFor(() => expect(urls).toContain('/api/projects/demo/codemap/hotspots?limit=200&tests=1'));
+  expect(await screen.findByText('src/db/pool.ts')).toBeTruthy();
+});
+
 test('a project with no map yet says the worker builds it', async () => {
   noMap = true;
   render(<CodeMap projectKey="demo" />);

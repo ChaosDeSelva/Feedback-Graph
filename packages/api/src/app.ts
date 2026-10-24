@@ -8,6 +8,7 @@ import { cloudRoutes, cloudStatus, type CloudDeps } from './cloud.ts';
 import { handleMcp } from './mcp.ts';
 import { deleteProjects, settingsRoutes, type SettingsDeps } from './settings.ts';
 import { importRoutes, type ImportDeps } from './import.ts';
+import { sessionRoutes, type SessionsDeps } from './sessions.ts';
 
 export type { SettingsDeps } from './settings.ts';
 
@@ -66,20 +67,26 @@ export type AppOpts = {
   /** The Settings page: which project folders are read. */
   settings?: SettingsDeps;
   /** The code map, for the Projects page (stats, hotspots, a file's module panel) and the Patterns page. */
-  codegraph?: Pick<CodeGraphStore, 'hotspots' | 'moduleContext' | 'impact' | 'codeMapMeta'>;
+  codegraph?: Pick<CodeGraphStore, 'hotspots' | 'moduleContext' | 'impact' | 'codeMapMeta'> & Partial<Pick<CodeGraphStore, 'mapGraph'>>;
   /** Feedback Graph Cloud sync: the Settings card and Sync now. */
   cloud?: CloudDeps;
   /** ProjectScope.project (the Settings selection and EXCLUDE_PROJECTS): the code map routes answer only inside it. */
   inScope?: (key: string) => boolean | Promise<boolean>;
   /** Import of an export bundle (POST /api/import). */
   importer?: ImportDeps;
+  /** Session summaries: the Sessions page. */
+  sessions?: SessionsDeps;
 };
 
 const MAX_DEPTH = 5;
 /** A repo-relative path as the map holds it: no absolute paths, no `..`. */
 const RepoPath = z.string().min(1).max(1000).refine((p) => cleanLessonPath(p) === p, 'a repo-relative path');
-const HotspotQuery = z.object({ limit: z.coerce.number().int().min(1).max(500).default(50) });
-const TopHotspotQuery = z.object({ project: z.string().min(1).max(200).optional(), limit: z.coerce.number().int().min(1).max(100).default(10) });
+/** tests=1: rank test files too (hotspots leave them out by default). */
+const IncludeTests = z.enum(['0', '1', 'true', 'false']).optional().transform((v) => v === '1' || v === 'true');
+const HotspotQuery = z.object({ limit: z.coerce.number().int().min(1).max(500).default(50), tests: IncludeTests });
+const TopHotspotQuery = z.object({ project: z.string().min(1).max(200).optional(), limit: z.coerce.number().int().min(1).max(100).default(10), tests: IncludeTests });
+/** The Graph page's Code mode: up to `limit` top files and as many neighbours, so at most twice that many nodes. */
+const MapGraphQuery = z.object({ limit: z.coerce.number().int().min(1).max(300).default(60), tests: IncludeTests });
 const ImpactQuery = z.object({ path: z.array(RepoPath).min(1).max(50), depth: z.coerce.number().int().min(1).max(MAX_DEPTH).default(3) });
 
 /** The worker beats every 30s; three minutes of silence means it is down or wedged. */
@@ -130,8 +137,12 @@ function modelHealth(w: WorkerStatus, ollama: OllamaHealth | null): Record<Model
     const provider = w.providers[job] ?? null;
     const h = w.health?.[job];
     const current = h?.provider ?? provider;
-    out[job] = !provider && job === 'classify'
-      ? { provider: null, ok: false, reason: 'no classifier is configured (see the worker log)' }
+    // A worker older than the summary report leaves the key out: unknown, not broken.
+    const unbuilt = !provider && (job === 'classify' || (job === 'summary' && job in w.providers));
+    out[job] = w.off?.includes(job)
+      ? { provider: null, ok: true, reason: null, off: true }
+      : unbuilt
+      ? { provider: null, ok: false, reason: job === 'classify' ? 'no classifier is configured (see the worker log)' : 'no summary model could be built (SUMMARY_LLM; see the worker log): summaries are paused' }
       : ollama && !ollama.ok && current?.startsWith('ollama:')
         ? { provider: current, ok: false, reason: ollama.reason }
         : { provider: current, ok: h?.ok ?? true, reason: h?.reason ?? null };
@@ -140,7 +151,7 @@ function modelHealth(w: WorkerStatus, ollama: OllamaHealth | null): Record<Model
 }
 
 export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
-  const { staticDir, context, knowledge, embed, facts, projectDirs, insights, activity, docs, auth = {}, system, portability, settings, log, codegraph, classifyQueue, inScope, importer, cloud } = opts;
+  const { staticDir, context, knowledge, embed, facts, projectDirs, insights, activity, docs, auth = {}, system, portability, settings, log, codegraph, classifyQueue, inScope, importer, cloud, sessions } = opts;
   const app = new Hono();
   // Other host names are only safe once a token stands between them and the API.
   const hosts = new Set([...LOCAL_HOSTS, ...(auth.token ? (auth.publicHosts ?? []).map((h) => h.toLowerCase()) : [])]);
@@ -195,6 +206,7 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
     ['POST', '/api/cloud/sync'],
     ['POST', '/api/turns/requeue'],
     ['POST', '/api/import'],
+    ['POST', '/api/sessions/:id/resummarize'],
   ] as const) app.on(method, path, ownerOnly);
 
   app.get('/api/health', (c) => c.json({ ok: true }));
@@ -355,9 +367,17 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
       const q = HotspotQuery.safeParse(c.req.query());
       if (!q.success) return c.json({ error: q.error.flatten() }, 400);
       const key = c.req.param('key');
-      const [meta, hotspots] = await Promise.all([codegraph.codeMapMeta(key), codegraph.hotspots(key, q.data.limit)]);
+      const [meta, hotspots] = await Promise.all([codegraph.codeMapMeta(key), codegraph.hotspots(key, q.data.limit, { includeTests: q.data.tests })]);
       return c.json({ meta, hotspots });
     });
+    if (codegraph.mapGraph) {
+      const mapGraph = codegraph.mapGraph.bind(codegraph);
+      app.get('/api/projects/:key/codemap/graph', async (c) => {
+        const q = MapGraphQuery.safeParse(c.req.query());
+        if (!q.success) return c.json({ error: q.error.flatten() }, 400);
+        return c.json(await mapGraph(c.req.param('key'), { limit: q.data.limit, includeTests: q.data.tests }));
+      });
+    }
     app.get('/api/projects/:key/codemap/module', async (c) => {
       const path = RepoPath.safeParse(c.req.query('path'));
       if (!path.success) return c.json({ error: 'path must be a repo-relative file path' }, 400);
@@ -376,7 +396,7 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
         if (!q.success) return c.json({ error: q.error.flatten() }, 400);
         const keys = (await projectDirs()).map((p) => p.key).filter((k) => !q.data.project || k === q.data.project);
         if (q.data.project && !keys.length) return c.json({ error: 'no such selected project' }, 404);
-        const per = await Promise.all(keys.map(async (k) => (await codegraph.hotspots(k, q.data.limit)).map((h) => ({ projectKey: k, ...h }))));
+        const per = await Promise.all(keys.map(async (k) => (await codegraph.hotspots(k, q.data.limit, { includeTests: q.data.tests })).map((h) => ({ projectKey: k, ...h }))));
         const all = per.flat().sort((a, b) => b.score - a.score || cmp(a.projectKey, b.projectKey) || cmp(a.path, b.path));
         return c.json(all.slice(0, q.data.limit));
       });
@@ -414,6 +434,7 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
   if (settings) settingsRoutes(app, settings, { activity, portability });
   if (cloud) cloudRoutes(app, cloud);
   if (importer) importRoutes(app, importer);
+  if (sessions) sessionRoutes(app, sessions);
 
   if (activity) {
     app.get('/api/activity', async (c) => {

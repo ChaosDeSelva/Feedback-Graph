@@ -9,7 +9,7 @@ cd "$(dirname "$0")/.."
 
 out="backups/$(date -u +%Y%m%dT%H%M%SZ)"
 compose_json="$(docker compose config --format json)"
-project="$(printf '%s' "$compose_json" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>console.log(JSON.parse(s).name))')"
+project="$(printf '%s' "$compose_json" | json_field name)"
 
 if [ "$STORE" = postgres ]; then
   mkdir -p "$out"
@@ -23,7 +23,7 @@ if [ "$STORE" = postgres ]; then
   echo postgres > "$out/STORE"
   ( cd "$out" && shasum -a 256 postgres.dump state.tgz STORE > SHA256SUMS )
 else
-  image="$(printf '%s' "$compose_json" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>console.log(JSON.parse(s).services.neo4j.image))')"
+  image="$(printf '%s' "$compose_json" | json_field services.neo4j.image)"
   mkdir -p "$out"
   running="$(docker compose ps --services --status running)"
   echo "stopping the stack for a consistent dump"

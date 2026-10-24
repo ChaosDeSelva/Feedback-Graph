@@ -1,8 +1,8 @@
 import { lstat, readdir, readFile, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import {
-  ConfigError, fetchPullRequestContext, killRunningCommands, loadConfig, makeProvider, ollamaEmbed, projectScope, providerUnavailableReason, ProviderUnavailableError, redactSecrets, runCloudSync, syncProjects,
-  searchLinearIssues, selectionNote, touchedAround, VERSION, withHealth, type KnowledgeStore, type LlmProvider, type ModelJob, type ProjectScope, type SyncMemory, type WorkerStatus,
+  ConfigError, fetchPullRequestContext, projectFolders, refreshLayout, relOfKey, killRunningCommands, loadConfig, makeProvider, ollamaEmbed, projectScope, providerUnavailableReason, ProviderUnavailableError, redactSecrets, runCloudSync, syncProjects,
+  searchLinearIssues, selectionNote, storedSyncMemory, touchedAround, VERSION, withHealth, type KnowledgeStore, type LlmProvider, type ModelJob, type ProjectScope, type SyncMemory, type WorkerStatus,
 } from '@fb/core';
 import { openStore } from '@fb/store-postgres';
 import { CloudSyncSchedule } from './cloud/schedule.ts';
@@ -20,6 +20,7 @@ import { huntContext } from './postmortem/hunt.ts';
 import { reposInScope, syncGithub } from './integrations/githubSync.ts';
 import { runPostmortems } from './postmortem/step.ts';
 import { runScan } from './scan/scan.ts';
+import { SummarizeStage } from './summarize/stage.ts';
 import { FileState } from './state.ts';
 
 const log = (msg: string, extra: object = {}) => console.log(JSON.stringify({ ts: new Date().toISOString(), msg, ...extra }));
@@ -86,6 +87,8 @@ async function main() {
       provider('postmortem (fallback)', localModel),
   );
   const defaultScan = config.llm.scan ?? localModel;
+  // An unavailable summary model only pauses summaries; /api/status and the badge say so. SUMMARY_LLM=off is reported as off.
+  const summaryLlm = config.summary.enabled ? tracked('summary', provider('summary', config.summary.llm ?? localModel)) : null;
   const state = new FileState(config.stateDb);
 
   // The owner picks the folders to read (Settings). First start: INGEST_PROJECTS seeds the choice, or nothing does.
@@ -106,8 +109,9 @@ async function main() {
     lastCycleAt: null,
     lastCycle: null,
     lastError: null,
-    providers: { classify: classifier?.id ?? null, postmortem: postmortemLlm?.id ?? null, scan: defaultScan },
+    providers: { classify: classifier?.id ?? null, postmortem: postmortemLlm?.id ?? null, scan: defaultScan, summary: summaryLlm?.id ?? null },
     health,
+    off: config.summary.enabled ? [] : ['summary'],
   };
   // A timer, not the loop, beats: a 15-minute post-mortem must not make the worker look dead.
   const beat = () => {
@@ -121,12 +125,16 @@ async function main() {
 
   let stopping = false;
   let wake: (() => void) | null = null;
+  /** MapStage.stop, once the stage exists (a signal can come before that). */
+  let stopMapStage: (() => Promise<void>) | null = null;
   const shutdown = (signal: string) => {
     if (stopping) return;
     stopping = true;
     log('shutting down', { signal });
     clearInterval(beater);
     killRunningCommands(); // detached CLI agents would otherwise outlive the worker
+    // Abandons a map being parsed now; the loop below waits for one being written before the store closes.
+    void stopMapStage?.();
     wake?.();
     setTimeout(() => process.exit(0), SHUTDOWN_GRACE_MS).unref();
   };
@@ -169,6 +177,7 @@ async function main() {
       runPostMortem(input, {
         llm: postmortemLlm,
         touched: async (i) => touchedAround(await store.codegraph.sessionFiles(i.sessionId), i.feedback.ts),
+        sessionSummary: async (i) => (await store.sessions.detail(i.sessionId))?.summary?.markdown ?? null,
         // Instruction files from the repo up to its project root (the mount: nothing above it is visible here).
         standing: (i) =>
           loadStandingContext({
@@ -194,11 +203,10 @@ async function main() {
 
   const memDeps = {
     transcriptsDir: transcripts,
-    roots: () =>
-      Promise.all(roots.map(async (r) => ({
-        host: r.host,
-        keys: (await readdir(r.container, { withFileTypes: true }).catch(() => [])).filter((d) => d.isDirectory()).map((d) => d.name),
-      }))),
+    roots: async () => {
+      const folders = await projectFolders(roots);
+      return roots.map((r) => ({ host: r.host, keys: folders.filter((f) => f.root === r).map((f) => f.rel) }));
+    },
     includeProject: (k: string) => scope.folder(k),
     state,
     embed,
@@ -207,12 +215,12 @@ async function main() {
     autoApprove: config.memoryAutoApprove,
   };
 
-  /** The folders of the selected projects, under the first root that has them (plain directories only). */
+  /** The folders of the selected projects, under the first root that has them (plain directories only, nested repos too). */
   async function selectedFolders(): Promise<{ key: string; repoPath: string }[]> {
     const out: { key: string; repoPath: string }[] = [];
     for (const key of scope.projects) {
       for (const r of roots) {
-        const repoPath = join(r.container, key);
+        const repoPath = join(r.container, relOfKey(key, r));
         if ((await lstat(repoPath).catch(() => null))?.isDirectory()) {
           out.push({ key, repoPath });
           break;
@@ -233,6 +241,25 @@ async function main() {
     exclusive: <T>(fn: () => Promise<T>) => selection.exclusive(fn),
     inScope: async (key: string) => (await selection.scope(config)).project(key),
   });
+  stopMapStage = () => mapStage.stop();
+
+  // Running summaries of the selected projects' sessions, beside ingest (never awaited by it).
+  const summarizeStage = config.summary.enabled
+    ? new SummarizeStage({
+        sessions: store.sessions,
+        llm: summaryLlm,
+        activity,
+        projects: () => scope.projects,
+        excludeProjects: config.excludeProjects,
+        quietMinutes: config.summary.quietMinutes,
+        idleMinutes: config.summary.idleMinutes,
+        maxDeltaTurns: config.summary.maxDeltaTurns,
+        backfillPerCycle: config.summary.backfillPerCycle,
+        log,
+      })
+    : null;
+  const { llm: _summarySpec, ...summarySettings } = config.summary;
+  log('session summaries', config.summary.enabled ? { ...summarySettings, provider: summaryLlm?.id ?? null } : { enabled: false });
 
   async function scanOne(): Promise<boolean> {
     const job = await facts.nextScanJob();
@@ -258,8 +285,8 @@ async function main() {
       return null;
     });
     if (r) log('scan done', { project: job.projectKey, ...r });
-    // Back in the queue: not progress, or the loop would pick it up again at once instead of waiting a poll.
-    return !unavailable;
+    // Back in the queue waiting out its retryAt (a failure or an unreachable model): not progress, so the loop sleeps.
+    return !!r;
   }
 
   const githubDeps = config.github
@@ -278,7 +305,8 @@ async function main() {
 
   // Feedback Graph Cloud: off (and nothing is sent) unless CLOUD_URL and CLOUD_TOKEN are set.
   const cloud = config.cloud;
-  const memory: SyncMemory = new Map();
+  // In the store, so it survives a restart and is the same record the api's Sync now uses.
+  const memory: SyncMemory | null = cloud && storedSyncMemory(store.docs, cloud);
   const cloudSchedule = cloud
     ? new CloudSyncSchedule({
         host: new URL(cloud.url).host,
@@ -291,7 +319,7 @@ async function main() {
             activity,
             projects: async () => syncProjects({ configured: cloud.projects, selected: scope.projects, excluded: config.excludeProjects }),
             trigger: 'schedule',
-            memory,
+            memory: memory ?? undefined,
           }),
       })
     : null;
@@ -302,7 +330,8 @@ async function main() {
   async function retention() {
     if (!config.turnRetentionDays || Date.now() - lastRetention < RETENTION_EVERY_MS) return;
     lastRetention = Date.now();
-    const pruned = await repo.pruneTurnText(new Date(Date.now() - config.turnRetentionDays * 86_400_000));
+    // While summaries are on, a turn keeps its text until a summary covers it (summaries themselves are never pruned).
+    const pruned = await repo.pruneTurnText(new Date(Date.now() - config.turnRetentionDays * 86_400_000), undefined, { keepUnsummarized: config.summary.enabled });
     if (pruned) log('retention: removed text of old unflagged turns', { pruned, days: config.turnRetentionDays });
   }
 
@@ -337,6 +366,20 @@ async function main() {
     if (dropped) log('forgot reads of deleted projects, read again when selected', { files: dropped });
   }
 
+  /**
+   * Which folders are projects: top-level folders, and the git repos nested in a folder that is not one. A top-level
+   * folder already selected or excluded as a whole stays one project. In place, so ingest, memory import and the map
+   * stage (which hold these roots) see the same layout.
+   */
+  async function refreshProjectLayout() {
+    const whole = new Set([...scope.projects, ...config.excludeProjects]);
+    try {
+      await refreshLayout(roots, { keepWhole: (k) => whole.has(k) });
+    } catch (err) {
+      log('project layout failed', { error: String(err) });
+    }
+  }
+
   /** The candidate list for Settings, from file heads (cached), and each file's folder for the ingest prefilter. */
   async function refreshCandidates() {
     const codexFound = !!(await lstat(config.codexSessionsDir).catch(() => null))?.isDirectory();
@@ -362,6 +405,7 @@ async function main() {
   while (!stopping) {
     try {
       await refreshScope();
+      await refreshProjectLayout();
       mapStage.kick();
       await refreshCandidates();
       await forgetDeletedReads();
@@ -384,6 +428,7 @@ async function main() {
         const scanned = await scanOne();
         const pm: Awaited<ReturnType<typeof runPostmortems>> = pmDeps ? await runPostmortems(pmDeps) : { done: 0, failed: 0 };
         const { classifierUnavailable, ...r } = await runCycle(cycleDeps);
+        summarizeStage?.kick();
         log('cycle', { ...r, postmortems: pm.done, postmortemFailures: pm.failed, scanned, classifierUnavailable, postmortemUnavailable: pm.unavailable });
         status.lastCycleAt = new Date().toISOString();
         status.lastCycle = { ...r, postmortems: pm.done, postmortemFailures: pm.failed, scanned };
@@ -403,6 +448,7 @@ async function main() {
     });
     wake = null;
   }
+  await mapStage.stop();
   state.close();
   await store.close();
   log('stopped');

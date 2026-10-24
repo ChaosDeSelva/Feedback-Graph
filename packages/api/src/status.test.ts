@@ -51,6 +51,7 @@ test('status says which model is unavailable and why, and how many turns the cla
     classify: { provider: 'ollama:gemma4', ok: false, reason: 'model not found (ollama 404)' },
     postmortem: { provider: 'claude-cli', ok: true, reason: null },
     scan: { provider: 'ollama:gemma4', ok: true, reason: null },
+    summary: { provider: null, ok: true, reason: null },
   });
   expect(s.givenUpTurns).toBe(7);
 });
@@ -74,6 +75,7 @@ test('status reports whether Ollama answers; an Ollama job is unavailable while 
     classify: { provider: 'ollama:gemma4', ok: false, reason: down.reason },
     postmortem: { provider: 'claude-cli', ok: true, reason: null },
     scan: { provider: 'ollama:gemma4', ok: false, reason: down.reason },
+    summary: { provider: null, ok: true, reason: null },
   });
   const up = createApp(repo, { system: { version: '0.2.0', ping: async () => true, worker: async () => w, ollama: async () => ({ ...down, ok: true, reason: null }) } });
   const u = await (await up.request('/api/status')).json();
@@ -81,4 +83,23 @@ test('status reports whether Ollama answers; an Ollama job is unavailable while 
   expect(u.models.classify).toEqual({ provider: 'ollama:gemma4', ok: true, reason: null });
   const unknown = createApp(repo, { system: { version: '0.2.0', ping: async () => true, worker: async () => w } });
   expect((await (await unknown.request('/api/status')).json()).ollama).toBeNull();
+});
+
+test('status lists the summary model: its health, paused when it cannot be built, and off when SUMMARY_LLM=off', async () => {
+  const at = (w: Partial<WorkerStatus>) => createApp(repo, { system: { version: '0.2.0', ping: async () => true, worker: async () => ({ ...beat(10_000), ...w }) } });
+  const models = async (w: Partial<WorkerStatus>) => (await (await at(w).request('/api/status')).json()).models;
+  expect((await models({ providers: { classify: 'ollama:gemma4', summary: 'ollama:gemma4' } })).summary).toEqual({ provider: 'ollama:gemma4', ok: true, reason: null });
+  const down = await models({
+    providers: { classify: 'ollama:gemma4', summary: 'claude-cli' },
+    health: { summary: { provider: 'claude-cli', ok: false, reason: 'claude is not signed in', at: 't' } },
+  });
+  expect(down.summary).toEqual({ provider: 'claude-cli', ok: false, reason: 'claude is not signed in' });
+  // Enabled, but the provider could not be built: summaries are paused, and that is not "off".
+  expect((await models({ providers: { classify: 'ollama:gemma4', summary: null } })).summary)
+    .toEqual({ provider: null, ok: false, reason: 'no summary model could be built (SUMMARY_LLM; see the worker log): summaries are paused' });
+  expect((await models({ providers: { classify: 'ollama:gemma4', summary: null }, off: ['summary'] })).summary).toEqual({ provider: null, ok: true, reason: null, off: true });
+  // While Ollama is down, an Ollama summary model is paused too.
+  const ollamaDown = { url: 'http://o', ok: false, reason: 'Ollama is not reachable at http://o: start it' };
+  const app = createApp(repo, { system: { version: '0.2.0', ping: async () => true, worker: async () => ({ ...beat(10_000), providers: { classify: 'claude-cli', summary: 'ollama:gemma4' } }), ollama: async () => ollamaDown } });
+  expect((await (await app.request('/api/status')).json()).models.summary).toEqual({ provider: 'ollama:gemma4', ok: false, reason: ollamaDown.reason });
 });

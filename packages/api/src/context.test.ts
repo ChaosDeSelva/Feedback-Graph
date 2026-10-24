@@ -1,6 +1,6 @@
 import type { ActivityInput, Lesson } from '@fb/core';
 import { describe, expect, test } from 'vitest';
-import { checkBeforeDone, getTaskContext, makeJudge, reportFeedback, resolveProject, type ContextDeps } from './context.ts';
+import { checkBeforeDone, getTaskContext, makeJudge, reportFeedback, resolveProject, taskFiles, type ContextDeps } from './context.ts';
 
 const roots = [{ host: '/Users/j/Vibe', container: '/vibe' }];
 const lesson = (id: string, title: string, over: Partial<Lesson> = {}): Lesson => ({
@@ -31,6 +31,14 @@ test('resolveProject accepts a project key or a cwd', () => {
   expect(resolveProject({ cwd: '/Users/j/Vibe/demo/src' }, roots)?.key).toBe('demo');
   expect(resolveProject({ project: 'demo' }, roots)?.key).toBe('demo');
   expect(resolveProject({ cwd: '/tmp' }, roots)).toBeNull();
+});
+
+test('resolveProject resolves a repo nested in a folder that is not a repo, by cwd or by its key', () => {
+  const nested = [{ host: '/Users/j/src', container: '/vibe', nested: ['github.com/org/repo'] }];
+  const want = { key: 'github.com__org__repo', name: 'github.com/org/repo', repoPath: '/vibe/github.com/org/repo' };
+  expect(resolveProject({ cwd: '/Users/j/src/github.com/org/repo/pkg' }, nested)).toEqual(want);
+  expect(resolveProject({ project: 'github.com__org__repo' }, nested, { exists: (p) => p === want.repoPath })).toEqual(want);
+  expect(taskFiles({ cwd: '/Users/j/src/github.com/org/repo/pkg', files: ['a.ts', '/Users/j/src/github.com/org/repo/b.ts'] }, nested)).toEqual(['pkg/a.ts', 'b.ts']);
 });
 
 test('getTaskContext lists lessons and past misses with citations', async () => {
@@ -102,6 +110,21 @@ test('makeJudge asks the provider for verdicts and validates them', async () => 
   expect(user).toContain('id=L1');
   const bad = makeJudge({ id: 'f', agentic: false, json: async () => ({ verdicts: [{ lessonId: 'l1', status: 'maybe', why: '' }] }) });
   await expect(bad({ task: 't', summary: 's' }, hits)).rejects.toThrow();
+});
+
+test('the judge sends only the prompt: an agentic provider would get a fresh empty folder, never the api folder, removed afterwards', async () => {
+  const { readdir, stat } = await import('node:fs/promises');
+  const seen: { cwd?: string; files: string[] }[] = [];
+  const judge = makeJudge({ id: 'claude-cli', agentic: true, json: async (t) => {
+    seen.push({ cwd: t.cwd, files: t.cwd ? await readdir(t.cwd) : [] });
+    return { verdicts: [{ lessonId: 'L1', status: 'addressed', why: 'ok' }] };
+  } });
+  await judge({ task: 't', summary: 's' }, [{ lesson: { id: 'l1', title: 'T', rule: 'R', appliesWhen: 'W' } as never, score: 1 }]);
+  expect(seen).toHaveLength(1);
+  expect(seen[0].cwd).toBeTruthy();
+  expect(seen[0].cwd).not.toBe(process.cwd());
+  expect(seen[0].files).toEqual([]);
+  await expect(stat(seen[0].cwd!)).rejects.toThrow();
 });
 
 test('getTaskContext includes relevant code facts when a scan exists', async () => {

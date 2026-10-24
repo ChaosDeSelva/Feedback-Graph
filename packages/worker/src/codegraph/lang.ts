@@ -24,7 +24,7 @@ export function langOf(path: string): string {
 }
 
 const TEST_DIRS = new Set(['__tests__', 'tests', 'test']);
-const TEST_FILE = /\.(test|spec)\.[^./]+$|^test_[^/]*\.py$|_test\.(py|go)$|Tests?\.(cs|swift)$/;
+const TEST_FILE = /\.(test|spec)\.[^./]+$|^test_[^/]*\.(py|gd)$|_test\.(py|go)$|Tests?\.(cs|swift)$/;
 
 export function isTestPath(path: string): boolean {
   const segs = path.split('/');

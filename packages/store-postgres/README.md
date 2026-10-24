@@ -21,6 +21,10 @@ implementation groups below are kept as the map of which test covers which class
 | `migrations/0006_candidate_reports.sql` | `detected`, `detected_turn_uuid` and `agent_report` on candidates: one Inbox item for a detector flag and an agent report of the same miss. | frozen once run |
 | `migrations/0007_import.sql` | The `bundle_imported` activity kind (POST /api/import). | frozen once run |
 | `migrations/0008_cloud_sync.sql` | The `cloud_synced` activity kind (team sync runs). | frozen once run |
+| `migrations/0009_session_summaries.sql` | Session summaries: stats, state, summary and cursor columns on `sessions` (backfilled for existing rows), `session_summary_updates`, and the `session_summarized` activity kind. | frozen once run |
+| `migrations/0010_scan_attempts.sql` | Scan attempts and backoff on scan jobs. | frozen once run |
+| `migrations/0011_session_final_reply.sql` | `final_reply_text` and `final_reply_ts` on `sessions`: the agent's last reply after the last human turn, for summaries. | frozen once run |
+| `migrations/0012_final_reply_summarized.sql` | `final_reply_summarized_ts` on `sessions`: the final reply the summary has taken in, so a reply stored after the summary reached the last turn is still summarized. | frozen once run |
 | `src/migrate.ts` | Migration runner: `schema_migrations`, one transaction per file, advisory lock so api and worker can start together. | seam |
 | `src/db.ts` | `openDb`, `tx()` (all-or-nothing, Neo4j's `runInTransaction`), `iso()`, `toVector()` / `fromVector()`, `toJson()`, `notImplemented()`. Every query's parameters lose their NUL characters in the pool's client class (`stripNul`). | seam |
 | `src/vector.ts` | The four nearest-neighbour queries in the form the HNSW indexes serve, and `runSearch` (iterative scans). | seam |
@@ -242,6 +246,29 @@ Knowledge, Facts and Portability.
 
 `packages/worker/src/codegraph/stage.int.test.ts`: a real repo is mapped, read back losslessly, and rebuilt
 incrementally from what was stored.
+
+### SessionsStore (`src/sessions.ts`): `packages/core/src/graph/sessions.int.test.ts`
+
+Session summaries. Also calls Graph (upsertSession, saveClassification, decide, pruneTurnText), Knowledge and
+Portability. upsertSession keeps `turn_count`, the last turn and `last_activity_at` current (`refreshSessionStats`,
+inside its transaction); Neo4j does the same for sessions stored before summaries in `ensureSchema`, Postgres in 0009.
+
+- upsertSession keeps the turn count, last turn and last activity; the list is newest first and leaves agent reports out
+- save stores the summary redacted, moves the cursor and appends the history; a stale version is not applied
+- turns gives the turns after an index, in order
+- work: a quiet delta or a big one is due; an active one is not; never-summarized history is backfill
+- work: a final reply stored after the summary reached the last turn is due until an update covers it; a newer one is due again
+- work: a summarized session with nothing new is marked idle once quiet long enough; new turns bring an idle one back
+- a failed update backs off; an idle session with new turns is still listed so it can be reactivated
+- a rebuild is due at once, refuses an update planned before it, and is cleared by the rebuild
+- the list pages by cursor and filters by state and by having a summary
+- detail links the Inbox items flagged in the session and the lesson each one led to
+- retention: with keepUnsummarized only turns a summary covers lose their text, and the summary stays
+- summaries are never exported or synced, and a project delete removes them
+- *(Neo4j only)* sessions stored before summaries get their stats when the schema is ensured
+
+`packages/worker/src/summarize/stage.int.test.ts`: the summarize stage with a fake model on each backend (only the
+delta is sent, cursors advance exactly, idle, retention interplay). `src/migrate.int.test.ts` checks 0009's backfill.
 
 ### Text with NUL characters: `packages/core/src/graph/nul.int.test.ts`
 

@@ -31,6 +31,8 @@ test('an Ollama that is not running is named, with its URL, the model and the fi
   const chat = ollamaChatJson({ url: 'http://o', model: 'gemma4', system: 's', user: 'u', schema: {}, fetchImpl: refused });
   await expect(chat).rejects.toThrow(/Ollama is not reachable at http:\/\/o \(gemma4, ECONNREFUSED\): start it .*_LLM/);
   expect(providerUnavailableReason(await chat.catch((e) => e))).toMatch(/^Ollama is not reachable/);
+  // Summaries are a job with their own model too: the hint names every job's setting.
+  await expect(chat).rejects.toThrow(/CLASSIFY_LLM, POSTMORTEM_LLM, SCAN_LLM, CHECK_LLM, SUMMARY_LLM/);
 });
 
 test('ollamaPing: ok when Ollama answers and has the models; otherwise the reason', async () => {

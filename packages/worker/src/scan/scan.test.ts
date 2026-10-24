@@ -79,6 +79,7 @@ function fakeDeps(over: Partial<ScanDeps> = {}) {
   const updates: object[] = [];
   const activity: ActivityInput[] = [];
   const jobIds: (string | null | undefined)[] = [];
+  let attempts = 0;
   const deps: ScanDeps = {
     facts: {
       fileHashes: async () => new Map([['src/a.ts', 'stale'], ['src/deleted.ts', 'x']]),
@@ -87,6 +88,13 @@ function fakeDeps(over: Partial<ScanDeps> = {}) {
       replaceProjectFacts: async (_k, facts, _s, files, jobId) => { replaced.push({ facts: facts.length, files: files.length }); jobIds.push(jobId); },
       updateScanJob: async (_id, p) => { updates.push(p); },
       currentSources: async () => [],
+      // The stores' rule (contract-tested in facts.int.test.ts): a counted failure backs off, then fails for good.
+      recordScanFailure: async (_id, error, o) => {
+        attempts += o.counted ? 1 : 0;
+        const retryAt = o.counted && attempts >= 3 ? null : 'later';
+        updates.push({ status: retryAt ? 'queued' : 'failed', error, counted: o.counted, attempts });
+        return { attempts, retryAt };
+      },
     },
     llm: llm({ summary: 'S', facts: [{ kind: 'api', statement: 'f', path: '', lines: null, confidence: 0.8, why: 'callers rely on it' }] }),
     activity: { record: async (a) => { activity.push(a); } },
@@ -98,7 +106,7 @@ function fakeDeps(over: Partial<ScanDeps> = {}) {
   return { deps, saved, removed, replaced, updates, activity, jobIds };
 }
 
-const job = (dir: string): ScanJob => ({ id: 'j', projectKey: 'demo', repoPath: dir, provider: null, status: 'queued', requestedAt: 't', startedAt: null, finishedAt: null, filesScanned: 0, factsAdded: 0, error: null });
+const job = (dir: string): ScanJob => ({ id: 'j', projectKey: 'demo', repoPath: dir, provider: null, status: 'queued', requestedAt: 't', startedAt: null, finishedAt: null, filesScanned: 0, factsAdded: 0, error: null, attempts: 0, retryAt: null });
 
 test('runScan (per-file) skips unchanged files, scans changed ones, and closes removed files', async () => {
   const dir = repo(true);
@@ -149,10 +157,15 @@ test('runScan (agentic) asks once for the whole repo and replaces project facts'
   expect(r.filesScanned).toBe(5);
 });
 
-test('runScan marks the job failed when the provider throws', async () => {
-  const { deps, updates } = fakeDeps({ llm: { id: 'x', agentic: true, json: async () => { throw new Error('quota'); } } });
+test('a provider that throws counts an attempt: the job is queued again with a backoff, and failed after the last one', async () => {
+  const { deps, updates, activity } = fakeDeps({ llm: { id: 'x', agentic: true, json: async () => { throw new Error('quota'); } } });
   await expect(runScan(job(repo(true)), deps)).rejects.toThrow('quota');
-  expect(updates.at(-1)).toMatchObject({ status: 'failed', error: 'Error: quota' });
+  expect(updates.at(-1)).toMatchObject({ status: 'queued', error: 'Error: quota', counted: true, attempts: 1 });
+  expect(activity.at(-1)).toMatchObject({ kind: 'scan_finished', subject: 'scan failed (attempt 1); retrying at later', why: 'Error: quota' });
+  await expect(runScan(job(repo(true)), deps)).rejects.toThrow('quota');
+  await expect(runScan(job(repo(true)), deps)).rejects.toThrow('quota');
+  expect(updates.at(-1)).toMatchObject({ status: 'failed', attempts: 3 });
+  expect(activity.at(-1)?.subject).toContain('gave up');
 });
 
 test('an unavailable model leaves the job queued, never failed, and stops asking it (per-file)', async () => {
@@ -162,15 +175,18 @@ test('an unavailable model leaves the job queued, never failed, and stops asking
   const { deps, updates, activity } = fakeDeps({ llm: down });
   await expect(runScan(job(dir), deps)).rejects.toBeInstanceOf(ProviderUnavailableError);
   expect(calls).toBe(1);
-  expect(updates.at(-1)).toMatchObject({ status: 'queued', error: expect.stringMatching(/model unavailable.*ECONNREFUSED/) });
+  expect(updates.at(-1)).toMatchObject({ status: 'queued', counted: false, error: expect.stringMatching(/model unavailable.*ECONNREFUSED/) });
   expect(updates.some((u) => (u as { status?: string }).status === 'failed' || (u as { status?: string }).status === 'done')).toBe(false);
+  // However long the outage, it never uses up an attempt.
+  for (let i = 0; i < 5; i++) await expect(runScan(job(dir), deps)).rejects.toBeInstanceOf(ProviderUnavailableError);
+  expect(updates.at(-1)).toMatchObject({ status: 'queued', attempts: 0 });
   expect(activity.some((a) => a.subject.startsWith('could not extract facts'))).toBe(false);
 });
 
 test('an unavailable model leaves an agentic scan queued too', async () => {
   const { deps, updates } = fakeDeps({ llm: { id: 'claude-cli', agentic: true, json: async () => { throw new Error('claude exit 1: Invalid API key · Please run /login'); } } });
   await expect(runScan(job(repo(true)), deps)).rejects.toBeInstanceOf(ProviderUnavailableError);
-  expect(updates.at(-1)).toMatchObject({ status: 'queued', error: expect.stringMatching(/not signed in/) });
+  expect(updates.at(-1)).toMatchObject({ status: 'queued', counted: false, error: expect.stringMatching(/not signed in/) });
 });
 
 test('listCodeFiles never includes secret files, with or without git', async () => {
@@ -243,4 +259,19 @@ test('listCodeFiles never follows a symlink, even one git tracks', async () => {
   execFileSync('git', ['-C', dir, 'init', '-q']);
   execFileSync('git', ['-C', dir, 'add', '-A', '-f']);
   expect((await listCodeFiles(dir, { maxBytes: 80_000, maxFiles: 100 })).map((f) => f.path)).toEqual(['src/a.ts']);
+});
+
+test('one-file extraction sends only the file text: an agentic model gets a fresh empty folder, never the worker folder, removed afterwards', async () => {
+  const { readdir, stat } = await import('node:fs/promises');
+  const seen: { cwd?: string; files: string[] }[] = [];
+  const llm: LlmProvider = { id: 'claude-cli', agentic: true, json: async (t) => {
+    seen.push({ cwd: t.cwd, files: t.cwd ? await readdir(t.cwd) : [] });
+    return { summary: 's', facts: [] };
+  } };
+  await extractFileFacts(llm, 'src/a.ts', 'export const a = 1;');
+  expect(seen).toHaveLength(1);
+  expect(seen[0].cwd).toBeTruthy();
+  expect(seen[0].cwd).not.toBe(process.cwd());
+  expect(seen[0].files).toEqual([]);
+  await expect(stat(seen[0].cwd!)).rejects.toThrow();
 });

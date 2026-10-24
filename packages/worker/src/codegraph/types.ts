@@ -30,7 +30,8 @@ export type CodeImport = {
 
 export type CodeMap = { files: CodeFile[]; symbols: CodeSymbol[]; imports: CodeImport[] };
 
-export type BuildOpts = { maxFiles: number; maxBytes: number; concurrency?: number };
+/** `signal`: stop parsing (the worker is shutting down); the build then rejects with the signal's reason. */
+export type BuildOpts = { maxFiles: number; maxBytes: number; concurrency?: number; signal?: AbortSignal };
 
 /** An import as the parser saw it, before resolution. names: '*' is the whole module, 'default' the default export. */
 export type RawImport = { spec: string; names: string[] };

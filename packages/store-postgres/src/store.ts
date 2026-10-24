@@ -11,6 +11,7 @@ import { PgKnowledgeStore } from './knowledge.ts';
 import { migrate } from './migrate.ts';
 import { PgPortabilityStore } from './portability.ts';
 import { PgSelectionStore } from './selection.ts';
+import { PgSessionsStore } from './sessions.ts';
 import { checkPgvector } from './vector.ts';
 
 export type PostgresStore = Store & { readonly kind: 'postgres'; readonly db: Db };
@@ -30,6 +31,7 @@ export function postgresStore(db: Db): PostgresStore {
     embeddings: new PgEmbeddingsStore(db),
     selection: new PgSelectionStore(db),
     codegraph: new PgCodeGraphStore(db),
+    sessions: new PgSessionsStore(db),
     ensureSchema: async () => {
       await migrate(db.pool, { embeddingDimensions: db.dims });
       await checkPgvector(db);

@@ -4,6 +4,7 @@
  */
 export const lessonHref = (id: string) => `#lessons/${encodeURIComponent(id)}`;
 export const inboxHref = (feedbackId: string) => `#inbox/${encodeURIComponent(feedbackId)}`;
+export const sessionHref = (sessionId: string) => `#sessions/${encodeURIComponent(sessionId)}`;
 
 /** The page part of the hash: `lessons` for `#lessons/l1`. */
 export const hashView = () => location.hash.slice(1).split('/')[0];

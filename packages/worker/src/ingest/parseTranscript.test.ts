@@ -57,6 +57,25 @@ describe('parseTranscript', () => {
     expect(s.turns[0].precedingAssistantText.endsWith('END')).toBe(true);
   });
 
+  test("the agent's reply after the last human turn is kept, redacted, as the session's final reply (not a turn)", () => {
+    const lines = [
+      { type: 'user', uuid: 'u0', sessionId: 's', timestamp: 't1', message: { content: 'deploy it' } },
+      { type: 'assistant', uuid: 'a1', sessionId: 's', timestamp: 't2', message: { content: [{ type: 'text', text: 'working on it' }] } },
+      { type: 'assistant', uuid: 'a2', sessionId: 's', timestamp: 't3', message: { content: [{ type: 'text', text: 'Deployed.\nDB_PASSWORD=hunter2EXAMPLE' }] } },
+    ].map((r) => JSON.stringify(r)).join('\n');
+    const [s] = parseTranscript(lines, 'f.jsonl');
+    expect(s.turns).toHaveLength(1);
+    expect(s.finalReply).toEqual({ text: expect.stringContaining('Deployed.'), ts: 't3' });
+    expect(s.finalReply!.text).not.toContain('hunter2EXAMPLE');
+    // A later human turn takes the reply in as its preceding text: there is no final reply then.
+    const more = lines + '\n' + JSON.stringify({ type: 'user', uuid: 'u1', sessionId: 's', timestamp: 't4', message: { content: 'thanks' } });
+    const [s2] = parseTranscript(more, 'f.jsonl');
+    expect(s2.turns[1].precedingAssistantText).toContain('Deployed.');
+    expect(s2.finalReply).toBeNull();
+    // The basic fixture ends on a human turn.
+    expect(parseTranscript(fixture('basic.jsonl'), 'basic.jsonl')[0].finalReply).toBeNull();
+  });
+
   test('Read and NotebookEdit map file paths', () => {
     const lines = [
       { type: 'assistant', uuid: 'a', sessionId: 's', timestamp: 't1', message: { content: [

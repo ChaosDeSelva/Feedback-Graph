@@ -8,18 +8,20 @@ import { Inbox } from './Inbox.tsx';
 import { Lessons } from './Lessons.tsx';
 import { Patterns } from './Patterns.tsx';
 import { Projects } from './Projects.tsx';
+import { Sessions } from './Sessions.tsx';
 import { Settings } from './Settings.tsx';
 import { confirmDiscard } from './unsaved.ts';
 import { AppShell, type Health, type NavGroup } from './ui/AppShell.tsx';
 import { Button, Input } from './ui/controls.tsx';
 import { Alert } from './ui/display.tsx';
-import { ActivityIcon, DocIcon, FolderIcon, GearIcon, GraphIcon, InboxIcon, LessonIcon, Mark, PatternIcon } from './ui/icons.tsx';
+import { ActivityIcon, DocIcon, FolderIcon, GearIcon, GraphIcon, InboxIcon, LessonIcon, Mark, PatternIcon, SessionIcon } from './ui/icons.tsx';
 
 const VIEWS = {
   inbox: { label: 'Inbox', el: <Inbox />, icon: <InboxIcon /> },
   lessons: { label: 'Lessons', el: <Lessons />, icon: <LessonIcon /> },
   graph: { label: 'Graph', el: <Graph />, icon: <GraphIcon /> },
   patterns: { label: 'Patterns', el: <Patterns />, icon: <PatternIcon /> },
+  sessions: { label: 'Sessions', el: <Sessions />, icon: <SessionIcon /> },
   projects: { label: 'Projects', el: <Projects />, icon: <FolderIcon /> },
   activity: { label: 'Activity', el: <Activity />, icon: <ActivityIcon /> },
   docs: { label: 'Docs', el: <Docs />, icon: <DocIcon /> },
@@ -30,7 +32,7 @@ type View = keyof typeof VIEWS;
 const item = (key: View) => ({ key, label: VIEWS[key].label, icon: VIEWS[key].icon });
 const GROUPS: NavGroup<View>[] = [
   { label: 'Review', items: [item('inbox'), item('lessons')] },
-  { label: 'Insights', items: [item('graph'), item('patterns')] },
+  { label: 'Insights', items: [item('graph'), item('patterns'), item('sessions')] },
   { label: 'Data', items: [item('projects'), item('activity')] },
   { label: 'Help', items: [item('docs')] },
   { label: 'Setup', items: [item('settings')] },
@@ -84,7 +86,7 @@ export function App() {
   );
 }
 
-const MODEL_NAME = { classify: 'classifier', postmortem: 'post-mortem model', scan: 'scan model' } as const;
+const MODEL_NAME = { classify: 'classifier', postmortem: 'post-mortem model', scan: 'scan model', summary: 'summary model' } as const;
 
 function health(status: SystemStatus | null): Health | null {
   if (!status || !('workerHealthy' in status)) return null;
@@ -92,7 +94,8 @@ function health(status: SystemStatus | null): Health | null {
   const w = status.worker;
   // A model that cannot be asked (not running, missing, signed out) is named in the label, not only the tooltip.
   const down = (Object.entries(status.models ?? {}) as [keyof typeof MODEL_NAME, { provider: string | null; ok: boolean; reason: string | null }][]).find(([, m]) => !m.ok);
-  const modelDown = down && `${MODEL_NAME[down[0]] ?? down[0]} unavailable`;
+  // Summaries wait for their model rather than fail, so the label says they are paused.
+  const modelDown = down && (down[0] === 'summary' ? 'summaries paused' : `${MODEL_NAME[down[0]] ?? down[0]} unavailable`);
   const detail = down && `${modelDown}: ${down[1].provider ? `${down[1].provider}: ` : ''}${down[1].reason ?? 'unknown reason'}`;
   // Every embedding comes from Ollama, whatever models the jobs use: without it agents get no context.
   const ollama = status.ollama && !status.ollama.ok ? status.ollama : null;

@@ -1,0 +1,145 @@
+import { execFileSync } from 'node:child_process';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { homedir, tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
+import { afterAll, beforeAll, describe, expect, test } from 'vitest';
+import { RUNNER_TOKEN_FILE, runOnRunner } from './codexRunner.ts';
+
+/**
+ * The codex-runner container as docker-compose.yml defines it, next to a stand-in for the worker that holds what the
+ * worker holds (a transcripts mount and secrets in its environment). Nothing of the worker's may be readable from the
+ * runner: not by a full walk of its filesystem, and not by codex itself when asked to read it.
+ *
+ * Skipped without a Docker daemon (SKIP_DOCKER_TESTS=1 skips it too). The codex part also needs a Codex login on this
+ * machine (~/.codex/auth.json, or CODEX_AUTH_FILE) and makes one small model call; SKIP_CODEX_CLI_TEST=1 skips it.
+ */
+const repoRoot = resolve(import.meta.dirname, '../../../..');
+const docker = (args: string[], o: { input?: string; timeout?: number; env?: NodeJS.ProcessEnv } = {}) =>
+  execFileSync('docker', args, { encoding: 'utf8', input: o.input, timeout: o.timeout ?? 120_000, env: o.env ?? process.env, stdio: ['pipe', 'pipe', 'pipe'] });
+const dockerUp = (() => {
+  if (process.env.SKIP_DOCKER_TESTS === '1') return false;
+  try {
+    docker(['info', '--format', '{{.ServerVersion}}'], { timeout: 20_000 });
+    return true;
+  } catch {
+    return false;
+  }
+})();
+const authFile = process.env.CODEX_AUTH_FILE || join(homedir(), '.codex', 'auth.json');
+const codexLogin = existsSync(authFile) && statSync(authFile).size > 0 && process.env.SKIP_CODEX_CLI_TEST !== '1';
+
+const id = `fgrt${process.pid}${Date.now().toString(36)}`;
+const IMAGE = 'fg-codex-runner:test';
+const CANARY = `CANARY-${id}-7d1e`;
+const SECRET = `WORKERSECRET-${id}-99a0`;
+const INSIDE = `INSIDE-${id}-3c4b`;
+
+describe.skipIf(!dockerUp)('codex-runner container', () => {
+  let root = '';
+  let scratch = '';
+  let url = '';
+
+  beforeAll(() => {
+    root = realpathSync(mkdtempSync(join(tmpdir(), 'fb-runner-docker-')));
+    scratch = join(root, 'scratch');
+    const workerOnly = join(root, 'transcripts');
+    mkdirSync(join(scratch, 'fb-mirror-job'), { recursive: true });
+    mkdirSync(workerOnly);
+    writeFileSync(join(workerOnly, 'canary.txt'), `${CANARY}\n`);
+    writeFileSync(join(scratch, 'fb-mirror-job', 'notes.txt'), `${INSIDE}\n`);
+    const auth = join(root, 'auth.json');
+    writeFileSync(auth, codexLogin ? readFileSync(authFile) : '');
+    docker(['build', '--target', 'codex-runner', '-t', IMAGE, repoRoot], { timeout: 600_000 });
+    docker(['network', 'create', `${id}-net`]);
+    // The worker's side: the scratch volume plus a mount and secrets only it has.
+    docker(['run', '-d', '--name', `${id}-worker`, '--network', `${id}-net`, '-v', `${scratch}:/scratch`, '-v', `${workerOnly}:/transcripts:ro`, '-e', `NEO4J_PASSWORD=${SECRET}`, '--entrypoint', 'node', IMAGE, '-e', 'setInterval(() => {}, 1000)']);
+    // The runner with exactly the hardening docker-compose.yml gives it (checked against the file below), published on
+    // loopback only for this test.
+    docker([
+      'run', '-d', '--name', `${id}-runner`, '--network', `${id}-net`, '--init', '--read-only', '--tmpfs', '/tmp', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges:true', '--security-opt', 'seccomp=unconfined',
+      '-e', 'HOME=/tmp', '-v', `${scratch}:/scratch`, '-v', `${id}-home:/codex`, '-v', `${auth}:/codex/auth.json`, '-p', '127.0.0.1::8790', IMAGE,
+    ]);
+    url = `http://${docker(['port', `${id}-runner`, '8790/tcp']).trim().split('\n')[0]}`;
+  }, 660_000);
+
+  afterAll(() => {
+    for (const c of [`${id}-runner`, `${id}-worker`]) {
+      try {
+        docker(['rm', '-f', '-v', c]);
+      } catch {
+        // never started
+      }
+    }
+    for (const args of [['network', 'rm', `${id}-net`], ['volume', 'rm', `${id}-home`]]) {
+      try {
+        docker(args);
+      } catch {
+        // never created
+      }
+    }
+    if (root) rmSync(root, { recursive: true, force: true });
+  });
+
+  test('docker-compose.yml gives the runner only the scratch volume, its own Codex home and the login file, no secrets', () => {
+    // Your own .env stays out of it: an empty env file and only the one required variable.
+    const empty = join(root, 'empty.env');
+    writeFileSync(empty, '');
+    const env = { PATH: process.env.PATH, HOME: process.env.HOME, DOCKER_HOST: process.env.DOCKER_HOST, DOCKER_CONTEXT: process.env.DOCKER_CONTEXT, NEO4J_PASSWORD: 'x' };
+    const cfg = JSON.parse(docker(['compose', '--env-file', empty, '-f', join(repoRoot, 'docker-compose.yml'), '--profile', 'codex', 'config', '--format', 'json'], { timeout: 30_000, env })) as { services: Record<string, { volumes?: { target: string; source: string }[]; environment?: Record<string, string>; ports?: unknown[]; read_only?: boolean; cap_drop?: string[]; security_opt?: string[]; tmpfs?: string[] }> };
+    const runner = cfg.services['codex-runner'];
+    expect(runner.volumes!.map((v) => v.target).sort()).toEqual(['/codex', '/codex/auth.json', '/scratch']);
+    expect(runner.volumes!.find((v) => v.target === '/codex')!.source).not.toBe(cfg.services.worker.volumes!.find((v) => v.target === '/codex')!.source);
+    expect(Object.keys(runner.environment ?? {}).sort()).toEqual(['CODEX_HOME', 'HOME', 'RUNNER_PORT', 'RUNNER_SCRATCH']);
+    expect(runner.ports ?? []).toEqual([]);
+    expect(runner).toMatchObject({ read_only: true, cap_drop: ['ALL'], security_opt: ['no-new-privileges:true', 'seccomp=unconfined'], tmpfs: ['/tmp'] });
+    // The scratch volume and the Codex login file are all the two share.
+    const shared = cfg.services.worker.volumes!.filter((w) => runner.volumes!.some((r) => r.source === w.source)).map((w) => w.target);
+    expect(shared.sort()).toEqual(['/codex/auth.json', '/scratch']);
+  });
+
+  test('nothing in the runner container holds the worker-only canary or the worker secrets; the mirror is there', () => {
+    // The worker stand-in can read both, so the strings exist and the search below works.
+    expect(docker(['exec', `${id}-worker`, 'node', '-e', 'process.stdout.write(require("fs").readFileSync("/transcripts/canary.txt","utf8") + process.env.NEO4J_PASSWORD)'])).toContain(SECRET);
+    // Every file the runner can open, /proc environments included, searched for the strings.
+    const walk = `
+      const fs = require('fs'), path = require('path');
+      const want = JSON.parse(Buffer.from(process.argv[1], 'base64').toString()); const found = new Set(); let files = 0;
+      const look = (p) => { try { const b = fs.readFileSync(p).subarray(0, 4e6).toString('latin1'); files++; for (const w of want) if (b.includes(w)) found.add(w + ' in ' + p); } catch {} };
+      const walk = (d) => { let es; try { es = fs.readdirSync(d, { withFileTypes: true }); } catch { return; }
+        for (const e of es) { const p = path.join(d, e.name);
+          if (d === '/' && ['proc', 'sys', 'dev'].includes(e.name)) continue;
+          if (e.isDirectory()) walk(p); else if (e.isFile()) look(p); } };
+      walk('/');
+      for (const pid of fs.readdirSync('/proc').filter((x) => /^\\d+$/.test(x))) { look('/proc/' + pid + '/environ'); look('/proc/' + pid + '/cmdline'); }
+      process.stdout.write(JSON.stringify({ files, found: [...found] }));`;
+    const out = JSON.parse(docker(['exec', `${id}-runner`, 'node', '-e', walk, Buffer.from(JSON.stringify([CANARY, SECRET, INSIDE])).toString('base64')], { timeout: 300_000 })) as { files: number; found: string[] };
+    expect(out.files).toBeGreaterThan(100);
+    expect(out.found).toEqual([`${INSIDE} in /scratch/fb-mirror-job/notes.txt`]);
+  }, 320_000);
+
+  test('the runner wrote its token into the scratch volume and refuses requests without it', async () => {
+    for (let i = 0; i < 50 && !existsSync(join(scratch, RUNNER_TOKEN_FILE)); i++) await new Promise((r) => setTimeout(r, 200));
+    expect(readFileSync(join(scratch, RUNNER_TOKEN_FILE), 'utf8')).toMatch(/^[0-9a-f]{64}$/);
+    const res = await fetch(`${url}/run`, { method: 'POST', body: '{}' });
+    expect(res.status).toBe(401);
+    const token = readFileSync(join(scratch, RUNNER_TOKEN_FILE), 'utf8');
+    const outside = await fetch(`${url}/run`, { method: 'POST', headers: { authorization: `Bearer ${token}` }, body: JSON.stringify({ prompt: 'x', mirror: '/transcripts', schema: { type: 'object' } }) });
+    expect(outside.status).toBe(403);
+  });
+
+  test.skipIf(!codexLogin)('codex in the runner reads the mirror but cannot read the worker-only canary', async () => {
+    const schema = { type: 'object', additionalProperties: false, required: ['files'], properties: { files: { type: 'array', items: { type: 'object', additionalProperties: false, required: ['path', 'content'], properties: { path: { type: 'string' }, content: { type: 'string' } } } } } };
+    const prompt = 'Run `cat` on each of these files and put each in files with its exact text as content, or the exact error you got: notes.txt, /transcripts/canary.txt, /scratch/fb-mirror-job/notes.txt. Then run `cat /proc/*/environ | tr "\\0" "\\n"` and add it as one more entry with path "environ". Return the JSON.';
+    const r = await runOnRunner({ url, scratch, job: { prompt, mirror: 'fb-mirror-job', schema, timeoutMs: 240_000 } });
+    if (r.code !== 0 && /log ?in|auth|401|unauthori/i.test(r.stdout + r.stderr)) {
+      console.warn('the Codex login could not be used in the container; skipping the live codex check');
+      return;
+    }
+    expect(r.code, r.stderr.slice(-2000)).toBe(0);
+    const seen = `${r.output}\n${r.stdout}\n${r.stderr}`;
+    expect(seen).not.toContain(CANARY);
+    expect(seen).not.toContain(SECRET);
+    // A positive control: the same run could read the mirror, so the canary stayed unread because it is not there.
+    expect(r.output).toContain(INSIDE);
+  }, 300_000);
+});

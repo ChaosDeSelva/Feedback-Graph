@@ -1,5 +1,5 @@
 import { beforeAll, beforeEach, expect, test } from 'vitest';
-import { runCloudSync } from './cloud.ts';
+import { runCloudSync, storedSyncMemory } from './cloud.ts';
 import type { CloudConfig } from './config.ts';
 import type { Store } from './store.ts';
 import { describeStores } from './testing/index.ts';
@@ -103,6 +103,27 @@ describeStores('cloud sync', (h) => {
     expect(bodies[1].withdrawn).toEqual([{ kind: 'doc', id: doc.id }]);
   });
 
+  test('what the cloud accepted is kept in the store: after a restart a removed doc is still withdrawn, and an unselected project is taken back out', async () => {
+    await seedSyncProject(store, 'blog', 'github.com/acme/blog', 'Blog lesson');
+    const bodies: { projectKey: string; lessons: unknown[]; withdrawn: { kind: string; id: string }[]; complete: boolean }[] = [];
+    const f = (async (_url: string, init: RequestInit) => {
+      bodies.push(JSON.parse(init.body as string));
+      return Response.json({ syncId: 's', org: 'acme', projects: [], lessons: { team: 0, suggested: 0, skipped: 0 }, misses: 0, facts: { files: 0, unchanged: 0 }, docs: 0 });
+    }) as unknown as typeof fetch;
+    // A fresh memory each run, as a restarted worker or the api's Sync now would have: only the store carries over.
+    const run = (projects: string[]) => runCloudSync({ cloud: fake, portability: store.portability, projects: async () => projects, trigger: 'manual', fetch: f, memory: storedSyncMemory(store.docs, fake) });
+    await run(['demo', 'blog']);
+    const [doc] = (await store.portability.exportData({ projectKey: 'demo' })).docs;
+    await store.docs.deleteDoc(doc.id);
+    const r = await run(['demo']);
+    expect(r.projects.map((p) => [p.key, p.status])).toEqual([['demo', 'sent'], ['blog', 'withdrawn']]);
+    expect(bodies[2]).toMatchObject({ projectKey: 'demo', withdrawn: [{ kind: 'doc', id: doc.id }] });
+    expect(bodies[3]).toMatchObject({ projectKey: 'blog', complete: true, lessons: [] });
+    expect(bodies[3].withdrawn.length).toBeGreaterThan(0);
+    await run(['demo']);
+    expect(bodies.slice(4).map((b) => b.projectKey)).toEqual(['demo']);
+  });
+
   // End to end against a running cloud (scripts/cloud-sync-e2e.sh starts one in Docker, makes an org and a token, and
   // sets these). Skipped otherwise: the open-source suite never needs the hosted service.
   const e2e = process.env.CLOUD_E2E_URL && process.env.CLOUD_E2E_TOKEN && process.env.CLOUD_E2E_ORG;
@@ -121,7 +142,14 @@ describeStores('cloud sync', (h) => {
     expect(json).not.toContain(`${title} (proposed)`);
     expect(json).not.toContain(FEEDBACK);
     // Sending the same bundle again changes nothing.
-    const again = await runCloudSync({ cloud, portability: store.portability, activity: store.activity, projects: async () => [`e2e-${h.kind}`], trigger: 'manual' });
+    const memory = storedSyncMemory(store.docs, cloud);
+    const again = await runCloudSync({ cloud, portability: store.portability, activity: store.activity, projects: async () => [`e2e-${h.kind}`], trigger: 'manual', memory });
     expect(again.projects[0]).toMatchObject({ status: 'sent', lessons: { team: 1 } });
+    // Unselected: its last, empty bundle takes the lesson back out of the team graph.
+    const gone = await runCloudSync({ cloud, portability: store.portability, activity: store.activity, projects: async () => [], trigger: 'manual', memory });
+    expect(gone.error).toBeNull();
+    expect(gone.projects[0]).toMatchObject({ key: `e2e-${h.kind}`, status: 'withdrawn' });
+    const after = await fetch(`${cloud.url}/api/v1/orgs/${org}/lessons?status=approved`, { headers: { authorization: `Bearer ${cloud.token}` } });
+    expect(JSON.stringify(await after.json())).not.toContain(title);
   });
 });

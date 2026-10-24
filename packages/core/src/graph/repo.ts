@@ -13,6 +13,9 @@ import type { GraphStore } from '../store.ts';
 import { candidateProvenance, matchReport, REPORT_MERGE_MINUTES } from '../dedupe.ts';
 import { MAX_POSTMORTEM_ATTEMPTS } from './knowledge.ts';
 import { SCHEMA } from './schema.ts';
+import { redactSecrets } from '../redact.ts';
+import { latestTime } from '../sessions.ts';
+import { refreshSessionStats } from './sessions.ts';
 
 export type ClassifiableTurn = HumanTurn & { projectKey: string };
 
@@ -93,7 +96,8 @@ export class GraphRepo implements GraphStore {
          SET p.name = $project.name, p.repoPath = $project.repoPath, p.remote = coalesce($project.remote, p.remote)
        MERGE (s:Session {id: $s.sessionId})
          SET s.sourceFile = $s.sourceFile, s.source = $source, s.cwd = $s.cwd, s.gitBranch = $s.gitBranch,
-             s.startedAt = $s.startedAt, s.endedAt = $s.endedAt
+             s.startedAt = $s.startedAt, s.endedAt = $s.endedAt,
+             s.finalReplyText = $finalReply.text, s.finalReplyTs = $finalReply.ts
        MERGE (s)-[:IN]->(p)
        WITH s
        UNWIND $turns AS t
@@ -103,8 +107,10 @@ export class GraphRepo implements GraphStore {
          MERGE (s)-[:HAS_TURN]->(turn)`,
       {
         project: { ...project, remote: project.remote ?? null },
-        s: { ...s, turns: undefined, toolCalls: undefined },
+        s: { ...s, turns: undefined, toolCalls: undefined, finalReply: undefined },
         source: s.source ?? 'claude',
+        // Redacted by the parser, and again here: it is stored like a turn's text.
+        finalReply: s.finalReply ? { text: redactSecrets(s.finalReply.text), ts: s.finalReply.ts } : { text: null, ts: null },
         turns: s.turns.map((t) => ({ ...t, toolCalls: JSON.stringify(t.precedingToolCalls), precedingToolCalls: undefined })),
       },
     );
@@ -117,6 +123,7 @@ export class GraphRepo implements GraphStore {
         { id: s.sessionId, commits },
       );
     }
+    await refreshSessionStats(this, s.sessionId, latestTime(s.endedAt, s.turns.at(-1)?.ts));
   }
 
   /**
@@ -340,15 +347,26 @@ export class GraphRepo implements GraphStore {
    * TURN_RETENTION_DAYS: drop the words of classified turns older than the cutoff that nothing points at.
    * Flagged turns and the turns around them stay (they are the evidence for candidates, feedback and post-mortems).
    */
-  async pruneTurnText(before: Date, limit = 5000): Promise<number> {
+  async pruneTurnText(before: Date, limit = 5000, o: { keepUnsummarized?: boolean } = {}): Promise<number> {
     const [r] = await this.run(
       `MATCH (s:Session)-[:HAS_TURN]->(t:Turn)
        WHERE t.ts < $before AND (t.label IS NOT NULL OR t.index = 0) AND t.text IS NOT NULL
          AND NOT EXISTS { MATCH (s)-[:HAS_TURN]->(:Turn)<-[:FLAGS]-(:Candidate) }
+         AND (NOT $keepUnsummarized OR (t.index <= s.summarizedThroughIndex AND NOT coalesce(s.summaryRebuild, false)))
        WITH t LIMIT $limit
        SET t.text = null, t.precedingAssistantText = null, t.toolCalls = '[]', t.prunedAt = $now
        RETURN count(t) AS n`,
-      { before: before.toISOString(), limit: neo4j.int(limit), now: new Date().toISOString() },
+      { before: before.toISOString(), limit: neo4j.int(limit), now: new Date().toISOString(), keepUnsummarized: !!o.keepUnsummarized },
+    );
+    // The agent's final reply goes with the session's turns: once the whole session is older than the cutoff, nothing
+    // flagged it, and (keepUnsummarized) a summary covers its last turn.
+    await this.run(
+      `MATCH (s:Session) WHERE s.finalReplyText IS NOT NULL AND s.lastActivityAt < $before
+         AND NOT EXISTS { MATCH (s)-[:HAS_TURN]->(:Turn)<-[:FLAGS]-(:Candidate) }
+         AND (NOT $keepUnsummarized OR (s.lastTurnIndex <= s.summarizedThroughIndex AND NOT coalesce(s.summaryRebuild, false)))
+       WITH s LIMIT $limit
+       SET s.finalReplyText = null, s.finalReplyTs = null`,
+      { before: before.toISOString(), limit: neo4j.int(limit), keepUnsummarized: !!o.keepUnsummarized },
     );
     return r?.get('n') ?? 0;
   }

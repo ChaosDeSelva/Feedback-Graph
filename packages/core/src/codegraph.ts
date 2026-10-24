@@ -91,6 +91,26 @@ export type Impact = {
 
 /** Where agents keep getting corrected: churn, misses and dependents of a file, and the score they make. */
 export type Hotspot = { path: string; churn: number; misses: number; dependents: number; score: number };
+/** includeTests: rank test files too (by default they are left out: a busy test file is rarely where agents struggle). */
+export type HotspotOpts = { includeTests?: boolean };
+
+/**
+ * The code map drawn as a graph: the top `limit` files by hotspot score (tests left out unless included), their
+ * direct neighbours by import or test edge (at most `limit` more, highest score first), the edges among them, and the
+ * misses and approved lessons tied to those files.
+ */
+export type MapGraph = {
+  files: (Hotspot & { lang: string; loc: number; isTest: boolean; /** One of the top files, not a neighbour. */ top: boolean })[];
+  /** File-to-file imports among the files (packages left out). */
+  imports: { from: string; to: string }[];
+  tests: { test: string; target: string }[];
+  /** paths: the files of the graph its session edited. */
+  misses: FileMiss[];
+  /** paths: the files of the graph it bears on. */
+  lessons: { id: string; title: string; paths: string[] }[];
+  /** How much was left out: files that could have been top files, and neighbours found. */
+  cap: { limit: number; eligible: number; neighbors: number; neighborsFound: number };
+};
 
 // ── Paths ──────────────────────────────────────────────────────────────
 
@@ -319,6 +339,8 @@ export interface CodeGraphReads {
   importerCounts(projectKey: string): Promise<Map<string, number>>;
   /** Misses of the project (feedback not rejected) whose session edited a file, for these paths or all of them. */
   missesOn(projectKey: string, paths: string[] | null): Promise<FileMissRow[]>;
+  /** File-to-file IMPORTS and TESTS edges with either end among the paths, sorted. */
+  edgesTouching(projectKey: string, paths: string[]): Promise<{ imports: { from: string; to: string }[]; tests: { test: string; target: string }[] }>;
   /** Approved lessons for the project, global ones included. */
   approvedLessons(projectKey: string): Promise<Lesson[]>;
   currentFacts(projectKey: string, path: string): Promise<StoredFact[]>;
@@ -360,6 +382,23 @@ export function codeGraphViews(r: CodeGraphReads) {
     const isTest = new Set((await r.mapFiles(projectKey, files)).filter((f) => f.isTest).map((f) => f.path));
     const covering = await r.testsOf(projectKey, files);
     return [...new Set([...files.filter((p) => isTest.has(p)), ...covering])].sort(cmp);
+  };
+  /** Every mapped file with its hotspot numbers, highest score first (ties by path), and the miss rows they came from. */
+  const scored = async (projectKey: string) => {
+    const [files, counts, rows] = await Promise.all([r.mapFiles(projectKey), r.importerCounts(projectKey), r.missesOn(projectKey, null)]);
+    const missCount = new Map<string, Set<string>>();
+    for (const m of rows) {
+      let s = missCount.get(m.path);
+      if (!s) missCount.set(m.path, (s = new Set()));
+      s.add(m.missId);
+    }
+    const ranked = files
+      .map((f) => {
+        const parts = { churn: f.churn?.commits ?? 0, misses: missCount.get(f.path)?.size ?? 0, dependents: counts.get(f.path) ?? 0 };
+        return { path: f.path, ...parts, score: hotspotScore(parts), lang: f.lang, loc: f.loc, isTest: f.isTest };
+      })
+      .sort((a, b) => b.score - a.score || cmp(a.path, b.path));
+    return { ranked, rows };
   };
   const views = {
     async moduleContext(projectKey: string, path: string): Promise<ModuleContext | null> {
@@ -403,27 +442,43 @@ export function codeGraphViews(r: CodeGraphReads) {
       };
     },
 
-    async hotspots(projectKey: string, limit: number): Promise<Hotspot[]> {
-      const [files, counts, rows] = await Promise.all([r.mapFiles(projectKey), r.importerCounts(projectKey), r.missesOn(projectKey, null)]);
-      const missCount = new Map<string, Set<string>>();
-      for (const m of rows) {
-        let s = missCount.get(m.path);
-        if (!s) missCount.set(m.path, (s = new Set()));
-        s.add(m.missId);
-      }
-      return files
-        .map((f) => {
-          const parts = { churn: f.churn?.commits ?? 0, misses: missCount.get(f.path)?.size ?? 0, dependents: counts.get(f.path) ?? 0 };
-          return { path: f.path, ...parts, score: hotspotScore(parts) };
-        })
-        .sort((a, b) => b.score - a.score || cmp(a.path, b.path))
-        .slice(0, Math.max(0, limit));
+    async hotspots(projectKey: string, limit: number, opts: HotspotOpts = {}): Promise<Hotspot[]> {
+      const { ranked } = await scored(projectKey);
+      return ranked
+        .filter((h) => opts.includeTests || !h.isTest)
+        .slice(0, Math.max(0, limit))
+        .map(({ path, churn, misses, dependents, score }) => ({ path, churn, misses, dependents, score }));
+    },
+
+    async mapGraph(projectKey: string, opts: HotspotOpts & { limit: number }): Promise<MapGraph> {
+      const limit = Math.max(0, Math.floor(opts.limit));
+      const { ranked, rows } = await scored(projectKey);
+      const eligible = ranked.filter((h) => opts.includeTests || !h.isTest);
+      const top = eligible.slice(0, limit);
+      const topPaths = new Set(top.map((h) => h.path));
+      const edges = top.length ? await r.edgesTouching(projectKey, [...topPaths]) : { imports: [], tests: [] };
+      const near = new Set<string>();
+      for (const e of edges.imports) for (const p of [e.from, e.to]) if (!topPaths.has(p)) near.add(p);
+      for (const e of edges.tests) for (const p of [e.test, e.target]) if (!topPaths.has(p)) near.add(p);
+      // ranked is in score order, so the neighbours kept are the hottest ones.
+      const neighbors = ranked.filter((h) => near.has(h.path)).slice(0, limit);
+      const shown = new Set([...topPaths, ...neighbors.map((h) => h.path)]);
+      const misses = groupMisses(rows.filter((m) => shown.has(m.path)));
+      const lessons = lessonsFor(await r.approvedLessons(projectKey), [...shown].sort(cmp), misses);
+      return {
+        files: [...top, ...neighbors].map((h) => ({ ...h, top: topPaths.has(h.path) })),
+        imports: edges.imports.filter((e) => shown.has(e.from) && shown.has(e.to)),
+        tests: edges.tests.filter((e) => shown.has(e.test) && shown.has(e.target)),
+        misses,
+        lessons: lessons.map(({ lesson, paths }) => ({ id: lesson.id, title: lesson.title, paths: paths.filter((p) => shown.has(p)) })).filter((l) => l.paths.length),
+        cap: { limit, eligible: eligible.length, neighbors: neighbors.length, neighborsFound: near.size },
+      };
     },
 
     /** The export's view of a project's map: each file with its hotspot numbers, by path. */
     async exportFiles(projectKey: string): Promise<ExportCodeFile[]> {
       const files = await r.mapFiles(projectKey);
-      const hot = new Map((await views.hotspots(projectKey, files.length)).map((x) => [x.path, x]));
+      const hot = new Map((await views.hotspots(projectKey, files.length, { includeTests: true })).map((x) => [x.path, x]));
       return files.map((f) => {
         const { path: _, ...h } = hot.get(f.path)!;
         return { projectKey, path: f.path, lang: f.lang, loc: f.loc, isTest: f.isTest, ...h };

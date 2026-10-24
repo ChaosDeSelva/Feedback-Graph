@@ -127,6 +127,25 @@ test('CLI providers get only the env they need, never other keys or the graph pa
   expect(disallowed).toContain('Read(//proc/**)');
 });
 
+test('a CLI provider given no folder runs in a fresh empty one, never the process folder, removed afterwards', async () => {
+  const { readdir, stat, writeFile } = await import('node:fs/promises');
+  const seen: { cwd: string; files: string[] }[] = [];
+  const exec: Exec = async (_c, args, o) => {
+    seen.push({ cwd: o.cwd, files: await readdir(o.cwd) });
+    const out = args.indexOf('-o') >= 0 ? args[args.indexOf('-o') + 1] : null;
+    if (out) await writeFile(out, '{"answer":"x"}');
+    return { code: 0, stdout: JSON.stringify({ structured_output: { answer: 'c' } }), stderr: '' };
+  };
+  await makeProvider('claude-cli', { CLAUDE_CODE_OAUTH_TOKEN: 't' }, { exec }).json(task);
+  await makeProvider('codex-cli', CODEX_OK, { exec }).json(task);
+  expect(seen).toHaveLength(2);
+  for (const { cwd, files } of seen) {
+    expect(cwd).not.toBe(process.cwd());
+    expect(files).toEqual([]);
+    await expect(stat(cwd)).rejects.toThrow();
+  }
+});
+
 test('unknown providers and missing keys fail loudly', () => {
   expect(() => makeProvider('magic:x', {})).toThrow(/unknown provider/);
   expect(() => makeProvider('openai:gpt', {})).toThrow(/OPENAI_API_KEY/);

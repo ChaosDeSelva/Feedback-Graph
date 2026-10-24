@@ -1,6 +1,6 @@
 import { readdir, readFile, stat } from 'node:fs/promises';
 import { join, relative, sep } from 'node:path';
-import type { ActivityStore, LessonInput } from '@fb/core';
+import { keyOfRel, type ActivityStore, type LessonInput } from '@fb/core';
 import type { FileState } from '../state.ts';
 
 export type MemoryNote = { name: string; description: string; type: string; body: string };
@@ -30,11 +30,15 @@ export function projectKeyForDir(dirName: string, hostRoot: string, keys: string
   return best;
 }
 
-/** The project key a transcripts dir maps to under any root (the longest match), or null. */
+/**
+ * The project key a transcripts dir maps to under any root (the longest match, so the deepest nested repo), or null.
+ * `keys` are the project folders relative to their root (a nested repo's path, e.g. github.com/org/repo).
+ */
 function keyForDir(dir: string, roots: { host: string; keys: string[] }[]): string | null {
-  return roots
+  const rel = roots
     .map((r) => projectKeyForDir(dir, r.host, r.keys))
     .reduce<string | null>((best, k) => (k && (!best || k.length > best.length) ? k : best), null);
+  return rel && keyOfRel(rel);
 }
 
 /** The project a memory file (<transcriptsDir>/<dir>/memory/<file>) is imported for, or null. */
@@ -47,7 +51,7 @@ export function memoryProjectKey(path: string, transcriptsDir: string, roots: { 
 
 export type MemoryDeps = {
   transcriptsDir: string;
-  /** Each project root on the host and the project keys under it. */
+  /** Each project root on the host and the project folders under it (relative paths: a nested repo's has a /). */
   roots(): Promise<{ host: string; keys: string[] }[]>;
   /** INGEST_PROJECTS: when set, memories of other projects are left alone. */
   includeProject?: (key: string) => boolean;

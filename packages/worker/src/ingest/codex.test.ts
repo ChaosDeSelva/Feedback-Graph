@@ -39,6 +39,18 @@ describe('parseCodexSession: current format', () => {
     expect(s.toolCalls).toHaveLength(5);
   });
 
+  test("the agent's answer after the last human turn is the session's final reply, redacted, and not a turn", () => {
+    const [s] = parse('normal.jsonl');
+    expect(s.finalReply).toEqual({ text: 'Moved filtering to the API.', ts: ts(12) });
+    const p = codexSessionParser('/codex/x.jsonl');
+    for (const l of fixture('normal.jsonl').split('\n')) p.push(l);
+    p.push(JSON.stringify({ timestamp: ts(20), type: 'response_item', payload: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'Also set:\nDB_PASSWORD=hunter2EXAMPLE' }] } }));
+    const [s2] = p.finish();
+    expect(s2.turns).toHaveLength(2);
+    expect(s2.finalReply!.ts).toBe(ts(20));
+    expect(s2.finalReply!.text).not.toContain('hunter2EXAMPLE');
+  });
+
   test('turn uuids are stable across re-parses', () => {
     const a = parse('normal.jsonl')[0].turns.map((t) => t.uuid);
     const b = parse('normal.jsonl')[0].turns.map((t) => t.uuid);
