@@ -12,7 +12,7 @@
 - **PR descriptions and Linear tickets are read as context.** A comment's Inbox item and its post-mortem show the pull request's description, or the ticket's description, state, priority, labels and assignee.
 
 ### Fixed
-- A comment is linked only to an agent session that did the work (edited files or ran `git commit`), not one that only read the repo. Transcripts are re-read once to record this.
+- A comment is linked only to an agent session that did the work (edited files or ran `git commit`), not one that only read the repo. Transcripts are re-read once to record this. Postgres adds migration `0015_session_work.sql`.
 - **Ticket and PR text cannot pose as instructions to the post-mortem.** Descriptions are fenced as untrusted, and lines in them (or in comments) that start like the prompt's own section markers are quoted. Ticket state, priority, assignee and labels are redacted and capped like the description.
 
 ## 0.4.3 (2026-10-24)
