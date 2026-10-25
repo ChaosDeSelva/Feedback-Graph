@@ -32,6 +32,8 @@ export const SCHEMA = [
   'CREATE INDEX codefile_project IF NOT EXISTS FOR (n:CodeFile) ON (n.projectKey)',
   // The map's files (`{projectKey} WHERE inMap = true`): most CodeFile nodes of a scanned project are not in its map.
   'CREATE INDEX codefile_project_inmap IF NOT EXISTS FOR (n:CodeFile) ON (n.projectKey, n.inMap)',
+  // The import index past the cap (`WHERE inIndex = true`): files a capped map left out, with their edges.
+  'CREATE INDEX codefile_project_inindex IF NOT EXISTS FOR (n:CodeFile) ON (n.projectKey, n.inIndex)',
   'CREATE INDEX scanjob_status IF NOT EXISTS FOR (n:ScanJob) ON (n.status)',
   `CREATE VECTOR INDEX fact_embedding IF NOT EXISTS FOR (n:Fact) ON n.embedding
      OPTIONS {indexConfig: {\`vector.dimensions\`: 768, \`vector.similarity_function\`: 'cosine'}}`,

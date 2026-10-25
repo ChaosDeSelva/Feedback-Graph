@@ -1,4 +1,4 @@
-import { shownProjects, type ProjectLink, type ProjectSummary } from '@fb/core';
+import { SCANNER_VERSION, shownProjects, type ProjectLink, type ProjectSummary } from '@fb/core';
 import { expect, test } from 'vitest';
 import { createApp, type ApiRepo } from './app.ts';
 
@@ -81,8 +81,35 @@ test('GET /api/projects/:key/facts lists, or searches when q is given', async ()
   const { app, calls } = setup();
   await app.request('/api/projects/alpha/facts?kind=convention');
   await app.request('/api/projects/alpha/facts?q=auth');
-  expect(calls[0]).toEqual(['list', { projectKey: 'alpha', kind: 'convention', limit: 500 }]);
+  // One more than the page, so the response can say there is more.
+  expect(calls[0]).toEqual(['list', { projectKey: 'alpha', kind: 'convention', limit: 501, offset: 0 }]);
   expect(calls[1]).toEqual(['search', { embedding: [1], projectKey: 'alpha', k: 30 }]);
+});
+
+test('GET /api/projects/:key/facts pages (limit, offset, X-Next-Offset), filters by origin, and never serves the constant confidence', async () => {
+  const { app } = setup();
+  const stored = Array.from({ length: 5 }, (_, i) => ({ id: `f${i}`, kind: 'api', statement: `s${i}`, path: 'a.ts', lines: null, confidence: 1, why: '', origin: 'model' }));
+  const seen: object[] = [];
+  const facts = {
+    listProjects: async () => [summary('alpha', 5)], requestScan: async () => ({}) as never,
+    listFacts: async (q: { limit?: number; offset?: number }) => { seen.push(q); return stored.slice(q.offset ?? 0, (q.offset ?? 0) + (q.limit ?? 500)); },
+    searchFacts: async () => [{ fact: stored[0], score: 0.9 }],
+  };
+  const paged = createApp(repo, { facts: facts as never, embed: async (t) => t.map(() => [1]), projectDirs: async () => [] });
+  const first = await paged.request('/api/projects/alpha/facts?limit=2&origin=model');
+  expect(seen[0]).toEqual({ projectKey: 'alpha', origin: 'model', limit: 3, offset: 0 });
+  expect(first.headers.get('x-next-offset')).toBe('2');
+  const rows = (await first.json()) as Record<string, unknown>[];
+  expect(rows.map((r) => r.id)).toEqual(['f0', 'f1']);
+  expect(rows.every((r) => !('confidence' in r))).toBe(true);
+  const last = await paged.request('/api/projects/alpha/facts?limit=2&offset=4');
+  expect(last.headers.get('x-next-offset')).toBeNull();
+  expect(((await last.json()) as unknown[]).length).toBe(1);
+  const hits = (await (await paged.request('/api/projects/alpha/facts?q=auth')).json()) as { fact: Record<string, unknown> }[];
+  expect('confidence' in hits[0].fact).toBe(false);
+  expect((await paged.request('/api/projects/alpha/facts?origin=nope')).status).toBe(400);
+  expect((await paged.request('/api/projects/alpha/facts?limit=5000')).status).toBe(400);
+  expect((await app.request('/api/projects/alpha/facts?offset=-1')).status).toBe(400);
 });
 
 test('PATCH /api/projects/:key/facts/:id/relevance sets your relevance for a fact of that project, and logs it', async () => {
@@ -141,3 +168,21 @@ test('GET /api/projects leaves the link count out when there is no links store',
   const list = (await (await app.request('/api/projects')).json()) as ProjectSummary[];
   expect(list[0].links).toBeUndefined();
 });
+
+test('GET /api/projects counts the files an older scanner read (the next scan you start reads them again); none: absent', async () => {
+  const asked: string[] = [];
+  const withOlder = createApp(repo, {
+    facts: { ...plainFacts(), olderScannerFiles: async (v: string) => { asked.push(v); return new Map([['alpha', 12], ['hidden', 3]]); } },
+    projectDirs: async () => [{ key: 'alpha', name: 'alpha', repoPath: '/vibe/alpha' }, { key: 'beta', name: 'beta', repoPath: '/vibe/beta' }],
+  });
+  const list = (await (await withOlder.request('/api/projects')).json()) as ProjectSummary[];
+  expect(list.map((p) => [p.key, p.olderScanner])).toEqual([['alpha', 12], ['beta', undefined]]);
+  expect(asked).toEqual([SCANNER_VERSION]);
+  // A store without the count: nothing is said.
+  const { app } = setup();
+  expect(((await (await app.request('/api/projects')).json()) as ProjectSummary[]).every((p) => p.olderScanner === undefined)).toBe(true);
+});
+
+function plainFacts() {
+  return { listProjects: async () => [summary('alpha', 5)], requestScan: async () => ({}) as never, listFacts: async () => [], searchFacts: async () => [] };
+}

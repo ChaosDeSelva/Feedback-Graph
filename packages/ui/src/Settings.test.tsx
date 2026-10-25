@@ -67,6 +67,41 @@ afterEach(() => { cleanup(); vi.unstubAllGlobals(); });
 const rowOf = (key: string) => screen.getByRole('row', { name: key });
 const box = (key: string) => screen.getByRole('checkbox', { name: `read ${key}` }) as HTMLInputElement;
 const shown = () => screen.queryAllByRole('checkbox').map((c) => c.getAttribute('aria-label')!.replace('read ', ''));
+const openTab = async (name: string) => fireEvent.click(await screen.findByRole('tab', { name }));
+afterEach(() => { history.replaceState(null, '', '#'); });
+
+test('Settings is split into tabs: Projects first, each other tab one click away and kept in the address', async () => {
+  render(<Settings />);
+  const tabs = await screen.findByRole('tablist', { name: 'settings sections' });
+  expect(within(tabs).getAllByRole('tab').map((t) => t.textContent)).toEqual(['Projects', 'Integrations', 'Cloud sync', 'Clean up']);
+  expect(screen.getByRole('tab', { name: 'Projects' }).getAttribute('aria-selected')).toBe('true');
+  await screen.findByRole('row', { name: 'demo-shop' });
+  await openTab('Clean up');
+  expect(screen.getByRole('tab', { name: 'Clean up' }).getAttribute('aria-selected')).toBe('true');
+  expect(screen.getByRole('region', { name: 'Clean up' })).toBeTruthy();
+  expect(screen.queryByRole('row', { name: 'demo-shop' })).toBeNull();
+  expect(location.hash).toBe('#settings/cleanup');
+});
+
+test('a link to a card opens the tab that holds it', async () => {
+  history.replaceState(null, '', '#settings/integrations-linear');
+  render(<Settings />);
+  expect((await screen.findByRole('tab', { name: 'Integrations' })).getAttribute('aria-selected')).toBe('true');
+  cleanup();
+  history.replaceState(null, '', '#settings/cleanup');
+  render(<Settings />);
+  expect((await screen.findByRole('tab', { name: 'Clean up' })).getAttribute('aria-selected')).toBe('true');
+});
+
+test('unsaved folder changes stay in the bar while another tab is open', async () => {
+  render(<Settings />);
+  await screen.findByRole('row', { name: 'demo-shop' });
+  fireEvent.click(box('other'));
+  await openTab('Cloud sync');
+  expect(within(screen.getByRole('region', { name: 'unsaved selection' })).getByText('+1 added')).toBeTruthy();
+  await openTab('Projects');
+  expect(box('other').checked).toBe(true);
+});
 
 test('the comments skipped before the classifier are listed right under Integrations, where comments are set up', async () => {
   const base = fetch as unknown as (url: string, init?: RequestInit) => Promise<Response>;
@@ -76,9 +111,9 @@ test('the comments skipped before the classifier are listed right under Integrat
       : url === '/api/cloud' ? Response.json({ enabled: false, host: null, intervalMinutes: 60, suggestions: false, projects: [], preview: null, previewError: null, last: null, nextAt: null, neverSent: 'x' })
       : base(url, init)));
   render(<Settings />);
+  await openTab('Integrations');
   const rules = await screen.findByRole('list', { name: 'comments skipped before the classifier' });
   const section = rules.closest('section')!;
-  await screen.findByText('Cloud sync');
   await waitFor(() => expect(section.previousElementSibling?.id).toBe('settings-integrations-section'));
 });
 
@@ -191,6 +226,7 @@ test('Cancel puts the saved selection back', async () => {
 test('clean up lists unselected projects with data and needs the typed confirm', async () => {
   render(<Settings />);
   await screen.findByRole('row', { name: 'demo-shop' });
+  await openTab('Clean up');
   const section = within(screen.getByRole('region', { name: 'Clean up' }));
   expect(section.getByText('other')).toBeTruthy();
   fireEvent.click(section.getByRole('button', { name: 'Remove data for 1 unselected project' }));
@@ -211,6 +247,7 @@ test('clean up lists unselected projects with data and needs the typed confirm',
 test('cancelling clean up removes nothing', async () => {
   render(<Settings />);
   await screen.findByRole('row', { name: 'demo-shop' });
+  await openTab('Clean up');
   fireEvent.click(within(screen.getByRole('region', { name: 'Clean up' })).getByRole('button', { name: 'Remove data for 1 unselected project' }));
   fireEvent.click(within(await screen.findByRole('alertdialog')).getByRole('button', { name: 'Cancel' }));
   await waitFor(() => expect(screen.queryByRole('alertdialog')).toBeNull());
@@ -221,6 +258,7 @@ test('clean up is disabled when every project with data is selected', async () =
   state = body({ tracked: ['demo-shop', 'other'] });
   render(<Settings />);
   await screen.findByRole('row', { name: 'demo-shop' });
+  await openTab('Clean up');
   const section = within(screen.getByRole('region', { name: 'Clean up' }));
   expect((section.getByRole('button', { name: /Remove data for 0/ }) as HTMLButtonElement).disabled).toBe(true);
 });
@@ -230,6 +268,7 @@ test('clean up does not offer data filed under a clone of a selected project', a
   state.candidates = state.candidates.map((c) => (c.key === 'shop-copy' ? { ...c, hasData: true } : c));
   render(<Settings />);
   await screen.findByRole('row', { name: 'demo-shop' });
+  await openTab('Clean up');
   const section = within(screen.getByRole('region', { name: 'Clean up' }));
   expect((section.getByRole('button', { name: /Remove data for 0/ }) as HTMLButtonElement).disabled).toBe(true);
 });
@@ -368,6 +407,7 @@ test('labels people read never use the icon-only faint colour', async () => {
 
 test('lists the rules that skip GitHub and Linear comments before the classifier', async () => {
   render(<Settings />);
+  await openTab('Integrations');
   const rules = await screen.findByRole('list', { name: 'comments skipped before the classifier' });
   expect(within(rules).getByText('pr-author-reply')).toBeTruthy();
 });

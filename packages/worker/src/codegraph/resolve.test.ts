@@ -3,7 +3,7 @@ import { makeResolver } from './resolve.ts';
 
 /** A repo as path -> content; files with no interesting content get ''. */
 const resolver = (files: Record<string, string>) => makeResolver(Object.keys(files), (p) => files[p]);
-const tos = (r: { to: string }[]) => r.map((x) => x.to);
+const tos = (r: { to: string | null }[]) => r.map((x) => x.to);
 
 test('relative TS/JS imports: extensions, index files, the .js -> .ts ESM convention, JSON', () => {
   const r = resolver({
@@ -135,7 +135,8 @@ test('Python: relative imports, package-absolute imports, src layouts, submodule
   expect(tos(leaf('ns', ['inner']))).toEqual(['ns/inner.py']); // namespace package
   expect(tos(leaf('os.path', ['*']))).toEqual(['pkg:os']);
   expect(tos(leaf('....toofar', ['x']))).toEqual([]);
-  expect(tos(leaf('.nope', ['x']))).toEqual([]);
+  // A relative import that names no file is counted as unresolved, with no edge.
+  expect(leaf('.nope', ['x'])).toEqual([{ to: null, names: ['x'], unresolved: true }]);
   expect(tos(r('scripts/run.py', 'python', { spec: 'helper', names: ['*'] }))).toEqual(['scripts/helper.py']);
 });
 
@@ -233,4 +234,65 @@ test('GDScript: res:// paths from the folder holding project.godot, relative pat
   expect(at('game/actors/player.gd', 'Player')).toEqual([]); // never itself
   // Without a project.godot above it, res:// is the repo root.
   expect(at('loose.gd', 'res://game/main.gd')).toEqual(['game/main.gd']);
+});
+
+test('a monorepo with @acme-core/* aliases: extends chains through a workspace package, per-package tsconfigs, workspace names', () => {
+  const json = (v: unknown) => JSON.stringify(v);
+  const r = resolver({
+    'package.json': json({ name: 'acme', private: true, workspaces: ['apps/*', 'packages/*'], devDependencies: { typescript: '5' } }),
+    'tsconfig.base.json': `{
+      // shared by every app and package
+      "compilerOptions": { "baseUrl": ".", "paths": { "@acme-core/*": ["packages/acme-core/src/*"], "@acme-core/ui": ["packages/ui/src/index.ts"] } },
+    }`,
+    // apps/web -> @acme/tsconfig/nextjs.json -> ../../tsconfig.base.json: three configs, the paths in the last one
+    'packages/tsconfig/package.json': json({ name: '@acme/tsconfig' }),
+    'packages/tsconfig/nextjs.json': json({ extends: '../../tsconfig.base.json', compilerOptions: { jsx: 'preserve' } }),
+    'apps/web/tsconfig.json': json({ extends: '@acme/tsconfig/nextjs.json', compilerOptions: { plugins: [{ name: 'next' }] } }),
+    'apps/web/src/chat/markdown.tsx': '',
+    'packages/acme-core/src/markdown/pipeline.ts': '',
+    'packages/acme-core/src/markdown/legacy-threads.ts': '',
+    // a package with its own tsconfig: its paths replace the base ones, relative to its own baseUrl
+    'packages/acme-core/tsconfig.json': json({ extends: '../../tsconfig.base.json', compilerOptions: { baseUrl: '.', paths: { '~/*': ['./src/*'], '@acme-core/*': ['./src/*'] } } }),
+    'packages/acme-core/src/agent/render.ts': '',
+    'packages/ui/package.json': json({ name: '@acme-core/ui-kit' }),
+    'packages/ui/src/index.ts': '',
+    // workspace packages by name, with subpath exports; an alias pattern that names no file falls through to them
+    'packages/db/package.json': json({ name: '@acme-core/db', exports: { '.': './src/index.ts', './*': './src/*.ts' } }),
+    'packages/db/src/index.ts': '', 'packages/db/src/client.ts': '',
+    'apps/api/package.json': json({ name: '@acme/api', dependencies: { '@acme-core/db': 'workspace:*', hono: '4' } }),
+    'apps/api/src/routes/agent.ts': '',
+  });
+  const at = (from: string, spec: string) => r(from, 'typescript', { spec, names: [] });
+  expect(tos(at('apps/web/src/chat/markdown.tsx', '@acme-core/markdown/pipeline'))).toEqual(['packages/acme-core/src/markdown/pipeline.ts']);
+  expect(tos(at('apps/web/src/chat/markdown.tsx', '@acme-core/ui'))).toEqual(['packages/ui/src/index.ts']);
+  expect(tos(at('packages/acme-core/src/agent/render.ts', '~/markdown/legacy-threads'))).toEqual(['packages/acme-core/src/markdown/legacy-threads.ts']);
+  expect(tos(at('packages/acme-core/src/agent/render.ts', '@acme-core/markdown/pipeline'))).toEqual(['packages/acme-core/src/markdown/pipeline.ts']);
+  expect(tos(at('apps/api/src/routes/agent.ts', '@acme-core/db'))).toEqual(['packages/db/src/index.ts']);
+  expect(tos(at('apps/api/src/routes/agent.ts', '@acme-core/db/client'))).toEqual(['packages/db/src/client.ts']);
+  expect(tos(at('apps/api/src/routes/agent.ts', '@acme-core/markdown/legacy-threads'))).toEqual(['packages/acme-core/src/markdown/legacy-threads.ts']);
+  expect(at('apps/api/src/routes/agent.ts', 'hono')).toEqual([{ to: 'pkg:hono', names: [] }]);
+  // Under the alias but no such file: counted, not taken for a package.
+  expect(at('apps/web/src/chat/markdown.tsx', '@acme-core/nothing/here')).toEqual([{ to: 'pkg:@acme-core/nothing', names: [], unresolved: true }]);
+});
+
+test('Python in a monorepo: service packages, src layouts and relative imports resolve; local-looking misses are counted', () => {
+  const r = resolver({
+    'services/billing/pyproject.toml': '', 'services/billing/billing/__init__.py': '', 'services/billing/billing/event_handlers.py': '',
+    'services/billing/billing/api.py': '', 'services/billing/tests/test_handlers.py': '',
+    'services/search/pyproject.toml': '', 'services/search/src/search/__init__.py': '', 'services/search/src/search/index.py': '',
+    'services/search/tests/test_index.py': '',
+    'tools/logging/__init__.py': '', 'tools/run.py': '',
+  });
+  const at = (from: string, spec: string, names: string[]) => r(from, 'python', { spec, names });
+  expect(tos(at('services/billing/billing/api.py', 'billing.event_handlers', ['handle']))).toEqual(['services/billing/billing/event_handlers.py']);
+  expect(tos(at('services/billing/billing/api.py', 'billing', ['event_handlers']))).toEqual(['services/billing/billing/event_handlers.py']);
+  expect(tos(at('services/billing/billing/api.py', '.event_handlers', ['handle']))).toEqual(['services/billing/billing/event_handlers.py']);
+  expect(tos(at('services/billing/tests/test_handlers.py', 'billing.event_handlers', ['*']))).toEqual(['services/billing/billing/event_handlers.py']);
+  expect(tos(at('services/search/tests/test_index.py', 'search.index', ['Index']))).toEqual(['services/search/src/search/index.py']);
+  // A package of this repo, a module it does not have: unresolved, not a third-party package.
+  expect(at('services/billing/billing/api.py', 'billing.missing', ['x'])).toEqual([{ to: 'pkg:billing', names: ['x'], unresolved: true }]);
+  expect(at('services/billing/billing/api.py', 'search.gone', ['Index'])).toEqual([{ to: 'pkg:search', names: ['Index'], unresolved: true }]);
+  // Third-party and the standard library stay packages, even when a folder of the repo shares the name.
+  expect(at('services/billing/billing/api.py', 'requests', ['*'])).toEqual([{ to: 'pkg:requests', names: ['*'] }]);
+  expect(at('services/billing/billing/api.py', 'logging', ['*'])).toEqual([{ to: 'pkg:logging', names: ['*'] }]);
 });

@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { ModelTimeoutError, ProviderUnavailableError, STRICT_JSON, type ActivityInput, type CodeFact, type FactScope, type LlmProvider, type ScanJob } from '@fb/core';
 import { expect, test } from 'vitest';
-import { checkCitations, deterministicFacts, extractFileFacts, hasCodeFiles, listCodeFiles, listCodeFilesWithTotal, runScan, SCAN_PROMPT_VERSION, type ScanDeps } from './scan.ts';
+import { checkCitations, deterministicFacts, extractFileFacts, hasCodeFiles, listCodeFiles, listCodeFilesWithTotal, runScan, FACT_CHECK_VERSION, SCAN_PROMPT_VERSION, SCANNER_VERSION, type ScanDeps } from './scan.ts';
 
 function repo(git = false) {
   const dir = mkdtempSync(join(tmpdir(), 'fbscan-'));
@@ -109,6 +109,25 @@ test('checkCitations drops facts citing a file that does not exist, fixes lines 
   ]);
 });
 
+test('checkCitations keeps a correct range whose identifier is the enclosing declaration above it, or the one a doc comment documents', async () => {
+  const body = Array.from({ length: 30 }, (_, i) => `  step${i}();`);
+  const content = [
+    '/**', ' * Pools are created lazily: the first query opens the pool.', ' */', '// eslint-disable-next-line max-params', '@traced()',
+    'export function createPool(retries = 3) {', ...body, '}', '', ...Array.from({ length: 60 }, () => '// filler'), 'export const UNRELATED = 1;',
+  ].join('\n');
+  const read = async () => content;
+  const fact = (lines: string, statement: string): CodeFact => ({ kind: 'gotcha', statement, path: 'src/pool.ts', lines, confidence: 1, why: 'w' });
+  const r = await checkCitations([
+    // The body of createPool, which is declared on line 6 (far more than LINE_SLACK above line 25).
+    fact('25-30', '`createPool` retries each step before giving up'),
+    // The doc comment, three lines above the declaration it documents (past LINE_SLACK).
+    fact('1-3', '`createPool` opens the pool on the first query'),
+    // Far from anything it names: still dropped.
+    fact('90-95', '`createPool` takes a retry count'),
+  ], read);
+  expect(r.kept.map((f) => [f.lines, f.evidence])).toEqual([['25-30', 'line'], ['1-3', 'line'], [null, 'file']]);
+});
+
 test('an agentic scan saves facts with their evidence level, never one citing an instruction file or a missing file', async () => {
   const dir = repo(true);
   const agent = llm({ facts: [
@@ -120,6 +139,15 @@ test('an agentic scan saves facts with their evidence level, never one citing an
   await runScan(job(dir), deps);
   expect(written.filter((f) => f.origin === 'model').map((f) => [f.statement, f.evidence])).toEqual([['`a` is exported', 'line'], ['restated from the docs', 'file']]);
   expect(written.filter((f) => f.origin === 'manifest')).toHaveLength(3);
+  // Stamped with the rule that checked them, so a later rule change rechecks them (recheck.ts).
+  expect(written.every((f) => f.checkVersion === FACT_CHECK_VERSION)).toBe(true);
+});
+
+test('a per-file scan stamps its facts with the citation rule that checked them', async () => {
+  const { deps, written } = fakeDeps();
+  await runScan(job(repo(true)), deps);
+  expect(written.length).toBeGreaterThan(0);
+  expect(written.every((f) => f.checkVersion === FACT_CHECK_VERSION)).toBe(true);
 });
 
 test('the extraction prompts say not to restate instruction files and not to infer absence from the file list', async () => {
@@ -139,7 +167,7 @@ test('a per-file scan does not ask the model about AGENTS.md or CLAUDE.md, but s
   const { deps, saved } = fakeDeps({ llm: m });
   await runScan(job(dir), deps);
   expect(asked.some((u) => u.includes('AGENTS.md'))).toBe(false);
-  expect(saved.find((s) => s.path === 'AGENTS.md')).toEqual({ path: 'AGENTS.md', facts: 0 });
+  expect(saved.find((s) => s.path === 'AGENTS.md')).toEqual({ path: 'AGENTS.md', facts: 0, version: SCANNER_VERSION });
 });
 
 const llm = (out: unknown, agentic = false): LlmProvider & { seen: { user: string; cwd?: string }[] } => {
@@ -170,12 +198,19 @@ test('the extraction prompt asks for relevance to everyday coding, with setup of
   expect(seen[0].system).toMatch(/relevance/i);
   expect(seen[0].system).toMatch(/external tool/i);
   expect(JSON.stringify(seen[0].schema)).toContain('"relevance"');
+  // Every model answered 1.0: it is no longer asked for (a fact without one is kept).
+  expect(JSON.stringify(seen[0].schema)).not.toContain('confidence');
+});
+
+test('a fact the model gave no confidence is kept', async () => {
+  const r = await extractFileFacts(llm({ summary: 'S', facts: [{ kind: 'api', statement: 'x', path: 'a', lines: null, why: 'w', relevance: 0.5 }] }), 'a', 'code');
+  expect(r.facts.map((f) => f.statement)).toEqual(['x']);
 });
 
 function fakeDeps(over: Partial<ScanDeps> = {}) {
-  const saved: { path: string; facts: number }[] = [];
+  const saved: { path: string; facts: number; version?: string | null }[] = [];
   const removed: string[][] = [];
-  const replaced: { facts: number; files: number; scope: FactScope; paths: string[] }[] = [];
+  const replaced: { facts: number; files: number; scope: FactScope; paths: string[]; versions: (string | null | undefined)[] }[] = [];
   const updates: object[] = [];
   const activity: ActivityInput[] = [];
   const jobIds: (string | null | undefined)[] = [];
@@ -184,9 +219,9 @@ function fakeDeps(over: Partial<ScanDeps> = {}) {
   const deps: ScanDeps = {
     facts: {
       fileHashes: async () => new Map([['src/a.ts', 'stale'], ['src/deleted.ts', 'x']]),
-      saveFileFacts: async (_k, f, facts, _s, jobId) => { saved.push({ path: f.path, facts: facts.length }); written.push(...facts); jobIds.push(jobId); },
+      saveFileFacts: async (_k, f, facts, _s, jobId) => { saved.push({ path: f.path, facts: facts.length, ...(f.version !== undefined && { version: f.version }) }); written.push(...facts); jobIds.push(jobId); },
       markFilesRemoved: async (_k, p) => { removed.push(p); },
-      replaceScopeFacts: async (_k, scope, facts, _s, files, jobId) => { replaced.push({ facts: facts.length, files: files.length, scope, paths: facts.map((f) => f.path) }); written.push(...facts); jobIds.push(jobId); },
+      replaceScopeFacts: async (_k, scope, facts, _s, files, jobId) => { replaced.push({ facts: facts.length, files: files.length, scope, paths: facts.map((f) => f.path), versions: files.map((x) => x.version) }); written.push(...facts); jobIds.push(jobId); },
       updateScanJob: async (_id, p) => { updates.push(p); },
       currentSources: async () => [],
       // The stores' rule (contract-tested in facts.int.test.ts): a counted failure backs off, then fails for good.
@@ -237,7 +272,7 @@ test('runScan logs what it extracted from each file, with which model and why th
   expect(a).toMatchObject({ actor: 'ollama:gemma4', projectKey: 'demo', subject: '1 fact from src/a.ts' });
   expect(a.why).toMatch(/changed since the last scan/);
   expect(a.details).toMatchObject({ scanJobId: 'j', previousHash: 'stale', summary: 'S', promptVersion: SCAN_PROMPT_VERSION });
-  expect(a.details!.facts).toEqual([{ kind: 'api', statement: 'f', why: 'callers rely on it', confidence: 0.8, evidence: 'file' }]);
+  expect(a.details!.facts).toEqual([{ kind: 'api', statement: 'f', why: 'callers rely on it', evidence: 'file' }]);
   expect(activity.find((x) => x.targets?.includes('demo:README.md'))!.why).toMatch(/new file/);
   expect(activity.find((x) => x.subject.includes('removed'))).toMatchObject({ targets: ['demo:src/deleted.ts'] });
   expect(activity.at(-1)).toMatchObject({ kind: 'scan_finished', subject: 'scanned 5 files, 8 facts' });
@@ -558,6 +593,19 @@ test('an agentic scan of a workspace runs one agent pass per package with its ow
   expect(updates.at(-1)).toMatchObject({ status: 'done', shards: { total: 3, rescanned: 3, failed: 0 } });
 });
 
+test('an agentic scan records its progress after each shard it runs: shards done of total and facts so far', async () => {
+  const dir = workspace();
+  const { deps, updates } = fakeDeps({ llm: shardAgent() });
+  deps.facts.fileHashes = async () => new Map();
+  await runScan(job(dir), deps);
+  const progress = updates.filter((u) => !('status' in u));
+  expect(progress).toEqual([
+    { factsAdded: 3, shards: { total: 3, done: 1, rescanned: 1, failed: 0 } },
+    { factsAdded: 6, shards: { total: 3, done: 2, rescanned: 2, failed: 0 } },
+    { factsAdded: 9, shards: { total: 3, done: 3, rescanned: 3, failed: 0 } },
+  ]);
+});
+
 test('the prompt tells the agent its shard, its path prefix and a budget scaled to the shard', async () => {
   const dir = workspace();
   const systems: string[] = [];
@@ -679,4 +727,129 @@ test('three shards in a row timing out stop the run instead of waiting out every
   await expect(runScan(job(dir), deps)).rejects.toThrow(/3 shards in a row timed out/);
   expect(agent.seen).toHaveLength(3);
   expect(updates.at(-1)).toMatchObject({ status: 'queued', counted: true });
+});
+
+test('a shard an older scanner read is rescanned even though none of its files changed; one the current scanner read is skipped', async () => {
+  const dir = workspace();
+  const files = await listCodeFiles(dir, { maxBytes: 80_000, maxFiles: 100 });
+  const asked: string[] = [];
+  const { deps, replaced, activity } = fakeDeps({ llm: shardAgent((s) => asked.push(s)) });
+  deps.facts.fileHashes = async () => new Map(files.map((f) => [f.path, f.hash]));
+  deps.facts.currentSources = async () => ['claude-cli'];
+  // packages/api was read by 0.6.0's scanner (or before versions were kept): its facts are an old skim.
+  deps.facts.fileScanVersions = async () => new Map(files.map((f) => [f.path, f.path.startsWith('packages/api/') ? (f.path.endsWith('m0.ts') ? null : 'scan-v4') : SCANNER_VERSION]));
+  await runScan(job(dir), deps);
+  expect(asked).toEqual(['packages/api']);
+  // What it saves carries the current version, so the next scan skips it.
+  expect(replaced[0].versions).toEqual(Array(7).fill(SCANNER_VERSION));
+  expect(activity[0].why).toMatch(/7 files were read by an older scanner/);
+});
+
+test('a per-file scan rereads unchanged files an older scanner read, and saves the version with each file', async () => {
+  const dir = repo(true);
+  const files = await listCodeFiles(dir, { maxBytes: 80_000, maxFiles: 100 });
+  const { deps, saved } = fakeDeps();
+  deps.facts.fileHashes = async () => new Map(files.map((f) => [f.path, f.hash]));
+  deps.facts.fileScanVersions = async () => new Map(files.map((f) => [f.path, f.path === 'src/a.ts' ? 'scan-v4' : SCANNER_VERSION]));
+  await runScan(job(dir), deps);
+  expect(saved.map((s) => [s.path, s.version])).toEqual([['src/a.ts', SCANNER_VERSION]]);
+});
+
+test('the agent sees its files by directory, hotspots first, with a minimum for each large directory, and is asked what it did not reach', async () => {
+  const dir = workspace();
+  // A large directory in packages/core, and a file with the kind of comment traps are written down in.
+  for (let i = 0; i < 40; i++) writeFileSync(join(dir, `packages/core/src/m${i}.ts`), `export const core${i} = ${i};\n`);
+  mkdirSync(join(dir, 'packages/core/lib'));
+  writeFileSync(join(dir, 'packages/core/lib/render.ts'), `${Array(14).fill('// The HTML5 parser ignores a self-closing slash on custom elements, so tags are paired first.').join('\n')}\nexport {};\n`);
+  execFileSync('git', ['-C', dir, 'add', '-A']);
+  const seen: { user: string; schema: object; system: string }[] = [];
+  const agent: LlmProvider = { id: 'claude-cli', agentic: true, json: async (t) => { seen.push({ user: t.user, schema: t.schema, system: t.system }); return { facts: [], unreached: [] }; } };
+  const { deps } = fakeDeps({ llm: agent });
+  deps.facts.fileHashes = async () => new Map();
+  await runScan(job(dir), deps);
+  const core = seen.find((s) => shardOf(s.user) === 'packages/core')!;
+  const lines = core.user.split('\n');
+  // The hotspot is listed first, before the directories.
+  expect(lines.slice(1, 3)).toEqual([expect.stringMatching(/^Read these first/), 'packages/core/lib/render.ts']);
+  expect(core.user).toMatch(/^## packages\/core\/src \(40 files\): at least \d+ facts? from here$/m);
+  expect(core.user).toMatch(/^## packages\/core \(1 file\)$/m);
+  expect(core.system).toMatch(/unreached/);
+  expect(JSON.stringify(core.schema)).toContain('"unreached"');
+});
+
+test('what an agent did not reach is kept to its shard and stored on the job, in the result and in Activity', async () => {
+  const dir = workspace();
+  const agent = llm((user: string) => ({ facts: [], unreached: shardOf(user) === 'packages/core' ? ['packages/core/src', './packages/core/src/m5.ts', 'packages/api/src', ''] : [] }), true);
+  const { deps, updates, activity } = fakeDeps({ llm: agent });
+  deps.facts.fileHashes = async () => new Map();
+  const r = await runScan(job(dir), deps);
+  expect(r.shards!.find((s) => s.shard === 'packages/core')).toMatchObject({ unreached: ['packages/core/src', 'packages/core/src/m5.ts'] });
+  expect(r.shards!.find((s) => s.shard === 'packages/api')!.unreached).toBeUndefined();
+  expect(updates.at(-1)).toMatchObject({ shards: { total: 3, rescanned: 3, failed: 0, unreached: ['packages/core/src', 'packages/core/src/m5.ts'] } });
+  const core = activity.find((a) => a.kind === 'facts_extracted' && a.details?.shard === 'packages/core')!;
+  expect(core.why).toMatch(/did not reach 2: packages\/core\/src, packages\/core\/src\/m5\.ts/);
+  expect(core.details).toMatchObject({ unreached: ['packages/core/src', 'packages/core/src/m5.ts'] });
+  expect(activity.at(-1)!.subject).toMatch(/2 places not reached/);
+});
+
+test('an agentic scan mirrors the repo once for all its shards, and removes the mirror at the end, even when it fails', async () => {
+  const dir = workspace();
+  let made = 0;
+  let disposed = 0;
+  const cwds: (string | undefined)[] = [];
+  const agent = (fail: boolean): LlmProvider => ({
+    id: 'codex-cli', agentic: true,
+    mirror: async (repo) => { expect(repo).toBe(dir); made++; return { dir: '/scratch/fb-mirror-1', dispose: async () => { disposed++; } }; },
+    json: async (t) => { cwds.push(t.cwd); if (fail) throw new Error('codex exit 1'); return { facts: [] }; },
+  });
+  const { deps } = fakeDeps({ llm: agent(false) });
+  deps.facts.fileHashes = async () => new Map();
+  await runScan(job(dir), deps);
+  expect([made, disposed]).toEqual([1, 1]);
+  expect(cwds).toEqual(Array(3).fill('/scratch/fb-mirror-1'));
+  // Every shard failing: the run fails, the mirror still goes.
+  const failing = fakeDeps({ llm: agent(true) }).deps;
+  failing.facts.fileHashes = async () => new Map();
+  await expect(runScan(job(dir), failing)).rejects.toThrow();
+  expect([made, disposed]).toEqual([2, 2]);
+  // Nothing to rescan: no mirror at all.
+  const files = await listCodeFiles(dir, { maxBytes: 80_000, maxFiles: 100 });
+  const idle = fakeDeps({ llm: agent(false) }).deps;
+  idle.facts.fileHashes = async () => new Map(files.map((f) => [f.path, f.hash]));
+  idle.facts.currentSources = async () => ['codex-cli'];
+  await runScan(job(dir), idle);
+  expect(made).toBe(2);
+});
+
+test('files an agent asked for are read first even when unchanged, and are no longer asked for once read (or gone)', async () => {
+  const dir = workspace();
+  const files = await listCodeFiles(dir, { maxBytes: 80_000, maxFiles: 100 });
+  const asked: string[] = [];
+  const cleared: string[][] = [];
+  const { deps, replaced } = fakeDeps({ llm: shardAgent((s) => asked.push(s)) });
+  deps.facts.fileHashes = async () => new Map(files.map((f) => [f.path, f.hash]));
+  deps.facts.currentSources = async () => ['claude-cli'];
+  deps.facts.scanRequests = async () => ['packages/core/src/m3.ts', 'packages/gone.ts'];
+  deps.facts.clearScanRequests = async (_k, p) => { cleared.push(p); };
+  await runScan(job(dir), deps);
+  // Only the shard holding the requested file, though nothing in it changed; the requested file is the first listed.
+  expect(asked).toEqual(['packages/core']);
+  expect(replaced[0].paths).toContain('packages/core/src/m3.ts');
+  expect(cleared.flat().sort()).toEqual(['packages/core/src/m3.ts', 'packages/gone.ts']);
+});
+
+test('a per-file scan reads requested files first, then files with long explanatory comments, before path order', async () => {
+  const dir = repo(true);
+  writeFileSync(join(dir, 'src/b.py'), `${Array(14).fill('# Retries are idempotent because every write carries a request id from the caller.').join('\n')}\ndef b(): pass\n`);
+  execFileSync('git', ['-C', dir, 'add', '-A']);
+  const order = async (requested: string[]) => {
+    const { deps, saved } = fakeDeps({ maxFiles: 2 });
+    deps.facts.fileHashes = async () => new Map();
+    deps.facts.scanRequests = async () => requested;
+    deps.facts.clearScanRequests = async () => {};
+    await runScan(job(dir), deps);
+    return saved.map((s) => s.path);
+  };
+  expect(await order([])).toEqual(['src/b.py', 'package.json']);
+  expect(await order(['README.md'])).toEqual(['README.md', 'src/b.py']);
 });

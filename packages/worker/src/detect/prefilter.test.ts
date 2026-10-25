@@ -68,6 +68,12 @@ test('a terse weak signal with nothing pasted still hits', () => {
   expect(prefilterPushback('why is the header blue').hit).toBe(true);
 });
 
+test('a correction of git behaviour hits: what the agent did, and what it was told', () => {
+  expect(prefilterPushback('you pushed to main, I said not to').signals).toEqual(['I said not to', 'you pushed']);
+  expect(prefilterPushback('you merged it into main without asking').hit).toBe(true);
+  expect(prefilterPushback('I asked you to keep this local').hit).toBe(true);
+});
+
 test('signals are the phrases that matched, not regex source', () => {
   expect(prefilterPushback("This isn't good enough. You didn't add a test.").signals).toEqual(["isn't good enough", "You didn't"]);
 });

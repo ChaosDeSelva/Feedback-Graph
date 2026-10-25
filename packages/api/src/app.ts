@@ -1,8 +1,9 @@
 import { Hono, type Context, type Next } from 'hono';
+import { bodyLimit } from 'hono/body-limit';
 import { streamSSE } from 'hono/streaming';
 import { serveStatic } from '@hono/node-server/serve-static';
 import { z } from 'zod';
-import { ACTIVITY_KINDS, EVERYDAY_FROM, chunkText, mapCapped, MAX_AUTO_MAP_FILES, MODEL_JOBS, cleanLessonPath, cmp, FACT_KINDS, redactSecrets, relevanceBand, selectionNote, type ActivityStore, type CodeGraphStore, type DocsStore, type FactsStore, type GraphStore, type InsightsStore, type ModelHealth, type ModelJob, type OllamaHealth, type PipelineStatus, type ProviderHealth, type KnowledgeStore, type Lesson, type LinksStore, IMAGE_MEDIA_TYPES, MAX_IMAGE_BYTES, LINK_RELATIONS, LINK_STATUSES, linkPair, type PortabilityStore, type Project, type ProjectSelection, type RelevanceBy, type ProjectSummary, type ShownProjects, type StoreKind, type SystemStatus, type WorkerStatus } from '@fb/core';
+import { ACTIVITY_KINDS, EVERYDAY_FROM, chunkText, mapCapped, MAX_AUTO_MAP_FILES, MODEL_JOBS, cleanLessonPath, cmp, FACT_KINDS, LESSON_CHECKS, LESSON_FROM, redactSecrets, relevanceBand, selectionNote, type ActivityStore, type CodeGraphStore, type DocsStore, type FactsStore, type GraphStore, type InsightsStore, type ModelHealth, type ModelJob, type OllamaHealth, type PipelineStatus, type ProviderHealth, type KnowledgeStore, type Lesson, type LinksStore, IMAGE_MEDIA_TYPES, MAX_IMAGE_BYTES, LINK_RELATIONS, LINK_STATUSES, linkPair, type PortabilityStore, type Project, type ProjectSelection, type RelevanceBy, type ProjectSummary, type ShownProjects, type StoreKind, type SystemStatus, type WorkerStatus, contextWhy, FACT_ORIGINS, SCANNER_VERSION } from '@fb/core';
 import { chatRoutes, type ChatRouteDeps } from './chat.ts';
 import { trackedProject, type ContextDeps } from './context.ts';
 import { authenticated, needsAuth, SECURITY_HEADERS, sessionCookie, tokenMatches, type AuthOpts } from './auth.ts';
@@ -11,7 +12,7 @@ import { createEventHub, type FgEvent } from './events.ts';
 import { handleMcp } from './mcp.ts';
 import { handleAdminMcp } from './adminMcp.ts';
 import { openApiDocument } from './openapi.ts';
-import { actingAsOperator, asActor, currentActor, hasOperatorToken, operatorName, OWNER_ROUTES, refusedVerb, runAs } from './operator.ts';
+import { actingAsOperator, asActor, currentActor, hasOperatorToken, operatorName, OWNER_ROUTES, refusedVerb, runAs, runVia } from './operator.ts';
 import { deleteProjects, settingsRoutes, type SettingsDeps } from './settings.ts';
 import { importRoutes, type ImportDeps } from './import.ts';
 import { sessionRoutes, type SessionsDeps } from './sessions.ts';
@@ -26,7 +27,11 @@ const ListQuery = z.object({
   project: z.string().min(1).optional(),
   source: z.enum(['claude', 'codex', 'github', 'linear']).optional(),
   limit: z.coerce.number().int().min(1).max(1000).optional(),
+  /** Skip this many (newest first): the next page starts where the x-next-offset header of the last one says. */
+  offset: z.coerce.number().int().min(0).max(1_000_000).optional(),
 });
+/** An Inbox page when the request names no limit. */
+const CANDIDATE_PAGE = 200;
 
 const Decision = z.object({
   status: z.enum(['confirmed', 'rejected']),
@@ -36,6 +41,16 @@ const Decision = z.object({
 const Decisions = z.object({
   items: z.array(z.object({ id: z.string().min(1).max(500), decision: z.enum(['confirm', 'reject']), reason: z.string().max(4000).optional() }).strict()).min(1).max(500),
 }).strict();
+
+const MB = 1024 * 1024;
+/** The most any request body may be; the upload routes below take more. */
+export const BODY_LIMIT = 1 * MB;
+/** A document upload (2,000,000 characters of text, or an 8 MB image as base64) and an export bundle being imported. */
+const UPLOAD_LIMITS: readonly [RegExp, number][] = [
+  [/^\/api\/projects\/[^/]+\/docs$/, 16 * MB],
+  [/^\/api\/import$/, 256 * MB],
+];
+export const bodyLimitFor = (path: string) => UPLOAD_LIMITS.find(([re]) => re.test(path))?.[1] ?? BODY_LIMIT;
 
 /** The admin MCP endpoint (owner decisions, operator token only); /mcp stays read-and-report only. */
 const ADMIN_MCP = '/mcp/admin';
@@ -56,13 +71,13 @@ function originAllowed(origin: string, hostHeader: string): boolean {
 export type AppOpts = {
   staticDir?: string;
   context?: ContextDeps;
-  knowledge?: Pick<KnowledgeStore, 'listLessons' | 'lessonDetail' | 'updateLesson'> & Partial<Pick<KnowledgeStore, 'retryPostmortem' | 'postmortemBacklog'>>;
+  knowledge?: Pick<KnowledgeStore, 'listLessons' | 'lessonDetail' | 'updateLesson'> & Partial<Pick<KnowledgeStore, 'retryPostmortem' | 'postmortemBacklog' | 'requestLessonRecheck'>>;
   embed?: (texts: string[]) => Promise<number[][]>;
-  facts?: Pick<FactsStore, 'listProjects' | 'requestScan' | 'listFacts' | 'searchFacts'> & Partial<Pick<FactsStore, 'setFactRelevance' | 'setPinned' | 'scanJob' | 'addOwnerFact'>>;
+  facts?: Pick<FactsStore, 'listProjects' | 'requestScan' | 'listFacts' | 'searchFacts'> & Partial<Pick<FactsStore, 'setFactRelevance' | 'setPinned' | 'scanJob' | 'addOwnerFact' | 'olderScannerFiles'>>;
   /** Folders under the configured roots that can be scanned. */
   projectDirs?: () => Promise<Project[]>;
   insights?: Pick<InsightsStore, 'projectGraph' | 'patterns'>;
-  activity?: Pick<ActivityStore, 'record' | 'list'>;
+  activity?: Pick<ActivityStore, 'record' | 'list'> & Partial<Pick<ActivityStore, 'get'>>;
   docs?: Pick<DocsStore, 'upsertDoc' | 'listDocs' | 'deleteDoc'> & Partial<Pick<DocsStore, 'docImage' | 'requeueDocRead'>>;
   links?: Pick<LinksStore, 'listLinks' | 'setLink' | 'deleteLink'>;
   auth?: AuthOpts;
@@ -118,6 +133,12 @@ function showsLesson(v: ShownProjects | null, l: Pick<Lesson, 'projectKey' | 'or
   return !v || key === null || v.has(key);
 }
 
+/** Activity's why for a lesson decision, by you or by an agent with the operator token. */
+function decidedWhy(by: string, status: 'approved' | 'rejected' | 'proposed' | undefined): string {
+  if (by === 'you') return status === 'approved' ? 'you approved it, so agents will now be given it' : status === 'rejected' ? 'you rejected it; agents will not see it' : 'you edited it';
+  return `an agent (${by}) ${status === 'approved' ? 'approved it with the operator token (OPERATOR_ALLOW has lesson_decide), so agents will now be given it' : status === 'rejected' ? 'rejected it with the operator token; agents will not see it' : 'edited it with the operator token'}`;
+}
+
 const NOT_SHOWN = { error: 'not found: this project is not selected (choose it in Settings to see it)' };
 
 const MAX_DEPTH = 5;
@@ -128,7 +149,8 @@ const IncludeTests = z.enum(['0', '1', 'true', 'false']).optional().transform((v
 /** Hotspots of one project: up to a whole map (the cap: SCAN_MAX_FILES, or 4000 when it scales with the repo). */
 const hotspotQuery = (maxFiles: number | null) =>
   z.object({ limit: z.coerce.number().int().min(1).max(Math.max(MAX_AUTO_MAP_FILES, maxFiles ?? 0)).default(50), tests: IncludeTests });
-const TopHotspotQuery = z.object({ project: z.string().min(1).max(200).optional(), limit: z.coerce.number().int().min(1).max(100).default(10), tests: IncludeTests });
+/** misses=1: only files a confirmed miss touched ("where agents struggle"), not the busiest ones. */
+const TopHotspotQuery = z.object({ project: z.string().min(1).max(200).optional(), limit: z.coerce.number().int().min(1).max(100).default(10), tests: IncludeTests, misses: IncludeTests });
 /** The Graph page's Code mode: up to `limit` top files and as many neighbours, so at most twice that many nodes. */
 const MapGraphQuery = z.object({ limit: z.coerce.number().int().min(1).max(300).default(60), tests: IncludeTests });
 const ImpactQuery = z.object({ path: z.array(RepoPath).min(1).max(50), depth: z.coerce.number().int().min(1).max(MAX_DEPTH).default(3) });
@@ -162,7 +184,11 @@ const ActivityQuery = z.object({
   kind: z.enum(ACTIVITY_KINDS).optional(),
   target: z.string().min(1).max(500).optional(),
   limit: z.coerce.number().int().min(1).max(1000).optional(),
+  /** 1: every row with its details, however big (the CLI's --json); else rows over LIST_DETAIL_BYTES leave them out. */
+  details: IncludeTests,
 });
+/** Details bigger than this stay out of an activity list (a scan's whole report is 1 MB): GET /api/activity/:id has them. */
+const LIST_DETAIL_BYTES = 1024;
 
 const ScanProvider = z.string().regex(/^[a-z][a-z-]*(:[\w./:-]+)?$/);
 const ScanRequest = z.object({ provider: ScanProvider.optional() }).strict();
@@ -191,14 +217,37 @@ export function lessonFactPath(paths: string[]): string {
   const glob = segments.findIndex((s) => /[*?[\]{}]/.test(s));
   return (glob < 0 ? segments : segments.slice(0, glob)).join('/').replace(/\/+$/, '') || '.';
 }
-const FactsQuery = z.object({ q: z.string().min(1).max(500).optional(), kind: z.enum(FACT_KINDS).optional() });
+/** Facts per page at most. A listing says where the next page starts in X-Next-Offset; no header: that was the last. */
+const MAX_FACTS_PAGE = 500;
+const FactsQuery = z.object({
+  q: z.string().min(1).max(500).optional(),
+  kind: z.enum(FACT_KINDS).optional(),
+  origin: z.enum(FACT_ORIGINS).optional(),
+  limit: z.coerce.number().int().min(1).max(MAX_FACTS_PAGE).default(MAX_FACTS_PAGE),
+  offset: z.coerce.number().int().min(0).default(0),
+});
+/** A fact as served: without `confidence`, which the extractor always set to 1 and so says nothing (still stored). */
+const servedFact = <T extends { confidence?: number }>({ confidence: _, ...f }: T) => f;
 
 const ProjectParam = z.object({ project: z.string().min(1).max(200) });
 
 const LessonQuery = z.object({
   status: z.enum(['proposed', 'approved', 'rejected', 'superseded']).optional(),
   project: z.string().min(1).optional(),
+  /** Only lessons whose checks hold this flag. */
+  flag: z.enum(LESSON_CHECKS).optional(),
+  /** Only lessons whose feedback came from there: a GitHub or Linear comment, session pushback, memory, by hand. */
+  source: z.enum(LESSON_FROM).optional(),
 });
+
+/** Many lesson decisions at once (the Lessons page's selection, `fg lessons approve|reject <id>...`). */
+const LessonDecisions = z.object({
+  items: z.array(z.object({
+    id: z.string().min(1).max(500),
+    status: z.enum(['approved', 'rejected']),
+    note: z.string().max(4000).optional(),
+  }).strict()).min(1).max(500),
+}).strict();
 
 const LessonPatch = z
   .object({
@@ -217,7 +266,7 @@ const ExportQuery = z.object({ project: z.string().min(1).max(200).optional(), a
 /** For the OpenAPI document (openapi.ts). */
 export const appSchemas = {
   ListQuery, Decision, Decisions, RepoPath, hotspotQuery, TopHotspotQuery, MapGraphQuery, ImpactQuery, DocUpload, ActivityQuery, ScanRequest,
-  BatchScanRequest, LinkRequest, PinRequest, RelevanceRequest, FactsQuery, ProjectParam, LessonQuery, LessonPatch, LessonToFact, ExportQuery,
+  BatchScanRequest, LinkRequest, PinRequest, RelevanceRequest, FactsQuery, ProjectParam, LessonQuery, LessonPatch, LessonDecisions, LessonToFact, ExportQuery,
 };
 
 /** The Bearer token a request carries, trimmed; null when there is none (or it is empty). */
@@ -322,8 +371,14 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
       log?.('auth refused', { method: c.req.method, path: c.req.path, reason: 'not the operator token', operator: operatorName(c.req.header('x-fg-operator')) });
       return c.json({ error: 'the admin MCP endpoint takes FG_OPERATOR_TOKEN as the Bearer: check it against the .env this Feedback Graph runs with' }, 401);
     }
-    if (needsAuth(c.req.path) && !authenticated(c, auth.token) && !hasOperatorToken(c, auth.operator)) {
-      return bearerOf(c) ? unrecognised(c) : c.json({ error: 'sign in required' }, 401);
+    const operator = hasOperatorToken(c, auth.operator);
+    if (needsAuth(c.req.path)) {
+      if (!authenticated(c, auth.token) && !operator) return bearerOf(c) ? unrecognised(c) : c.json({ error: 'sign in required' }, 401);
+      // A bearer that is neither configured token is refused on reads too (an agent with a stale token would otherwise
+      // read on and never learn its writes will fail). With no token configured there is nothing to check it against;
+      // "Bearer none" is the plugin's placeholder for no token.
+      const offered = bearerOf(c);
+      if (offered && offered !== 'none' && !operator && (auth.token || auth.operator?.token) && !(auth.token && tokenMatches(offered, auth.token))) return unrecognised(c);
     }
     if (c.req.method !== 'GET' && c.req.method !== 'HEAD') {
       const site = c.req.header('sec-fetch-site');
@@ -337,7 +392,22 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
       const mcpEnd = c.req.method === 'DELETE' && (c.req.path === '/mcp' || c.req.path === ADMIN_MCP);
       if (!mcpEnd && !c.req.header('content-type')?.startsWith('application/json')) return c.json({ error: 'json required' }, 415);
     }
-    await next();
+    // Activity says how each write arrived (operator.ts runVia).
+    await runVia(operator ? 'operator' : c.req.header('origin') !== undefined ? 'browser' : 'api', next);
+  });
+
+  // Every body has a size limit, checked before anything reads it (the Content-Length, else counted as it arrives):
+  // a 3 MB note is refused here, not read whole before the 4,000-character check.
+  app.use('*', (c, next) => {
+    const maxSize = bodyLimitFor(c.req.path);
+    const error = `request body too large: this route takes at most ${maxSize / MB} MB`;
+    return bodyLimit({
+      maxSize,
+      // An MCP client reads a JSON-RPC error, not a REST one.
+      onError: (c) => (c.req.path === '/mcp' || c.req.path === ADMIN_MCP
+        ? c.json({ jsonrpc: '2.0', id: null, error: { code: -32600, message: error } }, 413)
+        : c.json({ error }, 413)),
+    })(c, next);
   });
 
   // Decisions that teach agents are yours: they must come from the UI (browsers always send Origin on writes).
@@ -405,10 +475,14 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
     const count = async <T>(fn: () => Promise<T>): Promise<T | null> => fn().catch(() => null);
     const pending = (status: 'pending' | 'confirmed') => repo.listCandidates({ status, limit: PIPELINE_LIMIT, ...(keys && { projectKeys: keys }) }).then((r) => r.length);
     const lessons = (status: 'proposed' | 'approved') =>
-      knowledge!.listLessons({ status, limit: PIPELINE_LIMIT, ...(keys && { projectKeys: keys }) }).then((r) => r.filter((l) => showsLesson(v, l)).length);
+      knowledge!.listLessons({ status, limit: PIPELINE_LIMIT, ...(keys && { projectKeys: keys }) }).then((r) => r.filter((l) => showsLesson(v, l)));
     const projects = facts ? await count(async () => (await facts.listProjects()).filter((p) => (!v || v.has(p.key)) && (!project || p.key === project))) : null;
-    const scans = projects && { done: 0, queued: 0, running: 0, failed: 0, never: 0 };
+    const scans: PipelineStatus['scans'] = projects && { done: 0, queued: 0, running: 0, failed: 0, never: 0 };
     for (const p of projects ?? []) scans![p.lastScan?.status ?? 'never']++;
+    // Files an older scanner read: never rescanned on their own (a scan spends your model budget), so it is said.
+    const older = projects && facts?.olderScannerFiles ? await count(() => facts.olderScannerFiles!(SCANNER_VERSION)) : null;
+    const olderIn = (projects ?? []).filter((p) => (older?.get(p.key) ?? 0) > 0).map((p) => [p.key, older!.get(p.key)!] as const);
+    if (scans && olderIn.length) scans.olderScanner = { files: olderIn.reduce((n, [, c]) => n + c, 0), projects: Object.fromEntries(olderIn) };
     const [inboxPending, inboxConfirmed, proposed, approved, queued] = await Promise.all([
       count(() => pending('pending')),
       count(() => pending('confirmed')),
@@ -422,7 +496,8 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
       classify: worker?.backlog ? { backlog: worker.backlog.classify, capped: worker.backlog.classifyCapped } : null,
       inbox: inboxPending === null || inboxConfirmed === null ? null : { pending: inboxPending, confirmed: inboxConfirmed },
       postmortems: queued === null ? null : { queued },
-      lessons: proposed === null || approved === null ? null : { proposed, approved },
+      // global: the lessons with no project of their own (they serve every project), which no project's row counts.
+      lessons: proposed === null || approved === null ? null : { proposed: proposed.length, approved: approved.length, global: [...proposed, ...approved].filter((l) => !l.projectKey).length },
       scans,
     };
   };
@@ -506,7 +581,12 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
     const q = ListQuery.safeParse(c.req.query());
     if (!q.success) return c.json({ error: q.error.flatten() }, 400);
     const projectKeys = keysFor(await view(), q.data.project);
-    return c.json(await repo.listCandidates({ status: q.data.status, projectKey: q.data.project, source: q.data.source, limit: q.data.limit, ...(projectKeys && { projectKeys }) }));
+    // One more than the page tells whether another follows: the x-next-offset header says where it starts.
+    const limit = q.data.limit ?? CANDIDATE_PAGE;
+    const offset = q.data.offset ?? 0;
+    const rows = await repo.listCandidates({ status: q.data.status, projectKey: q.data.project, source: q.data.source, limit: limit + 1, offset, ...(projectKeys && { projectKeys }) });
+    if (rows.length > limit) c.header('x-next-offset', String(offset + limit));
+    return c.json(rows.slice(0, limit));
   });
 
   /** An Inbox item, if it belongs to a shown project. */
@@ -597,7 +677,10 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
           for (const k of [l.a, l.b]) linkCount.set(k, (linkCount.get(k) ?? 0) + 1);
         }
       }
-      const all = links ? [...known, ...fresh].map((p) => ({ ...p, links: linkCount.get(p.key) ?? 0 })) : [...known, ...fresh];
+      const linked = links ? [...known, ...fresh].map((p) => ({ ...p, links: linkCount.get(p.key) ?? 0 })) : [...known, ...fresh];
+      // Files an older scanner read: the next scan you start reads them again (none starts on its own).
+      const older = facts.olderScannerFiles ? await facts.olderScannerFiles(SCANNER_VERSION).catch(() => null) : null;
+      const all = older ? linked.map((p) => (older.get(p.key) ? { ...p, olderScanner: older.get(p.key) } : p)) : linked;
       // Pinned first: every page lists projects in this order.
       return c.json(all.sort((a, b) => Number(b.pinned) - Number(a.pinned) || a.key.localeCompare(b.key)));
     });
@@ -651,9 +734,13 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
       if (!(await shows(projectKey))) return c.json(NOT_SHOWN, 404);
       if (q.data.q && embed) {
         const [embedding] = await embed([q.data.q]);
-        return c.json(await facts.searchFacts({ embedding, projectKey, k: 30 }));
+        return c.json((await facts.searchFacts({ embedding, projectKey, k: 30 })).map((h) => ({ ...h, fact: servedFact(h.fact) })));
       }
-      return c.json(await facts.listFacts({ projectKey, kind: q.data.kind, limit: 500 }));
+      const { kind, origin, limit, offset } = q.data;
+      // One more than asked, so the page can say whether another follows.
+      const rows = await facts.listFacts({ projectKey, ...(kind && { kind }), ...(origin && { origin }), limit: limit + 1, offset });
+      if (rows.length > limit) c.header('X-Next-Offset', String(offset + limit));
+      return c.json(rows.slice(0, limit).map(servedFact));
     });
 
     const setPinned = facts.setPinned?.bind(facts);
@@ -794,7 +881,7 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
       const { a, b, ...patch } = body.data;
       if (a === b) return c.json({ error: 'a project cannot be linked to itself' }, 400);
       if (!(await shows(a)) || !(await shows(b))) return c.json({ error: 'both projects must be selected' }, 404);
-      const link = await links.setLink(a, b, patch);
+      const link = await links.setLink(a, b, { ...patch, decidedBy: currentActor() });
       const [x, y] = linkPair(a, b);
       const what = patch.status === 'confirmed' ? 'confirmed' : patch.status === 'dismissed' ? 'dismissed' : patch.status === 'suggested' ? 'reopened' : 'edited';
       await activity?.record({
@@ -843,7 +930,14 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
       const request = codegraph.requestCodeMapRebuild.bind(codegraph);
       // Owner-only (OWNER_ROUTES, the operator's `scan` verb): the worker remaps the project from scratch at its next pass.
       app.post('/api/projects/:key/codemap/rebuild', async (c) => {
-        if (!(await request(c.req.param('key')))) return c.json({ error: 'no code map yet: the worker builds the first one within a few minutes' }, 404);
+        const key = c.req.param('key');
+        if (!(await request(key))) return c.json({ error: 'no code map yet: the worker builds the first one within a few minutes' }, 404);
+        await activity?.record({
+          kind: 'code_mapped', actor: 'you', projectKey: key,
+          subject: `asked for a rebuild of the code map of ${key}`,
+          why: 'you asked for it: the worker remaps the project from scratch at its next pass (a code_mapped entry follows when it is done)',
+          details: { requested: true }, targets: [],
+        });
         return c.json({ queued: true }, 202);
       });
     }
@@ -886,7 +980,7 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
         const v = await view();
         const keys = (await projectDirs()).map((p) => p.key).filter((k) => (!q.data.project || k === q.data.project) && (!v || v.has(k)));
         if (q.data.project && !keys.length) return c.json({ error: 'no such selected project' }, 404);
-        const per = await Promise.all(keys.map(async (k) => (await codegraph.hotspots(k, q.data.limit, { includeTests: q.data.tests })).map((h) => ({ projectKey: k, ...h }))));
+        const per = await Promise.all(keys.map(async (k) => (await codegraph.hotspots(k, q.data.limit, { includeTests: q.data.tests, ...(q.data.misses && { missesOnly: true }) })).map((h) => ({ projectKey: k, ...h }))));
         const all = per.flat().sort((a, b) => b.score - a.score || cmp(a.projectKey, b.projectKey) || cmp(a.path, b.path));
         return c.json(all.slice(0, q.data.limit));
       });
@@ -932,9 +1026,15 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
     app.get('/api/activity', async (c) => {
       const q = ActivityQuery.safeParse(c.req.query());
       if (!q.success) return c.json({ error: q.error.flatten() }, 400);
-      const { project, ...rest } = q.data;
+      const { project, details, ...rest } = q.data;
       const projectKeys = keysFor(await view(), project);
-      return c.json(await activity.list({ projectKey: project, ...rest, ...(projectKeys && { projectKeys }) }));
+      return c.json(await activity.list({ projectKey: project, ...rest, ...(!details && { maxDetailBytes: LIST_DETAIL_BYTES }), ...(projectKeys && { projectKeys }) }));
+    });
+    // One entry, details and all (a row the list left them out of: detailsOmitted).
+    app.get('/api/activity/:id', async (c) => {
+      const a = await activity.get?.(c.req.param('id'));
+      const v = await view();
+      return a && (!v || a.projectKey === null || v.has(a.projectKey)) ? c.json(a) : c.json({ error: 'not found' }, 404);
     });
   }
 
@@ -987,13 +1087,17 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
       const q = LessonQuery.safeParse(c.req.query());
       if (!q.success) return c.json({ error: q.error.flatten() }, 400);
       const projectKeys = keysFor(await view(), q.data.project);
-      return c.json(await knowledge.listLessons({ status: q.data.status, projectKey: q.data.project, ...(projectKeys && { projectKeys }) }));
+      const { status, project, flag, source } = q.data;
+      return c.json(await knowledge.listLessons({
+        status, projectKey: project, ...(projectKeys && { projectKeys }), ...(flag && { flag }), ...(source && { from: source }),
+      }));
     });
 
     /** A lesson, if it was learned in (or serves) a shown project, or has no project. */
     const shownLesson = async (id: string) => {
       const d = await knowledge.lessonDetail(id);
-      return d && showsLesson(await view(), d.lesson) ? d : null;
+      // A why stored before the worker checked it (a model's echoed field name) reads as no reason, not as the word.
+      return d && showsLesson(await view(), d.lesson) ? { ...d, contextItems: (d.contextItems ?? []).map((ci) => ({ ...ci, why: contextWhy(ci.why) })) } : null;
     };
 
     app.get('/api/lessons/:id', async (c) => {
@@ -1028,14 +1132,58 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
         actor: 'you',
         projectKey: current.lesson.projectKey,
         subject: `${p.status ?? 'edited'} lesson "${p.title ?? current.lesson.title}"`,
-        why: by === 'you'
-          ? (p.status === 'approved' ? 'you approved it, so agents will now be given it' : p.status === 'rejected' ? 'you rejected it; agents will not see it' : 'you edited it')
-          : `an agent (${by}) ${p.status === 'approved' ? 'approved it with the operator token (OPERATOR_ALLOW has lesson_decide), so agents will now be given it' : p.status === 'rejected' ? 'rejected it with the operator token; agents will not see it' : 'edited it with the operator token'}`,
+        why: decidedWhy(by, p.status),
         details: { status: p.status ?? current.lesson.status, changed, supersedes: p.supersedes ?? null },
         targets: [id],
       });
       return c.body(null, 204);
     });
+
+    // Owner-only (OWNER_ROUTES, the operator's lesson_decide, off by default). Each lesson is decided and recorded on
+    // its own (decidedBy, Activity), as if decided one at a time; one not found (or not shown) does not stop the rest.
+    app.post('/api/lessons/decisions', async (c) => {
+      const body = LessonDecisions.safeParse(await c.req.json().catch(() => null));
+      if (!body.success) return c.json({ error: body.error.flatten() }, 400);
+      const by = currentActor();
+      const results = [];
+      for (const item of body.data.items) {
+        const current = await shownLesson(item.id);
+        if (!current) {
+          results.push({ id: item.id, ok: false, error: 'not found' });
+          continue;
+        }
+        await knowledge.updateLesson(item.id, { status: item.status }, { by, ...(item.note && { note: item.note }) });
+        await activity?.record({
+          kind: 'lesson_decided',
+          actor: 'you',
+          projectKey: current.lesson.projectKey,
+          subject: `${item.status} lesson "${current.lesson.title}"`,
+          why: decidedWhy(by, item.status),
+          details: { status: item.status, changed: {}, supersedes: null, bulk: true, ...(item.note && { note: item.note }) },
+          targets: [item.id],
+        });
+        results.push({ id: item.id, ok: true, status: item.status });
+      }
+      return c.json({ results });
+    });
+
+    // Owner-only (the operator's `retry`): flags only, so not a decision. The worker re-checks them at its next round.
+    const requestRecheck = knowledge.requestLessonRecheck?.bind(knowledge);
+    if (requestRecheck) {
+      app.post('/api/lessons/recheck', async (c) => {
+        const queued = await requestRecheck();
+        await activity?.record({
+          kind: 'lessons_checked',
+          actor: 'you',
+          projectKey: null,
+          subject: `${queued} lesson${queued === 1 ? '' : 's'} queued for a re-check`,
+          why: 'you asked for it (the UI, or fg lessons recheck): the worker re-runs the lesson checks on every proposed and approved lesson at its next round',
+          details: { queued },
+          targets: [],
+        });
+        return c.json({ queued }, 202);
+      });
+    }
 
     // A proposed lesson that states how the code is (the lesson check's looks-like-a-fact) becomes a project fact you
     // wrote: no scan replaces it, agents get it with the facts, and the lesson is rejected so it is not served twice.
@@ -1072,6 +1220,9 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
       });
     }
   }
+
+  // Last of the API: a path no route above answers is a JSON 404, not the UI's page with a 200.
+  app.all('/api/*', (c) => c.json({ error: `not found: no such API route (${c.req.method} ${c.req.path}); the routes are listed at /api/openapi.json` }, 404));
 
   if (staticDir) {
     app.use('/*', serveStatic({ root: staticDir }));

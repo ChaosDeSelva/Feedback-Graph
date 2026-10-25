@@ -98,6 +98,32 @@ describeStores('external feedback threads', (h) => {
     expect(await store.graph.listCandidates({})).toHaveLength(1);
   });
 
+  test('pending synced items come back with their words, by id; a skip rejects one that is still pending and marks its turn', async () => {
+    await store.graph.upsertExternalThread(project, thread(3));
+    for (const n of [1, 2, 3]) await store.graph.saveClassification(`github:acme/shop#7/c${n}`, pushback, true);
+    await store.graph.decide('github:acme/shop#7/c3', 'confirmed', null);
+    // A transcript turn's Inbox item is not a synced comment: never listed here.
+    await store.graph.upsertSession(project, work('s1', 'feat/checkout', '2026-10-01T09:00:00Z', '2026-10-01T09:00:00Z'), []);
+    await store.graph.saveClassification('s1-t1', pushback, true);
+
+    const first = await store.graph.pendingExternalItems({ limit: 1 });
+    expect(first).toEqual([{ id: 'github:acme/shop#7/c1', turnUuid: 'github:acme/shop#7/c1', projectKey: 'shop', text: expect.not.stringContaining('ghp_'), external: expect.objectContaining({ author: 'reviewer', thread: 'acme/shop#7' }) }]);
+    const next = await store.graph.pendingExternalItems({ limit: 10, afterId: first[0].id });
+    expect(next.map((i) => i.id)).toEqual(['github:acme/shop#7/c2']);
+
+    expect(await store.graph.skipPendingItem('github:acme/shop#7/c2', { rule: 'status-note', note: 'skipped by the status-note rule', by: 'skip-rules' })).toBe(true);
+    const [c] = await store.graph.listCandidates({ status: 'rejected' });
+    expect(c).toMatchObject({ id: 'github:acme/shop#7/c2', note: 'skipped by the status-note rule', decidedBy: 'skip-rules' });
+    expect(c.classification.signals).toContain('skip:status-note');
+    expect(c.decidedAt).not.toBeNull();
+    // Decided already (by you, or by an earlier skip): left as it is.
+    expect(await store.graph.skipPendingItem('github:acme/shop#7/c3', { rule: 'status-note', note: 'x', by: 'skip-rules' })).toBe(false);
+    expect(await store.graph.skipPendingItem('github:acme/shop#7/c2', { rule: 'status-note', note: 'x', by: 'skip-rules' })).toBe(false);
+    expect(await store.graph.skipPendingItem('nope', { rule: 'status-note', note: 'x', by: 'skip-rules' })).toBe(false);
+    expect((await store.graph.listCandidates({ status: 'confirmed' })).map((k) => k.id)).toEqual(['github:acme/shop#7/c3']);
+    expect((await store.graph.pendingExternalItems({ limit: 10 })).map((i) => i.id)).toEqual(['github:acme/shop#7/c1']);
+  });
+
   test('stand-in threads are not sessions: not listed, not counted in stats', async () => {
     await store.graph.upsertExternalThread(project, thread(2));
     const { sessions } = await store.sessions.list({ projectKeys: ['shop'], limit: 10 });
@@ -112,6 +138,23 @@ describeStores('external feedback threads', (h) => {
     const [input] = await store.knowledge.feedbackNeedingPostmortem(5);
     expect(input.feedback.external?.diffHunk).toContain('+b');
     expect(input.source).toBe('github');
+  });
+
+  test("a lesson from a review comment says whose words its feedback is: the source, the reviewer and the review's verdict", async () => {
+    const t = thread(1);
+    t.items[0].external = { ...ref(1), reviewState: 'APPROVED' };
+    await store.graph.upsertExternalThread(project, t);
+    await store.graph.saveClassification('github:acme/shop#7/c1', pushback, true);
+    await store.graph.decide('github:acme/shop#7/c1', 'confirmed', null);
+    const unit = Array.from({ length: 768 }, (_, i) => (i === 0 ? 1 : 0));
+    await store.knowledge.savePostmortem('github:acme/shop#7/c1', {
+      taskTitle: 'Checkout', missed: 'dropped the null check', cause: 'implementation_error', causeExplanation: 'x', outcome: 'addressed',
+      lesson: { title: 'Keep null checks', rule: 'Keep the null check in cart', appliesWhen: 'cart work', scope: 'project', paths: ['src/cart.ts'] },
+      contextItems: [],
+    }, { miss: unit, lesson: unit });
+    const [lesson] = await store.knowledge.listLessons({ status: 'proposed' });
+    const d = await store.knowledge.lessonDetail(lesson.id);
+    expect(d?.feedback?.external).toEqual({ source: 'github', author: 'reviewer', url: ref(1).url, reviewState: 'APPROVED' });
   });
 
   test('an agent report never merges into a synced comment', async () => {

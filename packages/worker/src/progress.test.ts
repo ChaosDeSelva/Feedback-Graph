@@ -1,6 +1,6 @@
 import type { ProviderHealth, WorkerStatus } from '@fb/core';
 import { expect, test } from 'vitest';
-import { healthSince, StageTracker } from './progress.ts';
+import { cycleProgressed, healthSince, StageTracker } from './progress.ts';
 
 const blank = (): WorkerStatus => ({ version: 't', startedAt: 't', lastBeat: 't', lastCycleAt: null, lastCycle: null, lastError: null, providers: {} });
 
@@ -63,4 +63,14 @@ test('healthSince: a different provider for the job starts a new run', () => {
   const before = healthSince(undefined, h(false, '10:00'));
   const other = healthSince(before, { provider: 'claude-cli', ok: false, reason: 'not signed in', at: '10:01' });
   expect(other.since).toBe('10:01');
+});
+
+test('a round counts as progress (the loop goes again without sleeping) for classified turns, post-mortems and uploads, never for the relevance backfill', () => {
+  const none = { turnsClassified: 0, postmortems: 0, docRead: false, scored: 0 };
+  expect(cycleProgressed(none)).toBe(false);
+  expect(cycleProgressed({ ...none, turnsClassified: 3 })).toBe(true);
+  expect(cycleProgressed({ ...none, postmortems: 1 })).toBe(true);
+  expect(cycleProgressed({ ...none, docRead: true })).toBe(true);
+  // Backfill scoring is last in line: a batch per wake, so it never keeps the loop spinning on its own.
+  expect(cycleProgressed({ ...none, scored: 40 })).toBe(false);
 });

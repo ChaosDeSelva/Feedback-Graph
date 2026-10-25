@@ -25,6 +25,7 @@ export * from './remote.ts';
 export * from './scope.ts';
 export * from './graph/selection.ts';
 export * from './store.ts';
+export * from './scanner.ts';
 export * from './codegraph.ts';
 export * from './dedupe.ts';
 export * from './graph/neo4j-store.ts';

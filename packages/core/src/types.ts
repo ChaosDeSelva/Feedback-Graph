@@ -11,6 +11,11 @@ export type HumanTurn = {
   precedingAssistantText: string;
   /** Tool calls since the previous human turn. */
   precedingToolCalls: ToolCall[];
+  /**
+   * Set only while classifying an instruction about git, never stored: the agent's git actions after this turn, the
+   * evidence that what it forbade happened.
+   */
+  followingToolCalls?: ToolCall[];
   /** Set on a comment synced from GitHub or Linear (its stand-in thread holds one turn per comment). */
   external?: ExternalRef;
 };
@@ -136,6 +141,10 @@ export type Candidate = {
 };
 
 export type CandidateOrigin = 'detector' | 'agent';
+/** A pending Inbox item from GitHub or Linear, as the skip rules see it (GraphStore.pendingExternalItems). */
+export type PendingExternalItem = { id: string; turnUuid: string; projectKey: string; text: string; external: ExternalRef };
+/** A pending Inbox item the detector flagged in a session (not a synced comment, not an agent's report), with the agent's calls before it. */
+export type PendingSessionItem = { id: string; turnUuid: string; projectKey: string; text: string; precedingToolCalls: ToolCall[] };
 export type AgentReport = { text: string; whatWasDone: string; reportedAt: string; sessionId: string | null };
 
 // ── Milestone 2: post-mortems and lessons ──────────────────────────────
@@ -143,6 +152,7 @@ export type AgentReport = { text: string; whatWasDone: string; reportedAt: strin
 export const CAUSES = [
   'context_missing',
   'context_available_ignored',
+  'code_not_read',
   'requirement_unstated',
   'verification_gap',
   'implementation_error',
@@ -156,6 +166,17 @@ export type FeedbackStatus = 'open' | 'addressed' | 'verified' | 'approved' | 'r
 export type ContextKind = 'code' | 'doc' | 'claude_md' | 'agents_md' | 'memory' | 'session' | 'pr' | 'ticket' | 'upload';
 export type ContextItem = { kind: ContextKind; ref: string; excerpt: string; why: string; wasAvailable: boolean };
 
+/** What a context item says when the model gave no usable reason. */
+export const NO_CONTEXT_WHY = 'the model gave no reason';
+/**
+ * A context item's "why", or NO_CONTEXT_WHY when the model left it empty or filled it with a field name or a bare value
+ * (`wasAvailable`, `true`, `null`): small models echo the item's keys, and the UI printed the literal word as the reason.
+ */
+export function contextWhy(why: string | null | undefined): string {
+  const w = (why ?? '').trim();
+  return !w || /^(true|false|null|undefined|none|n\/a)$/i.test(w) || /^[a-z]+(?:[A-Z][a-z0-9]*)+$/.test(w) || /^(why|kind|ref|excerpt)$/i.test(w) ? NO_CONTEXT_WHY : w;
+}
+
 export type PostMortem = {
   taskTitle: string;
   missed: string;
@@ -166,7 +187,19 @@ export type PostMortem = {
   contextItems: ContextItem[];
   /** What the lesson check found (stored on the lesson as `checks`); unset: not checked. */
   lessonChecks?: LessonCheck[];
+  /**
+   * 'process': the miss is about how the work was handled (branches, pushes, pull requests), not the code, so it is
+   * tied to no file the session edited. Unset: about the code.
+   */
+  subject?: 'process';
+  /**
+   * Facts about the code the post-mortem noticed beside its lesson (how the code is, not what to do). Proposals only:
+   * they are logged with the post-mortem for the owner and never stored as facts or served to agents.
+   */
+  facts?: ProposedFact[];
 };
+
+export type ProposedFact = { path: string; statement: string };
 
 /**
  * What the lesson check (worker postmortem/lessonCheck.ts) found on a proposed lesson, shown to the owner before they
@@ -185,9 +218,27 @@ export const LESSON_CHECKS = [
   'not-pushback',
   'wrong-session',
   'self-review',
+  'path-missing',
+  'duplicate-of',
 ] as const;
 export type LessonCheckName = (typeof LESSON_CHECKS)[number];
-export type LessonCheck = { name: LessonCheckName; why: string };
+/** `of`: for duplicate-of, the lesson this one repeats. */
+export type LessonCheck = { name: LessonCheckName; why: string; of?: string };
+
+/**
+ * The version of the lesson checks, stored with them (Lesson.checksVersion). Raise it when a check changes: at start the
+ * worker re-checks every proposed or approved lesson checked with an older version, and logs what changed.
+ * 1: the checks before the version was stored. 2: path-missing, duplicate-of, the data checks on stored lessons, and
+ * the item-20 fixes (APPROVED is not a nit, clause-start imperatives, platitudes in the title).
+ */
+export const LESSON_CHECKS_VERSION = 2;
+
+/**
+ * Where a lesson's feedback came from: a GitHub or Linear comment, pushback in an agent session, an imported memory
+ * file, or written by hand. Set by the stores.
+ */
+export const LESSON_FROM = ['github', 'linear', 'session', 'memory', 'manual'] as const;
+export type LessonFrom = (typeof LESSON_FROM)[number];
 
 export type LessonStatus = 'proposed' | 'approved' | 'rejected' | 'superseded';
 export type LessonSource = 'postmortem' | 'memory' | 'manual';
@@ -219,6 +270,10 @@ export type Lesson = {
    * checked (proposed before the checks were stored; the worker re-checks those once). [] : checked, nothing found.
    */
   checks?: LessonCheck[] | null;
+  /** LESSON_CHECKS_VERSION its checks were made with; null: before the version was stored (or never checked). */
+  checksVersion?: number | null;
+  /** Where its feedback came from (LESSON_FROM). Set by the stores. */
+  from?: LessonFrom;
   /** Why its last decision was made, when that says more than the status ("converted to a fact"). Null: none given. */
   decisionNote?: string | null;
 };
@@ -274,6 +329,11 @@ export type CodeFact = {
   origin?: FactOrigin;
   /** How well its citation was checked when it was saved (unset on older facts: unknown). */
   evidence?: FactEvidence;
+  /**
+   * The citation rule that last checked it (the worker's FACT_CHECK_VERSION); unset or null: none recorded, so it is
+   * checked again (FactsStore.factsToRecheck).
+   */
+  checkVersion?: string | null;
 };
 
 /**
@@ -320,8 +380,12 @@ export type ScanJob = {
   shards?: ScanShards | null;
 };
 
-/** How many shards an agentic scan had, how many it rescanned (the others had not changed) and how many of those failed. */
-export type ScanShards = { total: number; rescanned: number; failed: number };
+/**
+ * How many shards an agentic scan had, how many it rescanned (the others had not changed) and how many of those failed.
+ * done: while it runs, the shards it has got through so far (skipped ones included); unset once it is finished.
+ * unreached: the directories or files the agents said they did not read (at most 200; absent: none, or not asked).
+ */
+export type ScanShards = { total: number; rescanned: number; failed: number; done?: number; unreached?: string[] };
 
 export type ProjectSummary = {
   key: string;
@@ -340,6 +404,11 @@ export type ProjectSummary = {
   pinned: boolean;
   /** Confirmed links to other shown projects. Counted by the API from the links store; absent when it has none. */
   links?: number;
+  /**
+   * Scanned files an older scanner read (FactsStore.olderScannerFiles): the next scan you start reads them again.
+   * Counted by the API; absent when there are none.
+   */
+  olderScanner?: number;
 };
 
 // ── Provenance ─────────────────────────────────────────────────────────
@@ -380,6 +449,8 @@ export const ACTIVITY_KINDS = [
   'comments_skipped',
   'lessons_checked',
   'lesson_to_fact',
+  'misses_reclassified',
+  'items_reopened',
 ] as const;
 export type ActivityKind = (typeof ACTIVITY_KINDS)[number];
 
@@ -396,7 +467,11 @@ export type ActivityInput = {
   /** Ids of graph nodes this activity created or touched (lesson ids, `project:path` code files, feedback ids). */
   targets?: string[];
 };
-export type Activity = Required<ActivityInput> & { id: string; ts: string };
+/**
+ * detailsOmitted: a list asked for small rows (maxDetailBytes) and these details were bigger, so `details` is `{}`;
+ * the entry on its own (ActivityStore.get, GET /api/activity/:id) has them.
+ */
+export type Activity = Required<ActivityInput> & { id: string; ts: string; detailsOmitted?: boolean };
 
 /** What the worker reports about itself each heartbeat; shown in the UI header and at /api/status. */
 export type WorkerStatus = {
@@ -516,8 +591,13 @@ export type PipelineStatus = {
   classify: { backlog: number; capped: boolean } | null;
   inbox: { pending: number; confirmed: number } | null;
   postmortems: { queued: number } | null;
-  lessons: { proposed: number; approved: number } | null;
-  scans: { done: number; queued: number; running: number; failed: number; never: number } | null;
+  /** global: how many of them have no project of their own (they serve every project). Older APIs leave it out. */
+  lessons: { proposed: number; approved: number; global?: number } | null;
+  /**
+   * olderScanner: files an older scanner read, in all and by project (only those with some), which the next scan you
+   * start reads again; absent when there are none or the store cannot count them.
+   */
+  scans: { done: number; queued: number; running: number; failed: number; never: number; olderScanner?: { files: number; projects: Record<string, number> } } | null;
 };
 
 // ── Session summaries ──────────────────────────────────────────────────

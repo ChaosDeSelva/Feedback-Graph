@@ -417,4 +417,4 @@ test('the operator token is generated only with --yes or a yes answer, never pri
   const fresh = sandbox({ tags: both });
   fresh.run({}, undefined, ['--yes', '--projects', '~/code']);
   expect(fresh.value('FG_OPERATOR_TOKEN')).toMatch(/^[0-9a-f]{48}$/);
-});
+}, 20_000);

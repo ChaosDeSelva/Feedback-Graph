@@ -1,8 +1,8 @@
 import { useEffect, useId, useState, type ReactNode } from 'react';
 import { ActivityEntry } from './Activity.tsx';
 import { hashFocus } from './links.ts';
-import type { FactKind, LessonCheck, LessonCheckName } from '@fb/core';
-import { FACT_KINDS } from '@fb/core/types';
+import type { FactKind, LessonCheck, LessonCheckName, LessonFrom } from '@fb/core';
+import { FACT_KINDS, LESSON_CHECKS, LESSON_FROM } from '@fb/core/types';
 import { EVERYDAY_FROM } from '@fb/core/relevance';
 import { api, type Activity, type Lesson, type LessonDetail, type LessonEdit, type LessonStatus } from './api.ts';
 import { afterDiscard, useUnsavedChanges } from './unsaved.ts';
@@ -37,9 +37,14 @@ const CHECK_LABEL: Record<LessonCheckName, string> = {
   'not-pushback': 'not pushback',
   'wrong-session': 'wrong session',
   'self-review': 'self-review',
+  'path-missing': 'path not in repo',
+  'duplicate-of': 'duplicate',
 };
-/** Where a lesson came from, in words; the tooltip says it in full. */
+/** Where a lesson came from, in words; the tooltip says it in full. `from` (where its feedback came from) first. */
 const SOURCE_LABEL: Record<string, [label: string, title: string]> = {
+  github: ['GitHub review', 'from a GitHub pull request comment or review, through a post-mortem'],
+  linear: ['Linear comment', 'from a Linear issue comment, through a post-mortem'],
+  session: ['session pushback', 'from your pushback in an agent session, through a post-mortem'],
   postmortem: ['post-mortem', 'from a post-mortem'],
   memory: ['memory file', 'imported from a Claude Code memory file'],
   manual: ['by you', 'written by you'],
@@ -47,6 +52,73 @@ const SOURCE_LABEL: Record<string, [label: string, title: string]> = {
 function SourceLabel({ source }: { source: string }) {
   const [label, title] = SOURCE_LABEL[source] ?? [source, source];
   return <span title={title}>{label}</span>;
+}
+
+/** The store lists at most this many lessons per request (listLessons' default limit). */
+const LIST_CAP = 500;
+
+/**
+ * One confirm for many decisions: names every lesson, takes an optional note (kept on each lesson as the decision's
+ * note). Approving is not a removal, so this is a plain dialog; Reject is the red button.
+ */
+function BulkDialog({ action, lessons, onCancel, onDone }: {
+  action: 'approved' | 'rejected';
+  lessons: Lesson[];
+  onCancel: () => void;
+  onDone: (results: { id: string; ok: boolean; error?: string }[]) => void;
+}) {
+  const [note, setNote] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const titleId = useId();
+  const verb = action === 'approved' ? 'Approve' : 'Reject';
+  const label = `${verb} ${plural(lessons.length, 'lesson')}`;
+  async function go() {
+    setBusy(true);
+    setError(null);
+    try {
+      const { results } = await api.decideLessons(lessons.map((l) => ({ id: l.id, status: action, ...(note.trim() && { note: note.trim() }) })));
+      onDone(results);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+      setBusy(false);
+    }
+  }
+  return (
+    <div
+      onMouseDown={(e) => { if (e.target === e.currentTarget && !busy) onCancel(); }}
+      className="fixed inset-0 z-50 grid place-items-center overflow-y-auto bg-text/30 p-4"
+    >
+      <div
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby={titleId}
+        onKeyDown={(e) => { e.stopPropagation(); if (e.key === 'Escape' && !busy) onCancel(); }}
+        className="w-full max-w-md rounded-md border border-line bg-surface text-[13px] shadow-pop"
+      >
+        <div className="grid gap-3 p-4">
+          <h2 id={titleId} className="font-semibold">{label}?</h2>
+          <p className="text-muted">
+            {action === 'approved'
+              ? 'Agents start getting each of them with their task context straight away. Each is recorded as approved by you.'
+              : 'Agents never get them. They move to Rejected, where you can put any back up for review.'}
+          </p>
+          <ul aria-label="lessons" className="grid max-h-48 gap-1 overflow-y-auto">
+            {lessons.map((l) => <li key={l.id} className="rounded-sm border border-line bg-sunken px-2 py-1 [overflow-wrap:anywhere]">{l.title}</li>)}
+          </ul>
+          <label className="grid gap-1 text-xs font-medium text-muted">
+            Note (optional, kept on each lesson)
+            <Input aria-label="note" value={note} onChange={(e) => setNote(e.target.value)} placeholder={action === 'rejected' ? 'why, e.g. platitudes' : 'why'} maxLength={4000} />
+          </label>
+          {error && <Alert>{error}</Alert>}
+        </div>
+        <footer className="flex flex-wrap justify-end gap-2 rounded-b-md border-t border-line bg-sunken px-4 py-3">
+          <Button onClick={onCancel} disabled={busy}>Cancel</Button>
+          <Button variant={action === 'approved' ? 'primary' : 'danger'} onClick={() => void go()} disabled={busy}>{busy ? 'Saving…' : label}</Button>
+        </footer>
+      </div>
+    </div>
+  );
 }
 
 const checkLabel = (name: string) => CHECK_LABEL[name as LessonCheckName] ?? name.replace(/-/g, ' ');
@@ -144,7 +216,13 @@ function AgentDecided({ lesson }: { lesson: Pick<Lesson, 'status' | 'decidedBy'>
 
 export function Lessons() {
   const [status, setStatus] = useState<LessonStatus>('proposed');
+  // Filters the server applies: where the feedback came from, and one check flag.
+  const [source, setSource] = useState<LessonFrom | ''>('');
+  const [flag, setFlag] = useState<LessonCheckName | ''>('');
   const [items, setItems] = useState<Lesson[]>([]);
+  // The rows ticked for a bulk decision (proposed lessons only), and the decision being confirmed.
+  const [picked, setPicked] = useState<Set<string>>(new Set());
+  const [bulk, setBulk] = useState<'approved' | 'rejected' | null>(null);
   const [selected, setSelected] = useState(0);
   const [detail, setDetail] = useState<LessonDetail | null>(null);
   const [draft, setDraft] = useState<Draft | null>(null);
@@ -164,9 +242,10 @@ export function Lessons() {
     setLoaded(false);
     setOpen(false);
     setError(null);
+    setPicked(new Set());
     // The answer for a tab you have left must not fill the one you are on.
     let stale = false;
-    api.lessons(status).then((l) => {
+    api.lessons(status, { ...(flag && { flag }), ...(source && { source }) }).then((l) => {
       if (stale) return;
       const at = focus ? l.findIndex((x) => x.id === focus) : -1;
       setItems(l);
@@ -175,7 +254,7 @@ export function Lessons() {
       setLoaded(true);
     }, (e) => { if (!stale) { setError(String(e)); setLoaded(true); } });
     return () => { stale = true; };
-  }, [status]);
+  }, [status, flag, source]);
 
   const current = items[selected];
   useEffect(() => {
@@ -232,6 +311,27 @@ export function Lessons() {
     }
   }
 
+  /** The bulk decision went through: the decided lessons leave this tab; any that failed say why. */
+  function bulkDone(results: { id: string; ok: boolean; error?: string }[]) {
+    setBulk(null);
+    const done = new Set(results.filter((r) => r.ok).map((r) => r.id));
+    const failed = results.filter((r) => !r.ok);
+    const at = current?.id;
+    const rest = items.filter((x) => !done.has(x.id));
+    setItems(rest);
+    setPicked(new Set(failed.map((r) => r.id)));
+    const keep = at ? rest.findIndex((x) => x.id === at) : -1;
+    setSelected(keep >= 0 ? keep : Math.max(0, Math.min(selected, rest.length - 1)));
+    setError(failed.length ? `${plural(failed.length, 'lesson')} could not be decided (still selected): ${failed.map((r) => `${r.id}: ${r.error ?? 'failed'}`).join('; ')}` : null);
+  }
+  const pickedLessons = items.filter((l) => picked.has(l.id));
+  const toggle = (id: string) => setPicked((p) => { const n = new Set(p); if (n.has(id)) n.delete(id); else n.add(id); return n; });
+  /** The flags on the lessons listed, with how many carry each: what "select all with flag" offers. */
+  const flagCounts = LESSON_CHECKS.map((n) => [n, items.filter((l) => l.checks?.some((c) => c.name === n)).length] as const).filter(([, c]) => c > 0);
+  const bulkable = status === 'proposed' && items.length > 0;
+  // Deciding the lesson open with unsaved edits drops them: ask first, as moving away does.
+  const openBulk = (action: 'approved' | 'rejected') => (current && picked.has(current.id) ? afterDiscard(() => setBulk(action)) : setBulk(action));
+
   async function decide(next: 'approved' | 'rejected' | 'proposed') {
     if (!current || !detail || !draft || detail.lesson.id !== current.id) return;
     const patch: LessonEdit = { status: next };
@@ -260,6 +360,44 @@ export function Lessons() {
           <>
             <Tabs label="status" value={status} options={TABS} onChange={(s) => { if (s !== status) afterDiscard(() => setStatus(s)); }} />
             {loaded && <span className="ml-auto text-xs text-muted tabular-nums">{plural(items.length, 'lesson')}</span>}
+            <div className="flex w-full flex-wrap gap-2">
+              <Select aria-label="source" size="sm" value={source} onChange={(e) => { const v = e.target.value as LessonFrom | ''; afterDiscard(() => setSource(v)); }}>
+                <option value="">all sources</option>
+                {LESSON_FROM.map((f) => <option key={f} value={f}>{SOURCE_LABEL[f]?.[0] ?? f}</option>)}
+              </Select>
+              <Select aria-label="flag" size="sm" value={flag} onChange={(e) => { const v = e.target.value as LessonCheckName | ''; afterDiscard(() => setFlag(v)); }}>
+                <option value="">any check</option>
+                {LESSON_CHECKS.map((n) => <option key={n} value={n}>{checkLabel(n)}</option>)}
+              </Select>
+            </div>
+            {bulkable && (
+              <div className="flex w-full flex-wrap items-center gap-2">
+                <Select
+                  aria-label="select all with flag"
+                  size="sm"
+                  value=""
+                  onChange={(e) => {
+                    const n = e.target.value;
+                    if (n) setPicked((p) => new Set([...p, ...items.filter((l) => l.checks?.some((c) => c.name === n)).map((l) => l.id)]));
+                  }}
+                >
+                  <option value="">select all with flag…</option>
+                  {flagCounts.map(([n, c]) => <option key={n} value={n}>{checkLabel(n)} ({c})</option>)}
+                </Select>
+                <Button size="sm" onClick={() => setPicked(picked.size === items.length ? new Set() : new Set(items.map((l) => l.id)))}>
+                  {picked.size === items.length ? 'Clear' : 'Select all'}
+                </Button>
+                {picked.size > 0 && (
+                  <>
+                    <span className="text-xs text-muted tabular-nums">{picked.size} selected</span>
+                    <Button size="sm" variant="primary" onClick={() => openBulk('approved')}>Approve selected</Button>
+                    <Button size="sm" onClick={() => openBulk('rejected')}>Reject selected</Button>
+                  </>
+                )}
+              </div>
+            )}
+            {loaded && items.length >= LIST_CAP && <span className="w-full text-xs text-muted">Showing the newest {LIST_CAP}: narrow the list with the filters to reach the rest.</span>}
+            {bulk && <BulkDialog action={bulk} lessons={pickedLessons} onCancel={() => setBulk(null)} onDone={bulkDone} />}
           </>
         }
         detailOpen={open && items.length > 0}
@@ -271,10 +409,16 @@ export function Lessons() {
           ) : (
             <ul>
               {items.map((l, i) => (
-                <li key={l.id}>
+                <li key={l.id} className="flex">
+                  {bulkable && (
+                    <label className="grid shrink-0 cursor-pointer place-items-start border-b border-line pt-3 pl-3">
+                      <input type="checkbox" aria-label={`select ${l.title}`} checked={picked.has(l.id)} onChange={() => toggle(l.id)} />
+                    </label>
+                  )}
+                  <div className="min-w-0 flex-1">
                   <ListRow selected={i === selected} onClick={() => { const go = () => { setSelected(i); setOpen(true); }; if (i === selected) go(); else afterDiscard(go); }}>
                     <div className="flex items-center justify-between gap-2 text-xs text-muted">
-                      <span className="truncate">{l.projectKey ?? 'global'} · <SourceLabel source={l.source} /></span>
+                      <span className="truncate">{l.projectKey ?? 'global'} · <SourceLabel source={l.from ?? l.source} /></span>
                       {l.cause && (
                         <span className="flex min-w-0 shrink-0 items-center gap-1.5">
                           <span aria-hidden="true" className={`size-1.5 shrink-0 rounded-full ${TONE_FILL[causeTone(l.cause)]}`} />
@@ -287,6 +431,7 @@ export function Lessons() {
                     {l.decidedBy?.startsWith('operator') && l.status !== 'proposed' && <div className="mt-1"><AgentDecided lesson={l} /></div>}
                     {l.decisionNote && l.status !== 'proposed' && <div className="mt-1 text-xs text-muted">{l.decisionNote}</div>}
                   </ListRow>
+                  </div>
                 </li>
               ))}
             </ul>
@@ -327,12 +472,27 @@ export function Lessons() {
 
                 {detail.feedback && (
                   <section className="grid gap-1.5">
-                    <SectionLabel>You said</SectionLabel>
+                    <SectionLabel>{feedbackSpeaker(detail.feedback.external)}</SectionLabel>
                     <blockquote className="rounded-md border border-accent bg-accent-soft px-3.5 py-2.5 text-[13.5px] leading-relaxed whitespace-pre-wrap [overflow-wrap:anywhere] shadow-[inset_3px_0_0_var(--color-accent)]">
                       {detail.feedback.text}
                     </blockquote>
                     <div className="flex flex-wrap items-center gap-2 text-xs text-muted">
-                      <span className="min-w-0 [overflow-wrap:anywhere]">session <span className="font-mono">{detail.feedback.sessionId}</span></span>
+                      {detail.feedback.external ? (
+                        <>
+                          {detail.feedback.external.reviewState && (
+                            // The review's verdict on the pull request, not a decision on this lesson: neutral, never green.
+                            <span className="rounded-sm border border-line px-1.5 py-0.5">review: {detail.feedback.external.reviewState.toLowerCase().replace('_', ' ')}</span>
+                          )}
+                          {detail.feedback.external.url && (
+                            <a href={detail.feedback.external.url} target="_blank" rel="noreferrer" className="underline decoration-line-strong underline-offset-2 hover:text-text">
+                              on {detail.feedback.external.source === 'github' ? 'GitHub' : 'Linear'}
+                            </a>
+                          )}
+                          <span className="min-w-0 [overflow-wrap:anywhere]">likely session <span className="font-mono">{detail.feedback.sessionId}</span></span>
+                        </>
+                      ) : (
+                        <span className="min-w-0 [overflow-wrap:anywhere]">session <span className="font-mono">{detail.feedback.sessionId}</span></span>
+                      )}
                       <StatusBadge status={detail.feedback.status} />
                     </div>
                   </section>
@@ -470,4 +630,11 @@ function Field({ label, children }: { label: string; children: ReactNode }) {
       {children}
     </div>
   );
+}
+
+/** Whose words the feedback is: yours, or a reviewer's or commenter's on GitHub or Linear. */
+function feedbackSpeaker(ext: { source: string; author: string } | null | undefined): string {
+  if (!ext) return 'You said';
+  const who = ext.author || (ext.source === 'github' ? 'The reviewer' : 'The commenter');
+  return `${who} said`;
 }

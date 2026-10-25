@@ -5,7 +5,7 @@ import { createApp, type ApiRepo } from './app.ts';
 const repo = { listCandidates: async () => [], candidateDetail: async () => null, decide: async () => {}, stats: async () => [] } as unknown as ApiRepo;
 const link = (a: string, b: string, status: ProjectLink['status']): ProjectLink => ({
   id: `link:${a}|${b}`, a, b, relation: 'related', note: '', status, source: 'detected', score: 0.9,
-  evidence: [{ signal: 'manifest', detail: `${b} depends on ${a}`, path: 'package.json', from: b }], createdAt: 't', updatedAt: 't',
+  evidence: [{ signal: 'manifest', detail: `${b} depends on ${a}`, path: 'package.json', from: b }], createdAt: 't', updatedAt: 't', decidedBy: null,
 });
 
 function setup(links: ProjectLink[] = [link('api', 'game', 'suggested'), link('game', 'secret', 'confirmed')]) {
@@ -36,10 +36,10 @@ test('GET /api/projects/:key/links lists the project links whose other end is sh
 test('PUT /api/links confirms, dismisses or makes a link between two shown projects, and logs your decision', async () => {
   const { app, calls, activity } = setup();
   expect((await app.request('/api/links', json('PUT', { a: 'game', b: 'api', status: 'confirmed', note: 'client and api' }))).status).toBe(200);
-  expect(calls[0]).toEqual(['set', 'game', 'api', { status: 'confirmed', note: 'client and api' }]);
+  expect(calls[0]).toEqual(['set', 'game', 'api', { status: 'confirmed', note: 'client and api', decidedBy: 'you' }]);
   expect(activity[0]).toMatchObject({ kind: 'link_decided', actor: 'you', projectKey: 'game', subject: 'confirmed the link api ↔ game' });
   await app.request('/api/links', json('PUT', { a: 'web', b: 'api', relation: 'same_product' }));
-  expect(calls[1]).toEqual(['set', 'web', 'api', { relation: 'same_product' }]);
+  expect(calls[1]).toEqual(['set', 'web', 'api', { relation: 'same_product', decidedBy: 'you' }]);
 });
 
 test('link changes: unknown or hidden projects, a project and itself, bad fields and requests without an origin are refused', async () => {

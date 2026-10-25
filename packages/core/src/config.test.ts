@@ -169,12 +169,20 @@ test('redactUrl hides a connection string password', () => {
 
 const TOKEN = `fgc_pat_0123456789abcdef_${'A'.repeat(43)}`;
 
+test('CLOUD_MACHINE names this machine to the cloud (a label for provenance); a bad one is refused, never echoed whole', () => {
+  const on = { ...base, CLOUD_URL: 'https://cloud.example.com', CLOUD_TOKEN: TOKEN };
+  expect(loadConfig({ ...on, CLOUD_MACHINE: ' work-laptop ' }).cloud!.machine).toBe('work-laptop');
+  expect(loadConfig({ ...on, CLOUD_MACHINE: '' }).cloud!.machine).toBeNull();
+  expect(() => loadConfig({ ...on, CLOUD_MACHINE: 'bad name\nx' })).toThrow(/CLOUD_MACHINE/);
+  expect(() => loadConfig({ ...on, CLOUD_MACHINE: 'x'.repeat(65) })).toThrow(/CLOUD_MACHINE/);
+});
+
 test('cloud sync is off unless CLOUD_URL and CLOUD_TOKEN are both set', () => {
   expect(loadConfig(base).cloud).toBeNull();
   const c = loadConfig({ ...base, CLOUD_URL: 'https://cloud.example.com/', CLOUD_TOKEN: TOKEN });
-  expect(c.cloud).toEqual({ url: 'https://cloud.example.com', token: TOKEN, intervalMinutes: null, projects: [], suggestions: false });
+  expect(c.cloud).toEqual({ url: 'https://cloud.example.com', token: TOKEN, intervalMinutes: null, projects: [], suggestions: false, machine: null });
   expect(loadConfig({ ...base, CLOUD_URL: 'http://localhost:8788', CLOUD_TOKEN: TOKEN, SYNC_INTERVAL_MINUTES: '60', SYNC_PROJECTS: 'shop, api', SYNC_SUGGESTIONS: ' TRUE ' }).cloud)
-    .toEqual({ url: 'http://localhost:8788', token: TOKEN, intervalMinutes: 60, projects: ['shop', 'api'], suggestions: true });
+    .toEqual({ url: 'http://localhost:8788', token: TOKEN, intervalMinutes: 60, projects: ['shop', 'api'], suggestions: true, machine: null });
   expect(loadConfig({ ...base, CLOUD_URL: 'https://cloud.example.com', CLOUD_TOKEN: TOKEN, SYNC_SUGGESTIONS: 'false' }).cloud?.suggestions).toBe(false);
   // Off without a cloud is simply off.
   expect(loadConfig({ ...base, SYNC_SUGGESTIONS: 'false' }).cloud).toBeNull();
@@ -241,9 +249,10 @@ test('an operator token lets agents make owner decisions; unset, there is none, 
   expect(op.token).toBe('o'.repeat(32));
   // By default not deciding lessons (what agents learn stays the owner's call), nor anything that deletes data, changes
   // what is mounted, imports lessons from a file, or touches integration keys.
-  const off = ['lesson_decide', 'delete_project', 'docs_delete', 'settings', 'import', 'integrations', 'chat_delete'];
-  // Asking in Ask spends the owner's subscription but changes nothing agents learn: on. Deleting a chat deletes data: off.
-  expect(op.allow).toContain('chat');
+  const off = ['lesson_decide', 'delete_project', 'docs_delete', 'settings', 'import', 'integrations', 'chat', 'chat_delete'];
+  // Asking in Ask spends the owner's Claude or Codex subscription: off unless OPERATOR_ALLOW names it.
+  expect(op.allow).not.toContain('chat');
+  expect(loadConfig({ ...base, FG_OPERATOR_TOKEN: 'o'.repeat(32), OPERATOR_ALLOW: 'scan,chat' }).operator!.allow).toContain('chat');
   expect(op.allow).toEqual(OPERATOR_VERBS.filter((v) => !off.includes(v)));
 });
 

@@ -293,4 +293,103 @@ describeStores('FactsStore', (h) => {
     const hits = await f.searchFacts({ embedding: vec(2), projectKey: 'demo', k: 2 });
     expect(hits.map((x) => [x.fact.statement, x.score])).toEqual([['same', 1], ['orthogonal', 0.5]]);
   });
+
+  test('a scanned file keeps the scanner version that read it; files scanned before versions read as null', async () => {
+    await f.saveFileFacts('demo', { path: 'src/a.ts', hash: 'h', summary: '', version: 'scan-v5' }, [fact('x')], 'p');
+    await f.saveFileFacts('demo', { path: 'src/old.ts', hash: 'h', summary: '' }, [fact('y', 'src/old.ts')], 'p');
+    await f.replaceScopeFacts('demo', { prefixes: ['lib'], except: [] }, [], 'claude-cli', [{ path: 'lib/b.ts', hash: 'hb', version: 'scan-v5' }, { path: 'lib/c.ts', hash: 'hc' }]);
+    expect(await f.fileScanVersions('demo')).toEqual(new Map([['src/a.ts', 'scan-v5'], ['src/old.ts', null], ['lib/b.ts', 'scan-v5'], ['lib/c.ts', null]]));
+    // A rescan by a newer scanner moves it.
+    await f.replaceScopeFacts('demo', { prefixes: ['lib'], except: [] }, [], 'claude-cli', [{ path: 'lib/c.ts', hash: 'hc', version: 'scan-v6' }]);
+    expect((await f.fileScanVersions('demo')).get('lib/c.ts')).toBe('scan-v6');
+  });
+
+  test('olderScannerFiles counts, per project, the scanned files another scanner read (null included), not removed ones', async () => {
+    await f.saveFileFacts('demo', { path: 'src/a.ts', hash: 'h', summary: '', version: 'scan-v6' }, [fact('x')], 'p');
+    await f.saveFileFacts('demo', { path: 'src/old.ts', hash: 'h', summary: '' }, [fact('y', 'src/old.ts')], 'p');
+    await f.saveFileFacts('demo', { path: 'src/v5.ts', hash: 'h', summary: '', version: 'scan-v5' }, [fact('z', 'src/v5.ts')], 'p');
+    await f.saveFileFacts('demo', { path: 'src/gone.ts', hash: 'h', summary: '', version: 'scan-v5' }, [fact('g', 'src/gone.ts')], 'p');
+    await f.markFilesRemoved('demo', ['src/gone.ts']);
+    await f.saveFileFacts('web', { path: 'a.ts', hash: 'h', summary: '', version: 'scan-v6' }, [fact('w', 'a.ts')], 'p');
+    expect(await f.olderScannerFiles('scan-v6')).toEqual(new Map([['demo', 2]]));
+    expect(await f.olderScannerFiles('scan-v5')).toEqual(new Map([['demo', 2], ['web', 1]]));
+  });
+
+  test('a fact carries when its file last changed: a rescan of the same content keeps the time, new content moves it', async () => {
+    await f.saveFileFacts('demo', { path: 'src/a.ts', hash: 'h1', summary: '' }, [fact('first')], 'p');
+    const [first] = await f.listFacts({ projectKey: 'demo' });
+    expect(first.fileChangedAt).toEqual(expect.any(String));
+    await new Promise((r) => setTimeout(r, 5));
+    await f.replaceScopeFacts('demo', { prefixes: [''], except: [] }, [fact('same content')], 'p', [{ path: 'src/a.ts', hash: 'h1' }]);
+    const [same] = await f.listFacts({ projectKey: 'demo' });
+    expect(same).toMatchObject({ statement: 'same content', fileHash: 'h1', fileChangedAt: first.fileChangedAt });
+    expect(same.createdAt > first.createdAt).toBe(true);
+    await new Promise((r) => setTimeout(r, 5));
+    await f.saveFileFacts('demo', { path: 'src/a.ts', hash: 'h2', summary: '' }, [fact('changed')], 'p');
+    const [changed] = await f.listFacts({ projectKey: 'demo' });
+    expect(changed.fileChangedAt! > first.fileChangedAt!).toBe(true);
+    expect(changed.fileHash).toBe('h2');
+  });
+
+  test('listFacts pages with offset and limit and filters by origin (older facts by what they look like)', async () => {
+    await f.replaceProjectFacts('demo', [
+      { ...fact('m1', 'a.ts'), origin: 'model' }, { ...fact('m2', 'b.ts'), origin: 'model' }, fact('older model', 'c.ts'),
+      { ...fact('s1', 'package.json'), origin: 'manifest' }, { ...fact('s2', 'package.json'), why: 'Read directly from package.json; no model involved.' },
+    ], 'claude-cli', []);
+    const all = await f.listFacts({ projectKey: 'demo' });
+    expect(all).toHaveLength(5);
+    const page1 = await f.listFacts({ projectKey: 'demo', limit: 2 });
+    const page2 = await f.listFacts({ projectKey: 'demo', limit: 2, offset: 2 });
+    const page3 = await f.listFacts({ projectKey: 'demo', limit: 2, offset: 4 });
+    expect([...page1, ...page2, ...page3].map((x) => x.id)).toEqual(all.map((x) => x.id));
+    expect((await f.listFacts({ projectKey: 'demo', origin: 'model' })).map((x) => x.statement).sort()).toEqual(['m1', 'm2', 'older model']);
+    expect((await f.listFacts({ projectKey: 'demo', origin: 'manifest' })).map((x) => x.statement).sort()).toEqual(['s1', 's2']);
+    expect(await f.listFacts({ projectKey: 'demo', origin: 'document' })).toEqual([]);
+  });
+
+  test('facts checked by an older rule are listed for a recheck; the recheck closes failures and fixes the rest in place', async () => {
+    await f.replaceProjectFacts('demo', [
+      { ...fact('cites AGENTS.md', 'AGENTS.md'), origin: 'model' },
+      { ...fact('lines were wrong', 'src/a.ts'), origin: 'model' },
+      { ...fact('already current', 'src/b.ts'), origin: 'model', checkVersion: 'check-v2' },
+      fact('older, never checked', 'src/c.ts'),
+    ], 'claude-cli', []);
+    await f.addOwnerFact('demo', { ...fact('yours'), embedding: vec(1) }, 'you');
+    const stale = await f.factsToRecheck({ projectKey: 'demo', version: 'check-v2', limit: 10 });
+    expect(stale.map((x) => x.statement)).toEqual(['cites AGENTS.md', 'lines were wrong', 'older, never checked']);
+    expect(await f.factsToRecheck({ projectKey: 'demo', version: 'check-v2', limit: 1 })).toHaveLength(1);
+    const by = Object.fromEntries(stale.map((x) => [x.statement, x]));
+    const closed = await f.applyFactChecks('check-v2', [
+      { id: by['cites AGENTS.md'].id, keep: false, lines: null, evidence: null },
+      { id: by['lines were wrong'].id, keep: true, lines: null, evidence: 'file' },
+      { id: by['older, never checked'].id, keep: true, lines: '1-5', evidence: 'line' },
+    ]);
+    expect(closed).toBe(1);
+    expect(await f.factsToRecheck({ projectKey: 'demo', version: 'check-v2', limit: 10 })).toEqual([]);
+    const now = Object.fromEntries((await f.listFacts({ projectKey: 'demo' })).map((x) => [x.statement, x]));
+    expect(Object.keys(now).sort()).toEqual(['already current', 'lines were wrong', 'older, never checked', 'yours']);
+    expect(now['lines were wrong']).toMatchObject({ lines: null, evidence: 'file', createdAt: by['lines were wrong'].createdAt });
+    expect(now['older, never checked']).toMatchObject({ lines: '1-5', evidence: 'line' });
+    expect(await probe.factVersions('cites AGENTS.md')).toEqual([{ current: false, closed: true }]);
+    // A newer rule lists them all again.
+    expect(await f.factsToRecheck({ projectKey: 'demo', version: 'check-v3', limit: 10 })).toHaveLength(3);
+  });
+
+  test('files asked for a scan queue in request order, once each, until a scan clears them', async () => {
+    expect(await f.requestFilesScan('demo', ['src/b.ts', 'src/a.ts'])).toBe(2);
+    await new Promise((r) => setTimeout(r, 5));
+    expect(await f.requestFilesScan('demo', ['src/a.ts', 'src/c.ts'])).toBe(1);
+    // Only repo-relative paths (scanRequestPaths).
+    expect(await f.requestFilesScan('demo', ['../x.ts', '/etc/passwd', ''])).toBe(0);
+    expect(await f.scanRequests('demo')).toEqual(['src/b.ts', 'src/a.ts', 'src/c.ts']);
+    expect(await f.scanRequests('other')).toEqual([]);
+    // A scanned file with facts can be asked for again later; asking does not touch its hash or facts.
+    await f.saveFileFacts('demo', { path: 'src/d.ts', hash: 'hd', summary: '' }, [fact('d', 'src/d.ts')], 'p');
+    expect(await f.requestFilesScan('demo', ['src/d.ts'])).toBe(1);
+    expect((await f.fileHashes('demo')).get('src/d.ts')).toBe('hd');
+    await f.clearScanRequests('demo', ['src/a.ts', 'src/d.ts', 'never/asked.ts']);
+    expect(await f.scanRequests('demo')).toEqual(['src/b.ts', 'src/c.ts']);
+    // A file only asked for has no hash: it is not mistaken for a scanned one.
+    expect([...(await f.fileHashes('demo')).keys()]).toEqual(['src/d.ts']);
+  });
 });

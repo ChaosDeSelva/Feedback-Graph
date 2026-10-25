@@ -37,8 +37,10 @@ const ROUTES = {
   select_projects: ['PUT', '/api/settings/projects'],
   scan_projects: ['POST', '/api/projects/scan'],
   inbox_list: ['GET', '/api/candidates'],
+  inbox_get: ['GET', '/api/candidates/:id'],
   inbox_decide: ['POST', '/api/candidates/decisions'],
   lessons_list: ['GET', '/api/lessons'],
+  lesson_get: ['GET', '/api/lessons/:id'],
   lesson_decide: ['PATCH', '/api/lessons/:id'],
   link_decide: ['PUT', '/api/links'],
   set_fact_relevance: ['PATCH', '/api/projects/:key/facts/:id/relevance'],
@@ -52,14 +54,23 @@ export const ADMIN_TOOLS = Object.fromEntries(Object.entries(ROUTES).map(([name,
 
 /** Same limits as the REST bodies the tools turn into. */
 const MAX = { key: 200, id: 500, reason: 4000, note: 500, provider: 200 } as const;
+/** How many rows the store is asked for when a list tool counts what it did not show (the Inbox route's own cap). */
 const LIST_MAX = 1000;
+/** A list tool's page: this many rows unless asked, at most PAGE_MAX. */
+const PAGE_DEFAULT = 20;
+const PAGE_MAX = 200;
 /** scan_projects' wait: how often a job is checked, and how long it waits by default and at most. */
 const POLL_MS = 3000;
 const WAIT_DEFAULT_S = 300;
 const WAIT_MAX_S = 1800;
 
-const text = (s: string, isError = false) => ({ content: [{ type: 'text' as const, text: s }], ...(isError && { isError: true }) });
-const json = (data: unknown) => text(JSON.stringify(data));
+type Result = { content: { type: 'text'; text: string }[]; structuredContent?: Record<string, unknown>; isError?: true };
+const text = (s: string, isError = false): Result => ({ content: [{ type: 'text' as const, text: s }], ...(isError && { isError: true as const }) });
+/** The answer as structuredContent (an object: a list is wrapped as { items }) and as the same JSON in text. */
+const json = (data: unknown): Result => {
+  const structured = data !== null && typeof data === 'object' && !Array.isArray(data) ? (data as Record<string, unknown>) : { items: data };
+  return { content: [{ type: 'text', text: JSON.stringify(structured) }], structuredContent: structured };
+};
 const fail = (a: Answer) => {
   const e = (a.data as { error?: unknown } | null)?.error ?? a.data;
   return text(`${a.status}: ${typeof e === 'string' ? e : JSON.stringify(e)}`, true);
@@ -79,32 +90,95 @@ const needs = (name: ToolName) => {
 
 const Keys = z.array(z.string().min(1).max(MAX.key)).min(1).max(2000);
 
+/** A list tool's paging arguments. */
+const Paging = {
+  limit: z.number().int().min(1).max(PAGE_MAX).optional().describe(`Rows per page (default ${PAGE_DEFAULT}, at most ${PAGE_MAX})`),
+  offset: z.number().int().min(0).optional().describe('Rows to skip: the note on a page says which offset gives the next one'),
+};
+
+/**
+ * One page of a list, and what the page left out: `more` rows after it and the offset that gives them. `atLeast`: the
+ * store was asked for at most LIST_MAX rows and gave that many, so the total may be higher.
+ */
+export function page<T>(all: T[], a: { limit?: number; offset?: number }, row: (t: T) => unknown, atLeast = false) {
+  const offset = a.offset ?? 0;
+  const items = all.slice(offset, offset + (a.limit ?? PAGE_DEFAULT)).map(row);
+  const more = Math.max(0, all.length - offset - items.length);
+  return {
+    total: all.length, ...(atLeast && { totalIsAtLeast: true }), offset, more, items,
+    ...(more > 0 && { note: `${more}${atLeast ? '+' : ''} more: pass offset: ${offset + items.length} for the next page` }),
+  };
+}
+
+/** Cut a server string for a list row; the get tools give the whole thing. */
+const cut = (s: unknown, n: number) => (typeof s === 'string' ? (s.length > n ? `${s.slice(0, n - 1)}…` : s) : null);
+
+/** An Inbox item as a list row: what to decide on, not the PR's description, diff or thread (inbox_get has those). */
+const inboxRow = (c: Record<string, any>) => ({
+  id: c.id, projectKey: c.projectKey, source: c.source, status: c.status,
+  label: c.classification?.label ?? null, confidence: c.classification?.confidence ?? null, summary: cut(c.classification?.summary, 240),
+  ...(c.external && { author: c.external.author ?? null, authorKind: c.external.authorKind ?? null, title: cut(c.external.title, 120), url: c.external.url ?? null }),
+  createdAt: c.createdAt ?? null, decidedBy: c.decidedBy ?? null,
+});
+
+/** A lesson as a list row: the rule cut short and its check flags by name (lesson_get has the evidence). */
+const lessonRow = (l: Record<string, any>) => ({
+  id: l.id, status: l.status, projectKey: l.projectKey ?? null, scope: l.scope, title: cut(l.title, 160), rule: cut(l.rule, 300),
+  cause: l.cause ?? null, paths: (l.paths ?? []).slice(0, 5), checks: l.checks ? l.checks.map((c: { name: string }) => c.name) : null,
+  createdAt: l.createdAt, decidedBy: l.decidedBy ?? null,
+});
+
+/** What a client may assume about a tool (MCP ToolAnnotations): a read needs no approval; a write says how far it reaches. */
+const READ = { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false } as const;
+const write = (o: { destructive?: boolean; idempotent?: boolean; openWorld?: boolean } = {}) =>
+  ({ readOnlyHint: false, destructiveHint: !!o.destructive, idempotentHint: !!o.idempotent, openWorldHint: !!o.openWorld });
+type Annotations = typeof READ | ReturnType<typeof write>;
+
 function buildServer(call: Call, sleep: (ms: number) => Promise<void>) {
   const server = new McpServer({ name: 'feedback-graph-admin', version: VERSION });
-  const reg = <S extends z.ZodRawShape>(name: ToolName, description: string, inputSchema: S, fn: (a: z.objectOutputType<S, z.ZodTypeAny>) => Promise<ReturnType<typeof text>>) =>
-    server.registerTool(name, { description: description + needs(name), inputSchema }, fn as never);
+  const reg = <S extends z.ZodRawShape>(name: ToolName, description: string, inputSchema: S, annotations: Annotations, fn: (a: z.objectOutputType<S, z.ZodTypeAny>) => Promise<Result>) =>
+    server.registerTool(name, { description: description + needs(name), inputSchema, annotations }, fn as never);
 
   reg('pipeline_status', "Feedback Graph's health and every pipeline stage's backlog (fg status and fg pipeline): worker stage, models, Inbox, post-mortems, lessons, scans.", {
     project: z.string().min(1).max(MAX.key).optional().describe("One project's counts only"),
-  }, async (a) => {
+  }, READ, async (a) => {
     const [status, pipeline] = await Promise.all([call('GET', '/api/status'), call('GET', `/api/pipeline${qs({ project: a.project })}`)]);
     if (!status.ok) return fail(status);
     if (!pipeline.ok) return fail(pipeline);
     return json({ status: status.data, pipeline: pipeline.data });
   });
 
-  reg('list_projects', 'Every project folder: which are selected (tracked), and the shown projects with sessions, feedback, lessons, facts, last scan and pin.', {}, async () => {
+  reg('list_projects', 'Every project folder, one row each: whether it is selected (read), pinned, its sessions, feedback, lessons and facts, and its last scan. Paged.', {
+    selected_only: z.boolean().optional().describe('Only the selected folders'),
+    ...Paging,
+  }, READ, async (a) => {
     const [settings, shown] = await Promise.all([call('GET', '/api/settings/projects'), call('GET', '/api/projects')]);
     if (!shown.ok) return fail(shown);
-    const s = settings.ok ? (settings.data as { tracked?: unknown; candidates?: unknown }) : null;
-    return json({ tracked: s?.tracked ?? null, folders: s?.candidates ?? null, projects: shown.data });
+    type Folder = { key: string; exists?: boolean; tracked?: boolean; excluded?: boolean; aliasOf?: string | null; claudeSessions?: number; codexSessions?: number };
+    const s = settings.ok ? (settings.data as { tracked?: string[]; candidates?: Folder[] }) : null;
+    const projects = new Map((shown.data as Record<string, any>[]).map((p) => [p.key as string, p]));
+    const folders = new Map((s?.candidates ?? []).map((f) => [f.key, f]));
+    const keys = [...folders.keys(), ...[...projects.keys()].filter((k) => !folders.has(k))];
+    const rows = keys.map((key) => {
+      const f = folders.get(key);
+      const p = projects.get(key);
+      const scan = p?.lastScan;
+      return {
+        key, selected: f ? !!f.tracked || !!s?.tracked?.includes(key) : true, pinned: !!p?.pinned,
+        sessions: p?.sessions ?? (f ? (f.claudeSessions ?? 0) + (f.codexSessions ?? 0) : null),
+        feedback: p?.feedback ?? null, lessons: p?.lessons ?? null, facts: p?.facts ?? null,
+        lastScan: scan ? { status: scan.status, at: scan.finishedAt ?? scan.startedAt ?? scan.requestedAt ?? null } : null,
+        ...(f?.excluded && { note: 'excluded (EXCLUDE_PROJECTS)' }), ...(f?.aliasOf && { note: `clone of ${f.aliasOf}` }), ...(f && f.exists === false && { note: 'folder gone' }),
+      };
+    });
+    return json({ tracked: s?.tracked ?? null, ...page(a.selected_only ? rows.filter((r) => r.selected) : rows, a, (r) => r) });
   });
 
   reg('select_projects', 'Choose which project folders are read (opt-in). mode add (default) adds keys to the selection, only makes it exactly these, remove takes them out. all: every selectable folder.', {
     keys: Keys.optional(),
     all: z.literal(true).optional(),
     mode: z.enum(['add', 'only', 'remove']).optional(),
-  }, async (a) => {
+  }, write({ idempotent: true }), async (a) => {
     if ((a.keys === undefined) === (a.all === undefined)) return text('send either keys or all: true', true);
     const current = await call('GET', '/api/settings/projects');
     if (!current.ok) return fail(current);
@@ -122,7 +196,7 @@ function buildServer(call: Call, sleep: (ms: number) => Promise<void>) {
     provider: z.string().min(1).max(MAX.provider).optional().describe('The model to scan with, e.g. codex-cli or ollama:<model>; default: the configured one'),
     wait: z.boolean().optional().describe('Default false: return once queued'),
     timeout_seconds: z.number().int().min(1).max(WAIT_MAX_S).optional().describe(`How long wait follows the jobs (default ${WAIT_DEFAULT_S})`),
-  }, async (a) => {
+  }, write(), async (a) => {
     const queued = await call('POST', '/api/projects/scan', { ...(a.keys && { keys: a.keys }), ...(a.all && { all: true }), ...(a.provider && { provider: a.provider }) });
     if (!queued.ok || !a.wait) return answer(queued);
     type Result = { key: string; queued: boolean; job?: { id: string; status: string } };
@@ -145,16 +219,21 @@ function buildServer(call: Call, sleep: (ms: number) => Promise<void>) {
     return json({ jobs: [...jobs.values()], refused: results.filter((x) => !x.queued) });
   });
 
-  reg('inbox_list', 'Inbox items (flagged developer pushback waiting for a decision), newest first.', {
+  reg('inbox_list', 'Inbox items (flagged developer pushback waiting for a decision), newest first, one compact row each: id, project, source, label, summary, author and link. inbox_get gives one item in full. Paged.', {
     status: z.enum(['pending', 'confirmed', 'rejected']).optional().describe('Default pending'),
     source: z.enum(FEEDBACK_SOURCES as [string, ...string[]]).optional().describe('Only items from this source'),
     project: z.string().min(1).max(MAX.key).optional(),
-    limit: z.number().int().min(1).max(LIST_MAX).optional().describe('How many items the store returns before the source filter (default 100)'),
-  }, async (a) => {
-    const r = await call('GET', `/api/candidates${qs({ status: a.status ?? 'pending', project: a.project, limit: a.limit ?? 100 })}`);
-    if (!r.ok || !a.source) return answer(r);
-    return json((r.data as { source?: string }[]).filter((c) => c.source === a.source));
+    ...Paging,
+  }, READ, async (a) => {
+    const r = await call('GET', `/api/candidates${qs({ status: a.status ?? 'pending', project: a.project, source: a.source, limit: LIST_MAX })}`);
+    if (!r.ok) return fail(r);
+    const all = r.data as Record<string, any>[];
+    return json(page(all.filter((c) => !a.source || c.source === a.source), a, inboxRow, all.length >= LIST_MAX));
   });
+
+  reg('inbox_get', 'One Inbox item in full: the comment, the conversation or PR around it (description, diff), and its post-mortem.', {
+    id: z.string().min(1).max(MAX.id),
+  }, READ, async (a) => answer(await call('GET', `/api/candidates/${enc(a.id)}`)));
 
   reg('inbox_decide', 'Confirm or reject Inbox items (confirmed ones feed a post-mortem that proposes lessons for the owner to approve). Says per item what happened.', {
     items: z.array(z.object({
@@ -162,21 +241,25 @@ function buildServer(call: Call, sleep: (ms: number) => Promise<void>) {
       decision: z.enum(['confirm', 'reject']),
       reason: z.string().max(MAX.reason).optional(),
     }).strict()).min(1).max(500),
-  }, async (a) => answer(await call('POST', '/api/candidates/decisions', { items: a.items })));
+  }, write({ destructive: true }), async (a) => answer(await call('POST', '/api/candidates/decisions', { items: a.items })));
 
-  reg('lessons_list', 'Lessons learned from post-mortems: proposed ones wait for the owner; approved ones reach agents.', {
+  reg('lessons_list', 'Lessons learned from post-mortems, one compact row each (the rule cut short, check flags by name): proposed ones wait for the owner; approved ones reach agents. lesson_get gives one in full. Paged.', {
     status: z.enum(['proposed', 'approved', 'rejected', 'superseded']).optional(),
     project: z.string().min(1).max(MAX.key).optional(),
-    limit: z.number().int().min(1).max(LIST_MAX).optional().describe('At most this many (default 100)'),
-  }, async (a) => {
+    ...Paging,
+  }, READ, async (a) => {
     const r = await call('GET', `/api/lessons${qs({ status: a.status, project: a.project })}`);
-    return r.ok ? json((r.data as unknown[]).slice(0, a.limit ?? 100)) : fail(r);
+    return r.ok ? json(page(r.data as Record<string, any>[], a, lessonRow)) : fail(r);
   });
+
+  reg('lesson_get', 'One lesson in full, with the miss and the feedback it was learned from.', {
+    id: z.string().min(1).max(MAX.id),
+  }, READ, async (a) => answer(await call('GET', `/api/lessons/${enc(a.id)}`)));
 
   reg('lesson_decide', 'Approve a proposed lesson (agents are given it from then on) or reject it. Off by default: lessons are the owner\'s decision.', {
     id: z.string().min(1).max(MAX.id),
     decision: z.enum(['approve', 'reject']),
-  }, async (a) => {
+  }, write({ destructive: true, idempotent: true }), async (a) => {
     const r = await call('PATCH', `/api/lessons/${enc(a.id)}`, { status: a.decision === 'approve' ? 'approved' : 'rejected' });
     return r.ok ? json({ id: a.id, status: a.decision === 'approve' ? 'approved' : 'rejected' }) : fail(r);
   });
@@ -187,7 +270,7 @@ function buildServer(call: Call, sleep: (ms: number) => Promise<void>) {
     decision: z.enum(['confirm', 'dismiss', 'reopen']),
     relation: z.enum(LINK_RELATIONS).optional(),
     note: z.string().max(MAX.note).optional(),
-  }, async (a) => {
+  }, write({ idempotent: true }), async (a) => {
     const status = a.decision === 'confirm' ? 'confirmed' : a.decision === 'dismiss' ? 'dismissed' : 'suggested';
     return answer(await call('PUT', '/api/links', { a: a.a, b: a.b, status, ...(a.relation && { relation: a.relation }), ...(a.note !== undefined && { note: a.note }) }));
   });
@@ -196,18 +279,18 @@ function buildServer(call: Call, sleep: (ms: number) => Promise<void>) {
     project: z.string().min(1).max(MAX.key),
     id: z.string().min(1).max(MAX.id),
     relevance: z.number().min(0).max(1),
-  }, async (a) => {
+  }, write({ idempotent: true }), async (a) => {
     const r = await call('PATCH', `/api/projects/${enc(a.project)}/facts/${enc(a.id)}/relevance`, { relevance: a.relevance });
     return r.ok ? json({ id: a.id, relevance: a.relevance }) : fail(r);
   });
 
   reg('cloud_sync_now', 'Send what changed since the last Feedback Graph Cloud sync now (force: everything). Only when cloud sync is configured.', {
     force: z.boolean().optional(),
-  }, async (a) => answer(await call('POST', '/api/cloud/sync', a.force === undefined ? {} : { force: a.force })));
+  }, write({ idempotent: true, openWorld: true }), async (a) => answer(await call('POST', '/api/cloud/sync', a.force === undefined ? {} : { force: a.force })));
 
   reg('rebuild_code_map', "Remap a project's code from scratch at the worker's next pass.", {
     project: z.string().min(1).max(MAX.key),
-  }, async (a) => answer(await call('POST', `/api/projects/${enc(a.project)}/codemap/rebuild`, {})));
+  }, write({ idempotent: true }), async (a) => answer(await call('POST', `/api/projects/${enc(a.project)}/codemap/rebuild`, {})));
 
   return server;
 }

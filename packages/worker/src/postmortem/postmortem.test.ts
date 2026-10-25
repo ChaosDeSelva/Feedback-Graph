@@ -1,7 +1,7 @@
 import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { STRICT_JSON, type HumanTurn, type PostMortemInput } from '@fb/core';
+import { NO_CONTEXT_WHY, STRICT_JSON, type HumanTurn, type PostMortemInput } from '@fb/core';
 import { expect, test } from 'vitest';
 import { buildPrompt, loadStandingContext, markAvailability, memoryDirFor, runPostMortem } from './postmortem.ts';
 
@@ -102,6 +102,13 @@ test('markAvailability counts only the instruction files the session\'s agent lo
   ]);
   expect(markAvailability(items, input).map((i) => [i.kind, i.wasAvailable])).toEqual([
     ['agents_md', false], ['claude_md', true], ['memory', true],
+  ]);
+});
+
+test("markAvailability reads a why the model filled with a field name or a boolean as no reason, never prints it", () => {
+  const items = ['wasAvailable', ' true ', '', 'The handler already scoped by orgId'].map((why) => ({ kind: 'code' as const, ref: 'api/search.ts', excerpt: '', why }));
+  expect(markAvailability(items, input).map((i) => i.why)).toEqual([
+    NO_CONTEXT_WHY, NO_CONTEXT_WHY, NO_CONTEXT_WHY, 'The handler already scoped by orgId',
   ]);
 });
 
@@ -262,4 +269,66 @@ test('without touched files (none recorded, or no lookup) the model\'s paths sta
     llm: { id: 'fake', agentic: false, json: async () => answer({ paths: ['./api/**', '/etc/x'] }) },
   });
   expect(result.lesson.paths).toEqual(['api/**']);
+});
+
+const gitInput: PostMortemInput = {
+  ...input, note: null,
+  feedback: turn(2, 'you merged it back to main, it was supposed to stay on its own branch'),
+  turns: [turn(0, 'fix the chart embeds'), turn(1, 'keep it on its own branch'), turn(2, 'you merged it back to main, it was supposed to stay on its own branch')],
+};
+
+test('a miss about how the work was handled (branches, merges) is a process miss: on no file, with no paths', async () => {
+  const run = (paths: string[]) => runPostMortem(gitInput, {
+    standing: async () => [], facts: async () => [],
+    touched: async () => ({ edited: ['web/src/markdown/pipeline.ts'], fixed: [] }),
+    llm: { id: 'fake', agentic: false, json: async () => ({
+      ...answer({}),
+      lesson: { title: 'Stay on the branch', rule: 'Keep work on its own branch and never merge it to main unless the developer asks', appliesWhen: 'finishing a task', scope: 'project', paths },
+    }) },
+  });
+  const result = await run([]);
+  expect(result.subject).toBe('process');
+  expect(result.lesson.paths).toEqual([]);
+  expect(result.lessonChecks?.map((c) => c.name)).not.toContain('needs-path');
+  // A lesson tied to a file the evidence supports is about that code: it keeps the file and stays on it.
+  const onFile = await run(['web/src/markdown/pipeline.ts']);
+  expect(onFile.subject).toBeUndefined();
+  expect(onFile.lesson.paths).toEqual(['web/src/markdown/pipeline.ts']);
+  // Pushback about the code stays about the code.
+  const code = await runPostMortem(input, { standing: async () => [], facts: async () => [], llm: { id: 'fake', agentic: false, json: async () => answer({ paths: ['api/**'] }) } });
+  expect(code.subject).toBeUndefined();
+});
+
+test('the lesson comes back in shape: no PR numbers in the rule, a title that is not the rule, an appliesWhen that says when', async () => {
+  const result = await runPostMortem(input, {
+    standing: async () => [], facts: async () => [],
+    llm: { id: 'fake', agentic: false, json: async () => ({
+      ...answer({}),
+      lesson: { title: 'Filter search on the server, as in PR #812', rule: 'Filter search on the server, as in PR #812', appliesWhen: '', scope: 'project', paths: ['api/search.ts'] },
+    }) },
+  });
+  expect(result.lesson).toMatchObject({ rule: 'Filter search on the server', title: 'Customer search', appliesWhen: 'When changing api/search.ts' });
+  expect(result.trace.lessonShaped).toEqual(['rule', 'title', 'appliesWhen']);
+});
+
+test('the cause is code_not_read when the code it cites is in the repository and the session never read it', async () => {
+  const run = (exists: (p: string) => boolean) => runPostMortem(input, {
+    standing: async () => [], facts: async () => [], exists: async (_i, p) => exists(p),
+    llm: { id: 'fake', agentic: false, json: async () => ({
+      ...answer({}), cause: 'context_missing',
+      contextItems: [{ kind: 'code', ref: 'api/filters.ts:10-20', excerpt: 'export function serverFilter', why: 'the server filter existed' }],
+    }) },
+  });
+  expect((await run((p) => p === 'api/filters.ts')).cause).toBe('code_not_read');
+  expect((await run(() => false)).cause).toBe('context_missing');
+});
+
+test('facts the post-mortem noticed come back beside the lesson as proposals; none or a malformed list is []', async () => {
+  const run = (facts: unknown) => runPostMortem(input, {
+    standing: async () => [], facts: async () => [],
+    llm: { id: 'fake', agentic: false, json: async () => ({ ...answer({}), ...(facts !== undefined && { facts }) }) },
+  });
+  expect((await run([{ path: 'api/search.ts', statement: 'search() filters in SQL with a 200-row cap' }])).facts).toEqual([{ path: 'api/search.ts', statement: 'search() filters in SQL with a 200-row cap' }]);
+  expect((await run(undefined)).facts).toEqual([]);
+  expect((await run('none')).facts).toEqual([]);
 });

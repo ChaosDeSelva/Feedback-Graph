@@ -48,8 +48,13 @@ export function IncludeTests({ checked, onChange }: { checked: boolean; onChange
 }
 
 /** The Projects page's code map: its size, its hotspots (sortable), and a module panel for the file you pick. */
-export function CodeMap({ projectKey, initialModule = null, focus = null }: {
+/** How long the card waits for a rebuilt map before it stops asking. */
+const REBUILD_WAIT_MS = 15 * 60_000;
+
+export function CodeMap({ projectKey, initialModule = null, focus = null, pollMs = 5000 }: {
   projectKey: string;
+  /** How often the card asks for the new map after Rebuild map, until it arrives. */
+  pollMs?: number;
   initialModule?: string | null;
   /** Open this file's panel (a fact's file name was clicked); `at` makes the same file asked again a new request. */
   focus?: { path: string; at: number } | null;
@@ -66,6 +71,8 @@ export function CodeMap({ projectKey, initialModule = null, focus = null }: {
   // The panel a link asked for survives the first load only (run twice in StrictMode); any other project or filter closes it.
   const linked = useRef(initialModule ? projectKey : null);
   const [rebuild, setRebuild] = useState<{ busy: boolean; said: string | null; error: string | null }>({ busy: false, said: null, error: null });
+  // After Rebuild map: the builtAt of the map it replaces; the card polls until a map with another one arrives.
+  const [awaiting, setAwaiting] = useState<{ builtAt: string | null; since: number } | null>(null);
 
   useEffect(() => {
     setReport(null);
@@ -77,10 +84,30 @@ export function CodeMap({ projectKey, initialModule = null, focus = null }: {
     setAll(false);
     setShowZero(false);
     setRebuild({ busy: false, said: null, error: null });
+    setAwaiting(null);
     let stale = false;
     api.codeMap(projectKey, undefined, tests).then((r) => { if (!stale) setReport({ meta: r?.meta ?? null, hotspots: r?.hotspots ?? [], capped: r?.capped }); }, (e) => { if (!stale) setError(String(e)); });
     return () => { stale = true; };
   }, [projectKey, tests]);
+
+  useEffect(() => {
+    if (!awaiting) return;
+    let stale = false;
+    const t = setInterval(() => {
+      if (Date.now() - awaiting.since > REBUILD_WAIT_MS) {
+        setAwaiting(null);
+        setRebuild({ busy: false, said: 'The worker has not rebuilt the map yet: it may be busy with a long job. Reload this page later to see it.', error: null });
+        return;
+      }
+      api.codeMap(projectKey, undefined, tests).then((r) => {
+        if (stale || !r?.meta || r.meta.builtAt === awaiting.builtAt) return;
+        setReport({ meta: r.meta, hotspots: r.hotspots ?? [], capped: r.capped });
+        setAwaiting(null);
+        setRebuild({ busy: false, said: `Map rebuilt ${new Date(r.meta.builtAt).toLocaleString()}.`, error: null });
+      }, () => {});
+    }, pollMs);
+    return () => { stale = true; clearInterval(t); };
+  }, [awaiting, projectKey, tests, pollMs]);
 
   const rows = useMemo(() => {
     const hs = [...(report?.hotspots ?? [])];
@@ -95,7 +122,10 @@ export function CodeMap({ projectKey, initialModule = null, focus = null }: {
   const askRebuild = () => {
     setRebuild({ busy: true, said: null, error: null });
     api.rebuildCodeMap(projectKey).then(
-      () => setRebuild({ busy: false, said: 'Rebuild queued: the worker remaps this project from scratch at its next pass (a minute or so).', error: null }),
+      () => {
+        setRebuild({ busy: false, said: 'Rebuild queued: the worker remaps this project from scratch at its next pass (a minute or so). This card updates when the new map is in.', error: null });
+        setAwaiting({ builtAt: meta?.builtAt ?? null, since: Date.now() });
+      },
       (e) => setRebuild({ busy: false, said: null, error: e instanceof Error ? e.message : String(e) }),
     );
   };
@@ -104,7 +134,7 @@ export function CodeMap({ projectKey, initialModule = null, focus = null }: {
       title="Code map"
       bodyClass="grid gap-3 p-3"
       actions={meta ? (
-        <Button size="sm" onClick={askRebuild} disabled={rebuild.busy} title="remap this project from scratch, whether or not the repo changed">
+        <Button size="sm" onClick={askRebuild} disabled={rebuild.busy || !!awaiting} title="remap this project from scratch, whether or not the repo changed">
           Rebuild map
         </Button>
       ) : undefined}

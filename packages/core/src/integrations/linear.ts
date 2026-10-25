@@ -161,7 +161,7 @@ const TEAM_COMMENTS = `query TeamComments($teamId: ID!, $since: DateTimeOrDurati
   issues(first: 50, after: $after, orderBy: updatedAt, filter: { team: { id: { eq: $teamId } }, updatedAt: { gt: $since } }) {
     pageInfo { hasNextPage endCursor }
     nodes {
-      id identifier title url branchName description priorityLabel
+      id identifier title url branchName description priorityLabel updatedAt
       state { name }
       labels(first: 20) { nodes { name } }
       assignee { name displayName }
@@ -184,6 +184,7 @@ const CommentsPage = z.object({
         branchName: z.string().nullable().optional(),
         description: z.string().nullable().optional(),
         priorityLabel: z.string().nullable().optional(),
+        updatedAt: z.string().nullable().optional(),
         state: z.object({ name: z.string() }).nullable().optional(),
         labels: z.object({ nodes: z.array(z.object({ name: z.string() })) }).nullable().optional(),
         assignee: z.object({ name: z.string(), displayName: z.string().nullable().optional() }).nullable().optional(),
@@ -204,17 +205,20 @@ const CommentsPage = z.object({
   }),
 });
 
+/** A team's issue as read for context (fetchLinearIssues): the ticket and its people's comments, oldest first. */
+export type LinearTeamIssue = LinearComment['issue'] & { updatedAt: string | null; comments: Omit<LinearComment, 'issue'>[] };
+
 /**
- * Comments by people (not bots or integrations) on the team's issues updated after `since` (ISO), oldest first, at
- * most 10 pages of 50 issues. Raw text: redaction is the caller's job.
+ * The team's issues updated after `since` (ISO), with the comments people (not bots or integrations) wrote on them:
+ * one GraphQL query per page of 50, at most 10 pages. Raw text: redaction is the caller's job.
  */
-export async function fetchLinearComments(o: { apiKey: string; teamId: string; since: string; fetchImpl?: typeof fetch }): Promise<LinearComment[]> {
-  const out: LinearComment[] = [];
+export async function fetchLinearIssues(o: { apiKey: string; teamId: string; since: string; fetchImpl?: typeof fetch }): Promise<LinearTeamIssue[]> {
+  const out: LinearTeamIssue[] = [];
   let after: string | null = null;
   for (let page = 0; page < MAX_LINEAR_PAGES; page++) {
     const data = CommentsPage.parse(await linearRequest(o.apiKey, TEAM_COMMENTS, { teamId: o.teamId, since: o.since, after }, o.fetchImpl ?? fetch));
     for (const i of data.issues.nodes) {
-      const issue: LinearComment['issue'] = {
+      out.push({
         id: i.id,
         identifier: i.identifier,
         title: i.title,
@@ -225,23 +229,63 @@ export async function fetchLinearComments(o: { apiKey: string; teamId: string; s
         priority: i.priorityLabel ?? null,
         labels: (i.labels?.nodes ?? []).map((l) => l.name),
         assignee: i.assignee ? i.assignee.displayName || i.assignee.name : null,
-      };
-      for (const c of i.comments.nodes) {
-        if (!c.user || c.botActor || !c.body?.trim()) continue;
-        out.push({
-          id: c.id,
-          author: c.user.displayName || c.user.name,
-          body: c.body,
-          url: c.url ?? i.url,
-          createdAt: c.createdAt,
-          issue,
-        });
-      }
+        updatedAt: i.updatedAt ?? null,
+        comments: i.comments.nodes
+          .filter((c) => c.user && !c.botActor && c.body?.trim())
+          .map((c) => ({ id: c.id, author: c.user!.displayName || c.user!.name, body: c.body!, url: c.url ?? i.url, createdAt: c.createdAt }))
+          .sort((a, b) => a.createdAt.localeCompare(b.createdAt)),
+      });
     }
     if (!data.issues.pageInfo.hasNextPage || !data.issues.pageInfo.endCursor) break;
     after = data.issues.pageInfo.endCursor;
   }
-  return out.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+  return out;
+}
+
+/** The issues' comments as feedback (one per comment, carrying its ticket), oldest first. */
+export function linearCommentsOf(issues: LinearTeamIssue[]): LinearComment[] {
+  return issues
+    .flatMap(({ comments, updatedAt: _u, ...issue }) => comments.map((c) => ({ ...c, issue })))
+    .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+}
+
+/**
+ * Comments by people (not bots or integrations) on the team's issues updated after `since` (ISO), oldest first, at
+ * most 10 pages of 50 issues. Raw text: redaction is the caller's job.
+ */
+export async function fetchLinearComments(o: { apiKey: string; teamId: string; since: string; fetchImpl?: typeof fetch }): Promise<LinearComment[]> {
+  return linearCommentsOf(await fetchLinearIssues(o));
+}
+
+/** The latest comments of an issue kept as context: older ones are in the Inbox threads already. */
+const MAX_DOC_COMMENTS = 30;
+
+/**
+ * An issue as a document's chunks: the ticket (identifier, state, priority, labels, title, url, description), then one
+ * chunk per comment (the latest 30), each naming the ticket so a search hit says where it is from. Capped at 4000 chars.
+ */
+export function linearIssueDocChunks(i: LinearTeamIssue): string[] {
+  const details = [i.state, i.priority, ...i.labels].filter(Boolean).join(', ');
+  const head = `Linear ${i.identifier}${details ? ` (${details})` : ''}: ${i.title}\n${i.url}${i.assignee ? `\nAssignee: ${i.assignee}` : ''}${i.description.trim() ? `\n\n${i.description.trim()}` : ''}`;
+  return [
+    head.slice(0, CHUNK_CAP),
+    ...i.comments.slice(-MAX_DOC_COMMENTS).map((c) => `comment by ${c.author} on Linear ${i.identifier} (${i.title}):\n${c.body}`.slice(0, CHUNK_CAP)),
+  ];
+}
+
+/** Linear identifiers such as ENG-123 (a team key of 2 to 10 letters and digits, starting with two letters). */
+const TICKET_ID = /\b([A-Za-z]{2}[A-Za-z0-9]{0,8})-(\d{1,6})\b/g;
+const MAX_TICKET_IDS = 20;
+
+/**
+ * The ticket identifiers a pull request names in its title, body or branch (jo/eng-45-fix is ENG-45), upper-cased, in
+ * order, at most 20. Anything shaped like one counts ("UTF-8"): a link is made only to a stored Linear issue with that
+ * identifier (DocsStore.linkedDocs), so a lookalike links nothing.
+ */
+export function ticketIdsIn(...texts: (string | null | undefined)[]): string[] {
+  const out = new Set<string>();
+  for (const t of texts) for (const m of (t ?? '').matchAll(TICKET_ID)) if (out.size < MAX_TICKET_IDS) out.add(`${m[1].toUpperCase()}-${m[2]}`);
+  return [...out];
 }
 
 /** One chunk per issue: header, description, then comments; capped at 4000 chars. */

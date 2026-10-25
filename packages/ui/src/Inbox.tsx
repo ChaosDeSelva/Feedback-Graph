@@ -32,7 +32,15 @@ export function Inbox() {
   const focus = tabLink ? null : link;
   const [status, setStatus] = useState<CandidateStatus>(tabLink ?? 'pending');
   const [project, setProject] = useState('');
+  // The tab and project a page was asked for: a page that arrives after you moved on is dropped.
+  const statusRef = useRef(status);
+  const projectRef = useRef(project);
+  statusRef.current = status;
+  projectRef.current = project;
   const [all, setItems] = useState<Candidate[]>([]);
+  // Where the next page of this tab starts, or null when every item is loaded.
+  const [next, setNext] = useState<number | null>(null);
+  const [loadingMore, setLoadingMore] = useState(false);
   // Where the feedback came from: a Claude Code or Codex session, or a comment on GitHub or Linear. Filtered here.
   const [source, setSource] = useState<FeedbackSource | ''>('');
   const items = source ? all.filter((c) => (c.source ?? 'claude') === source) : all;
@@ -61,9 +69,11 @@ export function Inbox() {
     setError(null);
     // The answer for a tab or project you have left must not fill the one you are on.
     let stale = false;
-    api.candidates(status, project || undefined).then((c) => {
+    setNext(null);
+    api.candidates(status, project || undefined).then(({ items: page, next: more }) => {
       if (stale) return;
-      c = stableOrder(status, c);
+      const c = stableOrder(status, page);
+      setNext(more);
       const at = focus ? c.findIndex((x) => x.id === focus) : -1;
       setItems(c);
       setSelected(Math.max(0, at));
@@ -74,6 +84,23 @@ export function Inbox() {
   }, [status, project]);
 
   const current = items[selected];
+  // The next page joins the list in the same stable order; the item you are on stays selected.
+  const loadMore = () => {
+    if (next === null || loadingMore) return;
+    setLoadingMore(true);
+    const at = { status, project, id: current?.id };
+    api.candidates(status, project || undefined, next).then(({ items: page, next: more }) => {
+      if (at.status !== statusRef.current || at.project !== projectRef.current) return;
+      setItems((xs) => {
+        const seen = new Set(xs.map((x) => x.id));
+        const merged = stableOrder(status, [...xs, ...page.filter((x) => !seen.has(x.id))]);
+        const i = merged.findIndex((x) => x.id === at.id);
+        if (i >= 0) setSelected(i);
+        return merged;
+      });
+      setNext(more);
+    }, (e) => setError(String(e))).finally(() => setLoadingMore(false));
+  };
   useEffect(() => {
     setDetail(null);
     setNote('');
@@ -147,7 +174,7 @@ export function Inbox() {
         listHeader={
           <>
             <Tabs label="status" value={status} options={TABS} onChange={setStatus} />
-            {loaded && <span className="ml-auto text-xs text-muted tabular-nums">{plural(items.length, 'item')}</span>}
+            {loaded && <span className="ml-auto text-xs text-muted tabular-nums" title={next !== null ? 'the Inbox loads a page at a time: Load more, at the end of the list, adds the next' : undefined}>{plural(items.length, 'item')}{next !== null ? ', more waiting' : ''}</span>}
           </>
         }
         detailOpen={open && items.length > 0}
@@ -171,6 +198,11 @@ export function Inbox() {
                   </ListRow>
                 </li>
               ))}
+              {next !== null && (
+                <li className="px-3 py-2">
+                  <Button size="sm" variant="ghost" onClick={loadMore} disabled={loadingMore}>{loadingMore ? 'Loading…' : 'Load more'}</Button>
+                </li>
+              )}
             </ul>
           )
         }

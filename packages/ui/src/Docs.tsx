@@ -76,13 +76,13 @@ export function Docs() {
             never added twice). Add <Code>claude</Code> or <Code>codex</Code> to set up only one. The guidance tells the agent when to call each tool, so you don't have to ask:
           </p>
           <dl className="mt-2 space-y-2">
-            <Tool name="get_task_context">At the start of a task: approved lessons, similar past misses, code facts and docs for this project and task. When the agent names the files it will touch, lessons tied to those files come first.</Tool>
+            <Tool name="get_task_context">At the start of a task: approved lessons, similar past misses, code facts and docs for this project and task. When the agent names the files it will touch, lessons tied to those files come first, and files with no facts are queued for the next scan. <Code>brief: true</Code> gives only lessons, misses on those files, their importers and tests, and PR discussions (about 1,500 characters).</Tool>
             <Tool name="check_before_done">Before claiming done: compares the work against past misses and lists gaps it should address. Given <Code>files_changed</Code>, it also names the importers and tests of those files the change did not touch, and what the last misses there were about.</Tool>
             <Tool name="get_module_context">Before changing a file: what it is, its symbols, who imports it, what it imports, the tests that cover it, and the lessons and misses tied to it.</Tool>
             <Tool name="impact">Before changing files others use: everything that imports them (and how far away), the tests to run, and lessons and misses on all of it.</Tool>
             <Tool name="report_feedback">For <Code>/postmortem</Code>, or a miss you did not put in words: sends it to your Inbox. Pushback you typed is flagged from the session anyway; a report of the same moment joins that Inbox item.</Tool>
             <Tool name="get_recent_sessions">When picking up work: the newest session summaries of this project (goal, what was done and decided, open threads, pushback, files). Task context also lists the three most recent in one line each.</Tool>
-            <Tool name="search_graph">Searches lessons and past misses by meaning.</Tool>
+            <Tool name="search_graph">Searches lessons, past misses, facts and docs by meaning, about 3,000 characters; says when nothing is close enough.</Tool>
           </dl>
           <p className="mt-2">
             If the detector missed some pushback, type <Code>/postmortem what it missed</Code> in Claude Code. It goes to the Inbox like any other item.
@@ -90,7 +90,7 @@ export function Docs() {
           <p className="mt-2">
             These tools only read and report. To let an agent or a script make some of your decisions (choose projects, start scans, confirm Inbox items),
             set <Code>FG_OPERATOR_TOKEN</Code> in <Code>.env</Code> and use <Code>./scripts/fg</Code>. <Code>OPERATOR_ALLOW</Code> lists what the token may do;
-            by default it may not decide lessons, delete data, change settings, import or set integration keys, so what agents learn stays your call. Its
+            by default it may not decide lessons, delete data, change settings, import, set integration keys or ask in Ask (which spends your subscription), so what agents learn stays your call. Its
             writes show in Activity as <Code>operator:&lt;name&gt;</Code>, and a lesson it decided carries a badge.
           </p>
         </Section>
@@ -168,9 +168,9 @@ export function Docs() {
             agents. The full guide, with every badge, is <Code>docs/guide.md</Code>.
           </p>
           <div className="grid gap-2">
-            <PageGuide name="Dashboard" shot="dashboard" summary="Where everything stands, each part linked to its page.">
+            <PageGuide name="Dashboard" shot="dashboard" summary="Ask first, then where everything stands, each part linked to its page.">
+              <li><b>Ask</b>, at the top: type a question, pick the project, press <Kbd>Enter</Kbd> (<Kbd>Shift</Kbd>+<Kbd>Enter</Kbd> for a new line): it opens a new chat on the Ask page. Starter questions fill the box; <b>suggested questions</b> ask about your hotspots; <b>recent chats</b> open your last conversations.</li>
               <li><b>Now</b>: the worker (green running, red offline) and the step it is on; one badge per model job (classifier, post-mortem, scan, summaries, docs reader, embeddings), red with the reason when it cannot be reached.</li>
-              <li><b>Ask</b>: pick a project, type, press Ask (<Kbd>⌘</Kbd>/<Kbd>Ctrl</Kbd>+<Kbd>Enter</Kbd>): it opens a new chat on the Ask page.</li>
               <li><b>Pipeline</b> tiles: Inbox waiting on you, turns to classify (<b>1000+</b> when capped; opens Activity filtered to feedback flagged, with the backlog), post-mortems queued (opens the Inbox&apos;s confirmed tab), lessons <b>proposed / approved</b>, scans <b>done / queued / running / failed</b>. A dash means unknown.</li>
               <li><b>Quality</b>: <b>repeat rate</b> (confirmed feedback that repeats an earlier kind of miss; lower is better), <b>checks that caught a gap</b> (pre-done checks that found one), and feedback per week: grey first time, red repeats.</li>
               <li><b>Projects</b> (pinned first), <b>Hotspots</b> (misses and score; a file opens its module panel) and <b>Recent activity</b>. Each card loads on its own, so one error never blanks the page.</li>
@@ -204,7 +204,7 @@ export function Docs() {
 
             <PageGuide name="Graph" shot="graph" summary="The evidence chain behind each miss, or a project's code map." extraShot={{ name: 'graph-code', alt: 'The Graph page in Code mode' }}>
               <li><b>Evidence</b> mode: feedback, misses, causes, lessons, context, tasks and fix commits, coloured as in the legend (with counts). Causes are the biggest circles, misses medium. Click a node for its text and connections; click a connection to move to it.</li>
-              <li><b>Code</b> mode draws one project&apos;s code map: its top hotspot files sized by score (red when misses touched them; lighter circles are tests), their imports (arrows) and tests (dashed), and the misses (diamonds) and lessons (squares) on them; click a file for its module panel.</li>
+              <li><b>Code</b> mode draws one project&apos;s code map: its top hotspot files sized by score (red when misses touched them; lighter circles are tests), their imports (arrows) and tests (dashed), and the misses (diamonds) and lessons (squares) on them; click a file for its module panel. Files never overlap and folders form their own clusters; a large map takes a few seconds to settle and fit.</li>
               <li>The top 12 hotspots and files with misses are always captioned; zoom in to name every file. Hover for the full path, score and misses. <b>Find a file by path</b> opens any mapped file. A note says when the drawing or the map is capped.</li>
             </PageGuide>
 
@@ -235,10 +235,11 @@ export function Docs() {
               <li>Kind colours: decisions take the colour of what was decided (green confirmed or approved, red rejected); post-mortem green; failures and deletes red; flags blue.</li>
             </PageGuide>
 
-            <PageGuide name="Settings" shot="settings" summary="Which project folders are read, and the connections.">
-              <li>Which project folders are read. Tick folders and press <b>Save selection</b>. Badges: <b>selected</b> (green), <b>adding</b> or <b>stopping</b> (unsaved), <b>excluded</b>, <b>clone of</b> another folder, <b>missing folder</b>, <b>has data</b>. A greyed box says why on hover.</li>
+            <PageGuide name="Settings" shot="settings" summary="Which project folders are read, and the connections, in four tabs.">
+              <li>Four tabs: <b>Projects</b>, <b>Integrations</b>, <b>Cloud sync</b>, <b>Clean up</b>. A link to a card opens its tab; unsaved folder changes stay in the bar on every tab.</li>
+              <li><b>Projects</b>: which project folders are read. Tick folders and press <b>Save selection</b>. Badges: <b>selected</b> (green), <b>adding</b> or <b>stopping</b> (unsaved), <b>excluded</b>, <b>clone of</b> another folder, <b>missing folder</b>, <b>has data</b>. A greyed box says why on hover.</li>
               <li><b>Where folders come from</b> holds the project roots: add or remove them there (there is none by default), and the folders sessions ran in outside them are suggested with their session counts, each one click from being a root. A saved change is mounted when you run <Code>./scripts/setup.sh</Code>, which restarts the containers. A folder that is not a git repo but holds repos one or two levels down is not one project: each git repo inside it is a project of its own.</li>
-              <li><b>Integrations</b> (GitHub, Linear, read-only), the comment <b>skip rules</b> with their counts, <b>Cloud sync</b>, and <b>Clean up</b>, which deletes the data of projects you have not selected. Every other page shows only the selected projects; Settings is the one place that lists every folder.</li>
+              <li><b>Integrations</b> (GitHub, Linear, read-only; a token saved here wins over one in <Code>.env</Code>), the comment <b>skip rules</b> with their counts, <b>Cloud sync</b>, and <b>Clean up</b>, which deletes the data of projects you have not selected. Every other page shows only the selected projects; Settings is the one place that lists every folder.</li>
             </PageGuide>
           </div>
         </Section>
@@ -283,7 +284,7 @@ export function Docs() {
             <li>
               In <SettingsLink />, under <b>Integrations</b>, paste a token and press <b>Connect</b>. It is checked with one read-only call and saved only if
               it works. For GitHub use a fine-grained token with only your projects' repositories and <b>Pull requests</b> and <b>Issues</b> read-only; for
-              Linear a personal API key. A token in <Code>.env</Code> (<Code>GITHUB_TOKEN</Code>, <Code>LINEAR_API_KEY</Code>) wins and shows as "set in .env".
+              Linear a personal API key. A token in <Code>.env</Code> (<Code>GITHUB_TOKEN</Code>, <Code>LINEAR_API_KEY</Code>) shows as "set in .env"; one saved here wins over it, and Disconnect goes back to it.
             </li>
             <li>Each selected project with a github.com remote is linked to its repository (<Code>GITHUB_REPOS</Code> overrides it). For Linear, pick each project's team.</li>
             <li>Every 10 minutes (<Code>INTEGRATION_SYNC_MINUTES</Code>) new comments are read; the first sync goes back 14 days. Bots are skipped.</li>

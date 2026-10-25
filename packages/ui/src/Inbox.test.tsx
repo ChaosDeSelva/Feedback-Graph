@@ -175,12 +175,32 @@ test('an empty inbox with projects selected and nothing given up shows the usual
   expect(screen.queryByRole('link', { name: /open settings/i })).toBeNull();
 });
 
+test('a long Inbox comes a page at a time: it says more are waiting, and Load more appends the next page', async () => {
+  const urls: string[] = [];
+  const page = (from: number, n: number) => Array.from({ length: n }, (_, i) => ({ ...cand(`c${from + i}`, `miss number ${from + i}`), createdAt: `2026-10-01T10:${String(from + i).padStart(2, '0')}:00Z` }));
+  vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+    urls.push(url);
+    if (url === '/api/candidates?status=pending&limit=200') return Response.json(page(0, 3), { headers: { 'x-next-offset': '200' } });
+    if (url === '/api/candidates?status=pending&limit=200&offset=200') return Response.json(page(3, 2));
+    const m = url.match(/\/api\/candidates\/(\w+)$/);
+    if (m) return Response.json(detail(m[1]));
+    return Response.json([]);
+  }));
+  render(<Inbox />);
+  await screen.findByText('miss number 0');
+  expect(screen.getByText(/3 items, more waiting/)).toBeTruthy();
+  fireEvent.click(screen.getByRole('button', { name: 'Load more' }));
+  expect(await screen.findByText('miss number 4')).toBeTruthy();
+  expect(screen.getByText('5 items')).toBeTruthy();
+  expect(screen.queryByRole('button', { name: 'Load more' })).toBeNull();
+});
+
 test('pending filtered to a project with nothing waiting shows that project\'s pipeline counts', async () => {
   const urls: string[] = [];
   vi.stubGlobal('fetch', vi.fn(async (url: string) => {
     urls.push(url);
     if (url === '/api/projects') return Response.json([{ key: 'demo' }, { key: 'other' }]);
-    if (url === '/api/candidates?status=pending&limit=500') return Response.json([cand('c1', 'first miss')]);
+    if (url === '/api/candidates?status=pending&limit=200') return Response.json([cand('c1', 'first miss')]);
     if (url.startsWith('/api/candidates?')) return Response.json([]);
     if (url.startsWith('/api/pipeline')) return Response.json({ stage: null, progress: null, sessions: 4, classify: null, inbox: { pending: 0, confirmed: 0 }, postmortems: null, lessons: null, scans: null });
     const m = url.match(/\/api\/candidates\/(\w+)$/);

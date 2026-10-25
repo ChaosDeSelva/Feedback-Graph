@@ -15,12 +15,24 @@ export type Shard = { key: string; roots: string[]; files: string[] };
 /** The paths a shard owns: under one of `prefixes` ('' is everything) and under none of `except` (FactsStore.replaceScopeFacts). */
 export type ShardScope = FactScope;
 
-/** Shards per repo at most: past this the smallest are merged, so a repo of 200 services is not 200 agent runs. */
-export const MAX_SHARDS = 24;
+/**
+ * Shards per repo at most: past this the smallest are merged, so a repo of 200 services is not 200 agent runs. High
+ * enough that a 10,000-file monorepo split at MAX_SHARD_FILES is not merged back into big shards.
+ */
+export const MAX_SHARDS = 40;
 /** A shard with fewer files than this is merged into the next smallest one: an agent run for two files is waste. */
 export const MIN_SHARD_FILES = 5;
+/**
+ * A shard with more files than this is split by its subdirectories: one agent run over 7,000 files read 31 of them. A
+ * directory holding more than this many files directly cannot be split (a scope is a set of directories).
+ */
+export const MAX_SHARD_FILES = 400;
 /** Directories whose children are taken as shards when the repo declares no workspace. */
 const SOURCE_ROOTS = ['src', 'packages', 'services', 'apps', 'cmd'];
+/** Files that make their directory a package or service of its own, whether or not a workspace file names it. */
+const PACKAGE_MANIFESTS = ['package.json', 'go.mod', 'pyproject.toml', 'setup.py', 'Cargo.toml', 'Package.swift', 'composer.json', 'Gemfile', 'mix.exs', 'pom.xml', 'build.gradle', 'build.gradle.kts'];
+/** A manifest under one of these is test data, not a package. */
+const FIXTURE_DIRS = new Set(['fixtures', '__fixtures__', 'testdata', 'test-fixtures', 'node_modules']);
 
 /** The workspace files planShards reads, from the repo root. */
 export const WORKSPACE_FILES = ['pnpm-workspace.yaml', 'package.json', 'go.work', 'Cargo.toml'];
@@ -28,8 +40,13 @@ export const WORKSPACE_FILES = ['pnpm-workspace.yaml', 'package.json', 'go.work'
 export const under = (path: string, root: string) => root === '' || path === root || path.startsWith(`${root}/`);
 export const inScope = (path: string, s: ShardScope) => s.prefixes.some((r) => under(path, r)) && !s.except.some((r) => under(path, r));
 
-/** Facts asked of a shard's agent run: 10 for a handful of files, growing with the square root, 60 at most. */
-export const shardBudget = (files: number) => Math.min(60, Math.max(10, Math.round(4 * Math.sqrt(files))));
+/** The most facts one agent run is asked for (the answer schema allows 120). */
+export const MAX_SHARD_BUDGET = 120;
+/**
+ * Facts asked of a shard's agent run: 10 for a handful of files, growing with the square root for small shards and
+ * with the file count (one per five files) for big ones, MAX_SHARD_BUDGET at most. 0.6.0 stopped at 60 from 225 files.
+ */
+export const shardBudget = (files: number) => Math.min(MAX_SHARD_BUDGET, Math.max(10, Math.round(4 * Math.sqrt(files)), Math.round(files / 5)));
 
 /** Its roots, less the deeper roots of other shards (which own their own files and facts). */
 export function shardScope(shard: Shard, all: Shard[]): ShardScope {
@@ -100,24 +117,62 @@ function sourceDirRoots(paths: string[]): string[] {
   return [...roots];
 }
 
+/** Directories other than the repo root that hold a package manifest (PACKAGE_MANIFESTS), outside test fixtures. */
+function manifestRoots(paths: string[]): string[] {
+  const roots = new Set<string>();
+  for (const p of paths) {
+    const segs = p.split('/');
+    if (segs.length < 2 || !PACKAGE_MANIFESTS.includes(segs.at(-1)!) || segs.slice(0, -1).some((s) => FIXTURE_DIRS.has(s))) continue;
+    roots.add(segs.slice(0, -1).join('/'));
+  }
+  return [...roots];
+}
+
+/**
+ * A root's files, split while there are more than MAX_SHARD_FILES: each subdirectory holding at least MIN_SHARD_FILES
+ * of them becomes a root of its own (split in turn); files directly under the root and smaller subdirectories stay.
+ */
+function split(root: string, files: string[]): [string, string[]][] {
+  if (files.length <= MAX_SHARD_FILES) return [[root, files]];
+  const depth = root === '' ? 0 : root.split('/').length;
+  const own: string[] = [];
+  const children = new Map<string, string[]>();
+  for (const p of files) {
+    const segs = p.split('/');
+    if (segs.length <= depth + 1) own.push(p);
+    else {
+      const child = segs.slice(0, depth + 1).join('/');
+      if (!children.has(child)) children.set(child, []);
+      children.get(child)!.push(p);
+    }
+  }
+  const big = [...children].filter(([, fs]) => fs.length >= MIN_SHARD_FILES);
+  if (!big.length) return [[root, files]];
+  for (const [, fs] of [...children].filter(([, fs]) => fs.length < MIN_SHARD_FILES)) own.push(...fs);
+  return [...(own.length ? [[root, own] as [string, string[]]] : []), ...big.flatMap(([child, fs]) => split(child, fs))];
+}
+
 const cmp = (a: string, b: string) => (a < b ? -1 : a > b ? 1 : 0);
 const keyOf = (roots: string[]) => roots.map((r) => r || '.').join('+');
 
 /**
- * Split repo-relative `paths` into shards: workspace packages when the repo declares a workspace (`files` holds the
- * root's WORKSPACE_FILES), else the directories under SOURCE_ROOTS, else one shard. The smallest shards are merged
- * until none is under MIN_SHARD_FILES and there are at most MAX_SHARDS. Sorted by key; empty when there are no paths.
+ * Split repo-relative `paths` into shards: the workspace packages the repo declares (`files` holds the root's
+ * WORKSPACE_FILES) together with every directory holding its own package manifest (a Go or Python service in a JS
+ * workspace is no workspace member); without either, the directories under SOURCE_ROOTS; else one shard. A shard over
+ * MAX_SHARD_FILES is split by its subdirectories. The smallest shards are then merged until none is under
+ * MIN_SHARD_FILES and there are at most MAX_SHARDS. Sorted by key; empty when there are no paths.
  */
 export function planShards(paths: string[], files: Record<string, string>): Shard[] {
   if (!paths.length) return [];
-  const declared = workspaceRoots(paths, files);
+  const declared = [...new Set([...workspaceRoots(paths, files), ...manifestRoots(paths)])];
   const roots = ['', ...(declared.length ? declared : sourceDirRoots(paths))].sort((a, b) => b.length - a.length);
   const byRoot = new Map<string, string[]>();
   for (const p of paths) {
     const root = roots.find((r) => under(p, r))!;
-    byRoot.set(root, [...(byRoot.get(root) ?? []), p]);
+    if (!byRoot.has(root)) byRoot.set(root, []);
+    byRoot.get(root)!.push(p);
   }
-  const shards: Shard[] = [...byRoot].map(([root, fs]) => ({ key: keyOf([root]), roots: [root], files: fs }));
+  const shards: Shard[] = [...byRoot].flatMap(([root, fs]) => split(root, fs)).map(([root, fs]) => ({ key: keyOf([root]), roots: [root], files: fs }));
   const order = (a: Shard, b: Shard) => a.files.length - b.files.length || cmp(a.key, b.key);
   for (;;) {
     shards.sort(order);

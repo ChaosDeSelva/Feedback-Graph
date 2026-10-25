@@ -20,12 +20,13 @@ beforeEach(() => {
     if (url.startsWith('/api/patterns')) return Response.json(report);
     if (url.startsWith('/api/codemap/hotspots')) return Response.json([
       { projectKey: 'shop', path: 'src/db/pool.ts', churn: 7, misses: 2, dependents: 3, score: 13 },
-      { projectKey: 'blog', path: 'lib/render.ts', churn: 30, misses: 0, dependents: 1, score: 5.95 },
-    ]);
+      { projectKey: 'blog', path: 'lib/render.ts', churn: 30, misses: 1, dependents: 1, score: 5.95 },
+    ].filter((h) => !noMisses || !url.includes('misses=1')));
     return Response.json([]);
   }));
 });
-afterEach(() => { cleanup(); vi.unstubAllGlobals(); });
+afterEach(() => { cleanup(); vi.unstubAllGlobals(); noMisses = false; });
+let noMisses = false;
 
 test('shows causes, repeat groups, weekly trend and the pre-done catch rate', async () => {
   render(<Patterns />);
@@ -62,15 +63,23 @@ test('the weekly chart fills quiet weeks with zeros and shows at least eight, ac
   expect(fillWeeks([{ week: '2020-W53', feedback: 1, repeats: 0 }]).slice(-2).map((w) => w.week)).toEqual(['2020-W52', '2020-W53']);
 });
 
-test('where agents struggle: the top hotspots across the selected projects, rescoped by the project filter', async () => {
+test('where agents struggle: the files with misses across the selected projects, rescoped by the project filter', async () => {
   render(<Patterns />);
   const card = await screen.findByRole('region', { name: /where agents struggle/i });
   expect(await within(card).findByText('src/db/pool.ts')).toBeTruthy();
   expect(within(card).getByText('lib/render.ts')).toBeTruthy();
   expect(within(card).getByText('blog')).toBeTruthy();
-  expect(urls).toContain('/api/codemap/hotspots?limit=10');
+  expect(urls).toContain('/api/codemap/hotspots?limit=10&misses=1');
   fireEvent.change(screen.getByLabelText('project'), { target: { value: 'shop' } });
-  await waitFor(() => expect(urls).toContain('/api/codemap/hotspots?project=shop&limit=10'));
+  await waitFor(() => expect(urls).toContain('/api/codemap/hotspots?project=shop&limit=10&misses=1'));
+});
+
+test('where agents struggle, with no file missed yet, says so and links the hotspots (never lists files with 0 misses)', async () => {
+  noMisses = true;
+  render(<Patterns />);
+  const card = await screen.findByRole('region', { name: /where agents struggle/i });
+  expect(await within(card).findByText(/no files with misses yet/i)).toBeTruthy();
+  expect(within(card).getByRole('link', { name: /hotspots/i }).getAttribute('href')).toBe('#projects');
 });
 
 test('where agents struggle: test files are left out until "include tests" is ticked', async () => {
@@ -80,9 +89,9 @@ test('where agents struggle: test files are left out until "include tests" is ti
   const box = within(card).getByLabelText(/include tests/i) as HTMLInputElement;
   expect(box.checked).toBe(false);
   fireEvent.click(box);
-  await waitFor(() => expect(urls).toContain('/api/codemap/hotspots?limit=10&tests=1'));
+  await waitFor(() => expect(urls).toContain('/api/codemap/hotspots?limit=10&tests=1&misses=1'));
   fireEvent.change(screen.getByLabelText('project'), { target: { value: 'shop' } });
-  await waitFor(() => expect(urls).toContain('/api/codemap/hotspots?project=shop&limit=10&tests=1'));
+  await waitFor(() => expect(urls).toContain('/api/codemap/hotspots?project=shop&limit=10&tests=1&misses=1'));
 });
 
 test('a slow all-projects report never replaces the one for the project you picked', async () => {

@@ -44,6 +44,9 @@ describeStores('ChatStore', (h) => {
     const [user, asst] = thread!.turns;
     expect(user).toMatchObject({ conversationId: conv.id, seq: 1, role: 'user', text: 'how many modals?', status: 'done', sources: [], answer: null });
     expect(asst).toMatchObject({ conversationId: conv.id, seq: 2, role: 'assistant', text: '', status: 'pending', error: null, answer: null, sources: [src('S1')], provider: null, startedAt: null, finishedAt: null });
+    // The answer says how big its pack is (the UI shows it); the question itself has none.
+    expect(asst.pack).toEqual({ chars: '# pack\n[S1] src/ui/Modal.tsx'.length, sources: 1 });
+    expect(user.pack).toBeNull();
     await expect(c.addUserTurn(conv.id, 'again', { context: '', sources: [] })).rejects.toBeInstanceOf(ChatBusyError);
     expect((await c.listConversations({}))[0].pending).toBe(true);
     expect(await c.addUserTurn('chat-missing', 'x', { context: '', sources: [] })).toBeNull();

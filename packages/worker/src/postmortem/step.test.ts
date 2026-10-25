@@ -144,7 +144,8 @@ test('each post-mortem is logged with the model, the context it was given, and w
   const full = {
     ...pm, cause: 'context_available_ignored', taskTitle: 'Orders list',
     contextItems: [{ kind: 'claude_md', ref: 'CLAUDE.md', excerpt: 'scope', why: 'stated rule', wasAvailable: true }],
-    trace: { provider: 'claude-cli', agentic: true, standing: ['/vibe/shop/CLAUDE.md'], facts: ['src/db.ts: use scoped'], lessonFlags: [{ name: 'meta-lesson', why: 'about feedback' }] },
+    facts: [{ path: 'src/db.ts', statement: 'the pool holds 10 clients' }], subject: 'process',
+    trace: { provider: 'claude-cli', agentic: true, standing: ['/vibe/shop/CLAUDE.md'], facts: ['src/db.ts: use scoped'], lessonFlags: [{ name: 'meta-lesson', why: 'about feedback' }], lessonShaped: ['title'] },
   } as PostMortem & { trace: PostMortemTrace };
   await runPostmortems({
     k: {
@@ -165,6 +166,10 @@ test('each post-mortem is logged with the model, the context it was given, and w
     contextGiven: { standing: ['/vibe/shop/CLAUDE.md'], facts: ['src/db.ts: use scoped'], agentic: true },
     contextFound: [{ kind: 'claude_md', ref: 'CLAUDE.md', why: 'stated rule', wasAvailable: true }],
     lessonChecks: [{ name: 'meta-lesson', why: 'about feedback' }],
+    // What the shape check repaired, whether the miss is about a file at all, and the facts it proposed (logged, never stored).
+    lessonShaped: ['title'],
+    subject: 'process',
+    proposedFacts: [{ path: 'src/db.ts', statement: 'the pool holds 10 clients' }],
   });
 });
 
@@ -181,4 +186,22 @@ test('a failed post-mortem is logged with when it will be retried, or that it ga
   next = { attempts: 5, retryAt: null };
   await run();
   expect(activity[1].subject).toBe('post-mortem failed (attempt 5); gave up, retry it from the API');
+});
+
+test('a new lesson that repeats one already in the project is flagged duplicate-of it once saved', async () => {
+  const checks: unknown[][] = [];
+  const old = { id: 'lesson:old', status: 'approved' as const, createdAt: '2026-10-01T00:00:00Z' };
+  await runPostmortems({
+    k: {
+      feedbackNeedingPostmortem: async () => [input('a'), input('b')],
+      savePostmortem: async () => {},
+      recordPostmortemFailure: async () => ({ attempts: 1, retryAt: null }),
+      similarLessons: async (id) => [{ ...old, cosine: id === 'lesson:a' ? 0.96 : 0.5 }],
+      setLessonChecks: async (...a) => { checks.push(a); return true; },
+    },
+    postmortem: async () => ({ ...pm, lessonChecks: [{ name: 'needs-path', why: 'none' }] }),
+    embed: async (texts) => texts.map(() => [1]),
+    batch: 3,
+  });
+  expect(checks).toEqual([['lesson:a', [{ name: 'needs-path', why: 'none' }, expect.objectContaining({ name: 'duplicate-of', of: 'lesson:old' })]]]);
 });

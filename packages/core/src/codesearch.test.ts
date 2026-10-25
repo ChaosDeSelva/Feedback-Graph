@@ -91,3 +91,55 @@ test('files match by path or basename when no symbol of theirs did; more matched
   expect(findInCodeMap(map, [])).toEqual([]);
   expect(findInCodeMap(map, ['nothinglikethis'])).toEqual([]);
 });
+
+test('the question\'s filler words name no code: "already", "existing", "yet" are dropped', () => {
+  expect(codeTerms('do we have a modal component already?')).toEqual(['modal', 'component']);
+  expect(codeTerms('is there an existing one yet?')).toEqual([]);
+});
+
+const big = {
+  files: [
+    file('apps/api/errors.go', { lang: 'go' }),
+    file('apps/web/markdown/render.tsx'),
+    file('apps/web/lists/useList.ts'),
+    file('apps/web/ui/Button.tsx'),
+  ],
+  symbols: [
+    sym('apps/api/errors.go', 'ErrAlreadyMerged', { kind: 'const' }),
+    sym('apps/web/markdown/render.tsx', 'components', { kind: 'const' }),
+    sym('apps/web/lists/useList.ts', 'getList'),
+    sym('apps/web/ui/Button.tsx', 'Button'),
+    sym('apps/web/ui/Button.tsx', 'modaldialogtrigger', { exported: false }),
+  ],
+  // past the cap: in the import index (paths and edges), no symbols
+  outside: [
+    file('apps/web/ui/ConfirmDialog.tsx'),
+    file('apps/web/ui/SettingsDialog.tsx'),
+    file('apps/web/session/session-expired-modal.tsx'),
+    file('apps/web/tasks/task-form-modal.tsx'),
+    file('apps/web/tasks/task-form-modal.test.tsx'),
+  ],
+  imports: [
+    imp('apps/web/tasks/task-form-modal.tsx', 'apps/web/ui/ConfirmDialog.tsx', ['ConfirmDialog']),
+    imp('apps/web/tasks/task-form-modal.test.tsx', 'apps/web/tasks/task-form-modal.tsx', ['TaskFormModal']),
+  ],
+};
+
+test('files past the cap are found by name, "modal" also finds dialogs, and a symbol matching only a generic word is no hit', () => {
+  const hits = findInCodeMap(big, codeTerms('do we have a modal component already?'));
+  expect(hits.map((h) => h.path).sort()).toEqual([
+    'apps/web/session/session-expired-modal.tsx', 'apps/web/tasks/task-form-modal.tsx', 'apps/web/ui/ConfirmDialog.tsx', 'apps/web/ui/SettingsDialog.tsx',
+  ]);
+  // Files named modal outrank the dialogs found through the synonym; usages and tests come from the index edges.
+  expect(hits.slice(0, 2).every((h) => h.path.includes('modal'))).toBe(true);
+  expect(hits.find((h) => h.path.endsWith('ConfirmDialog.tsx'))).toMatchObject({ kind: 'file', usages: ['apps/web/tasks/task-form-modal.tsx'], tests: ['apps/web/tasks/task-form-modal.test.tsx'] });
+  expect(hits.find((h) => h.path.endsWith('task-form-modal.tsx'))?.tests).toEqual(['apps/web/tasks/task-form-modal.test.tsx']);
+});
+
+test('generic words match only beside a specific one; matching is by whole words of a name, never inside one', () => {
+  // "list" alone may still find a list; next to a specific word a hit on "list" alone is dropped.
+  expect(findInCodeMap(big, ['list']).map((h) => h.name)).toEqual(['getList']);
+  expect(findInCodeMap(big, ['button', 'list']).map((h) => h.name)).toEqual(['Button']);
+  // "modal" inside the single word "modaldialogtrigger" is not a match.
+  expect(findInCodeMap(big, ['modal']).some((h) => h.name === 'modaldialogtrigger')).toBe(false);
+});

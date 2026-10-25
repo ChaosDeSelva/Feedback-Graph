@@ -40,6 +40,34 @@ test('expanding an entry shows its details, including each fact and why it was k
   expect(screen.getByText(/scan:1/)).toBeTruthy();
 });
 
+test('an entry whose details the list left out fetches them when expanded, once', async () => {
+  const big = { ...rows[2], id: 'a9', subject: 'scan report', details: {}, detailsOmitted: true };
+  vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+    urls.push(url);
+    if (url === '/api/activity/a9') return Response.json({ ...big, detailsOmitted: undefined, details: { report: 'the whole long report' } });
+    if (url.startsWith('/api/activity')) return Response.json([big]);
+    return Response.json([]);
+  }));
+  render(<Activity />);
+  const row = await screen.findByText('scan report');
+  expect(urls.filter((u) => u === '/api/activity/a9')).toHaveLength(0);
+  fireEvent.click(row);
+  expect(await screen.findByText('the whole long report')).toBeTruthy();
+  fireEvent.click(row);
+  fireEvent.click(row);
+  expect(await screen.findByText('the whole long report')).toBeTruthy();
+  expect(urls.filter((u) => u === '/api/activity/a9')).toHaveLength(1);
+});
+
+test("a context item's why that is only a field name is not printed as a reason", async () => {
+  const pm = { ...rows[2], id: 'a8', kind: 'postmortem_done', subject: 'missed the org scope', details: { contextFound: [{ kind: 'code', ref: 'src/a.ts', why: 'wasAvailable' }, { kind: 'code', ref: 'src/b.ts', why: 'it scoped by org' }] } };
+  vi.stubGlobal('fetch', vi.fn(async (url: string) => (url.startsWith('/api/activity') ? Response.json([pm]) : Response.json([]))));
+  render(<Activity />);
+  fireEvent.click(await screen.findByText('missed the org scope'));
+  expect(await screen.findByText(/it scoped by org/)).toBeTruthy();
+  expect(screen.queryByText(/wasAvailable/)).toBeNull();
+});
+
 test('filters by project and kind', async () => {
   render(<Activity />);
   await screen.findByText('2 facts from src/db.ts');

@@ -36,6 +36,30 @@ test('the api and the worker run with no Linux capabilities and cannot gain priv
   }
 });
 
+test('the api and the worker run on a read-only file system, with memory for /tmp (and the worker for $HOME)', () => {
+  const compose = readFileSync(join(repo, 'docker-compose.yml'), 'utf8');
+  const service = (name: string, next: string) => compose.slice(compose.indexOf(`\n  ${name}:`), compose.indexOf(`\n  ${next}:`));
+  const worker = service('worker', 'codex-runner');
+  const api = service('api', 'postgres');
+  for (const s of [worker, api]) {
+    expect(s).toContain('read_only: true');
+    expect(s).toMatch(/tmpfs:\n\s+- \/tmp\n/);
+  }
+  // The agent CLIs keep their settings in HOME: the image's (Dockerfile ENV HOME), so the worker can still write it.
+  const home = /ENV .*HOME=(\S+)/.exec(readFileSync(join(repo, 'Dockerfile'), 'utf8'))![1];
+  expect(worker).toContain(`- ${home}\n`);
+  // What the worker writes besides: its volumes.
+  for (const v of ['./state:/state', 'codex-home:/codex', 'codex-scratch:/scratch']) expect(worker).toContain(v);
+});
+
+test('neo4j keeps only the capabilities its entrypoint needs and cannot gain privileges', () => {
+  const compose = readFileSync(join(repo, 'docker-compose.yml'), 'utf8');
+  const neo4j = compose.slice(compose.indexOf('\n  neo4j:'), compose.indexOf('\n  worker:'));
+  expect(neo4j).toContain('cap_drop: [ALL]');
+  expect(neo4j).toContain('cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID]');
+  expect(neo4j).toContain('- no-new-privileges:true');
+});
+
 test('docker-compose.yml comments do not contradict the settings they describe', () => {
   const compose = readFileSync(join(repo, 'docker-compose.yml'), 'utf8');
   // CLOUD_URL allows plain http to this machine and to the host as the containers see it; SCAN_MAX_FILES scales.

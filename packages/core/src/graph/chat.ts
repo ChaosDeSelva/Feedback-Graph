@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import {
-  ChatBusyError, cleanChatAnswer, cleanChatContext, cleanChatError, cleanChatSources, cleanChatText, cleanChatTitle, ORPHANED_TURN,
+  ChatBusyError, cleanChatAnswer, cleanChatContext, cleanChatError, cleanChatSources, cleanChatText, cleanChatTitle, ORPHANED_TURN, withPackSizes,
   type ChatAnswer, type ChatConversation, type ChatJob, type ChatPack, type ChatProvider, type ChatSource, type ChatThread, type ChatTurn,
 } from '../chat.ts';
 import type { ChatStore } from '../store.ts';
@@ -80,7 +80,8 @@ export class ChatRepo implements ChatStore {
       { id },
     );
     if (!rows[0]) return null;
-    const turns = (rows[0].get('turns') as { properties: Record<string, unknown> }[]).map((t) => turnOf(t.properties));
+    const props = (rows[0].get('turns') as { properties: Record<string, unknown> }[]).map((t) => t.properties);
+    const turns = withPackSizes(props.map((p) => ({ turn: turnOf(p), contextChars: typeof p.context === 'string' ? p.context.length : null })));
     return { ...conversationOf(rows[0].get('c').properties, turns.some((t) => t.status === 'pending' || t.status === 'answering')), turns };
   }
 

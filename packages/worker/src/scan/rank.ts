@@ -8,7 +8,8 @@ import { isTestPath } from '../codegraph/lang.ts';
  * Tiers, best first: files sessions edited; the manifests imports are resolved against (few, and without them a map
  * of the rest has no edges); source in languages whose imports resolve; other programming languages; scripts, infra
  * and schemas; tests; other manifests; docs; everything else (YAML and JSON config, data). Within a tier, files under
- * a hidden folder (`.github/`, `.claude/`) come last, then code-point order.
+ * a hidden folder (`.github/`, `.claude/`) come last, then the heaviest first when a weight is given (the code map
+ * weighs import in-degree and churn, so a capped map keeps the files most used and most changed), then code-point order.
  */
 const RESOLVER_INPUT = /(^|\/)(package\.json|go\.mod|Cargo\.toml|Package\.swift|project\.godot|[tj]sconfig[^/]*\.json)$/;
 const RESOLVABLE = new Set(['.ts', '.tsx', '.mts', '.cts', '.js', '.jsx', '.mjs', '.cjs', '.py', '.go', '.rs', '.cs', '.swift', '.gd']);
@@ -54,14 +55,14 @@ function subjectKeys(test: string): string[] {
  * whose file sits beside it (or above its __tests__ folder) comes right after that file instead of in the test tier,
  * so a capped map that keeps a file keeps the tests that cover it.
  */
-export function rankCodePaths(paths: string[], o: { priority?: Iterable<string> } = {}): string[] {
+export function rankCodePaths(paths: string[], o: { priority?: Iterable<string>; weight?: (path: string) => number } = {}): string[] {
   const present = new Set(paths);
   const first = [...new Set(o.priority ?? [])].filter((p) => present.has(p));
   const taken = new Set(first);
   const rest = paths
     .filter((p) => !taken.has(p))
-    .map((p) => ({ p, t: tierOf(p), h: hidden(p) ? 1 : 0 }))
-    .sort((a, b) => a.t - b.t || a.h - b.h || cmp(a.p, b.p))
+    .map((p) => ({ p, t: tierOf(p), h: hidden(p) ? 1 : 0, w: o.weight?.(p) ?? 0 }))
+    .sort((a, b) => a.t - b.t || a.h - b.h || b.w - a.w || cmp(a.p, b.p))
     .map((x) => x.p);
   const subjects = new Map<string, string>();
   for (const p of rest) if (tierOf(p) !== TIER.test) subjects.set(`${dirOf(p)}/${stemOf(p.split('/').pop()!)}`, p);

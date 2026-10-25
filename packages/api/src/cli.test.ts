@@ -141,9 +141,11 @@ test('status --watch follows /api/events when the API has it: the status again o
   expect(opened!.get('accept')).toBe('text/event-stream');
   const t = f.text();
   expect(t).toContain('activity  doc_added [acme]: uploaded "notes"');
-  // Printed when it changed only (a fetch that finds the same status prints nothing), then once more by the poll after the stream ended.
+  // Printed when it changed only (a fetch that finds the same status prints nothing, nor does the poll after the stream
+  // ended), and then only the line that changed.
   const stageLines = t.split('\n').filter((l) => l.startsWith('stage'));
-  expect(stageLines.map((l) => l.split(/\s+/)[1])).toEqual(['ingest', 'classify', 'waiting', 'waiting']);
+  expect(stageLines.map((l) => l.split(/\s+/)[1])).toEqual(['ingest', 'classify', 'waiting']);
+  expect(t.match(/^version/gm)).toHaveLength(1);
 });
 
 const settings = {
@@ -242,19 +244,36 @@ test('inbox confirm|reject sends one batch with the reason, and fails if any ite
 });
 
 test('lessons list and approve; a refusal from the server is shown as it was given', async () => {
-  const f = fake({ 'GET /api/lessons?status=proposed': () => ({ json: [{ id: 'l1', status: 'proposed', projectKey: 'acme', title: 'Filter on the server', decidedBy: null }] }) });
+  const f = fake({ 'GET /api/lessons?status=proposed': () => ({ json: [{ id: 'l1', status: 'proposed', projectKey: 'acme', title: 'Filter on the server', decidedBy: null, from: 'github', checks: [{ name: 'platitude', why: 'w' }] }] }) });
   expect(await run(['lessons', 'list'], f.io)).toBe(0);
-  expect(f.text()).toMatch(/l1\s+proposed\s+acme\s+Filter on the server/);
+  expect(f.text()).toMatch(/l1\s+proposed\s+acme\s+github\s+platitude\s+Filter on the server/);
 
   const refused = 'the operator token may not lesson decide (lesson_decide): add lesson_decide to OPERATOR_ALLOW in .env and restart, or do it in the Feedback Graph UI';
-  const g = fake({ 'PATCH /api/lessons/l1': () => ({ status: 403, json: { error: refused } }) });
+  const g = fake({ 'POST /api/lessons/decisions': () => ({ status: 403, json: { error: refused } }) });
   expect(await run(['lessons', 'approve', 'l1'], g.io)).toBe(1);
-  expect(g.calls[0]).toMatchObject({ method: 'PATCH', body: { status: 'approved' } });
+  expect(g.calls[0]).toMatchObject({ method: 'POST', body: { items: [{ id: 'l1', status: 'approved' }] } });
   expect(g.err.join('\n')).toContain(refused);
+});
 
-  const ok = fake({ 'PATCH /api/lessons/l%3A1': () => ({ status: 204 }) });
-  expect(await run(['lessons', 'reject', 'l:1'], ok.io)).toBe(0);
-  expect(ok.calls[0].body).toEqual({ status: 'rejected' });
+test('lessons approve|reject take many ids and a --note, send one batch, and fail if any lesson failed', async () => {
+  const f = fake({ 'POST /api/lessons/decisions': (b) => ({ json: { results: (b as { items: { id: string }[] }).items.map((i) => (i.id === 'nope' ? { id: i.id, ok: false, error: 'not found' } : { id: i.id, ok: true, status: 'rejected' })) } }) });
+  expect(await run(['lessons', 'reject', 'l:1', 'l2', 'nope', '--note', 'platitudes'], f.io)).toBe(1);
+  expect(f.calls[0].body).toEqual({ items: ['l:1', 'l2', 'nope'].map((id) => ({ id, status: 'rejected', note: 'platitudes' })) });
+  expect(f.text()).toMatch(/l2\s+rejected/);
+  expect(f.text()).toMatch(/nope\s+not found/);
+  const ok = fake({ 'POST /api/lessons/decisions': () => ({ json: { results: [{ id: 'l1', ok: true, status: 'approved' }] } }) });
+  expect(await run(['lessons', 'approve', 'l1'], ok.io)).toBe(0);
+  expect(ok.calls[0].body).toEqual({ items: [{ id: 'l1', status: 'approved' }] });
+  expect(await run(['lessons', 'reject'], fake({}).io)).toBe(2);
+});
+
+test('lessons list filters by --flag and --source; lessons recheck asks the worker to re-check', async () => {
+  const f = fake({ 'GET /api/lessons?status=proposed&flag=looks-like-a-fact&source=session': () => ({ json: [] }) });
+  expect(await run(['lessons', 'list', '--flag', 'looks-like-a-fact', '--source', 'session'], f.io)).toBe(0);
+  expect(f.text()).toContain('no proposed lessons');
+  const r = fake({ 'POST /api/lessons/recheck': () => ({ status: 202, json: { queued: 12 } }) });
+  expect(await run(['lessons', 'recheck'], r.io)).toBe(0);
+  expect(r.text()).toMatch(/12 lessons queued for a re-check/);
 });
 
 test('cloud sync-now posts to the sync route', async () => {
@@ -338,6 +357,15 @@ test('status prints the stage and since when, the pipeline backlog, the last Syn
   expect(t).toMatch(/pipeline\s+classify 12 · inbox 4 pending · postmortems 0 · lessons 2 proposed · scans 1 running, 2 queued/);
   expect(t).toMatch(/UNAVAILABLE since 2026-10-25 03:00:00: Ollama is not reachable/);
   expect(t).toMatch(/sync now\s+2026-10-25 03:43:00 ok: sent 2 projects, 68 unchanged/);
+});
+
+test('status says how many files an older scanner read, and that a scan you start refreshes them', async () => {
+  const f = fake({ 'GET /api/status': () => ({ json: idle }), 'GET /api/pipeline': () => pipeline({ scans: { done: 3, queued: 0, running: 0, failed: 0, never: 0, olderScanner: { files: 15, projects: { acme: 12, web: 3 } } } }) });
+  expect(await run(['status'], f.io)).toBe(0);
+  expect(f.text()).toMatch(/scanner\s+15 files were read by an older scanner \(acme 12, web 3\): press Scan on the Projects page \(or fg scan <project>\) to refresh them/);
+  const none = fake({ 'GET /api/status': () => ({ json: idle }), 'GET /api/pipeline': () => pipeline() });
+  await run(['status'], none.io);
+  expect(none.text()).not.toMatch(/older scanner/);
 });
 
 test('status --until idle waits until the worker is waiting and nothing is queued; --timeout gives up with exit 1', async () => {
@@ -579,4 +607,83 @@ test('scripts/fg doctor runs ./scripts/doctor.sh with its arguments, without Nod
   chmodSync(join(repo, 'scripts', 'doctor.sh'), 0o755);
   const out = execFileSync('bash', [join(repo, 'scripts', 'fg'), 'doctor', '--help'], { encoding: 'utf8', env: { PATH: '/usr/bin:/bin' } });
   expect(out).toBe('doctor ran: --help\n');
+});
+
+test('facts list --q prints the search hits (the API answers fact and score pairs), with their score', async () => {
+  const hits = [{ fact: { id: 'f1', kind: 'convention', path: 'src/a.ts', statement: 'Every query is scoped by orgId', relevance: 0.9, relevanceBy: 'model' }, score: 0.82 }];
+  const f = fake({ 'GET /api/projects/acme/facts?q=tenant+scoping': () => ({ json: hits }) });
+  expect(await run(['facts', 'list', '--project', 'acme', '--q', 'tenant scoping'], f.io)).toBe(0);
+  expect(f.text()).toMatch(/f1\s+convention\s+0\.90 model\s+0\.82\s+src\/a\.ts\s+Every query is scoped/);
+  const j = fake({ 'GET /api/projects/acme/facts?q=tenant': () => ({ json: hits }) });
+  await run(['facts', 'list', '--project', 'acme', '--q', 'tenant', '--json'], j.io);
+  expect(JSON.parse(j.text())).toEqual([{ ...hits[0].fact, score: 0.82 }]);
+});
+
+test('scan --wait says how far each job has got, on stderr, at least every 30 seconds', async () => {
+  let polls = 0;
+  const f = fake({
+    'POST /api/projects/scan': () => ({ status: 202, json: { results: [{ key: 'acme', queued: true, job: { id: 'scan:1', status: 'queued' } }] } }),
+    // Running for 14 polls (70 s at 5 s each) with the same progress, then done.
+    'GET /api/scans/scan%3A1': () => (++polls < 15
+      ? { json: { id: 'scan:1', projectKey: 'acme', status: 'running', factsAdded: 12, shards: { total: 7, done: 3, rescanned: 3, failed: 0 } } }
+      : { json: { id: 'scan:1', projectKey: 'acme', status: 'done', filesScanned: 40, factsAdded: 31 } }),
+  });
+  expect(await run(['scan', '--key', 'acme', '--wait'], f.io)).toBe(0);
+  const progress = f.err.filter((l) => l.startsWith('acme'));
+  // The first change at once, then a reminder every 30 s while nothing moves: never silent for longer.
+  expect(progress.length).toBeGreaterThanOrEqual(3);
+  expect(progress[0]).toMatch(/acme: running, shard 3 of 7, 12 facts so far/);
+  expect(progress.at(-1)).toMatch(/\(1m\d\ds\)/);
+  expect(f.text()).toMatch(/acme\s+done: 40 files, 31 facts/);
+});
+
+test('status --watch prints only the lines that changed since the last print', async () => {
+  const stages = ['ingest', 'ingest', 'classify'];
+  const f = fake({
+    'GET /api/status': () => ({ json: { version: 'x', workerHealthy: true, stage: { name: stages.shift() ?? 'classify', startedAt: '2026-10-24T10:00:00Z', current: null } } }),
+    'GET /api/pipeline': () => pipeline(),
+  });
+  let ticks = 0;
+  f.io.sleep = async () => { if (++ticks === 3) throw new Error('stop'); };
+  await expect(run(['status', '--watch', '--interval', '1'], f.io)).rejects.toThrow('stop');
+  const t = f.text();
+  // The whole status once, nothing for the poll that found the same, then only the stage line.
+  expect(t.match(/^version/gm)).toHaveLength(1);
+  expect(t.match(/^stage/gm)).toHaveLength(2);
+  expect(t.match(/^pipeline/gm)).toHaveLength(1);
+});
+
+test('with --json a failure is JSON on stdout too: { error }, and the exit code says what kind', async () => {
+  const f = fake({ 'POST /api/projects/scan': () => ({ status: 403, json: { error: 'the operator token may not scan (scan)' } }) });
+  expect(await run(['scan', '--key', 'acme', '--json'], f.io)).toBe(1);
+  expect(JSON.parse(f.text())).toEqual({ error: expect.stringContaining('may not scan'), status: 403 });
+  const u = fake({});
+  expect(await run(['scan', '--json'], u.io)).toBe(2);
+  expect(JSON.parse(u.text())).toEqual({ error: expect.stringContaining('fg scan needs --all') });
+  const p = fake({});
+  expect(await run(['scan', '--bogus', '--json'], p.io)).toBe(2);
+  expect(JSON.parse(p.text()).error).toMatch(/unknown option --bogus/);
+});
+
+test('a usage mistake is one line and where to read more, not the whole help; fg help <verb> prints that verb', async () => {
+  const f = fake({});
+  expect(await run(['scan'], f.io)).toBe(2);
+  expect(f.err).toEqual(['fg: fg scan needs --all or --key k1,k2 (see fg help scan)']);
+  const h = fake({});
+  expect(await run(['help', 'scan'], h.io)).toBe(0);
+  expect(h.text()).toMatch(/^\s*fg scan --all/m);
+  expect(h.text()).not.toMatch(/fg inbox/);
+  expect(h.text()).toMatch(/--wait/);
+  const unknown = fake({});
+  expect(await run(['frobnicate'], unknown.io)).toBe(2);
+  expect(unknown.err).toEqual(['fg: unknown command: frobnicate (see fg help)']);
+});
+
+test('status --until idle does not wait for the GitHub and Linear sync: nothing queued while it runs is idle', async () => {
+  const f = fake({ 'GET /api/status': () => ({ json: { ...idle, stage: { name: 'sync', startedAt: '2026-10-25T03:50:00Z', current: null } } }), 'GET /api/pipeline': () => pipeline() });
+  expect(await run(['status', '--until', 'idle', '--timeout', '60'], f.io)).toBe(0);
+  expect(f.text()).toMatch(/idle.*syncing GitHub and Linear/);
+  // Work still queued during the sync is not idle.
+  const busy = fake({ 'GET /api/status': () => ({ json: { ...idle, stage: { name: 'sync', startedAt: 't', current: null } } }), 'GET /api/pipeline': () => pipeline({ postmortems: { queued: 2 } }) });
+  expect(await run(['status', '--until', 'idle', '--timeout', '6', '--interval', '5'], busy.io)).toBe(1);
 });

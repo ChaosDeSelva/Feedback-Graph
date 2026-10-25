@@ -317,12 +317,20 @@ if typing && command -v claude >/dev/null 2>&1 && [ -z "$(envval CLAUDE_CODE_OAU
   unset token
 fi
 
+# Cloud sync names this machine on the cloud's sync log; inside the containers the hostname is a random id.
+if [ -n "$(envval CLOUD_URL)" ] && [ -z "$(envval CLOUD_MACHINE)" ]; then
+  machine="$(hostname -s 2>/dev/null | tr -cd 'A-Za-z0-9._-' | cut -c1-64)"
+  [ -n "$machine" ] && setenv CLOUD_MACHINE "$machine" && echo "CLOUD_MACHINE set to $machine (the name the cloud shows for this machine's syncs)"
+fi
+
 # The operator token lets an agent or ./scripts/fg make the owner decisions OPERATOR_ALLOW names (by default not
 # deciding lessons or deleting data). Made only when you say yes (or pass --yes), before the start so the api has it.
 if [ -z "$(envval FG_OPERATOR_TOKEN)" ] &&
   confirm "Create an operator token, so agents and ./scripts/fg can scan, triage the Inbox and sync (lessons stay yours)? [Y/n]" y; then
   setenv FG_OPERATOR_TOKEN "$(openssl rand -hex 24)"
-  echo "FG_OPERATOR_TOKEN saved to .env (not printed; ./scripts/fg reads it from there; OPERATOR_ALLOW says what it may do)"
+  echo "FG_OPERATOR_TOKEN saved to .env (not printed; ./scripts/fg reads it from there). It turns on the admin MCP at /mcp/admin"
+  echo "  and the fg CLI for scans, Inbox triage and sync. By default it cannot decide lessons, delete data, change settings or"
+  echo "  ask in Ask (which spends your subscription); OPERATOR_ALLOW in .env widens or narrows that. Remove the line to turn it off."
 fi
 
 compose=(docker compose)

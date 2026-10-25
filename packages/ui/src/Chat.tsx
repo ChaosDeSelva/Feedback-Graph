@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState, type FormEvent, type KeyboardEvent, type ReactNode } from 'react';
 import { api, type ProjectSummary } from './api.ts';
 import { CHAT_PROVIDERS, type ChatConversation, type ChatProvider, type ChatSource, type ChatThread, type ChatTurn } from '@fb/core/chat';
-import { chatHref, hashFocus, hashNewChat, moduleHref } from './links.ts';
+import { chatHref, hashFocus, hashNewChat, moduleHref, sourceHref } from './links.ts';
 import { askConfirm } from './ui/ConfirmDialog.tsx';
 import { PageHeader } from './ui/PageHeader.tsx';
 import { ListRow, SplitPane } from './ui/SplitPane.tsx';
@@ -428,7 +428,7 @@ function AssistantTurn({ turn, thread, onRetry }: { turn: ChatTurn; thread: Chat
   return (
     <div className="grid gap-3">
       <div className="rounded-md border border-line bg-surface px-3 py-2.5 shadow-card">
-        <Markdown text={a.answer} />
+        <Markdown text={a.answer} cite={(id) => { const s = turn.sources.find((x) => x.id === id); return s ? sourceHref(thread.projectKey, s) : null; }} />
         {turn.provider && <p className="mt-2 text-[11px] text-muted">answered by {turn.provider}</p>}
       </div>
       {a.examples.length > 0 && (
@@ -450,7 +450,7 @@ function AssistantTurn({ turn, thread, onRetry }: { turn: ChatTurn; thread: Chat
           </ul>
         </div>
       )}
-      {turn.sources.length > 0 && <Sources sources={turn.sources} />}
+      {turn.sources.length > 0 && <Sources project={thread.projectKey} sources={turn.sources} />}
       {a.prompt && (
         <Card title="Prompt for your agent" actions={<CopyButton text={a.prompt} />} bodyClass="p-3">
           <p className="mb-2 text-xs text-muted">Paste it into Claude Code or Codex in this project.</p>
@@ -465,7 +465,7 @@ function ModuleLink({ project, path, children }: { project: string; path: string
   return <a href={moduleHref(project, path)} className="font-mono text-[12px] [overflow-wrap:anywhere] text-accent-text hover:underline">{children}</a>;
 }
 
-function Sources({ sources }: { sources: ChatSource[] }) {
+function Sources({ project, sources }: { project: string; sources: ChatSource[] }) {
   return (
     <details className="rounded-md border border-line bg-surface px-3 py-2">
       <summary className="cursor-pointer text-xs font-semibold text-muted select-none">Sources ({sources.length})</summary>
@@ -474,7 +474,12 @@ function Sources({ sources }: { sources: ChatSource[] }) {
           <li key={s.id} className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5">
             <span className="font-mono text-xs font-semibold">{s.id}</span>
             <Badge tone={SOURCE_TONE[s.kind] ?? 'neutral'}>{s.kind}</Badge>
-            <span className="min-w-0">{s.title}</span>
+            {(() => {
+              const href = sourceHref(project, s);
+              return href
+                ? <a href={href} {...(/^https?:/.test(href) && { target: '_blank', rel: 'noreferrer' })} className="min-w-0 text-accent-text underline decoration-accent/40 underline-offset-2 hover:decoration-accent">{s.title}</a>
+                : <span className="min-w-0">{s.title}</span>;
+            })()}
             <span className="font-mono text-[11px] [overflow-wrap:anywhere] text-muted">{s.ref}</span>
           </li>
         ))}

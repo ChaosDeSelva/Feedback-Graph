@@ -1,4 +1,5 @@
-import { feedbackSkipRule, hostRepoPath, isSelfReview, modelTimeoutReason, providerUnavailableReason, redactSecrets, sessionFiles, type ActivityStore, type ProjectScope, type Classification, type CodeGraphStore, type GraphStore, type HumanTurn, type ParsedSession, type SessionSource } from '@fb/core';
+import { feedbackSkipRule, hostRepoPath, isSelfReview, modelTimeoutReason, providerUnavailableReason, redactSecrets, sessionFiles, type ActivityStore, type ProjectScope, type Classification, type CodeGraphStore, type GraphStore, type HumanTurn, type ParsedSession, type SessionSource, type ToolCall } from '@fb/core';
+import { gitEvidence } from './detect/instruction.ts';
 import { prefilterPushback } from './detect/prefilter.ts';
 import { codexSessionParser } from './ingest/codex.ts';
 import { conversationFingerprint } from './ingest/fingerprint.ts';
@@ -26,7 +27,8 @@ export type CycleDeps = {
    */
   folderOf?(path: string): string | string[] | null | undefined;
   state: FileState;
-  repo: Pick<GraphStore, 'upsertSession' | 'unclassifiedTurns' | 'saveClassification' | 'recordClassifyFailure'>;
+  /** callsAfter: what the agent did after a message (the evidence an instruction about git was broken). */
+  repo: Pick<GraphStore, 'upsertSession' | 'unclassifiedTurns' | 'saveClassification' | 'recordClassifyFailure'> & Partial<Pick<GraphStore, 'callsAfter'>>;
   roots: Root[];
   commits: typeof commitsInWindow;
   classify(turn: HumanTurn): Promise<Classification | null>;
@@ -73,6 +75,13 @@ const MAX_CONSECUTIVE_FAILURES = 3;
 const MAX_SKIP_SAMPLES = 5;
 const SKIP_SAMPLE_CHARS = 200;
 const MAX_SKIP_TARGETS = 50;
+
+const INSTRUCTION: Classification = {
+  label: 'neutral',
+  confidence: 1,
+  summary: 'an instruction about git, not a correction: nothing it forbids was done before it or after it',
+  signals: ['instruction'],
+};
 
 /**
  * Projects recorded before remotes were (or whose folder had none then), and records a scan, a code map or an upload
@@ -236,25 +245,31 @@ export async function runCycle(deps: CycleDeps): Promise<CycleResult> {
     }
     // A review or issue comment is feedback on finished work by nature, and reviewers word it politely: always ask the model.
     else if (pre.hit || turn.external) {
-      if (unavailable || modelCalls >= deps.classifyBatch || failuresInRow >= MAX_CONSECUTIVE_FAILURES) continue;
-      modelCalls++;
-      try {
-        c = await deps.classify(turn);
-      } catch (err) {
-        // The model could not be asked (down, missing, not signed in): not the turn's fault, so nothing is charged.
-        unavailable = providerUnavailableReason(err);
-        const timeout = unavailable ? null : modelTimeoutReason(err);
-        if (timeout && deps.modelBusy?.()) unavailable = `the model is busy with a scan: ${timeout}`;
-        if (unavailable) {
-          log('classifier unavailable, pausing until next cycle', { reason: unavailable });
-          continue;
+      // An instruction about git ("don't push a PR yet") is not pushback until the agent does what it forbids.
+      const git = turn.external ? null : await gitEvidence(turn, deps.repo.callsAfter?.bind(deps.repo), now());
+      if (git === 'wait') continue;
+      if (git === 'instruction') c = INSTRUCTION;
+      else {
+        if (unavailable || modelCalls >= deps.classifyBatch || failuresInRow >= MAX_CONSECUTIVE_FAILURES) continue;
+        modelCalls++;
+        try {
+          c = await deps.classify(git ? { ...turn, followingToolCalls: git } : turn);
+        } catch (err) {
+          // The model could not be asked (down, missing, not signed in): not the turn's fault, so nothing is charged.
+          unavailable = providerUnavailableReason(err);
+          const timeout = unavailable ? null : modelTimeoutReason(err);
+          if (timeout && deps.modelBusy?.()) unavailable = `the model is busy with a scan: ${timeout}`;
+          if (unavailable) {
+            log('classifier unavailable, pausing until next cycle', { reason: unavailable });
+            continue;
+          }
+          // Anything else (a call that timed out, an answer it could not use) is this turn's failure: charged below,
+          // and the batch goes on, so a turn the model can never finish is skipped after its attempts.
+          log('classification failed', { turn: turn.uuid, error: redactSecrets(String(err)).slice(0, 800) });
+          c = null;
         }
-        // Anything else (a call that timed out, an answer it could not use) is this turn's failure: charged below,
-        // and the batch goes on, so a turn the model can never finish is skipped after its attempts.
-        log('classification failed', { turn: turn.uuid, error: redactSecrets(String(err)).slice(0, 800) });
-        c = null;
+        failuresInRow = c ? 0 : failuresInRow + 1;
       }
-      failuresInRow = c ? 0 : failuresInRow + 1;
     }
     if (!c) {
       // Counted per turn, so a message the model can never label stops being retried (see unclassifiedTurns).

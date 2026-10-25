@@ -7,6 +7,11 @@ type Row = {
   subject: string; why: string; details: Record<string, unknown> | null; targets: string[] | null;
 };
 
+const activityOf = (r: Row): Activity => ({
+  id: r.id, ts: iso(r.ts)!, kind: r.kind, actor: r.actor, projectKey: r.project_key ?? null,
+  subject: r.subject, why: r.why, details: r.details ?? {}, targets: r.targets ?? [],
+});
+
 /**
  * The append-only provenance log. `seq` (an identity column) orders it, as Neo4j's per-process monotonic `order`
  * does; list() is newest first.
@@ -36,20 +41,29 @@ export class PgActivityStore implements ActivityStore {
     );
   }
 
-  async list(q: { projectKey?: string; projectKeys?: string[]; kind?: ActivityKind; target?: string; limit?: number }): Promise<Activity[]> {
-    const { rows } = await this.db.pool.query<Row>(
-      `SELECT id, ts, kind, actor, project_key, subject, why, details, targets
+  async list(q: { projectKey?: string; projectKeys?: string[]; kind?: ActivityKind; target?: string; limit?: number; maxDetailBytes?: number }): Promise<Activity[]> {
+    // The JSON's length, not pg_column_size (compressed: a long repeated log is tiny on disk): details bigger than
+    // maxDetailBytes never leave the database.
+    const { rows } = await this.db.pool.query<Row & { omitted: boolean }>(
+      `SELECT id, ts, kind, actor, project_key, subject, why, targets,
+              ($6::int IS NOT NULL AND octet_length(details::text) > $6) AS omitted,
+              CASE WHEN $6::int IS NOT NULL AND octet_length(details::text) > $6 THEN NULL ELSE details END AS details
          FROM activity
         WHERE ($1::text IS NULL OR project_key = $1) AND ($2::text IS NULL OR kind = $2)
           AND ($3::text IS NULL OR targets @> ARRAY[$3::text])
           AND ($5::text[] IS NULL OR project_key IS NULL OR project_key = ANY($5))
         ORDER BY seq DESC
         LIMIT $4`,
-      [q.projectKey ?? null, q.kind ?? null, q.target ?? null, q.limit ?? 200, q.projectKeys ?? null],
+      [q.projectKey ?? null, q.kind ?? null, q.target ?? null, q.limit ?? 200, q.projectKeys ?? null, q.maxDetailBytes ?? null],
     );
-    return rows.map((r) => ({
-      id: r.id, ts: iso(r.ts)!, kind: r.kind, actor: r.actor, projectKey: r.project_key ?? null,
-      subject: r.subject, why: r.why, details: r.details ?? {}, targets: r.targets ?? [],
-    }));
+    return rows.map((r) => ({ ...activityOf(r), ...(r.omitted && { detailsOmitted: true }) }));
+  }
+
+  async get(id: string): Promise<Activity | null> {
+    const { rows } = await this.db.pool.query<Row>(
+      'SELECT id, ts, kind, actor, project_key, subject, why, details, targets FROM activity WHERE id = $1',
+      [id],
+    );
+    return rows[0] ? activityOf(rows[0]) : null;
   }
 }

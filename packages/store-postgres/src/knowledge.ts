@@ -5,6 +5,8 @@ import {
   MAX_POSTMORTEM_ATTEMPTS,
   OUTCOME_STATUS,
   contextItemId,
+  LESSON_CHECKS_VERSION,
+  feedbackAuthorOf,
   postmortemRetryAt,
   redactDeep,
   redactSecrets,
@@ -14,6 +16,8 @@ import {
   type Lesson,
   type LessonCheck,
   type LessonDetail,
+  type LessonFilter,
+  type LessonFrom,
   type LessonHit,
   type LessonInput,
   type LessonPatch,
@@ -23,6 +27,8 @@ import {
   type PostMortemInput,
   type Project,
   type RelatedMiss,
+  type UnsortedMiss,
+  type SimilarLesson,
 } from '@fb/core';
 import { iso, toJson, toVector, tx, type Db } from './db.ts';
 import { commitOf, turnOf } from './graph.ts';
@@ -130,22 +136,23 @@ export class PgKnowledgeStore implements KnowledgeStore {
       await c.query('UPDATE feedback SET status = $2, updated_at = $3, task_id = $4 WHERE id = $1', [feedbackId, OUTCOME_STATUS[pm.outcome], now, taskId]);
       await c.query('INSERT INTO causes (key) VALUES ($1) ON CONFLICT DO NOTHING', [pm.cause]);
       await c.query(
-        `INSERT INTO misses (id, project_key, feedback_id, missed, cause, cause_explanation, outcome, created_at, embedding)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::vector)
+        `INSERT INTO misses (id, project_key, feedback_id, missed, cause, cause_explanation, outcome, created_at, embedding, subject)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::vector, $10)
          ON CONFLICT (id) DO UPDATE SET project_key = EXCLUDED.project_key, feedback_id = EXCLUDED.feedback_id, missed = EXCLUDED.missed,
            cause = EXCLUDED.cause, cause_explanation = EXCLUDED.cause_explanation, outcome = EXCLUDED.outcome,
-           created_at = EXCLUDED.created_at, embedding = EXCLUDED.embedding`,
-        [missId, r.pkey, feedbackId, pm.missed, pm.cause, pm.causeExplanation, pm.outcome, now, vectorOf(embeddings.miss)],
+           created_at = EXCLUDED.created_at, embedding = EXCLUDED.embedding, subject = EXCLUDED.subject`,
+        [missId, r.pkey, feedbackId, pm.missed, pm.cause, pm.causeExplanation, pm.outcome, now, vectorOf(embeddings.miss), pm.subject ?? null],
       );
       // A re-saved post-mortem rewrites the lesson's text but keeps its status, creation time and source.
       await c.query(
         `INSERT INTO lessons (id, status, created_at, source, title, rule, applies_when, scope, paths, cause, miss_id,
-                              project_key, origin_project_key, embedding, checks)
-         VALUES ($1, 'proposed', $2, 'postmortem', $3, $4, $5, $6, $7, $8, $9, CASE WHEN $6 = 'global' THEN NULL ELSE $10 END, $10, $11::vector, $12::jsonb)
+                              project_key, origin_project_key, embedding, checks, checks_version)
+         VALUES ($1, 'proposed', $2, 'postmortem', $3, $4, $5, $6, $7, $8, $9, CASE WHEN $6 = 'global' THEN NULL ELSE $10 END, $10, $11::vector, $12::jsonb,
+                 CASE WHEN $12::jsonb IS NULL THEN NULL ELSE $13::integer END)
          ON CONFLICT (id) DO UPDATE SET title = EXCLUDED.title, rule = EXCLUDED.rule, applies_when = EXCLUDED.applies_when,
            scope = EXCLUDED.scope, paths = EXCLUDED.paths, cause = EXCLUDED.cause, miss_id = EXCLUDED.miss_id,
            project_key = EXCLUDED.project_key, origin_project_key = EXCLUDED.origin_project_key, embedding = EXCLUDED.embedding,
-           checks = EXCLUDED.checks`,
+           checks = EXCLUDED.checks, checks_version = EXCLUDED.checks_version`,
         [
           lessonId,
           now,
@@ -159,6 +166,7 @@ export class PgKnowledgeStore implements KnowledgeStore {
           r.pkey,
           vectorOf(embeddings.lesson),
           pm.lessonChecks ? toJson(pm.lessonChecks) : null,
+          LESSON_CHECKS_VERSION,
         ],
       );
       // Fix commits: the session's commits made after the feedback, by real time (committers' offsets differ).
@@ -188,21 +196,51 @@ export class PgKnowledgeStore implements KnowledgeStore {
     });
   }
 
-  async listLessons(f: { status?: LessonStatus; projectKey?: string; projectKeys?: string[]; limit?: number }): Promise<Lesson[]> {
+  async listLessons(f: LessonFilter): Promise<Lesson[]> {
     const { rows } = await this.q(
-      `SELECT * FROM lessons
-       WHERE ($1::text IS NULL OR status = $1) AND ($2::text IS NULL OR project_key = $2 OR project_key IS NULL)
-         AND ${learnedIn('lessons', '$4')}
-       ORDER BY created_at DESC, id LIMIT $3`,
-      [f.status ?? null, f.projectKey ?? null, f.limit ?? 500, f.projectKeys ?? null],
+      `SELECT l.*, ${FROM} AS from_kind FROM lessons l ${FEEDBACK_TURN}
+       WHERE ($1::text IS NULL OR l.status = $1) AND ($2::text IS NULL OR l.project_key = $2 OR l.project_key IS NULL)
+         AND ${learnedIn('l', '$4')}
+         AND ($5::text IS NULL OR l.checks @> jsonb_build_array(jsonb_build_object('name', $5::text)))
+         AND ($6::text IS NULL OR ${FROM} = $6)
+       ORDER BY l.created_at DESC, l.id LIMIT $3`,
+      [f.status ?? null, f.projectKey ?? null, f.limit ?? 500, f.projectKeys ?? null, f.flag ?? null, f.from ?? null],
     );
     return rows.map(lessonOf);
+  }
+
+  async staleLessonChecks(version: number, limit: number): Promise<Lesson[]> {
+    const { rows } = await this.q(
+      `SELECT l.*, ${FROM} AS from_kind FROM lessons l ${FEEDBACK_TURN}
+       WHERE l.status IN ('proposed', 'approved') AND coalesce(l.checks_version, 0) < $1
+       ORDER BY l.created_at, l.id LIMIT $2`,
+      [version, limit],
+    );
+    return rows.map(lessonOf);
+  }
+
+  async requestLessonRecheck(): Promise<number> {
+    const { rowCount } = await this.q(`UPDATE lessons SET checks_version = 0 WHERE status IN ('proposed', 'approved')`);
+    return rowCount ?? 0;
+  }
+
+  async similarLessons(id: string, k: number): Promise<SimilarLesson[]> {
+    // <=> is the cosine distance: the true cosine is 1 - distance. Same project as the lesson (where it was learned).
+    const { rows } = await this.q(
+      `SELECT o.id, 1 - (o.embedding <=> l.embedding) AS cosine, o.status, o.created_at
+       FROM lessons l JOIN lessons o ON o.id <> l.id AND o.embedding IS NOT NULL AND vector_dims(o.embedding) = vector_dims(l.embedding)
+         AND coalesce(o.project_key, o.origin_project_key) IS NOT DISTINCT FROM coalesce(l.project_key, l.origin_project_key)
+       WHERE l.id = $1 AND l.embedding IS NOT NULL
+       ORDER BY cosine DESC, o.id LIMIT $2`,
+      [id, k],
+    );
+    return rows.map((r) => ({ id: r.id, cosine: Number(r.cosine), status: r.status as LessonStatus, createdAt: iso(r.created_at) as string }));
   }
 
   async lessonDetail(id: string): Promise<LessonDetail | null> {
     const { rows } = await this.q(
       `SELECT l.*, m.id AS m_id, m.missed AS m_missed, m.cause AS m_cause, m.cause_explanation AS m_cause_explanation,
-              f.id AS f_id, f.status AS f_status, t.text AS t_text, t.session_id AS t_session_id, t.ts_text AS t_ts
+              f.id AS f_id, f.status AS f_status, t.text AS t_text, t.session_id AS t_session_id, t.ts_text AS t_ts, ${FROM} AS from_kind, t.external AS t_external
        FROM lessons l
        LEFT JOIN (misses m JOIN feedback f ON f.id = m.feedback_id JOIN turns t ON t.uuid = f.turn_uuid) ON m.id = l.miss_id
        WHERE l.id = $1`,
@@ -232,7 +270,7 @@ export class PgKnowledgeStore implements KnowledgeStore {
     return {
       lesson: lessonOf(r),
       miss: r.m_id ? { id: r.m_id, missed: r.m_missed, cause: r.m_cause, causeExplanation: r.m_cause_explanation ?? undefined } : null,
-      feedback: r.f_id ? { id: r.f_id, text: r.t_text ?? undefined, status: r.f_status, sessionId: r.t_session_id, ts: r.t_ts } : null,
+      feedback: r.f_id ? { id: r.f_id, text: r.t_text ?? undefined, status: r.f_status, sessionId: r.t_session_id, ts: r.t_ts, external: feedbackAuthorOf(r.t_external) } : null,
       contextItems: items.rows.map((i) => ({
         kind: i.kind as ContextItem['kind'],
         ref: i.ref,
@@ -317,8 +355,8 @@ export class PgKnowledgeStore implements KnowledgeStore {
     });
   }
 
-  async setLessonChecks(id: string, checks: LessonCheck[]): Promise<boolean> {
-    const { rowCount } = await this.q('UPDATE lessons SET checks = $2::jsonb WHERE id = $1', [id, toJson(redactDeep(checks))]);
+  async setLessonChecks(id: string, checks: LessonCheck[], version = LESSON_CHECKS_VERSION): Promise<boolean> {
+    const { rowCount } = await this.q('UPDATE lessons SET checks = $2::jsonb, checks_version = $3 WHERE id = $1', [id, toJson(redactDeep(checks)), version]);
     return (rowCount ?? 0) > 0;
   }
 
@@ -326,6 +364,34 @@ export class PgKnowledgeStore implements KnowledgeStore {
     // This project's and the global lessons, nearest first, through the HNSW index when it pays (see vector.ts).
     const rows = await runSearch(this.db, searchLessonsQuery(this.db, q), q.k);
     return rows.map((r) => ({ lesson: lessonOf(r), score: r.score }));
+  }
+
+  async missesWithoutSubject(q: { limit: number; afterId?: string | null }): Promise<UnsortedMiss[]> {
+    return this.missesBySubject(null, q);
+  }
+
+  async processMisses(q: { limit: number; afterId?: string | null }): Promise<UnsortedMiss[]> {
+    return this.missesBySubject('process', q);
+  }
+
+  private async missesBySubject(subject: 'process' | null, q: { limit: number; afterId?: string | null }): Promise<UnsortedMiss[]> {
+    const { rows } = await this.q(
+      `SELECT m.id, m.project_key, coalesce(t.text, f.text, '') AS text, t.external->>'path' AS comment_path, l.rule, l.paths
+       FROM misses m JOIN feedback f ON f.id = m.feedback_id JOIN turns t ON t.uuid = f.turn_uuid
+       LEFT JOIN LATERAL (SELECT l.rule, l.paths FROM lessons l WHERE l.miss_id = m.id ORDER BY l.id COLLATE "C" LIMIT 1) l ON true
+       WHERE m.subject IS NOT DISTINCT FROM $3::text AND ($2::text IS NULL OR m.id COLLATE "C" > $2)
+       ORDER BY m.id COLLATE "C" LIMIT $1`,
+      [q.limit, q.afterId ?? null, subject],
+    );
+    return rows.map((r) => ({ missId: r.id, projectKey: r.project_key, feedbackText: r.text, rule: r.rule ?? null, commentPath: r.comment_path ?? null, paths: r.paths ?? [] }));
+  }
+
+  async setMissSubject(missId: string, subject: 'process' | null): Promise<boolean> {
+    const { rowCount } = await this.q(
+      subject ? 'UPDATE misses SET subject = $2 WHERE id = $1 AND subject IS NULL' : `UPDATE misses SET subject = NULL WHERE id = $1 AND subject = 'process'`,
+      subject ? [missId, subject] : [missId],
+    );
+    return (rowCount ?? 0) > 0;
   }
 
   async relatedMisses(q: { embedding: number[]; projectKey: string | null; k: number }): Promise<RelatedMiss[]> {
@@ -338,6 +404,7 @@ export class PgKnowledgeStore implements KnowledgeStore {
       sessionId: r.session_id,
       ts: r.ts_text,
       score: r.score,
+      rejectedWrongSession: r.wrong_session === true,
     }));
   }
 
@@ -426,6 +493,12 @@ export class PgKnowledgeStore implements KnowledgeStore {
   }
 }
 
+/** The lesson's feedback turn (`t`), for Lesson.from; none for memory and manual lessons. */
+const FEEDBACK_TURN = 'LEFT JOIN (misses m JOIN feedback f ON f.id = m.feedback_id JOIN turns t ON t.uuid = f.turn_uuid) ON m.id = l.miss_id';
+/** Lesson.from, for lessons `l` and their feedback turn `t`. */
+const FROM = `(CASE WHEN l.source IN ('memory', 'manual') THEN l.source WHEN t.external IS NULL THEN 'session'
+  WHEN t.external->>'source' = 'linear' THEN 'linear' ELSE 'github' END)`;
+
 function lessonOf(r: Row): Lesson {
   return {
     id: r.id,
@@ -445,5 +518,7 @@ function lessonOf(r: Row): Lesson {
     decidedBy: r.decided_by ?? null,
     decisionNote: r.decision_note ?? null,
     checks: (r.checks as LessonCheck[] | null) ?? null,
+    checksVersion: r.checks_version ?? null,
+    ...(r.from_kind && { from: r.from_kind as LessonFrom }),
   };
 }

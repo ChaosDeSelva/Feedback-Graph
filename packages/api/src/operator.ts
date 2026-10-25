@@ -14,6 +14,8 @@ export const OWNER_ROUTES: readonly (readonly ['POST' | 'PUT' | 'PATCH' | 'DELET
   ['POST', '/api/candidates/:id/decision', 'inbox_decide'],
   ['POST', '/api/candidates/decisions', 'inbox_decide'],
   ['PATCH', '/api/lessons/:id', 'lesson_decide'],
+  ['POST', '/api/lessons/decisions', 'lesson_decide'],
+  ['POST', '/api/lessons/recheck', 'retry'],
   ['POST', '/api/lessons/:id/to-fact', 'lesson_decide'],
   ['POST', '/api/projects/:key/scan', 'scan'],
   ['POST', '/api/projects/scan', 'scan'],
@@ -35,7 +37,7 @@ export const OWNER_ROUTES: readonly (readonly ['POST' | 'PUT' | 'PATCH' | 'DELET
   ['POST', '/api/import', 'import'],
   ['POST', '/api/sessions/:id/resummarize', 'resummarize'],
   ['PUT', '/api/settings/integrations/:kind', 'integrations'],
-  ['POST', '/api/settings/integrations/:kind/test', 'integrations'],
+  // Not POST /api/settings/integrations/:kind/test: it re-checks the token already saved, a read (fg integrations test).
   ['DELETE', '/api/settings/integrations/:kind', 'integrations'],
   ['PUT', '/api/settings/integrations/projects/:key', 'integrations'],
   ['POST', '/api/chats', 'chat'],
@@ -69,15 +71,26 @@ export const currentActor = (): string => acting.getStore() ?? 'you';
 export const actingAsOperator = (): boolean => acting.getStore() !== undefined;
 
 /**
+ * How the request being handled arrived: with the operator token, from a browser (it sent Origin, as browsers do on
+ * every write), or from another local client (no Origin, no operator token). A forged Origin still says browser: it is
+ * what the request claimed, recorded so a write "by you" can be told apart from one by the token.
+ */
+export type Via = 'operator' | 'browser' | 'api';
+const arrived = new AsyncLocalStorage<Via>();
+export const runVia = <T>(via: Via, fn: () => T): T => arrived.run(via, fn);
+
+/**
  * The store's record, with the owner's writes made through the operator token logged as the agent instead of you: the
  * actor, and a `why` written for the owner ("you pinned it") reworded to name the agent ("an agent (operator:codex)
- * pinned it").
+ * pinned it"). Every entry recorded while a request runs says how it arrived (`details.via`).
  */
 export function asActor<T extends Pick<ActivityStore, 'record'>>(a: T): T;
 export function asActor<T extends Pick<ActivityStore, 'record'>>(a: T | undefined): T | undefined;
 export function asActor<T extends Pick<ActivityStore, 'record'>>(a: T | undefined): T | undefined {
   if (!a) return a;
-  const record: ActivityStore['record'] = (e) => {
+  const record: ActivityStore['record'] = (input) => {
+    const via = arrived.getStore();
+    const e = via ? { ...input, details: { ...input.details, via } } : input;
     const actor = acting.getStore();
     if (!actor || e.actor !== 'you') return a.record(e);
     return a.record({ ...e, actor, why: e.why.startsWith('you ') ? `an agent (${actor}) ${e.why.slice(4)}` : e.why });

@@ -1,11 +1,14 @@
 import {
-  authorKindOf, feedbackSkipRule, githubRepoOfRemote, integrationErrorKind, IntegrationError, redactSecrets,
+  authorKindOf, githubRepoOfRemote, integrationErrorKind, IntegrationError, redactSecrets,
   type ActivityStore, type Credential, type DocsStore, type ExternalRef, type ExternalThread, type FetchPrOpts, type GraphStore,
-  type IntegrationKind, type Integrations, type IntegrationSyncState, type LinearComment, type PrContext, type Project, type WorkSession,
+  type IntegrationKind, type Integrations, type IntegrationSyncState, type LinearComment, type LinearTeamIssue, type PrContext, type Project, type WorkSession,
+  linearCommentsOf, linearDocRef, linearIssueDocChunks,
 } from '@fb/core';
+import { skipMatchingPending } from './pendingSkips.ts';
 
 /**
- * Review comments on pull requests (GitHub) and comments on issues (Linear) as feedback for the Inbox. Each PR or issue
+ * Review comments on pull requests (GitHub) and comments on issues (Linear) as feedback for the Inbox; Linear issues
+ * themselves (ticket and comments) as project documents, context rather than Inbox items. Each PR or issue
  * is stored as a stand-in thread (GraphStore.upsertExternalThread) whose turns the classifier labels like transcript
  * turns; pushback and corrections become Inbox items with source github or linear.
  *
@@ -19,15 +22,22 @@ export type SyncProject = Project & { remote: string | null };
 
 export type FeedbackSyncDeps = {
   integrations: Pick<Integrations, 'credential' | 'sync' | 'saveSync' | 'link'>;
-  /** listCandidates: the pending Inbox items a skip rule matches after a backfill (unset: not looked at). */
-  graph: Pick<GraphStore, 'upsertExternalThread' | 'workSessions'> & Partial<Pick<GraphStore, 'listCandidates'>>;
+  /** pendingExternalItems and skipPendingItem: the pending Inbox items a skip rule matches after a backfill are skipped (unset: not looked at). */
+  graph: Pick<GraphStore, 'upsertExternalThread' | 'workSessions'> & Partial<Pick<GraphStore, 'pendingExternalItems' | 'skipPendingItem'>>;
   cursors: Pick<DocsStore, 'getCursor' | 'setCursor'>;
   /** The tracked (and not excluded) projects, with their canonical remotes. */
   projects(): Promise<SyncProject[]>;
   /** GITHUB_REPOS: project key -> owner/repo, overriding the remote. */
   githubOverride?: Map<string, string>;
   fetchPrs(o: FetchPrOpts): Promise<PrContext[]>;
-  fetchLinear(o: { apiKey: string; teamId: string; since: string }): Promise<LinearComment[]>;
+  /** The mapped team's issues updated since, with their comments (fetchLinearIssues: one query per page). */
+  fetchLinearIssues(o: { apiKey: string; teamId: string; since: string }): Promise<LinearTeamIssue[]>;
+  /**
+   * With embed: each issue is also stored as a document (source linear, ref linear:<identifier>), project context like
+   * a PR's discussion, found by docs search and linked to the PRs that name it (DocsStore.linkedDocs). Unset: comments only.
+   */
+  docs?: Pick<DocsStore, 'upsertDoc'>;
+  embed?: (texts: string[]) => Promise<number[][]>;
   activity?: Pick<ActivityStore, 'record'>;
   minIntervalMs: number;
   lookbackDays?: number;
@@ -170,8 +180,7 @@ export function linearThread(comments: LinearComment[], floorMs: number, linked:
   };
 }
 
-type Skippable = { uuid: string; rule: string };
-type Outcome = { added: number; threads: number; target: string; skippable?: Skippable[] };
+type Outcome = { added: number; threads: number; target: string };
 
 /** Sync both services for every tracked project. Returns how many new comments each brought in. */
 export async function syncExternalFeedback(d: FeedbackSyncDeps): Promise<Record<IntegrationKind, number>> {
@@ -220,11 +229,17 @@ async function syncKind(kind: IntegrationKind, cred: Credential, projects: SyncP
     const floorMs = (since && !backfill ? Date.parse(since) : started.getTime()) - lookback;
     const fetchSince = since && !backfill ? since : new Date(started.getTime() - lookback).toISOString();
     try {
-      const r = kind === 'github' ? await syncRepo(p, target, cred.token, fetchSince, floorMs, d, backfill) : await syncTeam(p, target, link.linearTeamName ?? target, cred.token, fetchSince, floorMs, d);
+      const r = kind === 'github' ? await syncRepo(p, target, cred.token, fetchSince, floorMs, d) : await syncTeam(p, target, link.linearTeamName ?? target, cred.token, fetchSince, floorMs, d, since);
       await d.cursors.setCursor(cursorKey, started.toISOString());
       // Only a backfill (or a first sync, which fetches everything with author details) marks them known.
       if (!authorsKnown && (backfill || !since)) await d.cursors.setCursor(authorsCursor(p.key), started.toISOString());
-      if (r.skippable?.length) await reportPendingMatches(p, r.skippable, d);
+      if (backfill && d.graph.pendingExternalItems && d.graph.skipPendingItem) {
+        await skipMatchingPending({
+          graph: { pendingExternalItems: d.graph.pendingExternalItems.bind(d.graph), skipPendingItem: d.graph.skipPendingItem.bind(d.graph) },
+          activity: d.activity, botLogins: d.botLogins, agentLogins: d.agentLogins, projectKey: p.key, log: d.log,
+          why: 'synced before author details were kept, so the skip rules could not see them until now',
+        });
+      }
       added += r.added;
       state.projects[p.key] = { lastSyncAt: started.toISOString(), items: (state.projects[p.key]?.items ?? 0) + r.added, error: null, target: kind === 'github' ? target : link.linearTeamName ?? target };
       if (r.added) {
@@ -261,61 +276,47 @@ async function syncKind(kind: IntegrationKind, cred: Credential, projects: SyncP
   return added;
 }
 
-/** backfill: stored comments get their author details now; the ones a skip rule matches come back as `skippable`. */
-async function syncRepo(p: SyncProject, repo: string, token: string, since: string, floorMs: number, d: FeedbackSyncDeps, backfill = false): Promise<Outcome> {
+async function syncRepo(p: SyncProject, repo: string, token: string, since: string, floorMs: number, d: FeedbackSyncDeps): Promise<Outcome> {
   const prs = await d.fetchPrs({ repo, token, since });
   let added = 0;
   let threads = 0;
-  const skippable: Skippable[] = [];
   for (const pr of prs) {
     const fresh = pr.comments.filter((c) => c.createdAt && Date.parse(c.createdAt) >= floorMs);
     if (!fresh.length) continue;
     const latest = fresh.map((c) => c.createdAt).sort().at(-1)!;
     const linked = await linkWorkSessions(d.graph, p.key, pr.headBranch, latest);
-    const thread = prThread(pr, floorMs, linked, d);
-    const n = await d.graph.upsertExternalThread(p, thread);
+    const n = await d.graph.upsertExternalThread(p, prThread(pr, floorMs, linked, d));
     added += n;
     if (n) threads++;
-    if (backfill) {
-      for (const i of thread.items) {
-        const rule = feedbackSkipRule(i.text, i.external);
-        if (rule) skippable.push({ uuid: i.uuid, rule: rule.name });
-      }
-    }
   }
-  return { added, threads, target: repo, skippable };
+  return { added, threads, target: repo };
 }
 
-/** Most pending Inbox items looked at for skip-rule matches after a backfill. */
-const PENDING_LIMIT = 1000;
-
-/**
- * After a backfill: the pending Inbox items that a skip rule matches now that their authors are known (say, the PR
- * author's "Fixed in <sha>" reply). They were flagged before the rules could see them. Nothing is decided for you:
- * they stay pending, the Inbox shows the matching rule, and this note says how many there are.
- */
-async function reportPendingMatches(p: SyncProject, skippable: Skippable[], d: FeedbackSyncDeps): Promise<void> {
-  if (!d.graph.listCandidates) return;
-  const ruleOf = new Map(skippable.map((s) => [s.uuid, s.rule]));
-  const pending = await d.graph.listCandidates({ status: 'pending', projectKey: p.key, limit: PENDING_LIMIT });
-  const hits = pending.flatMap((c) => {
-    const rule = ruleOf.get(c.turnUuid) ?? ruleOf.get(c.id);
-    return rule ? [{ id: c.id, rule }] : [];
-  });
-  if (!hits.length) return;
-  const counts: Record<string, number> = {};
-  for (const h of hits) counts[h.rule] = (counts[h.rule] ?? 0) + 1;
+/** The issues as documents: what the ticket says is context for the work on it, whether or not anyone commented. */
+async function storeTickets(p: SyncProject, issues: LinearTeamIssue[], team: string, since: string | null, d: FeedbackSyncDeps): Promise<void> {
+  if (!d.docs || !d.embed || !issues.length) return;
+  const ids: string[] = [];
+  for (const i of issues) {
+    const chunks = linearIssueDocChunks(i).map((t) => redactSecrets(t));
+    const vectors = await d.embed(chunks);
+    ids.push(await d.docs.upsertDoc(
+      { projectKey: p.key, source: 'linear', ref: linearDocRef(i.identifier), title: `${i.identifier}: ${i.title}`, url: i.url },
+      chunks.map((text, n) => ({ text, embedding: vectors[n] })),
+    ));
+  }
   await d.activity?.record({
-    kind: 'feedback_synced', actor: 'github', projectKey: p.key,
-    subject: `${hits.length} pending Inbox item${hits.length === 1 ? ' matches' : 's match'} a skip rule now that ${hits.length === 1 ? 'its author is' : 'their authors are'} known`,
-    why: 'synced before author details were kept, so the skip rules could not see them; they stay pending for you to decide, with the rule shown',
-    details: { pendingMatches: counts },
-    targets: hits.map((h) => h.id),
+    kind: 'doc_added', actor: 'linear', projectKey: p.key,
+    subject: `synced ${issues.length} Linear ticket${issues.length === 1 ? '' : 's'} from ${team}`,
+    why: since ? `updated since the last sync at ${since}` : 'first sync of this team',
+    details: { team, tickets: issues.map((i) => ({ identifier: i.identifier, title: i.title, comments: i.comments.length })) },
+    targets: ids,
   });
 }
 
-async function syncTeam(p: SyncProject, teamId: string, teamName: string, apiKey: string, since: string, floorMs: number, d: FeedbackSyncDeps): Promise<Outcome> {
-  const comments = await d.fetchLinear({ apiKey, teamId, since });
+async function syncTeam(p: SyncProject, teamId: string, teamName: string, apiKey: string, since: string, floorMs: number, d: FeedbackSyncDeps, cursor: string | null = null): Promise<Outcome> {
+  const issues = await d.fetchLinearIssues({ apiKey, teamId, since });
+  await storeTickets(p, issues, `Linear team ${teamName}`, cursor, d);
+  const comments = linearCommentsOf(issues);
   const byIssue = new Map<string, LinearComment[]>();
   for (const c of comments) byIssue.set(c.issue.id, [...(byIssue.get(c.issue.id) ?? []), c]);
   let added = 0;

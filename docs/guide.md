@@ -48,14 +48,17 @@ Bars that can appear above any page:
 
 ![Dashboard](../packages/ui/public/guide/dashboard.png)
 
-The landing page: where everything stands, each part linked to the page with the detail. It refreshes the worker and pipeline every 10 seconds. Nothing here changes what agents learn.
+The landing page: a question box first, then where everything stands, each part linked to the page with the detail. It refreshes the worker and pipeline every 10 seconds. Nothing here changes what agents learn.
 
-**Now** (top left)
+**Ask** (top, centre): one box. Type a question, pick the project under it, press **Enter** (**Shift+Enter** is a new line) or **Ask**. It opens a new chat on the Ask page and sends the question.
+- The **starter questions** under the box fill it in for you to finish; they do not send.
+- **Suggested questions** ask about your top hotspots ("Before I change *file*, what should I know?"); a click sends it on that file's project.
+- **Recent chats**: your last five conversations, each with its project and when it last changed; **all** opens the Ask page.
+
+**Now**
 - **Worker** badge: green *running* or red *offline*, then the step it is on, with a count and how long it has run.
 - One badge per model job: *classifier*, *post-mortem*, *scan*, *summaries*, *docs reader*, plus *embeddings* (Ollama). Green works; red could not be reached, with the reason and since when underneath. The provider (for example `ollama:gemma4` or `claude-cli`) is in grey. A job you turned off is not listed.
 - The last line: worker version, last heartbeat, last error.
-
-**Ask** (top right): pick a project, type a question, press **Ask** (or `Cmd/Ctrl+Enter`). It opens a new chat on the Ask page and sends the question.
 
 **Pipeline** tiles (each opens the page that shows it)
 | Tile | Means |
@@ -192,7 +195,7 @@ Two views of one project, picked with the **evidence / code** tabs and the proje
 
 **Code mode**: the code map of one project.
 - Circles are files; lighter circles are **test files**. **Red** circles are files with misses. **Diamonds** are misses, **squares** are approved lessons.
-- **Size** is the hotspot score: bigger files score higher.
+- **Size** is the hotspot score: bigger files score higher. Files repel each other and never overlap, so folders that import each other form their own clusters; the drawing is fitted under the legend once it settles (a large map takes a few seconds).
 - Lines: solid arrows are imports, dashed lines are tests covering a file, dotted lines tie a miss or lesson to its files. A very faint dotted line only keeps a file with no drawn neighbour close by.
 - **Captions**: the top 12 hotspots and every file with misses are always named; zoom in to name every file. Names are shortened to the shortest unique ending (`read/handler.ts`); hover for the full path, score and misses.
 - **include tests** adds test files to the hotspots. **Find a file by path** opens any mapped file, drawn or not.
@@ -314,20 +317,20 @@ Click a row to expand it: the kind and project, every detail (lists of facts or 
 
 ![Settings](../packages/ui/public/guide/settings.png)
 
-Which project folders are read, where they come from, and the connections. **Nothing is read until you choose**, and every other page shows only the selected projects.
+Which project folders are read, where they come from, and the connections, in four tabs: **Projects**, **Integrations**, **Cloud sync** and **Clean up**. The tab is kept in the address (`#settings/integrations`), and a link to a card (the sidebar's connections, for example) opens its tab. **Nothing is read until you choose**, and every other page shows only the selected projects.
 
-**Project folders**
+**Projects tab: Project folders**
 - Search by folder, path or remote. Filters: **All**, **Selected**, **With sessions**, **Has data**, each with a count. Sort by folder, Claude Code sessions, Codex sessions or last activity.
 - **Tick** shortcuts: *Select all*, *Select none*, *Select shown*, *Select folders with sessions*. Then **Save selection**.
 - Each row: the box, the folder name and path, git remote ("no remote", "not git"), Claude Code and Codex session counts, last activity, and badges: green **selected**, accent **adding** or **stopping** (unsaved), **excluded** (by `EXCLUDE_PROJECTS`), blue **clone of *x*** (read together with *x*), red **missing folder**, **has data**. A greyed box cannot be ticked; hover it for why.
-- The **Unsaved changes** bar shows *+n added* (green) and *-n removed* (red), with **Cancel** and **Save selection**. Leaving the page asks first.
+- The **Unsaved changes** bar stays at the bottom on every tab, and shows *+n added* (green) and *-n removed* (red), with **Cancel** and **Save selection**. Leaving the page asks first.
 
-**Where folders come from**: the project roots. **Add folder** adds one; **Remove** takes one away (asks first). *not mounted yet* means you must run `./scripts/setup.sh` on the host (**Copy command** copies it). Sessions that ran outside your roots are suggested with their counts, each with **Add as root**.
+**Projects tab: Where folders come from**: the project roots. **Add folder** adds one; **Remove** takes one away (asks first). *not mounted yet* means you must run `./scripts/setup.sh` on the host (**Copy command** copies it). Sessions that ran outside your roots are suggested with their counts, each with **Add as root**.
 
-**Integrations**: GitHub and Linear cards, each with a state badge (green *connected*, red *error*, grey *not connected*) and *set in .env* or *saved here*. They show the account, where the token comes from, last sync and any rate-limit pause. **Connect** checks a token with one read-only call before keeping it; **Test connection**, **Replace token**, **Disconnect** (asks first; comments already in the Inbox stay). The **Projects** table turns pull request comments on or off per project, picks each project's Linear team, and shows each sync's time and comment count. **All connections** lists every connection with where it is set. Integrations only read; nothing is written to GitHub or Linear.
+**Integrations tab**: GitHub and Linear cards, each with a state badge (green *connected*, red *error*, grey *not connected*) and *set in .env* or *saved here*. They show the account, where the token comes from, last sync and any rate-limit pause. **Connect** checks a token with one read-only call before keeping it; **Test connection**, **Replace token** (also over a token from `.env`: the one saved here wins), **Disconnect** (asks first; comments already in the Inbox stay; with a token in `.env` it goes back to that one). The **Projects** table turns pull request comments on or off per project, picks each project's Linear team, and shows each sync's time and comment count. **All connections** lists every connection with where it is set. Integrations only read; nothing is written to GitHub or Linear.
 
 **Comments skipped before the classifier**: the rules that keep a comment out of the Inbox (`bot-author`, `pr-author-reply`, `status-note`, `review-trigger`), each with how many it skipped. Read-only.
 
-**Cloud sync**: off unless `CLOUD_URL` and `CLOUD_TOKEN` are set. When on: the host, schedule, last sync, which lessons are sent (approved only unless `SYNC_SUGGESTIONS=true`), the projects, and tiles counting what a sync sends. **Sync now** sends it.
+**Cloud sync tab**: off unless `CLOUD_URL` and `CLOUD_TOKEN` are set. When on: the host, schedule, last sync, which lessons are sent (approved only unless `SYNC_SUGGESTIONS=true`), the projects, and tiles counting what a sync sends. **Sync now** sends it.
 
-**Clean up**: removes the stored data of projects you have not selected. It uses the saved selection, so save first. Asks first.
+**Clean up tab**: removes the stored data of projects you have not selected. It uses the saved selection, so save first. Asks first.

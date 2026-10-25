@@ -3,6 +3,7 @@ import { CloudSync } from './CloudSync.tsx';
 import { Prefilters } from './Prefilters.tsx';
 import { Integrations } from './Integrations.tsx';
 import { api, CLEANUP_CONFIRM, type ProjectCandidate, type ProjectSettings } from './api.ts';
+import { hashFocus } from './links.ts';
 import { useUnsavedChanges } from './unsaved.ts';
 import { ConfirmDialog } from './ui/ConfirmDialog.tsx';
 import { PageHeader } from './ui/PageHeader.tsx';
@@ -10,6 +11,23 @@ import { Button, CopyButton, Input, Select } from './ui/controls.tsx';
 import { ago, Alert, Badge, EmptyState, plural, Skeleton, SkeletonList, tdClass, thClass } from './ui/display.tsx';
 import { ChevronIcon, FolderIcon, SearchIcon } from './ui/icons.tsx';
 
+
+/** The page's tabs; `#settings/<tab>` opens one, and so does a link to a card inside it (#settings/integrations-github). */
+const TABS = [
+  { key: 'projects', label: 'Projects' },
+  { key: 'integrations', label: 'Integrations' },
+  { key: 'cloud', label: 'Cloud sync' },
+  { key: 'cleanup', label: 'Clean up' },
+] as const;
+type Tab = (typeof TABS)[number]['key'];
+
+export function tabOf(focus: string | null): Tab {
+  if (!focus) return 'projects';
+  if (/^(integrations|connections|prefilters)/.test(focus)) return 'integrations';
+  if (focus.startsWith('cloud')) return 'cloud';
+  if (focus.startsWith('cleanup')) return 'cleanup';
+  return 'projects';
+}
 
 type Filter = 'all' | 'selected' | 'sessions' | 'data';
 const FILTERS: { key: Filter; label: string }[] = [
@@ -61,6 +79,14 @@ export function Settings() {
   const [query, setQuery] = useState('');
   const [filter, setFilter] = useState<Filter>('all');
   const [sort, setSort] = useState<Sort>(defaultSort('activity'));
+  const [tab, setTab] = useState<Tab>(() => tabOf(hashFocus('settings')));
+  useEffect(() => {
+    const onHash = () => { if (hashFocus('settings') !== null) setTab(tabOf(hashFocus('settings'))); };
+    window.addEventListener('hashchange', onHash);
+    return () => window.removeEventListener('hashchange', onHash);
+  }, []);
+  // Kept in the address without a history entry or a hashchange (which the app's router would act on).
+  const openTab = (t: Tab) => { setTab(t); history.replaceState(null, '', `#settings/${t}`); };
 
   const load = () =>
     api.projectSettings().then(
@@ -152,8 +178,26 @@ export function Settings() {
 
   return (
     <div className="flex h-full min-h-0 flex-col">
-      <PageHeader title="Settings" description="Choose which project folders Feedback Graph reads sessions from." />
-      <div className="min-h-0 flex-1 overflow-y-auto">
+      <PageHeader title="Settings" description="Which project folders are read, the GitHub and Linear connections, cloud sync, and cleaning up old data." />
+      <div role="tablist" aria-label="settings sections" className="flex shrink-0 gap-1 overflow-x-auto border-b border-line px-3 md:px-5">
+        {TABS.map((t) => (
+          <button
+            key={t.key}
+            type="button"
+            role="tab"
+            id={`settings-tab-${t.key}`}
+            aria-selected={tab === t.key}
+            aria-controls="settings-panel"
+            onClick={() => openTab(t.key)}
+            className={`-mb-px shrink-0 border-b-2 px-3 py-2 text-[13px] font-medium transition-colors ${
+              tab === t.key ? 'border-accent text-text' : 'border-transparent text-muted hover:text-text'
+            }`}
+          >
+            {t.label}
+          </button>
+        ))}
+      </div>
+      <div id="settings-panel" role="tabpanel" aria-labelledby={`settings-tab-${tab}`} className="min-h-0 flex-1 overflow-y-auto">
         <div className="mx-auto grid max-w-6xl gap-5 p-3 md:p-5">
           {error && (
             <Alert>
@@ -167,7 +211,7 @@ export function Settings() {
 
           {!data && !error && <SettingsSkeleton />}
 
-          {data && (!data.initialized || data.tracked.length === 0) && (
+          {tab === 'projects' && data && (!data.initialized || data.tracked.length === 0) && (
             <div className="rounded-md border border-accent-edge/50 bg-accent-soft px-4 py-3">
               <p className="font-semibold">Nothing is being read yet</p>
               <p className="mt-0.5 text-muted">
@@ -177,7 +221,7 @@ export function Settings() {
             </div>
           )}
 
-          {data && (
+          {tab === 'projects' && data && (
             <section aria-labelledby="settings-folders" className="grid gap-2.5">
               <SectionHead id="settings-folders" title="Project folders">
                 Tick a folder to read its Claude Code and Codex sessions. Unticking stops reading it and keeps what was learned.
@@ -272,12 +316,12 @@ export function Settings() {
             </section>
           )}
 
-          {data && <Sources data={data} onSaved={setData} onError={setError} />}
-          {data && <Integrations />}
+          {tab === 'projects' && data && <Sources data={data} onSaved={setData} onError={setError} />}
+          {tab === 'integrations' && data && <Integrations />}
           {/* Right under Integrations: the comments it syncs are what these rules skip. */}
-          {data && <Prefilters />}
-          {data && <CloudSync />}
-          {data && <Cleanup data={data} dirty={dirty} onDone={load} onError={setError} />}
+          {tab === 'integrations' && data && <Prefilters />}
+          {tab === 'cloud' && data && <CloudSync />}
+          {tab === 'cleanup' && data && <Cleanup data={data} dirty={dirty} onDone={load} onError={setError} />}
         </div>
       </div>
 

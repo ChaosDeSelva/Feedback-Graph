@@ -47,13 +47,43 @@ export function shortestSuffixes(paths: string[]): Map<string, string> {
   return out;
 }
 
-/** Labels drawn this frame, so a later one that would overlap an earlier one is skipped (earlier ones win). */
+type Box = [number, number, number, number];
+const overlaps = ([bx, by, bw, bh]: Box, x: number, y: number, w: number, h: number) => x < bx + bw && bx < x + w && y < by + bh && by < y + h;
+
+/**
+ * Labels drawn this frame, so a later one that would overlap an earlier one is skipped (earlier ones win). Nodes are
+ * blocked too, so no caption covers another node; and with `perCell`, at most that many captions sit in each `cell`
+ * square (by the caption's centre), so the dense centre of a big map shows a few names, not a pile of them.
+ */
 export class LabelPlacer {
-  private boxes: [number, number, number, number][] = [];
-  reset() { this.boxes = []; }
-  /** Takes the box (left, top, width, height) when it overlaps none taken so far. */
+  private boxes: Box[] = [];
+  private nodes: Box[] = [];
+  private cells = new Map<string, number>();
+  private cell: number;
+  private perCell: number;
+  constructor(o: { cell?: number; perCell?: number } = {}) {
+    this.cell = o.cell ?? 0;
+    this.perCell = o.perCell ?? Infinity;
+  }
+  /** Starts a frame; `o` changes the area cap (its cell is in drawing units, so it follows the zoom). */
+  reset(o: { cell?: number; perCell?: number } = {}) {
+    this.boxes = [];
+    this.nodes = [];
+    this.cells.clear();
+    if (o.cell !== undefined) this.cell = o.cell;
+    if (o.perCell !== undefined) this.perCell = o.perCell;
+  }
+  /** A node's box (left, top, width, height): no caption may cover it. */
+  block(x: number, y: number, w: number, h: number) {
+    this.nodes.push([x, y, w, h]);
+  }
+  /** Takes the box (left, top, width, height) when it overlaps no caption taken so far and no node, and its area has room. */
   place(x: number, y: number, w: number, h: number): boolean {
-    if (this.boxes.some(([bx, by, bw, bh]) => x < bx + bw && bx < x + w && y < by + bh && by < y + h)) return false;
+    if (this.boxes.some((b) => overlaps(b, x, y, w, h)) || this.nodes.some((b) => overlaps(b, x, y, w, h))) return false;
+    const key = this.cell > 0 ? `${Math.floor((x + w / 2) / this.cell)}:${Math.floor((y + h / 2) / this.cell)}` : '';
+    const n = this.cells.get(key) ?? 0;
+    if (this.cell > 0 && n >= this.perCell) return false;
+    this.cells.set(key, n + 1);
     this.boxes.push([x, y, w, h]);
     return true;
   }

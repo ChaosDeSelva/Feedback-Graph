@@ -83,7 +83,8 @@ test('discoverNested finds repos one or two levels inside folders that are not r
   ]);
   // A folder kept whole (already selected or excluded as one project) is not split.
   expect(await discoverNested(base, { keepWhole: (k) => k === 'kept' })).not.toContain('kept/one');
-});
+  // It makes real git repos: a few seconds alone, more on a loaded machine.
+}, 20_000);
 
 test('a nested key is its path with a safe separator, and maps back to its folder', () => {
   expect(keyOfRel('github.com/org/repo')).toBe('github.com__org__repo');

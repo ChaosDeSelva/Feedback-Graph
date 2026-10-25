@@ -2,7 +2,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { WebStandardStreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js';
 import { z } from 'zod';
 import { VERSION } from '@fb/core';
-import { checkBeforeDone, getImpact, getModuleContext, getRecentSessions, getTaskContext, MAX_DEPTH, RECENT_MAX, reportFeedback, type ContextDeps } from './context.ts';
+import { checkBeforeDone, getImpact, getModuleContext, getRecentSessions, getTaskContext, MAX_DEPTH, RECENT_MAX, reportFeedback, searchGraph, type ContextDeps } from './context.ts';
 
 /**
  * Length limits on free text: every argument is embedded, searched or stored, so a runaway client (a 1 MB task was
@@ -24,14 +24,16 @@ function buildServer(ctx: ContextDeps, client: string | undefined) {
     'get_task_context',
     {
       description:
-        'Before starting non-trivial work: returns approved lessons from past developer feedback and similar past misses in this project, with citations, the code and document facts that matter most for everyday work, and the best matches from projects the developer linked to this one. Name the files you expect to change: lessons tied to them come first, and a short code map shows their importers, tests and last misses.',
+        'Before starting non-trivial work: returns approved lessons from past developer feedback and similar past misses in this project, with citations, the code and document facts that matter most for everyday work, and the best matches from projects the developer linked to this one. Name the files you expect to change: lessons tied to them come first, and a short code map shows their importers, tests and past misses. brief: true returns only the lessons, the misses on the named files, their importers and tests, and PR discussions, in about 1,500 characters.',
       inputSchema: {
         ...where,
         task: z.string().max(MAX.task).describe('What you are about to build or change, in a sentence or two'),
         files: z.array(z.string().max(MAX.path)).max(50).optional().describe('Files you expect to read or change (repo-relative, or absolute inside the project)'),
+        brief: z.boolean().optional().describe('Only lessons, misses on the named files, their importers and tests, and PR discussions (about 1,500 characters)'),
+        session_id: z.string().max(MAX.key).optional().describe('Your session id, if you know it: facts refreshed since it started are marked as your own change'),
       },
     },
-    async (a) => text((await getTaskContext({ ...a, client }, ctx)).markdown),
+    async ({ session_id, ...a }) => text((await getTaskContext({ ...a, sessionId: session_id, client }, ctx)).markdown),
   );
 
   server.registerTool(
@@ -108,10 +110,10 @@ function buildServer(ctx: ContextDeps, client: string | undefined) {
   server.registerTool(
     'search_graph',
     {
-      description: 'Search lessons and past misses in the feedback graph by meaning.',
+      description: 'Search the feedback graph by meaning: approved lessons, past misses, code facts and docs closest to the query, in about 3,000 characters. Each section says when nothing is close enough.',
       inputSchema: { ...where, query: z.string().max(MAX.query) },
     },
-    async (a) => text((await getTaskContext({ ...a, task: a.query, client }, ctx)).markdown),
+    async (a) => text((await searchGraph({ ...a, client }, ctx)).markdown),
   );
 
   return server;

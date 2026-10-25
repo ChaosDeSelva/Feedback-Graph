@@ -59,3 +59,24 @@ test('LabelPlacer keeps the first label in a spot and refuses one that overlaps 
   p.reset();
   expect(p.place(20, 5, 40, 10)).toBe(true);
 });
+
+test('LabelPlacer refuses a caption that would cover a node, never its own (drawn below it)', () => {
+  const p = new LabelPlacer();
+  p.block(30, 0, 10, 10); // a neighbour's node
+  p.block(0, -10, 10, 10); // the captioned node itself, just above its caption
+  expect(p.place(0, 2, 40, 10)).toBe(false);
+  expect(p.place(0, 2, 25, 10)).toBe(true);
+  p.reset();
+  expect(p.place(0, 2, 40, 10)).toBe(true);
+});
+
+test('LabelPlacer caps captions per area, so the dense centre of a map does not fill with text', () => {
+  const p = new LabelPlacer({ cell: 100, perCell: 2 });
+  expect(p.place(0, 0, 20, 5)).toBe(true);
+  expect(p.place(0, 10, 20, 5)).toBe(true);
+  expect(p.place(0, 20, 20, 5)).toBe(false);
+  // Another area has its own allowance.
+  expect(p.place(150, 0, 20, 5)).toBe(true);
+  p.reset();
+  expect(p.place(0, 20, 20, 5)).toBe(true);
+});

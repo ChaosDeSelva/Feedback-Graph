@@ -39,8 +39,12 @@ export function CloudSync() {
       const r = await api.syncCloud();
       // Nothing stored for any selected project: no request reached the cloud, so it records no sync either.
       const nothing = r.ok && !r.sent.projects && !r.projects?.some((p) => p.status === 'withdrawn');
-      if (nothing) setResult('Nothing to send yet: the selected projects have no lessons, misses, facts or docs stored. The cloud records a sync once something is sent.');
-      else if (r.ok) setResult(sentence(r.host, r.sent));
+      // Unchanged: the same bundle as the last send, so nothing went (a forced sync resends it).
+      const unchanged = r.projects?.filter((p) => p.status === 'unchanged').length ?? 0;
+      const same = unchanged ? `${plural(unchanged, 'project')} unchanged` : '';
+      if (nothing && unchanged) setResult(`Nothing changed since the last sync (${same}).`);
+      else if (nothing) setResult('Nothing to send yet: the selected projects have no lessons, misses, facts or docs stored. The cloud records a sync once something is sent.');
+      else if (r.ok) setResult(unchanged ? `${sentence(r.host, r.sent).replace(/\.$/, '')}; ${same} since the last sync.` : sentence(r.host, r.sent));
       else setError(r.error ?? 'The sync failed.');
       await load();
     } catch (e) {

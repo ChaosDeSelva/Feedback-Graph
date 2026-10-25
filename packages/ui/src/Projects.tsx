@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { hashModule } from './links.ts';
+import { hashModule, projectHref } from './links.ts';
 import { FACT_KINDS, UNSCORED_RELEVANCE, type FactEvidence, type FactKind } from '@fb/core/types';
 import { relevanceBand, type RelevanceBand } from '@fb/core/relevance';
 import { ActivityEntry } from './Activity.tsx';
@@ -59,6 +59,25 @@ export function Projects({ pollMs = 5000 }: { pollMs?: number } = {}) {
     setSelected((s) => (s && ps.some((p) => p.key === s) ? s : null) ?? ps.find((p) => p.facts > 0)?.key ?? ps[0]?.key ?? null);
   }, (e) => { setError(String(e)); setProjects((ps) => ps ?? []); });
   useEffect(() => { load(); }, []);
+  // A link followed while the page is open (Ask, the Dashboard, a module's "link") switches to the project it names, so
+  // what the page shows, and what Rebuild or Scan acts on, is always what the address says.
+  useEffect(() => {
+    const onHash = () => {
+      const l = hashModule();
+      if (!l) return;
+      setSelected(l.project);
+      setOpen(true);
+      if (l.path) setModuleFocus({ path: l.path, at: Date.now() });
+    };
+    window.addEventListener('hashchange', onHash);
+    return () => window.removeEventListener('hashchange', onHash);
+  }, []);
+  /** Pick a project: the address names it too (without a history entry), so a reload or a copied link opens the same one. */
+  const pick = (key: string) => {
+    setSelected(key);
+    setOpen(true);
+    history.replaceState(history.state, '', projectHref(key));
+  };
 
   const current = projects?.find((p) => p.key === selected);
   const scanning = current?.lastScan && ['queued', 'running'].includes(current.lastScan.status);
@@ -133,7 +152,7 @@ export function Projects({ pollMs = 5000 }: { pollMs?: number } = {}) {
             <ul>
               {projects.map((p) => (
                 <li key={p.key} className="relative">
-                  <ListRow selected={p.key === selected} onClick={() => { setSelected(p.key); setOpen(true); }}>
+                  <ListRow selected={p.key === selected} onClick={() => pick(p.key)}>
                     <div className="truncate pr-7 text-[13px] font-medium">{p.key}</div>
                     {p.remote && <div className="truncate font-mono text-[11px] text-muted">{p.remote}</div>}
                     <div className="truncate text-xs text-muted tabular-nums">
@@ -201,6 +220,11 @@ export function Projects({ pollMs = 5000 }: { pollMs?: number } = {}) {
                       {current.lastScan.shards.failed ? `, ${current.lastScan.shards.failed} failed` : ''}
                     </span>
                   )}
+                  {!!current.lastScan.shards?.unreached?.length && (
+                    <span className="text-muted tabular-nums" title={`The scan's agents said they did not read these:\n${current.lastScan.shards.unreached.join('\n')}`}>
+                      {current.lastScan.shards.unreached.length} {current.lastScan.shards.unreached.length === 1 ? 'place' : 'places'} not reached
+                    </span>
+                  )}
                   {(() => {
                     const pos = current.lastScan.status === 'queued' ? queuePosition(projects, current.key) : null;
                     return pos !== null && <span className="text-muted">{pos === 1 ? 'next in the queue' : `${ordinal(pos)} in the queue`}</span>;
@@ -215,9 +239,17 @@ export function Projects({ pollMs = 5000 }: { pollMs?: number } = {}) {
                 </div>
               )}
 
+              {!!current.olderScanner && (
+                // A scan spends your model budget, so none starts on its own: say what is stale and what refreshes it.
+                <div className="rounded-md border border-line bg-surface px-3 py-2 text-xs text-muted shadow-card" title="The scanner's prompt or reader changed since these files were read; their facts stay served until a scan reads them again">
+                  {current.olderScanner === 1 ? '1 file was' : `${current.olderScanner} files were`} read by an older scanner:{' '}
+                  {scanning ? `the scan under way refreshes ${current.olderScanner === 1 ? 'it' : 'them'}.` : `press Scan to refresh ${current.olderScanner === 1 ? 'it' : 'them'}.`}
+                </div>
+              )}
+
               <ProjectLinks projectKey={current.key} projects={projects.map((p) => p.key)} onError={setError} />
 
-              <CodeMap projectKey={current.key} initialModule={current.key === link?.project ? link.path : null} focus={moduleFocus} />
+              <CodeMap projectKey={current.key} pollMs={pollMs} initialModule={current.key === link?.project ? link.path : null} focus={moduleFocus} />
 
               <Card
                 title="Code facts"

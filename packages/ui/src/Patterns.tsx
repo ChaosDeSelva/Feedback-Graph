@@ -103,7 +103,7 @@ export function Patterns() {
   const [tests, setTests] = useState(false);
   useEffect(() => {
     let stale = false;
-    api.topHotspots(project || undefined, 10, tests).then((h) => { if (!stale) setHot(h); }, () => { if (!stale) setHot([]); });
+    api.topHotspots(project || undefined, 10, tests, true).then((h) => { if (!stale) setHot(h); }, () => { if (!stale) setHot([]); });
     return () => { stale = true; };
   }, [project, tests]);
 
@@ -193,7 +193,10 @@ export function Patterns() {
   );
 }
 
-/** The files agents keep getting wrong: the top code map hotspots across the selected projects. */
+/**
+ * The files agents keep getting wrong: the files a confirmed miss touched, by hotspot score, across the selected
+ * projects. A busy file no miss touched is a hotspot, not a struggle: those are on the Projects page.
+ */
 function Struggle({ hot, tests, onTests }: { hot: ProjectHotspot[] | null; tests: boolean; onTests: (v: boolean) => void }) {
   return (
     <Card
@@ -231,7 +234,14 @@ function Struggle({ hot, tests, onTests }: { hot: ProjectHotspot[] | null; tests
           <p className="border-t border-line px-3 py-2 text-xs text-muted">Open a file on the Projects page to see its symbols, importers, tests, lessons and misses.</p>
         </div>
       ) : (
-        <p className="p-3 py-6 text-muted">{hot ? 'No code map yet. The worker maps each selected project within a few minutes.' : 'Loading…'}</p>
+        <p className="p-3 py-6 text-muted">
+          {hot ? (
+            <>
+              No files with misses yet: no confirmed miss has touched a mapped file. The busiest files are in each project's{' '}
+              <a href="#projects" className="font-semibold underline underline-offset-2">hotspots</a>.
+            </>
+          ) : 'Loading…'}
+        </p>
       )}
     </Card>
   );

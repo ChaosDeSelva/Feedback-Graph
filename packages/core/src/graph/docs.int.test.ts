@@ -42,6 +42,25 @@ describeStores('DocsStore', (h) => {
     expect(hits.find((h) => h.source === 'github')).toMatchObject({ ref: 'PR 12', title: 'title PR 12' });
   });
 
+  test('a pull request links the Linear tickets it names, both ways, within its project; a lookalike or a missing ticket links nothing', async () => {
+    const pr = await d.upsertDoc({ ...doc('github:acme/shop#12', 'shop', 'github'), title: 'acme/shop#12: Keep cents', url: 'https://github.com/acme/shop/pull/12' }, [{ text: 'pr', embedding: vec(1) }], { tickets: ['ENG-7', 'UTF-8', 'ENG-99'] });
+    const other = await d.upsertDoc({ ...doc('github:acme/shop#13', 'shop', 'github'), title: 'acme/shop#13: Totals' }, [{ text: 'pr', embedding: vec(1) }], { tickets: ['ENG-7'] });
+    const ticket = await d.upsertDoc({ ...doc('linear:ENG-7', 'shop', 'linear'), title: 'ENG-7: Keep cents', url: 'https://linear.app/acme/issue/ENG-7' }, [{ text: 'ticket', embedding: vec(2) }]);
+    // The same identifier in another project is another team's ticket.
+    await d.upsertDoc({ ...doc('linear:ENG-99', 'blog', 'linear') }, [{ text: 'elsewhere', embedding: vec(2) }]);
+
+    expect(await d.linkedDocs({ projectKey: 'shop', docIds: [pr] })).toEqual([
+      { docId: pr, linked: { docId: ticket, source: 'linear', ref: 'linear:ENG-7', title: 'ENG-7: Keep cents', url: 'https://linear.app/acme/issue/ENG-7' } },
+    ]);
+    const back = await d.linkedDocs({ projectKey: 'shop', docIds: [ticket] });
+    expect(back.map((l) => [l.docId, l.linked.docId])).toEqual([[ticket, pr], [ticket, other]]);
+    expect(await d.linkedDocs({ projectKey: 'blog', docIds: [pr] })).toEqual([]);
+    expect(await d.linkedDocs({ projectKey: 'shop', docIds: [] })).toEqual([]);
+    // Synced again without naming it: the link goes.
+    await d.upsertDoc({ ...doc('github:acme/shop#13', 'shop', 'github'), title: 'acme/shop#13: Totals' }, [{ text: 'pr', embedding: vec(1) }]);
+    expect((await d.linkedDocs({ projectKey: 'shop', docIds: [ticket] })).map((l) => l.linked.docId)).toEqual([pr]);
+  });
+
   test('deleteDoc removes the doc and its chunks', async () => {
     const id = await d.upsertDoc(doc('spec.md'), [{ text: 'x', embedding: vec(1) }]);
     expect(await d.deleteDoc(id)).toBe(true);

@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { ACTIVITY_KINDS, type Activity as Entry, type ActivityKind } from '@fb/core/types';
+import { ACTIVITY_KINDS, contextWhy, NO_CONTEXT_WHY, type Activity as Entry, type ActivityKind } from '@fb/core/types';
 import { api, type PipelineStatus, type ProjectSummary } from './api.ts';
 import { hashFocus } from './links.ts';
 import { PageHeader } from './ui/PageHeader.tsx';
@@ -42,6 +42,8 @@ const KIND_LABEL: Record<ActivityKind, string> = {
   comments_skipped: 'comments skipped',
   lessons_checked: 'lessons checked',
   lesson_to_fact: 'lesson to fact',
+  misses_reclassified: 'misses reclassified',
+  items_reopened: 'back in the Inbox',
 };
 
 const KIND_TONE: Partial<Record<ActivityKind, Tone>> = {
@@ -111,7 +113,8 @@ function Value({ v }: { v: unknown }) {
             <li key={i} className="rounded-sm border border-line bg-surface px-2 py-1.5">
               <span className="text-muted">{[it.kind, it.status].filter(Boolean).join(' · ')}{it.kind || it.status ? ' · ' : ''}</span>
               <span className="[overflow-wrap:anywhere]">{head ?? JSON.stringify(x)}</span>
-              {it.why && <div className="text-muted">why: {it.why}</div>}
+              {/* A why that is only an echoed field name (wasAvailable) says nothing: left out. */}
+              {it.why && contextWhy(it.why) !== NO_CONTEXT_WHY && <div className="text-muted">why: {it.why}</div>}
             </li>
           );
         })}
@@ -128,7 +131,16 @@ export const ACTIVITY_COLS = 'grid grid-cols-[1rem_minmax(0,1fr)_auto] gap-x-3 @
 
 export function ActivityEntry({ a, open: initial = false }: { a: Entry; open?: boolean }) {
   const [open, setOpen] = useState(initial);
-  const details = Object.entries(a.details);
+  // A list leaves big details out (detailsOmitted): the entry fetches them the first time it is opened.
+  const [full, setFull] = useState<Entry['details'] | null>(null);
+  const [failed, setFailed] = useState<string | null>(null);
+  useEffect(() => {
+    if (!open || !a.detailsOmitted || full) return;
+    let stale = false;
+    api.activityEntry(a.id).then((x) => { if (!stale) setFull(x.details); }, (e) => { if (!stale) setFailed(e instanceof Error ? e.message : String(e)); });
+    return () => { stale = true; };
+  }, [open, a.id, a.detailsOmitted, full]);
+  const details = Object.entries(full ?? a.details);
   return (
     <li className="@container border-b border-line last:border-b-0">
       <button type="button" aria-expanded={open} onClick={() => setOpen(!open)} className={`${ACTIVITY_COLS} w-full items-start px-3 py-2 text-left transition-colors hover:bg-sunken`}>
@@ -149,6 +161,7 @@ export function ActivityEntry({ a, open: initial = false }: { a: Entry; open?: b
       {open && (
         <dl className="grid gap-x-4 gap-y-2 border-t border-line bg-sunken px-3 py-2.5 pl-10 text-xs @xl:grid-cols-[10rem_minmax(0,1fr)]">
           <dt className="text-muted">what</dt><dd>{KIND_LABEL[a.kind] ?? a.kind}{a.projectKey ? ` · ${a.projectKey}` : ''}</dd>
+          {a.detailsOmitted && !full && <><dt className="text-muted">details</dt><dd className="text-muted">{failed ? `could not load them: ${failed}` : 'loading…'}</dd></>}
           {details.map(([k, v]) => (
             <div key={k} className="contents"><dt className="text-muted">{k}</dt><dd className="min-w-0"><Value v={v} /></dd></div>
           ))}

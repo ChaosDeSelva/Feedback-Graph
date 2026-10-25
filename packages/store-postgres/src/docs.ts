@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { docIdOf, redactDeep, redactSecrets, relevanceOf, scanRetryAt, SCAN_UNAVAILABLE_WAIT_MS } from '@fb/core';
-import type { DocHit, DocInput, DocSummary, DocsStore, DocToRead, EmbeddedFact, TaskImage, UpsertDocOpts } from '@fb/core';
+import type { DocHit, DocInput, DocLink, DocSummary, DocsStore, DocToRead, EmbeddedFact, TaskImage, UpsertDocOpts } from '@fb/core';
 import type pg from 'pg';
 import { iso, toVector, tx, type Db } from './db.ts';
 import { runSearch, searchDocsQuery } from './vector.ts';
@@ -21,12 +21,12 @@ export class PgDocsStore implements DocsStore {
     await tx(this.db, async (c) => {
       await c.query('INSERT INTO projects (key) VALUES ($1) ON CONFLICT DO NOTHING', [doc.projectKey]);
       await c.query(
-        `INSERT INTO docs (id, project_key, source, ref, title, url, added_at, kind, media_type, read_status, read_attempts, read_error, read_retry_at, read_at, added_by)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 0, NULL, NULL, NULL, $11)
+        `INSERT INTO docs (id, project_key, source, ref, title, url, added_at, kind, media_type, read_status, read_attempts, read_error, read_retry_at, read_at, added_by, tickets)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 0, NULL, NULL, NULL, $11, $12)
          ON CONFLICT (id) DO UPDATE SET project_key = EXCLUDED.project_key, source = EXCLUDED.source, ref = EXCLUDED.ref,
-           title = EXCLUDED.title, url = EXCLUDED.url, added_at = EXCLUDED.added_at, added_by = EXCLUDED.added_by, kind = EXCLUDED.kind, media_type = EXCLUDED.media_type,
+           title = EXCLUDED.title, url = EXCLUDED.url, added_at = EXCLUDED.added_at, added_by = EXCLUDED.added_by, kind = EXCLUDED.kind, media_type = EXCLUDED.media_type, tickets = EXCLUDED.tickets,
            read_status = EXCLUDED.read_status, read_attempts = 0, read_error = NULL, read_retry_at = NULL, read_at = NULL`,
-        [id, doc.projectKey, doc.source, doc.ref, doc.title, doc.url ?? null, new Date(), o.image ? 'image' : 'text', o.image?.mediaType ?? null, o.read ? 'pending' : null, o.addedBy ?? null],
+        [id, doc.projectKey, doc.source, doc.ref, doc.title, doc.url ?? null, new Date(), o.image ? 'image' : 'text', o.image?.mediaType ?? null, o.read ? 'pending' : null, o.addedBy ?? null, o.tickets ?? []],
       );
       // A new version of the document: what was read from the old one goes.
       await c.query('DELETE FROM facts WHERE doc_id = $1', [id]);
@@ -164,6 +164,20 @@ export class PgDocsStore implements DocsStore {
     // Chunks go with their doc (ON DELETE CASCADE).
     const { rowCount } = await this.db.pool.query('DELETE FROM docs WHERE id = $1', [id]);
     return (rowCount ?? 0) > 0;
+  }
+
+  async linkedDocs(q: { projectKey: string; docIds: string[] }): Promise<DocLink[]> {
+    if (!q.docIds.length) return [];
+    const { rows } = await this.db.pool.query(
+      `SELECT d.id AS doc_id, o.id, o.source, o.ref, o.title, o.url
+       FROM docs d JOIN docs o ON o.project_key = d.project_key
+        AND ((o.source = 'linear' AND o.ref = ANY(SELECT 'linear:' || t FROM unnest(d.tickets) AS t))
+          OR (d.source = 'linear' AND d.ref LIKE 'linear:%' AND substr(d.ref, 8) = ANY(o.tickets)))
+       WHERE d.project_key = $1 AND d.id = ANY($2::text[])
+       ORDER BY d.id, o.title, o.id`,
+      [q.projectKey, q.docIds],
+    );
+    return rows.map((r) => ({ docId: r.doc_id, linked: { docId: r.id, source: r.source, ref: r.ref, title: r.title, url: r.url ?? null } }));
   }
 
   async searchDocs(q: { embedding: number[]; projectKey: string; k: number }): Promise<DocHit[]> {

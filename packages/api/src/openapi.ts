@@ -10,9 +10,10 @@ import { settingsSchemas } from './settings.ts';
 
 /**
  * GET /api/openapi.json: the local REST API as an OpenAPI 3.1 document. Request bodies and query strings come from the
- * zod schemas the routes validate with; the route table below adds what zod cannot say (summary, response). Owner-only
- * routes (OWNER_ROUTES) carry `x-owner-only: true` and `x-operator-verb`, the OPERATOR_ALLOW verb that lets the operator
- * token make that decision. openapi.test.ts fails when a registered route is missing here.
+ * zod schemas the routes validate with; the route table below adds what zod cannot say (summary, response), and every
+ * 2xx body has a schema (components.schemas, SCHEMA_OF). Owner-only routes (OWNER_ROUTES) carry `x-owner-only: true` and
+ * `x-operator-verb`, the OPERATOR_ALLOW verb that lets the operator token make that decision. openapi.test.ts fails when
+ * a registered route is missing here or an operation has no response schema.
  */
 
 type JsonSchema = Record<string, unknown>;
@@ -67,7 +68,114 @@ export function jsonSchema(s: ZodTypeAny): JsonSchema {
 }
 
 type Method = 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE';
-type Route = { summary: string; tag: string; body?: ZodTypeAny; query?: z.AnyZodObject; response: string; status?: number; type?: string };
+/**
+ * schema: the 2xx body's JSON Schema. Unset: read from `response` when it starts with a type named in SCHEMAS
+ * (`Lesson`, `Candidate[]`).
+ */
+type Route = { summary: string; tag: string; body?: ZodTypeAny; query?: z.AnyZodObject; response: string; status?: number; type?: string; schema?: JsonSchema; description?: string };
+
+// ── Response shapes (components.schemas) ───────────────────────────────
+// The main objects spelled out from the core types (types.ts, graph/*.ts); the bigger composites are objects with a
+// description. A property marked nullable may be null; one not in `required` may be missing (older records).
+
+const ref = (name: string): JsonSchema => ({ $ref: `#/components/schemas/${name}` });
+const arrayOf = (s: JsonSchema): JsonSchema => ({ type: 'array', items: s });
+const str: JsonSchema = { type: 'string' };
+const num: JsonSchema = { type: 'number' };
+const int: JsonSchema = { type: 'integer' };
+const bool: JsonSchema = { type: 'boolean' };
+const nullable = (s: JsonSchema): JsonSchema => ({ anyOf: [s, { type: 'null' }] });
+const time: JsonSchema = { type: 'string', format: 'date-time' };
+const obj = (properties: Record<string, JsonSchema>, required: string[] = Object.keys(properties), description?: string): JsonSchema =>
+  ({ type: 'object', ...(description && { description }), properties, required });
+/** An object this document does not spell out field by field. */
+const loose = (description: string): JsonSchema => ({ type: 'object', description, additionalProperties: true });
+
+const SCHEMAS: Record<string, JsonSchema> = {
+  Error: obj({ error: { anyOf: [str, { type: 'object', description: 'zod flatten(): formErrors and fieldErrors' }] } }, ['error'], 'Every refusal: 4xx or 5xx'),
+  Classification: obj({ label: str, confidence: num, summary: str, signals: arrayOf(str) }),
+  Candidate: obj({
+    id: str, turnUuid: str, sessionId: str, projectKey: str, source: { type: 'string', enum: ['claude', 'codex', 'github', 'linear'] },
+    external: nullable(loose('The GitHub or Linear comment: author, url, thread, title, path, line, diffHunk, description (the PR or ticket text), ticket, authorKind')),
+    classification: ref('Classification'), status: { type: 'string', enum: ['pending', 'confirmed', 'rejected'] },
+    createdAt: time, decidedAt: nullable(time), note: nullable(str), decidedBy: nullable(str),
+    origins: arrayOf({ type: 'string', enum: ['detector', 'agent'] }), agentReport: nullable(loose('What the agent reported through report_feedback')),
+  }, ['id', 'turnUuid', 'sessionId', 'projectKey', 'source', 'classification', 'status', 'createdAt', 'decidedAt', 'note']),
+  CandidateDetail: obj({ candidate: ref('Candidate'), turn: loose('The flagged turn (text, role, ts)'), before: arrayOf(loose('A turn')), after: arrayOf(loose('A turn')), commits: arrayOf(loose('A commit')), postmortem: nullable(loose('Post-mortem progress')) }, ['candidate', 'turn']),
+  ProjectStats: obj({ projectKey: str, week: str, humanTurns: int, pushback: int }),
+  LessonCheck: obj({ name: str, why: str }),
+  Lesson: obj({
+    id: str, projectKey: nullable(str), origin: nullable(str), title: str, rule: str, appliesWhen: str,
+    scope: { type: 'string', enum: ['task', 'project', 'global'] }, paths: arrayOf(str),
+    status: { type: 'string', enum: ['proposed', 'approved', 'rejected', 'superseded'] }, source: { type: 'string', enum: ['postmortem', 'memory', 'manual'] },
+    cause: nullable(str), missId: nullable(str), createdAt: time, decidedAt: nullable(time), decidedBy: nullable(str),
+    checks: nullable(arrayOf(ref('LessonCheck'))), decisionNote: nullable(str),
+  }, ['id', 'projectKey', 'title', 'rule', 'appliesWhen', 'scope', 'paths', 'status', 'source', 'cause', 'missId', 'createdAt', 'decidedAt']),
+  LessonDetail: obj({ lesson: ref('Lesson'), miss: nullable(loose('The miss it was learned from')), feedback: nullable(loose('The feedback behind it')), contextItems: arrayOf(loose('What the agent had')), fixCommits: arrayOf(loose('A commit')), supersedes: arrayOf(ref('Lesson')) }, ['lesson']),
+  ScanShards: obj({ total: int, rescanned: int, failed: int, done: { type: 'integer', description: 'While it runs: shards got through so far' } }, ['total', 'rescanned', 'failed']),
+  ScanJob: obj({
+    id: str, projectKey: str, repoPath: str, provider: nullable(str), status: { type: 'string', enum: ['queued', 'running', 'done', 'failed'] },
+    requestedAt: time, startedAt: nullable(time), finishedAt: nullable(time), filesScanned: int, factsAdded: int, error: nullable(str),
+    attempts: int, retryAt: nullable(time), shards: nullable(ref('ScanShards')),
+  }, ['id', 'projectKey', 'status', 'requestedAt', 'filesScanned', 'factsAdded', 'error']),
+  ProjectSummary: obj({
+    key: str, repoPath: str, remote: nullable(str), aliases: arrayOf(str), sessions: int, feedback: int, lessons: int, facts: int,
+    factsByOrigin: { type: 'object', additionalProperties: int }, lastScan: nullable(ref('ScanJob')), pinned: bool, links: int,
+  }, ['key', 'repoPath', 'remote', 'sessions', 'feedback', 'lessons', 'facts', 'lastScan', 'pinned']),
+  StoredFact: obj({
+    id: str, kind: str, statement: str, path: str, lines: nullable(str), why: str, confidence: num, relevance: nullable(num), relevanceBy: nullable(str),
+    origin: { type: 'string', enum: ['model', 'manifest', 'document', 'you'] }, evidence: nullable({ type: 'string', enum: ['line', 'file', 'none'] }),
+    source: str, createdAt: time, scanJobId: nullable(str), fileHash: nullable(str), fileSummary: nullable(str), docId: nullable(str),
+  }, ['id', 'kind', 'statement', 'path', 'relevance', 'source', 'createdAt']),
+  FactHit: obj({ fact: ref('StoredFact'), score: num }, ['fact', 'score'], 'A search hit (?q=): the fact and how close it is'),
+  Doc: obj({
+    id: str, projectKey: str, source: str, ref: str, title: str, url: nullable(str), addedAt: time, addedBy: nullable(str), chunks: int,
+    kind: { type: 'string', enum: ['text', 'image'] }, mediaType: nullable(str), read: nullable(loose('How the worker read it: status, facts, error')),
+  }, ['id', 'projectKey', 'source', 'ref', 'title', 'addedAt', 'chunks']),
+  ProjectLink: obj({
+    id: str, a: str, b: str, relation: { type: 'string', enum: ['depends_on', 'same_product', 'shares_code', 'related'] }, note: str,
+    status: { type: 'string', enum: ['suggested', 'confirmed', 'dismissed'] }, source: { type: 'string', enum: ['detected', 'you'] }, score: num,
+    evidence: arrayOf(obj({ signal: str, detail: str, path: nullable(str), from: str })), createdAt: time, updatedAt: time, decidedBy: nullable(str),
+  }, ['id', 'a', 'b', 'relation', 'note', 'status', 'source', 'score', 'evidence', 'createdAt', 'updatedAt']),
+  Activity: obj({
+    id: str, ts: time, kind: str, actor: { type: 'string', description: "'you', 'operator:<name>', a model id or an MCP client" }, projectKey: nullable(str),
+    subject: str, why: str, details: { type: 'object', description: 'Per kind; details.via says how a write arrived: operator, browser or api', additionalProperties: true }, targets: arrayOf(str),
+  }),
+  SystemStatus: obj({
+    version: str, store: nullable({ type: 'string', enum: ['neo4j', 'postgres'] }), graph: bool, worker: nullable(loose('The worker heartbeat')), workerHealthy: bool,
+    authRequired: bool, selection: nullable(obj({ initialized: bool, tracked: int, roots: int, note: nullable(str) }, ['initialized', 'tracked', 'note'])),
+    cloud: nullable(loose('Cloud sync: host, interval, last Sync now, progress (token always [REDACTED])')), models: nullable(loose('Each job\'s model and whether it answers')),
+    givenUpTurns: nullable(int), ollama: nullable(loose('Whether Ollama answers')), connections: nullable(loose('GitHub, Linear, Claude, Codex, Ollama and cloud')),
+    stage: nullable(obj({ name: str, startedAt: time, current: nullable(str) })), progress: nullable(obj({ done: int, total: nullable(int) })),
+  }, ['version', 'store', 'graph', 'worker', 'workerHealthy', 'authRequired', 'selection']),
+  PipelineStatus: obj({
+    stage: nullable(obj({ name: str, startedAt: time, current: nullable(str) })), progress: nullable(obj({ done: int, total: nullable(int) })), sessions: nullable(int),
+    classify: nullable(obj({ backlog: int, capped: bool })), inbox: nullable(obj({ pending: int, confirmed: int })), postmortems: nullable(obj({ queued: int })),
+    lessons: nullable(obj({ proposed: int, approved: int })), scans: nullable(obj({ done: int, queued: int, running: int, failed: int, never: int })),
+  }),
+  SessionSummary: loose('A session summary: id, projectKey, source, state, turnCount, lastActivityAt, snippet'),
+  SessionDetail: loose('One session: its summary and history'),
+  SettingsBody: obj({ tracked: arrayOf(str), candidates: arrayOf(loose('A project folder: key, path, exists, tracked, excluded, aliasOf, sessions')) }, ['tracked', 'candidates']),
+  IntegrationsView: loose('GitHub and Linear: connection state, where the token comes from, per-project links, skip rules'),
+  CloudInfo: loose('Cloud sync: enabled, host, schedule, projects, preview counts, last result'),
+  CloudSyncResult: loose('One sync: ok, error, per-project status, what was sent'),
+  ExportBundle: loose('An export bundle: format, schemaVersion, lessons, facts, misses, docs, codeFiles'),
+  ImportResult: loose('What an import added and skipped'),
+  ChatConversation: loose('An Ask conversation: id, projectKey, title, provider, timestamps'),
+  ChatThread: loose('An Ask conversation with its turns'),
+  ModuleContext: loose('A file in the code map: its module, imports, importers, symbols, lessons and misses'),
+  Impact: loose('What changing the files touches: dependents by depth'),
+  MapGraph: loose('The Graph page\'s code mode: nodes, edges, lessons'),
+  Hotspot: loose('A file ranked by how much it is touched'),
+  ProjectGraph: loose('A project\'s knowledge graph: nodes and edges'),
+  Patterns: loose('Recurring patterns'),
+  LinearTeam: obj({ id: str, key: str, name: str }),
+  JsonRpc: obj({ jsonrpc: { const: '2.0' }, id: { anyOf: [str, int, { type: 'null' }] }, method: str, params: { type: 'object', additionalProperties: true } }, ['jsonrpc', 'method'], 'A JSON-RPC 2.0 message (MCP Streamable HTTP)'),
+  JsonRpcResult: loose('A JSON-RPC 2.0 answer: result, or error { code, message }'),
+};
+
+const QUEUED = obj({ queued: { const: true } });
+const RESULTS = (item: JsonSchema) => obj({ results: arrayOf(item) });
 
 /** DELETE /api/projects/:key checks this by hand: the project's name, typed again. */
 const ConfirmKey = z.object({ confirm: z.string().describe('the project key, typed again') });
@@ -77,7 +185,7 @@ const CwdQuery = z.object({ cwd: z.string().optional() });
 const KeepApproved = z.object({ keepApproved: z.enum(['1', 'true']).optional() });
 
 /**
- * Every route of createApp but the UI's files and /mcp (the MCP endpoint, described by its own protocol). A function:
+ * Every REST route of createApp (the MCP endpoints are mcpPath below; the UI's files are not described). A function:
  * app.ts imports this module, so its schemas are read only once both are loaded.
  */
 const routes = (a = appSchemas): Record<string, Partial<Record<Method, Route>>> => ({
@@ -107,6 +215,8 @@ const routes = (a = appSchemas): Record<string, Partial<Record<Method, Route>>> 
     GET: { tag: 'lessons', summary: 'One lesson with its evidence', response: 'LessonDetail' },
     PATCH: { tag: 'lessons', summary: 'Approve, reject or edit a lesson', body: a.LessonPatch, response: 'no content; 409 when a lesson with no project is narrowed', status: 204 },
   },
+  '/api/lessons/decisions': { POST: { tag: 'lessons', summary: 'Approve or reject many lessons in one call, each recorded on its own (decidedBy, Activity); one not found does not stop the rest', body: a.LessonDecisions, response: '{ results: [{ id, ok, status? | error? }] }' } },
+  '/api/lessons/recheck': { POST: { tag: 'lessons', summary: 'Re-run the lesson checks on every proposed and approved lesson at the worker\'s next round (flags only)', response: '{ queued: number }', status: 202 } },
   '/api/lessons/{id}/to-fact': {
     POST: { tag: 'lessons', summary: 'Turn a lesson that states how the code is into a project fact you wrote; the lesson is rejected with the note "converted to a fact"', body: a.LessonToFact, response: 'StoredFact; 409 when the lesson is already rejected or superseded, or has no project', status: 201 },
   },
@@ -116,7 +226,7 @@ const routes = (a = appSchemas): Record<string, Partial<Record<Method, Route>>> 
   '/api/projects/{key}': { DELETE: { tag: 'projects', summary: 'Delete everything learned from a project', body: ConfirmKey, response: '{ removed, note }' } },
   '/api/projects/{key}/scan': { POST: { tag: 'projects', summary: 'Queue a scan of one folder', body: a.ScanRequest, response: 'ScanJob', status: 202 } },
   '/api/scans/{id}': { GET: { tag: 'projects', summary: 'One scan job, with its place in the queue while queued', response: 'ScanJob & { queuePosition }' } },
-  '/api/projects/{key}/facts': { GET: { tag: 'projects', summary: 'A project\'s facts (q: semantic search)', query: a.FactsQuery, response: 'Fact[]' } },
+  '/api/projects/{key}/facts': { GET: { tag: 'projects', summary: 'A project\'s facts (q: semantic search; else paged by limit and offset, X-Next-Offset names the next page; origin: model, manifest, document or you)', query: a.FactsQuery, response: 'Fact[]' } },
   '/api/projects/{key}/facts/{id}/relevance': { PATCH: { tag: 'projects', summary: 'Set how often everyday coding needs a fact', body: a.RelevanceRequest, response: 'no content', status: 204 } },
   '/api/projects/{key}/pin': { PUT: { tag: 'projects', summary: 'Pin or unpin a project', body: a.PinRequest, response: 'no content', status: 204 } },
   '/api/projects/{key}/docs': {
@@ -139,7 +249,8 @@ const routes = (a = appSchemas): Record<string, Partial<Record<Method, Route>>> 
 
   '/api/graph': { GET: { tag: 'insights', summary: 'A project\'s knowledge graph', query: a.ProjectParam, response: 'ProjectGraph' } },
   '/api/patterns': { GET: { tag: 'insights', summary: 'Recurring patterns', query: ProjectQuery, response: 'Patterns' } },
-  '/api/activity': { GET: { tag: 'activity', summary: 'The activity log of the shown projects, newest first', query: a.ActivityQuery, response: 'Activity[]' } },
+  '/api/activity': { GET: { tag: 'activity', summary: 'The activity log of the shown projects, newest first; details over 1 KB are left out (detailsOmitted) unless details=1', query: a.ActivityQuery, response: 'Activity[]' } },
+  '/api/activity/{id}': { GET: { tag: 'activity', summary: 'One activity entry with all its details', response: 'Activity' } },
 
   '/api/export': { GET: { tag: 'portability', summary: 'An export bundle (attachment)', query: a.ExportQuery, response: 'ExportBundle' } },
   '/api/import': { POST: { tag: 'portability', summary: 'Import an export bundle; its lessons arrive proposed unless keepApproved', query: KeepApproved, body: importSchemas.Bundle, response: 'ImportResult' } },
@@ -180,6 +291,42 @@ const routes = (a = appSchemas): Record<string, Partial<Record<Method, Route>>> 
   '/api/chats/{id}/turns/{turnId}/retry': { POST: { tag: 'ask', summary: 'Retry a failed answer', response: 'ChatThread', status: 202 } },
 });
 
+/** The 2xx bodies `response` describes in words, as JSON Schema (by "METHOD path"). */
+const SCHEMA_OF: Record<string, JsonSchema> = {
+  'GET /api/health': obj({ ok: { const: true } }),
+  'GET /api/ready': obj({ ok: bool, store: { type: 'string', enum: ['neo4j', 'postgres'] } }, ['ok']),
+  'GET /api/events': { type: 'string', description: 'text/event-stream: events stage, pipeline, scan, chat, activity; data is JSON' },
+  'GET /api/openapi.json': { type: 'object', description: 'An OpenAPI 3.1 document', additionalProperties: true },
+  'GET /api/session': obj({ authRequired: bool, authenticated: bool }),
+  'GET /api/agent/project': loose('The selected project the folder belongs to, or why it is not one'),
+  'POST /api/lessons/decisions': RESULTS(obj({ id: str, ok: bool, status: str, error: str }, ['id', 'ok'])),
+  'POST /api/lessons/recheck': obj({ queued: int }),
+  'POST /api/candidates/decisions': RESULTS(obj({ id: str, ok: bool, status: str, error: str }, ['id', 'ok'])),
+  'POST /api/feedback/{id}/retry': QUEUED,
+  'POST /api/turns/requeue': obj({ requeued: int }),
+  'POST /api/projects/scan': RESULTS(obj({ key: str, queued: bool, job: ref('ScanJob'), error: str }, ['key', 'queued'])),
+  'DELETE /api/projects/{key}': obj({ removed: loose('What was deleted, by kind'), note: str }),
+  'GET /api/scans/{id}': { allOf: [ref('ScanJob'), obj({ queuePosition: nullable(int) })] },
+  'GET /api/projects/{key}/facts': { anyOf: [arrayOf(ref('StoredFact')), arrayOf(ref('FactHit'))], description: 'StoredFact[]; with ?q= the search hits, best first' },
+  'POST /api/projects/{key}/docs': obj({ id: str, chunks: int }),
+  'GET /api/docs/{id}/image': { type: 'string', format: 'binary' },
+  'GET /api/projects/{key}/codemap/hotspots': obj({ meta: nullable(loose('The map: files, symbols, imports, built at')), capped: bool, hotspots: arrayOf(ref('Hotspot')) }),
+  'POST /api/projects/{key}/codemap/rebuild': QUEUED,
+  'POST /api/settings/cleanup': obj({ removed: arrayOf(str), nodesRemoved: int }),
+  'GET /api/cloud/progress': obj({ running: nullable(obj({ done: int, total: int, current: nullable(str) })), lastManual: nullable(loose('The last Sync now')) }),
+  'GET /api/sessions': obj({ sessions: arrayOf(ref('SessionSummary')), next: nullable(str) }),
+  'POST /api/sessions/{id}/resummarize': QUEUED,
+};
+
+/** The 2xx body's schema: the route's own, else the type `response` starts with (`Lesson`, `Candidate[]`). */
+function responseSchema(method: Method, path: string, r: Route): JsonSchema | undefined {
+  const own = r.schema ?? SCHEMA_OF[`${method} ${path}`];
+  if (own) return own;
+  const m = /^(\w+)(\[\])?/.exec(r.response);
+  if (!m || !SCHEMAS[m[1]]) return undefined;
+  return m[2] ? arrayOf(ref(m[1])) : ref(m[1]);
+}
+
 const verbs = new Map(OWNER_ROUTES.map(([m, p, verb]) => [`${m} ${p.replace(/:(\w+)/g, '{$1}')}`, verb]));
 
 function operation(method: Method, path: string, r: Route) {
@@ -189,14 +336,17 @@ function operation(method: Method, path: string, r: Route) {
   const query = Object.entries(shape).map(([name, s]) => ({ name, in: 'query', required: !s.isOptional(), schema: jsonSchema(s) }));
   const status = String(r.status ?? 200);
   const noContent = r.status === 204;
+  const schema = noContent ? undefined : responseSchema(method, path, r);
+  if (!noContent && !schema) throw new Error(`openapi: no response schema for ${method} ${path} (${r.response})`);
   return {
     summary: r.summary,
     tags: [r.tag],
+    ...(r.description && { description: r.description }),
     ...(params.length || query.length ? { parameters: [...params, ...query] } : {}),
     ...(r.body ? { requestBody: { required: true, content: { 'application/json': { schema: jsonSchema(r.body) } } } } : {}),
     responses: {
-      [status]: { description: r.response, ...(noContent ? {} : { content: { [r.type ?? 'application/json']: {} } }) },
-      default: { description: 'an error: { error: string | zod flatten() }' },
+      [status]: { description: r.response, ...(noContent ? {} : { content: { [r.type ?? 'application/json']: { schema } } }) },
+      default: { description: 'an error: { error: string | zod flatten() }', content: { 'application/json': { schema: ref('Error') } } },
     },
     'x-owner-only': verb !== undefined,
     ...(verb && {
@@ -206,23 +356,52 @@ function operation(method: Method, path: string, r: Route) {
   };
 }
 
+/** /mcp and /mcp/admin: MCP over Streamable HTTP, stateless (each POST answered on its own, as JSON). */
+function mcpPath(admin: boolean) {
+  const rpc = { 'application/json': { schema: ref('JsonRpc') } };
+  return {
+    post: {
+      summary: admin
+        ? 'The admin MCP endpoint: the owner decisions OPERATOR_ALLOW names, as tools (inbox_list, inbox_decide, lessons_list, scan_projects, ...)'
+        : 'The MCP endpoint agents use: task context, search, check_before_done, report_feedback (read and report only)',
+      tags: ['mcp'],
+      description: admin
+        ? 'Only while FG_OPERATOR_TOKEN is set, and only with it as the Bearer (404 without a bearer, 401 with another). Tools carry annotations (readOnlyHint on the reads); list tools are paged (20 rows, a note with the next offset).'
+        : 'With API_TOKEN set it needs the token like every route. The tools never change an owner decision.',
+      requestBody: { required: true, content: rpc },
+      responses: {
+        200: { description: 'The JSON-RPC answer', content: { 'application/json': { schema: ref('JsonRpcResult') } } },
+        413: { description: 'The body is over 1 MB: a JSON-RPC error', content: { 'application/json': { schema: ref('JsonRpcResult') } } },
+        default: { description: 'an error: { error }', content: { 'application/json': { schema: ref('Error') } } },
+      },
+      'x-owner-only': false,
+    },
+    get: { summary: 'No server-sent stream: always 405', tags: ['mcp'], responses: { 405: { description: 'Method not allowed (Allow: POST, DELETE)' } }, 'x-owner-only': false },
+    delete: { summary: 'End the MCP session (nothing is kept, so this only answers)', tags: ['mcp'], responses: { 204: { description: 'no content' } }, 'x-owner-only': false },
+  };
+}
+
 let cached: { version: string; doc: object } | null = null;
 
 export function openApiDocument(version: string): object {
   if (cached?.version === version) return cached.doc;
-  const paths = Object.fromEntries(Object.entries(routes()).map(([p, ops]) => [
-    p,
-    Object.fromEntries(Object.entries(ops).map(([m, r]) => [m.toLowerCase(), operation(m as Method, p, r!)])),
-  ]));
+  const paths = {
+    ...Object.fromEntries(Object.entries(routes()).map(([p, ops]) => [
+      p,
+      Object.fromEntries(Object.entries(ops).map(([m, r]) => [m.toLowerCase(), operation(m as Method, p, r!)])),
+    ])),
+    '/mcp': mcpPath(false),
+    '/mcp/admin': mcpPath(true),
+  };
   const doc = {
     openapi: '3.1.0',
     info: {
       title: 'Feedback Graph local API',
       version,
-      description: 'The REST API the UI and the fg CLI use. With API_TOKEN set every route but /api/health, /api/ready and /api/session needs it (Bearer, or the UI session cookie). Writes need Content-Type: application/json.',
+      description: 'The REST API the UI and the fg CLI use. With API_TOKEN set every route but /api/health, /api/ready and /api/session needs it (Bearer, or the UI session cookie). A bearer that matches neither API_TOKEN nor FG_OPERATOR_TOKEN is refused (401) on every route. Writes need Content-Type: application/json; a body is at most 1 MB (16 MB for a document upload, 256 MB for an import). An unknown /api path is a JSON 404.',
     },
     servers: [{ url: '/' }],
-    components: { securitySchemes: { bearer: { type: 'http', scheme: 'bearer' } } },
+    components: { securitySchemes: { bearer: { type: 'http', scheme: 'bearer' } }, schemas: SCHEMAS },
     security: [{ bearer: [] }, {}],
     paths,
   };

@@ -117,7 +117,7 @@ test('PUT saves the selection, logs who changed what and why, and returns the ne
   expect(body.tracked).toEqual(['brand-new', 'demo-shop', 'gone']);
   expect(log).toEqual([expect.objectContaining({
     kind: 'projects_selected', actor: 'you', projectKey: null,
-    details: { added: ['brand-new', 'gone'], removed: [], tracked: ['brand-new', 'demo-shop', 'gone'] },
+    details: { added: ['brand-new', 'gone'], removed: [], tracked: ['brand-new', 'demo-shop', 'gone'], via: 'browser' },
   })]);
   expect(log[0].why).toMatch(/next cycle/);
 });
@@ -183,7 +183,7 @@ test('cleanup removes the data of every project that is not selected, and only t
   expect(res.status).toBe(200);
   expect(await res.json()).toEqual({ removed: ['client', 'old-one'], nodesRemoved: 20 });
   expect(deleted).toEqual(['client', 'old-one']);
-  expect(log).toEqual([expect.objectContaining({ kind: 'projects_cleaned', actor: 'you', projectKey: null, details: { projects: ['client', 'old-one'], nodesRemoved: 20 } })]);
+  expect(log).toEqual([expect.objectContaining({ kind: 'projects_cleaned', actor: 'you', projectKey: null, details: { projects: ['client', 'old-one'], nodesRemoved: 20, via: 'browser' } })]);
 });
 
 test('cleanup keeps data filed under a clone of a selected project, and deletes a clone of an unselected one', async () => {
@@ -264,7 +264,7 @@ test('PUT /api/settings/roots saves the roots for setup.sh to mount, and logs it
   expect(body.pendingRoots).toEqual(['/Users/me/Vibe', '/Users/me/work', '/Users/me/games']);
   expect(log).toEqual([expect.objectContaining({
     kind: 'roots_saved', actor: 'you', projectKey: null,
-    details: { roots: ['/Users/me/Vibe', '/Users/me/work', '/Users/me/games'], added: ['/Users/me/work', '/Users/me/games'], removed: [] },
+    details: { roots: ['/Users/me/Vibe', '/Users/me/work', '/Users/me/games'], added: ['/Users/me/work', '/Users/me/games'], removed: [], via: 'browser' },
   })]);
   expect(log[0].why).toContain('./scripts/setup.sh');
 });

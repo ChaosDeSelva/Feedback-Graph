@@ -1,6 +1,6 @@
 import type { ActivityInput, PrContext } from '@fb/core';
 import { expect, test } from 'vitest';
-import { reposInScope, syncGithub, type GithubSyncDeps } from './githubSync.ts';
+import { reposInScope, syncGithub, ticketsCursor, type GithubSyncDeps } from './githubSync.ts';
 
 const pr = (n: number, body = 'adds orders'): PrContext => ({
   repo: 'acme/shop', number: n, title: `PR ${n}`, url: `https://github.com/acme/shop/pull/${n}`, author: 'dev', state: 'merged',
@@ -47,6 +47,7 @@ test('stores each PR as a doc with redacted, embedded chunks and advances the cu
 test('uses the stored cursor as since, and skips projects synced recently', async () => {
   const s = setup();
   await s.deps.docs.setCursor('github:shop', '2026-10-22T11:00:00Z');
+  await s.deps.docs.setCursor(ticketsCursor('shop'), '2026-10-22T11:00:00Z');
   expect(await syncGithub({ ...s.deps, minIntervalMs: 2 * 3600_000 })).toEqual({ prs: 0 });
   expect(s.sinces).toEqual([]);
   expect(await syncGithub({ ...s.deps, minIntervalMs: 0 })).toEqual({ prs: 2 });
@@ -67,4 +68,28 @@ test('a failing repo is logged and does not stop the others', async () => {
 test('only repos of selected projects are synced', () => {
   const repos = new Map([['demo', 'me/demo'], ['client', 'me/client'], ['demo-2', 'me/demo']]);
   expect([...reposInScope(repos, (k) => k !== 'client')]).toEqual([['demo', 'me/demo'], ['demo-2', 'me/demo']]);
+});
+
+test('a PR names the Linear tickets in its title, body and branch, so it links to them', async () => {
+  const opts: unknown[] = [];
+  const s = setup({
+    fetchPrs: async () => [{ ...pr(1, 'Fixes ENG-12.'), title: 'Keep cents (ENG-12)', headBranch: 'jo/eng-45-totals' }, pr(2, 'no ticket here')],
+  });
+  s.deps.docs = { ...s.deps.docs, upsertDoc: async (_doc, _chunks, o) => { opts.push(o); return 'x'; } };
+  await syncGithub(s.deps);
+  expect(opts).toEqual([{ tickets: ['ENG-12', 'ENG-45'] }, { tickets: [] }]);
+});
+
+test('PRs synced before tickets were read are read again once, for the last 14 days, so they link too', async () => {
+  const s = setup();
+  await s.deps.docs.setCursor('github:shop', '2026-10-22T11:00:00Z');
+  await syncGithub({ ...s.deps, minIntervalMs: 0 });
+  expect(s.sinces).toEqual(['2026-10-08T12:00:00.000Z']);
+  expect(s.cursors.get(ticketsCursor('shop'))).toBe('2026-10-22T12:00:00Z');
+  await syncGithub({ ...s.deps, minIntervalMs: 0 });
+  expect(s.sinces[1]).toBe('2026-10-22T12:00:00Z');
+  // A first sync reads them with tickets already: no second pass.
+  const fresh = setup();
+  await syncGithub(fresh.deps);
+  expect(fresh.cursors.get(ticketsCursor('shop'))).toBe('2026-10-22T12:00:00Z');
 });

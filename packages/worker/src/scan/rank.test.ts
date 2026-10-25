@@ -51,3 +51,10 @@ test('mapCap: a set SCAN_MAX_FILES wins; unset, 40% of the candidates between 40
   expect(mapCap(null, 2_000)).toBe(800);
   expect(mapCap(null, 10_290)).toBe(4000);
 });
+
+test('a weight (importers and churn) orders files within a tier before the path does; tiers and tests stay where they were', () => {
+  const weight = (p: string) => ({ 'src/zz/logging.ts': 8, 'src/b.ts': 2 })[p] ?? 0;
+  expect(rankCodePaths(['src/a.ts', 'src/b.ts', 'src/zz/logging.ts', 'src/zz/logging.test.ts', 'README.md', 'package.json'], { weight })).toEqual([
+    'package.json', 'src/zz/logging.ts', 'src/zz/logging.test.ts', 'src/b.ts', 'src/a.ts', 'README.md',
+  ]);
+});

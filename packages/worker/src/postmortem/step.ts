@@ -1,8 +1,10 @@
 import { modelTimeoutReason, providerUnavailableReason, redactSecrets, type ActivityStore, type KnowledgeStore, type PostMortem, type PostMortemInput } from '@fb/core';
 import type { PostMortemTrace } from './postmortem.ts';
+import { duplicateFlag } from './recheck.ts';
 
 export type PostmortemStepDeps = {
-  k: Pick<KnowledgeStore, 'feedbackNeedingPostmortem' | 'savePostmortem' | 'recordPostmortemFailure'>;
+  k: Pick<KnowledgeStore, 'feedbackNeedingPostmortem' | 'savePostmortem' | 'recordPostmortemFailure'> &
+    Partial<Pick<KnowledgeStore, 'similarLessons' | 'setLessonChecks'>>;
   postmortem(input: PostMortemInput): Promise<PostMortem & { trace?: PostMortemTrace }>;
   embed(texts: string[]): Promise<number[][]>;
   batch: number;
@@ -17,6 +19,11 @@ export function embedTexts(pm: PostMortem): { miss: string; lesson: string } {
     miss: `${pm.missed}\n${pm.causeExplanation}`,
     lesson: `${pm.lesson.title}\n${pm.lesson.rule}\nApplies when: ${pm.lesson.appliesWhen}`,
   };
+}
+
+async function duplicateOfSaved(deps: PostmortemStepDeps, id: string) {
+  if (!deps.k.similarLessons || !deps.k.setLessonChecks) return null;
+  return duplicateFlag({ id, status: 'proposed', createdAt: new Date().toISOString() }, await deps.k.similarLessons(id, 5));
 }
 
 /**
@@ -34,6 +41,13 @@ export async function runPostmortems(deps: PostmortemStepDeps): Promise<{ done: 
       const [miss, lesson] = await deps.embed([t.miss, t.lesson]);
       await deps.k.savePostmortem(input.feedbackId, pm, { miss, lesson });
       done++;
+      // Only a saved lesson has an embedding to compare: one that repeats a lesson of the project is flagged now.
+      const dup = await duplicateOfSaved(deps, `lesson:${input.feedbackId}`).catch(() => null);
+      if (dup) {
+        pm.lessonChecks = [...(pm.lessonChecks ?? []), dup];
+        if (trace) trace.lessonFlags = [...trace.lessonFlags, dup];
+        await deps.k.setLessonChecks!(`lesson:${input.feedbackId}`, pm.lessonChecks);
+      }
       await deps.activity?.record({
         kind: 'postmortem_done',
         actor: trace?.provider ?? 'postmortem',
@@ -49,6 +63,11 @@ export async function runPostmortems(deps: PostmortemStepDeps): Promise<{ done: 
           contextFound: (pm.contextItems ?? []).map((c) => ({ kind: c.kind, ref: c.ref, why: c.why, wasAvailable: c.wasAvailable })),
           // What the lesson check narrowed or flagged (lessonCheck.ts), for the owner deciding on the lesson.
           lessonChecks: trace?.lessonFlags ?? [],
+          lessonShaped: trace?.lessonShaped ?? [],
+          // 'process': about how the work was handled, so on no file; 'code' otherwise.
+          subject: pm.subject ?? 'code',
+          // Facts it noticed beside the lesson: proposals for the owner, never stored as facts or served.
+          proposedFacts: pm.facts ?? [],
         },
         targets: [input.feedbackId, `miss:${input.feedbackId}`, `lesson:${input.feedbackId}`],
       });

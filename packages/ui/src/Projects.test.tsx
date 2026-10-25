@@ -37,7 +37,8 @@ beforeEach(() => {
     return Response.json([]);
   }));
 });
-afterEach(() => { cleanup(); vi.unstubAllGlobals(); });
+// Picking a project writes it into the address: each test starts from none.
+afterEach(() => { cleanup(); vi.unstubAllGlobals(); history.replaceState(null, '', location.pathname); });
 
 /** A project's row in the list (its name is also an option in the link picker). */
 const row = async (name: string) => (await screen.findAllByText(name)).find((e) => e.closest('button[aria-current], li > button'))!;
@@ -48,6 +49,24 @@ test('lists projects with counts and shows facts for the selected one', async ()
   expect(screen.getByText('Pagination max 50')).toBeTruthy();
   expect(screen.getByText(/3 sessions · 2 lessons · 12 facts/)).toBeTruthy();
   expect(await row('other')).toBeTruthy();
+});
+
+test('files an older scanner read are counted, with what to do: no scan starts on its own', async () => {
+  projectList = [{ ...projects[0], olderScanner: 12 }, projects[1]];
+  render(<Projects />);
+  expect(await screen.findByText('12 files were read by an older scanner: press Scan to refresh them.')).toBeTruthy();
+  expect(calls.some((c) => c.url.endsWith('/scan'))).toBe(false);
+  // While a scan is queued or running it says that scan will refresh them.
+  cleanup();
+  projectList = [{ ...projects[0], olderScanner: 1, lastScan: job('queued') }, projects[1]];
+  render(<Projects />);
+  expect(await screen.findByText('1 file was read by an older scanner: the scan under way refreshes it.')).toBeTruthy();
+});
+
+test('a project with no file from an older scanner says nothing about it', async () => {
+  render(<Projects />);
+  await screen.findByText('Use sendError for all errors');
+  expect(screen.queryByText(/older scanner/)).toBeNull();
 });
 
 test('a queued scan shows its place in the queue (scans waiting out a retry are not counted ahead of it)', async () => {
@@ -68,6 +87,15 @@ test("an agentic scan's line says how many of its shards were rescanned (the oth
   render(<Projects />);
   await screen.findByText('Use sendError for all errors');
   expect(screen.getByText('12 of 20 shards rescanned, 1 failed')).toBeTruthy();
+  expect(screen.queryByText(/not reached/)).toBeNull();
+});
+
+test('the scan line says how many places its agents did not reach, and names them on hover', async () => {
+  projectList = [{ ...projects[0], lastScan: { ...job('done'), shards: { total: 20, rescanned: 12, failed: 0, unreached: ['src/svc/internal', 'src/svc/cmd'] } } }, projects[1]];
+  render(<Projects />);
+  await screen.findByText('Use sendError for all errors');
+  const line = screen.getByText('2 places not reached');
+  expect(line.getAttribute('title')).toContain('src/svc/internal');
 });
 
 test('each project shows its git remote under its name, and the selected one its other clones', async () => {
@@ -459,4 +487,32 @@ test('a fact file name opens that file module panel in the code map', async () =
   fireEvent.click(screen.getAllByRole('button', { name: 'open module src/db.ts' })[0]);
   expect(await screen.findByRole('region', { name: 'module src/db.ts' })).toBeTruthy();
   expect(calls.some((c) => c.url === '/api/projects/demo-shop/codemap/module?path=src%2Fdb.ts')).toBe(true);
+});
+
+test('a Projects link followed while the page is open switches to that project (a Rebuild acts on the project shown)', async () => {
+  render(<Projects />);
+  await screen.findByText('Use sendError for all errors');
+  expect(screen.getByRole('heading', { name: 'demo-shop' })).toBeTruthy();
+  try {
+    location.hash = '#projects/other';
+    window.dispatchEvent(new HashChangeEvent('hashchange'));
+    expect(await screen.findByRole('heading', { name: 'other' })).toBeTruthy();
+    location.hash = `#projects/demo-shop/${encodeURIComponent('src/db.ts')}`;
+    window.dispatchEvent(new HashChangeEvent('hashchange'));
+    expect(await screen.findByRole('region', { name: 'module src/db.ts' })).toBeTruthy();
+    expect(screen.getByRole('heading', { name: 'demo-shop' })).toBeTruthy();
+  } finally {
+    location.hash = '';
+  }
+});
+
+test('picking a project in the list puts it in the address, so the URL names the project shown', async () => {
+  render(<Projects />);
+  await screen.findByText('Use sendError for all errors');
+  try {
+    fireEvent.click(await row('other'));
+    expect(location.hash).toBe('#projects/other');
+  } finally {
+    location.hash = '';
+  }
 });

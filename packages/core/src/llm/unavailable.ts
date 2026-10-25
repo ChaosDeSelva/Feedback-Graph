@@ -111,6 +111,7 @@ export function withHealth(p: LlmProvider, report: (h: ProviderHealth) => void):
     id: p.id,
     agentic: p.agentic,
     vision: p.vision ?? false,
+    ...(p.mirror ? { mirror: p.mirror } : {}),
     async json(t) {
       try {
         const out = await p.json(t);

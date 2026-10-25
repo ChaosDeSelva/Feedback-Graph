@@ -32,13 +32,30 @@ export type CodeImport = {
  * candidates: files worth mapping before the cap (absent on a map from before it was counted). unresolved: imports
  * that look like they name a repo file (an alias, a workspace package) but resolved to none, so edges are missing.
  */
-export type CodeMap = { files: CodeFile[]; symbols: CodeSymbol[]; imports: CodeImport[]; candidates?: number | null; unresolved?: number | null };
+export type CodeMap = {
+  files: CodeFile[];
+  symbols: CodeSymbol[];
+  /** Every edge of the import index: from and to mapped and outside files. */
+  imports: CodeImport[];
+  /** The import index past the cap: candidates not mapped (no symbols), whose edges are kept. Sorted by path. */
+  outside?: CodeFile[];
+  candidates?: number | null;
+  unresolved?: number | null;
+};
 
 /**
  * `signal`: stop parsing (the worker is shutting down); the build then rejects with the signal's reason. maxFiles null:
  * the cap scales with the repo (scan/rank.ts mapCap). priority: paths kept before the rest (files sessions edited).
+ * churn: commits per path (churn.ts); with the import in-degree it decides which files a capped map keeps.
  */
-export type BuildOpts = { maxFiles: number | null; maxBytes: number; concurrency?: number; signal?: AbortSignal; priority?: string[] };
+export type BuildOpts = {
+  maxFiles: number | null;
+  maxBytes: number;
+  concurrency?: number;
+  signal?: AbortSignal;
+  priority?: string[];
+  churn?: Map<string, { commits: number; lastTs?: string }>;
+};
 
 /** An import as the parser saw it, before resolution. names: '*' is the whole module, 'default' the default export. */
 export type RawImport = { spec: string; names: string[] };

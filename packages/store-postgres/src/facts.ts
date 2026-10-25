@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import type pg from 'pg';
-import { clampRelevance, factOrigin, MANIFEST_WHY_RE, PROJECT_PATH, provenanceOf, redactDeep, redactSecrets, relevanceOf, SCAN_UNAVAILABLE_WAIT_MS, scanRetryAt } from '@fb/core';
-import type { EmbeddedFact, FactHit, FactKind, FactScope, FactsStore, Project, ProjectSummary, RelevanceBy, ScanJob, ScanJobPatch, ScanStatus, StoredFact, RelevanceUpdate, UnscoredFact } from '@fb/core';
+import { clampRelevance, FACT_EVIDENCE, factOrigin, requestTimes, scanRequestPaths, MANIFEST_WHY_RE, PROJECT_PATH, provenanceOf, redactDeep, redactSecrets, relevanceOf, SCAN_UNAVAILABLE_WAIT_MS, scanRetryAt } from '@fb/core';
+import type { EmbeddedFact, FactCheck, FactHit, FactKind, FactOrigin, FactScope, FactsStore, Project, ScannedFile, ProjectSummary, RelevanceBy, ScanJob, ScanJobPatch, ScanStatus, StoredFact, RelevanceUpdate, UnscoredFact } from '@fb/core';
 import { iso, toJson, toVector, tx, type Db } from './db.ts';
 import { runSearch, searchFactsQuery } from './vector.ts';
 
@@ -11,7 +11,15 @@ type Exec = Pick<pg.PoolClient, 'query'>;
 const fileId = (projectKey: string, path: string) => `${projectKey}:${path}`;
 
 const FACT_COLUMNS = `x.id, x.kind, x.statement, x.path, x.lines, x.confidence, x.why, x.relevance, x.relevance_by, x.source,
-                      x.scan_job_id, x.file_hash, x.created_at, x.doc_id, x.origin, x.evidence`;
+                      x.scan_job_id, x.file_hash, x.created_at, x.doc_id, x.origin, x.evidence, x.check_version`;
+
+/** A fact's origin in SQL, as factOrigin reads it (the manifest reader's reason is parameter `$manifestWhy`). */
+const originSql = (manifestWhy: string) =>
+  `CASE WHEN x.origin IS NOT NULL THEN x.origin WHEN x.doc_id IS NOT NULL THEN 'document' WHEN coalesce(x.why, '') ~ ${manifestWhy} THEN 'manifest' ELSE 'model' END`;
+
+/** A code_files upsert's hash_changed_at: kept while the hash stays the same, else the scan's time. */
+const HASH_CHANGED = `hash_changed_at = CASE WHEN code_files.hash IS NOT DISTINCT FROM EXCLUDED.hash AND code_files.hash_changed_at IS NOT NULL
+                        THEN code_files.hash_changed_at ELSE EXCLUDED.scanned_at END`;
 
 /** Code facts, the files they are about, scan jobs and the per-project summary. */
 export class PgFactsStore implements FactsStore {
@@ -28,8 +36,26 @@ export class PgFactsStore implements FactsStore {
     return new Map(rows.map((r) => [r.path, r.hash]));
   }
 
+  async fileScanVersions(projectKey: string): Promise<Map<string, string | null>> {
+    const { rows } = await this.db.pool.query(
+      `SELECT path, scan_version FROM code_files WHERE project_key = $1 AND NOT removed AND path <> $2 AND hash IS NOT NULL`,
+      [projectKey, PROJECT_PATH],
+    );
+    return new Map(rows.map((r) => [r.path, r.scan_version ?? null]));
+  }
+
+  async olderScannerFiles(version: string): Promise<Map<string, number>> {
+    const { rows } = await this.db.pool.query(
+      `SELECT project_key, count(*)::int AS n FROM code_files
+       WHERE NOT removed AND path <> $2 AND hash IS NOT NULL AND scan_version IS DISTINCT FROM $1
+       GROUP BY project_key`,
+      [version, PROJECT_PATH],
+    );
+    return new Map(rows.map((r) => [r.project_key, r.n]));
+  }
+
   /** Replace the current facts of one file (old facts are closed, not deleted). */
-  async saveFileFacts(projectKey: string, rawFile: { path: string; hash: string; summary: string }, rawFacts: EmbeddedFact[], source: string, scanJobId: string | null = null): Promise<void> {
+  async saveFileFacts(projectKey: string, rawFile: ScannedFile & { summary: string }, rawFacts: EmbeddedFact[], source: string, scanJobId: string | null = null): Promise<void> {
     // Facts are model output about code that may contain credentials: redact at the door.
     const file = redactDeep(rawFile);
     const facts = redactDeep(rawFacts);
@@ -39,11 +65,12 @@ export class PgFactsStore implements FactsStore {
     await tx(this.db, async (c) => {
       await c.query('INSERT INTO projects (key) VALUES ($1) ON CONFLICT DO NOTHING', [projectKey]);
       await c.query(
-        `INSERT INTO code_files (id, project_key, path, hash, summary, scanned_at, removed)
-         VALUES ($1, $2, $3, $4, $5, $6, false)
+        `INSERT INTO code_files (id, project_key, path, hash, summary, scanned_at, removed, scan_version, hash_changed_at)
+         VALUES ($1, $2, $3, $4, $5, $6, false, $7, $6)
          ON CONFLICT (id) DO UPDATE SET project_key = EXCLUDED.project_key, path = EXCLUDED.path, hash = EXCLUDED.hash,
-           summary = EXCLUDED.summary, scanned_at = EXCLUDED.scanned_at, removed = false`,
-        [cf, projectKey, file.path, file.hash, file.summary, now],
+           summary = EXCLUDED.summary, scanned_at = EXCLUDED.scanned_at, removed = false, scan_version = EXCLUDED.scan_version,
+           ${HASH_CHANGED}`,
+        [cf, projectKey, file.path, file.hash, file.summary, now, file.version ?? null],
       );
       await c.query(`UPDATE facts SET current = false, valid_to = $2 WHERE code_file_id = $1 AND current AND origin IS DISTINCT FROM 'you'`, [cf, now]);
       await insertFacts(c, projectKey, facts.map((fx) => ({ ...fx, codeFileId: cf })), source, scanJobId, now, file.hash);
@@ -67,16 +94,16 @@ export class PgFactsStore implements FactsStore {
    * Agentic scans see the whole repo at once: close every current fact in the project, then attach the new ones to
    * their files (or to the project root). One transaction: a failure leaves the old facts current and hashes stale.
    */
-  async replaceProjectFacts(projectKey: string, rawFacts: EmbeddedFact[], source: string, files: { path: string; hash: string }[], scanJobId: string | null = null): Promise<void> {
+  async replaceProjectFacts(projectKey: string, rawFacts: EmbeddedFact[], source: string, files: ScannedFile[], scanJobId: string | null = null): Promise<void> {
     await this.replaceScopeFacts(projectKey, { prefixes: [''], except: [] }, rawFacts, source, files, scanJobId);
   }
 
   /** One shard of an agentic scan: only the current facts in `scope` are closed (FactsStore.replaceScopeFacts). */
-  async replaceScopeFacts(projectKey: string, scope: FactScope, rawFacts: EmbeddedFact[], source: string, files: { path: string; hash: string }[], scanJobId: string | null = null): Promise<void> {
+  async replaceScopeFacts(projectKey: string, scope: FactScope, rawFacts: EmbeddedFact[], source: string, files: ScannedFile[], scanJobId: string | null = null): Promise<void> {
     const facts = redactDeep(rawFacts).map((f) => ({ ...f, path: f.path || PROJECT_PATH }));
     const now = new Date();
     // Neo4j MERGEs file by file, so a path listed twice ends with the last hash.
-    const latest = new Map(files.map((fl) => [fl.path, fl.hash]));
+    const latest = new Map(files.map((fl) => [fl.path, fl]));
     await tx(this.db, async (c) => {
       // Facts read from your documents, and facts you wrote, are not the code's: a scan never closes them.
       await c.query(
@@ -88,11 +115,11 @@ export class PgFactsStore implements FactsStore {
       await c.query('INSERT INTO projects (key) VALUES ($1) ON CONFLICT DO NOTHING', [projectKey]);
       if (latest.size) {
         await c.query(
-          `INSERT INTO code_files (id, project_key, path, hash, scanned_at, removed)
-           SELECT $1 || ':' || f.path, $1, f.path, f.hash, $4, false FROM unnest($2::text[], $3::text[]) AS f(path, hash)
+          `INSERT INTO code_files (id, project_key, path, hash, scanned_at, removed, scan_version, hash_changed_at)
+           SELECT $1 || ':' || f.path, $1, f.path, f.hash, $4, false, f.version, $4 FROM unnest($2::text[], $3::text[], $5::text[]) AS f(path, hash, version)
            ON CONFLICT (id) DO UPDATE SET project_key = EXCLUDED.project_key, path = EXCLUDED.path, hash = EXCLUDED.hash,
-             scanned_at = EXCLUDED.scanned_at, removed = false`,
-          [projectKey, [...latest.keys()], [...latest.values()], now],
+             scanned_at = EXCLUDED.scanned_at, removed = false, scan_version = EXCLUDED.scan_version, ${HASH_CHANGED}`,
+          [projectKey, [...latest.keys()], [...latest.values()].map((fl) => fl.hash), now, [...latest.values()].map((fl) => fl.version ?? null)],
         );
       }
       if (!facts.length) return;
@@ -135,16 +162,84 @@ export class PgFactsStore implements FactsStore {
     return rows.map((r) => r.s);
   }
 
-  async listFacts(q: { projectKey: string; kind?: FactKind; path?: string; limit?: number }): Promise<StoredFact[]> {
+  async listFacts(q: { projectKey: string; kind?: FactKind; path?: string; origin?: FactOrigin; limit?: number; offset?: number }): Promise<StoredFact[]> {
     const { rows } = await this.db.pool.query(
-      `SELECT ${FACT_COLUMNS}, cf.summary AS file_summary
+      `SELECT ${FACT_COLUMNS}, cf.summary AS file_summary, cf.hash_changed_at AS file_changed_at
        FROM facts x LEFT JOIN code_files cf ON cf.id = x.code_file_id
        WHERE x.project_key = $1 AND x.current AND ($2::text IS NULL OR x.kind = $2) AND ($3::text IS NULL OR (x.path = $3 AND x.doc_id IS NULL))
+         AND ($6::text IS NULL OR ${originSql('$7')} = $6)
        ORDER BY x.path COLLATE "C", x.created_at, x.id
-       LIMIT $4`,
-      [q.projectKey, q.kind ?? null, q.path ?? null, q.limit ?? 500],
+       LIMIT $4 OFFSET $5`,
+      [q.projectKey, q.kind ?? null, q.path ?? null, q.limit ?? 500, Math.max(0, Math.floor(q.offset ?? 0)), q.origin ?? null, MANIFEST_WHY_RE],
     );
     return rows.map(factOf);
+  }
+
+  async factsToRecheck(q: { projectKey: string; version: string; limit: number }): Promise<StoredFact[]> {
+    const { rows } = await this.db.pool.query(
+      `SELECT ${FACT_COLUMNS}, cf.summary AS file_summary, cf.hash_changed_at AS file_changed_at
+       FROM facts x LEFT JOIN code_files cf ON cf.id = x.code_file_id
+       WHERE x.project_key = $1 AND x.current AND x.doc_id IS NULL AND x.origin IS DISTINCT FROM 'you' AND x.check_version IS DISTINCT FROM $2
+       ORDER BY x.path COLLATE "C", x.created_at, x.id
+       LIMIT $3`,
+      [q.projectKey, q.version, Math.max(0, Math.floor(q.limit))],
+    );
+    return rows.map(factOf);
+  }
+
+  /** Checked again in place: a kept fact keeps its created_at (when it was read), so its freshness does not move. */
+  async applyFactChecks(version: string, checks: FactCheck[]): Promise<number> {
+    if (!checks.length) return 0;
+    const { rows: [r] } = await this.db.pool.query(
+      `WITH c AS (SELECT * FROM unnest($2::text[], $3::boolean[], $4::text[], $5::text[]) AS c(id, keep, lines, evidence)),
+            u AS (
+              UPDATE facts x SET check_version = $1,
+                lines = CASE WHEN c.keep THEN c.lines ELSE x.lines END,
+                evidence = CASE WHEN c.keep THEN c.evidence ELSE x.evidence END,
+                current = c.keep,
+                valid_to = CASE WHEN c.keep THEN x.valid_to ELSE $6::timestamptz END
+              FROM c WHERE x.id = c.id AND x.current
+              RETURNING c.keep)
+       SELECT count(*) FILTER (WHERE NOT keep)::int AS closed FROM u`,
+      [version, checks.map((c) => c.id), checks.map((c) => c.keep), checks.map((c) => c.lines ?? null),
+        checks.map((c) => (c.evidence && FACT_EVIDENCE.includes(c.evidence) ? c.evidence : null)), new Date()],
+    );
+    return r?.closed ?? 0;
+  }
+
+  /** A request is a mark on the file's code_files row (one with no hash yet when it was never scanned). */
+  async requestFilesScan(projectKey: string, paths: string[]): Promise<number> {
+    const unique = scanRequestPaths(paths);
+    if (!unique.length) return 0;
+    return tx(this.db, async (c) => {
+      await c.query('INSERT INTO projects (key) VALUES ($1) ON CONFLICT DO NOTHING', [projectKey]);
+      await c.query(
+        `INSERT INTO code_files (id, project_key, path, removed) SELECT $1 || ':' || p, $1, p, false FROM unnest($2::text[]) AS p
+         ON CONFLICT (id) DO NOTHING`,
+        [projectKey, unique],
+      );
+      const { rowCount } = await c.query(
+        // One millisecond apart, so files asked for in one call keep the order they were named in.
+        `UPDATE code_files cf SET scan_requested_at = a.at
+           FROM unnest($2::text[], $3::timestamptz[]) AS a(path, at)
+          WHERE cf.id = $1 || ':' || a.path AND cf.scan_requested_at IS NULL`,
+        [projectKey, unique, requestTimes(unique).map(([, at]) => at)],
+      );
+      return rowCount ?? 0;
+    });
+  }
+
+  async scanRequests(projectKey: string): Promise<string[]> {
+    const { rows } = await this.db.pool.query(
+      `SELECT path FROM code_files WHERE project_key = $1 AND scan_requested_at IS NOT NULL ORDER BY scan_requested_at, path COLLATE "C"`,
+      [projectKey],
+    );
+    return rows.map((r) => r.path);
+  }
+
+  async clearScanRequests(projectKey: string, paths: string[]): Promise<void> {
+    if (!paths.length) return;
+    await this.db.pool.query('UPDATE code_files SET scan_requested_at = NULL WHERE project_key = $1 AND path = ANY($2::text[])', [projectKey, paths]);
   }
 
   async searchFacts(q: { embedding: number[]; projectKey: string; k: number }): Promise<FactHit[]> {
@@ -309,12 +404,12 @@ async function insertFacts(c: Exec, projectKey: string, facts: FactRow[], source
   if (!facts.length) return;
   await c.query(
     `INSERT INTO facts (id, project_key, code_file_id, kind, statement, path, lines, confidence, why, source, scan_job_id,
-                        file_hash, current, created_at, valid_from, embedding, relevance, relevance_by, origin, evidence)
+                        file_hash, current, created_at, valid_from, embedding, relevance, relevance_by, origin, evidence, check_version)
      SELECT n.id, $1, n.code_file_id, n.kind, n.statement, n.path, n.lines, n.confidence, n.why, $2, $3,
             CASE WHEN $4::boolean THEN $5 ELSE cf.hash END, true, $6, $6, n.embedding::vector,
-            n.relevance, CASE WHEN n.relevance IS NULL THEN NULL ELSE 'model' END, n.origin, n.evidence
-     FROM unnest($7::text[], $8::text[], $9::text[], $10::text[], $11::text[], $12::text[], $13::float8[], $14::text[], $15::text[], $16::float8[], $17::text[], $18::text[])
-            WITH ORDINALITY AS n(id, code_file_id, kind, statement, path, lines, confidence, why, embedding, relevance, origin, evidence, ord)
+            n.relevance, CASE WHEN n.relevance IS NULL THEN NULL ELSE 'model' END, n.origin, n.evidence, n.check_version
+     FROM unnest($7::text[], $8::text[], $9::text[], $10::text[], $11::text[], $12::text[], $13::float8[], $14::text[], $15::text[], $16::float8[], $17::text[], $18::text[], $19::text[])
+            WITH ORDINALITY AS n(id, code_file_id, kind, statement, path, lines, confidence, why, embedding, relevance, origin, evidence, check_version, ord)
      LEFT JOIN code_files cf ON cf.id = n.code_file_id
      ORDER BY n.ord`,
     [
@@ -331,6 +426,7 @@ async function insertFacts(c: Exec, projectKey: string, facts: FactRow[], source
       facts.map((f) => relevanceOf(f)),
       facts.map((f) => provenanceOf(f).origin),
       facts.map((f) => provenanceOf(f).evidence),
+      facts.map((f) => f.checkVersion ?? null),
     ],
   );
 }
@@ -349,10 +445,12 @@ function factOf(r: Record<string, any>): StoredFact {
     docId: r.doc_id ?? null,
     origin: factOrigin({ origin: r.origin, docId: r.doc_id, why: r.why }),
     evidence: r.evidence ?? null,
+    checkVersion: r.check_version ?? null,
     source: r.source,
     scanJobId: r.scan_job_id ?? null,
     fileHash: r.file_hash ?? null,
     fileSummary: r.file_summary ?? null,
+    fileChangedAt: r.file_changed_at ? iso(new Date(r.file_changed_at)) : null,
     createdAt: iso(r.created_at)!,
   };
 }

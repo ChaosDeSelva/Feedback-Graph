@@ -107,8 +107,8 @@ test('GET /api/candidates asks the store for the selected projects only; another
   const { get, calls } = setup();
   await get('/api/candidates?status=pending');
   await get('/api/candidates?status=pending&project=old');
-  expect(calls[0]).toEqual(['candidates', { status: 'pending', projectKeys: ['shop', 'shop-2'] }]);
-  expect(calls[1]).toEqual(['candidates', { status: 'pending', projectKey: 'old', projectKeys: [] }]);
+  expect(calls[0]).toEqual(['candidates', { status: 'pending', limit: 201, offset: 0, projectKeys: ['shop', 'shop-2'] }]);
+  expect(calls[1]).toEqual(['candidates', { status: 'pending', projectKey: 'old', limit: 201, offset: 0, projectKeys: [] }]);
 });
 
 test('an Inbox item of another project is not found, and cannot be decided or retried', async () => {
@@ -144,8 +144,8 @@ test('activity and patterns cover the selected projects only', async () => {
   await get('/api/patterns');
   await get('/api/patterns?project=shop');
   expect(calls).toEqual([
-    ['activity', { limit: 10, projectKeys: ['shop', 'shop-2'] }],
-    ['activity', { projectKey: 'old', projectKeys: [] }],
+    ['activity', { limit: 10, maxDetailBytes: 1024, projectKeys: ['shop', 'shop-2'] }],
+    ['activity', { projectKey: 'old', maxDetailBytes: 1024, projectKeys: [] }],
     ['patterns', { projectKeys: ['shop', 'shop-2'] }],
     ['patterns', { projectKey: 'shop', projectKeys: ['shop'] }],
   ]);

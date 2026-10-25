@@ -200,3 +200,55 @@ test('in the UI the same writes still say you', async () => {
   await app.request('/api/projects/shop/pin', call('PUT', { pinned: true }, { origin: 'http://localhost' }));
   expect(logged[0].why).toMatch(/^you pinned it/);
 });
+
+test('a wrong bearer on a read is 401 with a log line, whichever token is configured; no bearer, or the plugin\'s "Bearer none", reads as before', async () => {
+  const wrong = 'w'.repeat(32);
+  for (const o of [{}, { token: null, apiToken: API }] as const) {
+    const lines: [string, object | undefined][] = [];
+    const { app } = setup({ ...o, extra: { log: (msg, extra) => { lines.push([msg, extra]); } } });
+    const res = await app.request('/api/lessons', { headers: bearer(wrong, 'codex') });
+    expect(res.status).toBe(401);
+    expect((await res.json()).error).toMatch(/token not recognised/);
+    expect(lines.filter(([m]) => m === 'auth refused')).toEqual([['auth refused', expect.objectContaining({ method: 'GET', path: '/api/lessons', operator: 'operator:codex' })]]);
+    expect(JSON.stringify(lines)).not.toContain(wrong);
+  }
+  const { app } = setup();
+  expect((await app.request('/api/lessons')).status).toBe(200);
+  expect((await app.request('/api/lessons', { headers: { authorization: 'Bearer none' } })).status).toBe(200);
+  expect((await app.request('/api/lessons', { headers: bearer(OP) })).status).toBe(200);
+  // No token configured at all: there is nothing to check a bearer against, so it is ignored as before.
+  const open = setup({ token: null });
+  expect((await open.app.request('/api/lessons', { headers: bearer(wrong) })).status).toBe(200);
+});
+
+test('Activity records how a write arrived: via the operator token or from a browser', async () => {
+  const { app, logged } = setup({ extra: { facts: { listProjects: async () => [], requestScan: async () => ({}) as never, listFacts: async () => [], searchFacts: async () => [], setPinned: async () => {} } as never, projectDirs: async () => [{ key: 'shop', name: 'shop', repoPath: '/vibe/shop' }] } });
+  await app.request('/api/projects/shop/pin', call('PUT', { pinned: true }, bearer(OP, 'codex')));
+  await app.request('/api/projects/shop/pin', call('PUT', { pinned: false }, { origin: 'http://localhost' }));
+  expect(logged.map((e) => [e.actor, e.details?.via])).toEqual([['operator:codex', 'operator'], ['you', 'browser']]);
+});
+
+test('a link decision records who made it on the link itself', async () => {
+  const patches: unknown[] = [];
+  const links = { listLinks: async () => [], deleteLink: async () => true, setLink: async (_a: string, _b: string, p: unknown) => { patches.push(p); return { id: 'link:shop|web', a: 'shop', b: 'web', status: 'confirmed', relation: 'related' }; } };
+  const { app } = setup({ extra: { links: links as never } });
+  await app.request('/api/links', call('PUT', { a: 'shop', b: 'web', status: 'confirmed' }, bearer(OP, 'codex')));
+  await app.request('/api/links', call('PUT', { a: 'shop', b: 'web', status: 'dismissed' }, { origin: 'http://localhost' }));
+  expect(patches).toEqual([{ status: 'confirmed', decidedBy: 'operator:codex' }, { status: 'dismissed', decidedBy: 'you' }]);
+});
+
+test('asking for a code map rebuild is recorded in Activity, as the agent that asked', async () => {
+  const codegraph = { hotspots: async () => [], moduleContext: async () => null, impact: async () => null, codeMapMeta: async () => null, requestCodeMapRebuild: async (k: string) => k === 'shop' };
+  const { app, logged } = setup({ extra: { codegraph: codegraph as never } });
+  expect((await app.request('/api/projects/shop/codemap/rebuild', call('POST', {}, bearer(OP, 'codex')))).status).toBe(202);
+  expect(logged).toEqual([expect.objectContaining({ kind: 'code_mapped', actor: 'operator:codex', projectKey: 'shop', subject: expect.stringMatching(/rebuild/) })]);
+  // No map yet: refused, and nothing recorded.
+  expect((await app.request('/api/projects/web/codemap/rebuild', call('POST', {}, bearer(OP, 'codex')))).status).toBe(404);
+  expect(logged).toHaveLength(1);
+});
+
+test('testing an integration\'s token is a read: no OPERATOR_ALLOW verb gates it', () => {
+  expect(OWNER_ROUTES.some(([, path]) => path === '/api/settings/integrations/:kind/test')).toBe(false);
+  // Saving or removing a token still is the integrations verb.
+  expect(OWNER_ROUTES.filter(([, path]) => path.startsWith('/api/settings/integrations')).map(([m, , v]) => `${m} ${v}`)).toEqual(['PUT integrations', 'DELETE integrations', 'PUT integrations']);
+});

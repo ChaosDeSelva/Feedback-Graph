@@ -34,6 +34,20 @@ describeStores('ActivityStore', (h) => {
     expect(await a.list({ limit: 1 })).toHaveLength(1);
   });
 
+  test('a list with maxDetailBytes leaves big details out and says so; get(id) returns them whole', async () => {
+    await a.record({ kind: 'scan_finished', actor: 'm', projectKey: 'shop', subject: 'big', why: 'w', details: { log: 'x'.repeat(5000) } });
+    await a.record({ kind: 'lesson_decided', actor: 'you', projectKey: 'shop', subject: 'small', why: 'w', details: { status: 'approved' } });
+    const [small, big] = await a.list({ maxDetailBytes: 512 });
+    expect(small).toMatchObject({ subject: 'small', details: { status: 'approved' } });
+    expect(small.detailsOmitted).toBeFalsy();
+    expect(big).toMatchObject({ subject: 'big', details: {}, detailsOmitted: true });
+    expect((await a.get(big.id))?.details).toEqual({ log: 'x'.repeat(5000) });
+    expect((await a.get(big.id))?.detailsOmitted).toBeFalsy();
+    expect(await a.get('act:nope')).toBeNull();
+    // Without the option the list is as it always was.
+    expect((await a.list({}))[1].details).toEqual({ log: 'x'.repeat(5000) });
+  });
+
   test('defaults: no details, no targets, global project', async () => {
     await a.record({ kind: 'feedback_decided', actor: 'you', projectKey: null, subject: 's', why: 'w' });
     const [x] = await a.list({});

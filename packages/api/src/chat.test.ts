@@ -49,7 +49,7 @@ function deps(root: string, map: Partial<StoredCodeMap>, over: Partial<ContextDe
     exists: () => true,
     ...over,
   };
-  const full: StoredCodeMap = { fingerprint: null, builtAt: 't', stats: { files: 0, symbols: 0, imports: 0, tests: 0 }, candidates: null, files: [], symbols: [], imports: [], ...map };
+  const full: StoredCodeMap = { fingerprint: null, builtAt: 't', stats: { files: 0, symbols: 0, imports: 0, tests: 0 }, candidates: null, files: [], outside: [], symbols: [], imports: [], ...map };
   return { context, codeMap: async () => full, logged };
 }
 
@@ -77,6 +77,18 @@ describe('buildChatContext', () => {
     expect(pack.context).not.toContain('line 43\n');
     // The search is logged as context served to the Ask chat.
     expect(d.logged[0]).toMatchObject({ kind: 'context_served', actor: 'ui-chat', projectKey: 'demo-shop' });
+  });
+
+  test('a file past the cap of the map is still found by name, and the pack says it is outside the map', async () => {
+    const { root } = project({ 'src/ui/ConfirmDialog.tsx': lines(5) });
+    const d = deps(root, {
+      files: [file('src/App.tsx')],
+      outside: [file('src/ui/ConfirmDialog.tsx')],
+      imports: [{ from: 'src/App.tsx', to: 'src/ui/ConfirmDialog.tsx', names: ['ConfirmDialog'], spec: './ui/ConfirmDialog' }],
+    });
+    const pack = await buildChatContext('demo-shop', 'do we have a modal component already?', [], d);
+    expect(pack.sources.find((s) => s.kind === 'code')).toMatchObject({ ref: 'src/ui/ConfirmDialog.tsx' });
+    expect(pack.context).toMatch(/`src\/ui\/ConfirmDialog\.tsx` file \(outside the code map: no symbols\) · used by: `src\/App\.tsx`/);
   });
 
   test('a fact from an uploaded document is a doc source; a fact whose lines are not a line range cites only its file', async () => {

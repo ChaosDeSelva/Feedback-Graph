@@ -1,6 +1,6 @@
 import { expect, test } from 'vitest';
 import type { FactHit, StoredFact } from './graph/facts.ts';
-import { factOrigin, isNonMiss, pathAffinity, rankFacts, rankMisses, relevanceBand } from './relevance.ts';
+import { factOrigin, isNonMiss, pathAffinity, rankFacts, rankMisses, relevanceBand, serviceDirs, servicesInTask, SIMILARITY_FLOOR } from './relevance.ts';
 
 const hit = (statement: string, score: number, relevance: number | null): FactHit => ({
   fact: { id: statement, statement, relevance, relevanceBy: relevance === null ? null : 'model' } as StoredFact,
@@ -82,4 +82,32 @@ test('rankMisses drops non-misses and weak matches, and favours misses that name
     'Missed the exists=true filter in src/context-graph/internal/page.go',
   ]);
   expect(rankMisses([m('a', 0.8), m('b', 0.4)], 4, []).map((x) => x.missId)).toEqual(['a']);
+});
+
+test('rankFacts applies the same similarity floor as misses: a nonsense task gets no facts at all', () => {
+  const ranked = rankFacts([hit('every query is scoped by orgId', 0.22, 0.9), hit('routes live in src/routes', 0.18, 1)], 10);
+  expect(ranked).toEqual([]);
+  expect(rankFacts([hit('every query is scoped by orgId', SIMILARITY_FLOOR, 0.9)], 10)).toHaveLength(1);
+});
+
+test('servicesInTask finds the services a task names by their folder, never a generic folder like src or packages', () => {
+  const dirs = serviceDirs(['src/webapp/core/a.ts', 'src/context-graph/internal/page.go', 'billing/api/charge.ts', 'packages/ui/x.tsx', 'README.md']);
+  expect(dirs).toEqual(['billing', 'billing/api', 'src/context-graph', 'src/webapp']);
+  expect(servicesInTask('add a members page to the webapp settings', dirs)).toEqual(['src/webapp']);
+  expect(servicesInTask('Fix the context-graph page offsets', dirs)).toEqual(['src/context-graph']);
+  expect(servicesInTask('refund flow in Billing', dirs)).toEqual(['billing']);
+  // "src", "packages" and "ui" alone are no service: too short or too generic to name one.
+  expect(servicesInTask('move the src helpers into packages', dirs)).toEqual([]);
+});
+
+test('with no files named, the services the task names rank their facts and misses up and other services\' down', () => {
+  const at = (statement: string, path: string, score: number): FactHit => ({ fact: { id: statement, statement, path, relevance: 0.8, relevanceBy: 'model' } as StoredFact, score });
+  const facts = [at('graph pages are byte offsets', 'src/context-graph/AGENTS.md', 0.62), at('settings pages use SettingsState', 'src/webapp/core/settings.ts', 0.58)];
+  expect(rankFacts(facts, 5).map((h) => h.fact.id)[0]).toBe('graph pages are byte offsets');
+  expect(rankFacts(facts, 5, [], ['src/webapp']).map((h) => h.fact.id)[0]).toBe('settings pages use SettingsState');
+  const m = (missed: string, score: number) => ({ missId: missed, missed, feedbackText: '', score });
+  const misses = [m('Missed the filter in src/context-graph/internal/page.go', 0.62), m('Missed the admin gate in src/webapp/core/usage.ts', 0.58)];
+  expect(rankMisses(misses, 4, [], ['src/webapp'])[0].missId).toMatch(/webapp/);
+  // Named files win over words: the services are only a guess.
+  expect(rankMisses(misses, 4, ['src/context-graph/internal/x.go'], ['src/webapp'])[0].missId).toMatch(/context-graph/);
 });

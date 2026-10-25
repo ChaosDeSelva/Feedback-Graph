@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto';
 import { lstat } from 'node:fs/promises';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
-import type { ActivityStore, CodeGraphStore, CodeMapStats } from '@fb/core';
+import { CODE_MAP_VERSION, type ActivityStore, type CodeGraphStore, type CodeMapStats } from '@fb/core';
 import { GIT_SAFE } from '../ingest/git.ts';
 import { MAX_AUTO_MAP_FILES } from '../scan/rank.ts';
 import { candidatePaths } from '../scan/scan.ts';
@@ -257,6 +257,7 @@ export class MapStage {
 
   /** force: a rebuild you asked for, from scratch (no previous map reused), whether or not the repo changed. */
   private async build(p: { key: string; repoPath: string }, why: string | null, force: boolean): Promise<MapResult | null> {
+
     const d = this.d;
     const t0 = Date.now();
     try {
@@ -275,14 +276,24 @@ export class MapStage {
         }
         fingerprint = await (d.fsFingerprint ?? fileFingerprint)(p.repoPath).catch(() => null);
       }
+      // Built by older map rules (or before maps were versioned): rebuilt from scratch whatever the repo did, so a
+      // rule change reaches the maps built before it. The first pass after a start does every such project.
+      const outdated = !!meta && (meta.version ?? 0) < CODE_MAP_VERSION;
+      if (outdated) {
+        d.log?.('code map outdated, rebuilding', { project: p.key, version: meta.version ?? null, current: CODE_MAP_VERSION });
+        force = true;
+        why ??= `the map was built by older map rules (${meta.version == null ? 'unversioned' : `v${meta.version}`}, now v${CODE_MAP_VERSION})`;
+      }
       if (!force && meta && fingerprint !== null && meta.fingerprint === fingerprint) return null;
       // A stored map with no fingerprint is one whose write was cut short (the store clears it first, sets it last):
       // what it holds may be half old, half new, so it is not reused for the incremental parse.
       const prev = meta?.fingerprint && !force ? await d.store.codeMap(p.key) : null;
       const signal = this.stopping.signal;
       const priority = d.editedPaths ? await d.editedPaths(p.key).catch(() => []) : [];
-      const map = await (d.build ?? buildCodeMap)(p.repoPath, { maxFiles: d.maxFiles, maxBytes: d.maxBytes, signal, priority }, prev ?? undefined);
+      // Read first: a capped map keeps the files most imported and most changed.
       const commits = await (d.churn ?? gitChurn)(p.repoPath, CHURN_DAYS, gitArgs);
+      const map = await (d.build ?? buildCodeMap)(p.repoPath, { maxFiles: d.maxFiles, maxBytes: d.maxBytes, signal, priority, churn: commits }, prev ?? undefined);
+      // TESTS edges for mapped files, from the whole import index (a test past the cap still covers them).
       const tests = map.files.filter((f) => !f.isTest).flatMap((f) => testsFor(map, f.path).map((test) => ({ test, target: f.path })));
       const exclusive = d.exclusive ?? (<T>(fn: () => Promise<T>) => fn());
       const stats = await exclusive(async () => {
@@ -290,7 +301,7 @@ export class MapStage {
         if (signal.aborted) return 'stopped' as const;
         // Unselected, cleaned up or deleted while it was being parsed: writing now would bring its map back.
         if (d.inScope && !(await d.inScope(p.key))) return null;
-        return d.store.replaceCodeMap(p.key, { ...map, tests, churn: Object.fromEntries(commits), fingerprint, candidates: map.candidates ?? null });
+        return d.store.replaceCodeMap(p.key, { ...map, tests, churn: Object.fromEntries(commits), fingerprint, candidates: map.candidates ?? null, version: CODE_MAP_VERSION });
       });
       if (!stats || stats === 'stopped') {
         d.log?.('code map skipped', { project: p.key, reason: stats ? 'the worker is shutting down' : 'no longer selected' });

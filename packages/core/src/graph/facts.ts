@@ -3,12 +3,19 @@ import neo4j from 'neo4j-driver';
 import { FACT_EVIDENCE, FACT_ORIGINS, type CodeFact, type FactEvidence, type FactKind, type FactOrigin, type Project, type ProjectSummary, type RelevanceBy, type ScanJob, type ScanShards, type ScanStatus } from '../types.ts';
 import { factOrigin } from '../relevance.ts';
 import { redactDeep, redactSecrets } from '../redact.ts';
-import type { FactScope, FactsStore, ScanJobPatch } from '../store.ts';
+import type { FactCheck, FactScope, FactsStore, ScanJobPatch, ScannedFile } from '../store.ts';
 import type { GraphRepo } from './repo.ts';
 
-/** A stored fact with its provenance: which model, which scan, which version of the file. */
+/**
+ * A stored fact with its provenance: which model, which scan, which version of the file. `createdAt` is when a scan
+ * (or you) wrote it, so when it was last refreshed: a rescan writes new facts, a recheck keeps the time. `fileHash`:
+ * the file's hash as that scan read it. `fileChangedAt`: when a scan first saw the file at its current hash (null:
+ * not recorded, or not a code file), so a fact refreshed after a session started from a file that changed after it
+ * started is about that session's own change.
+ */
 export type StoredFact = Omit<CodeFact, 'relevance' | 'evidence'> & {
   id: string; source: string; createdAt: string; scanJobId: string | null; fileHash: string | null; fileSummary: string | null;
+  fileChangedAt?: string | null;
   relevance: number | null; relevanceBy: RelevanceBy | null;
   /** How its citation was checked when saved; null on facts saved before that was recorded. */
   evidence?: FactEvidence | null;
@@ -36,6 +43,29 @@ export const MANIFEST_WHY_RE = '^Read directly from \\S+; no model involved\\.$'
 
 /** The path facts about the whole project (not one file) are filed under. */
 export const PROJECT_PATH = '.';
+
+/**
+ * A manifest's dependency list (package.json, go.mod, pyproject.toml, Cargo.toml read without a model): long, and in
+ * the file an agent can read itself, so task context names the manifest instead of printing the list (one was 22% of
+ * an answer).
+ */
+export const isManifestDependency = (f: { kind: string; origin?: FactOrigin | null; docId?: string | null; why?: string | null }) =>
+  f.kind === 'dependency' && factOrigin(f) === 'manifest';
+
+/** Files one requestFilesScan call queues at most; more are left out. */
+export const MAX_SCAN_REQUESTS = 50;
+/** The paths requestFilesScan keeps: repo-relative, no '..', not empty, at most MAX_SCAN_REQUESTS, each once. */
+export function scanRequestPaths(paths: string[]): string[] {
+  const ok = paths
+    .map((p) => p.trim().replace(/^\.\//, ''))
+    .filter((p) => p && p !== PROJECT_PATH && p.length <= 500 && !p.startsWith('/') && !p.split('/').includes('..') && !p.includes('\0'));
+  return [...new Set(ok)].slice(0, MAX_SCAN_REQUESTS);
+}
+
+/** Each path's request time, one millisecond apart from now on, so one call's files queue in the order they were named. */
+export function requestTimes(paths: string[], now = Date.now()): [string, string][] {
+  return paths.map((p, i) => [p, new Date(now + i).toISOString()]);
+}
 
 /** Real failures a scan job gets before it is failed for good. */
 export const MAX_SCAN_ATTEMPTS = 3;
@@ -65,8 +95,26 @@ export class FactsRepo implements FactsStore {
     return new Map(rows.map((r) => [r.get('path'), r.get('hash')]));
   }
 
+  async fileScanVersions(projectKey: string): Promise<Map<string, string | null>> {
+    const rows = await this.g.run(
+      `MATCH (f:CodeFile {projectKey: $projectKey}) WHERE coalesce(f.removed, false) = false AND f.path <> $root AND f.hash IS NOT NULL
+       RETURN f.path AS path, f.scanVersion AS version`,
+      { projectKey, root: PROJECT_PATH },
+    );
+    return new Map(rows.map((r) => [r.get('path'), r.get('version') ?? null]));
+  }
+
+  async olderScannerFiles(version: string): Promise<Map<string, number>> {
+    const rows = await this.g.run(
+      `MATCH (f:CodeFile) WHERE coalesce(f.removed, false) = false AND f.path <> $root AND f.hash IS NOT NULL AND coalesce(f.scanVersion, '') <> $version
+       RETURN f.projectKey AS projectKey, count(f) AS n`,
+      { version, root: PROJECT_PATH },
+    );
+    return new Map(rows.map((r) => [r.get('projectKey'), Number(r.get('n'))]));
+  }
+
   /** Replace the current facts of one file (old facts are closed, not deleted). */
-  async saveFileFacts(projectKey: string, rawFile: { path: string; hash: string; summary: string }, rawFacts: EmbeddedFact[], source: string, scanJobId: string | null = null) {
+  async saveFileFacts(projectKey: string, rawFile: ScannedFile & { summary: string }, rawFacts: EmbeddedFact[], source: string, scanJobId: string | null = null) {
     // Facts are model output about code that may contain credentials: redact at the door.
     const file = redactDeep(rawFile);
     const facts = redactDeep(rawFacts);
@@ -74,8 +122,9 @@ export class FactsRepo implements FactsStore {
     await this.g.run(
       `MERGE (p:Project {key: $projectKey})
        MERGE (cf:CodeFile {id: $projectKey + ':' + $file.path})
+       SET cf.hashChangedAt = CASE WHEN cf.hash = $file.hash AND cf.hashChangedAt IS NOT NULL THEN cf.hashChangedAt ELSE $now END
        SET cf.projectKey = $projectKey, cf.path = $file.path, cf.hash = $file.hash, cf.summary = $file.summary,
-           cf.scannedAt = $now, cf.removed = false
+           cf.scannedAt = $now, cf.removed = false, cf.scanVersion = $file.version
        MERGE (cf)-[:IN]->(p)
        WITH cf
        OPTIONAL MATCH (old:Fact {current: true})-[:ABOUT]->(cf) WHERE coalesce(old.origin, '') <> 'you'
@@ -84,11 +133,11 @@ export class FactsRepo implements FactsStore {
        UNWIND $facts AS fx
          CREATE (n:Fact {id: randomUUID(), projectKey: $projectKey, kind: fx.kind, statement: fx.statement, path: fx.path,
                          lines: fx.lines, confidence: fx.confidence, why: fx.why, embedding: fx.embedding, source: $source,
-                         origin: fx.origin, evidence: fx.evidence,
+                         origin: fx.origin, evidence: fx.evidence, checkVersion: fx.checkVersion,
                          relevance: fx.relevance, relevanceBy: CASE WHEN fx.relevance IS NULL THEN null ELSE 'model' END,
                          scanJobId: $scanJobId, fileHash: $file.hash, current: true, createdAt: $now, validFrom: $now})
          CREATE (n)-[:ABOUT]->(cf)`,
-      { projectKey, file, facts: facts.map((fx) => ({ ...fx, ...provenanceOf(fx), relevance: relevanceOf(fx) })), source, now, scanJobId },
+      { projectKey, file: { ...file, version: file.version ?? null }, facts: facts.map((fx) => ({ ...fx, ...provenanceOf(fx), checkVersion: fx.checkVersion ?? null, relevance: relevanceOf(fx) })), source, now, scanJobId },
     );
   }
 
@@ -108,12 +157,13 @@ export class FactsRepo implements FactsStore {
    * Agentic scans see the whole repo at once: close every current fact from `source`
    * in the project, then attach the new ones to their files (or to the project root).
    */
-  async replaceProjectFacts(projectKey: string, rawFacts: EmbeddedFact[], source: string, files: { path: string; hash: string }[], scanJobId: string | null = null) {
+  async replaceProjectFacts(projectKey: string, rawFacts: EmbeddedFact[], source: string, files: ScannedFile[], scanJobId: string | null = null) {
     await this.replaceScopeFacts(projectKey, { prefixes: [''], except: [] }, rawFacts, source, files, scanJobId);
   }
 
   /** One shard of an agentic scan: only the current facts in `scope` are closed (FactsStore.replaceScopeFacts). */
-  async replaceScopeFacts(projectKey: string, scope: FactScope, rawFacts: EmbeddedFact[], source: string, files: { path: string; hash: string }[], scanJobId: string | null = null) {
+  async replaceScopeFacts(projectKey: string, scope: FactScope, rawFacts: EmbeddedFact[], source: string, rawFiles: ScannedFile[], scanJobId: string | null = null) {
+    const files = rawFiles.map((fl) => ({ path: fl.path, hash: fl.hash, version: fl.version ?? null }));
     const facts = redactDeep(rawFacts);
     const now = new Date().toISOString();
     // One transaction: if writing the new facts fails, the old ones stay current and the hashes stay stale,
@@ -128,7 +178,8 @@ export class FactsRepo implements FactsStore {
        WITH p
        UNWIND $files AS fl
          MERGE (cf:CodeFile {id: $projectKey + ':' + fl.path})
-         SET cf.projectKey = $projectKey, cf.path = fl.path, cf.hash = fl.hash, cf.scannedAt = $now, cf.removed = false
+         SET cf.hashChangedAt = CASE WHEN cf.hash = fl.hash AND cf.hashChangedAt IS NOT NULL THEN cf.hashChangedAt ELSE $now END
+         SET cf.projectKey = $projectKey, cf.path = fl.path, cf.hash = fl.hash, cf.scannedAt = $now, cf.removed = false, cf.scanVersion = fl.version
          MERGE (cf)-[:IN]->(p)`,
         { projectKey, files, now },
       ],
@@ -140,11 +191,11 @@ export class FactsRepo implements FactsStore {
          MERGE (cf)-[:IN]->(p)
          CREATE (n:Fact {id: randomUUID(), projectKey: $projectKey, kind: fx.kind, statement: fx.statement, path: fx.path,
                          lines: fx.lines, confidence: fx.confidence, why: fx.why, embedding: fx.embedding, source: $source,
-                         origin: fx.origin, evidence: fx.evidence,
+                         origin: fx.origin, evidence: fx.evidence, checkVersion: fx.checkVersion,
                          relevance: fx.relevance, relevanceBy: CASE WHEN fx.relevance IS NULL THEN null ELSE 'model' END,
                          scanJobId: $scanJobId, fileHash: cf.hash, current: true, createdAt: $now, validFrom: $now})
          CREATE (n)-[:ABOUT]->(cf)`,
-        { projectKey, facts: facts.map((f) => ({ ...f, ...provenanceOf(f), path: f.path || PROJECT_PATH, relevance: relevanceOf(f) })), source, now, scanJobId },
+        { projectKey, facts: facts.map((f) => ({ ...f, ...provenanceOf(f), checkVersion: f.checkVersion ?? null, path: f.path || PROJECT_PATH, relevance: relevanceOf(f) })), source, now, scanJobId },
       ],
     ]);
   }
@@ -177,15 +228,84 @@ export class FactsRepo implements FactsStore {
     return rows.map((r) => r.get('s'));
   }
 
-  async listFacts(q: { projectKey: string; kind?: FactKind; path?: string; limit?: number }): Promise<StoredFact[]> {
+  async listFacts(q: { projectKey: string; kind?: FactKind; path?: string; origin?: FactOrigin; limit?: number; offset?: number }): Promise<StoredFact[]> {
     const rows = await this.g.run(
       `MATCH (x:Fact {projectKey: $projectKey, current: true})
        WHERE ($kind IS NULL OR x.kind = $kind) AND ($path IS NULL OR (x.path = $path AND x.docId IS NULL))
+         AND ($origin IS NULL OR ${ORIGIN_CYPHER} = $origin)
        OPTIONAL MATCH (x)-[:ABOUT]->(cf:CodeFile)
-       RETURN x, cf.summary AS fileSummary ORDER BY x.path, x.createdAt LIMIT $limit`,
-      { projectKey: q.projectKey, kind: q.kind ?? null, path: q.path ?? null, limit: neo4j.int(q.limit ?? 500) },
+       RETURN x, cf.summary AS fileSummary, cf.hashChangedAt AS fileChangedAt ORDER BY x.path, x.createdAt, x.id SKIP $offset LIMIT $limit`,
+      {
+        projectKey: q.projectKey, kind: q.kind ?? null, path: q.path ?? null, origin: q.origin ?? null, manifestWhy: MANIFEST_WHY_RE,
+        offset: neo4j.int(Math.max(0, Math.floor(q.offset ?? 0))), limit: neo4j.int(q.limit ?? 500),
+      },
     );
-    return rows.map((r) => factOf(r.get('x').properties, r.get('fileSummary')));
+    return rows.map((r) => factOf(r.get('x').properties, r.get('fileSummary'), r.get('fileChangedAt')));
+  }
+
+  async factsToRecheck(q: { projectKey: string; version: string; limit: number }): Promise<StoredFact[]> {
+    const rows = await this.g.run(
+      `MATCH (x:Fact {projectKey: $projectKey, current: true})
+       WHERE x.docId IS NULL AND coalesce(x.origin, '') <> 'you' AND coalesce(x.checkVersion, '') <> $version
+       OPTIONAL MATCH (x)-[:ABOUT]->(cf:CodeFile)
+       RETURN x, cf.summary AS fileSummary, cf.hashChangedAt AS fileChangedAt ORDER BY x.path, x.createdAt, x.id LIMIT $limit`,
+      { projectKey: q.projectKey, version: q.version, limit: neo4j.int(Math.max(0, Math.floor(q.limit))) },
+    );
+    return rows.map((r) => factOf(r.get('x').properties, r.get('fileSummary'), r.get('fileChangedAt')));
+  }
+
+  /** Checked again in place: a kept fact keeps its createdAt (when it was read), so its freshness does not move. */
+  async applyFactChecks(version: string, checks: FactCheck[]): Promise<number> {
+    if (!checks.length) return 0;
+    const [r] = await this.g.run(
+      `UNWIND $checks AS c
+       MATCH (x:Fact {id: c.id, current: true})
+       SET x.checkVersion = $version,
+           x.lines = CASE WHEN c.keep THEN c.lines ELSE x.lines END,
+           x.evidence = CASE WHEN c.keep THEN c.evidence ELSE x.evidence END,
+           x.validTo = CASE WHEN c.keep THEN x.validTo ELSE $now END,
+           x.current = c.keep
+       RETURN count(CASE WHEN c.keep THEN null ELSE 1 END) AS closed`,
+      {
+        version, now: new Date().toISOString(),
+        checks: checks.map((c) => ({ id: c.id, keep: c.keep, lines: c.lines ?? null, evidence: c.evidence && FACT_EVIDENCE.includes(c.evidence) ? c.evidence : null })),
+      },
+    );
+    return r ? Number(r.get('closed')) : 0;
+  }
+
+  /** A request is a mark on the file's CodeFile (one with no hash yet when it was never scanned). */
+  async requestFilesScan(projectKey: string, paths: string[]): Promise<number> {
+    const unique = scanRequestPaths(paths);
+    if (!unique.length) return 0;
+    const [r] = await this.g.run(
+      `MERGE (p:Project {key: $projectKey})
+       WITH p
+       UNWIND $asked AS a
+         MERGE (cf:CodeFile {id: $projectKey + ':' + a.path})
+           ON CREATE SET cf.projectKey = $projectKey, cf.path = a.path, cf.removed = false
+         MERGE (cf)-[:IN]->(p)
+         WITH cf, a, cf.scanRequestedAt IS NULL AS fresh
+         SET cf.scanRequestedAt = coalesce(cf.scanRequestedAt, a.at)
+         RETURN count(CASE WHEN fresh THEN 1 END) AS n`,
+      // One millisecond apart, so files asked for in one call keep the order they were named in.
+      { projectKey, asked: requestTimes(unique).map(([path, at]) => ({ path, at })) },
+    );
+    return r ? Number(r.get('n')) : 0;
+  }
+
+  async scanRequests(projectKey: string): Promise<string[]> {
+    const rows = await this.g.run(
+      `MATCH (cf:CodeFile {projectKey: $projectKey}) WHERE cf.scanRequestedAt IS NOT NULL
+       RETURN cf.path AS path ORDER BY cf.scanRequestedAt, cf.path`,
+      { projectKey },
+    );
+    return rows.map((r) => r.get('path'));
+  }
+
+  async clearScanRequests(projectKey: string, paths: string[]): Promise<void> {
+    if (!paths.length) return;
+    await this.g.run(`MATCH (cf:CodeFile {projectKey: $projectKey}) WHERE cf.path IN $paths REMOVE cf.scanRequestedAt`, { projectKey, paths });
   }
 
   async searchFacts(q: { embedding: number[]; projectKey: string; k: number }): Promise<FactHit[]> {
@@ -194,10 +314,10 @@ export class FactsRepo implements FactsStore {
        WITH node, vector.similarity.cosine(node.embedding, $embedding) AS score
        ORDER BY score DESC LIMIT $k
        OPTIONAL MATCH (node)-[:ABOUT]->(cf:CodeFile)
-       RETURN node, score, cf.summary AS fileSummary ORDER BY score DESC`,
+       RETURN node, score, cf.summary AS fileSummary, cf.hashChangedAt AS fileChangedAt ORDER BY score DESC`,
       { embedding: q.embedding, k: neo4j.int(q.k), projectKey: q.projectKey },
     );
-    return rows.map((r) => ({ fact: factOf(r.get('node').properties, r.get('fileSummary')), score: r.get('score') }));
+    return rows.map((r) => ({ fact: factOf(r.get('node').properties, r.get('fileSummary'), r.get('fileChangedAt')), score: r.get('score') }));
   }
 
   async unscoredFacts(q: { projectKeys: string[]; limit: number }): Promise<UnscoredFact[]> {
@@ -342,7 +462,13 @@ export class FactsRepo implements FactsStore {
   }
 }
 
-function factOf(p: Record<string, unknown>, fileSummary: string | null = null): StoredFact {
+/**
+ * A fact's origin in Cypher, as factOrigin reads it: as recorded, else a document's by its docId, a manifest's by the
+ * reason the manifest reader gives (needs $manifestWhy), else a model's.
+ */
+const ORIGIN_CYPHER = `CASE WHEN x.origin IS NOT NULL THEN x.origin WHEN x.docId IS NOT NULL THEN 'document' WHEN coalesce(x.why, '') =~ $manifestWhy THEN 'manifest' ELSE 'model' END`;
+
+function factOf(p: Record<string, unknown>, fileSummary: string | null = null, fileChangedAt: string | null = null): StoredFact {
   return {
     id: p.id as string,
     kind: p.kind as FactKind,
@@ -356,10 +482,12 @@ function factOf(p: Record<string, unknown>, fileSummary: string | null = null): 
     docId: (p.docId as string) ?? null,
     origin: factOrigin({ origin: p.origin as FactOrigin | null, docId: (p.docId as string) ?? null, why: (p.why as string) ?? '' }),
     evidence: (p.evidence as FactEvidence) ?? null,
+    checkVersion: (p.checkVersion as string) ?? null,
     source: p.source as string,
     scanJobId: (p.scanJobId as string) ?? null,
     fileHash: (p.fileHash as string) ?? null,
     fileSummary: fileSummary ?? null,
+    fileChangedAt: fileChangedAt ?? null,
     createdAt: p.createdAt as string,
   };
 }

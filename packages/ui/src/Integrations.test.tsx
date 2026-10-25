@@ -108,13 +108,22 @@ test('Test connection reports the result; Disconnect asks first', async () => {
   expect(await within(gh).findByText(/Disconnected/)).toBeTruthy();
 });
 
-test('a token in .env is shown as set in .env, with no way to replace or disconnect it here', async () => {
+test('a token in .env is shown as set in .env and can be replaced here (a saved token wins), not disconnected', async () => {
   state = view({ github: connected({ envSet: true, savedInApp: false, connection: { state: 'connected', source: 'env', detail: 'Connected as octo (set in .env).', href: '' } }) });
   render(<Integrations />);
   const gh = await card('GitHub');
   expect(within(gh).getByText('set in .env')).toBeTruthy();
   expect(within(gh).queryByRole('button', { name: 'Disconnect' })).toBeNull();
-  expect(within(gh).queryByRole('button', { name: 'Replace token' })).toBeNull();
+  fireEvent.click(within(gh).getByRole('button', { name: 'Replace token' }));
+  expect(within(gh).getByText(/wins over GITHUB_TOKEN in \.env/)).toBeTruthy();
+});
+
+test('a token saved here while .env also sets one can be disconnected, falling back to .env', async () => {
+  state = view({ github: connected({ envSet: true, savedInApp: true }) });
+  render(<Integrations />);
+  const gh = await card('GitHub');
+  expect(within(gh).getByRole('button', { name: 'Disconnect' })).toBeTruthy();
+  expect(within(gh).getByText(/Disconnecting goes back to GITHUB_TOKEN in \.env/)).toBeTruthy();
 });
 
 test('the account shows when it was checked; a token not checked yet says it is checked on its own', async () => {

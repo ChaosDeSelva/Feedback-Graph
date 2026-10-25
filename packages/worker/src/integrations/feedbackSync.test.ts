@@ -1,4 +1,4 @@
-import { IntegrationError, Integrations, type ActivityInput, type ExternalThread, type LinearComment, type PrContext, type WorkSession } from '@fb/core';
+import { IntegrationError, Integrations, type ActivityInput, type ExternalThread, type LinearComment, type LinearTeamIssue, type PrContext, type WorkSession } from '@fb/core';
 import { describe, expect, test } from 'vitest';
 import { authorsCursor, feedbackCursor, findWorkSessions, linkWorkSessions, prThread, syncExternalFeedback, type FeedbackSyncDeps, type SyncProject } from './feedbackSync.ts';
 
@@ -20,7 +20,18 @@ function kv() {
   return { m, getCursor: async (k: string) => m.get(k) ?? null, setCursor: async (k: string, v: string) => void m.set(k, v) };
 }
 
-function setup(o: { env?: Record<string, string>; prs?: () => Promise<PrContext[]>; linear?: () => Promise<LinearComment[]>; sessions?: WorkSession[]; projects?: SyncProject[] } = {}) {
+/** Comments back as the issues they are on, the way fetchLinearIssues answers. */
+function issuesOf(comments: LinearComment[]): LinearTeamIssue[] {
+  const by = new Map<string, LinearTeamIssue>();
+  for (const { issue, ...c } of comments) {
+    const i = by.get(issue.id) ?? { ...issue, updatedAt: c.createdAt, comments: [] };
+    i.comments.push(c);
+    by.set(issue.id, i);
+  }
+  return [...by.values()];
+}
+
+function setup(o: { env?: Record<string, string>; prs?: () => Promise<PrContext[]>; linear?: () => Promise<LinearComment[]>; issues?: () => Promise<LinearTeamIssue[]>; sessions?: WorkSession[]; projects?: SyncProject[] } = {}) {
   const store = kv();
   const integrations = new Integrations(store, o.env ?? { GITHUB_TOKEN: 'gh-token' });
   const threads: ExternalThread[] = [];
@@ -35,7 +46,7 @@ function setup(o: { env?: Record<string, string>; prs?: () => Promise<PrContext[
     cursors: store,
     projects: async () => o.projects ?? [shop, local],
     fetchPrs: async (f) => { fetchCalls.push({ repo: f.repo, since: f.since }); return o.prs ? o.prs() : [pr(7, [{ id: '1', createdAt: '2026-10-22T10:00:00Z', path: 'src/cart.ts' }])]; },
-    fetchLinear: async () => (o.linear ? o.linear() : []),
+    fetchLinearIssues: async () => (o.issues ? o.issues() : issuesOf(o.linear ? await o.linear() : [])),
     activity: { record: async (a) => void activity.push(a) },
     minIntervalMs: 10 * 60_000,
     now: () => NOW,
@@ -152,6 +163,67 @@ describe('syncExternalFeedback', () => {
     expect(t.labels).toHaveLength(20);
     expect(Math.max(...t.labels.map((l) => l.length))).toBeLessThanOrEqual(61);
     expect(s.activity[0].subject).toContain('Linear team Web');
+  });
+});
+
+describe('Linear tickets as context', () => {
+  const ticket = (id: string, comments: LinearTeamIssue['comments'], extra: Partial<LinearTeamIssue> = {}): LinearTeamIssue => ({
+    id, identifier: `ENG-${id}`, title: `Issue ${id}`, url: `https://linear.app/acme/issue/ENG-${id}`, branch: `pat/eng-${id}`,
+    description: `Prices are integers in cents. key ghp_${'a'.repeat(36)}`, state: 'In Progress', priority: 'High', labels: ['billing'], assignee: 'jo',
+    updatedAt: '2026-10-21T00:00:00Z', comments, ...extra,
+  });
+  const said = (id: string, body: string): LinearTeamIssue['comments'][number] => ({ id, author: 'Pat', body, url: `https://linear.app/c/${id}`, createdAt: '2026-10-21T01:00:00Z' });
+
+  function withDocs(issues: LinearTeamIssue[]) {
+    const s = setup({ env: { LINEAR_API_KEY: 'x'.repeat(30) }, issues: async () => issues });
+    const docs: { doc: { projectKey: string; source: string; ref: string; title: string; url: string | null }; chunks: { text: string; embedding: number[] }[] }[] = [];
+    s.deps.docs = { upsertDoc: async (doc, chunks) => { docs.push({ doc, chunks }); return `doc:${doc.projectKey}:${doc.source}:${doc.ref}`; } };
+    s.deps.embed = async (texts) => texts.map((_, i) => [i]);
+    return { ...s, docs };
+  }
+
+  test('every issue of the mapped team updated in the window is stored as a document, with or without comments', async () => {
+    const s = withDocs([ticket('1', [said('a', 'Totals must round half up.')]), ticket('2', [])]);
+    await s.integrations.setLink('shop', { linearTeamId: 'team-1', linearTeamName: 'Web' });
+    expect(await syncExternalFeedback(s.deps)).toEqual({ github: 0, linear: 1 });
+    expect(s.docs.map((d) => d.doc)).toEqual([
+      { projectKey: 'shop', source: 'linear', ref: 'linear:ENG-1', title: 'ENG-1: Issue 1', url: 'https://linear.app/acme/issue/ENG-1' },
+      { projectKey: 'shop', source: 'linear', ref: 'linear:ENG-2', title: 'ENG-2: Issue 2', url: 'https://linear.app/acme/issue/ENG-2' },
+    ]);
+    const text = s.docs[0].chunks.map((c) => c.text).join('\n');
+    expect(text).toContain('Linear ENG-1 (In Progress, High, billing): Issue 1');
+    expect(text).toContain('Totals must round half up.');
+    expect(text).not.toContain('ghp_');
+    expect(s.docs[0].chunks.every((c) => c.embedding.length === 1)).toBe(true);
+    // Only the comments go to the Inbox's classifier, as before; the issue without any is context alone.
+    expect(s.threads.map((t) => t.id)).toEqual(['linear:ENG-1']);
+    expect(s.activity.find((a) => a.kind === 'doc_added')).toMatchObject({ actor: 'linear', projectKey: 'shop', subject: 'synced 2 Linear tickets from Linear team Web', targets: ['doc:shop:linear:linear:ENG-1', 'doc:shop:linear:linear:ENG-2'] });
+  });
+
+  test('a later sync passes the cursor, so only issues updated since are read', async () => {
+    const s = withDocs([ticket('1', [])]);
+    const asked: { since: string }[] = [];
+    s.deps.fetchLinearIssues = async (q) => { asked.push(q); return [ticket('1', [])]; };
+    await s.integrations.setLink('shop', { linearTeamId: 'team-1', linearTeamName: 'Web' });
+    s.store.m.set(feedbackCursor('linear', 'shop'), '2026-10-22T11:00:00Z');
+    await syncExternalFeedback(s.deps);
+    expect(asked.map((a) => a.since)).toEqual(['2026-10-22T11:00:00Z']);
+  });
+
+  test('a failure storing a ticket leaves the cursor, so the next sync reads the window again', async () => {
+    const s = withDocs([ticket('1', [])]);
+    s.deps.embed = async () => { throw new Error('embedder down'); };
+    await s.integrations.setLink('shop', { linearTeamId: 'team-1', linearTeamName: 'Web' });
+    await syncExternalFeedback(s.deps);
+    expect(s.store.m.get(feedbackCursor('linear', 'shop'))).toBeUndefined();
+    expect((await s.integrations.sync('linear')).projects.shop.error).toMatch(/embedder down/);
+  });
+
+  test('without a docs store, tickets are not stored and comments still sync', async () => {
+    const s = setup({ env: { LINEAR_API_KEY: 'x'.repeat(30) }, issues: async () => [ticket('1', [said('a', 'Wrong rounding')])] });
+    await s.integrations.setLink('shop', { linearTeamId: 'team-1', linearTeamName: 'Web' });
+    expect(await syncExternalFeedback(s.deps)).toEqual({ github: 0, linear: 1 });
+    expect(s.activity.some((a) => a.kind === 'doc_added')).toBe(false);
   });
 });
 
@@ -317,15 +389,30 @@ describe('comments synced before their authors were kept', () => {
     expect(s.fetchCalls.map((c) => c.since)).toEqual(['2026-10-08T12:00:00.000Z', '2026-10-22T11:00:00Z']);
   });
 
-  test('pending Inbox items that a skip rule now matches are reported, and left for you to decide', async () => {
+  test('pending Inbox items that a skip rule matches once their authors are known are skipped, with the rule as the reason', async () => {
     const s = setup({ prs: async () => [old()] });
     s.store.m.set(feedbackCursor('github', 'shop'), '2026-10-22T11:00:00Z');
-    const asked: unknown[] = [];
-    s.deps.graph = { ...s.deps.graph, listCandidates: async (f) => { asked.push(f); return [{ id: reply, turnUuid: reply } as never, { id: 'github:acme/shop#9/review_comment/1', turnUuid: 'github:acme/shop#9/review_comment/1' } as never]; } };
+    const skipped: { id: string; rule: string }[] = [];
+    // Both comments are pending in the Inbox; the store holds what the backfill just rewrote.
+    s.deps.graph = {
+      ...s.deps.graph,
+      pendingExternalItems: async (q) => (q.afterId ? [] : s.threads.flatMap((t) => t.items.map((i) => ({ id: i.uuid, turnUuid: i.uuid, projectKey: 'shop', text: i.text, external: i.external })))),
+      skipPendingItem: async (id, r) => { skipped.push({ id, rule: r.rule }); return true; },
+    };
     await syncExternalFeedback(s.deps);
-    expect(asked).toEqual([{ status: 'pending', projectKey: 'shop', limit: 1000 }]);
-    const note = s.activity.find((a) => a.details && 'pendingMatches' in a.details);
-    expect(note).toMatchObject({ kind: 'feedback_synced', projectKey: 'shop', targets: [reply], details: { pendingMatches: { 'pr-author-reply': 1 } } });
-    expect(note?.subject).toMatch(/1 pending Inbox item matches a skip rule/);
+    expect(skipped).toEqual([{ id: reply, rule: 'pr-author-reply' }]);
+    const note = s.activity.find((a) => a.kind === 'comments_skipped');
+    expect(note).toMatchObject({ projectKey: 'shop', targets: [reply], details: { rules: { 'pr-author-reply': 1 }, pending: 1 } });
+    expect(note?.why).toMatch(/author details/);
+  });
+
+  test('an incremental sync does not look at the pending items again', async () => {
+    const s = setup({ prs: async () => [old()] });
+    s.store.m.set(feedbackCursor('github', 'shop'), '2026-10-22T11:00:00Z');
+    s.store.m.set(authorsCursor('shop'), '2026-10-20T11:00:00Z');
+    let asked = 0;
+    s.deps.graph = { ...s.deps.graph, pendingExternalItems: async () => { asked++; return []; }, skipPendingItem: async () => true };
+    await syncExternalFeedback(s.deps);
+    expect(asked).toBe(0);
   });
 });

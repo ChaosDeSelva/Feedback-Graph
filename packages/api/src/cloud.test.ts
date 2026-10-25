@@ -4,7 +4,7 @@ import { createApp, type ApiRepo } from './app.ts';
 import type { CloudDeps } from './cloud.ts';
 
 const TOKEN = `fgc_pat_0123456789abcdef_${'Q'.repeat(43)}`;
-const cloud: CloudConfig = { url: 'https://cloud.example.com', token: TOKEN, intervalMinutes: 60, projects: [], suggestions: false };
+const cloud: CloudConfig = { url: 'https://cloud.example.com', token: TOKEN, intervalMinutes: 60, projects: [], suggestions: false, machine: null };
 const repo = { listCandidates: async () => [], candidateDetail: async () => null, decide: async () => {}, stats: async () => [] } as ApiRepo;
 
 const bundle = (key: string): ExportBundle => ({

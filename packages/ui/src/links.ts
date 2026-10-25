@@ -37,6 +37,8 @@ export function hashNewChat(): { project: string; q: string } | null {
   return { project: p.get('project') ?? '', q: (p.get('q') ?? '').trim() };
 }
 
+/** One project on the Projects page (`#projects/<key>`). */
+export const projectHref = (project: string) => `#projects/${encodeURIComponent(project)}`;
 /** A file's module panel on the Projects page (`#projects/<key>/<path>`, the path encoded as one segment). */
 export const moduleHref = (project: string, path: string) => `#projects/${encodeURIComponent(project)}/${encodeURIComponent(path)}`;
 
@@ -48,5 +50,23 @@ export function hashModule(): { project: string; path: string | null } | null {
     return { project: decodeURIComponent(key), path: path ? decodeURIComponent(path) : null };
   } catch {
     return null;
+  }
+}
+
+/**
+ * Where an Ask source opens: code and facts on their file's module panel, a lesson on the Lessons page, a session on
+ * Sessions, a linked project or a document on its project's page (where its documents are listed); a web link as itself.
+ * A miss has no page of its own: null.
+ */
+export function sourceHref(project: string, s: { kind: string; ref: string }): string | null {
+  const file = s.ref.replace(/:\d+(-\d+)?$/, '');
+  switch (s.kind) {
+    case 'code':
+    case 'fact': return moduleHref(project, file);
+    case 'lesson': return lessonHref(s.ref);
+    case 'session': return sessionHref(s.ref);
+    case 'linked': return projectHref(s.ref);
+    case 'doc': return /^https?:\/\//.test(s.ref) ? s.ref : projectHref(project);
+    default: return null;
   }
 }

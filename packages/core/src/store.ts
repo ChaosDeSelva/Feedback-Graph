@@ -14,24 +14,28 @@
  * - Vectors of a different length than the query are skipped by searches, never an error.
  */
 import type { Config } from './config.ts';
-import type { ActivityInput, Activity, ActivityKind, Candidate, Classification, Commit, FactKind, LessonCheck, LessonStatus, Lesson, ParsedSession, PostMortem, PostMortemInput, Project, ProjectSummary, RelevanceBy, ScanJob, ScanStatus, WorkerStatus } from './types.ts';
+import type { ActivityInput, Activity, ActivityKind, Candidate, Classification, Commit, FactKind, LessonCheck, LessonCheckName, LessonFrom, LessonStatus, Lesson, ParsedSession, PendingExternalItem, PendingSessionItem, PostMortem, PostMortemInput, Project, ProjectSummary, RelevanceBy, ScanJob, ScanStatus, WorkerStatus, FactEvidence, FactOrigin } from './types.ts';
 import type { ProjectScope, ProjectSelection } from './scope.ts';
-import type { CandidateDetail, CandidateFilter, ClassifiableTurn, StatsRow } from './graph/repo.ts';
-import type { LessonDetail, LessonHit, LessonInput, LessonPatch, RelatedMiss } from './graph/knowledge.ts';
+import type { CallsAfter, CandidateDetail, CandidateFilter, ClassifiableTurn, StatsRow } from './graph/repo.ts';
+import type { LessonDetail, LessonHit, LessonInput, LessonPatch, RelatedMiss, UnsortedMiss } from './graph/knowledge.ts';
 import type { EmbeddedFact, FactHit, RelevanceUpdate, StoredFact, UnscoredFact } from './graph/facts.ts';
-import type { DocHit, DocInput, DocSummary, DocToRead, UpsertDocOpts } from './graph/docs.ts';
+import type { DocHit, DocInput, DocLink, DocSummary, DocToRead, UpsertDocOpts } from './graph/docs.ts';
 import type { TaskImage } from './llm/providers.ts';
 import type { DetectedLink, LinkPatch, ProjectLink } from './graph/links.ts';
 import type { EvidenceGraph, PatternReport } from './graph/insights.ts';
 import type { ExportBundle } from './graph/portability.ts';
 import type { CandidateSnapshot } from './graph/selection.ts';
-import type { CodeMapMeta, CodeMapStats, CodeMapWrite, Hotspot, HotspotOpts, Impact, MapGraph, ModuleContext, SessionFile, StoredCodeMap } from './codegraph.ts';
+import type { CodeMapMeta, CodeMapStats, CodeMapWrite, Hotspot, HotspotOpts, Impact, MapGraph, ModuleContext, OutsideFile, SessionFile, StoredCodeMap } from './codegraph.ts';
 import type { ExternalRef, ExternalSource, SessionSource, HumanTurn, SessionDetail, SessionListItem, SessionState } from './types.ts';
 import type { SessionCursor, SummaryWork, SummaryWorkQuery, SummaryWrite } from './sessions.ts';
 import type { ChatAnswer, ChatConversation, ChatJob, ChatPack, ChatProvider, ChatThread } from './chat.ts';
 
 /** The paths a scope replace covers (FactsStore.replaceScopeFacts): under one of `prefixes`, under none of `except`. */
 export type FactScope = { prefixes: string[]; except: string[] };
+/** A file a scan read: its hash, and the scanner version that read it (absent: not recorded, read as an old scanner). */
+export type ScannedFile = { path: string; hash: string; version?: string | null };
+/** One fact checked again (FactsStore.applyFactChecks): kept with these lines and evidence, or closed. */
+export type FactCheck = { id: string; keep: boolean; lines: string | null; evidence: FactEvidence | null };
 /** What updateScanJob changes: only the keys given (a key set to null clears it). */
 export type ScanJobPatch = Partial<Pick<ScanJob, 'filesScanned' | 'factsAdded' | 'error' | 'shards'>> & { status?: ScanStatus };
 
@@ -79,6 +83,8 @@ export interface GraphStore {
   fillProjectFolder(key: string, folder: { repoPath: string; remote: string | null }): Promise<void>;
   unclassifiedTurns(limit: number, projectKeys?: string[], excludeKeys?: string[]): Promise<ClassifiableTurn[]>;
   recordClassifyFailure(turnUuid: string): Promise<void>;
+  /** What the agent did after this turn (later turns' tool calls, then those after the last turn); null: no such turn. */
+  callsAfter(turnUuid: string): Promise<CallsAfter | null>;
   /** Unlabelled turns skipped for good after MAX_CLASSIFY_ATTEMPTS failed classifications. */
   givenUpTurns(): Promise<number>;
   /** Give those turns their attempts back so the classifier tries them again; returns how many. */
@@ -92,6 +98,33 @@ export interface GraphStore {
   saveClassification(turnUuid: string, c: Classification, makeCandidate: boolean): Promise<string | null>;
   listCandidates(f?: CandidateFilter): Promise<Candidate[]>;
   candidateDetail(id: string): Promise<CandidateDetail | null>;
+  /**
+   * Pending Inbox items synced from GitHub or Linear, with the comment's words and details, by id after `afterId`: what
+   * the skip rules look at again when they change (worker integrations/pendingSkips.ts). Items whose words were pruned
+   * are left out.
+   */
+  pendingExternalItems(q: { limit: number; afterId?: string | null }): Promise<PendingExternalItem[]>;
+  /**
+   * Pending Inbox items the detector flagged in sessions (no synced comments, no agent reports), by id after `afterId`:
+   * what the detect rules look at again when they change (worker detect/pendingInstructions.ts). Pruned words: left out.
+   */
+  pendingSessionItems(q: { limit: number; afterId?: string | null }): Promise<PendingSessionItem[]>;
+  /**
+   * A skip rule now matches a pending item: it is rejected, decided by `by` with `note`, and its turn gets the
+   * `skip:<rule>` signal a comment skipped before the classifier has. Only while it is still pending, so a decision
+   * made in the meantime stands; false when it was not pending (or is gone).
+   */
+  skipPendingItem(id: string, s: { rule: string; note: string; by: string }): Promise<boolean>;
+  /**
+   * Session items a rule rejected (decided by `by`, their turn carrying `skip:<rule>`), by id after `afterId`: what a
+   * changed rule looks at again. Never an item someone else decided.
+   */
+  ruleSkippedItems(q: { rule: string; by: string; limit: number; afterId?: string | null }): Promise<PendingSessionItem[]>;
+  /**
+   * Undo skipPendingItem: back to pending with no decision, and the `skip:<rule>` signal gone. Only while it is still
+   * rejected by `by`, so a decision made since stands; false otherwise.
+   */
+  reopenRuleSkippedItem(id: string, s: { rule: string; by: string }): Promise<boolean>;
   /** by: who decided ('you', or 'operator:<name>' for an agent with the operator token); default 'you'. */
   decide(id: string, status: 'confirmed' | 'rejected', note: string | null, by?: string): Promise<void>;
   /** keepUnsummarized: only turns a session summary already covers lose their text (summaries stay either way). */
@@ -113,6 +146,21 @@ export interface GraphStore {
   stats(): Promise<StatsRow[]>;
 }
 
+/**
+ * Which lessons listLessons returns. projectKeys: see KnowledgeStore.listLessons. flag: only those whose checks hold it.
+ * from: only those whose feedback came from there (Lesson.from).
+ */
+export type LessonFilter = {
+  status?: LessonStatus;
+  projectKey?: string;
+  projectKeys?: string[];
+  limit?: number;
+  flag?: LessonCheckName;
+  from?: LessonFrom;
+};
+
+export type SimilarLesson = { id: string; cosine: number; status: LessonStatus; createdAt: string };
+
 /** Post-mortems (feedback, miss, cause, lesson, context items, fix commits), lessons and their search. */
 export interface KnowledgeStore {
   feedbackNeedingPostmortem(limit: number, now?: Date): Promise<PostMortemInput[]>;
@@ -121,19 +169,43 @@ export interface KnowledgeStore {
   recordPostmortemFailure(feedbackId: string, error: string, now?: Date): Promise<{ attempts: number; retryAt: string | null }>;
   retryPostmortem(feedbackId: string): Promise<boolean>;
   savePostmortem(feedbackId: string, raw: PostMortem, embeddings: { miss: number[]; lesson: number[] }): Promise<void>;
+  /** Misses with no subject, by id after `afterId`: what the process-miss rule looks at again when it changes. */
+  missesWithoutSubject(q: { limit: number; afterId?: string | null }): Promise<UnsortedMiss[]>;
+  /** The process misses, the same way: what a changed process-miss rule looks at again. */
+  processMisses(q: { limit: number; afterId?: string | null }): Promise<UnsortedMiss[]>;
+  /**
+   * Mark a miss as a process miss (tied to no file); false when it is gone or already has a subject. null undoes it
+   * (back on the files its session edited); false when it was not a process miss.
+   */
+  setMissSubject(missId: string, subject: 'process' | null): Promise<boolean>;
   /**
    * projectKeys (here and in searchLessons): only lessons learned in these projects (a global lesson by its origin);
    * lessons with no project at all stay. An empty list leaves only those.
    */
-  listLessons(f: { status?: LessonStatus; projectKey?: string; projectKeys?: string[]; limit?: number }): Promise<Lesson[]>;
+  listLessons(f: LessonFilter): Promise<Lesson[]>;
   lessonDetail(id: string): Promise<LessonDetail | null>;
   /**
    * `by`: who decides, when the patch sets a status ('you' when unset; `operator:<name>` for the operator token).
    * `note`: why (kept as decisionNote); a status set without one clears the old note.
    */
   updateLesson(id: string, patch: LessonPatch, o: { reembed?: number[]; by?: string; note?: string }): Promise<{ unscoped: boolean }>;
-  /** Store what the lesson check found (redacted), replacing earlier checks; nothing else changes. False: no such lesson. */
-  setLessonChecks(id: string, checks: LessonCheck[]): Promise<boolean>;
+  /**
+   * Store what the lesson check found (redacted), replacing earlier checks, with the checks' version (default
+   * LESSON_CHECKS_VERSION); nothing else changes. False: no such lesson. savePostmortem stamps the current version too.
+   */
+  setLessonChecks(id: string, checks: LessonCheck[], version?: number): Promise<boolean>;
+  /**
+   * Proposed and approved lessons whose checks are older than `version` (or were never made), oldest first: what the
+   * worker re-checks.
+   */
+  staleLessonChecks?(version: number, limit: number): Promise<Lesson[]>;
+  /** Mark every proposed and approved lesson's checks as old, so the worker re-checks them. Returns how many. */
+  requestLessonRecheck?(): Promise<number>;
+  /**
+   * The lessons nearest this one by their stored embeddings (true cosine, -1..1), among those learned in the same
+   * project (or, for a lesson with no project, those with none), any status, best first. [] when it has no embedding.
+   */
+  similarLessons?(id: string, k: number): Promise<SimilarLesson[]>;
   searchLessons(q: { embedding: number[]; projectKey: string | null; k: number; status?: LessonStatus; projectKeys?: string[] }): Promise<LessonHit[]>;
   relatedMisses(q: { embedding: number[]; projectKey: string | null; k: number }): Promise<RelatedMiss[]>;
   /**
@@ -149,23 +221,62 @@ export interface KnowledgeStore {
 /** Code facts from scans, the files they are about, scan jobs, and the per-project summary. */
 export interface FactsStore {
   fileHashes(projectKey: string): Promise<Map<string, string>>;
-  saveFileFacts(projectKey: string, rawFile: { path: string; hash: string; summary: string }, rawFacts: EmbeddedFact[], source: string, scanJobId?: string | null): Promise<void>;
+  /**
+   * The scanner version (prompt and reader) that last read each scanned file, by path; null for a file scanned before
+   * versions were recorded. A file an older scanner read is rescanned even when its hash is unchanged.
+   */
+  fileScanVersions(projectKey: string): Promise<Map<string, string | null>>;
+  /**
+   * Per project, the scanned files (as fileScanVersions lists them) last read by a scanner other than `version`, null
+   * included: the next scan you start reads them again. Projects with none are left out.
+   */
+  olderScannerFiles(version: string): Promise<Map<string, number>>;
+  /**
+   * A file's facts replaced. `version`: the scanner version that read it (fileScanVersions). The file's hashChangedAt
+   * moves only when its hash differs from the stored one.
+   */
+  saveFileFacts(projectKey: string, rawFile: ScannedFile & { summary: string }, rawFacts: EmbeddedFact[], source: string, scanJobId?: string | null): Promise<void>;
   markFilesRemoved(projectKey: string, paths: string[]): Promise<void>;
   /** All or nothing: a failure part way leaves the old facts current and the old hashes in place. */
-  replaceProjectFacts(projectKey: string, rawFacts: EmbeddedFact[], source: string, files: { path: string; hash: string }[], scanJobId?: string | null): Promise<void>;
+  replaceProjectFacts(projectKey: string, rawFacts: EmbeddedFact[], source: string, files: ScannedFile[], scanJobId?: string | null): Promise<void>;
   /**
    * replaceProjectFacts for one shard of an agentic scan: closes only the current code facts whose path is under one
    * of `scope.prefixes` ('' is every path, '.' included) and under none of `scope.except` (a path is under a prefix
    * when it is the prefix or starts with it plus '/'). Documents' facts are never closed. All or nothing, as above.
    */
-  replaceScopeFacts(projectKey: string, scope: FactScope, rawFacts: EmbeddedFact[], source: string, files: { path: string; hash: string }[], scanJobId?: string | null): Promise<void>;
+  replaceScopeFacts(projectKey: string, scope: FactScope, rawFacts: EmbeddedFact[], source: string, files: ScannedFile[], scanJobId?: string | null): Promise<void>;
+  /**
+   * Current scan facts (not a document's, not yours) whose citations were last checked by a rule other than `version`
+   * (checkVersion; null on facts from before it was recorded), oldest path first: the rule changed, so they are
+   * checked again (FactsStore.applyFactChecks).
+   */
+  factsToRecheck(q: { projectKey: string; version: string; limit: number }): Promise<StoredFact[]>;
+  /**
+   * The result of checking facts again under `version`: a fact not kept is closed (no longer served); a kept one gets
+   * its lines and evidence as given, in place (its createdAt, the time it was read, does not move). Every one is
+   * stamped with `version`. Facts that are no longer current are left alone. Returns how many were closed.
+   */
+  applyFactChecks(version: string, checks: FactCheck[]): Promise<number>;
+  /**
+   * Ask for these files to be read at the front of the next scan of the project (an agent named them and they have no
+   * facts). A file already asked for keeps its place. Returns how many were not already asked for.
+   */
+  requestFilesScan(projectKey: string, paths: string[]): Promise<number>;
+  /** Files asked for by requestFilesScan and not read since, oldest request first. */
+  scanRequests(projectKey: string): Promise<string[]>;
+  /** The scan read these (or found they are gone): they are no longer asked for. */
+  clearScanRequests(projectKey: string, paths: string[]): Promise<void>;
   /**
    * A fact you wrote (origin 'you'; source and relevanceBy are `by`): filed under the project, not a code file, so no
    * scan closes or replaces it, and it never counts as a model's in currentSources. Redacted here.
    */
   addOwnerFact(projectKey: string, rawFact: EmbeddedFact, by: RelevanceBy): Promise<StoredFact>;
   currentSources(projectKey: string): Promise<string[]>;
-  listFacts(q: { projectKey: string; kind?: FactKind; path?: string; limit?: number }): Promise<StoredFact[]>;
+  /**
+   * Current facts in path order. `origin`: only those from there (factOrigin, so older facts count by what they
+   * look like). `offset`: skip that many first (paging, with `limit`, default 500).
+   */
+  listFacts(q: { projectKey: string; kind?: FactKind; path?: string; origin?: FactOrigin; limit?: number; offset?: number }): Promise<StoredFact[]>;
   searchFacts(q: { embedding: number[]; projectKey: string; k: number }): Promise<FactHit[]>;
   /** Current facts of these projects that have no relevance yet, oldest path first. */
   unscoredFacts(q: { projectKeys: string[]; limit: number }): Promise<UnscoredFact[]>;
@@ -218,6 +329,11 @@ export interface DocsStore {
   listDocs(projectKey: string): Promise<DocSummary[]>;
   deleteDoc(id: string): Promise<boolean>;
   searchDocs(q: { embedding: number[]; projectKey: string; k: number }): Promise<DocHit[]>;
+  /**
+   * Pull requests and the Linear tickets they name, from either end: for a pull request's document, the project's
+   * tickets it names; for a ticket's, the project's pull requests that name it. Ordered by title.
+   */
+  linkedDocs(q: { projectKey: string; docIds: string[] }): Promise<DocLink[]>;
   getCursor(key: string): Promise<string | null>;
   setCursor(key: string, value: string): Promise<void>;
 }
@@ -240,8 +356,14 @@ export interface LinksStore {
 /** The provenance log: append-only, newest first. */
 export interface ActivityStore {
   record(a: ActivityInput): Promise<void>;
-  /** projectKeys: entries of other projects are left out; entries with no project stay. */
-  list(q: { projectKey?: string; projectKeys?: string[]; kind?: ActivityKind; target?: string; limit?: number }): Promise<Activity[]>;
+  /**
+   * projectKeys: entries of other projects are left out; entries with no project stay. maxDetailBytes: details
+   * bigger than this (as stored) are left out of the rows (`details: {}`, `detailsOmitted: true`), so a page of the log
+   * does not carry a scan's whole report; get() has them.
+   */
+  list(q: { projectKey?: string; projectKeys?: string[]; kind?: ActivityKind; target?: string; limit?: number; maxDetailBytes?: number }): Promise<Activity[]>;
+  /** One entry, details and all; null when there is none. */
+  get(id: string): Promise<Activity | null>;
 }
 
 /** Read-only views: one project's evidence graph, and patterns across misses. */
@@ -303,7 +425,8 @@ export interface CodeGraphStore {
   requestCodeMapRebuild(projectKey: string): Promise<boolean>;
   /**
    * Delete up to `limit` CodeFile records that no map holds and nothing needs: gone from the repo (removed by a scan)
-   * or of no project, with no fact (current or closed) and no session touch. A scanned file still in the repo stays:
+   * or of no project or never scanned (a file a session touched once), with no fact (current or closed) and no
+   * session touch. A scanned file still in the repo stays:
    * its hash is what lets the next scan skip it. Returns how many went.
    */
   purgeOrphanCodeFiles(limit: number): Promise<number>;
@@ -328,6 +451,8 @@ export interface CodeGraphStore {
   mapGraph(projectKey: string, opts: HotspotOpts & { limit: number }): Promise<MapGraph>;
   /** Approved lessons (global ones included) whose paths cover one of these files or whose miss edited one. */
   lessonsForPaths(projectKey: string, paths: string[]): Promise<{ lesson: Lesson; paths: string[] }[]>;
+  /** Of these paths, the files past the cap (in the import index, not the map), with their importers and tests. */
+  outsideMap(projectKey: string, paths: string[]): Promise<OutsideFile[]>;
 }
 
 /**

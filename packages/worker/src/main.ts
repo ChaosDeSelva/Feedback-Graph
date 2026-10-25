@@ -1,8 +1,8 @@
 import { lstat, readdir, readFile, writeFile } from 'node:fs/promises';
 import { basename, dirname, join } from 'node:path';
 import {
-  ConfigError, fetchPullRequestContext, projectFolders, refreshLayout, relOfKey, killRunningCommands, loadConfig, makeProvider, ollamaEmbed, projectScope, providerUnavailableReason, ProviderUnavailableError, redactSecrets, runCloudSync, syncProjects,
-  credentialFile, fetchLinearComments, Integrations, searchLinearIssues, selectionNote, storedSyncMemory, touchedAround, VERSION, withHealth, type KnowledgeStore, type LlmProvider, type ModelJob, type ProjectScope, type ScanJob, type SyncMemory, type WorkerStatus,
+  ConfigError, fetchPullRequestContext, projectFolders, refreshLayout, killRunningCommands, loadConfig, makeProvider, ollamaEmbed, projectScope, providerUnavailableReason, ProviderUnavailableError, redactSecrets, runCloudSync, syncProjects,
+  credentialFile, fetchLinearIssues, Integrations, searchLinearIssues, selectionNote, storedSyncMemory, touchedAround, VERSION, withHealth, type KnowledgeStore, type LlmProvider, type ModelJob, type ProjectScope, type ScanJob, type SyncMemory, type WorkerStatus,
 } from '@fb/core';
 import { openStore } from '@fb/store-postgres';
 import { answerTurn } from './chat/answer.ts';
@@ -16,24 +16,29 @@ import { codexSessionFiles } from './ingest/codex.ts';
 import { cachedRemote, commitsInWindow, projectRemote, worktreeGitArgs } from './ingest/git.ts';
 import { readLines } from './ingest/lines.ts';
 import { buildCandidates } from './projects/candidates.ts';
+import { containerFolders } from './projects/folders.ts';
 import { importMemories, memoryProjectKey } from './memory/memory.ts';
 import { forgetDeleted } from './forget.ts';
 import { loadStandingContext, memoryDirFor, runPostMortem } from './postmortem/postmortem.ts';
 import { huntContext } from './postmortem/hunt.ts';
 import { syncGithub } from './integrations/githubSync.ts';
 import { githubTarget, syncExternalFeedback, type SyncProject } from './integrations/feedbackSync.ts';
+import { skipPendingOnRulesChange } from './integrations/pendingSkips.ts';
+import { resolvePendingInstructions } from './detect/pendingInstructions.ts';
+import { sortOldMisses } from './postmortem/subjects.ts';
 import { attachWorkSession } from './postmortem/work.ts';
 import { repoHas } from './postmortem/paths.ts';
-import { recheckProposedLessons } from './postmortem/recheck.ts';
+import { recheckLessons } from './postmortem/recheck.ts';
 import { runPostmortems } from './postmortem/step.ts';
 import { ScanRunner } from './scan/runner.ts';
+import { recheckFacts } from './scan/recheck.ts';
 import { hasCodeFiles, runScan } from './scan/scan.ts';
 import { scoreFacts, ScoringPacer } from './relevance/score.ts';
 import { runLinkDetection } from './links/stage.ts';
 import { readOneDoc } from './docs/read.ts';
 import { SummarizeStage } from './summarize/stage.ts';
 import { FileState } from './state.ts';
-import { healthSince, StageTracker } from './progress.ts';
+import { cycleProgressed, healthSince, StageTracker } from './progress.ts';
 
 const log = (msg: string, extra: object = {}) => console.log(JSON.stringify({ ts: new Date().toISOString(), msg, ...extra }));
 
@@ -52,6 +57,8 @@ function provider(job: string, spec: string, why?: (reason: string) => void): Ll
 
 /** Providers that explore the repo themselves (LlmProvider.agentic): their scans run one at a time. */
 const AGENTIC_SPEC = /^(claude-cli|codex-cli)(:|$)/;
+/** GitHub review comments read per scan for the files they are on (scan order hotspots). */
+const PR_PATHS_LIMIT = 500;
 
 /** Claude Code transcripts sit one level down: <transcripts>/<encoded-project>/<session>.jsonl. Links are not followed. */
 async function listTranscripts(dir: string): Promise<FileInfo[]> {
@@ -88,8 +95,16 @@ async function main() {
   const { graph: repo, knowledge, facts, activity, docs, selection } = store;
   await facts.requeueStaleScans();
   await docs.requeueStaleDocs();
-  // Lessons proposed before their checks were stored get them once (flags only; a failure waits for the next start).
-  await recheckProposedLessons({ k: knowledge, activity, log }).catch((err) => log('lesson re-check failed', { error: String(err) }));
+  // Lessons whose checks are older than the current ones (or that `fg lessons recheck` marked) get today's checks: flags
+  // only, logged in Activity. At start, then each round (a cheap query when there is nothing to do); a failure waits.
+  const recheckOld = () =>
+    recheckLessons({
+      k: knowledge, activity, log,
+      // Lesson paths are checked against the repository as mounted here, under the container side of the roots (the
+      // stored repoPath is the host's, not there in Docker); a project under no root is not judged (repoHas).
+      repoPaths: async () => new Map((await containerFolders((await facts.listProjects()).map((p) => p.key), config.roots)).map((p) => [p.key, p.repoPath])),
+    }).catch((err) => log('lesson re-check failed', { error: String(err) }));
+  await recheckOld();
 
   const transcripts = config.transcriptsDir;
   const roots = config.roots;
@@ -299,19 +314,15 @@ async function main() {
   };
 
   /** The folders of the selected projects, under the first root that has them (plain directories only, nested repos too). */
-  async function selectedFolders(): Promise<{ key: string; repoPath: string }[]> {
-    const out: { key: string; repoPath: string }[] = [];
-    for (const key of scope.projects) {
-      for (const r of roots) {
-        const repoPath = join(r.container, relOfKey(key, r));
-        if ((await lstat(repoPath).catch(() => null))?.isDirectory()) {
-          out.push({ key, repoPath });
-          break;
-        }
-      }
-    }
-    return out;
+  function selectedFolders(): Promise<{ key: string; repoPath: string }[]> {
+    return containerFolders(scope.projects, roots);
   }
+
+  // Facts checked by an older citation rule (AGENTS.md citations, wrong lines) are checked again once against their
+  // repo, beside startup (never awaited); what changed is in Activity. A failure waits for the next start.
+  void recheckFacts({ facts, projects: selectedFolders, maxBytes: config.scanMaxBytes, activity, log })
+    .then((r) => r.checked && log('facts rechecked', r))
+    .catch((err) => log('fact recheck failed', { error: redactSecrets(String(err)) }));
 
   // The code map of each selected project, kept current beside ingest (never awaited by it).
   const mapStage = new MapStage({
@@ -420,7 +431,10 @@ async function main() {
     log('scan started', { project: job.projectKey, provider: llm.id });
     let unavailable: string | null = null;
     const touched = (key: string) => store.codegraph.editedPaths(key, EDITED_PATHS_LIMIT);
-    const r = await runScan(job, { facts, llm, embed, maxBytes: config.scanMaxBytes, maxFiles: config.scanMaxFiles, touched, log, activity }).catch((err) => {
+    // The files review comments are on: where reviewers found something to say, so scanned early.
+    const prPaths = async (key: string) =>
+      [...new Set((await repo.listCandidates({ projectKey: key, source: 'github', limit: PR_PATHS_LIMIT })).map((c) => c.external?.path).filter((p): p is string => !!p))];
+    const r = await runScan(job, { facts, llm, embed, maxBytes: config.scanMaxBytes, maxFiles: config.scanMaxFiles, touched, prPaths, log, activity }).catch((err) => {
       unavailable = providerUnavailableReason(err);
       if (unavailable) log('scan model unavailable, the scan stays queued', { project: job.projectKey, reason: unavailable });
       else log('scan failed', { project: job.projectKey, error: redactSecrets(String(err)) });
@@ -489,14 +503,18 @@ async function main() {
       botLogins: config.github.botLogins,
       agentLogins: config.github.agentLogins,
       fetchPrs: fetchPullRequestContext,
-      fetchLinear: fetchLinearComments,
+      fetchLinearIssues,
+      docs,
+      embed,
       activity,
       minIntervalMs: config.integrationSyncMinutes * 60_000,
       log,
     });
     if (r.github || r.linear) log('comments synced', r);
   }
-  log('integrations', { github: integrations.envSet('github') ? 'env' : 'settings', linear: integrations.envSet('linear') ? 'env' : 'settings', overrides: [...config.github.repos.keys()], everyMinutes: config.integrationSyncMinutes });
+  // Where each token is read from now (one saved in Settings wins over .env); it is read again every cycle.
+  const tokenFrom = async (k: 'github' | 'linear') => (await integrations.credential(k))?.source ?? 'none';
+  log('integrations', { github: await tokenFrom('github'), linear: await tokenFrom('linear'), overrides: [...config.github.repos.keys()], everyMinutes: config.integrationSyncMinutes });
 
   // Feedback Graph Cloud: off (and nothing is sent) unless CLOUD_URL and CLOUD_TOKEN are set.
   const cloud = config.cloud;
@@ -597,6 +615,20 @@ async function main() {
     }
   }
 
+  // A skip rule that changed (an upgrade, or new GITHUB_BOT_LOGINS / GITHUB_AGENT_LOGINS) runs once over what is already
+  // pending in the Inbox. A failure is logged and tried again at the next start.
+  await skipPendingOnRulesChange({ graph: repo, cursors: docs, activity, botLogins: config.github.botLogins, agentLogins: config.github.agentLogins, log })
+    .then((n) => { if (n !== null) log('skip rules applied to pending Inbox items', { skipped: n }); })
+    .catch((err) => log('skip rules over pending Inbox items failed', { error: redactSecrets(String(err)) }));
+  // The same for the instruction rule ("don't push a PR yet" is not pushback) and the process-miss rule (a miss about
+  // branches or pull requests is on no file): each runs once per version over what was stored before it.
+  await resolvePendingInstructions({ graph: repo, cursors: docs, activity, log })
+    .then((n) => { if (n !== null) log('instruction rule applied to pending Inbox items', n); })
+    .catch((err) => log('instruction rule over pending Inbox items failed', { error: redactSecrets(String(err)) }));
+  await sortOldMisses({ knowledge, cursors: docs, activity, log })
+    .then((n) => { if (n !== null) log('process-miss rule applied to past misses', n); })
+    .catch((err) => log('process-miss rule over past misses failed', { error: redactSecrets(String(err)) }));
+
   while (!stopping) {
     try {
       await refreshScope();
@@ -612,6 +644,7 @@ async function main() {
       const imported = await importMemories(memDeps);
       if (imported) log('memory lessons imported', { imported });
       await retention();
+      await recheckOld();
       // Keep going without sleeping while there is still work: backfill, post-mortems, scans.
       let progressed;
       do {
@@ -636,8 +669,9 @@ async function main() {
         // Last in line: only when this round had nothing else to do.
         const scored = r.turnsClassified > 0 || pm.done > 0 || docRead ? 0 : await scoreSome();
         // Failures back off on their own schedule; only real progress keeps the loop from sleeping. Scans are not
-        // counted: they run beside the loop and refill their own slots as they finish.
-        progressed = r.turnsClassified > 0 || pm.done > 0 || docRead || scored > 0;
+        // counted: they run beside the loop and refill their own slots as they finish. Nor is the relevance backfill.
+        progressed = cycleProgressed({ turnsClassified: r.turnsClassified, postmortems: pm.done, docRead: !!docRead, scored });
+        if (scored) log('relevance backfill', { scored });
       } while (progressed && !stopping);
     } catch (err) {
       status.lastError = redactSecrets(String(err)).slice(0, 500);

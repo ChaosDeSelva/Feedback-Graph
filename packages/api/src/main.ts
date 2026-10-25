@@ -104,6 +104,8 @@ const contextDeps: ContextDeps = {
   servesGlobal: (key: string) => !config.excludeProjects.includes(key),
   exists: existsSync,
   fileHash: hashRepoFile,
+  // Files an agent named that have no facts yet go to the front of the project's next scan.
+  requestScan: (key: string, paths: string[]) => facts.requestFilesScan(key, paths),
   aliasOf: (key: string) => store.graph.projectByAlias(key),
   codegraph: store.codegraph,
   sessions: store.sessions,

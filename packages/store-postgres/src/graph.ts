@@ -8,11 +8,14 @@ import {
   postmortemState,
   redactSecrets,
   sessionWork,
+  trailingToolCalls,
   type Candidate,
   type CandidateDetail,
   type CandidateFilter,
   type CandidateStatus,
+  type CallsAfter,
   type ClassifiableTurn,
+  type ToolCall,
   type ExternalThread,
   type SessionSource,
   type WorkSession,
@@ -21,6 +24,8 @@ import {
   type GraphStore,
   type HumanTurn,
   type ParsedSession,
+  type PendingExternalItem,
+  type PendingSessionItem,
   type Project,
   type StatsRow,
   type WorkerStatus,
@@ -75,20 +80,20 @@ export class PgGraphStore implements GraphStore {
       );
       await c.query(
         `INSERT INTO sessions (id, project_key, source, source_file, cwd, git_branch, started_at, ended_at, final_reply_text, final_reply_ts,
-                               work_edits, work_commits, first_work_at, last_work_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7::timestamptz, $8::timestamptz, $9, $10, $11, $12, $13::timestamptz, $14::timestamptz)
+                               work_edits, work_commits, first_work_at, last_work_at, final_tool_calls)
+         VALUES ($1, $2, $3, $4, $5, $6, $7::timestamptz, $8::timestamptz, $9, $10, $11, $12, $13::timestamptz, $14::timestamptz, $15::jsonb)
          ON CONFLICT (id) DO UPDATE SET project_key = EXCLUDED.project_key, source = EXCLUDED.source,
            source_file = EXCLUDED.source_file, cwd = EXCLUDED.cwd, git_branch = EXCLUDED.git_branch,
            started_at = EXCLUDED.started_at, ended_at = EXCLUDED.ended_at,
            final_reply_text = EXCLUDED.final_reply_text, final_reply_ts = EXCLUDED.final_reply_ts,
            work_edits = EXCLUDED.work_edits, work_commits = EXCLUDED.work_commits,
-           first_work_at = EXCLUDED.first_work_at, last_work_at = EXCLUDED.last_work_at`,
+           first_work_at = EXCLUDED.first_work_at, last_work_at = EXCLUDED.last_work_at, final_tool_calls = EXCLUDED.final_tool_calls`,
         [
           s.sessionId, project.key, s.source ?? 'claude', s.sourceFile ?? null, s.cwd ?? null, s.gitBranch ?? null, maybeTime(s.startedAt), maybeTime(s.endedAt),
           // Redacted by the parser, and again here: it is stored like a turn's text.
           s.finalReply ? redactSecrets(s.finalReply.text) : null,
           s.finalReply?.ts ?? null,
-          work.edits, work.commits, work.firstAt, work.lastAt,
+          work.edits, work.commits, work.firstAt, work.lastAt, toJson(trailingToolCalls(s)),
         ],
       );
       if (s.turns.length) {
@@ -195,6 +200,19 @@ export class PgGraphStore implements GraphStore {
    * Turns still to classify, newest first so fresh feedback is not stuck behind the history backfill.
    * projectKeys undefined: every project; an empty list: none (nothing is selected).
    */
+  async callsAfter(turnUuid: string): Promise<CallsAfter | null> {
+    const { rows } = await this.q(
+      `SELECT s.final_tool_calls, s.ended_at,
+              (SELECT coalesce(jsonb_agg(n.tool_calls ORDER BY n.idx, n.uuid), '[]'::jsonb) FROM turns n WHERE n.session_id = t.session_id AND n.idx > t.idx) AS later
+       FROM turns t JOIN sessions s ON s.id = t.session_id WHERE t.uuid = $1`,
+      [turnUuid],
+    );
+    const r = rows[0];
+    if (!r) return null;
+    const later = (r.later ?? []) as ToolCall[][];
+    return { calls: [...later.flat(), ...((r.final_tool_calls ?? []) as ToolCall[])], laterTurns: later.length, endedAt: r.ended_at ? new Date(r.ended_at).toISOString() : null };
+  }
+
   async unclassifiedTurns(limit: number, projectKeys?: string[], excludeKeys?: string[]): Promise<ClassifiableTurn[]> {
     const { rows } = await this.q(
       `SELECT t.*, p.key AS project_key
@@ -254,8 +272,8 @@ export class PgGraphStore implements GraphStore {
        FROM candidates k JOIN turns t ON t.uuid = k.turn_uuid
        WHERE ($1::text IS NULL OR k.status = $1) AND ($2::text IS NULL OR k.project_key = $2)
          AND ($4::text[] IS NULL OR k.project_key = ANY($4)) AND ($5::text IS NULL OR coalesce(k.source, 'claude') = $5)
-       ORDER BY t.ts DESC, k.id LIMIT $3`,
-      [f.status ?? null, f.projectKey ?? null, f.limit ?? 200, f.projectKeys ?? null, f.source ?? null],
+       ORDER BY t.ts DESC, k.id LIMIT $3 OFFSET $6`,
+      [f.status ?? null, f.projectKey ?? null, f.limit ?? 200, f.projectKeys ?? null, f.source ?? null, Math.max(0, Math.floor(f.offset ?? 0))],
     );
     return rows.map(candidateOf);
   }
@@ -294,6 +312,71 @@ export class PgGraphStore implements GraphStore {
       commits: commits.rows.map(commitOf),
       postmortem: postmortemState(f, r.done),
     };
+  }
+
+  async pendingExternalItems(q: { limit: number; afterId?: string | null }): Promise<PendingExternalItem[]> {
+    const { rows } = await this.q(
+      `SELECT k.id, k.turn_uuid, k.project_key, t.text, t.external
+       FROM candidates k JOIN turns t ON t.uuid = k.turn_uuid
+       WHERE k.status = 'pending' AND t.external IS NOT NULL AND t.text IS NOT NULL AND ($2::text IS NULL OR k.id > $2)
+       ORDER BY k.id LIMIT $1`,
+      [q.limit, q.afterId ?? null],
+    );
+    return rows.map((r) => ({ id: r.id, turnUuid: r.turn_uuid, projectKey: r.project_key, text: r.text, external: r.external }));
+  }
+
+  async pendingSessionItems(q: { limit: number; afterId?: string | null }): Promise<PendingSessionItem[]> {
+    const { rows } = await this.q(
+      `SELECT k.id, k.turn_uuid, k.project_key, t.text, t.tool_calls
+       FROM candidates k JOIN turns t ON t.uuid = k.turn_uuid
+       WHERE k.status = 'pending' AND t.external IS NULL AND t.text IS NOT NULL AND NOT k.manual AND k.agent_report IS NULL
+         AND ($2::text IS NULL OR k.id COLLATE "C" > $2)
+       ORDER BY k.id COLLATE "C" LIMIT $1`,
+      [q.limit, q.afterId ?? null],
+    );
+    return rows.map((r) => ({ id: r.id, turnUuid: r.turn_uuid, projectKey: r.project_key, text: r.text, precedingToolCalls: r.tool_calls ?? [] }));
+  }
+
+  async skipPendingItem(id: string, s: { rule: string; note: string; by: string }): Promise<boolean> {
+    return tx(this.db, async (c) => {
+      const { rows } = await c.query(
+        `UPDATE candidates SET status = 'rejected', note = $2, decided_at = $3, decided_by = $4 WHERE id = $1 AND status = 'pending' RETURNING turn_uuid`,
+        [id, s.note, new Date(), s.by],
+      );
+      if (!rows[0]) return false;
+      const signal = `skip:${s.rule}`;
+      await c.query(
+        `UPDATE turns SET signals = CASE WHEN $2 = ANY(coalesce(signals, '{}')) THEN signals ELSE array_append(coalesce(signals, '{}'), $2) END WHERE uuid = $1`,
+        [rows[0].turn_uuid, signal],
+      );
+      return true;
+    });
+  }
+
+  async ruleSkippedItems(q: { rule: string; by: string; limit: number; afterId?: string | null }): Promise<PendingSessionItem[]> {
+    const { rows } = await this.q(
+      `SELECT k.id, k.turn_uuid, k.project_key, t.text, t.tool_calls
+       FROM candidates k JOIN turns t ON t.uuid = k.turn_uuid
+       WHERE k.status = 'rejected' AND k.decided_by = $3 AND $4 = ANY(coalesce(t.signals, '{}'))
+         AND t.external IS NULL AND t.text IS NOT NULL AND NOT k.manual AND k.agent_report IS NULL
+         AND ($2::text IS NULL OR k.id COLLATE "C" > $2)
+       ORDER BY k.id COLLATE "C" LIMIT $1`,
+      [q.limit, q.afterId ?? null, q.by, `skip:${q.rule}`],
+    );
+    return rows.map((r) => ({ id: r.id, turnUuid: r.turn_uuid, projectKey: r.project_key, text: r.text, precedingToolCalls: r.tool_calls ?? [] }));
+  }
+
+  async reopenRuleSkippedItem(id: string, s: { rule: string; by: string }): Promise<boolean> {
+    return tx(this.db, async (c) => {
+      const { rows } = await c.query(
+        `UPDATE candidates SET status = 'pending', note = NULL, decided_at = NULL, decided_by = NULL
+         WHERE id = $1 AND status = 'rejected' AND decided_by = $2 RETURNING turn_uuid`,
+        [id, s.by],
+      );
+      if (!rows[0]) return false;
+      await c.query(`UPDATE turns SET signals = array_remove(signals, $2) WHERE uuid = $1`, [rows[0].turn_uuid, `skip:${s.rule}`]);
+      return true;
+    });
   }
 
   async decide(id: string, status: 'confirmed' | 'rejected', note: string | null, by = 'you'): Promise<void> {

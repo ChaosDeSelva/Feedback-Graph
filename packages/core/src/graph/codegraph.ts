@@ -36,7 +36,8 @@ type Props = Record<string, unknown>;
 
 /**
  * The code map on Neo4j. Files are the CodeFile nodes facts are ABOUT (id `<projectKey>:<path>`), marked inMap with
- * the map's own properties (codeHash, lang, loc, isTest, churn), next to the scanner's hash/summary/removed.
+ * the map's own properties (codeHash, lang, loc, isTest, churn), next to the scanner's hash/summary/removed. Files of
+ * the import index past the cap are marked inIndex instead (lang, codeHash, loc, isTest; no symbols, no churn).
  * (:CodeFile)-[:DEFINES]->(:Symbol), (:CodeFile)-[:IMPORTS {names, spec}]->(:CodeFile | :Module),
  * (:CodeFile)-[:TESTS]->(:CodeFile), (:CodeMap {projectKey}) for the build's fingerprint and size, and
  * (:Session)-[:TOUCHED {read, edited, firstEditAt, lastEditAt}]->(:CodeFile) for the files a session touched.
@@ -51,6 +52,7 @@ export class CodeGraphRepo implements CodeGraphStore {
     const knowledge = new KnowledgeRepo(g);
     const reads: CodeGraphReads = {
       mapFiles: (key, paths) => this.mapFiles(key, paths),
+      outsideFiles: (key, paths) => this.outsideFiles(key, paths),
       symbolsOf: (key, path) => this.symbolsOf(key, path),
       importsOf: (key, path) => this.importsOf(key, path),
       importersOf: (key, paths) => this.importersOf(key, paths),
@@ -75,7 +77,9 @@ export class CodeGraphRepo implements CodeGraphStore {
     const key = projectKey;
     const now = new Date().toISOString();
     const files = map.files.map((f) => ({ ...f, churnCommits: map.churn[f.path]?.commits ?? null, churnLastTs: map.churn[f.path]?.lastTs ?? null }));
-    const paths = files.map((f) => f.path);
+    const mapped = files.map((f) => f.path);
+    const outsidePaths = map.outside.map((f) => f.path);
+    const paths = [...mapped, ...outsidePaths];
     const [storedSymbols, storedImports] = await Promise.all([
       this.g.run('MATCH (s:Symbol {projectKey: $key}) RETURN s', { key }),
       this.g.run(
@@ -116,12 +120,19 @@ export class CodeGraphRepo implements CodeGraphStore {
         `MATCH (cf:CodeFile {projectKey: $key}) WHERE cf.inMap = true AND NOT cf.path IN $paths
          SET cf.inMap = false
          REMOVE cf.lang, cf.codeHash, cf.loc, cf.isTest, cf.churnCommits, cf.churnLastTs, cf.mappedAt`,
-        { key, paths },
+        { key, paths: mapped },
+      ],
+      [
+        `MATCH (cf:CodeFile {projectKey: $key}) WHERE cf.inIndex = true AND NOT cf.path IN $paths
+         REMOVE cf.inIndex
+         WITH cf WHERE coalesce(cf.inMap, false) = false
+         REMOVE cf.lang, cf.codeHash, cf.loc, cf.isTest, cf.mappedAt`,
+        { key, paths: outsidePaths },
       ],
       // A file that left the map and that nothing else refers to (never scanned, no fact about it, no session touched
       // it) goes: its symbols and edges are gone already, only its IN edge is left.
       [
-        `MATCH (cf:CodeFile {projectKey: $key}) WHERE cf.inMap = false AND NOT cf.path IN $paths AND cf.hash IS NULL
+        `MATCH (cf:CodeFile {projectKey: $key}) WHERE coalesce(cf.inMap, false) = false AND NOT cf.path IN $paths AND cf.hash IS NULL
            AND COUNT { (cf)-[r]-() WHERE type(r) <> 'IN' } = 0
          DETACH DELETE cf`,
         { key, paths },
@@ -134,6 +145,19 @@ export class CodeGraphRepo implements CodeGraphStore {
              ON CREATE SET cf.projectKey = $key, cf.path = f.path, cf.removed = false
            SET cf.inMap = true, cf.lang = f.lang, cf.codeHash = f.hash, cf.loc = f.loc, cf.isTest = f.isTest,
                cf.churnCommits = f.churnCommits, cf.churnLastTs = f.churnLastTs, cf.mappedAt = $now
+           REMOVE cf.inIndex
+           MERGE (cf)-[:IN]->(p)`,
+        { key, files: part, now },
+      ]),
+      ...slices(map.outside).map((part): [string, Props] => [
+        `MERGE (p:Project {key: $key})
+         WITH p
+         UNWIND $files AS f
+           MERGE (cf:CodeFile {id: $key + ':' + f.path})
+             ON CREATE SET cf.projectKey = $key, cf.path = f.path, cf.removed = false
+           SET cf.inMap = false, cf.inIndex = true, cf.lang = f.lang, cf.codeHash = f.hash, cf.loc = f.loc, cf.isTest = f.isTest,
+               cf.mappedAt = $now
+           REMOVE cf.churnCommits, cf.churnLastTs
            MERGE (cf)-[:IN]->(p)`,
         { key, files: part, now },
       ]),
@@ -170,8 +194,9 @@ export class CodeGraphRepo implements CodeGraphStore {
       [
         `MERGE (m:CodeMap {projectKey: $key})
          SET m.fingerprint = $fingerprint, m.builtAt = $now, m.files = $stats.files, m.symbols = $stats.symbols,
-             m.imports = $stats.imports, m.tests = $stats.tests, m.candidates = $candidates, m.unresolved = $unresolved`,
-        { key, fingerprint: map.fingerprint, now, stats: map.stats, candidates: map.candidates, unresolved: map.unresolved ?? null },
+             m.imports = $stats.imports, m.tests = $stats.tests, m.candidates = $candidates, m.unresolved = $unresolved,
+             m.version = $version`,
+        { key, fingerprint: map.fingerprint, now, stats: map.stats, candidates: map.candidates, unresolved: map.unresolved ?? null, version: map.version },
       ],
     ];
     for (const [cypher, params] of statements) await this.g.run(cypher, params);
@@ -180,8 +205,11 @@ export class CodeGraphRepo implements CodeGraphStore {
 
   async purgeOrphanCodeFiles(limit: number): Promise<number> {
     const [r] = await this.g.run(
-      `MATCH (cf:CodeFile) WHERE coalesce(cf.inMap, false) = false
-         AND (cf.removed = true OR NOT EXISTS { (cf)-[:IN]->(:Project) })
+      // inMap is unset (not false) on a file that was never mapped: a session's touch creates the node, and when the
+      // session is read again without it nothing refers to it. Never mapped and never scanned (no hash, the scan's
+      // memory of the file), it goes whatever its project; a scanned one only once it is gone from the repo.
+      `MATCH (cf:CodeFile) WHERE coalesce(cf.inMap, false) = false AND coalesce(cf.inIndex, false) = false
+         AND (cf.removed = true OR cf.hash IS NULL OR NOT EXISTS { (cf)-[:IN]->(:Project) })
          AND NOT EXISTS { (cf)-[r]-() WHERE type(r) <> 'IN' }
        WITH cf LIMIT $limit
        DETACH DELETE cf
@@ -217,14 +245,16 @@ export class CodeGraphRepo implements CodeGraphStore {
       stats: { files: m.files ?? 0, symbols: m.symbols ?? 0, imports: m.imports ?? 0, tests: m.tests ?? 0 },
       candidates: m.candidates ?? null,
       unresolved: m.unresolved ?? null,
+      version: m.version == null ? null : Number(m.version),
     };
   }
 
   async codeMap(projectKey: string): Promise<StoredCodeMap | null> {
     const meta = await this.codeMapMeta(projectKey);
     if (!meta) return null;
-    const [files, symbols, imports] = await Promise.all([
+    const [files, outside, symbols, imports] = await Promise.all([
       this.mapFiles(projectKey),
+      this.outsideFiles(projectKey),
       this.g.run('MATCH (s:Symbol {projectKey: $key}) RETURN s ORDER BY s.path, s.ord', { key: projectKey }),
       this.g.run(
         `MATCH (a:CodeFile {projectKey: $key})-[r:IMPORTS]->(b)
@@ -235,6 +265,7 @@ export class CodeGraphRepo implements CodeGraphStore {
     return {
       ...meta,
       files: files.map(({ churn: _, ...f }) => f),
+      outside: outside.map(({ churn: _, ...f }) => f),
       symbols: symbols.map((r) => symbolOf(r.get('s').properties)),
       imports: imports.map((r) => ({ from: r.get('from'), to: r.get('to'), names: r.get('names') ?? [], spec: r.get('spec') ?? '' })),
     };
@@ -301,6 +332,10 @@ export class CodeGraphRepo implements CodeGraphStore {
     return this.views.lessonsForPaths(projectKey, paths);
   }
 
+  outsideMap(projectKey: string, paths: string[]) {
+    return this.views.outsideMap(projectKey, paths);
+  }
+
   /** The export's per-file view of a project's map. */
   exportFiles(projectKey: string) {
     return this.views.exportFiles(projectKey);
@@ -308,10 +343,15 @@ export class CodeGraphRepo implements CodeGraphStore {
 
   // ── reads the views are built from ──
 
-  private async mapFiles(projectKey: string, paths?: string[]): Promise<(MapFile & { churn: FileChurn | null })[]> {
+  private outsideFiles(projectKey: string, paths?: string[]) {
+    return this.mapFiles(projectKey, paths, 'inIndex');
+  }
+
+  /** Mapped files (inMap), or with `inIndex` the files of the import index past the cap. */
+  private async mapFiles(projectKey: string, paths?: string[], mark: 'inMap' | 'inIndex' = 'inMap'): Promise<(MapFile & { churn: FileChurn | null })[]> {
     if (paths && !paths.length) return [];
     const rows = await this.g.run(
-      `MATCH (cf:CodeFile {projectKey: $key}) WHERE cf.inMap = true AND ($paths IS NULL OR cf.path IN $paths)
+      `MATCH (cf:CodeFile {projectKey: $key}) WHERE cf.${mark} = true AND ($paths IS NULL OR cf.path IN $paths)
        RETURN cf ORDER BY cf.path`,
       { key: projectKey, paths: paths ?? null },
     );
@@ -386,11 +426,12 @@ export class CodeGraphRepo implements CodeGraphStore {
     return new Map(rows.map((r) => [r.get('path'), r.get('n')]));
   }
 
+  /** A process miss (m.subject 'process': branches, pushes, pull requests) is about no file, so it is on none. */
   private async missesOn(projectKey: string, paths: string[] | null): Promise<FileMissRow[]> {
     if (paths && !paths.length) return [];
     const rows = await this.g.run(
       `MATCH (m:Miss {projectKey: $key})-[:EXPLAINS]->(f:Feedback)-[:FROM_TURN]->(t:Turn)<-[:HAS_TURN]-(s:Session)-[r:TOUCHED]->(cf:CodeFile)
-       WHERE r.edited = true AND f.status <> 'rejected' AND ($paths IS NULL OR cf.path IN $paths)
+       WHERE r.edited = true AND f.status <> 'rejected' AND m.subject IS NULL AND ($paths IS NULL OR cf.path IN $paths)
        OPTIONAL MATCH (l:Lesson)-[:DERIVED_FROM]->(m)
        RETURN m, f.id AS feedbackId, coalesce(t.text, f.text, '') AS text, s.id AS sessionId, t.ts AS ts, cf.path AS path,
               r.lastEditAt IS NOT NULL AND datetime(r.lastEditAt) > datetime(t.ts) AS fixedHere, min(l.id) AS lessonId`,

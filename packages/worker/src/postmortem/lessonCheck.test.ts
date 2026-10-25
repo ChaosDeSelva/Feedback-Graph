@@ -30,9 +30,15 @@ test('a universal rule drawn from one nit is narrowed to the task and flagged', 
   const nit = checkLesson(lesson('Always treat documentation nitpicks from reviewers as mandatory requirements'), feedback('nit: the README example is out of date', {}));
   expect(nit.lesson.scope).toBe('task');
   expect(nit.flags.map((f) => f.name)).toEqual(['universal-from-nit', 'meta-lesson']);
+});
+
+test('an APPROVED review is not a nit: a universal rule from it is kept as it is', () => {
   const approved = checkLesson(lesson('Never leave a TODO in any file', { scope: 'global' }), feedback('one LOW: a stray TODO', { reviewState: 'APPROVED' }));
-  expect(approved.lesson.scope).toBe('task');
-  expect(approved.flags.map((f) => f.name)).toEqual(['universal-from-nit']);
+  expect(approved.lesson.scope).toBe('global');
+  expect(approved.flags.map((f) => f.name)).not.toContain('universal-from-nit');
+  // A nit marker in an approving review is still a nit.
+  const nit = checkLesson(lesson('Never leave a TODO in any file', { scope: 'global' }), feedback('nit: a stray TODO', { reviewState: 'APPROVED' }));
+  expect(nit.flags.map((f) => f.name)).toContain('universal-from-nit');
 });
 
 test('a universal rule from real pushback is kept', () => {
@@ -70,6 +76,49 @@ test('meta-lessons phrased as relevance, scope or "pertains" are flagged too', (
 test('a platitude with nothing from the code in it is flagged; the same verb with an identifier is not', () => {
   expect(checkLesson(lesson('Always verify concurrent state interactions.'), feedback('handleRemoveAccount resends the cached list')).flags.map((f) => f.name)).toEqual(['platitude']);
   expect(checkLesson(lesson('Always verify that handleRemoveAccount does not resend the cached vendorAccountIds list'), feedback('it resends the list')).flags).toEqual([]);
+});
+
+test('a platitude in the title is read too, and assume / prioritize / cross-reference / maintain / monitor are platitude verbs', () => {
+  const names = (rule: string, title = 'T') => checkLesson(lesson(rule, { title }), feedback('the list is stale')).flags.map((f) => f.name);
+  expect(names('Check the state carefully.', 'Always verify state changes')).toContain('platitude');
+  for (const rule of [
+    'Never assume the data is fresh.',
+    'Always prioritize correctness over speed.',
+    'Always cross-reference related changes.',
+    'Always maintain consistency across the codebase.',
+    'Always monitor for regressions after a change.',
+  ]) expect(names(rule), rule).toContain('platitude');
+  // The same verbs naming something in the code are a rule.
+  expect(names('Never assume listOrders returns rows sorted; sort by created_at in api/orders.ts')).not.toContain('platitude');
+  expect(names('Read the totals from billing/invoice.ts', 'Always cross-reference the invoice totals')).not.toContain('platitude');
+});
+
+// Realistic lesson rules: the ones a post-mortem model writes when the "lesson" is really how the code is.
+const FACT_LIKE = [
+  'Feature flags are configured in config/flags.ts.',
+  'The build uses Vite with the React plugin.',
+  'Endpoints live under api/v2/routes.',
+  'Remember that the payment service reads its keys from services/payments/.env.',
+  'Be aware that migrations run before the server starts in docker-entrypoint.sh.',
+  'Authentication is handled in middleware/auth.ts, not in the route handlers.',
+  'The worker and the API share one Postgres database through packages/store-postgres.',
+  'Keep in mind that the session cookie is set by the gateway (gateway/session.go), so the web app never sees it.',
+];
+const RULE_LIKE = [
+  'Add new endpoints under api/v2/routes, not api/v1.',
+  'When changing the build config, ensure vite.config.ts and the tsconfig paths stay in sync.',
+  'Run pnpm typecheck before calling a TypeScript change done.',
+  'If a migration renames a column, update the Neo4j repo in packages/core/src/graph too.',
+  'Configure feature flags in config/flags.ts rather than in env files.',
+  'Prefer the shared Modal component in ui/components over a new dialog.',
+  'Never hardcode the API base URL; read it from config/env.ts.',
+  'Route handlers in api/ must return JSON errors, not HTML pages.',
+];
+
+test('statements that describe the code are flagged as looking like a fact; rules that say what to do are not', () => {
+  const factLike = (rule: string) => checkLesson(lesson(rule), feedback('this is wrong')).flags.some((f) => f.name === 'looks-like-a-fact');
+  for (const rule of FACT_LIKE) expect(factLike(rule), rule).toBe(true);
+  for (const rule of RULE_LIKE) expect(factLike(rule), rule).toBe(false);
 });
 
 test('a rule field holding the scope word takes the title as the rule and is flagged', () => {

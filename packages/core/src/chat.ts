@@ -37,7 +37,24 @@ export type ChatTurn = {
   createdAt: string;
   startedAt: string | null;
   finishedAt: string | null;
+  /**
+   * On an assistant turn: how big the pack it is answered from is (the context as stored, which is what the model
+   * gets, and its numbered sources). Null on a user turn, or when the question's pack is not stored.
+   */
+  pack?: ChatPackSize | null;
 };
+
+/** chars: characters of the stored pack (at most MAX_CHAT_CONTEXT); sources: how many numbered sources it cites. */
+export type ChatPackSize = { chars: number; sources: number };
+
+/** Each assistant turn's pack size, from the context stored on the user turn before it (seq - 1). Both stores use it. */
+export function withPackSizes(turns: { turn: ChatTurn; contextChars: number | null }[]): ChatTurn[] {
+  const chars = new Map(turns.map((t) => [t.turn.seq, t.contextChars]));
+  return turns.map(({ turn }) => {
+    const c = turn.role === 'assistant' ? chars.get(turn.seq - 1) : null;
+    return { ...turn, pack: c == null ? null : { chars: c, sources: turn.sources.length } };
+  });
+}
 
 /** pending: a turn of it is pending or answering. */
 export type ChatConversation = { id: string; projectKey: string; title: string; provider: ChatProvider | null; createdAt: string; updatedAt: string; pending: boolean };

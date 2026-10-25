@@ -21,9 +21,23 @@ export type MapSymbol = { id: string; path: string; name: string; kind: SymbolKi
 export type MapImport = { from: string; to: string; names: string[]; spec: string };
 export type FileChurn = { commits: number; lastTs: string };
 
+/**
+ * The version of the rules a map is built by (what is resolved, which files are kept, what the index holds). Bump it
+ * when they change: at start the worker rebuilds every map stamped with an older one (or none) from scratch, so a
+ * new rule reaches maps built before it. 2: the import index past the cap, ranking by importers and churn, Python
+ * imports counted when unresolved.
+ */
+export const CODE_MAP_VERSION = 2;
+
 /** What the worker writes for one project: the whole map, replacing the previous one. */
 export type CodeMapWrite = {
+  /** The mapped files: they carry symbols. */
   files: MapFile[];
+  /**
+   * The import index past the cap: candidate files not in the map, kept with their import edges (to and from them)
+   * but no symbols, so importer counts and the files a capped map left out are still known.
+   */
+  outside?: MapFile[];
   symbols: MapSymbol[];
   imports: MapImport[];
   /** TESTS edges: `test` imports `target` directly or through one file (codegraph testsFor). */
@@ -36,6 +50,8 @@ export type CodeMapWrite = {
   candidates?: number | null;
   /** Imports that look like they name a repo file (a path alias, a workspace package) but resolved to none. */
   unresolved?: number | null;
+  /** CODE_MAP_VERSION of the worker that built it; null (absent) for a map from before maps were versioned. */
+  version?: number | null;
 };
 
 export type CodeMapStats = { files: number; symbols: number; imports: number; tests: number };
@@ -44,7 +60,17 @@ export type CodeMapStats = { files: number; symbols: number; imports: number; te
  * unresolved: imports the map could not follow to a file although they look local, so importer and test lists may be
  * short (null: not counted).
  */
-export type CodeMapMeta = { fingerprint: string | null; builtAt: string; stats: CodeMapStats; candidates: number | null; unresolved?: number | null };
+export type CodeMapMeta = { fingerprint: string | null; builtAt: string; stats: CodeMapStats; candidates: number | null; unresolved?: number | null; /** CODE_MAP_VERSION it was built by; null before maps were versioned. */ version?: number | null };
+
+/**
+ * Whether what a map says about importers and tests may be short for a reason the map itself cannot count: it was
+ * built by older map rules (the worker rebuilds it at start), or before unresolved imports were counted. Until it is
+ * rebuilt, answers say the import graph is incomplete rather than that a file has no importers.
+ */
+export function mapIncomplete(meta: Pick<CodeMapMeta, 'unresolved' | 'version'> | null | undefined): boolean {
+  if (!meta) return false;
+  return meta.unresolved == null || (meta.version ?? 0) < CODE_MAP_VERSION;
+}
 /** The map's cap with SCAN_MAX_FILES unset: 40% of the candidates, at least MIN_MAP_FILES and at most MAX_AUTO_MAP_FILES. */
 export const MIN_MAP_FILES = 400;
 export const MAX_AUTO_MAP_FILES = 4000;
@@ -62,7 +88,14 @@ export function mapCapped(meta: Pick<CodeMapMeta, 'stats' | 'candidates'> | null
 }
 
 /** The stored map, in the parser's shape, so the next build can be incremental. Sorted by path (then position). */
-export type StoredCodeMap = CodeMapMeta & { files: MapFile[]; symbols: MapSymbol[]; imports: MapImport[] };
+export type StoredCodeMap = CodeMapMeta & {
+  files: MapFile[];
+  symbols: MapSymbol[];
+  /** Every edge of the import index: from and to mapped and outside files alike. */
+  imports: MapImport[];
+  /** The import index past the cap (CodeMapWrite.outside), sorted by path. */
+  outside: MapFile[];
+};
 
 /** One repo file a session touched. Times are ISO (Date.toISOString()); null when it was only read. */
 export type SessionFile = { path: string; read: boolean; edited: boolean; firstEditAt: string | null; lastEditAt: string | null };
@@ -103,8 +136,11 @@ export type ModuleContext = {
   lessons: Lesson[];
 };
 
+/** A file past the cap, in the import index: who imports it (sorted) and the tests among them (impact's one hop). */
+export type OutsideFile = { path: string; importers: string[]; tests: string[] };
+
 export type Impact = {
-  /** The paths asked about that are in the map, sorted. */
+  /** The paths asked about that are in the map or its import index past the cap, sorted. */
   paths: string[];
   /** Files that import them, transitively up to the depth, nearest first. */
   dependents: { path: string; depth: number }[];
@@ -117,7 +153,8 @@ export type Impact = {
 /** Where agents keep getting corrected: churn, misses and dependents of a file, and the score they make. */
 export type Hotspot = { path: string; churn: number; misses: number; dependents: number; score: number };
 /** includeTests: rank test files too (by default they are left out: a busy test file is rarely where agents struggle). */
-export type HotspotOpts = { includeTests?: boolean };
+/** missesOnly: only files a confirmed miss touched. */
+export type HotspotOpts = { includeTests?: boolean; missesOnly?: boolean };
 
 /**
  * The code map drawn as a graph: the top `limit` files by hotspot score (tests left out unless included), their
@@ -185,6 +222,19 @@ export function sessionWork(calls: ToolCall[]): SessionWork {
     if (!w.lastAt || at > w.lastAt) w.lastAt = at;
   }
   return w;
+}
+
+/** At most this many of the tool calls after a session's last human turn are kept on the session. */
+export const MAX_TRAILING_TOOL_CALLS = 200;
+
+/**
+ * The tool calls after the session's last human turn (none takes them in as preceding calls), the newest
+ * MAX_TRAILING_TOOL_CALLS: a push the agent ran right after an instruction not to, and then the session ended, is here.
+ */
+export function trailingToolCalls(s: Pick<ParsedSession, 'turns' | 'toolCalls'>): ToolCall[] {
+  const last = s.turns.at(-1)?.ts;
+  if (!last) return [];
+  return (s.toolCalls ?? []).filter((c) => c.ts > last).slice(-MAX_TRAILING_TOOL_CALLS);
 }
 
 /**
@@ -302,15 +352,19 @@ export type OrderedSymbol = MapSymbol & { ord: number };
 
 /**
  * The map exactly as a backend writes it: names, specifiers and package targets redacted (the parser does too; the
- * store does not rely on it), one entry per file, per (from, to) import and per (test, target) pair, and only
- * symbols and edges whose files are in the map, so a write never refers to a file it does not hold.
+ * store does not rely on it), one entry per file, per (from, to) import and per (test, target) pair, symbols only of
+ * mapped files, and only edges whose files are in the map or its import index (outside), so a write never refers to a
+ * file it does not hold.
  */
-export function normalizeCodeMap(map: CodeMapWrite): Omit<CodeMapWrite, 'symbols'> & { symbols: OrderedSymbol[]; stats: CodeMapStats } {
+export function normalizeCodeMap(map: CodeMapWrite): Omit<CodeMapWrite, 'symbols' | 'outside'> & { outside: MapFile[]; symbols: OrderedSymbol[]; stats: CodeMapStats } {
   const files = [...new Map(map.files.map((f) => [f.path, f])).values()].sort((a, b) => cmp(a.path, b.path));
-  const paths = new Set(files.map((f) => f.path));
+  const mapped = new Set(files.map((f) => f.path));
+  // A file is in the map or past it, never both.
+  const outside = [...new Map((map.outside ?? []).filter((f) => !mapped.has(f.path)).map((f) => [f.path, f])).values()].sort((a, b) => cmp(a.path, b.path));
+  const paths = new Set([...mapped, ...outside.map((f) => f.path)]);
   const ord = new Map<string, number>();
   const symbols = map.symbols
-    .filter((x) => paths.has(x.path))
+    .filter((x) => mapped.has(x.path))
     .map((x) => {
       const n = ord.get(x.path) ?? 0;
       ord.set(x.path, n + 1);
@@ -327,12 +381,13 @@ export function normalizeCodeMap(map: CodeMapWrite): Omit<CodeMapWrite, 'symbols
     else for (const n of names) if (!e.names.includes(n)) e.names.push(n);
   }
   const tests = [...new Map(map.tests.filter((t) => paths.has(t.test) && paths.has(t.target)).map((t) => [`${t.test}\0${t.target}`, t])).values()];
-  const churn = Object.fromEntries(Object.entries(map.churn).filter(([p]) => paths.has(p)));
+  const churn = Object.fromEntries(Object.entries(map.churn).filter(([p]) => mapped.has(p)));
   const fingerprint = map.fingerprint === null ? null : redactSecrets(map.fingerprint);
   const candidates = typeof map.candidates === 'number' && Number.isFinite(map.candidates) ? Math.max(files.length, Math.floor(map.candidates)) : null;
   const unresolved = typeof map.unresolved === 'number' && Number.isFinite(map.unresolved) ? Math.max(0, Math.floor(map.unresolved)) : null;
+  const version = typeof map.version === 'number' && Number.isInteger(map.version) && map.version > 0 ? map.version : null;
   return {
-    files, symbols, imports: [...imports.values()], tests, churn, fingerprint, candidates, unresolved,
+    files, outside, symbols, imports: [...imports.values()], tests, churn, fingerprint, candidates, unresolved, version,
     stats: { files: files.length, symbols: symbols.length, imports: imports.size, tests: tests.length },
   };
 }
@@ -425,9 +480,11 @@ export type FileMissRow = Omit<FileMiss, 'paths' | 'fixedHere'> & { path: string
 export interface CodeGraphReads {
   /** Mapped files with churn, sorted by path; only these paths when given. */
   mapFiles(projectKey: string, paths?: string[]): Promise<(MapFile & { churn: FileChurn | null })[]>;
+  /** Files of the import index past the cap (not mapped), sorted by path; only these paths when given. */
+  outsideFiles(projectKey: string, paths?: string[]): Promise<(MapFile & { churn: FileChurn | null })[]>;
   symbolsOf(projectKey: string, path: string): Promise<MapSymbol[]>;
   importsOf(projectKey: string, path: string): Promise<{ to: string; names: string[] }[]>;
-  /** Direct importers of each path (every path is a key, with [] when none). */
+  /** Direct importers of each path (every path is a key, with [] when none), mapped or in the index past the cap. */
   importersOf(projectKey: string, paths: string[]): Promise<Map<string, string[]>>;
   /** Test files with a TESTS edge to any of the paths. */
   testsOf(projectKey: string, paths: string[]): Promise<string[]>;
@@ -475,7 +532,8 @@ export const MODULE_TESTS_DEPTH = 3;
 export function codeGraphViews(r: CodeGraphReads) {
   /** Test files among `files`, and the tests covering any of them. Sorted. */
   const testsFor = async (projectKey: string, files: string[]) => {
-    const isTest = new Set((await r.mapFiles(projectKey, files)).filter((f) => f.isTest).map((f) => f.path));
+    const known = (await Promise.all([r.mapFiles(projectKey, files), r.outsideFiles(projectKey, files)])).flat();
+    const isTest = new Set(known.filter((f) => f.isTest).map((f) => f.path));
     const covering = await r.testsOf(projectKey, files);
     return [...new Set([...files.filter((p) => isTest.has(p)), ...covering])].sort(cmp);
   };
@@ -526,7 +584,9 @@ export function codeGraphViews(r: CodeGraphReads) {
     },
 
     async impact(projectKey: string, paths: string[], depth: number): Promise<Impact> {
-      const mapped = (await r.mapFiles(projectKey, [...new Set(paths)])).map((f) => f.path);
+      const asked = [...new Set(paths)];
+      // A file past the cap is a start too: the index knows who imports it.
+      const mapped = (await Promise.all([r.mapFiles(projectKey, asked), r.outsideFiles(projectKey, asked)])).flat().map((f) => f.path).sort(cmp);
       const dependents = await expandDependents(mapped, Math.max(0, Math.floor(depth)), (ps) => r.importersOf(projectKey, ps));
       const all = [...mapped, ...dependents.map((d) => d.path)];
       const [tests, rows, lessons] = await Promise.all([testsFor(projectKey, all), r.missesOn(projectKey, all), r.approvedLessons(projectKey)]);
@@ -540,10 +600,24 @@ export function codeGraphViews(r: CodeGraphReads) {
       };
     },
 
+    /**
+     * The asked paths that are past the cap (in the import index, not the map), with every file importing them and the
+     * tests among those importers and theirs: what get_module_context says instead of "not in the code map".
+     */
+    async outsideMap(projectKey: string, paths: string[]): Promise<OutsideFile[]> {
+      const files = await r.outsideFiles(projectKey, [...new Set(paths)]);
+      if (!files.length) return [];
+      const importers = await r.importersOf(projectKey, files.map((f) => f.path));
+      return Promise.all(files.map(async (f) => {
+        const direct = [...(importers.get(f.path) ?? [])].sort(cmp);
+        return { path: f.path, importers: direct, tests: await testsFor(projectKey, direct) };
+      }));
+    },
+
     async hotspots(projectKey: string, limit: number, opts: HotspotOpts = {}): Promise<Hotspot[]> {
       const { ranked } = await scored(projectKey);
       return ranked
-        .filter((h) => opts.includeTests || !h.isTest)
+        .filter((h) => (opts.includeTests || !h.isTest) && (!opts.missesOnly || h.misses > 0))
         .slice(0, Math.max(0, limit))
         .map(({ path, churn, misses, dependents, score }) => ({ path, churn, misses, dependents, score }));
     },
@@ -603,9 +677,20 @@ const STOPWORDS = new Set(
     'put into onto from that this these those there here our ours your yours you are was were been being about like some any all every ' +
     'everywhere each other others more most many much also just only then than them they their its not but out way thing things one two ' +
     'code please help show tell find give look see know think let lets via per such very really still within without between ' +
-    'over under above below after before again able goes going went come comes'
+    'over under above below after before again able goes going went come comes already yet exist exists existing currently ' +
+    'anything something somewhere anywhere maybe'
   ).split(' '),
 );
+/**
+ * Words that do name code, but so much of it that a hit on them alone says nothing: next to a more specific word of
+ * the question, a symbol or file matching only these is no hit ("modal component" finds modals, not `components`).
+ */
+const GENERIC = new Set(
+  ('list item data value type util utils helper component element info base common core main index default config ' +
+    'set get handle handler manager service model view state store result error').split(' '),
+);
+/** Words a question may use for the same thing a file is named by (both ways). */
+const SYNONYMS: Record<string, string[]> = { modal: ['dialog'], dialog: ['modal'], popup: ['popover'], popover: ['popup'] };
 const MIN_TERM = 3;
 const MAX_TERMS = 24;
 
@@ -656,8 +741,10 @@ export type CodeMapHit = {
   dependents: number;
   /** Test files importing its file, directly or through one importer. Sorted. */
   tests: string[];
-  /** How well it matched: 3 per exact name, 2 per word of its name, 1 per part of a word or folder. */
+  /** How well it matched: 3 per exact name, 2 per word of its name, 1 per folder or synonym word. */
   score: number;
+  /** A file past the cap (in the import index, not the map): its name and importers are known, its symbols are not. */
+  outside: boolean;
 };
 
 export type FindOpts = { limit?: number; maxUsages?: number };
@@ -666,29 +753,37 @@ const FIND_LIMIT = 8;
 const FIND_USAGES = 12;
 /** Hits from one file, at most: a big file must not fill the list with its methods. */
 const PER_FILE = 3;
-/** A term this long may match inside a longer word ("modal" in "modaldialog"). */
-const MIN_PART = 4;
-
-/** How a term matches a name: 3 the whole name, 2 one of its words, 1 inside one, 0 not at all. */
+/**
+ * How a term matches a name: 3 the whole name, 2 one of its words (camelCase, snake_case and kebab-case split), 0 not
+ * at all. Never inside a word: "already" is no match for a name whose word is "alreadymerged". A synonym (modal for
+ * dialog) counts one less.
+ */
 function strength(term: string, name: string): number {
-  if (foldTerm(name.replace(/[^A-Za-z0-9]/g, '')) === term) return 3;
+  const whole = foldTerm(name.replace(/[^A-Za-z0-9]/g, ''));
   const words = wordsOf(name).map(foldTerm);
-  if (words.includes(term)) return 2;
-  return term.length >= MIN_PART && words.some((w) => w.includes(term)) ? 1 : 0;
+  const of = (t: string) => (whole === t ? 3 : words.includes(t) ? 2 : 0);
+  return Math.max(of(term), ...(SYNONYMS[term] ?? []).map((t) => Math.max(0, of(t) - 1)));
 }
 
 /**
  * The symbols and files of a code map a question's terms name (codeTerms; terms are folded here too). Symbols match by
- * name, files by basename or folder when none of their symbols did. Ranked by how well they matched (more terms and
- * exact names first), then exported, then how many files depend on them, then path. Test files, secret files and files
- * that are not code are never hits: a hit lists its tests instead.
+ * name, files by basename or folder when none of their symbols did (files past the cap, in `outside`, too), by whole
+ * words only; a hit matching only GENERIC words is dropped when the question has a more specific one. Ranked by how
+ * well they matched (more terms and exact names first), then exported, then how many files depend on them, then path.
+ * Test files, secret files and files that are not code are never hits: a hit lists its tests instead.
  */
-export function findInCodeMap(map: Pick<StoredCodeMap, 'files' | 'symbols' | 'imports'>, terms: string[], opts: FindOpts = {}): CodeMapHit[] {
+export function findInCodeMap(map: Pick<StoredCodeMap, 'files' | 'symbols' | 'imports'> & { outside?: MapFile[] }, terms: string[], opts: FindOpts = {}): CodeMapHit[] {
   const want = [...new Set(terms.map(foldTerm).filter((t) => t.length >= MIN_TERM))];
   if (!want.length) return [];
+  // Next to a specific word, a hit on generic words only is dropped.
+  const specific = want.some((t) => !GENERIC.has(t));
+  const tells = (matched: string[]) => !specific || matched.some((t) => !GENERIC.has(t));
   const limit = opts.limit ?? FIND_LIMIT;
   const maxUsages = opts.maxUsages ?? FIND_USAGES;
-  const byPath = new Map(map.files.map((f) => [f.path, f]));
+  // Files past the cap (the import index) have no symbols, but their names and importers are known.
+  const allFiles = [...map.files, ...(map.outside ?? [])];
+  const past = new Set((map.outside ?? []).map((f) => f.path));
+  const byPath = new Map(allFiles.map((f) => [f.path, f]));
   const isTest = (p: string) => byPath.get(p)?.isTest ?? false;
   const importers = new Map<string, MapImport[]>();
   for (const i of map.imports) {
@@ -715,24 +810,24 @@ export function findInCodeMap(map: Pick<StoredCodeMap, 'files' | 'symbols' | 'im
   for (const s of map.symbols) {
     if (!usable(byPath.get(s.path))) continue;
     const matched = want.map((t) => [t, strength(t, s.name)] as const).filter(([, n]) => n > 0);
-    if (!matched.length) continue;
+    if (!matched.length || !tells(matched.map(([t]) => t))) continue;
     withSymbols.add(s.path);
     hits.push({
       kind: 'symbol', path: s.path, name: s.name, symbolKind: s.kind, lines: s.lines, exported: s.exported,
-      matched: matched.map(([t]) => t), score: matched.reduce((n, [, x]) => n + x, 0), ...around(s.path, s.name),
+      matched: matched.map(([t]) => t), score: matched.reduce((n, [, x]) => n + x, 0), outside: false, ...around(s.path, s.name),
     });
   }
-  for (const f of map.files) {
+  for (const f of allFiles) {
     if (!usable(f) || withSymbols.has(f.path)) continue;
     const segments = f.path.split('/');
     const name = segments.pop()!.replace(/\.[^.]+$/, '');
     const matched = want
       .map((t) => [t, Math.max(strength(t, name), ...segments.map((d) => Math.min(1, strength(t, d))))] as const)
       .filter(([, n]) => n > 0);
-    if (!matched.length) continue;
+    if (!matched.length || !tells(matched.map(([t]) => t))) continue;
     hits.push({
       kind: 'file', path: f.path, name: null, symbolKind: null, lines: null, exported: false,
-      matched: matched.map(([t]) => t), score: matched.reduce((n, [, x]) => n + x, 0), ...around(f.path, null),
+      matched: matched.map(([t]) => t), score: matched.reduce((n, [, x]) => n + x, 0), outside: past.has(f.path), ...around(f.path, null),
     });
   }
   hits.sort((a, b) => b.score - a.score || Number(b.exported) - Number(a.exported) || b.dependents - a.dependents || cmp(a.path, b.path) || cmp(a.name ?? '', b.name ?? ''));

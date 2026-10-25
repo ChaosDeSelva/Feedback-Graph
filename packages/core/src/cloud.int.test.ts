@@ -44,7 +44,7 @@ export async function seedSyncProject(store: Store, key: string, remote: string 
 }
 
 const TOKEN = `fgc_pat_0123456789abcdef_${'A'.repeat(43)}`;
-const fake: CloudConfig = { url: 'https://cloud.example.com', token: TOKEN, intervalMinutes: null, projects: [], suggestions: false };
+const fake: CloudConfig = { url: 'https://cloud.example.com', token: TOKEN, intervalMinutes: null, projects: [], suggestions: false, machine: null };
 
 describeStores('cloud sync', (h) => {
   let store: Store;
@@ -131,7 +131,7 @@ describeStores('cloud sync', (h) => {
   // sets these). Skipped otherwise: the open-source suite never needs the hosted service.
   const e2e = process.env.CLOUD_E2E_URL && process.env.CLOUD_E2E_TOKEN && process.env.CLOUD_E2E_ORG;
   test.skipIf(!e2e)('end to end: the approved lesson arrives in the cloud org as a team lesson', async () => {
-    const cloud: CloudConfig = { url: process.env.CLOUD_E2E_URL!, token: process.env.CLOUD_E2E_TOKEN!, intervalMinutes: null, projects: [], suggestions: false };
+    const cloud: CloudConfig = { url: process.env.CLOUD_E2E_URL!, token: process.env.CLOUD_E2E_TOKEN!, intervalMinutes: null, projects: [], suggestions: false, machine: null };
     const org = process.env.CLOUD_E2E_ORG!;
     const title = `E2E lesson ${h.kind}`;
     await seedSyncProject(store, `e2e-${h.kind}`, `github.com/acme/e2e-${h.kind}`, title);

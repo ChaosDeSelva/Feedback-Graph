@@ -18,6 +18,13 @@ function parseDetails(raw: string | null | undefined): Record<string, unknown> {
   }
 }
 
+function activityOf(p: Record<string, any>): Activity {
+  return {
+    id: p.id, ts: p.ts, kind: p.kind, actor: p.actor, projectKey: p.projectKey ?? null,
+    subject: p.subject, why: p.why, details: parseDetails(p.details), targets: p.targets ?? [],
+  };
+}
+
 export class ActivityRepo implements ActivityStore {
   readonly g: GraphRepo;
 
@@ -41,21 +48,26 @@ export class ActivityRepo implements ActivityStore {
     );
   }
 
-  async list(q: { projectKey?: string; projectKeys?: string[]; kind?: ActivityKind; target?: string; limit?: number }): Promise<Activity[]> {
+  async list(q: { projectKey?: string; projectKeys?: string[]; kind?: ActivityKind; target?: string; limit?: number; maxDetailBytes?: number }): Promise<Activity[]> {
+    // details is a JSON string: one bigger than maxDetailBytes is never sent from the database.
     const rows = await this.g.run(
       `MATCH (x:Activity)
        WHERE ($projectKey IS NULL OR x.projectKey = $projectKey) AND ($kind IS NULL OR x.kind = $kind)
          AND ($projectKeys IS NULL OR x.projectKey IS NULL OR x.projectKey IN $projectKeys)
          AND ($target IS NULL OR $target IN x.targets)
-       RETURN x ORDER BY x.order DESC LIMIT $limit`,
-      { projectKey: q.projectKey ?? null, projectKeys: q.projectKeys ?? null, kind: q.kind ?? null, target: q.target ?? null, limit: neo4j.int(q.limit ?? 200) },
+       WITH x, $max IS NOT NULL AND size(coalesce(x.details, '')) > $max AS omitted
+       RETURN x {.id, .ts, .kind, .actor, .projectKey, .subject, .why, .targets, details: CASE WHEN omitted THEN null ELSE x.details END} AS row, omitted
+       ORDER BY x.order DESC LIMIT $limit`,
+      {
+        projectKey: q.projectKey ?? null, projectKeys: q.projectKeys ?? null, kind: q.kind ?? null, target: q.target ?? null,
+        limit: neo4j.int(q.limit ?? 200), max: q.maxDetailBytes === undefined ? null : neo4j.int(q.maxDetailBytes),
+      },
     );
-    return rows.map((r) => {
-      const p = r.get('x').properties;
-      return {
-        id: p.id, ts: p.ts, kind: p.kind, actor: p.actor, projectKey: p.projectKey ?? null,
-        subject: p.subject, why: p.why, details: parseDetails(p.details), targets: p.targets ?? [],
-      };
-    });
+    return rows.map((r) => ({ ...activityOf(r.get('row')), ...(r.get('omitted') && { detailsOmitted: true }) }));
+  }
+
+  async get(id: string): Promise<Activity | null> {
+    const [r] = await this.g.run('MATCH (x:Activity {id: $id}) RETURN x', { id });
+    return r ? activityOf(r.get('x').properties) : null;
   }
 }

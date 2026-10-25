@@ -1,5 +1,5 @@
 import { beforeAll, expect, test } from 'vitest';
-import { MODULE_TESTS_DEPTH, sessionFiles, type CodeMapWrite } from '../codegraph.ts';
+import { CODE_MAP_VERSION, MODULE_TESTS_DEPTH, sessionFiles, type CodeMapWrite } from '../codegraph.ts';
 import type { Store } from '../store.ts';
 import { describeStores, type StoreProbe } from '../testing/index.ts';
 import type { Classification, ParsedSession, PostMortem, Project, ToolCall } from '../types.ts';
@@ -66,13 +66,13 @@ describeStores('CodeGraphStore', (h) => {
   });
 
   /** Ingest a session with its touched files and run its post-mortem; returns the feedback id. */
-  async function miss(id: string, calls: ToolCall[], missed = `missed in ${id}`, o: { reject?: boolean; paths?: string[] } = {}) {
+  async function miss(id: string, calls: ToolCall[], missed = `missed in ${id}`, o: { reject?: boolean; paths?: string[]; subject?: 'process' } = {}) {
     const s = session(id, calls);
     await store.graph.upsertSession(demo, s, []);
     await store.codegraph.recordSessionFiles(id, sessionFiles(s, HOST));
     await store.graph.saveClassification(`${id}-t1`, pushback, true);
     await store.graph.decide(`${id}-t1`, 'confirmed', null);
-    await store.knowledge.savePostmortem(`${id}-t1`, pm(missed, o.paths), { miss: vec(1), lesson: vec(1) });
+    await store.knowledge.savePostmortem(`${id}-t1`, { ...pm(missed, o.paths), ...(o.subject && { subject: o.subject }) }, { miss: vec(1), lesson: vec(1) });
     if (o.reject) await store.graph.decide(`${id}-t1`, 'rejected', null);
     return `${id}-t1`;
   }
@@ -89,8 +89,64 @@ describeStores('CodeGraphStore', (h) => {
     expect(m.imports.toSorted((a, b) => `${a.from} ${a.to}`.localeCompare(`${b.from} ${b.to}`))).toEqual(
       codeMap().imports.toSorted((a, b) => `${a.from} ${a.to}`.localeCompare(`${b.from} ${b.to}`)),
     );
-    expect(await store.codegraph.codeMapMeta('demo')).toEqual({ fingerprint: 'head:abc', builtAt: m.builtAt, stats, candidates: null, unresolved: null });
+    expect(await store.codegraph.codeMapMeta('demo')).toEqual({ fingerprint: 'head:abc', builtAt: m.builtAt, stats, candidates: null, unresolved: null, version: null });
+    expect(m.outside).toEqual([]);
     expect(await store.codegraph.codeMap('other')).toBeNull();
+  });
+
+  test('a map keeps the version of the map rules it was built by; one without (an older worker) reads back null', async () => {
+    await store.codegraph.replaceCodeMap('demo', codeMap({ version: CODE_MAP_VERSION }));
+    expect((await store.codegraph.codeMapMeta('demo'))?.version).toBe(CODE_MAP_VERSION);
+    expect((await store.codegraph.codeMap('demo'))?.version).toBe(CODE_MAP_VERSION);
+    await store.codegraph.replaceCodeMap('demo', codeMap());
+    expect((await store.codegraph.codeMapMeta('demo'))?.version).toBeNull();
+  });
+
+  test('the import index past the cap: outside files keep their edges, count as importers, and are never mapped files', async () => {
+    // A capped map: src/utils/log.ts and two importers of db.ts are past the cap, in the index only.
+    const capped = codeMap({
+      outside: [file('src/jobs/sync.ts'), file('src/utils/log.ts'), file('test/sync.test.ts', true)],
+      imports: [
+        ...codeMap().imports,
+        { from: 'src/jobs/sync.ts', to: 'src/db.ts', names: ['Db'], spec: '../db.ts' },
+        { from: 'src/jobs/sync.ts', to: 'src/utils/log.ts', names: ['log'], spec: '../utils/log.ts' },
+        { from: 'src/api.ts', to: 'src/utils/log.ts', names: ['log'], spec: './utils/log.ts' },
+        { from: 'test/sync.test.ts', to: 'src/jobs/sync.ts', names: [], spec: '../src/jobs/sync.ts' },
+      ],
+      candidates: 9,
+    });
+    expect(await store.codegraph.replaceCodeMap('demo', capped)).toEqual({ files: 6, symbols: 3, imports: 10, tests: 3 });
+    const m = (await store.codegraph.codeMap('demo'))!;
+    expect(m.files.map((f) => f.path)).toEqual(codeMap().files.map((f) => f.path));
+    expect(m.outside).toEqual([file('src/jobs/sync.ts'), file('src/utils/log.ts'), file('test/sync.test.ts', true)]);
+    expect(m.imports).toHaveLength(10);
+    // Importers past the cap count: db.ts has three importers, one of them outside the map.
+    expect((await store.codegraph.moduleContext('demo', 'src/db.ts'))!.importers).toEqual(['src/api.ts', 'src/cli.ts', 'src/jobs/sync.ts', 'test/db.test.ts']);
+    expect((await store.codegraph.hotspots('demo', 10)).find((h) => h.path === 'src/db.ts')?.dependents).toBe(4);
+    // A file past the cap has no module context, but the index says who imports it.
+    expect(await store.codegraph.moduleContext('demo', 'src/utils/log.ts')).toBeNull();
+    expect(await store.codegraph.outsideMap('demo', ['src/utils/log.ts', 'src/db.ts', 'src/nowhere.ts'])).toEqual([
+      // api.test.ts covers api.ts, which imports it
+      { path: 'src/utils/log.ts', importers: ['src/api.ts', 'src/jobs/sync.ts'], tests: ['test/api.test.ts'] },
+    ]);
+    expect(await store.codegraph.outsideMap('demo', ['src/jobs/sync.ts'])).toEqual([{ path: 'src/jobs/sync.ts', importers: ['test/sync.test.ts'], tests: ['test/sync.test.ts'] }]);
+    const impact = await store.codegraph.impact('demo', ['src/utils/log.ts'], 2);
+    expect(impact.paths).toEqual(['src/utils/log.ts']);
+    expect(impact.dependents.map((d) => d.path)).toEqual(['src/api.ts', 'src/jobs/sync.ts', 'src/main.ts', 'test/api.test.ts', 'test/sync.test.ts']);
+    // Index files are not orphans.
+    expect(await store.codegraph.purgeOrphanCodeFiles(100)).toBe(0);
+    // A file moving into the map leaves the index (one record), and a map without the index drops it and its edges.
+    await store.codegraph.replaceCodeMap('demo', codeMap({ files: [...codeMap().files, file('src/utils/log.ts')], outside: [file('src/jobs/sync.ts')], imports: capped.imports }));
+    const moved = (await store.codegraph.codeMap('demo'))!;
+    expect(moved.files.map((f) => f.path)).toContain('src/utils/log.ts');
+    expect(moved.outside.map((f) => f.path)).toEqual(['src/jobs/sync.ts']);
+    expect(moved.imports.some((i) => i.from === 'test/sync.test.ts')).toBe(false);
+    await store.codegraph.replaceCodeMap('demo', codeMap());
+    const plain = (await store.codegraph.codeMap('demo'))!;
+    expect(plain.outside).toEqual([]);
+    expect(plain.imports).toHaveLength(6);
+    expect(await store.codegraph.outsideMap('demo', ['src/jobs/sync.ts'])).toEqual([]);
+    expect(await probe.ids('CodeFile')).not.toContain('demo:src/jobs/sync.ts');
   });
 
   test('a capped map keeps how many files were worth mapping, never fewer than it holds', async () => {
@@ -204,6 +260,24 @@ describeStores('CodeGraphStore', (h) => {
     // A closed fact still cites it; a scanned file still in the repo is the scan's memory of its hash; map files stay.
     expect(ids).toEqual(expect.arrayContaining(['demo:docs/cited.md', 'demo:docs/kept.md', 'demo:src/db.ts']));
     expect(await store.facts.fileHashes('demo')).toEqual(new Map([['docs/kept.md', 'sha1-docs/kept.md']]));
+    expect(await store.codegraph.purgeOrphanCodeFiles(100)).toBe(0);
+  });
+
+  test('purgeOrphanCodeFiles also deletes files never mapped nor scanned that nothing refers to any more (a session touched them once)', async () => {
+    await store.codegraph.replaceCodeMap('demo', codeMap());
+    const s = session('s-once', [edit('lib/once.ts', '2026-10-01T10:01:00Z'), edit('lib/still.ts', '2026-10-01T10:02:00Z')]);
+    await store.graph.upsertSession(demo, s, []);
+    await store.codegraph.recordSessionFiles('s-once', sessionFiles(s, HOST));
+    // The session is read again and now touched only one of them: the other is referred to by nothing.
+    const again = session('s-once', [edit('lib/still.ts', '2026-10-01T10:02:00Z')]);
+    await store.codegraph.recordSessionFiles('s-once', sessionFiles(again, HOST));
+    await store.facts.saveFileFacts('demo', { path: 'docs/kept.md', hash: 'sha1-kept', summary: 's' }, [], 'ollama:gemma4');
+    await store.codegraph.purgeOrphanCodeFiles(100);
+    const ids = await probe.ids('CodeFile');
+    expect(ids).not.toContain('demo:lib/once.ts');
+    // A scanned file is the scan's memory of its hash; map files stay; what the session still touches is intact.
+    expect(ids).toEqual(expect.arrayContaining(['demo:docs/kept.md', 'demo:src/db.ts']));
+    expect((await store.codegraph.sessionFiles('s-once')).map((f) => f.path)).toEqual(['lib/still.ts']);
     expect(await store.codegraph.purgeOrphanCodeFiles(100)).toBe(0);
   });
 
@@ -328,6 +402,28 @@ describeStores('CodeGraphStore', (h) => {
     expect((await store.codegraph.moduleContext('demo', 'src/api.ts'))!.misses).toEqual([expect.objectContaining({ paths: ['src/api.ts'], fixedHere: false })]);
     // Read-only files are not linked.
     expect((await store.codegraph.moduleContext('demo', 'src/main.ts'))!.misses).toEqual([]);
+  });
+
+  test('a process miss (branches, pushes, pull requests) is tied to none of the files its session edited', async () => {
+    await store.codegraph.replaceCodeMap('demo', codeMap());
+    await miss('s1', [edit('src/api.ts', '2026-10-01T10:00:30Z'), edit('src/db.ts', '2026-10-01T10:00:40Z')], 'pushed before review', { subject: 'process' });
+    expect((await store.codegraph.moduleContext('demo', 'src/db.ts'))!.misses).toEqual([]);
+    expect((await store.codegraph.impact('demo', ['src/api.ts'], 3)).misses).toEqual([]);
+    expect((await store.codegraph.hotspots('demo', 100)).find((x) => x.path === 'src/api.ts')).toMatchObject({ misses: 0 });
+  });
+
+  test('an old miss marked a process miss afterwards (setMissSubject) leaves the files it was on', async () => {
+    await store.codegraph.replaceCodeMap('demo', codeMap());
+    const fid = await miss('s1', [edit('src/db.ts', '2026-10-01T10:00:40Z')], 'pushed before review');
+    expect((await store.codegraph.moduleContext('demo', 'src/db.ts'))!.misses).toHaveLength(1);
+    expect(await store.knowledge.setMissSubject(`miss:${fid}`, 'process')).toBe(true);
+    expect((await store.codegraph.moduleContext('demo', 'src/db.ts'))!.misses).toEqual([]);
+    // Once: it has a subject now.
+    expect(await store.knowledge.setMissSubject(`miss:${fid}`, 'process')).toBe(false);
+    // Undone (a changed rule no longer calls it a process miss): on the file again, read from its session.
+    expect(await store.knowledge.setMissSubject(`miss:${fid}`, null)).toBe(true);
+    expect((await store.codegraph.moduleContext('demo', 'src/db.ts'))!.misses).toHaveLength(1);
+    expect(await store.knowledge.setMissSubject(`miss:${fid}`, null)).toBe(false);
   });
 
   test('approved lessons reach a file through its misses or through their paths; proposed ones do not', async () => {

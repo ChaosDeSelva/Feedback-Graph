@@ -24,6 +24,24 @@ describe('parseTranscript', () => {
     expect(s.toolCalls).toHaveLength(2);
   });
 
+  test('the branch is the one the files were changed on, not the one the session started on', () => {
+    const rec = (o: object) => JSON.stringify({ sessionId: 's1', cwd: '/r/web', ...o });
+    const edit = (ts: string, gitBranch: string, file: string) => rec({ type: 'assistant', uuid: `a${ts}`, timestamp: ts, gitBranch, message: { content: [{ type: 'tool_use', name: 'Edit', input: { file_path: file } }] } });
+    const say = (ts: string, gitBranch: string, text: string) => rec({ type: 'user', uuid: `u${ts}`, timestamp: ts, gitBranch, message: { content: text } });
+    const started = say('2026-10-25T09:00:00Z', 'fix/invite-access', 'what is on this branch?');
+    const work = [
+      say('2026-10-25T10:00:00Z', 'fix/chart-embeds', 'fix the chart embeds'),
+      edit('2026-10-25T10:01:00Z', 'fix/chart-embeds', '/r/web/src/markdown/pipeline.ts'),
+      say('2026-10-25T10:02:00Z', 'fix/chart-embeds', 'thanks'),
+    ];
+    // A look around on the old branch, then all the edits on the new one.
+    expect(parseTranscript([started, ...work].join('\n'), 'f')[0].gitBranch).toBe('fix/chart-embeds');
+    // Back on another branch after the edits, with no edits there: still the branch the work is on.
+    expect(parseTranscript([started, ...work, say('2026-10-25T11:00:00Z', 'main', 'ok')].join('\n'), 'f')[0].gitBranch).toBe('fix/chart-embeds');
+    // No edits at all: the branch it was last on.
+    expect(parseTranscript([started, say('2026-10-25T09:05:00Z', 'main', 'and on main?')].join('\n'), 'f')[0].gitBranch).toBe('main');
+  });
+
   test('strips system-reminder blocks from turn text', () => {
     const [s] = parseTranscript(fixture('basic.jsonl'), 'basic.jsonl');
     expect(s.turns[1].text).toBe("This isn't good enough, filtering should be server-side.");

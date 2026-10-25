@@ -90,8 +90,8 @@ export function Integrations() {
 }
 
 function SourceBadge({ s }: { s: ServiceView }) {
-  if (s.envSet) return <Badge title={`${s.envVar} is set in .env; it wins over a token saved here`}>set in .env</Badge>;
-  if (s.savedInApp) return <Badge>saved here</Badge>;
+  if (s.savedInApp) return <Badge title={s.envSet ? `wins over ${s.envVar} in .env` : undefined}>saved here</Badge>;
+  if (s.envSet) return <Badge title={`${s.envVar} in .env; a token saved here wins over it`}>set in .env</Badge>;
   return null;
 }
 
@@ -106,7 +106,9 @@ function ServiceCard({ kind, view, onChange }: { kind: IntegrationKind; view: In
   const c = s.connection;
   const connected = c.state !== 'not_connected';
   const rejected = s.errorKind === 'auth' && c.state === 'error';
-  const showForm = !s.envSet && view.canSave && (!connected || replacing || rejected);
+  const showForm = view.canSave && (!connected || replacing || rejected);
+  // The token in use: one saved here wins over .env.
+  const fromEnv = s.envSet && !s.savedInApp;
 
   async function run(what: 'connect' | 'test' | 'disconnect', f: () => Promise<void>) {
     setBusy(what);
@@ -140,7 +142,7 @@ function ServiceCard({ kind, view, onChange }: { kind: IntegrationKind; view: In
   const disconnect = () => run('disconnect', async () => {
     onChange(await integrationsApi.disconnect(kind));
     setConfirming(false);
-    setResult(`Disconnected. Comments already in the Inbox stay; nothing new is read from ${NAME[kind]}.`);
+    setResult(s.envSet ? `Removed the token saved here; ${s.envVar} in .env is used again.` : `Disconnected. Comments already in the Inbox stay; nothing new is read from ${NAME[kind]}.`);
   });
 
   return (
@@ -168,7 +170,7 @@ function ServiceCard({ kind, view, onChange }: { kind: IntegrationKind; view: In
             )}
           </dd>
           <dt className="text-muted">Token</dt>
-          <dd>{s.envSet ? <>from <Mono>{s.envVar}</Mono> in <Mono>.env</Mono></> : 'saved in this app (never shown again)'}</dd>
+          <dd>{fromEnv ? <>from <Mono>{s.envVar}</Mono> in <Mono>.env</Mono></> : 'saved in this app (never shown again)'}</dd>
           <dt className="text-muted">Last sync</dt>
           <dd title={s.lastSyncAt ?? undefined}>{s.lastSyncAt ? ago(s.lastSyncAt) : 'not yet: the worker syncs within a few minutes'}</dd>
           {s.rateLimitedUntil && Date.parse(s.rateLimitedUntil) > Date.now() && (
@@ -180,10 +182,16 @@ function ServiceCard({ kind, view, onChange }: { kind: IntegrationKind; view: In
         </dl>
       )}
 
-      {s.envSet && (
+      {fromEnv && !showForm && (
         <p className="text-xs text-muted">
-          The token comes from <Mono>{s.envVar}</Mono> in <Mono>.env</Mono>, which wins over anything saved here. To change or remove it, edit{' '}
-          <Mono>.env</Mono> and restart (<Mono>docker compose up -d</Mono>).
+          The token comes from <Mono>{s.envVar}</Mono> in <Mono>.env</Mono>. Replace it here and the saved token is used instead; to remove the one in{' '}
+          <Mono>.env</Mono>, delete the line there and restart (<Mono>docker compose up -d</Mono>).
+        </p>
+      )}
+
+      {s.envSet && s.savedInApp && (
+        <p className="text-xs text-muted">
+          The token saved here is used. <Mono>{s.envVar}</Mono> is also set in <Mono>.env</Mono>: Disconnecting goes back to {s.envVar} in .env.
         </p>
       )}
 
@@ -210,22 +218,27 @@ function ServiceCard({ kind, view, onChange }: { kind: IntegrationKind; view: In
             <Button type="submit" variant="primary" disabled={!token.trim() || busy !== null}>{busy === 'connect' ? 'Checking' : rejected || replacing ? 'Replace token' : 'Connect'}</Button>
             {replacing && <Button onClick={() => { setReplacing(false); setToken(''); }}>Cancel</Button>}
           </div>
-          <p className="text-[11px] text-muted">Checked with one read-only call before it is saved. A token that does not work is not kept.</p>
+          <p className="text-[11px] text-muted">
+            Checked with one read-only call before it is saved. A token that does not work is not kept.
+            {s.envSet && ` A token saved here wins over ${s.envVar} in .env.`}
+          </p>
         </form>
       )}
 
       {connected && (
         <div className="flex flex-wrap gap-2">
           <Button size="sm" onClick={test} disabled={busy !== null}>{busy === 'test' ? 'Testing' : 'Test connection'}</Button>
-          {!s.envSet && view.canSave && !replacing && !rejected && <Button size="sm" onClick={() => setReplacing(true)} disabled={busy !== null}>Replace token</Button>}
-          {s.savedInApp && !s.envSet && <Button size="sm" variant="danger-outline" onClick={() => setConfirming(true)} disabled={busy !== null}>Disconnect</Button>}
+          {view.canSave && !replacing && !rejected && <Button size="sm" onClick={() => setReplacing(true)} disabled={busy !== null}>Replace token</Button>}
+          {s.savedInApp && <Button size="sm" variant="danger-outline" onClick={() => setConfirming(true)} disabled={busy !== null}>Disconnect</Button>}
         </div>
       )}
 
       <ConfirmDialog
         open={confirming}
         title={`Disconnect ${NAME[kind]}?`}
-        message={`The token saved here is deleted from this machine and nothing new is read from ${NAME[kind]}. Comments already in the Inbox, and what was learned from them, stay.`}
+        message={s.envSet
+          ? `The token saved here is deleted from this machine and ${s.envVar} in .env is used again.`
+          : `The token saved here is deleted from this machine and nothing new is read from ${NAME[kind]}. Comments already in the Inbox, and what was learned from them, stay.`}
         confirmLabel={`Disconnect ${NAME[kind]}`}
         busyLabel="Disconnecting"
         busy={busy === 'disconnect'}
@@ -351,7 +364,7 @@ const HOW: Partial<Record<ConnectionName, ReactNode>> = {
   claude: <>Set with <Mono>./scripts/setup.sh</Mono> (a Claude token) or <Mono>POSTMORTEM_LLM</Mono> in <Mono>.env</Mono>.</>,
   codex: <>Set <Mono>POSTMORTEM_LLM</Mono> or <Mono>SCAN_LLM</Mono> to <Mono>codex-cli</Mono> in <Mono>.env</Mono>.</>,
   ollama: <>Runs on your machine; <Mono>OLLAMA_URL</Mono> in <Mono>.env</Mono>.</>,
-  cloud: <><Mono>CLOUD_URL</Mono> and <Mono>CLOUD_TOKEN</Mono> in <Mono>.env</Mono>; see Cloud sync below.</>,
+  cloud: <><Mono>CLOUD_URL</Mono> and <Mono>CLOUD_TOKEN</Mono> in <Mono>.env</Mono>; see the Cloud sync tab.</>,
 };
 
 /** Every connection in one list, as the sidebar shows it, with where each one is set. */

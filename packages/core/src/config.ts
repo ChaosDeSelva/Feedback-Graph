@@ -4,7 +4,7 @@ import type { Root } from './projects.ts';
 import { DEFAULT_NUM_CTX, DEFAULT_NUM_PREDICT, DEFAULT_OLLAMA_TIMEOUT_MS, DEFAULT_REPEAT_PENALTY } from './ollama.ts';
 
 /** Bumped with each release; reported by /api/status and the worker heartbeat. */
-export const VERSION = '0.6.0';
+export const VERSION = '0.6.1';
 
 export class ConfigError extends Error {
   readonly problems: string[];
@@ -146,6 +146,8 @@ export type CloudConfig = {
   intervalMinutes: number | null;
   /** Projects to sync; empty means the projects selected in Settings. */
   projects: string[];
+  /** CLOUD_MACHINE: this machine's name, sent as x-fg-machine (a provenance label on the cloud's sync log). Null: none. */
+  machine: string | null;
   /**
    * SYNC_SUGGESTIONS=true: also send lessons you have not approved (proposed ones arrive as suggestions for an admin).
    * false (the default): only approved lessons leave, plus the new status of any lesson the cloud already has.
@@ -187,10 +189,10 @@ export type OperatorVerb = (typeof OPERATOR_VERBS)[number];
 /**
  * Off unless OPERATOR_ALLOW names them: deciding lessons (what agents are taught), and what deletes data (deleting a
  * project, an uploaded document or an Ask conversation; settings, whose cleanup deletes unselected projects' data), imports
- * lessons from a file, or sets integration keys. `chat` (asking in Ask) is on: it spends the owner's model subscription
- * but teaches agents nothing.
+ * lessons from a file, or sets integration keys; and `chat` (asking in Ask), which spends the owner's Claude or Codex
+ * subscription.
  */
-const OPERATOR_DEFAULT_OFF: readonly OperatorVerb[] = ['lesson_decide', 'delete_project', 'docs_delete', 'settings', 'import', 'integrations', 'chat_delete'];
+const OPERATOR_DEFAULT_OFF: readonly OperatorVerb[] = ['lesson_decide', 'delete_project', 'docs_delete', 'settings', 'import', 'integrations', 'chat', 'chat_delete'];
 
 /** FG_OPERATOR_TOKEN: agents (the `fg` CLI) may make the owner decisions in `allow`. Never log `token`. */
 export type OperatorConfig = { token: string; allow: OperatorVerb[] };
@@ -328,8 +330,10 @@ export function loadConfig(env: Env): Config {
     // Never echo the value: a mistyped token is still most of a secret.
     if (cloudToken && !CLOUD_TOKEN_RE.test(cloudToken)) problems.push('CLOUD_TOKEN is not a Feedback Graph Cloud token (fgc_pat_<16 hex>_<43 characters>)');
     const interval = env.SYNC_INTERVAL_MINUTES?.trim() ? num('SYNC_INTERVAL_MINUTES', 60, 5) : null;
+    const machine = env.CLOUD_MACHINE?.trim() || null;
+    if (machine && !/^[\w.-]{1,64}$/.test(machine)) problems.push('CLOUD_MACHINE must be 1 to 64 letters, digits, dots, dashes or underscores');
     if (problems.length === before) {
-      cloud = { url: cloudUrl.replace(/\/+$/, ''), token: cloudToken, intervalMinutes: interval, projects: list(env.SYNC_PROJECTS), suggestions: syncSuggestions === 'true' };
+      cloud = { url: cloudUrl.replace(/\/+$/, ''), token: cloudToken, intervalMinutes: interval, projects: list(env.SYNC_PROJECTS), suggestions: syncSuggestions === 'true', machine };
     }
   } else {
     if (syncSuggestions === 'true') problems.push('SYNC_SUGGESTIONS needs CLOUD_URL and CLOUD_TOKEN');

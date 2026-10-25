@@ -58,7 +58,11 @@ export type IntegrationsView = {
   skippedSince: string | null;
 };
 
-export type SkipRuleView = { name: string; description: string; skipped: number | null };
+/**
+ * skipped: comments the rule kept from the classifier, counting fromInbox: items already pending in the Inbox that it
+ * skipped later (the rules changed, or the authors became known; worker integrations/pendingSkips.ts).
+ */
+export type SkipRuleView = { name: string; description: string; skipped: number | null; fromInbox: number | null };
 
 /** How many comments_skipped entries (one per project and worker cycle that skipped something) the counts add up. */
 const SKIP_ENTRIES = 1000;
@@ -66,12 +70,17 @@ const SKIP_ENTRIES = 1000;
 async function skipRules(d: IntegrationsDeps): Promise<{ rules: SkipRuleView[]; skippedSince: string | null }> {
   const entries = d.activity?.list ? await d.activity.list({ kind: 'comments_skipped', limit: SKIP_ENTRIES }).catch(() => null) : null;
   const counts: Record<string, number> = {};
+  const fromInbox: Record<string, number> = {};
   for (const e of entries ?? []) {
-    const rules = (e.details as { rules?: Record<string, unknown> } | null)?.rules ?? {};
-    for (const [name, n] of Object.entries(rules)) if (typeof n === 'number') counts[name] = (counts[name] ?? 0) + n;
+    const details = e.details as { rules?: Record<string, unknown>; pending?: unknown } | null;
+    for (const [name, n] of Object.entries(details?.rules ?? {})) {
+      if (typeof n !== 'number') continue;
+      counts[name] = (counts[name] ?? 0) + n;
+      if (typeof details?.pending === 'number') fromInbox[name] = (fromInbox[name] ?? 0) + n;
+    }
   }
   return {
-    rules: FEEDBACK_SKIP_RULES.map((r) => ({ name: r.name, description: r.description, skipped: entries ? counts[r.name] ?? 0 : null })),
+    rules: FEEDBACK_SKIP_RULES.map((r) => ({ name: r.name, description: r.description, skipped: entries ? counts[r.name] ?? 0 : null, fromInbox: entries ? fromInbox[r.name] ?? 0 : null })),
     skippedSince: entries?.length ? entries.map((e) => e.ts).sort()[0] : null,
   };
 }
@@ -237,7 +246,6 @@ export function integrationRoutes(app: Hono, d: IntegrationsDeps) {
     const kind = Kind.safeParse(c.req.param('kind'));
     if (!kind.success) return c.json({ error: 'unknown service: github or linear' }, 404);
     const k = kind.data;
-    if (i.envSet(k)) return c.json({ error: `${ENV_VAR[k]} is set in .env, which wins over a token saved here. Change it there and restart.` }, 409);
     if (!i.canSave) return c.json({ error: `tokens cannot be saved here (no INTEGRATIONS_FILE): set ${ENV_VAR[k]} in .env instead` }, 501);
     const body = Token.safeParse(await c.req.json().catch(() => null));
     if (!body.success) return c.json({ error: body.error.issues[0]?.message ?? 'send { "token": "..." }' }, 400);
@@ -265,7 +273,7 @@ export function integrationRoutes(app: Hono, d: IntegrationsDeps) {
     const k = kind.data;
     if (i.envSet(k) && !(await i.savedInApp(k))) return c.json({ error: `${ENV_VAR[k]} is set in .env: remove it there and restart to disconnect.` }, 409);
     await i.removeCredential(k);
-    await record(k, `disconnected ${NAME[k]}`, 'you removed the token saved in Settings; comments already in the Inbox stay');
+    await record(k, `disconnected ${NAME[k]}`, i.envSet(k) ? `you removed the token saved in Settings, so ${ENV_VAR[k]} in .env is used again` : 'you removed the token saved in Settings; comments already in the Inbox stay');
     return c.json(await integrationsView(d));
   });
 

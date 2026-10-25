@@ -29,10 +29,16 @@ export type ProjectLink = {
   evidence: LinkEvidence[];
   createdAt: string;
   updatedAt: string;
+  /**
+   * Who made its last decision: 'you' (the UI) or 'operator:<name>' (an agent holding FG_OPERATOR_TOKEN). Null for a
+   * detected suggestion nobody has decided, or one decided before this was recorded.
+   */
+  decidedBy: string | null;
 };
 
 export type DetectedLink = { a: string; b: string; relation: LinkRelation; score: number; evidence: LinkEvidence[] };
-export type LinkPatch = { status?: LinkStatus; relation?: LinkRelation; note?: string };
+/** decidedBy: who made this change ('you', 'operator:<name>'); unset keeps the last one. */
+export type LinkPatch = { status?: LinkStatus; relation?: LinkRelation; note?: string; decidedBy?: string };
 
 /** The pair in store order. Throws on a link from a project to itself. */
 export function linkPair(x: string, y: string): [string, string] {
@@ -105,9 +111,9 @@ export class LinksRepo implements LinksStore {
          ON CREATE SET l.a = $a, l.b = $b, l.status = 'confirmed', l.source = 'you', l.note = '', l.relation = 'related',
                        l.score = 0.0, l.evidence = '[]', l.createdAt = $now
        SET l.status = coalesce($status, l.status), l.relation = coalesce($relation, l.relation), l.note = coalesce($note, l.note),
-           l.updatedAt = $now
+           l.decidedBy = coalesce($decidedBy, l.decidedBy), l.updatedAt = $now
        RETURN l`,
-      { id: linkIdOf(a, b), a, b, status: patch.status ?? null, relation: patch.relation ?? null, note: patch.note === undefined ? null : cleanNote(patch.note), now: new Date().toISOString() },
+      { id: linkIdOf(a, b), a, b, status: patch.status ?? null, relation: patch.relation ?? null, note: patch.note === undefined ? null : cleanNote(patch.note), decidedBy: patch.decidedBy ?? null, now: new Date().toISOString() },
     );
     return linkOf(r.get('l').properties);
   }
@@ -137,5 +143,6 @@ function linkOf(p: Record<string, unknown>): ProjectLink {
     evidence,
     createdAt: p.createdAt as string,
     updatedAt: p.updatedAt as string,
+    decidedBy: (p.decidedBy as string) ?? null,
   };
 }

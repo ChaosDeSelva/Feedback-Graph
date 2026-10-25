@@ -50,3 +50,13 @@ export function healthSince(prev: ProviderHealth | undefined, next: ProviderHeal
   const since = prev && !prev.ok && prev.provider === next.provider ? (prev.since ?? prev.at) : next.at;
   return { ...next, since };
 }
+
+/**
+ * Whether a round of the worker loop did work you are waiting for, so it goes again without sleeping: turns
+ * classified, post-mortems written, an upload read. The relevance backfill (`scored`) is not: it takes one batch per
+ * wake, last in line, and would otherwise keep the loop (and its scope refresh, ingest and sync checks) spinning for
+ * as long as old facts remain unscored.
+ */
+export function cycleProgressed(r: { turnsClassified: number; postmortems: number; docRead: boolean; scored: number }): boolean {
+  return r.turnsClassified > 0 || r.postmortems > 0 || r.docRead;
+}

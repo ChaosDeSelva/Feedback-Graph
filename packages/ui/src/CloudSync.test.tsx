@@ -97,6 +97,25 @@ test('a Sync now with nothing to send says so instead of claiming a sync', async
   expect(c.queryByText(/Sent 0 projects/)).toBeNull();
 });
 
+test('a Sync now that finds every project unchanged says nothing changed, never "Sent 0 projects"', async () => {
+  const none = { projects: 0, lessons: 0, misses: 0, facts: 0, docs: 0, codeFiles: 0 };
+  syncAnswer = () => Response.json({ ok: true, host: 'cloud.example.com', sent: none, projects: [{ key: 'shop', status: 'unchanged', counts }, { key: 'api', status: 'unchanged', counts }], error: null });
+  render(<CloudSync />);
+  const c = await card();
+  fireEvent.click(c.getByRole('button', { name: 'Sync now' }));
+  expect(await c.findByText(/Nothing changed since the last sync \(2 projects unchanged\)/)).toBeTruthy();
+  expect(c.queryByText(/Sent 0 projects/)).toBeNull();
+  expect(c.queryByText(/Nothing to send yet/)).toBeNull();
+});
+
+test('a Sync now that sent some projects names how many were unchanged', async () => {
+  syncAnswer = () => Response.json({ ok: true, host: 'cloud.example.com', sent: counts, projects: [{ key: 'shop', status: 'sent', counts }, { key: 'api', status: 'sent', counts }, { key: 'blog', status: 'unchanged', counts }], error: null });
+  render(<CloudSync />);
+  const c = await card();
+  fireEvent.click(c.getByRole('button', { name: 'Sync now' }));
+  expect(await c.findByText(/Sent 2 projects to cloud\.example\.com: .*; 1 project unchanged since the last sync\./)).toBeTruthy();
+});
+
 test('a failed last sync shows its error', async () => {
   state = info({ last: { at: '2026-10-23T09:00:00Z', ok: false, trigger: 'schedule', error: 'shop: the cloud refused the token (401)', sent: null, projects: [], failed: ['shop'] }, nextAt: '2026-10-23T11:00:00Z' });
   render(<CloudSync />);

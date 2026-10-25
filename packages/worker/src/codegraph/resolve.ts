@@ -4,9 +4,10 @@ import type { RawImport } from './types.ts';
 
 /**
  * unresolved: the import looks like it names a file of this repo (a tsconfig paths alias, a #-import, a workspace
- * package, or a bare name no package.json declares) but no file was found, so the import graph misses an edge.
+ * package, a bare name no package.json declares, a module of a Python package of the repo, a Python relative import)
+ * but no file was found, so the import graph misses an edge. to null: no edge at all (it is only counted).
  */
-export type Resolved = { to: string; names: string[]; unresolved?: true };
+export type Resolved = { to: string | null; names: string[]; unresolved?: true };
 export type Resolve = (from: string, lang: string, raw: RawImport) => Resolved[];
 
 /** Repo-relative join; '' is the repo root; null when the path leaves the repo. */
@@ -82,6 +83,14 @@ function matchPattern(patterns: string[], spec: string): { pattern: string; star
 type TsConfig = { baseUrl?: string; paths?: Record<string, string[]>; pathsDir?: string; configDir: string };
 const CONFIG_FILE = /^[tj]sconfig[^/]*\.json$/;
 const NODE_BUILTINS = new Set(builtinModules.map((m) => m.replace(/^node:/, '').split('/')[0]));
+/** Python standard library modules a repo folder may share a name with (tools/logging/): never "unresolved". */
+const PY_STDLIB = new Set((
+  'abc argparse ast asyncio base64 bisect builtins calendar collections concurrent contextlib copy csv ctypes dataclasses ' +
+  'datetime decimal difflib email enum errno functools gc getpass glob gzip hashlib heapq hmac html http importlib inspect io ' +
+  'ipaddress itertools json logging math mimetypes multiprocessing operator os pathlib pickle platform pprint queue random re ' +
+  'secrets select shlex shutil signal socket sqlite3 ssl stat statistics string struct subprocess sys tempfile textwrap ' +
+  'threading time timeit tomllib traceback types typing unittest urllib uuid warnings weakref xml zipfile zlib zoneinfo'
+).split(' '));
 /** Marks a JS import that looks like it names a repo file but resolved to none (Resolved.unresolved). */
 const UNRESOLVED = Symbol('unresolved');
 
@@ -327,6 +336,16 @@ export function makeResolver(paths: string[], read: (path: string) => string | u
     if (!names.length) add(mod.file, '*');
     return [...out].map(([to, ns]) => ({ to, names: ns }));
   };
+  /** Top-level names a Python import of this repo's own code may start with: folders holding .py files, and .py stems. */
+  const pyLocal = lazy(() => {
+    const s = new Set<string>();
+    for (const p of paths) {
+      if (!p.endsWith('.py')) continue;
+      s.add(base(p).slice(0, -3));
+      for (let d = dirOf(p); d; d = dirOf(d)) s.add(base(d));
+    }
+    return s;
+  });
   const resolvePython = (from: string, spec: string, names: string[]): Resolved[] | null => {
     if (spec.startsWith('.')) {
       const dots = spec.match(/^\.+/)![0].length;
@@ -336,7 +355,8 @@ export function makeResolver(paths: string[], read: (path: string) => string | u
       const modPath = join(d, spec.slice(dots).replace(/\./g, '/'));
       if (modPath === null) return [];
       const mod = pyModule(modPath);
-      return mod.file || mod.isDir ? pyFrom(modPath, mod, names) : [];
+      // A relative import is always this repo's code: one that names nothing is counted.
+      return mod.file || mod.isDir ? pyFrom(modPath, mod, names) : [{ to: null, names, unresolved: true }];
     }
     const segs = spec.split('.');
     const wholeModule = names.every((n) => n === '*');
@@ -503,7 +523,10 @@ export function makeResolver(paths: string[], read: (path: string) => string | u
       }
       case 'python': {
         const r = resolvePython(from, spec, names);
-        return r === null ? [{ to: `pkg:${spec.split('.')[0]}`, names }] : r.filter((x) => x.to !== from);
+        const top = spec.split('.')[0];
+        // Not found in the repo: a module of one of its own packages is unresolved; anything else is a package.
+        if (r === null) return [{ to: `pkg:${top}`, names, ...(pyLocal().has(top) && !PY_STDLIB.has(top) ? { unresolved: true as const } : {}) }];
+        return r.filter((x) => x.to !== from);
       }
       case 'go': {
         const r = resolveGo(spec);

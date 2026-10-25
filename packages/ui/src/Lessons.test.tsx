@@ -38,6 +38,21 @@ test('shows the evidence chain for the selected lesson', async () => {
   expect(screen.getByText(/move filter to API/)).toBeTruthy();
 });
 
+test('a lesson from a GitHub review names the reviewer, not you, and shows the review verdict neutrally', async () => {
+  const ext = { source: 'github', author: 'octo-reviewer', url: 'https://github.com/acme/shop/pull/12#discussion_r1', reviewState: 'APPROVED' };
+  vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+    if (url.startsWith('/api/lessons?')) return Response.json([lesson('l1', 'Server search')]);
+    if (url === '/api/lessons/l1') { const d = detail('l1', 'Server search'); return Response.json({ ...d, feedback: { ...d.feedback, external: ext } }); }
+    return Response.json([]);
+  }));
+  render(<Lessons />);
+  expect(await screen.findByText(/octo-reviewer said/i)).toBeTruthy();
+  expect(screen.queryByText(/^you said$/i)).toBeNull();
+  const verdict = screen.getByText('review: approved');
+  expect(verdict.className).not.toMatch(/\bok\b|text-ok/);
+  expect(screen.getByRole('link', { name: /on GitHub/i }).getAttribute('href')).toBe(ext.url);
+});
+
 test('approve sends edited fields with the status', async () => {
   render(<Lessons />);
   const rule = (await screen.findByLabelText('rule')) as HTMLTextAreaElement;
@@ -209,8 +224,9 @@ test("what the lesson check found shows as chips in the list and, with the reaso
   render(<Lessons />);
   await screen.findByText('filtered on the client');
   const list = screen.getByRole('complementary', { name: 'lessons' });
-  expect(within(list).getByText('wrong session')).toBeTruthy();
-  expect(within(list).getByText('about feedback')).toBeTruthy();
+  // The chips, not the filter menus that name every check.
+  expect(within(list).getByText('wrong session', { ignore: 'option' })).toBeTruthy();
+  expect(within(list).getByText('about feedback', { ignore: 'option' })).toBeTruthy();
   const found = screen.getByRole('region', { name: 'what the lesson check found' });
   expect(within(found).getByText(/redone from the comment alone/)).toBeTruthy();
   expect(within(found).getByText(/not about the work/)).toBeTruthy();
@@ -312,4 +328,73 @@ test('edits to an approved lesson are saved with Save, without changing its stat
   // Still listed and still open: saved edits are no longer unsaved.
   await waitFor(() => expect((screen.getByRole('button', { name: 'Save' }) as HTMLButtonElement).disabled).toBe(true));
   expect(screen.getByText('Server search', { selector: 'h2' })).toBeTruthy();
+});
+
+// ── Bulk decisions ─────────────────────────────────────────────────────
+
+function bulkFetch(listed: object[]) {
+  const posts: { url: string; body: any }[] = [];
+  const lists: string[] = [];
+  vi.stubGlobal('fetch', vi.fn(async (url: string, init?: RequestInit) => {
+    if (init?.method === 'POST' && url === '/api/lessons/decisions') {
+      const body = JSON.parse(init.body as string);
+      posts.push({ url, body });
+      return Response.json({ results: body.items.map((i: { id: string; status: string }) => ({ id: i.id, ok: true, status: i.status })) });
+    }
+    if (url.startsWith('/api/lessons?')) { lists.push(url); return Response.json(listed); }
+    const m = /^\/api\/lessons\/(\w+)$/.exec(url);
+    if (m) return Response.json(detail(m[1], m[1]));
+    return Response.json([]);
+  }));
+  return { posts, lists };
+}
+
+const flagged = (id: string, title: string, names: string[], extra: object = {}) =>
+  ({ ...lesson(id, title), checks: names.map((name) => ({ name, why: `why ${name}` })), ...extra });
+
+test('select rows, Reject selected: one confirm with a note, one request, and the decided lessons leave the list', async () => {
+  const f = bulkFetch([flagged('l1', 'Server search', ['platitude']), flagged('l2', 'Auth checks', []), flagged('l3', 'Cache keys', ['platitude'])]);
+  render(<Lessons />);
+  fireEvent.click(await screen.findByRole('checkbox', { name: 'select Server search' }));
+  fireEvent.click(screen.getByRole('checkbox', { name: 'select Cache keys' }));
+  expect(screen.getByText('2 selected')).toBeTruthy();
+  fireEvent.click(screen.getByRole('button', { name: 'Reject selected' }));
+  const ask = await screen.findByRole('dialog', { name: /reject 2 lessons/i });
+  expect(ask.textContent).toContain('Server search');
+  expect(ask.textContent).toContain('Cache keys');
+  fireEvent.change(within(ask).getByLabelText('note'), { target: { value: 'platitudes' } });
+  fireEvent.click(within(ask).getByRole('button', { name: 'Reject 2 lessons' }));
+  await waitFor(() => expect(f.posts).toEqual([{ url: '/api/lessons/decisions', body: { items: [{ id: 'l1', status: 'rejected', note: 'platitudes' }, { id: 'l3', status: 'rejected', note: 'platitudes' }] } }]));
+  await waitFor(() => expect(screen.queryByRole('checkbox', { name: 'select Server search' })).toBeNull());
+  expect(screen.getByRole('checkbox', { name: 'select Auth checks' })).toBeTruthy();
+  expect(screen.queryByText(/selected$/)).toBeNull();
+});
+
+test('"select all with flag" picks exactly the lessons carrying it; Approve selected, and Cancel sends nothing', async () => {
+  const f = bulkFetch([flagged('l1', 'Server search', ['looks-like-a-fact', 'needs-path']), flagged('l2', 'Auth checks', ['needs-path']), flagged('l3', 'Cache keys', ['platitude'])]);
+  render(<Lessons />);
+  await screen.findByRole('checkbox', { name: 'select Server search' });
+  fireEvent.change(screen.getByLabelText('select all with flag'), { target: { value: 'needs-path' } });
+  expect((screen.getByRole('checkbox', { name: 'select Server search' }) as HTMLInputElement).checked).toBe(true);
+  expect((screen.getByRole('checkbox', { name: 'select Auth checks' }) as HTMLInputElement).checked).toBe(true);
+  expect((screen.getByRole('checkbox', { name: 'select Cache keys' }) as HTMLInputElement).checked).toBe(false);
+  fireEvent.click(screen.getByRole('button', { name: 'Approve selected' }));
+  const ask = await screen.findByRole('dialog', { name: /approve 2 lessons/i });
+  expect(ask.textContent).toMatch(/agents/i);
+  fireEvent.click(within(ask).getByRole('button', { name: 'Cancel' }));
+  expect(f.posts).toEqual([]);
+  fireEvent.click(screen.getByRole('button', { name: 'Approve selected' }));
+  fireEvent.click(within(await screen.findByRole('dialog', { name: /approve 2 lessons/i })).getByRole('button', { name: 'Approve 2 lessons' }));
+  await waitFor(() => expect(f.posts[0]?.body).toEqual({ items: [{ id: 'l1', status: 'approved' }, { id: 'l2', status: 'approved' }] }));
+});
+
+test('the list filters by source (GitHub review vs session pushback) and by flag, on the server', async () => {
+  const f = bulkFetch([flagged('l1', 'Server search', [], { from: 'github' })]);
+  render(<Lessons />);
+  await screen.findByRole('checkbox', { name: 'select Server search' });
+  fireEvent.change(screen.getByLabelText('source'), { target: { value: 'github' } });
+  await waitFor(() => expect(f.lists.at(-1)).toBe('/api/lessons?status=proposed&source=github'));
+  fireEvent.change(screen.getByLabelText('flag'), { target: { value: 'duplicate-of' } });
+  await waitFor(() => expect(f.lists.at(-1)).toBe('/api/lessons?status=proposed&flag=duplicate-of&source=github'));
+  expect(screen.getAllByText('GitHub review').length).toBeGreaterThan(0);
 });

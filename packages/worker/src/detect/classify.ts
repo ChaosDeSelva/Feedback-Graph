@@ -29,6 +29,7 @@ Labels:
 - approval: the developer accepts the work ("looks good", "perfect, ship it").
 - neutral: a new request, a question, an instruction, or status chatter that does not judge the previous work.
 New feature requests are neutral even if phrased as "make X bigger" without implying the agent got it wrong.
+An instruction for what the agent does next (a constraint such as "keep it on its own branch, don't push a PR yet") is neutral when nothing shows the agent already did what it forbids. It is a correction when the agent's tool calls before it, or AFTER THIS MESSAGE when listed, show it did (it pushed, merged, opened a pull request).
 Strong words alone (wtf, why is) do not make a message pushback: a pasted error message or a bug report about something the agent did not just work on is neutral.
 For a comment on a pull request or issue:
 - The pull request author explaining or defending their choices to a reviewer is neutral: it is not feedback on the agent.
@@ -78,11 +79,14 @@ export function describeTurn(turn: HumanTurn): string {
     .map((c) => `${c.name} ${c.filePath ?? c.command ?? ''}`.trim())
     .slice(-15)
     .join('\n');
+  const next = (turn.followingToolCalls ?? []).map((c) => `${c.name} ${c.command ?? c.filePath ?? ''}`.trim()).slice(0, 15).join('\n');
   return [
     `AGENT'S LAST MESSAGE:\n${turn.precedingAssistantText || '(none)'}`,
     `AGENT'S TOOL CALLS:\n${tools || '(none)'}`,
     `DEVELOPER'S MESSAGE:\n${turn.text}`,
-  ].join('\n\n');
+    // Only for an instruction about git that the agent then broke (cycle.ts): the evidence.
+    next && `AGENT'S TOOL CALLS AFTER THIS MESSAGE (what it did next):\n${next}`,
+  ].filter(Boolean).join('\n\n');
 }
 
 /**

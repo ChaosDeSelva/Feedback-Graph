@@ -1,5 +1,5 @@
 import { expect, test } from 'vitest';
-import { inScope, MAX_SHARDS, MIN_SHARD_FILES, planShards, shardBudget, shardScope, type Shard } from './shard.ts';
+import { inScope, MAX_SHARD_BUDGET, MAX_SHARD_FILES, MAX_SHARDS, MIN_SHARD_FILES, planShards, shardBudget, shardScope, type Shard } from './shard.ts';
 
 /** n files under dir (dir/f0.ts, ...), plus a manifest when given. */
 const pkg = (dir: string, n: number, manifest?: string) => [...(manifest ? [`${dir}/${manifest}`] : []), ...Array.from({ length: n }, (_, i) => `${dir}/f${i}.ts`)];
@@ -87,11 +87,49 @@ test('the rest scope also owns project-wide facts (".") and paths no package cla
   expect(inScope('.', shardScope(a, shards))).toBe(false);
 });
 
-test('the fact budget scales with the shard, from 10 to 60', () => {
+test('the fact budget scales with the shard and does not saturate on a big one', () => {
   expect(shardBudget(1)).toBe(10);
   expect(shardBudget(5)).toBe(10);
   expect(shardBudget(50)).toBeGreaterThan(20);
   expect(shardBudget(100)).toBeGreaterThan(shardBudget(50));
-  expect(shardBudget(400)).toBe(60);
-  expect(shardBudget(20_000)).toBe(60);
+  // 0.6.0 stopped at 60 from 225 files: a 400-file shard got the budget of a 225-file one.
+  expect(shardBudget(400)).toBeGreaterThan(shardBudget(225));
+  expect(shardBudget(400)).toBeGreaterThanOrEqual(80);
+  expect(shardBudget(20_000)).toBe(MAX_SHARD_BUDGET);
+});
+
+test('directories with their own manifest are shards beside the declared workspaces, and a shard over the size limit is split', () => {
+  // A realistic monorepo: the root package.json declares four workspaces, and src/ holds 17 Go and Python services
+  // with their own go.mod or pyproject.toml, which no workspace file names. 0.6.0 put all of src/ in one shard.
+  const tree = (dir: string, subdirs: Record<string, number>) => Object.entries(subdirs).flatMap(([sub, n]) => pkg(sub ? `${dir}/${sub}` : dir, n));
+  const paths = [
+    'package.json', 'README.md', ...pkg('docs', 20),
+    'apps/web/package.json', ...tree('apps/web', { components: 380, routes: 300, lib: 200, '': 12 }),
+    ...pkg('apps/admin', 150, 'package.json'), ...pkg('packages/ui', 300, 'package.json'), ...pkg('packages/shared', 120, 'package.json'),
+    ...Array.from({ length: 17 }, (_, i) => {
+      const dir = `src/svc-${String(i).padStart(2, '0')}`;
+      const manifest = i % 2 ? 'pyproject.toml' : 'go.mod';
+      // two big services, laid out like Go services usually are
+      return i < 2 ? [`${dir}/${manifest}`, ...tree(dir, { internal: 380, cmd: 40, pkg: 300 })] : pkg(dir, 280, manifest);
+    }).flat(),
+    // a test fixture's manifest is not a package
+    ...pkg('packages/ui/test/fixtures/demo', 3, 'package.json'),
+  ];
+  expect(paths.length).toBeGreaterThan(7000);
+  const shards = planShards(paths, { 'package.json': JSON.stringify({ workspaces: ['apps/*', 'packages/*'] }) });
+  expect(shards.length).toBeGreaterThanOrEqual(20);
+  expect(shards.length).toBeLessThanOrEqual(MAX_SHARDS);
+  expect(Math.max(...shards.map((s) => s.files.length))).toBeLessThanOrEqual(MAX_SHARD_FILES);
+  for (let i = 0; i < 17; i++) expect(shards.some((s) => s.roots.includes(`src/svc-${String(i).padStart(2, '0')}`)), `svc-${i}`).toBe(true);
+  expect(shards.some((s) => s.roots.includes('apps/web/components'))).toBe(true);
+  expect(shards.some((s) => s.roots.includes('src/svc-00/internal'))).toBe(true);
+  expect(shards.some((s) => s.roots.includes('packages/ui/test/fixtures/demo'))).toBe(false);
+  expectPartition(paths, shards);
+});
+
+test('a flat directory over the size limit stays one shard (a scope is a directory), and small subdirectories stay with their parent', () => {
+  expect(summary(planShards(pkg('src/generated', 900), {}))).toEqual([['src/generated', 900]]);
+  const nested = [...pkg('lib', 380), ...pkg('lib/a', 3), ...pkg('lib/b', 30)];
+  // The rest of the repo (413 files) is split: lib/ becomes a shard, and lib/b inside it; lib/a (3 files) stays in lib.
+  expect(summary(planShards(nested, {}))).toEqual([['lib', 383], ['lib/b', 30]]);
 });

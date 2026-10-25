@@ -114,7 +114,7 @@ test('the operator token lists every admin tool, each description naming its ver
   expect(res.status).toBe(200);
   const tools = ((await res.json()) as { result: { tools: { name: string; description: string }[] } }).result.tools;
   expect(tools.map((t) => t.name).sort()).toEqual([
-    'cloud_sync_now', 'inbox_decide', 'inbox_list', 'lesson_decide', 'lessons_list', 'link_decide', 'list_projects',
+    'cloud_sync_now', 'inbox_decide', 'inbox_get', 'inbox_list', 'lesson_decide', 'lesson_get', 'lessons_list', 'link_decide', 'list_projects',
     'pipeline_status', 'rebuild_code_map', 'scan_projects', 'select_projects', 'set_fact_relevance',
   ]);
   expect(tools.find((t) => t.name === 'lesson_decide')!.description).toContain('lesson_decide');
@@ -176,7 +176,10 @@ test('pipeline_status: the status and every stage backlog', async () => {
 test('list_projects: the selection and the shown projects', async () => {
   const j = JSON.parse((await tool(setup().app, 'list_projects', {})).text);
   expect(j.tracked).toEqual(['acme']);
-  expect(j.projects.map((p: { key: string }) => p.key)).toContain('demo-shop');
+  expect(j.items.map((p: { key: string; selected: boolean }) => [p.key, p.selected])).toEqual([['acme', true], ['demo-shop', false]]);
+  expect(j).toMatchObject({ total: 2, more: 0 });
+  const only = JSON.parse((await tool(setup().app, 'list_projects', { selected_only: true })).text);
+  expect(only.items.map((p: { key: string }) => p.key)).toEqual(['acme']);
 });
 
 test('select_projects adds, narrows to only, or removes', async () => {
@@ -217,7 +220,7 @@ test('scan_projects with wait follows each job until it is done', async () => {
 test('inbox_list filters by status, project and source', async () => {
   const s = setup();
   const j = JSON.parse((await tool(s.app, 'inbox_list', { status: 'pending', project: 'demo-shop', source: 'github' })).text);
-  expect(j.map((c: { id: string }) => c.id)).toEqual(['c2']);
+  expect(j.items.map((c: { id: string }) => c.id)).toEqual(['c2']);
   expect(s.calls.listCandidates[0]).toEqual(expect.objectContaining({ status: 'pending', projectKey: 'demo-shop' }));
 });
 
@@ -230,7 +233,84 @@ test('inbox_decide decides many items and says per item what happened', async ()
 
 test('lessons_list lists lessons', async () => {
   const j = JSON.parse((await tool(setup().app, 'lessons_list', { status: 'proposed' })).text);
-  expect(j[0].id).toBe('l1');
+  expect(j.items[0].id).toBe('l1');
+});
+
+/** A fake app for the paging tests: `n` Inbox items with a long PR description each, and as many lessons. */
+function many(n: number) {
+  const description = 'D'.repeat(6000);
+  const items = Array.from({ length: n }, (_, i) => ({
+    ...cand(`c${i}`, 'github'), createdAt: 't', decidedBy: null,
+    classification: { label: 'pushback', confidence: 0.9, summary: 'S'.repeat(500), signals: [] },
+    external: { source: 'github', kind: 'review_comment', author: 'pat', authorKind: 'human', url: `https://github.com/acme/shop/pull/1#c${i}`, title: 'Add search', description, diffHunk: 'H'.repeat(3000) },
+  }));
+  const lessons = Array.from({ length: n }, (_, i) => ({ ...lesson, id: `l${i}`, rule: 'R'.repeat(2000), checks: [{ name: 'platitude', why: 'w' }] }));
+  const asked: string[] = [];
+  const request = async (path: string) => {
+    asked.push(path);
+    if (path.startsWith('/api/candidates/c3')) return Response.json({ candidate: items[3], turn: { text: 'no' } });
+    if (path.startsWith('/api/candidates?')) return Response.json(items);
+    if (path.startsWith('/api/lessons/l3')) return Response.json({ lesson: lessons[3], miss: null });
+    if (path.startsWith('/api/lessons')) return Response.json(lessons);
+    return Response.json({ error: 'no' }, { status: 404 });
+  };
+  const call = async (name: string, args: object) => {
+    const req = new Request('http://localhost/mcp/admin', rpc({ method: 'tools/call', params: { name, arguments: args } }, bearer(OP)));
+    const res = await handleAdminMcp(req, { request });
+    return ((await res.json()) as { result: ToolResult & { structuredContent?: any } }).result;
+  };
+  return { call, asked, description };
+}
+
+test('lists are compact and paged: 20 rows by default, and a note that says how many more and which offset to pass', async () => {
+  const m = many(25);
+  for (const name of ['inbox_list', 'lessons_list']) {
+    const r = await m.call(name, {});
+    const page = r.structuredContent;
+    // The text is the same JSON, for clients that read only text.
+    expect(JSON.parse(r.content[0].text)).toEqual(page);
+    expect(page.items).toHaveLength(20);
+    expect(page).toMatchObject({ total: 25, offset: 0, more: 5 });
+    expect(page.note).toMatch(/5 more.*offset: 20/);
+    // No PR description, diff or full rule in a row: the get tool has those.
+    expect(r.content[0].text).not.toContain(m.description);
+    expect(r.content[0].text.length, name).toBeLessThan(20 * 700);
+    const next = (await m.call(name, { offset: 20 })).structuredContent;
+    expect(next).toMatchObject({ offset: 20, more: 0 });
+    expect(next.items).toHaveLength(5);
+    expect(next.note).toBeUndefined();
+  }
+  const row = (await m.call('inbox_list', { limit: 1 })).structuredContent.items[0];
+  expect(row).toMatchObject({ id: 'c0', projectKey: 'demo-shop', source: 'github', label: 'pushback', author: 'pat', url: expect.stringContaining('github.com'), title: 'Add search' });
+  expect(row.summary.length).toBeLessThanOrEqual(240);
+  expect((await m.call('lessons_list', { limit: 1 })).structuredContent.items[0]).toMatchObject({ id: 'l0', checks: ['platitude'] });
+});
+
+test('inbox_get and lesson_get return one item in full', async () => {
+  const m = many(5);
+  const item = (await m.call('inbox_get', { id: 'c3' })).structuredContent;
+  expect(item.candidate.external.description).toBe(m.description);
+  expect((await m.call('lesson_get', { id: 'l3' })).structuredContent.lesson.rule).toHaveLength(2000);
+  expect(m.asked).toEqual(['/api/candidates/c3', '/api/lessons/l3']);
+  const missing = await m.call('inbox_get', { id: 'c9' });
+  expect(missing.isError).toBe(true);
+});
+
+test('read tools say they are read-only, so a client need not ask before each call; decisions do not', async () => {
+  const { app } = setup();
+  const res = await app.request('/mcp/admin', rpc({ method: 'tools/list', params: {} }, bearer(OP)));
+  const tools = ((await res.json()) as { result: { tools: { name: string; annotations?: Record<string, boolean> }[] } }).result.tools;
+  const reads = tools.filter((t) => t.annotations?.readOnlyHint).map((t) => t.name).sort();
+  expect(reads).toEqual(['inbox_get', 'inbox_list', 'lesson_get', 'lessons_list', 'list_projects', 'pipeline_status']);
+  for (const t of tools) {
+    expect(t.annotations, t.name).toBeDefined();
+    expect(t.annotations!.readOnlyHint, t.name).toBe(!(t.name in ADMIN_TOOLS) || ADMIN_TOOLS[t.name as keyof typeof ADMIN_TOOLS] === null);
+  }
+  // Decisions agents learn from cannot be taken back by the tool that made them.
+  expect(tools.find((t) => t.name === 'lesson_decide')!.annotations!.destructiveHint).toBe(true);
+  expect(tools.find((t) => t.name === 'scan_projects')!.annotations!.destructiveHint).toBe(false);
+  // Sync now sends data to Feedback Graph Cloud: beyond this machine.
+  expect(tools.find((t) => t.name === 'cloud_sync_now')!.annotations!.openWorldHint).toBe(true);
 });
 
 test('lesson_decide approves when OPERATOR_ALLOW names lesson_decide, attributed to the agent', async () => {
@@ -245,7 +325,7 @@ test('link_decide confirms a link', async () => {
   const s = setup();
   const r = await tool(s.app, 'link_decide', { a: 'acme', b: 'demo-shop', decision: 'confirm', relation: 'related' });
   expect(r.isError).toBeFalsy();
-  expect(s.calls.setLink[0]).toEqual(['acme', 'demo-shop', { status: 'confirmed', relation: 'related' }]);
+  expect(s.calls.setLink[0]).toEqual(['acme', 'demo-shop', { status: 'confirmed', relation: 'related', decidedBy: 'operator:codex' }]);
   expect(s.logged.at(-1)!.actor).toBe('operator:codex');
 });
 

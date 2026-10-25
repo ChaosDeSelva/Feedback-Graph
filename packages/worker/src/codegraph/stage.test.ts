@@ -2,7 +2,7 @@ import { execFileSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import type { ActivityInput, CodeMapMeta, CodeMapWrite, StoredCodeMap } from '@fb/core';
+import { CODE_MAP_VERSION, type ActivityInput, type CodeMapMeta, type CodeMapWrite, type StoredCodeMap } from '@fb/core';
 import { afterEach, expect, test } from 'vitest';
 import { worktreeGitArgs } from '../ingest/git.ts';
 import { fileFingerprint, gitStatusTimeoutMs, MapStage, repoFingerprint, type MapStageDeps } from './stage.ts';
@@ -100,12 +100,12 @@ function fakes(over: Partial<MapStageDeps> = {}) {
   let fp: string | null = 'fp1';
   const deps: MapStageDeps = {
     store: {
-      codeMapMeta: async (): Promise<CodeMapMeta | null> => stored && { fingerprint: stored.fingerprint, builtAt: stored.builtAt, stats: stored.stats, candidates: stored.write.candidates ?? null },
+      codeMapMeta: async (): Promise<CodeMapMeta | null> => stored && { fingerprint: stored.fingerprint, builtAt: stored.builtAt, stats: stored.stats, candidates: stored.write.candidates ?? null, unresolved: stored.write.unresolved ?? null, version: stored.write.version ?? null },
       codeMap: async () => stored,
       replaceCodeMap: async (_key, w) => {
         writes.push(w);
         const stats = { files: w.files.length, symbols: w.symbols.length, imports: w.imports.length, tests: w.tests.length };
-        stored = { fingerprint: w.fingerprint, builtAt: 't', stats, candidates: w.candidates ?? null, files: w.files, symbols: w.symbols, imports: w.imports, write: w };
+        stored = { fingerprint: w.fingerprint, builtAt: 't', stats, candidates: w.candidates ?? null, files: w.files, outside: w.outside ?? [], symbols: w.symbols, imports: w.imports, write: w };
         return stats;
       },
     },
@@ -187,6 +187,37 @@ test('an unchanged repo is not rebuilt; a changed one is, incrementally, but not
   expect(f.builds).toHaveLength(2);
   expect(f.builds[1].prev?.files.map((x) => x.path)).toEqual(['src/db.ts', 'test/db.test.ts']);
   expect(f.activity.at(-1)).toMatchObject({ why: 'the repo changed since the last map', details: expect.objectContaining({ incremental: true }) });
+});
+
+test('a map built by older map rules (or none) is rebuilt from scratch at start, logged, even when the repo is unchanged', async () => {
+  const logged: [string, object | undefined][] = [];
+  const f = fakes({ log: (m, e) => logged.push([m, e]) });
+  const stage = new MapStage(f.deps);
+  await stage.pass();
+  expect(f.writes[0].version).toBe(CODE_MAP_VERSION);
+  // What an older worker left: the same repo, but no version (or an older one) on the stored map.
+  for (const old of [null, CODE_MAP_VERSION - 1]) {
+    const meta = f.deps.store.codeMapMeta;
+    f.deps.store.codeMapMeta = async (k) => ({ ...(await meta(k))!, version: old });
+    const restarted = new MapStage(f.deps);
+    await restarted.pass();
+    f.deps.store.codeMapMeta = meta;
+    expect(f.builds.at(-1)?.prev).toBeUndefined();
+    expect(logged).toContainEqual(['code map outdated, rebuilding', { project: 'demo', version: old, current: CODE_MAP_VERSION }]);
+    expect(f.activity.at(-1)).toMatchObject({ why: `the map was built by older map rules (${old === null ? 'unversioned' : `v${old}`}, now v${CODE_MAP_VERSION})` });
+  }
+  expect(f.builds).toHaveLength(3);
+  // Rebuilt and current: an unchanged repo is left alone again.
+  const again = new MapStage(f.deps);
+  await again.pass();
+  expect(f.builds).toHaveLength(3);
+});
+
+test('churn is read before the build, so a capped map can keep the busiest files', async () => {
+  const opts: BuildOpts[] = [];
+  const f = fakes({ build: async (_repo, o) => { opts.push(o); return map; } });
+  await new MapStage(f.deps).pass();
+  expect(opts[0].churn?.get('src/db.ts')).toEqual({ commits: 4, lastTs: '2026-10-20T00:00:00.000Z' });
 });
 
 test('a folder git cannot read falls back to a file fingerprint: unchanged, it is not rebuilt, and that is logged once', async () => {

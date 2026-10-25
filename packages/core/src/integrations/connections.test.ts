@@ -11,7 +11,7 @@ function kv() {
 const tmpFile = () => join(mkdtempSync(join(tmpdir(), 'fg-int-')), 'settings', 'integrations.json');
 
 describe('Integrations', () => {
-  test('a pasted token is kept in a mode-600 file, never in the store; .env wins over it', async () => {
+  test('a pasted token is kept in a mode-600 file, never in the store, and wins over .env', async () => {
     const store = kv();
     const path = tmpFile();
     const app = new Integrations(store, {}, credentialFile(path));
@@ -23,8 +23,11 @@ describe('Integrations', () => {
 
     const env = new Integrations(store, { GITHUB_TOKEN: ' from-env ' }, credentialFile(path));
     expect(env.envSet('github')).toBe(true);
-    expect(await env.credential('github')).toMatchObject({ token: 'from-env', source: 'env' });
+    expect(await env.credential('github')).toMatchObject({ token: 'from-app', source: 'app' });
     expect(await env.savedInApp('github')).toBe(true);
+    // Forgetting the saved token falls back to .env.
+    await env.removeCredential('github');
+    expect(await env.credential('github')).toMatchObject({ token: 'from-env', source: 'env' });
   });
 
   test('without a file, tokens come only from .env and saving says why not', async () => {

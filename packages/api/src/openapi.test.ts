@@ -11,7 +11,7 @@ const anything: any = new Proxy({}, { get: (_, k) => (k === 'then' ? undefined :
 function fullApp() {
   return createApp(anything as ApiRepo, {
     context: anything, knowledge: anything, embed: async () => [], facts: anything, projectDirs: async () => [], insights: anything,
-    activity: anything, docs: anything, links: anything, portability: anything, auth: {}, log: () => {},
+    activity: anything, docs: anything, links: anything, portability: anything, auth: { operator: { token: 'o'.repeat(32), allow: [] } }, log: () => {},
     system: { version: '9.9.9', ping: async () => true, worker: async () => null },
     classifyQueue: anything, settings: anything, codegraph: anything, mapMaxFiles: null, cloud: anything, inScope: () => true,
     importer: anything, sessions: anything, shown: undefined, integrations: anything, chat: anything,
@@ -35,11 +35,12 @@ describe('GET /api/openapi.json', () => {
     expect((await app.request('/api/openapi.json', { headers: { authorization: `Bearer ${'x'.repeat(30)}` } })).status).toBe(200);
   });
 
-  test('describes every route the app registers (but the UI files and /mcp)', () => {
+  test('describes every route the app registers (but the UI files)', () => {
     const doc = openApiDocument('dev') as { paths: Record<string, Record<string, unknown>> };
+    // An ALL route (the MCP endpoints) counts as described by its POST; /api/* is the JSON 404 for every other path.
     const registered = fullApp().routes
-      .filter((r) => r.method !== 'ALL' && r.path !== '*' && r.path !== '/*' && r.path !== '/mcp')
-      .map((r) => `${r.method} ${r.path}`);
+      .filter((r) => r.path !== '*' && r.path !== '/*' && r.path !== '/api/*' && (r.method !== 'ALL' || r.path.startsWith('/mcp')))
+      .map((r) => `${r.method === 'ALL' ? 'POST' : r.method} ${r.path}`);
     expect(registered.length).toBeGreaterThan(60);
     const missing = [...new Set(registered)].filter((r) => {
       const [method, path] = r.split(' ');
@@ -50,8 +51,11 @@ describe('GET /api/openapi.json', () => {
 
   test('describes no route the app does not have', () => {
     const doc = openApiDocument('dev') as { paths: Record<string, Record<string, unknown>> };
-    const registered = new Set(fullApp().routes.map((r) => `${r.method.toLowerCase()} ${openApiPath(r.path)}`));
-    const extra = Object.entries(doc.paths).flatMap(([p, ops]) => Object.keys(ops).filter((m) => m !== 'parameters').map((m) => `${m} ${p}`)).filter((r) => !registered.has(r));
+    const routes = fullApp().routes;
+    const registered = new Set(routes.map((r) => `${r.method.toLowerCase()} ${openApiPath(r.path)}`));
+    const all = new Set(routes.filter((r) => r.method === 'ALL').map((r) => openApiPath(r.path)));
+    const extra = Object.entries(doc.paths).flatMap(([p, ops]) => Object.keys(ops).filter((m) => m !== 'parameters').map((m) => `${m} ${p}`))
+      .filter((r) => !registered.has(r) && !all.has(r.split(' ')[1]));
     expect(extra).toEqual([]);
   });
 
@@ -67,6 +71,52 @@ describe('GET /api/openapi.json', () => {
     for (const [p, ops] of Object.entries(doc.paths)) {
       for (const [m, op] of Object.entries(ops)) if (!owner.has(`${m} ${p}`)) expect(op['x-owner-only'], `${m} ${p}`).toBe(false);
     }
+  });
+
+  test('every operation has a 2xx response with a schema (but no content), and every $ref resolves', () => {
+    const doc = openApiDocument('dev') as any;
+    // GET on an MCP endpoint is refused (405: no server-sent stream), so it has no 2xx.
+    const ops = Object.entries(doc.paths as Record<string, Record<string, any>>).flatMap(([p, o]) => Object.entries(o).map(([m, op]) => [`${m} ${p}`, op] as const))
+      .filter(([name]) => !name.startsWith('get /mcp'));
+    expect(ops.length).toBeGreaterThan(70);
+    const refs: string[] = [];
+    const walk = (x: unknown) => {
+      if (!x || typeof x !== 'object') return;
+      for (const [k, v] of Object.entries(x)) {
+        if (k === '$ref' && typeof v === 'string') refs.push(v);
+        else walk(v);
+      }
+    };
+    for (const [name, op] of ops) {
+      const ok = Object.entries(op.responses).filter(([code]) => /^2\d\d$/.test(code));
+      expect(ok, name).toHaveLength(1);
+      const [code, res] = ok[0] as [string, any];
+      if (code === '204') { expect(res.content, name).toBeUndefined(); continue; }
+      const [schema] = Object.values(res.content ?? {}).map((c: any) => c.schema);
+      expect(schema, name).toBeDefined();
+      expect(Object.keys(schema).length, name).toBeGreaterThan(0);
+      walk(schema);
+    }
+    walk(doc.components.schemas);
+    const missing = [...new Set(refs)].filter((r) => !doc.components.schemas[r.replace('#/components/schemas/', '')]);
+    expect(missing).toEqual([]);
+    // The main shapes are spelled out, not left as an empty object.
+    for (const name of ['Candidate', 'Lesson', 'ProjectSummary', 'ScanJob', 'StoredFact', 'ProjectLink', 'Activity', 'SystemStatus', 'PipelineStatus', 'Error']) {
+      expect(doc.components.schemas[name]?.properties, name).toBeDefined();
+    }
+    expect(doc.paths['/api/candidates'].get.responses['200'].content['application/json'].schema).toEqual({ type: 'array', items: { $ref: '#/components/schemas/Candidate' } });
+    expect(doc.paths['/api/links'].put.responses['200'].content['application/json'].schema.$ref).toBe('#/components/schemas/ProjectLink');
+    expect(doc.paths['/api/lessons'].get.responses.default.content['application/json'].schema.$ref).toBe('#/components/schemas/Error');
+  });
+
+  test('the MCP endpoints are described: /mcp, and /mcp/admin with the operator token', () => {
+    const doc = openApiDocument('dev') as any;
+    for (const p of ['/mcp', '/mcp/admin']) {
+      expect(doc.paths[p].post.requestBody.content['application/json'].schema.$ref).toBe('#/components/schemas/JsonRpc');
+      expect(doc.paths[p].get.responses['405']).toBeDefined();
+    }
+    expect(doc.components.schemas.JsonRpc.properties.jsonrpc).toEqual({ const: '2.0' });
+    expect(doc.paths['/mcp/admin'].post.description).toMatch(/FG_OPERATOR_TOKEN/);
   });
 
   test('request bodies come from the zod schemas the routes validate with', () => {

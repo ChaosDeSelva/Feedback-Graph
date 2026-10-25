@@ -56,6 +56,19 @@ describe('the skip rules in Settings > Integrations', () => {
     expect(v.skippedSince).toBe('2026-10-23T10:00:00Z');
   });
 
+  test('items skipped later, from what was already pending in the Inbox, are counted too and said apart', async () => {
+    const { d } = setup();
+    const entries = [
+      { kind: 'comments_skipped', ts: '2026-10-25T10:00:00Z', details: { rules: { 'status-note': 3 }, pending: 3, rulesVersion: 2 } },
+      { kind: 'comments_skipped', ts: '2026-10-24T10:00:00Z', details: { rules: { 'status-note': 1, 'bot-author': 2 } } },
+    ];
+    const app = createApp(repo, { integrations: { ...d, activity: { record: async () => {}, list: async () => entries as never } } });
+    const v = await (await app.request('/api/settings/integrations')).json();
+    const note = v.rules.find((r: { name: string }) => r.name === 'status-note');
+    expect(note).toMatchObject({ skipped: 4, fromInbox: 3 });
+    expect(v.rules.find((r: { name: string }) => r.name === 'bot-author')).toMatchObject({ skipped: 2, fromInbox: 0 });
+  });
+
   test('without an activity log to count from, the rules are listed with no counts', async () => {
     const { app } = setup();
     const v = await (await app.request('/api/settings/integrations')).json();
@@ -101,12 +114,16 @@ describe('Settings > Integrations', () => {
     expect(() => readFileSync(path)).toThrow();
   });
 
-  test('a token in .env wins: shown as set in .env, and Settings cannot replace or remove it', async () => {
+  test('a token saved in Settings wins over .env; disconnecting it falls back to .env, which Settings cannot remove', async () => {
     const { app } = setup({ env: { GITHUB_TOKEN: TOKEN } });
     const v = await (await app.request('/api/settings/integrations')).json();
-    expect(v.github).toMatchObject({ envSet: true, envVar: 'GITHUB_TOKEN', connection: { source: 'env' } });
-    expect((await app.request('/api/settings/integrations/github', json('PUT', { token: 'another-token-123' }))).status).toBe(409);
+    expect(v.github).toMatchObject({ envSet: true, envVar: 'GITHUB_TOKEN', savedInApp: false, connection: { source: 'env' } });
     expect((await app.request('/api/settings/integrations/github', json('DELETE', {}))).status).toBe(409);
+    const saved = await app.request('/api/settings/integrations/github', json('PUT', { token: 'another-token-123' }));
+    expect(saved.status).toBe(200);
+    expect((await saved.json()).github).toMatchObject({ envSet: true, savedInApp: true, connection: { source: 'app' } });
+    const back = await (await app.request('/api/settings/integrations/github', json('DELETE', {}))).json();
+    expect(back.github).toMatchObject({ envSet: true, savedInApp: false, connection: { source: 'env' } });
   });
 
   test('Test connection re-checks the current token; disconnect removes it', async () => {

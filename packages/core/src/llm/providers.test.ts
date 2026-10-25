@@ -1,6 +1,7 @@
 import { expect, test } from 'vitest';
 import { makeProvider, makeProviderOr, strictSchema, type Exec } from './providers.ts';
 import { ModelOutputError } from './json.ts';
+import { withHealth } from './unavailable.ts';
 
 const schema = { type: 'object', properties: { answer: { type: 'string' }, n: { type: 'number' } }, required: ['answer'] };
 const task = { system: 'S', user: 'U', schema };
@@ -252,6 +253,43 @@ test('codex explores a mirror of the repo that has no secret files, removed afte
   expect(mirror).not.toBe(repo);
   expect(seen).toEqual({ 'src/a.ts': true, '.env': false, 'config/credentials.json': false, 'keys/id_ed25519': false, 'node_modules/x/index.js': false, '.git/config': false, 'src/notes.txt': false, 'src/passwd-link.ts': false });
   expect(existsSync(mirror)).toBe(false);
+});
+
+test('codex can mirror a repo once for many jobs: a job in a mirror it made is not copied again; any other folder still is', async () => {
+  const { mkdtempSync, mkdirSync, writeFileSync, existsSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const repo = mkdtempSync(join(tmpdir(), 'fb-repo-'));
+  for (const [f, c] of [['src/a.ts', 'export const a = 1'], ['.env', 'K=v']]) {
+    mkdirSync(join(repo, f, '..'), { recursive: true });
+    writeFileSync(join(repo, f), c);
+  }
+  const dirs: string[] = [];
+  const exec: Exec = async (_c, args) => {
+    dirs.push(args[args.indexOf('-C') + 1]);
+    await (await import('node:fs/promises')).writeFile(args[args.indexOf('-o') + 1], '{"answer":"x"}');
+    return { code: 0, stdout: '', stderr: '' };
+  };
+  const p = withHealth(makeProvider('codex-cli', CODEX_OK, { exec }), () => {});
+  const m = await p.mirror!(repo);
+  expect(existsSync(join(m.dir, 'src/a.ts'))).toBe(true);
+  expect(existsSync(join(m.dir, '.env'))).toBe(false);
+  await p.json({ ...task, cwd: m.dir });
+  await p.json({ ...task, cwd: m.dir });
+  expect(dirs).toEqual([m.dir, m.dir]);
+  // The repo itself (or any folder it did not make) is still mirrored per job.
+  await p.json({ ...task, cwd: repo });
+  expect(dirs[2]).not.toBe(repo);
+  expect(dirs[2]).not.toBe(m.dir);
+  await m.dispose();
+  expect(existsSync(m.dir)).toBe(false);
+  // Disposed: no longer trusted as a mirror.
+  mkdirSync(m.dir, { recursive: true });
+  writeFileSync(join(m.dir, '.env'), 'K=v');
+  await p.json({ ...task, cwd: m.dir });
+  expect(dirs[3]).not.toBe(m.dir);
+  // A provider that needs no mirror has none.
+  expect(makeProvider('claude-cli', { CLAUDE_CODE_OAUTH_TOKEN: 't' }).mirror).toBeUndefined();
 });
 
 test('claude-cli is confined to the repo: only the read tools, --restricted, nothing pre-approved outside the cwd', async () => {

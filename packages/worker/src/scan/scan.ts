@@ -9,8 +9,9 @@ import { extract } from '../codegraph/extract.ts';
 import { langOf } from '../codegraph/lang.ts';
 import { chunkBySymbols, type Chunk } from './chunk.ts';
 import { mapCap, rankCodePaths } from './rank.ts';
+import { gitChurn, hotScore, longCommentLines, scanOrder, type ScanSignals } from './priority.ts';
 import { inScope, shardBudget, shardRepo, shardScope } from './shard.ts';
-import { askJson, clampRelevance, FACT_KINDS, isSecretPath, modelTimeoutReason, ProviderUnavailableError, providerUnavailableReason, redactSecrets, type ActivityStore, type CodeFact, type FactScope, type FactsStore, type LlmProvider, type ScanJob } from '@fb/core';
+import { askJson, clampRelevance, FACT_KINDS, SCAN_PROMPT_VERSION, SCANNER_VERSION, type AgentMirror, isSecretPath, modelTimeoutReason, ProviderUnavailableError, providerUnavailableReason, redactSecrets, type ActivityStore, type CodeFact, type FactScope, type FactsStore, type LlmProvider, type ScanJob } from '@fb/core';
 
 const run = promisify(execFile);
 
@@ -27,13 +28,14 @@ const LOCKFILES = new Set(['pnpm-lock.yaml', 'package-lock.json', 'yarn.lock', '
 /** Files that hold credentials are never read, whatever their extension (the list lives in core). */
 const SECRET_FILE = { test: isSecretPath };
 export const MIN_CONFIDENCE = 0.5;
-/** Bump when the extraction prompts change, so the log says which prompt produced a fact. */
-export const SCAN_PROMPT_VERSION = 'scan-v4';
+// The scanner's versions live in core (scanner.ts): the API counts the files an older scanner read.
+export { SCAN_PROMPT_VERSION, SCAN_READER_VERSION, SCANNER_VERSION } from '@fb/core';
 const MAX_FILE_CHARS = 24_000;
 /** Files in a row whose model call timed out before a per-file scan gives up on this run. */
 const MAX_TIMEOUTS_IN_ROW = 3;
 
-export type CodeFile = { path: string; hash: string; size: number };
+/** comments: long explanatory comment lines (priority.ts), when the listing was asked to count them. */
+export type CodeFile = { path: string; hash: string; size: number; comments?: number };
 
 const wanted = (path: string) => {
   const name = path.split('/').pop()!;
@@ -64,7 +66,8 @@ async function walk(root: string, rel = ''): Promise<string[]> {
   return out;
 }
 
-export type ListOpts = { maxBytes: number; maxFiles: number | null; priority?: Iterable<string> };
+/** comments: also count each file's long explanatory comments (CodeFile.comments), for the scan order. */
+export type ListOpts = { maxBytes: number; maxFiles: number | null; priority?: Iterable<string>; comments?: boolean };
 
 /**
  * Source, docs and config worth reading; respects .gitignore when the dir is a git repo. Candidates are ranked before
@@ -81,9 +84,26 @@ export async function listCodeFilesWithTotal(repoPath: string, o: ListOpts): Pro
     const s = await lstat(join(repoPath, path)).catch(() => null); // a symlink could point at a secret or outside the repo
     if (!s?.isFile() || s.size > o.maxBytes) continue;
     const content = await readFile(join(repoPath, path));
-    files.push({ path, size: s.size, hash: createHash('sha1').update(content).digest('hex') });
+    files.push({ path, size: s.size, hash: createHash('sha1').update(content).digest('hex'), ...(o.comments && { comments: longCommentLines(path, content.toString('utf8')) }) });
   }
   return { files, totalCandidates: candidates.length, cap };
+}
+
+/**
+ * What the code map reads: every candidate that is a regular file within maxBytes, ranked by tier (rank.ts) with
+ * `priority` first, at most `limit` of them; and the map's cap (mapCap). The map parses all of them for its import
+ * index and keeps symbols for the first `cap` once it knows their importers.
+ */
+export async function listIndexPaths(repoPath: string, o: ListOpts & { limit: number }): Promise<{ paths: string[]; totalCandidates: number; cap: number }> {
+  const candidates = ((await gitFiles(repoPath)) ?? (await walk(repoPath))).filter(wanted);
+  const cap = mapCap(o.maxFiles, candidates.length);
+  const paths: string[] = [];
+  for (const path of rankCodePaths(candidates, { priority: o.priority })) {
+    if (paths.length >= o.limit) break;
+    const s = await lstat(join(repoPath, path)).catch(() => null); // a symlink could point at a secret or outside the repo
+    if (s?.isFile() && s.size <= o.maxBytes) paths.push(path);
+  }
+  return { paths, totalCandidates: candidates.length, cap };
 }
 
 /** The files a scan or a map would consider, before ranking and the cap (repo-relative paths). */
@@ -243,8 +263,15 @@ function identifiersIn(statement: string): string[] {
 const mentions = (text: string, id: string) => new RegExp(`(^|[^\\w$])${id.replace(/[$]/g, '\\$')}($|[^\\w$])`).test(text);
 /** Lines either side of a cited range that still count: models are often off by a line or two. */
 const LINE_SLACK = 2;
+/**
+ * How far above a cited range the name a statement gives may be declared: a fact about a function's body names the
+ * function, declared at its top. 0.6.0 dropped 3 of 25 correct ranges for this.
+ */
+const ENCLOSING_LINES = 40;
+/** How far below a cited range: a fact citing a doc comment names what it documents, a few lines (decorators) down. */
+const DOCUMENTED_LINES = 3;
 
-/** A cited range checked against the file: kept (clamped to its end) when it holds what the statement names. */
+/** A cited range checked against the file: kept (clamped to its end) when it, or what encloses it, holds what the statement names. */
 function checkLines(f: CodeFact, content: string): Pick<CodeFact, 'lines' | 'evidence'> {
   const r = parseRange(f.lines);
   if (!r) return { lines: null, evidence: 'file' };
@@ -253,10 +280,18 @@ function checkLines(f: CodeFact, content: string): Pick<CodeFact, 'lines' | 'evi
   if (r.start > count) return { lines: null, evidence: 'file' };
   const end = Math.min(r.end, count);
   const ids = identifiersIn(f.statement);
-  const window = all.slice(Math.max(0, r.start - 1 - LINE_SLACK), end + LINE_SLACK).join('\n');
-  if (ids.length && !ids.some((id) => mentions(window, id))) return { lines: null, evidence: 'file' };
+  const around = (above: number, below: number) => all.slice(Math.max(0, r.start - 1 - above), end + below).join('\n');
+  const holds = (text: string) => ids.some((id) => mentions(text, id));
+  if (ids.length && !holds(around(LINE_SLACK, LINE_SLACK)) && !holds(around(ENCLOSING_LINES, DOCUMENTED_LINES))) return { lines: null, evidence: 'file' };
   return { lines: r.start === end ? `${r.start}` : `${r.start}-${end}`, evidence: 'line' };
 }
+
+/**
+ * The rules checkCitations applies, stamped on every fact a scan saves (CodeFact.checkVersion). Bump when they change:
+ * at worker start, facts checked by an older version are checked again once (recheck.ts). check-v2: instruction files
+ * (0.6.0) and the enclosing-declaration window (0.6.1).
+ */
+export const FACT_CHECK_VERSION = 'check-v2';
 
 /**
  * Check what a model cited before its facts are saved. `read`: a repo file's text, null when it exists but is not read
@@ -264,9 +299,9 @@ function checkLines(f: CodeFact, content: string): Pick<CodeFact, 'lines' | 'evi
  * instruction file (isInstructionFile) is dropped; lines past the end of the file, or that do not hold what the
  * statement names, are dropped from the fact; each kept fact gets its evidence level.
  */
-export async function checkCitations(facts: CodeFact[], read: (path: string) => Promise<string | null | undefined>): Promise<{ kept: CodeFact[]; dropped: CodeFact[] }> {
-  const kept: CodeFact[] = [];
-  const dropped: CodeFact[] = [];
+export async function checkCitations<T extends CodeFact>(facts: T[], read: (path: string) => Promise<string | null | undefined>): Promise<{ kept: T[]; dropped: T[] }> {
+  const kept: T[] = [];
+  const dropped: T[] = [];
   const cache = new Map<string, Promise<string | null | undefined>>();
   for (const f of facts) {
     const path = f.path.trim().replace(/^\.\//, '') || '.';
@@ -287,7 +322,7 @@ export async function checkCitations(facts: CodeFact[], read: (path: string) => 
 }
 
 /** A repo file for checkCitations: its text, null when it exists but is not read, undefined when it is not there. */
-function repoReader(repoPath: string, maxBytes: number) {
+export function repoReader(repoPath: string, maxBytes: number) {
   return async (path: string): Promise<string | null | undefined> => {
     if (path.startsWith('/') || path.split('/').includes('..')) return undefined;
     const st = await lstat(join(repoPath, path)).catch(() => null);
@@ -302,7 +337,8 @@ export const FactSchema = z.object({
   statement: z.string().min(1),
   path: z.string(),
   lines: z.string().nullable(),
-  confidence: z.number().min(0).max(1),
+  // No longer asked for (every model answered 1.0); a model that still sends one below MIN_CONFIDENCE has it dropped.
+  confidence: z.number().min(0).max(1).default(1),
   why: z.string().default(''),
   // Older or smaller models leave it out: the fact is kept unscored and the background scorer scores it later.
   relevance: z.number().nullable().optional().transform((r) => (typeof r === 'number' ? clampRelevance(r) : null)),
@@ -310,13 +346,12 @@ export const FactSchema = z.object({
 
 export const FACT_JSON = {
   type: 'object',
-  required: ['kind', 'statement', 'path', 'lines', 'confidence', 'why', 'relevance'],
+  required: ['kind', 'statement', 'path', 'lines', 'why', 'relevance'],
   properties: {
     kind: { type: 'string', enum: [...FACT_KINDS] },
     statement: { type: 'string', description: 'One self-contained sentence a coding agent can act on' },
     path: { type: 'string', description: "Repo-relative file path, or '.' for the whole project" },
     lines: { type: ['string', 'null'], description: 'e.g. "12-30", or null' },
-    confidence: { type: 'number', description: '0..1' },
     why: { type: 'string', description: 'One short sentence: why an agent changing this code needs to know this' },
     relevance: { type: 'number', description: '0..1: how often an agent doing everyday coding here needs this (see the rubric)' },
   },
@@ -376,18 +411,59 @@ export async function extractFileFacts(llm: LlmProvider, path: string, content: 
   return { summary: redactSecrets(summary), facts };
 }
 
-const AgenticResult = z.object({ facts: z.array(FactSchema).max(120) });
-
-/** What one agent run is about: a shard of the repo (shard.ts), its files, and the paths its facts may cite. */
-export type ShardTask = { key: string; roots: string[]; scope: FactScope; files: CodeFile[] };
+const AgenticResult = z.object({
+  facts: z.array(FactSchema).max(120),
+  // Older answers (and agents that reached everything) leave it out.
+  unreached: z.array(z.string()).max(500).default([]),
+});
 
 /**
- * One agent run over one shard: the agent works in the whole repo (read-only) but is shown the shard's files and
- * asked for facts about them only, within a budget scaled to the shard (shardBudget). Facts about the shard as a
- * whole cite its directory ('.' for the shard holding the rest of the repo). Nothing is filtered here: runScan drops
- * facts outside the shard and checks citations before anything is saved.
+ * What one agent run is about: a shard of the repo (shard.ts), its files (best first: priority.ts), and the paths its
+ * facts may cite. hot: files to read before the rest (asked for, or hotspots), best first.
  */
-export async function extractShardFacts(llm: LlmProvider, repoPath: string, shard: ShardTask): Promise<CodeFact[]> {
+export type ShardTask = { key: string; roots: string[]; scope: FactScope; files: CodeFile[]; hot?: string[] };
+
+/** A directory with at least this many of a shard's files gets a minimum of facts of its own. */
+const LARGE_DIR_FILES = 30;
+/** Hotspots listed before the directories, at most. */
+const HOT_LISTED = 25;
+/** What an agent says it did not reach, kept per shard. */
+const MAX_UNREACHED = 100;
+
+const dirOfPath = (p: string) => (p.includes('/') ? p.slice(0, p.lastIndexOf('/')) : '.');
+
+/**
+ * The file list an agent is given: hotspots first (`hot`), then every file grouped by directory, directories in the
+ * order of their best file; a large directory (LARGE_DIR_FILES) carries its share of the budget as a minimum, half of
+ * its proportional share, so one directory cannot take the whole run.
+ */
+function shardListing(shard: ShardTask, budget: number): string {
+  const groups = new Map<string, string[]>();
+  for (const f of shard.files) {
+    const d = dirOfPath(f.path);
+    if (!groups.has(d)) groups.set(d, []);
+    groups.get(d)!.push(f.path);
+  }
+  const hot = (shard.hot ?? []).slice(0, HOT_LISTED);
+  const lines = hot.length
+    ? ['Read these first (an agent asked for them, they changed recently, PRs discuss them, or they carry long explanatory comments, where traps are written down):', ...hot, '']
+    : [];
+  lines.push('Files in this part, by directory:');
+  for (const [d, paths] of groups) {
+    const min = paths.length >= LARGE_DIR_FILES ? Math.max(1, Math.round((budget * paths.length) / shard.files.length / 2)) : 0;
+    lines.push(`## ${d} (${plural(paths.length, 'file')})${min ? `: at least ${plural(min, 'fact')} from here` : ''}`, ...paths);
+  }
+  return lines.join('\n');
+}
+
+/**
+ * One agent run over one shard: the agent works in the whole repo (read-only; `cwd`, the repo or a mirror of it) but
+ * is shown the shard's files and asked for facts about them only, within a budget scaled to the shard (shardBudget),
+ * and for what it did not reach. Facts about the shard as a whole cite its directory ('.' for the shard holding the
+ * rest of the repo). Nothing is filtered here: runScan drops facts outside the shard and checks citations before
+ * anything is saved.
+ */
+export async function extractShardFacts(llm: LlmProvider, cwd: string, shard: ShardTask): Promise<{ facts: CodeFact[]; unreached: string[] }> {
   const budget = shardBudget(shard.files.length);
   const whole = shard.scope.prefixes.includes('') && !shard.scope.except.length;
   const rest = shard.scope.prefixes.includes('');
@@ -402,17 +478,26 @@ export async function extractShardFacts(llm: LlmProvider, repoPath: string, shar
   // Agents sometimes answer with prose around (or instead of) the object: asked once more, strictly, before it counts.
   const r = await askJson(llm, {
     system: `${intro} ${WHAT_TO_KEEP}
-Return ${Math.ceil(budget / 3)} to ${budget} facts. Every fact must cite the file it comes from (repo-relative)${whole ? '' : ', from the list'}, or '${wide}' for facts about ${whole ? 'the whole project' : 'this part as a whole'}.`,
-    user: `SHARD: ${shard.key}\nFiles in ${whole ? 'the repository' : 'this part'}:\n${shard.files.map((f) => f.path).join('\n')}`,
-    schema: { type: 'object', required: ['facts'], properties: { facts: { type: 'array', items: FACT_JSON } } },
-    cwd: repoPath,
+Return ${Math.ceil(budget / 3)} to ${budget} facts. Every fact must cite the file it comes from (repo-relative)${whole ? '' : ', from the list'}, or '${wide}' for facts about ${whole ? 'the whole project' : 'this part as a whole'}.
+Read the files listed first before the rest, and cover every directory: a directory marked with a minimum needs at least that many facts from its files.
+In unreached, list the directories (or files) of ${whole ? 'the repository' : 'this part'} you did not get to read, so they can be read another time; an empty list means you read them all.`,
+    user: `SHARD: ${shard.key}\n${shardListing(shard, budget)}`,
+    schema: {
+      type: 'object', required: ['facts', 'unreached'],
+      properties: { facts: { type: 'array', items: FACT_JSON }, unreached: { type: 'array', items: { type: 'string' }, description: 'Repo-relative directories or files of this part you did not read' } },
+    },
+    cwd,
     timeoutMs: 30 * 60_000,
   }, (raw) => AgenticResult.parse(raw));
-  return r.facts.filter((f) => f.confidence >= MIN_CONFIDENCE).map((f) => ({ ...f, origin: 'model' as const }));
+  const unreached = [...new Set(r.unreached.map((p) => p.trim().replace(/^\.\//, '').replace(/\/+$/, '')).filter((p) => p && p !== '.' && inScope(p, shard.scope)))];
+  return { facts: r.facts.filter((f) => f.confidence >= MIN_CONFIDENCE).map((f) => ({ ...f, origin: 'model' as const })), unreached: unreached.slice(0, MAX_UNREACHED) };
 }
 
-/** One shard in a scan's result: its files, the facts saved for it, whether it was skipped (unchanged) or failed. */
-export type ShardCoverage = { shard: string; files: number; facts: number; skipped: boolean; failed?: string };
+/**
+ * One shard in a scan's result: its files, the facts saved for it, whether it was skipped (unchanged) or failed, and
+ * the directories or files its agent said it did not reach (absent: none).
+ */
+export type ShardCoverage = { shard: string; files: number; facts: number; skipped: boolean; failed?: string; unreached?: string[] };
 
 /** A shard's model facts, kept to its scope: '.' becomes the shard's own directory, facts outside it are dropped. */
 function inShard(facts: CodeFact[], shard: ShardTask): { inside: CodeFact[]; outside: CodeFact[] } {
@@ -425,8 +510,12 @@ function inShard(facts: CodeFact[], shard: ShardTask): { inside: CodeFact[]; out
 }
 
 export type ScanDeps = {
-  /** listFacts (optional): after a model switch, which shards still hold the other model's facts (others are skipped). */
-  facts: Pick<FactsStore, 'fileHashes' | 'saveFileFacts' | 'markFilesRemoved' | 'replaceScopeFacts' | 'updateScanJob' | 'currentSources' | 'recordScanFailure'> & Partial<Pick<FactsStore, 'listFacts'>>;
+  /**
+   * listFacts (optional): after a model switch, which shards still hold the other model's facts (others are skipped).
+   * fileScanVersions (optional): files an older scanner read are rescanned (absent: every stored file counts as current).
+   */
+  facts: Pick<FactsStore, 'fileHashes' | 'saveFileFacts' | 'markFilesRemoved' | 'replaceScopeFacts' | 'updateScanJob' | 'currentSources' | 'recordScanFailure'>
+    & Partial<Pick<FactsStore, 'listFacts' | 'fileScanVersions' | 'scanRequests' | 'clearScanRequests'>>;
   llm: LlmProvider;
   embed(texts: string[]): Promise<number[][]>;
   maxBytes: number;
@@ -434,6 +523,8 @@ export type ScanDeps = {
   maxFiles: number | null;
   /** Files the project's sessions edited, most recent first: listed (and so scanned) before the rest. */
   touched?: (projectKey: string) => Promise<string[]>;
+  /** Repo files review comments or PR discussions are about, when known: hotspots (priority.ts). */
+  prPaths?: (projectKey: string) => Promise<string[]>;
   log?: (msg: string, extra?: object) => void;
   activity?: Pick<ActivityStore, 'record'>;
 };
@@ -449,36 +540,62 @@ const embedFacts = async (facts: CodeFact[], embed: ScanDeps['embed']) => {
 
 /** Incremental scan: only files whose hash changed are (re)analysed; removed files have their facts closed. */
 const plural = (n: number, w: string) => `${n} ${w}${n === 1 ? '' : 's'}`;
-const factLog = (facts: CodeFact[]) => facts.map((f) => ({ kind: f.kind, statement: f.statement, why: f.why, confidence: f.confidence, ...(f.evidence ? { evidence: f.evidence } : {}) }));
+/** A fact that went through checkCitations (or needs none: a manifest's), stamped with the rule that checked it. */
+const checked = <T extends CodeFact>(f: T): T => ({ ...f, checkVersion: FACT_CHECK_VERSION });
+const factLog = (facts: CodeFact[]) => facts.map((f) => ({ kind: f.kind, statement: f.statement, why: f.why, ...(f.evidence ? { evidence: f.evidence } : {}) }));
 
 /** failed: files (per-file scans) or shards (agentic scans) that failed. shards: an agentic scan's coverage per shard. */
 export type ScanResult = { filesScanned: number; factsAdded: number; failed: number; remaining: number; shards?: ShardCoverage[] };
 
 /** Upper bound on files listed per project, so a giant tree cannot exhaust memory. */
 const LIST_LIMIT = 20_000;
+/** What the agents said they did not reach, kept on the job at most. */
+const JOB_UNREACHED = 200;
+const cmpKey = (a: string, b: string) => (a < b ? -1 : a > b ? 1 : 0);
 
 export async function runScan(job: ScanJob, d: ScanDeps): Promise<ScanResult> {
   const note = (kind: 'scan_started' | 'facts_extracted' | 'scan_finished', subject: string, why: string, details: Record<string, unknown> = {}, targets: string[] = []) =>
     d.activity?.record({ kind, actor: d.llm.id, projectKey: job.projectKey, subject, why, details: { scanJobId: job.id, promptVersion: SCAN_PROMPT_VERSION, ...details }, targets });
   const fileId = (path: string) => `${job.projectKey}:${path}`;
+  let mirror: AgentMirror | null = null;
   await d.facts.updateScanJob(job.id, { status: 'running' });
   try {
-    // List everything, so files beyond the per-run cap are never mistaken for removed ones.
-    // Ranked (rank.ts), so a capped run reads the files sessions edited and the source first.
-    const touched = await d.touched?.(job.projectKey).catch(() => []);
-    const files = await listCodeFiles(job.repoPath, { maxBytes: d.maxBytes, maxFiles: LIST_LIMIT, priority: touched });
+    // List everything, so files beyond the per-run cap are never mistaken for removed ones. Ranked (rank.ts), then put
+    // in scan order (priority.ts): files an agent asked for, files sessions edited, then hotspots (churn, PR
+    // discussions, long explanatory comments), so a capped or interrupted run has read the files that matter.
+    const touched = (await d.touched?.(job.projectKey).catch(() => [])) ?? [];
+    const requested = (await d.facts.scanRequests?.(job.projectKey).catch(() => [])) ?? [];
+    const listed = await listCodeFiles(job.repoPath, { maxBytes: d.maxBytes, maxFiles: LIST_LIMIT, priority: [...requested, ...touched], comments: true });
+    const signals: ScanSignals = {
+      requested, touched, churn: await gitChurn(job.repoPath),
+      prPaths: new Set((await d.prPaths?.(job.projectKey).catch(() => [])) ?? []),
+      comments: new Map(listed.map((f) => [f.path, f.comments ?? 0])),
+    };
+    const files = scanOrder(listed, signals);
+    const asked = new Set(requested);
     const stored = await d.facts.fileHashes(job.projectKey);
+    // A file another scanner version read is due again although its hash is the same (SCANNER_VERSION).
+    const versions = await d.facts.fileScanVersions?.(job.projectKey);
+    const olderScanner = (f: CodeFile) => !!versions && stored.get(f.path) === f.hash && versions.get(f.path) !== SCANNER_VERSION;
+    const outdated = files.filter(olderScanner);
     // Facts from another model are replaced wholesale: unchanged hashes do not mean this model has seen the files.
     const sources = await d.facts.currentSources(job.projectKey);
     const modelChanged = sources.some((s) => s !== d.llm.id);
-    const changed = modelChanged ? files : files.filter((f) => stored.get(f.path) !== f.hash);
+    // In scan order, so a capped per-file run reads the best files first. A file an agent asked for is due as well.
+    const due = files.filter((f) => stored.get(f.path) !== f.hash || olderScanner(f) || asked.has(f.path));
+    const changed = modelChanged ? files : due;
     const present = new Set(files.map((f) => f.path));
     const removed = [...stored.keys()].filter((p) => !present.has(p));
+    // Asked for but not in the repo (or not worth scanning): nothing to read, so no longer asked for.
+    const gone = requested.filter((p) => !present.has(p));
+    if (gone.length) await d.facts.clearScanRequests?.(job.projectKey, gone);
     await note('scan_started', `scan of ${job.projectKey}: ${plural(changed.length, 'changed file')} of ${files.length}`,
       [
         job.provider ? `you asked for a scan with ${job.provider}` : 'you asked for a scan (default model)',
         ...(modelChanged ? [`every file is rescanned because the current facts came from a different model (${sources.join(', ')})`] : []),
-      ].join('; '), { repoPath: job.repoPath });
+        ...(!modelChanged && outdated.length ? [`${plural(outdated.length, 'file')} ${outdated.length === 1 ? 'was' : 'were'} read by an older scanner and ${outdated.length === 1 ? 'is' : 'are'} read again with ${SCANNER_VERSION}`] : []),
+        ...(requested.length - gone.length > 0 ? [`${plural(requested.length - gone.length, 'file')} an agent asked for ${requested.length - gone.length === 1 ? 'is' : 'are'} read first`] : []),
+      ].join('; '), { repoPath: job.repoPath, scannerVersion: SCANNER_VERSION, olderScanner: outdated.length, requested: requested.filter((p) => present.has(p)).slice(0, 50) });
     await d.facts.markFilesRemoved(job.projectKey, removed);
     for (const p of removed) await note('facts_extracted', `facts closed for removed file ${p}`, 'the file is no longer in the project', {}, [fileId(p)]);
 
@@ -491,31 +608,44 @@ export async function runScan(job: ScanJob, d: ScanDeps): Promise<ScanResult> {
       // One agent run per shard (a package or service, shard.ts), each with its own budget; a shard none of whose
       // files changed (or were removed) keeps its facts. Its stored file hashes are its fingerprint: they are written
       // only when its facts are, so a shard that failed is still "changed" next scan.
-      const shards = files.length ? await shardRepo(job.repoPath, files.map((f) => f.path)) : [];
+      const planned = files.length ? await shardRepo(job.repoPath, files.map((f) => f.path)) : [];
+      const rank = new Map(files.map((f, i) => [f.path, i]));
+      const hotOf = (p: string) => hotScore(p, signals);
+      // Shards holding a file an agent asked for run first, then the hottest, then by key.
+      const heat = new Map(planned.map((s) => [s.key, { asked: s.files.some((p) => asked.has(p)), hot: s.files.reduce((m, p) => Math.max(m, hotOf(p)), 0) }]));
+      const shards = [...planned].sort((a, b) => Number(heat.get(b.key)!.asked) - Number(heat.get(a.key)!.asked) || heat.get(b.key)!.hot - heat.get(a.key)!.hot || cmpKey(a.key, b.key));
       const byPath = new Map(files.map((f) => [f.path, f]));
       // A shard is redone for a model switch only while its own facts are another model's: one that failed after the
       // switch keeps its old facts, and must not send every later scan through the whole repo again.
       const current = modelChanged && d.facts.listFacts ? await d.facts.listFacts({ projectKey: job.projectKey, limit: 100_000 }) : null;
       const otherModel = current?.filter((f) => !f.docId && f.origin !== 'you' && f.source !== d.llm.id) ?? null;
-      const hashChanged = files.filter((f) => stored.get(f.path) !== f.hash);
-      const changedPaths = new Set((otherModel ? hashChanged : changed).map((f) => f.path));
+      const changedPaths = new Set((otherModel ? due : changed).map((f) => f.path));
       const staleModel = (scope: FactScope) => (otherModel ? otherModel.some((f) => inScope(f.path, scope)) : false);
       const read = repoReader(job.repoPath, d.maxBytes);
       const cited = new Set<string>();
       const failedShards: { key: string; err: unknown }[] = [];
       let timeoutsInRow = 0;
       coverage = [];
+      // After each shard it ran, the job says how far it has got (fg scan --wait and the Projects page read it).
+      const progress = (c: ShardCoverage[]) => d.facts.updateScanJob(job.id, {
+        factsAdded, shards: { total: shards.length, done: c.length, rescanned: c.filter((x) => !x.skipped).length, failed: failedShards.length },
+      });
+      // Codex explores a filtered copy of the repo: made once for the whole scan (removed at its end), not per shard.
+      const agentCwd = async () => (d.llm.mirror ? (mirror ??= await d.llm.mirror(job.repoPath)).dir : job.repoPath);
       for (const s of shards) {
         const scope = shardScope(s, shards);
-        const shard: ShardTask = { key: s.key, roots: s.roots, scope, files: s.files.map((p) => byPath.get(p)!) };
-        const dirty = [...s.files.filter((p) => changedPaths.has(p)), ...removed.filter((p) => inScope(p, scope))];
+        const ordered = [...s.files].sort((a, b) => rank.get(a)! - rank.get(b)!);
+        const hot = ordered.filter((p) => asked.has(p) || hotOf(p) > 0);
+        const shard: ShardTask = { key: s.key, roots: s.roots, scope, files: ordered.map((p) => byPath.get(p)!), hot };
+        const dirty = [...s.files.filter((p) => changedPaths.has(p) || asked.has(p)), ...removed.filter((p) => inScope(p, scope))];
         if (!dirty.length && !staleModel(scope)) {
           coverage.push({ shard: s.key, files: s.files.length, facts: 0, skipped: true });
           continue;
         }
         let raw: CodeFact[];
+        let unreached: string[];
         try {
-          raw = await extractShardFacts(d.llm, job.repoPath, shard);
+          ({ facts: raw, unreached } = await extractShardFacts(d.llm, await agentCwd(), shard));
           timeoutsInRow = 0;
         } catch (err) {
           // The model could not be asked: every other shard would fail the same way, so the whole scan waits
@@ -528,6 +658,7 @@ export async function runScan(job: ScanJob, d: ScanDeps): Promise<ScanResult> {
           failedShards.push({ key: s.key, err });
           coverage.push({ shard: s.key, files: s.files.length, facts: 0, skipped: false, failed: redactSecrets(String(err)) });
           await note('facts_extracted', `could not extract facts from ${s.key}`, redactSecrets(String(err)), { shard: s.key }, [fileId(s.roots[0] || '.')]);
+          await progress(coverage);
           continue;
         }
         const { inside, outside } = inShard(raw, shard);
@@ -544,20 +675,24 @@ export async function runScan(job: ScanJob, d: ScanDeps): Promise<ScanResult> {
             return content === null ? null : { path: f.path, content };
           }),
         )).filter((c): c is { path: string; content: string } => c !== null);
-        const facts = [...model, ...deterministicFacts(contents)];
-        await d.facts.replaceScopeFacts(job.projectKey, scope, await embedFacts(facts, d.embed), d.llm.id, shard.files, job.id);
+        const facts = [...model, ...deterministicFacts(contents)].map(checked);
+        await d.facts.replaceScopeFacts(job.projectKey, scope, await embedFacts(facts, d.embed), d.llm.id, shard.files.map((f) => ({ path: f.path, hash: f.hash, version: SCANNER_VERSION })), job.id);
         factsAdded += facts.length;
-        coverage.push({ shard: s.key, files: s.files.length, facts: facts.length, skipped: false });
+        coverage.push({ shard: s.key, files: s.files.length, facts: facts.length, skipped: false, ...(unreached.length ? { unreached } : {}) });
+        const readAsked = s.files.filter((p) => asked.has(p));
+        if (readAsked.length) await d.facts.clearScanRequests?.(job.projectKey, readAsked);
+        await progress(coverage);
         const droppedWhy = [
           dropped.length ? `${plural(dropped.length, 'fact')} dropped for citing a file that does not exist or an instruction file (AGENTS.md, CLAUDE.md)` : '',
           outside.length ? `${plural(outside.length, 'fact')} dropped for citing a file outside this shard` : '',
+          unreached.length ? `the agent did not reach ${unreached.length}: ${unreached.slice(0, 10).join(', ')}${unreached.length > 10 ? ', ...' : ''}` : '',
         ].filter(Boolean).map((x) => `; ${x}`).join('');
         const where = shards.length === 1 ? 'the whole repository' : s.key;
         await note('facts_extracted', `${plural(facts.length, 'fact')} from ${where}`,
-          `${plural(dirty.length, 'file')} changed or removed; ${d.llm.id} explored ${where} with read-only tools and replaced its earlier facts there${droppedWhy}`,
-          { shard: s.key, facts: factLog(facts), ...(dropped.length || outside.length ? { dropped: factLog([...dropped, ...outside]) } : {}), changedFiles: dirty },
+          `${plural(dirty.length, 'file')} changed, removed or asked for; ${d.llm.id} explored ${where} with read-only tools and replaced its earlier facts there${droppedWhy}`,
+          { shard: s.key, facts: factLog(facts), ...(dropped.length || outside.length ? { dropped: factLog([...dropped, ...outside]) } : {}), changedFiles: dirty, ...(unreached.length ? { unreached } : {}) },
           [...new Set(facts.map((f) => fileId(f.path || '.')))]);
-        d.log?.('scanned shard', { project: job.projectKey, shard: s.key, files: s.files.length, facts: facts.length });
+        d.log?.('scanned shard', { project: job.projectKey, shard: s.key, files: s.files.length, facts: facts.length, unreached: unreached.length });
       }
       scanned = cited.size;
       failed.push(...failedShards.map((x) => x.key));
@@ -594,9 +729,10 @@ export async function runScan(job: ScanJob, d: ScanDeps): Promise<ScanResult> {
         }
         const { summary } = extracted;
         const { kept } = await checkCitations(extracted.facts.map((x) => ({ ...x, origin: 'model' as const })), async (p) => (p === f.path ? content : undefined));
-        const all = [...kept, ...deterministicFacts([{ path: f.path, content }])];
-        await d.facts.saveFileFacts(job.projectKey, { path: f.path, hash: f.hash, summary }, await embedFacts(all, d.embed), d.llm.id, job.id);
+        const all = [...kept, ...deterministicFacts([{ path: f.path, content }])].map(checked);
+        await d.facts.saveFileFacts(job.projectKey, { path: f.path, hash: f.hash, summary, version: SCANNER_VERSION }, await embedFacts(all, d.embed), d.llm.id, job.id);
         factsAdded += all.length;
+        if (asked.has(f.path)) await d.facts.clearScanRequests?.(job.projectKey, [f.path]);
         const previousHash = stored.get(f.path) ?? null;
         await note('facts_extracted', `${plural(all.length, 'fact')} from ${f.path}`,
           previousHash ? `the file changed since the last scan (${previousHash.slice(0, 7)} → ${f.hash.slice(0, 7)})` : 'new file, never scanned before',
@@ -611,7 +747,10 @@ export async function runScan(job: ScanJob, d: ScanDeps): Promise<ScanResult> {
       filesScanned: scanned, factsAdded, failed: failed.length, remaining: d.llm.agentic ? 0 : Math.max(0, changed.length - perRun),
       ...(coverage?.length ? { shards: coverage } : {}),
     };
-    const shards = coverage?.length ? { total: coverage.length, rescanned: coverage.filter((c) => !c.skipped).length, failed: failed.length } : null;
+    const unreached = (coverage ?? []).flatMap((c) => c.unreached ?? []);
+    const shards = coverage?.length
+      ? { total: coverage.length, rescanned: coverage.filter((c) => !c.skipped).length, failed: failed.length, ...(unreached.length ? { unreached: unreached.slice(0, JOB_UNREACHED) } : {}) }
+      : null;
     const unit = d.llm.agentic ? 'shard' : 'file';
     await d.facts.updateScanJob(job.id, {
       status: 'done', filesScanned: result.filesScanned, factsAdded,
@@ -619,7 +758,7 @@ export async function runScan(job: ScanJob, d: ScanDeps): Promise<ScanResult> {
       ...(shards ? { shards } : {}),
     });
     const left = result.remaining ? `; ${plural(result.remaining, 'changed file')} left for the next scan (SCAN_MAX_FILES)` : '';
-    const shardLine = shards ? `; ${shards.rescanned} of ${plural(shards.total, 'shard')} rescanned` : '';
+    const shardLine = shards ? `; ${shards.rescanned} of ${plural(shards.total, 'shard')} rescanned${unreached.length ? `, ${plural(unreached.length, 'place')} not reached` : ''}` : '';
     await note('scan_finished', `scanned ${plural(result.filesScanned, 'file')}, ${plural(factsAdded, 'fact')}${shardLine}${left}`,
       failed.length ? `scan completed; ${failed.length} failed and will be retried next scan` : 'scan completed', result);
     return result;
@@ -638,5 +777,7 @@ export async function runScan(job: ScanJob, d: ScanDeps): Promise<ScanResult> {
     await note('scan_finished', `scan failed (attempt ${next.attempts}); ${next.retryAt ? `retrying at ${next.retryAt}` : 'gave up, request a new scan to try again'}`,
       error, { attempts: next.attempts, retryAt: next.retryAt });
     throw err;
+  } finally {
+    await (mirror as AgentMirror | null)?.dispose().catch(() => {});
   }
 }

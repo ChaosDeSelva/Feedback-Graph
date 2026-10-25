@@ -22,6 +22,17 @@ test('passes through a valid classification with prefilter signals', async () =>
   expect(seenUser).toContain('filter server-side');
 });
 
+test('an instruction the agent broke is shown with the calls that broke it, and the prompt says an instruction alone is neutral', async () => {
+  let seen = { system: '', user: '' };
+  const order: HumanTurn = { ...turn, text: "keep it on its own branch, don't push yet", followingToolCalls: [{ name: 'Bash', ts: 't', command: 'git push -u origin fix/x' }] };
+  await classifyTurn(order, deps(async (o) => { seen = o as typeof seen; return { label: 'correction', confidence: 0.9, summary: 'pushed' }; }));
+  expect(seen.user).toContain("AGENT'S TOOL CALLS AFTER THIS MESSAGE (what it did next):\nBash git push -u origin fix/x");
+  expect(seen.system).toMatch(/instruction for what the agent does next .* is neutral/);
+  // Without them, no such section.
+  await classifyTurn(turn, deps(async (o) => { seen = o as typeof seen; return { label: 'neutral', confidence: 1, summary: '' }; }));
+  expect(seen.user).not.toContain('AFTER THIS MESSAGE');
+});
+
 test('a label needs a short answer: the job asks for at most 256 tokens', async () => {
   let budget: number | undefined;
   await classifyTurn(turn, deps(async (o) => { budget = (o as { maxTokens?: number }).maxTokens; return { label: 'neutral', confidence: 1, summary: 's' }; }));

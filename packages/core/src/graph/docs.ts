@@ -23,8 +23,19 @@ export type DocSummary = DocInput & { id: string; addedAt: string; addedBy: stri
  * replaced in the meantime (the same file uploaded again) is dropped instead of overwriting the new one.
  */
 export type DocToRead = { id: string; projectKey: string; ref: string; title: string; kind: DocKind; text: string; image: TaskImage | null; attempts: number; version: string };
-/** read: queue it to be read into facts (uploads). image: the upload is this image (stored for the reader and the thumbnail). */
-export type UpsertDocOpts = { read?: boolean; image?: TaskImage; addedBy?: string };
+/**
+ * read: queue it to be read into facts (uploads). image: the upload is this image (stored for the reader and the
+ * thumbnail). tickets: the Linear identifiers a pull request names (ticketIdsIn), linking it to those tickets' documents
+ * (linkedDocs); replaced on every upsert, none when unset.
+ */
+export type UpsertDocOpts = { read?: boolean; image?: TaskImage; addedBy?: string; tickets?: string[] };
+/**
+ * A pull request's document and a Linear ticket's, linked because the pull request names the ticket's identifier
+ * (UpsertDocOpts.tickets). `docId` is the document asked about, `linked` the one at the other end.
+ */
+export type DocLink = { docId: string; linked: { docId: string; source: DocSource; ref: string; title: string; url: string | null } };
+/** A Linear ticket's document ref, from its identifier: what a pull request's `tickets` are matched against. */
+export const linearDocRef = (identifier: string) => `linear:${identifier}`;
 /** Images are kept in the database, so no volume is needed: at most this many bytes. */
 export const MAX_IMAGE_BYTES = 8 * 1024 * 1024;
 /** Same project, source and ref: same document (re-adding replaces it). Takes the already-redacted ref. */
@@ -52,7 +63,7 @@ export class DocsRepo implements DocsStore {
         `MERGE (p:Project {key: $doc.projectKey})
          MERGE (d:Doc {id: $id})
          SET d.projectKey = $doc.projectKey, d.source = $doc.source, d.ref = $doc.ref, d.title = $doc.title,
-             d.url = $doc.url, d.addedAt = $now, d.addedBy = $addedBy, d.kind = $kind, d.mediaType = $mediaType,
+             d.url = $doc.url, d.addedAt = $now, d.addedBy = $addedBy, d.kind = $kind, d.mediaType = $mediaType, d.tickets = $tickets,
              d.readStatus = CASE WHEN $read THEN 'pending' ELSE null END, d.readAttempts = 0, d.readError = null,
              d.readRetryAt = null, d.readAt = null
          MERGE (d)-[:IN]->(p)
@@ -63,7 +74,7 @@ export class DocsRepo implements DocsStore {
          UNWIND range(0, size($chunks) - 1) AS i
            CREATE (d)-[:HAS_CHUNK]->(:Chunk {id: $id + '#' + toString(i), docId: $id, projectKey: $doc.projectKey,
                                              idx: i, text: $chunks[i].text, embedding: $chunks[i].embedding})`,
-        { id, doc, chunks, now: new Date().toISOString(), addedBy: o.addedBy ?? null, read: !!o.read, kind: o.image ? 'image' : 'text', mediaType: o.image?.mediaType ?? null },
+        { id, doc, chunks, tickets: o.tickets ?? [], now: new Date().toISOString(), addedBy: o.addedBy ?? null, read: !!o.read, kind: o.image ? 'image' : 'text', mediaType: o.image?.mediaType ?? null },
       ],
       [`MATCH (x:Fact {docId: $id}) DETACH DELETE x`, { id }],
       [`MATCH (b:DocBlob {docId: $id}) DETACH DELETE b`, { id }],
@@ -215,6 +226,22 @@ export class DocsRepo implements DocsStore {
       { id },
     );
     return r.get('existed');
+  }
+
+  async linkedDocs(q: { projectKey: string; docIds: string[] }): Promise<DocLink[]> {
+    if (!q.docIds.length) return [];
+    const rows = await this.g.run(
+      `MATCH (d:Doc {projectKey: $projectKey}) WHERE d.id IN $docIds
+       MATCH (o:Doc {projectKey: $projectKey})
+       WHERE (o.source = 'linear' AND o.ref IN [t IN coalesce(d.tickets, []) | 'linear:' + t])
+          OR (d.source = 'linear' AND substring(d.ref, 7) IN coalesce(o.tickets, []) AND d.ref STARTS WITH 'linear:')
+       RETURN d.id AS docId, o ORDER BY d.id, o.title, o.id`,
+      { projectKey: q.projectKey, docIds: q.docIds },
+    );
+    return rows.map((r) => {
+      const o = r.get('o').properties;
+      return { docId: r.get('docId'), linked: { docId: o.id, source: o.source, ref: o.ref, title: o.title, url: o.url ?? null } };
+    });
   }
 
   async searchDocs(q: { embedding: number[]; projectKey: string; k: number }): Promise<DocHit[]> {

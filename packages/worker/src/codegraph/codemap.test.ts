@@ -242,3 +242,76 @@ test('an aborted signal stops the build: it rejects instead of returning a parti
   ac.abort(new Error('the worker is shutting down'));
   await expect(buildCodeMap(dir, { ...OPTS, signal: ac.signal })).rejects.toThrow('shutting down');
 });
+
+/** A repo as path -> content, in a temp dir. */
+function repo(files: Record<string, string>) {
+  const dir = mkdtempSync(join(tmpdir(), 'fbcodemap-'));
+  dirs.push(dir);
+  for (const [p, c] of Object.entries(files)) {
+    mkdirSync(join(dir, p, '..'), { recursive: true });
+    writeFileSync(join(dir, p), c);
+  }
+  return dir;
+}
+
+test('a capped map keeps the import index for every candidate: importers past the cap count, and the most imported files are mapped', async () => {
+  const files: Record<string, string> = { 'package.json': JSON.stringify({ name: 'shop', dependencies: { zod: '3' } }) };
+  // Ten callers sort before the file they all import: path order would cap it away.
+  for (let i = 0; i < 10; i++) files[`src/a${i}.ts`] = `import { log } from '../zz/utils/logging.ts';\nexport const a${i} = log;\n`;
+  files['zz/utils/logging.ts'] = 'export const log = () => 1;\n';
+  files['src/quiet.ts'] = 'export const quiet = 1;\n';
+  const dir = repo(files);
+  const m = await buildCodeMap(dir, { maxFiles: 4, maxBytes: 200_000 });
+  expect(paths(m)).toEqual(['package.json', 'src/a0.ts', 'src/a1.ts', 'zz/utils/logging.ts']);
+  expect(m.candidates).toBe(13);
+  expect((m.outside ?? []).map((f) => f.path)).toEqual(['src/a2.ts', 'src/a3.ts', 'src/a4.ts', 'src/a5.ts', 'src/a6.ts', 'src/a7.ts', 'src/a8.ts', 'src/a9.ts', 'src/quiet.ts']);
+  // Every importer is an edge, the ones past the cap too; files past the cap carry no symbols.
+  expect(m.imports.filter((i) => i.to === 'zz/utils/logging.ts')).toHaveLength(10);
+  expect(m.symbols.some((s) => s.path === 'src/a5.ts')).toBe(false);
+  expect(m.symbols.some((s) => s.path === 'zz/utils/logging.ts')).toBe(true);
+  // Churn counts too: a busy file is kept over a quiet one with the same importers.
+  const busy = await buildCodeMap(dir, { maxFiles: 4, maxBytes: 200_000, churn: new Map([['src/quiet.ts', { commits: 40 }]]) });
+  expect(paths(busy)).toEqual(['package.json', 'src/a0.ts', 'src/quiet.ts', 'zz/utils/logging.ts']);
+  // Incremental: a file entering the map from the index gets its symbols, though it is unchanged.
+  const next = await buildCodeMap(dir, { maxFiles: 4, maxBytes: 200_000, churn: new Map([['src/a7.ts', { commits: 40 }]]) }, m);
+  expect(next.symbols.some((s) => s.path === 'src/a7.ts')).toBe(true);
+  expect(next.imports.filter((i) => i.to === 'zz/utils/logging.ts')).toHaveLength(10);
+});
+
+test('aliases that point past the cap resolve: a capped monorepo with @acme-core/* aliases counts nothing unresolved', async () => {
+  const dir = repo({
+    'package.json': JSON.stringify({ name: 'acme', private: true, workspaces: ['apps/*', 'packages/*'], devDependencies: { typescript: '5' } }),
+    'tsconfig.base.json': JSON.stringify({ compilerOptions: { baseUrl: '.', paths: { '@acme-core/*': ['packages/acme-core/src/*'] } } }),
+    'packages/tsconfig/package.json': JSON.stringify({ name: '@acme/tsconfig' }),
+    'packages/tsconfig/nextjs.json': JSON.stringify({ extends: '../../tsconfig.base.json' }),
+    'apps/web/tsconfig.json': JSON.stringify({ extends: '@acme/tsconfig/nextjs.json' }),
+    'apps/web/src/chat/a.tsx': "import { render } from '@acme-core/markdown/pipeline';\nexport const A = render;\n",
+    'apps/web/src/chat/b.tsx': "import { render } from '@acme-core/markdown/pipeline';\nimport { db } from '@acme-core/db';\nexport const B = render;\n",
+    'packages/acme-core/src/markdown/pipeline.ts': "export const render = () => '';\n",
+    'packages/db/package.json': JSON.stringify({ name: '@acme-core/db', exports: { '.': './src/index.ts' } }),
+    'packages/db/src/index.ts': 'export const db = 1;\n',
+  });
+  const m = await buildCodeMap(dir, { maxFiles: 6, maxBytes: 200_000 });
+  expect(m.candidates).toBeGreaterThan(6);
+  expect(m.unresolved).toBe(0);
+  expect(m.imports.filter((i) => i.to === 'packages/acme-core/src/markdown/pipeline.ts').map((i) => i.from).sort()).toEqual(['apps/web/src/chat/a.tsx', 'apps/web/src/chat/b.tsx']);
+  expect(edge(m, 'apps/web/src/chat/b.tsx', 'packages/db/src/index.ts')).toBeTruthy();
+});
+
+test('Python services: absolute, relative and src-layout imports become edges; a local module that is missing is counted', async () => {
+  const dir = repo({
+    'services/billing/pyproject.toml': '[project]\nname = "billing"\n',
+    'services/billing/billing/__init__.py': '',
+    'services/billing/billing/event_handlers.py': 'def handle(e):\n    return e\n',
+    'services/billing/billing/api.py': 'from billing.event_handlers import handle\nfrom billing.missing import nope\nimport requests\n',
+    'services/billing/billing/worker.py': 'from . import event_handlers\n',
+    'services/billing/tests/test_handlers.py': 'from billing import event_handlers\n\ndef test_it():\n    pass\n',
+  });
+  const m = await buildCodeMap(dir, OPTS);
+  expect(m.imports.filter((i) => i.to === 'services/billing/billing/event_handlers.py').map((i) => i.from).sort()).toEqual([
+    'services/billing/billing/api.py', 'services/billing/billing/worker.py', 'services/billing/tests/test_handlers.py',
+  ]);
+  expect(edge(m, 'services/billing/billing/api.py', 'pkg:requests')).toBeTruthy();
+  expect(m.unresolved).toBe(1);
+  expect(testsFor(m, 'services/billing/billing/event_handlers.py')).toEqual(['services/billing/tests/test_handlers.py']);
+});

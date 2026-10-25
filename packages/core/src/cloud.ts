@@ -24,7 +24,7 @@ import type { ActivityStore, DocsStore, PortabilityStore } from './store.ts';
  * excluded, or left out of SYNC_PROJECTS) gets one last, empty bundle that withdraws what was sent for it, so the
  * team copy does not linger; it then leaves the record. Approved lessons become team lessons
  * (or wait for an admin when the org reviews them), and rejected or superseded ones demote the team copy. `withdrawn`
- * also names what was sent before and is gone now. 429 means another sync of the org is running: wait the Retry-After.
+ * also names what was sent before and is gone now. 429 means another sync of the org is running or the token's sync rate limit was hit: wait the Retry-After.
  */
 
 /** POST /api/v1/sync's answer (the cloud's contract). */
@@ -244,15 +244,24 @@ const record = (key: string, b: SyncBundle, fingerprint: string): SentRecord => 
 });
 
 /** What a sync of these projects would send, without sending it. */
+/** Projects the preview exports at once: enough to overlap the store's round trips, few enough not to crowd it. */
+export const PREVIEW_CONCURRENCY = 4;
+
 export async function previewCloudSync(p: Pick<PortabilityStore, 'exportData'>, keys: string[], o: SyncOptions & { memory?: SyncMemory } = {}) {
   const total = zero();
-  const projects: { key: string; counts: SyncCounts | null }[] = [];
-  for (const key of keys) {
-    const b = await syncBundle(p, key, await o.memory?.get(key), o);
-    const counts = b && bundleCounts(b);
-    if (counts) for (const k of Object.keys(total) as (keyof SyncCounts)[]) total[k] += counts[k];
-    projects.push({ key, counts });
-  }
+  // A few at a time, each into its own slot, so the list keeps the order of `keys`.
+  const projects: { key: string; counts: SyncCounts | null }[] = new Array(keys.length);
+  let at = 0;
+  const lane = async () => {
+    while (at < keys.length) {
+      const i = at++;
+      const key = keys[i];
+      const b = await syncBundle(p, key, await o.memory?.get(key), o);
+      projects[i] = { key, counts: b && bundleCounts(b) };
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(PREVIEW_CONCURRENCY, keys.length) }, lane));
+  for (const { counts } of projects) if (counts) for (const k of Object.keys(total) as (keyof SyncCounts)[]) total[k] += counts[k];
   return { total, projects };
 }
 
@@ -289,7 +298,7 @@ function explain(status: number, serverError: string | null, bytes: number): str
     case 403: return `the token cannot sync (403): it needs the sync scope and a member role or above in its org${said}`;
     case 413: return `the bundle (${Math.round(bytes / 1024)} KB) is too large for the cloud (413); sync fewer projects with SYNC_PROJECTS, or ask the operator to raise SYNC_MAX_BYTES`;
     case 422: return `the cloud rejected the bundle (422)${said}`;
-    case 429: return 'another sync of this org is running on the cloud (429)';
+    case 429: return 'the cloud is busy (another sync of this org is running) or this token hit its sync rate limit (429)';
     default: return `the cloud answered ${status}${said}`;
   }
 }
@@ -300,7 +309,7 @@ function explain(status: number, serverError: string | null, bytes: number): str
  * token only ever goes to CLOUD_URL.
  */
 export async function pushBundle(o: {
-  cloud: Pick<CloudConfig, 'url' | 'token'>;
+  cloud: Pick<CloudConfig, 'url' | 'token'> & Partial<Pick<CloudConfig, 'machine'>>;
   bundle: ExportBundle;
   fetch?: typeof fetch;
   sleep?: (ms: number) => Promise<void>;
@@ -321,7 +330,12 @@ export async function pushBundle(o: {
     try {
       res = await doFetch(url, {
         method: 'POST',
-        headers: { authorization: `Bearer ${o.cloud.token}`, 'content-type': 'application/json', 'user-agent': `feedback-graph/${VERSION}` },
+        headers: {
+          authorization: `Bearer ${o.cloud.token}`,
+          'content-type': 'application/json',
+          'user-agent': `feedback-graph/${VERSION}`,
+          ...(o.cloud.machine ? { 'x-fg-machine': o.cloud.machine } : {}),
+        },
         body,
         redirect: 'error',
         signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),

@@ -19,8 +19,8 @@ export const EVERYDAY_FROM = 0.8;
 /** A rare fact (relevance < MIN_RELEVANCE) is served only when the task is at least this close to it. */
 const MIN_RELEVANCE = 0.3;
 const CLOSE_ENOUGH = 0.8;
-/** Similarity below which a past miss is never served, whatever else ranks. */
-const MISS_FLOOR = 0.3;
+/** Similarity below which a past miss or a fact is never served, whatever else ranks: a nonsense task gets nothing. */
+export const SIMILARITY_FLOOR = 0.3;
 /** A fact or miss scoring under this share of the best one is noise next to it, and is left out. */
 const RELATIVE_FLOOR = 0.6;
 
@@ -60,8 +60,52 @@ export function pathAffinity(path: string, files: string[]): number {
   return best;
 }
 
+// Folders that hold services rather than being one: a task saying "src" or "packages" names no service.
+const GENERIC_DIRS = new Set([
+  'src', 'lib', 'libs', 'app', 'apps', 'packages', 'package', 'pkg', 'services', 'service', 'internal', 'cmd', 'test',
+  'tests', 'spec', 'specs', 'docs', 'doc', 'scripts', 'script', 'tools', 'config', 'configs', 'build', 'dist', 'bin',
+  'public', 'assets', 'static', 'common', 'shared', 'utils', 'util', 'core', 'components', 'modules', 'vendor', 'main',
+  'data', 'types', 'examples', 'example',
+]);
+
+/**
+ * The folders that could be a service, from repo paths (of files, facts or misses): every first folder and every
+ * first-two-folders prefix, with no generic one (src, packages) or short one (ui) as the last part. Sorted, once each.
+ */
+export function serviceDirs(paths: string[]): string[] {
+  const out = new Set<string>();
+  for (const p of paths) {
+    const segs = dirSegs(p);
+    for (let i = 1; i <= Math.min(2, segs.length); i++) {
+      const name = segs[i - 1].toLowerCase();
+      if (name.length >= 3 && !GENERIC_DIRS.has(name)) out.add(segs.slice(0, i).join('/'));
+    }
+  }
+  return [...out].sort();
+}
+
+const escapeRe = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+/** The service folders (from serviceDirs) whose name the task says as a word ("the webapp settings" names src/webapp). */
+export function servicesInTask(task: string, dirs: string[]): string[] {
+  return dirs.filter((d) => new RegExp(`(?<![\\p{L}\\p{N}_])${escapeRe(d.split('/').at(-1)!)}(?![\\p{L}\\p{N}_])`, 'iu').test(task));
+}
+
+/**
+ * pathAffinity for services a task names in words, not files: a guess, so a milder weight. Above 1 inside one of them,
+ * below 1 in another folder, 1 for a project-wide path or with no service named.
+ */
+function serviceAffinity(path: string, services: string[]): number {
+  if (!services.length || path === '.' || !dirSegs(path).length) return 1;
+  const p = path.replace(/^\.\//, '');
+  return services.some((s) => p.startsWith(`${s}/`)) ? 1.15 : 0.85;
+}
+
+/** Named files decide where a path sits; without them, the services the task names do. */
+const affinity = (path: string, files: string[], services: string[]) => (files.length ? pathAffinity(path, files) : serviceAffinity(path, services));
+
 /** Repo paths a model's text mentions ("in src/api/orders.ts"): a slash inside, no spaces, no URL. */
-function mentionedPaths(text: string): string[] {
+export function mentionedPaths(text: string): string[] {
   return [...text.matchAll(/(?<![\w:/.-])((?:\.\/)?[\w@.-]+(?:\/[\w@.-]+)+)/g)].map((m) => m[1]);
 }
 
@@ -74,29 +118,31 @@ const keepNearBest = <T extends { score: number }>(xs: T[]) => {
  * The facts worth giving an agent, best first: similarity weighted by relevance (an unscored fact counts as middling),
  * so a convention it needs every day beats a slightly closer note on setting up some tool. A rare fact stays out
  * unless the task is very close to it, which is what a setup task looks like. With `files` (the files the task
- * names), facts of their folders and service rank up and other services' down (pathAffinity). Facts far below the
- * best are dropped. `score` becomes the weighted score.
+ * names), facts of their folders and service rank up and other services' down (pathAffinity); without files, the
+ * same, more mildly, for `services` (the folders the task names, servicesInTask). Nothing under SIMILARITY_FLOOR,
+ * and nothing far below the best, is kept. `score` becomes the weighted score.
  */
-export function rankFacts<T extends FactHit>(hits: T[], n: number, files: string[] = []): T[] {
+export function rankFacts<T extends FactHit>(hits: T[], n: number, files: string[] = [], services: string[] = []): T[] {
   return keepNearBest(
     hits
-      .filter((h) => (h.fact.relevance ?? UNSCORED_RELEVANCE) >= MIN_RELEVANCE || h.score >= CLOSE_ENOUGH)
-      .map((h) => ({ ...h, score: h.score * (0.55 + 0.45 * (h.fact.relevance ?? UNSCORED_RELEVANCE)) * pathAffinity(h.fact.path ?? '.', files) }))
+      .filter((h) => h.score >= SIMILARITY_FLOOR && ((h.fact.relevance ?? UNSCORED_RELEVANCE) >= MIN_RELEVANCE || h.score >= CLOSE_ENOUGH))
+      .map((h) => ({ ...h, score: h.score * (0.55 + 0.45 * (h.fact.relevance ?? UNSCORED_RELEVANCE)) * affinity(h.fact.path ?? '.', files, services) }))
       .sort((a, b) => b.score - a.score),
   ).slice(0, n);
 }
 
 /**
- * Past misses worth giving an agent, best first: never a non-miss (isNonMiss), never below MISS_FLOOR, weighted by
- * where the paths they mention sit against the named files (pathAffinity), and none far below the best.
+ * Past misses worth giving an agent, best first: never a non-miss (isNonMiss), never below SIMILARITY_FLOOR, weighted by
+ * where the paths they mention sit against the named files (pathAffinity), and none far below the best. Never one whose
+ * lesson you rejected as worked out from the wrong session (rejectedWrongSession): it is evidence of nothing.
  */
-export function rankMisses<T extends { missed: string; feedbackText: string; score: number }>(hits: T[], n: number, files: string[] = []): T[] {
+export function rankMisses<T extends { missed: string; feedbackText: string; score: number; rejectedWrongSession?: boolean }>(hits: T[], n: number, files: string[] = [], services: string[] = []): T[] {
   return keepNearBest(
     hits
-      .filter((m) => !isNonMiss(m.missed) && m.score >= MISS_FLOOR)
+      .filter((m) => !m.rejectedWrongSession && !isNonMiss(m.missed) && m.score >= SIMILARITY_FLOOR)
       .map((m) => {
         const paths = mentionedPaths(`${m.missed} ${m.feedbackText}`);
-        const w = paths.length ? Math.max(...paths.map((p) => pathAffinity(p, files))) : 1;
+        const w = paths.length ? Math.max(...paths.map((p) => affinity(p, files, services))) : 1;
         return { ...m, score: m.score * w };
       })
       .sort((a, b) => b.score - a.score),

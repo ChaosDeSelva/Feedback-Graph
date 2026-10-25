@@ -1,5 +1,5 @@
 import { expect, test } from 'vitest';
-import { codeGraphViews, codeMapDiff, expandDependents, hotspotScore, isCodeLang, isGitCommit, pathMatches, repoRelative, sessionFiles, sessionWork, suggestLessonPaths, touchedAround, type CodeGraphReads } from './codegraph.ts';
+import { CODE_MAP_VERSION, codeGraphViews, codeMapDiff, expandDependents, hotspotScore, isCodeLang, isGitCommit, mapIncomplete, normalizeCodeMap, pathMatches, repoRelative, sessionFiles, sessionWork, suggestLessonPaths, touchedAround, trailingToolCalls, type CodeGraphReads, type MapFile } from './codegraph.ts';
 import { hostRepoPath } from './projects.ts';
 import type { ParsedSession, ToolCall } from './types.ts';
 
@@ -140,6 +140,7 @@ function fakeReads(files: { path: string; lang: string; commits: number }[], mis
   const none = async () => [];
   return {
     mapFiles: async (_k, paths) => files.filter((f) => !paths || paths.includes(f.path)).map((f) => ({ path: f.path, lang: f.lang, hash: 'h', loc: 1, isTest: false, churn: { commits: f.commits, lastTs: '2026-10-01' } })),
+    outsideFiles: none,
     symbolsOf: none,
     importsOf: none,
     importersOf: async (_k, paths) => new Map(paths.map((p) => [p, []])),
@@ -159,6 +160,13 @@ test('hotspots: a busy manifest with no miss scores 0, below quiet code; a miss 
   const withMiss = await codeGraphViews(fakeReads(files, ['docs/a.md'])).hotspots('demo', 10);
   expect(withMiss[0]).toMatchObject({ path: 'docs/a.md', misses: 1 });
   expect(withMiss[0].score).toBeGreaterThan(4);
+});
+
+test('hotspots with missesOnly: only files a confirmed miss touched, however busy the others are', async () => {
+  const files = [{ path: 'src/busy.ts', lang: 'typescript', commits: 900 }, { path: 'docs/a.md', lang: 'md', commits: 1 }];
+  const h = await codeGraphViews(fakeReads(files, ['docs/a.md'])).hotspots('demo', 1, { missesOnly: true });
+  expect(h.map((x) => x.path)).toEqual(['docs/a.md']);
+  expect(await codeGraphViews(fakeReads(files)).hotspots('demo', 10, { missesOnly: true })).toEqual([]);
 });
 
 test('codeMapDiff rewrites only the files whose symbols changed and the import edges that changed', () => {
@@ -190,4 +198,72 @@ test('codeMapDiff rewrites only the files whose symbols changed and the import e
   expect(d.newImports.map((i) => `${i.from}>${i.to}`)).toEqual(['b.ts>pkg:zod', 'c.ts>a.ts', 'new.ts>a.ts']);
   // Nothing changed: nothing to write.
   expect(codeMapDiff(next, next)).toEqual({ symbolPaths: [], symbols: [], staleImports: [], newImports: [] });
+});
+
+const mf = (path: string, isTest = false): MapFile => ({ path, lang: 'typescript', hash: `h-${path}`, loc: 1, isTest });
+
+test('normalizeCodeMap keeps the import index past the cap: outside files with their edges, no symbols, never a mapped file twice', () => {
+  const n = normalizeCodeMap({
+    files: [mf('src/db.ts'), mf('src/api.ts')],
+    // past the cap: they import the mapped files (and each other) but carry no symbols
+    outside: [mf('src/cli.ts'), mf('src/db.ts'), mf('test/cli.test.ts', true), mf('src/cli.ts')],
+    symbols: [
+      { id: 'src/db.ts#Db', path: 'src/db.ts', name: 'Db', kind: 'class', exported: true, lines: '1-2' },
+      { id: 'src/cli.ts#run', path: 'src/cli.ts', name: 'run', kind: 'function', exported: true, lines: '1-2' },
+    ],
+    imports: [
+      { from: 'src/api.ts', to: 'src/db.ts', names: ['Db'], spec: './db' },
+      { from: 'src/cli.ts', to: 'src/db.ts', names: ['Db'], spec: './db' },
+      { from: 'test/cli.test.ts', to: 'src/cli.ts', names: ['run'], spec: '../src/cli' },
+      { from: 'src/gone.ts', to: 'src/db.ts', names: [], spec: './db' },
+    ],
+    tests: [{ test: 'test/cli.test.ts', target: 'src/cli.ts' }],
+    churn: {},
+    fingerprint: 'f',
+    version: CODE_MAP_VERSION,
+  });
+  expect(n.files.map((f) => f.path)).toEqual(['src/api.ts', 'src/db.ts']);
+  expect(n.outside.map((f) => f.path)).toEqual(['src/cli.ts', 'test/cli.test.ts']);
+  expect(n.symbols.map((s) => s.id)).toEqual(['src/db.ts#Db']);
+  expect(n.imports.map((i) => `${i.from}>${i.to}`)).toEqual(['src/api.ts>src/db.ts', 'src/cli.ts>src/db.ts', 'test/cli.test.ts>src/cli.ts']);
+  expect(n.tests).toEqual([{ test: 'test/cli.test.ts', target: 'src/cli.ts' }]);
+  expect(n.stats).toEqual({ files: 2, symbols: 1, imports: 3, tests: 1 });
+  expect(n.version).toBe(CODE_MAP_VERSION);
+  // A write without a version (an older worker) stores none, so the next start rebuilds it.
+  expect(normalizeCodeMap({ files: [], symbols: [], imports: [], tests: [], churn: {}, fingerprint: null }).version).toBeNull();
+});
+
+test('mapIncomplete: a map from older map rules, or one that never counted its unresolved imports, is not complete', () => {
+  const meta = (o: object) => ({ fingerprint: 'f', builtAt: 'x', stats: { files: 1, symbols: 0, imports: 0, tests: 0 }, candidates: null, unresolved: 0, version: CODE_MAP_VERSION, ...o });
+  expect(mapIncomplete(meta({}))).toBe(false);
+  expect(mapIncomplete(meta({ unresolved: null }))).toBe(true);
+  expect(mapIncomplete(meta({ version: null }))).toBe(true);
+  expect(mapIncomplete(meta({ version: CODE_MAP_VERSION - 1 }))).toBe(true);
+  expect(mapIncomplete(null)).toBe(false);
+});
+
+test('outsideMap and impact: a file past the cap is in the import index, with its importers; impact starts from it', async () => {
+  const outside = [{ ...mf('src/utils/logging.ts'), churn: null }, { ...mf('src/b.test.ts', true), churn: null }];
+  const importers: Record<string, string[]> = { 'src/utils/logging.ts': ['src/a.ts', 'src/b.ts', 'src/b.test.ts'], 'src/a.ts': ['src/main.ts'] };
+  const reads: CodeGraphReads = {
+    ...fakeReads([{ path: 'src/a.ts', lang: 'typescript', commits: 0 }, { path: 'src/main.ts', lang: 'typescript', commits: 0 }]),
+    outsideFiles: async (_k, paths) => outside.filter((f) => !paths || paths.includes(f.path)),
+    importersOf: async (_k, paths) => new Map(paths.map((p) => [p, importers[p] ?? []])),
+  };
+  const v = codeGraphViews(reads);
+  expect(await v.outsideMap('demo', ['src/utils/logging.ts', 'src/a.ts', 'src/nowhere.ts'])).toEqual([
+    { path: 'src/utils/logging.ts', importers: ['src/a.ts', 'src/b.test.ts', 'src/b.ts'], tests: ['src/b.test.ts'] },
+  ]);
+  const i = await v.impact('demo', ['src/utils/logging.ts', 'src/nowhere.ts'], 2);
+  expect(i.paths).toEqual(['src/utils/logging.ts']);
+  expect(i.dependents.map((d) => d.path)).toEqual(['src/a.ts', 'src/b.test.ts', 'src/b.ts', 'src/main.ts']);
+  expect(i.tests).toEqual(['src/b.test.ts']);
+});
+
+test('trailingToolCalls: the calls after the last human turn, which no turn takes in', () => {
+  const call = (ts: string, command: string): ToolCall => ({ name: 'Bash', ts, command });
+  const turn = (ts: string) => ({ uuid: ts, sessionId: 's', ts, index: 0, text: 'x', precedingAssistantText: '', precedingToolCalls: [] });
+  const calls = [call('2026-10-25T10:01:00Z', 'pnpm test'), call('2026-10-25T10:03:00Z', 'git push')];
+  expect(trailingToolCalls({ turns: [turn('2026-10-25T10:00:00Z'), turn('2026-10-25T10:02:00Z')], toolCalls: calls })).toEqual([calls[1]]);
+  expect(trailingToolCalls({ turns: [], toolCalls: calls })).toEqual([]);
 });

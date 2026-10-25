@@ -42,6 +42,35 @@ export interface LlmProvider {
   /** True when it can read `images`; one that cannot refuses a task that has any. Absent: false. */
   vision?: boolean;
   json(task: JsonTask): Promise<unknown>;
+  /**
+   * For providers that explore a filtered copy of the repo (codex-cli): make that copy once, so many jobs over one repo
+   * (the shards of a scan) do not copy it each. A job whose cwd is a mirror this provider made and has not disposed
+   * runs in it as it is; any other cwd is still copied per job. Absent: the provider reads the repo in place.
+   */
+  mirror?(repo: string): Promise<AgentMirror>;
+}
+
+/** A filtered copy of a repo (mirror.ts) a provider made with LlmProvider.mirror; dispose removes it. */
+export type AgentMirror = { dir: string; dispose(): Promise<void> };
+
+/**
+ * The mirrors a provider made and has not disposed: a job in one of them runs there, any other folder is mirrored for
+ * that job alone. Only a folder this provider made counts, so no caller can skip the secret filter by naming a folder.
+ */
+function mirrors(parent?: string) {
+  const live = new Set<string>();
+  return {
+    async make(repo: string): Promise<AgentMirror> {
+      const m = await mirrorForAgent(repo, parent);
+      live.add(m.dir);
+      return { dir: m.dir, dispose: async () => { live.delete(m.dir); await m.dispose(); } };
+    },
+    /** The task folder's mirror: the one given when it is live, else a fresh one, removed after the job. */
+    async forJob(cwd: string): Promise<{ dir: string; dispose(): Promise<void> }> {
+      if (live.has(cwd)) return { dir: cwd, dispose: async () => {} };
+      return mirrorForAgent(cwd, parent);
+    },
+  };
 }
 
 /** A provider that cannot see refuses images rather than answering as if there were none. */
@@ -266,13 +295,15 @@ export const DEFAULT_RUNNER_SCRATCH = '/scratch';
 
 /** Inside the worker, unconfined: only with ALLOW_UNCONFINED_CODEX=1. */
 function codexCli(id: string, model: string | undefined, o: ProviderOpts): LlmProvider {
+  const own = mirrors();
   return {
     id,
     agentic: true,
+    mirror: (repo) => own.make(repo),
     json: (t) => inTaskFolder(t, async (cwd) => {
       const dir = await mkdtemp(join(tmpdir(), 'fb-codex-'));
       // Codex's sandbox has no per-file deny list, so it explores a copy without secret files.
-      const mirror = await mirrorForAgent(cwd);
+      const mirror = await own.forJob(cwd);
       try {
         const schemaPath = join(dir, 'schema.json');
         const outPath = join(dir, 'out.json');
@@ -291,11 +322,13 @@ function codexCli(id: string, model: string | undefined, o: ProviderOpts): LlmPr
 
 /** Confined: the mirror goes into the scratch volume and the codex-runner sidecar runs codex on it (codexRunner.ts). */
 function codexRunnerCli(id: string, model: string | undefined, url: string, scratch: string, o: ProviderOpts): LlmProvider {
+  const own = mirrors(scratch);
   return {
     id,
     agentic: true,
+    mirror: (repo) => own.make(repo),
     json: (t) => inTaskFolder(t, async (cwd) => {
-      const mirror = await mirrorForAgent(cwd, scratch);
+      const mirror = await own.forJob(cwd);
       try {
         const r = await runOnRunner({
           url,

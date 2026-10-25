@@ -148,6 +148,31 @@ test('Rebuild map asks the worker for a fresh map and says so; a refusal is show
   expect(await screen.findByText(/only you can make this decision/)).toBeTruthy();
 });
 
+test('after Rebuild map the card polls until the new map is built, then shows it without a reload', async () => {
+  let built = meta.builtAt;
+  vi.stubGlobal('fetch', vi.fn(async (url: string, init?: RequestInit) => {
+    urls.push(url);
+    if (init?.method === 'POST') return Response.json({ queued: true }, { status: 202 });
+    if (url.startsWith('/api/projects/demo/codemap/hotspots')) {
+      return Response.json({ meta: { ...meta, builtAt: built, stats: { ...meta.stats, files: built === meta.builtAt ? 40 : 55 } }, hotspots });
+    }
+    return Response.json([]);
+  }));
+  render(<CodeMap projectKey="demo" pollMs={10} />);
+  await screen.findByText('src/db/pool.ts');
+  fireEvent.click(screen.getByRole('button', { name: 'Rebuild map' }));
+  expect(await screen.findByText(/rebuild queued/i)).toBeTruthy();
+  await waitFor(() => expect(urls.filter((u) => u.startsWith('/api/projects/demo/codemap/hotspots')).length).toBeGreaterThan(2));
+  // Still the old map: the card keeps waiting and says so.
+  expect(screen.getByLabelText('files').textContent).toContain('40');
+  built = '2026-10-22T13:00:00Z';
+  await waitFor(() => expect(screen.getByLabelText('files').textContent).toContain('55'));
+  expect(screen.getByText(/map rebuilt/i)).toBeTruthy();
+  const n = urls.length;
+  await new Promise((r) => setTimeout(r, 50));
+  expect(urls.length).toBe(n);
+});
+
 test('an uncapped map says nothing about a cap', async () => {
   render(<CodeMap projectKey="demo" />);
   await screen.findByText('src/db/pool.ts');

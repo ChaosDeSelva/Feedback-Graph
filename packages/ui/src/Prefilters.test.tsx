@@ -39,3 +39,15 @@ test('each rule says how many comments it has skipped, and since when', async ()
   expect(screen.getByText(/counted since/i)).toBeTruthy();
   expect(screen.getByRole('link', { name: /see them in Activity/i }).getAttribute('href')).toBe('#activity');
 });
+
+test('a rule that also cleared items already pending in the Inbox says how many of its count those are', async () => {
+  answer = () => Response.json({
+    rules: FEEDBACK_SKIP_RULES.map((r) => ({ name: r.name, description: r.description, skipped: r.name === 'status-note' ? 5 : 0, fromInbox: r.name === 'status-note' ? 2 : 0 })),
+    skippedSince: '2026-10-20T10:00:00Z',
+  });
+  render(<Prefilters />);
+  const row = (await screen.findByText('5 skipped')).closest('li')!;
+  expect(within(row).getByText('2 of them from the Inbox')).toBeTruthy();
+  expect(screen.queryAllByText(/of them from the Inbox/)).toHaveLength(1);
+  expect(screen.getByText(/already pending in the Inbox/)).toBeTruthy();
+});

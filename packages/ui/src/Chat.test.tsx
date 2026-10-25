@@ -108,6 +108,28 @@ test('opens the linked conversation: the answer, its examples linked to their mo
   expect(within(sources).getByText('S1')).toBeTruthy();
 });
 
+test('a citation [S1] and each Sources row link to what they cite: code to its module panel, a lesson to the lesson, a document to its project', async () => {
+  threads.c1.turns[1] = {
+    ...threads.c1.turns[1],
+    sources: [
+      { id: 'S1', kind: 'code', ref: 'src/ui/Modal.tsx:10-42', title: 'Modal component' },
+      { id: 'S2', kind: 'lesson', ref: 'lesson:7', title: 'Dialogs trap focus' },
+      { id: 'S3', kind: 'doc', ref: 'spec.md', title: 'The checkout spec' },
+      { id: 'S4', kind: 'fact', ref: 'src/db.ts:3-9', title: 'Scope every query' },
+    ],
+  };
+  location.hash = '#ask/c1';
+  render(<Chat />);
+  await screen.findByText('2 modals');
+  expect(screen.getByRole('link', { name: '[S1]' }).getAttribute('href')).toBe('#projects/shop/src%2Fui%2FModal.tsx');
+  const sources = screen.getByText(/Sources \(4\)/).closest('details')!;
+  const href = (name: string) => within(sources).getByRole('link', { name: new RegExp(name) }).getAttribute('href');
+  expect(href('Modal component')).toBe('#projects/shop/src%2Fui%2FModal.tsx');
+  expect(href('Dialogs trap focus')).toBe('#lessons/lesson%3A7');
+  expect(href('The checkout spec')).toBe('#projects/shop');
+  expect(href('Scope every query')).toBe('#projects/shop/src%2Fdb.ts');
+});
+
 test('the agent prompt is copied with its Copy button', async () => {
   location.hash = '#ask/c1';
   render(<Chat />);

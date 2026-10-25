@@ -57,6 +57,56 @@ describeStores('GraphStore', (h) => {
       expect(turns[0].precedingToolCalls[0].filePath).toBe('/a.ts');
     });
 
+    test('callsAfter: the tool calls of later turns, then those after the last turn, and when the session ended', async () => {
+      const s = session(3);
+      const push = { name: 'Bash', ts: '2026-10-01T10:08:00Z', command: 'git push -u origin fix/x' };
+      // The calls after the last turn are kept on the session (trailingToolCalls); earlier ones are the turns' own.
+      await repo.upsertSession(project, { ...s, toolCalls: [...s.turns.flatMap((t) => t.precedingToolCalls), push] }, []);
+      expect(await repo.callsAfter('t1')).toEqual({
+        calls: [{ name: 'Edit', ts: '2026-10-01T10:02:00Z', filePath: '/a.ts' }, push],
+        laterTurns: 1,
+        endedAt: '2026-10-01T10:09:00.000Z',
+      });
+      expect(await repo.callsAfter('t2')).toMatchObject({ calls: [push], laterTurns: 0 });
+      expect(await repo.callsAfter('nope')).toBeNull();
+    });
+
+    test('pendingSessionItems: pending detector items from sessions with their calls; decided ones and agent reports are not', async () => {
+      await repo.upsertSession(project, session(4), []);
+      for (const t of ['t1', 't2', 't3']) await repo.saveClassification(t, pushback, true);
+      await repo.decide('t2', 'rejected', null);
+      await k.createManualFeedback({ project, cwd: '/Users/j/Vibe/demo', text: 'you missed auth', whatWasDone: 'x' });
+      const items = await repo.pendingSessionItems({ limit: 10 });
+      expect(items).toEqual([
+        { id: 't1', turnUuid: 't1', projectKey: 'demo', text: 'turn 1', precedingToolCalls: [{ name: 'Edit', ts: '2026-10-01T10:01:00Z', filePath: '/a.ts' }] },
+        expect.objectContaining({ id: 't3' }),
+      ]);
+      expect((await repo.pendingSessionItems({ limit: 10, afterId: 't1' })).map((i) => i.id)).toEqual(['t3']);
+      // Skipped by a rule: no longer pending.
+      expect(await repo.skipPendingItem('t1', { rule: 'instruction', note: 'n', by: 'detect-rules' })).toBe(true);
+      expect((await repo.pendingSessionItems({ limit: 10 })).map((i) => i.id)).toEqual(['t3']);
+    });
+
+    test('ruleSkippedItems and reopenRuleSkippedItem: what a rule rejected goes back to pending; your decisions stay', async () => {
+      await repo.upsertSession(project, session(4), []);
+      for (const t of ['t1', 't2', 't3']) await repo.saveClassification(t, pushback, true);
+      await repo.skipPendingItem('t1', { rule: 'instruction', note: 'n', by: 'detect-rules' });
+      await repo.skipPendingItem('t2', { rule: 'instruction', note: 'n', by: 'detect-rules' });
+      // You decided t2 since: it is no longer the rule's.
+      await repo.decide('t2', 'rejected', 'not useful', 'you');
+      await repo.decide('t3', 'rejected', null, 'you');
+      const skipped = await repo.ruleSkippedItems({ rule: 'instruction', by: 'detect-rules', limit: 10 });
+      expect(skipped).toEqual([expect.objectContaining({ id: 't1', turnUuid: 't1', projectKey: 'demo', text: 'turn 1' })]);
+      expect(await repo.ruleSkippedItems({ rule: 'instruction', by: 'detect-rules', limit: 10, afterId: 't1' })).toEqual([]);
+      expect(await repo.reopenRuleSkippedItem('t2', { rule: 'instruction', by: 'detect-rules' })).toBe(false);
+      expect(await repo.reopenRuleSkippedItem('t1', { rule: 'instruction', by: 'detect-rules' })).toBe(true);
+      expect((await repo.pendingSessionItems({ limit: 10 })).map((i) => i.id)).toEqual(['t1']);
+      const [c] = await repo.listCandidates({ status: 'pending' });
+      expect(c).toMatchObject({ id: 't1', status: 'pending', note: null, decidedAt: null });
+      expect(c.classification.signals).not.toContain('skip:instruction');
+      expect(await repo.reopenRuleSkippedItem('t1', { rule: 'instruction', by: 'detect-rules' })).toBe(false);
+    });
+
     test('unclassifiedTurns returns newest first and can be limited to some projects', async () => {
       await repo.upsertSession(project, session(4), []);
       const other = { key: 'other', name: 'other', repoPath: '/vibe/other' };

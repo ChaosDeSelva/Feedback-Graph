@@ -6,8 +6,8 @@ import type { ExternalSource } from '../types.ts';
 import type { IntegrationErrorKind } from './errors.ts';
 
 /**
- * GitHub and Linear connections: a token from .env (GITHUB_TOKEN, LINEAR_API_KEY), which always wins, or one pasted in
- * Settings. A pasted token is kept in INTEGRATIONS_FILE (state/settings/integrations.json, mode 600): never in the
+ * GitHub and Linear connections: a token pasted in Settings, which wins, or one from .env (GITHUB_TOKEN, LINEAR_API_KEY),
+ * used when nothing is saved in the app (so disconnecting in Settings falls back to it). A pasted token is kept in INTEGRATIONS_FILE (state/settings/integrations.json, mode 600): never in the
  * database, never returned by the API, logged, exported or synced. The api writes it; the worker reads it each cycle.
  *
  * What is not secret lives in the store's key/value records, each written by one side so they never race: `check` (the
@@ -101,7 +101,7 @@ export class Integrations {
     this.file = file;
   }
 
-  /** Whether .env sets this service's token (it then wins over one saved in the app). */
+  /** Whether .env sets this service's token (used when none is saved in the app). */
   envSet(kind: IntegrationKind): boolean {
     return !!this.env[ENV_VAR[kind]]?.trim();
   }
@@ -112,13 +112,13 @@ export class Integrations {
   }
 
   async credential(kind: IntegrationKind): Promise<Credential | null> {
-    const fromEnv = this.env[ENV_VAR[kind]]?.trim();
-    if (fromEnv) return { token: fromEnv, source: 'env', fingerprint: tokenFingerprint(fromEnv) };
     const saved = this.file ? (await this.file.read())[kind]?.token : null;
-    return saved ? { token: saved, source: 'app', fingerprint: tokenFingerprint(saved) } : null;
+    if (saved) return { token: saved, source: 'app', fingerprint: tokenFingerprint(saved) };
+    const fromEnv = this.env[ENV_VAR[kind]]?.trim();
+    return fromEnv ? { token: fromEnv, source: 'env', fingerprint: tokenFingerprint(fromEnv) } : null;
   }
 
-  /** Whether a token is saved in the app (whether or not .env overrides it). */
+  /** Whether a token is saved in the app (it then wins over .env). */
   async savedInApp(kind: IntegrationKind): Promise<boolean> {
     return !!(this.file && (await this.file.read())[kind]?.token);
   }

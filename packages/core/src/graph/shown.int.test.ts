@@ -66,6 +66,13 @@ describeStores('project scoping (projectKeys)', (h) => {
     expect(await repo.listCandidates({ projectKeys: ['shop'], projectKey: 'old' })).toEqual([]);
   });
 
+  test('listCandidates pages with offset: the pages, in order, are the whole list once', async () => {
+    const all = (await repo.listCandidates({})).map((c) => c.id);
+    const pages = [0, 1, 2, 3].map((offset) => repo.listCandidates({ limit: 1, offset }).then((r) => r.map((c) => c.id)));
+    expect((await Promise.all(pages)).flat()).toEqual(all);
+    expect(await repo.listCandidates({ limit: 2, offset: 3 })).toEqual([]);
+  });
+
   test('lessons carry the project they were learned in; a global one keeps it as its origin', async () => {
     expect((await k.lessonDetail('lesson:s2-t1'))!.lesson).toMatchObject({ projectKey: null, origin: 'old' });
     expect((await k.lessonDetail('lesson:s1-t1'))!.lesson).toMatchObject({ projectKey: 'shop', origin: 'shop' });

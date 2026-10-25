@@ -1,5 +1,5 @@
 import {
-  ChatBusyError, cleanChatAnswer, cleanChatContext, cleanChatError, cleanChatSources, cleanChatText, cleanChatTitle, newChatId, newChatTurnId, ORPHANED_TURN,
+  ChatBusyError, cleanChatAnswer, cleanChatContext, cleanChatError, cleanChatSources, cleanChatText, cleanChatTitle, newChatId, newChatTurnId, ORPHANED_TURN, withPackSizes,
   type ChatAnswer, type ChatConversation, type ChatJob, type ChatPack, type ChatProvider, type ChatStore, type ChatThread, type ChatTurn,
 } from '@fb/core';
 import type pg from 'pg';
@@ -146,7 +146,7 @@ async function threadOf(q: pg.Pool | pg.PoolClient, id: string): Promise<ChatThr
   const { rows: [conv] } = await q.query(`SELECT c.*, ${PENDING} AS pending FROM chat_conversations c WHERE c.id = $1`, [id]);
   if (!conv) return null;
   const { rows } = await q.query('SELECT * FROM chat_turns WHERE conversation_id = $1 ORDER BY seq', [id]);
-  return { ...conversationOf(conv), turns: rows.map(turnOf) };
+  return { ...conversationOf(conv), turns: withPackSizes(rows.map((r) => ({ turn: turnOf(r), contextChars: typeof r.context === 'string' ? r.context.length : null }))) };
 }
 
 function conversationOf(r: Record<string, any>): ChatConversation {

@@ -25,7 +25,7 @@ Parsing uses tree-sitter through `web-tree-sitter` (WASM, no native build) with 
 | Language | Symbols | Imports resolved to repo files |
 |---|---|---|
 | TypeScript, TSX, JavaScript (ESM + CommonJS) | yes | relative (`.js` -> `.ts`, `index.*`), tsconfig `paths`/`baseUrl` (with `extends`), workspace package names |
-| Python | yes | relative, package-absolute from the repo root, each `pyproject.toml`/`setup.py` dir and their `src/` |
+| Python | yes | relative, package-absolute from the repo root, each `pyproject.toml`/`setup.py` dir and their `src/`; a miss under one of the repo's own package names (or a relative miss) counts as unresolved |
 | Go | yes | packages inside a `go.mod` module (an edge to each non-test file of the package) |
 | Rust | yes | `mod x;`, `crate::`/`self::`/`super::` paths, workspace crates by name |
 | C# | yes | `using` of a namespace declared in the repo (an edge to each declaring file) |
@@ -41,7 +41,23 @@ makes no edge. `.gd` files are always reparsed (it is cheap) because a class_nam
 unchanged file refers to.
 
 Anything that does not resolve inside the repo becomes `pkg:<name>` (the npm package, Python top-level module, Rust
-crate, Go import path, C# namespace or Swift module). A relative import that points at nothing is dropped.
+crate, Go import path, C# namespace or Swift module). A relative import that points at nothing is dropped (counted as
+unresolved for Python). `unresolved` counts imports that look like the repo's own code but name no file.
+
+## The import index and the cap
+
+Every candidate file (up to `MAX_INDEX_FILES`, 50,000) is parsed and its imports resolved against all of them, so an
+alias or a Python package pointing past the cap still resolves. The map keeps symbols for the first `cap` files
+(`mapCap`), ranked by tier (`scan/rank.ts`) and, within a tier, by `log2(1 + importers) + log2(1 + commits)`: a
+capped map holds the most imported and most changed files, not the alphabetically first. The rest are `outside`: no
+symbols, but their files and every edge to and from them are stored, so importer counts are right and a file past
+the cap can still say who imports it (`CodeGraphStore.outsideMap`). Ask's code search matches their names too.
+
+## Versions
+
+Each map is stamped with `CODE_MAP_VERSION` (core). The stage rebuilds a stored map with an older version (or none)
+from scratch on its next pass, whatever the repo did, and logs `code map outdated, rebuilding`; until then answers
+call its import graph incomplete. Bump the version whenever what a map holds changes.
 
 ## Incremental builds
 

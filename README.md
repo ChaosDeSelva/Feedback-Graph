@@ -66,7 +66,7 @@ Hooks only act in folders you selected in Settings and stay silent when the Feed
 
 ### Agents and scripts
 
-The MCP tools only read and report. Decisions (choosing projects, scanning, confirming Inbox items, approving lessons) are yours in the UI. To let an agent or a script make some of them, set `FG_OPERATOR_TOKEN` in `.env` (`openssl rand -hex 24`) and restart. A request carrying it as a bearer may make the decisions `OPERATOR_ALLOW` lists; by default that leaves out deciding lessons, deleting data, settings, imports and integration keys, so what agents learn stays yours. Writes made with it show in Activity as `operator:<name>`.
+The MCP tools only read and report. Decisions (choosing projects, scanning, confirming Inbox items, approving lessons) are yours in the UI. To let an agent or a script make some of them, set `FG_OPERATOR_TOKEN` in `.env` (`openssl rand -hex 24`) and restart. A request carrying it as a bearer may make the decisions `OPERATOR_ALLOW` lists; by default that leaves out deciding lessons, deleting data, settings, imports, integration keys and asking in Ask (which spends your subscription), so what agents learn stays yours. Writes made with it show in Activity as `operator:<name>`.
 
 `./scripts/fg` is a small CLI for it (Node from the host, or `docker compose exec api` when Node is missing):
 
@@ -80,7 +80,7 @@ The MCP tools only read and report. Decisions (choosing projects, scanning, conf
 
 `--json` prints raw answers; `--as <name>` names the agent in Activity. Reading works without the token. `fg status --watch` follows the live event stream. `./scripts/fg --help` lists every command (projects, scans, Inbox, lessons, links, facts, docs, activity, sessions, cloud, integrations, `map rebuild`, `doctor`, `setup`).
 
-**From inside an agent session:** with `FG_OPERATOR_TOKEN` set, a second MCP endpoint, `http://localhost:8787/mcp/admin`, gives a coding agent the same decisions as tools (`pipeline_status`, `list_projects`, `select_projects`, `scan_projects`, `inbox_list`, `inbox_decide`, `lessons_list`, `lesson_decide`, `link_decide`, `set_fact_relevance`, `cloud_sync_now`, `rebuild_code_map`). It answers only to the operator token (send it as the Bearer when you register the server), and each tool is limited by the same `OPERATOR_ALLOW` verbs. The regular `/mcp` endpoint stays read-and-report only.
+**From inside an agent session:** with `FG_OPERATOR_TOKEN` set, a second MCP endpoint, `http://localhost:8787/mcp/admin`, gives a coding agent the same decisions as tools (`pipeline_status`, `list_projects`, `select_projects`, `scan_projects`, `inbox_list`, `inbox_get`, `inbox_decide`, `lessons_list`, `lesson_get`, `lesson_decide`, `link_decide`, `set_fact_relevance`, `cloud_sync_now`, `rebuild_code_map`). It answers only to the operator token (send it as the Bearer when you register the server), and each tool is limited by the same `OPERATOR_ALLOW` verbs. Its lists are paged at 20 rows and its read tools are marked read-only, so Codex does not ask before each one; export `FG_OPERATOR_TOKEN` in the shell you start Codex from (see [docs/operations.md](docs/operations.md)). The regular `/mcp` endpoint stays read-and-report only. A wrong bearer is refused (401) on reads as well as writes.
 
 **For scripts:** `GET /api/openapi.json` describes the whole local API (OpenAPI 3.1), including which routes are owner-only and which `OPERATOR_ALLOW` verb unlocks each. `GET /api/events` streams changes as server-sent events (`stage`, `pipeline`, `scan`, `chat`, `activity`), so a watcher does not have to poll.
 
@@ -131,7 +131,7 @@ The sidebar shows whether the worker is running, and a connections list (GitHub,
 | `TURN_RETENTION_DAYS` | Remove the text of unflagged turns older than this. Empty keeps everything. While summaries are on, a turn keeps its text until its session summary covers it; summaries are never removed. |
 | `SUMMARY_LLM`, `SUMMARY_QUIET_MINUTES`, `SUMMARY_MAX_DELTA_TURNS`, `SESSION_IDLE_MINUTES`, `SUMMARY_BACKFILL_PER_CYCLE` | Session summaries: the model (same specs as below; empty: the local model; `off`: no summaries), the quiet time before new turns are summarized (10), the waiting turns that are summarized at once (40), the quiet time after which a summarized session is idle (30), and older sessions summarized per cycle (3). |
 | `MEMORY_AUTO_APPROVE` | `false` (default): Claude Code feedback memories (`type: feedback`) are imported as proposed lessons that you approve in Lessons. `true`: they are approved on import. Either way, once you edit, approve or reject one, re-importing its file never changes it. |
-| `FG_OPERATOR_TOKEN`, `OPERATOR_ALLOW` | Let agents and scripts (the `fg` CLI) make owner decisions without a browser. Empty: none can. `OPERATOR_ALLOW` names what the token may do; empty means everything except deciding lessons, deleting a project, an uploaded document or a chat, settings (roots and cleanup), imports and integration keys. See [Agents and scripts](#agents-and-scripts). |
+| `FG_OPERATOR_TOKEN`, `OPERATOR_ALLOW` | Let agents and scripts (the `fg` CLI) make owner decisions without a browser. Empty: none can. `OPERATOR_ALLOW` names what the token may do; empty means everything except deciding lessons, deleting a project, an uploaded document or a chat, settings (roots and cleanup), imports, integration keys and asking in Ask (`chat`). See [Agents and scripts](#agents-and-scripts). |
 | `GITHUB_BOT_LOGINS`, `GITHUB_AGENT_LOGINS` | GitHub logins whose comments are a bot's (skipped) or an AI agent's (kept and labelled), comma-separated. Accounts GitHub marks as bots are skipped anyway. |
 | `API_TOKEN`, `PUBLIC_HOSTS`, `API_BIND` | Reach the API from other machines: every call then needs the token. Without one, only localhost: an `API_BIND` other than 127.0.0.1 without `API_TOKEN` refuses to start. |
 | `CODEX_RUNNER_URL` | `http://codex-runner:8790`, with `codex` in `COMPOSE_PROFILES`: `codex-cli` runs confined in the codex-runner container, which holds only the Codex CLI, your Codex login and the job's copy of the repository ([docs/operations.md](docs/operations.md#running-codex-cli-confined)). |
@@ -139,7 +139,7 @@ The sidebar shows whether the worker is running, and a connections list (GitHub,
 | `CLAUDE_CODE_OAUTH_TOKEN` | From `claude setup-token`. Post-mortems then run on your Claude subscription (otherwise gemma4). |
 | `CLASSIFY_LLM`, `POSTMORTEM_LLM`, `SCAN_LLM`, `CHECK_LLM`, `DOCS_LLM` | Model per job: `ollama:<model>`, `claude-cli`, `codex-cli`, `openai:<model>`, `openrouter:<model>`, `groq:<model>`, `anthropic:<model>`, `jev` (classification only). `CHECK_LLM` (the `check_before_done` judge, which runs in the api) takes neither CLI. `DOCS_LLM` reads your uploads into facts (default `SCAN_LLM`); images need a model with vision (`ollama:gemma4`, `claude-cli`, `anthropic:`, `openai:`, `openrouter:`). The scan model also scores the relevance of facts stored before relevance existed, a batch at a time when nothing else is waiting. |
 | `OPENAI_API_KEY`, `OPENAI_BASE_URL`, `OPENROUTER_API_KEY`, `GROQ_API_KEY`, `ANTHROPIC_API_KEY`, `TYPESAFE_API_KEY` | Bring-your-own keys |
-| `GITHUB_TOKEN`, `LINEAR_API_KEY` | GitHub and Linear tokens. Optional: you can paste them in Settings instead; one set here wins and Settings shows it as "set in .env". See [GitHub and Linear](#github-and-linear-optional). |
+| `GITHUB_TOKEN`, `LINEAR_API_KEY` | GitHub and Linear tokens. Optional: you can paste them in Settings instead. A token saved in Settings wins; the one in `.env` is used when none is saved there. See [GitHub and Linear](#github-and-linear-optional). |
 | `GITHUB_REPOS` | Optional override of the repository a project's PR comments come from (`demo-shop=me/demo-shop,other=me/other`). Without it, each selected project's github.com remote is used. |
 | `LINK_SCAN_MINUTES` | Minutes between rounds of looking for links between the selected projects (30). No model: package manifests, mentions of another project's repository, and its name in several files. |
 | `INTEGRATION_SYNC_MINUTES`, `GITHUB_SYNC_HOURS` | How often each project's review comments and Linear comments are read into the Inbox (10), and how often PR discussions are refreshed as context (6). |
@@ -159,8 +159,10 @@ to the comment, the PR or issue title, and for a review comment the file, line a
 a confirmed one gets a post-mortem.
 
 1. **Settings > Integrations.** Paste a token and press **Connect**: it is checked with one read-only call (the account it
-   belongs to is shown) and saved only if it works. Or set `GITHUB_TOKEN` / `LINEAR_API_KEY` in `.env`, which wins and is shown
-   as "set in .env". **Test connection** checks it again; **Disconnect** (after a confirm) deletes a token saved in the app.
+   belongs to is shown) and saved only if it works. Or set `GITHUB_TOKEN` / `LINEAR_API_KEY` in `.env` (shown
+   as "set in .env"); a token saved in Settings wins over it, so you can replace a `.env` key without editing the file.
+   **Test connection** checks it again; **Disconnect** (after a confirm) deletes a token saved in the app and goes back to the
+   `.env` one, if any.
    - GitHub: a [fine-grained personal access token](https://github.com/settings/personal-access-tokens/new) with access to
      only your projects' repositories, and **Pull requests** and **Issues** set to **Read-only**. Nothing is ever written to GitHub.
    - Linear: a personal API key from [Settings, Security and access](https://linear.app/settings/account/security).

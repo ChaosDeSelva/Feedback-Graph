@@ -60,7 +60,7 @@ const vectorParam = (v: number[]) => (v.length ? toVector(v) : null);
 export function searchFactsQuery(db: Db, q: { embedding: number[]; projectKey: string; k: number }, columns: string): SqlQuery {
   const v = vectorTerms(db, 'f.embedding', '$2', q.embedding.length);
   return {
-    sql: `SELECT ${columns}, cf.summary AS file_summary, 1 - x.distance / 2 AS score
+    sql: `SELECT ${columns}, cf.summary AS file_summary, cf.hash_changed_at AS file_changed_at, 1 - x.distance / 2 AS score
           FROM (SELECT f.*, ${v.distance} AS distance FROM facts f
                 WHERE f.project_key = $1 AND f.current AND ${v.where}
                 ORDER BY ${v.distance}, f.id LIMIT $3) x
@@ -103,7 +103,9 @@ export function searchLessonsQuery(db: Db, q: { embedding: number[]; projectKey:
 export function relatedMissesQuery(db: Db, q: { embedding: number[]; projectKey: string | null; k: number }): SqlQuery {
   const v = vectorTerms(db, 'm.embedding', '$1', q.embedding.length);
   return {
-    sql: `SELECT n.id, n.missed, n.cause, 1 - n.distance / 2 AS score, t.text, t.session_id, t.ts_text
+    sql: `SELECT n.id, n.missed, n.cause, 1 - n.distance / 2 AS score, t.text, t.session_id, t.ts_text,
+                 EXISTS (SELECT 1 FROM lessons l WHERE l.miss_id = n.id AND l.status = 'rejected'
+                           AND l.checks @> '[{"name": "wrong-session"}]'::jsonb) AS wrong_session
           FROM (SELECT m.id, m.missed, m.cause, m.feedback_id, ${v.distance} AS distance FROM misses m
                 WHERE ($2::text IS NULL OR m.project_key = $2) AND ${v.where}
                 ORDER BY ${v.distance}, m.id LIMIT $3) n

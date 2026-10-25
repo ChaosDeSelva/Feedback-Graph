@@ -1,11 +1,11 @@
 import { expect, test, vi } from 'vitest';
-import { bundleCounts, CloudSyncError, nextSyncDelayMs, previewCloudSync, pushBundle, runCloudSync, storedSyncMemory, syncBundle, syncMemoryCursor, syncProjects, type SyncResponse } from './cloud.ts';
+import { bundleCounts, CloudSyncError, nextSyncDelayMs, PREVIEW_CONCURRENCY, previewCloudSync, pushBundle, runCloudSync, storedSyncMemory, syncBundle, syncMemoryCursor, syncProjects, type SyncResponse } from './cloud.ts';
 import type { CloudConfig } from './config.ts';
 import { EXPORT_FORMAT, type ExportBundle } from './graph/portability.ts';
 import type { ActivityInput } from './types.ts';
 
 const TOKEN = `fgc_pat_0123456789abcdef_${'A'.repeat(43)}`;
-const cloud: CloudConfig = { url: 'https://cloud.example.com', token: TOKEN, intervalMinutes: 60, projects: [], suggestions: false };
+const cloud: CloudConfig = { url: 'https://cloud.example.com', token: TOKEN, intervalMinutes: 60, projects: [], suggestions: false, machine: null };
 
 const TRANSCRIPT = 'no, you broke checkout again, read the README first';
 const SOURCE = 'export function charge(card) { return stripe.charge(card) }';
@@ -160,6 +160,15 @@ test('pushBundle posts JSON with the bearer token to /api/v1/sync and returns th
   expect(JSON.parse(calls[0].init.body as string).projectKey).toBe('shop');
 });
 
+test('pushBundle names this machine in x-fg-machine when CLOUD_MACHINE is set, and sends no such header otherwise', async () => {
+  const one = fakeFetch([Response.json(ok)]);
+  await pushBundle({ cloud: { ...cloud, machine: 'work-laptop' }, bundle: bundle(), fetch: one.f, sleep: noSleep });
+  expect(new Headers(one.calls[0].init.headers).get('x-fg-machine')).toBe('work-laptop');
+  const two = fakeFetch([Response.json(ok)]);
+  await pushBundle({ cloud, bundle: bundle(), fetch: two.f, sleep: noSleep });
+  expect(new Headers(two.calls[0].init.headers).has('x-fg-machine')).toBe(false);
+});
+
 test('pushBundle refuses plain http except to this machine, before anything is sent', async () => {
   const { f, calls } = fakeFetch([]);
   await expect(pushBundle({ cloud: { ...cloud, url: 'http://cloud.example.com' }, bundle: bundle(), fetch: f, sleep: noSleep })).rejects.toThrow(/https/);
@@ -305,6 +314,26 @@ test('the preview counts what a sync would send, per project, without sending', 
   expect(p.total).toEqual({ projects: 1, lessons: 1, misses: 1, facts: 1, docs: 1, codeFiles: 1 });
   expect(p.projects).toEqual([{ key: 'shop', counts: { projects: 1, lessons: 1, misses: 1, facts: 1, docs: 1, codeFiles: 1 } }, { key: 'empty', counts: null }]);
   expect(bundleCounts(bundle())).toEqual({ projects: 1, lessons: 2, misses: 1, facts: 1, docs: 1, codeFiles: 1 });
+});
+
+test('the preview exports a few projects at a time, not one after another, and keeps their order', async () => {
+  let running = 0;
+  let most = 0;
+  const keys = ['a', 'b', 'c', 'd', 'e', 'f'];
+  const slow = {
+    exportData: async (o?: { projectKey?: string }) => {
+      running++;
+      most = Math.max(most, running);
+      await new Promise((r) => setTimeout(r, 5));
+      running--;
+      return bundle(o?.projectKey ?? '');
+    },
+  };
+  const p = await previewCloudSync(slow, keys);
+  expect(p.projects.map((x) => x.key)).toEqual(keys);
+  expect(p.total.projects).toBe(6);
+  expect(most).toBeGreaterThan(1);
+  expect(most).toBeLessThanOrEqual(PREVIEW_CONCURRENCY);
 });
 
 test('after failures the next scheduled sync waits longer, up to a day', () => {

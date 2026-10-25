@@ -6,7 +6,10 @@ import type {
   Commit,
   HumanTurn,
   ParsedSession,
+  PendingExternalItem,
+  PendingSessionItem,
   Project,
+  ToolCall,
   WorkerStatus,
 } from '../types.ts';
 import type { ExternalThread, GraphStore, WorkSession } from '../store.ts';
@@ -17,10 +20,16 @@ import { MAX_POSTMORTEM_ATTEMPTS } from './knowledge.ts';
 import { SCHEMA } from './schema.ts';
 import { redactSecrets } from '../redact.ts';
 import { latestTime } from '../sessions.ts';
-import { sessionWork } from '../codegraph.ts';
+import { sessionWork, trailingToolCalls } from '../codegraph.ts';
 import { refreshSessionStats } from './sessions.ts';
 
 export type ClassifiableTurn = HumanTurn & { projectKey: string };
+
+/**
+ * What the agent did after a turn, as recorded so far: the tool calls of the later turns and those after the last one,
+ * oldest first; how many turns came later; and the session's last recorded time.
+ */
+export type CallsAfter = { calls: ToolCall[]; laterTurns: number; endedAt: string | null };
 
 export type CandidateDetail = {
   candidate: Candidate;
@@ -36,7 +45,8 @@ export type StatsRow = { projectKey: string; week: string; humanTurns: number; p
 
 /** projectKeys: only these projects (an empty list finds nothing); the limit counts what is left. */
 /** source: where the flagged comment came from (a candidate saved before sources were recorded is claude). */
-export type CandidateFilter = { status?: CandidateStatus; projectKey?: string; projectKeys?: string[]; source?: FeedbackSource; limit?: number };
+/** offset: skip that many (newest first), for paging. */
+export type CandidateFilter = { status?: CandidateStatus; projectKey?: string; projectKeys?: string[]; source?: FeedbackSource; limit?: number; offset?: number };
 
 const CANDIDATE_LABELS = ['pushback', 'correction'];
 export const MAX_CLASSIFY_ATTEMPTS = 3;
@@ -104,7 +114,7 @@ export class GraphRepo implements GraphStore {
        MERGE (s:Session {id: $s.sessionId})
          SET s.sourceFile = $s.sourceFile, s.source = $source, s.cwd = $s.cwd, s.gitBranch = $s.gitBranch,
              s.startedAt = $s.startedAt, s.endedAt = $s.endedAt,
-             s.finalReplyText = $finalReply.text, s.finalReplyTs = $finalReply.ts,
+             s.finalReplyText = $finalReply.text, s.finalReplyTs = $finalReply.ts, s.finalToolCalls = $finalToolCalls,
              s.workEdits = $work.edits, s.workCommits = $work.commits, s.firstWorkAt = $work.firstAt, s.lastWorkAt = $work.lastAt
        MERGE (s)-[:IN]->(p)
        WITH s
@@ -118,6 +128,7 @@ export class GraphRepo implements GraphStore {
         s: { ...s, turns: undefined, toolCalls: undefined, finalReply: undefined },
         source: s.source ?? 'claude',
         work: sessionWork(s.toolCalls ?? []),
+        finalToolCalls: JSON.stringify(trailingToolCalls(s)),
         // Redacted by the parser, and again here: it is stored like a turn's text.
         finalReply: s.finalReply ? { text: redactSecrets(s.finalReply.text), ts: s.finalReply.ts } : { text: null, ts: null },
         turns: s.turns.map((t) => ({ ...t, toolCalls: JSON.stringify(t.precedingToolCalls), precedingToolCalls: undefined })),
@@ -206,6 +217,19 @@ export class GraphRepo implements GraphStore {
       { limit: neo4j.int(limit), keys: projectKeys ?? null, exclude: excludeKeys ?? [], maxAttempts: MAX_CLASSIFY_ATTEMPTS },
     );
     return rows.map((r) => ({ ...toTurn(r.get('t').properties), projectKey: r.get('projectKey') }));
+  }
+
+  async callsAfter(turnUuid: string): Promise<CallsAfter | null> {
+    const [r] = await this.run(
+      `MATCH (s:Session)-[:HAS_TURN]->(t:Turn {uuid: $uuid})
+       OPTIONAL MATCH (s)-[:HAS_TURN]->(n:Turn) WHERE n.index > t.index
+       WITH s, n ORDER BY n.index
+       RETURN s.finalToolCalls AS final, s.endedAt AS endedAt, collect(n.toolCalls) AS later`,
+      { uuid: turnUuid },
+    );
+    if (!r) return null;
+    const later = (r.get('later') as (string | null)[]).map((j) => JSON.parse(j ?? '[]') as ToolCall[]);
+    return { calls: [...later.flat(), ...(JSON.parse(r.get('final') ?? '[]') as ToolCall[])], laterTurns: later.length, endedAt: isoOrNull(r.get('endedAt')) };
   }
 
   /** A classification that failed (timeout, unparseable answer). After MAX_CLASSIFY_ATTEMPTS the turn is skipped for good. */
@@ -310,8 +334,8 @@ export class GraphRepo implements GraphStore {
       `MATCH (k:Candidate)-[:FLAGS]->(t:Turn)
        WHERE ($status IS NULL OR k.status = $status) AND ($projectKey IS NULL OR k.projectKey = $projectKey)
          AND ($projectKeys IS NULL OR k.projectKey IN $projectKeys) AND ($source IS NULL OR coalesce(k.source, 'claude') = $source)
-       RETURN k, t ORDER BY t.ts DESC LIMIT $limit`,
-      { status: f.status ?? null, projectKey: f.projectKey ?? null, projectKeys: f.projectKeys ?? null, source: f.source ?? null, limit: neo4j.int(f.limit ?? 200) },
+       RETURN k, t ORDER BY t.ts DESC, k.id SKIP $offset LIMIT $limit`,
+      { status: f.status ?? null, projectKey: f.projectKey ?? null, projectKeys: f.projectKeys ?? null, source: f.source ?? null, limit: neo4j.int(f.limit ?? 200), offset: neo4j.int(Math.max(0, Math.floor(f.offset ?? 0))) },
     );
     return rows.map((r) => toCandidate(r.get('k').properties, r.get('t').properties));
   }
@@ -344,6 +368,63 @@ export class GraphRepo implements GraphStore {
       })),
       postmortem: postmortemState(r.get('f')?.properties, r.get('done')),
     };
+  }
+
+  async pendingExternalItems(q: { limit: number; afterId?: string | null }): Promise<PendingExternalItem[]> {
+    const rows = await this.run(
+      `MATCH (k:Candidate {status: 'pending'})-[:FLAGS]->(t:Turn)
+       WHERE t.external IS NOT NULL AND t.text IS NOT NULL AND ($afterId IS NULL OR k.id > $afterId)
+       RETURN k.id AS id, t.uuid AS turnUuid, k.projectKey AS projectKey, t.text AS text, t.external AS external
+       ORDER BY k.id LIMIT $limit`,
+      { limit: neo4j.int(q.limit), afterId: q.afterId ?? null },
+    );
+    return rows.map((r) => ({ id: r.get('id'), turnUuid: r.get('turnUuid'), projectKey: r.get('projectKey'), text: r.get('text'), external: JSON.parse(r.get('external')) as ExternalRef }));
+  }
+
+  async pendingSessionItems(q: { limit: number; afterId?: string | null }): Promise<PendingSessionItem[]> {
+    const rows = await this.run(
+      `MATCH (k:Candidate {status: 'pending'})-[:FLAGS]->(t:Turn)
+       WHERE t.external IS NULL AND t.text IS NOT NULL AND NOT coalesce(k.manual, false) AND k.agentReport IS NULL
+         AND ($afterId IS NULL OR k.id > $afterId)
+       RETURN k.id AS id, t.uuid AS turnUuid, k.projectKey AS projectKey, t.text AS text, t.toolCalls AS toolCalls
+       ORDER BY k.id LIMIT $limit`,
+      { limit: neo4j.int(q.limit), afterId: q.afterId ?? null },
+    );
+    return rows.map((r) => ({ id: r.get('id'), turnUuid: r.get('turnUuid'), projectKey: r.get('projectKey'), text: r.get('text'), precedingToolCalls: JSON.parse(r.get('toolCalls') ?? '[]') as ToolCall[] }));
+  }
+
+  async skipPendingItem(id: string, s: { rule: string; note: string; by: string }): Promise<boolean> {
+    const [r] = await this.run(
+      `MATCH (k:Candidate {id: $id, status: 'pending'})-[:FLAGS]->(t:Turn)
+       SET k.status = 'rejected', k.note = $note, k.decidedAt = $now, k.decidedBy = $by,
+           t.signals = CASE WHEN $signal IN coalesce(t.signals, []) THEN t.signals ELSE coalesce(t.signals, []) + $signal END
+       RETURN count(k) AS n`,
+      { id, note: s.note, by: s.by, signal: `skip:${s.rule}`, now: new Date().toISOString() },
+    );
+    return Number(r?.get('n') ?? 0) > 0;
+  }
+
+  async ruleSkippedItems(q: { rule: string; by: string; limit: number; afterId?: string | null }): Promise<PendingSessionItem[]> {
+    const rows = await this.run(
+      `MATCH (k:Candidate {status: 'rejected', decidedBy: $by})-[:FLAGS]->(t:Turn)
+       WHERE $signal IN coalesce(t.signals, []) AND t.external IS NULL AND t.text IS NOT NULL AND NOT coalesce(k.manual, false)
+         AND k.agentReport IS NULL AND ($afterId IS NULL OR k.id > $afterId)
+       RETURN k.id AS id, t.uuid AS turnUuid, k.projectKey AS projectKey, t.text AS text, t.toolCalls AS toolCalls
+       ORDER BY k.id LIMIT $limit`,
+      { by: q.by, signal: `skip:${q.rule}`, limit: neo4j.int(q.limit), afterId: q.afterId ?? null },
+    );
+    return rows.map((r) => ({ id: r.get('id'), turnUuid: r.get('turnUuid'), projectKey: r.get('projectKey'), text: r.get('text'), precedingToolCalls: JSON.parse(r.get('toolCalls') ?? '[]') as ToolCall[] }));
+  }
+
+  async reopenRuleSkippedItem(id: string, s: { rule: string; by: string }): Promise<boolean> {
+    const [r] = await this.run(
+      `MATCH (k:Candidate {id: $id, status: 'rejected', decidedBy: $by})-[:FLAGS]->(t:Turn)
+       SET k.status = 'pending', k.note = null, k.decidedAt = null, k.decidedBy = null,
+           t.signals = [x IN coalesce(t.signals, []) WHERE x <> $signal]
+       RETURN count(k) AS n`,
+      { id, by: s.by, signal: `skip:${s.rule}` },
+    );
+    return Number(r?.get('n') ?? 0) > 0;
   }
 
   async decide(id: string, status: 'confirmed' | 'rejected', note: string | null, by = 'you') {
@@ -495,6 +576,12 @@ export function postmortemState(f: Record<string, unknown> | undefined, done: bo
     retryAt: (f.retryAt as string) ?? null,
     gaveUp: !done && attempts >= MAX_POSTMORTEM_ATTEMPTS,
   };
+}
+
+/** A stored time as the same ISO form the Postgres store returns; null when missing or unreadable. */
+function isoOrNull(t: unknown): string | null {
+  const ms = typeof t === 'string' ? Date.parse(t) : NaN;
+  return Number.isNaN(ms) ? null : new Date(ms).toISOString();
 }
 
 function toTurn(p: Record<string, unknown>): HumanTurn {

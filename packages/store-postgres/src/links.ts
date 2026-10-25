@@ -48,12 +48,12 @@ export class PgLinksStore implements LinksStore {
     const [a, b] = linkPair(x, y);
     const now = new Date();
     const { rows: [row] } = await this.db.pool.query(
-      `INSERT INTO project_links (id, a, b, relation, note, status, source, score, evidence, created_at, updated_at)
-       VALUES ($1, $2, $3, coalesce($4, 'related'), coalesce($5, ''), coalesce($6, 'confirmed'), 'you', 0, '[]', $7, $7)
+      `INSERT INTO project_links (id, a, b, relation, note, status, source, score, evidence, created_at, updated_at, decided_by)
+       VALUES ($1, $2, $3, coalesce($4, 'related'), coalesce($5, ''), coalesce($6, 'confirmed'), 'you', 0, '[]', $7, $7, $8)
        ON CONFLICT (id) DO UPDATE SET relation = coalesce($4, project_links.relation), note = coalesce($5, project_links.note),
-         status = coalesce($6, project_links.status), updated_at = $7
+         status = coalesce($6, project_links.status), decided_by = coalesce($8, project_links.decided_by), updated_at = $7
        RETURNING *`,
-      [linkIdOf(a, b), a, b, patch.relation ?? null, patch.note === undefined ? null : cleanNote(patch.note), patch.status ?? null, now],
+      [linkIdOf(a, b), a, b, patch.relation ?? null, patch.note === undefined ? null : cleanNote(patch.note), patch.status ?? null, now, patch.decidedBy ?? null],
     );
     return linkOf(row);
   }
@@ -76,5 +76,6 @@ function linkOf(r: Record<string, any>): ProjectLink {
     evidence: r.evidence ?? [],
     createdAt: iso(r.created_at)!,
     updatedAt: iso(r.updated_at)!,
+    decidedBy: r.decided_by ?? null,
   };
 }

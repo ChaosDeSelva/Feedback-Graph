@@ -19,6 +19,7 @@ test('a schema rule the other service created at the same moment is not a startu
 
 test('map files are found by project and inMap together (the scanner adds many files that are not in the map)', () => {
   expect(SCHEMA).toContain('CREATE INDEX codefile_project_inmap IF NOT EXISTS FOR (n:CodeFile) ON (n.projectKey, n.inMap)');
+  expect(SCHEMA).toContain('CREATE INDEX codefile_project_inindex IF NOT EXISTS FOR (n:CodeFile) ON (n.projectKey, n.inIndex)');
 });
 
 test('any other schema error still stops startup', async () => {

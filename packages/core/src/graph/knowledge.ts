@@ -4,10 +4,12 @@ import type {
   Cause,
   Commit,
   ContextItem,
+  ExternalRef,
   FeedbackStatus,
   HumanTurn,
   Lesson,
   LessonCheck,
+  LessonFrom,
   LessonScope,
   LessonStatus,
   Outcome,
@@ -16,7 +18,8 @@ import type {
   Project,
 } from '../types.ts';
 import { redactDeep, redactSecrets } from '../redact.ts';
-import type { KnowledgeStore } from '../store.ts';
+import { LESSON_CHECKS_VERSION } from '../types.ts';
+import type { KnowledgeStore, LessonFilter, SimilarLesson } from '../store.ts';
 import type { GraphRepo } from './repo.ts';
 import { matchReport, REPORT_MERGE_MINUTES } from '../dedupe.ts';
 
@@ -32,10 +35,22 @@ export const OUTCOME_STATUS: Record<Outcome, FeedbackStatus> = {
   unknown: 'unknown',
 };
 
+/** Who wrote a lesson's feedback when it came from GitHub or Linear (ExternalRef, trimmed to what the lesson shows). */
+export type FeedbackAuthor = { source: ExternalRef['source']; author: string; url: string; reviewState: ExternalRef['reviewState'] | null };
+/** The FeedbackAuthor of a stored ExternalRef (JSON in Neo4j, jsonb in Postgres), or null. */
+export function feedbackAuthorOf(ext: unknown): FeedbackAuthor | null {
+  const e = (typeof ext === 'string' ? JSON.parse(ext) : ext) as Partial<ExternalRef> | null | undefined;
+  return e?.source ? { source: e.source, author: e.author ?? '', url: e.url ?? '', reviewState: e.reviewState ?? null } : null;
+}
+
 export type LessonDetail = {
   lesson: Lesson;
   miss: { id: string; missed: string; cause: Cause; causeExplanation: string } | null;
-  feedback: { id: string; text: string; status: FeedbackStatus; sessionId: string; ts: string } | null;
+  /**
+   * external: set when the feedback is a GitHub or Linear comment: whose words they are (a reviewer, not you) and,
+   * on GitHub, the verdict of the review it belongs to. Null for feedback you gave in a session.
+   */
+  feedback: { id: string; text: string; status: FeedbackStatus; sessionId: string; ts: string; external?: FeedbackAuthor | null } | null;
   contextItems: ContextItem[];
   fixCommits: Commit[];
   supersedes: string[];
@@ -56,7 +71,18 @@ export type RelatedMiss = {
   sessionId: string;
   ts: string;
   score: number;
+  /**
+   * Its lesson was rejected with the wrong-session check: the post-mortem was worked out from a session that did other
+   * work, so the miss is not evidence of anything and is left out of "Similar past misses". Both stores set it.
+   */
+  rejectedWrongSession?: boolean;
 };
+
+/**
+ * A stored miss with no subject (about the code, as far as it was known when it was saved), with what decides whether
+ * it is a process miss: the feedback's words, its lesson's rule, and the file a review comment is on.
+ */
+export type UnsortedMiss = { missId: string; projectKey: string; feedbackText: string; rule: string | null; commentPath: string | null; paths: string[] };
 
 export type LessonInput = {
   id: string;
@@ -156,7 +182,7 @@ export class KnowledgeRepo implements KnowledgeStore {
        MERGE (f)-[:CRITICIZES]->(task)
        MERGE (m:Miss {id: 'miss:' + f.id})
        SET m.missed = $pm.missed, m.cause = $pm.cause, m.causeExplanation = $pm.causeExplanation,
-           m.outcome = $pm.outcome, m.projectKey = p.key, m.createdAt = $now, m.embedding = $missEmbedding
+           m.outcome = $pm.outcome, m.projectKey = p.key, m.createdAt = $now, m.embedding = $missEmbedding, m.subject = $subject
        MERGE (m)-[:EXPLAINS]->(f)
        MERGE (c:Cause {key: $pm.cause})
        MERGE (m)-[:CAUSED_BY]->(c)
@@ -165,7 +191,7 @@ export class KnowledgeRepo implements KnowledgeStore {
        SET l.title = $pm.lesson.title, l.rule = $pm.lesson.rule, l.appliesWhen = $pm.lesson.appliesWhen,
            l.scope = $pm.lesson.scope, l.paths = $pm.lesson.paths, l.cause = $pm.cause, l.missId = m.id,
            l.projectKey = CASE WHEN $pm.lesson.scope = 'global' THEN null ELSE p.key END, l.originProjectKey = p.key,
-           l.embedding = $lessonEmbedding, l.checks = $checks
+           l.embedding = $lessonEmbedding, l.checks = $checks, l.checksVersion = CASE WHEN $checks IS NULL THEN null ELSE $checksVersion END
        MERGE (l)-[:DERIVED_FROM]->(m)
        WITH f, t, s, p, m, l
        CALL (l, p) {
@@ -185,9 +211,11 @@ export class KnowledgeRepo implements KnowledgeStore {
          FOREACH (_ IN CASE WHEN it.wasAvailable THEN [1] ELSE [] END | MERGE (ci)-[:WAS_AVAILABLE_IN]->(s))`,
       {
         fid: feedbackId,
-        pm: { ...pm, contextItems: undefined, lessonChecks: undefined },
+        pm: { ...pm, contextItems: undefined, lessonChecks: undefined, facts: undefined },
+        subject: pm.subject ?? null,
         // A node property cannot hold a list of maps: the checks are kept as JSON (lessonOf parses them).
         checks: pm.lessonChecks ? JSON.stringify(pm.lessonChecks) : null,
+        checksVersion: neo4j.int(LESSON_CHECKS_VERSION),
         status: OUTCOME_STATUS[pm.outcome],
         now,
         missEmbedding: embeddings.miss,
@@ -197,16 +225,53 @@ export class KnowledgeRepo implements KnowledgeStore {
     );
   }
 
-  async listLessons(f: { status?: LessonStatus; projectKey?: string; projectKeys?: string[]; limit?: number }): Promise<Lesson[]> {
+  async listLessons(f: LessonFilter): Promise<Lesson[]> {
     const rows = await this.g.run(
       `MATCH (l:Lesson)
        WHERE ($status IS NULL OR l.status = $status)
          AND ($projectKey IS NULL OR l.projectKey = $projectKey OR l.projectKey IS NULL)
          AND ${LEARNED_IN('l')}
-       RETURN l ORDER BY l.createdAt DESC LIMIT $limit`,
-      { status: f.status ?? null, projectKey: f.projectKey ?? null, projectKeys: f.projectKeys ?? null, limit: neo4j.int(f.limit ?? 500) },
+         // The checks are JSON text (lessonOf); a flag is its "name" key.
+         AND ($flag IS NULL OR l.checks CONTAINS $flag)
+       OPTIONAL MATCH (l)-[:DERIVED_FROM]->(:Miss)-[:EXPLAINS]->(:Feedback)-[:FROM_TURN]->(t:Turn)
+       WITH l, ${FROM} AS fromKind
+       WHERE $from IS NULL OR fromKind = $from
+       RETURN l, fromKind ORDER BY l.createdAt DESC LIMIT $limit`,
+      {
+        status: f.status ?? null, projectKey: f.projectKey ?? null, projectKeys: f.projectKeys ?? null, limit: neo4j.int(f.limit ?? 500),
+        flag: f.flag ? `"name":${JSON.stringify(f.flag)}` : null, from: f.from ?? null,
+      },
     );
-    return rows.map((r) => lessonOf(r.get('l').properties));
+    return rows.map((r) => lessonOf(r.get('l').properties, r.get('fromKind')));
+  }
+
+  async staleLessonChecks(version: number, limit: number): Promise<Lesson[]> {
+    const rows = await this.g.run(
+      `MATCH (l:Lesson) WHERE l.status IN ['proposed', 'approved'] AND coalesce(l.checksVersion, 0) < $version
+       OPTIONAL MATCH (l)-[:DERIVED_FROM]->(:Miss)-[:EXPLAINS]->(:Feedback)-[:FROM_TURN]->(t:Turn)
+       RETURN l, ${FROM} AS fromKind ORDER BY l.createdAt, l.id LIMIT $limit`,
+      { version: neo4j.int(version), limit: neo4j.int(limit) },
+    );
+    return rows.map((r) => lessonOf(r.get('l').properties, r.get('fromKind')));
+  }
+
+  async requestLessonRecheck(): Promise<number> {
+    const [r] = await this.g.run(`MATCH (l:Lesson) WHERE l.status IN ['proposed', 'approved'] SET l.checksVersion = 0 RETURN count(l) AS n`);
+    return Number(r?.get('n') ?? 0);
+  }
+
+  async similarLessons(id: string, k: number): Promise<SimilarLesson[]> {
+    // vector.similarity.cosine is (1 + cos) / 2: the true cosine is 2 * score - 1.
+    const rows = await this.g.run(
+      `MATCH (l:Lesson {id: $id}) WHERE l.embedding IS NOT NULL AND size(l.embedding) > 0
+       WITH l, coalesce(l.projectKey, l.originProjectKey) AS origin
+       MATCH (o:Lesson) WHERE o.id <> l.id AND o.embedding IS NOT NULL AND size(o.embedding) = size(l.embedding)
+         AND ((origin IS NULL AND coalesce(o.projectKey, o.originProjectKey) IS NULL) OR coalesce(o.projectKey, o.originProjectKey) = origin)
+       WITH o, 2 * vector.similarity.cosine(o.embedding, l.embedding) - 1 AS cosine
+       RETURN o.id AS id, cosine, o.status AS status, o.createdAt AS createdAt ORDER BY cosine DESC, id LIMIT $k`,
+      { id, k: neo4j.int(k) },
+    );
+    return rows.map((r) => ({ id: r.get('id'), cosine: r.get('cosine'), status: r.get('status'), createdAt: r.get('createdAt') }));
   }
 
   async lessonDetail(id: string): Promise<LessonDetail | null> {
@@ -220,7 +285,7 @@ export class KnowledgeRepo implements KnowledgeStore {
        WITH l, m, f, t, items, k ORDER BY k.ts
        WITH l, m, f, t, items, collect(k) AS commits
        OPTIONAL MATCH (l)-[:SUPERSEDES]->(old:Lesson)
-       RETURN l, m, f, t, items, commits, collect(old.id) AS supersedes`,
+       RETURN l, m, f, t, items, commits, collect(old.id) AS supersedes, ${FROM} AS fromKind`,
       { id },
     );
     if (!r) return null;
@@ -228,9 +293,9 @@ export class KnowledgeRepo implements KnowledgeStore {
     const f = r.get('f')?.properties;
     const t = r.get('t')?.properties;
     return {
-      lesson: lessonOf(r.get('l').properties),
+      lesson: lessonOf(r.get('l').properties, r.get('fromKind')),
       miss: m ? { id: m.id, missed: m.missed, cause: m.cause, causeExplanation: m.causeExplanation } : null,
-      feedback: f && t ? { id: f.id, text: t.text, status: f.status, sessionId: t.sessionId, ts: t.ts } : null,
+      feedback: f && t ? { id: f.id, text: t.text, status: f.status, sessionId: t.sessionId, ts: t.ts, external: feedbackAuthorOf(t.external) } : null,
       contextItems: (r.get('items') as { item: { properties: Record<string, string> } | null; why: string; available: boolean }[])
         .filter((i) => i.item)
         .map((i) => ({
@@ -286,8 +351,10 @@ export class KnowledgeRepo implements KnowledgeStore {
     return { unscoped: rows[0]?.get('unscoped') ?? false };
   }
 
-  async setLessonChecks(id: string, checks: LessonCheck[]): Promise<boolean> {
-    const [r] = await this.g.run('MATCH (l:Lesson {id: $id}) SET l.checks = $checks RETURN count(l) AS n', { id, checks: JSON.stringify(redactDeep(checks)) });
+  async setLessonChecks(id: string, checks: LessonCheck[], version = LESSON_CHECKS_VERSION): Promise<boolean> {
+    const [r] = await this.g.run('MATCH (l:Lesson {id: $id}) SET l.checks = $checks, l.checksVersion = $version RETURN count(l) AS n', {
+      id, checks: JSON.stringify(redactDeep(checks)), version: neo4j.int(version),
+    });
     return Number(r?.get('n') ?? 0) > 0;
   }
 
@@ -303,18 +370,55 @@ export class KnowledgeRepo implements KnowledgeStore {
     return rows.map((r) => ({ lesson: lessonOf(r.get('node').properties), score: r.get('score') }));
   }
 
+  async missesWithoutSubject(q: { limit: number; afterId?: string | null }): Promise<UnsortedMiss[]> {
+    return this.missesBySubject(null, q);
+  }
+
+  async processMisses(q: { limit: number; afterId?: string | null }): Promise<UnsortedMiss[]> {
+    return this.missesBySubject('process', q);
+  }
+
+  private async missesBySubject(subject: 'process' | null, q: { limit: number; afterId?: string | null }): Promise<UnsortedMiss[]> {
+    const rows = await this.g.run(
+      `MATCH (m:Miss)-[:EXPLAINS]->(f:Feedback)-[:FROM_TURN]->(t:Turn)
+       WHERE (CASE WHEN $subject IS NULL THEN m.subject IS NULL ELSE m.subject = $subject END) AND ($afterId IS NULL OR m.id > $afterId)
+       WITH m, f, t ORDER BY m.id LIMIT $limit
+       OPTIONAL MATCH (l:Lesson)-[:DERIVED_FROM]->(m)
+       WITH m, f, t, l ORDER BY l.id
+       WITH m, f, t, head(collect(l)) AS l
+       RETURN m.id AS id, m.projectKey AS projectKey, coalesce(t.text, f.text, '') AS text, t.external AS external, l.rule AS rule, l.paths AS paths
+       ORDER BY id`,
+      { subject, limit: neo4j.int(q.limit), afterId: q.afterId ?? null },
+    );
+    return rows.map((r) => {
+      const ext = r.get('external') ? (JSON.parse(r.get('external')) as { path?: string | null }) : null;
+      return { missId: r.get('id'), projectKey: r.get('projectKey'), feedbackText: r.get('text'), rule: r.get('rule') ?? null, commentPath: ext?.path ?? null, paths: (r.get('paths') as string[] | null) ?? [] };
+    });
+  }
+
+  async setMissSubject(missId: string, subject: 'process' | null): Promise<boolean> {
+    const [r] = await this.g.run(
+      `MATCH (m:Miss {id: $id}) WHERE CASE WHEN $subject IS NULL THEN m.subject = 'process' ELSE m.subject IS NULL END
+       SET m.subject = $subject RETURN count(m) AS n`,
+      { id: missId, subject },
+    );
+    return Number(r?.get('n') ?? 0) > 0;
+  }
+
   async relatedMisses(q: { embedding: number[]; projectKey: string | null; k: number }): Promise<RelatedMiss[]> {
     const rows = await this.g.run(
       `MATCH (node:Miss) WHERE ($projectKey IS NULL OR node.projectKey = $projectKey) AND node.embedding IS NOT NULL AND size(node.embedding) = size($embedding)
        WITH node, vector.similarity.cosine(node.embedding, $embedding) AS score ORDER BY score DESC LIMIT $k
        MATCH (node)-[:EXPLAINS]->(:Feedback)-[:FROM_TURN]->(t:Turn)
-       RETURN node, t, score ORDER BY score DESC`,
+       RETURN node, t, score,
+              EXISTS { MATCH (l:Lesson {status: 'rejected'})-[:DERIVED_FROM]->(node) WHERE l.checks CONTAINS '"name":"wrong-session"' } AS wrongSession
+       ORDER BY score DESC`,
       { embedding: q.embedding, k: neo4j.int(q.k), projectKey: q.projectKey },
     );
     return rows.map((r) => {
       const m = r.get('node').properties;
       const t = r.get('t').properties;
-      return { missId: m.id, missed: m.missed, cause: m.cause, feedbackText: t.text, sessionId: t.sessionId, ts: t.ts, score: r.get('score') };
+      return { missId: m.id, missed: m.missed, cause: m.cause, feedbackText: t.text, sessionId: t.sessionId, ts: t.ts, score: r.get('score'), rejectedWrongSession: r.get('wrongSession') === true };
     });
   }
 
@@ -404,7 +508,15 @@ function turnOf(p: Record<string, unknown>): HumanTurn {
 /** $projectKeys (null: any): the lesson was learned in one of them, or has no project at all. */
 const LEARNED_IN = (v: string) => `($projectKeys IS NULL OR coalesce(${v}.projectKey, ${v}.originProjectKey) IS NULL OR coalesce(${v}.projectKey, ${v}.originProjectKey) IN $projectKeys)`;
 
-function lessonOf(p: Record<string, unknown>): Lesson {
+/**
+ * Lesson.from, for a lesson `l` and its feedback's turn `t` (null for memory and manual lessons). The turn's external
+ * ref is JSON text: its source key says GitHub or Linear.
+ */
+const FROM = `CASE WHEN l.source IN ['memory', 'manual'] THEN l.source
+  WHEN t.external IS NOT NULL AND t.external CONTAINS '"source":"linear"' THEN 'linear'
+  WHEN t.external IS NOT NULL THEN 'github' ELSE 'session' END`;
+
+function lessonOf(p: Record<string, unknown>, from?: LessonFrom | null): Lesson {
   return {
     id: p.id as string,
     projectKey: (p.projectKey as string) ?? null,
@@ -423,5 +535,7 @@ function lessonOf(p: Record<string, unknown>): Lesson {
     decidedBy: (p.decidedBy as string) ?? null,
     decisionNote: (p.decisionNote as string) ?? null,
     checks: typeof p.checks === 'string' ? (JSON.parse(p.checks) as LessonCheck[]) : null,
+    checksVersion: p.checksVersion == null ? null : Number(p.checksVersion),
+    ...(from && { from }),
   };
 }

@@ -130,7 +130,8 @@ test('get_task_context adds the three most recent sessions in one line each', as
   const asked: unknown[] = [];
   const d = ctx({ sessions: { list: async (q) => { asked.push(q); return { sessions: [item('s1', 'demo', { pendingTurns: 2, state: 'active' })], next: null }; }, detail: async () => null } });
   const r = await getTaskContext({ cwd: '/Users/j/Vibe/demo', task: 'orders list' }, d);
-  expect(asked).toEqual([{ projectKeys: ['demo'], limit: 3, summarizedOnly: true }]);
+  // Three times as many as shown, so one-turn probe sessions can be passed over.
+  expect(asked).toEqual([{ projectKeys: ['demo'], limit: 9, summarizedOnly: true }]);
   expect(r.markdown).toContain('## Recent sessions in this project');
   expect(r.markdown).toContain('- 2026-10-22 · claude · active: goal of s1 (session s1 · 2 newer turns not summarized yet)');
   expect(r.markdown).toContain('get_recent_sessions');

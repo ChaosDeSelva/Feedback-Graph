@@ -57,6 +57,7 @@ export const TONE_FILL: Record<Tone, string> = { neutral: 'bg-muted', info: 'bg-
 export const CAUSE_LABEL: Record<string, string> = {
   context_missing: 'context missing',
   context_available_ignored: 'context available, ignored',
+  code_not_read: 'code not read',
   requirement_unstated: 'requirement unstated',
   verification_gap: 'verification gap',
   implementation_error: 'implementation error',
@@ -64,6 +65,7 @@ export const CAUSE_LABEL: Record<string, string> = {
 const CAUSE_TONE: Record<string, Tone> = {
   context_missing: 'info',
   context_available_ignored: 'bad',
+  code_not_read: 'ok',
   requirement_unstated: 'neutral',
   verification_gap: 'accent',
   implementation_error: 'violet',

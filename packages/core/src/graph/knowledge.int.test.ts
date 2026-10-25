@@ -3,6 +3,7 @@ import type { GraphStore, KnowledgeStore } from '../store.ts';
 import { describeStores, type StoreProbe } from '../testing/index.ts';
 import type { Classification, ParsedSession, PostMortem, Project } from '../types.ts';
 import { MAX_POSTMORTEM_ATTEMPTS } from './knowledge.ts';
+import { LESSON_CHECKS_VERSION } from '../types.ts';
 
 const project: Project = { key: 'demo', name: 'demo', repoPath: '/vibe/demo' };
 const pushback: Classification = { label: 'pushback', confidence: 0.9, summary: 's', signals: [] };
@@ -186,6 +187,59 @@ describeStores('KnowledgeStore', (h) => {
       expect(await k.setLessonChecks('lesson:nope', [])).toBe(false);
     });
 
+    test('the checks version is stored; stale lessons are listed until re-checked; a recheck request makes them stale again', async () => {
+      const a = await confirmedFeedback('s1');
+      const b = await confirmedFeedback('s2');
+      await k.savePostmortem(a, pm(), { miss: vec(1), lesson: vec(1) });
+      await k.savePostmortem(b, pm({ lessonChecks: [] }), { miss: vec(2), lesson: vec(2) });
+      const byId = async () => new Map((await k.listLessons({})).map((l) => [l.id, l]));
+      // Never checked: no version. Checked by the post-mortem: the current version.
+      expect((await byId()).get(`lesson:${a}`)?.checksVersion ?? null).toBeNull();
+      expect((await byId()).get(`lesson:${b}`)?.checksVersion).toBe(LESSON_CHECKS_VERSION);
+      expect((await k.staleLessonChecks!(LESSON_CHECKS_VERSION, 10)).map((l) => l.id)).toEqual([`lesson:${a}`]);
+      expect(await k.setLessonChecks(`lesson:${a}`, [{ name: 'duplicate-of', why: 'repeats', of: `lesson:${b}` }])).toBe(true);
+      expect((await byId()).get(`lesson:${a}`)).toMatchObject({ checksVersion: LESSON_CHECKS_VERSION, checks: [{ name: 'duplicate-of', why: 'repeats', of: `lesson:${b}` }] });
+      expect(await k.staleLessonChecks!(LESSON_CHECKS_VERSION, 10)).toEqual([]);
+      // An older version is stale under a newer one; rejected lessons never are.
+      expect(await k.setLessonChecks(`lesson:${b}`, [], 1)).toBe(true);
+      expect((await k.staleLessonChecks!(LESSON_CHECKS_VERSION, 10)).map((l) => l.id)).toEqual([`lesson:${b}`]);
+      await k.updateLesson(`lesson:${b}`, { status: 'rejected' }, {});
+      expect(await k.staleLessonChecks!(LESSON_CHECKS_VERSION, 10)).toEqual([]);
+      expect(await k.requestLessonRecheck!()).toBe(1);
+      expect((await k.staleLessonChecks!(LESSON_CHECKS_VERSION, 10)).map((l) => l.id)).toEqual([`lesson:${a}`]);
+    });
+
+    test('listLessons filters by a check flag and by where the feedback came from', async () => {
+      const a = await confirmedFeedback('s1');
+      await k.savePostmortem(a, pm({ lessonChecks: [{ name: 'platitude', why: 'vague' }, { name: 'needs-path', why: 'none' }] }), { miss: vec(1), lesson: vec(1) });
+      await k.upsertLesson({ id: 'memory:x', projectKey: 'demo', title: 'M', rule: 'Use the gateway', appliesWhen: '', scope: 'project', paths: [], status: 'proposed', source: 'memory', embedding: vec(3) });
+      const ids = async (f: Parameters<KnowledgeStore['listLessons']>[0]) => (await k.listLessons(f)).map((l) => l.id).sort();
+      expect(await ids({ flag: 'platitude' })).toEqual([`lesson:${a}`]);
+      expect(await ids({ flag: 'needs-path' })).toEqual([`lesson:${a}`]);
+      expect(await ids({ flag: 'meta-lesson' })).toEqual([]);
+      expect(await ids({ from: 'session' })).toEqual([`lesson:${a}`]);
+      expect(await ids({ from: 'memory' })).toEqual(['memory:x']);
+      expect(await ids({ from: 'github' })).toEqual([]);
+      expect((await k.listLessons({})).find((l) => l.id === `lesson:${a}`)?.from).toBe('session');
+    });
+
+    test('similarLessons returns the nearest lessons of the same project by stored embedding, as a true cosine', async () => {
+      const a = await confirmedFeedback('s1');
+      const b = await confirmedFeedback('s2');
+      const c = await confirmedFeedback('s3');
+      await k.savePostmortem(a, pm(), { miss: vec(1), lesson: vec(1) });
+      await k.savePostmortem(b, pm(), { miss: vec(1), lesson: vec(1, 0.001) });
+      await k.savePostmortem(c, pm(), { miss: vec(5), lesson: vec(5) });
+      await k.upsertLesson({ id: 'memory:other', projectKey: 'elsewhere', title: 'M', rule: 'r', appliesWhen: '', scope: 'project', paths: [], status: 'proposed', source: 'memory', embedding: vec(1) });
+      const near = await k.similarLessons!(`lesson:${a}`, 5);
+      expect(near[0]).toMatchObject({ id: `lesson:${b}`, status: 'proposed' });
+      expect(near[0].cosine).toBeGreaterThan(0.92);
+      expect(near.find((n) => n.id === `lesson:${c}`)!.cosine).toBeLessThan(0.1);
+      expect(near.map((n) => n.id)).not.toContain('memory:other');
+      expect(near.map((n) => n.id)).not.toContain(`lesson:${a}`);
+      expect(await k.similarLessons!('lesson:nope', 5)).toEqual([]);
+    });
+
     test('a global lesson has no project', async () => {
       const id = await confirmedFeedback('s1');
       await k.savePostmortem(id, pm({ lesson: { ...pm().lesson, scope: 'global' } }), { miss: vec(1), lesson: vec(1) });
@@ -261,6 +315,47 @@ describeStores('KnowledgeStore', (h) => {
       expect(m.missed).toBe('filtering was client-side');
       expect(m.feedbackText).toBe('turn 2');
       expect(m.sessionId).toBe('s1');
+    });
+
+    test('relatedMisses marks a miss whose lesson you rejected as worked out from the wrong session', async () => {
+      const a = await confirmedFeedback('s1');
+      await k.savePostmortem(a, pm({ lessonChecks: [{ name: 'wrong-session', why: 'the matched session did other work' }] }), { miss: vec(3), lesson: vec(3) });
+      const b = await confirmedFeedback('s2');
+      await k.savePostmortem(b, pm({ lessonChecks: [{ name: 'wrong-session', why: 'x' }] }), { miss: vec(3), lesson: vec(3) });
+      await k.updateLesson(`lesson:${a}`, { status: 'rejected' }, {});
+      const misses = await k.relatedMisses({ embedding: vec(3), projectKey: 'demo', k: 5 });
+      // Rejected with the check: marked. Flagged but still proposed: not (the owner has not said so).
+      expect(Object.fromEntries(misses.map((m) => [m.missId, m.rejectedWrongSession]))).toEqual({ [`miss:${a}`]: true, [`miss:${b}`]: false });
+    });
+
+    test('missesWithoutSubject pages the misses with no subject, with their feedback, lesson rule and comment file', async () => {
+      const a = await confirmedFeedback('s1');
+      await k.savePostmortem(a, pm({ lesson: { ...pm().lesson, rule: 'Keep work on its own branch' } }), { miss: vec(1), lesson: vec(1) });
+      const b = await confirmedFeedback('s2');
+      await k.savePostmortem(b, pm({ subject: 'process' }), { miss: vec(1), lesson: vec(1) });
+      const c = await confirmedFeedback('s3');
+      await k.savePostmortem(c, pm(), { miss: vec(1), lesson: vec(1) });
+      const first = await k.missesWithoutSubject({ limit: 1 });
+      expect(first).toEqual([{ missId: `miss:${a}`, projectKey: 'demo', feedbackText: 'turn 2', rule: 'Keep work on its own branch', commentPath: null, paths: ['api/**'] }]);
+      // b already has a subject; the next page starts after a.
+      expect((await k.missesWithoutSubject({ limit: 10, afterId: first[0].missId })).map((m) => m.missId)).toEqual([`miss:${c}`]);
+      // processMisses pages the others the same way.
+      expect(await k.processMisses({ limit: 10 })).toEqual([expect.objectContaining({ missId: `miss:${b}`, projectKey: 'demo', rule: 'Filter on the server', paths: ['api/**'] })]);
+      expect(await k.processMisses({ limit: 10, afterId: `miss:${b}` })).toEqual([]);
+    });
+
+    test('a miss can be code_not_read, and the lesson carries that cause', async () => {
+      const id = await confirmedFeedback('s1');
+      await k.savePostmortem(id, pm({ cause: 'code_not_read' }), { miss: vec(1), lesson: vec(1) });
+      expect((await k.listLessons({ status: 'proposed' }))[0].cause).toBe('code_not_read');
+    });
+
+    test('a flagged turn nobody confirmed gets no post-mortem, no miss and no lesson', async () => {
+      await repo.upsertSession(project, session('s1'), []);
+      await repo.saveClassification('s1-t2', pushback, true);
+      expect(await k.feedbackNeedingPostmortem(5)).toEqual([]);
+      expect(await k.listLessons({})).toEqual([]);
+      expect(await probe.count('Miss')).toBe(0);
     });
 
     test('createManualFeedback queues a pending candidate; only your confirmation starts a post-mortem', async () => {

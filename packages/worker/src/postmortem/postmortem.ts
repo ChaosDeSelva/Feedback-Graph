@@ -1,11 +1,15 @@
 import { readdir, readFile } from 'node:fs/promises';
-import { checkLesson, type LessonFlag } from './lessonCheck.ts';
+import { checkLesson, saysWrongSession, type LessonFlag } from './lessonCheck.ts';
 import { validateLessonPaths } from './paths.ts';
+import { capToCommentDir, codeNotRead, shapeLesson, type Shaped } from './shape.ts';
+import { isProcessMiss } from '../detect/instruction.ts';
 import { dirname, join, resolve } from 'node:path';
 import { z } from 'zod';
-import { askJson, CAUSES, redactSecrets, type ContextItem, type ExternalRef, type FeedbackSource, type HumanTurn, type LlmProvider, type PostMortem, type PostMortemInput } from '@fb/core';
+import { askJson, CAUSES, contextWhy, redactSecrets, type ContextItem, type ExternalRef, type FeedbackSource, type HumanTurn, type LlmProvider, type PostMortem, type PostMortemInput } from '@fb/core';
 
 const MAX_STANDING_CHARS = 6000;
+/** Facts a post-mortem may propose beside its lesson. */
+const MAX_PROPOSED_FACTS = 5;
 const MAX_TURN_CHARS = 1500;
 
 /** `loaded`: whether the session's agent loads this file (Claude Code: CLAUDE.md and memory; Codex: AGENTS.md). */
@@ -38,6 +42,8 @@ const PostMortemSchema = z.object({
   // What the model says about its own lesson; lenient, so a small model that leaves them out or misfills them still passes.
   about: z.enum(['work', 'process']).optional().catch(undefined),
   factLike: z.boolean().optional().catch(undefined),
+  // Facts it noticed beside the lesson: proposals only, so a missing or malformed list is no list.
+  facts: z.array(z.object({ path: z.string().max(500), statement: z.string().max(1000) })).max(MAX_PROPOSED_FACTS).optional().catch(undefined),
 });
 
 const JSON_SCHEMA = {
@@ -46,6 +52,12 @@ const JSON_SCHEMA = {
   properties: {
     about: { type: 'string', enum: ['work', 'process'], description: 'work: the lesson is about the code or behaviour; process: about how to handle feedback or reviews' },
     factLike: { type: 'boolean', description: 'true when the lesson states how the code is (a fact) rather than what to do' },
+    facts: {
+      type: 'array',
+      maxItems: MAX_PROPOSED_FACTS,
+      description: 'Facts about how the code is (a default, a lag, a limit) that you found, beside the lesson; may be empty',
+      items: { type: 'object', required: ['path', 'statement'], properties: { path: { type: 'string' }, statement: { type: 'string' } } },
+    },
     taskTitle: { type: 'string', description: 'Short name of the task or feature the agent was working on' },
     missed: { type: 'string', description: 'What the agent missed or got wrong, concretely' },
     cause: { type: 'string', enum: [...CAUSES] },
@@ -55,9 +67,9 @@ const JSON_SCHEMA = {
       type: 'object',
       required: ['title', 'rule', 'appliesWhen', 'scope', 'paths'],
       properties: {
-        title: { type: 'string' },
-        rule: { type: 'string', description: 'Imperative guidance a future agent can follow, naming the code it is about; never the scope word' },
-        appliesWhen: { type: 'string', description: 'The kind of task this lesson is relevant to' },
+        title: { type: 'string', description: 'A short name for the lesson (at most 8 words), never the rule repeated' },
+        rule: { type: 'string', description: 'Imperative guidance a future agent can follow, naming the code it is about; never the scope word, never a pull request or issue number' },
+        appliesWhen: { type: 'string', description: 'When it applies: the kind of task or the files, never the rule again' },
         scope: { type: 'string', enum: ['task', 'project', 'global'] },
         paths: { type: 'array', items: { type: 'string' }, description: 'Repo-relative globs this applies to; may be empty' },
       },
@@ -237,6 +249,7 @@ Use Read/Grep/Glob to look for the code, docs, conventions or earlier decisions 
 Classify the cause as exactly one of:
 - context_missing: the information was not available to the agent anywhere it would look.
 - context_available_ignored: the information was in an instruction file the agent loads (CLAUDE.md or memory for Claude Code, AGENTS.md for Codex), or files the agent read, and it was not followed.
+- code_not_read: the code that showed what "right" looked like was in this repository, but the agent never read it.
 - requirement_unstated: the developer never said it; it was an implicit expectation.
 - verification_gap: the agent did not test or check its work, so a visible defect shipped.
 - implementation_error: the agent understood the task but implemented it wrongly.
@@ -255,11 +268,16 @@ The lesson is about the quoted comment only (not the later comments or other rev
 "missed" must be checkable against the comment's own text.
 The rule must name at least one identifier from the feedback, its diff lines or the description (a function, file,
 constant, env var, table, endpoint). Never write "Always verify/check/ensure/test ..." with nothing concrete in it.
-Put the imperative sentence itself in lesson.rule, never the scope word.
+Put the imperative sentence itself in lesson.rule, never the scope word. Never put a pull request or issue number in
+the rule: name the code instead. lesson.title is a short name for the rule (at most 8 words), not the rule again.
+lesson.appliesWhen says when it applies (the kind of task, or the files), not the rule again.
+If you learned how the code is (a default, a lag, a limit) rather than what to do, put it in facts (path and
+statement), beside the lesson.
 Set about to "process" if your lesson is about handling feedback rather than the work, else "work". Set factLike to true
 when what you learned is a fact about the code (how it is, such as a default value or a lag) rather than something to do.
 Set lesson.paths to the narrowest repo-relative paths or globs the evidence supports, preferring the files edited to
-fix the miss (listed below); leave it empty when the lesson is about the whole project.
+fix the miss (listed below); leave it empty when the lesson is about the whole project, or about the git process itself
+(branches, pushing, merging, pull requests, commit hygiene) rather than the code.
 Return at most 8 contextItems, each with a verbatim excerpt.
 
 === STANDING CONTEXT (instruction files and memory) ===
@@ -313,7 +331,7 @@ export function markAvailability(items: RawItem[], input: PostMortemInput): Cont
     const kind = /(^|\/)CLAUDE\.md$/.test(ref) ? 'claude_md' : /(^|\/)AGENTS\.md$/.test(ref) ? 'agents_md' : /\/memory\/[^/]+\.md$/.test(ref) ? 'memory' : it.kind;
     const loaded = codex ? kind === 'agents_md' : kind === 'claude_md' || kind === 'memory';
     const wasAvailable = loaded || touched.some((p) => p === ref || p.endsWith(`/${ref}`));
-    return { ...it, kind, wasAvailable };
+    return { ...it, kind, why: contextWhy(it.why), wasAvailable };
   });
 }
 
@@ -331,18 +349,7 @@ export type PostMortemDeps = {
 };
 
 /** What the post-mortem model was shown, kept for the provenance log. */
-export type PostMortemTrace = { provider: string; agentic: boolean; standing: string[]; facts: string[]; lessonFlags: LessonFlag[] };
-
-/**
- * The model saying the session it was shown did other work than the comment is about: the "WRONG SESSION:" marker the
- * prompt asks for, or the same thing in its own words ("the feedback pertains to a different PR").
- */
-const WRONG_SESSION = [
-  /^\s*WRONG SESSION:/i,
-  /\b(pertains?|relates?|belongs?|refers?|applies) to (a |an )?(different|another|other|unrelated|separate)\b/i,
-  /\b(different|another|unrelated|separate) (pull request|PR|feature|task|branch|session)\b/i,
-];
-const saysWrongSession = (pm: { missed: string; causeExplanation: string }) => WRONG_SESSION.some((re) => re.test(pm.causeExplanation) || re.test(pm.missed));
+export type PostMortemTrace = { provider: string; agentic: boolean; standing: string[]; facts: string[]; lessonFlags: LessonFlag[]; lessonShaped?: Shaped['repaired'] };
 
 export async function runPostMortem(input: PostMortemInput, deps: PostMortemDeps): Promise<PostMortem & { trace: PostMortemTrace }> {
   const first = await postMortemOnce(input, deps);
@@ -369,32 +376,45 @@ async function postMortemOnce(input: PostMortemInput, deps: PostMortemDeps): Pro
   ]);
   const prompt = redactSecrets(buildPrompt(input, standing, { agentic: deps.llm.agentic, facts, touched, sessionSummary }));
   // An answer of the wrong shape is asked once more, more strictly, before it counts against the feedback.
-  const { about, factLike, ...raw } = await askJson(
+  const { about, factLike, facts: proposed, ...raw } = await askJson(
     deps.llm,
     { system: 'You are a meticulous engineering post-mortem analyst.', user: prompt, schema: JSON_SCHEMA, cwd: input.repoPath },
     (a) => PostMortemSchema.parse(a),
   );
+  const exists = deps.exists && ((p: string) => deps.exists!(input, p));
   // Paths are checked against the evidence and the repository, never inherited (paths.ts); a global lesson is about no
   // repository's files, so only the shape of its paths is checked.
   const global = raw.lesson.scope === 'global';
   const checkedPaths = await validateLessonPaths(raw.lesson.paths, {
-    commentPath: ext?.path ?? null,
-    named: ext ? [input.feedback.text, ext.diffHunk ?? '', ext.description ?? ''].join('\n') : '',
-    touched: global ? none : touched,
-    exists: deps.exists && ((p) => deps.exists!(input, p)),
-    transcript: !ext,
-    global,
-  });
+      commentPath: ext?.path ?? null,
+      named: ext ? [input.feedback.text, ext.diffHunk ?? '', ext.description ?? ''].join('\n') : '',
+      touched: global ? none : touched,
+      exists,
+      transcript: !ext,
+      global,
+    });
+  // Feedback about how the work was handled (a branch, a merge, a pull request), with a lesson about that too and no
+  // file the evidence supports: a process miss, tied to no file the session edited and scoped to none.
+  const processMiss = isProcessMiss({ feedbackText: input.feedback.text, rule: raw.lesson.rule, commentPath: ext?.path ?? null, paths: checkedPaths.paths });
   const pathFlags: LessonFlag[] = checkedPaths.dropped.length ? [{ name: 'bad-path', why: checkedPaths.dropped.map((d) => `${d.path}: ${d.why}`).join('; ') }] : [];
-  if (!checkedPaths.paths.length && !global) pathFlags.push({ name: 'needs-path', why: 'no file the evidence supports: as it is, it would apply anywhere in the project' });
+  if (!checkedPaths.paths.length && !global && !processMiss) pathFlags.push({ name: 'needs-path', why: 'no file the evidence supports: as it is, it would apply anywhere in the project' });
   // Scoped and falsifiable? Narrows what is clearly over-reaching and flags the rest for the owner (lessonCheck.ts).
   const checked = checkLesson({ ...raw.lesson, paths: checkedPaths.paths }, input.feedback, { about, factLike });
   const flags = [...pathFlags, ...checked.flags];
+  // A title that is not the rule, a rule with no PR numbers, an appliesWhen that says when (shape.ts).
+  const shaped = shapeLesson(checked.lesson, { taskTitle: raw.taskTitle });
+  // A review comment is explained by code near the file it is on.
+  const contextItems = capToCommentDir(markAvailability(raw.contextItems, input), ext?.path ?? null);
+  // With no session to have read anything, "never read in the session" cannot be said.
+  const cause = sessionless ? raw.cause : await codeNotRead(raw.cause, contextItems, exists);
   return {
     ...raw,
-    lesson: checked.lesson,
-    contextItems: markAvailability(raw.contextItems, input),
+    cause,
+    lesson: shaped.lesson,
+    contextItems,
     lessonChecks: flags,
-    trace: { provider: deps.llm.id, agentic: deps.llm.agentic, standing: standing.map((d) => d.ref), facts, lessonFlags: flags },
+    facts: proposed ?? [],
+    ...(processMiss && { subject: 'process' as const }),
+    trace: { provider: deps.llm.id, agentic: deps.llm.agentic, standing: standing.map((d) => d.ref), facts, lessonFlags: flags, lessonShaped: shaped.repaired },
   };
 }

@@ -57,6 +57,26 @@ describeStores('LinksStore', (h) => {
     expect(await l.listLinks({ projectKeys: [] })).toEqual([]);
   });
 
+  test('setLink records who decided it; a detected suggestion has nobody until a decision', async () => {
+    await l.replaceDetected(['m', 'n'], [{ a: 'm', b: 'n', relation: 'related', score: 0.6, evidence: [ev('e')] }]);
+    expect((await l.listLinks({ projectKey: 'm' }))[0].decidedBy).toBeNull();
+    expect(await l.setLink('m', 'n', { status: 'confirmed', decidedBy: 'operator:codex' })).toMatchObject({ status: 'confirmed', decidedBy: 'operator:codex' });
+    // An edit without a name keeps the last one; the next decision replaces it.
+    expect((await l.setLink('m', 'n', { note: 'shared types' })).decidedBy).toBe('operator:codex');
+    expect((await l.setLink('m', 'n', { status: 'dismissed', decidedBy: 'you' })).decidedBy).toBe('you');
+    expect((await l.setLink('m', 'o', { status: 'confirmed', decidedBy: 'you' })).decidedBy).toBe('you');
+  });
+
+  test('setLink records who decided it; a detected suggestion has nobody until a decision', async () => {
+    await l.replaceDetected(['m', 'n'], [{ a: 'm', b: 'n', relation: 'related', score: 0.6, evidence: [ev('e')] }]);
+    expect((await l.listLinks({ projectKey: 'm' }))[0].decidedBy).toBeNull();
+    expect(await l.setLink('m', 'n', { status: 'confirmed', decidedBy: 'operator:codex' })).toMatchObject({ status: 'confirmed', decidedBy: 'operator:codex' });
+    // An edit that names nobody keeps the last name; the next decision replaces it.
+    expect((await l.setLink('m', 'n', { note: 'shared types' })).decidedBy).toBe('operator:codex');
+    expect((await l.setLink('m', 'n', { status: 'dismissed', decidedBy: 'you' })).decidedBy).toBe('you');
+    expect((await l.setLink('m', 'o', { status: 'confirmed', decidedBy: 'you' })).decidedBy).toBe('you');
+  });
+
   test('a link to itself is refused; notes are redacted; deleteLink removes it', async () => {
     await expect(l.setLink('a', 'a', { status: 'confirmed' })).rejects.toThrow();
     const key = `ghp_${'E'.repeat(36)}`;

@@ -1,4 +1,4 @@
-import type { ActivityInput, Lesson } from '@fb/core';
+import { shownProjects, type ActivityInput, type Lesson } from '@fb/core';
 import { expect, test } from 'vitest';
 import { createApp, type ApiRepo, type AppOpts } from './app.ts';
 
@@ -33,6 +33,18 @@ test('GET /api/lessons/:id is 404 for unknown ids', async () => {
   const { app } = setup();
   expect((await app.request('/api/lessons/lesson%3Aa')).status).toBe(200);
   expect((await app.request('/api/lessons/nope')).status).toBe(404);
+});
+
+test('GET /api/lessons/:id never shows a context item why that is only a field name (stored before the check)', async () => {
+  const item = (why: string) => ({ kind: 'code' as const, ref: 'api/search.ts', excerpt: 'x', why, wasAvailable: true });
+  const knowledge = {
+    listLessons: async () => [lesson],
+    lessonDetail: async () => ({ lesson, miss: null, feedback: null, contextItems: [item('wasAvailable'), item('It scoped by org')], fixCommits: [], supersedes: [] }),
+    updateLesson: async () => ({ unscoped: false }),
+  };
+  const app = createApp(repo, { knowledge, embed: async (t) => t.map(() => [0.5]) });
+  const d = await (await app.request('/api/lessons/lesson%3Aa')).json();
+  expect(d.contextItems.map((c: { why: string }) => c.why)).toEqual(['the model gave no reason', 'It scoped by org']);
 });
 
 test('PATCH approving without text changes does not re-embed', async () => {
@@ -131,4 +143,86 @@ test('to-fact is an owner decision: a bare local client is refused, and the oper
   expect(on.calls[0][3]).toBe('operator:codex');
   expect(on.calls[1][3]).toEqual({ by: 'operator:codex', note: 'converted to a fact' });
   expect(on.logged[0]).toMatchObject({ actor: 'operator:codex' });
+});
+
+test('GET /api/lessons filters by a check flag and by where the feedback came from; unknown values are a 400', async () => {
+  const { app, calls } = setup();
+  expect((await app.request('/api/lessons?status=proposed&flag=looks-like-a-fact&source=github')).status).toBe(200);
+  expect(calls[0]).toEqual(['list', { status: 'proposed', flag: 'looks-like-a-fact', from: 'github' }]);
+  expect((await app.request('/api/lessons?flag=nonsense')).status).toBe(400);
+  expect((await app.request('/api/lessons?source=slack')).status).toBe(400);
+});
+
+function bulkSetup(o: { auth?: AppOpts['auth'] } = {}) {
+  const calls: unknown[][] = [];
+  const logged: ActivityInput[] = [];
+  const lessons: Lesson[] = [lesson, { ...lesson, id: 'lesson:b', title: 'B' }, { ...lesson, id: 'lesson:hidden', projectKey: 'other' }];
+  const knowledge = {
+    listLessons: async () => lessons,
+    lessonDetail: async (id: string) => {
+      const l = lessons.find((x) => x.id === id);
+      return l ? { lesson: l, miss: null, feedback: null, contextItems: [], fixCommits: [], supersedes: [] } : null;
+    },
+    updateLesson: async (...a: unknown[]) => { calls.push(['update', ...a]); return { unscoped: false }; },
+    requestLessonRecheck: async () => { calls.push(['recheck']); return 7; },
+  };
+  const app = createApp(repo, {
+    knowledge, ...(o.auth && { auth: o.auth }),
+    activity: { record: async (e) => { logged.push(e); }, list: async () => [] },
+    shown: async () => shownProjects({ tracked: ['demo'], initialized: true }, { excludeProjects: [] }),
+  });
+  return { app, calls, logged };
+}
+
+test('POST /api/lessons/decisions decides each lesson with its note, records each as yours, and reports the ones not found', async () => {
+  const { app, calls, logged } = bulkSetup();
+  const res = await app.request('/api/lessons/decisions', post({
+    items: [{ id: 'lesson:a', status: 'rejected', note: 'a platitude' }, { id: 'lesson:b', status: 'approved' }, { id: 'lesson:nope', status: 'rejected' }],
+  }));
+  expect(res.status).toBe(200);
+  expect((await res.json()).results).toEqual([
+    { id: 'lesson:a', ok: true, status: 'rejected' },
+    { id: 'lesson:b', ok: true, status: 'approved' },
+    { id: 'lesson:nope', ok: false, error: 'not found' },
+  ]);
+  expect(calls).toEqual([
+    ['update', 'lesson:a', { status: 'rejected' }, { by: 'you', note: 'a platitude' }],
+    ['update', 'lesson:b', { status: 'approved' }, { by: 'you' }],
+  ]);
+  expect(logged.map((e) => [e.kind, e.actor, e.targets])).toEqual([['lesson_decided', 'you', ['lesson:a']], ['lesson_decided', 'you', ['lesson:b']]]);
+  expect(logged[0].details).toMatchObject({ status: 'rejected', note: 'a platitude', bulk: true });
+});
+
+test('bulk decisions: a bad status, an empty list or more than 500 is a 400; a lesson of a hidden project is not found', async () => {
+  const { app, calls } = bulkSetup();
+  expect((await app.request('/api/lessons/decisions', post({ items: [{ id: 'lesson:a', status: 'superseded' }] }))).status).toBe(400);
+  expect((await app.request('/api/lessons/decisions', post({ items: [] }))).status).toBe(400);
+  expect((await app.request('/api/lessons/decisions', post({ items: Array.from({ length: 501 }, (_, i) => ({ id: `l${i}`, status: 'rejected' })) }))).status).toBe(400);
+  const res = await app.request('/api/lessons/decisions', post({ items: [{ id: 'lesson:hidden', status: 'approved' }] }));
+  expect((await res.json()).results).toEqual([{ id: 'lesson:hidden', ok: false, error: 'not found' }]);
+  expect(calls).toEqual([]);
+});
+
+test("bulk decisions are the owner's: a bare client is refused, the operator token needs lesson_decide (off by default)", async () => {
+  expect((await bulkSetup().app.request('/api/lessons/decisions', post({ items: [{ id: 'lesson:a', status: 'approved' }] }, {}))).status).toBe(403);
+  const op = 'o'.repeat(32);
+  const off = bulkSetup({ auth: { operator: { token: op, allow: ['inbox_decide', 'retry'] } } });
+  const refused = await off.app.request('/api/lessons/decisions', post({ items: [{ id: 'lesson:a', status: 'approved' }] }, { authorization: `Bearer ${op}` }));
+  expect(refused.status).toBe(403);
+  expect(off.calls).toEqual([]);
+  const on = bulkSetup({ auth: { operator: { token: op, allow: ['lesson_decide'] } } });
+  await on.app.request('/api/lessons/decisions', post({ items: [{ id: 'lesson:a', status: 'approved' }] }, { authorization: `Bearer ${op}`, 'x-fg-operator': 'codex' }));
+  expect(on.calls).toEqual([['update', 'lesson:a', { status: 'approved' }, { by: 'operator:codex' }]]);
+  expect(on.logged[0]).toMatchObject({ actor: 'operator:codex' });
+});
+
+test('POST /api/lessons/recheck marks every proposed and approved lesson for the worker to re-check', async () => {
+  const { app, calls, logged } = bulkSetup();
+  const res = await app.request('/api/lessons/recheck', post({}));
+  expect(res.status).toBe(202);
+  expect(await res.json()).toEqual({ queued: 7 });
+  expect(calls).toEqual([['recheck']]);
+  expect(logged).toEqual([expect.objectContaining({ kind: 'lessons_checked', actor: 'you', subject: '7 lessons queued for a re-check' })]);
+  // Owner-only, under the operator's `retry` verb.
+  expect((await app.request('/api/lessons/recheck', post({}, {}))).status).toBe(403);
 });

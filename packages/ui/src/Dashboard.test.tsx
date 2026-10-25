@@ -1,7 +1,7 @@
 import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, beforeEach, expect, test, vi } from 'vitest';
 import { Dashboard } from './Dashboard.tsx';
-import { newChatHref } from './links.ts';
+import { chatHref, newChatHref } from './links.ts';
 
 const ok = (provider: string) => ({ provider, ok: true, reason: null });
 const status = {
@@ -11,7 +11,7 @@ const status = {
 };
 const pipeline = {
   stage: status.stage, progress: status.progress, sessions: 12, classify: { backlog: 40, capped: true }, inbox: { pending: 5, confirmed: 9 },
-  postmortems: { queued: 2 }, lessons: { proposed: 3, approved: 7 }, scans: { done: 4, queued: 1, running: 2, failed: 1, never: 0 },
+  postmortems: { queued: 2 }, lessons: { proposed: 3, approved: 7, global: 4 }, scans: { done: 4, queued: 1, running: 2, failed: 1, never: 0 },
 };
 const report = {
   causes: [], repeatGroups: [], preDone: { checks: 8, withGaps: 2, gapsFound: 3 },
@@ -31,7 +31,10 @@ const activity = [
 ];
 const routes: Record<string, unknown> = {
   '/api/status': status, '/api/pipeline': pipeline, '/api/patterns': report, '/api/projects': projects,
-  '/api/codemap/hotspots?limit=8': hotspots, '/api/activity?limit=10': activity,
+  '/api/codemap/hotspots?limit=8': hotspots, '/api/codemap/hotspots?limit=8&misses=1': hotspots.filter((h) => h.misses > 0), '/api/activity?limit=10': activity,
+  '/api/chats': [
+    { id: 'c1', projectKey: 'acme', title: 'Where do modals live?', provider: 'claude', createdAt: '2026-10-24T10:00:00Z', updatedAt: new Date(Date.now() - 3_600_000).toISOString(), pending: false },
+  ],
 };
 
 let urls: string[];
@@ -101,12 +104,33 @@ test('projects: pinned first, with sessions, lessons, facts, last scan and confi
   expect(within(rows[1]).getByText('never')).toBeTruthy();
 });
 
-test('hotspots: the top 8, each linking to its module panel on the Projects page', async () => {
+test('where agents struggle: only files with misses, each linking to its module panel on the Projects page', async () => {
   render(<Dashboard />);
-  const card = await region(/hotspots/i);
+  const card = await region(/where agents struggle/i);
   expect((await within(card).findByRole('link', { name: 'src/db/pool.ts' })).getAttribute('href')).toBe('#projects/demo-shop/src%2Fdb%2Fpool.ts');
-  expect(within(card).getByRole('link', { name: 'lib/render.ts' }).getAttribute('href')).toBe('#projects/acme/lib%2Frender.ts');
-  expect(urls).toContain('/api/codemap/hotspots?limit=8');
+  // A busy file no miss touched is a hotspot, not a struggle.
+  expect(within(card).queryByRole('link', { name: 'lib/render.ts' })).toBeNull();
+  expect(urls).toContain('/api/codemap/hotspots?limit=8&misses=1');
+});
+
+test('where agents struggle, with no file missed yet, says so and links the hotspots', async () => {
+  serve({ '/api/codemap/hotspots?limit=8&misses=1': [] });
+  render(<Dashboard />);
+  const card = await region(/where agents struggle/i);
+  expect(await within(card).findByText(/no files with misses yet/i)).toBeTruthy();
+  expect(within(card).getByRole('link', { name: /hotspots/i }).getAttribute('href')).toBe('#projects');
+});
+
+test('projects: 10 at a time, then all of them on request; the global lessons are counted under the table', async () => {
+  const many = Array.from({ length: 14 }, (_, i) => ({ ...projects[1], key: `p${String(i).padStart(2, '0')}` }));
+  serve({ '/api/projects': many });
+  render(<Dashboard />);
+  const card = await region(/projects/i);
+  await within(card).findByText('p00');
+  expect(within(card).getAllByRole('row')).toHaveLength(11);
+  fireEvent.click(within(card).getByRole('button', { name: 'Show all 14' }));
+  expect(within(card).getAllByRole('row')).toHaveLength(15);
+  expect(await within(card).findByText(/4 global lessons/)).toBeTruthy();
 });
 
 test('recent activity: the last 10 entries', async () => {
@@ -118,10 +142,10 @@ test('recent activity: the last 10 entries', async () => {
 });
 
 test('a failing endpoint shows its error in its own section; the rest still renders', async () => {
-  serve({ '/api/patterns': new Error('patterns broke'), '/api/codemap/hotspots?limit=8': new Error('no map store'), '/api/status': new Error('status broke') });
+  serve({ '/api/patterns': new Error('patterns broke'), '/api/codemap/hotspots?limit=8&misses=1': new Error('no map store'), '/api/status': new Error('status broke') });
   render(<Dashboard />);
   expect((await within(await region(/quality/i)).findByRole('alert')).textContent).toBe('patterns broke');
-  expect((await within(await region(/hotspots/i)).findByRole('alert')).textContent).toBe('no map store');
+  expect((await within(await region(/where agents struggle/i)).findByRole('alert')).textContent).toBe('no map store');
   await waitFor(() => expect(within(screen.getByRole('region', { name: /^now$/i })).getByRole('alert').textContent).toBe('status broke'));
   expect(await screen.findByText('approved "scope every query by tenant"')).toBeTruthy();
   expect(screen.getByLabelText('inbox, waiting on you').textContent).toContain('5');
@@ -133,12 +157,12 @@ test('with nothing selected every section says it is empty instead of failing', 
     '/api/status': { ...status, selection: { initialized: true, tracked: 0, roots: 1, note: 'none' }, stage: null, progress: null, models: null },
     '/api/pipeline': { stage: null, progress: null, sessions: null, classify: null, inbox: null, postmortems: null, lessons: null, scans: null },
     '/api/patterns': { causes: [], repeatGroups: [], preDone: { checks: 0, withGaps: 0, gapsFound: 0 }, weekly: [] },
-    '/api/projects': [], '/api/codemap/hotspots?limit=8': [], '/api/activity?limit=10': [],
+    '/api/projects': [], '/api/codemap/hotspots?limit=8': [], '/api/codemap/hotspots?limit=8&misses=1': [], '/api/activity?limit=10': [],
   });
   render(<Dashboard />);
   const card = await region(/projects/i);
   expect(await within(card).findByRole('link', { name: 'Settings' })).toBeTruthy();
-  expect(within(await region(/hotspots/i)).getByText(/no code map yet/i)).toBeTruthy();
+  expect(within(await region(/where agents struggle/i)).getByText(/no files with misses yet/i)).toBeTruthy();
   expect(within(await region(/recent activity/i)).getByText(/nothing has happened yet/i)).toBeTruthy();
   expect(screen.getByLabelText('inbox, waiting on you').textContent).toContain('–');
   expect(screen.queryByRole('alert')).toBeNull();
@@ -146,10 +170,52 @@ test('with nothing selected every section says it is empty instead of failing', 
 });
 
 test('an answer of an unexpected shape breaks only its own section', async () => {
-  serve({ '/api/codemap/hotspots?limit=8': { not: 'a list' } });
+  serve({ '/api/codemap/hotspots?limit=8&misses=1': { not: 'a list' } });
   render(<Dashboard />);
-  expect((await within(await region(/hotspots/i)).findByRole('alert')).textContent).toMatch(/this section could not be shown/i);
+  expect((await within(await region(/where agents struggle/i)).findByRole('alert')).textContent).toMatch(/this section could not be shown/i);
   expect(await screen.findByText('approved "scope every query by tenant"')).toBeTruthy();
+});
+
+test('ask comes first, front and centre: one box, then the status cards', async () => {
+  render(<Dashboard />);
+  const ask = await region(/^ask$/i);
+  const now = await region(/^now$/i);
+  expect(ask.compareDocumentPosition(now) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  expect(within(ask).getByRole('heading', { name: /what do you want to build/i })).toBeTruthy();
+});
+
+test('ask: Enter sends the question; Shift+Enter is a new line', async () => {
+  render(<Dashboard />);
+  const ask = await region(/^ask$/i);
+  await waitFor(() => expect((within(ask).getByLabelText('ask project') as HTMLSelectElement).value).toBe('demo-shop'));
+  const box = within(ask).getByLabelText('question');
+  fireEvent.change(box, { target: { value: 'where do forms live' } });
+  fireEvent.keyDown(box, { key: 'Enter', shiftKey: true });
+  expect(location.hash).toBe('#dashboard');
+  fireEvent.keyDown(box, { key: 'Enter' });
+  expect(location.hash).toBe(newChatHref('demo-shop', 'where do forms live'));
+});
+
+test('ask: a starter question fills the box to edit, and a hotspot suggests a question about that file', async () => {
+  render(<Dashboard />);
+  const ask = await region(/^ask$/i);
+  const box = within(ask).getByLabelText('question') as HTMLTextAreaElement;
+  fireEvent.click(within(ask).getByRole('button', { name: /where should a new api endpoint go/i }));
+  expect(box.value).toMatch(/where should a new api endpoint go/i);
+  expect(location.hash).toBe('#dashboard');
+  const suggested = within(await within(ask).findByRole('list', { name: 'suggested questions' }));
+  fireEvent.click(await suggested.findByRole('button', { name: /src\/db\/pool\.ts/ }));
+  expect(location.hash).toContain('project=demo-shop');
+  expect(decodeURIComponent(location.hash)).toContain('src/db/pool.ts');
+});
+
+test('ask: recent chats link back to their conversation', async () => {
+  render(<Dashboard />);
+  const ask = await region(/^ask$/i);
+  const recent = within(await within(ask).findByRole('list', { name: 'recent chats' }));
+  const link = await recent.findByRole('link', { name: /Where do modals live\?/ });
+  expect(link.getAttribute('href')).toBe(chatHref('c1'));
+  expect(link.textContent).toContain('acme');
 });
 
 test('ask: picks a project and a question, then opens a new chat on the Ask page', async () => {

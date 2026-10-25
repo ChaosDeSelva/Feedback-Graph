@@ -6,7 +6,9 @@ const PUSHBACK: RegExp[] = [
   /\b(not|isn'?t|aren'?t) good enough\b/i,
   /\b(you )?(missed|forgot|skipped|ignored)\b/i,
   /\byou (didn'?t|did not|never|keep|still)\b/i,
-  /\bI (told|asked|said) you\b|\bI told\b/i,
+  /\bI (told|asked|said) you\b|\bI told\b|\bI (said|asked) (not )?to\b/i,
+  // Git actions the developer did not want: "you pushed to main", "you merged it".
+  /\byou (just |already )?(pushed|merged|force[- ]?pushed|rebased)\b/i,
   /\b(that'?s|this is|it'?s) not what I\b|\bnot what I (asked|wanted|meant|said)\b/i,
   /\b(wrong|incorrect)\b/i,
   /\b(broken|broke|buggy)\b/i,

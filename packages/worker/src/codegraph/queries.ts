@@ -2,6 +2,7 @@ import type { CodeMap } from './types.ts';
 
 // Agents call these per question against the same map; building the index once per map keeps that linear.
 const indexes = new WeakMap<CodeMap['imports'], Map<string, string[]>>();
+const testFiles = new WeakMap<CodeMap['files'], Set<string>>();
 
 function importersOf(map: CodeMap): Map<string, string[]> {
   let idx = indexes.get(map.imports);
@@ -39,8 +40,9 @@ export function dependents(map: CodeMap, path: string, depth: number): { path: s
   return out;
 }
 
-/** Test files that import `path` directly or through one intermediate file. */
+/** Test files (mapped or in the import index past the cap) that import `path` directly or through one intermediate file. */
 export function testsFor(map: CodeMap, path: string): string[] {
-  const tests = new Set(map.files.filter((f) => f.isTest).map((f) => f.path));
+  let tests = testFiles.get(map.files);
+  if (!tests) testFiles.set(map.files, (tests = new Set([...map.files, ...(map.outside ?? [])].filter((f) => f.isTest).map((f) => f.path))));
   return dependents(map, path, 2).map((d) => d.path).filter((p) => tests.has(p)).sort();
 }

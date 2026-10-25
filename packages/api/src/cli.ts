@@ -40,11 +40,12 @@ Usage:
   fg inbox list [--status pending|confirmed|rejected] [--source claude|codex|github|linear] [--project k] [--limit n]
   fg inbox show <id>
   fg inbox confirm|reject <id> [<id> ...] [--reason "..."]
-  fg lessons list [--status proposed|approved|rejected|superseded] [--project k]
+  fg lessons list [--status proposed|approved|rejected|superseded] [--project k] [--flag <check>] [--source github|linear|session|memory|manual]
   fg lessons show <id>
-  fg lessons approve|reject <id>
+  fg lessons approve|reject <id> [<id> ...] [--note "..."]   one batch; each lesson is recorded as decided on its own
+  fg lessons recheck                             re-run the lesson checks on every proposed and approved lesson (the worker's next round)
   fg lessons to-fact <id> [--kind convention] [--relevance 0.8]   file a lesson that states how the code is as a project fact you wrote; rejects the lesson
-  fg map rebuild <key>                               remap a project's code from scratch at the worker's next pass
+  fg map rebuild <key>                               remap a project's code from scratch at the worker's next pass (recorded in Activity)
   fg links list --project k
   fg links confirm|dismiss <a> <b> [--relation depends_on|related] [--note "..."]
   fg facts list --project k [--kind k] [--q "search"]
@@ -57,17 +58,20 @@ Usage:
   fg cloud sync-now [--force]                    sends what changed since the last sync (--force: everything)
   fg integrations status
   fg integrations set github|linear --from-stdin   the token from standard input (never an argument; needs integrations in OPERATOR_ALLOW)
-  fg integrations test github|linear
+  fg integrations test github|linear             re-check the saved token (a read: no OPERATOR_ALLOW verb needed)
   fg doctor                                      ./scripts/doctor.sh (run by scripts/fg on the host)
   fg setup [args]                                ./scripts/setup.sh with those arguments (run by scripts/fg on the host)
 
 Options:
-  --json           print the API's JSON instead of a table
-  --wait           fg scan: follow each job until it is done or failed (exit 1 if any failed)
-  --until <what>   fg status: poll until idle (waiting, nothing queued) or that stage; --timeout s gives up (exit 1)
+  --json           print the API's JSON instead of a table; a failure is { "error": "...", "status"? } on stdout
+  --wait           fg scan: follow each job until it is done or failed (exit 1 if any failed); progress (shard n of m,
+                   facts so far) goes to stderr when it changes and at least every 30 s
+  --watch          fg status: the whole status once, then only the lines that changed
+  --until <what>   fg status: poll until idle (nothing queued; the GitHub and Linear sync does not hold it up) or that
+                   stage; --timeout s gives up (exit 1)
   --as <name>      the agent name Activity records (default: FG_OPERATOR_NAME, else fg)
   --url <url>      the API (default: FEEDBACK_GRAPH_URL, else http://localhost:8787)
-  --help           this text
+  --help           this text (fg help <command>: that command only)
 
 Environment:
   FEEDBACK_GRAPH_URL   where the API answers (default http://localhost:8787)
@@ -81,12 +85,12 @@ Environment:
 type Flags = {
   json?: true; watch?: true; all?: true; only?: true; help?: true; wait?: true; force?: true; 'from-stdin'?: true; 'with-sessions'?: true;
   key?: string[]; provider?: string; status?: string; project?: string; limit?: string; reason?: string; interval?: string; as?: string; url?: string;
-  until?: string; timeout?: string; kind?: string; q?: string; title?: string; note?: string; relation?: string; source?: string; relevance?: string;
+  until?: string; timeout?: string; kind?: string; q?: string; title?: string; note?: string; relation?: string; source?: string; relevance?: string; flag?: string;
 };
 export type Parsed = { words: string[]; flags: Flags };
 
 const BOOLEAN = new Set(['json', 'watch', 'all', 'only', 'help', 'wait', 'force', 'from-stdin', 'with-sessions']);
-const VALUED = new Set(['key', 'provider', 'status', 'project', 'limit', 'reason', 'interval', 'as', 'url', 'until', 'timeout', 'kind', 'q', 'title', 'note', 'relation', 'source', 'relevance']);
+const VALUED = new Set(['key', 'provider', 'status', 'project', 'limit', 'reason', 'interval', 'as', 'url', 'until', 'timeout', 'kind', 'q', 'title', 'note', 'relation', 'source', 'relevance', 'flag']);
 
 export function parse(argv: string[]): Parsed {
   const words: string[] = [];
@@ -98,7 +102,7 @@ export function parse(argv: string[]): Parsed {
     const eq = a.indexOf('=');
     const name = a.slice(2, eq === -1 ? undefined : eq);
     if (BOOLEAN.has(name) && eq === -1) { flags[name] = true; continue; }
-    if (!VALUED.has(name)) throw new Error(`unknown option --${name} (see fg --help)`);
+    if (!VALUED.has(name)) throw new Error(`unknown option --${name}`);
     const value = eq === -1 ? argv[++i] : a.slice(eq + 1);
     if (value === undefined || (eq === -1 && value.startsWith('--'))) throw new Error(`--${name} needs a value`);
     if (name === 'key') flags.key = [...((flags.key as string[]) ?? []), ...value.split(',').map((k) => k.trim()).filter(Boolean)];
@@ -110,7 +114,14 @@ export function parse(argv: string[]): Parsed {
 // ── HTTP ───────────────────────────────────────────────────────────────
 
 class UsageError extends Error {}
-class ApiError extends Error {}
+class ApiError extends Error {
+  /** The HTTP status the API answered with; unset when it could not be reached. */
+  status?: number;
+  constructor(message: string, status?: number) {
+    super(message);
+    this.status = status;
+  }
+}
 
 const PLAIN_HTTP_OK = new Set(['localhost', '127.0.0.1', '[::1]', 'host.docker.internal']);
 
@@ -158,7 +169,7 @@ function client(io: CliIO, flags: Flags) {
       const e = (data as { error?: unknown } | null)?.error ?? data ?? res.statusText;
       const hint = res.status === 401 ? ' (set FG_OPERATOR_TOKEN or API_TOKEN)'
         : res.status === 403 && !io.env.FG_OPERATOR_TOKEN?.trim() ? ' (set FG_OPERATOR_TOKEN in .env, restart, and run fg with it to let agents make this decision)' : '';
-      throw new ApiError(`${method} ${path}: ${res.status} ${typeof e === 'string' ? e : JSON.stringify(e)}${hint}`);
+      throw new ApiError(`${method} ${path}: ${res.status} ${typeof e === 'string' ? e : JSON.stringify(e)}${hint}`, res.status);
     }
     return data as T;
   };
@@ -249,6 +260,11 @@ function statusLines(s: Record<string, any>, p: Pipeline | null): string[] {
     lines.push(`stage     ${s.stage.name}${s.stage.current ? ` ${s.stage.current}` : ''}${count} since ${at(s.stage.startedAt)}`);
   }
   if (p) lines.push(`pipeline  ${pipelineLine(p)}`);
+  const older = p?.scans?.olderScanner;
+  if (older?.files) {
+    const where = Object.entries((older.projects ?? {}) as Record<string, number>).map(([k, n]) => `${k} ${n}`).join(', ');
+    lines.push(`scanner   ${plural(older.files, 'file')} ${older.files === 1 ? 'was' : 'were'} read by an older scanner${where ? ` (${where})` : ''}: press Scan on the Projects page (or fg scan <project>) to refresh ${older.files === 1 ? 'it' : 'them'}`);
+  }
   if (w?.lastCycle) lines.push(`cycle     ${Object.entries(w.lastCycle).map(([k, v]) => `${k}=${v}`).join(' ')}`);
   if (w?.lastError) lines.push(`error     ${w.lastError}`);
   if (s.selection) lines.push(`projects  ${s.selection.tracked} selected${s.selection.note ? `: ${s.selection.note}` : ''}`);
@@ -268,9 +284,13 @@ function statusLines(s: Record<string, any>, p: Pipeline | null): string[] {
   return lines;
 }
 
-/** Idle: the worker is waiting, nothing is waiting for the classifier, a post-mortem or a scan, and no Sync now runs. */
+/**
+ * Idle: the worker is waiting, nothing is waiting for the classifier, a post-mortem or a scan, and no Sync now runs. The
+ * worker's GitHub and Linear sync (stage sync) counts as idle too: it can take minutes against the services' rate
+ * limits, and what it finds is new work for the next cycle, not work anyone is waiting on.
+ */
 function isIdle(s: Record<string, any>, p: Pipeline | null): boolean {
-  if (s.stage?.name !== 'waiting' || !p) return false;
+  if ((s.stage?.name !== 'waiting' && s.stage?.name !== 'sync') || !p) return false;
   return (p.classify?.backlog ?? 0) === 0 && (p.postmortems?.queued ?? 0) === 0 && (p.scans?.queued ?? 0) === 0 && (p.scans?.running ?? 0) === 0 && !s.cloud?.syncing;
 }
 
@@ -288,7 +308,9 @@ async function status(api: Api, io: CliIO, f: Flags): Promise<number> {
   if (until !== undefined && until !== 'idle' && !STAGES.has(until)) throw new UsageError(`--until takes idle or a stage (${[...STAGES].join(', ')})`);
   const timeout = f.timeout === undefined ? null : seconds(f.timeout, 0, '--timeout') * 1000;
   // /api/events says when something changed, so the watch need not poll; an API without it (or a dropped stream) is polled.
-  if (f.watch && until === undefined) await watchEvents(api, io, f);
+  // Both print through one printer: the whole status once, then only the lines that changed.
+  const print = watchPrinter(io, f);
+  if (f.watch && until === undefined) await watchEvents(api, io, f, print);
   let waited = 0;
   for (;;) {
     const s = await api<Record<string, any>>('GET', '/api/status');
@@ -297,18 +319,19 @@ async function status(api: Api, io: CliIO, f: Flags): Promise<number> {
     const reached = until === 'idle' ? isIdle(s, p) : until !== undefined && s.stage?.name === until;
     if (until !== undefined) {
       if (reached) {
-        io.out(f.json ? JSON.stringify({ ...s, pipeline: p }, null, 2) : `${until === 'idle' ? 'idle' : `stage ${until}`} since ${at(s.stage?.startedAt)}`);
+        const syncing = until === 'idle' && s.stage?.name === 'sync';
+        io.out(f.json ? JSON.stringify({ ...s, pipeline: p }, null, 2)
+          : syncing ? `idle: nothing is queued (the worker is syncing GitHub and Linear comments since ${at(s.stage?.startedAt)})`
+          : `${until === 'idle' ? 'idle' : `stage ${until}`} since ${at(s.stage?.startedAt)}`);
         return 0;
       }
       if (timeout !== null && waited + interval > timeout) {
         io.err(`fg: still not ${until === 'idle' ? 'idle' : `at stage ${until}`} after ${Math.round(timeout / 1000)} s: ${s.stage ? `stage ${s.stage.name}` : 'no stage reported'}${p ? `; ${pipelineLine(p)}` : ''}`);
         return 1;
       }
-    } else if (f.json) io.out(JSON.stringify(s, null, 2));
-    else {
-      if (f.watch) io.out(`── ${new Date().toISOString()}`);
-      for (const l of statusLines(s, p)) io.out(l);
-    }
+    } else if (f.watch) print(s, p);
+    else if (f.json) io.out(JSON.stringify(s, null, 2));
+    else for (const l of statusLines(s, p)) io.out(l);
     if (!f.watch && until === undefined) return 0;
     await io.sleep(interval);
     waited += interval;
@@ -322,7 +345,25 @@ const SETTLE_MS = 250;
  * fg status --watch over /api/events: the status again when the stage, a count, a scan or an Ask answer changes (and
  * only if what it prints changed), and each new Activity entry as a line. Returns when the stream ends or is not there.
  */
-async function watchEvents(api: Api, io: CliIO, f: Flags): Promise<void> {
+type Printer = (s: Record<string, any>, p: Pipeline | null) => void;
+
+/**
+ * fg status --watch's output: the whole status the first time, then under a timestamp only the lines that are new since
+ * the last print (nothing at all when nothing changed). --json prints the whole status again whenever it changed.
+ */
+function watchPrinter(io: CliIO, f: Flags): Printer {
+  let last: string[] | null = null;
+  return (s, p) => {
+    const lines = f.json ? [JSON.stringify(s, null, 2)] : statusLines(s, p);
+    const fresh = last ? lines.filter((l) => !last!.includes(l)) : lines;
+    last = lines;
+    if (!fresh.length) return;
+    if (!f.json) io.out(`── ${new Date().toISOString()}`);
+    for (const l of fresh) io.out(l);
+  };
+}
+
+async function watchEvents(api: Api, io: CliIO, f: Flags, print: Printer): Promise<void> {
   const stream = await api.events('/api/events');
   if (!stream) return;
   try {
@@ -333,15 +374,10 @@ async function watchEvents(api: Api, io: CliIO, f: Flags): Promise<void> {
   }
 
   async function follow(events: AsyncGenerator<SseEvent>) {
-    let last = '';
     const show = async () => {
       const s = await api<Record<string, any>>('GET', '/api/status');
       const p = await api<Pipeline>('GET', '/api/pipeline').catch(() => null);
-      const text = f.json ? JSON.stringify(s, null, 2) : statusLines(s, p).join('\n');
-      if (text === last) return;
-      last = text;
-      if (!f.json) io.out(`── ${new Date().toISOString()}`);
-      io.out(text);
+      print(s, p);
     };
     await show();
     let changed = false;
@@ -461,7 +497,23 @@ async function scan(api: Api, io: CliIO, f: Flags): Promise<number> {
   return results.every((r) => r.queued) ? 0 : 1;
 }
 
-type ScanJobView = { id: string; projectKey: string; status: string; filesScanned?: number; factsAdded?: number; error?: string | null; queuePosition?: number | null };
+type ScanJobView = {
+  id: string; projectKey: string; status: string; filesScanned?: number; factsAdded?: number; error?: string | null; queuePosition?: number | null;
+  /** An agentic scan's shards: done (so far, while it runs) of total. */
+  shards?: { total: number; done?: number; rescanned: number; failed: number } | null;
+};
+
+/** fg scan --wait prints a job's progress when it changes, and at least this often while it does not. */
+const PROGRESS_EVERY_MS = 30_000;
+const elapsed = (ms: number) => `${Math.floor(ms / 60_000)}m${String(Math.floor((ms % 60_000) / 1000)).padStart(2, '0')}s`;
+
+/** A job still going, in one line: where it is in the queue, or how many shards are done and facts saved so far. */
+function progressLine(j: ScanJobView): string {
+  const where = j.status === 'queued' && j.queuePosition ? ` (${ordinal(j.queuePosition)} in the queue)` : '';
+  const shards = j.shards?.total ? `, shard ${j.shards.done ?? j.shards.rescanned} of ${j.shards.total}` : '';
+  const facts = j.status === 'running' ? `, ${plural(j.factsAdded ?? 0, 'fact')} so far` : '';
+  return `${j.projectKey}: ${j.status}${where}${shards}${facts}`;
+}
 
 /** Poll GET /api/scans/:id for each queued job until all are done or failed, or --timeout runs out. */
 async function waitForScans(api: Api, io: CliIO, f: Flags, results: ScanResult[]): Promise<number> {
@@ -470,9 +522,19 @@ async function waitForScans(api: Api, io: CliIO, f: Flags, results: ScanResult[]
   const jobs = new Map<string, ScanJobView>();
   for (const r of results) if (r.queued && r.job) jobs.set(r.job.id, { id: r.job.id, projectKey: r.key, status: r.job.status });
   const finished = (j: ScanJobView) => j.status === 'done' || j.status === 'failed';
+  // Progress goes to stderr, so stdout stays the result table (or --json).
+  const printed = new Map<string, { line: string; at: number }>();
   let waited = 0;
   for (;;) {
     for (const j of [...jobs.values()].filter((x) => !finished(x))) jobs.set(j.id, await api<ScanJobView>('GET', `/api/scans/${encodeURIComponent(j.id)}`));
+    for (const j of jobs.values()) {
+      if (finished(j)) continue;
+      const line = progressLine(j);
+      const last = printed.get(j.id);
+      if (last && last.line === line && waited - last.at < PROGRESS_EVERY_MS) continue;
+      io.err(`${line} (${elapsed(waited)})`);
+      printed.set(j.id, { line, at: waited });
+    }
     if ([...jobs.values()].every(finished) || waited + interval > timeout) break;
     await io.sleep(interval);
     waited += interval;
@@ -534,11 +596,18 @@ async function inbox(api: Api, io: CliIO, words: string[], f: Flags): Promise<nu
 async function lessons(api: Api, io: CliIO, words: string[], f: Flags): Promise<number> {
   const [verb, id] = words;
   if (verb === 'list' || verb === undefined) {
-    const list = await api<any[]>('GET', `/api/lessons${qs({ status: f.status ?? 'proposed', project: f.project })}`);
+    const list = await api<any[]>('GET', `/api/lessons${qs({ status: f.status ?? 'proposed', project: f.project, flag: f.flag, source: f.source })}`);
     if (f.json) { io.out(JSON.stringify(list, null, 2)); return 0; }
     io.out(list.length
-      ? table(['ID', 'STATUS', 'PROJECT', 'TITLE', 'DECIDED BY'], list.map((l) => [l.id, l.status, l.projectKey ?? 'global', l.title, l.decidedBy ?? '']), 70)
+      ? table(['ID', 'STATUS', 'PROJECT', 'FROM', 'FLAGS', 'TITLE', 'DECIDED BY'], list.map((l) => [
+        l.id, l.status, l.projectKey ?? 'global', l.from ?? '', (l.checks ?? []).map((c: { name: string }) => c.name).join(','), l.title, l.decidedBy ?? '',
+      ]), 70)
       : `no ${f.status ?? 'proposed'} lessons`);
+    return 0;
+  }
+  if (verb === 'recheck') {
+    const r = await api<{ queued: number }>('POST', '/api/lessons/recheck', {});
+    io.out(f.json ? JSON.stringify(r) : `${r.queued} lessons queued for a re-check: the worker re-runs the checks at its next round (fg activity --kind lessons_checked)`);
     return 0;
   }
   if (verb === 'show') {
@@ -564,11 +633,14 @@ async function lessons(api: Api, io: CliIO, words: string[], f: Flags): Promise<
     return 0;
   }
   if (verb !== 'approve' && verb !== 'reject') throw new UsageError(`unknown lessons command: ${verb}`);
-  if (!id) throw new UsageError(`fg lessons ${verb} needs a lesson id (see fg lessons list)`);
-  const next = verb === 'approve' ? 'approved' : 'rejected';
-  await api('PATCH', `/api/lessons/${encodeURIComponent(id)}`, { status: next });
-  io.out(f.json ? JSON.stringify({ id, status: next }) : `${id} ${next}`);
-  return 0;
+  const ids = words.slice(1);
+  if (!ids.length) throw new UsageError(`fg lessons ${verb} needs at least one lesson id (see fg lessons list)`);
+  const status = verb === 'approve' ? 'approved' : 'rejected';
+  const items = ids.map((lessonId) => ({ id: lessonId, status, ...(f.note !== undefined && { note: f.note }) }));
+  const { results } = await api<{ results: { id: string; ok: boolean; status?: string; error?: string }[] }>('POST', '/api/lessons/decisions', { items });
+  if (f.json) io.out(JSON.stringify(results, null, 2));
+  else io.out(table(['ID', 'RESULT'], results.map((r) => [r.id, r.ok ? r.status : r.error])));
+  return results.every((r) => r.ok) ? 0 : 1;
 }
 
 async function cloud(api: Api, io: CliIO, verb: string | undefined, f: Flags): Promise<number> {
@@ -640,12 +712,18 @@ async function factsCmd(api: Api, io: CliIO, words: string[], f: Flags): Promise
   if (!f.project) throw new UsageError(`fg facts ${verb ?? 'list'} needs --project k`);
   const base = `/api/projects/${encodeURIComponent(f.project)}/facts`;
   if (verb === 'list' || verb === undefined) {
-    const list = await api<any[]>('GET', `${base}${qs({ kind: f.kind, q: f.q })}`);
+    const raw = await api<any[]>('GET', `${base}${qs({ kind: f.kind, q: f.q })}`);
+    // A search (--q) answers { fact, score } pairs, best first; the kind filter is the list's only.
+    const searched = raw.length > 0 && raw[0]?.fact !== undefined;
+    const list = searched ? raw.map((h) => ({ ...h.fact, score: h.score })).filter((x) => !f.kind || x.kind === f.kind) : raw;
     const shown = f.limit ? list.slice(0, Number(f.limit)) : list;
     if (f.json) { io.out(JSON.stringify(shown, null, 2)); return 0; }
+    const relevance = (x: any) => (x.relevance === null || x.relevance === undefined ? 'unscored' : `${Number(x.relevance).toFixed(2)} ${x.relevanceBy ?? ''}`.trim());
     io.out(shown.length
-      ? table(['ID', 'KIND', 'RELEVANCE', 'PATH', 'STATEMENT'], shown.map((x) => [x.id, x.kind, x.relevance === null || x.relevance === undefined ? 'unscored' : `${Number(x.relevance).toFixed(2)} ${x.relevanceBy ?? ''}`.trim(), x.path, x.statement]), 90)
-      : `no facts for ${f.project}`);
+      ? searched
+        ? table(['ID', 'KIND', 'RELEVANCE', 'SCORE', 'PATH', 'STATEMENT'], shown.map((x) => [x.id, x.kind, relevance(x), Number(x.score).toFixed(2), x.path, x.statement]), 90)
+        : table(['ID', 'KIND', 'RELEVANCE', 'PATH', 'STATEMENT'], shown.map((x) => [x.id, x.kind, relevance(x), x.path, x.statement]), 90)
+      : f.q ? `no facts in ${f.project} match "${f.q}"` : `no facts for ${f.project}`);
     return 0;
   }
   if (verb !== 'relevance') throw new UsageError(`unknown facts command: ${verb}`);
@@ -687,7 +765,8 @@ async function docs(api: Api, io: CliIO, words: string[], f: Flags): Promise<num
 }
 
 async function activityCmd(api: Api, io: CliIO, f: Flags): Promise<number> {
-  const list = await api<any[]>('GET', `/api/activity${qs({ project: f.project, kind: f.kind, limit: f.limit ?? '50' })}`);
+  // --json is the whole record: the list leaves big details out unless asked.
+  const list = await api<any[]>('GET', `/api/activity${qs({ project: f.project, kind: f.kind, limit: f.limit ?? '50', details: f.json ? '1' : undefined })}`);
   if (f.json) { io.out(JSON.stringify(list, null, 2)); return 0; }
   io.out(list.length ? table(['TIME', 'ACTOR', 'KIND', 'PROJECT', 'SUBJECT'], list.map((a) => [at(a.ts), a.actor, a.kind, a.projectKey ?? '', a.subject]), 90) : 'no activity');
   return 0;
@@ -730,24 +809,50 @@ async function integrationsCmd(api: Api, io: CliIO, words: string[], f: Flags): 
   return 0;
 }
 
+const VERBS = new Set(['status', 'pipeline', 'projects', 'scan', 'inbox', 'lessons', 'map', 'links', 'facts', 'docs', 'activity', 'sessions', 'cloud', 'integrations', 'doctor', 'setup']);
+
+/** fg help <verb>: that verb's usage lines (with their continuation lines) and the options; the whole text otherwise. */
+export function helpFor(verb: string | undefined): string {
+  if (!verb || !VERBS.has(verb)) return USAGE;
+  const [head, rest] = USAGE.split('\nOptions:\n');
+  const out: string[] = [];
+  let inVerb = false;
+  for (const line of head.split('\n')) {
+    if (line.startsWith('  fg ')) inVerb = line.startsWith(`  fg ${verb} `) || line === `  fg ${verb}`;
+    else if (!line.startsWith('    ')) inVerb = false;
+    if (inVerb) out.push(line);
+  }
+  return `Usage:\n${out.join('\n')}\n\nOptions:\n${rest.split('\n\nEnvironment:')[0]}`;
+}
+
 /** Runs one fg command. Exit codes: 0 done, 1 the API refused or something failed, 2 a usage mistake. */
 export async function run(argv: string[], raw: CliIO): Promise<number> {
   let io = raw;
   let p: Parsed;
+  // --json: a failure is JSON on stdout too, so whatever parses the output gets { error } and not prose.
+  const asJson = argv.includes('--json');
+  const failed = (message: string, code: 1 | 2, extra: { status?: number; help?: string } = {}) => {
+    const hint = code === 2 ? ` (see ${extra.help ?? 'fg help'})` : '';
+    if (asJson) io.out(JSON.stringify({ error: `${message}${hint}`, ...(extra.status !== undefined && { status: extra.status }) }));
+    else io.err(`fg: ${message}${hint}`);
+    return code;
+  };
   // setup's arguments are setup.sh's, not fg's: say where it runs before trying to read them as fg options.
   if (argv[0] === 'setup') {
     io.err('fg: fg setup runs ./scripts/setup.sh, which must run on the host (scripts/fg does that): it cannot run inside the api container');
     return 2;
   }
+  const verb = argv.find((a) => !a.startsWith('-'));
+  const help = verb && VERBS.has(verb) ? `fg help ${verb}` : 'fg help';
   try {
     p = parse(argv);
   } catch (e) {
-    io.err(`fg: ${(e as Error).message}`);
-    return 2;
+    return failed((e as Error).message, 2, { help });
   }
   const { words, flags } = p;
   io = { ...io, out: (l) => raw.out(printable(l)), err: (l) => raw.err(printable(l)) };
-  if (flags.help || !words.length || words[0] === 'help') { io.out(USAGE); return 0; }
+  if (words[0] === 'help') { io.out(helpFor(words[1])); return 0; }
+  if (flags.help || !words.length) { io.out(words.length ? helpFor(words[0]) : USAGE); return 0; }
   try {
     const api = client(io, flags);
     switch (words[0]) {
@@ -769,8 +874,8 @@ export async function run(argv: string[], raw: CliIO): Promise<number> {
       default: throw new UsageError(`unknown command: ${words[0]}`);
     }
   } catch (e) {
-    if (e instanceof UsageError) { io.err(`fg: ${e.message}\n\n${USAGE}`); return 2; }
-    if (e instanceof ApiError) { io.err(`fg: ${e.message}`); return 1; }
+    if (e instanceof UsageError) return failed(e.message, 2, { help: VERBS.has(words[0]) ? `fg help ${words[0]}` : 'fg help' });
+    if (e instanceof ApiError) return failed(e.message, 1, { status: e.status });
     throw e;
   }
 }

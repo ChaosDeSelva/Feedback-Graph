@@ -1,4 +1,4 @@
-import type { Activity, ActivityKind, Connection, ConnectionName, ExternalRef, FeedbackSource, CloudSyncResult, SyncCounts, SyncTrigger, Candidate, CodeMapMeta, Hotspot, MapGraph, ModuleContext, FolderCandidate, OutsideFolder, PipelineStatus, DocSummary, CandidateDetail, CandidateStatus, EvidenceGraph, FactHit, FactKind, Lesson, LessonDetail, LessonStatus, PatternReport, ProjectSummary, ProjectLink, LinkRelation, LinkStatus, ScanJob, SessionDetail, SessionListItem, SessionState, StatsRow, StoredFact, SystemStatus } from '@fb/core';
+import type { Activity, ActivityKind, Connection, ConnectionName, ExternalRef, FeedbackSource, CloudSyncResult, SyncCounts, SyncTrigger, Candidate, CodeMapMeta, Hotspot, MapGraph, ModuleContext, FolderCandidate, OutsideFolder, PipelineStatus, DocSummary, CandidateDetail, CandidateStatus, EvidenceGraph, FactHit, FactKind, Lesson, LessonCheckName, LessonDetail, LessonFrom, LessonStatus, PatternReport, ProjectSummary, ProjectLink, LinkRelation, LinkStatus, ScanJob, SessionDetail, SessionListItem, SessionState, StatsRow, StoredFact, SystemStatus } from '@fb/core';
 import type { ChatConversation, ChatProvider, ChatThread } from '@fb/core/chat';
 
 export type { Connection, ConnectionName, ExternalRef, FeedbackSource, CloudSyncResult, SyncCounts, Activity, Candidate, CodeMapMeta, Hotspot, MapGraph, ModuleContext, DocSummary, CandidateDetail, CandidateStatus, EvidenceGraph, Lesson, LessonDetail, LessonStatus, PatternReport, ProjectSummary, ProjectLink, LinkRelation, LinkStatus, ScanJob, PipelineStatus, SessionDetail, SessionListItem, SessionState, StatsRow, StoredFact, SystemStatus };
@@ -131,11 +131,23 @@ async function request<T = void>(path: string, o: { method?: string; body?: unkn
   return res.json() as Promise<T>;
 }
 
+/** A GET of one page of a list: the rows, and where the next page starts (the x-next-offset header), or null. */
+async function requestPage<T>(path: string): Promise<{ items: T[]; next: number | null }> {
+  const res = await send(path, { method: 'GET' }, { write: false, retry: true });
+  if (res.status === 401) window.dispatchEvent(new Event(SIGN_IN_EVENT));
+  if (!res.ok) throw new Error(await errorText(res));
+  const next = res.headers.get('x-next-offset');
+  return { items: (await res.json()) as T[], next: next === null ? null : Number(next) };
+}
+
 const enc = encodeURIComponent;
 const qs = (o: Record<string, string | undefined>) => {
   const q = new URLSearchParams(Object.entries(o).filter((e): e is [string, string] => !!e[1]));
   return q.size ? `?${q}` : '';
 };
+
+/** Inbox items per page. */
+export const CANDIDATE_PAGE = 200;
 
 export const api = {
   session: () => request<{ authRequired: boolean; authenticated: boolean }>('/api/session'),
@@ -144,13 +156,19 @@ export const api = {
   status: () => request<SystemStatus>('/api/status'),
   pipeline: (project?: string) => request<PipelineStatus>(`/api/pipeline${qs({ project })}`),
 
-  candidates: (status: CandidateStatus, project?: string) => request<Candidate[]>(`/api/candidates${qs({ status, limit: '500', project })}`),
+  /** One page of the Inbox (CANDIDATE_PAGE items from `offset`), and where the next starts. */
+  candidates: (status: CandidateStatus, project?: string, offset = 0) =>
+    requestPage<Candidate>(`/api/candidates${qs({ status, limit: String(CANDIDATE_PAGE), project, offset: offset ? String(offset) : undefined })}`),
   candidate: (id: string) => request<CandidateDetail>(`/api/candidates/${enc(id)}`),
   decide: (id: string, status: 'confirmed' | 'rejected', note?: string) =>
     request(`/api/candidates/${enc(id)}/decision`, { method: 'POST', body: note ? { status, note } : { status } }),
   stats: () => request<StatsRow[]>('/api/stats'),
 
-  lessons: (status: LessonStatus, project?: string) => request<Lesson[]>(`/api/lessons${qs({ status, project })}`),
+  lessons: (status: LessonStatus, o: { project?: string; flag?: LessonCheckName; source?: LessonFrom } = {}) =>
+    request<Lesson[]>(`/api/lessons${qs({ status, project: o.project, flag: o.flag, source: o.source })}`),
+  /** Many decisions in one call (owner-only); each lesson is recorded as decided on its own. */
+  decideLessons: (items: { id: string; status: 'approved' | 'rejected'; note?: string }[]) =>
+    request<{ results: { id: string; ok: boolean; status?: string; error?: string }[] }>('/api/lessons/decisions', { method: 'POST', body: { items } }),
   lesson: (id: string) => request<LessonDetail>(`/api/lessons/${enc(id)}`),
   updateLesson: (id: string, patch: LessonEdit) => request(`/api/lessons/${enc(id)}`, { method: 'PATCH', body: patch }),
   /** File the lesson's rule as a project fact you wrote (no scan replaces it); the lesson is rejected, noted "converted to a fact". */
@@ -180,14 +198,17 @@ export const api = {
   patterns: (key?: string) => request<PatternReport>(`/api/patterns${qs({ project: key })}`),
   activity: (o: { project?: string; kind?: ActivityKind; target?: string; limit?: number }) =>
     request<Activity[]>(`/api/activity${qs({ target: o.target, project: o.project, kind: o.kind, limit: String(o.limit ?? 100) })}`),
+  /** One activity entry with all its details (a list row with detailsOmitted has none). */
+  activityEntry: (id: string) => request<Activity>(`/api/activity/${enc(id)}`),
 
   codeMap: (key: string, limit = 200, includeTests = false) =>
     request<CodeMapReport>(`/api/projects/${enc(key)}/codemap/hotspots${qs({ limit: String(limit), tests: includeTests ? '1' : undefined })}`),
   rebuildCodeMap: (key: string) => request<{ queued: boolean }>(`/api/projects/${enc(key)}/codemap/rebuild`, { method: 'POST', body: {}, retry: false }),
   codeGraph: (key: string, includeTests = false) => request<MapGraph & { meta?: CodeMapMeta | null; capped?: MapCapped }>(`/api/projects/${enc(key)}/codemap/graph${qs({ tests: includeTests ? '1' : undefined })}`),
   codeModule: (key: string, path: string) => request<ModuleContext>(`/api/projects/${enc(key)}/codemap/module${qs({ path })}`),
-  topHotspots: (project?: string, limit = 10, includeTests = false) =>
-    request<ProjectHotspot[]>(`/api/codemap/hotspots${qs({ project, limit: String(limit), tests: includeTests ? '1' : undefined })}`),
+  /** missesOnly: only the files a confirmed miss touched ("where agents struggle"). */
+  topHotspots: (project?: string, limit = 10, includeTests = false, missesOnly = false) =>
+    request<ProjectHotspot[]>(`/api/codemap/hotspots${qs({ project, limit: String(limit), tests: includeTests ? '1' : undefined, misses: missesOnly ? '1' : undefined })}`),
 
   docs: (key: string) => request<DocSummary[]>(`/api/projects/${enc(key)}/docs`),
   // Uploads and imports are not retried: a lost answer can mean it was stored, and a retry would store it twice.
@@ -244,7 +265,7 @@ export type ProjectIntegrations = {
 };
 
 /** A skip rule with how many comments it kept from the classifier (null: not counted). */
-export type SkipRuleView = { name: string; description: string; skipped: number | null };
+export type SkipRuleView = { name: string; description: string; skipped: number | null; fromInbox?: number | null };
 export type IntegrationsView = {
   canSave: boolean; syncMinutes: number; github: ServiceView; linear: ServiceView; projects: ProjectIntegrations[];
   /** Absent from APIs older than 0.5.1. */

@@ -31,6 +31,8 @@ x-env: &env
   # host.docker.internal: the host as the containers see it). CLOUD_TOKEN is a token with the sync scope. Never logged.
   CLOUD_URL: ${CLOUD_URL:-}
   CLOUD_TOKEN: ${CLOUD_TOKEN:-}
+  # This machine's name on the cloud's sync log (inside a container the hostname is a random id). setup.sh fills it.
+  CLOUD_MACHINE: ${CLOUD_MACHINE:-}
   # Minutes between automatic syncs (at least 5); empty syncs only when you press Sync now in Settings.
   SYNC_INTERVAL_MINUTES: ${SYNC_INTERVAL_MINUTES:-}
   # Narrow the synced projects (comma-separated); empty syncs every selected project.
@@ -55,6 +57,12 @@ services:
       - "127.0.0.1:${NEO4J_BOLT_PORT:-7689}:7687"
     volumes:
       - neo4j-data:/data
+    # The image's entrypoint starts as root, fixes the ownership of /data and switches to the neo4j user: it keeps only
+    # the capabilities that needs, and no process in it may gain more (a setuid binary included).
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID]
+    security_opt:
+      - no-new-privileges:true
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://localhost:7474 >/dev/null || exit 1"]
       interval: 5s
@@ -74,6 +82,13 @@ services:
     cap_drop: [ALL]
     security_opt:
       - no-new-privileges:true
+    # Nothing in the image is written at run time: what it writes is /state, /codex and /scratch (volumes below), /tmp
+    # (the heartbeat, scratch folders and repository mirrors for the agent CLIs) and $HOME=/home/fg (the agent CLIs'
+    # settings), both in memory and gone at restart.
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /home/fg
     environment:
       <<: *env
       TRANSCRIPTS_DIR: /transcripts
@@ -190,6 +205,10 @@ services:
     cap_drop: [ALL]
     security_opt:
       - no-new-privileges:true
+    # It writes only /settings (the volume below); /tmp is there, in memory, for anything a library puts there.
+    read_only: true
+    tmpfs:
+      - /tmp
     environment:
       <<: *env
       CHECK_LLM: ${CHECK_LLM:-}

@@ -1,5 +1,5 @@
 import type { HumanTurn, ParsedSession, ToolCall } from '@fb/core';
-import { redactSecrets } from '@fb/core';
+import { isGitCommit, redactSecrets } from '@fb/core';
 
 const MAX_ASSISTANT_CHARS = 2000;
 
@@ -39,7 +39,14 @@ type SessionState = {
   /** When lastAssistantText was written. */
   lastAssistantTs: string;
   pendingToolCalls: ToolCall[];
+  /** The branch the newest record was on, and the one the newest edit or commit was made on. */
+  lastBranch: string | null;
+  workBranch: string | null;
 };
+
+/** Tool calls that change the repository: the branch they ran on is the branch the session's work is on. */
+const WORK_TOOLS = new Set(['Edit', 'Write', 'MultiEdit', 'NotebookEdit']);
+const isWork = (c: ToolCall) => WORK_TOOLS.has(c.name) || (c.name === 'Bash' && !!c.command && isGitCommit(c.command));
 
 export function parseTranscript(text: string, sourceFile: string): ParsedSession[] {
   const sessions = new Map<string, SessionState>();
@@ -54,6 +61,7 @@ export function parseTranscript(text: string, sourceFile: string): ParsedSession
     if (rec.timestamp > s.endedAt) s.endedAt = rec.timestamp;
     if (!s.cwd && rec.cwd) s.cwd = rec.cwd;
     if (s.gitBranch === null && rec.gitBranch) s.gitBranch = rec.gitBranch;
+    if (rec.gitBranch) state.lastBranch = rec.gitBranch;
     if (rec.isSidechain) continue;
 
     if (rec.type === 'assistant') {
@@ -76,8 +84,11 @@ export function parseTranscript(text: string, sourceFile: string): ParsedSession
   }
 
   // What the agent said after the last human turn: nothing takes it in as preceding text, so it is kept on the session.
+  // The branch is the one the files were changed on (a session that started on one branch and did its work on
+  // another is about the second); with no edits or commits, the branch it was last on.
   return [...sessions.values()].map((st) => ({
     ...st.session,
+    gitBranch: st.workBranch ?? st.lastBranch ?? st.session.gitBranch,
     finalReply: st.session.turns.length && st.lastAssistantText ? { text: st.lastAssistantText, ts: st.lastAssistantTs } : null,
   }));
 }
@@ -109,6 +120,8 @@ function sessionFor(sessions: Map<string, SessionState>, rec: RawRecord, sourceF
       lastAssistantText: '',
       lastAssistantTs: '',
       pendingToolCalls: [],
+      lastBranch: null,
+      workBranch: null,
     };
     sessions.set(rec.sessionId!, st);
   }
@@ -126,6 +139,7 @@ function readAssistant(rec: RawRecord, state: SessionState) {
       const call = toolCallOf(part, rec.timestamp!);
       state.pendingToolCalls.push(call);
       state.session.toolCalls.push(call);
+      if (rec.gitBranch && isWork(call)) state.workBranch = rec.gitBranch;
     }
   }
 }

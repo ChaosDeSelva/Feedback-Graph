@@ -559,3 +559,86 @@ test('a failure recording touched files does not stop ingest', async () => {
   expect(r.filesIngested).toBe(1);
   expect(logged).toContain('session files not recorded');
 });
+
+describe('an instruction about git is not pushback until the agent does what it forbids', () => {
+  const ORDER = 'this should be on its own branch based on main, do not merge back to main, dont push a PR yet';
+  const bashUse = (id: string, command: string) => ({ type: 'tool_use', id, name: 'Bash', input: { command } });
+  const session = (o: { before?: string[]; after?: string[]; then?: string }) => [
+    line({ type: 'user', uuid: 'u0', timestamp: '2026-10-25T10:00:00Z', message: { content: 'fix the chart embeds in the legacy thread view' } }),
+    line({ type: 'assistant', uuid: 'a1', timestamp: '2026-10-25T10:01:00Z', message: { content: [{ type: 'text', text: 'Fixed in pipeline.ts, tests pass.' }, ...(o.before ?? []).map((c, i) => bashUse(`b${i}`, c))] } }),
+    line({ type: 'user', uuid: 'u1', timestamp: '2026-10-25T10:02:00Z', message: { content: ORDER } }),
+    line({ type: 'assistant', uuid: 'a2', timestamp: '2026-10-25T10:03:00Z', message: { content: [{ type: 'text', text: 'On a new branch.' }, ...(o.after ?? []).map((c, i) => bashUse(`c${i}`, c))] } }),
+    ...(o.then ? [line({ type: 'user', uuid: 'u2', timestamp: '2026-10-25T10:04:00Z', message: { content: o.then } })] : []),
+  ].join('\n');
+  /** The fake store's callsAfter, from what upsertSession received (later turns' calls, then the trailing ones). */
+  function withCalls(text: string, now = Date.parse('2026-10-25T12:00:00Z')) {
+    const f = fakes({ readFile: async () => text, now: () => now });
+    let s: ParsedSession | null = null;
+    const upsert = f.deps.repo.upsertSession;
+    f.deps.repo.upsertSession = async (p, x, c) => { s = x; return upsert(p, x, c); };
+    f.deps.repo.callsAfter = async (uuid) => {
+      const turn = s!.turns.find((t) => t.uuid === uuid)!;
+      const later = s!.turns.filter((t) => t.index > turn.index);
+      const trailing = s!.toolCalls.filter((c) => c.ts > s!.turns.at(-1)!.ts);
+      return { calls: [...later.flatMap((t) => t.precedingToolCalls), ...trailing], laterTurns: later.length, endedAt: s!.endedAt };
+    };
+    return f;
+  }
+
+  test('nothing pushed, merged or opened after it: neutral, never sent to the model, never an Inbox item', async () => {
+    const f = withCalls(session({ before: ['git status'], after: ['git checkout -b fix/chart-embeds', 'git commit -m "fix: chart embeds"'], then: 'thanks, looks right' }));
+    await runCycle(f.deps);
+    expect(f.classifyCalls).toEqual([]);
+    expect(f.saved.find((x) => x.uuid === 'u1')).toMatchObject({ cand: false, c: { label: 'neutral', signals: ['instruction'] } });
+  });
+
+  test('a push after it (even in the calls after the last message) sends it to the model with that evidence', async () => {
+    const seen: HumanTurn[] = [];
+    const f = withCalls(session({ after: ['git checkout -b fix/chart-embeds', 'git push -u origin fix/chart-embeds'] }));
+    f.deps.classify = async (t) => { seen.push(t); return { label: 'correction', confidence: 0.9, summary: 'pushed after being told not to', signals: [] }; };
+    await runCycle(f.deps);
+    expect(seen.map((t) => t.uuid)).toEqual(['u1']);
+    expect(seen[0].followingToolCalls?.map((c) => c.command)).toEqual(['git push -u origin fix/chart-embeds']);
+  });
+
+  test('the same words after the agent had already pushed are about what happened: the model decides', async () => {
+    const f = withCalls(session({ before: ['git push origin HEAD'], then: 'ok' }));
+    await runCycle(f.deps);
+    expect(f.classifyCalls).toEqual(['u1']);
+  });
+
+  test('a true correction ("you pushed to main, I said not to") is always sent to the model', async () => {
+    const f = withCalls(session({ then: 'you pushed to main, I said not to' }));
+    await runCycle(f.deps);
+    expect(f.classifyCalls).toContain('u2');
+  });
+
+  test('the last message of a live session waits for what the agent does next', async () => {
+    const f = withCalls(session({}), Date.parse('2026-10-25T10:05:00Z'));
+    await runCycle(f.deps);
+    expect(f.classifyCalls).toEqual([]);
+    expect(f.saved.find((x) => x.uuid === 'u1')).toBeUndefined();
+  });
+
+  test('a later message does not clear it while the session is live: the push that follows still makes it a miss', async () => {
+    // "on its own branch, don't push yet", "looks good", then the agent pushes: classified before the push, it would be cleared for good.
+    const transcript = (o: { push: boolean }) => [
+      line({ type: 'user', uuid: 'u0', timestamp: '2026-10-25T10:00:00Z', message: { content: 'fix the chart embeds' } }),
+      line({ type: 'assistant', uuid: 'a1', timestamp: '2026-10-25T10:01:00Z', message: { content: [{ type: 'text', text: 'Fixed, committed.' }, bashUse('b0', 'git commit -am "fix: chart embeds"')] } }),
+      line({ type: 'user', uuid: 'u1', timestamp: '2026-10-25T10:02:00Z', message: { content: "this should be on its own branch, don't push yet" } }),
+      line({ type: 'assistant', uuid: 'a2', timestamp: '2026-10-25T10:03:00Z', message: { content: [{ type: 'text', text: 'Holding off.' }] } }),
+      line({ type: 'user', uuid: 'u2', timestamp: '2026-10-25T10:04:00Z', message: { content: 'looks good' } }),
+      line({ type: 'assistant', uuid: 'a3', timestamp: '2026-10-25T10:05:00Z', message: { content: [{ type: 'text', text: 'Pushing.' }, ...(o.push ? [bashUse('c0', 'git push -u origin fix/chart-embeds')] : [])] } }),
+    ].join('\n');
+    const live = withCalls(transcript({ push: false }), Date.parse('2026-10-25T10:06:00Z'));
+    await runCycle(live.deps);
+    expect(live.saved.find((x) => x.uuid === 'u1')).toBeUndefined();
+
+    const seen: HumanTurn[] = [];
+    const later = withCalls(transcript({ push: true }), Date.parse('2026-10-25T12:00:00Z'));
+    later.deps.classify = async (t) => { seen.push(t); return { label: 'correction', confidence: 0.9, summary: 'pushed after being told not to', signals: [] }; };
+    await runCycle(later.deps);
+    expect(seen.map((t) => t.uuid)).toEqual(['u1']);
+    expect(seen[0].followingToolCalls?.map((c) => c.command)).toEqual(['git push -u origin fix/chart-embeds']);
+  });
+});

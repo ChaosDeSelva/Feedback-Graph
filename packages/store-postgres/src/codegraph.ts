@@ -30,7 +30,8 @@ type Row = Record<string, any>;
 
 /**
  * The code map on Postgres (migration 0002): map columns on code_files (the rows facts point at), code_symbols,
- * code_imports, code_tests, code_maps, and session_files for what each session touched. Text is ordered with
+ * code_imports, code_tests, code_maps, and session_files for what each session touched. Files of the import index past
+ * the cap are code_files rows with in_index (0026): their columns and edges, no symbols. Text is ordered with
  * COLLATE "C" to match Neo4j's code-point order.
  */
 export class PgCodeGraphStore implements CodeGraphStore {
@@ -43,6 +44,7 @@ export class PgCodeGraphStore implements CodeGraphStore {
     const knowledge = new PgKnowledgeStore(db);
     const reads: CodeGraphReads = {
       mapFiles: (key, paths) => this.mapFiles(key, paths),
+      outsideFiles: (key, paths) => this.mapFiles(key, paths, 'in_index'),
       symbolsOf: (key, path) => this.symbolsOf(key, path),
       importsOf: (key, path) => this.importsOf(key, path),
       importersOf: (key, paths) => this.importersOf(key, paths),
@@ -76,20 +78,25 @@ export class PgCodeGraphStore implements CodeGraphStore {
          WHERE project_key = $1 AND in_map AND NOT (path = ANY($2::text[]))`,
         [key, map.files.map((f) => f.path)],
       );
+      await c.query(
+        `UPDATE code_files SET in_index = false, lang = NULL, code_hash = NULL, loc = NULL, is_test = false, mapped_at = NULL
+         WHERE project_key = $1 AND in_index AND NOT (path = ANY($2::text[]))`,
+        [key, map.outside.map((f) => f.path)],
+      );
       // A file that left the map and that nothing else refers to (never scanned, no fact about it) goes. Session
       // touches (session_files) need no code_files row.
       await c.query(
         `DELETE FROM code_files cf
-         WHERE cf.project_key = $1 AND NOT cf.in_map AND cf.hash IS NULL AND NOT (cf.path = ANY($2::text[]))
+         WHERE cf.project_key = $1 AND NOT cf.in_map AND NOT cf.in_index AND cf.hash IS NULL AND NOT (cf.path = ANY($2::text[]))
            AND NOT EXISTS (SELECT 1 FROM facts x WHERE x.code_file_id = cf.id)`,
-        [key, map.files.map((f) => f.path)],
+        [key, [...map.files, ...map.outside].map((f) => f.path)],
       );
       await c.query(
         `INSERT INTO code_files (id, project_key, path, removed, in_map, lang, code_hash, loc, is_test, churn_commits, churn_last_ts, mapped_at)
          SELECT f.id, $1, f.path, false, true, f.lang, f.hash, f.loc, f.is_test, f.churn, f.last_ts, $2
          FROM unnest($3::text[], $4::text[], $5::text[], $6::text[], $7::int[], $8::boolean[], $9::int[], $10::text[])
               AS f(id, path, lang, hash, loc, is_test, churn, last_ts)
-         ON CONFLICT (id) DO UPDATE SET in_map = true, lang = EXCLUDED.lang, code_hash = EXCLUDED.code_hash, loc = EXCLUDED.loc,
+         ON CONFLICT (id) DO UPDATE SET in_map = true, in_index = false, lang = EXCLUDED.lang, code_hash = EXCLUDED.code_hash, loc = EXCLUDED.loc,
            is_test = EXCLUDED.is_test, churn_commits = EXCLUDED.churn_commits, churn_last_ts = EXCLUDED.churn_last_ts,
            mapped_at = EXCLUDED.mapped_at`,
         [
@@ -97,6 +104,18 @@ export class PgCodeGraphStore implements CodeGraphStore {
           map.files.map((f) => id(f.path)), map.files.map((f) => f.path), map.files.map((f) => f.lang), map.files.map((f) => f.hash),
           map.files.map((f) => f.loc), map.files.map((f) => f.isTest),
           map.files.map((f) => map.churn[f.path]?.commits ?? null), map.files.map((f) => map.churn[f.path]?.lastTs ?? null),
+        ],
+      );
+      await c.query(
+        `INSERT INTO code_files (id, project_key, path, removed, in_map, in_index, lang, code_hash, loc, is_test, mapped_at)
+         SELECT f.id, $1, f.path, false, false, true, f.lang, f.hash, f.loc, f.is_test, $2
+         FROM unnest($3::text[], $4::text[], $5::text[], $6::text[], $7::int[], $8::boolean[]) AS f(id, path, lang, hash, loc, is_test)
+         ON CONFLICT (id) DO UPDATE SET in_map = false, in_index = true, lang = EXCLUDED.lang, code_hash = EXCLUDED.code_hash, loc = EXCLUDED.loc,
+           is_test = EXCLUDED.is_test, churn_commits = NULL, churn_last_ts = NULL, mapped_at = EXCLUDED.mapped_at`,
+        [
+          key, now,
+          map.outside.map((f) => id(f.path)), map.outside.map((f) => f.path), map.outside.map((f) => f.lang), map.outside.map((f) => f.hash),
+          map.outside.map((f) => f.loc), map.outside.map((f) => f.isTest),
         ],
       );
       await c.query(
@@ -124,10 +143,12 @@ export class PgCodeGraphStore implements CodeGraphStore {
         [key, map.tests.map((t) => id(t.test)), map.tests.map((t) => id(t.target))],
       );
       await c.query(
-        `INSERT INTO code_maps (project_key, fingerprint, built_at, files, symbols, imports, tests, candidates, unresolved) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+        `INSERT INTO code_maps (project_key, fingerprint, built_at, files, symbols, imports, tests, candidates, unresolved, version)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
          ON CONFLICT (project_key) DO UPDATE SET fingerprint = EXCLUDED.fingerprint, built_at = EXCLUDED.built_at, files = EXCLUDED.files,
-           symbols = EXCLUDED.symbols, imports = EXCLUDED.imports, tests = EXCLUDED.tests, candidates = EXCLUDED.candidates, unresolved = EXCLUDED.unresolved`,
-        [key, map.fingerprint, now, map.stats.files, map.stats.symbols, map.stats.imports, map.stats.tests, map.candidates, map.unresolved ?? null],
+           symbols = EXCLUDED.symbols, imports = EXCLUDED.imports, tests = EXCLUDED.tests, candidates = EXCLUDED.candidates, unresolved = EXCLUDED.unresolved,
+           version = EXCLUDED.version`,
+        [key, map.fingerprint, now, map.stats.files, map.stats.symbols, map.stats.imports, map.stats.tests, map.candidates, map.unresolved ?? null, map.version],
       );
     });
     return map.stats;
@@ -138,7 +159,7 @@ export class PgCodeGraphStore implements CodeGraphStore {
     const { rowCount } = await this.q(
       `DELETE FROM code_files WHERE id IN (
          SELECT cf.id FROM code_files cf
-         WHERE NOT cf.in_map AND (cf.removed OR NOT EXISTS (SELECT 1 FROM projects p WHERE p.key = cf.project_key))
+         WHERE NOT cf.in_map AND NOT cf.in_index AND (cf.removed OR cf.hash IS NULL OR NOT EXISTS (SELECT 1 FROM projects p WHERE p.key = cf.project_key))
            AND NOT EXISTS (SELECT 1 FROM facts x WHERE x.code_file_id = cf.id)
          LIMIT $1)`,
       [Math.max(0, Math.floor(limit))],
@@ -162,14 +183,15 @@ export class PgCodeGraphStore implements CodeGraphStore {
   async codeMapMeta(projectKey: string): Promise<CodeMapMeta | null> {
     const { rows: [m] } = await this.q('SELECT * FROM code_maps WHERE project_key = $1', [projectKey]);
     if (!m) return null;
-    return { fingerprint: m.fingerprint ?? null, builtAt: iso(m.built_at)!, stats: { files: m.files, symbols: m.symbols, imports: m.imports, tests: m.tests }, candidates: m.candidates ?? null, unresolved: m.unresolved ?? null };
+    return { fingerprint: m.fingerprint ?? null, builtAt: iso(m.built_at)!, stats: { files: m.files, symbols: m.symbols, imports: m.imports, tests: m.tests }, candidates: m.candidates ?? null, unresolved: m.unresolved ?? null, version: m.version ?? null };
   }
 
   async codeMap(projectKey: string): Promise<StoredCodeMap | null> {
     const meta = await this.codeMapMeta(projectKey);
     if (!meta) return null;
-    const [files, symbols, imports] = await Promise.all([
+    const [files, outside, symbols, imports] = await Promise.all([
       this.mapFiles(projectKey),
+      this.mapFiles(projectKey, undefined, 'in_index'),
       this.q('SELECT * FROM code_symbols WHERE project_key = $1 ORDER BY path COLLATE "C", ord', [projectKey]),
       this.q(
         `SELECT f.path AS from_path, i.to_ref, i.names, i.spec FROM code_imports i JOIN code_files f ON f.id = i.from_file_id
@@ -180,6 +202,7 @@ export class PgCodeGraphStore implements CodeGraphStore {
     return {
       ...meta,
       files: files.map(({ churn: _, ...f }) => f),
+      outside: outside.map(({ churn: _, ...f }) => f),
       symbols: symbols.rows.map(symbolOf),
       imports: imports.rows.map((r) => ({ from: r.from_path, to: r.to_ref, names: r.names ?? [], spec: r.spec ?? '' })),
     };
@@ -235,6 +258,10 @@ export class PgCodeGraphStore implements CodeGraphStore {
     return this.views.lessonsForPaths(projectKey, paths);
   }
 
+  outsideMap(projectKey: string, paths: string[]) {
+    return this.views.outsideMap(projectKey, paths);
+  }
+
   /** The export's per-file view of a project's map. */
   exportFiles(projectKey: string) {
     return this.views.exportFiles(projectKey);
@@ -242,11 +269,12 @@ export class PgCodeGraphStore implements CodeGraphStore {
 
   // ── reads the views are built from ──
 
-  private async mapFiles(projectKey: string, paths?: string[]): Promise<(MapFile & { churn: FileChurn | null })[]> {
+  /** Mapped files (in_map), or with `in_index` the files of the import index past the cap. */
+  private async mapFiles(projectKey: string, paths?: string[], mark: 'in_map' | 'in_index' = 'in_map'): Promise<(MapFile & { churn: FileChurn | null })[]> {
     if (paths && !paths.length) return [];
     const { rows } = await this.q(
       `SELECT path, lang, code_hash, loc, is_test, churn_commits, churn_last_ts FROM code_files
-       WHERE project_key = $1 AND in_map AND ($2::text[] IS NULL OR path = ANY($2::text[]))
+       WHERE project_key = $1 AND ${mark} AND ($2::text[] IS NULL OR path = ANY($2::text[]))
        ORDER BY path COLLATE "C"`,
       [projectKey, paths ?? null],
     );
@@ -335,7 +363,7 @@ export class PgCodeGraphStore implements CodeGraphStore {
        JOIN feedback f ON f.id = m.feedback_id
        JOIN turns t ON t.uuid = f.turn_uuid
        JOIN session_files sf ON sf.session_id = t.session_id AND sf.edited
-       WHERE m.project_key = $1 AND f.status <> 'rejected' AND ($2::text[] IS NULL OR sf.path = ANY($2::text[]))
+       WHERE m.project_key = $1 AND f.status <> 'rejected' AND m.subject IS NULL AND ($2::text[] IS NULL OR sf.path = ANY($2::text[]))
        ORDER BY m.id COLLATE "C", sf.path COLLATE "C"`,
       [projectKey, paths],
     );

@@ -1,5 +1,116 @@
 # Changelog
 
+## 0.6.1 (2026-10-25)
+
+0.6.1 makes 0.6.0 work on the data an install already holds, and on a large real repository. Each rule change now
+migrates the data it governs (maps, scan shards, facts, lesson checks, pending Inbox items, misses), lists say what a
+cap left out, and judges answer "applies or not" instead of a reason with no verdict.
+
+### Upgrading
+- At the first worker start after the upgrade, without you doing anything (each step once, logged in Activity):
+  - code maps from older map rules are rebuilt;
+  - existing facts are validated again;
+  - existing lessons are checked again;
+  - the skip rules and the new instruction rule run over items already waiting in the Inbox;
+  - misses about branches, merges and pull requests stop sitting on files.
+- **Files read by an older scanner are rescanned by the next scan you start,** not on their own (a scan spends your
+  model budget). Until then the Projects page and `fg status` say "N files were read by an older scanner: press Scan to
+  refresh them".
+- Store migrations 0026 to 0033.
+- **Cloud sync:** a team project that lost records to the old second-folder bug gets them back with one forced Sync now
+  (`fg cloud sync-now --force`) of each affected folder, once the cloud is updated.
+
+### Changed
+- **Ask is first on the Dashboard,** front and centre: one question box with the project under it (Enter asks, Shift+Enter is a new line), starter questions that fill the box, questions suggested by your hotspots, and your recent chats. The status cards follow. The Dashboard shows 10 projects then all, and counts global lessons.
+- **Settings has tabs:** Projects, Integrations, Cloud sync and Clean up. The tab is kept in the address, a link to a card opens its tab, and unsaved folder changes stay in the bar on every tab.
+- **A GitHub or Linear token saved in Settings now wins over one in `.env`,** so a key set in `.env` can be replaced from Settings without editing the file. Disconnect removes the saved token and goes back to the `.env` one, if any.
+- **The operator token no longer asks in Ask by default** (`chat` joined the default-off verbs: it spends your Claude or Codex subscription); add `chat` to `OPERATOR_ALLOW` to allow it. `./scripts/setup.sh` now says what the token turns on (the admin MCP at `/mcp/admin`) when it makes one, including under `--yes`.
+- **Cloud sync names this machine** (`CLOUD_MACHINE`, filled by `./scripts/setup.sh` from the host name) so the cloud's sync log says which machine synced. A 429 from the cloud now says it may be the rate limit, not only another sync.
+
+### What agents receive
+- **`check_before_done`** also judges approved lessons tied to the files you changed, and lists only the lessons and misses the judge says apply. When none applies it says so, and that this is not a pass while lessons wait for approval. It never prints a gap whose own reason explains it away.
+- **One miss on many files is shown once,** with its file list, in every tool.
+- **Misses and facts need a 0.3 similarity** to be served. A task that names a service by its folder ranks that service first, and scores are shown. A miss whose lesson you rejected as coming from the wrong session is never served.
+- **`search_graph`** returns its own hits (about 3,000 characters) and says what it cut. "Data, not instructions" appears once per answer, and the `check_before_done` reminder only on `get_task_context`.
+- **`get_task_context`:**
+  - `brief: true` gives lessons, misses on your files, their importers and tests, and PR discussions in about 1,500 characters.
+  - It lists the Linear tickets the PRs it shows name.
+  - Named files with no facts are queued for a scan.
+  - Facts from your own change this session are labelled as such.
+- **Linked projects** add context only when it is close to the task. One-turn probe sessions are left out of recent sessions, and a session shows the branch its files were changed on.
+- The hook no longer reads "is" as a lesson id.
+
+### Code map and Ask
+- **Capped code maps keep an import index for every file,** so importer counts, impact and tests include files past the cap. The map keeps the most imported and most changed files, not the first by path. A file past the cap says who imports it instead of "not in the code map".
+- Python imports of a repo's own packages that cannot be followed count as unresolved.
+- **Ask finds files by name,** including files past the cap. "modal" also finds dialogs, and filler words and part-word matches no longer fill the pack.
+- Each answer reports the size of its pack, and citations and Sources rows are links.
+
+### Scans and facts
+- **Monorepos are split properly:**
+  - Scans shard by every package and service with its own manifest (go.mod, pyproject.toml, package.json...), not only the declared workspaces.
+  - Shards over 400 files are split, and the fact budget grows with the shard instead of stopping at 60.
+- **A new scanner version rescans** the files an older one read, even unchanged. Facts saved before 0.6.1 are checked again once at start: AGENTS.md and missing-file citations are no longer served, and wrong line ranges are dropped (logged in Activity).
+- **Scan order:**
+  - files an agent named in `get_task_context` that have no facts come first (read first by the next scan);
+  - then files sessions edited;
+  - then hotspots (recent churn, review comments, long explanatory comments).
+- **Scan agents:**
+  - They see files grouped by directory, with a minimum per large directory.
+  - They report what they did not reach, and the Projects page shows it.
+  - Codex copies the repo once per scan, not once per shard.
+- **Facts API and line ranges:**
+  - The facts API pages (`limit`, `offset`, `X-Next-Offset`) and filters by `origin`; `confidence` is gone.
+  - Correct line ranges inside a function body are no longer dropped.
+  - Task context points at a manifest instead of printing its dependency list.
+
+### Learning from feedback
+- **An instruction about git ("don't push a PR yet") is not a miss** unless the agent then pushed, merged or opened the PR.
+  - Only a pure git constraint counts. A message that complains, asks for a change or names a file still goes to the classifier, even when it mentions a commit or a PR.
+  - It is judged once its session has gone idle, so a push that comes later still makes it a miss.
+- **Misses purely about branches, pushes, merges, PRs or commits** are no longer attached to every file the session edited.
+- **Post-mortems:**
+  - Lessons no longer carry PR numbers in the rule, repeat the rule as the title, or leave "applies when" empty.
+  - A new cause, "code not read": the code was in the repository and the session never opened it.
+  - Proposed facts are logged beside the lesson, never stored.
+- **Lesson checks are versioned and rerun on upgrade.**
+  - They now flag paths missing from the repo, lessons with no path, wrong-session misses and near-duplicates (`duplicate-of`).
+  - An APPROVED review is not a nit, and "When X, ensure Y" counts as a rule.
+  - "Looks like a fact" now catches "X is configured in Y" and "Remember that ...".
+  - `fg lessons recheck` forces a recheck.
+- **Bulk decisions:** select lessons, or all lessons with a flag, and approve or reject them with one confirm. Also `fg lessons approve|reject <id>... --note` and `POST /api/lessons/decisions`. Lessons filter by source and by check. A lesson from a review says who said it, with the review verdict shown neutrally.
+- **Skip rules:**
+  - The status-note rule knows "Fixed: …", "Done.", "Closing in favour of #…", "Superseded by #…" and "Addressed in the latest commit"; corrections worded the same way still reach the classifier.
+  - When the rules change, they run over items already pending.
+- **Linear issues** of a mapped team are read (read-only) as project documents, and pull requests link to the tickets they name.
+
+### Operator tools
+- **Admin MCP:** compact paged lists (20 rows), `inbox_get` and `lesson_get`, `structuredContent`, and read-only hints, so Codex no longer asks before each read.
+- **`fg`:**
+  - `facts list --q` shows results.
+  - `scan --wait` shows progress at least every 30 seconds.
+  - `status --watch` prints only changes.
+  - `--json` errors are JSON, usage errors are one line, and `fg help <verb>` works.
+  - `--until idle` is not held up by the GitHub or Linear sync, and `map rebuild` is logged.
+- **OpenAPI** has response schemas for every operation and describes the MCP endpoints. Unknown `/api` paths answer a JSON 404.
+- **Security:**
+  - A wrong bearer token is refused (401) and logged on reads too.
+  - Request bodies are limited: 1 MB, 16 MB for uploads, 256 MB for imports.
+  - Link decisions record who made them, and Activity records whether a write came from the operator token or a browser.
+  - The api and worker containers run on a read-only file system, and Neo4j drops capabilities.
+
+### Fixed
+- **The Graph's Code mode no longer packs files into one ball:** files repel each other more as the map grows, never overlap, links get room by kind, each dot keeps a readable size when zoomed out, and the drawing is fitted below the legend and notes. Captions no longer pile up or cover nodes.
+- A Projects link followed while the page is open switches project, so Rebuild and Scan act on the project shown. The code map card shows the new map once a rebuild finishes.
+- A lesson's context no longer prints "wasAvailable" as its reason.
+- "Where agents struggle" lists only files with misses, and Sync now says "Nothing changed since the last sync".
+- **Performance:**
+  - Orphan code files left by old session touches are purged.
+  - Activity lists leave big details out until you open an entry.
+  - The Inbox loads 200 items at a time.
+  - The relevance backfill no longer keeps the worker busy.
+  - The cloud preview runs 4 projects at a time.
+
 ## 0.6.0 (2026-10-24)
 
 ### Added

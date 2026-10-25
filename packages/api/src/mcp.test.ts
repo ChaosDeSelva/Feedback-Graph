@@ -63,6 +63,24 @@ test('MCP get_task_context takes the files the agent will touch and ranks their 
   expect(body.result.content[0].text).toContain('touches src/db/pool.ts');
 });
 
+test('MCP search_graph returns its hits, not the task context, and has no check_before_done footer', async () => {
+  const app = createApp(repo, { context: ctx });
+  const res = await app.request('/mcp', rpc({ method: 'tools/call', params: { name: 'search_graph', arguments: { cwd: '/Users/j/Vibe/demo', query: 'purple elephant' } } }));
+  const text = ((await res.json()) as { result: { content: { text: string }[] } }).result.content[0].text;
+  expect(text).toMatch(/^# Feedback Graph search for "purple elephant"/);
+  expect(text).toMatch(/No past miss is close enough/);
+  expect(text).not.toContain('check_before_done');
+});
+
+test('MCP get_task_context takes brief and session_id', async () => {
+  const asked: string[] = [];
+  const app = createApp(repo, { context: { ...ctx, sessions: { list: async () => ({ sessions: [], next: null }), detail: async (id) => { asked.push(id); return null; } } } });
+  const res = await app.request('/mcp', rpc({ method: 'tools/call', params: { name: 'get_task_context', arguments: { cwd: '/Users/j/Vibe/demo', task: 'tune pool', brief: true } } }));
+  expect(((await res.json()) as { result: { content: { text: string }[] } }).result.content[0].text).toMatch(/^# Feedback Graph brief/);
+  await app.request('/mcp', rpc({ method: 'tools/call', params: { name: 'get_task_context', arguments: { cwd: '/Users/j/Vibe/demo', task: 'tune pool', session_id: 's-7' } } }));
+  expect(asked).toEqual(['s-7']);
+});
+
 test('without Ollama, get_task_context and check_before_done say Ollama is not reachable, with its URL and model', async () => {
   const refused = (async () => {
     throw Object.assign(new TypeError('fetch failed'), { cause: Object.assign(new Error('connect ECONNREFUSED'), { code: 'ECONNREFUSED' }) });

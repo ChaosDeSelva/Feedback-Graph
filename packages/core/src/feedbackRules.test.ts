@@ -76,6 +76,45 @@ describe('feedbackSkipRule', () => {
     expect(feedbackSkipRule(text, byAuthor)?.name).toBe('status-note');
   });
 
+  // Real-looking status notes a PR author (or their agent) posts when a thread is done: no feedback in any of them.
+  test.each([
+    'Fixed: moved the null check ahead of the loop.',
+    'Fixed in the latest commit',
+    'Done.',
+    'Closing in favour of #812',
+    'Closing in favor of acme/web#77.',
+    'Superseded by #455.',
+    'Addressed in the latest commit.',
+    'Good catch, fixed in 9e1d0c4.',
+    'Thanks! Done in the last push.',
+    '[claude] Fixed: the handler now returns 404 for a missing id.',
+    'Updated.',
+    'Resolved in the follow-up commit.',
+    'Replaced by #90',
+    'Done: renamed to `cartTotal` everywhere.',
+  ])("the PR author's status note is skipped: %s", (text) => {
+    expect(feedbackSkipRule(text, byAuthor)?.name).toBe('status-note');
+  });
+
+  // Real corrections that open with the same words: a solo developer reviewing their agent's PR under their own
+  // account writes these, so the rule must leave every one of them to the classifier.
+  test.each([
+    'Fixed? No, the empty-list case still throws.',
+    'Fixed in a1b2c3d broke the login redirect, please revert it.',
+    'Done is not done: the second call site still uses the old helper.',
+    'Fixed: not really, the test only passes because it is skipped.',
+    'Addressed in the latest commit? I still see the raw SQL on line 40.',
+    'Superseded by #456 is wrong, that PR was closed without merging.',
+    'Closing in favour of #123 was a mistake; reopen this and keep the original approach.',
+    'Done. But you also deleted the migration, put it back.',
+    'Updated the docs but the code path is unchanged, fix the handler too.',
+    'Resolved the conflict wrong: the retry loop from main is gone.',
+    'Fixed: but now the totals ignore discounts.',
+    'Done: you only changed one of the three call sites, do the other two.',
+  ])('a correction that opens with status words is kept, even by the PR author: %s', (text) => {
+    expect(feedbackSkipRule(text, byAuthor)).toBeNull();
+  });
+
   test('a verified bot or agent may post status notes; an unverified marker may not', () => {
     expect(feedbackSkipRule('Resolved', ext({ authorKind: 'agent', authorVerified: true }))?.name).toBe('status-note');
     expect(feedbackSkipRule('[claude] Resolved', ext({ authorKind: 'agent', authorVerified: false }))).toBeNull();

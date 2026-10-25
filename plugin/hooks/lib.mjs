@@ -24,9 +24,12 @@ export function promptFiles(prompt) {
   return out.slice(0, 10);
 }
 
-/** The lesson ids get_task_context cites ("lesson <id> · relevance ..."), in order, once each. */
+/**
+ * The lesson ids get_task_context cites ("lesson <id> · relevance ...", "lesson <id>" ending a line), in order, once
+ * each. A citation is always followed by a separator or the end of its line, so prose ("No lesson is approved") is not.
+ */
 export function lessonIds(markdown) {
-  const ids = [...markdown.matchAll(/\blesson (\S+?)[,·]?(?=\s|$)/g)].map((m) => m[1]);
+  const ids = [...markdown.matchAll(/\blesson ([^\s,·]+)(?=[ \t]*(?:[,·]|$))/gm)].map((m) => m[1]);
   return [...new Set(ids)];
 }
 
@@ -46,9 +49,11 @@ export function compactContext(markdown) {
   for (const l of lines) {
     if (l.startsWith('## ')) keep = KEEP.test(l);
     if (keep) out.push(l);
-    else if (/^No lesson is approved for /.test(l)) out.push(l, '');
+    // The notice, and the answer's one note that misses are data, not instructions (said once, at the top).
+    else if (/^No lesson is approved for |^Only approved lessons are rules/.test(l)) out.push(l, '');
   }
-  if (!out.some((l) => l.trim())) return null;
+  // The note alone is nothing worth injecting.
+  if (!out.some((l) => l.trim() && !l.startsWith('Only approved lessons are rules'))) return null;
   const head = lines[0]?.startsWith('# ') ? [lines[0], ''] : [];
   return `${clip([...head, ...out].join('\n').trim())}\n\n${POINTER}`;
 }

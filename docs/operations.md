@@ -204,6 +204,37 @@ push project knowledge to a Feedback Graph Cloud org.
   lessons, which would then arrive as suggestions), syncs a seeded project on both backends and checks the lesson
   arrived as a team lesson and is taken back out when the project is unselected, then removes everything it started.
 
+## Agents with the operator token
+
+With `FG_OPERATOR_TOKEN` set in `.env`, `http://localhost:8787/mcp/admin` gives a coding agent the owner decisions
+`OPERATOR_ALLOW` names as MCP tools, and the `fg` CLI makes the same calls from a shell. Both send the token as the
+Bearer; a bearer that matches neither `FG_OPERATOR_TOKEN` nor `API_TOKEN` is answered 401 on every route, reads included,
+and logged as `auth refused` (the token itself is never logged).
+
+- **The token must be in the agent's own environment.** The agent reads it from the shell it was started in, not from
+  Feedback Graph's `.env`. Export it there first, for example `export FG_OPERATOR_TOKEN="$(grep '^FG_OPERATOR_TOKEN=' .env | cut -d= -f2-)"`
+  in the repo folder, then start the agent from that shell.
+- **Codex.** Register the server in `~/.codex/config.toml` with the variable's name, not its value:
+
+  ```toml
+  [mcp_servers.feedback-graph-admin]
+  url = "http://localhost:8787/mcp/admin"
+  bearer_token_env_var = "FG_OPERATOR_TOKEN"
+  ```
+
+  Codex reads `FG_OPERATOR_TOKEN` from its environment when it starts; unset, the server is not found (404) and its
+  tools are missing. `codex exec` needs the same export.
+- **Claude Code.** `claude mcp add --transport http --scope user feedback-graph-admin http://localhost:8787/mcp/admin --header "Authorization: Bearer $FG_OPERATOR_TOKEN"`.
+- **Approvals.** The read tools (`pipeline_status`, `list_projects`, `inbox_list`, `inbox_get`, `lessons_list`,
+  `lesson_get`) say `readOnlyHint: true`, so a client may run them without asking. The decisions do not, and
+  `inbox_decide` and `lesson_decide` also say `destructiveHint: true`.
+- **Lists are paged.** `list_projects`, `inbox_list` and `lessons_list` return 20 compact rows by default (`limit` up to
+  200) with `total`, `more` and a note naming the `offset` of the next page. A row leaves out PR descriptions, diffs and
+  long rules; `inbox_get` and `lesson_get` give one item in full. Every tool's answer is also in `structuredContent`.
+- **Attribution.** Writes made with the token are recorded as `operator:<name>` (the `X-FG-Operator` header, else the
+  MCP client's name) on the item itself (Inbox decisions, lessons, fact relevance, links, uploads) and in Activity,
+  whose entries also say how the write arrived: `details.via` is `operator`, `browser` or `api`.
+
 ## Troubleshooting
 
 | Symptom | Look at |

@@ -127,7 +127,7 @@ export async function buildChatContext(projectKey: string, question: string, his
       const ref = h.lines ? `${h.path}:${h.lines}` : h.path;
       const tag = src.add('code', ref, h.name ?? h.path);
       tags.set(h, tag);
-      const what = h.name ? `${h.symbolKind ?? 'symbol'} ${oneLine(h.name, 120)}${h.exported ? ' (exported)' : ''}` : 'file';
+      const what = h.name ? `${h.symbolKind ?? 'symbol'} ${oneLine(h.name, 120)}${h.exported ? ' (exported)' : ''}` : h.outside ? 'file (outside the code map: no symbols)' : 'file';
       out.push(`${tag} ${code(ref)} ${what} · ${h.usages.length ? `used by: ${listed(h.usages)}${h.dependents > h.usages.length ? ` (${h.dependents} files import it)` : ''}` : 'no file imports it'} · ${h.tests.length ? `tests: ${listed(h.tests, 6)}` : 'no tests found'}`);
     }
   }

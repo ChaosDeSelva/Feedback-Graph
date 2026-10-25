@@ -5,11 +5,19 @@ import type { ReactNode } from 'react';
  * fenced code, inline code, bold and italics. Everything renders as React text, never as HTML,
  * so a transcript cannot inject markup. Anything else stays as written.
  */
-export function Markdown({ text, className = '' }: { text: string; className?: string }) {
-  return <div className={`grid min-w-0 grid-cols-[minmax(0,1fr)] gap-2 [overflow-wrap:anywhere] ${className}`}>{blocks(text)}</div>;
+export function Markdown({ text, className = '', cite }: {
+  text: string;
+  className?: string;
+  /** Where a citation like [S1] links to; unset or null: it stays text. */
+  cite?: (id: string) => string | null;
+}) {
+  return <div className={`grid min-w-0 grid-cols-[minmax(0,1fr)] gap-2 [overflow-wrap:anywhere] ${className}`}>{blocks(text, cite)}</div>;
 }
 
-function blocks(text: string): ReactNode[] {
+type Cite = ((id: string) => string | null) | undefined;
+
+function blocks(text: string, cite?: Cite): ReactNode[] {
+  const inline = (t: string) => inlineOf(t, cite);
   const out: ReactNode[] = [];
   const lines = text.replace(/\r\n?/g, '\n').split('\n');
   let i = 0;
@@ -61,17 +69,20 @@ function blocks(text: string): ReactNode[] {
   return out;
 }
 
-/** `code`, **bold**, *italic* / _italic_. Unmatched markers are left as they are. */
-function inline(text: string): ReactNode[] {
+/** `code`, **bold**, *italic* / _italic_, and [S1] citations when `cite` links them. Unmatched markers are left as they are. */
+function inlineOf(text: string, cite?: Cite): ReactNode[] {
   const out: ReactNode[] = [];
-  const re = /`([^`\n]+)`|\*\*([^\n]+?)\*\*|__([^_\n]+?)__|(?<![\w*])\*([^*\s][^*\n]*?)\*(?![\w*])|(?<![\w_])_([^_\s][^_\n]*?)_(?![\w_])/g;
+  const inline = (t: string) => inlineOf(t, cite);
+  const re = /\[(S\d+)\]|`([^`\n]+)`|\*\*([^\n]+?)\*\*|__([^_\n]+?)__|(?<![\w*])\*([^*\s][^*\n]*?)\*(?![\w*])|(?<![\w_])_([^_\s][^_\n]*?)_(?![\w_])/g;
   let last = 0;
   for (const m of text.matchAll(re)) {
     if (m.index! > last) out.push(text.slice(last, m.index));
     const k = out.length;
-    if (m[1] !== undefined) out.push(<code key={k} className="rounded-[3px] bg-neutral-soft px-1 py-px font-mono text-[0.88em]">{m[1]}</code>);
-    else if (m[2] !== undefined || m[3] !== undefined) out.push(<strong key={k} className="font-semibold">{inline(m[2] ?? m[3])}</strong>);
-    else out.push(<em key={k}>{inline(m[4] ?? m[5])}</em>);
+    const href = m[1] !== undefined ? cite?.(m[1]) : null;
+    if (m[1] !== undefined) out.push(href ? <a key={k} href={href} className="font-mono text-[0.88em] text-accent-text hover:underline">{m[0]}</a> : m[0]);
+    else if (m[2] !== undefined) out.push(<code key={k} className="rounded-[3px] bg-neutral-soft px-1 py-px font-mono text-[0.88em]">{m[2]}</code>);
+    else if (m[3] !== undefined || m[4] !== undefined) out.push(<strong key={k} className="font-semibold">{inline(m[3] ?? m[4])}</strong>);
+    else out.push(<em key={k}>{inline(m[5] ?? m[6])}</em>);
     last = m.index! + m[0].length;
   }
   if (last < text.length) out.push(text.slice(last));
