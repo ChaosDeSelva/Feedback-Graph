@@ -8,6 +8,7 @@ import { PgFactsStore } from './facts.ts';
 import { PgGraphStore } from './graph.ts';
 import { PgInsightsStore } from './insights.ts';
 import { PgKnowledgeStore } from './knowledge.ts';
+import { PgLinksStore } from './links.ts';
 import { migrate } from './migrate.ts';
 import { PgPortabilityStore } from './portability.ts';
 import { PgSelectionStore } from './selection.ts';
@@ -25,6 +26,7 @@ export function postgresStore(db: Db): PostgresStore {
     knowledge: new PgKnowledgeStore(db),
     facts: new PgFactsStore(db),
     docs: new PgDocsStore(db),
+    links: new PgLinksStore(db),
     activity: new PgActivityStore(db),
     insights: new PgInsightsStore(db),
     portability: new PgPortabilityStore(db),

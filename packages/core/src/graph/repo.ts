@@ -62,12 +62,14 @@ export class GraphRepo implements GraphStore {
     return res.records;
   }
 
-  /** Several statements as one transaction: all of them land, or none do. */
-  async runInTransaction(statements: [cypher: string, params: Record<string, unknown>][]): Promise<void> {
+  /** Several statements as one transaction: all of them land, or none do. Returns each statement's records. */
+  async runInTransaction(statements: [cypher: string, params: Record<string, unknown>][]): Promise<NeoRecord[][]> {
     const session = this.driver.session();
     try {
-      await session.executeWrite(async (tx) => {
-        for (const [cypher, params] of statements) await tx.run(cypher, params);
+      return await session.executeWrite(async (tx) => {
+        const out: NeoRecord[][] = [];
+        for (const [cypher, params] of statements) out.push((await tx.run(cypher, params)).records);
+        return out;
       });
     } finally {
       await session.close();

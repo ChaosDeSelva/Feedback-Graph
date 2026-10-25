@@ -95,6 +95,7 @@ const app = createApp(store.graph, {
   insights: store.insights,
   activity,
   docs,
+  links: store.links,
   portability: store.portability,
   codegraph: store.codegraph,
   cloud: {
@@ -120,7 +121,7 @@ const app = createApp(store.graph, {
     projects: async () => (await shown()).keys,
     inScope: async (key: string) => (await shown()).has(key),
   },
-  auth: { token: config.apiToken ?? undefined, publicHosts: config.publicHosts },
+  auth: { token: config.apiToken ?? undefined, publicHosts: config.publicHosts, operator: config.operator ?? undefined },
   system: { version: VERSION, store: store.kind, roots: roots.length, ping: () => store.ping(), worker: () => store.graph.workerStatus(), selection: () => selection.current(), givenUpTurns: () => store.graph.givenUpTurns(),
     // The embedding model always; the local chat model too when the api's check_before_done judge uses it.
     ollama: () => ollamaPing({ url: config.ollama.url, models: [config.ollama.embedModel, ...(judgeLlm.id.startsWith('ollama:') ? [judgeLlm.id.slice(7)] : [])], timeoutMs: 2000 }),
@@ -151,13 +152,14 @@ const app = createApp(store.graph, {
     codegraph: store.codegraph,
     sessions: store.sessions,
     shown,
+    links: store.links,
   },
   log,
 });
 
 // API_LISTEN is 0.0.0.0 inside the container (compose publishes it on API_BIND); otherwise API_BIND, loopback by default.
 const server = serve({ fetch: app.fetch, port: config.port, hostname: config.apiListen });
-log('api listening', { port: config.port, version: VERSION, bind: config.apiBind, auth: config.apiToken ? 'token' : 'none (loopback only)', publicHosts: config.publicHosts, cloudSync: config.cloud ? new URL(config.cloud.url).host : 'off' });
+log('api listening', { port: config.port, version: VERSION, bind: config.apiBind, auth: config.apiToken ? 'token' : 'none (loopback only)', operator: config.operator ? config.operator.allow.join(',') : 'off', publicHosts: config.publicHosts, cloudSync: config.cloud ? new URL(config.cloud.url).host : 'off' });
 if (!config.apiToken) log(`no API_TOKEN set: reachable on ${config.apiBind} only; setting API_BIND to anything but loopback requires API_TOKEN`);
 
 let stopping = false;

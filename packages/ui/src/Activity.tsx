@@ -32,6 +32,12 @@ const KIND_LABEL: Record<ActivityKind, string> = {
   roots_saved: 'project roots saved',
   integration_changed: 'connection changed',
   feedback_synced: 'comments synced',
+  facts_scored: 'facts scored',
+  fact_relevance_set: 'fact relevance set',
+  project_pinned: 'project pinned',
+  links_suggested: 'links suggested',
+  link_decided: 'link decision',
+  doc_read: 'document read',
 };
 
 const KIND_TONE: Partial<Record<ActivityKind, Tone>> = {

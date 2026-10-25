@@ -1,11 +1,14 @@
 import { createHash, timingSafeEqual } from 'node:crypto';
 import type { Context } from 'hono';
+import type { OperatorConfig } from '@fb/core';
 
 export type AuthOpts = {
   /** When set, every /api and /mcp call needs it (Bearer header, or the UI's session cookie). */
   token?: string;
   /** Host names besides localhost the API answers to. Only honoured when a token is set. */
   publicHosts?: string[];
+  /** FG_OPERATOR_TOKEN: as a Bearer it signs in like the token and passes ownerOnly for the verbs in `allow`. */
+  operator?: OperatorConfig;
 };
 
 export const SESSION_COOKIE = 'fg_session';

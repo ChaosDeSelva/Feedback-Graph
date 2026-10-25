@@ -1,6 +1,6 @@
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { ProviderUnavailableError, type ActivityInput, type Classification, type HumanTurn, type ParsedSession, type Project } from '@fb/core';
+import { ModelTimeoutError, ProviderUnavailableError, type ActivityInput, type Classification, type HumanTurn, type ParsedSession, type Project } from '@fb/core';
 import { describe, expect, test } from 'vitest';
 import { runCycle, type CycleDeps } from './cycle.ts';
 import { FileState } from './state.ts';
@@ -170,6 +170,43 @@ test('an unavailable model stops classifying for the cycle without charging any 
   // Prefilter misses need no model, so they are still labelled neutral.
   expect(f.saved.find((s) => s.uuid === 'u2')).toMatchObject({ c: { label: 'neutral' } });
   expect(f.saved.some((s) => s.uuid.startsWith('p') || s.uuid === 'u1')).toBe(false);
+});
+
+test('a classification that timed out is charged to that turn and the batch goes on, so one turn cannot stall the queue', async () => {
+  const many = Array.from({ length: 3 }, (_, i) => [
+    line({ type: 'assistant', uuid: `a${i}`, timestamp: `2026-10-01T11:0${i}:00Z`, message: { content: [{ type: 'text', text: 'done' }] } }),
+    line({ type: 'user', uuid: `p${i}`, timestamp: `2026-10-01T11:0${i}:30Z`, message: { content: 'this is still broken' } }),
+  ]).flat();
+  const logged: [string, object | undefined][] = [];
+  const f = fakes({
+    log: (m, x) => { logged.push([m, x]); },
+    classify: async (t) => {
+      f.classifyCalls.push(t.uuid);
+      if (t.uuid === 'u1') throw new ModelTimeoutError('Ollama (gemma4) did not answer within 120 s');
+      return { label: 'pushback', confidence: 0.8, summary: 's', signals: [] };
+    },
+  });
+  f.deps.readFile = async () => [transcript, ...many].join('\n');
+  const r = await runCycle(f.deps);
+  expect(f.failures.get('u1')).toBe(1);
+  expect(f.classifyCalls).toEqual(['u1', 'p0', 'p1', 'p2']);
+  expect(r.classifierUnavailable).toBeUndefined();
+  expect(r.candidates).toBe(3);
+  expect(logged.find(([m]) => m === 'classification failed')?.[1]).toMatchObject({ turn: 'u1', error: expect.stringMatching(/did not answer within 120 s/) });
+});
+
+test('while a scan holds the model, a classification that timed out charges nothing and classifying waits for the next cycle', async () => {
+  const f = fakes({
+    modelBusy: () => true,
+    classify: async (t) => {
+      f.classifyCalls.push(t.uuid);
+      throw new ModelTimeoutError('Ollama (gemma4) did not answer within 120 s');
+    },
+  });
+  const r = await runCycle(f.deps);
+  expect(f.failures.size).toBe(0);
+  expect(f.classifyCalls).toEqual(['u1']);
+  expect(r.classifierUnavailable).toMatch(/busy with a scan.*did not answer/);
 });
 
 test('a file that fails to ingest is retried when it changes, not every cycle', async () => {
@@ -361,6 +398,27 @@ describe('Codex sessions', () => {
     expect([...f.turns.values()].every((t) => t.projectKey === 'demo-shop')).toBe(true);
     expect(f.turns.size).toBeGreaterThan(1);
     expect(f.saved.length).toBeGreaterThan(0); // classified like any Claude Code turn
+  });
+
+  test('a Codex copy of a conversation already read from Claude Code (an import) is skipped; its own conversations are not', async () => {
+    const { parseCodexSession } = await import('./ingest/codex.ts');
+    const [codexSession] = parseCodexSession(rollout, codexFile.path);
+    // The same conversation as Claude Code wrote it: same human turns, its own ids and layout.
+    const claude = codexSession.turns.map((t, i) => line({ type: 'user', uuid: `cc${i}`, cwd: '/work/demo-shop', timestamp: t.ts, message: { content: t.text } })).join('\n');
+    const logs: string[] = [];
+    const f = codexFakes(rollout, {
+      listFiles: async () => [{ path: '/t/demo-shop/cc.jsonl', size: 10, mtimeMs: 1, source: 'claude' as const }, codexFile],
+      readFile: async () => claude,
+      log: (msg) => void logs.push(msg),
+    });
+    await runCycle(f.deps);
+    expect(f.sessions.map((s) => s.source)).toEqual(['claude']);
+    expect(logs).toContain('codex session skipped: a copy of a Claude Code conversation');
+
+    // A conversation only Codex has is ingested as before.
+    const g = codexFakes();
+    await runCycle(g.deps);
+    expect(g.sessions.map((s) => s.source)).toEqual(['codex']);
   });
 
   test('a Claude Code transcript is recorded with source claude', async () => {

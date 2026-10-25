@@ -6,21 +6,39 @@ import { basename } from 'node:path';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { ollamaChatJson } from '../ollama.ts';
+import { ollamaChatJson, ollamaTuning } from '../ollama.ts';
+import { extractJsonAnswer, ModelOutputError } from './json.ts';
 import { inEmptyFolder } from './promptOnly.ts';
 
 /**
  * One structured-output request. `cwd` lets agentic providers read the repo themselves; without one they run in a fresh
  * empty folder (never the process's own). Prompt-only jobs go through askPromptOnly (promptOnly.ts).
  */
-export type JsonTask = { system: string; user: string; schema: object; cwd?: string; timeoutMs?: number };
+export type JsonTask = { system: string; user: string; schema: object; cwd?: string; timeoutMs?: number; images?: TaskImage[] };
+
+/** An image sent with a request (an uploaded screenshot, diagram or mock), base64 without a data: prefix. */
+export type TaskImage = { mediaType: ImageMediaType; data: string };
+export const IMAGE_MEDIA_TYPES = ['image/png', 'image/jpeg', 'image/webp', 'image/gif'] as const;
+export type ImageMediaType = (typeof IMAGE_MEDIA_TYPES)[number];
+const IMAGE_EXT: Record<ImageMediaType, string> = { 'image/png': 'png', 'image/jpeg': 'jpg', 'image/webp': 'webp', 'image/gif': 'gif' };
 
 export interface LlmProvider {
   /** The spec string it was built from, e.g. `ollama:gemma4`. */
   id: string;
   /** True when the provider can explore `cwd` with read-only tools (Claude Code, Codex). */
   agentic: boolean;
+  /** True when it can read `images`; one that cannot refuses a task that has any. Absent: false. */
+  vision?: boolean;
   json(task: JsonTask): Promise<unknown>;
+}
+
+/** A provider that cannot see refuses images rather than answering as if there were none. */
+function blind(p: LlmProvider): LlmProvider {
+  return {
+    ...p,
+    vision: false,
+    json: (t) => (t.images?.length ? Promise.reject(new Error(`${p.id} cannot read images: choose a model with vision for this job (DOCS_LLM)`)) : p.json(t)),
+  };
 }
 
 export type { Exec, ExecResult } from './exec.ts';
@@ -97,21 +115,25 @@ function need(env: ProviderEnv, key: string): string {
   return v;
 }
 
-function extractJson(text: string): unknown {
-  const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/);
-  return JSON.parse(fenced ? fenced[1] : text.slice(text.indexOf('{'), text.lastIndexOf('}') + 1));
-}
-
 function cliPrompt(t: JsonTask): string {
   return `${t.system}\n\n${t.user}\n\nReturn only the JSON object described by the schema.`;
 }
 
 function ollama(id: string, model: string, env: ProviderEnv, o: ProviderOpts): LlmProvider {
   const url = env.OLLAMA_URL ?? 'http://host.docker.internal:11434';
+  const tune = ollamaTuning(env);
   return {
     id,
     agentic: false,
-    json: (t) => ollamaChatJson({ url, model, system: t.system, user: t.user, schema: t.schema, fetchImpl: o.fetchImpl, timeoutMs: t.timeoutMs }),
+    vision: true,
+    json: (t) => ollamaChatJson({
+      url, model, system: t.system, user: t.user, schema: t.schema, fetchImpl: o.fetchImpl,
+      // OLLAMA_TIMEOUT_SECONDS, when set, is the limit for every Ollama call; otherwise each job's own.
+      timeoutMs: tune.timeoutMs ?? t.timeoutMs,
+      numPredict: tune.numPredict,
+      repeatPenalty: tune.repeatPenalty,
+      images: t.images?.map((i) => i.data),
+    }),
   };
 }
 
@@ -119,6 +141,7 @@ function openaiCompatible(id: string, model: string, baseUrl: string, key: strin
   return {
     id,
     agentic: false,
+    vision: true,
     async json(t) {
       const res = await (o.fetchImpl ?? fetch)(`${baseUrl.replace(/\/+$/, '')}/chat/completions`, {
         method: 'POST',
@@ -127,7 +150,12 @@ function openaiCompatible(id: string, model: string, baseUrl: string, key: strin
           model,
           messages: [
             { role: 'system', content: t.system },
-            { role: 'user', content: t.user },
+            {
+              role: 'user',
+              content: t.images?.length
+                ? [{ type: 'text', text: t.user }, ...t.images.map((i) => ({ type: 'image_url', image_url: { url: `data:${i.mediaType};base64,${i.data}` } }))]
+                : t.user,
+            },
           ],
           response_format: { type: 'json_schema', json_schema: { name: 'result', strict: true, schema: strictSchema(t.schema) } },
         }),
@@ -135,7 +163,7 @@ function openaiCompatible(id: string, model: string, baseUrl: string, key: strin
       });
       if (!res.ok) throw new Error(`${id} ${res.status}: ${(await res.text()).slice(0, 500)}`);
       const body = (await res.json()) as { choices?: { message?: { content?: string } }[] };
-      return extractJson(body.choices?.[0]?.message?.content ?? '');
+      return extractJsonAnswer(body.choices?.[0]?.message?.content ?? '');
     },
   };
 }
@@ -144,6 +172,7 @@ function anthropic(id: string, model: string, key: string, o: ProviderOpts): Llm
   return {
     id,
     agentic: false,
+    vision: true,
     async json(t) {
       const res = await (o.fetchImpl ?? fetch)('https://api.anthropic.com/v1/messages', {
         method: 'POST',
@@ -152,7 +181,12 @@ function anthropic(id: string, model: string, key: string, o: ProviderOpts): Llm
           model,
           max_tokens: 8192,
           system: t.system,
-          messages: [{ role: 'user', content: t.user }],
+          messages: [{
+            role: 'user',
+            content: t.images?.length
+              ? [...t.images.map((i) => ({ type: 'image', source: { type: 'base64', media_type: i.mediaType, data: i.data } })), { type: 'text', text: t.user }]
+              : t.user,
+          }],
           tools: [{ name: 'respond', description: 'Return the result', input_schema: t.schema }],
           tool_choice: { type: 'tool', name: 'respond' },
         }),
@@ -171,15 +205,32 @@ function claudeCli(id: string, model: string | undefined, token: string, o: Prov
   return {
     id,
     agentic: true,
+    vision: true,
     async json(t) {
       const args = claudeArgs(t.schema, model);
       // Subscription only: no ANTHROPIC_API_KEY, so it never falls back to paid API billing.
       const env = cliEnv({ CLAUDE_CODE_OAUTH_TOKEN: token });
-      const r = await inTaskFolder(t, (cwd) => (o.exec ?? execCommand)('claude', args, { cwd, stdin: cliPrompt(t), env, timeoutMs: t.timeoutMs ?? DEFAULT_TIMEOUT }));
+      const ask = (cwd: string, stdin: string) => (o.exec ?? execCommand)('claude', args, { cwd, stdin, env, timeoutMs: t.timeoutMs ?? DEFAULT_TIMEOUT });
+      // Images go in as files it opens with Read, in a fresh folder holding only them: never written into a repo.
+      const r = t.images?.length
+        ? await inEmptyFolder(async (cwd) => {
+            const names = await Promise.all(t.images!.map(async (img, i) => {
+              const name = `image-${i + 1}.${IMAGE_EXT[img.mediaType]}`;
+              await writeFile(join(cwd, name), Buffer.from(img.data, 'base64'));
+              return name;
+            }));
+            return ask(cwd, `${cliPrompt(t)}\n\nThe image${names.length === 1 ? ' is' : 's are'} ${names.join(', ')} in your current directory: open ${names.length === 1 ? 'it' : 'each'} with the Read tool before answering.`);
+          }, 'fb-image-')
+        : await inTaskFolder(t, (cwd) => ask(cwd, cliPrompt(t)));
       if (r.code !== 0) throw new Error(`claude exit ${r.code}: ${(r.stderr || r.stdout).slice(0, 500)}`);
-      const out = JSON.parse(r.stdout) as { is_error?: boolean; result?: string; structured_output?: unknown };
+      let out: { is_error?: boolean; result?: string; structured_output?: unknown };
+      try {
+        out = JSON.parse(r.stdout) as typeof out;
+      } catch {
+        throw new ModelOutputError('claude printed no JSON result', r.stdout);
+      }
       if (out.is_error) throw new Error(`claude error: ${String(out.result).slice(0, 500)}`);
-      return out.structured_output ?? extractJson(out.result ?? '');
+      return out.structured_output ?? extractJsonAnswer(out.result ?? '');
     },
   };
 }
@@ -216,7 +267,7 @@ function codexCli(id: string, model: string | undefined, o: ProviderOpts): LlmPr
         const args = codexArgs({ dir: mirror.dir, schemaPath, outPath, model });
         const r = await (o.exec ?? execCommand)('codex', args, { cwd: mirror.dir, stdin: cliPrompt(t), env: cliEnv({ CODEX_HOME: process.env.CODEX_HOME }), timeoutMs: t.timeoutMs ?? DEFAULT_TIMEOUT });
         if (r.code !== 0) throw new Error(`codex exit ${r.code}: ${(r.stderr || r.stdout).slice(-500)}`);
-        return extractJson(await readFile(outPath, 'utf8'));
+        return extractJsonAnswer(await readFile(outPath, 'utf8'));
       } finally {
         await rm(dir, { recursive: true, force: true });
         await mirror.dispose();
@@ -244,7 +295,7 @@ function codexRunnerCli(id: string, model: string | undefined, url: string, scra
         });
         if (r.code !== 0) throw new Error(`codex exit ${r.code}: ${(r.stderr || r.stdout).slice(-500)}`);
         if (r.output === null) throw new Error('codex exit 0: it wrote no answer');
-        return extractJson(r.output);
+        return extractJsonAnswer(r.output);
       } finally {
         await mirror.dispose();
       }
@@ -317,11 +368,11 @@ export function makeProvider(spec: string, env: ProviderEnv, o: ProviderOpts = {
     case 'claude-cli':
       return claudeCli(spec, model, need(env, 'CLAUDE_CODE_OAUTH_TOKEN'), o);
     case 'codex-cli':
-      if (env.CODEX_RUNNER_URL) return codexRunnerCli(spec, model, env.CODEX_RUNNER_URL, env.CODEX_RUNNER_SCRATCH || DEFAULT_RUNNER_SCRATCH, o);
+      if (env.CODEX_RUNNER_URL) return blind(codexRunnerCli(spec, model, env.CODEX_RUNNER_URL, env.CODEX_RUNNER_SCRATCH || DEFAULT_RUNNER_SCRATCH, o));
       if (env.ALLOW_UNCONFINED_CODEX !== '1') throw new Error(CODEX_UNCONFINED);
-      return codexCli(spec, model, o);
+      return blind(codexCli(spec, model, o));
     case 'jev':
-      return jev(spec, model ?? 'jev-latest', need(env, 'TYPESAFE_API_KEY'), o);
+      return blind(jev(spec, model ?? 'jev-latest', need(env, 'TYPESAFE_API_KEY'), o));
     default:
       throw new Error(`unknown provider "${kind}" in "${spec}"`);
   }

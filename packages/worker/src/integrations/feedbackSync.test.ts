@@ -177,6 +177,14 @@ describe('linkWorkSessions', () => {
     expect(await linkWorkSessions(graph([ws('b', 'main'), ws('c', 'x')]), 'shop', 'feat', NOW.toISOString())).toEqual([]);
   });
 
+  test('the one session in the window is not the work when it ran on another feature branch', async () => {
+    expect(await linkWorkSessions(graph([ws('other', 'feat/billing')]), 'shop', 'feat/cart', NOW.toISOString())).toEqual([]);
+    // Unknown, the default branch, or no branch to compare with: it may have been the work.
+    expect(await linkWorkSessions(graph([ws('u', null)]), 'shop', 'feat/cart', NOW.toISOString())).toEqual(['u']);
+    expect(await linkWorkSessions(graph([ws('m', 'master')]), 'shop', 'feat/cart', NOW.toISOString())).toEqual(['m']);
+    expect(await linkWorkSessions(graph([ws('o', 'feat/billing')]), 'shop', null, NOW.toISOString())).toEqual(['o']);
+  });
+
   test('a session that only read (a security review on the branch) is never linked; one that only committed is', async () => {
     expect(await linkWorkSessions(graph([ws('review', 'feat', 0, 0)]), 'shop', 'feat', NOW.toISOString())).toEqual([]);
     expect(await linkWorkSessions(graph([ws('review', 'feat', 0, 0), ws('coder', 'main')]), 'shop', 'feat', NOW.toISOString())).toEqual(['coder']);
@@ -198,4 +206,49 @@ test('a PR whose branch only had a review session syncs with no work session lin
   const s = setup({ sessions: [{ id: 'review', source: 'claude', gitBranch: 'feat/cart', cwd: '/x', startedAt: null, lastActivityAt: null, edits: 0, commits: 0 }] });
   await syncExternalFeedback(s.deps);
   expect(s.threads[0].items[0].external.linkedSessionIds).toEqual([]);
+});
+
+test('a PR comment says who wrote it: the PR author, whether it is a thread reply, the review verdict and the author kind', () => {
+  const base = pr(7, [{ id: '1', createdAt: '2026-10-22T10:00:00Z', path: 'src/cart.ts' }]);
+  const comments = [
+    { ...base.comments[0], author: 'dev', body: 'Fixed in 3f2a9c1', inReplyTo: '0', reviewState: 'COMMENTED' as const },
+    { ...base.comments[0], id: '2', author: 'lead', body: '[P2] totals ignore discounts', reviewState: 'APPROVED' as const },
+    { ...base.comments[0], id: '3', author: 'docs-check', body: 'Docs out of date (HIGH)' },
+  ];
+  const items = prThread({ ...base, comments }, 0, [], { botLogins: ['docs-check'] }).items.map((i) => i.external);
+  expect(items[0]).toMatchObject({ threadAuthor: 'dev', isReply: true, reviewState: 'COMMENTED', authorKind: 'human' });
+  expect(items[1]).toMatchObject({ isReply: false, reviewState: 'APPROVED', authorKind: 'agent' });
+  expect(items[2]).toMatchObject({ authorKind: 'bot', reviewState: null });
+});
+
+test('a Linear comment is labelled by author kind too', async () => {
+  const s = setup({
+    env: { LINEAR_API_KEY: 'lin' },
+    linear: async () => [{
+      id: 'c1', author: 'jo', body: '[claude] the migration is missing', url: 'u', createdAt: '2026-10-21T00:00:00Z',
+      issue: { id: 'i1', identifier: 'ENG-1', title: 'T', url: 'u', branch: null, description: '', state: null, priority: null, labels: [], assignee: null },
+    }],
+  });
+  await s.integrations.setLink('shop', { linearTeamId: 'team-1', linearTeamName: 'Web' });
+  await syncExternalFeedback(s.deps);
+  expect(s.threads.flatMap((t) => t.items.map((i) => i.external.authorKind))).toEqual(['agent']);
+});
+
+test('the configured bot and agent logins reach the threads', async () => {
+  const s = setup({ prs: async () => [{ ...pr(7, [{ id: '1', createdAt: '2026-10-22T10:00:00Z' }]), comments: [{ ...pr(7, [{ id: '1', createdAt: '2026-10-22T10:00:00Z' }]).comments[0], author: 'Review-Agent' }] }] });
+  await syncExternalFeedback({ ...s.deps, agentLogins: ['review-agent'] });
+  expect(s.threads[0].items[0].external.authorKind).toBe('agent');
+});
+
+test('a reply says whose comment it answers, so the PR author replying in their own thread is not taken for an answer to a reviewer', () => {
+  const base = pr(8, [{ id: '1', createdAt: '2026-10-22T10:00:00Z', path: 'src/cart.ts' }]);
+  const comments = [
+    { ...base.comments[0], id: '10', author: 'dev', body: 'This still skips the tenant filter.' },
+    { ...base.comments[0], id: '11', author: 'dev', body: 'And the test is missing, again.', inReplyTo: '10' },
+    { ...base.comments[0], id: '12', author: 'lead', body: 'totals ignore discounts' },
+    { ...base.comments[0], id: '13', author: 'dev', body: 'good catch, see the next commit', inReplyTo: '12' },
+    { ...base.comments[0], id: '14', author: 'dev', body: 'answering something older', inReplyTo: '999' },
+  ];
+  const items = prThread({ ...base, author: 'dev', comments }, 0, []).items.map((i) => i.external);
+  expect(items.map((e) => e.repliesTo ?? null)).toEqual([null, 'dev', null, 'lead', null]);
 });

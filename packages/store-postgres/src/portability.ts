@@ -18,6 +18,8 @@ const DELETES: string[] = [
   `DELETE FROM activity WHERE project_key = $1`,
   `DELETE FROM predone_checks WHERE project_key = $1`,
   `DELETE FROM chunks WHERE project_key = $1`,
+  `DELETE FROM facts WHERE project_key = $1 AND doc_id IS NOT NULL`,
+  `DELETE FROM doc_blobs WHERE project_key = $1`,
   `DELETE FROM docs WHERE project_key = $1`,
   `DELETE FROM facts WHERE project_key = $1`,
   `DELETE FROM code_tests WHERE project_key = $1`,
@@ -39,6 +41,7 @@ const DELETES: string[] = [
   `DELETE FROM session_files WHERE project_key = $1`,
   `DELETE FROM sessions WHERE project_key = $1`,
   `DELETE FROM sync_cursors WHERE right(key, length($1) + 1) = ':' || $1`,
+  `DELETE FROM project_links WHERE a = $1 OR b = $1`,
   `DELETE FROM projects WHERE key = $1`,
 ];
 
@@ -79,7 +82,7 @@ export class PgPortabilityStore implements PortabilityStore {
         ),
         await q(
           `SELECT path, lines, kind, statement, why, confidence, source, created_at, project_key
-           FROM facts WHERE current AND ($1::text IS NULL OR project_key = $1)
+           FROM facts WHERE current AND doc_id IS NULL AND ($1::text IS NULL OR project_key = $1)
            ORDER BY project_key COLLATE "C", path COLLATE "C", statement COLLATE "C", id COLLATE "C"`,
           [key],
         ),

@@ -269,6 +269,22 @@ test('an item the agent reported says so, with its words, and whether the detect
   expect(screen.getByText(/^reported by the agent$/i)).toBeTruthy();
 });
 
+test('pending items are listed in the order they arrived, then by id, whatever order the API sends them in', async () => {
+  const at = (id: string, createdAt: string, ts: string) => ({ ...cand(id, `miss ${id}`), createdAt, turnTs: ts });
+  // The API orders by the turn's own time; a comment synced later can carry an older time and land mid-list.
+  const sent = [at('b2', '2026-10-02T09:00:00Z', '2026-10-01T00:00:00Z'), at('a9', '2026-10-01T09:00:00Z', '2026-10-03T00:00:00Z'), at('b1', '2026-10-02T09:00:00Z', '2026-09-01T00:00:00Z')];
+  vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+    if (url.startsWith('/api/candidates?')) return Response.json(sent);
+    const m = url.match(/\/api\/candidates\/(\w+)$/);
+    if (m) return Response.json(detail(m[1]));
+    return Response.json([]);
+  }));
+  render(<Inbox />);
+  await screen.findByText('miss a9');
+  const order = screen.getAllByText(/^miss /).map((e) => e.textContent);
+  expect(order).toEqual(['miss a9', 'miss b1', 'miss b2']);
+});
+
 test('an item only the detector flagged has no agent note', async () => {
   render(<Inbox />);
   await screen.findByText('turn text c1');

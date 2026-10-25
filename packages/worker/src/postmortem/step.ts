@@ -1,4 +1,4 @@
-import { providerUnavailableReason, redactSecrets, type ActivityStore, type KnowledgeStore, type PostMortem, type PostMortemInput } from '@fb/core';
+import { modelTimeoutReason, providerUnavailableReason, redactSecrets, type ActivityStore, type KnowledgeStore, type PostMortem, type PostMortemInput } from '@fb/core';
 import type { PostMortemTrace } from './postmortem.ts';
 
 export type PostmortemStepDeps = {
@@ -8,6 +8,8 @@ export type PostmortemStepDeps = {
   batch: number;
   log?: (msg: string, extra?: object) => void;
   activity?: Pick<ActivityStore, 'record'>;
+  /** True while a scan is using a model: a timeout then means a queue behind it, not this feedback's fault. */
+  modelBusy?: () => boolean;
 };
 
 export function embedTexts(pm: PostMortem): { miss: string; lesson: string } {
@@ -45,12 +47,15 @@ export async function runPostmortems(deps: PostmortemStepDeps): Promise<{ done: 
           lesson: { title: pm.lesson.title, rule: pm.lesson.rule, appliesWhen: pm.lesson.appliesWhen, scope: pm.lesson.scope, paths: pm.lesson.paths },
           contextGiven: trace && { standing: trace.standing, facts: trace.facts, agentic: trace.agentic },
           contextFound: (pm.contextItems ?? []).map((c) => ({ kind: c.kind, ref: c.ref, why: c.why, wasAvailable: c.wasAvailable })),
+          // What the lesson check narrowed or flagged (lessonCheck.ts), for the owner deciding on the lesson.
+          lessonChecks: trace?.lessonFlags ?? [],
         },
         targets: [input.feedbackId, `miss:${input.feedbackId}`, `lesson:${input.feedbackId}`],
       });
       deps.log?.('postmortem saved', { feedbackId: input.feedbackId, cause: pm.cause });
     } catch (err) {
-      const unavailable = providerUnavailableReason(err);
+      const timeout = modelTimeoutReason(err);
+      const unavailable = providerUnavailableReason(err) ?? (timeout && deps.modelBusy?.() ? `the model is busy with a scan: ${timeout}` : null);
       if (unavailable) {
         deps.log?.('postmortem model unavailable, pausing until next cycle', { feedbackId: input.feedbackId, reason: unavailable });
         return { done, failed, unavailable };

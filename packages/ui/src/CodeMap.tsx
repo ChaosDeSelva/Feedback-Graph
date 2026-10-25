@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
-import { api, type CodeMapReport, type Hotspot, type ModuleContext } from './api.ts';
+import { api, type CodeMapMeta, type CodeMapReport, type Hotspot, type ModuleContext } from './api.ts';
 import { inboxHref, lessonHref } from './links.ts';
 import { Button } from './ui/controls.tsx';
 import { Alert, Badge, Card, CauseBadge, EmptyState, plural, SectionLabel, SkeletonDetail, SkeletonList, StatGrid, StatTile, tableClass, tdClass, thClass } from './ui/display.tsx';
@@ -13,8 +13,14 @@ const HINT: Record<SortKey, string> = {
   churn: 'commits touching it in the last 90 days',
   misses: 'confirmed misses whose session edited it',
   dependents: 'files that import it',
-  score: '4 × misses + log2(1 + churn) + log2(1 + dependents)',
+  score: '4 × misses + log2(1 + churn) + log2(1 + dependents); docs and config files score 0 until a miss touches them',
 };
+
+/** "400 of 10,290 files" when the map is capped (SCAN_MAX_FILES), else null. */
+export function mapCapNote(meta: CodeMapMeta | null | undefined): string | null {
+  if (!meta || meta.candidates == null || meta.candidates <= meta.stats.files) return null;
+  return `${meta.stats.files.toLocaleString()} of ${meta.candidates.toLocaleString()} files`;
+}
 /** Names read A to Z; numbers read biggest first. */
 const defaultSort = (key: SortKey): Sort => ({ key, desc: key !== 'path' });
 const ROWS = 25;
@@ -56,6 +62,7 @@ export function CodeMap({ projectKey }: { projectKey: string }) {
   const sortBy = (key: SortKey) => setSort((s) => (s.key === key ? { key, desc: !s.desc } : defaultSort(key)));
 
   const meta = report?.meta;
+  const cappedAt = mapCapNote(meta);
   return (
     <Card title="Code map" bodyClass="grid gap-3 p-3">
       {error && <Alert>{error}</Alert>}
@@ -68,11 +75,21 @@ export function CodeMap({ projectKey }: { projectKey: string }) {
       ) : (
         <>
           <StatGrid className="grid-cols-2 sm:grid-cols-4">
-            <StatTile label="files" value={meta.stats.files} hint="mapped source files" />
+            <StatTile
+              label="files"
+              value={cappedAt ? <span>{meta.stats.files.toLocaleString()} <span className="text-[13px] font-normal text-muted">of {meta.candidates!.toLocaleString()}</span></span> : meta.stats.files}
+              hint={cappedAt ? 'mapped, of the files worth mapping' : 'mapped source files'}
+            />
             <StatTile label="symbols" value={meta.stats.symbols} hint="functions, classes, types…" />
             <StatTile label="edges" value={meta.stats.imports + meta.stats.tests} hint={`${meta.stats.imports} imports · ${meta.stats.tests} test links`} />
             <StatTile label="last built" value={<span className="text-[15px]">{new Date(meta.builtAt).toLocaleString()}</span>} hint="rebuilt when the repo changes" />
           </StatGrid>
+          {cappedAt && (
+            <p role="note" className="rounded-md border border-line bg-sunken px-3 py-2 text-xs text-muted">
+              Showing {cappedAt}: the map is capped, keeping source and the files your sessions edited first. Files past the cap have no
+              hotspot, module panel or impact. To map more, raise SCAN_MAX_FILES (unset, it is 40% of the files, between 400 and 4,000).
+            </p>
+          )}
 
           <div className="grid gap-1.5">
             <div className="flex flex-wrap items-baseline justify-between gap-2">
@@ -185,7 +202,7 @@ export function ModulePanel({ projectKey, path, onOpen, onClose, narrow = false 
         <SkeletonDetail />
       ) : (
         <div className={`grid gap-3 ${narrow ? '' : 'md:grid-cols-2'}`}>
-          <Part title="What it is" wide={!narrow} count={m.facts.length} empty="No facts yet: Scan the project to have a model read this file.">
+          <Part title="What it is" wide={!narrow} count={m.facts.length} empty="No scan fact cites this file. A scan's facts are filed under the files they cite; project-wide ones are on the Projects page.">
             {m.facts.map((f) => (
               <li key={f.id} className="flex flex-wrap items-baseline gap-x-2">
                 <Badge>{f.kind.replace('_', ' ')}</Badge>

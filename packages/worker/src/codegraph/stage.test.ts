@@ -4,8 +4,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { ActivityInput, CodeMapMeta, CodeMapWrite, StoredCodeMap } from '@fb/core';
 import { afterEach, expect, test } from 'vitest';
-import { MapStage, repoFingerprint, type MapStageDeps } from './stage.ts';
-import type { CodeMap } from './types.ts';
+import { gitStatusTimeoutMs, MapStage, repoFingerprint, type MapStageDeps } from './stage.ts';
+import type { BuildOpts, CodeMap } from './types.ts';
 
 const dirs: string[] = [];
 afterEach(() => {
@@ -51,7 +51,33 @@ test('repoFingerprint never takes git locks (the repo is a read-only mount) and 
   expect(await repoFingerprint('/repo', 100, { exec, log: (m, e) => logged.push([m, e]) })).toBeNull();
   for (const a of calls) expect(a.indexOf('--no-optional-locks')).toBeGreaterThanOrEqual(0);
   for (const a of calls) expect(a.indexOf('--no-optional-locks')).toBeLessThan(a.indexOf('-C'));
-  expect(logged).toEqual([['git status timed out', expect.objectContaining({ repoPath: '/repo' })]]);
+  expect(logged).toEqual([
+    ['git status timed out', expect.objectContaining({ repoPath: '/repo' })],
+    ['git status timed out', expect.objectContaining({ repoPath: '/repo', untracked: 'no' })],
+  ]);
+});
+
+test('a git status that times out is tried once more without untracked files (the slow part on a big tree)', async () => {
+  const timeouts: (number | undefined)[] = [];
+  const timeout = Object.assign(new Error('Command failed'), { killed: true, signal: 'SIGTERM' });
+  const exec = async (args: string[], timeoutMs?: number) => {
+    if (args.includes('--show-toplevel')) return '/repo\n';
+    if (args.includes('status')) {
+      timeouts.push(timeoutMs);
+      if (args.includes('--untracked-files=normal')) throw timeout;
+      return '';
+    }
+    return 'abc\n';
+  };
+  const fp = await repoFingerprint('/repo', 100, { exec, timeoutMs: 90_000 });
+  expect(fp).toMatch(/^[0-9a-f]{64}$/);
+  expect(timeouts).toEqual([90_000, 90_000]);
+});
+
+test('the git status timeout grows with the repo: 30 s, plus 10 ms a file, at most 5 minutes', () => {
+  expect(gitStatusTimeoutMs(0)).toBe(30_000);
+  expect(gitStatusTimeoutMs(10_000)).toBe(130_000);
+  expect(gitStatusTimeoutMs(1_000_000)).toBe(300_000);
 });
 
 const map: CodeMap = {
@@ -73,12 +99,12 @@ function fakes(over: Partial<MapStageDeps> = {}) {
   let fp: string | null = 'fp1';
   const deps: MapStageDeps = {
     store: {
-      codeMapMeta: async (): Promise<CodeMapMeta | null> => stored && { fingerprint: stored.fingerprint, builtAt: stored.builtAt, stats: stored.stats },
+      codeMapMeta: async (): Promise<CodeMapMeta | null> => stored && { fingerprint: stored.fingerprint, builtAt: stored.builtAt, stats: stored.stats, candidates: stored.write.candidates ?? null },
       codeMap: async () => stored,
       replaceCodeMap: async (_key, w) => {
         writes.push(w);
         const stats = { files: w.files.length, symbols: w.symbols.length, imports: w.imports.length, tests: w.tests.length };
-        stored = { fingerprint: w.fingerprint, builtAt: 't', stats, files: w.files, symbols: w.symbols, imports: w.imports, write: w };
+        stored = { fingerprint: w.fingerprint, builtAt: 't', stats, candidates: w.candidates ?? null, files: w.files, symbols: w.symbols, imports: w.imports, write: w };
         return stats;
       },
     },
@@ -117,6 +143,32 @@ test('a first pass maps each selected project, with test links and churn, and lo
     why: 'first map of this project',
     details: expect.objectContaining({ files: 2, symbols: 1, imports: 1, tests: 1, durationMs: expect.any(Number), incremental: false }),
   })]);
+});
+
+test('a capped map says so: candidates are stored and logged, and files sessions edited are kept first', async () => {
+  const opts: BuildOpts[] = [];
+  const logged: [string, object | undefined][] = [];
+  const f = fakes({
+    build: async (_repo, o) => { opts.push(o); return { ...map, candidates: 10_290 }; },
+    editedPaths: async (key) => (key === 'demo' ? ['src/webapp/page.tsx'] : []),
+    maxFiles: null,
+    log: (m, e) => logged.push([m, e]),
+  });
+  await new MapStage(f.deps).pass();
+  expect(opts[0]).toMatchObject({ maxFiles: null, priority: ['src/webapp/page.tsx'] });
+  expect(f.writes[0].candidates).toBe(10_290);
+  expect(logged).toContainEqual(['code map capped', { project: 'demo', mapped: 2, totalCandidates: 10_290 }]);
+  expect(f.activity[0].subject).toBe('code map built: 2 of 10290 files (capped), 1 symbol, 1 import edge, 1 test link');
+  expect(f.activity[0].details).toMatchObject({ candidates: 10_290 });
+});
+
+test('the fingerprint is given a git status timeout that grows with the last map', async () => {
+  const seen: (number | undefined)[] = [];
+  const f = fakes({ fingerprint: async (_r, _m, o) => { seen.push(o?.timeoutMs); return 'fp1'; } });
+  const stage = new MapStage(f.deps);
+  await stage.mapProject({ key: 'demo', repoPath: '/vibe/demo' }, null);
+  await stage.mapProject({ key: 'demo', repoPath: '/vibe/demo' }, null);
+  expect(seen).toEqual([gitStatusTimeoutMs(0), gitStatusTimeoutMs(2)]);
 });
 
 test('an unchanged repo is not rebuilt; a changed one is, incrementally, but not more often than the interval', async () => {

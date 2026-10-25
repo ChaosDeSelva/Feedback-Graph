@@ -1,5 +1,5 @@
 import { expect, test } from 'vitest';
-import { ConfigError, loadConfig, redactUrl } from './config.ts';
+import { ConfigError, loadConfig, OPERATOR_VERBS, redactUrl } from './config.ts';
 
 const base = { NEO4J_PASSWORD: 'pw', PROJECT_ROOTS: '/vibe,/examples', HOST_PROJECT_ROOTS: '/Users/a/Vibe,/Users/a/fb/examples' };
 
@@ -13,6 +13,24 @@ test('defaults fill in everything optional', () => {
   expect(c.turnRetentionDays).toBeNull();
   expect(c.apiToken).toBeNull();
   expect(c.codexSessionsDir).toBe('/codex-sessions');
+});
+
+test('Ollama generation limits and timeout default sanely, can be tuned, and bad values are named', () => {
+  expect(loadConfig(base).ollama).toMatchObject({ numPredict: 2048, repeatPenalty: 1.1, timeoutSeconds: null });
+  expect(loadConfig({ ...base, OLLAMA_NUM_PREDICT: '4096', OLLAMA_REPEAT_PENALTY: '1.2', OLLAMA_TIMEOUT_SECONDS: '300' }).ollama)
+    .toMatchObject({ numPredict: 4096, repeatPenalty: 1.2, timeoutSeconds: 300 });
+  expect(() => loadConfig({ ...base, OLLAMA_NUM_PREDICT: 'lots' })).toThrow(/OLLAMA_NUM_PREDICT must be a number of at least 1/);
+  expect(() => loadConfig({ ...base, OLLAMA_REPEAT_PENALTY: '0' })).toThrow(/OLLAMA_REPEAT_PENALTY must be a number of at least 0\.01/);
+  expect(() => loadConfig({ ...base, OLLAMA_TIMEOUT_SECONDS: '0' })).toThrow(/OLLAMA_TIMEOUT_SECONDS must be a number of at least 1/);
+});
+
+test('SCAN_MAX_FILES unset scales with the repo (null); set, it is a fixed cap; SCAN_CONCURRENCY defaults to 2', () => {
+  expect(loadConfig(base).scanMaxFiles).toBeNull();
+  expect(loadConfig({ ...base, SCAN_MAX_FILES: '4000' }).scanMaxFiles).toBe(4000);
+  expect(() => loadConfig({ ...base, SCAN_MAX_FILES: 'lots' })).toThrow(/SCAN_MAX_FILES/);
+  expect(loadConfig(base).scanConcurrency).toBe(2);
+  expect(loadConfig({ ...base, SCAN_CONCURRENCY: '4' }).scanConcurrency).toBe(4);
+  expect(() => loadConfig({ ...base, SCAN_CONCURRENCY: '0' })).toThrow(/SCAN_CONCURRENCY/);
 });
 
 test('CODEX_SESSIONS_DIR points the worker at another Codex sessions folder', () => {
@@ -67,6 +85,13 @@ test('GitHub and Linear tokens can come from Settings: GITHUB_REPOS needs no GIT
   expect(c.github.syncHours).toBe(6);
   expect(c.integrationSyncMinutes).toBe(10);
   expect(loadConfig({ ...base, INTEGRATION_SYNC_MINUTES: '30' }).integrationSyncMinutes).toBe(30);
+});
+
+test('GITHUB_BOT_LOGINS and GITHUB_AGENT_LOGINS are comma lists, lower-cased, empty by default', () => {
+  expect(loadConfig(base).github).toMatchObject({ botLogins: [], agentLogins: [] });
+  const c = loadConfig({ ...base, GITHUB_BOT_LOGINS: 'Docs-Check, acme-ci', GITHUB_AGENT_LOGINS: 'review-agent' });
+  expect(c.github.botLogins).toEqual(['docs-check', 'acme-ci']);
+  expect(c.github.agentLogins).toEqual(['review-agent']);
 });
 
 test('host and container roots must pair up', () => {
@@ -182,11 +207,14 @@ test('cloud settings are checked with everything else, and the token is never ec
   }
 });
 
-test('plain http is allowed for a cloud on this machine only', () => {
-  for (const url of ['http://localhost:8788', 'http://127.0.0.1:9000', 'http://[::1]:8788']) {
+test('plain http is allowed for a cloud on this machine only: loopback, or the host as the containers see it', () => {
+  // host.docker.internal: inside the api and worker containers, localhost is the container itself.
+  for (const url of ['http://localhost:8788', 'http://127.0.0.1:9000', 'http://[::1]:8788', 'http://host.docker.internal:8788', 'http://HOST.docker.internal:8788']) {
     expect(loadConfig({ ...base, CLOUD_URL: url, CLOUD_TOKEN: TOKEN }).cloud?.url).toBe(url);
   }
-  expect(() => loadConfig({ ...base, CLOUD_URL: 'http://host.docker.internal:8788', CLOUD_TOKEN: TOKEN })).toThrow(/https/);
+  for (const url of ['http://host.docker.internal.example.com:8788', 'http://docker.internal:8788', 'http://cloud.example.com']) {
+    expect(() => loadConfig({ ...base, CLOUD_URL: url, CLOUD_TOKEN: TOKEN })).toThrow(/https.*localhost or host\.docker\.internal/);
+  }
 });
 
 test('redactUrl hides a password passed as a query parameter too (pg reads ?password=)', () => {
@@ -202,6 +230,28 @@ test('a misspelled DATABASE_URL scheme is reported without a query-string passwo
   } catch (e) {
     expect((e as Error).message).not.toContain('hunter2');
   }
+});
+
+test('an operator token lets agents make owner decisions; unset, there is none, and it must be long enough', () => {
+  expect(loadConfig(base).operator).toBeNull();
+  expect(loadConfig({ ...base, FG_OPERATOR_TOKEN: '   ' }).operator).toBeNull();
+  expect(() => loadConfig({ ...base, FG_OPERATOR_TOKEN: 'short' })).toThrow(/FG_OPERATOR_TOKEN.*24/);
+  const op = loadConfig({ ...base, FG_OPERATOR_TOKEN: 'o'.repeat(32) }).operator!;
+  expect(op.token).toBe('o'.repeat(32));
+  // By default not deciding lessons (what agents learn stays the owner's call), nor anything that deletes data, changes
+  // what is mounted, imports lessons from a file, or touches integration keys.
+  const off = ['lesson_decide', 'delete_project', 'docs_delete', 'settings', 'import', 'integrations'];
+  expect(op.allow).toEqual(OPERATOR_VERBS.filter((v) => !off.includes(v)));
+});
+
+test('OPERATOR_ALLOW narrows (or widens) what the operator token may do, and names only known verbs', () => {
+  const t = 'o'.repeat(32);
+  expect(loadConfig({ ...base, FG_OPERATOR_TOKEN: t, OPERATOR_ALLOW: 'scan, inbox_decide' }).operator!.allow).toEqual(['scan', 'inbox_decide']);
+  expect(loadConfig({ ...base, FG_OPERATOR_TOKEN: t, OPERATOR_ALLOW: 'all' }).operator!.allow).toEqual([...OPERATOR_VERBS]);
+  expect(loadConfig({ ...base, FG_OPERATOR_TOKEN: t, OPERATOR_ALLOW: 'scan,lesson_decide' }).operator!.allow).toContain('lesson_decide');
+  expect(() => loadConfig({ ...base, FG_OPERATOR_TOKEN: t, OPERATOR_ALLOW: 'scan,approve_everything' })).toThrow(/OPERATOR_ALLOW.*approve_everything/);
+  // The operator token and the API token are different secrets.
+  expect(() => loadConfig({ ...base, FG_OPERATOR_TOKEN: t, API_TOKEN: t })).toThrow(/FG_OPERATOR_TOKEN.*API_TOKEN/);
 });
 
 test('the API refuses to listen beyond this machine without a token', () => {

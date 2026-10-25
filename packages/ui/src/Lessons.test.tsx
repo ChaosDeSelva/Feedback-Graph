@@ -180,3 +180,17 @@ test('an error goes away once the next change succeeds', async () => {
   fireEvent.click(screen.getByRole('button', { name: 'Reject' }));
   await waitFor(() => expect(screen.queryByText(/graph unreachable/)).toBeNull());
 });
+
+test('a lesson an agent approved with the operator token says so, in the list and the detail', async () => {
+  const byAgent = { ...lesson('l1', 'Server search'), status: 'approved', decidedBy: 'operator:codex' };
+  vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+    if (url.startsWith('/api/lessons?')) return Response.json([byAgent, { ...lesson('l2', 'Auth checks'), status: 'approved', decidedBy: 'you' }]);
+    if (url === '/api/lessons/l1') return Response.json({ ...detail('l1', 'Server search'), lesson: byAgent });
+    return Response.json([]);
+  }));
+  render(<Lessons />);
+  await screen.findByText('filtered on the client');
+  const badges = screen.getAllByText('approved by agent');
+  expect(badges).toHaveLength(2);
+  expect(badges[0].closest('[title]')?.getAttribute('title')).toContain('operator:codex');
+});

@@ -8,14 +8,21 @@ const MAX_WORK_TURNS = 400;
  * after the comment was synced): the session the sync linked, else the newest on the branch or the only one just
  * before the comment. The post-mortem then reads that session's turns, edited files and summary, as it would for
  * pushback in a transcript. No session: `work` is null and the post-mortem works from the comment alone.
+ *
+ * `files` (the repo files a session read or edited): a session that never touched the file a review comment is on did
+ * not do that work, however well its branch or time fit. A session with no files recorded is not ruled out.
  */
 export async function attachWorkSession(
   input: PostMortemInput,
-  d: { graph: Pick<GraphStore, 'workSessions'>; sessions: Pick<SessionsStore, 'turns'> },
+  d: { graph: Pick<GraphStore, 'workSessions'>; sessions: Pick<SessionsStore, 'turns'>; files?: (sessionId: string) => Promise<string[]> },
 ): Promise<PostMortemInput> {
   const ext = input.feedback.external;
   if (!ext) return input;
-  const found = await findWorkSessions(d.graph, input.projectKey, ext.branch, ext.createdAt);
+  let found = await findWorkSessions(d.graph, input.projectKey, ext.branch, ext.createdAt);
+  if (ext.path && d.files) {
+    const touched = await Promise.all(found.map((s) => d.files!(s.id).catch(() => [] as string[])));
+    found = found.filter((_, i) => !touched[i].length || touched[i].includes(ext.path!));
+  }
   const pick = found.find((s) => ext.linkedSessionIds.includes(s.id)) ?? found[0];
   if (!pick) return { ...input, work: null };
   const turns = await d.sessions.turns(pick.id, -1, MAX_WORK_TURNS);

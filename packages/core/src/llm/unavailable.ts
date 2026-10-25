@@ -15,10 +15,24 @@ export class ProviderUnavailableError extends Error {
   }
 }
 
+/**
+ * The model was asked but did not answer within the call's time limit (a runaway generation, a prompt too big for it).
+ * That is this item's failure, not unavailability: it counts against the item, so one item the model can never finish
+ * is given up on after its attempts instead of stalling every batch it heads.
+ */
+export class ModelTimeoutError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'ModelTimeoutError';
+  }
+}
+
 const NETWORK_CODES = new Set([
   'ECONNREFUSED', 'ECONNRESET', 'ENOTFOUND', 'EAI_AGAIN', 'EHOSTUNREACH', 'ENETUNREACH', 'ETIMEDOUT', 'EPIPE',
-  'UND_ERR_CONNECT_TIMEOUT', 'UND_ERR_SOCKET', 'UND_ERR_HEADERS_TIMEOUT', 'UND_ERR_BODY_TIMEOUT',
+  'UND_ERR_CONNECT_TIMEOUT', 'UND_ERR_SOCKET',
 ]);
+/** Connected, then waited too long for the answer: the call timed out, the model is there. */
+const ANSWER_TIMEOUT_CODES = new Set(['UND_ERR_HEADERS_TIMEOUT', 'UND_ERR_BODY_TIMEOUT']);
 const SIGNED_OUT = /not logged in|please run \/?login|codex login|invalid api key|oauth token (has )?expired|authenticat|unauthori[sz]ed|\b401\b|forbidden|\b403\b/i;
 const LIMITED = /usage limit|rate limit|credit balance|quota|\b429\b|overloaded/i;
 const excerpt = (s: string) => redactSecrets(s).replace(/\s+/g, ' ').trim().slice(0, 160);
@@ -26,15 +40,36 @@ const excerpt = (s: string) => redactSecrets(s).replace(/\s+/g, ' ').trim().slic
 type ErrLike = { name?: unknown; code?: unknown; message?: unknown; cause?: unknown; syscall?: unknown; path?: unknown };
 
 /**
- * Why `err` means the provider is unavailable, or null when it is about this request's answer (bad JSON, a schema
- * mismatch, a 400, a CLI that ran and failed at the task). Reads the errors the providers in providers.ts throw.
+ * Why `err` means one call timed out waiting for the model's answer (see ModelTimeoutError), or null. A connection
+ * that could not be made in time is unavailability instead (providerUnavailableReason).
  */
-export function providerUnavailableReason(err: unknown): string | null {
-  if (err instanceof ProviderUnavailableError) return err.reason;
+export function modelTimeoutReason(err: unknown): string | null {
+  if (err instanceof ModelTimeoutError) return err.message;
   if (!err || typeof err !== 'object') return null;
   const e = err as ErrLike;
   const cause = (e.cause && typeof e.cause === 'object' ? e.cause : {}) as ErrLike;
   if (e.name === 'TimeoutError' || cause.name === 'TimeoutError') return 'timed out waiting for the model';
+  const code = typeof e.code === 'string' ? e.code : typeof cause.code === 'string' ? cause.code : null;
+  if (code && ANSWER_TIMEOUT_CODES.has(code)) return `timed out waiting for the model (${code})`;
+  const msg = typeof e.message === 'string' ? e.message : '';
+  const http = msg.match(/^(\S+) (?:embed )?408:/);
+  if (http) return `timed out waiting for ${http[1]}`;
+  const cli = msg.match(/^(claude|codex) (?:exit (\d+)|error):\s*([\s\S]*)$/);
+  if (cli && (cli[2] === '124' || /timed out after/.test(cli[3]))) return `timed out waiting for ${cli[1]}`;
+  return null;
+}
+
+/**
+ * Why `err` means the provider is unavailable, or null when it is about this request's answer (bad JSON, a schema
+ * mismatch, a 400, a CLI that ran and failed at the task, a call that timed out: see modelTimeoutReason). Reads the
+ * errors the providers in providers.ts throw.
+ */
+export function providerUnavailableReason(err: unknown): string | null {
+  if (err instanceof ProviderUnavailableError) return err.reason;
+  if (!err || typeof err !== 'object') return null;
+  if (modelTimeoutReason(err)) return null;
+  const e = err as ErrLike;
+  const cause = (e.cause && typeof e.cause === 'object' ? e.cause : {}) as ErrLike;
   const code = typeof e.code === 'string' ? e.code : typeof cause.code === 'string' ? cause.code : null;
   if (code === 'ENOENT' && typeof e.syscall === 'string' && e.syscall.startsWith('spawn')) return `${String(e.path ?? 'the CLI')} is not installed`;
   if (code && NETWORK_CODES.has(code)) return `cannot reach the model (${code})`;
@@ -50,7 +85,6 @@ export function providerUnavailableReason(err: unknown): string | null {
     if (status === 404) return `model not found (${http[1]} 404${body ? `: ${body}` : ''})`;
     if (status === 401 || status === 403) return `${http[1]} is not authorized (HTTP ${status}); check its key`;
     if (status === 429) return `${http[1]} is rate limited (HTTP 429)`;
-    if (status === 408) return `timed out waiting for ${http[1]}`;
     return null;
   }
 
@@ -58,7 +92,6 @@ export function providerUnavailableReason(err: unknown): string | null {
   const cli = msg.match(/^(claude|codex) (?:exit (\d+)|error):\s*([\s\S]*)$/);
   if (cli) {
     const [, name, exit, out] = cli;
-    if (exit === '124' || /timed out after/.test(out)) return `timed out waiting for ${name}`;
     if (exit === '127' || /command not found/i.test(out)) return `${name} is not installed`;
     if (SIGNED_OUT.test(out)) return `${name} is not signed in (${excerpt(out)})`;
     if (LIMITED.test(out)) return `${name} hit a usage or rate limit (${excerpt(out)})`;
@@ -72,6 +105,7 @@ export function withHealth(p: LlmProvider, report: (h: ProviderHealth) => void):
   return {
     id: p.id,
     agentic: p.agentic,
+    vision: p.vision ?? false,
     async json(t) {
       try {
         const out = await p.json(t);

@@ -2,7 +2,7 @@ import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-li
 import { afterEach, beforeEach, expect, test, vi } from 'vitest';
 import { CodeMap } from './CodeMap.tsx';
 
-const meta = { fingerprint: 'abc', builtAt: '2026-10-22T12:00:00Z', stats: { files: 40, symbols: 200, imports: 90, tests: 12 } };
+const meta = { fingerprint: 'abc', builtAt: '2026-10-22T12:00:00Z', stats: { files: 40, symbols: 200, imports: 90, tests: 12 }, candidates: null };
 const hotspots = [
   { path: 'src/db/pool.ts', churn: 7, misses: 2, dependents: 3, score: 13 },
   { path: 'src/api/orders.ts', churn: 30, misses: 0, dependents: 1, score: 5.95 },
@@ -24,14 +24,18 @@ const mod = (path: string) => ({
 
 let urls: string[];
 let noMap = false;
+let capped = false;
+let noFacts = false;
 beforeEach(() => {
   urls = [];
   noMap = false;
+  capped = false;
+  noFacts = false;
   vi.stubGlobal('fetch', vi.fn(async (url: string) => {
     urls.push(url);
-    if (url.startsWith('/api/projects/demo/codemap/hotspots')) return Response.json(noMap ? { meta: null, hotspots: [] } : { meta, hotspots });
+    if (url.startsWith('/api/projects/demo/codemap/hotspots')) return Response.json(noMap ? { meta: null, hotspots: [] } : { meta: capped ? { ...meta, candidates: 10_290 } : meta, hotspots });
     const m = url.match(/^\/api\/projects\/demo\/codemap\/module\?path=(.+)$/);
-    if (m) return Response.json(mod(decodeURIComponent(m[1])));
+    if (m) return Response.json(noFacts ? { ...mod(decodeURIComponent(m[1])), facts: [] } : mod(decodeURIComponent(m[1])));
     return Response.json([]);
   }));
 });
@@ -97,6 +101,30 @@ test('hotspots leave test files out until "include tests" is ticked', async () =
   fireEvent.click(box);
   await waitFor(() => expect(urls).toContain('/api/projects/demo/codemap/hotspots?limit=200&tests=1'));
   expect(await screen.findByText('src/db/pool.ts')).toBeTruthy();
+});
+
+test('a capped map says how many files it left out and how to raise the cap', async () => {
+  capped = true;
+  render(<CodeMap projectKey="demo" />);
+  await screen.findByText('src/db/pool.ts');
+  expect(screen.getByRole('note').textContent).toMatch(/Showing 40 of 10,290 files[\s\S]*raise SCAN_MAX_FILES/);
+  expect(screen.getByLabelText('files').textContent).toContain('of 10,290');
+});
+
+test('an uncapped map says nothing about a cap', async () => {
+  render(<CodeMap projectKey="demo" />);
+  await screen.findByText('src/db/pool.ts');
+  expect(screen.queryByRole('note')).toBeNull();
+});
+
+test('a file no scan fact cites does not claim the project has no facts', async () => {
+  noFacts = true;
+  render(<CodeMap projectKey="demo" />);
+  fireEvent.click(await screen.findByRole('button', { name: 'src/db/pool.ts' }));
+  const panel = await screen.findByRole('region', { name: /module src\/db\/pool\.ts/ });
+  await within(panel).findByText('createPool');
+  expect(within(panel).queryByText(/No facts yet/)).toBeNull();
+  expect(within(panel).getByText(/No scan fact cites this file/)).toBeTruthy();
 });
 
 test('a project with no map yet says the worker builds it', async () => {

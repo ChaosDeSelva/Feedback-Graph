@@ -117,6 +117,13 @@ test('a token in .env is shown as set in .env, with no way to replace or disconn
   expect(within(gh).queryByRole('button', { name: 'Replace token' })).toBeNull();
 });
 
+test('the account shows when it was checked; a token not checked yet says it is checked on its own', async () => {
+  state = view({ github: connected({ checkedAt: new Date(Date.now() - 5 * 60_000).toISOString() }), linear: connected({ envVar: 'LINEAR_API_KEY', account: null, checkedAt: null }) });
+  render(<Integrations />);
+  expect(await screen.findByText(/checked 5m ago/)).toBeTruthy();
+  expect(screen.getByText(/being checked: it is checked on first use/)).toBeTruthy();
+});
+
 test('a revoked token is an error with the token field back to replace it', async () => {
   state = view({ github: connected({ errorKind: 'auth', connection: { state: 'error', source: 'app', detail: 'GitHub rejected the token (revoked, expired or missing access). Syncing is paused until you replace it.', href: '' } }) });
   render(<Integrations />);

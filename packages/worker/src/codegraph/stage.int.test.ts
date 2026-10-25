@@ -39,7 +39,9 @@ describeStores('Code map stage', (h) => {
     expect(first).toMatchObject({ files: 3, symbols: 3, imports: 2, tests: 2 });
     const stored = (await h.store.codegraph.codeMap('demo'))!;
     const fresh = await buildCodeMap(r.dir, OPTS);
-    expect({ files: stored.files, symbols: stored.symbols, imports: stored.imports }).toEqual(fresh);
+    const { candidates, ...parts } = fresh;
+    expect({ files: stored.files, symbols: stored.symbols, imports: stored.imports }).toEqual(parts);
+    expect((await h.store.codegraph.codeMapMeta('demo'))?.candidates).toBe(candidates);
 
     const db = (await h.store.codegraph.moduleContext('demo', 'src/db.ts'))!;
     expect(db.importers).toEqual(['src/api.ts']);

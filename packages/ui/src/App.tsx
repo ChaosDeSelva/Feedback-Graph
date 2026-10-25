@@ -1,7 +1,9 @@
 import { useEffect, useRef, useState } from 'react';
 import { Activity } from './Activity.tsx';
 import { Docs } from './Docs.tsx';
-import { api, SIGN_IN_EVENT, type SystemStatus } from './api.ts';
+import { api, NETWORK_EVENT, SIGN_IN_EVENT, type NetworkState, type SystemStatus } from './api.ts';
+import type { ModelHealth } from '@fb/core';
+import { FirstRun, stageLine } from './FirstRun.tsx';
 import { Graph } from './Graph.tsx';
 import { hashView } from './links.ts';
 import { Inbox } from './Inbox.tsx';
@@ -85,6 +87,7 @@ export function App() {
   }, [needsSignIn]);
 
   if (needsSignIn) return <SignIn onDone={() => setNeedsSignIn(false)} />;
+  const nothingSelected = !!status?.selection && (!status.selection.initialized || status.selection.tracked === 0);
   return (
     <AppShell
       groups={GROUPS}
@@ -93,23 +96,27 @@ export function App() {
       health={health(status)}
       connections={status?.connections ? (collapsed) => <ConnectionsBadge connections={status.connections!} collapsed={collapsed} /> : undefined}
     >
-      {view !== 'settings' && view !== 'docs' && status?.selection && (!status.selection.initialized || status.selection.tracked === 0) && <NothingSelected />}
+      <NetworkBanner />
+      {nothingSelected && view !== 'settings' && view !== 'docs' && <NothingSelected />}
+      {!nothingSelected && (view === 'inbox' || view === 'lessons' || view === 'graph') && <FirstRun key={view} view={view} />}
       <div className="flex min-h-0 flex-1 flex-col">{VIEWS[view].el}</div>
     </AppShell>
   );
 }
 
-const MODEL_NAME = { classify: 'classifier', postmortem: 'post-mortem model', scan: 'scan model', summary: 'summary model' } as const;
+const MODEL_NAME = { classify: 'classifier', postmortem: 'post-mortem model', scan: 'scan model', summary: 'summary model', docs: 'docs reader' } as const;
 
 function health(status: SystemStatus | null): Health | null {
   if (!status || !('workerHealthy' in status)) return null;
   const idle = status.selection?.note ?? null;
   const w = status.worker;
   // A model that cannot be asked (not running, missing, signed out) is named in the label, not only the tooltip.
-  const down = (Object.entries(status.models ?? {}) as [keyof typeof MODEL_NAME, { provider: string | null; ok: boolean; reason: string | null }][]).find(([, m]) => !m.ok);
+  const down = (Object.entries(status.models ?? {}) as [keyof typeof MODEL_NAME, ModelHealth][]).find(([, m]) => !m.ok);
   // Summaries wait for their model rather than fail, so the label says they are paused.
   const modelDown = down && (down[0] === 'summary' ? 'summaries paused' : `${MODEL_NAME[down[0]] ?? down[0]} unavailable`);
-  const detail = down && `${modelDown}: ${down[1].provider ? `${down[1].provider}: ` : ''}${down[1].reason ?? 'unknown reason'}`;
+  const since = down?.[1].since ? ` (since ${new Date(down[1].since).toLocaleTimeString()}${down[1].checkedAt ? `, last tried ${new Date(down[1].checkedAt).toLocaleTimeString()}` : ''})` : '';
+  const detail = down && `${modelDown}: ${down[1].provider ? `${down[1].provider}: ` : ''}${down[1].reason ?? 'unknown reason'}${since}`;
+  const doing = status.workerHealthy && status.stage ? `now: ${stageLine({ stage: status.stage, progress: status.progress ?? null })}` : null;
   // Every embedding comes from Ollama, whatever models the jobs use: without it agents get no context.
   const ollama = status.ollama && !status.ollama.ok ? status.ollama : null;
   const ollamaLabel = ollama && (/not pulled/.test(ollama.reason ?? '') ? 'Ollama model missing' : 'Ollama unreachable');
@@ -118,10 +125,37 @@ function health(status: SystemStatus | null): Health | null {
     ok: !!status.graph && status.workerHealthy && !idle && !down && !ollama,
     label: !status.graph ? 'graph unreachable' : !status.workerHealthy ? 'worker offline' : idle ? (status.selection?.roots === 0 ? 'no project folders' : 'no projects selected') : ollamaLabel || modelDown || 'worker running',
     version: status.version,
-    title: idle ?? [ollamaDetail, detail, w
+    title: idle ?? [ollamaDetail, detail, doing, w
       ? `worker ${w.version}, last heartbeat ${new Date(w.lastBeat).toLocaleTimeString()}${w.lastError ? `, last error: ${w.lastError}` : ''}`
       : 'the worker has not reported yet'].filter(Boolean).join('; '),
   };
+}
+
+/**
+ * A write the API could not take (it is restarting, or the network dropped): a banner while api.ts retries it, then an
+ * alert if it gave up, so a lost decision is never silent.
+ */
+function NetworkBanner() {
+  const [net, setNet] = useState<NetworkState | null>(null);
+  useEffect(() => {
+    const on = (e: Event) => setNet((e as CustomEvent<NetworkState>).detail);
+    window.addEventListener(NETWORK_EVENT, on);
+    return () => window.removeEventListener(NETWORK_EVENT, on);
+  }, []);
+  if (!net || net.state === 'ok') return null;
+  if (net.state === 'retrying') {
+    return (
+      <div role="status" aria-label="connection" className="shrink-0 border-b border-line bg-info-soft px-4 py-2 text-[13px] text-info-text md:px-6">
+        Reconnecting to the API: retrying your last change ({net.attempt} of {net.of})…
+      </div>
+    );
+  }
+  return (
+    <div role="alert" aria-label="connection" className="flex shrink-0 items-center justify-between gap-3 border-b border-bad/40 bg-bad-soft px-4 py-2 text-[13px] text-bad-text md:px-6">
+      <span>The API did not answer (it may be restarting), so your last change was not saved. Check the page and try it again.</span>
+      <Button size="sm" variant="ghost" onClick={() => setNet(null)}>Dismiss</Button>
+    </div>
+  );
 }
 
 /** Opt-in: before any project is selected every list is empty, so say why and where to choose. */

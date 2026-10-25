@@ -40,14 +40,14 @@ test('PATCH approving without text changes does not re-embed', async () => {
   const res = await app.request('/api/lessons/lesson%3Aa', patch({ status: 'approved' }));
   expect(res.status).toBe(204);
   expect(embedded).toEqual([]);
-  expect(calls).toContainEqual(['update', 'lesson:a', { status: 'approved' }, { reembed: undefined }]);
+  expect(calls).toContainEqual(['update', 'lesson:a', { status: 'approved' }, { reembed: undefined, by: 'you' }]);
 });
 
 test('PATCH editing the rule re-embeds the lesson text', async () => {
   const { app, calls, embedded } = setup();
   await app.request('/api/lessons/lesson%3Aa', patch({ rule: 'New rule', scope: 'global' }));
   expect(embedded).toEqual([['T\nNew rule\nApplies when: W']]);
-  expect(calls).toContainEqual(['update', 'lesson:a', { rule: 'New rule', scope: 'global' }, { reembed: [0.5] }]);
+  expect(calls).toContainEqual(['update', 'lesson:a', { rule: 'New rule', scope: 'global' }, { reembed: [0.5], by: 'you' }]);
 });
 
 test('PATCH rejects unknown fields and bad statuses', async () => {

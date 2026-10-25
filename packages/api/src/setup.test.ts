@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, utimesSync, writeFileSync } from 'node:fs';
+import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, statSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -9,13 +9,18 @@ import { expect, test } from 'vitest';
 // stand-ins for docker, curl (Ollama not answering) and, to play Linux, uname and id.
 const repoRoot = fileURLToPath(new URL('../../../', import.meta.url));
 
-function sandbox(o: { linuxUid?: number; tags?: string; claude?: boolean } = {}) {
+/** Ollama's /api/chat answer to the structured-output probe: an HTTP status and a body. */
+type Chat = { code: number; body: string };
+const CHAT_OK: Chat = { code: 200, body: JSON.stringify({ message: { role: 'assistant', content: '{"ok": true}' }, done: true }) };
+const CHAT_501: Chat = { code: 501, body: JSON.stringify({ error: 'structured output is unavailable: this build of Ollama has no grammar support' }) };
+
+function sandbox(o: { linuxUid?: number; tags?: string; claude?: boolean; chat?: Chat } = {}) {
   const base = mkdtempSync(join(tmpdir(), 'fbsetup-'));
   const repo = join(base, 'repo');
   const home = join(base, 'home');
   const bin = join(base, 'bin');
   for (const d of [join(repo, 'scripts', 'lib'), home, bin, join(home, 'code'), join(home, 'work')]) mkdirSync(d, { recursive: true });
-  for (const f of ['scripts/setup.sh', 'scripts/lib/env.sh', '.env.example']) copyFileSync(join(repoRoot, f), join(repo, f));
+  for (const f of ['scripts/setup.sh', 'scripts/lib/env.sh', 'scripts/lib/ollama.sh', '.env.example']) copyFileSync(join(repoRoot, f), join(repo, f));
   const stub = (name: string, body: string) => {
     writeFileSync(join(bin, name), `#!/bin/sh\n${body}\n`);
     chmodSync(join(bin, name), 0o755);
@@ -23,10 +28,15 @@ function sandbox(o: { linuxUid?: number; tags?: string; claude?: boolean } = {})
   // Each stand-in appends what it was asked to ${base}/calls, so a test can see what setup.sh ran.
   const calls = join(base, 'calls');
   stub('docker', `echo "docker $*" >> '${calls}'`);
-  // Ollama answers /api/tags with o.tags (not at all without it); the Feedback Graph answers /api/status.
+  // Ollama answers /api/tags with o.tags (not at all without it) and /api/chat with o.chat (the body, then the status on
+  // its own line, as curl -w prints it); the Feedback Graph answers /api/status. Each chat request body is kept.
+  const chat = o.chat ?? CHAT_OK;
+  writeFileSync(join(base, 'chat'), `${chat.body}\n${chat.code}`);
   stub(
     'curl',
-    `case "$*" in *api/tags*) ${o.tags === undefined ? 'exit 7' : `printf '%s' '${o.tags}'`} ;; *api/status*) echo '{}' ;; *) exit 7 ;; esac`,
+    `case "$*" in *api/tags*) ${o.tags === undefined ? 'exit 7' : `printf '%s' '${o.tags}'`} ;;
+      *api/chat*) ${o.tags === undefined ? 'exit 7' : `printf '%s\\n' "$*" >> '${join(base, 'chat-requests')}'; cat '${join(base, 'chat')}'`} ;;
+      *api/status*) echo '{}' ;; *) exit 7 ;; esac`,
   );
   stub('ollama', `echo "OLLAMA_HOST=$OLLAMA_HOST ollama $*" >> '${calls}'`);
   if (o.claude) stub('claude', 'exit 0');
@@ -35,9 +45,12 @@ function sandbox(o: { linuxUid?: number; tags?: string; claude?: boolean } = {})
   if (o.linuxUid !== undefined) {
     stub('uname', 'echo Linux');
     stub('id', `case "$1" in -u) echo ${o.linuxUid} ;; -g) echo ${o.linuxUid + 1} ;; *) /usr/bin/id "$@" ;; esac`);
+  } else {
+    // Not Linux unless a test says so, whatever runs the suite (in a Linux container as root, setup.sh would set HOST_UID=0).
+    stub('uname', 'echo Darwin');
   }
-  const run = (env: Record<string, string> = {}, answers?: string) =>
-    execFileSync('bash', [join(repo, 'scripts', 'setup.sh')], {
+  const run = (env: Record<string, string> = {}, answers?: string, args: string[] = []) =>
+    execFileSync('bash', [join(repo, 'scripts', 'setup.sh'), ...args], {
       // With answers, setup.sh asks its questions as in a terminal and reads them, one per line.
       env: { PATH: `${bin}:/usr/bin:/bin`, HOME: home, ...(answers === undefined ? {} : { FEEDBACK_SETUP_INTERACTIVE: '1' }), ...env },
       encoding: 'utf8',
@@ -55,15 +68,23 @@ function sandbox(o: { linuxUid?: number; tags?: string; claude?: boolean } = {})
     mkdirSync(join(repo, 'state', 'settings'), { recursive: true });
     writeFileSync(rootsFile, `${JSON.stringify({ roots, updatedAt: '2026-10-24T00:00:00.000Z' }, null, 2)}\n`);
   };
-  const runFailing = (env: Record<string, string> = {}) => {
+  const runFailing = (env: Record<string, string> = {}, args: string[] = []) => {
     try {
-      run(env);
+      run(env, undefined, args);
     } catch (e) {
-      return String((e as { stdout?: string }).stdout ?? '');
+      const x = e as { stdout?: string; stderr?: string };
+      return String(x.stdout ?? '') + String(x.stderr ?? '');
     }
     throw new Error('setup.sh did not fail');
   };
-  return { repo, home, run, runFailing, ran, env, value, saved, saveInSettings, rootsFile, override: join(repo, 'docker-compose.override.yml') };
+  const chatRequests = () => (existsSync(join(base, 'chat-requests')) ? readFileSync(join(base, 'chat-requests'), 'utf8') : '');
+  /** A file a person wrote, holding a secret, for the --*-file flags. */
+  const secretFile = (name: string, text: string) => {
+    const p = join(base, name);
+    writeFileSync(p, text);
+    return p;
+  };
+  return { repo, home, run, runFailing, ran, env, value, saved, saveInSettings, rootsFile, chatRequests, secretFile, override: join(repo, 'docker-compose.override.yml') };
 }
 
 test('PROJECTS_DIRS=~/code on a first run writes it into .env and the roots file, and the override mounts exactly it', () => {
@@ -288,4 +309,89 @@ test('the roots file setup.sh writes reads back in the api exactly', async () =>
   s.saveInSettings([]);
   s.run();
   expect((await rootsFile(s.rootsFile).read())?.roots).toEqual([]);
+});
+
+test('structured output is probed with one real schema-constrained chat call to the classifier model', () => {
+  const s = sandbox({ tags: both });
+  const out = s.run({ PROJECTS_DIRS: '~/code' });
+  expect(out).toContain('ollama: structured output works (gemma4)');
+  const req = s.chatRequests();
+  expect(req).toContain('/api/chat');
+  expect(req).toContain('"format"');
+  expect(req).toContain('"model":"gemma4"');
+});
+
+test('an Ollama without structured output stops setup loudly, with the fix (the official app, not the Homebrew formula)', () => {
+  const s = sandbox({ tags: both, chat: CHAT_501 });
+  const out = s.runFailing({ PROJECTS_DIRS: '~/code' });
+  expect(out).toContain('FAIL ollama: structured output does not work');
+  expect(out).toContain('structured output is unavailable');
+  expect(out).toContain('official Ollama app');
+  expect(out).toContain('brew services stop ollama');
+  // .env and the mounts were still written: only the model check failed.
+  expect(s.value('PROJECTS_DIRS')).toBe(join(s.home, 'code'));
+});
+
+test('no structured-output probe when the classifier runs on another provider, or its model is not pulled yet', () => {
+  const other = sandbox({ tags: both, chat: CHAT_501 });
+  expect(other.run({ PROJECTS_DIRS: '~/code', CLASSIFY_LLM: 'claude-cli' })).not.toContain('structured output');
+  const missing = sandbox({ tags: '{"models":[{"name":"nomic-embed-text:latest"}]}', chat: CHAT_501 });
+  expect(missing.run({ PROJECTS_DIRS: '~/code' })).not.toContain('FAIL');
+  expect(missing.chatRequests()).toBe('');
+});
+
+test('--pull-models pulls the missing models without a terminal; --projects is PROJECTS_DIRS', () => {
+  const s = sandbox({ tags: '{"models":[{"name":"nomic-embed-text:latest"}]}' });
+  s.run({}, undefined, ['--projects', '~/code,~/work', '--pull-models']);
+  expect(s.ran()).toBe('OLLAMA_HOST=http://localhost:11434 ollama pull gemma4\n');
+  expect(s.saved()).toEqual([join(s.home, 'code'), join(s.home, 'work')]);
+});
+
+test('--yes answers yes to every question without a terminal: pull, start, connect the agents; nothing is read from stdin', () => {
+  const s = sandbox({ tags: '{"models":[{"name":"nomic-embed-text:latest"}]}', claude: true });
+  const out = s.run({}, undefined, ['--yes', '--projects', '~/code']);
+  expect(s.ran()).toBe('OLLAMA_HOST=http://localhost:11434 ollama pull gemma4\ndocker compose up -d --build\ninstall-agent \n');
+  expect(out).not.toContain('Paste');
+  expect(out).toContain('running: http://localhost:8787');
+});
+
+test('the --*-file flags put a secret a person wrote into .env, private, and never print it', () => {
+  const s = sandbox({ tags: both });
+  const gh = 'g'.repeat(36);
+  const lin = 'l'.repeat(40);
+  const claude = 'c'.repeat(20) + '-_.x';
+  const out = s.run({}, undefined, [
+    '--projects', '~/code',
+    '--github-token-file', s.secretFile('gh', `${gh}\n`),
+    '--linear-key-file', s.secretFile('lin', `  ${lin}  \n`),
+    '--claude-token-file', s.secretFile('claude', claude),
+  ]);
+  expect(s.value('GITHUB_TOKEN')).toBe(gh);
+  expect(s.value('LINEAR_API_KEY')).toBe(lin);
+  expect(s.value('CLAUDE_CODE_OAUTH_TOKEN')).toBe(claude);
+  for (const secret of [gh, lin, claude]) expect(out).not.toContain(secret);
+  expect(out).toContain('GITHUB_TOKEN saved to .env');
+  expect(statSync(join(s.repo, '.env')).mode & 0o777).toBe(0o600);
+  // Read again on a re-run: replaced in place, one line each.
+  s.run({}, undefined, ['--github-token-file', s.secretFile('gh2', 'h'.repeat(36))]);
+  expect(s.value('GITHUB_TOKEN')).toBe('h'.repeat(36));
+  expect(s.env().match(/^GITHUB_TOKEN=/gm)).toHaveLength(1);
+});
+
+test('a secret file that is missing, empty or holds other characters stops setup, and .env keeps no value from it', () => {
+  const s = sandbox({ tags: both });
+  s.run({ PROJECTS_DIRS: '~/code' });
+  expect(s.runFailing({}, ['--linear-key-file', join(s.home, 'nope')])).toContain('cannot read');
+  expect(s.runFailing({}, ['--linear-key-file', s.secretFile('empty', '\n')])).toContain('is empty');
+  const bad = 'x'.repeat(10) + ' $(rm -rf ~)';
+  const out = s.runFailing({}, ['--linear-key-file', s.secretFile('bad', bad)]);
+  expect(out).toContain('does not look like a key');
+  expect(out).not.toContain(bad);
+  expect(s.value('LINEAR_API_KEY')).toBe('');
+});
+
+test('an unknown flag, or a flag missing its value, says how to use it', () => {
+  const s = sandbox();
+  expect(s.runFailing({}, ['--frobnicate'])).toContain('usage:');
+  expect(s.runFailing({}, ['--projects'])).toContain('--projects needs a value');
 });

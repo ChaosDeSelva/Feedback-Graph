@@ -36,9 +36,10 @@ export type IntegrationSyncState = {
   projects: Record<string, ProjectSyncState>;
 };
 
-export type ProjectLink = { github: boolean; linearTeamId: string | null; linearTeamName: string | null };
+/** Which integrations a project is linked to: its GitHub repository, its Linear team. */
+export type IntegrationLink = { github: boolean; linearTeamId: string | null; linearTeamName: string | null };
 
-export const DEFAULT_LINK: ProjectLink = { github: true, linearTeamId: null, linearTeamName: null };
+export const DEFAULT_LINK: IntegrationLink = { github: true, linearTeamId: null, linearTeamName: null };
 
 export const emptySyncState = (): IntegrationSyncState => ({ lastSyncAt: null, lastError: null, errorKind: null, rateLimitedUntil: null, authFailedFor: null, projects: {} });
 
@@ -154,15 +155,15 @@ export class Integrations {
     await this.kv.setCursor(key(kind, 'sync'), JSON.stringify(s));
   }
 
-  async links(): Promise<Record<string, ProjectLink>> {
-    return parse<Record<string, ProjectLink>>(await this.kv.getCursor(LINKS), {});
+  async links(): Promise<Record<string, IntegrationLink>> {
+    return parse<Record<string, IntegrationLink>>(await this.kv.getCursor(LINKS), {});
   }
 
-  async link(projectKey: string): Promise<ProjectLink> {
+  async link(projectKey: string): Promise<IntegrationLink> {
     return { ...DEFAULT_LINK, ...(await this.links())[projectKey] };
   }
 
-  async setLink(projectKey: string, patch: Partial<ProjectLink>): Promise<ProjectLink> {
+  async setLink(projectKey: string, patch: Partial<IntegrationLink>): Promise<IntegrationLink> {
     const all = await this.links();
     const next = { ...DEFAULT_LINK, ...all[projectKey], ...patch };
     await this.kv.setCursor(LINKS, JSON.stringify({ ...all, [projectKey]: next }));

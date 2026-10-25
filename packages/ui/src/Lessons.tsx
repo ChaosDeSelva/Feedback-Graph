@@ -21,6 +21,16 @@ const EMPTY: Record<LessonStatus, { title: string; children: string }> = {
   superseded: { title: 'Nothing superseded', children: 'When a newer lesson replaces an older one, the older one moves here.' },
 };
 
+/** An agent holding the operator token (FG_OPERATOR_TOKEN, with lesson_decide in OPERATOR_ALLOW) decided it, not you. */
+function AgentDecided({ lesson }: { lesson: Pick<Lesson, 'status' | 'decidedBy'> }) {
+  if (!lesson.decidedBy?.startsWith('operator') || lesson.status === 'proposed') return null;
+  return (
+    <Badge tone="accent" title={`${lesson.status} by ${lesson.decidedBy} with the operator token, not from this page`}>
+      {lesson.status} by agent
+    </Badge>
+  );
+}
+
 export function Lessons() {
   const [status, setStatus] = useState<LessonStatus>('proposed');
   const [items, setItems] = useState<Lesson[]>([]);
@@ -132,6 +142,7 @@ export function Lessons() {
                       )}
                     </div>
                     <div className="mt-0.5 line-clamp-2 text-[13px] leading-snug">{l.title}</div>
+                    {l.decidedBy?.startsWith('operator') && l.status !== 'proposed' && <div className="mt-1"><AgentDecided lesson={l} /></div>}
                   </ListRow>
                 </li>
               ))}
@@ -148,6 +159,7 @@ export function Lessons() {
                   <div className="flex flex-wrap items-center gap-1.5">
                     <Badge>{detail.lesson.projectKey ?? 'global'}</Badge>
                     <StatusBadge status={detail.lesson.status} />
+                    <AgentDecided lesson={detail.lesson} />
                   </div>
                   <h2 className="text-[19px] leading-snug font-semibold tracking-[-0.01em] text-balance [overflow-wrap:anywhere]">{detail.lesson.title}</h2>
                 </header>

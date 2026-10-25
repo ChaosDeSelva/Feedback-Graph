@@ -157,6 +157,18 @@ test('maxFiles and maxBytes bound the map', async () => {
   const m = await buildCodeMap(dir, { maxFiles: 3, maxBytes: 4000 });
   expect(m.files).toHaveLength(3);
   expect(paths(m)).not.toContain('packages/app/src/huge.ts');
+  // The cap is counted, so the map can say what it left out.
+  expect(m.candidates).toBe((await buildCodeMap(dir, OPTS)).candidates);
+  expect(m.candidates).toBeGreaterThan(3);
+});
+
+test('a capped map keeps source and the files sessions edited, not the alphabetically first config', async () => {
+  const dir = fixture(true);
+  for (let i = 0; i < 5; i++) writeFileSync(join(dir, `a${i}.yaml`), 'x: 1\n');
+  const m = await buildCodeMap(dir, { maxFiles: 6, maxBytes: 200_000, priority: ['a3.yaml'] });
+  expect(paths(m)).toContain('a3.yaml');
+  expect(paths(m).filter((p) => p.endsWith('.yaml'))).toEqual(['a3.yaml']);
+  expect(paths(m).some((p) => p.endsWith('.ts'))).toBe(true);
 });
 
 test('incremental: unchanged files reuse the previous entries without reparsing; changes, additions and deletions are picked up', async () => {

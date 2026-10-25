@@ -152,7 +152,8 @@ function snapshot(dir: string): Record<string, string> {
 test('--help prints the usage and exits 0; an unknown option is an error', () => {
   const s = sandbox([]);
   const out = s.run(['--help']);
-  expect(out).toMatch(/^usage: .*install-agent\.sh \[--dry-run\] \[claude\|codex\]/);
+  expect(out).toMatch(/^usage: .*install-agent\.sh \[--dry-run\] \[--codex-auto-approve\] \[claude\|codex\]/);
+  expect(out).toContain('default_tools_approval_mode');
   expect(out).toContain('--dry-run');
   expect(s.run(['-h'])).toBe(out);
   expect(() => s.run(['--bogus'])).toThrow(/unknown option/);
@@ -204,4 +205,53 @@ test('Claude Code with the feedback-graph plugin installed: nothing is registere
   expect(out).toMatch(/plugin/);
   expect(readFileSync(s.calls, 'utf8')).not.toContain('mcp add');
   expect(existsSync(join(s.home, '.claude', 'skills', 'feedback-graph'))).toBe(false);
+});
+
+// Codex refuses MCP tool calls under `codex exec` (approval policy "never") unless the server's table says
+// default_tools_approval_mode = "approve" (a per-server key; values auto, prompt, writes, approve).
+const APPROVE = 'default_tools_approval_mode = "approve"';
+
+test('Codex --codex-auto-approve: the server table lets Codex call the tools without asking', () => {
+  const s = sandbox(['codex']);
+  const out = s.run(['codex', '--codex-auto-approve']);
+  expect(readFileSync(s.config, 'utf8')).toContain(`[mcp_servers.feedback-graph]\nurl = "http://localhost:8787/mcp"\n${APPROVE}\n`);
+  expect(out).toContain('without asking');
+});
+
+test('Codex --codex-auto-approve on a server already registered adds the key inside its table, once, with a backup', () => {
+  const s = sandbox(['codex']);
+  mkdirSync(s.codexDir);
+  writeFileSync(s.config, 'model = "o4"\n\n[mcp_servers.feedback-graph]\nurl = "http://localhost:8787/mcp"\n\n[mcp_servers.other]\ncommand = "x"\n');
+  s.run(['codex', '--codex-auto-approve']);
+  const cfg = readFileSync(s.config, 'utf8');
+  expect(cfg).toBe(`model = "o4"\n\n[mcp_servers.feedback-graph]\n${APPROVE}\nurl = "http://localhost:8787/mcp"\n\n[mcp_servers.other]\ncommand = "x"\n`);
+  expect(backups(s.codexDir, 'config.toml')).toHaveLength(1);
+  expect(s.run(['codex', '--codex-auto-approve'])).toMatch(/already/);
+  expect(readFileSync(s.config, 'utf8')).toBe(cfg);
+  expect(backups(s.codexDir, 'config.toml')).toHaveLength(1);
+});
+
+test('Codex without the flag: no approval key unasked; without a terminal it says how, in a terminal it asks (default no)', () => {
+  const s = sandbox(['codex']);
+  const out = s.run(['codex']);
+  expect(readFileSync(s.config, 'utf8')).not.toContain('default_tools_approval_mode');
+  expect(out).toContain('--codex-auto-approve');
+
+  const asked = sandbox(['codex']);
+  const ask = (answer: string) =>
+    execFileSync('bash', [script, 'codex'], {
+      env: { PATH: `${join(asked.home, 'bin')}:/usr/bin:/bin`, HOME: asked.home, FEEDBACK_GRAPH_ENV: join(asked.home, 'no.env'), FEEDBACK_INSTALL_INTERACTIVE: '1' },
+      encoding: 'utf8',
+      input: answer,
+    });
+  ask('\n');
+  expect(readFileSync(asked.config, 'utf8')).not.toContain('default_tools_approval_mode');
+  ask('y\n');
+  expect(readFileSync(asked.config, 'utf8')).toContain(APPROVE);
+});
+
+test('--dry-run with --codex-auto-approve writes nothing', () => {
+  const s = sandbox(['codex']);
+  expect(s.run(['codex', '--dry-run', '--codex-auto-approve'])).toContain(`would: add ${APPROVE}`);
+  expect(existsSync(s.config)).toBe(false);
 });

@@ -25,6 +25,10 @@ export const SCHEMA = [
   'CREATE CONSTRAINT fact_id IF NOT EXISTS FOR (n:Fact) REQUIRE n.id IS UNIQUE',
   'CREATE CONSTRAINT scanjob_id IF NOT EXISTS FOR (n:ScanJob) REQUIRE n.id IS UNIQUE',
   'CREATE INDEX fact_project IF NOT EXISTS FOR (n:Fact) ON (n.projectKey, n.current)',
+  'CREATE INDEX fact_doc IF NOT EXISTS FOR (n:Fact) ON (n.docId)',
+  'CREATE INDEX doc_read IF NOT EXISTS FOR (n:Doc) ON (n.readStatus)',
+  'CREATE INDEX docblob_doc IF NOT EXISTS FOR (n:DocBlob) ON (n.docId)',
+  'CREATE CONSTRAINT projectlink_id IF NOT EXISTS FOR (n:ProjectLink) REQUIRE n.id IS UNIQUE',
   'CREATE INDEX codefile_project IF NOT EXISTS FOR (n:CodeFile) ON (n.projectKey)',
   'CREATE INDEX scanjob_status IF NOT EXISTS FOR (n:ScanJob) ON (n.status)',
   `CREATE VECTOR INDEX fact_embedding IF NOT EXISTS FOR (n:Fact) ON n.embedding

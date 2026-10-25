@@ -1,12 +1,25 @@
 import { randomUUID } from 'node:crypto';
 import neo4j from 'neo4j-driver';
-import type { CodeFact, FactKind, Project, ProjectSummary, ScanJob, ScanStatus } from '../types.ts';
+import type { CodeFact, FactKind, Project, ProjectSummary, RelevanceBy, ScanJob, ScanStatus } from '../types.ts';
 import { redactDeep, redactSecrets } from '../redact.ts';
 import type { FactsStore } from '../store.ts';
 import type { GraphRepo } from './repo.ts';
 
 /** A stored fact with its provenance: which model, which scan, which version of the file. */
-export type StoredFact = CodeFact & { id: string; source: string; createdAt: string; scanJobId: string | null; fileHash: string | null; fileSummary: string | null };
+export type StoredFact = Omit<CodeFact, 'relevance'> & {
+  id: string; source: string; createdAt: string; scanJobId: string | null; fileHash: string | null; fileSummary: string | null;
+  relevance: number | null; relevanceBy: RelevanceBy | null;
+  /** Set for a fact read from an uploaded document (path is then the document's name); null for code facts. */
+  docId: string | null;
+};
+/** A current fact with no relevance yet, for the background scorer. */
+export type UnscoredFact = { id: string; projectKey: string; kind: FactKind; statement: string; path: string; why: string };
+/** projectKey: only a fact of that project is changed. */
+export type RelevanceUpdate = { id: string; relevance: number; by: RelevanceBy; projectKey?: string };
+/** 0..1, so a model's or a request's stray number cannot skew ranking. */
+export const clampRelevance = (r: number) => (Number.isFinite(r) ? Math.min(1, Math.max(0, r)) : 0.5);
+/** Store form of an extracted fact's relevance: a number in range, or null (not scored). */
+export const relevanceOf = (f: Pick<CodeFact, 'relevance'>) => (typeof f.relevance === 'number' ? clampRelevance(f.relevance) : null);
 export type FactHit = { fact: StoredFact; score: number };
 export type EmbeddedFact = CodeFact & { embedding: number[] };
 
@@ -60,9 +73,10 @@ export class FactsRepo implements FactsStore {
        UNWIND $facts AS fx
          CREATE (n:Fact {id: randomUUID(), projectKey: $projectKey, kind: fx.kind, statement: fx.statement, path: fx.path,
                          lines: fx.lines, confidence: fx.confidence, why: fx.why, embedding: fx.embedding, source: $source,
+                         relevance: fx.relevance, relevanceBy: CASE WHEN fx.relevance IS NULL THEN null ELSE 'model' END,
                          scanJobId: $scanJobId, fileHash: $file.hash, current: true, createdAt: $now, validFrom: $now})
          CREATE (n)-[:ABOUT]->(cf)`,
-      { projectKey, file, facts, source, now, scanJobId },
+      { projectKey, file, facts: facts.map((fx) => ({ ...fx, relevance: relevanceOf(fx) })), source, now, scanJobId },
     );
   }
 
@@ -88,7 +102,8 @@ export class FactsRepo implements FactsStore {
     // One transaction: if writing the new facts fails, the old ones stay current and the hashes stay stale,
     // so the next scan tries again instead of finding "nothing changed" over an empty project.
     await this.g.runInTransaction([
-      [`MATCH (x:Fact {projectKey: $projectKey, current: true}) SET x.current = false, x.validTo = $now`, { projectKey, now }],
+      // Facts read from your documents are not the code's: a scan never closes them.
+      [`MATCH (x:Fact {projectKey: $projectKey, current: true}) WHERE x.docId IS NULL SET x.current = false, x.validTo = $now`, { projectKey, now }],
       [`MERGE (p:Project {key: $projectKey})
        WITH p
        UNWIND $files AS fl
@@ -105,9 +120,10 @@ export class FactsRepo implements FactsStore {
          MERGE (cf)-[:IN]->(p)
          CREATE (n:Fact {id: randomUUID(), projectKey: $projectKey, kind: fx.kind, statement: fx.statement, path: fx.path,
                          lines: fx.lines, confidence: fx.confidence, why: fx.why, embedding: fx.embedding, source: $source,
+                         relevance: fx.relevance, relevanceBy: CASE WHEN fx.relevance IS NULL THEN null ELSE 'model' END,
                          scanJobId: $scanJobId, fileHash: cf.hash, current: true, createdAt: $now, validFrom: $now})
          CREATE (n)-[:ABOUT]->(cf)`,
-        { projectKey, facts: facts.map((f) => ({ ...f, path: f.path || PROJECT_PATH })), source, now, scanJobId },
+        { projectKey, facts: facts.map((f) => ({ ...f, path: f.path || PROJECT_PATH, relevance: relevanceOf(f) })), source, now, scanJobId },
       ],
     ]);
   }
@@ -115,7 +131,7 @@ export class FactsRepo implements FactsStore {
   /** Which models wrote the project's current facts; a scan with a different one rescans every file. */
   async currentSources(projectKey: string): Promise<string[]> {
     const rows = await this.g.run(
-      `MATCH (x:Fact {projectKey: $projectKey, current: true}) RETURN DISTINCT x.source AS s ORDER BY s`,
+      `MATCH (x:Fact {projectKey: $projectKey, current: true}) WHERE x.docId IS NULL RETURN DISTINCT x.source AS s ORDER BY s`,
       { projectKey },
     );
     return rows.map((r) => r.get('s'));
@@ -124,7 +140,7 @@ export class FactsRepo implements FactsStore {
   async listFacts(q: { projectKey: string; kind?: FactKind; path?: string; limit?: number }): Promise<StoredFact[]> {
     const rows = await this.g.run(
       `MATCH (x:Fact {projectKey: $projectKey, current: true})
-       WHERE ($kind IS NULL OR x.kind = $kind) AND ($path IS NULL OR x.path = $path)
+       WHERE ($kind IS NULL OR x.kind = $kind) AND ($path IS NULL OR (x.path = $path AND x.docId IS NULL))
        OPTIONAL MATCH (x)-[:ABOUT]->(cf:CodeFile)
        RETURN x, cf.summary AS fileSummary ORDER BY x.path, x.createdAt LIMIT $limit`,
       { projectKey: q.projectKey, kind: q.kind ?? null, path: q.path ?? null, limit: neo4j.int(q.limit ?? 500) },
@@ -142,6 +158,31 @@ export class FactsRepo implements FactsStore {
       { embedding: q.embedding, k: neo4j.int(q.k), projectKey: q.projectKey },
     );
     return rows.map((r) => ({ fact: factOf(r.get('node').properties, r.get('fileSummary')), score: r.get('score') }));
+  }
+
+  async unscoredFacts(q: { projectKeys: string[]; limit: number }): Promise<UnscoredFact[]> {
+    const rows = await this.g.run(
+      `MATCH (x:Fact {current: true}) WHERE x.projectKey IN $keys AND x.relevance IS NULL
+       RETURN x ORDER BY x.projectKey, x.path, x.createdAt, x.id LIMIT $limit`,
+      { keys: q.projectKeys, limit: neo4j.int(q.limit) },
+    );
+    return rows.map((r) => {
+      const p = r.get('x').properties;
+      return { id: p.id, projectKey: p.projectKey, kind: p.kind, statement: p.statement, path: p.path, why: p.why ?? '' };
+    });
+  }
+
+  /** A model's score never replaces yours. Returns how many facts changed. */
+  async setFactRelevance(updates: RelevanceUpdate[]): Promise<number> {
+    if (!updates.length) return 0;
+    const [r] = await this.g.run(
+      `UNWIND $updates AS u
+       MATCH (x:Fact {id: u.id}) WHERE (u.projectKey IS NULL OR x.projectKey = u.projectKey) AND (u.by = 'you' OR coalesce(x.relevanceBy, '') <> 'you')
+       SET x.relevance = u.relevance, x.relevanceBy = u.by
+       RETURN count(x) AS n`,
+      { updates: updates.map((u) => ({ ...u, projectKey: u.projectKey ?? null, relevance: clampRelevance(u.relevance) })) },
+    );
+    return Number(r.get('n'));
   }
 
   async requestScan(project: Project, provider: string | null): Promise<ScanJob> {
@@ -171,10 +212,11 @@ export class FactsRepo implements FactsStore {
     return r ? jobOf(r.get('j').properties) : null;
   }
 
-  async nextScanJob(now = new Date()): Promise<ScanJob | null> {
+  async nextScanJob(now = new Date(), exclude: string[] = []): Promise<ScanJob | null> {
     const [r] = await this.g.run(
-      `MATCH (j:ScanJob {status: 'queued'}) WHERE coalesce(j.retryAt, '') <= $now RETURN j ORDER BY j.requestedAt LIMIT 1`,
-      { now: now.toISOString() },
+      `MATCH (j:ScanJob {status: 'queued'}) WHERE coalesce(j.retryAt, '') <= $now AND NOT j.id IN $exclude
+       RETURN j ORDER BY j.requestedAt, j.id LIMIT 1`,
+      { now: now.toISOString(), exclude },
     );
     return r ? jobOf(r.get('j').properties) : null;
   }
@@ -237,7 +279,16 @@ export class FactsRepo implements FactsStore {
       lessons: r.get('lessons'),
       facts: r.get('facts'),
       lastScan: r.get('last') ? jobOf(r.get('last').properties) : null,
+      pinned: r.get('p').properties.pinned === true,
     }));
+  }
+
+  async setPinned(project: Project, pinned: boolean) {
+    await this.g.run(
+      `MERGE (p:Project {key: $key})
+       SET p.pinned = $pinned, p.name = coalesce(p.name, $name), p.repoPath = coalesce(p.repoPath, $repoPath)`,
+      { key: project.key, name: project.name, repoPath: project.repoPath, pinned },
+    );
   }
 }
 
@@ -250,6 +301,9 @@ function factOf(p: Record<string, unknown>, fileSummary: string | null = null): 
     lines: (p.lines as string) ?? null,
     confidence: p.confidence as number,
     why: (p.why as string) ?? '',
+    relevance: typeof p.relevance === 'number' ? p.relevance : null,
+    relevanceBy: (p.relevanceBy as RelevanceBy) ?? null,
+    docId: (p.docId as string) ?? null,
     source: p.source as string,
     scanJobId: (p.scanJobId as string) ?? null,
     fileHash: (p.fileHash as string) ?? null,

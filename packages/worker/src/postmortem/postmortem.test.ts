@@ -1,7 +1,7 @@
 import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import type { HumanTurn, PostMortemInput } from '@fb/core';
+import { STRICT_JSON, type HumanTurn, type PostMortemInput } from '@fb/core';
 import { expect, test } from 'vitest';
 import { buildPrompt, loadStandingContext, markAvailability, memoryDirFor, runPostMortem } from './postmortem.ts';
 
@@ -192,6 +192,17 @@ const answer = (lesson: Partial<{ scope: string; paths: string[] }>) => ({
   taskTitle: 'Customer search', missed: 'filtering was client-side', cause: 'requirement_unstated', causeExplanation: 'x', outcome: 'approved',
   lesson: { title: 'Server-side search', rule: 'Filter search on the server', appliesWhen: 'building search', scope: 'project', paths: [], ...lesson },
   contextItems: [],
+});
+
+test('an answer of the wrong shape is asked again once, more strictly; a second one fails with the end of the answer', async () => {
+  const systems: string[] = [];
+  const replies: unknown[] = [{ missed: 'half an answer' }, answer({})];
+  const llm = { id: 'x', agentic: false, json: async (t: { system: string }) => { systems.push(t.system); return replies.shift(); } };
+  const ok = await runPostMortem(input, { llm: llm as never, standing: async () => [], facts: async () => [] });
+  expect(ok.missed).toBe('filtering was client-side');
+  expect(systems[1]).toContain(STRICT_JSON);
+  const bad = { id: 'x', agentic: false, json: async () => ({ missed: 'half an answer' }) };
+  await expect(runPostMortem(input, { llm: bad as never, standing: async () => [], facts: async () => [] })).rejects.toThrow(/did not match the schema.*half an answer/);
 });
 
 test('the model is shown the files the session edited and where the fix landed, and the lesson is scoped to them', async () => {

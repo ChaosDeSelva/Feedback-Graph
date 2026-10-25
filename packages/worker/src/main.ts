@@ -1,12 +1,12 @@
 import { lstat, readdir, readFile, writeFile } from 'node:fs/promises';
-import { dirname, join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import {
   ConfigError, fetchPullRequestContext, projectFolders, refreshLayout, relOfKey, killRunningCommands, loadConfig, makeProvider, ollamaEmbed, projectScope, providerUnavailableReason, ProviderUnavailableError, redactSecrets, runCloudSync, syncProjects,
-  credentialFile, fetchLinearComments, Integrations, searchLinearIssues, selectionNote, storedSyncMemory, touchedAround, VERSION, withHealth, type KnowledgeStore, type LlmProvider, type ModelJob, type ProjectScope, type SyncMemory, type WorkerStatus,
+  credentialFile, fetchLinearComments, Integrations, searchLinearIssues, selectionNote, storedSyncMemory, touchedAround, VERSION, withHealth, type KnowledgeStore, type LlmProvider, type ModelJob, type ProjectScope, type ScanJob, type SyncMemory, type WorkerStatus,
 } from '@fb/core';
 import { openStore } from '@fb/store-postgres';
 import { CloudSyncSchedule } from './cloud/schedule.ts';
-import { MapStage } from './codegraph/stage.ts';
+import { EDITED_PATHS_LIMIT, MapStage } from './codegraph/stage.ts';
 import { runCycle, type FileInfo } from './cycle.ts';
 import { classifyTurn } from './detect/classify.ts';
 import { codexSessionFiles } from './ingest/codex.ts';
@@ -21,9 +21,14 @@ import { syncGithub } from './integrations/githubSync.ts';
 import { githubTarget, syncExternalFeedback, type SyncProject } from './integrations/feedbackSync.ts';
 import { attachWorkSession } from './postmortem/work.ts';
 import { runPostmortems } from './postmortem/step.ts';
-import { runScan } from './scan/scan.ts';
+import { ScanRunner } from './scan/runner.ts';
+import { hasCodeFiles, runScan } from './scan/scan.ts';
+import { scoreFacts, ScoringPacer } from './relevance/score.ts';
+import { runLinkDetection } from './links/stage.ts';
+import { readOneDoc } from './docs/read.ts';
 import { SummarizeStage } from './summarize/stage.ts';
 import { FileState } from './state.ts';
+import { healthSince, StageTracker } from './progress.ts';
 
 const log = (msg: string, extra: object = {}) => console.log(JSON.stringify({ ts: new Date().toISOString(), msg, ...extra }));
 
@@ -39,6 +44,9 @@ function provider(job: string, spec: string, why?: (reason: string) => void): Ll
     return null;
   }
 }
+
+/** Providers that explore the repo themselves (LlmProvider.agentic): their scans run one at a time. */
+const AGENTIC_SPEC = /^(claude-cli|codex-cli)(:|$)/;
 
 /** Claude Code transcripts sit one level down: <transcripts>/<encoded-project>/<session>.jsonl. Links are not followed. */
 async function listTranscripts(dir: string): Promise<FileInfo[]> {
@@ -59,6 +67,7 @@ export const embedMismatch = (stored: string, configured: string) =>
   `OLLAMA_EMBED_MODEL is ${configured} but the stored vectors were embedded with ${stored}. Set it back to ${stored}, or re-embed: docker compose run --rm worker node src/reembed.ts`;
 
 const HEARTBEAT_MS = 30_000;
+const STAGE_BEAT_MS = 3_000;
 const HEARTBEAT_FILE = process.env.HEARTBEAT_FILE ?? '/tmp/fg-heartbeat';
 const RETENTION_EVERY_MS = 6 * 3600_000;
 const REMOTE_TTL_MS = 10 * 60_000;
@@ -73,6 +82,7 @@ async function main() {
   if (!emb.ok) throw new ConfigError([embedMismatch(emb.stored, config.ollama.embedModel)]);
   const { graph: repo, knowledge, facts, activity, docs, selection } = store;
   await facts.requeueStaleScans();
+  await docs.requeueStaleDocs();
 
   const transcripts = config.transcriptsDir;
   const roots = config.roots;
@@ -81,7 +91,7 @@ async function main() {
 
   // Each job's model reports whether it answers, so /api/status (and the sidebar badge) can say which one is down.
   const health: NonNullable<WorkerStatus['health']> = {};
-  const tracked = (job: ModelJob, p: LlmProvider | null) => p && withHealth(p, (h) => { health[job] = h; });
+  const tracked = (job: ModelJob, p: LlmProvider | null) => p && withHealth(p, (h) => { health[job] = healthSince(health[job], h); });
   const classifier = tracked('classify', provider('classify', config.llm.classify ?? localModel));
   const postmortemLlm = tracked(
     'postmortem',
@@ -89,6 +99,8 @@ async function main() {
       provider('postmortem (fallback)', localModel),
   );
   const defaultScan = config.llm.scan ?? localModel;
+  // Reads your uploads (documents and images) into facts; images need a model with vision.
+  const docsLlm = tracked('docs', provider('docs', config.llm.docs ?? defaultScan));
   // An unavailable summary model only pauses summaries; /api/status and the badge say so. SUMMARY_LLM=off is reported as off.
   const summaryLlm = config.summary.enabled ? tracked('summary', provider('summary', config.summary.llm ?? localModel)) : null;
   const state = new FileState(config.stateDb);
@@ -111,7 +123,7 @@ async function main() {
     lastCycleAt: null,
     lastCycle: null,
     lastError: null,
-    providers: { classify: classifier?.id ?? null, postmortem: postmortemLlm?.id ?? null, scan: defaultScan, summary: summaryLlm?.id ?? null },
+    providers: { classify: classifier?.id ?? null, postmortem: postmortemLlm?.id ?? null, scan: defaultScan, summary: summaryLlm?.id ?? null, docs: docsLlm?.id ?? null },
     health,
     off: config.summary.enabled ? [] : ['summary'],
   };
@@ -124,19 +136,28 @@ async function main() {
   };
   beat();
   const beater = setInterval(beat, HEARTBEAT_MS);
+  // The step running now (/api/status stage and progress): a change beats within a few seconds, not at the next beat.
+  let soon: NodeJS.Timeout | null = null;
+  const stage = new StageTracker(status, () => {
+    soon ??= setTimeout(() => { soon = null; beat(); }, STAGE_BEAT_MS);
+  });
 
   let stopping = false;
   let wake: (() => void) | null = null;
   /** MapStage.stop, once the stage exists (a signal can come before that). */
   let stopMapStage: (() => Promise<void>) | null = null;
+  /** ScanRunner.stop, likewise: nothing new starts once shutdown begins. */
+  let stopScans: (() => Promise<void>) | null = null;
   const shutdown = (signal: string) => {
     if (stopping) return;
     stopping = true;
     log('shutting down', { signal });
     clearInterval(beater);
+    if (soon) clearTimeout(soon);
     killRunningCommands(); // detached CLI agents would otherwise outlive the worker
     // Abandons a map being parsed now; the loop below waits for one being written before the store closes.
     void stopMapStage?.();
+    void stopScans?.();
     wake?.();
     setTimeout(() => process.exit(0), SHUTDOWN_GRACE_MS).unref();
   };
@@ -144,21 +165,49 @@ async function main() {
   process.once('SIGINT', () => shutdown('SIGINT'));
   process.once('exit', killRunningCommands);
 
+  // The classify step's size: the turns waiting (as fetched, so capped), and the model calls this cycle may make.
+  const stagedRepo = new Proxy(repo, {
+    get(target, key) {
+      if (key === 'unclassifiedTurns') {
+        return async (...args: Parameters<typeof repo.unclassifiedTurns>) => {
+          const turns = await target.unclassifiedTurns(...args);
+          status.backlog = { classify: turns.length, classifyCapped: turns.length >= args[0], at: new Date().toISOString() };
+          stage.enter('classify', { total: Math.min(turns.length, config.classifyBatch) });
+          return turns;
+        };
+      }
+      const v = Reflect.get(target, key);
+      return typeof v === 'function' ? v.bind(target) : v;
+    },
+  });
+
   const cycleDeps = {
-    listFiles: async () => [...(await listTranscripts(transcripts)), ...(await codexSessionFiles(config.codexSessionsDir)).map((f) => ({ ...f, source: 'codex' as const }))],
-    readFile: (p: string) => readFile(p, 'utf8'),
-    readLines,
+    listFiles: async () => {
+      stage.enter('ingest');
+      return [...(await listTranscripts(transcripts)), ...(await codexSessionFiles(config.codexSessionsDir)).map((f) => ({ ...f, source: 'codex' as const }))];
+    },
+    readFile: (p: string) => {
+      stage.step(basename(p));
+      return readFile(p, 'utf8');
+    },
+    readLines: (p: string) => {
+      stage.step(basename(p));
+      return readLines(p);
+    },
     folderOf: (p: string) => folderOf.get(p),
     state,
-    repo,
+    repo: stagedRepo,
     roots,
     commits: commitsInWindow,
     // No classifier (it could not be built) is unavailability too: turns wait for one instead of being charged.
     classify: async (t: Parameters<typeof classifyTurn>[0]) => {
       if (!classifier) throw new ProviderUnavailableError('no classifier could be built (see the provider log line at startup)');
-      return classifyTurn(t, classifier);
+      stage.step(t.uuid);
+      return classifyTurn(t, classifier, (error) => log('classification failed', { turn: t.uuid, error }));
     },
     classifyBatch: config.classifyBatch,
+    // Scans run beside the cycle and may hold the same model; a classify timeout meanwhile is a queue, not the turn.
+    modelBusy: () => scanRunner.running().length > 0,
     log,
     classifierId: classifier?.id,
     includeProject: (k: string) => scope.folder(k),
@@ -179,9 +228,15 @@ async function main() {
 
   const pmDeps = postmortemLlm && {
     k: knowledge,
+    modelBusy: () => scanRunner.running().length > 0,
     // A comment from GitHub or Linear is worked out against the agent session that did the work, when one is found.
     postmortem: async (raw: Parameters<typeof runPostMortem>[0]) => {
-      const input = await attachWorkSession(raw, { graph: repo, sessions: store.sessions });
+      stage.enter('postmortem', { current: raw.feedbackId });
+      const input = await attachWorkSession(raw, {
+        graph: repo,
+        sessions: store.sessions,
+        files: async (id) => (await store.codegraph.sessionFiles(id)).map((f) => f.path),
+      });
       return runPostMortem(input, {
         llm: postmortemLlm,
         touched: async (i) => touchedAround(await store.codegraph.sessionFiles(i.sessionId), i.feedback.ts),
@@ -246,6 +301,8 @@ async function main() {
     projects: selectedFolders,
     maxFiles: config.scanMaxFiles,
     maxBytes: config.scanMaxBytes,
+    // Files your sessions edited are kept first when the map is capped: they are where the next miss happens.
+    editedPaths: (key) => store.codegraph.editedPaths(key, EDITED_PATHS_LIMIT),
     log,
     exclusive: <T>(fn: () => Promise<T>) => selection.exclusive(fn),
     inScope: async (key: string) => (await selection.scope(config)).project(key),
@@ -270,9 +327,62 @@ async function main() {
   const { llm: _summarySpec, ...summarySettings } = config.summary;
   log('session summaries', config.summary.enabled ? { ...summarySettings, provider: summaryLlm?.id ?? null } : { enabled: false });
 
-  async function scanOne(): Promise<boolean> {
-    const job = await facts.nextScanJob();
-    if (!job) return false;
+  // Facts stored before relevance existed are scored by the scan model, a batch at a time, when nothing else is waiting.
+  // Not health-tracked: a scoring hiccup must not mark the scan model down.
+  const scorer = provider('relevance', defaultScan);
+  const scoring = scorer
+    ? new ScoringPacer(async () => {
+        try {
+          return await scoreFacts({ facts, llm: scorer, projects: () => scope.projects, activity, log });
+        } catch (err) {
+          log('relevance scoring failed', { error: redactSecrets(String(err)) });
+          throw err;
+        }
+      }, 10 * 60_000)
+    : null;
+  const scoreSome = () => scoring?.tick() ?? Promise.resolve(0);
+
+  // Links between the selected projects, from evidence in them (no model), every LINK_SCAN_MINUTES.
+  let linksAt = 0;
+  let linksRunning = false;
+  /** Beside the loop, never awaited by it: a round over many projects must not hold up ingest, scans or uploads. */
+  function detectLinksSometimes() {
+    if (linksRunning || Date.now() - linksAt < config.linkScanMinutes * 60_000) return;
+    linksAt = Date.now();
+    linksRunning = true;
+    void detectLinksRound()
+      .catch((err) => log('link detection failed', { error: redactSecrets(String(err)) }))
+      .finally(() => { linksRunning = false; });
+  }
+  async function detectLinksRound() {
+    const remotes = new Map((await facts.listProjects()).map((p) => [p.key, p.remote]));
+    const r = await runLinkDetection({
+      links: store.links,
+      projects: async () => (await selectedFolders()).map((p) => ({ ...p, remote: remotes.get(p.key) ?? null })),
+      activity,
+    });
+    log('links detected', r);
+  }
+
+  /**
+   * One upload read into facts; true when one was read (so the loop keeps going). Uploads skipped (a project not
+   * selected, replaced while picked, failed) are passed over in the same cycle, a few at most, unless the model is down.
+   */
+  async function readDocOne(): Promise<boolean> {
+    if (!docsLlm) return false;
+    stage.enter('docs');
+    for (let i = 0; i < 5; i++) {
+      const r = await readOneDoc({ docs, llm: docsLlm, embed, inScope: async (key) => scope.project(key), activity, log }).catch((err) => {
+        log('document reading failed', { error: redactSecrets(String(err)) });
+        return null;
+      });
+      if (!r || r.read || r.unavailable) return !!r?.read;
+    }
+    return false;
+  }
+
+  /** Run one claimed scan job to its end; true when it finished (done or failed), false when it went back to wait. */
+  async function scanJob(job: ScanJob): Promise<boolean> {
     if (!scope.folder(job.projectKey)) {
       await facts.updateScanJob(job.id, { status: 'failed', error: 'project is not selected in Settings, or is in EXCLUDE_PROJECTS' });
       return true;
@@ -287,7 +397,8 @@ async function main() {
     await mapStage.mapProject({ key: job.projectKey, repoPath: job.repoPath }, 'a scan was requested');
     log('scan started', { project: job.projectKey, provider: llm.id });
     let unavailable: string | null = null;
-    const r = await runScan(job, { facts, llm, embed, maxBytes: config.scanMaxBytes, maxFiles: config.scanMaxFiles, log, activity }).catch((err) => {
+    const touched = (key: string) => store.codegraph.editedPaths(key, EDITED_PATHS_LIMIT);
+    const r = await runScan(job, { facts, llm, embed, maxBytes: config.scanMaxBytes, maxFiles: config.scanMaxFiles, touched, log, activity }).catch((err) => {
       unavailable = providerUnavailableReason(err);
       if (unavailable) log('scan model unavailable, the scan stays queued', { project: job.projectKey, reason: unavailable });
       else log('scan failed', { project: job.projectKey, error: redactSecrets(String(err)) });
@@ -297,6 +408,18 @@ async function main() {
     // Back in the queue waiting out its retryAt (a failure or an unreachable model): not progress, so the loop sleeps.
     return !!r;
   }
+
+  // Scans run beside the cycle, SCAN_CONCURRENCY at once (agentic ones one at a time), not one per cycle.
+  const scanRunner = new ScanRunner({
+    next: (exclude) => facts.nextScanJob(new Date(), exclude),
+    agentic: (job) => AGENTIC_SPEC.test(job.provider || defaultScan),
+    empty: async (job) => !(await hasCodeFiles(job.repoPath)),
+    run: scanJob,
+    concurrency: config.scanConcurrency,
+    log,
+  });
+  stopScans = () => scanRunner.stop();
+  log('scans', { concurrency: config.scanConcurrency, maxFiles: config.scanMaxFiles ?? 'scales with the repo' });
 
   /** The selected projects with their remotes: the only ones whose PRs and issues are read. */
   async function syncProjectsList(): Promise<SyncProject[]> {
@@ -325,6 +448,8 @@ async function main() {
       cursors: docs,
       projects: syncProjectsList,
       githubOverride: config.github.repos,
+      botLogins: config.github.botLogins,
+      agentLogins: config.github.agentLogins,
       fetchPrs: fetchPullRequestContext,
       fetchLinear: fetchLinearComments,
       activity,
@@ -442,8 +567,10 @@ async function main() {
       await refreshCandidates();
       await forgetDeletedReads();
       // Each fails on its own: GitHub or Linear being down never holds up reading transcripts.
+      stage.enter('sync');
       await syncGithubDocs().catch((err) => log('github sync failed', { error: redactSecrets(String(err)) }));
       await syncFeedback().catch((err) => log('comment sync failed', { error: redactSecrets(String(err)) }));
+      detectLinksSometimes();
       const imported = await importMemories(memDeps);
       if (imported) log('memory lessons imported', { imported });
       await retention();
@@ -455,8 +582,11 @@ async function main() {
         // hold up the sync).
         void cloudSchedule?.tick();
         await forgetDeletedReads();
-        // Work you asked for (scans, confirmed feedback) runs before the history backfill.
-        const scanned = await scanOne();
+        // Work you asked for (scans, confirmed feedback) runs before the history backfill; scans run beside it.
+        scanRunner.kick();
+        const scanned = scanRunner.running().length;
+        // Your uploads, like scans, are work you asked for.
+        const docRead = await readDocOne();
         const pm: Awaited<ReturnType<typeof runPostmortems>> = pmDeps ? await runPostmortems(pmDeps) : { done: 0, failed: 0 };
         const { classifierUnavailable, ...r } = await runCycle(cycleDeps);
         summarizeStage?.kick();
@@ -465,20 +595,25 @@ async function main() {
         status.lastCycle = { ...r, postmortems: pm.done, postmortemFailures: pm.failed, scanned };
         status.lastError = classifierUnavailable ? `classifier unavailable: ${classifierUnavailable}`
           : pm.unavailable ? `post-mortem model unavailable: ${pm.unavailable}` : null;
-        // Failures back off on their own schedule; only real progress keeps the loop from sleeping.
-        progressed = r.turnsClassified > 0 || pm.done > 0 || scanned;
+        // Last in line: only when this round had nothing else to do.
+        const scored = r.turnsClassified > 0 || pm.done > 0 || docRead ? 0 : await scoreSome();
+        // Failures back off on their own schedule; only real progress keeps the loop from sleeping. Scans are not
+        // counted: they run beside the loop and refill their own slots as they finish.
+        progressed = r.turnsClassified > 0 || pm.done > 0 || docRead || scored > 0;
       } while (progressed && !stopping);
     } catch (err) {
       status.lastError = redactSecrets(String(err)).slice(0, 500);
       log('cycle failed', { error: status.lastError });
     }
     if (stopping) break;
+    stage.enter('waiting');
     await new Promise<void>((res) => {
       wake = res;
       setTimeout(res, config.pollSeconds * 1000);
     });
     wake = null;
   }
+  await scanRunner.stop();
   await mapStage.stop();
   state.close();
   await store.close();

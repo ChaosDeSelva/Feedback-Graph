@@ -2,9 +2,9 @@ import { execFileSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { ProviderUnavailableError, type ActivityInput, type LlmProvider, type ScanJob } from '@fb/core';
+import { ModelTimeoutError, ProviderUnavailableError, STRICT_JSON, type ActivityInput, type LlmProvider, type ScanJob } from '@fb/core';
 import { expect, test } from 'vitest';
-import { deterministicFacts, extractFileFacts, listCodeFiles, runScan, SCAN_PROMPT_VERSION, type ScanDeps } from './scan.ts';
+import { deterministicFacts, extractFileFacts, hasCodeFiles, listCodeFiles, listCodeFilesWithTotal, runScan, SCAN_PROMPT_VERSION, type ScanDeps } from './scan.ts';
 
 function repo(git = false) {
   const dir = mkdtempSync(join(tmpdir(), 'fbscan-'));
@@ -48,8 +48,8 @@ test('listCodeFiles respects .gitignore in a git repo', async () => {
 test('deterministicFacts reads package.json scripts and dependencies', () => {
   const facts = deterministicFacts([{ path: 'package.json', content: JSON.stringify({ scripts: { dev: 'vite' }, dependencies: { react: '^18' }, devDependencies: { vitest: '^3' } }) }]);
   expect(facts).toEqual([
-    { kind: 'command', statement: '`dev` script runs: vite', path: 'package.json', lines: null, confidence: 1, why: 'Read directly from package.json; no model involved.' },
-    { kind: 'dependency', statement: 'Dependencies: react ^18. Dev dependencies: vitest ^3.', path: 'package.json', lines: null, confidence: 1, why: 'Read directly from package.json; no model involved.' },
+    { kind: 'command', statement: '`dev` script runs: vite', path: 'package.json', lines: null, confidence: 1, why: 'Read directly from package.json; no model involved.', relevance: 0.7 },
+    { kind: 'dependency', statement: 'Dependencies: react ^18. Dev dependencies: vitest ^3.', path: 'package.json', lines: null, confidence: 1, why: 'Read directly from package.json; no model involved.', relevance: 0.5 },
   ]);
 });
 
@@ -60,16 +60,27 @@ const llm = (out: unknown, agentic = false): LlmProvider & { seen: { user: strin
 
 test('extractFileFacts pins facts to the file and drops low-confidence ones', async () => {
   const r = await extractFileFacts(llm({ summary: 'S', facts: [
-    { kind: 'convention', statement: 'keep', path: 'elsewhere.ts', lines: '1-2', confidence: 0.9, why: 'every route depends on it' },
-    { kind: 'gotcha', statement: 'drop', path: 'src/a.ts', lines: null, confidence: 0.2, why: 'w' },
+    { kind: 'convention', statement: 'keep', path: 'elsewhere.ts', lines: '1-2', confidence: 0.9, why: 'every route depends on it', relevance: 0.9 },
+    { kind: 'gotcha', statement: 'drop', path: 'src/a.ts', lines: null, confidence: 0.2, why: 'w', relevance: 0.5 },
   ] }), 'src/a.ts', 'code');
   expect(r.summary).toBe('S');
-  expect(r.facts).toEqual([{ kind: 'convention', statement: 'keep', path: 'src/a.ts', lines: '1-2', confidence: 0.9, why: 'every route depends on it' }]);
+  expect(r.facts).toEqual([{ kind: 'convention', statement: 'keep', path: 'src/a.ts', lines: '1-2', confidence: 0.9, why: 'every route depends on it', relevance: 0.9 }]);
 });
 
-test('extractFileFacts keeps a fact whose model left out the why', async () => {
-  const r = await extractFileFacts(llm({ summary: 'S', facts: [{ kind: 'api', statement: 'x', path: 'a', lines: null, confidence: 0.9 }] }), 'a', 'code');
+test('extractFileFacts keeps a fact whose model left out the why or the relevance (unscored), and clamps a stray relevance', async () => {
+  const r = await extractFileFacts(llm({ summary: 'S', facts: [{ kind: 'api', statement: 'x', path: 'a', lines: null, confidence: 0.9 }, { kind: 'api', statement: 'y', path: 'a', lines: null, confidence: 0.9, why: '', relevance: 3 }] }), 'a', 'code');
   expect(r.facts[0].why).toBe('');
+  expect(r.facts[0].relevance).toBeNull();
+  expect(r.facts[1].relevance).toBe(1);
+});
+
+test('the extraction prompt asks for relevance to everyday coding, with setup of external tools ranked low', async () => {
+  const seen: { system: string; schema: object }[] = [];
+  const m: LlmProvider = { id: 'ollama:gemma4', agentic: false, json: async (t) => { seen.push({ system: t.system, schema: t.schema }); return { summary: 'S', facts: [] }; } };
+  await extractFileFacts(m, 'a', 'code');
+  expect(seen[0].system).toMatch(/relevance/i);
+  expect(seen[0].system).toMatch(/external tool/i);
+  expect(JSON.stringify(seen[0].schema)).toContain('"relevance"');
 });
 
 function fakeDeps(over: Partial<ScanDeps> = {}) {
@@ -154,7 +165,33 @@ test('runScan (agentic) asks once for the whole repo and replaces project facts'
   expect(agent.seen[0].cwd).toBe(dir);
   expect(saved).toEqual([]);
   expect(replaced).toEqual([{ facts: 5, files: 5 }]); // 2 agentic (bad path re-homed to '.') + 3 package.json facts
-  expect(r.filesScanned).toBe(5);
+  // Only what the model cited counts as scanned ('.' and a path outside the repo are not files it read).
+  expect(r.filesScanned).toBe(0);
+});
+
+test('an agentic scan reports the files the model cited as scanned, not every file it was shown', async () => {
+  const dir = repo(true);
+  const agent = llm({ facts: [
+    { kind: 'api', statement: 'a', path: './src/a.ts', lines: null, confidence: 0.9 },
+    { kind: 'api', statement: 'a2', path: 'src/a.ts', lines: null, confidence: 0.9 },
+    { kind: 'api', statement: 'b', path: 'src/b.py', lines: null, confidence: 0.9 },
+  ] }, true);
+  const { deps, updates, activity } = fakeDeps({ llm: agent });
+  const r = await runScan(job(dir), deps);
+  expect(r.filesScanned).toBe(2);
+  expect(updates.at(-1)).toMatchObject({ status: 'done', filesScanned: 2 });
+  expect(activity.at(-1)!.subject).toMatch(/^scanned 2 files/);
+});
+
+test('a project with no code files finishes at once: done, no facts, no model call', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'fbscan-'));
+  writeFileSync(join(dir, 'notes.txt'), 'x');
+  let calls = 0;
+  const { deps, updates } = fakeDeps({ llm: llm(() => { calls++; return { facts: [] }; }, true) });
+  deps.facts.fileHashes = async () => new Map();
+  expect(await runScan(job(dir), deps)).toEqual({ filesScanned: 0, factsAdded: 0, failed: 0, remaining: 0 });
+  expect(calls).toBe(0);
+  expect(updates.at(-1)).toMatchObject({ status: 'done', filesScanned: 0, factsAdded: 0 });
 });
 
 test('a provider that throws counts an attempt: the job is queued again with a backoff, and failed after the last one', async () => {
@@ -216,6 +253,45 @@ test('a file the model chokes on is logged and skipped; the rest of the scan sti
   expect(updates.at(-1)).toMatchObject({ status: 'done', error: '1 file failed: src/a.ts' });
 });
 
+const timedOut = () => new ModelTimeoutError('Ollama (gemma4) did not answer within 180 s');
+
+test('a file whose model call times out is skipped like any failure, and the scan goes on', async () => {
+  const dir = repo(true);
+  const slow = llm((user: string) => { if (user.includes('FILE: src/a.ts')) throw timedOut(); return { summary: 'S', facts: [] }; });
+  const { deps, saved, updates } = fakeDeps({ llm: slow });
+  const r = await runScan(job(dir), deps);
+  expect(r).toMatchObject({ failed: 1 });
+  expect(saved.map((x) => x.path)).toContain('README.md');
+  expect(updates.at(-1)).toMatchObject({ status: 'done', error: '1 file failed: src/a.ts' });
+});
+
+test('a model that times out on 3 files in a row fails the run as a counted attempt, instead of waiting out every file or staying queued forever', async () => {
+  const dir = repo(true);
+  let calls = 0;
+  const hung = llm(() => { calls++; throw timedOut(); });
+  const { deps, updates } = fakeDeps({ llm: hung });
+  await expect(runScan(job(dir), deps)).rejects.toThrow(/3 files in a row timed out.*did not answer within 180 s/);
+  expect(calls).toBe(3);
+  expect(updates.at(-1)).toMatchObject({ status: 'queued', counted: true, attempts: 1 });
+});
+
+test('an agentic scan that times out counts an attempt (it is not mistaken for an unavailable model)', async () => {
+  const { deps, updates } = fakeDeps({ llm: { id: 'codex-cli', agentic: true, json: async () => { throw new Error('codex exit 124: \ncodex timed out after 1800000ms'); } } });
+  await expect(runScan(job(repo(true)), deps)).rejects.toThrow(/timed out/);
+  expect(updates.at(-1)).toMatchObject({ status: 'queued', counted: true, attempts: 1 });
+});
+
+test('an agentic answer of the wrong shape is asked again once with a stricter instruction', async () => {
+  const systems: string[] = [];
+  const replies: unknown[] = [{ facts: 'I explored the repo and' }, { facts: [{ kind: 'architecture', statement: 'Hono API', path: '.', lines: null, confidence: 0.9 }] }];
+  const agent: LlmProvider = { id: 'codex-cli', agentic: true, json: async (t) => { systems.push(t.system); return replies.shift(); } };
+  const { deps, replaced } = fakeDeps({ llm: agent });
+  await runScan(job(repo(true)), deps);
+  expect(systems).toHaveLength(2);
+  expect(systems[1]).toContain(STRICT_JSON);
+  expect(replaced).toEqual([{ facts: 4, files: 5 }]);
+});
+
 test('the file cap limits how many changed files are scanned per run, and never closes facts of files beyond it', async () => {
   const dir = repo(true);
   const { deps, saved, removed, activity } = fakeDeps({ maxFiles: 2 });
@@ -235,7 +311,8 @@ test('scanning with a different model than last time rescans every file, even un
   deps.facts.currentSources = async () => ['ollama:gemma4'];
   const r = await runScan(job(dir), deps);
   expect(replaced).toHaveLength(1);
-  expect(r.filesScanned).toBe(files.length);
+  expect(replaced[0].files).toBe(files.length);
+  expect(r.filesScanned).toBe(0); // the model cited only "."
   expect(activity[0].why).toMatch(/different model/);
 });
 
@@ -274,4 +351,57 @@ test('one-file extraction sends only the file text: an agentic model gets a fres
   expect(seen[0].cwd).not.toBe(process.cwd());
   expect(seen[0].files).toEqual([]);
   await expect(stat(seen[0].cwd!)).rejects.toThrow();
+});
+
+test('listCodeFilesWithTotal ranks before capping: source, not the alphabetically first config, fills a small cap', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'fbscan-'));
+  const w = (p: string, c = 'x') => { mkdirSync(join(dir, p, '..'), { recursive: true }); writeFileSync(join(dir, p), c); };
+  for (let i = 0; i < 5; i++) w(`.github/workflows/w${i}.yml`);
+  for (let i = 0; i < 5; i++) w(`deploy/k8s/s${i}.yaml`);
+  w('docs/guide.md');
+  w('src/webapp/page.tsx', 'export const p = 1;');
+  w('src/webapp/page.test.tsx', 'import "./page";');
+  w('go.mod', 'module example.com/demo\n');
+  const r = await listCodeFilesWithTotal(dir, { maxBytes: 80_000, maxFiles: 3 });
+  expect(r.files.map((f) => f.path)).toEqual(['go.mod', 'src/webapp/page.tsx', 'src/webapp/page.test.tsx']);
+  expect(r.totalCandidates).toBe(14);
+  expect(r.cap).toBe(3);
+});
+
+test('a large file is read in parts cut where its functions start, not cut off at 24,000 characters', async () => {
+  const fn = (name: string) => `export function ${name}() {\n${`  const x = '${'y'.repeat(70)}';\n`.repeat(200)}}\n`;
+  const content = [fn('first'), fn('second'), fn('third')].join('');
+  const seen: string[] = [];
+  const m = llm((user: string) => {
+    seen.push(user);
+    const part = seen.length;
+    return { summary: `S${part}`, facts: [{ kind: 'api', statement: `from part ${part}`, path: 'x', lines: null, confidence: 0.9, why: 'w', relevance: 0.5 }] };
+  });
+  const r = await extractFileFacts(m, 'src/big.ts', content);
+  expect(seen).toHaveLength(3);
+  expect(seen[0]).toMatch(/^FILE: src\/big\.ts \(lines 1-202, part 1 of 3\)\n\nexport function first/);
+  expect(seen[2]).toContain('export function third');
+  expect(r.summary).toBe('S1');
+  expect(r.facts.map((f) => f.statement)).toEqual(['from part 1', 'from part 2', 'from part 3']);
+});
+
+test('hasCodeFiles: false for a folder with nothing worth scanning, so its scan needs no slot', async () => {
+  const empty = mkdtempSync(join(tmpdir(), 'fbscan-'));
+  writeFileSync(join(empty, 'notes.txt'), 'x');
+  writeFileSync(join(empty, '.env'), 'TOKEN=x');
+  expect(await hasCodeFiles(empty)).toBe(false);
+  expect(await hasCodeFiles(repo(true))).toBe(true);
+  expect(await hasCodeFiles(join(empty, 'missing'))).toBe(false);
+});
+
+test('listCodeFilesWithTotal puts files sessions edited first, and scales an unset cap with the repo', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'fbscan-'));
+  const w = (p: string) => { mkdirSync(join(dir, p, '..'), { recursive: true }); writeFileSync(join(dir, p), 'x'); };
+  for (let i = 0; i < 450; i++) w(`src/m${String(i).padStart(3, '0')}.ts`);
+  w('docs/edited.md');
+  const r = await listCodeFilesWithTotal(dir, { maxBytes: 80_000, maxFiles: null, priority: ['docs/edited.md'] });
+  expect(r.cap).toBe(400);
+  expect(r.files).toHaveLength(400);
+  expect(r.files[0].path).toBe('docs/edited.md');
+  expect(r.totalCandidates).toBe(451);
 });

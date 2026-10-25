@@ -87,6 +87,16 @@ export class KnowledgeRepo implements KnowledgeStore {
     this.g = g;
   }
 
+  async postmortemBacklog(): Promise<number> {
+    const [r] = await this.g.run(
+      `MATCH (f:Feedback)-[:FROM_TURN]->(:Turn)<-[:HAS_TURN]-(:Session)-[:IN]->(:Project)
+       WHERE NOT (f)<-[:EXPLAINS]-(:Miss) AND f.status <> 'rejected' AND coalesce(f.attempts, 0) < $max
+       RETURN count(DISTINCT f) AS n`,
+      { max: MAX_POSTMORTEM_ATTEMPTS },
+    );
+    return Number(r.get('n'));
+  }
+
   async feedbackNeedingPostmortem(limit: number, now = new Date()): Promise<PostMortemInput[]> {
     const rows = await this.g.run(
       `MATCH (f:Feedback)-[:FROM_TURN]->(t:Turn)<-[:HAS_TURN]-(s:Session)-[:IN]->(p:Project)
@@ -236,7 +246,7 @@ export class KnowledgeRepo implements KnowledgeStore {
   }
 
   /** `unscoped`: you narrowed it but its project is unknown, so it went back to proposed instead of serving everywhere. */
-  async updateLesson(id: string, patch: LessonPatch, o: { reembed?: number[] }): Promise<{ unscoped: boolean }> {
+  async updateLesson(id: string, patch: LessonPatch, o: { reembed?: number[]; by?: string }): Promise<{ unscoped: boolean }> {
     const now = new Date().toISOString();
     const { supersedes, status, ...fields } = patch;
     if (supersedes !== undefined) {
@@ -247,7 +257,7 @@ export class KnowledgeRepo implements KnowledgeStore {
     const rows = await this.g.run(
       `MATCH (l:Lesson {id: $id})
        SET l += $fields, l.decidedByYou = true
-       FOREACH (_ IN CASE WHEN $status IS NULL THEN [] ELSE [1] END | SET l.status = $status, l.decidedAt = $now)
+       FOREACH (_ IN CASE WHEN $status IS NULL THEN [] ELSE [1] END | SET l.status = $status, l.decidedAt = $now, l.decidedBy = $by)
        FOREACH (_ IN CASE WHEN $embedding IS NULL THEN [] ELSE [1] END | SET l.embedding = $embedding)
        WITH l
        // Scope decides who sees it: global has no project; project/task go back to the project it came from.
@@ -267,7 +277,7 @@ export class KnowledgeRepo implements KnowledgeStore {
          MERGE (l)-[:SUPERSEDES]->(old)
          SET old.status = 'superseded', old.decidedAt = $now, old.validTo = $now)
        RETURN unscoped`,
-      { id, fields, status: status ?? null, now, embedding: o.reembed ?? null, supersedes: supersedes ?? null },
+      { id, fields, status: status ?? null, now, by: o.by ?? 'you', embedding: o.reembed ?? null, supersedes: supersedes ?? null },
     );
     return { unscoped: rows[0]?.get('unscoped') ?? false };
   }
@@ -401,5 +411,6 @@ function lessonOf(p: Record<string, unknown>): Lesson {
     missId: (p.missId as string) ?? null,
     createdAt: p.createdAt as string,
     decidedAt: (p.decidedAt as string) ?? null,
+    decidedBy: (p.decidedBy as string) ?? null,
   };
 }

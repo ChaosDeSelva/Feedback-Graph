@@ -80,6 +80,10 @@ export const UploadIcon = (p: P) => (
 export const DownloadIcon = (p: P) => (
   <Icon {...p}><path d="M8 2.5v8M5 7.7 8 10.5l3-2.8M2.5 10v3.5h11V10" /></Icon>
 );
+/** A pushpin; `filled` when pinned. */
+export const PinIcon = ({ filled = false, ...p }: P & { filled?: boolean }) => (
+  <Icon {...p}><path d="M6 2.5h4l-.5 4 2 2v1H4.5v-1l2-2Z" fill={filled ? 'currentColor' : 'none'} /><path d="M8 9.5V14" /></Icon>
+);
 export const ChevronIcon = (p: P) => (
   <Icon {...p}><path d="m6 4 4 4-4 4" /></Icon>
 );

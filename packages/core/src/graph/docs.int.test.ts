@@ -1,6 +1,8 @@
 import { beforeAll, expect, test } from 'vitest';
 import type { DocsStore } from '../store.ts';
 import { describeStores, type StoreProbe } from '../testing/index.ts';
+import { MAX_SCAN_ATTEMPTS, SCAN_UNAVAILABLE_WAIT_MS } from './facts.ts';
+import type { CodeFact } from '../types.ts';
 
 const vec = (axis: number) => Array.from({ length: 768 }, (_, i) => (i === axis ? 1 : 0));
 
@@ -66,5 +68,105 @@ describeStores('DocsStore', (h) => {
     await d.upsertDoc(doc('a.md'), [{ text: 'same', embedding: vec(1) }, { text: 'orthogonal', embedding: vec(2) }]);
     const hits = await d.searchDocs({ embedding: vec(1), projectKey: 'shop', k: 2 });
     expect(hits.map((x) => [x.text, x.score])).toEqual([['same', 1], ['orthogonal', 0.5]]);
+  });
+});
+
+describeStores('DocsStore: reading uploads into facts', (h) => {
+  let d: DocsStore;
+  beforeAll(() => {
+    d = h.store.docs;
+  });
+  const png = { mediaType: 'image/png' as const, data: Buffer.from('png-bytes').toString('base64') };
+  const fact = (statement: string, relevance = 0.8): CodeFact & { embedding: number[] } => ({ kind: 'architecture', statement, path: 'flow.png', lines: null, confidence: 0.9, why: 'w', relevance, embedding: vec(4) });
+
+  test('an upload to read is pending with its text; synced docs are never read', async () => {
+    await d.upsertDoc(doc('PR 1', 'shop', 'github'), [{ text: 'review', embedding: vec(1) }]);
+    const id = await d.upsertDoc(doc('spec.md'), [{ text: 'part one', embedding: vec(1) }, { text: 'part two', embedding: vec(2) }], { read: true });
+    const listed = await d.listDocs('shop');
+    expect(listed.find((x) => x.id === id)).toMatchObject({ kind: 'text', read: { status: 'pending', attempts: 0, facts: 0, error: null } });
+    expect(listed.find((x) => x.source === 'github')).toMatchObject({ kind: 'text', read: null });
+    const next = await d.nextDocToRead();
+    expect(next).toMatchObject({ id, projectKey: 'shop', ref: 'spec.md', kind: 'text', text: 'part one\n\npart two', image: null, attempts: 0 });
+  });
+
+  test('an image upload keeps its bytes for the reader and the thumbnail; deleting the doc removes them', async () => {
+    const id = await d.upsertDoc(doc('flow.png'), [{ text: 'image, not read yet', embedding: vec(1) }], { read: true, image: png });
+    expect((await d.listDocs('shop'))[0]).toMatchObject({ kind: 'image', mediaType: 'image/png' });
+    expect(await d.nextDocToRead()).toMatchObject({ id, kind: 'image', image: png, text: '' });
+    expect(await d.docImage(id)).toEqual(png);
+    await d.deleteDoc(id);
+    expect(await d.docImage(id)).toBeNull();
+  });
+
+  test('saveDocReading replaces the excerpts (an image description), stores facts from the doc, and marks it read', async () => {
+    const id = await d.upsertDoc(doc('flow.png'), [{ text: 'image, not read yet', embedding: vec(1) }], { read: true, image: png });
+    await d.markDocReading(id);
+    expect(await d.nextDocToRead()).toBeNull();
+    await d.saveDocReading(id, { chunks: [{ text: 'A checkout flow: cart, then address, then payment.', embedding: vec(5) }], facts: [fact('Checkout asks for the address before payment')], source: 'ollama:gemma4' });
+    const [listed] = await d.listDocs('shop');
+    expect(listed).toMatchObject({ chunks: 1, read: { status: 'done', facts: 1, error: null } });
+    expect(listed.read?.readAt).toBeTruthy();
+    const [hit] = await d.searchDocs({ embedding: vec(5), projectKey: 'shop', k: 1 });
+    expect(hit.text).toContain('checkout flow');
+    const facts = await h.store.facts.listFacts({ projectKey: 'shop' });
+    expect(facts).toEqual([expect.objectContaining({ statement: 'Checkout asks for the address before payment', docId: id, path: 'flow.png', source: 'ollama:gemma4', relevance: 0.8, relevanceBy: 'model' })]);
+    const [found] = await h.store.facts.searchFacts({ embedding: vec(4), projectKey: 'shop', k: 3 });
+    expect(found.fact.docId).toBe(id);
+  });
+
+  test('doc facts survive code scans, and leave with their doc; uploading the doc again starts its reading over', async () => {
+    const id = await d.upsertDoc(doc('spec.md'), [{ text: 'x', embedding: vec(1) }], { read: true });
+    await d.saveDocReading(id, { facts: [fact('From the spec')], source: 'p' });
+    await h.store.facts.replaceProjectFacts('shop', [{ ...fact('From the code'), path: 'src/a.ts' }], 'claude-cli', [{ path: 'src/a.ts', hash: 'h' }]);
+    expect((await h.store.facts.listFacts({ projectKey: 'shop' })).map((f) => f.statement).sort()).toEqual(['From the code', 'From the spec']);
+    expect(await h.store.facts.currentSources('shop')).toEqual(['claude-cli']);
+    await d.upsertDoc(doc('spec.md'), [{ text: 'new text', embedding: vec(1) }], { read: true });
+    expect((await h.store.facts.listFacts({ projectKey: 'shop' })).map((f) => f.statement)).toEqual(['From the code']);
+    expect((await d.listDocs('shop'))[0].read).toMatchObject({ status: 'pending', facts: 0 });
+    await d.saveDocReading(id, { facts: [fact('Again')], source: 'p' });
+    await d.deleteDoc(id);
+    expect((await h.store.facts.listFacts({ projectKey: 'shop' })).map((f) => f.statement)).toEqual(['From the code']);
+  });
+
+  test('a document uploaded again while it is being read keeps the new version: the old reading is dropped, and so is its failure', async () => {
+    const id = await d.upsertDoc(doc('flow.png'), [{ text: 'image, not read yet', embedding: vec(1) }], { read: true, image: png });
+    const old = (await d.nextDocToRead())!;
+    expect(await d.markDocReading(id, old.version)).toBe(true);
+    // The right screenshot, uploaded under the same name while the wrong one is being read.
+    await new Promise((r) => setTimeout(r, 5));
+    await d.upsertDoc(doc('flow.png'), [{ text: 'image, not read yet', embedding: vec(1) }], { read: true, image: { ...png, data: Buffer.from('right-bytes').toString('base64') } });
+    expect(await d.saveDocReading(id, { version: old.version, chunks: [{ text: 'the wrong screenshot', embedding: vec(5) }], facts: [fact('About the wrong image')], source: 'p' })).toBe(false);
+    expect(await d.recordDocFailure(id, 'boom', { counted: true, version: old.version })).toBeNull();
+    const [listed] = await d.listDocs('shop');
+    expect(listed.read).toMatchObject({ status: 'pending', attempts: 0, facts: 0, error: null });
+    expect((await d.searchDocs({ embedding: vec(5), projectKey: 'shop', k: 1 }))[0].text).toBe('image, not read yet');
+    const fresh = (await d.nextDocToRead())!;
+    expect(fresh.version).not.toBe(old.version);
+    expect(fresh.image?.data).toBe(Buffer.from('right-bytes').toString('base64'));
+    expect(await d.markDocReading(id, old.version)).toBe(false);
+    expect(await d.saveDocReading(id, { version: fresh.version, facts: [fact('About the right image')], source: 'p' })).toBe(true);
+  });
+
+  test('a failed reading backs off and gives up after MAX_SCAN_ATTEMPTS; an unreachable model waits without counting; stale readings are queued again', async () => {
+    const id = await d.upsertDoc(doc('spec.md'), [{ text: 'x', embedding: vec(1) }], { read: true });
+    const t0 = new Date('2026-10-24T10:00:00Z');
+    const at = (min: number) => new Date(t0.getTime() + min * 60_000);
+    expect(await d.recordDocFailure(id, 'model unavailable', { counted: false }, t0)).toEqual({ attempts: 0, retryAt: new Date(t0.getTime() + SCAN_UNAVAILABLE_WAIT_MS).toISOString() });
+    expect(await d.nextDocToRead(at(1))).toBeNull();
+    expect(await d.recordDocFailure(id, `boom ghp_${'F'.repeat(36)}`, { counted: true }, t0)).toEqual({ attempts: 1, retryAt: at(5).toISOString() });
+    expect((await d.listDocs('shop'))[0].read).toMatchObject({ status: 'pending', attempts: 1, error: expect.stringContaining('[REDACTED]') });
+    expect((await d.nextDocToRead(at(5)))?.id).toBe(id);
+    for (let i = 1; i < MAX_SCAN_ATTEMPTS; i++) await d.recordDocFailure(id, 'boom', { counted: true }, t0);
+    expect((await d.listDocs('shop'))[0].read).toMatchObject({ status: 'failed', attempts: MAX_SCAN_ATTEMPTS });
+    expect(await d.nextDocToRead(at(600))).toBeNull();
+    // Giving up at once, when retrying cannot help.
+    const blindOne = await d.upsertDoc(doc('c.png'), [{ text: 'z', embedding: vec(1) }], { read: true, image: png });
+    expect(await d.recordDocFailure(blindOne, 'jev cannot read images', { counted: true, final: true }, t0)).toEqual({ attempts: 1, retryAt: null });
+    expect((await d.listDocs('shop')).find((x) => x.id === blindOne)?.read).toMatchObject({ status: 'failed', error: 'jev cannot read images' });
+
+    const other = await d.upsertDoc(doc('b.md'), [{ text: 'y', embedding: vec(1) }], { read: true });
+    await d.markDocReading(other);
+    await d.requeueStaleDocs();
+    expect((await d.nextDocToRead())?.id).toBe(other);
   });
 });

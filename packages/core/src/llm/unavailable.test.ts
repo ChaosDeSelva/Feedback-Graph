@@ -1,7 +1,7 @@
 import { expect, test } from 'vitest';
 import { makeProvider } from './providers.ts';
 import type { ProviderHealth } from '../types.ts';
-import { ProviderUnavailableError, providerUnavailableReason, withHealth } from './unavailable.ts';
+import { ModelTimeoutError, modelTimeoutReason, ProviderUnavailableError, providerUnavailableReason, withHealth } from './unavailable.ts';
 
 const task = { system: 'S', user: 'U', schema: { type: 'object' } };
 const fetchFails = (cause: object) => (async () => { throw new TypeError('fetch failed', { cause }); }) as unknown as typeof fetch;
@@ -20,11 +20,24 @@ test('a model that cannot be reached is unavailable: refused, DNS, reset', async
   expect(await reasonFor('ollama:gemma4', {}, { fetchImpl: fetchFails({ code: 'EAI_AGAIN' }) })).toMatch(/EAI_AGAIN/);
 });
 
-test('a timeout is unavailable', async () => {
+test('a call that timed out is not unavailability: it is that item\'s failure, with its own reason', async () => {
   const slow = (async () => { throw new DOMException('The operation was aborted due to timeout', 'TimeoutError'); }) as unknown as typeof fetch;
-  expect(await reasonFor('ollama:gemma4', {}, { fetchImpl: slow })).toMatch(/timed out/);
+  expect(await reasonFor('ollama:gemma4', {}, { fetchImpl: slow })).toBeNull();
+  const ollamaErr = await makeProvider('ollama:gemma4', {}, { fetchImpl: slow }).json(task).catch((e: unknown) => e);
+  expect(ollamaErr).toBeInstanceOf(ModelTimeoutError);
+  expect(modelTimeoutReason(ollamaErr)).toMatch(/Ollama \(gemma4\) did not answer within 120 s.*OLLAMA_TIMEOUT_SECONDS/);
   const cliTimeout = async () => ({ code: 124, stdout: '', stderr: '\nclaude timed out after 120000ms' });
-  expect(await reasonFor('claude-cli', { CLAUDE_CODE_OAUTH_TOKEN: 't' }, { exec: cliTimeout })).toMatch(/timed out/);
+  expect(await reasonFor('claude-cli', { CLAUDE_CODE_OAUTH_TOKEN: 't' }, { exec: cliTimeout })).toBeNull();
+  expect(modelTimeoutReason(new Error('claude exit 124: claude timed out after 120000ms'))).toMatch(/timed out waiting for claude/);
+  expect(modelTimeoutReason(new Error('codex exit 124: x'))).toMatch(/timed out waiting for codex/);
+  expect(modelTimeoutReason(new Error('openai:gpt 408: slow'))).toMatch(/timed out/);
+  expect(modelTimeoutReason(new DOMException('aborted', 'TimeoutError'))).toMatch(/timed out/);
+  expect(modelTimeoutReason(new TypeError('fetch failed', { cause: { code: 'UND_ERR_HEADERS_TIMEOUT' } }))).toMatch(/timed out/);
+  expect(providerUnavailableReason(new TypeError('fetch failed', { cause: { code: 'UND_ERR_HEADERS_TIMEOUT' } }))).toBeNull();
+  // Failing to connect at all is still unavailability, even when it ends in a timeout.
+  expect(modelTimeoutReason(new TypeError('fetch failed', { cause: { code: 'UND_ERR_CONNECT_TIMEOUT' } }))).toBeNull();
+  expect(providerUnavailableReason(new TypeError('fetch failed', { cause: { code: 'UND_ERR_CONNECT_TIMEOUT' } }))).toMatch(/cannot reach/);
+  expect(modelTimeoutReason(new Error('label: invalid'))).toBeNull();
 });
 
 test('HTTP 5xx, a missing model (404), auth and rate limits are unavailable', async () => {
@@ -73,4 +86,11 @@ test('withHealth reports ok on an answer and the reason on unavailability, and l
   await expect(p.json(task)).rejects.toThrow(/unparseable/);
   expect(seen.map((h) => [h.ok, h.reason?.slice(0, 15) ?? null])).toEqual([[true, null], [false, 'cannot reach th']]);
   expect(seen[1].provider).toBe('x');
+});
+
+test('withHealth keeps whether the provider can read images', () => {
+  const see = withHealth({ id: 'ollama:gemma4', agentic: false, vision: true, json: async () => ({}) }, () => {});
+  const blindOne = withHealth({ id: 'jev', agentic: false, json: async () => ({}) }, () => {});
+  expect(see.vision).toBe(true);
+  expect(blindOne.vision).toBe(false);
 });

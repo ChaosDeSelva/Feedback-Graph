@@ -124,10 +124,10 @@ export class PgCodeGraphStore implements CodeGraphStore {
         [key, map.tests.map((t) => id(t.test)), map.tests.map((t) => id(t.target))],
       );
       await c.query(
-        `INSERT INTO code_maps (project_key, fingerprint, built_at, files, symbols, imports, tests) VALUES ($1, $2, $3, $4, $5, $6, $7)
+        `INSERT INTO code_maps (project_key, fingerprint, built_at, files, symbols, imports, tests, candidates) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
          ON CONFLICT (project_key) DO UPDATE SET fingerprint = EXCLUDED.fingerprint, built_at = EXCLUDED.built_at, files = EXCLUDED.files,
-           symbols = EXCLUDED.symbols, imports = EXCLUDED.imports, tests = EXCLUDED.tests`,
-        [key, map.fingerprint, now, map.stats.files, map.stats.symbols, map.stats.imports, map.stats.tests],
+           symbols = EXCLUDED.symbols, imports = EXCLUDED.imports, tests = EXCLUDED.tests, candidates = EXCLUDED.candidates`,
+        [key, map.fingerprint, now, map.stats.files, map.stats.symbols, map.stats.imports, map.stats.tests, map.candidates],
       );
     });
     return map.stats;
@@ -136,7 +136,7 @@ export class PgCodeGraphStore implements CodeGraphStore {
   async codeMapMeta(projectKey: string): Promise<CodeMapMeta | null> {
     const { rows: [m] } = await this.q('SELECT * FROM code_maps WHERE project_key = $1', [projectKey]);
     if (!m) return null;
-    return { fingerprint: m.fingerprint ?? null, builtAt: iso(m.built_at)!, stats: { files: m.files, symbols: m.symbols, imports: m.imports, tests: m.tests } };
+    return { fingerprint: m.fingerprint ?? null, builtAt: iso(m.built_at)!, stats: { files: m.files, symbols: m.symbols, imports: m.imports, tests: m.tests }, candidates: m.candidates ?? null };
   }
 
   async codeMap(projectKey: string): Promise<StoredCodeMap | null> {
@@ -178,6 +178,15 @@ export class PgCodeGraphStore implements CodeGraphStore {
   async sessionFiles(sessionId: string): Promise<SessionFile[]> {
     const { rows } = await this.q('SELECT * FROM session_files WHERE session_id = $1 ORDER BY path COLLATE "C"', [sessionId]);
     return rows.map((r) => ({ path: r.path, read: r.read, edited: r.edited, firstEditAt: iso(r.first_edit_at), lastEditAt: iso(r.last_edit_at) }));
+  }
+
+  async editedPaths(projectKey: string, limit: number): Promise<string[]> {
+    const { rows } = await this.q(
+      `SELECT path FROM session_files WHERE project_key = $1 AND edited
+       GROUP BY path ORDER BY max(last_edit_at) DESC NULLS LAST, path COLLATE "C" LIMIT $2`,
+      [projectKey, Math.max(0, Math.floor(limit))],
+    );
+    return rows.map((r) => r.path as string);
   }
 
   moduleContext(projectKey: string, path: string) {

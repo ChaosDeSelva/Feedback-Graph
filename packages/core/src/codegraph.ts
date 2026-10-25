@@ -32,10 +32,13 @@ export type CodeMapWrite = {
   churn: Record<string, FileChurn>;
   /** What the repo looked like when the map was built (git HEAD + dirty files); null when it cannot be told. */
   fingerprint: string | null;
+  /** Files worth mapping before the cap (SCAN_MAX_FILES): more than files.length when the map is capped. */
+  candidates?: number | null;
 };
 
 export type CodeMapStats = { files: number; symbols: number; imports: number; tests: number };
-export type CodeMapMeta = { fingerprint: string | null; builtAt: string; stats: CodeMapStats };
+/** candidates: files worth mapping before the cap; null for a map built before it was counted. */
+export type CodeMapMeta = { fingerprint: string | null; builtAt: string; stats: CodeMapStats; candidates: number | null };
 /** The stored map, in the parser's shape, so the next build can be incremental. Sorted by path (then position). */
 export type StoredCodeMap = CodeMapMeta & { files: MapFile[]; symbols: MapSymbol[]; imports: MapImport[] };
 
@@ -304,8 +307,9 @@ export function normalizeCodeMap(map: CodeMapWrite): Omit<CodeMapWrite, 'symbols
   const tests = [...new Map(map.tests.filter((t) => paths.has(t.test) && paths.has(t.target)).map((t) => [`${t.test}\0${t.target}`, t])).values()];
   const churn = Object.fromEntries(Object.entries(map.churn).filter(([p]) => paths.has(p)));
   const fingerprint = map.fingerprint === null ? null : redactSecrets(map.fingerprint);
+  const candidates = typeof map.candidates === 'number' && Number.isFinite(map.candidates) ? Math.max(files.length, Math.floor(map.candidates)) : null;
   return {
-    files, symbols, imports: [...imports.values()], tests, churn, fingerprint,
+    files, symbols, imports: [...imports.values()], tests, churn, fingerprint, candidates,
     stats: { files: files.length, symbols: symbols.length, imports: imports.size, tests: tests.length },
   };
 }
@@ -314,6 +318,12 @@ export function normalizeCodeMap(map: CodeMapWrite): Omit<CodeMapWrite, 'symbols
 
 /** Weight of one miss against log2 of churn and of dependents: a file agents got wrong once outranks busy files. */
 export const MISS_WEIGHT = 4;
+
+/** Map languages (MapFile.lang: a grammar name, an extension or a lowercased file name) that are docs, data or config. */
+const NOT_CODE = new Set(['md', 'mdx', 'txt', 'json', 'yaml', 'yml', 'toml', 'gitignore', 'example', 'godot', 'dockerfile', 'makefile']);
+
+/** Whether a mapped file is code: docs, data and config are mapped too, but are not where agents struggle by churning. */
+export const isCodeLang = (lang: string): boolean => !NOT_CODE.has(lang.toLowerCase());
 
 export function hotspotScore(p: { churn: number; misses: number; dependents: number }): number {
   const s = MISS_WEIGHT * p.misses + Math.log2(1 + p.churn) + Math.log2(1 + p.dependents);
@@ -421,7 +431,9 @@ export function codeGraphViews(r: CodeGraphReads) {
     const ranked = files
       .map((f) => {
         const parts = { churn: f.churn?.commits ?? 0, misses: missCount.get(f.path)?.size ?? 0, dependents: counts.get(f.path) ?? 0 };
-        return { path: f.path, ...parts, score: hotspotScore(parts), lang: f.lang, loc: f.loc, isTest: f.isTest };
+        // Deploy manifests and docs churn constantly; they rank only once a miss touched them.
+        const score = isCodeLang(f.lang) || parts.misses > 0 ? hotspotScore(parts) : 0;
+        return { path: f.path, ...parts, score, lang: f.lang, loc: f.loc, isTest: f.isTest };
       })
       .sort((a, b) => b.score - a.score || cmp(a.path, b.path));
     return { ranked, rows };

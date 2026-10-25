@@ -28,10 +28,14 @@ export type CodeImport = {
   spec: string;
 };
 
-export type CodeMap = { files: CodeFile[]; symbols: CodeSymbol[]; imports: CodeImport[] };
+/** candidates: files worth mapping before the cap (absent on a map from before it was counted). */
+export type CodeMap = { files: CodeFile[]; symbols: CodeSymbol[]; imports: CodeImport[]; candidates?: number | null };
 
-/** `signal`: stop parsing (the worker is shutting down); the build then rejects with the signal's reason. */
-export type BuildOpts = { maxFiles: number; maxBytes: number; concurrency?: number; signal?: AbortSignal };
+/**
+ * `signal`: stop parsing (the worker is shutting down); the build then rejects with the signal's reason. maxFiles null:
+ * the cap scales with the repo (scan/rank.ts mapCap). priority: paths kept before the rest (files sessions edited).
+ */
+export type BuildOpts = { maxFiles: number | null; maxBytes: number; concurrency?: number; signal?: AbortSignal; priority?: string[] };
 
 /** An import as the parser saw it, before resolution. names: '*' is the whole module, 'default' the default export. */
 export type RawImport = { spec: string; names: string[] };

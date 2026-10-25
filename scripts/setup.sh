@@ -6,10 +6,51 @@
 # token so post-mortems run on your Claude subscription, start (or restart) the stack and connect your agents. Without a
 # terminal it only reports. Re-run it after changing the project folders in Settings: it remounts them.
 #   PROJECTS_DIRS=~/code,~/work ./scripts/setup.sh     (or answer the question, or add them in Settings)
+# Without a terminal (an agent, a script), flags answer the questions; see --help. Secrets come from files a person wrote,
+# never from arguments: ./scripts/setup.sh --yes --projects ~/code --github-token-file ~/gh.txt
 set -euo pipefail
 here="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$here"
 . scripts/lib/env.sh
+. scripts/lib/ollama.sh
+
+usage() {
+  cat <<'EOF'
+usage: ./scripts/setup.sh [--yes] [--pull-models] [--projects <dirs>] [--github-token-file <file>]
+                          [--linear-key-file <file>] [--claude-token-file <file>]
+
+Write .env, mount the project folders, check Ollama (including structured output) and offer to start the stack.
+In a terminal it asks; these answer without one:
+
+  --yes, -y                  yes to every question: pull missing models, start the stack, connect your agents
+  --pull-models              pull missing Ollama models (and nothing else unasked)
+  --projects <dirs>          the project folders, comma-separated (same as PROJECTS_DIRS=<dirs>)
+  --github-token-file <f>    GITHUB_TOKEN from a file you wrote (read-only token); written to .env, never printed
+  --linear-key-file <f>      LINEAR_API_KEY from a file, the same way
+  --claude-token-file <f>    CLAUDE_CODE_OAUTH_TOKEN (from claude setup-token) from a file, the same way
+  -h, --help                 this text
+EOF
+}
+
+yes=0 pull_models=0 github_file="" linear_file="" claude_file=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -h | --help) usage; exit 0 ;;
+    -y | --yes) yes=1 ;;
+    --pull-models) pull_models=1 ;;
+    --projects | --github-token-file | --linear-key-file | --claude-token-file)
+      [ $# -ge 2 ] && [ -n "$2" ] || { echo "$1 needs a value" >&2; usage >&2; exit 1; }
+      case "$1" in
+        --projects) export PROJECTS_DIRS="$2" ;;
+        --github-token-file) github_file="$2" ;;
+        --linear-key-file) linear_file="$2" ;;
+        --claude-token-file) claude_file="$2" ;;
+      esac
+      shift ;;
+    *) echo "unknown option: $1" >&2; usage >&2; exit 1 ;;
+  esac
+  shift
+done
 
 need() { command -v "$1" >/dev/null 2>&1 || { echo "missing: $1 ($2)"; exit 1; }; }
 need docker "https://docs.docker.com/get-docker/"
@@ -19,6 +60,10 @@ need openssl "used to generate passwords"
 interactive() { [ -t 0 ] || [ "${FEEDBACK_SETUP_INTERACTIVE:-}" = 1 ]; }
 # ask "question" y|n: true for yes; Enter takes the default.
 ask() { local a=""; read -r -p "$1 " a || true; a="${a:-$2}"; case "$a" in [Yy]*) return 0 ;; *) return 1 ;; esac; }
+# A yes/no question: --yes answers yes, a terminal asks, otherwise no.
+confirm() { [ "$yes" = 1 ] && return 0; interactive && ask "$@"; }
+# Questions whose answer is typed (folders, a token): only in a terminal, never with --yes.
+typing() { [ "$yes" = 0 ] && interactive; }
 
 expand() { local p="${1/#\~/$HOME}"; p="${p%/}"; printf '%s' "${p:-/}"; }
 
@@ -62,7 +107,7 @@ elif [ -f "$roots_file" ] && grep -q '"roots"' "$roots_file"; then
   fi
 elif [ -n "$(envval PROJECTS_DIRS)" ]; then dirs_raw="$(envval PROJECTS_DIRS)" from="PROJECTS_DIRS in .env"
 elif [ -n "$(envval PROJECTS_DIR)" ]; then dirs_raw="$(envval PROJECTS_DIR)" from="PROJECTS_DIR in .env"
-elif interactive; then
+elif typing; then
   guesses="$(set +o pipefail; suggest || true)"
   echo "Which folders hold your projects (one folder per project inside)? Only these are mounted, read-only; you can"
   echo "change them later in Settings. Sessions are read only from the projects you then select."
@@ -134,6 +179,22 @@ else
   echo "wrote .env (projects: ${joined:-none yet}${codex:+; codex login found}${run_uid:+; containers run as uid $run_uid})"
 fi
 
+# Secrets from files a person wrote (--github-token-file and co.): into .env, which stays readable by you only. The
+# value is never printed, and a file with anything but token characters is refused before .env is touched.
+secret_from_file() {
+  local file="$1" key="$2" what="$3" v
+  [ -n "$file" ] || return 0
+  if [ ! -r "$file" ] || [ -d "$file" ]; then echo "$file: cannot read it (for $key)" >&2; exit 1; fi
+  v="$(tr -d '[:space:]' <"$file")"
+  if [ -z "$v" ]; then echo "$file is empty (for $key)" >&2; exit 1; fi
+  case "$v" in *[!A-Za-z0-9._-]*) echo "$file does not look like a $what (letters, digits, . _ - only); $key not saved" >&2; exit 1 ;; esac
+  setenv "$key" "$v"
+  echo "$key saved to .env (from $file; you can delete that file now)"
+}
+secret_from_file "$github_file" GITHUB_TOKEN token
+secret_from_file "$linear_file" LINEAR_API_KEY key
+secret_from_file "$claude_file" CLAUDE_CODE_OAUTH_TOKEN token
+
 # Settings shows these as the saved roots, so it agrees with what is mounted (the api compares the two).
 # Not when nothing was chosen at all: then there is nothing to say.
 if [ -n "$from" ] && [ "$from" != Settings ]; then
@@ -200,9 +261,31 @@ elif tags="$(curl -fsS --max-time 5 "$ollama_url/api/tags" 2>/dev/null)"; then
     if printf '%s' "$tags" | grep -qE "\"(name|model)\":\"($m|$want)\""; then echo "ollama: $m is there"
     else echo "ollama: $m is missing: ollama pull $m"; missing+=("$m"); fi
   done
-  if [ ${#missing[@]} -gt 0 ] && interactive && command -v ollama >/dev/null 2>&1 &&
-    ask "Pull ${missing[*]} now (gemma4 is about 10 GB)? [Y/n]" y; then
-    for m in "${missing[@]}"; do OLLAMA_HOST="$ollama_url" ollama pull "$m"; done
+  if [ ${#missing[@]} -gt 0 ] && command -v ollama >/dev/null 2>&1 &&
+    { [ "$pull_models" = 1 ] || confirm "Pull ${missing[*]} now (gemma4 is about 10 GB)? [Y/n]" y; }; then
+    still=()
+    for m in "${missing[@]}"; do OLLAMA_HOST="$ollama_url" ollama pull "$m" || still+=("$m"); done
+    missing=("${still[@]+"${still[@]}"}")
+  fi
+  # Every request the classifier sends carries a JSON schema; listing the models says nothing about whether that works.
+  classify_llm="$(envval CLASSIFY_LLM)"
+  probe_model=""
+  case "$classify_llm" in "" | ollama:*) probe_model="${classify_llm#ollama:}"; probe_model="${probe_model:-${models[0]}}" ;; esac
+  case " ${missing[*]+"${missing[*]}"} " in *" $probe_model "*) probe_model="" ;; esac
+  if [ -n "$probe_model" ]; then
+    echo "ollama: checking structured output with $probe_model (the first call loads the model; can take a minute)"
+    ollama_structured_probe "$ollama_url" "$probe_model"
+    case "$PROBE" in
+      ok) echo "ollama: structured output works ($probe_model)" ;;
+      timeout) echo "ollama: $probe_model gave no answer in time ($PROBE_DETAIL); run ./scripts/doctor.sh once it has loaded" ;;
+      notjson) echo "ollama: $probe_model answered a schema request with something other than JSON: $PROBE_DETAIL" ;;
+      *)
+        echo "FAIL ollama: structured output does not work with $probe_model at $ollama_url"
+        echo "  Ollama said: ${PROBE_DETAIL:-nothing}"
+        if [ "$PROBE" = unsupported ]; then ollama_structured_fix; fi
+        exit 1
+        ;;
+    esac
   fi
 else
   echo "Ollama does not answer at $ollama_url. Install it (https://ollama.com), start it, and: ollama pull ${models[0]} && ollama pull ${models[1]}"
@@ -216,7 +299,7 @@ fi
 
 # Post-mortems need real reasoning: with a Claude Code token they run on your Claude subscription (claude-cli);
 # classifying, summaries and embeddings stay on the free local model.
-if interactive && command -v claude >/dev/null 2>&1 && [ -z "$(envval CLAUDE_CODE_OAUTH_TOKEN)" ] && [ -z "$(envval POSTMORTEM_LLM)" ]; then
+if typing && command -v claude >/dev/null 2>&1 && [ -z "$(envval CLAUDE_CODE_OAUTH_TOKEN)" ] && [ -z "$(envval POSTMORTEM_LLM)" ]; then
   echo "Post-mortems run on Ollama now. To run them on your Claude subscription instead, run  claude setup-token  in"
   echo "another terminal and paste the token it prints."
   token=""
@@ -241,7 +324,7 @@ if [ "$(envval STORE)" = postgres ] && [ -z "$(envval DATABASE_URL)" ] && [ "$(e
 fi
 api_port="$(envval API_PORT)"
 url="http://localhost:${api_port:-8787}"
-if interactive && ask "Start Feedback Graph now (docker compose up -d --build; restarts it to apply .env and project folder changes)? [Y/n]" y; then
+if confirm "Start Feedback Graph now (docker compose up -d --build; restarts it to apply .env and project folder changes)? [Y/n]" y; then
   "${compose[@]}" up -d --build
   auth=()
   api_token="$(envval API_TOKEN)"
@@ -259,7 +342,7 @@ if interactive && ask "Start Feedback Graph now (docker compose up -d --build; r
     exit 1
   fi
   echo "running: $url (Settings: add project folders and choose the projects to read)"
-  if ask "Connect Claude Code and Codex to it (./scripts/install-agent.sh)? [Y/n]" y; then
+  if confirm "Connect Claude Code and Codex to it (./scripts/install-agent.sh)? [Y/n]" y; then
     ./scripts/install-agent.sh || echo "install-agent.sh did not finish; fix what it says and re-run it"
   fi
 else

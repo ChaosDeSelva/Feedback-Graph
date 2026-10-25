@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import { lstat, readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { isSecretPath, redactSecrets } from '@fb/core';
-import { listCodeFiles } from '../scan/scan.ts';
+import { listCodeFilesWithTotal } from '../scan/scan.ts';
 import { extract } from './extract.ts';
 import { isTestPath, langOf } from './lang.ts';
 import { makeResolver } from './resolve.ts';
@@ -61,7 +61,7 @@ type Parsed = { file: CodeFile; symbols: CodeSymbol[]; raw: RawImport[] };
  * symbols and is not reparsed; every import is re-resolved against the current file set either way.
  */
 export async function buildCodeMap(repoPath: string, opts: BuildOpts, prev?: CodeMap): Promise<CodeMap> {
-  const listed = await listCodeFiles(repoPath, { maxFiles: opts.maxFiles, maxBytes: opts.maxBytes });
+  const { files: listed, totalCandidates } = await listCodeFilesWithTotal(repoPath, { maxFiles: opts.maxFiles, maxBytes: opts.maxBytes, priority: opts.priority });
   const prevFiles = new Map(prev?.files.map((f) => [f.path, f]));
   const prevSymbols = groupBy(prev?.symbols, (s) => s.path);
   const prevImports = groupBy(prev?.imports, (i) => i.from);
@@ -101,7 +101,8 @@ export async function buildCodeMap(repoPath: string, opts: BuildOpts, prev?: Cod
   });
 
   opts.signal?.throwIfAborted();
-  const entries = listed.map((f) => parsed.get(f.path)).filter((p): p is Parsed => !!p);
+  // Listed best first (for the cap); the map itself is in path order.
+  const entries = listed.map((f) => parsed.get(f.path)).filter((p): p is Parsed => !!p).sort((a, b) => (a.file.path < b.file.path ? -1 : a.file.path > b.file.path ? 1 : 0));
   const resolve = makeResolver(entries.map((e) => e.file.path), (p) => resolverInput.get(p));
   const imports: CodeImport[] = [];
   for (const { file, raw } of entries) {
@@ -117,5 +118,5 @@ export async function buildCodeMap(repoPath: string, opts: BuildOpts, prev?: Cod
     }
     imports.push(...byTarget.values());
   }
-  return { files: entries.map((e) => e.file), symbols: entries.flatMap((e) => e.symbols), imports };
+  return { files: entries.map((e) => e.file), symbols: entries.flatMap((e) => e.symbols), imports, candidates: totalCandidates };
 }

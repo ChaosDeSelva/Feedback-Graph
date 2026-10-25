@@ -1,11 +1,12 @@
 import { Hono, type Context, type Next } from 'hono';
 import { serveStatic } from '@hono/node-server/serve-static';
 import { z } from 'zod';
-import { ACTIVITY_KINDS, chunkText, MODEL_JOBS, cleanLessonPath, cmp, FACT_KINDS, redactSecrets, selectionNote, type ActivityStore, type CodeGraphStore, type DocsStore, type FactsStore, type GraphStore, type InsightsStore, type ModelHealth, type ModelJob, type OllamaHealth, type KnowledgeStore, type Lesson, type PortabilityStore, type Project, type ProjectSelection, type ProjectSummary, type ShownProjects, type StoreKind, type SystemStatus, type WorkerStatus } from '@fb/core';
+import { ACTIVITY_KINDS, chunkText, MODEL_JOBS, cleanLessonPath, cmp, FACT_KINDS, redactSecrets, relevanceBand, selectionNote, type ActivityStore, type CodeGraphStore, type DocsStore, type FactsStore, type GraphStore, type InsightsStore, type ModelHealth, type ModelJob, type OllamaHealth, type PipelineStatus, type ProviderHealth, type KnowledgeStore, type Lesson, type LinksStore, IMAGE_MEDIA_TYPES, MAX_IMAGE_BYTES, LINK_RELATIONS, LINK_STATUSES, linkPair, type PortabilityStore, type Project, type ProjectSelection, type ProjectSummary, type ShownProjects, type StoreKind, type SystemStatus, type WorkerStatus } from '@fb/core';
 import { trackedProject, type ContextDeps } from './context.ts';
 import { authenticated, needsAuth, SECURITY_HEADERS, sessionCookie, tokenMatches, type AuthOpts } from './auth.ts';
 import { cloudRoutes, cloudStatus, type CloudDeps } from './cloud.ts';
 import { handleMcp } from './mcp.ts';
+import { actingAsOperator, asActor, currentActor, hasOperatorToken, operatorName, OWNER_ROUTES, refusedVerb, runAs } from './operator.ts';
 import { deleteProjects, settingsRoutes, type SettingsDeps } from './settings.ts';
 import { importRoutes, type ImportDeps } from './import.ts';
 import { sessionRoutes, type SessionsDeps } from './sessions.ts';
@@ -26,6 +27,10 @@ const Decision = z.object({
   note: z.string().max(4000).optional(),
 });
 
+const Decisions = z.object({
+  items: z.array(z.object({ id: z.string().min(1).max(500), decision: z.enum(['confirm', 'reject']), reason: z.string().max(4000).optional() }).strict()).min(1).max(500),
+}).strict();
+
 const LOCAL_HOSTS = new Set(['localhost', '127.0.0.1', '[::1]']);
 
 function hostname(hostHeader: string | undefined): string {
@@ -42,14 +47,15 @@ function originAllowed(origin: string, hostHeader: string): boolean {
 export type AppOpts = {
   staticDir?: string;
   context?: ContextDeps;
-  knowledge?: Pick<KnowledgeStore, 'listLessons' | 'lessonDetail' | 'updateLesson'> & Partial<Pick<KnowledgeStore, 'retryPostmortem'>>;
+  knowledge?: Pick<KnowledgeStore, 'listLessons' | 'lessonDetail' | 'updateLesson'> & Partial<Pick<KnowledgeStore, 'retryPostmortem' | 'postmortemBacklog'>>;
   embed?: (texts: string[]) => Promise<number[][]>;
-  facts?: Pick<FactsStore, 'listProjects' | 'requestScan' | 'listFacts' | 'searchFacts'>;
+  facts?: Pick<FactsStore, 'listProjects' | 'requestScan' | 'listFacts' | 'searchFacts'> & Partial<Pick<FactsStore, 'setFactRelevance' | 'setPinned'>>;
   /** Folders under the configured roots that can be scanned. */
   projectDirs?: () => Promise<Project[]>;
   insights?: Pick<InsightsStore, 'projectGraph' | 'patterns'>;
   activity?: Pick<ActivityStore, 'record' | 'list'>;
-  docs?: Pick<DocsStore, 'upsertDoc' | 'listDocs' | 'deleteDoc'>;
+  docs?: Pick<DocsStore, 'upsertDoc' | 'listDocs' | 'deleteDoc'> & Partial<Pick<DocsStore, 'docImage'>>;
+  links?: Pick<LinksStore, 'listLinks' | 'setLink' | 'deleteLink'>;
   auth?: AuthOpts;
   /** JSON access log: method, path, status, ms. Query strings are left out (they can carry search text). */
   log?: (msg: string, extra?: object) => void;
@@ -114,14 +120,21 @@ const ImpactQuery = z.object({ path: z.array(RepoPath).min(1).max(50), depth: z.
 
 /** The worker beats every 30s; three minutes of silence means it is down or wedged. */
 const WORKER_STALE_MS = 3 * 60_000;
+/** /api/pipeline counts Inbox items and lessons up to this many each (the panel only needs to know there are some). */
+const PIPELINE_LIMIT = 1000;
 
 const DocUpload = z
   .object({
     title: z.string().min(1).max(300),
     name: z.string().min(1).max(200).regex(/^[\w][\w .()-]*$/, 'a plain file name'),
-    text: z.string().min(1).max(2_000_000),
+    text: z.string().min(1).max(2_000_000).optional(),
+    // No SVG: it is a page that can run script, not an image a model reads.
+    image: z.object({ mediaType: z.enum(IMAGE_MEDIA_TYPES), data: z.string().min(1).regex(/^[A-Za-z0-9+/]+={0,2}$/, 'base64') }).strict().optional(),
   })
-  .strict();
+  .strict()
+  .refine((d) => (d.text === undefined) !== (d.image === undefined), 'send either text or an image');
+/** Base64 of MAX_IMAGE_BYTES. */
+const MAX_IMAGE_BASE64 = Math.ceil(MAX_IMAGE_BYTES / 3) * 4;
 
 const ActivityQuery = z.object({
   project: z.string().min(1).max(200).optional(),
@@ -130,7 +143,21 @@ const ActivityQuery = z.object({
   limit: z.coerce.number().int().min(1).max(1000).optional(),
 });
 
-const ScanRequest = z.object({ provider: z.string().regex(/^[a-z][a-z-]*(:[\w./:-]+)?$/).optional() }).strict();
+const ScanProvider = z.string().regex(/^[a-z][a-z-]*(:[\w./:-]+)?$/);
+const ScanRequest = z.object({ provider: ScanProvider.optional() }).strict();
+const BatchScanRequest = z
+  .object({ keys: z.array(z.string().min(1).max(200)).min(1).max(2000).optional(), all: z.literal(true).optional(), provider: ScanProvider.optional() })
+  .strict()
+  .refine((b) => (b.keys === undefined) !== (b.all === undefined), 'send either keys or all: true');
+const LinkRequest = z.object({
+  a: z.string().min(1).max(200),
+  b: z.string().min(1).max(200),
+  status: z.enum(LINK_STATUSES).optional(),
+  relation: z.enum(LINK_RELATIONS).optional(),
+  note: z.string().max(500).optional(),
+}).strict();
+const PinRequest = z.object({ pinned: z.boolean() }).strict();
+const RelevanceRequest = z.object({ relevance: z.number().min(0).max(1) });
 const FactsQuery = z.object({ q: z.string().min(1).max(500).optional(), kind: z.enum(FACT_KINDS).optional() });
 
 const ProjectParam = z.object({ project: z.string().min(1).max(200) });
@@ -152,13 +179,30 @@ const LessonPatch = z
   })
   .strict();
 
+/** Could not reach the server at all, as opposed to a server that answered with a refusal. */
+const UNREACHABLE = /ECONNREFUSED|ECONNRESET|ENOTFOUND|EAI_AGAIN|EHOSTUNREACH|fetch failed|not reachable|socket hang up/i;
+
+/**
+ * A job's last failure that is no longer true: the same provider has answered since (for another job), or it was an
+ * Ollama model that could not reach Ollama and Ollama answers now (checked on this read). Without this a job that has
+ * not run again (summaries wait for an idle session) would report a long-fixed outage.
+ */
+function stale(job: ModelJob, h: ProviderHealth, w: WorkerStatus, ollama: OllamaHealth | null): boolean {
+  const answeredSince = MODEL_JOBS.some((j) => {
+    const o = w.health?.[j];
+    return j !== job && !!o?.ok && o.provider === h.provider && o.at > h.at;
+  });
+  return answeredSince || (h.provider.startsWith('ollama:') && !!ollama?.ok && UNREACHABLE.test(h.reason ?? ''));
+}
+
 /** Each job's model as the worker last reported it. A job with no model (it could not be built) is unavailable, and
  * so is an Ollama model while Ollama does not answer, whether or not a job has asked it yet. */
 function modelHealth(w: WorkerStatus, ollama: OllamaHealth | null): Record<ModelJob, ModelHealth> {
   const out = {} as Record<ModelJob, ModelHealth>;
   for (const job of MODEL_JOBS) {
     const provider = w.providers[job] ?? null;
-    const h = w.health?.[job];
+    const reported = w.health?.[job];
+    const h = reported && !reported.ok && stale(job, reported, w, ollama) ? { ...reported, ok: true, reason: null } : reported;
     const current = h?.provider ?? provider;
     // A worker older than the summary report leaves the key out: unknown, not broken.
     const unbuilt = !provider && (job === 'classify' || (job === 'summary' && job in w.providers));
@@ -168,13 +212,27 @@ function modelHealth(w: WorkerStatus, ollama: OllamaHealth | null): Record<Model
       ? { provider: null, ok: false, reason: job === 'classify' ? 'no classifier is configured (see the worker log)' : 'no summary model could be built (SUMMARY_LLM; see the worker log): summaries are paused' }
       : ollama && !ollama.ok && current?.startsWith('ollama:')
         ? { provider: current, ok: false, reason: ollama.reason }
-        : { provider: current, ok: h?.ok ?? true, reason: h?.reason ?? null };
+        : h && !h.ok
+          ? { provider: current, ok: false, reason: h.reason, since: h.since ?? h.at, checkedAt: h.at }
+          : { provider: current, ok: true, reason: null };
   }
   return out;
 }
 
+/** /api/status stage and progress from a live worker's heartbeat (both null when it is offline or does not say). */
+function stageOf(w: WorkerStatus | null): Pick<PipelineStatus, 'stage' | 'progress'> {
+  const st = w?.stage;
+  if (!st) return { stage: null, progress: null };
+  return { stage: { name: st.name, startedAt: st.startedAt, current: st.current }, progress: st.done === null ? null : { done: st.done, total: st.total } };
+}
+
 export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
-  const { staticDir, context, knowledge, embed, facts, projectDirs, insights, activity, docs, auth = {}, system, portability, settings, log, codegraph, classifyQueue, inScope, importer, cloud, sessions, shown, integrations } = opts;
+  const { staticDir, context, knowledge, embed, facts, projectDirs, insights, docs, links, auth = {}, system, portability, settings, log, codegraph, classifyQueue, inScope, sessions, shown } = opts;
+  // Writes made with the operator token are logged as the agent that made them, wherever the route lives.
+  const activity = asActor(opts.activity);
+  const cloud = opts.cloud && { ...opts.cloud, activity: asActor(opts.cloud.activity) };
+  const importer = opts.importer && { ...opts.importer, activity: asActor(opts.importer.activity) };
+  const integrations = opts.integrations && { ...opts.integrations, activity: asActor(opts.integrations.activity) };
   /** null: no selection to apply (everything is shown). */
   const view = async (): Promise<ShownProjects | null> => (shown ? await shown() : null);
   const shows = async (key: string) => {
@@ -199,7 +257,7 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
   app.use('*', async (c, next) => {
     const host = hostname(c.req.header('host') ?? new URL(c.req.url).host);
     if (!hosts.has(host)) return c.json({ error: 'forbidden host' }, 403);
-    if (needsAuth(c.req.path) && !authenticated(c, auth.token)) return c.json({ error: 'sign in required' }, 401);
+    if (needsAuth(c.req.path) && !authenticated(c, auth.token) && !hasOperatorToken(c, auth.operator)) return c.json({ error: 'sign in required' }, 401);
     if (c.req.method !== 'GET' && c.req.method !== 'HEAD') {
       const site = c.req.header('sec-fetch-site');
       if (site === 'cross-site' || site === 'same-site') return c.json({ error: 'cross-site write' }, 403);
@@ -208,7 +266,9 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
       if (origin !== undefined && !originAllowed(origin, c.req.header('host') ?? new URL(c.req.url).host)) {
         return c.json({ error: 'cross-origin write' }, 403);
       }
-      if (!c.req.header('content-type')?.startsWith('application/json')) return c.json({ error: 'json required' }, 415);
+      // A Streamable HTTP client ending its MCP session sends DELETE with no body; handleMcp answers it.
+      const mcpEnd = c.req.method === 'DELETE' && c.req.path === '/mcp';
+      if (!mcpEnd && !c.req.header('content-type')?.startsWith('application/json')) return c.json({ error: 'json required' }, 415);
     }
     await next();
   });
@@ -216,32 +276,20 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
   // Decisions that teach agents are yours: they must come from the UI (browsers always send Origin on writes).
   // A local agent with curl sends none. This stops accidental self-approval; it cannot stop a process that
   // deliberately forges headers (that process could read .env and the database anyway).
-  const ownerOnly = async (c: Context, next: Next) => {
+  // The exception you opt into: FG_OPERATOR_TOKEN as the Bearer, for the verbs OPERATOR_ALLOW names. Its writes are
+  // logged as operator:<name> (X-FG-Operator), never as you.
+  const allowed = new Set(auth.operator?.allow ?? []);
+  const ownerOnly = (verb: (typeof OWNER_ROUTES)[number][2]) => async (c: Context, next: Next) => {
+    if (hasOperatorToken(c, auth.operator)) {
+      if (!allowed.has(verb)) return c.json(refusedVerb(verb), 403);
+      return runAs(operatorName(c.req.header('x-fg-operator')), next);
+    }
     if (c.req.header('origin') === undefined) {
       return c.json({ error: 'only you can make this decision, from the Feedback Graph UI' }, 403);
     }
     await next();
   };
-  for (const [method, path] of [
-    ['POST', '/api/candidates/:id/decision'],
-    ['PATCH', '/api/lessons/:id'],
-    ['POST', '/api/projects/:key/scan'],
-    ['POST', '/api/projects/:key/docs'],
-    ['DELETE', '/api/docs/:id'],
-    ['DELETE', '/api/projects/:key'],
-    ['POST', '/api/feedback/:id/retry'],
-    ['PUT', '/api/settings/projects'],
-    ['PUT', '/api/settings/roots'],
-    ['POST', '/api/settings/cleanup'],
-    ['POST', '/api/cloud/sync'],
-    ['POST', '/api/turns/requeue'],
-    ['POST', '/api/import'],
-    ['POST', '/api/sessions/:id/resummarize'],
-    ['PUT', '/api/settings/integrations/:kind'],
-    ['POST', '/api/settings/integrations/:kind/test'],
-    ['DELETE', '/api/settings/integrations/:kind'],
-    ['PUT', '/api/settings/integrations/projects/:key'],
-  ] as const) app.on(method, path, ownerOnly);
+  for (const [method, path, verb] of OWNER_ROUTES) app.on(method, path, ownerOnly(verb));
 
   app.get('/api/health', (c) => c.json({ ok: true }));
   // Readiness, unlike health, needs the store: a load balancer should not route here while the database is down.
@@ -256,21 +304,56 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
     const sel = graph && system?.selection ? await system.selection().catch(() => null) : null;
     const givenUpTurns = graph && system?.givenUpTurns ? await system.givenUpTurns().catch(() => null) : null;
     const ollama = system?.ollama ? await system.ollama().catch(() => null) : null;
+    const workerHealthy = !!worker && Date.now() - Date.parse(worker.lastBeat) < WORKER_STALE_MS;
     const s: SystemStatus = {
       version: system?.version ?? 'dev',
       store: system?.store ?? null,
       graph,
       worker,
-      workerHealthy: !!worker && Date.now() - Date.parse(worker.lastBeat) < WORKER_STALE_MS,
+      workerHealthy,
+      ...stageOf(workerHealthy ? worker : null),
       authRequired: !!auth.token,
       selection: sel && { initialized: sel.initialized, tracked: sel.tracked.length, ...(system?.roots === undefined ? {} : { roots: system.roots }), note: selectionNote(sel, system?.roots) },
       cloud: cloudStatus(cloud?.cloud ?? null),
       models: worker ? modelHealth(worker, ollama) : null,
       givenUpTurns,
       ollama,
-      connections: await connectionsStatus({ integrations: graph ? (integrations?.integrations ?? null) : null, worker, ollama, cloud: cloud?.cloud ?? null }).catch(() => null),
+      connections: await connectionsStatus({ integrations: graph ? (integrations?.integrations ?? null) : null, deps: integrations, worker, ollama, cloud: cloud?.cloud ?? null }).catch(() => null),
     };
     return c.json(s);
+  });
+
+  // The first-run panel: every stage's count in one call. Each count fails on its own (null), never the whole answer.
+  app.get('/api/pipeline', async (c) => {
+    const v = await view();
+    const keys = keysFor(v);
+    const graph = (await system?.ping().catch(() => false)) ?? false;
+    const worker = graph ? ((await system?.worker().catch(() => null)) ?? null) : null;
+    const live = !!worker && Date.now() - Date.parse(worker.lastBeat) < WORKER_STALE_MS;
+    const count = async <T>(fn: () => Promise<T>): Promise<T | null> => fn().catch(() => null);
+    const pending = (status: 'pending' | 'confirmed') => repo.listCandidates({ status, limit: PIPELINE_LIMIT, ...(keys && { projectKeys: keys }) }).then((r) => r.length);
+    const lessons = (status: 'proposed' | 'approved') =>
+      knowledge!.listLessons({ status, limit: PIPELINE_LIMIT, ...(keys && { projectKeys: keys }) }).then((r) => r.filter((l) => showsLesson(v, l)).length);
+    const projects = facts ? await count(async () => (await facts.listProjects()).filter((p) => !v || v.has(p.key))) : null;
+    const scans = projects && { done: 0, queued: 0, running: 0, failed: 0, never: 0 };
+    for (const p of projects ?? []) scans![p.lastScan?.status ?? 'never']++;
+    const [inboxPending, inboxConfirmed, proposed, approved, queued] = await Promise.all([
+      count(() => pending('pending')),
+      count(() => pending('confirmed')),
+      knowledge ? count(() => lessons('proposed')) : null,
+      knowledge ? count(() => lessons('approved')) : null,
+      knowledge?.postmortemBacklog ? count(() => knowledge.postmortemBacklog!()) : null,
+    ]);
+    const body: PipelineStatus = {
+      ...stageOf(live ? worker : null),
+      sessions: projects ? projects.reduce((n, p) => n + p.sessions, 0) : null,
+      classify: worker?.backlog ? { backlog: worker.backlog.classify, capped: worker.backlog.classifyCapped } : null,
+      inbox: inboxPending === null || inboxConfirmed === null ? null : { pending: inboxPending, confirmed: inboxConfirmed },
+      postmortems: queued === null ? null : { queued },
+      lessons: proposed === null || approved === null ? null : { proposed, approved },
+      scans,
+    };
+    return c.json(body);
   });
 
   const secure = (c: Context) => c.req.header('x-forwarded-proto') === 'https' || new URL(c.req.url).protocol === 'https:';
@@ -305,24 +388,43 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
     return d ? c.json(d) : c.json({ error: 'not found' }, 404);
   });
 
-  app.post('/api/candidates/:id/decision', async (c) => {
-    const body = Decision.safeParse(await c.req.json().catch(() => null));
-    if (!body.success) return c.json({ error: body.error.flatten() }, 400);
-    const id = c.req.param('id');
+  /** Confirm or reject an Inbox item of a shown project, and log it. False: no such item (or not shown). */
+  const decideCandidate = async (id: string, status: 'confirmed' | 'rejected', note: string | null): Promise<boolean> => {
     const detail = await shownCandidate(id);
-    if (!detail) return c.json({ error: 'not found' }, 404);
-    await repo.decide(id, body.data.status, body.data.note ?? null);
+    if (!detail) return false;
+    await repo.decide(id, status, note);
     const text = detail.turn.text ?? '';
+    const who = actingAsOperator() ? `an agent (${currentActor()})` : 'you';
     await activity?.record({
       kind: 'feedback_decided',
       actor: 'you',
       projectKey: detail.candidate.projectKey,
-      subject: `${body.data.status}: "${text.slice(0, 80)}${text.length > 80 ? '…' : ''}"`,
-      why: body.data.note || (body.data.status === 'confirmed' ? 'you confirmed this was real pushback' : 'you rejected it as not pushback'),
-      details: { status: body.data.status, classifier: { label: detail.candidate.classification.label, confidence: detail.candidate.classification.confidence } },
+      subject: `${status}: "${text.slice(0, 80)}${text.length > 80 ? '…' : ''}"`,
+      why: note || (status === 'confirmed' ? `${who} confirmed this was real pushback` : `${who} rejected it as not pushback`),
+      details: { status, classifier: { label: detail.candidate.classification.label, confidence: detail.candidate.classification.confidence } },
       targets: [id],
     });
+    return true;
+  };
+
+  app.post('/api/candidates/:id/decision', async (c) => {
+    const body = Decision.safeParse(await c.req.json().catch(() => null));
+    if (!body.success) return c.json({ error: body.error.flatten() }, 400);
+    if (!(await decideCandidate(c.req.param('id'), body.data.status, body.data.note ?? null))) return c.json({ error: 'not found' }, 404);
     return c.body(null, 204);
+  });
+
+  // Many Inbox decisions in one call (the `fg` CLI, an agent with the operator token). Each item is decided like the
+  // single route above; one that is not found does not stop the rest.
+  app.post('/api/candidates/decisions', async (c) => {
+    const body = Decisions.safeParse(await c.req.json().catch(() => null));
+    if (!body.success) return c.json({ error: body.error.flatten() }, 400);
+    const results = [];
+    for (const item of body.data.items) {
+      const status = item.decision === 'confirm' ? 'confirmed' : 'rejected';
+      results.push((await decideCandidate(item.id, status, item.reason ?? null)) ? { id: item.id, ok: true, status } : { id: item.id, ok: false, error: 'not found' });
+    }
+    return c.json({ results });
   });
 
   app.get('/api/stats', async (c) => {
@@ -343,8 +445,9 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
       const keys = new Set(known.flatMap((p) => [p.key, ...p.aliases]));
       const fresh: ProjectSummary[] = (await projectDirs())
         .filter((d) => !keys.has(d.key) && (!v || v.has(d.key)))
-        .map((d) => ({ key: d.key, repoPath: d.repoPath, remote: null, aliases: [], sessions: 0, feedback: 0, lessons: 0, facts: 0, lastScan: null }));
-      return c.json([...known, ...fresh].sort((a, b) => a.key.localeCompare(b.key)));
+        .map((d) => ({ key: d.key, repoPath: d.repoPath, remote: null, aliases: [], sessions: 0, feedback: 0, lessons: 0, facts: 0, lastScan: null, pinned: false }));
+      // Pinned first: every page lists projects in this order.
+      return c.json([...known, ...fresh].sort((a, b) => Number(b.pinned) - Number(a.pinned) || a.key.localeCompare(b.key)));
     });
 
     app.post('/api/projects/:key/scan', async (c) => {
@@ -353,6 +456,24 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
       const project = (await projectDirs()).find((p) => p.key === c.req.param('key'));
       if (!project) return c.json({ error: 'no such folder under the configured roots' }, 404);
       return c.json(await facts.requestScan(project, body.data.provider ?? null), 202);
+    });
+
+    // Scan many folders in one call: `all` (every selected folder) or `keys`. Each is queued like the route above;
+    // a folder that is not selected is skipped, and the answer says per key what happened.
+    app.post('/api/projects/scan', async (c) => {
+      const body = BatchScanRequest.safeParse(await c.req.json().catch(() => null));
+      if (!body.success) return c.json({ error: body.error.flatten() }, 400);
+      const folders = await projectDirs();
+      const v = await view();
+      const keys = body.data.all ? folders.map((p) => p.key).filter((k) => !v || v.has(k)) : [...new Set(body.data.keys)];
+      const results = [];
+      for (const key of keys) {
+        const project = folders.find((p) => p.key === key);
+        if (!project) results.push({ key, queued: false, error: 'no such folder under the configured roots' });
+        else if (v && !v.has(key)) results.push({ key, queued: false, error: 'not selected: choose it in Settings first' });
+        else results.push({ key, queued: true, job: await facts.requestScan(project, body.data.provider ?? null) });
+      }
+      return c.json({ results }, 202);
     });
 
     app.get('/api/projects/:key/facts', async (c) => {
@@ -366,6 +487,46 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
       }
       return c.json(await facts.listFacts({ projectKey, kind: q.data.kind, limit: 500 }));
     });
+
+    const setPinned = facts.setPinned?.bind(facts);
+    if (setPinned) {
+      app.put('/api/projects/:key/pin', async (c) => {
+        const body = PinRequest.safeParse(await c.req.json().catch(() => null));
+        if (!body.success) return c.json({ error: body.error.flatten() }, 400);
+        const key = c.req.param('key');
+        // A folder under the roots, or a project the store knows (one imported, or whose folder is elsewhere).
+        const known = (await facts.listProjects()).find((p) => p.key === key);
+        const project = (await projectDirs()).find((p) => p.key === key) ?? (known && { key, name: key, repoPath: known.repoPath });
+        if (!project || !(await shows(project.key))) return c.json({ error: 'no such project' }, 404);
+        await setPinned(project, body.data.pinned);
+        await activity?.record({
+          kind: 'project_pinned', actor: 'you', projectKey: project.key,
+          subject: `${body.data.pinned ? 'pinned' : 'unpinned'} ${project.key}`,
+          why: body.data.pinned ? 'you pinned it: it comes first in every project list' : 'you unpinned it', details: { pinned: body.data.pinned }, targets: [],
+        });
+        return c.body(null, 204);
+      });
+    }
+
+    const setRelevance = facts.setFactRelevance?.bind(facts);
+    if (setRelevance) {
+      app.patch('/api/projects/:key/facts/:id/relevance', async (c) => {
+        const body = RelevanceRequest.safeParse(await c.req.json().catch(() => null));
+        if (!body.success) return c.json({ error: body.error.flatten() }, 400);
+        const projectKey = c.req.param('key');
+        if (!(await shows(projectKey))) return c.json(NOT_SHOWN, 404);
+        const id = c.req.param('id');
+        const changed = await setRelevance([{ id, relevance: body.data.relevance, by: 'you', projectKey }]);
+        if (!changed) return c.json({ error: 'no such fact in this project' }, 404);
+        await activity?.record({
+          kind: 'fact_relevance_set', actor: 'you', projectKey,
+          subject: `set a fact to ${relevanceBand(body.data.relevance)} (${body.data.relevance})`,
+          why: 'you set how often everyday coding needs it; agents get facts ranked by it, and the background scorer leaves it alone (a rescan replaces the fact with a new one, scored again)',
+          details: { relevance: body.data.relevance }, targets: [id],
+        });
+        return c.body(null, 204);
+      });
+    }
   }
 
   if (docs && embed && projectDirs) {
@@ -377,25 +538,47 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
     app.post('/api/projects/:key/docs', async (c) => {
       const body = DocUpload.safeParse(await c.req.json().catch(() => null));
       if (!body.success) return c.json({ error: body.error.flatten() }, 400);
+      const { image, title, name } = body.data;
+      if (image && image.data.length > MAX_IMAGE_BASE64) return c.json({ error: `images can be at most ${MAX_IMAGE_BYTES / 1024 / 1024} MB` }, 413);
       const project = (await projectDirs()).find((p) => p.key === c.req.param('key'));
       if (!project) return c.json({ error: 'no such project' }, 404);
-      const chunks = chunkText(redactSecrets(body.data.text));
+      // An image is searchable by a placeholder until the worker reads it; its description then replaces it.
+      const chunks = image ? [`Image "${title}" (${name}): not read yet.`] : chunkText(redactSecrets(body.data.text!));
       if (!chunks.length) return c.json({ error: 'document has no text' }, 400);
       const vectors = await embed(chunks);
       // Same file name, same doc: say so, rather than logging a fresh upload over a silent replacement.
-      const previous = (await docs.listDocs(project.key)).find((d) => d.source === 'upload' && d.ref === body.data.name);
+      const previous = (await docs.listDocs(project.key)).find((d) => d.source === 'upload' && d.ref === name);
       const id = await docs.upsertDoc(
-        { projectKey: project.key, source: 'upload', ref: body.data.name, title: body.data.title, url: null },
+        { projectKey: project.key, source: 'upload', ref: name, title, url: null },
         chunks.map((text, i) => ({ text, embedding: vectors[i] })),
+        image ? { read: true, image } : { read: true },
       );
+      const what = image ? `image "${title}"` : `"${title}" (${chunks.length} chunk${chunks.length === 1 ? '' : 's'})`;
       await activity?.record({
         kind: 'doc_added', actor: 'you', projectKey: project.key,
-        subject: `${previous ? `replaced "${previous.title}" with` : 'uploaded'} "${body.data.title}" (${chunks.length} chunk${chunks.length === 1 ? '' : 's'})`,
-        why: 'you added it as context; agents get matching excerpts with their task context',
-        details: { name: body.data.name, chars: body.data.text.length }, targets: [id],
+        subject: `${previous ? `replaced "${previous.title}" with` : 'uploaded'} ${what}`,
+        why: 'you added it as context; the worker reads it into facts, and agents get matching excerpts and facts with their task context',
+        details: image ? { name, mediaType: image.mediaType, bytes: Math.floor((image.data.length * 3) / 4) } : { name, chars: body.data.text!.length }, targets: [id],
       });
       return c.json({ id, chunks: chunks.length }, 201);
     });
+
+    const docImage = docs.docImage?.bind(docs);
+    if (docImage) {
+      app.get('/api/docs/:id/image', async (c) => {
+        const id = c.req.param('id');
+        // ids are doc:<project>:<source>:<ref>
+        if (!(await shows(id.split(':')[1] ?? ''))) return c.json({ error: 'not found' }, 404);
+        const img = await docImage(id);
+        if (!img) return c.json({ error: 'not found' }, 404);
+        return c.body(Buffer.from(img.data, 'base64'), 200, {
+          'content-type': img.mediaType,
+          'content-disposition': 'inline',
+          'x-content-type-options': 'nosniff',
+          'cache-control': 'private, max-age=300',
+        });
+      });
+    }
 
     app.delete('/api/docs/:id', async (c) => {
       const id = c.req.param('id');
@@ -406,6 +589,46 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
       await activity?.record({
         kind: 'doc_removed', actor: 'you', projectKey: id.split(':')[1] ?? null,
         subject: `removed ${id.split(':').slice(3).join(':') || id}`, why: 'you removed it from the Projects page', details: {}, targets: [id],
+      });
+      return c.body(null, 204);
+    });
+  }
+
+  if (links) {
+    app.get('/api/projects/:key/links', async (c) => {
+      const key = c.req.param('key');
+      if (!(await shows(key))) return c.json(NOT_SHOWN, 404);
+      const v = await view();
+      // Only links whose other end you can see: a hidden project's name never shows through a link.
+      return c.json((await links.listLinks({ projectKey: key })).filter((l) => !v || (v.has(l.a) && v.has(l.b))));
+    });
+
+    app.put('/api/links', async (c) => {
+      const body = LinkRequest.safeParse(await c.req.json().catch(() => null));
+      if (!body.success) return c.json({ error: body.error.flatten() }, 400);
+      const { a, b, ...patch } = body.data;
+      if (a === b) return c.json({ error: 'a project cannot be linked to itself' }, 400);
+      if (!(await shows(a)) || !(await shows(b))) return c.json({ error: 'both projects must be selected' }, 404);
+      const link = await links.setLink(a, b, patch);
+      const [x, y] = linkPair(a, b);
+      const what = patch.status === 'confirmed' ? 'confirmed' : patch.status === 'dismissed' ? 'dismissed' : patch.status === 'suggested' ? 'reopened' : 'edited';
+      await activity?.record({
+        kind: 'link_decided', actor: 'you', projectKey: a,
+        subject: `${what} the link ${x} ↔ ${y}`,
+        why: link.status === 'confirmed' ? 'agents working in either project get the best matches from the other' : link.status === 'dismissed' ? 'you said they do not belong together: it is not suggested again' : 'you changed the link',
+        details: { a: x, b: y, ...patch, status: link.status, relation: link.relation }, targets: [link.id],
+      });
+      return c.json(link);
+    });
+
+    app.delete('/api/links/:id', async (c) => {
+      const id = c.req.param('id');
+      const ends = /^link:([^|]+)\|(.+)$/.exec(id);
+      if (!ends || !(await shows(ends[1])) || !(await shows(ends[2]))) return c.json({ error: 'not found' }, 404);
+      if (!(await links.deleteLink(id))) return c.json({ error: 'not found' }, 404);
+      await activity?.record({
+        kind: 'link_decided', actor: 'you', projectKey: ends[1],
+        subject: `removed the link ${ends[1]} ↔ ${ends[2]}`, why: 'you removed it; the worker may suggest it again if the evidence is still there', details: {}, targets: [id],
       });
       return c.body(null, 204);
     });
@@ -434,7 +657,10 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
       app.get('/api/projects/:key/codemap/graph', async (c) => {
         const q = MapGraphQuery.safeParse(c.req.query());
         if (!q.success) return c.json({ error: q.error.flatten() }, 400);
-        const g = await mapGraph(c.req.param('key'), { limit: q.data.limit, includeTests: q.data.tests });
+        const key = c.req.param('key');
+        const [graph, meta] = await Promise.all([mapGraph(key, { limit: q.data.limit, includeTests: q.data.tests }), codegraph.codeMapMeta(key)]);
+        // The map's size too: the graph says when the map itself is capped (SCAN_MAX_FILES).
+        const g = { ...graph, meta };
         const v = await view();
         if (!v || !knowledge || !g.lessons.length) return c.json(g);
         // The map holds ids only: the shown approved lessons say which of them were learned in a selected project.
@@ -594,7 +820,8 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
       }
       if (p.supersedes === id) return c.json({ error: 'a lesson cannot supersede itself' }, 400);
       if (p.supersedes !== undefined && !(await shownLesson(p.supersedes))) return c.json({ error: `no lesson ${p.supersedes} to supersede` }, 400);
-      const { unscoped } = await knowledge.updateLesson(id, p, { reembed });
+      const by = currentActor();
+      const { unscoped } = await knowledge.updateLesson(id, p, { reembed, by });
       if (unscoped) return c.json({ error: 'this lesson has no known project, so it cannot be narrowed; it was set back to proposed. Make it global or reject it.' }, 409);
       const changed = Object.fromEntries(
         (['title', 'rule', 'appliesWhen', 'scope', 'paths'] as const)
@@ -606,7 +833,9 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
         actor: 'you',
         projectKey: current.lesson.projectKey,
         subject: `${p.status ?? 'edited'} lesson "${p.title ?? current.lesson.title}"`,
-        why: p.status === 'approved' ? 'you approved it, so agents will now be given it' : p.status === 'rejected' ? 'you rejected it; agents will not see it' : 'you edited it',
+        why: by === 'you'
+          ? (p.status === 'approved' ? 'you approved it, so agents will now be given it' : p.status === 'rejected' ? 'you rejected it; agents will not see it' : 'you edited it')
+          : `an agent (${by}) ${p.status === 'approved' ? 'approved it with the operator token (OPERATOR_ALLOW has lesson_decide), so agents will now be given it' : p.status === 'rejected' ? 'rejected it with the operator token; agents will not see it' : 'edited it with the operator token'}`,
         details: { status: p.status ?? current.lesson.status, changed, supersedes: p.supersedes ?? null },
         targets: [id],
       });

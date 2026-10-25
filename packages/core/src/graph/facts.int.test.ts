@@ -35,6 +35,55 @@ describeStores('FactsStore', (h) => {
     expect(agentic).toMatchObject({ why: 'agents need: agentic', scanJobId: 'scan:10', fileHash: 'hb' });
   });
 
+  test('facts keep the relevance the extractor gave; facts without one are unscored', async () => {
+    await f.saveFileFacts('demo', { path: 'src/a.ts', hash: 'h', summary: '' }, [{ ...fact('core rule'), relevance: 0.9 }, fact('no score')], 'p');
+    await f.replaceProjectFacts('other', [{ ...fact('setup step', '.'), relevance: 0.1 }], 'claude-cli', []);
+    const byStatement = Object.fromEntries([...(await f.listFacts({ projectKey: 'demo' })), ...(await f.listFacts({ projectKey: 'other' }))].map((x) => [x.statement, x]));
+    expect(byStatement['core rule']).toMatchObject({ relevance: 0.9, relevanceBy: 'model' });
+    expect(byStatement['no score']).toMatchObject({ relevance: null, relevanceBy: null });
+    expect(byStatement['setup step']).toMatchObject({ relevance: 0.1, relevanceBy: 'model' });
+    const [hit] = await f.searchFacts({ embedding: vec(1), projectKey: 'other', k: 1 });
+    expect(hit.fact.relevance).toBe(0.1);
+  });
+
+  test('unscoredFacts lists current facts of the given projects with no relevance; setFactRelevance scores them', async () => {
+    await f.saveFileFacts('demo', { path: 'src/a.ts', hash: 'h', summary: '' }, [fact('a'), { ...fact('b'), relevance: 0.5 }], 'p');
+    await f.saveFileFacts('skip', { path: 'src/a.ts', hash: 'h', summary: '' }, [fact('not selected')], 'p');
+    const todo = await f.unscoredFacts({ projectKeys: ['demo'], limit: 10 });
+    expect(todo.map((x) => x.statement)).toEqual(['a']);
+    expect(todo[0]).toMatchObject({ projectKey: 'demo', kind: 'convention', path: 'src/a.ts' });
+    await f.setFactRelevance([{ id: todo[0].id, relevance: 0.2, by: 'model' }]);
+    expect(await f.unscoredFacts({ projectKeys: ['demo'], limit: 10 })).toEqual([]);
+    expect((await f.listFacts({ projectKey: 'demo' })).find((x) => x.statement === 'a')).toMatchObject({ relevance: 0.2, relevanceBy: 'model' });
+  });
+
+  test("the owner's relevance wins: a model score never overwrites it", async () => {
+    await f.saveFileFacts('demo', { path: 'src/a.ts', hash: 'h', summary: '' }, [{ ...fact('a'), relevance: 0.9 }], 'p');
+    const [x] = await f.listFacts({ projectKey: 'demo' });
+    expect(await f.setFactRelevance([{ id: x.id, relevance: 0.1, by: 'you' }])).toBe(1);
+    expect(await f.setFactRelevance([{ id: x.id, relevance: 0.8, by: 'model' }])).toBe(0);
+    expect((await f.listFacts({ projectKey: 'demo' }))[0]).toMatchObject({ relevance: 0.1, relevanceBy: 'you' });
+    // Out of range is clamped, an unknown id changes nothing.
+    await f.setFactRelevance([{ id: x.id, relevance: 7, by: 'you' }, { id: 'nope', relevance: 0.5, by: 'you' }]);
+    expect((await f.listFacts({ projectKey: 'demo' }))[0].relevance).toBe(1);
+    // Scoped to a project: a fact of another project is left alone.
+    expect(await f.setFactRelevance([{ id: x.id, relevance: 0.3, by: 'you', projectKey: 'other' }])).toBe(0);
+    expect(await f.setFactRelevance([{ id: x.id, relevance: 0.3, by: 'you', projectKey: 'demo' }])).toBe(1);
+  });
+
+  test('pinning a project shows in listProjects; a folder with no data yet is recorded when pinned; unpin clears it', async () => {
+    await f.saveFileFacts('demo', { path: 'src/a.ts', hash: 'h', summary: '' }, [fact('x')], 'p');
+    expect((await f.listProjects()).find((p) => p.key === 'demo')?.pinned).toBe(false);
+    await f.setPinned({ key: 'demo', name: 'demo', repoPath: '/vibe/demo' }, true);
+    await f.setPinned({ key: 'fresh', name: 'fresh', repoPath: '/vibe/fresh' }, true);
+    const list = await f.listProjects();
+    expect(list.find((p) => p.key === 'demo')).toMatchObject({ pinned: true, facts: 1 });
+    expect(list.find((p) => p.key === 'fresh')).toMatchObject({ pinned: true, repoPath: '/vibe/fresh', facts: 0 });
+    await f.setPinned({ key: 'demo', name: 'demo', repoPath: '/elsewhere' }, false);
+    // Unpinning never rewrites what the project already knows about itself.
+    expect((await f.listProjects()).find((p) => p.key === 'demo')).toMatchObject({ pinned: false });
+  });
+
   test('markFilesRemoved closes facts of deleted files', async () => {
     await f.saveFileFacts('demo', { path: 'src/gone.ts', hash: 'h', summary: '' }, [fact('gone', 'src/gone.ts')], 'p');
     await f.markFilesRemoved('demo', ['src/gone.ts']);
@@ -80,6 +129,13 @@ describeStores('FactsStore', (h) => {
     expect((await f.nextScanJob())?.id).toBe(job.id);
     await f.updateScanJob(job.id, { status: 'running' });
     expect(await f.nextScanJob()).toBeNull();
+    // The worker's scan runner passes over jobs it is not ready for (an agentic one while another agentic one runs).
+    await f.updateScanJob(job.id, { status: 'queued' });
+    const second = await f.requestScan({ key: 'demo2', name: 'demo2', repoPath: '/vibe/demo2' }, null);
+    expect((await f.nextScanJob(new Date(), [job.id]))?.id).toBe(second.id);
+    expect(await f.nextScanJob(new Date(), [job.id, second.id])).toBeNull();
+    await f.updateScanJob(second.id, { status: 'done' });
+    await f.updateScanJob(job.id, { status: 'running' });
     await f.updateScanJob(job.id, { status: 'done', filesScanned: 3, factsAdded: 7 });
     await f.saveFileFacts('demo', { path: 'src/a.ts', hash: 'h', summary: '' }, [fact('x')], 'p');
     const [p] = await f.listProjects();

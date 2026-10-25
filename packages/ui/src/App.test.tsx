@@ -211,3 +211,58 @@ test('with nothing unsaved, moving between pages never asks', async () => {
   expect(screen.getByRole('button', { name: 'Inbox' }).getAttribute('aria-current')).toBe('page');
   expect(screen.queryByRole('alertdialog')).toBeNull();
 });
+
+test('a write the API cannot take (restarting) shows a banner while it retries, and a plain alert if it gives up', async () => {
+  const { NETWORK_EVENT } = await import('./api.ts');
+  const say = (detail: object) => act(async () => { window.dispatchEvent(new CustomEvent(NETWORK_EVENT, { detail })); });
+  render(<App />);
+  await say({ state: 'retrying', attempt: 1, of: 4 });
+  expect(screen.getByRole('status', { name: 'connection' }).textContent).toMatch(/reconnecting to the API: retrying your last change \(1 of 4\)/i);
+  await say({ state: 'ok' });
+  expect(screen.queryByRole('status', { name: 'connection' })).toBeNull();
+  await say({ state: 'failed' });
+  const alert = screen.getByRole('alert', { name: 'connection' });
+  expect(alert.textContent).toMatch(/was not saved/);
+  await act(async () => { within(alert).getByRole('button', { name: 'Dismiss' }).click(); });
+  expect(screen.queryByRole('alert', { name: 'connection' })).toBeNull();
+});
+
+test('the first-run panel shows on an empty Inbox, Lessons and Graph, not on other pages or with nothing selected', async () => {
+  const pipeline = { stage: { name: 'ingest', startedAt: new Date().toISOString(), current: null }, progress: { done: 4, total: null }, sessions: 3, classify: { backlog: 10, capped: false }, inbox: { pending: 0, confirmed: 0 }, postmortems: { queued: 0 }, lessons: { proposed: 0, approved: 0 }, scans: { done: 0, queued: 0, running: 0, failed: 0, never: 2 } };
+  const status = (tracked: number) => ({ version: '0.4.5', graph: true, worker: null, workerHealthy: true, authRequired: false, selection: { initialized: true, tracked, roots: 1, note: tracked ? null : 'none' } });
+  let tracked = 2;
+  vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+    if (url === '/api/pipeline') return Response.json(pipeline);
+    if (url === '/api/status') return Response.json(status(tracked));
+    if (url === '/api/session') return Response.json({ authRequired: false, authenticated: true });
+    return Response.json([]);
+  }));
+  render(<App />);
+  expect(await screen.findByRole('region', { name: 'pipeline' })).toBeTruthy();
+  await act(async () => { screen.getByRole('button', { name: 'Lessons' }).click(); });
+  expect(await screen.findByRole('region', { name: 'pipeline' })).toBeTruthy();
+  await act(async () => { screen.getByRole('button', { name: 'Activity' }).click(); });
+  expect(screen.queryByRole('region', { name: 'pipeline' })).toBeNull();
+  cleanup();
+  tracked = 0;
+  render(<App />);
+  await screen.findByRole('status', { name: 'no projects selected' });
+  expect(screen.queryByRole('region', { name: 'pipeline' })).toBeNull();
+});
+
+test('the header tooltip says what the worker is doing, and since when a model has been down', async () => {
+  vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+    if (url === '/api/session') return Response.json({ authRequired: false, authenticated: true });
+    if (url === '/api/status') return Response.json({
+      version: '0.4.5', graph: true, worker: { version: '0.4.5', lastBeat: new Date().toISOString() }, workerHealthy: true, authRequired: false, selection: { initialized: true, tracked: 1, roots: 1, note: null },
+      models: { classify: { provider: 'ollama:gemma4', ok: false, reason: 'timed out', since: '2026-10-24T10:00:00Z', checkedAt: '2026-10-24T10:05:00Z' } },
+      stage: { name: 'scan', startedAt: new Date().toISOString(), current: 'demo-shop' }, progress: null,
+    });
+    return Response.json([]);
+  }));
+  render(<App />);
+  const badge = await screen.findByText(/classifier unavailable/i);
+  const title = badge.closest('[title]')?.getAttribute('title') ?? '';
+  expect(title).toMatch(/ollama:gemma4: timed out \(since /);
+  expect(title).toMatch(/now: Scanning a project, for \d+s \(demo-shop\)/);
+});

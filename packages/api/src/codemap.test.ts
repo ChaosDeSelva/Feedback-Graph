@@ -37,7 +37,7 @@ function codegraph(over: Partial<CodeGraphStore> = {}) {
       asked.push({ fn: 'impact', args: [k, paths, depth] });
       return { paths: ['src/db/pool.ts'], dependents: [{ path: 'src/api/orders.ts', depth: 1 }, { path: 'src/server.ts', depth: 2 }], tests: ['test/orders.test.ts', 'test/pool.test.ts'], misses: [miss()], lessons: [lesson('l1', 'Release pool clients')] } satisfies Impact;
     },
-    codeMapMeta: async () => ({ fingerprint: 'abc', builtAt: '2026-10-22T12:00:00Z', stats: { files: 40, symbols: 200, imports: 90, tests: 12 } }),
+    codeMapMeta: async () => ({ fingerprint: 'abc', builtAt: '2026-10-22T12:00:00Z', stats: { files: 40, symbols: 200, imports: 90, tests: 12 }, candidates: null }),
     ...over,
   };
   return { cg, asked };
@@ -99,6 +99,9 @@ test('get_module_context logs what it served as context, with the tool and the p
 
 test('get_module_context says when the file is not in the map, when there is no map, and when the path is outside the project', async () => {
   expect((await getModuleContext({ project: 'demo', path: 'src/nope.ts' }, deps())).markdown).toMatch(/not in the code map[\s\S]*40 files/);
+  // A capped map says so: the file may simply be past the cap.
+  const capped = deps({ codegraph: codegraph({ codeMapMeta: async () => ({ fingerprint: 'abc', builtAt: '2026-10-22T12:00:00Z', stats: { files: 400, symbols: 1, imports: 1, tests: 0 }, candidates: 10_290 }), moduleContext: async () => null }).cg });
+  expect((await getModuleContext({ project: 'demo', path: 'src/x.ts' }, capped)).markdown).toMatch(/400 of 10290 files[\s\S]*SCAN_MAX_FILES/);
   const none = deps({ codegraph: codegraph({ codeMapMeta: async () => null, moduleContext: async () => null }).cg });
   expect((await getModuleContext({ project: 'demo', path: 'src/x.ts' }, none)).markdown).toMatch(/no code map/i);
   const out = await getModuleContext({ cwd: '/Users/j/Vibe/demo', path: '/etc/passwd' }, deps());
@@ -229,7 +232,7 @@ function restApp(over: Record<string, unknown> = {}) {
     moduleContext: async (k: string, p: string) => { asked.push(['module', k, p]); return p === 'src/db/pool.ts' ? pool : null; },
     impact: async (k: string, paths: string[], depth: number) => { asked.push(['impact', k, paths, depth]); return { paths, dependents: [], tests: [], misses: [], lessons: [] }; },
     mapGraph: async (k: string, opts: HotspotOpts & { limit: number }) => { asked.push(['mapGraph', k, opts]); return graphOf(k); },
-    codeMapMeta: async (k: string) => (k === 'demo' ? { fingerprint: 'x', builtAt: '2026-10-22T12:00:00Z', stats: { files: 40, symbols: 200, imports: 90, tests: 12 } } : null),
+    codeMapMeta: async (k: string) => (k === 'demo' ? { fingerprint: 'x', builtAt: '2026-10-22T12:00:00Z', stats: { files: 40, symbols: 200, imports: 90, tests: 12 }, candidates: 10_290 } : null),
     ...over,
   };
   const app = createApp(repo, {
@@ -243,7 +246,7 @@ test('GET /api/projects/:key/codemap/hotspots returns the map stats and the hots
   const { app, asked } = restApp();
   const res = await app.request('/api/projects/demo/codemap/hotspots?limit=5');
   expect(res.status).toBe(200);
-  expect(await res.json()).toEqual({ meta: { fingerprint: 'x', builtAt: '2026-10-22T12:00:00Z', stats: { files: 40, symbols: 200, imports: 90, tests: 12 } }, hotspots: [hot('src/db/pool.ts', 7.5), hot('src/a.ts', 2)] });
+  expect(await res.json()).toEqual({ meta: { fingerprint: 'x', builtAt: '2026-10-22T12:00:00Z', stats: { files: 40, symbols: 200, imports: 90, tests: 12 }, candidates: 10_290 }, hotspots: [hot('src/db/pool.ts', 7.5), hot('src/a.ts', 2)] });
   expect(asked).toEqual([['hotspots', 'demo', 5, { includeTests: false }]]);
   expect((await app.request('/api/projects/demo/codemap/hotspots?limit=0')).status).toBe(400);
   await app.request('/api/projects/demo/codemap/hotspots?tests=1');
@@ -290,7 +293,8 @@ test('GET /api/projects/:key/codemap/graph returns the map graph with a limit an
   const { app, asked } = restApp();
   const res = await app.request('/api/projects/demo/codemap/graph');
   expect(res.status).toBe(200);
-  expect(await res.json()).toEqual(graphOf('demo'));
+  // With the map's size, so the graph can say when the map itself is capped.
+  expect(await res.json()).toEqual({ ...graphOf('demo'), meta: { fingerprint: 'x', builtAt: '2026-10-22T12:00:00Z', stats: { files: 40, symbols: 200, imports: 90, tests: 12 }, candidates: 10_290 } });
   expect(asked).toEqual([['mapGraph', 'demo', { limit: 60, includeTests: false }]]);
   await app.request('/api/projects/demo/codemap/graph?limit=20&tests=1');
   expect(asked.at(-1)).toEqual(['mapGraph', 'demo', { limit: 20, includeTests: true }]);

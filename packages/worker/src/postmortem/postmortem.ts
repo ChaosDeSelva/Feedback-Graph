@@ -1,7 +1,8 @@
 import { readdir, readFile } from 'node:fs/promises';
+import { checkLesson, type LessonFlag } from './lessonCheck.ts';
 import { dirname, join, resolve } from 'node:path';
 import { z } from 'zod';
-import { CAUSES, redactSecrets, suggestLessonPaths, type ContextItem, type ExternalRef, type FeedbackSource, type HumanTurn, type LlmProvider, type PostMortem, type PostMortemInput } from '@fb/core';
+import { askJson, CAUSES, redactSecrets, suggestLessonPaths, type ContextItem, type ExternalRef, type FeedbackSource, type HumanTurn, type LlmProvider, type PostMortem, type PostMortemInput } from '@fb/core';
 
 const MAX_STANDING_CHARS = 6000;
 const MAX_TURN_CHARS = 1500;
@@ -187,7 +188,7 @@ function externalSections(input: PostMortemInput, ext: ExternalRef): string {
 ${
     work
       ? `Session ${work.sessionId} (${work.source === 'codex' ? 'Codex' : 'Claude Code'}), matched by ${ext.branch ? `branch ${ext.branch} or ` : ''}time. Its last turns:\n${workTurns.map((t) => renderTurn(t, 'DEVELOPER')).join('\n\n') || '(no turns recorded)'}`
-      : 'No agent session was found for this work (no session on its branch, or no single session just before the comment). Work from the comment, the diff lines and the repository alone, and say so in causeExplanation.'
+      : 'No agent session was found for this work (no session on its branch, or no single session just before the comment). Work from the comment, the diff lines and the repository alone, and say so in causeExplanation. Do not take paths or scope from any session: scope the lesson to the file the comment is on, or leave its paths empty.'
   }
 
 ${renderRequirements(ext)}
@@ -226,6 +227,10 @@ Outcome of the feedback, judged from the turns AFTER it: approved (developer exp
 
 Write ONE lesson a future agent can act on. Scope it as narrowly as the evidence supports:
 task (only this feature), project (this repo), global (any project) — prefer narrower.
+The lesson must be falsifiable and scoped: someone could check a later change against it, and it names the code, file,
+API or behaviour it is about. Do not turn one reviewer's nit or one comment into a universal rule ("always", "never",
+"treat every nitpick as mandatory"). Do not write lessons about how to treat feedback or reviewers (such as "ignore
+unrelated feedback"): write about the work.
 Set lesson.paths to the narrowest repo-relative paths or globs the evidence supports, preferring the files edited to
 fix the miss (listed below); leave it empty when the lesson is about the whole project.
 Return at most 8 contextItems, each with a verbatim excerpt.
@@ -297,25 +302,46 @@ export type PostMortemDeps = {
 };
 
 /** What the post-mortem model was shown, kept for the provenance log. */
-export type PostMortemTrace = { provider: string; agentic: boolean; standing: string[]; facts: string[] };
+export type PostMortemTrace = { provider: string; agentic: boolean; standing: string[]; facts: string[]; lessonFlags: LessonFlag[] };
+
+/**
+ * The paths a lesson for a comment with no work session may carry: the comment's file, else the model's paths that the
+ * comment, its diff lines or the description name. Never another session's files.
+ */
+function commentOnlyPaths(modelPaths: string[], ext: ExternalRef, text: string): string[] {
+  if (ext.path) return suggestLessonPaths(modelPaths, { edited: [], fixed: [ext.path] });
+  const named = [text, ext.diffHunk ?? '', ext.description ?? ''].join('\n');
+  return suggestLessonPaths(modelPaths, { edited: [], fixed: [] }).filter((p) => !p.startsWith('~') && named.includes(p));
+}
 
 export async function runPostMortem(input: PostMortemInput, deps: PostMortemDeps): Promise<PostMortem & { trace: PostMortemTrace }> {
+  const ext = input.feedback.external;
+  // A comment no session was matched to: nothing a session did (its edits, its summary) belongs in this post-mortem.
+  const sessionless = !!ext && !input.work;
+  const none: Touched = { edited: [], fixed: [] };
   const [standing, facts, touched, sessionSummary] = await Promise.all([
     deps.standing(input),
     deps.facts(input),
-    deps.touched ? deps.touched(input).catch((): Touched => ({ edited: [], fixed: [] })) : Promise.resolve<Touched>({ edited: [], fixed: [] }),
-    deps.sessionSummary ? deps.sessionSummary(input).catch(() => null) : Promise.resolve(null),
+    deps.touched && !sessionless ? deps.touched(input).catch((): Touched => none) : Promise.resolve<Touched>(none),
+    deps.sessionSummary && !sessionless ? deps.sessionSummary(input).catch(() => null) : Promise.resolve(null),
   ]);
   const prompt = redactSecrets(buildPrompt(input, standing, { agentic: deps.llm.agentic, facts, touched, sessionSummary }));
-  const raw = PostMortemSchema.parse(
-    await deps.llm.json({ system: 'You are a meticulous engineering post-mortem analyst.', user: prompt, schema: JSON_SCHEMA, cwd: input.repoPath }),
+  // An answer of the wrong shape is asked once more, more strictly, before it counts against the feedback.
+  const raw = await askJson(
+    deps.llm,
+    { system: 'You are a meticulous engineering post-mortem analyst.', user: prompt, schema: JSON_SCHEMA, cwd: input.repoPath },
+    (a) => PostMortemSchema.parse(a),
   );
   // A global lesson is not about this repo's files; any other is scoped as narrowly as the edits support.
-  const paths = suggestLessonPaths(raw.lesson.paths, raw.lesson.scope === 'global' ? { edited: [], fixed: [] } : touched);
+  const paths = sessionless
+    ? commentOnlyPaths(raw.lesson.paths, ext!, input.feedback.text)
+    : suggestLessonPaths(raw.lesson.paths, raw.lesson.scope === 'global' ? none : touched);
+  // Scoped and falsifiable? Narrows what is clearly over-reaching and flags the rest for the owner (lessonCheck.ts).
+  const checked = checkLesson({ ...raw.lesson, paths }, input.feedback);
   return {
     ...raw,
-    lesson: { ...raw.lesson, paths },
+    lesson: checked.lesson,
     contextItems: markAvailability(raw.contextItems, input),
-    trace: { provider: deps.llm.id, agentic: deps.llm.agentic, standing: standing.map((d) => d.ref), facts },
+    trace: { provider: deps.llm.id, agentic: deps.llm.agentic, standing: standing.map((d) => d.ref), facts, lessonFlags: checked.flags },
   };
 }

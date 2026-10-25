@@ -92,9 +92,56 @@ export function serviceConnection(
   return { state: 'connected', source: o.source, detail: `Connected ${who}${from}; ${synced}.`, href };
 }
 
-async function service(d: IntegrationsDeps, kind: IntegrationKind): Promise<ServiceView> {
+/** A check that could not reach the service is tried again after this long, not on every read. */
+const RECHECK_AFTER_MS = 10 * 60_000;
+/** How long a read waits for a check started on it; a slower one lands on a later read. */
+const CHECK_WAIT_MS = 5_000;
+/** Per Integrations: the check last started for each service (its token's fingerprint, when, and the call). */
+const checking = new WeakMap<Integrations, Map<IntegrationKind, { fingerprint: string; at: number; done: Promise<IntegrationCheck | null> }>>();
+
+/**
+ * Check a token nobody has checked (one set in .env is never checked by saving it), or one whose last check failed
+ * while a sync has worked since, so the connection names the account instead of "token not checked yet". At most one
+ * call per token at a time; a service that could not be reached is not recorded as refusing the token, and is asked
+ * again only after RECHECK_AFTER_MS. Returns the new check, or null when none was made or it did not finish in time.
+ */
+async function checkOnFirstUse(
+  d: IntegrationsDeps,
+  kind: IntegrationKind,
+  cred: { token: string; source: 'env' | 'app'; fingerprint: string },
+  current: IntegrationCheck | null,
+  sync: IntegrationSyncState,
+): Promise<IntegrationCheck | null> {
+  const failedBeforeASync = !!current && !current.ok && !!sync.lastSyncAt && sync.lastSyncAt > current.at && sync.authFailedFor !== cred.fingerprint;
+  if (current && !failedBeforeASync) return null;
+  const mine = checking.get(d.integrations) ?? new Map();
+  checking.set(d.integrations, mine);
+  let run = mine.get(kind);
+  if (!run || run.fingerprint !== cred.fingerprint || (Date.now() - run.at > RECHECK_AFTER_MS)) {
+    const done = checkToken(d, kind, cred.token, cred.source).then(async (c) => {
+      if (c.ok || c.errorKind !== 'network') {
+        await d.integrations.saveCheck(kind, c);
+        return c;
+      }
+      return null;
+    }, () => null);
+    run = { fingerprint: cred.fingerprint, at: Date.now(), done };
+    mine.set(kind, run);
+  }
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([run.done, new Promise<null>((r) => { timer = setTimeout(() => r(null), CHECK_WAIT_MS); })]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** `checkUnchecked`: check a token nobody has checked yet (checkOnFirstUse) before saying how it stands. */
+async function service(d: IntegrationsDeps, kind: IntegrationKind, o: { checkUnchecked: boolean } = { checkUnchecked: true }): Promise<ServiceView> {
   const i = d.integrations;
-  const [cred, check, sync, savedInApp] = await Promise.all([i.credential(kind), i.check(kind), i.sync(kind), i.savedInApp(kind)]);
+  const [cred, saved, sync, savedInApp] = await Promise.all([i.credential(kind), i.check(kind), i.sync(kind), i.savedInApp(kind)]);
+  let check = saved;
+  if (cred && o.checkUnchecked) check = (await checkOnFirstUse(d, kind, cred, saved && saved.fingerprint === cred.fingerprint ? saved : null, sync)) ?? saved;
   const current = check && cred && check.fingerprint === cred.fingerprint ? check : null;
   return {
     connection: serviceConnection(kind, { source: cred?.source ?? null, fingerprint: cred?.fingerprint ?? null, check, sync, canSave: i.canSave }),
@@ -257,6 +304,8 @@ function cloudConnection(cloud: CloudConfig | null, w: WorkerStatus | null): Con
 /** Every connection for /api/status. Each one fails on its own: a broken one never hides the others. */
 export async function connectionsStatus(o: {
   integrations: Integrations | null;
+  /** The integration routes' deps: with them, a token nobody has checked is checked here too (the status bar polls). */
+  deps?: IntegrationsDeps;
   worker: WorkerStatus | null;
   ollama: OllamaHealth | null;
   cloud: CloudConfig | null;
@@ -264,7 +313,8 @@ export async function connectionsStatus(o: {
   const one = async (kind: IntegrationKind): Promise<Connection> => {
     if (!o.integrations) return { state: 'not_connected', source: null, detail: 'Not available in this setup.', href: integrationHref(kind) };
     try {
-      return (await service({ integrations: o.integrations } as IntegrationsDeps, kind)).connection;
+      const d = o.deps?.integrations === o.integrations ? o.deps : ({ integrations: o.integrations } as IntegrationsDeps);
+      return (await service(d, kind, { checkUnchecked: d === o.deps })).connection;
     } catch (err) {
       return { state: 'error', source: null, detail: `Could not read the ${NAME[kind]} state: ${redactSecrets(String(err)).slice(0, 200)}`, href: integrationHref(kind) };
     }

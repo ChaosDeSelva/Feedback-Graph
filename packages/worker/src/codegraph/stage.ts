@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { promisify } from 'node:util';
 import type { ActivityStore, CodeGraphStore, CodeMapStats } from '@fb/core';
 import { GIT_SAFE } from '../ingest/git.ts';
+import { MAX_AUTO_MAP_FILES } from '../scan/rank.ts';
 import { buildCodeMap } from './codemap.ts';
 import { churn as gitChurn } from './churn.ts';
 import { testsFor } from './queries.ts';
@@ -16,6 +17,11 @@ const run = promisify(execFile);
 export const CHURN_DAYS = 90;
 /** A project's repo is looked at no more often than this (a scan maps its project regardless). */
 export const MAP_INTERVAL_MS = 5 * 60_000;
+/** How many of the files a project's sessions edited a capped map or a scan keeps first. */
+export const EDITED_PATHS_LIMIT = 1000;
+
+/** How long `git status` may take: a bind-mounted tree of thousands of files can need minutes. */
+export const gitStatusTimeoutMs = (files: number) => Math.min(300_000, 30_000 + 10 * Math.max(0, files));
 
 /**
  * What the repo looks like right now, cheaply: HEAD, `git status` (which respects .gitignore), and the size and mtime
@@ -25,11 +31,14 @@ export const MAP_INTERVAL_MS = 5 * 60_000;
 export async function repoFingerprint(
   repoPath: string,
   maxFiles: number,
-  o: { exec?: (args: string[]) => Promise<string>; log?: (msg: string, extra?: object) => void } = {},
+  o: { exec?: (args: string[], timeoutMs?: number) => Promise<string>; log?: (msg: string, extra?: object) => void; timeoutMs?: number } = {},
 ): Promise<string | null> {
-  const exec = o.exec ?? (async (args: string[]) => (await run('git', args, { timeout: 30_000, maxBuffer: 64 * 1024 * 1024 })).stdout);
+  const timeoutMs = o.timeoutMs ?? gitStatusTimeoutMs(0);
+  const exec = o.exec ?? (async (args: string[], timeout = 30_000) => (await run('git', args, { timeout, maxBuffer: 64 * 1024 * 1024 })).stdout);
   // The repo is mounted read-only: --no-optional-locks stops `git status` from trying to refresh the index.
   const git = (...args: string[]) => exec(['--no-optional-locks', ...GIT_SAFE, '-C', repoPath, ...args]);
+  const status = (untracked: 'normal' | 'no') =>
+    exec(['--no-optional-locks', ...GIT_SAFE, '-C', repoPath, 'status', '--porcelain=v1', '-z', `--untracked-files=${untracked}`, '--', '.'], timeoutMs);
   let top: string;
   try {
     top = (await git('rev-parse', '--show-toplevel')).trim();
@@ -37,18 +46,29 @@ export async function repoFingerprint(
     return null;
   }
   const head = (await git('rev-parse', '-q', '--verify', 'HEAD').catch(() => '')).trim();
-  let status: string;
-  try {
-    status = await git('status', '--porcelain=v1', '-z', '--untracked-files=normal', '--', '.');
-  } catch (e) {
-    // Without status a dirty tree looks clean: no fingerprint, so the map is rebuilt on the interval instead.
+  const failed = (e: unknown, extra: object = {}) => {
     const err = e as { killed?: boolean; signal?: string; message?: string };
-    o.log?.(err.killed ? 'git status timed out' : 'git status failed', { repoPath, error: String(err.message ?? e).slice(0, 300) });
-    return null;
+    o.log?.(err.killed ? 'git status timed out' : 'git status failed', { repoPath, error: String(err.message ?? e).slice(0, 300), ...extra });
+    return !!err.killed;
+  };
+  let out: string;
+  try {
+    out = await status('normal');
+  } catch (e) {
+    // Listing untracked files is the slow part of a big tree: a timeout is tried once more without them (new files
+    // then show up at the next commit or edit of a tracked file, or when the interval rebuild runs).
+    if (!failed(e)) return null;
+    try {
+      out = `untracked=no\0${await status('no')}`;
+    } catch (e2) {
+      // Without status a dirty tree looks clean: no fingerprint, so the map is rebuilt on the interval instead.
+      failed(e2, { untracked: 'no' });
+      return null;
+    }
   }
-  const h = createHash('sha256').update(`${head}\n${status}\n`);
+  const h = createHash('sha256').update(`${head}\n${out}\n`);
   // -z: "XY <path>\0", and a rename's old path as one more "\0"-terminated field.
-  const entries = status.split('\0');
+  const entries = out.split('\0');
   let seen = 0;
   for (let i = 0; i < entries.length && seen < maxFiles; i++) {
     const e = entries[i];
@@ -66,13 +86,15 @@ export type MapStageDeps = {
   activity?: Pick<ActivityStore, 'record'>;
   /** The selected projects (scope) and their folders, as the worker sees them. */
   projects(): Promise<{ key: string; repoPath: string }[]>;
-  /** The scanner's bounds. */
-  maxFiles: number;
+  /** The scanner's bounds. maxFiles null: the map's cap scales with the repo (SCAN_MAX_FILES unset). */
+  maxFiles: number | null;
   maxBytes: number;
   minIntervalMs?: number;
   build?: (repoPath: string, opts: BuildOpts, prev?: CodeMap) => Promise<CodeMap>;
   churn?: typeof gitChurn;
-  fingerprint?: (repoPath: string, maxFiles: number) => Promise<string | null>;
+  fingerprint?: (repoPath: string, maxFiles: number, o?: { timeoutMs?: number }) => Promise<string | null>;
+  /** Files the project's sessions edited, most recent first (CodeGraphStore.editedPaths): kept in a capped map first. */
+  editedPaths?: (projectKey: string) => Promise<string[]>;
   log?: (msg: string, extra?: object) => void;
   now?: () => number;
   /**
@@ -163,12 +185,15 @@ export class MapStage {
     const d = this.d;
     const t0 = Date.now();
     try {
-      const fingerprint = d.fingerprint ? await d.fingerprint(p.repoPath, d.maxFiles) : await repoFingerprint(p.repoPath, d.maxFiles, { log: d.log });
       const meta = await d.store.codeMapMeta(p.key);
+      const dirtyCap = d.maxFiles ?? MAX_AUTO_MAP_FILES;
+      const timeoutMs = gitStatusTimeoutMs(meta?.candidates ?? meta?.stats.files ?? 0);
+      const fingerprint = d.fingerprint ? await d.fingerprint(p.repoPath, dirtyCap, { timeoutMs }) : await repoFingerprint(p.repoPath, dirtyCap, { log: d.log, timeoutMs });
       if (meta && fingerprint !== null && meta.fingerprint === fingerprint) return null;
       const prev = meta ? await d.store.codeMap(p.key) : null;
       const signal = this.stopping.signal;
-      const map = await (d.build ?? buildCodeMap)(p.repoPath, { maxFiles: d.maxFiles, maxBytes: d.maxBytes, signal }, prev ?? undefined);
+      const priority = d.editedPaths ? await d.editedPaths(p.key).catch(() => []) : [];
+      const map = await (d.build ?? buildCodeMap)(p.repoPath, { maxFiles: d.maxFiles, maxBytes: d.maxBytes, signal, priority }, prev ?? undefined);
       const commits = await (d.churn ?? gitChurn)(p.repoPath, CHURN_DAYS);
       const tests = map.files.filter((f) => !f.isTest).flatMap((f) => testsFor(map, f.path).map((test) => ({ test, target: f.path })));
       const exclusive = d.exclusive ?? (<T>(fn: () => Promise<T>) => fn());
@@ -177,20 +202,24 @@ export class MapStage {
         if (signal.aborted) return 'stopped' as const;
         // Unselected, cleaned up or deleted while it was being parsed: writing now would bring its map back.
         if (d.inScope && !(await d.inScope(p.key))) return null;
-        return d.store.replaceCodeMap(p.key, { ...map, tests, churn: Object.fromEntries(commits), fingerprint });
+        return d.store.replaceCodeMap(p.key, { ...map, tests, churn: Object.fromEntries(commits), fingerprint, candidates: map.candidates ?? null });
       });
       if (!stats || stats === 'stopped') {
         d.log?.('code map skipped', { project: p.key, reason: stats ? 'the worker is shutting down' : 'no longer selected' });
         return null;
       }
       const durationMs = Date.now() - t0;
+      const candidates = map.candidates ?? null;
+      const capped = candidates !== null && candidates > stats.files;
+      if (capped) d.log?.('code map capped', { project: p.key, mapped: stats.files, totalCandidates: candidates });
+      const filesPart = capped ? `${stats.files} of ${candidates} files (capped)` : plural(stats.files, 'file');
       await d.activity?.record({
         kind: 'code_mapped',
         actor: 'deterministic',
         projectKey: p.key,
-        subject: `code map built: ${plural(stats.files, 'file')}, ${plural(stats.symbols, 'symbol')}, ${plural(stats.imports, 'import edge')}, ${plural(stats.tests, 'test link')}`,
+        subject: `code map built: ${filesPart}, ${plural(stats.symbols, 'symbol')}, ${plural(stats.imports, 'import edge')}, ${plural(stats.tests, 'test link')}`,
         why: why ?? (meta ? 'the repo changed since the last map' : 'first map of this project'),
-        details: { ...stats, durationMs, incremental: !!prev, fingerprint, churnDays: CHURN_DAYS },
+        details: { ...stats, candidates, durationMs, incremental: !!prev, fingerprint, churnDays: CHURN_DAYS },
       });
       d.log?.('code map built', { project: p.key, ...stats, durationMs });
       return { ...stats, durationMs };

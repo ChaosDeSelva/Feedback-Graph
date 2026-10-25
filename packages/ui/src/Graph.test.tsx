@@ -24,8 +24,10 @@ const graph = {
   ],
 };
 let urls: string[];
+let graphMeta: object | null = null;
 beforeEach(() => {
   urls = [];
+  graphMeta = null;
   vi.stubGlobal('fetch', vi.fn(async (url: string) => {
     urls.push(url);
     if (url === '/api/projects') return Response.json([
@@ -33,7 +35,7 @@ beforeEach(() => {
       { key: 'shop', repoPath: '/x', sessions: 3, feedback: 2, lessons: 1, facts: 0, lastScan: null },
     ]);
     if (url.startsWith('/api/graph?')) return Response.json(graph);
-    if (url.startsWith('/api/projects/shop/codemap/graph')) return Response.json(codeGraph);
+    if (url.startsWith('/api/projects/shop/codemap/graph')) return Response.json(graphMeta ? { ...codeGraph, meta: graphMeta } : codeGraph);
     const m = url.match(/^\/api\/projects\/shop\/codemap\/module\?path=(.+)$/);
     if (m) return Response.json(mod(decodeURIComponent(m[1])));
     return Response.json([]);
@@ -72,6 +74,17 @@ test('Code mode draws the project\'s code map, says when it is capped, and a fil
   // A file named in the panel opens in its place.
   fireEvent.click(within(panel).getByText('src/api/orders.ts'));
   expect(await screen.findByRole('region', { name: 'module src/api/orders.ts' })).toBeTruthy();
+});
+
+test('Code mode says when the map itself is capped, and how to raise the cap', async () => {
+  graphMeta = { fingerprint: 'x', builtAt: '2026-10-22T12:00:00Z', stats: { files: 392, symbols: 1, imports: 1, tests: 0 }, candidates: 10_290 };
+  render(<Graph />);
+  await waitFor(() => expect((screen.getByLabelText('project') as HTMLSelectElement).value).toBe('shop'));
+  fireEvent.click(screen.getByRole('button', { name: 'code' }));
+  await screen.findByText('src/db/pool.ts');
+  const notes = screen.getAllByRole('note').map((n) => n.textContent).join(' ');
+  expect(notes).toMatch(/map holds 392 of 10,290 files/);
+  expect(notes).toMatch(/SCAN_MAX_FILES/);
 });
 
 test('Code mode: a miss shows its cause, feedback and files; include tests asks again with tests=1', async () => {

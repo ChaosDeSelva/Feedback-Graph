@@ -9,6 +9,7 @@
 #   ./scripts/install-agent.sh            # every agent found (claude or codex on PATH, or a Codex config or login)
 #   ./scripts/install-agent.sh codex      # only Codex (or: claude)
 #   ./scripts/install-agent.sh --dry-run  # print what would change, change nothing
+#   ./scripts/install-agent.sh codex --codex-auto-approve   # let Codex call the tools without asking (codex exec)
 #   ./scripts/install-agent.sh --help
 #   FEEDBACK_GRAPH_URL=https://feedback.example.com ./scripts/install-agent.sh
 #   (default http://localhost:<API_PORT>, API_PORT from .env or the environment, 8787 when unset; an API_BIND other
@@ -22,7 +23,7 @@ set -euo pipefail
 
 usage() {
   cat <<'EOF'
-usage: ./scripts/install-agent.sh [--dry-run] [claude|codex]
+usage: ./scripts/install-agent.sh [--dry-run] [--codex-auto-approve] [claude|codex]
 
 Connect Claude Code and Codex to the Feedback Graph's MCP server.
 
@@ -33,6 +34,10 @@ Connect Claude Code and Codex to the Feedback Graph's MCP server.
   codex        Codex only: [mcp_servers.feedback-graph] in $CODEX_HOME/config.toml, and the guidance in
                $CODEX_HOME/AGENTS.md between BEGIN/END feedback-graph markers
   --dry-run    print what would change and change nothing (no files, no links, no claude mcp add)
+  --codex-auto-approve
+               let Codex call the Feedback Graph tools without asking: default_tools_approval_mode = "approve" in
+               [mcp_servers.feedback-graph]. `codex exec` (approval policy never) refuses MCP tool calls without it.
+               In a terminal you are asked instead (default no).
   -h, --help   this text
 
 The URL is FEEDBACK_GRAPH_URL, else http://localhost:<API_PORT> (API_PORT from the environment or .env, 8787 when
@@ -41,11 +46,13 @@ EOF
 }
 
 dry=0
+auto_approve=0
 args=()
 for a in "$@"; do
   case "$a" in
     -h | --help) usage; exit 0 ;;
     -n | --dry-run) dry=1 ;;
+    --codex-auto-approve) auto_approve=1 ;;
     -*) echo "unknown option: $a" >&2; usage >&2; exit 1 ;;
     *) args+=("$a") ;;
   esac
@@ -133,6 +140,34 @@ install_claude() {
   fi
 }
 
+# Questions only in a terminal (FEEDBACK_INSTALL_INTERACTIVE=1 asks them anyway, reading answers from stdin).
+interactive() { [ -t 0 ] || [ "${FEEDBACK_INSTALL_INTERACTIVE:-}" = 1 ]; }
+
+# Codex's per-server tool approval (a key of the server's table; values auto, prompt, writes, approve). With "approve",
+# Codex calls this server's tools without asking, which `codex exec` needs: its approval policy is never, so otherwise
+# every MCP tool call is refused. The tools only read the graph and file reports for you to decide on.
+APPROVE_LINE='default_tools_approval_mode = "approve"'
+# Whether the feedback-graph table in $1 already sets the approval mode.
+table_has_approval() {
+  awk '
+    /^[[:space:]]*\[/ { on = ($0 ~ /^[[:space:]]*\[mcp_servers\.("feedback-graph"|feedback-graph)\][[:space:]]*$/); next }
+    on && /^[[:space:]]*default_tools_approval_mode[[:space:]]*=/ { found = 1 }
+    END { exit found ? 0 : 1 }
+  ' "$1" 2>/dev/null
+}
+# --codex-auto-approve says yes, a terminal asks (default no), otherwise no.
+want_approval() {
+  [ "$auto_approve" = 1 ] && return 0
+  interactive || return 1
+  local a=""
+  read -r -p "Let Codex call the Feedback Graph tools without asking ($APPROVE_LINE; codex exec needs it)? [y/N] " a || true
+  case "$a" in [Yy]*) return 0 ;; *) return 1 ;; esac
+}
+approval_hint() {
+  echo "Codex: each tool call waits for your approval (codex exec refuses them); to allow them, re-run with --codex-auto-approve"
+  echo "  or add $APPROVE_LINE under [mcp_servers.feedback-graph] in $1"
+}
+
 BEGIN_MARK='<!-- BEGIN feedback-graph (managed by scripts/install-agent.sh in the Feedback Graph folder; re-run it to update) -->'
 END_MARK='<!-- END feedback-graph -->'
 
@@ -140,27 +175,55 @@ install_codex() {
   local cfg="$codex_home/config.toml" md="$codex_home/AGENTS.md"
   [ "$dry" = 1 ] || mkdir -p "$codex_home"
 
-  # Codex config keys for a streamable HTTP MCP server: url, and static http_headers for the token.
+  # Codex config keys for a streamable HTTP MCP server: url, static http_headers for the token, and (when you allow it)
+  # default_tools_approval_mode.
+  local approve=0
   if grep -Eq '^[[:space:]]*\[mcp_servers\.("feedback-graph"|feedback-graph)\][[:space:]]*$' "$cfg" 2>/dev/null; then
     echo "Codex: MCP server feedback-graph already in $cfg (delete its [mcp_servers.feedback-graph] table, then re-run, to change it)"
-  elif [ "$dry" = 1 ]; then
-    backup "$cfg"
-    would "add [mcp_servers.feedback-graph] with url = \"$url/mcp\"${token:+ and the API_TOKEN as a Bearer header (then make it readable by you only)} to $cfg"
-  else
-    backup "$cfg"
-    local sep
-    sep="$(separator "$cfg")"
-    {
-      printf '%s' "${sep%x}"
-      echo '[mcp_servers.feedback-graph]'
-      echo "url = \"$url/mcp\""
-      if [ -n "$token" ]; then echo "http_headers = { \"Authorization\" = \"Bearer $token\" }"; fi
-    } >>"$cfg"
-    if [ -n "$token" ]; then
-      chmod 600 "$cfg" # it now holds the token
-      echo "Codex: registered $url/mcp with your API_TOKEN in $cfg (made readable by you only)"
+    if table_has_approval "$cfg"; then
+      echo "Codex: the approval mode for feedback-graph is already set in $cfg"
+    elif want_approval; then
+      backup "$cfg"
+      if [ "$dry" = 1 ]; then
+        would "add $APPROVE_LINE to [mcp_servers.feedback-graph] in $cfg"
+      else
+        # In place (cp keeps the file's mode: it may hold the token), right under the table's header.
+        local tmp="$cfg.tmp.$$"
+        cp -p "$cfg" "$tmp"
+        LINE="$APPROVE_LINE" awk '
+          { print }
+          !done && /^[[:space:]]*\[mcp_servers\.("feedback-graph"|feedback-graph)\][[:space:]]*$/ { print ENVIRON["LINE"]; done = 1 }
+        ' "$cfg" >"$tmp"
+        mv "$tmp" "$cfg"
+        echo "Codex: feedback-graph tools now run without asking ($APPROVE_LINE in $cfg)"
+      fi
     else
-      echo "Codex: registered $url/mcp in $cfg"
+      approval_hint "$cfg"
+    fi
+  else
+    want_approval && approve=1
+    if [ "$dry" = 1 ]; then
+      backup "$cfg"
+      would "add [mcp_servers.feedback-graph] with url = \"$url/mcp\"${token:+ and the API_TOKEN as a Bearer header (then make it readable by you only)} to $cfg"
+      if [ "$approve" = 1 ]; then would "add $APPROVE_LINE to it"; fi
+    else
+      backup "$cfg"
+      local sep
+      sep="$(separator "$cfg")"
+      {
+        printf '%s' "${sep%x}"
+        echo '[mcp_servers.feedback-graph]'
+        echo "url = \"$url/mcp\""
+        if [ "$approve" = 1 ]; then echo "$APPROVE_LINE"; fi
+        if [ -n "$token" ]; then echo "http_headers = { \"Authorization\" = \"Bearer $token\" }"; fi
+      } >>"$cfg"
+      if [ -n "$token" ]; then
+        chmod 600 "$cfg" # it now holds the token
+        echo "Codex: registered $url/mcp with your API_TOKEN in $cfg (made readable by you only)"
+      else
+        echo "Codex: registered $url/mcp in $cfg"
+      fi
+      if [ "$approve" = 1 ]; then echo "Codex: feedback-graph tools run without asking ($APPROVE_LINE)"; else approval_hint "$cfg"; fi
     fi
   fi
 

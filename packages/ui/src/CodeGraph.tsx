@@ -1,11 +1,12 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import ForceGraph2D, { type ForceGraphMethods } from 'react-force-graph-2d';
-import { api, type MapGraph } from './api.ts';
+import { api, type CodeMapMeta, type MapGraph } from './api.ts';
+import { mapCapNote } from './CodeMap.tsx';
 import { IncludeTests, ModulePanel } from './CodeMap.tsx';
 import { inboxHref, lessonHref } from './links.ts';
 import { Alert, CauseBadge, EmptyState, plural, SectionLabel, Skeleton } from './ui/display.tsx';
 import { MAX_FIT_ZOOM, useSize } from './ui/graphCanvas.ts';
-import { codeLinkLabel, codeNodeLabel } from './ui/graphLabels.ts';
+import { codeLinkLabel, codeNodeCaption, codeNodeLabel } from './ui/graphLabels.ts';
 import { GraphIcon } from './ui/icons.tsx';
 import { readToken, useTheme } from './ui/theme.ts';
 
@@ -54,7 +55,7 @@ export function toNodes(g: MapGraph): { nodes: CodeNode[]; links: CodeLink[] } {
 
 /** The Graph page's Code mode: the code map of one project, drawn; a file opens its module panel. */
 export function CodeGraph({ projectKey }: { projectKey: string }) {
-  const [graph, setGraph] = useState<MapGraph | null>(null);
+  const [graph, setGraph] = useState<(MapGraph & { meta?: CodeMapMeta | null }) | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [tests, setTests] = useState(false);
   const [selected, setSelected] = useState<Selected | null>(null);
@@ -84,6 +85,7 @@ export function CodeGraph({ projectKey }: { projectKey: string }) {
   const cap = graph?.cap;
   const tops = graph?.files.filter((f) => f.top).length ?? 0;
   const capped = cap && (cap.eligible > tops || cap.neighborsFound > cap.neighbors);
+  const mapCapped = mapCapNote(graph?.meta);
 
   const fileButton = (p: string) => (
     <button type="button" onClick={() => setSelected({ kind: 'file', path: p })} className="text-left font-mono text-[12px] [overflow-wrap:anywhere] text-accent-text hover:underline">{p}</button>
@@ -110,6 +112,11 @@ export function CodeGraph({ projectKey }: { projectKey: string }) {
               Showing the top {tops} of {plural(cap.eligible, 'file')} by hotspot score
               {cap.neighborsFound > cap.neighbors ? ` and ${cap.neighbors} of their ${cap.neighborsFound} neighbours` : ' and their neighbours'}.
               The Projects page lists them all.
+            </p>
+          )}
+          {mapCapped && (
+            <p role="note" className="rounded-md border border-line bg-surface/90 px-2.5 py-1 text-xs text-muted shadow-card backdrop-blur">
+              The map holds {mapCapped}; files past the cap are not drawn. Raise SCAN_MAX_FILES to map more.
             </p>
           )}
         </div>
@@ -148,6 +155,15 @@ export function CodeGraph({ projectKey }: { projectKey: string }) {
               ctx.lineWidth = (on ? 3 : 1.5) / scale;
               ctx.strokeStyle = on ? palette.text : palette.surface;
               ctx.stroke();
+              // Canvas text is drawn, not parsed, so the path needs no escaping here (the hover label is HTML).
+              const caption = codeNodeCaption(n, scale);
+              if (caption) {
+                ctx.font = `${11 / scale}px sans-serif`;
+                ctx.textAlign = 'center';
+                ctx.textBaseline = 'top';
+                ctx.fillStyle = palette.text;
+                ctx.fillText(caption, x, y + r + 2 / scale);
+              }
             }}
             linkColor={() => palette.link}
             linkWidth={1}
@@ -199,7 +215,7 @@ export function CodeGraph({ projectKey }: { projectKey: string }) {
           </div>
         ) : (
           <p className="text-muted">
-            Click a file to open its module panel. Bigger files score higher as hotspots; red ones had misses. Arrows are imports, dashed ones tests; diamonds are misses and squares the approved lessons on those files.
+            Click a file to open its module panel; hover one for its path, or zoom in to see every file's name. Bigger files score higher as hotspots; red ones had misses. Arrows are imports, dashed ones tests; diamonds are misses and squares the approved lessons on those files.
           </p>
         )}
       </aside>

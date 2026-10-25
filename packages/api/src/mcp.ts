@@ -18,7 +18,7 @@ function buildServer(ctx: ContextDeps, client: string | undefined) {
     'get_task_context',
     {
       description:
-        'Before starting non-trivial work: returns approved lessons from past developer feedback and similar past misses in this project, with citations. Name the files you expect to change: lessons tied to them come first, and a short code map shows their importers, tests and last misses.',
+        'Before starting non-trivial work: returns approved lessons from past developer feedback and similar past misses in this project, with citations, the code and document facts that matter most for everyday work, and the best matches from projects the developer linked to this one. Name the files you expect to change: lessons tied to them come first, and a short code map shows their importers, tests and last misses.',
       inputSchema: {
         ...where,
         task: z.string().describe('What you are about to build or change, in a sentence or two'),
@@ -146,6 +146,8 @@ async function initializeClient(req: Request): Promise<string | undefined> {
 
 /** Stateless Streamable HTTP: a fresh server + transport per request. */
 export async function handleMcp(req: Request, ctx: ContextDeps): Promise<Response> {
+  // A client ending its session (Codex does on every exit). Stateless: there is nothing to end, so it simply succeeds.
+  if (req.method === 'DELETE') return new Response(null, { status: 204 });
   const initialized = await initializeClient(req);
   const server = buildServer(ctx, initialized ?? decodeClient(req.headers.get('mcp-session-id')));
   const transport = new WebStandardStreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true });

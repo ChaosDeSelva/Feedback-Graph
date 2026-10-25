@@ -37,7 +37,10 @@ export function CloudSync() {
     setResult(null);
     try {
       const r = await api.syncCloud();
-      if (r.ok) setResult(sentence(r.host, r.sent));
+      // Nothing stored for any selected project: no request reached the cloud, so it records no sync either.
+      const nothing = r.ok && !r.sent.projects && !r.projects?.some((p) => p.status === 'withdrawn');
+      if (nothing) setResult('Nothing to send yet: the selected projects have no lessons, misses, facts or docs stored. The cloud records a sync once something is sent.');
+      else if (r.ok) setResult(sentence(r.host, r.sent));
       else setError(r.error ?? 'The sync failed.');
       await load();
     } catch (e) {

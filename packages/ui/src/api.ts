@@ -1,6 +1,6 @@
-import type { Activity, ActivityKind, Connection, ConnectionName, ExternalRef, FeedbackSource, CloudSyncResult, SyncCounts, SyncTrigger, Candidate, CodeMapMeta, Hotspot, MapGraph, ModuleContext, FolderCandidate, OutsideFolder, DocSummary, CandidateDetail, CandidateStatus, EvidenceGraph, FactHit, FactKind, Lesson, LessonDetail, LessonStatus, PatternReport, ProjectSummary, ScanJob, SessionDetail, SessionListItem, SessionState, StatsRow, StoredFact, SystemStatus } from '@fb/core';
+import type { Activity, ActivityKind, Connection, ConnectionName, ExternalRef, FeedbackSource, CloudSyncResult, SyncCounts, SyncTrigger, Candidate, CodeMapMeta, Hotspot, MapGraph, ModuleContext, FolderCandidate, OutsideFolder, PipelineStatus, DocSummary, CandidateDetail, CandidateStatus, EvidenceGraph, FactHit, FactKind, Lesson, LessonDetail, LessonStatus, PatternReport, ProjectSummary, ProjectLink, LinkRelation, LinkStatus, ScanJob, SessionDetail, SessionListItem, SessionState, StatsRow, StoredFact, SystemStatus } from '@fb/core';
 
-export type { Connection, ConnectionName, ExternalRef, FeedbackSource, CloudSyncResult, SyncCounts, Activity, Candidate, CodeMapMeta, Hotspot, MapGraph, ModuleContext, DocSummary, CandidateDetail, CandidateStatus, EvidenceGraph, Lesson, LessonDetail, LessonStatus, PatternReport, ProjectSummary, ScanJob, SessionDetail, SessionListItem, SessionState, StatsRow, StoredFact, SystemStatus };
+export type { Connection, ConnectionName, ExternalRef, FeedbackSource, CloudSyncResult, SyncCounts, Activity, Candidate, CodeMapMeta, Hotspot, MapGraph, ModuleContext, DocSummary, CandidateDetail, CandidateStatus, EvidenceGraph, Lesson, LessonDetail, LessonStatus, PatternReport, ProjectSummary, ProjectLink, LinkRelation, LinkStatus, ScanJob, PipelineStatus, SessionDetail, SessionListItem, SessionState, StatsRow, StoredFact, SystemStatus };
 
 /** One folder on the Settings page (GET /api/settings/projects). */
 export type ProjectCandidate = FolderCandidate & {
@@ -78,14 +78,47 @@ async function errorText(res: Response): Promise<string> {
   return `${res.status} ${res.statusText}`;
 }
 
-async function request<T = void>(path: string, o: { method?: string; body?: unknown } = {}): Promise<T> {
-  const write = o.method && o.method !== 'GET';
-  const res = await fetch(path, {
+/**
+ * A write that could not reach the API at all (it is restarting, or the network dropped) is tried again after each of
+ * these waits; one the server answered, even with an error, never is. Writes that must not happen twice (uploads,
+ * imports, deletes, cleanup, a cloud sync) pass retry: false: the first try may have reached the server. The app shell shows NETWORK_EVENT as a banner.
+ */
+export const WRITE_RETRY_DELAYS_MS = [1000, 2000, 4000, 8000];
+export const NETWORK_EVENT = 'fg:network';
+/** retrying: attempt `attempt` of `of` failed, trying again; ok: it got through after retrying; failed: gave up. */
+export type NetworkState = { state: 'retrying'; attempt: number; of: number } | { state: 'ok' } | { state: 'failed' };
+const announce = (detail: NetworkState) => window.dispatchEvent(new CustomEvent<NetworkState>(NETWORK_EVENT, { detail }));
+const UNREACHABLE = 'Could not reach the Feedback Graph API (it may be restarting)';
+
+async function send(path: string, init: RequestInit, o: { write: boolean; retry: boolean }): Promise<Response> {
+  const retry = o.write && o.retry;
+  const delays = retry ? WRITE_RETRY_DELAYS_MS : [];
+  for (let attempt = 0; ; attempt++) {
+    try {
+      const res = await fetch(path, init);
+      if (attempt > 0) announce({ state: 'ok' });
+      return res;
+    } catch (err) {
+      // fetch rejects only when no answer came back (a TypeError); anything else is a bug worth seeing as it is.
+      if (!(err instanceof TypeError)) throw err;
+      if (attempt >= delays.length) {
+        if (retry) announce({ state: 'failed' });
+        throw new Error(o.write ? `${UNREACHABLE}; this change was not saved. Try again in a moment.` : `${UNREACHABLE}.`);
+      }
+      announce({ state: 'retrying', attempt: attempt + 1, of: delays.length });
+      await new Promise((r) => setTimeout(r, delays[attempt]));
+    }
+  }
+}
+
+async function request<T = void>(path: string, o: { method?: string; body?: unknown; retry?: boolean } = {}): Promise<T> {
+  const write = !!o.method && o.method !== 'GET';
+  const res = await send(path, {
     method: o.method ?? 'GET',
     // Writes are always JSON: the API refuses other content types to block form-based cross-site posts.
     headers: write ? { 'content-type': 'application/json' } : undefined,
     body: write && o.body !== undefined ? JSON.stringify(o.body) : undefined,
-  });
+  }, { write, retry: o.retry !== false });
   if (res.status === 401) window.dispatchEvent(new Event(SIGN_IN_EVENT));
   if (!res.ok) throw new Error(await errorText(res));
   if (res.status === 204) return undefined as T;
@@ -103,6 +136,7 @@ export const api = {
   signIn: (token: string) => request('/api/session', { method: 'POST', body: { token } }),
   signOut: () => request('/api/session', { method: 'DELETE', body: {} }),
   status: () => request<SystemStatus>('/api/status'),
+  pipeline: () => request<PipelineStatus>('/api/pipeline'),
 
   candidates: (status: CandidateStatus, project?: string) => request<Candidate[]>(`/api/candidates${qs({ status, limit: '500', project })}`),
   candidate: (id: string) => request<CandidateDetail>(`/api/candidates/${enc(id)}`),
@@ -123,10 +157,16 @@ export const api = {
     const rows = await request<(StoredFact | FactHit)[]>(`/api/projects/${enc(key)}/facts${qs(o.q ? { q: o.q } : { kind: o.kind })}`);
     return rows.map((r) => ('fact' in r ? r.fact : r));
   },
+  links: (key: string) => request<ProjectLink[]>(`/api/projects/${enc(key)}/links`),
+  setLink: (body: { a: string; b: string; status?: LinkStatus; relation?: LinkRelation; note?: string }) => request<ProjectLink>('/api/links', { method: 'PUT', body }),
+  deleteLink: (id: string) => request(`/api/links/${enc(id)}`, { method: 'DELETE', body: {}, retry: false }),
+  pinProject: (key: string, pinned: boolean) => request(`/api/projects/${enc(key)}/pin`, { method: 'PUT', body: { pinned } }),
+  setFactRelevance: (key: string, id: string, relevance: number) =>
+    request(`/api/projects/${enc(key)}/facts/${enc(id)}/relevance`, { method: 'PATCH', body: { relevance } }),
   scan: (key: string, provider?: string) => request<ScanJob>(`/api/projects/${enc(key)}/scan`, { method: 'POST', body: provider ? { provider } : {} }),
-  deleteProject: (key: string) => request(`/api/projects/${enc(key)}`, { method: 'DELETE', body: { confirm: key } }),
+  deleteProject: (key: string) => request(`/api/projects/${enc(key)}`, { method: 'DELETE', body: { confirm: key }, retry: false }),
   exportUrl: (key?: string) => `/api/export${qs({ project: key })}`,
-  importBundle: (bundle: unknown, keepApproved: boolean) => request<ImportResult>(`/api/import${qs({ keepApproved: keepApproved ? '1' : undefined })}`, { method: 'POST', body: bundle }),
+  importBundle: (bundle: unknown, keepApproved: boolean) => request<ImportResult>(`/api/import${qs({ keepApproved: keepApproved ? '1' : undefined })}`, { method: 'POST', body: bundle, retry: false }),
 
   graph: (key: string) => request<EvidenceGraph>(`/api/graph${qs({ project: key })}`),
   patterns: (key?: string) => request<PatternReport>(`/api/patterns${qs({ project: key })}`),
@@ -135,23 +175,24 @@ export const api = {
 
   codeMap: (key: string, limit = 200, includeTests = false) =>
     request<CodeMapReport>(`/api/projects/${enc(key)}/codemap/hotspots${qs({ limit: String(limit), tests: includeTests ? '1' : undefined })}`),
-  codeGraph: (key: string, includeTests = false) => request<MapGraph>(`/api/projects/${enc(key)}/codemap/graph${qs({ tests: includeTests ? '1' : undefined })}`),
+  codeGraph: (key: string, includeTests = false) => request<MapGraph & { meta?: CodeMapMeta | null }>(`/api/projects/${enc(key)}/codemap/graph${qs({ tests: includeTests ? '1' : undefined })}`),
   codeModule: (key: string, path: string) => request<ModuleContext>(`/api/projects/${enc(key)}/codemap/module${qs({ path })}`),
   topHotspots: (project?: string, limit = 10, includeTests = false) =>
     request<ProjectHotspot[]>(`/api/codemap/hotspots${qs({ project, limit: String(limit), tests: includeTests ? '1' : undefined })}`),
 
   docs: (key: string) => request<DocSummary[]>(`/api/projects/${enc(key)}/docs`),
-  uploadDoc: (key: string, doc: { title: string; name: string; text: string }) =>
-    request<{ id: string; chunks: number }>(`/api/projects/${enc(key)}/docs`, { method: 'POST', body: doc }),
+  // Uploads and imports are not retried: a lost answer can mean it was stored, and a retry would store it twice.
+  uploadDoc: (key: string, doc: { title: string; name: string } & ({ text: string } | { image: { mediaType: string; data: string } })) =>
+    request<{ id: string; chunks: number }>(`/api/projects/${enc(key)}/docs`, { method: 'POST', body: doc, retry: false }),
   projectSettings: () => request<ProjectSettings>('/api/settings/projects'),
   saveProjectSelection: (tracked: string[]) => request<ProjectSettings>('/api/settings/projects', { method: 'PUT', body: { tracked } }),
   saveProjectRoots: (roots: string[]) => request<ProjectSettings>('/api/settings/roots', { method: 'PUT', body: { roots } }),
-  cleanupUnselected: () => request<{ removed: string[]; nodesRemoved: number }>('/api/settings/cleanup', { method: 'POST', body: { confirm: CLEANUP_CONFIRM } }),
+  cleanupUnselected: () => request<{ removed: string[]; nodesRemoved: number }>('/api/settings/cleanup', { method: 'POST', body: { confirm: CLEANUP_CONFIRM }, retry: false }),
 
   cloud: () => request<CloudInfo>('/api/cloud'),
-  syncCloud: () => request<CloudSyncResult>('/api/cloud/sync', { method: 'POST', body: {} }),
+  syncCloud: () => request<CloudSyncResult>('/api/cloud/sync', { method: 'POST', body: {}, retry: false }),
 
-  deleteDoc: (id: string) => request(`/api/docs/${enc(id)}`, { method: 'DELETE', body: {} }),
+  deleteDoc: (id: string) => request(`/api/docs/${enc(id)}`, { method: 'DELETE', body: {}, retry: false }),
 
   sessions: (o: { project?: string; state?: SessionState; cursor?: string }) =>
     request<SessionPage>(`/api/sessions${qs({ project: o.project, state: o.state, cursor: o.cursor })}`),

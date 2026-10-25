@@ -46,6 +46,16 @@ export class PgKnowledgeStore implements KnowledgeStore {
     return this.db.pool.query(sql, params);
   }
 
+  async postmortemBacklog(): Promise<number> {
+    const { rows } = await this.q(
+      `SELECT count(*)::int AS n
+       FROM feedback f JOIN turns t ON t.uuid = f.turn_uuid JOIN sessions s ON s.id = t.session_id JOIN projects p ON p.key = s.project_key
+       WHERE NOT EXISTS (SELECT 1 FROM misses m WHERE m.feedback_id = f.id) AND f.status <> 'rejected' AND f.attempts < $1`,
+      [MAX_POSTMORTEM_ATTEMPTS],
+    );
+    return rows[0].n;
+  }
+
   async feedbackNeedingPostmortem(limit: number, now = new Date()): Promise<PostMortemInput[]> {
     const { rows } = await this.q(
       `SELECT f.id AS feedback_id, row_to_json(t) AS turn, s.id AS sid, s.cwd, s.source, p.key AS pkey, p.repo_path, k.note
@@ -232,7 +242,7 @@ export class PgKnowledgeStore implements KnowledgeStore {
   }
 
   /** `unscoped`: you narrowed it but its project is unknown, so it went back to proposed instead of serving everywhere. */
-  async updateLesson(id: string, patch: LessonPatch, o: { reembed?: number[] }): Promise<{ unscoped: boolean }> {
+  async updateLesson(id: string, patch: LessonPatch, o: { reembed?: number[]; by?: string }): Promise<{ unscoped: boolean }> {
     const now = new Date();
     const { supersedes, status, ...fields } = patch;
     if (supersedes !== undefined) {
@@ -252,6 +262,7 @@ export class PgKnowledgeStore implements KnowledgeStore {
            decided_by_you = true,
            status = coalesce($12, status),
            decided_at = CASE WHEN $12::text IS NULL THEN decided_at ELSE $13 END,
+           decided_by = CASE WHEN $12::text IS NULL THEN decided_by ELSE $15 END,
            embedding = CASE WHEN $14::vector IS NULL THEN embedding ELSE $14::vector END
          WHERE id = $1
          RETURNING (SELECT coalesce(lessons.origin_project_key, f.project_key, lessons.project_key)
@@ -271,6 +282,7 @@ export class PgKnowledgeStore implements KnowledgeStore {
           status ?? null,
           now,
           o.reembed ? vectorOf(o.reembed) : null,
+          o.by ?? 'you',
         ],
       );
       if (!rows[0]) return { unscoped: false };
@@ -419,5 +431,6 @@ function lessonOf(r: Row): Lesson {
     missId: r.miss_id ?? null,
     createdAt: iso(r.created_at) as string,
     decidedAt: iso(r.decided_at),
+    decidedBy: r.decided_by ?? null,
   };
 }

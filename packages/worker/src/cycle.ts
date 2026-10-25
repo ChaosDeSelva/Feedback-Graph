@@ -1,6 +1,7 @@
-import { hostRepoPath, providerUnavailableReason, sessionFiles, type ActivityStore, type ProjectScope, type Classification, type CodeGraphStore, type GraphStore, type HumanTurn, type ParsedSession, type SessionSource } from '@fb/core';
+import { feedbackSkipRule, hostRepoPath, modelTimeoutReason, providerUnavailableReason, redactSecrets, sessionFiles, type ActivityStore, type ProjectScope, type Classification, type CodeGraphStore, type GraphStore, type HumanTurn, type ParsedSession, type SessionSource } from '@fb/core';
 import { prefilterPushback } from './detect/prefilter.ts';
 import { codexSessionParser } from './ingest/codex.ts';
+import { conversationFingerprint } from './ingest/fingerprint.ts';
 import type { commitsInWindow } from './ingest/git.ts';
 import { parseTranscript } from './ingest/parseTranscript.ts';
 import { projectFromCwd, type Project, type Root } from '@fb/core';
@@ -30,6 +31,8 @@ export type CycleDeps = {
   commits: typeof commitsInWindow;
   classify(turn: HumanTurn): Promise<Classification | null>;
   classifyBatch: number;
+  /** True while a scan is using a model: a classify timeout then means a queue behind it, not this turn's fault. */
+  modelBusy?: () => boolean;
   log?: (msg: string, extra?: object) => void;
   /** ProjectScope.folder: when set, only sessions in folders that pass are read and ingested. */
   includeProject?: (key: string) => boolean;
@@ -163,6 +166,14 @@ export async function runCycle(deps: CycleDeps): Promise<CycleResult> {
         for (const s of sessions) {
           const folder = projectFromCwd(s.cwd, deps.roots);
           if (!folder || !s.turns.length) continue;
+          // Codex can import Claude Code conversations; Claude Code files are listed first, so the original is known.
+          const fingerprint = conversationFingerprint(s);
+          if (fingerprint && source === 'claude') deps.state.rememberConversation(fingerprint, s.sessionId);
+          const original = fingerprint && source === 'codex' ? deps.state.conversation(fingerprint) : null;
+          if (original) {
+            log('codex session skipped: a copy of a Claude Code conversation', { session: s.sessionId, original });
+            continue;
+          }
           keys.add(folder.key);
           // Out of scope: skipped, and remembered as such so selecting it later reads this file again.
           if (scope && !scope.folder(folder.key)) {
@@ -200,8 +211,11 @@ export async function runCycle(deps: CycleDeps): Promise<CycleResult> {
   for (const turn of await deps.repo.unclassifiedTurns(deps.classifyBatch * 20, deps.onlyProjects, deps.excludeProjects)) {
     let c: Classification | null = NEUTRAL;
     const pre = prefilterPushback(turn.text);
+    // A bot, the PR author's reply, a status note or a bare review trigger: never feedback, so never sent (feedbackRules.ts).
+    const skip = turn.external ? feedbackSkipRule(turn.text, turn.external) : null;
+    if (skip) c = { label: 'neutral', confidence: 1, summary: `skipped before the model: ${skip.description}`, signals: [`skip:${skip.name}`] };
     // A review or issue comment is feedback on finished work by nature, and reviewers word it politely: always ask the model.
-    if (pre.hit || turn.external) {
+    else if (pre.hit || turn.external) {
       if (unavailable || modelCalls >= deps.classifyBatch || failuresInRow >= MAX_CONSECUTIVE_FAILURES) continue;
       modelCalls++;
       try {
@@ -209,9 +223,16 @@ export async function runCycle(deps: CycleDeps): Promise<CycleResult> {
       } catch (err) {
         // The model could not be asked (down, missing, not signed in): not the turn's fault, so nothing is charged.
         unavailable = providerUnavailableReason(err);
-        if (!unavailable) throw err;
-        log('classifier unavailable, pausing until next cycle', { reason: unavailable });
-        continue;
+        const timeout = unavailable ? null : modelTimeoutReason(err);
+        if (timeout && deps.modelBusy?.()) unavailable = `the model is busy with a scan: ${timeout}`;
+        if (unavailable) {
+          log('classifier unavailable, pausing until next cycle', { reason: unavailable });
+          continue;
+        }
+        // Anything else (a call that timed out, an answer it could not use) is this turn's failure: charged below,
+        // and the batch goes on, so a turn the model can never finish is skipped after its attempts.
+        log('classification failed', { turn: turn.uuid, error: redactSecrets(String(err)).slice(0, 800) });
+        c = null;
       }
       failuresInRow = c ? 0 : failuresInRow + 1;
     }

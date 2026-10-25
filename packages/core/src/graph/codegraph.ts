@@ -1,3 +1,4 @@
+import neo4j from 'neo4j-driver';
 import {
   cmp,
   codeGraphViews,
@@ -127,8 +128,8 @@ export class CodeGraphRepo implements CodeGraphStore {
       [
         `MERGE (m:CodeMap {projectKey: $key})
          SET m.fingerprint = $fingerprint, m.builtAt = $now, m.files = $stats.files, m.symbols = $stats.symbols,
-             m.imports = $stats.imports, m.tests = $stats.tests`,
-        { key, fingerprint: map.fingerprint, now, stats: map.stats },
+             m.imports = $stats.imports, m.tests = $stats.tests, m.candidates = $candidates`,
+        { key, fingerprint: map.fingerprint, now, stats: map.stats, candidates: map.candidates },
       ],
     ];
     await this.g.runInTransaction(statements);
@@ -143,6 +144,7 @@ export class CodeGraphRepo implements CodeGraphStore {
       fingerprint: m.fingerprint ?? null,
       builtAt: m.builtAt,
       stats: { files: m.files ?? 0, symbols: m.symbols ?? 0, imports: m.imports ?? 0, tests: m.tests ?? 0 },
+      candidates: m.candidates ?? null,
     };
   }
 
@@ -195,6 +197,16 @@ export class CodeGraphRepo implements CodeGraphStore {
       firstEditAt: r.get('firstEditAt') ?? null,
       lastEditAt: r.get('lastEditAt') ?? null,
     }));
+  }
+
+  async editedPaths(projectKey: string, limit: number): Promise<string[]> {
+    const rows = await this.g.run(
+      `MATCH (s:Session)-[r:TOUCHED]->(cf:CodeFile {projectKey: $key}) WHERE r.edited = true
+       WITH cf.path AS path, max(coalesce(r.lastEditAt, '')) AS last
+       RETURN path ORDER BY last DESC, path LIMIT $limit`,
+      { key: projectKey, limit: neo4j.int(Math.max(0, Math.floor(limit))) },
+    );
+    return rows.map((r) => r.get('path'));
   }
 
   moduleContext(projectKey: string, path: string) {

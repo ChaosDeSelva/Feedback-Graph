@@ -1,4 +1,4 @@
-import { finalReplyDue, ProviderUnavailableError, type ActivityInput, type FinalReply, type HumanTurn, type JsonTask, type LlmProvider, type SessionState, type SessionSummary, type SessionsStore, type SummaryCursor, type SummaryWork, type SummaryWorkQuery, type SummaryWrite } from '@fb/core';
+import { finalReplyDue, ModelOutputError, ModelTimeoutError, ProviderUnavailableError, STRICT_JSON, type ActivityInput, type FinalReply, type HumanTurn, type JsonTask, type LlmProvider, type SessionState, type SessionSummary, type SessionsStore, type SummaryCursor, type SummaryWork, type SummaryWorkQuery, type SummaryWrite } from '@fb/core';
 import { beforeEach, expect, test } from 'vitest';
 import { runSummaries, type SummarizeDeps } from './stage.ts';
 
@@ -233,6 +233,34 @@ test('an invalid answer is asked again once; twice invalid keeps the previous su
   // Backing off: the next pass does not ask again.
   await runSummaries(deps(bad.llm));
   expect(bad.prompts).toHaveLength(2);
+});
+
+test('the second ask after an unusable answer carries a stricter instruction, and prose with no JSON counts as unusable', async () => {
+  mem.add('s', 3, 15 * MIN);
+  const systems: string[] = [];
+  const good = { goal: 'strict try', done: [], decisions: [], openThreads: [], filesTouched: [], pushback: [], outcome: '' };
+  const llm: LlmProvider = {
+    id: 'fake:model', agentic: false,
+    json: async (t) => { systems.push(t.system); if (systems.length === 1) throw new ModelOutputError('no JSON object in the answer', 'Here is the summary'); return good; },
+  };
+  expect((await runSummaries(deps(llm))).summarized).toBe(1);
+  expect(systems[1]).toContain(STRICT_JSON);
+  expect(mem.s.get('s')!.summary!.goal).toBe('strict try');
+});
+
+test('a summary call that timed out is charged to that session (backoff) and the pass goes on to the next', async () => {
+  mem.add('slow', 3, 20 * MIN);
+  mem.add('ok', 3, 15 * MIN);
+  const ok = fakeModel();
+  const llm: LlmProvider = {
+    id: 'fake:model', agentic: false,
+    json: async (t) => { if (t.user.includes('slow user turn')) throw new ModelTimeoutError('Ollama (gemma4) did not answer within 300 s'); return ok.llm.json(t); },
+  };
+  const r = await runSummaries(deps(llm));
+  expect(r).toMatchObject({ summarized: 1, failed: 1 });
+  expect(r.unavailable).toBeUndefined();
+  expect(mem.s.get('slow')!).toMatchObject({ attempts: 1, through: null });
+  expect(mem.failures[0]).toMatch(/did not answer within 300 s/);
 });
 
 test('a big delta is summarized in parts (map), then merged into the previous summary; each part sees only its turns', async () => {

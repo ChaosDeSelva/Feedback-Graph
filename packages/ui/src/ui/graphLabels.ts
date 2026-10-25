@@ -15,5 +15,15 @@ export const codeNodeLabel = (n: { kind: string; label: string; score: number; m
     ? `${escapeHtml(n.label)} · score ${n.score.toFixed(2)} · ${plural(n.misses, 'miss', 'misses')}`
     : `${escapeHtml(n.kind)}: ${escapeHtml(n.label)}`;
 
+/** Zoom at which every file is captioned; below it only files with misses are, so a zoomed-out map stays legible. */
+export const CAPTION_ZOOM = 1.2;
+
+/** The caption drawn under a file node (its base name; the full path is on hover), or null for none at this zoom. */
+export function codeNodeCaption(n: { kind: string; label: string; misses: number }, scale: number): string | null {
+  if (n.kind !== 'file' && n.kind !== 'test') return null;
+  if (n.misses === 0 && scale < CAPTION_ZOOM) return null;
+  return n.label.split('/').pop() || n.label;
+}
+
 export const evidenceLinkLabel = (l: { type: string }) => escapeHtml(l.type);
 export const codeLinkLabel = evidenceLinkLabel;

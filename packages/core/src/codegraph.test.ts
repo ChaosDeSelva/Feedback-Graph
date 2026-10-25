@@ -1,5 +1,5 @@
 import { expect, test } from 'vitest';
-import { expandDependents, hotspotScore, isGitCommit, pathMatches, repoRelative, sessionFiles, sessionWork, suggestLessonPaths, touchedAround } from './codegraph.ts';
+import { codeGraphViews, expandDependents, hotspotScore, isCodeLang, isGitCommit, pathMatches, repoRelative, sessionFiles, sessionWork, suggestLessonPaths, touchedAround, type CodeGraphReads } from './codegraph.ts';
 import { hostRepoPath } from './projects.ts';
 import type { ParsedSession, ToolCall } from './types.ts';
 
@@ -129,4 +129,34 @@ test('sessionWork counts the edits and commits a session made, and when; reading
     { name: 'Bash', ts: '2026-10-01T11:00:00Z', command: 'git commit -m done' },
   ];
   expect(sessionWork(work)).toEqual({ edits: 5, commits: 1, firstAt: '2026-10-01T08:00:00.000Z', lastAt: '2026-10-01T11:00:00.000Z' });
+});
+
+test('isCodeLang: docs, data and config are not code; parsed and other programming languages are', () => {
+  for (const l of ['typescript', 'python', 'go', 'gdscript', 'rb', 'java', 'sh', 'sql', 'tf', 'css']) expect(isCodeLang(l)).toBe(true);
+  for (const l of ['md', 'mdx', 'json', 'yaml', 'yml', 'toml', 'gitignore', 'example', 'godot', 'dockerfile', 'makefile', 'txt']) expect(isCodeLang(l)).toBe(false);
+});
+
+function fakeReads(files: { path: string; lang: string; commits: number }[], missesOn: string[] = []): CodeGraphReads {
+  const none = async () => [];
+  return {
+    mapFiles: async (_k, paths) => files.filter((f) => !paths || paths.includes(f.path)).map((f) => ({ path: f.path, lang: f.lang, hash: 'h', loc: 1, isTest: false, churn: { commits: f.commits, lastTs: '2026-10-01' } })),
+    symbolsOf: none,
+    importsOf: none,
+    importersOf: async (_k, paths) => new Map(paths.map((p) => [p, []])),
+    testsOf: none,
+    importerCounts: async () => new Map(),
+    missesOn: async () => missesOn.map((path, i) => ({ missId: `m${i}`, missed: 'x', cause: 'other', causeExplanation: '', feedbackId: 'f', feedbackText: '', sessionId: 's', ts: '2026-10-01', lessonId: null, path, fixedHere: false }) as never),
+    edgesTouching: async () => ({ imports: [], tests: [] }),
+    approvedLessons: none,
+    currentFacts: none,
+  };
+}
+
+test('hotspots: a busy manifest with no miss scores 0, below quiet code; a miss makes any file count', async () => {
+  const files = [{ path: 'deploy/api.yaml', lang: 'yaml', commits: 60 }, { path: 'docs/a.md', lang: 'md', commits: 30 }, { path: 'src/a.ts', lang: 'typescript', commits: 1 }];
+  const h = await codeGraphViews(fakeReads(files)).hotspots('demo', 10);
+  expect(h.map((x) => [x.path, x.score])).toEqual([['src/a.ts', 1], ['deploy/api.yaml', 0], ['docs/a.md', 0]]);
+  const withMiss = await codeGraphViews(fakeReads(files, ['docs/a.md'])).hotspots('demo', 10);
+  expect(withMiss[0]).toMatchObject({ path: 'docs/a.md', misses: 1 });
+  expect(withMiss[0].score).toBeGreaterThan(4);
 });

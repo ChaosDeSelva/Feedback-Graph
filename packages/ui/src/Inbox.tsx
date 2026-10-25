@@ -11,6 +11,17 @@ import { InboxIcon } from './ui/icons.tsx';
 
 const TABS: CandidateStatus[] = ['pending', 'confirmed', 'rejected'];
 
+/**
+ * An order that does not move under you during a long triage: pending items by when they arrived in the Inbox (oldest
+ * first, so new arrivals join the end), decided ones by when you decided (latest first); the id breaks ties. The API
+ * orders by the turn's own time, which a comment synced later can place anywhere in the list.
+ */
+function stableOrder(status: CandidateStatus, c: Candidate[]): Candidate[] {
+  const byId = (a: Candidate, b: Candidate) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
+  if (status === 'pending') return [...c].sort((a, b) => a.createdAt.localeCompare(b.createdAt) || byId(a, b));
+  return [...c].sort((a, b) => (b.decidedAt ?? b.createdAt).localeCompare(a.decidedAt ?? a.createdAt) || byId(a, b));
+}
+
 export function Inbox() {
   const [status, setStatus] = useState<CandidateStatus>('pending');
   const [project, setProject] = useState('');
@@ -47,6 +58,7 @@ export function Inbox() {
     let stale = false;
     api.candidates(status, project || undefined).then((c) => {
       if (stale) return;
+      c = stableOrder(status, c);
       const at = focus ? c.findIndex((x) => x.id === focus) : -1;
       setItems(c);
       setSelected(Math.max(0, at));
@@ -104,7 +116,8 @@ export function Inbox() {
     return () => window.removeEventListener('keydown', onKey);
   }, [decide, items.length, status]);
 
-  const projects = [...new Set([...allProjects, ...items.map((i) => i.projectKey), ...(project ? [project] : [])])].sort();
+  // The project list's own order (pinned first), then any other project an item names.
+  const projects = [...new Set([...allProjects, ...[...items.map((i) => i.projectKey), ...(project ? [project] : [])].sort()])];
 
   return (
     <div className="flex h-full min-h-0 flex-col">

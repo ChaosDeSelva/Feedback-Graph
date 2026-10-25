@@ -15,9 +15,10 @@ function list(json: string | null | undefined): string[] {
 /**
  * Bump when ingest starts storing something new about a session, so transcripts read before are read once more
  * (re-ingesting is idempotent). 1: touched files (recordSessionFiles). 2: a session's work (edits and git commits,
- * sessionWork()), without which it is never linked to a GitHub or Linear comment.
+ * sessionWork()), without which it is never linked to a GitHub or Linear comment. 3: Claude Code conversations'
+ * fingerprints (ingest/fingerprint.ts), so a Codex import of one is recognised.
  */
-export const INGEST_VERSION = 2;
+export const INGEST_VERSION = 3;
 
 /**
  * The worker's own bookkeeping (never in the graph): which memory files and session transcripts were read
@@ -43,6 +44,8 @@ export class FileState {
     this.db.exec('CREATE TABLE IF NOT EXISTS heads (path TEXT PRIMARY KEY, size INTEGER, cwd TEXT, human INTEGER)');
     // Codex rollouts: every cwd the session switched to (JSON), and the byte offset scanned so far.
     this.db.exec('CREATE TABLE IF NOT EXISTS cwds (path TEXT PRIMARY KEY, scanned INTEGER, cwds TEXT)');
+    // Claude Code conversations by fingerprint: a Codex session with the same one is an import of it.
+    this.db.exec('CREATE TABLE IF NOT EXISTS conversations (fingerprint TEXT PRIMARY KEY, session_id TEXT NOT NULL)');
   }
 
   private addColumn(table: string, column: string, type: string) {
@@ -135,6 +138,17 @@ export class FileState {
     this.db
       .prepare('INSERT INTO cwds (path, scanned, cwds) VALUES (?, ?, ?) ON CONFLICT(path) DO UPDATE SET scanned = excluded.scanned, cwds = excluded.cwds')
       .run(path, scanned, JSON.stringify(cwds));
+  }
+
+  /** Remember a Claude Code conversation's fingerprint (the first session to have it keeps it). */
+  rememberConversation(fingerprint: string, sessionId: string) {
+    this.db.prepare('INSERT INTO conversations (fingerprint, session_id) VALUES (?, ?) ON CONFLICT(fingerprint) DO NOTHING').run(fingerprint, sessionId);
+  }
+
+  /** The Claude Code session with this fingerprint, or null. */
+  conversation(fingerprint: string): string | null {
+    const row = this.db.prepare('SELECT session_id FROM conversations WHERE fingerprint = ?').get(fingerprint) as { session_id: string } | undefined;
+    return row?.session_id ?? null;
   }
 
   getHead(path: string): { size: number; cwd: string | null; human: boolean } | null {

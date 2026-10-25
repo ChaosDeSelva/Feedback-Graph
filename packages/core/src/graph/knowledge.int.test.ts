@@ -79,6 +79,19 @@ describeStores('KnowledgeStore', (h) => {
       expect((await k.lessonDetail(`lesson:${id}`))!.contextItems).toEqual([item]);
     });
 
+    test('postmortemBacklog counts the feedback still waiting for a post-mortem, those backing off after a failure too', async () => {
+      const a = await confirmedFeedback('s1');
+      const b = await confirmedFeedback('s2');
+      const c = await confirmedFeedback('s3');
+      expect(await k.postmortemBacklog!()).toBe(3);
+      await k.savePostmortem(a, pm(), { miss: vec(1), lesson: vec(1) });
+      await repo.decide(b, 'rejected', null);
+      await k.recordPostmortemFailure(c, 'boom');
+      expect(await k.postmortemBacklog!()).toBe(1);
+      for (let i = 1; i < MAX_POSTMORTEM_ATTEMPTS; i++) await k.recordPostmortemFailure(c, 'boom');
+      expect(await k.postmortemBacklog!()).toBe(0); // given up on
+    });
+
     test('feedback you reject after confirming gets no post-mortem', async () => {
       const id = await confirmedFeedback('s1');
       await repo.decide(id, 'rejected', 'changed my mind');
@@ -166,6 +179,24 @@ describeStores('KnowledgeStore', (h) => {
       expect((await k.lessonDetail(lb.id))?.lesson).toMatchObject({ status: 'superseded', rule: 'Edited rule' });
       expect((await k.lessonDetail(la.id))?.lesson.status).toBe('approved');
       expect((await k.lessonDetail(la.id))?.supersedes).toEqual([lb.id]);
+    });
+
+    test('updateLesson records who decided: an agent with the operator token, until you decide again', async () => {
+      const a = await confirmedFeedback('s1');
+      await k.savePostmortem(a, pm(), { miss: vec(1), lesson: vec(1) });
+      const [l] = await k.listLessons({});
+      expect(l.decidedBy ?? null).toBeNull();
+      await k.updateLesson(l.id, { status: 'approved' }, { by: 'operator:codex' });
+      expect((await k.lessonDetail(l.id))?.lesson.decidedBy).toBe('operator:codex');
+      expect((await k.listLessons({ status: 'approved' }))[0].decidedBy).toBe('operator:codex');
+      // An edit that decides nothing leaves it; your own decision replaces it.
+      await k.updateLesson(l.id, { rule: 'Reworded' }, { by: 'you' });
+      expect((await k.lessonDetail(l.id))?.lesson.decidedBy).toBe('operator:codex');
+      await k.updateLesson(l.id, { status: 'approved' }, { by: 'you' });
+      expect((await k.lessonDetail(l.id))?.lesson.decidedBy).toBe('you');
+      // No `by` (older callers): the owner.
+      await k.updateLesson(l.id, { status: 'rejected' }, {});
+      expect((await k.lessonDetail(l.id))?.lesson.decidedBy).toBe('you');
     });
 
     test('searchLessons returns approved lessons for the project and global ones, nearest first', async () => {

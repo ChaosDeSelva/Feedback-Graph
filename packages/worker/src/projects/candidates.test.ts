@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, readFileSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, statSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { expect, test } from 'vitest';
@@ -45,8 +45,9 @@ function setup() {
     utimesSync(p, new Date(`${d}T00:00:00Z`), new Date(`${d}T00:00:00Z`));
   }
   const file = (path: string, source: 'claude' | 'codex') => {
-    const s = execFileSync('stat', ['-f', '%z %m', path]).toString().trim().split(' ').map(Number);
-    return { path, size: s[0], mtimeMs: s[1] * 1000, source };
+    // fs, not `stat -f` (BSD only): the suite runs on macOS and in Linux containers alike.
+    const s = statSync(path);
+    return { path, size: s.size, mtimeMs: s.mtimeMs, source };
   };
   const files = [file(c1, 'claude'), file(c2, 'claude'), file(c3, 'claude'), file(x1, 'codex'), file(x2, 'codex'), file(x3, 'codex')];
   return { vibe, files };

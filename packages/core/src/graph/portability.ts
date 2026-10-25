@@ -41,7 +41,7 @@ export type ExportBundle = {
 export type ExportCodeFile = { projectKey: string; path: string; lang: string; loc: number; isTest: boolean } & Omit<Hotspot, 'path'>;
 
 /** Labels whose nodes belong to one project through their projectKey. */
-const PROJECT_LABELS = ['Candidate', 'Feedback', 'Miss', 'Task', 'ContextItem', 'Fact', 'Symbol', 'Module', 'CodeMap', 'CodeFile', 'ScanJob', 'Doc', 'Chunk', 'Activity', 'PreDoneCheck'];
+const PROJECT_LABELS = ['Candidate', 'Feedback', 'Miss', 'Task', 'ContextItem', 'Fact', 'Symbol', 'Module', 'CodeMap', 'CodeFile', 'ScanJob', 'Doc', 'DocBlob', 'Chunk', 'Activity', 'PreDoneCheck'];
 
 const BATCH = 5000;
 
@@ -73,7 +73,7 @@ export class PortabilityRepo implements PortabilityStore {
         { key },
       ),
       this.g.run(
-        `MATCH (x:Fact {current: true}) WHERE $key IS NULL OR x.projectKey = $key
+        `MATCH (x:Fact {current: true}) WHERE ($key IS NULL OR x.projectKey = $key) AND x.docId IS NULL
          RETURN x ORDER BY x.projectKey, x.path, x.statement`,
         { key },
       ),
@@ -167,6 +167,7 @@ export class PortabilityRepo implements PortabilityStore {
       await drain(`MATCH (n:${label} {projectKey: $key}) WITH n LIMIT $batch DETACH DELETE n RETURN count(*) AS n`);
     }
     await drain(`MATCH (c:SyncCursor) WHERE c.key ENDS WITH ':' + $key WITH c LIMIT $batch DETACH DELETE c RETURN count(*) AS n`);
+    await drain(`MATCH (l:ProjectLink) WHERE l.a = $key OR l.b = $key WITH l LIMIT $batch DETACH DELETE l RETURN count(*) AS n`);
     await drain(`MATCH (p:Project {key: $key}) DETACH DELETE p RETURN count(*) AS n`);
     return removed;
   }

@@ -112,3 +112,11 @@ test('GET /api/agent/project tells the plugin hooks whether a folder is a select
   expect(await ask('/Users/j/Vibe/demo/src')).toEqual({ project: 'demo', tracked: true });
   expect(await ask('/Users/j/Vibe/other')).toEqual({ project: null, tracked: false });
 });
+
+test('a client ending its session (DELETE /mcp, no body) gets a clean answer: the server is stateless', async () => {
+  const logs: { msg: string; extra?: object }[] = [];
+  const app = createApp(repo, { context: ctx, log: (msg, extra) => logs.push({ msg, extra }) });
+  const res = await app.request('/mcp', { method: 'DELETE', headers: { 'mcp-session-id': 'whatever' } });
+  expect(res.status).toBe(204);
+  expect(logs).toEqual([{ msg: 'request', extra: expect.objectContaining({ method: 'DELETE', status: 204 }) }]);
+});

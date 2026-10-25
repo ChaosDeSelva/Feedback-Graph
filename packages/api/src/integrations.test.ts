@@ -118,6 +118,47 @@ describe('Settings > Integrations', () => {
   });
 });
 
+describe('a token nobody has checked yet', () => {
+  const counting = () => {
+    const calls = { github: 0, linear: 0 };
+    return { calls, viewer: { github: async () => { calls.github++; return 'octo'; }, linear: async () => { calls.linear++; return 'Pat (Acme)'; } } };
+  };
+
+  test('a token from .env is checked on first use and the account is shown, in Settings and in /api/status; once', async () => {
+    const { calls, viewer } = counting();
+    const { d } = setup({ env: { GITHUB_TOKEN: TOKEN, LINEAR_API_KEY: 'k'.repeat(30) }, viewer });
+    const app = createApp(repo, { integrations: d, system: { version: 't', ping: async () => true, worker: async () => null } });
+    // The status bar asks first (it polls); Settings then shows the same check without asking again.
+    const s = await (await app.request('/api/status')).json();
+    expect(s.connections.github.detail).toMatch(/^Connected as octo \(set in \.env\)/);
+    expect(s.connections.linear.detail).toMatch(/^Connected as Pat \(Acme\)/);
+    const v = await (await app.request('/api/settings/integrations')).json();
+    expect(v.github).toMatchObject({ account: 'octo', connection: { state: 'connected' } });
+    expect(calls).toEqual({ github: 1, linear: 1 });
+  });
+
+  test('a check that failed before a later successful sync is made again', async () => {
+    const { calls, viewer } = counting();
+    const { app, integrations } = setup({ env: { GITHUB_TOKEN: TOKEN }, viewer });
+    const cred = (await integrations.credential('github'))!;
+    await integrations.saveCheck('github', { ok: false, account: null, error: 'github 502', errorKind: 'other', at: '2026-10-22T09:00:00Z', source: 'env', fingerprint: cred.fingerprint });
+    await integrations.saveSync('github', { ...(await integrations.sync('github')), lastSyncAt: '2026-10-22T10:00:00Z' });
+    const v = await (await app.request('/api/settings/integrations')).json();
+    expect(v.github).toMatchObject({ account: 'octo', connection: { state: 'connected' } });
+    expect(calls.github).toBe(1);
+  });
+
+  test('when the service cannot be reached the token is not called refused, and it is not asked again at once', async () => {
+    let n = 0;
+    const viewer = { github: async () => { n++; throw new IntegrationError('fetch failed', 'network'); }, linear: async () => 'x' };
+    const { app } = setup({ env: { GITHUB_TOKEN: TOKEN }, viewer });
+    const v = await (await app.request('/api/settings/integrations')).json();
+    expect(v.github.connection).toMatchObject({ state: 'connected', detail: expect.stringMatching(/token not checked yet/) });
+    await app.request('/api/settings/integrations');
+    expect(n).toBe(1);
+  });
+});
+
 describe('connection states', () => {
   const sync = { lastSyncAt: '2026-10-22T10:00:00Z', lastError: null, errorKind: null, rateLimitedUntil: null, authFailedFor: null, projects: {} };
   test('a token the worker found rejected is an error until replaced; a rate limit says when it resumes', () => {

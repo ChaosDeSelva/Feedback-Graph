@@ -2,7 +2,7 @@ import type { ReactNode } from 'react';
 import { PageHeader } from './ui/PageHeader.tsx';
 import { Kbd } from './ui/display.tsx';
 
-const SECTIONS = ['How it works', 'Your first hour', 'Connect your agents', 'The code map', 'Each page', 'Choosing models', 'Limit what it reads', 'Share with a team', 'When something looks wrong'];
+const SECTIONS = ['How it works', 'Your first hour', 'Connect your agents', 'The code map', 'Linked projects, uploads and relevance', 'Each page', 'Choosing models', 'Limit what it reads', 'Share with a team', 'When something looks wrong'];
 const slug = (t: string) => `doc-${t.toLowerCase().replace(/[^a-z]+/g, '-')}`;
 
 /** How to use the tool, for someone who just opened it. Static: nothing here calls the API. */
@@ -87,6 +87,12 @@ export function Docs() {
           <p className="mt-2">
             If the detector missed some pushback, type <Code>/postmortem what it missed</Code> in Claude Code. It goes to the Inbox like any other item.
           </p>
+          <p className="mt-2">
+            These tools only read and report. To let an agent or a script make some of your decisions (choose projects, start scans, confirm Inbox items),
+            set <Code>FG_OPERATOR_TOKEN</Code> in <Code>.env</Code> and use <Code>./scripts/fg</Code>. <Code>OPERATOR_ALLOW</Code> lists what the token may do;
+            by default it may not decide lessons, delete data, change settings, import or set integration keys, so what agents learn stays your call. Its
+            writes show in Activity as <Code>operator:&lt;name&gt;</Code>, and a lesson it decided carries a badge.
+          </p>
         </Section>
 
         <Section title="The code map">
@@ -110,12 +116,49 @@ export function Docs() {
             that import it. One miss outweighs a busy file: a file agents got wrong once ranks above one that only changes a lot. The Projects page shows a
             project's hotspots (click a file for its module panel); Patterns lists the top ones across your selected projects.
           </p>
-          <p className="mt-2 text-muted">Test files are left out of the hotspots unless you tick include tests (Projects, or Code mode on the Graph page).</p>
+          <p className="mt-2 text-muted">
+            Test files are left out of the hotspots unless you tick include tests (Projects, or Code mode on the Graph page). Docs and config files score 0
+            until a miss touches them.
+          </p>
+          <p className="mt-2 text-muted">
+            A big repo's map is capped: by default at 40% of the files worth mapping, from 400 to 4,000 (<Code>SCAN_MAX_FILES</Code> sets a number). The
+            files your sessions edited come first, then source, then tests, manifests and docs. The code map card says when a map is capped and how many files
+            it left out.
+          </p>
           <p className="mt-2 text-muted">
             GDScript preload, load and extends paths link to the files they name (<Code>res://</Code> is the folder holding the nearest{' '}
             <Code>project.godot</Code>), and a <Code>class_name</Code> used elsewhere links to the file that declares it. A Swift import of a local module
             links to that module's files (a <Code>Package.swift</Code> target, or a <Code>Sources/&lt;Module&gt;</Code> folder).
           </p>
+        </Section>
+
+        <Section title="Linked projects, uploads and relevance">
+          <dl className="space-y-3">
+            <Page name="Pin">Pin a project on the Projects page (the pin beside it, or <b>Pin</b> in its header): pinned projects come first in every project list.</Page>
+            <Page name="Link">
+              Projects that belong together (a game and its backend, an app and its site, a product and the library it vendors) can be linked under{' '}
+              <b>Linked projects</b>. An agent working in one then also gets the best lessons, past misses, facts and doc excerpts of the other, each labelled
+              with where it came from, and <b>check_before_done</b> checks the work against the other project's most relevant lessons too. Every{' '}
+              <Code>LINK_SCAN_MINUTES</Code> (30) the worker looks for links between your selected projects, without a model: a package manifest naming
+              another project's package or a local path into it, another project's repository named in its files, and its name in several files. These
+              arrive as <b>suggestions</b> with their evidence: nothing reaches an agent until you <b>Confirm</b> one. <b>Dismiss</b> keeps it from being
+              suggested again; you can also link two projects by hand, with a relation and a note on how they fit together.
+            </Page>
+            <Page name="Uploads">
+              Upload specs, notes, screenshots, design mocks or whiteboard photos under <b>Docs and discussions</b> (text, or PNG, JPEG, WebP and GIF
+              images up to 8 MB). Text is searchable at once. The worker then reads each upload with <Code>DOCS_LLM</Code> (default the scan model): a
+              document becomes facts; an image becomes a description of everything in it, which replaces its placeholder excerpt, and facts. Images need
+              a model with vision. Facts from a document show <b>from your document</b> and go with it when you remove it. Uploads stay on this machine
+              and are sent only to that model.
+            </Page>
+            <Page name="Relevance">
+              Every fact gets a relevance from 0 to 1: how often an agent doing everyday coding here needs it. A core convention is <b>everyday</b>; how to
+              set up an external tool, CI or deploy steps are <b>rare</b>. Agents get facts ranked by similarity weighted by relevance, and a rare fact only
+              when the task is very close to it. Scans and document reading score new facts; facts stored before relevance existed are scored in the
+              background by the scan model. Set one yourself with <b>everyday</b>, <b>sometimes</b> or <b>rare</b> under the fact: the background scorer never
+              changes yours (a rescan makes new facts, scored again).
+            </Page>
+          </dl>
         </Section>
 
         <Section title="Each page">
@@ -144,8 +187,8 @@ export function Docs() {
               Summaries stay on this machine: they are never exported or synced.
             </Page>
             <Page name="Projects">
-              Per project: its <b>code map</b> (size, last build and hotspots; click a file for its symbols, importers, tests, lessons and misses), <b>Scan</b>
-              the code for facts (choose which model reads it), search the facts, upload docs agents should know about, export everything learned, or delete it.
+              Per project: <b>Pin</b> it, its <b>linked projects</b> (and suggestions to confirm), its <b>code map</b> (size, last build and hotspots; click a file for its symbols, importers, tests, lessons and misses), <b>Scan</b>
+              the code for facts (choose which model reads it), search and sort the facts by relevance, upload docs and images agents should know about (read into facts), export everything learned, or delete it.
             </Page>
             <Page name="Activity">The log of everything the tool created or changed, who or what did it, and why, including each <b>code mapped</b> build with its size and duration.</Page>
             <Page name="Settings">
@@ -164,7 +207,7 @@ export function Docs() {
             By default everything runs on Ollama on your machine (<Code>gemma4</Code> and <Code>nomic-embed-text</Code>), so nothing leaves it. Post-mortems are
             much better on Claude: run <Code>claude setup-token</Code>, put the token in <Code>.env</Code> as <Code>CLAUDE_CODE_OAUTH_TOKEN</Code>, and post-mortems switch to
             Claude automatically. Each job (<Code>CLASSIFY_LLM</Code>, <Code>POSTMORTEM_LLM</Code>, <Code>SCAN_LLM</Code>, <Code>CHECK_LLM</Code>, <Code>SUMMARY_LLM</Code> for session
-            summaries, where <Code>off</Code> turns them off) can also be set on its own; <Code>.env.example</Code> lists the providers.
+            summaries, where <Code>off</Code> turns them off, <Code>DOCS_LLM</Code> for reading uploads, which needs vision for images) can also be set on its own; <Code>.env.example</Code> lists the providers.
           </p>
           <p className="mt-3">
             The CLI agents read code differently. <Code>claude-cli</Code> can read only the project folder it is working on, and not the secret files in
@@ -241,8 +284,11 @@ export function Docs() {
 
         <Section title="When something looks wrong">
           <ul className="list-disc space-y-1.5 pl-5 marker:text-faint">
+            <li><b>First, run <Code>./scripts/doctor.sh</Code>:</b> it checks Docker, ports, Ollama (with a real structured-output call), the mounts, the Codex login and GitHub and Linear, and says how to fix each failure.</li>
+            <li><b>Nothing seems to happen:</b> the empty Inbox, Lessons and Graph pages show what the worker is on and every stage's backlog. The first hours of a big selection go to classifying and scanning.</li>
             <li><b>Inbox is empty:</b> the worker classifies newest sessions first; check the badge (it says <b>no projects selected</b> when nothing is being read), and that the project is ticked in <SettingsLink /> and not excluded.</li>
             <li><b>Badge says classifier unavailable</b> (or post-mortem / scan model unavailable, or summaries paused for the summary model): that model could not be asked at all (not running, not pulled, signed out, rate limited); the tooltip gives the reason. That work waits and nothing is charged against it, so fixing the model is enough. Turns given up on earlier can be tried again with <b>Re-queue</b> in the empty Inbox.</li>
+            <li><b>A GitHub comment never reached the Inbox:</b> bots, the pull request author's replies to a reviewer, status notes and bare review triggers are skipped before the classifier; <SettingsLink /> lists the rules.</li>
             <li><b>Post-mortem never appears:</b> Inbox → Confirmed shows whether it is waiting, failed (with the error) or gave up, with a retry button.</li>
             <li><b>Agents get no lessons:</b> lessons must be approved, and the agent must be working inside that project's folder.</li>
             <li><b>Backups, upgrades, running it for a team:</b> see <Code>docs/operations.md</Code>.</li>

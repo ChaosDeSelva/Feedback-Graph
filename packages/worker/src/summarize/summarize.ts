@@ -4,9 +4,9 @@
  * with the previous summary, and the model returns the merged summary.
  */
 import {
-  askPromptOnly,
+  askJson,
   mergeFiles,
-  providerUnavailableReason,
+  ModelOutputError,
   redactSecrets,
   SESSION_SUMMARY_JSON_SCHEMA,
   SessionSummarySchema,
@@ -147,28 +147,19 @@ Return the whole updated summary of the session: merge the parts, in order, into
 /** The model answered, twice, with something that is not a summary. */
 export class InvalidSummaryError extends Error {}
 
-/** One structured call, validated; an invalid answer is asked again once. Unavailability and other errors propagate. */
+/**
+ * One structured call, validated; an answer that is not JSON or not a summary is asked again once, more strictly
+ * (askJson). Unavailability, timeouts and other errors propagate.
+ */
 export async function askSummary(llm: LlmProvider, user: string): Promise<SummaryFields> {
-  let last: unknown = null;
-  for (let attempt = 0; attempt < 2; attempt++) {
-    let raw: unknown;
-    try {
-      // A summary needs nothing but the prompt: an agentic model gets an empty folder, not the worker's.
-      raw = await askPromptOnly(llm, { system: SYSTEM, user: redactSecrets(user), schema: SESSION_SUMMARY_JSON_SCHEMA, timeoutMs: TIMEOUT_MS });
-    } catch (err) {
-      if (providerUnavailableReason(err)) throw err;
-      // A reply that is not JSON at all is an answer we cannot use, like one of the wrong shape: ask once more.
-      if (err instanceof SyntaxError || /json/i.test(String((err as Error)?.message ?? ''))) {
-        last = err;
-        continue;
-      }
-      throw err;
-    }
-    const parsed = SessionSummarySchema.safeParse(raw);
-    if (parsed.success) return parsed.data;
-    last = parsed.error;
+  try {
+    // A summary needs nothing but the prompt: an agentic model gets an empty folder, not the worker's.
+    return await askJson(llm, { system: SYSTEM, user: redactSecrets(user), schema: SESSION_SUMMARY_JSON_SCHEMA, timeoutMs: TIMEOUT_MS },
+      (raw) => SessionSummarySchema.parse(raw), { promptOnly: true });
+  } catch (err) {
+    if (err instanceof ModelOutputError) throw new InvalidSummaryError(`the model did not return a valid summary: ${err.message.slice(0, 800)}`);
+    throw err;
   }
-  throw new InvalidSummaryError(`the model did not return a valid summary: ${String(last instanceof Error ? last.message : last).slice(0, 300)}`);
 }
 
 export type SummarizeOpts = {

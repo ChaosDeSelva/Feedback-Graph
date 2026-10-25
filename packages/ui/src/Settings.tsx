@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState, type ReactNode } from 'react';
 import { CloudSync } from './CloudSync.tsx';
+import { Prefilters } from './Prefilters.tsx';
 import { Integrations } from './Integrations.tsx';
 import { api, CLEANUP_CONFIRM, type ProjectCandidate, type ProjectSettings } from './api.ts';
 import { useUnsavedChanges } from './unsaved.ts';
@@ -90,6 +91,14 @@ export function Settings() {
       else next.add(key);
       return next;
     });
+  }
+
+  /** The folders among `cs` you could tick yourself (not excluded, another clone, gone, or a stale saved key). */
+  const tickable = (cs: ProjectCandidate[]) => cs.filter((c) => !lockedReason(c, saved) && !staleReason(c, saved));
+  /** Tick many at once (tickable ones only), or with null untick every one. Nothing is saved yet. */
+  function selectMany(cs: ProjectCandidate[] | null) {
+    setNotice(null);
+    setDraft((d) => (cs ? new Set([...d, ...tickable(cs).map((c) => c.key)]) : new Set()));
   }
 
   async function save() {
@@ -203,6 +212,21 @@ export function Settings() {
                 </span>
               </div>
 
+              {data.candidates.length > 0 && (
+                <div role="group" aria-label="select folders" className="flex flex-wrap items-center gap-1.5 text-xs">
+                  <span className="text-muted">Tick:</span>
+                  <Button size="sm" variant="ghost" onClick={() => selectMany(data.candidates)}>Select all</Button>
+                  <Button size="sm" variant="ghost" onClick={() => selectMany(null)}>Select none</Button>
+                  <Button size="sm" variant="ghost" onClick={() => selectMany(rows)} title="The folders the search and filter above show">
+                    Select shown ({tickable(rows).length})
+                  </Button>
+                  <Button size="sm" variant="ghost" onClick={() => selectMany(data.candidates.filter((c) => c.claudeSessions + c.codexSessions > 0))}>
+                    Select folders with sessions ({tickable(data.candidates.filter((c) => c.claudeSessions + c.codexSessions > 0)).length})
+                  </Button>
+                  <span className="text-muted">then Save selection.</span>
+                </div>
+              )}
+
               {(data.builtAt === null || data.codexSessionsFound === false) && (
                 <p className="text-xs text-muted">
                   {data.builtAt === null && 'The worker has not counted sessions yet, so every folder shows 0 until its first pass. '}
@@ -251,6 +275,7 @@ export function Settings() {
           {data && <Sources data={data} onSaved={setData} onError={setError} />}
           {data && <Integrations />}
           {data && <CloudSync />}
+          {data && <Prefilters />}
           {data && <Cleanup data={data} dirty={dirty} onDone={load} onError={setError} />}
         </div>
       </div>

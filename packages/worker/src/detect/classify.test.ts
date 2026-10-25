@@ -1,7 +1,7 @@
 import { expect, test } from 'vitest';
 import type { HumanTurn } from '@fb/core';
 import { classifyTurn } from './classify.ts';
-import { ollamaChatJson, ProviderUnavailableError } from '@fb/core';
+import { ModelOutputError, ModelTimeoutError, ollamaChatJson, ProviderUnavailableError, STRICT_JSON } from '@fb/core';
 
 const turn: HumanTurn = {
   uuid: 'u1', sessionId: 's', ts: 't', index: 1,
@@ -32,12 +32,27 @@ test('throws ProviderUnavailableError when the model cannot be asked, so the tur
   await expect(classifyTurn(turn, deps(refused))).rejects.toBeInstanceOf(ProviderUnavailableError);
   const missing = async () => { throw new Error('ollama 404: {"error":"model \\"gemma4\\" not found"}'); };
   await expect(classifyTurn(turn, deps(missing))).rejects.toThrow(/model not found/);
-  const timeout = async () => { throw new DOMException('timeout', 'TimeoutError'); };
-  await expect(classifyTurn(turn, deps(timeout))).rejects.toThrow(/timed out/);
 });
 
-test('returns null on an invalid label', async () => {
-  expect(await classifyTurn(turn, deps(async () => ({ label: 'banana', confidence: 1, summary: '' })))).toBeNull();
+test('a call that timed out is the turn\'s failure (null, charged an attempt), not unavailability', async () => {
+  const timeout = async () => { throw new DOMException('timeout', 'TimeoutError'); };
+  expect(await classifyTurn(turn, deps(timeout))).toBeNull();
+  const ollamaTimeout = async () => { throw new ModelTimeoutError('Ollama (gemma4) did not answer within 120 s'); };
+  expect(await classifyTurn(turn, deps(ollamaTimeout))).toBeNull();
+});
+
+test('returns null on an invalid label, after asking once more with a stricter instruction', async () => {
+  const systems: string[] = [];
+  const chat = async (o: { system: string }) => { systems.push(o.system); return { label: 'banana', confidence: 1, summary: '' }; };
+  expect(await classifyTurn(turn, deps(chat as never))).toBeNull();
+  expect(systems).toHaveLength(2);
+  expect(systems[1]).toContain(STRICT_JSON);
+});
+
+test('an unusable first answer is asked again once, and a good second answer is used', async () => {
+  const answers: unknown[] = [new ModelOutputError('no JSON object in the answer', 'thinking...'), { label: 'approval', confidence: 0.8, summary: '' }];
+  const chat = async () => { const a = answers.shift(); if (a instanceof Error) throw a; return a; };
+  expect(await classifyTurn(turn, deps(chat))).toMatchObject({ label: 'approval' });
 });
 
 test('ollamaChatJson posts a non-streaming chat with the schema and parses content', async () => {

@@ -33,3 +33,16 @@ test('no session found: work is null', async () => {
   expect(out.work).toBeNull();
   expect(out.sessionId).toBe('github:acme/demo#9');
 });
+
+test('a session that never touched the file a review comment is on is not the work; the next one that did is', async () => {
+  const onFile = { ...input, feedback: { ...turn, external: { ...external, path: 'api/search.ts', linkedSessionIds: [] } } };
+  const files = async (id: string) => (id === 'a' ? ['src/settings/users.ts'] : id === 'b' ? ['api/search.ts', 'api/db.ts'] : []);
+  const d = (list: WorkSession[]) => ({ graph: { workSessions: async () => list }, sessions: { turns: async () => [] }, files });
+  expect((await attachWorkSession(onFile, d([ws('a'), ws('b')]))).work?.sessionId).toBe('b');
+  const none = await attachWorkSession(onFile, d([ws('a')]));
+  expect(none.work).toBeNull();
+  expect(none.sessionId).toBe('github:acme/demo#9');
+  expect(none.cwd).toBe('');
+  // No files recorded for a session (read before files were): it is not ruled out.
+  expect((await attachWorkSession(onFile, d([ws('c')]))).work?.sessionId).toBe('c');
+});

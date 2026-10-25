@@ -138,6 +138,32 @@ test('ticking only edits locally; Save selection sends exactly the edited list',
   expect(box('other').checked).toBe(true);
 });
 
+test('bulk selection: all, none, the folders shown by the search and filter, and the folders with sessions; locked ones are skipped', async () => {
+  render(<Settings />);
+  await screen.findByRole('row', { name: 'demo-shop' });
+  const bulk = within(screen.getByRole('group', { name: 'select folders' }));
+  const ticked = () => shown().filter((k) => box(k).checked);
+  const saveSends = async (tracked: string[]) => {
+    fireEvent.click(within(screen.getByRole('region', { name: 'unsaved selection' })).getByRole('button', { name: 'Save selection' }));
+    await waitFor(() => expect(calls).toContainEqual({ url: '/api/settings/projects', method: 'PUT', body: { tracked } }));
+  };
+
+  fireEvent.click(bulk.getByRole('button', { name: 'Select all' }));
+  // Excluded, another clone (it follows demo-shop) and gone stay as they were.
+  expect(ticked().sort()).toEqual(['demo-shop', 'empty', 'other', 'shop-copy']);
+  fireEvent.click(bulk.getByRole('button', { name: 'Select none' }));
+  expect(ticked()).toEqual([]);
+  await saveSends([]);
+
+  fireEvent.change(screen.getByLabelText('search folders'), { target: { value: 'oth' } });
+  fireEvent.click(bulk.getByRole('button', { name: 'Select shown (1)' }));
+  fireEvent.change(screen.getByLabelText('search folders'), { target: { value: '' } });
+  expect(ticked()).toEqual(['other']);
+  fireEvent.click(bulk.getByRole('button', { name: 'Select folders with sessions (2)' }));
+  expect(ticked().sort()).toEqual(['demo-shop', 'other', 'shop-copy']);
+  await saveSends(['demo-shop', 'other']);
+});
+
 test('Cancel puts the saved selection back', async () => {
   render(<Settings />);
   await screen.findByRole('row', { name: 'demo-shop' });
@@ -324,4 +350,10 @@ test('labels people read never use the icon-only faint colour', async () => {
   await screen.findByRole('row', { name: 'demo-shop' });
   expect(within(rowOf('empty')).getByText('never')).toBeTruthy();
   expect(container.querySelectorAll('.text-faint')).toHaveLength(0);
+});
+
+test('lists the rules that skip GitHub and Linear comments before the classifier', async () => {
+  render(<Settings />);
+  const rules = await screen.findByRole('list', { name: 'comments skipped before the classifier' });
+  expect(within(rules).getByText('pr-author-reply')).toBeTruthy();
 });

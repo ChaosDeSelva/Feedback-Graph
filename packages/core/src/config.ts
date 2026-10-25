@@ -1,8 +1,10 @@
+import { parseLogins } from './feedbackRules.ts';
 import { parseGithubRepos } from './integrations/github.ts';
 import type { Root } from './projects.ts';
+import { DEFAULT_NUM_PREDICT, DEFAULT_OLLAMA_TIMEOUT_MS, DEFAULT_REPEAT_PENALTY } from './ollama.ts';
 
 /** Bumped with each release; reported by /api/status and the worker heartbeat. */
-export const VERSION = '0.4.4';
+export const VERSION = '0.5.0';
 
 export class ConfigError extends Error {
   readonly problems: string[];
@@ -64,12 +66,23 @@ export type Config = {
   /** Codex CLI / Desktop rollout files (~/.codex/sessions on the host), mounted read-only. */
   codexSessionsDir: string;
   stateDb: string;
-  ollama: { url: string; model: string; embedModel: string };
-  llm: { classify: string | null; postmortem: string | null; scan: string | null; check: string | null };
+  /**
+   * numPredict / repeatPenalty: sent with every Ollama chat call (OLLAMA_NUM_PREDICT, OLLAMA_REPEAT_PENALTY).
+   * timeoutSeconds: OLLAMA_TIMEOUT_SECONDS, the limit for every Ollama chat call; null: each job's own (classify 120 s).
+   */
+  ollama: { url: string; model: string; embedModel: string; numPredict: number; repeatPenalty: number; timeoutSeconds: number | null };
+  /** docs: reads uploaded documents and images into facts (DOCS_LLM, default SCAN_LLM; it needs vision for images). */
+  llm: { classify: string | null; postmortem: string | null; scan: string | null; check: string | null; docs: string | null };
   pollSeconds: number;
   classifyBatch: number;
   scanMaxBytes: number;
-  scanMaxFiles: number;
+  /**
+   * SCAN_MAX_FILES: files per project the code map keeps and changed files a per-file scan reads per run. Null (unset):
+   * the map keeps 40% of the candidates, between 400 and 4000, and a scan reads 400 per run.
+   */
+  scanMaxFiles: number | null;
+  /** SCAN_CONCURRENCY: scans run at once, beside the worker cycle (default 2; agentic ones one at a time). */
+  scanConcurrency: number;
   /** Seeds the project selection on its first start only; from then on the selection (Settings) decides. */
   ingestProjects: string[];
   /** Never ingested, scanned or served, even when INGEST_PROJECTS is empty. */
@@ -83,11 +96,17 @@ export type Config = {
   /**
    * GITHUB_REPOS (project=owner/repo), which overrides the repository a project's github.com remote names, and the
    * hours between PR-as-context syncs. The token is resolved per cycle (Integrations: .env, else Settings).
+   * botLogins / agentLogins (GITHUB_BOT_LOGINS, GITHUB_AGENT_LOGINS, lower-cased): comment authors labelled bot
+   * (skipped before the classifier) or agent (kept, labelled) besides the [bot] suffix and the "[claude]"-style markers.
    */
-  github: { repos: Map<string, string>; syncHours: number };
+  github: { repos: Map<string, string>; syncHours: number; botLogins: string[]; agentLogins: string[] };
   /** Minutes between syncs of review comments and Linear comments into the Inbox, per project (INTEGRATION_SYNC_MINUTES). */
   integrationSyncMinutes: number;
+  /** Minutes between rounds of looking for links between the selected projects (LINK_SCAN_MINUTES, default 30). */
+  linkScanMinutes: number;
   apiToken: string | null;
+  /** FG_OPERATOR_TOKEN and OPERATOR_ALLOW; null (the default): no request can make owner decisions without the UI. */
+  operator: OperatorConfig | null;
   publicHosts: string[];
   /** Feedback Graph Cloud sync; null (the default) sends nothing anywhere. Never log `token`. */
   cloud: CloudConfig | null;
@@ -130,7 +149,11 @@ export type CloudConfig = {
 
 /** fgc_pat_<16 hex lookup id>_<43 base64url chars>: what the cloud issues. */
 export const CLOUD_TOKEN_RE = /^fgc_pat_[0-9a-f]{16}_[A-Za-z0-9_-]{43}$/;
-const CLOUD_LOOPBACK = new Set(['localhost', '127.0.0.1', '[::1]']);
+/**
+ * This machine: loopback, and host.docker.internal, which is how the api and worker containers reach the host (inside a
+ * container localhost is the container; docker-compose.yml maps host.docker.internal for them).
+ */
+const CLOUD_LOCAL = new Set(['localhost', '127.0.0.1', '[::1]', 'host.docker.internal']);
 
 /** The problem with a cloud base URL, or null: https anywhere, plain http only to this machine, no credentials. */
 export function cloudUrlProblem(raw: string): string | null {
@@ -142,9 +165,28 @@ export function cloudUrlProblem(raw: string): string | null {
   }
   if (u.username || u.password) return 'CLOUD_URL must not carry a user name or password (the token goes in CLOUD_TOKEN)';
   if (u.protocol === 'https:') return null;
-  if (u.protocol === 'http:' && CLOUD_LOOPBACK.has(u.hostname)) return null;
-  return `CLOUD_URL must be https:// (plain http is allowed only for localhost); got ${u.protocol}//${u.host}`;
+  if (u.protocol === 'http:' && CLOUD_LOCAL.has(u.hostname)) return null;
+  return `CLOUD_URL must be https:// (plain http is allowed only for localhost or host.docker.internal); got ${u.protocol}//${u.host}`;
 }
+
+/**
+ * The owner-only actions an agent holding FG_OPERATOR_TOKEN can be allowed (OPERATOR_ALLOW). Each names a group of the
+ * routes createApp guards with ownerOnly.
+ */
+export const OPERATOR_VERBS = [
+  'select_projects', 'settings', 'scan', 'inbox_decide', 'lesson_decide', 'relevance', 'pin', 'links', 'docs', 'docs_delete',
+  'delete_project', 'retry', 'requeue', 'sync_now', 'import', 'resummarize', 'integrations',
+] as const;
+export type OperatorVerb = (typeof OPERATOR_VERBS)[number];
+/**
+ * Off unless OPERATOR_ALLOW names them: deciding lessons (what agents are taught), and what deletes data (deleting a
+ * project or an uploaded document; settings, whose cleanup deletes unselected projects' data), imports lessons from a file, or sets
+ * integration keys.
+ */
+const OPERATOR_DEFAULT_OFF: readonly OperatorVerb[] = ['lesson_decide', 'delete_project', 'docs_delete', 'settings', 'import', 'integrations'];
+
+/** FG_OPERATOR_TOKEN: agents (the `fg` CLI) may make the owner decisions in `allow`. Never log `token`. */
+export type OperatorConfig = { token: string; allow: OperatorVerb[] };
 
 type Env = Record<string, string | undefined>;
 
@@ -194,7 +236,9 @@ export function loadConfig(env: Env): Config {
   } catch (e) {
     problems.push((e as Error).message);
   }
-  const github: Config['github'] = { repos, syncHours: num('GITHUB_SYNC_HOURS', 6) };
+  const github: Config['github'] = {
+    repos, syncHours: num('GITHUB_SYNC_HOURS', 6), botLogins: parseLogins(env.GITHUB_BOT_LOGINS), agentLogins: parseLogins(env.GITHUB_AGENT_LOGINS),
+  };
 
   const apiToken = env.API_TOKEN?.trim() || null;
   if (apiToken && apiToken.length < 24) problems.push('API_TOKEN must be at least 24 characters (try: openssl rand -hex 24)');
@@ -204,6 +248,20 @@ export function loadConfig(env: Env): Config {
   // Without a token the Host check is the only guard, and any client can send `Host: localhost`.
   if (!apiToken && !LOOPBACK.test(apiBind)) {
     problems.push(`API_BIND=${apiBind} exposes the API beyond this machine, which needs API_TOKEN (openssl rand -hex 24); or set API_BIND=127.0.0.1`);
+  }
+  const operatorToken = env.FG_OPERATOR_TOKEN?.trim() || null;
+  let operator: OperatorConfig | null = null;
+  if (operatorToken) {
+    if (operatorToken.length < 24) problems.push('FG_OPERATOR_TOKEN must be at least 24 characters (try: openssl rand -hex 24)');
+    if (operatorToken === apiToken) problems.push('FG_OPERATOR_TOKEN must differ from API_TOKEN: the operator token can make owner decisions');
+    const asked = list(env.OPERATOR_ALLOW);
+    const isVerb = (v: string): v is OperatorVerb => (OPERATOR_VERBS as readonly string[]).includes(v);
+    const unknown = asked.filter((v) => v !== 'all' && !isVerb(v));
+    if (unknown.length) problems.push(`OPERATOR_ALLOW names unknown actions: ${unknown.join(', ')} (known: all, ${OPERATOR_VERBS.join(', ')})`);
+    const allow = !asked.length
+      ? OPERATOR_VERBS.filter((v) => !OPERATOR_DEFAULT_OFF.includes(v))
+      : asked.includes('all') ? [...OPERATOR_VERBS] : [...new Set(asked.filter(isVerb))];
+    operator = { token: operatorToken, allow };
   }
   const runnerUrl = env.CODEX_RUNNER_URL?.trim() || '';
   if (runnerUrl) {
@@ -216,7 +274,7 @@ export function loadConfig(env: Env): Config {
     if (u && u.protocol !== 'http:' && u.protocol !== 'https:') problems.push(`CODEX_RUNNER_URL must be http:// or https:// (got ${u.protocol})`);
     else if (u && (u.username || u.password)) problems.push('CODEX_RUNNER_URL must not carry a user name or password (the runner token is in the scratch volume)');
   }
-  for (const k of ['CLASSIFY_LLM', 'POSTMORTEM_LLM', 'SCAN_LLM', 'SUMMARY_LLM']) {
+  for (const k of ['CLASSIFY_LLM', 'POSTMORTEM_LLM', 'SCAN_LLM', 'SUMMARY_LLM', 'DOCS_LLM']) {
     if (/^codex-cli(:|$)/.test(env[k]?.trim() ?? '') && !runnerUrl && env.ALLOW_UNCONFINED_CODEX?.trim() !== '1') {
       problems.push(`${k}: codex-cli inside the worker can read every file the worker can (all transcripts, every project's .env, the worker's secrets); run it in the codex-runner sidecar (CODEX_RUNNER_URL with docker compose --profile codex), set ALLOW_UNCONFINED_CODEX=1 to accept that, or use claude-cli (SECURITY.md)`);
     }
@@ -304,12 +362,17 @@ export function loadConfig(env: Env): Config {
       url: str('OLLAMA_URL', 'http://host.docker.internal:11434'),
       model: str('OLLAMA_MODEL', 'gemma4'),
       embedModel: str('OLLAMA_EMBED_MODEL', 'nomic-embed-text'),
+      // Read again by each Ollama provider (ollamaTuning): checked here so a bad value fails at startup.
+      numPredict: num('OLLAMA_NUM_PREDICT', DEFAULT_NUM_PREDICT),
+      repeatPenalty: num('OLLAMA_REPEAT_PENALTY', DEFAULT_REPEAT_PENALTY, 0.01),
+      timeoutSeconds: env.OLLAMA_TIMEOUT_SECONDS?.trim() ? num('OLLAMA_TIMEOUT_SECONDS', DEFAULT_OLLAMA_TIMEOUT_MS / 1000) : null,
     },
-    llm: { classify: spec('CLASSIFY_LLM', true), postmortem: spec('POSTMORTEM_LLM'), scan: spec('SCAN_LLM'), check: spec('CHECK_LLM') },
+    llm: { classify: spec('CLASSIFY_LLM', true), postmortem: spec('POSTMORTEM_LLM'), scan: spec('SCAN_LLM'), check: spec('CHECK_LLM'), docs: spec('DOCS_LLM') },
     pollSeconds: num('POLL_SECONDS', 30),
     classifyBatch: num('CLASSIFY_BATCH', 50),
     scanMaxBytes: num('SCAN_MAX_BYTES', 80_000),
-    scanMaxFiles: num('SCAN_MAX_FILES', 400),
+    scanMaxFiles: env.SCAN_MAX_FILES?.trim() ? num('SCAN_MAX_FILES', 400) : null,
+    scanConcurrency: num('SCAN_CONCURRENCY', 2),
     ingestProjects: list(env.INGEST_PROJECTS),
     excludeProjects: list(env.EXCLUDE_PROJECTS),
     turnRetentionDays: retention,
@@ -317,7 +380,9 @@ export function loadConfig(env: Env): Config {
     summary,
     github,
     integrationSyncMinutes: num('INTEGRATION_SYNC_MINUTES', 10),
+    linkScanMinutes: num('LINK_SCAN_MINUTES', 30),
     apiToken,
+    operator,
     publicHosts,
     cloud,
     apiBind,

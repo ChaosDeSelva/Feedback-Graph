@@ -41,6 +41,39 @@ test('a failure is recorded and does not stop the batch', async () => {
   expect(failures).toEqual(['bad:Error: rate limited']);
 });
 
+test('a post-mortem that timed out is charged to that feedback (backoff, attempts) and the batch goes on', async () => {
+  const failures: string[] = [];
+  const r = await runPostmortems({
+    k: {
+      feedbackNeedingPostmortem: async () => [input('slow'), input('good')],
+      savePostmortem: async () => {},
+      recordPostmortemFailure: async (id, err) => { failures.push(`${id}:${err}`); return { attempts: 1, retryAt: '2026-10-24T12:00:00Z' }; },
+    },
+    postmortem: async (i) => { if (i.feedbackId === 'slow') throw new DOMException('The operation was aborted due to timeout', 'TimeoutError'); return pm; },
+    embed: async (texts) => texts.map(() => [1]),
+    batch: 3,
+  });
+  expect(r).toEqual({ done: 1, failed: 1 });
+  expect(failures).toEqual([expect.stringMatching(/^slow:TimeoutError/)]);
+});
+
+test('while a scan holds the model, a post-mortem that timed out charges nothing and the batch waits', async () => {
+  const failures: string[] = [];
+  const r = await runPostmortems({
+    k: {
+      feedbackNeedingPostmortem: async () => [input('slow'), input('good')],
+      savePostmortem: async () => {},
+      recordPostmortemFailure: async (id) => { failures.push(id); return { attempts: 1, retryAt: null }; },
+    },
+    postmortem: async () => { throw new DOMException('The operation was aborted due to timeout', 'TimeoutError'); },
+    embed: async (texts) => texts.map(() => [1]),
+    batch: 3,
+    modelBusy: () => true,
+  });
+  expect(failures).toEqual([]);
+  expect(r).toEqual({ done: 0, failed: 0, unavailable: expect.stringMatching(/busy with a scan/) });
+});
+
 test('an unavailable model is not charged to the feedback: no failure recorded, and the batch pauses', async () => {
   const failures: string[] = [];
   const activity: ActivityInput[] = [];
@@ -111,7 +144,7 @@ test('each post-mortem is logged with the model, the context it was given, and w
   const full = {
     ...pm, cause: 'context_available_ignored', taskTitle: 'Orders list',
     contextItems: [{ kind: 'claude_md', ref: 'CLAUDE.md', excerpt: 'scope', why: 'stated rule', wasAvailable: true }],
-    trace: { provider: 'claude-cli', agentic: true, standing: ['/vibe/shop/CLAUDE.md'], facts: ['src/db.ts: use scoped'] },
+    trace: { provider: 'claude-cli', agentic: true, standing: ['/vibe/shop/CLAUDE.md'], facts: ['src/db.ts: use scoped'], lessonFlags: [{ name: 'meta-lesson', why: 'about feedback' }] },
   } as PostMortem & { trace: PostMortemTrace };
   await runPostmortems({
     k: {
@@ -131,6 +164,7 @@ test('each post-mortem is logged with the model, the context it was given, and w
     cause: 'context_available_ignored', feedback: 'not good enough', lesson: { title: 't', rule: 'r' },
     contextGiven: { standing: ['/vibe/shop/CLAUDE.md'], facts: ['src/db.ts: use scoped'], agentic: true },
     contextFound: [{ kind: 'claude_md', ref: 'CLAUDE.md', why: 'stated rule', wasAvailable: true }],
+    lessonChecks: [{ name: 'meta-lesson', why: 'about feedback' }],
   });
 });
 

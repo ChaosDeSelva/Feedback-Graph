@@ -160,7 +160,13 @@ function ServiceCard({ kind, view, onChange }: { kind: IntegrationKind; view: In
       {connected && (
         <dl className="grid gap-x-6 gap-y-1 text-[13px] sm:grid-cols-[auto_1fr]">
           <dt className="text-muted">Account</dt>
-          <dd>{s.account ?? <span className="text-muted">not checked yet: press Test connection</span>}</dd>
+          <dd>
+            {s.account ? (
+              <>{s.account}{s.checkedAt && <span className="text-muted" title={s.checkedAt}> (checked {ago(s.checkedAt)})</span>}</>
+            ) : (
+              <span className="text-muted">being checked: it is checked on first use and after a sync (or press Test connection)</span>
+            )}
+          </dd>
           <dt className="text-muted">Token</dt>
           <dd>{s.envSet ? <>from <Mono>{s.envVar}</Mono> in <Mono>.env</Mono></> : 'saved in this app (never shown again)'}</dd>
           <dt className="text-muted">Last sync</dt>

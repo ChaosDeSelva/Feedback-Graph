@@ -9,7 +9,7 @@ The developer runs a local Feedback Graph that learns from every time they pushe
 
 ## Before you start work
 
-Call `get_task_context` with your current working directory (`cwd`), a one or two sentence description of the task, and, when you know them, the `files` you expect to read or change. Lessons tied to those files come first, and a short code map shows who imports each file, which tests cover it and its last miss.
+Call `get_task_context` with your current working directory (`cwd`), a one or two sentence description of the task, and, when you know them, the `files` you expect to read or change. Lessons tied to those files come first, and a short code map shows who imports each file, which tests cover it and its last miss. Facts come from the code scan and from documents and images the developer uploaded (labelled by document), ranked by how often everyday coding needs them. A "From linked projects" section brings the best lessons, misses and facts of projects the developer linked to this one (an app and its backend, say): use them for how the two fit together.
 
 - Treat **approved lessons** as project rules for this task. They come from real corrections.
 - Read **similar past misses** as "this is what went wrong last time". Avoid repeating them.

@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { IntegrationError } from './errors.ts';
+import type { ReviewVerdict } from '../types.ts';
 
 /**
  * GitHub PR discussion as project context. Review comments are where humans state
@@ -22,6 +23,10 @@ export type PrComment = {
   kind: 'review_comment' | 'issue_comment' | 'review';
   /** The diff lines a review comment is attached to (the end of GitHub's diff_hunk); null for other kinds. */
   diffHunk: string | null;
+  /** A review comment that replies in a thread: the id of the comment it answers. Unset otherwise. */
+  inReplyTo?: string;
+  /** The verdict of the review this is (kind review) or belongs to (a review comment). Unset when GitHub did not say. */
+  reviewState?: ReviewVerdict;
 };
 
 export type PrContext = {
@@ -87,6 +92,8 @@ const Id = z.union([z.number(), z.string()]).optional();
 
 const ReviewCommentSchema = z.object({
   id: Id,
+  in_reply_to_id: Id.nullable(),
+  pull_request_review_id: Id.nullable(),
   diff_hunk: z.string().nullable().optional(),
   user: User,
   body: z.string().nullable().optional(),
@@ -107,6 +114,7 @@ const IssueCommentSchema = z.object({
 
 const ReviewSchema = z.object({
   id: Id,
+  state: z.string().nullable().optional(),
   user: User,
   body: z.string().nullable().optional(),
   html_url: z.string().optional(),
@@ -171,6 +179,9 @@ async function all<T>(url: string, schema: z.ZodType<T>, token: string, fetchImp
   return out;
 }
 
+const VERDICTS: readonly ReviewVerdict[] = ['APPROVED', 'CHANGES_REQUESTED', 'COMMENTED', 'DISMISSED'];
+const verdict = (state: string | null | undefined): ReviewVerdict | undefined => VERDICTS.find((v) => v === state?.toUpperCase());
+
 const keep = (u: GhUser, body: string | null | undefined): body is string => !isBot(u) && !!body && body.trim() !== '';
 
 async function commentsFor(repo: string, n: number, token: string, fetchImpl: typeof fetch): Promise<PrComment[]> {
@@ -181,11 +192,16 @@ async function commentsFor(repo: string, n: number, token: string, fetchImpl: ty
     all(`${base}/pulls/${n}/reviews?per_page=100`, ReviewSchema, token, fetchImpl),
   ]);
   const out: PrComment[] = [];
+  const verdicts = new Map(reviews.map((r) => [String(r.id), verdict(r.state)]));
+  const optional = (inReplyTo: string | number | null | undefined, state: ReviewVerdict | undefined) => ({
+    ...(inReplyTo != null ? { inReplyTo: String(inReplyTo) } : {}),
+    ...(state ? { reviewState: state } : {}),
+  });
   const idOf = (id: string | number | undefined, url: string) => (id === undefined ? commentId(url, out.length) : String(id));
   for (const c of review) {
     if (!keep(c.user, c.body)) continue;
     const diffHunk = c.diff_hunk ? c.diff_hunk.slice(-HUNK_CAP) : null;
-    out.push({ id: idOf(c.id, c.html_url), author: c.user?.login ?? 'ghost', body: c.body, path: c.path ?? null, line: c.line ?? c.original_line ?? null, url: c.html_url, createdAt: c.created_at, kind: 'review_comment', diffHunk });
+    out.push({ id: idOf(c.id, c.html_url), author: c.user?.login ?? 'ghost', body: c.body, path: c.path ?? null, line: c.line ?? c.original_line ?? null, url: c.html_url, createdAt: c.created_at, kind: 'review_comment', diffHunk, ...optional(c.in_reply_to_id, c.pull_request_review_id != null ? verdicts.get(String(c.pull_request_review_id)) : undefined) });
   }
   for (const c of issue) {
     if (!keep(c.user, c.body)) continue;
@@ -193,7 +209,7 @@ async function commentsFor(repo: string, n: number, token: string, fetchImpl: ty
   }
   for (const r of reviews) {
     if (!keep(r.user, r.body)) continue;
-    out.push({ id: idOf(r.id, r.html_url ?? ''), author: r.user?.login ?? 'ghost', body: r.body, path: null, line: null, url: r.html_url ?? '', createdAt: r.submitted_at ?? '', kind: 'review', diffHunk: null });
+    out.push({ id: idOf(r.id, r.html_url ?? ''), author: r.user?.login ?? 'ghost', body: r.body, path: null, line: null, url: r.html_url ?? '', createdAt: r.submitted_at ?? '', kind: 'review', diffHunk: null, ...optional(null, verdict(r.state)) });
   }
   return out;
 }

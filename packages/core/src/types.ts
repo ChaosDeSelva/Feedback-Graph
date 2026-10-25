@@ -46,7 +46,22 @@ export type ExternalRef = {
   description?: string | null;
   /** Linear only: the ticket's workflow state, priority, labels and assignee when it was synced. */
   ticket?: TicketMeta | null;
+  /** Who wrote it (feedbackRules.authorKindOf): a person, a bot, or an AI agent. Unset on comments synced before. */
+  authorKind?: AuthorKind;
+  /** The author kind comes from the GitHub login (a bot or agent listed by login), not from text the author typed. */
+  authorVerified?: boolean;
+  /** GitHub: the PR's author, so a reply of theirs is told from a reviewer's comment. */
+  threadAuthor?: string | null;
+  /** GitHub: a reply in a review comment thread (not the comment that opened it). */
+  isReply?: boolean;
+  /** GitHub: for a reply, who wrote the comment it answers (the thread's first comment); null when not fetched. */
+  repliesTo?: string | null;
+  /** GitHub: the verdict of the review the comment belongs to. */
+  reviewState?: ReviewVerdict | null;
 };
+
+export type AuthorKind = 'human' | 'bot' | 'agent';
+export type ReviewVerdict = 'APPROVED' | 'CHANGES_REQUESTED' | 'COMMENTED' | 'DISMISSED';
 
 export type TicketMeta = { state: string | null; priority: string | null; labels: string[]; assignee: string | null };
 
@@ -166,6 +181,11 @@ export type Lesson = {
   missId: string | null;
   createdAt: string;
   decidedAt: string | null;
+  /**
+   * Who made its last decision (approved, rejected, back to proposed): 'you' (the UI), or `operator:<name>` for an
+   * agent holding FG_OPERATOR_TOKEN. Null for lessons decided before this was recorded, or never decided.
+   */
+  decidedBy?: string | null;
 };
 
 /** Everything the post-mortem needs about one confirmed piece of feedback. */
@@ -204,8 +224,17 @@ export const FACT_KINDS = [
 ] as const;
 export type FactKind = (typeof FACT_KINDS)[number];
 
-/** `why`: the extractor's reason a coding agent needs this fact. */
-export type CodeFact = { kind: FactKind; statement: string; path: string; lines: string | null; confidence: number; why: string };
+/**
+ * `why`: the extractor's reason a coding agent needs this fact. `relevance` (0..1): how often an agent doing everyday
+ * coding in the project needs it (setup of an external tool is low); null or absent: not scored yet.
+ */
+export type CodeFact = { kind: FactKind; statement: string; path: string; lines: string | null; confidence: number; why: string; relevance?: number | null };
+
+/** Who set a fact's relevance: the extractor or the background scorer ('model'), or you ('you', never overwritten). */
+export type RelevanceBy = 'model' | 'you';
+
+/** Relevance used for ranking when a fact has none yet. */
+export const UNSCORED_RELEVANCE = 0.5;
 
 export type ScanStatus = 'queued' | 'running' | 'done' | 'failed';
 export type ScanJob = {
@@ -237,6 +266,8 @@ export type ProjectSummary = {
   lessons: number;
   facts: number;
   lastScan: ScanJob | null;
+  /** You pinned it: it comes first in every project list (UI order only). */
+  pinned: boolean;
 };
 
 // ── Provenance ─────────────────────────────────────────────────────────
@@ -268,6 +299,12 @@ export const ACTIVITY_KINDS = [
   'roots_saved',
   'integration_changed',
   'feedback_synced',
+  'facts_scored',
+  'fact_relevance_set',
+  'project_pinned',
+  'links_suggested',
+  'link_decided',
+  'doc_read',
 ] as const;
 export type ActivityKind = (typeof ACTIVITY_KINDS)[number];
 
@@ -297,20 +334,46 @@ export type WorkerStatus = {
   providers: Record<string, string | null>;
   /** Feedback Graph Cloud sync; absent or null when CLOUD_URL is not set. */
   cloudSync?: CloudSyncStatus | null;
-  /** How each job's model last fared (classify, postmortem, scan, summary); missing until it is first asked. */
+  /** How each job's model last fared (classify, postmortem, scan, summary, docs); missing until it is first asked. */
   health?: Partial<Record<ModelJob, ProviderHealth>>;
   /** Jobs turned off on purpose (SUMMARY_LLM=off), so a missing model is not reported as broken. */
   off?: ModelJob[];
+  /** What the worker is doing right now; absent from workers older than 0.4.5. */
+  stage?: WorkerStage | null;
+  /** Work waiting, as last counted by the worker. */
+  backlog?: WorkerBacklog | null;
 };
 
-/** How a provider last fared: `reason` says why it could not be asked, null while it answers. */
-export type ProviderHealth = { provider: string; ok: boolean; reason: string | null; at: string };
+/**
+ * The step of the worker's loop running now. `waiting`: between cycles, nothing to do. done/total count the step's items
+ * where it has them (null where not: ingest reads only changed files, so it counts reads without a total); `current` is
+ * the item in hand (a transcript's file name, a turn id, a project key, a feedback id).
+ */
+export const WORKER_STAGES = ['sync', 'ingest', 'classify', 'postmortem', 'scan', 'docs', 'waiting'] as const;
+export type WorkerStageName = (typeof WORKER_STAGES)[number];
+export type WorkerStage = { name: WorkerStageName; startedAt: string; done: number | null; total: number | null; current: string | null };
+/** Turns waiting for the classifier (the first `classifyBatch * 20` of them are fetched: `capped` means at least). */
+export type WorkerBacklog = { classify: number; classifyCapped: boolean; at: string };
 
-export const MODEL_JOBS = ['classify', 'postmortem', 'scan', 'summary'] as const;
+/**
+ * How a provider last fared: `reason` says why it could not be asked, null while it answers. `since`: when it was first
+ * found unavailable in this run of failures (unset while it answers).
+ */
+export type ProviderHealth = { provider: string; ok: boolean; reason: string | null; at: string; since?: string };
+
+export const MODEL_JOBS = ['classify', 'postmortem', 'scan', 'summary', 'docs'] as const;
 export type ModelJob = (typeof MODEL_JOBS)[number];
 /** A job's model as /api/status reports it: ok until it was last found unavailable (or, for an Ollama model, while
  * Ollama does not answer), with the reason. */
-export type ModelHealth = { provider: string | null; ok: boolean; reason: string | null; off?: true };
+export type ModelHealth = {
+  provider: string | null;
+  ok: boolean;
+  reason: string | null;
+  off?: true;
+  /** While unavailable: since when (the first failure in a row), and when that was last seen. */
+  since?: string;
+  checkedAt?: string;
+};
 
 /** Whether Ollama answers at `url` with the models it is asked for; `reason` says why not. */
 export type OllamaHealth = { url: string; ok: boolean; reason: string | null };
@@ -351,6 +414,27 @@ export type SystemStatus = {
   ollama?: OllamaHealth | null;
   /** GitHub, Linear, Claude, Codex, Ollama and cloud sync; null when unknown (an older api leaves it out). */
   connections?: Record<ConnectionName, Connection> | null;
+  /** The worker's current step and since when; null when the worker is offline or has not said. */
+  stage?: { name: WorkerStageName; startedAt: string; current: string | null } | null;
+  /** That step's items done of total (total null when it has none); null when the step does not count items. */
+  progress?: { done: number; total: number | null } | null;
+};
+
+/**
+ * GET /api/pipeline: where everything stands, for the first-run panel. Each count is null when this server cannot tell
+ * (an older worker, or a store without that count).
+ */
+export type PipelineStatus = {
+  stage: NonNullable<SystemStatus['stage']> | null;
+  progress: NonNullable<SystemStatus['progress']> | null;
+  /** Sessions read so far, in the shown projects. */
+  sessions: number | null;
+  /** Turns waiting for the classifier; `capped`: at least that many. */
+  classify: { backlog: number; capped: boolean } | null;
+  inbox: { pending: number; confirmed: number } | null;
+  postmortems: { queued: number } | null;
+  lessons: { proposed: number; approved: number } | null;
+  scans: { done: number; queued: number; running: number; failed: number; never: number } | null;
 };
 
 // ── Session summaries ──────────────────────────────────────────────────

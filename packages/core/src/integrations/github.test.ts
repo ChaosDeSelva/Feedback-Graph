@@ -90,6 +90,26 @@ describe('fetchPullRequestContext', () => {
     ]);
   });
 
+  test('a reply in a review thread says so, and comments carry the verdict of the review they belong to', async () => {
+    const { fetchImpl } = mockFetch({
+      '/repos/acme/demo/pulls': [pr(7, '2026-10-20T00:00:00Z')],
+      '/repos/acme/demo/pulls/7/comments': [
+        { id: 1, pull_request_review_id: 60, user: human('bob'), body: 'nit: rename', path: 'a.ts', line: 1, html_url: 'u1', created_at: '2026-10-19T00:00:00Z' },
+        { id: 2, in_reply_to_id: 1, pull_request_review_id: 61, user: human('alice'), body: 'Fixed in 3f2a9c1', path: 'a.ts', line: 1, html_url: 'u2', created_at: '2026-10-19T01:00:00Z' },
+      ],
+      '/repos/acme/demo/pulls/7/reviews': [
+        { id: 60, user: human('bob'), body: 'LGTM, one LOW nit', state: 'APPROVED', html_url: 'u60', submitted_at: '2026-10-19T00:00:00Z' },
+        { id: 61, user: human('alice'), body: '', state: 'COMMENTED', html_url: 'u61', submitted_at: '2026-10-19T01:00:00Z' },
+      ],
+    });
+    const [p] = await fetchPullRequestContext({ repo: 'acme/demo', token: 't', fetchImpl });
+    expect(p.comments.map((c) => [c.id, c.inReplyTo ?? null, c.reviewState ?? null])).toEqual([
+      ['1', null, 'APPROVED'],
+      ['2', '1', 'COMMENTED'],
+      ['60', null, 'APPROVED'],
+    ]);
+  });
+
   test('skips PRs authored by bots', async () => {
     const { fetchImpl } = mockFetch({
       '/repos/acme/demo/pulls': [pr(1, '2026-10-20T00:00:00Z', { user: { login: 'dependabot[bot]', type: 'Bot' } }), pr(2, '2026-10-19T00:00:00Z')],

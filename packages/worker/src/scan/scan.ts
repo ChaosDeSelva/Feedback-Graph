@@ -5,7 +5,11 @@ import { extname, join } from 'node:path';
 import { promisify } from 'node:util';
 import { z } from 'zod';
 import { GIT_SAFE } from '../ingest/git.ts';
-import { askPromptOnly, FACT_KINDS, isSecretPath, ProviderUnavailableError, providerUnavailableReason, redactSecrets, type ActivityStore, type CodeFact, type FactsStore, type LlmProvider, type ScanJob } from '@fb/core';
+import { extract } from '../codegraph/extract.ts';
+import { langOf } from '../codegraph/lang.ts';
+import { chunkBySymbols, type Chunk } from './chunk.ts';
+import { mapCap, rankCodePaths } from './rank.ts';
+import { askJson, clampRelevance, FACT_KINDS, isSecretPath, modelTimeoutReason, ProviderUnavailableError, providerUnavailableReason, redactSecrets, type ActivityStore, type CodeFact, type FactsStore, type LlmProvider, type ScanJob } from '@fb/core';
 
 const run = promisify(execFile);
 
@@ -15,16 +19,19 @@ const CODE_EXT = new Set([
   '.yaml', '.yml', '.toml', '.sh', '.tf', '.prisma',
 ]);
 // project.godot marks where a Godot project's res:// starts (codegraph resolves GDScript paths against it).
-const CODE_NAMES = new Set(['Dockerfile', 'Makefile', '.gitignore', '.env.example', 'project.godot']);
+// go.mod: Go imports resolve against its module path.
+const CODE_NAMES = new Set(['Dockerfile', 'Makefile', '.gitignore', '.env.example', 'project.godot', 'go.mod']);
 const SKIP_DIRS = new Set(['node_modules', 'dist', 'build', '.git', '.next', 'out', 'coverage', 'vendor', '.venv', '__pycache__', 'target', '.turbo', '.cache']);
 const LOCKFILES = new Set(['pnpm-lock.yaml', 'package-lock.json', 'yarn.lock', 'bun.lockb', 'Cargo.lock', 'poetry.lock', 'Gemfile.lock', 'composer.lock']);
 /** Files that hold credentials are never read, whatever their extension (the list lives in core). */
 const SECRET_FILE = { test: isSecretPath };
-const MIN_CONFIDENCE = 0.5;
+export const MIN_CONFIDENCE = 0.5;
 /** Bump when the extraction prompts change, so the log says which prompt produced a fact. */
-export const SCAN_PROMPT_VERSION = 'scan-v2';
+export const SCAN_PROMPT_VERSION = 'scan-v3';
 const DETERMINISTIC_WHY = 'Read directly from package.json; no model involved.';
 const MAX_FILE_CHARS = 24_000;
+/** Files in a row whose model call timed out before a per-file scan gives up on this run. */
+const MAX_TIMEOUTS_IN_ROW = 3;
 
 export type CodeFile = { path: string; hash: string; size: number };
 
@@ -57,18 +64,35 @@ async function walk(root: string, rel = ''): Promise<string[]> {
   return out;
 }
 
-/** Source, docs and config worth reading; respects .gitignore when the dir is a git repo. */
-export async function listCodeFiles(repoPath: string, o: { maxBytes: number; maxFiles: number }): Promise<CodeFile[]> {
-  const paths = ((await gitFiles(repoPath)) ?? (await walk(repoPath))).filter(wanted).sort();
+export type ListOpts = { maxBytes: number; maxFiles: number | null; priority?: Iterable<string> };
+
+/**
+ * Source, docs and config worth reading; respects .gitignore when the dir is a git repo. Candidates are ranked before
+ * the cap (rank.ts), so a capped list keeps source over config and docs, and `priority` paths (files sessions edited)
+ * before anything. maxFiles null: the cap scales with the repo (mapCap). totalCandidates: how many files were worth
+ * listing before the cap, so a capped map can say what it left out.
+ */
+export async function listCodeFilesWithTotal(repoPath: string, o: ListOpts): Promise<{ files: CodeFile[]; totalCandidates: number; cap: number }> {
+  const candidates = ((await gitFiles(repoPath)) ?? (await walk(repoPath))).filter(wanted);
+  const cap = mapCap(o.maxFiles, candidates.length);
   const files: CodeFile[] = [];
-  for (const path of paths) {
-    if (files.length >= o.maxFiles) break;
+  for (const path of rankCodePaths(candidates, { priority: o.priority })) {
+    if (files.length >= cap) break;
     const s = await lstat(join(repoPath, path)).catch(() => null); // a symlink could point at a secret or outside the repo
     if (!s?.isFile() || s.size > o.maxBytes) continue;
     const content = await readFile(join(repoPath, path));
     files.push({ path, size: s.size, hash: createHash('sha1').update(content).digest('hex') });
   }
-  return files;
+  return { files, totalCandidates: candidates.length, cap };
+}
+
+/** Whether the folder has any file worth scanning (a scan of one without finishes at once, with no model call). */
+export async function hasCodeFiles(repoPath: string): Promise<boolean> {
+  return ((await gitFiles(repoPath)) ?? (await walk(repoPath))).some(wanted);
+}
+
+export async function listCodeFiles(repoPath: string, o: ListOpts): Promise<CodeFile[]> {
+  return (await listCodeFilesWithTotal(repoPath, o)).files;
 }
 
 /** Facts we can read without a model: package.json scripts and dependencies. */
@@ -82,7 +106,7 @@ export function deterministicFacts(files: { path: string; content: string }[]): 
       continue;
     }
     for (const [name, cmd] of Object.entries(pkg.scripts ?? {})) {
-      facts.push({ kind: 'command', statement: `\`${name}\` script runs: ${cmd}`, path: f.path, lines: null, confidence: 1, why: DETERMINISTIC_WHY });
+      facts.push({ kind: 'command', statement: `\`${name}\` script runs: ${cmd}`, path: f.path, lines: null, confidence: 1, why: DETERMINISTIC_WHY, relevance: 0.7 });
     }
     const list = (d?: Record<string, string>) => Object.entries(d ?? {}).map(([n, v]) => `${n} ${v}`).join(', ');
     const deps = list(pkg.dependencies);
@@ -95,24 +119,27 @@ export function deterministicFacts(files: { path: string; content: string }[]): 
         lines: null,
         confidence: 1,
         why: DETERMINISTIC_WHY,
+        relevance: 0.5,
       });
     }
   }
   return facts;
 }
 
-const FactSchema = z.object({
+export const FactSchema = z.object({
   kind: z.enum(FACT_KINDS),
   statement: z.string().min(1),
   path: z.string(),
   lines: z.string().nullable(),
   confidence: z.number().min(0).max(1),
   why: z.string().default(''),
+  // Older or smaller models leave it out: the fact is kept unscored and the background scorer scores it later.
+  relevance: z.number().nullable().optional().transform((r) => (typeof r === 'number' ? clampRelevance(r) : null)),
 });
 
-const FACT_JSON = {
+export const FACT_JSON = {
   type: 'object',
-  required: ['kind', 'statement', 'path', 'lines', 'confidence', 'why'],
+  required: ['kind', 'statement', 'path', 'lines', 'confidence', 'why', 'relevance'],
   properties: {
     kind: { type: 'string', enum: [...FACT_KINDS] },
     statement: { type: 'string', description: 'One self-contained sentence a coding agent can act on' },
@@ -120,46 +147,74 @@ const FACT_JSON = {
     lines: { type: ['string', 'null'], description: 'e.g. "12-30", or null' },
     confidence: { type: 'number', description: '0..1' },
     why: { type: 'string', description: 'One short sentence: why an agent changing this code needs to know this' },
+    relevance: { type: 'number', description: '0..1: how often an agent doing everyday coding here needs this (see the rubric)' },
   },
 };
+
+/** Shared with the background scorer and the docs reader, so every fact is scored on one scale. */
+export const RELEVANCE_RUBRIC = `Give every fact a relevance from 0 to 1: how often an agent doing everyday coding in this project needs it.
+- 0.8 to 1: needed in most changes (core conventions, invariants, the data model, auth and security rules, how modules fit together).
+- 0.4 to 0.7: needed for some changes (one module's API, a config option, a gotcha in one area).
+- 0 to 0.3: rarely needed while coding (installing, setting up or configuring an external tool, CI or deploy steps, editor or machine setup, history).`;
 
 const WHAT_TO_KEEP = `Extract durable, non-obvious facts a coding agent would need to change this code correctly:
 conventions and patterns to follow, invariants and assumptions, public APIs and their contracts, data models,
 config and environment, security/auth rules, gotchas and side effects, and the overall architecture.
-Skip anything trivial or obvious from a file name. Prefer fewer, higher-value facts. Never include secrets.`;
+Skip anything trivial or obvious from a file name. Prefer fewer, higher-value facts. Never include secrets.
+
+${RELEVANCE_RUBRIC}`;
 
 const FileResult = z.object({ summary: z.string(), facts: z.array(FactSchema).max(15) });
 
+/** Model calls per file at most: the tail of a file longer than this many chunks is left out. */
+const MAX_FILE_CHUNKS = 4;
+
+/** The file as the model reads it: whole when it fits, else cut where top-level symbols start (chunk.ts). */
+async function fileChunks(path: string, content: string): Promise<Chunk[]> {
+  if (content.length <= MAX_FILE_CHARS) return [{ text: content, lines: '' }];
+  const symbols = (await extract(langOf(path), content).catch(() => null))?.symbols ?? [];
+  const starts = symbols.filter((s) => s.kind !== 'method').map((s) => Number.parseInt(s.lines, 10));
+  return chunkBySymbols(content, starts, MAX_FILE_CHARS, MAX_FILE_CHUNKS);
+}
+
 export async function extractFileFacts(llm: LlmProvider, path: string, content: string): Promise<{ summary: string; facts: CodeFact[] }> {
-  // The file's text is the whole input: an agentic model gets an empty folder, not the worker's.
-  const raw = await askPromptOnly(llm, {
-    system: `You analyse one source file from a codebase. ${WHAT_TO_KEEP} At most 10 facts.`,
-    user: `FILE: ${path}\n\n${redactSecrets(content.slice(0, MAX_FILE_CHARS))}`,
-    schema: {
-      type: 'object',
-      required: ['summary', 'facts'],
-      properties: { summary: { type: 'string', description: 'One sentence: what this file is for' }, facts: { type: 'array', items: FACT_JSON } },
-    },
-    timeoutMs: 180_000,
-  });
-  const r = FileResult.parse(raw);
+  const chunks = await fileChunks(path, content);
   const clean = (f: CodeFact) => ({ ...f, statement: redactSecrets(f.statement), why: redactSecrets(f.why) });
-  return { summary: redactSecrets(r.summary), facts: r.facts.filter((f) => f.confidence >= MIN_CONFIDENCE).slice(0, 10).map((f) => clean({ ...f, path })) };
+  let summary = '';
+  const facts: CodeFact[] = [];
+  for (const [i, c] of chunks.entries()) {
+    const part = chunks.length > 1 ? ` (lines ${c.lines}, part ${i + 1} of ${chunks.length})` : '';
+    // The file's text is the whole input: an agentic model gets an empty folder, not the worker's.
+    const r = await askJson(llm, {
+      system: `You analyse one source file from a codebase${part ? ', one part at a time' : ''}. ${WHAT_TO_KEEP} At most 10 facts.`,
+      user: `FILE: ${path}${part}\n\n${redactSecrets(c.text)}`,
+      schema: {
+        type: 'object',
+        required: ['summary', 'facts'],
+        properties: { summary: { type: 'string', description: 'One sentence: what this file is for' }, facts: { type: 'array', items: FACT_JSON } },
+      },
+      timeoutMs: 180_000,
+    }, (raw) => FileResult.parse(raw), { promptOnly: true });
+    summary ||= r.summary;
+    facts.push(...r.facts.filter((f) => f.confidence >= MIN_CONFIDENCE).slice(0, 10).map((f) => clean({ ...f, path })));
+  }
+  return { summary: redactSecrets(summary), facts };
 }
 
 const AgenticResult = z.object({ facts: z.array(FactSchema).max(120) });
 
 export async function extractRepoFacts(llm: LlmProvider, repoPath: string, files: CodeFile[]): Promise<CodeFact[]> {
-  const raw = await llm.json({
+  // Agents sometimes answer with prose around (or instead of) the object: asked once more, strictly, before it counts.
+  const r = await askJson(llm, {
     system: `You analyse a whole codebase (your current directory, read-only). Explore it with your tools. ${WHAT_TO_KEEP}
 Return 20 to 80 facts. Every fact must cite the file it comes from (repo-relative), or '.' for project-wide facts.`,
     user: `Files in the repository:\n${files.map((f) => f.path).join('\n')}`,
     schema: { type: 'object', required: ['facts'], properties: { facts: { type: 'array', items: FACT_JSON } } },
     cwd: repoPath,
     timeoutMs: 30 * 60_000,
-  });
+  }, (raw) => AgenticResult.parse(raw));
   const known = new Set(files.map((f) => f.path));
-  return AgenticResult.parse(raw)
+  return r
     .facts.filter((f) => f.confidence >= MIN_CONFIDENCE)
     .map((f) => ({ ...f, path: known.has(f.path.replace(/^\.\//, '')) ? f.path.replace(/^\.\//, '') : '.' }));
 }
@@ -169,10 +224,16 @@ export type ScanDeps = {
   llm: LlmProvider;
   embed(texts: string[]): Promise<number[][]>;
   maxBytes: number;
-  maxFiles: number;
+  /** SCAN_MAX_FILES: changed files read per run (per-file models); null (unset): DEFAULT_SCAN_FILES. */
+  maxFiles: number | null;
+  /** Files the project's sessions edited, most recent first: listed (and so scanned) before the rest. */
+  touched?: (projectKey: string) => Promise<string[]>;
   log?: (msg: string, extra?: object) => void;
   activity?: Pick<ActivityStore, 'record'>;
 };
+
+/** Changed files a per-file scan reads per run when SCAN_MAX_FILES is unset; the rest wait for the next scan. */
+export const DEFAULT_SCAN_FILES = 400;
 
 const embedFacts = async (facts: CodeFact[], embed: ScanDeps['embed']) => {
   if (!facts.length) return [];
@@ -196,7 +257,9 @@ export async function runScan(job: ScanJob, d: ScanDeps): Promise<ScanResult> {
   await d.facts.updateScanJob(job.id, { status: 'running' });
   try {
     // List everything, so files beyond the per-run cap are never mistaken for removed ones.
-    const files = await listCodeFiles(job.repoPath, { maxBytes: d.maxBytes, maxFiles: LIST_LIMIT });
+    // Ranked (rank.ts), so a capped run reads the files sessions edited and the source first.
+    const touched = await d.touched?.(job.projectKey).catch(() => []);
+    const files = await listCodeFiles(job.repoPath, { maxBytes: d.maxBytes, maxFiles: LIST_LIMIT, priority: touched });
     const stored = await d.facts.fileHashes(job.projectKey);
     // Facts from another model are replaced wholesale: unchanged hashes do not mean this model has seen the files.
     const sources = await d.facts.currentSources(job.projectKey);
@@ -212,8 +275,9 @@ export async function runScan(job: ScanJob, d: ScanDeps): Promise<ScanResult> {
     await d.facts.markFilesRemoved(job.projectKey, removed);
     for (const p of removed) await note('facts_extracted', `facts closed for removed file ${p}`, 'the file is no longer in the project', {}, [fileId(p)]);
 
+    const perRun = d.maxFiles ?? DEFAULT_SCAN_FILES;
     let factsAdded = 0;
-    let scanned = changed.length;
+    let scanned = 0;
     const failed: string[] = [];
     if (changed.length && d.llm.agentic) {
       // Only package.json feeds the deterministic facts; a file gone since listing is simply skipped.
@@ -223,7 +287,10 @@ export async function runScan(job: ScanJob, d: ScanDeps): Promise<ScanResult> {
           return content === null ? null : { path: f.path, content };
         }),
       )).filter((c): c is { path: string; content: string } => c !== null);
-      const facts = [...(await extractRepoFacts(d.llm, job.repoPath, files)), ...deterministicFacts(contents)];
+      const modelFacts = await extractRepoFacts(d.llm, job.repoPath, files);
+      // What the model cited is what it read (as far as anyone can tell); the list it was shown is not coverage.
+      scanned = new Set(modelFacts.map((f) => f.path).filter((p) => p !== '.')).size;
+      const facts = [...modelFacts, ...deterministicFacts(contents)];
       await d.facts.replaceProjectFacts(job.projectKey, await embedFacts(facts, d.embed), d.llm.id, files, job.id);
       factsAdded = facts.length;
       await note('facts_extracted', `${plural(facts.length, 'fact')} from the whole repository`,
@@ -231,16 +298,23 @@ export async function runScan(job: ScanJob, d: ScanDeps): Promise<ScanResult> {
         { facts: factLog(facts), changedFiles: changed.map((f) => f.path) }, [...new Set(facts.map((f) => fileId(f.path || '.')))]);
     } else {
       let done = 0;
+      let timeoutsInRow = 0;
       // The cap bounds one run's model calls; the rest stay changed and are picked up next scan.
-      for (const f of changed.slice(0, d.maxFiles)) {
+      for (const f of changed.slice(0, perRun)) {
         let content: string;
         let extracted: Awaited<ReturnType<typeof extractFileFacts>>;
         try {
           content = await readFile(join(job.repoPath, f.path), 'utf8'); // may be gone since listing
           extracted = await extractFileFacts(d.llm, f.path, content);
+          timeoutsInRow = 0;
         } catch (err) {
           // The model could not be asked: every other file would fail the same way, so the whole scan waits.
           if (providerUnavailableReason(err)) throw err;
+          // A timeout is that file's failure, but a model timing out on file after file is stuck: the run fails as a
+          // counted attempt (files saved so far stay) rather than waiting out the timeout on every remaining file.
+          const timeout = modelTimeoutReason(err);
+          timeoutsInRow = timeout ? timeoutsInRow + 1 : 0;
+          if (timeout && timeoutsInRow >= MAX_TIMEOUTS_IN_ROW) throw new Error(`${MAX_TIMEOUTS_IN_ROW} files in a row timed out (last: ${f.path}): ${timeout}`);
           // Not saved, so its hash stays stale and the next scan tries it again.
           failed.push(f.path);
           await note('facts_extracted', `could not extract facts from ${f.path}`, String(err), { hash: f.hash }, [fileId(f.path)]);
@@ -259,8 +333,8 @@ export async function runScan(job: ScanJob, d: ScanDeps): Promise<ScanResult> {
         d.log?.('scanned file', { project: job.projectKey, path: f.path, facts: all.length });
       }
     }
-    if (!d.llm.agentic) scanned = Math.min(changed.length, d.maxFiles) - failed.length;
-    const result: ScanResult = { filesScanned: scanned, factsAdded, failed: failed.length, remaining: d.llm.agentic ? 0 : Math.max(0, changed.length - d.maxFiles) };
+    if (!d.llm.agentic) scanned = Math.min(changed.length, perRun) - failed.length;
+    const result: ScanResult = { filesScanned: scanned, factsAdded, failed: failed.length, remaining: d.llm.agentic ? 0 : Math.max(0, changed.length - perRun) };
     await d.facts.updateScanJob(job.id, {
       status: 'done', filesScanned: result.filesScanned, factsAdded,
       ...(failed.length ? { error: `${plural(failed.length, 'file')} failed: ${failed.slice(0, 10).join(', ')}` } : {}),

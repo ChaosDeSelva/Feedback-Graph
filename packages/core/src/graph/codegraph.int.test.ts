@@ -89,8 +89,30 @@ describeStores('CodeGraphStore', (h) => {
     expect(m.imports.toSorted((a, b) => `${a.from} ${a.to}`.localeCompare(`${b.from} ${b.to}`))).toEqual(
       codeMap().imports.toSorted((a, b) => `${a.from} ${a.to}`.localeCompare(`${b.from} ${b.to}`)),
     );
-    expect(await store.codegraph.codeMapMeta('demo')).toEqual({ fingerprint: 'head:abc', builtAt: m.builtAt, stats });
+    expect(await store.codegraph.codeMapMeta('demo')).toEqual({ fingerprint: 'head:abc', builtAt: m.builtAt, stats, candidates: null });
     expect(await store.codegraph.codeMap('other')).toBeNull();
+  });
+
+  test('a capped map keeps how many files were worth mapping, never fewer than it holds', async () => {
+    await store.codegraph.replaceCodeMap('demo', codeMap({ candidates: 10_290 }));
+    expect((await store.codegraph.codeMapMeta('demo'))?.candidates).toBe(10_290);
+    expect((await store.codegraph.codeMap('demo'))?.candidates).toBe(10_290);
+    await store.codegraph.replaceCodeMap('demo', codeMap({ candidates: 2 }));
+    expect((await store.codegraph.codeMapMeta('demo'))?.candidates).toBe(6);
+    await store.codegraph.replaceCodeMap('demo', codeMap());
+    expect((await store.codegraph.codeMapMeta('demo'))?.candidates).toBeNull();
+  });
+
+  test('editedPaths: the files the project\'s sessions edited, most recently edited first; reads and other projects left out', async () => {
+    const a = session('s-a', [edit('src/db.ts', '2026-10-01T10:03:00Z'), { name: 'Read', ts: '2026-10-01T10:00:00Z', filePath: `${HOST}/src/cli.ts` }]);
+    const b = session('s-b', [edit('src/api.ts', '2026-10-02T10:03:00Z'), edit('src/db.ts', '2026-09-01T10:03:00Z')]);
+    for (const s of [a, b]) {
+      await store.graph.upsertSession(demo, s, []);
+      await store.codegraph.recordSessionFiles(s.sessionId, sessionFiles(s, HOST));
+    }
+    expect(await store.codegraph.editedPaths('demo', 10)).toEqual(['src/api.ts', 'src/db.ts']);
+    expect(await store.codegraph.editedPaths('demo', 1)).toEqual(['src/api.ts']);
+    expect(await store.codegraph.editedPaths('other', 10)).toEqual([]);
   });
 
   test('a new map replaces the old one: removed files, symbols and edges are gone', async () => {

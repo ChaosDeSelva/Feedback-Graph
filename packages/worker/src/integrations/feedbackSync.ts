@@ -1,5 +1,5 @@
 import {
-  githubRepoOfRemote, integrationErrorKind, IntegrationError, redactSecrets,
+  authorKindOf, githubRepoOfRemote, integrationErrorKind, IntegrationError, redactSecrets,
   type ActivityStore, type Credential, type DocsStore, type ExternalRef, type ExternalThread, type FetchPrOpts, type GraphStore,
   type IntegrationKind, type Integrations, type IntegrationSyncState, type LinearComment, type PrContext, type Project, type WorkSession,
 } from '@fb/core';
@@ -30,6 +30,9 @@ export type FeedbackSyncDeps = {
   activity?: Pick<ActivityStore, 'record'>;
   minIntervalMs: number;
   lookbackDays?: number;
+  /** GITHUB_BOT_LOGINS and GITHUB_AGENT_LOGINS (lower-cased): who counts as a bot or an AI agent besides the markers. */
+  botLogins?: string[];
+  agentLogins?: string[];
   now?: () => Date;
   log?: (msg: string, extra?: object) => void;
 };
@@ -52,10 +55,19 @@ export function githubTarget(p: SyncProject, override?: Map<string, string>): st
 /** A session that edited files or committed; one that only read (a review, a question) never did the work. */
 const didWork = (s: WorkSession) => s.edits + s.commits > 0;
 
+/** Branches a session may have started on before it made the work's branch. */
+const DEFAULT_BRANCHES = new Set(['main', 'master', 'develop', 'dev', 'trunk']);
+
+/**
+ * Whether a session found by time alone can have done the work on `branch`: not when it ran on another feature branch.
+ * A session with no branch recorded, or on a default branch (it may have created the work's branch), can.
+ */
+const mayBeOnBranch = (s: WorkSession, branch: string | null) => !branch || !s.gitBranch || s.gitBranch === branch || DEFAULT_BRANCHES.has(s.gitBranch);
+
 /**
  * The agent sessions that most likely did the work: those of the project on the work's branch that edited files or
  * committed before the comment, most edits first; with none, the one session that did work in the two days before it
- * (several: none, rather than a wrong one). The store already leaves read-only sessions out; checked again here.
+ * (several, or one on another feature branch: none, rather than a wrong one). The store already leaves read-only sessions out; checked again here.
  */
 export async function findWorkSessions(graph: Pick<GraphStore, 'workSessions'>, projectKey: string, branch: string | null, before: string): Promise<WorkSession[]> {
   if (branch) {
@@ -64,7 +76,7 @@ export async function findWorkSessions(graph: Pick<GraphStore, 'workSessions'>, 
   }
   const after = new Date(Date.parse(before) - WINDOW_MS).toISOString();
   const near = (await graph.workSessions({ projectKey, branch: null, before, after, limit: 2 })).filter(didWork);
-  return near.length === 1 ? near : [];
+  return near.length === 1 && mayBeOnBranch(near[0], branch) ? near : [];
 }
 
 export async function linkWorkSessions(graph: Pick<GraphStore, 'workSessions'>, projectKey: string, branch: string | null, before: string): Promise<string[]> {
@@ -86,8 +98,17 @@ const field = (text: string | null | undefined): string | null => (text?.trim() 
 const description = (text: string | null | undefined): string | null => (text?.trim() ? clip(redactSecrets(text.trim()), DESCRIPTION_CAP) : null);
 
 /** A PR's comments as a thread: indexes follow creation order over all of them, so they stay put between syncs. */
-export function prThread(pr: PrContext, floorMs: number, linked: string[]): ExternalThread {
+export type AuthorLogins = Pick<FeedbackSyncDeps, 'botLogins' | 'agentLogins'>;
+
+/** The comment's author kind; the login lists are GitHub's and apply to GitHub logins only (authorKindOf). */
+function author(source: 'github' | 'linear', login: string, body: string, logins: AuthorLogins): Pick<ExternalRef, 'authorKind' | 'authorVerified'> {
+  const a = authorKindOf({ source, login, body, botLogins: logins.botLogins, agentLogins: logins.agentLogins });
+  return { authorKind: a.kind, authorVerified: a.verified };
+}
+
+export function prThread(pr: PrContext, floorMs: number, linked: string[], logins: AuthorLogins = {}): ExternalThread {
   const ordered = [...pr.comments].filter((c) => c.createdAt).sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+  const authorOf = new Map(pr.comments.map((c) => [c.id, c.author]));
   const header = `PR ${pr.repo}#${pr.number} "${pr.title}" by ${pr.author} (${pr.state}${pr.headBranch ? `, branch ${pr.headBranch}` : ''})`;
   const body = description(pr.body);
   return {
@@ -100,6 +121,7 @@ export function prThread(pr: PrContext, floorMs: number, linked: string[]): Exte
         source: 'github', kind: c.kind, author: c.author, url: c.url, thread: `${pr.repo}#${pr.number}`, title: pr.title, threadUrl: pr.url,
         path: c.path, line: c.line, diffHunk: c.diffHunk, branch: pr.headBranch, createdAt: c.createdAt, linkedSessionIds: linked,
         description: body,
+        ...author('github', c.author, c.body, logins), threadAuthor: pr.author, isReply: !!c.inReplyTo, repliesTo: c.inReplyTo ? authorOf.get(c.inReplyTo) ?? null : null, reviewState: c.reviewState ?? null,
       };
       return [{ uuid: `github:${pr.repo}#${pr.number}/${c.kind}/${c.id}`, ts: c.createdAt, index: i + 1, text: c.body, context: clip(`${header}${where}`), external }];
     }),
@@ -107,7 +129,7 @@ export function prThread(pr: PrContext, floorMs: number, linked: string[]): Exte
 }
 
 /** One Linear issue's comments as a thread, each carrying the ticket: its description, state, priority, labels, assignee. */
-export function linearThread(comments: LinearComment[], floorMs: number, linked: string[]): ExternalThread {
+export function linearThread(comments: LinearComment[], floorMs: number, linked: string[], logins: AuthorLogins = {}): ExternalThread {
   const ordered = [...comments].sort((a, b) => a.createdAt.localeCompare(b.createdAt));
   const issue = ordered[0].issue;
   const body = description(issue.description);
@@ -125,7 +147,7 @@ export function linearThread(comments: LinearComment[], floorMs: number, linked:
       const external: ExternalRef = {
         source: 'linear', kind: 'linear_comment', author: c.author, url: c.url, thread: issue.identifier, title: issue.title, threadUrl: issue.url,
         path: null, line: null, diffHunk: null, branch: issue.branch, createdAt: c.createdAt, linkedSessionIds: linked,
-        description: body, ticket,
+        description: body, ticket, ...author('linear', c.author, c.body, logins),
       };
       return [{ uuid: `linear:${issue.identifier}/${c.id}`, ts: c.createdAt, index: i + 1, text: c.body, context: `Linear ${issue.identifier} "${issue.title}"`, external }];
     }),
@@ -217,7 +239,7 @@ async function syncRepo(p: SyncProject, repo: string, token: string, since: stri
     if (!fresh.length) continue;
     const latest = fresh.map((c) => c.createdAt).sort().at(-1)!;
     const linked = await linkWorkSessions(d.graph, p.key, pr.headBranch, latest);
-    const n = await d.graph.upsertExternalThread(p, prThread(pr, floorMs, linked));
+    const n = await d.graph.upsertExternalThread(p, prThread(pr, floorMs, linked, d));
     added += n;
     if (n) threads++;
   }
@@ -235,7 +257,7 @@ async function syncTeam(p: SyncProject, teamId: string, teamName: string, apiKey
     if (!fresh.length) continue;
     const latest = fresh.map((c) => c.createdAt).sort().at(-1)!;
     const linked = await linkWorkSessions(d.graph, p.key, list[0].issue.branch, latest);
-    const n = await d.graph.upsertExternalThread(p, linearThread(list, floorMs, linked));
+    const n = await d.graph.upsertExternalThread(p, linearThread(list, floorMs, linked, d));
     added += n;
     if (n) threads++;
   }

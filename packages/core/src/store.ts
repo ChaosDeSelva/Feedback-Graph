@@ -18,8 +18,10 @@ import type { ActivityInput, Activity, ActivityKind, Candidate, Classification, 
 import type { ProjectScope, ProjectSelection } from './scope.ts';
 import type { CandidateDetail, CandidateFilter, ClassifiableTurn, StatsRow } from './graph/repo.ts';
 import type { LessonDetail, LessonHit, LessonInput, LessonPatch, RelatedMiss } from './graph/knowledge.ts';
-import type { EmbeddedFact, FactHit, StoredFact } from './graph/facts.ts';
-import type { DocHit, DocInput, DocSummary } from './graph/docs.ts';
+import type { EmbeddedFact, FactHit, RelevanceUpdate, StoredFact, UnscoredFact } from './graph/facts.ts';
+import type { DocHit, DocInput, DocSummary, DocToRead, UpsertDocOpts } from './graph/docs.ts';
+import type { TaskImage } from './llm/providers.ts';
+import type { DetectedLink, LinkPatch, ProjectLink } from './graph/links.ts';
 import type { EvidenceGraph, PatternReport } from './graph/insights.ts';
 import type { ExportBundle } from './graph/portability.ts';
 import type { CandidateSnapshot } from './graph/selection.ts';
@@ -103,6 +105,8 @@ export interface GraphStore {
 /** Post-mortems (feedback, miss, cause, lesson, context items, fix commits), lessons and their search. */
 export interface KnowledgeStore {
   feedbackNeedingPostmortem(limit: number, now?: Date): Promise<PostMortemInput[]>;
+  /** How many still wait for a post-mortem: not rejected, none yet, not given up (those backing off count). */
+  postmortemBacklog?(): Promise<number>;
   recordPostmortemFailure(feedbackId: string, error: string, now?: Date): Promise<{ attempts: number; retryAt: string | null }>;
   retryPostmortem(feedbackId: string): Promise<boolean>;
   savePostmortem(feedbackId: string, raw: PostMortem, embeddings: { miss: number[]; lesson: number[] }): Promise<void>;
@@ -112,7 +116,8 @@ export interface KnowledgeStore {
    */
   listLessons(f: { status?: LessonStatus; projectKey?: string; projectKeys?: string[]; limit?: number }): Promise<Lesson[]>;
   lessonDetail(id: string): Promise<LessonDetail | null>;
-  updateLesson(id: string, patch: LessonPatch, o: { reembed?: number[] }): Promise<{ unscoped: boolean }>;
+  /** `by`: who decides, when the patch sets a status ('you' when unset; `operator:<name>` for the operator token). */
+  updateLesson(id: string, patch: LessonPatch, o: { reembed?: number[]; by?: string }): Promise<{ unscoped: boolean }>;
   searchLessons(q: { embedding: number[]; projectKey: string | null; k: number; status?: LessonStatus; projectKeys?: string[] }): Promise<LessonHit[]>;
   relatedMisses(q: { embedding: number[]; projectKey: string | null; k: number }): Promise<RelatedMiss[]>;
   /**
@@ -135,10 +140,14 @@ export interface FactsStore {
   currentSources(projectKey: string): Promise<string[]>;
   listFacts(q: { projectKey: string; kind?: FactKind; path?: string; limit?: number }): Promise<StoredFact[]>;
   searchFacts(q: { embedding: number[]; projectKey: string; k: number }): Promise<FactHit[]>;
+  /** Current facts of these projects that have no relevance yet, oldest path first. */
+  unscoredFacts(q: { projectKeys: string[]; limit: number }): Promise<UnscoredFact[]>;
+  /** Set relevance (clamped to 0..1). A 'model' update skips facts you scored. Returns how many facts changed. */
+  setFactRelevance(updates: RelevanceUpdate[]): Promise<number>;
   requestScan(project: Project, provider: string | null): Promise<ScanJob>;
   scanJob(id: string): Promise<ScanJob | null>;
-  /** The oldest queued job that is due (its retryAt, if any, has passed). */
-  nextScanJob(now?: Date): Promise<ScanJob | null>;
+  /** The oldest queued job that is due (its retryAt, if any, has passed), other than the `exclude` ids. */
+  nextScanJob(now?: Date, exclude?: string[]): Promise<ScanJob | null>;
   /**
    * A run that did not finish. `counted` (a real failure): one more attempt, queued again after scanRetryAt, or
    * failed for good after MAX_SCAN_ATTEMPTS. Not counted (the model could not be asked): queued again after
@@ -148,16 +157,52 @@ export interface FactsStore {
   updateScanJob(id: string, patch: Partial<Pick<ScanJob, 'filesScanned' | 'factsAdded' | 'error'>> & { status?: ScanStatus }): Promise<void>;
   requeueStaleScans(): Promise<void>;
   listProjects(): Promise<ProjectSummary[]>;
+  /** Pin or unpin. A folder with no data yet is recorded as a project (its name and path kept if it had them). */
+  setPinned(project: Project, pinned: boolean): Promise<void>;
 }
 
 /** Documents that are not code (uploads, PR discussions, tickets) as embedded chunks, and integration sync cursors. */
 export interface DocsStore {
-  upsertDoc(input: DocInput, raw: { text: string; embedding: number[] }[]): Promise<string>;
+  /** Insert or replace; a replaced document loses what was read from it (its facts, its image) and is read again if `read`. */
+  upsertDoc(input: DocInput, raw: { text: string; embedding: number[] }[], o?: UpsertDocOpts): Promise<string>;
+  /** The oldest upload waiting to be read whose retryAt (if any) has passed. */
+  nextDocToRead(now?: Date): Promise<DocToRead | null>;
+  /** version: only if it is still that upload. False when it was replaced (or is gone). */
+  markDocReading(id: string, version?: string): Promise<boolean>;
+  /**
+   * What the reader made of it: its facts (filed under the project, path = the document's name, never closed by a code
+   * scan) replace earlier ones, and `chunks`, when given (an image's description), replace its excerpts. Redacted here.
+   */
+  saveDocReading(id: string, r: { version?: string; chunks?: { text: string; embedding: number[] }[]; facts: EmbeddedFact[]; source: string }): Promise<boolean>;
+  /**
+   * Like recordScanFailure: counted failures back off and give up after MAX_SCAN_ATTEMPTS; uncounted ones just wait.
+   * final: give up now (retrying cannot help, e.g. an image for a model with no vision). version: only if it is still
+   * that upload; null when it was replaced, so a failure of the old version never marks the new one.
+   */
+  recordDocFailure(id: string, error: string, o: { counted: boolean; final?: boolean; version?: string }, now?: Date): Promise<{ attempts: number; retryAt: string | null } | null>;
+  /** Readings left running by a worker that died go back to pending (on startup). */
+  requeueStaleDocs(): Promise<void>;
+  docImage(id: string): Promise<TaskImage | null>;
   listDocs(projectKey: string): Promise<DocSummary[]>;
   deleteDoc(id: string): Promise<boolean>;
   searchDocs(q: { embedding: number[]; projectKey: string; k: number }): Promise<DocHit[]>;
   getCursor(key: string): Promise<string | null>;
   setCursor(key: string, value: string): Promise<void>;
+}
+
+/** Links between projects: suggested by the worker's evidence, confirmed or dismissed by you, made by hand. */
+export interface LinksStore {
+  /** projectKey: links with it at either end. projectKeys: links with both ends in it (an empty list finds none). */
+  listLinks(q: { projectKey?: string; projectKeys?: string[] }): Promise<ProjectLink[]>;
+  /**
+   * One detection round over the `scanned` projects. New pairs become suggestions; a suggestion gets the new relation,
+   * score and evidence; a link you decided keeps its status, relation and note and only gets fresh evidence. A
+   * suggestion between scanned projects that this round did not find again is dropped. Returns how many are new.
+   */
+  replaceDetected(scanned: string[], found: DetectedLink[]): Promise<number>;
+  /** Your decision or edit; creates the link (confirmed, by you) when there is none. Throws for a project and itself. */
+  setLink(x: string, y: string, patch: LinkPatch): Promise<ProjectLink>;
+  deleteLink(id: string): Promise<boolean>;
 }
 
 /** The provenance log: append-only, newest first. */
@@ -225,6 +270,8 @@ export interface CodeGraphStore {
   /** Replace the files a session touched (paths already repo-relative, see sessionFiles()). Unknown session: no-op. */
   recordSessionFiles(sessionId: string, files: SessionFile[]): Promise<void>;
   sessionFiles(sessionId: string): Promise<SessionFile[]>;
+  /** Paths the project's sessions edited, most recently edited first (then path), at most `limit`. */
+  editedPaths(projectKey: string, limit: number): Promise<string[]>;
   /** A mapped file with its symbols, importers, imports, tests, facts, misses and approved lessons; null if not mapped. */
   moduleContext(projectKey: string, path: string): Promise<ModuleContext | null>;
   /** What changing these files touches: dependents up to `depth`, tests to run, misses and lessons on them. */
@@ -266,6 +313,7 @@ export interface Store {
   readonly knowledge: KnowledgeStore;
   readonly facts: FactsStore;
   readonly docs: DocsStore;
+  readonly links: LinksStore;
   readonly activity: ActivityStore;
   readonly insights: InsightsStore;
   readonly portability: PortabilityStore;

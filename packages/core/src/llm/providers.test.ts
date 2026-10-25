@@ -1,5 +1,6 @@
 import { expect, test } from 'vitest';
 import { makeProvider, makeProviderOr, strictSchema, type Exec } from './providers.ts';
+import { ModelOutputError } from './json.ts';
 
 const schema = { type: 'object', properties: { answer: { type: 'string' }, n: { type: 'number' } }, required: ['answer'] };
 const task = { system: 'S', user: 'U', schema };
@@ -96,6 +97,29 @@ test('codex-cli provider runs codex exec read-only with a strict output schema',
   expect(calls[0].cmd).toBe('codex');
   expect(a.slice(0, 1)).toEqual(['exec']);
   expect(a).toEqual(expect.arrayContaining(['-s', 'read-only', '-C', '--skip-git-repo-check', '--ephemeral', '--output-schema']));
+});
+
+test('answers wrapped in prose or fences are read with the shared extractor; none at all is a ModelOutputError with the tail', async () => {
+  const codexWrites = (text: string): Exec => async (_cmd, args) => {
+    const { writeFile } = await import('node:fs/promises');
+    await writeFile(args[args.indexOf('-o') + 1], text);
+    return { code: 0, stdout: '', stderr: '' };
+  };
+  // What a codex scan wrote around its object, with a stray brace in the prose after it.
+  const prose = 'I explored the repo. Draft {"answer":"old"} replaced by:\n{"answer":"x","n":2}\nand first literal } marker and';
+  expect(await makeProvider('codex-cli', CODEX_OK, { exec: codexWrites(prose) }).json({ ...task, cwd: '/vibe/demo' })).toEqual({ answer: 'x', n: 2 });
+  const err = await makeProvider('codex-cli', CODEX_OK, { exec: codexWrites('I could not decide, marker and') }).json({ ...task, cwd: '/vibe/demo' }).catch((e: unknown) => e);
+  expect(err).toBeInstanceOf(ModelOutputError);
+  expect((err as Error).message).toMatch(/marker and/);
+
+  const fetchImpl = (async () => Response.json({ choices: [{ message: { content: 'Sure!\n```json\n{"answer":"ok"}\n```' } }] })) as unknown as typeof fetch;
+  expect(await makeProvider('openai:gpt', { OPENAI_API_KEY: 'k' }, { fetchImpl }).json(task)).toEqual({ answer: 'ok' });
+
+  const claude = (stdout: string): Exec => async () => ({ code: 0, stdout, stderr: '' });
+  expect(await makeProvider('claude-cli', { CLAUDE_CODE_OAUTH_TOKEN: 't' }, { exec: claude(JSON.stringify({ result: 'Here it is: {"answer":"c"}' })) }).json(task)).toEqual({ answer: 'c' });
+  const noEnvelope = await makeProvider('claude-cli', { CLAUDE_CODE_OAUTH_TOKEN: 't' }, { exec: claude('warning: something odd') }).json(task).catch((e: unknown) => e);
+  expect(noEnvelope).toBeInstanceOf(ModelOutputError);
+  expect((noEnvelope as Error).message).toMatch(/something odd/);
 });
 
 test('CLI providers get only the env they need, never other keys or the graph password', async () => {
@@ -261,4 +285,54 @@ test('codex-cli refuses to run unless the owner accepts that it can read everyth
   expect(() => makeProvider('codex-cli', { ALLOW_UNCONFINED_CODEX: 'yes' })).toThrow(/ALLOW_UNCONFINED_CODEX=1/);
   expect(() => makeProvider('codex-cli:gpt-5', {})).toThrow(/\/transcripts/);
   expect(makeProvider('codex-cli', CODEX_OK).id).toBe('codex-cli');
+});
+
+const image = { mediaType: 'image/png' as const, data: Buffer.from('fake png bytes').toString('base64') };
+const seeTask = { ...task, images: [image] };
+
+test('vision: ollama sends the images with the user message', async () => {
+  let body: any;
+  const fetchImpl = (async (_u: string, init: RequestInit) => { body = JSON.parse(init.body as string); return Response.json({ message: { content: '{"answer":"a"}' } }); }) as unknown as typeof fetch;
+  const p = makeProvider('ollama:gemma4', { OLLAMA_URL: 'http://o' }, { fetchImpl });
+  expect(p.vision).toBe(true);
+  await p.json(seeTask);
+  expect(body.messages[1]).toEqual({ role: 'user', content: 'U', images: [image.data] });
+});
+
+test('vision: openai-compatible sends a data URL image part, anthropic an image block', async () => {
+  let body: any;
+  const fetchImpl = (async (_u: string, init: RequestInit) => {
+    body = JSON.parse(init.body as string);
+    return body.messages?.[0]?.role === 'system' ? Response.json({ choices: [{ message: { content: '{"answer":"x"}' } }] }) : Response.json({ content: [{ type: 'tool_use', input: { answer: 'x' } }] });
+  }) as unknown as typeof fetch;
+  await makeProvider('openai:gpt-5.1', { OPENAI_API_KEY: 'k' }, { fetchImpl }).json(seeTask);
+  expect(body.messages[1].content).toEqual([{ type: 'text', text: 'U' }, { type: 'image_url', image_url: { url: `data:image/png;base64,${image.data}` } }]);
+  await makeProvider('anthropic:claude-sonnet-5-5', { ANTHROPIC_API_KEY: 'k' }, { fetchImpl }).json(seeTask);
+  expect(body.messages[0].content).toEqual([{ type: 'image', source: { type: 'base64', media_type: 'image/png', data: image.data } }, { type: 'text', text: 'U' }]);
+});
+
+test('vision: claude-cli reads the image from a fresh folder holding only it, never the given cwd, removed afterwards', async () => {
+  const { readdirSync, readFileSync, existsSync } = await import('node:fs');
+  let seen: { cwd: string; files: string[]; bytes: string; stdin: string } | null = null;
+  const exec: Exec = async (_cmd, _args, o) => {
+    seen = { cwd: o.cwd!, files: readdirSync(o.cwd!), bytes: readFileSync(`${o.cwd}/image-1.png`, 'utf8'), stdin: o.stdin ?? '' };
+    return { code: 0, stdout: JSON.stringify({ structured_output: { answer: 'a' } }), stderr: '' };
+  };
+  const p = makeProvider('claude-cli', { CLAUDE_CODE_OAUTH_TOKEN: 't' }, { exec });
+  expect(p.vision).toBe(true);
+  await p.json({ ...seeTask, cwd: '/vibe/some-repo' });
+  expect(seen!.cwd).not.toBe('/vibe/some-repo');
+  expect(seen!.files).toEqual(['image-1.png']);
+  expect(seen!.bytes).toBe('fake png bytes');
+  expect(seen!.stdin).toMatch(/image-1\.png/);
+  expect(existsSync(seen!.cwd)).toBe(false);
+});
+
+test('vision: providers that cannot read images say so instead of answering without them', async () => {
+  const exec: Exec = async () => ({ code: 0, stdout: '{}', stderr: '' });
+  for (const spec of ['codex-cli', 'jev']) {
+    const p = makeProvider(spec, { ...CODEX_OK, TYPESAFE_API_KEY: 'k' }, { exec });
+    expect(p.vision).toBe(false);
+    await expect(p.json(seeTask)).rejects.toThrow(/cannot read images/);
+  }
 });

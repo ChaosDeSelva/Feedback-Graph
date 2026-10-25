@@ -6,6 +6,7 @@ import { EmbeddingsRepo } from './embeddings.ts';
 import { FactsRepo } from './facts.ts';
 import { InsightsRepo } from './insights.ts';
 import { KnowledgeRepo } from './knowledge.ts';
+import { LinksRepo } from './links.ts';
 import { PortabilityRepo } from './portability.ts';
 import { GraphRepo } from './repo.ts';
 import { SelectionRepo } from './selection.ts';
@@ -21,6 +22,7 @@ export function neo4jStore(g: GraphRepo): Store {
     knowledge: new KnowledgeRepo(g),
     facts: new FactsRepo(g),
     docs: new DocsRepo(g),
+    links: new LinksRepo(g),
     activity: new ActivityRepo(g),
     insights: new InsightsRepo(g),
     portability: new PortabilityRepo(g),

@@ -1,6 +1,6 @@
 import type { HumanTurn, PostMortemInput } from '@fb/core';
 import { expect, test } from 'vitest';
-import { buildPrompt, markAvailability } from './postmortem.ts';
+import { buildPrompt, markAvailability, runPostMortem } from './postmortem.ts';
 
 const turn = (i: number, text: string, extra: Partial<HumanTurn> = {}): HumanTurn => ({
   uuid: `t${i}`, sessionId: 's1', ts: `2026-10-01T10:0${i}:00Z`, index: i, text,
@@ -90,4 +90,40 @@ test('untrusted text cannot open a section of its own: descriptions, ticket fiel
   // The fences appear once each: the text cannot close them early.
   expect(p.match(/^--- end of untrusted description ---$/gm)).toHaveLength(1);
   expect(p.match(/^--- end of comment ---$/gm)).toHaveLength(1);
+});
+
+const answer = (paths: string[], scope = 'project') => ({
+  taskTitle: 'Customer search', missed: 'filters in memory', cause: 'implementation_error', causeExplanation: 'x', outcome: 'unknown',
+  lesson: { title: 'Filter in SQL', rule: 'Filter customer search rows in the SQL query in api/search.ts', appliesWhen: 'changing customer search', scope, paths },
+  contextItems: [],
+});
+const llm = (paths: string[]) => ({ id: 'fake', agentic: false, json: async () => answer(paths) });
+
+test('with no work session, a lesson never takes paths from anywhere but the comment: its file, else the paths it names', async () => {
+  const deps = { standing: async () => [], facts: async () => [], touched: async () => ({ edited: ['src/settings/users.ts'], fixed: [] }) };
+  const onFile = await runPostMortem({ ...base, work: null }, { ...deps, llm: llm(['src/settings/users/**']) });
+  expect(onFile.lesson.paths).toEqual(['api/search.ts']);
+  const noFile = { ...base, work: null, feedback: { ...base.feedback, text: 'api/search.ts filters in memory', external: { ...ext(1, 'lead'), path: null, diffHunk: null } } };
+  expect((await runPostMortem(noFile, { ...deps, llm: llm(['api/search.ts', '~/.config/acme/settings.json', 'src/settings/**']) })).lesson.paths).toEqual(['api/search.ts']);
+  expect((await runPostMortem(noFile, { ...deps, llm: llm(['src/settings/**']) })).lesson.paths).toEqual([]);
+});
+
+test('the prompt without a work session says not to borrow paths or scope from any session', () => {
+  expect(buildPrompt({ ...base, work: null }, [], { agentic: false, facts: [] })).toMatch(/do not take paths or scope from any session/i);
+});
+
+test('the lesson check runs on every post-mortem: a universal rule from an approving nit is narrowed and flagged in the trace', async () => {
+  const nit = { ...base, work: null, feedback: { ...base.feedback, text: 'nit: rename this', external: { ...ext(1, 'lead'), reviewState: 'APPROVED' as const } } };
+  const r = await runPostMortem(nit, {
+    standing: async () => [], facts: async () => [],
+    llm: { id: 'fake', agentic: false, json: async () => ({ ...answer([]), lesson: { ...answer([]).lesson, rule: 'Always rename variables reviewers mention', scope: 'global' } }) },
+  });
+  expect(r.lesson.scope).toBe('task');
+  expect(r.trace.lessonFlags.map((f) => f.name)).toEqual(['universal-from-nit']);
+});
+
+test('the prompt asks for a falsifiable, scoped lesson and no rules about how to treat feedback', () => {
+  const p = buildPrompt({ ...base, work: null }, [], { agentic: false, facts: [] });
+  expect(p).toMatch(/falsifiable/);
+  expect(p).toMatch(/one reviewer's nit/);
 });

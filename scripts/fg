@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# fg: drive Feedback Graph from a terminal or an agent (status, projects, scans, Inbox, lessons, cloud sync).
+#   ./scripts/fg --help
+#   ./scripts/fg status --watch
+#   ./scripts/fg projects select --key acme,demo-shop
+#   ./scripts/fg scan --all
+#   ./scripts/fg inbox list ; ./scripts/fg inbox reject <id> --reason "bot comment"
+#
+# Owner decisions need FG_OPERATOR_TOKEN (from the environment, else .env); the API allows only the verbs OPERATOR_ALLOW
+# names (by default not deciding lessons, deleting data, importing or integration keys). The token is passed to the CLI in its environment, never printed.
+# Runs packages/api/src/cli.ts with the host's Node (22.18+ or 23.6+, which run TypeScript natively); without one, inside
+# the api container (docker compose exec api node src/cli.ts ...), which has the same settings from .env.
+set -euo pipefail
+
+here="$(cd "$(dirname "$0")/.." && pwd)"
+env_file="${FEEDBACK_GRAPH_ENV:-$here/.env}"
+# KEY's value: the environment's when set, else the last KEY= line of the env file, surrounding quotes removed.
+setting() {
+  local v
+  v="$(printenv "$1" 2>/dev/null || true)"
+  if [ -z "$v" ] && [ -f "$env_file" ]; then
+    v="$(grep -E "^$1=" "$env_file" | tail -n 1 | cut -d= -f2- | sed -e "s/^[\"']//" -e "s/[\"']\$//" || true)"
+  fi
+  printf '%s' "$v"
+}
+
+native_ts() {
+  command -v node >/dev/null 2>&1 &&
+    node -e 'const [a,b]=process.versions.node.split(".").map(Number);process.exit(a>23||(a===23&&b>=6)||(a===22&&b>=18)?0:1)' 2>/dev/null
+}
+
+if native_ts; then
+  if [ -z "${FEEDBACK_GRAPH_URL:-}" ]; then
+    port="$(setting API_PORT)"
+    export FEEDBACK_GRAPH_URL="http://localhost:${port:-8787}"
+  fi
+  FG_OPERATOR_TOKEN="$(setting FG_OPERATOR_TOKEN)" API_TOKEN="$(setting API_TOKEN)" \
+    exec node "$here/packages/api/src/cli.ts" "$@"
+fi
+
+if command -v docker >/dev/null 2>&1; then
+  # Inside the container the API is on localhost:8787 and FG_OPERATOR_TOKEN comes from compose (.env).
+  exec docker compose --project-directory "$here" exec -T ${FG_OPERATOR_NAME:+-e FG_OPERATOR_NAME="$FG_OPERATOR_NAME"} api node src/cli.ts "$@"
+fi
+
+echo "fg needs Node 22.18+ (or 23.6+) on the host, or docker to run it inside the api container" >&2
+exit 1

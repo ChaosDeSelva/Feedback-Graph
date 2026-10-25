@@ -48,10 +48,12 @@ test('status says which model is unavailable and why, and how many turns the cla
   const app = createApp(repo, { system: { version: '0.2.0', ping: async () => true, worker: async () => w, givenUpTurns: async () => 7 } });
   const s = await (await app.request('/api/status')).json();
   expect(s.models).toEqual({
-    classify: { provider: 'ollama:gemma4', ok: false, reason: 'model not found (ollama 404)' },
+    classify: { provider: 'ollama:gemma4', ok: false, reason: 'model not found (ollama 404)', since: 't', checkedAt: 't' },
     postmortem: { provider: 'claude-cli', ok: true, reason: null },
     scan: { provider: 'ollama:gemma4', ok: true, reason: null },
     summary: { provider: null, ok: true, reason: null },
+    // A worker from before the docs reader does not report one: unknown, not broken.
+    docs: { provider: null, ok: true, reason: null },
   });
   expect(s.givenUpTurns).toBe(7);
 });
@@ -76,6 +78,7 @@ test('status reports whether Ollama answers; an Ollama job is unavailable while 
     postmortem: { provider: 'claude-cli', ok: true, reason: null },
     scan: { provider: 'ollama:gemma4', ok: false, reason: down.reason },
     summary: { provider: null, ok: true, reason: null },
+    docs: { provider: null, ok: true, reason: null },
   });
   const up = createApp(repo, { system: { version: '0.2.0', ping: async () => true, worker: async () => w, ollama: async () => ({ ...down, ok: true, reason: null }) } });
   const u = await (await up.request('/api/status')).json();
@@ -93,7 +96,7 @@ test('status lists the summary model: its health, paused when it cannot be built
     providers: { classify: 'ollama:gemma4', summary: 'claude-cli' },
     health: { summary: { provider: 'claude-cli', ok: false, reason: 'claude is not signed in', at: 't' } },
   });
-  expect(down.summary).toEqual({ provider: 'claude-cli', ok: false, reason: 'claude is not signed in' });
+  expect(down.summary).toEqual({ provider: 'claude-cli', ok: false, reason: 'claude is not signed in', since: 't', checkedAt: 't' });
   // Enabled, but the provider could not be built: summaries are paused, and that is not "off".
   expect((await models({ providers: { classify: 'ollama:gemma4', summary: null } })).summary)
     .toEqual({ provider: null, ok: false, reason: 'no summary model could be built (SUMMARY_LLM; see the worker log): summaries are paused' });
@@ -102,4 +105,49 @@ test('status lists the summary model: its health, paused when it cannot be built
   const ollamaDown = { url: 'http://o', ok: false, reason: 'Ollama is not reachable at http://o: start it' };
   const app = createApp(repo, { system: { version: '0.2.0', ping: async () => true, worker: async () => ({ ...beat(10_000), providers: { classify: 'claude-cli', summary: 'ollama:gemma4' } }), ollama: async () => ollamaDown } });
   expect((await (await app.request('/api/status')).json()).models.summary).toEqual({ provider: 'ollama:gemma4', ok: false, reason: ollamaDown.reason });
+});
+
+test('status says what the worker is doing: the step, since when, the item in hand, and done of total', async () => {
+  const w: WorkerStatus = { ...beat(10_000), stage: { name: 'classify', startedAt: '2026-10-24T10:00:00.000Z', done: 3, total: 50, current: 'turn-9' } };
+  const s = await (await createApp(repo, { system: { version: '0.2.0', ping: async () => true, worker: async () => w } }).request('/api/status')).json();
+  expect(s.stage).toEqual({ name: 'classify', startedAt: '2026-10-24T10:00:00.000Z', current: 'turn-9' });
+  expect(s.progress).toEqual({ done: 3, total: 50 });
+  // A step that does not count items has no progress; an offline worker has neither.
+  const scan: WorkerStatus = { ...beat(10_000), stage: { name: 'scan', startedAt: 't', done: null, total: null, current: 'demo-shop' } };
+  const s2 = await (await createApp(repo, { system: { version: '0.2.0', ping: async () => true, worker: async () => scan } }).request('/api/status')).json();
+  expect(s2.progress).toBeNull();
+  const stale = await (await createApp(repo, { system: { version: '0.2.0', ping: async () => true, worker: async () => ({ ...w, lastBeat: beat(4 * 60_000).lastBeat }) } }).request('/api/status')).json();
+  expect([stale.stage, stale.progress]).toEqual([null, null]);
+  // An older worker does not say.
+  const old = await (await createApp(repo, { system: { version: '0.2.0', ping: async () => true, worker: async () => beat(10_000) } }).request('/api/status')).json();
+  expect([old.stage, old.progress]).toEqual([null, null]);
+});
+
+test('an unavailable model says since when; a later answer from the same provider (another job) clears the stale reason', async () => {
+  const w: WorkerStatus = {
+    ...beat(10_000),
+    providers: { classify: 'ollama:gemma4', postmortem: 'claude-cli', scan: 'ollama:gemma4', summary: 'ollama:gemma4' },
+    health: {
+      summary: { provider: 'ollama:gemma4', ok: false, reason: 'Ollama is not reachable: connect ECONNREFUSED', at: '2026-10-24T10:00:00.000Z', since: '2026-10-24T09:40:00.000Z' },
+      classify: { provider: 'ollama:gemma4', ok: true, reason: null, at: '2026-10-24T10:05:00.000Z' },
+      postmortem: { provider: 'claude-cli', ok: false, reason: 'claude is not signed in', at: '2026-10-24T10:06:00.000Z', since: '2026-10-24T10:01:00.000Z' },
+    },
+  };
+  const s = await (await createApp(repo, { system: { version: '0.2.0', ping: async () => true, worker: async () => w } }).request('/api/status')).json();
+  expect(s.models.summary).toEqual({ provider: 'ollama:gemma4', ok: true, reason: null });
+  expect(s.models.postmortem).toEqual({ provider: 'claude-cli', ok: false, reason: 'claude is not signed in', since: '2026-10-24T10:01:00.000Z', checkedAt: '2026-10-24T10:06:00.000Z' });
+});
+
+test('a connection failure to Ollama is re-checked on read: Ollama answering now clears it; other reasons stay', async () => {
+  const w = (reason: string): WorkerStatus => ({
+    ...beat(10_000),
+    providers: { classify: 'ollama:gemma4', summary: 'ollama:gemma4' },
+    health: { summary: { provider: 'ollama:gemma4', ok: false, reason, at: 't' } },
+  });
+  const up = { url: 'http://o', ok: true, reason: null };
+  const read = async (reason: string) =>
+    (await (await createApp(repo, { system: { version: '0.2.0', ping: async () => true, worker: async () => w(reason), ollama: async () => up } }).request('/api/status')).json()).models.summary;
+  expect(await read('connect ECONNREFUSED 192.168.65.254:11434')).toEqual({ provider: 'ollama:gemma4', ok: true, reason: null });
+  expect(await read('Ollama is not reachable at http://o: start it')).toEqual({ provider: 'ollama:gemma4', ok: true, reason: null });
+  expect((await read('structured output is unavailable (ollama 501)')).ok).toBe(false);
 });

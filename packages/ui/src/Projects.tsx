@@ -1,15 +1,18 @@
 import { useEffect, useRef, useState } from 'react';
-import { FACT_KINDS, type FactKind } from '@fb/core/types';
+import { FACT_KINDS, UNSCORED_RELEVANCE, type FactKind } from '@fb/core/types';
+import { relevanceBand, type RelevanceBand } from '@fb/core/relevance';
 import { ActivityEntry } from './Activity.tsx';
 import { CodeMap } from './CodeMap.tsx';
 import { ImportBundle } from './ImportBundle.tsx';
-import { api, type Activity, type DocSummary, type ProjectSummary, type StoredFact } from './api.ts';
+import { ProjectDocs } from './ProjectDocs.tsx';
+import { ProjectLinks } from './ProjectLinks.tsx';
+import { api, type Activity, type ProjectSummary, type StoredFact } from './api.ts';
 import { ConfirmDialog } from './ui/ConfirmDialog.tsx';
 import { PageHeader } from './ui/PageHeader.tsx';
 import { ListRow, SplitPane } from './ui/SplitPane.tsx';
 import { Button, buttonClass, Input, Select } from './ui/controls.tsx';
 import { Alert, Badge, Card, EmptyState, plural, SkeletonDetail, SkeletonList, StatGrid, StatTile, StatusBadge } from './ui/display.tsx';
-import { DownloadIcon, FolderIcon, SearchIcon, UploadIcon } from './ui/icons.tsx';
+import { DownloadIcon, FolderIcon, PinIcon, SearchIcon, UploadIcon } from './ui/icons.tsx';
 
 /** '' means "worker default" (SCAN_LLM), so the request body stays empty. */
 const PROVIDERS = [
@@ -19,11 +22,27 @@ const PROVIDERS = [
   { value: 'codex-cli', label: 'Codex (subscription)' },
 ];
 
+const ordinal = (n: number) => `${n}${n % 100 >= 11 && n % 100 <= 13 ? 'th' : ['th', 'st', 'nd', 'rd'][n % 10] ?? 'th'}`;
+
+/**
+ * Where a project's queued scan stands: 1 runs next. Scans waiting out a retry are not ahead of it (the worker passes
+ * over them until then); null when its scan is not queued or is itself waiting. Approximate: the worker may also pass
+ * over an agentic scan while another agentic one runs.
+ */
+export function queuePosition(projects: ProjectSummary[], key: string, now = Date.now()): number | null {
+  const due = (j: ProjectSummary['lastScan']) => !!j && j.status === 'queued' && (!j.retryAt || Date.parse(j.retryAt) <= now);
+  const queue = projects.map((p) => p.lastScan).filter(due).sort((a, b) => (a!.requestedAt < b!.requestedAt ? -1 : a!.requestedAt > b!.requestedAt ? 1 : a!.id < b!.id ? -1 : 1));
+  const mine = projects.find((p) => p.key === key)?.lastScan;
+  const i = mine ? queue.findIndex((j) => j!.id === mine.id) : -1;
+  return i < 0 ? null : i + 1;
+}
+
 export function Projects({ pollMs = 5000 }: { pollMs?: number } = {}) {
   const [projects, setProjects] = useState<ProjectSummary[] | null>(null);
   const [selected, setSelected] = useState<string | null>(null);
   const [facts, setFacts] = useState<StoredFact[] | null>(null);
   const [kind, setKind] = useState<FactKind | ''>('');
+  const [sort, setSort] = useState<'file' | 'relevance'>('file');
   const [query, setQuery] = useState('');
   const [provider, setProvider] = useState('');
   const [error, setError] = useState<string | null>(null);
@@ -68,6 +87,25 @@ export function Projects({ pollMs = 5000 }: { pollMs?: number } = {}) {
     }
   }
 
+  async function pin(p: ProjectSummary) {
+    try {
+      await api.pinProject(p.key, !p.pinned);
+      await load();
+    } catch (e) {
+      setError(String(e));
+    }
+  }
+
+  async function setRelevance(f: StoredFact, relevance: number) {
+    if (!selected) return;
+    try {
+      await api.setFactRelevance(selected, f.id, relevance);
+      setFacts((fs) => fs && fs.map((x) => (x.id === f.id ? { ...x, relevance, relevanceBy: 'you' } : x)));
+    } catch (e) {
+      setError(String(e));
+    }
+  }
+
   async function search(e: React.FormEvent) {
     e.preventDefault();
     if (!selected) return;
@@ -89,15 +127,16 @@ export function Projects({ pollMs = 5000 }: { pollMs?: number } = {}) {
           !projects ? <SkeletonList /> : (
             <ul>
               {projects.map((p) => (
-                <li key={p.key}>
+                <li key={p.key} className="relative">
                   <ListRow selected={p.key === selected} onClick={() => { setSelected(p.key); setOpen(true); }}>
-                    <div className="truncate text-[13px] font-medium">{p.key}</div>
+                    <div className="truncate pr-7 text-[13px] font-medium">{p.key}</div>
                     {p.remote && <div className="truncate font-mono text-[11px] text-muted">{p.remote}</div>}
                     <div className="truncate text-xs text-muted tabular-nums">
                       {plural(p.sessions, 'session')} · {plural(p.lessons, 'lesson')} · {plural(p.facts, 'fact')}
                       {p.lastScan && ` · scan ${p.lastScan.status}`}
                     </div>
                   </ListRow>
+                  <PinButton project={p} onToggle={() => pin(p)} className="absolute top-2 right-2" />
                 </li>
               ))}
               {projects.length === 0 && (
@@ -124,6 +163,10 @@ export function Projects({ pollMs = 5000 }: { pollMs?: number } = {}) {
                   {current.aliases.length > 0 && <div className="text-xs text-muted">also cloned in {current.aliases.join(", ")}</div>}
                 </div>
                 <div className="flex flex-wrap items-center gap-2">
+                  <Button size="md" aria-pressed={current.pinned} onClick={() => pin(current)} title={current.pinned ? 'pinned: listed first everywhere' : 'pin to list it first everywhere'}>
+                    <PinIcon size={13} filled={current.pinned} />
+                    {current.pinned ? 'Pinned' : 'Pin'}
+                  </Button>
                   <Select aria-label="provider" value={provider} onChange={(e) => setProvider(e.target.value)} className="w-56">
                     {PROVIDERS.map((p) => <option key={p.value} value={p.value}>{p.label}</option>)}
                   </Select>
@@ -145,6 +188,10 @@ export function Projects({ pollMs = 5000 }: { pollMs?: number } = {}) {
                   <span className="font-mono text-muted">{current.lastScan.provider ?? 'default'}</span>
                   <span className="text-muted tabular-nums">{current.lastScan.filesScanned} files</span>
                   <span className="text-muted tabular-nums">{current.lastScan.factsAdded} facts</span>
+                  {(() => {
+                    const pos = current.lastScan.status === 'queued' ? queuePosition(projects, current.key) : null;
+                    return pos !== null && <span className="text-muted">{pos === 1 ? 'next in the queue' : `${ordinal(pos)} in the queue`}</span>;
+                  })()}
                   {current.lastScan.status === 'queued' && current.lastScan.retryAt && (
                     <span className="text-muted">
                       retrying {new Date(current.lastScan.retryAt).toLocaleTimeString()}
@@ -154,6 +201,8 @@ export function Projects({ pollMs = 5000 }: { pollMs?: number } = {}) {
                   {current.lastScan.error && <div className="w-full text-bad-text">{current.lastScan.error}</div>}
                 </div>
               )}
+
+              <ProjectLinks projectKey={current.key} projects={projects.map((p) => p.key)} onError={setError} />
 
               <CodeMap projectKey={current.key} />
 
@@ -165,6 +214,10 @@ export function Projects({ pollMs = 5000 }: { pollMs?: number } = {}) {
                       <SearchIcon size={13} className="pointer-events-none absolute top-1/2 left-2 -translate-y-1/2 text-faint" />
                       <Input aria-label="search facts" size="sm" value={query} onChange={(e) => setQuery(e.target.value)} placeholder="Search by meaning…" className="w-52 pl-7" />
                     </form>
+                    <Select aria-label="sort facts" size="sm" value={sort} onChange={(e) => setSort(e.target.value as 'file' | 'relevance')}>
+                      <option value="file">by file</option>
+                      <option value="relevance">by relevance</option>
+                    </Select>
                     <Select aria-label="kind" size="sm" value={kind} onChange={(e) => setKind(e.target.value as FactKind | '')}>
                       <option value="">all kinds</option>
                       {FACT_KINDS.map((k) => <option key={k} value={k}>{k.replace('_', ' ')}</option>)}
@@ -179,11 +232,15 @@ export function Projects({ pollMs = 5000 }: { pollMs?: number } = {}) {
                     Scan the code to extract conventions, invariants and gotchas agents should know.
                   </EmptyState>
                 ) : (
-                  <ul>{facts.map((f) => <FactCard key={f.id} f={f} projectKey={current.key} />)}</ul>
+                  <ul>
+                    {(sort === 'relevance' ? byRelevance(facts) : facts).map((f) => (
+                      <FactCard key={f.id} f={f} projectKey={current.key} onRelevance={(relevance) => setRelevance(f, relevance)} />
+                    ))}
+                  </ul>
                 )}
               </Card>
 
-              <Docs projectKey={current.key} onError={setError} />
+              <ProjectDocs projectKey={current.key} onError={setError} pollMs={pollMs} />
 
               <DataControls projectKey={current.key} onDeleted={() => { setSelected(null); setFacts([]); load(); }} onError={setError} />
             </div>
@@ -194,28 +251,85 @@ export function Projects({ pollMs = 5000 }: { pollMs?: number } = {}) {
   );
 }
 
+/** Pin or unpin from the list, beside the row (a button cannot sit inside the row's own button). */
+function PinButton({ project, onToggle, className = '' }: { project: ProjectSummary; onToggle: () => void; className?: string }) {
+  return (
+    <button
+      type="button"
+      aria-label={`${project.pinned ? 'unpin' : 'pin'} ${project.key}`}
+      aria-pressed={project.pinned}
+      title={project.pinned ? 'pinned: listed first everywhere' : 'pin to list it first everywhere'}
+      onClick={onToggle}
+      className={`grid size-6 place-items-center rounded-sm hover:bg-sunken hover:text-text ${project.pinned ? 'text-accent-text' : 'text-faint'} ${className}`}
+    >
+      <PinIcon size={13} filled={project.pinned} />
+    </button>
+  );
+}
+
+/** Highest relevance first; unscored facts after the scored ones; the list's own order breaks ties. */
+const byRelevance = (facts: StoredFact[]) =>
+  facts.map((f, i) => ({ f, i, r: f.relevance ?? -1 })).sort((a, b) => b.r - a.r || a.i - b.i).map((x) => x.f);
+
+const BAND_TONE: Record<RelevanceBand, 'ok' | 'info' | 'neutral'> = { everyday: 'ok', sometimes: 'info', rare: 'neutral', unscored: 'neutral' };
+const BAND_HINT: Record<RelevanceBand, string> = {
+  everyday: 'needed in most changes: agents get it first',
+  sometimes: 'needed for some changes',
+  rare: 'rarely needed while coding (setup, tooling): agents get it only when a task is about it',
+  unscored: `not scored yet: ranked as middling (${UNSCORED_RELEVANCE}) until the worker scores it`,
+};
+/** What each button sets: the middle of its band. */
+const MARKS: { band: Exclude<RelevanceBand, 'unscored'>; value: number }[] = [
+  { band: 'everyday', value: 0.9 },
+  { band: 'sometimes', value: 0.55 },
+  { band: 'rare', value: 0.15 },
+];
+
 /** A fact plus, on demand, how it came to exist: the model, its reason, the scan and file version, and the scan log. */
-function FactCard({ f, projectKey }: { f: StoredFact; projectKey: string }) {
+function FactCard({ f, projectKey, onRelevance }: { f: StoredFact; projectKey: string; onRelevance: (relevance: number) => void }) {
+  const band = relevanceBand(f.relevance);
   const [log, setLog] = useState<Activity[] | null>(null);
   const [open, setOpen] = useState(false);
   function toggle() {
     setOpen(!open);
-    if (!log) api.activity({ target: `${projectKey}:${f.path}`, kind: 'facts_extracted', limit: 10 }).then(setLog, () => setLog([]));
+    // A fact from a document was made by its reading; a code fact by the scan of its file.
+    const history = f.docId ? { target: f.docId, kind: 'doc_read' as const } : { target: `${projectKey}:${f.path}`, kind: 'facts_extracted' as const };
+    if (!log) api.activity({ ...history, limit: 10 }).then(setLog, () => setLog([]));
   }
   return (
     <li className="border-b border-line px-3 py-2.5 last:border-b-0">
       <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
-        <span className="min-w-0 font-mono text-[11.5px] [overflow-wrap:anywhere] text-accent-text">{f.path}{f.lines ? `:${f.lines}` : ''}</span>
+        <span className="min-w-0 font-mono text-[11.5px] [overflow-wrap:anywhere] text-accent-text">{f.docId ? `from your document ${f.path}` : `${f.path}${f.lines ? `:${f.lines}` : ''}`}</span>
         <span className="flex items-center gap-2 text-muted">
+          <Badge tone={BAND_TONE[band]} title={BAND_HINT[band]}>{band}</Badge>
           <Badge>{f.kind.replace('_', ' ')}</Badge>
           <span className="tabular-nums">{Math.round(f.confidence * 100)}%</span>
           <span className="font-mono text-[11px]">{f.source}</span>
         </span>
       </div>
       <p className="mt-1 text-[13.5px] [overflow-wrap:anywhere]">{f.statement}</p>
-      <button type="button" aria-expanded={open} onClick={toggle} className="mt-1 text-xs text-muted underline decoration-line-strong underline-offset-2 hover:text-text">
-        how was this created?
-      </button>
+      <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted">
+        <button type="button" aria-expanded={open} onClick={toggle} className="underline decoration-line-strong underline-offset-2 hover:text-text">
+          how was this created?
+        </button>
+        <span className="flex flex-wrap items-center gap-1">
+          <span title={f.relevanceBy === 'you' ? (f.docId ? 'kept until the document is uploaded again' : 'kept until a rescan of this file replaces the fact with new ones, scored again') : undefined}>
+            relevance{f.relevance !== null ? ` ${f.relevance.toFixed(2)}` : ''}{f.relevanceBy === 'you' ? ', set by you' : ''}:
+          </span>
+          {MARKS.map((m) => (
+            <button
+              key={m.band}
+              type="button"
+              aria-label={`mark ${m.band}`}
+              aria-pressed={band === m.band && f.relevanceBy === 'you'}
+              onClick={() => onRelevance(m.value)}
+              className="rounded-sm border border-line px-1.5 py-px hover:border-line-strong hover:text-text aria-pressed:border-accent aria-pressed:text-accent-text"
+            >
+              {m.band}
+            </button>
+          ))}
+        </span>
+      </div>
       {open && (
         <div className="mt-2 grid gap-2 rounded-sm border border-line bg-sunken p-2.5 text-xs">
           <dl className="grid gap-1 md:grid-cols-[8rem_minmax(0,1fr)]">
@@ -232,100 +346,6 @@ function FactCard({ f, projectKey }: { f: StoredFact; projectKey: string }) {
         </div>
       )}
     </li>
-  );
-}
-
-const readText = (f: File) =>
-  new Promise<string>((resolve, reject) => {
-    const r = new FileReader();
-    r.onload = () => resolve(String(r.result ?? ''));
-    r.onerror = () => reject(r.error);
-    r.readAsText(f);
-  });
-
-/** The server only accepts plain file names. */
-const safeName = (n: string) => n.replace(/[^\w .()-]/g, '_').replace(/^[^\w]+/, '') || 'document.txt';
-
-/** Context that isn't code: your uploads, PR discussions and tickets synced for this project. */
-function Docs({ projectKey, onError }: { projectKey: string; onError: (e: string) => void }) {
-  const [docs, setDocs] = useState<DocSummary[]>([]);
-  const [busy, setBusy] = useState(false);
-  const load = (stale = () => false) => api.docs(projectKey).then((d) => { if (!stale()) setDocs(d); }, (e) => { if (!stale()) onError(String(e)); });
-  useEffect(() => {
-    let stale = false;
-    load(() => stale);
-    return () => { stale = true; };
-  }, [projectKey]);
-
-  async function upload(files: FileList | null) {
-    if (!files?.length) return;
-    setBusy(true);
-    try {
-      for (const f of Array.from(files)) await api.uploadDoc(projectKey, { title: f.name, name: safeName(f.name), text: await readText(f) });
-      await load();
-    } catch (e) {
-      onError(String(e));
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  const [removing, setRemoving] = useState<DocSummary | null>(null);
-  const [busyRemoving, setBusyRemoving] = useState(false);
-  useEffect(() => setRemoving(null), [projectKey]);
-
-  async function remove(id: string) {
-    setBusyRemoving(true);
-    try {
-      await api.deleteDoc(id);
-      setDocs((ds) => ds.filter((d) => d.id !== id));
-    } catch (e) {
-      onError(String(e));
-    } finally {
-      setBusyRemoving(false);
-      setRemoving(null);
-    }
-  }
-
-  return (
-    <Card
-      title={`Docs and discussions (${docs.length})`}
-      actions={
-        <label className={buttonClass('secondary', 'sm', `cursor-pointer focus-within:outline-2 focus-within:outline-focus ${busy ? 'opacity-60' : ''}`)}>
-          <UploadIcon size={13} />
-          {busy ? 'uploading…' : 'upload text / markdown'}
-          <input aria-label="upload document" type="file" multiple accept=".md,.txt,.markdown,.rst,.json,.yaml,.yml,.csv,text/*" className="sr-only" onChange={(e) => upload(e.target.files)} disabled={busy} />
-        </label>
-      }
-    >
-      <ul>
-        {docs.map((d) => (
-          <li key={d.id} className="flex items-center justify-between gap-2 border-b border-line px-3 py-2 last:border-b-0 hover:bg-sunken">
-            <span className="flex min-w-0 items-center gap-2">
-              <Badge>{d.source}</Badge>
-              <span className="truncate">
-                {d.url ? <a href={d.url} target="_blank" rel="noreferrer" className="underline decoration-line-strong underline-offset-2 hover:text-accent-text">{d.title}</a> : d.title}
-              </span>
-              <span className="shrink-0 text-xs text-muted tabular-nums">{d.chunks} chunks</span>
-            </span>
-            <Button size="sm" variant="ghost" aria-label={`remove ${d.title}`} onClick={() => setRemoving(d)} className="hover:text-bad-text">remove</Button>
-          </li>
-        ))}
-        {docs.length === 0 && <li className="px-3 py-3 text-muted">No docs yet. Upload specs or notes; agents get matching excerpts with their task context.</li>}
-      </ul>
-      <ConfirmDialog
-        open={!!removing}
-        title="Remove this document?"
-        confirmLabel="Remove document"
-        busyLabel="Removing…"
-        busy={busyRemoving}
-        items={removing ? [removing.title] : []}
-        onCancel={() => setRemoving(null)}
-        onConfirm={() => { if (removing) void remove(removing.id); }}
-      >
-        {removing && <>Its {plural(removing.chunks, 'chunk')} are deleted from <b>{projectKey}</b> and agents stop getting excerpts from it. {removing.source === 'upload' ? 'Upload it again to bring it back.' : 'The next sync may bring it back while the integration is on.'}</>}
-      </ConfirmDialog>
-    </Card>
   );
 }
 
