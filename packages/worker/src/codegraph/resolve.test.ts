@@ -85,7 +85,7 @@ test('an import that looks local but resolves to nothing is marked unresolved; r
   });
   const at = (spec: string) => r('src/a.ts', 'typescript', { spec, names: [] });
   expect(at('@app/missing')).toEqual([{ to: 'pkg:@app/missing', names: [], unresolved: true }]);
-  expect(at('@webapp-core/lib')).toEqual([{ to: 'pkg:@webapp-core/lib', names: [], unresolved: true }]);
+  expect(at('@shared-ui/lib')).toEqual([{ to: 'pkg:@shared-ui/lib', names: [], unresolved: true }]);
   expect(at('#internal/x')).toEqual([{ to: 'pkg:#internal', names: [], unresolved: true }]);
   expect(at('react')).toEqual([{ to: 'pkg:react', names: [] }]);
   expect(at('@tanstack/react-router')).toEqual([{ to: 'pkg:@tanstack/react-router', names: [] }]);

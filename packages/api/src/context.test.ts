@@ -305,7 +305,8 @@ test('several verdicts for one lesson become one gap with all the reasons', asyn
 test('the judge never sees secrets in the summary or diff', async () => {
   let user = '';
   const judge = makeJudge({ id: 'f', agentic: false, json: async (t) => { user = t.user; return { verdicts: [] }; } });
-  await judge({ task: 't', summary: 'added sk-ant-api03-cccccccccccccccccccccccccccccccccccccccc', diff: '+ const k = "sk-ant-api03-cccccccccccccccccccccccccccccccccccccccc"' }, [{ lesson: { id: 'l', title: 'T', rule: 'R', appliesWhen: 'W' } as never, score: 1 }]);
+  const key = 'sk-ant-api03-' + 'c'.repeat(40);
+  await judge({ task: 't', summary: `added ${key}`, diff: `+ const k = "${key}"` }, [{ lesson: { id: 'l', title: 'T', rule: 'R', appliesWhen: 'W' } as never, score: 1 }]);
   expect(user).not.toContain('sk-ant-api03');
 });
 

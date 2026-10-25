@@ -225,7 +225,7 @@ test('the map counts imports that look local but resolve to no file, so answers 
   const w = (p: string, c: string) => { mkdirSync(join(dir, p, '..'), { recursive: true }); writeFileSync(join(dir, p), c); };
   w('package.json', JSON.stringify({ name: 'shop', dependencies: { zod: '3' } }));
   w('tsconfig.json', '{ "compilerOptions": { "paths": { "@app/*": ["src/*"] } } }');
-  w('src/a.ts', "import { b } from '@app/b';\nimport { gone } from '@app/gone';\nimport { x } from '@webapp-core/lib';\nimport { z } from 'zod';\nexport const a = 1;\n");
+  w('src/a.ts', "import { b } from '@app/b';\nimport { gone } from '@app/gone';\nimport { x } from '@shared-ui/lib';\nimport { z } from 'zod';\nexport const a = 1;\n");
   w('src/b.ts', "import { gone } from '@app/gone';\nexport const b = 1;\n");
   const m = await buildCodeMap(dir, OPTS);
   expect(edge(m, 'src/a.ts', 'src/b.ts')).toBeTruthy();
