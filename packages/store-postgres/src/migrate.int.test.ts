@@ -63,12 +63,12 @@ describe.skipIf(!testStores().includes('postgres'))('Postgres migrations', () =>
     );
     const columns = Object.fromEntries(rows.map((r) => [r.table_name, r.columns as string[]]));
     expect(Object.keys(columns).sort()).toEqual([
-      'activity', 'candidates', 'causes', 'chunks', 'code_files', 'code_imports', 'code_maps', 'code_symbols', 'code_tests', 'commit_feedback', 'commits', 'context_item_misses',
+      'activity', 'candidates', 'causes', 'chat_conversations', 'chat_turns', 'chunks', 'code_files', 'code_imports', 'code_maps', 'code_symbols', 'code_tests', 'commit_feedback', 'commits', 'context_item_misses',
       'context_item_sessions', 'context_items', 'doc_blobs', 'docs', 'facts', 'feedback', 'graph_config', 'lesson_supersedes', 'lessons',
       'misses', 'predone_check_lessons', 'predone_checks', 'project_candidates', 'project_links', 'project_selection', 'projects', 'read_resets',
       'scan_jobs', 'schema_migrations', 'session_commits', 'session_files', 'session_summary_updates', 'sessions', 'sync_cursors', 'tasks', 'turns', 'worker_status',
     ]);
-    for (const t of ['sessions', 'turns', 'candidates', 'feedback', 'tasks', 'misses', 'lessons', 'context_items', 'predone_checks', 'code_files', 'facts', 'scan_jobs', 'docs', 'chunks', 'activity', 'code_symbols', 'code_imports', 'code_tests', 'code_maps', 'session_files', 'session_summary_updates']) {
+    for (const t of ['sessions', 'turns', 'candidates', 'feedback', 'tasks', 'misses', 'lessons', 'context_items', 'predone_checks', 'code_files', 'facts', 'scan_jobs', 'docs', 'chunks', 'activity', 'code_symbols', 'code_imports', 'code_tests', 'code_maps', 'session_files', 'session_summary_updates', 'chat_conversations', 'chat_turns']) {
       expect(columns[t], t).toContain('project_key');
     }
   });

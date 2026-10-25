@@ -1,5 +1,5 @@
 import { expect, test } from 'vitest';
-import { codeGraphViews, expandDependents, hotspotScore, isCodeLang, isGitCommit, pathMatches, repoRelative, sessionFiles, sessionWork, suggestLessonPaths, touchedAround, type CodeGraphReads } from './codegraph.ts';
+import { codeGraphViews, codeMapDiff, expandDependents, hotspotScore, isCodeLang, isGitCommit, pathMatches, repoRelative, sessionFiles, sessionWork, suggestLessonPaths, touchedAround, type CodeGraphReads } from './codegraph.ts';
 import { hostRepoPath } from './projects.ts';
 import type { ParsedSession, ToolCall } from './types.ts';
 
@@ -159,4 +159,35 @@ test('hotspots: a busy manifest with no miss scores 0, below quiet code; a miss 
   const withMiss = await codeGraphViews(fakeReads(files, ['docs/a.md'])).hotspots('demo', 10);
   expect(withMiss[0]).toMatchObject({ path: 'docs/a.md', misses: 1 });
   expect(withMiss[0].score).toBeGreaterThan(4);
+});
+
+test('codeMapDiff rewrites only the files whose symbols changed and the import edges that changed', () => {
+  const sym = (path: string, name: string, ord: number, lines = '1-2') => ({ id: `${path}#${name}`, path, name, kind: 'function' as const, exported: true, lines, ord });
+  const stored = {
+    symbols: [sym('a.ts', 'a', 0), sym('b.ts', 'b', 0), sym('gone.ts', 'g', 0)],
+    imports: [
+      { from: 'a.ts', to: 'b.ts', names: ['b'], spec: './b' },
+      { from: 'b.ts', to: 'pkg:zod', names: ['z'], spec: 'zod' },
+      { from: 'gone.ts', to: 'a.ts', names: ['a'], spec: './a' },
+      // Two edges for one pair (an older write): the pair is rewritten as one.
+      { from: 'c.ts', to: 'a.ts', names: ['a'], spec: './a' },
+      { from: 'c.ts', to: 'a.ts', names: ['x'], spec: './a' },
+    ],
+  };
+  const next = {
+    symbols: [sym('a.ts', 'a', 0), sym('b.ts', 'b', 0, '1-3'), sym('new.ts', 'n', 0)],
+    imports: [
+      { from: 'a.ts', to: 'b.ts', names: ['b'], spec: './b' },
+      { from: 'b.ts', to: 'pkg:zod', names: ['z', 'y'], spec: 'zod' },
+      { from: 'c.ts', to: 'a.ts', names: ['a', 'x'], spec: './a' },
+      { from: 'new.ts', to: 'a.ts', names: ['a'], spec: './a' },
+    ],
+  };
+  const d = codeMapDiff(stored, next);
+  expect([...d.symbolPaths].sort()).toEqual(['b.ts', 'gone.ts', 'new.ts']);
+  expect(d.symbols.map((s) => s.id)).toEqual(['b.ts#b', 'new.ts#n']);
+  expect(d.staleImports).toEqual([{ from: 'b.ts', to: 'pkg:zod' }, { from: 'gone.ts', to: 'a.ts' }, { from: 'c.ts', to: 'a.ts' }]);
+  expect(d.newImports.map((i) => `${i.from}>${i.to}`)).toEqual(['b.ts>pkg:zod', 'c.ts>a.ts', 'new.ts>a.ts']);
+  // Nothing changed: nothing to write.
+  expect(codeMapDiff(next, next)).toEqual({ symbolPaths: [], symbols: [], staleImports: [], newImports: [] });
 });

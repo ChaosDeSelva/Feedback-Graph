@@ -100,7 +100,7 @@ export type SyncTrigger = 'manual' | 'schedule';
 export type ProjectSyncResult = {
   key: string;
   /**
-   * sent; empty (nothing stored); unchanged (same bundle as the last send, scheduled runs only); failed; not sent (an
+   * sent; empty (nothing stored); unchanged (same bundle as the last send; a forced Sync now resends it); failed; not sent (an
    * earlier 401/403 stopped the run); withdrawn (no longer synced: its last, empty bundle took back what was sent).
    */
   status: 'sent' | 'empty' | 'unchanged' | 'failed' | 'not sent' | 'withdrawn';
@@ -126,6 +126,9 @@ export type CloudSyncResult = {
   /** The first failure, one line, redacted. */
   error: string | null;
 };
+
+/** The last Sync now the api ran: when, whether it worked, what it sent, and how many projects had nothing new. */
+export type ManualSync = { at: string; ok: boolean; error: string | null; sent: SyncCounts; unchanged: number; failed: number };
 
 /** What the worker reports about sync in its heartbeat (WorkerStatus.cloudSync). */
 export type CloudSyncStatus = {
@@ -370,14 +373,19 @@ const fingerprint = (b: SyncBundle) => createHash('sha256').update(JSON.stringif
 const list = (keys: string[]) => keys.join(', ');
 const plural = (n: number, w: string, many = `${w}s`) => `${n} ${n === 1 ? w : many}`;
 
+/** How far a run has got: projects done of total, and the one being sent now (null once all are done). */
+export type SyncProgress = { done: number; total: number; current: string | null };
+
 /**
  * Sync the given projects, one request each, and record one Activity entry for the run (what was sent: counts,
  * project keys, the cloud's host; never the token). `memory` holds what the cloud last accepted per project: it names
- * what has gone since in `withdrawn`, turns a project that now holds nothing into a tombstone, lets a scheduled run
- * skip a project whose bundle has not changed (Sync now always sends), and names the projects synced before that are
- * no longer in the list: each gets a last, empty bundle that withdraws everything sent for it. It is updated only on
- * success, so a failed send's withdrawals go with the next one. Without it, `complete: true` still withdraws on the
- * cloud whatever a bundle leaves out. A run that sent nothing and failed nothing logs nothing.
+ * what has gone since in `withdrawn`, turns a project that now holds nothing into a tombstone, lets a run skip a
+ * project whose bundle has not changed (`force`, for Sync now, resends it anyway), and names the projects synced before
+ * that are no longer in the list: each gets a last, empty bundle that withdraws everything sent for it. It is updated
+ * only on success, so a failed send's withdrawals go with the next one. Without it, `complete: true` still withdraws on
+ * the cloud whatever a bundle leaves out. A scheduled run that sent nothing and failed nothing logs nothing; Sync now
+ * always logs, so whoever asked can see the answer ("nothing to send"). `onProgress` hears before each project and
+ * once at the end.
  */
 export async function runCloudSync(d: {
   cloud: CloudConfig;
@@ -389,6 +397,9 @@ export async function runCloudSync(d: {
   sleep?: (ms: number) => Promise<void>;
   memory?: SyncMemory;
   baseDelayMs?: number;
+  /** Resend projects whose bundle has not changed (Sync now with --force). */
+  force?: boolean;
+  onProgress?: (p: SyncProgress) => void;
 }): Promise<CloudSyncResult> {
   const host = new URL(d.cloud.url).host;
   const sent = zero();
@@ -396,7 +407,8 @@ export async function runCloudSync(d: {
   let error: string | null = null;
   let stopped = false;
   const keys = [...new Set(await d.projects())];
-  for (const key of keys) {
+  for (const [i, key] of keys.entries()) {
+    d.onProgress?.({ done: i, total: keys.length, current: key });
     if (stopped) {
       results.push({ key, status: 'not sent', counts: null });
       continue;
@@ -410,7 +422,7 @@ export async function runCloudSync(d: {
     const bundle = stored ?? tombstone(key, previous!);
     const counts = bundleCounts(bundle);
     const print = fingerprint(bundle);
-    if (d.trigger === 'schedule' && previous?.fingerprint === print && !bundle.withdrawn.length) {
+    if (!d.force && previous?.fingerprint === print && !bundle.withdrawn.length) {
       results.push({ key, status: 'unchanged', counts });
       continue;
     }
@@ -448,15 +460,20 @@ export async function runCloudSync(d: {
       if (e.fatal) stopped = true;
     }
   }
+  d.onProgress?.({ done: keys.length, total: keys.length, current: null });
   const result: CloudSyncResult = { at: new Date().toISOString(), trigger: d.trigger, host, ok: error === null, sent, projects: results, error };
   const sentKeys = results.filter((r) => r.status === 'sent').map((r) => r.key);
   const failedKeys = results.filter((r) => r.status === 'failed').map((r) => r.key);
   const withdrawnKeys = results.filter((r) => r.status === 'withdrawn').map((r) => r.key);
-  if (d.activity && (sentKeys.length || failedKeys.length || withdrawnKeys.length)) {
+  const unchanged = results.filter((r) => r.status === 'unchanged').length;
+  const asked = d.trigger === 'manual' && unchanged > 0;
+  if (d.activity && (sentKeys.length || failedKeys.length || withdrawnKeys.length || asked)) {
     const what = `${plural(sent.lessons, 'lesson')}, ${plural(sent.misses, 'miss', 'misses')}, ${plural(sent.facts, 'fact')}, ${plural(sent.docs, 'doc')}`;
     const attempted = sentKeys.length + failedKeys.length + withdrawnKeys.length;
     const took = withdrawnKeys.length ? `; took ${list(withdrawnKeys)} back out (no longer synced)` : '';
-    const subject = !failedKeys.length
+    const subject = !sentKeys.length && !failedKeys.length && !withdrawnKeys.length
+      ? `nothing to send to ${host}: ${plural(unchanged, 'project')} unchanged since the last sync`
+      : !failedKeys.length
       ? (sentKeys.length ? `sent ${plural(sentKeys.length, 'project')} to ${host}: ${what}${took}` : `took ${list(withdrawnKeys)} back out of ${host}: no longer synced`)
       : sentKeys.length || withdrawnKeys.length
         ? `${failedKeys.length} of ${plural(attempted, 'project')} failed to sync to ${host}; sent ${list(sentKeys) || 'nothing'} (${what})${took}`
@@ -467,7 +484,7 @@ export async function runCloudSync(d: {
       projectKey: null,
       subject: subject.slice(0, 500),
       why: d.trigger === 'manual'
-        ? 'you pressed Sync now in Settings'
+        ? 'you asked for Sync now (Settings, or fg cloud sync-now)'
         : `CLOUD_URL and CLOUD_TOKEN are set and SYNC_INTERVAL_MINUTES is ${d.cloud.intervalMinutes}`,
       details: {
         host,

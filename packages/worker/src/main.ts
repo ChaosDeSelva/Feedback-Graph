@@ -5,12 +5,15 @@ import {
   credentialFile, fetchLinearComments, Integrations, searchLinearIssues, selectionNote, storedSyncMemory, touchedAround, VERSION, withHealth, type KnowledgeStore, type LlmProvider, type ModelJob, type ProjectScope, type ScanJob, type SyncMemory, type WorkerStatus,
 } from '@fb/core';
 import { openStore } from '@fb/store-postgres';
+import { answerTurn } from './chat/answer.ts';
+import { chatSpec, codexLoggedIn, defaultChatSpec, type ChatSpecOpts } from './chat/provider.ts';
+import { ChatRunner, sharesModel } from './chat/runner.ts';
 import { CloudSyncSchedule } from './cloud/schedule.ts';
 import { EDITED_PATHS_LIMIT, MapStage } from './codegraph/stage.ts';
 import { runCycle, type FileInfo } from './cycle.ts';
 import { classifyTurn } from './detect/classify.ts';
 import { codexSessionFiles } from './ingest/codex.ts';
-import { cachedRemote, commitsInWindow, projectRemote } from './ingest/git.ts';
+import { cachedRemote, commitsInWindow, projectRemote, worktreeGitArgs } from './ingest/git.ts';
 import { readLines } from './ingest/lines.ts';
 import { buildCandidates } from './projects/candidates.ts';
 import { importMemories, memoryProjectKey } from './memory/memory.ts';
@@ -20,6 +23,8 @@ import { huntContext } from './postmortem/hunt.ts';
 import { syncGithub } from './integrations/githubSync.ts';
 import { githubTarget, syncExternalFeedback, type SyncProject } from './integrations/feedbackSync.ts';
 import { attachWorkSession } from './postmortem/work.ts';
+import { repoHas } from './postmortem/paths.ts';
+import { recheckProposedLessons } from './postmortem/recheck.ts';
 import { runPostmortems } from './postmortem/step.ts';
 import { ScanRunner } from './scan/runner.ts';
 import { hasCodeFiles, runScan } from './scan/scan.ts';
@@ -83,6 +88,8 @@ async function main() {
   const { graph: repo, knowledge, facts, activity, docs, selection } = store;
   await facts.requeueStaleScans();
   await docs.requeueStaleDocs();
+  // Lessons proposed before their checks were stored get them once (flags only; a failure waits for the next start).
+  await recheckProposedLessons({ k: knowledge, activity, log }).catch((err) => log('lesson re-check failed', { error: String(err) }));
 
   const transcripts = config.transcriptsDir;
   const roots = config.roots;
@@ -103,6 +110,11 @@ async function main() {
   const docsLlm = tracked('docs', provider('docs', config.llm.docs ?? defaultScan));
   // An unavailable summary model only pauses summaries; /api/status and the badge say so. SUMMARY_LLM=off is reported as off.
   const summaryLlm = config.summary.enabled ? tracked('summary', provider('summary', config.summary.llm ?? localModel)) : null;
+  // Ask: CHAT_LLM, else claude-cli with a Claude token, else codex-cli with a Codex login, else the local model. A chat
+  // may pick another provider; the Codex login is looked at again per answer (it can be added without a restart).
+  const chatOpts = (): ChatSpecOpts => ({ chatLlm: config.llm.chat, localModel, env: process.env, codexLogin: codexLoggedIn(process.env) });
+  const defaultChat = defaultChatSpec(chatOpts());
+  log('chat', { default: defaultChat });
   const state = new FileState(config.stateDb);
 
   // The owner picks the folders to read (Settings). First start: INGEST_PROJECTS seeds the choice, or nothing does.
@@ -123,7 +135,7 @@ async function main() {
     lastCycleAt: null,
     lastCycle: null,
     lastError: null,
-    providers: { classify: classifier?.id ?? null, postmortem: postmortemLlm?.id ?? null, scan: defaultScan, summary: summaryLlm?.id ?? null, docs: docsLlm?.id ?? null },
+    providers: { classify: classifier?.id ?? null, postmortem: postmortemLlm?.id ?? null, scan: defaultScan, summary: summaryLlm?.id ?? null, docs: docsLlm?.id ?? null, chat: defaultChat },
     health,
     off: config.summary.enabled ? [] : ['summary'],
   };
@@ -148,6 +160,8 @@ async function main() {
   let stopMapStage: (() => Promise<void>) | null = null;
   /** ScanRunner.stop, likewise: nothing new starts once shutdown begins. */
   let stopScans: (() => Promise<void>) | null = null;
+  /** ChatRunner.stop, likewise. */
+  let stopChats: (() => Promise<void>) | null = null;
   const shutdown = (signal: string) => {
     if (stopping) return;
     stopping = true;
@@ -158,6 +172,7 @@ async function main() {
     // Abandons a map being parsed now; the loop below waits for one being written before the store closes.
     void stopMapStage?.();
     void stopScans?.();
+    void stopChats?.();
     wake?.();
     setTimeout(() => process.exit(0), SHUTDOWN_GRACE_MS).unref();
   };
@@ -206,8 +221,8 @@ async function main() {
       return classifyTurn(t, classifier, (error) => log('classification failed', { turn: t.uuid, error }));
     },
     classifyBatch: config.classifyBatch,
-    // Scans run beside the cycle and may hold the same model; a classify timeout meanwhile is a queue, not the turn.
-    modelBusy: () => scanRunner.running().length > 0,
+    // Scans and Ask answers run beside the cycle and may hold the same model; a classify timeout meanwhile is a queue, not the turn.
+    modelBusy: () => scanRunner.running().length > 0 || sharesModel(chatRunner.running(), classifier?.id),
     log,
     classifierId: classifier?.id,
     includeProject: (k: string) => scope.folder(k),
@@ -219,6 +234,8 @@ async function main() {
     activity,
     remote: cachedRemote(projectRemote, REMOTE_TTL_MS),
     projects: repo,
+    // Records a scan or a code map made have no folder: the backfill reads it (and its remote) from the selection.
+    folders: () => selectedFolders(),
     codegraph: store.codegraph,
   };
 
@@ -228,19 +245,21 @@ async function main() {
 
   const pmDeps = postmortemLlm && {
     k: knowledge,
-    modelBusy: () => scanRunner.running().length > 0,
+    modelBusy: () => scanRunner.running().length > 0 || sharesModel(chatRunner.running(), postmortemLlm.id),
     // A comment from GitHub or Linear is worked out against the agent session that did the work, when one is found.
     postmortem: async (raw: Parameters<typeof runPostMortem>[0]) => {
       stage.enter('postmortem', { current: raw.feedbackId });
       const input = await attachWorkSession(raw, {
         graph: repo,
         sessions: store.sessions,
-        files: async (id) => (await store.codegraph.sessionFiles(id)).map((f) => f.path),
+        files: (id) => store.codegraph.sessionFiles(id),
       });
       return runPostMortem(input, {
         llm: postmortemLlm,
         touched: async (i) => touchedAround(await store.codegraph.sessionFiles(i.sessionId), i.feedback.ts),
         sessionSummary: async (i) => (await store.sessions.detail(i.sessionId))?.summary?.markdown ?? null,
+        // Lesson paths must exist in the repository (postmortem/paths.ts).
+        exists: (i, p) => repoHas(i.repoPath, p),
         // Instruction files from the repo up to its project root (the mount: nothing above it is visible here).
         standing: (i) =>
           loadStandingContext({
@@ -303,6 +322,8 @@ async function main() {
     maxBytes: config.scanMaxBytes,
     // Files your sessions edited are kept first when the map is capped: they are where the next miss happens.
     editedPaths: (key) => store.codegraph.editedPaths(key, EDITED_PATHS_LIMIT),
+    // A worktree's .git names its git dir by the host path: reach it through the roots mapping.
+    gitArgs: (repoPath) => worktreeGitArgs(repoPath, roots),
     log,
     exclusive: <T>(fn: () => Promise<T>) => selection.exclusive(fn),
     inScope: async (key: string) => (await selection.scope(config)).project(key),
@@ -358,7 +379,8 @@ async function main() {
     const remotes = new Map((await facts.listProjects()).map((p) => [p.key, p.remote]));
     const r = await runLinkDetection({
       links: store.links,
-      projects: async () => (await selectedFolders()).map((p) => ({ ...p, remote: remotes.get(p.key) ?? null })),
+      // A record a scan or code map made has no remote until the next cycle fills it: read the folder's own then.
+      projects: async () => Promise.all((await selectedFolders()).map(async (p) => ({ ...p, remote: remotes.get(p.key) ?? (await cycleDeps.remote(p.repoPath)) }))),
       activity,
     });
     log('links detected', r);
@@ -419,6 +441,22 @@ async function main() {
     log,
   });
   stopScans = () => scanRunner.stop();
+
+  // Ask answers, beside the cycle: the oldest pending question every 2 s, one at a time, with its chat's model.
+  const chatRunner = new ChatRunner({
+    store: store.chats,
+    provider: (conversation) => {
+      const spec = chatSpec(conversation.provider, chatOpts());
+      let reason = '';
+      const p = provider('chat', spec, (r) => (reason = r));
+      // Only the default model reports to /api/status: a chat's own pick failing is shown on its turn.
+      return { llm: spec === defaultChat ? tracked('chat', p) : p, spec, reason: reason || undefined };
+    },
+    answer: answerTurn,
+    log,
+  });
+  stopChats = () => chatRunner.stop();
+  await chatRunner.start();
   log('scans', { concurrency: config.scanConcurrency, maxFiles: config.scanMaxFiles ?? 'scales with the repo' });
 
   /** The selected projects with their remotes: the only ones whose PRs and issues are read. */
@@ -614,6 +652,7 @@ async function main() {
     wake = null;
   }
   await scanRunner.stop();
+  await chatRunner.stop();
   await mapStage.stop();
   state.close();
   await store.close();

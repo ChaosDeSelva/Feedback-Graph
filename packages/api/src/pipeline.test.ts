@@ -56,3 +56,11 @@ test('what this server cannot tell is null, not zero', async () => {
   expect([p.stage, p.progress]).toEqual([null, null]);
   expect(p.inbox).toEqual({ pending: 2, confirmed: 1 });
 });
+
+test('GET /api/pipeline?project=: the counts of one shown project (the worker-wide backlog stays worker-wide)', async () => {
+  const p = await (await app().request('/api/pipeline?project=api')).json();
+  expect(p).toMatchObject({ sessions: 2, inbox: { pending: 0, confirmed: 1 }, lessons: { proposed: 0, approved: 1 }, scans: { done: 0, queued: 1, running: 0, failed: 0, never: 0 }, classify: { backlog: 120, capped: false } });
+  // A project that is not shown counts nothing, rather than leaking its numbers.
+  const hidden = await (await app().request('/api/pipeline?project=hidden')).json();
+  expect(hidden).toMatchObject({ sessions: 0, inbox: { pending: 0, confirmed: 0 }, lessons: { proposed: 0, approved: 0 } });
+});

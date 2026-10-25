@@ -4,6 +4,10 @@
  */
 export const lessonHref = (id: string) => `#lessons/${encodeURIComponent(id)}`;
 export const inboxHref = (feedbackId: string) => `#inbox/${encodeURIComponent(feedbackId)}`;
+/** The Inbox open on one tab (`#inbox/confirmed`): the confirmed tab shows each item's post-mortem state. */
+export const inboxTabHref = (status: 'pending' | 'confirmed' | 'rejected') => `#inbox/${status}`;
+/** The Activity page filtered to one kind (`#activity/candidate_flagged`). */
+export const activityKindHref = (kind: string) => `#activity/${encodeURIComponent(kind)}`;
 export const sessionHref = (sessionId: string) => `#sessions/${encodeURIComponent(sessionId)}`;
 
 /** The page part of the hash: `lessons` for `#lessons/l1`. */
@@ -15,6 +19,33 @@ export function hashFocus(view: string): string | null {
   if (v !== view || !rest.length) return null;
   try {
     return decodeURIComponent(rest.join('/')) || null;
+  } catch {
+    return null;
+  }
+}
+
+/** One Ask conversation (`#ask/<id>`). */
+export const chatHref = (conversationId: string) => `#ask/${encodeURIComponent(conversationId)}`;
+/** A new Ask conversation on `project` that asks `q` straight away (`#ask/new?project=<key>&q=<text>`). */
+export const newChatHref = (project: string, q?: string) => `#ask/new?${new URLSearchParams(q ? { project, q } : { project })}`;
+
+/** What `#ask/new?project=…&q=…` asks for, or null for any other hash. */
+export function hashNewChat(): { project: string; q: string } | null {
+  const m = location.hash.match(/^#ask\/new(?:\?(.*))?$/);
+  if (!m) return null;
+  const p = new URLSearchParams(m[1] ?? '');
+  return { project: p.get('project') ?? '', q: (p.get('q') ?? '').trim() };
+}
+
+/** A file's module panel on the Projects page (`#projects/<key>/<path>`, the path encoded as one segment). */
+export const moduleHref = (project: string, path: string) => `#projects/${encodeURIComponent(project)}/${encodeURIComponent(path)}`;
+
+/** The project, and the file whose module panel to open, that a Projects link names. */
+export function hashModule(): { project: string; path: string | null } | null {
+  const [v, key, path] = location.hash.slice(1).split('/');
+  if (v !== 'projects' || !key) return null;
+  try {
+    return { project: decodeURIComponent(key), path: path ? decodeURIComponent(path) : null };
   } catch {
     return null;
   }

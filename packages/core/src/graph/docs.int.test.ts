@@ -23,7 +23,14 @@ describeStores('DocsStore', (h) => {
     expect(id).toBe('doc:shop:upload:spec.md');
     await d.upsertDoc(doc('spec.md'), [{ text: 'only one chunk now', embedding: vec(3) }]);
     const [listed] = await d.listDocs('shop');
-    expect(listed).toMatchObject({ id, title: 'title spec.md', source: 'upload', chunks: 1 });
+    expect(listed).toMatchObject({ id, title: 'title spec.md', source: 'upload', chunks: 1, addedBy: null });
+  });
+
+  test('an upload records who added it', async () => {
+    await d.upsertDoc(doc('notes.md'), [{ text: 'tenants must be isolated', embedding: vec(1) }], { read: true, addedBy: 'operator:codex' });
+    expect((await d.listDocs('shop'))[0]).toMatchObject({ ref: 'notes.md', addedBy: 'operator:codex' });
+    await d.upsertDoc(doc('notes.md'), [{ text: 'tenants must be isolated', embedding: vec(1) }], { read: true, addedBy: 'you' });
+    expect((await d.listDocs('shop'))[0].addedBy).toBe('you');
   });
 
   test('searchDocs returns nearest chunks of the project with their doc', async () => {
@@ -168,5 +175,19 @@ describeStores('DocsStore: reading uploads into facts', (h) => {
     await d.markDocReading(other);
     await d.requeueStaleDocs();
     expect((await d.nextDocToRead())?.id).toBe(other);
+  });
+
+  test('requeueDocRead: a failed reading goes back to pending, attempts and error cleared; a done or missing one is left alone', async () => {
+    const t0 = new Date('2026-10-24T10:00:00Z');
+    const failed = await d.upsertDoc(doc('blind.png'), [{ text: 'z', embedding: vec(1) }], { read: true, image: png });
+    await d.recordDocFailure(failed, 'cannot read images', { counted: true, final: true }, t0);
+    expect(await d.requeueDocRead(failed)).toBe(true);
+    expect((await d.listDocs('shop')).find((x) => x.id === failed)?.read).toMatchObject({ status: 'pending', attempts: 0, error: null, retryAt: null });
+
+    const done = await d.upsertDoc(doc('done.md'), [{ text: 'y', embedding: vec(1) }], { read: true });
+    await d.saveDocReading(done, { facts: [], source: 'p' });
+    expect(await d.requeueDocRead(done)).toBe(false);
+    expect((await d.listDocs('shop')).find((x) => x.id === done)?.read).toMatchObject({ status: 'done' });
+    expect(await d.requeueDocRead('doc:shop:upload:missing.md')).toBe(false);
   });
 });

@@ -127,3 +127,66 @@ test('the prompt asks for a falsifiable, scoped lesson and no rules about how to
   expect(p).toMatch(/falsifiable/);
   expect(p).toMatch(/one reviewer's nit/);
 });
+
+test('the prompt says the comment is the evidence, never the ignored context, and the lesson is about this comment only', () => {
+  const p = buildPrompt({ ...base, work: null }, [], { agentic: false, facts: [] });
+  expect(p).toMatch(/evidence of the miss, never the context the agent ignored/);
+  expect(p).toMatch(/about the quoted comment only/);
+  expect(p).toMatch(/name at least one identifier/);
+  expect(p).toMatch(/factLike/);
+  const withWork = buildPrompt({ ...base, work: { sessionId: 's1', source: 'claude', cwd: '', turns: [] } }, [], { agentic: false, facts: [] });
+  expect(withWork).toContain('WRONG SESSION:');
+});
+
+const work = { sessionId: 'invite', source: 'claude' as const, cwd: '/Users/j/Vibe/demo', turns: [turn(0, 'improve the user invitation errors')] };
+
+test('a post-mortem that finds the matched session did other work is redone from the comment alone, and says so', async () => {
+  const prompts: string[] = [];
+  const replies = [
+    { ...answer(['src/settings/users/**']), causeExplanation: 'WRONG SESSION: the session implemented user invitations; the comment is about search.', lesson: { ...answer([]).lesson, rule: 'Verify that review comments are relevant to the current task', paths: ['src/settings/users/**'] } },
+    answer(['api/search.ts']),
+  ];
+  const r = await runPostMortem({ ...base, sessionId: 'invite', work }, {
+    standing: async () => [], facts: async () => [],
+    touched: async () => ({ edited: ['src/settings/users/invite.ts'], fixed: [] }),
+    sessionSummary: async () => 'Invitation error handling',
+    llm: { id: 'fake', agentic: false, json: async (o) => { prompts.push(o.user); return replies.shift(); } },
+  });
+  expect(prompts).toHaveLength(2);
+  expect(prompts[1]).toContain('No agent session was found');
+  expect(prompts[1]).not.toContain('Invitation error handling');
+  expect(prompts[1]).not.toContain('src/settings/users/invite.ts');
+  expect(r.lesson).toMatchObject({ rule: 'Filter customer search rows in the SQL query in api/search.ts', paths: ['api/search.ts'] });
+  expect(r.lessonChecks?.map((f) => f.name)).toEqual(['wrong-session']);
+  expect(r.trace.lessonFlags).toEqual(r.lessonChecks);
+});
+
+test('the same wrong-session tell in plain words ("pertains to a different PR") is caught too', async () => {
+  const replies = [{ ...answer([]), missed: 'The feedback pertains to a different pull request than the agent worked on.' }, answer([])];
+  let calls = 0;
+  await runPostMortem({ ...base, work }, { standing: async () => [], facts: async () => [], llm: { id: 'fake', agentic: false, json: async () => { calls++; return replies.shift(); } } });
+  expect(calls).toBe(2);
+});
+
+test('lesson paths are checked against the repository and the comment: instruction files, PR refs and missing files go, flagged', async () => {
+  const exists = async (_i: PostMortemInput, p: string) => ['api/search.ts', 'api/db.ts'].includes(p);
+  const r = await runPostMortem({ ...base, work: null }, { standing: async () => [], facts: async () => [], exists, llm: llm(['src/fido/AGENTS.md', 'acme/demo#9', 'api/gone.ts', 'api/search.ts']) });
+  expect(r.lesson.paths).toEqual(['api/search.ts']);
+  expect(r.lessonChecks?.map((f) => f.name)).toEqual(['bad-path']);
+  expect(r.lessonChecks?.[0].why).toContain('src/fido/AGENTS.md');
+});
+
+test('a lesson left with no path is flagged as needing one; a global lesson is not', async () => {
+  const noFile = { ...base, work: null, feedback: { ...base.feedback, text: 'this races', external: { ...ext(1, 'lead'), path: null, diffHunk: null } } };
+  const r = await runPostMortem(noFile, { standing: async () => [], facts: async () => [], llm: llm([]) });
+  expect(r.lessonChecks?.map((f) => f.name)).toEqual(['needs-path']);
+  const g = await runPostMortem(noFile, { standing: async () => [], facts: async () => [], llm: { id: 'fake', agentic: false, json: async () => ({ ...answer([]), lesson: { ...answer([]).lesson, scope: 'global' } }) } });
+  expect(g.lessonChecks).toEqual([]);
+});
+
+test('what the model says about its own lesson (process, a fact) becomes a check', async () => {
+  const r = await runPostMortem({ ...base, work: null }, { standing: async () => [], facts: async () => [], llm: { id: 'fake', agentic: false, json: async () => ({ ...answer([]), about: 'process', factLike: true }) } });
+  expect(r.lessonChecks?.map((f) => f.name)).toEqual(['meta-lesson', 'looks-like-a-fact']);
+  expect(r).not.toHaveProperty('about');
+  expect(r).not.toHaveProperty('factLike');
+});

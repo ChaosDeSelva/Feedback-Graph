@@ -41,7 +41,7 @@ export type ExportBundle = {
 export type ExportCodeFile = { projectKey: string; path: string; lang: string; loc: number; isTest: boolean } & Omit<Hotspot, 'path'>;
 
 /** Labels whose nodes belong to one project through their projectKey. */
-const PROJECT_LABELS = ['Candidate', 'Feedback', 'Miss', 'Task', 'ContextItem', 'Fact', 'Symbol', 'Module', 'CodeMap', 'CodeFile', 'ScanJob', 'Doc', 'DocBlob', 'Chunk', 'Activity', 'PreDoneCheck'];
+const PROJECT_LABELS = ['Candidate', 'Feedback', 'Miss', 'Task', 'ContextItem', 'Fact', 'Symbol', 'Module', 'CodeMap', 'CodeFile', 'ScanJob', 'Doc', 'DocBlob', 'Chunk', 'Activity', 'PreDoneCheck', 'ChatTurn', 'ChatConversation'];
 
 const BATCH = 5000;
 

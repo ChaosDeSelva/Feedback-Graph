@@ -61,8 +61,8 @@ export class PostgresProbe implements StoreProbe {
   }
 
   async project(key: string) {
-    const { rows } = await this.q('SELECT key, remote, aliases FROM projects WHERE key = $1', [key]);
-    return rows[0] ? { key: rows[0].key, remote: rows[0].remote ?? null, aliases: rows[0].aliases ?? [] } : null;
+    const { rows } = await this.q('SELECT key, remote, aliases, repo_path FROM projects WHERE key = $1', [key]);
+    return rows[0] ? { key: rows[0].key, remote: rows[0].remote ?? null, aliases: rows[0].aliases ?? [], repoPath: rows[0].repo_path || null } : null;
   }
 
   async sessionSource(id: string): Promise<string | null> {

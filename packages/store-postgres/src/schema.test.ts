@@ -1,5 +1,5 @@
 import { readdirSync, readFileSync } from 'node:fs';
-import { ACTIVITY_KINDS, CAUSES, FACT_KINDS, SESSION_STATES, SYMBOL_KINDS, TURN_LABELS, type CandidateStatus, type FeedbackSource, type ContextKind, type DocSource, type FeedbackStatus, type LessonScope, type LessonSource, type LessonStatus, type Outcome, type ScanStatus } from '@fb/core';
+import { ACTIVITY_KINDS, CAUSES, CHAT_PROVIDERS, CHAT_TURN_STATUSES, FACT_EVIDENCE, FACT_KINDS, FACT_ORIGINS, SESSION_STATES, SYMBOL_KINDS, TURN_LABELS, type CandidateStatus, type FeedbackSource, type ContextKind, type DocSource, type FeedbackStatus, type LessonScope, type LessonSource, type LessonStatus, type Outcome, type ScanStatus } from '@fb/core';
 import { expect, test } from 'vitest';
 import { renderMigration } from './migrate.ts';
 
@@ -36,7 +36,11 @@ test('CHECK constraints allow exactly the values the TypeScript types allow (add
   expect(allowed('lessons_source_check')).toEqual(all<LessonSource>()(['postmortem', 'memory', 'manual']));
   expect(allowed('context_items_kind_check')).toEqual(all<ContextKind>()(['code', 'doc', 'claude_md', 'agents_md', 'memory', 'session', 'pr', 'ticket', 'upload']));
   expect(allowed('scan_jobs_status_check')).toEqual(all<ScanStatus>()(['queued', 'running', 'done', 'failed']));
+  expect(allowed('chat_turns_status_check')).toEqual([...CHAT_TURN_STATUSES].sort());
+  expect(allowed('chat_conversations_provider_check')).toEqual([...CHAT_PROVIDERS].sort());
   expect(allowed('docs_source_check')).toEqual(all<DocSource>()(['upload', 'github', 'linear']));
+  expect(allowed('facts_origin_check')).toEqual([...FACT_ORIGINS].sort());
+  expect(allowed('facts_evidence_check')).toEqual([...FACT_EVIDENCE].sort());
 });
 
 test('the embedding dimension is filled in from config, and only a sane one is accepted', () => {

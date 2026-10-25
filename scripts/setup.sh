@@ -274,7 +274,7 @@ elif tags="$(curl -fsS --max-time 5 "$ollama_url/api/tags" 2>/dev/null)"; then
   case " ${missing[*]+"${missing[*]}"} " in *" $probe_model "*) probe_model="" ;; esac
   if [ -n "$probe_model" ]; then
     echo "ollama: checking structured output with $probe_model (the first call loads the model; can take a minute)"
-    ollama_structured_probe "$ollama_url" "$probe_model"
+    ollama_structured_probe "$ollama_url" "$probe_model" "$(envval OLLAMA_NUM_CTX)"
     case "$PROBE" in
       ok) echo "ollama: structured output works ($probe_model)" ;;
       timeout) echo "ollama: $probe_model gave no answer in time ($PROBE_DETAIL); run ./scripts/doctor.sh once it has loaded" ;;
@@ -283,6 +283,7 @@ elif tags="$(curl -fsS --max-time 5 "$ollama_url/api/tags" 2>/dev/null)"; then
         echo "FAIL ollama: structured output does not work with $probe_model at $ollama_url"
         echo "  Ollama said: ${PROBE_DETAIL:-nothing}"
         if [ "$PROBE" = unsupported ]; then ollama_structured_fix; fi
+        if [ "$PROBE" = thinking ]; then ollama_thinking_fix; fi
         exit 1
         ;;
     esac
@@ -300,13 +301,13 @@ fi
 # Post-mortems need real reasoning: with a Claude Code token they run on your Claude subscription (claude-cli);
 # classifying, summaries and embeddings stay on the free local model.
 if typing && command -v claude >/dev/null 2>&1 && [ -z "$(envval CLAUDE_CODE_OAUTH_TOKEN)" ] && [ -z "$(envval POSTMORTEM_LLM)" ]; then
-  echo "Post-mortems run on Ollama now. To run them on your Claude subscription instead, run  claude setup-token  in"
-  echo "another terminal and paste the token it prints."
+  echo "Post-mortems and Ask answers run on Ollama now. To run them on your Claude subscription instead (much better"
+  echo "answers), run  claude setup-token  in another terminal and paste the token it prints."
   token=""
   read -r -s -p "Paste the token (hidden; Enter to skip): " token || true
   echo
   if [ -z "$token" ]; then
-    echo "skipped: post-mortems stay on Ollama (re-run ./scripts/setup.sh to add the token later)"
+    echo "skipped: post-mortems and Ask stay on Ollama (re-run ./scripts/setup.sh to add the token later)"
   else
     case "$token" in
       *[!A-Za-z0-9._-]*) echo "that does not look like a token (letters, digits, . _ - only); nothing saved" ;;
@@ -314,6 +315,14 @@ if typing && command -v claude >/dev/null 2>&1 && [ -z "$(envval CLAUDE_CODE_OAU
     esac
   fi
   unset token
+fi
+
+# The operator token lets an agent or ./scripts/fg make the owner decisions OPERATOR_ALLOW names (by default not
+# deciding lessons or deleting data). Made only when you say yes (or pass --yes), before the start so the api has it.
+if [ -z "$(envval FG_OPERATOR_TOKEN)" ] &&
+  confirm "Create an operator token, so agents and ./scripts/fg can scan, triage the Inbox and sync (lessons stay yours)? [Y/n]" y; then
+  setenv FG_OPERATOR_TOKEN "$(openssl rand -hex 24)"
+  echo "FG_OPERATOR_TOKEN saved to .env (not printed; ./scripts/fg reads it from there; OPERATOR_ALLOW says what it may do)"
 fi
 
 compose=(docker compose)

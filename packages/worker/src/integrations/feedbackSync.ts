@@ -1,5 +1,5 @@
 import {
-  authorKindOf, githubRepoOfRemote, integrationErrorKind, IntegrationError, redactSecrets,
+  authorKindOf, feedbackSkipRule, githubRepoOfRemote, integrationErrorKind, IntegrationError, redactSecrets,
   type ActivityStore, type Credential, type DocsStore, type ExternalRef, type ExternalThread, type FetchPrOpts, type GraphStore,
   type IntegrationKind, type Integrations, type IntegrationSyncState, type LinearComment, type PrContext, type Project, type WorkSession,
 } from '@fb/core';
@@ -19,7 +19,8 @@ export type SyncProject = Project & { remote: string | null };
 
 export type FeedbackSyncDeps = {
   integrations: Pick<Integrations, 'credential' | 'sync' | 'saveSync' | 'link'>;
-  graph: Pick<GraphStore, 'upsertExternalThread' | 'workSessions'>;
+  /** listCandidates: the pending Inbox items a skip rule matches after a backfill (unset: not looked at). */
+  graph: Pick<GraphStore, 'upsertExternalThread' | 'workSessions'> & Partial<Pick<GraphStore, 'listCandidates'>>;
   cursors: Pick<DocsStore, 'getCursor' | 'setCursor'>;
   /** The tracked (and not excluded) projects, with their canonical remotes. */
   projects(): Promise<SyncProject[]>;
@@ -46,6 +47,15 @@ const WINDOW_MS = 2 * DAY;
 const CONTEXT_CAP = 2500;
 
 export const feedbackCursor = (kind: IntegrationKind, projectKey: string) => `feedback-${kind}:${projectKey}`;
+/**
+ * Set once a project's GitHub comments carry their author details (author kind, PR author, reply, review verdict).
+ * Comments synced before those were kept have none, so the skip rules cannot see them: the first sync without this
+ * marker fetches the last `lookbackDays` again, which rewrites the stored comments' details (classifications stay).
+ */
+export const authorsCursor = (projectKey: string) => `feedback-github-authors:${projectKey}`;
+/** Failed backfill tries, as `<count>|<last try>`: a failing one waits the sync interval, and stops after MAX_BACKFILL_TRIES. */
+const authorsTriesCursor = (projectKey: string) => `feedback-github-authors-tries:${projectKey}`;
+const MAX_BACKFILL_TRIES = 3;
 
 /** The repository a project's PR comments come from: GITHUB_REPOS first, else its github.com remote. */
 export function githubTarget(p: SyncProject, override?: Map<string, string>): string | null {
@@ -64,23 +74,29 @@ const DEFAULT_BRANCHES = new Set(['main', 'master', 'develop', 'dev', 'trunk']);
  */
 const mayBeOnBranch = (s: WorkSession, branch: string | null) => !branch || !s.gitBranch || s.gitBranch === branch || DEFAULT_BRANCHES.has(s.gitBranch);
 
+/** A session that may have done the work, and how it was found: on the work's branch, or by time alone. */
+export type WorkMatch = WorkSession & { by: 'branch' | 'time' };
+
 /**
  * The agent sessions that most likely did the work: those of the project on the work's branch that edited files or
  * committed before the comment, most edits first; with none, the one session that did work in the two days before it
  * (several, or one on another feature branch: none, rather than a wrong one). The store already leaves read-only sessions out; checked again here.
+ * A match by time alone is a guess: the post-mortem accepts it only with evidence that the session did this work
+ * (postmortem/work.ts), and the sync does not link it.
  */
-export async function findWorkSessions(graph: Pick<GraphStore, 'workSessions'>, projectKey: string, branch: string | null, before: string): Promise<WorkSession[]> {
+export async function findWorkSessions(graph: Pick<GraphStore, 'workSessions'>, projectKey: string, branch: string | null, before: string): Promise<WorkMatch[]> {
   if (branch) {
     const onBranch = (await graph.workSessions({ projectKey, branch, before, limit: 3 })).filter(didWork);
-    if (onBranch.length) return onBranch;
+    if (onBranch.length) return onBranch.map((s) => ({ ...s, by: 'branch' as const }));
   }
   const after = new Date(Date.parse(before) - WINDOW_MS).toISOString();
   const near = (await graph.workSessions({ projectKey, branch: null, before, after, limit: 2 })).filter(didWork);
-  return near.length === 1 && mayBeOnBranch(near[0], branch) ? near : [];
+  return near.length === 1 && mayBeOnBranch(near[0], branch) ? [{ ...near[0], by: 'time' }] : [];
 }
 
+/** The sessions shown as a comment's work: only those on its branch (a match by time alone is not known to be it). */
 export async function linkWorkSessions(graph: Pick<GraphStore, 'workSessions'>, projectKey: string, branch: string | null, before: string): Promise<string[]> {
-  return (await findWorkSessions(graph, projectKey, branch, before)).map((s) => s.id);
+  return (await findWorkSessions(graph, projectKey, branch, before)).filter((s) => s.by === 'branch').map((s) => s.id);
 }
 
 const clip = (s: string, n = CONTEXT_CAP) => (s.length > n ? `${s.slice(0, n)}…` : s);
@@ -154,7 +170,8 @@ export function linearThread(comments: LinearComment[], floorMs: number, linked:
   };
 }
 
-type Outcome = { added: number; threads: number; target: string };
+type Skippable = { uuid: string; rule: string };
+type Outcome = { added: number; threads: number; target: string; skippable?: Skippable[] };
 
 /** Sync both services for every tracked project. Returns how many new comments each brought in. */
 export async function syncExternalFeedback(d: FeedbackSyncDeps): Promise<Record<IntegrationKind, number>> {
@@ -194,11 +211,20 @@ async function syncKind(kind: IntegrationKind, cred: Credential, projects: SyncP
     const started = now();
     if (since && started.getTime() - Date.parse(since) < d.minIntervalMs) continue;
     attempted = true;
-    const floorMs = (since ? Date.parse(since) : started.getTime()) - lookback;
-    const fetchSince = since ?? new Date(started.getTime() - lookback).toISOString();
+    // Synced before author details were kept: this once, the whole look-back window again (authorsCursor).
+    const authorsKnown = kind !== 'github' || !!(await d.cursors.getCursor(authorsCursor(p.key)));
+    const [triesRaw, lastTry] = (!authorsKnown && (await d.cursors.getCursor(authorsTriesCursor(p.key)))?.split('|')) || [];
+    const tries = Number(triesRaw) || 0;
+    // A failed backfill is the whole look-back window: not again every cycle, only once the sync interval has passed.
+    const backfill = !!since && !authorsKnown && !(lastTry && started.getTime() - Date.parse(lastTry) < d.minIntervalMs);
+    const floorMs = (since && !backfill ? Date.parse(since) : started.getTime()) - lookback;
+    const fetchSince = since && !backfill ? since : new Date(started.getTime() - lookback).toISOString();
     try {
-      const r = kind === 'github' ? await syncRepo(p, target, cred.token, fetchSince, floorMs, d) : await syncTeam(p, target, link.linearTeamName ?? target, cred.token, fetchSince, floorMs, d);
+      const r = kind === 'github' ? await syncRepo(p, target, cred.token, fetchSince, floorMs, d, backfill) : await syncTeam(p, target, link.linearTeamName ?? target, cred.token, fetchSince, floorMs, d);
       await d.cursors.setCursor(cursorKey, started.toISOString());
+      // Only a backfill (or a first sync, which fetches everything with author details) marks them known.
+      if (!authorsKnown && (backfill || !since)) await d.cursors.setCursor(authorsCursor(p.key), started.toISOString());
+      if (r.skippable?.length) await reportPendingMatches(p, r.skippable, d);
       added += r.added;
       state.projects[p.key] = { lastSyncAt: started.toISOString(), items: (state.projects[p.key]?.items ?? 0) + r.added, error: null, target: kind === 'github' ? target : link.linearTeamName ?? target };
       if (r.added) {
@@ -210,6 +236,11 @@ async function syncKind(kind: IntegrationKind, cred: Credential, projects: SyncP
         });
       }
     } catch (err) {
+      if (backfill) {
+        await d.cursors.setCursor(authorsTriesCursor(p.key), `${tries + 1}|${started.toISOString()}`);
+        // Given up: the comments keep what they have, and the skip rules work on what arrives from now on.
+        if (tries + 1 >= MAX_BACKFILL_TRIES) await d.cursors.setCursor(authorsCursor(p.key), started.toISOString());
+      }
       const errorKind = integrationErrorKind(err);
       const message = redactSecrets(err instanceof Error ? err.message : String(err)).slice(0, 500);
       d.log?.(`${kind} feedback sync failed`, { projectKey: p.key, kind: errorKind, error: message });
@@ -230,20 +261,57 @@ async function syncKind(kind: IntegrationKind, cred: Credential, projects: SyncP
   return added;
 }
 
-async function syncRepo(p: SyncProject, repo: string, token: string, since: string, floorMs: number, d: FeedbackSyncDeps): Promise<Outcome> {
+/** backfill: stored comments get their author details now; the ones a skip rule matches come back as `skippable`. */
+async function syncRepo(p: SyncProject, repo: string, token: string, since: string, floorMs: number, d: FeedbackSyncDeps, backfill = false): Promise<Outcome> {
   const prs = await d.fetchPrs({ repo, token, since });
   let added = 0;
   let threads = 0;
+  const skippable: Skippable[] = [];
   for (const pr of prs) {
     const fresh = pr.comments.filter((c) => c.createdAt && Date.parse(c.createdAt) >= floorMs);
     if (!fresh.length) continue;
     const latest = fresh.map((c) => c.createdAt).sort().at(-1)!;
     const linked = await linkWorkSessions(d.graph, p.key, pr.headBranch, latest);
-    const n = await d.graph.upsertExternalThread(p, prThread(pr, floorMs, linked, d));
+    const thread = prThread(pr, floorMs, linked, d);
+    const n = await d.graph.upsertExternalThread(p, thread);
     added += n;
     if (n) threads++;
+    if (backfill) {
+      for (const i of thread.items) {
+        const rule = feedbackSkipRule(i.text, i.external);
+        if (rule) skippable.push({ uuid: i.uuid, rule: rule.name });
+      }
+    }
   }
-  return { added, threads, target: repo };
+  return { added, threads, target: repo, skippable };
+}
+
+/** Most pending Inbox items looked at for skip-rule matches after a backfill. */
+const PENDING_LIMIT = 1000;
+
+/**
+ * After a backfill: the pending Inbox items that a skip rule matches now that their authors are known (say, the PR
+ * author's "Fixed in <sha>" reply). They were flagged before the rules could see them. Nothing is decided for you:
+ * they stay pending, the Inbox shows the matching rule, and this note says how many there are.
+ */
+async function reportPendingMatches(p: SyncProject, skippable: Skippable[], d: FeedbackSyncDeps): Promise<void> {
+  if (!d.graph.listCandidates) return;
+  const ruleOf = new Map(skippable.map((s) => [s.uuid, s.rule]));
+  const pending = await d.graph.listCandidates({ status: 'pending', projectKey: p.key, limit: PENDING_LIMIT });
+  const hits = pending.flatMap((c) => {
+    const rule = ruleOf.get(c.turnUuid) ?? ruleOf.get(c.id);
+    return rule ? [{ id: c.id, rule }] : [];
+  });
+  if (!hits.length) return;
+  const counts: Record<string, number> = {};
+  for (const h of hits) counts[h.rule] = (counts[h.rule] ?? 0) + 1;
+  await d.activity?.record({
+    kind: 'feedback_synced', actor: 'github', projectKey: p.key,
+    subject: `${hits.length} pending Inbox item${hits.length === 1 ? ' matches' : 's match'} a skip rule now that ${hits.length === 1 ? 'its author is' : 'their authors are'} known`,
+    why: 'synced before author details were kept, so the skip rules could not see them; they stay pending for you to decide, with the rule shown',
+    details: { pendingMatches: counts },
+    targets: hits.map((h) => h.id),
+  });
 }
 
 async function syncTeam(p: SyncProject, teamId: string, teamName: string, apiKey: string, since: string, floorMs: number, d: FeedbackSyncDeps): Promise<Outcome> {

@@ -14,13 +14,16 @@ export const OWNER_ROUTES: readonly (readonly ['POST' | 'PUT' | 'PATCH' | 'DELET
   ['POST', '/api/candidates/:id/decision', 'inbox_decide'],
   ['POST', '/api/candidates/decisions', 'inbox_decide'],
   ['PATCH', '/api/lessons/:id', 'lesson_decide'],
+  ['POST', '/api/lessons/:id/to-fact', 'lesson_decide'],
   ['POST', '/api/projects/:key/scan', 'scan'],
   ['POST', '/api/projects/scan', 'scan'],
+  ['POST', '/api/projects/:key/codemap/rebuild', 'scan'],
   ['PATCH', '/api/projects/:key/facts/:id/relevance', 'relevance'],
   ['PUT', '/api/projects/:key/pin', 'pin'],
   ['PUT', '/api/links', 'links'],
   ['DELETE', '/api/links/:id', 'links'],
   ['POST', '/api/projects/:key/docs', 'docs'],
+  ['POST', '/api/docs/:id/reread', 'docs'],
   ['DELETE', '/api/docs/:id', 'docs_delete'],
   ['DELETE', '/api/projects/:key', 'delete_project'],
   ['POST', '/api/feedback/:id/retry', 'retry'],
@@ -35,6 +38,11 @@ export const OWNER_ROUTES: readonly (readonly ['POST' | 'PUT' | 'PATCH' | 'DELET
   ['POST', '/api/settings/integrations/:kind/test', 'integrations'],
   ['DELETE', '/api/settings/integrations/:kind', 'integrations'],
   ['PUT', '/api/settings/integrations/projects/:key', 'integrations'],
+  ['POST', '/api/chats', 'chat'],
+  ['POST', '/api/chats/:id/messages', 'chat'],
+  ['POST', '/api/chats/:id/turns/:turnId/retry', 'chat'],
+  ['PATCH', '/api/chats/:id', 'chat'],
+  ['DELETE', '/api/chats/:id', 'chat_delete'],
 ];
 
 const MAX_NAME = 40;
@@ -60,14 +68,19 @@ export const runAs = <T>(actor: string, fn: () => T): T => acting.run(actor, fn)
 export const currentActor = (): string => acting.getStore() ?? 'you';
 export const actingAsOperator = (): boolean => acting.getStore() !== undefined;
 
-/** The store's record, with the owner's writes made through the operator token logged as the agent instead of you. */
+/**
+ * The store's record, with the owner's writes made through the operator token logged as the agent instead of you: the
+ * actor, and a `why` written for the owner ("you pinned it") reworded to name the agent ("an agent (operator:codex)
+ * pinned it").
+ */
 export function asActor<T extends Pick<ActivityStore, 'record'>>(a: T): T;
 export function asActor<T extends Pick<ActivityStore, 'record'>>(a: T | undefined): T | undefined;
 export function asActor<T extends Pick<ActivityStore, 'record'>>(a: T | undefined): T | undefined {
   if (!a) return a;
   const record: ActivityStore['record'] = (e) => {
     const actor = acting.getStore();
-    return a.record(actor && e.actor === 'you' ? { ...e, actor } : e);
+    if (!actor || e.actor !== 'you') return a.record(e);
+    return a.record({ ...e, actor, why: e.why.startsWith('you ') ? `an agent (${actor}) ${e.why.slice(4)}` : e.why });
   };
   return new Proxy(a, {
     get: (t, k) => {

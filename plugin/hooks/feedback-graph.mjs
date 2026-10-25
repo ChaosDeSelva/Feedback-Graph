@@ -1,9 +1,10 @@
 #!/usr/bin/env node
 // Claude Code hooks for the Feedback Graph. One script, one event per call:
-//   prompt   UserPromptSubmit: adds the task's lessons, past misses and code map (get_task_context) to the prompt
+//   prompt   UserPromptSubmit: adds the task's approved lessons and the past misses on the files the prompt names
+//            (from get_task_context, about 1,500 characters) to a request; skips pure questions
 //   edit     PreToolUse on Edit/Write/MultiEdit/NotebookEdit: adds a file's lessons and misses (get_module_context)
 //            the first time this session edits it, when it has any
-//   stop     Stop: once, asks the agent to run check_before_done when it changed files and has not checked since
+//   stop     Stop: once, asks the agent to run check_before_done, naming the files it edited since its last check
 //   session  SessionStart after /clear or a compaction: forgets what this session was shown, so it is shown again
 // Every hook is silent outside a project selected in the Feedback Graph, and when the Feedback Graph is unreachable:
 // it never blocks or slows real work beyond its timeout.
@@ -12,7 +13,7 @@
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { asksForContext, contextForPrompt, doneCheckPending, mcpText, moduleWorthSaying, stopDecision } from './lib.mjs';
+import { asksForContext, contextForPrompt, doneCheckPending, editedSince, mcpText, moduleWorthSaying, promptFiles, stopDecision } from './lib.mjs';
 
 const BASE = (process.env.FEEDBACK_GRAPH_URL || 'http://localhost:8787').replace(/\/+$/, '');
 const TOKEN = process.env.FEEDBACK_GRAPH_TOKEN || '';
@@ -58,7 +59,8 @@ const addContext = (event, text) => process.stdout.write(JSON.stringify({ hookSp
 const handlers = {
   async prompt(input) {
     if (!asksForContext(input.prompt) || !(await tracked(input.cwd))) return;
-    const md = await tool('get_task_context', { cwd: input.cwd, task: input.prompt.slice(0, 1_000) }, 12_000);
+    const files = promptFiles(input.prompt);
+    const md = await tool('get_task_context', { cwd: input.cwd, task: input.prompt.slice(0, 1_000), ...(files.length ? { files } : {}) }, 12_000);
     if (!md) return;
     const state = loadState(input.session_id);
     const r = contextForPrompt(md, state);
@@ -81,7 +83,7 @@ const handlers = {
     const project = await tracked(input.cwd);
     if (!project) return;
     const lines = readFileSync(input.transcript_path, 'utf8').split('\n');
-    const d = stopDecision(input, doneCheckPending(lines), project);
+    const d = stopDecision(input, doneCheckPending(lines), project, editedSince(lines));
     if (d) process.stdout.write(JSON.stringify(d));
   },
 

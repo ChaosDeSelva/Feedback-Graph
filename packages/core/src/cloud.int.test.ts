@@ -111,7 +111,7 @@ describeStores('cloud sync', (h) => {
       return Response.json({ syncId: 's', org: 'acme', projects: [], lessons: { team: 0, suggested: 0, skipped: 0 }, misses: 0, facts: { files: 0, unchanged: 0 }, docs: 0 });
     }) as unknown as typeof fetch;
     // A fresh memory each run, as a restarted worker or the api's Sync now would have: only the store carries over.
-    const run = (projects: string[]) => runCloudSync({ cloud: fake, portability: store.portability, projects: async () => projects, trigger: 'manual', fetch: f, memory: storedSyncMemory(store.docs, fake) });
+    const run = (projects: string[], force = false) => runCloudSync({ cloud: fake, portability: store.portability, projects: async () => projects, trigger: 'manual', fetch: f, memory: storedSyncMemory(store.docs, fake), force });
     await run(['demo', 'blog']);
     const [doc] = (await store.portability.exportData({ projectKey: 'demo' })).docs;
     await store.docs.deleteDoc(doc.id);
@@ -120,7 +120,10 @@ describeStores('cloud sync', (h) => {
     expect(bodies[2]).toMatchObject({ projectKey: 'demo', withdrawn: [{ kind: 'doc', id: doc.id }] });
     expect(bodies[3]).toMatchObject({ projectKey: 'blog', complete: true, lessons: [] });
     expect(bodies[3].withdrawn.length).toBeGreaterThan(0);
-    await run(['demo']);
+    // Nothing changed since: the stored memory skips it, unless the sync is forced.
+    expect((await run(['demo'])).projects.map((p) => p.status)).toEqual(['unchanged']);
+    expect(bodies).toHaveLength(4);
+    await run(['demo'], true);
     expect(bodies.slice(4).map((b) => b.projectKey)).toEqual(['demo']);
   });
 

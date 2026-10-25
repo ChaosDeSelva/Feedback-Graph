@@ -34,8 +34,8 @@ export class Neo4jProbe implements StoreProbe {
   }
 
   async project(key: string) {
-    const [r] = await this.g.run('MATCH (p:Project {key: $key}) RETURN p.key AS key, p.remote AS remote, p.aliases AS aliases', { key });
-    return r ? { key: r.get('key'), remote: r.get('remote') ?? null, aliases: r.get('aliases') ?? [] } : null;
+    const [r] = await this.g.run('MATCH (p:Project {key: $key}) RETURN p.key AS key, p.remote AS remote, p.aliases AS aliases, p.repoPath AS repoPath', { key });
+    return r ? { key: r.get('key'), remote: r.get('remote') ?? null, aliases: r.get('aliases') ?? [], repoPath: r.get('repoPath') ?? null } : null;
   }
 
   async sessionSource(id: string): Promise<string | null> {

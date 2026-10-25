@@ -80,6 +80,15 @@ export const FEEDBACK_SKIP_RULES: readonly FeedbackSkipRule[] = [
   },
 ];
 
+/**
+ * An AI agent reviewing its own pull request: an agent-written comment posted under the PR author's account (the
+ * developer's agent reviewing the agent's PR). Still classified, but labelled self-review rather than a reviewer's
+ * pushback, in the Inbox and on the lesson.
+ */
+export function isSelfReview(ext: ExternalRef): boolean {
+  return ext.source === 'github' && ext.authorKind === 'agent' && !!ext.threadAuthor && ext.author.toLowerCase() === ext.threadAuthor.toLowerCase();
+}
+
 /** The first rule that skips this comment, or null when it goes to the model. */
 export function feedbackSkipRule(text: string, ext: ExternalRef): FeedbackSkipRule | null {
   return FEEDBACK_SKIP_RULES.find((r) => r.skips(text, ext)) ?? null;

@@ -1,5 +1,6 @@
 import type { Store } from '../store.ts';
 import { ActivityRepo } from './activity.ts';
+import { ChatRepo } from './chat.ts';
 import { CodeGraphRepo } from './codegraph.ts';
 import { DocsRepo } from './docs.ts';
 import { EmbeddingsRepo } from './embeddings.ts';
@@ -30,6 +31,7 @@ export function neo4jStore(g: GraphRepo): Store {
     selection: new SelectionRepo(g),
     codegraph: new CodeGraphRepo(g),
     sessions: new SessionsRepo(g),
+    chats: new ChatRepo(g),
     ensureSchema: async () => {
       await g.ensureSchema();
       await backfillSessionStats(g);

@@ -105,10 +105,13 @@ export async function buildCodeMap(repoPath: string, opts: BuildOpts, prev?: Cod
   const entries = listed.map((f) => parsed.get(f.path)).filter((p): p is Parsed => !!p).sort((a, b) => (a.file.path < b.file.path ? -1 : a.file.path > b.file.path ? 1 : 0));
   const resolve = makeResolver(entries.map((e) => e.file.path), (p) => resolverInput.get(p));
   const imports: CodeImport[] = [];
+  let unresolved = 0;
   for (const { file, raw } of entries) {
     const byTarget = new Map<string, CodeImport>();
     for (const r of raw) {
-      for (const { to, names } of resolve(file.path, file.lang, r)) {
+      const found = resolve(file.path, file.lang, r);
+      if (found.some((x) => x.unresolved)) unresolved++;
+      for (const { to, names } of found) {
         const target = to.startsWith('pkg:') ? redactSecrets(to) : to;
         const e = byTarget.get(target);
         const clean = names.map(redactSecrets);
@@ -118,5 +121,5 @@ export async function buildCodeMap(repoPath: string, opts: BuildOpts, prev?: Cod
     }
     imports.push(...byTarget.values());
   }
-  return { files: entries.map((e) => e.file), symbols: entries.flatMap((e) => e.symbols), imports, candidates: totalCandidates };
+  return { files: entries.map((e) => e.file), symbols: entries.flatMap((e) => e.symbols), imports, candidates: totalCandidates, unresolved };
 }

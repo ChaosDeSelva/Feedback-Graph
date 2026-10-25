@@ -1,5 +1,6 @@
 import type { Store } from '@fb/core';
 import { PgActivityStore } from './activity.ts';
+import { PgChatStore } from './chat.ts';
 import { PgCodeGraphStore } from './codegraph.ts';
 import { openDb, type Db, type PostgresConfig } from './db.ts';
 import { PgDocsStore } from './docs.ts';
@@ -34,6 +35,7 @@ export function postgresStore(db: Db): PostgresStore {
     selection: new PgSelectionStore(db),
     codegraph: new PgCodeGraphStore(db),
     sessions: new PgSessionsStore(db),
+    chats: new PgChatStore(db),
     ensureSchema: async () => {
       await migrate(db.pool, { embeddingDimensions: db.dims });
       await checkPgvector(db);

@@ -32,6 +32,7 @@ beforeEach(() => {
     if (url === '/api/projects/demo-shop/docs') return Response.json([{ id: 'doc:demo-shop:github:github:me/shop#3', projectKey: 'demo-shop', source: 'github', ref: 'github:me/shop#3', title: 'me/shop#3: Orders', url: 'https://github.com/me/shop/pull/3', addedAt: 't', chunks: 4 }]);
     if (url.startsWith('/api/docs/') && init?.method === 'DELETE') return new Response(null, { status: 204 });
     if (url.endsWith('/scan')) return Response.json(job('queued'), { status: 202 });
+    if (url.startsWith('/api/projects/demo-shop/codemap/module')) return Response.json({ file: { path: 'src/db.ts', lang: 'typescript', hash: 'h', loc: 10, isTest: false, churn: null }, symbols: [], importers: [], imports: [], tests: [], facts: [], misses: [], lessons: [] });
     if (url.startsWith('/api/projects/demo-shop/codemap/hotspots')) return Response.json({ meta: { fingerprint: 'x', builtAt: '2026-10-22T12:00:00Z', stats: { files: 40, symbols: 200, imports: 90, tests: 12 } }, hotspots: [{ path: 'src/routes/orders.ts', churn: 5, misses: 1, dependents: 2, score: 8.17 }] });
     return Response.json([]);
   }));
@@ -60,6 +61,13 @@ test('a queued scan shows its place in the queue (scans waiting out a retry are 
   render(<Projects />);
   await screen.findByText('Use sendError for all errors');
   expect(screen.getByText(/2nd in the queue/)).toBeTruthy();
+});
+
+test("an agentic scan's line says how many of its shards were rescanned (the others had not changed)", async () => {
+  projectList = [{ ...projects[0], lastScan: { ...job('done'), shards: { total: 20, rescanned: 12, failed: 1 } } }, projects[1]];
+  render(<Projects />);
+  await screen.findByText('Use sendError for all errors');
+  expect(screen.getByText('12 of 20 shards rescanned, 1 failed')).toBeTruthy();
 });
 
 test('each project shows its git remote under its name, and the selected one its other clones', async () => {
@@ -240,6 +248,74 @@ test('each fact shows its everyday relevance, and you can set it; sorting by rel
   expect(order[order.length - 1]).toMatch(/Unscored/);
 });
 
+test('selecting or pinning a project never scrolls the page: the list scrolls only itself', async () => {
+  const into = vi.fn();
+  const proto = Element.prototype as unknown as { scrollIntoView?: unknown };
+  const before = proto.scrollIntoView;
+  proto.scrollIntoView = into;
+  try {
+    render(<Projects />);
+    await screen.findByText('Use sendError for all errors');
+    fireEvent.click(screen.getByRole('button', { name: 'pin other' }));
+    fireEvent.click(await row('other'));
+    await screen.findByText(/No facts yet/);
+    // scrollIntoView scrolls every scrolling ancestor, the page included; that clipped the header by ~30px.
+    expect(into).not.toHaveBeenCalled();
+  } finally {
+    proto.scrollIntoView = before;
+  }
+});
+
+test('a fact shows how well its citation was checked and, for a manifest fact, where it came from; never a confidence percentage', async () => {
+  projectList = [{ ...projects[0], facts: 12, factsByOrigin: { model: 7, manifest: 4, document: 1 } }, projects[1]];
+  vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+    if (url === '/api/projects') return Response.json(projectList);
+    if (url.startsWith('/api/projects/demo-shop/facts')) return Response.json([
+      { ...fact('f1', 'createPool returns a pg Pool'), evidence: 'line', origin: 'model' },
+      { ...fact('f2', 'Pools are per process'), lines: null, evidence: 'file', origin: 'model' },
+      { ...fact('f3', '`dev` script runs: vite'), path: 'package.json', lines: null, evidence: 'file', origin: 'manifest' },
+      { ...fact('f4', 'An older fact') },
+      { ...fact('f5', 'Uses pnpm workspaces'), lines: null, evidence: 'none', origin: 'model' },
+    ]);
+    return Response.json([]);
+  }));
+  render(<Projects />);
+  const li = async (text: string) => (await screen.findByText(text)).closest('li')!;
+  expect(within(await li('createPool returns a pg Pool')).getByText('line checked')).toBeTruthy();
+  expect(within(await li('Pools are per process')).getByText('file only')).toBeTruthy();
+  // No file to check reads as just that, never as a scope.
+  expect(within(await li('Uses pnpm workspaces')).getByText('not checkable (no file)')).toBeTruthy();
+  expect(screen.queryByText('project-wide')).toBeNull();
+  // facts are grouped by file, the rest collapsed: open package.json's group
+  fireEvent.click(screen.getByRole('button', { name: /package\.json · 1 fact/ }));
+  expect(within(await li('`dev` script runs: vite')).getByText('manifest')).toBeTruthy();
+  expect(within(await li('An older fact')).queryByText(/checked|file only/)).toBeNull();
+  expect(screen.queryByText('90%')).toBeNull();
+  // the headline is the model's facts; manifest and document facts are counted beside them
+  expect(screen.getByText(/4 from manifests, 1 from documents/)).toBeTruthy();
+});
+
+test('a fact you wrote (a converted lesson) says so, keeps its relevance through rescans, and its history is the conversion', async () => {
+  projectList = [{ ...projects[0], facts: 3, factsByOrigin: { model: 1, manifest: 0, document: 0, you: 2 } }, projects[1]];
+  const asked: string[] = [];
+  vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+    if (url === '/api/projects') return Response.json(projectList);
+    if (url.startsWith('/api/projects/demo-shop/facts')) return Response.json([
+      { ...fact('f1', 'Orders are read from the source table', 'convention', 0.8), relevanceBy: 'you', source: 'you', lines: null, origin: 'you', scanJobId: null, fileHash: null, fileSummary: null, why: 'From the lesson "Read orders"' },
+    ]);
+    if (url.startsWith('/api/activity?')) { asked.push(url); return Response.json([{ id: 'a1', ts: '2026-10-22T20:33:00Z', kind: 'lesson_to_fact', actor: 'you', projectKey: 'demo-shop', subject: 'converted lesson "Read orders" to a convention fact', why: 'you converted it', details: {}, targets: ['lesson:1', 'f1'] }]); }
+    return Response.json([]);
+  }));
+  render(<Projects />);
+  const item = (await screen.findByText('Orders are read from the source table')).closest('li')!;
+  expect(within(item).getByText('yours').getAttribute('title')).toMatch(/no scan replaces it/);
+  expect(within(item).getByText(/set by you/).getAttribute('title')).toMatch(/no scan replaces it/);
+  expect(screen.getByText(/2 you wrote/)).toBeTruthy();
+  fireEvent.click(within(item).getByRole('button', { name: 'how was this created?' }));
+  expect(await screen.findByText('you converted it')).toBeTruthy();
+  expect(asked).toEqual(['/api/activity?target=f1&kind=lesson_to_fact&limit=10']);
+});
+
 test('pin a project from the list: it moves to the top and stays marked pinned', async () => {
   let pinned = false;
   vi.stubGlobal('fetch', vi.fn(async (url: string, init?: RequestInit) => {
@@ -265,6 +341,23 @@ test('uploads an image as context: sent as base64 with its type, never as text',
   const file = new File([new Uint8Array([0x89, 0x50, 0x4e, 0x47])], 'flow.png', { type: 'image/png' });
   fireEvent.change(input, { target: { files: [file] } });
   await waitFor(() => expect(calls).toContainEqual({ url: '/api/projects/demo-shop/docs', body: { title: 'flow.png', name: 'flow.png', image: { mediaType: 'image/png', data: 'iVBORw==' } } }));
+});
+
+test('a failed upload can be read again with Retry, without uploading it again', async () => {
+  const read = (status: string) => ({ status, attempts: 1, error: status === 'failed' ? 'cannot read images: set DOCS_LLM to a model with vision' : null, retryAt: null, readAt: null, facts: 0 });
+  let status = 'failed';
+  vi.stubGlobal('fetch', vi.fn(async (url: string, init?: RequestInit) => {
+    calls.push({ url, body: init?.method });
+    if (url === '/api/projects') return Response.json(projects);
+    if (url === '/api/docs/doc%3Ademo-shop%3Aupload%3Amock.png/reread' && init?.method === 'POST') { status = 'pending'; return new Response(null, { status: 204 }); }
+    if (url === '/api/projects/demo-shop/docs') return Response.json([{ id: 'doc:demo-shop:upload:mock.png', projectKey: 'demo-shop', source: 'upload', ref: 'mock.png', title: 'mock.png', url: null, addedAt: 't', chunks: 1, kind: 'image', mediaType: 'image/png', read: read(status) }]);
+    return Response.json([]);
+  }));
+  render(<Projects />);
+  const item = (await screen.findByText(/not read: cannot read images/)).closest('li')!;
+  fireEvent.click(within(item).getByRole('button', { name: 'retry reading mock.png' }));
+  await waitFor(() => expect(calls).toContainEqual({ url: '/api/docs/doc%3Ademo-shop%3Aupload%3Amock.png/reread', body: 'POST' }));
+  expect(await screen.findByText(/queued for reading|reading/)).toBeTruthy();
 });
 
 test('each upload shows whether it was read into facts: reading, how many facts, or why it failed; images show a thumbnail', async () => {
@@ -301,4 +394,69 @@ test('a fact read from a document says so, and its history is the document readi
   expect(within(item).getByText(/from your document flow\.png/)).toBeTruthy();
   fireEvent.click(within(item).getByRole('button', { name: 'how was this created?' }));
   await waitFor(() => expect(calls.some((c) => c.url === '/api/activity?target=doc%3Ademo-shop%3Aupload%3Aflow.png&kind=doc_read&limit=10')).toBe(true));
+});
+
+test('a module link (#projects/<key>/<path>) opens that project and its module panel', async () => {
+  location.hash = `#projects/demo-shop/${encodeURIComponent('src/ui/Modal.tsx')}`;
+  projectList = [projects[1], projects[0]];
+  try {
+    render(<Projects />);
+    expect(await screen.findByRole('region', { name: 'module src/ui/Modal.tsx' })).toBeTruthy();
+    expect(calls.map((c) => c.url)).toContain('/api/projects/demo-shop/codemap/module?path=src%2Fui%2FModal.tsx');
+  } finally {
+    location.hash = '';
+  }
+});
+
+test('facts sort by relevance by default, grouped by file: the first group open, the rest collapsed until clicked', async () => {
+  const at = (id: string, path: string, statement: string, relevance: number) => ({ ...fact(id, statement, 'convention', relevance), path });
+  vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+    if (url === '/api/projects') return Response.json(projects);
+    if (url.startsWith('/api/projects/demo-shop/facts')) return Response.json([at('a', 'AGENTS.md', 'Read the agents file', 0.2), at('b', 'src/db.ts', 'Scope every query', 0.9), at('c', 'src/db.ts', 'Close the pool', 0.5)]);
+    return Response.json([]);
+  }));
+  render(<Projects />);
+  expect(await screen.findByText('Scope every query')).toBeTruthy();
+  expect((screen.getByLabelText('sort facts') as HTMLSelectElement).value).toBe('relevance');
+  // src/db.ts holds the most relevant fact, so it comes first and open; AGENTS.md waits collapsed.
+  expect(screen.getByText('Close the pool')).toBeTruthy();
+  expect(screen.queryByText('Read the agents file')).toBeNull();
+  fireEvent.click(screen.getByRole('button', { name: /AGENTS\.md · 1 fact/ }));
+  expect(screen.getByText('Read the agents file')).toBeTruthy();
+});
+
+test('facts show 25 files at a time, then more on request', async () => {
+  const many = Array.from({ length: 30 }, (_, i) => ({ ...fact(`f${i}`, `Fact number ${i}`, 'convention', 0.5), path: `src/f${String(i).padStart(2, '0')}.ts` }));
+  vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+    if (url === '/api/projects') return Response.json(projects);
+    if (url.startsWith('/api/projects/demo-shop/facts')) return Response.json(many);
+    return Response.json([]);
+  }));
+  render(<Projects />);
+  await screen.findByText('Fact number 0');
+  expect(screen.getAllByRole('button', { name: /src\/f\d\d\.ts · 1 fact/ })).toHaveLength(25);
+  fireEvent.click(screen.getByRole('button', { name: 'Show 5 more files' }));
+  expect(screen.getAllByRole('button', { name: /src\/f\d\d\.ts · 1 fact/ })).toHaveLength(30);
+});
+
+test('a long fact is cut short with "show all"', async () => {
+  const long = `Dependencies: ${'react, '.repeat(80)}end-of-list`;
+  vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+    if (url === '/api/projects') return Response.json(projects);
+    if (url.startsWith('/api/projects/demo-shop/facts')) return Response.json([fact('f1', long)]);
+    return Response.json([]);
+  }));
+  render(<Projects />);
+  expect(await screen.findByText(/^Dependencies: react/)).toBeTruthy();
+  expect(screen.queryByText(/end-of-list/)).toBeNull();
+  fireEvent.click(screen.getByRole('button', { name: 'show all' }));
+  expect(screen.getByText(/end-of-list/)).toBeTruthy();
+});
+
+test('a fact file name opens that file module panel in the code map', async () => {
+  render(<Projects />);
+  await screen.findByText('Use sendError for all errors');
+  fireEvent.click(screen.getAllByRole('button', { name: 'open module src/db.ts' })[0]);
+  expect(await screen.findByRole('region', { name: 'module src/db.ts' })).toBeTruthy();
+  expect(calls.some((c) => c.url === '/api/projects/demo-shop/codemap/module?path=src%2Fdb.ts')).toBe(true);
 });

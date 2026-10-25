@@ -21,15 +21,17 @@ export function SectionLabel({ children, as: As = 'h3', className = '', id }: { 
   return <As id={id} className={`text-[11px] font-semibold tracking-[0.06em] text-muted uppercase ${className}`}>{children}</As>;
 }
 
-export type Tone = 'neutral' | 'info' | 'ok' | 'bad' | 'accent';
+/** `violet` is a fifth hue for marks that need one more distinct color (a cause, a source); it never means a status. */
+export type Tone = 'neutral' | 'info' | 'ok' | 'bad' | 'accent' | 'violet';
 const TONES: Record<Tone, string> = {
   neutral: 'bg-neutral-soft text-muted',
   info: 'bg-info-soft text-info-text',
   ok: 'bg-ok-soft text-ok-text',
   bad: 'bg-bad-soft text-bad-text',
   accent: 'bg-accent-soft text-accent-text',
+  violet: 'bg-violet-soft text-violet-text',
 };
-const DOTS: Record<Tone, string> = { neutral: 'bg-faint', info: 'bg-info', ok: 'bg-ok', bad: 'bg-bad', accent: 'bg-accent' };
+const DOTS: Record<Tone, string> = { neutral: 'bg-faint', info: 'bg-info', ok: 'bg-ok', bad: 'bg-bad', accent: 'bg-accent', violet: 'bg-violet' };
 
 export function Badge({ tone = 'neutral', dot = false, children, className = '', title }: { tone?: Tone; dot?: boolean; children: ReactNode; className?: string; title?: string }) {
   return (
@@ -49,9 +51,9 @@ export function statusTone(status: string): Tone {
 }
 
 /** Solid fills for bars and swatches, one per tone (neutral is muted so it still reads as a mark). */
-export const TONE_FILL: Record<Tone, string> = { neutral: 'bg-muted', info: 'bg-info', ok: 'bg-ok', bad: 'bg-bad', accent: 'bg-accent' };
+export const TONE_FILL: Record<Tone, string> = { neutral: 'bg-muted', info: 'bg-info', ok: 'bg-ok', bad: 'bg-bad', accent: 'bg-accent', violet: 'bg-violet' };
 
-/** Why a miss happened. The same label and the same tone on every page that shows one. */
+/** Why a miss happened. The same label and the same tone on every page that shows one, and no two causes share a tone. */
 export const CAUSE_LABEL: Record<string, string> = {
   context_missing: 'context missing',
   context_available_ignored: 'context available, ignored',
@@ -64,7 +66,7 @@ const CAUSE_TONE: Record<string, Tone> = {
   context_available_ignored: 'bad',
   requirement_unstated: 'neutral',
   verification_gap: 'accent',
-  implementation_error: 'bad',
+  implementation_error: 'violet',
 };
 export const causeLabel = (cause: string) => CAUSE_LABEL[cause] ?? cause;
 export const causeTone = (cause: string): Tone => CAUSE_TONE[cause] ?? 'neutral';

@@ -124,7 +124,7 @@ test('a lesson approved, synced, then moved back to proposed is still sent, with
   expect(body.complete).toBe(true);
   // And it keeps going with its status on later syncs (the cloud still has it).
   const third = fakeFetch([]);
-  await runCloudSync({ cloud, portability: store(bundles), projects: async () => ['shop'], trigger: 'manual', fetch: third.f, sleep: noSleep, memory });
+  await runCloudSync({ cloud, portability: store(bundles), projects: async () => ['shop'], trigger: 'manual', force: true, fetch: third.f, sleep: noSleep, memory });
   expect(sentBody(third.calls[0]).lessons.map((l) => [l.id, l.status])).toEqual([['lesson:1', 'proposed']]);
 });
 
@@ -261,7 +261,7 @@ test('401 stops the whole run; a 413 on one project does not stop the next; the 
   expect(r2.error).toMatch(/refused the token/);
 });
 
-test('a scheduled sync skips a project whose bundle has not changed since it was last sent; Sync now always sends', async () => {
+test('a sync skips a project whose bundle has not changed since it was last sent; Sync now resends only when forced', async () => {
   const activity = activityLog();
   const memory = new Map();
   const s = store({ shop: bundle('shop') });
@@ -272,11 +272,32 @@ test('a scheduled sync skips a project whose bundle has not changed since it was
   const r = await runCloudSync({ cloud, portability: s, activity, projects: async () => ['shop'], trigger: 'schedule', fetch: again.f, sleep: noSleep, memory });
   expect(again.calls).toHaveLength(0);
   expect(r.projects[0].status).toBe('unchanged');
-  // Nothing went anywhere, so nothing is logged.
+  // Nothing went anywhere on the schedule, so nothing is logged.
   expect(activity.rows).toHaveLength(1);
+  // Sync now diffs the same way, and says so: someone asked, so the answer is recorded.
   const manual = fakeFetch([]);
-  await runCloudSync({ cloud, portability: s, activity, projects: async () => ['shop'], trigger: 'manual', fetch: manual.f, sleep: noSleep, memory });
-  expect(manual.calls).toHaveLength(1);
+  const m = await runCloudSync({ cloud, portability: s, activity, projects: async () => ['shop'], trigger: 'manual', fetch: manual.f, sleep: noSleep, memory });
+  expect(manual.calls).toHaveLength(0);
+  expect(m.projects[0].status).toBe('unchanged');
+  expect(activity.rows).toHaveLength(2);
+  expect(activity.rows[1].subject).toBe('nothing to send to cloud.example.com: 1 project unchanged since the last sync');
+  // --force resends everything.
+  const forced = fakeFetch([]);
+  await runCloudSync({ cloud, portability: s, activity, projects: async () => ['shop'], trigger: 'manual', force: true, fetch: forced.f, sleep: noSleep, memory });
+  expect(forced.calls).toHaveLength(1);
+});
+
+test('a sync reports its progress, one project at a time', async () => {
+  const seen: unknown[] = [];
+  await runCloudSync({
+    cloud, portability: store({ shop: bundle('shop'), blog: bundle('blog') }), projects: async () => ['shop', 'blog'], trigger: 'manual',
+    fetch: fakeFetch([]).f, sleep: noSleep, onProgress: (p) => { seen.push(p); },
+  });
+  expect(seen).toEqual([
+    { done: 0, total: 2, current: 'shop' },
+    { done: 1, total: 2, current: 'blog' },
+    { done: 2, total: 2, current: null },
+  ]);
 });
 
 test('the preview counts what a sync would send, per project, without sending', async () => {
@@ -336,7 +357,7 @@ test('what was sent before and is gone now is listed in withdrawn: lessons, miss
   expect(r.projects[0].withdrawn).toBe(4);
   // Withdrawn once is enough: the next sync does not list them again.
   const third = fakeFetch([]);
-  await runCloudSync({ cloud, portability: store(bundles), projects: async () => ['shop'], trigger: 'manual', fetch: third.f, sleep: noSleep, memory });
+  await runCloudSync({ cloud, portability: store(bundles), projects: async () => ['shop'], trigger: 'manual', force: true, fetch: third.f, sleep: noSleep, memory });
   expect(sentBody(third.calls[0]).withdrawn).toEqual([]);
 });
 

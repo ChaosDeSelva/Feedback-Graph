@@ -1,5 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { Activity } from './Activity.tsx';
+import { Chat } from './Chat.tsx';
+import { Dashboard } from './Dashboard.tsx';
 import { Docs } from './Docs.tsx';
 import { api, NETWORK_EVENT, SIGN_IN_EVENT, type NetworkState, type SystemStatus } from './api.ts';
 import type { ModelHealth } from '@fb/core';
@@ -17,10 +19,12 @@ import { ConnectionsBadge } from './Connections.tsx';
 import { AppShell, type Health, type NavGroup } from './ui/AppShell.tsx';
 import { Button, Input } from './ui/controls.tsx';
 import { Alert } from './ui/display.tsx';
-import { ActivityIcon, DocIcon, FolderIcon, GearIcon, GraphIcon, InboxIcon, LessonIcon, Mark, PatternIcon, SessionIcon } from './ui/icons.tsx';
+import { ActivityIcon, AskIcon, DashboardIcon, DocIcon, FolderIcon, GearIcon, GraphIcon, InboxIcon, LessonIcon, Mark, PatternIcon, SessionIcon } from './ui/icons.tsx';
 
 const VIEWS = {
+  dashboard: { label: 'Dashboard', el: <Dashboard />, icon: <DashboardIcon /> },
   inbox: { label: 'Inbox', el: <Inbox />, icon: <InboxIcon /> },
+  ask: { label: 'Ask', el: <Chat />, icon: <AskIcon /> },
   lessons: { label: 'Lessons', el: <Lessons />, icon: <LessonIcon /> },
   graph: { label: 'Graph', el: <Graph />, icon: <GraphIcon /> },
   patterns: { label: 'Patterns', el: <Patterns />, icon: <PatternIcon /> },
@@ -34,7 +38,8 @@ type View = keyof typeof VIEWS;
 
 const item = (key: View) => ({ key, label: VIEWS[key].label, icon: VIEWS[key].icon });
 const GROUPS: NavGroup<View>[] = [
-  { label: 'Review', items: [item('inbox'), item('lessons')] },
+  { label: 'Overview', items: [item('dashboard')] },
+  { label: 'Review', items: [item('inbox'), item('ask'), item('lessons')] },
   { label: 'Insights', items: [item('graph'), item('patterns'), item('sessions')] },
   { label: 'Data', items: [item('projects'), item('activity')] },
   { label: 'Help', items: [item('docs')] },
@@ -42,7 +47,7 @@ const GROUPS: NavGroup<View>[] = [
 ];
 
 export function App() {
-  const fromHash = (): View => ((hashView() as View) in VIEWS ? (hashView() as View) : 'inbox');
+  const fromHash = (): View => ((hashView() as View) in VIEWS ? (hashView() as View) : 'dashboard');
   const [view, setView] = useState<View>(fromHash);
   // A link to one item (#lessons/<id>) keeps its id: only a different page rewrites the hash.
   useEffect(() => { if (hashView() !== view) location.hash = view; }, [view]);
@@ -104,7 +109,7 @@ export function App() {
   );
 }
 
-const MODEL_NAME = { classify: 'classifier', postmortem: 'post-mortem model', scan: 'scan model', summary: 'summary model', docs: 'docs reader' } as const;
+const MODEL_NAME = { classify: 'classifier', postmortem: 'post-mortem model', scan: 'scan model', summary: 'summary model', docs: 'docs reader', chat: 'Ask model' } as const;
 
 function health(status: SystemStatus | null): Health | null {
   if (!status || !('workerHealthy' in status)) return null;

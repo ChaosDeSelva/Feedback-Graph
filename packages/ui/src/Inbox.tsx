@@ -1,7 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { api, type Candidate, type CandidateDetail as Detail, type CandidateStatus, type FeedbackSource } from './api.ts';
-import { SOURCE_LABEL, SourceBadge } from './CandidateDetail.tsx';
+import { isSelfReview } from '@fb/core/feedback-rules';
+import { SelfReviewBadge, SOURCE_LABEL, SourceBadge } from './CandidateDetail.tsx';
 import { CandidateDetail } from './CandidateDetail.tsx';
+import { FirstRun } from './FirstRun.tsx';
 import { hashFocus } from './links.ts';
 import { PageHeader } from './ui/PageHeader.tsx';
 import { ListRow, SplitPane } from './ui/SplitPane.tsx';
@@ -23,7 +25,12 @@ function stableOrder(status: CandidateStatus, c: Candidate[]): Candidate[] {
 }
 
 export function Inbox() {
-  const [status, setStatus] = useState<CandidateStatus>('pending');
+  // A link to one item (#inbox/<id>, from a module panel) opens it in the tab of its status; a link to a tab
+  // (#inbox/confirmed, from the Dashboard) opens that tab.
+  const [link] = useState(() => hashFocus('inbox'));
+  const tabLink = TABS.find((t) => t === link);
+  const focus = tabLink ? null : link;
+  const [status, setStatus] = useState<CandidateStatus>(tabLink ?? 'pending');
   const [project, setProject] = useState('');
   const [all, setItems] = useState<Candidate[]>([]);
   // Where the feedback came from: a Claude Code or Codex session, or a comment on GitHub or Linear. Filtered here.
@@ -44,8 +51,6 @@ export function Inbox() {
   const deciding = useRef(false);
   const [busy, setBusy] = useState(false);
 
-  // A link to one item (#inbox/<id>, from a module panel) opens it in the tab of its status.
-  const [focus] = useState(() => hashFocus('inbox'));
   useEffect(() => {
     if (focus) api.candidate(focus).then((d) => { if (d?.candidate) setStatus(d.candidate.status); }).catch(() => {});
   }, [focus]);
@@ -159,8 +164,8 @@ export function Inbox() {
                 <li key={c.id}>
                   <ListRow selected={i === selected} onClick={() => { setSelected(i); setOpen(true); }}>
                     <div className="flex items-center justify-between gap-2 text-xs text-muted">
-                      <span className="flex min-w-0 items-center gap-1.5"><SourceBadge source={c.source} /><span className="truncate">{c.projectKey}</span></span>
-                      <span className="tabular-nums">{Math.round(c.classification.confidence * 100)}%</span>
+                      <span className="flex min-w-0 items-center gap-1.5"><SourceBadge source={c.source} />{c.external && isSelfReview(c.external) && <SelfReviewBadge />}<span className="truncate">{c.projectKey}</span></span>
+                      <span className="tabular-nums" title="how sure the classifier is that this is pushback">{Math.round(c.classification.confidence * 100)}% sure</span>
                     </div>
                     <div className="mt-0.5 line-clamp-2 text-[13px] leading-snug">{c.classification.summary || '(no summary)'}</div>
                   </ListRow>
@@ -190,6 +195,9 @@ export function Inbox() {
               </>
             ) : current ? (
               <SkeletonDetail />
+            ) : loaded && status === 'pending' && (project || source) ? (
+              // Filtered to nothing: where the pipeline stands for this project (or, filtered by source, overall).
+              <div className="-mx-4 -mt-5 md:-mx-6"><FirstRun view="inbox" project={project || undefined} force /></div>
             ) : null}
           </div>
           {detail && status === 'pending' && (

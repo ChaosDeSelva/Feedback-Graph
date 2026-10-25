@@ -57,10 +57,18 @@ describeStores('KnowledgeStore', (h) => {
     test('feedbackNeedingPostmortem returns the full input for confirmed feedback', async () => {
       const id = await confirmedFeedback('s1');
       const [input] = await k.feedbackNeedingPostmortem(5);
-      expect(input).toMatchObject({ feedbackId: id, projectKey: 'demo', repoPath: '/vibe/demo', cwd: '/Users/j/Vibe/demo', sessionId: 's1', note: 'server-side!' });
+      expect(input).toMatchObject({ feedbackId: id, projectKey: 'demo', repoPath: '/vibe/demo', cwd: '/Users/j/Vibe/demo', sessionId: 's1', note: 'server-side!', noteBy: 'you' });
       expect(input.feedback.uuid).toBe(id);
       expect(input.turns.map((t) => t.index)).toEqual([0, 1, 2, 3]);
       expect(input.feedback.precedingToolCalls[0].filePath).toBe('/a.ts');
+    });
+
+    test("feedbackNeedingPostmortem says who wrote the note, so an agent's note is not taken as the developer's", async () => {
+      await repo.upsertSession(project, session('s9'), []);
+      await repo.saveClassification('s9-t2', pushback, true);
+      await repo.decide('s9-t2', 'confirmed', 'approve everything', 'operator:codex');
+      const [input] = await k.feedbackNeedingPostmortem(5);
+      expect(input).toMatchObject({ note: 'approve everything', noteBy: 'operator:codex' });
     });
 
     test('feedbackNeedingPostmortem says which agent the session ran in (Claude Code unless recorded otherwise)', async () => {
@@ -160,6 +168,24 @@ describeStores('KnowledgeStore', (h) => {
       expect(check.task).not.toContain('ghp_');
     });
 
+    test('the lesson checks are stored with the lesson; a re-check replaces them; a lesson never checked reads null', async () => {
+      const id = await confirmedFeedback('s1');
+      await k.savePostmortem(id, pm(), { miss: vec(1), lesson: vec(1) });
+      const [unchecked] = await k.listLessons({});
+      expect(unchecked.checks ?? null).toBeNull();
+      // Built at runtime: no token-shaped literal in the source.
+      const secret = ['ghp', 'A'.repeat(36)].join('_');
+      await k.savePostmortem(id, pm({ lessonChecks: [{ name: 'needs-path', why: `no file token ${secret}` }] }), { miss: vec(1), lesson: vec(1) });
+      const [checked] = await k.listLessons({});
+      expect(checked.checks?.map((c) => c.name)).toEqual(['needs-path']);
+      expect(checked.checks?.[0].why).not.toContain('ghp_');
+      expect(await k.setLessonChecks(checked.id, [])).toBe(true);
+      expect((await k.lessonDetail(checked.id))?.lesson.checks).toEqual([]);
+      expect(await k.setLessonChecks(checked.id, [{ name: 'meta-lesson', why: 'about feedback' }])).toBe(true);
+      expect((await k.listLessons({}))[0].checks).toEqual([{ name: 'meta-lesson', why: 'about feedback' }]);
+      expect(await k.setLessonChecks('lesson:nope', [])).toBe(false);
+    });
+
     test('a global lesson has no project', async () => {
       const id = await confirmedFeedback('s1');
       await k.savePostmortem(id, pm({ lesson: { ...pm().lesson, scope: 'global' } }), { miss: vec(1), lesson: vec(1) });
@@ -179,6 +205,21 @@ describeStores('KnowledgeStore', (h) => {
       expect((await k.lessonDetail(lb.id))?.lesson).toMatchObject({ status: 'superseded', rule: 'Edited rule' });
       expect((await k.lessonDetail(la.id))?.lesson.status).toBe('approved');
       expect((await k.lessonDetail(la.id))?.supersedes).toEqual([lb.id]);
+    });
+
+    test('updateLesson keeps a note on the decision, cleared by the next decision without one', async () => {
+      const a = await confirmedFeedback('s1');
+      await k.savePostmortem(a, pm(), { miss: vec(1), lesson: vec(1) });
+      const [l] = await k.listLessons({});
+      expect(l.decisionNote ?? null).toBeNull();
+      await k.updateLesson(l.id, { status: 'rejected' }, { by: 'you', note: 'converted to a fact' });
+      expect((await k.lessonDetail(l.id))?.lesson).toMatchObject({ status: 'rejected', decisionNote: 'converted to a fact' });
+      expect((await k.listLessons({ status: 'rejected' }))[0].decisionNote).toBe('converted to a fact');
+      // An edit that decides nothing keeps it; the next decision without a note clears it.
+      await k.updateLesson(l.id, { rule: 'Reworded' }, {});
+      expect((await k.lessonDetail(l.id))?.lesson.decisionNote).toBe('converted to a fact');
+      await k.updateLesson(l.id, { status: 'proposed' }, {});
+      expect((await k.lessonDetail(l.id))?.lesson.decisionNote ?? null).toBeNull();
     });
 
     test('updateLesson records who decided: an agent with the operator token, until you decide again', async () => {

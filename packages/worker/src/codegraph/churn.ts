@@ -11,14 +11,14 @@ const HEADER = '\x01';
 /**
  * Commits per file over the last `sinceDays`, keyed by each file's current path: history from before a rename counts
  * toward the new name. Paths are relative to repoPath (a subdirectory of a repo sees only its own files).
- * Not a git repo, or git failing, gives an empty map.
+ * Not a git repo, or git failing, gives an empty map. gitArgs: worktreeGitArgs, for a worktree whose git dir is mapped.
  */
-export async function churn(repoPath: string, sinceDays: number): Promise<Churn> {
+export async function churn(repoPath: string, sinceDays: number, gitArgs: readonly string[] = []): Promise<Churn> {
   const since = new Date(Date.now() - sinceDays * 86_400_000).toISOString();
   let stdout: string;
   try {
     ({ stdout } = await run('git', [
-      ...GIT_SAFE, '-C', repoPath, 'log', `--since=${since}`, '--no-merges', '-M', '--numstat', '-z', '--relative', `--format=${HEADER}%H%x09%cI`,
+      ...GIT_SAFE, '-C', repoPath, ...gitArgs, 'log', `--since=${since}`, '--no-merges', '-M', '--numstat', '-z', '--relative', `--format=${HEADER}%H%x09%cI`,
     ], { timeout: 60_000, maxBuffer: 256 * 1024 * 1024 }));
   } catch {
     return new Map();

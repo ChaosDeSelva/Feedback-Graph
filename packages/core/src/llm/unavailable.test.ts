@@ -66,6 +66,11 @@ test('an answer that cannot be used is not unavailability: bad JSON, a 400, a CL
   expect(await reasonFor('claude-cli', { CLAUDE_CODE_OAUTH_TOKEN: 't' }, { exec: maxTurns })).toBeNull();
   expect(providerUnavailableReason(new Error('label: invalid enum value'))).toBeNull();
   expect(providerUnavailableReason('boom')).toBeNull();
+  // Ollama aborting one generation (stuck repeating, or out of context) answers 500, but the model is up: that item's
+  // failure, so the stage goes on instead of pausing on the same item every cycle.
+  expect(await reasonFor('ollama:gemma4', {}, { fetchImpl: answers(500, '{"error":"prediction aborted, token repeat limit reached"}') })).toBeNull();
+  expect(providerUnavailableReason(new Error('ollama:gemma4 500: {"error":"prediction aborted, token repeat limit reached"}'))).toBeNull();
+  expect(providerUnavailableReason(new Error('ollama:gemma4 500: {"error":"model runner has unexpectedly stopped"}'))).toMatch(/HTTP 500/);
 });
 
 test('reasons never carry a key, and ProviderUnavailableError keeps its own', async () => {

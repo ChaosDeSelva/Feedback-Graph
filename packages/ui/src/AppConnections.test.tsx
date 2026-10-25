@@ -1,4 +1,4 @@
-import { cleanup, render, screen } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen } from '@testing-library/react';
 import { afterEach, beforeEach, expect, test, vi } from 'vitest';
 import { App } from './App.tsx';
 
@@ -22,4 +22,15 @@ afterEach(() => { cleanup(); vi.unstubAllGlobals(); });
 test('the sidebar shows every connection from /api/status next to the health badge', async () => {
   render(<App />);
   expect(await screen.findByRole('button', { name: 'Connections: Linear has a problem' })).toBeTruthy();
+});
+
+test('the connections popover closes when you go to another page', async () => {
+  render(<App />);
+  fireEvent.click(await screen.findByRole('button', { name: 'Connections: Linear has a problem' }));
+  expect(screen.getByRole('dialog', { name: 'Connections' })).toBeTruthy();
+  act(() => {
+    location.hash = 'lessons';
+    window.dispatchEvent(new HashChangeEvent('hashchange'));
+  });
+  expect(screen.queryByRole('dialog', { name: 'Connections' })).toBeNull();
 });

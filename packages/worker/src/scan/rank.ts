@@ -36,7 +36,24 @@ function tierOf(path: string): number {
 const hidden = (path: string) => path.split('/').slice(0, -1).some((s) => s.startsWith('.'));
 const cmp = (a: string, b: string) => (a < b ? -1 : a > b ? 1 : 0);
 
-/** The paths, best first (see above). `priority`: paths to put first, in their order (only ones among `paths`). */
+const TEST_DIR = new Set(['__tests__', 'tests', 'test']);
+const stemOf = (name: string) => name.replace(/(\.d)?\.[^.]+$/, '');
+const dirOf = (p: string) => (p.includes('/') ? p.slice(0, p.lastIndexOf('/')) : '');
+/** Where the file a test is about would be (`dir/stem`): beside it, or above its __tests__/tests folder. */
+function subjectKeys(test: string): string[] {
+  const name = test.split('/').pop()!;
+  const stem = stemOf(name).replace(/\.(test|spec)$/, '').replace(/_test$/, '').replace(/^test_/, '').replace(/Tests?$/, '');
+  const dir = dirOf(test);
+  const keys = [`${dir}/${stem}`];
+  if (TEST_DIR.has(dir.split('/').pop()!.toLowerCase())) keys.push(`${dirOf(dir)}/${stem}`);
+  return keys;
+}
+
+/**
+ * The paths, best first (see above). `priority`: paths to put first, in their order (only ones among `paths`). A test
+ * whose file sits beside it (or above its __tests__ folder) comes right after that file instead of in the test tier,
+ * so a capped map that keeps a file keeps the tests that cover it.
+ */
 export function rankCodePaths(paths: string[], o: { priority?: Iterable<string> } = {}): string[] {
   const present = new Set(paths);
   const first = [...new Set(o.priority ?? [])].filter((p) => present.has(p));
@@ -46,11 +63,23 @@ export function rankCodePaths(paths: string[], o: { priority?: Iterable<string> 
     .map((p) => ({ p, t: tierOf(p), h: hidden(p) ? 1 : 0 }))
     .sort((a, b) => a.t - b.t || a.h - b.h || cmp(a.p, b.p))
     .map((x) => x.p);
-  return [...first, ...rest];
+  const subjects = new Map<string, string>();
+  for (const p of rest) if (tierOf(p) !== TIER.test) subjects.set(`${dirOf(p)}/${stemOf(p.split('/').pop()!)}`, p);
+  const attached = new Map<string, string[]>();
+  const placed = new Set<string>();
+  for (const p of rest) {
+    if (tierOf(p) !== TIER.test) continue;
+    const subject = subjectKeys(p).map((k) => subjects.get(k)).find((s) => s !== undefined);
+    if (!subject) continue;
+    attached.set(subject, [...(attached.get(subject) ?? []), p]);
+    placed.add(p);
+  }
+  return [...first, ...rest.filter((p) => !placed.has(p)).flatMap((p) => [p, ...(attached.get(p) ?? [])])];
 }
 
-export const MIN_MAP_FILES = 400;
-export const MAX_AUTO_MAP_FILES = 4000;
+// Defined in core, which also says from them whether a map is capped (mapCapped).
+import { MAX_AUTO_MAP_FILES, MIN_MAP_FILES } from '@fb/core';
+export { MAX_AUTO_MAP_FILES, MIN_MAP_FILES };
 const AUTO_SHARE = 0.4;
 
 /** How many files a map keeps: SCAN_MAX_FILES when set, else 40% of the candidates, at least 400 and at most 4000. */

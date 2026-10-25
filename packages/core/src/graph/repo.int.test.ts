@@ -94,6 +94,11 @@ describeStores('GraphStore', (h) => {
       expect(c.note).toBe('real miss');
       expect(c.decidedAt).not.toBeNull();
       expect(c.classification).toEqual(pushback);
+      // Who decided: you by default, or the agent that used the operator token.
+      expect(c.decidedBy).toBe('you');
+      await repo.decide('t1', 'rejected', 'bot comment', 'operator:codex');
+      expect((await repo.listCandidates({ status: 'rejected' }))[0].decidedBy).toBe('operator:codex');
+      expect((await repo.candidateDetail('t1'))!.candidate.decidedBy).toBe('operator:codex');
     });
 
     test('listCandidates filters by project', async () => {
@@ -101,6 +106,14 @@ describeStores('GraphStore', (h) => {
       await repo.saveClassification('t1', pushback, true);
       expect(await repo.listCandidates({ projectKey: 'other' })).toEqual([]);
       expect(await repo.listCandidates({ projectKey: 'demo' })).toHaveLength(1);
+    });
+
+    test('listCandidates filters by source (a Claude Code session is claude)', async () => {
+      await repo.upsertSession(project, session(3), []);
+      await repo.saveClassification('t1', pushback, true);
+      expect((await repo.listCandidates({ source: 'claude' })).map((c) => c.id)).toEqual(['t1']);
+      expect(await repo.listCandidates({ source: 'codex' })).toEqual([]);
+      expect(await repo.listCandidates({ source: 'github', projectKey: 'demo' })).toEqual([]);
     });
 
     test('candidateDetail returns neighbouring turns in order and session commits', async () => {
@@ -266,6 +279,17 @@ describeStores('GraphStore', (h) => {
       expect((await props('demo'))?.remote).toBe('github.com/org/demo');
       expect(await repo.projectsMissingRemote()).toEqual([]);
       expect(await probe.count('Turn')).toBe(turns);
+    });
+
+    test('a record made with no folder (a code map) is listed and gets its path and remote, never overwriting one', async () => {
+      await h.store.codegraph.replaceCodeMap('mapped', { files: [], symbols: [], imports: [], tests: [], churn: {}, fingerprint: null });
+      await repo.upsertSession(clone('known', 'local/known'), session(2), []);
+      expect((await repo.projectsMissingFolder()).map((p) => p.key)).toEqual(['mapped']);
+      await repo.fillProjectFolder('mapped', { repoPath: '/vibe/mapped', remote: 'github.com/org/mapped' });
+      await repo.fillProjectFolder('known', { repoPath: '/elsewhere', remote: 'github.com/org/other' });
+      expect(await repo.projectsMissingFolder()).toEqual([]);
+      expect(await props('mapped')).toMatchObject({ repoPath: '/vibe/mapped', remote: 'github.com/org/mapped' });
+      expect(await props('known')).toMatchObject({ repoPath: '/vibe/known', remote: 'local/known' });
     });
   });
 });

@@ -17,6 +17,14 @@ export function ConnectionsBadge({ connections, collapsed = false }: { connectio
   const connected = names.filter((n) => connections[n].state === 'connected');
   const label = errors.length ? `${errors.map((n) => CONNECTION_LABEL[n]).join(', ')} ${errors.length === 1 ? 'has' : 'have'} a problem` : `${connected.length} of ${names.length} connected`;
 
+  // Going to another page (a nav click, a link, back) closes it, rather than leaving it over the next page.
+  useEffect(() => {
+    if (!open) return;
+    const close = () => setOpen(false);
+    window.addEventListener('hashchange', close);
+    return () => window.removeEventListener('hashchange', close);
+  }, [open]);
+
   useEffect(() => {
     if (!open) return;
     const onDown = (e: MouseEvent) => { if (!root.current?.contains(e.target as Node)) setOpen(false); };

@@ -26,14 +26,29 @@ let urls: string[];
 let noMap = false;
 let capped = false;
 let noFacts = false;
+let zero = false;
+let atCap: number | null = null;
+let rebuild: { status: number; json: unknown };
+let posts: string[];
 beforeEach(() => {
+  zero = false;
   urls = [];
+  posts = [];
   noMap = false;
   capped = false;
   noFacts = false;
-  vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+  atCap = null;
+  rebuild = { status: 202, json: { queued: true } };
+  vi.stubGlobal('fetch', vi.fn(async (url: string, init?: RequestInit) => {
     urls.push(url);
-    if (url.startsWith('/api/projects/demo/codemap/hotspots')) return Response.json(noMap ? { meta: null, hotspots: [] } : { meta: capped ? { ...meta, candidates: 10_290 } : meta, hotspots });
+    if (init?.method === 'POST') {
+      posts.push(url);
+      if (url === '/api/projects/demo/codemap/rebuild') return Response.json(rebuild.json, { status: rebuild.status });
+    }
+    if (atCap !== null && url.startsWith('/api/projects/demo/codemap/hotspots')) {
+      return Response.json({ meta: { ...meta, stats: { ...meta.stats, files: atCap } }, capped: { files: atCap, of: null }, hotspots });
+    }
+    if (url.startsWith('/api/projects/demo/codemap/hotspots')) return Response.json(noMap ? { meta: null, hotspots: [] } : { meta: capped ? { ...meta, candidates: 10_290 } : meta, hotspots: zero ? hotspots.map((h) => ({ ...h, score: 0, misses: 0 })) : hotspots });
     const m = url.match(/^\/api\/projects\/demo\/codemap\/module\?path=(.+)$/);
     if (m) return Response.json(noFacts ? { ...mod(decodeURIComponent(m[1])), facts: [] } : mod(decodeURIComponent(m[1])));
     return Response.json([]);
@@ -111,6 +126,28 @@ test('a capped map says how many files it left out and how to raise the cap', as
   expect(screen.getByLabelText('files').textContent).toContain('of 10,290');
 });
 
+test('a map built before the total was counted still says it is capped, at its cap, and how to see the total', async () => {
+  atCap = 4000;
+  render(<CodeMap projectKey="demo" />);
+  await screen.findByText('src/db/pool.ts');
+  expect(screen.getByRole('note').textContent).toMatch(/capped at 4,000 files[\s\S]*Rebuild map[\s\S]*raise SCAN_MAX_FILES/i);
+  expect(screen.getByLabelText('files').textContent).toContain('4,000');
+});
+
+test('Rebuild map asks the worker for a fresh map and says so; a refusal is shown', async () => {
+  render(<CodeMap projectKey="demo" />);
+  await screen.findByText('src/db/pool.ts');
+  fireEvent.click(screen.getByRole('button', { name: 'Rebuild map' }));
+  expect(await screen.findByText(/rebuild queued/i)).toBeTruthy();
+  expect(posts).toEqual(['/api/projects/demo/codemap/rebuild']);
+  cleanup();
+  rebuild = { status: 403, json: { error: 'only you can make this decision, from the Feedback Graph UI' } };
+  render(<CodeMap projectKey="demo" />);
+  await screen.findByText('src/db/pool.ts');
+  fireEvent.click(screen.getByRole('button', { name: 'Rebuild map' }));
+  expect(await screen.findByText(/only you can make this decision/)).toBeTruthy();
+});
+
 test('an uncapped map says nothing about a cap', async () => {
   render(<CodeMap projectKey="demo" />);
   await screen.findByText('src/db/pool.ts');
@@ -131,4 +168,23 @@ test('a project with no map yet says the worker builds it', async () => {
   noMap = true;
   render(<CodeMap projectKey="demo" />);
   expect(await screen.findByText(/no code map yet/i)).toBeTruthy();
+});
+
+test('when every file scores 0 the card says "no hotspots yet" instead of listing docs and config as hotspots', async () => {
+  zero = true;
+  render(<CodeMap projectKey="demo" />);
+  expect(await screen.findByText(/No hotspots yet/)).toBeTruthy();
+  expect(screen.queryByRole('table')).toBeNull();
+  fireEvent.click(screen.getByRole('button', { name: /show the files anyway/i }));
+  expect(screen.getByRole('table')).toBeTruthy();
+});
+
+test('a focus request (a fact file name on the Projects page) opens that file panel, again each time', async () => {
+  const { rerender } = render(<CodeMap projectKey="demo" />);
+  await screen.findByText('src/db/pool.ts');
+  rerender(<CodeMap projectKey="demo" focus={{ path: 'src/deep/a.ts', at: 1 }} />);
+  expect(await screen.findByRole('region', { name: 'module src/deep/a.ts' })).toBeTruthy();
+  fireEvent.click(screen.getByRole('button', { name: 'close module' }));
+  rerender(<CodeMap projectKey="demo" focus={{ path: 'src/deep/a.ts', at: 2 }} />);
+  expect(await screen.findByRole('region', { name: 'module src/deep/a.ts' })).toBeTruthy();
 });

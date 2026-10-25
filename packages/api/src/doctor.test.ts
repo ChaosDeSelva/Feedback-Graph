@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { chmodSync, copyFileSync, mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { chmodSync, copyFileSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -69,17 +69,20 @@ exit 0`,
     'curl',
     `case "$*" in
   *api/tags*) ${w.ollama === false ? 'exit 7' : `printf '%s' '${w.tags ?? BOTH}'`} ;;
-  *api/chat*) cat '${join(base, 'chat')}' ;;
+  *api/chat*) printf '%s\n' "$*" >> '${join(base, 'chat-args')}'; cat '${join(base, 'chat')}' ;;
   *api/status*) [ -s '${join(base, 'status')}' ] || exit 7; cat '${join(base, 'status')}' ;;
   *) exit 7 ;;
 esac`,
   );
+  const chatArgs = () => {
+    try { return readFileSync(join(base, 'chat-args'), 'utf8'); } catch { return ''; }
+  };
   try {
     const out = execFileSync('bash', [join(repo, 'scripts', 'doctor.sh')], { env: { PATH: `${bin}:/usr/bin:/bin`, HOME: home }, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] });
-    return { out, code: 0 };
+    return { out, code: 0, chatArgs: chatArgs() };
   } catch (e) {
     const x = e as { stdout?: string; status?: number };
-    return { out: String(x.stdout ?? ''), code: x.status ?? -1 };
+    return { out: String(x.stdout ?? ''), code: x.status ?? -1, chatArgs: chatArgs() };
   }
 }
 
@@ -144,4 +147,19 @@ test('never prints a secret from .env', () => {
 test('the classifier on another provider skips the structured-output probe', () => {
   const { out } = doctor({ env: 'CLASSIFY_LLM=claude-cli\n', chat: { code: 501, body: '{}' }, status: {} });
   expect(out).toContain('SKIP  ollama structured output: the classifier runs on claude-cli');
+});
+
+test('the probe asks for no thinking and the context the workers use, as the real classifier does', () => {
+  const { chatArgs } = doctor({ env: 'OLLAMA_NUM_CTX=8192\n', status: {} });
+  expect(chatArgs).toContain('"think":false');
+  expect(chatArgs).toContain('"num_ctx":8192');
+  expect(doctor({ status: {} }).chatArgs).toContain('"num_ctx":16384');
+});
+
+test('an answer that is all thinking and no content is a FAIL that says what to do', () => {
+  const thinking = { code: 200, body: JSON.stringify({ message: { role: 'assistant', content: '', thinking: 'Thinking Process: the user wants' } }) };
+  const { out, code } = doctor({ chat: thinking, status: {} });
+  expect(code).toBe(1);
+  expect(out).toContain('FAIL  ollama structured output: gemma4 answered only in its thinking, with no content');
+  expect(out).toMatch(/think:false/);
 });

@@ -56,7 +56,15 @@ Symbol names, specifiers and `pkg:` names pass through `redactSecrets` before th
 
 `MapStage.kick()` starts a background pass over the selected projects (one at a time; ingest never waits for it).
 Per project: at most every `MAP_INTERVAL_MS` (5 minutes), `repoFingerprint` (HEAD, `git status`, size and mtime of
-dirty files) is compared with the stored map's; when it differs (or the folder is not a git repo), the map is rebuilt
-from the stored one, test links (`testsFor`) and 90-day churn are added, and `replaceCodeMap` writes it in one
-transaction. Each build logs a `code_mapped` Activity entry (files, symbols, edges, tests, duration). A scan calls
-`mapProject` first, regardless of the interval.
+dirty files) is compared with the stored map's. A git worktree, whose `.git` file names its git dir by the host path,
+is reached through the roots mapping (`worktreeGitArgs`); when git still cannot tell (not a repo, git dir not mounted),
+`fileFingerprint` (path, size and mtime of every candidate) stands in, logged once as `code map fingerprint
+unavailable`, so such a folder is not rebuilt every interval. When the fingerprint differs, the map is rebuilt
+from the stored one, test links (`testsFor`) and 90-day churn are added, and `replaceCodeMap` writes it (Postgres in
+one transaction; Neo4j as a diff against the stored map, one slice per transaction, with the fingerprint cleared first
+and set last, so a write cut short is reparsed from scratch rather than reused). A rebuild you ask for (`POST
+/api/projects/:key/codemap/rebuild`, the Rebuild map button, `fg map rebuild`) remaps the project from scratch at the
+next pass. Once per interval a pass also deletes up to 5,000 orphan CodeFile records (out of every map, gone from the
+repo or of no project, nothing about them). Each build logs a `code_mapped` Activity entry (files, symbols, edges, tests, duration). A scan calls
+`mapProject` first, regardless of the interval. A pass held by one project for longer than `MAP_STALL_MS` (20 minutes)
+is logged as `code map stage stalled` and abandoned; the next `kick()` starts a fresh pass.

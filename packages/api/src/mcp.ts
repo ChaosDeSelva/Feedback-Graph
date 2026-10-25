@@ -4,9 +4,15 @@ import { z } from 'zod';
 import { VERSION } from '@fb/core';
 import { checkBeforeDone, getImpact, getModuleContext, getRecentSessions, getTaskContext, MAX_DEPTH, RECENT_MAX, reportFeedback, type ContextDeps } from './context.ts';
 
+/**
+ * Length limits on free text: every argument is embedded, searched or stored, so a runaway client (a 1 MB task was
+ * seen) is refused here instead of costing an embedding and a megabyte Activity row.
+ */
+const MAX = { path: 1000, key: 200, task: 8000, query: 2000, prose: 20_000, diff: 200_000 } as const;
+
 const where = {
-  cwd: z.string().optional().describe('Absolute path of the directory you are working in (preferred)'),
-  project: z.string().optional().describe('Project key, if you know it instead of cwd'),
+  cwd: z.string().max(MAX.path).optional().describe('Absolute path of the directory you are working in (preferred)'),
+  project: z.string().max(MAX.key).optional().describe('Project key, if you know it instead of cwd'),
 };
 
 const text = (markdown: string) => ({ content: [{ type: 'text' as const, text: markdown }] });
@@ -21,8 +27,8 @@ function buildServer(ctx: ContextDeps, client: string | undefined) {
         'Before starting non-trivial work: returns approved lessons from past developer feedback and similar past misses in this project, with citations, the code and document facts that matter most for everyday work, and the best matches from projects the developer linked to this one. Name the files you expect to change: lessons tied to them come first, and a short code map shows their importers, tests and last misses.',
       inputSchema: {
         ...where,
-        task: z.string().describe('What you are about to build or change, in a sentence or two'),
-        files: z.array(z.string()).max(50).optional().describe('Files you expect to read or change (repo-relative, or absolute inside the project)'),
+        task: z.string().max(MAX.task).describe('What you are about to build or change, in a sentence or two'),
+        files: z.array(z.string().max(MAX.path)).max(50).optional().describe('Files you expect to read or change (repo-relative, or absolute inside the project)'),
       },
     },
     async (a) => text((await getTaskContext({ ...a, client }, ctx)).markdown),
@@ -35,10 +41,10 @@ function buildServer(ctx: ContextDeps, client: string | undefined) {
         'Before telling the developer a task is done: checks your work against lessons from past feedback on similar work and lists likely gaps. Pass files_changed to also hear which importers and tests of those files your change did not touch, and what past misses there were about.',
       inputSchema: {
         ...where,
-        task: z.string(),
-        summary: z.string().describe('What you built and how you verified it'),
-        diff: z.string().optional().describe('Optional unified diff of your changes'),
-        files_changed: z.array(z.string()).max(50).optional().describe('Files you changed (repo-relative, or absolute inside the project)'),
+        task: z.string().max(MAX.task),
+        summary: z.string().max(MAX.prose).describe('What you built and how you verified it'),
+        diff: z.string().max(MAX.diff).optional().describe('Optional unified diff of your changes'),
+        files_changed: z.array(z.string().max(MAX.path)).max(50).optional().describe('Files you changed (repo-relative, or absolute inside the project)'),
       },
     },
     async ({ files_changed, ...a }) => text((await checkBeforeDone({ ...a, filesChanged: files_changed, client }, ctx)).markdown),
@@ -78,9 +84,9 @@ function buildServer(ctx: ContextDeps, client: string | undefined) {
         'When the developer runs /postmortem, or your work missed something the developer did not say in words (pushback they typed is picked up from the session on its own): queues it in the Feedback Graph inbox for the developer; once they confirm it, a post-mortem learns from it. A report of pushback already flagged from the session joins that inbox item.',
       inputSchema: {
         ...where,
-        feedback: z.string().describe("The developer's feedback, in their words"),
-        what_was_done: z.string().describe('What you had built or claimed before the feedback'),
-        session_id: z.string().optional().describe('Your session id, if you know it: lets the report join the same pushback flagged from this session'),
+        feedback: z.string().max(MAX.prose).describe("The developer's feedback, in their words"),
+        what_was_done: z.string().max(MAX.prose).describe('What you had built or claimed before the feedback'),
+        session_id: z.string().max(MAX.key).optional().describe('Your session id, if you know it: lets the report join the same pushback flagged from this session'),
       },
     },
     async (a) => text((await reportFeedback({ ...a, whatWasDone: a.what_was_done, sessionId: a.session_id, client }, ctx)).markdown),
@@ -103,7 +109,7 @@ function buildServer(ctx: ContextDeps, client: string | undefined) {
     'search_graph',
     {
       description: 'Search lessons and past misses in the feedback graph by meaning.',
-      inputSchema: { ...where, query: z.string() },
+      inputSchema: { ...where, query: z.string().max(MAX.query) },
     },
     async (a) => text((await getTaskContext({ ...a, task: a.query, client }, ctx)).markdown),
   );
@@ -136,18 +142,27 @@ function decodeClient(header: string | null): string | undefined {
   return /^[\w.@/+-][\w .@/+-]{0,96} \(MCP\)$/.test(label) ? label : undefined;
 }
 
-async function initializeClient(req: Request): Promise<string | undefined> {
-  if (req.method !== 'POST') return undefined;
+/** The `clientInfo` of an `initialize` request (as the client claims it, uncleaned); undefined for any other request. */
+export async function initializeClientInfo(req: Request): Promise<{ found: boolean; info: unknown }> {
+  if (req.method !== 'POST') return { found: false, info: undefined };
   const body = (await req.clone().json().catch(() => null)) as unknown;
   const msgs = (Array.isArray(body) ? body : [body]) as { method?: unknown; params?: { clientInfo?: unknown } }[];
   const init = msgs.find((m) => m && typeof m === 'object' && m.method === 'initialize');
-  return init ? mcpClientLabel(init.params?.clientInfo) : undefined;
+  return init ? { found: true, info: init.params?.clientInfo } : { found: false, info: undefined };
+}
+
+async function initializeClient(req: Request): Promise<string | undefined> {
+  const init = await initializeClientInfo(req);
+  return init.found ? mcpClientLabel(init.info) : undefined;
 }
 
 /** Stateless Streamable HTTP: a fresh server + transport per request. */
 export async function handleMcp(req: Request, ctx: ContextDeps): Promise<Response> {
   // A client ending its session (Codex does on every exit). Stateless: there is nothing to end, so it simply succeeds.
   if (req.method === 'DELETE') return new Response(null, { status: 204 });
+  // The stream a GET opens is for messages the server sends unasked, and this one never does: the stateless transport
+  // closed it at once, and every client reopened it, twice a second. 405 is the spec's way to say there is none.
+  if (req.method === 'GET') return new Response(null, { status: 405, headers: { allow: 'POST, DELETE' } });
   const initialized = await initializeClient(req);
   const server = buildServer(ctx, initialized ?? decodeClient(req.headers.get('mcp-session-id')));
   const transport = new WebStandardStreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true });

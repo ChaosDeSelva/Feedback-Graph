@@ -80,7 +80,7 @@ test('POST /api/candidates/decisions decides each item like the single route and
     { id: 'missing', ok: false, error: 'not found' },
     { id: 'c-hidden', ok: false, error: 'not found' },
   ]);
-  expect(decided).toEqual([['c1', 'confirmed', null], ['c2', 'rejected', 'the author fixing their own PR']]);
+  expect(decided).toEqual([['c1', 'confirmed', null, 'operator:codex'], ['c2', 'rejected', 'the author fixing their own PR', 'operator:codex']]);
   expect(logged.map((e) => [e.kind, e.actor, e.targets])).toEqual([
     ['feedback_decided', 'operator:codex', ['c1']],
     ['feedback_decided', 'operator:codex', ['c2']],
@@ -93,4 +93,24 @@ test('POST /api/candidates/decisions refuses a malformed batch outright', async 
   expect((await app.request('/api/candidates/decisions', post('/api/candidates/decisions', { items: [{ id: 'c1', decision: 'maybe' }] }))).status).toBe(400);
   expect((await app.request('/api/candidates/decisions', post('/api/candidates/decisions', { items: [{ id: 'c1', decision: 'confirm' }] }, false))).status).toBe(403);
   expect(decided).toEqual([]);
+});
+
+test('GET /api/scans/:id answers one job, with its place in the queue while it waits; a hidden project\'s is not found', async () => {
+  const job = (id: string, projectKey: string, status: string, requestedAt: string) =>
+    ({ id, projectKey, repoPath: `/vibe/${projectKey}`, provider: null, status, requestedAt, startedAt: null, finishedAt: null, filesScanned: 0, factsAdded: 0, error: null, attempts: 0, retryAt: null });
+  const jobs = [job('s1', 'acme', 'queued', '2026-10-25T03:00:00Z'), job('s2', 'demo-shop', 'queued', '2026-10-25T03:01:00Z'), job('s3', 'unpicked', 'done', 't'), job('s4', 'acme', 'running', 't')];
+  const app = createApp({ listCandidates: async () => [], stats: async () => [], decide: async () => {}, candidateDetail: async () => null } as unknown as ApiRepo, {
+    facts: {
+      listFacts: async () => [], searchFacts: async () => [], requestScan: async () => ({}) as never,
+      listProjects: async () => jobs.map((j) => ({ key: j.projectKey, lastScan: j })),
+      scanJob: async (id: string) => jobs.find((j) => j.id === id) ?? null,
+    } as never,
+    projectDirs: async () => dirs,
+    shown: () => shownProjects({ tracked: ['acme', 'demo-shop'], initialized: true }, { excludeProjects: [] }),
+  });
+  expect(await (await app.request('/api/scans/s2')).json()).toMatchObject({ id: 's2', status: 'queued', queuePosition: 2 });
+  expect(await (await app.request('/api/scans/s1')).json()).toMatchObject({ id: 's1', queuePosition: 1 });
+  expect(await (await app.request('/api/scans/s4')).json()).toMatchObject({ id: 's4', status: 'running', queuePosition: null });
+  expect((await app.request('/api/scans/s3')).status).toBe(404);
+  expect((await app.request('/api/scans/nope')).status).toBe(404);
 });

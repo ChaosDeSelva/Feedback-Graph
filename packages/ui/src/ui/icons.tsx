@@ -23,6 +23,9 @@ function Icon({ children, size = 16, ...rest }: { children: ReactNode; size?: nu
 
 type P = { size?: number; className?: string };
 
+export const DashboardIcon = (p: P) => (
+  <Icon {...p}><rect x="2" y="2" width="5" height="6" rx="1" /><rect x="9" y="2" width="5" height="3.5" rx="1" /><rect x="2" y="10" width="5" height="4" rx="1" /><rect x="9" y="7.5" width="5" height="6.5" rx="1" /></Icon>
+);
 export const InboxIcon = (p: P) => (
   <Icon {...p}><path d="M2 9.5 3.6 3.3A1 1 0 0 1 4.6 2.5h6.8a1 1 0 0 1 1 .8L14 9.5V13a.5.5 0 0 1-.5.5h-11A.5.5 0 0 1 2 13Z" /><path d="M2 9.5h3.2l.8 1.5h4l.8-1.5H14" /></Icon>
 );
@@ -43,6 +46,10 @@ export const ActivityIcon = (p: P) => (
 );
 export const SessionIcon = (p: P) => (
   <Icon {...p}><path d="M2.5 3.5h11v7h-6l-3 2.5v-2.5h-2Z" /><path d="M5 6h6M5 8.2h4" /></Icon>
+);
+/** A speech bubble with a question mark: the Ask page. */
+export const AskIcon = (p: P) => (
+  <Icon {...p}><path d="M2.5 3.5h11v7.5H8l-3 2.5V11H2.5Z" /><path d="M6.6 5.9a1.4 1.4 0 1 1 1.9 1.3c-.3.1-.5.4-.5.7v.3" /><path d="M8 9.6v.01" /></Icon>
 );
 export const DocIcon = (p: P) => (
   <Icon {...p}><path d="M4 1.8h5.3L12.5 5v9.2H4Z" /><path d="M9 1.8V5.3h3.5M6 8.5h4.5M6 11h4.5" /></Icon>

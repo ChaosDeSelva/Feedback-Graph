@@ -3,7 +3,8 @@ import { serve } from '@hono/node-server';
 import { ConfigError, credentialFile, Integrations, loadConfig, makeProviderOr, redactSecrets, ollamaEmbed, ollamaPing, projectFolders, refreshLayout, shownProjects, storedSyncMemory, syncProjects, VERSION, type Project } from '@fb/core';
 import { openStore } from '@fb/store-postgres';
 import { createApp } from './app.ts';
-import { makeJudge } from './context.ts';
+import { buildChatContext } from './chat.ts';
+import { hashRepoFile, makeJudge, type ContextDeps } from './context.ts';
 import { rootsFile } from './roots.ts';
 
 const log = (msg: string, extra: object = {}) => console.log(JSON.stringify({ ts: new Date().toISOString(), msg, ...extra }));
@@ -71,10 +72,11 @@ async function allFolders(): Promise<(Project & { path: string })[]> {
   return (await projectFolders(roots)).map((f) => ({ key: f.key, name: f.rel, repoPath: f.container, path: f.host }));
 }
 
-/** The folders that are in scope: selected in Settings and not in EXCLUDE_PROJECTS. */
+/** The folders that are in scope: selected in Settings and not in EXCLUDE_PROJECTS, with their remotes as the worker last read them. */
 async function projectDirs(): Promise<Project[]> {
-  const s = await scope();
-  return (await allFolders()).filter((f) => s.folder(f.key)).map(({ path: _, ...p }) => p);
+  const [s, snap] = await Promise.all([scope(), selection.candidates()]);
+  const remotes = new Map((snap?.candidates ?? []).map((c) => [c.key, c.remote]));
+  return (await allFolders()).filter((f) => s.folder(f.key)).map(({ path: _, ...p }) => ({ ...p, remote: remotes.get(p.key) ?? null }));
 }
 
 // GitHub and Linear: .env wins; otherwise the token pasted in Settings, kept in INTEGRATIONS_FILE (mode 600).
@@ -85,6 +87,29 @@ async function integrationProjects(): Promise<{ key: string; remote: string | nu
   const remotes = new Map((snap?.candidates ?? []).map((c) => [c.key, c.remote]));
   return s.projects.map((key) => ({ key, remote: remotes.get(key) ?? null }));
 }
+
+/** What get_task_context and the other MCP tools read; Ask builds its context packs from the same. */
+const contextDeps: ContextDeps = {
+  roots,
+  mapMaxFiles: config.scanMaxFiles,
+  facts,
+  embed,
+  k: knowledge,
+  judge: makeJudge(judgeLlm),
+  judgeId: judgeLlm.id,
+  activity,
+  docs,
+  inScope: async (key: string) => (await scope()).folder(key),
+  // Global lessons reach any folder under a root that is not excluded; reading its sessions stays opt-in.
+  servesGlobal: (key: string) => !config.excludeProjects.includes(key),
+  exists: existsSync,
+  fileHash: hashRepoFile,
+  aliasOf: (key: string) => store.graph.projectByAlias(key),
+  codegraph: store.codegraph,
+  sessions: store.sessions,
+  shown,
+  links: store.links,
+};
 
 const app = createApp(store.graph, {
   staticDir: process.env.STATIC_DIR,
@@ -98,6 +123,7 @@ const app = createApp(store.graph, {
   links: store.links,
   portability: store.portability,
   codegraph: store.codegraph,
+  mapMaxFiles: config.scanMaxFiles,
   cloud: {
     cloud: config.cloud,
     memory: config.cloud ? storedSyncMemory(store.docs, config.cloud) : undefined,
@@ -135,24 +161,10 @@ const app = createApp(store.graph, {
     savedRoots: config.rootsFile ? rootsFile(config.rootsFile) : undefined,
     hostHome: config.hostHome,
   },
-  context: {
-    roots,
-    facts,
-    embed,
-    k: knowledge,
-    judge: makeJudge(judgeLlm),
-    judgeId: judgeLlm.id,
-    activity,
-    docs,
-    inScope: async (key: string) => (await scope()).folder(key),
-    // Global lessons reach any folder under a root that is not excluded; reading its sessions stays opt-in.
-    servesGlobal: (key: string) => !config.excludeProjects.includes(key),
-    exists: existsSync,
-    aliasOf: (key: string) => store.graph.projectByAlias(key),
-    codegraph: store.codegraph,
-    sessions: store.sessions,
-    shown,
-    links: store.links,
+  context: contextDeps,
+  chat: {
+    store: store.chats,
+    build: (key, question, history) => buildChatContext(key, question, history, { context: contextDeps, codeMap: (k) => store.codegraph.codeMap(k) }),
   },
   log,
 });

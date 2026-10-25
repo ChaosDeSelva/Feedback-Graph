@@ -97,7 +97,53 @@ test('status --watch polls until stopped', async () => {
   let ticks = 0;
   f.io.sleep = async () => { if (++ticks === 2) throw new Error('stop'); };
   await expect(run(['status', '--watch', '--interval', '1'], f.io)).rejects.toThrow('stop');
-  expect(f.calls.length).toBe(2);
+  expect(f.calls.filter((c) => c.url.endsWith('/api/status')).length).toBe(2);
+});
+
+test('status --watch follows /api/events when the API has it: the status again on a change, new Activity as lines', async () => {
+  // The worker's stage as the stream has told it so far.
+  let latest = 'ingest';
+  const f = fake({
+    'GET /api/status': () => ({ json: { version: 'x', workerHealthy: true, stage: { name: latest, startedAt: '2026-10-24T10:00:00Z', current: null } } }),
+    'GET /api/pipeline': () => ({ json: { inbox: { pending: 1, confirmed: 0 } } }),
+  });
+  const chunks = [
+    'retry: 5000\n\n',
+    'event: stage\ndata: {"stage":{"name":"classify"}}\n\n',
+    'event: activity\ndata: {"id":"a1","ts":"t","kind":"doc_added","subject":"uploaded \\"notes\\"","projectKey":"acme","actor":"you"}\n\n',
+    ': ping\n\n',
+    'event: pipeline\ndata: {"inbox":{"pending":1,"confirmed":0}}\n\nevent: st',
+    'age\ndata: {"stage":{"name":"waiting"}}\n\n',
+  ];
+  const plain = f.io.fetch;
+  let opened: Headers | null = null;
+  f.io.fetch = (async (url: string, init?: RequestInit) => {
+    if (!String(url).endsWith('/api/events')) return plain(url, init);
+    opened = new Headers(init?.headers);
+    const enc = new TextEncoder();
+    let i = 0;
+    // One chunk per read, so fg renders between them.
+    const body = new ReadableStream<Uint8Array>({
+      pull(c) {
+        if (i === chunks.length) return c.close();
+        const chunk = chunks[i++];
+        latest = /"name":"(\w+)"/.exec(chunk)?.[1] ?? latest;
+        c.enqueue(enc.encode(chunk));
+      },
+    });
+    return new Response(body, { headers: { 'content-type': 'text/event-stream' } });
+  }) as typeof fetch;
+  // When the stream ends, fg goes back to polling: the first sleep there stops the test.
+  let polled = false;
+  f.io.sleep = async (ms) => { if (ms >= 1000) { polled = true; throw new Error('stop'); } };
+  await expect(run(['status', '--watch'], f.io)).rejects.toThrow('stop');
+  expect(polled).toBe(true);
+  expect(opened!.get('accept')).toBe('text/event-stream');
+  const t = f.text();
+  expect(t).toContain('activity  doc_added [acme]: uploaded "notes"');
+  // Printed when it changed only (a fetch that finds the same status prints nothing), then once more by the poll after the stream ended.
+  const stageLines = t.split('\n').filter((l) => l.startsWith('stage'));
+  expect(stageLines.map((l) => l.split(/\s+/)[1])).toEqual(['ingest', 'classify', 'waiting', 'waiting']);
 });
 
 const settings = {
@@ -111,16 +157,32 @@ const settings = {
   ],
 };
 
-test('projects list shows every folder and whether it is selected', async () => {
-  const f = fake({ 'GET /api/settings/projects': () => ({ json: settings }) });
+const summaries = [
+  { key: 'acme', repoPath: '/roots/1/acme', remote: 'github.com/acme/acme', aliases: [], sessions: 4, feedback: 2, lessons: 3, facts: 40, pinned: true,
+    lastScan: { id: 'scan:1', status: 'done', finishedAt: '2026-10-25T03:00:00Z', requestedAt: '2026-10-25T02:59:00Z' } },
+];
+const links = [{ id: 'link:acme|demo-shop', a: 'acme', b: 'demo-shop', relation: 'depends_on', status: 'confirmed', score: 0.94 }, { id: 'link:acme|web', a: 'acme', b: 'web', relation: 'related', status: 'suggested', score: 0.6 }];
+
+test('projects list joins every folder with the shown projects: pinned, counts, last scan and links', async () => {
+  const routes = {
+    'GET /api/settings/projects': () => ({ json: settings }),
+    'GET /api/projects': () => ({ json: summaries }),
+    'GET /api/projects/acme/links': () => ({ json: links }),
+  };
+  const f = fake(routes);
   expect(await run(['projects', 'list'], f.io)).toBe(0);
   const t = f.text();
-  expect(t).toMatch(/acme\s+yes/);
+  expect(t.split('\n')[0]).toMatch(/KEY\s+SELECTED\s+PINNED\s+SESSIONS\s+FEEDBACK\s+LESSONS\s+FACTS\s+LAST SCAN\s+LINKS\s+NOTE/);
+  expect(t).toMatch(/acme\s+yes\s+yes\s+4\s+2\s+3\s+40\s+done 2026-10-25 03:00\s+1 confirmed, 1 suggested/);
   expect(t).toMatch(/demo-shop-2\s+.*clone of demo-shop/);
   expect(t).toMatch(/secret\s+.*excluded/);
-  const j = fake({ 'GET /api/settings/projects': () => ({ json: settings }) });
+  // Links are asked for the shown projects only.
+  expect(f.calls.filter((c) => c.url.includes('/links')).map((c) => new URL(c.url).pathname)).toEqual(['/api/projects/acme/links']);
+  const j = fake(routes);
   await run(['projects', 'list', '--json'], j.io);
-  expect(JSON.parse(j.text())).toEqual(settings.candidates);
+  const rows = JSON.parse(j.text());
+  expect(rows.find((r: { key: string }) => r.key === 'acme')).toMatchObject({ tracked: true, pinned: true, facts: 40, lastScan: { status: 'done' }, links: { confirmed: 1, suggested: 1, dismissed: 0 } });
+  expect(rows.find((r: { key: string }) => r.key === 'secret')).toMatchObject({ excluded: true, pinned: false });
 });
 
 test('projects select --key adds to the selection; --only replaces it; --all picks every selectable folder', async () => {
@@ -201,6 +263,20 @@ test('cloud sync-now posts to the sync route', async () => {
   expect(f.calls[0]).toMatchObject({ method: 'POST', body: {} });
 });
 
+test('map rebuild asks for a fresh code map of one project; a project with no map yet fails with the reason', async () => {
+  const f = fake({
+    'POST /api/projects/demo-shop/codemap/rebuild': () => ({ status: 202, json: { queued: true } }),
+    'POST /api/projects/acme/codemap/rebuild': () => ({ status: 404, json: { error: 'no code map yet: the worker builds the first one within a few minutes' } }),
+  });
+  expect(await run(['map', 'rebuild', 'demo-shop'], f.io)).toBe(0);
+  expect(f.calls[0]).toMatchObject({ method: 'POST', body: {} });
+  expect(f.text()).toMatch(/demo-shop: rebuild queued/);
+  expect(await run(['map', 'rebuild', 'acme'], f.io)).toBe(1);
+  expect(f.err.join('\n')).toMatch(/no code map yet/);
+  expect(await run(['map', 'rebuild'], f.io)).toBe(2);
+  expect(await run(['map', 'show', 'acme'], f.io)).toBe(2);
+});
+
 test('an unreachable server says where it looked and how to point elsewhere', async () => {
   const f = fake({});
   f.io.fetch = (async () => { throw new TypeError('fetch failed'); }) as typeof fetch;
@@ -235,8 +311,272 @@ test('end to end against the real app: fg decides Inbox items as the agent, and 
     fetch: ((url: string, init?: RequestInit) => app.request(url, init)) as typeof fetch,
   };
   expect(await run(['inbox', 'confirm', 'c1'], io)).toBe(0);
-  expect(decided).toEqual([['c1', 'confirmed', null]]);
+  expect(decided).toEqual([['c1', 'confirmed', null, 'operator:codex']]);
   expect(logged[0].actor).toBe('operator:codex');
   expect(await run(['lessons', 'approve', 'l1'], io)).toBe(1);
   expect(err.join('\n')).toMatch(/403 .*lesson_decide.*OPERATOR_ALLOW/);
+});
+
+
+// ── Waiting, and the verbs over existing routes ─────────────────────────
+
+const idle = { version: '0.5.1', workerHealthy: true, stage: { name: 'waiting', startedAt: '2026-10-25T03:50:00Z', current: null } };
+const pipeline = (o: object = {}) => ({ json: { stage: null, progress: null, sessions: 10, classify: { backlog: 0, capped: false }, inbox: { pending: 4, confirmed: 1 }, postmortems: { queued: 0 }, lessons: { proposed: 2, approved: 0 }, scans: { done: 3, queued: 0, running: 0, failed: 0, never: 0 }, ...o } });
+
+test('status prints the stage and since when, the pipeline backlog, the last Sync now and since when a model is down', async () => {
+  const f = fake({
+    'GET /api/status': () => ({ json: {
+      ...idle, stage: { name: 'ingest', startedAt: '2026-10-25T03:38:29Z', current: '3ff6.jsonl' }, progress: { done: 1, total: null },
+      models: { classify: { provider: 'ollama:gemma4', ok: false, reason: 'Ollama is not reachable', since: '2026-10-25T03:00:00Z' } },
+      cloud: { host: 'cloud.example.com', token: '[REDACTED]', intervalMinutes: 60, lastManual: { at: '2026-10-25T03:43:00Z', ok: true, error: null, sent: { projects: 2 }, unchanged: 68, failed: 0 }, syncing: null },
+    } }),
+    'GET /api/pipeline': () => pipeline({ classify: { backlog: 12, capped: false }, scans: { done: 3, queued: 2, running: 1, failed: 0, never: 0 } }),
+  });
+  expect(await run(['status'], f.io)).toBe(0);
+  const t = f.text();
+  expect(t).toMatch(/stage\s+ingest 3ff6\.jsonl \(1 done\) since 2026-10-25 03:38:29/);
+  expect(t).toMatch(/pipeline\s+classify 12 · inbox 4 pending · postmortems 0 · lessons 2 proposed · scans 1 running, 2 queued/);
+  expect(t).toMatch(/UNAVAILABLE since 2026-10-25 03:00:00: Ollama is not reachable/);
+  expect(t).toMatch(/sync now\s+2026-10-25 03:43:00 ok: sent 2 projects, 68 unchanged/);
+});
+
+test('status --until idle waits until the worker is waiting and nothing is queued; --timeout gives up with exit 1', async () => {
+  const backlog = [5, 0];
+  const f = fake({ 'GET /api/status': () => ({ json: idle }), 'GET /api/pipeline': () => pipeline({ classify: { backlog: backlog.shift() ?? 0, capped: false } }) });
+  expect(await run(['status', '--until', 'idle', '--interval', '1'], f.io)).toBe(0);
+  expect(f.calls.filter((c) => c.url.endsWith('/api/pipeline')).length).toBe(2);
+  expect(f.text()).toMatch(/idle/);
+
+  const busy = fake({ 'GET /api/status': () => ({ json: { ...idle, stage: { name: 'classify', startedAt: 't', current: null } } }), 'GET /api/pipeline': () => pipeline() });
+  expect(await run(['status', '--until', 'idle', '--interval', '5', '--timeout', '12'], busy.io)).toBe(1);
+  expect(busy.err.join('\n')).toMatch(/still not idle after 12 s/);
+
+  // A stage name waits for that stage.
+  const stage = fake({ 'GET /api/status': () => ({ json: { ...idle, stage: { name: 'scan', startedAt: 't', current: null } } }), 'GET /api/pipeline': () => pipeline() });
+  expect(await run(['status', '--until', 'scan'], stage.io)).toBe(0);
+  expect(await run(['status', '--until', 'nap'], fake({}).io)).toBe(2);
+});
+
+test('scan --wait follows each queued job until it is done or failed, and fails if any failed', async () => {
+  const states: Record<string, string[]> = { 'scan:1': ['queued', 'running', 'done'], 'scan:2': ['running', 'failed'] };
+  const f = fake({
+    'POST /api/projects/scan': () => ({ status: 202, json: { results: [{ key: 'acme', queued: true, job: { id: 'scan:1', status: 'queued' } }, { key: 'web', queued: true, job: { id: 'scan:2', status: 'queued' } }] } }),
+    'GET /api/scans/scan%3A1': () => { const st = states['scan:1'].length > 1 ? states['scan:1'].shift()! : states['scan:1'][0]; return { json: { id: 'scan:1', projectKey: 'acme', status: st, filesScanned: 6, factsAdded: 31, error: null, queuePosition: st === 'queued' ? 1 : null } }; },
+    'GET /api/scans/scan%3A2': () => { const st = states['scan:2'].length > 1 ? states['scan:2'].shift()! : states['scan:2'][0]; return { json: { id: 'scan:2', projectKey: 'web', status: st, filesScanned: 0, factsAdded: 0, error: st === 'failed' ? 'not valid JSON' : null, queuePosition: null } }; },
+  });
+  expect(await run(['scan', '--key', 'acme,web', '--wait'], f.io)).toBe(1);
+  const t = f.text();
+  expect(t).toMatch(/acme\s+done: 6 files, 31 facts/);
+  expect(t).toMatch(/web\s+failed: not valid JSON/);
+  // A job still going when --timeout runs out: exit 1 and what it was doing.
+  const slow = fake({
+    'POST /api/projects/scan': () => ({ status: 202, json: { results: [{ key: 'acme', queued: true, job: { id: 'scan:1', status: 'queued' } }] } }),
+    'GET /api/scans/scan%3A1': () => ({ json: { id: 'scan:1', projectKey: 'acme', status: 'queued', queuePosition: 3 } }),
+  });
+  expect(await run(['scan', '--key', 'acme', '--wait', '--timeout', '6', '--interval', '2'], slow.io)).toBe(1);
+  expect(slow.text()).toMatch(/acme\s+still queued \(3rd in the queue\)/);
+});
+
+test('pipeline prints each stage\'s count; --json is the API body', async () => {
+  const f = fake({ 'GET /api/pipeline': () => pipeline() });
+  expect(await run(['pipeline'], f.io)).toBe(0);
+  expect(f.text()).toMatch(/inbox\s+4 pending, 1 confirmed/);
+  expect(f.text()).toMatch(/scans\s+3 done, 0 queued, 0 running, 0 failed, 0 never/);
+  const j = fake({ 'GET /api/pipeline': () => pipeline() });
+  await run(['pipeline', '--json'], j.io);
+  expect(JSON.parse(j.text()).inbox).toEqual({ pending: 4, confirmed: 1 });
+});
+
+test('inbox show and lessons show print one item, with who decided it', async () => {
+  const f = fake({ 'GET /api/candidates/github%3Aacme%2Fshop%2313': () => ({ json: {
+    candidate: { id: 'github:acme/shop#13', projectKey: 'acme', source: 'github', status: 'rejected', decidedBy: 'operator:codex', note: 'author reply', classification: { label: 'pushback', confidence: 1, summary: 'says it is fixed' }, external: { author: 'sam', url: 'https://github.com/acme/shop/pull/13' } },
+    turn: { text: 'Fixed in abc123' }, before: [], after: [], commits: [], postmortem: null,
+  } }) });
+  expect(await run(['inbox', 'show', 'github:acme/shop#13'], f.io)).toBe(0);
+  const t = f.text();
+  expect(t).toMatch(/status\s+rejected by operator:codex/);
+  expect(t).toMatch(/comment\s+Fixed in abc123/);
+  expect(t).toMatch(/note\s+author reply/);
+  const l = fake({ 'GET /api/lessons/l1': () => ({ json: { lesson: { id: 'l1', status: 'proposed', projectKey: 'acme', title: 'Filter on the server', rule: 'Never filter client-side', appliesWhen: 'list endpoints', scope: 'project', paths: ['api/search.ts'], decidedBy: null }, miss: { missed: 'filtered in the browser', cause: 'context_missing' }, feedback: null, contextItems: [], fixCommits: [], supersedes: [] } }) });
+  expect(await run(['lessons', 'show', 'l1'], l.io)).toBe(0);
+  expect(l.text()).toMatch(/rule\s+Never filter client-side/);
+  expect(l.text()).toMatch(/paths\s+api\/search\.ts/);
+  expect(await run(['inbox', 'show'], fake({}).io)).toBe(2);
+});
+
+test('links list a project\'s links; confirm and dismiss decide one by its two projects', async () => {
+  const f = fake({ 'GET /api/projects/acme/links': () => ({ json: links }), 'PUT /api/links': (b) => ({ json: { ...links[0], ...(b as object) } }) });
+  expect(await run(['links', 'list', '--project', 'acme'], f.io)).toBe(0);
+  expect(f.text()).toMatch(/acme\s+demo-shop\s+depends_on\s+confirmed\s+0\.94/);
+  expect(await run(['links', 'dismiss', 'acme', 'web', '--note', 'unrelated'], f.io)).toBe(0);
+  expect(f.calls.at(-1)).toMatchObject({ method: 'PUT', body: { a: 'acme', b: 'web', status: 'dismissed', note: 'unrelated' } });
+  expect(await run(['links', 'list'], fake({}).io)).toBe(2);
+});
+
+test('facts list and relevance', async () => {
+  const facts = [{ id: 'f1', kind: 'convention', path: 'src/a.ts', statement: 'Every query is scoped by orgId', relevance: 0.9, relevanceBy: 'model' }];
+  const f = fake({ 'GET /api/projects/acme/facts?kind=convention': () => ({ json: facts }), 'PATCH /api/projects/acme/facts/f1/relevance': () => ({ status: 204 }) });
+  expect(await run(['facts', 'list', '--project', 'acme', '--kind', 'convention'], f.io)).toBe(0);
+  expect(f.text()).toMatch(/f1\s+convention\s+0\.90 model\s+src\/a\.ts\s+Every query/);
+  expect(await run(['facts', 'relevance', 'f1', '0.2', '--project', 'acme'], f.io)).toBe(0);
+  expect(f.calls.at(-1)).toMatchObject({ method: 'PATCH', body: { relevance: 0.2 } });
+  expect(await run(['facts', 'relevance', 'f1', 'lots', '--project', 'acme'], fake({}).io)).toBe(2);
+});
+
+test('docs list and upload a text file or an image', async () => {
+  const files: Record<string, Buffer> = { '/tmp/notes.md': Buffer.from('tenants are isolated'), '/tmp/shot.png': Buffer.from([137, 80, 78, 71]) };
+  const f = fake({
+    'GET /api/projects/acme/docs': () => ({ json: [{ id: 'doc:acme:upload:notes.md', title: 'Notes', ref: 'notes.md', source: 'upload', kind: 'text', addedAt: '2026-10-25T03:00:00Z', addedBy: 'operator:codex', read: { status: 'done', facts: 2 } }] }),
+    'POST /api/projects/acme/docs': () => ({ status: 201, json: { id: 'doc:acme:upload:notes.md', chunks: 1 } }),
+  });
+  f.io.readFile = async (path: string) => { if (!files[path]) throw new Error('ENOENT'); return files[path]; };
+  expect(await run(['docs', 'list', '--project', 'acme'], f.io)).toBe(0);
+  expect(f.text()).toMatch(/notes\.md\s+text\s+done \(2 facts\)\s+operator:codex/);
+  expect(await run(['docs', 'upload', '/tmp/notes.md', '--project', 'acme', '--title', 'Notes'], f.io)).toBe(0);
+  expect(f.calls.at(-1)!.body).toEqual({ title: 'Notes', name: 'notes.md', text: 'tenants are isolated' });
+  expect(await run(['docs', 'upload', '/tmp/shot.png', '--project', 'acme'], f.io)).toBe(0);
+  expect(f.calls.at(-1)!.body).toEqual({ title: 'shot.png', name: 'shot.png', image: { mediaType: 'image/png', data: files['/tmp/shot.png'].toString('base64') } });
+  const missing = fake({});
+  missing.io.readFile = async () => { throw new Error('ENOENT: no such file'); };
+  expect(await run(['docs', 'upload', '/tmp/nope.md', '--project', 'acme'], missing.io)).toBe(1);
+});
+
+test('activity and sessions list what the API returns', async () => {
+  const f = fake({
+    'GET /api/activity?project=acme&kind=feedback_decided&limit=5': () => ({ json: [{ id: 'a1', ts: '2026-10-25T03:31:55Z', actor: 'operator:fg', kind: 'feedback_decided', projectKey: 'acme', subject: 'rejected: "Fixed in abc"', why: '' }] }),
+    'GET /api/sessions?project=acme&limit=10': () => ({ json: { sessions: [{ id: 's1', projectKey: 'acme', source: 'claude', state: 'idle', snippet: 'Build search', lastActivityAt: '2026-10-25T02:00:00Z', turnCount: 12 }], next: null } }),
+  });
+  expect(await run(['activity', '--project', 'acme', '--kind', 'feedback_decided', '--limit', '5'], f.io)).toBe(0);
+  expect(f.text()).toMatch(/2026-10-25 03:31:55\s+operator:fg\s+feedback_decided\s+acme\s+rejected/);
+  expect(await run(['sessions', '--project', 'acme', '--limit', '10'], f.io)).toBe(0);
+  expect(f.text()).toMatch(/s1\s+acme\s+claude\s+idle/);
+});
+
+test('cloud status and integrations status read their routes; sync-now --force resends everything', async () => {
+  const f = fake({
+    'GET /api/cloud': () => ({ json: { enabled: true, host: 'cloud.example.com', intervalMinutes: 60, suggestions: false, projects: ['acme', 'web'], preview: { total: { projects: 2, lessons: 1, misses: 3, facts: 40, docs: 2, codeFiles: 100 } }, last: { at: '2026-10-25T03:43:00Z', ok: true, trigger: 'manual', error: null }, nextAt: '2026-10-25T04:43:00Z' } }),
+    'GET /api/settings/integrations': () => ({ json: { github: { connection: { state: 'connected', detail: 'signed in as acme-bot' }, lastSyncAt: '2026-10-25T03:48:00Z' }, linear: { connection: { state: 'not_connected', detail: 'no key yet' }, lastSyncAt: null } } }),
+    'POST /api/cloud/sync': () => ({ json: { ok: true, sent: { projects: 2 }, projects: [{ key: 'acme', status: 'sent' }, { key: 'web', status: 'unchanged' }] } }),
+    'GET /api/cloud/progress': () => ({ json: { running: null, lastManual: null } }),
+  });
+  expect(await run(['cloud', 'status'], f.io)).toBe(0);
+  expect(f.text()).toMatch(/host\s+cloud\.example\.com, every 60 min, next 2026-10-25 04:43:00/);
+  expect(f.text()).toMatch(/last\s+2026-10-25 03:43:00 \(manual\) ok/);
+  expect(await run(['integrations', 'status'], f.io)).toBe(0);
+  expect(f.text()).toMatch(/github\s+connected: signed in as acme-bot/);
+  expect(await run(['cloud', 'sync-now', '--force'], f.io)).toBe(0);
+  expect(f.calls.find((c) => c.method === 'POST')!.body).toEqual({ force: true });
+  expect(f.text()).toMatch(/1 sent, 1 unchanged/);
+});
+
+test('integrations set reads the token from stdin (never an argument), sends it once and never prints it; test checks it', async () => {
+  const token = 'k'.repeat(40);
+  const f = fake({
+    'PUT /api/settings/integrations/linear': () => ({ json: { ok: true, view: { linear: { connection: { state: 'connected', detail: 'signed in as Acme' } } } } }),
+    'POST /api/settings/integrations/linear/test': () => ({ json: { ok: true, account: 'Acme', error: null } }),
+  });
+  f.io.readStdin = async () => `${token}\n`;
+  expect(await run(['integrations', 'set', 'linear', '--from-stdin'], f.io)).toBe(0);
+  expect(f.calls[0]).toMatchObject({ method: 'PUT', body: { token } });
+  expect(f.text()).toMatch(/linear\s+connected: signed in as Acme/);
+  expect(f.text() + f.err.join('\n')).not.toContain(token);
+  expect(await run(['integrations', 'test', 'linear'], f.io)).toBe(0);
+  expect(f.text()).toMatch(/linear: ok \(Acme\)/);
+  // Without --from-stdin, or with an empty stdin, nothing is sent.
+  const g = fake({});
+  g.io.readStdin = async () => '\n';
+  expect(await run(['integrations', 'set', 'linear'], g.io)).toBe(2);
+  expect(await run(['integrations', 'set', 'linear', '--from-stdin'], g.io)).toBe(2);
+  expect(await run(['integrations', 'set', 'jira', '--from-stdin'], g.io)).toBe(2);
+  expect(g.calls).toEqual([]);
+});
+
+test('doctor is run by scripts/fg on the host; the CLI itself says so', async () => {
+  const f = fake({});
+  expect(await run(['doctor'], f.io)).toBe(2);
+  expect(f.err.join('\n')).toMatch(/scripts\/doctor\.sh/);
+});
+
+test('setup is run by scripts/fg on the host; the CLI itself (as in the api container) says it must run on the host', async () => {
+  const f = fake({});
+  expect(await run(['setup', '--yes'], f.io)).toBe(2);
+  expect(f.err.join('\n')).toMatch(/scripts\/setup\.sh/);
+  expect(f.err.join('\n')).toMatch(/on the host/);
+  expect(f.calls).toEqual([]);
+});
+
+test('projects list --with-sessions shows only folders with sessions; select --with-sessions selects the selectable ones', async () => {
+  const routes = { 'GET /api/settings/projects': () => ({ json: settings }), 'GET /api/projects': () => ({ json: summaries }), 'GET /api/projects/acme/links': () => ({ json: [] }) };
+  const f = fake(routes);
+  expect(await run(['projects', 'list', '--with-sessions', '--json'], f.io)).toBe(0);
+  expect(JSON.parse(f.text()).map((r: { key: string }) => r.key)).toEqual(['acme', 'demo-shop', 'demo-shop-2', 'secret']);
+  const t = fake(routes);
+  await run(['projects', 'list', '--with-sessions'], t.io);
+  expect(t.text()).not.toMatch(/folder gone/);
+
+  const put = (b: unknown) => ({ json: { ...settings, tracked: (b as { tracked: string[] }).tracked } });
+  // Not excluded, not a clone, not gone, and with at least one Claude or Codex session.
+  const sel = fake({ 'GET /api/settings/projects': () => ({ json: { ...settings, tracked: [] } }), 'PUT /api/settings/projects': put });
+  expect(await run(['projects', 'select', '--with-sessions'], sel.io)).toBe(0);
+  expect(sel.calls.at(-1)!.body).toEqual({ tracked: ['acme', 'demo-shop'] });
+  // With --key it narrows those keys to the ones with sessions.
+  const none = { ...settings, tracked: [], candidates: settings.candidates.map((c) => (c.key === 'demo-shop' ? { ...c, codexSessions: 0 } : c)) };
+  const keyed = fake({ 'GET /api/settings/projects': () => ({ json: none }), 'PUT /api/settings/projects': put });
+  await run(['projects', 'select', '--with-sessions', '--key', 'acme,demo-shop'], keyed.io);
+  expect(keyed.calls.at(-1)!.body).toEqual({ tracked: ['acme'] });
+});
+
+test('inbox list --source filters by where the comment came from; an unknown source is a usage mistake', async () => {
+  const f = fake({ 'GET /api/candidates?status=pending&source=linear': () => ({ json: [] }) });
+  expect(await run(['inbox', 'list', '--source', 'linear'], f.io)).toBe(0);
+  expect(f.text()).toMatch(/no pending items from linear/);
+  const bad = fake({});
+  expect(await run(['inbox', 'list', '--source', 'slack'], bad.io)).toBe(2);
+  expect(bad.err.join('\n')).toMatch(/claude, codex, github, linear/);
+  expect(bad.calls).toEqual([]);
+});
+
+test('lessons to-fact converts a lesson into a project fact (default convention); --kind and --relevance choose', async () => {
+  const fact = { id: 'fact:1', kind: 'convention', path: '.', statement: 'Orders are read from the source table', origin: 'you' };
+  const f = fake({ 'POST /api/lessons/l1/to-fact': () => ({ status: 201, json: fact }) });
+  expect(await run(['lessons', 'to-fact', 'l1'], f.io)).toBe(0);
+  expect(f.calls[0]).toMatchObject({ method: 'POST', body: {} });
+  expect(f.text()).toMatch(/l1 converted to a convention fact fact:1 \(\.\); the lesson is rejected/);
+  const g = fake({ 'POST /api/lessons/l1/to-fact': (b) => ({ status: 201, json: { ...fact, ...(b as object) } }) });
+  await run(['lessons', 'to-fact', 'l1', '--kind', 'gotcha', '--relevance', '0.3'], g.io);
+  expect(g.calls[0].body).toEqual({ kind: 'gotcha', relevance: 0.3 });
+  expect(await run(['lessons', 'to-fact'], fake({}).io)).toBe(2);
+  expect(await run(['lessons', 'to-fact', 'l1', '--relevance', '2'], fake({}).io)).toBe(2);
+});
+
+test('scripts/fg setup runs ./scripts/setup.sh with its arguments, without Node or the API', async () => {
+  const { execFileSync } = await import('node:child_process');
+  const { chmodSync, copyFileSync, mkdirSync, mkdtempSync, writeFileSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const { fileURLToPath } = await import('node:url');
+  const root = fileURLToPath(new URL('../../../', import.meta.url));
+  const repo = mkdtempSync(join(tmpdir(), 'fgsetup-'));
+  mkdirSync(join(repo, 'scripts'));
+  copyFileSync(join(root, 'scripts', 'fg'), join(repo, 'scripts', 'fg'));
+  writeFileSync(join(repo, 'scripts', 'setup.sh'), '#!/bin/sh\necho "setup ran: $*"\n');
+  chmodSync(join(repo, 'scripts', 'setup.sh'), 0o755);
+  const out = execFileSync('bash', [join(repo, 'scripts', 'fg'), 'setup', '--yes', '--projects', '/tmp/x'], { encoding: 'utf8', env: { PATH: '/usr/bin:/bin' } });
+  expect(out).toBe('setup ran: --yes --projects /tmp/x\n');
+});
+
+test('scripts/fg doctor runs ./scripts/doctor.sh with its arguments, without Node or the API', async () => {
+  const { execFileSync } = await import('node:child_process');
+  const { chmodSync, copyFileSync, mkdirSync, mkdtempSync, writeFileSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const { fileURLToPath } = await import('node:url');
+  const root = fileURLToPath(new URL('../../../', import.meta.url));
+  const repo = mkdtempSync(join(tmpdir(), 'fgdoctor-'));
+  mkdirSync(join(repo, 'scripts'));
+  copyFileSync(join(root, 'scripts', 'fg'), join(repo, 'scripts', 'fg'));
+  writeFileSync(join(repo, 'scripts', 'doctor.sh'), '#!/bin/sh\necho "doctor ran: $*"\n');
+  chmodSync(join(repo, 'scripts', 'doctor.sh'), 0o755);
+  const out = execFileSync('bash', [join(repo, 'scripts', 'fg'), 'doctor', '--help'], { encoding: 'utf8', env: { PATH: '/usr/bin:/bin' } });
+  expect(out).toBe('doctor ran: --help\n');
 });

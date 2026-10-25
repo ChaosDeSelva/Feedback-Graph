@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen } from '@testing-library/react';
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, expect, test, vi } from 'vitest';
 import { ImportBundle } from './ImportBundle.tsx';
 
@@ -35,6 +35,18 @@ test('imports a bundle file and says what came in; lessons wait for approval unl
   pick(JSON.stringify(bundle));
   await screen.findByText(/3 lessons/);
   expect(calls.at(-1)?.url).toBe('/api/import?keepApproved=1');
+});
+
+test('the message can be dismissed, and clears by itself after a while', async () => {
+  // Long enough that a loaded test run still sees the message before it clears.
+  render(<ImportBundle clearAfterMs={400} />);
+  pick('not json');
+  await screen.findByRole('alert');
+  fireEvent.click(screen.getByRole('button', { name: 'dismiss' }));
+  expect(screen.queryByRole('alert')).toBeNull();
+  pick('not json');
+  await screen.findByRole('alert');
+  await waitFor(() => expect(screen.queryByRole('alert')).toBeNull(), { timeout: 3000 });
 });
 
 test('a file that is not JSON, or a bundle the server refuses, shows why', async () => {

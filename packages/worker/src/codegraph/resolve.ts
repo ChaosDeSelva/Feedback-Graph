@@ -1,7 +1,12 @@
+import { builtinModules } from 'node:module';
 import { posix } from 'node:path';
 import type { RawImport } from './types.ts';
 
-export type Resolved = { to: string; names: string[] };
+/**
+ * unresolved: the import looks like it names a file of this repo (a tsconfig paths alias, a #-import, a workspace
+ * package, or a bare name no package.json declares) but no file was found, so the import graph misses an edge.
+ */
+export type Resolved = { to: string; names: string[]; unresolved?: true };
 export type Resolve = (from: string, lang: string, raw: RawImport) => Resolved[];
 
 /** Repo-relative join; '' is the repo root; null when the path leaves the repo. */
@@ -73,7 +78,12 @@ function matchPattern(patterns: string[], spec: string): { pattern: string; star
   return best;
 }
 
-type TsConfig = { baseUrl?: string; paths?: Record<string, string[]>; pathsDir?: string };
+/** configDir: the folder of the config itself (the leaf of an extends chain), what `${configDir}` in paths stands for. */
+type TsConfig = { baseUrl?: string; paths?: Record<string, string[]>; pathsDir?: string; configDir: string };
+const CONFIG_FILE = /^[tj]sconfig[^/]*\.json$/;
+const NODE_BUILTINS = new Set(builtinModules.map((m) => m.replace(/^node:/, '').split('/')[0]));
+/** Marks a JS import that looks like it names a repo file but resolved to none (Resolved.unresolved). */
+const UNRESOLVED = Symbol('unresolved');
 
 export function makeResolver(paths: string[], read: (path: string) => string | undefined): Resolve {
   const files = new Set(paths);
@@ -108,6 +118,18 @@ export function makeResolver(paths: string[], read: (path: string) => string | u
     return null;
   };
 
+  /** The config an `extends` names: a relative path, or a workspace package (`@acme/tsconfig/base.json`). */
+  const extendsTarget = (dir: string, e: string): string | undefined => {
+    let p: string | null;
+    if (e.startsWith('.') || e.startsWith('/')) p = e.startsWith('/') ? join(e.slice(1)) : join(dir, e);
+    else {
+      const segs = e.split('/');
+      const n = e.startsWith('@') ? 2 : 1;
+      const ws = workspaces().get(segs.slice(0, n).join('/'));
+      p = ws ? join(ws.dir, segs.slice(n).join('/')) : null;
+    }
+    return p === null ? undefined : [p, `${p}.json`, p ? `${p}/tsconfig.json` : 'tsconfig.json'].find((c) => files.has(c));
+  };
   const tsconfigs = new Map<string, TsConfig | null>();
   const loadTsconfig = (path: string, depth = 0): TsConfig | null => {
     if (tsconfigs.has(path)) return tsconfigs.get(path)!;
@@ -115,13 +137,12 @@ export function makeResolver(paths: string[], read: (path: string) => string | u
     const json = tryParse(read(path), true);
     if (!json) return null;
     const dir = dirOf(path);
-    let cfg: TsConfig = {};
+    let cfg: TsConfig = { configDir: dir };
     const ext = json.extends;
-    for (const e of (Array.isArray(ext) ? ext : [ext]).filter((x): x is string => typeof x === 'string' && x.startsWith('.'))) {
-      const p = join(dir, e);
-      const found = p === null ? undefined : [p, `${p}.json`, `${p}/tsconfig.json`].find((c) => files.has(c));
+    for (const e of (Array.isArray(ext) ? ext : [ext]).filter((x): x is string => typeof x === 'string')) {
+      const found = extendsTarget(dir, e);
       const parent = found && depth < 10 ? loadTsconfig(found, depth + 1) : null;
-      if (parent) cfg = { ...cfg, ...parent };
+      if (parent) cfg = { ...cfg, ...parent, configDir: dir };
     }
     const co = (json.compilerOptions ?? {}) as Record<string, unknown>;
     if (typeof co.baseUrl === 'string') cfg.baseUrl = join(dir, co.baseUrl) ?? undefined;
@@ -140,6 +161,70 @@ export function makeResolver(paths: string[], read: (path: string) => string | u
     nearestTsconfig.set(dir, cfg);
     return cfg;
   };
+  /**
+   * Every config whose paths may apply to a file in `dir`, nearest first: the nearest tsconfig.json (with what it
+   * extends), then the other tsconfig*.json beside it (a solution-style tsconfig.json keeps its aliases in
+   * tsconfig.app.json), then the same for each folder above. TypeScript would use one; the map tries them in turn.
+   */
+  const configChain = new Map<string, TsConfig[]>();
+  const pathsConfigsFor = (dir: string): TsConfig[] => {
+    if (configChain.has(dir)) return configChain.get(dir)!;
+    const here = (dirFiles.get(dir) ?? []).filter((p) => CONFIG_FILE.test(base(p))).sort((a, b) => Number(!/\/?tsconfig\.json$/.test(a)) - Number(!/\/?tsconfig\.json$/.test(b)) || (a < b ? -1 : 1));
+    const own = here.map((p) => loadTsconfig(p)).filter((c): c is TsConfig => !!c?.paths);
+    const chain = [...own, ...(dir ? pathsConfigsFor(dirOf(dir)) : [])];
+    configChain.set(dir, chain);
+    return chain;
+  };
+  /** A spec through one config's paths: the file, null when a pattern matched but named no file, undefined when none matched. */
+  const viaPaths = (cfg: TsConfig, spec: string): string | null | undefined => {
+    const m = matchPattern(Object.keys(cfg.paths!), spec);
+    if (!m) return undefined;
+    const baseDir = cfg.baseUrl ?? cfg.pathsDir ?? '';
+    for (const t of cfg.paths![m.pattern] ?? []) {
+      if (typeof t !== 'string') continue;
+      const target = t.replace('*', m.star);
+      const f = target.includes('${configDir}') ? resolveFile(join(target.replace('${configDir}', cfg.configDir))) : resolveFile(join(baseDir, target));
+      if (f) return f;
+    }
+    return null;
+  };
+  /** A #-import through the `imports` of the nearest package.json above the file. */
+  const packageImport = (from: string, spec: string): string | null | undefined => {
+    for (let d: string | null = dirOf(from); d !== null; d = d ? dirOf(d) : null) {
+      const p = d ? `${d}/package.json` : 'package.json';
+      if (!files.has(p)) continue;
+      const imp = tryParse(read(p))?.imports;
+      if (!imp || typeof imp !== 'object') return undefined;
+      const o = imp as Record<string, unknown>;
+      const m = matchPattern(Object.keys(o), spec);
+      if (!m) return null;
+      for (const t of exportTargets(o[m.pattern]).map((x) => x.replace('*', m.star))) {
+        const f = fromPackage(d, t);
+        if (f) return f;
+      }
+      return null;
+    }
+    return undefined;
+  };
+  /** Every name a package.json in the repo declares as a dependency, with the workspace names. */
+  const declared = lazy(() => {
+    const s = new Set<string>(workspaces().keys());
+    let any = false;
+    for (const p of named('package.json')) {
+      const pkg = tryParse(read(p));
+      for (const k of ['dependencies', 'devDependencies', 'peerDependencies', 'optionalDependencies']) {
+        const deps = pkg?.[k];
+        if (!deps || typeof deps !== 'object') continue;
+        for (const name of Object.keys(deps)) {
+          s.add(name);
+          any = true;
+          // @types/foo is imported as foo; @types/scope__pkg as @scope/pkg
+          if (name.startsWith('@types/')) s.add(name.slice(7).includes('__') ? `@${name.slice(7).replace('__', '/')}` : name.slice(7));
+        }
+      }
+    }
+    return any ? s : null;
+  });
 
   const workspaces = lazy(() => {
     const m = new Map<string, { dir: string; pkg: Record<string, unknown> }>();
@@ -190,25 +275,31 @@ export function makeResolver(paths: string[], read: (path: string) => string | u
     return null;
   };
 
-  const resolveJs = (from: string, spec: string): string | null | undefined => {
+  const jsRoot = (spec: string) => spec.split('/').slice(0, spec.startsWith('@') ? 2 : 1).join('/');
+  /** A file; null when nothing (a relative path to no file); undefined for a package; UNRESOLVED (see Resolved). */
+  const resolveJs = (from: string, spec: string): string | null | undefined | typeof UNRESOLVED => {
     if (spec.startsWith('.')) return resolveFile(join(dirOf(from), spec));
     if (spec.startsWith('/')) return resolveFile(join(spec.slice(1)));
-    const cfg = tsconfigFor(dirOf(from));
-    if (cfg?.paths) {
-      const m = matchPattern(Object.keys(cfg.paths), spec);
-      const baseDir = cfg.baseUrl ?? cfg.pathsDir ?? '';
-      for (const t of m ? cfg.paths[m.pattern] ?? [] : []) {
-        const f = typeof t === 'string' ? resolveFile(join(baseDir, t.replace('*', m!.star))) : null;
-        if (f) return f;
-      }
+    let aliased = false;
+    for (const cfg of pathsConfigsFor(dirOf(from))) {
+      const f = viaPaths(cfg, spec);
+      if (f) return f;
+      if (f === null) aliased = true;
     }
+    if (spec.startsWith('#')) return packageImport(from, spec) ?? UNRESOLVED;
+    const cfg = tsconfigFor(dirOf(from));
     if (cfg?.baseUrl !== undefined) {
       const f = resolveFile(join(cfg.baseUrl, spec));
       if (f) return f;
     }
-    return workspaceImport(spec) ?? undefined;
+    const ws = workspaceImport(spec);
+    if (ws) return ws;
+    const root = jsRoot(spec);
+    if (aliased || workspaces().has(root)) return UNRESOLVED;
+    if (spec.includes(':') || NODE_BUILTINS.has(root)) return undefined;
+    const deps = declared();
+    return deps && !deps.has(root) ? UNRESOLVED : undefined;
   };
-  const jsRoot = (spec: string) => spec.split('/').slice(0, spec.startsWith('@') ? 2 : 1).join('/');
 
   // ---------- Python ----------
 
@@ -406,8 +497,10 @@ export function makeResolver(paths: string[], read: (path: string) => string | u
     const many = (tos: string[] | null, external: string): Resolved[] =>
       tos === null ? [{ to: `pkg:${external}`, names }] : tos.filter((t) => t !== from).map((to) => ({ to, names }));
     switch (lang) {
-      case 'typescript': case 'tsx': case 'javascript':
-        return one(resolveJs(from, spec), jsRoot(spec));
+      case 'typescript': case 'tsx': case 'javascript': {
+        const to = resolveJs(from, spec);
+        return to === UNRESOLVED ? [{ to: `pkg:${jsRoot(spec)}`, names, unresolved: true }] : one(to, jsRoot(spec));
+      }
       case 'python': {
         const r = resolvePython(from, spec, names);
         return r === null ? [{ to: `pkg:${spec.split('.')[0]}`, names }] : r.filter((x) => x.to !== from);

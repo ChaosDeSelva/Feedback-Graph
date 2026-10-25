@@ -78,6 +78,15 @@ export function ProjectDocs({ projectKey, onError, pollMs = 5000 }: { projectKey
     }
   }
 
+  async function reread(id: string) {
+    try {
+      await api.rereadDoc(id);
+      await load();
+    } catch (e) {
+      onError(String(e));
+    }
+  }
+
   const [removing, setRemoving] = useState<DocSummary | null>(null);
   const [busyRemoving, setBusyRemoving] = useState(false);
   useEffect(() => setRemoving(null), [projectKey]);
@@ -121,7 +130,12 @@ export function ProjectDocs({ projectKey, onError, pollMs = 5000 }: { projectKey
               {d.kind !== 'image' && <span className="shrink-0 text-xs text-muted tabular-nums">{plural(d.chunks, 'chunk')}</span>}
               <ReadState d={d} />
             </span>
-            <Button size="sm" variant="ghost" aria-label={`remove ${d.title}`} onClick={() => setRemoving(d)} className="shrink-0 hover:text-bad-text">remove</Button>
+            <span className="flex shrink-0 items-center gap-1">
+              {d.read?.status === 'failed' && (
+                <Button size="sm" variant="ghost" aria-label={`retry reading ${d.title}`} title="read it again now (after changing DOCS_LLM, say), without uploading it again" onClick={() => void reread(d.id)}>retry</Button>
+              )}
+              <Button size="sm" variant="ghost" aria-label={`remove ${d.title}`} onClick={() => setRemoving(d)} className="hover:text-bad-text">remove</Button>
+            </span>
           </li>
         ))}
         {docs.length === 0 && (

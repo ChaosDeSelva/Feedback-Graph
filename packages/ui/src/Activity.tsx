@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { ACTIVITY_KINDS, type Activity as Entry, type ActivityKind } from '@fb/core/types';
-import { api, type ProjectSummary } from './api.ts';
+import { api, type PipelineStatus, type ProjectSummary } from './api.ts';
+import { hashFocus } from './links.ts';
 import { PageHeader } from './ui/PageHeader.tsx';
 import { Button, Select } from './ui/controls.tsx';
 import { Alert, Badge, EmptyState, SkeletonList, statusTone, type Tone } from './ui/display.tsx';
@@ -38,6 +39,9 @@ const KIND_LABEL: Record<ActivityKind, string> = {
   links_suggested: 'links suggested',
   link_decided: 'link decision',
   doc_read: 'document read',
+  comments_skipped: 'comments skipped',
+  lessons_checked: 'lessons checked',
+  lesson_to_fact: 'lesson to fact',
 };
 
 const KIND_TONE: Partial<Record<ActivityKind, Tone>> = {
@@ -56,6 +60,35 @@ function kindTone(a: Entry): Tone {
   if (a.kind === 'cloud_synced') return (a.details as { ok?: unknown }).ok === false ? 'bad' : 'ok';
   return KIND_TONE[a.kind] ?? 'neutral';
 }
+
+/** Model provider names, as in a provider spec (`ollama:gemma4`, `claude-cli`; core llm/providers.ts). */
+const MODEL_PROVIDERS = ['ollama', 'openai', 'openrouter', 'groq', 'anthropic', 'claude-cli', 'codex-cli', 'jev'];
+/** MCP clients that log as themselves, and the Ask page's chat. */
+const MCP_AGENTS = ['agent (MCP)', 'claude-code', 'codex', 'ui-chat'];
+
+export type ActorKind = 'person' | 'operator' | 'mcp' | 'model' | 'step';
+const ACTOR_HINT: Record<ActorKind, string> = {
+  person: 'person: you, from this app or the CLI',
+  operator: 'agent with the operator token: an agent acting for you through the admin tools',
+  mcp: 'agent over MCP: an agent asking for context or reporting a miss (or the Ask page)',
+  model: 'model: a language model did this step',
+  step: 'pipeline step: a fixed rule or step in the worker, no model involved',
+};
+
+/** The page's legend: an example of each kind of actor. */
+const LEGEND: [ActorKind, string][] = [
+  ['person', 'you'], ['operator', 'operator:<name>'], ['mcp', 'claude-code, agent (MCP)'], ['model', 'provider:model'], ['step', 'skip-rules, deterministic'],
+];
+
+/** What kind of actor wrote an entry: you, an agent (operator token or MCP), a model, or a step of the pipeline. */
+export function actorKind(actor: string): ActorKind {
+  if (actor === 'you') return 'person';
+  if (actor.startsWith('operator')) return 'operator';
+  if (MCP_AGENTS.includes(actor)) return 'mcp';
+  if (MODEL_PROVIDERS.includes(actor.split(':')[0]) || actor.startsWith('fake:')) return 'model';
+  return 'step';
+}
+export const actorHint = (actor: string) => ACTOR_HINT[actorKind(actor)];
 
 /** Prose (anything with a space in it) reads in the text font; ids, paths and hashes stay monospaced. */
 const isProse = (s: string) => /\s/.test(s.trim());
@@ -109,7 +142,7 @@ export function ActivityEntry({ a, open: initial = false }: { a: Entry; open?: b
           <Badge tone={kindTone(a)}>{KIND_LABEL[a.kind] ?? a.kind}</Badge>
         </span>
         <span className="max-w-36 min-w-0 text-right text-xs @3xl:contents">
-          <span className="block truncate font-mono text-[11.5px] text-muted @3xl:text-left">{a.actor}</span>
+          <span title={actorHint(a.actor)} className="block truncate font-mono text-[11.5px] text-muted @3xl:text-left">{a.actor}</span>
           <span className="block text-muted tabular-nums @3xl:text-right">{time(a.ts)}</span>
         </span>
       </button>
@@ -129,7 +162,11 @@ export function ActivityEntry({ a, open: initial = false }: { a: Entry; open?: b
 export function Activity() {
   const [projects, setProjects] = useState<ProjectSummary[]>([]);
   const [project, setProject] = useState('');
-  const [kind, setKind] = useState<ActivityKind | ''>('');
+  // A link to one kind (#activity/candidate_flagged, from the Dashboard) opens filtered to it.
+  const [kind, setKind] = useState<ActivityKind | ''>(() => {
+    const k = hashFocus('activity');
+    return ACTIVITY_KINDS.includes(k as ActivityKind) ? (k as ActivityKind) : '';
+  });
   const [rows, setRows] = useState<Entry[] | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -144,6 +181,15 @@ export function Activity() {
   }, [project, kind]);
 
   const filtered = !!(project || kind);
+
+  // Turns waiting for the classifier are not entries yet: filtered to what the classifier flags, say how many wait.
+  const [classify, setClassify] = useState<PipelineStatus['classify']>(null);
+  useEffect(() => {
+    if (kind !== 'candidate_flagged') return;
+    let live = true;
+    api.pipeline().then((p) => { if (live) setClassify(p.classify ?? null); }, () => {});
+    return () => { live = false; };
+  }, [kind]);
 
   return (
     <div className="flex h-full min-h-0 flex-col">
@@ -165,6 +211,17 @@ export function Activity() {
       />
       <div className="min-h-0 flex-1 overflow-y-auto p-3 md:p-5">
         {error && <Alert className="mb-3">{error}</Alert>}
+        {kind === 'candidate_flagged' && classify && (
+          <p role="status" className="mb-3 rounded-md border border-line bg-sunken px-3 py-2 text-[13px]">
+            {classify.backlog === 0 && !classify.capped
+              ? 'No turns are waiting for the classifier.'
+              : `${classify.backlog}${classify.capped ? '+' : ''} turns are waiting for the classifier. Each one it flags as pushback shows up below and in the Inbox.`}
+          </p>
+        )}
+        {/* Who "By" names: the same words as each actor's tooltip, once for the page. */}
+        <ul aria-label="who did it" className="mb-2 flex flex-wrap gap-x-4 gap-y-0.5 text-xs text-muted">
+          {LEGEND.map(([k, example]) => <li key={k} title={ACTOR_HINT[k]}><span className="font-mono">{example}</span> {ACTOR_HINT[k].split(':')[0]}</li>)}
+        </ul>
         <div className="@container rounded-md border border-line bg-surface shadow-card">
           <div className={`${ACTIVITY_COLS} sticky top-0 z-[1] rounded-t-md border-b border-line bg-sunken px-3 py-1.5 text-[11px] font-semibold tracking-[0.06em] text-muted uppercase`}>
             <span />

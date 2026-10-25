@@ -1,5 +1,6 @@
 import { execFile } from 'node:child_process';
-import { lstat, realpath } from 'node:fs/promises';
+import { lstat, readFile, realpath } from 'node:fs/promises';
+import { isAbsolute, join } from 'node:path';
 import { promisify } from 'node:util';
 import { normalizeRemote, redactSecrets, type Commit } from '@fb/core';
 
@@ -7,6 +8,28 @@ const run = promisify(execFile);
 
 /** Repos under the roots are not ours: a crafted .git/config must not run fsmonitor commands or hooks. */
 export const GIT_SAFE = ['-c', 'core.fsmonitor=', '-c', 'core.hooksPath=/dev/null'];
+
+/**
+ * A git worktree's `.git` is a file whose `gitdir:` line names its git dir by the host's absolute path, which the
+ * container does not see (git then says "not a git repository"). The `--git-dir`/`--work-tree` pair that reaches it
+ * through the roots mapping (host prefix → container prefix), as global git options; [] when `.git` is a directory,
+ * the named path is visible as it is (or relative), or it is under no root whose container side has it.
+ */
+export async function worktreeGitArgs(repoPath: string, roots: readonly { host: string; container: string }[]): Promise<string[]> {
+  const dotGit = join(repoPath, '.git');
+  const st = await lstat(dotGit).catch(() => null);
+  if (!st?.isFile() || st.size > 4096) return [];
+  const m = /^gitdir:\s*(.+?)\s*$/m.exec(await readFile(dotGit, 'utf8').catch(() => ''));
+  const gitdir = m?.[1];
+  if (!gitdir || !isAbsolute(gitdir) || (await lstat(gitdir).catch(() => null))?.isDirectory()) return [];
+  for (const r of [...roots].sort((a, b) => b.host.length - a.host.length)) {
+    const host = r.host.replace(/\/+$/, '');
+    if (!host || !gitdir.startsWith(`${host}/`)) continue;
+    const mapped = `${r.container.replace(/\/+$/, '')}${gitdir.slice(host.length)}`;
+    if ((await lstat(mapped).catch(() => null))?.isDirectory()) return ['--git-dir', mapped, '--work-tree', repoPath];
+  }
+  return [];
+}
 
 export async function commitsInWindow(repoPath: string, from: string, to: string): Promise<Commit[]> {
   try {

@@ -1,6 +1,6 @@
 import { IntegrationError, Integrations, type ActivityInput, type ExternalThread, type LinearComment, type PrContext, type WorkSession } from '@fb/core';
 import { describe, expect, test } from 'vitest';
-import { feedbackCursor, linkWorkSessions, prThread, syncExternalFeedback, type FeedbackSyncDeps, type SyncProject } from './feedbackSync.ts';
+import { authorsCursor, feedbackCursor, findWorkSessions, linkWorkSessions, prThread, syncExternalFeedback, type FeedbackSyncDeps, type SyncProject } from './feedbackSync.ts';
 
 const NOW = new Date('2026-10-22T12:00:00Z');
 const shop: SyncProject = { key: 'shop', name: 'shop', repoPath: '/vibe/shop', remote: 'github.com/acme/shop' };
@@ -70,6 +70,7 @@ describe('syncExternalFeedback', () => {
 
   test('waits the interval between syncs, then passes the cursor', async () => {
     const s = setup();
+    s.store.m.set(authorsCursor('shop'), '2026-10-21T00:00:00Z');
     s.store.m.set(feedbackCursor('github', 'shop'), '2026-10-22T11:55:00Z');
     await syncExternalFeedback(s.deps);
     expect(s.fetchCalls).toEqual([]);
@@ -171,23 +172,30 @@ describe('linkWorkSessions', () => {
     workSessions: async (q: { branch: string | null }) => list.filter((s) => (q.branch ? s.gitBranch === q.branch : true)),
   });
 
-  test('sessions on the branch win; else exactly one session in the window; several is none', async () => {
-    expect(await linkWorkSessions(graph([ws('a', 'feat'), ws('b', 'main')]), 'shop', 'feat', NOW.toISOString())).toEqual(['a']);
-    expect(await linkWorkSessions(graph([ws('b', 'main')]), 'shop', 'feat', NOW.toISOString())).toEqual(['b']);
-    expect(await linkWorkSessions(graph([ws('b', 'main'), ws('c', 'x')]), 'shop', 'feat', NOW.toISOString())).toEqual([]);
+  const found = async (list: WorkSession[], branch: string | null) => (await findWorkSessions(graph(list), 'shop', branch, NOW.toISOString())).map((s) => [s.id, s.by]);
+
+  test('sessions on the branch win; else exactly one session in the window, found by time; several is none', async () => {
+    expect(await found([ws('a', 'feat'), ws('b', 'main')], 'feat')).toEqual([['a', 'branch']]);
+    expect(await found([ws('b', 'main')], 'feat')).toEqual([['b', 'time']]);
+    expect(await found([ws('b', 'main'), ws('c', 'x')], 'feat')).toEqual([]);
   });
 
   test('the one session in the window is not the work when it ran on another feature branch', async () => {
-    expect(await linkWorkSessions(graph([ws('other', 'feat/billing')]), 'shop', 'feat/cart', NOW.toISOString())).toEqual([]);
-    // Unknown, the default branch, or no branch to compare with: it may have been the work.
-    expect(await linkWorkSessions(graph([ws('u', null)]), 'shop', 'feat/cart', NOW.toISOString())).toEqual(['u']);
-    expect(await linkWorkSessions(graph([ws('m', 'master')]), 'shop', 'feat/cart', NOW.toISOString())).toEqual(['m']);
-    expect(await linkWorkSessions(graph([ws('o', 'feat/billing')]), 'shop', null, NOW.toISOString())).toEqual(['o']);
+    expect(await found([ws('other', 'feat/billing')], 'feat/cart')).toEqual([]);
+    // Unknown, the default branch, or no branch to compare with: it may have been the work (the post-mortem asks for evidence).
+    expect(await found([ws('u', null)], 'feat/cart')).toEqual([['u', 'time']]);
+    expect(await found([ws('m', 'master')], 'feat/cart')).toEqual([['m', 'time']]);
+    expect(await found([ws('o', 'feat/billing')], null)).toEqual([['o', 'time']]);
+  });
+
+  test('the sync links only sessions on the branch: a match by time alone is not shown as the work', async () => {
+    expect(await linkWorkSessions(graph([ws('a', 'feat'), ws('b', 'main')]), 'shop', 'feat', NOW.toISOString())).toEqual(['a']);
+    expect(await linkWorkSessions(graph([ws('b', 'main')]), 'shop', 'feat', NOW.toISOString())).toEqual([]);
   });
 
   test('a session that only read (a security review on the branch) is never linked; one that only committed is', async () => {
     expect(await linkWorkSessions(graph([ws('review', 'feat', 0, 0)]), 'shop', 'feat', NOW.toISOString())).toEqual([]);
-    expect(await linkWorkSessions(graph([ws('review', 'feat', 0, 0), ws('coder', 'main')]), 'shop', 'feat', NOW.toISOString())).toEqual(['coder']);
+    expect(await found([ws('review', 'feat', 0, 0), ws('coder', 'main')], 'feat')).toEqual([['coder', 'time']]);
     expect(await linkWorkSessions(graph([ws('review', 'feat', 0, 0), ws('commit', 'feat', 0, 1)]), 'shop', 'feat', NOW.toISOString())).toEqual(['commit']);
   });
 });
@@ -251,4 +259,73 @@ test('a reply says whose comment it answers, so the PR author replying in their 
   ];
   const items = prThread({ ...base, author: 'dev', comments }, 0, []).items.map((i) => i.external);
   expect(items.map((e) => e.repliesTo ?? null)).toEqual([null, 'dev', null, 'lead', null]);
+});
+
+describe('comments synced before their authors were kept', () => {
+  // PR 9 by dev: lead's review comment (9 days ago), and dev's "Fixed in" reply to it, already in the Inbox as pending.
+  const old = (): PrContext => {
+    const p = pr(9, [{ id: '1', createdAt: '2026-10-13T10:00:00Z', path: 'src/cart.ts' }]);
+    return { ...p, comments: [p.comments[0], { ...p.comments[0], id: '2', author: 'dev', body: 'Fixed in ada836b. The cart now keeps cents.', inReplyTo: '1', createdAt: '2026-10-13T11:00:00Z' }] };
+  };
+  const reply = 'github:acme/shop#9/review_comment/2';
+
+  test('the next sync fetches the last 14 days again once, so stored comments get their author details', async () => {
+    const s = setup({ prs: async () => [old()] });
+    s.store.m.set(feedbackCursor('github', 'shop'), '2026-10-22T11:00:00Z');
+    await syncExternalFeedback(s.deps);
+    expect(s.fetchCalls).toEqual([{ repo: 'acme/shop', since: '2026-10-08T12:00:00.000Z' }]);
+    expect(s.threads[0].items.find((i) => i.uuid === reply)?.external).toMatchObject({ threadAuthor: 'dev', isReply: true, repliesTo: 'lead', authorKind: 'human' });
+    // Once: later syncs go on from the cursor.
+    s.store.m.set(feedbackCursor('github', 'shop'), '2026-10-22T11:00:00Z');
+    await syncExternalFeedback(s.deps);
+    expect(s.fetchCalls[1]).toEqual({ repo: 'acme/shop', since: '2026-10-22T11:00:00Z' });
+  });
+
+  test('a backfill that fails waits the sync interval before the whole window again, and is given up after three tries', async () => {
+    let fail = true;
+    const s = setup({ prs: async () => { if (fail) throw new IntegrationError('github 502: bad gateway', 'network'); return [old()]; } });
+    s.store.m.set(feedbackCursor('github', 'shop'), '2026-10-22T11:00:00Z');
+    const at = (iso: string) => { s.deps.now = () => new Date(iso); };
+    await syncExternalFeedback(s.deps);
+    // Within the interval: the next cycle only fetches from the cursor (cheap), not the 14 days again; that incremental
+    // sync working does not count as the backfill.
+    at('2026-10-22T12:01:00Z');
+    fail = false;
+    await syncExternalFeedback(s.deps);
+    fail = true;
+    expect(s.fetchCalls.map((c) => c.since)).toEqual(['2026-10-08T12:00:00.000Z', '2026-10-22T11:00:00Z']);
+    expect(s.store.m.get(authorsCursor('shop'))).toBeUndefined();
+    s.store.m.set(feedbackCursor('github', 'shop'), '2026-10-22T11:00:00Z');
+    // Two more failed backfills, an interval apart, and it stops trying: the next syncs are incremental.
+    at('2026-10-22T12:20:00Z');
+    await syncExternalFeedback(s.deps);
+    at('2026-10-22T12:40:00Z');
+    await syncExternalFeedback(s.deps);
+    expect(s.fetchCalls.filter((c) => c.since?.startsWith('2026-10-0'))).toHaveLength(3);
+    expect(s.store.m.get(authorsCursor('shop'))).toBeTruthy();
+    fail = false;
+    at('2026-10-22T13:00:00Z');
+    await syncExternalFeedback(s.deps);
+    expect(s.fetchCalls.at(-1)?.since).toBe('2026-10-22T11:00:00Z');
+  });
+
+  test('a first sync already has them: no second fetch', async () => {
+    const s = setup({ prs: async () => [old()] });
+    await syncExternalFeedback(s.deps);
+    s.store.m.set(feedbackCursor('github', 'shop'), '2026-10-22T11:00:00Z');
+    await syncExternalFeedback(s.deps);
+    expect(s.fetchCalls.map((c) => c.since)).toEqual(['2026-10-08T12:00:00.000Z', '2026-10-22T11:00:00Z']);
+  });
+
+  test('pending Inbox items that a skip rule now matches are reported, and left for you to decide', async () => {
+    const s = setup({ prs: async () => [old()] });
+    s.store.m.set(feedbackCursor('github', 'shop'), '2026-10-22T11:00:00Z');
+    const asked: unknown[] = [];
+    s.deps.graph = { ...s.deps.graph, listCandidates: async (f) => { asked.push(f); return [{ id: reply, turnUuid: reply } as never, { id: 'github:acme/shop#9/review_comment/1', turnUuid: 'github:acme/shop#9/review_comment/1' } as never]; } };
+    await syncExternalFeedback(s.deps);
+    expect(asked).toEqual([{ status: 'pending', projectKey: 'shop', limit: 1000 }]);
+    const note = s.activity.find((a) => a.details && 'pendingMatches' in a.details);
+    expect(note).toMatchObject({ kind: 'feedback_synced', projectKey: 'shop', targets: [reply], details: { pendingMatches: { 'pr-author-reply': 1 } } });
+    expect(note?.subject).toMatch(/1 pending Inbox item matches a skip rule/);
+  });
 });

@@ -54,6 +54,8 @@ export const CLEANUP_CONFIRM = 'remove-unselected';
 const Selection = z.object({ tracked: z.array(z.string().min(1).max(200)).max(2000) }).strict();
 const Cleanup = z.object({ confirm: z.string() }).strict();
 const Roots = z.object({ roots: z.array(z.string().max(2048)).max(MAX_ROOTS * 5) }).strict();
+/** For the OpenAPI document (openapi.ts). */
+export const settingsSchemas = { Selection, Cleanup, Roots };
 
 const sameSet = (a: string[], b: string[]) => a.length === b.length && [...a].sort().join('\n') === [...b].sort().join('\n');
 /** The folder is this root or inside it. */

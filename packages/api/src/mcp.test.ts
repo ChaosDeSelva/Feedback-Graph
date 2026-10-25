@@ -120,3 +120,31 @@ test('a client ending its session (DELETE /mcp, no body) gets a clean answer: th
   expect(res.status).toBe(204);
   expect(logs).toEqual([{ msg: 'request', extra: expect.objectContaining({ method: 'DELETE', status: 204 }) }]);
 });
+
+test('GET /mcp answers 405: the server sends nothing unasked, so clients do not hold (and reopen) an event stream', async () => {
+  const app = createApp(repo, { context: ctx });
+  const res = await app.request('/mcp', { method: 'GET', headers: { accept: 'text/event-stream' } });
+  expect(res.status).toBe(405);
+  expect(res.headers.get('allow')).toBe('POST, DELETE');
+});
+
+test('free-text arguments have a length limit: a megabyte task is refused before it is embedded or stored', async () => {
+  const embedded: string[][] = [];
+  const app = createApp(repo, { context: { ...ctx, embed: async (t) => { embedded.push(t); return t.map(() => [1]); } } });
+  const call = async (name: string, args: object) => (await (await app.request('/mcp', rpc({ method: 'tools/call', params: { name, arguments: args } }))).json()) as { result?: { isError?: boolean; content: { text: string }[] }; error?: { message: string } };
+  const huge = 'C'.repeat(1_048_576);
+  for (const [name, args] of [
+    ['get_task_context', { cwd: '/Users/j/Vibe/demo', task: huge }],
+    ['search_graph', { cwd: '/Users/j/Vibe/demo', query: huge }],
+    ['check_before_done', { cwd: '/Users/j/Vibe/demo', task: 't', summary: huge }],
+    ['report_feedback', { cwd: '/Users/j/Vibe/demo', feedback: huge, what_was_done: 'x' }],
+  ] as const) {
+    const r = await call(name, args);
+    const text = r.error?.message ?? r.result?.content[0]?.text ?? '';
+    expect(r.error !== undefined || r.result?.isError === true, name).toBe(true);
+    expect(text, name).toMatch(/too_big|at most|too long|<=/i);
+  }
+  expect(embedded).toEqual([]);
+  // An ordinary task still works.
+  expect((await call('get_task_context', { cwd: '/Users/j/Vibe/demo', task: 'add search' })).result?.isError).toBeFalsy();
+});

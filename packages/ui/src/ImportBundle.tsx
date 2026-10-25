@@ -1,8 +1,8 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { api, type ImportResult } from './api.ts';
 import { buttonClass } from './ui/controls.tsx';
 import { plural } from './ui/display.tsx';
-import { UploadIcon } from './ui/icons.tsx';
+import { CloseIcon, UploadIcon } from './ui/icons.tsx';
 
 const readText = (f: File) =>
   new Promise<string>((resolve, reject) => {
@@ -20,10 +20,16 @@ function summary(r: ImportResult): string {
 }
 
 /** Projects page: bring an export bundle (from this or another machine) back in. Lessons wait for approval by default. */
-export function ImportBundle({ onImported }: { onImported?: () => void }) {
+export function ImportBundle({ onImported, clearAfterMs = 20_000 }: { onImported?: () => void; clearAfterMs?: number }) {
   const [keepApproved, setKeepApproved] = useState(false);
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState<{ ok: boolean; text: string } | null>(null);
+  // It sits in the page header: dismissible, and gone by itself after a while (a wrong file dropped here is no emergency).
+  useEffect(() => {
+    if (!message) return;
+    const t = setTimeout(() => setMessage(null), clearAfterMs);
+    return () => clearTimeout(t);
+  }, [message, clearAfterMs]);
 
   async function pick(files: FileList | null) {
     const f = files?.[0];
@@ -60,7 +66,12 @@ export function ImportBundle({ onImported }: { onImported?: () => void }) {
           onChange={(e) => { void pick(e.target.files); e.target.value = ''; }} />
       </label>
       {message && (
-        <span role={message.ok ? 'status' : 'alert'} className={`max-w-md ${message.ok ? 'text-muted' : 'text-bad-text'}`}>{message.text}</span>
+        <span className="flex max-w-md items-start gap-1">
+          <span role={message.ok ? 'status' : 'alert'} className={message.ok ? 'text-muted' : 'text-bad-text'}>{message.text}</span>
+          <button type="button" aria-label="dismiss" onClick={() => setMessage(null)} className="grid size-4 shrink-0 place-items-center rounded-sm text-muted hover:bg-sunken hover:text-text">
+            <CloseIcon size={10} />
+          </button>
+        </span>
       )}
     </div>
   );

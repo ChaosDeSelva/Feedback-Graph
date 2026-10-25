@@ -14,7 +14,7 @@
  * - Vectors of a different length than the query are skipped by searches, never an error.
  */
 import type { Config } from './config.ts';
-import type { ActivityInput, Activity, ActivityKind, Candidate, Classification, Commit, FactKind, LessonStatus, Lesson, ParsedSession, PostMortem, PostMortemInput, Project, ProjectSummary, ScanJob, ScanStatus, WorkerStatus } from './types.ts';
+import type { ActivityInput, Activity, ActivityKind, Candidate, Classification, Commit, FactKind, LessonCheck, LessonStatus, Lesson, ParsedSession, PostMortem, PostMortemInput, Project, ProjectSummary, RelevanceBy, ScanJob, ScanStatus, WorkerStatus } from './types.ts';
 import type { ProjectScope, ProjectSelection } from './scope.ts';
 import type { CandidateDetail, CandidateFilter, ClassifiableTurn, StatsRow } from './graph/repo.ts';
 import type { LessonDetail, LessonHit, LessonInput, LessonPatch, RelatedMiss } from './graph/knowledge.ts';
@@ -28,6 +28,12 @@ import type { CandidateSnapshot } from './graph/selection.ts';
 import type { CodeMapMeta, CodeMapStats, CodeMapWrite, Hotspot, HotspotOpts, Impact, MapGraph, ModuleContext, SessionFile, StoredCodeMap } from './codegraph.ts';
 import type { ExternalRef, ExternalSource, SessionSource, HumanTurn, SessionDetail, SessionListItem, SessionState } from './types.ts';
 import type { SessionCursor, SummaryWork, SummaryWorkQuery, SummaryWrite } from './sessions.ts';
+import type { ChatAnswer, ChatConversation, ChatJob, ChatPack, ChatProvider, ChatThread } from './chat.ts';
+
+/** The paths a scope replace covers (FactsStore.replaceScopeFacts): under one of `prefixes`, under none of `except`. */
+export type FactScope = { prefixes: string[]; except: string[] };
+/** What updateScanJob changes: only the keys given (a key set to null clears it). */
+export type ScanJobPatch = Partial<Pick<ScanJob, 'filesScanned' | 'factsAdded' | 'error' | 'shards'>> & { status?: ScanStatus };
 
 /**
  * A pull request's or Linear issue's comments as one stand-in session (`id`, e.g. `github:acme/shop#12`): never
@@ -67,6 +73,10 @@ export interface GraphStore {
   projectByAlias(key: string): Promise<Project | null>;
   projectsMissingRemote(): Promise<Project[]>;
   setProjectRemote(key: string, remote: string): Promise<void>;
+  /** Records with no remote or no folder path (scans, code maps and uploads make them with neither). */
+  projectsMissingFolder(): Promise<Project[]>;
+  /** Fill a record's folder path and remote where missing; one already set is never overwritten. */
+  fillProjectFolder(key: string, folder: { repoPath: string; remote: string | null }): Promise<void>;
   unclassifiedTurns(limit: number, projectKeys?: string[], excludeKeys?: string[]): Promise<ClassifiableTurn[]>;
   recordClassifyFailure(turnUuid: string): Promise<void>;
   /** Unlabelled turns skipped for good after MAX_CLASSIFY_ATTEMPTS failed classifications. */
@@ -82,7 +92,8 @@ export interface GraphStore {
   saveClassification(turnUuid: string, c: Classification, makeCandidate: boolean): Promise<string | null>;
   listCandidates(f?: CandidateFilter): Promise<Candidate[]>;
   candidateDetail(id: string): Promise<CandidateDetail | null>;
-  decide(id: string, status: 'confirmed' | 'rejected', note: string | null): Promise<void>;
+  /** by: who decided ('you', or 'operator:<name>' for an agent with the operator token); default 'you'. */
+  decide(id: string, status: 'confirmed' | 'rejected', note: string | null, by?: string): Promise<void>;
   /** keepUnsummarized: only turns a session summary already covers lose their text (summaries stay either way). */
   pruneTurnText(before: Date, limit?: number, o?: { keepUnsummarized?: boolean }): Promise<number>;
   /**
@@ -116,8 +127,13 @@ export interface KnowledgeStore {
    */
   listLessons(f: { status?: LessonStatus; projectKey?: string; projectKeys?: string[]; limit?: number }): Promise<Lesson[]>;
   lessonDetail(id: string): Promise<LessonDetail | null>;
-  /** `by`: who decides, when the patch sets a status ('you' when unset; `operator:<name>` for the operator token). */
-  updateLesson(id: string, patch: LessonPatch, o: { reembed?: number[]; by?: string }): Promise<{ unscoped: boolean }>;
+  /**
+   * `by`: who decides, when the patch sets a status ('you' when unset; `operator:<name>` for the operator token).
+   * `note`: why (kept as decisionNote); a status set without one clears the old note.
+   */
+  updateLesson(id: string, patch: LessonPatch, o: { reembed?: number[]; by?: string; note?: string }): Promise<{ unscoped: boolean }>;
+  /** Store what the lesson check found (redacted), replacing earlier checks; nothing else changes. False: no such lesson. */
+  setLessonChecks(id: string, checks: LessonCheck[]): Promise<boolean>;
   searchLessons(q: { embedding: number[]; projectKey: string | null; k: number; status?: LessonStatus; projectKeys?: string[] }): Promise<LessonHit[]>;
   relatedMisses(q: { embedding: number[]; projectKey: string | null; k: number }): Promise<RelatedMiss[]>;
   /**
@@ -137,6 +153,17 @@ export interface FactsStore {
   markFilesRemoved(projectKey: string, paths: string[]): Promise<void>;
   /** All or nothing: a failure part way leaves the old facts current and the old hashes in place. */
   replaceProjectFacts(projectKey: string, rawFacts: EmbeddedFact[], source: string, files: { path: string; hash: string }[], scanJobId?: string | null): Promise<void>;
+  /**
+   * replaceProjectFacts for one shard of an agentic scan: closes only the current code facts whose path is under one
+   * of `scope.prefixes` ('' is every path, '.' included) and under none of `scope.except` (a path is under a prefix
+   * when it is the prefix or starts with it plus '/'). Documents' facts are never closed. All or nothing, as above.
+   */
+  replaceScopeFacts(projectKey: string, scope: FactScope, rawFacts: EmbeddedFact[], source: string, files: { path: string; hash: string }[], scanJobId?: string | null): Promise<void>;
+  /**
+   * A fact you wrote (origin 'you'; source and relevanceBy are `by`): filed under the project, not a code file, so no
+   * scan closes or replaces it, and it never counts as a model's in currentSources. Redacted here.
+   */
+  addOwnerFact(projectKey: string, rawFact: EmbeddedFact, by: RelevanceBy): Promise<StoredFact>;
   currentSources(projectKey: string): Promise<string[]>;
   listFacts(q: { projectKey: string; kind?: FactKind; path?: string; limit?: number }): Promise<StoredFact[]>;
   searchFacts(q: { embedding: number[]; projectKey: string; k: number }): Promise<FactHit[]>;
@@ -154,7 +181,7 @@ export interface FactsStore {
    * SCAN_UNAVAILABLE_WAIT_MS, attempts unchanged. Returns the job's attempts and when it runs next (null: failed).
    */
   recordScanFailure(id: string, error: string, o: { counted: boolean }, now?: Date): Promise<{ attempts: number; retryAt: string | null }>;
-  updateScanJob(id: string, patch: Partial<Pick<ScanJob, 'filesScanned' | 'factsAdded' | 'error'>> & { status?: ScanStatus }): Promise<void>;
+  updateScanJob(id: string, patch: ScanJobPatch): Promise<void>;
   requeueStaleScans(): Promise<void>;
   listProjects(): Promise<ProjectSummary[]>;
   /** Pin or unpin. A folder with no data yet is recorded as a project (its name and path kept if it had them). */
@@ -182,6 +209,11 @@ export interface DocsStore {
   recordDocFailure(id: string, error: string, o: { counted: boolean; final?: boolean; version?: string }, now?: Date): Promise<{ attempts: number; retryAt: string | null } | null>;
   /** Readings left running by a worker that died go back to pending (on startup). */
   requeueStaleDocs(): Promise<void>;
+  /**
+   * Your retry: a reading that failed (or is waiting out a retry) goes back to pending now, its attempts and error
+   * cleared. False when the doc is gone, is not an upload to read, or is being read or already read.
+   */
+  requeueDocRead(id: string): Promise<boolean>;
   docImage(id: string): Promise<TaskImage | null>;
   listDocs(projectKey: string): Promise<DocSummary[]>;
   deleteDoc(id: string): Promise<boolean>;
@@ -261,8 +293,22 @@ export interface SelectionStore {
  * (fixedHere: edited after the feedback); file nodes are the ones facts are ABOUT. Paths are repo-relative.
  */
 export interface CodeGraphStore {
-  /** Replace the project's map in one transaction: files gone from it lose their map data, edges are rebuilt. */
+  /**
+   * Replace the project's map: files gone from it lose their map data, edges are rebuilt. Postgres writes it in one
+   * transaction; Neo4j as a diff in slices, with the fingerprint cleared until the last one (a cut-short write reads
+   * back with a null fingerprint, never as current).
+   */
   replaceCodeMap(projectKey: string, map: CodeMapWrite): Promise<CodeMapStats>;
+  /** Ask the worker to remap the project from scratch; false when it has no map yet (the first one is on its way). */
+  requestCodeMapRebuild(projectKey: string): Promise<boolean>;
+  /**
+   * Delete up to `limit` CodeFile records that no map holds and nothing needs: gone from the repo (removed by a scan)
+   * or of no project, with no fact (current or closed) and no session touch. A scanned file still in the repo stays:
+   * its hash is what lets the next scan skip it. Returns how many went.
+   */
+  purgeOrphanCodeFiles(limit: number): Promise<number>;
+  /** Rebuilds asked for and not yet done (asked after the map was last built), oldest first. */
+  codeMapRebuildsRequested(): Promise<{ projectKey: string; requestedAt: string }[]>;
   /** The stored map in the parser's shape (for an incremental build), or null before the first build. */
   codeMap(projectKey: string): Promise<StoredCodeMap | null>;
   /** When the map was built, from what (fingerprint), and its size; null before the first build. Cheap. */
@@ -306,6 +352,40 @@ export interface SessionsStore {
   requestRebuild(sessionId: string): Promise<boolean>;
 }
 
+/**
+ * Ask conversations (chat.ts): the api writes questions with their context pack, the worker's chat runner writes the
+ * answers. Text, packs, answers and errors are redacted before they are stored. Never exported or synced; deleted with
+ * their project.
+ */
+export interface ChatStore {
+  /** Newest activity first. projectKeys: only these (an empty list finds none); unset: every project. */
+  listConversations(q: { projectKeys?: string[] }): Promise<ChatConversation[]>;
+  createConversation(input: { projectKey: string; title: string; provider: ChatProvider | null }): Promise<ChatConversation>;
+  /** Rename or switch provider; null when there is no such conversation. */
+  updateConversation(id: string, patch: { title?: string; provider?: ChatProvider | null }): Promise<ChatConversation | null>;
+  /** The conversation with its turns in order; null when missing. */
+  conversation(id: string): Promise<ChatThread | null>;
+  /**
+   * A question: its user turn (holding the pack's context, capped at MAX_CHAT_CONTEXT) and a pending assistant turn
+   * (holding the pack's sources). Throws ChatBusyError while another turn of the conversation is pending or answering;
+   * null when there is no such conversation.
+   */
+  addUserTurn(conversationId: string, text: string, pack: ChatPack): Promise<ChatThread | null>;
+  /** The oldest pending assistant turn, with its conversation, question and stored pack; null when none waits. */
+  nextPendingTurn(): Promise<ChatJob | null>;
+  /** Claim a pending turn for `provider` (pending -> answering). False when it is not pending any more. */
+  markAnswering(turnId: string, provider: string): Promise<boolean>;
+  /** answering -> done with the answer. False when it is not answering (deleted, requeued). */
+  saveAnswer(turnId: string, answer: ChatAnswer): Promise<boolean>;
+  /** pending or answering -> failed with the (redacted) reason. */
+  failTurn(turnId: string, error: string): Promise<boolean>;
+  /** A failed assistant turn of this conversation back to pending (its pack is reused); null when there is none such. */
+  retryTurn(conversationId: string, turnId: string): Promise<ChatThread | null>;
+  deleteConversation(id: string): Promise<boolean>;
+  /** Turns left answering by a worker that died go back to pending (on startup). Returns how many. */
+  requeueStaleTurns(): Promise<number>;
+}
+
 /** One backend, opened: every repository over one connection, plus the lifecycle the services need. */
 export interface Store {
   readonly kind: StoreKind;
@@ -321,6 +401,7 @@ export interface Store {
   readonly selection: SelectionStore;
   readonly codegraph: CodeGraphStore;
   readonly sessions: SessionsStore;
+  readonly chats: ChatStore;
   /** Create or upgrade the schema (Neo4j constraints and indexes; Postgres migrations). Safe from two services at once. */
   ensureSchema(): Promise<void>;
   /** Whether the database answers. Never throws. */

@@ -3,9 +3,9 @@ import { api, type PatternReport, type ProjectHotspot, type ProjectSummary } fro
 import { IncludeTests } from './CodeMap.tsx';
 import { PageHeader } from './ui/PageHeader.tsx';
 import { Select } from './ui/controls.tsx';
-import { Alert, Card, causeLabel, causeTone, StatGrid, StatTile, StatTileSkeleton, tableClass, tdClass, thClass, TONE_FILL } from './ui/display.tsx';
+import { Alert, Card, causeLabel, causeTone, EmptyState, StatGrid, StatTile, StatTileSkeleton, tableClass, tdClass, thClass, TONE_FILL } from './ui/display.tsx';
 
-const pct = (n: number, d: number) => (d ? `${Math.round((n / d) * 100)}%` : '–');
+export const pct = (n: number, d: number) => (d ? `${Math.round((n / d) * 100)}%` : '–');
 
 type Week = PatternReport['weekly'][number];
 const DAY = 86_400_000;
@@ -44,7 +44,7 @@ export function fillWeeks(weekly: Week[], min = 8): Week[] {
 }
 
 /** Feedback per ISO week as columns: first-time misses below, repeats stacked on top. */
-function WeeklyChart({ weekly: given }: { weekly: PatternReport['weekly'] }) {
+export function WeeklyChart({ weekly: given }: { weekly: PatternReport['weekly'] }) {
   const weekly = fillWeeks(given);
   const max = Math.max(1, ...weekly.map((w) => w.feedback));
   const step = Math.max(1, Math.ceil(weekly.length / 8));
@@ -119,13 +119,21 @@ export function Patterns() {
         actions={
           <Select aria-label="project" value={project} onChange={(e) => setProject(e.target.value)} className="w-44">
             <option value="">all projects</option>
-            {projects.filter((p) => p.feedback > 0).map((p) => <option key={p.key} value={p.key}>{p.key}</option>)}
+            {/* Every project, as on the other pages; one with no feedback says so below. */}
+            {projects.map((p) => <option key={p.key} value={p.key}>{p.key}</option>)}
           </Select>
         }
       />
       <div className="min-h-0 flex-1 overflow-y-auto">
         <div className="mx-auto flex max-w-6xl flex-col gap-4 p-3 md:p-5">
           {error && <Alert>{error}</Alert>}
+          {projects.find((p) => p.key === project)?.feedback === 0 && (
+            <Card>
+              <EmptyState compact title={`No feedback in ${project} yet`}>
+                Nothing from this project has been confirmed in the Inbox, so there are no misses to find patterns in. Where agents struggle in its code is still below.
+              </EmptyState>
+            </Card>
+          )}
 
           <StatGrid>
             {report ? (

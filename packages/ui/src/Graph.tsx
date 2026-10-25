@@ -2,9 +2,10 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import ForceGraph2D, { type ForceGraphMethods } from 'react-force-graph-2d';
 import { api, type EvidenceGraph, type ProjectSummary } from './api.ts';
 import { CodeGraph } from './CodeGraph.tsx';
+import { FirstRun } from './FirstRun.tsx';
 import { PageHeader } from './ui/PageHeader.tsx';
 import { Select, Tabs } from './ui/controls.tsx';
-import { Alert, EmptyState, SectionLabel, Skeleton } from './ui/display.tsx';
+import { Alert, CauseBadge, causeLabel, EmptyState, SectionLabel, Skeleton } from './ui/display.tsx';
 import { MAX_FIT_ZOOM, useSize } from './ui/graphCanvas.ts';
 import { evidenceLinkLabel, evidenceNodeLabel } from './ui/graphLabels.ts';
 import { GraphIcon } from './ui/icons.tsx';
@@ -37,6 +38,8 @@ export function Graph() {
   const [projects, setProjects] = useState<ProjectSummary[]>([]);
   const [project, setProject] = useState<string | null>(null);
   const [graph, setGraph] = useState<EvidenceGraph | null>(null);
+  // A cause node carries its key (context_available_ignored); it reads as the label Lessons and Patterns use.
+  const setGraphLabelled = (g: EvidenceGraph) => setGraph({ ...g, nodes: g.nodes.map((n) => (n.kind === 'cause' ? { ...n, label: causeLabel(n.label) } : n)) });
   const [selected, setSelected] = useState<Node | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loadedProjects, setLoadedProjects] = useState(false);
@@ -62,7 +65,7 @@ export function Graph() {
     fitted.current = false;
     // A slow graph for the project you left must not be drawn under the one you picked.
     let stale = false;
-    api.graph(project).then((g) => { if (!stale) setGraph(g); }, (e) => { if (!stale) setError(String(e)); });
+    api.graph(project).then((g) => { if (!stale) setGraphLabelled(g); }, (e) => { if (!stale) setError(String(e)); });
     return () => { stale = true; };
   }, [project, mode]);
 
@@ -153,9 +156,13 @@ export function Graph() {
               onNodeClick={(n: Node) => setSelected(byId.get(n.id) ?? null)}
             />
           ) : data || (loadedProjects && !project) ? (
-            <EmptyState icon={<GraphIcon />} title="No evidence graph yet" className="pt-24">
-              Confirm feedback in the Inbox. Once its post-mortem runs, the miss, its cause and the lesson appear here.
-            </EmptyState>
+            <div className="h-full overflow-y-auto">
+              {/* Where the pipeline stands for the project picked, under the legend. */}
+              {project && <div className="pt-12"><FirstRun key={project} view="graph" project={project} force /></div>}
+              <EmptyState icon={<GraphIcon />} title="No evidence graph yet" className={project ? 'pt-10' : 'pt-24'}>
+                Confirm feedback in the Inbox. Once its post-mortem runs, the miss, its cause and the lesson appear here.
+              </EmptyState>
+            </div>
           ) : (
             <div role="status" aria-label="loading" className="grid h-full place-items-center">
               <div className="grid justify-items-center gap-3">
@@ -172,8 +179,10 @@ export function Graph() {
               <div className="flex items-center gap-2">
                 <span aria-hidden="true" className="size-2.5 rounded-full" style={{ background: palette.node[selected.kind] }} />
                 <SectionLabel as="div">{selected.kind}{selected.status ? ` · ${selected.status}` : ''}</SectionLabel>
+                {selected.kind === 'cause' && <CauseBadge cause={selected.id.slice('cause:'.length)} />}
               </div>
-              <p className="text-[13.5px] leading-relaxed whitespace-pre-wrap [overflow-wrap:anywhere]">{selected.label}</p>
+              {/* A cause's badge already names it. */}
+              {selected.kind !== 'cause' && <p className="text-[13.5px] leading-relaxed whitespace-pre-wrap [overflow-wrap:anywhere]">{selected.label}</p>}
               <SectionLabel>Connections</SectionLabel>
               <ul className="grid gap-1.5">
                 {connections.map((c, i) => (

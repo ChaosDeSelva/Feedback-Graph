@@ -1,6 +1,6 @@
 import { shownProjects, type ActivityInput, type Lesson } from '@fb/core';
 import { describe, expect, test } from 'vitest';
-import { checkBeforeDone, getImpact, getModuleContext, getTaskContext, makeJudge, reportFeedback, resolveProject, taskFiles, trackedProject, type ContextDeps } from './context.ts';
+import { checkBeforeDone, getImpact, getModuleContext, getTaskContext, hashRepoFile, makeJudge, reportFeedback, resolveProject, taskFiles, trackedProject, type ContextDeps } from './context.ts';
 
 const roots = [{ host: '/Users/j/Vibe', container: '/vibe' }];
 const lesson = (id: string, title: string, over: Partial<Lesson> = {}): Lesson => ({
@@ -66,10 +66,10 @@ test('checkBeforeDone reports gaps and records the check', async () => {
   expect(d.checks[0]).toMatchObject({ projectKey: 'demo', task: 'order search', gapLessonIds: ['l1'], checkedLessonIds: ['l1'] });
 });
 
-test('checkBeforeDone with no relevant lessons passes without calling the judge', async () => {
+test('checkBeforeDone with no relevant lessons and no close past miss passes without calling the judge', async () => {
   let judged = false;
   const d = deps({
-    k: { ...deps().k, searchLessons: async () => [] },
+    k: { ...deps().k, searchLessons: async () => [], relatedMisses: async () => [] },
     judge: async () => { judged = true; return []; },
   });
   const r = await checkBeforeDone({ project: 'demo', task: 't', summary: 's' }, d);
@@ -161,6 +161,30 @@ test('getTaskContext labels a fact read from an uploaded document by the documen
   });
   const r = await getTaskContext({ project: 'demo', task: 'change checkout' }, d);
   expect(r.markdown).toContain('- from your document `flow.png` (architecture): Checkout asks for the address before payment');
+});
+
+test('getTaskContext labels a manifest fact as read from the manifest, and keeps lines only where they were checked', async () => {
+  const base = { confidence: 1, why: 'w', source: 'x', createdAt: 't', scanJobId: null, fileHash: null, fileSummary: null, relevance: 0.8, relevanceBy: 'model' as const, docId: null };
+  const d = deps({
+    facts: { searchFacts: async () => [
+      { fact: { ...base, id: 'fm', kind: 'command' as const, statement: '`test` script runs: vitest run', path: 'package.json', lines: null, origin: 'manifest' as const, evidence: 'file' as const }, score: 0.8 },
+      { fact: { ...base, id: 'fl', kind: 'invariant' as const, statement: 'Every query is scoped by orgId', path: 'src/db.ts', lines: '10-20', origin: 'model' as const, evidence: 'line' as const }, score: 0.8 },
+    ] },
+  });
+  const r = await getTaskContext({ project: 'demo', task: 'run tests' }, d);
+  expect(r.markdown).toContain('- from the manifest `package.json` (command): `test` script runs: vitest run');
+  expect(r.markdown).toContain('`src/db.ts:10-20` (invariant): Every query is scoped by orgId');
+});
+
+test('getTaskContext labels a fact the owner wrote (a converted lesson) as the owner\'s', async () => {
+  const base = { confidence: 1, why: 'w', source: 'you', createdAt: 't', scanJobId: null, fileHash: null, fileSummary: null, relevance: 0.8, relevanceBy: 'you' as const, docId: null };
+  const d = deps({
+    facts: { searchFacts: async () => [
+      { fact: { ...base, id: 'fy', kind: 'convention' as const, statement: 'Orders are read from the source table', path: 'src/orders', lines: null, origin: 'you' as const }, score: 0.8 },
+    ] },
+  });
+  const r = await getTaskContext({ project: 'demo', task: 'change orders' }, d);
+  expect(r.markdown).toContain('- from the project owner, about `src/orders` (convention): Orders are read from the source table');
 });
 
 test('resolveProject rejects keys that could escape the root', () => {
@@ -522,5 +546,146 @@ describe('linked projects', () => {
     const t = linkedDeps([link('api', 'demo', 'confirmed')], { judge: async (_w, ls) => { judged.push(ls.map((h) => h.lesson.id)); return ls.map((h) => ({ lessonId: h.lesson.id, status: 'addressed' as const, why: 'ok' })); } });
     await checkBeforeDone({ project: 'demo', task: 'orders', summary: 'built it' }, t.d);
     expect(judged[0]).toEqual(['l1', 'la']);
+  });
+});
+
+describe('when no lesson is approved yet', () => {
+  const proposed = (n: number) => Array.from({ length: n }, (_, i) => lesson(`p${i}`, `Proposed ${i}`, { status: 'proposed' }));
+  const listing = (approved: number, prop: number) => async (f: { status?: string }) => (f.status === 'approved' ? proposed(approved).map((l) => ({ ...l, status: 'approved' as const })) : f.status === 'proposed' ? proposed(prop) : []);
+
+  test('get_task_context says plainly that proposed lessons are not applied until approved', async () => {
+    const d = deps({ k: { ...deps().k, searchLessons: async () => [], listLessons: listing(0, 136) } as ContextDeps['k'] });
+    const r = await getTaskContext({ project: 'demo', task: 'add members list' }, d);
+    expect(r.markdown).toMatch(/No lesson is approved for demo yet: 136 proposed lessons are not applied until the developer approves them/);
+    expect(r.markdown).not.toContain('No approved lessons match this task yet.');
+  });
+
+  test('with approved lessons that do not match, it says only that none match', async () => {
+    const d = deps({ k: { ...deps().k, searchLessons: async () => [], listLessons: listing(2, 5) } as ContextDeps['k'] });
+    const r = await getTaskContext({ project: 'demo', task: 'add members list' }, d);
+    expect(r.markdown).toContain('No approved lessons match this task yet.');
+    expect(r.markdown).not.toMatch(/proposed lessons are not applied/);
+  });
+
+  test('check_before_done judges the work against confirmed past misses instead, and the result never reads as a lesson pass', async () => {
+    const seen: string[][] = [];
+    const d = deps({
+      k: { ...deps().k, searchLessons: async () => [], listLessons: listing(0, 3) } as ContextDeps['k'],
+      judge: async (_w, ls) => { seen.push(ls.map((h) => h.lesson.id)); return [{ lessonId: 'm1', status: 'not_addressed', why: 'still filters in the browser' }]; },
+    });
+    const r = await checkBeforeDone({ project: 'demo', task: 'order search', summary: 'added a search box' }, d);
+    expect(seen).toEqual([['m1']]);
+    expect(r.gaps).toEqual([expect.objectContaining({ lessonId: 'm1', why: 'still filters in the browser', kind: 'miss' })]);
+    expect(r.markdown).toMatch(/possible gap.*past misses/i);
+    expect(r.markdown).toMatch(/3 proposed lessons are not applied/);
+    // the lesson catch-rate counts lessons only
+    expect(d.checks).toEqual([]);
+  });
+
+  test('check_before_done with misses that all look handled says what it checked, not that lessons passed', async () => {
+    const d = deps({
+      k: { ...deps().k, searchLessons: async () => [], listLessons: listing(0, 3) } as ContextDeps['k'],
+      judge: async () => [{ lessonId: 'm1', status: 'addressed', why: 'server-side now' }],
+    });
+    const r = await checkBeforeDone({ project: 'demo', task: 'order search', summary: 's' }, d);
+    expect(r.gaps).toEqual([]);
+    expect(r.markdown).toMatch(/Checked 1 confirmed past miss/);
+    expect(r.markdown).not.toMatch(/relevant lesson/);
+  });
+
+  test('check_before_done with nothing at all to check against says it is not a pass', async () => {
+    const d = deps({ k: { ...deps().k, searchLessons: async () => [], relatedMisses: async () => [], listLessons: listing(0, 7) } as ContextDeps['k'] });
+    const r = await checkBeforeDone({ project: 'demo', task: 't', summary: 's' }, d);
+    expect(r.markdown).toMatch(/not a pass/i);
+    expect(r.markdown).toMatch(/7 proposed lessons are not applied/);
+  });
+});
+
+describe('fact freshness for the named files', () => {
+  const fact = (path: string, createdAt: string, fileHash: string | null) => ({ id: `f-${path}`, kind: 'invariant' as const, statement: 's', path, lines: null, confidence: 1, why: 'w', source: 'x', createdAt, scanJobId: null, fileHash, fileSummary: null, relevance: null, relevanceBy: null, docId: null });
+
+  test('get_task_context says when facts for each named file were refreshed and whether the file changed since', async () => {
+    const d = deps({
+      facts: {
+        searchFacts: async () => [],
+        listFacts: async (q) => (q.path === 'src/a.ts' ? [fact('src/a.ts', '2026-10-20T08:00:00Z', 'h-old'), fact('src/a.ts', '2026-10-21T08:00:00Z', 'h-old')] : q.path === 'src/b.ts' ? [fact('src/b.ts', '2026-10-19T08:00:00Z', 'h-b')] : []),
+      },
+      fileHash: async (_repo, rel) => (rel === 'src/a.ts' ? 'h-new' : rel === 'src/b.ts' ? 'h-b' : null),
+    });
+    const r = await getTaskContext({ project: 'demo', task: 'change a', files: ['src/a.ts', 'src/b.ts', 'src/c.ts'] }, d);
+    const section = r.markdown.slice(r.markdown.indexOf('## How fresh the facts about these files are'));
+    expect(section).toMatch(/`src\/a\.ts`: 2 facts, last refreshed 2026-10-21; the file has changed since, so check them against the code/);
+    expect(section).toMatch(/`src\/b\.ts`: 1 fact, last refreshed 2026-10-19; the file is unchanged since/);
+    expect(section).toMatch(/`src\/c\.ts`: no facts from a scan yet/);
+  });
+
+  test('without listFacts there is no freshness section', async () => {
+    const r = await getTaskContext({ project: 'demo', task: 'change a', files: ['src/a.ts'] }, deps());
+    expect(r.markdown).not.toContain('How fresh');
+  });
+
+  test('hashRepoFile hashes a file inside the repo the way the scan does, and nothing outside it', async () => {
+    const { mkdtempSync, writeFileSync, mkdirSync, symlinkSync } = await import('node:fs');
+    const { tmpdir } = await import('node:os');
+    const { join } = await import('node:path');
+    const { createHash } = await import('node:crypto');
+    const dir = mkdtempSync(join(tmpdir(), 'fbctx-'));
+    mkdirSync(join(dir, 'src'));
+    writeFileSync(join(dir, 'src/a.ts'), 'export const a = 1;\n');
+    symlinkSync('/etc/hosts', join(dir, 'src/link.ts'));
+    expect(await hashRepoFile(dir, 'src/a.ts')).toBe(createHash('sha1').update('export const a = 1;\n').digest('hex'));
+    expect(await hashRepoFile(dir, '../etc/hosts')).toBeNull();
+    expect(await hashRepoFile(dir, 'src/link.ts')).toBeNull();
+    expect(await hashRepoFile(dir, 'src/missing.ts')).toBeNull();
+    // A linked folder is not followed out of the repo, and a secret file is never read.
+    const outside = mkdtempSync(join(tmpdir(), 'fbout-'));
+    writeFileSync(join(outside, 'x.ts'), 'secret();\n');
+    symlinkSync(outside, join(dir, 'linked'));
+    expect(await hashRepoFile(dir, 'linked/x.ts')).toBeNull();
+    writeFileSync(join(dir, '.env'), 'A=b\n');
+    expect(await hashRepoFile(dir, '.env')).toBeNull();
+  });
+});
+
+describe('what reaches the agent: misses', () => {
+  const rm = (missId: string, missed: string, score: number, feedbackText = 'fix it') => ({ missId, missed, cause: 'requirement_unstated' as const, feedbackText, sessionId: 's1', ts: '2026-10-01T10:00:00Z', score });
+
+  test('a miss whose feedback text is empty (the cloud blanks it) has no empty "developer said" fragment', async () => {
+    for (const text of ['', '   ']) {
+      const d = deps({ k: { ...deps().k, relatedMisses: async () => [rm('m1', 'client-side filtering', 0.8, text)] } });
+      const r = await getTaskContext({ project: 'demo', task: 't' }, d);
+      expect(r.markdown).toContain('client-side filtering');
+      expect(r.markdown).not.toContain('developer said');
+      expect(r.markdown).toContain('session s1');
+    }
+  });
+
+  test('an empty doc excerpt adds no empty quote line', async () => {
+    const d = deps({ docs: { searchDocs: async () => [{ docId: 'x', source: 'github', ref: 'github:a/b#1', title: 'PR', url: null, text: '  ', score: 0.9 }] } });
+    const r = await getTaskContext({ project: 'demo', task: 't' }, d);
+    expect(r.markdown).toContain('github:a/b#1');
+    expect(r.markdown.split('\n').some((l) => /^\s*>\s*$/.test(l))).toBe(false);
+  });
+
+  test('a stored non-miss ("the agent did not miss ...") is never served, and weak matches stay out', async () => {
+    const d = deps({ k: { ...deps().k, relatedMisses: async () => [
+      rm('m0', 'The agent did not miss the feedback, as it was directed at a different pull request', 0.95),
+      rm('m1', 'client-side filtering', 0.8),
+      rm('m2', 'a Brotli CVE bump', 0.25),
+    ] } });
+    const r = await getTaskContext({ project: 'demo', task: 't' }, d);
+    expect(r.misses.map((m) => m.missId)).toEqual(['m1']);
+    expect(r.markdown).not.toContain('did not miss');
+  });
+
+  test('misses about the named files\' service rank above another service\'s', async () => {
+    let asked = 0;
+    const d = deps({ k: { ...deps().k, relatedMisses: async (q) => { asked = q.k; return [
+      rm('mg', 'missed the exists=true filter in src/graph/internal/page.go', 0.66),
+      rm('mw', 'missed the admin gate in src/webapp/core/settings/usage.ts', 0.6),
+    ]; } } });
+    const r = await getTaskContext({ project: 'demo', task: 'list members', files: ['src/webapp/core/settings/users/router.ts'] }, d);
+    expect(asked).toBeGreaterThan(4);
+    expect(r.misses.map((m) => m.missId)).toEqual(['mw', 'mg']);
   });
 });

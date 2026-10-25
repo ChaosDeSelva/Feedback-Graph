@@ -1,5 +1,5 @@
 import { expect, test } from 'vitest';
-import { codeLinkLabel, codeNodeCaption, codeNodeLabel, escapeHtml, evidenceLinkLabel, evidenceNodeLabel } from './graphLabels.ts';
+import { codeLinkLabel, codeNodeCaption, codeNodeLabel, escapeHtml, evidenceLinkLabel, evidenceNodeLabel, LabelPlacer, shortestSuffixes } from './graphLabels.ts';
 
 // force-graph renders nodeLabel/linkLabel strings as HTML: untrusted text (feedback, lesson titles, paths) is escaped.
 const evil = '<img src=x onerror=alert(1)>';
@@ -31,4 +31,31 @@ test('a file node is captioned with its base name: always when it had misses, el
   expect(codeNodeCaption(f, 1.5)).toBe('page.tsx');
   expect(codeNodeCaption({ ...f, misses: 1 }, 0.5)).toBe('page.tsx');
   expect(codeNodeCaption({ kind: 'miss', label: 'x', misses: 0 }, 3)).toBeNull();
+});
+
+test('shortestSuffixes: each path gets the fewest trailing segments no other path shares', () => {
+  const s = shortestSuffixes(['src/tools/read/handler.ts', 'src/tools/write/handler.ts', 'src/mcp/types.ts', 'src/db/types.ts', 'src/app.ts', 'lib/a/index.ts', 'lib/b/a/index.ts']);
+  expect(s.get('src/tools/read/handler.ts')).toBe('read/handler.ts');
+  expect(s.get('src/tools/write/handler.ts')).toBe('write/handler.ts');
+  expect(s.get('src/mcp/types.ts')).toBe('mcp/types.ts');
+  expect(s.get('src/app.ts')).toBe('app.ts');
+  // One path is a suffix of the other: the shorter one needs all of itself.
+  expect(s.get('lib/a/index.ts')).toBe('lib/a/index.ts');
+  expect(s.get('lib/b/a/index.ts')).toBe('b/a/index.ts');
+});
+
+test('a top hotspot is captioned at any zoom, with its short label when given', () => {
+  const f = { kind: 'file', label: 'src/tools/read/handler.ts', score: 9, misses: 0 };
+  expect(codeNodeCaption(f, 0.3)).toBeNull();
+  expect(codeNodeCaption(f, 0.3, { top: true, short: 'read/handler.ts' })).toBe('read/handler.ts');
+  expect(codeNodeCaption(f, 2, { short: 'read/handler.ts' })).toBe('read/handler.ts');
+});
+
+test('LabelPlacer keeps the first label in a spot and refuses one that overlaps it', () => {
+  const p = new LabelPlacer();
+  expect(p.place(0, 0, 40, 10)).toBe(true);
+  expect(p.place(20, 5, 40, 10)).toBe(false);
+  expect(p.place(0, 12, 40, 10)).toBe(true);
+  p.reset();
+  expect(p.place(20, 5, 40, 10)).toBe(true);
 });

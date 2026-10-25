@@ -45,6 +45,16 @@ test('approving an edited lesson logs which fields you changed, before and after
   });
 });
 
+test('saving edits without a status (Save on an approved lesson) keeps its status and logs an edit', async () => {
+  const { app, recorded } = setup();
+  const res = await app.request('/api/lessons/lesson:1', json('PATCH', { rule: 'always use db.scoped(orgId)' }));
+  expect(res.status).toBe(204);
+  expect(recorded[0]).toMatchObject({
+    kind: 'lesson_decided', actor: 'you', subject: 'edited lesson "Scope queries"', why: 'you edited it',
+    details: { status: 'proposed', changed: { rule: { from: 'use scoped', to: 'always use db.scoped(orgId)' } } },
+  });
+});
+
 test('GET /api/activity passes filters through', async () => {
   const { app, listed } = setup();
   expect((await app.request('/api/activity?project=shop&kind=facts_extracted&target=shop%3Asrc%2Fdb.ts&limit=20')).status).toBe(200);

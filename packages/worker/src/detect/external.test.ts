@@ -1,5 +1,5 @@
 import { FileState } from '../state.ts';
-import type { ClassifiableTurn, ExternalRef, HumanTurn } from '@fb/core';
+import type { ActivityInput, ClassifiableTurn, ExternalRef, HumanTurn } from '@fb/core';
 import { expect, test } from 'vitest';
 import { runCycle } from '../cycle.ts';
 import { describeTurn } from './classify.ts';
@@ -47,7 +47,9 @@ test('a polite review comment the keyword prefilter misses still goes to the mod
 function cycleWith(turns: ClassifiableTurn[]) {
   const calls: string[] = [];
   const saved: { uuid: string; label: string; signals: string[]; summary: string; candidate: boolean }[] = [];
+  const activity: ActivityInput[] = [];
   const run = () => runCycle({
+    activity: { record: async (a) => void activity.push(a) },
     listFiles: async () => [],
     readFile: async () => '',
     state: new FileState(':memory:'),
@@ -62,7 +64,7 @@ function cycleWith(turns: ClassifiableTurn[]) {
     classify: async (t) => { calls.push(t.uuid); return { label: 'pushback', confidence: 0.9, summary: 'x', signals: [] }; },
     classifyBatch: 5,
   });
-  return { run, calls, saved };
+  return { run, calls, saved, activity };
 }
 
 test('comments a skip rule matches are labelled neutral without the model, with the rule recorded', async () => {
@@ -90,6 +92,26 @@ test('comments a skip rule matches are labelled neutral without the model, with 
   ]);
   expect(c.saved[0].summary).toMatch(/skipped before the model/);
   expect(r.candidates).toBe(2);
+  // One entry per project and cycle says how many each rule kept from the model, and which comments.
+  const skipped = c.activity.filter((a) => a.kind === 'comments_skipped');
+  expect(skipped).toEqual([expect.objectContaining({
+    actor: 'skip-rules', projectKey: 'shop', subject: '4 comments skipped before the classifier',
+    details: { rules: { 'pr-author-reply': 1, 'bot-author': 1, 'review-trigger': 1, 'status-note': 1 }, samples: expect.any(Array) },
+    targets: ['1', '2', '3', '4'].map((n) => `github:acme/shop#7/review_comment/${n}`),
+  })]);
+  expect((skipped[0].details as { samples: { rule: string; text: string }[] }).samples[0]).toEqual({ rule: 'pr-author-reply', turn: 'github:acme/shop#7/review_comment/1', text: 'Fixed in 3f2a9c1' });
+});
+
+test('no comment skipped: no entry', async () => {
+  const c = cycleWith([{ ...comment, projectKey: 'shop', text: 'this misses the discount' }]);
+  await c.run();
+  expect(c.activity.filter((a) => a.kind === 'comments_skipped')).toEqual([]);
+});
+
+test("an agent reviewing its own pull request under the author's account is flagged with a self-review signal", async () => {
+  const c = cycleWith([{ ...comment, projectKey: 'shop', text: '[claude] the totals ignore discounts', external: { ...external, author: 'dev', threadAuthor: 'dev', authorKind: 'agent' } }]);
+  await c.run();
+  expect(c.saved[0]).toMatchObject({ label: 'pushback', signals: ['self-review'], candidate: true });
 });
 
 test('the classifier is told who wrote a comment: author kind, whether it is the PR author, and the review verdict', () => {

@@ -48,6 +48,56 @@ test('tsconfig paths and baseUrl, with comments, trailing commas and extends; th
   expect(tos(r('packages/app/src/main.ts', 'typescript', { spec: 'src/b', names: [] }))).toEqual(['pkg:src']);
 });
 
+test('path aliases in a monorepo: extends from a workspace package, solution-style tsconfigs, ${configDir}, package imports', () => {
+  const r = resolver({
+    'package.json': JSON.stringify({ name: 'acme', workspaces: ['packages/*', 'apps/*'], devDependencies: { typescript: '5' } }),
+    'packages/tsconfig/package.json': JSON.stringify({ name: '@acme/tsconfig' }),
+    'packages/tsconfig/base.json': '{ "compilerOptions": { "paths": { "@shared/*": ["${configDir}/src/shared/*"] } } }',
+    // the app extends a config from a workspace package, and adds its own aliases relative to its own folder
+    'apps/web/tsconfig.json': '{ "extends": "@acme/tsconfig/base.json", "compilerOptions": { "baseUrl": ".", "paths": { "@web-core/*": ["../../packages/core/src/*"], "@shared/*": ["./src/shared/*"] } } }',
+    'apps/web/src/main.ts': '', 'apps/web/src/shared/util.ts': '',
+    'packages/core/src/users/router.ts': '',
+    // solution style: tsconfig.json only references; the aliases live in tsconfig.app.json beside it
+    'apps/admin/tsconfig.json': '{ "files": [], "references": [{ "path": "./tsconfig.app.json" }] }',
+    'apps/admin/tsconfig.app.json': '{ "compilerOptions": { "paths": { "@admin/*": ["./src/*"] } } }',
+    'apps/admin/src/page.tsx': '', 'apps/admin/src/lib/api.ts': '',
+    // ${configDir} is the folder of the config that uses it, even when the paths come from a config it extends
+    'apps/docs/tsconfig.json': '{ "extends": "../../packages/tsconfig/base.json" }',
+    'apps/docs/src/index.ts': '', 'apps/docs/src/shared/theme.ts': '',
+    // package.json "imports": #-specifiers of the nearest package
+    'apps/api/package.json': JSON.stringify({ name: 'api', imports: { '#db/*': './src/db/*.ts', '#config': './src/config.ts' } }),
+    'apps/api/src/server.ts': '', 'apps/api/src/db/pool.ts': '', 'apps/api/src/config.ts': '',
+  });
+  const at = (from: string, spec: string) => tos(r(from, 'typescript', { spec, names: [] }));
+  expect(at('apps/web/src/main.ts', '@web-core/users/router')).toEqual(['packages/core/src/users/router.ts']);
+  expect(at('apps/web/src/main.ts', '@shared/util')).toEqual(['apps/web/src/shared/util.ts']);
+  expect(at('apps/admin/src/page.tsx', '@admin/lib/api')).toEqual(['apps/admin/src/lib/api.ts']);
+  expect(at('apps/docs/src/index.ts', '@shared/theme')).toEqual(['apps/docs/src/shared/theme.ts']);
+  expect(at('apps/api/src/server.ts', '#db/pool')).toEqual(['apps/api/src/db/pool.ts']);
+  expect(at('apps/api/src/server.ts', '#config')).toEqual(['apps/api/src/config.ts']);
+});
+
+test('an import that looks local but resolves to nothing is marked unresolved; real packages and builtins are not', () => {
+  const r = resolver({
+    'package.json': JSON.stringify({ dependencies: { react: '18', '@tanstack/react-router': '1' }, devDependencies: { vitest: '3' } }),
+    'tsconfig.json': '{ "compilerOptions": { "paths": { "@app/*": ["src/*"] } } }',
+    'src/a.ts': '',
+  });
+  const at = (spec: string) => r('src/a.ts', 'typescript', { spec, names: [] });
+  expect(at('@app/missing')).toEqual([{ to: 'pkg:@app/missing', names: [], unresolved: true }]);
+  expect(at('@webapp-core/lib')).toEqual([{ to: 'pkg:@webapp-core/lib', names: [], unresolved: true }]);
+  expect(at('#internal/x')).toEqual([{ to: 'pkg:#internal', names: [], unresolved: true }]);
+  expect(at('react')).toEqual([{ to: 'pkg:react', names: [] }]);
+  expect(at('@tanstack/react-router')).toEqual([{ to: 'pkg:@tanstack/react-router', names: [] }]);
+  expect(at('vitest/config')).toEqual([{ to: 'pkg:vitest', names: [] }]);
+  expect(at('node:fs')).toEqual([{ to: 'pkg:node:fs', names: [] }]);
+  expect(at('path')).toEqual([{ to: 'pkg:path', names: [] }]);
+  expect(at('virtual:pwa')).toEqual([{ to: 'pkg:virtual:pwa', names: [] }]);
+  // Without any declared dependency there is nothing to tell a package from an alias: only a paths match counts.
+  const bare = resolver({ 'src/a.ts': '' });
+  expect(bare('src/a.ts', 'typescript', { spec: 'lodash', names: [] })).toEqual([{ to: 'pkg:lodash', names: [] }]);
+});
+
 test('workspace package names resolve to the package entry or source', () => {
   const r = resolver({
     'packages/core/package.json': JSON.stringify({ name: '@fb/core', main: 'src/index.ts', exports: { '.': './src/index.ts', './types': './src/types.ts' } }),

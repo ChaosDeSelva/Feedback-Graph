@@ -84,6 +84,30 @@ test('detectLinks: a remote slug mention plus name mentions make a related sugge
   expect(links[0].evidence.map((e) => e.signal).sort()).toEqual(['name', 'remote']);
 });
 
+test('detectLinks never suggests a project and its own clone: the same remote, or a local/<key> remote naming the other', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'fblinks-'));
+  const many = Object.fromEntries(['a.md', 'b.md', 'c.md'].map((f) => [f, 'the orbital-server and github.com/me/orbital-server\n']));
+  const projects: LinkProject[] = [
+    { key: 'orbital-server', repoPath: repo(root, 'orbital-server', many), remote: 'github.com/me/orbital-server' },
+    // Cloned from the same GitHub repo, and cloned from the folder on disk.
+    { key: 'tmp-orbital-fresh', repoPath: repo(root, 'tmp-orbital-fresh', many), remote: 'github.com/me/orbital-server' },
+    { key: 'tmp-orbital-bug1', repoPath: repo(root, 'tmp-orbital-bug1', many), remote: 'local/orbital-server' },
+  ];
+  expect(await detectLinks(projects)).toEqual([]);
+});
+
+test('detectLinks ranks depends_on above related, whatever the scores', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'fblinks-'));
+  const many = Object.fromEntries(['a.md', 'b.md', 'c.md'].map((f) => [f, 'talks to orbital-server via github.com/me/orbital-server\n']));
+  const projects: LinkProject[] = [
+    { key: 'orbital-server', repoPath: repo(root, 'orbital-server', { 'package.json': pkg({ name: '@me/orbital' }) }), remote: 'github.com/me/orbital-server' },
+    { key: 'launcher', repoPath: repo(root, 'launcher', many), remote: null },
+    { key: 'zz-client', repoPath: repo(root, 'zz-client', { 'package.json': pkg({ name: 'zz', dependencies: { '@me/orbital': '1' } }) }), remote: null },
+  ];
+  const links = await detectLinks(projects);
+  expect(links.map((l) => l.relation)).toEqual(['depends_on', 'related']);
+});
+
 test('detectLinks skips short or generic names, and never links a project to itself', async () => {
   const root = mkdtempSync(join(tmpdir(), 'fblinks-'));
   const files = Object.fromEntries(['a.md', 'b.md', 'c.md', 'd.md'].map((f) => [f, 'the server and the shop\n']));

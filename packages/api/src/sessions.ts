@@ -16,6 +16,8 @@ const ListQuery = z.object({
   cursor: z.string().min(1).max(2000).optional(),
   limit: z.coerce.number().int().min(1).max(200).default(50),
 });
+/** For the OpenAPI document (openapi.ts). */
+export const sessionSchemas = { ListQuery };
 
 /**
  * GET /api/sessions (newest first, paged by `cursor`), GET /api/sessions/:id (the summary, its history, the Inbox items

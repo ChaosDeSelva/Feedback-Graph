@@ -13,7 +13,10 @@ beforeEach(() => {
   urls = [];
   vi.stubGlobal('fetch', vi.fn(async (url: string) => {
     urls.push(url);
-    if (url === '/api/projects') return Response.json([{ key: 'shop', repoPath: '/x', sessions: 3, feedback: 2, lessons: 1, facts: 0, lastScan: null }]);
+    if (url === '/api/projects') return Response.json([
+      { key: 'shop', repoPath: '/x', sessions: 3, feedback: 2, lessons: 1, facts: 0, lastScan: null },
+      { key: 'quiet', repoPath: '/y', sessions: 1, feedback: 0, lessons: 0, facts: 4, lastScan: null },
+    ]);
     if (url.startsWith('/api/patterns')) return Response.json(report);
     if (url.startsWith('/api/codemap/hotspots')) return Response.json([
       { projectKey: 'shop', path: 'src/db/pool.ts', churn: 7, misses: 2, dependents: 3, score: 13 },
@@ -41,6 +44,15 @@ test('project filter rescopes the report', async () => {
   fireEvent.change(screen.getByLabelText('project'), { target: { value: 'shop' } });
   await waitFor(() => expect(urls).toContain('/api/patterns?project=shop'));
   expect(urls).toContain('/api/patterns');
+});
+
+test('the project filter lists every project, as other pages do; one with no feedback says so', async () => {
+  render(<Patterns />);
+  await screen.findByText('no tenant scoping');
+  const select = screen.getByLabelText('project') as HTMLSelectElement;
+  await waitFor(() => expect([...select.options].map((o) => o.value)).toEqual(['', 'shop', 'quiet']));
+  fireEvent.change(select, { target: { value: 'quiet' } });
+  expect(await screen.findByText('No feedback in quiet yet')).toBeTruthy();
 });
 
 test('the weekly chart fills quiet weeks with zeros and shows at least eight, across a year end', () => {

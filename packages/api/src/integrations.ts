@@ -1,9 +1,9 @@
 import type { Hono } from 'hono';
 import { z } from 'zod';
 import {
-  DEFAULT_LINK, ENV_VAR, githubRepoOfRemote, githubViewer, integrationErrorKind, linearViewer, listLinearTeams, redactSecrets, tokenFingerprint,
+  DEFAULT_LINK, ENV_VAR, FEEDBACK_SKIP_RULES, githubRepoOfRemote, githubViewer, integrationErrorKind, linearViewer, listLinearTeams, redactSecrets, tokenFingerprint,
   type ActivityStore, type CloudConfig, type Connection, type ConnectionName, type IntegrationCheck, type IntegrationKind, type Integrations,
-  type IntegrationSyncState, type LinearTeam, type OllamaHealth, type WorkerStatus,
+  type IntegrationSyncState, type LinearTeam, type ManualSync, type OllamaHealth, type WorkerStatus,
 } from '@fb/core';
 
 /**
@@ -17,7 +17,8 @@ export type IntegrationsDeps = {
   /** GITHUB_REPOS overrides. */
   githubOverride: Map<string, string>;
   syncMinutes: number;
-  activity?: Pick<ActivityStore, 'record'>;
+  /** list: counts the comments each skip rule kept from the classifier (comments_skipped entries); unset: no counts. */
+  activity?: Pick<ActivityStore, 'record'> & Partial<Pick<ActivityStore, 'list'>>;
   /** Test seams for the one call that checks a token. */
   viewer?: { github(token: string): Promise<string>; linear(token: string): Promise<string> };
   teams?(apiKey: string): Promise<LinearTeam[]>;
@@ -51,7 +52,29 @@ export type IntegrationsView = {
   github: ServiceView;
   linear: ServiceView;
   projects: ProjectIntegrations[];
+  /** The rules that keep a comment from the classifier (core feedbackRules.ts), each with how many it kept (null: not counted). */
+  rules: SkipRuleView[];
+  /** The oldest comments_skipped entry counted (the counts cover the most recent SKIP_ENTRIES); null when there is none. */
+  skippedSince: string | null;
 };
+
+export type SkipRuleView = { name: string; description: string; skipped: number | null };
+
+/** How many comments_skipped entries (one per project and worker cycle that skipped something) the counts add up. */
+const SKIP_ENTRIES = 1000;
+
+async function skipRules(d: IntegrationsDeps): Promise<{ rules: SkipRuleView[]; skippedSince: string | null }> {
+  const entries = d.activity?.list ? await d.activity.list({ kind: 'comments_skipped', limit: SKIP_ENTRIES }).catch(() => null) : null;
+  const counts: Record<string, number> = {};
+  for (const e of entries ?? []) {
+    const rules = (e.details as { rules?: Record<string, unknown> } | null)?.rules ?? {};
+    for (const [name, n] of Object.entries(rules)) if (typeof n === 'number') counts[name] = (counts[name] ?? 0) + n;
+  }
+  return {
+    rules: FEEDBACK_SKIP_RULES.map((r) => ({ name: r.name, description: r.description, skipped: entries ? counts[r.name] ?? 0 : null })),
+    skippedSince: entries?.length ? entries.map((e) => e.ts).sort()[0] : null,
+  };
+}
 
 const NAME: Record<IntegrationKind, string> = { github: 'GitHub', linear: 'Linear' };
 export const integrationHref = (kind: IntegrationKind) => `#settings/integrations-${kind}`;
@@ -61,6 +84,8 @@ const Kind = z.enum(['github', 'linear']);
 const LinkPatch = z
   .object({ github: z.boolean().optional(), linearTeamId: z.string().min(1).max(100).nullable().optional(), linearTeamName: z.string().max(200).nullable().optional() })
   .strict();
+/** For the OpenAPI document (openapi.ts). */
+export const integrationSchemas = { Token, LinkPatch };
 
 const when = (iso: string | null) => (iso ? new Date(iso).toISOString().replace('T', ' ').slice(0, 16) + ' UTC' : null);
 
@@ -158,10 +183,11 @@ async function service(d: IntegrationsDeps, kind: IntegrationKind, o: { checkUnc
 }
 
 export async function integrationsView(d: IntegrationsDeps): Promise<IntegrationsView> {
-  const [github, linear, projects, links, ghSync, linSync] = await Promise.all([
-    service(d, 'github'), service(d, 'linear'), d.projects(), d.integrations.links(), d.integrations.sync('github'), d.integrations.sync('linear'),
+  const [github, linear, projects, links, ghSync, linSync, skips] = await Promise.all([
+    service(d, 'github'), service(d, 'linear'), d.projects(), d.integrations.links(), d.integrations.sync('github'), d.integrations.sync('linear'), skipRules(d),
   ]);
   return {
+    ...skips,
     canSave: d.integrations.canSave,
     syncMinutes: d.syncMinutes,
     github,
@@ -292,13 +318,17 @@ function ollamaConnection(o: OllamaHealth | null): Connection {
   return o.ok ? { state: 'connected', source: 'env', detail: `Ollama answers at ${o.url}.`, href } : { state: 'error', source: 'env', detail: `Ollama: ${o.reason}`, href };
 }
 
-function cloudConnection(cloud: CloudConfig | null, w: WorkerStatus | null): Connection {
+/** The newer of the worker's last scheduled sync and the api's last Sync now decides what the line says. */
+function cloudConnection(cloud: CloudConfig | null, w: WorkerStatus | null, manual: ManualSync | null): Connection {
   const href = '#settings/connections';
   if (!cloud) return { state: 'not_connected', source: null, detail: 'Cloud sync is off: nothing is sent anywhere.', href };
   const host = new URL(cloud.url).host;
   const s = w?.cloudSync;
-  if (s?.lastOk === false) return { state: 'error', source: 'env', detail: `Sync to ${host} failed: ${s.lastError ?? 'unknown error'}`, href };
-  return { state: 'connected', source: 'env', detail: s?.lastAt ? `Syncing to ${host}; last sync ${when(s.lastAt)}.` : `Set up for ${host}; not synced yet.`, href };
+  const last = manual && (!s?.lastAt || manual.at > s.lastAt)
+    ? { at: manual.at, ok: manual.ok, error: manual.error, how: ' (Sync now)' }
+    : s?.lastAt ? { at: s.lastAt, ok: s.lastOk !== false, error: s.lastError, how: '' } : null;
+  if (last && !last.ok) return { state: 'error', source: 'env', detail: `Sync to ${host} failed${last.how}: ${last.error ?? 'unknown error'}`, href };
+  return { state: 'connected', source: 'env', detail: last ? `Syncing to ${host}; last sync ${when(last.at)}${last.how}.` : `Set up for ${host}; not synced yet.`, href };
 }
 
 /** Every connection for /api/status. Each one fails on its own: a broken one never hides the others. */
@@ -309,6 +339,8 @@ export async function connectionsStatus(o: {
   worker: WorkerStatus | null;
   ollama: OllamaHealth | null;
   cloud: CloudConfig | null;
+  /** The api's last Sync now, when it ran one. */
+  manualSync?: ManualSync | null;
 }): Promise<Record<ConnectionName, Connection>> {
   const one = async (kind: IntegrationKind): Promise<Connection> => {
     if (!o.integrations) return { state: 'not_connected', source: null, detail: 'Not available in this setup.', href: integrationHref(kind) };
@@ -326,6 +358,6 @@ export async function connectionsStatus(o: {
     claude: agentConnection('claude', o.worker),
     codex: agentConnection('codex', o.worker),
     ollama: ollamaConnection(o.ollama),
-    cloud: cloudConnection(o.cloud, o.worker),
+    cloud: cloudConnection(o.cloud, o.worker, o.manualSync ?? null),
   };
 }

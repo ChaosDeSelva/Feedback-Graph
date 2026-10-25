@@ -1,8 +1,41 @@
-import { cleanup, render, screen, within } from '@testing-library/react';
+import { cleanup, fireEvent, render, screen, within } from '@testing-library/react';
 import { afterEach, expect, test } from 'vitest';
 import { Docs } from './Docs.tsx';
 
 afterEach(cleanup);
+
+test('each page in the Docs has a screenshot from /guide/, framed, loaded lazily, that hides itself when it fails to load', () => {
+  render(<Docs />);
+  const pages = within(screen.getByRole('region', { name: 'Each page' }));
+  const shots = pages.getAllByRole('img');
+  expect(shots.map((i) => i.getAttribute('src'))).toEqual(
+    ['dashboard', 'ask', 'inbox', 'lessons', 'graph', 'graph-code', 'patterns', 'sessions', 'projects', 'projects-facts', 'activity', 'settings'].map((n) => `/guide/${n}.png`),
+  );
+  for (const img of shots) {
+    expect(img.getAttribute('loading')).toBe('lazy');
+    expect(img.getAttribute('alt')).toBeTruthy();
+  }
+  const inbox = pages.getByAltText('The Inbox page');
+  const frame = inbox.closest('figure')!;
+  expect(frame.className).toMatch(/border-line/);
+  expect(frame.style.display).toBe('');
+  fireEvent.error(inbox);
+  expect(frame.style.display).toBe('none');
+  // The other screenshots are not affected.
+  expect(pages.getByAltText('The Lessons page').closest('figure')!.style.display).toBe('');
+});
+
+test('the Each page section says how to read the badges and numbers, one collapsible entry per page', () => {
+  render(<Docs />);
+  const section = screen.getByRole('region', { name: 'Each page' });
+  const pages = within(section);
+  expect(section.querySelectorAll('details')).toHaveLength(10);
+  expect(pages.getByText(/confidence %/)).toBeTruthy();
+  expect(pages.getByText(/approved by agent/)).toBeTruthy();
+  expect(pages.getByText(/operator:<name>/)).toBeTruthy();
+  expect(pages.getByText(/the catch rate/).textContent).toMatch(/pre-done checks that found a gap ÷ all pre-done checks/);
+  expect(pages.getByText('docs/guide.md')).toBeTruthy();
+});
 
 test('the Docs page explains the code map, its two agent tools and how hotspots are scored', () => {
   render(<Docs />);

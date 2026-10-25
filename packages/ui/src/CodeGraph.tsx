@@ -1,18 +1,23 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import ForceGraph2D, { type ForceGraphMethods } from 'react-force-graph-2d';
-import { api, type CodeMapMeta, type MapGraph } from './api.ts';
+import { api, type CodeMapMeta, type MapCapped, type MapGraph } from './api.ts';
 import { mapCapNote } from './CodeMap.tsx';
 import { IncludeTests, ModulePanel } from './CodeMap.tsx';
 import { inboxHref, lessonHref } from './links.ts';
 import { Alert, CauseBadge, EmptyState, plural, SectionLabel, Skeleton } from './ui/display.tsx';
 import { MAX_FIT_ZOOM, useSize } from './ui/graphCanvas.ts';
-import { codeLinkLabel, codeNodeCaption, codeNodeLabel } from './ui/graphLabels.ts';
+import { codeLinkLabel, codeNodeCaption, codeNodeLabel, LabelPlacer, shortestSuffixes } from './ui/graphLabels.ts';
+import { Input } from './ui/controls.tsx';
 import { GraphIcon } from './ui/icons.tsx';
 import { readToken, useTheme } from './ui/theme.ts';
 
 type Kind = 'file' | 'test' | 'miss' | 'lesson';
-type CodeNode = { id: string; kind: Kind; label: string; path?: string; score: number; misses: number };
-type CodeLink = { source: string; target: string; type: 'IMPORTS' | 'TESTS' | 'EDITED' | 'APPLIES_TO' };
+/** short: the shortest path suffix no other file in the drawing shares; top: one of the top hotspots, not a neighbour. */
+type CodeNode = { id: string; kind: Kind; label: string; path?: string; score: number; misses: number; short?: string; top?: boolean };
+/** NEAR: not an edge of the code, a faint tie that keeps a file with no drawn neighbour beside the drawing. */
+type CodeLink = { source: string; target: string; type: 'IMPORTS' | 'TESTS' | 'EDITED' | 'APPLIES_TO' | 'NEAR' };
+/** How many of the top hotspots are captioned at every zoom. */
+const ALWAYS_LABELLED = 12;
 type Selected = { kind: 'file'; path: string } | { kind: 'miss'; id: string } | { kind: 'lesson'; id: string };
 
 const LEGEND: { kind: Kind | 'hot'; label: string }[] = [
@@ -37,7 +42,8 @@ function usePalette() {
 const val = (n: CodeNode) => (n.kind === 'file' || n.kind === 'test' ? 1 + Math.min(n.score, 24) : 1.5);
 
 export function toNodes(g: MapGraph): { nodes: CodeNode[]; links: CodeLink[] } {
-  const nodes: CodeNode[] = g.files.map((f) => ({ id: `file:${f.path}`, kind: f.isTest ? 'test' : 'file', label: f.path, path: f.path, score: f.score, misses: f.misses }));
+  const short = shortestSuffixes(g.files.map((f) => f.path));
+  const nodes: CodeNode[] = g.files.map((f) => ({ id: `file:${f.path}`, kind: f.isTest ? 'test' : 'file', label: f.path, path: f.path, score: f.score, misses: f.misses, short: short.get(f.path), top: f.top }));
   const links: CodeLink[] = [
     ...g.imports.map((e): CodeLink => ({ source: `file:${e.from}`, target: `file:${e.to}`, type: 'IMPORTS' })),
     ...g.tests.map((e): CodeLink => ({ source: `file:${e.test}`, target: `file:${e.target}`, type: 'TESTS' })),
@@ -50,12 +56,20 @@ export function toNodes(g: MapGraph): { nodes: CodeNode[]; links: CodeLink[] } {
     nodes.push({ id: `lesson:${l.id}`, kind: 'lesson', label: l.title, score: 0, misses: 0 });
     for (const p of l.paths) links.push({ source: `lesson:${l.id}`, target: `file:${p}`, type: 'APPLIES_TO' });
   }
+  // A file whose neighbours are all past the cap would float off alone: tie it faintly to the best-scoring file that
+  // has edges, so it sits beside the drawing (the tie is drawn faint and says why on hover).
+  const linked = new Set(links.flatMap((l) => [l.source, l.target]));
+  const files = nodes.filter((n) => n.path);
+  const hub = files.filter((n) => linked.has(n.id)).sort((a, b) => b.score - a.score)[0];
+  if (hub) for (const n of files) if (!linked.has(n.id)) links.push({ source: n.id, target: hub.id, type: 'NEAR' });
   return { nodes, links };
 }
 
+const linkLabel = (l: CodeLink) => (l.type === 'NEAR' ? 'no drawn neighbour: the files it imports or that import it are past the cap' : codeLinkLabel(l));
+
 /** The Graph page's Code mode: the code map of one project, drawn; a file opens its module panel. */
 export function CodeGraph({ projectKey }: { projectKey: string }) {
-  const [graph, setGraph] = useState<(MapGraph & { meta?: CodeMapMeta | null }) | null>(null);
+  const [graph, setGraph] = useState<(MapGraph & { meta?: CodeMapMeta | null; capped?: MapCapped }) | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [tests, setTests] = useState(false);
   const [selected, setSelected] = useState<Selected | null>(null);
@@ -63,6 +77,20 @@ export function CodeGraph({ projectKey }: { projectKey: string }) {
   const palette = usePalette();
   const fg = useRef<ForceGraphMethods<any, any>>(undefined);
   const fitted = useRef(false);
+  // Every mapped file the find box suggests (the top 500 by score, tests included); any other path can still be typed.
+  const [known, setKnown] = useState<string[]>([]);
+  const [find, setFind] = useState('');
+  // Captions collected while nodes are drawn, placed after the frame: top hotspots first, so they win any overlap.
+  const captions = useRef<{ text: string; x: number; y: number; rank: number }[]>([]);
+  const placer = useRef(new LabelPlacer());
+
+  useEffect(() => {
+    setKnown([]);
+    setFind('');
+    let stale = false;
+    api.codeMap(projectKey, 500, true).then((r) => { if (!stale) setKnown((r?.hotspots ?? []).map((h) => h.path).sort()); }, () => {});
+    return () => { stale = true; };
+  }, [projectKey]);
 
   useEffect(() => {
     setGraph(null);
@@ -85,7 +113,14 @@ export function CodeGraph({ projectKey }: { projectKey: string }) {
   const cap = graph?.cap;
   const tops = graph?.files.filter((f) => f.top).length ?? 0;
   const capped = cap && (cap.eligible > tops || cap.neighborsFound > cap.neighbors);
-  const mapCapped = mapCapNote(graph?.meta);
+  const mapCapped = mapCapNote(graph?.meta, graph?.capped);
+  // Before anything scores (no misses, churn or importers), the "hotspots" are just docs and config in path order.
+  const noHotspots = !!graph && graph.files.length > 0 && graph.files.every((f) => f.score === 0);
+  // The top hotspots by score, captioned at every zoom.
+  const alwaysLabelled = useMemo(
+    () => new Set([...(graph?.files ?? [])].filter((f) => f.top && f.score > 0).sort((a, b) => b.score - a.score).slice(0, ALWAYS_LABELLED).map((f) => f.path)),
+    [graph],
+  );
 
   const fileButton = (p: string) => (
     <button type="button" onClick={() => setSelected({ kind: 'file', path: p })} className="text-left font-mono text-[12px] [overflow-wrap:anywhere] text-accent-text hover:underline">{p}</button>
@@ -107,6 +142,22 @@ export function CodeGraph({ projectKey }: { projectKey: string }) {
             </ul>
             <IncludeTests checked={tests} onChange={setTests} />
           </div>
+          <form
+            className="flex items-center gap-1.5"
+            onSubmit={(e) => {
+              e.preventDefault();
+              const p = find.trim().replace(/^\.?\/+/, '');
+              if (p) setSelected({ kind: 'file', path: p });
+            }}
+          >
+            <Input aria-label="find file" size="sm" list="code-files" value={find} onChange={(e) => setFind(e.target.value)} placeholder="Find a file by path…" className="w-64 bg-surface/90" />
+            <datalist id="code-files">{known.map((p) => <option key={p} value={p} />)}</datalist>
+          </form>
+          {noHotspots && (
+            <p role="note" className="rounded-md border border-line bg-surface/90 px-2.5 py-1 text-xs text-muted shadow-card backdrop-blur">
+              No hotspots yet: no file has misses, recent commits or importers, so these are just the first files of the map. Find any file by path above.
+            </p>
+          )}
           {capped && (
             <p role="note" className="rounded-md border border-line bg-surface/90 px-2.5 py-1 text-xs text-muted shadow-card backdrop-blur">
               Showing the top {tops} of {plural(cap.eligible, 'file')} by hotspot score
@@ -116,7 +167,7 @@ export function CodeGraph({ projectKey }: { projectKey: string }) {
           )}
           {mapCapped && (
             <p role="note" className="rounded-md border border-line bg-surface/90 px-2.5 py-1 text-xs text-muted shadow-card backdrop-blur">
-              The map holds {mapCapped}; files past the cap are not drawn. Raise SCAN_MAX_FILES to map more.
+              The map {mapCapped.startsWith('capped') ? 'is' : 'holds'} {mapCapped}; files past the cap are not drawn. Raise SCAN_MAX_FILES to map more.
             </p>
           )}
         </div>
@@ -125,6 +176,19 @@ export function CodeGraph({ projectKey }: { projectKey: string }) {
             ref={fg}
             graphData={data}
             cooldownTicks={120}
+            onRenderFramePre={() => { captions.current = []; }}
+            onRenderFramePost={(ctx: CanvasRenderingContext2D, scale: number) => {
+              placer.current.reset();
+              ctx.font = `${11 / scale}px sans-serif`;
+              ctx.textAlign = 'left';
+              ctx.textBaseline = 'top';
+              ctx.fillStyle = palette.text;
+              const h = 13 / scale;
+              for (const c of [...captions.current].sort((a, b) => b.rank - a.rank)) {
+                const w = ctx.measureText(c.text).width;
+                if (placer.current.place(c.x - w / 2, c.y, w, h)) ctx.fillText(c.text, c.x - w / 2, c.y);
+              }
+            }}
             onEngineStop={() => {
               if (fitted.current) return;
               fitted.current = true;
@@ -156,20 +220,15 @@ export function CodeGraph({ projectKey }: { projectKey: string }) {
               ctx.strokeStyle = on ? palette.text : palette.surface;
               ctx.stroke();
               // Canvas text is drawn, not parsed, so the path needs no escaping here (the hover label is HTML).
-              const caption = codeNodeCaption(n, scale);
-              if (caption) {
-                ctx.font = `${11 / scale}px sans-serif`;
-                ctx.textAlign = 'center';
-                ctx.textBaseline = 'top';
-                ctx.fillStyle = palette.text;
-                ctx.fillText(caption, x, y + r + 2 / scale);
-              }
+              const top = !!n.path && alwaysLabelled.has(n.path);
+              const caption = codeNodeCaption(n, scale, { top, short: n.short });
+              if (caption) captions.current.push({ text: caption, x, y: y + r + 2 / scale, rank: (top ? 1e6 : 0) + n.misses * 1e3 + n.score });
             }}
             linkColor={() => palette.link}
-            linkWidth={1}
-            linkLineDash={(l: CodeLink) => (l.type === 'TESTS' ? [3, 2] : l.type === 'EDITED' || l.type === 'APPLIES_TO' ? [1, 2] : null)}
-            linkLabel={codeLinkLabel}
-            linkDirectionalArrowLength={3}
+            linkWidth={(l: CodeLink) => (l.type === 'NEAR' ? 0.3 : 1)}
+            linkLineDash={(l: CodeLink) => (l.type === 'TESTS' ? [3, 2] : l.type === 'EDITED' || l.type === 'APPLIES_TO' ? [1, 2] : l.type === 'NEAR' ? [1, 6] : null)}
+            linkLabel={linkLabel}
+            linkDirectionalArrowLength={(l: CodeLink) => (l.type === 'NEAR' ? 0 : 3)}
             linkDirectionalArrowRelPos={1}
             onNodeClick={(n: CodeNode) => {
               if (n.path) setSelected({ kind: 'file', path: n.path });
@@ -215,7 +274,7 @@ export function CodeGraph({ projectKey }: { projectKey: string }) {
           </div>
         ) : (
           <p className="text-muted">
-            Click a file to open its module panel; hover one for its path, or zoom in to see every file's name. Bigger files score higher as hotspots; red ones had misses. Arrows are imports, dashed ones tests; diamonds are misses and squares the approved lessons on those files.
+            Click a file to open its module panel, or find one by path; hover one for its full path, or zoom in to see every file's name. Bigger files score higher as hotspots; red ones had misses. Arrows are imports, dashed ones tests; diamonds are misses and squares the approved lessons on those files.
           </p>
         )}
       </aside>

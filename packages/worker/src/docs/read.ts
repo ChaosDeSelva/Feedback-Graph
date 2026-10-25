@@ -43,7 +43,7 @@ export async function readOneDoc(d: ReadDeps): Promise<{ read: boolean; unavaila
     return { read: false };
   }
   if (job.image && !d.llm.vision) {
-    await d.docs.recordDocFailure(job.id, `${d.llm.id} cannot read images: set DOCS_LLM to a model with vision (ollama:gemma4, claude-cli, anthropic:, openai:) and upload it again`, { counted: true, final: true, version });
+    await d.docs.recordDocFailure(job.id, `${d.llm.id} cannot read images: set DOCS_LLM to a model with vision (ollama:gemma4, claude-cli, anthropic:, openai:), restart the worker, then press retry on the upload`, { counted: true, final: true, version });
     return { read: false };
   }
   // Uploaded again since it was picked: the next round reads the new version.

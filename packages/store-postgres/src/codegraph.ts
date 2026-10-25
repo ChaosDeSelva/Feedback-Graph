@@ -124,19 +124,45 @@ export class PgCodeGraphStore implements CodeGraphStore {
         [key, map.tests.map((t) => id(t.test)), map.tests.map((t) => id(t.target))],
       );
       await c.query(
-        `INSERT INTO code_maps (project_key, fingerprint, built_at, files, symbols, imports, tests, candidates) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+        `INSERT INTO code_maps (project_key, fingerprint, built_at, files, symbols, imports, tests, candidates, unresolved) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
          ON CONFLICT (project_key) DO UPDATE SET fingerprint = EXCLUDED.fingerprint, built_at = EXCLUDED.built_at, files = EXCLUDED.files,
-           symbols = EXCLUDED.symbols, imports = EXCLUDED.imports, tests = EXCLUDED.tests, candidates = EXCLUDED.candidates`,
-        [key, map.fingerprint, now, map.stats.files, map.stats.symbols, map.stats.imports, map.stats.tests, map.candidates],
+           symbols = EXCLUDED.symbols, imports = EXCLUDED.imports, tests = EXCLUDED.tests, candidates = EXCLUDED.candidates, unresolved = EXCLUDED.unresolved`,
+        [key, map.fingerprint, now, map.stats.files, map.stats.symbols, map.stats.imports, map.stats.tests, map.candidates, map.unresolved ?? null],
       );
     });
     return map.stats;
   }
 
+  async purgeOrphanCodeFiles(limit: number): Promise<number> {
+    // Session touches (session_files) need no code_files row; map edges hang off map files only.
+    const { rowCount } = await this.q(
+      `DELETE FROM code_files WHERE id IN (
+         SELECT cf.id FROM code_files cf
+         WHERE NOT cf.in_map AND (cf.removed OR NOT EXISTS (SELECT 1 FROM projects p WHERE p.key = cf.project_key))
+           AND NOT EXISTS (SELECT 1 FROM facts x WHERE x.code_file_id = cf.id)
+         LIMIT $1)`,
+      [Math.max(0, Math.floor(limit))],
+    );
+    return rowCount ?? 0;
+  }
+
+  async requestCodeMapRebuild(projectKey: string): Promise<boolean> {
+    const { rowCount } = await this.q('UPDATE code_maps SET rebuild_requested_at = $2 WHERE project_key = $1', [projectKey, new Date()]);
+    return (rowCount ?? 0) > 0;
+  }
+
+  async codeMapRebuildsRequested(): Promise<{ projectKey: string; requestedAt: string }[]> {
+    const { rows } = await this.q(
+      `SELECT project_key, rebuild_requested_at FROM code_maps WHERE rebuild_requested_at > built_at
+       ORDER BY rebuild_requested_at, project_key COLLATE "C"`,
+    );
+    return rows.map((r) => ({ projectKey: r.project_key as string, requestedAt: iso(r.rebuild_requested_at)! }));
+  }
+
   async codeMapMeta(projectKey: string): Promise<CodeMapMeta | null> {
     const { rows: [m] } = await this.q('SELECT * FROM code_maps WHERE project_key = $1', [projectKey]);
     if (!m) return null;
-    return { fingerprint: m.fingerprint ?? null, builtAt: iso(m.built_at)!, stats: { files: m.files, symbols: m.symbols, imports: m.imports, tests: m.tests }, candidates: m.candidates ?? null };
+    return { fingerprint: m.fingerprint ?? null, builtAt: iso(m.built_at)!, stats: { files: m.files, symbols: m.symbols, imports: m.imports, tests: m.tests }, candidates: m.candidates ?? null, unresolved: m.unresolved ?? null };
   }
 
   async codeMap(projectKey: string): Promise<StoredCodeMap | null> {

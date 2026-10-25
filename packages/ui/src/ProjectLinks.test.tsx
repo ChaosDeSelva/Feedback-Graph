@@ -47,14 +47,14 @@ test('shows confirmed links with their note, and suggestions with their evidence
 });
 
 test('confirming a suggestion sends your decision and moves it to the linked list', async () => {
-  render(<ProjectLinks projectKey="game" projects={['game', ...others]} onError={() => {}} />);
+  render(<ProjectLinks projectKey="game" projects={['game', ...others]} onError={() => {}} undoMs={30} />);
   fireEvent.click(await screen.findByRole('button', { name: 'confirm link to api' }));
   await waitFor(() => expect(calls.some((c) => c.url === '/api/links' && (c.body as { status: string }).status === 'confirmed' && (c.body as { b: string }).b === 'api')).toBe(true));
   await waitFor(() => expect(screen.getByRole('button', { name: 'unlink api' })).toBeTruthy());
 });
 
 test('dismiss a suggestion; unlink a confirmed link', async () => {
-  render(<ProjectLinks projectKey="game" projects={['game', ...others]} onError={() => {}} />);
+  render(<ProjectLinks projectKey="game" projects={['game', ...others]} onError={() => {}} undoMs={30} />);
   fireEvent.click(await screen.findByRole('button', { name: 'dismiss link to api' }));
   await waitFor(() => expect(calls.some((c) => (c.body as { status?: string } | undefined)?.status === 'dismissed')).toBe(true));
   fireEvent.click(screen.getByRole('button', { name: 'unlink site' }));
@@ -71,4 +71,25 @@ test('link a project by hand with a relation and a note; projects already linked
   fireEvent.click(screen.getByRole('button', { name: 'Link' }));
   await waitFor(() => expect(calls.some((c) => c.url === '/api/links' && JSON.stringify(c.body) === JSON.stringify({ a: 'game', b: 'web', status: 'confirmed', relation: 'same_product', note: 'the web build of the game' }))).toBe(true));
   expect(await screen.findByRole('button', { name: 'unlink web' })).toBeTruthy();
+});
+
+test('a decided suggestion keeps its row (faded, so the next Confirm does not slide under the pointer) with an Undo', async () => {
+  links = [link('api', 'game', 'suggested'), link('game', 'web', 'suggested', { score: 0.6 })];
+  render(<ProjectLinks projectKey="game" projects={['game', ...others]} onError={() => {}} />);
+  fireEvent.click(await screen.findByRole('button', { name: 'confirm link to api' }));
+  const row = (await screen.findByText(/confirmed the link to api/)).closest('li')!;
+  expect(row.querySelector('.opacity-45')).toBeTruthy();
+  // The next suggestion has not moved into its place, and the linked list has not grown above it yet.
+  expect(screen.getByRole('button', { name: 'confirm link to web' })).toBeTruthy();
+  expect(screen.queryByRole('button', { name: 'unlink api' })).toBeNull();
+  fireEvent.click(within(row).getByRole('button', { name: 'Undo' }));
+  await waitFor(() => expect(calls.filter((c) => c.url === '/api/links').map((c) => (c.body as { status: string }).status)).toEqual(['confirmed', 'suggested']));
+  expect(await screen.findByRole('button', { name: 'confirm link to api' })).toBeTruthy();
+});
+
+test('suggestions list depends_on before related, then by strength', async () => {
+  links = [link('game', 'web', 'suggested', { relation: 'related', score: 0.76 }), link('api', 'game', 'suggested', { score: 0.9 }), link('game', 'tools', 'suggested', { score: 0.95 })];
+  render(<ProjectLinks projectKey="game" projects={['game', ...others]} onError={() => {}} />);
+  await screen.findByRole('button', { name: 'confirm link to api' });
+  expect(screen.getAllByRole('button', { name: /^confirm link to/ }).map((b) => b.getAttribute('aria-label'))).toEqual(['confirm link to tools', 'confirm link to api', 'confirm link to web']);
 });

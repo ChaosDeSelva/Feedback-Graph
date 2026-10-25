@@ -1,10 +1,10 @@
 import { parseLogins } from './feedbackRules.ts';
 import { parseGithubRepos } from './integrations/github.ts';
 import type { Root } from './projects.ts';
-import { DEFAULT_NUM_PREDICT, DEFAULT_OLLAMA_TIMEOUT_MS, DEFAULT_REPEAT_PENALTY } from './ollama.ts';
+import { DEFAULT_NUM_CTX, DEFAULT_NUM_PREDICT, DEFAULT_OLLAMA_TIMEOUT_MS, DEFAULT_REPEAT_PENALTY } from './ollama.ts';
 
 /** Bumped with each release; reported by /api/status and the worker heartbeat. */
-export const VERSION = '0.5.0';
+export const VERSION = '0.6.0';
 
 export class ConfigError extends Error {
   readonly problems: string[];
@@ -67,12 +67,18 @@ export type Config = {
   codexSessionsDir: string;
   stateDb: string;
   /**
-   * numPredict / repeatPenalty: sent with every Ollama chat call (OLLAMA_NUM_PREDICT, OLLAMA_REPEAT_PENALTY).
+   * numPredict: OLLAMA_NUM_PREDICT, the answer limit for every job; null: each job's own (classify 256, relevance scores
+   * 1024, everything else 2048). numCtx / repeatPenalty: sent with every Ollama chat call (OLLAMA_NUM_CTX, default
+   * 16384; OLLAMA_REPEAT_PENALTY).
    * timeoutSeconds: OLLAMA_TIMEOUT_SECONDS, the limit for every Ollama chat call; null: each job's own (classify 120 s).
    */
-  ollama: { url: string; model: string; embedModel: string; numPredict: number; repeatPenalty: number; timeoutSeconds: number | null };
-  /** docs: reads uploaded documents and images into facts (DOCS_LLM, default SCAN_LLM; it needs vision for images). */
-  llm: { classify: string | null; postmortem: string | null; scan: string | null; check: string | null; docs: string | null };
+  ollama: { url: string; model: string; embedModel: string; numPredict: number | null; numCtx: number; repeatPenalty: number; timeoutSeconds: number | null };
+  /**
+   * docs: reads uploaded documents and images into facts (DOCS_LLM, default SCAN_LLM; it needs vision for images).
+   * chat: answers Ask conversations that have no provider of their own (CHAT_LLM); null: the worker picks claude-cli
+   * when a Claude token is set, else codex-cli when a Codex login exists, else the local model.
+   */
+  llm: { classify: string | null; postmortem: string | null; scan: string | null; check: string | null; docs: string | null; chat: string | null };
   pollSeconds: number;
   classifyBatch: number;
   scanMaxBytes: number;
@@ -175,15 +181,16 @@ export function cloudUrlProblem(raw: string): string | null {
  */
 export const OPERATOR_VERBS = [
   'select_projects', 'settings', 'scan', 'inbox_decide', 'lesson_decide', 'relevance', 'pin', 'links', 'docs', 'docs_delete',
-  'delete_project', 'retry', 'requeue', 'sync_now', 'import', 'resummarize', 'integrations',
+  'delete_project', 'retry', 'requeue', 'sync_now', 'import', 'resummarize', 'integrations', 'chat', 'chat_delete',
 ] as const;
 export type OperatorVerb = (typeof OPERATOR_VERBS)[number];
 /**
  * Off unless OPERATOR_ALLOW names them: deciding lessons (what agents are taught), and what deletes data (deleting a
- * project or an uploaded document; settings, whose cleanup deletes unselected projects' data), imports lessons from a file, or sets
- * integration keys.
+ * project, an uploaded document or an Ask conversation; settings, whose cleanup deletes unselected projects' data), imports
+ * lessons from a file, or sets integration keys. `chat` (asking in Ask) is on: it spends the owner's model subscription
+ * but teaches agents nothing.
  */
-const OPERATOR_DEFAULT_OFF: readonly OperatorVerb[] = ['lesson_decide', 'delete_project', 'docs_delete', 'settings', 'import', 'integrations'];
+const OPERATOR_DEFAULT_OFF: readonly OperatorVerb[] = ['lesson_decide', 'delete_project', 'docs_delete', 'settings', 'import', 'integrations', 'chat_delete'];
 
 /** FG_OPERATOR_TOKEN: agents (the `fg` CLI) may make the owner decisions in `allow`. Never log `token`. */
 export type OperatorConfig = { token: string; allow: OperatorVerb[] };
@@ -274,7 +281,7 @@ export function loadConfig(env: Env): Config {
     if (u && u.protocol !== 'http:' && u.protocol !== 'https:') problems.push(`CODEX_RUNNER_URL must be http:// or https:// (got ${u.protocol})`);
     else if (u && (u.username || u.password)) problems.push('CODEX_RUNNER_URL must not carry a user name or password (the runner token is in the scratch volume)');
   }
-  for (const k of ['CLASSIFY_LLM', 'POSTMORTEM_LLM', 'SCAN_LLM', 'SUMMARY_LLM', 'DOCS_LLM']) {
+  for (const k of ['CLASSIFY_LLM', 'POSTMORTEM_LLM', 'SCAN_LLM', 'SUMMARY_LLM', 'DOCS_LLM', 'CHAT_LLM']) {
     if (/^codex-cli(:|$)/.test(env[k]?.trim() ?? '') && !runnerUrl && env.ALLOW_UNCONFINED_CODEX?.trim() !== '1') {
       problems.push(`${k}: codex-cli inside the worker can read every file the worker can (all transcripts, every project's .env, the worker's secrets); run it in the codex-runner sidecar (CODEX_RUNNER_URL with docker compose --profile codex), set ALLOW_UNCONFINED_CODEX=1 to accept that, or use claude-cli (SECURITY.md)`);
     }
@@ -363,11 +370,12 @@ export function loadConfig(env: Env): Config {
       model: str('OLLAMA_MODEL', 'gemma4'),
       embedModel: str('OLLAMA_EMBED_MODEL', 'nomic-embed-text'),
       // Read again by each Ollama provider (ollamaTuning): checked here so a bad value fails at startup.
-      numPredict: num('OLLAMA_NUM_PREDICT', DEFAULT_NUM_PREDICT),
+      numPredict: env.OLLAMA_NUM_PREDICT?.trim() ? num('OLLAMA_NUM_PREDICT', DEFAULT_NUM_PREDICT) : null,
+      numCtx: num('OLLAMA_NUM_CTX', DEFAULT_NUM_CTX, 512),
       repeatPenalty: num('OLLAMA_REPEAT_PENALTY', DEFAULT_REPEAT_PENALTY, 0.01),
       timeoutSeconds: env.OLLAMA_TIMEOUT_SECONDS?.trim() ? num('OLLAMA_TIMEOUT_SECONDS', DEFAULT_OLLAMA_TIMEOUT_MS / 1000) : null,
     },
-    llm: { classify: spec('CLASSIFY_LLM', true), postmortem: spec('POSTMORTEM_LLM'), scan: spec('SCAN_LLM'), check: spec('CHECK_LLM'), docs: spec('DOCS_LLM') },
+    llm: { classify: spec('CLASSIFY_LLM', true), postmortem: spec('POSTMORTEM_LLM'), scan: spec('SCAN_LLM'), check: spec('CHECK_LLM'), docs: spec('DOCS_LLM'), chat: spec('CHAT_LLM') },
     pollSeconds: num('POLL_SECONDS', 30),
     classifyBatch: num('CLASSIFY_BATCH', 50),
     scanMaxBytes: num('SCAN_MAX_BYTES', 80_000),

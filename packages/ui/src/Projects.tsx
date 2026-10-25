@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
-import { FACT_KINDS, UNSCORED_RELEVANCE, type FactKind } from '@fb/core/types';
+import { hashModule } from './links.ts';
+import { FACT_KINDS, UNSCORED_RELEVANCE, type FactEvidence, type FactKind } from '@fb/core/types';
 import { relevanceBand, type RelevanceBand } from '@fb/core/relevance';
 import { ActivityEntry } from './Activity.tsx';
 import { CodeMap } from './CodeMap.tsx';
@@ -12,7 +13,7 @@ import { PageHeader } from './ui/PageHeader.tsx';
 import { ListRow, SplitPane } from './ui/SplitPane.tsx';
 import { Button, buttonClass, Input, Select } from './ui/controls.tsx';
 import { Alert, Badge, Card, EmptyState, plural, SkeletonDetail, SkeletonList, StatGrid, StatTile, StatusBadge } from './ui/display.tsx';
-import { DownloadIcon, FolderIcon, PinIcon, SearchIcon, UploadIcon } from './ui/icons.tsx';
+import { ChevronIcon, DownloadIcon, FolderIcon, PinIcon, SearchIcon, UploadIcon } from './ui/icons.tsx';
 
 /** '' means "worker default" (SCAN_LLM), so the request body stays empty. */
 const PROVIDERS = [
@@ -39,19 +40,23 @@ export function queuePosition(projects: ProjectSummary[], key: string, now = Dat
 
 export function Projects({ pollMs = 5000 }: { pollMs?: number } = {}) {
   const [projects, setProjects] = useState<ProjectSummary[] | null>(null);
-  const [selected, setSelected] = useState<string | null>(null);
+  // A module link (#projects/<key>/<path>, from Ask or the Dashboard) opens on that project with the file's panel open.
+  const [link] = useState(hashModule);
+  const [selected, setSelected] = useState<string | null>(link?.project ?? null);
   const [facts, setFacts] = useState<StoredFact[] | null>(null);
   const [kind, setKind] = useState<FactKind | ''>('');
-  const [sort, setSort] = useState<'file' | 'relevance'>('file');
+  const [sort, setSort] = useState<'file' | 'relevance'>('relevance');
+  // A fact's file name opens its module panel in the code map card; `at` makes the same file clicked again a new ask.
+  const [moduleFocus, setModuleFocus] = useState<{ path: string; at: number } | null>(null);
   const [query, setQuery] = useState('');
   const [provider, setProvider] = useState('');
   const [error, setError] = useState<string | null>(null);
   // On a phone the list and the project take turns; this is true while the project is showing.
-  const [open, setOpen] = useState(false);
+  const [open, setOpen] = useState(!!link);
 
   const load = () => api.projects().then((ps) => {
     setProjects(ps);
-    setSelected((s) => s ?? ps.find((p) => p.facts > 0)?.key ?? ps[0]?.key ?? null);
+    setSelected((s) => (s && ps.some((p) => p.key === s) ? s : null) ?? ps.find((p) => p.facts > 0)?.key ?? ps[0]?.key ?? null);
   }, (e) => { setError(String(e)); setProjects((ps) => ps ?? []); });
   useEffect(() => { load(); }, []);
 
@@ -178,7 +183,9 @@ export function Projects({ pollMs = 5000 }: { pollMs?: number } = {}) {
                 <StatTile label="sessions" value={current.sessions} hint="read from this folder" />
                 <StatTile label="feedback" value={current.feedback} hint="pushback flagged" />
                 <StatTile label="lessons" value={current.lessons} hint="drawn from confirmed misses" />
-                <StatTile label="facts" value={current.facts} hint="extracted from the code" />
+                {current.factsByOrigin
+                  ? <StatTile label="facts" value={current.factsByOrigin.model} hint={`read from the code by a model; ${current.factsByOrigin.manifest} from manifests, ${current.factsByOrigin.document} from documents${current.factsByOrigin.you ? `, ${current.factsByOrigin.you} you wrote` : ''}`} />
+                  : <StatTile label="facts" value={current.facts} hint="extracted from the code" />}
               </StatGrid>
 
               {current.lastScan && (
@@ -188,6 +195,12 @@ export function Projects({ pollMs = 5000 }: { pollMs?: number } = {}) {
                   <span className="font-mono text-muted">{current.lastScan.provider ?? 'default'}</span>
                   <span className="text-muted tabular-nums">{current.lastScan.filesScanned} files</span>
                   <span className="text-muted tabular-nums">{current.lastScan.factsAdded} facts</span>
+                  {current.lastScan.shards && (
+                    <span className="text-muted tabular-nums" title="An agentic scan runs once per package or service; one whose files did not change keeps its facts">
+                      {current.lastScan.shards.rescanned} of {current.lastScan.shards.total} shards rescanned
+                      {current.lastScan.shards.failed ? `, ${current.lastScan.shards.failed} failed` : ''}
+                    </span>
+                  )}
                   {(() => {
                     const pos = current.lastScan.status === 'queued' ? queuePosition(projects, current.key) : null;
                     return pos !== null && <span className="text-muted">{pos === 1 ? 'next in the queue' : `${ordinal(pos)} in the queue`}</span>;
@@ -204,7 +217,7 @@ export function Projects({ pollMs = 5000 }: { pollMs?: number } = {}) {
 
               <ProjectLinks projectKey={current.key} projects={projects.map((p) => p.key)} onError={setError} />
 
-              <CodeMap projectKey={current.key} />
+              <CodeMap projectKey={current.key} initialModule={current.key === link?.project ? link.path : null} focus={moduleFocus} />
 
               <Card
                 title="Code facts"
@@ -232,11 +245,14 @@ export function Projects({ pollMs = 5000 }: { pollMs?: number } = {}) {
                     Scan the code to extract conventions, invariants and gotchas agents should know.
                   </EmptyState>
                 ) : (
-                  <ul>
-                    {(sort === 'relevance' ? byRelevance(facts) : facts).map((f) => (
-                      <FactCard key={f.id} f={f} projectKey={current.key} onRelevance={(relevance) => setRelevance(f, relevance)} />
-                    ))}
-                  </ul>
+                  <FactGroups
+                    key={`${current.key}:${sort}:${kind}`}
+                    facts={facts}
+                    sort={sort}
+                    render={(f) => (
+                      <FactCard key={f.id} f={f} projectKey={current.key} onRelevance={(relevance) => setRelevance(f, relevance)} onOpenFile={(path) => setModuleFocus({ path, at: Date.now() })} />
+                    )}
+                  />
                 )}
               </Card>
 
@@ -278,6 +294,13 @@ const BAND_HINT: Record<RelevanceBand, string> = {
   rare: 'rarely needed while coding (setup, tooling): agents get it only when a task is about it',
   unscored: `not scored yet: ranked as middling (${UNSCORED_RELEVANCE}) until the worker scores it`,
 };
+/** How well a fact's citation was checked when it was saved (older facts have none and show nothing). */
+const EVIDENCE_LABEL: Record<FactEvidence, string> = { line: 'line checked', file: 'file only', none: 'not checkable (no file)' };
+const EVIDENCE_HINT: Record<FactEvidence, string> = {
+  line: 'the cited lines exist and hold what the fact names',
+  file: 'the file exists; no lines were cited, or the cited ones did not hold what the fact names',
+  none: 'the fact cites no file, so there was nothing to check it against',
+};
 /** What each button sets: the middle of its band. */
 const MARKS: { band: Exclude<RelevanceBand, 'unscored'>; value: number }[] = [
   { band: 'everyday', value: 0.9 },
@@ -285,35 +308,109 @@ const MARKS: { band: Exclude<RelevanceBand, 'unscored'>; value: number }[] = [
   { band: 'rare', value: 0.15 },
 ];
 
+/** Files listed at a time; "show more" adds as many again. */
+const GROUPS_PAGE = 25;
+
+/**
+ * Facts grouped by the file (or document) they are about: by relevance, the file holding the most relevant fact first;
+ * by file, A to Z. Only the first group starts open, and 25 files show at a time, so 140 facts do not fill 70 screens.
+ */
+function FactGroups({ facts, sort, render }: { facts: StoredFact[]; sort: 'file' | 'relevance'; render: (f: StoredFact) => React.ReactNode }) {
+  const groups = new Map<string, StoredFact[]>();
+  for (const f of sort === 'relevance' ? byRelevance(facts) : facts) {
+    const k = f.docId ? `doc:${f.path}` : f.path;
+    (groups.get(k) ?? groups.set(k, []).get(k)!).push(f);
+  }
+  // byRelevance put each group's best fact first and Map keeps first-seen order, so by relevance the order is right already.
+  const list = [...groups.entries()];
+  if (sort === 'file') list.sort(([a], [b]) => a.localeCompare(b));
+  const [shown, setShown] = useState(GROUPS_PAGE);
+  const [open, setOpen] = useState<Set<string>>(() => new Set(list.slice(0, 1).map(([k]) => k)));
+  const toggle = (k: string) => setOpen((o) => { const n = new Set(o); if (n.has(k)) n.delete(k); else n.add(k); return n; });
+  const rest = list.length - shown;
+  return (
+    <div>
+      <ul>
+        {list.slice(0, shown).map(([k, fs]) => {
+          const isOpen = open.has(k);
+          const best = relevanceBand(fs[0].relevance);
+          return (
+            <li key={k} className="border-b border-line last:border-b-0">
+              <button
+                type="button"
+                aria-expanded={isOpen}
+                onClick={() => toggle(k)}
+                className="flex w-full items-center gap-2 bg-sunken/60 px-3 py-1.5 text-left text-xs hover:bg-sunken"
+              >
+                <ChevronIcon size={10} className={isOpen ? 'rotate-90' : ''} />
+                <span className="min-w-0 flex-1 font-mono text-[11.5px] [overflow-wrap:anywhere]">{fs[0].docId ? `document ${fs[0].path}` : fs[0].path} · {plural(fs.length, 'fact')}</span>
+                {sort === 'relevance' && <Badge tone={BAND_TONE[best]}>{best}</Badge>}
+              </button>
+              {isOpen && <ul>{fs.map(render)}</ul>}
+            </li>
+          );
+        })}
+      </ul>
+      {rest > 0 && (
+        <div className="border-t border-line px-3 py-2">
+          <Button size="sm" variant="ghost" onClick={() => setShown((n) => n + GROUPS_PAGE)}>Show {Math.min(rest, GROUPS_PAGE)} more file{Math.min(rest, GROUPS_PAGE) === 1 ? '' : 's'}</Button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** A statement longer than this is cut short, with "show all". */
+const LONG_FACT = 280;
+
 /** A fact plus, on demand, how it came to exist: the model, its reason, the scan and file version, and the scan log. */
-function FactCard({ f, projectKey, onRelevance }: { f: StoredFact; projectKey: string; onRelevance: (relevance: number) => void }) {
+function FactCard({ f, projectKey, onRelevance, onOpenFile }: { f: StoredFact; projectKey: string; onRelevance: (relevance: number) => void; onOpenFile?: (path: string) => void }) {
+  const [full, setFull] = useState(false);
+  const long = f.statement.length > LONG_FACT;
   const band = relevanceBand(f.relevance);
   const [log, setLog] = useState<Activity[] | null>(null);
   const [open, setOpen] = useState(false);
+  const yours = f.origin === 'you';
   function toggle() {
     setOpen(!open);
-    // A fact from a document was made by its reading; a code fact by the scan of its file.
-    const history = f.docId ? { target: f.docId, kind: 'doc_read' as const } : { target: `${projectKey}:${f.path}`, kind: 'facts_extracted' as const };
+    // A fact from a document was made by its reading; one you wrote by converting a lesson; a code fact by the scan of its file.
+    const history = f.docId ? { target: f.docId, kind: 'doc_read' as const }
+      : yours ? { target: f.id, kind: 'lesson_to_fact' as const }
+      : { target: `${projectKey}:${f.path}`, kind: 'facts_extracted' as const };
     if (!log) api.activity({ ...history, limit: 10 }).then(setLog, () => setLog([]));
   }
   return (
     <li className="border-b border-line px-3 py-2.5 last:border-b-0">
       <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
-        <span className="min-w-0 font-mono text-[11.5px] [overflow-wrap:anywhere] text-accent-text">{f.docId ? `from your document ${f.path}` : `${f.path}${f.lines ? `:${f.lines}` : ''}`}</span>
+        {f.docId || !onOpenFile ? (
+          <span className="min-w-0 font-mono text-[11.5px] [overflow-wrap:anywhere] text-accent-text">{f.docId ? `from your document ${f.path}` : `${f.path}${f.lines ? `:${f.lines}` : ''}`}</span>
+        ) : (
+          <button type="button" aria-label={`open module ${f.path}`} title="open its module panel in the code map" onClick={() => onOpenFile(f.path)} className="min-w-0 text-left font-mono text-[11.5px] [overflow-wrap:anywhere] text-accent-text hover:underline">
+            {f.path}{f.lines ? `:${f.lines}` : ''}
+          </button>
+        )}
         <span className="flex items-center gap-2 text-muted">
           <Badge tone={BAND_TONE[band]} title={BAND_HINT[band]}>{band}</Badge>
           <Badge>{f.kind.replace('_', ' ')}</Badge>
-          <span className="tabular-nums">{Math.round(f.confidence * 100)}%</span>
+          {yours
+            ? <Badge tone="accent" title={`written by ${f.source === 'you' ? 'you' : f.source} (a lesson converted to a fact): no scan replaces it`}>yours</Badge>
+            : f.origin && f.origin !== 'model' && !f.docId && <Badge title="read from a manifest (package.json, go.mod, a Makefile...) without a model">{f.origin}</Badge>}
+          {f.evidence && <span title={EVIDENCE_HINT[f.evidence]}>{EVIDENCE_LABEL[f.evidence]}</span>}
           <span className="font-mono text-[11px]">{f.source}</span>
         </span>
       </div>
-      <p className="mt-1 text-[13.5px] [overflow-wrap:anywhere]">{f.statement}</p>
+      <p className="mt-1 text-[13.5px] [overflow-wrap:anywhere]">
+        {long && !full ? `${f.statement.slice(0, LONG_FACT).trimEnd()}…` : f.statement}
+        {long && (
+          <button type="button" onClick={() => setFull(!full)} className="ml-1.5 text-xs text-muted underline decoration-line-strong underline-offset-2 hover:text-text">{full ? 'show less' : 'show all'}</button>
+        )}
+      </p>
       <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted">
         <button type="button" aria-expanded={open} onClick={toggle} className="underline decoration-line-strong underline-offset-2 hover:text-text">
           how was this created?
         </button>
         <span className="flex flex-wrap items-center gap-1">
-          <span title={f.relevanceBy === 'you' ? (f.docId ? 'kept until the document is uploaded again' : 'kept until a rescan of this file replaces the fact with new ones, scored again') : undefined}>
+          <span title={f.relevanceBy === 'you' ? (yours ? 'kept: you wrote this fact, and no scan replaces it' : f.docId ? 'kept until the document is uploaded again' : 'kept until a rescan of this file replaces the fact with new ones, scored again') : undefined}>
             relevance{f.relevance !== null ? ` ${f.relevance.toFixed(2)}` : ''}{f.relevanceBy === 'you' ? ', set by you' : ''}:
           </span>
           {MARKS.map((m) => (

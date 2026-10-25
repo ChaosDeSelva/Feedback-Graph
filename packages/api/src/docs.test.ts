@@ -7,6 +7,7 @@ const repo = { listCandidates: async () => [], candidateDetail: async () => null
 function setup() {
   const upserts: { doc: object; chunks: { text: string }[]; opts?: object }[] = [];
   const deleted: string[] = [];
+  const reread: string[] = [];
   const recorded: ActivityInput[] = [];
   const app = createApp(repo, {
     embed: async (t) => t.map(() => [1]),
@@ -15,11 +16,12 @@ function setup() {
       upsertDoc: async (doc, chunks, opts) => { upserts.push({ doc, chunks, opts }); return `doc:shop:upload:${doc.ref}`; },
       listDocs: async () => [],
       deleteDoc: async (id) => { deleted.push(id); return id === 'doc:shop:upload:a.md'; },
+      requeueDocRead: async (id) => { reread.push(id); return id === 'doc:shop:upload:flow.png'; },
       docImage: async (id) => (id === 'doc:shop:upload:flow.png' ? { mediaType: 'image/png', data: Buffer.from('PNGDATA').toString('base64') } : null),
     },
     activity: { record: async (a) => { recorded.push(a); }, list: async () => [] },
   });
-  return { app, upserts, deleted, recorded };
+  return { app, upserts, deleted, reread, recorded };
 }
 const post = (body: object) => ({ method: 'POST', headers: { 'content-type': 'application/json', origin: 'http://localhost' }, body: JSON.stringify(body) });
 
@@ -33,7 +35,7 @@ test('uploading a document chunks, redacts, embeds and logs it', async () => {
   expect(upserts[0].chunks[0].text).toContain('Every list is paginated.');
   expect(upserts[0].chunks[0].text).not.toContain('sk-ant-api03');
   // Uploads are queued to be read into facts.
-  expect(upserts[0].opts).toEqual({ read: true });
+  expect(upserts[0].opts).toEqual({ read: true, addedBy: 'you' });
   expect(recorded[0]).toMatchObject({ kind: 'doc_added', actor: 'you', projectKey: 'shop', subject: 'uploaded "Product spec" (1 chunk)', targets: ['doc:shop:upload:spec.md'] });
 });
 
@@ -60,7 +62,7 @@ test('uploading a file with the name of an existing upload says it replaced it',
     projectDirs: async () => [{ key: 'shop', name: 'shop', repoPath: '/vibe/shop' }],
     docs: {
       upsertDoc: async (doc) => `doc:shop:upload:${doc.ref}`,
-      listDocs: async () => [{ id: 'doc:shop:upload:spec.md', projectKey: 'shop', source: 'upload', ref: 'spec.md', title: 'Old spec', url: null, addedAt: 't', chunks: 3, kind: 'text', mediaType: null, read: null }],
+      listDocs: async () => [{ id: 'doc:shop:upload:spec.md', projectKey: 'shop', source: 'upload', ref: 'spec.md', title: 'Old spec', url: null, addedAt: 't', addedBy: 'you', chunks: 3, kind: 'text', mediaType: null, read: null }],
       deleteDoc: async () => true,
     },
     activity: { record: async (a) => { recorded.push(a); }, list: async () => [] },
@@ -76,7 +78,7 @@ test('uploading an image stores it to be read, with a placeholder excerpt until 
   const res = await app.request('/api/projects/shop/docs', post({ title: 'Checkout flow', name: 'flow.png', image: { mediaType: 'image/png', data: png } }));
   expect(res.status).toBe(201);
   expect(upserts[0].doc).toEqual({ projectKey: 'shop', source: 'upload', ref: 'flow.png', title: 'Checkout flow', url: null });
-  expect(upserts[0].opts).toEqual({ read: true, image: { mediaType: 'image/png', data: png } });
+  expect(upserts[0].opts).toEqual({ read: true, addedBy: 'you', image: { mediaType: 'image/png', data: png } });
   expect(upserts[0].chunks).toEqual([{ text: 'Image "Checkout flow" (flow.png): not read yet.', embedding: [1] }]);
   expect(recorded[0]).toMatchObject({ kind: 'doc_added', subject: 'uploaded image "Checkout flow"' });
 });
@@ -100,4 +102,13 @@ test('GET /api/docs/:id/image serves an uploaded image with its type, never as a
   expect(res.headers.get('x-content-type-options')).toBe('nosniff');
   expect(Buffer.from(await res.arrayBuffer()).toString()).toBe('PNGDATA');
   expect((await app.request('/api/docs/doc%3Ashop%3Aupload%3Anope.png/image')).status).toBe(404);
+});
+
+test('POST /api/docs/:id/reread queues a failed reading again (say, after DOCS_LLM changed); 404 when there is none', async () => {
+  const { app, reread, recorded } = setup();
+  const res = await app.request('/api/docs/doc%3Ashop%3Aupload%3Aflow.png/reread', post({}));
+  expect(res.status).toBe(204);
+  expect(reread).toEqual(['doc:shop:upload:flow.png']);
+  expect(recorded[0]).toMatchObject({ kind: 'doc_added', actor: 'you', projectKey: 'shop', subject: 'asked for flow.png to be read again', targets: ['doc:shop:upload:flow.png'] });
+  expect((await app.request('/api/docs/doc%3Ashop%3Aupload%3Anope.md/reread', post({}))).status).toBe(404);
 });

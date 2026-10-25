@@ -95,9 +95,10 @@ elif tags="$(curl -fsS --max-time 5 "$ollama_url/api/tags" 2>/dev/null)"; then
   if [ -z "$probe_model" ]; then skip "ollama structured output: the classifier runs on $classify_llm"
   elif case " $missing " in *" $probe_model "*) true ;; *) false ;; esac; then skip "ollama structured output: $probe_model is not pulled"
   else
-    ollama_structured_probe "$ollama_url" "$probe_model"
+    ollama_structured_probe "$ollama_url" "$probe_model" "$(envval OLLAMA_NUM_CTX)"
     case "$PROBE" in
       ok) pass "ollama structured output: a schema-constrained call to $probe_model answered with JSON" ;;
+      thinking) fail "ollama structured output: $probe_model answered only in its thinking, with no content (asked with think:false)"; ollama_thinking_fix | sed 's/^  /      /' ;;
       timeout) warn "ollama structured output: $probe_model gave no answer in time ($PROBE_DETAIL); run again once it has loaded" ;;
       notjson) warn "ollama structured output: $probe_model answered, but not with JSON: $PROBE_DETAIL" ;;
       unsupported) fail "ollama structured output: refused by this Ollama: ${PROBE_DETAIL:-HTTP 501}"; ollama_structured_fix | sed 's/^  /      /' ;;

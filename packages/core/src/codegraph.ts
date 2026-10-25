@@ -34,11 +34,33 @@ export type CodeMapWrite = {
   fingerprint: string | null;
   /** Files worth mapping before the cap (SCAN_MAX_FILES): more than files.length when the map is capped. */
   candidates?: number | null;
+  /** Imports that look like they name a repo file (a path alias, a workspace package) but resolved to none. */
+  unresolved?: number | null;
 };
 
 export type CodeMapStats = { files: number; symbols: number; imports: number; tests: number };
 /** candidates: files worth mapping before the cap; null for a map built before it was counted. */
-export type CodeMapMeta = { fingerprint: string | null; builtAt: string; stats: CodeMapStats; candidates: number | null };
+/**
+ * unresolved: imports the map could not follow to a file although they look local, so importer and test lists may be
+ * short (null: not counted).
+ */
+export type CodeMapMeta = { fingerprint: string | null; builtAt: string; stats: CodeMapStats; candidates: number | null; unresolved?: number | null };
+/** The map's cap with SCAN_MAX_FILES unset: 40% of the candidates, at least MIN_MAP_FILES and at most MAX_AUTO_MAP_FILES. */
+export const MIN_MAP_FILES = 400;
+export const MAX_AUTO_MAP_FILES = 4000;
+
+/**
+ * Whether a map is capped. `of`: the files worth mapping, when the build counted them; null for a map built before
+ * they were counted, which is called capped when it holds as many files as the cap allows: SCAN_MAX_FILES when set
+ * (maxFiles), else MIN_MAP_FILES or more (an automatic cap above that is always below the count).
+ */
+export function mapCapped(meta: Pick<CodeMapMeta, 'stats' | 'candidates'> | null | undefined, maxFiles: number | null = null): { files: number; of: number | null } | null {
+  if (!meta) return null;
+  const files = meta.stats.files;
+  if (meta.candidates != null) return meta.candidates > files ? { files, of: meta.candidates } : null;
+  return files > 0 && files >= (maxFiles ?? MIN_MAP_FILES) ? { files, of: null } : null;
+}
+
 /** The stored map, in the parser's shape, so the next build can be incremental. Sorted by path (then position). */
 export type StoredCodeMap = CodeMapMeta & { files: MapFile[]; symbols: MapSymbol[]; imports: MapImport[] };
 
@@ -308,9 +330,47 @@ export function normalizeCodeMap(map: CodeMapWrite): Omit<CodeMapWrite, 'symbols
   const churn = Object.fromEntries(Object.entries(map.churn).filter(([p]) => paths.has(p)));
   const fingerprint = map.fingerprint === null ? null : redactSecrets(map.fingerprint);
   const candidates = typeof map.candidates === 'number' && Number.isFinite(map.candidates) ? Math.max(files.length, Math.floor(map.candidates)) : null;
+  const unresolved = typeof map.unresolved === 'number' && Number.isFinite(map.unresolved) ? Math.max(0, Math.floor(map.unresolved)) : null;
   return {
-    files, symbols, imports: [...imports.values()], tests, churn, fingerprint, candidates,
+    files, symbols, imports: [...imports.values()], tests, churn, fingerprint, candidates, unresolved,
     stats: { files: files.length, symbols: symbols.length, imports: imports.size, tests: tests.length },
+  };
+}
+
+/**
+ * What a map write has to change against the stored map, so a rebuild where a handful of files changed rewrites a
+ * handful of rows, not every symbol and edge. symbolPaths: files whose symbols differ (their stored symbols go and
+ * `symbols` replace them); staleImports: (from, to) pairs whose edges go; newImports: edges to create.
+ */
+export function codeMapDiff(
+  stored: { symbols: OrderedSymbol[]; imports: MapImport[] },
+  next: { symbols: OrderedSymbol[]; imports: MapImport[] },
+): { symbolPaths: string[]; symbols: OrderedSymbol[]; staleImports: { from: string; to: string }[]; newImports: MapImport[] } {
+  const signatures = (xs: OrderedSymbol[]) => {
+    const m = new Map<string, string[]>();
+    for (const s of [...xs].sort((a, b) => a.ord - b.ord)) {
+      const sig = m.get(s.path) ?? [];
+      sig.push(JSON.stringify([s.ord, s.id, s.name, s.kind, s.exported, s.lines]));
+      m.set(s.path, sig);
+    }
+    return new Map([...m].map(([p, sig]) => [p, sig.join('\n')]));
+  };
+  const before = signatures(stored.symbols);
+  const after = signatures(next.symbols);
+  const symbolPaths = [...new Set([...before.keys(), ...after.keys()])].filter((p) => before.get(p) !== after.get(p));
+  const changed = new Set(symbolPaths);
+
+  const pair = (i: { from: string; to: string }) => `${i.from}\0${i.to}`;
+  const edge = (i: MapImport) => JSON.stringify([i.spec, i.names]);
+  const old = new Map<string, MapImport[]>();
+  for (const i of stored.imports) old.set(pair(i), [...(old.get(pair(i)) ?? []), i]);
+  const wanted = new Map(next.imports.map((i) => [pair(i), i]));
+  const kept = new Set([...old].filter(([k, es]) => es.length === 1 && wanted.has(k) && edge(es[0]) === edge(wanted.get(k)!)).map(([k]) => k));
+  return {
+    symbolPaths,
+    symbols: next.symbols.filter((s) => changed.has(s.path)),
+    staleImports: [...old.entries()].filter(([k]) => !kept.has(k)).map(([, [i]]) => ({ from: i.from, to: i.to })),
+    newImports: next.imports.filter((i) => !kept.has(pair(i))),
   };
 }
 
@@ -531,4 +591,159 @@ export function codeGraphViews(r: CodeGraphReads) {
     },
   };
   return views;
+}
+
+// ── Search: which symbols and files a question is about (Ask) ─────────
+
+/** Words of a question that never name code. */
+const STOPWORDS = new Set(
+  (
+    'the and for with how what where when why which who whom whose should would could can will does did doing done add adding added new ' +
+    'create creating make making build building implement implementing want wants need needs use used uses using reuse have has had get ' +
+    'put into onto from that this these those there here our ours your yours you are was were been being about like some any all every ' +
+    'everywhere each other others more most many much also just only then than them they their its not but out way thing things one two ' +
+    'code please help show tell find give look see know think let lets via per such very really still within without between ' +
+    'over under above below after before again able goes going went come comes'
+  ).split(' '),
+);
+const MIN_TERM = 3;
+const MAX_TERMS = 24;
+
+/** One word folded for matching: lower case, plural to singular ("modals" -> "modal", "entries" -> "entry", "classes" -> "class"). */
+export function foldTerm(word: string): string {
+  const w = word.toLowerCase();
+  if (w.length <= 3 || /(ss|us|is)$/.test(w)) return w;
+  if (w.endsWith('ies') && w.length > 4) return `${w.slice(0, -3)}y`;
+  if (/(aches|iches)$/.test(w)) return w.slice(0, -1);
+  if (/(sses|xes|zes|ches|shes)$/.test(w)) return w.slice(0, -2);
+  return w.endsWith('s') ? w.slice(0, -1) : w;
+}
+
+/** The words of an identifier or a path segment: camelCase, PascalCase, ACRONYMWord, snake_case and kebab-case split. */
+const wordsOf = (s: string): string[] =>
+  s.replace(/([a-z0-9])([A-Z])/g, '$1 $2').replace(/([A-Z]+)([A-Z][a-z])/g, '$1 $2').split(/[^A-Za-z0-9]+/).filter(Boolean);
+
+/**
+ * The terms of a question that can name code: its words and identifiers (an identifier also as its parts), folded,
+ * stopwords and words shorter than three letters dropped, unique, in order of appearance.
+ */
+export function codeTerms(text: string): string[] {
+  const out = new Set<string>();
+  for (const raw of text.match(/[A-Za-z][A-Za-z0-9_]*/g) ?? []) {
+    const parts = wordsOf(raw);
+    for (const w of [raw.replace(/_/g, ''), ...(parts.length > 1 ? parts : [])]) {
+      const t = foldTerm(w);
+      if (t.length >= MIN_TERM && !STOPWORDS.has(t) && !STOPWORDS.has(w.toLowerCase())) out.add(t);
+    }
+  }
+  return [...out].slice(0, MAX_TERMS);
+}
+
+/** A symbol or a file a question is about, with where it is used and the tests that cover it. */
+export type CodeMapHit = {
+  kind: 'symbol' | 'file';
+  path: string;
+  /** The symbol's name; null for a file hit. */
+  name: string | null;
+  symbolKind: SymbolKind | null;
+  lines: string | null;
+  exported: boolean;
+  /** The (folded) terms it matched. */
+  matched: string[];
+  /** Files importing it by name, then the other files importing its file (tests left out), at most maxUsages. */
+  usages: string[];
+  /** Files importing its file (tests left out). */
+  dependents: number;
+  /** Test files importing its file, directly or through one importer. Sorted. */
+  tests: string[];
+  /** How well it matched: 3 per exact name, 2 per word of its name, 1 per part of a word or folder. */
+  score: number;
+};
+
+export type FindOpts = { limit?: number; maxUsages?: number };
+
+const FIND_LIMIT = 8;
+const FIND_USAGES = 12;
+/** Hits from one file, at most: a big file must not fill the list with its methods. */
+const PER_FILE = 3;
+/** A term this long may match inside a longer word ("modal" in "modaldialog"). */
+const MIN_PART = 4;
+
+/** How a term matches a name: 3 the whole name, 2 one of its words, 1 inside one, 0 not at all. */
+function strength(term: string, name: string): number {
+  if (foldTerm(name.replace(/[^A-Za-z0-9]/g, '')) === term) return 3;
+  const words = wordsOf(name).map(foldTerm);
+  if (words.includes(term)) return 2;
+  return term.length >= MIN_PART && words.some((w) => w.includes(term)) ? 1 : 0;
+}
+
+/**
+ * The symbols and files of a code map a question's terms name (codeTerms; terms are folded here too). Symbols match by
+ * name, files by basename or folder when none of their symbols did. Ranked by how well they matched (more terms and
+ * exact names first), then exported, then how many files depend on them, then path. Test files, secret files and files
+ * that are not code are never hits: a hit lists its tests instead.
+ */
+export function findInCodeMap(map: Pick<StoredCodeMap, 'files' | 'symbols' | 'imports'>, terms: string[], opts: FindOpts = {}): CodeMapHit[] {
+  const want = [...new Set(terms.map(foldTerm).filter((t) => t.length >= MIN_TERM))];
+  if (!want.length) return [];
+  const limit = opts.limit ?? FIND_LIMIT;
+  const maxUsages = opts.maxUsages ?? FIND_USAGES;
+  const byPath = new Map(map.files.map((f) => [f.path, f]));
+  const isTest = (p: string) => byPath.get(p)?.isTest ?? false;
+  const importers = new Map<string, MapImport[]>();
+  for (const i of map.imports) {
+    if (i.to.startsWith('pkg:') || i.from === i.to) continue;
+    const list = importers.get(i.to);
+    if (list) list.push(i);
+    else importers.set(i.to, [i]);
+  }
+  const importersOf = (p: string) => [...new Set((importers.get(p) ?? []).map((i) => i.from))].sort(cmp);
+  const testsOf = (p: string) => {
+    const direct = importersOf(p);
+    const near = direct.filter((x) => !isTest(x)).flatMap(importersOf);
+    return [...new Set([...direct, ...near].filter(isTest))].sort(cmp);
+  };
+  const usable = (f: MapFile | undefined): f is MapFile => !!f && !f.isTest && isCodeLang(f.lang) && !isSecretPath(f.path);
+  const around = (p: string, name: string | null) => {
+    const users = importersOf(p).filter((x) => !isTest(x));
+    const byName = name ? [...new Set((importers.get(p) ?? []).filter((i) => i.names.includes(name)).map((i) => i.from))].filter((x) => !isTest(x)).sort(cmp) : [];
+    return { usages: [...byName, ...users.filter((x) => !byName.includes(x))].slice(0, maxUsages), dependents: users.length, tests: testsOf(p) };
+  };
+
+  const hits: CodeMapHit[] = [];
+  const withSymbols = new Set<string>();
+  for (const s of map.symbols) {
+    if (!usable(byPath.get(s.path))) continue;
+    const matched = want.map((t) => [t, strength(t, s.name)] as const).filter(([, n]) => n > 0);
+    if (!matched.length) continue;
+    withSymbols.add(s.path);
+    hits.push({
+      kind: 'symbol', path: s.path, name: s.name, symbolKind: s.kind, lines: s.lines, exported: s.exported,
+      matched: matched.map(([t]) => t), score: matched.reduce((n, [, x]) => n + x, 0), ...around(s.path, s.name),
+    });
+  }
+  for (const f of map.files) {
+    if (!usable(f) || withSymbols.has(f.path)) continue;
+    const segments = f.path.split('/');
+    const name = segments.pop()!.replace(/\.[^.]+$/, '');
+    const matched = want
+      .map((t) => [t, Math.max(strength(t, name), ...segments.map((d) => Math.min(1, strength(t, d))))] as const)
+      .filter(([, n]) => n > 0);
+    if (!matched.length) continue;
+    hits.push({
+      kind: 'file', path: f.path, name: null, symbolKind: null, lines: null, exported: false,
+      matched: matched.map(([t]) => t), score: matched.reduce((n, [, x]) => n + x, 0), ...around(f.path, null),
+    });
+  }
+  hits.sort((a, b) => b.score - a.score || Number(b.exported) - Number(a.exported) || b.dependents - a.dependents || cmp(a.path, b.path) || cmp(a.name ?? '', b.name ?? ''));
+  const perFile = new Map<string, number>();
+  const out: CodeMapHit[] = [];
+  for (const h of hits) {
+    const n = perFile.get(h.path) ?? 0;
+    if (n >= PER_FILE) continue;
+    perFile.set(h.path, n + 1);
+    out.push(h);
+    if (out.length >= limit) break;
+  }
+  return out;
 }

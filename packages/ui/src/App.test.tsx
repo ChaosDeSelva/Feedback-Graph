@@ -5,15 +5,25 @@ import { App } from './App.tsx';
 beforeEach(() => { vi.stubGlobal('fetch', vi.fn(async () => Response.json([]))); location.hash = ''; });
 afterEach(() => { cleanup(); vi.unstubAllGlobals(); });
 
+test('the Dashboard is the first page in the sidebar and the one the app opens on', async () => {
+  render(<App />);
+  const labels = screen.getAllByRole('button').map((b) => b.textContent);
+  expect(labels.indexOf('Dashboard')).toBeLessThan(labels.indexOf('Inbox'));
+  expect(screen.getByRole('button', { name: 'Dashboard' }).getAttribute('aria-current')).toBe('page');
+  expect(screen.getByRole('heading', { name: 'Dashboard', level: 1 })).toBeTruthy();
+  await act(async () => {});
+  expect(location.hash).toBe('#dashboard');
+});
+
 test('changing the URL hash (links, back button) switches the page', async () => {
   render(<App />);
-  expect(screen.getByRole('button', { name: 'Inbox' }).getAttribute('aria-current')).toBe('page');
+  expect(screen.getByRole('button', { name: 'Dashboard' }).getAttribute('aria-current')).toBe('page');
   await act(async () => {
     location.hash = 'activity';
     window.dispatchEvent(new HashChangeEvent('hashchange'));
   });
   expect(screen.getByRole('button', { name: 'Activity' }).getAttribute('aria-current')).toBe('page');
-  expect(screen.getByRole('button', { name: 'Inbox' }).getAttribute('aria-current')).toBeNull();
+  expect(screen.getByRole('button', { name: 'Dashboard' }).getAttribute('aria-current')).toBeNull();
 });
 
 test('a link to one item (#lessons/<id>) opens its page and keeps the id in the hash', async () => {
@@ -237,6 +247,7 @@ test('the first-run panel shows on an empty Inbox, Lessons and Graph, not on oth
     if (url === '/api/session') return Response.json({ authRequired: false, authenticated: true });
     return Response.json([]);
   }));
+  location.hash = '#inbox';
   render(<App />);
   expect(await screen.findByRole('region', { name: 'pipeline' })).toBeTruthy();
   await act(async () => { screen.getByRole('button', { name: 'Lessons' }).click(); });

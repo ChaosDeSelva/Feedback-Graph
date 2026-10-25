@@ -52,10 +52,22 @@ test('status says which model is unavailable and why, and how many turns the cla
     postmortem: { provider: 'claude-cli', ok: true, reason: null },
     scan: { provider: 'ollama:gemma4', ok: true, reason: null },
     summary: { provider: null, ok: true, reason: null },
-    // A worker from before the docs reader does not report one: unknown, not broken.
+    // A worker from before the docs reader (or Ask) does not report one: unknown, not broken.
     docs: { provider: null, ok: true, reason: null },
+    chat: { provider: null, ok: true, reason: null },
   });
   expect(s.givenUpTurns).toBe(7);
+});
+
+test("the Ask model is a job of its own: the worker reports its default provider and how it last fared", async () => {
+  const w: WorkerStatus = {
+    ...beat(10_000),
+    providers: { classify: 'ollama:gemma4', chat: 'claude-cli' },
+    health: { chat: { provider: 'claude-cli', ok: false, reason: 'claude is not signed in (401)', at: 't' } },
+  };
+  const app = createApp(repo, { system: { version: '0.5.0', ping: async () => true, worker: async () => w } });
+  const s = await (await app.request('/api/status')).json();
+  expect(s.models.chat).toEqual({ provider: 'claude-cli', ok: false, reason: 'claude is not signed in (401)', since: 't', checkedAt: 't' });
 });
 
 test('a worker that runs without a classifier reports it unavailable; no worker reports no model health', async () => {
@@ -79,6 +91,7 @@ test('status reports whether Ollama answers; an Ollama job is unavailable while 
     scan: { provider: 'ollama:gemma4', ok: false, reason: down.reason },
     summary: { provider: null, ok: true, reason: null },
     docs: { provider: null, ok: true, reason: null },
+    chat: { provider: null, ok: true, reason: null },
   });
   const up = createApp(repo, { system: { version: '0.2.0', ping: async () => true, worker: async () => w, ollama: async () => ({ ...down, ok: true, reason: null }) } });
   const u = await (await up.request('/api/status')).json();

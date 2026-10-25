@@ -19,6 +19,9 @@ const SCHEMA = {
   required: ['label', 'confidence', 'summary'],
 };
 
+/** A label, a confidence and a one-line summary: a few dozen tokens; more is a runaway answer. */
+const CLASSIFY_MAX_TOKENS = 256;
+
 const SYSTEM = `You label one message a developer sent to an AI coding agent, right after the agent did some work.
 Labels:
 - pushback: the developer says the agent's work is wrong, incomplete, broken, or not what they asked for.
@@ -91,7 +94,7 @@ export function describeTurn(turn: HumanTurn): string {
 export async function classifyTurn(turn: HumanTurn, llm: LlmProvider, onFailure?: (error: string) => void): Promise<Classification | null> {
   try {
     // Only the turn is sent: an agentic classifier gets an empty folder, not the worker's.
-    const r = await askJson(llm, { system: SYSTEM, user: describeTurn(turn), schema: SCHEMA, timeoutMs: 120_000 }, (raw) => Result.parse(raw), { promptOnly: true });
+    const r = await askJson(llm, { system: SYSTEM, user: describeTurn(turn), schema: SCHEMA, timeoutMs: 120_000, maxTokens: CLASSIFY_MAX_TOKENS }, (raw) => Result.parse(raw), { promptOnly: true });
     return { ...r, label: r.label as Classification['label'], signals: prefilterPushback(turn.text).signals };
   } catch (err) {
     const unavailable = providerUnavailableReason(err);

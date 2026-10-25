@@ -69,6 +69,8 @@ const Bundle = z.object({
 });
 export type ImportBundle = z.infer<typeof Bundle>;
 export const parseBundle = (json: unknown) => Bundle.safeParse(json);
+/** For the OpenAPI document (openapi.ts). */
+export const importSchemas = { Bundle };
 
 async function embedAll(texts: string[], embed: ImportDeps['embed']): Promise<number[][]> {
   const out: number[][] = [];

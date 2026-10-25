@@ -68,6 +68,20 @@ const rowOf = (key: string) => screen.getByRole('row', { name: key });
 const box = (key: string) => screen.getByRole('checkbox', { name: `read ${key}` }) as HTMLInputElement;
 const shown = () => screen.queryAllByRole('checkbox').map((c) => c.getAttribute('aria-label')!.replace('read ', ''));
 
+test('the comments skipped before the classifier are listed right under Integrations, where comments are set up', async () => {
+  const base = fetch as unknown as (url: string, init?: RequestInit) => Promise<Response>;
+  const svc = { connection: { state: 'not_connected', source: null, detail: 'Not connected.', href: '#settings/integrations-github' }, envSet: false, envVar: 'GITHUB_TOKEN', savedInApp: false, account: null, checkedAt: null, lastSyncAt: null, lastError: null, errorKind: null, rateLimitedUntil: null };
+  vi.stubGlobal('fetch', vi.fn(async (url: string, init?: RequestInit) =>
+    url === '/api/settings/integrations' ? Response.json({ canSave: true, syncMinutes: 10, github: svc, linear: { ...svc, envVar: 'LINEAR_API_KEY' }, projects: [] })
+      : url === '/api/cloud' ? Response.json({ enabled: false, host: null, intervalMinutes: 60, suggestions: false, projects: [], preview: null, previewError: null, last: null, nextAt: null, neverSent: 'x' })
+      : base(url, init)));
+  render(<Settings />);
+  const rules = await screen.findByRole('list', { name: 'comments skipped before the classifier' });
+  const section = rules.closest('section')!;
+  await screen.findByText('Cloud sync');
+  await waitFor(() => expect(section.previousElementSibling?.id).toBe('settings-integrations-section'));
+});
+
 test('lists every candidate folder with its path, remote, counts and status chips', async () => {
   render(<Settings />);
   await screen.findByRole('row', { name: 'demo-shop' });

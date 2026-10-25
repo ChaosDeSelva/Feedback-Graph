@@ -1,4 +1,4 @@
-import { cleanup, render, screen, within } from '@testing-library/react';
+import { cleanup, fireEvent, render, screen, within } from '@testing-library/react';
 import { afterEach, beforeEach, expect, test, vi } from 'vitest';
 import type { PipelineStatus } from '@fb/core';
 import { FirstRun, stageLine } from './FirstRun.tsx';
@@ -30,22 +30,37 @@ test('while the Inbox is empty, the panel shows every stage, linked to its page,
   expect(w.getByText(/Classifying turns: 3 of 50, for 2m 10s/)).toBeTruthy();
   const row = (name: RegExp) => w.getByRole('link', { name });
   expect(row(/Sessions read\s*12/).getAttribute('href')).toBe('#sessions');
-  expect(row(/Turns to classify\s*1000\+/).getAttribute('href')).toBe('#activity');
+  expect(row(/Turns to classify\s*1000\+/).getAttribute('href')).toBe('#activity/candidate_flagged');
   expect(row(/Inbox, waiting on you\s*0/).getAttribute('href')).toBe('#inbox');
-  expect(row(/Post-mortems queued\s*2/).getAttribute('href')).toBe('#activity');
+  expect(row(/Post-mortems queued\s*2/).getAttribute('href')).toBe('#inbox/confirmed');
   expect(row(/Lessons\s*0 proposed, 0 approved/).getAttribute('href')).toBe('#lessons');
   expect(row(/Project scans\s*1 done, 1 running, 4 queued, 2 never/).getAttribute('href')).toBe('#projects');
 });
 
-test('a page that has something to show gets no panel', async () => {
+test('once a page has something to show, the panel folds to one line: the stage now and the backlog, with the stages on request', async () => {
   served = pipeline({ inbox: { pending: 3, confirmed: 0 } });
-  const { container } = render(<FirstRun view="inbox" now={() => NOW} />);
-  await new Promise((r) => setTimeout(r, 0));
-  await Promise.resolve();
-  expect(container.textContent).toBe('');
+  render(<FirstRun view="inbox" now={() => NOW} />);
+  const panel = await screen.findByRole('region', { name: 'pipeline' });
+  expect(panel.textContent).toMatch(/Classifying turns: 3 of 50/);
+  expect(panel.textContent).toMatch(/1000\+ turns to classify/);
+  expect(panel.textContent).toMatch(/2 post-mortems queued/);
+  expect(within(panel).queryByRole('link', { name: /Sessions read/ })).toBeNull();
+  fireEvent.click(within(panel).getByRole('button', { name: 'show stages' }));
+  expect(within(panel).getByRole('link', { name: /Sessions read\s*12/ })).toBeTruthy();
   cleanup();
   render(<FirstRun view="lessons" now={() => NOW} />);
-  expect(await screen.findByRole('region', { name: 'pipeline' })).toBeTruthy();
+  expect(await screen.findByText(/nothing to show here yet/)).toBeTruthy();
+});
+
+test('an empty state filtered to one project asks for that project\'s counts and shows the whole panel', async () => {
+  served = pipeline({ inbox: { pending: 0, confirmed: 0 } });
+  const urls: string[] = [];
+  vi.stubGlobal('fetch', vi.fn(async (url: string) => { urls.push(url); return Response.json(served); }));
+  render(<FirstRun view="inbox" project="demo-shop" force now={() => NOW} />);
+  const panel = await screen.findByRole('region', { name: 'pipeline' });
+  expect(urls).toContain('/api/pipeline?project=demo-shop');
+  expect(panel.textContent).toMatch(/demo-shop/);
+  expect(within(panel).getByRole('link', { name: /Inbox, waiting on you\s*0/ })).toBeTruthy();
 });
 
 test('stage lines read plainly, with or without counts, and say when the worker is offline', () => {
@@ -53,4 +68,6 @@ test('stage lines read plainly, with or without counts, and say when the worker 
   expect(stageLine(pipeline({ stage: { name: 'scan', startedAt: '2026-10-24T10:02:00Z', current: 'demo-shop' }, progress: null }), NOW)).toBe('Scanning a project, for 10s (demo-shop)');
   expect(stageLine(pipeline({ stage: { name: 'waiting', startedAt: '2026-10-24T09:02:10Z', current: null }, progress: null }), NOW)).toBe('Waiting for new work, for 1h 0m');
   expect(stageLine(pipeline({ stage: null, progress: null }), NOW)).toBe('The worker is not reporting (offline, or older than this page)');
+  // A stage with nothing counted yet never reads "0 of 0".
+  expect(stageLine(pipeline({ progress: { done: 0, total: 0 } }), NOW)).toBe('Classifying turns, for 2m 10s (turn-9)');
 });

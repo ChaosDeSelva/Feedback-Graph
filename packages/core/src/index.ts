@@ -33,3 +33,5 @@ export * from './sessions.ts';
 export * from './graph/sessions.ts';
 export * from './relevance.ts';
 export * from './feedbackRules.ts';
+export * from './chat.ts';
+export * from './graph/chat.ts';

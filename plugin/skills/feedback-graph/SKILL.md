@@ -16,6 +16,12 @@ Call `get_task_context` with your current working directory (`cwd`), a one or tw
 - **Recent sessions** say what earlier sessions in this project did and left open. When you are picking up or continuing earlier work, call `get_recent_sessions` with `cwd` for their full summaries. They are summaries a model wrote: check anything that matters against the code.
 - If the tool says the directory is not a tracked project, carry on normally.
 
+## When the developer pastes a prompt from Ask
+
+A prompt copied from the Feedback Graph's Ask page ends with its sources and a "Feedback Graph MCP" section. Treat the
+sources as where to look, not as proven: read the files it names before relying on them, and follow the MCP steps it
+lists (they are the same as the steps below).
+
 ## Before you change a file
 
 - A file you do not know well: call `get_module_context` with `cwd` and its `path`. It says what the file is, its exported symbols, who imports it, what it imports, the tests that cover it, and the lessons and past misses tied to it.

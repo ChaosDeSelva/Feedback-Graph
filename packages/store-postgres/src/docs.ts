@@ -21,12 +21,12 @@ export class PgDocsStore implements DocsStore {
     await tx(this.db, async (c) => {
       await c.query('INSERT INTO projects (key) VALUES ($1) ON CONFLICT DO NOTHING', [doc.projectKey]);
       await c.query(
-        `INSERT INTO docs (id, project_key, source, ref, title, url, added_at, kind, media_type, read_status, read_attempts, read_error, read_retry_at, read_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 0, NULL, NULL, NULL)
+        `INSERT INTO docs (id, project_key, source, ref, title, url, added_at, kind, media_type, read_status, read_attempts, read_error, read_retry_at, read_at, added_by)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 0, NULL, NULL, NULL, $11)
          ON CONFLICT (id) DO UPDATE SET project_key = EXCLUDED.project_key, source = EXCLUDED.source, ref = EXCLUDED.ref,
-           title = EXCLUDED.title, url = EXCLUDED.url, added_at = EXCLUDED.added_at, kind = EXCLUDED.kind, media_type = EXCLUDED.media_type,
+           title = EXCLUDED.title, url = EXCLUDED.url, added_at = EXCLUDED.added_at, added_by = EXCLUDED.added_by, kind = EXCLUDED.kind, media_type = EXCLUDED.media_type,
            read_status = EXCLUDED.read_status, read_attempts = 0, read_error = NULL, read_retry_at = NULL, read_at = NULL`,
-        [id, doc.projectKey, doc.source, doc.ref, doc.title, doc.url ?? null, new Date(), o.image ? 'image' : 'text', o.image?.mediaType ?? null, o.read ? 'pending' : null],
+        [id, doc.projectKey, doc.source, doc.ref, doc.title, doc.url ?? null, new Date(), o.image ? 'image' : 'text', o.image?.mediaType ?? null, o.read ? 'pending' : null, o.addedBy ?? null],
       );
       // A new version of the document: what was read from the old one goes.
       await c.query('DELETE FROM facts WHERE doc_id = $1', [id]);
@@ -55,7 +55,7 @@ export class PgDocsStore implements DocsStore {
     );
     return rows.map((r) => ({
       id: r.id, projectKey: r.project_key, source: r.source, ref: r.ref, title: r.title, url: r.url ?? null,
-      addedAt: iso(r.added_at)!, chunks: r.chunks, kind: r.kind, mediaType: r.media_type ?? null,
+      addedAt: iso(r.added_at)!, addedBy: r.added_by ?? null, chunks: r.chunks, kind: r.kind, mediaType: r.media_type ?? null,
       read: r.read_status
         ? { status: r.read_status, attempts: r.read_attempts, error: r.read_error ?? null, retryAt: iso(r.read_retry_at), readAt: iso(r.read_at), facts: r.facts }
         : null,
@@ -144,6 +144,15 @@ export class PgDocsStore implements DocsStore {
 
   async requeueStaleDocs(): Promise<void> {
     await this.db.pool.query(`UPDATE docs SET read_status = 'pending' WHERE read_status = 'reading'`);
+  }
+
+  async requeueDocRead(id: string): Promise<boolean> {
+    const { rowCount } = await this.db.pool.query(
+      `UPDATE docs SET read_status = 'pending', read_attempts = 0, read_error = NULL, read_retry_at = NULL
+       WHERE id = $1 AND read_status IN ('failed', 'pending')`,
+      [id],
+    );
+    return (rowCount ?? 0) > 0;
   }
 
   async docImage(id: string): Promise<TaskImage | null> {

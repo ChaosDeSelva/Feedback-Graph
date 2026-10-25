@@ -6,7 +6,7 @@ import { api, CLEANUP_CONFIRM, type ProjectCandidate, type ProjectSettings } fro
 import { useUnsavedChanges } from './unsaved.ts';
 import { ConfirmDialog } from './ui/ConfirmDialog.tsx';
 import { PageHeader } from './ui/PageHeader.tsx';
-import { Button, Input, Select } from './ui/controls.tsx';
+import { Button, CopyButton, Input, Select } from './ui/controls.tsx';
 import { ago, Alert, Badge, EmptyState, plural, Skeleton, SkeletonList, tdClass, thClass } from './ui/display.tsx';
 import { ChevronIcon, FolderIcon, SearchIcon } from './ui/icons.tsx';
 
@@ -274,8 +274,9 @@ export function Settings() {
 
           {data && <Sources data={data} onSaved={setData} onError={setError} />}
           {data && <Integrations />}
-          {data && <CloudSync />}
+          {/* Right under Integrations: the comments it syncs are what these rules skip. */}
           {data && <Prefilters />}
+          {data && <CloudSync />}
           {data && <Cleanup data={data} dirty={dirty} onDone={load} onError={setError} />}
         </div>
       </div>
@@ -393,7 +394,6 @@ function Sources({ data, onSaved, onError }: { data: ProjectSettings; onSaved: (
   const [adding, setAdding] = useState('');
   const [confirming, setConfirming] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
-  const [copied, setCopied] = useState(false);
 
   async function save(next: string[]) {
     setBusy(true);
@@ -402,20 +402,10 @@ function Sources({ data, onSaved, onError }: { data: ProjectSettings; onSaved: (
       onSaved(await api.saveProjectRoots(next));
       setAdding('');
       setConfirming(null);
-      setCopied(false);
     } catch (e) {
       onError(message(e));
     } finally {
       setBusy(false);
-    }
-  }
-
-  async function copy() {
-    try {
-      await navigator.clipboard.writeText(APPLY_ROOTS);
-      setCopied(true);
-    } catch {
-      onError(`Could not copy; run ${APPLY_ROOTS} in the Feedback Graph folder on the host.`);
     }
   }
 
@@ -429,7 +419,7 @@ function Sources({ data, onSaved, onError }: { data: ProjectSettings; onSaved: (
           <span className="min-w-0 flex-1">
             Saved. Run <code className="font-mono font-semibold">{APPLY_ROOTS}</code> to mount these folders (restarts the containers).
           </span>
-          <Button size="sm" onClick={copy}>{copied ? 'Copied' : 'Copy command'}</Button>
+          <CopyButton text={APPLY_ROOTS} label="Copy command" onError={() => onError(`Could not copy; run ${APPLY_ROOTS} in the Feedback Graph folder on the host.`)} />
         </div>
       )}
       <div className="grid gap-3 rounded-md border border-line bg-surface p-4 shadow-card md:grid-cols-2">

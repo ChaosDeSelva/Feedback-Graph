@@ -1,11 +1,11 @@
-import type { ProjectSummary } from '@fb/core';
+import { shownProjects, type ProjectLink, type ProjectSummary } from '@fb/core';
 import { expect, test } from 'vitest';
 import { createApp, type ApiRepo } from './app.ts';
 
 const repo = { listCandidates: async () => [], candidateDetail: async () => null, decide: async () => {}, stats: async () => [] } as unknown as ApiRepo;
 const summary = (key: string, facts = 0, over: Partial<ProjectSummary> = {}): ProjectSummary => ({ key, repoPath: `/vibe/${key}`, remote: null, aliases: [], sessions: 2, feedback: 1, lessons: 1, facts, lastScan: null, pinned: false, ...over });
 
-function setup(projects = [summary('alpha', 5)]) {
+function setup(projects = [summary('alpha', 5)], dirs: { key: string; name: string; repoPath: string; remote?: string | null }[] = [{ key: 'alpha', name: 'alpha', repoPath: '/vibe/alpha' }, { key: 'beta', name: 'beta', repoPath: '/vibe/beta' }]) {
   const calls: unknown[][] = [];
   const facts = {
     listProjects: async () => projects,
@@ -19,7 +19,7 @@ function setup(projects = [summary('alpha', 5)]) {
   const app = createApp(repo, {
     facts,
     embed: async (t) => t.map(() => [1]),
-    projectDirs: async () => [{ key: 'alpha', name: 'alpha', repoPath: '/vibe/alpha' }, { key: 'beta', name: 'beta', repoPath: '/vibe/beta' }],
+    projectDirs: async () => dirs,
     activity: { record: async (a) => { activity.push(a); }, list: async () => [] },
   });
   return { app, calls, activity };
@@ -37,6 +37,25 @@ test('GET /api/projects shows each remote, and a folder that is a clone of a pro
   const { app } = setup([summary('alpha', 5, { remote: 'github.com/org/alpha', aliases: ['beta'] })]);
   const list = (await (await app.request('/api/projects')).json()) as ProjectSummary[];
   expect(list.map((p) => [p.key, p.remote, p.aliases])).toEqual([['alpha', 'github.com/org/alpha', ['beta']]]);
+});
+
+test('a record a scan or code map made (no path, no remote) is joined with its selected folder', async () => {
+  const { app } = setup(
+    [summary('alpha', 5, { repoPath: '', remote: null }), summary('kept', 1, { remote: 'github.com/org/kept' })],
+    [{ key: 'alpha', name: 'alpha', repoPath: '/vibe/alpha', remote: 'github.com/org/alpha' }, { key: 'kept', name: 'kept', repoPath: '/vibe/other', remote: 'github.com/org/other' }],
+  );
+  const list = (await (await app.request('/api/projects')).json()) as ProjectSummary[];
+  expect(list.map((p) => [p.key, p.repoPath, p.remote])).toEqual([
+    ['alpha', '/vibe/alpha', 'github.com/org/alpha'],
+    // What the record knows wins: the folder only fills what is missing.
+    ['kept', '/vibe/kept', 'github.com/org/kept'],
+  ]);
+});
+
+test('a folder with no data yet carries the remote its folder has', async () => {
+  const { app } = setup([], [{ key: 'beta', name: 'beta', repoPath: '/vibe/beta', remote: 'github.com/org/beta' }]);
+  const list = (await (await app.request('/api/projects')).json()) as ProjectSummary[];
+  expect(list).toEqual([expect.objectContaining({ key: 'beta', repoPath: '/vibe/beta', remote: 'github.com/org/beta' })]);
 });
 
 test('folders with no data yet are listed with no remote', async () => {
@@ -102,4 +121,23 @@ test('a listed project with data but no folder under the roots can be pinned too
   const { app, calls } = setup([summary('alpha', 5), summary('imported', 3, { repoPath: '/examples/imported' })]);
   expect((await app.request('/api/projects/imported/pin', json('PUT', { pinned: true }))).status).toBe(204);
   expect(calls).toEqual([['pin', { key: 'imported', name: 'imported', repoPath: '/examples/imported' }, true]]);
+});
+
+test('GET /api/projects counts each project\'s confirmed links whose other end is shown', async () => {
+  const link = (a: string, b: string, status: ProjectLink['status']) => ({ id: `link:${a}|${b}`, a, b, status }) as ProjectLink;
+  const all = [link('alpha', 'beta', 'confirmed'), link('alpha', 'gamma', 'suggested'), link('alpha', 'secret', 'confirmed'), link('beta', 'gamma', 'dismissed')];
+  const app = createApp(repo, {
+    facts: { listProjects: async () => [summary('alpha', 5)] } as never,
+    projectDirs: async () => [{ key: 'alpha', name: 'alpha', repoPath: '/vibe/alpha' }, { key: 'beta', name: 'beta', repoPath: '/vibe/beta' }],
+    links: { listLinks: async () => all, setLink: async () => all[0], deleteLink: async () => true },
+    shown: () => shownProjects({ tracked: ['alpha', 'beta', 'gamma'], initialized: true }, { excludeProjects: [] }),
+  });
+  const list = (await (await app.request('/api/projects')).json()) as ProjectSummary[];
+  expect(list.map((p) => [p.key, p.links])).toEqual([['alpha', 1], ['beta', 1]]);
+});
+
+test('GET /api/projects leaves the link count out when there is no links store', async () => {
+  const { app } = setup();
+  const list = (await (await app.request('/api/projects')).json()) as ProjectSummary[];
+  expect(list[0].links).toBeUndefined();
 });

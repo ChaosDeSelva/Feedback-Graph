@@ -5,6 +5,8 @@
  * Owner decisions (selecting projects, scans, Inbox decisions, lessons, Sync now) need FG_OPERATOR_TOKEN, and the API
  * allows only the verbs OPERATOR_ALLOW names. Without it, API_TOKEN (when set) signs in for reading.
  */
+import { readFile } from 'node:fs/promises';
+import { basename, extname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 export type CliIO = {
@@ -13,24 +15,56 @@ export type CliIO = {
   out: (line: string) => void;
   err: (line: string) => void;
   sleep: (ms: number) => Promise<void>;
+  /** For fg docs upload; default: the file system. */
+  readFile?: (path: string) => Promise<Buffer>;
+  /** For fg integrations set --from-stdin; default: all of standard input. */
+  readStdin?: () => Promise<string>;
 };
+
+async function allOfStdin(): Promise<string> {
+  const parts: Buffer[] = [];
+  for await (const chunk of process.stdin) parts.push(chunk as Buffer);
+  return Buffer.concat(parts).toString('utf8');
+}
 
 const USAGE = `fg: drive Feedback Graph from a terminal or an agent
 
 Usage:
-  fg status [--watch [--interval 5]]
-  fg projects list
-  fg projects select --all | --key k1,k2 [--only]    add folders to the selection (--only: exactly these)
+  fg status [--watch [--interval 5]] [--until idle|<stage> [--timeout s]]   stages: sync ingest classify postmortem scan docs waiting
+  fg pipeline                                    every stage's backlog
+  fg projects list [--with-sessions]             every folder (--with-sessions: only those with sessions): selected, pinned, counts, last scan, links
+  fg projects select --all | --key k1,k2 | --with-sessions [--only]    add folders to the selection (--only: exactly these;
+                                                 --with-sessions: only folders with Claude or Codex sessions)
   fg projects unselect --key k1,k2
-  fg scan --all | --key k1,k2 [--provider codex-cli]
-  fg inbox list [--status pending|confirmed|rejected] [--project k] [--limit n]
+  fg scan --all | --key k1,k2 [--provider codex-cli] [--wait [--timeout s]]
+  fg inbox list [--status pending|confirmed|rejected] [--source claude|codex|github|linear] [--project k] [--limit n]
+  fg inbox show <id>
   fg inbox confirm|reject <id> [<id> ...] [--reason "..."]
   fg lessons list [--status proposed|approved|rejected|superseded] [--project k]
+  fg lessons show <id>
   fg lessons approve|reject <id>
-  fg cloud sync-now
+  fg lessons to-fact <id> [--kind convention] [--relevance 0.8]   file a lesson that states how the code is as a project fact you wrote; rejects the lesson
+  fg map rebuild <key>                               remap a project's code from scratch at the worker's next pass
+  fg links list --project k
+  fg links confirm|dismiss <a> <b> [--relation depends_on|related] [--note "..."]
+  fg facts list --project k [--kind k] [--q "search"]
+  fg facts relevance <id> <0..1> --project k
+  fg docs list --project k
+  fg docs upload <file> --project k [--title "..."]   text, or a png/jpeg/webp/gif image
+  fg activity [--project k] [--kind k] [--limit n]
+  fg sessions [--project k] [--limit n]
+  fg cloud status
+  fg cloud sync-now [--force]                    sends what changed since the last sync (--force: everything)
+  fg integrations status
+  fg integrations set github|linear --from-stdin   the token from standard input (never an argument; needs integrations in OPERATOR_ALLOW)
+  fg integrations test github|linear
+  fg doctor                                      ./scripts/doctor.sh (run by scripts/fg on the host)
+  fg setup [args]                                ./scripts/setup.sh with those arguments (run by scripts/fg on the host)
 
 Options:
   --json           print the API's JSON instead of a table
+  --wait           fg scan: follow each job until it is done or failed (exit 1 if any failed)
+  --until <what>   fg status: poll until idle (waiting, nothing queued) or that stage; --timeout s gives up (exit 1)
   --as <name>      the agent name Activity records (default: FG_OPERATOR_NAME, else fg)
   --url <url>      the API (default: FEEDBACK_GRAPH_URL, else http://localhost:8787)
   --help           this text
@@ -44,11 +78,15 @@ Environment:
 
 // ── Arguments ──────────────────────────────────────────────────────────
 
-type Flags = { json?: true; watch?: true; all?: true; only?: true; help?: true; key?: string[]; provider?: string; status?: string; project?: string; limit?: string; reason?: string; interval?: string; as?: string; url?: string };
+type Flags = {
+  json?: true; watch?: true; all?: true; only?: true; help?: true; wait?: true; force?: true; 'from-stdin'?: true; 'with-sessions'?: true;
+  key?: string[]; provider?: string; status?: string; project?: string; limit?: string; reason?: string; interval?: string; as?: string; url?: string;
+  until?: string; timeout?: string; kind?: string; q?: string; title?: string; note?: string; relation?: string; source?: string; relevance?: string;
+};
 export type Parsed = { words: string[]; flags: Flags };
 
-const BOOLEAN = new Set(['json', 'watch', 'all', 'only', 'help']);
-const VALUED = new Set(['key', 'provider', 'status', 'project', 'limit', 'reason', 'interval', 'as', 'url']);
+const BOOLEAN = new Set(['json', 'watch', 'all', 'only', 'help', 'wait', 'force', 'from-stdin', 'with-sessions']);
+const VALUED = new Set(['key', 'provider', 'status', 'project', 'limit', 'reason', 'interval', 'as', 'url', 'until', 'timeout', 'kind', 'q', 'title', 'note', 'relation', 'source', 'relevance']);
 
 export function parse(argv: string[]): Parsed {
   const words: string[] = [];
@@ -79,6 +117,8 @@ const PLAIN_HTTP_OK = new Set(['localhost', '127.0.0.1', '[::1]', 'host.docker.i
 /** Server text (errors, summaries, model reasons) printed as text, never as terminal escapes. Keeps tabs and newlines. */
 const printable = (s: string) => s.replace(/[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/g, '');
 
+type Api = ReturnType<typeof client>;
+
 function client(io: CliIO, flags: Flags) {
   const base = (flags.url ?? io.env.FEEDBACK_GRAPH_URL ?? 'http://localhost:8787').replace(/\/+$/, '');
   const token = io.env.FG_OPERATOR_TOKEN?.trim() || io.env.API_TOKEN?.trim() || '';
@@ -91,9 +131,19 @@ function client(io: CliIO, flags: Flags) {
       throw new UsageError(`refusing to send the token to ${u.host} over ${u.protocol.replace(':', '')}: use https:// for another machine`);
     }
   }
-  return async <T = unknown>(method: string, path: string, body?: unknown): Promise<T> => {
-    const headers: Record<string, string> = { accept: 'application/json', 'x-fg-operator': name };
-    if (token) headers.authorization = `Bearer ${token}`;
+  const authHeaders = (): Record<string, string> => ({ 'x-fg-operator': name, ...(token && { authorization: `Bearer ${token}` }) });
+  /** A server-sent event stream; null when the API has none there (an older version) or cannot be reached. */
+  const events = async (path: string): Promise<{ events: AsyncGenerator<SseEvent>; close(): void } | null> => {
+    const ctl = new AbortController();
+    const res = await io.fetch(`${base}${path}`, { headers: { ...authHeaders(), accept: 'text/event-stream' }, signal: ctl.signal }).catch(() => null);
+    if (!res?.ok || !res.body || !res.headers.get('content-type')?.startsWith('text/event-stream')) {
+      await res?.body?.cancel().catch(() => {});
+      return null;
+    }
+    return { events: readSse(res.body), close: () => ctl.abort() };
+  };
+  const api = async <T = unknown>(method: string, path: string, body?: unknown): Promise<T> => {
+    const headers: Record<string, string> = { accept: 'application/json', ...authHeaders() };
     if (body !== undefined) headers['content-type'] = 'application/json';
     let res: Response;
     try {
@@ -112,6 +162,36 @@ function client(io: CliIO, flags: Flags) {
     }
     return data as T;
   };
+  return Object.assign(api, { events });
+}
+
+type SseEvent = { event: string; data: string };
+
+/** The events of a text/event-stream body, as they complete; comments (heartbeats) and retry hints are skipped. */
+async function* readSse(body: ReadableStream<Uint8Array>): AsyncGenerator<SseEvent> {
+  const reader = body.getReader();
+  const dec = new TextDecoder();
+  let buf = '';
+  try {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) return;
+      buf += dec.decode(value, { stream: true }).replace(/\r\n?/g, '\n');
+      for (let end = buf.indexOf('\n\n'); end !== -1; end = buf.indexOf('\n\n')) {
+        const block = buf.slice(0, end);
+        buf = buf.slice(end + 2);
+        let event = 'message';
+        const data: string[] = [];
+        for (const line of block.split('\n')) {
+          if (line.startsWith('event:')) event = line.slice(6).trim();
+          else if (line.startsWith('data:')) data.push(line.slice(5).replace(/^ /, ''));
+        }
+        if (data.length) yield { event, data: data.join('\n') };
+      }
+    }
+  } finally {
+    await reader.cancel().catch(() => {});
+  }
 }
 
 const qs = (o: Record<string, string | undefined>) => {
@@ -134,59 +214,232 @@ export function table(head: string[], rows: (string | number | null | undefined)
 // ── Commands ───────────────────────────────────────────────────────────
 
 type Candidate = { key: string; path: string; exists: boolean; tracked: boolean; excluded: boolean; aliasOf: string | null; claudeSessions: number; codexSessions: number };
+/** A folder with Claude Code or Codex sessions on disk (what Settings counts for it). */
+const hasSessions = (c: Pick<Candidate, 'claudeSessions' | 'codexSessions'>) => (c.claudeSessions ?? 0) + (c.codexSessions ?? 0) > 0;
 type Settings = { tracked: string[]; candidates: Candidate[] };
 
-function statusLines(s: Record<string, any>): string[] {
+/** An ISO time as `2026-10-25 03:38:29` (UTC, as the API gives it). */
+const at = (iso: string | null | undefined) => (iso ? iso.replace('T', ' ').replace(/(\.\d+)?Z$/, '') : '');
+const plural = (n: number, w: string) => `${n} ${w}${n === 1 ? '' : 's'}`;
+const ordinal = (n: number) => `${n}${n % 100 >= 11 && n % 100 <= 13 ? 'th' : ['th', 'st', 'nd', 'rd'][n % 10] ?? 'th'}`;
+
+type Pipeline = Record<string, any>;
+
+/** One line of every stage's backlog, for status. */
+function pipelineLine(p: Pipeline): string {
+  const parts = [];
+  if (p.classify) parts.push(`classify ${p.classify.backlog}${p.classify.capped ? '+' : ''}`);
+  if (p.inbox) parts.push(`inbox ${p.inbox.pending} pending`);
+  if (p.postmortems) parts.push(`postmortems ${p.postmortems.queued}`);
+  if (p.lessons) parts.push(`lessons ${p.lessons.proposed} proposed`);
+  if (p.scans) parts.push(`scans ${p.scans.running} running, ${p.scans.queued} queued${p.scans.failed ? `, ${p.scans.failed} failed` : ''}`);
+  return parts.join(' · ');
+}
+
+function statusLines(s: Record<string, any>, p: Pipeline | null): string[] {
   const w = s.worker;
   const lines = [
     `version   ${s.version ?? '?'}${s.store ? ` (${s.store})` : ''}`,
     `store     ${s.graph === false ? 'NOT answering' : 'ok'}`,
     `worker    ${s.workerHealthy ? 'ok' : w ? 'stale (no heartbeat lately)' : 'not reported'}${w?.lastCycleAt ? `, last cycle ${w.lastCycleAt}` : ''}`,
   ];
+  if (s.stage) {
+    const pr = s.progress;
+    const count = pr ? ` (${pr.total === null ? `${pr.done} done` : `${pr.done} of ${pr.total}`})` : '';
+    lines.push(`stage     ${s.stage.name}${s.stage.current ? ` ${s.stage.current}` : ''}${count} since ${at(s.stage.startedAt)}`);
+  }
+  if (p) lines.push(`pipeline  ${pipelineLine(p)}`);
   if (w?.lastCycle) lines.push(`cycle     ${Object.entries(w.lastCycle).map(([k, v]) => `${k}=${v}`).join(' ')}`);
   if (w?.lastError) lines.push(`error     ${w.lastError}`);
   if (s.selection) lines.push(`projects  ${s.selection.tracked} selected${s.selection.note ? `: ${s.selection.note}` : ''}`);
   for (const [job, m] of Object.entries((s.models ?? {}) as Record<string, any>)) {
-    lines.push(`model     ${job.padEnd(10)} ${m.off ? 'off' : `${m.provider ?? 'none'} ${m.ok ? 'ok' : `UNAVAILABLE: ${m.reason ?? ''}`}`}`);
+    const down = `UNAVAILABLE${m.since ? ` since ${at(m.since)}` : ''}: ${m.reason ?? ''}`;
+    lines.push(`model     ${job.padEnd(10)} ${m.off ? 'off' : `${m.provider ?? 'none'} ${m.ok ? 'ok' : down}`}`);
   }
   if (s.givenUpTurns) lines.push(`given up  ${s.givenUpTurns} turns (re-queue them in the UI)`);
   for (const [name, c] of Object.entries((s.connections ?? {}) as Record<string, any>)) lines.push(`${name.padEnd(9)} ${c.state}: ${c.detail}`);
+  const sync = s.cloud?.syncing;
+  if (sync) lines.push(`syncing   ${sync.done} of ${sync.total} projects${sync.current ? ` (${sync.current})` : ''} since ${at(sync.startedAt)}`);
+  const m = s.cloud?.lastManual;
+  if (m) {
+    const sent = m.sent?.projects ?? 0;
+    lines.push(`sync now  ${at(m.at)} ${m.ok ? 'ok' : `FAILED: ${m.error ?? ''}`}: sent ${plural(sent, 'project')}, ${m.unchanged} unchanged${m.failed ? `, ${m.failed} failed` : ''}`);
+  }
   return lines;
 }
 
-async function status(api: ReturnType<typeof client>, io: CliIO, f: Flags): Promise<number> {
+/** Idle: the worker is waiting, nothing is waiting for the classifier, a post-mortem or a scan, and no Sync now runs. */
+function isIdle(s: Record<string, any>, p: Pipeline | null): boolean {
+  if (s.stage?.name !== 'waiting' || !p) return false;
+  return (p.classify?.backlog ?? 0) === 0 && (p.postmortems?.queued ?? 0) === 0 && (p.scans?.queued ?? 0) === 0 && (p.scans?.running ?? 0) === 0 && !s.cloud?.syncing;
+}
+
+const STAGES = new Set(['sync', 'ingest', 'classify', 'postmortem', 'scan', 'docs', 'waiting']);
+
+const seconds = (raw: string | undefined, d: number, what: string) => {
+  const n = raw === undefined ? d : Number(raw);
+  if (!Number.isFinite(n) || n <= 0) throw new UsageError(`${what} must be a number of seconds above 0`);
+  return n;
+};
+
+async function status(api: Api, io: CliIO, f: Flags): Promise<number> {
   const interval = Math.max(1, Number(f.interval ?? 5)) * 1000;
+  const until = f.until;
+  if (until !== undefined && until !== 'idle' && !STAGES.has(until)) throw new UsageError(`--until takes idle or a stage (${[...STAGES].join(', ')})`);
+  const timeout = f.timeout === undefined ? null : seconds(f.timeout, 0, '--timeout') * 1000;
+  // /api/events says when something changed, so the watch need not poll; an API without it (or a dropped stream) is polled.
+  if (f.watch && until === undefined) await watchEvents(api, io, f);
+  let waited = 0;
   for (;;) {
-    const s = await api<Record<string, unknown>>('GET', '/api/status');
-    if (f.json) io.out(JSON.stringify(s, null, 2));
+    const s = await api<Record<string, any>>('GET', '/api/status');
+    // The backlog is a second call; an older API without it still gets the rest.
+    const p = await api<Pipeline>('GET', '/api/pipeline').catch(() => null);
+    const reached = until === 'idle' ? isIdle(s, p) : until !== undefined && s.stage?.name === until;
+    if (until !== undefined) {
+      if (reached) {
+        io.out(f.json ? JSON.stringify({ ...s, pipeline: p }, null, 2) : `${until === 'idle' ? 'idle' : `stage ${until}`} since ${at(s.stage?.startedAt)}`);
+        return 0;
+      }
+      if (timeout !== null && waited + interval > timeout) {
+        io.err(`fg: still not ${until === 'idle' ? 'idle' : `at stage ${until}`} after ${Math.round(timeout / 1000)} s: ${s.stage ? `stage ${s.stage.name}` : 'no stage reported'}${p ? `; ${pipelineLine(p)}` : ''}`);
+        return 1;
+      }
+    } else if (f.json) io.out(JSON.stringify(s, null, 2));
     else {
       if (f.watch) io.out(`── ${new Date().toISOString()}`);
-      for (const l of statusLines(s)) io.out(l);
+      for (const l of statusLines(s, p)) io.out(l);
     }
-    if (!f.watch) return 0;
+    if (!f.watch && until === undefined) return 0;
     await io.sleep(interval);
+    waited += interval;
   }
 }
 
-async function projects(api: ReturnType<typeof client>, io: CliIO, verb: string | undefined, f: Flags): Promise<number> {
+/** How long fg status --watch waits after a change for the ones that come with it (the stage and the counts), to print once. */
+const SETTLE_MS = 250;
+
+/**
+ * fg status --watch over /api/events: the status again when the stage, a count, a scan or an Ask answer changes (and
+ * only if what it prints changed), and each new Activity entry as a line. Returns when the stream ends or is not there.
+ */
+async function watchEvents(api: Api, io: CliIO, f: Flags): Promise<void> {
+  const stream = await api.events('/api/events');
+  if (!stream) return;
+  try {
+    await follow(stream.events);
+  } finally {
+    // An open stream would keep fg running after an error.
+    stream.close();
+  }
+
+  async function follow(events: AsyncGenerator<SseEvent>) {
+    let last = '';
+    const show = async () => {
+      const s = await api<Record<string, any>>('GET', '/api/status');
+      const p = await api<Pipeline>('GET', '/api/pipeline').catch(() => null);
+      const text = f.json ? JSON.stringify(s, null, 2) : statusLines(s, p).join('\n');
+      if (text === last) return;
+      last = text;
+      if (!f.json) io.out(`── ${new Date().toISOString()}`);
+      io.out(text);
+    };
+    await show();
+    let changed = false;
+    let ended = false;
+    let wake = () => {};
+    const reading = (async () => {
+      try {
+        for await (const e of events) {
+          if (e.event !== 'activity') {
+            changed = true;
+            wake();
+            continue;
+          }
+          const a = JSON.parse(e.data) as { kind: string; subject: string; projectKey: string | null };
+          io.out(f.json ? JSON.stringify({ event: 'activity', data: a }) : `activity  ${a.kind}${a.projectKey ? ` [${a.projectKey}]` : ''}: ${a.subject}`);
+        }
+      } catch { /* a dropped stream: back to polling */ } finally {
+        ended = true;
+        wake();
+      }
+    })();
+    for (;;) {
+      if (!changed && !ended) await new Promise<void>((resolve) => { wake = resolve; });
+      if (!changed) break;
+      await io.sleep(SETTLE_MS);
+      changed = false;
+      await show();
+    }
+    await reading;
+  }
+}
+
+async function pipelineCmd(api: Api, io: CliIO, f: Flags): Promise<number> {
+  const p = await api<Pipeline>('GET', '/api/pipeline');
+  if (f.json) { io.out(JSON.stringify(p, null, 2)); return 0; }
+  const n = (x: unknown) => (x === null || x === undefined ? 'unknown' : String(x));
+  io.out(table(['STAGE', 'COUNT'], [
+    ['worker', p.stage ? `${p.stage.name}${p.stage.current ? ` ${p.stage.current}` : ''} since ${at(p.stage.startedAt)}` : 'not reported'],
+    ['sessions', n(p.sessions)],
+    ['classify', p.classify ? `${p.classify.backlog}${p.classify.capped ? '+' : ''} waiting` : 'unknown'],
+    ['inbox', p.inbox ? `${p.inbox.pending} pending, ${p.inbox.confirmed} confirmed` : 'unknown'],
+    ['postmortems', p.postmortems ? `${p.postmortems.queued} queued` : 'unknown'],
+    ['lessons', p.lessons ? `${p.lessons.proposed} proposed, ${p.lessons.approved} approved` : 'unknown'],
+    ['scans', p.scans ? `${p.scans.done} done, ${p.scans.queued} queued, ${p.scans.running} running, ${p.scans.failed} failed, ${p.scans.never} never` : 'unknown'],
+  ], 100));
+  return 0;
+}
+
+async function projects(api: Api, io: CliIO, verb: string | undefined, f: Flags): Promise<number> {
   if (verb === 'list' || verb === undefined) {
-    const current = await api<Settings>('GET', '/api/settings/projects');
-    if (f.json) { io.out(JSON.stringify(current.candidates, null, 2)); return 0; }
-    io.out(table(['KEY', 'SELECTED', 'SESSIONS', 'NOTE', 'PATH'], current.candidates.map((c) => [
-      c.key, c.tracked ? 'yes' : 'no', c.claudeSessions + c.codexSessions,
-      c.excluded ? 'excluded (EXCLUDE_PROJECTS)' : c.aliasOf ? `clone of ${c.aliasOf}` : !c.exists ? 'folder gone' : '', c.path,
+    // Every folder (Settings) joined with what each shown project holds (/api/projects) and its links.
+    const [current, shown] = await Promise.all([api<Settings>('GET', '/api/settings/projects'), api<any[]>('GET', '/api/projects')]);
+    const byKey = new Map(shown.map((p) => [p.key, p]));
+    const linkCounts = new Map<string, Record<string, number>>();
+    const keys = shown.map((p) => p.key as string);
+    // A few at a time: one request per project.
+    for (let i = 0; i < keys.length; i += 8) {
+      await Promise.all(keys.slice(i, i + 8).map(async (key) => {
+        const links = await api<{ status: string }[]>('GET', `/api/projects/${encodeURIComponent(key)}/links`).catch(() => null);
+        if (!links) return;
+        const n: Record<string, number> = { confirmed: 0, suggested: 0, dismissed: 0 };
+        for (const l of links) n[l.status] = (n[l.status] ?? 0) + 1;
+        linkCounts.set(key, n);
+      }));
+    }
+    const all = [...current.candidates.map((c) => c.key), ...keys.filter((k) => !current.candidates.some((c) => c.key === k))].map((key) => {
+      const c = current.candidates.find((x) => x.key === key);
+      const p = byKey.get(key);
+      return {
+        key, path: c?.path ?? p?.repoPath ?? '', exists: c?.exists ?? true, tracked: c?.tracked ?? true, excluded: c?.excluded ?? false, aliasOf: c?.aliasOf ?? null,
+        claudeSessions: c?.claudeSessions ?? 0, codexSessions: c?.codexSessions ?? 0,
+        pinned: !!p?.pinned, sessions: p?.sessions ?? null, feedback: p?.feedback ?? null, lessons: p?.lessons ?? null, facts: p?.facts ?? null,
+        remote: p?.remote ?? null, lastScan: p?.lastScan ?? null, links: linkCounts.get(key) ?? null,
+      };
+    });
+    // Sessions on disk (Settings), or recorded for a shown project.
+    const rows = f['with-sessions'] ? all.filter((r) => hasSessions(r) || (r.sessions ?? 0) > 0) : all;
+    if (f.json) { io.out(JSON.stringify(rows, null, 2)); return 0; }
+    const scanOf = (s: any) => (s ? `${s.status}${s.finishedAt || s.startedAt || s.requestedAt ? ` ${at(s.finishedAt ?? s.startedAt ?? s.requestedAt).slice(0, 16)}` : ''}` : '');
+    const linksOf = (n: Record<string, number> | null) => (n ? Object.entries(n).filter(([, v]) => v).map(([k, v]) => `${v} ${k}`).join(', ') : '');
+    io.out(table(['KEY', 'SELECTED', 'PINNED', 'SESSIONS', 'FEEDBACK', 'LESSONS', 'FACTS', 'LAST SCAN', 'LINKS', 'NOTE', 'PATH'], rows.map((r) => [
+      r.key, r.tracked ? 'yes' : 'no', r.pinned ? 'yes' : '', r.sessions ?? r.claudeSessions + r.codexSessions, r.feedback ?? '', r.lessons ?? '', r.facts ?? '',
+      scanOf(r.lastScan), linksOf(r.links),
+      r.excluded ? 'excluded (EXCLUDE_PROJECTS)' : r.aliasOf ? `clone of ${r.aliasOf}` : !r.exists ? 'folder gone' : '', r.path,
     ])));
     return 0;
   }
   if (verb !== 'select' && verb !== 'unselect') throw new UsageError(`unknown projects command: ${verb}`);
   if (verb === 'unselect' && !f.key?.length) throw new UsageError('fg projects unselect needs --key k1,k2');
-  if (verb === 'select' && !f.all && !f.key?.length) throw new UsageError('fg projects select needs --all or --key k1,k2');
+  if (verb === 'select' && !f.all && !f.key?.length && !f['with-sessions']) throw new UsageError('fg projects select needs --all, --key k1,k2 or --with-sessions');
   // The API takes the whole list (PUT { tracked }), so fg reads the current one and adds to it, or removes from it.
   const current = await api<Settings>('GET', '/api/settings/projects');
   // What the Settings page would let you tick: a folder that exists, not excluded, and not a clone (a clone follows
   // its project, and the API maps a ticked clone to it anyway).
   const selectable = current.candidates.filter((c) => c.exists && !c.excluded && !c.aliasOf).map((c) => c.key);
-  const asked = f.all ? selectable : f.key!;
+  const withSessions = new Set(current.candidates.filter(hasSessions).map((c) => c.key));
+  const named = f.key?.length ? f.key : selectable;
+  const asked = verb === 'select' && f['with-sessions'] ? named.filter((k) => selectable.includes(k) && withSessions.has(k)) : f.all ? selectable : f.key!;
   const next = verb === 'unselect'
     ? current.tracked.filter((k) => !asked.includes(k))
     : [...new Set([...(f.only ? [] : current.tracked), ...asked])].sort();
@@ -198,23 +451,75 @@ async function projects(api: ReturnType<typeof client>, io: CliIO, verb: string 
 
 type ScanResult = { key: string; queued: boolean; job?: { id: string; status: string }; error?: string };
 
-async function scan(api: ReturnType<typeof client>, io: CliIO, f: Flags): Promise<number> {
+async function scan(api: Api, io: CliIO, f: Flags): Promise<number> {
   if (!f.all && !f.key?.length) throw new UsageError('fg scan needs --all or --key k1,k2');
   const body = { ...(f.all ? { all: true } : { keys: f.key }), ...(f.provider && { provider: f.provider }) };
   const { results } = await api<{ results: ScanResult[] }>('POST', '/api/projects/scan', body);
+  if (f.wait) return waitForScans(api, io, f, results);
   if (f.json) io.out(JSON.stringify(results, null, 2));
   else io.out(results.length ? table(['PROJECT', 'RESULT'], results.map((r) => [r.key, r.queued ? `queued (${r.job?.id ?? ''})` : r.error])) : 'nothing to scan: no selected folders');
   return results.every((r) => r.queued) ? 0 : 1;
 }
 
-async function inbox(api: ReturnType<typeof client>, io: CliIO, words: string[], f: Flags): Promise<number> {
+type ScanJobView = { id: string; projectKey: string; status: string; filesScanned?: number; factsAdded?: number; error?: string | null; queuePosition?: number | null };
+
+/** Poll GET /api/scans/:id for each queued job until all are done or failed, or --timeout runs out. */
+async function waitForScans(api: Api, io: CliIO, f: Flags, results: ScanResult[]): Promise<number> {
+  const interval = Math.max(1, Number(f.interval ?? 5)) * 1000;
+  const timeout = seconds(f.timeout, 1800, '--timeout') * 1000;
+  const jobs = new Map<string, ScanJobView>();
+  for (const r of results) if (r.queued && r.job) jobs.set(r.job.id, { id: r.job.id, projectKey: r.key, status: r.job.status });
+  const finished = (j: ScanJobView) => j.status === 'done' || j.status === 'failed';
+  let waited = 0;
+  for (;;) {
+    for (const j of [...jobs.values()].filter((x) => !finished(x))) jobs.set(j.id, await api<ScanJobView>('GET', `/api/scans/${encodeURIComponent(j.id)}`));
+    if ([...jobs.values()].every(finished) || waited + interval > timeout) break;
+    await io.sleep(interval);
+    waited += interval;
+  }
+  const all = [...jobs.values()];
+  const refused = results.filter((r) => !r.queued);
+  if (f.json) io.out(JSON.stringify({ jobs: all, refused }, null, 2));
+  else {
+    const line = (j: ScanJobView) => j.status === 'done'
+      ? `done: ${plural(j.filesScanned ?? 0, 'file')}, ${plural(j.factsAdded ?? 0, 'fact')}${j.filesScanned ? '' : ' (nothing changed since the last scan)'}`
+      : j.status === 'failed' ? `failed: ${j.error ?? 'no reason given'}`
+      : `still ${j.status}${j.queuePosition ? ` (${ordinal(j.queuePosition)} in the queue)` : ''}`;
+    io.out(table(['PROJECT', 'RESULT'], [...all.map((j) => [j.projectKey, line(j)]), ...refused.map((r) => [r.key, r.error])], 100));
+  }
+  return refused.length || all.some((j) => j.status !== 'done') ? 1 : 0;
+}
+
+/** Where an Inbox item came from (FeedbackSource). */
+const SOURCES = ['claude', 'codex', 'github', 'linear'];
+
+async function inbox(api: Api, io: CliIO, words: string[], f: Flags): Promise<number> {
   const [verb, ...ids] = words;
   if (verb === 'list' || verb === undefined) {
-    const items = await api<any[]>('GET', `/api/candidates${qs({ status: f.status ?? 'pending', project: f.project, limit: f.limit })}`);
+    if (f.source !== undefined && !SOURCES.includes(f.source)) throw new UsageError(`--source takes one of ${SOURCES.join(', ')}`);
+    const items = await api<any[]>('GET', `/api/candidates${qs({ status: f.status ?? 'pending', source: f.source, project: f.project, limit: f.limit })}`);
     if (f.json) { io.out(JSON.stringify(items, null, 2)); return 0; }
     io.out(items.length
       ? table(['ID', 'PROJECT', 'SOURCE', 'LABEL', 'CONF', 'SUMMARY'], items.map((c) => [c.id, c.projectKey, c.source, c.classification?.label, c.classification?.confidence?.toFixed(2), c.classification?.summary]))
-      : `no ${f.status ?? 'pending'} items`);
+      : `no ${f.status ?? 'pending'} items${f.source ? ` from ${f.source}` : ''}`);
+    return 0;
+  }
+  if (verb === 'show') {
+    if (!ids[0]) throw new UsageError('fg inbox show needs an item id (see fg inbox list)');
+    const d = await api<any>('GET', `/api/candidates/${encodeURIComponent(ids[0])}`);
+    if (f.json) { io.out(JSON.stringify(d, null, 2)); return 0; }
+    const c = d.candidate;
+    const ext = c.external;
+    io.out(table(['FIELD', 'VALUE'], [
+      ['id', c.id], ['project', c.projectKey], ['source', c.source],
+      ['status', `${c.status}${c.decidedBy ? ` by ${c.decidedBy}` : ''}${c.decidedAt ? ` at ${at(c.decidedAt)}` : ''}`],
+      ['label', `${c.classification?.label ?? ''} (${c.classification?.confidence ?? ''}): ${c.classification?.summary ?? ''}`],
+      ...(ext ? [['author', `${ext.author ?? ''}${ext.authorKind ? ` (${ext.authorKind})` : ''}`], ['url', ext.url ?? '']] : []),
+      ['comment', d.turn?.text ?? ''],
+      ...(c.note ? [['note', c.note]] : []),
+      ...(c.agentReport ? [['reported', c.agentReport.text]] : []),
+      ...(d.postmortem ? [['postmortem', d.postmortem.done ? 'done' : d.postmortem.gaveUp ? `gave up: ${d.postmortem.lastError ?? ''}` : `attempt ${d.postmortem.attempts}${d.postmortem.retryAt ? `, next ${at(d.postmortem.retryAt)}` : ''}`]] : []),
+    ], 400));
     return 0;
   }
   if (verb !== 'confirm' && verb !== 'reject') throw new UsageError(`unknown inbox command: ${verb}`);
@@ -226,7 +531,7 @@ async function inbox(api: ReturnType<typeof client>, io: CliIO, words: string[],
   return results.every((r) => r.ok) ? 0 : 1;
 }
 
-async function lessons(api: ReturnType<typeof client>, io: CliIO, words: string[], f: Flags): Promise<number> {
+async function lessons(api: Api, io: CliIO, words: string[], f: Flags): Promise<number> {
   const [verb, id] = words;
   if (verb === 'list' || verb === undefined) {
     const list = await api<any[]>('GET', `/api/lessons${qs({ status: f.status ?? 'proposed', project: f.project })}`);
@@ -234,6 +539,28 @@ async function lessons(api: ReturnType<typeof client>, io: CliIO, words: string[
     io.out(list.length
       ? table(['ID', 'STATUS', 'PROJECT', 'TITLE', 'DECIDED BY'], list.map((l) => [l.id, l.status, l.projectKey ?? 'global', l.title, l.decidedBy ?? '']), 70)
       : `no ${f.status ?? 'proposed'} lessons`);
+    return 0;
+  }
+  if (verb === 'show') {
+    if (!id) throw new UsageError('fg lessons show needs a lesson id (see fg lessons list)');
+    const d = await api<any>('GET', `/api/lessons/${encodeURIComponent(id)}`);
+    if (f.json) { io.out(JSON.stringify(d, null, 2)); return 0; }
+    const l = d.lesson;
+    io.out(table(['FIELD', 'VALUE'], [
+      ['id', l.id], ['status', `${l.status}${l.decidedBy ? ` by ${l.decidedBy}` : ''}`], ['project', l.projectKey ?? 'global'], ['scope', l.scope],
+      ['title', l.title], ['rule', l.rule], ['applies', l.appliesWhen], ['paths', (l.paths ?? []).join(', ')],
+      ...(d.miss ? [['missed', `${d.miss.missed} (${d.miss.cause ?? ''})`]] : []),
+      ...(d.feedback ? [['feedback', d.feedback.text]] : []),
+    ], 400));
+    return 0;
+  }
+  if (verb === 'to-fact') {
+    if (!id) throw new UsageError('fg lessons to-fact needs a lesson id (see fg lessons list)');
+    const relevance = f.relevance === undefined ? undefined : Number(f.relevance);
+    if (relevance !== undefined && !(Number.isFinite(relevance) && relevance >= 0 && relevance <= 1)) throw new UsageError('--relevance takes a number from 0 to 1');
+    // The API checks the kind (FACT_KINDS) and defaults to convention, relevance 0.8 (everyday).
+    const fact = await api<any>('POST', `/api/lessons/${encodeURIComponent(id)}/to-fact`, { ...(f.kind && { kind: f.kind }), ...(relevance !== undefined && { relevance }) });
+    io.out(f.json ? JSON.stringify(fact, null, 2) : `${id} converted to a ${fact.kind} fact ${fact.id} (${fact.path}); the lesson is rejected (fg facts list --project <key>)`);
     return 0;
   }
   if (verb !== 'approve' && verb !== 'reject') throw new UsageError(`unknown lessons command: ${verb}`);
@@ -244,17 +571,174 @@ async function lessons(api: ReturnType<typeof client>, io: CliIO, words: string[
   return 0;
 }
 
-async function cloud(api: ReturnType<typeof client>, io: CliIO, verb: string | undefined, f: Flags): Promise<number> {
-  if (verb !== 'sync-now' && verb !== 'sync') throw new UsageError('usage: fg cloud sync-now');
-  const r = await api<Record<string, unknown>>('POST', '/api/cloud/sync', {});
-  io.out(f.json ? JSON.stringify(r, null, 2) : `cloud sync ${r?.ok === false ? `failed: ${r.error ?? ''}` : 'done'}${r?.sent ? `: sent ${JSON.stringify(r.sent)}` : ''}`);
+async function cloud(api: Api, io: CliIO, verb: string | undefined, f: Flags): Promise<number> {
+  if (verb === 'status') {
+    const c = await api<any>('GET', '/api/cloud');
+    if (f.json) { io.out(JSON.stringify(c, null, 2)); return 0; }
+    if (!c.enabled) { io.out('cloud sync is off: set CLOUD_URL and CLOUD_TOKEN in .env and restart'); return 0; }
+    const t = c.preview?.total;
+    io.out(table(['FIELD', 'VALUE'], [
+      ['host', `${c.host}, ${c.intervalMinutes ? `every ${c.intervalMinutes} min${c.nextAt ? `, next ${at(c.nextAt)}` : ''}` : 'only on Sync now'}`],
+      ['projects', `${c.projects.length}: ${c.projects.join(', ')}`],
+      ['lessons', c.suggestions ? 'approved and proposed (SYNC_SUGGESTIONS)' : 'approved only'],
+      ...(t ? [['would send', `${t.projects} projects, ${t.lessons} lessons, ${t.misses} misses, ${t.facts} facts, ${t.docs} docs, ${t.codeFiles} code files`]] : []),
+      ...(c.previewError ? [['preview', `failed: ${c.previewError}`]] : []),
+      ['last', c.last ? `${at(c.last.at)} (${c.last.trigger}) ${c.last.ok ? 'ok' : `FAILED: ${c.last.error ?? ''}`}` : 'never'],
+    ], 200));
+    return 0;
+  }
+  if (verb !== 'sync-now' && verb !== 'sync') throw new UsageError('usage: fg cloud status | fg cloud sync-now [--force]');
+  // The sync is one request that can take minutes: show its progress on stderr while it runs.
+  let done = false;
+  const sync = api<Record<string, any>>('POST', '/api/cloud/sync', f.force ? { force: true } : {}).finally(() => { done = true; });
+  let shown = '';
+  while (!done) {
+    await Promise.race([sync.catch(() => null), io.sleep(2000)]);
+    if (done) break;
+    const pr = await api<{ running: { done: number; total: number; current: string | null } | null }>('GET', '/api/cloud/progress').catch(() => null);
+    const line = pr?.running ? `syncing ${pr.running.done} of ${pr.running.total}${pr.running.current ? ` (${pr.running.current})` : ''}` : '';
+    if (line && line !== shown) io.err(line);
+    shown = line;
+  }
+  const r = await sync;
+  if (f.json) { io.out(JSON.stringify(r, null, 2)); return r?.ok === false ? 1 : 0; }
+  const by: Record<string, number> = {};
+  for (const p of (r?.projects ?? []) as { status: string }[]) by[p.status] = (by[p.status] ?? 0) + 1;
+  const summary = Object.entries(by).map(([k, v]) => `${v} ${k}`).join(', ');
+  io.out(`cloud sync ${r?.ok === false ? `failed: ${r.error ?? ''}` : 'done'}${summary ? `: ${summary}` : ''}${r?.sent?.projects ? `; sent ${JSON.stringify(r.sent)}` : ''}`);
   return r?.ok === false ? 1 : 0;
+}
+
+async function map(api: ReturnType<typeof client>, io: CliIO, words: string[], f: Flags): Promise<number> {
+  const [verb, key] = words;
+  if (verb !== 'rebuild') throw new UsageError('usage: fg map rebuild <key>');
+  if (!key) throw new UsageError('fg map rebuild needs a project key (see fg projects list)');
+  const r = await api<{ queued: boolean }>('POST', `/api/projects/${encodeURIComponent(key)}/codemap/rebuild`, {});
+  io.out(f.json ? JSON.stringify({ key, ...r }) : `${key}: rebuild queued; the worker remaps it at its next pass (watch Activity for code_mapped)`);
+  return 0;
+}
+
+async function links(api: Api, io: CliIO, words: string[], f: Flags): Promise<number> {
+  const [verb, a, b] = words;
+  if (verb === 'list' || verb === undefined) {
+    if (!f.project) throw new UsageError('fg links list needs --project k');
+    const list = await api<any[]>('GET', `/api/projects/${encodeURIComponent(f.project)}/links`);
+    if (f.json) { io.out(JSON.stringify(list, null, 2)); return 0; }
+    io.out(list.length ? table(['A', 'B', 'RELATION', 'STATUS', 'SCORE', 'NOTE'], list.map((l) => [l.a, l.b, l.relation, l.status, Number(l.score ?? 0).toFixed(2), l.note ?? ''])) : `no links for ${f.project}`);
+    return 0;
+  }
+  if (verb !== 'confirm' && verb !== 'dismiss') throw new UsageError(`unknown links command: ${verb}`);
+  if (!a || !b) throw new UsageError(`fg links ${verb} needs two projects: fg links ${verb} <a> <b>`);
+  const body = { a, b, status: verb === 'confirm' ? 'confirmed' : 'dismissed', ...(f.relation && { relation: f.relation }), ...(f.note !== undefined && { note: f.note }) };
+  const link = await api<any>('PUT', '/api/links', body);
+  io.out(f.json ? JSON.stringify(link, null, 2) : `${link.a} ↔ ${link.b} ${link.status} (${link.relation})`);
+  return 0;
+}
+
+async function factsCmd(api: Api, io: CliIO, words: string[], f: Flags): Promise<number> {
+  const [verb, id, value] = words;
+  if (!f.project) throw new UsageError(`fg facts ${verb ?? 'list'} needs --project k`);
+  const base = `/api/projects/${encodeURIComponent(f.project)}/facts`;
+  if (verb === 'list' || verb === undefined) {
+    const list = await api<any[]>('GET', `${base}${qs({ kind: f.kind, q: f.q })}`);
+    const shown = f.limit ? list.slice(0, Number(f.limit)) : list;
+    if (f.json) { io.out(JSON.stringify(shown, null, 2)); return 0; }
+    io.out(shown.length
+      ? table(['ID', 'KIND', 'RELEVANCE', 'PATH', 'STATEMENT'], shown.map((x) => [x.id, x.kind, x.relevance === null || x.relevance === undefined ? 'unscored' : `${Number(x.relevance).toFixed(2)} ${x.relevanceBy ?? ''}`.trim(), x.path, x.statement]), 90)
+      : `no facts for ${f.project}`);
+    return 0;
+  }
+  if (verb !== 'relevance') throw new UsageError(`unknown facts command: ${verb}`);
+  const n = Number(value);
+  if (!id || value === undefined || !Number.isFinite(n) || n < 0 || n > 1) throw new UsageError('fg facts relevance <id> <0..1> --project k');
+  await api('PATCH', `${base}/${encodeURIComponent(id)}/relevance`, { relevance: n });
+  io.out(f.json ? JSON.stringify({ id, relevance: n }) : `${id} relevance ${n}`);
+  return 0;
+}
+
+const IMAGE_TYPES: Record<string, string> = { '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.webp': 'image/webp', '.gif': 'image/gif' };
+
+async function docs(api: Api, io: CliIO, words: string[], f: Flags): Promise<number> {
+  const [verb, file] = words;
+  if (!f.project) throw new UsageError(`fg docs ${verb ?? 'list'} needs --project k`);
+  const base = `/api/projects/${encodeURIComponent(f.project)}/docs`;
+  if (verb === 'list' || verb === undefined) {
+    const list = await api<any[]>('GET', base);
+    if (f.json) { io.out(JSON.stringify(list, null, 2)); return 0; }
+    const read = (r: any) => (r ? `${r.status}${r.status === 'done' ? ` (${plural(r.facts ?? 0, 'fact')})` : r.error ? `: ${r.error}` : ''}` : '');
+    io.out(list.length ? table(['REF', 'KIND', 'READ', 'ADDED BY', 'ADDED', 'TITLE'], list.map((d) => [d.ref, d.kind ?? 'text', read(d.read), d.addedBy ?? '', at(d.addedAt), d.title]), 90) : `no documents for ${f.project}`);
+    return 0;
+  }
+  if (verb !== 'upload') throw new UsageError(`unknown docs command: ${verb}`);
+  if (!file) throw new UsageError('fg docs upload <file> --project k [--title "..."]');
+  let bytes: Buffer;
+  try {
+    bytes = await (io.readFile ?? readFile)(file);
+  } catch (e) {
+    throw new ApiError(`cannot read ${file}: ${(e as Error).message}`);
+  }
+  // The API takes a plain file name.
+  const name = basename(file).replace(/[^\w .()-]/g, '_').replace(/^[^\w]+/, '') || 'upload.txt';
+  const media = IMAGE_TYPES[extname(name).toLowerCase()];
+  const body = { title: f.title ?? name, name, ...(media ? { image: { mediaType: media, data: bytes.toString('base64') } } : { text: bytes.toString('utf8') }) };
+  const r = await api<{ id: string; chunks: number }>('POST', base, body);
+  io.out(f.json ? JSON.stringify(r, null, 2) : `uploaded ${r.id}: the worker reads it into facts (fg docs list --project ${f.project})`);
+  return 0;
+}
+
+async function activityCmd(api: Api, io: CliIO, f: Flags): Promise<number> {
+  const list = await api<any[]>('GET', `/api/activity${qs({ project: f.project, kind: f.kind, limit: f.limit ?? '50' })}`);
+  if (f.json) { io.out(JSON.stringify(list, null, 2)); return 0; }
+  io.out(list.length ? table(['TIME', 'ACTOR', 'KIND', 'PROJECT', 'SUBJECT'], list.map((a) => [at(a.ts), a.actor, a.kind, a.projectKey ?? '', a.subject]), 90) : 'no activity');
+  return 0;
+}
+
+async function sessionsCmd(api: Api, io: CliIO, f: Flags): Promise<number> {
+  const r = await api<{ sessions: any[]; next: string | null }>('GET', `/api/sessions${qs({ project: f.project, limit: f.limit })}`);
+  if (f.json) { io.out(JSON.stringify(r, null, 2)); return 0; }
+  io.out(r.sessions.length
+    ? table(['ID', 'PROJECT', 'SOURCE', 'STATE', 'TURNS', 'LAST ACTIVITY', 'GOAL'], r.sessions.map((x) => [x.id, x.projectKey, x.source, x.state, x.turnCount ?? '', at(x.lastActivityAt), x.snippet ?? '']), 70)
+    : 'no sessions');
+  if (r.next) io.out(`(more: the API's next cursor is ${r.next})`);
+  return 0;
+}
+
+const SERVICES = new Set(['github', 'linear']);
+
+async function integrationsCmd(api: Api, io: CliIO, words: string[], f: Flags): Promise<number> {
+  const [verb, kind] = words;
+  if (verb === 'set' || verb === 'test') {
+    if (!kind || !SERVICES.has(kind)) throw new UsageError(`fg integrations ${verb} github|linear`);
+    if (verb === 'test') {
+      const r = await api<{ ok: boolean; account: string | null; error: string | null }>('POST', `/api/settings/integrations/${kind}/test`, {});
+      io.out(f.json ? JSON.stringify(r, null, 2) : `${kind}: ${r.ok ? `ok (${r.account ?? 'signed in'})` : `FAILED: ${r.error ?? ''}`}`);
+      return r.ok ? 0 : 1;
+    }
+    // A token on the command line ends up in shell history and the process list: only standard input.
+    if (!f['from-stdin']) throw new UsageError(`fg integrations set ${kind} --from-stdin  (pipe the token in, e.g. from a file you then delete)`);
+    const token = (await (io.readStdin ?? allOfStdin)()).trim();
+    if (!token) throw new UsageError('no token on standard input');
+    const r = await api<{ ok: boolean; view?: Record<string, any> }>('PUT', `/api/settings/integrations/${kind}`, { token });
+    const c = r.view?.[kind]?.connection;
+    io.out(f.json ? JSON.stringify({ ok: r.ok, connection: c ?? null }, null, 2) : table(['SERVICE', 'STATE'], [[kind, c ? `${c.state}: ${c.detail}` : 'saved']], 120));
+    return 0;
+  }
+  if (verb !== 'status' && verb !== undefined) throw new UsageError('usage: fg integrations status | set github|linear --from-stdin | test github|linear');
+  const v = await api<any>('GET', '/api/settings/integrations');
+  if (f.json) { io.out(JSON.stringify(v, null, 2)); return 0; }
+  io.out(table(['SERVICE', 'STATE', 'LAST SYNC'], (['github', 'linear'] as const).map((k) => [k, `${v[k]?.connection?.state ?? 'unknown'}: ${v[k]?.connection?.detail ?? ''}`, at(v[k]?.lastSyncAt) || 'never']), 120));
+  return 0;
 }
 
 /** Runs one fg command. Exit codes: 0 done, 1 the API refused or something failed, 2 a usage mistake. */
 export async function run(argv: string[], raw: CliIO): Promise<number> {
   let io = raw;
   let p: Parsed;
+  // setup's arguments are setup.sh's, not fg's: say where it runs before trying to read them as fg options.
+  if (argv[0] === 'setup') {
+    io.err('fg: fg setup runs ./scripts/setup.sh, which must run on the host (scripts/fg does that): it cannot run inside the api container');
+    return 2;
+  }
   try {
     p = parse(argv);
   } catch (e) {
@@ -268,11 +752,20 @@ export async function run(argv: string[], raw: CliIO): Promise<number> {
     const api = client(io, flags);
     switch (words[0]) {
       case 'status': return await status(api, io, flags);
+      case 'pipeline': return await pipelineCmd(api, io, flags);
+      case 'links': return await links(api, io, words.slice(1), flags);
+      case 'facts': return await factsCmd(api, io, words.slice(1), flags);
+      case 'docs': return await docs(api, io, words.slice(1), flags);
+      case 'activity': return await activityCmd(api, io, flags);
+      case 'sessions': return await sessionsCmd(api, io, flags);
+      case 'integrations': return await integrationsCmd(api, io, words.slice(1), flags);
+      case 'doctor': throw new UsageError('fg doctor runs ./scripts/doctor.sh on the host (scripts/fg does that); it cannot run inside the api container');
       case 'projects': return await projects(api, io, words[1], flags);
       case 'scan': return await scan(api, io, flags);
       case 'inbox': return await inbox(api, io, words.slice(1), flags);
       case 'lessons': return await lessons(api, io, words.slice(1), flags);
       case 'cloud': return await cloud(api, io, words[1], flags);
+      case 'map': return await map(api, io, words.slice(1), flags);
       default: throw new UsageError(`unknown command: ${words[0]}`);
     }
   } catch (e) {

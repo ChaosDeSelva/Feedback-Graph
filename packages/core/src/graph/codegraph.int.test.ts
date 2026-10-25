@@ -89,7 +89,7 @@ describeStores('CodeGraphStore', (h) => {
     expect(m.imports.toSorted((a, b) => `${a.from} ${a.to}`.localeCompare(`${b.from} ${b.to}`))).toEqual(
       codeMap().imports.toSorted((a, b) => `${a.from} ${a.to}`.localeCompare(`${b.from} ${b.to}`)),
     );
-    expect(await store.codegraph.codeMapMeta('demo')).toEqual({ fingerprint: 'head:abc', builtAt: m.builtAt, stats, candidates: null });
+    expect(await store.codegraph.codeMapMeta('demo')).toEqual({ fingerprint: 'head:abc', builtAt: m.builtAt, stats, candidates: null, unresolved: null });
     expect(await store.codegraph.codeMap('other')).toBeNull();
   });
 
@@ -101,6 +101,15 @@ describeStores('CodeGraphStore', (h) => {
     expect((await store.codegraph.codeMapMeta('demo'))?.candidates).toBe(6);
     await store.codegraph.replaceCodeMap('demo', codeMap());
     expect((await store.codegraph.codeMapMeta('demo'))?.candidates).toBeNull();
+  });
+
+  test('a map keeps how many imports it could not follow to a file, so answers can say the import graph is incomplete', async () => {
+    await store.codegraph.replaceCodeMap('demo', codeMap({ unresolved: 42 }));
+    expect((await store.codegraph.codeMapMeta('demo'))?.unresolved).toBe(42);
+    await store.codegraph.replaceCodeMap('demo', codeMap({ unresolved: 0 }));
+    expect((await store.codegraph.codeMapMeta('demo'))?.unresolved).toBe(0);
+    await store.codegraph.replaceCodeMap('demo', codeMap());
+    expect((await store.codegraph.codeMapMeta('demo'))?.unresolved).toBeNull();
   });
 
   test('editedPaths: the files the project\'s sessions edited, most recently edited first; reads and other projects left out', async () => {
@@ -169,10 +178,73 @@ describeStores('CodeGraphStore', (h) => {
       fingerprint: 'head:bad',
     });
     await expect(store.codegraph.replaceCodeMap('demo', bad)).rejects.toThrow();
-    const m = (await store.codegraph.codeMap('demo'))!;
-    expect(m.fingerprint).toBe('head:abc');
-    expect(m.files).toHaveLength(6);
-    expect(m.symbols).toHaveLength(3);
+    // Postgres writes a map in one transaction; Neo4j in slices (its transaction memory is bounded), clearing the
+    // fingerprint first. Either way a failed write is never taken for a current map: a null one is reparsed whole.
+    const meta = (await store.codegraph.codeMapMeta('demo'))!;
+    expect(meta.fingerprint).not.toBe('head:bad');
+    if (meta.fingerprint !== null) {
+      const m = (await store.codegraph.codeMap('demo'))!;
+      expect(m.fingerprint).toBe('head:abc');
+      expect(m.files).toHaveLength(6);
+      expect(m.symbols).toHaveLength(3);
+    }
+  });
+
+  test('purgeOrphanCodeFiles deletes files out of every map that are gone from the repo with nothing about them, and nothing else', async () => {
+    await store.codegraph.replaceCodeMap('demo', codeMap());
+    const scanned = (path: string, facts: { statement: string }[] = []) =>
+      store.facts.saveFileFacts('demo', { path, hash: `sha1-${path}`, summary: 's' }, facts.map((f) => ({ kind: 'convention' as const, statement: f.statement, path, lines: '1', confidence: 0.9, why: 'w', embedding: vec(2) })), 'ollama:gemma4');
+    await scanned('docs/gone.md');
+    await scanned('docs/cited.md', [{ statement: 'docs are terse' }]);
+    await scanned('docs/kept.md');
+    await store.facts.markFilesRemoved('demo', ['docs/gone.md', 'docs/cited.md']);
+    expect(await store.codegraph.purgeOrphanCodeFiles(100)).toBe(1);
+    const ids = await probe.ids('CodeFile');
+    expect(ids).not.toContain('demo:docs/gone.md');
+    // A closed fact still cites it; a scanned file still in the repo is the scan's memory of its hash; map files stay.
+    expect(ids).toEqual(expect.arrayContaining(['demo:docs/cited.md', 'demo:docs/kept.md', 'demo:src/db.ts']));
+    expect(await store.facts.fileHashes('demo')).toEqual(new Map([['docs/kept.md', 'sha1-docs/kept.md']]));
+    expect(await store.codegraph.purgeOrphanCodeFiles(100)).toBe(0);
+  });
+
+  test('a rebuild asked for stays requested until the map is built again; a project with no map cannot be asked', async () => {
+    expect(await store.codegraph.requestCodeMapRebuild('demo')).toBe(false);
+    await store.codegraph.replaceCodeMap('demo', codeMap());
+    expect(await store.codegraph.codeMapRebuildsRequested()).toEqual([]);
+    await new Promise((r) => setTimeout(r, 5));
+    expect(await store.codegraph.requestCodeMapRebuild('demo')).toBe(true);
+    expect(await store.codegraph.codeMapRebuildsRequested()).toEqual([{ projectKey: 'demo', requestedAt: expect.any(String) }]);
+    await new Promise((r) => setTimeout(r, 5));
+    await store.codegraph.replaceCodeMap('demo', codeMap());
+    expect(await store.codegraph.codeMapRebuildsRequested()).toEqual([]);
+  });
+
+  test('a rebuild where a few files changed reads back exactly like a fresh write of the new map', async () => {
+    await store.codegraph.replaceCodeMap('demo', codeMap());
+    const next = codeMap({
+      files: [...codeMap().files.filter((f) => f.path !== 'src/cli.ts'), file('src/new.ts')],
+      symbols: [
+        ...codeMap().symbols.filter((x) => x.path !== 'src/api.ts'),
+        { id: 'src/api.ts#route', path: 'src/api.ts', name: 'route', kind: 'function', exported: true, lines: '1-6' },
+        { id: 'src/new.ts#n', path: 'src/new.ts', name: 'n', kind: 'function', exported: false, lines: '1-1' },
+      ],
+      imports: [
+        ...codeMap().imports.filter((i) => i.from !== 'src/cli.ts' && i.to !== 'pkg:pg'),
+        { from: 'src/db.ts', to: 'pkg:postgres', names: ['sql'], spec: 'postgres' },
+        { from: 'src/new.ts', to: 'src/db.ts', names: ['Db', 'x'], spec: './db.ts' },
+      ],
+      fingerprint: 'head:def',
+    });
+    await store.codegraph.replaceCodeMap('demo', next);
+    const incremental = (await store.codegraph.codeMap('demo'))!;
+    await store.codegraph.replaceCodeMap('fresh', next);
+    const fresh = (await store.codegraph.codeMap('fresh'))!;
+    const sort = <T extends { from: string; to: string }>(xs: T[]) => xs.toSorted((a, b) => `${a.from} ${a.to}`.localeCompare(`${b.from} ${b.to}`));
+    expect(incremental.files).toEqual(fresh.files);
+    expect(incremental.symbols).toEqual(fresh.symbols);
+    expect(sort(incremental.imports)).toEqual(sort(fresh.imports));
+    expect(incremental.stats).toEqual({ files: 6, symbols: 4, imports: 6, tests: 3 });
+    expect((await store.codegraph.moduleContext('demo', 'src/db.ts'))!.imports.map((i) => i.to)).toEqual(['pkg:postgres']);
   });
 
   test('symbol names, import names and specifiers are redacted before they are stored', async () => {

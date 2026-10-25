@@ -28,6 +28,8 @@ test('scoreFacts asks once for a batch of unscored facts and stores each score a
   const r = await scoreFacts(t.d);
   expect(r).toEqual({ scored: 2 });
   expect(t.asked).toHaveLength(1);
+  // 40 short score objects fit in 1024 tokens even pretty-printed; a runaway answer stops there.
+  expect((t.asked[0] as { maxTokens?: number }).maxTokens).toBe(1024);
   expect(t.asked[0].user).toContain('1. [config] README.md: Set up the profiler app');
   expect(t.asked[0].system).toMatch(/external tool/);
   expect(t.set[0]).toEqual([{ id: 'f1', relevance: 0.1, by: 'model' }, { id: 'f2', relevance: 0.95, by: 'model' }]);

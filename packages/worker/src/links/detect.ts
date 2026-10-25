@@ -164,16 +164,34 @@ const slugOf = (remote: string | null) => {
   const parts = remote.split('/').slice(1);
   return parts.length >= 2 && parts[parts.length - 1].length >= 3 ? parts.slice(-2).join('/') : null;
 };
+/**
+ * Two folders of one repo: the same normalized remote, or one cloned from the other on disk (`local/<name>` naming
+ * the other's folder or key). A clone mentions its original everywhere, so it is never a link to suggest.
+ */
+export function sameRepo(x: LinkProject, y: LinkProject): boolean {
+  if (x.remote && x.remote === y.remote) return true;
+  const names = (p: LinkProject) => new Set([shortName(p.key), basename(p.repoPath)].map((n) => `local/${n.toLowerCase()}`));
+  return (!!x.remote && names(y).has(x.remote.toLowerCase())) || (!!y.remote && names(x).has(y.remote.toLowerCase()));
+}
+/** Each project's repo: projects that are clones of one another (sameRepo, followed through) share one. */
+function repoGroups(projects: LinkProject[]): Map<string, string> {
+  const parent = new Map(projects.map((p) => [p.key, p.key]));
+  const find = (k: string): string => (parent.get(k) === k ? k : find(parent.get(k)!));
+  for (const [i, x] of projects.entries()) for (const y of projects.slice(i + 1)) if (sameRepo(x, y)) parent.set(find(y.key), find(x.key));
+  return new Map(projects.map((p) => [p.key, find(p.key)]));
+}
 const inside = (target: string, dir: string) => target === dir || target.startsWith(`${dir.replace(/\/+$/, '')}/`);
 
 /**
  * Evidence that selected projects belong together, from what is in them (no model): a manifest naming another
  * project's package or a local path into it, another project's git remote, and its name in several files. Pairs whose
- * evidence reaches SUGGEST_FROM come back, strongest evidence first; depends_on when a manifest says so.
+ * evidence reaches SUGGEST_FROM come back, depends_on (a manifest says so) first, then the strongest evidence; a
+ * project and its own clone (sameRepo) never pair.
  */
 export async function detectLinks(projects: LinkProject[]): Promise<DetectedLink[]> {
   const manifests = new Map<string, Manifests>();
   for (const p of projects) manifests.set(p.key, await readManifests(p.repoPath));
+  const repo = repoGroups(projects);
   const evidence = new Map<string, { a: string; b: string; items: LinkEvidence[] }>();
   const add = (x: string, y: string, e: LinkEvidence) => {
     if (x === y) return;
@@ -195,7 +213,7 @@ export async function detectLinks(projects: LinkProject[]): Promise<DetectedLink
       ...[...names.values()].filter((n) => nameWorthSearching(n) && n.toLowerCase() !== shortName(from.key).toLowerCase()),
     ]);
     for (const to of projects) {
-      if (to.key === from.key) continue;
+      if (to.key === from.key || repo.get(to.key) === repo.get(from.key)) continue;
       const theirs = new Set(manifests.get(to.key)!.names.filter((n) => !own.has(n)));
       for (const d of mine.deps) {
         if (theirs.has(d.name)) add(from.key, to.key, { signal: 'manifest', detail: `${from.key} depends on ${d.name}, a package of ${to.key}`, path: d.path, from: from.key });
@@ -226,5 +244,7 @@ export async function detectLinks(projects: LinkProject[]): Promise<DetectedLink
     const sorted = [...items].sort((x, y) => order.indexOf(x.signal) - order.indexOf(y.signal)).slice(0, MAX_EVIDENCE);
     out.push({ a, b, relation: signals.has('manifest') ? 'depends_on' : 'related', score: Math.round(score * 100) / 100, evidence: sorted });
   }
-  return out.sort((x, y) => y.score - x.score || x.a.localeCompare(y.a) || x.b.localeCompare(y.b));
+  // A dependency a manifest declares outranks any count of mentions.
+  const rank = (l: DetectedLink) => (l.relation === 'depends_on' ? 1 : 0);
+  return out.sort((x, y) => rank(y) - rank(x) || y.score - x.score || x.a.localeCompare(y.a) || x.b.localeCompare(y.b));
 }

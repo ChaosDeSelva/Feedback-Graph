@@ -30,6 +30,8 @@ export const SCHEMA = [
   'CREATE INDEX docblob_doc IF NOT EXISTS FOR (n:DocBlob) ON (n.docId)',
   'CREATE CONSTRAINT projectlink_id IF NOT EXISTS FOR (n:ProjectLink) REQUIRE n.id IS UNIQUE',
   'CREATE INDEX codefile_project IF NOT EXISTS FOR (n:CodeFile) ON (n.projectKey)',
+  // The map's files (`{projectKey} WHERE inMap = true`): most CodeFile nodes of a scanned project are not in its map.
+  'CREATE INDEX codefile_project_inmap IF NOT EXISTS FOR (n:CodeFile) ON (n.projectKey, n.inMap)',
   'CREATE INDEX scanjob_status IF NOT EXISTS FOR (n:ScanJob) ON (n.status)',
   `CREATE VECTOR INDEX fact_embedding IF NOT EXISTS FOR (n:Fact) ON n.embedding
      OPTIONS {indexConfig: {\`vector.dimensions\`: 768, \`vector.similarity_function\`: 'cosine'}}`,
@@ -48,6 +50,11 @@ export const SCHEMA = [
   'CREATE CONSTRAINT module_id IF NOT EXISTS FOR (n:Module) REQUIRE n.id IS UNIQUE',
   'CREATE CONSTRAINT codemap_project IF NOT EXISTS FOR (n:CodeMap) REQUIRE n.projectKey IS UNIQUE',
   'CREATE INDEX session_activity IF NOT EXISTS FOR (n:Session) ON (n.lastActivityAt)',
+  'CREATE CONSTRAINT chat_conversation_id IF NOT EXISTS FOR (n:ChatConversation) REQUIRE n.id IS UNIQUE',
+  'CREATE CONSTRAINT chat_turn_id IF NOT EXISTS FOR (n:ChatTurn) REQUIRE n.id IS UNIQUE',
+  'CREATE INDEX chat_turn_conversation IF NOT EXISTS FOR (n:ChatTurn) ON (n.conversationId)',
+  'CREATE INDEX chat_turn_status IF NOT EXISTS FOR (n:ChatTurn) ON (n.status)',
+  'CREATE INDEX chat_conversation_project IF NOT EXISTS FOR (n:ChatConversation) ON (n.projectKey)',
   `CREATE VECTOR INDEX chunk_embedding IF NOT EXISTS FOR (n:Chunk) ON n.embedding
      OPTIONS {indexConfig: {\`vector.dimensions\`: 768, \`vector.similarity_function\`: 'cosine'}}`,
 ];

@@ -26,3 +26,19 @@ test('docker-compose.yml mounts no project folder: the roots come only from the 
   expect(api).toContain('ROOTS_FILE: /settings/project-roots.json');
   expect(api).not.toContain('./state:/state');
 });
+
+test('the api and the worker run with no Linux capabilities and cannot gain privileges', () => {
+  const compose = readFileSync(join(repo, 'docker-compose.yml'), 'utf8');
+  const service = (name: string, next: string) => compose.slice(compose.indexOf(`\n  ${name}:`), compose.indexOf(`\n  ${next}:`));
+  for (const s of [service('worker', 'codex-runner'), service('api', 'postgres')]) {
+    expect(s).toContain('cap_drop: [ALL]');
+    expect(s).toContain('- no-new-privileges:true');
+  }
+});
+
+test('docker-compose.yml comments do not contradict the settings they describe', () => {
+  const compose = readFileSync(join(repo, 'docker-compose.yml'), 'utf8');
+  // CLOUD_URL allows plain http to this machine and to the host as the containers see it; SCAN_MAX_FILES scales.
+  expect(compose).not.toContain('plain http only to localhost');
+  expect(compose).not.toMatch(/400 files, 80000 bytes/);
+});

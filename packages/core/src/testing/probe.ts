@@ -51,7 +51,7 @@ export interface StoreProbe {
   ids(kind: ProbeKind): Promise<string[]>;
   /** Every stored value of every record of a kind, vectors left out. Field names are the backend's own: use for content checks only. */
   rows(kind: ProbeKind): Promise<Record<string, unknown>[]>;
-  project(key: string): Promise<{ key: string; remote: string | null; aliases: string[] } | null>;
+  project(key: string): Promise<{ key: string; remote: string | null; aliases: string[]; repoPath: string | null } | null>;
   /** The source stored on a session ('claude' | 'codex'), null when none was stored (or no such session). */
   sessionSource(id: string): Promise<string | null>;
   turn(uuid: string): Promise<{ text: string | null; precedingAssistantText: string | null } | null>;

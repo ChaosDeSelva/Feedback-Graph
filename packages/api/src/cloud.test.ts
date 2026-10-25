@@ -112,9 +112,45 @@ test('/api/status says whether cloud sync is on, with the token redacted', async
   const app = createApp(repo, { cloud: d, system: { version: '0.2.0', ping: async () => true, worker: async () => null } });
   const text = await (await app.request('/api/status')).text();
   expect(text).not.toContain(TOKEN);
-  expect(JSON.parse(text).cloud).toEqual({ host: 'cloud.example.com', token: '[REDACTED]', intervalMinutes: 60 });
+  expect(JSON.parse(text).cloud).toEqual({ host: 'cloud.example.com', token: '[REDACTED]', intervalMinutes: 60, lastManual: null, syncing: null });
   const off = createApp(repo, { cloud: deps({ cloud: null }).d, system: { version: '0.2.0', ping: async () => true, worker: async () => null } });
   expect((await (await off.request('/api/status')).json()).cloud).toBeNull();
+});
+
+test('Sync now sends only what changed since the last sync, and resends everything with force', async () => {
+  const { d, fetchCalls, log } = deps({ memory: new Map() });
+  const app = createApp(repo, { cloud: d });
+  await app.request('/api/cloud/sync', post('http://localhost'));
+  const again = await (await app.request('/api/cloud/sync', post('http://localhost'))).json();
+  expect(again.projects).toEqual([expect.objectContaining({ key: 'shop', status: 'unchanged' })]);
+  expect(fetchCalls).toHaveLength(1);
+  expect(log[0].subject).toMatch(/^nothing to send/);
+  const forced = await app.request('/api/cloud/sync', { ...post('http://localhost'), body: JSON.stringify({ force: true }) });
+  expect(forced.status).toBe(200);
+  expect(fetchCalls).toHaveLength(2);
+  expect((await app.request('/api/cloud/sync', { ...post('http://localhost'), body: JSON.stringify({ force: 'yes' }) })).status).toBe(400);
+});
+
+test('a running Sync now reports its progress; afterwards /api/status shows when it ran and what it sent', async () => {
+  let release!: () => void;
+  const gate = new Promise<void>((r) => { release = r; });
+  const { d } = deps({ projects: async () => ['shop', 'blog'], fetch: (async () => { await gate; return Response.json(syncOk); }) as unknown as typeof fetch });
+  const app = createApp(repo, { cloud: d, system: { version: '0.5.0', ping: async () => true, worker: async () => null } });
+  expect(await (await app.request('/api/cloud/progress')).json()).toEqual({ running: null, lastManual: null });
+  const run = app.request('/api/cloud/sync', post('http://localhost'));
+  await new Promise((r) => setTimeout(r, 5));
+  const during = await (await app.request('/api/cloud/progress')).json();
+  expect(during.running).toMatchObject({ done: 0, total: 2, current: 'shop', startedAt: expect.any(String) });
+  expect((await (await app.request('/api/status')).json()).cloud.syncing).toMatchObject({ done: 0, total: 2 });
+  release();
+  await run;
+  const after = await (await app.request('/api/cloud/progress')).json();
+  expect(after.running).toBeNull();
+  expect(after.lastManual).toMatchObject({ ok: true, sent: { lessons: 2 }, unchanged: 0, error: null, at: expect.any(String) });
+  const status = await (await app.request('/api/status')).json();
+  expect(status.cloud.lastManual).toMatchObject({ ok: true });
+  // The connection line counts a manual sync too, not only the worker's schedule.
+  expect(status.connections.cloud.detail).toMatch(/last sync/);
 });
 
 test('preview errors do not break the card', async () => {

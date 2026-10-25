@@ -1,10 +1,11 @@
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { ActivityInput, CodeMapMeta, CodeMapWrite, StoredCodeMap } from '@fb/core';
 import { afterEach, expect, test } from 'vitest';
-import { gitStatusTimeoutMs, MapStage, repoFingerprint, type MapStageDeps } from './stage.ts';
+import { worktreeGitArgs } from '../ingest/git.ts';
+import { fileFingerprint, gitStatusTimeoutMs, MapStage, repoFingerprint, type MapStageDeps } from './stage.ts';
 import type { BuildOpts, CodeMap } from './types.ts';
 
 const dirs: string[] = [];
@@ -188,14 +189,148 @@ test('an unchanged repo is not rebuilt; a changed one is, incrementally, but not
   expect(f.activity.at(-1)).toMatchObject({ why: 'the repo changed since the last map', details: expect.objectContaining({ incremental: true }) });
 });
 
-test('a folder that is not a git repo is rebuilt each interval (incrementally: unchanged files are not reparsed)', async () => {
-  const f = fakes();
+test('a folder git cannot read falls back to a file fingerprint: unchanged, it is not rebuilt, and that is logged once', async () => {
+  let files = 'fs:1';
+  const f = fakes({ fsFingerprint: async () => files });
   f.setFingerprint(null);
   const stage = new MapStage(f.deps);
   await stage.pass();
+  expect(f.writes[0].fingerprint).toBe('fs:1');
+  f.tick(61_000);
+  await stage.pass();
+  expect(f.builds).toHaveLength(1);
+  files = 'fs:2';
   f.tick(61_000);
   await stage.pass();
   expect(f.builds).toHaveLength(2);
+  expect(f.logs.filter((m) => m === 'code map fingerprint unavailable')).toHaveLength(1);
+});
+
+test('a map whose write was cut short (its fingerprint cleared) is reparsed from scratch, not from what was half written', async () => {
+  const f = fakes();
+  const stage = new MapStage(f.deps);
+  await stage.pass();
+  // The store clears the fingerprint before writing and sets it last: a crash in between leaves it null.
+  f.writes.length = 0;
+  const meta = f.deps.store.codeMapMeta;
+  f.deps.store.codeMapMeta = async (k) => ({ ...(await meta(k))!, fingerprint: null });
+  f.tick(61_000);
+  await stage.pass();
+  expect(f.builds).toHaveLength(2);
+  expect(f.builds[1].prev).toBeUndefined();
+  expect(f.activity.at(-1)).toMatchObject({ details: expect.objectContaining({ incremental: false }) });
+});
+
+test('the map stage hands its git commands the worktree arguments for the folder', async () => {
+  const seen: unknown[] = [];
+  const args = ['--git-dir', '/vibe/main/.git/worktrees/demo', '--work-tree', '/vibe/demo'];
+  const f = fakes({
+    gitArgs: async (repo) => (repo === '/vibe/demo' ? args : []),
+    fingerprint: async (_r, _m, o) => { seen.push(['fp', o?.gitArgs]); return 'fp1'; },
+    churn: async (_r, _d, a) => { seen.push(['churn', a]); return new Map(); },
+  });
+  await new MapStage(f.deps).pass();
+  expect(seen).toEqual([['fp', args], ['churn', args]]);
+});
+
+test('a git worktree whose .git names a host path is fingerprinted through the roots mapping', async () => {
+  const base = tmp();
+  const main = join(base, 'main');
+  mkdirSync(main);
+  git(main, 'init', '-q');
+  writeFileSync(join(main, 'a.ts'), 'export const a = 1;\n');
+  git(main, 'add', '.');
+  git(main, 'commit', '-qm', 'a');
+  const wt = join(base, 'wt');
+  git(main, 'worktree', 'add', '-q', wt);
+  // What the container sees: the .git file names the host's folder, which is not mounted under that path.
+  writeFileSync(join(wt, '.git'), 'gitdir: /Users/me/Code/main/.git/worktrees/wt\n');
+  expect(await repoFingerprint(wt, 100)).toBeNull();
+  const args = await worktreeGitArgs(wt, [{ host: '/Users/me/Code', container: base }]);
+  expect(args).toEqual(['--git-dir', join(main, '.git/worktrees/wt'), '--work-tree', wt]);
+  const fp = await repoFingerprint(wt, 100, { gitArgs: args });
+  expect(fp).toMatch(/^[0-9a-f]{64}$/);
+  writeFileSync(join(wt, 'a.ts'), 'export const a = 2;\n');
+  expect(await repoFingerprint(wt, 100, { gitArgs: args })).not.toBe(fp);
+  // A plain repo, and a gitdir under no root, need nothing.
+  expect(await worktreeGitArgs(main, [{ host: '/Users/me/Code', container: base }])).toEqual([]);
+  expect(await worktreeGitArgs(wt, [{ host: '/elsewhere', container: base }])).toEqual([]);
+});
+
+test('fileFingerprint changes when a candidate file is added or edited, and ignores skipped folders', async () => {
+  const dir = tmp();
+  writeFileSync(join(dir, 'a.ts'), 'export const a = 1;\n');
+  const one = await fileFingerprint(dir);
+  expect(one).toMatch(/^fs:[0-9a-f]{64}$/);
+  expect(await fileFingerprint(dir)).toBe(one);
+  mkdirSync(join(dir, 'node_modules'));
+  writeFileSync(join(dir, 'node_modules', 'x.ts'), 'x');
+  expect(await fileFingerprint(dir)).toBe(one);
+  writeFileSync(join(dir, 'b.ts'), 'b');
+  const two = await fileFingerprint(dir);
+  expect(two).not.toBe(one);
+  writeFileSync(join(dir, 'b.ts'), 'bb');
+  expect(await fileFingerprint(dir)).not.toBe(two);
+});
+
+test('a pass stuck on one project past the stall limit is logged and abandoned, so the next kick starts a new pass', async () => {
+  const logged: [string, object | undefined][] = [];
+  let calls = 0;
+  const f = fakes({
+    // The first build never settles (a hung read over the mount); later ones do.
+    build: async () => (++calls === 1 ? new Promise<CodeMap>(() => {}) : map),
+    stallMs: 20 * 60_000,
+    log: (m, e) => logged.push([m, e]),
+  });
+  const stage = new MapStage(f.deps);
+  stage.kick();
+  await new Promise((r) => setTimeout(r, 5));
+  f.tick(10 * 60_000);
+  stage.kick(); // still within the limit: nothing happens
+  expect(logged.map(([m]) => m)).not.toContain('code map stage stalled');
+  f.tick(11 * 60_000);
+  stage.kick();
+  expect(logged).toContainEqual(['code map stage stalled', expect.objectContaining({ project: 'demo', runningMs: 21 * 60_000 })]);
+  await stage.idle();
+  expect(calls).toBe(2);
+  expect(f.writes).toHaveLength(1);
+});
+
+test('a rebuild you asked for remaps the project from scratch at the next kick, whatever the interval and the fingerprint', async () => {
+  let requested: { projectKey: string; requestedAt: string }[] = [];
+  const f = fakes();
+  f.deps.store.codeMapRebuildsRequested = async () => requested;
+  const stage = new MapStage(f.deps);
+  await stage.pass();
+  f.tick(1000);
+  requested = [{ projectKey: 'demo', requestedAt: new Date(1_000_500).toISOString() }];
+  await stage.pass();
+  expect(f.builds).toHaveLength(2);
+  expect(f.builds[1].prev).toBeUndefined();
+  expect(f.activity.at(-1)).toMatchObject({ why: 'you asked for a rebuild of the map', details: expect.objectContaining({ incremental: false }) });
+  // Still listed (the fake store does not clear it): not again until the interval, then once more.
+  await stage.pass();
+  expect(f.builds).toHaveLength(2);
+  f.tick(61_000);
+  await stage.pass();
+  expect(f.builds).toHaveLength(3);
+});
+
+test('a pass purges orphan code files at most once per interval, and logs only when some went', async () => {
+  const purged: number[] = [];
+  let n = 3;
+  const logged: [string, object | undefined][] = [];
+  const f = fakes({ log: (m, e) => logged.push([m, e]) });
+  f.deps.store.purgeOrphanCodeFiles = async (limit) => { purged.push(limit); const r = n; n = 0; return r; };
+  const stage = new MapStage(f.deps);
+  await stage.pass();
+  await stage.pass();
+  expect(purged).toHaveLength(1);
+  expect(logged).toContainEqual(['orphan code files purged', { files: 3 }]);
+  f.tick(61_000);
+  await stage.pass();
+  expect(purged).toHaveLength(2);
+  expect(logged.filter(([m]) => m === 'orphan code files purged')).toHaveLength(1);
 });
 
 test('a scan maps its project first, ignoring the interval but not the fingerprint', async () => {

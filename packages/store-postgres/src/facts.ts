@@ -1,8 +1,8 @@
 import { randomUUID } from 'node:crypto';
 import type pg from 'pg';
-import { clampRelevance, PROJECT_PATH, redactDeep, redactSecrets, relevanceOf, SCAN_UNAVAILABLE_WAIT_MS, scanRetryAt } from '@fb/core';
-import type { EmbeddedFact, FactHit, FactKind, FactsStore, Project, ProjectSummary, ScanJob, ScanStatus, StoredFact, RelevanceUpdate, UnscoredFact } from '@fb/core';
-import { iso, toVector, tx, type Db } from './db.ts';
+import { clampRelevance, factOrigin, MANIFEST_WHY_RE, PROJECT_PATH, provenanceOf, redactDeep, redactSecrets, relevanceOf, SCAN_UNAVAILABLE_WAIT_MS, scanRetryAt } from '@fb/core';
+import type { EmbeddedFact, FactHit, FactKind, FactScope, FactsStore, Project, ProjectSummary, RelevanceBy, ScanJob, ScanJobPatch, ScanStatus, StoredFact, RelevanceUpdate, UnscoredFact } from '@fb/core';
+import { iso, toJson, toVector, tx, type Db } from './db.ts';
 import { runSearch, searchFactsQuery } from './vector.ts';
 
 type Exec = Pick<pg.PoolClient, 'query'>;
@@ -11,7 +11,7 @@ type Exec = Pick<pg.PoolClient, 'query'>;
 const fileId = (projectKey: string, path: string) => `${projectKey}:${path}`;
 
 const FACT_COLUMNS = `x.id, x.kind, x.statement, x.path, x.lines, x.confidence, x.why, x.relevance, x.relevance_by, x.source,
-                      x.scan_job_id, x.file_hash, x.created_at, x.doc_id`;
+                      x.scan_job_id, x.file_hash, x.created_at, x.doc_id, x.origin, x.evidence`;
 
 /** Code facts, the files they are about, scan jobs and the per-project summary. */
 export class PgFactsStore implements FactsStore {
@@ -45,7 +45,7 @@ export class PgFactsStore implements FactsStore {
            summary = EXCLUDED.summary, scanned_at = EXCLUDED.scanned_at, removed = false`,
         [cf, projectKey, file.path, file.hash, file.summary, now],
       );
-      await c.query('UPDATE facts SET current = false, valid_to = $2 WHERE code_file_id = $1 AND current', [cf, now]);
+      await c.query(`UPDATE facts SET current = false, valid_to = $2 WHERE code_file_id = $1 AND current AND origin IS DISTINCT FROM 'you'`, [cf, now]);
       await insertFacts(c, projectKey, facts.map((fx) => ({ ...fx, codeFileId: cf })), source, scanJobId, now, file.hash);
     });
   }
@@ -59,7 +59,7 @@ export class PgFactsStore implements FactsStore {
         [projectKey, paths],
       );
       if (!rows.length) return;
-      await c.query('UPDATE facts SET current = false, valid_to = $2 WHERE code_file_id = ANY($1::text[]) AND current', [rows.map((r) => r.id), now]);
+      await c.query(`UPDATE facts SET current = false, valid_to = $2 WHERE code_file_id = ANY($1::text[]) AND current AND origin IS DISTINCT FROM 'you'`, [rows.map((r) => r.id), now]);
     });
   }
 
@@ -68,13 +68,23 @@ export class PgFactsStore implements FactsStore {
    * their files (or to the project root). One transaction: a failure leaves the old facts current and hashes stale.
    */
   async replaceProjectFacts(projectKey: string, rawFacts: EmbeddedFact[], source: string, files: { path: string; hash: string }[], scanJobId: string | null = null): Promise<void> {
+    await this.replaceScopeFacts(projectKey, { prefixes: [''], except: [] }, rawFacts, source, files, scanJobId);
+  }
+
+  /** One shard of an agentic scan: only the current facts in `scope` are closed (FactsStore.replaceScopeFacts). */
+  async replaceScopeFacts(projectKey: string, scope: FactScope, rawFacts: EmbeddedFact[], source: string, files: { path: string; hash: string }[], scanJobId: string | null = null): Promise<void> {
     const facts = redactDeep(rawFacts).map((f) => ({ ...f, path: f.path || PROJECT_PATH }));
     const now = new Date();
     // Neo4j MERGEs file by file, so a path listed twice ends with the last hash.
     const latest = new Map(files.map((fl) => [fl.path, fl.hash]));
     await tx(this.db, async (c) => {
-      // Facts read from your documents are not the code's: a scan never closes them.
-      await c.query('UPDATE facts SET current = false, valid_to = $2 WHERE project_key = $1 AND current AND doc_id IS NULL', [projectKey, now]);
+      // Facts read from your documents, and facts you wrote, are not the code's: a scan never closes them.
+      await c.query(
+        `UPDATE facts x SET current = false, valid_to = $2 WHERE x.project_key = $1 AND x.current AND x.doc_id IS NULL AND x.origin IS DISTINCT FROM 'you'
+           AND EXISTS (SELECT 1 FROM unnest($3::text[]) AS p(pre) WHERE p.pre = '' OR x.path = p.pre OR left(x.path, length(p.pre) + 1) = p.pre || '/')
+           AND NOT EXISTS (SELECT 1 FROM unnest($4::text[]) AS e(ex) WHERE x.path = e.ex OR left(x.path, length(e.ex) + 1) = e.ex || '/')`,
+        [projectKey, now, scope.prefixes, scope.except],
+      );
       await c.query('INSERT INTO projects (key) VALUES ($1) ON CONFLICT DO NOTHING', [projectKey]);
       if (latest.size) {
         await c.query(
@@ -98,10 +108,28 @@ export class PgFactsStore implements FactsStore {
     });
   }
 
+  /** Your fact: under the project, about no code file, so a scan has nothing of it to close. */
+  async addOwnerFact(projectKey: string, rawFact: EmbeddedFact, by: RelevanceBy): Promise<StoredFact> {
+    const fx = redactDeep(rawFact);
+    const relevance = relevanceOf(fx);
+    return tx(this.db, async (c) => {
+      await c.query('INSERT INTO projects (key) VALUES ($1) ON CONFLICT DO NOTHING', [projectKey]);
+      const { rows } = await c.query(
+        `INSERT INTO facts (id, project_key, kind, statement, path, lines, confidence, why, source, current, created_at, valid_from,
+                            embedding, relevance, relevance_by, origin)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::text, true, $10, $10, $11::vector, $12::float8, CASE WHEN $12::float8 IS NULL THEN NULL ELSE $9::text END, 'you')
+         RETURNING ${FACT_COLUMNS.replace(/x\./g, '')}`,
+        [randomUUID(), projectKey, fx.kind, fx.statement, fx.path || PROJECT_PATH, fx.lines ?? null, fx.confidence ?? null, fx.why ?? null, by,
+          new Date(), toVector(fx.embedding), relevance],
+      );
+      return factOf(rows[0]);
+    });
+  }
+
   /** Which models wrote the project's current facts; a scan with a different one rescans every file. */
   async currentSources(projectKey: string): Promise<string[]> {
     const { rows } = await this.db.pool.query(
-      `SELECT DISTINCT source COLLATE "C" AS s FROM facts WHERE project_key = $1 AND current AND doc_id IS NULL ORDER BY s`,
+      `SELECT DISTINCT source COLLATE "C" AS s FROM facts WHERE project_key = $1 AND current AND doc_id IS NULL AND origin IS DISTINCT FROM 'you' ORDER BY s`,
       [projectKey],
     );
     return rows.map((r) => r.s);
@@ -135,14 +163,14 @@ export class PgFactsStore implements FactsStore {
     return rows.map((r) => ({ id: r.id, projectKey: r.project_key, kind: r.kind, statement: r.statement, path: r.path, why: r.why ?? '' }));
   }
 
-  /** A model's score never replaces yours. Returns how many facts changed. */
+  /** A model's score never replaces yours or an agent's (the operator token). Returns how many facts changed. */
   async setFactRelevance(updates: RelevanceUpdate[]): Promise<number> {
     if (!updates.length) return 0;
     const { rowCount } = await this.db.pool.query(
       `UPDATE facts x SET relevance = u.relevance, relevance_by = u.by
        FROM unnest($1::text[], $2::float8[], $3::text[], $4::text[]) AS u(id, relevance, by, project_key)
        WHERE x.id = u.id AND (u.project_key IS NULL OR x.project_key = u.project_key)
-         AND (u.by = 'you' OR x.relevance_by IS DISTINCT FROM 'you')`,
+         AND (u.by <> 'model' OR coalesce(x.relevance_by, 'model') = 'model')`,
       [updates.map((u) => u.id), updates.map((u) => clampRelevance(u.relevance)), updates.map((u) => u.by), updates.map((u) => u.projectKey ?? null)],
     );
     return rowCount ?? 0;
@@ -204,7 +232,7 @@ export class PgFactsStore implements FactsStore {
     });
   }
 
-  async updateScanJob(id: string, patch: Partial<Pick<ScanJob, 'filesScanned' | 'factsAdded' | 'error'>> & { status?: ScanStatus }): Promise<void> {
+  async updateScanJob(id: string, patch: ScanJobPatch): Promise<void> {
     // Neo4j's `SET j += $patch`: only the keys present change; a key set to null removes the property, which reads
     // back as 0 for the counters and null for the error.
     const has = (k: keyof typeof patch) => Object.hasOwn(patch, k);
@@ -216,9 +244,11 @@ export class PgFactsStore implements FactsStore {
          facts_added = CASE WHEN $5::boolean THEN coalesce($6::integer, 0) ELSE facts_added END,
          error = CASE WHEN $7::boolean THEN $8::text ELSE error END,
          started_at = CASE WHEN $2::text = 'running' THEN $9 ELSE started_at END,
-         finished_at = CASE WHEN $2::text IN ('done', 'failed') THEN $9 ELSE finished_at END
+         finished_at = CASE WHEN $2::text IN ('done', 'failed') THEN $9 ELSE finished_at END,
+         shards = CASE WHEN $10::boolean THEN $11::jsonb ELSE shards END
        WHERE id = $1`,
-      [id, status, has('filesScanned'), patch.filesScanned ?? null, has('factsAdded'), patch.factsAdded ?? null, has('error'), patch.error == null ? null : redactSecrets(patch.error), new Date()],
+      [id, status, has('filesScanned'), patch.filesScanned ?? null, has('factsAdded'), patch.factsAdded ?? null, has('error'), patch.error == null ? null : redactSecrets(patch.error), new Date(),
+        has('shards') && patch.shards !== undefined, patch.shards ? toJson(patch.shards) : null],
     );
   }
 
@@ -234,10 +264,15 @@ export class PgFactsStore implements FactsStore {
               (SELECT count(*) FROM feedback f WHERE f.project_key = p.key) AS feedback,
               (SELECT count(*) FROM lessons l WHERE l.project_key = p.key) AS lessons,
               (SELECT count(*) FROM facts x WHERE x.project_key = p.key AND x.current) AS facts,
+              (SELECT count(*) FROM facts x WHERE x.project_key = p.key AND x.current AND x.doc_id IS NOT NULL) AS document_facts,
+              (SELECT count(*) FROM facts x WHERE x.project_key = p.key AND x.current AND x.doc_id IS NULL
+                 AND (x.origin = 'manifest' OR (x.origin IS NULL AND x.why ~ $1))) AS manifest_facts,
+              (SELECT count(*) FROM facts x WHERE x.project_key = p.key AND x.current AND x.doc_id IS NULL AND x.origin = 'you') AS your_facts,
               to_jsonb(last) AS last
        FROM projects p
        LEFT JOIN LATERAL (SELECT * FROM scan_jobs j WHERE j.project_key = p.key ORDER BY j.requested_at DESC, j.id DESC LIMIT 1) last ON true
        ORDER BY p.key COLLATE "C"`,
+      [MANIFEST_WHY_RE],
     );
     return rows.map((r) => ({
       key: r.key,
@@ -248,6 +283,7 @@ export class PgFactsStore implements FactsStore {
       feedback: r.feedback,
       lessons: r.lessons,
       facts: r.facts,
+      factsByOrigin: { model: r.facts - r.document_facts - r.manifest_facts - r.your_facts, manifest: r.manifest_facts, document: r.document_facts, you: r.your_facts },
       lastScan: r.last ? jobOf(r.last) : null,
       pinned: r.pinned === true,
     }));
@@ -273,12 +309,12 @@ async function insertFacts(c: Exec, projectKey: string, facts: FactRow[], source
   if (!facts.length) return;
   await c.query(
     `INSERT INTO facts (id, project_key, code_file_id, kind, statement, path, lines, confidence, why, source, scan_job_id,
-                        file_hash, current, created_at, valid_from, embedding, relevance, relevance_by)
+                        file_hash, current, created_at, valid_from, embedding, relevance, relevance_by, origin, evidence)
      SELECT n.id, $1, n.code_file_id, n.kind, n.statement, n.path, n.lines, n.confidence, n.why, $2, $3,
             CASE WHEN $4::boolean THEN $5 ELSE cf.hash END, true, $6, $6, n.embedding::vector,
-            n.relevance, CASE WHEN n.relevance IS NULL THEN NULL ELSE 'model' END
-     FROM unnest($7::text[], $8::text[], $9::text[], $10::text[], $11::text[], $12::text[], $13::float8[], $14::text[], $15::text[], $16::float8[])
-            WITH ORDINALITY AS n(id, code_file_id, kind, statement, path, lines, confidence, why, embedding, relevance, ord)
+            n.relevance, CASE WHEN n.relevance IS NULL THEN NULL ELSE 'model' END, n.origin, n.evidence
+     FROM unnest($7::text[], $8::text[], $9::text[], $10::text[], $11::text[], $12::text[], $13::float8[], $14::text[], $15::text[], $16::float8[], $17::text[], $18::text[])
+            WITH ORDINALITY AS n(id, code_file_id, kind, statement, path, lines, confidence, why, embedding, relevance, origin, evidence, ord)
      LEFT JOIN code_files cf ON cf.id = n.code_file_id
      ORDER BY n.ord`,
     [
@@ -293,6 +329,8 @@ async function insertFacts(c: Exec, projectKey: string, facts: FactRow[], source
       facts.map((f) => f.why ?? null),
       facts.map((f) => toVector(f.embedding)),
       facts.map((f) => relevanceOf(f)),
+      facts.map((f) => provenanceOf(f).origin),
+      facts.map((f) => provenanceOf(f).evidence),
     ],
   );
 }
@@ -309,6 +347,8 @@ function factOf(r: Record<string, any>): StoredFact {
     relevance: r.relevance ?? null,
     relevanceBy: r.relevance_by ?? null,
     docId: r.doc_id ?? null,
+    origin: factOrigin({ origin: r.origin, docId: r.doc_id, why: r.why }),
+    evidence: r.evidence ?? null,
     source: r.source,
     scanJobId: r.scan_job_id ?? null,
     fileHash: r.file_hash ?? null,
@@ -334,5 +374,6 @@ function jobOf(r: Record<string, any>): ScanJob {
     error: r.error ?? null,
     attempts: r.attempts ?? 0,
     retryAt: t(r.retry_at),
+    shards: r.shards ?? null,
   };
 }

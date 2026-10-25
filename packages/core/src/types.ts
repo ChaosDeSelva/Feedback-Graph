@@ -122,6 +122,11 @@ export type Candidate = {
   decidedAt: string | null;
   note: string | null;
   /**
+   * Who made the last decision: 'you' (the UI) or 'operator:<name>' (an agent holding FG_OPERATOR_TOKEN). Null while
+   * pending, or decided before this was recorded.
+   */
+  decidedBy?: string | null;
+  /**
    * Who flagged it: the detector (from the transcript), an agent's report_feedback call, or both when the two were the
    * same miss and were merged into this one item (see dedupe.ts). Always set by the stores.
    */
@@ -159,7 +164,30 @@ export type PostMortem = {
   outcome: Outcome;
   lesson: { title: string; rule: string; appliesWhen: string; scope: LessonScope; paths: string[] };
   contextItems: ContextItem[];
+  /** What the lesson check found (stored on the lesson as `checks`); unset: not checked. */
+  lessonChecks?: LessonCheck[];
 };
+
+/**
+ * What the lesson check (worker postmortem/lessonCheck.ts) found on a proposed lesson, shown to the owner before they
+ * decide. A check narrows only what is clearly wrong (a path that is not a repository path, a universal rule from one
+ * nit) and flags the rest; it never approves or rejects.
+ */
+export const LESSON_CHECKS = [
+  'non-repo-path',
+  'bad-path',
+  'needs-path',
+  'universal-from-nit',
+  'meta-lesson',
+  'platitude',
+  'broken-rule',
+  'looks-like-a-fact',
+  'not-pushback',
+  'wrong-session',
+  'self-review',
+] as const;
+export type LessonCheckName = (typeof LESSON_CHECKS)[number];
+export type LessonCheck = { name: LessonCheckName; why: string };
 
 export type LessonStatus = 'proposed' | 'approved' | 'rejected' | 'superseded';
 export type LessonSource = 'postmortem' | 'memory' | 'manual';
@@ -186,6 +214,13 @@ export type Lesson = {
    * agent holding FG_OPERATOR_TOKEN. Null for lessons decided before this was recorded, or never decided.
    */
   decidedBy?: string | null;
+  /**
+   * What the lesson check found when the lesson was proposed (or re-checked), for the owner deciding on it. Null: never
+   * checked (proposed before the checks were stored; the worker re-checks those once). [] : checked, nothing found.
+   */
+  checks?: LessonCheck[] | null;
+  /** Why its last decision was made, when that says more than the status ("converted to a fact"). Null: none given. */
+  decisionNote?: string | null;
 };
 
 /** Everything the post-mortem needs about one confirmed piece of feedback. */
@@ -206,6 +241,11 @@ export type PostMortemInput = {
   /** All human turns in the session, in order (the flagged one included). */
   turns: HumanTurn[];
   note: string | null;
+  /**
+   * Who confirmed it, and so wrote `note`: 'you' (the UI) or 'operator:<name>'. Anything but 'you' (null: not recorded)
+   * puts the note in the prompt as untrusted text, never as the developer's.
+   */
+  noteBy?: string | null;
 };
 
 // ── Code scanning ──────────────────────────────────────────────────────
@@ -228,10 +268,33 @@ export type FactKind = (typeof FACT_KINDS)[number];
  * `why`: the extractor's reason a coding agent needs this fact. `relevance` (0..1): how often an agent doing everyday
  * coding in the project needs it (setup of an external tool is low); null or absent: not scored yet.
  */
-export type CodeFact = { kind: FactKind; statement: string; path: string; lines: string | null; confidence: number; why: string; relevance?: number | null };
+export type CodeFact = {
+  kind: FactKind; statement: string; path: string; lines: string | null; confidence: number; why: string; relevance?: number | null;
+  /** Where it came from (unset on facts saved before this was recorded: see factOrigin). */
+  origin?: FactOrigin;
+  /** How well its citation was checked when it was saved (unset on older facts: unknown). */
+  evidence?: FactEvidence;
+};
 
-/** Who set a fact's relevance: the extractor or the background scorer ('model'), or you ('you', never overwritten). */
-export type RelevanceBy = 'model' | 'you';
+/**
+ * model: a model read the code. manifest: read from package.json, go.mod, a Makefile... without a model. document: from
+ * an upload. you: the owner (or an agent with the operator token) wrote it, e.g. a lesson converted to a fact; no scan
+ * closes or replaces it.
+ */
+export const FACT_ORIGINS = ['model', 'manifest', 'document', 'you'] as const;
+export type FactOrigin = (typeof FACT_ORIGINS)[number];
+/**
+ * line: the cited lines exist and hold what the statement names. file: the file exists, the lines were missing, wrong
+ * or past its end (and were dropped). none: project-wide, nothing to check.
+ */
+export const FACT_EVIDENCE = ['line', 'file', 'none'] as const;
+export type FactEvidence = (typeof FACT_EVIDENCE)[number];
+
+/**
+ * Who set a fact's relevance: the extractor or the background scorer ('model'), you ('you'), or an agent holding
+ * FG_OPERATOR_TOKEN ('operator:<name>'). Only 'model' is ever overwritten by a model.
+ */
+export type RelevanceBy = 'model' | 'you' | `operator${string}`;
 
 /** Relevance used for ranking when a fact has none yet. */
 export const UNSCORED_RELEVANCE = 0.5;
@@ -253,7 +316,12 @@ export type ScanJob = {
   attempts: number;
   /** Queued but not to run before this (ISO): backing off after a failure or an unreachable model. */
   retryAt: string | null;
+  /** An agentic scan's shards (packages or services, one agent run each): null for a per-file scan or before the end. */
+  shards?: ScanShards | null;
 };
+
+/** How many shards an agentic scan had, how many it rescanned (the others had not changed) and how many of those failed. */
+export type ScanShards = { total: number; rescanned: number; failed: number };
 
 export type ProjectSummary = {
   key: string;
@@ -265,9 +333,13 @@ export type ProjectSummary = {
   feedback: number;
   lessons: number;
   facts: number;
+  /** The current facts split by where they came from (factOrigin): the model's are the ones to headline. */
+  factsByOrigin?: Record<FactOrigin, number>;
   lastScan: ScanJob | null;
   /** You pinned it: it comes first in every project list (UI order only). */
   pinned: boolean;
+  /** Confirmed links to other shown projects. Counted by the API from the links store; absent when it has none. */
+  links?: number;
 };
 
 // ── Provenance ─────────────────────────────────────────────────────────
@@ -305,6 +377,9 @@ export const ACTIVITY_KINDS = [
   'links_suggested',
   'link_decided',
   'doc_read',
+  'comments_skipped',
+  'lessons_checked',
+  'lesson_to_fact',
 ] as const;
 export type ActivityKind = (typeof ACTIVITY_KINDS)[number];
 
@@ -334,7 +409,7 @@ export type WorkerStatus = {
   providers: Record<string, string | null>;
   /** Feedback Graph Cloud sync; absent or null when CLOUD_URL is not set. */
   cloudSync?: CloudSyncStatus | null;
-  /** How each job's model last fared (classify, postmortem, scan, summary, docs); missing until it is first asked. */
+  /** How each job's model last fared (classify, postmortem, scan, summary, docs, chat); missing until it is first asked. */
   health?: Partial<Record<ModelJob, ProviderHealth>>;
   /** Jobs turned off on purpose (SUMMARY_LLM=off), so a missing model is not reported as broken. */
   off?: ModelJob[];
@@ -361,7 +436,7 @@ export type WorkerBacklog = { classify: number; classifyCapped: boolean; at: str
  */
 export type ProviderHealth = { provider: string; ok: boolean; reason: string | null; at: string; since?: string };
 
-export const MODEL_JOBS = ['classify', 'postmortem', 'scan', 'summary', 'docs'] as const;
+export const MODEL_JOBS = ['classify', 'postmortem', 'scan', 'summary', 'docs', 'chat'] as const;
 export type ModelJob = (typeof MODEL_JOBS)[number];
 /** A job's model as /api/status reports it: ok until it was last found unavailable (or, for an Ollama model, while
  * Ollama does not answer), with the reason. */
@@ -405,7 +480,15 @@ export type SystemStatus = {
    */
   selection: { initialized: boolean; tracked: number; roots?: number; note: string | null } | null;
   /** Feedback Graph Cloud sync: null when off. The token is always shown as [REDACTED]. */
-  cloud?: { host: string; token: '[REDACTED]'; intervalMinutes: number | null } | null;
+  cloud?: {
+    host: string;
+    token: '[REDACTED]';
+    intervalMinutes: number | null;
+    /** The last Sync now this api ran (Settings or fg cloud sync-now); null: none since it started. */
+    lastManual?: { at: string; ok: boolean; error: string | null; sent: Record<string, number>; unchanged: number; failed: number } | null;
+    /** A Sync now in progress: projects done of total, the one being sent, and since when. */
+    syncing?: { done: number; total: number; current: string | null; startedAt: string } | null;
+  } | null;
   /** Each job's model from the worker's heartbeat; null when the worker has not reported. */
   models?: Record<ModelJob, ModelHealth> | null;
   /** Turns the classifier gave up on (they can be re-queued); null when unknown. */

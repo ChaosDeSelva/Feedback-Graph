@@ -38,6 +38,10 @@
   --color-info: #2f6bd8;
   --color-info-soft: #e3ecfb;
   --color-info-text: #1f52b0;
+  /* A fifth hue for marks that need one more distinct color (a cause, the Linear source); not a status. */
+  --color-violet: #7c4ddb;
+  --color-violet-soft: #eee7fb;
+  --color-violet-text: #5b33b0;
   --color-neutral-soft: #ecebe5;
 
   --color-focus: #2f6bd8;
@@ -95,6 +99,9 @@
     --color-info: #4f84e6;
     --color-info-soft: #172642;
     --color-info-text: #91b3f3;
+    --color-violet: #9b7cf0;
+    --color-violet-soft: #2a2140;
+    --color-violet-text: #c3adf7;
     --color-neutral-soft: #2a2a27;
     --color-focus: #6f9cf0;
     --color-node-feedback: #e0a200;
@@ -139,6 +146,9 @@
   --color-info: #4f84e6;
   --color-info-soft: #172642;
   --color-info-text: #91b3f3;
+  --color-violet: #9b7cf0;
+  --color-violet-soft: #2a2140;
+  --color-violet-text: #c3adf7;
   --color-neutral-soft: #2a2a27;
   --color-focus: #6f9cf0;
   --color-node-feedback: #e0a200;

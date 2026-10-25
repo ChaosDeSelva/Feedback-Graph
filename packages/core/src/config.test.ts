@@ -16,9 +16,10 @@ test('defaults fill in everything optional', () => {
 });
 
 test('Ollama generation limits and timeout default sanely, can be tuned, and bad values are named', () => {
-  expect(loadConfig(base).ollama).toMatchObject({ numPredict: 2048, repeatPenalty: 1.1, timeoutSeconds: null });
-  expect(loadConfig({ ...base, OLLAMA_NUM_PREDICT: '4096', OLLAMA_REPEAT_PENALTY: '1.2', OLLAMA_TIMEOUT_SECONDS: '300' }).ollama)
-    .toMatchObject({ numPredict: 4096, repeatPenalty: 1.2, timeoutSeconds: 300 });
+  expect(loadConfig(base).ollama).toMatchObject({ numPredict: null, numCtx: 16384, repeatPenalty: 1.1, timeoutSeconds: null });
+  expect(loadConfig({ ...base, OLLAMA_NUM_PREDICT: '4096', OLLAMA_NUM_CTX: '32768', OLLAMA_REPEAT_PENALTY: '1.2', OLLAMA_TIMEOUT_SECONDS: '300' }).ollama)
+    .toMatchObject({ numPredict: 4096, numCtx: 32768, repeatPenalty: 1.2, timeoutSeconds: 300 });
+  expect(() => loadConfig({ ...base, OLLAMA_NUM_CTX: '100' })).toThrow(/OLLAMA_NUM_CTX must be a number of at least 512/);
   expect(() => loadConfig({ ...base, OLLAMA_NUM_PREDICT: 'lots' })).toThrow(/OLLAMA_NUM_PREDICT must be a number of at least 1/);
   expect(() => loadConfig({ ...base, OLLAMA_REPEAT_PENALTY: '0' })).toThrow(/OLLAMA_REPEAT_PENALTY must be a number of at least 0\.01/);
   expect(() => loadConfig({ ...base, OLLAMA_TIMEOUT_SECONDS: '0' })).toThrow(/OLLAMA_TIMEOUT_SECONDS must be a number of at least 1/);
@@ -240,7 +241,9 @@ test('an operator token lets agents make owner decisions; unset, there is none, 
   expect(op.token).toBe('o'.repeat(32));
   // By default not deciding lessons (what agents learn stays the owner's call), nor anything that deletes data, changes
   // what is mounted, imports lessons from a file, or touches integration keys.
-  const off = ['lesson_decide', 'delete_project', 'docs_delete', 'settings', 'import', 'integrations'];
+  const off = ['lesson_decide', 'delete_project', 'docs_delete', 'settings', 'import', 'integrations', 'chat_delete'];
+  // Asking in Ask spends the owner's subscription but changes nothing agents learn: on. Deleting a chat deletes data: off.
+  expect(op.allow).toContain('chat');
   expect(op.allow).toEqual(OPERATOR_VERBS.filter((v) => !off.includes(v)));
 });
 
@@ -266,8 +269,16 @@ test('the API refuses to listen beyond this machine without a token', () => {
   expect(loadConfig({ ...base, API_BIND: '127.0.0.1' }).apiListen).toBe('127.0.0.1');
 });
 
+test('CHAT_LLM sets the default model of Ask conversations; unset, the worker picks one from the logins it has', () => {
+  expect(loadConfig(base).llm.chat).toBeNull();
+  expect(loadConfig({ ...base, CHAT_LLM: 'claude-cli:opus' }).llm.chat).toBe('claude-cli:opus');
+  expect(loadConfig({ ...base, CHAT_LLM: 'ollama:gemma4' }).llm.chat).toBe('ollama:gemma4');
+  expect(() => loadConfig({ ...base, CHAT_LLM: 'gpt5' })).toThrow(/CHAT_LLM: unknown provider/);
+  expect(() => loadConfig({ ...base, CHAT_LLM: 'jev' })).toThrow(/CHAT_LLM: jev is a classification model/);
+});
+
 test('codex-cli for a worker job needs the owner to accept that it is not confined', () => {
-  for (const k of ['POSTMORTEM_LLM', 'SCAN_LLM', 'CLASSIFY_LLM', 'SUMMARY_LLM']) {
+  for (const k of ['POSTMORTEM_LLM', 'SCAN_LLM', 'CLASSIFY_LLM', 'SUMMARY_LLM', 'CHAT_LLM']) {
     expect(() => loadConfig({ ...base, [k]: 'codex-cli:gpt-5' })).toThrow(new RegExp(`${k}.*ALLOW_UNCONFINED_CODEX=1`));
     expect(() => loadConfig({ ...base, [k]: 'codex-cli', ALLOW_UNCONFINED_CODEX: '1' })).not.toThrow();
   }

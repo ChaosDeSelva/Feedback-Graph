@@ -175,6 +175,27 @@ test('an empty inbox with projects selected and nothing given up shows the usual
   expect(screen.queryByRole('link', { name: /open settings/i })).toBeNull();
 });
 
+test('pending filtered to a project with nothing waiting shows that project\'s pipeline counts', async () => {
+  const urls: string[] = [];
+  vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+    urls.push(url);
+    if (url === '/api/projects') return Response.json([{ key: 'demo' }, { key: 'other' }]);
+    if (url === '/api/candidates?status=pending&limit=500') return Response.json([cand('c1', 'first miss')]);
+    if (url.startsWith('/api/candidates?')) return Response.json([]);
+    if (url.startsWith('/api/pipeline')) return Response.json({ stage: null, progress: null, sessions: 4, classify: null, inbox: { pending: 0, confirmed: 0 }, postmortems: null, lessons: null, scans: null });
+    const m = url.match(/\/api\/candidates\/(\w+)$/);
+    if (m) return Response.json(detail(m[1]));
+    return Response.json([]);
+  }));
+  render(<Inbox />);
+  await screen.findByText('turn text c1');
+  expect(screen.queryByRole('region', { name: 'pipeline' })).toBeNull();
+  fireEvent.change(screen.getByLabelText('project'), { target: { value: 'other' } });
+  const panel = await screen.findByRole('region', { name: 'pipeline' });
+  expect(urls).toContain('/api/pipeline?project=other');
+  expect(panel.textContent).toMatch(/other: nothing to show here yet/);
+});
+
 test('the project filter lists every project, and keeps showing the one picked when its list is empty', async () => {
   vi.stubGlobal('fetch', vi.fn(async (url: string) => {
     if (url === '/api/projects') return Response.json([{ key: 'demo' }, { key: 'other' }]);
@@ -283,6 +304,34 @@ test('pending items are listed in the order they arrived, then by id, whatever o
   await screen.findByText('miss a9');
   const order = screen.getAllByText(/^miss /).map((e) => e.textContent);
   expect(order).toEqual(['miss a9', 'miss b1', 'miss b2']);
+});
+
+test('each list row labels its confidence as the classifier\'s', async () => {
+  render(<Inbox />);
+  await screen.findByText('first miss');
+  const chip = screen.getAllByText('90% sure')[0];
+  expect(chip.getAttribute('title')).toMatch(/classifier/);
+});
+
+test('a link to a tab (#inbox/confirmed) opens on that tab, not as an item', async () => {
+  location.hash = '#inbox/confirmed';
+  const urls: string[] = [];
+  vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+    urls.push(url);
+    if (url.startsWith('/api/candidates?status=confirmed')) return Response.json([{ ...cand('c1', 'first miss'), status: 'confirmed' }]);
+    if (url.startsWith('/api/candidates?')) return Response.json([cand('c9', 'pending one')]);
+    const m = url.match(/\/api\/candidates\/(\w+)$/);
+    if (m) return Response.json(detail(m[1]));
+    return Response.json([]);
+  }));
+  try {
+    render(<Inbox />);
+    expect(await screen.findByText('first miss')).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'confirmed' }).getAttribute('aria-pressed')).toBe('true');
+    expect(urls).not.toContain('/api/candidates/confirmed');
+  } finally {
+    location.hash = '';
+  }
 });
 
 test('an item only the detector flagged has no agent note', async () => {

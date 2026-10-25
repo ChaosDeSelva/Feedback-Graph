@@ -14,7 +14,19 @@ import { inEmptyFolder } from './promptOnly.ts';
  * One structured-output request. `cwd` lets agentic providers read the repo themselves; without one they run in a fresh
  * empty folder (never the process's own). Prompt-only jobs go through askPromptOnly (promptOnly.ts).
  */
-export type JsonTask = { system: string; user: string; schema: object; cwd?: string; timeoutMs?: number; images?: TaskImage[] };
+export type JsonTask = {
+  system: string;
+  user: string;
+  schema: object;
+  cwd?: string;
+  timeoutMs?: number;
+  images?: TaskImage[];
+  /**
+   * The most tokens this job's answer needs (a short label: 256). Ollama sends it as num_predict unless
+   * OLLAMA_NUM_PREDICT overrides every job; absent: DEFAULT_NUM_PREDICT. Other providers keep their own limits.
+   */
+  maxTokens?: number;
+};
 
 /** An image sent with a request (an uploaded screenshot, diagram or mock), base64 without a data: prefix. */
 export type TaskImage = { mediaType: ImageMediaType; data: string };
@@ -130,7 +142,8 @@ function ollama(id: string, model: string, env: ProviderEnv, o: ProviderOpts): L
       url, model, system: t.system, user: t.user, schema: t.schema, fetchImpl: o.fetchImpl,
       // OLLAMA_TIMEOUT_SECONDS, when set, is the limit for every Ollama call; otherwise each job's own.
       timeoutMs: tune.timeoutMs ?? t.timeoutMs,
-      numPredict: tune.numPredict,
+      numPredict: tune.numPredict ?? t.maxTokens,
+      numCtx: tune.numCtx,
       repeatPenalty: tune.repeatPenalty,
       images: t.images?.map((i) => i.data),
     }),

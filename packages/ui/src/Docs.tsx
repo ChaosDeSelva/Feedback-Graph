@@ -1,4 +1,4 @@
-import type { ReactNode } from 'react';
+import { useState, type ReactNode } from 'react';
 import { PageHeader } from './ui/PageHeader.tsx';
 import { Kbd } from './ui/display.tsx';
 
@@ -162,44 +162,85 @@ export function Docs() {
         </Section>
 
         <Section title="Each page">
-          <dl className="space-y-3">
-            <Page name="Inbox">
-              Possible pushback, with the conversation around it. <b>Pending</b> is waiting for you; <b>Confirmed</b> shows each item's post-mortem state, with
-              a retry button if one failed; <b>Rejected</b> lets you change your mind.
-            </Page>
-            <Page name="Lessons">
-              Proposed lessons with the miss and evidence behind them. Scope decides where a lesson applies: <b>task</b> (work like this one), <b>project</b>, or
-              <b> global</b> (every project). Prefer the narrowest scope that fits. An approved lesson can be revoked at any time.
-            </Page>
-            <Page name="Graph">
-              The evidence chain for a project: feedback, misses, causes, lessons and the context items behind them. Click a node to follow its links.{' '}
-              <b>Code</b> mode draws one project's code map: its top hotspot files sized by score (red when misses touched them), their imports and tests,
-              and the misses and lessons on them; click a file for its module panel.
-            </Page>
-            <Page name="Patterns">
-              Whether this is working: how often the same kind of miss repeats, why misses happen, how often an agent's pre-done check caught a gap, and
-              where agents struggle (the top code map hotspots).
-            </Page>
-            <Page name="Sessions">
-              A running summary of each session of the selected projects: its goal, what was done and decided, open threads, pushback and files touched. The
-              worker summarizes a session once it has been quiet for a few minutes, then only the turns that came after, merged into the summary; after half
-              an hour of quiet the session is <b>idle</b> (complete for now) until it continues. Each update is listed with the turns it took in.
-              Summaries stay on this machine: they are never exported or synced.
-            </Page>
-            <Page name="Projects">
-              Per project: <b>Pin</b> it, its <b>linked projects</b> (and suggestions to confirm), its <b>code map</b> (size, last build and hotspots; click a file for its symbols, importers, tests, lessons and misses), <b>Scan</b>
-              the code for facts (choose which model reads it), search and sort the facts by relevance, upload docs and images agents should know about (read into facts), export everything learned, or delete it.
-            </Page>
-            <Page name="Activity">The log of everything the tool created or changed, who or what did it, and why, including each <b>code mapped</b> build with its size and duration.</Page>
-            <Page name="Settings">
-              Which project folders are read. Tick folders and press <b>Save selection</b>. <b>Where folders come from</b> holds the project roots: add
-              or remove them there (there is none by default), and the folders sessions ran in outside them are suggested with their session counts, each
-              one click from being a root. A saved change is mounted when you run <Code>./scripts/setup.sh</Code>, which restarts the containers. A folder
-              that is not a git repo but holds repos one or two levels down is not one project: each git repo inside it is a project of its own.{' '}
-              <b>Clean up</b> deletes the data of projects you have not selected. Every other page shows only the selected
-              projects; Settings is the one place that lists every folder.
-            </Page>
-          </dl>
+          <p className="mb-3 text-muted">
+            Open a page below for how to read it. Colours mean the same everywhere: <b>blue</b> is waiting (pending, proposed, queued), <b>green</b> is
+            done or kept (confirmed, approved), <b>red</b> is refused or failed, <b>grey</b> is neutral or retired. Only lessons you approve ever reach
+            agents. The full guide, with every badge, is <Code>docs/guide.md</Code>.
+          </p>
+          <div className="grid gap-2">
+            <PageGuide name="Dashboard" shot="dashboard" summary="Where everything stands, each part linked to its page.">
+              <li><b>Now</b>: the worker (green running, red offline) and the step it is on; one badge per model job (classifier, post-mortem, scan, summaries, docs reader, embeddings), red with the reason when it cannot be reached.</li>
+              <li><b>Ask</b>: pick a project, type, press Ask (<Kbd>⌘</Kbd>/<Kbd>Ctrl</Kbd>+<Kbd>Enter</Kbd>): it opens a new chat on the Ask page.</li>
+              <li><b>Pipeline</b> tiles: Inbox waiting on you, turns to classify (<b>1000+</b> when capped; opens Activity filtered to feedback flagged, with the backlog), post-mortems queued (opens the Inbox&apos;s confirmed tab), lessons <b>proposed / approved</b>, scans <b>done / queued / running / failed</b>. A dash means unknown.</li>
+              <li><b>Quality</b>: <b>repeat rate</b> (confirmed feedback that repeats an earlier kind of miss; lower is better), <b>checks that caught a gap</b> (pre-done checks that found one), and feedback per week: grey first time, red repeats.</li>
+              <li><b>Projects</b> (pinned first), <b>Hotspots</b> (misses and score; a file opens its module panel) and <b>Recent activity</b>. Each card loads on its own, so one error never blanks the page.</li>
+            </PageGuide>
+
+            <PageGuide name="Ask" shot="ask" summary="Chat about one project; the answer ends with a prompt for your agent.">
+              <li>A chat about one project, one conversation per topic. Ask what already exists (&quot;I want to add a modal: what do we have?&quot;) or where something belongs (&quot;where would feature X go?&quot;).</li>
+              <li><b>New chat</b>: pick the project and the model (Default, Claude, Codex, Local model; <Code>CHAT_LLM</Code> sets the default). The answer uses the project and its confirmed linked projects. The model gets only your question and that context, never the repository, and secret files are never read.</li>
+              <li>While it writes, <b>Answering with Claude… 0:42</b> counts up; a red box with <b>Retry</b> means it failed. The list shows a blue <b>answering</b> badge.</li>
+              <li><b>[S1]</b> in the answer points to <b>Sources</b>: kind badges <b>lesson</b> (green), <b>miss</b> (red), <b>fact</b> (accent), <b>code</b> (blue), doc, session, linked (grey).</li>
+              <li><b>Examples</b>: existing code with <Code>path:lines</Code>, why it fits, and where it is used; each path opens its module panel.</li>
+              <li><b>Prompt for your agent</b>: <b>Copy</b> it into Claude Code or Codex. It names the files to read first and the Feedback Graph tools to use. Tip: select the tool&apos;s own folder in Settings and ask about it.</li>
+            </PageGuide>
+
+            <PageGuide name="Inbox" shot="inbox" summary="Possible pushback for you to confirm or reject. Only confirmed items are learned from.">
+              <li>Tabs <b>pending</b>, <b>confirmed</b>, <b>rejected</b>; filter by source and project. Pending items stay in arrival order while you work.</li>
+              <li>Each row: a <b>source</b> badge (Claude accent, Codex grey, GitHub blue, Linear violet), <b>self-review</b> when an agent reviewed its own PR under the author&apos;s account, the project, and the classifier&apos;s <b>confidence %</b> that this is pushback, shown as &quot;87% sure&quot;.</li>
+              <li>The pane: the flagged turn (accent border, <b>flagged as pushback</b>) with the turns and the agent&apos;s reply around it. For a comment: the PR or Linear issue, its work session and author chips <b>reviewer</b> or <b>PR author</b> (blue), <b>AI agent</b> or <b>bot</b> (grey).</li>
+              <li>A grey <b>skip rule</b> note means the comment would be kept out if it came in today: a hint, the decision stays yours. <b>Reported by the agent</b> means an agent sent it with <Code>report_feedback</Code>.</li>
+              <li><Kbd>j</Kbd>/<Kbd>k</Kbd> move, <Kbd>c</Kbd> confirm (sends it for a post-mortem, with your optional note), <Kbd>r</Kbd> reject (nothing is learned). The <b>confirmed</b> tab shows each post-mortem: waiting, retrying, gave up or done, with <b>Retry post-mortem now</b>.</li>
+            </PageGuide>
+
+            <PageGuide name="Lessons" shot="lessons" summary="Proposed lessons to approve. Approving is what agents learn from.">
+              <li>Tabs <b>proposed</b>, <b>approved</b> (agents get these), <b>rejected</b> (rejected or revoked), <b>superseded</b> (replaced by a newer one).</li>
+              <li>Each row: the project or <b>global</b>, where it came from (<b>post-mortem</b>, <b>memory file</b>, <b>by you</b>; hover for the full wording), the <b>cause</b> with its dot, and red <b>check chips</b> from the automatic lesson check (hover for why), such as <b>needs a path</b>, <b>platitude</b> or <b>not pushback</b>. An accent <b>approved by agent</b> badge means an agent with the operator token decided, not you.</li>
+              <li>Causes: <b>context missing</b> (blue), <b>context available, ignored</b> (red), <b>requirement unstated</b> (grey), <b>verification gap</b> (accent), <b>implementation error</b> (violet). The same colours on Patterns and the Graph.</li>
+              <li>The pane: <b>Before you approve</b> (the check findings), <b>You said</b>, <b>What was missed</b>, context that would have prevented it (red <b>was available to the agent</b> or grey <b>not loaded in the session</b>), and fix commits.</li>
+              <li>Edit the title, rule, applies when and scope: <b>task</b> (work like this one), <b>project</b>, or <b>global</b> (every project). Prefer the narrowest. <b>Approve</b> saves your edits and serves it; on an approved lesson <b>Save</b> keeps it approved with your edits; <b>Revoke</b> stops agents getting it straight away; <b>Back to proposed</b> reopens a rejected one.</li>
+              <li><b>Convert to fact</b>: a lesson that only states how the code is (often flagged <i>looks like a fact</i>) becomes a project fact you wrote. No scan replaces it, agents get it as a fact, and the lesson is rejected with the note <i>converted to a fact</i>.</li>
+            </PageGuide>
+
+            <PageGuide name="Graph" shot="graph" summary="The evidence chain behind each miss, or a project's code map." extraShot={{ name: 'graph-code', alt: 'The Graph page in Code mode' }}>
+              <li><b>Evidence</b> mode: feedback, misses, causes, lessons, context, tasks and fix commits, coloured as in the legend (with counts). Causes are the biggest circles, misses medium. Click a node for its text and connections; click a connection to move to it.</li>
+              <li><b>Code</b> mode draws one project&apos;s code map: its top hotspot files sized by score (red when misses touched them; lighter circles are tests), their imports (arrows) and tests (dashed), and the misses (diamonds) and lessons (squares) on them; click a file for its module panel.</li>
+              <li>The top 12 hotspots and files with misses are always captioned; zoom in to name every file. Hover for the full path, score and misses. <b>Find a file by path</b> opens any mapped file. A note says when the drawing or the map is capped.</li>
+            </PageGuide>
+
+            <PageGuide name="Patterns" shot="patterns" summary="Whether misses repeat, why they happen, and where agents struggle.">
+              <li><b>repeat rate</b> = repeats ÷ confirmed feedback, where a repeat is the same kind of miss as an earlier one. It should fall over time.</li>
+              <li><b>checks that caught a gap</b> (the catch rate) = pre-done checks that found a gap ÷ all pre-done checks.</li>
+              <li><b>Why misses happen</b> (one bar per cause), <b>Feedback per week</b> (grey first time, red repeats), <b>Where agents struggle</b> (the top hotspots), and <b>Repeated misses</b> grouped with their count, projects, cause and last date.</li>
+            </PageGuide>
+
+            <PageGuide name="Sessions" shot="sessions" summary="A running summary of each agent session.">
+              <li>A running summary of each session of the selected projects: its goal, what was done and decided, open threads, pushback and files touched.</li>
+              <li><b>active</b> (blue): turns are still coming in. <b>idle</b> (grey): quiet for half an hour and summarized to its last turn, complete for now until it continues. An accent <b>n new</b> badge counts turns not yet in the summary.</li>
+              <li>The worker summarizes a session once it has been quiet for a few minutes, then only the newer turns, merged in. <b>Update history</b> lists each update with the turns it took in. <b>Rebuild summary</b> redoes it from the first turn.</li>
+              <li><b>Flagged in this session</b> links its Inbox items and lessons. Summaries stay on this machine: they are never exported or synced.</li>
+            </PageGuide>
+
+            <PageGuide name="Projects" shot="projects" summary="Links, code map, facts, docs and your data, per project." extraShot={{ name: 'projects-facts', alt: 'Code facts on the Projects page' }}>
+              <li><b>Pin</b> lists a project first everywhere. <b>Scan</b> reads its code into facts with the model you choose; the last scan shows status, files, facts and its place in the queue.</li>
+              <li><b>Linked projects</b>: confirmed links (accent relation) give agents here the best matches from the other project. <b>Suggested</b> links show the evidence and its strength in %; they do nothing until you <b>Confirm</b> (<b>Undo</b> stays for a few seconds).</li>
+              <li><b>Code map</b>: files (&quot;400 of 10,290&quot; when capped by <Code>SCAN_MAX_FILES</Code>), symbols, edges, last built. Hotspots sort by churn (commits in 90 days), misses, dependents (importers) and <b>score = 4 × misses + log2(1 + churn) + log2(1 + dependents)</b>. A file opens its module panel: what it is, symbols, importers, imports, tests, approved lessons and past misses.</li>
+              <li><b>Code facts</b> by relevance: <b>everyday</b> (green, 0.8 and up, agents get it first), <b>sometimes</b> (blue), <b>rare</b> (grey, below 0.4, only when a task is about it), <b>unscored</b>. Evidence: <b>line checked</b>, <b>file only</b>, <b>not checkable (no file)</b>. A <b>manifest</b> badge means read without a model. <b>how was this created?</b> shows the model, reason, file version and scan; the band buttons set relevance yourself.</li>
+              <li><b>Docs and discussions</b>: uploads read into facts show queued, reading, <b>not read</b> (with <b>retry</b>) or <b>n facts</b>. <b>Export</b> downloads a JSON bundle; <b>Delete project data</b> removes everything learned, after you type the name. <b>Import bundle</b> brings lessons back as proposed unless you tick keep approved.</li>
+            </PageGuide>
+
+            <PageGuide name="Activity" shot="activity" summary="The log of everything created or changed, by whom, and why.">
+              <li>The log of everything the tool created or changed, who or what did it, and why, including each <b>code mapped</b> build with its size and duration. Filter by project and kind; click a row for its details and the ids it touched.</li>
+              <li><b>By</b>: <b>you</b>; <b>operator:&lt;name&gt;</b>, an agent with the operator token acting for you; a model id like <Code>ollama:gemma4</Code>; an agent over MCP like <Code>claude-code</Code>; or a pipeline step such as <b>deterministic</b>, <b>skip-rules</b> or <b>lesson-check</b>. Hover an actor, or read the legend above the list, for which kind it is.</li>
+              <li>Kind colours: decisions take the colour of what was decided (green confirmed or approved, red rejected); post-mortem green; failures and deletes red; flags blue.</li>
+            </PageGuide>
+
+            <PageGuide name="Settings" shot="settings" summary="Which project folders are read, and the connections.">
+              <li>Which project folders are read. Tick folders and press <b>Save selection</b>. Badges: <b>selected</b> (green), <b>adding</b> or <b>stopping</b> (unsaved), <b>excluded</b>, <b>clone of</b> another folder, <b>missing folder</b>, <b>has data</b>. A greyed box says why on hover.</li>
+              <li><b>Where folders come from</b> holds the project roots: add or remove them there (there is none by default), and the folders sessions ran in outside them are suggested with their session counts, each one click from being a root. A saved change is mounted when you run <Code>./scripts/setup.sh</Code>, which restarts the containers. A folder that is not a git repo but holds repos one or two levels down is not one project: each git repo inside it is a project of its own.</li>
+              <li><b>Integrations</b> (GitHub, Linear, read-only), the comment <b>skip rules</b> with their counts, <b>Cloud sync</b>, and <b>Clean up</b>, which deletes the data of projects you have not selected. Every other page shows only the selected projects; Settings is the one place that lists every folder.</li>
+            </PageGuide>
+          </div>
         </Section>
 
         <Section title="Choosing models">
@@ -316,6 +357,37 @@ function Tool({ name, children }: { name: string; children: ReactNode }) {
       <dt><Code>{name}</Code></dt>
       <dd className="text-muted">{children}</dd>
     </div>
+  );
+}
+
+/**
+ * A screenshot from public/guide/, in a bordered frame. The images are added separately; until one exists (or if it
+ * fails to load) the frame hides itself, so the page never shows a broken image.
+ */
+export function GuideShot({ name, alt }: { name: string; alt: string }) {
+  const [failed, setFailed] = useState(false);
+  return (
+    <figure style={failed ? { display: 'none' } : undefined} className="my-2 overflow-hidden rounded-md border border-line bg-sunken shadow-card">
+      <img src={`/guide/${name}.png`} alt={alt} loading="lazy" onError={() => setFailed(true)} className="block h-auto w-full" />
+    </figure>
+  );
+}
+
+/** One page of the UI: what it is for in the summary line, and how to read it (with its screenshot) when opened. */
+function PageGuide({ name, shot, summary, extraShot, children }: { name: string; shot: string; summary: string; extraShot?: { name: string; alt: string }; children: ReactNode }) {
+  return (
+    <details className="group rounded-md border border-line bg-surface">
+      <summary className="flex cursor-pointer list-none items-baseline gap-3 px-3 py-2 select-none hover:bg-sunken [&::-webkit-details-marker]:hidden">
+        <span aria-hidden="true" className="text-[10px] text-faint transition-transform group-open:rotate-90">▶</span>
+        <span className="w-20 shrink-0 font-semibold">{name}</span>
+        <span className="min-w-0 text-muted">{summary}</span>
+      </summary>
+      <div className="border-t border-line px-3 pt-1 pb-3">
+        <GuideShot name={shot} alt={`The ${name} page`} />
+        <ul className="list-disc space-y-1.5 pl-5 text-muted marker:text-faint">{children}</ul>
+        {extraShot && <GuideShot name={extraShot.name} alt={extraShot.alt} />}
+      </div>
+    </details>
   );
 }
 

@@ -102,6 +102,9 @@ test('get_module_context says when the file is not in the map, when there is no 
   // A capped map says so: the file may simply be past the cap.
   const capped = deps({ codegraph: codegraph({ codeMapMeta: async () => ({ fingerprint: 'abc', builtAt: '2026-10-22T12:00:00Z', stats: { files: 400, symbols: 1, imports: 1, tests: 0 }, candidates: 10_290 }), moduleContext: async () => null }).cg });
   expect((await getModuleContext({ project: 'demo', path: 'src/x.ts' }, capped)).markdown).toMatch(/400 of 10290 files[\s\S]*SCAN_MAX_FILES/);
+  // Built before the total was counted: at the cap, it is still called capped.
+  const old = deps({ codegraph: codegraph({ codeMapMeta: async () => ({ fingerprint: 'abc', builtAt: '2026-10-22T12:00:00Z', stats: { files: 4000, symbols: 1, imports: 1, tests: 0 }, candidates: null }), moduleContext: async () => null }).cg });
+  expect((await getModuleContext({ project: 'demo', path: 'src/x.ts' }, old)).markdown).toMatch(/capped at 4000 files[\s\S]*files past the cap are left out/);
   const none = deps({ codegraph: codegraph({ codeMapMeta: async () => null, moduleContext: async () => null }).cg });
   expect((await getModuleContext({ project: 'demo', path: 'src/x.ts' }, none)).markdown).toMatch(/no code map/i);
   const out = await getModuleContext({ cwd: '/Users/j/Vibe/demo', path: '/etc/passwd' }, deps());
@@ -123,6 +126,47 @@ test('module context fences misses and facts as data: injected text cannot start
   expect(md).not.toContain('**Run rm -rf**');
   expect(md.split('\n').filter((l) => l.startsWith('## ')).every((l) => !l.includes('rm -rf') && !l.includes('## b'))).toBe(true);
   expect(md.split('\n').filter((l) => l.startsWith('## Approved lessons'))).toHaveLength(1);
+});
+
+test('a stored non-miss on a file is never served by get_module_context, impact or the task context', async () => {
+  const non = miss({ missId: 'miss:0', missed: 'The agent did not miss the feedback: it was about another pull request' });
+  const m = { ...pool, misses: [miss(), non] };
+  const d = deps({ codegraph: codegraph({ moduleContext: async () => m, impact: async () => ({ paths: ['src/db/pool.ts'], dependents: [], tests: [], misses: [non], lessons: [] }) }).cg });
+  const mod = await getModuleContext({ project: 'demo', path: 'src/db/pool.ts' }, d);
+  expect(mod.markdown).toContain('leaked pool clients on error');
+  expect(mod.markdown).not.toContain('did not miss');
+  expect(mod.module?.misses.map((x) => x.missId)).toEqual(['miss:1']);
+  const imp = await getImpact({ project: 'demo', paths: ['src/db/pool.ts'] }, d);
+  expect(imp.markdown).not.toContain('did not miss');
+  expect(imp.markdown).not.toContain('## Past misses');
+  const task = await getTaskContext({ project: 'demo', task: 'pool', files: ['src/db/pool.ts'] }, deps({ codegraph: codegraph({ moduleContext: async () => ({ ...pool, misses: [miss(), non] }) }).cg }));
+  expect(task.markdown).not.toContain('did not miss');
+});
+
+test('when the import graph is known incomplete, empty importer and test lists say so instead of "(0)"', async () => {
+  const lonely = { ...pool, importers: [], tests: [] };
+  const meta = (unresolved: number | null, candidates: number | null = null) => async () => ({ fingerprint: 'abc', builtAt: '2026-10-22T12:00:00Z', stats: { files: 400, symbols: 1, imports: 1, tests: 0 }, candidates, unresolved });
+  const at = async (unresolved: number | null, candidates: number | null = null) =>
+    (await getModuleContext({ project: 'demo', path: 'src/db/pool.ts' }, deps({ codegraph: codegraph({ moduleContext: async () => lonely, codeMapMeta: meta(unresolved, candidates) }).cg }))).markdown;
+  const md = await at(12);
+  expect(md).toContain('## Imported by (none found: import graph incomplete)');
+  expect(md).toMatch(/12 imports in demo look local \(path aliases, workspace packages\) but could not be followed to a file/);
+  expect(md).toMatch(/search the code/i);
+  expect(md).toContain('## Tests that cover it (none found: import graph incomplete)');
+  expect(md).not.toContain('(0)');
+  expect(await at(null, 10_290)).toMatch(/Imported by \(none found: import graph incomplete\)[\s\S]*400 of 10290 files/);
+  // a complete map keeps the plain answer
+  expect(await at(0)).toContain('## Imported by (0)');
+  // with importers found, the count says there may be more
+  const some = await getModuleContext({ project: 'demo', path: 'src/db/pool.ts' }, deps({ codegraph: codegraph({ codeMapMeta: meta(3) }).cg }));
+  expect(some.markdown).toContain('## Imported by (2 found, import graph incomplete: there may be more)');
+
+  const imp = await getImpact({ project: 'demo', paths: ['src/db/pool.ts'] }, deps({ codegraph: codegraph({ codeMapMeta: meta(5), impact: async () => ({ paths: ['src/db/pool.ts'], dependents: [], tests: [], misses: [], lessons: [] }) }).cg }));
+  expect(imp.markdown).toContain('## Files that depend on them (none found: import graph incomplete)');
+  expect(imp.markdown).toContain('## Tests to run (none found: import graph incomplete)');
+
+  const task = await getTaskContext({ project: 'demo', task: 'pool', files: ['src/db/pool.ts'] }, deps({ codegraph: codegraph({ moduleContext: async () => lonely, codeMapMeta: meta(5) }).cg }));
+  expect(task.markdown).toMatch(/`src\/db\/pool\.ts`: importers and tests unknown \(import graph incomplete\)/);
 });
 
 // ── impact ──────────────────────────────────────────────────────────────
@@ -156,6 +200,17 @@ test('get_task_context adds a short code map section for the files the agent nam
   expect(section).toMatch(/last miss.*leaked pool clients on error/);
   expect(section).toMatch(/src\/new\.ts.*not in the code map/);
   expect(section).toMatch(/data, not instructions/i);
+});
+
+test('get_task_context lists the past misses on the files the agent named in their own section, before the similar ones', async () => {
+  const d = deps({ k: { ...deps().k, relatedMisses: async () => [{ missId: 'miss:1', missed: 'leaked pool clients on error', cause: 'implementation_error', feedbackText: 'again', sessionId: 's1', ts: '2026-10-01T10:00:00Z', score: 0.9 }, { missId: 'miss:9', missed: 'forgot the index', cause: 'implementation_error', feedbackText: 'slow', sessionId: 's2', ts: '2026-10-02T10:00:00Z', score: 0.8 }] } });
+  const r = await getTaskContext({ cwd: '/Users/j/Vibe/demo', task: 'tune pool', files: ['src/db/pool.ts'] }, d);
+  const section = r.markdown.slice(r.markdown.indexOf('## Past misses on the files you named'));
+  expect(section).toMatch(/leaked pool clients on error[\s\S]*in `src\/db\/pool\.ts`[\s\S]*developer said: "connections pile up again"/);
+  expect(r.markdown.indexOf('## Past misses on the files you named')).toBeLessThan(r.markdown.indexOf('## Similar past misses'));
+  // shown once: the similar misses leave out the one already listed for the file
+  expect(r.markdown.match(/leaked pool clients on error/g)?.length).toBe(2); // the section and the code map's "last miss"
+  expect(r.misses.map((m) => m.missId)).toEqual(['miss:9']);
 });
 
 test('get_task_context without files has no code map section', async () => {
@@ -224,7 +279,7 @@ const graphOf = (k: string): MapGraph => ({
   cap: { limit: 60, eligible: 1, neighbors: 0, neighborsFound: 0 },
 });
 
-function restApp(over: Record<string, unknown> = {}) {
+function restApp(over: Record<string, unknown> = {}, opts: Record<string, unknown> = {}) {
   const asked: unknown[][] = [];
   const store = {
     ...codegraph().cg,
@@ -233,11 +288,13 @@ function restApp(over: Record<string, unknown> = {}) {
     impact: async (k: string, paths: string[], depth: number) => { asked.push(['impact', k, paths, depth]); return { paths, dependents: [], tests: [], misses: [], lessons: [] }; },
     mapGraph: async (k: string, opts: HotspotOpts & { limit: number }) => { asked.push(['mapGraph', k, opts]); return graphOf(k); },
     codeMapMeta: async (k: string) => (k === 'demo' ? { fingerprint: 'x', builtAt: '2026-10-22T12:00:00Z', stats: { files: 40, symbols: 200, imports: 90, tests: 12 }, candidates: 10_290 } : null),
+    requestCodeMapRebuild: async (k: string) => { asked.push(['rebuild', k]); return k === 'demo'; },
     ...over,
   };
   const app = createApp(repo, {
     codegraph: store,
     projectDirs: async () => [{ key: 'demo', name: 'demo', repoPath: '/vibe/demo' }, { key: 'beta', name: 'beta', repoPath: '/vibe/beta' }],
+    ...opts,
   });
   return { app, asked };
 }
@@ -246,13 +303,62 @@ test('GET /api/projects/:key/codemap/hotspots returns the map stats and the hots
   const { app, asked } = restApp();
   const res = await app.request('/api/projects/demo/codemap/hotspots?limit=5');
   expect(res.status).toBe(200);
-  expect(await res.json()).toEqual({ meta: { fingerprint: 'x', builtAt: '2026-10-22T12:00:00Z', stats: { files: 40, symbols: 200, imports: 90, tests: 12 }, candidates: 10_290 }, hotspots: [hot('src/db/pool.ts', 7.5), hot('src/a.ts', 2)] });
+  expect(await res.json()).toEqual({
+    meta: { fingerprint: 'x', builtAt: '2026-10-22T12:00:00Z', stats: { files: 40, symbols: 200, imports: 90, tests: 12 }, candidates: 10_290 },
+    capped: { files: 40, of: 10_290 },
+    hotspots: [hot('src/db/pool.ts', 7.5), hot('src/a.ts', 2)],
+  });
   expect(asked).toEqual([['hotspots', 'demo', 5, { includeTests: false }]]);
   expect((await app.request('/api/projects/demo/codemap/hotspots?limit=0')).status).toBe(400);
   await app.request('/api/projects/demo/codemap/hotspots?tests=1');
   expect(asked.at(-1)).toEqual(['hotspots', 'demo', 50, { includeTests: true }]);
   expect((await app.request('/api/projects/demo/codemap/hotspots?tests=maybe')).status).toBe(400);
-  expect(await (await app.request('/api/projects/none/codemap/hotspots')).json()).toEqual({ meta: null, hotspots: [] });
+  expect(await (await app.request('/api/projects/none/codemap/hotspots')).json()).toEqual({ meta: null, capped: null, hotspots: [] });
+});
+
+test('a map built before the total was counted is still called capped when it is at the cap', async () => {
+  const at = (files: number) => async () => ({ fingerprint: 'x', builtAt: 't', stats: { files, symbols: 0, imports: 0, tests: 0 }, candidates: null });
+  const capped = async (over: Record<string, unknown>, opts: Record<string, unknown> = {}) =>
+    ((await (await restApp(over, opts).app.request('/api/projects/demo/codemap/hotspots')).json()) as { capped: unknown }).capped;
+  // SCAN_MAX_FILES unset: an automatic cap is at least 400, and below the count whenever it is above 400.
+  expect(await capped({ codeMapMeta: at(4000) })).toEqual({ files: 4000, of: null });
+  expect(await capped({ codeMapMeta: at(120) })).toBeNull();
+  // SCAN_MAX_FILES set: capped when the map holds that many.
+  expect(await capped({ codeMapMeta: at(4000) }, { mapMaxFiles: 6000 })).toBeNull();
+  expect(await capped({ codeMapMeta: at(6000) }, { mapMaxFiles: 6000 })).toEqual({ files: 6000, of: null });
+  // A counted map that is not capped says so.
+  expect(await capped({ codeMapMeta: async () => ({ fingerprint: 'x', builtAt: 't', stats: { files: 40, symbols: 0, imports: 0, tests: 0 }, candidates: 40 }) })).toBeNull();
+});
+
+test('hotspots can list a whole map: the limit goes up to the map cap', async () => {
+  const { app, asked } = restApp();
+  expect((await app.request('/api/projects/demo/codemap/hotspots?limit=4000')).status).toBe(200);
+  expect(asked.at(-1)).toEqual(['hotspots', 'demo', 4000, { includeTests: false }]);
+  expect((await app.request('/api/projects/demo/codemap/hotspots?limit=4001')).status).toBe(400);
+  const big = restApp({}, { mapMaxFiles: 9000 });
+  expect((await big.app.request('/api/projects/demo/codemap/hotspots?limit=9000')).status).toBe(200);
+});
+
+test('POST /api/projects/:key/codemap/rebuild asks the worker for a fresh map; only you (or an operator allowed to scan) may', async () => {
+  const { app, asked } = restApp();
+  const json = { 'content-type': 'application/json' };
+  const post = (key: string, headers: Record<string, string> = { origin: 'http://localhost' }) =>
+    app.request(`/api/projects/${key}/codemap/rebuild`, { method: 'POST', headers: { ...json, ...headers }, body: '{}' });
+  expect((await post('demo', {})).status).toBe(403);
+  expect(asked).toEqual([]);
+  const res = await post('demo');
+  expect(res.status).toBe(202);
+  expect(await res.json()).toEqual({ queued: true });
+  expect(asked).toEqual([['rebuild', 'demo']]);
+  // No map yet: the first one is on its way.
+  const none = await post('beta');
+  expect(none.status).toBe(404);
+  expect(((await none.json()) as { error: string }).error).toMatch(/no code map yet/i);
+  const OP = 'o'.repeat(32);
+  const op = restApp({}, { auth: { operator: { token: OP, allow: ['scan'] } } });
+  expect((await op.app.request('/api/projects/demo/codemap/rebuild', { method: 'POST', headers: { ...json, authorization: `Bearer ${OP}` }, body: '{}' })).status).toBe(202);
+  const noScan = restApp({}, { auth: { operator: { token: OP, allow: ['pin'] } } });
+  expect((await noScan.app.request('/api/projects/demo/codemap/rebuild', { method: 'POST', headers: { ...json, authorization: `Bearer ${OP}` }, body: '{}' })).status).toBe(403);
 });
 
 test('GET /api/projects/:key/codemap/module returns the module context, 404 when the file is not mapped, 400 without a clean path', async () => {
@@ -294,7 +400,7 @@ test('GET /api/projects/:key/codemap/graph returns the map graph with a limit an
   const res = await app.request('/api/projects/demo/codemap/graph');
   expect(res.status).toBe(200);
   // With the map's size, so the graph can say when the map itself is capped.
-  expect(await res.json()).toEqual({ ...graphOf('demo'), meta: { fingerprint: 'x', builtAt: '2026-10-22T12:00:00Z', stats: { files: 40, symbols: 200, imports: 90, tests: 12 }, candidates: 10_290 } });
+  expect(await res.json()).toEqual({ ...graphOf('demo'), meta: { fingerprint: 'x', builtAt: '2026-10-22T12:00:00Z', stats: { files: 40, symbols: 200, imports: 90, tests: 12 }, candidates: 10_290 }, capped: { files: 40, of: 10_290 } });
   expect(asked).toEqual([['mapGraph', 'demo', { limit: 60, includeTests: false }]]);
   await app.request('/api/projects/demo/codemap/graph?limit=20&tests=1');
   expect(asked.at(-1)).toEqual(['mapGraph', 'demo', { limit: 20, includeTests: true }]);

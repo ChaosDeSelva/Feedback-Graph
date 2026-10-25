@@ -1,11 +1,16 @@
 import { Hono, type Context, type Next } from 'hono';
+import { streamSSE } from 'hono/streaming';
 import { serveStatic } from '@hono/node-server/serve-static';
 import { z } from 'zod';
-import { ACTIVITY_KINDS, chunkText, MODEL_JOBS, cleanLessonPath, cmp, FACT_KINDS, redactSecrets, relevanceBand, selectionNote, type ActivityStore, type CodeGraphStore, type DocsStore, type FactsStore, type GraphStore, type InsightsStore, type ModelHealth, type ModelJob, type OllamaHealth, type PipelineStatus, type ProviderHealth, type KnowledgeStore, type Lesson, type LinksStore, IMAGE_MEDIA_TYPES, MAX_IMAGE_BYTES, LINK_RELATIONS, LINK_STATUSES, linkPair, type PortabilityStore, type Project, type ProjectSelection, type ProjectSummary, type ShownProjects, type StoreKind, type SystemStatus, type WorkerStatus } from '@fb/core';
+import { ACTIVITY_KINDS, EVERYDAY_FROM, chunkText, mapCapped, MAX_AUTO_MAP_FILES, MODEL_JOBS, cleanLessonPath, cmp, FACT_KINDS, redactSecrets, relevanceBand, selectionNote, type ActivityStore, type CodeGraphStore, type DocsStore, type FactsStore, type GraphStore, type InsightsStore, type ModelHealth, type ModelJob, type OllamaHealth, type PipelineStatus, type ProviderHealth, type KnowledgeStore, type Lesson, type LinksStore, IMAGE_MEDIA_TYPES, MAX_IMAGE_BYTES, LINK_RELATIONS, LINK_STATUSES, linkPair, type PortabilityStore, type Project, type ProjectSelection, type RelevanceBy, type ProjectSummary, type ShownProjects, type StoreKind, type SystemStatus, type WorkerStatus } from '@fb/core';
+import { chatRoutes, type ChatRouteDeps } from './chat.ts';
 import { trackedProject, type ContextDeps } from './context.ts';
 import { authenticated, needsAuth, SECURITY_HEADERS, sessionCookie, tokenMatches, type AuthOpts } from './auth.ts';
-import { cloudRoutes, cloudStatus, type CloudDeps } from './cloud.ts';
+import { cloudRoutes, cloudStatus, type CloudDeps, type CloudState } from './cloud.ts';
+import { createEventHub, type FgEvent } from './events.ts';
 import { handleMcp } from './mcp.ts';
+import { handleAdminMcp } from './adminMcp.ts';
+import { openApiDocument } from './openapi.ts';
 import { actingAsOperator, asActor, currentActor, hasOperatorToken, operatorName, OWNER_ROUTES, refusedVerb, runAs } from './operator.ts';
 import { deleteProjects, settingsRoutes, type SettingsDeps } from './settings.ts';
 import { importRoutes, type ImportDeps } from './import.ts';
@@ -19,6 +24,7 @@ export type ApiRepo = Pick<GraphStore, 'listCandidates' | 'candidateDetail' | 'd
 const ListQuery = z.object({
   status: z.enum(['pending', 'confirmed', 'rejected']).optional(),
   project: z.string().min(1).optional(),
+  source: z.enum(['claude', 'codex', 'github', 'linear']).optional(),
   limit: z.coerce.number().int().min(1).max(1000).optional(),
 });
 
@@ -30,6 +36,9 @@ const Decision = z.object({
 const Decisions = z.object({
   items: z.array(z.object({ id: z.string().min(1).max(500), decision: z.enum(['confirm', 'reject']), reason: z.string().max(4000).optional() }).strict()).min(1).max(500),
 }).strict();
+
+/** The admin MCP endpoint (owner decisions, operator token only); /mcp stays read-and-report only. */
+const ADMIN_MCP = '/mcp/admin';
 
 const LOCAL_HOSTS = new Set(['localhost', '127.0.0.1', '[::1]']);
 
@@ -49,12 +58,12 @@ export type AppOpts = {
   context?: ContextDeps;
   knowledge?: Pick<KnowledgeStore, 'listLessons' | 'lessonDetail' | 'updateLesson'> & Partial<Pick<KnowledgeStore, 'retryPostmortem' | 'postmortemBacklog'>>;
   embed?: (texts: string[]) => Promise<number[][]>;
-  facts?: Pick<FactsStore, 'listProjects' | 'requestScan' | 'listFacts' | 'searchFacts'> & Partial<Pick<FactsStore, 'setFactRelevance' | 'setPinned'>>;
+  facts?: Pick<FactsStore, 'listProjects' | 'requestScan' | 'listFacts' | 'searchFacts'> & Partial<Pick<FactsStore, 'setFactRelevance' | 'setPinned' | 'scanJob' | 'addOwnerFact'>>;
   /** Folders under the configured roots that can be scanned. */
   projectDirs?: () => Promise<Project[]>;
   insights?: Pick<InsightsStore, 'projectGraph' | 'patterns'>;
   activity?: Pick<ActivityStore, 'record' | 'list'>;
-  docs?: Pick<DocsStore, 'upsertDoc' | 'listDocs' | 'deleteDoc'> & Partial<Pick<DocsStore, 'docImage'>>;
+  docs?: Pick<DocsStore, 'upsertDoc' | 'listDocs' | 'deleteDoc'> & Partial<Pick<DocsStore, 'docImage' | 'requeueDocRead'>>;
   links?: Pick<LinksStore, 'listLinks' | 'setLink' | 'deleteLink'>;
   auth?: AuthOpts;
   /** JSON access log: method, path, status, ms. Query strings are left out (they can carry search text). */
@@ -75,7 +84,9 @@ export type AppOpts = {
   /** The Settings page: which project folders are read. */
   settings?: SettingsDeps;
   /** The code map, for the Projects page (stats, hotspots, a file's module panel) and the Patterns page. */
-  codegraph?: Pick<CodeGraphStore, 'hotspots' | 'moduleContext' | 'impact' | 'codeMapMeta'> & Partial<Pick<CodeGraphStore, 'mapGraph'>>;
+  codegraph?: Pick<CodeGraphStore, 'hotspots' | 'moduleContext' | 'impact' | 'codeMapMeta'> & Partial<Pick<CodeGraphStore, 'mapGraph' | 'requestCodeMapRebuild'>>;
+  /** SCAN_MAX_FILES (null: the cap scales with the repo): how many hotspots one page may list, and whether a map is capped. */
+  mapMaxFiles?: number | null;
   /** Feedback Graph Cloud sync: the Settings card and Sync now. */
   cloud?: CloudDeps;
   /** ProjectScope.project (the Settings selection and EXCLUDE_PROJECTS): the code map routes answer only inside it. */
@@ -91,6 +102,8 @@ export type AppOpts = {
   shown?: () => Promise<ShownProjects> | ShownProjects;
   /** Settings > Integrations (GitHub, Linear) and the connections in /api/status. */
   integrations?: IntegrationsDeps;
+  /** Ask: conversations answered by the worker from a context pack built here (chat.ts). */
+  chat?: ChatRouteDeps;
 };
 
 /** The store's projectKeys for a list: every shown key, or for ?project= that one if it is shown (else none). */
@@ -112,7 +125,9 @@ const MAX_DEPTH = 5;
 const RepoPath = z.string().min(1).max(1000).refine((p) => cleanLessonPath(p) === p, 'a repo-relative path');
 /** tests=1: rank test files too (hotspots leave them out by default). */
 const IncludeTests = z.enum(['0', '1', 'true', 'false']).optional().transform((v) => v === '1' || v === 'true');
-const HotspotQuery = z.object({ limit: z.coerce.number().int().min(1).max(500).default(50), tests: IncludeTests });
+/** Hotspots of one project: up to a whole map (the cap: SCAN_MAX_FILES, or 4000 when it scales with the repo). */
+const hotspotQuery = (maxFiles: number | null) =>
+  z.object({ limit: z.coerce.number().int().min(1).max(Math.max(MAX_AUTO_MAP_FILES, maxFiles ?? 0)).default(50), tests: IncludeTests });
 const TopHotspotQuery = z.object({ project: z.string().min(1).max(200).optional(), limit: z.coerce.number().int().min(1).max(100).default(10), tests: IncludeTests });
 /** The Graph page's Code mode: up to `limit` top files and as many neighbours, so at most twice that many nodes. */
 const MapGraphQuery = z.object({ limit: z.coerce.number().int().min(1).max(300).default(60), tests: IncludeTests });
@@ -122,6 +137,12 @@ const ImpactQuery = z.object({ path: z.array(RepoPath).min(1).max(50), depth: z.
 const WORKER_STALE_MS = 3 * 60_000;
 /** /api/pipeline counts Inbox items and lessons up to this many each (the panel only needs to know there are some). */
 const PIPELINE_LIMIT = 1000;
+/** /api/events: at most this many open streams; a heartbeat comment this often; the reconnect delay it suggests. */
+const MAX_EVENT_STREAMS = 20;
+const EVENT_HEARTBEAT_MS = 15_000;
+const EVENT_RETRY_MS = 5000;
+/** How many of the latest Activity entries each poll reads for new ones. */
+const EVENT_ACTIVITY_WINDOW = 100;
 
 const DocUpload = z
   .object({
@@ -158,6 +179,18 @@ const LinkRequest = z.object({
 }).strict();
 const PinRequest = z.object({ pinned: z.boolean() }).strict();
 const RelevanceRequest = z.object({ relevance: z.number().min(0).max(1) });
+
+/** Converting a lesson to a fact: the kind you chose (default convention) and how often everyday coding needs it. */
+const LessonToFact = z.object({ kind: z.enum(FACT_KINDS).default('convention'), relevance: z.number().min(0).max(1).default(EVERYDAY_FROM) }).strict();
+
+/** Where a fact from a lesson is filed: the lesson's first path (a glob cut back to its folder), else the project ('.'). */
+export function lessonFactPath(paths: string[]): string {
+  const first = paths.length ? cleanLessonPath(paths[0]) : null;
+  if (!first) return '.';
+  const segments = first.split('/');
+  const glob = segments.findIndex((s) => /[*?[\]{}]/.test(s));
+  return (glob < 0 ? segments : segments.slice(0, glob)).join('/').replace(/\/+$/, '') || '.';
+}
 const FactsQuery = z.object({ q: z.string().min(1).max(500).optional(), kind: z.enum(FACT_KINDS).optional() });
 
 const ProjectParam = z.object({ project: z.string().min(1).max(200) });
@@ -178,6 +211,20 @@ const LessonPatch = z
     supersedes: z.string().optional(),
   })
   .strict();
+
+const ExportQuery = z.object({ project: z.string().min(1).max(200).optional(), approved: z.enum(['1', 'true']).optional() });
+
+/** For the OpenAPI document (openapi.ts). */
+export const appSchemas = {
+  ListQuery, Decision, Decisions, RepoPath, hotspotQuery, TopHotspotQuery, MapGraphQuery, ImpactQuery, DocUpload, ActivityQuery, ScanRequest,
+  BatchScanRequest, LinkRequest, PinRequest, RelevanceRequest, FactsQuery, ProjectParam, LessonQuery, LessonPatch, LessonToFact, ExportQuery,
+};
+
+/** The Bearer token a request carries, trimmed; null when there is none (or it is empty). */
+const bearerOf = (c: Context): string | null => {
+  const h = c.req.header('authorization');
+  return h?.startsWith('Bearer ') && h.slice(7).trim() ? h.slice(7).trim() : null;
+};
 
 /** Could not reach the server at all, as opposed to a server that answered with a refusal. */
 const UNREACHABLE = /ECONNREFUSED|ECONNRESET|ENOTFOUND|EAI_AGAIN|EHOSTUNREACH|fetch failed|not reachable|socket hang up/i;
@@ -240,6 +287,8 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
     return !v || v.has(key);
   };
   const app = new Hono();
+  /** Sync now's progress and last run, once its routes are registered below. */
+  let cloudState: CloudState | null = null;
   // Other host names are only safe once a token stands between them and the API.
   const hosts = new Set([...LOCAL_HOSTS, ...(auth.token ? (auth.publicHosts ?? []).map((h) => h.toLowerCase()) : [])]);
 
@@ -247,17 +296,35 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
     const started = Date.now();
     await next();
     for (const [k, v] of Object.entries(SECURITY_HEADERS)) c.header(k, v);
-    const logged = c.req.path === '/mcp' || (c.req.path.startsWith('/api/') && c.req.path !== '/api/health');
+    const logged = c.req.path === '/mcp' || c.req.path === ADMIN_MCP || (c.req.path.startsWith('/api/') && c.req.path !== '/api/health');
     if (log && logged) {
       log('request', { method: c.req.method, path: c.req.path, status: c.res.status, ms: Date.now() - started });
     }
   });
 
+  /**
+   * A Bearer was sent and matches no configured token: 401, and a log line naming the route and the agent (never the
+   * token), so a stale token is plain to the agent and repeated guesses show in the log.
+   */
+  const unrecognised = (c: Context) => {
+    log?.('auth refused', { method: c.req.method, path: c.req.path, reason: 'bearer token not recognised', operator: operatorName(c.req.header('x-fg-operator')) });
+    return c.json({ error: 'token not recognised: check FG_OPERATOR_TOKEN (or API_TOKEN) against the .env this Feedback Graph runs with' }, 401);
+  };
+
   // Refuse DNS-rebinding hosts and cross-site writes; with a token configured, require it.
   app.use('*', async (c, next) => {
     const host = hostname(c.req.header('host') ?? new URL(c.req.url).host);
     if (!hosts.has(host)) return c.json({ error: 'forbidden host' }, 403);
-    if (needsAuth(c.req.path) && !authenticated(c, auth.token) && !hasOperatorToken(c, auth.operator)) return c.json({ error: 'sign in required' }, 401);
+    // The admin MCP endpoint answers only the operator token: without it, it does not exist (no token sent, or
+    // FG_OPERATOR_TOKEN unset); a bearer that is not the operator token (the API token included) is refused.
+    if (c.req.path === ADMIN_MCP && !hasOperatorToken(c, auth.operator)) {
+      if (!auth.operator?.token || !bearerOf(c)) return c.notFound();
+      log?.('auth refused', { method: c.req.method, path: c.req.path, reason: 'not the operator token', operator: operatorName(c.req.header('x-fg-operator')) });
+      return c.json({ error: 'the admin MCP endpoint takes FG_OPERATOR_TOKEN as the Bearer: check it against the .env this Feedback Graph runs with' }, 401);
+    }
+    if (needsAuth(c.req.path) && !authenticated(c, auth.token) && !hasOperatorToken(c, auth.operator)) {
+      return bearerOf(c) ? unrecognised(c) : c.json({ error: 'sign in required' }, 401);
+    }
     if (c.req.method !== 'GET' && c.req.method !== 'HEAD') {
       const site = c.req.header('sec-fetch-site');
       if (site === 'cross-site' || site === 'same-site') return c.json({ error: 'cross-site write' }, 403);
@@ -267,7 +334,7 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
         return c.json({ error: 'cross-origin write' }, 403);
       }
       // A Streamable HTTP client ending its MCP session sends DELETE with no body; handleMcp answers it.
-      const mcpEnd = c.req.method === 'DELETE' && c.req.path === '/mcp';
+      const mcpEnd = c.req.method === 'DELETE' && (c.req.path === '/mcp' || c.req.path === ADMIN_MCP);
       if (!mcpEnd && !c.req.header('content-type')?.startsWith('application/json')) return c.json({ error: 'json required' }, 415);
     }
     await next();
@@ -284,8 +351,12 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
       if (!allowed.has(verb)) return c.json(refusedVerb(verb), 403);
       return runAs(operatorName(c.req.header('x-fg-operator')), next);
     }
+    // A token was offered for this decision and it is neither token (with the operator token configured): say so. The
+    // API token is recognised, it just cannot decide: that stays the 403 below.
+    const offered = bearerOf(c);
+    if (auth.operator?.token && offered && !(auth.token && tokenMatches(offered, auth.token))) return unrecognised(c);
     if (c.req.header('origin') === undefined) {
-      return c.json({ error: 'only you can make this decision, from the Feedback Graph UI' }, 403);
+      return c.json({ error: 'only you can make this decision, from the Feedback Graph UI, or with FG_OPERATOR_TOKEN as a Bearer for the verbs OPERATOR_ALLOW names' }, 403);
     }
     await next();
   };
@@ -314,19 +385,20 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
       ...stageOf(workerHealthy ? worker : null),
       authRequired: !!auth.token,
       selection: sel && { initialized: sel.initialized, tracked: sel.tracked.length, ...(system?.roots === undefined ? {} : { roots: system.roots }), note: selectionNote(sel, system?.roots) },
-      cloud: cloudStatus(cloud?.cloud ?? null),
+      cloud: cloudStatus(cloud?.cloud ?? null, cloudState),
       models: worker ? modelHealth(worker, ollama) : null,
       givenUpTurns,
       ollama,
-      connections: await connectionsStatus({ integrations: graph ? (integrations?.integrations ?? null) : null, deps: integrations, worker, ollama, cloud: cloud?.cloud ?? null }).catch(() => null),
+      connections: await connectionsStatus({ integrations: graph ? (integrations?.integrations ?? null) : null, deps: integrations, worker, ollama, cloud: cloud?.cloud ?? null, manualSync: cloudState?.lastManual() ?? null }).catch(() => null),
     };
     return c.json(s);
   });
 
   // The first-run panel: every stage's count in one call. Each count fails on its own (null), never the whole answer.
-  app.get('/api/pipeline', async (c) => {
+  // ?project=: one project's counts (an empty state filtered to it); the classify backlog and the stage stay worker-wide.
+  const pipelineStatus = async (project?: string): Promise<PipelineStatus> => {
     const v = await view();
-    const keys = keysFor(v);
+    const keys = project ? (keysFor(v, project) ?? [project]) : keysFor(v);
     const graph = (await system?.ping().catch(() => false)) ?? false;
     const worker = graph ? ((await system?.worker().catch(() => null)) ?? null) : null;
     const live = !!worker && Date.now() - Date.parse(worker.lastBeat) < WORKER_STALE_MS;
@@ -334,7 +406,7 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
     const pending = (status: 'pending' | 'confirmed') => repo.listCandidates({ status, limit: PIPELINE_LIMIT, ...(keys && { projectKeys: keys }) }).then((r) => r.length);
     const lessons = (status: 'proposed' | 'approved') =>
       knowledge!.listLessons({ status, limit: PIPELINE_LIMIT, ...(keys && { projectKeys: keys }) }).then((r) => r.filter((l) => showsLesson(v, l)).length);
-    const projects = facts ? await count(async () => (await facts.listProjects()).filter((p) => !v || v.has(p.key))) : null;
+    const projects = facts ? await count(async () => (await facts.listProjects()).filter((p) => (!v || v.has(p.key)) && (!project || p.key === project))) : null;
     const scans = projects && { done: 0, queued: 0, running: 0, failed: 0, never: 0 };
     for (const p of projects ?? []) scans![p.lastScan?.status ?? 'never']++;
     const [inboxPending, inboxConfirmed, proposed, approved, queued] = await Promise.all([
@@ -344,7 +416,7 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
       knowledge ? count(() => lessons('approved')) : null,
       knowledge?.postmortemBacklog ? count(() => knowledge.postmortemBacklog!()) : null,
     ]);
-    const body: PipelineStatus = {
+    return {
       ...stageOf(live ? worker : null),
       sessions: projects ? projects.reduce((n, p) => n + p.sessions, 0) : null,
       classify: worker?.backlog ? { backlog: worker.backlog.classify, capped: worker.backlog.classifyCapped } : null,
@@ -353,7 +425,67 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
       lessons: proposed === null || approved === null ? null : { proposed, approved },
       scans,
     };
-    return c.json(body);
+  };
+  app.get('/api/pipeline', async (c) => c.json(await pipelineStatus(c.req.query('project')?.slice(0, 200) || undefined)));
+
+  // This API as an OpenAPI 3.1 document (openapi.ts); signed in like every other read.
+  app.get('/api/openapi.json', (c) => c.json(openApiDocument(system?.version ?? 'dev')));
+
+  // What changes, as server-sent events (events.ts): one poller for every stream, narrowed to the shown projects.
+  const hub = createEventHub({
+    ...(system && {
+      stage: async () => {
+        const w = await system.worker();
+        const workerHealthy = !!w && Date.now() - Date.parse(w.lastBeat) < WORKER_STALE_MS;
+        return { ...stageOf(workerHealthy ? w : null), workerHealthy };
+      },
+    }),
+    pipeline: () => pipelineStatus(),
+    ...(facts && {
+      scans: async () => {
+        const v = await view();
+        return (await facts.listProjects()).filter((p) => p.lastScan && (!v || v.has(p.key))).map((p) => p.lastScan!);
+      },
+    }),
+    ...(opts.chat && {
+      chats: {
+        list: async () => opts.chat!.store.listConversations({ projectKeys: keysFor(await view()) }),
+        thread: async (id: string) => {
+          const t = await opts.chat!.store.conversation(id);
+          return t && (await shows(t.projectKey)) ? t : null;
+        },
+      },
+    }),
+    ...(activity && {
+      activity: async () => {
+        const v = await view();
+        const entries = await activity.list({ limit: EVENT_ACTIVITY_WINDOW, ...(v && { projectKeys: v.keys }) });
+        return entries.filter((a) => !v || a.projectKey === null || v.has(a.projectKey));
+      },
+    }),
+  });
+  let streams = 0;
+  app.get('/api/events', (c) => {
+    if (streams >= MAX_EVENT_STREAMS) return c.json({ error: `too many event streams are open (${MAX_EVENT_STREAMS}): close one, or poll /api/status` }, 503);
+    streams++;
+    return streamSSE(c, async (stream) => {
+      let close = () => {};
+      const closed = new Promise<void>((resolve) => { close = resolve; });
+      stream.onAbort(() => close());
+      const send = (e: FgEvent) => void stream.writeSSE({ event: e.event, data: JSON.stringify(e.data) }).catch(() => close());
+      let off = () => {};
+      const beat = setInterval(() => void stream.write(': ping\n\n').catch(() => close()), EVENT_HEARTBEAT_MS);
+      try {
+        await stream.write(`retry: ${EVENT_RETRY_MS}\n\n`);
+        for (const e of hub.current()) send(e);
+        off = hub.subscribe(send);
+        await closed;
+      } finally {
+        clearInterval(beat);
+        off();
+        streams--;
+      }
+    });
   });
 
   const secure = (c: Context) => c.req.header('x-forwarded-proto') === 'https' || new URL(c.req.url).protocol === 'https:';
@@ -374,7 +506,7 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
     const q = ListQuery.safeParse(c.req.query());
     if (!q.success) return c.json({ error: q.error.flatten() }, 400);
     const projectKeys = keysFor(await view(), q.data.project);
-    return c.json(await repo.listCandidates({ status: q.data.status, projectKey: q.data.project, limit: q.data.limit, ...(projectKeys && { projectKeys }) }));
+    return c.json(await repo.listCandidates({ status: q.data.status, projectKey: q.data.project, source: q.data.source, limit: q.data.limit, ...(projectKeys && { projectKeys }) }));
   });
 
   /** An Inbox item, if it belongs to a shown project. */
@@ -392,7 +524,7 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
   const decideCandidate = async (id: string, status: 'confirmed' | 'rejected', note: string | null): Promise<boolean> => {
     const detail = await shownCandidate(id);
     if (!detail) return false;
-    await repo.decide(id, status, note);
+    await repo.decide(id, status, note, currentActor());
     const text = detail.turn.text ?? '';
     const who = actingAsOperator() ? `an agent (${currentActor()})` : 'you';
     await activity?.record({
@@ -433,6 +565,9 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
   });
 
   if (context) app.all('/mcp', (c) => handleMcp(c.req.raw, context));
+  // Owner decisions for an agent holding the operator token (adminMcp.ts): each tool calls the REST route in-process,
+  // so the OPERATOR_ALLOW gate, validation and Activity are the route's own. Not mounted without FG_OPERATOR_TOKEN.
+  if (auth.operator?.token) app.all(ADMIN_MCP, (c) => handleAdminMcp(c.req.raw, { request: (path, init) => app.request(path, init) }));
   // Read-only, for the Claude Code plugin's hooks: is this folder a selected project?
   if (context) app.get('/api/agent/project', async (c) => c.json(await trackedProject({ cwd: c.req.query('cwd') ?? undefined }, context)));
 
@@ -440,14 +575,31 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
     // Every page's project list. Settings lists every folder (GET /api/settings/projects); this lists the shown ones.
     app.get('/api/projects', async (c) => {
       const v = await view();
-      const known = (await facts.listProjects()).filter((p) => !v || v.has(p.key));
+      const dirs = await projectDirs();
+      const folder = new Map(dirs.map((d) => [d.key, d]));
+      // Records a scan, a code map or an upload made carry no path or remote: the selected folder fills what is missing.
+      const known = (await facts.listProjects())
+        .filter((p) => !v || v.has(p.key))
+        .map((p) => {
+          const d = folder.get(p.key);
+          return d ? { ...p, repoPath: p.repoPath || d.repoPath, remote: p.remote ?? d.remote ?? null } : p;
+        });
       // An alias folder is a second clone: its sessions are its project's, so it is not listed as one of its own.
       const keys = new Set(known.flatMap((p) => [p.key, ...p.aliases]));
-      const fresh: ProjectSummary[] = (await projectDirs())
+      const fresh: ProjectSummary[] = dirs
         .filter((d) => !keys.has(d.key) && (!v || v.has(d.key)))
-        .map((d) => ({ key: d.key, repoPath: d.repoPath, remote: null, aliases: [], sessions: 0, feedback: 0, lessons: 0, facts: 0, lastScan: null, pinned: false }));
+        .map((d) => ({ key: d.key, repoPath: d.repoPath, remote: d.remote ?? null, aliases: [], sessions: 0, feedback: 0, lessons: 0, facts: 0, lastScan: null, pinned: false }));
+      // Confirmed links whose other end is shown, so a hidden project never counts (one query for every project).
+      const linkCount = new Map<string, number>();
+      if (links) {
+        for (const l of await links.listLinks({})) {
+          if (l.status !== 'confirmed' || (v && !(v.has(l.a) && v.has(l.b)))) continue;
+          for (const k of [l.a, l.b]) linkCount.set(k, (linkCount.get(k) ?? 0) + 1);
+        }
+      }
+      const all = links ? [...known, ...fresh].map((p) => ({ ...p, links: linkCount.get(p.key) ?? 0 })) : [...known, ...fresh];
       // Pinned first: every page lists projects in this order.
-      return c.json([...known, ...fresh].sort((a, b) => Number(b.pinned) - Number(a.pinned) || a.key.localeCompare(b.key)));
+      return c.json(all.sort((a, b) => Number(b.pinned) - Number(a.pinned) || a.key.localeCompare(b.key)));
     });
 
     app.post('/api/projects/:key/scan', async (c) => {
@@ -475,6 +627,22 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
       }
       return c.json({ results }, 202);
     });
+
+    const scanJob = facts.scanJob?.bind(facts);
+    if (scanJob) {
+      // One scan job, for `fg scan --wait`: its status, and while it waits its place in the queue (1: next). Jobs are
+      // one open per project, so the projects' last scans are the queue.
+      app.get('/api/scans/:id', async (c) => {
+        const job = await scanJob(c.req.param('id'));
+        if (!job || !(await shows(job.projectKey))) return c.json({ error: 'not found' }, 404);
+        let queuePosition: number | null = null;
+        if (job.status === 'queued') {
+          const ahead = (await facts.listProjects()).filter((p) => p.lastScan?.status === 'queued' && p.lastScan.id !== job.id && p.lastScan.requestedAt < job.requestedAt).length;
+          queuePosition = ahead + 1;
+        }
+        return c.json({ ...job, queuePosition });
+      });
+    }
 
     app.get('/api/projects/:key/facts', async (c) => {
       const q = FactsQuery.safeParse(c.req.query());
@@ -516,7 +684,7 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
         const projectKey = c.req.param('key');
         if (!(await shows(projectKey))) return c.json(NOT_SHOWN, 404);
         const id = c.req.param('id');
-        const changed = await setRelevance([{ id, relevance: body.data.relevance, by: 'you', projectKey }]);
+        const changed = await setRelevance([{ id, relevance: body.data.relevance, by: currentActor() as RelevanceBy, projectKey }]);
         if (!changed) return c.json({ error: 'no such fact in this project' }, 404);
         await activity?.record({
           kind: 'fact_relevance_set', actor: 'you', projectKey,
@@ -551,7 +719,7 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
       const id = await docs.upsertDoc(
         { projectKey: project.key, source: 'upload', ref: name, title, url: null },
         chunks.map((text, i) => ({ text, embedding: vectors[i] })),
-        image ? { read: true, image } : { read: true },
+        { read: true, addedBy: currentActor(), ...(image && { image }) },
       );
       const what = image ? `image "${title}"` : `"${title}" (${chunks.length} chunk${chunks.length === 1 ? '' : 's'})`;
       await activity?.record({
@@ -577,6 +745,23 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
           'x-content-type-options': 'nosniff',
           'cache-control': 'private, max-age=300',
         });
+      });
+    }
+
+    // A failed reading, read again now (the owner changed DOCS_LLM to a model with vision, say): no re-upload needed.
+    const requeueDocRead = docs.requeueDocRead?.bind(docs);
+    if (requeueDocRead) {
+      app.post('/api/docs/:id/reread', async (c) => {
+        const id = c.req.param('id');
+        // ids are doc:<project>:<source>:<ref>
+        const [, projectKey = '', , ...ref] = id.split(':');
+        if (!(await shows(projectKey))) return c.json({ error: 'not found' }, 404);
+        if (!(await requeueDocRead(id))) return c.json({ error: 'not found, or not waiting to be read again' }, 404);
+        await activity?.record({
+          kind: 'doc_added', actor: 'you', projectKey,
+          subject: `asked for ${ref.join(':') || id} to be read again`, why: 'its reading failed; the worker reads it again on its next cycle', details: {}, targets: [id],
+        });
+        return c.body(null, 204);
       });
     }
 
@@ -645,13 +830,23 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
         await next();
       });
     }
+    const mapMaxFiles = opts.mapMaxFiles ?? null;
+    const HotspotQuery = hotspotQuery(mapMaxFiles);
     app.get('/api/projects/:key/codemap/hotspots', async (c) => {
       const q = HotspotQuery.safeParse(c.req.query());
       if (!q.success) return c.json({ error: q.error.flatten() }, 400);
       const key = c.req.param('key');
       const [meta, hotspots] = await Promise.all([codegraph.codeMapMeta(key), codegraph.hotspots(key, q.data.limit, { includeTests: q.data.tests })]);
-      return c.json({ meta, hotspots });
+      return c.json({ meta, capped: mapCapped(meta, mapMaxFiles), hotspots });
     });
+    if (codegraph.requestCodeMapRebuild) {
+      const request = codegraph.requestCodeMapRebuild.bind(codegraph);
+      // Owner-only (OWNER_ROUTES, the operator's `scan` verb): the worker remaps the project from scratch at its next pass.
+      app.post('/api/projects/:key/codemap/rebuild', async (c) => {
+        if (!(await request(c.req.param('key')))) return c.json({ error: 'no code map yet: the worker builds the first one within a few minutes' }, 404);
+        return c.json({ queued: true }, 202);
+      });
+    }
     if (codegraph.mapGraph) {
       const mapGraph = codegraph.mapGraph.bind(codegraph);
       app.get('/api/projects/:key/codemap/graph', async (c) => {
@@ -660,7 +855,7 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
         const key = c.req.param('key');
         const [graph, meta] = await Promise.all([mapGraph(key, { limit: q.data.limit, includeTests: q.data.tests }), codegraph.codeMapMeta(key)]);
         // The map's size too: the graph says when the map itself is capped (SCAN_MAX_FILES).
-        const g = { ...graph, meta };
+        const g = { ...graph, meta, capped: mapCapped(meta, mapMaxFiles) };
         const v = await view();
         if (!v || !knowledge || !g.lessons.length) return c.json(g);
         // The map holds ids only: the shown approved lessons say which of them were learned in a selected project.
@@ -699,7 +894,6 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
   }
 
   if (portability) {
-    const ExportQuery = z.object({ project: z.string().min(1).max(200).optional(), approved: z.enum(['1', 'true']).optional() });
     app.get('/api/export', async (c) => {
       const q = ExportQuery.safeParse(c.req.query());
       if (!q.success) return c.json({ error: q.error.flatten() }, 400);
@@ -728,10 +922,11 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
   }
 
   if (settings) settingsRoutes(app, settings, { activity, portability });
-  if (cloud) cloudRoutes(app, cloud);
+  if (cloud) cloudState = cloudRoutes(app, cloud);
   if (integrations) integrationRoutes(app, integrations);
   if (importer) importRoutes(app, importer);
   if (sessions) sessionRoutes(app, sessions);
+  if (opts.chat) chatRoutes(app, opts.chat, view);
 
   if (activity) {
     app.get('/api/activity', async (c) => {
@@ -768,7 +963,7 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
           actor: 'you',
           projectKey: null,
           subject: `re-queued ${requeued} turn${requeued === 1 ? '' : 's'} the classifier had given up on`,
-          why: 'asked from the UI',
+          why: 'you asked for it (the UI, or fg)',
           details: { requeued },
           targets: [],
         });
@@ -841,6 +1036,41 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
       });
       return c.body(null, 204);
     });
+
+    // A proposed lesson that states how the code is (the lesson check's looks-like-a-fact) becomes a project fact you
+    // wrote: no scan replaces it, agents get it with the facts, and the lesson is rejected so it is not served twice.
+    const addOwnerFact = facts?.addOwnerFact?.bind(facts);
+    if (addOwnerFact && embed) {
+      app.post('/api/lessons/:id/to-fact', async (c) => {
+        const body = LessonToFact.safeParse((await c.req.json().catch(() => null)) ?? {});
+        if (!body.success) return c.json({ error: body.error.flatten() }, 400);
+        const id = c.req.param('id');
+        const d = await shownLesson(id);
+        if (!d) return c.json({ error: 'not found' }, 404);
+        const l = d.lesson;
+        if (l.status === 'rejected' || l.status === 'superseded') return c.json({ error: `this lesson is already ${l.status}` }, 409);
+        const projectKey = l.projectKey ?? l.origin ?? null;
+        if (!projectKey) return c.json({ error: 'this lesson has no project, so there is no project to file the fact under' }, 409);
+        const by = currentActor();
+        const path = lessonFactPath(l.paths);
+        const why = `From the lesson "${l.title}"${d.miss ? `: ${d.miss.missed}` : ''}`;
+        const [embedding] = await embed([`${path}: ${l.rule}`]);
+        const fact = await addOwnerFact(projectKey, {
+          kind: body.data.kind, statement: l.rule, path, lines: null, confidence: 1, why, relevance: body.data.relevance, origin: 'you', embedding,
+        }, by as RelevanceBy);
+        await knowledge.updateLesson(id, { status: 'rejected' }, { by, note: 'converted to a fact' });
+        await activity?.record({
+          kind: 'lesson_to_fact',
+          actor: 'you',
+          projectKey,
+          subject: `converted lesson "${l.title}" to a ${body.data.kind} fact`,
+          why: 'you converted it: it states how the code is, so agents now get it with the project facts (no scan replaces it) and the lesson is rejected',
+          details: { kind: body.data.kind, relevance: body.data.relevance, path, statement: l.rule },
+          targets: [id, fact.id],
+        });
+        return c.json(fact, 201);
+      });
+    }
   }
 
   if (staticDir) {

@@ -21,7 +21,7 @@ cd feedback-graph
 ollama pull gemma4 && ollama pull nomic-embed-text   # with Ollama running
 ./scripts/setup.sh                             # asks which folders hold your projects, writes .env with generated passwords, checks Ollama, offers to fix and start
 docker compose up -d --build
-open http://localhost:8787                     # 8787 unless you set API_PORT (setup.sh prints the address); Settings: add project folders, choose the projects to read
+open http://localhost:8787                     # the Dashboard (8787 unless you set API_PORT); Settings: add project folders, choose the projects to read
 ./scripts/install-agent.sh                     # connect Claude Code and Codex (see below); --dry-run shows what it would change
 ```
 
@@ -78,7 +78,11 @@ The MCP tools only read and report. Decisions (choosing projects, scanning, conf
 ./scripts/fg lessons list            # lessons approve|reject <id> needs lesson_decide in OPERATOR_ALLOW
 ```
 
-`--json` prints raw answers; `--as <name>` names the agent in Activity. Reading works without the token.
+`--json` prints raw answers; `--as <name>` names the agent in Activity. Reading works without the token. `fg status --watch` follows the live event stream. `./scripts/fg --help` lists every command (projects, scans, Inbox, lessons, links, facts, docs, activity, sessions, cloud, integrations, `map rebuild`, `doctor`, `setup`).
+
+**From inside an agent session:** with `FG_OPERATOR_TOKEN` set, a second MCP endpoint, `http://localhost:8787/mcp/admin`, gives a coding agent the same decisions as tools (`pipeline_status`, `list_projects`, `select_projects`, `scan_projects`, `inbox_list`, `inbox_decide`, `lessons_list`, `lesson_decide`, `link_decide`, `set_fact_relevance`, `cloud_sync_now`, `rebuild_code_map`). It answers only to the operator token (send it as the Bearer when you register the server), and each tool is limited by the same `OPERATOR_ALLOW` verbs. The regular `/mcp` endpoint stays read-and-report only.
+
+**For scripts:** `GET /api/openapi.json` describes the whole local API (OpenAPI 3.1), including which routes are owner-only and which `OPERATOR_ALLOW` verb unlocks each. `GET /api/events` streams changes as server-sent events (`stage`, `pipeline`, `scan`, `chat`, `activity`), so a watcher does not have to poll.
 
 ## How it works
 
@@ -96,6 +100,8 @@ The MCP tools only read and report. Decisions (choosing projects, scanning, conf
 
 | Page | What |
 |---|---|
+| Dashboard | The landing page: what the worker is doing, model health, pipeline counts, repeat and catch rates, projects, hotspots, recent activity, and an Ask box |
+| Ask | Chat about one project, one conversation per topic ("I want to add a modal", "where would feature X go?"). Answers cite the lessons, misses, facts, docs and code they come from, show existing examples and where they are used, and end with a **prompt for your agent** to copy into Claude Code or Codex, with the Feedback Graph tools to use. Runs on Claude, Codex or the local model (`CHAT_LLM`; switch per chat). The model gets only the question and that context, up to 16 KB of code from the project with secret files never read |
 | Inbox | Flagged feedback to confirm or reject (`j`/`k`, `c`, `r`), from sessions (Claude, Codex) and from GitHub and Linear comments, filterable by source |
 | Lessons | Evidence chain per lesson, edit and approve, plus its history |
 | Graph | Clickable map from feedback to miss, cause, lesson, context and fix commits; **Code** mode draws a project's code map (hotspot files, imports, tests, and the misses and lessons on them), and a file opens its module panel |
@@ -103,6 +109,8 @@ The MCP tools only read and report. Decisions (choosing projects, scanning, conf
 | Sessions | Each session's running summary (filter by project and active/idle), its update history, files touched, the Inbox items and lessons from it, and **Rebuild summary** |
 | Projects | Pin a project (pinned ones come first in every list), link it to the projects it belongs with (the worker suggests links from what is in them; you confirm), code map (stats, sortable hotspots with an include-tests toggle, a module panel per file linking to its lessons and Inbox items), scan code into facts (choose the model), browse facts by relevance with "how was this created?" and set a fact's relevance, upload docs and images that the worker reads into facts |
 | Activity | The provenance log, filterable by project and kind |
+
+How to read each page, with screenshots: [docs/guide.md](docs/guide.md).
 
 The sidebar shows whether the worker is running, and a connections list (GitHub, Linear, Claude, Codex, Ollama, cloud sync) with each one's state and a link to where it is set. Projects also has **Export** (a versioned JSON bundle), **Import bundle** (its lessons arrive proposed unless you keep them approved) and **Delete project data**. Settings picks the project folders to read and, when team sync is configured, shows the **Cloud sync** card.
 
@@ -113,7 +121,8 @@ The sidebar shows whether the worker is running, and a connections list (GitHub,
 | `PROJECTS_DIRS` | The project folders that are mounted, comma-separated. `setup.sh` keeps it in step with the folders you add in Settings (editing it here and re-running `setup.sh` also works). No default. |
 | `POLL_SECONDS`, `CLASSIFY_BATCH`, `SCAN_MAX_FILES`, `SCAN_MAX_BYTES` | Worker pace and bounds: seconds between cycles (30), turns classified per cycle (50), files per project the code map keeps (empty: 40% of the files worth mapping, from 400 to 4000; source and the files your sessions edited first) and bytes per file (80000). Empty: the default. |
 | `SCAN_CONCURRENCY` | Scans run at once, beside the worker cycle (2). Agentic scans (`codex-cli`, `claude-cli`) run one at a time. |
-| `OLLAMA_NUM_PREDICT`, `OLLAMA_REPEAT_PENALTY`, `OLLAMA_TIMEOUT_SECONDS` | Sent with every Ollama call: the most tokens an answer may take (2048) and the repeat penalty (1.1), so a model stuck repeating itself stops early; and how long one call may take (empty: each job's own limit). |
+| `OLLAMA_NUM_PREDICT`, `OLLAMA_NUM_CTX`, `OLLAMA_REPEAT_PENALTY`, `OLLAMA_TIMEOUT_SECONDS` | Sent with every Ollama call: the most tokens an answer may take (empty: each job's own budget, classify 256, relevance 1024, Ask 6144, others 2048), the context window (16384; one value for every call, so the model is not reloaded), the repeat penalty (1.1), and how long one call may take (empty: each job's own limit). Structured calls also send `think: false`. |
+| `CHAT_LLM` | The model that answers Ask questions (same forms as the other jobs). Empty: `claude-cli` when a Claude token is set, else `codex-cli` when Codex may run, else the local model. Each chat can switch between Claude, Codex and the local model. |
 | `INGEST_PROJECTS` | Seeds the project selection on the very first start only (e.g. `demo-shop`); after that, the selection in Settings decides. Empty: nothing is read until you choose (an upgrade selects the projects that already hold your approved lessons, confirmed feedback, docs or scans). Global lessons reach every folder under a root that is not excluded, selected or not. |
 | `EXCLUDE_PROJECTS` | Never read, scan or serve these projects, whatever is selected. Settings shows them as excluded and cannot select them. |
 | `CLAUDE_PROJECTS_DIR`, `CODEX_SESSIONS_DIR` | Session transcripts on the host: Claude Code's (default `~/.claude/projects`, where its memory notes are too) and Codex's (default `~/.codex/sessions`; if it does not exist the worker carries on without Codex). |
@@ -122,7 +131,7 @@ The sidebar shows whether the worker is running, and a connections list (GitHub,
 | `TURN_RETENTION_DAYS` | Remove the text of unflagged turns older than this. Empty keeps everything. While summaries are on, a turn keeps its text until its session summary covers it; summaries are never removed. |
 | `SUMMARY_LLM`, `SUMMARY_QUIET_MINUTES`, `SUMMARY_MAX_DELTA_TURNS`, `SESSION_IDLE_MINUTES`, `SUMMARY_BACKFILL_PER_CYCLE` | Session summaries: the model (same specs as below; empty: the local model; `off`: no summaries), the quiet time before new turns are summarized (10), the waiting turns that are summarized at once (40), the quiet time after which a summarized session is idle (30), and older sessions summarized per cycle (3). |
 | `MEMORY_AUTO_APPROVE` | `false` (default): Claude Code feedback memories (`type: feedback`) are imported as proposed lessons that you approve in Lessons. `true`: they are approved on import. Either way, once you edit, approve or reject one, re-importing its file never changes it. |
-| `FG_OPERATOR_TOKEN`, `OPERATOR_ALLOW` | Let agents and scripts (the `fg` CLI) make owner decisions without a browser. Empty: none can. `OPERATOR_ALLOW` names what the token may do; empty means everything except deciding lessons, deleting a project or an uploaded document, settings (roots and cleanup), imports and integration keys. See [Agents and scripts](#agents-and-scripts). |
+| `FG_OPERATOR_TOKEN`, `OPERATOR_ALLOW` | Let agents and scripts (the `fg` CLI) make owner decisions without a browser. Empty: none can. `OPERATOR_ALLOW` names what the token may do; empty means everything except deciding lessons, deleting a project, an uploaded document or a chat, settings (roots and cleanup), imports and integration keys. See [Agents and scripts](#agents-and-scripts). |
 | `GITHUB_BOT_LOGINS`, `GITHUB_AGENT_LOGINS` | GitHub logins whose comments are a bot's (skipped) or an AI agent's (kept and labelled), comma-separated. Accounts GitHub marks as bots are skipped anyway. |
 | `API_TOKEN`, `PUBLIC_HOSTS`, `API_BIND` | Reach the API from other machines: every call then needs the token. Without one, only localhost: an `API_BIND` other than 127.0.0.1 without `API_TOKEN` refuses to start. |
 | `CODEX_RUNNER_URL` | `http://codex-runner:8790`, with `codex` in `COMPOSE_PROFILES`: `codex-cli` runs confined in the codex-runner container, which holds only the Codex CLI, your Codex login and the job's copy of the repository ([docs/operations.md](docs/operations.md#running-codex-cli-confined)). |

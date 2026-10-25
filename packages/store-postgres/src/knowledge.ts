@@ -12,6 +12,7 @@ import {
   type ContextItem,
   type KnowledgeStore,
   type Lesson,
+  type LessonCheck,
   type LessonDetail,
   type LessonHit,
   type LessonInput,
@@ -58,7 +59,7 @@ export class PgKnowledgeStore implements KnowledgeStore {
 
   async feedbackNeedingPostmortem(limit: number, now = new Date()): Promise<PostMortemInput[]> {
     const { rows } = await this.q(
-      `SELECT f.id AS feedback_id, row_to_json(t) AS turn, s.id AS sid, s.cwd, s.source, p.key AS pkey, p.repo_path, k.note
+      `SELECT f.id AS feedback_id, row_to_json(t) AS turn, s.id AS sid, s.cwd, s.source, p.key AS pkey, p.repo_path, k.note, k.decided_by AS note_by
        FROM feedback f JOIN turns t ON t.uuid = f.turn_uuid JOIN sessions s ON s.id = t.session_id
          JOIN projects p ON p.key = s.project_key LEFT JOIN candidates k ON k.id = f.id
        WHERE NOT EXISTS (SELECT 1 FROM misses m WHERE m.feedback_id = f.id) AND f.status <> 'rejected'
@@ -80,6 +81,7 @@ export class PgKnowledgeStore implements KnowledgeStore {
       feedback: turnOf(r.turn),
       turns: turns.rows.filter((t) => t.session_id === r.sid).map(turnOf),
       note: r.note ?? null,
+      noteBy: r.note_by ?? null,
     }));
   }
 
@@ -138,11 +140,12 @@ export class PgKnowledgeStore implements KnowledgeStore {
       // A re-saved post-mortem rewrites the lesson's text but keeps its status, creation time and source.
       await c.query(
         `INSERT INTO lessons (id, status, created_at, source, title, rule, applies_when, scope, paths, cause, miss_id,
-                              project_key, origin_project_key, embedding)
-         VALUES ($1, 'proposed', $2, 'postmortem', $3, $4, $5, $6, $7, $8, $9, CASE WHEN $6 = 'global' THEN NULL ELSE $10 END, $10, $11::vector)
+                              project_key, origin_project_key, embedding, checks)
+         VALUES ($1, 'proposed', $2, 'postmortem', $3, $4, $5, $6, $7, $8, $9, CASE WHEN $6 = 'global' THEN NULL ELSE $10 END, $10, $11::vector, $12::jsonb)
          ON CONFLICT (id) DO UPDATE SET title = EXCLUDED.title, rule = EXCLUDED.rule, applies_when = EXCLUDED.applies_when,
            scope = EXCLUDED.scope, paths = EXCLUDED.paths, cause = EXCLUDED.cause, miss_id = EXCLUDED.miss_id,
-           project_key = EXCLUDED.project_key, origin_project_key = EXCLUDED.origin_project_key, embedding = EXCLUDED.embedding`,
+           project_key = EXCLUDED.project_key, origin_project_key = EXCLUDED.origin_project_key, embedding = EXCLUDED.embedding,
+           checks = EXCLUDED.checks`,
         [
           lessonId,
           now,
@@ -155,6 +158,7 @@ export class PgKnowledgeStore implements KnowledgeStore {
           missId,
           r.pkey,
           vectorOf(embeddings.lesson),
+          pm.lessonChecks ? toJson(pm.lessonChecks) : null,
         ],
       );
       // Fix commits: the session's commits made after the feedback, by real time (committers' offsets differ).
@@ -242,7 +246,7 @@ export class PgKnowledgeStore implements KnowledgeStore {
   }
 
   /** `unscoped`: you narrowed it but its project is unknown, so it went back to proposed instead of serving everywhere. */
-  async updateLesson(id: string, patch: LessonPatch, o: { reembed?: number[]; by?: string }): Promise<{ unscoped: boolean }> {
+  async updateLesson(id: string, patch: LessonPatch, o: { reembed?: number[]; by?: string; note?: string }): Promise<{ unscoped: boolean }> {
     const now = new Date();
     const { supersedes, status, ...fields } = patch;
     if (supersedes !== undefined) {
@@ -263,6 +267,7 @@ export class PgKnowledgeStore implements KnowledgeStore {
            status = coalesce($12, status),
            decided_at = CASE WHEN $12::text IS NULL THEN decided_at ELSE $13 END,
            decided_by = CASE WHEN $12::text IS NULL THEN decided_by ELSE $15 END,
+           decision_note = CASE WHEN $12::text IS NULL THEN decision_note ELSE $16::text END,
            embedding = CASE WHEN $14::vector IS NULL THEN embedding ELSE $14::vector END
          WHERE id = $1
          RETURNING (SELECT coalesce(lessons.origin_project_key, f.project_key, lessons.project_key)
@@ -283,6 +288,7 @@ export class PgKnowledgeStore implements KnowledgeStore {
           now,
           o.reembed ? vectorOf(o.reembed) : null,
           o.by ?? 'you',
+          o.note ? redactSecrets(o.note) : null,
         ],
       );
       if (!rows[0]) return { unscoped: false };
@@ -309,6 +315,11 @@ export class PgKnowledgeStore implements KnowledgeStore {
       }
       return { unscoped };
     });
+  }
+
+  async setLessonChecks(id: string, checks: LessonCheck[]): Promise<boolean> {
+    const { rowCount } = await this.q('UPDATE lessons SET checks = $2::jsonb WHERE id = $1', [id, toJson(redactDeep(checks))]);
+    return (rowCount ?? 0) > 0;
   }
 
   async searchLessons(q: { embedding: number[]; projectKey: string | null; k: number; status?: LessonStatus; projectKeys?: string[] }): Promise<LessonHit[]> {
@@ -432,5 +443,7 @@ function lessonOf(r: Row): Lesson {
     createdAt: iso(r.created_at) as string,
     decidedAt: iso(r.decided_at),
     decidedBy: r.decided_by ?? null,
+    decisionNote: r.decision_note ?? null,
+    checks: (r.checks as LessonCheck[] | null) ?? null,
   };
 }

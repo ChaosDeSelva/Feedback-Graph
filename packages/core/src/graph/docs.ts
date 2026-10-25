@@ -15,7 +15,8 @@ export type DocReadStatus = 'pending' | 'reading' | 'done' | 'failed';
 export type DocReadState = { status: DocReadStatus; attempts: number; error: string | null; retryAt: string | null; readAt: string | null; facts: number };
 export type DocKind = 'text' | 'image';
 /** read: null for a document that is never read into facts (PR discussions and tickets). */
-export type DocSummary = DocInput & { id: string; addedAt: string; chunks: number; kind: DocKind; mediaType: string | null; read: DocReadState | null };
+/** addedBy: who uploaded it ('you', or 'operator:<name>'); null for PR discussions, tickets and older uploads. */
+export type DocSummary = DocInput & { id: string; addedAt: string; addedBy: string | null; chunks: number; kind: DocKind; mediaType: string | null; read: DocReadState | null };
 /** What the docs stage reads: the text of a text upload (its chunks joined), or the image of an image upload. */
 /**
  * `version`: which upload of the document this is (its addedAt). The reader passes it back, so a reading of a version
@@ -23,7 +24,7 @@ export type DocSummary = DocInput & { id: string; addedAt: string; chunks: numbe
  */
 export type DocToRead = { id: string; projectKey: string; ref: string; title: string; kind: DocKind; text: string; image: TaskImage | null; attempts: number; version: string };
 /** read: queue it to be read into facts (uploads). image: the upload is this image (stored for the reader and the thumbnail). */
-export type UpsertDocOpts = { read?: boolean; image?: TaskImage };
+export type UpsertDocOpts = { read?: boolean; image?: TaskImage; addedBy?: string };
 /** Images are kept in the database, so no volume is needed: at most this many bytes. */
 export const MAX_IMAGE_BYTES = 8 * 1024 * 1024;
 /** Same project, source and ref: same document (re-adding replaces it). Takes the already-redacted ref. */
@@ -51,7 +52,7 @@ export class DocsRepo implements DocsStore {
         `MERGE (p:Project {key: $doc.projectKey})
          MERGE (d:Doc {id: $id})
          SET d.projectKey = $doc.projectKey, d.source = $doc.source, d.ref = $doc.ref, d.title = $doc.title,
-             d.url = $doc.url, d.addedAt = $now, d.kind = $kind, d.mediaType = $mediaType,
+             d.url = $doc.url, d.addedAt = $now, d.addedBy = $addedBy, d.kind = $kind, d.mediaType = $mediaType,
              d.readStatus = CASE WHEN $read THEN 'pending' ELSE null END, d.readAttempts = 0, d.readError = null,
              d.readRetryAt = null, d.readAt = null
          MERGE (d)-[:IN]->(p)
@@ -62,7 +63,7 @@ export class DocsRepo implements DocsStore {
          UNWIND range(0, size($chunks) - 1) AS i
            CREATE (d)-[:HAS_CHUNK]->(:Chunk {id: $id + '#' + toString(i), docId: $id, projectKey: $doc.projectKey,
                                              idx: i, text: $chunks[i].text, embedding: $chunks[i].embedding})`,
-        { id, doc, chunks, now: new Date().toISOString(), read: !!o.read, kind: o.image ? 'image' : 'text', mediaType: o.image?.mediaType ?? null },
+        { id, doc, chunks, now: new Date().toISOString(), addedBy: o.addedBy ?? null, read: !!o.read, kind: o.image ? 'image' : 'text', mediaType: o.image?.mediaType ?? null },
       ],
       [`MATCH (x:Fact {docId: $id}) DETACH DELETE x`, { id }],
       [`MATCH (b:DocBlob {docId: $id}) DETACH DELETE b`, { id }],
@@ -161,6 +162,16 @@ export class DocsRepo implements DocsStore {
     await this.g.run(`MATCH (d:Doc {readStatus: 'reading'}) SET d.readStatus = 'pending'`);
   }
 
+  async requeueDocRead(id: string): Promise<boolean> {
+    const [r] = await this.g.run(
+      `MATCH (d:Doc {id: $id}) WHERE d.readStatus IN ['failed', 'pending']
+       SET d.readStatus = 'pending', d.readAttempts = 0, d.readError = null, d.readRetryAt = null
+       RETURN count(d) AS n`,
+      { id },
+    );
+    return Number(r?.get('n') ?? 0) > 0;
+  }
+
   async docImage(id: string): Promise<TaskImage | null> {
     const [r] = await this.g.run(`MATCH (b:DocBlob {docId: $id}) RETURN b.mediaType AS mediaType, b.data AS data LIMIT 1`, { id });
     return r ? { mediaType: r.get('mediaType'), data: r.get('data') } : null;
@@ -178,7 +189,7 @@ export class DocsRepo implements DocsStore {
     return rows.map((r) => {
       const p = r.get('d').properties;
       return {
-        id: p.id, projectKey: p.projectKey, source: p.source, ref: p.ref, title: p.title, url: p.url ?? null, addedAt: p.addedAt, chunks: r.get('chunks'),
+        id: p.id, projectKey: p.projectKey, source: p.source, ref: p.ref, title: p.title, url: p.url ?? null, addedAt: p.addedAt, addedBy: p.addedBy ?? null, chunks: r.get('chunks'),
         kind: p.kind ?? 'text', mediaType: p.mediaType ?? null,
         read: p.readStatus
           ? { status: p.readStatus, attempts: Number(p.readAttempts ?? 0), error: p.readError ?? null, retryAt: p.readRetryAt ?? null, readAt: p.readAt ?? null, facts: Number(r.get('facts')) }

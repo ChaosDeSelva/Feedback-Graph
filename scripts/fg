@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
-# fg: drive Feedback Graph from a terminal or an agent (status, projects, scans, Inbox, lessons, cloud sync).
+# fg: drive Feedback Graph from a terminal or an agent (status, projects, scans, Inbox, lessons, links, facts, docs,
+# activity, sessions, cloud sync, integrations).
 #   ./scripts/fg --help
-#   ./scripts/fg status --watch
+#   ./scripts/fg status --until idle --timeout 600
 #   ./scripts/fg projects select --key acme,demo-shop
-#   ./scripts/fg scan --all
+#   ./scripts/fg scan --all --wait
 #   ./scripts/fg inbox list ; ./scripts/fg inbox reject <id> --reason "bot comment"
+#   ./scripts/fg doctor                      the host checks (./scripts/doctor.sh)
+#   ./scripts/fg setup --yes                 ./scripts/setup.sh with those arguments
 #
 # Owner decisions need FG_OPERATOR_TOKEN (from the environment, else .env); the API allows only the verbs OPERATOR_ALLOW
 # names (by default not deciding lessons, deleting data, importing or integration keys). The token is passed to the CLI in its environment, never printed.
@@ -13,6 +16,10 @@
 set -euo pipefail
 
 here="$(cd "$(dirname "$0")/.." && pwd)"
+# The host checks (Docker, ports, Ollama, mounts) are not an API call: they run here, with or without Node.
+if [ "${1:-}" = doctor ]; then shift; exec "$here/scripts/doctor.sh" "$@"; fi
+# Setup (Docker, .env, models, the stack) is the host's job too: never inside the api container.
+if [ "${1:-}" = setup ]; then shift; exec "$here/scripts/setup.sh" "$@"; fi
 env_file="${FEEDBACK_GRAPH_ENV:-$here/.env}"
 # KEY's value: the environment's when set, else the last KEY= line of the env file, surrounding quotes removed.
 setting() {

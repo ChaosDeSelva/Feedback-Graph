@@ -37,6 +37,9 @@ const SIGNED_OUT = /not logged in|please run \/?login|codex login|invalid api ke
 const LIMITED = /usage limit|rate limit|credit balance|quota|\b429\b|overloaded/i;
 const excerpt = (s: string) => redactSecrets(s).replace(/\s+/g, ' ').trim().slice(0, 160);
 
+/** Ollama's answer when it stops one generation (e.g. the repeat limit): the model is up, this input went wrong. */
+const ABORTED_GENERATION = /prediction aborted|token repeat limit/i;
+
 type ErrLike = { name?: unknown; code?: unknown; message?: unknown; cause?: unknown; syscall?: unknown; path?: unknown };
 
 /**
@@ -81,6 +84,8 @@ export function providerUnavailableReason(err: unknown): string | null {
   if (http) {
     const status = Number(http[2]);
     const body = excerpt(http[3]);
+    // Ollama aborting this one generation (stuck repeating itself) is about this input's answer, not the model being down.
+    if (status >= 500 && ABORTED_GENERATION.test(http[3])) return null;
     if (status >= 500) return `${http[1]} answered HTTP ${status}${body ? `: ${body}` : ''}`;
     if (status === 404) return `model not found (${http[1]} 404${body ? `: ${body}` : ''})`;
     if (status === 401 || status === 403) return `${http[1]} is not authorized (HTTP ${status}); check its key`;

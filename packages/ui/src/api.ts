@@ -1,4 +1,5 @@
 import type { Activity, ActivityKind, Connection, ConnectionName, ExternalRef, FeedbackSource, CloudSyncResult, SyncCounts, SyncTrigger, Candidate, CodeMapMeta, Hotspot, MapGraph, ModuleContext, FolderCandidate, OutsideFolder, PipelineStatus, DocSummary, CandidateDetail, CandidateStatus, EvidenceGraph, FactHit, FactKind, Lesson, LessonDetail, LessonStatus, PatternReport, ProjectSummary, ProjectLink, LinkRelation, LinkStatus, ScanJob, SessionDetail, SessionListItem, SessionState, StatsRow, StoredFact, SystemStatus } from '@fb/core';
+import type { ChatConversation, ChatProvider, ChatThread } from '@fb/core/chat';
 
 export type { Connection, ConnectionName, ExternalRef, FeedbackSource, CloudSyncResult, SyncCounts, Activity, Candidate, CodeMapMeta, Hotspot, MapGraph, ModuleContext, DocSummary, CandidateDetail, CandidateStatus, EvidenceGraph, Lesson, LessonDetail, LessonStatus, PatternReport, ProjectSummary, ProjectLink, LinkRelation, LinkStatus, ScanJob, PipelineStatus, SessionDetail, SessionListItem, SessionState, StatsRow, StoredFact, SystemStatus };
 
@@ -35,7 +36,12 @@ export type ProjectSettings = {
 };
 
 /** GET /api/projects/:key/codemap/hotspots: the map's stats (null before its first build) and its hotspots. */
-export type CodeMapReport = { meta: CodeMapMeta | null; hotspots: Hotspot[] };
+/**
+ * Whether the map is capped (the API's mapCapped): `of` the files worth mapping, or null for a map built before they
+ * were counted that holds as many files as the cap allows.
+ */
+export type MapCapped = { files: number; of: number | null } | null;
+export type CodeMapReport = { meta: CodeMapMeta | null; hotspots: Hotspot[]; capped?: MapCapped };
 /** GET /api/codemap/hotspots: hotspots across the selected projects. */
 export type ProjectHotspot = Hotspot & { projectKey: string };
 
@@ -136,7 +142,7 @@ export const api = {
   signIn: (token: string) => request('/api/session', { method: 'POST', body: { token } }),
   signOut: () => request('/api/session', { method: 'DELETE', body: {} }),
   status: () => request<SystemStatus>('/api/status'),
-  pipeline: () => request<PipelineStatus>('/api/pipeline'),
+  pipeline: (project?: string) => request<PipelineStatus>(`/api/pipeline${qs({ project })}`),
 
   candidates: (status: CandidateStatus, project?: string) => request<Candidate[]>(`/api/candidates${qs({ status, limit: '500', project })}`),
   candidate: (id: string) => request<CandidateDetail>(`/api/candidates/${enc(id)}`),
@@ -147,6 +153,8 @@ export const api = {
   lessons: (status: LessonStatus, project?: string) => request<Lesson[]>(`/api/lessons${qs({ status, project })}`),
   lesson: (id: string) => request<LessonDetail>(`/api/lessons/${enc(id)}`),
   updateLesson: (id: string, patch: LessonEdit) => request(`/api/lessons/${enc(id)}`, { method: 'PATCH', body: patch }),
+  /** File the lesson's rule as a project fact you wrote (no scan replaces it); the lesson is rejected, noted "converted to a fact". */
+  lessonToFact: (id: string, body: { kind: FactKind; relevance: number }) => request<StoredFact>(`/api/lessons/${enc(id)}/to-fact`, { method: 'POST', body }),
   retryPostmortem: (feedbackId: string) => request(`/api/feedback/${enc(feedbackId)}/retry`, { method: 'POST', body: {} }),
   /** Give the turns the classifier gave up on another go (owner-only). */
   requeueTurns: () => request<{ requeued: number }>('/api/turns/requeue', { method: 'POST', body: {} }),
@@ -175,7 +183,8 @@ export const api = {
 
   codeMap: (key: string, limit = 200, includeTests = false) =>
     request<CodeMapReport>(`/api/projects/${enc(key)}/codemap/hotspots${qs({ limit: String(limit), tests: includeTests ? '1' : undefined })}`),
-  codeGraph: (key: string, includeTests = false) => request<MapGraph & { meta?: CodeMapMeta | null }>(`/api/projects/${enc(key)}/codemap/graph${qs({ tests: includeTests ? '1' : undefined })}`),
+  rebuildCodeMap: (key: string) => request<{ queued: boolean }>(`/api/projects/${enc(key)}/codemap/rebuild`, { method: 'POST', body: {}, retry: false }),
+  codeGraph: (key: string, includeTests = false) => request<MapGraph & { meta?: CodeMapMeta | null; capped?: MapCapped }>(`/api/projects/${enc(key)}/codemap/graph${qs({ tests: includeTests ? '1' : undefined })}`),
   codeModule: (key: string, path: string) => request<ModuleContext>(`/api/projects/${enc(key)}/codemap/module${qs({ path })}`),
   topHotspots: (project?: string, limit = 10, includeTests = false) =>
     request<ProjectHotspot[]>(`/api/codemap/hotspots${qs({ project, limit: String(limit), tests: includeTests ? '1' : undefined })}`),
@@ -192,6 +201,8 @@ export const api = {
   cloud: () => request<CloudInfo>('/api/cloud'),
   syncCloud: () => request<CloudSyncResult>('/api/cloud/sync', { method: 'POST', body: {}, retry: false }),
 
+  /** A failed reading, queued again (no re-upload): after DOCS_LLM changed to a model with vision, say. */
+  rereadDoc: (id: string) => request(`/api/docs/${enc(id)}/reread`, { method: 'POST', body: {} }),
   deleteDoc: (id: string) => request(`/api/docs/${enc(id)}`, { method: 'DELETE', body: {}, retry: false }),
 
   sessions: (o: { project?: string; state?: SessionState; cursor?: string }) =>
@@ -199,6 +210,17 @@ export const api = {
   sessionDetail: (id: string) => request<SessionDetail>(`/api/sessions/${enc(id)}`),
   /** Rebuild a session's summary from its first turn (owner-only). */
   resummarize: (id: string) => request<{ queued: boolean }>(`/api/sessions/${enc(id)}/resummarize`, { method: 'POST', body: {} }),
+
+  // Ask: conversations about one project. Writes spend the owner's model subscription, so a send or retry is never
+  // repeated on its own: a lost answer may mean the question was queued.
+  chats: (project?: string) => request<ChatConversation[]>(`/api/chats${qs({ project })}`),
+  chat: (id: string) => request<ChatThread>(`/api/chats/${enc(id)}`),
+  createChat: (body: { project: string; provider?: ChatProvider | null; title?: string }) =>
+    request<ChatConversation>('/api/chats', { method: 'POST', body, retry: false }),
+  sendChat: (id: string, text: string) => request<ChatThread>(`/api/chats/${enc(id)}/messages`, { method: 'POST', body: { text }, retry: false }),
+  retryChatTurn: (id: string, turnId: string) => request<ChatThread>(`/api/chats/${enc(id)}/turns/${enc(turnId)}/retry`, { method: 'POST', body: {}, retry: false }),
+  updateChat: (id: string, patch: { provider?: ChatProvider | null; title?: string }) => request<ChatConversation>(`/api/chats/${enc(id)}`, { method: 'PATCH', body: patch }),
+  deleteChat: (id: string) => request(`/api/chats/${enc(id)}`, { method: 'DELETE', body: {}, retry: false }),
 };
 
 /** One service on Settings > Integrations (GET /api/settings/integrations). Never carries a token. */
@@ -221,7 +243,13 @@ export type ProjectIntegrations = {
   linear: { teamId: string | null; teamName: string | null; lastSyncAt: string | null; items: number; error: string | null };
 };
 
-export type IntegrationsView = { canSave: boolean; syncMinutes: number; github: ServiceView; linear: ServiceView; projects: ProjectIntegrations[] };
+/** A skip rule with how many comments it kept from the classifier (null: not counted). */
+export type SkipRuleView = { name: string; description: string; skipped: number | null };
+export type IntegrationsView = {
+  canSave: boolean; syncMinutes: number; github: ServiceView; linear: ServiceView; projects: ProjectIntegrations[];
+  /** Absent from APIs older than 0.5.1. */
+  rules?: SkipRuleView[]; skippedSince?: string | null;
+};
 export type IntegrationKind = 'github' | 'linear';
 export type LinearTeam = { id: string; key: string; name: string };
 

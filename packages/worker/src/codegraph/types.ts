@@ -28,8 +28,11 @@ export type CodeImport = {
   spec: string;
 };
 
-/** candidates: files worth mapping before the cap (absent on a map from before it was counted). */
-export type CodeMap = { files: CodeFile[]; symbols: CodeSymbol[]; imports: CodeImport[]; candidates?: number | null };
+/**
+ * candidates: files worth mapping before the cap (absent on a map from before it was counted). unresolved: imports
+ * that look like they name a repo file (an alias, a workspace package) but resolved to none, so edges are missing.
+ */
+export type CodeMap = { files: CodeFile[]; symbols: CodeSymbol[]; imports: CodeImport[]; candidates?: number | null; unresolved?: number | null };
 
 /**
  * `signal`: stop parsing (the worker is shutting down); the build then rejects with the signal's reason. maxFiles null:

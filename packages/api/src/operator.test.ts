@@ -45,7 +45,8 @@ test('the operator token passes the owner-only gate and the write is logged as t
   const { app, logged, decided } = setup();
   const res = await app.request('/api/candidates/c1/decision', call('POST', { status: 'confirmed' }, bearer(OP, 'codex')));
   expect(res.status).toBe(204);
-  expect(decided).toEqual([['c1', 'confirmed', null]]);
+  // The item itself records who decided, not only Activity.
+  expect(decided).toEqual([['c1', 'confirmed', null, 'operator:codex']]);
   expect(logged).toEqual([expect.objectContaining({ kind: 'feedback_decided', actor: 'operator:codex' })]);
   // No name: plain operator.
   await app.request('/api/candidates/c1/decision', call('POST', { status: 'rejected' }, bearer(OP)));
@@ -61,13 +62,28 @@ test('the browser is still you, and a bare local client is still refused', async
 
 test('a wrong token, or any token while FG_OPERATOR_TOKEN is unset, grants nothing', async () => {
   const { app } = setup();
-  expect((await app.request('/api/candidates/c1/decision', call('POST', { status: 'confirmed' }, bearer('x'.repeat(32))))).status).toBe(403);
-  expect((await app.request('/api/candidates/c1/decision', call('POST', { status: 'confirmed' }, bearer(OP.slice(1))))).status).toBe(403);
+  // A present but unrecognised bearer on an owner decision is 401, not the "only you" refusal meant for a bare client.
+  const wrong = await app.request('/api/candidates/c1/decision', call('POST', { status: 'confirmed' }, bearer('x'.repeat(32))));
+  expect(wrong.status).toBe(401);
+  expect((await wrong.json()).error).toMatch(/token not recognised/);
+  expect((await app.request('/api/candidates/c1/decision', call('POST', { status: 'confirmed' }, bearer(OP.slice(1))))).status).toBe(401);
   const off = setup({ token: null });
   expect((await off.app.request('/api/candidates/c1/decision', call('POST', { status: 'confirmed' }, bearer(OP)))).status).toBe(403);
   // An empty token is never a match, even for an empty bearer.
   const empty = setup({ token: '' });
   expect((await empty.app.request('/api/candidates/c1/decision', call('POST', { status: 'confirmed' }, { authorization: 'Bearer ' }))).status).toBe(403);
+});
+
+test('an unrecognised bearer is logged without the token; reads ignore a bearer when no API_TOKEN is set', async () => {
+  const lines: [string, object | undefined][] = [];
+  const { app } = setup({ extra: { log: (msg, extra) => { lines.push([msg, extra]); } } });
+  const wrong = 'w'.repeat(32);
+  await app.request('/api/projects/shop/pin', call('PUT', { pinned: true }, bearer(wrong, 'codex')));
+  const refused = lines.filter(([m]) => m === 'auth refused');
+  expect(refused).toEqual([['auth refused', expect.objectContaining({ method: 'PUT', path: '/api/projects/shop/pin', operator: 'operator:codex' })]]);
+  expect(JSON.stringify(lines)).not.toContain(wrong);
+  // The Claude Code plugin sends "Bearer none" when it has no token: reading still works.
+  expect((await app.request('/api/lessons', { headers: { authorization: 'Bearer none' } })).status).toBe(200);
 });
 
 test('deciding lessons stays with you unless OPERATOR_ALLOW names lesson_decide; the refusal says how to allow it', async () => {
@@ -138,4 +154,49 @@ test('writes logged by the Settings routes carry the agent too', async () => {
 test('deleting an uploaded document is its own verb, off by default', () => {
   expect(OWNER_ROUTES.find(([m, path]) => m === 'DELETE' && path === '/api/docs/:id')?.[2]).toBe('docs_delete');
   expect(OWNER_ROUTES.find(([m, path]) => m === 'POST' && path === '/api/projects/:key/docs')?.[2]).toBe('docs');
+});
+
+test('asking for a document to be read again is the docs verb, like uploading it', () => {
+  expect(OWNER_ROUTES.find(([m, path]) => m === 'POST' && path === '/api/docs/:id/reread')?.[2]).toBe('docs');
+});
+
+test('pins, relevance, uploads and links made with the token are recorded as the agent, in the data and the wording', async () => {
+  const relevance: unknown[] = [];
+  const upserts: unknown[] = [];
+  const project = { key: 'shop', name: 'shop', repoPath: '/vibe/shop' };
+  const { app, logged } = setup({
+    extra: {
+      facts: {
+        listProjects: async () => [], requestScan: async () => ({}) as never, listFacts: async () => [], searchFacts: async () => [],
+        setPinned: async () => {}, setFactRelevance: async (u: unknown[]) => { relevance.push(...u); return 1; },
+      } as never,
+      projectDirs: async () => [project],
+      embed: async (t: string[]) => t.map(() => [0]),
+      docs: { listDocs: async () => [], deleteDoc: async () => true, upsertDoc: async (...a: unknown[]) => { upserts.push(a); return 'doc:shop:upload:a.md'; } } as never,
+      links: { listLinks: async () => [], deleteLink: async () => true, setLink: async () => ({ id: 'link:shop|web', a: 'shop', b: 'web', status: 'dismissed', relation: 'related' }) } as never,
+    },
+  });
+  expect((await app.request('/api/projects/shop/pin', call('PUT', { pinned: true }, bearer(OP, 'codex')))).status).toBe(204);
+  expect((await app.request('/api/projects/shop/facts/f1/relevance', call('PATCH', { relevance: 0.8 }, bearer(OP, 'codex')))).status).toBe(204);
+  expect((await app.request('/api/projects/shop/docs', call('POST', { title: 'A', name: 'a.md', text: 'tenants are isolated' }, bearer(OP, 'codex')))).status).toBe(201);
+  expect((await app.request('/api/links', call('PUT', { a: 'shop', b: 'web', status: 'dismissed' }, bearer(OP, 'codex')))).status).toBe(200);
+  expect(relevance).toEqual([expect.objectContaining({ id: 'f1', by: 'operator:codex' })]);
+  expect(upserts[0]).toEqual([expect.anything(), expect.anything(), expect.objectContaining({ addedBy: 'operator:codex' })]);
+  for (const e of logged) {
+    expect(e.actor).toBe('operator:codex');
+    expect(e.why).not.toMatch(/^you /);
+    expect(e.why).toContain('operator:codex');
+  }
+  expect(logged.map((e) => e.kind)).toEqual(['project_pinned', 'fact_relevance_set', 'doc_added', 'link_decided']);
+});
+
+test('in the UI the same writes still say you', async () => {
+  const { app, logged } = setup({
+    extra: {
+      facts: { listProjects: async () => [], requestScan: async () => ({}) as never, listFacts: async () => [], searchFacts: async () => [], setPinned: async () => {} } as never,
+      projectDirs: async () => [{ key: 'shop', name: 'shop', repoPath: '/vibe/shop' }],
+    },
+  });
+  await app.request('/api/projects/shop/pin', call('PUT', { pinned: true }, { origin: 'http://localhost' }));
+  expect(logged[0].why).toMatch(/^you pinned it/);
 });

@@ -22,6 +22,12 @@ test('passes through a valid classification with prefilter signals', async () =>
   expect(seenUser).toContain('filter server-side');
 });
 
+test('a label needs a short answer: the job asks for at most 256 tokens', async () => {
+  let budget: number | undefined;
+  await classifyTurn(turn, deps(async (o) => { budget = (o as { maxTokens?: number }).maxTokens; return { label: 'neutral', confidence: 1, summary: 's' }; }));
+  expect(budget).toBe(256);
+});
+
 test('returns null when the model answers with something unusable', async () => {
   expect(await classifyTurn(turn, deps(async () => { throw new SyntaxError('Unexpected token'); }))).toBeNull();
   expect(await classifyTurn(turn, deps(async () => { throw new Error('openai:gpt 400: context length exceeded'); }))).toBeNull();

@@ -194,3 +194,122 @@ test('a lesson an agent approved with the operator token says so, in the list an
   expect(badges).toHaveLength(2);
   expect(badges[0].closest('[title]')?.getAttribute('title')).toContain('operator:codex');
 });
+
+test("what the lesson check found shows as chips in the list and, with the reasons, on the lesson; the lesson's paths are shown", async () => {
+  const checks = [
+    { name: 'wrong-session', why: 'the matched session invite did other work; redone from the comment alone' },
+    { name: 'meta-lesson', why: 'about how to treat feedback, not about the work' },
+  ];
+  const flagged = { ...lesson('l1', 'Server search'), checks, paths: ['api/search.ts'] };
+  vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+    if (url.startsWith('/api/lessons?')) return Response.json([flagged, { ...lesson('l2', 'Auth checks'), checks: [] }]);
+    if (url === '/api/lessons/l1') return Response.json({ ...detail('l1', 'Server search'), lesson: flagged });
+    return Response.json([]);
+  }));
+  render(<Lessons />);
+  await screen.findByText('filtered on the client');
+  const list = screen.getByRole('complementary', { name: 'lessons' });
+  expect(within(list).getByText('wrong session')).toBeTruthy();
+  expect(within(list).getByText('about feedback')).toBeTruthy();
+  const found = screen.getByRole('region', { name: 'what the lesson check found' });
+  expect(within(found).getByText(/redone from the comment alone/)).toBeTruthy();
+  expect(within(found).getByText(/not about the work/)).toBeTruthy();
+  expect(screen.getByText('api/search.ts')).toBeTruthy();
+});
+
+test('a proposed lesson can be converted to a project fact: the dialog picks the kind and relevance, and the lesson leaves the list', async () => {
+  const factLike = { ...lesson('l1', 'Server search'), checks: [{ name: 'looks-like-a-fact', why: 'states how the code is rather than what to do' }] };
+  const posts: { url: string; body: unknown }[] = [];
+  vi.stubGlobal('fetch', vi.fn(async (url: string, init?: RequestInit) => {
+    if (init?.method === 'POST') { posts.push({ url, body: JSON.parse(init.body as string) }); return Response.json({ id: 'fact:1', origin: 'you' }, { status: 201 }); }
+    if (url.startsWith('/api/lessons?')) return Response.json([factLike, lesson('l2', 'Auth checks')]);
+    if (url === '/api/lessons/l1') return Response.json({ ...detail('l1', 'Server search'), lesson: factLike });
+    if (url === '/api/lessons/l2') return Response.json(detail('l2', 'Auth checks'));
+    return Response.json([]);
+  }));
+  render(<Lessons />);
+  await screen.findByText('filtered on the client');
+  // The check that flagged it points at the way out.
+  expect(within(screen.getByRole('region', { name: 'what the lesson check found' })).getByText(/convert it to a project fact/i)).toBeTruthy();
+  fireEvent.click(screen.getByRole('button', { name: 'Convert to fact' }));
+  const ask = await screen.findByRole('dialog', { name: /convert this lesson to a project fact/i });
+  expect(ask.textContent).toContain('Server search rule');
+  expect((within(ask).getByLabelText('fact kind') as HTMLSelectElement).value).toBe('convention');
+  expect((within(ask).getByLabelText('fact relevance') as HTMLSelectElement).value).toBe('0.8');
+  fireEvent.change(within(ask).getByLabelText('fact kind'), { target: { value: 'gotcha' } });
+  fireEvent.change(within(ask).getByLabelText('fact relevance'), { target: { value: '0.55' } });
+  fireEvent.click(within(ask).getByRole('button', { name: 'Convert' }));
+  await waitFor(() => expect(posts).toEqual([{ url: '/api/lessons/l1/to-fact', body: { kind: 'gotcha', relevance: 0.55 } }]));
+  expect(await screen.findByText('Auth checks', { selector: 'h2' })).toBeTruthy();
+  expect(screen.queryByRole('dialog')).toBeNull();
+});
+
+test('Cancel in the convert dialog changes nothing, and a refusal is shown in the dialog', async () => {
+  const posts: string[] = [];
+  vi.stubGlobal('fetch', vi.fn(async (url: string, init?: RequestInit) => {
+    if (init?.method === 'POST') { posts.push(url); return Response.json({ error: 'this lesson has no project, so there is no project to file the fact under' }, { status: 409 }); }
+    if (url.startsWith('/api/lessons?')) return Response.json([lesson('l1', 'Server search')]);
+    if (url === '/api/lessons/l1') return Response.json(detail('l1', 'Server search'));
+    return Response.json([]);
+  }));
+  render(<Lessons />);
+  await screen.findByText('filtered on the client');
+  fireEvent.click(screen.getByRole('button', { name: 'Convert to fact' }));
+  fireEvent.click(within(await screen.findByRole('dialog')).getByRole('button', { name: 'Cancel' }));
+  await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
+  expect(posts).toEqual([]);
+  fireEvent.click(screen.getByRole('button', { name: 'Convert to fact' }));
+  fireEvent.click(within(await screen.findByRole('dialog')).getByRole('button', { name: 'Convert' }));
+  expect(await within(screen.getByRole('dialog')).findByText(/no project to file the fact under/)).toBeTruthy();
+  expect(screen.getByText('Server search', { selector: 'h2' })).toBeTruthy();
+});
+
+test('a rejected lesson shows the note on its decision (converted to a fact)', async () => {
+  const converted = { ...lesson('l1', 'Server search'), status: 'rejected', decidedBy: 'you', decisionNote: 'converted to a fact' };
+  vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+    if (url.startsWith('/api/lessons?')) return Response.json([converted]);
+    if (url === '/api/lessons/l1') return Response.json({ ...detail('l1', 'Server search'), lesson: converted });
+    return Response.json([]);
+  }));
+  render(<Lessons />);
+  fireEvent.click(await screen.findByRole('button', { name: 'rejected' }));
+  await screen.findByText('filtered on the client');
+  expect(screen.getAllByText('converted to a fact').length).toBeGreaterThan(0);
+});
+
+test('a lesson with no paths says it applies across the project; one never checked shows no check section', async () => {
+  render(<Lessons />);
+  await screen.findByText('filtered on the client');
+  expect(screen.getByText(/no paths: applies anywhere in its project/i)).toBeTruthy();
+  expect(screen.queryByRole('region', { name: 'what the lesson check found' })).toBeNull();
+});
+
+test('the list names where each lesson came from in words, with the detail in a tooltip', async () => {
+  vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+    if (url.startsWith('/api/lessons?')) return Response.json([lesson('l1', 'Server search'), { ...lesson('l2', 'Imported'), source: 'memory' }, { ...lesson('l3', 'Mine'), source: 'manual' }]);
+    if (url.startsWith('/api/lessons/')) return Response.json(detail('l1', 'Server search'));
+    return Response.json([]);
+  }));
+  render(<Lessons />);
+  const from = async (label: string) => (await screen.findByText(label, { selector: '[title]' })).getAttribute('title');
+  expect(await from('post-mortem')).toBe('from a post-mortem');
+  expect(await from('memory file')).toBe('imported from a Claude Code memory file');
+  expect(await from('by you')).toBe('written by you');
+  expect(screen.queryByText(/· postmortem/)).toBeNull();
+});
+
+test('edits to an approved lesson are saved with Save, without changing its status', async () => {
+  render(<Lessons />);
+  fireEvent.click(await screen.findByRole('button', { name: 'approved' }));
+  const rule = (await screen.findByLabelText('rule')) as HTMLTextAreaElement;
+  await waitFor(() => expect(rule.value).toBe('Server search rule'));
+  const save = screen.getByRole('button', { name: 'Save' }) as HTMLButtonElement;
+  expect(save.disabled).toBe(true);
+  fireEvent.change(rule, { target: { value: 'Always filter on the server' } });
+  expect(save.disabled).toBe(false);
+  fireEvent.click(save);
+  await waitFor(() => expect(patches).toEqual([{ url: '/api/lessons/l1', body: { rule: 'Always filter on the server' } }]));
+  // Still listed and still open: saved edits are no longer unsaved.
+  await waitFor(() => expect((screen.getByRole('button', { name: 'Save' }) as HTMLButtonElement).disabled).toBe(true));
+  expect(screen.getByText('Server search', { selector: 'h2' })).toBeTruthy();
+});

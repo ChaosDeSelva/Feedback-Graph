@@ -176,6 +176,21 @@ export class PgGraphStore implements GraphStore {
     await this.q('UPDATE projects SET remote = $2 WHERE key = $1', [key, remote]);
   }
 
+  /** Records with no remote or no folder path (scans, code maps and uploads make them with neither). */
+  async projectsMissingFolder(): Promise<Project[]> {
+    const { rows } = await this.q(`SELECT * FROM projects WHERE remote IS NULL OR coalesce(repo_path, '') = '' ORDER BY key`);
+    return rows.map(projectOf);
+  }
+
+  /** Fill a record's folder path and remote where missing; one already set is never overwritten. */
+  async fillProjectFolder(key: string, folder: { repoPath: string; remote: string | null }): Promise<void> {
+    await this.q(
+      `UPDATE projects SET repo_path = CASE WHEN coalesce(repo_path, '') = '' THEN $2 ELSE repo_path END, remote = coalesce(remote, $3)
+       WHERE key = $1`,
+      [key, folder.repoPath, folder.remote],
+    );
+  }
+
   /**
    * Turns still to classify, newest first so fresh feedback is not stuck behind the history backfill.
    * projectKeys undefined: every project; an empty list: none (nothing is selected).
@@ -238,9 +253,9 @@ export class PgGraphStore implements GraphStore {
       `SELECT ${CANDIDATE_COLUMNS}
        FROM candidates k JOIN turns t ON t.uuid = k.turn_uuid
        WHERE ($1::text IS NULL OR k.status = $1) AND ($2::text IS NULL OR k.project_key = $2)
-         AND ($4::text[] IS NULL OR k.project_key = ANY($4))
+         AND ($4::text[] IS NULL OR k.project_key = ANY($4)) AND ($5::text IS NULL OR coalesce(k.source, 'claude') = $5)
        ORDER BY t.ts DESC, k.id LIMIT $3`,
-      [f.status ?? null, f.projectKey ?? null, f.limit ?? 200, f.projectKeys ?? null],
+      [f.status ?? null, f.projectKey ?? null, f.limit ?? 200, f.projectKeys ?? null, f.source ?? null],
     );
     return rows.map(candidateOf);
   }
@@ -281,10 +296,10 @@ export class PgGraphStore implements GraphStore {
     };
   }
 
-  async decide(id: string, status: 'confirmed' | 'rejected', note: string | null): Promise<void> {
+  async decide(id: string, status: 'confirmed' | 'rejected', note: string | null, by = 'you'): Promise<void> {
     const now = new Date();
     await tx(this.db, async (c) => {
-      const { rowCount } = await c.query('UPDATE candidates SET status = $2, note = $3, decided_at = $4 WHERE id = $1', [id, status, note, now]);
+      const { rowCount } = await c.query('UPDATE candidates SET status = $2, note = $3, decided_at = $4, decided_by = $5 WHERE id = $1', [id, status, note, now, by]);
       if (rowCount && status === 'confirmed') {
         // One Feedback per candidate: confirming again reopens one you rejected, and leaves any other status alone.
         await c.query(
@@ -460,7 +475,7 @@ async function mergeIntoReport(x: { query: (sql: string, params?: unknown[]) => 
 }
 
 /** What candidateOf reads: the candidate's columns and the flagged turn's classification and words. */
-const CANDIDATE_COLUMNS = `k.id, k.turn_uuid, k.session_id, k.project_key, k.source, k.status, k.created_at, k.decided_at, k.note,
+const CANDIDATE_COLUMNS = `k.id, k.turn_uuid, k.session_id, k.project_key, k.source, k.status, k.created_at, k.decided_at, k.note, k.decided_by,
   k.manual, k.detected, k.agent_report, t.text AS turn_text, t.preceding_assistant_text AS turn_done,
   t.label, t.confidence, t.summary, t.signals, t.external`;
 
@@ -498,6 +513,7 @@ function candidateOf(r: Row): Candidate {
     createdAt: iso(r.created_at) as string,
     decidedAt: iso(r.decided_at),
     note: r.note ?? null,
+    decidedBy: r.decided_by ?? null,
     ...candidateProvenance({
       manual: !!r.manual,
       detected: !!r.detected,

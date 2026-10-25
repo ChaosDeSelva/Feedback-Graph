@@ -35,6 +35,52 @@ describeStores('FactsStore', (h) => {
     expect(agentic).toMatchObject({ why: 'agents need: agentic', scanJobId: 'scan:10', fileHash: 'hb' });
   });
 
+  test('facts keep their origin and evidence level; older facts without them read as model (or manifest) facts with no evidence', async () => {
+    await f.saveFileFacts('demo', { path: 'src/a.ts', hash: 'h', summary: '' }, [
+      { ...fact('cited and checked'), origin: 'model', evidence: 'line' },
+      { ...fact('`dev` script runs: vite', 'package.json'), why: 'Read directly from package.json; no model involved.' },
+      fact('older fact'),
+    ], 'p');
+    await f.replaceProjectFacts('other', [{ ...fact('a Make target', 'Makefile'), origin: 'manifest', evidence: 'file' }], 'claude-cli', []);
+    const all = [...(await f.listFacts({ projectKey: 'demo' })), ...(await f.listFacts({ projectKey: 'other' }))];
+    const by = Object.fromEntries(all.map((x) => [x.statement, x]));
+    expect(by['cited and checked']).toMatchObject({ origin: 'model', evidence: 'line' });
+    expect(by['`dev` script runs: vite']).toMatchObject({ origin: 'manifest', evidence: null });
+    expect(by['older fact']).toMatchObject({ origin: 'model', evidence: null });
+    expect(by['a Make target']).toMatchObject({ origin: 'manifest', evidence: 'file' });
+    const [hit] = await f.searchFacts({ embedding: vec(1), projectKey: 'other', k: 1 });
+    expect(hit.fact).toMatchObject({ origin: 'manifest', evidence: 'file' });
+  });
+
+  test('listProjects counts current facts by origin, so model facts can headline the count', async () => {
+    await f.replaceProjectFacts('demo', [
+      { ...fact('m1'), origin: 'model' }, fact('older model fact'),
+      { ...fact('s1', 'package.json'), origin: 'manifest' }, { ...fact('s2', 'package.json'), why: 'Read directly from package.json; no model involved.' },
+    ], 'claude-cli', []);
+    const p = (await f.listProjects()).find((x) => x.key === 'demo')!;
+    expect(p.facts).toBe(4);
+    expect(p.factsByOrigin).toEqual({ model: 2, manifest: 2, document: 0, you: 0 });
+  });
+
+  test('addOwnerFact saves your fact (origin you, your relevance); no scan closes or replaces it', async () => {
+    const mine = await f.addOwnerFact('demo', { kind: 'gotcha', statement: 'Orders read from the source table', path: 'src/a.ts', lines: null, confidence: 1, why: 'From the lesson "Read orders"', relevance: 0.8, embedding: vec(2) }, 'operator:codex');
+    expect(mine).toMatchObject({ statement: 'Orders read from the source table', origin: 'you', relevance: 0.8, relevanceBy: 'operator:codex', source: 'operator:codex', docId: null });
+    await f.saveFileFacts('demo', { path: 'src/a.ts', hash: 'h1', summary: '' }, [fact('per-file')], 'ollama:gemma4');
+    await f.saveFileFacts('demo', { path: 'src/a.ts', hash: 'h2', summary: '' }, [fact('per-file again')], 'ollama:gemma4');
+    await f.markFilesRemoved('demo', ['src/a.ts']);
+    await f.replaceProjectFacts('demo', [fact('agentic', 'src/b.ts')], 'claude-cli', [{ path: 'src/b.ts', hash: 'hb' }]);
+    expect((await f.listFacts({ projectKey: 'demo' })).map((x) => x.statement).sort()).toEqual(['Orders read from the source table', 'agentic']);
+    expect((await f.listFacts({ projectKey: 'demo', path: 'src/a.ts' })).map((x) => x.id)).toEqual([mine.id]);
+    // Your facts are not a model's: a scan with another model does not take them as a reason to rescan every file.
+    expect(await f.currentSources('demo')).toEqual(['claude-cli']);
+    const [hit] = await f.searchFacts({ embedding: vec(2), projectKey: 'demo', k: 1 });
+    expect(hit.fact.id).toBe(mine.id);
+    // The background scorer never sees it: it has your relevance already, and a model update leaves it alone.
+    expect((await f.unscoredFacts({ projectKeys: ['demo'], limit: 10 })).map((x) => x.id)).not.toContain(mine.id);
+    expect(await f.setFactRelevance([{ id: mine.id, relevance: 0.1, by: 'model' }])).toBe(0);
+    expect((await f.listProjects()).find((p) => p.key === 'demo')?.factsByOrigin).toEqual({ model: 1, manifest: 0, document: 0, you: 1 });
+  });
+
   test('facts keep the relevance the extractor gave; facts without one are unscored', async () => {
     await f.saveFileFacts('demo', { path: 'src/a.ts', hash: 'h', summary: '' }, [{ ...fact('core rule'), relevance: 0.9 }, fact('no score')], 'p');
     await f.replaceProjectFacts('other', [{ ...fact('setup step', '.'), relevance: 0.1 }], 'claude-cli', []);
@@ -69,6 +115,16 @@ describeStores('FactsStore', (h) => {
     // Scoped to a project: a fact of another project is left alone.
     expect(await f.setFactRelevance([{ id: x.id, relevance: 0.3, by: 'you', projectKey: 'other' }])).toBe(0);
     expect(await f.setFactRelevance([{ id: x.id, relevance: 0.3, by: 'you', projectKey: 'demo' }])).toBe(1);
+  });
+
+  test('an agent with the operator token is recorded by name, and a model score does not overwrite it either', async () => {
+    await f.saveFileFacts('demo', { path: 'src/a.ts', hash: 'h', summary: '' }, [{ ...fact('a'), relevance: 0.9 }], 'p');
+    const [x] = await f.listFacts({ projectKey: 'demo' });
+    expect(await f.setFactRelevance([{ id: x.id, relevance: 0.2, by: 'operator:codex' }])).toBe(1);
+    expect(await f.setFactRelevance([{ id: x.id, relevance: 0.8, by: 'model' }])).toBe(0);
+    expect((await f.listFacts({ projectKey: 'demo' }))[0]).toMatchObject({ relevance: 0.2, relevanceBy: 'operator:codex' });
+    // You can still change what an agent set.
+    expect(await f.setFactRelevance([{ id: x.id, relevance: 0.6, by: 'you' }])).toBe(1);
   });
 
   test('pinning a project shows in listProjects; a folder with no data yet is recorded when pinned; unpin clears it', async () => {
@@ -108,6 +164,34 @@ describeStores('FactsStore', (h) => {
     expect((await f.fileHashes('demo')).get('src/b.ts')).toBe('h1');
   });
 
+  test('replaceScopeFacts swaps only the facts in its scope (one shard of an agentic scan); facts elsewhere stay current', async () => {
+    const at = (path: string) => fact(`old ${path}`, path);
+    await f.replaceProjectFacts('demo', ['packages/core/a.ts', 'packages/core', 'packages/core/plugins/x/b.ts', 'packages/api/c.ts', '.', 'README.md', 'packages/core2/d.ts'].map(at),
+      'claude-cli', [{ path: 'packages/core/a.ts', hash: 'h1' }, { path: 'packages/api/c.ts', hash: 'h1' }]);
+    // The packages/core shard: its own files and its directory, not the nested package nor a look-alike prefix.
+    await f.replaceScopeFacts('demo', { prefixes: ['packages/core'], except: ['packages/core/plugins/x'] }, [fact('core new', 'packages/core/a.ts')],
+      'claude-cli', [{ path: 'packages/core/a.ts', hash: 'h2' }, { path: 'packages/core/new.ts', hash: 'hn' }], 'scan:2');
+    const statements = async () => (await f.listFacts({ projectKey: 'demo' })).map((x) => x.statement).sort();
+    expect(await statements()).toEqual(['core new', 'old .', 'old README.md', 'old packages/api/c.ts', 'old packages/core/plugins/x/b.ts', 'old packages/core2/d.ts']);
+    expect(await f.fileHashes('demo')).toEqual(new Map([['packages/core/a.ts', 'h2'], ['packages/core/new.ts', 'hn'], ['packages/api/c.ts', 'h1']]));
+    expect((await f.listFacts({ projectKey: 'demo', path: 'packages/core/a.ts' }))[0]).toMatchObject({ scanJobId: 'scan:2', fileHash: 'h2', source: 'claude-cli' });
+    // The rest of the repo: everything not under another shard's root, project-wide facts included.
+    await f.replaceScopeFacts('demo', { prefixes: [''], except: ['packages/api', 'packages/core', 'packages/core/plugins/x'] }, [fact('root new', '.')], 'claude-cli', []);
+    expect(await statements()).toEqual(['core new', 'old packages/api/c.ts', 'old packages/core/plugins/x/b.ts', 'root new']);
+    // Another project is never touched.
+    await f.saveFileFacts('other', { path: 'packages/core/a.ts', hash: 'h', summary: '' }, [fact('other project', 'packages/core/a.ts')], 'p');
+    await f.replaceScopeFacts('demo', { prefixes: ['packages/core'], except: [] }, [], 'claude-cli', []);
+    expect((await f.listFacts({ projectKey: 'other' })).map((x) => x.statement)).toEqual(['other project']);
+  });
+
+  test('a scope replace that fails part way leaves the old facts and file hashes as they were', async () => {
+    await f.replaceScopeFacts('demo', { prefixes: ['src'], except: [] }, [fact('old', 'src/b.ts')], 'claude-cli', [{ path: 'src/b.ts', hash: 'h1' }]);
+    const bad = { ...fact('new', 'src/b.ts'), kind: { not: 'a primitive' } } as unknown as ReturnType<typeof fact>;
+    await expect(f.replaceScopeFacts('demo', { prefixes: ['src'], except: [] }, [bad], 'claude-cli', [{ path: 'src/b.ts', hash: 'h2' }])).rejects.toThrow();
+    expect((await f.listFacts({ projectKey: 'demo' })).map((x) => x.statement)).toEqual(['old']);
+    expect((await f.fileHashes('demo')).get('src/b.ts')).toBe('h1');
+  });
+
   test('searchFacts returns current facts for the project, nearest first', async () => {
     await f.saveFileFacts('demo', { path: 'src/a.ts', hash: 'h', summary: '' }, [{ ...fact('near'), embedding: vec(2) }, { ...fact('far'), embedding: vec(9) }], 'p');
     await f.saveFileFacts('other', { path: 'src/a.ts', hash: 'h', summary: '' }, [{ ...fact('other project'), embedding: vec(2) }], 'p');
@@ -136,10 +220,12 @@ describeStores('FactsStore', (h) => {
     expect(await f.nextScanJob(new Date(), [job.id, second.id])).toBeNull();
     await f.updateScanJob(second.id, { status: 'done' });
     await f.updateScanJob(job.id, { status: 'running' });
-    await f.updateScanJob(job.id, { status: 'done', filesScanned: 3, factsAdded: 7 });
+    await f.updateScanJob(job.id, { status: 'done', filesScanned: 3, factsAdded: 7, shards: { total: 20, rescanned: 12, failed: 1 } });
     await f.saveFileFacts('demo', { path: 'src/a.ts', hash: 'h', summary: '' }, [fact('x')], 'p');
     const [p] = await f.listProjects();
-    expect(p).toMatchObject({ key: 'demo', facts: 1, lastScan: { status: 'done', filesScanned: 3, factsAdded: 7, provider: 'ollama:gemma4' } });
+    expect(p).toMatchObject({ key: 'demo', facts: 1, lastScan: { status: 'done', filesScanned: 3, factsAdded: 7, provider: 'ollama:gemma4', shards: { total: 20, rescanned: 12, failed: 1 } } });
+    // A per-file scan has no shards.
+    expect((await f.scanJob(second.id))?.shards).toBeNull();
     expect(p.lastScan?.startedAt).not.toBeNull();
     expect(p.lastScan?.finishedAt).not.toBeNull();
   });

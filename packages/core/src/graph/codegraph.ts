@@ -2,6 +2,7 @@ import neo4j from 'neo4j-driver';
 import {
   cmp,
   codeGraphViews,
+  codeMapDiff,
   normalizeCodeMap,
   type CodeGraphReads,
   type CodeMapMeta,
@@ -22,9 +23,11 @@ import { FactsRepo, PROJECT_PATH } from './facts.ts';
 import { KnowledgeRepo } from './knowledge.ts';
 import type { GraphRepo } from './repo.ts';
 
-/** Rows per UNWIND statement: big repos are written in slices, all inside one transaction. */
+/** Rows per UNWIND statement: big repos are written in slices, each its own transaction (replaceCodeMap). */
 const SLICE = 5000;
-const slices = <T>(xs: T[]): T[][] => (xs.length ? Array.from({ length: Math.ceil(xs.length / SLICE) }, (_, i) => xs.slice(i * SLICE, (i + 1) * SLICE)) : []);
+/** Files per symbol-delete statement: a file can define many symbols, so fewer of them per transaction. */
+const PATH_SLICE = 500;
+const slices = <T>(xs: T[], size = SLICE): T[][] => (xs.length ? Array.from({ length: Math.ceil(xs.length / size) }, (_, i) => xs.slice(i * size, (i + 1) * size)) : []);
 
 /** Enough for any project's approved lessons; path matching happens after the read. */
 const LESSON_LIMIT = 5000;
@@ -61,22 +64,59 @@ export class CodeGraphRepo implements CodeGraphStore {
     this.views = codeGraphViews(reads);
   }
 
+  /**
+   * Written as a diff against the stored map, one statement per transaction (each at most one slice): a 4000-file map
+   * no longer holds 100k created and deleted rows in one transaction (Neo4j's transaction memory limit), and a rebuild
+   * where a few files changed rewrites a few files' symbols and edges. The fingerprint is cleared first and written
+   * last, so a write cut short is never taken for a current map (and the stage reparses it from scratch).
+   */
   async replaceCodeMap(projectKey: string, raw: CodeMapWrite): Promise<CodeMapStats> {
     const map = normalizeCodeMap(raw);
     const key = projectKey;
     const now = new Date().toISOString();
     const files = map.files.map((f) => ({ ...f, churnCommits: map.churn[f.path]?.commits ?? null, churnLastTs: map.churn[f.path]?.lastTs ?? null }));
-    const fileImports = map.imports.filter((i) => !i.to.startsWith('pkg:'));
-    const pkgImports = map.imports.filter((i) => i.to.startsWith('pkg:'));
+    const paths = files.map((f) => f.path);
+    const [storedSymbols, storedImports] = await Promise.all([
+      this.g.run('MATCH (s:Symbol {projectKey: $key}) RETURN s', { key }),
+      this.g.run(
+        `MATCH (a:CodeFile {projectKey: $key})-[r:IMPORTS]->(b)
+         RETURN a.path AS from, coalesce(b.path, b.name) AS to, r.names AS names, r.spec AS spec`,
+        { key },
+      ),
+    ]);
+    const diff = codeMapDiff(
+      {
+        symbols: storedSymbols.map((r) => {
+          const p = r.get('s').properties;
+          return { ...symbolOf(p), ord: p.ord == null ? -1 : neo4j.integer.toNumber(p.ord) };
+        }),
+        imports: storedImports.map((r) => ({ from: r.get('from'), to: r.get('to'), names: r.get('names') ?? [], spec: r.get('spec') ?? '' })),
+      },
+      map,
+    );
+    const fileImports = diff.newImports.filter((i) => !i.to.startsWith('pkg:'));
+    const pkgImports = diff.newImports.filter((i) => i.to.startsWith('pkg:'));
     const statements: [string, Props][] = [
-      [`MATCH (:CodeFile {projectKey: $key})-[r:IMPORTS|TESTS]->() DELETE r`, { key }],
-      [`MATCH (s:Symbol {projectKey: $key}) DETACH DELETE s`, { key }],
-      [`MATCH (m:Module {projectKey: $key}) DETACH DELETE m`, { key }],
+      // The project exists even for a map with no files, as in Postgres (the file slices below MERGE it otherwise).
+      [`MERGE (:Project {key: $key})`, { key }],
+      [`MATCH (m:CodeMap {projectKey: $key}) SET m.fingerprint = null`, { key }],
+      ...slices(diff.staleImports).map((part): [string, Props] => [
+        `UNWIND $pairs AS e
+           MATCH (a:CodeFile {id: $key + ':' + e.from})-[r:IMPORTS]->(b)
+           WHERE coalesce(b.path, b.name) = e.to
+           DELETE r`,
+        { key, pairs: part },
+      ]),
+      [`MATCH (:CodeFile {projectKey: $key})-[r:TESTS]->() DELETE r`, { key }],
+      ...slices(diff.symbolPaths, PATH_SLICE).map((part): [string, Props] => [
+        `MATCH (s:Symbol {projectKey: $key}) WHERE s.path IN $paths DETACH DELETE s`,
+        { key, paths: part },
+      ]),
       [
         `MATCH (cf:CodeFile {projectKey: $key}) WHERE cf.inMap = true AND NOT cf.path IN $paths
          SET cf.inMap = false
          REMOVE cf.lang, cf.codeHash, cf.loc, cf.isTest, cf.churnCommits, cf.churnLastTs, cf.mappedAt`,
-        { key, paths: files.map((f) => f.path) },
+        { key, paths },
       ],
       // A file that left the map and that nothing else refers to (never scanned, no fact about it, no session touched
       // it) goes: its symbols and edges are gone already, only its IN edge is left.
@@ -84,7 +124,7 @@ export class CodeGraphRepo implements CodeGraphStore {
         `MATCH (cf:CodeFile {projectKey: $key}) WHERE cf.inMap = false AND NOT cf.path IN $paths AND cf.hash IS NULL
            AND COUNT { (cf)-[r]-() WHERE type(r) <> 'IN' } = 0
          DETACH DELETE cf`,
-        { key, paths: files.map((f) => f.path) },
+        { key, paths },
       ],
       ...slices(files).map((part): [string, Props] => [
         `MERGE (p:Project {key: $key})
@@ -97,7 +137,7 @@ export class CodeGraphRepo implements CodeGraphStore {
            MERGE (cf)-[:IN]->(p)`,
         { key, files: part, now },
       ]),
-      ...slices(map.symbols).map((part): [string, Props] => [
+      ...slices(diff.symbols).map((part): [string, Props] => [
         `UNWIND $symbols AS s
            MATCH (cf:CodeFile {id: $key + ':' + s.path})
            CREATE (cf)-[:DEFINES]->(:Symbol {projectKey: $key, id: s.id, path: s.path, ord: s.ord, name: s.name, kind: s.kind,
@@ -118,6 +158,8 @@ export class CodeGraphRepo implements CodeGraphStore {
            CREATE (a)-[:IMPORTS {names: i.names, spec: i.spec}]->(m)`,
         { key, imports: part },
       ]),
+      // A package nothing imports any more.
+      [`MATCH (m:Module {projectKey: $key}) WHERE NOT EXISTS { ()-[:IMPORTS]->(m) } DETACH DELETE m`, { key }],
       ...slices(map.tests).map((part): [string, Props] => [
         `UNWIND $tests AS t
            MATCH (a:CodeFile {id: $key + ':' + t.test})
@@ -128,12 +170,41 @@ export class CodeGraphRepo implements CodeGraphStore {
       [
         `MERGE (m:CodeMap {projectKey: $key})
          SET m.fingerprint = $fingerprint, m.builtAt = $now, m.files = $stats.files, m.symbols = $stats.symbols,
-             m.imports = $stats.imports, m.tests = $stats.tests, m.candidates = $candidates`,
-        { key, fingerprint: map.fingerprint, now, stats: map.stats, candidates: map.candidates },
+             m.imports = $stats.imports, m.tests = $stats.tests, m.candidates = $candidates, m.unresolved = $unresolved`,
+        { key, fingerprint: map.fingerprint, now, stats: map.stats, candidates: map.candidates, unresolved: map.unresolved ?? null },
       ],
     ];
-    await this.g.runInTransaction(statements);
+    for (const [cypher, params] of statements) await this.g.run(cypher, params);
     return map.stats;
+  }
+
+  async purgeOrphanCodeFiles(limit: number): Promise<number> {
+    const [r] = await this.g.run(
+      `MATCH (cf:CodeFile) WHERE coalesce(cf.inMap, false) = false
+         AND (cf.removed = true OR NOT EXISTS { (cf)-[:IN]->(:Project) })
+         AND NOT EXISTS { (cf)-[r]-() WHERE type(r) <> 'IN' }
+       WITH cf LIMIT $limit
+       DETACH DELETE cf
+       RETURN count(*) AS n`,
+      { limit: neo4j.int(Math.max(0, Math.floor(limit))) },
+    );
+    return r ? neo4j.integer.toNumber(r.get('n')) : 0;
+  }
+
+  async requestCodeMapRebuild(projectKey: string): Promise<boolean> {
+    const rows = await this.g.run('MATCH (m:CodeMap {projectKey: $key}) SET m.rebuildRequestedAt = $now RETURN m.projectKey AS key', {
+      key: projectKey,
+      now: new Date().toISOString(),
+    });
+    return rows.length > 0;
+  }
+
+  async codeMapRebuildsRequested(): Promise<{ projectKey: string; requestedAt: string }[]> {
+    const rows = await this.g.run(
+      `MATCH (m:CodeMap) WHERE m.rebuildRequestedAt IS NOT NULL AND (m.builtAt IS NULL OR m.rebuildRequestedAt > m.builtAt)
+       RETURN m.projectKey AS projectKey, m.rebuildRequestedAt AS requestedAt ORDER BY requestedAt, projectKey`,
+    );
+    return rows.map((r) => ({ projectKey: r.get('projectKey') as string, requestedAt: r.get('requestedAt') as string }));
   }
 
   async codeMapMeta(projectKey: string): Promise<CodeMapMeta | null> {
@@ -145,6 +216,7 @@ export class CodeGraphRepo implements CodeGraphStore {
       builtAt: m.builtAt,
       stats: { files: m.files ?? 0, symbols: m.symbols ?? 0, imports: m.imports ?? 0, tests: m.tests ?? 0 },
       candidates: m.candidates ?? null,
+      unresolved: m.unresolved ?? null,
     };
   }
 

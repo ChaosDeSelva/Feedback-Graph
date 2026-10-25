@@ -1,4 +1,4 @@
-import { feedbackSkipRule, hostRepoPath, modelTimeoutReason, providerUnavailableReason, redactSecrets, sessionFiles, type ActivityStore, type ProjectScope, type Classification, type CodeGraphStore, type GraphStore, type HumanTurn, type ParsedSession, type SessionSource } from '@fb/core';
+import { feedbackSkipRule, hostRepoPath, isSelfReview, modelTimeoutReason, providerUnavailableReason, redactSecrets, sessionFiles, type ActivityStore, type ProjectScope, type Classification, type CodeGraphStore, type GraphStore, type HumanTurn, type ParsedSession, type SessionSource } from '@fb/core';
 import { prefilterPushback } from './detect/prefilter.ts';
 import { codexSessionParser } from './ingest/codex.ts';
 import { conversationFingerprint } from './ingest/fingerprint.ts';
@@ -52,7 +52,9 @@ export type CycleDeps = {
   activity?: Pick<ActivityStore, 'record'>;
   /** A folder's canonical git remote (projectRemote). Without it and `projects`, projects are folders only. */
   remote?: (repoPath: string) => Promise<string | null>;
-  projects?: Pick<GraphStore, 'canonicalProject' | 'projectsMissingRemote' | 'setProjectRemote'>;
+  projects?: Pick<GraphStore, 'canonicalProject' | 'projectsMissingFolder' | 'fillProjectFolder'>;
+  /** The selected folders (container paths): records made by scans, code maps or uploads get their path from here. */
+  folders?: () => Promise<{ key: string; repoPath: string }[]>;
   /** Where the repo files each session read and edited are recorded (links misses to code). */
   codegraph?: Pick<CodeGraphStore, 'recordSessionFiles'>;
   now?: () => number;
@@ -67,14 +69,27 @@ const CANDIDATE_LABELS = new Set(['pushback', 'correction']);
 const NEUTRAL: Classification = { label: 'neutral', confidence: 0, summary: '', signals: [] };
 /** Failures in a row before the cycle stops calling the model: a hung or broken model would otherwise cost batch × timeout. */
 const MAX_CONSECUTIVE_FAILURES = 3;
+/** A comments_skipped entry keeps this many skipped comments as samples (clipped), and this many as targets. */
+const MAX_SKIP_SAMPLES = 5;
+const SKIP_SAMPLE_CHARS = 200;
+const MAX_SKIP_TARGETS = 50;
 
-/** Projects recorded before remotes were (or whose folder had none then) get one in place: nothing is re-ingested. */
+/**
+ * Projects recorded before remotes were (or whose folder had none then), and records a scan, a code map or an upload
+ * made with no folder at all, get their path and remote in place from the selected folder: nothing is re-ingested.
+ * Cloud sync and link detection read the remote from these records.
+ */
 async function backfillRemotes(deps: CycleDeps, log: (msg: string, extra?: object) => void) {
   if (!deps.remote || !deps.projects) return;
   try {
-    for (const p of await deps.projects.projectsMissingRemote()) {
-      const remote = await deps.remote(p.repoPath);
-      if (remote) await deps.projects.setProjectRemote(p.key, remote);
+    const missing = await deps.projects.projectsMissingFolder();
+    if (!missing.length) return;
+    const folders = new Map((deps.folders ? await deps.folders() : []).map((f) => [f.key, f.repoPath]));
+    for (const p of missing) {
+      const repoPath = p.repoPath || folders.get(p.key);
+      if (!repoPath) continue;
+      const remote = p.remote ?? (await deps.remote(repoPath));
+      if (repoPath !== p.repoPath || (remote && remote !== p.remote)) await deps.projects.fillProjectFolder(p.key, { repoPath, remote });
     }
   } catch (err) {
     log('remote backfill failed', { error: String(err) });
@@ -208,12 +223,17 @@ export async function runCycle(deps: CycleDeps): Promise<CycleResult> {
   let modelCalls = 0;
   let failuresInRow = 0;
   let unavailable: string | null = null;
+  // Comments the skip rules kept from the model this cycle, per project: one activity entry each (comments_skipped).
+  const skippedBy = new Map<string, { turn: string; rule: string; text: string }[]>();
   for (const turn of await deps.repo.unclassifiedTurns(deps.classifyBatch * 20, deps.onlyProjects, deps.excludeProjects)) {
     let c: Classification | null = NEUTRAL;
     const pre = prefilterPushback(turn.text);
     // A bot, the PR author's reply, a status note or a bare review trigger: never feedback, so never sent (feedbackRules.ts).
     const skip = turn.external ? feedbackSkipRule(turn.text, turn.external) : null;
-    if (skip) c = { label: 'neutral', confidence: 1, summary: `skipped before the model: ${skip.description}`, signals: [`skip:${skip.name}`] };
+    if (skip) {
+      c = { label: 'neutral', confidence: 1, summary: `skipped before the model: ${skip.description}`, signals: [`skip:${skip.name}`] };
+      skippedBy.set(turn.projectKey, [...(skippedBy.get(turn.projectKey) ?? []), { turn: turn.uuid, rule: skip.name, text: turn.text }]);
+    }
     // A review or issue comment is feedback on finished work by nature, and reviewers word it politely: always ask the model.
     else if (pre.hit || turn.external) {
       if (unavailable || modelCalls >= deps.classifyBatch || failuresInRow >= MAX_CONSECUTIVE_FAILURES) continue;
@@ -242,6 +262,8 @@ export async function runCycle(deps: CycleDeps): Promise<CycleResult> {
       if (failuresInRow === MAX_CONSECUTIVE_FAILURES) log('classifier failing, pausing until next cycle', { turn: turn.uuid });
       continue;
     }
+    // An agent reviewing its own PR under the author's account: kept, but labelled so the Inbox does not read it as a reviewer's pushback.
+    if (turn.external && !skip && isSelfReview(turn.external) && !c.signals.includes('self-review')) c = { ...c, signals: [...c.signals, 'self-review'] };
     const isCandidate = CANDIDATE_LABELS.has(c.label);
     // The Inbox item the turn is filed under: its own id, or an agent report's it was merged into (dedupe.ts).
     const itemId = await deps.repo.saveClassification(turn.uuid, c, isCandidate);
@@ -258,6 +280,19 @@ export async function runCycle(deps: CycleDeps): Promise<CycleResult> {
         targets: [itemId ?? turn.uuid],
       });
     }
+  }
+
+  for (const [projectKey, skipped] of skippedBy) {
+    const rules: Record<string, number> = {};
+    for (const s of skipped) rules[s.rule] = (rules[s.rule] ?? 0) + 1;
+    await deps.activity?.record({
+      kind: 'comments_skipped', actor: 'skip-rules', projectKey,
+      subject: `${skipped.length} comment${skipped.length === 1 ? '' : 's'} skipped before the classifier`,
+      why: Object.entries(rules).map(([r, n]) => `${r}: ${n}`).join(', '),
+      // A few of them to look at (the rest are in targets), clipped: enough to tell whether a rule skips real feedback.
+      details: { rules, samples: skipped.slice(0, MAX_SKIP_SAMPLES).map((s) => ({ rule: s.rule, turn: s.turn, text: s.text.slice(0, SKIP_SAMPLE_CHARS) })) },
+      targets: skipped.slice(0, MAX_SKIP_TARGETS).map((s) => s.turn),
+    });
   }
 
   return unavailable ? { filesIngested, turnsClassified, candidates, classifierUnavailable: unavailable } : { filesIngested, turnsClassified, candidates };

@@ -20,13 +20,15 @@ x-env: &env
   OLLAMA_EMBED_MODEL: ${OLLAMA_EMBED_MODEL:-nomic-embed-text}
   OLLAMA_NUM_PREDICT: ${OLLAMA_NUM_PREDICT:-}
   OLLAMA_REPEAT_PENALTY: ${OLLAMA_REPEAT_PENALTY:-}
+  OLLAMA_NUM_CTX: ${OLLAMA_NUM_CTX:-}
   OLLAMA_TIMEOUT_SECONDS: ${OLLAMA_TIMEOUT_SECONDS:-}
   # Which projects are read is chosen in the UI (Settings). INGEST_PROJECTS only seeds that choice on the first
   # start; EXCLUDE_PROJECTS is never read, scanned or served, whatever is chosen.
   INGEST_PROJECTS: ${INGEST_PROJECTS:-}
   EXCLUDE_PROJECTS: ${EXCLUDE_PROJECTS:-}
   # Feedback Graph Cloud sync, off unless both are set: push your lessons to a team org (see README).
-  # CLOUD_URL is https (plain http only to localhost); CLOUD_TOKEN is a token with the sync scope. Never logged.
+  # CLOUD_URL is https; plain http only to a cloud on this machine (localhost, 127.0.0.1, [::1], or
+  # host.docker.internal: the host as the containers see it). CLOUD_TOKEN is a token with the sync scope. Never logged.
   CLOUD_URL: ${CLOUD_URL:-}
   CLOUD_TOKEN: ${CLOUD_TOKEN:-}
   # Minutes between automatic syncs (at least 5); empty syncs only when you press Sync now in Settings.
@@ -67,6 +69,11 @@ services:
     user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
     init: true # reaps the CLI agents' child processes and forwards SIGTERM for a clean shutdown
     stop_grace_period: 30s
+    # It runs as an ordinary user and spawns git and the CLI agents as that same user: no capability is needed, and no
+    # process in it may gain one (a setuid binary included). Codex's own Linux sandbox sets no_new_privs itself.
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
     environment:
       <<: *env
       TRANSCRIPTS_DIR: /transcripts
@@ -81,6 +88,8 @@ services:
       ALLOW_UNCONFINED_CODEX: ${ALLOW_UNCONFINED_CODEX:-}
       SCAN_LLM: ${SCAN_LLM:-}
       DOCS_LLM: ${DOCS_LLM:-}
+      # Ask: the default model of chats that pick none (empty: claude-cli, else codex-cli, else the local model).
+      CHAT_LLM: ${CHAT_LLM:-}
       CODEX_HOME: /codex
       CLAUDE_CODE_OAUTH_TOKEN: ${CLAUDE_CODE_OAUTH_TOKEN:-}
       CLAUDE_MODEL: ${CLAUDE_MODEL:-}
@@ -104,7 +113,8 @@ services:
       MEMORY_AUTO_APPROVE: ${MEMORY_AUTO_APPROVE:-false}
       STATE_DB: /state/worker.sqlite
       POLL_SECONDS: ${POLL_SECONDS:-30}
-      # Empty = the defaults (50 turns per cycle; 400 files, 80000 bytes per file for the code map and scans).
+      # Empty = the defaults: 50 turns per cycle; files per project scale with its size (40% of the candidates, at least
+      # 400, at most 4000; a number here fixes the cap for the code map and each scan run); 80000 bytes per file.
       CLASSIFY_BATCH: ${CLASSIFY_BATCH:-}
       SCAN_MAX_FILES: ${SCAN_MAX_FILES:-}
       SCAN_CONCURRENCY: ${SCAN_CONCURRENCY:-}
@@ -176,6 +186,10 @@ services:
     build: { context: ., target: api }
     user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
     init: true
+    # An ordinary user listening on an unprivileged port: no capability is needed, and none can be gained.
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
     environment:
       <<: *env
       CHECK_LLM: ${CHECK_LLM:-}

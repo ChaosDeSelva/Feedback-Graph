@@ -10,7 +10,7 @@ import type {
   WorkerStatus,
 } from '../types.ts';
 import type { ExternalThread, GraphStore, WorkSession } from '../store.ts';
-import { EXTERNAL_SOURCES, type ExternalRef, type SessionSource } from '../types.ts';
+import { EXTERNAL_SOURCES, type ExternalRef, type FeedbackSource, type SessionSource } from '../types.ts';
 import { redactDeep } from '../redact.ts';
 import { candidateProvenance, matchReport, REPORT_MERGE_MINUTES } from '../dedupe.ts';
 import { MAX_POSTMORTEM_ATTEMPTS } from './knowledge.ts';
@@ -35,7 +35,8 @@ export type CandidateDetail = {
 export type StatsRow = { projectKey: string; week: string; humanTurns: number; pushback: number };
 
 /** projectKeys: only these projects (an empty list finds nothing); the limit counts what is left. */
-export type CandidateFilter = { status?: CandidateStatus; projectKey?: string; projectKeys?: string[]; limit?: number };
+/** source: where the flagged comment came from (a candidate saved before sources were recorded is claude). */
+export type CandidateFilter = { status?: CandidateStatus; projectKey?: string; projectKeys?: string[]; source?: FeedbackSource; limit?: number };
 
 const CANDIDATE_LABELS = ['pushback', 'correction'];
 export const MAX_CLASSIFY_ATTEMPTS = 3;
@@ -177,6 +178,21 @@ export class GraphRepo implements GraphStore {
     await this.run('MATCH (p:Project {key: $key}) SET p.remote = $remote', { key, remote });
   }
 
+  /** Records with no remote or no folder path (scans, code maps and uploads make them with neither). */
+  async projectsMissingFolder(): Promise<Project[]> {
+    const rows = await this.run(`MATCH (p:Project) WHERE p.remote IS NULL OR coalesce(p.repoPath, '') = '' RETURN p ORDER BY p.key`);
+    return rows.map((r) => projectOf(r.get('p').properties));
+  }
+
+  /** Fill a record's folder path and remote where missing; one already set is never overwritten. */
+  async fillProjectFolder(key: string, folder: { repoPath: string; remote: string | null }) {
+    await this.run(
+      `MATCH (p:Project {key: $key})
+       SET p.repoPath = CASE WHEN coalesce(p.repoPath, '') = '' THEN $repoPath ELSE p.repoPath END, p.remote = coalesce(p.remote, $remote)`,
+      { key, repoPath: folder.repoPath, remote: folder.remote },
+    );
+  }
+
   /**
    * Turns still to classify, newest first so fresh feedback is not stuck behind the history backfill.
    * projectKeys undefined: every project; an empty list: none (nothing is selected).
@@ -293,9 +309,9 @@ export class GraphRepo implements GraphStore {
     const rows = await this.run(
       `MATCH (k:Candidate)-[:FLAGS]->(t:Turn)
        WHERE ($status IS NULL OR k.status = $status) AND ($projectKey IS NULL OR k.projectKey = $projectKey)
-         AND ($projectKeys IS NULL OR k.projectKey IN $projectKeys)
+         AND ($projectKeys IS NULL OR k.projectKey IN $projectKeys) AND ($source IS NULL OR coalesce(k.source, 'claude') = $source)
        RETURN k, t ORDER BY t.ts DESC LIMIT $limit`,
-      { status: f.status ?? null, projectKey: f.projectKey ?? null, projectKeys: f.projectKeys ?? null, limit: neo4j.int(f.limit ?? 200) },
+      { status: f.status ?? null, projectKey: f.projectKey ?? null, projectKeys: f.projectKeys ?? null, source: f.source ?? null, limit: neo4j.int(f.limit ?? 200) },
     );
     return rows.map((r) => toCandidate(r.get('k').properties, r.get('t').properties));
   }
@@ -330,16 +346,16 @@ export class GraphRepo implements GraphStore {
     };
   }
 
-  async decide(id: string, status: 'confirmed' | 'rejected', note: string | null) {
+  async decide(id: string, status: 'confirmed' | 'rejected', note: string | null, by = 'you') {
     await this.run(
       `MATCH (k:Candidate {id: $id})-[:FLAGS]->(t:Turn)
-       SET k.status = $status, k.note = $note, k.decidedAt = $now
+       SET k.status = $status, k.note = $note, k.decidedAt = $now, k.decidedBy = $by
        WITH k, t WHERE $status = 'confirmed'
        MERGE (f:Feedback {id: k.id})
          ON CREATE SET f.status = 'open', f.createdAt = $now, f.projectKey = k.projectKey, f.text = t.text
        SET f.status = CASE f.status WHEN 'rejected' THEN 'open' ELSE f.status END
        MERGE (f)-[:FROM_TURN]->(t)`,
-      { id, status, note, now: new Date().toISOString() },
+      { id, status, note, by, now: new Date().toISOString() },
     );
     if (status === 'rejected') {
       // Changing your mind after confirming: stop the post-mortem and withdraw lessons you have not approved yet.
@@ -520,6 +536,7 @@ function toCandidate(k: Record<string, unknown>, t: Record<string, unknown>): Ca
     createdAt: k.createdAt as string,
     decidedAt: (k.decidedAt as string) ?? null,
     note: (k.note as string) ?? null,
+    decidedBy: (k.decidedBy as string) ?? null,
     ...provenance,
   };
 }

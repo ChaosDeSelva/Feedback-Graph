@@ -14,6 +14,8 @@ import { iso, tx, type Db } from './db.ts';
  * Commits and sessions are matched through this project's sessions, as Neo4j matches them through (:Session)-[:IN].
  */
 const DELETES: string[] = [
+  `DELETE FROM chat_turns WHERE project_key = $1`,
+  `DELETE FROM chat_conversations WHERE project_key = $1`,
   `DELETE FROM lessons WHERE project_key = $1 OR origin_project_key = $1`,
   `DELETE FROM activity WHERE project_key = $1`,
   `DELETE FROM predone_checks WHERE project_key = $1`,

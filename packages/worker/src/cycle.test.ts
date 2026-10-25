@@ -275,8 +275,12 @@ function projectTable(rows: Project[]) {
       other.aliases.push(folder.key);
       return { project: other, aliasedNow: true };
     },
-    projectsMissingRemote: async () => [...projects.values()].filter((p) => !p.remote),
-    setProjectRemote: async (key, remote) => { projects.get(key)!.remote = remote; },
+    projectsMissingFolder: async () => [...projects.values()].filter((p) => !p.remote || !p.repoPath),
+    fillProjectFolder: async (key, f) => {
+      const p = projects.get(key)!;
+      if (!p.repoPath) p.repoPath = f.repoPath;
+      if (!p.remote && f.remote) p.remote = f.remote;
+    },
   };
   return { projects, repo };
 }
@@ -367,6 +371,27 @@ describe('projects identified by git remote', () => {
     expect(table.projects.get('old')!.remote).toBe('local/old');
     expect(table.projects.get('local-only')!.remote).toBeUndefined();
     expect(f.reads).toEqual([]);
+  });
+
+  test('records made by a scan or a code map (no folder path) get the selected folder\'s path and remote', async () => {
+    const table = projectTable([
+      { key: 'mapped', name: 'mapped', repoPath: '' },
+      { key: 'kept', name: 'kept', repoPath: '/vibe/kept', remote: 'github.com/org/kept' },
+      { key: 'gone', name: 'gone', repoPath: '' },
+    ]);
+    const asked: string[] = [];
+    const f = fakes({
+      listFiles: async () => [],
+      remote: async (p) => { asked.push(p); return p === '/vibe/mapped' ? 'github.com/org/mapped' : null; },
+      projects: table.repo,
+      folders: async () => [{ key: 'mapped', repoPath: '/vibe/mapped' }, { key: 'kept', repoPath: '/vibe/elsewhere' }],
+    });
+    await runCycle(f.deps);
+    expect(table.projects.get('mapped')).toMatchObject({ repoPath: '/vibe/mapped', remote: 'github.com/org/mapped' });
+    // A complete record is never rewritten, and a record with no folder anywhere is left alone.
+    expect(table.projects.get('kept')).toMatchObject({ repoPath: '/vibe/kept', remote: 'github.com/org/kept' });
+    expect(table.projects.get('gone')).toMatchObject({ repoPath: '' });
+    expect(asked).toEqual(['/vibe/mapped']);
   });
 });
 

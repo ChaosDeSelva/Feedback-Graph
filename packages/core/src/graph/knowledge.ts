@@ -7,6 +7,7 @@ import type {
   FeedbackStatus,
   HumanTurn,
   Lesson,
+  LessonCheck,
   LessonScope,
   LessonStatus,
   Outcome,
@@ -105,7 +106,7 @@ export class KnowledgeRepo implements KnowledgeStore {
        WITH f, t, s, p, k ORDER BY f.createdAt LIMIT $limit
        MATCH (s)-[:HAS_TURN]->(st:Turn)
        WITH f, t, s, p, k, st ORDER BY st.index
-       RETURN f.id AS id, t, s, p, k.note AS note, collect(st) AS turns`,
+       RETURN f.id AS id, t, s, p, k.note AS note, k.decidedBy AS noteBy, collect(st) AS turns`,
       { max: MAX_POSTMORTEM_ATTEMPTS, limit: neo4j.int(limit), now: now.toISOString() },
     );
     return rows.map((r) => ({
@@ -118,6 +119,7 @@ export class KnowledgeRepo implements KnowledgeStore {
       feedback: turnOf(r.get('t').properties),
       turns: (r.get('turns') as { properties: Record<string, unknown> }[]).map((n) => turnOf(n.properties)),
       note: r.get('note') ?? null,
+      noteBy: r.get('noteBy') ?? null,
     }));
   }
 
@@ -163,7 +165,7 @@ export class KnowledgeRepo implements KnowledgeStore {
        SET l.title = $pm.lesson.title, l.rule = $pm.lesson.rule, l.appliesWhen = $pm.lesson.appliesWhen,
            l.scope = $pm.lesson.scope, l.paths = $pm.lesson.paths, l.cause = $pm.cause, l.missId = m.id,
            l.projectKey = CASE WHEN $pm.lesson.scope = 'global' THEN null ELSE p.key END, l.originProjectKey = p.key,
-           l.embedding = $lessonEmbedding
+           l.embedding = $lessonEmbedding, l.checks = $checks
        MERGE (l)-[:DERIVED_FROM]->(m)
        WITH f, t, s, p, m, l
        CALL (l, p) {
@@ -183,7 +185,9 @@ export class KnowledgeRepo implements KnowledgeStore {
          FOREACH (_ IN CASE WHEN it.wasAvailable THEN [1] ELSE [] END | MERGE (ci)-[:WAS_AVAILABLE_IN]->(s))`,
       {
         fid: feedbackId,
-        pm: { ...pm, contextItems: undefined },
+        pm: { ...pm, contextItems: undefined, lessonChecks: undefined },
+        // A node property cannot hold a list of maps: the checks are kept as JSON (lessonOf parses them).
+        checks: pm.lessonChecks ? JSON.stringify(pm.lessonChecks) : null,
         status: OUTCOME_STATUS[pm.outcome],
         now,
         missEmbedding: embeddings.miss,
@@ -246,7 +250,7 @@ export class KnowledgeRepo implements KnowledgeStore {
   }
 
   /** `unscoped`: you narrowed it but its project is unknown, so it went back to proposed instead of serving everywhere. */
-  async updateLesson(id: string, patch: LessonPatch, o: { reembed?: number[]; by?: string }): Promise<{ unscoped: boolean }> {
+  async updateLesson(id: string, patch: LessonPatch, o: { reembed?: number[]; by?: string; note?: string }): Promise<{ unscoped: boolean }> {
     const now = new Date().toISOString();
     const { supersedes, status, ...fields } = patch;
     if (supersedes !== undefined) {
@@ -257,7 +261,7 @@ export class KnowledgeRepo implements KnowledgeStore {
     const rows = await this.g.run(
       `MATCH (l:Lesson {id: $id})
        SET l += $fields, l.decidedByYou = true
-       FOREACH (_ IN CASE WHEN $status IS NULL THEN [] ELSE [1] END | SET l.status = $status, l.decidedAt = $now, l.decidedBy = $by)
+       FOREACH (_ IN CASE WHEN $status IS NULL THEN [] ELSE [1] END | SET l.status = $status, l.decidedAt = $now, l.decidedBy = $by, l.decisionNote = $note)
        FOREACH (_ IN CASE WHEN $embedding IS NULL THEN [] ELSE [1] END | SET l.embedding = $embedding)
        WITH l
        // Scope decides who sees it: global has no project; project/task go back to the project it came from.
@@ -277,9 +281,14 @@ export class KnowledgeRepo implements KnowledgeStore {
          MERGE (l)-[:SUPERSEDES]->(old)
          SET old.status = 'superseded', old.decidedAt = $now, old.validTo = $now)
        RETURN unscoped`,
-      { id, fields, status: status ?? null, now, by: o.by ?? 'you', embedding: o.reembed ?? null, supersedes: supersedes ?? null },
+      { id, fields, status: status ?? null, now, by: o.by ?? 'you', note: o.note ? redactSecrets(o.note) : null, embedding: o.reembed ?? null, supersedes: supersedes ?? null },
     );
     return { unscoped: rows[0]?.get('unscoped') ?? false };
+  }
+
+  async setLessonChecks(id: string, checks: LessonCheck[]): Promise<boolean> {
+    const [r] = await this.g.run('MATCH (l:Lesson {id: $id}) SET l.checks = $checks RETURN count(l) AS n', { id, checks: JSON.stringify(redactDeep(checks)) });
+    return Number(r?.get('n') ?? 0) > 0;
   }
 
   async searchLessons(q: { embedding: number[]; projectKey: string | null; k: number; status?: LessonStatus; projectKeys?: string[] }): Promise<LessonHit[]> {
@@ -412,5 +421,7 @@ function lessonOf(p: Record<string, unknown>): Lesson {
     createdAt: p.createdAt as string,
     decidedAt: (p.decidedAt as string) ?? null,
     decidedBy: (p.decidedBy as string) ?? null,
+    decisionNote: (p.decisionNote as string) ?? null,
+    checks: typeof p.checks === 'string' ? (JSON.parse(p.checks) as LessonCheck[]) : null,
   };
 }

@@ -2,9 +2,9 @@ import { execFileSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { ModelTimeoutError, ProviderUnavailableError, STRICT_JSON, type ActivityInput, type LlmProvider, type ScanJob } from '@fb/core';
+import { ModelTimeoutError, ProviderUnavailableError, STRICT_JSON, type ActivityInput, type CodeFact, type FactScope, type LlmProvider, type ScanJob } from '@fb/core';
 import { expect, test } from 'vitest';
-import { deterministicFacts, extractFileFacts, hasCodeFiles, listCodeFiles, listCodeFilesWithTotal, runScan, SCAN_PROMPT_VERSION, type ScanDeps } from './scan.ts';
+import { checkCitations, deterministicFacts, extractFileFacts, hasCodeFiles, listCodeFiles, listCodeFilesWithTotal, runScan, SCAN_PROMPT_VERSION, type ScanDeps } from './scan.ts';
 
 function repo(git = false) {
   const dir = mkdtempSync(join(tmpdir(), 'fbscan-'));
@@ -48,9 +48,98 @@ test('listCodeFiles respects .gitignore in a git repo', async () => {
 test('deterministicFacts reads package.json scripts and dependencies', () => {
   const facts = deterministicFacts([{ path: 'package.json', content: JSON.stringify({ scripts: { dev: 'vite' }, dependencies: { react: '^18' }, devDependencies: { vitest: '^3' } }) }]);
   expect(facts).toEqual([
-    { kind: 'command', statement: '`dev` script runs: vite', path: 'package.json', lines: null, confidence: 1, why: 'Read directly from package.json; no model involved.', relevance: 0.7 },
-    { kind: 'dependency', statement: 'Dependencies: react ^18. Dev dependencies: vitest ^3.', path: 'package.json', lines: null, confidence: 1, why: 'Read directly from package.json; no model involved.', relevance: 0.5 },
+    { kind: 'command', statement: '`dev` script runs: vite', path: 'package.json', lines: null, confidence: 1, why: 'Read directly from package.json; no model involved.', relevance: 0.7, origin: 'manifest', evidence: 'file' },
+    { kind: 'dependency', statement: 'Dependencies: react ^18. Dev dependencies: vitest ^3.', path: 'package.json', lines: null, confidence: 1, why: 'Read directly from package.json; no model involved.', relevance: 0.5, origin: 'manifest', evidence: 'file' },
   ]);
+});
+
+test('deterministicFacts also reads pyproject, go.mod, Cargo.toml, Makefile targets, compose services and .env.example keys', () => {
+  const at = (path: string, content: string) => deterministicFacts([{ path, content }]).map((f) => `${f.kind}: ${f.statement}`);
+  expect(at('svc/pyproject.toml', [
+    '[project]', 'name = "shop"', 'requires-python = ">=3.11"', 'dependencies = [', '  "fastapi>=0.110",', '  "sqlalchemy",', ']',
+    '[project.scripts]', 'shop = "shop.cli:main"', '[tool.poetry.dependencies]', 'pydantic = "^2"',
+  ].join('\n'))).toEqual([
+    'command: `shop` script runs: shop.cli:main',
+    'dependency: Python >=3.11. Dependencies: fastapi>=0.110, sqlalchemy, pydantic ^2.',
+  ]);
+  expect(at('go.mod', 'module example.com/shop\n\ngo 1.22\n\nrequire (\n\tgithub.com/acme/kit v1.2.0\n\tgolang.org/x/sync v0.7.0 // indirect\n)\nrequire github.com/acme/one v0.1.0\n')).toEqual([
+    'dependency: Go module example.com/shop (go 1.22). Requires: github.com/acme/kit v1.2.0, golang.org/x/sync v0.7.0, github.com/acme/one v0.1.0.',
+  ]);
+  expect(at('crates/core/Cargo.toml', '[package]\nname = "core"\nedition = "2021"\n\n[dependencies]\nserde = { version = "1", features = ["derive"] }\ntokio = "1.37"\n\n[dev-dependencies]\ninsta = "1"\n')).toEqual([
+    'dependency: Crate core (edition 2021). Dependencies: serde 1, tokio 1.37. Dev dependencies: insta 1.',
+  ]);
+  expect(at('Makefile', '.PHONY: test build\nVERSION := 1\ntest: build\n\tgo test ./...\nbuild:\n\tgo build\n%.o: %.c\n\tcc\n')).toEqual(['command: Make targets: test, build.']);
+  expect(at('deploy/docker-compose.yml', 'version: "3"\nservices:\n  db:\n    image: postgres:16\n  api:\n    build: .\n    ports:\n      - "8080:8080"\nvolumes:\n  data: {}\n')).toEqual(['config: Compose services: db, api.']);
+  expect(at('.env.example', `# settings\nDATABASE_URL=postgres://user@db/app\nexport API_TOKEN=${'x'.repeat(30)}\nlower=1\n`)).toEqual(['config: Environment keys (from .env.example): DATABASE_URL, API_TOKEN.']);
+  // never a value from .env.example
+  expect(at('.env.example', `API_TOKEN=${'x'.repeat(30)}`).join()).not.toContain('xxxx');
+  expect(at('src/main.ts', 'export const a = 1;')).toEqual([]);
+});
+
+test('checkCitations drops facts citing a file that does not exist, fixes lines beyond the file, and grades the evidence', async () => {
+  const files: Record<string, string> = {
+    'src/pool.ts': ['import pg from "pg";', 'export function createPool() {', '  const pool = new pg.Pool();', '  return pool;', '}', 'export const MAX_CLIENTS = 10;'].join('\n'),
+    'big.bin': '',
+  };
+  const read = async (p: string) => (p === 'big.bin' ? null : files[p]);
+  const fact = (path: string, lines: string | null, statement: string): CodeFact => ({ kind: 'api', statement, path, lines, confidence: 1, why: 'w' });
+  const r = await checkCitations([
+    fact('src/pool.ts', '2-4', '`createPool` returns a new pg Pool'),
+    fact('src/pool.ts', '1-2', 'MAX_CLIENTS caps the pool at ten clients'),
+    fact('src/pool.ts', '40-60', 'the pool is created lazily'),
+    fact('src/pool.ts', '5-90', 'nothing named here'),
+    fact('src/pool.ts', null, 'pools are per process'),
+    fact('fg-verifier-notes.txt', null, 'run tests with bun test'),
+    fact('.', null, 'the API is a Hono app'),
+    fact('./src/pool.ts', '6', 'MAX_CLIENTS is 10'),
+    fact('big.bin', '1-3', 'a binary blob'),
+    fact('src/AGENTS.md', null, 'Webapp code lives under core'),
+    fact('CLAUDE.md', null, 'always run the linter'),
+  ], read);
+  expect(r.dropped.map((f) => f.statement)).toEqual(['run tests with bun test', 'Webapp code lives under core', 'always run the linter']);
+  expect(r.kept.map((f) => [f.path, f.lines, f.evidence])).toEqual([
+    ['src/pool.ts', '2-4', 'line'],
+    ['src/pool.ts', null, 'file'], // MAX_CLIENTS is on line 6, not 1-2
+    ['src/pool.ts', null, 'file'], // past the end of a 6-line file
+    ['src/pool.ts', '5-6', 'line'], // clamped to the file
+    ['src/pool.ts', null, 'file'],
+    ['.', null, 'none'],
+    ['src/pool.ts', '6', 'line'],
+    ['big.bin', '1-3', 'file'],
+  ]);
+});
+
+test('an agentic scan saves facts with their evidence level, never one citing an instruction file or a missing file', async () => {
+  const dir = repo(true);
+  const agent = llm({ facts: [
+    { kind: 'api', statement: '`a` is exported', path: 'src/a.ts', lines: '1', confidence: 1 },
+    { kind: 'convention', statement: 'restated from the docs', path: 'README.md', lines: null, confidence: 1 },
+    { kind: 'convention', statement: 'ghost', path: 'notes.txt', lines: null, confidence: 1 },
+  ] }, true);
+  const { deps, written } = fakeDeps({ llm: agent });
+  await runScan(job(dir), deps);
+  expect(written.filter((f) => f.origin === 'model').map((f) => [f.statement, f.evidence])).toEqual([['`a` is exported', 'line'], ['restated from the docs', 'file']]);
+  expect(written.filter((f) => f.origin === 'manifest')).toHaveLength(3);
+});
+
+test('the extraction prompts say not to restate instruction files and not to infer absence from the file list', async () => {
+  const seen: string[] = [];
+  const m: LlmProvider = { id: 'claude-cli', agentic: true, json: async (t) => { seen.push(t.system); return { facts: [] }; } };
+  await runScan(job(repo(true)), fakeDeps({ llm: m }).deps);
+  expect(seen[0]).toMatch(/AGENTS\.md/);
+  expect(seen[0]).toMatch(/CLAUDE\.md/);
+  expect(seen[0]).toMatch(/absent|missing/i);
+});
+
+test('a per-file scan does not ask the model about AGENTS.md or CLAUDE.md, but still records them as scanned', async () => {
+  const dir = repo(true);
+  writeFileSync(join(dir, 'AGENTS.md'), '# rules\nAlways run the linter.\n');
+  const asked: string[] = [];
+  const m: LlmProvider = { id: 'ollama:gemma4', agentic: false, json: async (t) => { asked.push(t.user.split('\n')[0]); return { summary: 'S', facts: [] }; } };
+  const { deps, saved } = fakeDeps({ llm: m });
+  await runScan(job(dir), deps);
+  expect(asked.some((u) => u.includes('AGENTS.md'))).toBe(false);
+  expect(saved.find((s) => s.path === 'AGENTS.md')).toEqual({ path: 'AGENTS.md', facts: 0 });
 });
 
 const llm = (out: unknown, agentic = false): LlmProvider & { seen: { user: string; cwd?: string }[] } => {
@@ -86,17 +175,18 @@ test('the extraction prompt asks for relevance to everyday coding, with setup of
 function fakeDeps(over: Partial<ScanDeps> = {}) {
   const saved: { path: string; facts: number }[] = [];
   const removed: string[][] = [];
-  const replaced: { facts: number; files: number }[] = [];
+  const replaced: { facts: number; files: number; scope: FactScope; paths: string[] }[] = [];
   const updates: object[] = [];
   const activity: ActivityInput[] = [];
   const jobIds: (string | null | undefined)[] = [];
+  const written: CodeFact[] = [];
   let attempts = 0;
   const deps: ScanDeps = {
     facts: {
       fileHashes: async () => new Map([['src/a.ts', 'stale'], ['src/deleted.ts', 'x']]),
-      saveFileFacts: async (_k, f, facts, _s, jobId) => { saved.push({ path: f.path, facts: facts.length }); jobIds.push(jobId); },
+      saveFileFacts: async (_k, f, facts, _s, jobId) => { saved.push({ path: f.path, facts: facts.length }); written.push(...facts); jobIds.push(jobId); },
       markFilesRemoved: async (_k, p) => { removed.push(p); },
-      replaceProjectFacts: async (_k, facts, _s, files, jobId) => { replaced.push({ facts: facts.length, files: files.length }); jobIds.push(jobId); },
+      replaceScopeFacts: async (_k, scope, facts, _s, files, jobId) => { replaced.push({ facts: facts.length, files: files.length, scope, paths: facts.map((f) => f.path) }); written.push(...facts); jobIds.push(jobId); },
       updateScanJob: async (_id, p) => { updates.push(p); },
       currentSources: async () => [],
       // The stores' rule (contract-tested in facts.int.test.ts): a counted failure backs off, then fails for good.
@@ -114,7 +204,7 @@ function fakeDeps(over: Partial<ScanDeps> = {}) {
     maxFiles: 100,
     ...over,
   };
-  return { deps, saved, removed, replaced, updates, activity, jobIds };
+  return { deps, saved, removed, replaced, updates, activity, jobIds, written };
 }
 
 const job = (dir: string): ScanJob => ({ id: 'j', projectKey: 'demo', repoPath: dir, provider: null, status: 'queued', requestedAt: 't', startedAt: null, finishedAt: null, filesScanned: 0, factsAdded: 0, error: null, attempts: 0, retryAt: null });
@@ -147,7 +237,7 @@ test('runScan logs what it extracted from each file, with which model and why th
   expect(a).toMatchObject({ actor: 'ollama:gemma4', projectKey: 'demo', subject: '1 fact from src/a.ts' });
   expect(a.why).toMatch(/changed since the last scan/);
   expect(a.details).toMatchObject({ scanJobId: 'j', previousHash: 'stale', summary: 'S', promptVersion: SCAN_PROMPT_VERSION });
-  expect(a.details!.facts).toEqual([{ kind: 'api', statement: 'f', why: 'callers rely on it', confidence: 0.8 }]);
+  expect(a.details!.facts).toEqual([{ kind: 'api', statement: 'f', why: 'callers rely on it', confidence: 0.8, evidence: 'file' }]);
   expect(activity.find((x) => x.targets?.includes('demo:README.md'))!.why).toMatch(/new file/);
   expect(activity.find((x) => x.subject.includes('removed'))).toMatchObject({ targets: ['demo:src/deleted.ts'] });
   expect(activity.at(-1)).toMatchObject({ kind: 'scan_finished', subject: 'scanned 5 files, 8 facts' });
@@ -164,7 +254,7 @@ test('runScan (agentic) asks once for the whole repo and replaces project facts'
   expect(agent.seen).toHaveLength(1);
   expect(agent.seen[0].cwd).toBe(dir);
   expect(saved).toEqual([]);
-  expect(replaced).toEqual([{ facts: 5, files: 5 }]); // 2 agentic (bad path re-homed to '.') + 3 package.json facts
+  expect(replaced).toMatchObject([{ facts: 4, files: 5, scope: { prefixes: [''], except: [] } }]); // 1 agentic (the one citing a file that does not exist is dropped) + 3 package.json facts
   // Only what the model cited counts as scanned ('.' and a path outside the repo are not files it read).
   expect(r.filesScanned).toBe(0);
 });
@@ -289,7 +379,7 @@ test('an agentic answer of the wrong shape is asked again once with a stricter i
   await runScan(job(repo(true)), deps);
   expect(systems).toHaveLength(2);
   expect(systems[1]).toContain(STRICT_JSON);
-  expect(replaced).toEqual([{ facts: 4, files: 5 }]);
+  expect(replaced).toMatchObject([{ facts: 4, files: 5 }]);
 });
 
 test('the file cap limits how many changed files are scanned per run, and never closes facts of files beyond it', async () => {
@@ -404,4 +494,189 @@ test('listCodeFilesWithTotal puts files sessions edited first, and scales an uns
   expect(r.files).toHaveLength(400);
   expect(r.files[0].path).toBe('docs/edited.md');
   expect(r.totalCandidates).toBe(451);
+});
+
+/** A pnpm workspace: packages/core and packages/api (6 source files each, their own package.json) and root files. */
+function workspace() {
+  const dir = mkdtempSync(join(tmpdir(), 'fbscan-ws-'));
+  const w = (p: string, c: string) => { mkdirSync(join(dir, p, '..'), { recursive: true }); writeFileSync(join(dir, p), c); };
+  w('pnpm-workspace.yaml', "packages:\n  - 'packages/*'\n");
+  w('package.json', JSON.stringify({ name: 'demo', scripts: { test: 'vitest run' } }));
+  w('README.md', '# demo\n');
+  for (const d of ['docs/a.md', 'docs/b.md', 'docs/c.md']) w(d, '# doc\n');
+  for (const pkg of ['core', 'api']) {
+    w(`packages/${pkg}/package.json`, JSON.stringify({ name: `@demo/${pkg}`, dependencies: { zod: '^3' } }));
+    for (let i = 0; i < 6; i++) w(`packages/${pkg}/src/m${i}.ts`, `export const ${pkg}${i} = ${i};\n`);
+  }
+  execFileSync('git', ['-C', dir, 'init', '-q']);
+  execFileSync('git', ['-C', dir, 'add', '-A']);
+  return dir;
+}
+
+/** The shard a prompt is about, from its "SHARD: <key>" line. */
+const shardOf = (user: string) => user.match(/^SHARD: (\S+)/m)?.[1] ?? '?';
+/** An agent answering each shard with one fact about its first listed file, one about the shard as a whole and one outside it. */
+const shardAgent = (onShard: (shard: string) => void = () => {}) => llm((user: string) => {
+  const shard = shardOf(user);
+  onShard(shard);
+  const first = user.split('\n').find((l) => /\.ts$/.test(l)) ?? 'README.md';
+  return { facts: [
+    { kind: 'api', statement: `about ${first}`, path: first, lines: null, confidence: 0.9 },
+    { kind: 'architecture', statement: `whole of ${shard}`, path: '.', lines: null, confidence: 0.9 },
+    { kind: 'convention', statement: `outside ${shard}`, path: shard === 'packages/api' ? 'packages/core/src/m0.ts' : 'packages/api/src/m0.ts', lines: null, confidence: 0.9 },
+  ] };
+}, true);
+
+test('an agentic scan of a workspace runs one agent pass per package with its own file list, and replaces only that package', async () => {
+  const dir = workspace();
+  const agent = shardAgent();
+  const { deps, replaced, updates } = fakeDeps({ llm: agent });
+  deps.facts.fileHashes = async () => new Map();
+  const r = await runScan(job(dir), deps);
+  expect(agent.seen.map((s) => shardOf(s.user))).toEqual(['.', 'packages/api', 'packages/core']);
+  expect(agent.seen.every((s) => s.cwd === dir)).toBe(true);
+  const core = agent.seen.find((s) => shardOf(s.user) === 'packages/core')!.user;
+  expect(core).toContain('packages/core/src/m0.ts');
+  expect(core).not.toContain('packages/api/');
+  expect(core).not.toContain('README.md');
+  expect(replaced.map((x) => x.scope)).toEqual([
+    { prefixes: [''], except: ['packages/api', 'packages/core'] },
+    { prefixes: ['packages/api'], except: [] },
+    { prefixes: ['packages/core'], except: [] },
+  ]);
+  const coreSave = replaced[2];
+  expect(coreSave.files).toBe(7);
+  // Its own file, the package as a whole (filed under its directory) and its package.json facts; never the other package's file.
+  expect([...new Set(coreSave.paths)].sort()).toEqual(['packages/core', 'packages/core/package.json', 'packages/core/src/m0.ts']);
+  expect(replaced[0].paths).toContain('.');
+  expect(replaced[0].paths).not.toContain('packages/api/src/m0.ts');
+  expect(r.shards).toEqual([
+    { shard: '.', files: 6, facts: 3, skipped: false },
+    { shard: 'packages/api', files: 7, facts: 3, skipped: false },
+    { shard: 'packages/core', files: 7, facts: 3, skipped: false },
+  ]);
+  expect(updates.at(-1)).toMatchObject({ status: 'done', shards: { total: 3, rescanned: 3, failed: 0 } });
+});
+
+test('the prompt tells the agent its shard, its path prefix and a budget scaled to the shard', async () => {
+  const dir = workspace();
+  const systems: string[] = [];
+  const agent: LlmProvider = { id: 'claude-cli', agentic: true, json: async (t) => { systems.push(t.system); return { facts: [] }; } };
+  const { deps } = fakeDeps({ llm: agent });
+  deps.facts.fileHashes = async () => new Map();
+  await runScan(job(dir), deps);
+  expect(systems[2]).toMatch(/packages\/core/);
+  expect(systems[2]).toMatch(/Return 4 to 11 facts/);
+  expect(systems[2]).toMatch(/only about files in this part/i);
+});
+
+test('a rescan only revisits the shards whose files changed; the others keep their facts and are reported as unchanged', async () => {
+  const dir = workspace();
+  const files = await listCodeFiles(dir, { maxBytes: 80_000, maxFiles: 100 });
+  const asked: string[] = [];
+  const { deps, replaced, updates, activity } = fakeDeps({ llm: shardAgent((s) => asked.push(s)) });
+  deps.facts.fileHashes = async () => new Map(files.map((f) => [f.path, f.path === 'packages/api/src/m3.ts' ? 'old' : f.hash]));
+  deps.facts.currentSources = async () => ['claude-cli'];
+  const r = await runScan(job(dir), deps);
+  expect(asked).toEqual(['packages/api']);
+  expect(replaced.map((x) => x.scope.prefixes)).toEqual([['packages/api']]);
+  expect(r.shards).toEqual([
+    { shard: '.', files: 6, facts: 0, skipped: true },
+    { shard: 'packages/api', files: 7, facts: 3, skipped: false },
+    { shard: 'packages/core', files: 7, facts: 0, skipped: true },
+  ]);
+  expect(updates.at(-1)).toMatchObject({ status: 'done', shards: { total: 3, rescanned: 1, failed: 0 } });
+  const finished = activity.at(-1)!;
+  expect(finished.subject).toMatch(/1 of 3 shards rescanned/);
+  expect(finished.details).toMatchObject({ shards: r.shards });
+
+  // A file removed from a shard is a change too.
+  asked.length = 0;
+  deps.facts.fileHashes = async () => new Map([...files.map((f) => [f.path, f.hash] as [string, string]), ['packages/core/src/gone.ts', 'x']]);
+  await runScan(job(dir), deps);
+  expect(asked).toEqual(['packages/core']);
+
+  // Nothing changed: no agent run at all.
+  asked.length = 0;
+  deps.facts.fileHashes = async () => new Map(files.map((f) => [f.path, f.hash]));
+  expect(await runScan(job(dir), deps)).toMatchObject({ factsAdded: 0, failed: 0 });
+  expect(asked).toEqual([]);
+});
+
+test('facts from a different model rescan every shard', async () => {
+  const dir = workspace();
+  const files = await listCodeFiles(dir, { maxBytes: 80_000, maxFiles: 100 });
+  const asked: string[] = [];
+  const { deps } = fakeDeps({ llm: shardAgent((s) => asked.push(s)) });
+  deps.facts.fileHashes = async () => new Map(files.map((f) => [f.path, f.hash]));
+  deps.facts.currentSources = async () => ['codex-cli'];
+  await runScan(job(dir), deps);
+  expect(asked).toEqual(['.', 'packages/api', 'packages/core']);
+});
+
+test('after a model switch, only the shards still holding the other model\'s facts are rescanned, so one failed shard does not redo the repo', async () => {
+  const dir = workspace();
+  const files = await listCodeFiles(dir, { maxBytes: 80_000, maxFiles: 100 });
+  const asked: string[] = [];
+  const { deps } = fakeDeps({ llm: shardAgent((s) => asked.push(s)) });
+  deps.facts.fileHashes = async () => new Map(files.map((f) => [f.path, f.hash]));
+  // The last scan with claude-cli saved every shard but packages/api, which still has codex-cli's facts.
+  deps.facts.currentSources = async () => ['claude-cli', 'codex-cli'];
+  deps.facts.listFacts = async () => [
+    { path: 'README.md', source: 'claude-cli', docId: null, origin: 'model' },
+    { path: 'packages/core/src/m0.ts', source: 'claude-cli', docId: null, origin: 'model' },
+    { path: 'packages/api/src/m0.ts', source: 'codex-cli', docId: null, origin: 'model' },
+    { path: 'packages/core', source: 'you', docId: null, origin: 'you' },
+  ] as never;
+  await runScan(job(dir), deps);
+  expect(asked).toEqual(['packages/api']);
+});
+
+test('one shard failing fails only that shard: the others are saved, its hashes stay stale for the next scan, and the job is done', async () => {
+  const dir = workspace();
+  const agent = shardAgent((s) => { if (s === 'packages/api') throw new Error('bad answer'); });
+  const { deps, replaced, updates, activity } = fakeDeps({ llm: agent });
+  deps.facts.fileHashes = async () => new Map();
+  const r = await runScan(job(dir), deps);
+  expect(replaced.map((x) => x.scope.prefixes)).toEqual([[''], ['packages/core']]);
+  expect(r).toMatchObject({ failed: 1 });
+  expect(r.shards!.find((s) => s.shard === 'packages/api')).toMatchObject({ skipped: false, facts: 0, failed: 'Error: bad answer' });
+  expect(updates.at(-1)).toMatchObject({ status: 'done', error: '1 shard failed: packages/api', shards: { total: 3, rescanned: 3, failed: 1 } });
+  expect(activity.find((a) => a.subject === 'could not extract facts from packages/api')).toMatchObject({ why: 'Error: bad answer' });
+});
+
+test('every shard failing fails the run as a counted attempt', async () => {
+  const dir = workspace();
+  const { deps, replaced, updates } = fakeDeps({ llm: shardAgent(() => { throw new Error('bad answer'); }) });
+  deps.facts.fileHashes = async () => new Map();
+  await expect(runScan(job(dir), deps)).rejects.toThrow(/all 3 shards failed.*bad answer/);
+  expect(replaced).toEqual([]);
+  expect(updates.at(-1)).toMatchObject({ status: 'queued', counted: true, attempts: 1 });
+});
+
+test('an unavailable model stops a sharded scan (shards saved so far stay) and leaves the job queued', async () => {
+  const dir = workspace();
+  const agent = shardAgent((s) => { if (s === 'packages/api') throw new Error('claude exit 1: Invalid API key · Please run /login'); });
+  const { deps, replaced, updates } = fakeDeps({ llm: agent });
+  deps.facts.fileHashes = async () => new Map();
+  await expect(runScan(job(dir), deps)).rejects.toBeInstanceOf(ProviderUnavailableError);
+  expect(replaced.map((x) => x.scope.prefixes)).toEqual([['']]);
+  expect(agent.seen).toHaveLength(2);
+  expect(updates.at(-1)).toMatchObject({ status: 'queued', counted: false });
+});
+
+test('three shards in a row timing out stop the run instead of waiting out every shard', async () => {
+  const dir = workspace();
+  // A fourth package, so a fourth shard is left when the third timeout stops the run.
+  writeFileSync(join(dir, 'pnpm-workspace.yaml'), "packages:\n  - 'packages/*'\n  - 'tools/*'\n");
+  mkdirSync(join(dir, 'tools/gen'), { recursive: true });
+  writeFileSync(join(dir, 'tools/gen/package.json'), '{}');
+  for (let i = 0; i < 6; i++) writeFileSync(join(dir, `tools/gen/g${i}.ts`), 'export {};\n');
+  execFileSync('git', ['-C', dir, 'add', '-A']);
+  const agent = shardAgent(() => { throw new Error('codex exit 124: \ncodex timed out after 1800000ms'); });
+  const { deps, updates } = fakeDeps({ llm: agent });
+  deps.facts.fileHashes = async () => new Map();
+  await expect(runScan(job(dir), deps)).rejects.toThrow(/3 shards in a row timed out/);
+  expect(agent.seen).toHaveLength(3);
+  expect(updates.at(-1)).toMatchObject({ status: 'queued', counted: true });
 });

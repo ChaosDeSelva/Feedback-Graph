@@ -68,3 +68,39 @@ test('a slow answer for the filters you left never replaces the rows for the one
   expect(screen.getByText('lesson "no dashes" imported')).toBeTruthy();
   expect(screen.queryByText('2 facts from src/db.ts')).toBeNull();
 });
+
+test('a link to one kind (#activity/candidate_flagged) opens filtered to it, with the classifier backlog on top', async () => {
+  location.hash = '#activity/candidate_flagged';
+  vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+    urls.push(url);
+    if (url === '/api/pipeline') return Response.json({ classify: { backlog: 40, capped: true } });
+    return Response.json([]);
+  }));
+  render(<Activity />);
+  await waitFor(() => expect(urls).toContain('/api/activity?kind=candidate_flagged&limit=300'));
+  expect((screen.getByLabelText('kind') as HTMLSelectElement).value).toBe('candidate_flagged');
+  expect(await screen.findByText(/40\+ turns are waiting for the classifier/)).toBeTruthy();
+  location.hash = '';
+});
+
+test('each actor says what kind of actor it is: a person, an agent with the operator token, a model, a pipeline step', async () => {
+  vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+    if (url.startsWith('/api/activity')) {
+      return Response.json(['you', 'operator:codex', 'ollama:gemma4', 'claude-cli', 'skip-rules', 'claude-code'].map((actor, i) => ({
+        id: `x${i}`, ts: '2026-10-22T20:33:00Z', kind: 'lesson_decided', actor, projectKey: null, subject: `by ${actor}`, why: '', details: {}, targets: [],
+      })));
+    }
+    return Response.json([]);
+  }));
+  render(<Activity />);
+  await screen.findByText('by you');
+  const title = (actor: string) => screen.getByText(actor, { selector: '[title]' }).getAttribute('title');
+  expect(title('you')).toMatch(/^person/);
+  expect(title('operator:codex')).toMatch(/^agent with the operator token/);
+  expect(title('ollama:gemma4')).toMatch(/^model/);
+  expect(title('claude-cli')).toMatch(/^model/);
+  expect(title('skip-rules')).toMatch(/^pipeline step/);
+  expect(title('claude-code')).toMatch(/^agent over MCP/);
+  // A legend says the same once for the page.
+  expect(screen.getByLabelText('who did it')).toBeTruthy();
+});

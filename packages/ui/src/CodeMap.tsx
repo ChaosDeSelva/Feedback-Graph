@@ -1,7 +1,8 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
-import { api, type CodeMapMeta, type CodeMapReport, type Hotspot, type ModuleContext } from './api.ts';
-import { inboxHref, lessonHref } from './links.ts';
+import { api, type CodeMapMeta, type CodeMapReport, type Hotspot, type MapCapped, type ModuleContext } from './api.ts';
+import { inboxHref, lessonHref, moduleHref } from './links.ts';
 import { Button } from './ui/controls.tsx';
+import { scrollIntoPane } from './ui/scroll.ts';
 import { Alert, Badge, Card, CauseBadge, EmptyState, plural, SectionLabel, SkeletonDetail, SkeletonList, StatGrid, StatTile, tableClass, tdClass, thClass } from './ui/display.tsx';
 import { ChevronIcon, CloseIcon } from './ui/icons.tsx';
 
@@ -16,10 +17,21 @@ const HINT: Record<SortKey, string> = {
   score: '4 × misses + log2(1 + churn) + log2(1 + dependents); docs and config files score 0 until a miss touches them',
 };
 
-/** "400 of 10,290 files" when the map is capped (SCAN_MAX_FILES), else null. */
-export function mapCapNote(meta: CodeMapMeta | null | undefined): string | null {
+/**
+ * Whether the map is capped (SCAN_MAX_FILES): the API's answer when it gave one, else from the counted total. A map
+ * built before the total was counted (candidates null) is capped only by the API's answer, `of: null`.
+ */
+export function mapCap(meta: CodeMapMeta | null | undefined, capped?: MapCapped): MapCapped {
+  if (capped !== undefined) return capped;
   if (!meta || meta.candidates == null || meta.candidates <= meta.stats.files) return null;
-  return `${meta.stats.files.toLocaleString()} of ${meta.candidates.toLocaleString()} files`;
+  return { files: meta.stats.files, of: meta.candidates };
+}
+
+/** "400 of 10,290 files", or "capped at 4,000 files" when the total was not counted; null when the map is not capped. */
+export function mapCapNote(meta: CodeMapMeta | null | undefined, capped?: MapCapped): string | null {
+  const c = mapCap(meta, capped);
+  if (!c) return null;
+  return c.of !== null ? `${c.files.toLocaleString()} of ${c.of.toLocaleString()} files` : `capped at ${c.files.toLocaleString()} files`;
 }
 /** Names read A to Z; numbers read biggest first. */
 const defaultSort = (key: SortKey): Sort => ({ key, desc: key !== 'path' });
@@ -36,21 +48,37 @@ export function IncludeTests({ checked, onChange }: { checked: boolean; onChange
 }
 
 /** The Projects page's code map: its size, its hotspots (sortable), and a module panel for the file you pick. */
-export function CodeMap({ projectKey }: { projectKey: string }) {
+export function CodeMap({ projectKey, initialModule = null, focus = null }: {
+  projectKey: string;
+  initialModule?: string | null;
+  /** Open this file's panel (a fact's file name was clicked); `at` makes the same file asked again a new request. */
+  focus?: { path: string; at: number } | null;
+}) {
   const [report, setReport] = useState<CodeMapReport | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [sort, setSort] = useState<Sort>(defaultSort('score'));
   const [all, setAll] = useState(false);
-  const [open, setOpen] = useState<string | null>(null);
+  const [open, setOpen] = useState<string | null>(initialModule);
   const [tests, setTests] = useState(false);
+  // Every score 0: the table would only list docs and config by path, so it waits behind a button.
+  const [showZero, setShowZero] = useState(false);
+  useEffect(() => { if (focus) setOpen(focus.path); }, [focus?.path, focus?.at]);
+  // The panel a link asked for survives the first load only (run twice in StrictMode); any other project or filter closes it.
+  const linked = useRef(initialModule ? projectKey : null);
+  const [rebuild, setRebuild] = useState<{ busy: boolean; said: string | null; error: string | null }>({ busy: false, said: null, error: null });
 
   useEffect(() => {
     setReport(null);
     setError(null);
-    setOpen(null);
+    if (linked.current !== projectKey || tests) {
+      linked.current = null;
+      setOpen(null);
+    }
     setAll(false);
+    setShowZero(false);
+    setRebuild({ busy: false, said: null, error: null });
     let stale = false;
-    api.codeMap(projectKey, undefined, tests).then((r) => { if (!stale) setReport({ meta: r?.meta ?? null, hotspots: r?.hotspots ?? [] }); }, (e) => { if (!stale) setError(String(e)); });
+    api.codeMap(projectKey, undefined, tests).then((r) => { if (!stale) setReport({ meta: r?.meta ?? null, hotspots: r?.hotspots ?? [], capped: r?.capped }); }, (e) => { if (!stale) setError(String(e)); });
     return () => { stale = true; };
   }, [projectKey, tests]);
 
@@ -62,10 +90,28 @@ export function CodeMap({ projectKey }: { projectKey: string }) {
   const sortBy = (key: SortKey) => setSort((s) => (s.key === key ? { key, desc: !s.desc } : defaultSort(key)));
 
   const meta = report?.meta;
-  const cappedAt = mapCapNote(meta);
+  const cap = mapCap(meta, report?.capped);
+  const cappedAt = mapCapNote(meta, report?.capped);
+  const askRebuild = () => {
+    setRebuild({ busy: true, said: null, error: null });
+    api.rebuildCodeMap(projectKey).then(
+      () => setRebuild({ busy: false, said: 'Rebuild queued: the worker remaps this project from scratch at its next pass (a minute or so).', error: null }),
+      (e) => setRebuild({ busy: false, said: null, error: e instanceof Error ? e.message : String(e) }),
+    );
+  };
   return (
-    <Card title="Code map" bodyClass="grid gap-3 p-3">
+    <Card
+      title="Code map"
+      bodyClass="grid gap-3 p-3"
+      actions={meta ? (
+        <Button size="sm" onClick={askRebuild} disabled={rebuild.busy} title="remap this project from scratch, whether or not the repo changed">
+          Rebuild map
+        </Button>
+      ) : undefined}
+    >
       {error && <Alert>{error}</Alert>}
+      {rebuild.error && <Alert>{rebuild.error}</Alert>}
+      {rebuild.said && <p role="status" className="text-xs text-muted">{rebuild.said}</p>}
       {!report && !error ? (
         <SkeletonList rows={3} />
       ) : !meta ? (
@@ -77,16 +123,19 @@ export function CodeMap({ projectKey }: { projectKey: string }) {
           <StatGrid className="grid-cols-2 sm:grid-cols-4">
             <StatTile
               label="files"
-              value={cappedAt ? <span>{meta.stats.files.toLocaleString()} <span className="text-[13px] font-normal text-muted">of {meta.candidates!.toLocaleString()}</span></span> : meta.stats.files}
-              hint={cappedAt ? 'mapped, of the files worth mapping' : 'mapped source files'}
+              value={cap?.of != null ? <span>{meta.stats.files.toLocaleString()} <span className="text-[13px] font-normal text-muted">of {cap.of.toLocaleString()}</span></span> : meta.stats.files.toLocaleString()}
+              hint={cap?.of != null ? 'mapped, of the files worth mapping' : cap ? 'mapped, at the cap' : 'mapped source files'}
             />
             <StatTile label="symbols" value={meta.stats.symbols} hint="functions, classes, types…" />
             <StatTile label="edges" value={meta.stats.imports + meta.stats.tests} hint={`${meta.stats.imports} imports · ${meta.stats.tests} test links`} />
             <StatTile label="last built" value={<span className="text-[15px]">{new Date(meta.builtAt).toLocaleString()}</span>} hint="rebuilt when the repo changes" />
           </StatGrid>
-          {cappedAt && (
+          {cap && (
             <p role="note" className="rounded-md border border-line bg-sunken px-3 py-2 text-xs text-muted">
-              Showing {cappedAt}: the map is capped, keeping source and the files your sessions edited first. Files past the cap have no
+              {cap.of !== null
+                ? `Showing ${cappedAt}: the map is capped`
+                : `The map is ${cappedAt}; it was built before the total was counted, so Rebuild map to see how many it leaves out`}
+              , keeping source and the files your sessions edited first. Files past the cap have no
               hotspot, module panel or impact. To map more, raise SCAN_MAX_FILES (unset, it is 40% of the files, between 400 and 4,000).
             </p>
           )}
@@ -101,6 +150,11 @@ export function CodeMap({ projectKey }: { projectKey: string }) {
             </div>
             {rows.length === 0 ? (
               <p className="py-3 text-muted">The map has no files yet.</p>
+            ) : rows.every((h) => h.score === 0) && !showZero ? (
+              <div className="flex flex-wrap items-center gap-2 py-2 text-muted">
+                <span>No hotspots yet: no file has misses, recent commits or importers, so every score is 0.</span>
+                <Button size="sm" variant="ghost" onClick={() => setShowZero(true)}>Show the files anyway</Button>
+              </div>
             ) : (
               <div className="overflow-x-auto rounded-sm border border-line">
                 <table className={`${tableClass} text-[13px]`}>
@@ -129,7 +183,7 @@ export function CodeMap({ projectKey }: { projectKey: string }) {
                 </table>
               </div>
             )}
-            {rows.length > ROWS && (
+            {rows.length > ROWS && (showZero || rows.some((h) => h.score > 0)) && (
               <Button size="sm" variant="ghost" className="justify-self-start" onClick={() => setAll(!all)}>{all ? `Show the top ${ROWS}` : `Show all ${rows.length}`}</Button>
             )}
           </div>
@@ -171,7 +225,7 @@ export function ModulePanel({ projectKey, path, onOpen, onClose, narrow = false 
     setError(null);
     let stale = false;
     api.codeModule(projectKey, path).then((r) => { if (!stale) setM(r); }, (e) => { if (!stale) setError(e instanceof Error ? e.message : String(e)); });
-    ref.current?.scrollIntoView?.({ block: 'nearest', behavior: 'smooth' });
+    scrollIntoPane(ref.current, { smooth: true });
     return () => { stale = true; };
   }, [projectKey, path]);
 
@@ -193,7 +247,10 @@ export function ModulePanel({ projectKey, path, onOpen, onClose, narrow = false 
             </div>
           )}
         </div>
-        <Button size="sm" variant="ghost" aria-label="close module" onClick={onClose}><CloseIcon size={13} /></Button>
+        <span className="flex shrink-0 items-center gap-1">
+          <a href={moduleHref(projectKey, path)} aria-label="link to this file" title="a link that opens this panel" className="px-1 text-xs text-muted underline decoration-line-strong underline-offset-2 hover:text-text">link</a>
+          <Button size="sm" variant="ghost" aria-label="close module" onClick={onClose}><CloseIcon size={13} /></Button>
+        </span>
       </header>
 
       {error ? (

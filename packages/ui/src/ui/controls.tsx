@@ -1,4 +1,4 @@
-import type { ButtonHTMLAttributes, InputHTMLAttributes, ReactNode, SelectHTMLAttributes, TextareaHTMLAttributes } from 'react';
+import { useEffect, useState, type ButtonHTMLAttributes, type InputHTMLAttributes, type ReactNode, type SelectHTMLAttributes, type TextareaHTMLAttributes } from 'react';
 import { ChevronIcon } from './icons.tsx';
 
 export type ButtonVariant = 'primary' | 'secondary' | 'ghost' | 'danger' | 'danger-outline';
@@ -24,6 +24,37 @@ export const buttonClass = (variant: ButtonVariant = 'secondary', size: Size = '
 
 export function Button({ variant = 'secondary', size = 'md', className = '', type = 'button', ...rest }: { variant?: ButtonVariant; size?: Size } & ButtonHTMLAttributes<HTMLButtonElement>) {
   return <button type={type} className={buttonClass(variant, size, className)} {...rest} />;
+}
+
+/**
+ * Copies `text` to the clipboard and says "Copied" for a moment. A clipboard the browser refuses (no permission, not a
+ * secure context) calls `onError` instead, so the caller can show the text to copy by hand.
+ */
+export function CopyButton({ text, label = 'Copy', onError, variant = 'secondary', size = 'sm', className = '' }: {
+  text: string;
+  label?: string;
+  onError?: (e: unknown) => void;
+  variant?: ButtonVariant;
+  size?: Size;
+  className?: string;
+}) {
+  const [copied, setCopied] = useState(false);
+  useEffect(() => {
+    if (!copied) return;
+    const t = setTimeout(() => setCopied(false), 2000);
+    return () => clearTimeout(t);
+  }, [copied]);
+  useEffect(() => setCopied(false), [text]);
+  async function copy() {
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopied(true);
+    } catch (e) {
+      setCopied(false);
+      onError?.(e);
+    }
+  }
+  return <Button variant={variant} size={size} className={className} onClick={copy}>{copied ? 'Copied' : label}</Button>;
 }
 
 export const fieldClass =

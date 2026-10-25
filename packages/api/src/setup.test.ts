@@ -161,7 +161,7 @@ test('without a terminal it only reports: no pulls, no token question, no start,
 
 test('asked in a terminal, it pulls only the missing models, from the Ollama it checked', () => {
   const s = sandbox({ tags: '{"models":[{"name":"nomic-embed-text:latest"}]}' });
-  s.run({ PROJECTS_DIRS: '~/code' }, 'y\nn\n');
+  s.run({ PROJECTS_DIRS: '~/code' }, 'y\nn\nn\n');
   expect(s.ran()).toBe('OLLAMA_HOST=http://localhost:11434 ollama pull gemma4\n');
 });
 
@@ -198,14 +198,14 @@ test('Enter skips the token; no claude on PATH means no question', () => {
 
 test('yes to starting: compose up, wait until it answers, then connect the agents', () => {
   const s = sandbox({ tags: both });
-  const out = s.run({ PROJECTS_DIRS: '~/code' }, 'y\ny\n');
+  const out = s.run({ PROJECTS_DIRS: '~/code' }, 'n\ny\ny\n');
   expect(s.ran()).toBe('docker compose up -d --build\ninstall-agent \n');
   expect(out).toContain('running: http://localhost:8787');
 });
 
 test('STORE=postgres without the profile set: the start includes the bundled database', () => {
   const s = sandbox({ tags: both });
-  s.run({ PROJECTS_DIRS: '~/code', STORE: 'postgres' }, 'y\nn\n');
+  s.run({ PROJECTS_DIRS: '~/code', STORE: 'postgres' }, 'n\ny\nn\n');
   expect(s.ran()).toBe('docker compose --profile postgres up -d --build\n');
 });
 
@@ -283,7 +283,7 @@ test('an install from before Settings keeps its PROJECTS_DIR, and the bundled ex
 
 test('asked in a terminal: the folders typed are mounted; Enter mounts none, with no default taken', () => {
   const s = sandbox({ tags: both });
-  const out = s.run({}, `~/work\nn\n`);
+  const out = s.run({}, `~/work\nn\nn\n`);
   expect(out).toContain('Which folders hold your projects');
   expect(s.saved()).toEqual([join(s.home, 'work')]);
   expect(s.ran()).toBe(''); // the next answer was no to starting
@@ -394,4 +394,27 @@ test('an unknown flag, or a flag missing its value, says how to use it', () => {
   const s = sandbox();
   expect(s.runFailing({}, ['--frobnicate'])).toContain('usage:');
   expect(s.runFailing({}, ['--projects'])).toContain('--projects needs a value');
+});
+
+test('the operator token is generated only with --yes or a yes answer, never printed, and kept on re-runs', () => {
+  const s = sandbox({ tags: both });
+  // No terminal, no --yes: not asked, not made.
+  s.run({ PROJECTS_DIRS: '~/code' });
+  expect(s.value('FG_OPERATOR_TOKEN')).toBe('');
+  // Asked: no keeps it empty.
+  s.run({}, 'n\nn\n');
+  expect(s.value('FG_OPERATOR_TOKEN')).toBe('');
+  // Asked: yes makes one (48 hex characters), mentioned but not printed.
+  const out = s.run({}, 'y\nn\n');
+  const token = s.value('FG_OPERATOR_TOKEN')!;
+  expect(token).toMatch(/^[0-9a-f]{48}$/);
+  expect(out).toContain('FG_OPERATOR_TOKEN saved to .env');
+  expect(out).not.toContain(token);
+  expect(statSync(join(s.repo, '.env')).mode & 0o777).toBe(0o600);
+  // Set already: not asked again, and --yes keeps it.
+  s.run({}, undefined, ['--yes']);
+  expect(s.value('FG_OPERATOR_TOKEN')).toBe(token);
+  const fresh = sandbox({ tags: both });
+  fresh.run({}, undefined, ['--yes', '--projects', '~/code']);
+  expect(fresh.value('FG_OPERATOR_TOKEN')).toMatch(/^[0-9a-f]{48}$/);
 });

@@ -32,6 +32,14 @@ test('GET /api/candidates rejects an unknown status', async () => {
   expect(res.status).toBe(400);
 });
 
+test('GET /api/candidates filters by source, and refuses an unknown one', async () => {
+  const { repo, calls } = fakeRepo();
+  const app = createApp(repo);
+  expect((await app.request('/api/candidates?source=github')).status).toBe(200);
+  expect(calls[0]).toEqual(['list', { source: 'github' }]);
+  expect((await app.request('/api/candidates?source=slack')).status).toBe(400);
+});
+
 test('GET /api/candidates/:id returns 404 for unknown ids', async () => {
   const app = createApp(fakeRepo().repo);
   expect((await app.request('/api/candidates/c1')).status).toBe(200);
@@ -45,7 +53,7 @@ test('POST decision validates the body', async () => {
   expect(bad.status).toBe(400);
   const ok = await app.request('/api/candidates/c1/decision', { method: 'POST', body: JSON.stringify({ status: 'confirmed', note: 'yes' }), headers: { 'content-type': 'application/json', origin: 'http://localhost' } });
   expect(ok.status).toBe(204);
-  expect(calls).toContainEqual(['decide', 'c1', 'confirmed', 'yes']);
+  expect(calls).toContainEqual(['decide', 'c1', 'confirmed', 'yes', 'you']);
 });
 
 test('POST decision on an unknown id is 404', async () => {

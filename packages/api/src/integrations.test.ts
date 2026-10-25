@@ -40,6 +40,30 @@ const json = (method: string, body?: unknown, origin: string | null = ORIGIN) =>
   headers: { 'content-type': 'application/json', ...(origin ? { origin } : {}) },
 });
 
+describe('the skip rules in Settings > Integrations', () => {
+  test('each rule is listed with how many comments it kept from the classifier, from the comments_skipped activity', async () => {
+    const { d } = setup();
+    const asked: unknown[] = [];
+    const entries = [
+      { kind: 'comments_skipped', ts: '2026-10-24T10:00:00Z', details: { rules: { 'pr-author-reply': 2, 'bot-author': 1 } } },
+      { kind: 'comments_skipped', ts: '2026-10-23T10:00:00Z', details: { rules: { 'pr-author-reply': 1, 'unknown-old-rule': 4 } } },
+    ];
+    const app = createApp(repo, { integrations: { ...d, activity: { record: async () => {}, list: async (q) => { asked.push(q); return entries as never; } } } });
+    const v = await (await app.request('/api/settings/integrations')).json();
+    expect(asked).toEqual([{ kind: 'comments_skipped', limit: 1000 }]);
+    expect(v.rules.map((r: { name: string; skipped: number }) => [r.name, r.skipped])).toEqual([['bot-author', 1], ['pr-author-reply', 3], ['status-note', 0], ['review-trigger', 0]]);
+    expect(v.rules[0].description).toMatch(/bots/i);
+    expect(v.skippedSince).toBe('2026-10-23T10:00:00Z');
+  });
+
+  test('without an activity log to count from, the rules are listed with no counts', async () => {
+    const { app } = setup();
+    const v = await (await app.request('/api/settings/integrations')).json();
+    expect(v.rules.map((r: { skipped: number | null }) => r.skipped)).toEqual([null, null, null, null]);
+    expect(v.skippedSince).toBeNull();
+  });
+});
+
 describe('Settings > Integrations', () => {
   test('nothing connected: each service says how to connect; projects show the repository their remote names', async () => {
     const { app } = setup();

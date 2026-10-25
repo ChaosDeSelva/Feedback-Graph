@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'vitest';
-import { authorKindOf, FEEDBACK_SKIP_RULES, feedbackSkipRule, parseLogins } from './feedbackRules.ts';
+import { authorKindOf, FEEDBACK_SKIP_RULES, feedbackSkipRule, isSelfReview, parseLogins } from './feedbackRules.ts';
 import type { ExternalRef } from './types.ts';
 
 const ext = (extra: Partial<ExternalRef> = {}): ExternalRef => ({
@@ -106,5 +106,19 @@ describe('feedbackSkipRule', () => {
   test('a reviewer pushing back is kept', () => {
     expect(feedbackSkipRule('this misses the server-side filter', ext())).toBeNull();
     expect(feedbackSkipRule('[P1] the totals ignore discounts', ext({ authorKind: 'agent' }))).toBeNull();
+  });
+});
+
+describe('isSelfReview', () => {
+  test("an agent comment under the pull request author's own account is a self-review", () => {
+    expect(isSelfReview(ext({ author: 'Dev', threadAuthor: 'dev', authorKind: 'agent' }))).toBe(true);
+  });
+
+  test('a person, another account, a bot, Linear, or a comment synced before authors were kept is not', () => {
+    expect(isSelfReview(ext({ author: 'dev', threadAuthor: 'dev', authorKind: 'human' }))).toBe(false);
+    expect(isSelfReview(ext({ author: 'lead', threadAuthor: 'dev', authorKind: 'agent' }))).toBe(false);
+    expect(isSelfReview(ext({ author: 'dev', threadAuthor: 'dev', authorKind: 'bot' }))).toBe(false);
+    expect(isSelfReview(ext({ source: 'linear', author: 'dev', threadAuthor: 'dev', authorKind: 'agent' }))).toBe(false);
+    expect(isSelfReview(ext({ author: 'dev' }))).toBe(false);
   });
 });

@@ -1,5 +1,6 @@
 import { useEffect, useRef, useSyncExternalStore, type ReactNode } from 'react';
 import { ChevronIcon } from './icons.tsx';
+import { scrollIntoPane } from './scroll.ts';
 
 const NARROW = '(max-width: 767.98px)';
 const narrowQuery = () => (typeof window !== 'undefined' && typeof window.matchMedia === 'function' ? window.matchMedia(NARROW) : null);
@@ -54,11 +55,11 @@ export function SplitPane({ listHeader, list, listFooter, children, listWidth = 
   );
 }
 
-/** One selectable row in a SplitPane list. The selected row is marked with a bar on its left edge and kept in view. */
+/** One selectable row in a SplitPane list. The selected row is marked with a bar on its left edge and kept in view (its list scrolls, never the page). */
 export function ListRow({ selected, onClick, children }: { selected: boolean; onClick: () => void; children: ReactNode }) {
   const ref = useRef<HTMLButtonElement>(null);
   useEffect(() => {
-    if (selected) ref.current?.scrollIntoView?.({ block: 'nearest' });
+    if (selected) scrollIntoPane(ref.current);
   }, [selected]);
   return (
     <button

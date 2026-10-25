@@ -6,6 +6,7 @@ import { promisify } from 'node:util';
 import type { ActivityStore, CodeGraphStore, CodeMapStats } from '@fb/core';
 import { GIT_SAFE } from '../ingest/git.ts';
 import { MAX_AUTO_MAP_FILES } from '../scan/rank.ts';
+import { candidatePaths } from '../scan/scan.ts';
 import { buildCodeMap } from './codemap.ts';
 import { churn as gitChurn } from './churn.ts';
 import { testsFor } from './queries.ts';
@@ -17,6 +18,14 @@ const run = promisify(execFile);
 export const CHURN_DAYS = 90;
 /** A project's repo is looked at no more often than this (a scan maps its project regardless). */
 export const MAP_INTERVAL_MS = 5 * 60_000;
+/**
+ * How long one project may hold the background pass before it counts as stalled: git status may take 5 minutes, a
+ * 4000-file parse and write a minute or two. A stalled pass is logged and abandoned, so one hung read over the mount
+ * (nothing can cancel it) does not stop every other project's map for good.
+ */
+export const MAP_STALL_MS = 20 * 60_000;
+/** Orphan CodeFile records deleted per purge (once per MAP_INTERVAL_MS): one bounded transaction each time. */
+export const ORPHAN_PURGE_LIMIT = 5000;
 /** How many of the files a project's sessions edited a capped map or a scan keeps first. */
 export const EDITED_PATHS_LIMIT = 1000;
 
@@ -25,20 +34,22 @@ export const gitStatusTimeoutMs = (files: number) => Math.min(300_000, 30_000 + 
 
 /**
  * What the repo looks like right now, cheaply: HEAD, `git status` (which respects .gitignore), and the size and mtime
- * of each dirty file (at most maxFiles of them). Null when the folder is not in a git repo: then there is no cheap
- * check, and the map is rebuilt on the interval (incrementally, so unchanged files are not reparsed).
+ * of each dirty file (at most maxFiles of them). Null when git cannot tell (not a repo, a worktree whose git dir is
+ * out of reach, status failing): the map stage then falls back to fileFingerprint.
  */
 export async function repoFingerprint(
   repoPath: string,
   maxFiles: number,
-  o: { exec?: (args: string[], timeoutMs?: number) => Promise<string>; log?: (msg: string, extra?: object) => void; timeoutMs?: number } = {},
+  o: { exec?: (args: string[], timeoutMs?: number) => Promise<string>; log?: (msg: string, extra?: object) => void; timeoutMs?: number; gitArgs?: readonly string[] } = {},
 ): Promise<string | null> {
   const timeoutMs = o.timeoutMs ?? gitStatusTimeoutMs(0);
   const exec = o.exec ?? (async (args: string[], timeout = 30_000) => (await run('git', args, { timeout, maxBuffer: 64 * 1024 * 1024 })).stdout);
   // The repo is mounted read-only: --no-optional-locks stops `git status` from trying to refresh the index.
-  const git = (...args: string[]) => exec(['--no-optional-locks', ...GIT_SAFE, '-C', repoPath, ...args]);
+  // gitArgs: a worktree's git dir reached through the roots mapping (worktreeGitArgs).
+  const base = ['--no-optional-locks', ...GIT_SAFE, '-C', repoPath, ...(o.gitArgs ?? [])];
+  const git = (...args: string[]) => exec([...base, ...args]);
   const status = (untracked: 'normal' | 'no') =>
-    exec(['--no-optional-locks', ...GIT_SAFE, '-C', repoPath, 'status', '--porcelain=v1', '-z', `--untracked-files=${untracked}`, '--', '.'], timeoutMs);
+    exec([...base, 'status', '--porcelain=v1', '-z', `--untracked-files=${untracked}`, '--', '.'], timeoutMs);
   let top: string;
   try {
     top = (await git('rev-parse', '--show-toplevel')).trim();
@@ -81,8 +92,22 @@ export async function repoFingerprint(
   return h.digest('hex');
 }
 
+/**
+ * The fallback when git cannot tell (not a repo, a worktree whose git dir is out of reach, `git status` failing): the
+ * path, size and mtime of every file a map would consider. Dearer than git (one lstat per candidate) but far cheaper
+ * than a rebuild; `fs:`-prefixed so it never equals a git fingerprint.
+ */
+export async function fileFingerprint(repoPath: string): Promise<string> {
+  const h = createHash('sha256');
+  for (const path of (await candidatePaths(repoPath)).sort()) {
+    const st = await lstat(join(repoPath, path)).catch(() => null);
+    h.update(st ? `${path}\0${st.size}\0${st.mtimeMs}\0` : `${path}\0gone\0`);
+  }
+  return `fs:${h.digest('hex')}`;
+}
+
 export type MapStageDeps = {
-  store: Pick<CodeGraphStore, 'codeMap' | 'codeMapMeta' | 'replaceCodeMap'>;
+  store: Pick<CodeGraphStore, 'codeMap' | 'codeMapMeta' | 'replaceCodeMap'> & Partial<Pick<CodeGraphStore, 'codeMapRebuildsRequested' | 'purgeOrphanCodeFiles'>>;
   activity?: Pick<ActivityStore, 'record'>;
   /** The selected projects (scope) and their folders, as the worker sees them. */
   projects(): Promise<{ key: string; repoPath: string }[]>;
@@ -90,9 +115,15 @@ export type MapStageDeps = {
   maxFiles: number | null;
   maxBytes: number;
   minIntervalMs?: number;
+  /** MAP_STALL_MS: how long one project may hold the background pass before kick() gives up on that pass. */
+  stallMs?: number;
   build?: (repoPath: string, opts: BuildOpts, prev?: CodeMap) => Promise<CodeMap>;
   churn?: typeof gitChurn;
-  fingerprint?: (repoPath: string, maxFiles: number, o?: { timeoutMs?: number }) => Promise<string | null>;
+  fingerprint?: (repoPath: string, maxFiles: number, o?: { timeoutMs?: number; gitArgs?: readonly string[] }) => Promise<string | null>;
+  /** The fallback fingerprint when git gives none (fileFingerprint). */
+  fsFingerprint?: (repoPath: string) => Promise<string | null>;
+  /** Extra global git options for a folder: a worktree's git dir through the roots mapping (worktreeGitArgs). */
+  gitArgs?: (repoPath: string) => Promise<string[]>;
   /** Files the project's sessions edited, most recent first (CodeGraphStore.editedPaths): kept in a capped map first. */
   editedPaths?: (projectKey: string) => Promise<string[]>;
   log?: (msg: string, extra?: object) => void;
@@ -108,6 +139,9 @@ export type MapStageDeps = {
 
 export type MapResult = CodeMapStats & { durationMs: number };
 
+/** The `why` of a map built because you asked for it (POST /api/projects/:key/codemap/rebuild). */
+const REBUILD_WHY = 'you asked for a rebuild of the map';
+
 const plural = (n: number, one: string, many = `${one}s`) => `${n} ${n === 1 ? one : many}`;
 
 /**
@@ -117,7 +151,13 @@ const plural = (n: number, one: string, many = `${one}s`) => `${n} ${n === 1 ? o
 export class MapStage {
   private readonly d: MapStageDeps;
   private readonly checkedAt = new Map<string, number>();
+  /** When orphan code files were last purged (d.now). */
+  private purgedAt: number | null = null;
+  /** Projects already logged as having no git fingerprint (said once, not every interval). */
+  private readonly noGitFingerprint = new Set<string>();
   private running: Promise<void> | null = null;
+  /** The background pass's current project and since when (d.now), for the stall check. */
+  private current: { key: string; since: number } | null = null;
   /** One build per project at a time: a scan's map waits for the background one on the same project. */
   private readonly building = new Map<string, Promise<MapResult | null>>();
   /** Aborted by stop(): parsing stops, nothing new starts, and a map not yet being written is not written. */
@@ -129,12 +169,23 @@ export class MapStage {
 
   /** Start a pass over the selected projects unless one is running. Never throws; nothing waits for it. */
   kick(): void {
-    if (this.running || this.stopping.signal.aborted) return;
-    this.running = this.pass()
+    if (this.stopping.signal.aborted) return;
+    if (this.running) {
+      const now = this.d.now ?? Date.now;
+      const stuck = this.current;
+      if (!stuck || now() - stuck.since < (this.d.stallMs ?? MAP_STALL_MS)) return;
+      // Nothing can cancel a hung read or git call: the pass is left behind (it stops at its next project), and the
+      // project's build no longer holds back the next one.
+      this.d.log?.('code map stage stalled', { project: stuck.key, runningMs: now() - stuck.since });
+      this.building.delete(stuck.key);
+      this.current = null;
+    }
+    const pass: Promise<void> = this.pass(() => this.running === pass)
       .catch((err) => this.d.log?.('code map pass failed', { error: String(err) }))
       .finally(() => {
-        this.running = null;
+        if (this.running === pass) this.running = null;
       });
+    this.running = pass;
   }
 
   /** Resolves when no pass is running (tests, shutdown). */
@@ -153,14 +204,37 @@ export class MapStage {
   }
 
   /** Map every selected project whose repo was not looked at within the interval and has changed since its map. */
-  async pass(): Promise<void> {
+  async pass(live: () => boolean = () => true): Promise<void> {
     const now = this.d.now ?? Date.now;
+    // Rebuilds you asked for (the Rebuild map button, `fg map rebuild`): pending until the map is built again.
+    const asked = new Map(((await this.d.store.codeMapRebuildsRequested?.().catch(() => [])) ?? []).map((r) => [r.projectKey, Date.parse(r.requestedAt)]));
     for (const p of await this.d.projects()) {
-      if (this.stopping.signal.aborted) return;
+      // Shutting down, or abandoned as stalled (a newer pass has taken over).
+      if (this.stopping.signal.aborted || !live()) return;
       const last = this.checkedAt.get(p.key);
-      if (last !== undefined && now() - last < (this.d.minIntervalMs ?? MAP_INTERVAL_MS)) continue;
+      const at = asked.get(p.key);
+      // Asked since this project was last looked at: now. A rebuild that failed waits for the interval like any other.
+      const fresh = at !== undefined && (last === undefined || at > last);
+      if (!fresh && last !== undefined && now() - last < (this.d.minIntervalMs ?? MAP_INTERVAL_MS)) continue;
       this.checkedAt.set(p.key, now());
-      await this.mapProject(p, null).catch(() => null);
+      this.current = { key: p.key, since: now() };
+      await this.mapProject(p, at !== undefined ? REBUILD_WHY : null, { force: at !== undefined }).catch(() => null);
+      if (live()) this.current = null;
+    }
+    if (!this.stopping.signal.aborted && live()) await this.purgeOrphans();
+  }
+
+  /** Files out of every map with nothing about them (see CodeGraphStore.purgeOrphanCodeFiles), once per interval. */
+  private async purgeOrphans(): Promise<void> {
+    const now = this.d.now ?? Date.now;
+    if (!this.d.store.purgeOrphanCodeFiles) return;
+    if (this.purgedAt !== null && now() - this.purgedAt < (this.d.minIntervalMs ?? MAP_INTERVAL_MS)) return;
+    this.purgedAt = now();
+    try {
+      const files = await this.d.store.purgeOrphanCodeFiles(ORPHAN_PURGE_LIMIT);
+      if (files > 0) this.d.log?.('orphan code files purged', { files });
+    } catch (err) {
+      this.d.log?.('orphan code file purge failed', { error: String(err) });
     }
   }
 
@@ -168,11 +242,11 @@ export class MapStage {
    * Map one project now if its repo changed since its map (any interval aside). `why` is the trigger for the log;
    * null: the background pass. Returns what was written, or null when nothing changed or the build failed.
    */
-  async mapProject(p: { key: string; repoPath: string }, why: string | null): Promise<MapResult | null> {
+  async mapProject(p: { key: string; repoPath: string }, why: string | null, o: { force?: boolean } = {}): Promise<MapResult | null> {
     const pending = this.building.get(p.key);
     if (pending) await pending.catch(() => null);
     if (this.stopping.signal.aborted) return null;
-    const job = this.build(p, why);
+    const job = this.build(p, why, !!o.force);
     this.building.set(p.key, job);
     try {
       return await job;
@@ -181,20 +255,34 @@ export class MapStage {
     }
   }
 
-  private async build(p: { key: string; repoPath: string }, why: string | null): Promise<MapResult | null> {
+  /** force: a rebuild you asked for, from scratch (no previous map reused), whether or not the repo changed. */
+  private async build(p: { key: string; repoPath: string }, why: string | null, force: boolean): Promise<MapResult | null> {
     const d = this.d;
     const t0 = Date.now();
     try {
       const meta = await d.store.codeMapMeta(p.key);
       const dirtyCap = d.maxFiles ?? MAX_AUTO_MAP_FILES;
       const timeoutMs = gitStatusTimeoutMs(meta?.candidates ?? meta?.stats.files ?? 0);
-      const fingerprint = d.fingerprint ? await d.fingerprint(p.repoPath, dirtyCap, { timeoutMs }) : await repoFingerprint(p.repoPath, dirtyCap, { log: d.log, timeoutMs });
-      if (meta && fingerprint !== null && meta.fingerprint === fingerprint) return null;
-      const prev = meta ? await d.store.codeMap(p.key) : null;
+      const gitArgs = d.gitArgs ? await d.gitArgs(p.repoPath).catch(() => []) : [];
+      let fingerprint = d.fingerprint
+        ? await d.fingerprint(p.repoPath, dirtyCap, { timeoutMs, gitArgs })
+        : await repoFingerprint(p.repoPath, dirtyCap, { log: d.log, timeoutMs, gitArgs });
+      if (fingerprint === null) {
+        // Without one the map would be rebuilt (and rewritten) every interval, forever: compare the files instead.
+        if (!this.noGitFingerprint.has(p.key)) {
+          this.noGitFingerprint.add(p.key);
+          d.log?.('code map fingerprint unavailable', { project: p.key, repoPath: p.repoPath, fallback: 'file sizes and times' });
+        }
+        fingerprint = await (d.fsFingerprint ?? fileFingerprint)(p.repoPath).catch(() => null);
+      }
+      if (!force && meta && fingerprint !== null && meta.fingerprint === fingerprint) return null;
+      // A stored map with no fingerprint is one whose write was cut short (the store clears it first, sets it last):
+      // what it holds may be half old, half new, so it is not reused for the incremental parse.
+      const prev = meta?.fingerprint && !force ? await d.store.codeMap(p.key) : null;
       const signal = this.stopping.signal;
       const priority = d.editedPaths ? await d.editedPaths(p.key).catch(() => []) : [];
       const map = await (d.build ?? buildCodeMap)(p.repoPath, { maxFiles: d.maxFiles, maxBytes: d.maxBytes, signal, priority }, prev ?? undefined);
-      const commits = await (d.churn ?? gitChurn)(p.repoPath, CHURN_DAYS);
+      const commits = await (d.churn ?? gitChurn)(p.repoPath, CHURN_DAYS, gitArgs);
       const tests = map.files.filter((f) => !f.isTest).flatMap((f) => testsFor(map, f.path).map((test) => ({ test, target: f.path })));
       const exclusive = d.exclusive ?? (<T>(fn: () => Promise<T>) => fn());
       const stats = await exclusive(async () => {

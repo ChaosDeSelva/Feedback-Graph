@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { api, type LinkRelation, type ProjectLink } from './api.ts';
 import { Button, Input, Select } from './ui/controls.tsx';
 import { Badge, Card } from './ui/display.tsx';
@@ -16,8 +16,18 @@ const otherEnd = (l: ProjectLink, key: string) => (l.a === key ? l.b : l.a);
  * Projects that belong with this one. Confirmed links give agents here the best matches from the other project (and
  * the other way round); suggestions come from evidence the worker found and do nothing until you confirm them.
  */
-export function ProjectLinks({ projectKey, projects, onError }: { projectKey: string; projects: string[]; onError: (e: string) => void }) {
+export function ProjectLinks({ projectKey, projects, onError, undoMs = 6000 }: { projectKey: string; projects: string[]; onError: (e: string) => void; undoMs?: number }) {
   const [links, setLinks] = useState<ProjectLink[]>([]);
+  // Suggestions you just confirmed or dismissed: they keep their row (faded, with Undo) for `undoMs`, so the list does
+  // not close up under the pointer and a slip can be taken back. Only then do they move to their list.
+  const [decided, setDecided] = useState<Map<string, 'confirmed' | 'dismissed'>>(new Map());
+  const timers = useRef(new Map<string, ReturnType<typeof setTimeout>>());
+  useEffect(() => () => { for (const t of timers.current.values()) clearTimeout(t); }, []);
+  const settle = (id: string) => {
+    clearTimeout(timers.current.get(id));
+    timers.current.delete(id);
+    setDecided((d) => { const n = new Map(d); n.delete(id); return n; });
+  };
   const [pick, setPick] = useState('');
   const [relation, setRelation] = useState<LinkRelation>('related');
   const [note, setNote] = useState('');
@@ -26,6 +36,7 @@ export function ProjectLinks({ projectKey, projects, onError }: { projectKey: st
   useEffect(() => {
     let stale = false;
     setLinks([]);
+    for (const id of [...timers.current.keys()]) settle(id);
     api.links(projectKey).then((l) => { if (!stale) setLinks(l); }, (e) => { if (!stale) onError(String(e)); });
     return () => { stale = true; };
   }, [projectKey]);
@@ -42,10 +53,21 @@ export function ProjectLinks({ projectKey, projects, onError }: { projectKey: st
     }
   }
   const decide = (other: string, patch: { status?: ProjectLink['status']; relation?: LinkRelation; note?: string }) => act(() => api.setLink({ a: projectKey, b: other, ...patch }));
+  async function decideSuggestion(l: ProjectLink, status: 'confirmed' | 'dismissed') {
+    setDecided((d) => new Map(d).set(l.id, status));
+    await decide(otherEnd(l, projectKey), { status });
+    timers.current.set(l.id, setTimeout(() => settle(l.id), undoMs));
+  }
+  async function undo(l: ProjectLink) {
+    settle(l.id);
+    await decide(otherEnd(l, projectKey), { status: 'suggested' });
+  }
 
-  const confirmed = links.filter((l) => l.status === 'confirmed');
-  const suggested = links.filter((l) => l.status === 'suggested');
-  const dismissed = links.filter((l) => l.status === 'dismissed');
+  // A manifest dependency first, then the strongest evidence.
+  const rank = (l: ProjectLink) => (l.relation === 'depends_on' ? 1 : 0);
+  const confirmed = links.filter((l) => l.status === 'confirmed' && !decided.has(l.id));
+  const suggested = links.filter((l) => l.status === 'suggested' || decided.has(l.id)).sort((x, y) => rank(y) - rank(x) || y.score - x.score);
+  const dismissed = links.filter((l) => l.status === 'dismissed' && !decided.has(l.id));
   const linked = new Set(confirmed.map((l) => otherEnd(l, projectKey)));
   const offer = projects.filter((p) => p !== projectKey && !linked.has(p));
 
@@ -78,20 +100,28 @@ export function ProjectLinks({ projectKey, projects, onError }: { projectKey: st
           <ul>
             {suggested.map((l) => {
               const other = otherEnd(l, projectKey);
+              const done = decided.get(l.id);
               return (
                 <li key={l.id} className="grid gap-1 border-b border-line px-3 py-2 last:border-b-0">
                   <div className="flex flex-wrap items-center justify-between gap-2">
-                    <span className="flex items-center gap-2">
+                    <span className={`flex items-center gap-2 transition-opacity ${done ? 'opacity-45' : ''}`}>
                       <span className="font-medium">{other}</span>
                       <Badge>{relationLabel(l.relation)}</Badge>
                       <span className="text-xs text-muted tabular-nums" title="strength of the evidence">{Math.round(l.score * 100)}%</span>
                     </span>
-                    <span className="flex gap-1">
-                      <Button size="sm" variant="primary" aria-label={`confirm link to ${other}`} disabled={busy} onClick={() => decide(other, { status: 'confirmed' })}>Confirm</Button>
-                      <Button size="sm" variant="ghost" aria-label={`dismiss link to ${other}`} disabled={busy} onClick={() => decide(other, { status: 'dismissed' })}>Dismiss</Button>
-                    </span>
+                    {done ? (
+                      <span role="status" className="flex items-center gap-2 text-xs text-muted">
+                        {done === 'confirmed' ? 'confirmed' : 'dismissed'} the link to {other}
+                        <Button size="sm" variant="ghost" disabled={busy} onClick={() => void undo(l)}>Undo</Button>
+                      </span>
+                    ) : (
+                      <span className="flex gap-1">
+                        <Button size="sm" variant="primary" aria-label={`confirm link to ${other}`} disabled={busy} onClick={() => void decideSuggestion(l, 'confirmed')}>Confirm</Button>
+                        <Button size="sm" variant="ghost" aria-label={`dismiss link to ${other}`} disabled={busy} onClick={() => void decideSuggestion(l, 'dismissed')}>Dismiss</Button>
+                      </span>
+                    )}
                   </div>
-                  <ul className="grid gap-0.5 text-xs text-muted">
+                  <ul className={`grid gap-0.5 text-xs text-muted transition-opacity ${done ? 'opacity-45' : ''}`}>
                     {l.evidence.map((e, i) => (
                       <li key={i} className="[overflow-wrap:anywhere]">
                         {e.detail}

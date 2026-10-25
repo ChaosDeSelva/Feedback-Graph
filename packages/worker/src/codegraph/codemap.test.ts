@@ -219,6 +219,23 @@ test('smoke: maps this repo\'s packages/core with sane counts, and graph/repo.ts
   expect(ms).toBeLessThan(20_000);
 });
 
+test('the map counts imports that look local but resolve to no file, so answers can say the import graph is incomplete', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'fbcodemap-'));
+  dirs.push(dir);
+  const w = (p: string, c: string) => { mkdirSync(join(dir, p, '..'), { recursive: true }); writeFileSync(join(dir, p), c); };
+  w('package.json', JSON.stringify({ name: 'shop', dependencies: { zod: '3' } }));
+  w('tsconfig.json', '{ "compilerOptions": { "paths": { "@app/*": ["src/*"] } } }');
+  w('src/a.ts', "import { b } from '@app/b';\nimport { gone } from '@app/gone';\nimport { x } from '@webapp-core/lib';\nimport { z } from 'zod';\nexport const a = 1;\n");
+  w('src/b.ts', "import { gone } from '@app/gone';\nexport const b = 1;\n");
+  const m = await buildCodeMap(dir, OPTS);
+  expect(edge(m, 'src/a.ts', 'src/b.ts')).toBeTruthy();
+  expect(m.unresolved).toBe(3);
+  const clean = mkdtempSync(join(tmpdir(), 'fbcodemap-'));
+  dirs.push(clean);
+  writeFileSync(join(clean, 'a.ts'), "import { z } from 'zod';\n");
+  expect((await buildCodeMap(clean, OPTS)).unresolved).toBe(0);
+});
+
 test('an aborted signal stops the build: it rejects instead of returning a partial map', async () => {
   const dir = fixture(false);
   const ac = new AbortController();
