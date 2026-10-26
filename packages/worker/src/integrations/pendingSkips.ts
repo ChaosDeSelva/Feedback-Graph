@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { authorKindOf, feedbackSkipRule, SKIP_RULES_VERSION, type ActivityStore, type DocsStore, type GraphStore, type PendingExternalItem } from '@fb/core';
+import { authorKindOf, feedbackSkipRule, foldsIntoInline, SKIP_RULES_VERSION, type ActivityStore, type DocsStore, type GraphStore, type PendingExternalItem } from '@fb/core';
 
 /**
  * The skip rules (core feedbackRules.ts) run once more over what is already pending in the Inbox, so a rule change
@@ -40,6 +40,28 @@ function ruleFor(i: PendingExternalItem, d: PendingSkipDeps) {
   return feedbackSkipRule(i.text, { ...i.external, authorKind: a.kind, authorVerified: a.verified });
 }
 
+/** How far apart a review's summary and its inline comments are posted (GitHub submits them together). */
+const REVIEW_SPAN_MS = 10 * 60_000;
+
+/**
+ * Review summaries synced before the sync folded them (feedbackSync prThread): a pending summary whose words are those
+ * of the same reviewer's pending inline comments on the same pull request, posted with it. By summary id: the inline
+ * comment's turn it folds into.
+ */
+function foldedSummaries(items: PendingExternalItem[]): Map<string, string> {
+  const out = new Map<string, string>();
+  for (const s of items) {
+    const e = s.external;
+    if (e.source !== 'github' || e.kind !== 'review' || e.foldedInto) continue;
+    const at = Date.parse(e.createdAt);
+    const inline = items.filter((c) =>
+      c.external.kind === 'review_comment' && c.external.thread === e.thread && c.external.author === e.author && !c.external.isReply &&
+      Math.abs(Date.parse(c.external.createdAt) - at) <= REVIEW_SPAN_MS);
+    if (foldsIntoInline(s.text, inline.map((c) => c.text))) out.set(s.id, inline[0].turnUuid);
+  }
+  return out;
+}
+
 /**
  * Skip every pending synced item a rule matches. `why` says what prompted it (the rules changed, the authors became
  * known). One comments_skipped entry per project, with per-rule counts, so Settings counts these beside the comments
@@ -47,19 +69,22 @@ function ruleFor(i: PendingExternalItem, d: PendingSkipDeps) {
  */
 export async function skipMatchingPending(d: PendingSkipDeps & { why: string }): Promise<{ skipped: number; byProject: Record<string, Record<string, number>> }> {
   const hits = new Map<string, { id: string; rule: string; text: string }[]>();
+  // All of them first: a review's summary folds into inline comments that can be on another page.
+  const pending: PendingExternalItem[] = [];
   let after: string | null = null;
   for (;;) {
     const page = await d.graph.pendingExternalItems({ limit: PAGE, afterId: after });
-    for (const i of page) {
-      if (d.projectKey && i.projectKey !== d.projectKey) continue;
-      const rule = ruleFor(i, d);
-      if (!rule) continue;
-      const note = `skipped by the ${rule.name} rule after it was flagged (skip rules v${SKIP_RULES_VERSION}): ${rule.description}`;
-      if (!(await d.graph.skipPendingItem(i.id, { rule: rule.name, note, by: SKIP_DECIDER }))) continue;
-      hits.set(i.projectKey, [...(hits.get(i.projectKey) ?? []), { id: i.id, rule: rule.name, text: i.text }]);
-    }
+    pending.push(...page.filter((i) => !d.projectKey || i.projectKey === d.projectKey));
     if (page.length < PAGE) break;
     after = page[page.length - 1].id;
+  }
+  const folds = foldedSummaries(pending);
+  for (const i of pending) {
+    const rule = ruleFor(folds.has(i.id) ? { ...i, external: { ...i.external, foldedInto: folds.get(i.id) } } : i, d);
+    if (!rule) continue;
+    const note = `skipped by the ${rule.name} rule after it was flagged (skip rules v${SKIP_RULES_VERSION}): ${rule.description}`;
+    if (!(await d.graph.skipPendingItem(i.id, { rule: rule.name, note, by: SKIP_DECIDER }))) continue;
+    hits.set(i.projectKey, [...(hits.get(i.projectKey) ?? []), { id: i.id, rule: rule.name, text: i.text }]);
   }
   const byProject: Record<string, Record<string, number>> = {};
   let skipped = 0;

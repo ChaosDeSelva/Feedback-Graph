@@ -5,6 +5,7 @@ import { cloudSchemas } from './cloud.ts';
 import { importSchemas } from './import.ts';
 import { integrationSchemas } from './integrations.ts';
 import { OWNER_ROUTES } from './operator.ts';
+import { runSchemas } from './runs.ts';
 import { sessionSchemas } from './sessions.ts';
 import { settingsSchemas } from './settings.ts';
 
@@ -110,13 +111,20 @@ const SCHEMAS: Record<string, JsonSchema> = {
     status: { type: 'string', enum: ['proposed', 'approved', 'rejected', 'superseded'] }, source: { type: 'string', enum: ['postmortem', 'memory', 'manual'] },
     cause: nullable(str), missId: nullable(str), createdAt: time, decidedAt: nullable(time), decidedBy: nullable(str),
     checks: nullable(arrayOf(ref('LessonCheck'))), decisionNote: nullable(str),
+    proposedAs: nullable(obj({ title: str, rule: str, appliesWhen: str, scope: str, paths: arrayOf(str) }, ['title', 'rule', 'appliesWhen', 'scope', 'paths'], 'What the post-mortem proposed, kept when the owner first edited it')),
   }, ['id', 'projectKey', 'title', 'rule', 'appliesWhen', 'scope', 'paths', 'status', 'source', 'cause', 'missId', 'createdAt', 'decidedAt']),
+  LessonQuality: obj({ days: int, asWritten: int, edited: int, rejected: int, decided: int }),
+  LessonQualityReport: obj({
+    windows: arrayOf(ref('LessonQuality')),
+    projects: { type: 'object', additionalProperties: arrayOf(ref('LessonQuality')), description: 'The same windows, by the project each lesson was learned in' },
+    capped: { const: true, description: 'More decisions than were counted' },
+  }, ['windows', 'projects']),
   LessonDetail: obj({ lesson: ref('Lesson'), miss: nullable(loose('The miss it was learned from')), feedback: nullable(loose('The feedback behind it')), contextItems: arrayOf(loose('What the agent had')), fixCommits: arrayOf(loose('A commit')), supersedes: arrayOf(ref('Lesson')) }, ['lesson']),
   ScanShards: obj({ total: int, rescanned: int, failed: int, done: { type: 'integer', description: 'While it runs: shards got through so far' } }, ['total', 'rescanned', 'failed']),
   ScanJob: obj({
     id: str, projectKey: str, repoPath: str, provider: nullable(str), status: { type: 'string', enum: ['queued', 'running', 'done', 'failed'] },
     requestedAt: time, startedAt: nullable(time), finishedAt: nullable(time), filesScanned: int, factsAdded: int, error: nullable(str),
-    attempts: int, retryAt: nullable(time), shards: nullable(ref('ScanShards')),
+    attempts: int, retryAt: nullable(time), shards: nullable(ref('ScanShards')), servedAt: nullable(time),
   }, ['id', 'projectKey', 'status', 'requestedAt', 'filesScanned', 'factsAdded', 'error']),
   ProjectSummary: obj({
     key: str, repoPath: str, remote: nullable(str), aliases: arrayOf(str), sessions: int, feedback: int, lessons: int, facts: int,
@@ -140,7 +148,8 @@ const SCHEMAS: Record<string, JsonSchema> = {
   Activity: obj({
     id: str, ts: time, kind: str, actor: { type: 'string', description: "'you', 'operator:<name>', a model id or an MCP client" }, projectKey: nullable(str),
     subject: str, why: str, details: { type: 'object', description: 'Per kind; details.via says how a write arrived: operator, browser or api', additionalProperties: true }, targets: arrayOf(str),
-  }),
+    run: { type: 'string', description: 'The run the request was labelled with (x-fg-run); absent when none' }, sandbox: { const: true, description: 'Present on a sandbox run (x-fg-sandbox)' },
+  }, ['id', 'ts', 'kind', 'actor', 'projectKey', 'subject', 'why', 'details', 'targets']),
   SystemStatus: obj({
     version: str, store: nullable({ type: 'string', enum: ['neo4j', 'postgres'] }), graph: bool, worker: nullable(loose('The worker heartbeat')), workerHealthy: bool,
     authRequired: bool, selection: nullable(obj({ initialized: bool, tracked: int, roots: int, note: nullable(str) }, ['initialized', 'tracked', 'note'])),
@@ -151,8 +160,14 @@ const SCHEMAS: Record<string, JsonSchema> = {
   PipelineStatus: obj({
     stage: nullable(obj({ name: str, startedAt: time, current: nullable(str) })), progress: nullable(obj({ done: int, total: nullable(int) })), sessions: nullable(int),
     classify: nullable(obj({ backlog: int, capped: bool })), inbox: nullable(obj({ pending: int, confirmed: int })), postmortems: nullable(obj({ queued: int })),
-    lessons: nullable(obj({ proposed: int, approved: int })), scans: nullable(obj({ done: int, queued: int, running: int, failed: int, never: int })),
+    lessons: nullable(obj({ proposed: int, approved: int, global: int, quality: arrayOf(ref('LessonQuality')) }, ['proposed', 'approved'])), scans: nullable(obj({ done: int, queued: int, running: int, failed: int, never: int })),
+    queues: obj({ scans: nullable(ref('WorkQueue')), classify: nullable(ref('WorkQueue')), postmortems: nullable(ref('WorkQueue')), chats: nullable(ref('WorkQueue')) }),
   }),
+  WorkQueue: obj({
+    waiting: int, capped: bool, oldestAt: nullable(time),
+    running: arrayOf(obj({ what: str, since: time, shards: nullable(obj({ done: int, total: int })) }, ['what', 'since'])),
+    projects: arrayOf(obj({ project: str, status: { type: 'string', enum: ['queued', 'running'] }, since: time, shards: nullable(obj({ done: int, total: int })) }, ['project', 'status', 'since'])),
+  }, ['waiting', 'oldestAt', 'running']),
   SessionSummary: loose('A session summary: id, projectKey, source, state, turnCount, lastActivityAt, snippet'),
   SessionDetail: loose('One session: its summary and history'),
   SettingsBody: obj({ tracked: arrayOf(str), candidates: arrayOf(loose('A project folder: key, path, exists, tracked, excluded, aliasOf, sessions')) }, ['tracked', 'candidates']),
@@ -175,6 +190,13 @@ const SCHEMAS: Record<string, JsonSchema> = {
 };
 
 const QUEUED = obj({ queued: { const: true } });
+const PER_KIND = loose('A count per kind: feedback, lesson, miss, predone_check, fact, doc, link, chat');
+const CLEANUP_PLAN = obj({
+  run: str, dryRun: bool, sandbox: bool, remove: PER_KIND,
+  kept: arrayOf(obj({ kind: str, id: str, why: str })),
+  changed: arrayOf(obj({ kind: str, subject: str, targets: arrayOf(str), ts: str })),
+  entries: int,
+});
 const RESULTS = (item: JsonSchema) => obj({ results: arrayOf(item) });
 
 /** DELETE /api/projects/:key checks this by hand: the project's name, typed again. */
@@ -215,6 +237,7 @@ const routes = (a = appSchemas): Record<string, Partial<Record<Method, Route>>> 
     GET: { tag: 'lessons', summary: 'One lesson with its evidence', response: 'LessonDetail' },
     PATCH: { tag: 'lessons', summary: 'Approve, reject or edit a lesson', body: a.LessonPatch, response: 'no content; 409 when a lesson with no project is narrowed', status: 204 },
   },
+  '/api/lessons/quality': { GET: { tag: 'lessons', summary: 'Of the decided post-mortem lessons in the last 30 and 90 days: approved as written, approved after an edit, rejected; in all and by project', query: a.QualityQuery, response: 'LessonQualityReport' } },
   '/api/lessons/decisions': { POST: { tag: 'lessons', summary: 'Approve or reject many lessons in one call, each recorded on its own (decidedBy, Activity); one not found does not stop the rest', body: a.LessonDecisions, response: '{ results: [{ id, ok, status? | error? }] }' } },
   '/api/lessons/recheck': { POST: { tag: 'lessons', summary: 'Re-run the lesson checks on every proposed and approved lesson at the worker\'s next round (flags only)', response: '{ queued: number }', status: 202 } },
   '/api/lessons/{id}/to-fact': {
@@ -230,7 +253,7 @@ const routes = (a = appSchemas): Record<string, Partial<Record<Method, Route>>> 
   '/api/projects/{key}/facts/{id}/relevance': { PATCH: { tag: 'projects', summary: 'Set how often everyday coding needs a fact', body: a.RelevanceRequest, response: 'no content', status: 204 } },
   '/api/projects/{key}/pin': { PUT: { tag: 'projects', summary: 'Pin or unpin a project', body: a.PinRequest, response: 'no content', status: 204 } },
   '/api/projects/{key}/docs': {
-    GET: { tag: 'docs', summary: 'A project\'s documents', response: 'Doc[]' },
+    GET: { tag: 'docs', summary: 'A project\'s documents, newest first, a page at a time (limit, default 100; X-Next-Cursor names the next page: send it as cursor)', query: a.DocsQuery, response: 'Doc[]' },
     POST: { tag: 'docs', summary: 'Upload a text document or an image', body: a.DocUpload, response: '{ id, chunks }', status: 201 },
   },
   '/api/docs/{id}': { DELETE: { tag: 'docs', summary: 'Remove a document', response: 'no content', status: 204 } },
@@ -277,6 +300,12 @@ const routes = (a = appSchemas): Record<string, Partial<Record<Method, Route>>> 
   '/api/sessions': { GET: { tag: 'sessions', summary: 'Session summaries, newest first, paged by cursor', query: sessionSchemas.ListQuery, response: '{ sessions, next }' } },
   '/api/sessions/{id}': { GET: { tag: 'sessions', summary: 'One session\'s summary and history', response: 'SessionDetail' } },
   '/api/sessions/{id}/resummarize': { POST: { tag: 'sessions', summary: 'Rebuild a session summary from scratch', response: '{ queued: true }', status: 202 } },
+  '/api/sessions/{id}/evidence': { GET: { tag: 'sessions', summary: 'What the tool saw in one session and decided: turns, the detector\'s call on each (and the skip rules), Inbox items with their post-mortem, miss and lesson, the context served (redacted)', response: 'SessionEvidence' } },
+
+  '/api/runs/{id}': {
+    GET: { tag: 'activity', summary: 'What cleaning up a labelled run (x-fg-run) would remove per kind, what stays and why, and what it changed that is not its own', response: 'CleanupPlan' },
+    DELETE: { tag: 'activity', summary: 'Clean up a run: a dry run unless dryRun is false; removes only what the run wrote and nobody outside it touched since; logged in Activity', body: runSchemas.CleanupBody, response: 'CleanupPlan & { removed }' },
+  },
 
   '/api/chats': {
     GET: { tag: 'ask', summary: 'Ask conversations of the shown projects', query: chatSchemas.ListChats, response: 'ChatConversation[]' },
@@ -316,6 +345,17 @@ const SCHEMA_OF: Record<string, JsonSchema> = {
   'GET /api/cloud/progress': obj({ running: nullable(obj({ done: int, total: int, current: nullable(str) })), lastManual: nullable(loose('The last Sync now')) }),
   'GET /api/sessions': obj({ sessions: arrayOf(ref('SessionSummary')), next: nullable(str) }),
   'POST /api/sessions/{id}/resummarize': QUEUED,
+  'GET /api/sessions/{id}/evidence': obj({
+    session: loose('The session: id, project, source, folder, branch, times, state, goal'),
+    turns: obj({ count: int, first: nullable(str), last: nullable(str), classified: int, waiting: int, givenUp: int, prunedText: int }),
+    files: nullable(obj({ edited: arrayOf(str), readOnly: arrayOf(str) })),
+    flags: arrayOf(obj({ uuid: str, index: int, ts: str, label: str, confidence: nullable(num), why: nullable(str), signals: arrayOf(str), skipped: arrayOf(str), flagged: bool, candidateId: nullable(str) })),
+    flagsLeftOut: int,
+    inbox: arrayOf(loose('An Inbox item: status, who decided, the post-mortem, its miss and lesson, its Activity')),
+    served: arrayOf(loose('Context served to the session (when the agent passed its session_id), with the lessons it named')),
+  }, ['session', 'turns', 'files', 'flags', 'inbox', 'served']),
+  'GET /api/runs/{id}': CLEANUP_PLAN,
+  'DELETE /api/runs/{id}': { allOf: [CLEANUP_PLAN, obj({ removed: loose('How many of each kind went (on a real run, not a dry run)') }, [])] },
 };
 
 /** The 2xx body's schema: the route's own, else the type `response` starts with (`Lesson`, `Candidate[]`). */

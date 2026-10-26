@@ -14,12 +14,12 @@
  * - Vectors of a different length than the query are skipped by searches, never an error.
  */
 import type { Config } from './config.ts';
-import type { ActivityInput, Activity, ActivityKind, Candidate, Classification, Commit, FactKind, LessonCheck, LessonCheckName, LessonFrom, LessonStatus, Lesson, ParsedSession, PendingExternalItem, PendingSessionItem, PostMortem, PostMortemInput, Project, ProjectSummary, RelevanceBy, ScanJob, ScanStatus, WorkerStatus, FactEvidence, FactOrigin } from './types.ts';
+import type { ActivityInput, Activity, ActivityKind, Candidate, Classification, Commit, FactKind, LessonCheck, LessonCheckName, LessonFrom, LessonStatus, Lesson, ParsedSession, PendingExternalItem, PendingSessionItem, PostMortem, PostMortemInput, Project, ProjectSummary, RelevanceBy, ScanJob, ScanQueueEntry, ScanStatus, WorkerStatus, FactEvidence, FactOrigin, RunItem, RunItemKind, RunOwner, RunPrincipal, RunTag, TurnEvidence, Cause } from './types.ts';
 import type { ProjectScope, ProjectSelection } from './scope.ts';
 import type { CallsAfter, CandidateDetail, CandidateFilter, ClassifiableTurn, StatsRow } from './graph/repo.ts';
 import type { LessonDetail, LessonHit, LessonInput, LessonPatch, RelatedMiss, UnsortedMiss } from './graph/knowledge.ts';
 import type { EmbeddedFact, FactHit, RelevanceUpdate, StoredFact, UnscoredFact } from './graph/facts.ts';
-import type { DocHit, DocInput, DocLink, DocSummary, DocToRead, UpsertDocOpts } from './graph/docs.ts';
+import type { DocHit, DocInput, DocLink, DocListOpts, DocSummary, DocToRead, UpsertDocOpts } from './graph/docs.ts';
 import type { TaskImage } from './llm/providers.ts';
 import type { DetectedLink, LinkPatch, ProjectLink } from './graph/links.ts';
 import type { EvidenceGraph, PatternReport } from './graph/insights.ts';
@@ -85,6 +85,11 @@ export interface GraphStore {
   recordClassifyFailure(turnUuid: string): Promise<void>;
   /** What the agent did after this turn (later turns' tool calls, then those after the last turn); null: no such turn. */
   callsAfter(turnUuid: string): Promise<CallsAfter | null>;
+  /**
+   * The instruction files the session's transcript shows its agent had (ParsedSession.instructionFiles); null when the
+   * session is unknown or was read before they were recorded.
+   */
+  sessionInstructionFiles(sessionId: string): Promise<string[] | null>;
   /** Unlabelled turns skipped for good after MAX_CLASSIFY_ATTEMPTS failed classifications. */
   givenUpTurns(): Promise<number>;
   /** Give those turns their attempts back so the classifier tries them again; returns how many. */
@@ -110,6 +115,12 @@ export interface GraphStore {
    */
   pendingSessionItems(q: { limit: number; afterId?: string | null }): Promise<PendingSessionItem[]>;
   /**
+   * The current redaction rules over every Inbox item's text: its turn's words, the agent's text before them and the
+   * classifier's summary, and the item's note and agent report, in place. Run once per REDACTION_VERSION at worker
+   * start. Returns how many items changed.
+   */
+  redactStoredCandidates?(): Promise<number>;
+  /**
    * A skip rule now matches a pending item: it is rejected, decided by `by` with `note`, and its turn gets the
    * `skip:<rule>` signal a comment skipped before the classifier has. Only while it is still pending, so a decision
    * made in the meantime stands; false when it was not pending (or is gone).
@@ -125,6 +136,11 @@ export interface GraphStore {
    * rejected by `by`, so a decision made since stands; false otherwise.
    */
   reopenRuleSkippedItem(id: string, s: { rule: string; by: string }): Promise<boolean>;
+  /**
+   * Set the work sessions a synced comment links (ExternalRef.linkedSessionIds), as a changed matching rule re-matches
+   * it; the comment's other details stay. False when the turn is not a synced comment (or is gone).
+   */
+  setExternalLinks(turnUuid: string, linkedSessionIds: string[]): Promise<boolean>;
   /** by: who decided ('you', or 'operator:<name>' for an agent with the operator token); default 'you'. */
   decide(id: string, status: 'confirmed' | 'rejected', note: string | null, by?: string): Promise<void>;
   /** keepUnsummarized: only turns a session summary already covers lose their text (summaries stay either way). */
@@ -148,7 +164,8 @@ export interface GraphStore {
 
 /**
  * Which lessons listLessons returns. projectKeys: see KnowledgeStore.listLessons. flag: only those whose checks hold it.
- * from: only those whose feedback came from there (Lesson.from).
+ * from: only those whose feedback came from there (Lesson.from). run: see KnowledgeStore.relatedMisses (a sandbox
+ * run's lessons are listed only to that run).
  */
 export type LessonFilter = {
   status?: LessonStatus;
@@ -157,15 +174,40 @@ export type LessonFilter = {
   limit?: number;
   flag?: LessonCheckName;
   from?: LessonFrom;
+  run?: string | null;
+};
+
+/** A lesson whose feedback is a synced comment (KnowledgeStore.commentLessons). */
+export type CommentLesson = {
+  id: string;
+  feedbackId: string;
+  projectKey: string;
+  text: string;
+  external: ExternalRef;
+  checks: LessonCheck[] | null;
+  missed: string;
+  causeExplanation: string;
+  /** The owner edited it while proposed (Lesson.proposedAs set): what a rule change may only flag, never change. */
+  ownerEdited: boolean;
 };
 
 export type SimilarLesson = { id: string; cosine: number; status: LessonStatus; createdAt: string };
+
+/**
+ * Which lessons decidedLessons returns: post-mortem lessons the owner approved or rejected (decidedAt set) since `since`,
+ * never a sandbox run's, learned in one of projectKeys (null: any project; a lesson with no project never). embedding:
+ * also score each by true cosine (-1..1) against it; null when unset or the sizes differ.
+ */
+export type DecidedLessonsQuery = { projectKeys: string[] | null; since: string; limit: number; embedding?: number[] | null };
+export type DecidedLesson = { lesson: Lesson; score: number | null };
 
 /** Post-mortems (feedback, miss, cause, lesson, context items, fix commits), lessons and their search. */
 export interface KnowledgeStore {
   feedbackNeedingPostmortem(limit: number, now?: Date): Promise<PostMortemInput[]>;
   /** How many still wait for a post-mortem: not rejected, none yet, not given up (those backing off count). */
   postmortemBacklog?(): Promise<number>;
+  /** The same backlog, and since when its oldest item has waited (its feedback's createdAt); null oldestAt: none waits. */
+  postmortemQueue?(): Promise<{ waiting: number; oldestAt: string | null }>;
   recordPostmortemFailure(feedbackId: string, error: string, now?: Date): Promise<{ attempts: number; retryAt: string | null }>;
   retryPostmortem(feedbackId: string): Promise<boolean>;
   savePostmortem(feedbackId: string, raw: PostMortem, embeddings: { miss: number[]; lesson: number[] }): Promise<void>;
@@ -187,18 +229,41 @@ export interface KnowledgeStore {
   /**
    * `by`: who decides, when the patch sets a status ('you' when unset; `operator:<name>` for the operator token).
    * `note`: why (kept as decisionNote); a status set without one clears the old note.
+   * The first edit of a proposed lesson's words, paths or scope keeps what the writer proposed (Lesson.proposedAs,
+   * redacted), so the owner's edit can teach the post-mortem (editedDraft).
+   * Only the owner's decisions and edits (ownerDecided: you, an operator) mark the lesson as yours, which a memory
+   * file's re-import respects; a machine's (`by` 'postmortem', 'session-match') records decidedBy and nothing more.
    */
   updateLesson(id: string, patch: LessonPatch, o: { reembed?: number[]; by?: string; note?: string }): Promise<{ unscoped: boolean }>;
+  /** The owner's decisions on post-mortem lessons (ownerDecided), newest decision first (DecidedLessonsQuery). */
+  decidedLessons?(q: DecidedLessonsQuery): Promise<DecidedLesson[]>;
   /**
    * Store what the lesson check found (redacted), replacing earlier checks, with the checks' version (default
    * LESSON_CHECKS_VERSION); nothing else changes. False: no such lesson. savePostmortem stamps the current version too.
    */
   setLessonChecks(id: string, checks: LessonCheck[], version?: number): Promise<boolean>;
   /**
+   * Replace a PROPOSED lesson's paths with the lesson check's normalized ones (worker recheck: bare names resolved, junk
+   * and missing files dropped); nothing else changes and it is not a decision. False: no such lesson, it is not
+   * proposed (an approved lesson's paths are the owner's, never rewritten), or the owner edited it (proposedAs set).
+   */
+  setLessonPaths?(id: string, paths: string[]): Promise<boolean>;
+  /**
    * Proposed and approved lessons whose checks are older than `version` (or were never made), oldest first: what the
    * worker re-checks.
    */
   staleLessonChecks?(version: number, limit: number): Promise<Lesson[]>;
+  /**
+   * Lessons with `status` whose feedback is a synced comment, by id after `afterId`: the comment's full details, its
+   * project and its miss, for what a changed session-matching rule looks at again (worker postmortem/rematch.ts).
+   */
+  commentLessons?(q: { status: LessonStatus; limit: number; afterId?: string | null }): Promise<CommentLesson[]>;
+  /**
+   * Lessons the rule before 0.6.2 marked as yours for a machine's decision (decidedBy not ownerDecided) and never
+   * edited by the owner (no proposedAs): the mark is cleared, so a memory file's re-import updates them again. Returns
+   * their ids; a second run finds none.
+   */
+  clearMachineOwnerMarks?(): Promise<string[]>;
   /** Mark every proposed and approved lesson's checks as old, so the worker re-checks them. Returns how many. */
   requestLessonRecheck?(): Promise<number>;
   /**
@@ -206,17 +271,65 @@ export interface KnowledgeStore {
    * project (or, for a lesson with no project, those with none), any status, best first. [] when it has no embedding.
    */
   similarLessons?(id: string, k: number): Promise<SimilarLesson[]>;
-  searchLessons(q: { embedding: number[]; projectKey: string | null; k: number; status?: LessonStatus; projectKeys?: string[] }): Promise<LessonHit[]>;
-  relatedMisses(q: { embedding: number[]; projectKey: string | null; k: number }): Promise<RelatedMiss[]>;
+  searchLessons(q: { embedding: number[]; projectKey: string | null; k: number; status?: LessonStatus; projectKeys?: string[]; run?: string | null }): Promise<LessonHit[]>;
+  /**
+   * run (here, in searchLessons, FactsStore.searchFacts and DocsStore.searchDocs): the asking agent's run (RunTag.id).
+   * What a sandbox run wrote is found only by that run; unset or null, no sandbox record is.
+   */
+  relatedMisses(q: { embedding: number[]; projectKey: string | null; k: number; run?: string | null }): Promise<RelatedMiss[]>;
   /**
    * An agent's report_feedback. Returns the Inbox item's id: a new `manual:<uuid>`, or the id of the detector's item
    * for the same miss that it was merged into (REPORT_MERGE_MINUTES, dedupe.ts). The detector merges the other way in
-   * GraphStore.saveClassification.
+   * GraphStore.saveClassification. run: the run the report was made in (a merged report keeps the item's own: none).
    */
-  createManualFeedback(input: { project: Project; cwd: string; text: string; whatWasDone: string; sessionId?: string | null }): Promise<string>;
-  recordPreDoneCheck(c: { projectKey: string; task: string; checkedLessonIds: string[]; gapLessonIds: string[] }): Promise<void>;
+  createManualFeedback(input: { project: Project; cwd: string; text: string; whatWasDone: string; sessionId?: string | null; run?: RunTag | null }): Promise<string>;
+  /** sessionId: the agent's session (check_before_done's session_id), so the session's evidence can list the check. */
+  recordPreDoneCheck(c: { projectKey: string; task: string; checkedLessonIds: string[]; gapLessonIds: string[]; run?: RunTag | null; sessionId?: string | null }): Promise<void>;
   upsertLesson(input: LessonInput): Promise<void>;
+  /**
+   * The current redaction rules (redactSecrets) over every stored lesson's title, rule and applies-when, in place.
+   * Run once per REDACTION_VERSION at worker start. Returns how many lessons changed.
+   */
+  redactStoredLessons?(): Promise<number>;
+  /**
+   * The current redaction rules over every miss's feedback text, what was missed and why, in place. Run once per
+   * REDACTION_VERSION at worker start. Returns how many misses (feedback included) changed.
+   */
+  redactStoredMisses?(): Promise<number>;
+  /**
+   * fg demo seed: a confirmed miss with the session, pushback turn, Inbox item (confirmed) and feedback (addressed) it
+   * hangs off, all under `m.id` (which must start with `demo:<project key>:`), redacted. Written again in place, so
+   * seeding twice keeps one. Returns the miss id (`miss:<id>`). Its session is manual: never listed or summarized.
+   */
+  saveDemoMiss?(m: DemoMiss): Promise<string>;
+  /**
+   * fg demo remove: exactly what the demo seed wrote in this project, and nothing else: lessons with source 'demo'
+   * (served there), the sessions under `demo:<key>:` with everything hanging off them (turns, Inbox items, feedback,
+   * misses, the files they touched), and current facts with source 'demo'. Returns how many of each it removed.
+   */
+  removeDemo?(projectKey: string): Promise<DemoRemoved>;
 }
+
+/** A demo miss (KnowledgeStore.saveDemoMiss). ts: when the pushback was made (ISO). */
+export type DemoMiss = {
+  project: Project;
+  id: string;
+  ts: string;
+  feedbackText: string;
+  whatWasDone: string;
+  missed: string;
+  cause: Cause;
+  causeExplanation: string;
+  embedding: number[];
+};
+export type DemoRemoved = { lessons: number; misses: number; facts: number };
+/** The prefix every id the demo seed writes in a project starts with. */
+export const demoPrefix = (projectKey: string) => `demo:${projectKey}:`;
+/**
+ * The source (and the file hash) the demo seed saves its facts with (FactsStore.saveFileFacts). No real file hashes to
+ * it, so a file row with this hash is one the demo added: removeDemo takes back exactly those.
+ */
+export const DEMO_SOURCE = 'demo';
 
 /** Code facts from scans, the files they are about, scan jobs, and the per-project summary. */
 export interface FactsStore {
@@ -233,7 +346,8 @@ export interface FactsStore {
   olderScannerFiles(version: string): Promise<Map<string, number>>;
   /**
    * A file's facts replaced. `version`: the scanner version that read it (fileScanVersions). The file's hashChangedAt
-   * moves only when its hash differs from the stored one.
+   * moves only when its hash differs from the stored one. Source DEMO_SOURCE (fg demo seed) never touches a file that
+   * is already recorded (its hash and summary stay a scan's): it adds the file only when there is none.
    */
   saveFileFacts(projectKey: string, rawFile: ScannedFile & { summary: string }, rawFacts: EmbeddedFact[], source: string, scanJobId?: string | null): Promise<void>;
   markFilesRemoved(projectKey: string, paths: string[]): Promise<void>;
@@ -268,24 +382,38 @@ export interface FactsStore {
   clearScanRequests(projectKey: string, paths: string[]): Promise<void>;
   /**
    * A fact you wrote (origin 'you'; source and relevanceBy are `by`): filed under the project, not a code file, so no
-   * scan closes or replaces it, and it never counts as a model's in currentSources. Redacted here.
+   * scan closes or replaces it, and it never counts as a model's in currentSources. Redacted here. run: written in it.
    */
-  addOwnerFact(projectKey: string, rawFact: EmbeddedFact, by: RelevanceBy): Promise<StoredFact>;
+  addOwnerFact(projectKey: string, rawFact: EmbeddedFact, by: RelevanceBy, run?: RunTag | null): Promise<StoredFact>;
   currentSources(projectKey: string): Promise<string[]>;
   /**
    * Current facts in path order. `origin`: only those from there (factOrigin, so older facts count by what they
-   * look like). `offset`: skip that many first (paging, with `limit`, default 500).
+   * look like). `offset`: skip that many first (paging, with `limit`, default 500). run: see KnowledgeStore.relatedMisses.
    */
-  listFacts(q: { projectKey: string; kind?: FactKind; path?: string; origin?: FactOrigin; limit?: number; offset?: number }): Promise<StoredFact[]>;
-  searchFacts(q: { embedding: number[]; projectKey: string; k: number }): Promise<FactHit[]>;
+  listFacts(q: { projectKey: string; kind?: FactKind; path?: string; origin?: FactOrigin; limit?: number; offset?: number; run?: string | null }): Promise<StoredFact[]>;
+  /** run: see KnowledgeStore.relatedMisses. */
+  searchFacts(q: { embedding: number[]; projectKey: string; k: number; run?: string | null }): Promise<FactHit[]>;
   /** Current facts of these projects that have no relevance yet, oldest path first. */
   unscoredFacts(q: { projectKeys: string[]; limit: number }): Promise<UnscoredFact[]>;
   /** Set relevance (clamped to 0..1). A 'model' update skips facts you scored. Returns how many facts changed. */
   setFactRelevance(updates: RelevanceUpdate[]): Promise<number>;
   requestScan(project: Project, provider: string | null): Promise<ScanJob>;
   scanJob(id: string): Promise<ScanJob | null>;
-  /** The oldest queued job that is due (its retryAt, if any, has passed), other than the `exclude` ids. */
+  /**
+   * The queued job that is due (its retryAt, if any, has passed) and has waited longest, other than the `exclude` ids.
+   * A job that gave up its slot (requeueScanJob) waits from then, behind every job queued before, so a big scan run
+   * shard by shard takes turns with the projects queued after it instead of holding the queue until its last shard. A
+   * job never served waits from when it was requested, or from when an agent asked for one of its project's files if
+   * that is older; a file request never moves a job that gave way back in front of the job it gave way to.
+   */
   nextScanJob(now?: Date, exclude?: string[]): Promise<ScanJob | null>;
+  /**
+   * Back in the queue after a shard so another scan can have the slot: queued, waiting from `now` (servedAt), its
+   * progress (factsAdded, filesScanned, shards) and attempts kept.
+   */
+  requeueScanJob(id: string, now?: Date): Promise<void>;
+  /** Every queued or running job: the running first (oldest start first), then the queued in the order nextScanJob serves them. */
+  scanQueue(): Promise<ScanQueueEntry[]>;
   /**
    * A run that did not finish. `counted` (a real failure): one more attempt, queued again after scanRetryAt, or
    * failed for good after MAX_SCAN_ATTEMPTS. Not counted (the model could not be asked): queued again after
@@ -297,6 +425,13 @@ export interface FactsStore {
   listProjects(): Promise<ProjectSummary[]>;
   /** Pin or unpin. A folder with no data yet is recorded as a project (its name and path kept if it had them). */
   setPinned(project: Project, pinned: boolean): Promise<void>;
+  /**
+   * The current redaction rules over every stored fact's statement and why, in place (current or not), as
+   * redactStoredFact decides: a current fact a rule matches now is closed (no longer served); a fact you wrote (origin
+   * you) is never closed and loses only known token shapes. Run once per REDACTION_VERSION at worker start. Returns
+   * how many facts changed, how many of them were closed, and how many of them were yours.
+   */
+  redactStoredFacts?(): Promise<{ redacted: number; closed: number; owner: number }>;
 }
 
 /** Documents that are not code (uploads, PR discussions, tickets) as embedded chunks, and integration sync cursors. */
@@ -326,31 +461,63 @@ export interface DocsStore {
    */
   requeueDocRead(id: string): Promise<boolean>;
   docImage(id: string): Promise<TaskImage | null>;
-  listDocs(projectKey: string): Promise<DocSummary[]>;
-  deleteDoc(id: string): Promise<boolean>;
-  searchDocs(q: { embedding: number[]; projectKey: string; k: number }): Promise<DocHit[]>;
+  /**
+   * A project's documents, newest first (ties by id), each with its chunk and fact counts. `limit` and `after` (the
+   * addedAt and id of the last one of the page before) page through them; `source` and `ref` find one by name. `run`: see KnowledgeStore.relatedMisses (another run's sandbox uploads
+   * are not listed).
+   */
+  listDocs(projectKey: string, o?: DocListOpts): Promise<DocSummary[]>;
+  /** run: only a document that run uploaded (false for anyone else's); unset: any (the owner). */
+  deleteDoc(id: string, o?: { run?: string | null }): Promise<boolean>;
+  /** run: see KnowledgeStore.relatedMisses (a chunk is its document's). */
+  searchDocs(q: { embedding: number[]; projectKey: string; k: number; run?: string | null }): Promise<DocHit[]>;
   /**
    * Pull requests and the Linear tickets they name, from either end: for a pull request's document, the project's
-   * tickets it names; for a ticket's, the project's pull requests that name it. Ordered by title.
+   * tickets it names; for a ticket's, the project's pull requests that name it. Ordered by title. run: see
+   * KnowledgeStore.relatedMisses.
    */
-  linkedDocs(q: { projectKey: string; docIds: string[] }): Promise<DocLink[]>;
+  linkedDocs(q: { projectKey: string; docIds: string[]; run?: string | null }): Promise<DocLink[]>;
+  /**
+   * The Linear ticket ids among `ids` that belong to this project: held as one of its documents (linear:<id>, synced
+   * from its mapped team) or named by one of its pull requests. Any order; none for an empty list.
+   */
+  projectTickets(q: { projectKey: string; ids: string[] }): Promise<string[]>;
   getCursor(key: string): Promise<string | null>;
   setCursor(key: string, value: string): Promise<void>;
+  /** Every cursor whose key starts with `prefix` (taken literally), in any order. */
+  cursorsWithPrefix(prefix: string): Promise<{ key: string; value: string }[]>;
+  /** Remove a cursor; none is fine. */
+  deleteCursor(key: string): Promise<void>;
+  /**
+   * The current redaction rules over every stored document's title and chunk texts, in place (embeddings are kept).
+   * Run once per REDACTION_VERSION at worker start. Returns how many titles and chunks changed.
+   */
+  redactStoredDocs?(): Promise<number>;
 }
 
 /** Links between projects: suggested by the worker's evidence, confirmed or dismissed by you, made by hand. */
 export interface LinksStore {
-  /** projectKey: links with it at either end. projectKeys: links with both ends in it (an empty list finds none). */
-  listLinks(q: { projectKey?: string; projectKeys?: string[] }): Promise<ProjectLink[]>;
+  /**
+   * projectKey: links with it at either end. projectKeys: links with both ends in it (an empty list finds none). run:
+   * see KnowledgeStore.relatedMisses (a link a sandbox run made is listed only to it, in place of the shared one).
+   */
+  listLinks(q: { projectKey?: string; projectKeys?: string[]; run?: string | null }): Promise<ProjectLink[]>;
   /**
    * One detection round over the `scanned` projects. New pairs become suggestions; a suggestion gets the new relation,
    * score and evidence; a link you decided keeps its status, relation and note and only gets fresh evidence. A
    * suggestion between scanned projects that this round did not find again is dropped. Returns how many are new.
    */
   replaceDetected(scanned: string[], found: DetectedLink[]): Promise<number>;
-  /** Your decision or edit; creates the link (confirmed, by you) when there is none. Throws for a project and itself. */
+  /**
+   * Your decision or edit; creates the link (confirmed, by you) when there is none. Throws for a project and itself.
+   * Ownership (patch.run): a sandbox run decides on its own row of the pair (linkIdOf with the run), made from the
+   * shared one, which listLinks shows that run instead; any other run edits only a link it made, and throws
+   * NotTheRunsError on the owner's or another run's unless patch.byOwner (the link is then the owner's). A decision
+   * with no run makes a run's link the owner's.
+   */
   setLink(x: string, y: string, patch: LinkPatch): Promise<ProjectLink>;
-  deleteLink(id: string): Promise<boolean>;
+  /** run: only a link that run made (false for anyone else's); unset: any (the owner). */
+  deleteLink(id: string, o?: { run?: string | null }): Promise<boolean>;
 }
 
 /** The provenance log: append-only, newest first. */
@@ -361,9 +528,14 @@ export interface ActivityStore {
    * bigger than this (as stored) are left out of the rows (`details: {}`, `detailsOmitted: true`), so a page of the log
    * does not carry a scan's whole report; get() has them.
    */
-  list(q: { projectKey?: string; projectKeys?: string[]; kind?: ActivityKind; target?: string; limit?: number; maxDetailBytes?: number }): Promise<Activity[]>;
+  list(q: { projectKey?: string; projectKeys?: string[]; kind?: ActivityKind; target?: string; run?: string; limit?: number; maxDetailBytes?: number }): Promise<Activity[]>;
   /** One entry, details and all; null when there is none. */
   get(id: string): Promise<Activity | null>;
+  /**
+   * The current redaction rules over every entry's subject, why and details, in place. Run once per REDACTION_VERSION
+   * at worker start. Returns how many entries changed.
+   */
+  redactStoredActivity?(): Promise<number>;
 }
 
 /** Read-only views: one project's evidence graph, and patterns across misses. */
@@ -375,7 +547,11 @@ export interface InsightsStore {
 
 /** Export of derived knowledge, and deleting a project with everything learned from it. */
 export interface PortabilityStore {
-  exportData(o?: { projectKey?: string; approvedOnly?: boolean }): Promise<ExportBundle>;
+  /**
+   * projectKey: one project. projectKeys (with no projectKey): only these projects, and global lessons learned in one of
+   * them or in none; an empty list exports nothing. Neither: everything stored.
+   */
+  exportData(o?: { projectKey?: string; projectKeys?: string[]; approvedOnly?: boolean }): Promise<ExportBundle>;
   /** Returns how many records were deleted (backends count differently; callers only show it). */
   deleteProject(key: string): Promise<number>;
 }
@@ -441,16 +617,20 @@ export interface CodeGraphStore {
   sessionFiles(sessionId: string): Promise<SessionFile[]>;
   /** Paths the project's sessions edited, most recently edited first (then path), at most `limit`. */
   editedPaths(projectKey: string, limit: number): Promise<string[]>;
-  /** A mapped file with its symbols, importers, imports, tests, facts, misses and approved lessons; null if not mapped. */
-  moduleContext(projectKey: string, path: string): Promise<ModuleContext | null>;
+  /**
+   * A mapped file with its symbols, importers, imports, tests, facts, misses and approved lessons; null if not mapped.
+   * run (here, in impact, hotspots, mapGraph and lessonsForPaths): see KnowledgeStore.relatedMisses. Another run's
+   * sandbox misses, lessons and facts are never in these views, nor counted in them.
+   */
+  moduleContext(projectKey: string, path: string, run?: string | null): Promise<ModuleContext | null>;
   /** What changing these files touches: dependents up to `depth`, tests to run, misses and lessons on them. */
-  impact(projectKey: string, paths: string[], depth: number): Promise<Impact>;
+  impact(projectKey: string, paths: string[], depth: number, run?: string | null): Promise<Impact>;
   /** Mapped files by score (misses, churn, dependents), highest first, ties by path. Test files only with includeTests. */
   hotspots(projectKey: string, limit: number, opts?: HotspotOpts): Promise<Hotspot[]>;
   /** The map as a graph: the top files by score, their neighbours, the edges among them, and their misses and lessons. */
   mapGraph(projectKey: string, opts: HotspotOpts & { limit: number }): Promise<MapGraph>;
   /** Approved lessons (global ones included) whose paths cover one of these files or whose miss edited one. */
-  lessonsForPaths(projectKey: string, paths: string[]): Promise<{ lesson: Lesson; paths: string[] }[]>;
+  lessonsForPaths(projectKey: string, paths: string[], run?: string | null): Promise<{ lesson: Lesson; paths: string[] }[]>;
   /** Of these paths, the files past the cap (in the import index, not the map), with their importers and tests. */
   outsideMap(projectKey: string, paths: string[]): Promise<OutsideFile[]>;
 }
@@ -475,6 +655,13 @@ export interface SessionsStore {
   setState(sessionId: string, state: SessionState): Promise<void>;
   /** The next update rebuilds the summary from the first turn. The current one is served until then. False: no such session. */
   requestRebuild(sessionId: string): Promise<boolean>;
+  /** Every turn of the session in order, without its words: what the detector made of it (GET /api/sessions/:id/evidence). */
+  turnEvidence(sessionId: string): Promise<TurnEvidence[]>;
+  /**
+   * The current redaction rules over every session's summary and final reply, in place. Run once per
+   * REDACTION_VERSION at worker start. Returns how many sessions changed.
+   */
+  redactStoredSummaries?(): Promise<number>;
 }
 
 /**
@@ -485,7 +672,8 @@ export interface SessionsStore {
 export interface ChatStore {
   /** Newest activity first. projectKeys: only these (an empty list finds none); unset: every project. */
   listConversations(q: { projectKeys?: string[] }): Promise<ChatConversation[]>;
-  createConversation(input: { projectKey: string; title: string; provider: ChatProvider | null }): Promise<ChatConversation>;
+  /** run: the run it was started in (RunTag.id). */
+  createConversation(input: { projectKey: string; title: string; provider: ChatProvider | null; run?: string | null }): Promise<ChatConversation>;
   /** Rename or switch provider; null when there is no such conversation. */
   updateConversation(id: string, patch: { title?: string; provider?: ChatProvider | null }): Promise<ChatConversation | null>;
   /** The conversation with its turns in order; null when missing. */
@@ -509,6 +697,34 @@ export interface ChatStore {
   deleteConversation(id: string): Promise<boolean>;
   /** Turns left answering by a worker that died go back to pending (on startup). Returns how many. */
   requeueStaleTurns(): Promise<number>;
+  /**
+   * Questions waiting for an answer (pending assistant turns) and since when the oldest has, and the turns being
+   * answered now, oldest start first.
+   */
+  chatQueue(): Promise<{ waiting: number; oldestAt: string | null; running: { id: string; projectKey: string; startedAt: string }[] }>;
+}
+
+/**
+ * What runs wrote (RunTag): every write a labelled request makes records its run id, so cleaning up after a test run
+ * removes exactly that. Activity entries keep theirs too, but the log is never removed.
+ */
+export interface RunsStore {
+  /** Every record stored with this run id; lessons and misses name the report they came from as `group`. */
+  items(run: string): Promise<RunItem[]>;
+  /**
+   * Delete what the run wrote, except `keep` (record ids; a report's id, or its lesson's or miss's, keeps all three): a
+   * report with its stand-in session, its post-mortem (miss, lesson, context items), a pre-done check, a fact, a
+   * document with its chunks and the facts read from it, a link, a conversation with its turns. A report the detector
+   * then found in a real session (RunItem.merged) is that session's and stays. Returns how many of each kind went.
+   */
+  remove(run: string, keep: string[]): Promise<Record<RunItemKind, number>>;
+  /**
+   * Record who opened `run`, if no one has yet, and return its owner: the stored one when the run was already opened
+   * (by this principal or another), else the new one. Atomic, so two first writes race to one owner.
+   */
+  claim(run: string, principal: RunPrincipal): Promise<RunOwner>;
+  /** Who opened `run`; null for a run never opened, or one opened before owners were recorded. */
+  owner(run: string): Promise<RunOwner | null>;
 }
 
 /** One backend, opened: every repository over one connection, plus the lifecycle the services need. */
@@ -527,6 +743,7 @@ export interface Store {
   readonly codegraph: CodeGraphStore;
   readonly sessions: SessionsStore;
   readonly chats: ChatStore;
+  readonly runs: RunsStore;
   /** Create or upgrade the schema (Neo4j constraints and indexes; Postgres migrations). Safe from two services at once. */
   ensureSchema(): Promise<void>;
   /** Whether the database answers. Never throws. */

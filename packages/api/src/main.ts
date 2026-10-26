@@ -1,10 +1,11 @@
 import { existsSync } from 'node:fs';
 import { serve } from '@hono/node-server';
-import { ConfigError, credentialFile, Integrations, loadConfig, makeProviderOr, redactSecrets, ollamaEmbed, ollamaPing, projectFolders, refreshLayout, shownProjects, storedSyncMemory, syncProjects, VERSION, type Project } from '@fb/core';
+import { ConfigError, credentialFile, Integrations, loadConfig, makeProviderOr, redactSecrets, ollamaEmbed, ollamaPing, projectFolders, refreshLayout, shownProjects, storedSyncMemory, syncProjects, VERSION, worktreeGitArgs, type Project } from '@fb/core';
 import { openStore } from '@fb/store-postgres';
 import { createApp } from './app.ts';
-import { buildChatContext } from './chat.ts';
-import { hashRepoFile, makeJudge, type ContextDeps } from './context.ts';
+import { chatPackBuilder } from './chat.ts';
+import { hashRepoFile, makeJudge, resolveProject, type ContextDeps } from './context.ts';
+import { readRepoDiff } from './diff.ts';
 import { rootsFile } from './roots.ts';
 
 const log = (msg: string, extra: object = {}) => console.log(JSON.stringify({ ts: new Date().toISOString(), msg, ...extra }));
@@ -104,6 +105,8 @@ const contextDeps: ContextDeps = {
   servesGlobal: (key: string) => !config.excludeProjects.includes(key),
   exists: existsSync,
   fileHash: hashRepoFile,
+  // check_before_done with no diff: the change to files_changed, read-only from the mounted folder.
+  repoDiff: async (repoPath: string, files: string[]) => readRepoDiff(repoPath, files, { gitArgs: await worktreeGitArgs(repoPath, roots) }),
   // Files an agent named that have no facts yet go to the front of the project's next scan.
   requestScan: (key: string, paths: string[]) => facts.requestFilesScan(key, paths),
   aliasOf: (key: string) => store.graph.projectByAlias(key),
@@ -137,6 +140,15 @@ const app = createApp(store.graph, {
   inScope: async (key: string) => (await scope()).project(key),
   shown,
   importer: { knowledge, facts, embed, activity, excluded: config.excludeProjects },
+  demo: {
+    knowledge,
+    facts,
+    codegraph: store.codegraph,
+    embed,
+    activity,
+    project: (key: string) => resolveProject({ project: key }, roots, { exists: existsSync }),
+    selected: async (key: string) => (await selection.current()).tracked.includes(key),
+  },
   integrations: {
     integrations,
     projects: integrationProjects,
@@ -148,6 +160,15 @@ const app = createApp(store.graph, {
     store: store.sessions,
     projects: async () => (await shown()).keys,
     inScope: async (key: string) => (await shown()).has(key),
+  },
+  runs: store.runs,
+  evidence: {
+    sessions: store.sessions,
+    inScope: async (key: string) => (await shown()).has(key),
+    candidateDetail: (id) => store.graph.candidateDetail(id),
+    lessonDetail: (id) => knowledge.lessonDetail(id),
+    sessionFiles: (id) => store.codegraph.sessionFiles(id),
+    activity,
   },
   auth: { token: config.apiToken ?? undefined, publicHosts: config.publicHosts, operator: config.operator ?? undefined },
   system: { version: VERSION, store: store.kind, roots: roots.length, ping: () => store.ping(), worker: () => store.graph.workerStatus(), selection: () => selection.current(), givenUpTurns: () => store.graph.givenUpTurns(),
@@ -166,7 +187,8 @@ const app = createApp(store.graph, {
   context: contextDeps,
   chat: {
     store: store.chats,
-    build: (key, question, history) => buildChatContext(key, question, history, { context: contextDeps, codeMap: (k) => store.codegraph.codeMap(k) }),
+    // As the asking request sees the stores (runScoped): a sandbox run's records reach only its own turns.
+    build: chatPackBuilder({ context: contextDeps, codeMap: (k) => store.codegraph.codeMap(k) }),
   },
   log,
 });

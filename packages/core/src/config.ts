@@ -4,7 +4,7 @@ import type { Root } from './projects.ts';
 import { DEFAULT_NUM_CTX, DEFAULT_NUM_PREDICT, DEFAULT_OLLAMA_TIMEOUT_MS, DEFAULT_REPEAT_PENALTY } from './ollama.ts';
 
 /** Bumped with each release; reported by /api/status and the worker heartbeat. */
-export const VERSION = '0.6.1';
+export const VERSION = '0.6.2';
 
 export class ConfigError extends Error {
   readonly problems: string[];
@@ -182,17 +182,19 @@ export function cloudUrlProblem(raw: string): string | null {
  * routes createApp guards with ownerOnly.
  */
 export const OPERATOR_VERBS = [
-  'select_projects', 'settings', 'scan', 'inbox_decide', 'lesson_decide', 'relevance', 'pin', 'links', 'docs', 'docs_delete',
+  'select_projects', 'settings', 'scan', 'inbox_decide', 'lesson_decide', 'relevance', 'pin', 'links', 'links_delete', 'docs', 'docs_delete',
   'delete_project', 'retry', 'requeue', 'sync_now', 'import', 'resummarize', 'integrations', 'chat', 'chat_delete',
+  // Removes what one labelled run (x-fg-run) wrote and nothing else, so it is on by default (DELETE /api/runs/:id).
+  'run_cleanup',
 ] as const;
 export type OperatorVerb = (typeof OPERATOR_VERBS)[number];
 /**
- * Off unless OPERATOR_ALLOW names them: deciding lessons (what agents are taught), and what deletes data (deleting a
- * project, an uploaded document or an Ask conversation; settings, whose cleanup deletes unselected projects' data), imports
- * lessons from a file, or sets integration keys; and `chat` (asking in Ask), which spends the owner's Claude or Codex
- * subscription.
+ * Off unless OPERATOR_ALLOW names them: deciding lessons (what agents are taught), choosing which project folders are read
+ * (projects are the owner's opt-in), and what deletes data (deleting a project, an uploaded document, a link between
+ * projects or an Ask conversation; settings, whose cleanup deletes unselected projects' data), imports lessons from a
+ * file, or sets integration keys; and `chat` (asking in Ask), which spends the owner's Claude or Codex subscription.
  */
-const OPERATOR_DEFAULT_OFF: readonly OperatorVerb[] = ['lesson_decide', 'delete_project', 'docs_delete', 'settings', 'import', 'integrations', 'chat', 'chat_delete'];
+const OPERATOR_DEFAULT_OFF: readonly OperatorVerb[] = ['lesson_decide', 'select_projects', 'delete_project', 'docs_delete', 'links_delete', 'settings', 'import', 'integrations', 'chat', 'chat_delete'];
 
 /** FG_OPERATOR_TOKEN: agents (the `fg` CLI) may make the owner decisions in `allow`. Never log `token`. */
 export type OperatorConfig = { token: string; allow: OperatorVerb[] };

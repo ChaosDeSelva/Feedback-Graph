@@ -15,6 +15,14 @@ test('every key in .env.example is used by docker-compose.yml', () => {
   expect(missing).toEqual([]);
 });
 
+test('the project name is FG_INSTANCE, defaulting to the name every earlier install has (so their volumes keep their names)', () => {
+  const compose = readFileSync(join(repo, 'docker-compose.yml'), 'utf8');
+  expect(compose).toMatch(/^name: \$\{FG_INSTANCE:-feedback-graph\}$/m);
+  // Only the project name prefixes containers and volumes: nothing pins its own name across installs.
+  expect(compose).not.toMatch(/^\s+container_name:/m);
+  expect(compose).not.toMatch(/^\s+name: /m);
+});
+
 test('docker-compose.yml mounts no project folder: the roots come only from the override setup.sh generates', () => {
   const compose = readFileSync(join(repo, 'docker-compose.yml'), 'utf8');
   for (const gone of ['${PROJECTS_DIR', '${FEEDBACK_TOOL_DIR', '/examples', ':/vibe', 'PROJECT_ROOTS:', '${HOME}/code']) {
@@ -65,4 +73,11 @@ test('docker-compose.yml comments do not contradict the settings they describe',
   // CLOUD_URL allows plain http to this machine and to the host as the containers see it; SCAN_MAX_FILES scales.
   expect(compose).not.toContain('plain http only to localhost');
   expect(compose).not.toMatch(/400 files, 80000 bytes/);
+});
+
+test('the bundled ollama publishes on OLLAMA_PORT (11435 by default), so a second install can move it', () => {
+  const compose = readFileSync(join(repo, 'docker-compose.yml'), 'utf8');
+  const ollama = compose.slice(compose.indexOf('\n  ollama:'), compose.indexOf('\nvolumes:'));
+  expect(ollama).toContain('- "127.0.0.1:${OLLAMA_PORT:-11435}:11434"');
+  expect(readFileSync(join(repo, '.env.example'), 'utf8')).toMatch(/^OLLAMA_PORT=$/m);
 });

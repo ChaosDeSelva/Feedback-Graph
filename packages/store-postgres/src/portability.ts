@@ -54,22 +54,25 @@ export class PgPortabilityStore implements PortabilityStore {
     this.db = db;
   }
 
-  async exportData(o: { projectKey?: string; approvedOnly?: boolean } = {}): Promise<ExportBundle> {
+  async exportData(o: { projectKey?: string; projectKeys?: string[]; approvedOnly?: boolean } = {}): Promise<ExportBundle> {
     const key = o.projectKey ?? null;
+    // null: no list to apply (one project by key, or everything).
+    const keys = key === null && o.projectKeys ? o.projectKeys : null;
     const approvedOnly = !!o.approvedOnly;
     // One snapshot for the whole bundle, so a write landing mid-export cannot leave it half old, half new.
     const [projects, lessons, misses, facts, docs] = await tx(this.db, async (c: pg.PoolClient) => {
       await c.query('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY');
       const q = async (sql: string, params: unknown[]) => (await c.query(sql, params)).rows;
       return [
-        await q(`SELECT key, remote FROM projects WHERE $1::text IS NULL OR key = $1 ORDER BY key COLLATE "C"`, [key]),
+        await q(`SELECT key, remote FROM projects WHERE ($1::text IS NULL OR key = $1) AND ($2::text[] IS NULL OR key = ANY($2)) ORDER BY key COLLATE "C"`, [key, keys]),
         await q(
           `SELECT id, project_key, title, rule, applies_when, scope, paths, status, source, cause, miss_id, created_at, decided_at
            FROM lessons
            WHERE ($1::text IS NULL OR project_key = $1 OR (project_key IS NULL AND origin_project_key = $1))
-             AND (NOT $2 OR status = 'approved')
+             AND ($3::text[] IS NULL OR coalesce(project_key, origin_project_key) IS NULL OR coalesce(project_key, origin_project_key) = ANY($3))
+             AND (NOT $2 OR status = 'approved') AND NOT sandbox
            ORDER BY created_at, id COLLATE "C"`,
-          [key, approvedOnly],
+          [key, approvedOnly, keys],
         ),
         await q(
           `SELECT m.id, m.project_key, m.missed, m.cause, m.cause_explanation, f.text AS feedback_text, f.created_at AS ts,
@@ -78,20 +81,20 @@ export class PgPortabilityStore implements PortabilityStore {
                             FROM context_item_misses w JOIN context_items ci ON ci.id = w.context_item_id
                             WHERE w.miss_id = m.id), '[]'::json) AS items
            FROM misses m JOIN feedback f ON f.id = m.feedback_id
-           WHERE $1::text IS NULL OR m.project_key = $1
+           WHERE ($1::text IS NULL OR m.project_key = $1) AND ($2::text[] IS NULL OR m.project_key = ANY($2)) AND NOT m.sandbox
            ORDER BY f.created_at, m.id COLLATE "C"`,
-          [key],
+          [key, keys],
         ),
         await q(
           `SELECT path, lines, kind, statement, why, confidence, source, created_at, project_key
-           FROM facts WHERE current AND doc_id IS NULL AND ($1::text IS NULL OR project_key = $1)
+           FROM facts WHERE current AND doc_id IS NULL AND ($1::text IS NULL OR project_key = $1) AND ($2::text[] IS NULL OR project_key = ANY($2)) AND NOT sandbox
            ORDER BY project_key COLLATE "C", path COLLATE "C", statement COLLATE "C", id COLLATE "C"`,
-          [key],
+          [key, keys],
         ),
         await q(
-          `SELECT id, project_key, source, ref, title, url FROM docs WHERE $1::text IS NULL OR project_key = $1
+          `SELECT id, project_key, source, ref, title, url FROM docs WHERE ($1::text IS NULL OR project_key = $1) AND ($2::text[] IS NULL OR project_key = ANY($2)) AND NOT sandbox
            ORDER BY project_key COLLATE "C", id COLLATE "C"`,
-          [key],
+          [key, keys],
         ),
       ];
     });

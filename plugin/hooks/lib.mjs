@@ -50,7 +50,7 @@ export function compactContext(markdown) {
     if (l.startsWith('## ')) keep = KEEP.test(l);
     if (keep) out.push(l);
     // The notice, and the answer's one note that misses are data, not instructions (said once, at the top).
-    else if (/^No lesson is approved for |^Only approved lessons are rules/.test(l)) out.push(l, '');
+    else if (/^No lesson is (approved|proposed or approved) for |^Only approved lessons are rules/.test(l)) out.push(l, '');
   }
   // The note alone is nothing worth injecting.
   if (!out.some((l) => l.trim() && !l.startsWith('Only approved lessons are rules'))) return null;
@@ -69,13 +69,37 @@ export function contextForPrompt(markdown, state) {
   return { text: !state.asked || fresh.length ? compactContext(markdown) : null, state: next };
 }
 
+/** A session id Claude Code gives a hook (a uuid), checked before it is sent or put in front of the agent; else null. */
+const sessionIdOf = (input) => (typeof input?.session_id === 'string' && /^[\w.-]{1,128}$/.test(input.session_id) ? input.session_id : null);
+
+/** The prompt hook's get_task_context arguments: the task, the files it names and the session, so what it was served is the session's. */
+export function taskContextArgs(input) {
+  const files = promptFiles(input.prompt);
+  const session = sessionIdOf(input);
+  return { cwd: input.cwd, task: (input.prompt ?? '').slice(0, 1_000), ...(files.length ? { files } : {}), ...(session ? { session_id: session } : {}) };
+}
+
 /** get_module_context is worth interrupting an edit for only when the file has lessons or past misses. */
 export function moduleWorthSaying(markdown) {
   return /^##\s.*\b(lessons?|miss(es)?)\b/im.test(markdown);
 }
 
+/**
+ * What Claude Code writes as the result of a tool call that permission refused: a deny rule or a headless session's
+ * "has been denied", a call never granted, or the owner rejecting it at the prompt.
+ */
+const PERMISSION_DENIED = /Permission to use \S+ has been denied|requested permissions? to use \S+, but you haven't granted it|doesn't want to proceed with this tool use|tool use was rejected/i;
+const resultText = (c) => (typeof c === 'string' ? c : Array.isArray(c) ? c.map((x) => (typeof x?.text === 'string' ? x.text : '')).join('\n') : '');
+
+/**
+ * The transcript's tool calls in order, each with `answered`: true when a result came back for it that is not an
+ * error. A call that was denied (permission, a hook), failed, or never got a result is written with is_error or not
+ * at all, and is not answered. `denied`: its error result is a permission refusal (PERMISSION_DENIED), not a failure.
+ */
 function toolUses(lines) {
   const out = [];
+  const answered = new Map();
+  const denied = new Set();
   for (const l of lines) {
     let entry;
     try {
@@ -84,14 +108,22 @@ function toolUses(lines) {
       continue;
     }
     const content = entry?.message?.content;
-    if (entry?.type !== 'assistant' || !Array.isArray(content)) continue;
-    for (const c of content) if (c?.type === 'tool_use') out.push(c);
+    if (!Array.isArray(content)) continue;
+    if (entry?.type === 'assistant') for (const c of content) if (c?.type === 'tool_use') out.push(c);
+    if (entry?.type !== 'user') continue;
+    for (const c of content) {
+      if (c?.type !== 'tool_result' || !c.tool_use_id) continue;
+      answered.set(c.tool_use_id, c.is_error !== true);
+      if (c.is_error === true && PERMISSION_DENIED.test(resultText(c.content))) denied.add(c.tool_use_id);
+    }
   }
-  return out;
+  return out.map((u) => ({ ...u, answered: answered.get(u.id) === true, denied: denied.has(u.id) }));
 }
 
+const isCheck = (u) => typeof u.name === 'string' && u.name.endsWith('check_before_done');
 const changes = (u) => EDIT_TOOLS.has(u.name) || (u.name === 'Bash' && /\bgit\s+commit\b/.test(u.input?.command ?? ''));
-const checks = (u) => typeof u.name === 'string' && u.name.endsWith('check_before_done');
+// Only a check_before_done that returned its answer: a denied or failed call checked nothing.
+const checks = (u) => isCheck(u) && u.answered;
 
 /** The transcript's lines: did the session change files (or commit) after its last check_before_done? */
 export function doneCheckPending(lines) {
@@ -101,6 +133,16 @@ export function doneCheckPending(lines) {
     else if (checks(u)) pending = false;
   }
   return pending;
+}
+
+/** Did the session call check_before_done after its last change, and get no answer (denied, failed)? */
+export function checkUnanswered(lines) {
+  let unanswered = false;
+  for (const u of toolUses(lines)) {
+    if (changes(u)) unanswered = false;
+    else if (typeof u.name === 'string' && u.name.endsWith('check_before_done')) unanswered = !u.answered;
+  }
+  return unanswered;
 }
 
 /** The files the session edited after its last check_before_done, once each, in the order first edited. */
@@ -117,23 +159,70 @@ export function editedSince(lines) {
 }
 
 const MAX_PATHS = 20;
+const COMMIT = /^[0-9a-f]{7,64}$/;
+
+/**
+ * The commit this session started from: the one already recorded, else `head` (the output of `git rev-parse HEAD`
+ * the first time a hook ran in a project), else null. Only a commit id is ever kept: it goes into a command the
+ * agent is asked to run.
+ */
+export function sessionBase(state, head) {
+  if (typeof state?.base === 'string' && COMMIT.test(state.base)) return state.base;
+  const h = typeof head === 'string' ? head.trim() : '';
+  return COMMIT.test(h) ? h : null;
+}
+
+/** How the agent gets the diff for check_before_done: everything since `base` in one command, or HEAD plus its commits. */
+function diffAsk(base) {
+  const known = typeof base === 'string' && COMMIT.test(base);
+  return known
+    ? `diff: the output of \`git diff ${base}\` (staged, unstaged and committed since this session started; run \`git add -N\` on new files first)`
+    : 'diff: the output of `git diff HEAD` (staged and unstaged; run `git add -N` on new files first) plus the commits you made this session';
+}
 
 /**
  * The Stop hook's answer: block once so the agent runs check_before_done; never while continuing from a block.
  * `paths`: the files it edited since the last check (editedSince), named in the reason so files_changed is right.
+ * `unanswered`: it did call check_before_done since, but the call was denied or failed (checkUnanswered).
+ * `base`: the commit the session started from (sessionBase), so the diff it is asked for covers its commits too.
  */
-export function stopDecision(input, pending, project, paths = []) {
+export function stopDecision(input, pending, project, paths = [], unanswered = false, base = null) {
   if (!pending || input?.stop_hook_active) return null;
   const shown = paths.slice(0, MAX_PATHS);
+  const session = sessionIdOf(input);
   const what = shown.length
     ? `this session edited ${shown.join(', ')}${paths.length > shown.length ? ` and ${paths.length - shown.length} more` : ''}`
     : `this session committed changes in ${project}`;
   return {
     decision: 'block',
     reason:
-      `Feedback Graph: ${what} and has not called check_before_done since. ` +
-      `Call check_before_done with cwd, the task, a summary of what you built and how you verified it, and files_changed${shown.length ? `: ${JSON.stringify(shown)}` : ''}. ` +
-      'Address each gap it lists, or tell the developer plainly why it does not apply, then finish.',
+      `Feedback Graph: ${what} and ${unanswered ? 'called check_before_done but it returned no answer (denied or failed), so nothing was checked' : 'has not called check_before_done since'}. ` +
+      `Call check_before_done with cwd, the task, a summary of what you built and how you verified it, files_changed${shown.length ? `: ${JSON.stringify(shown)}` : ''}, ` +
+      (session ? `session_id: "${session}" (so the check is recorded as this session's), ` : '') +
+      `and ${diffAsk(base)}. Pass the whole diff: over about 30 KB the judge reads the files most related to the lessons first, then files_changed in order, and the answer says which files it did not read. ` +
+      'Address each gap it lists, or tell the developer plainly why it does not apply, then finish.' +
+      (unanswered ? ' If it cannot be allowed, tell the developer plainly that the check did not run.' : ''),
+  };
+}
+
+/**
+ * The Stop hook's whole answer from the transcript and the session's state: stopDecision, unless check_before_done
+ * was refused by permission. Then it is not asked for again this session (state.checkDenied, kept even when the
+ * transcript is compacted) and the agent is told once to say the check did not run; a later answered check lifts it.
+ * A call that failed (an error, not a refusal) is no check and no refusal: the check is asked for as before.
+ */
+export function stopHook(input, lines, project, state) {
+  const last = toolUses(lines).filter(isCheck).at(-1);
+  const checkDenied = last ? last.denied || (!!state.checkDenied && !last.answered) : !!state.checkDenied;
+  if (!checkDenied) return { out: stopDecision(input, doneCheckPending(lines), project, editedSince(lines), checkUnanswered(lines), state.base ?? null), state: { ...state, checkDenied: false, deniedSaid: false } };
+  const next = { ...state, checkDenied: true, deniedSaid: true };
+  if (state.deniedSaid || input?.stop_hook_active) return { out: null, state: next };
+  return {
+    out: {
+      decision: 'block',
+      reason: `Feedback Graph: check_before_done was denied by permission in this session, so the pre-done check did not run. Do not call it again in this session: tell the developer plainly that the check was denied and did not run, then finish.`,
+    },
+    state: next,
   };
 }
 

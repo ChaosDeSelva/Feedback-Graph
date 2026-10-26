@@ -114,3 +114,21 @@ test('GET /api/scans/:id answers one job, with its place in the queue while it w
   expect((await app.request('/api/scans/s3')).status).toBe(404);
   expect((await app.request('/api/scans/nope')).status).toBe(404);
 });
+
+test('GET /api/scans/:id: the place in the queue is the fair queue\'s, where a big scan that gave way waits behind those queued since', async () => {
+  const job = (id: string, projectKey: string, status: string, requestedAt: string, waitingSince = requestedAt) =>
+    ({ id, projectKey, repoPath: `/vibe/${projectKey}`, provider: null, status, requestedAt, waitingSince, startedAt: null, finishedAt: null, filesScanned: 0, factsAdded: 0, error: null, attempts: 0, retryAt: null });
+  // acme was queued first but gave up its slot after a shard at 03:05, so demo-shop (03:01) is served first.
+  const queue = [job('s2', 'demo-shop', 'queued', '2026-10-25T03:01:00Z'), job('s1', 'acme', 'queued', '2026-10-25T03:00:00Z', '2026-10-25T03:05:00Z')];
+  const app = createApp({ listCandidates: async () => [], stats: async () => [], decide: async () => {}, candidateDetail: async () => null } as unknown as ApiRepo, {
+    facts: {
+      listFacts: async () => [], searchFacts: async () => [], requestScan: async () => ({}) as never, listProjects: async () => [],
+      scanJob: async (id: string) => queue.find((j) => j.id === id) ?? null,
+      scanQueue: async () => queue,
+    } as never,
+    projectDirs: async () => dirs,
+    shown: () => shownProjects({ tracked: ['acme', 'demo-shop'], initialized: true }, { excludeProjects: [] }),
+  });
+  expect(await (await app.request('/api/scans/s2')).json()).toMatchObject({ queuePosition: 1 });
+  expect(await (await app.request('/api/scans/s1')).json()).toMatchObject({ queuePosition: 2 });
+});

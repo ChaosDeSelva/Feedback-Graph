@@ -1,6 +1,6 @@
-import { expect, test } from 'vitest';
+import { describe, expect, test } from 'vitest';
 import type { ContextItem } from '@fb/core';
-import { capToCommentDir, codeNotRead, shapeLesson, stripRefs } from './shape.ts';
+import { capToCommentDir, codeNotRead, lessonFieldJunk, rescueRule, shapeLesson, stripRefs } from './shape.ts';
 
 const lesson = (o: Partial<{ title: string; rule: string; appliesWhen: string; paths: string[] }>) => ({
   title: 'Pair self-closing custom tags', rule: 'Rewrite self-closing <chart /> tags to paired tags in pipeline.ts before rehype-raw parses them',
@@ -66,4 +66,44 @@ test('code_not_read: the code that showed the way is in the repository and the s
   expect(await codeNotRead('context_missing', [item('web/src/gone.tsx')], exists)).toBe('context_missing');
   expect(await codeNotRead('implementation_error', items, exists)).toBe('implementation_error');
   expect(await codeNotRead('context_missing', items, undefined)).toBe('context_missing');
+});
+
+describe('lessonFieldJunk: fields that hold a label instead of a rule', () => {
+  test.each([
+    [{ rule: 'project' }, /scope word/],
+    [{ rule: 'Global' }, /scope word/],
+    [{ rule: 'task' }, /scope word/],
+    [{ rule: 'File-export imports' }, /label, not a rule/],
+    [{ rule: 'CSV header escaping' }, /label, not a rule/],
+    [{ title: 'Escape the CSV header row in export/csv.ts', rule: 'Escape the CSV header row in export/csv.ts' }, /repeats the title/],
+    [{ appliesWhen: 'work' }, /appliesWhen "work"/],
+    [{ appliesWhen: 'project' }, /appliesWhen "project"/],
+    [{ appliesWhen: 'implementation_error' }, /appliesWhen "implementation_error"/],
+    [{ appliesWhen: 'Task' }, /appliesWhen "Task"/],
+  ])('%o is refused', (over, why) => {
+    expect(lessonFieldJunk(lesson(over))).toMatch(why);
+  });
+
+  test.each([
+    {},
+    { rule: 'Filter search on the server' },
+    { rule: 'Use toJson for jsonb parameters' },
+    { appliesWhen: 'When changing export/csv.ts' },
+  ])('%o passes', (over) => {
+    expect(lessonFieldJunk(lesson(over))).toBeNull();
+  });
+});
+
+test('rescueRule: a junk rule is replaced by a title that reads as a rule, else the lesson cannot be saved', () => {
+  expect(rescueRule(lesson({ title: 'Escape the CSV header row in export/csv.ts', rule: 'project' }))).toMatchObject({ rule: 'Escape the CSV header row in export/csv.ts' });
+  expect(rescueRule(lesson({ title: 'File-export imports', rule: 'project' }))).toBeNull();
+  expect(rescueRule(lesson({ title: 'CSV escaping', rule: 'CSV escaping' }))).toBeNull();
+  // A filler appliesWhen alone is not a reason to drop: shapeLesson writes one.
+  expect(rescueRule(lesson({ appliesWhen: 'work' }))).toMatchObject({ rule: lesson({}).rule });
+});
+
+test('shapeLesson replaces a filler appliesWhen', () => {
+  const r = shapeLesson(lesson({ appliesWhen: 'implementation_error' }), { taskTitle: 'Chart embeds' });
+  expect(r.lesson.appliesWhen).toBe('When changing web/src/markdown/pipeline.ts');
+  expect(r.repaired).toEqual(['appliesWhen']);
 });

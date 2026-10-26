@@ -72,10 +72,7 @@ fi
 # OLLAMA_URL is what the containers use; from here the same server is on localhost.
 ollama_url="$(envval OLLAMA_URL)"
 container_ollama="${ollama_url:-http://host.docker.internal:11434}"
-case "$ollama_url" in
-  "" | *host.docker.internal*) ollama_url="http://localhost:11434" ;;
-  http://ollama:11434*) ollama_url="http://localhost:11435" ;;
-esac
+ollama_url="$(ollama_host_url "$ollama_url" "$(envval OLLAMA_PORT)")"
 models=("$(envval OLLAMA_MODEL)" "$(envval OLLAMA_EMBED_MODEL)")
 models=("${models[0]:-gemma4}" "${models[1]:-nomic-embed-text}")
 classify_llm="$(envval CLASSIFY_LLM)"

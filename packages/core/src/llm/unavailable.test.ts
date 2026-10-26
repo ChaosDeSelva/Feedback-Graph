@@ -99,3 +99,24 @@ test('withHealth keeps whether the provider can read images', () => {
   expect(see.vision).toBe(true);
   expect(blindOne.vision).toBe(false);
 });
+
+test('the model\'s own answer is never read for unavailability: a failed run whose output talks about auth is that item\'s failure', async () => {
+  const env = { CLAUDE_CODE_OAUTH_TOKEN: 't' };
+  // A post-mortem about auth code: the run failed, and its stdout (the model's work) is full of auth words.
+  const answer = 'The agent changed the authentication middleware; the 401 handler now returns forbidden for unauthorized users.';
+  const prose = async () => ({ code: 1, stdout: answer, stderr: '' });
+  expect(await reasonFor('claude-cli', env, { exec: prose })).toBeNull();
+  const json = async () => ({ code: 1, stdout: JSON.stringify({ is_error: false, result: answer }), stderr: '' });
+  expect(await reasonFor('claude-cli', env, { exec: json })).toBeNull();
+  // The output still reaches the item's error, so the owner can see what happened.
+  const err = (await makeProvider('claude-cli', env, { exec: prose }).json(task).catch((e: unknown) => e)) as Error;
+  expect(err.message).toMatch(/^claude exit 1: .*authentication middleware/);
+  // The CLI's own error (its stderr, or its structured is_error result) still means not signed in.
+  const stderr = async () => ({ code: 1, stdout: answer, stderr: 'Invalid API key · Please run /login' });
+  expect(await reasonFor('claude-cli', env, { exec: stderr })).toMatch(/not signed in/);
+  const structured = async () => ({ code: 1, stdout: JSON.stringify({ is_error: true, result: 'Invalid API key · Please run /login' }), stderr: '' });
+  expect(await reasonFor('claude-cli', env, { exec: structured })).toMatch(/not signed in/);
+  // Codex: stdout is its transcript; only stderr counts.
+  const codex = async () => ({ code: 1, stdout: `${answer} usage limit 429`, stderr: '' });
+  expect(await reasonFor('codex-cli', { ALLOW_UNCONFINED_CODEX: '1' }, { exec: codex })).toBeNull();
+});

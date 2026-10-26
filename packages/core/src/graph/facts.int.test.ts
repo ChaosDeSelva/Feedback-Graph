@@ -230,6 +230,68 @@ describeStores('FactsStore', (h) => {
     expect(p.lastScan?.finishedAt).not.toBeNull();
   });
 
+  test('the scan queue is fair across projects: a job that gave up its slot after a shard waits behind those queued since', async () => {
+    const t0 = new Date(Date.now() + 3_600_000);
+    const at = (min: number) => new Date(t0.getTime() + min * 60_000);
+    const big = await f.requestScan({ key: 'big', name: 'big', repoPath: '/vibe/big' }, 'codex-cli');
+    const small = await f.requestScan({ key: 'small', name: 'small', repoPath: '/vibe/small' }, 'codex-cli');
+    expect((await f.nextScanJob(at(60)))?.id).toBe(big.id);
+    await f.updateScanJob(big.id, { status: 'running' });
+    await f.updateScanJob(big.id, { factsAdded: 4, shards: { total: 40, done: 1, rescanned: 1, failed: 0, processed: ['packages/a'] } });
+    // One shard done and another project waiting: back in the queue, its progress kept, waiting from now.
+    await f.requeueScanJob(big.id, at(30));
+    expect(await f.scanJob(big.id)).toMatchObject({ status: 'queued', attempts: 0, factsAdded: 4, servedAt: at(30).toISOString(), shards: { done: 1, processed: ['packages/a'] } });
+    expect((await f.nextScanJob(at(60)))?.id).toBe(small.id);
+    // The queue in the order it is served, each with how long it has waited.
+    expect((await f.scanQueue()).map((j) => [j.projectKey, j.status, j.waitingSince])).toEqual([
+      ['small', 'queued', small.requestedAt],
+      ['big', 'queued', at(30).toISOString()],
+    ]);
+    await f.updateScanJob(small.id, { status: 'running' });
+    expect((await f.nextScanJob(at(60)))?.id).toBe(big.id);
+    expect((await f.scanQueue()).map((j) => [j.projectKey, j.status])).toEqual([['small', 'running'], ['big', 'queued']]);
+    await f.updateScanJob(small.id, { status: 'done' });
+    expect((await f.scanQueue()).map((j) => j.projectKey)).toEqual(['big']);
+  });
+
+  test('a job not served yet whose files an agent asked for counts as waiting since the oldest request', async () => {
+    const t0 = new Date(Date.now() + 3_600_000);
+    const later = (min: number) => new Date(t0.getTime() + min * 60_000);
+    // An agent asked for one of qa's files (get_task_context) before either scan was queued.
+    const before = new Date().toISOString();
+    await f.requestFilesScan('qa', ['src/asked.ts']);
+    await new Promise((r) => setTimeout(r, 5));
+    const b = await f.requestScan({ key: 'qb', name: 'qb', repoPath: '/vibe/qb' }, null);
+    const a = await f.requestScan({ key: 'qa', name: 'qa', repoPath: '/vibe/qa' }, null);
+    expect((await f.nextScanJob(later(10)))?.id).toBe(a.id);
+    const [first] = await f.scanQueue();
+    expect(first.id).toBe(a.id);
+    expect(first.waitingSince >= before && first.waitingSince < b.requestedAt).toBe(true);
+  });
+
+  test('a job that gave way waits from then, whatever file of its project an agent asked for earlier: the others go first', async () => {
+    const t0 = new Date(Date.now() + 3_600_000);
+    const later = (min: number) => new Date(t0.getTime() + min * 60_000);
+    // A 40-shard codex scan whose project has an old unread file request (in a later shard), then an agentic scan.
+    await f.requestFilesScan('big40', ['packages/late/src/asked.ts']);
+    const big = await f.requestScan({ key: 'big40', name: 'big40', repoPath: '/vibe/big40' }, 'codex-cli');
+    const other = await f.requestScan({ key: 'other', name: 'other', repoPath: '/vibe/other' }, 'claude-cli');
+    expect((await f.nextScanJob(later(10)))?.id).toBe(big.id);
+    await f.updateScanJob(big.id, { status: 'running' });
+    await f.updateScanJob(big.id, { shards: { total: 40, done: 1, rescanned: 1, failed: 0, processed: ['packages/a'] } });
+    // Its first shard done and another scan waiting: it gives way, and does not get the slot straight back.
+    await f.requeueScanJob(big.id, later(1));
+    expect((await f.nextScanJob(later(10)))?.id).toBe(other.id);
+    expect((await f.scanQueue()).map((j) => [j.projectKey, j.waitingSince])).toEqual([
+      ['other', other.requestedAt],
+      ['big40', later(1).toISOString()],
+    ]);
+    // The other scan done: the big one goes on.
+    await f.updateScanJob(other.id, { status: 'running' });
+    await f.updateScanJob(other.id, { status: 'done' });
+    expect((await f.nextScanJob(later(10)))?.id).toBe(big.id);
+  });
+
   test('stored facts and file summaries are redacted, whatever the model returned', async () => {
     await f.saveFileFacts('demo', { path: 'src/a.ts', hash: 'h', summary: 'key sk-ant-api03-cccccccccccccccccccccccccccccccccccccccc' }, [{ ...fact('uses sk-ant-api03-cccccccccccccccccccccccccccccccccccccccc'), why: 'why sk-ant-api03-cccccccccccccccccccccccccccccccccccccccc' }], 'p');
     await f.replaceProjectFacts('demo', [{ ...fact('agentic sk-ant-api03-cccccccccccccccccccccccccccccccccccccccc', 'src/b.ts'), why: 'sk-ant-api03-cccccccccccccccccccccccccccccccccccccccc' }], 'claude-cli', [{ path: 'src/b.ts', hash: 'hb' }]);

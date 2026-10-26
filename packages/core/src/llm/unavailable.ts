@@ -27,6 +27,26 @@ export class ModelTimeoutError extends Error {
   }
 }
 
+/**
+ * A CLI provider's run failed. `said` is what the CLI itself reported (its stderr, or the is_error result of its JSON
+ * output): the only text read to tell unavailability. The model's answer (stdout) goes into the message so the owner
+ * can see it, and is never classified: a post-mortem about auth code would otherwise read as "not signed in" forever.
+ */
+export class CliRunError extends Error {
+  readonly tool: 'claude' | 'codex';
+  /** Exit status; null when it exited 0 and reported an error. */
+  readonly exit: number | null;
+  readonly said: string;
+  constructor(tool: 'claude' | 'codex', exit: number | null, said: string, output = '') {
+    const shown = said.trim() ? said : output;
+    super(`${tool} ${exit === null ? 'error' : `exit ${exit}`}: ${(tool === 'codex' ? shown.slice(-500) : shown.slice(0, 500))}`);
+    this.name = 'CliRunError';
+    this.tool = tool;
+    this.exit = exit;
+    this.said = said;
+  }
+}
+
 const NETWORK_CODES = new Set([
   'ECONNREFUSED', 'ECONNRESET', 'ENOTFOUND', 'EAI_AGAIN', 'EHOSTUNREACH', 'ENETUNREACH', 'ETIMEDOUT', 'EPIPE',
   'UND_ERR_CONNECT_TIMEOUT', 'UND_ERR_SOCKET',
@@ -57,6 +77,7 @@ export function modelTimeoutReason(err: unknown): string | null {
   const msg = typeof e.message === 'string' ? e.message : '';
   const http = msg.match(/^(\S+) (?:embed )?408:/);
   if (http) return `timed out waiting for ${http[1]}`;
+  if (err instanceof CliRunError) return err.exit === 124 || /timed out after/.test(err.said) ? `timed out waiting for ${err.tool}` : null;
   const cli = msg.match(/^(claude|codex) (?:exit (\d+)|error):\s*([\s\S]*)$/);
   if (cli && (cli[2] === '124' || /timed out after/.test(cli[3]))) return `timed out waiting for ${cli[1]}`;
   return null;
@@ -93,8 +114,10 @@ export function providerUnavailableReason(err: unknown): string | null {
     return null;
   }
 
-  // CLI providers: "claude exit <code>: <stderr>", "codex exit <code>: ...", "claude error: <result>"
-  const cli = msg.match(/^(claude|codex) (?:exit (\d+)|error):\s*([\s\S]*)$/);
+  // CLI providers: what the CLI said (CliRunError), never its output; an older plain "claude exit <code>: <stderr>" too.
+  const cli: [string, string, string | undefined, string] | null = err instanceof CliRunError
+    ? ['', err.tool, err.exit === null ? undefined : String(err.exit), err.said]
+    : (msg.match(/^(claude|codex) (?:exit (\d+)|error):\s*([\s\S]*)$/) as [string, string, string | undefined, string] | null);
   if (cli) {
     const [, name, exit, out] = cli;
     if (exit === '127' || /command not found/i.test(out)) return `${name} is not installed`;

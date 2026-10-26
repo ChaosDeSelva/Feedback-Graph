@@ -116,7 +116,8 @@ test('PATCH /api/projects/:key/facts/:id/relevance sets your relevance for a fac
   const { app, calls, activity } = setup();
   const res = await app.request('/api/projects/alpha/facts/f1/relevance', json('PATCH', { relevance: 0.1 }));
   expect(res.status).toBe(204);
-  expect(calls).toEqual([['relevance', [{ id: 'f1', relevance: 0.1, by: 'you', projectKey: 'alpha' }]]]);
+  // run null: the owner's setting (a fact a run wrote becomes the owner's).
+  expect(calls).toEqual([['relevance', [{ id: 'f1', relevance: 0.1, by: 'you', projectKey: 'alpha', run: null }]]]);
   expect(activity[0]).toMatchObject({ kind: 'fact_relevance_set', subject: 'set a fact to rare (0.1)' });
 });
 

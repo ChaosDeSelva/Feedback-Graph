@@ -1,4 +1,4 @@
-import type { ActivityInput, PrContext } from '@fb/core';
+import { prBacklogKey, type ActivityInput, type PrContext } from '@fb/core';
 import { expect, test } from 'vitest';
 import { reposInScope, syncGithub, ticketsCursor, type GithubSyncDeps } from './githubSync.ts';
 
@@ -92,4 +92,38 @@ test('PRs synced before tickets were read are read again once, for the last 14 d
   const fresh = setup();
   await syncGithub(fresh.deps);
   expect(fresh.cursors.get(ticketsCursor('shop'))).toBe('2026-10-22T12:00:00Z');
+});
+
+test('a sync stopped by its PR cap keeps what it did not read as a backlog, reads it on the next syncs, and says so', async () => {
+  const calls: { since?: string; until?: string }[] = [];
+  // first call: capped at 10-21; second (the backlog, until 10-21): capped again at 10-15; then done
+  const capAt = ['2026-10-21T00:00:00Z', null, '2026-10-15T00:00:00Z', null, null];
+  const s = setup({
+    fetchPrs: async (o) => {
+      calls.push({ since: o.since, until: o.until });
+      const cap = capAt[calls.length - 1];
+      if (cap) o.onCap?.(cap);
+      return [pr(calls.length)];
+    },
+  });
+  await s.deps.docs.setCursor('github:shop', '2026-10-01T00:00:00Z');
+  await s.deps.docs.setCursor(ticketsCursor('shop'), '2026-10-01T00:00:00Z');
+  await syncGithub({ ...s.deps, minIntervalMs: 0 });
+  // the newest PRs were read, so the cursor moves on; what lies between the old cursor and 10-21 is the backlog
+  expect(s.cursors.get('github:shop')).toBe('2026-10-22T12:00:00Z');
+  expect(JSON.parse(s.cursors.get(prBacklogKey('shop'))!)).toEqual({ since: '2026-10-01T00:00:00Z', until: '2026-10-21T00:00:00Z' });
+  expect(s.activity.at(-1)).toMatchObject({ kind: 'doc_added', details: { backlog: { since: '2026-10-01T00:00:00Z', until: '2026-10-21T00:00:00Z' } } });
+  expect(s.activity.at(-1)!.why).toMatch(/more than 1000 .*updated between 2026-10-01 and 2026-10-21 .*next syncs/i);
+
+  // next sync: the new PRs since the cursor, then one batch of the backlog, which is capped again
+  await syncGithub({ ...s.deps, minIntervalMs: 0 });
+  expect(calls.slice(1, 3)).toEqual([{ since: '2026-10-22T12:00:00Z', until: undefined }, { since: '2026-10-01T00:00:00Z', until: '2026-10-21T00:00:00Z' }]);
+  expect(JSON.parse(s.cursors.get(prBacklogKey('shop'))!)).toEqual({ since: '2026-10-01T00:00:00Z', until: '2026-10-15T00:00:00Z' });
+
+  // and the one after reads the rest: no backlog left
+  await syncGithub({ ...s.deps, minIntervalMs: 0 });
+  expect(calls[4]).toEqual({ since: '2026-10-01T00:00:00Z', until: '2026-10-15T00:00:00Z' });
+  expect(s.cursors.get(prBacklogKey('shop'))).toBe('');
+  expect(s.activity.at(-1)!.why).toMatch(/caught up/i);
+  expect(s.upserts).toHaveLength(5);
 });

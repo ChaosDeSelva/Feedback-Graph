@@ -3,7 +3,7 @@ import { z } from 'zod';
 import {
   DEFAULT_LINK, ENV_VAR, FEEDBACK_SKIP_RULES, githubRepoOfRemote, githubViewer, integrationErrorKind, linearViewer, listLinearTeams, redactSecrets, tokenFingerprint,
   type ActivityStore, type CloudConfig, type Connection, type ConnectionName, type IntegrationCheck, type IntegrationKind, type Integrations,
-  type IntegrationSyncState, type LinearTeam, type ManualSync, type OllamaHealth, type WorkerStatus,
+  type IntegrationSyncState, type LinearTeam, type ManualSync, type OllamaHealth, type PrBacklog, type WorkerStatus,
 } from '@fb/core';
 
 /**
@@ -41,7 +41,11 @@ export type ServiceView = {
 
 export type ProjectIntegrations = {
   key: string;
-  github: { repo: string | null; from: 'remote' | 'GITHUB_REPOS' | null; enabled: boolean; lastSyncAt: string | null; items: number; error: string | null };
+  github: {
+    repo: string | null; from: 'remote' | 'GITHUB_REPOS' | null; enabled: boolean; lastSyncAt: string | null; items: number; error: string | null;
+    /** PRs a sync stopped by its cap has not read yet (updated after `since`, before `until`): read on the next syncs. */
+    backlog: PrBacklog | null;
+  };
   linear: { teamId: string | null; teamName: string | null; lastSyncAt: string | null; items: number; error: string | null };
 };
 
@@ -201,7 +205,7 @@ export async function integrationsView(d: IntegrationsDeps): Promise<Integration
     syncMinutes: d.syncMinutes,
     github,
     linear,
-    projects: projects.map((p) => {
+    projects: await Promise.all(projects.map(async (p) => {
       const link = { ...DEFAULT_LINK, ...links[p.key] };
       const override = d.githubOverride.get(p.key) ?? null;
       const repo = override ?? githubRepoOfRemote(p.remote);
@@ -209,10 +213,13 @@ export async function integrationsView(d: IntegrationsDeps): Promise<Integration
       const ls = linSync.projects[p.key];
       return {
         key: p.key,
-        github: { repo, from: override ? 'GITHUB_REPOS' : repo ? 'remote' : null, enabled: link.github, lastSyncAt: gs?.lastSyncAt ?? null, items: gs?.items ?? 0, error: gs?.error ?? null },
+        github: {
+          repo, from: override ? 'GITHUB_REPOS' : repo ? 'remote' : null, enabled: link.github, lastSyncAt: gs?.lastSyncAt ?? null, items: gs?.items ?? 0, error: gs?.error ?? null,
+          backlog: repo ? await d.integrations.prBacklog(p.key) : null,
+        },
         linear: { teamId: link.linearTeamId, teamName: link.linearTeamName, lastSyncAt: ls?.lastSyncAt ?? null, items: ls?.items ?? 0, error: ls?.error ?? null },
       };
-    }),
+    })),
   };
 }
 
@@ -336,6 +343,12 @@ function cloudConnection(cloud: CloudConfig | null, w: WorkerStatus | null, manu
     ? { at: manual.at, ok: manual.ok, error: manual.error, how: ' (Sync now)' }
     : s?.lastAt ? { at: s.lastAt, ok: s.lastOk !== false, error: s.lastError, how: '' } : null;
   if (last && !last.ok) return { state: 'error', source: 'env', detail: `Sync to ${host} failed${last.how}: ${last.error ?? 'unknown error'}`, href };
+  // A project that keeps failing backs off alone (worker/cloud/schedule.ts): the rest sync, so name it here.
+  const waiting = s?.waiting ?? [];
+  if (waiting.length) {
+    const each = waiting.map((p) => `${p.key} failed ${p.failures} ${p.failures === 1 ? 'time' : 'times in a row'}${p.error ? ` (${p.error})` : ''}, tried again ${when(p.until)}`);
+    return { state: 'error', source: 'env', detail: `Syncing to ${host}, but ${each.join('; ')}; the others sync as usual.`, href };
+  }
   return { state: 'connected', source: 'env', detail: last ? `Syncing to ${host}; last sync ${when(last.at)}${last.how}.` : `Set up for ${host}; not synced yet.`, href };
 }
 

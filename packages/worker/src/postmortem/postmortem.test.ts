@@ -170,6 +170,12 @@ test('buildPrompt tells non-agentic models they cannot read files and lists code
   expect(buildPrompt(input, [], { agentic: true, facts: [] })).toMatch(/Read\/Grep\/Glob/);
 });
 
+test('buildPrompt tells the writer to name the concrete thing and to keep one miss per lesson', () => {
+  const p = buildPrompt(input, [], { agentic: false, facts: [] });
+  expect(p).toMatch(/process words .* is not a lesson: name the concrete file, function, value or command/s);
+  expect(p).toContain('One miss per lesson');
+});
+
 test('runPostMortem calls the provider in the repo and returns availability-marked items', async () => {
   let cwd: string | undefined = '';
   const result = await runPostMortem(input, {
@@ -225,6 +231,32 @@ test('an answer of the wrong shape is asked again once, more strictly; a second 
   await expect(runPostMortem(input, { llm: bad as never, standing: async () => [], facts: async () => [] })).rejects.toThrow(/did not match the schema.*half an answer/);
 });
 
+test('a lesson whose rule is the scope word is refused and asked again, the retry told why', async () => {
+  const systems: string[] = [];
+  const replies = [answer({ rule: 'project' } as never), answer({})];
+  const llm = { id: 'x', agentic: false, json: async (t: { system: string }) => { systems.push(t.system); return replies.shift(); } };
+  const r = await runPostMortem(input, { llm: llm as never, standing: async () => [], facts: async () => [] });
+  expect(r.lesson.rule).toBe('Filter search on the server');
+  expect(systems[1]).toContain('Your last answer was refused: lesson.rule holds the scope word "project"');
+  expect(r.lessonDropped).toBeUndefined();
+});
+
+test('still junk after the retry: a title that reads as a rule becomes the rule; a label for a title drops the lesson', async () => {
+  const run = (lesson: object) => {
+    const logs: string[] = [];
+    const llm = { id: 'x', agentic: false, json: async () => answer(lesson as never) };
+    return runPostMortem(input, { llm: llm as never, standing: async () => [], facts: async () => [], log: (m) => logs.push(m) }).then((r) => ({ r, logs }));
+  };
+  const rescued = await run({ title: 'Filter customer search rows in the SQL query', rule: 'Global', appliesWhen: 'work' });
+  expect(rescued.r.lesson).toMatchObject({ rule: 'Filter customer search rows in the SQL query', appliesWhen: 'When working on customer search' });
+  expect(rescued.r.lessonChecks?.map((c) => c.name)).toContain('broken-rule');
+  expect(rescued.r.lessonDropped).toBeUndefined();
+
+  const dropped = await run({ title: 'File-export imports', rule: 'project' });
+  expect(dropped.r.lessonDropped).toMatch(/scope word "project"/);
+  expect(dropped.logs).toContain('post-mortem lesson dropped: its rule is not a rule');
+});
+
 test('the model is shown the files the session edited and where the fix landed, and the lesson is scoped to them', async () => {
   let prompt = '';
   const result = await runPostMortem(input, {
@@ -261,6 +293,21 @@ test('lesson paths the edits support are kept; a global lesson keeps only its ow
   });
   expect((await run({ paths: ['api/**'] })).lesson.paths).toEqual(['api/**']);
   expect((await run({ scope: 'global', paths: ['**/*.sql', '../x'] })).lesson.paths).toEqual(['**/*.sql']);
+});
+
+test('a bare file name resolves through the repository listing; one in two folders is kept and flagged ambiguous-path', async () => {
+  const files = ['jobs/export/csv.ts', 'jobs/import/csv.ts', 'jobs/export/schedule.go'];
+  const r = await runPostMortem(input, {
+    standing: async () => [], facts: async () => [],
+    exists: async (_i, p) => files.includes(p) || files.some((f) => f.startsWith(`${p}/`)),
+    repoFiles: async () => files,
+    llm: { id: 'fake', agentic: false, json: async () => answer({ paths: ['schedule.go', 'csv.ts', 'CLAUDE.md'] }) },
+  });
+  expect(r.lesson.paths).toEqual(['jobs/export/schedule.go', 'csv.ts']);
+  expect(r.lessonChecks).toEqual(expect.arrayContaining([
+    { name: 'bad-path', why: 'CLAUDE.md: an instruction file, not the code the lesson is about' },
+    { name: 'ambiguous-path', why: 'csv.ts is in more than one place (jobs/export/csv.ts, jobs/import/csv.ts): say which' },
+  ]));
 });
 
 test('without touched files (none recorded, or no lookup) the model\'s paths stand, cleaned', async () => {
@@ -331,4 +378,29 @@ test('facts the post-mortem noticed come back beside the lesson as proposals; no
   expect((await run([{ path: 'api/search.ts', statement: 'search() filters in SQL with a 200-row cap' }])).facts).toEqual([{ path: 'api/search.ts', statement: 'search() filters in SQL with a 200-row cap' }]);
   expect((await run(undefined)).facts).toEqual([]);
   expect((await run('none')).facts).toEqual([]);
+});
+
+test("runPostMortem shows the writer this project's own lesson decisions as examples; none leaves the prompt unchanged", async () => {
+  const prompts: string[] = [];
+  const llm = { id: 'fake', agentic: false, json: async (o: { user: string }) => { prompts.push(o.user); return answer({}); } };
+  const base = { standing: async () => [], facts: async () => [], llm };
+  const seen: string[] = [];
+  const lesson = {
+    id: 'lesson:x', projectKey: 'demo', origin: 'demo', title: 'Search on the server', rule: 'Filter in api/search.ts', appliesWhen: 'search',
+    scope: 'project' as const, paths: ['api/search.ts'], status: 'approved' as const, source: 'postmortem' as const, cause: null, missId: null,
+    createdAt: '2026-10-01T00:00:00.000Z', decidedAt: '2026-10-02T00:00:00.000Z',
+    proposedAs: { title: 'Verify', rule: 'Always verify the work', appliesWhen: 'always', scope: 'global' as const, paths: [] },
+  };
+  const r = await runPostMortem(input, { ...base, examples: async (i) => { seen.push(i.projectKey); return [{ lesson, score: 0.8 }]; } });
+  expect(seen).toEqual(['demo']);
+  expect(prompts[0]).toContain('HOW THE OWNER JUDGED EARLIER LESSONS IN THIS PROJECT');
+  expect(prompts[0]).toContain('The writer proposed: title "Verify"; rule "Always verify the work"');
+  expect(r.trace.examples).toEqual(['lesson:x']);
+  // No decisions yet, none of them usable, or the store failing: the prompt is as it was.
+  await runPostMortem(input, base);
+  await runPostMortem(input, { ...base, examples: async () => [] });
+  await runPostMortem(input, { ...base, examples: async () => [{ lesson: { ...lesson, sandbox: true as const }, score: null }] });
+  await runPostMortem(input, { ...base, examples: async () => { throw new Error('store down'); } });
+  expect(new Set(prompts.slice(1)).size).toBe(1);
+  expect(prompts[1]).not.toContain('HOW THE OWNER JUDGED');
 });

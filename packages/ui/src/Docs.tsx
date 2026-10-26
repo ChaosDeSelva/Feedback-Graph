@@ -88,9 +88,9 @@ export function Docs() {
             If the detector missed some pushback, type <Code>/postmortem what it missed</Code> in Claude Code. It goes to the Inbox like any other item.
           </p>
           <p className="mt-2">
-            These tools only read and report. To let an agent or a script make some of your decisions (choose projects, start scans, confirm Inbox items),
+            These tools only read and report. To let an agent or a script make some of your decisions (start scans, confirm Inbox items),
             set <Code>FG_OPERATOR_TOKEN</Code> in <Code>.env</Code> and use <Code>./scripts/fg</Code>. <Code>OPERATOR_ALLOW</Code> lists what the token may do;
-            by default it may not decide lessons, delete data, change settings, import, set integration keys or ask in Ask (which spends your subscription), so what agents learn stays your call. Its
+            by default it may not decide lessons, choose which projects are read, delete data, change settings, import, set integration keys or ask in Ask (which spends your subscription), so what agents learn stays your call. Its
             writes show in Activity as <Code>operator:&lt;name&gt;</Code>, and a lesson it decided carries a badge.
           </p>
         </Section>

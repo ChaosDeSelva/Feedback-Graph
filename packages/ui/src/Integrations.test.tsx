@@ -16,8 +16,8 @@ function view(o: Partial<IntegrationsView> = {}): IntegrationsView {
     github: svc(),
     linear: svc({ envVar: 'LINEAR_API_KEY', connection: { state: 'not_connected', source: null, detail: 'Not connected.', href: '#settings/integrations-linear' } }),
     projects: [
-      { key: 'shop', github: { repo: 'acme/shop', from: 'remote', enabled: true, lastSyncAt: null, items: 0, error: null }, linear: { teamId: null, teamName: null, lastSyncAt: null, items: 0, error: null } },
-      { key: 'notes', github: { repo: null, from: null, enabled: true, lastSyncAt: null, items: 0, error: null }, linear: { teamId: null, teamName: null, lastSyncAt: null, items: 0, error: null } },
+      { key: 'shop', github: { repo: 'acme/shop', from: 'remote', enabled: true, lastSyncAt: null, items: 0, error: null, backlog: null }, linear: { teamId: null, teamName: null, lastSyncAt: null, items: 0, error: null } },
+      { key: 'notes', github: { repo: null, from: null, enabled: true, lastSyncAt: null, items: 0, error: null, backlog: null }, linear: { teamId: null, teamName: null, lastSyncAt: null, items: 0, error: null } },
     ],
     ...o,
   };
@@ -69,6 +69,16 @@ test('not connected: explains the token scopes with a link to create one, and ea
   expect(within(lin).getByRole('link', { name: /Security and access/ }).getAttribute('href')).toBe('https://linear.app/settings/account/security');
   expect(screen.getByText('acme/shop')).toBeTruthy();
   expect(screen.getByText('no github.com remote')).toBeTruthy();
+});
+
+test('a project whose PR sync hit its cap says which pull requests are still to be read', async () => {
+  const base = view();
+  state = view({
+    github: connected(),
+    projects: [{ ...base.projects[0], github: { ...base.projects[0].github, lastSyncAt: new Date().toISOString(), items: 3, backlog: { since: '2026-10-01T00:00:00Z', until: '2026-10-21T00:00:00Z' } } }, base.projects[1]],
+  });
+  render(<Integrations />);
+  expect(await screen.findByText(/catching up: pull requests updated 2026-10-01 to 2026-10-21 are read on the next syncs/)).toBeTruthy();
 });
 
 test('connecting sends the token once, clears the field and shows the account', async () => {

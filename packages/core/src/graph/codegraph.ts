@@ -22,6 +22,7 @@ import type { Cause } from '../types.ts';
 import { FactsRepo, PROJECT_PATH } from './facts.ts';
 import { KnowledgeRepo } from './knowledge.ts';
 import type { GraphRepo } from './repo.ts';
+import { VISIBLE_TO_RUN } from './runs.ts';
 
 /** Rows per UNWIND statement: big repos are written in slices, each its own transaction (replaceCodeMap). */
 const SLICE = 5000;
@@ -59,9 +60,9 @@ export class CodeGraphRepo implements CodeGraphStore {
       testsOf: (key, paths) => this.testsOf(key, paths),
       importerCounts: (key) => this.importerCounts(key),
       edgesTouching: (key, paths) => this.edgesTouching(key, paths),
-      missesOn: (key, paths) => this.missesOn(key, paths),
-      approvedLessons: (key) => knowledge.listLessons({ status: 'approved', projectKey: key, limit: LESSON_LIMIT }),
-      currentFacts: (key, path) => facts.listFacts({ projectKey: key, path }),
+      missesOn: (key, paths, run) => this.missesOn(key, paths, run ?? null),
+      approvedLessons: (key, run) => knowledge.listLessons({ status: 'approved', projectKey: key, limit: LESSON_LIMIT, run }),
+      currentFacts: (key, path, run) => facts.listFacts({ projectKey: key, path, run }),
     };
     this.views = codeGraphViews(reads);
   }
@@ -312,12 +313,12 @@ export class CodeGraphRepo implements CodeGraphStore {
     return rows.map((r) => r.get('path'));
   }
 
-  moduleContext(projectKey: string, path: string) {
-    return this.views.moduleContext(projectKey, path);
+  moduleContext(projectKey: string, path: string, run?: string | null) {
+    return this.views.moduleContext(projectKey, path, run ?? null);
   }
 
-  impact(projectKey: string, paths: string[], depth: number) {
-    return this.views.impact(projectKey, paths, depth);
+  impact(projectKey: string, paths: string[], depth: number, run?: string | null) {
+    return this.views.impact(projectKey, paths, depth, run ?? null);
   }
 
   hotspots(projectKey: string, limit: number, opts?: HotspotOpts) {
@@ -328,8 +329,8 @@ export class CodeGraphRepo implements CodeGraphStore {
     return this.views.mapGraph(projectKey, opts);
   }
 
-  lessonsForPaths(projectKey: string, paths: string[]) {
-    return this.views.lessonsForPaths(projectKey, paths);
+  lessonsForPaths(projectKey: string, paths: string[], run?: string | null) {
+    return this.views.lessonsForPaths(projectKey, paths, run ?? null);
   }
 
   outsideMap(projectKey: string, paths: string[]) {
@@ -427,15 +428,15 @@ export class CodeGraphRepo implements CodeGraphStore {
   }
 
   /** A process miss (m.subject 'process': branches, pushes, pull requests) is about no file, so it is on none. */
-  private async missesOn(projectKey: string, paths: string[] | null): Promise<FileMissRow[]> {
+  private async missesOn(projectKey: string, paths: string[] | null, run: string | null): Promise<FileMissRow[]> {
     if (paths && !paths.length) return [];
     const rows = await this.g.run(
       `MATCH (m:Miss {projectKey: $key})-[:EXPLAINS]->(f:Feedback)-[:FROM_TURN]->(t:Turn)<-[:HAS_TURN]-(s:Session)-[r:TOUCHED]->(cf:CodeFile)
-       WHERE r.edited = true AND f.status <> 'rejected' AND m.subject IS NULL AND ($paths IS NULL OR cf.path IN $paths)
+       WHERE r.edited = true AND f.status <> 'rejected' AND m.subject IS NULL AND ($paths IS NULL OR cf.path IN $paths) AND ${VISIBLE_TO_RUN('m')}
        OPTIONAL MATCH (l:Lesson)-[:DERIVED_FROM]->(m)
        RETURN m, f.id AS feedbackId, coalesce(t.text, f.text, '') AS text, s.id AS sessionId, t.ts AS ts, cf.path AS path,
               r.lastEditAt IS NOT NULL AND datetime(r.lastEditAt) > datetime(t.ts) AS fixedHere, min(l.id) AS lessonId`,
-      { key: projectKey, paths },
+      { key: projectKey, paths, run },
     );
     return rows
       .map((r) => {

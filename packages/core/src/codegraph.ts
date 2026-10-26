@@ -126,7 +126,7 @@ export type ModuleContext = {
   imports: { to: string; names: string[] }[];
   /**
    * Tests to run when it changes, the same ones impact gives for it at MODULE_TESTS_DEPTH: test files among its
-   * importers up to that many hops, and the tests covering any of them (TESTS edges). Sorted.
+   * importers up to that many hops, and the tests covering any of them (TESTS edges). Nearest first.
    */
   tests: string[];
   /** Current facts from code scans about this file. */
@@ -144,7 +144,7 @@ export type Impact = {
   paths: string[];
   /** Files that import them, transitively up to the depth, nearest first. */
   dependents: { path: string; depth: number }[];
-  /** Tests to run: test files among the paths and dependents, and tests covering any of them. Sorted. */
+  /** Tests to run: test files among the paths and dependents, and tests covering any of them, nearest first. */
   tests: string[];
   misses: FileMiss[];
   lessons: Lesson[];
@@ -153,8 +153,8 @@ export type Impact = {
 /** Where agents keep getting corrected: churn, misses and dependents of a file, and the score they make. */
 export type Hotspot = { path: string; churn: number; misses: number; dependents: number; score: number };
 /** includeTests: rank test files too (by default they are left out: a busy test file is rarely where agents struggle). */
-/** missesOnly: only files a confirmed miss touched. */
-export type HotspotOpts = { includeTests?: boolean; missesOnly?: boolean };
+/** missesOnly: only files a confirmed miss touched. run: the asking run (CodeGraphStore.moduleContext). */
+export type HotspotOpts = { includeTests?: boolean; missesOnly?: boolean; run?: string | null };
 
 /**
  * The code map drawn as a graph: the top `limit` files by hotspot score (tests left out unless included), their
@@ -490,13 +490,16 @@ export interface CodeGraphReads {
   testsOf(projectKey: string, paths: string[]): Promise<string[]>;
   /** How many files import each mapped file (only files with at least one importer). */
   importerCounts(projectKey: string): Promise<Map<string, number>>;
-  /** Misses of the project (feedback not rejected) whose session edited a file, for these paths or all of them. */
-  missesOn(projectKey: string, paths: string[] | null): Promise<FileMissRow[]>;
+  /**
+   * Misses of the project (feedback not rejected) whose session edited a file, for these paths or all of them. run
+   * (here, in approvedLessons and currentFacts): the asking run; another run's sandbox records are left out.
+   */
+  missesOn(projectKey: string, paths: string[] | null, run?: string | null): Promise<FileMissRow[]>;
   /** File-to-file IMPORTS and TESTS edges with either end among the paths, sorted. */
   edgesTouching(projectKey: string, paths: string[]): Promise<{ imports: { from: string; to: string }[]; tests: { test: string; target: string }[] }>;
   /** Approved lessons for the project, global ones included. */
-  approvedLessons(projectKey: string): Promise<Lesson[]>;
-  currentFacts(projectKey: string, path: string): Promise<StoredFact[]>;
+  approvedLessons(projectKey: string, run?: string | null): Promise<Lesson[]>;
+  currentFacts(projectKey: string, path: string, run?: string | null): Promise<StoredFact[]>;
 }
 
 /** One FileMiss per miss, merging its rows; ordered by feedback time, then id. */
@@ -514,32 +517,60 @@ export function groupMisses(rows: FileMissRow[]): FileMiss[] {
   return [...by.values()].sort((a, b) => cmp(a.ts, b.ts) || cmp(a.missId, b.missId));
 }
 
-/** Approved lessons that bear on files: derived from one of the misses, or whose paths cover one of the files. */
-export function lessonsFor(lessons: Lesson[], files: string[], misses: FileMiss[]): { lesson: Lesson; paths: string[] }[] {
+/**
+ * A path of a global lesson that names a file or folder of the project it was learned in (a literal path with a folder,
+ * such as app/jobs/retention.ts), not a pattern or a root file name any project may have (**\/*.sql, Dockerfile).
+ */
+const originPath = (l: Lesson, p: string) => l.projectKey === null && !!l.origin && p.includes('/') && !/[*?]/.test(p);
+
+/**
+ * Approved lessons that bear on files: derived from one of the misses, or whose paths cover one of the files. With
+ * `projectKey` (the project the files are in), a global lesson's paths in the project it was learned in (originPath)
+ * cover files only there: elsewhere a file of the same name is not the one the lesson is about.
+ */
+export function lessonsFor(lessons: Lesson[], files: string[], misses: FileMiss[], projectKey: string | null = null): { lesson: Lesson; paths: string[] }[] {
   const byMiss = new Map(misses.map((m) => [m.missId, m.paths]));
   const out: { lesson: Lesson; paths: string[] }[] = [];
   for (const l of lessons) {
-    const matched = new Set(files.filter((f) => l.paths.some((p) => pathMatches(p, f))));
+    const paths = projectKey === null || l.origin === projectKey ? l.paths : l.paths.filter((p) => !originPath(l, p));
+    const matched = new Set(files.filter((f) => paths.some((p) => pathMatches(p, f))));
     for (const p of (l.missId && byMiss.get(l.missId)) || []) matched.add(p);
     if (matched.size) out.push({ lesson: l, paths: [...matched].sort(cmp) });
   }
   return out.sort((a, b) => cmp(a.lesson.id, b.lesson.id));
 }
 
+/** The start files, then the dependents one hop away, two hops, and so on. */
+function byDepth(start: string[], dependents: { path: string; depth: number }[]): string[][] {
+  const layers: string[][] = Array.from({ length: Math.max(0, ...dependents.map((d) => d.depth)) + 1 }, () => []);
+  layers[0] = [...start];
+  for (const d of dependents) layers[d.depth].push(d.path);
+  return layers;
+}
+
 /** How many import hops moduleContext follows for its tests: impact's default depth, so the two agree. */
 export const MODULE_TESTS_DEPTH = 3;
 
 export function codeGraphViews(r: CodeGraphReads) {
-  /** Test files among `files`, and the tests covering any of them. Sorted. */
-  const testsFor = async (projectKey: string, files: string[]) => {
+  /**
+   * Test files among the files, and the tests covering any of them, nearest first: `layers[d]` are the files d import
+   * hops from the change, so a test file there is d away and a test covering one of them (a TESTS edge) d + 1. Ties
+   * by path. A capped list then keeps the tests most likely to catch the change.
+   */
+  const testsFor = async (projectKey: string, layers: string[][]) => {
+    const files = layers.flat();
     const known = (await Promise.all([r.mapFiles(projectKey, files), r.outsideFiles(projectKey, files)])).flat();
     const isTest = new Set(known.filter((f) => f.isTest).map((f) => f.path));
-    const covering = await r.testsOf(projectKey, files);
-    return [...new Set([...files.filter((p) => isTest.has(p)), ...covering])].sort(cmp);
+    const covering = await Promise.all(layers.map((ps) => (ps.length ? r.testsOf(projectKey, ps) : Promise.resolve([]))));
+    const out = new Set<string>();
+    for (let d = 0; d <= layers.length; d++) {
+      for (const t of [...(layers[d] ?? []).filter((p) => isTest.has(p)), ...(covering[d - 1] ?? [])].sort(cmp)) out.add(t);
+    }
+    return [...out];
   };
   /** Every mapped file with its hotspot numbers, highest score first (ties by path), and the miss rows they came from. */
-  const scored = async (projectKey: string) => {
-    const [files, counts, rows] = await Promise.all([r.mapFiles(projectKey), r.importerCounts(projectKey), r.missesOn(projectKey, null)]);
+  const scored = async (projectKey: string, run: string | null) => {
+    const [files, counts, rows] = await Promise.all([r.mapFiles(projectKey), r.importerCounts(projectKey), r.missesOn(projectKey, null, run)]);
     const missCount = new Map<string, Set<string>>();
     for (const m of rows) {
       let s = missCount.get(m.path);
@@ -557,7 +588,7 @@ export function codeGraphViews(r: CodeGraphReads) {
     return { ranked, rows };
   };
   const views = {
-    async moduleContext(projectKey: string, path: string): Promise<ModuleContext | null> {
+    async moduleContext(projectKey: string, path: string, run: string | null = null): Promise<ModuleContext | null> {
       const [file] = await r.mapFiles(projectKey, [path]);
       if (!file) return null;
       const [symbols, imports, importers, tests, facts, rows, lessons] = await Promise.all([
@@ -565,10 +596,10 @@ export function codeGraphViews(r: CodeGraphReads) {
         r.importsOf(projectKey, path),
         r.importersOf(projectKey, [path]),
         // Through the importers, as impact does: a test reaching the file in several hops has no TESTS edge to it.
-        expandDependents([path], MODULE_TESTS_DEPTH, (ps) => r.importersOf(projectKey, ps)).then((ds) => testsFor(projectKey, [path, ...ds.map((d) => d.path)])),
-        r.currentFacts(projectKey, path),
-        r.missesOn(projectKey, [path]),
-        r.approvedLessons(projectKey),
+        expandDependents([path], MODULE_TESTS_DEPTH, (ps) => r.importersOf(projectKey, ps)).then((ds) => testsFor(projectKey, byDepth([path], ds))),
+        r.currentFacts(projectKey, path, run),
+        r.missesOn(projectKey, [path], run),
+        r.approvedLessons(projectKey, run),
       ]);
       const misses = groupMisses(rows);
       return {
@@ -579,24 +610,24 @@ export function codeGraphViews(r: CodeGraphReads) {
         tests,
         facts,
         misses,
-        lessons: lessonsFor(lessons, [path], misses).map((x) => x.lesson),
+        lessons: lessonsFor(lessons, [path], misses, projectKey).map((x) => x.lesson),
       };
     },
 
-    async impact(projectKey: string, paths: string[], depth: number): Promise<Impact> {
+    async impact(projectKey: string, paths: string[], depth: number, run: string | null = null): Promise<Impact> {
       const asked = [...new Set(paths)];
       // A file past the cap is a start too: the index knows who imports it.
       const mapped = (await Promise.all([r.mapFiles(projectKey, asked), r.outsideFiles(projectKey, asked)])).flat().map((f) => f.path).sort(cmp);
       const dependents = await expandDependents(mapped, Math.max(0, Math.floor(depth)), (ps) => r.importersOf(projectKey, ps));
       const all = [...mapped, ...dependents.map((d) => d.path)];
-      const [tests, rows, lessons] = await Promise.all([testsFor(projectKey, all), r.missesOn(projectKey, all), r.approvedLessons(projectKey)]);
+      const [tests, rows, lessons] = await Promise.all([testsFor(projectKey, byDepth(mapped, dependents)), r.missesOn(projectKey, all, run), r.approvedLessons(projectKey, run)]);
       const misses = groupMisses(rows);
       return {
         paths: mapped,
         dependents,
         tests,
         misses,
-        lessons: lessonsFor(lessons, all, misses).map((x) => x.lesson),
+        lessons: lessonsFor(lessons, all, misses, projectKey).map((x) => x.lesson),
       };
     },
 
@@ -610,12 +641,12 @@ export function codeGraphViews(r: CodeGraphReads) {
       const importers = await r.importersOf(projectKey, files.map((f) => f.path));
       return Promise.all(files.map(async (f) => {
         const direct = [...(importers.get(f.path) ?? [])].sort(cmp);
-        return { path: f.path, importers: direct, tests: await testsFor(projectKey, direct) };
+        return { path: f.path, importers: direct, tests: await testsFor(projectKey, [direct]) };
       }));
     },
 
     async hotspots(projectKey: string, limit: number, opts: HotspotOpts = {}): Promise<Hotspot[]> {
-      const { ranked } = await scored(projectKey);
+      const { ranked } = await scored(projectKey, opts.run ?? null);
       return ranked
         .filter((h) => (opts.includeTests || !h.isTest) && (!opts.missesOnly || h.misses > 0))
         .slice(0, Math.max(0, limit))
@@ -624,7 +655,7 @@ export function codeGraphViews(r: CodeGraphReads) {
 
     async mapGraph(projectKey: string, opts: HotspotOpts & { limit: number }): Promise<MapGraph> {
       const limit = Math.max(0, Math.floor(opts.limit));
-      const { ranked, rows } = await scored(projectKey);
+      const { ranked, rows } = await scored(projectKey, opts.run ?? null);
       const eligible = ranked.filter((h) => opts.includeTests || !h.isTest);
       const top = eligible.slice(0, limit);
       const topPaths = new Set(top.map((h) => h.path));
@@ -636,7 +667,7 @@ export function codeGraphViews(r: CodeGraphReads) {
       const neighbors = ranked.filter((h) => near.has(h.path)).slice(0, limit);
       const shown = new Set([...topPaths, ...neighbors.map((h) => h.path)]);
       const misses = groupMisses(rows.filter((m) => shown.has(m.path)));
-      const lessons = lessonsFor(await r.approvedLessons(projectKey), [...shown].sort(cmp), misses);
+      const lessons = lessonsFor(await r.approvedLessons(projectKey, opts.run ?? null), [...shown].sort(cmp), misses, projectKey);
       return {
         files: [...top, ...neighbors].map((h) => ({ ...h, top: topPaths.has(h.path) })),
         imports: edges.imports.filter((e) => shown.has(e.from) && shown.has(e.to)),
@@ -657,11 +688,11 @@ export function codeGraphViews(r: CodeGraphReads) {
       });
     },
 
-    async lessonsForPaths(projectKey: string, paths: string[]): Promise<{ lesson: Lesson; paths: string[] }[]> {
+    async lessonsForPaths(projectKey: string, paths: string[], run: string | null = null): Promise<{ lesson: Lesson; paths: string[] }[]> {
       const files = [...new Set(paths)];
       if (!files.length) return [];
-      const [rows, lessons] = await Promise.all([r.missesOn(projectKey, files), r.approvedLessons(projectKey)]);
-      return lessonsFor(lessons, files, groupMisses(rows));
+      const [rows, lessons] = await Promise.all([r.missesOn(projectKey, files, run), r.approvedLessons(projectKey, run)]);
+      return lessonsFor(lessons, files, groupMisses(rows), projectKey);
     },
   };
   return views;
@@ -685,7 +716,7 @@ const STOPWORDS = new Set(
  * Words that do name code, but so much of it that a hit on them alone says nothing: next to a more specific word of
  * the question, a symbol or file matching only these is no hit ("modal component" finds modals, not `components`).
  */
-const GENERIC = new Set(
+export const GENERIC = new Set(
   ('list item data value type util utils helper component element info base common core main index default config ' +
     'set get handle handler manager service model view state store result error').split(' '),
 );
@@ -710,9 +741,9 @@ const wordsOf = (s: string): string[] =>
 
 /**
  * The terms of a question that can name code: its words and identifiers (an identifier also as its parts), folded,
- * stopwords and words shorter than three letters dropped, unique, in order of appearance.
+ * stopwords and words shorter than three letters dropped, unique, in order of appearance; at most `max` of them.
  */
-export function codeTerms(text: string): string[] {
+export function codeTerms(text: string, max = MAX_TERMS): string[] {
   const out = new Set<string>();
   for (const raw of text.match(/[A-Za-z][A-Za-z0-9_]*/g) ?? []) {
     const parts = wordsOf(raw);
@@ -721,7 +752,7 @@ export function codeTerms(text: string): string[] {
       if (t.length >= MIN_TERM && !STOPWORDS.has(t) && !STOPWORDS.has(w.toLowerCase())) out.add(t);
     }
   }
-  return [...out].slice(0, MAX_TERMS);
+  return [...out].slice(0, max);
 }
 
 /** A symbol or a file a question is about, with where it is used and the tests that cover it. */

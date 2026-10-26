@@ -253,11 +253,19 @@ function ServiceCard({ kind, view, onChange }: { kind: IntegrationKind; view: In
   );
 }
 
-function syncCell(x: { lastSyncAt: string | null; items: number; error: string | null }, on: boolean): ReactNode {
+function syncCell(x: { lastSyncAt: string | null; items: number; error: string | null; backlog?: { since: string; until: string } | null }, on: boolean): ReactNode {
   if (!on) return <span className="text-muted">off</span>;
   if (x.error) return <span className="text-bad-text [overflow-wrap:anywhere]" title={x.error}>error: {x.error.slice(0, 120)}</span>;
   if (!x.lastSyncAt) return <span className="text-muted">waiting for the first sync</span>;
-  return <span title={x.lastSyncAt}>{ago(x.lastSyncAt)} · {plural(x.items, 'comment')}</span>;
+  const synced = <span title={x.lastSyncAt}>{ago(x.lastSyncAt)} · {plural(x.items, 'comment')}</span>;
+  if (!x.backlog) return synced;
+  // A sync stopped by its cap: the newest pull requests were read, these are read on the next syncs.
+  return (
+    <span className="flex flex-col gap-0.5">
+      {synced}
+      <span className="text-muted">catching up: pull requests updated {x.backlog.since.slice(0, 10)} to {x.backlog.until.slice(0, 10)} are read on the next syncs</span>
+    </span>
+  );
 }
 
 /** Each selected project: the repository its remote names (or GITHUB_REPOS), on or off, and its Linear team. */

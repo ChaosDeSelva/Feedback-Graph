@@ -1,7 +1,17 @@
 import type { ScanJob } from '@fb/core';
 
+/** What a running scan can ask the runner. */
+export type ScanTurn = {
+  /**
+   * Whether another scan waits for this one's slot (asked between shards): an agentic one while this holds the agentic
+   * slot, or any while every slot is taken; true too once the runner is stopping. A waiting scan a free slot can run
+   * is started there instead, and is no reason to give way.
+   */
+  waiting(): Promise<boolean>;
+};
+
 export type ScanRunnerDeps = {
-  /** The oldest due queued job other than these ids (FactsStore.nextScanJob). */
+  /** The due queued job that has waited longest, other than these ids (FactsStore.nextScanJob). */
   next(exclude: string[]): Promise<ScanJob | null>;
   /** Whether the job's model explores the repo itself (codex-cli, claude-cli): those run one at a time. */
   agentic(job: ScanJob): boolean;
@@ -11,7 +21,7 @@ export type ScanRunnerDeps = {
    * Run one job to its end (done, failed, or queued again with a retryAt). True when it finished; false when it went
    * back to wait, so the runner does not pick the queue up again on its own (the worker loop kicks it next cycle).
    */
-  run(job: ScanJob): Promise<boolean>;
+  run(job: ScanJob, turn: ScanTurn): Promise<boolean>;
   /** SCAN_CONCURRENCY. */
   concurrency: number;
   log?: (msg: string, extra?: object) => void;
@@ -24,11 +34,16 @@ const AGENTIC_SLOTS = 1;
  * or a per-file job that can start, so a long queue costs few queries.
  */
 const MAX_PASSED_OVER = 20;
+/** A scan with no code files finishes without a model call: nothing to give way for. */
+const NO_TURN: ScanTurn = { waiting: async () => false };
 
 /**
  * Scans beside the worker cycle: up to `concurrency` at once, agentic ones one at a time, so a queue of 70 projects
  * no longer waits for one scan per cycle behind classification. kick() fills free slots and returns at once; a slot
  * that frees up fills itself. Jobs are claimed one at a time (fill is never concurrent), so no job runs twice.
+ * Fair across projects: a sharded scan asks after each shard whether another scan waits for its slot (ScanTurn) and,
+ * when one does, goes back in the queue behind it, so a 40-shard scan takes turns with small ones instead of holding
+ * the agentic slot for hours.
  */
 export class ScanRunner {
   private readonly d: ScanRunnerDeps;
@@ -38,6 +53,12 @@ export class ScanRunner {
   private stopped = false;
   /** Jobs already found to have files, so a job waiting for a slot is not listed again on every fill. */
   private readonly hasFiles = new Set<string>();
+  /**
+   * Jobs that gave way (waiting() said true), with whether they held the agentic slot: passed over while any other job
+   * can be had, so a job that gave way never gets its slot straight back while another waits, whatever the queue's
+   * order. Dropped when it starts again, or once another job takes the kind of slot it gave up.
+   */
+  private readonly yielded = new Map<string, boolean>();
 
   constructor(d: ScanRunnerDeps) {
     this.d = d;
@@ -83,12 +104,15 @@ export class ScanRunner {
   private async fill(): Promise<void> {
     const passedOver: string[] = [];
     while (!this.stopped) {
-      const job = await this.d.next([...this.active.keys(), ...passedOver]);
+      const taken = [...this.active.keys(), ...passedOver];
+      // waiting() asked for the next job other than the one running; this asks the same, so a yield goes to it.
+      let job = await this.d.next([...taken, ...this.yielded.keys()]);
+      if (!job && this.yielded.size) job = await this.d.next(taken);
       if (!job || this.stopped) return;
       if (!this.hasFiles.has(job.id)) {
         if (await this.d.empty(job).catch(() => false)) {
           // Finishes without a model call: no slot, and the queue moves on at once.
-          await this.d.run(job).catch((err) => this.d.log?.('scan runner: a scan threw', { project: job.projectKey, error: String(err) }));
+          await this.d.run(job, NO_TURN).catch((err) => this.d.log?.('scan runner: a scan threw', { project: job.projectKey, error: String(err) }));
           continue;
         }
         this.hasFiles.add(job.id);
@@ -105,11 +129,38 @@ export class ScanRunner {
     }
   }
 
+  /** ScanTurn.waiting for the running job `id`. */
+  private async waiting(id: string): Promise<boolean> {
+    if (this.stopped) return true;
+    const self = this.active.get(id);
+    const exclude = [...this.active.keys()];
+    for (let i = 0; i < MAX_PASSED_OVER; i++) {
+      const other = await this.d.next(exclude).catch(() => null);
+      if (!other || this.stopped) return this.stopped;
+      exclude.push(other.id);
+      const agentic = this.d.agentic(other);
+      const full = this.active.size >= Math.max(1, this.d.concurrency);
+      // It needs the slot this job holds: the agentic one, or any slot while all are taken. fill() serves it before
+      // this job comes round again.
+      if (full || (agentic && self?.agentic)) {
+        this.yielded.set(id, !!self?.agentic);
+        return true;
+      }
+      // A free slot can run it: start it there and go on.
+      if (!agentic) this.kick();
+    }
+    return false;
+  }
+
   private start(job: ScanJob, agentic: boolean) {
+    this.yielded.delete(job.id);
+    // Another job took a slot of the kind those gave up (any slot for one that gave way because all were taken).
+    for (const [id, heldAgentic] of this.yielded) if (agentic || !heldAgentic) this.yielded.delete(id);
+    const turn: ScanTurn = { waiting: () => this.waiting(job.id) };
     const done = (async () => {
       let progressed = false;
       try {
-        progressed = await this.d.run(job);
+        progressed = await this.d.run(job, turn);
       } catch (err) {
         this.d.log?.('scan runner: a scan threw', { project: job.projectKey, error: String(err) });
       } finally {

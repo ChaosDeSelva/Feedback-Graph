@@ -2,7 +2,7 @@ import { mkdir, mkdtemp, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, test } from 'vitest';
-import { junkPathReason, repoHas, validateLessonPaths } from './paths.ts';
+import { junkPathReason, normalizeStoredPaths, repoFileList, repoHas, validateLessonPaths } from './paths.ts';
 
 test('repoHas looks in the repository on disk; no repository known is not a reason to drop a path', async () => {
   const repo = await mkdtemp(join(tmpdir(), 'fg-paths-'));
@@ -24,6 +24,10 @@ describe('junkPathReason', () => {
     expect(junkPathReason('src/webapp/AGENTS.md')).toMatch(/instruction file/);
     expect(junkPathReason('CLAUDE.md')).toMatch(/instruction file/);
     expect(junkPathReason('acme/shop#13513')).toMatch(/pull request/);
+    expect(junkPathReason('#13513')).toMatch(/pull request/);
+    expect(junkPathReason('pull/13859/head')).toMatch(/pull request/);
+    expect(junkPathReason('refs/pull/77/merge')).toMatch(/pull request/);
+    expect(junkPathReason('PR-812')).toMatch(/pull request/);
     expect(junkPathReason('github/acme/shop#14254')).toMatch(/pull request/);
     expect(junkPathReason('handleUpload')).toMatch(/identifier/);
     expect(junkPathReason('~/.config/acme/settings.json')).toMatch(/repository/);
@@ -87,5 +91,57 @@ describe('validateLessonPaths', () => {
   test('without a repository to look in, existence is not checked', async () => {
     const r = await validateLessonPaths(['api/other.ts'], { named: '', touched: { edited: ['api/other.ts'], fixed: [] }, transcript: true });
     expect(r.paths).toEqual(['api/other.ts']);
+  });
+});
+
+/** A data-pipeline repository: one file name in two folders, the rest unique. */
+const pipeline = [
+  'web/src/upload/constants.ts', 'web/src/upload/handleUpload.ts', 'jobs/export/csv.ts', 'jobs/import/csv.ts',
+  'jobs/export/schedule.go', 'migrations/0042_orders.sql', 'README.md',
+];
+const inPipeline = async (p: string) => pipeline.includes(p) || pipeline.some((f) => f.startsWith(`${p}/`));
+const listing = async () => pipeline;
+
+describe('the repository listing', () => {
+  test('a bare file name resolves to its one match in the repository; two matches keep it and say which', async () => {
+    const r = await validateLessonPaths(['schedule.go', 'csv.ts'], { named: '', touched: { edited: [], fixed: [] }, exists: inPipeline, repoFiles: listing, transcript: true });
+    expect(r.paths).toEqual(['jobs/export/schedule.go', 'csv.ts']);
+    expect(r.ambiguous).toEqual([{ path: 'csv.ts', matches: ['jobs/export/csv.ts', 'jobs/import/csv.ts'] }]);
+  });
+
+  test('a bare file name the repository does not have is dropped, as is a glob that matches nothing', async () => {
+    const r = await validateLessonPaths(['orders.py', 'jobs/**/*.rs', 'jobs/**/*.go'], { named: '', touched: { edited: [], fixed: [] }, exists: inPipeline, repoFiles: listing, transcript: true });
+    expect(r.paths).toEqual(['jobs/**/*.go']);
+    expect(r.dropped).toEqual([
+      { path: 'orders.py', why: 'no such file in the repository' },
+      { path: 'jobs/**/*.rs', why: 'a glob that matches no file in the repository' },
+    ]);
+  });
+
+  test('repoFileList lists the files of a folder (a repository or not); none known is null', async () => {
+    const repo = await mkdtemp(join(tmpdir(), 'fg-list-'));
+    await mkdir(join(repo, 'jobs'));
+    await writeFile(join(repo, 'jobs/csv.ts'), '');
+    expect(await repoFileList(repo)).toContain('jobs/csv.ts');
+    expect(await repoFileList(null)).toBeNull();
+  });
+});
+
+describe('normalizeStoredPaths: the paths of a stored lesson, by the rule of today', () => {
+  test('resolves, drops and flags, each with why', async () => {
+    const r = await normalizeStoredPaths(
+      ['AGENTS.md', 'pull/13859/head', 'handleUpload', 'schedule.go', 'csv.ts', 'jobs/export/gone.ts', 'migrations/*.sql', 'web/**/*.vue', 'README.md'],
+      { exists: inPipeline, repoFiles: listing },
+    );
+    expect(r.paths).toEqual(['jobs/export/schedule.go', 'csv.ts', 'migrations/*.sql', 'README.md']);
+    expect(r.dropped.map((d) => d.path)).toEqual(['AGENTS.md', 'pull/13859/head', 'handleUpload', 'jobs/export/gone.ts', 'web/**/*.vue']);
+    expect(r.ambiguous.map((a) => a.path)).toEqual(['csv.ts']);
+    expect(r.resolved).toEqual([{ from: 'schedule.go', to: 'jobs/export/schedule.go' }]);
+  });
+
+  test('with no repository to look in, only the shape is checked', async () => {
+    const r = await normalizeStoredPaths(['AGENTS.md', 'schedule.go', 'jobs/export/gone.ts'], {});
+    expect(r.paths).toEqual(['schedule.go', 'jobs/export/gone.ts']);
+    expect(r.dropped.map((d) => d.path)).toEqual(['AGENTS.md']);
   });
 });

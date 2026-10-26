@@ -1,5 +1,134 @@
 # Changelog
 
+## 0.6.2 (2026-10-26)
+
+From the team's 0.6.1 field report (real headless Claude Code and Codex sessions end to end, a fresh install with
+planted secrets, a stress run on a large repository) and their audit of 143 proposed lessons: 21 approved as written,
+60 only after an edit, 62 rejected. Most of this release is about the lessons being right the first time.
+
+### Upgrading
+- At the first worker start, without you doing anything (each step once, logged in Activity with counts):
+  - **secret redaction v3** runs over stored facts, document texts, lessons, miss feedback, Inbox items, session
+    summaries and Activity. Facts you wrote are never closed; a fact that is itself a credential is.
+  - **lessons are re-checked (v4):** proposed lessons get their paths normalized against the repository; every lesson
+    gets the new flags (generic, two-in-one, wrong session, contradicts the session's evidence, built on another
+    project's Linear tickets). Approved lessons are only flagged, never rewritten.
+  - **comments are matched to sessions again** under the new rule; a proposed lesson built on the wrong session is
+    flagged, and one whose own post-mortem found no miss is rejected.
+  - **skip rules v3** run over the pending Inbox (bot reviews, approvals, status tables, folded review summaries).
+  - Codex sessions an older rule froze at their first turn are read again; transcripts are read once more to record
+    which instruction files each session had.
+  - Each cloud project is sent once more (the unchanged-check now uses a canonical form).
+- Store migrations 0034 to 0043.
+- **The operator token** can no longer choose which projects are read (`select_projects`) or delete a link
+  (`links_delete`) unless `OPERATOR_ALLOW` names them. Add them if a script relies on that.
+- **A second checkout** gets its own Docker Compose name (`FG_INSTANCE`), ports and Ollama port (`OLLAMA_PORT`) from
+  `./scripts/setup.sh`, and `install-agent.sh` registers it as `feedback-graph-<name>`. An existing install keeps its
+  name, ports and volumes.
+
+### Lessons
+- **A review comment is matched to a session only if the session worked on the pull request's branch or edited its
+  files,** never for being nearest in time (the most common reason the team rejected a lesson). With no match the
+  post-mortem works from the comment and the pull request alone, and says so.
+- **A post-mortem that finds the agent missed nothing proposes no lesson.** A nit, "Minor:" or optional comment never
+  becomes a project-wide lesson.
+- **Not pushback, so skipped:** reviews written by a bot or an AI, approvals with nothing to change, status tables,
+  notes about branch merge order. A review summary that repeats its inline comments is one Inbox item.
+- **A lesson whose rule is just "project" or a label is asked for again,** told why; if still empty the title becomes
+  the rule, or the lesson is dropped and logged (the miss is kept).
+- **New flags:** "generic" (a rule that names no file, function, value or command; listed last, with the reason) and
+  "two lessons in one".
+- **Lesson paths are checked against the repository:** a bare file name resolves to its one match, an ambiguous one is
+  flagged, missing files, pull request refs and globs matching nothing are dropped.
+- **The post-mortem learns from how you judged this project's earlier lessons:** what you changed (the writer's
+  version is now kept when you edit), what you rejected and why, and what you approved as written. Never another
+  project's, never a sandbox run's.
+- **How your lessons are judged** (approved as written, after an edit, rejected; 30 and 90 days, per project) on the
+  Lessons page, `fg lessons quality`, `fg status` and `/api/pipeline`.
+- **A global lesson can be narrowed to a project** on the Lessons page (or `projectKey` in `PATCH /api/lessons/:id`).
+- **A global lesson reaches an agent only when the task is on its topic,** and its own project's files no longer rank
+  it up elsewhere.
+
+### What agents are told
+- **Lesson counts are the project's own and the global ones, apart.**
+- **check_before_done reads the real diff:** the one the agent passes, or the repository's diff of `files_changed`. The
+  judge copies the diff lines each verdict rests on; a verdict with no line in the diff is "cannot tell from the diff",
+  neither a gap nor a pass. A size cut names the files it left out. It takes `session_id`, and the plugin passes it.
+  The Stop hook asks for `git diff` from the commit the session started at, and no longer counts a denied or failed
+  check_before_done as done.
+- **impact and get_module_context are capped and say what they left out:** the nearest 15 tests, 8 lessons, the 6
+  most recent misses (grouped), within about 4,000 characters. Facts and imports past 40 say "and N more".
+- **A post-mortem judges what the agent had loaded from the session itself** (attachments, `@AGENTS.md` imports, the
+  Codex instructions), and only sees Linear tickets linked to its project.
+- **A folder that is not selected** still gets global lessons, but its task and summary are not kept in Activity or
+  sent to the judge; check_before_done says the work was not judged.
+
+### Codex
+- The agent MCP tools carry MCP annotations, so `codex exec` can call them. `install-agent.sh` also prints the one-run
+  override: `codex exec -c 'mcp_servers.feedback-graph.default_tools_approval_mode="approve"'`.
+- A live Codex session is no longer frozen at its first turn when it later opens like a Claude Code conversation.
+
+### Secrets and privacy
+- Secrets assigned in code (`const API_KEY = "..."`, `token := "..."`, `self.password = '...'`), unquoted config
+  values, `-e`/`--password` flags and passwords written in prose are redacted everywhere, including Ask's snippets.
+  Database, cache, config and map keys, identifiers, paths and versions are not ("The primary key is user_id2." stays).
+- An uploaded image or document that shows a password no longer becomes a fact; uploaded text reaches a model fenced
+  as data.
+- No git command the tool runs on a project can run a filter, fsmonitor, textconv, external diff, signature program or
+  hook the repository configures.
+- An export with no project named covers the selected projects only.
+
+### Scans, queues and scale
+- **Scans take turns:** a big repository's sharded scan gives way after each shard to scans queued behind it, never
+  gets its slot straight back while another waits, and picks up where it left off (its file list and plan kept while
+  HEAD is unchanged).
+- **Each queue says how it stands** (scans by project, classify, post-mortems, Ask answers): how many wait, the oldest
+  wait, what runs now, in `/api/pipeline`, `fg status` and the Dashboard.
+- **A GitHub sync past 1,000 pull requests** reads the rest over the next syncs instead of skipping them, and says so.
+- **The Docs list** loads 100 at a time ("load older"; `limit` and `X-Next-Cursor` in the API).
+- **Neo4j** has indexes for the per-project lookups the Projects page makes.
+- **A post-mortem about auth code** no longer reads as "model not signed in"; one that keeps reading as unavailable is
+  recorded as failed after five tries instead of holding the queue.
+
+### Cloud sync
+- A project that keeps failing backs off on its own; the others sync on their interval, and Settings names it.
+- A project too large for the cloud is sent with its code map cut to the busiest files that fit, and says how many.
+  The bundle says `codeFilesPartial`, so a cloud from 0.6.2 on keeps the files it left out of the team's code map.
+- An unchanged project is not resent because rows came back in another order; Sync now and the scheduled sync no
+  longer lose each other's record of what was sent.
+
+### For testers and automation
+- **Runs:** label requests with `x-fg-run: <id>` (or `?run=<id>` on `/mcp`, `fg --run <id>`); Activity shows and
+  filters it. A run belongs to whoever opened it: a write under another caller's run id is refused.
+- **`fg cleanup --run <id>`** removes only what that run wrote: a dry run first, `--apply` to do it, keeping anything
+  you decided on since. The operator token may clean up only runs it opened.
+- **Sandbox runs** (`x-fg-sandbox: 1`): their records reach only that run (every list, search, count, Ask pack and code
+  map answer), and are never exported or synced.
+- **`fg evidence <session>`** (`GET /api/sessions/:id/evidence`): what the tool saw in a session and what it decided.
+- **`fg demo seed` / `fg demo remove`:** a labelled demo corpus in demo-shop so the lesson path can be tried on a fresh
+  install. Running it is your approval of those demo lessons; it never touches a file a scan recorded.
+- **Running Claude Code headless** (`claude -p`): a tool that is not allowed is denied, never prompted. Pass
+  `--allowedTools "mcp__plugin_feedback-graph_fg" "Bash(git diff *)"`; with `scripts/install-agent.sh claude` instead
+  of the plugin, allow `mcp__feedback-graph`. The plugin skill has the details.
+
+### Safer by default
+- **A lesson you edited or decided is never changed automatically:** a re-run post-mortem keeps your wording, the path
+  clean-up leaves your paths, and a "no miss" finding only flags it. Automatic rejections never count as yours in the
+  quality numbers or the writer's examples (operator-token decisions do, counted apart); ones already stored are
+  corrected once at start.
+- **A model outage, or a model busy with a scan, never uses up post-mortem attempts;** only an item that keeps failing
+  while the model answers everything else is charged.
+- **A run never takes over your records:** a sandbox tester's upload or link decision is its own copy beside yours,
+  any other labelled run gets a 409 on your documents, links, pins, Inbox items, lessons and chats unless you opened
+  it, and your decision on something a run made makes it yours, so cleanup leaves it. `fg cleanup` never labels its
+  own request with the run it removes.
+- **check_before_done judges only the lessons get_task_context would serve** (lessons tied to the changed files always),
+  and when a diff is over its ~32 KB budget it keeps the files the lessons and misses name first. If you deny the tool,
+  the Stop hook says so once and stops asking.
+
+### Changed
+- **The Dashboard** gives Where agents struggle and Recent activity a full-width row each.
+
 ## 0.6.1 (2026-10-25)
 
 0.6.1 makes 0.6.0 work on the data an install already holds, and on a large real repository. Each rule change now

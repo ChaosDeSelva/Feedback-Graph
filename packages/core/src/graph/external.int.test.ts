@@ -157,6 +157,58 @@ describeStores('external feedback threads', (h) => {
     expect(d?.feedback?.external).toEqual({ source: 'github', author: 'reviewer', url: ref(1).url, reviewState: 'APPROVED' });
   });
 
+  test("a synced comment's work-session links can be set again (a re-match under a new rule); other turns are left alone", async () => {
+    await store.graph.upsertExternalThread(project, thread(2));
+    expect(await store.graph.setExternalLinks('github:acme/shop#7/c1', ['s-loader'])).toBe(true);
+    const turns = await store.graph.unclassifiedTurns(10, ['shop']);
+    expect(turns.find((t) => t.index === 1)?.external).toMatchObject({ linkedSessionIds: ['s-loader'], author: 'reviewer', path: 'src/cart.ts' });
+    expect(turns.find((t) => t.index === 2)?.external?.linkedSessionIds).toEqual([]);
+    expect(await store.graph.setExternalLinks('github:acme/shop#7/c1', [])).toBe(true);
+    expect((await store.graph.unclassifiedTurns(10, ['shop'])).find((t) => t.index === 1)?.external?.linkedSessionIds).toEqual([]);
+    // A transcript turn has no comment details to link; an unknown turn is no turn.
+    await store.graph.upsertSession(project, work('s1', 'feat/checkout', '2026-10-01T09:00:00Z', '2026-10-01T09:00:00Z'), []);
+    expect(await store.graph.setExternalLinks('s1-t1', ['x'])).toBe(false);
+    expect(await store.graph.setExternalLinks('nope', ['x'])).toBe(false);
+  });
+
+  test("lessons from comments come back with the comment's full details and their miss, by status and id", async () => {
+    const unit = Array.from({ length: 768 }, (_, i) => (i === 0 ? 1 : 0));
+    const t = thread(2);
+    t.items[1].external = { ...ref(2), prFiles: ['pipeline/load.py'], linkedSessionIds: ['s-ui'] };
+    await store.graph.upsertExternalThread(project, t);
+    for (const n of [1, 2]) {
+      await store.graph.saveClassification(`github:acme/shop#7/c${n}`, pushback, true);
+      await store.graph.decide(`github:acme/shop#7/c${n}`, 'confirmed', null);
+      await store.knowledge.savePostmortem(`github:acme/shop#7/c${n}`, {
+        taskTitle: 'Loader', missed: `missed ${n}`, cause: 'implementation_error', causeExplanation: `because ${n}`, outcome: 'addressed',
+        lesson: { title: 'Stream rows', rule: 'Stream rows in pipeline/load.py', appliesWhen: 'loader work', scope: 'project', paths: ['pipeline/load.py'] },
+        contextItems: [], lessonChecks: [{ name: 'needs-path', why: 'x' }],
+      }, { miss: unit, lesson: unit });
+    }
+    // A lesson from a transcript is not a comment's.
+    await store.graph.upsertSession(project, work('s1', 'feat/checkout', '2026-10-01T09:00:00Z', '2026-10-01T09:00:00Z'), []);
+    await store.graph.saveClassification('s1-t1', pushback, true);
+    await store.graph.decide('s1-t1', 'confirmed', null);
+    await store.knowledge.savePostmortem('s1-t1', {
+      taskTitle: 'T', missed: 'm', cause: 'implementation_error', causeExplanation: 'c', outcome: 'addressed',
+      lesson: { title: 't', rule: 'r', appliesWhen: 'w', scope: 'project', paths: [] }, contextItems: [],
+    }, { miss: unit, lesson: unit });
+
+    const all = await store.knowledge.commentLessons!({ status: 'proposed', limit: 10 });
+    expect(all.map((l) => l.id)).toEqual(['lesson:github:acme/shop#7/c1', 'lesson:github:acme/shop#7/c2']);
+    expect(all[1]).toEqual({
+      id: 'lesson:github:acme/shop#7/c2', feedbackId: 'github:acme/shop#7/c2', projectKey: 'shop', text: 'comment 2',
+      external: expect.objectContaining({ prFiles: ['pipeline/load.py'], linkedSessionIds: ['s-ui'], branch: 'feat/checkout', path: 'src/cart.ts' }),
+      checks: [{ name: 'needs-path', why: 'x' }], missed: 'missed 2', causeExplanation: 'because 2', ownerEdited: false,
+    });
+    // An edit by the owner while it is proposed: the re-match must leave it to the owner.
+    await store.knowledge.updateLesson(all[1].id, { rule: 'Stream rows in pipeline/load.py, never buffer them' }, { by: 'you' });
+    expect((await store.knowledge.commentLessons!({ status: 'proposed', limit: 10 }))[1].ownerEdited).toBe(true);
+    expect((await store.knowledge.commentLessons!({ status: 'proposed', limit: 1, afterId: all[0].id })).map((l) => l.id)).toEqual([all[1].id]);
+    await store.knowledge.updateLesson(all[0].id, { status: 'rejected' }, { by: 'you' });
+    expect((await store.knowledge.commentLessons!({ status: 'proposed', limit: 10 })).map((l) => l.id)).toEqual([all[1].id]);
+  });
+
   test('an agent report never merges into a synced comment', async () => {
     const now = new Date().toISOString();
     await store.graph.upsertExternalThread(project, {

@@ -35,7 +35,7 @@ const PLATITUDE = /^\s*(always|never|make sure to|be sure to)\s+(verify|validate
 /** Something from the code: a path, a dotted or snake/camel-case name, a call, a backticked span, a CONSTANT. */
 const IDENTIFIER = /`[^`]+`|\w+\/\w+|\w+\.\w+|\w+_\w+|\b[a-z]+[A-Z]\w*|\b\w+\(\)|\b[A-Z]{2,}[A-Z0-9_]*\b/;
 /** Words a small model puts in the rule field instead of a rule. */
-const SCOPE_WORDS = new Set(['task', 'project', 'global', 'context_missing', 'context_available_ignored', 'code_not_read', 'requirement_unstated', 'verification_gap', 'implementation_error']);
+export const SCOPE_WORDS = new Set(['task', 'project', 'global', 'context_missing', 'context_available_ignored', 'code_not_read', 'requirement_unstated', 'verification_gap', 'implementation_error']);
 /** The verbs a rule starts with, at the start of the rule or of a clause ("When X, ensure Y"). */
 const DO = 'do|don\'?t|use|avoid|prefer|keep|make|check|ensure|add|remove|read|write|call|pass|set|run|test|assert|lock|validate|verify|carry|label|flag|document|return|reuse|filter|derive|split|resolve|guard|cover|update|fix|rename|move|wait|retry|stop|skip|treat|mark|include|exclude|handle|configure|register|define|declare|put|place|import|export|scope|limit|log|send|store|load|cache|escape|sanitize|redact|sort|close|release|clear|delete|create|replace|look|search|ask|confirm|compare|measure|wrap|catch|throw|raise|emit|parse|normalize|trim|clamp';
 const IMPERATIVE_LEAD = new RegExp(`(^|[,;:]|\\bthen|\\bso)\\s*(${DO})\\b`, 'i');
@@ -49,7 +49,7 @@ const AWARE = /^\s*(?:(?:always|when [^,]{1,80},|if [^,]{1,80},)\s*)?(?:remember
 /** A declarative sentence about the codebase: "<subject> is / defaults to / lives under / uses ...". */
 const DECLARATIVE = /\b(is|are|was|were|defaults? to|lags?|uses|reads|returns|carries|holds|stores|runs|has|have|pins?|caps?|counts?|lives?|resides?|sits|shares?|relies on|depends on|expects|contains|exposes|requires|owns|wraps|calls|sends|emits|loads|writes|located|configured|defined|declared|registered|handled|implemented|built with)\b/i;
 
-const imperative = (s: string) => IMPERATIVE_LEAD.test(s) || IMPERATIVE_WORD.test(s);
+export const imperative = (s: string) => IMPERATIVE_LEAD.test(s) || IMPERATIVE_WORD.test(s);
 
 /** The rule says how the code is rather than what to do (it may belong in the project facts). */
 export function statesAFact(rule: string): boolean {
@@ -58,6 +58,104 @@ export function statesAFact(rule: string): boolean {
   if (imperative(core)) return false;
   return !!aware || DECLARATIVE.test(core);
 }
+/**
+ * The words of a rule that name nothing in particular: process verbs ("check", "verify", "follow", "consult"), their
+ * objects ("patterns", "feedback", "edge cases", "the full sequence") and fillers. Stems (see stem()).
+ */
+const PROCESS_VERBS = new Set([
+  'check', 'verify', 'validate', 'ensure', 'confirm', 'test', 'review', 'consult', 'follow', 'consider', 'prioritize', 'prioritise',
+  'treat', 'apply', 'profile', 'look', 'search', 'read', 'understand', 'analyze', 'analyse', 'investigate', 'double-check', 'cross-reference',
+  'maintain', 'monitor', 'make', 'be', 'pay', 'respect', 'adhere', 'honor', 'honour', 'think', 'plan', 'document', 'communicate', 'ask',
+  'clarify', 'implement', 'handle', 'address', 'incorporate', 'assess', 'evaluate', 'inspect', 'examine', 'audit', 'keep', 'use', 'avoid',
+  'mark', 'run', 'write', 'add', 'update', 'reuse', 'align', 'match', 'mirror', 'stick', 'compare',
+]);
+const GENERIC_WORDS = new Set([
+  ...PROCESS_VERBS,
+  'always', 'never', 'sure', 'careful', 'carefully', 'thorough', 'thoroughly', 'properly', 'correctly', 'fully', 'explicitly', 'explicit',
+  'mandatory', 'required', 'requirement', 'existing', 'exist', 'new', 'full', 'entire', 'complete', 'all', 'any', 'every', 'each', 'other',
+  'relevant', 'related', 'similar', 'appropriate', 'necessary', 'possible', 'potential', 'important', 'common', 'general', 'specific',
+  'pattern', 'convention', 'standard', 'guideline', 'practice', 'best', 'approach', 'consistency', 'consistent', 'quality', 'style', 'stylistic',
+  'formatting', 'feedback', 'comment', 'pr', 'prs', 'pull', 'request', 'reviewer', 'nit', 'nitpick', 'suggestion', 'instruction', 'doc',
+  'docs', 'documentation', 'code', 'codebase', 'change', 'functionality', 'feature', 'task', 'work', 'project', 'repo', 'repository', 'file',
+  'edge', 'case', 'scenario', 'concurrency', 'performance', 'security', 'error', 'issue', 'problem', 'bug', 'behavior', 'behaviour', 'logic',
+  'flow', 'process', 'step', 'sequence', 'detail', 'context', 'user', 'developer', 'team', 'expectation', 'intent', 'scope', 'impact', 'side',
+  'effect', 'result', 'output', 'input', 'assumption', 'decision', 'rule', 'lesson', 'thing', 'way', 'part', 'when', 'before', 'after',
+  'during', 'complete', 'completion', 'done', 'finished', 'final', 'time', 'first', 'again', 'also', 'correct', 'correctness', 'accurate',
+  'accuracy', 'attention', 'mind', 'aware', 'account', 'priority', 'blocking', 'non-blocking', 'minor', 'major', 'critical',
+]);
+const STOP_WORDS = new Set([
+  'a', 'an', 'the', 'to', 'for', 'of', 'in', 'on', 'at', 'by', 'with', 'from', 'into', 'onto', 'as', 'and', 'or', 'but', 'is', 'are',
+  'be', 'it', 'its', 'this', 'that', 'these', 'those', 'than', 'then', 'there', 'so', 'if', 'not', 'no', 'do', 'don', 't', 'does', 'must',
+  'should', 'can', 'could', 'will', 'would', 'may', 'might', 'need', 'needs', 'have', 'has', 'what', 'which', 'who', 'how', 'why', 'where',
+  'what', 'them', 'they', 'their', 'you', 'your', 'we', 'our', 'any', 'even', 'only', 'just', 'too', 'very', 'more', 'most', 'less',
+]);
+/** Acronyms that name a kind of thing, not a thing. */
+const GENERIC_ACRONYMS = new Set(['PR', 'PRS', 'MR', 'CI', 'QA', 'UI', 'UX', 'TODO', 'LGTM', 'API']);
+
+/** A word reduced for the vocabulary: lower case, no plural, no -ing/-ed. */
+function stem(word: string): string {
+  const w = word.toLowerCase();
+  if (GENERIC_WORDS.has(w) || STOP_WORDS.has(w)) return w;
+  for (const [end, by] of [['ies', 'y'], ['ing', ''], ['ed', ''], ['es', ''], ['s', '']] as const) {
+    if (w.length > end.length + 3 && w.endsWith(end)) {
+      const s = w.slice(0, -end.length) + by;
+      if (GENERIC_WORDS.has(s) || GENERIC_WORDS.has(`${s}e`)) return GENERIC_WORDS.has(s) ? s : `${s}e`;
+    }
+  }
+  return w;
+}
+
+/** A token that names something: a path, a file, a dotted, snake or camel name, a call, a flag, a number, a CONSTANT. */
+function concrete(token: string): boolean {
+  if (/[/`]|\w\.\w|\w_\w|\b[a-z]+[A-Z]|\w\(\)|^--?\w|\d/.test(token)) return true;
+  return /^[A-Z][A-Z0-9_]+$/.test(token) && !GENERIC_ACRONYMS.has(token);
+}
+
+const tokens = (text: string) => text.split(/[\s,;:()"']+/).map((t) => t.replace(/^[.!?]+|[.!?]+$/g, '')).filter(Boolean);
+
+/**
+ * generic: the rule names no file, symbol, API, value, command or behaviour of its own, only process verbs and their
+ * objects ("check for existing patterns", "test concurrency edge cases", "verify the full sequence"). A future agent
+ * cannot check a change against it.
+ */
+export function isGeneric(rule: string): boolean {
+  const words = tokens(rule);
+  if (!words.length || words.some(concrete)) return false;
+  const content = words.map(stem).filter((w) => !STOP_WORDS.has(w));
+  const specific = content.filter((w) => !GENERIC_WORDS.has(w));
+  return specific.length < 2 && content.some((w) => PROCESS_VERBS.has(w));
+}
+
+/** A file a clause names: a path with a folder, or a name with an extension. */
+const FILE = /^[\w.@-]*\/[\w./*@-]+$|^[\w-]+\.[a-z]{1,5}$/;
+const CLAUSE_LEAD = new RegExp(`^(?:(?:never|always|do not|don'?t)\\s+\\w+|(?:${DO})\\b)`, 'i');
+const ALSO = /^(?:also|additionally|separately|in addition|and also)\b,?\s*/i;
+
+/**
+ * bundled: two independent instructions in one rule, about different files or subjects ("X in a.ts; also Y in b.go"):
+ * two misses, so the owner can split them. Only clauses that start with a verb count; two about different files, or a
+ * second one starting with "also" about different names.
+ */
+export function bundledClauses(rule: string): [string, string] | null {
+  const clauses = rule.split(/;\s+|\.\s+(?=[A-Z])/).map((c) => c.trim().replace(/[.]+$/, '')).filter(Boolean);
+  const parts = clauses
+    .map((c) => {
+      const also = ALSO.test(c);
+      const body = c.replace(ALSO, '');
+      const toks = tokens(body);
+      return { text: c, also, imperative: CLAUSE_LEAD.test(body), files: new Set(toks.filter((t) => FILE.test(t))), names: new Set(toks.filter(concrete)) };
+    })
+    .filter((p) => p.imperative);
+  const disjoint = (a: Set<string>, b: Set<string>) => a.size > 0 && b.size > 0 && ![...a].some((x) => b.has(x));
+  for (let i = 0; i < parts.length; i++) {
+    for (let j = i + 1; j < parts.length; j++) {
+      const [a, b] = [parts[i], parts[j]];
+      if (disjoint(a.files, b.files) || (b.also && disjoint(a.names, b.names))) return [a.text, b.text];
+    }
+  }
+  return null;
+}
+
 /** A comment that carries no new pushback: an approval summary, a findings status table, an echo of another review. */
 const NOT_PUSHBACK = [
   /^\W{0,4}(approving|approved|lgtm|looks good)\b/i,
@@ -109,7 +207,11 @@ function textFlags(lesson: PostMortem['lesson'], feedback: HumanTurn, model: Mod
   const flags: LessonFlag[] = [];
   const text = `${lesson.title}. ${lesson.rule}`;
   if (META.some((re) => re.test(text)) || model.about === 'process') flags.push({ name: 'meta-lesson', why: 'about how to treat feedback, not about the work' });
-  if ((PLATITUDE.test(lesson.title) || PLATITUDE.test(lesson.rule)) && !IDENTIFIER.test(lesson.rule)) flags.push({ name: 'platitude', why: 'a general rule that names nothing in the code; say what to check, where' });
+  // generic says more than platitude (which only reads the "Always verify ..." shape), so it stands in for it.
+  if (isGeneric(lesson.rule)) flags.push({ name: 'generic', why: 'names no file, function, value or command, only what to do in general: say what to check, where' });
+  else if ((PLATITUDE.test(lesson.title) || PLATITUDE.test(lesson.rule)) && !IDENTIFIER.test(lesson.rule)) flags.push({ name: 'platitude', why: 'a general rule that names nothing in the code; say what to check, where' });
+  const bundled = bundledClauses(lesson.rule);
+  if (bundled) flags.push({ name: 'bundled', why: `two separate instructions in one rule ("${bundled[0]}" and "${bundled[1]}"): split it into two lessons` });
   if (model.factLike) flags.push({ name: 'looks-like-a-fact', why: MODEL_FACT_WHY });
   else if (statesAFact(lesson.rule)) flags.push({ name: 'looks-like-a-fact', why: 'states how the code is rather than what to do: it may belong in the project facts' });
   const comment = feedback.text.trim();

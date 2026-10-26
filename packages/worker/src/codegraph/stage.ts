@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto';
 import { lstat } from 'node:fs/promises';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
-import { CODE_MAP_VERSION, type ActivityStore, type CodeGraphStore, type CodeMapStats } from '@fb/core';
+import { CODE_MAP_VERSION, filterOverrides, gitSafeEnv, type ActivityStore, type CodeGraphStore, type CodeMapStats } from '@fb/core';
 import { GIT_SAFE } from '../ingest/git.ts';
 import { MAX_AUTO_MAP_FILES } from '../scan/rank.ts';
 import { candidatePaths } from '../scan/scan.ts';
@@ -43,19 +43,27 @@ export async function repoFingerprint(
   o: { exec?: (args: string[], timeoutMs?: number) => Promise<string>; log?: (msg: string, extra?: object) => void; timeoutMs?: number; gitArgs?: readonly string[] } = {},
 ): Promise<string | null> {
   const timeoutMs = o.timeoutMs ?? gitStatusTimeoutMs(0);
-  const exec = o.exec ?? (async (args: string[], timeout = 30_000) => (await run('git', args, { timeout, maxBuffer: 64 * 1024 * 1024 })).stdout);
+  const exec = o.exec ?? (async (args: string[], timeout = 30_000) => (await run('git', args, { timeout, maxBuffer: 64 * 1024 * 1024, env: gitSafeEnv() })).stdout);
   // The repo is mounted read-only: --no-optional-locks stops `git status` from trying to refresh the index.
   // gitArgs: a worktree's git dir reached through the roots mapping (worktreeGitArgs).
   const base = ['--no-optional-locks', ...GIT_SAFE, '-C', repoPath, ...(o.gitArgs ?? [])];
   const git = (...args: string[]) => exec([...base, ...args]);
-  const status = (untracked: 'normal' | 'no') =>
-    exec([...base, 'status', '--porcelain=v1', '-z', `--untracked-files=${untracked}`, '--', '.'], timeoutMs);
   let top: string;
   try {
     top = (await git('rev-parse', '--show-toplevel')).trim();
   } catch {
     return null;
   }
+  // Status reads (and so cleans) every file whose stat changed: each filter the repo configures is switched off first
+  // (a filtered file may then show as modified; it does so every time, so the fingerprint is stable). Exit 1 is "none".
+  const filters = filterOverrides(await git('config', '-z', '--name-only', '--get-regexp', '^filter\\.').catch(() => ''));
+  if (!filters) {
+    o.log?.('git status skipped: a filter name cannot be switched off', { repoPath });
+    return null;
+  }
+  // Submodules are not entered: their own config could name filters this one does not switch off.
+  const status = (untracked: 'normal' | 'no') =>
+    exec([...base, ...filters, 'status', '--porcelain=v1', '-z', '--ignore-submodules=all', `--untracked-files=${untracked}`, '--', '.'], timeoutMs);
   const head = (await git('rev-parse', '-q', '--verify', 'HEAD').catch(() => '')).trim();
   const failed = (e: unknown, extra: object = {}) => {
     const err = e as { killed?: boolean; signal?: string; message?: string };

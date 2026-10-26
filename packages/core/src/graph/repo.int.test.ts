@@ -71,6 +71,16 @@ describeStores('GraphStore', (h) => {
       expect(await repo.callsAfter('nope')).toBeNull();
     });
 
+    test('sessionInstructionFiles: what the transcript showed the agent had, null when not recorded', async () => {
+      await repo.upsertSession(project, { ...session(2), instructionFiles: ['/Users/you/Vibe/demo/CLAUDE.md', '/Users/you/Vibe/demo/AGENTS.md'] }, []);
+      expect(await repo.sessionInstructionFiles('s1')).toEqual(['/Users/you/Vibe/demo/CLAUDE.md', '/Users/you/Vibe/demo/AGENTS.md']);
+      await repo.upsertSession(project, { ...session(2), instructionFiles: [] }, []);
+      expect(await repo.sessionInstructionFiles('s1')).toEqual([]);
+      await repo.upsertSession(project, session(2), []);
+      expect(await repo.sessionInstructionFiles('s1')).toBeNull();
+      expect(await repo.sessionInstructionFiles('nope')).toBeNull();
+    });
+
     test('pendingSessionItems: pending detector items from sessions with their calls; decided ones and agent reports are not', async () => {
       await repo.upsertSession(project, session(4), []);
       for (const t of ['t1', 't2', 't3']) await repo.saveClassification(t, pushback, true);

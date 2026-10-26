@@ -1,4 +1,6 @@
-name: feedback-graph
+# FG_INSTANCE (.env): one name per install, so a second checkout never adopts this one's containers and volumes.
+# Unset: feedback-graph, as before, so an existing install keeps its data. ./scripts/setup.sh picks one when needed.
+name: ${FG_INSTANCE:-feedback-graph}
 
 # No project folder is mounted here. You choose them in Settings (or PROJECTS_DIRS in .env); ./scripts/setup.sh then
 # writes docker-compose.override.yml with exactly those folders, read-only, plus PROJECT_ROOTS and HOST_PROJECT_ROOTS
@@ -279,7 +281,7 @@ services:
     volumes:
       - ollama-models:/root/.ollama
     ports:
-      - "127.0.0.1:11435:11434"
+      - "127.0.0.1:${OLLAMA_PORT:-11435}:11434"
 
 volumes:
   neo4j-data:

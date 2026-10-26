@@ -61,6 +61,38 @@ describeStores('DocsStore', (h) => {
     expect((await d.linkedDocs({ projectKey: 'shop', docIds: [ticket] })).map((l) => l.linked.docId)).toEqual([pr]);
   });
 
+  test('projectTickets: the ticket ids a project holds or its pull requests name, never another project\'s', async () => {
+    await d.upsertDoc({ ...doc('github:acme/shop#12', 'shop', 'github') }, [{ text: 'pr', embedding: vec(1) }], { tickets: ['OPS-9'] });
+    await d.upsertDoc({ ...doc('linear:SHOP-1', 'shop', 'linear') }, [{ text: 'ticket', embedding: vec(2) }]);
+    await d.upsertDoc({ ...doc('linear:OPS-5', 'blog', 'linear') }, [{ text: 'elsewhere', embedding: vec(2) }]);
+    expect((await d.projectTickets({ projectKey: 'shop', ids: ['SHOP-1', 'OPS-5', 'OPS-9', 'OPS-11'] })).sort()).toEqual(['OPS-9', 'SHOP-1']);
+    expect(await d.projectTickets({ projectKey: 'blog', ids: ['SHOP-1', 'OPS-9'] })).toEqual([]);
+    expect(await d.projectTickets({ projectKey: 'shop', ids: [] })).toEqual([]);
+  });
+
+  test('listDocs pages newest first with a cursor (no doc twice, none skipped, even at the same time), and finds one upload by name', async () => {
+    for (let i = 0; i < 5; i++) await d.upsertDoc(doc(`github:acme/shop#${i}`, 'shop', 'github'), [{ text: `pr ${i}`, embedding: vec(1) }, { text: 'review', embedding: vec(2) }]);
+    await d.upsertDoc(doc('spec.md'), [{ text: 'spec', embedding: vec(3) }], { read: true });
+    await d.upsertDoc(doc('other.md', 'blog'), [{ text: 'blog', embedding: vec(3) }]);
+    const all = await d.listDocs('shop');
+    expect(all).toHaveLength(6);
+    const paged: typeof all = [];
+    let after: { addedAt: string; id: string } | null = null;
+    for (let i = 0; i < 10; i++) {
+      const page = await d.listDocs('shop', { limit: 4, after });
+      expect(page.length).toBeLessThanOrEqual(4);
+      paged.push(...page);
+      if (page.length < 4) break;
+      after = { addedAt: page.at(-1)!.addedAt, id: page.at(-1)!.id };
+    }
+    expect(paged.map((x) => x.id)).toEqual(all.map((x) => x.id));
+    // the counts come with every page
+    expect(paged.find((x) => x.ref === 'github:acme/shop#3')).toMatchObject({ chunks: 2, read: null });
+    expect(paged.find((x) => x.ref === 'spec.md')).toMatchObject({ chunks: 1, read: { status: 'pending', facts: 0 } });
+    expect((await d.listDocs('shop', { source: 'upload', ref: 'spec.md' })).map((x) => x.ref)).toEqual(['spec.md']);
+    expect(await d.listDocs('shop', { source: 'github', ref: 'spec.md' })).toEqual([]);
+  });
+
   test('deleteDoc removes the doc and its chunks', async () => {
     const id = await d.upsertDoc(doc('spec.md'), [{ text: 'x', embedding: vec(1) }]);
     expect(await d.deleteDoc(id)).toBe(true);
@@ -73,6 +105,23 @@ describeStores('DocsStore', (h) => {
     expect(await d.getCursor('github:shop')).toBeNull();
     await d.setCursor('github:shop', '2026-10-22T00:00:00Z');
     expect(await d.getCursor('github:shop')).toBe('2026-10-22T00:00:00Z');
+  });
+
+  test('cursors are listed by prefix (a literal prefix: % and _ match only themselves) and can be deleted', async () => {
+    await d.setCursor('cloud-sync-sent:abc/shop', '{"a":1}');
+    await d.setCursor('cloud-sync-sent:abc/web_app', '{"b":2}');
+    await d.setCursor('cloud-sync-sent:abd/shop', 'other org');
+    await d.setCursor('cloud_sync-sent:abc/x', 'not the prefix');
+    const listed = await d.cursorsWithPrefix('cloud-sync-sent:abc/');
+    expect(listed.sort((a, b) => a.key.localeCompare(b.key))).toEqual([
+      { key: 'cloud-sync-sent:abc/shop', value: '{"a":1}' },
+      { key: 'cloud-sync-sent:abc/web_app', value: '{"b":2}' },
+    ]);
+    expect(await d.cursorsWithPrefix('cloud%')).toEqual([]);
+    await d.deleteCursor('cloud-sync-sent:abc/shop');
+    await d.deleteCursor('cloud-sync-sent:abc/nothing');
+    expect(await d.getCursor('cloud-sync-sent:abc/shop')).toBeNull();
+    expect((await d.cursorsWithPrefix('cloud-sync-sent:abc/')).map((c) => c.key)).toEqual(['cloud-sync-sent:abc/web_app']);
   });
 
   test('upsertDoc redacts secrets in the title and every chunk, whoever the caller is', async () => {

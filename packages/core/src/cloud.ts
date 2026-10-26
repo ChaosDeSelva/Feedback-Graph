@@ -44,14 +44,15 @@ export type SyncResponse = {
 export type WithdrawnItem = { kind: 'lesson' | 'miss' | 'doc'; id: string } | { kind: 'file'; id: string; projectKey: string };
 
 /** The sync body: the export bundle plus the two cloud fields. */
-export type SyncBundle = ExportBundle & { complete: boolean; withdrawn: WithdrawnItem[] };
+/** `codeFilesPartial`: the code map was cut to fit (pushFitting), so the cloud keeps the files it leaves out. */
+export type SyncBundle = ExportBundle & { complete: boolean; withdrawn: WithdrawnItem[]; codeFilesPartial?: boolean };
 
 /** What the cloud last accepted for a project: enough to name what has since gone, and to skip an unchanged bundle. */
 export type SentRecord = { fingerprint: string; remote: string | null; lessons: string[]; misses: string[]; docs: string[]; files: string[] };
 
 /**
  * What the cloud last accepted, per project key. A Map works (tests, a one-off run); the services use
- * storedSyncMemory, one record in the store shared by the worker's schedule and the api's Sync now.
+ * storedSyncMemory, records in the store shared by the worker's schedule and the api's Sync now.
  */
 export type SyncMemory = {
   get(key: string): SentRecord | undefined | Promise<SentRecord | undefined>;
@@ -60,36 +61,67 @@ export type SyncMemory = {
   keys(): Iterable<string> | Promise<Iterable<string>>;
 };
 
-/** The store cursor holding what one cloud org (URL and token; the token itself is never stored) last accepted. */
+/** The store cursor naming one cloud org (URL and token; the token itself is never stored): its records are under `<it>/`. */
 export const syncMemoryCursor = (cloud: Pick<CloudConfig, 'url' | 'token'>) =>
   `cloud-sync-sent:${createHash('sha256').update(`${cloud.url.replace(/\/+$/, '')}\0${cloud.token}`).digest('hex').slice(0, 24)}`;
 
 /**
- * SyncMemory kept in the store (a DocsStore cursor), so it survives restarts and is the one record both services use.
- * Keyed by the cloud URL and token: another org (or a new token) starts with no record, so nothing it never received
- * is withdrawn from it and no lesson's status is sent to it just because an earlier org had the lesson. Each write
- * re-reads the record and changes only its own project, so a sync running in the other service is not overwritten.
+ * SyncMemory kept in the store, so it survives restarts and is the one record both services use. Keyed by the cloud URL
+ * and token: another org (or a new token) starts with no record, so nothing it never received is withdrawn from it and
+ * no lesson's status is sent to it just because an earlier org had the lesson. One cursor per project
+ * (`<syncMemoryCursor>/<project key>`), each written whole: the api's Sync now and the worker's schedule can run at
+ * once and neither can lose the other's record (a single shared record, read, changed and written back, could).
+ * A record kept the old way (one cursor holding every project) is moved over on first use; a project that already
+ * has its own record keeps it.
  */
-export function storedSyncMemory(docs: Pick<DocsStore, 'getCursor' | 'setCursor'>, cloud: Pick<CloudConfig, 'url' | 'token'>): SyncMemory {
-  const cursor = syncMemoryCursor(cloud);
-  const read = async (): Promise<Record<string, SentRecord>> => {
+export function storedSyncMemory(docs: Pick<DocsStore, 'getCursor' | 'setCursor' | 'cursorsWithPrefix' | 'deleteCursor'>, cloud: Pick<CloudConfig, 'url' | 'token'>): SyncMemory {
+  const legacy = syncMemoryCursor(cloud);
+  const prefix = `${legacy}/`;
+  const parse = (v: string | null): SentRecord | undefined => {
     try {
-      const v = JSON.parse((await docs.getCursor(cursor)) ?? '{}');
-      return v && typeof v === 'object' && !Array.isArray(v) ? v : {};
+      const r = JSON.parse(v ?? 'null');
+      return r && typeof r === 'object' && !Array.isArray(r) && typeof r.fingerprint === 'string' ? r : undefined;
     } catch {
-      return {};
+      return undefined;
     }
   };
-  const change = async (fn: (all: Record<string, SentRecord>) => void) => {
-    const all = await read();
-    fn(all);
-    await docs.setCursor(cursor, JSON.stringify(all));
-  };
+  let moved: Promise<void> | null = null;
+  const ready = () =>
+    (moved ??= (async () => {
+      const old = await docs.getCursor(legacy);
+      if (old === null) return;
+      let all: Record<string, unknown> = {};
+      try {
+        const v = JSON.parse(old);
+        if (v && typeof v === 'object' && !Array.isArray(v)) all = v;
+      } catch {
+        /* a damaged record reads as none */
+      }
+      for (const [key, r] of Object.entries(all)) {
+        if (parse(JSON.stringify(r)) && (await docs.getCursor(prefix + key)) === null) await docs.setCursor(prefix + key, JSON.stringify(r));
+      }
+      await docs.deleteCursor(legacy);
+    })().catch((err) => {
+      moved = null;
+      throw err;
+    }));
   return {
-    get: async (key) => (await read())[key],
-    set: (key, r) => change((all) => { all[key] = r; }),
-    delete: (key) => change((all) => { delete all[key]; }),
-    keys: async () => Object.keys(await read()),
+    get: async (key) => {
+      await ready();
+      return parse(await docs.getCursor(prefix + key));
+    },
+    set: async (key, r) => {
+      await ready();
+      await docs.setCursor(prefix + key, JSON.stringify(r));
+    },
+    delete: async (key) => {
+      await ready();
+      await docs.deleteCursor(prefix + key);
+    },
+    keys: async () => {
+      await ready();
+      return (await docs.cursorsWithPrefix(prefix)).filter((c) => parse(c.value)).map((c) => c.key.slice(prefix.length));
+    },
   };
 }
 
@@ -101,9 +133,10 @@ export type ProjectSyncResult = {
   key: string;
   /**
    * sent; empty (nothing stored); unchanged (same bundle as the last send; a forced Sync now resends it); failed; not sent (an
-   * earlier 401/403 stopped the run); withdrawn (no longer synced: its last, empty bundle took back what was sent).
+   * earlier 401/403 stopped the run); withdrawn (no longer synced: its last, empty bundle took back what was sent);
+   * waiting (the schedule is backing off from this project after it failed, until `until`; the others go on).
    */
-  status: 'sent' | 'empty' | 'unchanged' | 'failed' | 'not sent' | 'withdrawn';
+  status: 'sent' | 'empty' | 'unchanged' | 'failed' | 'not sent' | 'withdrawn' | 'waiting';
   counts: SyncCounts | null;
   /** Where the cloud filed it. */
   cloudKey?: string;
@@ -112,6 +145,10 @@ export type ProjectSyncResult = {
   syncId?: string;
   /** Items this bundle named in `withdrawn`. */
   withdrawn?: number;
+  /** The cloud refused the whole bundle as too large (413), so it went with only the hottest code map files that fit. */
+  trimmed?: { codeFiles: { sent: number; of: number } };
+  /** waiting: when the schedule tries this project again. */
+  until?: string;
   error?: string;
 };
 
@@ -125,6 +162,8 @@ export type CloudSyncResult = {
   projects: ProjectSyncResult[];
   /** The first failure, one line, redacted. */
   error: string | null;
+  /** A 401/403 (or a refused CLOUD_URL) stopped the run: no project will fare better, unlike one project's failure. */
+  stopped: boolean;
 };
 
 /** The last Sync now the api ran: when, whether it worked, what it sent, and how many projects had nothing new. */
@@ -139,7 +178,10 @@ export type CloudSyncStatus = {
   lastError: string | null;
   lastSent: SyncCounts | null;
   nextAt: string | null;
+  /** Runs in a row a 401/403 stopped, or that threw: the whole schedule backs off for these. */
   failures: number;
+  /** Projects the schedule is backing off from after they failed, alone (older workers leave it out). */
+  waiting?: { key: string; failures: number; until: string; error: string | null }[];
 };
 
 const zero = (): SyncCounts => ({ projects: 0, lessons: 0, misses: 0, facts: 0, docs: 0, codeFiles: 0 });
@@ -271,11 +313,14 @@ export class CloudSyncError extends Error {
   readonly retryable: boolean;
   /** 401/403: no other project will fare better, so the run stops. */
   readonly fatal: boolean;
-  constructor(message: string, status: number, retryable = false) {
+  /** 413: the most bytes the cloud takes in one request, when it said (its SYNC_MAX_BYTES). */
+  readonly limit: number | null;
+  constructor(message: string, status: number, retryable = false, limit: number | null = null) {
     super(redactSecrets(message).slice(0, 500));
     this.status = status;
     this.retryable = retryable;
     this.fatal = status === 401 || status === 403 || status === -1;
+    this.limit = limit;
   }
 }
 
@@ -291,12 +336,26 @@ export function retryAfterMs(h: string | null, now = Date.now()): number | null 
 }
 const REQUEST_TIMEOUT_MS = 120_000;
 
+/** The cloud's limit from its 413 answer ("bundle larger than <n> bytes"), or null. */
+const limitOf = (serverError: string | null) => {
+  const n = Number(serverError?.match(/larger than (\d+) bytes/)?.[1]);
+  return Number.isFinite(n) && n > 0 ? n : null;
+};
+
+/**
+ * Each bundle is already one project, so a 413 is not helped by syncing fewer: the cloud's limit has to go up or the
+ * project has to stay home. (A code map too large is cut before this is said: see runCloudSync.)
+ */
+const tooLarge = (bytes: number, limit: number | null, what = 'the bundle') =>
+  `${what} (${Math.round(bytes / 1024)} KB) is too large for the cloud (413)${limit ? `, which takes at most ${limit} bytes` : ''}: ` +
+  `ask its operator to raise SYNC_MAX_BYTES${limit ? ` above ${limit} bytes` : ''}, or leave this project out of sync with EXCLUDE_PROJECTS or SYNC_PROJECTS`;
+
 function explain(status: number, serverError: string | null, bytes: number): string {
   const said = serverError ? `: ${serverError}` : '';
   switch (status) {
     case 401: return 'the cloud refused the token (401): check CLOUD_TOKEN; it may be revoked or expired';
     case 403: return `the token cannot sync (403): it needs the sync scope and a member role or above in its org${said}`;
-    case 413: return `the bundle (${Math.round(bytes / 1024)} KB) is too large for the cloud (413); sync fewer projects with SYNC_PROJECTS, or ask the operator to raise SYNC_MAX_BYTES`;
+    case 413: return tooLarge(bytes, limitOf(serverError));
     case 422: return `the cloud rejected the bundle (422)${said}`;
     case 429: return 'the cloud is busy (another sync of this org is running) or this token hit its sync rate limit (429)';
     default: return `the cloud answered ${status}${said}`;
@@ -323,6 +382,7 @@ export async function pushBundle(o: {
   const attempts = Math.max(1, o.attempts ?? 4);
   const base = o.baseDelayMs ?? 2000;
   const body = JSON.stringify(o.bundle);
+  const bytes = Buffer.byteLength(body);
   const url = `${o.cloud.url.replace(/\/+$/, '')}/api/v1/sync`;
   let last: CloudSyncError | null = null;
   for (let attempt = 1; attempt <= attempts; attempt++) {
@@ -359,13 +419,13 @@ export async function pushBundle(o: {
       /* not JSON */
     }
     const retryable = res.status === 429 || res.status >= 500;
-    last = new CloudSyncError(explain(res.status, serverError, body.length), res.status, retryable);
+    last = new CloudSyncError(explain(res.status, serverError, bytes), res.status, retryable, res.status === 413 ? limitOf(serverError) : null);
     if (!retryable) throw last;
     if (attempt < attempts) {
       const after = retryAfterMs(res.headers.get('retry-after'));
       // Never sooner than the cloud asked; a wait longer than we hold a run for fails this project until the next sync.
       if (after !== null && after > RETRY_AFTER_CAP_MS) {
-        throw new CloudSyncError(`${explain(res.status, serverError, body.length)}; it asked to retry after ${Math.ceil(after / 1000)} s`, res.status, true);
+        throw new CloudSyncError(`${explain(res.status, serverError, bytes)}; it asked to retry after ${Math.ceil(after / 1000)} s`, res.status, true);
       }
       await sleep(after ?? base * 2 ** (attempt - 1));
     }
@@ -383,9 +443,75 @@ export function syncProjects(o: { configured: string[]; selected: string[]; excl
   return o.selected.filter((k) => !excluded.has(k) && (!wanted || wanted.has(k)));
 }
 
-const fingerprint = (b: SyncBundle) => createHash('sha256').update(JSON.stringify({ ...b, exportedAt: '', withdrawn: [] })).digest('hex');
+/** Rows in a fixed order (by their own JSON, compared by code unit): the same rows read in another order are one form. */
+const sorted = <T>(rows: T[]) => rows.map((r) => [JSON.stringify(r), r] as const).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)).map(([, r]) => r);
+
+/**
+ * What identifies a bundle's content, for the unchanged skip: hashed over a canonical form (every list sorted, the
+ * export time and `withdrawn` left out), so a store that hands back tied rows in another order (Neo4j reads have no
+ * snapshot, and its five queries run apart) is not a change that resends the whole project.
+ */
+const fingerprint = (b: SyncBundle) => createHash('sha256').update(JSON.stringify({
+  ...b,
+  exportedAt: '',
+  withdrawn: [],
+  projects: sorted(b.projects),
+  lessons: sorted(b.lessons),
+  misses: sorted(b.misses.map((m) => ({ ...m, contextItems: sorted(m.contextItems) }))),
+  facts: sorted(b.facts),
+  docs: sorted(b.docs),
+  codeFiles: sorted(b.codeFiles ?? []),
+})).digest('hex');
 const list = (keys: string[]) => keys.join(', ');
 const plural = (n: number, w: string, many = `${w}s`) => `${n} ${n === 1 ? w : many}`;
+
+const bytesOf = (b: SyncBundle) => Buffer.byteLength(JSON.stringify(b));
+
+/**
+ * `b` with its code map cut to the files with the highest hotspot scores that keep the whole body within `maxBytes`
+ * (kept in their path order). Everything else stays whole: lessons, misses, facts and docs are what the team reads.
+ */
+export function fitCodeFiles(b: SyncBundle, maxBytes: number): SyncBundle {
+  let room = maxBytes - bytesOf({ ...b, codeFiles: [] });
+  const keep = new Set<ExportBundle['codeFiles'][number]>();
+  const hottest = [...b.codeFiles].sort((x, y) => y.score - x.score || (x.path < y.path ? -1 : x.path > y.path ? 1 : 0));
+  for (const c of hottest) {
+    const size = Buffer.byteLength(JSON.stringify(c)) + 1;
+    if (size > room) break;
+    room -= size;
+    keep.add(c);
+  }
+  return { ...b, codeFiles: b.codeFiles.filter((c) => keep.has(c)) };
+}
+
+/**
+ * Send `bundle`; when the cloud refuses it as too large (413) and it carries a code map, send it again with the code
+ * map cut to fit: to the limit the cloud named (else half the body), then half that, then none. The cut bundle says
+ * `codeFilesPartial`, so the cloud keeps the files it leaves out (the rest of the bundle is still complete); a cloud
+ * from before that flag takes them out of the team's code map until they fit again. The result says how many went. A bundle too large even without its code map fails with what to do.
+ */
+async function pushFitting(bundle: SyncBundle, push: (b: SyncBundle) => Promise<SyncResponse>): Promise<{ r: SyncResponse; trimmed?: ProjectSyncResult['trimmed'] }> {
+  try {
+    return { r: await push(bundle) };
+  } catch (err) {
+    if (!(err instanceof CloudSyncError) || err.status !== 413 || !bundle.codeFiles.length) throw err;
+    const full = bytesOf(bundle);
+    let budget = Math.floor(err.limit !== null ? err.limit * 0.95 : full / 2);
+    let limit = err.limit;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const fit = { ...(attempt === 2 ? { ...bundle, codeFiles: [] } : fitCodeFiles(bundle, budget)), codeFilesPartial: true };
+      try {
+        return { r: await push(fit), trimmed: { codeFiles: { sent: fit.codeFiles.length, of: bundle.codeFiles.length } } };
+      } catch (again) {
+        if (!(again instanceof CloudSyncError) || again.status !== 413) throw again;
+        limit = again.limit ?? limit;
+        if (!fit.codeFiles.length) throw new CloudSyncError(tooLarge(bytesOf(fit), limit, 'the bundle, even without its code map,'), 413, false, limit);
+        budget = Math.floor(budget / 2);
+      }
+    }
+    throw err;
+  }
+}
 
 /** How far a run has got: projects done of total, and the one being sent now (null once all are done). */
 export type SyncProgress = { done: number; total: number; current: string | null };
@@ -413,6 +539,11 @@ export async function runCloudSync(d: {
   baseDelayMs?: number;
   /** Resend projects whose bundle has not changed (Sync now with --force). */
   force?: boolean;
+  /**
+   * The schedule's per-project backoff: when a project last failed, the time it waits until (ISO), else null. A
+   * waiting project is neither exported nor sent this run; the others keep their interval.
+   */
+  waiting?: (key: string) => string | null;
   onProgress?: (p: SyncProgress) => void;
 }): Promise<CloudSyncResult> {
   const host = new URL(d.cloud.url).host;
@@ -425,6 +556,11 @@ export async function runCloudSync(d: {
     d.onProgress?.({ done: i, total: keys.length, current: key });
     if (stopped) {
       results.push({ key, status: 'not sent', counts: null });
+      continue;
+    }
+    const until = d.waiting?.(key) ?? null;
+    if (until) {
+      results.push({ key, status: 'waiting', counts: null, until });
       continue;
     }
     const previous = await d.memory?.get(key);
@@ -441,12 +577,14 @@ export async function runCloudSync(d: {
       continue;
     }
     try {
-      const r = await pushBundle({ cloud: d.cloud, bundle, fetch: d.fetch, sleep: d.sleep, baseDelayMs: d.baseDelayMs });
+      const { r, trimmed } = await pushFitting(bundle, (b) => pushBundle({ cloud: d.cloud, bundle: b, fetch: d.fetch, sleep: d.sleep, baseDelayMs: d.baseDelayMs }));
+      // The whole bundle's fingerprint even when its code map was cut: an unchanged project is not cut and resent each run.
       if (stored) await d.memory?.set(key, record(key, bundle, print));
       else await d.memory?.delete(key);
-      for (const k of Object.keys(sent) as (keyof SyncCounts)[]) sent[k] += counts[k];
+      const went = trimmed ? { ...counts, codeFiles: trimmed.codeFiles.sent } : counts;
+      for (const k of Object.keys(sent) as (keyof SyncCounts)[]) sent[k] += went[k];
       const filed = r.projects?.find((p) => p.localKey === key) ?? r.projects?.[0];
-      results.push({ key, status: 'sent', counts, cloudKey: filed?.key, namespace: filed?.namespace, lessons: r.lessons, syncId: r.syncId, withdrawn: bundle.withdrawn.length });
+      results.push({ key, status: 'sent', counts: went, cloudKey: filed?.key, namespace: filed?.namespace, lessons: r.lessons, syncId: r.syncId, withdrawn: bundle.withdrawn.length, ...(trimmed ? { trimmed } : {}) });
     } catch (err) {
       const e = err instanceof CloudSyncError ? err : new CloudSyncError(String(err), 0);
       results.push({ key, status: 'failed', counts, error: e.message });
@@ -459,6 +597,11 @@ export async function runCloudSync(d: {
   const listed = new Set(keys);
   for (const key of d.memory ? [...(await d.memory.keys())].filter((k) => !listed.has(k)).sort() : []) {
     if (stopped) break;
+    const until = d.waiting?.(key) ?? null;
+    if (until) {
+      results.push({ key, status: 'waiting', counts: null, until });
+      continue;
+    }
     const previous = await d.memory!.get(key);
     if (!previous) continue;
     const bundle = tombstone(key, previous);
@@ -475,7 +618,7 @@ export async function runCloudSync(d: {
     }
   }
   d.onProgress?.({ done: keys.length, total: keys.length, current: null });
-  const result: CloudSyncResult = { at: new Date().toISOString(), trigger: d.trigger, host, ok: error === null, sent, projects: results, error };
+  const result: CloudSyncResult = { at: new Date().toISOString(), trigger: d.trigger, host, ok: error === null, sent, projects: results, error, stopped };
   const sentKeys = results.filter((r) => r.status === 'sent').map((r) => r.key);
   const failedKeys = results.filter((r) => r.status === 'failed').map((r) => r.key);
   const withdrawnKeys = results.filter((r) => r.status === 'withdrawn').map((r) => r.key);
@@ -484,7 +627,8 @@ export async function runCloudSync(d: {
   if (d.activity && (sentKeys.length || failedKeys.length || withdrawnKeys.length || asked)) {
     const what = `${plural(sent.lessons, 'lesson')}, ${plural(sent.misses, 'miss', 'misses')}, ${plural(sent.facts, 'fact')}, ${plural(sent.docs, 'doc')}`;
     const attempted = sentKeys.length + failedKeys.length + withdrawnKeys.length;
-    const took = withdrawnKeys.length ? `; took ${list(withdrawnKeys)} back out (no longer synced)` : '';
+    const cut = results.filter((r) => r.trimmed).map((r) => `; ${r.key}'s code map cut to ${r.trimmed!.codeFiles.sent} of ${r.trimmed!.codeFiles.of} files (too large for the cloud)`).join('');
+    const took = `${withdrawnKeys.length ? `; took ${list(withdrawnKeys)} back out (no longer synced)` : ''}${cut}`;
     const subject = !sentKeys.length && !failedKeys.length && !withdrawnKeys.length
       ? `nothing to send to ${host}: ${plural(unchanged, 'project')} unchanged since the last sync`
       : !failedKeys.length
@@ -508,7 +652,7 @@ export async function runCloudSync(d: {
         failed: failedKeys,
         withdrawnProjects: withdrawnKeys,
         sent,
-        results: results.map(({ key, status, counts, cloudKey, namespace, lessons, syncId, withdrawn, error: e }) => ({ key, status, counts, cloudKey, namespace, lessons, syncId, withdrawn, error: e })),
+        results: results.map(({ key, status, counts, cloudKey, namespace, lessons, syncId, withdrawn, trimmed, until, error: e }) => ({ key, status, counts, cloudKey, namespace, lessons, syncId, withdrawn, trimmed, until, error: e })),
         error,
       },
       targets: [],
@@ -519,7 +663,7 @@ export async function runCloudSync(d: {
 
 const DAY_MS = 86_400_000;
 
-/** Wait before the next scheduled sync: the interval, doubled per consecutive failed run, at most a day. */
+/** Wait before the next scheduled sync (or the next try of one failing project): the interval, doubled per failure in a row, at most a day. */
 export function nextSyncDelayMs(intervalMinutes: number, failures: number): number {
   const base = intervalMinutes * 60_000;
   return Math.min(DAY_MS, base * 2 ** Math.min(failures, 20));

@@ -125,12 +125,12 @@ export class InsightsRepo implements InsightsStore {
   /** Evidence chains for the most recent misses in a project: feedback, miss, cause, lesson, context, task, fix commits. */
   async projectGraph(projectKey: string, limit = 150): Promise<EvidenceGraph> {
     const rows = await this.g.run(
-      `MATCH (m:Miss {projectKey: $projectKey})-[:EXPLAINS]->(f:Feedback)
+      `MATCH (m:Miss {projectKey: $projectKey})-[:EXPLAINS]->(f:Feedback) WHERE NOT coalesce(m.sandbox, false)
        WITH m, f ORDER BY m.createdAt DESC LIMIT $limit
        CALL (m, f) {
          MATCH (m)-[r:EXPLAINS]->(f) RETURN r, m AS a, f AS b
          UNION MATCH (m)-[r:CAUSED_BY]->(x:Cause) RETURN r, m AS a, x AS b
-         UNION MATCH (x:Lesson)-[r:DERIVED_FROM]->(m) RETURN r, x AS a, m AS b
+         UNION MATCH (x:Lesson)-[r:DERIVED_FROM]->(m) WHERE NOT coalesce(x.sandbox, false) RETURN r, x AS a, m AS b
          UNION MATCH (x:ContextItem)-[r:WOULD_HAVE_PREVENTED]->(m) RETURN r, x AS a, m AS b
          UNION MATCH (f)-[r:CRITICIZES]->(x:Task) RETURN r, f AS a, x AS b
          UNION MATCH (x:Commit)-[r:ADDRESSES]->(f) RETURN r, x AS a, f AS b
@@ -156,12 +156,14 @@ export class InsightsRepo implements InsightsStore {
     const [causeRows, missRows, feedbackRows, [pre]] = await Promise.all([
       this.g.run(
         `MATCH (m:Miss) WHERE ($projectKey IS NULL OR m.projectKey = $projectKey) AND ($projectKeys IS NULL OR m.projectKey IN $projectKeys)
+           AND NOT coalesce(m.sandbox, false)
          RETURN m.cause AS cause, count(*) AS count ORDER BY count DESC, cause`,
         { projectKey, projectKeys },
       ),
       this.g.run(
         `MATCH (m:Miss)-[:EXPLAINS]->(:Feedback)-[:FROM_TURN]->(t:Turn)
          WHERE ($projectKey IS NULL OR m.projectKey = $projectKey) AND ($projectKeys IS NULL OR m.projectKey IN $projectKeys) AND m.embedding IS NOT NULL
+           AND NOT coalesce(m.sandbox, false)
          // Repeat detection compares every pair, so only the most recent misses are loaded.
          WITH m, t ORDER BY t.ts DESC LIMIT $cap
          RETURN m.missed AS missed, m.cause AS cause, m.projectKey AS projectKey, m.embedding AS embedding, t.ts AS ts
@@ -170,11 +172,13 @@ export class InsightsRepo implements InsightsStore {
       ),
       this.g.run(
         `MATCH (f:Feedback)-[:FROM_TURN]->(t:Turn) WHERE ($projectKey IS NULL OR f.projectKey = $projectKey) AND ($projectKeys IS NULL OR f.projectKey IN $projectKeys)
+           AND NOT EXISTS { MATCH (k:Candidate {id: f.id}) WHERE k.sandbox = true }
          RETURN t.ts AS ts`,
         { projectKey, projectKeys },
       ),
       this.g.run(
         `MATCH (x:PreDoneCheck) WHERE ($projectKey IS NULL OR x.projectKey = $projectKey) AND ($projectKeys IS NULL OR x.projectKey IN $projectKeys)
+           AND NOT coalesce(x.sandbox, false)
          RETURN count(x) AS checks, sum(CASE WHEN x.gaps > 0 THEN 1 ELSE 0 END) AS withGaps, coalesce(sum(x.gaps), 0) AS gapsFound`,
         { projectKey, projectKeys },
       ),

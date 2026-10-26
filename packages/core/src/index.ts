@@ -36,3 +36,7 @@ export * from './relevance.ts';
 export * from './feedbackRules.ts';
 export * from './chat.ts';
 export * from './graph/chat.ts';
+export * from './runs.ts';
+export * from './lessonOutcome.ts';
+export * from './git.ts';
+export * from './lessonRank.ts';

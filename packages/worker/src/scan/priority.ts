@@ -1,7 +1,7 @@
 import { execFile } from 'node:child_process';
 import { extname } from 'node:path';
 import { promisify } from 'node:util';
-import { GIT_SAFE } from '../ingest/git.ts';
+import { GIT_SAFE, gitSafeEnv } from '../ingest/git.ts';
 
 const run = promisify(execFile);
 
@@ -35,7 +35,7 @@ const HOT_COMMENTS = 12;
 export async function gitChurn(repoPath: string, o: { days?: number } = {}): Promise<Map<string, number>> {
   const out = new Map<string, number>();
   try {
-    const { stdout } = await run('git', [...GIT_SAFE, '-C', repoPath, 'log', `--since=${o.days ?? CHURN_DAYS}.days`, '-n', String(CHURN_COMMITS), '--no-renames', '--name-only', '--format='], { maxBuffer: 64 * 1024 * 1024, timeout: 30_000 });
+    const { stdout } = await run('git', [...GIT_SAFE, '-C', repoPath, 'log', '--no-textconv', '--no-ext-diff', `--since=${o.days ?? CHURN_DAYS}.days`, '-n', String(CHURN_COMMITS), '--no-renames', '--name-only', '--format='], { maxBuffer: 64 * 1024 * 1024, timeout: 30_000, env: gitSafeEnv() });
     for (const p of stdout.split('\n')) if (p.trim()) out.set(p.trim(), (out.get(p.trim()) ?? 0) + 1);
   } catch {
     // not a repo, no commits, or git missing: no churn signal

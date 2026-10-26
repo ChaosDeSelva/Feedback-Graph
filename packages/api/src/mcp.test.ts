@@ -166,3 +166,44 @@ test('free-text arguments have a length limit: a megabyte task is refused before
   // An ordinary task still works.
   expect((await call('get_task_context', { cwd: '/Users/j/Vibe/demo', task: 'add search' })).result?.isError).toBeFalsy();
 });
+
+test('check_before_done takes a big diff and cuts it for the judge instead of refusing the call', async () => {
+  const app = createApp(repo, { context: ctx });
+  const file = (i: number) => `diff --git a/src/f${i}.ts b/src/f${i}.ts\n--- a/src/f${i}.ts\n+++ b/src/f${i}.ts\n@@ -1 +1,400 @@\n${Array.from({ length: 400 }, (_, k) => `+export const v${k} = ${k};`).join('\n')}\n`;
+  const diff = Array.from({ length: 40 }, (_, i) => file(i)).join('');
+  expect(diff.length).toBeGreaterThan(300_000);
+  const res = await app.request('/mcp', rpc({ method: 'tools/call', params: { name: 'check_before_done', arguments: { cwd: '/Users/j/Vibe/demo', task: 't', summary: 's', diff } } }));
+  const r = (await res.json()) as { result?: { isError?: boolean; content: { text: string }[] }; error?: unknown };
+  expect(r.error).toBeUndefined();
+  expect(r.result?.isError).toBeFalsy();
+});
+
+test('the check_before_done description tells the agent to pass its git diff', async () => {
+  const app = createApp(repo, { context: ctx });
+  const res = await app.request('/mcp', rpc({ method: 'tools/list', params: {} }));
+  const tools = ((await res.json()) as { result: { tools: { name: string; description: string; inputSchema: { properties: Record<string, { description?: string }> } }[] } }).result.tools;
+  const t = tools.find((x) => x.name === 'check_before_done')!;
+  expect(t.inputSchema.properties.diff.description).toMatch(/git diff/);
+  expect(t.description).toMatch(/diff/);
+});
+
+test('every agent MCP tool carries annotations: reads are read-only, report_feedback is a non-destructive write', async () => {
+  // codex exec will not call a tool without annotations (it cannot tell a read from a write), so headless runs need each.
+  const app = createApp(repo, { context: ctx });
+  const res = await app.request('/mcp', rpc({ method: 'tools/list', params: {} }));
+  type Tool = { name: string; title?: string; annotations?: Record<string, unknown> };
+  const tools = ((await res.json()) as { result: { tools: Tool[] } }).result.tools;
+  const writes = new Set(['report_feedback']);
+  expect(tools).toHaveLength(7);
+  for (const t of tools) {
+    expect(t.annotations, t.name).toBeDefined();
+    expect(t.title, t.name).toMatch(/\w/);
+    expect(t.annotations!.title, t.name).toBe(t.title);
+    expect(t.annotations!.readOnlyHint, t.name).toBe(!writes.has(t.name));
+    expect(t.annotations!.destructiveHint, t.name).toBe(false);
+    expect(t.annotations!.openWorldHint, t.name).toBe(false);
+  }
+  // Each report queues a new inbox item, so calling it twice is not the same as calling it once.
+  expect(tools.find((t) => t.name === 'report_feedback')!.annotations!.idempotentHint).toBe(false);
+  expect(tools.filter((t) => !writes.has(t.name)).every((t) => t.annotations!.idempotentHint === true)).toBe(true);
+});

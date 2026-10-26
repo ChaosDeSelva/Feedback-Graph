@@ -132,3 +132,12 @@ test('each actor says what kind of actor it is: a person, an agent with the oper
   // A legend says the same once for the page.
   expect(screen.getByLabelText('who did it')).toBeTruthy();
 });
+
+test('an entry made in a labelled run says which run, and whether it was a sandbox', async () => {
+  const labelled = { ...rows[2], id: 'a7', subject: 'context for "tune it"', run: 'run-1', sandbox: true };
+  vi.stubGlobal('fetch', vi.fn(async (url: string) => (url.startsWith('/api/activity') ? Response.json([labelled, rows[1]]) : Response.json([]))));
+  render(<Activity />);
+  await screen.findByText('context for "tune it"');
+  expect(screen.getByText('run run-1 · sandbox')).toBeTruthy();
+  expect(screen.getAllByText(/^run run-/)).toHaveLength(1);
+});

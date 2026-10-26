@@ -1,4 +1,4 @@
-import { INCREMENTAL_MAX_PRS, prContextToChunks, redactSecrets, ticketIdsIn, type ActivityStore, type DocsStore, type FetchPrOpts, type PrContext } from '@fb/core';
+import { INCREMENTAL_MAX_PRS, parsePrBacklog, prBacklogKey, prContextToChunks, redactSecrets, ticketIdsIn, type ActivityStore, type DocsStore, type FetchPrOpts, type PrBacklog, type PrContext } from '@fb/core';
 
 export type GithubSyncDeps = {
   /** project key → owner/repo, from GITHUB_REPOS. */
@@ -21,6 +21,8 @@ export type GithubSyncDeps = {
 export const ticketsCursor = (projectKey: string) => `github-tickets:${projectKey}`;
 const TICKETS_BACKFILL_DAYS = 14;
 
+const day = (iso: string) => iso.slice(0, 10);
+
 /** Pull PR descriptions, reviews and comments into the docs store, one doc per PR, with the Linear tickets it names. */
 export async function syncGithub(d: GithubSyncDeps): Promise<{ prs: number }> {
   const now = d.now ?? (() => new Date().toISOString());
@@ -34,28 +36,51 @@ export async function syncGithub(d: GithubSyncDeps): Promise<{ prs: number }> {
     const backfillFrom = new Date(Date.parse(started) - TICKETS_BACKFILL_DAYS * 86_400_000).toISOString();
     const since = cursor && !ticketsKnown && backfillFrom < cursor ? backfillFrom : cursor;
     try {
-      const list = await d.fetchPrs({ repo, token: d.token, since });
-      for (const pr of list) {
-        const chunks = prContextToChunks(pr).map((c) => redactSecrets(c.text));
-        const vectors = chunks.length ? await d.embed(chunks) : [];
-        await d.docs.upsertDoc(
-          { projectKey, source: 'github', ref: `github:${repo}#${pr.number}`, title: `${repo}#${pr.number}: ${pr.title}`, url: pr.url },
-          chunks.map((text, i) => ({ text, embedding: vectors[i] })),
-          // The Linear tickets it names (ENG-123 in its title, body or branch): linked to their documents (linkedDocs).
-          { tickets: ticketIdsIn(pr.title, pr.body, pr.headBranch) },
-        );
+      const backlog = parsePrBacklog(await d.docs.getCursor(prBacklogKey(projectKey)));
+      const store = async (list: PrContext[]) => {
+        for (const pr of list) {
+          const chunks = prContextToChunks(pr).map((c) => redactSecrets(c.text));
+          const vectors = chunks.length ? await d.embed(chunks) : [];
+          await d.docs.upsertDoc(
+            { projectKey, source: 'github', ref: `github:${repo}#${pr.number}`, title: `${repo}#${pr.number}: ${pr.title}`, url: pr.url },
+            chunks.map((text, i) => ({ text, embedding: vectors[i] })),
+            // The Linear tickets it names (ENG-123 in its title, body or branch): linked to their documents (linkedDocs).
+            { tickets: ticketIdsIn(pr.title, pr.body, pr.headBranch) },
+          );
+        }
+      };
+      let readBackTo = null as string | null; // set by onCap
+      const list = await d.fetchPrs({ repo, token: d.token, since, onCap: (t) => { readBackTo = t; } });
+      await store(list);
+      // Capped: the newest were read; the rest joins what was left from before (all of it older than the old cursor).
+      let left: PrBacklog | null = since && readBackTo ? { since: backlog?.since ?? since, until: readBackTo } : backlog;
+      let older: PrContext[] = [];
+      if (!readBackTo && backlog) {
+        // Not capped this time: one more batch of the backlog, newest first.
+        let back = null as string | null;
+        older = await d.fetchPrs({ repo, token: d.token, since: backlog.since, until: backlog.until, onCap: (t) => { back = t; } });
+        await store(older);
+        left = back ? { since: backlog.since, until: back } : null;
       }
-      if (since && list.length >= INCREMENTAL_MAX_PRS) d.log?.('github sync hit its cap; older updates were skipped', { projectKey, repo, cap: INCREMENTAL_MAX_PRS });
+      if (left || backlog) await d.docs.setCursor(prBacklogKey(projectKey), left ? JSON.stringify(left) : '');
+      if (left) d.log?.('github sync hit its cap; the PRs it did not read are read on the next syncs', { projectKey, repo, cap: INCREMENTAL_MAX_PRS, backlog: left });
       await d.docs.setCursor(key, started);
       if (!ticketsKnown) await d.docs.setCursor(ticketsCursor(projectKey), started);
-      prs += list.length;
-      if (list.length) {
+      const all = [...list, ...older];
+      prs += all.length;
+      if (all.length || left) {
+        const why = [
+          since ? `updated since the last sync at ${since}` : 'first sync of this repository',
+          ...(left
+            ? [`GitHub listed more than ${INCREMENTAL_MAX_PRS} updated pull requests: those updated between ${day(left.since)} and ${day(left.until)} are read on the next syncs, newest first`]
+            : backlog ? ['caught up on the pull requests an earlier capped sync left for later'] : []),
+        ].join('; ');
         await d.activity?.record({
           kind: 'doc_added', actor: 'github', projectKey,
-          subject: `synced ${list.length} pull request${list.length === 1 ? '' : 's'} from ${repo}`,
-          why: since ? `updated since the last sync at ${since}` : 'first sync of this repository',
-          details: { repo, prs: list.map((p) => ({ number: p.number, title: p.title, comments: p.comments.length })) },
-          targets: list.map((p) => `doc:${projectKey}:github:github:${repo}#${p.number}`),
+          subject: `synced ${all.length} pull request${all.length === 1 ? '' : 's'} from ${repo}`,
+          why,
+          details: { repo, prs: all.map((p) => ({ number: p.number, title: p.title, comments: p.comments.length })), ...(left ? { backlog: left } : {}) },
+          targets: all.map((p) => `doc:${projectKey}:github:github:${repo}#${p.number}`),
         });
       }
     } catch (err) {

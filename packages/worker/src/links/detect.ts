@@ -3,7 +3,7 @@ import { readdir, readFile } from 'node:fs/promises';
 import { basename, dirname, join, resolve } from 'node:path';
 import { promisify } from 'node:util';
 import { isSecretPath, linkPair, MAX_EVIDENCE, NESTED_KEY_SEP, SECRET_GLOBS, SKIP_DIRS, type DetectedLink, type LinkEvidence, type LinkSignal } from '@fb/core';
-import { GIT_SAFE } from '../ingest/git.ts';
+import { GIT_SAFE, gitSafeEnv } from '../ingest/git.ts';
 
 const run = promisify(execFile);
 
@@ -31,7 +31,7 @@ export type Manifests = { names: string[]; deps: ManifestDep[]; localPaths: Loca
 
 async function trackedFiles(repoPath: string): Promise<string[] | null> {
   try {
-    const { stdout } = await run('git', [...GIT_SAFE, '-C', repoPath, 'ls-files', '-z', '--cached', '--others', '--exclude-standard'], { maxBuffer: 64 * 1024 * 1024, timeout: 60_000 });
+    const { stdout } = await run('git', [...GIT_SAFE, '-C', repoPath, 'ls-files', '-z', '--cached', '--others', '--exclude-standard'], { maxBuffer: 64 * 1024 * 1024, timeout: 60_000, env: gitSafeEnv() });
     return stdout.split('\0').filter(Boolean);
   } catch {
     return null;
@@ -138,7 +138,7 @@ export async function grepMentions(repoPath: string, needles: string[]): Promise
   const tests = wanted.map((n) => ({ n, re: new RegExp(mentionNeedle(n), 'i') }));
   let stdout = '';
   try {
-    ({ stdout } = await run('git', [...GIT_SAFE, '-C', repoPath, 'grep', '-z', '-o', '-I', '-i', '-E', '-e', wanted.map(mentionNeedle).join('|'), '--', '.', ...EXCLUDES], { maxBuffer: 64 * 1024 * 1024, timeout: 60_000 }));
+    ({ stdout } = await run('git', [...GIT_SAFE, '-C', repoPath, 'grep', '--no-textconv', '-z', '-o', '-I', '-i', '-E', '-e', wanted.map(mentionNeedle).join('|'), '--', '.', ...EXCLUDES], { maxBuffer: 64 * 1024 * 1024, timeout: 60_000, env: gitSafeEnv() }));
   } catch (err) {
     // Exit 1 is "no match"; a huge repo may still have printed what it found before a limit.
     stdout = (err as { stdout?: string }).stdout ?? '';

@@ -1,7 +1,7 @@
-import type { Activity, ActivityKind, Connection, ConnectionName, ExternalRef, FeedbackSource, CloudSyncResult, SyncCounts, SyncTrigger, Candidate, CodeMapMeta, Hotspot, MapGraph, ModuleContext, FolderCandidate, OutsideFolder, PipelineStatus, DocSummary, CandidateDetail, CandidateStatus, EvidenceGraph, FactHit, FactKind, Lesson, LessonCheckName, LessonDetail, LessonFrom, LessonStatus, PatternReport, ProjectSummary, ProjectLink, LinkRelation, LinkStatus, ScanJob, SessionDetail, SessionListItem, SessionState, StatsRow, StoredFact, SystemStatus } from '@fb/core';
+import type { Activity, ActivityKind, Connection, ConnectionName, ExternalRef, FeedbackSource, CloudSyncResult, SyncCounts, SyncTrigger, Candidate, CodeMapMeta, Hotspot, MapGraph, ModuleContext, FolderCandidate, OutsideFolder, PipelineStatus, DocSummary, CandidateDetail, CandidateStatus, EvidenceGraph, FactHit, FactKind, Lesson, LessonCheckName, LessonDetail, LessonFrom, LessonQuality, LessonQualityReport, LessonStatus, PatternReport, ProjectSummary, ProjectLink, LinkRelation, LinkStatus, ScanJob, SessionDetail, SessionListItem, SessionState, StatsRow, StoredFact, SystemStatus } from '@fb/core';
 import type { ChatConversation, ChatProvider, ChatThread } from '@fb/core/chat';
 
-export type { Connection, ConnectionName, ExternalRef, FeedbackSource, CloudSyncResult, SyncCounts, Activity, Candidate, CodeMapMeta, Hotspot, MapGraph, ModuleContext, DocSummary, CandidateDetail, CandidateStatus, EvidenceGraph, Lesson, LessonDetail, LessonStatus, PatternReport, ProjectSummary, ProjectLink, LinkRelation, LinkStatus, ScanJob, PipelineStatus, SessionDetail, SessionListItem, SessionState, StatsRow, StoredFact, SystemStatus };
+export type { Connection, ConnectionName, ExternalRef, FeedbackSource, CloudSyncResult, SyncCounts, Activity, Candidate, CodeMapMeta, Hotspot, MapGraph, ModuleContext, DocSummary, CandidateDetail, CandidateStatus, EvidenceGraph, Lesson, LessonDetail, LessonQuality, LessonQualityReport, LessonStatus, PatternReport, ProjectSummary, ProjectLink, LinkRelation, LinkStatus, ScanJob, PipelineStatus, SessionDetail, SessionListItem, SessionState, StatsRow, StoredFact, SystemStatus };
 
 /** One folder on the Settings page (GET /api/settings/projects). */
 export type ProjectCandidate = FolderCandidate & {
@@ -70,7 +70,8 @@ export type ImportResult = {
 /** The phrase POST /api/settings/cleanup wants before it deletes anything. */
 export const CLEANUP_CONFIRM = 'remove-unselected';
 
-export type LessonEdit = Partial<Pick<Lesson, 'title' | 'rule' | 'appliesWhen' | 'scope'>> & { status?: 'approved' | 'rejected' | 'proposed' };
+/** projectKey: with scope project or task, the project a global lesson is narrowed to (PATCH /api/lessons/:id). */
+export type LessonEdit = Partial<Pick<Lesson, 'title' | 'rule' | 'appliesWhen' | 'scope'>> & { status?: 'approved' | 'rejected' | 'proposed'; projectKey?: string };
 
 /** Fired when the API wants a sign-in (a token is configured and the session is missing or expired). */
 export const SIGN_IN_EVENT = 'fg:sign-in';
@@ -140,6 +141,14 @@ async function requestPage<T>(path: string): Promise<{ items: T[]; next: number 
   return { items: (await res.json()) as T[], next: next === null ? null : Number(next) };
 }
 
+/** A GET of one page of a list paged by cursor: the rows, and the cursor of the next page (x-next-cursor), or null. */
+async function requestCursorPage<T>(path: string): Promise<{ items: T[]; next: string | null }> {
+  const res = await send(path, { method: 'GET' }, { write: false, retry: true });
+  if (res.status === 401) window.dispatchEvent(new Event(SIGN_IN_EVENT));
+  if (!res.ok) throw new Error(await errorText(res));
+  return { items: (await res.json()) as T[], next: res.headers.get('x-next-cursor') };
+}
+
 const enc = encodeURIComponent;
 const qs = (o: Record<string, string | undefined>) => {
   const q = new URLSearchParams(Object.entries(o).filter((e): e is [string, string] => !!e[1]));
@@ -170,6 +179,8 @@ export const api = {
   decideLessons: (items: { id: string; status: 'approved' | 'rejected'; note?: string }[]) =>
     request<{ results: { id: string; ok: boolean; status?: string; error?: string }[] }>('/api/lessons/decisions', { method: 'POST', body: { items } }),
   lesson: (id: string) => request<LessonDetail>(`/api/lessons/${enc(id)}`),
+  /** Of the post-mortem's lessons decided in the last 30 and 90 days: approved as written, after an edit, rejected. */
+  lessonQuality: (project?: string) => request<LessonQualityReport>(`/api/lessons/quality${qs({ project })}`),
   updateLesson: (id: string, patch: LessonEdit) => request(`/api/lessons/${enc(id)}`, { method: 'PATCH', body: patch }),
   /** File the lesson's rule as a project fact you wrote (no scan replaces it); the lesson is rejected, noted "converted to a fact". */
   lessonToFact: (id: string, body: { kind: FactKind; relevance: number }) => request<StoredFact>(`/api/lessons/${enc(id)}/to-fact`, { method: 'POST', body }),
@@ -210,7 +221,9 @@ export const api = {
   topHotspots: (project?: string, limit = 10, includeTests = false, missesOnly = false) =>
     request<ProjectHotspot[]>(`/api/codemap/hotspots${qs({ project, limit: String(limit), tests: includeTests ? '1' : undefined, misses: missesOnly ? '1' : undefined })}`),
 
-  docs: (key: string) => request<DocSummary[]>(`/api/projects/${enc(key)}/docs`),
+  /** A page of a project's documents, newest first (the API's default size, or `limit`), and where the next starts. */
+  docs: (key: string, o: { cursor?: string; limit?: number } = {}) =>
+    requestCursorPage<DocSummary>(`/api/projects/${enc(key)}/docs${qs({ cursor: o.cursor, limit: o.limit ? String(o.limit) : undefined })}`),
   // Uploads and imports are not retried: a lost answer can mean it was stored, and a retry would store it twice.
   uploadDoc: (key: string, doc: { title: string; name: string } & ({ text: string } | { image: { mediaType: string; data: string } })) =>
     request<{ id: string; chunks: number }>(`/api/projects/${enc(key)}/docs`, { method: 'POST', body: doc, retry: false }),
@@ -260,7 +273,11 @@ export type ServiceView = {
 
 export type ProjectIntegrations = {
   key: string;
-  github: { repo: string | null; from: 'remote' | 'GITHUB_REPOS' | null; enabled: boolean; lastSyncAt: string | null; items: number; error: string | null };
+  github: {
+    repo: string | null; from: 'remote' | 'GITHUB_REPOS' | null; enabled: boolean; lastSyncAt: string | null; items: number; error: string | null;
+    /** PRs a sync stopped by its cap has not read yet (updated after `since`, before `until`): read on the next syncs. */
+    backlog: { since: string; until: string } | null;
+  };
   linear: { teamId: string | null; teamName: string | null; lastSyncAt: string | null; items: number; error: string | null };
 };
 

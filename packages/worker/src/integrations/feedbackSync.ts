@@ -1,5 +1,5 @@
 import {
-  authorKindOf, githubRepoOfRemote, integrationErrorKind, IntegrationError, redactSecrets,
+  authorKindOf, foldsIntoInline, githubRepoOfRemote, type PrComment, integrationErrorKind, IntegrationError, redactSecrets,
   type ActivityStore, type Credential, type DocsStore, type ExternalRef, type ExternalThread, type FetchPrOpts, type GraphStore,
   type IntegrationKind, type Integrations, type IntegrationSyncState, type LinearComment, type LinearTeamIssue, type PrContext, type Project, type WorkSession,
   linearCommentsOf, linearDocRef, linearIssueDocChunks,
@@ -52,8 +52,11 @@ const DAY = 86_400_000;
 const DEFAULT_LOOKBACK_DAYS = 14;
 /** When a rate-limit answer did not say when it lifts. */
 const RATE_LIMIT_PAUSE_MS = 15 * 60_000;
-/** How far before a comment an agent session with no branch match can have been active, to count as the work. */
-const WINDOW_MS = 2 * DAY;
+/**
+ * How far before a comment an agent session with no branch match can have been active to be a candidate. Being in it
+ * is never evidence (the files are), so it can span the days a PR waits for review.
+ */
+const WINDOW_MS = 7 * DAY;
 const CONTEXT_CAP = 2500;
 
 export const feedbackCursor = (kind: IntegrationKind, projectKey: string) => `feedback-${kind}:${projectKey}`;
@@ -84,24 +87,39 @@ const DEFAULT_BRANCHES = new Set(['main', 'master', 'develop', 'dev', 'trunk']);
  */
 const mayBeOnBranch = (s: WorkSession, branch: string | null) => !branch || !s.gitBranch || s.gitBranch === branch || DEFAULT_BRANCHES.has(s.gitBranch);
 
-/** A session that may have done the work, and how it was found: on the work's branch, or by time alone. */
-export type WorkMatch = WorkSession & { by: 'branch' | 'time' };
+/**
+ * A session that may have done the work, and how it was found: on the work's branch, or only in the days before the
+ * comment (`window`), a candidate that counts only if it edited the files the PR changed (postmortem/work.ts).
+ */
+export type WorkMatch = WorkSession & { by: 'branch' | 'window' };
 
 /**
- * The agent sessions that most likely did the work: those of the project on the work's branch that edited files or
- * committed before the comment, most edits first; with none, the one session that did work in the two days before it
- * (several, or one on another feature branch: none, rather than a wrong one). The store already leaves read-only sessions out; checked again here.
- * A match by time alone is a guess: the post-mortem accepts it only with evidence that the session did this work
- * (postmortem/work.ts), and the sync does not link it.
+ * The version of the rule that matches a comment to the session that did its work (findWorkSessions and
+ * postmortem/work.ts workMatches). Raise it when the rule changes: at start the worker re-matches what is pending and
+ * flags proposed lessons whose session the new rule would not match (postmortem/rematch.ts).
+ * 1: on the branch, else the only session in the two days before the comment, with a file the comment named.
+ * 2: on the branch (not a default branch), else a session that edited files the PR changed; never by time alone.
+ */
+export const SESSION_MATCH_VERSION = 2;
+
+/** Candidates off the branch: at most this many, so a busy week is not one files lookup per session. */
+const MAX_WINDOW_CANDIDATES = 10;
+
+/**
+ * The agent sessions that may have done the work, all of the comment's project: those on the work's branch that edited
+ * files or committed before the comment, most edits first; with none, those that did work in the days before it (not
+ * on another feature branch), as candidates only: a session is never the work for being near in time, the post-mortem
+ * keeps one only when it edited the files the PR changed (postmortem/work.ts). A PR from a default branch (main) says
+ * nothing about who did it, so it has no branch match. The store already leaves read-only sessions out; checked again here.
  */
 export async function findWorkSessions(graph: Pick<GraphStore, 'workSessions'>, projectKey: string, branch: string | null, before: string): Promise<WorkMatch[]> {
-  if (branch) {
+  if (branch && !DEFAULT_BRANCHES.has(branch)) {
     const onBranch = (await graph.workSessions({ projectKey, branch, before, limit: 3 })).filter(didWork);
     if (onBranch.length) return onBranch.map((s) => ({ ...s, by: 'branch' as const }));
   }
   const after = new Date(Date.parse(before) - WINDOW_MS).toISOString();
-  const near = (await graph.workSessions({ projectKey, branch: null, before, after, limit: 2 })).filter(didWork);
-  return near.length === 1 && mayBeOnBranch(near[0], branch) ? [{ ...near[0], by: 'time' }] : [];
+  const near = (await graph.workSessions({ projectKey, branch: null, before, after, limit: MAX_WINDOW_CANDIDATES })).filter(didWork);
+  return near.filter((s) => mayBeOnBranch(s, branch)).map((s) => ({ ...s, by: 'window' as const }));
 }
 
 /** The sessions shown as a comment's work: only those on its branch (a match by time alone is not known to be it). */
@@ -137,21 +155,41 @@ export function prThread(pr: PrContext, floorMs: number, linked: string[], login
   const authorOf = new Map(pr.comments.map((c) => [c.id, c.author]));
   const header = `PR ${pr.repo}#${pr.number} "${pr.title}" by ${pr.author} (${pr.state}${pr.headBranch ? `, branch ${pr.headBranch}` : ''})`;
   const body = description(pr.body);
+  const uuidOf = (c: PrComment) => `github:${pr.repo}#${pr.number}/${c.kind}/${c.id}`;
+  const files = pr.files ? pr.files.slice(0, MAX_PR_FILES) : null;
   return {
     id: `github:${pr.repo}#${pr.number}`,
     source: 'github',
     items: ordered.flatMap((c, i) => {
       if (Date.parse(c.createdAt) < floorMs) return [];
+      const folded = c.kind === 'review' ? foldedInto(c, ordered) : null;
       const where = c.path ? `\nOn ${c.path}${c.line != null ? `:${c.line}` : ''}${c.diffHunk ? `\n${c.diffHunk}` : ''}` : '';
       const external: ExternalRef = {
         source: 'github', kind: c.kind, author: c.author, url: c.url, thread: `${pr.repo}#${pr.number}`, title: pr.title, threadUrl: pr.url,
         path: c.path, line: c.line, diffHunk: c.diffHunk, branch: pr.headBranch, createdAt: c.createdAt, linkedSessionIds: linked,
         description: body,
         ...author('github', c.author, c.body, logins), threadAuthor: pr.author, isReply: !!c.inReplyTo, repliesTo: c.inReplyTo ? authorOf.get(c.inReplyTo) ?? null : null, reviewState: c.reviewState ?? null,
+        ...(folded && { foldedInto: uuidOf(folded) }),
+        ...(files && { prFiles: files }),
       };
-      return [{ uuid: `github:${pr.repo}#${pr.number}/${c.kind}/${c.id}`, ts: c.createdAt, index: i + 1, text: c.body, context: clip(`${header}${where}`), external }];
+      return [{ uuid: uuidOf(c), ts: c.createdAt, index: i + 1, text: c.body, context: clip(`${header}${where}`), external }];
     }),
   };
+}
+
+/** How far apart a review's summary and its inline comments are posted (GitHub submits them together). */
+const REVIEW_SPAN_MS = 10 * 60_000;
+/** At most this many of a PR's changed files are kept on its comments. */
+const MAX_PR_FILES = 300;
+
+/**
+ * The inline comment a review's summary folds into: the same reviewer's inline comments posted with it say the same
+ * thing (feedbackRules.foldsIntoInline). Null: the summary says something of its own.
+ */
+function foldedInto(review: PrComment, all: PrComment[]): PrComment | null {
+  const at = Date.parse(review.createdAt);
+  const inline = all.filter((c) => c.kind === 'review_comment' && c.author === review.author && !c.inReplyTo && Math.abs(Date.parse(c.createdAt) - at) <= REVIEW_SPAN_MS);
+  return foldsIntoInline(review.body, inline.map((c) => c.body)) ? inline[0] : null;
 }
 
 /** One Linear issue's comments as a thread, each carrying the ticket: its description, state, priority, labels, assignee. */

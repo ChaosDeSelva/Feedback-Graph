@@ -1,0 +1,333 @@
+# Ordinary code and code-fact prose that holds no secret. Every line must come out of redactSecrets unchanged.
+# One case per line; lines starting with # are comments and are skipped.
+The primary key is user_id2.
+Partition key is tenant_id1 for all tables
+The cache key is v2:users list
+key is config/app2.yml
+foreign key is account_id9
+The sort key is created_at2 and the partition key is org_id.
+The map key is the order's sku_code3.
+The object key is uploads/2026/avatar.png
+The composite key is (project_key, path2).
+The API route key is orders.list2
+The idempotency key is request_id7 from the header.
+The S3 key is exports/acme/report-2026.csv
+The Redis key is session:v3:user_id
+The config key is feature_flags.checkout2
+The lookup key is emailLower2 on the users table.
+The dedupe key is sha256(body).
+The sort key was updatedAt2 until migration 0031.
+The cache key is now tenantId42 plus the route.
+The React key is item.id2 for list rows.
+key = user_id2 in the join
+the token is refreshed every 5m
+the token is refreshed every 15m by the worker
+The secret is stored in Vault under kv/acme/web.
+the secret is stored in AWS Secrets Manager
+password is required
+password is hashed with bcrypt
+The password is hashed with argon2id before it is saved.
+token is a JWT
+The token is a JWT signed with RS256.
+key is the user's email
+The access token is short-lived (15 minutes).
+The refresh token is stored in an httpOnly cookie.
+The API key is read from ACME_API_KEY at start.
+The API key is passed as the X-Api-Key header.
+The api key is optional for local runs.
+The private key is ~/.ssh/id_ed25519 on the build box.
+The private key is id_rsa in the deploy user's home.
+The access key is AWS_ACCESS_KEY_ID in the CI environment.
+The secret is SESSION_SECRET in .env, never committed.
+The password is DB_PASSWORD from docker-compose.yml.
+The token is GITHUB_TOKEN, injected by Actions.
+the token is v2 since the auth rewrite
+The token is version 3 of the format.
+The password is at least 12 characters with one digit.
+The password is checked against haveibeenpwned.
+the password was reset by the support script
+the token was revoked on logout
+The secret is in config/secrets.yml.enc.
+The credentials are in ~/.aws/credentials.
+credentials are loaded from credentials.json at start
+The passphrase is prompted for on first run.
+token is created by createToken() in auth/tokens.ts
+The token is user_session2 in localStorage.
+The token is authToken2 in the Redux store.
+The secret is https://vault.example.com/v1/kv/web
+The token is https://auth.example.com/oauth/token
+The password is the same as the username in dev seeds.
+password = None by default
+The token is base64url encoded.
+the token is 32 bytes from crypto.randomBytes
+The token is sha256 hashed before storage.
+The key is rotated every 90 days.
+The signing key is loaded from JWKS at https://auth.example.com/.well-known/jwks.json
+The encryption key is derived with HKDF from the master key.
+The token is 3600 seconds long-lived.
+The secret is 64 hex chars.
+The password is v1.2.3-compatible.
+The token is 2.0 format.
+the pin is 1.4.2 for the lockfile
+Pin is v18.20.4 in .nvmrc
+The PIN is four digits.
+Rotate the API key every 90 days.
+password reset emails expire after 24 hours
+The token budget is 4096 per call.
+Tokens are counted with tiktoken o200k_base.
+The tokenizer is cl100k_base.
+The secret sauce is caching the code map.
+The secret is to cache the code map.
+The key is the project folder name.
+The key insight is that scans are incremental.
+key is a composite of project_key and path
+The token bucket is refilled at 10 per second.
+token: string
+password: string | null;
+password: z.string().min(8)
+const token = await getToken();
+const tokenizer = new Tokenizer();
+let password: string;
+function login(user: string, password: string): Promise<Token> {
+const passwordHash = await bcrypt.hash(password, 10);
+const TOKEN_URL = "https://auth.example.com/oauth/token";
+const PASSWORD_MIN_LENGTH = 12;
+const ACCESS_TOKEN_KEY = "access_token";
+const REFRESH_TOKEN_KEY = 'refresh_token_v2';
+const SESSION_COOKIE = "session_id";
+localStorage.setItem('auth-token', token);
+localStorage.getItem("acme.auth.token.v2")
+if (password === confirmPassword) return;
+const isTokenValid = (t: string) => t.length > 0;
+tokens: 1200, maxTokens: 4096
+maxTokens: 8192,
+const secretName = "db-credentials-v2";
+secretName: db-credentials-v2
+passwordField: "password"
+type Secret = { name: string; value: string };
+interface Credentials { user: string; password: string }
+const token = req.headers.authorization?.slice(7);
+const apiKey = process.env.ACME_API_KEY;
+const apiKey = config.apiKey ?? '';
+apiKey: config.apiKey,
+token: session.token,
+password: form.password,
+secret: env.SESSION_SECRET,
+secret: process.env.JWT_SECRET!,
+const secret = await secrets.get('stripe/webhook');
+const token = jwt.sign({ sub: user.id }, secret, { expiresIn: '15m' });
+const { token } = await res.json();
+token: z.string().uuid(),
+apiKey: z.string().min(20).optional(),
+password: Joi.string().min(8).required(),
+password = forms.CharField(widget=forms.PasswordInput)
+password = models.CharField(max_length=128)
+token = models.CharField(max_length=64, unique=True)
+api_key = os.environ["ACME_API_KEY"]
+api_key = os.getenv("ACME_API_KEY", "")
+self.password = password
+self.token = token_from_header(request)
+password = getpass.getpass("Password: ")
+token = settings.SLACK_BOT_TOKEN
+secret_key = settings.SECRET_KEY
+SECRET_KEY = env("DJANGO_SECRET_KEY")
+SECRET_KEY = os.environ.get("SECRET_KEY")
+token := os.Getenv("ACME_TOKEN")
+password := r.FormValue("password")
+apiKey := cfg.APIKey
+secret := []byte(os.Getenv("JWT_SECRET"))
+token, err := auth.NewToken(userID)
+Password string `json:"password"`
+Token    string `json:"token,omitempty"`
+APIKey string `yaml:"api_key" env:"ACME_API_KEY"`
+secret: ${{ secrets.DEPLOY_KEY }}
+token: ${{ secrets.GITHUB_TOKEN }}
+password: "${DB_PASSWORD}"
+password: ${POSTGRES_PASSWORD:-postgres}
+NEO4J_PASSWORD: ${NEO4J_PASSWORD:?set it}
+token: <your-token-here>
+api_key: <paste your key>
+password: changeme
+password: password
+password: postgres
+password: example
+password: secret
+password: hunter
+token: null
+token: ~
+api_key: ""
+password: ''
+secret_key_base: <%= ENV["SECRET_KEY_BASE"] %>
+password: !vault |
+token_file: /run/secrets/acme_token
+password_file: /run/secrets/db_password
+secret_ref: acme-web-secrets
+tokenEndpoint: https://auth.example.com/token
+token_url: https://auth.example.com/oauth/token
+password_min_length: 12
+token_ttl: 3600
+token_ttl_seconds: 86400
+secret_rotation_days: 90
+api_key_header: X-Api-Key
+export API_TOKEN="$ACME_TOKEN"
+export DB_PASSWORD="${DB_PASSWORD:-}"
+API_KEY=$OPENAI_API_KEY
+GITHUB_TOKEN=${{ secrets.GITHUB_TOKEN }}
+PASSWORD_RESET_TTL=3600
+TOKEN_EXPIRY=15m
+TOKEN_EXPIRY_SECONDS=900
+SECRET_ROTATION=90d
+ACCESS_TOKEN_TTL=15m
+docker run -e DB_PASSWORD -p 5432:5432 postgres
+docker run --env-file .env -p 3000:3000 web
+docker secret create db_password ./db_password.txt
+kubectl create secret generic acme-web --from-env-file=.env.prod
+kubectl get secret acme-web -o yaml
+gh auth token
+gh secret set DEPLOY_KEY < key.pem
+npm config set //registry.npmjs.org/:_authToken=${NPM_TOKEN}
+vault kv get -field=password kv/acme/db
+aws secretsmanager get-secret-value --secret-id acme/web/prod
+op read op://acme/db/password
+deploy --token-file ./token.txt --env prod
+deploy --password-stdin < pw.txt
+psql --password -h localhost -U app
+mysql --user=root --password app
+curl -H "Authorization: Bearer $TOKEN" https://api.example.com
+curl -H "X-Api-Key: $ACME_API_KEY" https://api.example.com
+--token string   GitHub token (default: $GITHUB_TOKEN)
+-p, --password   prompt for the password
+SELECT id, token_hash FROM api_tokens WHERE revoked_at IS NULL;
+CREATE TABLE api_keys (id uuid PRIMARY KEY, key_hash text NOT NULL, prefix text);
+ALTER TABLE users ADD COLUMN password_hash text;
+UPDATE sessions SET token = NULL WHERE expires_at < now();
+CREATE INDEX tokens_user ON tokens (user_id);
+PRIMARY KEY (project_key, path)
+FOREIGN KEY (account_id) REFERENCES accounts (id)
+@Column({ name: 'password_hash' }) passwordHash: string;
+@IsString() @MinLength(8) password: string;
+[Required] public string Password { get; set; }
+private String token;
+private final String apiKey;
+public static final String TOKEN_HEADER = "X-Auth-Token";
+private static final String SECRET_PARAM = "client_secret";
+val token: String = intent.getStringExtra("token") ?: ""
+let token = try await auth.fetchToken()
+guard let password = passwordField.text else { return }
+fn verify(password: &str, hash: &str) -> bool {
+let api_key = std::env::var("ACME_API_KEY")?;
+config.secret_key_base = Rails.application.credentials.secret_key_base
+config.api_key = ENV.fetch("ACME_API_KEY")
+$password = $request->input('password');
+$token = Str::random(60);
+$apiKey = getenv('ACME_API_KEY');
+"password": { "type": "string", "minLength": 8 },
+"token": { "$ref": "#/components/schemas/Token" },
+"apiKey": "string",
+"secret": "<redacted>",
+"access_token": "{{ access_token }}",
+"client_secret": "{{CLIENT_SECRET}}",
+"tokenType": "Bearer",
+"token_type": "bearer",
+"expires_in": 3600,
+"scope": "repo read:org",
+{"password": null, "token": null}
+api_key: str | None = None
+password: str = Field(min_length=8)
+token: Optional[str] = None
+secret: SecretStr
+def rotate_token(user_id: int, ttl: int = 3600) -> str:
+def check_password(password: str) -> bool:
+async def get_api_key(name: str) -> ApiKey:
+token = secrets.token_urlsafe(32)
+api_key = generate_api_key(prefix="acme")
+password = make_password(raw)
+const token = crypto.randomBytes(32).toString('hex');
+const key = `user:${id}:profile`;
+const cacheKey = `v2:users:${tenantId}`;
+const key = path.join(dir, `${hash}.json`);
+const storageKey = 'acme.settings.v2';
+map.set(key, value);
+const primaryKey = 'user_id2';
+const sortKey = 'created_at';
+keyPrefix: 'acme:v2:',
+key: 'user_id2',
+key: item.id,
+key={item.id}
+password: hashPassword(input.password),
+token: generateToken(32),
+secret: randomSecret(),
+apiKey: deriveKey(master, 'api'),
+accessToken: tokens.access_token,
+refreshToken: tokens.refresh_token,
+idToken: tokens.id_token ?? null,
+password: undefined,
+token: '',
+password: process.env.DB_PASSWORD ?? 'postgres',
+password: process.env.PGPASSWORD || 'example',
+The test user's password is in the seed script.
+The demo password is printed by fg demo seed.
+Passwords are hashed with bcrypt cost 12.
+Tokens expire after 30 days of inactivity.
+Secrets are mounted at /run/secrets by Docker.
+The token is validated by middleware/auth.ts before every route.
+The password is never logged; redactSecrets strips it.
+The secret is required for webhook signature checks (HMAC-SHA256).
+The access key is scoped to the acme-uploads bucket.
+The private key is generated by scripts/gen-keys.sh.
+The token is stored hashed (sha256) in api_tokens.token_hash.
+The password field is validated with zod in schemas/user.ts.
+Token is the session_token2 cookie.
+Secret is the webhookSecret2 field on the Integration model.
+The API key is the apiKey2 column on the projects table.
+The token is 40-char hex.
+AUTH_TOKEN_ISSUER=acme-web
+SECRET_MANAGER_REGION=us-east-1
+PASSWORD_POLICY=strict-v2
+TOKEN_URL=https://auth.example.com/oauth/token
+TOKEN_TTL_SECONDS=1209600
+GITHUB_TOKEN_SCOPES=repo,read:org
+PASSWORD_HASH_ALGO=argon2id
+token: refresh_token_v2
+secret: acme-web-secret-v2
+password: *db_password
+password: &pw postgres
+<Button>{busy ? 'Checking' : replacing ? 'Replace token' : 'Connect'}</Button>
+const label = rotating ? "New password" : "Current";
+title={saved ? 'Saved token' : 'Missing'}
+NEO4J_PASSWORD=change-me-please
+DB_PASSWORD=your-password-here
+POSTGRES_PASSWORD=e2e-$(openssl rand -hex 12)
+DATABASE_URL: ${DATABASE_URL:-postgres://fg:${POSTGRES_PASSWORD:-}@postgres:5432/feedback}
+The secret is stored per tenant (tenant_secrets table).
+The password is bcrypt(salt, 12).
+The token is a 40-char hex string.
+The credentials are AWS SSO profile acme-dev.
+The passphrase is the one in 1Password, not in the repo.
+token = "access_token"
+password = "password"
+secret = "client_secret"
+api_key = "api_key"
+TOKEN_KEY = "acme.token"
+const PASSWORD_PLACEHOLDER = "••••••••";
+password_placeholder: "Enter your password"
+token_hint: "starts with fgc_pat_"
+"password_label": "Password (12+ characters)",
+label: 'API key',
+placeholder: 'sk-...',
+see https://example.com/path@v2 and user@example.com
+git clone https://github.com/acme/web.git
+postgres://localhost:5432/app
+redis://cache:6379/0
+mongodb://mongo:27017/acme
+amqp://rabbit:5672
+https://user@example.com/repo.git
+The release key is v2026.10 for the tag.
+The table's primary key is (id), and its token column is unique.
+The password is never stored in plain text; only password_hash is.
+The token is passed to fetchUser(token2) in hooks/useUser.ts.
+The secret is shared between api2 and worker2 services.
+The API key is per project (projects.api_key_hash).
+password is set to null after migration 0012
+token is set to expire_at2 in the session row
+The token is now JwtV2 by default.

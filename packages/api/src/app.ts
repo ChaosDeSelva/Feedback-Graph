@@ -3,16 +3,19 @@ import { bodyLimit } from 'hono/body-limit';
 import { streamSSE } from 'hono/streaming';
 import { serveStatic } from '@hono/node-server/serve-static';
 import { z } from 'zod';
-import { ACTIVITY_KINDS, EVERYDAY_FROM, chunkText, mapCapped, MAX_AUTO_MAP_FILES, MODEL_JOBS, cleanLessonPath, cmp, FACT_KINDS, LESSON_CHECKS, LESSON_FROM, redactSecrets, relevanceBand, selectionNote, type ActivityStore, type CodeGraphStore, type DocsStore, type FactsStore, type GraphStore, type InsightsStore, type ModelHealth, type ModelJob, type OllamaHealth, type PipelineStatus, type ProviderHealth, type KnowledgeStore, type Lesson, type LinksStore, IMAGE_MEDIA_TYPES, MAX_IMAGE_BYTES, LINK_RELATIONS, LINK_STATUSES, linkPair, type PortabilityStore, type Project, type ProjectSelection, type RelevanceBy, type ProjectSummary, type ShownProjects, type StoreKind, type SystemStatus, type WorkerStatus, contextWhy, FACT_ORIGINS, SCANNER_VERSION } from '@fb/core';
+import { ACTIVITY_KINDS, EVERYDAY_FROM, chunkText, mapCapped, MAX_AUTO_MAP_FILES, MODEL_JOBS, cleanLessonPath, cmp, FACT_KINDS, LESSON_CHECKS, LESSON_FROM, redactSecrets, relevanceBand, selectionNote, type ActivityStore, type CodeGraphStore, type DocsStore, type FactsStore, type GraphStore, type InsightsStore, type ModelHealth, type ModelJob, type OllamaHealth, type PipelineStatus, type ProviderHealth, type KnowledgeStore, type Lesson, type LinksStore, IMAGE_MEDIA_TYPES, MAX_IMAGE_BYTES, LINK_RELATIONS, LINK_STATUSES, linkPair, linkEnds, docIdOf, NotTheRunsError, type PortabilityStore, type Project, type ProjectSelection, type RelevanceBy, type ProjectSummary, type ScanQueueEntry, type ShownProjects, type WorkQueue, type WorkQueues, type StoreKind, type SystemStatus, type WorkerStatus, contextWhy, FACT_ORIGINS, SCANNER_VERSION, RUN_ID, type RunPrincipal, type RunsStore, LESSON_QUALITY_DAYS, lessonQualityReport, type LessonQualityReport } from '@fb/core';
 import { chatRoutes, type ChatRouteDeps } from './chat.ts';
 import { trackedProject, type ContextDeps } from './context.ts';
 import { authenticated, needsAuth, SECURITY_HEADERS, sessionCookie, tokenMatches, type AuthOpts } from './auth.ts';
 import { cloudRoutes, cloudStatus, type CloudDeps, type CloudState } from './cloud.ts';
 import { createEventHub, type FgEvent } from './events.ts';
+import { demoRoutes, type DemoDeps } from './demo.ts';
 import { handleMcp } from './mcp.ts';
 import { handleAdminMcp } from './adminMcp.ts';
 import { openApiDocument } from './openapi.ts';
-import { actingAsOperator, asActor, currentActor, hasOperatorToken, operatorName, OWNER_ROUTES, refusedVerb, runAs, runVia } from './operator.ts';
+import { actingAsOperator, asActor, currentActor, currentRun, hasOperatorToken, mayChange, mayChangeAny, operatorName, OWNER_ROUTES, refusedVerb, runAs, runFromOwner, runIn, runLabel, runVia } from './operator.ts';
+import { askingRun, RUN_OPENERS, runAsked, runRoutes, runScoped } from './runs.ts';
+import { evidenceRoutes, type EvidenceDeps } from './evidence.ts';
 import { deleteProjects, settingsRoutes, type SettingsDeps } from './settings.ts';
 import { importRoutes, type ImportDeps } from './import.ts';
 import { sessionRoutes, type SessionsDeps } from './sessions.ts';
@@ -32,6 +35,21 @@ const ListQuery = z.object({
 });
 /** An Inbox page when the request names no limit. */
 const CANDIDATE_PAGE = 200;
+
+/** A project's documents per page (a GitHub sync adds one per PR, so a project can hold thousands). */
+const DOCS_PAGE = 100;
+const DOCS_MAX_PAGE = 500;
+const DocsQuery = z.object({ limit: z.coerce.number().int().min(1).max(DOCS_MAX_PAGE).optional(), cursor: z.string().min(1).max(1000).optional() });
+/** Where the next page of documents starts: the addedAt and id of the last one shown, opaque to the client. */
+const toDocCursor = (d: { addedAt: string; id: string }) => Buffer.from(JSON.stringify([d.addedAt, d.id])).toString('base64url');
+function docCursor(s: string): { addedAt: string; id: string } | null {
+  try {
+    const [addedAt, id] = JSON.parse(Buffer.from(s, 'base64url').toString('utf8')) as unknown[];
+    return typeof addedAt === 'string' && !Number.isNaN(Date.parse(addedAt)) && typeof id === 'string' ? { addedAt, id } : null;
+  } catch {
+    return null;
+  }
+}
 
 const Decision = z.object({
   status: z.enum(['confirmed', 'rejected']),
@@ -54,6 +72,8 @@ export const bodyLimitFor = (path: string) => UPLOAD_LIMITS.find(([re]) => re.te
 
 /** The admin MCP endpoint (owner decisions, operator token only); /mcp stays read-and-report only. */
 const ADMIN_MCP = '/mcp/admin';
+/** GET and DELETE /api/runs/:id: what a run wrote, and its cleanup. */
+const RUN_PATH = /^\/api\/runs\/[^/]+\/?$/;
 
 const LOCAL_HOSTS = new Set(['localhost', '127.0.0.1', '[::1]']);
 
@@ -71,9 +91,9 @@ function originAllowed(origin: string, hostHeader: string): boolean {
 export type AppOpts = {
   staticDir?: string;
   context?: ContextDeps;
-  knowledge?: Pick<KnowledgeStore, 'listLessons' | 'lessonDetail' | 'updateLesson'> & Partial<Pick<KnowledgeStore, 'retryPostmortem' | 'postmortemBacklog' | 'requestLessonRecheck'>>;
+  knowledge?: Pick<KnowledgeStore, 'listLessons' | 'lessonDetail' | 'updateLesson'> & Partial<Pick<KnowledgeStore, 'retryPostmortem' | 'postmortemBacklog' | 'postmortemQueue' | 'requestLessonRecheck' | 'decidedLessons'>>;
   embed?: (texts: string[]) => Promise<number[][]>;
-  facts?: Pick<FactsStore, 'listProjects' | 'requestScan' | 'listFacts' | 'searchFacts'> & Partial<Pick<FactsStore, 'setFactRelevance' | 'setPinned' | 'scanJob' | 'addOwnerFact' | 'olderScannerFiles'>>;
+  facts?: Pick<FactsStore, 'listProjects' | 'requestScan' | 'listFacts' | 'searchFacts'> & Partial<Pick<FactsStore, 'setFactRelevance' | 'setPinned' | 'scanJob' | 'addOwnerFact' | 'olderScannerFiles' | 'scanQueue'>>;
   /** Folders under the configured roots that can be scanned. */
   projectDirs?: () => Promise<Project[]>;
   insights?: Pick<InsightsStore, 'projectGraph' | 'patterns'>;
@@ -108,6 +128,8 @@ export type AppOpts = {
   inScope?: (key: string) => boolean | Promise<boolean>;
   /** Import of an export bundle (POST /api/import). */
   importer?: ImportDeps;
+  /** fg demo seed / remove (demo.ts). */
+  demo?: DemoDeps;
   /** Session summaries: the Sessions page. */
   sessions?: SessionsDeps;
   /**
@@ -119,7 +141,24 @@ export type AppOpts = {
   integrations?: IntegrationsDeps;
   /** Ask: conversations answered by the worker from a context pack built here (chat.ts). */
   chat?: ChatRouteDeps;
+  /** What labelled runs wrote (x-fg-run): GET and DELETE /api/runs/:id, `fg cleanup --run` (runs.ts). */
+  runs?: Pick<RunsStore, 'items' | 'remove' | 'claim' | 'owner'>;
+  /** GET /api/sessions/:id/evidence: what the tool saw in one session and decided (evidence.ts). */
+  evidence?: EvidenceDeps;
 };
+
+/**
+ * `run` for a store write made in a labelled run (x-fg-run), nothing outside one so other writes stay as they were;
+ * plus byOwner when the owner opened the run: the store may then replace the owner's record (it stays theirs).
+ */
+const runWrite = () => {
+  const run = currentRun();
+  return run ? { run, ...(mayChangeAny() && { byOwner: true }) } : {};
+};
+/** A store delete's ownership filter: in a run that may not change everything, only what the run wrote. */
+const runOnly = () => (mayChangeAny() ? {} : { run: currentRun()!.id });
+/** The 409 for a run's change to a record it does not own (NotTheRunsError). */
+const notTheRuns = (c: Context, what: string) => c.json({ error: new NotTheRunsError(what, currentRun()?.id ?? '').message }, 409);
 
 /** The store's projectKeys for a list: every shown key, or for ?project= that one if it is shown (else none). */
 function keysFor(v: ShownProjects | null, project?: string): string[] | undefined {
@@ -159,6 +198,8 @@ const ImpactQuery = z.object({ path: z.array(RepoPath).min(1).max(50), depth: z.
 const WORKER_STALE_MS = 3 * 60_000;
 /** /api/pipeline counts Inbox items and lessons up to this many each (the panel only needs to know there are some). */
 const PIPELINE_LIMIT = 1000;
+/** /api/lessons/quality counts at most this many decisions (it says when there were more). */
+const QUALITY_LIMIT = 5000;
 /** /api/events: at most this many open streams; a heartbeat comment this often; the reconnect delay it suggests. */
 const MAX_EVENT_STREAMS = 20;
 const EVENT_HEARTBEAT_MS = 15_000;
@@ -183,6 +224,8 @@ const ActivityQuery = z.object({
   project: z.string().min(1).max(200).optional(),
   kind: z.enum(ACTIVITY_KINDS).optional(),
   target: z.string().min(1).max(500).optional(),
+  /** One run's entries (x-fg-run). */
+  run: z.string().regex(RUN_ID, 'a run id: 1 to 64 letters, digits, dots, dashes or underscores').optional(),
   limit: z.coerce.number().int().min(1).max(1000).optional(),
   /** 1: every row with its details, however big (the CLI's --json); else rows over LIST_DETAIL_BYTES leave them out. */
   details: IncludeTests,
@@ -230,6 +273,8 @@ const FactsQuery = z.object({
 const servedFact = <T extends { confidence?: number }>({ confidence: _, ...f }: T) => f;
 
 const ProjectParam = z.object({ project: z.string().min(1).max(200) });
+/** GET /api/lessons/quality: one project, or (unset) every shown one. */
+const QualityQuery = z.object({ project: z.string().min(1).max(200).optional() });
 
 const LessonQuery = z.object({
   status: z.enum(['proposed', 'approved', 'rejected', 'superseded']).optional(),
@@ -258,6 +303,8 @@ const LessonPatch = z
     scope: z.enum(['task', 'project', 'global']).optional(),
     paths: z.array(z.string().max(300)).max(50).optional(),
     supersedes: z.string().optional(),
+    // Narrowing a global lesson (scope project or task): the project it now serves. Only for a lesson that is global.
+    projectKey: z.string().min(1).max(200).optional(),
   })
   .strict();
 
@@ -266,7 +313,7 @@ const ExportQuery = z.object({ project: z.string().min(1).max(200).optional(), a
 /** For the OpenAPI document (openapi.ts). */
 export const appSchemas = {
   ListQuery, Decision, Decisions, RepoPath, hotspotQuery, TopHotspotQuery, MapGraphQuery, ImpactQuery, DocUpload, ActivityQuery, ScanRequest,
-  BatchScanRequest, LinkRequest, PinRequest, RelevanceRequest, FactsQuery, ProjectParam, LessonQuery, LessonPatch, LessonDecisions, LessonToFact, ExportQuery,
+  BatchScanRequest, LinkRequest, PinRequest, RelevanceRequest, FactsQuery, ProjectParam, LessonQuery, LessonPatch, LessonDecisions, LessonToFact, ExportQuery, QualityQuery, DocsQuery,
 };
 
 /** The Bearer token a request carries, trimmed; null when there is none (or it is empty). */
@@ -313,6 +360,26 @@ function modelHealth(w: WorkerStatus, ollama: OllamaHealth | null): Record<Model
           : { provider: current, ok: true, reason: null };
   }
   return out;
+}
+
+/** What a project not shown is called where a queue counts its work: counted, never named. */
+const NOT_SHOWN_PROJECT = 'a project not shown';
+
+/**
+ * The scan queue from FactsStore.scanQueue (in the shown projects): how many wait and since when the oldest has, the
+ * running scans with their shards, and every one by project.
+ */
+export function scanQueueOf(entries: ScanQueueEntry[]): NonNullable<WorkQueues['scans']> {
+  const shards = (j: ScanQueueEntry) => (j.shards && j.shards.done !== undefined ? { done: j.shards.done, total: j.shards.total } : null);
+  const since = (j: ScanQueueEntry) => (j.status === 'running' ? (j.startedAt ?? j.waitingSince) : j.waitingSince);
+  const queued = entries.filter((j) => j.status === 'queued');
+  const running = entries.filter((j) => j.status === 'running');
+  return {
+    waiting: queued.length,
+    oldestAt: queued.reduce<string | null>((m, j) => (m === null || j.waitingSince < m ? j.waitingSince : m), null),
+    running: running.map((j) => ({ what: j.projectKey, since: since(j), shards: shards(j) })),
+    projects: entries.map((j) => ({ project: j.projectKey, status: j.status as 'queued' | 'running', since: since(j), shards: shards(j) })),
+  };
 }
 
 /** /api/status stage and progress from a live worker's heartbeat (both null when it is offline or does not say). */
@@ -392,8 +459,29 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
       const mcpEnd = c.req.method === 'DELETE' && (c.req.path === '/mcp' || c.req.path === ADMIN_MCP);
       if (!mcpEnd && !c.req.header('content-type')?.startsWith('application/json')) return c.json({ error: 'json required' }, 415);
     }
+    // A run label (x-fg-run, and on the MCP endpoints ?run=): what the request writes records it (runs.ts).
+    const mcp = c.req.path === '/mcp' || c.req.path === ADMIN_MCP;
+    const label = runLabel((h) => c.req.header(h), mcp ? (k) => c.req.query(k) : undefined);
+    if (label && 'error' in label) return mcp ? c.json({ jsonrpc: '2.0', id: null, error: { code: -32600, message: label.error } }, 400) : c.json({ error: label.error }, 400);
+    // Cleaning a run up is not part of any run: a label there would claim the run for whoever cleans it (409 for the
+    // owner on an agent's run; a dry run of an unused id would open it).
+    const run = RUN_PATH.test(c.req.path) ? null : label;
+    const browser = c.req.header('origin') !== undefined;
+    const principal: RunPrincipal = operator ? 'operator' : browser ? 'browser' : auth.token && authenticated(c, auth.token) ? 'owner_token' : 'agent';
+    // A run id belongs to whoever opened it (its first labelled write): a write under it by anyone else is refused, so
+    // a run cannot be hijacked or mixed, and the operator token cleans up only runs it opened (runs.ts).
+    if (run && opts.runs && c.req.method !== 'GET' && c.req.method !== 'HEAD') {
+      const owner = await opts.runs.claim(run.id, principal);
+      if (owner.principal !== principal) {
+        const error = `run id belongs to another caller: ${run.id} was opened by ${RUN_OPENERS[owner.principal]} at ${owner.firstSeen}; label this one with a run id of its own`;
+        log?.('run refused', { method: c.req.method, path: c.req.path, run: run.id, owner: owner.principal, caller: principal });
+        return mcp ? c.json({ jsonrpc: '2.0', id: null, error: { code: -32600, message: error } }, 409) : c.json({ error }, 409);
+      }
+    }
     // Activity says how each write arrived (operator.ts runVia).
-    await runVia(operator ? 'operator' : c.req.header('origin') !== undefined ? 'browser' : 'api', next);
+    // A run changes only what it wrote, unless the owner opened it (operator.ts mayChange).
+    const fromOwner = principal === 'browser' || principal === 'owner_token';
+    await runVia(operator ? 'operator' : browser ? 'browser' : 'api', () => runFromOwner(fromOwner, () => runIn(run, next)));
   });
 
   // Every body has a size limit, checked before anything reads it (the Content-Length, else counted as it arrives):
@@ -466,6 +554,17 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
 
   // The first-run panel: every stage's count in one call. Each count fails on its own (null), never the whole answer.
   // ?project=: one project's counts (an empty state filtered to it); the classify backlog and the stage stay worker-wide.
+  // How the owner decided the post-mortem's lessons (approved as written, after an edit, rejected), in the shown
+  // projects or the one asked for. Null: the store cannot tell.
+  const lessonQualityFor = async (project?: string): Promise<LessonQualityReport | null> => {
+    if (!knowledge?.decidedLessons) return null;
+    const v = await view();
+    const keys = project ? (keysFor(v, project) ?? [project]) : keysFor(v);
+    const since = new Date(Date.now() - Math.max(...LESSON_QUALITY_DAYS) * 86_400_000).toISOString();
+    const rows = await knowledge.decidedLessons({ projectKeys: keys ?? null, since, limit: QUALITY_LIMIT });
+    return lessonQualityReport(rows.map((r) => r.lesson).filter((l) => showsLesson(v, l)), { capped: rows.length >= QUALITY_LIMIT });
+  };
+
   const pipelineStatus = async (project?: string): Promise<PipelineStatus> => {
     const v = await view();
     const keys = project ? (keysFor(v, project) ?? [project]) : keysFor(v);
@@ -473,9 +572,9 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
     const worker = graph ? ((await system?.worker().catch(() => null)) ?? null) : null;
     const live = !!worker && Date.now() - Date.parse(worker.lastBeat) < WORKER_STALE_MS;
     const count = async <T>(fn: () => Promise<T>): Promise<T | null> => fn().catch(() => null);
-    const pending = (status: 'pending' | 'confirmed') => repo.listCandidates({ status, limit: PIPELINE_LIMIT, ...(keys && { projectKeys: keys }) }).then((r) => r.length);
+    const pending = (status: 'pending' | 'confirmed') => repo.listCandidates({ status, limit: PIPELINE_LIMIT, ...(keys && { projectKeys: keys }), ...runAsked() }).then((r) => r.length);
     const lessons = (status: 'proposed' | 'approved') =>
-      knowledge!.listLessons({ status, limit: PIPELINE_LIMIT, ...(keys && { projectKeys: keys }) }).then((r) => r.filter((l) => showsLesson(v, l)));
+      knowledge!.listLessons({ status, limit: PIPELINE_LIMIT, ...(keys && { projectKeys: keys }), ...runAsked() }).then((r) => r.filter((l) => showsLesson(v, l)));
     const projects = facts ? await count(async () => (await facts.listProjects()).filter((p) => (!v || v.has(p.key)) && (!project || p.key === project))) : null;
     const scans: PipelineStatus['scans'] = projects && { done: 0, queued: 0, running: 0, failed: 0, never: 0 };
     for (const p of projects ?? []) scans![p.lastScan?.status ?? 'never']++;
@@ -483,13 +582,32 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
     const older = projects && facts?.olderScannerFiles ? await count(() => facts.olderScannerFiles!(SCANNER_VERSION)) : null;
     const olderIn = (projects ?? []).filter((p) => (older?.get(p.key) ?? 0) > 0).map((p) => [p.key, older!.get(p.key)!] as const);
     if (scans && olderIn.length) scans.olderScanner = { files: olderIn.reduce((n, [, c]) => n + c, 0), projects: Object.fromEntries(olderIn) };
-    const [inboxPending, inboxConfirmed, proposed, approved, queued] = await Promise.all([
+    const [inboxPending, inboxConfirmed, proposed, approved, queued, scanQueue, pmQueue, chatQueue, quality] = await Promise.all([
       count(() => pending('pending')),
       count(() => pending('confirmed')),
       knowledge ? count(() => lessons('proposed')) : null,
       knowledge ? count(() => lessons('approved')) : null,
       knowledge?.postmortemBacklog ? count(() => knowledge.postmortemBacklog!()) : null,
+      facts?.scanQueue ? count(() => facts.scanQueue!()) : null,
+      knowledge?.postmortemQueue ? count(() => knowledge.postmortemQueue!()) : null,
+      opts.chat?.store.chatQueue ? count(() => opts.chat!.store.chatQueue!()) : null,
+      count(() => lessonQualityFor(project)),
     ]);
+    // Back-pressure: what waits in each queue and since when, and what runs now (the worker's stage for the steps of
+    // its loop). Scans count the shown projects (or the one asked for); an answer for a hidden project is not named.
+    const stage = live ? worker?.stage : null;
+    const runningIn = (name: string) => (stage?.name === name ? [{ what: stage.current ?? name, since: stage.startedAt }] : []);
+    const backlog = worker?.backlog ?? null;
+    const queues: WorkQueues = {
+      scans: scanQueue && scanQueueOf(scanQueue.filter((j) => (!v || v.has(j.projectKey)) && (!project || j.projectKey === project))),
+      classify: backlog ? { waiting: backlog.classify, capped: backlog.classifyCapped, oldestAt: backlog.oldestAt ?? null, running: runningIn('classify') } : null,
+      postmortems: pmQueue ? { ...pmQueue, running: runningIn('postmortem') }
+        : queued !== null ? { waiting: queued, oldestAt: null, running: runningIn('postmortem') } : null,
+      chats: chatQueue && ({
+        waiting: chatQueue.waiting, oldestAt: chatQueue.oldestAt,
+        running: chatQueue.running.map((t) => ({ what: !v || v.has(t.projectKey) ? t.projectKey : NOT_SHOWN_PROJECT, since: t.startedAt })),
+      } satisfies WorkQueue),
+    };
     return {
       ...stageOf(live ? worker : null),
       sessions: projects ? projects.reduce((n, p) => n + p.sessions, 0) : null,
@@ -497,8 +615,12 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
       inbox: inboxPending === null || inboxConfirmed === null ? null : { pending: inboxPending, confirmed: inboxConfirmed },
       postmortems: queued === null ? null : { queued },
       // global: the lessons with no project of their own (they serve every project), which no project's row counts.
-      lessons: proposed === null || approved === null ? null : { proposed: proposed.length, approved: approved.length, global: [...proposed, ...approved].filter((l) => !l.projectKey).length },
+      lessons: proposed === null || approved === null ? null : {
+        proposed: proposed.length, approved: approved.length, global: [...proposed, ...approved].filter((l) => !l.projectKey).length,
+        ...(quality && { quality: quality.windows }),
+      },
       scans,
+      queues,
     };
   };
   app.get('/api/pipeline', async (c) => c.json(await pipelineStatus(c.req.query('project')?.slice(0, 200) || undefined)));
@@ -584,7 +706,7 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
     // One more than the page tells whether another follows: the x-next-offset header says where it starts.
     const limit = q.data.limit ?? CANDIDATE_PAGE;
     const offset = q.data.offset ?? 0;
-    const rows = await repo.listCandidates({ status: q.data.status, projectKey: q.data.project, source: q.data.source, limit: limit + 1, offset, ...(projectKeys && { projectKeys }) });
+    const rows = await repo.listCandidates({ status: q.data.status, projectKey: q.data.project, source: q.data.source, limit: limit + 1, offset, ...(projectKeys && { projectKeys }), ...runAsked() });
     if (rows.length > limit) c.header('x-next-offset', String(offset + limit));
     return c.json(rows.slice(0, limit));
   });
@@ -604,6 +726,7 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
   const decideCandidate = async (id: string, status: 'confirmed' | 'rejected', note: string | null): Promise<boolean> => {
     const detail = await shownCandidate(id);
     if (!detail) return false;
+    if (!mayChange(detail.candidate)) throw new NotTheRunsError(`the Inbox item ${id}`, currentRun()!.id);
     await repo.decide(id, status, note, currentActor());
     const text = detail.turn.text ?? '';
     const who = actingAsOperator() ? `an agent (${currentActor()})` : 'you';
@@ -622,7 +745,12 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
   app.post('/api/candidates/:id/decision', async (c) => {
     const body = Decision.safeParse(await c.req.json().catch(() => null));
     if (!body.success) return c.json({ error: body.error.flatten() }, 400);
-    if (!(await decideCandidate(c.req.param('id'), body.data.status, body.data.note ?? null))) return c.json({ error: 'not found' }, 404);
+    try {
+      if (!(await decideCandidate(c.req.param('id'), body.data.status, body.data.note ?? null))) return c.json({ error: 'not found' }, 404);
+    } catch (err) {
+      if (err instanceof NotTheRunsError) return c.json({ error: err.message }, 409);
+      throw err;
+    }
     return c.body(null, 204);
   });
 
@@ -634,7 +762,12 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
     const results = [];
     for (const item of body.data.items) {
       const status = item.decision === 'confirm' ? 'confirmed' : 'rejected';
-      results.push((await decideCandidate(item.id, status, item.reason ?? null)) ? { id: item.id, ok: true, status } : { id: item.id, ok: false, error: 'not found' });
+      try {
+        results.push((await decideCandidate(item.id, status, item.reason ?? null)) ? { id: item.id, ok: true, status } : { id: item.id, ok: false, error: 'not found' });
+      } catch (err) {
+        if (!(err instanceof NotTheRunsError)) throw err;
+        results.push({ id: item.id, ok: false, error: err.message });
+      }
     }
     return c.json({ results });
   });
@@ -644,7 +777,9 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
     return c.json((await repo.stats()).filter((r) => !v || v.has(r.projectKey)));
   });
 
-  if (context) app.all('/mcp', (c) => handleMcp(c.req.raw, context));
+  // A labelled run's writes carry it, and a sandbox run's records are served only to that run (runs.ts).
+  const mcpContext = context && runScoped(context);
+  if (mcpContext) app.all('/mcp', (c) => handleMcp(c.req.raw, mcpContext));
   // Owner decisions for an agent holding the operator token (adminMcp.ts): each tool calls the REST route in-process,
   // so the OPERATOR_ALLOW gate, validation and Activity are the route's own. Not mounted without FG_OPERATOR_TOKEN.
   if (auth.operator?.token) app.all(ADMIN_MCP, (c) => handleAdminMcp(c.req.raw, { request: (path, init) => app.request(path, init) }));
@@ -672,7 +807,7 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
       // Confirmed links whose other end is shown, so a hidden project never counts (one query for every project).
       const linkCount = new Map<string, number>();
       if (links) {
-        for (const l of await links.listLinks({})) {
+        for (const l of await links.listLinks(runAsked())) {
           if (l.status !== 'confirmed' || (v && !(v.has(l.a) && v.has(l.b)))) continue;
           for (const k of [l.a, l.b]) linkCount.set(k, (linkCount.get(k) ?? 0) + 1);
         }
@@ -719,7 +854,12 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
         const job = await scanJob(c.req.param('id'));
         if (!job || !(await shows(job.projectKey))) return c.json({ error: 'not found' }, 404);
         let queuePosition: number | null = null;
-        if (job.status === 'queued') {
+        if (job.status === 'queued' && facts.scanQueue) {
+          // The order the queue serves (a scan that gave way waits behind those queued since); every project counts.
+          const queued = (await facts.scanQueue()).filter((j) => j.status === 'queued');
+          const at = queued.findIndex((j) => j.id === job.id);
+          queuePosition = at < 0 ? null : at + 1;
+        } else if (job.status === 'queued') {
           const ahead = (await facts.listProjects()).filter((p) => p.lastScan?.status === 'queued' && p.lastScan.id !== job.id && p.lastScan.requestedAt < job.requestedAt).length;
           queuePosition = ahead + 1;
         }
@@ -738,7 +878,7 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
       }
       const { kind, origin, limit, offset } = q.data;
       // One more than asked, so the page can say whether another follows.
-      const rows = await facts.listFacts({ projectKey, ...(kind && { kind }), ...(origin && { origin }), limit: limit + 1, offset });
+      const rows = await facts.listFacts({ projectKey, ...(kind && { kind }), ...(origin && { origin }), limit: limit + 1, offset, ...runAsked() });
       if (rows.length > limit) c.header('X-Next-Offset', String(offset + limit));
       return c.json(rows.slice(0, limit).map(servedFact));
     });
@@ -753,6 +893,8 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
         const known = (await facts.listProjects()).find((p) => p.key === key);
         const project = (await projectDirs()).find((p) => p.key === key) ?? (known && { key, name: key, repoPath: known.repoPath });
         if (!project || !(await shows(project.key))) return c.json({ error: 'no such project' }, 404);
+        // A project's pin is the owner's: no run's record, so a run cannot change it (nor cleanup undo it).
+        if (!mayChangeAny()) return notTheRuns(c, `the pin of ${project.key}`);
         await setPinned(project, body.data.pinned);
         await activity?.record({
           kind: 'project_pinned', actor: 'you', projectKey: project.key,
@@ -771,8 +913,9 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
         const projectKey = c.req.param('key');
         if (!(await shows(projectKey))) return c.json(NOT_SHOWN, 404);
         const id = c.req.param('id');
-        const changed = await setRelevance([{ id, relevance: body.data.relevance, by: currentActor() as RelevanceBy, projectKey }]);
-        if (!changed) return c.json({ error: 'no such fact in this project' }, 404);
+        // In a run, only a fact the run wrote; otherwise the owner's setting (a run's fact becomes the owner's).
+        const changed = await setRelevance([{ id, relevance: body.data.relevance, by: currentActor() as RelevanceBy, projectKey, run: mayChangeAny() ? null : currentRun()!.id }]);
+        if (!changed) return c.json({ error: currentRun() ? 'no such fact in this project among the facts this run wrote' : 'no such fact in this project' }, 404);
         await activity?.record({
           kind: 'fact_relevance_set', actor: 'you', projectKey,
           subject: `set a fact to ${relevanceBand(body.data.relevance)} (${body.data.relevance})`,
@@ -787,7 +930,16 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
   if (docs && embed && projectDirs) {
     app.get('/api/projects/:key/docs', async (c) => {
       const key = c.req.param('key');
-      return (await shows(key)) ? c.json(await docs.listDocs(key)) : c.json(NOT_SHOWN, 404);
+      if (!(await shows(key))) return c.json(NOT_SHOWN, 404);
+      const q = DocsQuery.safeParse(c.req.query());
+      const after = q.success && q.data.cursor ? docCursor(q.data.cursor) : null;
+      if (!q.success || (q.data.cursor && !after)) return c.json({ error: `send limit (1-${DOCS_MAX_PAGE}) and the cursor of the page before (x-next-cursor)` }, 400);
+      // One more than the page tells whether another follows: the x-next-cursor header says where it starts.
+      const limit = q.data.limit ?? DOCS_PAGE;
+      const rows = await docs.listDocs(key, { limit: limit + 1, after, run: askingRun() });
+      const page = rows.slice(0, limit);
+      if (rows.length > limit) c.header('x-next-cursor', toDocCursor(page.at(-1)!));
+      return c.json(page);
     });
 
     app.post('/api/projects/:key/docs', async (c) => {
@@ -801,13 +953,21 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
       const chunks = image ? [`Image "${title}" (${name}): not read yet.`] : chunkText(redactSecrets(body.data.text!));
       if (!chunks.length) return c.json({ error: 'document has no text' }, 400);
       const vectors = await embed(chunks);
-      // Same file name, same doc: say so, rather than logging a fresh upload over a silent replacement.
-      const previous = (await docs.listDocs(project.key)).find((d) => d.source === 'upload' && d.ref === name);
-      const id = await docs.upsertDoc(
-        { projectKey: project.key, source: 'upload', ref: name, title, url: null },
-        chunks.map((text, i) => ({ text, embedding: vectors[i] })),
-        { read: true, addedBy: currentActor(), ...(image && { image }) },
-      );
+      // Same file name, same doc: say so, rather than logging a fresh upload over a silent replacement. A sandbox run's
+      // upload is its own document beside the owner's of that name (docIdOf), so only that one is a replacement.
+      const replaces = docIdOf({ projectKey: project.key, source: 'upload', ref: redactSecrets(name) }, currentRun());
+      const previous = (await docs.listDocs(project.key, { source: 'upload', ref: name, limit: 2, run: askingRun() })).find((d) => d.id === replaces);
+      let id: string;
+      try {
+        id = await docs.upsertDoc(
+          { projectKey: project.key, source: 'upload', ref: name, title, url: null },
+          chunks.map((text, i) => ({ text, embedding: vectors[i] })),
+          { read: true, addedBy: currentActor(), ...runWrite(), ...(image && { image }) },
+        );
+      } catch (err) {
+        if (err instanceof NotTheRunsError) return c.json({ error: err.message }, 409);
+        throw err;
+      }
       const what = image ? `image "${title}"` : `"${title}" (${chunks.length} chunk${chunks.length === 1 ? '' : 's'})`;
       await activity?.record({
         kind: 'doc_added', actor: 'you', projectKey: project.key,
@@ -856,7 +1016,8 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
       const id = c.req.param('id');
       // ids are doc:<project>:<source>:<ref>
       if (!(await shows(id.split(':')[1] ?? ''))) return c.json({ error: 'not found' }, 404);
-      if (!(await docs.deleteDoc(id))) return c.json({ error: 'not found' }, 404);
+      // In a run, only a document the run uploaded (runOnly).
+      if (!(await docs.deleteDoc(id, runOnly()))) return c.json({ error: currentRun() ? 'not found among the documents this run uploaded' : 'not found' }, 404);
       // ids are doc:<project>:<source>:<ref>
       await activity?.record({
         kind: 'doc_removed', actor: 'you', projectKey: id.split(':')[1] ?? null,
@@ -872,7 +1033,7 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
       if (!(await shows(key))) return c.json(NOT_SHOWN, 404);
       const v = await view();
       // Only links whose other end you can see: a hidden project's name never shows through a link.
-      return c.json((await links.listLinks({ projectKey: key })).filter((l) => !v || (v.has(l.a) && v.has(l.b))));
+      return c.json((await links.listLinks({ projectKey: key, ...runAsked() })).filter((l) => !v || (v.has(l.a) && v.has(l.b))));
     });
 
     app.put('/api/links', async (c) => {
@@ -881,7 +1042,13 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
       const { a, b, ...patch } = body.data;
       if (a === b) return c.json({ error: 'a project cannot be linked to itself' }, 400);
       if (!(await shows(a)) || !(await shows(b))) return c.json({ error: 'both projects must be selected' }, 404);
-      const link = await links.setLink(a, b, { ...patch, decidedBy: currentActor() });
+      let link;
+      try {
+        link = await links.setLink(a, b, { ...patch, decidedBy: currentActor(), ...runWrite() });
+      } catch (err) {
+        if (err instanceof NotTheRunsError) return c.json({ error: err.message }, 409);
+        throw err;
+      }
       const [x, y] = linkPair(a, b);
       const what = patch.status === 'confirmed' ? 'confirmed' : patch.status === 'dismissed' ? 'dismissed' : patch.status === 'suggested' ? 'reopened' : 'edited';
       await activity?.record({
@@ -895,12 +1062,13 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
 
     app.delete('/api/links/:id', async (c) => {
       const id = c.req.param('id');
-      const ends = /^link:([^|]+)\|(.+)$/.exec(id);
-      if (!ends || !(await shows(ends[1])) || !(await shows(ends[2]))) return c.json({ error: 'not found' }, 404);
-      if (!(await links.deleteLink(id))) return c.json({ error: 'not found' }, 404);
+      const ends = linkEnds(id);
+      if (!ends || !(await shows(ends[0])) || !(await shows(ends[1]))) return c.json({ error: 'not found' }, 404);
+      // In a run, only a link the run made (runOnly).
+      if (!(await links.deleteLink(id, runOnly()))) return c.json({ error: currentRun() ? 'not found among the links this run made' : 'not found' }, 404);
       await activity?.record({
-        kind: 'link_decided', actor: 'you', projectKey: ends[1],
-        subject: `removed the link ${ends[1]} ↔ ${ends[2]}`, why: 'you removed it; the worker may suggest it again if the evidence is still there', details: {}, targets: [id],
+        kind: 'link_decided', actor: 'you', projectKey: ends[0],
+        subject: `removed the link ${ends[0]} ↔ ${ends[1]}`, why: 'you removed it; the worker may suggest it again if the evidence is still there', details: {}, targets: [id],
       });
       return c.body(null, 204);
     });
@@ -923,7 +1091,7 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
       const q = HotspotQuery.safeParse(c.req.query());
       if (!q.success) return c.json({ error: q.error.flatten() }, 400);
       const key = c.req.param('key');
-      const [meta, hotspots] = await Promise.all([codegraph.codeMapMeta(key), codegraph.hotspots(key, q.data.limit, { includeTests: q.data.tests })]);
+      const [meta, hotspots] = await Promise.all([codegraph.codeMapMeta(key), codegraph.hotspots(key, q.data.limit, { includeTests: q.data.tests, ...runAsked() })]);
       return c.json({ meta, capped: mapCapped(meta, mapMaxFiles), hotspots });
     });
     if (codegraph.requestCodeMapRebuild) {
@@ -947,20 +1115,20 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
         const q = MapGraphQuery.safeParse(c.req.query());
         if (!q.success) return c.json({ error: q.error.flatten() }, 400);
         const key = c.req.param('key');
-        const [graph, meta] = await Promise.all([mapGraph(key, { limit: q.data.limit, includeTests: q.data.tests }), codegraph.codeMapMeta(key)]);
+        const [graph, meta] = await Promise.all([mapGraph(key, { limit: q.data.limit, includeTests: q.data.tests, ...runAsked() }), codegraph.codeMapMeta(key)]);
         // The map's size too: the graph says when the map itself is capped (SCAN_MAX_FILES).
         const g = { ...graph, meta, capped: mapCapped(meta, mapMaxFiles) };
         const v = await view();
         if (!v || !knowledge || !g.lessons.length) return c.json(g);
         // The map holds ids only: the shown approved lessons say which of them were learned in a selected project.
-        const ok = new Set((await knowledge.listLessons({ status: 'approved', projectKeys: v.keys, limit: 5000 })).filter((l) => showsLesson(v, l)).map((l) => l.id));
+        const ok = new Set((await knowledge.listLessons({ status: 'approved', projectKeys: v.keys, limit: 5000, ...runAsked() })).filter((l) => showsLesson(v, l)).map((l) => l.id));
         return c.json({ ...g, lessons: g.lessons.filter((l) => ok.has(l.id)) });
       });
     }
     app.get('/api/projects/:key/codemap/module', async (c) => {
       const path = RepoPath.safeParse(c.req.query('path'));
       if (!path.success) return c.json({ error: 'path must be a repo-relative file path' }, 400);
-      const m = await codegraph.moduleContext(c.req.param('key'), path.data);
+      const m = await codegraph.moduleContext(c.req.param('key'), path.data, askingRun());
       if (!m) return c.json({ error: 'not in the code map' }, 404);
       const v = await view();
       return c.json({ ...m, lessons: m.lessons.filter((l) => showsLesson(v, l)) });
@@ -968,7 +1136,7 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
     app.get('/api/projects/:key/codemap/impact', async (c) => {
       const q = ImpactQuery.safeParse({ path: c.req.queries('path') ?? [], depth: c.req.query('depth') });
       if (!q.success) return c.json({ error: q.error.flatten() }, 400);
-      const r = await codegraph.impact(c.req.param('key'), [...new Set(q.data.path)], q.data.depth);
+      const r = await codegraph.impact(c.req.param('key'), [...new Set(q.data.path)], q.data.depth, askingRun());
       const v = await view();
       return c.json({ ...r, lessons: r.lessons.filter((l) => showsLesson(v, l)) });
     });
@@ -980,7 +1148,7 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
         const v = await view();
         const keys = (await projectDirs()).map((p) => p.key).filter((k) => (!q.data.project || k === q.data.project) && (!v || v.has(k)));
         if (q.data.project && !keys.length) return c.json({ error: 'no such selected project' }, 404);
-        const per = await Promise.all(keys.map(async (k) => (await codegraph.hotspots(k, q.data.limit, { includeTests: q.data.tests, ...(q.data.misses && { missesOnly: true }) })).map((h) => ({ projectKey: k, ...h }))));
+        const per = await Promise.all(keys.map(async (k) => (await codegraph.hotspots(k, q.data.limit, { includeTests: q.data.tests, ...(q.data.misses && { missesOnly: true }), ...runAsked() })).map((h) => ({ projectKey: k, ...h }))));
         const all = per.flat().sort((a, b) => b.score - a.score || cmp(a.projectKey, b.projectKey) || cmp(a.path, b.path));
         return c.json(all.slice(0, q.data.limit));
       });
@@ -991,8 +1159,16 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
     app.get('/api/export', async (c) => {
       const q = ExportQuery.safeParse(c.req.query());
       if (!q.success) return c.json({ error: q.error.flatten() }, 400);
-      if (q.data.project && !(await shows(q.data.project))) return c.json(NOT_SHOWN, 404);
-      const bundle = await portability.exportData({ projectKey: q.data.project, approvedOnly: !!q.data.approved });
+      const approvedOnly = !!q.data.approved;
+      let bundle;
+      if (q.data.project) {
+        if (!(await shows(q.data.project))) return c.json(NOT_SHOWN, 404);
+        bundle = await portability.exportData({ projectKey: q.data.project, approvedOnly });
+      } else {
+        // Everything means every selected project: one you unselected stays out, though its data is still stored.
+        const v = await view();
+        bundle = await portability.exportData(v ? { projectKeys: v.keys, approvedOnly } : { approvedOnly });
+      }
       const name = `feedback-graph-${(q.data.project ?? 'all').replace(/[^\w.-]/g, '_')}-${bundle.exportedAt.slice(0, 10)}.json`;
       c.header('content-disposition', `attachment; filename="${name}"`);
       return c.json(bundle);
@@ -1019,8 +1195,11 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
   if (cloud) cloudState = cloudRoutes(app, cloud);
   if (integrations) integrationRoutes(app, integrations);
   if (importer) importRoutes(app, importer);
+  if (opts.demo) demoRoutes(app, { ...opts.demo, activity: opts.demo.activity ? asActor(opts.demo.activity) : activity }, { operator: auth.operator });
   if (sessions) sessionRoutes(app, sessions);
   if (opts.chat) chatRoutes(app, opts.chat, view);
+  if (opts.runs && activity) runRoutes(app, { store: opts.runs, activity });
+  if (opts.evidence) evidenceRoutes(app, opts.evidence);
 
   if (activity) {
     app.get('/api/activity', async (c) => {
@@ -1089,9 +1268,23 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
       const projectKeys = keysFor(await view(), q.data.project);
       const { status, project, flag, source } = q.data;
       return c.json(await knowledge.listLessons({
-        status, projectKey: project, ...(projectKeys && { projectKeys }), ...(flag && { flag }), ...(source && { from: source }),
+        status, projectKey: project, ...(projectKeys && { projectKeys }), ...(flag && { flag }), ...(source && { from: source }), ...runAsked(),
       }));
     });
+
+    // Before /api/lessons/:id, which would take "quality" for a lesson id.
+    app.get('/api/lessons/quality', async (c) => {
+      const p = QualityQuery.safeParse(c.req.query());
+      if (!p.success) return c.json({ error: p.error.flatten() }, 400);
+      const q = await lessonQualityFor(p.data.project);
+      return q ? c.json(q) : c.json({ error: 'this store cannot count lesson decisions' }, 404);
+    });
+    /** A project a lesson can be narrowed to: a folder under the roots or one the store knows, and selected. */
+    const knownProject = async (key: string) => {
+      if (!(await shows(key))) return false;
+      if ((await projectDirs?.().catch(() => []))?.some((p) => p.key === key)) return true;
+      return !!(await facts?.listProjects().catch(() => []))?.some((p) => p.key === key);
+    };
 
     /** A lesson, if it was learned in (or serves) a shown project, or has no project. */
     const shownLesson = async (id: string) => {
@@ -1111,26 +1304,32 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
       const id = c.req.param('id');
       const current = await shownLesson(id);
       if (!current) return c.json({ error: 'not found' }, 404);
+      if (!mayChange(current.lesson)) return notTheRuns(c, `the lesson ${id}`);
       const p = body.data;
       let reembed: number[] | undefined;
       if (embed && (p.title !== undefined || p.rule !== undefined || p.appliesWhen !== undefined)) {
         const l = { ...current.lesson, ...p };
         [reembed] = await embed([`${l.title}\n${l.rule}\nApplies when: ${l.appliesWhen}`]);
       }
+      if (p.projectKey !== undefined) {
+        const narrowing = current.lesson.scope === 'global' && (p.scope === 'project' || p.scope === 'task');
+        if (!narrowing) return c.json({ error: 'projectKey only narrows a global lesson: send it with scope project or task' }, 400);
+        if (!(await knownProject(p.projectKey))) return c.json({ error: `no project ${p.projectKey} (or it is not selected): choose one from Settings` }, 400);
+      }
       if (p.supersedes === id) return c.json({ error: 'a lesson cannot supersede itself' }, 400);
       if (p.supersedes !== undefined && !(await shownLesson(p.supersedes))) return c.json({ error: `no lesson ${p.supersedes} to supersede` }, 400);
       const by = currentActor();
       const { unscoped } = await knowledge.updateLesson(id, p, { reembed, by });
-      if (unscoped) return c.json({ error: 'this lesson has no known project, so it cannot be narrowed; it was set back to proposed. Make it global or reject it.' }, 409);
+      if (unscoped) return c.json({ error: 'this lesson has no known project, so it cannot be narrowed without one; it was set back to proposed. Name the project (projectKey), make it global, or reject it.' }, 409);
       const changed = Object.fromEntries(
-        (['title', 'rule', 'appliesWhen', 'scope', 'paths'] as const)
+        (['title', 'rule', 'appliesWhen', 'scope', 'paths', 'projectKey'] as const)
           .filter((k) => p[k] !== undefined && JSON.stringify(p[k]) !== JSON.stringify(current.lesson[k]))
           .map((k) => [k, { from: current.lesson[k], to: p[k] }]),
       );
       await activity?.record({
         kind: 'lesson_decided',
         actor: 'you',
-        projectKey: current.lesson.projectKey,
+        projectKey: p.projectKey ?? current.lesson.projectKey,
         subject: `${p.status ?? 'edited'} lesson "${p.title ?? current.lesson.title}"`,
         why: decidedWhy(by, p.status),
         details: { status: p.status ?? current.lesson.status, changed, supersedes: p.supersedes ?? null },
@@ -1150,6 +1349,10 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
         const current = await shownLesson(item.id);
         if (!current) {
           results.push({ id: item.id, ok: false, error: 'not found' });
+          continue;
+        }
+        if (!mayChange(current.lesson)) {
+          results.push({ id: item.id, ok: false, error: new NotTheRunsError(`the lesson ${item.id}`, currentRun()!.id).message });
           continue;
         }
         await knowledge.updateLesson(item.id, { status: item.status }, { by, ...(item.note && { note: item.note }) });
@@ -1195,6 +1398,8 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
         const id = c.req.param('id');
         const d = await shownLesson(id);
         if (!d) return c.json({ error: 'not found' }, 404);
+        // Converting rejects the lesson: a run may do that only to its own.
+        if (!mayChange(d.lesson)) return notTheRuns(c, `the lesson ${id}`);
         const l = d.lesson;
         if (l.status === 'rejected' || l.status === 'superseded') return c.json({ error: `this lesson is already ${l.status}` }, 409);
         const projectKey = l.projectKey ?? l.origin ?? null;
@@ -1205,7 +1410,7 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
         const [embedding] = await embed([`${path}: ${l.rule}`]);
         const fact = await addOwnerFact(projectKey, {
           kind: body.data.kind, statement: l.rule, path, lines: null, confidence: 1, why, relevance: body.data.relevance, origin: 'you', embedding,
-        }, by as RelevanceBy);
+        }, by as RelevanceBy, ...(currentRun() ? [currentRun()] : []));
         await knowledge.updateLesson(id, { status: 'rejected' }, { by, note: 'converted to a fact' });
         await activity?.record({
           kind: 'lesson_to_fact',

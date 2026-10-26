@@ -164,6 +164,25 @@ test("another project's evidence graph, facts, docs and export are not found", a
   expect((await get('/api/projects/shop/docs')).status).toBe(200);
 });
 
+test('an export with no project covers the selected projects only, never one you unselected', async () => {
+  const { get, calls } = setup();
+  expect((await get('/api/export')).status).toBe(200);
+  expect((await get('/api/export?approved=1')).status).toBe(200);
+  expect(calls).toEqual([
+    ['export', { projectKeys: ['shop', 'shop-2'], approvedOnly: false }],
+    ['export', { projectKeys: ['shop', 'shop-2'], approvedOnly: true }],
+  ]);
+  const none = setup(NOTHING_YET);
+  await none.get('/api/export');
+  expect(none.calls).toEqual([['export', { projectKeys: [], approvedOnly: false }]]);
+});
+
+test('naming an unselected project for export is refused with a reason', async () => {
+  const res = await setup().app.request('/api/export?project=old');
+  expect(res.status).toBe(404);
+  expect((await res.json()).error).toMatch(/not selected/);
+});
+
 test('the code map leaves out lessons learned in a project that is not selected', async () => {
   const { get } = setup();
   const ids = (ls: { id: string }[]) => ls.map((l) => l.id);

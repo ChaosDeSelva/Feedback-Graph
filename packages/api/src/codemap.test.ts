@@ -489,3 +489,80 @@ test('the per-project code map routes answer only for projects in scope (selecte
   }
   expect(asked).not.toContain('secret');
 });
+
+// ── caps: a shared file in a big repo must not flood the agent's context ──
+
+describe('a shared util in a big repo: impact and get_module_context cap each list and say what they left out', () => {
+  const quote = (i: number) => `the agent changed the shared logger again and broke structured output for job ${i}; `.repeat(3).slice(0, 160);
+  const many = <T,>(k: number, f: (i: number) => T): T[] => Array.from({ length: k }, (_, i) => f(i));
+  const misses = many(30, (i) => miss({ missId: `miss:${i}`, missed: `missed thing number ${i}`, feedbackText: quote(i), ts: `2026-09-${String(i % 28 + 1).padStart(2, '0')}T10:00:00Z`, paths: [`src/jobs/job${i}.ts`], lessonId: null }));
+  const lessons = many(20, (i) => lesson(`l${i}`, `Lesson ${i}`, { rule: `keep the log fields stable ${'x'.repeat(80)}` }));
+  // Nearest first, as the code map gives them.
+  const tests = many(120, (i) => `test/t${String(i).padStart(3, '0')}.test.ts`);
+  const dependents = many(200, (i) => ({ path: `src/jobs/job${i}.ts`, depth: i < 50 ? 1 : 2 }));
+  const big: Impact = { paths: ['src/utils/log.ts'], dependents, tests, misses, lessons };
+  const bigModule: ModuleContext = {
+    ...pool,
+    file: { ...pool.file, path: 'src/utils/log.ts' },
+    importers: dependents.map((x) => x.path).sort(),
+    imports: many(60, (i) => ({ to: `src/lib/m${i}.ts`, names: ['x'] })),
+    facts: many(60, (i) => ({ ...pool.facts[0], id: `f${i}`, statement: `fact ${i} about the logger` })),
+    tests,
+    misses,
+    lessons,
+  };
+  const d = () => deps({ codegraph: codegraph({ impact: async () => big, moduleContext: async () => bigModule }).cg });
+
+  test('impact: nearest tests, a few lessons and grouped misses, each with "and N more", in about 4,000 characters', async () => {
+    const dd = d();
+    const md = (await getImpact({ project: 'demo', paths: ['src/utils/log.ts'] }, dd)).markdown;
+    expect(md.length).toBeLessThan(4_500);
+    expect(md).toContain('## Tests to run (120)');
+    expect(md).toContain('`test/t000.test.ts`');
+    expect(md).not.toContain('`test/t119.test.ts`');
+    expect(md).toMatch(/- and \d+ more tests?, farther from the change/);
+    expect(md).toMatch(/- and \d+ more approved lessons?/);
+    expect(md).toMatch(/- and \d+ more past misses/);
+    expect(md).toMatch(/- and \d+ more dependents?/);
+    // the most recent miss is the one kept
+    expect(md).toContain('missed thing number 27');
+    expect(md).not.toContain('missed thing number 0 ');
+    expect(md.match(/^- \*\*Lesson \d+\*\*/gm)!.length).toBeLessThanOrEqual(8);
+    expect(md.match(/^- missed thing number/gm)!.length).toBeLessThanOrEqual(6);
+    // what the answer left out, stored as counts and ids, not every miss and its quote
+    const details = dd.recorded[0].details as Record<string, unknown>;
+    expect(details).toMatchObject({ tool: 'impact', dependents: 200, tests: 120, total: { lessons: 20, misses: 30 } });
+    expect(JSON.stringify(details)).not.toContain('missed thing');
+    expect(JSON.stringify(details)).not.toContain('Lesson 1');
+    expect((details.misses as { id: string }[]).length).toBeLessThanOrEqual(6);
+    expect((details.lessons as { id: string }[])[0]).toEqual({ id: 'l0' });
+    expect(dd.recorded[0].targets!.length).toBeLessThanOrEqual(14);
+  });
+
+  test('get_module_context: facts, imports, tests, lessons and misses are capped with "and N more", within the budget', async () => {
+    const dd = d();
+    const md = (await getModuleContext({ project: 'demo', path: 'src/utils/log.ts' }, dd)).markdown;
+    expect(md.length).toBeLessThan(4_500);
+    expect(md).toMatch(/- and \d+ more facts?/);
+    expect(md).toMatch(/- and \d+ more imports?/);
+    expect(md).toMatch(/- and \d+ more tests?, farther from the file/);
+    expect(md).toMatch(/- and \d+ more approved lessons?/);
+    expect(md).toMatch(/- and \d+ more past misses/);
+    expect(JSON.stringify(dd.recorded[0].details)).not.toContain('missed thing');
+    expect(dd.recorded[0].details).toMatchObject({ tool: 'get_module_context', importers: 200, tests: 120, total: { lessons: 20, misses: 30 } });
+  });
+
+  test('a small answer is not cut: every list is whole and nothing says "more"', async () => {
+    const md = (await getImpact({ project: 'demo', paths: ['src/db/pool.ts'] }, deps())).markdown;
+    expect(md).not.toMatch(/more|shortened/i);
+  });
+
+  test('a file past the cap lists its nearest tests and says how many more', async () => {
+    const outsideMap: CodeGraphStore['outsideMap'] = async (_k, paths) => paths.map((path) => ({ path, importers: ['src/a.ts'], tests }));
+    const capped = async () => ({ fingerprint: 'abc', builtAt: '2026-10-22T12:00:00Z', stats: { files: 4000, symbols: 1, imports: 1, tests: 0 }, candidates: 10_290, unresolved: 0, version: CODE_MAP_VERSION });
+    const md = (await getModuleContext({ project: 'demo', path: 'src/utils/logging.ts' }, deps({ codegraph: codegraph({ codeMapMeta: capped, outsideMap }).cg }))).markdown;
+    expect(md).toContain('`test/t000.test.ts`');
+    expect(md).not.toContain('`test/t119.test.ts`');
+    expect(md).toMatch(/- and \d+ more tests?/);
+  });
+});

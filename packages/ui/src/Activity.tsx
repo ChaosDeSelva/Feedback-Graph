@@ -44,6 +44,12 @@ const KIND_LABEL: Record<ActivityKind, string> = {
   lesson_to_fact: 'lesson to fact',
   misses_reclassified: 'misses reclassified',
   items_reopened: 'back in the Inbox',
+  session_resumed: 'session read again',
+  secrets_redacted: 'secrets redacted',
+  run_cleaned: 'run cleaned up',
+  demo_seeded: 'demo corpus added',
+  demo_removed: 'demo corpus removed',
+  sessions_rematched: 'comments re-matched',
 };
 
 const KIND_TONE: Partial<Record<ActivityKind, Tone>> = {
@@ -155,6 +161,7 @@ export function ActivityEntry({ a, open: initial = false }: { a: Entry; open?: b
         </span>
         <span className="max-w-36 min-w-0 text-right text-xs @3xl:contents">
           <span title={actorHint(a.actor)} className="block truncate font-mono text-[11.5px] text-muted @3xl:text-left">{a.actor}</span>
+          {a.run && <span title="the run its request was labelled with (x-fg-run): fg cleanup --run removes what the run wrote" className="block truncate font-mono text-[11px] text-muted @3xl:text-left">run {a.run}{a.sandbox ? ' · sandbox' : ''}</span>}
           <span className="block text-muted tabular-nums @3xl:text-right">{time(a.ts)}</span>
         </span>
       </button>

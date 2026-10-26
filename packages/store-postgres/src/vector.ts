@@ -57,29 +57,39 @@ export function vectorTerms(db: Db, col: string, param: string, length: number):
 /** An embedding as a vector parameter; pgvector holds no empty vector, and a search for one finds nothing. */
 const vectorParam = (v: number[]) => (v.length ? toVector(v) : null);
 
-export function searchFactsQuery(db: Db, q: { embedding: number[]; projectKey: string; k: number }, columns: string): SqlQuery {
+/**
+ * `t` was not written by a sandbox run (RunTag), or by the one in `param`: a sandbox record is found only by its own
+ * run, and by no one when the parameter is null.
+ */
+export const visibleToRun = (t: string, param: string) => `(NOT ${t}.sandbox OR ${t}.run IS NOT DISTINCT FROM ${param}::text)`;
+
+export function searchFactsQuery(db: Db, q: { embedding: number[]; projectKey: string; k: number; run?: string | null }, columns: string): SqlQuery {
   const v = vectorTerms(db, 'f.embedding', '$2', q.embedding.length);
   return {
     sql: `SELECT ${columns}, cf.summary AS file_summary, cf.hash_changed_at AS file_changed_at, 1 - x.distance / 2 AS score
           FROM (SELECT f.*, ${v.distance} AS distance FROM facts f
-                WHERE f.project_key = $1 AND f.current AND ${v.where}
+                WHERE f.project_key = $1 AND f.current AND ${visibleToRun('f', '$4')} AND ${v.where}
                 ORDER BY ${v.distance}, f.id LIMIT $3) x
           LEFT JOIN code_files cf ON cf.id = x.code_file_id
           ORDER BY score DESC, x.id`,
-    params: [q.projectKey, vectorParam(q.embedding), q.k],
+    params: [q.projectKey, vectorParam(q.embedding), q.k, q.run ?? null],
   };
 }
 
-export function searchDocsQuery(db: Db, q: { embedding: number[]; projectKey: string; k: number }): SqlQuery {
+/**
+ * A chunk carries its document's run and sandbox flag (upsertDoc, saveDocReading), so another run's sandbox upload is
+ * left out inside the scan, as facts are, and the search still finds k hits when such chunks are the nearest.
+ */
+export function searchDocsQuery(db: Db, q: { embedding: number[]; projectKey: string; k: number; run?: string | null }): SqlQuery {
   const v = vectorTerms(db, 'c.embedding', '$2', q.embedding.length);
   return {
     sql: `SELECT d.id AS doc_id, d.source, d.ref, d.title, d.url, x.text, 1 - x.distance / 2 AS score
           FROM (SELECT c.id, c.doc_id, c.text, ${v.distance} AS distance FROM chunks c
-                WHERE c.project_key = $1 AND ${v.where}
+                WHERE c.project_key = $1 AND ${visibleToRun('c', '$4')} AND ${v.where}
                 ORDER BY ${v.distance}, c.id LIMIT $3) x
           JOIN docs d ON d.id = x.doc_id
           ORDER BY score DESC, x.id`,
-    params: [q.projectKey, vectorParam(q.embedding), q.k],
+    params: [q.projectKey, vectorParam(q.embedding), q.k, q.run ?? null],
   };
 }
 
@@ -87,31 +97,31 @@ export function searchDocsQuery(db: Db, q: { embedding: number[]; projectKey: st
 export const learnedIn = (t: string, param: string) =>
   `(${param}::text[] IS NULL OR coalesce(${t}.project_key, ${t}.origin_project_key) IS NULL OR coalesce(${t}.project_key, ${t}.origin_project_key) = ANY(${param}))`;
 
-export function searchLessonsQuery(db: Db, q: { embedding: number[]; projectKey: string | null; k: number; status?: string; projectKeys?: string[] }): SqlQuery {
+export function searchLessonsQuery(db: Db, q: { embedding: number[]; projectKey: string | null; k: number; status?: string; projectKeys?: string[]; run?: string | null }): SqlQuery {
   const v = vectorTerms(db, 'l.embedding', '$1', q.embedding.length);
   return {
     sql: `SELECT x.*, 1 - x.distance / 2 AS score
           FROM (SELECT l.*, ${v.distance} AS distance FROM lessons l
-                WHERE l.status = $2 AND (l.project_key IS NULL OR l.project_key = $3) AND ${learnedIn('l', '$5')} AND ${v.where}
+                WHERE l.status = $2 AND (l.project_key IS NULL OR l.project_key = $3) AND ${learnedIn('l', '$5')} AND ${visibleToRun('l', '$6')} AND ${v.where}
                 ORDER BY ${v.distance}, l.id LIMIT $4) x
           ORDER BY score DESC, x.id`,
-    params: [vectorParam(q.embedding), q.status ?? 'approved', q.projectKey, q.k, q.projectKeys ?? null],
+    params: [vectorParam(q.embedding), q.status ?? 'approved', q.projectKey, q.k, q.projectKeys ?? null, q.run ?? null],
   };
 }
 
 /** The k nearest misses first, then their feedback, as Neo4j does: a miss whose chain is broken drops out after the limit. */
-export function relatedMissesQuery(db: Db, q: { embedding: number[]; projectKey: string | null; k: number }): SqlQuery {
+export function relatedMissesQuery(db: Db, q: { embedding: number[]; projectKey: string | null; k: number; run?: string | null }): SqlQuery {
   const v = vectorTerms(db, 'm.embedding', '$1', q.embedding.length);
   return {
     sql: `SELECT n.id, n.missed, n.cause, 1 - n.distance / 2 AS score, t.text, t.session_id, t.ts_text,
                  EXISTS (SELECT 1 FROM lessons l WHERE l.miss_id = n.id AND l.status = 'rejected'
                            AND l.checks @> '[{"name": "wrong-session"}]'::jsonb) AS wrong_session
           FROM (SELECT m.id, m.missed, m.cause, m.feedback_id, ${v.distance} AS distance FROM misses m
-                WHERE ($2::text IS NULL OR m.project_key = $2) AND ${v.where}
+                WHERE ($2::text IS NULL OR m.project_key = $2) AND ${visibleToRun('m', '$4')} AND ${v.where}
                 ORDER BY ${v.distance}, m.id LIMIT $3) n
           JOIN feedback f ON f.id = n.feedback_id JOIN turns t ON t.uuid = f.turn_uuid
           ORDER BY score DESC, n.id`,
-    params: [vectorParam(q.embedding), q.projectKey, q.k],
+    params: [vectorParam(q.embedding), q.projectKey, q.k, q.run ?? null],
   };
 }
 

@@ -4,7 +4,8 @@ import { join } from 'node:path';
 import { ChatBusyError, shownProjects, type ActivityInput, type ChatConversation, type ChatPack, type ChatThread, type ChatTurn, type Lesson, type MapFile, type MapSymbol, type StoredCodeMap } from '@fb/core';
 import { beforeEach, describe, expect, test } from 'vitest';
 import { createApp, type ApiRepo } from './app.ts';
-import { buildChatContext, SNIPPET_BYTES, SNIPPET_LINES, type ChatContextDeps, type ChatRouteDeps } from './chat.ts';
+import { buildChatContext, chatPackBuilder, SNIPPET_BYTES, SNIPPET_LINES, type ChatContextDeps, type ChatRouteDeps } from './chat.ts';
+import { runIn } from './operator.ts';
 import type { ContextDeps } from './context.ts';
 
 const token = () => `ghp_${'E'.repeat(36)}`;
@@ -135,6 +136,27 @@ describe('buildChatContext', () => {
     expect(pack.context).not.toContain(token());
   });
 
+  test('a secret assigned in code is redacted from the snippet, in any language', async () => {
+    const secret = 'Q9x' + 'w'.repeat(20) + '7Zk';
+    const src = [
+      `export const AWS_SECRET_ACCESS_KEY = "${secret}";`,
+      `const stripeApiKey: string = '${secret}';`,
+      `export function upload() { return AWS_SECRET_ACCESS_KEY.length; }`,
+    ].join('\n');
+    const py = `class Uploader:\n    def __init__(self):\n        self.password = '${secret}'\n`;
+    const go = `package upload\n\nfunc Upload() {\n\tapiToken := "${secret}"\n}\n`;
+    const { root } = project({ 'src/upload.ts': src, 'src/upload.py': py, 'src/upload.go': go });
+    const d = deps(root, {
+      files: [file('src/upload.ts'), file('src/upload.py', { lang: 'python' }), file('src/upload.go', { lang: 'go' })],
+      symbols: [sym('src/upload.ts', 'upload', '1-3'), sym('src/upload.py', 'Uploader', '1-3'), sym('src/upload.go', 'Upload', '1-5')],
+    });
+    const pack = await buildChatContext('demo-shop', 'where is upload done', [], d);
+    expect(pack.context).toContain('AWS_SECRET_ACCESS_KEY = "[REDACTED]"');
+    expect(pack.context).toContain("self.password = '[REDACTED]'");
+    expect(pack.context).toContain('apiToken := "[REDACTED]"');
+    expect(pack.context).not.toContain(secret);
+  });
+
   test('a secret file, or a link out of the project or to a secret, is never read', async () => {
     const { root, repo } = project({ '.env': `TOKEN=${token()}`, 'src/ui/Modal.tsx': 'export const Modal = 1;' });
     writeFileSync(join(root, 'outside.txt'), 'outside the project');
@@ -245,6 +267,30 @@ const app = (o: { operator?: string[] } = {}) =>
   });
 const UI = { 'content-type': 'application/json', origin: 'http://localhost' };
 const send = (method: string, body?: unknown, headers: Record<string, string> = UI) => ({ method, headers, ...(body === undefined ? {} : { body: JSON.stringify(body) }) });
+
+describe('chatPackBuilder', () => {
+  test("an Ask pack is the asking request's view: a sandbox run's lesson and link reach only a turn sent in that run", async () => {
+    const { root } = project({ 'src/ui/Modal.tsx': lines(5) });
+    const asked: unknown[] = [];
+    const sandboxed = { ...lesson('lesson:sbx', 'Sandbox rule for Modal'), paths: ['src/ui/Modal.tsx'], run: 'run-1', sandbox: true as const };
+    const d = deps(root, { files: [file('src/ui/Modal.tsx')] }, {
+      // As the stores do: a sandbox record is found only when its own run asks.
+      k: { ...deps(root, {}).context.k, searchLessons: async (q) => { asked.push(q.run); return q.run === 'run-1' ? [{ lesson: sandboxed, score: 0.9 }] : []; } },
+      links: { listLinks: async (q) => { asked.push(q.run); return []; } },
+    });
+    const build = chatPackBuilder(d);
+    const outside = await build('demo-shop', 'how does src/ui/Modal.tsx close?', []);
+    expect(outside.context).not.toContain('Sandbox rule for Modal');
+    expect(asked.every((r) => (r ?? null) === null)).toBe(true);
+    asked.length = 0;
+    const inRun = await runIn({ id: 'run-1', sandbox: true }, () => build('demo-shop', 'how does src/ui/Modal.tsx close?', []));
+    expect(inRun.context).toContain('Sandbox rule for Modal');
+    expect(asked.length).toBeGreaterThan(0);
+    expect(asked.every((r) => r === 'run-1')).toBe(true);
+    const other = await runIn({ id: 'run-2', sandbox: true }, () => build('demo-shop', 'how does src/ui/Modal.tsx close?', []));
+    expect(other.context).not.toContain('Sandbox rule for Modal');
+  });
+});
 
 describe('chat routes', () => {
   test('POST /api/chats creates a conversation on a shown project; GET lists them by project', async () => {

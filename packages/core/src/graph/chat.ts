@@ -40,12 +40,12 @@ export class ChatRepo implements ChatStore {
     return rows.map((r) => conversationOf(r.get('c').properties, r.get('pending')));
   }
 
-  async createConversation(input: { projectKey: string; title: string; provider: ChatProvider | null }): Promise<ChatConversation> {
+  async createConversation(input: { projectKey: string; title: string; provider: ChatProvider | null; run?: string | null }): Promise<ChatConversation> {
     const now = new Date().toISOString();
     const [r] = await this.g.run(
-      `CREATE (c:ChatConversation {id: $id, projectKey: $projectKey, title: $title, provider: $provider, nextSeq: 1, createdAt: $now, updatedAt: $now})
+      `CREATE (c:ChatConversation {id: $id, projectKey: $projectKey, title: $title, provider: $provider, nextSeq: 1, createdAt: $now, updatedAt: $now, run: $run})
        RETURN c`,
-      { id: newChatId(), projectKey: input.projectKey, title: cleanChatTitle(input.title), provider: input.provider, now },
+      { id: newChatId(), projectKey: input.projectKey, title: cleanChatTitle(input.title), provider: input.provider, now, run: input.run ?? null },
     );
     return conversationOf(r.get('c').properties, false);
   }
@@ -178,6 +178,21 @@ export class ChatRepo implements ChatStore {
     return !!r?.get('existed');
   }
 
+  async chatQueue(): Promise<{ waiting: number; oldestAt: string | null; running: { id: string; projectKey: string; startedAt: string }[] }> {
+    const [r] = await this.g.run(
+      `OPTIONAL MATCH (p:ChatTurn {status: 'pending', role: 'assistant'})
+       WITH count(p) AS waiting, min(p.createdAt) AS oldest
+       OPTIONAL MATCH (a:ChatTurn {status: 'answering', role: 'assistant'})
+       WITH waiting, oldest, a ORDER BY a.startedAt, a.id
+       RETURN waiting, oldest, [x IN collect(a) | {id: x.id, projectKey: x.projectKey, startedAt: x.startedAt}] AS running`,
+    );
+    return {
+      waiting: Number(r?.get('waiting') ?? 0),
+      oldestAt: (r?.get('oldest') as string | null) ?? null,
+      running: ((r?.get('running') ?? []) as { id: string; projectKey: string; startedAt: string }[]).map((x) => ({ id: x.id, projectKey: x.projectKey, startedAt: x.startedAt })),
+    };
+  }
+
   async requeueStaleTurns(): Promise<number> {
     const [r] = await this.g.run(
       `MATCH (t:ChatTurn {status: 'answering'}) SET t.status = 'pending', t.startedAt = null RETURN count(t) AS n`,
@@ -209,6 +224,7 @@ function conversationOf(p: Record<string, unknown>, pending: boolean): ChatConve
     createdAt: p.createdAt as string,
     updatedAt: p.updatedAt as string,
     pending: !!pending,
+    ...(p.run ? { run: p.run as string } : {}),
   };
 }
 

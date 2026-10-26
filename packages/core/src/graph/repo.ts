@@ -17,8 +17,9 @@ import { EXTERNAL_SOURCES, type ExternalRef, type FeedbackSource, type SessionSo
 import { redactDeep } from '../redact.ts';
 import { candidateProvenance, matchReport, REPORT_MERGE_MINUTES } from '../dedupe.ts';
 import { MAX_POSTMORTEM_ATTEMPTS } from './knowledge.ts';
+import { VISIBLE_TO_RUN } from './runs.ts';
 import { SCHEMA } from './schema.ts';
-import { redactSecrets } from '../redact.ts';
+import { REDACT_PAGE, redactSecrets, redactStoredRow } from '../redact.ts';
 import { latestTime } from '../sessions.ts';
 import { sessionWork, trailingToolCalls } from '../codegraph.ts';
 import { refreshSessionStats } from './sessions.ts';
@@ -46,7 +47,8 @@ export type StatsRow = { projectKey: string; week: string; humanTurns: number; p
 /** projectKeys: only these projects (an empty list finds nothing); the limit counts what is left. */
 /** source: where the flagged comment came from (a candidate saved before sources were recorded is claude). */
 /** offset: skip that many (newest first), for paging. */
-export type CandidateFilter = { status?: CandidateStatus; projectKey?: string; projectKeys?: string[]; source?: FeedbackSource; limit?: number; offset?: number };
+/** run: the asking run (RunTag.id): a sandbox run's Inbox items are listed only to it; unset or null, to no one. */
+export type CandidateFilter = { status?: CandidateStatus; projectKey?: string; projectKeys?: string[]; source?: FeedbackSource; limit?: number; offset?: number; run?: string | null };
 
 const CANDIDATE_LABELS = ['pushback', 'correction'];
 export const MAX_CLASSIFY_ATTEMPTS = 3;
@@ -115,7 +117,8 @@ export class GraphRepo implements GraphStore {
          SET s.sourceFile = $s.sourceFile, s.source = $source, s.cwd = $s.cwd, s.gitBranch = $s.gitBranch,
              s.startedAt = $s.startedAt, s.endedAt = $s.endedAt,
              s.finalReplyText = $finalReply.text, s.finalReplyTs = $finalReply.ts, s.finalToolCalls = $finalToolCalls,
-             s.workEdits = $work.edits, s.workCommits = $work.commits, s.firstWorkAt = $work.firstAt, s.lastWorkAt = $work.lastAt
+             s.workEdits = $work.edits, s.workCommits = $work.commits, s.firstWorkAt = $work.firstAt, s.lastWorkAt = $work.lastAt,
+             s.instructionFiles = $instructionFiles
        MERGE (s)-[:IN]->(p)
        WITH s
        UNWIND $turns AS t
@@ -125,7 +128,8 @@ export class GraphRepo implements GraphStore {
          MERGE (s)-[:HAS_TURN]->(turn)`,
       {
         project: { ...project, remote: project.remote ?? null },
-        s: { ...s, turns: undefined, toolCalls: undefined, finalReply: undefined },
+        s: { ...s, turns: undefined, toolCalls: undefined, finalReply: undefined, instructionFiles: undefined },
+        instructionFiles: s.instructionFiles ?? null,
         source: s.source ?? 'claude',
         work: sessionWork(s.toolCalls ?? []),
         finalToolCalls: JSON.stringify(trailingToolCalls(s)),
@@ -232,6 +236,12 @@ export class GraphRepo implements GraphStore {
     return { calls: [...later.flat(), ...(JSON.parse(r.get('final') ?? '[]') as ToolCall[])], laterTurns: later.length, endedAt: isoOrNull(r.get('endedAt')) };
   }
 
+  async sessionInstructionFiles(sessionId: string): Promise<string[] | null> {
+    const [r] = await this.run('MATCH (s:Session {id: $id}) RETURN s.instructionFiles AS f', { id: sessionId });
+    const f = r?.get('f');
+    return Array.isArray(f) ? f.filter((x): x is string => typeof x === 'string') : null;
+  }
+
   /** A classification that failed (timeout, unparseable answer). After MAX_CLASSIFY_ATTEMPTS the turn is skipped for good. */
   async recordClassifyFailure(turnUuid: string) {
     await this.run(`MATCH (t:Turn {uuid: $uuid}) SET t.classifyAttempts = coalesce(t.classifyAttempts, 0) + 1`, { uuid: turnUuid });
@@ -334,8 +344,9 @@ export class GraphRepo implements GraphStore {
       `MATCH (k:Candidate)-[:FLAGS]->(t:Turn)
        WHERE ($status IS NULL OR k.status = $status) AND ($projectKey IS NULL OR k.projectKey = $projectKey)
          AND ($projectKeys IS NULL OR k.projectKey IN $projectKeys) AND ($source IS NULL OR coalesce(k.source, 'claude') = $source)
+         AND ${VISIBLE_TO_RUN('k')}
        RETURN k, t ORDER BY t.ts DESC, k.id SKIP $offset LIMIT $limit`,
-      { status: f.status ?? null, projectKey: f.projectKey ?? null, projectKeys: f.projectKeys ?? null, source: f.source ?? null, limit: neo4j.int(f.limit ?? 200), offset: neo4j.int(Math.max(0, Math.floor(f.offset ?? 0))) },
+      { status: f.status ?? null, projectKey: f.projectKey ?? null, projectKeys: f.projectKeys ?? null, source: f.source ?? null, limit: neo4j.int(f.limit ?? 200), offset: neo4j.int(Math.max(0, Math.floor(f.offset ?? 0))), run: f.run ?? null },
     );
     return rows.map((r) => toCandidate(r.get('k').properties, r.get('t').properties));
   }
@@ -379,6 +390,44 @@ export class GraphRepo implements GraphStore {
       { limit: neo4j.int(q.limit), afterId: q.afterId ?? null },
     );
     return rows.map((r) => ({ id: r.get('id'), turnUuid: r.get('turnUuid'), projectKey: r.get('projectKey'), text: r.get('text'), external: JSON.parse(r.get('external')) as ExternalRef }));
+  }
+
+  async setExternalLinks(turnUuid: string, linkedSessionIds: string[]): Promise<boolean> {
+    const [r] = await this.run(`MATCH (t:Turn {uuid: $uuid}) WHERE t.external IS NOT NULL RETURN t.external AS external`, { uuid: turnUuid });
+    if (!r) return false;
+    const external = { ...(JSON.parse(r.get('external')) as ExternalRef), linkedSessionIds };
+    await this.run(`MATCH (t:Turn {uuid: $uuid}) SET t.external = $external`, { uuid: turnUuid, external: JSON.stringify(external) });
+    return true;
+  }
+
+  async redactStoredCandidates(): Promise<number> {
+    let changed = 0;
+    for (let after = ''; ;) {
+      const rows = await this.run(
+        `MATCH (k:Candidate) WHERE k.id > $after WITH k ORDER BY k.id LIMIT $page
+         OPTIONAL MATCH (k)-[:FLAGS]->(t:Turn)
+         WITH k, head(collect(t)) AS t
+         RETURN k.id AS id, k.note AS note, k.agentReport AS agentReport, t.uuid AS uuid,
+                t.text AS text, t.precedingAssistantText AS context, t.summary AS summary
+         ORDER BY k.id LIMIT $page`,
+        { after, page: neo4j.int(REDACT_PAGE) },
+      );
+      if (!rows.length) break;
+      after = rows[rows.length - 1].get('id');
+      const page = rows.flatMap((r) => redactStoredRow(
+        { id: r.get('id') as string, uuid: r.get('uuid') ?? null, note: r.get('note') ?? null, agentReport: r.get('agentReport') ?? null, text: r.get('text') ?? null, context: r.get('context') ?? null, summary: r.get('summary') ?? null },
+        ['note', 'text', 'context', 'summary'], ['agentReport'],
+      ) ?? []);
+      if (!page.length) continue;
+      await this.run(
+        `UNWIND $page AS c MATCH (k:Candidate {id: c.id}) SET k.note = c.note, k.agentReport = c.agentReport
+         WITH c WHERE c.uuid IS NOT NULL MATCH (t:Turn {uuid: c.uuid})
+         SET t.text = c.text, t.precedingAssistantText = c.context, t.summary = c.summary`,
+        { page },
+      );
+      changed += page.length;
+    }
+    return changed;
   }
 
   async pendingSessionItems(q: { limit: number; afterId?: string | null }): Promise<PendingSessionItem[]> {
@@ -549,6 +598,8 @@ export class GraphRepo implements GraphStore {
   async stats(): Promise<StatsRow[]> {
     const rows = await this.run(
       `MATCH (p:Project)<-[:IN]-(s:Session)-[:HAS_TURN]->(t:Turn) WHERE t.index > 0 AND NOT coalesce(s.source, 'claude') IN $external
+         // A sandbox run's report is no one else's pushback.
+         AND NOT EXISTS { MATCH (k:Candidate)-[:FLAGS]->(t) WHERE k.sandbox = true }
        WITH p.key AS projectKey, date(datetime(t.ts)) AS d, t
        WITH projectKey, toString(d.weekYear) + '-W' + right('0' + toString(d.week), 2) AS week, t
        RETURN projectKey, week, count(t) AS humanTurns,
@@ -625,6 +676,8 @@ function toCandidate(k: Record<string, unknown>, t: Record<string, unknown>): Ca
     note: (k.note as string) ?? null,
     decidedBy: (k.decidedBy as string) ?? null,
     ...provenance,
+    ...(k.run ? { run: k.run as string } : {}),
+    ...(k.sandbox === true && { sandbox: true as const }),
   };
 }
 

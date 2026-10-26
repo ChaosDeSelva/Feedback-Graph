@@ -59,12 +59,87 @@ const STATUS_NOTE = new RegExp(
  * Bumped whenever a skip rule changes what it matches: the worker then runs the rules once over the items already
  * pending in the Inbox (worker integrations/pendingSkips.ts), so a better rule also clears what the old one let through.
  */
-export const SKIP_RULES_VERSION = 2;
+export const SKIP_RULES_VERSION = 3;
 /** "@claude review", "@codex please re-review this", "/review": a request for a review, nothing more. */
 const REVIEW_TRIGGER = /^(?:(?:@[\w-]+[\s,]+)+(?:please\s+)?(?:re-?)?review(?:\s+(?:this|again|it))?(?:\s+please)?|\/(?:re-?)?review)[.!]*$/i;
 
 /** The text without an agent's opening tag, so "[claude] Fixed in abc" reads as the status note it is. */
 const untagged = (text: string) => text.replace(AGENT_MARKER, '').replace(/^[\s*_:]+/, '').trim();
+
+/**
+ * A review that says an AI or a bot wrote it: it opens with 🤖, "Claude Code here", "Automated review", "This is an
+ * AI-generated review", or carries a "Generated with Claude Code" footer. Not "[claude]"-tagged findings (authorKindOf):
+ * those are an agent's findings someone chose to post, and are classified.
+ */
+const AI_REVIEW_OPENING = /^(?:\s|[*_#>]|<\/?sub>)*(?:🤖|(?:claude(?: code)?|codex)\s+here\b|(?:this is an?\s+)?(?:automated|ai[- ]generated|ai|bot)\s+(?:code\s+)?review\b|this (?:review|comment) (?:was|is) (?:generated|written|posted) by (?:an? )?(?:ai|bot|claude|codex)\b)/i;
+const AI_FOOTER = /🤖\s*generated (?:with|by)\b|\bgenerated (?:with|by) \[?(?:claude code|codex)\b/i;
+
+/** A nit or optional remark, by its marker (isNitComment). "minor" or "optional" inside a sentence is just a word. */
+const NIT_MARK = /^\W{0,4}(?:optional\s+)?(?:nit|nitpick|minor|optional|cosmetic|non-blocking)\b|[([*_]{1,2}\s*(?:nit|nitpick|minor|optional|cosmetic)\s*[)\]*_]{1,2}|\bnit:|\bnitpick|\bnon-blocking\b|\bnot a blocker\b/i;
+/** A part of an approval that is a nit or optional: left out when asking whether anything is asked to change. */
+const NIT_PART = /\b(?:nit|nitpick|minor|optional|non-blocking|not a blocker)\b/i;
+/** An approval or praise opening. */
+const APPROVAL = /^\W{0,4}(?:lgtm|looks good|looks great|approved?|approving|ship it|great work|nice work|good work|well done|nice|👍|✅)/i;
+/** Something asked of the author: a modal, a correction word, a condition, a question. */
+const ASKS = /\b(?:but|however|except|although|though|should|must|please|need|needs|fix|change|wrong|bug|broken|missing|instead|once|until|before|todo|why|not|don'?t|isn'?t|doesn'?t|can'?t|won'?t)\b|\?/i;
+/** At most this much praise is still a summary; more is a review that says something. */
+const APPROVAL_CHARS = 200;
+
+/** An approval with nothing asked to change, once its nits and optional remarks are set aside. */
+function approvalOnly(text: string, ext: ExternalRef): boolean {
+  const parts = text.split('\n').flatMap((l) => l.split(/(?<=[.!])\s+/)).map((p) => p.trim()).filter(Boolean);
+  const rest = parts.filter((p) => !NIT_PART.test(p)).join(' ');
+  if (!rest || rest.length > APPROVAL_CHARS || ASKS.test(rest)) return false;
+  return APPROVAL.test(rest) || (ext.reviewState === 'APPROVED' && APPROVAL.test(text.trim()));
+}
+
+const TABLE_ROW = /^\s*\|.*\|\s*$/;
+const TABLE_RULE = /^\s*\|[\s:|-]+\|\s*$/;
+const STATUS_CELL = /\b(?:fixed|resolved|addressed|done|open|pending|deferred|wontfix|won'?t fix|not applicable|n\/a|in progress|outdated)\b|[✅❌⏳✔️]/i;
+
+/** A markdown table that relays where earlier findings stand: most of the comment, most rows with a status. */
+function statusTable(text: string): boolean {
+  const lines = text.split('\n').filter((l) => l.trim());
+  const rows = lines.filter((l) => TABLE_ROW.test(l));
+  const data = rows.filter((l) => !TABLE_RULE.test(l)).slice(1);
+  return data.length >= 2 && rows.length >= lines.length * 0.6 && data.filter((r) => STATUS_CELL.test(r)).length >= data.length / 2;
+}
+
+/** "@sam hold off merging until your branch lands": addressed to someone, about when branches merge, no code in it. */
+const MENTIONS = /^\s*(?:@[\w-]+[\s,:]*)+/;
+const MERGE_TIMING = /\b(?:rebase[sd]?|rebasing|merge[sd]?|merging|lands?|landed|hold off|wait(?:ing)? (?:for|until|on))\b/i;
+const BRANCH_REF = /\b(?:branch|branches|#\d+|pr|pull request|yours|first)\b|#\d+/i;
+const BRANCH_TIMING_CHARS = 300;
+function branchTiming(text: string): boolean {
+  const t = text.trim();
+  const m = MENTIONS.exec(t);
+  if (!m || t.length > BRANCH_TIMING_CHARS || t.includes('`')) return false;
+  const rest = t.slice(m[0].length);
+  return MERGE_TIMING.test(rest) && BRANCH_REF.test(rest);
+}
+
+/** A nit or optional comment ("nit:", "Minor:", "optional nit:", "**nit**", "(optional)"): never a project-wide lesson. */
+export function isNitComment(text: string): boolean {
+  return NIT_MARK.test(text.trim());
+}
+
+const STOP = new Set(['the', 'and', 'for', 'from', 'with', 'this', 'that', 'these', 'those', 'are', 'was', 'were', 'has', 'have', 'its', 'into', 'two', 'one', 'issues', 'issue', 'also', 'here', 'there', 'some', 'just', 'see', 'inline', 'comments', 'comment']);
+const words = (text: string) => new Set((text.toLowerCase().match(/[a-z0-9_]{3,}/g) ?? []).filter((w) => !STOP.has(w)));
+/** How much of a review summary's words its inline comments must hold for it to be the same content. */
+const FOLD_COVERAGE = 0.8;
+
+/**
+ * Whether a review's summary says the same as its inline comments (the same reviewer's, on the same pull request): most
+ * of its words are theirs. Then it is one item, the inline comments, not two.
+ */
+export function foldsIntoInline(summary: string, inline: string[]): boolean {
+  const mine = words(summary);
+  if (mine.size < 4 || !inline.length) return false;
+  const theirs = words(inline.join('\n'));
+  let held = 0;
+  for (const w of mine) if (theirs.has(w)) held++;
+  return held / mine.size >= FOLD_COVERAGE;
+}
 
 export const FEEDBACK_SKIP_RULES: readonly FeedbackSkipRule[] = [
   {
@@ -94,6 +169,31 @@ export const FEEDBACK_SKIP_RULES: readonly FeedbackSkipRule[] = [
     name: 'review-trigger',
     description: 'Bare requests for an automated review, such as "@claude review" or "@codex review", with nothing else in them.',
     skips: (text) => REVIEW_TRIGGER.test(text.trim()),
+  },
+  {
+    name: 'ai-review',
+    description: 'A review that says an AI or a bot wrote it: it opens with 🤖, "Claude Code here" or "Automated review", or ends with a "Generated with Claude Code" footer.',
+    skips: (text) => AI_REVIEW_OPENING.test(text) || AI_FOOTER.test(text),
+  },
+  {
+    name: 'approval-summary',
+    description: 'An approval with nothing asked to change ("LGTM", "Looks good, nice work"), once remarks marked nit or optional are set aside. One that still asks for something ("LGTM, but ...") is classified.',
+    skips: (text, ext) => approvalOnly(text, ext),
+  },
+  {
+    name: 'status-table',
+    description: 'A table relaying where earlier review findings stand (fixed, addressed, open), with little else in the comment.',
+    skips: (text) => statusTable(text),
+  },
+  {
+    name: 'branch-timing',
+    description: 'A comment addressed to someone about when branches merge or rebase ("@sam hold off merging until your branch lands"), with no code in it.',
+    skips: (text) => branchTiming(text),
+  },
+  {
+    name: 'review-folded',
+    description: "A review's summary that says the same as its inline comments: one item (the inline comments), not two.",
+    skips: (_text, ext) => !!ext.foldedInto,
   },
 ];
 

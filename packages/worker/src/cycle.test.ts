@@ -4,6 +4,7 @@ import { ModelTimeoutError, ProviderUnavailableError, type ActivityInput, type C
 import { describe, expect, test } from 'vitest';
 import { runCycle, type CycleDeps } from './cycle.ts';
 import { FileState } from './state.ts';
+import { conversationFingerprint } from './ingest/fingerprint.ts';
 
 const line = (o: object) => JSON.stringify({ sessionId: 's1', cwd: '/H/Vibe/demo', ...o });
 const transcript = [
@@ -444,6 +445,103 @@ describe('Codex sessions', () => {
     const g = codexFakes();
     await runCycle(g.deps);
     expect(g.sessions.map((s) => s.source)).toEqual(['codex']);
+  });
+
+  /** A live Codex session as the worker first saw it (its first human turn only), the whole of it, and a Claude Code file with the same opening. */
+  async function liveCodexSession() {
+    const { parseCodexSession } = await import('./ingest/codex.ts');
+    const [full] = parseCodexSession(rollout, codexFile.path);
+    const lines = rollout.split('\n');
+    let cut = 0;
+    for (let n = 1; n <= lines.length; n++) if (parseCodexSession(lines.slice(0, n).join('\n'), codexFile.path)[0]?.turns.length === 1) cut = n;
+    const early = lines.slice(0, cut).join('\n');
+    const claude = full.turns.map((t, i) => line({ type: 'user', uuid: `cc${i}`, cwd: '/work/demo-shop', timestamp: t.ts, message: { content: t.text } })).join('\n');
+    const claudeFile = { path: '/t/demo-shop/cc.jsonl', size: 10, mtimeMs: 1, source: 'claude' as const };
+    return { full, early, claude, claudeFile };
+  }
+
+  test('a live Codex session first read at one turn keeps being read as it grows, though its opening matches a Claude Code conversation', async () => {
+    const { full, early, claude, claudeFile } = await liveCodexSession();
+    expect(full.turns.length).toBeGreaterThanOrEqual(2);
+    let text = early;
+    const f = codexFakes(early, {
+      listFiles: async () => [claudeFile, { ...codexFile, size: text.length }],
+      readFile: async () => claude,
+      readLines: async function* () { yield* text.split('\n'); },
+    });
+    const stored = () => [...f.turns.values()].filter((t) => t.sessionId === full.sessionId).length;
+    await runCycle(f.deps);
+    expect(stored()).toBe(1); // one turn: too short to tell apart, so it is Codex's own
+    // The developer goes on in Codex; the file grows and now opens like the Claude Code conversation.
+    text = rollout;
+    await runCycle(f.deps);
+    expect(stored()).toBe(full.turns.length);
+  });
+
+  test('the copy rule change re-reads Codex files once at start and resumes a session the old rule froze, logged in Activity', async () => {
+    const { full, claude, claudeFile } = await liveCodexSession();
+    const activity: ActivityInput[] = [];
+    const f = codexFakes(rollout, {
+      listFiles: async () => [claudeFile, codexFile],
+      readFile: async () => claude,
+      activity: { record: async (a) => void activity.push(a) },
+      // The graph holds the session as the old rule left it: its first turn.
+      storedTurns: async (id) => (id === full.sessionId ? 1 : null),
+    });
+    // The worker as the old rule left it: both files read at the current ingest version, no verdict on the Codex session.
+    f.state.markIngested(claudeFile.path, claudeFile.size, claudeFile.mtimeMs, 1);
+    f.state.rememberConversation(conversationFingerprint(full)!, 's1');
+    f.state.markIngested(codexFile.path, codexFile.size, codexFile.mtimeMs, 1);
+    await runCycle(f.deps);
+    expect(f.sessions).toEqual([]); // nothing changed on disk: nothing read
+
+    expect(f.state.migrateCodexCopyRule('/codex-sessions')).toBe(1); // only the Codex file is read again
+    expect(f.state.migrateCodexCopyRule('/codex-sessions')).toBe(0); // once
+    await runCycle(f.deps);
+    expect(f.sessions.map((s) => [s.source, s.turns.length])).toEqual([['codex', full.turns.length]]);
+    expect(activity.filter((a) => a.kind === 'session_resumed')).toEqual([
+      expect.objectContaining({ actor: 'deterministic', projectKey: 'demo-shop', details: expect.objectContaining({ sessionId: full.sessionId, storedTurns: 1, turns: full.turns.length }) }),
+    ]);
+
+    // From now on it is Codex's own: read as it grows, and not logged again.
+    f.state.markIngested(codexFile.path, 0, 0, 1);
+    await runCycle(f.deps);
+    expect(f.sessions).toHaveLength(2);
+    expect(activity.filter((a) => a.kind === 'session_resumed')).toHaveLength(1);
+  });
+
+  test('a Codex session of a project not selected is neither judged nor logged', async () => {
+    const { full, claude, claudeFile } = await liveCodexSession();
+    const activity: ActivityInput[] = [];
+    const f = codexFakes(rollout, {
+      listFiles: async () => [claudeFile, codexFile],
+      readFile: async () => claude,
+      includeProject: () => false,
+      activity: { record: async (a) => void activity.push(a) },
+      storedTurns: async () => 1,
+    });
+    f.state.rememberConversation(conversationFingerprint(full)!, 's1');
+    await runCycle(f.deps);
+    expect(activity).toEqual([]);
+    expect(f.state.codexVerdict(full.sessionId)).toBeUndefined();
+  });
+
+  test('the copy rule migration refuses an empty or root folder', () => {
+    const f = codexFakes();
+    f.state.markIngested('/t/demo/s1.jsonl', 1, 1, 1);
+    expect(f.state.migrateCodexCopyRule('')).toBe(0);
+    expect(f.state.migrateCodexCopyRule('/')).toBe(0);
+    expect(f.state.ingestState('/t/demo/s1.jsonl', 1, 1).changed).toBe(false);
+  });
+
+  test('a real Codex copy (never stored) stays skipped after the rule change', async () => {
+    const { full, claude, claudeFile } = await liveCodexSession();
+    const f = codexFakes(rollout, { listFiles: async () => [claudeFile, codexFile], readFile: async () => claude, storedTurns: async () => null });
+    await runCycle(f.deps);
+    expect(f.sessions.map((s) => s.source)).toEqual(['claude']);
+    f.state.migrateCodexCopyRule('/codex-sessions');
+    await runCycle(f.deps);
+    expect(f.sessions.filter((s) => s.sessionId === full.sessionId)).toEqual([]);
   });
 
   test('a Claude Code transcript is recorded with source claude', async () => {

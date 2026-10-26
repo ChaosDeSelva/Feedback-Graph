@@ -1,9 +1,12 @@
 import neo4j from 'neo4j-driver';
-import { redactDeep, redactSecrets } from '../redact.ts';
+import { REDACT_PAGE, redactDeep, redactSecrets } from '../redact.ts';
 import type { DocsStore } from '../store.ts';
 import type { TaskImage } from '../llm/providers.ts';
 import { relevanceOf, scanRetryAt, SCAN_UNAVAILABLE_WAIT_MS, type EmbeddedFact } from './facts.ts';
 import type { GraphRepo } from './repo.ts';
+import type { RunTag } from '../types.ts';
+import { VISIBLE_TO_RUN } from './runs.ts';
+import { runWriteOwner } from '../runs.ts';
 
 export type DocSource = 'upload' | 'github' | 'linear';
 export type DocInput = { projectKey: string; source: DocSource; ref: string; title: string; url: string | null };
@@ -16,6 +19,8 @@ export type DocReadState = { status: DocReadStatus; attempts: number; error: str
 export type DocKind = 'text' | 'image';
 /** read: null for a document that is never read into facts (PR discussions and tickets). */
 /** addedBy: who uploaded it ('you', or 'operator:<name>'); null for PR discussions, tickets and older uploads. */
+/** listDocs: a page (at most `limit`, after the doc `after` names), or the docs with this source and ref. */
+export type DocListOpts = { limit?: number; after?: { addedAt: string; id: string } | null; source?: DocSource; ref?: string; run?: string | null };
 export type DocSummary = DocInput & { id: string; addedAt: string; addedBy: string | null; chunks: number; kind: DocKind; mediaType: string | null; read: DocReadState | null };
 /** What the docs stage reads: the text of a text upload (its chunks joined), or the image of an image upload. */
 /**
@@ -28,7 +33,13 @@ export type DocToRead = { id: string; projectKey: string; ref: string; title: st
  * thumbnail). tickets: the Linear identifiers a pull request names (ticketIdsIn), linking it to those tickets' documents
  * (linkedDocs); replaced on every upsert, none when unset.
  */
-export type UpsertDocOpts = { read?: boolean; image?: TaskImage; addedBy?: string; tickets?: string[] };
+/**
+ * run: the run (RunTag) it was uploaded in; an upload replaced without one is no longer the run's (it is the owner's).
+ * A run never replaces a document it does not own: a sandbox run's upload is its own document (docIdOf with the run),
+ * beside the owner's of that name; any other run's over the owner's or another run's throws NotTheRunsError, unless
+ * byOwner (the owner opened the run): then it is replaced and stays (or becomes) the owner's.
+ */
+export type UpsertDocOpts = { read?: boolean; image?: TaskImage; addedBy?: string; tickets?: string[]; run?: RunTag | null; byOwner?: boolean };
 /**
  * A pull request's document and a Linear ticket's, linked because the pull request names the ticket's identifier
  * (UpsertDocOpts.tickets). `docId` is the document asked about, `linked` the one at the other end.
@@ -38,8 +49,13 @@ export type DocLink = { docId: string; linked: { docId: string; source: DocSourc
 export const linearDocRef = (identifier: string) => `linear:${identifier}`;
 /** Images are kept in the database, so no volume is needed: at most this many bytes. */
 export const MAX_IMAGE_BYTES = 8 * 1024 * 1024;
-/** Same project, source and ref: same document (re-adding replaces it). Takes the already-redacted ref. */
-export const docIdOf = (d: Pick<DocInput, 'projectKey' | 'source' | 'ref'>) => `doc:${d.projectKey}:${d.source}:${d.ref}`;
+/**
+ * Same project, source and ref: same document (re-adding replaces it). Takes the already-redacted ref. A sandbox run's
+ * upload is its own document (doc@<run>:...), so it never replaces the owner's of that name; the project is still the
+ * second part and the ref everything after the third.
+ */
+export const docIdOf = (d: Pick<DocInput, 'projectKey' | 'source' | 'ref'>, run?: RunTag | null) =>
+  `doc${run?.sandbox ? `@${run.id}` : ''}:${d.projectKey}:${d.source}:${d.ref}`;
 export type DocHit = { docId: string; source: DocSource; ref: string; title: string; url: string | null; text: string; score: number };
 
 /** Context that isn't code: uploaded documents, PR discussions, tickets. Stored as embedded chunks per document. */
@@ -55,7 +71,10 @@ export class DocsRepo implements DocsStore {
     // Docs come from outside (uploads, PRs, tickets): redact here so no caller can skip it.
     const doc = { ...input, title: redactSecrets(input.title), ref: redactSecrets(input.ref) };
     const chunks = raw.map((c) => ({ ...c, text: redactSecrets(c.text) }));
-    const id = docIdOf(doc);
+    const id = docIdOf(doc, o.run);
+    // A run replaces only its own document (runWriteOwner); the owner's write makes a run's document the owner's.
+    const [cur] = await this.g.run(`MATCH (d:Doc {id: $id}) RETURN d.run AS run`, { id });
+    const run = runWriteOwner(`the document ${doc.ref}`, cur ? (cur.get('run') ?? null) : undefined, o.run, o.byOwner);
     // A new version of the document: what was read from the old one goes, and it is read again when asked.
     // The Doc is written first, so its lock orders this against a reading being saved (saveDocReading locks it too).
     await this.g.runInTransaction([
@@ -64,6 +83,7 @@ export class DocsRepo implements DocsStore {
          MERGE (d:Doc {id: $id})
          SET d.projectKey = $doc.projectKey, d.source = $doc.source, d.ref = $doc.ref, d.title = $doc.title,
              d.url = $doc.url, d.addedAt = $now, d.addedBy = $addedBy, d.kind = $kind, d.mediaType = $mediaType, d.tickets = $tickets,
+             d.run = $run, d.sandbox = $sandbox,
              d.readStatus = CASE WHEN $read THEN 'pending' ELSE null END, d.readAttempts = 0, d.readError = null,
              d.readRetryAt = null, d.readAt = null
          MERGE (d)-[:IN]->(p)
@@ -74,7 +94,7 @@ export class DocsRepo implements DocsStore {
          UNWIND range(0, size($chunks) - 1) AS i
            CREATE (d)-[:HAS_CHUNK]->(:Chunk {id: $id + '#' + toString(i), docId: $id, projectKey: $doc.projectKey,
                                              idx: i, text: $chunks[i].text, embedding: $chunks[i].embedding})`,
-        { id, doc, chunks, tickets: o.tickets ?? [], now: new Date().toISOString(), addedBy: o.addedBy ?? null, read: !!o.read, kind: o.image ? 'image' : 'text', mediaType: o.image?.mediaType ?? null },
+        { id, doc, chunks, tickets: o.tickets ?? [], now: new Date().toISOString(), addedBy: o.addedBy ?? null, read: !!o.read, kind: o.image ? 'image' : 'text', mediaType: o.image?.mediaType ?? null, run: run?.id ?? null, sandbox: !!run?.sandbox },
       ],
       [`MATCH (x:Fact {docId: $id}) DETACH DELETE x`, { id }],
       [`MATCH (b:DocBlob {docId: $id}) DETACH DELETE b`, { id }],
@@ -147,7 +167,8 @@ export class DocsRepo implements DocsStore {
            CREATE (n:Fact {id: randomUUID(), projectKey: d.projectKey, docId: $id, kind: fx.kind, statement: fx.statement,
                            path: d.ref, lines: fx.lines, confidence: fx.confidence, why: fx.why, embedding: fx.embedding,
                            relevance: fx.relevance, relevanceBy: CASE WHEN fx.relevance IS NULL THEN null ELSE 'model' END,
-                           source: $source, scanJobId: null, fileHash: null, current: true, createdAt: $now, validFrom: $now})
+                           source: $source, scanJobId: null, fileHash: null, current: true, createdAt: $now, validFrom: $now,
+                           run: d.run, sandbox: coalesce(d.sandbox, false)})
            CREATE (n)-[:FROM]->(d)`,
         { id, facts, source: r.source, now, version },
       ],
@@ -188,14 +209,22 @@ export class DocsRepo implements DocsStore {
     return r ? { mediaType: r.get('mediaType'), data: r.get('data') } : null;
   }
 
-  async listDocs(projectKey: string): Promise<DocSummary[]> {
+  async listDocs(projectKey: string, o: DocListOpts = {}): Promise<DocSummary[]> {
+    // The page first, then the counts for its docs only.
     const rows = await this.g.run(
       `MATCH (d:Doc {projectKey: $projectKey})
+       WHERE ${VISIBLE_TO_RUN('d')} AND ($source IS NULL OR d.source = $source) AND ($ref IS NULL OR d.ref = $ref)
+         AND ($afterAt IS NULL OR d.addedAt < $afterAt OR (d.addedAt = $afterAt AND d.id > $afterId))
+       WITH d ORDER BY d.addedAt DESC, d.id
+       ${o.limit !== undefined ? 'LIMIT $limit' : ''}
        OPTIONAL MATCH (d)-[:HAS_CHUNK]->(c:Chunk)
        WITH d, count(c) AS chunks
        OPTIONAL MATCH (x:Fact {docId: d.id, current: true})
        RETURN d, chunks, count(x) AS facts ORDER BY d.addedAt DESC, d.id`,
-      { projectKey },
+      {
+        projectKey, run: o.run ?? null, source: o.source ?? null, ref: o.ref ?? null, afterAt: o.after?.addedAt ?? null, afterId: o.after?.id ?? null,
+        limit: neo4j.int(Math.max(0, Math.floor(o.limit ?? 0))),
+      },
     );
     return rows.map((r) => {
       const p = r.get('d').properties;
@@ -209,34 +238,35 @@ export class DocsRepo implements DocsStore {
     });
   }
 
-  async deleteDoc(id: string): Promise<boolean> {
+  async deleteDoc(id: string, o: { run?: string | null } = {}): Promise<boolean> {
     const [r] = await this.g.run(
-      `OPTIONAL MATCH (d:Doc {id: $id})
+      `OPTIONAL MATCH (d:Doc {id: $id}) WHERE $run IS NULL OR d.run = $run
        OPTIONAL MATCH (d)-[:HAS_CHUNK]->(c:Chunk)
        WITH d, collect(c) AS cs, d IS NOT NULL AS existed
-       OPTIONAL MATCH (x:Fact {docId: $id})
+       OPTIONAL MATCH (x:Fact {docId: $id}) WHERE existed
        WITH d, cs, existed, collect(x) AS xs
-       OPTIONAL MATCH (b:DocBlob {docId: $id})
+       OPTIONAL MATCH (b:DocBlob {docId: $id}) WHERE existed
        WITH d, cs, existed, xs, collect(b) AS bs
        FOREACH (x IN xs | DETACH DELETE x)
        FOREACH (b IN bs | DETACH DELETE b)
        FOREACH (c IN cs | DETACH DELETE c)
        FOREACH (_ IN CASE WHEN existed THEN [1] ELSE [] END | DETACH DELETE d)
        RETURN existed`,
-      { id },
+      { id, run: o.run ?? null },
     );
     return r.get('existed');
   }
 
-  async linkedDocs(q: { projectKey: string; docIds: string[] }): Promise<DocLink[]> {
+  async linkedDocs(q: { projectKey: string; docIds: string[]; run?: string | null }): Promise<DocLink[]> {
     if (!q.docIds.length) return [];
     const rows = await this.g.run(
       `MATCH (d:Doc {projectKey: $projectKey}) WHERE d.id IN $docIds
        MATCH (o:Doc {projectKey: $projectKey})
-       WHERE (o.source = 'linear' AND o.ref IN [t IN coalesce(d.tickets, []) | 'linear:' + t])
-          OR (d.source = 'linear' AND substring(d.ref, 7) IN coalesce(o.tickets, []) AND d.ref STARTS WITH 'linear:')
+       WHERE ((o.source = 'linear' AND o.ref IN [t IN coalesce(d.tickets, []) | 'linear:' + t])
+          OR (d.source = 'linear' AND substring(d.ref, 7) IN coalesce(o.tickets, []) AND d.ref STARTS WITH 'linear:'))
+         AND ${VISIBLE_TO_RUN('o')}
        RETURN d.id AS docId, o ORDER BY d.id, o.title, o.id`,
-      { projectKey: q.projectKey, docIds: q.docIds },
+      { projectKey: q.projectKey, docIds: q.docIds, run: q.run ?? null },
     );
     return rows.map((r) => {
       const o = r.get('o').properties;
@@ -244,14 +274,27 @@ export class DocsRepo implements DocsStore {
     });
   }
 
-  async searchDocs(q: { embedding: number[]; projectKey: string; k: number }): Promise<DocHit[]> {
+  async projectTickets(q: { projectKey: string; ids: string[] }): Promise<string[]> {
+    if (!q.ids.length) return [];
+    const rows = await this.g.run(
+      `UNWIND $ids AS id
+       WITH DISTINCT id
+       WHERE EXISTS { MATCH (d:Doc {projectKey: $projectKey}) WHERE (d.source = 'linear' AND d.ref = 'linear:' + id) OR id IN coalesce(d.tickets, []) }
+       RETURN id`,
+      { projectKey: q.projectKey, ids: q.ids },
+    );
+    return rows.map((r) => r.get('id') as string);
+  }
+
+  async searchDocs(q: { embedding: number[]; projectKey: string; k: number; run?: string | null }): Promise<DocHit[]> {
     const rows = await this.g.run(
       `MATCH (node:Chunk {projectKey: $projectKey}) WHERE node.embedding IS NOT NULL AND size(node.embedding) = size($embedding)
+         AND NOT EXISTS { MATCH (sd:Doc {id: node.docId}) WHERE NOT ${VISIBLE_TO_RUN('sd')} }
        WITH node, vector.similarity.cosine(node.embedding, $embedding) AS score
        ORDER BY score DESC LIMIT $k
        MATCH (d:Doc {id: node.docId})
        RETURN node.text AS text, score, d`,
-      { embedding: q.embedding, k: neo4j.int(q.k), projectKey: q.projectKey },
+      { embedding: q.embedding, k: neo4j.int(q.k), projectKey: q.projectKey, run: q.run ?? null },
     );
     return rows.map((r) => {
       const p = r.get('d').properties;
@@ -260,6 +303,22 @@ export class DocsRepo implements DocsStore {
   }
 
   /** Small key/value store for integration sync cursors (e.g. last GitHub sync time per project). */
+  async redactStoredDocs(): Promise<number> {
+    let changed = 0;
+    for (const [label, prop] of [['Doc', 'title'], ['Chunk', 'text']] as const) {
+      for (let after = ''; ;) {
+        const rows = await this.g.run(`MATCH (x:${label}) WHERE x.id > $after RETURN x.id AS id, x.${prop} AS text ORDER BY x.id LIMIT $page`, { after, page: neo4j.int(REDACT_PAGE) });
+        if (!rows.length) break;
+        after = rows[rows.length - 1].get('id');
+        const page = rows.flatMap((r) => { const was: string = r.get('text') ?? ''; const text = redactSecrets(was); return text === was ? [] : [{ id: r.get('id') as string, text }]; });
+        if (!page.length) continue;
+        await this.g.run(`UNWIND $page AS c MATCH (x:${label} {id: c.id}) SET x.${prop} = c.text`, { page });
+        changed += page.length;
+      }
+    }
+    return changed;
+  }
+
   async getCursor(key: string): Promise<string | null> {
     const [r] = await this.g.run('MATCH (c:SyncCursor {key: $key}) RETURN c.value AS v', { key });
     return r ? r.get('v') : null;
@@ -267,6 +326,15 @@ export class DocsRepo implements DocsStore {
 
   async setCursor(key: string, value: string) {
     await this.g.run('MERGE (c:SyncCursor {key: $key}) SET c.value = $value', { key, value });
+  }
+
+  async cursorsWithPrefix(prefix: string): Promise<{ key: string; value: string }[]> {
+    const rows = await this.g.run('MATCH (c:SyncCursor) WHERE c.key STARTS WITH $prefix RETURN c.key AS key, c.value AS value', { prefix });
+    return rows.map((r) => ({ key: r.get('key') as string, value: r.get('value') as string }));
+  }
+
+  async deleteCursor(key: string) {
+    await this.g.run('MATCH (c:SyncCursor {key: $key}) DELETE c', { key });
   }
 }
 

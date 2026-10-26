@@ -155,6 +155,23 @@ test('lists the project docs and uploads a text file as context', async () => {
   await waitFor(() => expect(calls).toContainEqual({ url: '/api/projects/demo-shop/docs', body: { title: 'spec.md', name: 'spec.md', text: '# Spec\n\nLists are paginated.' } }));
 });
 
+test('a project with many docs shows the newest page and loads older ones on request', async () => {
+  const pr = (n: number) => ({ id: `doc:demo-shop:github:github:me/shop#${n}`, projectKey: 'demo-shop', source: 'github', ref: `github:me/shop#${n}`, title: `me/shop#${n}: change ${n}`, url: null, addedAt: 't', chunks: 1, kind: 'text', mediaType: null, read: null });
+  const base = (fetch as unknown as { getMockImplementation(): (u: string, i?: RequestInit) => Promise<Response> }).getMockImplementation();
+  vi.stubGlobal('fetch', vi.fn(async (url: string, init?: RequestInit) => {
+    if (url === '/api/projects/demo-shop/docs') return Response.json([pr(9), pr(8)], { headers: { 'x-next-cursor': 'c1' } });
+    if (url === '/api/projects/demo-shop/docs?cursor=c1') { calls.push({ url }); return Response.json([pr(7)]); }
+    return base(url, init);
+  }));
+  render(<Projects />);
+  expect(await screen.findByText('me/shop#9: change 9')).toBeTruthy();
+  expect(screen.getByText('Docs and discussions (2+)')).toBeTruthy();
+  fireEvent.click(screen.getByRole('button', { name: 'load older docs' }));
+  expect(await screen.findByText('me/shop#7: change 7')).toBeTruthy();
+  expect(screen.getByText('Docs and discussions (3)')).toBeTruthy();
+  expect(screen.queryByRole('button', { name: 'load older docs' })).toBeNull();
+});
+
 const removedDoc = () => calls.some((c) => c.url === '/api/docs/doc%3Ademo-shop%3Agithub%3Agithub%3Ame%2Fshop%233');
 
 test('removing a doc asks first, naming it; Cancel or Escape keeps it', async () => {

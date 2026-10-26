@@ -88,6 +88,15 @@ describeStores('KnowledgeStore', (h) => {
       expect((await k.lessonDetail(`lesson:${id}`))!.contextItems).toEqual([item]);
     });
 
+    test('a post-mortem whose lesson was dropped (no rule even after the retry) saves its miss and no lesson', async () => {
+      const id = await confirmedFeedback('sd');
+      await k.savePostmortem(id, pm({ lesson: { ...pm().lesson, title: 'File-export imports', rule: 'project' }, lessonDropped: 'lesson.rule holds the scope word "project"' }), { miss: vec(1), lesson: [] });
+      expect(await k.feedbackNeedingPostmortem(5)).toEqual([]);
+      expect(await k.listLessons({})).toEqual([]);
+      expect(await k.lessonDetail(`lesson:${id}`)).toBeNull();
+      expect(await k.postmortemBacklog!()).toBe(0);
+    });
+
     test('postmortemBacklog counts the feedback still waiting for a post-mortem, those backing off after a failure too', async () => {
       const a = await confirmedFeedback('s1');
       const b = await confirmedFeedback('s2');
@@ -99,6 +108,18 @@ describeStores('KnowledgeStore', (h) => {
       expect(await k.postmortemBacklog!()).toBe(1);
       for (let i = 1; i < MAX_POSTMORTEM_ATTEMPTS; i++) await k.recordPostmortemFailure(c, 'boom');
       expect(await k.postmortemBacklog!()).toBe(0); // given up on
+    });
+
+    test('postmortemQueue says how many wait and since when the oldest has', async () => {
+      expect(await k.postmortemQueue!()).toEqual({ waiting: 0, oldestAt: null });
+      const started = new Date(Date.now() - 1000).toISOString();
+      const a = await confirmedFeedback('s1');
+      await confirmedFeedback('s2');
+      const q = await k.postmortemQueue!();
+      expect(q.waiting).toBe(2);
+      expect(q.oldestAt! >= started && q.oldestAt! <= new Date().toISOString()).toBe(true);
+      await k.savePostmortem(a, pm(), { miss: vec(1), lesson: vec(1) });
+      expect((await k.postmortemQueue!()).waiting).toBe(1);
     });
 
     test('feedback you reject after confirming gets no post-mortem', async () => {
@@ -292,6 +313,139 @@ describeStores('KnowledgeStore', (h) => {
       // No `by` (older callers): the owner.
       await k.updateLesson(l.id, { status: 'rejected' }, {});
       expect((await k.lessonDetail(l.id))?.lesson.decidedBy).toBe('you');
+    });
+
+    test('the first edit of a proposed lesson keeps what the writer proposed, redacted; later edits and decisions keep it', async () => {
+      const a = await confirmedFeedback('s1');
+      await k.savePostmortem(a, pm(), { miss: vec(1), lesson: vec(1) });
+      const [l] = await k.listLessons({});
+      expect(l.proposedAs ?? null).toBeNull();
+      // Deciding without an edit keeps nothing.
+      await k.updateLesson(l.id, { status: 'proposed' }, {});
+      expect((await k.lessonDetail(l.id))?.lesson.proposedAs ?? null).toBeNull();
+      await k.updateLesson(l.id, { rule: 'Filter in api/search.ts on the server', paths: ['api/search.ts'] }, { by: 'you' });
+      const writer = { title: 'Server-side search', rule: 'Filter on the server', appliesWhen: 'search features', scope: 'project', paths: ['api/**'] };
+      expect((await k.lessonDetail(l.id))?.lesson.proposedAs).toEqual(writer);
+      await k.updateLesson(l.id, { status: 'approved', title: 'Search runs on the server' }, {});
+      const after = (await k.lessonDetail(l.id))!.lesson;
+      expect(after).toMatchObject({ status: 'approved', title: 'Search runs on the server', proposedAs: writer });
+      expect((await k.listLessons({ status: 'approved' }))[0].proposedAs).toEqual(writer);
+
+      const b = await confirmedFeedback('s2');
+      const secret = 'x'.repeat(8);
+      await k.savePostmortem(b, pm({ lesson: { ...pm().lesson, rule: `Set API_KEY=${secret}${secret}${secret} in api/env.ts` } }), { miss: vec(2), lesson: vec(2) });
+      const lb = (await k.listLessons({ status: 'proposed' }))[0];
+      await k.updateLesson(lb.id, { rule: 'Read the key from the environment in api/env.ts' }, {});
+      expect((await k.lessonDetail(lb.id))?.lesson.proposedAs?.rule).toBe(lb.rule);
+    });
+
+    test('decidedLessons: the owner decisions on post-mortem lessons of these projects, newest first, never a sandbox run, with a score', async () => {
+      const a = await confirmedFeedback('s1');
+      const b = await confirmedFeedback('s2');
+      const c = await confirmedFeedback('s3');
+      const d = await confirmedFeedback('s4');
+      await k.savePostmortem(a, pm(), { miss: vec(1), lesson: vec(1) });
+      await k.savePostmortem(b, pm({ lesson: { ...pm().lesson, title: 'B' } }), { miss: vec(2), lesson: vec(2) });
+      await k.savePostmortem(c, pm({ lesson: { ...pm().lesson, title: 'C' } }), { miss: vec(3), lesson: vec(3) });
+      await k.savePostmortem(d, pm({ lesson: { ...pm().lesson, title: 'D' } }), { miss: vec(4), lesson: vec(4) });
+      await k.updateLesson(`lesson:${a}`, { status: 'approved' }, {});
+      await k.updateLesson(`lesson:${b}`, { rule: 'Owner wording' }, {});
+      await k.updateLesson(`lesson:${b}`, { status: 'approved' }, {});
+      await k.updateLesson(`lesson:${c}`, { status: 'rejected' }, { note: 'meta rule' });
+      // d stays proposed; a memory lesson the owner approved is not the writer's.
+      await k.upsertLesson({ id: 'memory:m', projectKey: 'demo', title: 'M', rule: 'r', appliesWhen: '', scope: 'project', paths: [], status: 'proposed', source: 'memory', embedding: vec(1) });
+      await k.updateLesson('memory:m', { status: 'approved' }, {});
+      const got = await k.decidedLessons!({ projectKeys: ['demo'], since: '2000-01-01T00:00:00.000Z', limit: 10, embedding: vec(3) });
+      expect(got.map((g) => g.lesson.id)).toEqual([`lesson:${c}`, `lesson:${b}`, `lesson:${a}`]);
+      expect(got[0].lesson).toMatchObject({ status: 'rejected', decisionNote: 'meta rule' });
+      expect(got[1].lesson.proposedAs?.rule).toBe('Filter on the server');
+      expect(got[0].score).toBeGreaterThan(0.99);
+      expect(got[2].score).toBeLessThan(0.01);
+      expect((await k.decidedLessons!({ projectKeys: ['demo'], since: '2000-01-01T00:00:00.000Z', limit: 1 }))[0]).toEqual({ lesson: expect.objectContaining({ id: `lesson:${c}` }), score: null });
+      expect(await k.decidedLessons!({ projectKeys: ['elsewhere'], since: '2000-01-01T00:00:00.000Z', limit: 10 })).toEqual([]);
+      expect(await k.decidedLessons!({ projectKeys: ['demo'], since: '2999-01-01T00:00:00.000Z', limit: 10 })).toEqual([]);
+      expect((await k.decidedLessons!({ projectKeys: null, since: '2000-01-01T00:00:00.000Z', limit: 10 })).length).toBe(3);
+      // A sandbox run's lesson never teaches the writer.
+      const sbx = await k.createManualFeedback({ project, cwd: '/vibe/demo', text: 'sandbox miss', whatWasDone: 'x', run: { id: 'sbx-1', sandbox: true } });
+      await repo.decide(sbx, 'confirmed', null);
+      await k.savePostmortem(sbx, pm(), { miss: vec(5), lesson: vec(5) });
+      await k.updateLesson(`lesson:${sbx}`, { status: 'rejected' }, { note: 'tester' });
+      expect((await k.decidedLessons!({ projectKeys: ['demo'], since: '2000-01-01T00:00:00.000Z', limit: 10 })).map((g) => g.lesson.id)).not.toContain(`lesson:${sbx}`);
+    });
+
+    test("a machine's decision (no miss, the session re-match) is not the owner's: decidedLessons leaves it out, an operator's counts", async () => {
+      const a = await confirmedFeedback('s1');
+      const b = await confirmedFeedback('s2');
+      const c = await confirmedFeedback('s3');
+      for (const id of [a, b, c]) await k.savePostmortem(id, pm(), { miss: vec(1), lesson: vec(1) });
+      await k.updateLesson(`lesson:${a}`, { status: 'rejected' }, { by: 'postmortem', note: 'no miss' });
+      await k.updateLesson(`lesson:${b}`, { status: 'rejected' }, { by: 'operator:codex' });
+      await new Promise((r) => setTimeout(r, 5));
+      await k.updateLesson(`lesson:${c}`, { status: 'approved' }, { by: 'you' });
+      expect((await k.lessonDetail(`lesson:${a}`))!.lesson).toMatchObject({ status: 'rejected', decidedBy: 'postmortem' });
+      const got = await k.decidedLessons!({ projectKeys: ['demo'], since: '2000-01-01T00:00:00.000Z', limit: 10 });
+      expect(got.map((g) => g.lesson.id)).toEqual([`lesson:${c}`, `lesson:${b}`]);
+      // Nor do machine decisions take the limit's room: the one owner decision is still found with limit 1.
+      await k.updateLesson(`lesson:${a}`, { status: 'rejected' }, { by: 'session-match' });
+      expect((await k.decidedLessons!({ projectKeys: ['demo'], since: '2000-01-01T00:00:00.000Z', limit: 1 })).map((g) => g.lesson.id)).toEqual([`lesson:${c}`]);
+    });
+
+    test("a machine's decision does not mark the lesson yours: its memory file still updates it", async () => {
+      const mem = (rule: string) => ({ id: 'memory:m.md', projectKey: 'demo', title: 'T', rule, appliesWhen: 'w', scope: 'project' as const, paths: [], status: 'proposed' as const, source: 'memory' as const, embedding: vec(2) });
+      await k.upsertLesson(mem('v1'));
+      await k.updateLesson('memory:m.md', { status: 'rejected' }, { by: 'postmortem' });
+      await k.upsertLesson(mem('v2'));
+      expect((await k.lessonDetail('memory:m.md'))!.lesson).toMatchObject({ rule: 'v2', status: 'rejected' });
+    });
+
+    test('clearMachineOwnerMarks: a lesson an older rule marked yours for a machine decision loses the mark, once; owner-decided or edited ones keep it', async () => {
+      const mem = (id: string, rule: string) => ({ id, projectKey: 'demo', title: 'T', rule, appliesWhen: 'w', scope: 'project' as const, paths: [], status: 'proposed' as const, source: 'memory' as const, embedding: vec(2) });
+      await k.upsertLesson(mem('memory:machine.md', 'v1'));
+      await k.updateLesson('memory:machine.md', { status: 'rejected' }, { by: 'postmortem' });
+      await probe.seedOwnerMark('memory:machine.md');
+      await k.upsertLesson(mem('memory:yours.md', 'v1'));
+      await k.updateLesson('memory:yours.md', { status: 'rejected' }, { by: 'you' });
+      await k.upsertLesson(mem('memory:operator.md', 'v1'));
+      await k.updateLesson('memory:operator.md', { status: 'rejected' }, { by: 'operator:codex' });
+      // Edited by the owner while proposed, then rejected by a machine: the edit is the owner's, the mark stays.
+      const a = await confirmedFeedback('s1');
+      await k.savePostmortem(a, pm(), { miss: vec(1), lesson: vec(1) });
+      await k.updateLesson(`lesson:${a}`, { rule: 'Owner words' }, { by: 'you' });
+      await k.updateLesson(`lesson:${a}`, { status: 'rejected' }, { by: 'postmortem' });
+      expect(await k.clearMachineOwnerMarks!()).toEqual(['memory:machine.md']);
+      expect(await k.clearMachineOwnerMarks!()).toEqual([]);
+      for (const id of ['memory:machine.md', 'memory:yours.md', 'memory:operator.md']) await k.upsertLesson(mem(id, 'v2'));
+      const rule = async (id: string) => (await k.lessonDetail(id))!.lesson.rule;
+      expect(await rule('memory:machine.md')).toBe('v2');
+      expect(await rule('memory:yours.md')).toBe('v1');
+      expect(await rule('memory:operator.md')).toBe('v1');
+    });
+
+    test("a re-saved post-mortem never overwrites the owner's edit: the edited lesson keeps its words and the draft they edited", async () => {
+      const a = await confirmedFeedback('s1');
+      const b = await confirmedFeedback('s2');
+      await k.savePostmortem(a, pm(), { miss: vec(1), lesson: vec(1) });
+      await k.savePostmortem(b, pm(), { miss: vec(1), lesson: vec(1) });
+      await k.updateLesson(`lesson:${a}`, { rule: 'Filter in api/search.ts on the server', paths: ['api/search.ts'] }, { by: 'you' });
+      const writer = { title: 'Server-side search', rule: 'Filter on the server', appliesWhen: 'search features', scope: 'project', paths: ['api/**'] };
+      const again = pm({ lesson: { title: 'Search on the server, v2', rule: 'Push filters down', appliesWhen: 'lists', scope: 'project', paths: ['api/list.ts'] } });
+      await k.savePostmortem(a, again, { miss: vec(3), lesson: vec(3) });
+      await k.savePostmortem(b, again, { miss: vec(3), lesson: vec(3) });
+      expect((await k.lessonDetail(`lesson:${a}`))!.lesson).toMatchObject({
+        status: 'proposed', title: 'Server-side search', rule: 'Filter in api/search.ts on the server', paths: ['api/search.ts'], proposedAs: writer,
+      });
+      // Not edited by the owner: the re-save rewrites it, and there is no earlier draft to compare an approval against.
+      const lb = (await k.lessonDetail(`lesson:${b}`))!.lesson;
+      expect(lb).toMatchObject({ title: 'Search on the server, v2', rule: 'Push filters down', paths: ['api/list.ts'] });
+      expect(lb.proposedAs ?? null).toBeNull();
+    });
+
+    test("setLessonPaths leaves a proposed lesson the owner edited alone: its paths are the owner's", async () => {
+      const a = await confirmedFeedback('s1');
+      await k.savePostmortem(a, pm(), { miss: vec(1), lesson: vec(1) });
+      await k.updateLesson(`lesson:${a}`, { paths: ['api/new-file.ts'] }, { by: 'you' });
+      expect(await k.setLessonPaths!(`lesson:${a}`, [])).toBe(false);
+      expect((await k.lessonDetail(`lesson:${a}`))!.lesson.paths).toEqual(['api/new-file.ts']);
     });
 
     test('searchLessons returns approved lessons for the project and global ones, nearest first', async () => {
@@ -559,6 +713,28 @@ describeStores('KnowledgeStore', (h) => {
     expect((await k.lessonDetail('orphan'))!.lesson.status).toBe('proposed');
   });
 
+  test("setLessonPaths replaces a proposed lesson's paths only: an approved lesson's paths are the owner's", async () => {
+    const one = (id: string, status: 'proposed' | 'approved') => ({ id, projectKey: 'demo', title: id, rule: 'r', appliesWhen: 'w', scope: 'project' as const, paths: ['schedule.go', 'AGENTS.md'], status, source: 'postmortem' as const, embedding: vec(6) });
+    await k.upsertLesson(one('lesson:p', 'proposed'));
+    await k.upsertLesson(one('lesson:a', 'approved'));
+    expect(await k.setLessonPaths!('lesson:p', ['jobs/export/schedule.go'])).toBe(true);
+    expect(await k.setLessonPaths!('lesson:a', ['jobs/export/schedule.go'])).toBe(false);
+    expect(await k.setLessonPaths!('lesson:none', [])).toBe(false);
+    const d = (id: string) => k.lessonDetail(id).then((x) => x!.lesson);
+    expect(await d('lesson:p')).toMatchObject({ paths: ['jobs/export/schedule.go'], status: 'proposed' });
+    expect((await d('lesson:p')).decidedBy ?? null).toBeNull();
+    expect(await d('lesson:a')).toMatchObject({ paths: ['schedule.go', 'AGENTS.md'], status: 'approved' });
+  });
+
+  test('a global lesson with no project to trace is narrowed to the project the owner names, and served only there', async () => {
+    await k.upsertLesson({ id: 'manual:g', projectKey: null, title: 't', rule: 'r', appliesWhen: 'w', scope: 'global', paths: [], status: 'approved', source: 'manual', embedding: vec(7) });
+    expect(await k.updateLesson('manual:g', { scope: 'project', projectKey: 'web' }, {})).toEqual({ unscoped: false });
+    const l = (await k.lessonDetail('manual:g'))!.lesson;
+    expect(l).toMatchObject({ scope: 'project', projectKey: 'web', status: 'approved' });
+    expect((await k.searchLessons({ embedding: vec(7), projectKey: 'web', k: 5 })).map((h) => h.lesson.id)).toEqual(['manual:g']);
+    expect(await k.searchLessons({ embedding: vec(7), projectKey: 'demo', k: 5 })).toEqual([]);
+  });
+
   test('a lesson stored with another embedding size is skipped, not a failed search', async () => {
     await k.upsertLesson({ id: 'memory:old', projectKey: 'demo', title: 'old', rule: 'r', appliesWhen: 'w', scope: 'project', paths: [], status: 'approved', source: 'memory', embedding: [1, 0, 0] });
     await k.upsertLesson({ id: 'memory:new', projectKey: 'demo', title: 'new', rule: 'r', appliesWhen: 'w', scope: 'project', paths: [], status: 'approved', source: 'memory', embedding: vec(1) });
@@ -571,5 +747,76 @@ describeStores('KnowledgeStore', (h) => {
     await k.upsertLesson(mem('memory:orthogonal', vec(5)));
     const hits = await k.searchLessons({ embedding: vec(4), projectKey: 'demo', k: 2 });
     expect(hits.map((x) => [x.lesson.id, x.score])).toEqual([['memory:same', 1], ['memory:orthogonal', 0.5]]);
+  });
+
+  describe('the demo corpus (fg demo seed / remove)', () => {
+    const demo = (over = {}) => ({
+      project, id: 'demo:demo:tenant', ts: '2026-10-01T10:00:00.000Z', feedbackText: 'this reads every org', whatWasDone: 'added /orders',
+      missed: 'the route used db.raw() and skipped tenant scoping', cause: 'context_available_ignored' as const, causeExplanation: 'CLAUDE.md says so',
+      embedding: vec(7), ...over,
+    });
+    const fact = { kind: 'convention' as const, statement: 'routes use db.scoped', path: 'src/routes/orders.ts', lines: null, confidence: 1, why: 'demo', embedding: vec(8) };
+
+    test('a demo miss is a confirmed miss found like any other, tied to the files its session touched, and written once', async () => {
+      const id = await k.saveDemoMiss!(demo());
+      expect(await k.saveDemoMiss!(demo({ missed: 'the route skipped tenant scoping' }))).toBe(id);
+      expect(id).toBe('miss:demo:demo:tenant');
+      const found = await k.relatedMisses({ embedding: vec(7), projectKey: 'demo', k: 5 });
+      expect(found.map((m) => [m.missId, m.missed])).toEqual([[id, 'the route skipped tenant scoping']]);
+      await h.store.codegraph.recordSessionFiles('demo:demo:tenant', [{ path: 'src/routes/orders.ts', read: true, edited: true, firstEditAt: '2026-10-01T09:59:00.000Z', lastEditAt: '2026-10-01T10:01:00.000Z' }]);
+      expect((await h.store.codegraph.sessionFiles('demo:demo:tenant')).map((f) => f.path)).toEqual(['src/routes/orders.ts']);
+      // Not waiting for a post-mortem, not in the Inbox as pending.
+      expect(await k.feedbackNeedingPostmortem(5)).toEqual([]);
+      await expect(k.saveDemoMiss!(demo({ id: 'manual:x' }))).rejects.toThrow(/demo:/);
+    });
+
+    test('removeDemo takes back exactly the demo lessons, misses and facts of that project', async () => {
+      await k.saveDemoMiss!(demo());
+      const lesson = (id: string, source: 'demo' | 'memory', projectKey = 'demo') => ({ id, projectKey, title: id, rule: 'r', appliesWhen: 'w', scope: 'project' as const, paths: [], status: 'approved' as const, source, embedding: vec(9) });
+      await k.upsertLesson(lesson('demo:demo:l1', 'demo'));
+      await k.upsertLesson(lesson('demo:other:l1', 'demo', 'other'));
+      await k.upsertLesson(lesson('memory:keep', 'memory'));
+      await h.store.facts.saveFileFacts('demo', { path: 'src/routes/orders.ts', hash: 'demo', summary: 's' }, [fact], 'demo');
+      await h.store.facts.saveFileFacts('demo', { path: 'src/db.ts', hash: 'h', summary: 's' }, [{ ...fact, path: 'src/db.ts' }], 'ollama:x');
+      const real = await confirmedFeedback('s-real');
+      await k.savePostmortem(real, pm(), { miss: vec(7), lesson: vec(1) });
+
+      expect(await k.removeDemo!('demo')).toEqual({ lessons: 1, misses: 1, facts: 1 });
+      expect(await k.lessonDetail('demo:demo:l1')).toBeNull();
+      expect(await k.lessonDetail('demo:other:l1')).not.toBeNull();
+      expect(await k.lessonDetail('memory:keep')).not.toBeNull();
+      expect((await k.relatedMisses({ embedding: vec(7), projectKey: 'demo', k: 5 })).map((m) => m.missId)).toEqual([`miss:${real}`]);
+      expect((await h.store.facts.listFacts({ projectKey: 'demo' })).map((f) => f.path)).toEqual(['src/db.ts']);
+      expect(await k.removeDemo!('demo')).toEqual({ lessons: 0, misses: 0, facts: 0 });
+    });
+
+    test("demo facts never touch a file a scan already recorded (its hash and summary stay), and removeDemo takes back only the file rows the demo added", async () => {
+      const f = h.store.facts;
+      // Scanned before, with no current facts (the scan found none, or they were closed since).
+      await f.saveFileFacts('demo', { path: 'src/db.ts', hash: 'h-real', summary: 'the real summary', version: 'v1' }, [], 'ollama:x');
+      await f.saveFileFacts('demo', { path: 'src/db.ts', hash: 'demo', summary: '[demo] seeded' }, [{ ...fact, path: 'src/db.ts' }], 'demo');
+      await f.saveFileFacts('demo', { path: 'src/routes/orders.ts', hash: 'demo', summary: '[demo] seeded' }, [fact], 'demo');
+      const listed = await f.listFacts({ projectKey: 'demo' });
+      expect(listed.map((x) => [x.path, x.fileSummary])).toEqual([['src/db.ts', 'the real summary'], ['src/routes/orders.ts', '[demo] seeded']]);
+      expect(Object.fromEntries(await f.fileHashes('demo'))).toEqual({ 'src/db.ts': 'h-real', 'src/routes/orders.ts': 'demo' });
+      expect((await f.fileScanVersions('demo')).get('src/db.ts')).toBe('v1');
+
+      expect(await k.removeDemo!('demo')).toMatchObject({ facts: 2 });
+      // The scanned file is as the scan left it; the one the demo added is gone (the next scan reads it as new).
+      expect(Object.fromEntries(await f.fileHashes('demo'))).toEqual({ 'src/db.ts': 'h-real' });
+      expect((await f.fileScanVersions('demo')).get('src/db.ts')).toBe('v1');
+      expect([...(await f.fileScanVersions('demo')).keys()]).toEqual(['src/db.ts']);
+      await f.saveFileFacts('demo', { path: 'src/db.ts', hash: 'h-real', summary: 'the real summary', version: 'v1' }, [{ ...fact, path: 'src/db.ts', statement: 'scanned' }], 'ollama:x');
+      expect((await f.listFacts({ projectKey: 'demo' })).map((x) => x.fileSummary)).toEqual(['the real summary']);
+    });
+
+    test('a file the demo added that a scan then read is the scan\'s: removeDemo leaves it', async () => {
+      const f = h.store.facts;
+      await f.saveFileFacts('demo', { path: 'src/routes/orders.ts', hash: 'demo', summary: '[demo] seeded' }, [fact], 'demo');
+      await f.saveFileFacts('demo', { path: 'src/routes/orders.ts', hash: 'h-scan', summary: 'scanned' }, [{ ...fact, statement: 'scanned' }], 'ollama:x');
+      await k.removeDemo!('demo');
+      expect(Object.fromEntries(await f.fileHashes('demo'))).toEqual({ 'src/routes/orders.ts': 'h-scan' });
+      expect((await f.listFacts({ projectKey: 'demo' })).map((x) => [x.statement, x.fileSummary])).toEqual([['scanned', 'scanned']]);
+    });
   });
 });

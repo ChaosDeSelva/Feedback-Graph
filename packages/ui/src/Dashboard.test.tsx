@@ -74,6 +74,40 @@ test('pipeline tiles: inbox, classify backlog, post-mortems, lessons and scans',
   expect(screen.getByLabelText('scans').textContent).toContain('done / queued / running / failed');
 });
 
+test('pipeline: a line per busy queue says how many wait, the oldest wait, and what runs now for how long', async () => {
+  const ago = (min: number) => new Date(Date.now() - min * 60_000).toISOString();
+  serve({ '/api/pipeline': { ...pipeline, queues: {
+    scans: {
+      waiting: 7, oldestAt: ago(125), running: [{ what: 'big', since: ago(14), shards: { done: 11, total: 40 } }],
+      projects: [{ project: 'big', status: 'running', since: ago(14), shards: { done: 11, total: 40 } }],
+    },
+    classify: { waiting: 40, capped: true, oldestAt: ago(190), running: [] },
+    postmortems: { waiting: 2, oldestAt: ago(10), running: [{ what: 'fb-1', since: ago(3) }] },
+    // Nothing waits or runs: no line.
+    chats: { waiting: 0, oldestAt: null, running: [] },
+  } } });
+  render(<Dashboard />);
+  const queues = await screen.findByRole('list', { name: 'queues' });
+  const lines = within(queues).getAllByRole('listitem').map((li) => li.textContent);
+  expect(lines).toEqual([
+    'Scan queue: 7 waiting, oldest 2 h; running shard 12/40 of big for 14 min',
+    'Classify queue: 40+ waiting, oldest at least 3 h',
+    'Post-mortem queue: 2 waiting, oldest 10 min; running fb-1 for 3 min',
+  ]);
+});
+
+test('pipeline: no queue line from an API without queues, or when every queue is empty', async () => {
+  render(<Dashboard />);
+  await waitFor(() => expect(screen.getByLabelText('turns to classify').textContent).toContain('40+'));
+  expect(screen.queryByRole('list', { name: 'queues' })).toBeNull();
+  cleanup();
+  const empty = { waiting: 0, oldestAt: null, running: [] };
+  serve({ '/api/pipeline': { ...pipeline, queues: { scans: { ...empty, projects: [] }, classify: empty, postmortems: empty, chats: null } } });
+  render(<Dashboard />);
+  await waitFor(() => expect(screen.getByLabelText('turns to classify').textContent).toContain('40+'));
+  expect(screen.queryByRole('list', { name: 'queues' })).toBeNull();
+});
+
 test('each backlog tile links to where that backlog is shown', async () => {
   render(<Dashboard />);
   await waitFor(() => expect(screen.getByLabelText('turns to classify').textContent).toContain('40+'));

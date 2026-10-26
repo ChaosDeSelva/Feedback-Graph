@@ -34,7 +34,14 @@ export const SCHEMA = [
   'CREATE INDEX codefile_project_inmap IF NOT EXISTS FOR (n:CodeFile) ON (n.projectKey, n.inMap)',
   // The import index past the cap (`WHERE inIndex = true`): files a capped map left out, with their edges.
   'CREATE INDEX codefile_project_inindex IF NOT EXISTS FOR (n:CodeFile) ON (n.projectKey, n.inIndex)',
+  // Files an agent asked to have scanned: the scan queue's order reads each queued project's oldest request.
+  'CREATE INDEX codefile_project_requested IF NOT EXISTS FOR (n:CodeFile) ON (n.projectKey, n.scanRequestedAt)',
   'CREATE INDEX scanjob_status IF NOT EXISTS FOR (n:ScanJob) ON (n.status)',
+  // Per-project lookups (`{projectKey: ...}`): the projects list counts feedback and finds the last scan of every
+  // project, the Docs list pages a project's documents; without these each one reads every node of the label.
+  ...['Feedback', 'ScanJob', 'Doc', 'Candidate', 'Module'].map(
+    (label) => `CREATE INDEX ${label.toLowerCase()}_project IF NOT EXISTS FOR (n:${label}) ON (n.projectKey)`,
+  ),
   `CREATE VECTOR INDEX fact_embedding IF NOT EXISTS FOR (n:Fact) ON n.embedding
      OPTIONS {indexConfig: {\`vector.dimensions\`: 768, \`vector.similarity_function\`: 'cosine'}}`,
   'CREATE CONSTRAINT activity_id IF NOT EXISTS FOR (n:Activity) REQUIRE n.id IS UNIQUE',
@@ -59,6 +66,12 @@ export const SCHEMA = [
   'CREATE INDEX chat_conversation_project IF NOT EXISTS FOR (n:ChatConversation) ON (n.projectKey)',
   `CREATE VECTOR INDEX chunk_embedding IF NOT EXISTS FOR (n:Chunk) ON n.embedding
      OPTIONS {indexConfig: {\`vector.dimensions\`: 768, \`vector.similarity_function\`: 'cosine'}}`,
+  // Runs (x-fg-run): Activity filters by it; cleanup finds each kind's records by it.
+  ...['Activity', 'Candidate', 'Lesson', 'Miss', 'PreDoneCheck', 'Fact', 'Doc', 'ProjectLink', 'ChatConversation'].map(
+    (label) => `CREATE INDEX ${label.toLowerCase()}_run IF NOT EXISTS FOR (n:${label}) ON (n.run)`,
+  ),
+  // Who opened each run (RunsStore.claim): unique, so two first writes racing MERGE into one owner.
+  'CREATE CONSTRAINT run_owner_run IF NOT EXISTS FOR (n:RunOwner) REQUIRE n.run IS UNIQUE',
 ];
 
 export const EMBEDDING_DIMENSIONS = 768;

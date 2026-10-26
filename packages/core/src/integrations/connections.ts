@@ -4,6 +4,7 @@ import { dirname } from 'node:path';
 import type { DocsStore } from '../store.ts';
 import type { ExternalSource } from '../types.ts';
 import type { IntegrationErrorKind } from './errors.ts';
+import { parsePrBacklog, prBacklogKey, type PrBacklog } from './github.ts';
 
 /**
  * GitHub and Linear connections: a token pasted in Settings, which wins, or one from .env (GITHUB_TOKEN, LINEAR_API_KEY),
@@ -153,6 +154,11 @@ export class Integrations {
 
   async saveSync(kind: IntegrationKind, s: IntegrationSyncState): Promise<void> {
     await this.kv.setCursor(key(kind, 'sync'), JSON.stringify(s));
+  }
+
+  /** The PRs a capped GitHub sync of the project has not read yet (the worker reads them on its next syncs); null: none. */
+  async prBacklog(projectKey: string): Promise<PrBacklog | null> {
+    return parsePrBacklog(await this.kv.getCursor(prBacklogKey(projectKey)));
   }
 
   async links(): Promise<Record<string, IntegrationLink>> {

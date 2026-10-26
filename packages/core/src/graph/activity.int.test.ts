@@ -63,7 +63,7 @@ describeStores('ActivityStore', (h) => {
   test('details that look like config survive redaction as valid JSON', async () => {
     await a.record({ kind: 'doc_added', actor: 'x', projectKey: 'shop', subject: 's', why: 'w', details: { cmd: 'password: "hunter2-EXAMPLE"', env: 'API_TOKEN=abcdefEXAMPLE' } });
     const [x] = await a.list({});
-    expect(x.details).toEqual({ cmd: 'password: [REDACTED]', env: 'API_TOKEN=[REDACTED]' });
+    expect(x.details).toEqual({ cmd: 'password: "[REDACTED]"', env: 'API_TOKEN=[REDACTED]' });
   });
 });
 

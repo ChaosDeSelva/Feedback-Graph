@@ -14,7 +14,10 @@ type Chat = { code: number; body: string };
 const CHAT_OK: Chat = { code: 200, body: JSON.stringify({ message: { role: 'assistant', content: '{"ok": true}' }, done: true }) };
 const CHAT_501: Chat = { code: 501, body: JSON.stringify({ error: 'structured output is unavailable: this build of Ollama has no grammar support' }) };
 
-function sandbox(o: { linuxUid?: number; tags?: string; claude?: boolean; chat?: Chat } = {}) {
+/** A Compose container Docker knows about: its project, the folder it was started from, its published ports. */
+type Container = { project: string; dir: string; ports?: string };
+
+function sandbox(o: { linuxUid?: number; tags?: string; claude?: boolean; chat?: Chat; containers?: Container[] } = {}) {
   const base = mkdtempSync(join(tmpdir(), 'fbsetup-'));
   const repo = join(base, 'repo');
   const home = join(base, 'home');
@@ -27,7 +30,17 @@ function sandbox(o: { linuxUid?: number; tags?: string; claude?: boolean; chat?:
   };
   // Each stand-in appends what it was asked to ${base}/calls, so a test can see what setup.sh ran.
   const calls = join(base, 'calls');
-  stub('docker', `echo "docker $*" >> '${calls}'`);
+  // docker ps (not recorded) answers from o.containers: by project label (-a --filter), or every container's published ports.
+  const containers = join(base, 'containers');
+  writeFileSync(containers, (o.containers ?? []).map((c) => `${c.project}\t${c.dir}\t${c.ports ?? ''}\n`).join(''));
+  stub(
+    'docker',
+    `case "$1" in ps) ;; *) echo "docker $*" >> '${calls}' ;; esac
+    case "$1 $2" in
+      "ps -a") p="$(printf '%s\\n' "$@" | sed -n 's/^label=com.docker.compose.project=//p')"; awk -F'\t' -v p="$p" '$1 == p { print $2 }' '${containers}' ;;
+      "ps --format") awk -F'\t' '{ print $3 }' '${containers}' ;;
+    esac`,
+  );
   // Ollama answers /api/tags with o.tags (not at all without it) and /api/chat with o.chat (the body, then the status on
   // its own line, as curl -w prints it); the Feedback Graph answers /api/status. Each chat request body is kept.
   const chat = o.chat ?? CHAT_OK;
@@ -84,7 +97,7 @@ function sandbox(o: { linuxUid?: number; tags?: string; claude?: boolean; chat?:
     writeFileSync(p, text);
     return p;
   };
-  return { repo, home, run, runFailing, ran, env, value, saved, saveInSettings, rootsFile, chatRequests, secretFile, override: join(repo, 'docker-compose.override.yml') };
+  return { base, repo, home, run, runFailing, ran, env, value, saved, saveInSettings, rootsFile, chatRequests, secretFile, override: join(repo, 'docker-compose.override.yml') };
 }
 
 test('PROJECTS_DIRS=~/code on a first run writes it into .env and the roots file, and the override mounts exactly it', () => {
@@ -418,3 +431,74 @@ test('the operator token is generated only with --yes or a yes answer, never pri
   fresh.run({}, undefined, ['--yes', '--projects', '~/code']);
   expect(fresh.value('FG_OPERATOR_TOKEN')).toMatch(/^[0-9a-f]{48}$/);
 }, 20_000);
+
+// ── Two installs on one machine ────────────────────────────────────────
+
+const PORTS = '127.0.0.1:8787->8787/tcp, 127.0.0.1:7476->7474/tcp, 127.0.0.1:7689->7687/tcp';
+
+test('another folder\'s install is running: a new .env gets its own instance name and ports, and says why', () => {
+  const s = sandbox({ containers: [{ project: 'feedback-graph', dir: '/srv/acme/feedback-graph', ports: PORTS }] });
+  const out = s.run({ PROJECTS_DIRS: '~/code' });
+  expect(s.value('FG_INSTANCE')).toBe('feedback-graph-repo');
+  expect([s.value('API_PORT'), s.value('NEO4J_HTTP_PORT'), s.value('NEO4J_BOLT_PORT'), s.value('POSTGRES_PORT'), s.value('OLLAMA_PORT')]).toEqual(['8797', '7486', '7699', '5444', '11445']);
+  expect(out).toContain('/srv/acme/feedback-graph');
+  expect(out).toContain('OLLAMA_PORT=11445');
+  expect(out).toMatch(/FG_INSTANCE=feedback-graph-repo/);
+  expect(out).toMatch(/http:\/\/localhost:8797/);
+  // Re-running keeps them.
+  s.run();
+  expect(s.value('FG_INSTANCE')).toBe('feedback-graph-repo');
+  expect(s.value('API_PORT')).toBe('8797');
+});
+
+test('the install running is this folder\'s own, or none is: the name and ports stay the defaults (existing volumes keep their names)', () => {
+  const own = sandbox();
+  writeFileSync(join(own.base, 'containers'), `feedback-graph\t${own.repo}\t${PORTS}\n`);
+  own.run({ PROJECTS_DIRS: '~/code' });
+  expect(own.value('FG_INSTANCE')).toBe('');
+  expect(own.value('API_PORT')).toBe('8787');
+  expect(own.value('OLLAMA_PORT')).toBe('');
+  const none = sandbox();
+  none.run({ PROJECTS_DIRS: '~/code' });
+  expect(none.value('FG_INSTANCE')).toBe('');
+  expect(none.value('POSTGRES_PORT')).toBe('5434');
+});
+
+test('a name or ports another install already took are skipped', () => {
+  const s = sandbox({ containers: [
+    { project: 'feedback-graph', dir: '/srv/acme/feedback-graph', ports: PORTS },
+    { project: 'feedback-graph-repo', dir: '/srv/demo-shop/repo', ports: '127.0.0.1:8797->8787/tcp, 127.0.0.1:5444->5432/tcp' },
+  ] });
+  s.run({ PROJECTS_DIRS: '~/code' });
+  expect(s.value('FG_INSTANCE')).toBe('feedback-graph-repo-2');
+  expect([s.value('API_PORT'), s.value('NEO4J_HTTP_PORT'), s.value('NEO4J_BOLT_PORT'), s.value('POSTGRES_PORT'), s.value('OLLAMA_PORT')]).toEqual(['8807', '7496', '7709', '5454', '11455']);
+});
+
+test('the bundled ollama profile is reached on its own host port: OLLAMA_PORT, 11435 when unset', () => {
+  const s = sandbox({ tags: '{"models":[{"name":"nomic-embed-text:latest"}]}' });
+  s.run({ PROJECTS_DIRS: '~/code', OLLAMA_URL: 'http://ollama:11434' }, 'y\nn\nn\n');
+  expect(s.ran()).toContain('OLLAMA_HOST=http://localhost:11435 ollama pull gemma4\n');
+  const other = sandbox({ tags: '{"models":[{"name":"nomic-embed-text:latest"}]}' });
+  other.run({ PROJECTS_DIRS: '~/code', OLLAMA_URL: 'http://ollama:11434', OLLAMA_PORT: '11445' }, 'y\nn\nn\n');
+  expect(other.ran()).toContain('OLLAMA_HOST=http://localhost:11445 ollama pull gemma4\n');
+});
+
+test('a port another container publishes for the bundled ollama is skipped too', () => {
+  const s = sandbox({ containers: [{ project: 'feedback-graph', dir: '/srv/acme/feedback-graph', ports: `${PORTS}, 127.0.0.1:11445->11434/tcp` }] });
+  s.run({ PROJECTS_DIRS: '~/code' });
+  expect([s.value('API_PORT'), s.value('OLLAMA_PORT')]).toEqual(['8807', '11455']);
+});
+
+test('FG_INSTANCE given is used as it is; an existing .env is never renamed, only told how', () => {
+  const given = sandbox({ containers: [{ project: 'feedback-graph', dir: '/srv/acme/feedback-graph', ports: PORTS }] });
+  given.run({ PROJECTS_DIRS: '~/code', FG_INSTANCE: 'fg-staging' });
+  expect(given.value('FG_INSTANCE')).toBe('fg-staging');
+  const old = sandbox({ containers: [{ project: 'feedback-graph', dir: '/srv/acme/feedback-graph', ports: PORTS }] });
+  writeFileSync(join(old.repo, '.env'), `NEO4J_PASSWORD=x\nPROJECTS_DIRS=${join(old.home, 'code')}\n`);
+  const said = old.run();
+  expect(old.value('FG_INSTANCE')).toBeUndefined();
+  expect(said).toContain('/srv/acme/feedback-graph');
+  expect(said).toMatch(/FG_INSTANCE=/);
+  const bad = sandbox();
+  expect(bad.runFailing({ PROJECTS_DIRS: '~/code', FG_INSTANCE: 'Has Spaces' })).toMatch(/FG_INSTANCE/);
+});

@@ -1,7 +1,7 @@
 import { beforeAll, beforeEach, expect, test } from 'vitest';
 import type { GraphStore, KnowledgeStore, PortabilityStore, Store } from '../store.ts';
 import { describeStores, type StoreProbe } from '../testing/index.ts';
-import type { Classification, ParsedSession, PostMortem, Project } from '../types.ts';
+import type { Classification, FactKind, ParsedSession, PostMortem, Project } from '../types.ts';
 import { EXPORT_FORMAT } from './portability.ts';
 
 const vec = (axis: number) => Array.from({ length: 768 }, (_, i) => (i === axis ? 1 : 0));
@@ -71,6 +71,23 @@ describeStores('PortabilityStore', (h) => {
     expect((await p.exportData({ projectKey: 'nope' })).projects).toEqual([]);
   });
 
+  test('projectKeys exports only those projects: an unselected one stays out, global lessons learned in it too', async () => {
+    const [g] = await k.listLessons({ projectKey: 'other' });
+    await k.updateLesson(g.id, { scope: 'global' }, {});
+    const x = await p.exportData({ projectKeys: ['demo'] });
+    expect(x.projectKey).toBeNull();
+    expect(x.projects.map((r) => r.key)).toEqual(['demo']);
+    expect(x.lessons.map((l) => l.projectKey)).toEqual(['demo']);
+    expect(x.misses.map((m) => m.projectKey)).toEqual(['demo']);
+    expect(x.facts.map((f) => f.projectKey)).toEqual(['demo']);
+    expect(x.docs.map((d) => d.projectKey)).toEqual(['demo']);
+    expect(x.codeFiles.every((f) => f.projectKey === 'demo')).toBe(true);
+    // Listing the project it was learned in brings the global lesson along.
+    expect((await p.exportData({ projectKeys: ['demo', 'other'] })).lessons).toHaveLength(2);
+    const none = await p.exportData({ projectKeys: [] });
+    expect([none.projects, none.lessons, none.misses, none.facts, none.docs, none.codeFiles]).toEqual([[], [], [], [], [], []]);
+  });
+
   test('approvedOnly exports just what you approved, the shape a team sync would send', async () => {
     expect((await p.exportData({ projectKey: 'demo', approvedOnly: true })).lessons).toEqual([]);
     const [l] = await k.listLessons({ projectKey: 'demo' });
@@ -87,5 +104,14 @@ describeStores('PortabilityStore', (h) => {
     expect(await probe.ids('Commit')).not.toContain('s1'.padEnd(40, '0'));
     expect(await probe.ids('Commit')).toContain('s2'.padEnd(40, '0'));
     expect(await p.exportData({ projectKey: 'other' })).toEqual({ ...before, exportedAt: expect.any(String) });
+  });
+
+  test('the export is deterministic: rows that tie on every sort column still come out in the same order', async () => {
+    // Same path and statement, different kinds: they tie on (project, path, statement), so only an id breaks the tie.
+    const fact = (kind: FactKind) => ({ path: 'src/b.ts', lines: '1', kind, statement: 'same words', why: 'w', confidence: 1, embedding: vec(4) });
+    await store.facts.saveFileFacts('demo', { path: 'src/b.ts', hash: 'h', summary: 'B' }, (['convention', 'gotcha', 'invariant', 'api'] as const).map(fact), 'ollama:gemma4');
+    const first = await p.exportData({ projectKey: 'demo' });
+    for (let i = 0; i < 5; i++) expect(await p.exportData({ projectKey: 'demo' })).toEqual({ ...first, exportedAt: expect.any(String) });
+    expect(first.facts.filter((f) => f.path === 'src/b.ts')).toHaveLength(4);
   });
 });

@@ -1,8 +1,8 @@
 import neo4j from 'neo4j-driver';
-import { redactDeep, redactSecrets } from '../redact.ts';
+import { REDACT_PAGE, redactDeep, redactSecrets, redactStoredRow } from '../redact.ts';
 import { latestTime, readSummary, summaryRetryAt, summarySnippet, type SessionCursor, type SummaryWork, type SummaryWorkQuery, type SummaryWrite } from '../sessions.ts';
 import type { SessionsStore } from '../store.ts';
-import type { CandidateStatus, HumanTurn, LessonStatus, SessionDetail, SessionListItem, SessionSource, SessionState, SummaryCursor, SummaryUpdate } from '../types.ts';
+import type { CandidateStatus, HumanTurn, LessonStatus, SessionDetail, SessionListItem, SessionSource, SessionState, SummaryCursor, SummaryUpdate, TurnEvidence, TurnLabel } from '../types.ts';
 import type { GraphRepo } from './repo.ts';
 
 /**
@@ -281,5 +281,40 @@ export class SessionsRepo implements SessionsStore {
       { id: sessionId },
     );
     return rows.length > 0;
+  }
+
+  async redactStoredSummaries(): Promise<number> {
+    let changed = 0;
+    for (let after = ''; ;) {
+      const rows = await this.g.run(
+        `MATCH (s:Session) WHERE s.id > $after AND (s.summaryJson IS NOT NULL OR s.finalReplyText IS NOT NULL)
+         RETURN s.id AS id, s.summaryJson AS summaryJson, s.finalReplyText AS finalReplyText ORDER BY s.id LIMIT $page`,
+        { after, page: neo4j.int(REDACT_PAGE) },
+      );
+      if (!rows.length) break;
+      after = rows[rows.length - 1].get('id');
+      const page = rows.flatMap((r) => redactStoredRow({ id: r.get('id') as string, summaryJson: r.get('summaryJson') ?? null, finalReplyText: r.get('finalReplyText') ?? null }, ['finalReplyText'], ['summaryJson']) ?? []);
+      if (!page.length) continue;
+      await this.g.run('UNWIND $page AS c MATCH (s:Session {id: c.id}) SET s.summaryJson = c.summaryJson, s.finalReplyText = c.finalReplyText', { page });
+      changed += page.length;
+    }
+    return changed;
+  }
+
+  async turnEvidence(sessionId: string): Promise<TurnEvidence[]> {
+    const rows = await this.g.run(
+      `MATCH (:Session {id: $id})-[:HAS_TURN]->(t:Turn)
+       OPTIONAL MATCH (k:Candidate)-[:FLAGS]->(t)
+       WITH t, min(k.id) AS candidateId
+       RETURN t.uuid AS uuid, t.index AS idx, t.ts AS ts, t.label AS label, t.confidence AS confidence, t.summary AS summary,
+              coalesce(t.signals, []) AS signals, coalesce(t.classifyAttempts, 0) AS attempts, candidateId
+       ORDER BY t.index, t.uuid`,
+      { id: sessionId },
+    );
+    return rows.map((r) => ({
+      uuid: r.get('uuid'), index: Number(r.get('idx')), ts: r.get('ts') ?? '', label: (r.get('label') as TurnLabel) ?? null,
+      confidence: r.get('confidence') == null ? null : Number(r.get('confidence')), summary: r.get('summary') ?? null,
+      signals: r.get('signals') ?? [], classifyAttempts: Number(r.get('attempts')), candidateId: r.get('candidateId') ?? null,
+    }));
   }
 }

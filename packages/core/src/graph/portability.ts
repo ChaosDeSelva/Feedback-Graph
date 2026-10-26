@@ -51,33 +51,36 @@ export class PortabilityRepo implements PortabilityStore {
     this.g = g;
   }
 
-  async exportData(o: { projectKey?: string; approvedOnly?: boolean } = {}): Promise<ExportBundle> {
+  async exportData(o: { projectKey?: string; projectKeys?: string[]; approvedOnly?: boolean } = {}): Promise<ExportBundle> {
     const key = o.projectKey ?? null;
+    // null: no list to apply (one project by key, or everything).
+    const keys = key === null && o.projectKeys ? o.projectKeys : null;
     const [projects, lessons, misses, facts, docs] = await Promise.all([
-      this.g.run(`MATCH (p:Project) WHERE $key IS NULL OR p.key = $key RETURN p.key AS key, p.remote AS remote ORDER BY p.key`, { key }),
+      this.g.run(`MATCH (p:Project) WHERE ($key IS NULL OR p.key = $key) AND ($keys IS NULL OR p.key IN $keys) RETURN p.key AS key, p.remote AS remote ORDER BY p.key`, { key, keys }),
       this.g.run(
         `MATCH (l:Lesson)
          WHERE ($key IS NULL OR l.projectKey = $key OR (l.projectKey IS NULL AND l.originProjectKey = $key))
-           AND (NOT $approvedOnly OR l.status = 'approved')
+           AND ($keys IS NULL OR coalesce(l.projectKey, l.originProjectKey) IS NULL OR coalesce(l.projectKey, l.originProjectKey) IN $keys)
+           AND (NOT $approvedOnly OR l.status = 'approved') AND NOT coalesce(l.sandbox, false)
          RETURN l ORDER BY l.createdAt, l.id`,
-        { key, approvedOnly: !!o.approvedOnly },
+        { key, keys, approvedOnly: !!o.approvedOnly },
       ),
       this.g.run(
         `MATCH (m:Miss)-[:EXPLAINS]->(f:Feedback)
-         WHERE $key IS NULL OR m.projectKey = $key
+         WHERE ($key IS NULL OR m.projectKey = $key) AND ($keys IS NULL OR m.projectKey IN $keys) AND NOT coalesce(m.sandbox, false)
          OPTIONAL MATCH (ci:ContextItem)-[w:WOULD_HAVE_PREVENTED]->(m)
-         WITH m, f, ci, w ORDER BY ci.ref
+         WITH m, f, ci, w ORDER BY ci.ref, ci.id
          RETURN m, f.text AS feedbackText, f.createdAt AS ts,
                 [x IN collect({kind: ci.kind, ref: ci.ref, excerpt: ci.excerpt, why: w.why}) WHERE x.ref IS NOT NULL] AS items
          ORDER BY ts, m.id`,
-        { key },
+        { key, keys },
       ),
       this.g.run(
-        `MATCH (x:Fact {current: true}) WHERE ($key IS NULL OR x.projectKey = $key) AND x.docId IS NULL
-         RETURN x ORDER BY x.projectKey, x.path, x.statement`,
-        { key },
+        `MATCH (x:Fact {current: true}) WHERE ($key IS NULL OR x.projectKey = $key) AND ($keys IS NULL OR x.projectKey IN $keys) AND x.docId IS NULL AND NOT coalesce(x.sandbox, false)
+         RETURN x ORDER BY x.projectKey, x.path, x.statement, x.id`,
+        { key, keys },
       ),
-      this.g.run(`MATCH (d:Doc) WHERE $key IS NULL OR d.projectKey = $key RETURN d ORDER BY d.projectKey, d.id`, { key }),
+      this.g.run(`MATCH (d:Doc) WHERE ($key IS NULL OR d.projectKey = $key) AND ($keys IS NULL OR d.projectKey IN $keys) AND NOT coalesce(d.sandbox, false) RETURN d ORDER BY d.projectKey, d.id`, { key, keys }),
     ]);
     const codegraph = new CodeGraphRepo(this.g);
     const codeFiles = (await Promise.all(projects.map((r) => codegraph.exportFiles(r.get('key') as string)))).flat();

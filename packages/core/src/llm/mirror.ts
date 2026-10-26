@@ -4,6 +4,7 @@ import { copyFile, lstat, mkdir, mkdtemp, readdir, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join, relative } from 'node:path';
 import { promisify } from 'node:util';
+import { GIT_SAFE, gitSafeEnv } from '../git.ts';
 import { isSecretPath, SKIP_DIRS } from '../secrets.ts';
 
 const run = promisify(execFile);
@@ -13,9 +14,10 @@ const MAX_FILES = 50_000;
 
 async function listFiles(repo: string): Promise<string[]> {
   try {
-    const { stdout } = await run('git', ['-c', 'core.fsmonitor=', '-c', 'core.hooksPath=/dev/null', '-C', repo, 'ls-files', '--cached', '--others', '--exclude-standard'], {
+    const { stdout } = await run('git', [...GIT_SAFE, '-C', repo, 'ls-files', '--cached', '--others', '--exclude-standard'], {
       maxBuffer: 64 * 1024 * 1024,
       timeout: 60_000,
+      env: gitSafeEnv(),
     });
     return stdout.split('\n').filter(Boolean);
   } catch {

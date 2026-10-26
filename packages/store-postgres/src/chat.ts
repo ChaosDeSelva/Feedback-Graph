@@ -24,12 +24,12 @@ export class PgChatStore implements ChatStore {
     return rows.map(conversationOf);
   }
 
-  async createConversation(input: { projectKey: string; title: string; provider: ChatProvider | null }): Promise<ChatConversation> {
+  async createConversation(input: { projectKey: string; title: string; provider: ChatProvider | null; run?: string | null }): Promise<ChatConversation> {
     const now = new Date();
     const { rows: [row] } = await this.db.pool.query(
-      `INSERT INTO chat_conversations (id, project_key, title, provider, next_seq, created_at, updated_at)
-       VALUES ($1, $2, $3, $4, 1, $5, $5) RETURNING *, false AS pending`,
-      [newChatId(), input.projectKey, cleanChatTitle(input.title), input.provider, now],
+      `INSERT INTO chat_conversations (id, project_key, title, provider, next_seq, created_at, updated_at, run)
+       VALUES ($1, $2, $3, $4, 1, $5, $5, $6) RETURNING *, false AS pending`,
+      [newChatId(), input.projectKey, cleanChatTitle(input.title), input.provider, now, input.run ?? null],
     );
     return conversationOf(row);
   }
@@ -126,6 +126,14 @@ export class PgChatStore implements ChatStore {
     });
   }
 
+  async chatQueue(): Promise<{ waiting: number; oldestAt: string | null; running: { id: string; projectKey: string; startedAt: string }[] }> {
+    const [{ rows: [w] }, { rows }] = await Promise.all([
+      this.db.pool.query(`SELECT count(*)::int AS n, min(created_at) AS oldest FROM chat_turns WHERE status = 'pending' AND role = 'assistant'`),
+      this.db.pool.query(`SELECT id, project_key, started_at FROM chat_turns WHERE status = 'answering' AND role = 'assistant' ORDER BY started_at, id COLLATE "C"`),
+    ]);
+    return { waiting: w.n, oldestAt: iso(w.oldest), running: rows.map((r) => ({ id: r.id, projectKey: r.project_key, startedAt: iso(r.started_at)! })) };
+  }
+
   async requeueStaleTurns(): Promise<number> {
     const { rowCount } = await this.db.pool.query(`UPDATE chat_turns SET status = 'pending', started_at = NULL WHERE status = 'answering'`);
     return rowCount ?? 0;
@@ -158,6 +166,7 @@ function conversationOf(r: Record<string, any>): ChatConversation {
     createdAt: iso(r.created_at)!,
     updatedAt: iso(r.updated_at)!,
     pending: !!r.pending,
+    ...(r.run ? { run: r.run as string } : {}),
   };
 }
 

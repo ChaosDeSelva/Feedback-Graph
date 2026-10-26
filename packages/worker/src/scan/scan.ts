@@ -4,14 +4,14 @@ import { lstat, readdir, readFile, stat } from 'node:fs/promises';
 import { extname, join } from 'node:path';
 import { promisify } from 'node:util';
 import { z } from 'zod';
-import { GIT_SAFE } from '../ingest/git.ts';
+import { GIT_SAFE, gitSafeEnv } from '../ingest/git.ts';
 import { extract } from '../codegraph/extract.ts';
 import { langOf } from '../codegraph/lang.ts';
 import { chunkBySymbols, type Chunk } from './chunk.ts';
 import { mapCap, rankCodePaths } from './rank.ts';
 import { gitChurn, hotScore, longCommentLines, scanOrder, type ScanSignals } from './priority.ts';
-import { inScope, shardBudget, shardRepo, shardScope } from './shard.ts';
-import { askJson, clampRelevance, FACT_KINDS, SCAN_PROMPT_VERSION, SCANNER_VERSION, type AgentMirror, isSecretPath, modelTimeoutReason, ProviderUnavailableError, providerUnavailableReason, redactSecrets, type ActivityStore, type CodeFact, type FactScope, type FactsStore, type LlmProvider, type ScanJob } from '@fb/core';
+import { inScope, shardBudget, shardRepo, shardScope, type Shard } from './shard.ts';
+import { askJson, clampRelevance, FACT_KINDS, holdsCredential, SCAN_PROMPT_VERSION, SCANNER_VERSION, type AgentMirror, isSecretPath, modelTimeoutReason, ProviderUnavailableError, providerUnavailableReason, redactSecrets, type ActivityStore, type CodeFact, type FactScope, type FactsStore, type LlmProvider, type ScanJob, type ScanShards } from '@fb/core';
 
 const run = promisify(execFile);
 
@@ -46,7 +46,7 @@ const wanted = (path: string) => {
 
 async function gitFiles(repoPath: string): Promise<string[] | null> {
   try {
-    const { stdout } = await run('git', [...GIT_SAFE, '-C', repoPath, 'ls-files', '--cached', '--others', '--exclude-standard'], { maxBuffer: 64 * 1024 * 1024, timeout: 60_000 });
+    const { stdout } = await run('git', [...GIT_SAFE, '-C', repoPath, 'ls-files', '--cached', '--others', '--exclude-standard'], { maxBuffer: 64 * 1024 * 1024, timeout: 60_000, env: gitSafeEnv() });
     return stdout.split('\n').filter(Boolean);
   } catch {
     return null;
@@ -406,7 +406,8 @@ export async function extractFileFacts(llm: LlmProvider, path: string, content: 
       timeoutMs: 180_000,
     }, (raw) => FileResult.parse(raw), { promptOnly: true });
     summary ||= r.summary;
-    facts.push(...r.facts.filter((f) => f.confidence >= MIN_CONFIDENCE).slice(0, 10).map((f) => clean({ ...f, path })));
+    // A fact that is a credential is never kept (holdsCredential): it would reach agents as a secret.
+    facts.push(...r.facts.filter((f) => f.confidence >= MIN_CONFIDENCE).slice(0, 10).filter((f) => !holdsCredential(f.statement)).map((f) => clean({ ...f, path })));
   }
   return { summary: redactSecrets(summary), facts };
 }
@@ -490,7 +491,7 @@ In unreached, list the directories (or files) of ${whole ? 'the repository' : 't
     timeoutMs: 30 * 60_000,
   }, (raw) => AgenticResult.parse(raw));
   const unreached = [...new Set(r.unreached.map((p) => p.trim().replace(/^\.\//, '').replace(/\/+$/, '')).filter((p) => p && p !== '.' && inScope(p, shard.scope)))];
-  return { facts: r.facts.filter((f) => f.confidence >= MIN_CONFIDENCE).map((f) => ({ ...f, origin: 'model' as const })), unreached: unreached.slice(0, MAX_UNREACHED) };
+  return { facts: r.facts.filter((f) => f.confidence >= MIN_CONFIDENCE && !holdsCredential(f.statement)).map((f) => ({ ...f, origin: 'model' as const })), unreached: unreached.slice(0, MAX_UNREACHED) };
 }
 
 /**
@@ -515,7 +516,7 @@ export type ScanDeps = {
    * fileScanVersions (optional): files an older scanner read are rescanned (absent: every stored file counts as current).
    */
   facts: Pick<FactsStore, 'fileHashes' | 'saveFileFacts' | 'markFilesRemoved' | 'replaceScopeFacts' | 'updateScanJob' | 'currentSources' | 'recordScanFailure'>
-    & Partial<Pick<FactsStore, 'listFacts' | 'fileScanVersions' | 'scanRequests' | 'clearScanRequests'>>;
+    & Partial<Pick<FactsStore, 'listFacts' | 'fileScanVersions' | 'scanRequests' | 'clearScanRequests' | 'requeueScanJob'>>;
   llm: LlmProvider;
   embed(texts: string[]): Promise<number[][]>;
   maxBytes: number;
@@ -527,7 +528,70 @@ export type ScanDeps = {
   prPaths?: (projectKey: string) => Promise<string[]>;
   log?: (msg: string, extra?: object) => void;
   activity?: Pick<ActivityStore, 'record'>;
+  /**
+   * Whether another scan waits for this one's slot (ScanRunner.waiting): asked after each shard an agent ran while
+   * another is still to run. True: the job goes back in the queue (requeueScanJob) and this run ends; it goes on from
+   * the next shard when its turn comes again. Absent: a sharded scan runs to its end.
+   */
+  yieldTurn?: () => Promise<boolean>;
+  /** Where a sharded scan that gives way keeps its listing, shard plan and mirror for its next turn. Absent: built each turn. */
+  plans?: ScanPlans;
 };
+
+/**
+ * What a sharded scan builds before its first shard (the repo listed and hashed, its churn, the shard plan), kept while
+ * it waits its turn again so going on costs no re-list. Never codex's mirror: a copy of one project's repo left in the
+ * shared scratch space while another project's scan runs could be read by that scan, so the mirror is removed when the
+ * scan gives way and made again when it goes on. Only for the same repo and HEAD: once a commit lands the next turn lists
+ * again (an uncommitted edit meanwhile is picked up by the next scan, as one made during an uninterrupted run is).
+ */
+export type ScanPlan = { head: string; repoPath: string; listed: CodeFile[]; churn: Map<string, number>; planned: Shard[] };
+
+/** Scan plans kept by job id between turns, at most `max` (the oldest goes first). */
+export class ScanPlans {
+  private readonly plans = new Map<string, ScanPlan>();
+  private readonly max: number;
+  /** Turns that went on from a kept plan. */
+  reused = 0;
+
+  constructor(max = 3) {
+    this.max = max;
+  }
+
+  /** The job's plan if it was kept for this repo at this HEAD, handed over; one for another repo or HEAD is dropped. */
+  take(jobId: string, repoPath: string, head: string): ScanPlan | null {
+    const plan = this.plans.get(jobId);
+    if (!plan) return null;
+    this.plans.delete(jobId);
+    if (plan.head !== head || plan.repoPath !== repoPath) return null;
+    this.reused++;
+    return plan;
+  }
+
+  keep(jobId: string, plan: ScanPlan): void {
+    this.plans.delete(jobId);
+    this.plans.set(jobId, plan);
+    for (const id of this.plans.keys()) {
+      if (this.plans.size <= this.max) break;
+      this.plans.delete(id);
+    }
+  }
+
+  /** Forget every kept plan (shutdown). */
+  clear(): void {
+    this.plans.clear();
+  }
+}
+
+/** The repo's HEAD commit, or null (not a repo, no commit yet). */
+async function repoHead(repoPath: string): Promise<string | null> {
+  try {
+    const { stdout } = await run('git', [...GIT_SAFE, '-C', repoPath, 'rev-parse', '-q', '--verify', 'HEAD'], { timeout: 10_000 });
+    return stdout.trim() || null;
+  } catch {
+    return null;
+  }
+}
 
 /** Changed files a per-file scan reads per run when SCAN_MAX_FILES is unset; the rest wait for the next scan. */
 export const DEFAULT_SCAN_FILES = 400;
@@ -544,8 +608,11 @@ const plural = (n: number, w: string) => `${n} ${w}${n === 1 ? '' : 's'}`;
 const checked = <T extends CodeFact>(f: T): T => ({ ...f, checkVersion: FACT_CHECK_VERSION });
 const factLog = (facts: CodeFact[]) => facts.map((f) => ({ kind: f.kind, statement: f.statement, why: f.why, ...(f.evidence ? { evidence: f.evidence } : {}) }));
 
-/** failed: files (per-file scans) or shards (agentic scans) that failed. shards: an agentic scan's coverage per shard. */
-export type ScanResult = { filesScanned: number; factsAdded: number; failed: number; remaining: number; shards?: ShardCoverage[] };
+/**
+ * failed: files (per-file scans) or shards (agentic scans) that failed. shards: an agentic scan's coverage per shard (of
+ * this run). paused: it gave up its slot to another scan with `remaining` shards to go (the counts are the scan's so far).
+ */
+export type ScanResult = { filesScanned: number; factsAdded: number; failed: number; remaining: number; shards?: ShardCoverage[]; paused?: true };
 
 /** Upper bound on files listed per project, so a giant tree cannot exhaust memory. */
 const LIST_LIMIT = 20_000;
@@ -558,16 +625,24 @@ export async function runScan(job: ScanJob, d: ScanDeps): Promise<ScanResult> {
     d.activity?.record({ kind, actor: d.llm.id, projectKey: job.projectKey, subject, why, details: { scanJobId: job.id, promptVersion: SCAN_PROMPT_VERSION, ...details }, targets });
   const fileId = (path: string) => `${job.projectKey}:${path}`;
   let mirror: AgentMirror | null = null;
+  // A sharded scan that gave up its slot earlier goes on from where it was (ScanShards.processed).
+  const resume = d.llm.agentic && job.shards?.processed ? job.shards : null;
+  /** The shard progress last saved on the job (by this run, or the one it goes on from). */
+  let lastShards: ScanShards | null = resume;
   await d.facts.updateScanJob(job.id, { status: 'running' });
+  // A sharded scan going on at the same HEAD reuses what its last turn built (ScanPlans); one starting over does not.
+  const head = d.plans && d.llm.agentic ? await repoHead(job.repoPath) : null;
+  const taken = head ? d.plans!.take(job.id, job.repoPath, head) : null;
+  const kept = resume ? taken : null;
   try {
     // List everything, so files beyond the per-run cap are never mistaken for removed ones. Ranked (rank.ts), then put
     // in scan order (priority.ts): files an agent asked for, files sessions edited, then hotspots (churn, PR
     // discussions, long explanatory comments), so a capped or interrupted run has read the files that matter.
     const touched = (await d.touched?.(job.projectKey).catch(() => [])) ?? [];
     const requested = (await d.facts.scanRequests?.(job.projectKey).catch(() => [])) ?? [];
-    const listed = await listCodeFiles(job.repoPath, { maxBytes: d.maxBytes, maxFiles: LIST_LIMIT, priority: [...requested, ...touched], comments: true });
+    const listed = kept?.listed ?? await listCodeFiles(job.repoPath, { maxBytes: d.maxBytes, maxFiles: LIST_LIMIT, priority: [...requested, ...touched], comments: true });
     const signals: ScanSignals = {
-      requested, touched, churn: await gitChurn(job.repoPath),
+      requested, touched, churn: kept?.churn ?? await gitChurn(job.repoPath),
       prPaths: new Set((await d.prPaths?.(job.projectKey).catch(() => [])) ?? []),
       comments: new Map(listed.map((f) => [f.path, f.comments ?? 0])),
     };
@@ -589,7 +664,8 @@ export async function runScan(job: ScanJob, d: ScanDeps): Promise<ScanResult> {
     // Asked for but not in the repo (or not worth scanning): nothing to read, so no longer asked for.
     const gone = requested.filter((p) => !present.has(p));
     if (gone.length) await d.facts.clearScanRequests?.(job.projectKey, gone);
-    await note('scan_started', `scan of ${job.projectKey}: ${plural(changed.length, 'changed file')} of ${files.length}`,
+    if (resume) d.log?.('scan resumed', { project: job.projectKey, shardsDone: resume.done ?? resume.processed!.length, shards: resume.total, keptPlan: !!kept });
+    else await note('scan_started', `scan of ${job.projectKey}: ${plural(changed.length, 'changed file')} of ${files.length}`,
       [
         job.provider ? `you asked for a scan with ${job.provider}` : 'you asked for a scan (default model)',
         ...(modelChanged ? [`every file is rescanned because the current facts came from a different model (${sources.join(', ')})`] : []),
@@ -600,15 +676,19 @@ export async function runScan(job: ScanJob, d: ScanDeps): Promise<ScanResult> {
     for (const p of removed) await note('facts_extracted', `facts closed for removed file ${p}`, 'the file is no longer in the project', {}, [fileId(p)]);
 
     const perRun = d.maxFiles ?? DEFAULT_SCAN_FILES;
-    let factsAdded = 0;
+    let factsAdded = resume ? job.factsAdded : 0;
     let scanned = 0;
     const failed: string[] = [];
     let coverage: ShardCoverage[] | undefined;
+    // An agentic scan's totals over all its runs (it may give way to other scans between shards).
+    const unreachedAll: string[] = [];
+    let totalShards = 0;
+    let rescannedAll = 0;
     if (d.llm.agentic) {
       // One agent run per shard (a package or service, shard.ts), each with its own budget; a shard none of whose
       // files changed (or were removed) keeps its facts. Its stored file hashes are its fingerprint: they are written
       // only when its facts are, so a shard that failed is still "changed" next scan.
-      const planned = files.length ? await shardRepo(job.repoPath, files.map((f) => f.path)) : [];
+      const planned = kept?.planned ?? (files.length ? await shardRepo(job.repoPath, files.map((f) => f.path)) : []);
       const rank = new Map(files.map((f, i) => [f.path, i]));
       const hotOf = (p: string) => hotScore(p, signals);
       // Shards holding a file an agent asked for run first, then the hottest, then by key.
@@ -626,20 +706,56 @@ export async function runScan(job: ScanJob, d: ScanDeps): Promise<ScanResult> {
       const failedShards: { key: string; err: unknown }[] = [];
       let timeoutsInRow = 0;
       coverage = [];
-      // After each shard it ran, the job says how far it has got (fg scan --wait and the Projects page read it).
-      const progress = (c: ShardCoverage[]) => d.facts.updateScanJob(job.id, {
-        factsAdded, shards: { total: shards.length, done: c.length, rescanned: c.filter((x) => !x.skipped).length, failed: failedShards.length },
+      // What earlier runs of this job got through: those shards are not run again, and the counts go on from theirs.
+      const processed = new Set(resume?.processed ?? []);
+      const failedKeys = [...(resume?.failedKeys ?? [])];
+      const rescannedBefore = resume?.rescanned ?? 0;
+      const citedBefore = resume ? job.filesScanned : 0;
+      unreachedAll.push(...(resume?.unreached ?? []));
+      // A shard run again for a file asked for since is one shard rescanned, not two.
+      const rescannedNow = () => Math.min(shards.length, rescannedBefore + coverage!.filter((x) => !x.skipped).length);
+      // A file an agent asked for since this scan got through its shard (those it read were cleared): read now, not
+      // at the next scan. A failed shard is not retried for it here.
+      const askedAgain = (s: (typeof shards)[number]) => processed.has(s.key) && !failedKeys.includes(s.key) && s.files.some((p) => asked.has(p));
+      // After each shard it ran, the job says how far it has got (fg scan --wait and the Projects page read it), and
+      // what a run picking it up again needs.
+      const progress = () => d.facts.updateScanJob(job.id, {
+        factsAdded, filesScanned: citedBefore + cited.size,
+        shards: lastShards = {
+          total: shards.length, done: shards.filter((s) => processed.has(s.key)).length, rescanned: rescannedNow(), failed: failedKeys.length,
+          processed: [...processed], ...(failedKeys.length ? { failedKeys: [...failedKeys] } : {}), ...(unreachedAll.length ? { unreached: unreachedAll.slice(0, JOB_UNREACHED) } : {}),
+        },
       });
+      const dirtyOf = (s: (typeof shards)[number], scope: FactScope) => [...s.files.filter((p) => changedPaths.has(p) || asked.has(p)), ...removed.filter((p) => inScope(p, scope))];
+      // A shard still to run in this scan: not got through yet, and changed or holding another model's facts.
+      const toRun = (s: (typeof shards)[number]) => {
+        if (processed.has(s.key)) return askedAgain(s);
+        const scope = shardScope(s, shards);
+        return dirtyOf(s, scope).length > 0 || staleModel(scope);
+      };
+      /** After a shard: true when another scan waits for the slot and this one has more to run, so it gives way. */
+      const giveWay = async () => !!d.yieldTurn && !!d.facts.requeueScanJob && shards.some(toRun) && (await d.yieldTurn().catch(() => false));
+      // Gave way to another scan: back in the queue with its progress (saved after the shard), to go on from there.
+      const paused = async (): Promise<ScanResult> => {
+        // Kept for its next turn; the mirror is not (removed below with the rest of this turn).
+        if (head) d.plans!.keep(job.id, { head, repoPath: job.repoPath, listed, churn: signals.churn ?? new Map(), planned });
+        await d.facts.requeueScanJob!(job.id);
+        const remaining = shards.filter(toRun).length;
+        d.log?.('scan gave way to another scan', { project: job.projectKey, shardsDone: shards.filter((x) => processed.has(x.key)).length, shards: shards.length, remaining });
+        return { filesScanned: citedBefore + cited.size, factsAdded, failed: failedKeys.length, remaining, shards: coverage, paused: true };
+      };
       // Codex explores a filtered copy of the repo: made once for the whole scan (removed at its end), not per shard.
       const agentCwd = async () => (d.llm.mirror ? (mirror ??= await d.llm.mirror(job.repoPath)).dir : job.repoPath);
       for (const s of shards) {
+        if (processed.has(s.key) && !askedAgain(s)) continue;
         const scope = shardScope(s, shards);
         const ordered = [...s.files].sort((a, b) => rank.get(a)! - rank.get(b)!);
         const hot = ordered.filter((p) => asked.has(p) || hotOf(p) > 0);
         const shard: ShardTask = { key: s.key, roots: s.roots, scope, files: ordered.map((p) => byPath.get(p)!), hot };
-        const dirty = [...s.files.filter((p) => changedPaths.has(p) || asked.has(p)), ...removed.filter((p) => inScope(p, scope))];
+        const dirty = dirtyOf(s, scope);
         if (!dirty.length && !staleModel(scope)) {
           coverage.push({ shard: s.key, files: s.files.length, facts: 0, skipped: true });
+          processed.add(s.key);
           continue;
         }
         let raw: CodeFact[];
@@ -656,9 +772,12 @@ export async function runScan(job: ScanJob, d: ScanDeps): Promise<ScanResult> {
           if (timeout && timeoutsInRow >= MAX_TIMEOUTS_IN_ROW) throw new Error(`${MAX_TIMEOUTS_IN_ROW} shards in a row timed out (last: ${s.key}): ${timeout}`);
           // Not saved, so its hashes stay stale and the next scan tries it again; the other shards go on.
           failedShards.push({ key: s.key, err });
+          failedKeys.push(s.key);
+          processed.add(s.key);
           coverage.push({ shard: s.key, files: s.files.length, facts: 0, skipped: false, failed: redactSecrets(String(err)) });
           await note('facts_extracted', `could not extract facts from ${s.key}`, redactSecrets(String(err)), { shard: s.key }, [fileId(s.roots[0] || '.')]);
-          await progress(coverage);
+          await progress();
+          if (await giveWay()) return await paused();
           continue;
         }
         const { inside, outside } = inShard(raw, shard);
@@ -679,9 +798,11 @@ export async function runScan(job: ScanJob, d: ScanDeps): Promise<ScanResult> {
         await d.facts.replaceScopeFacts(job.projectKey, scope, await embedFacts(facts, d.embed), d.llm.id, shard.files.map((f) => ({ path: f.path, hash: f.hash, version: SCANNER_VERSION })), job.id);
         factsAdded += facts.length;
         coverage.push({ shard: s.key, files: s.files.length, facts: facts.length, skipped: false, ...(unreached.length ? { unreached } : {}) });
+        processed.add(s.key);
+        unreachedAll.push(...unreached);
         const readAsked = s.files.filter((p) => asked.has(p));
         if (readAsked.length) await d.facts.clearScanRequests?.(job.projectKey, readAsked);
-        await progress(coverage);
+        await progress();
         const droppedWhy = [
           dropped.length ? `${plural(dropped.length, 'fact')} dropped for citing a file that does not exist or an instruction file (AGENTS.md, CLAUDE.md)` : '',
           outside.length ? `${plural(outside.length, 'fact')} dropped for citing a file outside this shard` : '',
@@ -693,14 +814,17 @@ export async function runScan(job: ScanJob, d: ScanDeps): Promise<ScanResult> {
           { shard: s.key, facts: factLog(facts), ...(dropped.length || outside.length ? { dropped: factLog([...dropped, ...outside]) } : {}), changedFiles: dirty, ...(unreached.length ? { unreached } : {}) },
           [...new Set(facts.map((f) => fileId(f.path || '.')))]);
         d.log?.('scanned shard', { project: job.projectKey, shard: s.key, files: s.files.length, facts: facts.length, unreached: unreached.length });
+        if (await giveWay()) return await paused();
       }
-      scanned = cited.size;
-      failed.push(...failedShards.map((x) => x.key));
-      const rescanned = coverage.filter((c) => !c.skipped).length;
+      scanned = citedBefore + cited.size;
+      failed.push(...failedKeys);
+      totalShards = shards.length;
+      rescannedAll = rescannedNow();
       // Every shard that was tried failed: the run fails as a counted attempt, like a whole-repo scan that failed.
-      if (rescanned && failedShards.length === rescanned) {
-        const last = failedShards.at(-1)!;
-        throw rescanned === 1 ? last.err : new Error(`all ${rescanned} shards failed (last: ${last.key}): ${String(last.err)}`);
+      if (rescannedAll && failedKeys.length === rescannedAll) {
+        const last = failedShards.at(-1);
+        if (rescannedAll === 1 && last) throw last.err;
+        throw new Error(`all ${rescannedAll} shards failed (last: ${failedKeys.at(-1)}): ${last ? String(last.err) : 'see the earlier runs'}`);
       }
     } else {
       let done = 0;
@@ -747,9 +871,9 @@ export async function runScan(job: ScanJob, d: ScanDeps): Promise<ScanResult> {
       filesScanned: scanned, factsAdded, failed: failed.length, remaining: d.llm.agentic ? 0 : Math.max(0, changed.length - perRun),
       ...(coverage?.length ? { shards: coverage } : {}),
     };
-    const unreached = (coverage ?? []).flatMap((c) => c.unreached ?? []);
-    const shards = coverage?.length
-      ? { total: coverage.length, rescanned: coverage.filter((c) => !c.skipped).length, failed: failed.length, ...(unreached.length ? { unreached: unreached.slice(0, JOB_UNREACHED) } : {}) }
+    const unreached = unreachedAll;
+    const shards = totalShards
+      ? { total: totalShards, rescanned: rescannedAll, failed: failed.length, ...(unreached.length ? { unreached: unreached.slice(0, JOB_UNREACHED) } : {}) }
       : null;
     const unit = d.llm.agentic ? 'shard' : 'file';
     await d.facts.updateScanJob(job.id, {
@@ -771,7 +895,12 @@ export async function runScan(job: ScanJob, d: ScanDeps): Promise<ScanResult> {
       d.log?.('scan waiting for its model', { project: job.projectKey, retryAt: next.retryAt });
       throw err instanceof ProviderUnavailableError ? err : new ProviderUnavailableError(unavailable);
     }
-    // A real failure counts: retried after a backoff, failed for good after MAX_SCAN_ATTEMPTS.
+    // A real failure counts: retried after a backoff, failed for good after MAX_SCAN_ATTEMPTS. The retry starts the
+    // shards afresh (those saved are skipped by their hashes), so the ones that failed are tried again; the counts stay.
+    if (lastShards?.processed) {
+      const { processed: _p, failedKeys: _f, ...counts } = lastShards;
+      await d.facts.updateScanJob(job.id, { shards: counts });
+    }
     const error = redactSecrets(String(err));
     const next = await d.facts.recordScanFailure(job.id, error, { counted: true });
     await note('scan_finished', `scan failed (attempt ${next.attempts}); ${next.retryAt ? `retrying at ${next.retryAt}` : 'gave up, request a new scan to try again'}`,

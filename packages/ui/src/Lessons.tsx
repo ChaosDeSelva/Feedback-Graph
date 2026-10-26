@@ -4,7 +4,7 @@ import { hashFocus } from './links.ts';
 import type { FactKind, LessonCheck, LessonCheckName, LessonFrom } from '@fb/core';
 import { FACT_KINDS, LESSON_CHECKS, LESSON_FROM } from '@fb/core/types';
 import { EVERYDAY_FROM } from '@fb/core/relevance';
-import { api, type Activity, type Lesson, type LessonDetail, type LessonEdit, type LessonStatus } from './api.ts';
+import { api, type Activity, type Lesson, type LessonDetail, type LessonEdit, type LessonQuality, type LessonQualityReport, type LessonStatus } from './api.ts';
 import { afterDiscard, useUnsavedChanges } from './unsaved.ts';
 import { ConfirmDialog } from './ui/ConfirmDialog.tsx';
 import { PageHeader } from './ui/PageHeader.tsx';
@@ -14,6 +14,11 @@ import { Alert, Badge, Card, CauseBadge, causeLabel, causeTone, EmptyState, plur
 import { LessonIcon } from './ui/icons.tsx';
 
 const TABS: LessonStatus[] = ['proposed', 'approved', 'rejected', 'superseded'];
+
+/** The lesson check's generic flag (a rule naming nothing concrete), if it has one. */
+const genericOf = (l: Lesson) => l.checks?.find((c) => c.name === 'generic');
+/** Generic lessons last (the rest keep their order): the owner reaches the concrete ones first. */
+const genericLast = (ls: Lesson[]) => [...ls.filter((l) => !genericOf(l)), ...ls.filter((l) => genericOf(l))];
 
 type Draft = Pick<Lesson, 'title' | 'rule' | 'appliesWhen' | 'scope'>;
 
@@ -39,6 +44,12 @@ const CHECK_LABEL: Record<LessonCheckName, string> = {
   'self-review': 'self-review',
   'path-missing': 'path not in repo',
   'duplicate-of': 'duplicate',
+  'contradicts-evidence': 'cause contradicted',
+  'unlinked-ticket': 'another project\'s ticket',
+  generic: 'generic',
+  bundled: 'two lessons in one',
+  'ambiguous-path': 'ambiguous path',
+  'no-miss': 'no miss found',
 };
 /** Where a lesson came from, in words; the tooltip says it in full. `from` (where its feedback came from) first. */
 const SOURCE_LABEL: Record<string, [label: string, title: string]> = {
@@ -48,6 +59,7 @@ const SOURCE_LABEL: Record<string, [label: string, title: string]> = {
   postmortem: ['post-mortem', 'from a post-mortem'],
   memory: ['memory file', 'imported from a Claude Code memory file'],
   manual: ['by you', 'written by you'],
+  demo: ['demo', 'a demo lesson from fg demo seed; fg demo remove takes it back'],
 };
 function SourceLabel({ source }: { source: string }) {
   const [label, title] = SOURCE_LABEL[source] ?? [source, source];
@@ -214,7 +226,44 @@ function AgentDecided({ lesson }: { lesson: Pick<Lesson, 'status' | 'decidedBy'>
   );
 }
 
+const percent = (n: number, of: number) => `${of ? Math.round((100 * n) / of) : 0}%`;
+const share = (n: number, of: number) => `${n} (${percent(n, of)})`;
+const said = (n: number, what: string, of: number) => `${n} ${what} (${percent(n, of)})`;
+
+/**
+ * How you judged the lessons the post-mortem wrote: approved as written, approved after your edit, rejected. The
+ * post-mortem learns from the last two (they are shown to it as examples), so this is the number to watch go up.
+ * Nothing when none were decided in 90 days or the server cannot tell.
+ */
+function Judged({ report }: { report: LessonQualityReport | null }) {
+  const [last30, last90] = report?.windows ?? [];
+  if (!last30 || !last90?.decided) return null;
+  const projects = Object.entries(report!.projects ?? {}).sort(([a], [b]) => a.localeCompare(b));
+  const cells = (q: LessonQuality | undefined) =>
+    q ? [String(q.decided), share(q.asWritten, q.decided), share(q.edited, q.decided), share(q.rejected, q.decided)] : ['', '', '', ''];
+  return (
+    <details aria-label="how your lessons were judged" className="text-xs text-muted">
+      <summary className="cursor-pointer tabular-nums" title="Of the post-mortem's lessons you decided. The ones you edited or rejected are shown to the post-mortem as examples.">
+        {last30.decided
+          ? <>Last 30 days: {last30.decided} decided · {said(last30.asWritten, 'as written', last30.decided)} · {said(last30.edited, 'after your edit', last30.decided)} · {said(last30.rejected, 'rejected', last30.decided)}</>
+          : <>Last 30 days: none decided ({last90.decided} in 90 days)</>}
+        {report!.capped && ' (capped)'}
+      </summary>
+      <table className={`${tableClass} mt-2 tabular-nums`}>
+        <thead><tr>{['project', 'days', 'decided', 'as written', 'after edit', 'rejected'].map((h) => <th key={h} className={tdClass}>{h}</th>)}</tr></thead>
+        <tbody>
+          {[['all', report!.windows] as const, ...projects].flatMap(([k, ws]) => ws.map((q) => (
+            <tr key={`${k}-${q.days}`}>{[k, `${q.days} days`, ...cells(q)].map((c, i) => <td key={i} className={tdClass}>{c}</td>)}</tr>
+          )))}
+        </tbody>
+      </table>
+    </details>
+  );
+}
+
 export function Lessons() {
+  const [judged, setJudged] = useState<LessonQualityReport | null>(null);
+  useEffect(() => { api.lessonQuality().then(setJudged, () => setJudged(null)); }, []);
   const [status, setStatus] = useState<LessonStatus>('proposed');
   // Filters the server applies: where the feedback came from, and one check flag.
   const [source, setSource] = useState<LessonFrom | ''>('');
@@ -227,6 +276,9 @@ export function Lessons() {
   const [detail, setDetail] = useState<LessonDetail | null>(null);
   const [draft, setDraft] = useState<Draft | null>(null);
   const [history, setHistory] = useState<Activity[]>([]);
+  // Narrowing a global lesson: the project it will serve (it has none to go back to), and the projects to choose from.
+  const [narrowTo, setNarrowTo] = useState('');
+  const [projectKeys, setProjectKeys] = useState<string[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loaded, setLoaded] = useState(false);
   // On a phone the list and the lesson take turns; this is true while the lesson is showing.
@@ -247,8 +299,9 @@ export function Lessons() {
     let stale = false;
     api.lessons(status, { ...(flag && { flag }), ...(source && { source }) }).then((l) => {
       if (stale) return;
-      const at = focus ? l.findIndex((x) => x.id === focus) : -1;
-      setItems(l);
+      const sorted = genericLast(l);
+      const at = focus ? sorted.findIndex((x) => x.id === focus) : -1;
+      setItems(sorted);
       setSelected(Math.max(0, at));
       setOpen(at >= 0);
       setLoaded(true);
@@ -262,6 +315,7 @@ export function Lessons() {
     setDraft(null);
     setHistory([]);
     setError(null);
+    setNarrowTo('');
     if (!current) return;
     // Answers for a lesson you have moved past are dropped, so you never approve one while reading another.
     let stale = false;
@@ -278,6 +332,26 @@ export function Lessons() {
   const edited = !!detail && !!draft && detail.lesson.id === current?.id &&
     (['title', 'rule', 'appliesWhen', 'scope'] as const).some((k) => draft[k] !== detail.lesson[k]);
   useUnsavedChanges(edited, 'Your edits to this lesson are not saved.');
+  const narrowing = !!detail && !!draft && detail.lesson.scope === 'global' && draft.scope !== 'global';
+  useEffect(() => {
+    if (narrowing && projectKeys === null) api.projects().then((ps) => setProjectKeys(ps.map((p) => p.key)), () => setProjectKeys([]));
+  }, [narrowing, projectKeys]);
+  /** The edited fields of the draft, with the project a narrowed global lesson serves; null (and why) when it has none. */
+  function edits(): LessonEdit | null {
+    if (!detail || !draft) return null;
+    const patch: LessonEdit = {};
+    for (const k of ['title', 'rule', 'appliesWhen', 'scope'] as const) {
+      if (draft[k] !== detail.lesson[k]) (patch as Record<string, unknown>)[k] = draft[k];
+    }
+    if (narrowing) {
+      if (!narrowTo) {
+        setError('Choose the project this lesson will serve: as a global lesson it has none to go back to.');
+        return null;
+      }
+      patch.projectKey = narrowTo;
+    }
+    return patch;
+  }
   const [revoking, setRevoking] = useState(false);
   const [converting, setConverting] = useState(false);
   useEffect(() => { setRevoking(false); setConverting(false); }, [current?.id]);
@@ -294,11 +368,9 @@ export function Lessons() {
   const [saving, setSaving] = useState(false);
   async function save() {
     if (!current || !detail || !draft || detail.lesson.id !== current.id) return;
-    const patch: LessonEdit = {};
-    for (const k of ['title', 'rule', 'appliesWhen', 'scope'] as const) {
-      if (draft[k] !== detail.lesson[k]) (patch as Record<string, unknown>)[k] = draft[k];
-    }
     setError(null);
+    const patch = edits();
+    if (!patch) return;
     setSaving(true);
     try {
       await api.updateLesson(current.id, patch);
@@ -334,13 +406,13 @@ export function Lessons() {
 
   async function decide(next: 'approved' | 'rejected' | 'proposed') {
     if (!current || !detail || !draft || detail.lesson.id !== current.id) return;
-    const patch: LessonEdit = { status: next };
-    if (next === 'approved') {
-      for (const k of ['title', 'rule', 'appliesWhen', 'scope'] as const) {
-        if (draft[k] !== detail.lesson[k]) (patch as Record<string, unknown>)[k] = draft[k];
-      }
-    }
     setError(null);
+    let patch: LessonEdit = { status: next };
+    if (next === 'approved') {
+      const changed = edits();
+      if (!changed) return;
+      patch = { ...patch, ...changed };
+    }
     try {
       await api.updateLesson(current.id, patch);
       setItems((xs) => xs.filter((x) => x.id !== current.id));
@@ -352,7 +424,7 @@ export function Lessons() {
 
   return (
     <div className="flex h-full min-h-0 flex-col">
-      <PageHeader title="Lessons" description="Rules drawn from confirmed misses. Agents only ever see the ones you approve." />
+      <PageHeader title="Lessons" description="Rules drawn from confirmed misses. Agents only ever see the ones you approve." actions={<Judged report={judged} />} />
       <SplitPane
         listLabel="lessons"
         listWidth="24rem"
@@ -428,6 +500,7 @@ export function Lessons() {
                     </div>
                     <div className="mt-0.5 line-clamp-2 text-[13px] leading-snug">{l.title}</div>
                     {!!l.checks?.length && <div className="mt-1"><CheckChips checks={l.checks} max={3} /></div>}
+                    {genericOf(l) && <div className="mt-1 text-xs text-muted">{genericOf(l)!.why}</div>}
                     {l.decidedBy?.startsWith('operator') && l.status !== 'proposed' && <div className="mt-1"><AgentDecided lesson={l} /></div>}
                     {l.decisionNote && l.status !== 'proposed' && <div className="mt-1 text-xs text-muted">{l.decisionNote}</div>}
                   </ListRow>
@@ -558,7 +631,13 @@ export function Lessons() {
                       <option value="project">project</option>
                       <option value="global">global</option>
                     </Select>
-                    <span className="text-xs text-muted">prefer the narrowest scope the evidence supports</span>
+                    {narrowing && (
+                      <Select aria-label="project" size="sm" value={narrowTo} onChange={(e) => setNarrowTo(e.target.value)}>
+                        <option value="">choose a project…</option>
+                        {(projectKeys ?? []).map((k) => <option key={k} value={k}>{k}</option>)}
+                      </Select>
+                    )}
+                    <span className="text-xs text-muted">{narrowing ? 'a global lesson has no project of its own: choose the one it serves' : 'prefer the narrowest scope the evidence supports'}</span>
                   </div>
                   <div className="grid gap-1">
                     <span className="text-xs font-medium text-muted">Paths (agents get it when they edit these)</span>

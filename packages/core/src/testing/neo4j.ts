@@ -1,7 +1,7 @@
 import { GraphRepo } from '../graph/repo.ts';
 import { neo4jStore } from '../graph/neo4j-store.ts';
 import type { Store } from '../store.ts';
-import type { EmbeddedSeed, PreDoneCheckRow, ProbeKind, StoreProbe } from './probe.ts';
+import type { EmbeddedSeed, PreDoneCheckRow, ProbeKind, StaleTextSeed, StoreProbe } from './probe.ts';
 
 const IDENTITY: Partial<Record<ProbeKind, string>> = { Project: 'key', Cause: 'key', SyncCursor: 'key', Turn: 'uuid', Commit: 'sha' };
 const label = (kind: ProbeKind) => `\`${kind}\``;
@@ -71,7 +71,7 @@ export class Neo4jProbe implements StoreProbe {
     );
     return rows.map((r) => {
       const x = r.get('x').properties;
-      return { projectKey: x.projectKey, task: x.task, checked: x.checked, gaps: x.gaps, lessons: r.get('lessons') };
+      return { projectKey: x.projectKey, task: x.task, checked: x.checked, gaps: x.gaps, lessons: r.get('lessons'), ...(x.sessionId ? { sessionId: x.sessionId } : {}) };
     });
   }
 
@@ -103,6 +103,36 @@ export class Neo4jProbe implements StoreProbe {
   async seedEmbedded(row: EmbeddedSeed) {
     const { kind, ...props } = row;
     await this.g.run(`CREATE (n:${label(kind)}) SET n = $props`, { props });
+  }
+
+  async seedOwnerMark(lessonId: string) {
+    await this.g.run('MATCH (l:Lesson {id: $id}) SET l.decidedByYou = true', { id: lessonId });
+  }
+
+  async seedStaleText(row: StaleTextSeed) {
+    const now = new Date().toISOString();
+    switch (row.kind) {
+      case 'InboxItem':
+        await this.g.run(
+          `CREATE (s:Session {id: $id, projectKey: '__probe__'})
+           CREATE (t:Turn {uuid: $id, sessionId: $id, index: 1, ts: $now, text: $r.text, precedingAssistantText: $r.context, summary: $r.summary})
+           CREATE (s)-[:HAS_TURN]->(t)
+           CREATE (k:Candidate {id: $id, status: 'pending', projectKey: '__probe__', createdAt: $now, note: $r.note, agentReport: $report})-[:FLAGS]->(t)
+           CREATE (:Feedback {id: $id, status: 'open', projectKey: '__probe__', createdAt: $now, text: $r.feedbackText})
+           CREATE (:Miss {id: 'miss:' + $id, projectKey: '__probe__', missed: $r.missed, causeExplanation: $r.causeExplanation})`,
+          { id: row.id, now, r: row, report: row.agentReport ? JSON.stringify(row.agentReport) : null },
+        );
+        return;
+      case 'Session':
+        await this.g.run('CREATE (:Session {id: $id, projectKey: $p, summaryJson: $summary, finalReplyText: $reply})', { id: row.id, p: '__probe__', summary: JSON.stringify(row.summary), reply: row.finalReply });
+        return;
+      case 'Activity':
+        await this.g.run(
+          `CREATE (:Activity {id: $id, ts: $now, order: 0.0, kind: 'doc_added', actor: 'probe', projectKey: null, subject: $subject, why: $why, details: $details, targets: []})`,
+          { id: row.id, now, subject: row.subject, why: row.why, details: JSON.stringify(row.details) },
+        );
+        return;
+    }
   }
 }
 

@@ -1,7 +1,7 @@
 import { expect, test } from 'vitest';
 import { OPERATOR_VERBS, type ActivityInput } from '@fb/core';
 import { createApp, type ApiRepo } from './app.ts';
-import { parse, run, type CliIO } from './cli.ts';
+import { helpFor, parse, run, type CliIO } from './cli.ts';
 
 const OP = 'o'.repeat(32);
 
@@ -296,6 +296,22 @@ test('map rebuild asks for a fresh code map of one project; a project with no ma
   expect(await run(['map', 'show', 'acme'], f.io)).toBe(2);
 });
 
+test('demo seed and remove post to the demo routes and print what they say; --project passes through', async () => {
+  const f = fake({
+    'POST /api/demo/seed': (b) => ({ json: { project: (b as { project?: string }).project ?? 'demo-shop', lessons: 4, misses: 1, facts: 3, message: 'Seeded the demo corpus into demo-shop.\nThese lessons are approved by you running fg demo seed.' } }),
+    'POST /api/demo/remove': () => ({ json: { project: 'demo-shop', lessons: 4, misses: 1, facts: 3, message: 'Removed 4 demo lessons, 1 miss and 3 facts from demo-shop.' } }),
+  });
+  expect(await run(['demo', 'seed'], f.io)).toBe(0);
+  expect(f.calls[0]).toMatchObject({ method: 'POST', body: {} });
+  expect(f.text()).toMatch(/approved by you running fg demo seed/);
+  expect(await run(['demo', 'seed', '--project', 'acme'], f.io)).toBe(0);
+  expect(f.calls[1]).toMatchObject({ body: { project: 'acme' } });
+  expect(await run(['demo', 'remove'], f.io)).toBe(0);
+  expect(f.text()).toMatch(/Removed 4 demo lessons/);
+  expect(await run(['demo', 'show'], f.io)).toBe(2);
+  expect(helpFor('demo')).toMatch(/fg demo seed/);
+});
+
 test('an unreachable server says where it looked and how to point elsewhere', async () => {
   const f = fake({});
   f.io.fetch = (async () => { throw new TypeError('fetch failed'); }) as typeof fetch;
@@ -357,6 +373,36 @@ test('status prints the stage and since when, the pipeline backlog, the last Syn
   expect(t).toMatch(/pipeline\s+classify 12 · inbox 4 pending · postmortems 0 · lessons 2 proposed · scans 1 running, 2 queued/);
   expect(t).toMatch(/UNAVAILABLE since 2026-10-25 03:00:00: Ollama is not reachable/);
   expect(t).toMatch(/sync now\s+2026-10-25 03:43:00 ok: sent 2 projects, 68 unchanged/);
+});
+
+test('status prints every queue: how many wait, the oldest wait, what runs now and for how long, and each scan by project', async () => {
+  const ago = (min: number) => new Date(Date.now() - min * 60_000).toISOString();
+  const queues = {
+    scans: {
+      waiting: 2, oldestAt: ago(125), running: [{ what: 'big', since: ago(14), shards: { done: 11, total: 40 } }],
+      projects: [
+        { project: 'big', status: 'running', since: ago(14), shards: { done: 11, total: 40 } },
+        { project: 'shop', status: 'queued', since: ago(125), shards: null },
+        { project: 'web', status: 'queued', since: ago(5), shards: { done: 3, total: 8 } },
+      ],
+    },
+    classify: { waiting: 120, capped: true, oldestAt: ago(190), running: [] },
+    postmortems: { waiting: 2, oldestAt: ago(10), running: [{ what: 'fb-1', since: ago(3) }] },
+    chats: { waiting: 0, oldestAt: null, running: [] },
+  };
+  const f = fake({ 'GET /api/status': () => ({ json: idle }), 'GET /api/pipeline': () => pipeline({ queues }) });
+  expect(await run(['status'], f.io)).toBe(0);
+  const t = f.text();
+  expect(t).toMatch(/queue\s+scans: 2 waiting, oldest 2 h; running shard 12\/40 of big for 14 min/);
+  expect(t).toMatch(/\s+shop\s+queued 2 h\n/);
+  expect(t).toMatch(/\s+web\s+queued 5 min, 3 of 8 shards done/);
+  expect(t).toMatch(/queue\s+classify: 120\+ waiting, oldest at least 3 h/);
+  expect(t).toMatch(/queue\s+post-mortems: 2 waiting, oldest 10 min; running fb-1 for 3 min/);
+  expect(t).toMatch(/queue\s+Ask answers: none waiting/);
+  // An older API without queues prints none of it.
+  const old = fake({ 'GET /api/status': () => ({ json: idle }), 'GET /api/pipeline': () => pipeline() });
+  await run(['status'], old.io);
+  expect(old.text()).not.toMatch(/^queue/m);
 });
 
 test('status says how many files an older scanner read, and that a scan you start refreshes them', async () => {
@@ -454,12 +500,18 @@ test('facts list and relevance', async () => {
 test('docs list and upload a text file or an image', async () => {
   const files: Record<string, Buffer> = { '/tmp/notes.md': Buffer.from('tenants are isolated'), '/tmp/shot.png': Buffer.from([137, 80, 78, 71]) };
   const f = fake({
-    'GET /api/projects/acme/docs': () => ({ json: [{ id: 'doc:acme:upload:notes.md', title: 'Notes', ref: 'notes.md', source: 'upload', kind: 'text', addedAt: '2026-10-25T03:00:00Z', addedBy: 'operator:codex', read: { status: 'done', facts: 2 } }] }),
+    'GET /api/projects/acme/docs?limit=500': () => ({ json: [{ id: 'doc:acme:upload:notes.md', title: 'Notes', ref: 'notes.md', source: 'upload', kind: 'text', addedAt: '2026-10-25T03:00:00Z', addedBy: 'operator:codex', read: { status: 'done', facts: 2 } }] }),
     'POST /api/projects/acme/docs': () => ({ status: 201, json: { id: 'doc:acme:upload:notes.md', chunks: 1 } }),
   });
   f.io.readFile = async (path: string) => { if (!files[path]) throw new Error('ENOENT'); return files[path]; };
   expect(await run(['docs', 'list', '--project', 'acme'], f.io)).toBe(0);
   expect(f.text()).toMatch(/notes\.md\s+text\s+done \(2 facts\)\s+operator:codex/);
+  expect(f.text()).not.toMatch(/newest/);
+  // a full page says the list goes on
+  const doc = (i: number) => ({ id: `doc:acme:github:${i}`, title: `PR ${i}`, ref: `github:acme/shop#${i}`, source: 'github', kind: 'text', addedAt: '2026-10-25T03:00:00Z', addedBy: null, read: null });
+  const full = fake({ 'GET /api/projects/acme/docs?limit=500': () => ({ json: Array.from({ length: 500 }, (_, i) => doc(i)) }) });
+  expect(await run(['docs', 'list', '--project', 'acme'], full.io)).toBe(0);
+  expect(full.text()).toMatch(/the newest 500 documents are shown: older ones are on the project's Docs page/);
   expect(await run(['docs', 'upload', '/tmp/notes.md', '--project', 'acme', '--title', 'Notes'], f.io)).toBe(0);
   expect(f.calls.at(-1)!.body).toEqual({ title: 'Notes', name: 'notes.md', text: 'tenants are isolated' });
   expect(await run(['docs', 'upload', '/tmp/shot.png', '--project', 'acme'], f.io)).toBe(0);
@@ -686,4 +738,105 @@ test('status --until idle does not wait for the GitHub and Linear sync: nothing 
   // Work still queued during the sync is not idle.
   const busy = fake({ 'GET /api/status': () => ({ json: { ...idle, stage: { name: 'sync', startedAt: 't', current: null } } }), 'GET /api/pipeline': () => pipeline({ postmortems: { queued: 2 } }) });
   expect(await run(['status', '--until', 'idle', '--timeout', '6', '--interval', '5'], busy.io)).toBe(1);
+});
+
+// ── Runs: a tester labels what it does, sandboxes it, and cleans up after it ──
+
+const plan = (o: object = {}) => ({
+  run: 'run-1', dryRun: true, sandbox: true, entries: 4,
+  remove: { feedback: 2, lesson: 1, miss: 1, predone_check: 0, fact: 0, doc: 1, link: 0, chat: 0 },
+  kept: [{ kind: 'feedback', id: 'manual:b', why: 'you touched it outside the run (approved lesson "B", t)' }],
+  changed: [{ kind: 'feedback_decided', subject: 'confirmed: "x"', targets: ['c-owner'], ts: 't' }],
+  ...o,
+});
+
+test('--run and --sandbox (or FG_RUN and FG_SANDBOX) label every request fg makes', async () => {
+  const f = fake({ 'GET /api/pipeline': () => pipeline() });
+  expect(await run(['pipeline', '--run', 'run-1', '--sandbox'], f.io)).toBe(0);
+  expect(f.calls[0].headers).toMatchObject({ 'x-fg-run': 'run-1', 'x-fg-sandbox': '1' });
+  const e = fake({ 'GET /api/pipeline': () => pipeline() }, { FG_OPERATOR_TOKEN: OP, FG_RUN: 'run-2', FG_SANDBOX: '1' });
+  expect(await run(['pipeline'], e.io)).toBe(0);
+  expect(e.calls[0].headers).toMatchObject({ 'x-fg-run': 'run-2', 'x-fg-sandbox': '1' });
+  const none = fake({ 'GET /api/pipeline': () => pipeline() });
+  await run(['pipeline'], none.io);
+  expect(none.calls[0].headers['x-fg-run']).toBeUndefined();
+  expect(await run(['pipeline', '--sandbox'], fake({}).io)).toBe(2);
+});
+
+test('fg cleanup --run: a dry run by default (counts per kind, what stays and why, what it changed that is not its own); --apply removes', async () => {
+  const f = fake({ 'DELETE /api/runs/run-1': (b) => ({ json: (b as { dryRun: boolean }).dryRun ? plan() : plan({ dryRun: false, removed: plan().remove }) }) });
+  expect(await run(['cleanup', '--run', 'run-1'], f.io)).toBe(0);
+  expect(f.calls[0]).toMatchObject({ method: 'DELETE', body: { dryRun: true } });
+  expect(f.text()).toMatch(/dry run/i);
+  expect(f.text()).toMatch(/feedback\s+2/);
+  expect(f.text()).toMatch(/manual:b.*approved lesson "B"/);
+  expect(f.text()).toMatch(/c-owner/);
+  expect(f.text()).toMatch(/--apply/);
+  const g = fake({ 'DELETE /api/runs/run-1': () => ({ json: plan({ dryRun: false, removed: plan().remove }) }) });
+  expect(await run(['cleanup', '--run', 'run-1', '--apply'], g.io)).toBe(0);
+  expect(g.calls[0].body).toEqual({ dryRun: false });
+  expect(g.text()).toMatch(/removed/i);
+  expect(await run(['cleanup', '--run', 'run-1', '--dry-run'], fake({ 'DELETE /api/runs/run-1': () => ({ json: plan() }) }).io)).toBe(0);
+  expect(await run(['cleanup'], fake({}).io)).toBe(2);
+  expect(await run(['cleanup', '--run', 'run-1', '--apply', '--dry-run'], fake({}).io)).toBe(2);
+});
+
+test('fg cleanup, activity and evidence never label their requests with a run: --run names what to clean or list, and FG_RUN is not sent', async () => {
+  const env = { FG_OPERATOR_TOKEN: OP, FG_RUN: 'run-2', FG_SANDBOX: '1' };
+  const f = fake({ 'DELETE /api/runs/run-1': () => ({ json: plan() }) }, env);
+  expect(await run(['cleanup', '--run', 'run-1', '--sandbox'], f.io)).toBe(0);
+  const g = fake({ 'GET /api/activity': () => ({ json: [] }) }, env);
+  expect(await run(['activity', '--run', 'run-1'], g.io)).toBe(0);
+  const h = fake({ 'GET /api/sessions/s1/evidence': () => ({ json: { session: { id: 's1', projectKey: 'demo', source: 'claude', state: 'idle' }, turns: { count: 0, classified: 0, waiting: 0, givenUp: 0 }, flags: [], inbox: [], served: [] } }) }, env);
+  expect(await run(['evidence', 's1'], h.io)).toBe(0);
+  for (const c of [...f.calls, ...g.calls, ...h.calls]) {
+    expect(c.headers['x-fg-run']).toBeUndefined();
+    expect(c.headers['x-fg-sandbox']).toBeUndefined();
+  }
+});
+
+test('fg activity --run lists one run; fg evidence <session> shows what the tool saw and decided', async () => {
+  const f = fake({ 'GET /api/activity': () => ({ json: [{ ts: '2026-10-25T10:00:00Z', actor: 'agent (MCP)', kind: 'context_served', projectKey: 'demo', subject: 'context', run: 'run-1' }] }) });
+  expect(await run(['activity', '--run', 'run-1'], f.io)).toBe(0);
+  expect(new URL(f.calls[0].url).searchParams.get('run')).toBe('run-1');
+  expect(f.text()).toMatch(/run-1/);
+  const evidence = {
+    session: { id: 's1', projectKey: 'demo', source: 'claude', state: 'idle' },
+    turns: { count: 4, first: '2026-10-25T09:00:00Z', last: '2026-10-25T09:03:00Z', classified: 2, waiting: 0, givenUp: 1, prunedText: 0 },
+    files: { edited: ['src/total.ts'], readOnly: [] },
+    flags: [{ index: 1, label: 'neutral', confidence: 0.8, flagged: false, skipped: ['git-instruction'], why: 'an instruction' }, { index: 2, label: 'pushback', confidence: 0.9, flagged: true, skipped: [], why: 'keep cents', candidateId: 's1-t2' }],
+    inbox: [{ id: 's1-t2', status: 'confirmed', decidedBy: 'you', lesson: { id: 'lesson:s1-t2', status: 'proposed' }, miss: null }],
+    served: [{ ts: 't', kind: 'context_served', subject: 'context for "x"' }],
+  };
+  const e = fake({ 'GET /api/sessions/s1/evidence': () => ({ json: evidence }) });
+  expect(await run(['evidence', 's1'], e.io)).toBe(0);
+  expect(e.text()).toMatch(/4 turns/);
+  expect(e.text()).toMatch(/git-instruction/);
+  expect(e.text()).toMatch(/s1-t2.*confirmed.*lesson:s1-t2/);
+  expect(await run(['evidence'], fake({}).io)).toBe(2);
+});
+
+const quality = (days: number, asWritten: number, edited: number, rejected: number) => ({ days, asWritten, edited, rejected, decided: asWritten + edited + rejected });
+
+test('lessons quality: of the decided lessons, approved as written / after an edit / rejected, in all and by project', async () => {
+  const f = fake({
+    'GET /api/lessons/quality': () => ({ json: { windows: [quality(30, 21, 60, 62), quality(90, 30, 70, 80)], projects: { acme: [quality(30, 21, 60, 62), quality(90, 30, 70, 80)] } } }),
+    'GET /api/lessons/quality?project=acme': () => ({ json: { windows: [quality(30, 1, 0, 0), quality(90, 1, 0, 0)], projects: {} } }),
+  });
+  expect(await run(['lessons', 'quality'], f.io)).toBe(0);
+  const t = f.text();
+  expect(t).toMatch(/PROJECT\s+DAYS\s+DECIDED\s+AS WRITTEN\s+AFTER EDIT\s+REJECTED/);
+  expect(t).toMatch(/all\s+30\s+143\s+21 \(15%\)\s+60 \(42%\)\s+62 \(43%\)/);
+  expect(t).toMatch(/acme\s+90\s+180\s+30 \(17%\)/);
+  expect(await run(['lessons', 'quality', '--project', 'acme'], f.io)).toBe(0);
+  expect(f.calls.at(-1)?.url).toMatch(/\?project=acme$/);
+});
+
+test('status says how the lessons were judged in the last 30 days, when the server can tell', async () => {
+  const f = fake({ 'GET /api/status': () => ({ json: idle }), 'GET /api/pipeline': () => pipeline({ lessons: { proposed: 2, approved: 0, quality: [quality(30, 21, 60, 62), quality(90, 30, 70, 80)] } }) });
+  expect(await run(['status'], f.io)).toBe(0);
+  expect(f.text()).toMatch(/lessons\s+last 30 d: 143 decided: 21 approved as written \(15%\), 60 after an edit \(42%\), 62 rejected \(43%\)/);
+  const none = fake({ 'GET /api/status': () => ({ json: idle }), 'GET /api/pipeline': () => pipeline() });
+  expect(await run(['status'], none.io)).toBe(0);
+  expect(none.text()).not.toMatch(/approved as written/);
 });

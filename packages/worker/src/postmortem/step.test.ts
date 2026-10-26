@@ -1,6 +1,6 @@
-import type { ActivityInput, PostMortem, PostMortemInput } from '@fb/core';
+import type { ActivityInput, Lesson, LessonDetail, PostMortem, PostMortemInput } from '@fb/core';
 import { expect, test } from 'vitest';
-import { runPostmortems, embedTexts } from './step.ts';
+import { runPostmortems, embedTexts, providerAnswers, UNAVAILABLE_CAP } from './step.ts';
 import type { PostMortemTrace } from './postmortem.ts';
 
 const input = (id: string) => ({ feedbackId: id }) as PostMortemInput;
@@ -23,6 +23,29 @@ test('saves each post-mortem with miss and lesson embeddings', async () => {
   expect(id).toBe('a');
   expect(emb.miss).toEqual([embedTexts(pm).miss.length]);
   expect(emb.lesson).toEqual([embedTexts(pm).lesson.length]);
+});
+
+test('a dropped lesson: only the miss is embedded, no duplicate check runs, and Activity says why there is no lesson', async () => {
+  const embedded: string[][] = [];
+  const activity: ActivityInput[] = [];
+  let similar = 0;
+  await runPostmortems({
+    k: {
+      feedbackNeedingPostmortem: async () => [input('a')],
+      savePostmortem: async () => {},
+      recordPostmortemFailure: async () => ({ attempts: 1, retryAt: null }),
+      similarLessons: async () => { similar++; return []; },
+      setLessonChecks: async () => true,
+    },
+    postmortem: async () => ({ ...pm, lessonDropped: 'lesson.rule holds the scope word "project"' }),
+    embed: async (texts) => { embedded.push(texts); return texts.map(() => [1]); },
+    batch: 1,
+    activity: { record: async (a) => void activity.push(a) },
+  });
+  expect(embedded).toEqual([[embedTexts(pm).miss]]);
+  expect(similar).toBe(0);
+  expect(activity[0].details).toMatchObject({ lesson: null, lessonDropped: 'lesson.rule holds the scope word "project"' });
+  expect(activity[0].targets).toEqual(['a', 'miss:a']);
 });
 
 test('a failure is recorded and does not stop the batch', async () => {
@@ -188,6 +211,125 @@ test('a failed post-mortem is logged with when it will be retried, or that it ga
   expect(activity[1].subject).toBe('post-mortem failed (attempt 5); gave up, retry it from the API');
 });
 
+test('one feedback that is "unavailable" cycle after cycle is charged after a few, so it cannot stall the queue forever', async () => {
+  const failures: string[] = [];
+  const asked: string[] = [];
+  // The same item heads the queue every cycle and its run is classified unavailable each time.
+  const streak = { feedbackId: null as string | null, count: 0 };
+  const run = (head = 'stuck') => runPostmortems({
+    k: {
+      feedbackNeedingPostmortem: async () => [input(head), input('next')],
+      savePostmortem: async () => {},
+      recordPostmortemFailure: async (id, err) => { failures.push(`${id}:${err}`); return { attempts: 1, retryAt: '2026-10-25T12:00:00Z' }; },
+    },
+    postmortem: async (i) => { asked.push(i.feedbackId); if (i.feedbackId !== 'next') throw new Error('claude exit 1: Invalid API key · Please run /login'); return pm; },
+    embed: async (texts) => texts.map(() => [1]),
+    batch: 3,
+    unavailableStreak: streak,
+    unavailableCap: 3,
+    // Other asks of the same provider are answered: it is this item, not the provider.
+    providerHealthy: async () => true,
+  });
+  expect((await run()).unavailable).toMatch(/not signed in/);
+  expect((await run()).unavailable).toMatch(/not signed in/);
+  expect(failures).toEqual([]);
+  const third = await run();
+  // The third time in a row it is recorded as this item's failure (attempts, backoff) and the batch goes on.
+  expect(third).toEqual({ done: 1, failed: 1 });
+  expect(failures).toEqual([expect.stringMatching(/^stuck:.*unavailable 3 times in a row on this feedback.*not signed in/)]);
+  expect(asked.slice(-2)).toEqual(['stuck', 'next']);
+  expect(streak.count).toBe(0);
+  // A different item heading the queue starts its own count.
+  await run();
+  await run('other');
+  expect(streak).toEqual({ feedbackId: 'other', count: 1 });
+});
+
+// A two-hour outage at one cycle every 30 seconds, ten items queued: the head item reads "unavailable" every cycle.
+test('a provider-wide outage charges nothing: two hours down with ten queued items, none is charged or given up on', async () => {
+  const failures: string[] = [];
+  const streak = { feedbackId: null as string | null, count: 0 };
+  const queue = Array.from({ length: 10 }, (_, i) => input(`f${i}`));
+  const down = Object.assign(new TypeError('fetch failed'), { cause: { code: 'ECONNREFUSED' } });
+  let probes = 0;
+  for (let cycle = 0; cycle < 240; cycle++) {
+    const r = await runPostmortems({
+      k: {
+        feedbackNeedingPostmortem: async () => queue,
+        savePostmortem: async () => {},
+        recordPostmortemFailure: async (id) => { failures.push(id); return { attempts: 1, retryAt: null }; },
+      },
+      postmortem: async () => { throw down; },
+      embed: async (texts) => texts.map(() => [1]),
+      batch: 1,
+      unavailableStreak: streak,
+      // The provider does not answer a health ask either: it is down, not this item.
+      providerHealthy: async () => { probes++; return false; },
+    });
+    expect(r.unavailable).toMatch(/ECONNREFUSED/);
+  }
+  expect(failures).toEqual([]);
+  expect(streak.count).toBe(0);
+  expect(probes).toBe(240);
+});
+
+test('"busy with a scan" never counts toward the cap, and the health ask is not even made', async () => {
+  const failures: string[] = [];
+  const streak = { feedbackId: null as string | null, count: 0 };
+  let probes = 0;
+  for (let cycle = 0; cycle < UNAVAILABLE_CAP * 4; cycle++) {
+    await runPostmortems({
+      k: {
+        feedbackNeedingPostmortem: async () => [input('a'), input('b')],
+        savePostmortem: async () => {},
+        recordPostmortemFailure: async (id) => { failures.push(id); return { attempts: 1, retryAt: null }; },
+      },
+      postmortem: async () => { throw new DOMException('The operation was aborted due to timeout', 'TimeoutError'); },
+      embed: async (texts) => texts.map(() => [1]),
+      batch: 1,
+      modelBusy: () => true,
+      unavailableStreak: streak,
+      providerHealthy: async () => { probes++; return true; },
+    });
+  }
+  expect(failures).toEqual([]);
+  expect(probes).toBe(0);
+});
+
+test('one poisoned item while the provider answers everything else is charged once after the cap, then the queue moves', async () => {
+  const failures: string[] = [];
+  const streak = { feedbackId: null as string | null, count: 0 };
+  const results: { done: number; failed: number; unavailable?: string }[] = [];
+  // An outage in the middle: those cycles neither count nor reset the item's streak.
+  const healthy = [true, true, false, false, true, true, true];
+  for (const ok of healthy) {
+    results.push(await runPostmortems({
+      k: {
+        feedbackNeedingPostmortem: async () => (failures.length ? [input('next')] : [input('poisoned'), input('next')]),
+        savePostmortem: async () => {},
+        recordPostmortemFailure: async (id) => { failures.push(id); return { attempts: 1, retryAt: '2026-10-25T12:05:00Z' }; },
+      },
+      postmortem: async (i) => { if (i.feedbackId === 'poisoned') throw new Error('ollama:gemma 500: llama runner process has terminated'); return pm; },
+      embed: async (texts) => texts.map(() => [1]),
+      batch: 2,
+      unavailableStreak: streak,
+      unavailableCap: 4,
+      providerHealthy: async () => ok,
+    }));
+  }
+  expect(failures).toEqual(['poisoned']);
+  expect(results.map((r) => r.failed)).toEqual([0, 0, 0, 0, 0, 1, 0]);
+  expect(results[5].done).toBe(1);
+});
+
+test('providerAnswers: a tiny ask; down or timed out is false, any answer (even a bad one) is true', async () => {
+  const llm = (json: () => Promise<unknown>) => ({ id: 'x', agentic: false, json });
+  expect(await providerAnswers(llm(async () => ({ ok: true })))).toBe(true);
+  expect(await providerAnswers(llm(async () => { throw new Error('not JSON: hello'); }))).toBe(true);
+  expect(await providerAnswers(llm(async () => { throw Object.assign(new TypeError('fetch failed'), { cause: { code: 'ECONNREFUSED' } }); }))).toBe(false);
+  expect(await providerAnswers(llm(async () => { throw new DOMException('The operation was aborted due to timeout', 'TimeoutError'); }))).toBe(false);
+});
+
 test('a new lesson that repeats one already in the project is flagged duplicate-of it once saved', async () => {
   const checks: unknown[][] = [];
   const old = { id: 'lesson:old', status: 'approved' as const, createdAt: '2026-10-01T00:00:00Z' };
@@ -204,4 +346,67 @@ test('a new lesson that repeats one already in the project is flagged duplicate-
     batch: 3,
   });
   expect(checks).toEqual([['lesson:a', [{ name: 'needs-path', why: 'none' }, expect.objectContaining({ name: 'duplicate-of', of: 'lesson:old' })]]]);
+});
+
+test('a post-mortem that says there was no miss is saved with its lesson rejected, never proposed, and Activity says why', async () => {
+  const decided: [string, unknown, unknown][] = [];
+  const activity: ActivityInput[] = [];
+  const none = { ...pm, missed: 'The agent did not miss any defects.', noMiss: 'The agent did not miss any defects.' };
+  const r = await runPostmortems({
+    k: {
+      feedbackNeedingPostmortem: async () => [{ ...input('a'), projectKey: 'data-pipeline' }],
+      savePostmortem: async () => {},
+      recordPostmortemFailure: async () => ({ attempts: 1, retryAt: null }),
+      updateLesson: async (id, patch, o) => { decided.push([id, patch, o]); return { unscoped: false }; },
+    },
+    postmortem: async () => none,
+    embed: async (texts) => texts.map(() => [1]),
+    batch: 3,
+    activity: { record: async (a) => void activity.push(a) },
+  });
+  expect(r).toEqual({ done: 1, failed: 0 });
+  expect(decided).toEqual([['lesson:a', { status: 'rejected' }, { by: 'postmortem', note: expect.stringContaining('no miss') }]]);
+  expect(activity[0]).toMatchObject({ kind: 'postmortem_done', subject: expect.stringMatching(/^no miss, no lesson: /), details: expect.objectContaining({ noLesson: 'The agent did not miss any defects.' }) });
+});
+
+test("a re-saved post-mortem that says no miss never rejects a lesson the owner edited or decided: it is flagged no-miss", async () => {
+  const decided: unknown[] = [];
+  const checks: [string, unknown][] = [];
+  const none = { ...pm, missed: 'Nothing was missed.', noMiss: 'Nothing was missed.' };
+  const stored: Record<string, Partial<Lesson>> = {
+    'lesson:edited': { status: 'proposed', proposedAs: { title: 't', rule: 'r', appliesWhen: 'w', scope: 'project', paths: [] }, checks: [{ name: 'needs-path', why: 'x' }] },
+    'lesson:approved': { status: 'approved', proposedAs: null, checks: [] },
+    'lesson:fresh': { status: 'proposed', proposedAs: null, checks: [] },
+  };
+  await runPostmortems({
+    k: {
+      feedbackNeedingPostmortem: async () => [input('edited'), input('approved'), input('fresh')],
+      savePostmortem: async () => {},
+      recordPostmortemFailure: async () => ({ attempts: 1, retryAt: null }),
+      lessonDetail: async (id) => ({ lesson: { id, ...stored[id] } as Lesson }) as LessonDetail,
+      updateLesson: async (id) => { decided.push(id); return { unscoped: false }; },
+      setLessonChecks: async (id, c) => { checks.push([id, c]); return true; },
+      similarLessons: async () => [],
+    },
+    postmortem: async () => none,
+    embed: async (texts) => texts.map(() => [1]),
+    batch: 3,
+  });
+  expect(decided).toEqual(['lesson:fresh']);
+  expect(checks).toEqual([
+    ['lesson:edited', [{ name: 'needs-path', why: 'x' }, { name: 'no-miss', why: expect.stringContaining('Nothing was missed.') }]],
+    ['lesson:approved', [{ name: 'no-miss', why: expect.stringContaining('Nothing was missed.') }]],
+  ]);
+});
+
+test('the session a comment was worked out against, and how it was matched, are kept in Activity', async () => {
+  const activity: ActivityInput[] = [];
+  await runPostmortems({
+    k: { feedbackNeedingPostmortem: async () => [input('a')], savePostmortem: async () => {}, recordPostmortemFailure: async () => ({ attempts: 1, retryAt: null }) },
+    postmortem: async () => ({ ...pm, trace: { provider: 'fake', agentic: false, standing: [], facts: [], lessonFlags: [], workSession: { id: 's-loader', matchedBy: 'files' } } }),
+    embed: async (texts) => texts.map(() => [1]),
+    batch: 3,
+    activity: { record: async (a) => void activity.push(a) },
+  });
+  expect(activity[0].details).toMatchObject({ workSession: { id: 's-loader', matchedBy: 'files' } });
 });

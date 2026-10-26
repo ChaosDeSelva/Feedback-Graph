@@ -24,7 +24,7 @@ export class PgInsightsStore implements InsightsStore {
          SELECT m.id AS miss_id, m.missed, m.cause, f.id AS feedback_id, f.text, f.status, f.task_id,
                 row_number() OVER (ORDER BY m.created_at DESC, m.id) AS rank
            FROM misses m JOIN feedback f ON f.id = m.feedback_id
-          WHERE m.project_key = $1
+          WHERE m.project_key = $1 AND NOT m.sandbox
           ORDER BY m.created_at DESC, m.id
           LIMIT $2
        ),
@@ -42,7 +42,7 @@ export class PgInsightsStore implements InsightsStore {
          SELECT c.rank, 3, l.id, 'DERIVED_FROM',
                 'lesson', jsonb_build_object('id', l.id, 'title', l.title, 'status', l.status),
                 'miss', jsonb_build_object('id', c.miss_id, 'missed', c.missed)
-           FROM chosen c JOIN lessons l ON l.miss_id = c.miss_id
+           FROM chosen c JOIN lessons l ON l.miss_id = c.miss_id AND NOT l.sandbox
          UNION ALL
          SELECT c.rank, 4, ci.id, 'WOULD_HAVE_PREVENTED',
                 'context', jsonb_build_object('id', ci.id, 'kind', ci.kind, 'ref', ci.ref),
@@ -80,7 +80,7 @@ export class PgInsightsStore implements InsightsStore {
     const pool = this.db.pool;
     const [causeRows, missRows, feedbackRows, preRows] = await Promise.all([
       pool.query<{ cause: Cause; count: number }>(
-        `SELECT cause, count(*) AS count FROM misses WHERE ($1::text IS NULL OR project_key = $1) AND ($2::text[] IS NULL OR project_key = ANY($2))
+        `SELECT cause, count(*) AS count FROM misses WHERE ($1::text IS NULL OR project_key = $1) AND ($2::text[] IS NULL OR project_key = ANY($2)) AND NOT sandbox
           GROUP BY cause ORDER BY count DESC, cause COLLATE "C"`,
         [projectKey, projectKeys],
       ),
@@ -89,7 +89,7 @@ export class PgInsightsStore implements InsightsStore {
         `SELECT missed, cause, project_key, embedding, ts FROM (
            SELECT m.id, m.missed, m.cause, m.project_key, m.embedding::text AS embedding, t.ts_text AS ts, t.ts AS at
              FROM misses m JOIN feedback f ON f.id = m.feedback_id JOIN turns t ON t.uuid = f.turn_uuid
-            WHERE ($1::text IS NULL OR m.project_key = $1) AND ($3::text[] IS NULL OR m.project_key = ANY($3)) AND m.embedding IS NOT NULL
+            WHERE ($1::text IS NULL OR m.project_key = $1) AND ($3::text[] IS NULL OR m.project_key = ANY($3)) AND m.embedding IS NOT NULL AND NOT m.sandbox
             ORDER BY t.ts DESC, m.id DESC
             LIMIT $2
          ) recent
@@ -98,13 +98,14 @@ export class PgInsightsStore implements InsightsStore {
       ),
       pool.query<{ ts: string }>(
         `SELECT t.ts_text AS ts FROM feedback f JOIN turns t ON t.uuid = f.turn_uuid
-          WHERE ($1::text IS NULL OR f.project_key = $1) AND ($2::text[] IS NULL OR f.project_key = ANY($2))`,
+          WHERE ($1::text IS NULL OR f.project_key = $1) AND ($2::text[] IS NULL OR f.project_key = ANY($2))
+            AND NOT EXISTS (SELECT 1 FROM candidates k WHERE k.id = f.id AND k.sandbox)`,
         [projectKey, projectKeys],
       ),
       pool.query<{ checks: number; with_gaps: number; gaps_found: number }>(
         `SELECT count(*) AS checks, coalesce(sum(CASE WHEN gaps > 0 THEN 1 ELSE 0 END), 0) AS with_gaps,
                 coalesce(sum(gaps), 0) AS gaps_found
-           FROM predone_checks WHERE ($1::text IS NULL OR project_key = $1) AND ($2::text[] IS NULL OR project_key = ANY($2))`,
+           FROM predone_checks WHERE ($1::text IS NULL OR project_key = $1) AND ($2::text[] IS NULL OR project_key = ANY($2)) AND NOT sandbox`,
         [projectKey, projectKeys],
       ),
     ]);

@@ -153,7 +153,54 @@ mkdir -p "$codex_sessions"
 run_uid="" run_gid=""
 if [ "$(uname -s)" = Linux ] && [ "$(id -u)" != 1000 ]; then run_uid="$(id -u)" run_gid="$(id -g)"; fi
 
+# One install per folder. Docker Compose names containers and volumes after the project name (FG_INSTANCE, default
+# feedback-graph), so a second checkout with the same name would take over the first one's running containers and its
+# data. A new .env in a folder whose name another folder's install already uses gets a name and ports of its own.
+instance_dir() { # the folder the install named $1 was started from (any of its containers, running or not)
+  docker ps -a --filter "label=com.docker.compose.project=$1" --format '{{.Label "com.docker.compose.project.working_dir"}}' 2>/dev/null | head -n 1
+}
+physical() { (cd "$1" 2>/dev/null && pwd -P) || printf '%s' "$1"; }
+here_p="$(physical "$here")"
+other_dir() { # the other folder using name $1, empty when none (or it is this one)
+  local d
+  d="$(instance_dir "$1")"
+  [ -n "$d" ] && [ "$(physical "$d")" != "$here_p" ] && printf '%s' "$d"
+  return 0
+}
+instance="$(printenv FG_INSTANCE 2>/dev/null || true)"
+if [ -n "$instance" ]; then
+  case "$instance" in
+    [a-z0-9]*) case "$instance" in *[!a-z0-9_-]*) bad=1 ;; *) bad="" ;; esac ;;
+    *) bad=1 ;;
+  esac
+  [ -z "$bad" ] || { echo "FG_INSTANCE=$instance: use lowercase letters, digits, - and _ (starting with a letter or digit)" >&2; exit 1; }
+fi
+current_name="${instance:-$(envval FG_INSTANCE)}"
+current_name="${current_name:-feedback-graph}"
+taken_by="$(other_dir "$current_name")"
+slug="$(basename "$here" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9_-' '-' | sed -e 's/^[^a-z0-9]*//' -e 's/-*$//')"
+new_instance="" port_offset=0
+if [ ! -f .env ] && [ -z "$instance" ] && [ -n "$taken_by" ]; then
+  new_instance="feedback-graph-${slug:-2}"
+  n=2 base_name="$new_instance"
+  while [ -n "$(other_dir "$new_instance")" ]; do new_instance="$base_name-$n"; n=$((n + 1)); done
+  # Ports 10 apart from the defaults until none is published by another container.
+  used="$(docker ps --format '{{.Ports}}' 2>/dev/null | grep -oE ':[0-9]+->' | tr -d ':>-' | sort -u || true)"
+  for k in $(seq 1 20); do
+    clash=""
+    for p in $((8787 + 10 * k)) $((7476 + 10 * k)) $((7689 + 10 * k)) $((5434 + 10 * k)) $((11435 + 10 * k)); do
+      if printf '%s\n' "$used" | grep -qx "$p"; then clash=1; fi
+    done
+    if [ -z "$clash" ]; then port_offset=$((10 * k)); break; fi
+  done
+fi
+
 if [ -f .env ]; then
+  if [ -n "$taken_by" ]; then
+    echo "note: the install in $taken_by has the same Docker Compose name ($current_name), so docker compose here would"
+    echo "  take over its containers and its data. To run this folder as a separate install, set FG_INSTANCE=feedback-graph-${slug:-2}"
+    echo "  and other ports (API_PORT, NEO4J_HTTP_PORT, NEO4J_BOLT_PORT, POSTGRES_PORT, OLLAMA_PORT) in .env before docker compose up."
+  fi
   # .env is kept as it is, except that PROJECTS_DIRS says which folders are mounted.
   env_dirs="$(grep -E '^PROJECTS_DIRS=' .env | tail -n 1 | cut -d= -f2- || true)"
   if [ "$env_dirs" = "$joined" ] && grep -qE '^PROJECTS_DIRS=' .env; then echo ".env exists; leaving it alone."
@@ -177,6 +224,29 @@ else
       .env.example > .env
   chmod 600 .env
   echo "wrote .env (projects: ${joined:-none yet}${codex:+; codex login found}${run_uid:+; containers run as uid $run_uid})"
+  if [ -n "$instance" ]; then
+    setenv FG_INSTANCE "$instance"
+    [ -z "$taken_by" ] || echo "note: FG_INSTANCE=$instance is also the name of the install in $taken_by: docker compose here would take over its containers and data"
+  elif [ -n "$new_instance" ]; then
+    setenv FG_INSTANCE "$new_instance"
+    if [ "$port_offset" -gt 0 ]; then
+      setenv API_PORT $((8787 + port_offset))
+      setenv NEO4J_HTTP_PORT $((7476 + port_offset))
+      setenv NEO4J_BOLT_PORT $((7689 + port_offset))
+      setenv POSTGRES_PORT $((5434 + port_offset))
+      setenv OLLAMA_PORT $((11435 + port_offset))
+    fi
+    echo "another install of Feedback Graph, in $taken_by, already uses the Docker Compose name $current_name. So that"
+    echo "  this folder never takes over its containers or its data, .env here sets FG_INSTANCE=$new_instance"
+    if [ "$port_offset" -gt 0 ]; then
+      echo "  and its own ports: API_PORT=$((8787 + port_offset)) (http://localhost:$((8787 + port_offset))), NEO4J_HTTP_PORT=$((7476 + port_offset)), NEO4J_BOLT_PORT=$((7689 + port_offset)), POSTGRES_PORT=$((5434 + port_offset)),"
+      echo "  OLLAMA_PORT=$((11435 + port_offset)) (the bundled ollama profile)."
+    else
+      echo "  (no free ports found 10 to 200 apart from the defaults: set API_PORT, NEO4J_HTTP_PORT, NEO4J_BOLT_PORT, POSTGRES_PORT and OLLAMA_PORT in .env)."
+    fi
+    echo "  Both installs then run side by side, each with its own data. Agents connect to this one with ./scripts/install-agent.sh here,"
+    echo "  which registers it as the MCP server $new_instance (the first install keeps feedback-graph)."
+  fi
 fi
 
 # Secrets from files a person wrote (--github-token-file and co.): into .env, which stays readable by you only. The
@@ -244,12 +314,8 @@ else
 fi
 
 # Ollama on the host, with both models, unless every job uses another provider. OLLAMA_URL is what the containers
-# use; from here the same server is on localhost (the bundled ollama profile publishes 11435).
-ollama_url="$(envval OLLAMA_URL)"
-case "$ollama_url" in
-  "" | *host.docker.internal*) ollama_url="http://localhost:11434" ;;
-  http://ollama:11434*) ollama_url="http://localhost:11435" ;;
-esac
+# use; from here the same server is on localhost (the bundled ollama profile publishes OLLAMA_PORT, default 11435).
+ollama_url="$(ollama_host_url "$(envval OLLAMA_URL)" "$(envval OLLAMA_PORT)")"
 models=("$(envval OLLAMA_MODEL)" "$(envval OLLAMA_EMBED_MODEL)")
 models=("${models[0]:-gemma4}" "${models[1]:-nomic-embed-text}")
 if ! command -v curl >/dev/null 2>&1; then
@@ -329,7 +395,8 @@ if [ -z "$(envval FG_OPERATOR_TOKEN)" ] &&
   confirm "Create an operator token, so agents and ./scripts/fg can scan, triage the Inbox and sync (lessons stay yours)? [Y/n]" y; then
   setenv FG_OPERATOR_TOKEN "$(openssl rand -hex 24)"
   echo "FG_OPERATOR_TOKEN saved to .env (not printed; ./scripts/fg reads it from there). It turns on the admin MCP at /mcp/admin"
-  echo "  and the fg CLI for scans, Inbox triage and sync. By default it cannot decide lessons, delete data, change settings or"
+  echo "  and the fg CLI for scans, Inbox triage and sync. By default it cannot decide lessons, choose which projects are read,"
+  echo "  delete data, change settings or"
   echo "  ask in Ask (which spends your subscription); OPERATOR_ALLOW in .env widens or narrows that. Remove the line to turn it off."
 fi
 

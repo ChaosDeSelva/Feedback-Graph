@@ -14,7 +14,7 @@ function fullApp() {
     activity: anything, docs: anything, links: anything, portability: anything, auth: { operator: { token: 'o'.repeat(32), allow: [] } }, log: () => {},
     system: { version: '9.9.9', ping: async () => true, worker: async () => null },
     classifyQueue: anything, settings: anything, codegraph: anything, mapMaxFiles: null, cloud: anything, inScope: () => true,
-    importer: anything, sessions: anything, shown: undefined, integrations: anything, chat: anything,
+    importer: anything, sessions: anything, shown: undefined, integrations: anything, chat: anything, runs: anything, evidence: anything,
   });
 }
 

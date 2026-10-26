@@ -162,6 +162,29 @@ test('hotspots: a busy manifest with no miss scores 0, below quiet code; a miss 
   expect(withMiss[0].score).toBeGreaterThan(4);
 });
 
+test("every per-file view asks its reads for the caller's run, so another run's sandbox misses, lessons and facts never reach it", async () => {
+  const asked: [string, unknown][] = [];
+  const base = fakeReads([{ path: 'src/a.ts', lang: 'typescript', commits: 1 }]);
+  const reads: CodeGraphReads = {
+    ...base,
+    missesOn: async (k, p, run) => { asked.push(['missesOn', run]); return base.missesOn(k, p, run); },
+    approvedLessons: async (_k, run) => { asked.push(['approvedLessons', run]); return []; },
+    currentFacts: async (_k, _p, run) => { asked.push(['currentFacts', run]); return []; },
+  };
+  const v = codeGraphViews(reads);
+  await v.moduleContext('demo', 'src/a.ts', 'sbx-1');
+  await v.impact('demo', ['src/a.ts'], 2, 'sbx-1');
+  await v.lessonsForPaths('demo', ['src/a.ts'], 'sbx-1');
+  await v.hotspots('demo', 5, { run: 'sbx-1' });
+  await v.mapGraph('demo', { limit: 5, run: 'sbx-1' });
+  expect(asked.length).toBeGreaterThanOrEqual(10);
+  expect(asked.every(([, run]) => run === 'sbx-1')).toBe(true);
+  asked.length = 0;
+  await v.moduleContext('demo', 'src/a.ts');
+  await v.hotspots('demo', 5);
+  expect(asked.every(([, run]) => run === null)).toBe(true);
+});
+
 test('hotspots with missesOnly: only files a confirmed miss touched, however busy the others are', async () => {
   const files = [{ path: 'src/busy.ts', lang: 'typescript', commits: 900 }, { path: 'docs/a.md', lang: 'md', commits: 1 }];
   const h = await codeGraphViews(fakeReads(files, ['docs/a.md'])).hotspots('demo', 1, { missesOnly: true });
@@ -266,4 +289,24 @@ test('trailingToolCalls: the calls after the last human turn, which no turn take
   const calls = [call('2026-10-25T10:01:00Z', 'pnpm test'), call('2026-10-25T10:03:00Z', 'git push')];
   expect(trailingToolCalls({ turns: [turn('2026-10-25T10:00:00Z'), turn('2026-10-25T10:02:00Z')], toolCalls: calls })).toEqual([calls[1]]);
   expect(trailingToolCalls({ turns: [], toolCalls: calls })).toEqual([]);
+});
+
+test('impact and moduleContext give the tests nearest the change first, not in path order (a capped list keeps the nearest)', async () => {
+  // src/core.ts <- src/a.ts <- src/z.ts; src/b.test.ts imports core directly. TESTS edges: test/z.test.ts -> core,
+  // test/a.test.ts -> a, test/aa.test.ts -> z.
+  const files = ['src/core.ts', 'src/a.ts', 'src/z.ts', 'src/b.test.ts', 'test/z.test.ts', 'test/a.test.ts', 'test/aa.test.ts'];
+  const importers: Record<string, string[]> = { 'src/core.ts': ['src/a.ts', 'src/b.test.ts'], 'src/a.ts': ['src/z.ts'] };
+  const covering: Record<string, string[]> = { 'src/core.ts': ['test/z.test.ts'], 'src/a.ts': ['test/a.test.ts'], 'src/z.ts': ['test/aa.test.ts'] };
+  const reads: CodeGraphReads = {
+    ...fakeReads([]),
+    mapFiles: async (_k, paths) => files.filter((p) => !paths || paths.includes(p)).map((p) => ({ ...mf(p, p.includes('.test.')), churn: null })),
+    importersOf: async (_k, paths) => new Map(paths.map((p) => [p, importers[p] ?? []])),
+    testsOf: async (_k, paths) => [...new Set(paths.flatMap((p) => covering[p] ?? []))],
+  };
+  const v = codeGraphViews(reads);
+  const nearest = ['src/b.test.ts', 'test/z.test.ts', 'test/a.test.ts', 'test/aa.test.ts'];
+  expect((await v.impact('demo', ['src/core.ts'], 3)).tests).toEqual(nearest);
+  expect((await v.moduleContext('demo', 'src/core.ts'))!.tests).toEqual(nearest);
+  // a test file asked about is its own nearest test
+  expect((await v.impact('demo', ['test/aa.test.ts', 'src/z.ts'], 1)).tests).toEqual(['test/aa.test.ts']);
 });

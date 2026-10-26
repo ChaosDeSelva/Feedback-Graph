@@ -16,6 +16,8 @@
 #   than loopback or 0.0.0.0 is used as the host)
 #
 # When .env (or the environment) sets API_TOKEN, the MCP server is registered with it as a Bearer header.
+# The server is named feedback-graph, or feedback-graph-<name> for an install with its own FG_INSTANCE (setup.sh gives a
+# second checkout on the same machine one, and its own API_PORT), so two installs on one machine each keep a server.
 # Safe to re-run: a server already registered is left alone, the guidance block is only rewritten when it changed, and
 # a Codex file is copied to <file>.bak.<time> before it is changed. The skills are symlinks into this folder, so a
 # git pull updates them; after moving or deleting this folder, re-run the script (or remove the links).
@@ -42,6 +44,7 @@ Connect Claude Code and Codex to the Feedback Graph's MCP server.
 
 The URL is FEEDBACK_GRAPH_URL, else http://localhost:<API_PORT> (API_PORT from the environment or .env, 8787 when
 unset). With API_TOKEN set, the server is registered with it as a Bearer header (never printed). Re-running is safe.
+An install with its own FG_INSTANCE (a second one on this machine) is registered as feedback-graph-<name> instead.
 EOF
 }
 
@@ -72,6 +75,15 @@ setting() {
   printf '%s' "$v"
 }
 token="$(setting API_TOKEN)"
+# The MCP server's name: feedback-graph for the default install, feedback-graph-<suffix> for another FG_INSTANCE (the
+# name setup.sh gives it, feedback-graph-<folder>, is used as it is), so a second install never takes over the first's.
+instance="$(setting FG_INSTANCE)"
+case "$instance" in
+  '' | feedback-graph) name=feedback-graph ;;
+  *[!a-z0-9_-]* | [!a-z0-9]*) echo "FG_INSTANCE must be lowercase letters, digits, - and _ (starting with a letter or digit)" >&2; exit 1 ;;
+  feedback-graph-*) name="$instance" ;;
+  *) name="feedback-graph-$instance" ;;
+esac
 if [ -n "${FEEDBACK_GRAPH_URL:-}" ]; then
   url="$FEEDBACK_GRAPH_URL"
 else
@@ -110,11 +122,19 @@ backup() {
 
 install_claude() {
   # The plugin (plugin/) brings the same MCP server and skills, plus hooks: registering them again would double the tools.
+  # Its server (fg) reaches one install (FEEDBACK_GRAPH_URL, else port 8787): another instance still gets a server of its
+  # own, under its own name, so the agent can reach both. The skills come with the plugin either way.
+  local plugin=0
   if claude plugin list 2>/dev/null | grep -q 'feedback-graph@'; then
-    echo "Claude Code: the feedback-graph plugin is installed and already provides the MCP server and skills; nothing to do"
-    return
+    if [ "$name" = feedback-graph ]; then
+      echo "Claude Code: the feedback-graph plugin is installed and already provides the MCP server and skills; nothing to do"
+      return
+    fi
+    plugin=1
+    echo "Claude Code: the feedback-graph plugin is installed (its fg server and skills); adding this install's server $name beside it"
   fi
   for s in feedback-graph postmortem test-from-feedback; do
+    [ "$plugin" = 0 ] || break
     local link="$HOME/.claude/skills/$s"
     if [ "$(readlink "$link" 2>/dev/null || true)" = "$here/plugin/skills/$s" ]; then
       echo "skill already linked: ~/.claude/skills/$s"
@@ -127,16 +147,16 @@ install_claude() {
       echo "linked skill: ~/.claude/skills/$s"
     fi
   done
-  if claude mcp get feedback-graph >/dev/null 2>&1; then
-    echo "Claude Code: MCP server feedback-graph already registered (remove it with: claude mcp remove feedback-graph --scope user, then re-run)"
+  if claude mcp get "$name" >/dev/null 2>&1; then
+    echo "Claude Code: MCP server $name already registered (remove it with: claude mcp remove $name --scope user, then re-run)"
   elif [ "$dry" = 1 ]; then
-    would "claude mcp add --transport http --scope user feedback-graph $url/mcp${token:+ --header 'Authorization: Bearer <API_TOKEN>'}"
+    would "claude mcp add --transport http --scope user $name $url/mcp${token:+ --header 'Authorization: Bearer <API_TOKEN>'}"
   elif [ -n "$token" ]; then
-    claude mcp add --transport http --scope user feedback-graph "$url/mcp" --header "Authorization: Bearer $token"
-    echo "Claude Code: registered $url/mcp with your API_TOKEN"
+    claude mcp add --transport http --scope user "$name" "$url/mcp" --header "Authorization: Bearer $token"
+    echo "Claude Code: registered $name at $url/mcp with your API_TOKEN"
   else
-    claude mcp add --transport http --scope user feedback-graph "$url/mcp"
-    echo "Claude Code: registered $url/mcp"
+    claude mcp add --transport http --scope user "$name" "$url/mcp"
+    echo "Claude Code: registered $name at $url/mcp"
   fi
 }
 
@@ -147,10 +167,12 @@ interactive() { [ -t 0 ] || [ "${FEEDBACK_INSTALL_INTERACTIVE:-}" = 1 ]; }
 # Codex calls this server's tools without asking, which `codex exec` needs: its approval policy is never, so otherwise
 # every MCP tool call is refused. The tools only read the graph and file reports for you to decide on.
 APPROVE_LINE='default_tools_approval_mode = "approve"'
-# Whether the feedback-graph table in $1 already sets the approval mode.
+# The header line of this install's table in config.toml, bare or quoted (an ERE; the name needs no escaping).
+table_re="^[[:space:]]*\\[mcp_servers\\.(\"$name\"|$name)\\][[:space:]]*\$"
+# Whether this install's table in $1 already sets the approval mode.
 table_has_approval() {
-  awk '
-    /^[[:space:]]*\[/ { on = ($0 ~ /^[[:space:]]*\[mcp_servers\.("feedback-graph"|feedback-graph)\][[:space:]]*$/); next }
+  RE="$table_re" awk '
+    /^[[:space:]]*\[/ { on = ($0 ~ ENVIRON["RE"]); next }
     on && /^[[:space:]]*default_tools_approval_mode[[:space:]]*=/ { found = 1 }
     END { exit found ? 0 : 1 }
   ' "$1" 2>/dev/null
@@ -165,7 +187,8 @@ want_approval() {
 }
 approval_hint() {
   echo "Codex: each tool call waits for your approval (codex exec refuses them); to allow them, re-run with --codex-auto-approve"
-  echo "  or add $APPROVE_LINE under [mcp_servers.feedback-graph] in $1"
+  echo "  or add $APPROVE_LINE under [mcp_servers.$name] in $1"
+  echo "  or, for one headless run: codex exec -c 'mcp_servers.$name.default_tools_approval_mode=\"approve\"' ..."
 }
 
 BEGIN_MARK='<!-- BEGIN feedback-graph (managed by scripts/install-agent.sh in the Feedback Graph folder; re-run it to update) -->'
@@ -178,24 +201,24 @@ install_codex() {
   # Codex config keys for a streamable HTTP MCP server: url, static http_headers for the token, and (when you allow it)
   # default_tools_approval_mode.
   local approve=0
-  if grep -Eq '^[[:space:]]*\[mcp_servers\.("feedback-graph"|feedback-graph)\][[:space:]]*$' "$cfg" 2>/dev/null; then
-    echo "Codex: MCP server feedback-graph already in $cfg (delete its [mcp_servers.feedback-graph] table, then re-run, to change it)"
+  if grep -Eq "$table_re" "$cfg" 2>/dev/null; then
+    echo "Codex: MCP server $name already in $cfg (delete its [mcp_servers.$name] table, then re-run, to change it)"
     if table_has_approval "$cfg"; then
-      echo "Codex: the approval mode for feedback-graph is already set in $cfg"
+      echo "Codex: the approval mode for $name is already set in $cfg"
     elif want_approval; then
       backup "$cfg"
       if [ "$dry" = 1 ]; then
-        would "add $APPROVE_LINE to [mcp_servers.feedback-graph] in $cfg"
+        would "add $APPROVE_LINE to [mcp_servers.$name] in $cfg"
       else
         # In place (cp keeps the file's mode: it may hold the token), right under the table's header.
         local tmp="$cfg.tmp.$$"
         cp -p "$cfg" "$tmp"
-        LINE="$APPROVE_LINE" awk '
+        LINE="$APPROVE_LINE" RE="$table_re" awk '
           { print }
-          !done && /^[[:space:]]*\[mcp_servers\.("feedback-graph"|feedback-graph)\][[:space:]]*$/ { print ENVIRON["LINE"]; done = 1 }
+          !done && $0 ~ ENVIRON["RE"] { print ENVIRON["LINE"]; done = 1 }
         ' "$cfg" >"$tmp"
         mv "$tmp" "$cfg"
-        echo "Codex: feedback-graph tools now run without asking ($APPROVE_LINE in $cfg)"
+        echo "Codex: $name tools now run without asking ($APPROVE_LINE in $cfg)"
       fi
     else
       approval_hint "$cfg"
@@ -204,7 +227,7 @@ install_codex() {
     want_approval && approve=1
     if [ "$dry" = 1 ]; then
       backup "$cfg"
-      would "add [mcp_servers.feedback-graph] with url = \"$url/mcp\"${token:+ and the API_TOKEN as a Bearer header (then make it readable by you only)} to $cfg"
+      would "add [mcp_servers.$name] with url = \"$url/mcp\"${token:+ and the API_TOKEN as a Bearer header (then make it readable by you only)} to $cfg"
       if [ "$approve" = 1 ]; then would "add $APPROVE_LINE to it"; fi
     else
       backup "$cfg"
@@ -212,18 +235,18 @@ install_codex() {
       sep="$(separator "$cfg")"
       {
         printf '%s' "${sep%x}"
-        echo '[mcp_servers.feedback-graph]'
+        echo "[mcp_servers.$name]"
         echo "url = \"$url/mcp\""
         if [ "$approve" = 1 ]; then echo "$APPROVE_LINE"; fi
         if [ -n "$token" ]; then echo "http_headers = { \"Authorization\" = \"Bearer $token\" }"; fi
       } >>"$cfg"
       if [ -n "$token" ]; then
         chmod 600 "$cfg" # it now holds the token
-        echo "Codex: registered $url/mcp with your API_TOKEN in $cfg (made readable by you only)"
+        echo "Codex: registered $name at $url/mcp with your API_TOKEN in $cfg (made readable by you only)"
       else
-        echo "Codex: registered $url/mcp in $cfg"
+        echo "Codex: registered $name at $url/mcp in $cfg"
       fi
-      if [ "$approve" = 1 ]; then echo "Codex: feedback-graph tools run without asking ($APPROVE_LINE)"; else approval_hint "$cfg"; fi
+      if [ "$approve" = 1 ]; then echo "Codex: $name tools run without asking ($APPROVE_LINE)"; else approval_hint "$cfg"; fi
     fi
   fi
 

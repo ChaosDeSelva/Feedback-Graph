@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { ModelTimeoutError, ProviderUnavailableError, STRICT_JSON, type ActivityInput, type CodeFact, type FactScope, type LlmProvider, type ScanJob } from '@fb/core';
 import { expect, test } from 'vitest';
-import { checkCitations, deterministicFacts, extractFileFacts, hasCodeFiles, listCodeFiles, listCodeFilesWithTotal, runScan, FACT_CHECK_VERSION, SCAN_PROMPT_VERSION, SCANNER_VERSION, type ScanDeps } from './scan.ts';
+import { checkCitations, deterministicFacts, extractFileFacts, hasCodeFiles, listCodeFiles, listCodeFilesWithTotal, runScan, ScanPlans, FACT_CHECK_VERSION, SCAN_PROMPT_VERSION, SCANNER_VERSION, type ScanDeps } from './scan.ts';
 
 function repo(git = false) {
   const dir = mkdtempSync(join(tmpdir(), 'fbscan-'));
@@ -366,6 +366,16 @@ test('extractFileFacts redacts the file before the model sees it, and redacts wh
   expect(JSON.stringify(r)).not.toContain('sk-ant-api03');
 });
 
+test('extractFileFacts keeps no fact that is only a credential', async () => {
+  const m = llm({ summary: 'S', facts: [
+    { kind: 'config', statement: 'The seed admin password is hunter2', path: 'a', lines: null, confidence: 0.9, why: 'w' },
+    { kind: 'config', statement: 'KEY is set to [REDACTED]', path: 'a', lines: null, confidence: 0.9, why: 'w' },
+    { kind: 'config', statement: 'The API key is read from ACME_API_KEY at start', path: 'a', lines: null, confidence: 0.9, why: 'w' },
+  ] });
+  const r = await extractFileFacts(m, 'src/config.ts', 'export const KEY = process.env.ACME_API_KEY;');
+  expect(r.facts.map((f) => f.statement)).toEqual(['The API key is read from ACME_API_KEY at start']);
+});
+
 test('a file the model chokes on is logged and skipped; the rest of the scan still lands', async () => {
   const dir = repo(true);
   const flaky = llm((user: string) => { if (user.includes('FILE: src/a.ts')) throw new Error('bad json'); return { summary: 'S', facts: [] }; });
@@ -600,10 +610,142 @@ test('an agentic scan records its progress after each shard it runs: shards done
   await runScan(job(dir), deps);
   const progress = updates.filter((u) => !('status' in u));
   expect(progress).toEqual([
-    { factsAdded: 3, shards: { total: 3, done: 1, rescanned: 1, failed: 0 } },
-    { factsAdded: 6, shards: { total: 3, done: 2, rescanned: 2, failed: 0 } },
-    { factsAdded: 9, shards: { total: 3, done: 3, rescanned: 3, failed: 0 } },
+    { factsAdded: 3, filesScanned: 1, shards: { total: 3, done: 1, rescanned: 1, failed: 0, processed: ['.'] } },
+    { factsAdded: 6, filesScanned: 2, shards: { total: 3, done: 2, rescanned: 2, failed: 0, processed: ['.', 'packages/api'] } },
+    { factsAdded: 9, filesScanned: 3, shards: { total: 3, done: 3, rescanned: 3, failed: 0, processed: ['.', 'packages/api', 'packages/core'] } },
   ]);
+});
+
+/** A job record the fake store keeps up to date from updateScanJob and requeueScanJob, so a run can pick up the last one. */
+function storedJob(dir: string, deps: ScanDeps) {
+  let current: ScanJob = job(dir);
+  const requeued: string[] = [];
+  const update = deps.facts.updateScanJob;
+  deps.facts.updateScanJob = async (id, p) => {
+    await update(id, p);
+    current = { ...current, ...p } as ScanJob;
+  };
+  deps.facts.requeueScanJob = async (id) => {
+    requeued.push(id);
+    current = { ...current, status: 'queued', servedAt: 'now' };
+  };
+  return { get: () => current, requeued };
+}
+
+test('a sharded scan gives up its slot after a shard while another scan waits, and goes on from the next shard with its progress whole', async () => {
+  const dir = workspace();
+  const agent = shardAgent((s) => { if (s === 'packages/api') throw new Error('bad answer'); });
+  const { deps, updates, replaced, activity } = fakeDeps({ llm: agent });
+  // Nothing is saved between runs here, so only the job's own record of its shards can stop a shard running twice.
+  deps.facts.fileHashes = async () => new Map();
+  const stored = storedJob(dir, deps);
+  deps.yieldTurn = async () => true;
+
+  const first = await runScan(stored.get(), deps);
+  expect(first).toMatchObject({ paused: true, factsAdded: 3 });
+  expect(stored.requeued).toEqual(['j']);
+  expect(stored.get()).toMatchObject({ status: 'queued', factsAdded: 3, shards: { total: 3, done: 1, rescanned: 1, failed: 0, processed: ['.'] } });
+  expect(updates.some((u) => (u as { status?: string }).status === 'done')).toBe(false);
+
+  // Its turn again: the next shard (it fails), then it gives up the slot again.
+  expect(await runScan(stored.get(), deps)).toMatchObject({ paused: true });
+  expect(stored.get().shards).toMatchObject({ total: 3, done: 2, rescanned: 2, failed: 1, processed: ['.', 'packages/api'], failedKeys: ['packages/api'] });
+
+  // The last shard: nothing is left to give way for, so it finishes, counting every run's shards and facts.
+  const last = await runScan(stored.get(), deps);
+  expect(last.paused).toBeUndefined();
+  expect(stored.requeued).toHaveLength(2);
+  expect(agent.seen.map((s) => shardOf(s.user))).toEqual(['.', 'packages/api', 'packages/core']);
+  expect(replaced.map((x) => x.scope.prefixes)).toEqual([[''], ['packages/core']]);
+  expect(stored.get()).toMatchObject({ status: 'done', factsAdded: 6, error: '1 shard failed: packages/api', shards: { total: 3, rescanned: 3, failed: 1 } });
+  expect(stored.get().shards).not.toHaveProperty('processed');
+  // One scan in Activity: started once, finished once.
+  expect(activity.filter((a) => a.kind === 'scan_started')).toHaveLength(1);
+  expect(activity.filter((a) => a.kind === 'scan_finished')).toHaveLength(1);
+});
+
+test('a file an agent asks for while a sharded scan waits its turn is read when it goes on, even in a shard it already got through', async () => {
+  const dir = workspace();
+  const asked: string[] = [];
+  const { deps } = fakeDeps({ llm: shardAgent((s) => asked.push(s)) });
+  deps.facts.fileHashes = async () => new Map();
+  const stored = storedJob(dir, deps);
+  deps.yieldTurn = async () => true;
+  await runScan(stored.get(), deps);
+  expect(asked).toEqual(['.']);
+  // get_task_context named a root file meanwhile: the shard holding it runs first, then the next one.
+  deps.facts.scanRequests = async () => ['README.md'];
+  deps.facts.clearScanRequests = async () => { deps.facts.scanRequests = async () => []; };
+  await runScan(stored.get(), deps);
+  expect(asked).toEqual(['.', '.']);
+  await runScan(stored.get(), deps);
+  await runScan(stored.get(), deps);
+  expect(asked).toEqual(['.', '.', 'packages/api', 'packages/core']);
+  expect(stored.get()).toMatchObject({ status: 'done', shards: { total: 3, rescanned: 3 } });
+});
+
+test('a sharded scan that gives way keeps its file list and shard plan for its next turn while HEAD stays, never its mirror, and builds them again once HEAD moves', async () => {
+  const dir = workspace();
+  const commit = () => execFileSync('git', ['-C', dir, '-c', 'user.name=t', '-c', 'user.email=t@example.com', 'commit', '-qam', 'c']);
+  commit();
+  let made = 0;
+  let disposed = 0;
+  const agent = shardAgent();
+  agent.mirror = async () => { made++; return { dir: `/scratch/fb-mirror-${made}`, dispose: async () => { disposed++; } }; };
+  const { deps } = fakeDeps({ llm: agent });
+  deps.facts.fileHashes = async () => new Map();
+  const stored = storedJob(dir, deps);
+  deps.yieldTurn = async () => true;
+  const plans = new ScanPlans();
+  deps.plans = plans;
+
+  expect(await runScan(stored.get(), deps)).toMatchObject({ paused: true });
+  // Waiting its turn, no copy of the repo is left where another project's scan could read it.
+  expect([made, disposed]).toEqual([1, 1]);
+  // Its next turn, HEAD unchanged: the kept plan, no new listing; a fresh mirror.
+  expect(await runScan(stored.get(), deps)).toMatchObject({ paused: true });
+  expect([made, disposed, plans.reused]).toEqual([2, 2, 1]);
+  expect(agent.seen.map((s) => s.cwd)).toEqual(['/scratch/fb-mirror-1', '/scratch/fb-mirror-2']);
+
+  // A commit lands while it waits: listed again (the new file is in its shard), a new mirror, the old one removed.
+  writeFileSync(join(dir, 'packages/core/src/fresh.ts'), 'export const fresh = 1;\n');
+  execFileSync('git', ['-C', dir, 'add', '-A']);
+  commit();
+  const last = await runScan(stored.get(), deps);
+  expect(last.paused).toBeUndefined();
+  expect(agent.seen.map((s) => shardOf(s.user))).toEqual(['.', 'packages/api', 'packages/core']);
+  expect(agent.seen[2].user).toContain('packages/core/src/fresh.ts');
+  expect(agent.seen[2].cwd).toBe('/scratch/fb-mirror-3');
+  expect([made, disposed, plans.reused]).toEqual([3, 3, 1]);
+  expect(stored.get()).toMatchObject({ status: 'done', shards: { total: 3, rescanned: 3 } });
+});
+
+test('kept scan plans are bounded, and only handed back for the same repo and HEAD', () => {
+  const plans = new ScanPlans(2);
+  const plan = { head: 'h', repoPath: '/repo', listed: [], churn: new Map(), planned: [] };
+  plans.keep('a', plan);
+  plans.keep('b', plan);
+  plans.keep('c', plan);
+  expect(plans.take('a', '/repo', 'h')).toBeNull(); // the oldest went
+  expect(plans.take('b', '/repo', 'other')).toBeNull(); // another HEAD
+  expect(plans.take('b', '/repo', 'h')).toBeNull(); // and it is gone
+  expect(plans.take('c', '/elsewhere', 'h')).toBeNull(); // another repo
+  plans.keep('d', plan);
+  expect(plans.take('d', '/repo', 'h')).toBe(plan);
+});
+
+test('a sharded scan with no one waiting runs on without giving up its slot', async () => {
+  const dir = workspace();
+  const { deps } = fakeDeps({ llm: shardAgent() });
+  deps.facts.fileHashes = async () => new Map();
+  const stored = storedJob(dir, deps);
+  let asked = 0;
+  deps.yieldTurn = async () => { asked++; return false; };
+  expect((await runScan(stored.get(), deps)).paused).toBeUndefined();
+  expect(stored.requeued).toEqual([]);
+  // Asked after each shard but the last.
+  expect(asked).toBe(2);
+  expect(stored.get()).toMatchObject({ status: 'done', factsAdded: 9 });
 });
 
 test('the prompt tells the agent its shard, its path prefix and a budget scaled to the shard', async () => {

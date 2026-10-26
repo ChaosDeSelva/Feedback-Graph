@@ -1,6 +1,9 @@
 import { redactSecrets } from '../redact.ts';
 import type { LinksStore } from '../store.ts';
+import type { RunTag } from '../types.ts';
+import { runWriteOwner } from '../runs.ts';
 import type { GraphRepo } from './repo.ts';
+import { VISIBLE_TO_RUN } from './runs.ts';
 
 /**
  * How two projects belong together. depends_on: one uses the other's code, package or API. same_product: parts of one
@@ -34,21 +37,34 @@ export type ProjectLink = {
    * detected suggestion nobody has decided, or one decided before this was recorded.
    */
   decidedBy: string | null;
+  /** The run that made it (RunTag), and whether that run was a sandbox; absent when none. */
+  run?: string;
+  sandbox?: true;
 };
 
 export type DetectedLink = { a: string; b: string; relation: LinkRelation; score: number; evidence: LinkEvidence[] };
 /** decidedBy: who made this change ('you', 'operator:<name>'); unset keeps the last one. */
-export type LinkPatch = { status?: LinkStatus; relation?: LinkRelation; note?: string; decidedBy?: string };
+/**
+ * run: the run (RunTag) the decision is made in; a link it creates is the run's, and it may change only a link it made
+ * (LinksStore.setLink). byOwner: the owner opened the run, so it may decide on the owner's links (they stay the owner's).
+ */
+export type LinkPatch = { status?: LinkStatus; relation?: LinkRelation; note?: string; decidedBy?: string; run?: RunTag | null; byOwner?: boolean };
 
 /** The pair in store order. Throws on a link from a project to itself. */
 export function linkPair(x: string, y: string): [string, string] {
   if (x === y) throw new Error('a project cannot be linked to itself');
   return x < y ? [x, y] : [y, x];
 }
-export const linkIdOf = (x: string, y: string) => {
+/** A sandbox run's decision on a pair is its own row (link@<run>:a|b), never the shared one. */
+export const linkIdOf = (x: string, y: string, run?: RunTag | null) => {
   const [a, b] = linkPair(x, y);
-  return `link:${a}|${b}`;
+  return `link${run?.sandbox ? `@${run.id}` : ''}:${a}|${b}`;
 };
+/** The two ends a link id names (with or without a sandbox run), or null for anything else. */
+export function linkEnds(id: string): [string, string] | null {
+  const m = /^link(?:@[\w.-]+)?:([^|]+)\|(.+)$/.exec(id);
+  return m ? [m[1], m[2]] : null;
+}
 /** The other end of a link, seen from one project. */
 export const otherEnd = (l: Pick<ProjectLink, 'a' | 'b'>, key: string) => (l.a === key ? l.b : l.a);
 
@@ -68,12 +84,13 @@ export class LinksRepo implements LinksStore {
     this.g = g;
   }
 
-  async listLinks(q: { projectKey?: string; projectKeys?: string[] }): Promise<ProjectLink[]> {
+  async listLinks(q: { projectKey?: string; projectKeys?: string[]; run?: string | null }): Promise<ProjectLink[]> {
     const rows = await this.g.run(
       `MATCH (l:ProjectLink)
-       WHERE ($key IS NULL OR l.a = $key OR l.b = $key) AND ($keys IS NULL OR (l.a IN $keys AND l.b IN $keys))
+       WHERE ($key IS NULL OR l.a = $key OR l.b = $key) AND ($keys IS NULL OR (l.a IN $keys AND l.b IN $keys)) AND ${VISIBLE_TO_RUN('l')}
+         AND ($run IS NULL OR coalesce(l.run = $run, false) OR NOT EXISTS { MATCH (s:ProjectLink {a: l.a, b: l.b, run: $run, sandbox: true}) })
        RETURN l ORDER BY l.a, l.b`,
-      { key: q.projectKey ?? null, keys: q.projectKeys ?? null },
+      { key: q.projectKey ?? null, keys: q.projectKeys ?? null, run: q.run ?? null },
     );
     return rows.map((r) => linkOf(r.get('l').properties));
   }
@@ -106,20 +123,31 @@ export class LinksRepo implements LinksStore {
 
   async setLink(x: string, y: string, patch: LinkPatch): Promise<ProjectLink> {
     const [a, b] = linkPair(x, y);
+    const id = linkIdOf(a, b, patch.run);
+    // A run decides only on a link it made (runWriteOwner); the owner's decision makes a run's link the owner's.
+    const [cur] = await this.g.run(`MATCH (l:ProjectLink {id: $id}) RETURN l.run AS run`, { id });
+    const run = runWriteOwner(`the link ${a} ↔ ${b}`, cur ? (cur.get('run') ?? null) : undefined, patch.run, patch.byOwner);
+    // A sandbox run's own row starts as a copy of the shared one (when there is one), so only its decision differs.
     const [r] = await this.g.run(
-      `MERGE (l:ProjectLink {id: $id})
-         ON CREATE SET l.a = $a, l.b = $b, l.status = 'confirmed', l.source = 'you', l.note = '', l.relation = 'related',
-                       l.score = 0.0, l.evidence = '[]', l.createdAt = $now
+      `OPTIONAL MATCH (base:ProjectLink {id: $base})
+       MERGE (l:ProjectLink {id: $id})
+         ON CREATE SET l.a = $a, l.b = $b, l.status = coalesce(base.status, 'confirmed'), l.source = coalesce(base.source, 'you'),
+                       l.note = coalesce(base.note, ''), l.relation = coalesce(base.relation, 'related'), l.score = coalesce(base.score, 0.0),
+                       l.evidence = coalesce(base.evidence, '[]'), l.decidedBy = base.decidedBy, l.createdAt = $now
        SET l.status = coalesce($status, l.status), l.relation = coalesce($relation, l.relation), l.note = coalesce($note, l.note),
-           l.decidedBy = coalesce($decidedBy, l.decidedBy), l.updatedAt = $now
+           l.decidedBy = coalesce($decidedBy, l.decidedBy), l.updatedAt = $now, l.run = $run, l.sandbox = $sandbox
        RETURN l`,
-      { id: linkIdOf(a, b), a, b, status: patch.status ?? null, relation: patch.relation ?? null, note: patch.note === undefined ? null : cleanNote(patch.note), decidedBy: patch.decidedBy ?? null, now: new Date().toISOString() },
+      { id, base: linkIdOf(a, b), a, b, status: patch.status ?? null, relation: patch.relation ?? null, note: patch.note === undefined ? null : cleanNote(patch.note), decidedBy: patch.decidedBy ?? null, now: new Date().toISOString(), run: run?.id ?? null, sandbox: !!run?.sandbox },
     );
     return linkOf(r.get('l').properties);
   }
 
-  async deleteLink(id: string): Promise<boolean> {
-    const [r] = await this.g.run(`OPTIONAL MATCH (l:ProjectLink {id: $id}) WITH l, l IS NOT NULL AS existed DETACH DELETE l RETURN existed`, { id });
+  async deleteLink(id: string, o: { run?: string | null } = {}): Promise<boolean> {
+    const [r] = await this.g.run(
+      `OPTIONAL MATCH (l:ProjectLink {id: $id}) WHERE $run IS NULL OR l.run = $run
+       WITH l, l IS NOT NULL AS existed DETACH DELETE l RETURN existed`,
+      { id, run: o.run ?? null },
+    );
     return r.get('existed');
   }
 }
@@ -144,5 +172,7 @@ function linkOf(p: Record<string, unknown>): ProjectLink {
     createdAt: p.createdAt as string,
     updatedAt: p.updatedAt as string,
     decidedBy: (p.decidedBy as string) ?? null,
+    ...(typeof p.run === 'string' && { run: p.run }),
+    ...(p.sandbox === true && { sandbox: true as const }),
   };
 }

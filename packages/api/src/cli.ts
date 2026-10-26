@@ -43,8 +43,13 @@ Usage:
   fg lessons list [--status proposed|approved|rejected|superseded] [--project k] [--flag <check>] [--source github|linear|session|memory|manual]
   fg lessons show <id>
   fg lessons approve|reject <id> [<id> ...] [--note "..."]   one batch; each lesson is recorded as decided on its own
+  fg lessons quality [--project k]               of the lessons decided in the last 30 and 90 days: approved as written, after an edit, rejected
   fg lessons recheck                             re-run the lesson checks on every proposed and approved lesson (the worker's next round)
   fg lessons to-fact <id> [--kind convention] [--relevance 0.8]   file a lesson that states how the code is as a project fact you wrote; rejects the lesson
+  fg demo seed [--project k]                     a small corpus marked demo in demo-shop (approved lessons tied to files, a miss,
+                                                 facts) so the lesson path fires; you approve its lessons by running it.
+                                                 --project: another project (the owner only: needs lesson_decide)
+  fg demo remove [--project k]                   take back exactly what fg demo seed wrote
   fg map rebuild <key>                               remap a project's code from scratch at the worker's next pass (recorded in Activity)
   fg links list --project k
   fg links confirm|dismiss <a> <b> [--relation depends_on|related] [--note "..."]
@@ -52,8 +57,12 @@ Usage:
   fg facts relevance <id> <0..1> --project k
   fg docs list --project k
   fg docs upload <file> --project k [--title "..."]   text, or a png/jpeg/webp/gif image
-  fg activity [--project k] [--kind k] [--limit n]
+  fg activity [--project k] [--kind k] [--run id] [--limit n]
   fg sessions [--project k] [--limit n]
+  fg evidence <session-id>                       what the tool saw in one session and decided: turns, the detector's call
+                                                 on each and the skip rules, Inbox items with their post-mortem and lesson, context served
+  fg cleanup --run <id> [--apply]                remove what a labelled run wrote: a dry run (counts per kind, what stays and
+                                                 why) unless --apply; never what anyone outside the run touched since
   fg cloud status
   fg cloud sync-now [--force]                    sends what changed since the last sync (--force: everything)
   fg integrations status
@@ -70,27 +79,33 @@ Options:
   --until <what>   fg status: poll until idle (nothing queued; the GitHub and Linear sync does not hold it up) or that
                    stage; --timeout s gives up (exit 1)
   --as <name>      the agent name Activity records (default: FG_OPERATOR_NAME, else fg)
+  --run <id>       label every request with this run (x-fg-run; default: FG_RUN), so fg cleanup --run removes what it wrote;
+                   on cleanup and activity it names the run, and cleanup, activity and evidence are never labelled
+  --sandbox        with --run: a sandbox run (x-fg-sandbox; default: FG_SANDBOX=1): what it writes is served only to its own agents
   --url <url>      the API (default: FEEDBACK_GRAPH_URL, else http://localhost:8787)
   --help           this text (fg help <command>: that command only)
 
 Environment:
   FEEDBACK_GRAPH_URL   where the API answers (default http://localhost:8787)
   FG_OPERATOR_TOKEN    lets fg make owner decisions; the API allows only the verbs in OPERATOR_ALLOW (by default
-                       not lesson_decide, delete_project, docs_delete, settings, import, integrations). Writes are logged in Activity as operator:<name>.
+                       not lesson_decide, select_projects, delete_project, docs_delete, links_delete, settings, import,
+                       integrations, chat, chat_delete). Writes are logged in Activity as operator:<name>.
   API_TOKEN            signs in for reading when FG_OPERATOR_TOKEN is not set
-  FG_OPERATOR_NAME     the default for --as`;
+  FG_OPERATOR_NAME     the default for --as
+  FG_RUN, FG_SANDBOX   the defaults for --run and --sandbox (FG_SANDBOX=1)`;
 
 // ── Arguments ──────────────────────────────────────────────────────────
 
 type Flags = {
   json?: true; watch?: true; all?: true; only?: true; help?: true; wait?: true; force?: true; 'from-stdin'?: true; 'with-sessions'?: true;
+  sandbox?: true; apply?: true; 'dry-run'?: true; run?: string;
   key?: string[]; provider?: string; status?: string; project?: string; limit?: string; reason?: string; interval?: string; as?: string; url?: string;
   until?: string; timeout?: string; kind?: string; q?: string; title?: string; note?: string; relation?: string; source?: string; relevance?: string; flag?: string;
 };
 export type Parsed = { words: string[]; flags: Flags };
 
-const BOOLEAN = new Set(['json', 'watch', 'all', 'only', 'help', 'wait', 'force', 'from-stdin', 'with-sessions']);
-const VALUED = new Set(['key', 'provider', 'status', 'project', 'limit', 'reason', 'interval', 'as', 'url', 'until', 'timeout', 'kind', 'q', 'title', 'note', 'relation', 'source', 'relevance', 'flag']);
+const BOOLEAN = new Set(['json', 'watch', 'all', 'only', 'help', 'wait', 'force', 'from-stdin', 'with-sessions', 'sandbox', 'apply', 'dry-run']);
+const VALUED = new Set(['key', 'provider', 'status', 'project', 'limit', 'reason', 'interval', 'as', 'url', 'until', 'timeout', 'kind', 'q', 'title', 'note', 'relation', 'source', 'relevance', 'flag', 'run']);
 
 export function parse(argv: string[]): Parsed {
   const words: string[] = [];
@@ -130,7 +145,10 @@ const printable = (s: string) => s.replace(/[\u0000-\u0008\u000b-\u001f\u007f-\u
 
 type Api = ReturnType<typeof client>;
 
-function client(io: CliIO, flags: Flags) {
+/** Verbs whose requests are never part of a run (cleanup, and reading what runs did). */
+const UNLABELLED = new Set(['cleanup', 'activity', 'evidence']);
+
+function client(io: CliIO, flags: Flags, labels = true) {
   const base = (flags.url ?? io.env.FEEDBACK_GRAPH_URL ?? 'http://localhost:8787').replace(/\/+$/, '');
   const token = io.env.FG_OPERATOR_TOKEN?.trim() || io.env.API_TOKEN?.trim() || '';
   const name = flags.as ?? io.env.FG_OPERATOR_NAME ?? 'fg';
@@ -142,7 +160,13 @@ function client(io: CliIO, flags: Flags) {
       throw new UsageError(`refusing to send the token to ${u.host} over ${u.protocol.replace(':', '')}: use https:// for another machine`);
     }
   }
-  const authHeaders = (): Record<string, string> => ({ 'x-fg-operator': name, ...(token && { authorization: `Bearer ${token}` }) });
+  // A run label (fg cleanup --run removes what the run wrote); the API checks it and refuses a malformed one. Not on
+  // cleanup, activity or evidence: their --run names the run to clean or list, and labelling would claim it.
+  const runId = labels ? flags.run ?? io.env.FG_RUN?.trim() ?? '' : '';
+  const sandbox = labels && (!!flags.sandbox || io.env.FG_SANDBOX?.trim() === '1');
+  if (sandbox && !runId) throw new UsageError('--sandbox needs --run <id> (or FG_RUN): a sandbox run is cleaned up by its id');
+  const runHeaders: Record<string, string> = runId ? { 'x-fg-run': runId, ...(sandbox && { 'x-fg-sandbox': '1' }) } : {};
+  const authHeaders = (): Record<string, string> => ({ 'x-fg-operator': name, ...runHeaders, ...(token && { authorization: `Bearer ${token}` }) });
   /** A server-sent event stream; null when the API has none there (an older version) or cannot be reached. */
   const events = async (path: string): Promise<{ events: AsyncGenerator<SseEvent>; close(): void } | null> => {
     const ctl = new AbortController();
@@ -236,6 +260,17 @@ const ordinal = (n: number) => `${n}${n % 100 >= 11 && n % 100 <= 13 ? 'th' : ['
 
 type Pipeline = Record<string, any>;
 
+/** LessonQuality (GET /api/lessons/quality, /api/pipeline lessons.quality). */
+type Quality = { days: number; asWritten: number; edited: number; rejected: number; decided: number };
+const pct = (n: number, of: number) => `${n} (${of ? Math.round((100 * n) / of) : 0}%)`;
+/** How the owner judged the lessons the post-mortem wrote, in one window. */
+function qualityLine(q: Quality): string {
+  const share = (n: number) => `${Math.round((100 * n) / q.decided)}%`;
+  return q.decided
+    ? `last ${q.days} d: ${q.decided} decided: ${q.asWritten} approved as written (${share(q.asWritten)}), ${q.edited} after an edit (${share(q.edited)}), ${q.rejected} rejected (${share(q.rejected)})`
+    : `last ${q.days} d: no lessons decided`;
+}
+
 /** One line of every stage's backlog, for status. */
 function pipelineLine(p: Pipeline): string {
   const parts = [];
@@ -245,6 +280,42 @@ function pipelineLine(p: Pipeline): string {
   if (p.lessons) parts.push(`lessons ${p.lessons.proposed} proposed`);
   if (p.scans) parts.push(`scans ${p.scans.running} running, ${p.scans.queued} queued${p.scans.failed ? `, ${p.scans.failed} failed` : ''}`);
   return parts.join(' · ');
+}
+
+/** How long since an ISO time, roughly: `40 s`, `14 min`, `3 h`, `2 d`. */
+export function waited(iso: string, now = Date.now()): string {
+  const s = Math.max(0, Math.round((now - Date.parse(iso)) / 1000));
+  if (s < 60) return `${s} s`;
+  if (s < 3600) return `${Math.floor(s / 60)} min`;
+  if (s < 48 * 3600) return `${Math.floor(s / 3600)} h`;
+  return `${Math.floor(s / 86_400)} d`;
+}
+
+const QUEUE_LABEL: Record<string, string> = { scans: 'scans', classify: 'classify', postmortems: 'post-mortems', chats: 'Ask answers' };
+/** Scans listed by project under the scan queue's line at most. */
+const QUEUE_PROJECTS = 10;
+
+/** One line per queue (pipeline.queues): how many wait, the oldest wait, what runs now and for how long; then each scan. */
+function queueLines(queues: Record<string, any> | undefined): string[] {
+  if (!queues) return [];
+  const lines: string[] = [];
+  for (const [name, q] of Object.entries(queues)) {
+    if (!q) continue;
+    const head = q.waiting
+      ? `${q.waiting}${q.capped ? '+' : ''} waiting${q.oldestAt ? `, oldest ${q.capped ? 'at least ' : ''}${waited(q.oldestAt)}` : ''}`
+      : 'none waiting';
+    const runs = (q.running ?? []).map((r: { what: string; since: string; shards?: { done: number; total: number } | null }) =>
+      `running ${r.shards ? `shard ${Math.min(r.shards.done + 1, r.shards.total)}/${r.shards.total} of ` : ''}${r.what} for ${waited(r.since)}`);
+    lines.push(`queue     ${QUEUE_LABEL[name] ?? name}: ${[head, ...runs].join('; ')}`);
+    if (name !== 'scans') continue;
+    const projects = (q.projects ?? []) as { project: string; status: string; since: string; shards: { done: number; total: number } | null }[];
+    for (const j of projects.slice(0, QUEUE_PROJECTS)) {
+      const shards = j.shards ? `, ${j.shards.done} of ${plural(j.shards.total, 'shard')} done` : '';
+      lines.push(`          ${j.project.padEnd(20)} ${j.status} ${waited(j.since)}${shards}`);
+    }
+    if (projects.length > QUEUE_PROJECTS) lines.push(`          and ${projects.length - QUEUE_PROJECTS} more`);
+  }
+  return lines;
 }
 
 function statusLines(s: Record<string, any>, p: Pipeline | null): string[] {
@@ -259,7 +330,9 @@ function statusLines(s: Record<string, any>, p: Pipeline | null): string[] {
     const count = pr ? ` (${pr.total === null ? `${pr.done} done` : `${pr.done} of ${pr.total}`})` : '';
     lines.push(`stage     ${s.stage.name}${s.stage.current ? ` ${s.stage.current}` : ''}${count} since ${at(s.stage.startedAt)}`);
   }
-  if (p) lines.push(`pipeline  ${pipelineLine(p)}`);
+  if (p) lines.push(`pipeline  ${pipelineLine(p)}`, ...queueLines(p.queues));
+  const judged = (p?.lessons?.quality as Quality[] | undefined)?.[0];
+  if (judged) lines.push(`lessons   ${qualityLine(judged)}`);
   const older = p?.scans?.olderScanner;
   if (older?.files) {
     const where = Object.entries((older.projects ?? {}) as Record<string, number>).map(([k, n]) => `${k} ${n}`).join(', ');
@@ -605,6 +678,15 @@ async function lessons(api: Api, io: CliIO, words: string[], f: Flags): Promise<
       : `no ${f.status ?? 'proposed'} lessons`);
     return 0;
   }
+  if (verb === 'quality') {
+    const r = await api<{ windows: Quality[]; projects: Record<string, Quality[]>; capped?: true }>('GET', `/api/lessons/quality${qs({ project: f.project })}`);
+    if (f.json) { io.out(JSON.stringify(r, null, 2)); return 0; }
+    const rows = [['all', r.windows] as const, ...Object.entries(r.projects).sort(([a], [b]) => a.localeCompare(b))].flatMap(([k, ws]) =>
+      ws.map((q) => [k, String(q.days), String(q.decided), pct(q.asWritten, q.decided), pct(q.edited, q.decided), pct(q.rejected, q.decided)]));
+    io.out(table(['PROJECT', 'DAYS', 'DECIDED', 'AS WRITTEN', 'AFTER EDIT', 'REJECTED'], rows, 40));
+    if (r.capped) io.out('(capped: more decisions than were counted; the oldest are left out)');
+    return 0;
+  }
   if (verb === 'recheck') {
     const r = await api<{ queued: number }>('POST', '/api/lessons/recheck', {});
     io.out(f.json ? JSON.stringify(r) : `${r.queued} lessons queued for a re-check: the worker re-runs the checks at its next round (fg activity --kind lessons_checked)`);
@@ -690,6 +772,14 @@ async function map(api: ReturnType<typeof client>, io: CliIO, words: string[], f
   return 0;
 }
 
+async function demo(api: Api, io: CliIO, words: string[], f: Flags): Promise<number> {
+  const [verb] = words;
+  if (verb !== 'seed' && verb !== 'remove') throw new UsageError('usage: fg demo seed|remove [--project k]');
+  const r = await api<{ message: string }>('POST', `/api/demo/${verb}`, f.project ? { project: f.project } : {});
+  io.out(f.json ? JSON.stringify(r, null, 2) : r.message);
+  return 0;
+}
+
 async function links(api: Api, io: CliIO, words: string[], f: Flags): Promise<number> {
   const [verb, a, b] = words;
   if (verb === 'list' || verb === undefined) {
@@ -736,15 +826,19 @@ async function factsCmd(api: Api, io: CliIO, words: string[], f: Flags): Promise
 
 const IMAGE_TYPES: Record<string, string> = { '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.webp': 'image/webp', '.gif': 'image/gif' };
 
+const DOCS_LIST_MAX = 500;
+
 async function docs(api: Api, io: CliIO, words: string[], f: Flags): Promise<number> {
   const [verb, file] = words;
   if (!f.project) throw new UsageError(`fg docs ${verb ?? 'list'} needs --project k`);
   const base = `/api/projects/${encodeURIComponent(f.project)}/docs`;
   if (verb === 'list' || verb === undefined) {
-    const list = await api<any[]>('GET', base);
+    // The API pages documents (a GitHub sync adds one per PR): the newest page of the largest size.
+    const list = await api<any[]>('GET', `${base}?limit=${DOCS_LIST_MAX}`);
     if (f.json) { io.out(JSON.stringify(list, null, 2)); return 0; }
     const read = (r: any) => (r ? `${r.status}${r.status === 'done' ? ` (${plural(r.facts ?? 0, 'fact')})` : r.error ? `: ${r.error}` : ''}` : '');
     io.out(list.length ? table(['REF', 'KIND', 'READ', 'ADDED BY', 'ADDED', 'TITLE'], list.map((d) => [d.ref, d.kind ?? 'text', read(d.read), d.addedBy ?? '', at(d.addedAt), d.title]), 90) : `no documents for ${f.project}`);
+    if (list.length >= DOCS_LIST_MAX) io.out(`the newest ${DOCS_LIST_MAX} documents are shown: older ones are on the project's Docs page`);
     return 0;
   }
   if (verb !== 'upload') throw new UsageError(`unknown docs command: ${verb}`);
@@ -766,9 +860,54 @@ async function docs(api: Api, io: CliIO, words: string[], f: Flags): Promise<num
 
 async function activityCmd(api: Api, io: CliIO, f: Flags): Promise<number> {
   // --json is the whole record: the list leaves big details out unless asked.
-  const list = await api<any[]>('GET', `/api/activity${qs({ project: f.project, kind: f.kind, limit: f.limit ?? '50', details: f.json ? '1' : undefined })}`);
+  const list = await api<any[]>('GET', `/api/activity${qs({ project: f.project, kind: f.kind, run: f.run, limit: f.limit ?? '50', details: f.json ? '1' : undefined })}`);
   if (f.json) { io.out(JSON.stringify(list, null, 2)); return 0; }
-  io.out(list.length ? table(['TIME', 'ACTOR', 'KIND', 'PROJECT', 'SUBJECT'], list.map((a) => [at(a.ts), a.actor, a.kind, a.projectKey ?? '', a.subject]), 90) : 'no activity');
+  const runs = list.some((a) => a.run);
+  io.out(list.length
+    ? table(['TIME', 'ACTOR', 'KIND', 'PROJECT', ...(runs ? ['RUN'] : []), 'SUBJECT'], list.map((a) => [at(a.ts), a.actor, a.kind, a.projectKey ?? '', ...(runs ? [a.run ? `${a.run}${a.sandbox ? ' (sandbox)' : ''}` : ''] : []), a.subject]), 90)
+    : 'no activity');
+  return 0;
+}
+
+/** fg cleanup --run <id>: what the run wrote, removed with --apply (DELETE /api/runs/:id); a dry run otherwise. */
+async function cleanupCmd(api: Api, io: CliIO, f: Flags): Promise<number> {
+  if (!f.run) throw new UsageError('fg cleanup --run <id> [--apply]');
+  if (f.apply && f['dry-run']) throw new UsageError('--apply and --dry-run: choose one');
+  const r = await api<any>('DELETE', `/api/runs/${encodeURIComponent(f.run)}`, { dryRun: !f.apply });
+  if (f.json) { io.out(JSON.stringify(r, null, 2)); return 0; }
+  const counts: Record<string, number> = r.dryRun ? r.remove : r.removed ?? r.remove;
+  const rows = Object.entries(counts).filter(([, n]) => n > 0);
+  io.out(`run ${r.run}${r.sandbox ? ' (sandbox)' : ''}: ${r.dryRun ? 'dry run, nothing removed yet' : 'removed'}`);
+  io.out(rows.length ? table(['KIND', r.dryRun ? 'WOULD REMOVE' : 'REMOVED'], rows) : r.dryRun ? 'nothing to remove' : 'nothing removed');
+  if (r.kept?.length) {
+    io.out(`\nkept (${r.kept.length}): someone outside the run touched them, or they are a real session's now`);
+    io.out(table(['KIND', 'ID', 'WHY'], r.kept.map((k: any) => [k.kind, k.id, k.why]), 100));
+  }
+  if (r.changed?.length) {
+    io.out(`\nchanged by the run but not its own (never undone: put them back by hand if you need to)`);
+    io.out(table(['KIND', 'TARGETS', 'SUBJECT'], r.changed.map((c: any) => [c.kind, c.targets.join(','), c.subject]), 80));
+  }
+  const n = r.entries ?? 0;
+  io.out(`\nits ${n} Activity ${n === 1 ? 'entry stays' : 'entries stay'} (the log is never edited)${r.dryRun ? `; fg cleanup --run ${r.run} --apply removes the rest` : ''}`);
+  return 0;
+}
+
+/** fg evidence <session>: GET /api/sessions/:id/evidence, in a few tables. */
+async function evidenceCmd(api: Api, io: CliIO, words: string[], f: Flags): Promise<number> {
+  const id = words[0];
+  if (!id) throw new UsageError('fg evidence <session-id>');
+  const e = await api<any>('GET', `/api/sessions/${encodeURIComponent(id)}/evidence`);
+  if (f.json) { io.out(JSON.stringify(e, null, 2)); return 0; }
+  const t = e.turns;
+  io.out(`${e.session.id} [${e.session.projectKey}] ${e.session.source}, ${e.session.state}: ${plural(t.count, 'turn')} (${at(t.first)} to ${at(t.last)}), ${t.classified} classified, ${t.waiting} waiting, ${t.givenUp} given up${t.prunedText ? `, ${t.prunedText} with their text pruned` : ''}`);
+  if (e.files) io.out(`files: ${e.files.edited.length} edited${e.files.edited.length ? ` (${e.files.edited.slice(0, 8).join(', ')}${e.files.edited.length > 8 ? ', ...' : ''})` : ''}, ${e.files.readOnly.length} only read`);
+  const flags = e.flags.filter((x: any) => x.flagged || x.skipped.length || x.label === 'pushback' || x.label === 'correction');
+  io.out(flags.length
+    ? `\n${table(['TURN', 'LABEL', 'CONF', 'FILED', 'SKIP RULES', 'WHY'], flags.map((x: any) => [x.index, x.label, x.confidence ?? '', x.flagged ? x.candidateId : 'no', x.skipped.join(',') || '', x.why ?? '']), 80)}`
+    : '\nno turn read as pushback or correction');
+  if (e.flagsLeftOut) io.out(`(${e.flagsLeftOut} more classified turns not listed)`);
+  if (e.inbox.length) io.out(`\n${table(['INBOX', 'STATUS', 'DECIDED BY', 'LESSON', 'MISS'], e.inbox.map((i: any) => [i.id, i.status, i.decidedBy ?? '', i.lesson ? `${i.lesson.id} (${i.lesson.status})` : '', i.miss?.missed ?? '']), 70)}`);
+  io.out(e.served.length ? `\ncontext served: ${plural(e.served.length, 'call')}` : '\nno context served is recorded (it is when the agent passes its session_id)');
   return 0;
 }
 
@@ -809,7 +948,7 @@ async function integrationsCmd(api: Api, io: CliIO, words: string[], f: Flags): 
   return 0;
 }
 
-const VERBS = new Set(['status', 'pipeline', 'projects', 'scan', 'inbox', 'lessons', 'map', 'links', 'facts', 'docs', 'activity', 'sessions', 'cloud', 'integrations', 'doctor', 'setup']);
+const VERBS = new Set(['status', 'pipeline', 'projects', 'scan', 'inbox', 'lessons', 'demo', 'map', 'links', 'facts', 'docs', 'activity', 'sessions', 'evidence', 'cleanup', 'cloud', 'integrations', 'doctor', 'setup']);
 
 /** fg help <verb>: that verb's usage lines (with their continuation lines) and the options; the whole text otherwise. */
 export function helpFor(verb: string | undefined): string {
@@ -854,7 +993,7 @@ export async function run(argv: string[], raw: CliIO): Promise<number> {
   if (words[0] === 'help') { io.out(helpFor(words[1])); return 0; }
   if (flags.help || !words.length) { io.out(words.length ? helpFor(words[0]) : USAGE); return 0; }
   try {
-    const api = client(io, flags);
+    const api = client(io, flags, !UNLABELLED.has(words[0]));
     switch (words[0]) {
       case 'status': return await status(api, io, flags);
       case 'pipeline': return await pipelineCmd(api, io, flags);
@@ -863,6 +1002,8 @@ export async function run(argv: string[], raw: CliIO): Promise<number> {
       case 'docs': return await docs(api, io, words.slice(1), flags);
       case 'activity': return await activityCmd(api, io, flags);
       case 'sessions': return await sessionsCmd(api, io, flags);
+      case 'evidence': return await evidenceCmd(api, io, words.slice(1), flags);
+      case 'cleanup': return await cleanupCmd(api, io, flags);
       case 'integrations': return await integrationsCmd(api, io, words.slice(1), flags);
       case 'doctor': throw new UsageError('fg doctor runs ./scripts/doctor.sh on the host (scripts/fg does that); it cannot run inside the api container');
       case 'projects': return await projects(api, io, words[1], flags);
@@ -871,6 +1012,7 @@ export async function run(argv: string[], raw: CliIO): Promise<number> {
       case 'lessons': return await lessons(api, io, words.slice(1), flags);
       case 'cloud': return await cloud(api, io, words[1], flags);
       case 'map': return await map(api, io, words.slice(1), flags);
+      case 'demo': return await demo(api, io, words.slice(1), flags);
       default: throw new UsageError(`unknown command: ${words[0]}`);
     }
   } catch (e) {

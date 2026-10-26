@@ -236,6 +236,8 @@ test('Codex without the flag: no approval key unasked; without a terminal it say
   const out = s.run(['codex']);
   expect(readFileSync(s.config, 'utf8')).not.toContain('default_tools_approval_mode');
   expect(out).toContain('--codex-auto-approve');
+  // The one-run form, for a headless `codex exec` without changing config.toml.
+  expect(out).toContain(`codex exec -c 'mcp_servers.feedback-graph.default_tools_approval_mode="approve"'`);
 
   const asked = sandbox(['codex']);
   const ask = (answer: string) =>
@@ -254,4 +256,50 @@ test('--dry-run with --codex-auto-approve writes nothing', () => {
   const s = sandbox(['codex']);
   expect(s.run(['codex', '--dry-run', '--codex-auto-approve'])).toContain(`would: add ${APPROVE}`);
   expect(existsSync(s.config)).toBe(false);
+});
+
+// ── A second install on the same machine ───────────────────────────────
+// setup.sh gives a second checkout FG_INSTANCE=feedback-graph-<folder> and its own API_PORT. Its agents get a server of
+// their own next to the first one's, never the first one's name pointed at another port.
+
+test('a second instance registers under its own name and port in Claude Code and Codex; the default keeps feedback-graph', () => {
+  const s = sandbox(['claude', 'codex']);
+  mkdirSync(s.codexDir);
+  writeFileSync(s.config, '[mcp_servers.feedback-graph]\nurl = "http://localhost:8787/mcp"\n');
+  const file = join(s.home, 'second.env');
+  writeFileSync(file, 'FG_INSTANCE=feedback-graph-repo\nAPI_PORT=8797\n');
+  const out = s.run(['--codex-auto-approve'], { FEEDBACK_GRAPH_ENV: file });
+  expect(readFileSync(s.calls, 'utf8')).toContain('mcp add --transport http --scope user feedback-graph-repo http://localhost:8797/mcp');
+  expect(readFileSync(s.calls, 'utf8')).toContain('mcp get feedback-graph-repo');
+  const cfg = readFileSync(s.config, 'utf8');
+  // The first install's table is untouched; the second one's is added beside it.
+  expect(cfg.startsWith('[mcp_servers.feedback-graph]\nurl = "http://localhost:8787/mcp"\n')).toBe(true);
+  expect(cfg).toContain(`[mcp_servers.feedback-graph-repo]\nurl = "http://localhost:8797/mcp"\n${APPROVE}\n`);
+  expect(out).toContain('feedback-graph-repo');
+  // Re-running finds its own table, and does not mistake the first install's for it (or the reverse).
+  expect(s.run(['codex', '--codex-auto-approve'], { FEEDBACK_GRAPH_ENV: file })).toMatch(/feedback-graph-repo already/);
+  expect(readFileSync(s.config, 'utf8')).toBe(cfg);
+});
+
+test('server names: the default instance is feedback-graph, feedback-graph-<x> is used as it is, any other name is prefixed', () => {
+  const nameFor = (instance: string) => {
+    const s = sandbox(['codex']);
+    s.run(['codex'], { FG_INSTANCE: instance });
+    return readFileSync(s.config, 'utf8').match(/^\[mcp_servers\.(.*)\]$/m)?.[1];
+  };
+  expect(nameFor('')).toBe('feedback-graph');
+  expect(nameFor('feedback-graph')).toBe('feedback-graph');
+  expect(nameFor('feedback-graph-demo-shop')).toBe('feedback-graph-demo-shop');
+  expect(nameFor('fg-staging')).toBe('feedback-graph-fg-staging');
+  expect(() => nameFor('Bad Name')).toThrow(/FG_INSTANCE/);
+});
+
+test('a second instance with the plugin installed still registers its own server (the plugin\'s fg reaches one install)', () => {
+  const s = sandbox(['claude']);
+  writeFileSync(join(s.home, 'bin', 'claude'), `#!/bin/sh\necho "$*" >> '${s.calls}'\n[ "$1" = plugin ] && echo '  ❯ feedback-graph@feedback-graph'\n[ "$2" = get ] && exit 1\nexit 0\n`);
+  const out = s.run(['claude'], { FG_INSTANCE: 'feedback-graph-repo', API_PORT: '8797' });
+  expect(readFileSync(s.calls, 'utf8')).toContain('mcp add --transport http --scope user feedback-graph-repo http://localhost:8797/mcp');
+  // The skills come with the plugin already.
+  expect(existsSync(join(s.home, '.claude', 'skills', 'feedback-graph'))).toBe(false);
+  expect(out).toMatch(/plugin/);
 });

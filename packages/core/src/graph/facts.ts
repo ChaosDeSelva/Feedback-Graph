@@ -1,10 +1,11 @@
 import { randomUUID } from 'node:crypto';
 import neo4j from 'neo4j-driver';
-import { FACT_EVIDENCE, FACT_ORIGINS, type CodeFact, type FactEvidence, type FactKind, type FactOrigin, type Project, type ProjectSummary, type RelevanceBy, type ScanJob, type ScanShards, type ScanStatus } from '../types.ts';
+import { FACT_EVIDENCE, FACT_ORIGINS, type CodeFact, type FactEvidence, type FactKind, type FactOrigin, type Project, type ProjectSummary, type RelevanceBy, type ScanJob, type ScanQueueEntry, type ScanShards, type ScanStatus, type RunTag } from '../types.ts';
 import { factOrigin } from '../relevance.ts';
-import { redactDeep, redactSecrets } from '../redact.ts';
-import type { FactCheck, FactScope, FactsStore, ScanJobPatch, ScannedFile } from '../store.ts';
+import { holdsCredential, REDACT_PAGE, redactDeep, redactSecrets, redactStoredFact } from '../redact.ts';
+import { DEMO_SOURCE, type FactCheck, type FactScope, type FactsStore, type ScanJobPatch, type ScannedFile } from '../store.ts';
 import type { GraphRepo } from './repo.ts';
+import { VISIBLE_TO_RUN } from './runs.ts';
 
 /**
  * A stored fact with its provenance: which model, which scan, which version of the file. `createdAt` is when a scan
@@ -24,8 +25,11 @@ export type StoredFact = Omit<CodeFact, 'relevance' | 'evidence'> & {
 };
 /** A current fact with no relevance yet, for the background scorer. */
 export type UnscoredFact = { id: string; projectKey: string; kind: FactKind; statement: string; path: string; why: string };
-/** projectKey: only a fact of that project is changed. */
-export type RelevanceUpdate = { id: string; relevance: number; by: RelevanceBy; projectKey?: string };
+/**
+ * projectKey: only a fact of that project is changed. run: a decision made in that run changes only a fact the run
+ * wrote; null: the owner's decision, which makes a run's fact the owner's; unset (the scorer): ownership is left alone.
+ */
+export type RelevanceUpdate = { id: string; relevance: number; by: RelevanceBy; projectKey?: string; run?: string | null };
 /** 0..1, so a model's or a request's stray number cannot skew ranking. */
 export const clampRelevance = (r: number) => (Number.isFinite(r) ? Math.min(1, Math.max(0, r)) : 0.5);
 /** Store form of an extracted fact's relevance: a number in range, or null (not scored). */
@@ -66,6 +70,16 @@ export function scanRequestPaths(paths: string[]): string[] {
 export function requestTimes(paths: string[], now = Date.now()): [string, string][] {
   return paths.map((p, i) => [p, new Date(now + i).toISOString()]);
 }
+
+/**
+ * Cypher after a MATCH of (j:ScanJob): adds waitingSince. A job that gave up its slot waits from then (servedAt), so it
+ * goes behind every job queued before it gave way, whatever its project's files an agent asked for earlier: a file
+ * request only moves up a job not served since. A job never served waits from when it was requested, or from its
+ * project's oldest file request not read yet when that is older. ISO strings, so they compare as times.
+ */
+const WAITING_SINCE = `OPTIONAL MATCH (cf:CodeFile {projectKey: j.projectKey}) WHERE j.servedAt IS NULL AND cf.scanRequestedAt IS NOT NULL
+       WITH j, min(cf.scanRequestedAt) AS asked
+       WITH j, CASE WHEN j.servedAt IS NOT NULL THEN j.servedAt WHEN asked IS NOT NULL AND asked < j.requestedAt THEN asked ELSE j.requestedAt END AS waitingSince`;
 
 /** Real failures a scan job gets before it is failed for good. */
 export const MAX_SCAN_ATTEMPTS = 3;
@@ -119,12 +133,17 @@ export class FactsRepo implements FactsStore {
     const file = redactDeep(rawFile);
     const facts = redactDeep(rawFacts);
     const now = new Date().toISOString();
+    const fields = `cf.projectKey = $projectKey, cf.path = $file.path, cf.hash = $file.hash, cf.summary = $file.summary,
+           cf.scannedAt = $now, cf.removed = false, cf.scanVersion = $file.version`;
+    // The demo seed only adds a file that is not recorded yet (FactsStore.saveFileFacts).
+    const setFile = source === DEMO_SOURCE
+      ? `ON CREATE SET ${fields}, cf.hashChangedAt = $now`
+      : `SET cf.hashChangedAt = CASE WHEN cf.hash = $file.hash AND cf.hashChangedAt IS NOT NULL THEN cf.hashChangedAt ELSE $now END
+       SET ${fields}`;
     await this.g.run(
       `MERGE (p:Project {key: $projectKey})
        MERGE (cf:CodeFile {id: $projectKey + ':' + $file.path})
-       SET cf.hashChangedAt = CASE WHEN cf.hash = $file.hash AND cf.hashChangedAt IS NOT NULL THEN cf.hashChangedAt ELSE $now END
-       SET cf.projectKey = $projectKey, cf.path = $file.path, cf.hash = $file.hash, cf.summary = $file.summary,
-           cf.scannedAt = $now, cf.removed = false, cf.scanVersion = $file.version
+       ${setFile}
        MERGE (cf)-[:IN]->(p)
        WITH cf
        OPTIONAL MATCH (old:Fact {current: true})-[:ABOUT]->(cf) WHERE coalesce(old.origin, '') <> 'you'
@@ -201,7 +220,7 @@ export class FactsRepo implements FactsStore {
   }
 
   /** Your fact: under the project, about no code file, so a scan has nothing of it to close. */
-  async addOwnerFact(projectKey: string, rawFact: EmbeddedFact, by: RelevanceBy): Promise<StoredFact> {
+  async addOwnerFact(projectKey: string, rawFact: EmbeddedFact, by: RelevanceBy, run?: RunTag | null): Promise<StoredFact> {
     const fx = redactDeep(rawFact);
     const id = randomUUID();
     const now = new Date().toISOString();
@@ -211,9 +230,9 @@ export class FactsRepo implements FactsStore {
        CREATE (n:Fact {id: $id, projectKey: $projectKey, kind: $fx.kind, statement: $fx.statement, path: $fx.path,
                        lines: $fx.lines, confidence: $fx.confidence, why: $fx.why, embedding: $fx.embedding, source: $by,
                        origin: 'you', evidence: null, relevance: $relevance, relevanceBy: CASE WHEN $relevance IS NULL THEN null ELSE $by END,
-                       scanJobId: null, fileHash: null, current: true, createdAt: $now, validFrom: $now})
+                       scanJobId: null, fileHash: null, current: true, createdAt: $now, validFrom: $now, run: $run, sandbox: $sandbox})
        RETURN n`,
-      { projectKey, id, fx: { ...fx, path: fx.path || PROJECT_PATH, lines: fx.lines ?? null }, by, relevance, now },
+      { projectKey, id, fx: { ...fx, path: fx.path || PROJECT_PATH, lines: fx.lines ?? null }, by, relevance, now, run: run?.id ?? null, sandbox: !!run?.sandbox },
     );
     return factOf(r.get('n').properties);
   }
@@ -228,16 +247,16 @@ export class FactsRepo implements FactsStore {
     return rows.map((r) => r.get('s'));
   }
 
-  async listFacts(q: { projectKey: string; kind?: FactKind; path?: string; origin?: FactOrigin; limit?: number; offset?: number }): Promise<StoredFact[]> {
+  async listFacts(q: { projectKey: string; kind?: FactKind; path?: string; origin?: FactOrigin; limit?: number; offset?: number; run?: string | null }): Promise<StoredFact[]> {
     const rows = await this.g.run(
       `MATCH (x:Fact {projectKey: $projectKey, current: true})
        WHERE ($kind IS NULL OR x.kind = $kind) AND ($path IS NULL OR (x.path = $path AND x.docId IS NULL))
-         AND ($origin IS NULL OR ${ORIGIN_CYPHER} = $origin)
+         AND ($origin IS NULL OR ${ORIGIN_CYPHER} = $origin) AND ${VISIBLE_TO_RUN('x')}
        OPTIONAL MATCH (x)-[:ABOUT]->(cf:CodeFile)
        RETURN x, cf.summary AS fileSummary, cf.hashChangedAt AS fileChangedAt ORDER BY x.path, x.createdAt, x.id SKIP $offset LIMIT $limit`,
       {
         projectKey: q.projectKey, kind: q.kind ?? null, path: q.path ?? null, origin: q.origin ?? null, manifestWhy: MANIFEST_WHY_RE,
-        offset: neo4j.int(Math.max(0, Math.floor(q.offset ?? 0))), limit: neo4j.int(q.limit ?? 500),
+        offset: neo4j.int(Math.max(0, Math.floor(q.offset ?? 0))), limit: neo4j.int(q.limit ?? 500), run: q.run ?? null,
       },
     );
     return rows.map((r) => factOf(r.get('x').properties, r.get('fileSummary'), r.get('fileChangedAt')));
@@ -274,6 +293,38 @@ export class FactsRepo implements FactsStore {
     return r ? Number(r.get('closed')) : 0;
   }
 
+  async redactStoredFacts(): Promise<{ redacted: number; closed: number; owner: number }> {
+    let redacted = 0;
+    let closed = 0;
+    let owner = 0;
+    for (let after = ''; ;) {
+      const rows = await this.g.run(
+        `MATCH (f:Fact) WHERE f.id > $after
+         RETURN f.id AS id, f.statement AS statement, f.why AS why, f.current AS current, f.origin AS origin ORDER BY f.id LIMIT $page`,
+        { after, page: neo4j.int(REDACT_PAGE) },
+      );
+      if (!rows.length) break;
+      after = rows[rows.length - 1].get('id');
+      const changed = rows.flatMap((r) => {
+        const was = { statement: (r.get('statement') ?? '') as string, why: (r.get('why') ?? null) as string | null, current: r.get('current') === true, origin: (r.get('origin') ?? null) as string | null };
+        const x = { id: r.get('id') as string, owner: was.origin === 'you', ...redactStoredFact(was) };
+        return x.statement !== was.statement || x.why !== was.why || x.close ? [x] : [];
+      });
+      if (!changed.length) continue;
+      await this.g.run(
+        `UNWIND $changed AS c MATCH (f:Fact {id: c.id})
+         SET f.statement = c.statement, f.why = c.why,
+             f.validTo = CASE WHEN c.close THEN $now ELSE f.validTo END,
+             f.current = CASE WHEN c.close THEN false ELSE f.current END`,
+        { changed, now: new Date().toISOString() },
+      );
+      redacted += changed.length;
+      closed += changed.filter((c) => c.close).length;
+      owner += changed.filter((c) => c.owner).length;
+    }
+    return { redacted, closed, owner };
+  }
+
   /** A request is a mark on the file's CodeFile (one with no hash yet when it was never scanned). */
   async requestFilesScan(projectKey: string, paths: string[]): Promise<number> {
     const unique = scanRequestPaths(paths);
@@ -308,14 +359,15 @@ export class FactsRepo implements FactsStore {
     await this.g.run(`MATCH (cf:CodeFile {projectKey: $projectKey}) WHERE cf.path IN $paths REMOVE cf.scanRequestedAt`, { projectKey, paths });
   }
 
-  async searchFacts(q: { embedding: number[]; projectKey: string; k: number }): Promise<FactHit[]> {
+  async searchFacts(q: { embedding: number[]; projectKey: string; k: number; run?: string | null }): Promise<FactHit[]> {
     const rows = await this.g.run(
       `MATCH (node:Fact {projectKey: $projectKey, current: true}) WHERE node.embedding IS NOT NULL AND size(node.embedding) = size($embedding)
+         AND ${VISIBLE_TO_RUN('node')}
        WITH node, vector.similarity.cosine(node.embedding, $embedding) AS score
        ORDER BY score DESC LIMIT $k
        OPTIONAL MATCH (node)-[:ABOUT]->(cf:CodeFile)
        RETURN node, score, cf.summary AS fileSummary, cf.hashChangedAt AS fileChangedAt ORDER BY score DESC`,
-      { embedding: q.embedding, k: neo4j.int(q.k), projectKey: q.projectKey },
+      { embedding: q.embedding, k: neo4j.int(q.k), projectKey: q.projectKey, run: q.run ?? null },
     );
     return rows.map((r) => ({ fact: factOf(r.get('node').properties, r.get('fileSummary'), r.get('fileChangedAt')), score: r.get('score') }));
   }
@@ -338,9 +390,11 @@ export class FactsRepo implements FactsStore {
     const [r] = await this.g.run(
       `UNWIND $updates AS u
        MATCH (x:Fact {id: u.id}) WHERE (u.projectKey IS NULL OR x.projectKey = u.projectKey) AND (u.by <> 'model' OR coalesce(x.relevanceBy, 'model') = 'model')
+         AND (u.run IS NULL OR x.run = u.run)
        SET x.relevance = u.relevance, x.relevanceBy = u.by
+       FOREACH (_ IN CASE WHEN u.owner THEN [1] ELSE [] END | SET x.run = null, x.sandbox = false)
        RETURN count(x) AS n`,
-      { updates: updates.map((u) => ({ ...u, projectKey: u.projectKey ?? null, relevance: clampRelevance(u.relevance) })) },
+      { updates: updates.map((u) => ({ id: u.id, by: u.by, projectKey: u.projectKey ?? null, relevance: clampRelevance(u.relevance), run: u.run ?? null, owner: u.run === null })) },
     );
     return Number(r.get('n'));
   }
@@ -375,10 +429,24 @@ export class FactsRepo implements FactsStore {
   async nextScanJob(now = new Date(), exclude: string[] = []): Promise<ScanJob | null> {
     const [r] = await this.g.run(
       `MATCH (j:ScanJob {status: 'queued'}) WHERE coalesce(j.retryAt, '') <= $now AND NOT j.id IN $exclude
-       RETURN j ORDER BY j.requestedAt, j.id LIMIT 1`,
+       ${WAITING_SINCE}
+       RETURN j ORDER BY waitingSince, j.requestedAt, j.id LIMIT 1`,
       { now: now.toISOString(), exclude },
     );
     return r ? jobOf(r.get('j').properties) : null;
+  }
+
+  async requeueScanJob(id: string, now = new Date()): Promise<void> {
+    await this.g.run(`MATCH (j:ScanJob {id: $id}) WHERE j.status IN ['queued', 'running'] SET j.status = 'queued', j.servedAt = $now`, { id, now: now.toISOString() });
+  }
+
+  async scanQueue(): Promise<ScanQueueEntry[]> {
+    const rows = await this.g.run(
+      `MATCH (j:ScanJob) WHERE j.status IN ['queued', 'running']
+       ${WAITING_SINCE}
+       RETURN j, waitingSince ORDER BY CASE j.status WHEN 'running' THEN 0 ELSE 1 END, CASE j.status WHEN 'running' THEN j.startedAt END, waitingSince, j.requestedAt, j.id`,
+    );
+    return rows.map((r) => ({ ...jobOf(r.get('j').properties), waitingSince: r.get('waitingSince') }));
   }
 
   async recordScanFailure(id: string, error: string, o: { counted: boolean }, now = new Date()): Promise<{ attempts: number; retryAt: string | null }> {
@@ -419,11 +487,12 @@ export class FactsRepo implements FactsStore {
       `MATCH (p:Project)
        OPTIONAL MATCH (p)<-[:IN]-(s:Session)
        WITH p, count(s) AS sessions
-       OPTIONAL MATCH (f:Feedback {projectKey: p.key})
+       // A sandbox run's feedback, lessons and facts are counted for no one (they are served only to that run).
+       OPTIONAL MATCH (f:Feedback {projectKey: p.key}) WHERE NOT EXISTS { MATCH (k:Candidate {id: f.id}) WHERE k.sandbox = true }
        WITH p, sessions, count(f) AS feedback
-       OPTIONAL MATCH (l:Lesson {projectKey: p.key})
+       OPTIONAL MATCH (l:Lesson {projectKey: p.key}) WHERE NOT coalesce(l.sandbox, false)
        WITH p, sessions, feedback, count(l) AS lessons
-       OPTIONAL MATCH (x:Fact {projectKey: p.key, current: true})
+       OPTIONAL MATCH (x:Fact {projectKey: p.key, current: true}) WHERE NOT coalesce(x.sandbox, false)
        WITH p, sessions, feedback, lessons, count(x) AS facts,
             count(CASE WHEN x.docId IS NOT NULL THEN 1 END) AS documentFacts,
             count(CASE WHEN x.docId IS NULL AND (x.origin = 'manifest' OR (x.origin IS NULL AND x.why =~ $manifestWhy)) THEN 1 END) AS manifestFacts,
@@ -508,5 +577,6 @@ function jobOf(p: Record<string, unknown>): ScanJob {
     attempts: Number(p.attempts ?? 0),
     retryAt: (p.retryAt as string) ?? null,
     shards: typeof p.shards === 'string' ? (JSON.parse(p.shards) as ScanShards) : null,
+    servedAt: (p.servedAt as string) ?? null,
   };
 }

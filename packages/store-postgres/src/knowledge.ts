@@ -8,14 +8,28 @@ import {
   LESSON_CHECKS_VERSION,
   feedbackAuthorOf,
   postmortemRetryAt,
+  REDACT_PAGE,
   redactDeep,
   redactSecrets,
+  redactStoredRow,
   type Cause,
+  type CommentLesson,
+  type ExternalRef,
   type ContextItem,
+  DEMO_SOURCE,
+  demoPrefix,
+  type DemoMiss,
+  type DemoRemoved,
   type KnowledgeStore,
   type Lesson,
   type LessonCheck,
   type LessonDetail,
+  type LessonDraft,
+  type DecidedLesson,
+  type DecidedLessonsQuery,
+  editedDraft,
+  ownerDecided,
+  OWNER_DECIDED_SQL,
   type LessonFilter,
   type LessonFrom,
   type LessonHit,
@@ -27,12 +41,13 @@ import {
   type PostMortemInput,
   type Project,
   type RelatedMiss,
+  type RunTag,
   type UnsortedMiss,
   type SimilarLesson,
 } from '@fb/core';
 import { iso, toJson, toVector, tx, type Db } from './db.ts';
 import { commitOf, turnOf } from './graph.ts';
-import { learnedIn, relatedMissesQuery, runSearch, searchLessonsQuery } from './vector.ts';
+import { learnedIn, relatedMissesQuery, runSearch, searchLessonsQuery, visibleToRun } from './vector.ts';
 
 type Row = Record<string, any>;
 
@@ -61,6 +76,16 @@ export class PgKnowledgeStore implements KnowledgeStore {
       [MAX_POSTMORTEM_ATTEMPTS],
     );
     return rows[0].n;
+  }
+
+  async postmortemQueue(): Promise<{ waiting: number; oldestAt: string | null }> {
+    const { rows } = await this.q(
+      `SELECT count(*)::int AS n, min(f.created_at) AS oldest
+       FROM feedback f JOIN turns t ON t.uuid = f.turn_uuid JOIN sessions s ON s.id = t.session_id JOIN projects p ON p.key = s.project_key
+       WHERE NOT EXISTS (SELECT 1 FROM misses m WHERE m.feedback_id = f.id) AND f.status <> 'rejected' AND f.attempts < $1`,
+      [MAX_POSTMORTEM_ATTEMPTS],
+    );
+    return { waiting: rows[0].n, oldestAt: iso(rows[0].oldest) };
   }
 
   async feedbackNeedingPostmortem(limit: number, now = new Date()): Promise<PostMortemInput[]> {
@@ -118,9 +143,11 @@ export class PgKnowledgeStore implements KnowledgeStore {
     const pm = redactDeep(raw); // model output can quote secrets it read in the repo
     const now = new Date();
     await tx(this.db, async (c) => {
+      // The report's run (RunTag), carried to the miss and lesson so a sandbox one is served only to its run.
       const { rows } = await c.query(
-        `SELECT f.id, t.uuid, s.id AS sid, p.key AS pkey
+        `SELECT f.id, t.uuid, s.id AS sid, p.key AS pkey, k.run, coalesce(k.sandbox, false) AS sandbox
          FROM feedback f JOIN turns t ON t.uuid = f.turn_uuid JOIN sessions s ON s.id = t.session_id JOIN projects p ON p.key = s.project_key
+           LEFT JOIN candidates k ON k.id = f.id
          WHERE f.id = $1 FOR UPDATE OF f`,
         [feedbackId],
       );
@@ -136,23 +163,33 @@ export class PgKnowledgeStore implements KnowledgeStore {
       await c.query('UPDATE feedback SET status = $2, updated_at = $3, task_id = $4 WHERE id = $1', [feedbackId, OUTCOME_STATUS[pm.outcome], now, taskId]);
       await c.query('INSERT INTO causes (key) VALUES ($1) ON CONFLICT DO NOTHING', [pm.cause]);
       await c.query(
-        `INSERT INTO misses (id, project_key, feedback_id, missed, cause, cause_explanation, outcome, created_at, embedding, subject)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::vector, $10)
+        `INSERT INTO misses (id, project_key, feedback_id, missed, cause, cause_explanation, outcome, created_at, embedding, subject, run, sandbox)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::vector, $10, $11, $12)
          ON CONFLICT (id) DO UPDATE SET project_key = EXCLUDED.project_key, feedback_id = EXCLUDED.feedback_id, missed = EXCLUDED.missed,
            cause = EXCLUDED.cause, cause_explanation = EXCLUDED.cause_explanation, outcome = EXCLUDED.outcome,
-           created_at = EXCLUDED.created_at, embedding = EXCLUDED.embedding, subject = EXCLUDED.subject`,
-        [missId, r.pkey, feedbackId, pm.missed, pm.cause, pm.causeExplanation, pm.outcome, now, vectorOf(embeddings.miss), pm.subject ?? null],
+           created_at = EXCLUDED.created_at, embedding = EXCLUDED.embedding, subject = EXCLUDED.subject, run = EXCLUDED.run, sandbox = EXCLUDED.sandbox`,
+        [missId, r.pkey, feedbackId, pm.missed, pm.cause, pm.causeExplanation, pm.outcome, now, vectorOf(embeddings.miss), pm.subject ?? null, r.run ?? null, r.sandbox === true],
       );
-      // A re-saved post-mortem rewrites the lesson's text but keeps its status, creation time and source.
-      await c.query(
+      // A re-saved post-mortem rewrites the lesson's text but keeps its status, creation time and source; one the owner
+      // edited (proposed_as kept) keeps the owner's words, paths, scope and their checks. A dropped lesson (no rule even
+      // after the retry) is not written: the miss is.
+      if (!pm.lessonDropped) await c.query(
         `INSERT INTO lessons (id, status, created_at, source, title, rule, applies_when, scope, paths, cause, miss_id,
-                              project_key, origin_project_key, embedding, checks, checks_version)
+                              project_key, origin_project_key, embedding, checks, checks_version, run, sandbox)
          VALUES ($1, 'proposed', $2, 'postmortem', $3, $4, $5, $6, $7, $8, $9, CASE WHEN $6 = 'global' THEN NULL ELSE $10 END, $10, $11::vector, $12::jsonb,
-                 CASE WHEN $12::jsonb IS NULL THEN NULL ELSE $13::integer END)
-         ON CONFLICT (id) DO UPDATE SET title = EXCLUDED.title, rule = EXCLUDED.rule, applies_when = EXCLUDED.applies_when,
-           scope = EXCLUDED.scope, paths = EXCLUDED.paths, cause = EXCLUDED.cause, miss_id = EXCLUDED.miss_id,
-           project_key = EXCLUDED.project_key, origin_project_key = EXCLUDED.origin_project_key, embedding = EXCLUDED.embedding,
-           checks = EXCLUDED.checks, checks_version = EXCLUDED.checks_version`,
+                 CASE WHEN $12::jsonb IS NULL THEN NULL ELSE $13::integer END, $14, $15)
+         ON CONFLICT (id) DO UPDATE SET
+           title = CASE WHEN lessons.proposed_as IS NULL THEN EXCLUDED.title ELSE lessons.title END,
+           rule = CASE WHEN lessons.proposed_as IS NULL THEN EXCLUDED.rule ELSE lessons.rule END,
+           applies_when = CASE WHEN lessons.proposed_as IS NULL THEN EXCLUDED.applies_when ELSE lessons.applies_when END,
+           scope = CASE WHEN lessons.proposed_as IS NULL THEN EXCLUDED.scope ELSE lessons.scope END,
+           paths = CASE WHEN lessons.proposed_as IS NULL THEN EXCLUDED.paths ELSE lessons.paths END,
+           project_key = CASE WHEN lessons.proposed_as IS NULL THEN EXCLUDED.project_key ELSE lessons.project_key END,
+           embedding = CASE WHEN lessons.proposed_as IS NULL THEN EXCLUDED.embedding ELSE lessons.embedding END,
+           checks = CASE WHEN lessons.proposed_as IS NULL THEN EXCLUDED.checks ELSE lessons.checks END,
+           checks_version = CASE WHEN lessons.proposed_as IS NULL THEN EXCLUDED.checks_version ELSE lessons.checks_version END,
+           cause = EXCLUDED.cause, miss_id = EXCLUDED.miss_id, origin_project_key = EXCLUDED.origin_project_key,
+           run = EXCLUDED.run, sandbox = EXCLUDED.sandbox`,
         [
           lessonId,
           now,
@@ -167,6 +204,8 @@ export class PgKnowledgeStore implements KnowledgeStore {
           vectorOf(embeddings.lesson),
           pm.lessonChecks ? toJson(pm.lessonChecks) : null,
           LESSON_CHECKS_VERSION,
+          r.run ?? null,
+          r.sandbox === true,
         ],
       );
       // Fix commits: the session's commits made after the feedback, by real time (committers' offsets differ).
@@ -202,9 +241,9 @@ export class PgKnowledgeStore implements KnowledgeStore {
        WHERE ($1::text IS NULL OR l.status = $1) AND ($2::text IS NULL OR l.project_key = $2 OR l.project_key IS NULL)
          AND ${learnedIn('l', '$4')}
          AND ($5::text IS NULL OR l.checks @> jsonb_build_array(jsonb_build_object('name', $5::text)))
-         AND ($6::text IS NULL OR ${FROM} = $6)
+         AND ($6::text IS NULL OR ${FROM} = $6) AND ${visibleToRun('l', '$7')}
        ORDER BY l.created_at DESC, l.id LIMIT $3`,
-      [f.status ?? null, f.projectKey ?? null, f.limit ?? 500, f.projectKeys ?? null, f.flag ?? null, f.from ?? null],
+      [f.status ?? null, f.projectKey ?? null, f.limit ?? 500, f.projectKeys ?? null, f.flag ?? null, f.from ?? null, f.run ?? null],
     );
     return rows.map(lessonOf);
   }
@@ -217,6 +256,28 @@ export class PgKnowledgeStore implements KnowledgeStore {
       [version, limit],
     );
     return rows.map(lessonOf);
+  }
+
+  async commentLessons(q: { status: LessonStatus; limit: number; afterId?: string | null }): Promise<CommentLesson[]> {
+    const { rows } = await this.q(
+      `SELECT l.id, f.id AS feedback_id, coalesce(m.project_key, l.origin_project_key, l.project_key) AS project_key, t.text,
+              t.external, l.checks, m.missed, m.cause_explanation, l.proposed_as IS NOT NULL AS owner_edited
+       FROM lessons l JOIN misses m ON m.id = l.miss_id JOIN feedback f ON f.id = m.feedback_id JOIN turns t ON t.uuid = f.turn_uuid
+       WHERE l.status = $1 AND t.external IS NOT NULL AND ($2::text IS NULL OR l.id COLLATE "C" > $2)
+       ORDER BY l.id COLLATE "C" LIMIT $3`,
+      [q.status, q.afterId ?? null, q.limit],
+    );
+    return rows.map((r) => ({
+      id: r.id,
+      feedbackId: r.feedback_id,
+      projectKey: r.project_key,
+      text: r.text ?? '',
+      external: r.external as ExternalRef,
+      checks: (r.checks as LessonCheck[] | null) ?? null,
+      missed: r.missed ?? '',
+      causeExplanation: r.cause_explanation ?? '',
+      ownerEdited: r.owner_edited === true,
+    }));
   }
 
   async requestLessonRecheck(): Promise<number> {
@@ -235,6 +296,22 @@ export class PgKnowledgeStore implements KnowledgeStore {
       [id, k],
     );
     return rows.map((r) => ({ id: r.id, cosine: Number(r.cosine), status: r.status as LessonStatus, createdAt: iso(r.created_at) as string }));
+  }
+
+  async decidedLessons(q: DecidedLessonsQuery): Promise<DecidedLesson[]> {
+    // <=> is the cosine distance: the true cosine is 1 - distance.
+    const { rows } = await this.q(
+      `SELECT l.*, CASE WHEN $4::vector IS NOT NULL AND l.embedding IS NOT NULL AND vector_dims(l.embedding) = vector_dims($4::vector)
+                        THEN 1 - (l.embedding <=> $4::vector) END AS score
+       FROM lessons l
+       WHERE l.source = 'postmortem' AND l.status IN ('approved', 'rejected') AND l.decided_at IS NOT NULL AND l.decided_at >= $1
+         AND NOT coalesce(l.sandbox, false) AND coalesce(l.project_key, l.origin_project_key) IS NOT NULL
+         AND ($2::text[] IS NULL OR coalesce(l.project_key, l.origin_project_key) = ANY($2::text[]))
+         AND ${OWNER_DECIDED_SQL('l.decided_by')}
+       ORDER BY l.decided_at DESC, l.id DESC LIMIT $3`,
+      [q.since, q.projectKeys, q.limit, vectorOf(q.embedding)],
+    );
+    return rows.map((r) => ({ lesson: lessonOf(r), score: r.score == null ? null : Number(r.score) }));
   }
 
   async lessonDetail(id: string): Promise<LessonDetail | null> {
@@ -286,7 +363,7 @@ export class PgKnowledgeStore implements KnowledgeStore {
   /** `unscoped`: you narrowed it but its project is unknown, so it went back to proposed instead of serving everywhere. */
   async updateLesson(id: string, patch: LessonPatch, o: { reembed?: number[]; by?: string; note?: string }): Promise<{ unscoped: boolean }> {
     const now = new Date();
-    const { supersedes, status, ...fields } = patch;
+    const { supersedes, status, projectKey, ...fields } = patch;
     if (supersedes !== undefined) {
       if (supersedes === id) throw new Error('a lesson cannot supersede itself');
       const found = await this.q('SELECT 1 FROM lessons WHERE id = $1', [supersedes]);
@@ -294,6 +371,12 @@ export class PgKnowledgeStore implements KnowledgeStore {
     }
     const has = (k: keyof typeof fields) => fields[k] !== undefined;
     return tx(this.db, async (c) => {
+      // The writer's version, kept on the first edit of a proposed lesson (read under the row lock, so it is the first).
+      if (Object.values(fields).some((v) => v !== undefined)) {
+        const cur = await c.query('SELECT * FROM lessons WHERE id = $1 FOR UPDATE', [id]);
+        const draft = cur.rows[0] ? editedDraft(lessonOf(cur.rows[0]), fields) : null;
+        if (draft) await c.query('UPDATE lessons SET proposed_as = $2 WHERE id = $1 AND proposed_as IS NULL', [id, toJson(redactDeep(draft))]);
+      }
       const { rows } = await c.query(
         `UPDATE lessons SET
            title = CASE WHEN $2 THEN $3 ELSE title END,
@@ -301,7 +384,7 @@ export class PgKnowledgeStore implements KnowledgeStore {
            applies_when = CASE WHEN $6 THEN $7 ELSE applies_when END,
            scope = CASE WHEN $8 THEN $9 ELSE scope END,
            paths = CASE WHEN $10 THEN $11::text[] ELSE paths END,
-           decided_by_you = true,
+           decided_by_you = decided_by_you OR $17,
            status = coalesce($12, status),
            decided_at = CASE WHEN $12::text IS NULL THEN decided_at ELSE $13 END,
            decided_by = CASE WHEN $12::text IS NULL THEN decided_by ELSE $15 END,
@@ -327,10 +410,13 @@ export class PgKnowledgeStore implements KnowledgeStore {
           o.reembed ? vectorOf(o.reembed) : null,
           o.by ?? 'you',
           o.note ? redactSecrets(o.note) : null,
+          // Only the owner's decision or edit makes it yours (a memory file's re-import then leaves it); a machine's does not.
+          ownerDecided(o.by ?? 'you'),
         ],
       );
       if (!rows[0]) return { unscoped: false };
-      const origin: string | null = rows[0].origin ?? null;
+      // A project named in the patch (narrowing a global lesson) wins over the one it was learned in.
+      const origin: string | null = projectKey ?? rows[0].origin ?? null;
       const scope = fields.scope;
       const narrowed = scope === 'project' || scope === 'task';
       // Scope decides who sees it: global has no project; project/task go back to the project it came from.
@@ -355,12 +441,26 @@ export class PgKnowledgeStore implements KnowledgeStore {
     });
   }
 
+  async setLessonPaths(id: string, paths: string[]): Promise<boolean> {
+    const { rowCount } = await this.q(`UPDATE lessons SET paths = $2::text[] WHERE id = $1 AND status = 'proposed' AND proposed_as IS NULL`, [id, paths]);
+    return (rowCount ?? 0) > 0;
+  }
+
+  async clearMachineOwnerMarks(): Promise<string[]> {
+    const { rows } = await this.q(
+      `UPDATE lessons SET decided_by_you = false
+       WHERE decided_by_you AND decided_by IS NOT NULL AND NOT ${OWNER_DECIDED_SQL('decided_by')} AND proposed_as IS NULL
+       RETURNING id`,
+    );
+    return rows.map((r) => r.id as string).sort();
+  }
+
   async setLessonChecks(id: string, checks: LessonCheck[], version = LESSON_CHECKS_VERSION): Promise<boolean> {
     const { rowCount } = await this.q('UPDATE lessons SET checks = $2::jsonb, checks_version = $3 WHERE id = $1', [id, toJson(redactDeep(checks)), version]);
     return (rowCount ?? 0) > 0;
   }
 
-  async searchLessons(q: { embedding: number[]; projectKey: string | null; k: number; status?: LessonStatus; projectKeys?: string[] }): Promise<LessonHit[]> {
+  async searchLessons(q: { embedding: number[]; projectKey: string | null; k: number; status?: LessonStatus; projectKeys?: string[]; run?: string | null }): Promise<LessonHit[]> {
     // This project's and the global lessons, nearest first, through the HNSW index when it pays (see vector.ts).
     const rows = await runSearch(this.db, searchLessonsQuery(this.db, q), q.k);
     return rows.map((r) => ({ lesson: lessonOf(r), score: r.score }));
@@ -394,7 +494,7 @@ export class PgKnowledgeStore implements KnowledgeStore {
     return (rowCount ?? 0) > 0;
   }
 
-  async relatedMisses(q: { embedding: number[]; projectKey: string | null; k: number }): Promise<RelatedMiss[]> {
+  async relatedMisses(q: { embedding: number[]; projectKey: string | null; k: number; run?: string | null }): Promise<RelatedMiss[]> {
     const rows = await runSearch(this.db, relatedMissesQuery(this.db, q), q.k);
     return rows.map((r) => ({
       missId: r.id,
@@ -409,7 +509,7 @@ export class PgKnowledgeStore implements KnowledgeStore {
   }
 
   /** The manual /postmortem path: queued for your decision, or added to the detector's item for the same miss. */
-  async createManualFeedback(input: { project: Project; cwd: string; text: string; whatWasDone: string; sessionId?: string | null }): Promise<string> {
+  async createManualFeedback(input: { project: Project; cwd: string; text: string; whatWasDone: string; sessionId?: string | null; run?: RunTag | null }): Promise<string> {
     const o = { ...input, text: redactDeep(input.text), whatWasDone: redactDeep(input.whatWasDone) };
     const now = new Date();
     const report = toJson({ text: o.text, whatWasDone: o.whatWasDone, reportedAt: now.toISOString(), sessionId: o.sessionId ?? null });
@@ -445,24 +545,27 @@ export class PgKnowledgeStore implements KnowledgeStore {
         [id, o.project.key, now, now.toISOString(), o.text, o.whatWasDone],
       );
       await c.query(
-        `INSERT INTO candidates (id, turn_uuid, session_id, project_key, ts, status, created_at, manual, agent_report)
-         VALUES ($1, $1, $1, $2, $3, 'pending', $3, true, $4::jsonb)`,
-        [id, o.project.key, now, report],
+        `INSERT INTO candidates (id, turn_uuid, session_id, project_key, ts, status, created_at, manual, agent_report, run, sandbox)
+         VALUES ($1, $1, $1, $2, $3, 'pending', $3, true, $4::jsonb, $5, $6)`,
+        [id, o.project.key, now, report, o.run?.id ?? null, !!o.run?.sandbox],
       );
     });
     return id;
   }
 
-  async recordPreDoneCheck(c: { projectKey: string; task: string; checkedLessonIds: string[]; gapLessonIds: string[] }): Promise<void> {
+  async recordPreDoneCheck(c: { projectKey: string; task: string; checkedLessonIds: string[]; gapLessonIds: string[]; run?: RunTag | null; sessionId?: string | null }): Promise<void> {
     const id = randomUUID();
     await tx(this.db, async (x) => {
-      await x.query('INSERT INTO predone_checks (id, project_key, ts, task, checked, gaps) VALUES ($1, $2, $3, $4, $5, $6)', [
+      await x.query('INSERT INTO predone_checks (id, project_key, ts, task, checked, gaps, run, sandbox, session_id) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)', [
         id,
         c.projectKey,
         new Date(),
         redactSecrets(c.task),
         c.checkedLessonIds.length,
         c.gapLessonIds.length,
+        c.run?.id ?? null,
+        !!c.run?.sandbox,
+        c.sessionId ?? null,
       ]);
       // Lesson ids that do not exist are not linked.
       await x.query(
@@ -471,6 +574,118 @@ export class PgKnowledgeStore implements KnowledgeStore {
          ON CONFLICT DO NOTHING`,
         [id, c.checkedLessonIds, c.gapLessonIds],
       );
+    });
+  }
+
+  async redactStoredLessons(): Promise<number> {
+    let changed = 0;
+    for (let after = ''; ;) {
+      const { rows } = await this.q('SELECT id, title, rule, applies_when FROM lessons WHERE id > $1 ORDER BY id LIMIT $2', [after, REDACT_PAGE]);
+      if (!rows.length) break;
+      after = rows[rows.length - 1].id;
+      const page = rows.flatMap((r: { id: string; title: string; rule: string; applies_when: string | null }) => {
+        const x = { id: r.id, title: redactSecrets(r.title), rule: redactSecrets(r.rule), appliesWhen: r.applies_when === null ? null : redactSecrets(r.applies_when) };
+        return x.title !== r.title || x.rule !== r.rule || x.appliesWhen !== r.applies_when ? [x] : [];
+      });
+      if (!page.length) continue;
+      await this.q(
+        `UPDATE lessons x SET title = c.title, rule = c.rule, applies_when = c.applies_when
+         FROM unnest($1::text[], $2::text[], $3::text[], $4::text[]) AS c(id, title, rule, applies_when) WHERE x.id = c.id`,
+        [page.map((c) => c.id), page.map((c) => c.title), page.map((c) => c.rule), page.map((c) => c.appliesWhen)],
+      );
+      changed += page.length;
+    }
+    return changed;
+  }
+
+  /** Feedback text, then what each miss missed and why. The words of the turn a miss quotes are the Inbox item's. */
+  async redactStoredMisses(): Promise<number> {
+    let changed = 0;
+    for (const [table, fields] of [['feedback', ['text']], ['misses', ['missed', 'cause_explanation']]] as const) {
+      for (let after = ''; ;) {
+        const { rows } = await this.q(`SELECT id, ${fields.join(', ')} FROM ${table} WHERE id > $1 ORDER BY id LIMIT $2`, [after, REDACT_PAGE]);
+        if (!rows.length) break;
+        after = rows[rows.length - 1].id;
+        const page = rows.flatMap((r: Record<string, unknown>) => redactStoredRow(r, fields) ?? []);
+        if (!page.length) continue;
+        await this.q(
+          `UPDATE ${table} x SET ${fields.map((f) => `${f} = c.${f}`).join(', ')}
+           FROM jsonb_to_recordset($1::jsonb) AS c(id text, ${fields.map((f) => `${f} text`).join(', ')}) WHERE x.id = c.id`,
+          [toJson(page)],
+        );
+        changed += page.length;
+      }
+    }
+    return changed;
+  }
+
+  async saveDemoMiss(input: DemoMiss): Promise<string> {
+    if (!input.id.startsWith(demoPrefix(input.project.key))) throw new Error(`a demo miss id starts with ${demoPrefix(input.project.key)}`);
+    const m = { ...input, feedbackText: redactSecrets(input.feedbackText), whatWasDone: redactSecrets(input.whatWasDone), missed: redactSecrets(input.missed), causeExplanation: redactSecrets(input.causeExplanation) };
+    const ts = new Date(m.ts);
+    const missId = `miss:${m.id}`;
+    await tx(this.db, async (c) => {
+      await c.query('INSERT INTO projects (key, name, repo_path) VALUES ($1, $2, $3) ON CONFLICT (key) DO NOTHING', [m.project.key, m.project.name ?? null, m.project.repoPath ?? null]);
+      await c.query(
+        `INSERT INTO sessions (id, project_key, source_file, cwd, started_at, ended_at, manual) VALUES ($1, $2, 'demo', $3, $4, $4, true)
+         ON CONFLICT (id) DO NOTHING`,
+        [m.id, m.project.key, m.project.repoPath ?? null, ts],
+      );
+      await c.query(
+        `INSERT INTO turns (uuid, session_id, project_key, ts, ts_text, idx, text, preceding_assistant_text, tool_calls, label, confidence, summary, signals)
+         VALUES ($1, $1, $2, $3, $4, 1, $5, $6, '[]', 'pushback', 1.0, $5, ARRAY['demo'])
+         ON CONFLICT (uuid) DO UPDATE SET text = EXCLUDED.text, preceding_assistant_text = EXCLUDED.preceding_assistant_text, summary = EXCLUDED.summary`,
+        [m.id, m.project.key, ts, ts.toISOString(), m.feedbackText, m.whatWasDone],
+      );
+      await c.query(
+        `INSERT INTO candidates (id, turn_uuid, session_id, project_key, ts, status, created_at, decided_at, decided_by, manual)
+         VALUES ($1, $1, $1, $2, $3, 'confirmed', $3, $3, 'demo', true) ON CONFLICT (id) DO NOTHING`,
+        [m.id, m.project.key, ts],
+      );
+      await c.query(
+        `INSERT INTO feedback (id, project_key, turn_uuid, status, text, created_at) VALUES ($1, $2, $1, 'addressed', $3, $4)
+         ON CONFLICT (id) DO UPDATE SET text = EXCLUDED.text`,
+        [m.id, m.project.key, m.feedbackText, ts],
+      );
+      await c.query('INSERT INTO causes (key) VALUES ($1) ON CONFLICT DO NOTHING', [m.cause]);
+      await c.query(
+        `INSERT INTO misses (id, project_key, feedback_id, missed, cause, cause_explanation, outcome, created_at, embedding)
+         VALUES ($1, $2, $3, $4, $5, $6, 'addressed', $7, $8::vector)
+         ON CONFLICT (id) DO UPDATE SET missed = EXCLUDED.missed, cause = EXCLUDED.cause, cause_explanation = EXCLUDED.cause_explanation,
+           embedding = EXCLUDED.embedding`,
+        [missId, m.project.key, m.id, m.missed, m.cause, m.causeExplanation, ts, vectorOf(m.embedding)],
+      );
+    });
+    return missId;
+  }
+
+  async removeDemo(projectKey: string): Promise<DemoRemoved> {
+    const like = `${demoPrefix(projectKey).replace(/[\\%_]/g, '\\$&')}%`;
+    return tx(this.db, async (c) => {
+      const misses = await c.query(
+        `SELECT count(*)::int AS n FROM misses m JOIN feedback f ON f.id = m.feedback_id JOIN turns t ON t.uuid = f.turn_uuid
+         WHERE t.session_id LIKE $1 AND m.project_key = $2`,
+        [like, projectKey],
+      );
+      // Turns, Inbox items, feedback, misses, tasks and touched files all hang off the session (ON DELETE CASCADE).
+      await c.query('DELETE FROM sessions WHERE id LIKE $1 AND project_key = $2 AND manual', [like, projectKey]);
+      const lessons = await c.query(`DELETE FROM lessons WHERE source = 'demo' AND (project_key = $1 OR (project_key IS NULL AND origin_project_key = $1))`, [projectKey]);
+      const facts = await c.query(`DELETE FROM facts WHERE project_key = $1 AND source = 'demo'`, [projectKey]);
+      // The file rows the demo added (hash DEMO_SOURCE: a scan that read the file since gave it a real one): unscanned
+      // again, and gone unless the code map or other facts hold them.
+      const added = await c.query(
+        `UPDATE code_files SET hash = NULL, summary = NULL, scanned_at = NULL, scan_version = NULL, hash_changed_at = NULL
+         WHERE project_key = $1 AND hash = $2 RETURNING id`,
+        [projectKey, DEMO_SOURCE],
+      );
+      if (added.rows.length) {
+        await c.query(
+          `DELETE FROM code_files cf WHERE cf.id = ANY($1::text[]) AND NOT cf.in_map AND NOT cf.in_index
+             AND NOT EXISTS (SELECT 1 FROM facts x WHERE x.code_file_id = cf.id)`,
+          [added.rows.map((r) => r.id)],
+        );
+      }
+      return { lessons: lessons.rowCount ?? 0, misses: misses.rows[0].n, facts: facts.rowCount ?? 0 };
     });
   }
 
@@ -496,7 +711,7 @@ export class PgKnowledgeStore implements KnowledgeStore {
 /** The lesson's feedback turn (`t`), for Lesson.from; none for memory and manual lessons. */
 const FEEDBACK_TURN = 'LEFT JOIN (misses m JOIN feedback f ON f.id = m.feedback_id JOIN turns t ON t.uuid = f.turn_uuid) ON m.id = l.miss_id';
 /** Lesson.from, for lessons `l` and their feedback turn `t`. */
-const FROM = `(CASE WHEN l.source IN ('memory', 'manual') THEN l.source WHEN t.external IS NULL THEN 'session'
+const FROM = `(CASE WHEN l.source IN ('memory', 'manual', 'demo') THEN l.source WHEN t.external IS NULL THEN 'session'
   WHEN t.external->>'source' = 'linear' THEN 'linear' ELSE 'github' END)`;
 
 function lessonOf(r: Row): Lesson {
@@ -520,5 +735,8 @@ function lessonOf(r: Row): Lesson {
     checks: (r.checks as LessonCheck[] | null) ?? null,
     checksVersion: r.checks_version ?? null,
     ...(r.from_kind && { from: r.from_kind as LessonFrom }),
+    ...(r.run ? { run: r.run as string } : {}),
+    ...(r.sandbox === true && { sandbox: true as const }),
+    ...(r.proposed_as && { proposedAs: r.proposed_as as LessonDraft }),
   };
 }

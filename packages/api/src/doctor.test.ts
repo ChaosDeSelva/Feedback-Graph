@@ -134,6 +134,11 @@ test('Docker down, Ollama down and the api not answering: failures and skips, ne
   expect(out).toContain('SKIP  GitHub, Linear: the api does not answer');
 });
 
+test('the bundled ollama profile is checked on its own host port: OLLAMA_PORT, 11435 when unset', () => {
+  expect(doctor({ env: 'API_PORT=8787\nOLLAMA_URL=http://ollama:11434\n' }).out).toContain('PASS  ollama: answers at http://localhost:11435');
+  expect(doctor({ env: 'API_PORT=8787\nOLLAMA_URL=http://ollama:11434\nOLLAMA_PORT=11445\n' }).out).toContain('PASS  ollama: answers at http://localhost:11445');
+});
+
 test('never prints a secret from .env', () => {
   const secret = 'q'.repeat(40);
   const { out } = doctor({

@@ -1,18 +1,25 @@
 import { readdir, readFile } from 'node:fs/promises';
 import { checkLesson, saysWrongSession, type LessonFlag } from './lessonCheck.ts';
-import { validateLessonPaths } from './paths.ts';
-import { capToCommentDir, codeNotRead, shapeLesson, type Shaped } from './shape.ts';
+import { saysNoMiss } from './noMiss.ts';
+import { ambiguousFlag, validateLessonPaths } from './paths.ts';
+import { capToCommentDir, codeNotRead, lessonFieldJunk, rescueRule, shapeLesson, type Shaped } from './shape.ts';
 import { isProcessMiss } from '../detect/instruction.ts';
-import { dirname, join, resolve } from 'node:path';
+import { correctStandingClaims, evidenced, imports } from './standing.ts';
+import { dirname, join, relative, resolve } from 'node:path';
 import { z } from 'zod';
-import { askJson, CAUSES, contextWhy, redactSecrets, type ContextItem, type ExternalRef, type FeedbackSource, type HumanTurn, type LlmProvider, type PostMortem, type PostMortemInput } from '@fb/core';
+import { pickExamples, renderExamples } from './examples.ts';
+import { AnswerRefused, askJson, CAUSES, contextWhy, isNitComment, redactSecrets, type ContextItem, type DecidedLesson, type ExternalRef, type FeedbackSource, type HumanTurn, type LlmProvider, type PostMortem, type PostMortemInput } from '@fb/core';
 
 const MAX_STANDING_CHARS = 6000;
 /** Facts a post-mortem may propose beside its lesson. */
 const MAX_PROPOSED_FACTS = 5;
 const MAX_TURN_CHARS = 1500;
 
-/** `loaded`: whether the session's agent loads this file (Claude Code: CLAUDE.md and memory; Codex: AGENTS.md). */
+/**
+ * `loaded`: whether the session's agent had this file: the files its agent loads (Claude Code: CLAUDE.md and memory;
+ * Codex: AGENTS.md), those the session shows it had (an attachment, an @-import, a read), and what a loaded CLAUDE.md
+ * imports.
+ */
 export type StandingDoc = { kind: 'claude_md' | 'agents_md' | 'memory'; ref: string; text: string; loaded: boolean };
 type RawItem = Omit<ContextItem, 'wasAvailable'>;
 
@@ -112,20 +119,42 @@ function dirsDownTo(repoPath: string, stopAt?: string): string[] {
  * (default: the filesystem root), and Claude Code's memory notes. Claude Code loads CLAUDE.md and memory, Codex loads
  * AGENTS.md: the session's agent's files come first and are marked `loaded`; the others are kept as evidence of what
  * was written down. Codex's personal ~/.codex/AGENTS.md is not mounted into the worker, so it is not read.
+ * `evidence`: the instruction files the session shows its agent had, as the developer's machine names them
+ * (standing.ts sessionEvidence); `roots` map those paths onto the worker's. Evidence only adds: an agent's own files are
+ * loaded whether or not its transcript shows them (Claude Code does not write its CLAUDE.md into the transcript).
  */
-export async function loadStandingContext(o: { repoPath: string; stopAt?: string; memoryDir: string; source?: FeedbackSource }): Promise<StandingDoc[]> {
+export async function loadStandingContext(o: {
+  repoPath: string;
+  stopAt?: string;
+  memoryDir: string;
+  source?: FeedbackSource;
+  evidence?: string[];
+  roots?: { host: string; container: string }[];
+}): Promise<StandingDoc[]> {
   const codex = o.source === 'codex';
   const dirs = dirsDownTo(o.repoPath, o.stopAt);
+  const stop = o.stopAt ? resolve(o.stopAt) : null;
   const read = async (kind: StandingDoc['kind'], ref: string, loaded: boolean): Promise<StandingDoc | null> => {
     const text = await readFile(ref, 'utf8').catch(() => null);
-    return text ? { kind, ref, text: text.slice(0, MAX_STANDING_CHARS), loaded } : null;
+    const seen = kind !== 'memory' && evidenced(ref, stop ? relative(stop, ref) : null, o.evidence ?? [], o.roots);
+    return text ? { kind, ref, text: text.slice(0, MAX_STANDING_CHARS), loaded: loaded || seen } : null;
   };
   const instructions = (kind: 'claude_md' | 'agents_md', file: string, loaded: boolean) => Promise.all(dirs.map((d) => read(kind, join(d, file), loaded)));
   const claude = await instructions('claude_md', 'CLAUDE.md', !codex);
   const agents = await instructions('agents_md', 'AGENTS.md', codex);
   const files = await readdir(o.memoryDir).catch(() => [] as string[]);
   const memory = await Promise.all(files.filter((f) => f.endsWith('.md') && f !== 'MEMORY.md').sort().map((f) => read('memory', join(o.memoryDir, f), !codex)));
-  return [...(codex ? [...agents, ...claude] : [...claude, ...agents]), ...memory].filter((d): d is StandingDoc => d !== null);
+  const docs = [...(codex ? [...agents, ...claude] : [...claude, ...agents]), ...memory].filter((d): d is StandingDoc => d !== null);
+  // Claude Code loads what a loaded CLAUDE.md imports (@AGENTS.md), and what those import in turn.
+  if (!codex) {
+    const full = new Map(await Promise.all(docs.filter((d) => d.kind !== 'memory').map(async (d) => [d.ref, (await readFile(d.ref, 'utf8').catch(() => d.text))] as const)));
+    for (let changed = true; changed; ) {
+      changed = false;
+      const wanted = new Set(docs.filter((d) => d.loaded && d.kind !== 'memory').flatMap((d) => imports(full.get(d.ref) ?? d.text, dirname(d.ref), resolve)));
+      for (const d of docs) if (!d.loaded && wanted.has(d.ref)) changed = d.loaded = true;
+    }
+  }
+  return docs;
 }
 
 const clip = (s: string, n = MAX_TURN_CHARS) => (s.length > n ? `${s.slice(0, n)}…` : s);
@@ -144,8 +173,11 @@ function renderTurn(t: HumanTurn, label: string): string {
 /** Repo files the session edited before the feedback, and after it (the fix). */
 export type Touched = { edited: string[]; fixed: string[] };
 
-/** sessionSummary: the running summary of the whole session (markdown), when one exists. */
-export type PromptOpts = { agentic: boolean; facts: string[]; touched?: Touched; sessionSummary?: string | null };
+/**
+ * sessionSummary: the running summary of the whole session (markdown), when one exists. examples: the rendered section
+ * of the owner's earlier lesson decisions (examples.ts); '' or unset: none, and the prompt is as without it.
+ */
+export type PromptOpts = { agentic: boolean; facts: string[]; touched?: Touched; sessionSummary?: string | null; examples?: string };
 
 const MAX_SUMMARY_CHARS = 4000;
 
@@ -205,6 +237,14 @@ function renderRequirements(ext: ExternalRef): string {
 ${details ? `${details}\n` : ''}${body}`;
 }
 
+/** How the work session was matched (postmortem/work.ts): its branch, or the files the PR changed. */
+function matchedHow(by: 'branch' | 'files' | undefined, ext: ExternalRef): string {
+  const pr = ext.source === 'github' ? 'pull request' : 'issue';
+  if (by === 'branch') return `matched because it ran on the ${pr}'s branch${ext.branch ? ` ${oneLine(ext.branch, 200)}` : ''}`;
+  if (by === 'files') return `matched because it edited files the ${pr} changed`;
+  return `matched by the ${pr}'s branch or the files it changed`;
+}
+
 /**
  * The prompt for a comment from GitHub or Linear: the agent session that did the work (input.work) stands where the
  * transcript usually does, the PR description or the ticket gives the requirements, and the rest of the thread is what
@@ -217,8 +257,8 @@ function externalSections(input: PostMortemInput, ext: ExternalRef): string {
   return `=== THE AGENT SESSION THAT DID THE WORK ===
 ${
     work
-      ? `Session ${work.sessionId} (${work.source === 'codex' ? 'Codex' : 'Claude Code'}), matched by ${ext.branch ? `branch ${ext.branch} or ` : ''}time. If it clearly did other work than what the comment is about (another feature, other files), start causeExplanation with "WRONG SESSION:" and say what each is about. Its last turns:\n${workTurns.map((t) => renderTurn(t, 'DEVELOPER')).join('\n\n') || '(no turns recorded)'}`
-      : 'No agent session was found for this work (no session on its branch, or no single session just before the comment). Work from the comment, the diff lines and the repository alone, and say so in causeExplanation. Do not take paths or scope from any session: scope the lesson to the file the comment is on, or leave its paths empty.'
+      ? `Session ${work.sessionId} (${work.source === 'codex' ? 'Codex' : 'Claude Code'}), ${matchedHow(work.matchedBy, ext)}. If it clearly did other work than what the comment is about (another feature, other files), start causeExplanation with "WRONG SESSION:" and say what each is about. Its last turns:\n${workTurns.map((t) => renderTurn(t, 'DEVELOPER')).join('\n\n') || '(no turns recorded)'}`
+      : 'No agent session was found for this work (no session ran on its branch or edited the files it changed; one is never borrowed for being near in time). Work from the comment, the diff lines and the repository alone, and say so in causeExplanation. Do not take paths or scope from any session: scope the lesson to the file the comment is on, or leave its paths empty.'
   }
 
 ${renderRequirements(ext)}
@@ -268,6 +308,8 @@ The lesson is about the quoted comment only (not the later comments or other rev
 "missed" must be checkable against the comment's own text.
 The rule must name at least one identifier from the feedback, its diff lines or the description (a function, file,
 constant, env var, table, endpoint). Never write "Always verify/check/ensure/test ..." with nothing concrete in it.
+A rule made only of process words ("check for existing patterns", "test concurrency edge cases", "verify the full
+sequence") is not a lesson: name the concrete file, function, value or command. One miss per lesson: never "X; also Y".
 Put the imperative sentence itself in lesson.rule, never the scope word. Never put a pull request or issue number in
 the rule: name the code instead. lesson.title is a short name for the rule (at most 8 words), not the rule again.
 lesson.appliesWhen says when it applies (the kind of task, or the files), not the rule again.
@@ -279,9 +321,10 @@ Set lesson.paths to the narrowest repo-relative paths or globs the evidence supp
 fix the miss (listed below); leave it empty when the lesson is about the whole project, or about the git process itself
 (branches, pushing, merging, pull requests, commit hygiene) rather than the code.
 Return at most 8 contextItems, each with a verbatim excerpt.
-
+${o.examples ? `\n${o.examples}` : ''}
 === STANDING CONTEXT (instruction files and memory) ===
-The session ran in ${input.source === 'codex' ? 'Codex, which loads AGENTS.md' : 'Claude Code, which loads CLAUDE.md and its memory notes'}. A file this agent does not load was not available to it.
+The session ran in ${input.source === 'codex' ? 'Codex, which loads AGENTS.md' : 'Claude Code, which loads CLAUDE.md, what it imports (@AGENTS.md) and its memory notes'}. "loaded" means the agent had the file in this session (it loads it, or the session shows it did); a file marked NOT loaded was not available to it.
+Never give as the cause that the agent did not load or could not see a file marked loaded: it was in its context, so a miss it covers is context_available_ignored.
 ${standing.map((d) => `--- ${d.kind} (${STANDING_LABEL[d.kind]}, ${d.loaded ? 'loaded' : 'NOT loaded'} by this agent): ${d.ref}\n${d.text}`).join('\n\n') || '(none found)'}
 
 === CONTEXT FOUND OUTSIDE THE SESSION (code facts, docs, PR reviews, tickets) ===
@@ -314,10 +357,11 @@ ${after.map((t) => renderTurn(t, 'DEVELOPER')).join('\n\n') || '(session ended)'
 }
 
 /**
- * An item was "available" if the session's agent had it loaded (Claude Code: CLAUDE.md and memory; Codex: AGENTS.md)
- * or touched the file in the session.
+ * An item was "available" if the session's agent had it loaded or touched the file in the session. `standing` (what
+ * loadStandingContext found): an instruction file it holds is loaded as it says; one it does not hold, and every one
+ * without it, as the agent loads by default (Claude Code: CLAUDE.md and memory; Codex: AGENTS.md).
  */
-export function markAvailability(items: RawItem[], input: PostMortemInput): ContextItem[] {
+export function markAvailability(items: RawItem[], input: PostMortemInput, standing: StandingDoc[] = []): ContextItem[] {
   const codex = input.source === 'codex';
   // A comment from GitHub or Linear: what the agent read is in the session that did the work, if one was found.
   const turns = input.feedback.external ? (input.work?.turns ?? []) : [...input.turns.filter((t) => t.index < input.feedback.index), input.feedback];
@@ -329,7 +373,8 @@ export function markAvailability(items: RawItem[], input: PostMortemInput): Cont
     const ref = it.ref.replace(/:\d+(-\d+)?$/, '').replace(/^\.\//, '');
     // Small models often label instruction files and memory notes as code.
     const kind = /(^|\/)CLAUDE\.md$/.test(ref) ? 'claude_md' : /(^|\/)AGENTS\.md$/.test(ref) ? 'agents_md' : /\/memory\/[^/]+\.md$/.test(ref) ? 'memory' : it.kind;
-    const loaded = codex ? kind === 'agents_md' : kind === 'claude_md' || kind === 'memory';
+    const held = standing.filter((d) => d.kind === kind && (d.ref === ref || d.ref.endsWith(`/${ref}`) || ref.endsWith(d.ref)));
+    const loaded = held.length ? held.some((d) => d.loaded) : codex ? kind === 'agents_md' : kind === 'claude_md' || kind === 'memory';
     const wasAvailable = loaded || touched.some((p) => p === ref || p.endsWith(`/${ref}`));
     return { ...it, kind, why: contextWhy(it.why), wasAvailable };
   });
@@ -343,13 +388,27 @@ export type PostMortemDeps = {
   touched?: (input: PostMortemInput) => Promise<Touched>;
   /** The session's running summary (SessionsStore), as markdown; unset, failing or null: none. */
   sessionSummary?: (input: PostMortemInput) => Promise<string | null>;
+  /**
+   * The owner's latest decisions on this project's post-mortem lessons (KnowledgeStore.decidedLessons, scored against
+   * this feedback); a few are shown to the writer as examples (examples.ts). Unset or failing: none.
+   */
+  examples?: (input: PostMortemInput) => Promise<DecidedLesson[]>;
   /** Whether the repository has this file (or anything under this folder); unset: lesson paths are not checked against it. */
   exists?: (input: PostMortemInput, path: string) => Promise<boolean>;
+  /** The repository's files (paths.ts repoFileList), so a bare file name resolves to its one match; unset: not listed. */
+  repoFiles?: (input: PostMortemInput) => Promise<string[] | null>;
   llm: LlmProvider;
+  log?: (msg: string, extra?: object) => void;
 };
 
 /** What the post-mortem model was shown, kept for the provenance log. */
-export type PostMortemTrace = { provider: string; agentic: boolean; standing: string[]; facts: string[]; lessonFlags: LessonFlag[]; lessonShaped?: Shaped['repaired'] };
+export type PostMortemTrace = {
+  provider: string; agentic: boolean; standing: string[]; facts: string[]; lessonFlags: LessonFlag[]; lessonShaped?: Shaped['repaired'];
+  /** The lessons shown as the owner's examples, when any were. */
+  examples?: string[];
+  /** A comment's post-mortem: the session it was worked out against and how it was matched; null: none. Unset: a transcript's. */
+  workSession?: { id: string; matchedBy: 'branch' | 'files' | null } | null;
+};
 
 export async function runPostMortem(input: PostMortemInput, deps: PostMortemDeps): Promise<PostMortem & { trace: PostMortemTrace }> {
   const first = await postMortemOnce(input, deps);
@@ -363,24 +422,54 @@ export async function runPostMortem(input: PostMortemInput, deps: PostMortemDeps
   return first;
 }
 
+/** Put before the cause of a comment's post-mortem that had no session, when the model did not say so itself. */
+export const NO_SESSION_NOTE = "No agent session matched this comment (none ran on the pull request's branch or edited the files it changed), so this was worked out from the comment and the pull request alone.";
+
 async function postMortemOnce(input: PostMortemInput, deps: PostMortemDeps): Promise<PostMortem & { trace: PostMortemTrace }> {
   const ext = input.feedback.external;
   // A comment no session was matched to: nothing a session did (its edits, its summary) belongs in this post-mortem.
   const sessionless = !!ext && !input.work;
   const none: Touched = { edited: [], fixed: [] };
-  const [standing, facts, touched, sessionSummary] = await Promise.all([
+  const [standing, facts, touched, sessionSummary, decided] = await Promise.all([
     deps.standing(input),
     deps.facts(input),
     deps.touched && !sessionless ? deps.touched(input).catch((): Touched => none) : Promise.resolve<Touched>(none),
     deps.sessionSummary && !sessionless ? deps.sessionSummary(input).catch(() => null) : Promise.resolve(null),
+    deps.examples
+      ? deps.examples(input).catch((err): DecidedLesson[] => {
+          deps.log?.('lesson examples unavailable; the post-mortem runs without them', { feedback: input.feedbackId, error: String(err) });
+          return [];
+        })
+      : Promise.resolve<DecidedLesson[]>([]),
   ]);
-  const prompt = redactSecrets(buildPrompt(input, standing, { agentic: deps.llm.agentic, facts, touched, sessionSummary }));
-  // An answer of the wrong shape is asked once more, more strictly, before it counts against the feedback.
-  const { about, factLike, facts: proposed, ...raw } = await askJson(
+  const examples = pickExamples(decided);
+  const prompt = redactSecrets(buildPrompt(input, standing, { agentic: deps.llm.agentic, facts, touched, sessionSummary, examples: renderExamples(examples) }));
+  // An answer of the wrong shape is asked once more, more strictly, before it counts against the feedback. So is a
+  // lesson whose fields hold a label (the rule "project", appliesWhen "work"), told why; the second answer is taken
+  // as it is and repaired below.
+  let asked = 0;
+  const { about, factLike, facts: proposed, ...answer } = await askJson(
     deps.llm,
     { system: 'You are a meticulous engineering post-mortem analyst.', user: prompt, schema: JSON_SCHEMA, cwd: input.repoPath },
-    (a) => PostMortemSchema.parse(a),
+    (a) => {
+      const first = ++asked === 1;
+      const pm = PostMortemSchema.parse(a);
+      const junk = first ? lessonFieldJunk(pm.lesson) : null;
+      if (junk) throw new AnswerRefused(junk);
+      return pm;
+    },
   );
+  // Still junk: the title as the rule when it reads as one, else no lesson (the miss is still saved).
+  const rescued = rescueRule(answer.lesson);
+  const brokenRule: LessonFlag[] = rescued && rescued.rule !== answer.lesson.rule
+    ? [{ name: 'broken-rule', why: `the rule field held "${answer.lesson.rule.trim().slice(0, 80)}" after a retry; the title is used as the rule` }]
+    : [];
+  const lessonDropped = rescued ? undefined : lessonFieldJunk(answer.lesson) ?? 'the rule is not a rule';
+  if (lessonDropped) deps.log?.('post-mortem lesson dropped: its rule is not a rule', { feedback: input.feedbackId, why: lessonDropped, title: answer.lesson.title });
+  if (rescued) answer.lesson = rescued;
+  // A cause the evidence contradicts ("did not load AGENTS.md" when the session had it) is refused (standing.ts).
+  const { flag: contradiction, ...raw } = correctStandingClaims(answer, standing);
+  if (contradiction) deps.log?.('post-mortem cause contradicted the standing context; corrected', { feedback: input.feedbackId, why: contradiction.why });
   const exists = deps.exists && ((p: string) => deps.exists!(input, p));
   // Paths are checked against the evidence and the repository, never inherited (paths.ts); a global lesson is about no
   // repository's files, so only the shape of its paths is checked.
@@ -392,29 +481,49 @@ async function postMortemOnce(input: PostMortemInput, deps: PostMortemDeps): Pro
       exists,
       transcript: !ext,
       global,
+      repoFiles: deps.repoFiles && (() => deps.repoFiles!(input)),
     });
   // Feedback about how the work was handled (a branch, a merge, a pull request), with a lesson about that too and no
   // file the evidence supports: a process miss, tied to no file the session edited and scoped to none.
   const processMiss = isProcessMiss({ feedbackText: input.feedback.text, rule: raw.lesson.rule, commentPath: ext?.path ?? null, paths: checkedPaths.paths });
   const pathFlags: LessonFlag[] = checkedPaths.dropped.length ? [{ name: 'bad-path', why: checkedPaths.dropped.map((d) => `${d.path}: ${d.why}`).join('; ') }] : [];
+  for (const a of checkedPaths.ambiguous) pathFlags.push(ambiguousFlag(a));
   if (!checkedPaths.paths.length && !global && !processMiss) pathFlags.push({ name: 'needs-path', why: 'no file the evidence supports: as it is, it would apply anywhere in the project' });
   // Scoped and falsifiable? Narrows what is clearly over-reaching and flags the rest for the owner (lessonCheck.ts).
   const checked = checkLesson({ ...raw.lesson, paths: checkedPaths.paths }, input.feedback, { about, factLike });
-  const flags = [...pathFlags, ...checked.flags];
+  // A nit or optional remark is never a project-wide lesson, however its rule is worded (feedbackRules.isNitComment).
+  if (ext && isNitComment(input.feedback.text) && checked.lesson.scope !== 'task') {
+    if (!checked.flags.some((f) => f.name === 'universal-from-nit')) checked.flags.push({ name: 'universal-from-nit', why: `a ${checked.lesson.scope}-wide rule from one nit or optional comment; narrowed to the task` });
+    checked.lesson = { ...checked.lesson, scope: 'task' };
+  }
+  const flags = [...(contradiction ? [contradiction] : []), ...brokenRule, ...pathFlags, ...checked.flags];
   // A title that is not the rule, a rule with no PR numbers, an appliesWhen that says when (shape.ts).
   const shaped = shapeLesson(checked.lesson, { taskTitle: raw.taskTitle });
+  // The post-mortem says there was no miss: whatever lesson it wrote is invented (noMiss.ts; step.ts saves it rejected).
+  const noMiss = saysNoMiss(raw);
+  // No session matched: the post-mortem says so, whether or not the model did.
+  const causeExplanation = sessionless && !/\bno (?:agent |work )?session\b/i.test(raw.causeExplanation)
+    ? `${NO_SESSION_NOTE} ${raw.causeExplanation}`
+    : raw.causeExplanation;
   // A review comment is explained by code near the file it is on.
-  const contextItems = capToCommentDir(markAvailability(raw.contextItems, input), ext?.path ?? null);
+  const contextItems = capToCommentDir(markAvailability(raw.contextItems, input, standing), ext?.path ?? null);
   // With no session to have read anything, "never read in the session" cannot be said.
   const cause = sessionless ? raw.cause : await codeNotRead(raw.cause, contextItems, exists);
   return {
     ...raw,
+    causeExplanation,
     cause,
     lesson: shaped.lesson,
+    ...(noMiss && { noMiss }),
     contextItems,
     lessonChecks: flags,
+    ...(lessonDropped && { lessonDropped }),
     facts: proposed ?? [],
     ...(processMiss && { subject: 'process' as const }),
-    trace: { provider: deps.llm.id, agentic: deps.llm.agentic, standing: standing.map((d) => d.ref), facts, lessonFlags: flags, lessonShaped: shaped.repaired },
+    trace: {
+      provider: deps.llm.id, agentic: deps.llm.agentic, standing: standing.map((d) => d.ref), facts, lessonFlags: flags, lessonShaped: shaped.repaired,
+      ...(examples.length && { examples: examples.map((x) => x.lesson.id) }),
+      ...(ext && { workSession: input.work ? { id: input.work.sessionId, matchedBy: input.work.matchedBy ?? null } : null }),
+    },
   };
 }

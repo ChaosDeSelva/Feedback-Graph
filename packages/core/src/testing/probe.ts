@@ -31,8 +31,20 @@ export type ProbeKind =
 export type EmbeddedSeed =
   | { kind: 'Lesson'; id: string; title: string; rule: string; appliesWhen?: string; embedding: number[] }
   | { kind: 'Miss'; id: string; missed: string; causeExplanation: string; embedding: number[] }
-  | { kind: 'Fact'; id: string; path: string; statement: string; current: boolean; embedding: number[] }
+  | { kind: 'Fact'; id: string; path: string; statement: string; current: boolean; origin?: 'model' | 'you'; embedding: number[] }
   | { kind: 'Chunk'; id: string; text: string; embedding: number[] };
+
+/**
+ * Text as older redaction rules left it, written past the redaction at the door: an Inbox item (its turn, feedback and
+ * miss), a session's summary and final reply, an Activity entry.
+ */
+export type StaleTextSeed =
+  | {
+      kind: 'InboxItem'; id: string; text: string; context: string; summary: string; note: string;
+      agentReport: Record<string, unknown> | null; feedbackText: string; missed: string; causeExplanation: string;
+    }
+  | { kind: 'Session'; id: string; summary: Record<string, unknown>; finalReply: string }
+  | { kind: 'Activity'; id: string; subject: string; why: string; details: Record<string, unknown> };
 
 export type PreDoneCheckRow = {
   projectKey: string;
@@ -41,6 +53,8 @@ export type PreDoneCheckRow = {
   gaps: number;
   /** The CHECKED links, by lesson id. */
   lessons: { lessonId: string; gap: boolean }[];
+  /** The agent's session it was made in; absent when none was given. */
+  sessionId?: string;
 };
 
 export interface StoreProbe {
@@ -69,4 +83,8 @@ export interface StoreProbe {
   seedOrphan(row: { kind: 'Lesson' | 'Doc'; id: string; projectKey: string }): Promise<void>;
   /** An embedded record with only the fields its embedding text needs (a backend may add placeholder parents). */
   seedEmbedded(row: EmbeddedSeed): Promise<void>;
+  /** Text stored under older redaction rules (StaleTextSeed), with placeholder parents where a backend needs them. */
+  seedStaleText(row: StaleTextSeed): Promise<void>;
+  /** Mark a lesson decided by you, as the rule before 0.6.2 marked every decision, a machine's too. */
+  seedOwnerMark(lessonId: string): Promise<void>;
 }

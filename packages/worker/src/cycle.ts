@@ -52,6 +52,8 @@ export type CycleDeps = {
   /** Provider id of `classify`, for the provenance log. */
   classifierId?: string;
   activity?: Pick<ActivityStore, 'record'>;
+  /** How many turns the graph holds for a session, null when it has none (SessionsStore.detail): see codexCopyOf. */
+  storedTurns?: (sessionId: string) => Promise<number | null>;
   /** A folder's canonical git remote (projectRemote). Without it and `projects`, projects are folders only. */
   remote?: (repoPath: string) => Promise<string | null>;
   projects?: Pick<GraphStore, 'canonicalProject' | 'projectsMissingFolder' | 'fillProjectFolder'>;
@@ -144,6 +146,37 @@ async function recordTouchedFiles(s: ParsedSession, deps: CycleDeps, log: (msg: 
   }
 }
 
+/**
+ * The Claude Code session this Codex session is a copy of, or null: Codex's own. Judged once, the first time it is read,
+ * and kept: a live session read at its first turn is too short to fingerprint, so it is Codex's own, and stays so when
+ * it grows to open like a Claude Code conversation (the same prompts given to both agents). Judging on every read
+ * dropped such a session once it matched, frozen at the turns already stored. A session with no verdict yet that the
+ * graph already holds was read as Codex's own under that rule: it stays so, and is logged as resumed.
+ */
+async function codexCopyOf(s: ParsedSession, fingerprint: string | null, projectKey: string, deps: CycleDeps): Promise<string | null> {
+  const verdict = deps.state.codexVerdict(s.sessionId);
+  if (verdict !== undefined) return verdict;
+  const original = fingerprint ? deps.state.conversation(fingerprint) : null;
+  const stored = original && deps.storedTurns ? await deps.storedTurns(s.sessionId) : null;
+  if (original && stored === null) {
+    deps.state.judgeCodexSession(s.sessionId, original);
+    return original;
+  }
+  deps.state.judgeCodexSession(s.sessionId, null);
+  if (original && stored !== null) {
+    await deps.activity?.record({
+      kind: 'session_resumed',
+      actor: 'deterministic',
+      projectKey,
+      subject: `Codex session ${s.sessionId} is read again: ${stored} of its ${s.turns.length} turns were stored`,
+      why: 'an older rule dropped a Codex session as a copy of a Claude Code conversation once its opening matched one, though it had already been read as Codex\'s own; it stopped at the turns stored then',
+      details: { sessionId: s.sessionId, storedTurns: stored, turns: s.turns.length, matched: original },
+      targets: [s.sessionId],
+    });
+  }
+  return null;
+}
+
 async function readSessions(path: string, source: SessionSource, deps: CycleDeps): Promise<ParsedSession[]> {
   if (source === 'claude') return parseTranscript(await deps.readFile(path), path);
   if (!deps.readLines) throw new Error('no line reader for Codex sessions');
@@ -193,15 +226,16 @@ export async function runCycle(deps: CycleDeps): Promise<CycleResult> {
           // Codex can import Claude Code conversations; Claude Code files are listed first, so the original is known.
           const fingerprint = conversationFingerprint(s);
           if (fingerprint && source === 'claude') deps.state.rememberConversation(fingerprint, s.sessionId);
-          const original = fingerprint && source === 'codex' ? deps.state.conversation(fingerprint) : null;
-          if (original) {
-            log('codex session skipped: a copy of a Claude Code conversation', { session: s.sessionId, original });
-            continue;
-          }
           keys.add(folder.key);
-          // Out of scope: skipped, and remembered as such so selecting it later reads this file again.
+          // Out of scope: skipped, and remembered as such so selecting it later reads this file again. Before the copy
+          // verdict, so a project not selected is neither judged nor named in Activity.
           if (scope && !scope.folder(folder.key)) {
             skipped.add(folder.key);
+            continue;
+          }
+          const original = source === 'codex' ? await codexCopyOf(s, fingerprint, folder.key, deps) : null;
+          if (original) {
+            log('codex session skipped: a copy of a Claude Code conversation', { session: s.sessionId, original });
             continue;
           }
           const target = await projectFor(folder, deps, scope);

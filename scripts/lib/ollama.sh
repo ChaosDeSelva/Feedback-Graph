@@ -1,6 +1,18 @@
 # shellcheck shell=bash
 # Sourced by setup.sh and doctor.sh: checks of the Ollama on this machine that a /api/tags call cannot make.
 
+# The address of the containers' Ollama (OLLAMA_URL, $1) as seen from this machine: the host's own on 11434, or the
+# bundled ollama profile on the port it publishes (OLLAMA_PORT, $2, default 11435; a second install moves it).
+ollama_host_url() {
+  local url="$1" port="$2"
+  case "$port" in '' | *[!0-9]*) port=11435 ;; esac
+  case "$url" in
+    "" | *host.docker.internal*) printf '%s' "http://localhost:11434" ;;
+    http://ollama:11434*) printf '%s' "http://localhost:$port" ;;
+    *) printf '%s' "$url" ;;
+  esac
+}
+
 # One real schema-constrained /api/chat call (a `format` JSON schema, as the classifier sends), because a server can list
 # its models and still refuse every structured call (Homebrew's ollama formula ships its MLX runner without the grammar
 # library: HTTP 501 "structured output is unavailable"). It sends what the workers send: think:false (so a thinking model

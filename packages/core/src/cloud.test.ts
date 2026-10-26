@@ -256,7 +256,7 @@ test('a sync sends each project in scope and records one Activity entry: counts,
 test('401 stops the whole run; a 413 on one project does not stop the next; the failure is recorded', async () => {
   const activity = activityLog();
   const big = fakeFetch([new Response('', { status: 413 }), Response.json(ok)]);
-  const r = await runCloudSync({ cloud, portability: store({ big: bundle('big'), shop: bundle('shop') }), activity, projects: async () => ['big', 'shop'], trigger: 'schedule', fetch: big.f, sleep: noSleep });
+  const r = await runCloudSync({ cloud, portability: store({ big: bundle('big', { codeFiles: [] }), shop: bundle('shop') }), activity, projects: async () => ['big', 'shop'], trigger: 'schedule', fetch: big.f, sleep: noSleep });
   expect(r.ok).toBe(false);
   expect(r.projects.map((p) => p.status)).toEqual(['failed', 'sent']);
   expect(r.error).toMatch(/big.*too large/);
@@ -268,6 +268,74 @@ test('401 stops the whole run; a 413 on one project does not stop the next; the 
   expect(denied.calls).toHaveLength(1);
   expect(r2.projects.map((p) => p.status)).toEqual(['failed', 'not sent']);
   expect(r2.error).toMatch(/refused the token/);
+  // The run stopped: the schedule backs off as a whole only for this.
+  expect(r2.stopped).toBe(true);
+  expect(r.stopped).toBe(false);
+});
+
+const codeFile = (i: number, score: number) => ({ projectKey: 'shop', path: `src/f${String(i).padStart(4, '0')}.ts`, lang: 'ts', loc: 100, isTest: false, churn: 1, misses: 0, dependents: 1, score });
+
+test('a project too large for the cloud (413) goes again with its code map cut to the hottest files that fit, and says so', async () => {
+  const activity = activityLog();
+  const codeFiles = Array.from({ length: 400 }, (_, i) => codeFile(i, i % 7 === 0 ? 50 + i : i / 100));
+  const full = bundle('shop', { codeFiles });
+  const fullBytes = Buffer.byteLength(JSON.stringify(await syncBundle(store({ shop: full }), 'shop')));
+  const limit = Math.floor(fullBytes / 2);
+  const tooBig = Response.json({ error: `bundle larger than ${limit} bytes; sync one project at a time` }, { status: 413 });
+  const { f, calls } = fakeFetch([tooBig, Response.json(ok)]);
+  const memory = new Map();
+  const r = await runCloudSync({ cloud, portability: store({ shop: full }), activity, projects: async () => ['shop'], trigger: 'schedule', fetch: f, sleep: noSleep, memory });
+  expect(calls).toHaveLength(2);
+  const second = sentBody(calls[1]);
+  expect(Buffer.byteLength(calls[1].init.body as string)).toBeLessThanOrEqual(limit);
+  // Everything else whole; the code map cut to the highest scores, still in path order.
+  expect(second.facts).toEqual(sentBody(calls[0]).facts);
+  expect(second.codeFiles!.length).toBeGreaterThan(0);
+  expect(second.codeFiles!.length).toBeLessThan(400);
+  const kept = new Set(second.codeFiles!.map((c) => c.path));
+  const lowestKept = Math.min(...second.codeFiles!.map((c) => c.score));
+  expect(codeFiles.filter((c) => !kept.has(c.path)).every((c) => c.score <= lowestKept)).toBe(true);
+  expect(second.codeFiles!.map((c) => c.path)).toEqual([...kept].sort());
+  // Still complete for everything else; its code map says it is partial, so the cloud keeps the files it left out.
+  expect(second).toMatchObject({ complete: true, codeFilesPartial: true });
+  expect(sentBody(calls[0])).not.toHaveProperty('codeFilesPartial');
+  expect(r.ok).toBe(true);
+  expect(r.projects[0]).toMatchObject({ key: 'shop', status: 'sent', trimmed: { codeFiles: { sent: second.codeFiles!.length, of: 400 } } });
+  expect(activity.rows[0].subject).toMatch(/code map cut to \d+ of 400 files/);
+  // The full bundle is what is remembered: unchanged next time, so it is not cut and resent every run.
+  const again = fakeFetch([]);
+  expect((await runCloudSync({ cloud, portability: store({ shop: full }), projects: async () => ['shop'], trigger: 'schedule', fetch: again.f, sleep: noSleep, memory })).projects[0].status).toBe('unchanged');
+  expect(again.calls).toHaveLength(0);
+});
+
+test('a 413 that the code map cannot explain says what to do: raise SYNC_MAX_BYTES or leave the project out', async () => {
+  const tooBig = () => Response.json({ error: 'bundle larger than 1000 bytes; sync one project at a time' }, { status: 413 });
+  // No code map to cut: one request, and the advice fits a bundle that is already one project.
+  const plain = fakeFetch([tooBig()]);
+  const r = await runCloudSync({ cloud, portability: store({ shop: bundle('shop', { codeFiles: [] }) }), projects: async () => ['shop'], trigger: 'schedule', fetch: plain.f, sleep: noSleep });
+  expect(plain.calls).toHaveLength(1);
+  expect(r.projects[0].status).toBe('failed');
+  expect(r.error).toMatch(/shop.*too large for the cloud \(413\).*SYNC_MAX_BYTES.*1000 bytes.*EXCLUDE_PROJECTS/);
+  expect(r.error).not.toMatch(/sync fewer projects|one project at a time/);
+  // With a code map that is not enough: it goes once more without any, and then fails with the same advice.
+  const both = fakeFetch([tooBig(), tooBig(), tooBig(), tooBig()]);
+  const r2 = await runCloudSync({ cloud, portability: store({ shop: bundle('shop') }), projects: async () => ['shop'], trigger: 'schedule', fetch: both.f, sleep: noSleep });
+  expect(sentBody(both.calls.at(-1)!).codeFiles).toEqual([]);
+  expect(both.calls.length).toBeLessThanOrEqual(4);
+  expect(r2.error).toMatch(/even without its code map.*SYNC_MAX_BYTES/);
+});
+
+test('a project the schedule is backing off from waits: it is not exported or sent, and the run is not a failure', async () => {
+  const s = store({ big: bundle('big'), shop: bundle('shop') });
+  const { f, calls } = fakeFetch([]);
+  const r = await runCloudSync({
+    cloud, portability: s, projects: async () => ['big', 'shop'], trigger: 'schedule', fetch: f, sleep: noSleep,
+    waiting: (key) => (key === 'big' ? '2026-10-25T14:00:00.000Z' : null),
+  });
+  expect(calls).toHaveLength(1);
+  expect(r.ok).toBe(true);
+  expect(r.projects).toEqual([{ key: 'big', status: 'waiting', counts: null, until: '2026-10-25T14:00:00.000Z' }, expect.objectContaining({ key: 'shop', status: 'sent' })]);
+  expect(s.exportData.mock.calls.map((c) => c[0]?.projectKey)).toEqual(['shop']);
 });
 
 test('a sync skips a project whose bundle has not changed since it was last sent; Sync now resends only when forced', async () => {
@@ -352,6 +420,31 @@ test('the projects synced: the selected ones, narrowed by SYNC_PROJECTS when set
 });
 
 const sentBody = (c: Call) => JSON.parse(c.init.body as string) as ExportBundle & { complete?: boolean; withdrawn?: { kind: string; id: string; projectKey?: string }[] };
+
+test('the unchanged skip does not depend on row order: the same rows in another order are the same bundle', async () => {
+  const fact = (statement: string, kind: string) => ({ ...bundle().facts[0], statement, kind });
+  const misses = [bundle().misses[0], { ...bundle().misses[0], id: 'miss:2' }];
+  const items = [{ kind: 'file', ref: 'a.ts', excerpt: '', why: 'one' }, { kind: 'file', ref: 'a.ts', excerpt: '', why: 'two' }];
+  const facts = [fact('same', 'convention'), fact('same', 'gotcha'), fact('other', 'api')];
+  const docs = [bundle().docs[0], { ...bundle().docs[0], id: 'doc:shop:upload:b.md' }];
+  const codeFiles = [bundle().codeFiles[0], { ...bundle().codeFiles[0], path: 'src/b.ts' }];
+  const bundles = { shop: bundle('shop', { facts, misses: misses.map((m) => ({ ...m, contextItems: items })), docs, codeFiles }) };
+  const memory = new Map();
+  await runCloudSync({ cloud, portability: store(bundles), projects: async () => ['shop'], trigger: 'schedule', fetch: fakeFetch([]).f, sleep: noSleep, memory });
+  // A store without a snapshot (or ties with no tiebreak) hands back the same rows in another order.
+  bundles.shop = bundle('shop', {
+    facts: [...facts].reverse(), misses: [...misses].reverse().map((m) => ({ ...m, contextItems: [...items].reverse() })), docs: [...docs].reverse(), codeFiles: [...codeFiles].reverse(),
+  });
+  const again = fakeFetch([]);
+  const r = await runCloudSync({ cloud, portability: store(bundles), projects: async () => ['shop'], trigger: 'schedule', fetch: again.f, sleep: noSleep, memory });
+  expect(again.calls).toHaveLength(0);
+  expect(r.projects[0].status).toBe('unchanged');
+  // A real change still goes.
+  bundles.shop = bundle('shop', { facts: [fact('changed', 'api')], misses, docs, codeFiles });
+  const changed = fakeFetch([]);
+  await runCloudSync({ cloud, portability: store(bundles), projects: async () => ['shop'], trigger: 'schedule', fetch: changed.f, sleep: noSleep, memory });
+  expect(changed.calls).toHaveLength(1);
+});
 
 test('a lesson approved and then revoked locally is sent with its new status, so the team copy is demoted', async () => {
   const bundles = { shop: bundle('shop') };
@@ -443,15 +536,23 @@ test('a 429 is retried only after the Retry-After the cloud asked for (seconds o
 /** A DocsStore's cursors, in memory: what storedSyncMemory keeps its record in. */
 function cursors() {
   const m = new Map<string, string>();
-  return { m, getCursor: async (k: string) => m.get(k) ?? null, setCursor: async (k: string, v: string) => { m.set(k, v); } };
+  // Each call yields first, as a store round trip does, so two services' writes can interleave.
+  const tick = () => new Promise<void>((r) => setTimeout(r, 0));
+  return {
+    m,
+    getCursor: async (k: string) => { await tick(); return m.get(k) ?? null; },
+    setCursor: async (k: string, v: string) => { await tick(); m.set(k, v); },
+    cursorsWithPrefix: async (p: string) => { await tick(); return [...m].filter(([k]) => k.startsWith(p)).map(([key, value]) => ({ key, value })); },
+    deleteCursor: async (k: string) => { await tick(); m.delete(k); },
+  };
 }
 
 test('what the cloud last accepted is kept in the store: a restarted process (or the other service) still withdraws what is gone', async () => {
   const docs = cursors();
   const bundles = { shop: bundle('shop') };
   await runCloudSync({ cloud, portability: store(bundles), projects: async () => ['shop'], trigger: 'schedule', fetch: fakeFetch([]).f, sleep: noSleep, memory: storedSyncMemory(docs, cloud) });
-  // One record, keyed without the token in it.
-  expect([...docs.m.keys()]).toEqual([syncMemoryCursor(cloud)]);
+  // One record per project, keyed without the token in it.
+  expect([...docs.m.keys()]).toEqual([`${syncMemoryCursor(cloud)}/shop`]);
   expect([...docs.m.keys(), ...docs.m.values()].join(' ')).not.toContain(TOKEN);
   bundles.shop = bundle('shop', { docs: [] });
   // A new process: a fresh memory over the same store.
@@ -484,8 +585,35 @@ test('each write changes only its own project, so two services syncing at once d
   expect([...(await b.keys())]).toEqual(['two']);
   expect(await a.get('two')).toEqual(rec('2'));
   // A damaged record reads as none, never as an error that stops sync.
-  docs.m.set(syncMemoryCursor(cloud), 'not json');
+  docs.m.set(`${syncMemoryCursor(cloud)}/two`, 'not json');
   expect([...(await a.keys())]).toEqual([]);
+  expect(await a.get('two')).toBeUndefined();
+});
+
+test('two services writing at once (Sync now and the schedule) never lose each other\'s record: each project is its own write', async () => {
+  const docs = cursors();
+  const api = storedSyncMemory(docs, cloud);
+  const worker = storedSyncMemory(docs, cloud);
+  const rec = (fingerprint: string) => ({ fingerprint, remote: null, lessons: [], misses: [], docs: [], files: [] });
+  await Promise.all([api.set('one', rec('1')), worker.set('two', rec('2')), api.set('three', rec('3'))]);
+  expect([...(await api.keys())].sort()).toEqual(['one', 'three', 'two']);
+  await Promise.all([api.delete('one'), worker.set('four', rec('4'))]);
+  expect([...(await worker.keys())].sort()).toEqual(['four', 'three', 'two']);
+  expect(await worker.get('three')).toEqual(rec('3'));
+});
+
+test('a record kept the old way (one cursor for every project) is moved to one per project, and nothing in it is lost', async () => {
+  const docs = cursors();
+  const rec = (fingerprint: string) => ({ fingerprint, remote: null, lessons: ['lesson:1'], misses: [], docs: [], files: [] });
+  docs.m.set(syncMemoryCursor(cloud), JSON.stringify({ shop: rec('s'), blog: rec('b') }));
+  const memory = storedSyncMemory(docs, cloud);
+  expect([...(await memory.keys())].sort()).toEqual(['blog', 'shop']);
+  expect(await memory.get('shop')).toEqual(rec('s'));
+  // The old record is gone once moved; a newer per-project record is never overwritten by it.
+  expect(docs.m.has(syncMemoryCursor(cloud))).toBe(false);
+  docs.m.set(syncMemoryCursor(cloud), JSON.stringify({ shop: rec('old') }));
+  const next = storedSyncMemory(docs, cloud);
+  expect(await next.get('shop')).toEqual(rec('s'));
 });
 
 test('a project synced before and no longer in the list gets one last, empty bundle that withdraws what was sent, then is forgotten', async () => {

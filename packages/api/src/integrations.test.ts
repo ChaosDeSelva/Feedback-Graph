@@ -1,7 +1,7 @@
 import { mkdtempSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { credentialFile, IntegrationError, Integrations, type ActivityInput, type WorkerStatus } from '@fb/core';
+import { credentialFile, IntegrationError, Integrations, prBacklogKey, type ActivityInput, type WorkerStatus } from '@fb/core';
 import { describe, expect, test } from 'vitest';
 import { createApp, type ApiRepo } from './app.ts';
 import { connectionsStatus, serviceConnection, type IntegrationsDeps } from './integrations.ts';
@@ -51,7 +51,10 @@ describe('the skip rules in Settings > Integrations', () => {
     const app = createApp(repo, { integrations: { ...d, activity: { record: async () => {}, list: async (q) => { asked.push(q); return entries as never; } } } });
     const v = await (await app.request('/api/settings/integrations')).json();
     expect(asked).toEqual([{ kind: 'comments_skipped', limit: 1000 }]);
-    expect(v.rules.map((r: { name: string; skipped: number }) => [r.name, r.skipped])).toEqual([['bot-author', 1], ['pr-author-reply', 3], ['status-note', 0], ['review-trigger', 0]]);
+    expect(v.rules.map((r: { name: string; skipped: number }) => [r.name, r.skipped])).toEqual([
+      ['bot-author', 1], ['pr-author-reply', 3], ['status-note', 0], ['review-trigger', 0],
+      ['ai-review', 0], ['approval-summary', 0], ['status-table', 0], ['branch-timing', 0], ['review-folded', 0],
+    ]);
     expect(v.rules[0].description).toMatch(/bots/i);
     expect(v.skippedSince).toBe('2026-10-23T10:00:00Z');
   });
@@ -72,7 +75,7 @@ describe('the skip rules in Settings > Integrations', () => {
   test('without an activity log to count from, the rules are listed with no counts', async () => {
     const { app } = setup();
     const v = await (await app.request('/api/settings/integrations')).json();
-    expect(v.rules.map((r: { skipped: number | null }) => r.skipped)).toEqual([null, null, null, null]);
+    expect(v.rules.map((r: { skipped: number | null }) => r.skipped)).toEqual(Array(9).fill(null));
     expect(v.skippedSince).toBeNull();
   });
 });
@@ -88,6 +91,16 @@ describe('Settings > Integrations', () => {
       expect.objectContaining({ key: 'shop', github: expect.objectContaining({ repo: 'acme/shop', from: 'remote', enabled: true }) }),
       expect.objectContaining({ key: 'notes', github: expect.objectContaining({ repo: null, from: null }) }),
     ]);
+  });
+
+  test('a PR sync that hit its cap shows what it has not read yet on the project, until the worker catches up', async () => {
+    const { app, store } = setup();
+    await store.setCursor(prBacklogKey('shop'), JSON.stringify({ since: '2026-10-01T00:00:00Z', until: '2026-10-21T00:00:00Z' }));
+    const v = await (await app.request('/api/settings/integrations')).json();
+    expect(v.projects[0].github.backlog).toEqual({ since: '2026-10-01T00:00:00Z', until: '2026-10-21T00:00:00Z' });
+    expect(v.projects[1].github.backlog).toBeNull();
+    await store.setCursor(prBacklogKey('shop'), '');
+    expect((await (await app.request('/api/settings/integrations')).json()).projects[0].github.backlog).toBeNull();
   });
 
   test('saving a token checks it with one call, keeps it in the mode-600 file and never returns it', async () => {
@@ -219,5 +232,15 @@ describe('connection states', () => {
     expect(c.ollama.state).toBe('connected');
     expect(c.cloud).toMatchObject({ state: 'not_connected', detail: expect.stringMatching(/nothing is sent/) });
     expect(JSON.stringify(c)).not.toContain('x'.repeat(20));
+  });
+
+  test('a project the sync schedule is backing off from is named, though the last run was fine for the rest', async () => {
+    const cloud = { url: 'https://cloud.example.com', token: 't', intervalMinutes: 60, projects: [], suggestions: false, machine: null };
+    const cloudSync = {
+      host: 'cloud.example.com', intervalMinutes: 60, lastAt: '2026-10-25T11:00:00.000Z', lastOk: true, lastError: null, lastSent: null, nextAt: null, failures: 0,
+      waiting: [{ key: 'demo-shop', failures: 2, until: '2026-10-25T15:00:00.000Z', error: 'the cloud rejected the bundle (422)' }],
+    };
+    const c = await connectionsStatus({ integrations: null, worker: { providers: {}, health: {}, cloudSync } as unknown as WorkerStatus, ollama: null, cloud });
+    expect(c.cloud).toMatchObject({ state: 'error', detail: expect.stringMatching(/demo-shop failed 2 times in a row.*422.*tried again 2026-10-25 15:00 UTC.*others sync as usual/) });
   });
 });

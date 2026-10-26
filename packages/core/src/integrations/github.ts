@@ -41,14 +41,31 @@ export type PrContext = {
   headBranch: string | null;
   body: string;
   comments: PrComment[];
+  /** The repo-relative files the PR changed (GitHub's list, capped at MAX_PR_FILES); unset when not fetched. */
+  files?: string[];
 };
 
-export type FetchPrOpts = { repo: string; token: string; since?: string; maxPrs?: number; fetchImpl?: typeof fetch };
+export type FetchPrOpts = {
+  repo: string;
+  token: string;
+  since?: string;
+  maxPrs?: number;
+  /** Only PRs updated at or before this: the newer ones were read already, so they are skipped and not counted. */
+  until?: string;
+  /**
+   * An incremental read (`since`) stopped by maxPrs or the page limit before reaching `since`: called with the update
+   * time of the oldest PR listed. PRs updated after `since` and before it were not read; read them with `until`.
+   */
+  onCap?: (readBackTo: string) => void;
+  fetchImpl?: typeof fetch;
+};
 
 const API = 'https://api.github.com';
 const REPO_RE = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})\/[A-Za-z0-9._-]{1,100}$/;
 const PROJECT_RE = /^[A-Za-z0-9._-]+$/;
 const MAX_PAGES = 10;
+// Listing pages a read with `until` may also spend skipping PRs updated after it (100 PRs a page).
+const SKIP_PAGES = 50;
 const CHUNK_CAP = 4000;
 const ERR_BODY_CAP = 500;
 const HUNK_CAP = 1500;
@@ -164,13 +181,15 @@ async function ghFetch(url: string, token: string, fetchImpl: typeof fetch): Pro
 }
 
 /** Walk `Link: rel="next"` pages (capped), yielding each page's parsed items. */
-async function* pages<T>(url: string, schema: z.ZodType<T>, token: string, fetchImpl: typeof fetch): AsyncGenerator<T[]> {
+/** `state.more` ends true when the page limit stopped the listing with pages left. */
+async function* pages<T>(url: string, schema: z.ZodType<T>, token: string, fetchImpl: typeof fetch, limit = MAX_PAGES, state?: { more: boolean }): AsyncGenerator<T[]> {
   let next: string | null = url;
-  for (let i = 0; next && i < MAX_PAGES; i++) {
+  for (let i = 0; next && i < limit; i++) {
     const res = await ghFetch(next, token, fetchImpl);
     yield z.array(schema).parse(await res.json());
     next = nextLink(res.headers.get('link'));
   }
+  if (state) state.more = !!next;
 }
 
 async function all<T>(url: string, schema: z.ZodType<T>, token: string, fetchImpl: typeof fetch): Promise<T[]> {
@@ -214,35 +233,89 @@ async function commentsFor(repo: string, n: number, token: string, fetchImpl: ty
   return out;
 }
 
+const FileSchema = z.object({ filename: z.string() });
+/** GitHub lists at most 3000 files of a PR; this many are plenty to tell which session did the work. */
+const MAX_PR_FILES = 300;
+
+/**
+ * The files a PR changed (renamed: the new path). A list that cannot be read leaves them out (the comments still sync);
+ * a rejected token or a rate limit still stops the sync.
+ */
+async function filesFor(repo: string, n: number, token: string, fetchImpl: typeof fetch): Promise<{ files?: string[] }> {
+  try {
+    const out: string[] = [];
+    for await (const page of pages(`${API}/repos/${repo}/pulls/${n}/files?per_page=100`, FileSchema, token, fetchImpl)) {
+      out.push(...page.map((f) => f.filename));
+      if (out.length >= MAX_PR_FILES) break;
+    }
+    return { files: out.slice(0, MAX_PR_FILES) };
+  } catch (err) {
+    if (err instanceof IntegrationError && (err.kind === 'auth' || err.kind === 'rate_limit')) throw err;
+    return {};
+  }
+}
+
 /**
  * Recently updated PRs (newest first) with their review comments, conversation comments,
  * and review bodies. Stops at `since` (ISO time) or `maxPrs` (default 30). Bot authors and
  * empty bodies are dropped. Output is unredacted; see the module comment.
  */
-/** Safety cap for one incremental sync; at a 6-hour interval no real repository gets near it. */
+/** Cap for one incremental read; a busy repository (or the 14-day ticket backfill) can pass it: see onCap. */
 export const INCREMENTAL_MAX_PRS = 1000;
+
+/**
+ * What a PR sync stopped by INCREMENTAL_MAX_PRS did not read: the PRs updated after `since` and before `until`. The
+ * sync cursor still moves on (the newest PRs were read); each later sync reads one more batch of this, newest first,
+ * until none is left. JSON in the cursor store under prBacklogKey; '' when there is none.
+ */
+export type PrBacklog = { since: string; until: string };
+export const prBacklogKey = (projectKey: string) => `github-backlog:${projectKey}`;
+
+export function parsePrBacklog(raw: string | null): PrBacklog | null {
+  if (!raw) return null;
+  try {
+    const b = JSON.parse(raw) as Partial<PrBacklog>;
+    return typeof b.since === 'string' && typeof b.until === 'string' ? { since: b.since, until: b.until } : null;
+  } catch {
+    return null;
+  }
+}
 
 export async function fetchPullRequestContext(o: FetchPrOpts): Promise<PrContext[]> {
   if (!validRepo(o.repo)) throw new Error(`github: malformed repo ${JSON.stringify(o.repo)}, expected owner/repo`);
   const fetchImpl = o.fetchImpl ?? fetch;
   // A first sync takes the most recent PRs; an incremental one must take everything since the cursor,
-  // because the caller moves the cursor forward afterwards and anything skipped would never come back.
+  // because the caller moves the cursor forward afterwards; past the cap, onCap says what is left for a read with until.
   const maxPrs = Math.max(1, o.maxPrs ?? (o.since ? INCREMENTAL_MAX_PRS : 30));
   const sinceMs = o.since ? Date.parse(o.since) : Number.NEGATIVE_INFINITY;
   if (Number.isNaN(sinceMs)) throw new Error(`github: invalid since ${JSON.stringify(o.since)}`);
+  const untilMs = o.until ? Date.parse(o.until) : Number.POSITIVE_INFINITY;
+  if (Number.isNaN(untilMs)) throw new Error(`github: invalid until ${JSON.stringify(o.until)}`);
   const perPage = Math.min(maxPrs, 100);
   const listUrl = `${API}/repos/${o.repo}/pulls?state=all&sort=updated&direction=desc&per_page=${perPage}`;
 
   const picked: z.infer<typeof PullSchema>[] = [];
   let seen = 0;
-  outer: for await (const page of pages(listUrl, PullSchema, o.token, fetchImpl)) {
+  // Newest first: reaching `since` (or the end of the list) means everything since was read.
+  let reachedSince = false;
+  let oldest: string | null = null;
+  const listing = { more: false };
+  outer: for await (const page of pages(listUrl, PullSchema, o.token, fetchImpl, o.until ? MAX_PAGES + SKIP_PAGES : MAX_PAGES, listing)) {
     for (const p of page) {
-      if (Date.parse(p.updated_at) < sinceMs || seen >= maxPrs) break outer;
+      const t = Date.parse(p.updated_at);
+      if (t < sinceMs) {
+        reachedSince = true;
+        break outer;
+      }
+      if (seen >= maxPrs) break outer;
+      oldest = t > untilMs ? o.until! : p.updated_at;
+      if (t > untilMs) continue;
       seen++;
       if (!isBot(p.user)) picked.push(p);
     }
     if (seen >= maxPrs) break;
   }
+  if (o.since && o.onCap && oldest && !reachedSince && (seen >= maxPrs || listing.more)) o.onCap(oldest);
 
   const out: PrContext[] = [];
   for (const p of picked) {
@@ -257,6 +330,7 @@ export async function fetchPullRequestContext(o: FetchPrOpts): Promise<PrContext
       headBranch: p.head?.ref ?? null,
       body: p.body ?? '',
       comments: await commentsFor(o.repo, p.number, o.token, fetchImpl),
+      ...await filesFor(o.repo, p.number, o.token, fetchImpl),
     });
   }
   return out;

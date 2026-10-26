@@ -1,6 +1,6 @@
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { GIT_SAFE } from '../ingest/git.ts';
+import { GIT_SAFE, gitSafeEnv } from '../ingest/git.ts';
 
 const run = promisify(execFile);
 
@@ -18,8 +18,8 @@ export async function churn(repoPath: string, sinceDays: number, gitArgs: readon
   let stdout: string;
   try {
     ({ stdout } = await run('git', [
-      ...GIT_SAFE, '-C', repoPath, ...gitArgs, 'log', `--since=${since}`, '--no-merges', '-M', '--numstat', '-z', '--relative', `--format=${HEADER}%H%x09%cI`,
-    ], { timeout: 60_000, maxBuffer: 256 * 1024 * 1024 }));
+      ...GIT_SAFE, '-C', repoPath, ...gitArgs, 'log', '--no-textconv', '--no-ext-diff', `--since=${since}`, '--no-merges', '-M', '--numstat', '-z', '--relative', `--format=${HEADER}%H%x09%cI`,
+    ], { timeout: 60_000, maxBuffer: 256 * 1024 * 1024, env: gitSafeEnv() }));
   } catch {
     return new Map();
   }

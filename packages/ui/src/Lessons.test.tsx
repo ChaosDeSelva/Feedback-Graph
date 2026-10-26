@@ -398,3 +398,70 @@ test('the list filters by source (GitHub review vs session pushback) and by flag
   await waitFor(() => expect(f.lists.at(-1)).toBe('/api/lessons?status=proposed&flag=duplicate-of&source=github'));
   expect(screen.getAllByText('GitHub review').length).toBeGreaterThan(0);
 });
+
+test('the header says how the lessons the post-mortem wrote were judged: approved as written, after an edit, rejected', async () => {
+  const q = (days: number, asWritten: number, edited: number, rejected: number) => ({ days, asWritten, edited, rejected, decided: asWritten + edited + rejected });
+  vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+    if (url === '/api/lessons/quality') return Response.json({ windows: [q(30, 21, 60, 62), q(90, 30, 70, 80)], projects: { acme: [q(30, 20, 50, 60), q(90, 29, 60, 78)], web: [q(30, 1, 10, 2), q(90, 1, 10, 2)] } });
+    if (url.startsWith('/api/lessons?')) return Response.json([lesson('l1', 'Server search')]);
+    if (url === '/api/lessons/l1') return Response.json(detail('l1', 'Server search'));
+    return Response.json([]);
+  }));
+  render(<Lessons />);
+  const judged = await screen.findByLabelText('how your lessons were judged');
+  expect(judged.textContent).toMatch(/Last 30 days: 143 decided/);
+  expect(judged.textContent).toMatch(/21 as written \(15%\)/);
+  expect(judged.textContent).toMatch(/60 after your edit \(42%\)/);
+  expect(judged.textContent).toMatch(/62 rejected \(43%\)/);
+  // By project and over 90 days, one click away.
+  const rows = within(judged).getAllByRole('row').map((r) => r.textContent);
+  expect(rows).toEqual(expect.arrayContaining([expect.stringMatching(/^acme.*130.*20.*50.*60/), expect.stringMatching(/^web/)]));
+  expect(judged.textContent).toMatch(/90 days/);
+});
+
+test('no decided lessons yet, or a server that cannot tell: the header says nothing about it', async () => {
+  vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+    if (url === '/api/lessons/quality') return Response.json({ error: 'this store cannot count lesson decisions' }, { status: 404 });
+    if (url.startsWith('/api/lessons?')) return Response.json([lesson('l1', 'Server search')]);
+    if (url === '/api/lessons/l1') return Response.json(detail('l1', 'Server search'));
+    return Response.json([]);
+  }));
+  render(<Lessons />);
+  await screen.findByText('filtered on the client');
+  expect(screen.queryByLabelText('how your lessons were judged')).toBeNull();
+});
+
+test('a generic lesson is listed last, with the reason under it', async () => {
+  bulkFetch([flagged('l1', 'Verify the sequence', ['generic']), flagged('l2', 'Escape CSV headers', []), flagged('l3', 'Close the pool', ['needs-path'])]);
+  render(<Lessons />);
+  await screen.findByRole('checkbox', { name: 'select Escape CSV headers' });
+  const rows = screen.getAllByRole('checkbox').map((c) => c.getAttribute('aria-label')).filter((n) => n?.startsWith('select '));
+  expect(rows).toEqual(['select Escape CSV headers', 'select Close the pool', 'select Verify the sequence']);
+  const list = screen.getByRole('complementary', { name: 'lessons' });
+  expect(within(list).getByText('why generic')).toBeTruthy();
+});
+
+test('narrowing a global lesson asks for its project and sends it with the scope', async () => {
+  const global = { ...lesson('g1', 'Escape CSV headers'), projectKey: null, scope: 'global', source: 'manual' };
+  const sent: unknown[] = [];
+  vi.stubGlobal('fetch', vi.fn(async (url: string, init?: RequestInit) => {
+    if (init?.method === 'PATCH') { sent.push(JSON.parse(init.body as string)); return new Response(null, { status: 204 }); }
+    if (url.startsWith('/api/lessons?')) return Response.json([global]);
+    if (url === '/api/lessons/g1') return Response.json({ ...detail('g1', 'Escape CSV headers'), lesson: global });
+    if (url === '/api/projects') return Response.json([{ key: 'web' }, { key: 'data-pipeline' }]);
+    return Response.json([]);
+  }));
+  render(<Lessons />);
+  const scope = await screen.findByLabelText('scope');
+  expect(screen.queryByLabelText('project')).toBeNull();
+  fireEvent.change(scope, { target: { value: 'project' } });
+  const project = (await screen.findByLabelText('project')) as HTMLSelectElement;
+  await waitFor(() => expect([...project.options].map((o) => o.value)).toEqual(['', 'web', 'data-pipeline']));
+  // No project chosen: nothing is sent, and the owner is told why.
+  fireEvent.click(screen.getByRole('button', { name: 'Approve' }));
+  expect(await screen.findByText(/choose the project/i)).toBeTruthy();
+  expect(sent).toEqual([]);
+  fireEvent.change(project, { target: { value: 'data-pipeline' } });
+  fireEvent.click(screen.getByRole('button', { name: 'Approve' }));
+  await waitFor(() => expect(sent).toEqual([{ status: 'approved', scope: 'project', projectKey: 'data-pipeline' }]));
+});

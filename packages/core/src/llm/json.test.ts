@@ -1,5 +1,5 @@
 import { expect, test } from 'vitest';
-import { askJson, extractJsonAnswer, ModelOutputError, outputTail, STRICT_JSON } from './json.ts';
+import { AnswerRefused, askJson, extractJsonAnswer, ModelOutputError, outputTail, STRICT_JSON } from './json.ts';
 import type { JsonTask, LlmProvider } from './providers.ts';
 
 test('a bare JSON answer parses as is', () => {
@@ -96,6 +96,20 @@ test('askJson fails after the second bad answer, naming the problem and the tail
   expect(err).toBeInstanceOf(ModelOutputError);
   expect((err as Error).message).toMatch(/did not match the schema: a: expected number/);
   expect((err as Error).message).toMatch(/still wrong/);
+});
+
+test('a validator refusing the content (AnswerRefused) has the retry told why; a plain schema error is not quoted back', async () => {
+  const refuse = (raw: unknown) => {
+    const a = isA(raw);
+    if (a.a < 0) throw new AnswerRefused('a must be positive, not a sign of the scope');
+    return a;
+  };
+  const { llm, seen } = fake([{ a: -1 }, { a: 4 }]);
+  expect(await askJson(llm, task, refuse)).toEqual({ a: 4 });
+  expect(seen[1].system).toBe(`SYS\n\n${STRICT_JSON}\nYour last answer was refused: a must be positive, not a sign of the scope`);
+  const plain = fake([{ b: 1 }, { a: 1 }]);
+  await askJson(plain.llm, task, refuse);
+  expect(plain.seen[1].system).toBe(`SYS\n\n${STRICT_JSON}`);
 });
 
 test('askJson does not retry other errors (timeouts, unavailability, HTTP 400)', async () => {

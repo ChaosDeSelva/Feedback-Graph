@@ -1,5 +1,5 @@
-import { shownProjects, type ActivityInput, type Lesson } from '@fb/core';
-import { expect, test } from 'vitest';
+import { shownProjects, type ActivityInput, type Lesson, type ShownProjects } from '@fb/core';
+import { describe, expect, test } from 'vitest';
 import { createApp, type ApiRepo, type AppOpts } from './app.ts';
 
 const repo = { listCandidates: async () => [], candidateDetail: async () => null, decide: async () => {}, stats: async () => [] } as unknown as ApiRepo;
@@ -60,6 +60,51 @@ test('PATCH editing the rule re-embeds the lesson text', async () => {
   await app.request('/api/lessons/lesson%3Aa', patch({ rule: 'New rule', scope: 'global' }));
   expect(embedded).toEqual([['T\nNew rule\nApplies when: W']]);
   expect(calls).toContainEqual(['update', 'lesson:a', { rule: 'New rule', scope: 'global' }, { reembed: [0.5], by: 'you' }]);
+});
+
+describe('narrowing a global lesson to a project', () => {
+  const global: Lesson = { ...lesson, id: 'lesson:g', projectKey: null, origin: null, scope: 'global', source: 'manual' };
+  function narrowSetup(o: { shown?: string[] } = {}) {
+    const calls: unknown[][] = [];
+    const knowledge = {
+      listLessons: async () => [global],
+      lessonDetail: async (id: string) => (id === global.id ? { lesson: global, miss: null, feedback: null, contextItems: [], fixCommits: [], supersedes: [] } : null),
+      // As both stores: a narrowed lesson with neither a project given nor one to trace it to is unscoped.
+      updateLesson: async (id: string, p: { scope?: string; projectKey?: string }) => { calls.push(['update', id, p]); return { unscoped: !p.projectKey && (p.scope === 'project' || p.scope === 'task') }; },
+    };
+    const projectDirs = async () => [{ key: 'web', name: 'web', repoPath: '/repos/web' }, { key: 'data-pipeline', name: 'data-pipeline', repoPath: '/repos/data-pipeline' }];
+    const keys = o.shown;
+    const shown = keys && (async () => ({ initialized: true, keys, has: (k: string) => keys.includes(k) }) as ShownProjects);
+    const app = createApp(repo, { knowledge, projectDirs, ...(shown && { shown }) } as AppOpts);
+    return { app, calls };
+  }
+
+  test('with no project named it is still refused (409), and the error says to name one', async () => {
+    const { app } = narrowSetup();
+    const res = await app.request('/api/lessons/lesson%3Ag', patch({ scope: 'project' }));
+    expect(res.status).toBe(409);
+    expect((await res.json()).error).toMatch(/projectKey/);
+  });
+
+  test('with a known project it is narrowed to that project', async () => {
+    const { app, calls } = narrowSetup();
+    expect((await app.request('/api/lessons/lesson%3Ag', patch({ scope: 'project', projectKey: 'data-pipeline' }))).status).toBe(204);
+    expect(calls).toContainEqual(['update', 'lesson:g', { scope: 'project', projectKey: 'data-pipeline' }]);
+  });
+
+  test('an unknown project, one not selected, or a project on a lesson staying global is a 400', async () => {
+    const { app, calls } = narrowSetup({ shown: ['web'] });
+    expect((await app.request('/api/lessons/lesson%3Ag', patch({ scope: 'task', projectKey: 'acme-legacy' }))).status).toBe(400);
+    expect((await app.request('/api/lessons/lesson%3Ag', patch({ scope: 'project', projectKey: 'data-pipeline' }))).status).toBe(400);
+    expect((await app.request('/api/lessons/lesson%3Ag', patch({ projectKey: 'web' }))).status).toBe(400);
+    expect(calls).toEqual([]);
+    expect((await app.request('/api/lessons/lesson%3Ag', patch({ scope: 'task', projectKey: 'web' }))).status).toBe(204);
+  });
+
+  test('a project lesson cannot be moved to another project with projectKey', async () => {
+    const { app } = setup();
+    expect((await app.request('/api/lessons/lesson%3Aa', patch({ scope: 'project', projectKey: 'web' }))).status).toBe(400);
+  });
 });
 
 test('PATCH rejects unknown fields and bad statuses', async () => {

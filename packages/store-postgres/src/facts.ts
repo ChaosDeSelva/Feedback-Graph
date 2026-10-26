@@ -1,9 +1,9 @@
 import { randomUUID } from 'node:crypto';
 import type pg from 'pg';
-import { clampRelevance, FACT_EVIDENCE, factOrigin, requestTimes, scanRequestPaths, MANIFEST_WHY_RE, PROJECT_PATH, provenanceOf, redactDeep, redactSecrets, relevanceOf, SCAN_UNAVAILABLE_WAIT_MS, scanRetryAt } from '@fb/core';
-import type { EmbeddedFact, FactCheck, FactHit, FactKind, FactOrigin, FactScope, FactsStore, Project, ScannedFile, ProjectSummary, RelevanceBy, ScanJob, ScanJobPatch, ScanStatus, StoredFact, RelevanceUpdate, UnscoredFact } from '@fb/core';
+import { clampRelevance, DEMO_SOURCE, FACT_EVIDENCE, factOrigin, requestTimes, scanRequestPaths, MANIFEST_WHY_RE, PROJECT_PATH, provenanceOf, holdsCredential, REDACT_PAGE, redactDeep, redactSecrets, relevanceOf, SCAN_UNAVAILABLE_WAIT_MS, scanRetryAt, redactStoredFact } from '@fb/core';
+import type { EmbeddedFact, FactCheck, FactHit, FactKind, FactOrigin, FactScope, FactsStore, Project, ScannedFile, ProjectSummary, RelevanceBy, ScanJob, ScanJobPatch, ScanQueueEntry, ScanStatus, StoredFact, RelevanceUpdate, UnscoredFact, RunTag } from '@fb/core';
 import { iso, toJson, toVector, tx, type Db } from './db.ts';
-import { runSearch, searchFactsQuery } from './vector.ts';
+import { runSearch, searchFactsQuery, visibleToRun } from './vector.ts';
 
 type Exec = Pick<pg.PoolClient, 'query'>;
 
@@ -67,9 +67,9 @@ export class PgFactsStore implements FactsStore {
       await c.query(
         `INSERT INTO code_files (id, project_key, path, hash, summary, scanned_at, removed, scan_version, hash_changed_at)
          VALUES ($1, $2, $3, $4, $5, $6, false, $7, $6)
-         ON CONFLICT (id) DO UPDATE SET project_key = EXCLUDED.project_key, path = EXCLUDED.path, hash = EXCLUDED.hash,
+         ON CONFLICT (id) DO ${source === DEMO_SOURCE ? 'NOTHING' : `UPDATE SET project_key = EXCLUDED.project_key, path = EXCLUDED.path, hash = EXCLUDED.hash,
            summary = EXCLUDED.summary, scanned_at = EXCLUDED.scanned_at, removed = false, scan_version = EXCLUDED.scan_version,
-           ${HASH_CHANGED}`,
+           ${HASH_CHANGED}`}`,
         [cf, projectKey, file.path, file.hash, file.summary, now, file.version ?? null],
       );
       await c.query(`UPDATE facts SET current = false, valid_to = $2 WHERE code_file_id = $1 AND current AND origin IS DISTINCT FROM 'you'`, [cf, now]);
@@ -136,18 +136,18 @@ export class PgFactsStore implements FactsStore {
   }
 
   /** Your fact: under the project, about no code file, so a scan has nothing of it to close. */
-  async addOwnerFact(projectKey: string, rawFact: EmbeddedFact, by: RelevanceBy): Promise<StoredFact> {
+  async addOwnerFact(projectKey: string, rawFact: EmbeddedFact, by: RelevanceBy, run?: RunTag | null): Promise<StoredFact> {
     const fx = redactDeep(rawFact);
     const relevance = relevanceOf(fx);
     return tx(this.db, async (c) => {
       await c.query('INSERT INTO projects (key) VALUES ($1) ON CONFLICT DO NOTHING', [projectKey]);
       const { rows } = await c.query(
         `INSERT INTO facts (id, project_key, kind, statement, path, lines, confidence, why, source, current, created_at, valid_from,
-                            embedding, relevance, relevance_by, origin)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::text, true, $10, $10, $11::vector, $12::float8, CASE WHEN $12::float8 IS NULL THEN NULL ELSE $9::text END, 'you')
+                            embedding, relevance, relevance_by, origin, run, sandbox)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::text, true, $10, $10, $11::vector, $12::float8, CASE WHEN $12::float8 IS NULL THEN NULL ELSE $9::text END, 'you', $13, $14)
          RETURNING ${FACT_COLUMNS.replace(/x\./g, '')}`,
         [randomUUID(), projectKey, fx.kind, fx.statement, fx.path || PROJECT_PATH, fx.lines ?? null, fx.confidence ?? null, fx.why ?? null, by,
-          new Date(), toVector(fx.embedding), relevance],
+          new Date(), toVector(fx.embedding), relevance, run?.id ?? null, !!run?.sandbox],
       );
       return factOf(rows[0]);
     });
@@ -162,15 +162,15 @@ export class PgFactsStore implements FactsStore {
     return rows.map((r) => r.s);
   }
 
-  async listFacts(q: { projectKey: string; kind?: FactKind; path?: string; origin?: FactOrigin; limit?: number; offset?: number }): Promise<StoredFact[]> {
+  async listFacts(q: { projectKey: string; kind?: FactKind; path?: string; origin?: FactOrigin; limit?: number; offset?: number; run?: string | null }): Promise<StoredFact[]> {
     const { rows } = await this.db.pool.query(
       `SELECT ${FACT_COLUMNS}, cf.summary AS file_summary, cf.hash_changed_at AS file_changed_at
        FROM facts x LEFT JOIN code_files cf ON cf.id = x.code_file_id
        WHERE x.project_key = $1 AND x.current AND ($2::text IS NULL OR x.kind = $2) AND ($3::text IS NULL OR (x.path = $3 AND x.doc_id IS NULL))
-         AND ($6::text IS NULL OR ${originSql('$7')} = $6)
+         AND ($6::text IS NULL OR ${originSql('$7')} = $6) AND ${visibleToRun('x', '$8')}
        ORDER BY x.path COLLATE "C", x.created_at, x.id
        LIMIT $4 OFFSET $5`,
-      [q.projectKey, q.kind ?? null, q.path ?? null, q.limit ?? 500, Math.max(0, Math.floor(q.offset ?? 0)), q.origin ?? null, MANIFEST_WHY_RE],
+      [q.projectKey, q.kind ?? null, q.path ?? null, q.limit ?? 500, Math.max(0, Math.floor(q.offset ?? 0)), q.origin ?? null, MANIFEST_WHY_RE, q.run ?? null],
     );
     return rows.map(factOf);
   }
@@ -205,6 +205,32 @@ export class PgFactsStore implements FactsStore {
         checks.map((c) => (c.evidence && FACT_EVIDENCE.includes(c.evidence) ? c.evidence : null)), new Date()],
     );
     return r?.closed ?? 0;
+  }
+
+  async redactStoredFacts(): Promise<{ redacted: number; closed: number; owner: number }> {
+    let redacted = 0;
+    let closed = 0;
+    let owner = 0;
+    for (let after = ''; ;) {
+      const { rows } = await this.db.pool.query('SELECT id, statement, why, current, origin FROM facts WHERE id > $1 ORDER BY id LIMIT $2', [after, REDACT_PAGE]);
+      if (!rows.length) break;
+      after = rows[rows.length - 1].id;
+      const changed = rows.flatMap((r: { id: string; statement: string; why: string | null; current: boolean; origin: string | null }) => {
+        const x = { id: r.id, owner: r.origin === 'you', ...redactStoredFact(r) };
+        return x.statement !== r.statement || x.why !== r.why || x.close ? [x] : [];
+      });
+      if (!changed.length) continue;
+      await this.db.pool.query(
+        `UPDATE facts x SET statement = c.statement, why = c.why,
+           current = x.current AND NOT c.close, valid_to = CASE WHEN c.close THEN $5::timestamptz ELSE x.valid_to END
+         FROM unnest($1::text[], $2::text[], $3::text[], $4::boolean[]) AS c(id, statement, why, close) WHERE x.id = c.id`,
+        [changed.map((c) => c.id), changed.map((c) => c.statement), changed.map((c) => c.why), changed.map((c) => c.close), new Date()],
+      );
+      redacted += changed.length;
+      closed += changed.filter((c) => c.close).length;
+      owner += changed.filter((c) => c.owner).length;
+    }
+    return { redacted, closed, owner };
   }
 
   /** A request is a mark on the file's code_files row (one with no hash yet when it was never scanned). */
@@ -242,7 +268,7 @@ export class PgFactsStore implements FactsStore {
     await this.db.pool.query('UPDATE code_files SET scan_requested_at = NULL WHERE project_key = $1 AND path = ANY($2::text[])', [projectKey, paths]);
   }
 
-  async searchFacts(q: { embedding: number[]; projectKey: string; k: number }): Promise<FactHit[]> {
+  async searchFacts(q: { embedding: number[]; projectKey: string; k: number; run?: string | null }): Promise<FactHit[]> {
     // The project's current facts, nearest first, through the HNSW index when it pays (see vector.ts).
     const rows = await runSearch(this.db, searchFactsQuery(this.db, q, FACT_COLUMNS), q.k);
     return rows.map((r) => ({ fact: factOf(r), score: r.score }));
@@ -262,11 +288,13 @@ export class PgFactsStore implements FactsStore {
   async setFactRelevance(updates: RelevanceUpdate[]): Promise<number> {
     if (!updates.length) return 0;
     const { rowCount } = await this.db.pool.query(
-      `UPDATE facts x SET relevance = u.relevance, relevance_by = u.by
-       FROM unnest($1::text[], $2::float8[], $3::text[], $4::text[]) AS u(id, relevance, by, project_key)
+      `UPDATE facts x SET relevance = u.relevance, relevance_by = u.by,
+         run = CASE WHEN u.owner THEN NULL ELSE x.run END, sandbox = CASE WHEN u.owner THEN false ELSE x.sandbox END
+       FROM unnest($1::text[], $2::float8[], $3::text[], $4::text[], $5::text[], $6::boolean[]) AS u(id, relevance, by, project_key, run, owner)
        WHERE x.id = u.id AND (u.project_key IS NULL OR x.project_key = u.project_key)
-         AND (u.by <> 'model' OR coalesce(x.relevance_by, 'model') = 'model')`,
-      [updates.map((u) => u.id), updates.map((u) => clampRelevance(u.relevance)), updates.map((u) => u.by), updates.map((u) => u.projectKey ?? null)],
+         AND (u.by <> 'model' OR coalesce(x.relevance_by, 'model') = 'model')
+         AND (u.run IS NULL OR x.run = u.run)`,
+      [updates.map((u) => u.id), updates.map((u) => clampRelevance(u.relevance)), updates.map((u) => u.by), updates.map((u) => u.projectKey ?? null), updates.map((u) => u.run ?? null), updates.map((u) => u.run === null)],
     );
     return rowCount ?? 0;
   }
@@ -305,11 +333,24 @@ export class PgFactsStore implements FactsStore {
 
   async nextScanJob(now = new Date(), exclude: string[] = []): Promise<ScanJob | null> {
     const { rows: [r] } = await this.db.pool.query(
-      `SELECT * FROM scan_jobs WHERE status = 'queued' AND (retry_at IS NULL OR retry_at <= $1) AND NOT (id = ANY($2::text[]))
-       ORDER BY requested_at, id LIMIT 1`,
+      `SELECT j.*, ${WAITING_SINCE} AS waiting_since FROM scan_jobs j
+        WHERE j.status = 'queued' AND (j.retry_at IS NULL OR j.retry_at <= $1) AND NOT (j.id = ANY($2::text[]))
+        ORDER BY waiting_since, j.requested_at, j.id LIMIT 1`,
       [now, exclude],
     );
     return r ? jobOf(r) : null;
+  }
+
+  async requeueScanJob(id: string, now = new Date()): Promise<void> {
+    await this.db.pool.query(`UPDATE scan_jobs SET status = 'queued', served_at = $2 WHERE id = $1 AND status IN ('queued', 'running')`, [id, now]);
+  }
+
+  async scanQueue(): Promise<ScanQueueEntry[]> {
+    const { rows } = await this.db.pool.query(
+      `SELECT j.*, ${WAITING_SINCE} AS waiting_since FROM scan_jobs j WHERE j.status IN ('queued', 'running')
+        ORDER BY (j.status = 'running') DESC, CASE WHEN j.status = 'running' THEN j.started_at END, waiting_since, j.requested_at, j.id`,
+    );
+    return rows.map((r) => ({ ...jobOf(r), waitingSince: iso(new Date(r.waiting_since))! }));
   }
 
   async recordScanFailure(id: string, error: string, o: { counted: boolean }, now = new Date()): Promise<{ attempts: number; retryAt: string | null }> {
@@ -356,13 +397,14 @@ export class PgFactsStore implements FactsStore {
     const { rows } = await this.db.pool.query(
       `SELECT p.key, p.repo_path, p.remote, p.aliases, p.pinned,
               (SELECT count(*) FROM sessions s WHERE s.project_key = p.key) AS sessions,
-              (SELECT count(*) FROM feedback f WHERE f.project_key = p.key) AS feedback,
-              (SELECT count(*) FROM lessons l WHERE l.project_key = p.key) AS lessons,
-              (SELECT count(*) FROM facts x WHERE x.project_key = p.key AND x.current) AS facts,
-              (SELECT count(*) FROM facts x WHERE x.project_key = p.key AND x.current AND x.doc_id IS NOT NULL) AS document_facts,
-              (SELECT count(*) FROM facts x WHERE x.project_key = p.key AND x.current AND x.doc_id IS NULL
+              -- A sandbox run's feedback, lessons and facts are counted for no one (they are served only to that run).
+              (SELECT count(*) FROM feedback f WHERE f.project_key = p.key AND NOT EXISTS (SELECT 1 FROM candidates k WHERE k.id = f.id AND k.sandbox)) AS feedback,
+              (SELECT count(*) FROM lessons l WHERE l.project_key = p.key AND NOT l.sandbox) AS lessons,
+              (SELECT count(*) FROM facts x WHERE x.project_key = p.key AND x.current AND NOT x.sandbox) AS facts,
+              (SELECT count(*) FROM facts x WHERE x.project_key = p.key AND x.current AND NOT x.sandbox AND x.doc_id IS NOT NULL) AS document_facts,
+              (SELECT count(*) FROM facts x WHERE x.project_key = p.key AND x.current AND NOT x.sandbox AND x.doc_id IS NULL
                  AND (x.origin = 'manifest' OR (x.origin IS NULL AND x.why ~ $1))) AS manifest_facts,
-              (SELECT count(*) FROM facts x WHERE x.project_key = p.key AND x.current AND x.doc_id IS NULL AND x.origin = 'you') AS your_facts,
+              (SELECT count(*) FROM facts x WHERE x.project_key = p.key AND x.current AND NOT x.sandbox AND x.doc_id IS NULL AND x.origin = 'you') AS your_facts,
               to_jsonb(last) AS last
        FROM projects p
        LEFT JOIN LATERAL (SELECT * FROM scan_jobs j WHERE j.project_key = p.key ORDER BY j.requested_at DESC, j.id DESC LIMIT 1) last ON true
@@ -455,6 +497,15 @@ function factOf(r: Record<string, any>): StoredFact {
   };
 }
 
+/**
+ * A scan job's place in the queue (SQL over scan_jobs j). A job that gave up its slot waits from then (served_at), so
+ * it goes behind every job queued before it gave way, whatever its project's files an agent asked for earlier: a file
+ * request only moves up a job not served since. A job never served waits from when it was requested, or from its
+ * project's oldest file request not read yet when that is older (least() skips the null of a project with none).
+ */
+const WAITING_SINCE = `coalesce(j.served_at, least(j.requested_at,
+  (SELECT min(cf.scan_requested_at) FROM code_files cf WHERE cf.project_key = j.project_key AND cf.scan_requested_at IS NOT NULL)))`;
+
 /** A scan_jobs row, from a query (Date values) or from to_jsonb (ISO text values). */
 function jobOf(r: Record<string, any>): ScanJob {
   const t = (v: Date | string | null | undefined) => (v == null ? null : iso(new Date(v)));
@@ -473,5 +524,6 @@ function jobOf(r: Record<string, any>): ScanJob {
     attempts: r.attempts ?? 0,
     retryAt: t(r.retry_at),
     shards: r.shards ?? null,
+    servedAt: t(r.served_at),
   };
 }

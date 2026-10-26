@@ -151,6 +151,21 @@ test('writes logged by the Settings routes carry the agent too', async () => {
   expect(sel.tracked).toEqual(['demo-shop']);
 });
 
+test('the links verb confirms or dismisses a link but cannot delete one: that is links_delete, off by default', async () => {
+  expect(OWNER_ROUTES.find(([m, path]) => m === 'PUT' && path === '/api/links')?.[2]).toBe('links');
+  expect(OWNER_ROUTES.find(([m, path]) => m === 'DELETE' && path === '/api/links/:id')?.[2]).toBe('links_delete');
+  const deleted: string[] = [];
+  const links = { listLinks: async () => [], setLink: async () => ({}) as never, deleteLink: async (id: string) => { deleted.push(id); return true; } } as never;
+  const { app } = setup({ allow: OPERATOR_VERBS.filter((v) => v !== 'links_delete'), extra: { links } });
+  const res = await app.request('/api/links/link:acme|demo-shop', call('DELETE', {}, bearer(OP)));
+  expect(res.status).toBe(403);
+  expect((await res.json()).error).toContain('links_delete');
+  expect(deleted).toEqual([]);
+  const allowed = setup({ allow: ['links_delete'], extra: { links } });
+  expect((await allowed.app.request('/api/links/link:acme|demo-shop', call('DELETE', {}, bearer(OP)))).status).toBe(204);
+  expect(deleted).toEqual(['link:acme|demo-shop']);
+});
+
 test('deleting an uploaded document is its own verb, off by default', () => {
   expect(OWNER_ROUTES.find(([m, path]) => m === 'DELETE' && path === '/api/docs/:id')?.[2]).toBe('docs_delete');
   expect(OWNER_ROUTES.find(([m, path]) => m === 'POST' && path === '/api/projects/:key/docs')?.[2]).toBe('docs');

@@ -1,5 +1,5 @@
 import type { HumanTurn, PostMortem } from '@fb/core';
-import { expect, test } from 'vitest';
+import { describe, expect, test } from 'vitest';
 import { checkLesson, recheckLesson } from './lessonCheck.ts';
 
 const lesson = (rule: string, extra: Partial<PostMortem['lesson']> = {}): PostMortem['lesson'] => ({
@@ -29,7 +29,7 @@ test('a path outside the repository (a home-folder file) is dropped and flagged'
 test('a universal rule drawn from one nit is narrowed to the task and flagged', () => {
   const nit = checkLesson(lesson('Always treat documentation nitpicks from reviewers as mandatory requirements'), feedback('nit: the README example is out of date', {}));
   expect(nit.lesson.scope).toBe('task');
-  expect(nit.flags.map((f) => f.name)).toEqual(['universal-from-nit', 'meta-lesson']);
+  expect(nit.flags.map((f) => f.name)).toEqual(['universal-from-nit', 'meta-lesson', 'generic']);
 });
 
 test('an APPROVED review is not a nit: a universal rule from it is kept as it is', () => {
@@ -80,14 +80,16 @@ test('a platitude with nothing from the code in it is flagged; the same verb wit
 
 test('a platitude in the title is read too, and assume / prioritize / cross-reference / maintain / monitor are platitude verbs', () => {
   const names = (rule: string, title = 'T') => checkLesson(lesson(rule, { title }), feedback('the list is stale')).flags.map((f) => f.name);
-  expect(names('Check the state carefully.', 'Always verify state changes')).toContain('platitude');
+  // Vague: the platitude shape, or generic, which stands in for it when the rule names nothing at all.
+  const vague = (rule: string, title = 'T') => names(rule, title).some((n) => n === 'platitude' || n === 'generic');
+  expect(vague('Check the state carefully.', 'Always verify state changes')).toBe(true);
   for (const rule of [
     'Never assume the data is fresh.',
     'Always prioritize correctness over speed.',
     'Always cross-reference related changes.',
     'Always maintain consistency across the codebase.',
     'Always monitor for regressions after a change.',
-  ]) expect(names(rule), rule).toContain('platitude');
+  ]) expect(vague(rule), rule).toBe(true);
   // The same verbs naming something in the code are a rule.
   expect(names('Never assume listOrders returns rows sorted; sort by created_at in api/orders.ts')).not.toContain('platitude');
   expect(names('Read the totals from billing/invoice.ts', 'Always cross-reference the invoice totals')).not.toContain('platitude');
@@ -152,7 +154,69 @@ test('the model saying the lesson is about process, or an agent reviewing its ow
 test('a re-check of a stored lesson only flags: it never changes the lesson', () => {
   const stored = lesson('Always treat documentation nitpicks as mandatory', { paths: ['src/webapp/AGENTS.md', 'acme/shop#12', 'handleUpload', 'src/upload.ts'] });
   const flags = recheckLesson(stored, 'nit: the README example is out of date');
-  expect(flags.map((f) => f.name)).toEqual(['bad-path', 'universal-from-nit', 'meta-lesson']);
+  expect(flags.map((f) => f.name)).toEqual(['bad-path', 'universal-from-nit', 'meta-lesson', 'generic']);
   expect(flags[0].why).toContain('src/webapp/AGENTS.md');
   expect(flags[0].why).not.toContain('src/upload.ts');
+});
+
+describe('generic: a rule that names nothing concrete, built from process verbs', () => {
+  const generic = (rule: string) => checkLesson(lesson(rule), feedback('this broke the upload flow')).flags.filter((f) => f.name === 'generic');
+  test.each([
+    'Check for existing patterns',
+    'Always check for existing patterns in the codebase before implementing new functionality to ensure consistency.',
+    'Consult PR review comments',
+    'Prioritize stylistic feedback',
+    'Follow explicit instructions',
+    'Treat doc nitpicks as mandatory',
+    'Always profile',
+    'Test concurrency edge cases',
+    'Verify the full sequence',
+    'Make sure to test all edge cases thoroughly before marking the task as complete.',
+  ])('flagged: %s', (rule) => {
+    const flags = generic(rule);
+    expect(flags).toHaveLength(1);
+    expect(flags[0].why).toMatch(/names no file, function, value or command/);
+  });
+
+  test.each([
+    'Remove must not resend the cached vendorAccountIds list',
+    'Derive the lookup ctx from the request deadline, not a pre-made 500 ms ctx',
+    'A CONCURRENTLY index migration must drop an INVALID index before retrying',
+    'Close the database connection before returning from the upload handler',
+    'Run pnpm -r typecheck after changing a shared type',
+    'Filter customer search rows in the SQL query in api/search.ts, not in memory',
+  ])('not flagged: %s', (rule) => {
+    expect(generic(rule)).toEqual([]);
+  });
+
+  test('it replaces the narrower platitude flag, and the recheck flags a stored generic lesson too', () => {
+    const names = checkLesson(lesson('Always verify the full sequence'), feedback('x')).flags.map((f) => f.name);
+    expect(names).toContain('generic');
+    expect(names).not.toContain('platitude');
+    expect(recheckLesson(lesson('Verify the full sequence'), '').map((f) => f.name)).toContain('generic');
+  });
+});
+
+describe('bundled: two unrelated misses in one lesson', () => {
+  const bundled = (rule: string) => checkLesson(lesson(rule), feedback('two things here')).flags.filter((f) => f.name === 'bundled');
+  test.each([
+    'Pass the request deadline to lookupVendor in vendor/client.go; also rename the retry flag in cmd/sync/main.go',
+    'Escape the CSV header in export/csv.ts. Also, add the missing index in migrations/0042_orders.sql',
+    'Use toJson for jsonb parameters in store/orders.ts; validate the upload size in web/upload.ts',
+    'Retry the S3 upload on a 503; also rename fetchRows to loadRows',
+  ])('flagged: %s', (rule) => {
+    const flags = bundled(rule);
+    expect(flags).toHaveLength(1);
+    expect(flags[0].why).toMatch(/split/);
+  });
+
+  test.each([
+    'Use toJson for jsonb parameters; never pass JSON.stringify output',
+    'Drop the INVALID index before retrying; otherwise the CONCURRENTLY build fails again',
+    'Validate the upload size in web/upload.ts and return 413 from web/upload.ts',
+    'Read the deadline from ctx in vendor/client.go; pass it to lookupVendor in vendor/client.go',
+    'Filter customer search rows in the SQL query in api/search.ts, not in memory',
+  ])('not flagged: %s', (rule) => {
+    expect(bundled(rule)).toEqual([]);
+  });
 });

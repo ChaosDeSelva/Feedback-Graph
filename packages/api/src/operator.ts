@@ -1,6 +1,6 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import type { Context } from 'hono';
-import type { ActivityStore, OperatorConfig, OperatorVerb } from '@fb/core';
+import { RUN_ID, type ActivityStore, type OperatorConfig, type OperatorVerb, type RunTag } from '@fb/core';
 import { tokenMatches } from './auth.ts';
 
 /**
@@ -23,7 +23,8 @@ export const OWNER_ROUTES: readonly (readonly ['POST' | 'PUT' | 'PATCH' | 'DELET
   ['PATCH', '/api/projects/:key/facts/:id/relevance', 'relevance'],
   ['PUT', '/api/projects/:key/pin', 'pin'],
   ['PUT', '/api/links', 'links'],
-  ['DELETE', '/api/links/:id', 'links'],
+  // Confirming or dismissing is `links`; removing a link (one the owner may have decided) is its own verb, off by default.
+  ['DELETE', '/api/links/:id', 'links_delete'],
   ['POST', '/api/projects/:key/docs', 'docs'],
   ['POST', '/api/docs/:id/reread', 'docs'],
   ['DELETE', '/api/docs/:id', 'docs_delete'],
@@ -45,6 +46,8 @@ export const OWNER_ROUTES: readonly (readonly ['POST' | 'PUT' | 'PATCH' | 'DELET
   ['POST', '/api/chats/:id/turns/:turnId/retry', 'chat'],
   ['PATCH', '/api/chats/:id', 'chat'],
   ['DELETE', '/api/chats/:id', 'chat_delete'],
+  // Removes only what one run wrote (runs.ts): on for the operator token by default.
+  ['DELETE', '/api/runs/:id', 'run_cleanup'],
 ];
 
 const MAX_NAME = 40;
@@ -79,6 +82,45 @@ export type Via = 'operator' | 'browser' | 'api';
 const arrived = new AsyncLocalStorage<Via>();
 export const runVia = <T>(via: Via, fn: () => T): T => arrived.run(via, fn);
 
+/** The run the request being handled was labelled with (runLabel); unset: none. */
+const running = new AsyncLocalStorage<RunTag>();
+export const runIn = <T>(run: RunTag | null, fn: () => T): T => (run ? running.run(run, fn) : fn());
+/** The run of the request being handled, for the writes that record it; null outside a labelled request. */
+export const currentRun = (): RunTag | null => running.getStore() ?? null;
+
+/** The request being handled came from the owner (the browser, or the owner's API token), not an agent. */
+const fromOwner = new AsyncLocalStorage<boolean>();
+export const runFromOwner = <T>(owner: boolean, fn: () => T): T => fromOwner.run(owner, fn);
+
+/**
+ * A run changes only what it wrote: outside a run, or in a run the owner opened (not a sandbox), the request may change
+ * any record, and the change is the owner's. A sandbox run, or one an agent opened, changes only records with its run.
+ */
+export const mayChangeAny = (): boolean => {
+  const run = currentRun();
+  return !run || (!run.sandbox && fromOwner.getStore() === true);
+};
+/** Whether the request may change a record that carries `run` (absent or null: the owner's). */
+export const mayChange = (record: { run?: string | null }): boolean => mayChangeAny() || (!!record.run && record.run === currentRun()?.id);
+
+const YES = new Set(['1', 'true', 'yes', 'on']);
+const NO = new Set(['0', 'false', 'no', 'off', '']);
+
+/**
+ * The run a request is labelled with: X-FG-Run (a run id like CLOUD_MACHINE: 1 to 64 letters, digits, dots, dashes or
+ * underscores) and X-FG-Sandbox (1 or 0). `query`: the MCP endpoints also take ?run= and ?sandbox=, for a client that
+ * is configured with a URL only. Null: not labelled; an error: a label that is not usable, refused rather than ignored.
+ */
+export function runLabel(header: (name: string) => string | undefined, query?: (name: string) => string | undefined): RunTag | null | { error: string } {
+  const id = (header('x-fg-run') ?? query?.('run'))?.trim() ?? '';
+  const flag = (header('x-fg-sandbox') ?? query?.('sandbox'))?.trim().toLowerCase();
+  if (flag !== undefined && !YES.has(flag) && !NO.has(flag)) return { error: 'x-fg-sandbox must be 1 or 0' };
+  const sandbox = flag !== undefined && YES.has(flag);
+  if (!id) return sandbox ? { error: 'x-fg-sandbox needs x-fg-run: name the run too, so what it writes can be cleaned up (fg cleanup --run <id>)' } : null;
+  if (!RUN_ID.test(id)) return { error: 'x-fg-run must be 1 to 64 letters, digits, dots, dashes or underscores' };
+  return { id, sandbox };
+}
+
 /**
  * The store's record, with the owner's writes made through the operator token logged as the agent instead of you: the
  * actor, and a `why` written for the owner ("you pinned it") reworded to name the agent ("an agent (operator:codex)
@@ -90,7 +132,10 @@ export function asActor<T extends Pick<ActivityStore, 'record'>>(a: T | undefine
   if (!a) return a;
   const record: ActivityStore['record'] = (input) => {
     const via = arrived.getStore();
-    const e = via ? { ...input, details: { ...input.details, via } } : input;
+    const run = running.getStore();
+    const e0 = via ? { ...input, details: { ...input.details, via } } : input;
+    // The run it was made in, unless the entry names one itself.
+    const e = run && e0.run === undefined ? { ...e0, run: run.id, ...(run.sandbox && { sandbox: true }) } : e0;
     const actor = acting.getStore();
     if (!actor || e.actor !== 'you') return a.record(e);
     return a.record({ ...e, actor, why: e.why.startsWith('you ') ? `an agent (${actor}) ${e.why.slice(4)}` : e.why });

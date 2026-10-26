@@ -1,12 +1,14 @@
 import { readFile, realpath, stat } from 'node:fs/promises';
 import { join } from 'node:path';
-import type { Hono } from 'hono';
+import type { Context, Hono } from 'hono';
 import { z } from 'zod';
 import {
-  ChatBusyError, chatTitle, CHAT_PROVIDERS, cleanLessonPath, codeTerms, findInCodeMap, isSecretPath, MAX_CHAT_TEXT, MAX_CHAT_TITLE, redactSecrets,
+  ChatBusyError, chatTitle, CHAT_PROVIDERS, cleanLessonPath, codeTerms, findInCodeMap, isSecretPath, MAX_CHAT_TEXT, MAX_CHAT_TITLE, NotTheRunsError, redactSecrets,
   type ChatPack, type ChatSource, type ChatStore, type ChatTurn, type CodeGraphStore, type CodeMapHit, type ShownProjects,
 } from '@fb/core';
 import { getTaskContext, resolveProject, type ContextDeps, type TaskContext } from './context.ts';
+import { currentRun, mayChange } from './operator.ts';
+import { runScoped } from './runs.ts';
 
 /**
  * Ask: the context pack a question is answered from, and the /api/chats routes. The pack is built here, at send time,
@@ -30,6 +32,16 @@ export type ChatContextDeps = {
   /** The project's stored code map (CodeGraphStore.codeMap). Without it the pack has no code map section. */
   codeMap?: CodeGraphStore['codeMap'];
 };
+
+/**
+ * ChatRouteDeps.build for the server: the pack is built with the stores as the asking request sees them (runScoped,
+ * as the MCP endpoint does). A turn sent outside any run gets no sandbox record; one sent in a run (x-fg-run) gets
+ * that run's view, and never another run's sandbox lessons, misses, facts, documents or links.
+ */
+export function chatPackBuilder(d: ChatContextDeps): ChatRouteDeps['build'] {
+  const scoped = { ...d, context: runScoped(d.context) };
+  return (projectKey, question, history) => buildChatContext(projectKey, question, history, scoped);
+}
 
 /** Our own section markers inside untrusted text read as text: a line starting with --- or === is quoted. */
 const defuse = (s: string) => s.replace(/^(\s*)(===|---)/gm, '$1> $2');
@@ -201,7 +213,7 @@ export async function buildChatContext(projectKey: string, question: string, his
 // ── Routes ─────────────────────────────────────────────────────────────
 
 export type ChatRouteDeps = {
-  store: Pick<ChatStore, 'listConversations' | 'createConversation' | 'updateConversation' | 'conversation' | 'addUserTurn' | 'retryTurn' | 'deleteConversation'>;
+  store: Pick<ChatStore, 'listConversations' | 'createConversation' | 'updateConversation' | 'conversation' | 'addUserTurn' | 'retryTurn' | 'deleteConversation'> & Partial<Pick<ChatStore, 'chatQueue'>>;
   /** buildChatContext with the server's deps. */
   build(projectKey: string, question: string, history: ChatTurn[]): Promise<ChatPack>;
 };
@@ -229,6 +241,8 @@ export function chatRoutes(app: Hono, d: ChatRouteDeps, view: () => Promise<Show
     const v = await view();
     return !v || v.has(key);
   };
+  /** A run changes only a conversation it started (operator.ts mayChange): 409 for anyone else's. */
+  const notTheRuns = (c: Context, id: string) => c.json({ error: new NotTheRunsError(`the conversation ${id}`, currentRun()?.id ?? '').message }, 409);
   /** A conversation of a shown project, with its turns; null otherwise. */
   const shownThread = async (id: string) => {
     const t = await d.store.conversation(id);
@@ -247,7 +261,7 @@ export function chatRoutes(app: Hono, d: ChatRouteDeps, view: () => Promise<Show
     const body = CreateChat.safeParse(await c.req.json().catch(() => null));
     if (!body.success) return c.json({ error: body.error.flatten() }, 400);
     if (!(await shows(body.data.project))) return c.json(NOT_SHOWN, 404);
-    const conv = await d.store.createConversation({ projectKey: body.data.project, title: body.data.title?.trim() || DEFAULT_TITLE, provider: body.data.provider ?? null });
+    const conv = await d.store.createConversation({ projectKey: body.data.project, title: body.data.title?.trim() || DEFAULT_TITLE, provider: body.data.provider ?? null, ...(currentRun() && { run: currentRun()!.id }) });
     return c.json(conv, 201);
   });
 
@@ -261,6 +275,7 @@ export function chatRoutes(app: Hono, d: ChatRouteDeps, view: () => Promise<Show
     if (!body.success) return c.json({ error: body.error.flatten() }, 400);
     const t = await shownThread(c.req.param('id'));
     if (!t) return c.json(NOT_FOUND, 404);
+    if (!mayChange(t)) return notTheRuns(c, t.id);
     // Checked before the pack is built (the store checks again when it adds the turn).
     if (t.pending) return c.json(BUSY, 409);
     const text = body.data.text;
@@ -282,6 +297,7 @@ export function chatRoutes(app: Hono, d: ChatRouteDeps, view: () => Promise<Show
   app.post('/api/chats/:id/turns/:turnId/retry', async (c) => {
     const t = await shownThread(c.req.param('id'));
     if (!t) return c.json(NOT_FOUND, 404);
+    if (!mayChange(t)) return notTheRuns(c, t.id);
     const retried = await d.store.retryTurn(t.id, c.req.param('turnId'));
     return retried ? c.json(retried, 202) : c.json({ error: 'not found: only a failed answer can be retried' }, 404);
   });
@@ -291,6 +307,7 @@ export function chatRoutes(app: Hono, d: ChatRouteDeps, view: () => Promise<Show
     if (!body.success) return c.json({ error: body.error.flatten() }, 400);
     const t = await shownThread(c.req.param('id'));
     if (!t) return c.json(NOT_FOUND, 404);
+    if (!mayChange(t)) return notTheRuns(c, t.id);
     const conv = await d.store.updateConversation(t.id, body.data);
     return conv ? c.json(conv) : c.json(NOT_FOUND, 404);
   });
@@ -298,6 +315,7 @@ export function chatRoutes(app: Hono, d: ChatRouteDeps, view: () => Promise<Show
   app.delete('/api/chats/:id', async (c) => {
     const t = await shownThread(c.req.param('id'));
     if (!t) return c.json(NOT_FOUND, 404);
+    if (!mayChange(t)) return notTheRuns(c, t.id);
     await d.store.deleteConversation(t.id);
     return c.body(null, 204);
   });

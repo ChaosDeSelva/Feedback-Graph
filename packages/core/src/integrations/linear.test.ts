@@ -7,7 +7,7 @@ const node = {
   description: 'Coupons stack with sales.',
   url: 'https://linear.app/acme/issue/ENG-123',
   state: { name: 'In Progress' },
-  team: { key: 'ENG' },
+  team: { id: 'team-eng', key: 'ENG' },
   updatedAt: '2026-10-20T00:00:00Z',
   comments: { nodes: [{ body: 'only one coupon per order', user: { name: 'Pat' } }, { body: 'from integration', user: null }] },
 };
@@ -37,6 +37,7 @@ describe('searchLinearIssues', () => {
       url: 'https://linear.app/acme/issue/ENG-123',
       state: 'In Progress',
       team: 'ENG',
+      teamId: 'team-eng',
       updatedAt: '2026-10-20T00:00:00Z',
       comments: [
         { author: 'Pat', body: 'only one coupon per order' },
@@ -78,6 +79,7 @@ describe('linearIssueToChunk', () => {
     url: 'https://linear.app/acme/issue/ENG-123',
     state: 'Done',
     team: 'ENG',
+    teamId: 'team-eng',
     updatedAt: '2026-10-20T00:00:00Z',
     comments: [{ author: 'Pat', body: 'only one coupon per order' }],
   };

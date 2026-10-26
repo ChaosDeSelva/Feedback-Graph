@@ -10,6 +10,7 @@ import { KnowledgeRepo } from './knowledge.ts';
 import { LinksRepo } from './links.ts';
 import { PortabilityRepo } from './portability.ts';
 import { GraphRepo } from './repo.ts';
+import { RunsRepo } from './runs.ts';
 import { SelectionRepo } from './selection.ts';
 import { backfillSessionStats, SessionsRepo } from './sessions.ts';
 
@@ -32,6 +33,7 @@ export function neo4jStore(g: GraphRepo): Store {
     codegraph: new CodeGraphRepo(g),
     sessions: new SessionsRepo(g),
     chats: new ChatRepo(g),
+    runs: new RunsRepo(g),
     ensureSchema: async () => {
       await g.ensureSchema();
       await backfillSessionStats(g);

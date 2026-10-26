@@ -1,5 +1,5 @@
 import { Component, useEffect, useRef, useState, type ReactNode } from 'react';
-import type { ModelHealth, ModelJob } from '@fb/core';
+import type { ModelHealth, ModelJob, WorkQueue, WorkQueues } from '@fb/core';
 import { ActivityEntry } from './Activity.tsx';
 import { api, type Activity, type PatternReport, type PipelineStatus, type ProjectHotspot, type ProjectSummary, type SystemStatus } from './api.ts';
 import { activityKindHref, chatHref, inboxTabHref, moduleHref, newChatHref } from './links.ts';
@@ -53,10 +53,8 @@ export function Dashboard() {
           <Pipeline load={pipeline} />
           <Quality load={patterns} />
           <Projects load={projects} globalLessons={pipeline.data?.lessons?.global ?? null} />
-          <div className="grid items-start gap-4 lg:grid-cols-2">
-            <Struggles load={struggles} />
-            <RecentActivity load={activity} />
-          </div>
+          <Struggles load={struggles} />
+          <RecentActivity load={activity} />
         </div>
       </div>
     </div>
@@ -134,6 +132,41 @@ function Now({ load }: { load: Load<SystemStatus> }) {
 
 const num = (v: number | null | undefined) => (v === null || v === undefined ? '–' : String(v));
 
+/** How long since an ISO time, roughly: `40 s`, `14 min`, `3 h`, `2 d` (as fg status says it). */
+export function waitedFor(iso: string, now = Date.now()): string {
+  const s = Math.max(0, Math.round((now - Date.parse(iso)) / 1000));
+  if (s < 60) return `${s} s`;
+  if (s < 3600) return `${Math.floor(s / 60)} min`;
+  if (s < 48 * 3600) return `${Math.floor(s / 3600)} h`;
+  return `${Math.floor(s / 86_400)} d`;
+}
+
+const QUEUE_NAME: Record<keyof WorkQueues, string> = { scans: 'Scan queue', classify: 'Classify queue', postmortems: 'Post-mortem queue', chats: 'Ask queue' };
+
+/**
+ * One queue in a line: "Scan queue: 7 waiting, oldest 2 h; running shard 12/40 of acme for 14 min". Null when nothing
+ * waits or runs in it.
+ */
+export function queueLine(name: keyof WorkQueues, q: WorkQueue | null | undefined): string | null {
+  if (!q || (!q.waiting && !q.running.length)) return null;
+  const head = q.waiting
+    ? `${q.waiting}${q.capped ? '+' : ''} waiting${q.oldestAt ? `, oldest ${q.capped ? 'at least ' : ''}${waitedFor(q.oldestAt)}` : ''}`
+    : 'none waiting';
+  const runs = q.running.map((r) => `running ${r.shards ? `shard ${Math.min(r.shards.done + 1, r.shards.total)}/${r.shards.total} of ` : ''}${r.what} for ${waitedFor(r.since)}`);
+  return `${QUEUE_NAME[name]}: ${[head, ...runs].join('; ')}`;
+}
+
+/** Back-pressure under the tiles: a line per queue with work in it (none from an API without queues). */
+function QueueLines({ queues }: { queues: WorkQueues | undefined }) {
+  const lines = queues ? (Object.keys(QUEUE_NAME) as (keyof WorkQueues)[]).map((k) => queueLine(k, queues[k])).filter((l): l is string => !!l) : [];
+  if (!lines.length) return null;
+  return (
+    <ul aria-label="queues" className="grid gap-0.5 text-[13px] text-muted">
+      {lines.map((l) => <li key={l} className="[overflow-wrap:anywhere]">{l}</li>)}
+    </ul>
+  );
+}
+
 function Pipeline({ load }: { load: Load<PipelineStatus> }) {
   const tile = (href: string, label: string, value: string, hint: string) => (
     <a key={label} href={href} className="block min-w-0 bg-surface hover:bg-sunken [&>div]:bg-transparent">
@@ -163,6 +196,7 @@ function Pipeline({ load }: { load: Load<PipelineStatus> }) {
           })() : Array.from({ length: 5 }, (_, i) => <StatTileSkeleton key={i} />)}
         </StatGrid>
       )}
+      {load.data && <QueueLines queues={load.data.queues} />}
     </div>
   );
 }

@@ -190,3 +190,51 @@ test('what the model says about its own lesson (process, a fact) becomes a check
   expect(r).not.toHaveProperty('about');
   expect(r).not.toHaveProperty('factLike');
 });
+
+test('the prompt says how the session was matched: its branch, or the files the PR changed; never time', () => {
+  const byBranch = buildPrompt({ ...base, work: { ...work, matchedBy: 'branch' } }, [], { agentic: false, facts: [] });
+  expect(byBranch).toContain("matched because it ran on the pull request's branch feat/search");
+  const byFiles = buildPrompt({ ...base, work: { ...work, matchedBy: 'files' } }, [], { agentic: false, facts: [] });
+  expect(byFiles).toContain('matched because it edited files the pull request changed');
+  expect(byFiles).not.toMatch(/\bor time\b/);
+  expect(buildPrompt({ ...base, work: null }, [], { agentic: false, facts: [] })).toContain('no session ran on its branch or edited the files it changed');
+});
+
+test('with no session matched, the post-mortem says so in its cause, whatever the model wrote', async () => {
+  const r = await runPostMortem({ ...base, work: null }, { standing: async () => [], facts: async () => [], llm: llm(['api/search.ts']) });
+  expect(r.causeExplanation).toMatch(/^No agent session matched this comment/);
+  expect(r.causeExplanation).toMatch(/x$/);
+  const said = await runPostMortem({ ...base, work: null }, {
+    standing: async () => [], facts: async () => [],
+    llm: { id: 'fake', agentic: false, json: async () => ({ ...answer([]), causeExplanation: 'No agent session was found; from the comment alone, the query filters in memory.' }) },
+  });
+  expect(said.causeExplanation).toBe('No agent session was found; from the comment alone, the query filters in memory.');
+  // A session was matched: nothing is added.
+  expect((await runPostMortem({ ...base, work }, { standing: async () => [], facts: async () => [], llm: llm([]) })).causeExplanation).toBe('x');
+});
+
+test.each([
+  ['missed', 'The agent did not miss any defects; the reviewer was asking a question.'],
+  ['missed', 'Nothing was missed: the change already batches the rows.'],
+  ['causeExplanation', 'The agent did not receive the feedback: it was posted on another pull request.'],
+  ['missed', 'No miss: the comment is an approval.'],
+  ['missed', 'There was no defect in the agent\'s work.'],
+])('a post-mortem whose own miss says there was no miss yields no lesson (%s: %s)', async (field, text) => {
+  const r = await runPostMortem({ ...base, work: null }, { standing: async () => [], facts: async () => [], llm: { id: 'fake', agentic: false, json: async () => ({ ...answer([]), [field]: text }) } });
+  expect(r.noMiss).toBeTruthy();
+});
+
+test('a real miss that mentions "no error handling" or "missing" is still a miss', async () => {
+  for (const missed of ['No error handling for the warehouse timeout in pipeline/load.py', 'Missing index on orders.created_at', 'The agent did not batch the inserts', 'It did not miss the cache but skipped the retry']) {
+    const r = await runPostMortem({ ...base, work: null }, { standing: async () => [], facts: async () => [], llm: { id: 'fake', agentic: false, json: async () => ({ ...answer([]), missed }) } });
+    expect(r.noMiss ?? null).toBeNull();
+  }
+});
+
+test('a nit never becomes a project-wide lesson, even when its rule is not worded as universal', async () => {
+  const nit = { ...base, work: null, feedback: { ...base.feedback, text: 'Minor: `tmp` could be named `batch` here.' } };
+  const rule = { ...answer([]).lesson, rule: 'Name batch variables in api/search.ts after what they hold', scope: 'project', paths: ['api/search.ts'] };
+  const r = await runPostMortem(nit, { standing: async () => [], facts: async () => [], llm: { id: 'fake', agentic: false, json: async () => ({ ...answer(['api/search.ts']), lesson: rule }) } });
+  expect(r.lesson.scope).toBe('task');
+  expect(r.lessonChecks?.filter((f) => f.name === 'universal-from-nit')).toHaveLength(1);
+});

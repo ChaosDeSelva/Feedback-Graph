@@ -57,7 +57,8 @@ export function withPackSizes(turns: { turn: ChatTurn; contextChars: number | nu
 }
 
 /** pending: a turn of it is pending or answering. */
-export type ChatConversation = { id: string; projectKey: string; title: string; provider: ChatProvider | null; createdAt: string; updatedAt: string; pending: boolean };
+/** run: the run it was started in (x-fg-run); absent when none. */
+export type ChatConversation = { id: string; projectKey: string; title: string; provider: ChatProvider | null; createdAt: string; updatedAt: string; pending: boolean; run?: string };
 export type ChatThread = ChatConversation & { turns: ChatTurn[] };
 
 /** What the api stores with a question: the pack (markdown, numbered sources) the answer is built from. */

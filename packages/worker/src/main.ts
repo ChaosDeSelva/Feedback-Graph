@@ -20,24 +20,29 @@ import { containerFolders } from './projects/folders.ts';
 import { importMemories, memoryProjectKey } from './memory/memory.ts';
 import { forgetDeleted } from './forget.ts';
 import { loadStandingContext, memoryDirFor, runPostMortem } from './postmortem/postmortem.ts';
+import { EXAMPLE_POOL } from './postmortem/examples.ts';
 import { huntContext } from './postmortem/hunt.ts';
 import { syncGithub } from './integrations/githubSync.ts';
 import { githubTarget, syncExternalFeedback, type SyncProject } from './integrations/feedbackSync.ts';
 import { skipPendingOnRulesChange } from './integrations/pendingSkips.ts';
+import { redactStoredOnRuleChange } from './redactStored.ts';
 import { resolvePendingInstructions } from './detect/pendingInstructions.ts';
 import { sortOldMisses } from './postmortem/subjects.ts';
 import { attachWorkSession } from './postmortem/work.ts';
-import { repoHas } from './postmortem/paths.ts';
+import { repoFileList, repoHas } from './postmortem/paths.ts';
 import { recheckLessons } from './postmortem/recheck.ts';
-import { runPostmortems } from './postmortem/step.ts';
-import { ScanRunner } from './scan/runner.ts';
+import { rematchOnRuleChange } from './postmortem/rematch.ts';
+import { sessionEvidence } from './postmortem/standing.ts';
+import { providerAnswers, runPostmortems } from './postmortem/step.ts';
+import { migrateDeciderRule } from './postmortem/deciders.ts';
+import { ScanRunner, type ScanTurn } from './scan/runner.ts';
 import { recheckFacts } from './scan/recheck.ts';
-import { hasCodeFiles, runScan } from './scan/scan.ts';
+import { hasCodeFiles, runScan, ScanPlans } from './scan/scan.ts';
 import { scoreFacts, ScoringPacer } from './relevance/score.ts';
 import { runLinkDetection } from './links/stage.ts';
 import { readOneDoc } from './docs/read.ts';
 import { SummarizeStage } from './summarize/stage.ts';
-import { FileState } from './state.ts';
+import { CODEX_COPY_RULE, FileState } from './state.ts';
 import { cycleProgressed, healthSince, StageTracker } from './progress.ts';
 
 const log = (msg: string, extra: object = {}) => console.log(JSON.stringify({ ts: new Date().toISOString(), msg, ...extra }));
@@ -103,6 +108,14 @@ async function main() {
       // Lesson paths are checked against the repository as mounted here, under the container side of the roots (the
       // stored repoPath is the host's, not there in Docker); a project under no root is not judged (repoHas).
       repoPaths: async () => new Map((await containerFolders((await facts.listProjects()).map((p) => p.key), config.roots)).map((p) => [p.key, p.repoPath])),
+      // What the session's transcript showed its agent had: a miss blaming a file it "did not load" is checked against it.
+      instructionFiles: (id) => repo.sessionInstructionFiles(id),
+      // A ticket is the project's when it holds it or its PRs name it, or it is from a team whose tickets it holds.
+      linkedTickets: async (key, ids) => {
+        const held = new Set(await docs.projectTickets({ projectKey: key, ids }));
+        const teams = new Set((await docs.listDocs(key)).filter((x) => x.source === 'linear').map((x) => x.ref.replace(/^linear:/, '').split('-')[0]));
+        return ids.filter((id) => held.has(id) || teams.has(id.split('-')[0]));
+      },
     }).catch((err) => log('lesson re-check failed', { error: String(err) }));
   await recheckOld();
 
@@ -131,6 +144,9 @@ async function main() {
   const defaultChat = defaultChatSpec(chatOpts());
   log('chat', { default: defaultChat });
   const state = new FileState(config.stateDb);
+  // The Codex copy rule changed: its rollouts are read once more, and a session the old rule froze is logged as resumed.
+  const codexRequeued = state.migrateCodexCopyRule(config.codexSessionsDir);
+  if (codexRequeued) log('codex copy rule changed: Codex sessions are read again', { files: codexRequeued, rule: CODEX_COPY_RULE });
 
   // The owner picks the folders to read (Settings). First start: INGEST_PROJECTS seeds the choice, or nothing does.
   const seeded = await selection.ensure(config, activity);
@@ -201,7 +217,7 @@ async function main() {
       if (key === 'unclassifiedTurns') {
         return async (...args: Parameters<typeof repo.unclassifiedTurns>) => {
           const turns = await target.unclassifiedTurns(...args);
-          status.backlog = { classify: turns.length, classifyCapped: turns.length >= args[0], at: new Date().toISOString() };
+          status.backlog = { classify: turns.length, classifyCapped: turns.length >= args[0], at: new Date().toISOString(), oldestAt: turns.at(-1)?.ts ?? null };
           stage.enter('classify', { total: Math.min(turns.length, config.classifyBatch) });
           return turns;
         };
@@ -247,6 +263,7 @@ async function main() {
     onlyProjects: scope.projects,
     excludeProjects: config.excludeProjects.length ? config.excludeProjects : undefined,
     activity,
+    storedTurns: async (id: string) => (await store.sessions.detail(id))?.turnCount ?? null,
     remote: cachedRemote(projectRemote, REMOTE_TTL_MS),
     projects: repo,
     // Records a scan or a code map made have no folder: the backfill reads it (and its remote) from the selection.
@@ -260,6 +277,10 @@ async function main() {
 
   const pmDeps = postmortemLlm && {
     k: knowledge,
+    // Kept across cycles: one feedback that reads as "model unavailable" every time is charged after a few (step.ts).
+    unavailableStreak: { feedbackId: null as string | null, count: 0 },
+    // A cycle counts toward that only when the provider answers a neutral ask: an outage never uses up attempts.
+    providerHealthy: () => providerAnswers(postmortemLlm),
     modelBusy: () => scanRunner.running().length > 0 || sharesModel(chatRunner.running(), postmortemLlm.id),
     // A comment from GitHub or Linear is worked out against the agent session that did the work, when one is found.
     postmortem: async (raw: Parameters<typeof runPostMortem>[0]) => {
@@ -273,22 +294,36 @@ async function main() {
         llm: postmortemLlm,
         touched: async (i) => touchedAround(await store.codegraph.sessionFiles(i.sessionId), i.feedback.ts),
         sessionSummary: async (i) => (await store.sessions.detail(i.sessionId))?.summary?.markdown ?? null,
+        // The owner's latest decisions on this project's lessons only (never another project's, never a sandbox run's),
+        // scored against this feedback so the closest are shown to the writer (postmortem/examples.ts).
+        examples: async (i) => {
+          if (!knowledge.decidedLessons) return [];
+          const [embedding] = await embed([i.feedback.text.slice(0, 2000)]);
+          return knowledge.decidedLessons({ projectKeys: [i.projectKey], since: new Date(0).toISOString(), limit: EXAMPLE_POOL, embedding });
+        },
         // Lesson paths must exist in the repository (postmortem/paths.ts).
         exists: (i, p) => repoHas(i.repoPath, p),
-        // Instruction files from the repo up to its project root (the mount: nothing above it is visible here).
-        standing: (i) =>
+        // A bare file name in a lesson resolves to its one match in the repository (postmortem/paths.ts).
+        repoFiles: (i) => repoFileList(i.repoPath),
+        // Instruction files from the repo up to its project root (the mount: nothing above it is visible here), each
+        // loaded as the agent loads it or as its transcript shows it had (ingest/instructions.ts).
+        standing: async (i) =>
           loadStandingContext({
             repoPath: i.repoPath,
             stopAt: roots.find((r) => i.repoPath.startsWith(`${r.container}/`))?.container ?? dirname(i.repoPath),
             memoryDir: memoryDirFor(transcripts, i.cwd),
             source: i.source,
+            evidence: sessionEvidence(i, await repo.sessionInstructionFiles(i.work?.sessionId ?? i.sessionId).catch(() => null)),
+            roots,
           }),
-        facts: (i) =>
+        log,
+        facts: async (i) =>
           huntContext(i, {
             embed,
             facts,
             docs,
-            linear: linearKey ? { apiKey: linearKey, search: searchLinearIssues } : undefined,
+            // Workspace-wide search, kept to the tickets of the team mapped to this project or named by its PRs (hunt.ts).
+            linear: linearKey ? { apiKey: linearKey, teamId: (await integrations.link(i.projectKey).catch(() => null))?.linearTeamId ?? null, search: searchLinearIssues } : undefined,
             log,
           }),
       });
@@ -414,8 +449,13 @@ async function main() {
     return false;
   }
 
-  /** Run one claimed scan job to its end; true when it finished (done or failed), false when it went back to wait. */
-  async function scanJob(job: ScanJob): Promise<boolean> {
+  /**
+   * Run one claimed scan job to its end, or to a shard boundary where it gives way to a scan waiting for its slot (turn);
+   * true when it finished (done or failed) or gave way, false when it went back to wait out a retry.
+   */
+  /** A sharded scan's listing, shard plan and mirror, kept while it waits its turn again (same HEAD). */
+  const scanPlans = new ScanPlans();
+  async function scanJob(job: ScanJob, turn?: ScanTurn): Promise<boolean> {
     if (!scope.folder(job.projectKey)) {
       await facts.updateScanJob(job.id, { status: 'failed', error: 'project is not selected in Settings, or is in EXCLUDE_PROJECTS' });
       return true;
@@ -426,21 +466,22 @@ async function main() {
       await facts.updateScanJob(job.id, { status: 'failed', error: `provider unavailable: ${job.provider || defaultScan}${reason ? `: ${reason}` : ''}` });
       return true;
     }
-    // The map first, so the scan's project has a current one; a failure here is logged and the scan goes on.
-    await mapStage.mapProject({ key: job.projectKey, repoPath: job.repoPath }, 'a scan was requested');
+    // The map first, so the scan's project has a current one; a failure here is logged and the scan goes on. A scan
+    // going on after giving way had its map made when it started.
+    if (!job.shards?.processed) await mapStage.mapProject({ key: job.projectKey, repoPath: job.repoPath }, 'a scan was requested');
     log('scan started', { project: job.projectKey, provider: llm.id });
     let unavailable: string | null = null;
     const touched = (key: string) => store.codegraph.editedPaths(key, EDITED_PATHS_LIMIT);
     // The files review comments are on: where reviewers found something to say, so scanned early.
     const prPaths = async (key: string) =>
       [...new Set((await repo.listCandidates({ projectKey: key, source: 'github', limit: PR_PATHS_LIMIT })).map((c) => c.external?.path).filter((p): p is string => !!p))];
-    const r = await runScan(job, { facts, llm, embed, maxBytes: config.scanMaxBytes, maxFiles: config.scanMaxFiles, touched, prPaths, log, activity }).catch((err) => {
+    const r = await runScan(job, { facts, llm, embed, maxBytes: config.scanMaxBytes, maxFiles: config.scanMaxFiles, touched, prPaths, log, activity, plans: scanPlans, ...(turn && { yieldTurn: () => turn.waiting() }) }).catch((err) => {
       unavailable = providerUnavailableReason(err);
       if (unavailable) log('scan model unavailable, the scan stays queued', { project: job.projectKey, reason: unavailable });
       else log('scan failed', { project: job.projectKey, error: redactSecrets(String(err)) });
       return null;
     });
-    if (r) log('scan done', { project: job.projectKey, ...r });
+    if (r && !r.paused) log('scan done', { project: job.projectKey, ...r });
     // Back in the queue waiting out its retryAt (a failure or an unreachable model): not progress, so the loop sleeps.
     return !!r;
   }
@@ -454,7 +495,8 @@ async function main() {
     concurrency: config.scanConcurrency,
     log,
   });
-  stopScans = () => scanRunner.stop();
+  // Kept mirrors are removed once the running scans have ended.
+  stopScans = () => scanRunner.stop().finally(() => { scanPlans.clear(); });
 
   // Ask answers, beside the cycle: the oldest pending question every 2 s, one at a time, with its chat's model.
   const chatRunner = new ChatRunner({
@@ -525,9 +567,11 @@ async function main() {
         host: new URL(cloud.url).host,
         intervalMinutes: cloud.intervalMinutes,
         log,
-        run: () =>
+        // A project that failed waits alone (its own backoff); the others keep the interval.
+        run: (waiting) =>
           runCloudSync({
             cloud,
+            waiting,
             portability: store.portability,
             activity,
             projects: async () => syncProjects({ configured: cloud.projects, selected: scope.projects, excluded: config.excludeProjects }),
@@ -615,6 +659,11 @@ async function main() {
     }
   }
 
+  // Changed redaction rules run once over the facts, documents, lessons, misses, Inbox items, session summaries and
+  // Activity stored under older ones, before any of it is served again; the counts are in Activity. A failure is
+  // logged and tried again at the next start.
+  await redactStoredOnRuleChange({ cursors: docs, facts, docs, knowledge, graph: repo, sessions: store.sessions, activity, log })
+    .catch((err) => log('redaction over stored data failed', { error: redactSecrets(String(err)) }));
   // A skip rule that changed (an upgrade, or new GITHUB_BOT_LOGINS / GITHUB_AGENT_LOGINS) runs once over what is already
   // pending in the Inbox. A failure is logged and tried again at the next start.
   await skipPendingOnRulesChange({ graph: repo, cursors: docs, activity, botLogins: config.github.botLogins, agentLogins: config.github.agentLogins, log })
@@ -628,6 +677,15 @@ async function main() {
   await sortOldMisses({ knowledge, cursors: docs, activity, log })
     .then((n) => { if (n !== null) log('process-miss rule applied to past misses', n); })
     .catch((err) => log('process-miss rule over past misses failed', { error: redactSecrets(String(err)) }));
+  // The session-matching rule (a comment's session ran on its PR's branch or edited the files it changed, never the
+  // nearest in time): pending comments are matched again and proposed lessons built on a session it would not match are
+  // flagged, once per version, after the lesson re-check above so its flags are kept.
+  await rematchOnRuleChange({ graph: repo, knowledge, files: (id) => store.codegraph.sessionFiles(id), cursors: docs, activity, log })
+    .then((n) => { if (n !== null) log('session-matching rule applied to stored comments', n); })
+    .catch((err) => log('session-matching rule over stored comments failed', { error: redactSecrets(String(err)) }));
+  // Only the owner's decisions mark a lesson as yours: one a machine decided under the older rule loses the mark, once.
+  await migrateDeciderRule({ knowledge, cursors: docs, activity, log })
+    .catch((err) => log('lesson decider rule failed', { error: redactSecrets(String(err)) }));
 
   while (!stopping) {
     try {

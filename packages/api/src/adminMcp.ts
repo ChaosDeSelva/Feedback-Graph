@@ -46,6 +46,8 @@ const ROUTES = {
   set_fact_relevance: ['PATCH', '/api/projects/:key/facts/:id/relevance'],
   cloud_sync_now: ['POST', '/api/cloud/sync'],
   rebuild_code_map: ['POST', '/api/projects/:key/codemap/rebuild'],
+  run_cleanup: ['DELETE', '/api/runs/:id'],
+  session_evidence: ['GET', '/api/sessions/:id/evidence'],
 } as const satisfies Record<string, Route>;
 type ToolName = keyof typeof ROUTES;
 
@@ -53,7 +55,7 @@ type ToolName = keyof typeof ROUTES;
 export const ADMIN_TOOLS = Object.fromEntries(Object.entries(ROUTES).map(([name, r]) => [name, verbOf(r)])) as Record<ToolName, OperatorVerb | null>;
 
 /** Same limits as the REST bodies the tools turn into. */
-const MAX = { key: 200, id: 500, reason: 4000, note: 500, provider: 200 } as const;
+const MAX = { key: 200, id: 500, reason: 4000, note: 500, provider: 200, run: 64 } as const;
 /** How many rows the store is asked for when a list tool counts what it did not show (the Inbox route's own cap). */
 const LIST_MAX = 1000;
 /** A list tool's page: this many rows unless asked, at most PAGE_MAX. */
@@ -288,9 +290,33 @@ function buildServer(call: Call, sleep: (ms: number) => Promise<void>) {
     force: z.boolean().optional(),
   }, write({ idempotent: true, openWorld: true }), async (a) => answer(await call('POST', '/api/cloud/sync', a.force === undefined ? {} : { force: a.force })));
 
+  reg('run_cleanup', 'After a test run (requests labelled x-fg-run): remove exactly what that run wrote (its reports with their post-mortems, misses and lessons, pre-done checks, facts, uploads, links, conversations). A dry run unless apply is true: it lists per kind what would go, what stays because someone outside the run touched it since (a lesson the owner approved), and what the run changed that is not its own (never undone). Activity entries stay.', {
+    run: z.string().min(1).max(MAX.run).describe('The run id the requests were labelled with'),
+    apply: z.boolean().optional().describe('Default false: only say what would go'),
+  }, write({ destructive: true, idempotent: true }), async (a) => answer(await call('DELETE', `/api/runs/${enc(a.run)}`, { dryRun: !a.apply })));
+
+  reg('session_evidence', 'For one ingested session: the turns read (count, first and last, the files), what the detector made of each turn and why (pushback, correction, an instruction; the skip rules applied), its Inbox items with their decision, post-mortem, miss and lesson, and the context served to it when the agent passed session_id. Redacted.', {
+    id: z.string().min(1).max(MAX.id).describe('The session id'),
+  }, READ, async (a) => answer(await call('GET', `/api/sessions/${enc(a.id)}/evidence`)));
+
   reg('rebuild_code_map', "Remap a project's code from scratch at the worker's next pass.", {
     project: z.string().min(1).max(MAX.key),
   }, write({ idempotent: true }), async (a) => answer(await call('POST', `/api/projects/${enc(a.project)}/codemap/rebuild`, {})));
+
+  // fg demo seed / remove (demo.ts): gated by the route itself, not by one OPERATOR_ALLOW verb (see DEMO_NEEDS).
+  const DEMO_NEEDS = ' The demo project needs only the operator token; another project (project) needs OPERATOR_ALLOW: lesson_decide.';
+  const demoArgs = { project: z.string().min(1).max(MAX.key).optional().describe('Another project than demo-shop (needs lesson_decide)') };
+  const demoAnswer = (a: Answer) => (a.ok ? text((a.data as { message: string }).message) : fail(a));
+  server.registerTool('demo_seed', {
+    description: 'fg demo seed: a small corpus marked demo in demo-shop (approved lessons tied to files, a miss on a file, facts), so the lesson path fires on a project that has no approved lesson. The owner approves its lessons by having you run it: say so.' + DEMO_NEEDS,
+    inputSchema: demoArgs,
+    annotations: write({ idempotent: true }),
+  }, (async (a: { project?: string }) => demoAnswer(await call('POST', '/api/demo/seed', a.project ? { project: a.project } : {}))) as never);
+  server.registerTool('demo_remove', {
+    description: 'fg demo remove: take back exactly what demo_seed wrote (demo lessons, the demo miss, demo facts), nothing else.' + DEMO_NEEDS,
+    inputSchema: demoArgs,
+    annotations: write({ destructive: true, idempotent: true }),
+  }, (async (a: { project?: string }) => demoAnswer(await call('POST', '/api/demo/remove', a.project ? { project: a.project } : {}))) as never);
 
   return server;
 }
@@ -321,6 +347,7 @@ export async function handleAdminMcp(req: Request, deps: AdminMcpDeps): Promise<
   const header = req.headers.get('x-fg-operator');
   const name = header?.trim() ? header : fromClient;
   const authorization = req.headers.get('authorization') ?? '';
+  // The run label (x-fg-run, ?run=) needs no forwarding: each in-process route call runs inside this request's run.
   const call: Call = async (method, path, body) => {
     const headers: Record<string, string> = { accept: 'application/json', authorization, ...(name && { 'x-fg-operator': name }) };
     if (body !== undefined) headers['content-type'] = 'application/json';

@@ -1,5 +1,5 @@
-import type { EmbeddedSeed, PreDoneCheckRow, ProbeKind, StoreProbe } from '@fb/core/testing';
-import { fromVector, toVector, type Db } from '../db.ts';
+import type { EmbeddedSeed, PreDoneCheckRow, ProbeKind, StaleTextSeed, StoreProbe } from '@fb/core/testing';
+import { fromVector, toJson, toVector, type Db } from '../db.ts';
 
 /** Where each record kind (Neo4j label) lives, and its identity column. */
 export const TABLES: Record<ProbeKind, { table: string; id: string }> = {
@@ -87,13 +87,13 @@ export class PostgresProbe implements StoreProbe {
 
   async preDoneChecks(): Promise<PreDoneCheckRow[]> {
     const { rows } = await this.q(
-      `SELECT x.project_key, x.task, x.checked, x.gaps,
+      `SELECT x.project_key, x.task, x.checked, x.gaps, x.session_id,
               coalesce(jsonb_agg(jsonb_build_object('lessonId', c.lesson_id, 'gap', c.gap) ORDER BY c.lesson_id)
                        FILTER (WHERE c.lesson_id IS NOT NULL), '[]') AS lessons
        FROM predone_checks x LEFT JOIN predone_check_lessons c ON c.check_id = x.id
        GROUP BY x.id ORDER BY x.ts`,
     );
-    return rows.map((r) => ({ projectKey: r.project_key, task: r.task, checked: r.checked, gaps: r.gaps, lessons: r.lessons }));
+    return rows.map((r) => ({ projectKey: r.project_key, task: r.task, checked: r.checked, gaps: r.gaps, lessons: r.lessons, ...(r.session_id ? { sessionId: r.session_id } : {}) }));
   }
 
   async filedUnder(key: string): Promise<ProbeKind[]> {
@@ -152,16 +152,53 @@ export class PostgresProbe implements StoreProbe {
         );
         return;
       case 'Fact':
-        await this.q(`INSERT INTO code_files (id, project_key, path) VALUES ($1, $2, $3) ON CONFLICT (id) DO NOTHING`, [`${PROBE_PROJECT}:${row.path}`, PROBE_PROJECT, row.path]);
+        // A fact you wrote hangs off no file (facts_about_one).
+        if (row.origin !== 'you') await this.q(`INSERT INTO code_files (id, project_key, path) VALUES ($1, $2, $3) ON CONFLICT (id) DO NOTHING`, [`${PROBE_PROJECT}:${row.path}`, PROBE_PROJECT, row.path]);
         await this.q(
-          `INSERT INTO facts (id, project_key, code_file_id, kind, statement, path, source, current, created_at, valid_from, embedding)
-           VALUES ($1, $2, $3, 'convention', $4, $5, 'probe', $6, now(), now(), $7::vector)`,
-          [row.id, PROBE_PROJECT, `${PROBE_PROJECT}:${row.path}`, row.statement, row.path, row.current, v],
+          `INSERT INTO facts (id, project_key, code_file_id, kind, statement, path, source, current, created_at, valid_from, embedding, origin)
+           VALUES ($1, $2, $3, 'convention', $4, $5, 'probe', $6, now(), now(), $7::vector, $8)`,
+          [row.id, PROBE_PROJECT, row.origin === 'you' ? null : `${PROBE_PROJECT}:${row.path}`, row.statement, row.path, row.current, v, row.origin ?? null],
         );
         return;
       case 'Chunk':
         await this.q(`INSERT INTO docs (id, project_key, source, ref, title, added_at) VALUES ($1, $2, 'upload', $1, '', now())`, [p, PROBE_PROJECT]);
         await this.q(`INSERT INTO chunks (id, doc_id, project_key, idx, text, embedding) VALUES ($1, $2, $3, 0, $4, $5::vector)`, [row.id, p, PROBE_PROJECT, row.text, v]);
+        return;
+    }
+  }
+
+  async seedOwnerMark(lessonId: string) {
+    await this.q('UPDATE lessons SET decided_by_you = true WHERE id = $1', [lessonId]);
+  }
+
+  async seedStaleText(row: StaleTextSeed) {
+    switch (row.kind) {
+      case 'InboxItem':
+        await this.q(`INSERT INTO sessions (id, project_key) VALUES ($1, $2)`, [row.id, PROBE_PROJECT]);
+        await this.q(
+          `INSERT INTO turns (uuid, session_id, project_key, ts, ts_text, idx, text, preceding_assistant_text, summary)
+           VALUES ($1, $1, $2, now(), now()::text, 1, $3, $4, $5)`,
+          [row.id, PROBE_PROJECT, row.text, row.context, row.summary],
+        );
+        await this.q(
+          `INSERT INTO candidates (id, turn_uuid, session_id, project_key, status, created_at, note, agent_report)
+           VALUES ($1, $1, $1, $2, 'pending', now(), $3, $4::jsonb)`,
+          [row.id, PROBE_PROJECT, row.note, row.agentReport ? toJson(row.agentReport) : null],
+        );
+        await this.q(`INSERT INTO feedback (id, project_key, turn_uuid, status, text, created_at) VALUES ($1, $2, $1, 'open', $3, now())`, [row.id, PROBE_PROJECT, row.feedbackText]);
+        await this.q(
+          `INSERT INTO misses (id, project_key, feedback_id, missed, cause_explanation, created_at) VALUES ($1, $2, $3, $4, $5, now())`,
+          [`miss:${row.id}`, PROBE_PROJECT, row.id, row.missed, row.causeExplanation],
+        );
+        return;
+      case 'Session':
+        await this.q(`INSERT INTO sessions (id, project_key, summary, final_reply_text) VALUES ($1, $2, $3::jsonb, $4)`, [row.id, PROBE_PROJECT, toJson(row.summary), row.finalReply]);
+        return;
+      case 'Activity':
+        await this.q(
+          `INSERT INTO activity (id, ts, kind, actor, subject, why, details) VALUES ($1, now(), 'doc_added', 'probe', $2, $3, $4::jsonb)`,
+          [row.id, row.subject, row.why, toJson(row.details)],
+        );
         return;
     }
   }

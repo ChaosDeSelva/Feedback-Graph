@@ -235,6 +235,35 @@ describe('prThread', () => {
     expect(t.items[0].external.linkedSessionIds).toEqual(['s1']);
     expect(t.items[0].context).toContain('PR acme/shop#3 "PR 3"');
   });
+
+  // A data-pipeline PR reviewed with two inline comments and a summary that repeats them.
+  const reviewed = (summary: string): PrContext => ({
+    repo: 'acme/data-pipeline', number: 12, title: 'Batch loader', url: 'https://github.com/acme/data-pipeline/pull/12', author: 'dev', state: 'open',
+    updatedAt: '2026-10-22T11:00:00Z', headBranch: 'feat/batch-loader', body: '', files: ['pipeline/load.py', 'pipeline/retry.py'],
+    comments: [
+      { id: '9', author: 'lead', body: 'The batch size is hard-coded to 500; read it from `PIPELINE_BATCH_SIZE`.', path: 'pipeline/load.py', line: 40, url: 'u9', createdAt: '2026-10-22T10:00:00Z', kind: 'review_comment', diffHunk: '@@', reviewState: 'CHANGES_REQUESTED' },
+      { id: '10', author: 'lead', body: 'This retry loop never backs off, so a down warehouse gets hammered.', path: 'pipeline/retry.py', line: 12, url: 'u10', createdAt: '2026-10-22T10:00:01Z', kind: 'review_comment', diffHunk: '@@', reviewState: 'CHANGES_REQUESTED' },
+      { id: '77', author: 'lead', body: summary, path: null, line: null, url: 'u77', createdAt: '2026-10-22T10:00:02Z', kind: 'review', diffHunk: null, reviewState: 'CHANGES_REQUESTED' },
+    ],
+  });
+
+  test("a review summary that repeats its inline comments folds into them: it is marked, so the review-folded rule skips it", () => {
+    const t = prThread(reviewed('Batch size is hard-coded to 500, read it from PIPELINE_BATCH_SIZE. The retry loop never backs off, so a down warehouse gets hammered.'), 0, []);
+    const summary = t.items.find((i) => i.external.kind === 'review')!;
+    expect(summary.external.foldedInto).toBe('github:acme/data-pipeline#12/review_comment/9');
+    expect(t.items.filter((i) => i.external.kind === 'review_comment').every((i) => !i.external.foldedInto)).toBe(true);
+  });
+
+  test('a summary that says more than its inline comments stays its own item', () => {
+    const t = prThread(reviewed('Besides the inline notes: the whole job should run inside one transaction, otherwise a failed batch leaves half an import behind.'), 0, []);
+    expect(t.items.find((i) => i.external.kind === 'review')!.external.foldedInto ?? null).toBeNull();
+  });
+
+  test("each comment carries the files the PR changed, what a session is matched by", () => {
+    const t = prThread(reviewed('x'), 0, []);
+    expect(t.items.map((i) => i.external.prFiles)).toEqual(Array(3).fill(['pipeline/load.py', 'pipeline/retry.py']));
+    expect(prThread(pr(3, [{ id: 'b', createdAt: '2026-10-20T00:00:00Z' }]), 0, []).items[0].external.prFiles ?? null).toBeNull();
+  });
 });
 
 describe('linkWorkSessions', () => {
@@ -246,18 +275,24 @@ describe('linkWorkSessions', () => {
 
   const found = async (list: WorkSession[], branch: string | null) => (await findWorkSessions(graph(list), 'shop', branch, NOW.toISOString())).map((s) => [s.id, s.by]);
 
-  test('sessions on the branch win; else exactly one session in the window, found by time; several is none', async () => {
+  test('sessions on the branch win; else the sessions that did work in the window, as candidates the post-mortem checks by their files', async () => {
     expect(await found([ws('a', 'feat'), ws('b', 'main')], 'feat')).toEqual([['a', 'branch']]);
-    expect(await found([ws('b', 'main')], 'feat')).toEqual([['b', 'time']]);
-    expect(await found([ws('b', 'main'), ws('c', 'x')], 'feat')).toEqual([]);
+    expect(await found([ws('b', 'main')], 'feat')).toEqual([['b', 'window']]);
+    // Several in the window are all candidates now: none is picked for being nearest (postmortem/work.ts wants evidence).
+    expect(await found([ws('b', 'main'), ws('c', null)], 'feat')).toEqual([['b', 'window'], ['c', 'window']]);
   });
 
-  test('the one session in the window is not the work when it ran on another feature branch', async () => {
+  test('a session in the window on another feature branch is not a candidate', async () => {
     expect(await found([ws('other', 'feat/billing')], 'feat/cart')).toEqual([]);
     // Unknown, the default branch, or no branch to compare with: it may have been the work (the post-mortem asks for evidence).
-    expect(await found([ws('u', null)], 'feat/cart')).toEqual([['u', 'time']]);
-    expect(await found([ws('m', 'master')], 'feat/cart')).toEqual([['m', 'time']]);
-    expect(await found([ws('o', 'feat/billing')], null)).toEqual([['o', 'time']]);
+    expect(await found([ws('u', null)], 'feat/cart')).toEqual([['u', 'window']]);
+    expect(await found([ws('m', 'master')], 'feat/cart')).toEqual([['m', 'window']]);
+    expect(await found([ws('o', 'feat/billing')], null)).toEqual([['o', 'window']]);
+  });
+
+  test("a PR from a default branch says nothing about which session did it: no branch match, only candidates", async () => {
+    expect(await found([ws('m', 'main')], 'main')).toEqual([['m', 'window']]);
+    expect(await linkWorkSessions(graph([ws('m', 'main')]), 'shop', 'main', NOW.toISOString())).toEqual([]);
   });
 
   test('the sync links only sessions on the branch: a match by time alone is not shown as the work', async () => {
@@ -267,7 +302,7 @@ describe('linkWorkSessions', () => {
 
   test('a session that only read (a security review on the branch) is never linked; one that only committed is', async () => {
     expect(await linkWorkSessions(graph([ws('review', 'feat', 0, 0)]), 'shop', 'feat', NOW.toISOString())).toEqual([]);
-    expect(await found([ws('review', 'feat', 0, 0), ws('coder', 'main')], 'feat')).toEqual([['coder', 'time']]);
+    expect(await found([ws('review', 'feat', 0, 0), ws('coder', 'main')], 'feat')).toEqual([['coder', 'window']]);
     expect(await linkWorkSessions(graph([ws('review', 'feat', 0, 0), ws('commit', 'feat', 0, 1)]), 'shop', 'feat', NOW.toISOString())).toEqual(['commit']);
   });
 });

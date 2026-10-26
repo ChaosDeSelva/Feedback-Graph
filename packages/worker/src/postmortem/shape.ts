@@ -1,4 +1,5 @@
 import type { Cause, ContextItem, PostMortem } from '@fb/core';
+import { imperative, SCOPE_WORDS } from './lessonCheck.ts';
 
 /**
  * The shape of a post-mortem's lesson, made right after the model answers: a title that names the rule instead of
@@ -57,6 +58,43 @@ function firstClause(rule: string): string {
 
 const lowerFirst = (s: string) => (/^[A-Z][a-z]/.test(s) ? s[0].toLowerCase() + s.slice(1) : s);
 
+/** What a small model puts in appliesWhen instead of saying when: a scope word, a cause, a word for everything. */
+const FILLERS = new Set([...SCOPE_WORDS, 'work', 'general', 'always', 'any', 'all', 'anywhere', 'everything', 'code', 'coding', 'development', 'implementation', 'n/a', 'na', 'none']);
+const isFiller = (s: string) => FILLERS.has(s.trim().toLowerCase().replace(/[.\s]+$/, ''));
+
+const RULE_WORDS = 6;
+const MIN_RULE_WORDS = 4;
+
+/** Why this text cannot be a lesson's rule (a scope word, a label), or null when it can. */
+function ruleJunk(text: string): string | null {
+  const t = text.trim();
+  if (SCOPE_WORDS.has(t.toLowerCase())) return `holds the scope word "${t}"`;
+  const n = t.split(/\s+/).filter(Boolean).length;
+  if (n < MIN_RULE_WORDS || (n < RULE_WORDS && !imperative(t))) return `"${t.slice(0, 80)}" is a label, not a rule`;
+  return null;
+}
+
+/**
+ * What is wrong with the fields of the model's lesson, said so the model can fix it on its one retry: a rule that is
+ * the scope word or a label, a rule that repeats the title, an appliesWhen that is a filler. Null: nothing.
+ */
+export function lessonFieldJunk(lesson: Lesson): string | null {
+  const rule = ruleJunk(lesson.rule);
+  if (rule) return `lesson.rule ${rule}: put the imperative sentence a future agent follows there, naming the code`;
+  if (norm(lesson.rule) === norm(stripRefs(lesson.title))) return 'lesson.rule repeats the title: the title is a short name for the rule, the rule is the sentence';
+  if (isFiller(lesson.appliesWhen)) return `lesson.appliesWhen "${lesson.appliesWhen.trim()}" is a filler: say the kind of task or the files it applies to`;
+  return null;
+}
+
+/**
+ * A lesson whose rule is still junk after the retry: the title as the rule when the title reads as one, else null (it
+ * cannot be saved as a lesson). A rule that is fine comes back as it is; the other fields are shapeLesson's to repair.
+ */
+export function rescueRule(lesson: Lesson): Lesson | null {
+  if (!ruleJunk(lesson.rule)) return lesson;
+  return ruleJunk(lesson.title) ? null : { ...lesson, rule: lesson.title.trim() };
+}
+
 export function shapeLesson(lesson: Lesson, o: { taskTitle: string }): Shaped {
   const repaired: Shaped['repaired'] = [];
   let { title, appliesWhen } = lesson;
@@ -68,7 +106,7 @@ export function shapeLesson(lesson: Lesson, o: { taskTitle: string }): Shaped {
     title = norm(clause) === norm(rule) && o.taskTitle.trim() ? o.taskTitle.trim().slice(0, TITLE_CHARS) : clause;
     repaired.push('title');
   }
-  if (!appliesWhen.trim() || norm(appliesWhen) === norm(rule) || norm(appliesWhen) === norm(title) || overlap(appliesWhen, rule) >= 0.8) {
+  if (!appliesWhen.trim() || isFiller(appliesWhen) || norm(appliesWhen) === norm(rule) || norm(appliesWhen) === norm(title) || overlap(appliesWhen, rule) >= 0.8) {
     appliesWhen = lesson.paths.length
       ? `When changing ${lesson.paths.slice(0, 3).join(', ')}`
       : `When working on ${lowerFirst(o.taskTitle.trim()) || 'this project'}`;

@@ -69,6 +69,34 @@ describe('skipMatchingPending', () => {
     expect(r.skipped).toBe(2);
   });
 
+  test('the noise rules of v3 clear what was pending before them: an AI review, an approval, a status table, a branch-timing note', async () => {
+    const review = ext({ kind: 'review', path: null, line: null, thread: 'acme/data-pipeline#12' });
+    const g = fakeGraph([
+      item('a', 'Claude Code here. I reviewed the loader: `loadBatches` reads the whole table into memory.', review),
+      item('b', 'LGTM, nice work on the retry handling!', { ...review, reviewState: 'APPROVED' }),
+      item('c', '| # | Finding | Status |\n|---|---|---|\n| 1 | Batch size | Fixed |\n| 2 | Retry | Addressed |', ext({ kind: 'issue_comment', path: null })),
+      item('d', '@sam hold off merging until your schema branch lands, then rebase.', ext({ kind: 'issue_comment', path: null })),
+      item('e', 'nit: rename `tmp` to `batch`', ext()),
+      item('f', 'The loader swallows the timeout error; surface it.', review),
+    ]);
+    await skipMatchingPending({ graph: g.graph, why: 'x' });
+    expect(g.skipped.map((s) => [s.id, s.rule])).toEqual([['a', 'ai-review'], ['b', 'approval-summary'], ['c', 'status-table'], ['d', 'branch-timing']]);
+  });
+
+  test("a pending review summary that repeats the same reviewer's pending inline comments folds into them", async () => {
+    const on = (o: Partial<ExternalRef>) => ext({ thread: 'acme/data-pipeline#12', author: 'lead', createdAt: '2026-10-22T10:00:00Z', ...o });
+    const g = fakeGraph([
+      item('i1', 'The batch size is hard-coded to 500; read it from `PIPELINE_BATCH_SIZE`.', on({ path: 'pipeline/load.py' })),
+      item('i2', 'This retry loop never backs off, so a down warehouse gets hammered.', on({ path: 'pipeline/retry.py' })),
+      item('r1', 'Batch size is hard-coded to 500, read it from PIPELINE_BATCH_SIZE. The retry loop never backs off, so a down warehouse gets hammered.', on({ kind: 'review', path: null, createdAt: '2026-10-22T10:00:03Z' })),
+      // The same words from another reviewer, and on another PR: not a summary of these.
+      item('r2', 'Batch size is hard-coded to 500, read it from PIPELINE_BATCH_SIZE. The retry loop never backs off, so a down warehouse gets hammered.', on({ kind: 'review', path: null, author: 'sam' })),
+      item('r3', 'Batch size is hard-coded to 500, read it from PIPELINE_BATCH_SIZE. The retry loop never backs off, so a down warehouse gets hammered.', on({ kind: 'review', path: null, thread: 'acme/web#3' })),
+    ]);
+    await skipMatchingPending({ graph: g.graph, why: 'x' });
+    expect(g.skipped.map((s) => [s.id, s.rule])).toEqual([['r1', 'review-folded']]);
+  });
+
   test('only the named project, when one is named; every page is read', async () => {
     const many = Array.from({ length: 1203 }, (_, i) => item(`k${String(i).padStart(5, '0')}`, i % 2 ? 'Done.' : 'the totals are wrong', own, i % 3 ? 'shop' : 'web'));
     const g = fakeGraph(many);

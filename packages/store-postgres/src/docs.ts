@@ -1,9 +1,9 @@
 import { randomUUID } from 'node:crypto';
-import { docIdOf, redactDeep, redactSecrets, relevanceOf, scanRetryAt, SCAN_UNAVAILABLE_WAIT_MS } from '@fb/core';
-import type { DocHit, DocInput, DocLink, DocSummary, DocsStore, DocToRead, EmbeddedFact, TaskImage, UpsertDocOpts } from '@fb/core';
+import { docIdOf, runWriteOwner, REDACT_PAGE, redactDeep, redactSecrets, relevanceOf, scanRetryAt, SCAN_UNAVAILABLE_WAIT_MS } from '@fb/core';
+import type { DocHit, DocInput, DocLink, DocListOpts, DocSummary, DocsStore, DocToRead, EmbeddedFact, TaskImage, UpsertDocOpts } from '@fb/core';
 import type pg from 'pg';
 import { iso, toVector, tx, type Db } from './db.ts';
-import { runSearch, searchDocsQuery } from './vector.ts';
+import { runSearch, searchDocsQuery, visibleToRun } from './vector.ts';
 
 /** Documents as embedded chunks, and integration sync cursors. */
 export class PgDocsStore implements DocsStore {
@@ -17,16 +17,20 @@ export class PgDocsStore implements DocsStore {
     // Docs come from outside (uploads, PRs, tickets): redact here so no caller can skip it.
     const doc = { ...input, title: redactSecrets(input.title), ref: redactSecrets(input.ref) };
     const chunks = raw.map((c) => ({ ...c, text: redactSecrets(c.text) }));
-    const id = docIdOf(doc);
+    const id = docIdOf(doc, o.run);
     await tx(this.db, async (c) => {
       await c.query('INSERT INTO projects (key) VALUES ($1) ON CONFLICT DO NOTHING', [doc.projectKey]);
+      // A run replaces only its own document (runWriteOwner); the owner's write makes a run's document the owner's.
+      const { rows: [cur] } = await c.query('SELECT run FROM docs WHERE id = $1 FOR UPDATE', [id]);
+      const run = runWriteOwner(`the document ${doc.ref}`, cur ? (cur.run ?? null) : undefined, o.run, o.byOwner);
       await c.query(
-        `INSERT INTO docs (id, project_key, source, ref, title, url, added_at, kind, media_type, read_status, read_attempts, read_error, read_retry_at, read_at, added_by, tickets)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 0, NULL, NULL, NULL, $11, $12)
+        `INSERT INTO docs (id, project_key, source, ref, title, url, added_at, kind, media_type, read_status, read_attempts, read_error, read_retry_at, read_at, added_by, tickets, run, sandbox)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 0, NULL, NULL, NULL, $11, $12, $13, $14)
          ON CONFLICT (id) DO UPDATE SET project_key = EXCLUDED.project_key, source = EXCLUDED.source, ref = EXCLUDED.ref,
            title = EXCLUDED.title, url = EXCLUDED.url, added_at = EXCLUDED.added_at, added_by = EXCLUDED.added_by, kind = EXCLUDED.kind, media_type = EXCLUDED.media_type, tickets = EXCLUDED.tickets,
+           run = EXCLUDED.run, sandbox = EXCLUDED.sandbox,
            read_status = EXCLUDED.read_status, read_attempts = 0, read_error = NULL, read_retry_at = NULL, read_at = NULL`,
-        [id, doc.projectKey, doc.source, doc.ref, doc.title, doc.url ?? null, new Date(), o.image ? 'image' : 'text', o.image?.mediaType ?? null, o.read ? 'pending' : null, o.addedBy ?? null, o.tickets ?? []],
+        [id, doc.projectKey, doc.source, doc.ref, doc.title, doc.url ?? null, new Date(), o.image ? 'image' : 'text', o.image?.mediaType ?? null, o.read ? 'pending' : null, o.addedBy ?? null, o.tickets ?? [], run?.id ?? null, !!run?.sandbox],
       );
       // A new version of the document: what was read from the old one goes.
       await c.query('DELETE FROM facts WHERE doc_id = $1', [id]);
@@ -36,22 +40,33 @@ export class PgDocsStore implements DocsStore {
       }
       await c.query('DELETE FROM chunks WHERE doc_id = $1', [id]);
       if (!chunks.length) return;
+      // Each chunk carries its document's run, so the search leaves out another run's sandbox upload in the scan.
       await c.query(
-        `INSERT INTO chunks (id, doc_id, project_key, idx, text, embedding)
-         SELECT $1 || '#' || (n.ord - 1), $1, $2, n.ord - 1, n.text, n.embedding::vector
+        `INSERT INTO chunks (id, doc_id, project_key, idx, text, embedding, run, sandbox)
+         SELECT $1 || '#' || (n.ord - 1), $1, $2, n.ord - 1, n.text, n.embedding::vector, $5, $6
          FROM unnest($3::text[], $4::text[]) WITH ORDINALITY AS n(text, embedding, ord)`,
-        [id, doc.projectKey, chunks.map((ch) => ch.text), chunks.map((ch) => toVector(ch.embedding))],
+        [id, doc.projectKey, chunks.map((ch) => ch.text), chunks.map((ch) => toVector(ch.embedding)), run?.id ?? null, !!run?.sandbox],
       );
     });
     return id;
   }
 
-  async listDocs(projectKey: string): Promise<DocSummary[]> {
+  async listDocs(projectKey: string, o: DocListOpts = {}): Promise<DocSummary[]> {
+    // The page first (docs_project), then one grouped count of chunks and of facts for its docs only.
     const { rows } = await this.db.pool.query(
-      `SELECT d.*, (SELECT count(*) FROM chunks c WHERE c.doc_id = d.id) AS chunks,
-              (SELECT count(*) FROM facts x WHERE x.doc_id = d.id AND x.current) AS facts
-       FROM docs d WHERE d.project_key = $1 ORDER BY d.added_at DESC, d.id`,
-      [projectKey],
+      `WITH page AS (
+         SELECT * FROM docs d
+         WHERE d.project_key = $1 AND ${visibleToRun('d', '$7')} AND ($2::text IS NULL OR d.source = $2) AND ($3::text IS NULL OR d.ref = $3)
+           AND ($4::timestamptz IS NULL OR d.added_at < $4 OR (d.added_at = $4 AND d.id > $5))
+         ORDER BY d.added_at DESC, d.id
+         LIMIT $6
+       )
+       SELECT p.*, coalesce(c.n, 0) AS chunks, coalesce(x.n, 0) AS facts
+       FROM page p
+       LEFT JOIN (SELECT doc_id, count(*) AS n FROM chunks WHERE doc_id IN (SELECT id FROM page) GROUP BY doc_id) c ON c.doc_id = p.id
+       LEFT JOIN (SELECT doc_id, count(*) AS n FROM facts WHERE current AND doc_id IN (SELECT id FROM page) GROUP BY doc_id) x ON x.doc_id = p.id
+       ORDER BY p.added_at DESC, p.id`,
+      [projectKey, o.source ?? null, o.ref ?? null, o.after?.addedAt ?? null, o.after?.id ?? null, o.limit ?? null, o.run ?? null],
     );
     return rows.map((r) => ({
       id: r.id, projectKey: r.project_key, source: r.source, ref: r.ref, title: r.title, url: r.url ?? null,
@@ -91,7 +106,7 @@ export class PgDocsStore implements DocsStore {
     return tx(this.db, async (c: pg.PoolClient) => {
       // Locked, so a re-upload either lands before (and the version no longer matches) or waits until this is saved.
       const { rows: [d] } = await c.query(
-        'SELECT project_key, ref FROM docs WHERE id = $1 AND ($2::timestamptz IS NULL OR added_at = $2) FOR UPDATE',
+        'SELECT project_key, ref, run, sandbox FROM docs WHERE id = $1 AND ($2::timestamptz IS NULL OR added_at = $2) FOR UPDATE',
         [id, r.version ?? null],
       );
       if (!d) return false;
@@ -101,18 +116,18 @@ export class PgDocsStore implements DocsStore {
         await c.query('DELETE FROM chunks WHERE doc_id = $1', [id]);
         if (chunks.length) {
           await c.query(
-            `INSERT INTO chunks (id, doc_id, project_key, idx, text, embedding)
-             SELECT $1 || '#' || (n.ord - 1), $1, $2, n.ord - 1, n.text, n.embedding::vector
+            `INSERT INTO chunks (id, doc_id, project_key, idx, text, embedding, run, sandbox)
+             SELECT $1 || '#' || (n.ord - 1), $1, $2, n.ord - 1, n.text, n.embedding::vector, $5, $6
              FROM unnest($3::text[], $4::text[]) WITH ORDINALITY AS n(text, embedding, ord)`,
-            [id, d.project_key, chunks.map((ch) => ch.text), chunks.map((ch) => toVector(ch.embedding))],
+            [id, d.project_key, chunks.map((ch) => ch.text), chunks.map((ch) => toVector(ch.embedding)), d.run ?? null, d.sandbox === true],
           );
         }
       }
       if (facts.length) {
         await c.query(
-          `INSERT INTO facts (id, project_key, doc_id, kind, statement, path, lines, confidence, why, source, current, created_at, valid_from, embedding, relevance, relevance_by)
+          `INSERT INTO facts (id, project_key, doc_id, kind, statement, path, lines, confidence, why, source, current, created_at, valid_from, embedding, relevance, relevance_by, run, sandbox)
            SELECT n.id, $1, $2, n.kind, n.statement, $3, n.lines, n.confidence, n.why, $4, true, $5, $5, n.embedding::vector,
-                  n.relevance, CASE WHEN n.relevance IS NULL THEN NULL ELSE 'model' END
+                  n.relevance, CASE WHEN n.relevance IS NULL THEN NULL ELSE 'model' END, $14, $15
            FROM unnest($6::text[], $7::text[], $8::text[], $9::text[], $10::float8[], $11::text[], $12::text[], $13::float8[])
                   WITH ORDINALITY AS n(id, kind, statement, lines, confidence, why, embedding, relevance, ord)
            ORDER BY n.ord`,
@@ -120,6 +135,7 @@ export class PgDocsStore implements DocsStore {
             d.project_key, id, d.ref, r.source, now,
             facts.map(() => randomUUID()), facts.map((f) => f.kind), facts.map((f) => f.statement), facts.map((f) => f.lines ?? null),
             facts.map((f) => f.confidence ?? null), facts.map((f) => f.why ?? null), facts.map((f) => toVector(f.embedding)), facts.map((f) => relevanceOf(f)),
+            d.run ?? null, d.sandbox === true,
           ],
         );
       }
@@ -160,33 +176,63 @@ export class PgDocsStore implements DocsStore {
     return b ? { mediaType: b.media_type, data: b.data.replace(/\n/g, '') } : null;
   }
 
-  async deleteDoc(id: string): Promise<boolean> {
+  async deleteDoc(id: string, o: { run?: string | null } = {}): Promise<boolean> {
     // Chunks go with their doc (ON DELETE CASCADE).
-    const { rowCount } = await this.db.pool.query('DELETE FROM docs WHERE id = $1', [id]);
+    const { rowCount } = await this.db.pool.query('DELETE FROM docs WHERE id = $1 AND ($2::text IS NULL OR run = $2)', [id, o.run ?? null]);
     return (rowCount ?? 0) > 0;
   }
 
-  async linkedDocs(q: { projectKey: string; docIds: string[] }): Promise<DocLink[]> {
+  async linkedDocs(q: { projectKey: string; docIds: string[]; run?: string | null }): Promise<DocLink[]> {
     if (!q.docIds.length) return [];
     const { rows } = await this.db.pool.query(
       `SELECT d.id AS doc_id, o.id, o.source, o.ref, o.title, o.url
        FROM docs d JOIN docs o ON o.project_key = d.project_key
         AND ((o.source = 'linear' AND o.ref = ANY(SELECT 'linear:' || t FROM unnest(d.tickets) AS t))
           OR (d.source = 'linear' AND d.ref LIKE 'linear:%' AND substr(d.ref, 8) = ANY(o.tickets)))
-       WHERE d.project_key = $1 AND d.id = ANY($2::text[])
+       WHERE d.project_key = $1 AND d.id = ANY($2::text[]) AND ${visibleToRun('o', '$3')}
        ORDER BY d.id, o.title, o.id`,
-      [q.projectKey, q.docIds],
+      [q.projectKey, q.docIds, q.run ?? null],
     );
     return rows.map((r) => ({ docId: r.doc_id, linked: { docId: r.id, source: r.source, ref: r.ref, title: r.title, url: r.url ?? null } }));
   }
 
-  async searchDocs(q: { embedding: number[]; projectKey: string; k: number }): Promise<DocHit[]> {
+  async projectTickets(q: { projectKey: string; ids: string[] }): Promise<string[]> {
+    if (!q.ids.length) return [];
+    const { rows } = await this.db.pool.query(
+      // t.tid, not a bare id: inside the subquery that would be docs.id.
+      `SELECT DISTINCT t.tid FROM unnest($2::text[]) AS t(tid)
+       WHERE EXISTS (SELECT 1 FROM docs d WHERE d.project_key = $1 AND ((d.source = 'linear' AND d.ref = 'linear:' || t.tid) OR t.tid = ANY(d.tickets)))`,
+      [q.projectKey, q.ids],
+    );
+    return rows.map((r) => r.tid as string);
+  }
+
+  async searchDocs(q: { embedding: number[]; projectKey: string; k: number; run?: string | null }): Promise<DocHit[]> {
     // The project's chunks, nearest first, through the HNSW index when it pays (see vector.ts).
     const rows = await runSearch(this.db, searchDocsQuery(this.db, q), q.k);
     return rows.map((r) => ({ docId: r.doc_id, source: r.source, ref: r.ref, title: r.title, url: r.url ?? null, text: r.text, score: r.score }));
   }
 
   /** Small key/value store for integration sync cursors (e.g. last GitHub sync time per project). */
+  async redactStoredDocs(): Promise<number> {
+    let changed = 0;
+    for (const [table, column] of [['docs', 'title'], ['chunks', 'text']] as const) {
+      for (let after = ''; ;) {
+        const { rows } = await this.db.pool.query(`SELECT id, ${column} AS text FROM ${table} WHERE id > $1 ORDER BY id LIMIT $2`, [after, REDACT_PAGE]);
+        if (!rows.length) break;
+        after = rows[rows.length - 1].id;
+        const page = rows.flatMap((r: { id: string; text: string }) => { const text = redactSecrets(r.text); return text === r.text ? [] : [{ id: r.id, text }]; });
+        if (!page.length) continue;
+        await this.db.pool.query(
+          `UPDATE ${table} x SET ${column} = c.text FROM unnest($1::text[], $2::text[]) AS c(id, text) WHERE x.id = c.id`,
+          [page.map((c) => c.id), page.map((c) => c.text)],
+        );
+        changed += page.length;
+      }
+    }
+    return changed;
+  }
+
   async getCursor(key: string): Promise<string | null> {
     const { rows: [r] } = await this.db.pool.query('SELECT value FROM sync_cursors WHERE key = $1', [key]);
     return r ? r.value : null;
@@ -197,5 +243,15 @@ export class PgDocsStore implements DocsStore {
       'INSERT INTO sync_cursors (key, value) VALUES ($1, $2) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value',
       [key, value],
     );
+  }
+
+  async cursorsWithPrefix(prefix: string): Promise<{ key: string; value: string }[]> {
+    // starts_with, not LIKE: the prefix is literal, so % and _ in it match only themselves.
+    const { rows } = await this.db.pool.query('SELECT key, value FROM sync_cursors WHERE starts_with(key, $1)', [prefix]);
+    return rows.map((r) => ({ key: r.key as string, value: r.value as string }));
+  }
+
+  async deleteCursor(key: string): Promise<void> {
+    await this.db.pool.query('DELETE FROM sync_cursors WHERE key = $1', [key]);
   }
 }

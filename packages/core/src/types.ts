@@ -63,6 +63,16 @@ export type ExternalRef = {
   repliesTo?: string | null;
   /** GitHub: the verdict of the review the comment belongs to. */
   reviewState?: ReviewVerdict | null;
+  /**
+   * GitHub, a review's summary: the inline comment (its item uuid) it repeats, when its content is the same as its
+   * inline comments (feedbackRules.foldsIntoInline). One item, not two: the summary is skipped (review-folded).
+   */
+  foldedInto?: string | null;
+  /**
+   * GitHub: the repo-relative files the pull request changed (capped), what a session must have edited to be matched to
+   * the PR by its files (worker postmortem/work.ts). Unset on comments synced before they were kept, and on Linear.
+   */
+  prFiles?: string[] | null;
 };
 
 export type AuthorKind = 'human' | 'bot' | 'agent';
@@ -93,6 +103,12 @@ export type ParsedSession = {
    * take it in with the delta that reaches the last turn.
    */
   finalReply?: FinalReply | null;
+  /**
+   * The instruction files (CLAUDE.md, AGENTS.md, memory notes) the transcript shows the agent had, as the transcript
+   * names them: Claude Code attachments and the contents it puts in context, Codex's AGENTS.md instructions. Evidence
+   * of what was loaded, on top of what each agent loads by default. Unset: not recorded (read before ingest v5).
+   */
+  instructionFiles?: string[];
 };
 
 export type FinalReply = { text: string; ts: string };
@@ -138,6 +154,9 @@ export type Candidate = {
   origins?: CandidateOrigin[];
   /** What the agent reported through report_feedback, when it did; kept when merged with the detector's turn. */
   agentReport?: AgentReport | null;
+  /** The run it was reported in (RunTag), and whether that run was a sandbox; absent when none. */
+  run?: string;
+  sandbox?: true;
 };
 
 export type CandidateOrigin = 'detector' | 'agent';
@@ -188,6 +207,11 @@ export type PostMortem = {
   /** What the lesson check found (stored on the lesson as `checks`); unset: not checked. */
   lessonChecks?: LessonCheck[];
   /**
+   * Set when the model's lesson was no lesson even after its retry (the rule field held a scope word or a label, and the
+   * title was not a rule either): why. The miss is saved; the lesson is not (savePostmortem writes no lesson).
+   */
+  lessonDropped?: string;
+  /**
    * 'process': the miss is about how the work was handled (branches, pushes, pull requests), not the code, so it is
    * tied to no file the session edited. Unset: about the code.
    */
@@ -197,6 +221,11 @@ export type PostMortem = {
    * they are logged with the post-mortem for the owner and never stored as facts or served to agents.
    */
   facts?: ProposedFact[];
+  /**
+   * Set when the post-mortem's own miss says there was none ("the agent did not miss any defects"): the lesson it wrote
+   * is invented, so it is saved rejected, never proposed (worker postmortem/step.ts). The text that said so.
+   */
+  noMiss?: string;
 };
 
 export type ProposedFact = { path: string; statement: string };
@@ -220,6 +249,12 @@ export const LESSON_CHECKS = [
   'self-review',
   'path-missing',
   'duplicate-of',
+  'contradicts-evidence',
+  'unlinked-ticket',
+  'generic',
+  'bundled',
+  'ambiguous-path',
+  'no-miss',
 ] as const;
 export type LessonCheckName = (typeof LESSON_CHECKS)[number];
 /** `of`: for duplicate-of, the lesson this one repeats. */
@@ -229,19 +264,25 @@ export type LessonCheck = { name: LessonCheckName; why: string; of?: string };
  * The version of the lesson checks, stored with them (Lesson.checksVersion). Raise it when a check changes: at start the
  * worker re-checks every proposed or approved lesson checked with an older version, and logs what changed.
  * 1: the checks before the version was stored. 2: path-missing, duplicate-of, the data checks on stored lessons, and
- * the item-20 fixes (APPROVED is not a nit, clause-start imperatives, platitudes in the title).
+ * the item-20 fixes (APPROVED is not a nit, clause-start imperatives, platitudes in the title). 3: contradicts-evidence,
+ * a miss blaming an instruction file the agent "did not load" when the session had it, and unlinked-ticket, a
+ * post-mortem that cited Linear tickets of another project (the hunt searched the whole workspace). 4: generic (a rule
+ * naming nothing concrete, only process verbs), bundled (two unrelated instructions in one rule), and paths normalized:
+ * a proposed lesson's bare file names resolve to their one repository match, and instruction files, PR refs, bare
+ * identifiers, missing files and globs matching nothing are dropped (bad-path says which); an approved lesson's paths
+ * are only flagged.
  */
-export const LESSON_CHECKS_VERSION = 2;
+export const LESSON_CHECKS_VERSION = 4;
 
 /**
  * Where a lesson's feedback came from: a GitHub or Linear comment, pushback in an agent session, an imported memory
  * file, or written by hand. Set by the stores.
  */
-export const LESSON_FROM = ['github', 'linear', 'session', 'memory', 'manual'] as const;
+export const LESSON_FROM = ['github', 'linear', 'session', 'memory', 'manual', 'demo'] as const;
 export type LessonFrom = (typeof LESSON_FROM)[number];
 
 export type LessonStatus = 'proposed' | 'approved' | 'rejected' | 'superseded';
-export type LessonSource = 'postmortem' | 'memory' | 'manual';
+export type LessonSource = 'postmortem' | 'memory' | 'manual' | 'demo';
 
 export type Lesson = {
   id: string;
@@ -276,7 +317,34 @@ export type Lesson = {
   from?: LessonFrom;
   /** Why its last decision was made, when that says more than the status ("converted to a fact"). Null: none given. */
   decisionNote?: string | null;
+  /** The run its feedback was reported in (RunTag), copied by the post-mortem; absent when none. */
+  run?: string;
+  /** From a sandbox run: served only to that run's agents. Absent unless true. */
+  sandbox?: true;
+  /**
+   * The lesson as the post-mortem wrote it, kept the first time the owner (or an operator) changed its words, paths or
+   * scope while it was proposed. Null or absent: never edited while proposed (approved as written, if approved).
+   */
+  proposedAs?: LessonDraft | null;
 };
+
+/** What the lesson writer controls: the parts the owner edits before approving. */
+export type LessonDraft = Pick<Lesson, 'title' | 'rule' | 'appliesWhen' | 'scope' | 'paths'>;
+
+/**
+ * How the owner decided a lesson the post-mortem wrote: approved as written, approved after editing it, or rejected.
+ * The few-shot examples of the post-mortem prompt and the lesson quality numbers are made of these.
+ */
+export type LessonOutcome = 'as_written' | 'edited' | 'rejected';
+
+/** Of the post-mortem lessons decided in the last `days` days: how many of each outcome (decided is their sum). */
+/** byOperator: of `decided`, those an agent with the operator token made (counted as the owner's, said apart). */
+export type LessonQuality = { days: number; asWritten: number; edited: number; rejected: number; decided: number; byOperator: number };
+/**
+ * GET /api/lessons/quality: LessonQuality over the last 30 and 90 days, in all (the shown projects, or ?project=) and by
+ * project (where each lesson was learned). capped: more decisions than were counted (the oldest were left out).
+ */
+export type LessonQualityReport = { windows: LessonQuality[]; projects: Record<string, LessonQuality[]>; capped?: true };
 
 /** Everything the post-mortem needs about one confirmed piece of feedback. */
 export type PostMortemInput = {
@@ -291,7 +359,11 @@ export type PostMortemInput = {
    * For a comment from GitHub or Linear (feedback.external is set): the agent session that most likely did the work,
    * filled in by the worker. Absent: no session was found, and the post-mortem works from the comment alone.
    */
-  work?: { sessionId: string; source: SessionSource; cwd: string; turns: HumanTurn[] } | null;
+  work?: {
+    sessionId: string; source: SessionSource; cwd: string; turns: HumanTurn[];
+    /** How it was matched: it ran on the PR's branch, or it edited files the PR changed. Unset: not said. */
+    matchedBy?: 'branch' | 'files';
+  } | null;
   feedback: HumanTurn;
   /** All human turns in the session, in order (the flagged one included). */
   turns: HumanTurn[];
@@ -378,14 +450,28 @@ export type ScanJob = {
   retryAt: string | null;
   /** An agentic scan's shards (packages or services, one agent run each): null for a per-file scan or before the end. */
   shards?: ScanShards | null;
+  /**
+   * When it last gave up its slot after a shard so another project's scan could run (FactsStore.requeueScanJob): it
+   * waits in the queue from then, not from requestedAt. Null: it never has.
+   */
+  servedAt?: string | null;
 };
+
+/**
+ * A queued or running scan in the order the queue serves it (FactsStore.scanQueue). waitingSince is what the order
+ * goes by: the oldest of when it was requested (or last gave up its slot) and when an agent first asked for one of the
+ * project's files that is not read yet (requestFilesScan).
+ */
+export type ScanQueueEntry = ScanJob & { waitingSince: string };
 
 /**
  * How many shards an agentic scan had, how many it rescanned (the others had not changed) and how many of those failed.
  * done: while it runs, the shards it has got through so far (skipped ones included); unset once it is finished.
  * unreached: the directories or files the agents said they did not read (at most 200; absent: none, or not asked).
+ * processed, failedKeys: while it runs or waits between shards, the keys of the shards it has got through (skipped and
+ * failed ones included) and of those that failed, so a scan that gave up its slot goes on from there. Unset once finished.
  */
-export type ScanShards = { total: number; rescanned: number; failed: number; done?: number; unreached?: string[] };
+export type ScanShards = { total: number; rescanned: number; failed: number; done?: number; unreached?: string[]; processed?: string[]; failedKeys?: string[] };
 
 export type ProjectSummary = {
   key: string;
@@ -451,6 +537,12 @@ export const ACTIVITY_KINDS = [
   'lesson_to_fact',
   'misses_reclassified',
   'items_reopened',
+  'session_resumed',
+  'secrets_redacted',
+  'run_cleaned',
+  'demo_seeded',
+  'demo_removed',
+  'sessions_rematched',
 ] as const;
 export type ActivityKind = (typeof ACTIVITY_KINDS)[number];
 
@@ -466,12 +558,68 @@ export type ActivityInput = {
   details?: Record<string, unknown>;
   /** Ids of graph nodes this activity created or touched (lesson ids, `project:path` code files, feedback ids). */
   targets?: string[];
+  /** The run the request was labelled with (x-fg-run, see RunTag); unset: no run. */
+  run?: string | null;
+  /** The run was a sandbox one. */
+  sandbox?: boolean;
 };
 /**
  * detailsOmitted: a list asked for small rows (maxDetailBytes) and these details were bigger, so `details` is `{}`;
- * the entry on its own (ActivityStore.get, GET /api/activity/:id) has them.
+ * the entry on its own (ActivityStore.get, GET /api/activity/:id) has them. `run` and `sandbox` are there only when set.
  */
-export type Activity = Required<ActivityInput> & { id: string; ts: string; detailsOmitted?: boolean };
+export type Activity = Required<Omit<ActivityInput, 'run' | 'sandbox'>> & Pick<ActivityInput, 'run' | 'sandbox'> & { id: string; ts: string; detailsOmitted?: boolean };
+
+// ── Runs ───────────────────────────────────────────────────────────────
+
+/** A run id as a tester labels its requests (x-fg-run): 1 to 64 letters, digits, dots, dashes or underscores. */
+export const RUN_ID = /^[\w.-]{1,64}$/;
+
+/**
+ * The run a request was labelled with: what it writes records the run id, so `fg cleanup --run <id>` can remove exactly
+ * that. sandbox: what it writes is never served to agents of other runs (nor exported or synced to the cloud).
+ */
+export type RunTag = { id: string; sandbox: boolean };
+
+/**
+ * A run's write to a record it does not own (the owner's, or another run's): refused, so a tester never replaces,
+ * decides on or adopts the owner's records (and `fg cleanup --run` never removes them). The API answers 409.
+ */
+export class NotTheRunsError extends Error {
+  constructor(what: string, run: string) {
+    super(`${what} is not run ${run}'s: a labelled run changes only what it wrote (a sandbox run makes its own copy; drop x-fg-run, or open the run from the owner's browser, to change the owner's)`);
+    this.name = 'NotTheRunsError';
+  }
+}
+
+/**
+ * Who opened a run (RunsStore.claim), from its first labelled write: the operator token (FG_OPERATOR_TOKEN), the owner's
+ * API token (API_TOKEN as the Bearer, no Origin), the browser (it sent Origin), or an agent with neither token (/mcp or
+ * the API with no API_TOKEN configured). Writes under the run by anyone else are refused, and the operator token may
+ * clean up only a run it opened.
+ */
+export const RUN_PRINCIPALS = ['operator', 'owner_token', 'browser', 'agent'] as const;
+export type RunPrincipal = (typeof RUN_PRINCIPALS)[number];
+/** A run's owner as stored. firstSeen: ISO time of its first labelled write. */
+export type RunOwner = { run: string; principal: RunPrincipal; firstSeen: string };
+
+/** What a run's id is stored on (RunsStore.items). feedback: an agent's report, with its post-mortem's miss and lesson. */
+export const RUN_ITEM_KINDS = ['feedback', 'lesson', 'miss', 'predone_check', 'fact', 'doc', 'link', 'chat'] as const;
+export type RunItemKind = (typeof RUN_ITEM_KINDS)[number];
+/**
+ * One record a run wrote. `group`: the report a lesson or miss came from (its feedback id); null for the rest.
+ * merged: a report the detector then found in a real session, so it is that session's Inbox item now (never removed).
+ */
+export type RunItem = { kind: RunItemKind; id: string; projectKey: string | null; sandbox: boolean; group: string | null; merged: boolean };
+
+/**
+ * One turn of a session as the detector saw it (SessionsStore.turnEvidence), without its words. label null: not
+ * classified (the opening turn, one still waiting, or one given up on after classifyAttempts). signals: the
+ * classifier's, plus the rules applied (`skip:<rule>`, `manual`). candidateId: the Inbox item it filed, if any.
+ */
+export type TurnEvidence = {
+  uuid: string; index: number; ts: string; label: TurnLabel | null; confidence: number | null; summary: string | null;
+  signals: string[]; classifyAttempts: number; candidateId: string | null;
+};
 
 /** What the worker reports about itself each heartbeat; shown in the UI header and at /api/status. */
 export type WorkerStatus = {
@@ -502,8 +650,11 @@ export type WorkerStatus = {
 export const WORKER_STAGES = ['sync', 'ingest', 'classify', 'postmortem', 'scan', 'docs', 'waiting'] as const;
 export type WorkerStageName = (typeof WORKER_STAGES)[number];
 export type WorkerStage = { name: WorkerStageName; startedAt: string; done: number | null; total: number | null; current: string | null };
-/** Turns waiting for the classifier (the first `classifyBatch * 20` of them are fetched: `capped` means at least). */
-export type WorkerBacklog = { classify: number; classifyCapped: boolean; at: string };
+/**
+ * Turns waiting for the classifier (the first `classifyBatch * 20` of them are fetched: `capped` means at least).
+ * oldestAt: the oldest fetched turn's time (newest are fetched first, so when capped the oldest waits longer still).
+ */
+export type WorkerBacklog = { classify: number; classifyCapped: boolean; at: string; oldestAt?: string | null };
 
 /**
  * How a provider last fared: `reason` says why it could not be asked, null while it answers. `since`: when it was first
@@ -591,13 +742,35 @@ export type PipelineStatus = {
   classify: { backlog: number; capped: boolean } | null;
   inbox: { pending: number; confirmed: number } | null;
   postmortems: { queued: number } | null;
-  /** global: how many of them have no project of their own (they serve every project). Older APIs leave it out. */
-  lessons: { proposed: number; approved: number; global?: number } | null;
+  /**
+   * global: how many of them have no project of their own (they serve every project). quality: LessonQualityReport's
+   * windows, when the store can tell. Older APIs leave both out.
+   */
+  lessons: { proposed: number; approved: number; global?: number; quality?: LessonQuality[] } | null;
   /**
    * olderScanner: files an older scanner read, in all and by project (only those with some), which the next scan you
    * start reads again; absent when there are none or the store cannot count them.
    */
   scans: { done: number; queued: number; running: number; failed: number; never: number; olderScanner?: { files: number; projects: Record<string, number> } } | null;
+  /** Back-pressure: each queue's waiting work and what runs now. Older APIs leave it out. */
+  queues?: WorkQueues;
+};
+
+/** One piece of work running now: what (a project, a feedback or turn id), since when; a scan's shards got through so far. */
+export type QueueRun = { what: string; since: string; shards?: { done: number; total: number } | null };
+/**
+ * A queue: how many wait (capped: at least that many), since when the oldest has waited (null: none waits, or it is
+ * not known), and what runs now.
+ */
+export type WorkQueue = { waiting: number; capped?: boolean; oldestAt: string | null; running: QueueRun[] };
+/** A scan queued or running: since when it has waited (or, running, run), and its shards got through of all. */
+export type ScanQueueItem = { project: string; status: 'queued' | 'running'; since: string; shards: { done: number; total: number } | null };
+/** The queues of /api/pipeline; each null when this server cannot read it. Scans count the shown projects only. */
+export type WorkQueues = {
+  scans: (WorkQueue & { projects: ScanQueueItem[] }) | null;
+  classify: WorkQueue | null;
+  postmortems: WorkQueue | null;
+  chats: WorkQueue | null;
 };
 
 // ── Session summaries ──────────────────────────────────────────────────

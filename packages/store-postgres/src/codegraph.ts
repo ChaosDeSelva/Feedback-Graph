@@ -19,6 +19,7 @@ import {
 import { iso, toJson, tx, type Db } from './db.ts';
 import { PgFactsStore } from './facts.ts';
 import { PgKnowledgeStore } from './knowledge.ts';
+import { visibleToRun } from './vector.ts';
 
 /** The CodeFile id Neo4j uses: '<projectKey>:<path>'. */
 const fileId = (projectKey: string, path: string) => `${projectKey}:${path}`;
@@ -51,9 +52,9 @@ export class PgCodeGraphStore implements CodeGraphStore {
       testsOf: (key, paths) => this.testsOf(key, paths),
       importerCounts: (key) => this.importerCounts(key),
       edgesTouching: (key, paths) => this.edgesTouching(key, paths),
-      missesOn: (key, paths) => this.missesOn(key, paths),
-      approvedLessons: (key) => knowledge.listLessons({ status: 'approved', projectKey: key, limit: LESSON_LIMIT }),
-      currentFacts: (key, path) => facts.listFacts({ projectKey: key, path }),
+      missesOn: (key, paths, run) => this.missesOn(key, paths, run ?? null),
+      approvedLessons: (key, run) => knowledge.listLessons({ status: 'approved', projectKey: key, limit: LESSON_LIMIT, run }),
+      currentFacts: (key, path, run) => facts.listFacts({ projectKey: key, path, run }),
     };
     this.views = codeGraphViews(reads);
   }
@@ -238,12 +239,12 @@ export class PgCodeGraphStore implements CodeGraphStore {
     return rows.map((r) => r.path as string);
   }
 
-  moduleContext(projectKey: string, path: string) {
-    return this.views.moduleContext(projectKey, path);
+  moduleContext(projectKey: string, path: string, run?: string | null) {
+    return this.views.moduleContext(projectKey, path, run ?? null);
   }
 
-  impact(projectKey: string, paths: string[], depth: number) {
-    return this.views.impact(projectKey, paths, depth);
+  impact(projectKey: string, paths: string[], depth: number, run?: string | null) {
+    return this.views.impact(projectKey, paths, depth, run ?? null);
   }
 
   hotspots(projectKey: string, limit: number, opts?: HotspotOpts) {
@@ -254,8 +255,8 @@ export class PgCodeGraphStore implements CodeGraphStore {
     return this.views.mapGraph(projectKey, opts);
   }
 
-  lessonsForPaths(projectKey: string, paths: string[]) {
-    return this.views.lessonsForPaths(projectKey, paths);
+  lessonsForPaths(projectKey: string, paths: string[], run?: string | null) {
+    return this.views.lessonsForPaths(projectKey, paths, run ?? null);
   }
 
   outsideMap(projectKey: string, paths: string[]) {
@@ -353,7 +354,7 @@ export class PgCodeGraphStore implements CodeGraphStore {
     return new Map(rows.map((r) => [r.path, r.n]));
   }
 
-  private async missesOn(projectKey: string, paths: string[] | null): Promise<FileMissRow[]> {
+  private async missesOn(projectKey: string, paths: string[] | null, run: string | null): Promise<FileMissRow[]> {
     if (paths && !paths.length) return [];
     const { rows } = await this.q(
       `SELECT m.id, m.missed, m.cause, m.cause_explanation, f.id AS feedback_id, coalesce(t.text, f.text, '') AS text,
@@ -364,8 +365,9 @@ export class PgCodeGraphStore implements CodeGraphStore {
        JOIN turns t ON t.uuid = f.turn_uuid
        JOIN session_files sf ON sf.session_id = t.session_id AND sf.edited
        WHERE m.project_key = $1 AND f.status <> 'rejected' AND m.subject IS NULL AND ($2::text[] IS NULL OR sf.path = ANY($2::text[]))
+         AND ${visibleToRun('m', '$3')}
        ORDER BY m.id COLLATE "C", sf.path COLLATE "C"`,
-      [projectKey, paths],
+      [projectKey, paths, run],
     );
     return rows.map((r: Row) => ({
       missId: r.id,

@@ -136,4 +136,16 @@ describe.skipIf(!testStores().includes('postgres'))('Postgres vector searches us
     // And the forced store's plan really is the index (so the comparison above compared the two paths).
     expect(await indexesUsed(pinned.db, searchFactsQuery(pinned.db, { embedding: query, projectKey: 'demo', k: 2 }, COLUMNS))).toContain('facts_embedding');
   });
+
+  // Last: it adds chunks to demo.
+  test("another run's sandbox chunks, nearer than the project's own, are left out before the k nearest, through the index too", async () => {
+    await store.docs.upsertDoc({ projectKey: 'demo', source: 'upload', ref: 'upload:sbx', title: 's', url: null }, Array.from({ length: 5 }, (_, i) => ({ text: `sandbox ${i}`, embedding: near(0.3) })), { run: { id: 'sbx-1', sandbox: true } });
+    const docs = (s: PostgresStore, run?: string) => s.docs.searchDocs({ embedding: query, projectKey: 'demo', k: 2, run }).then((r) => r.map((h) => h.text));
+    for (const s of [store, pinned]) {
+      expect(await docs(s)).toEqual(['demo 0', 'demo 1']);
+      expect(await docs(s, 'other-run')).toEqual(['demo 0', 'demo 1']);
+      expect((await docs(s, 'sbx-1')).every((t) => t.startsWith('sandbox'))).toBe(true);
+    }
+    expect(await indexesUsed(pinned.db, searchDocsQuery(pinned.db, { embedding: query, projectKey: 'demo', k: 2, run: 'other-run' }))).toContain('chunks_embedding');
+  });
 });

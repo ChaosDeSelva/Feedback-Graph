@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { askJson, chunkText, providerUnavailableReason, redactSecrets, type ActivityStore, type CodeFact, type DocsStore, type DocToRead, type LlmProvider } from '@fb/core';
+import { askJson, chunkText, holdsCredential, providerUnavailableReason, redactSecrets, type ActivityStore, type CodeFact, type DocsStore, type DocToRead, type LlmProvider } from '@fb/core';
 import { FACT_JSON, FactSchema, MIN_CONFIDENCE, RELEVANCE_RUBRIC } from '../scan/scan.ts';
 
 export type ReadDeps = {
@@ -28,6 +28,11 @@ const TextResult = z.object({ summary: z.string().default(''), facts: z.array(Fa
 const ImageResult = z.object({ description: z.string().min(1), facts: z.array(FactSchema).max(30) });
 
 const factsJson = { type: 'array', items: FACT_JSON };
+
+/** Like the Ask pack's fences: a line of the upload starting with --- or === is quoted, so it cannot close ours. */
+const defuse = (s: string) => s.replace(/^(\s*)(===|---)/gm, '$1> $2');
+const oneLine = (s: string) => defuse(s.replace(/\s+/g, ' ').trim()).slice(0, 200);
+const fenced = (label: string, text: string) => `--- begin untrusted document ${oneLine(label)} ---\n${defuse(text)}\n--- end of untrusted document ---`;
 
 /**
  * One upload read into facts (the oldest waiting). A text document: facts from its text. An image: a description of
@@ -66,7 +71,7 @@ Then: ${WHAT_TO_KEEP} At most ${MAX_FACTS} facts.`,
     } else {
       facts = (await askJson(d.llm, {
         system: `You read one document a developer uploaded as context for their software project. ${WHAT_TO_KEEP} At most ${MAX_FACTS} facts.`,
-        user: `DOCUMENT: ${job.title} (${job.ref})\n\n${redactSecrets(job.text.slice(0, MAX_DOC_CHARS))}`,
+        user: `DOCUMENT: ${oneLine(job.title)} (${oneLine(job.ref)})\n\n${fenced(job.title, redactSecrets(job.text.slice(0, MAX_DOC_CHARS)))}`,
         schema: { type: 'object', required: ['summary', 'facts'], properties: { summary: { type: 'string', description: 'One sentence: what this document is' }, facts: factsJson } },
         timeoutMs: 300_000,
       }, (raw) => TextResult.parse(raw), { promptOnly: true })).facts;
@@ -88,10 +93,12 @@ Then: ${WHAT_TO_KEEP} At most ${MAX_FACTS} facts.`,
 }
 
 async function saveReading(d: ReadDeps, job: DocToRead, facts: CodeFact[], description: string | null): Promise<{ read: boolean }> {
-  const kept = facts
-    .filter((f) => f.confidence >= MIN_CONFIDENCE)
-    .slice(0, MAX_FACTS)
+  const confident = facts.filter((f) => f.confidence >= MIN_CONFIDENCE).slice(0, MAX_FACTS);
+  // A fact that is a credential ("the admin password is ...") would reach agents ranked high: never kept.
+  const kept = confident
+    .filter((f) => !holdsCredential(f.statement))
     .map((f) => ({ ...f, path: job.ref, statement: redactSecrets(f.statement), why: redactSecrets(f.why) }));
+  const credentials = confident.length - kept.length;
   const vectors = kept.length ? await d.embed(kept.map((f) => `${f.path}: ${f.statement}`)) : [];
   const chunks = description ? chunkText(`Image "${job.title}" (${job.ref}): ${description}`) : null;
   const chunkVectors = chunks ? await d.embed(chunks) : [];
@@ -106,8 +113,9 @@ async function saveReading(d: ReadDeps, job: DocToRead, facts: CodeFact[], descr
   await d.activity?.record({
     kind: 'doc_read', actor: d.llm.id, projectKey: job.projectKey,
     subject: `read "${job.title}": ${kept.length} fact${kept.length === 1 ? '' : 's'}`,
-    why: job.image ? 'you uploaded this image; its description is now searchable and its facts reach agents' : 'you uploaded this document; its facts reach agents ranked by relevance',
-    details: { kind: job.kind, facts: kept.map((f) => ({ kind: f.kind, statement: f.statement, relevance: f.relevance ?? null })), ...(description ? { description: description.slice(0, 2000) } : {}) },
+    why: (job.image ? 'you uploaded this image; its description is now searchable and its facts reach agents' : 'you uploaded this document; its facts reach agents ranked by relevance')
+      + (credentials ? `; ${credentials} fact${credentials === 1 ? '' : 's'} held a credential and ${credentials === 1 ? 'was' : 'were'} not kept (remove the secret from the upload and rotate it)` : ''),
+    details: { kind: job.kind, ...(credentials ? { credentialFactsDropped: credentials } : {}), facts: kept.map((f) => ({ kind: f.kind, statement: f.statement, relevance: f.relevance ?? null })), ...(description ? { description: description.slice(0, 2000) } : {}) },
     targets: [job.id],
   });
   return { read: true };

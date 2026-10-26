@@ -1,5 +1,6 @@
 import type { HumanTurn, ParsedSession, ToolCall } from '@fb/core';
 import { isGitCommit, redactSecrets } from '@fb/core';
+import { addInstructionFiles, claudeInstructionFiles } from './instructions.ts';
 
 const MAX_ASSISTANT_CHARS = 2000;
 
@@ -63,6 +64,7 @@ export function parseTranscript(text: string, sourceFile: string): ParsedSession
     if (s.gitBranch === null && rec.gitBranch) s.gitBranch = rec.gitBranch;
     if (rec.gitBranch) state.lastBranch = rec.gitBranch;
     if (rec.isSidechain) continue;
+    addInstructionFiles(s.instructionFiles!, claudeInstructionFiles(rec as Record<string, unknown>));
 
     if (rec.type === 'assistant') {
       readAssistant(rec, state);
@@ -116,6 +118,7 @@ function sessionFor(sessions: Map<string, SessionState>, rec: RawRecord, sourceF
         endedAt: rec.timestamp!,
         turns: [],
         toolCalls: [],
+        instructionFiles: [],
       },
       lastAssistantText: '',
       lastAssistantTs: '',

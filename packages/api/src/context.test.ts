@@ -1,6 +1,6 @@
 import { shownProjects, type ActivityInput, type Lesson } from '@fb/core';
 import { describe, expect, test } from 'vitest';
-import { checkBeforeDone, getImpact, getModuleContext, getTaskContext, hashRepoFile, makeJudge, reportFeedback, resolveProject, taskFiles, trackedProject, type ContextDeps } from './context.ts';
+import { checkBeforeDone, getImpact, getModuleContext, getTaskContext, hashRepoFile, makeJudge, reportFeedback, resolveProject, searchGraph, taskFiles, trackedProject, type ContextDeps } from './context.ts';
 
 const roots = [{ host: '/Users/j/Vibe', container: '/vibe' }];
 const lesson = (id: string, title: string, over: Partial<Lesson> = {}): Lesson => ({
@@ -97,7 +97,8 @@ test('reportFeedback passes the session id, and says so when the report joined t
   expect(d.manual[0]).toMatchObject({ sessionId: 'sess-7' });
   expect(r.id).toBe('sess-7-t3');
   expect(r.markdown).toMatch(/already in the Feedback Graph inbox/i);
-  expect(recorded[0]).toMatchObject({ kind: 'candidate_flagged', targets: ['sess-7-t3'], details: { merged: true, sessionId: 'sess-7' } });
+  // The session is a target too, so its evidence (GET /api/sessions/:id/evidence) finds the report.
+  expect(recorded[0]).toMatchObject({ kind: 'candidate_flagged', targets: ['sess-7-t3', 'sess-7'], details: { merged: true, sessionId: 'sess-7' } });
   expect(recorded[0].why).toMatch(/same miss/);
 });
 
@@ -394,21 +395,45 @@ describe('global lessons in folders that are not selected', () => {
 
   test('get_task_context serves only global approved lessons there, reads nothing of the folder, and says how to get more', async () => {
     const { d, asked, recorded } = unselected();
-    const r = await getTaskContext({ cwd: '/Users/j/Vibe/side-project/src', task: 'add a flag' }, d);
+    const r = await getTaskContext({ cwd: '/Users/j/Vibe/side-project/src', task: 'add a flag, with tests' }, d);
     expect(asked).toEqual(['lessons:null']);
     expect(r.lessons.map((h) => h.lesson.id)).toEqual(['g1']);
     expect(r.markdown).toContain('Run the tests before saying done rule');
     expect(r.markdown).toMatch(/side-project is not selected/);
     expect(r.markdown).toMatch(/Settings/);
     expect(r.misses).toEqual([]);
-    expect(recorded).toEqual([expect.objectContaining({ kind: 'context_served', projectKey: 'side-project', targets: ['g1'] })]);
+    // Activity notes that global lessons were served, never the task, nor which unselected folder asked.
+    expect(recorded).toEqual([expect.objectContaining({ kind: 'context_served', projectKey: null, targets: ['g1'], details: { globalOnly: true, project: 'unselected', lessons: ['g1'] } })]);
+    expect(JSON.stringify(recorded)).not.toMatch(/add a flag|side-project/);
   });
 
-  test('check_before_done there judges the work against global lessons only', async () => {
-    const { d, asked } = unselected();
-    const r = await checkBeforeDone({ cwd: '/Users/j/Vibe/side-project', task: 't', summary: 's' }, { ...d, judge: async () => [{ lessonId: 'g1', status: 'not_addressed', why: 'no tests run' }] });
+  test('get_task_context with brief and search_graph there record no task, query or folder either', async () => {
+    const { d, recorded } = unselected();
+    // On the global lesson's topic (tests), so it is served (a global lesson off the task's topic is not).
+    expect((await getTaskContext({ cwd: '/Users/j/Vibe/side-project', task: 'add a flag and run the tests', brief: true }, d)).lessons.map((h) => h.lesson.id)).toEqual(['g1']);
+    expect((await searchGraph({ cwd: '/Users/j/Vibe/side-project', query: 'add a flag and run the tests' }, d)).markdown).toContain('Run the tests before saying done');
+    expect(recorded).toHaveLength(2);
+    expect(recorded.every((a) => a.projectKey === null && a.details?.project === 'unselected')).toBe(true);
+    expect(JSON.stringify(recorded)).not.toMatch(/add a flag|side-project/);
+  });
+
+  test('check_before_done there sends nothing to the judge: it lists the global lessons as not judged, and keeps no summary', async () => {
+    const { d, asked, recorded } = unselected();
+    const judged: unknown[] = [];
+    const checks: unknown[] = [];
+    const r = await checkBeforeDone(
+      // On the global lesson's topic (tests): check_before_done judges only what get_task_context would serve.
+      { cwd: '/Users/j/Vibe/side-project', task: 'add a flag and run the tests', summary: 'added the flag', diff: 'diff --git a/x b/x' },
+      { ...d, judge: async (...a) => { judged.push(a); return [{ lessonId: 'g1', status: 'not_addressed', why: 'no tests run' }]; }, k: { ...d.k, recordPreDoneCheck: async (x) => { checks.push(x); } } },
+    );
     expect(asked).toEqual(['lessons:null']);
-    expect(r.gaps.map((g) => g.lessonId)).toEqual(['g1']);
+    expect(judged).toEqual([]);
+    expect(checks).toEqual([]);
+    expect(r.gaps).toEqual([]);
+    expect(r.markdown).toMatch(/not judged: side-project is not selected/i);
+    expect(r.markdown).toContain('Run the tests before saying done');
+    expect(recorded).toEqual([expect.objectContaining({ kind: 'predone_check', projectKey: null, targets: ['g1'], details: { globalOnly: true, project: 'unselected', lessons: ['g1'] } })]);
+    expect(JSON.stringify(recorded)).not.toMatch(/add a flag|added the flag|side-project|diff --git/);
   });
 
   test('an excluded folder, or a clone of an excluded project, still gets nothing at all', async () => {
@@ -462,6 +487,68 @@ test('lessons whose paths match the files the agent will touch rank first, even 
   expect(r.markdown.indexOf('Pool connections')).toBeLessThan(r.markdown.indexOf('Server-side search'));
 });
 
+test('check_before_done judges what get_task_context would serve: no off-topic global lesson, none under the floor, but a lesson tied to a changed file however it scored', async () => {
+  const retention = lesson('g-retention', 'Purge audit records only through the retention job', {
+    projectKey: null, origin: 'acme', scope: 'global', paths: ['app/jobs/retention.ts'],
+    rule: 'Expired audit rows are removed by app/jobs/retention.ts on its schedule; never delete them by hand.',
+    appliesWhen: 'changing how long data is kept, purging or archiving records',
+  });
+  const own = lesson('l-own', 'Members are scoped by organisation', { rule: 'Filter members by org_id.' });
+  const faint = lesson('l-faint', 'Cache invalidation on writes', { rule: 'Bust the cache on every write.' });
+  const pooled = lesson('l-pool', 'Release pooled clients', { rule: 'Release the client in finally.', paths: ['src/db/pool.ts'] });
+  const judged: string[][] = [];
+  const d = deps({
+    k: { ...deps().k, searchLessons: async () => [{ lesson: retention, score: 0.77 }, { lesson: own, score: 0.7 }, { lesson: faint, score: 0.12 }, { lesson: pooled, score: 0.1 }] },
+    codegraph: { lessonsForPaths: async () => [{ lesson: pooled, paths: ['src/db/pool.ts'] }] },
+    judge: async (_w, ls) => { judged.push(ls.map((h) => h.lesson.id)); return []; },
+  });
+  await checkBeforeDone({ cwd: '/Users/j/Vibe/demo', task: 'add pagination to the members list', summary: 'added a cursor', filesChanged: ['src/db/pool.ts'] }, d);
+  expect(judged).toEqual([['l-pool', 'l-own']]);
+});
+
+test('a diff over the judge\'s budget keeps the files the judged lessons (or misses) name first, and says which were cut', async () => {
+  const file = (p: string, n = 6000) => `diff --git a/${p} b/${p}\n--- a/${p}\n+++ b/${p}\n@@ -1 +1 @@\n-x\n+${'y'.repeat(n)}\n`;
+  const filler = Array.from({ length: 8 }, (_, i) => file(`web/page${i}.tsx`)).join('');
+  const diff = filler + file('src/db/pool.ts', 3000);
+  const seen: string[] = [];
+  const pooled = lesson('l-pool', 'Release pooled clients', { rule: 'Release the client in finally.', paths: ['src/db/**'] });
+  const d = deps({
+    k: { ...deps().k, searchLessons: async () => [{ lesson: pooled, score: 0.8 }] },
+    judge: async (w) => { seen.push(w.diff ?? ''); return [{ lessonId: 'l-pool', status: 'addressed', applies: true, why: 'released in finally' }]; },
+  });
+  const r = await checkBeforeDone({ project: 'demo', task: 'tune the pool', summary: 'pool size', diff }, d);
+  expect(seen[0]).toContain('diff --git a/src/db/pool.ts');
+  expect(seen[0].indexOf('src/db/pool.ts')).toBeLessThan(seen[0].indexOf('web/page0.tsx'));
+  expect(r.markdown).toMatch(/files not shown: web\/page/);
+  // No lesson: the misses it is judged against name the file instead.
+  const misses: string[] = [];
+  const m = deps({
+    k: { ...deps().k, searchLessons: async () => [], relatedMisses: async () => [{ missId: 'm1', missed: 'left a client checked out in src/db/pool.ts', cause: 'implementation_error', feedbackText: 'leak', sessionId: 's1', ts: '2026-10-01T10:00:00Z', score: 0.8 }] },
+    judge: async (w) => { misses.push(w.diff ?? ''); return []; },
+  });
+  await checkBeforeDone({ project: 'demo', task: 'tune the pool', summary: 'pool size', diff }, m);
+  expect(misses[0]).toContain('diff --git a/src/db/pool.ts');
+});
+
+test('a global lesson about another topic is not served however the embedding scored it; one on the task\'s topic is', async () => {
+  const retention = lesson('g-retention', 'Purge audit records only through the retention job', {
+    projectKey: null, origin: 'acme', scope: 'global', paths: ['app/jobs/retention.ts'],
+    rule: 'Expired audit rows are removed by app/jobs/retention.ts on its schedule; never delete them by hand.',
+    appliesWhen: 'changing how long data is kept, purging or archiving records',
+  });
+  const cursor = lesson('g-cursor', 'Paginate with a cursor, never OFFSET', {
+    projectKey: null, origin: 'acme', scope: 'global', rule: 'Every endpoint returning many rows takes an after=<id> cursor.', appliesWhen: 'adding an endpoint that returns many rows',
+  });
+  const own = lesson('l-own', 'Members are scoped by organisation', { rule: 'Filter members by org_id.' });
+  const d = deps({ k: { ...deps().k, searchLessons: async () => [{ lesson: retention, score: 0.77 }, { lesson: cursor, score: 0.74 }, { lesson: own, score: 0.7 }] } });
+  const task = 'add pagination to the members list';
+  const r = await getTaskContext({ cwd: '/Users/j/Vibe/demo', task }, d);
+  expect(r.lessons.map((h) => h.lesson.id)).toEqual(['g-cursor', 'l-own']);
+  expect(r.markdown).not.toContain('retention');
+  const brief = await getTaskContext({ cwd: '/Users/j/Vibe/demo', task, brief: true }, d);
+  expect(brief.lessons.map((h) => h.lesson.id)).toEqual(['g-cursor', 'l-own']);
+});
+
 test('without files, or without a code graph, lessons rank by the search alone', async () => {
   let called = false;
   const d = deps({ codegraph: { lessonsForPaths: async () => { called = true; return []; } } });
@@ -499,7 +586,7 @@ describe('lessons learned in a project that is not selected are never served to 
 
   test('get_task_context and check_before_done search only lessons learned in the selected projects', async () => {
     const { d, asked } = scoped();
-    const r = await getTaskContext({ cwd: '/Users/j/Vibe/demo', task: 't', files: ['src/a.ts'] }, d);
+    const r = await getTaskContext({ cwd: '/Users/j/Vibe/demo', task: 'add search', files: ['src/a.ts'] }, d);
     expect(r.lessons.map((h) => h.lesson.id)).toEqual(['l1', 'g-any']);
     await checkBeforeDone({ project: 'demo', task: 't', summary: 's' }, d);
     // A folder that is not selected gets global lessons, still only ones learned in a selected project.
@@ -643,6 +730,39 @@ describe('when no lesson is approved yet', () => {
     const r = await checkBeforeDone({ project: 'demo', task: 't', summary: 's' }, d);
     expect(r.markdown).toMatch(/not a pass/i);
     expect(r.markdown).toContain('No confirmed miss resembles this work; 7 lessons are unapproved, so this is not a pass.');
+  });
+});
+
+describe('lesson counts: the project\'s own and the global ones, each said for what it is', () => {
+  const mk = (n: number, projectKey: string | null, status: 'proposed' | 'approved') => Array.from({ length: n }, (_, i) => lesson(`${projectKey ?? 'g'}${status}${i}`, `L ${i}`, { projectKey, scope: projectKey ? 'project' : 'global', status }));
+  // What listLessons returns for a project: its own lessons and the global ones.
+  const listing = (own: number, global: number, approvedGlobal = 0) => async (f: { status?: string }) =>
+    f.status === 'proposed' ? [...mk(own, 'demo', 'proposed'), ...mk(global, null, 'proposed')] : f.status === 'approved' ? mk(approvedGlobal, null, 'approved') : [];
+  const k = (l: ReturnType<typeof listing>) => ({ ...deps().k, searchLessons: async () => [], relatedMisses: async () => [], listLessons: l }) as ContextDeps['k'];
+
+  test('a project with no lesson of its own is never told the global ones are its own', async () => {
+    const r = await getTaskContext({ project: 'demo', task: 'add members list' }, deps({ k: k(listing(0, 25)) }));
+    expect(r.markdown).toContain('No lesson is proposed or approved for demo; 25 global lessons are proposed, waiting on the Lessons page.');
+    expect(r.markdown).not.toMatch(/25 proposed/);
+  });
+
+  test('own and global proposed lessons are counted apart', async () => {
+    const r = await getTaskContext({ project: 'demo', task: 'add members list' }, deps({ k: k(listing(3, 25)) }));
+    expect(r.markdown).toContain('No lesson is approved for demo yet (3 proposed for demo and 25 global, waiting on the Lessons page).');
+    const one = await getTaskContext({ project: 'demo', task: 'x' }, deps({ k: k(listing(0, 1)) }));
+    expect(one.markdown).toContain('No lesson is proposed or approved for demo; 1 global lesson is proposed, waiting on the Lessons page.');
+  });
+
+  test('check_before_done with nothing to check counts own and global apart too', async () => {
+    const r = await checkBeforeDone({ project: 'demo', task: 't', summary: 's' }, deps({ k: k(listing(0, 25)) }));
+    expect(r.markdown).toContain('No confirmed miss resembles this work; demo has no lesson of its own and 25 global lessons are unapproved, so this is not a pass.');
+    const both = await checkBeforeDone({ project: 'demo', task: 't', summary: 's' }, deps({ k: k(listing(2, 25)) }));
+    expect(both.markdown).toContain('No confirmed miss resembles this work; 2 lessons for demo and 25 global lessons are unapproved, so this is not a pass.');
+  });
+
+  test('an approved global lesson that does not match is named as global, not as the project\'s', async () => {
+    const r = await getTaskContext({ project: 'demo', task: 'add members list' }, deps({ k: k(listing(0, 4, 2)) }));
+    expect(r.markdown).toContain('No approved lessons match this task yet (demo has no approved lesson of its own; 2 global lessons are approved).');
   });
 });
 
@@ -816,6 +936,13 @@ describe('what reaches the agent: misses', () => {
     }
   });
 
+  test('what the developer said is redacted again as it is served (feedback stored under older rules)', async () => {
+    const d = deps({ k: { ...deps().k, relatedMisses: async () => [rm('m1', 'client-side filtering', 0.8, 'no, the staging password is hunter2, use it')] } });
+    const r = await getTaskContext({ project: 'demo', task: 't' }, d);
+    expect(r.markdown).toContain('developer said: "no, the staging password is [REDACTED], use it"');
+    expect(r.markdown).not.toContain('hunter2');
+  });
+
   test('an empty doc excerpt adds no empty quote line', async () => {
     const d = deps({ docs: { searchDocs: async () => [{ docId: 'x', source: 'github', ref: 'github:a/b#1', title: 'PR', url: null, text: '  ', score: 0.9 }] } });
     const r = await getTaskContext({ project: 'demo', task: 't' }, d);
@@ -843,5 +970,133 @@ describe('what reaches the agent: misses', () => {
     const r = await getTaskContext({ project: 'demo', task: 'list members', files: ['src/webapp/core/settings/users/router.ts'] }, d);
     expect(asked).toBeGreaterThan(4);
     expect(r.misses.map((m) => m.missId)).toEqual(['mw', 'mg']);
+  });
+});
+
+describe('check_before_done judges the diff', () => {
+  // The work: an orders route that went through db.raw() (the lesson: always db.scoped) and is now scoped, plus a
+  // new endpoint that still reads db.raw().
+  const DIFF = `diff --git a/src/routes/orders.ts b/src/routes/orders.ts
+index 3b18e51..a9c4f2d 100644
+--- a/src/routes/orders.ts
++++ b/src/routes/orders.ts
+@@ -4,6 +4,11 @@ import { sendJson, type Req } from '../http.ts';
+ export function listOrders(req: Req, res: ServerResponse) {
+-  sendJson(res, 200, db.raw().list('orders'));
++  sendJson(res, 200, paginate(db.scoped(req.auth.orgId).list('orders'), req.query));
++}
++
++export function exportOrders(req: Req, res: ServerResponse) {
++  sendJson(res, 200, db.raw().list('orders'));
+ }
+`;
+  const lessons = [
+    { lesson: lesson('l1', 'Tenant scoping', { rule: 'Every query goes through db.scoped(orgId), never db.raw()', paths: ['src/routes/orders.ts'] }), score: 0.9 },
+    { lesson: lesson('l2', 'Paginate lists', { rule: 'List endpoints paginate server-side', paths: ['src/routes/orders.ts'] }), score: 0.8 },
+  ];
+  const withLessons = (over: Partial<ContextDeps>) => {
+    const d = deps(over);
+    d.k = { ...d.k, searchLessons: async () => lessons };
+    return d;
+  };
+
+  test('a gap cites the diff line it rests on; a pass with evidence stays a pass', async () => {
+    let seen = '';
+    const d = withLessons({
+      judge: async (w) => {
+        seen = w.diff ?? '';
+        return [
+          { lessonId: 'l1', status: 'not_addressed', applies: true, why: 'exportOrders still reads db.raw()', evidence: ["+  sendJson(res, 200, db.raw().list('orders'));"] },
+          { lessonId: 'l2', status: 'addressed', applies: true, why: 'listOrders paginates', evidence: ["paginate(db.scoped(req.auth.orgId).list('orders'), req.query)"] },
+        ];
+      },
+    });
+    const r = await checkBeforeDone({ project: 'demo', task: 'orders export', summary: 'added export', diff: DIFF }, d);
+    expect(seen).toBe(DIFF);
+    expect(r.gaps.map((g) => g.lessonId)).toEqual(['l1']);
+    // The first matching line: the removed one in listOrders reads the same as the added one in exportOrders.
+    expect(r.gaps[0].evidence).toEqual([{ path: 'src/routes/orders.ts', hunk: "@@ -4,6 +4,11 @@ import { sendJson, type Req } from '../http.ts';", line: "+  sendJson(res, 200, db.raw().list('orders'));" }]);
+    expect(r.markdown).toContain('`src/routes/orders.ts` @@ -4,6 +4,11 @@');
+    expect(r.markdown).toContain("db.raw().list('orders')");
+    expect(r.markdown).not.toMatch(/cannot tell/i);
+  });
+
+  test('a verdict that cites nothing in the diff becomes "cannot tell from the diff": not a gap, never a pass', async () => {
+    const d = withLessons({
+      judge: async () => [
+        { lessonId: 'l1', status: 'addressed', applies: true, why: 'looks scoped' },
+        { lessonId: 'l2', status: 'not_addressed', applies: true, why: 'no pagination', evidence: ['rateLimit(req, res);'] },
+      ],
+    });
+    const r = await checkBeforeDone({ project: 'demo', task: 'orders export', summary: 'added export', diff: DIFF }, d);
+    expect(r.gaps).toEqual([]);
+    expect(r.cannotTell?.map((c) => c.lessonId)).toEqual(['l1', 'l2']);
+    expect(r.markdown).toMatch(/cannot tell from the diff/i);
+    expect(r.markdown).not.toMatch(/none looks unaddressed/);
+    expect(r.markdown).toContain('Tenant scoping');
+    expect(d.checks[0]).toMatchObject({ gapLessonIds: [] });
+  });
+
+  test('a lesson the judge says does not apply needs no evidence', async () => {
+    const d = withLessons({
+      judge: async () => [
+        { lessonId: 'l1', status: 'addressed', applies: true, why: 'scoped', evidence: ["+  sendJson(res, 200, paginate(db.scoped(req.auth.orgId).list('orders'), req.query));"] },
+        { lessonId: 'l2', status: 'not_applicable', applies: false, why: 'about another feature' },
+      ],
+    });
+    const r = await checkBeforeDone({ project: 'demo', task: 't', summary: 's', diff: DIFF }, d);
+    expect(r.gaps).toEqual([]);
+    expect(r.cannotTell ?? []).toEqual([]);
+    expect(r.markdown).toMatch(/none looks unaddressed/);
+  });
+
+  test('with no diff given, the diff of files_changed is read from the repo and judged', async () => {
+    const asked: [string, string[]][] = [];
+    let seen = '';
+    const d = withLessons({
+      repoDiff: async (repoPath, files) => { asked.push([repoPath, files]); return { text: DIFF, files: ['src/routes/orders.ts'] }; },
+      judge: async (w) => { seen = w.diff ?? ''; return [{ lessonId: 'l1', status: 'not_addressed', applies: true, why: 'raw', evidence: ["db.raw().list('orders')"] }, { lessonId: 'l2', status: 'not_applicable', applies: false, why: 'no list here' }]; },
+    });
+    const r = await checkBeforeDone({ cwd: '/Users/j/Vibe/demo', task: 't', summary: 's', filesChanged: ['src/routes/orders.ts'] }, d);
+    expect(asked).toEqual([['/vibe/demo', ['src/routes/orders.ts']]]);
+    expect(seen).toBe(DIFF);
+    expect(r.markdown).toMatch(/read from the repo/i);
+    expect(r.gaps.map((g) => g.lessonId)).toEqual(['l1']);
+  });
+
+  test('a diff over the budget is cut, and the answer names the files the judge did not see', async () => {
+    const big = `diff --git a/src/big.ts b/src/big.ts\n--- a/src/big.ts\n+++ b/src/big.ts\n@@ -1 +1,3000 @@\n${Array.from({ length: 3000 }, (_, i) => `+export const v${i} = ${i}; // ${'x'.repeat(20)}`).join('\n')}\n`;
+    let seen = '';
+    const d = withLessons({ judge: async (w) => { seen = w.diff ?? ''; return []; } });
+    const r = await checkBeforeDone({ project: 'demo', task: 't', summary: 's', diff: DIFF + big }, d);
+    expect(seen).toContain('exportOrders');
+    expect(seen).not.toContain('v2999');
+    expect(r.markdown).toMatch(/diff cut at [\d.]+ KB, files not shown: src\/big\.ts/);
+  });
+
+  test('no diff and nothing to read it from: judged from the summary, and the answer says so', async () => {
+    const d = withLessons({ judge: async () => [{ lessonId: 'l1', status: 'addressed', applies: true, why: 'the summary says so' }, { lessonId: 'l2', status: 'addressed', applies: true, why: 'ok' }] });
+    const r = await checkBeforeDone({ project: 'demo', task: 't', summary: 's' }, d);
+    expect(r.cannotTell ?? []).toEqual([]);
+    expect(r.markdown).toMatch(/no diff/i);
+    expect(r.markdown).toMatch(/summary only/i);
+  });
+
+  test('makeJudge asks for evidence lines from the diff and passes them through, cannot_tell included', async () => {
+    let schema: unknown;
+    let system = '';
+    const judge = makeJudge({ id: 'f', agentic: false, json: async (t) => { schema = t.schema; system = t.system; return { verdicts: [
+      { lessonId: 'L1', status: 'not_addressed', applies: true, why: 'raw', evidence: ["+  sendJson(res, 200, db.raw().list('orders'));"] },
+      { lessonId: 'L2', status: 'cannot_tell', applies: true, why: 'the diff does not show the list call' },
+    ] }; } });
+    const out = await judge({ task: 't', summary: 's', diff: DIFF }, lessons);
+    expect(out).toEqual([
+      { lessonId: 'l1', status: 'not_addressed', applies: true, why: 'raw', evidence: ["+  sendJson(res, 200, db.raw().list('orders'));"] },
+      { lessonId: 'l2', status: 'cannot_tell', applies: true, why: 'the diff does not show the list call' },
+    ]);
+    expect(JSON.stringify(schema)).toContain('"evidence"');
+    expect(JSON.stringify(schema)).toContain('cannot_tell');
+    expect(system).toMatch(/evidence/i);
+    expect(system).toMatch(/copy/i);
   });
 });

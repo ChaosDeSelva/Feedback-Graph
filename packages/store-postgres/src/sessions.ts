@@ -3,6 +3,8 @@ import {
   readSummary,
   redactDeep,
   redactSecrets,
+  redactStoredRow,
+  REDACT_PAGE,
   summaryRetryAt,
   summarySnippet,
   type CandidateStatus,
@@ -17,6 +19,8 @@ import {
   type SummaryWork,
   type SummaryWorkQuery,
   type SummaryWrite,
+  type TurnEvidence,
+  type TurnLabel,
 } from '@fb/core';
 import { iso, toJson, tx, type Db } from './db.ts';
 import { turnOf } from './graph.ts';
@@ -234,5 +238,40 @@ export class PgSessionsStore implements SessionsStore {
       [sessionId],
     );
     return !!rowCount;
+  }
+
+  async redactStoredSummaries(): Promise<number> {
+    let changed = 0;
+    for (let after = ''; ;) {
+      const { rows } = await this.q(
+        `SELECT id, summary, final_reply_text FROM sessions
+          WHERE id > $1 AND (summary IS NOT NULL OR final_reply_text IS NOT NULL) ORDER BY id LIMIT $2`,
+        [after, REDACT_PAGE],
+      );
+      if (!rows.length) break;
+      after = rows[rows.length - 1].id;
+      const page = rows.flatMap((r: Record<string, unknown>) => redactStoredRow(r, ['final_reply_text'], ['summary']) ?? []);
+      if (!page.length) continue;
+      await this.q(
+        `UPDATE sessions x SET summary = c.summary, final_reply_text = c.final_reply_text
+         FROM jsonb_to_recordset($1::jsonb) AS c(id text, summary jsonb, final_reply_text text) WHERE x.id = c.id`,
+        [toJson(page)],
+      );
+      changed += page.length;
+    }
+    return changed;
+  }
+
+  async turnEvidence(sessionId: string): Promise<TurnEvidence[]> {
+    const { rows } = await this.q(
+      `SELECT t.uuid, t.idx, t.ts_text, t.label, t.confidence, t.summary, coalesce(t.signals, '{}') AS signals, t.classify_attempts, k.id AS candidate_id
+       FROM turns t LEFT JOIN LATERAL (SELECT min(c.id) AS id FROM candidates c WHERE c.turn_uuid = t.uuid) k ON true
+       WHERE t.session_id = $1 ORDER BY t.idx, t.uuid`,
+      [sessionId],
+    );
+    return rows.map((r) => ({
+      uuid: r.uuid, index: r.idx, ts: r.ts_text, label: (r.label as TurnLabel) ?? null, confidence: r.confidence ?? null, summary: r.summary ?? null,
+      signals: r.signals ?? [], classifyAttempts: r.classify_attempts ?? 0, candidateId: r.candidate_id ?? null,
+    }));
   }
 }

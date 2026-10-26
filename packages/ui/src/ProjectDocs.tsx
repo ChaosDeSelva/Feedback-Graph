@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { api, type DocSummary } from './api.ts';
 import { ConfirmDialog } from './ui/ConfirmDialog.tsx';
 import { Button, buttonClass } from './ui/controls.tsx';
@@ -20,6 +20,10 @@ const readFile = (f: File, as: 'text' | 'dataUrl') =>
     else r.readAsDataURL(f);
   });
 
+/** The API's page of documents when none is asked for, and the most one request may ask for. */
+const DOCS_PAGE = 100;
+const DOCS_MAX = 500;
+
 /** The server only accepts plain file names. */
 const safeName = (n: string) => n.replace(/[^\w .()-]/g, '_').replace(/^[^\w]+/, '') || 'document.txt';
 
@@ -40,10 +44,35 @@ function ReadState({ d }: { d: DocSummary }) {
  */
 export function ProjectDocs({ projectKey, onError, pollMs = 5000 }: { projectKey: string; onError: (e: string) => void; pollMs?: number }) {
   const [docs, setDocs] = useState<DocSummary[]>([]);
+  // Where the next (older) page starts; null when every document is shown.
+  const [next, setNext] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
-  const load = (stale = () => false) => api.docs(projectKey).then((d) => { if (!stale()) setDocs(d); }, (e) => { if (!stale()) onError(String(e)); });
+  const [loadingMore, setLoadingMore] = useState(false);
+  // A refresh reloads as many as are shown, so loading older ones is not undone by the next poll.
+  const shown = useRef(0);
+  shown.current = docs.length;
+  const load = (stale = () => false) =>
+    api.docs(projectKey, shown.current > DOCS_PAGE ? { limit: Math.min(shown.current, DOCS_MAX) } : {}).then(
+      (p) => { if (!stale()) { setDocs(p.items); setNext(p.next); } },
+      (e) => { if (!stale()) onError(String(e)); },
+    );
+  async function loadMore() {
+    if (!next) return;
+    setLoadingMore(true);
+    try {
+      const p = await api.docs(projectKey, { cursor: next });
+      setDocs((ds) => [...ds, ...p.items.filter((d) => !ds.some((x) => x.id === d.id))]);
+      setNext(p.next);
+    } catch (e) {
+      onError(String(e));
+    } finally {
+      setLoadingMore(false);
+    }
+  }
   useEffect(() => {
     let stale = false;
+    shown.current = 0;
+    setNext(null);
     load(() => stale);
     return () => { stale = true; };
   }, [projectKey]);
@@ -106,7 +135,7 @@ export function ProjectDocs({ projectKey, onError, pollMs = 5000 }: { projectKey
 
   return (
     <Card
-      title={`Docs and discussions (${docs.length})`}
+      title={`Docs and discussions (${docs.length}${next ? '+' : ''})`}
       actions={
         <label className={buttonClass('secondary', 'sm', `cursor-pointer focus-within:outline-2 focus-within:outline-focus ${busy ? 'opacity-60' : ''}`)}>
           <UploadIcon size={13} />
@@ -144,6 +173,13 @@ export function ProjectDocs({ projectKey, onError, pollMs = 5000 }: { projectKey
           </li>
         )}
       </ul>
+      {next && (
+        <div className="border-t border-line px-3 py-2">
+          <Button size="sm" variant="secondary" aria-label="load older docs" onClick={() => void loadMore()} disabled={loadingMore}>
+            {loadingMore ? 'loading…' : 'load older'}
+          </Button>
+        </div>
+      )}
       <ConfirmDialog
         open={!!removing}
         title="Remove this document?"

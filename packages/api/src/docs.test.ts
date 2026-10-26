@@ -71,6 +71,55 @@ test('uploading a file with the name of an existing upload says it replaced it',
   expect(recorded[0]).toMatchObject({ subject: 'replaced "Old spec" with "New spec" (1 chunk)' });
 });
 
+test('the docs list comes a page at a time, newest first, with x-next-cursor while more follow', async () => {
+  const all = Array.from({ length: 5 }, (_, i) => ({
+    id: `doc:shop:github:github:acme/shop#${i}`, projectKey: 'shop', source: 'github' as const, ref: `github:acme/shop#${i}`, title: `PR ${i}`, url: null,
+    addedAt: `2026-10-2${5 - i}T00:00:00.000Z`, addedBy: null, chunks: 1, kind: 'text' as const, mediaType: null, read: null,
+  }));
+  const asked: object[] = [];
+  const app = createApp(repo, {
+    embed: async (t) => t.map(() => [1]),
+    projectDirs: async () => [{ key: 'shop', name: 'shop', repoPath: '/vibe/shop' }],
+    docs: {
+      upsertDoc: async () => 'x',
+      deleteDoc: async () => true,
+      listDocs: async (_k, o = {}) => {
+        asked.push(o);
+        const from = o.after ? all.findIndex((d) => d.id === o.after!.id) + 1 : 0;
+        return all.slice(from, o.limit === undefined ? undefined : from + o.limit);
+      },
+    },
+  });
+  const first = await app.request('/api/projects/shop/docs?limit=2');
+  expect((await first.json()).map((d: { ref: string }) => d.ref)).toEqual(['github:acme/shop#0', 'github:acme/shop#1']);
+  // one more than the page is asked for, to know whether another follows
+  expect(asked[0]).toMatchObject({ limit: 3, after: null });
+  const cursor = first.headers.get('x-next-cursor');
+  expect(cursor).toBeTruthy();
+  const second = await app.request(`/api/projects/shop/docs?limit=2&cursor=${encodeURIComponent(cursor!)}`);
+  expect((await second.json()).map((d: { ref: string }) => d.ref)).toEqual(['github:acme/shop#2', 'github:acme/shop#3']);
+  const third = await app.request(`/api/projects/shop/docs?limit=2&cursor=${encodeURIComponent(second.headers.get('x-next-cursor')!)}`);
+  expect((await third.json()).map((d: { ref: string }) => d.ref)).toEqual(['github:acme/shop#4']);
+  expect(third.headers.get('x-next-cursor')).toBeNull();
+  // no limit: a page of the default size, never every document at once
+  await app.request('/api/projects/shop/docs');
+  expect(asked.at(-1)).toMatchObject({ limit: 101 });
+  expect((await app.request('/api/projects/shop/docs?cursor=nonsense')).status).toBe(400);
+  expect((await app.request('/api/projects/shop/docs?limit=100000')).status).toBe(400);
+});
+
+test('an upload looks up an earlier one with its name, not by listing every document', async () => {
+  const asked: object[] = [];
+  const app = createApp(repo, {
+    embed: async (t) => t.map(() => [1]),
+    projectDirs: async () => [{ key: 'shop', name: 'shop', repoPath: '/vibe/shop' }],
+    docs: { upsertDoc: async () => 'doc:shop:upload:spec.md', deleteDoc: async () => true, listDocs: async (_k, o) => { asked.push(o ?? {}); return []; } },
+  });
+  await app.request('/api/projects/shop/docs', post({ title: 'Spec', name: 'spec.md', text: 'v1' }));
+  // Two at most: the shared one of that name, and a sandbox run's own beside it.
+  expect(asked).toEqual([{ source: 'upload', ref: 'spec.md', limit: 2, run: null }]);
+});
+
 const png = Buffer.from('\x89PNG fake image').toString('base64');
 
 test('uploading an image stores it to be read, with a placeholder excerpt until it is', async () => {

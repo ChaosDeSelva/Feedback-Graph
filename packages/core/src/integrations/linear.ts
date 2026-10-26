@@ -15,7 +15,9 @@ export type LinearIssue = {
   description: string;
   url: string;
   state: string;
+  /** The team's key (ENG) and id: the id is what a project is mapped to (IntegrationLink.linearTeamId). */
   team: string;
+  teamId: string;
   updatedAt: string;
   comments: { author: string; body: string }[];
 };
@@ -34,7 +36,7 @@ const SEARCH = `query SearchIssues($term: String!, $first: Int) {
       description
       url
       state { name }
-      team { key }
+      team { id key }
       updatedAt
       comments(first: 10) { nodes { body user { name } } }
     }
@@ -47,7 +49,7 @@ const IssueNode = z.object({
   description: z.string().nullable().optional(),
   url: z.string(),
   state: z.object({ name: z.string() }).nullable().optional(),
-  team: z.object({ key: z.string() }).nullable().optional(),
+  team: z.object({ id: z.string().optional(), key: z.string() }).nullable().optional(),
   updatedAt: z.string(),
   comments: z
     .object({ nodes: z.array(z.object({ body: z.string().nullable().optional(), user: z.object({ name: z.string() }).nullable().optional() })) })
@@ -104,6 +106,7 @@ export async function searchLinearIssues(o: SearchLinearOpts): Promise<LinearIss
     url: n.url,
     state: n.state?.name ?? '',
     team: n.team?.key ?? '',
+    teamId: n.team?.id ?? '',
     updatedAt: n.updatedAt,
     comments: (n.comments?.nodes ?? [])
       .filter((c) => c.body && c.body.trim() !== '')

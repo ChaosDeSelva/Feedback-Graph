@@ -57,6 +57,29 @@ function pr(n: number, updated: string, extra: Record<string, unknown> = {}) {
 }
 
 describe('fetchPullRequestContext', () => {
+  test("each PR carries the files it changed (renamed files by their new path), what a session is matched to it by", async () => {
+    const { fetchImpl, calls } = mockFetch({
+      '/repos/acme/data-pipeline/pulls': [pr(12, '2026-10-20T00:00:00Z', { head: { ref: 'feat/batch-loader' } })],
+      '/repos/acme/data-pipeline/pulls/12/files': [
+        { filename: 'pipeline/load.py', status: 'modified' },
+        { filename: 'pipeline/retry.py', status: 'renamed', previous_filename: 'pipeline/backoff.py' },
+        { filename: 'tests/test_load.py', status: 'added' },
+      ],
+    });
+    const [out] = await fetchPullRequestContext({ repo: 'acme/data-pipeline', token: 'tok', fetchImpl });
+    expect(out.files).toEqual(['pipeline/load.py', 'pipeline/retry.py', 'tests/test_load.py']);
+    expect(calls.some((c) => c.url === 'https://api.github.com/repos/acme/data-pipeline/pulls/12/files?per_page=100')).toBe(true);
+  });
+
+  test('a PR whose file list cannot be read still syncs, with no files', async () => {
+    const { fetchImpl } = mockFetch({
+      '/repos/acme/data-pipeline/pulls': [pr(12, '2026-10-20T00:00:00Z')],
+      '/repos/acme/data-pipeline/pulls/12/files': () => new Response('server error', { status: 500 }),
+    });
+    const [out] = await fetchPullRequestContext({ repo: 'acme/data-pipeline', token: 'tok', fetchImpl });
+    expect(out.files).toBeUndefined();
+  });
+
   test('sends GitHub headers and collects review, issue, and review-body comments without bots or empties', async () => {
     const { fetchImpl, calls } = mockFetch({
       '/repos/acme/demo/pulls': [pr(7, '2026-10-20T00:00:00Z', { head: { ref: 'feat/dark' } })],
@@ -150,6 +173,29 @@ describe('fetchPullRequestContext', () => {
     const many = Array.from({ length: 45 }, (_, i) => pr(100 - i, `2026-10-20T00:${String(59 - i).padStart(2, '0')}:00Z`));
     const { fetchImpl } = mockFetch({ '/repos/acme/demo/pulls': many });
     expect(await fetchPullRequestContext({ repo: 'acme/demo', token: 't', fetchImpl })).toHaveLength(30);
+  });
+
+  test('an incremental sync stopped by its cap says how far back it read; a complete one says nothing', async () => {
+    const five = [5, 4, 3, 2, 1].map((n) => pr(n, `2026-10-2${n}T00:00:00Z`));
+    const { fetchImpl } = mockFetch({ '/repos/acme/demo/pulls': five });
+    const caps: string[] = [];
+    const out = await fetchPullRequestContext({ repo: 'acme/demo', token: 't', since: '2026-10-01T00:00:00Z', maxPrs: 3, fetchImpl, onCap: (t) => caps.push(t) });
+    expect(out.map((p) => p.number)).toEqual([5, 4, 3]);
+    // PRs updated after the cursor and before 10-23 were not read
+    expect(caps).toEqual(['2026-10-23T00:00:00Z']);
+    const done: string[] = [];
+    await fetchPullRequestContext({ repo: 'acme/demo', token: 't', since: '2026-10-01T00:00:00Z', maxPrs: 10, fetchImpl, onCap: (t) => done.push(t) });
+    expect(done).toEqual([]);
+  });
+
+  test('until skips the PRs a capped sync already read, without counting them against the cap', async () => {
+    const five = [5, 4, 3, 2, 1].map((n) => pr(n, `2026-10-2${n}T00:00:00Z`));
+    const { fetchImpl } = mockFetch({ '/repos/acme/demo/pulls': five });
+    const caps: string[] = [];
+    const out = await fetchPullRequestContext({ repo: 'acme/demo', token: 't', since: '2026-10-01T00:00:00Z', until: '2026-10-23T00:00:00Z', maxPrs: 2, fetchImpl, onCap: (t) => caps.push(t) });
+    // 10-23 itself was read (the cap stopped after it): reading it again is harmless, skipping one is not
+    expect(out.map((p) => p.number)).toEqual([3, 2]);
+    expect(caps).toEqual(['2026-10-22T00:00:00Z']);
   });
 
   test('follows Link rel=next pagination and respects maxPrs', async () => {

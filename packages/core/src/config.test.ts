@@ -249,11 +249,17 @@ test('an operator token lets agents make owner decisions; unset, there is none, 
   expect(op.token).toBe('o'.repeat(32));
   // By default not deciding lessons (what agents learn stays the owner's call), nor anything that deletes data, changes
   // what is mounted, imports lessons from a file, or touches integration keys.
-  const off = ['lesson_decide', 'delete_project', 'docs_delete', 'settings', 'import', 'integrations', 'chat', 'chat_delete'];
+  const off = ['lesson_decide', 'delete_project', 'docs_delete', 'settings', 'import', 'integrations', 'chat', 'chat_delete', 'select_projects', 'links_delete'];
+  // Which folders are read is the owner's opt-in; removing a link the owner decided is the owner's too.
+  expect(op.allow).not.toContain('select_projects');
+  expect(op.allow).not.toContain('links_delete');
+  expect(op.allow).toContain('links');
   // Asking in Ask spends the owner's Claude or Codex subscription: off unless OPERATOR_ALLOW names it.
   expect(op.allow).not.toContain('chat');
   expect(loadConfig({ ...base, FG_OPERATOR_TOKEN: 'o'.repeat(32), OPERATOR_ALLOW: 'scan,chat' }).operator!.allow).toContain('chat');
   expect(op.allow).toEqual(OPERATOR_VERBS.filter((v) => !off.includes(v)));
+  // Cleaning up after a test run deletes only what that run wrote: on by default.
+  expect(op.allow).toContain('run_cleanup');
 });
 
 test('OPERATOR_ALLOW narrows (or widens) what the operator token may do, and names only known verbs', () => {

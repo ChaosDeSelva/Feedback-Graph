@@ -19,6 +19,17 @@ export function outputTail(text: string, max = TAIL_CHARS): string {
   return flat.length <= max ? flat : `…${flat.slice(flat.length - (max - 1))}`;
 }
 
+/**
+ * Thrown by an askJson validator that refuses what the answer says (a rule field holding the scope word), not its
+ * shape: the one retry is told why, so the model can fix that field.
+ */
+export class AnswerRefused extends Error {
+  constructor(problem: string) {
+    super(problem);
+    this.name = 'AnswerRefused';
+  }
+}
+
 /** The model answered, but not with JSON of the asked shape. Not unavailability: it counts against the item. */
 export class ModelOutputError extends Error {
   /** The end of what came back (outputTail), so the owner can see it. */
@@ -130,11 +141,13 @@ const problemOf = (err: unknown) => (err instanceof Error ? err.message : String
  */
 export async function askJson<T>(llm: LlmProvider, task: JsonTask, validate: (raw: unknown) => T, o: { promptOnly?: boolean } = {}): Promise<T> {
   const ask = (t: JsonTask) => (o.promptOnly ? askPromptOnly(llm, t) : llm.json(t));
+  let refused: string | null = null;
   const once = async (t: JsonTask): Promise<T> => {
     const raw = await ask(t);
     try {
       return validate(raw);
     } catch (err) {
+      if (err instanceof AnswerRefused) refused = problemOf(err);
       throw new ModelOutputError(`the answer did not match the schema: ${problemOf(err)}`, shown(raw));
     }
   };
@@ -143,5 +156,5 @@ export async function askJson<T>(llm: LlmProvider, task: JsonTask, validate: (ra
   } catch (err) {
     if (!(err instanceof ModelOutputError)) throw err;
   }
-  return once({ ...task, system: `${task.system}\n\n${STRICT_JSON}` });
+  return once({ ...task, system: `${task.system}\n\n${STRICT_JSON}${refused ? `\nYour last answer was refused: ${refused}` : ''}` });
 }

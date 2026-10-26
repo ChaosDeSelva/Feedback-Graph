@@ -8,7 +8,7 @@ import { checkBeforeDone, getImpact, getModuleContext, getRecentSessions, getTas
  * Length limits on free text: every argument is embedded, searched or stored, so a runaway client (a 1 MB task was
  * seen) is refused here instead of costing an embedding and a megabyte Activity row.
  */
-const MAX = { path: 1000, key: 200, task: 8000, query: 2000, prose: 20_000, diff: 200_000 } as const;
+const MAX = { path: 1000, key: 200, task: 8000, query: 2000, prose: 20_000, diff: 900_000 } as const;
 
 const where = {
   cwd: z.string().max(MAX.path).optional().describe('Absolute path of the directory you are working in (preferred)'),
@@ -17,12 +17,21 @@ const where = {
 
 const text = (markdown: string) => ({ content: [{ type: 'text' as const, text: markdown }] });
 
+/**
+ * MCP ToolAnnotations. Codex will not call a tool without them, so every tool says what it is: the reads change nothing
+ * the agent would notice (the provenance log aside) and may be repeated; report_feedback queues a new inbox item each
+ * call, but never removes or overwrites anything. None reaches past this machine's graph.
+ */
+const read = (title: string) => ({ title, annotations: { title, readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false } });
+const write = (title: string) => ({ title, annotations: { title, readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false } });
+
 function buildServer(ctx: ContextDeps, client: string | undefined) {
   const server = new McpServer({ name: 'feedback-graph', version: VERSION });
 
   server.registerTool(
     'get_task_context',
     {
+      ...read('Task context'),
       description:
         'Before starting non-trivial work: returns approved lessons from past developer feedback and similar past misses in this project, with citations, the code and document facts that matter most for everyday work, and the best matches from projects the developer linked to this one. Name the files you expect to change: lessons tied to them come first, and a short code map shows their importers, tests and past misses. brief: true returns only the lessons, the misses on the named files, their importers and tests, and PR discussions, in about 1,500 characters.',
       inputSchema: {
@@ -39,22 +48,29 @@ function buildServer(ctx: ContextDeps, client: string | undefined) {
   server.registerTool(
     'check_before_done',
     {
+      ...read('Check before done'),
       description:
-        'Before telling the developer a task is done: checks your work against lessons from past feedback on similar work and lists likely gaps. Pass files_changed to also hear which importers and tests of those files your change did not touch, and what past misses there were about.',
+        'Before telling the developer a task is done: checks your work against lessons from past feedback on similar work and lists likely gaps, each with the diff lines it rests on. Pass diff (your git diff) and files_changed; with no diff, the diff of files_changed is read from the repo. Also says which importers and tests of those files your change did not touch, and what past misses there were about.',
       inputSchema: {
         ...where,
         task: z.string().max(MAX.task),
         summary: z.string().max(MAX.prose).describe('What you built and how you verified it'),
-        diff: z.string().max(MAX.diff).optional().describe('Optional unified diff of your changes'),
+        diff: z
+          .string()
+          .max(MAX.diff)
+          .optional()
+          .describe('Your change as a unified diff: `git diff <commit this session started from>` (staged, unstaged and committed; run `git add -N` on new files first). The judge reads about 32 KB of it, the files most related to the lessons first, then files_changed in order, and the answer names the files it cut. Omitted: the diff of files_changed is read from the repo.'),
         files_changed: z.array(z.string().max(MAX.path)).max(50).optional().describe('Files you changed (repo-relative, or absolute inside the project)'),
+        session_id: z.string().max(MAX.key).optional().describe("Your session id, if you know it: the check is recorded as your session's"),
       },
     },
-    async ({ files_changed, ...a }) => text((await checkBeforeDone({ ...a, filesChanged: files_changed, client }, ctx)).markdown),
+    async ({ files_changed, session_id, ...a }) => text((await checkBeforeDone({ ...a, filesChanged: files_changed, sessionId: session_id, client }, ctx)).markdown),
   );
 
   server.registerTool(
     'get_module_context',
     {
+      ...read('Module context'),
       description:
         'Before changing a file you do not know well: what it is (code facts), its exported symbols, who imports it, what it imports, the tests that cover it, and approved lessons and past misses tied to it, with citations.',
       inputSchema: {
@@ -68,6 +84,7 @@ function buildServer(ctx: ContextDeps, client: string | undefined) {
   server.registerTool(
     'impact',
     {
+      ...read('Impact of a change'),
       description:
         'Before changing files others depend on: the files that import them (with how many hops away), the tests to run, and approved lessons and past misses on everything impacted.',
       inputSchema: {
@@ -82,6 +99,7 @@ function buildServer(ctx: ContextDeps, client: string | undefined) {
   server.registerTool(
     'report_feedback',
     {
+      ...write('Report feedback'),
       description:
         'When the developer runs /postmortem, or your work missed something the developer did not say in words (pushback they typed is picked up from the session on its own): queues it in the Feedback Graph inbox for the developer; once they confirm it, a post-mortem learns from it. A report of pushback already flagged from the session joins that inbox item.',
       inputSchema: {
@@ -97,6 +115,7 @@ function buildServer(ctx: ContextDeps, client: string | undefined) {
   server.registerTool(
     'get_recent_sessions',
     {
+      ...read('Recent sessions'),
       description:
         'When picking up work in a project, or to see what earlier sessions did: the newest session summaries (goal, what was done and decided, open threads, pushback, files touched, outcome), newest first.',
       inputSchema: {
@@ -110,6 +129,7 @@ function buildServer(ctx: ContextDeps, client: string | undefined) {
   server.registerTool(
     'search_graph',
     {
+      ...read('Search the graph'),
       description: 'Search the feedback graph by meaning: approved lessons, past misses, code facts and docs closest to the query, in about 3,000 characters. Each section says when nothing is close enough.',
       inputSchema: { ...where, query: z.string().max(MAX.query) },
     },

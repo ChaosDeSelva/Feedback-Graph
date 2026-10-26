@@ -82,6 +82,21 @@ describeStores('ChatStore', (h) => {
     expect(next!.turns.map((t) => [t.seq, t.role])).toEqual([[1, 'user'], [2, 'assistant'], [3, 'user'], [4, 'assistant']]);
   });
 
+  test('the question queue: how many wait, since when the oldest has, and which are being answered since when', async () => {
+    expect(await c.chatQueue()).toEqual({ waiting: 0, oldestAt: null, running: [] });
+    const a = await c.createConversation({ projectKey: 'demo-shop', title: 'modals', provider: null });
+    const b = await c.createConversation({ projectKey: 'acme', title: 'routes', provider: null });
+    const first = (await c.addUserTurn(a.id, 'how many modals?', { context: 'ctx', sources: [] }))!.turns.at(-1)!;
+    await tick();
+    await c.addUserTurn(b.id, 'where are routes?', { context: 'ctx', sources: [] });
+    expect(await c.chatQueue()).toEqual({ waiting: 2, oldestAt: first.createdAt, running: [] });
+    expect(await c.markAnswering(first.id, 'claude-cli')).toBe(true);
+    const q = await c.chatQueue();
+    expect(q.waiting).toBe(1);
+    expect(q.oldestAt).not.toBe(first.createdAt);
+    expect(q.running).toEqual([{ id: first.id, projectKey: 'demo-shop', startedAt: expect.any(String) }]);
+  });
+
   test('a failed turn keeps its reason, can be retried with the same pack, and stale answering turns go back to pending', async () => {
     const conv = await c.createConversation({ projectKey: 'demo-shop', title: 'f', provider: 'codex' });
     const t = await c.addUserTurn(conv.id, 'why?', { context: 'the pack', sources: [src('S1')] });

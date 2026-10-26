@@ -12,6 +12,7 @@ import { PgKnowledgeStore } from './knowledge.ts';
 import { PgLinksStore } from './links.ts';
 import { migrate } from './migrate.ts';
 import { PgPortabilityStore } from './portability.ts';
+import { PgRunsStore } from './runs.ts';
 import { PgSelectionStore } from './selection.ts';
 import { PgSessionsStore } from './sessions.ts';
 import { checkPgvector } from './vector.ts';
@@ -36,6 +37,7 @@ export function postgresStore(db: Db): PostgresStore {
     codegraph: new PgCodeGraphStore(db),
     sessions: new PgSessionsStore(db),
     chats: new PgChatStore(db),
+    runs: new PgRunsStore(db),
     ensureSchema: async () => {
       await migrate(db.pool, { embeddingDimensions: db.dims });
       await checkPgvector(db);

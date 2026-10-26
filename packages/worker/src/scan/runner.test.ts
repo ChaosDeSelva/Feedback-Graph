@@ -1,5 +1,5 @@
 import type { ScanJob } from '@fb/core';
-import { expect, test } from 'vitest';
+import { describe, expect, test } from 'vitest';
 import { ScanRunner, type ScanRunnerDeps } from './runner.ts';
 
 const job = (id: string, provider: string | null = null): ScanJob => ({
@@ -62,9 +62,9 @@ test('a project with no code files is finished at once without taking a slot', a
   const runs: string[] = [];
   const f = fakes([job('a'), job('empty'), job('b')], { empty: async (j) => j.id === 'empty', concurrency: 1 });
   const run = f.deps.run;
-  f.deps.run = (j) => {
+  f.deps.run = (j, turn) => {
     runs.push(j.id);
-    if (j.id !== 'empty') return run(j);
+    if (j.id !== 'empty') return run(j, turn);
     f.drop('empty');
     return Promise.resolve(true);
   };
@@ -108,4 +108,117 @@ test('a run that throws is logged and frees its slot', async () => {
   await r.idle();
   expect(logs).toContain('scan runner: a scan threw');
   expect(r.running()).toEqual([]);
+});
+
+/**
+ * The store's fair queue (FactsStore.nextScanJob, contract-tested in facts.int.test.ts): queued jobs by how long they
+ * have waited, a job that gave way waiting from then; a job never served yet from its project's oldest unread file
+ * request when that is older. Each run is a sharded scan that asks after every shard whether another scan waits for
+ * its slot, and gives way when one does. `askedFirst`: the 0.6.2 rule, under which an old file request kept a job that
+ * gave way at the front (the runner must not hand it the slot back anyway).
+ */
+function shardedQueue(specs: { id: string; shards: number; provider?: string | null; asked?: number }[], o: { askedFirst?: boolean } = {}) {
+  let clock = 0;
+  const jobs = specs.map((s) => ({ job: job(s.id, s.provider === undefined ? 'codex-cli' : s.provider), shards: s.shards, done: 0, since: clock++, served: false, asked: s.asked, status: 'queued' as 'queued' | 'done' }));
+  const ran: string[] = [];
+  const finished: string[] = [];
+  const add = (id: string, shards: number, provider: string | null = 'codex-cli') => jobs.push({ job: job(id, provider), shards, done: 0, since: clock++, served: false, asked: undefined, status: 'queued' });
+  const waitingSince = (j: (typeof jobs)[number]) =>
+    j.asked === undefined || (j.served && !o.askedFirst) ? j.since : Math.min(j.since, j.asked);
+  const deps: ScanRunnerDeps = {
+    next: async (exclude) => jobs.filter((j) => j.status === 'queued' && !exclude.includes(j.job.id)).sort((a, b) => waitingSince(a) - waitingSince(b) || a.since - b.since)[0]?.job ?? null,
+    agentic: (j) => j.provider === 'codex-cli',
+    empty: async () => false,
+    run: async (j, turn) => {
+      const rec = jobs.find((x) => x.job.id === j.id)!;
+      while (rec.done < rec.shards) {
+        await new Promise((r) => setTimeout(r, 0));
+        rec.done++;
+        ran.push(`${j.id}:${rec.done}`);
+        if (rec.done < rec.shards && (await turn.waiting())) {
+          rec.since = clock++;
+          rec.served = true;
+          return true;
+        }
+      }
+      rec.status = 'done';
+      finished.push(j.id);
+      return true;
+    },
+    concurrency: 2,
+  };
+  return { deps, ran, finished, add, jobs };
+}
+
+test('a 40-shard scan queued first takes turns with three small scans queued after it: they finish before its shard 5', async () => {
+  const q = shardedQueue([{ id: 'big', shards: 40 }, { id: 'a', shards: 1 }, { id: 'b', shards: 1 }, { id: 'c', shards: 1 }]);
+  const r = new ScanRunner(q.deps);
+  r.kick();
+  await r.idle();
+  expect(q.finished).toEqual(['a', 'b', 'c', 'big']);
+  const at = (step: string) => q.ran.indexOf(step);
+  for (const small of ['a:1', 'b:1', 'c:1']) expect(at(small)).toBeLessThan(at('big:5'));
+  expect(q.ran.slice(0, 5)).toEqual(['big:1', 'a:1', 'b:1', 'c:1', 'big:2']);
+  // Every shard of the big scan ran once, in order: resumable, and its progress whole.
+  expect(q.ran.filter((s) => s.startsWith('big:'))).toEqual(Array.from({ length: 40 }, (_, i) => `big:${i + 1}`));
+});
+
+test('a scan queued while a big one runs gets the next turn, not the end of the big one', async () => {
+  const q = shardedQueue([{ id: 'big', shards: 10 }]);
+  const r = new ScanRunner(q.deps);
+  r.kick();
+  await new Promise((res) => setTimeout(res, 0));
+  await new Promise((res) => setTimeout(res, 0));
+  q.add('late', 1);
+  await r.idle();
+  expect(q.ran.indexOf('late:1')).toBeLessThan(q.ran.indexOf('big:4'));
+  expect(q.finished).toEqual(['late', 'big']);
+});
+
+test('a big agentic scan does not give way to a per-file scan a free slot can run: that one starts beside it', async () => {
+  const q = shardedQueue([{ id: 'big', shards: 3 }]);
+  let waitedTrue = 0;
+  const run = q.deps.run;
+  q.deps.run = (j, turn) => run(j, { waiting: async () => { const w = await turn.waiting(); if (w) waitedTrue++; return w; } });
+  const r = new ScanRunner(q.deps);
+  r.kick();
+  await new Promise((res) => setTimeout(res, 0));
+  q.add('files', 1, null);
+  await r.idle();
+  expect(waitedTrue).toBe(0);
+  expect(q.finished).toEqual(['files', 'big']);
+  expect(q.ran.filter((s) => s.startsWith('big:'))).toEqual(['big:1', 'big:2', 'big:3']);
+});
+
+test('stopping asks a sharded scan to give way after its shard, so shutdown does not wait for its last one', async () => {
+  const q = shardedQueue([{ id: 'big', shards: 40 }]);
+  const r = new ScanRunner(q.deps);
+  r.kick();
+  await new Promise((res) => setTimeout(res, 0));
+  await r.stop();
+  expect(q.ran.length).toBeLessThan(5);
+  expect(q.jobs[0]).toMatchObject({ status: 'queued' });
+});
+
+describe.each([
+  ['the store serves a job that gave way after those waiting', false],
+  ['the store would serve the job that gave way first (an old file request): the runner still does not', true],
+])('a 40-shard codex scan with an old unread file request in a later shard, and an agentic scan queued behind it: %s', (_, askedFirst) => {
+  test('the queued scan runs right after the first shard; the big one goes on after it; every shard runs once', async () => {
+    // The big scan's project had a file asked for (get_task_context) before either scan was queued.
+    const q = shardedQueue([{ id: 'big', shards: 40, asked: -1 }], { askedFirst });
+    let gaveWay = 0;
+    const run = q.deps.run;
+    q.deps.run = (j, turn) => run(j, { waiting: async () => { const w = await turn.waiting(); if (w && j.id === 'big') gaveWay++; return w; } });
+    const r = new ScanRunner(q.deps);
+    r.kick();
+    await new Promise((res) => setTimeout(res, 0));
+    q.add('b', 1);
+    await r.idle();
+    expect(q.ran.indexOf('b:1')).toBe(q.ran.indexOf('big:1') + 1);
+    expect(q.finished).toEqual(['b', 'big']);
+    expect(q.ran.filter((s) => s.startsWith('big:'))).toEqual(Array.from({ length: 40 }, (_, i) => `big:${i + 1}`));
+    // It gave way once, to b; after that no one waited, so it was not sent back through the queue (a re-list each time).
+    expect(gaveWay).toBe(1);
+  });
 });

@@ -96,6 +96,14 @@ function ctx(over: Partial<ContextDeps> = {}): ContextDeps & { logged: ActivityI
   } as ContextDeps & { logged: ActivityInput[] };
 }
 
+test('get_recent_sessions redacts a summary again as it serves it (one stored under older rules)', async () => {
+  const leaky = { ...detail('s1'), summary: { ...detail('s1').summary!, markdown: 'Goal: ship. Note: the admin password is hunter2' } };
+  const d = ctx({ sessions: { list: async () => ({ sessions: [item('s1')], next: null }), detail: async () => leaky } as ContextDeps['sessions'] });
+  const r = await getRecentSessions({ cwd: '/Users/j/Vibe/demo', limit: 5 }, d);
+  expect(r.markdown).toContain('the admin password is [REDACTED]');
+  expect(r.markdown).not.toContain('hunter2');
+});
+
 test('get_recent_sessions serves the newest summaries of the project, fenced as model-written data, and logs what it served', async () => {
   const d = ctx();
   const r = await getRecentSessions({ cwd: '/Users/j/Vibe/demo', limit: 5, client: 'claude-code' }, d);

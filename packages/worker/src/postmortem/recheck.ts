@@ -1,6 +1,9 @@
-import { LESSON_CHECKS_VERSION, type ActivityStore, type KnowledgeStore, type Lesson, type LessonCheck, type LessonCheckName, type SimilarLesson } from '@fb/core';
+import { readFile } from 'node:fs/promises';
+import { join, resolve } from 'node:path';
+import { LESSON_CHECKS_VERSION, type ActivityStore, type KnowledgeStore, type Lesson, type LessonCheck, type LessonCheckName, type LessonDetail, type SimilarLesson } from '@fb/core';
 import { MODEL_FACT_WHY, recheckLesson, saysWrongSession } from './lessonCheck.ts';
-import { junkPathReason, repoHas } from './paths.ts';
+import { ambiguousFlag, junkPathReason, normalizeStoredPaths, repoFileList, repoHas, type Normalized } from './paths.ts';
+import { claimsNotLoaded, imports } from './standing.ts';
 
 /** More lessons than any instance holds; one pass, so a store that cannot save never loops. */
 const MAX_LESSONS = 10_000;
@@ -12,15 +15,13 @@ const NEIGHBOURS = 5;
 
 const MAX_TARGETS = 500;
 
-const GLOB = /[*?[\]{}]/;
-
 /**
  * Flags a re-check cannot work out again, kept from the earlier checks: made from the comment's metadata (who wrote
  * it, the matched session) or by the model, neither of which is stored with the lesson; or a repair already applied to
- * the lesson (a dropped path, the title used as the rule).
+ * the lesson (a dropped path, the title used as the rule); or no-miss, which only a post-mortem's own words raise.
  */
 const kept = (c: LessonCheck) =>
-  c.name === 'wrong-session' || c.name === 'self-review' || c.name === 'non-repo-path' || c.name === 'broken-rule' ||
+  c.name === 'wrong-session' || c.name === 'self-review' || c.name === 'no-miss' || c.name === 'non-repo-path' || c.name === 'broken-rule' || c.name === 'contradicts-evidence' ||
   (c.name === 'looks-like-a-fact' && c.why === MODEL_FACT_WHY);
 
 /**
@@ -38,20 +39,85 @@ export function duplicateFlag(me: Pick<Lesson, 'id' | 'status' | 'createdAt'>, n
 }
 
 export type RecheckDeps = {
-  k: Pick<KnowledgeStore, 'listLessons' | 'lessonDetail' | 'setLessonChecks'> & Partial<Pick<KnowledgeStore, 'staleLessonChecks' | 'similarLessons'>>;
+  k: Pick<KnowledgeStore, 'listLessons' | 'lessonDetail' | 'setLessonChecks'> & Partial<Pick<KnowledgeStore, 'staleLessonChecks' | 'similarLessons' | 'setLessonPaths'>>;
   /** Each project's repository folder as the worker sees it; unset or missing a project: its paths are not looked up. */
   repoPaths?: () => Promise<Map<string, string>>;
   /** Whether the repository has the path (default repoHas: true when the repository is not mounted). */
   exists?: (repoPath: string, path: string) => Promise<boolean>;
+  /** The repository's files, so a bare file name resolves (default repoFileList: null when it is not mounted). */
+  repoFiles?: (repoPath: string) => Promise<string[] | null>;
+  /**
+   * The Linear ticket ids among `ids` linked to the project: from its mapped team or named by its pull requests (the
+   * worker: DocsStore.projectTickets and its synced tickets' team keys). Unset: cited tickets are not checked.
+   */
+  linkedTickets?: (projectKey: string, ids: string[]) => Promise<string[]>;
+  /** The instruction files a session's transcript shows its agent had (GraphStore.sessionInstructionFiles); unset: none known. */
+  instructionFiles?: (sessionId: string) => Promise<string[] | null>;
   activity?: Pick<ActivityStore, 'record'>;
   log?: (msg: string, extra?: object) => void;
 };
 
+const FILE_NAME = { claude_md: /(^|\/)CLAUDE(\.local)?\.md$/, agents_md: /(^|\/)AGENTS\.md$/ } as const;
+const LABEL = { claude_md: 'CLAUDE.md', agents_md: 'AGENTS.md' } as const;
+
+/**
+ * contradicts-evidence on a stored lesson: its miss says the agent did not load CLAUDE.md or AGENTS.md, and what is
+ * stored shows it had: a context item marked available, the session's recorded instruction files, or (AGENTS.md) the
+ * project's CLAUDE.md importing it, which Claude Code follows and Codex, which loads AGENTS.md itself, does not need.
+ */
+const TICKET_REF = /^(?:linear:)?([A-Za-z]{2}[A-Za-z0-9]{0,8}-\d{1,6})\b/;
+
+/**
+ * unlinked-ticket: the post-mortem cited Linear tickets that are not linked to the lesson's project. Before the hunt
+ * kept to the project's tickets it searched the whole workspace, so a lesson could be built on another team's ticket.
+ */
+async function unlinkedTickets(l: Lesson, detail: LessonDetail | null, d: RecheckDeps): Promise<LessonCheck | null> {
+  const key = l.projectKey ?? l.origin;
+  if (!d.linkedTickets || !key || !detail) return null;
+  const ids = [...new Set(detail.contextItems.filter((i) => i.kind === 'ticket').flatMap((i) => TICKET_REF.exec(i.ref)?.[1]?.toUpperCase() ?? []))];
+  if (!ids.length) return null;
+  const linked = new Set(await d.linkedTickets(key, ids));
+  const other = ids.filter((id) => !linked.has(id));
+  return other.length ? { name: 'unlinked-ticket', why: `its post-mortem cited Linear tickets not linked to ${key} (${other.join(', ')}): what it took from them is likely another project's` } : null;
+}
+
+async function contradiction(detail: LessonDetail | null, repo: string | undefined, d: RecheckDeps): Promise<LessonCheck | null> {
+  if (!detail?.miss) return null;
+  const claimed = claimsNotLoaded(`${detail.miss.causeExplanation}\n${detail.miss.missed}`);
+  if (!claimed.length) return null;
+  const recorded = detail.feedback ? ((await d.instructionFiles?.(detail.feedback.sessionId).catch(() => null)) ?? []) : [];
+  const claudeMd = repo ? await readFile(join(repo, 'CLAUDE.md'), 'utf8').catch(() => null) : null;
+  const importsAgents = !!repo && !!claudeMd && imports(claudeMd, repo, resolve).some((p) => p === join(repo, 'AGENTS.md'));
+  for (const kind of claimed) {
+    const said = `the miss says ${LABEL[kind]} was not loaded, but`;
+    const item = detail.contextItems.find((i) => i.kind === kind && i.wasAvailable);
+    if (item) return { name: 'contradicts-evidence', why: `${said} the post-mortem itself marked it available (${item.ref}): its cause is likely wrong` };
+    const file = recorded.find((p) => FILE_NAME[kind].test(p));
+    if (file) return { name: 'contradicts-evidence', why: `${said} the session's transcript shows it (${file}): its cause is likely wrong` };
+    if (kind === 'agents_md' && importsAgents) return { name: 'contradicts-evidence', why: `${said} the project's CLAUDE.md imports it (@AGENTS.md), so Claude Code loads it: its cause is likely wrong` };
+  }
+  return null;
+}
+
+/**
+ * The path flags of a stored lesson after normalizeStoredPaths. Its paths replaced (proposed): bad-path says what was
+ * dropped. Kept as they are (approved): path-missing for what the repository does not have as written (bad-path for
+ * what cannot be a path comes from recheckLesson).
+ */
+function pathFlags(n: Normalized, replaced: boolean): LessonCheck[] {
+  const missing = [...n.resolved.map((r) => `${r.from} (it is ${r.to})`), ...n.dropped.filter((x) => !junkPathReason(x.path)).map((x) => x.path)];
+  const flags: LessonCheck[] = replaced
+    ? n.dropped.length ? [{ name: 'bad-path', why: `dropped ${n.dropped.map((x) => `${x.path}: ${x.why}`).join('; ')}` }] : []
+    : missing.length ? [{ name: 'path-missing', why: `not in the repository: ${missing.join(', ')}` }] : [];
+  return [...flags, ...n.ambiguous.map(ambiguousFlag)];
+}
+
 /**
  * The lesson checks of today over every proposed and approved lesson checked with an older LESSON_CHECKS_VERSION (or
  * never): the text checks, and the data checks only a stored lesson can have (its miss saying the session was the wrong
- * one, its paths against the mounted repository, a near-duplicate by stored embedding). Flags only: the lessons are
- * left as they are, so the owner sees what the checks say now. Each lesson is stamped with the version, so it runs once
+ * one, its paths against the mounted repository, a near-duplicate by stored embedding). A proposed lesson's paths are
+ * normalized and stored (normalizeStoredPaths: bare names resolved, junk and missing files dropped) and the change
+ * logged; otherwise flags only: an approved lesson's text and paths are left as the owner approved them. Each lesson is stamped with the version, so it runs once
  * per version (and again after requestLessonRecheck); Activity says how many were checked and which flags came and went.
  */
 export async function recheckLessons(d: RecheckDeps): Promise<{ checked: number; flagged: number; changed: number }> {
@@ -61,6 +127,8 @@ export async function recheckLessons(d: RecheckDeps): Promise<{ checked: number;
   if (!todo.length) return { checked: 0, flagged: 0, changed: 0 };
   const repos = (await d.repoPaths?.().catch(() => null)) ?? new Map<string, string>();
   const exists = d.exists ?? repoHas;
+  const repoFiles = d.repoFiles ?? repoFileList;
+  let normalized = 0;
   const counts: Record<string, number> = {};
   const added: Record<string, number> = {};
   const removed: Record<string, number> = {};
@@ -69,25 +137,38 @@ export async function recheckLessons(d: RecheckDeps): Promise<{ checked: number;
   const changedIds: string[] = [];
   for (const l of todo) {
     const detail = await d.k.lessonDetail(l.id);
-    const fresh = recheckLesson(l, detail?.feedback?.text ?? '');
-    const usable = l.paths.filter((p) => !junkPathReason(p));
+    const repo = repos.get(l.projectKey ?? l.origin ?? '');
+    const norm = await normalizeStoredPaths(l.paths, repo ? { exists: (p) => exists(repo, p), repoFiles: () => repoFiles(repo) } : {});
+    // A proposed lesson's paths are replaced by the normalized ones (only while it is proposed and the writer's alone:
+    // the store refuses others). Paths the owner edited are the owner's (a file about to be created too): only flagged.
+    let paths = l.paths;
+    if (l.status === 'proposed' && !l.proposedAs && d.k.setLessonPaths && JSON.stringify(norm.paths) !== JSON.stringify(l.paths) && (await d.k.setLessonPaths(l.id, norm.paths))) {
+      paths = norm.paths;
+      normalized++;
+      d.log?.('lesson paths normalized', { id: l.id, from: l.paths, to: norm.paths, dropped: norm.dropped, resolved: norm.resolved });
+    }
+    const replaced = paths !== l.paths;
+    const fresh = recheckLesson({ ...l, paths }, detail?.feedback?.text ?? '');
+    const usable = paths.filter((p) => !junkPathReason(p));
     const data: LessonCheck[] = [];
     if (!usable.length && l.scope !== 'global' && l.source === 'postmortem') {
       data.push({ name: 'needs-path', why: 'no file the evidence supports: as it is, it would apply anywhere in the project' });
     }
-    const repo = repos.get(l.projectKey ?? l.origin ?? '');
-    if (repo) {
-      const missing: string[] = [];
-      for (const p of usable) if (!GLOB.test(p) && !(await exists(repo, p))) missing.push(p);
-      if (missing.length) data.push({ name: 'path-missing', why: `not in the repository: ${missing.join(', ')}` });
-    }
+    const fromPaths = pathFlags(norm, replaced);
     if ((l.from === 'github' || l.from === 'linear') && detail?.miss && saysWrongSession(detail.miss)) {
       data.push({ name: 'wrong-session', why: 'the post-mortem says the matched session did other work: what it took from that session is likely wrong' });
     }
     const dup = d.k.similarLessons ? duplicateFlag(l, await d.k.similarLessons(l.id, NEIGHBOURS)) : null;
     if (dup) data.push(dup);
+    const contradicted = await contradiction(detail, repo, d);
+    if (contradicted) data.push(contradicted);
+    const unlinked = await unlinkedTickets(l, detail, d);
+    if (unlinked) data.push(unlinked);
     // bad-path first, as at proposal time, then the data checks, then the rest of the text checks.
-    const computed = [...fresh.filter((f) => f.name === 'bad-path'), ...data, ...fresh.filter((f) => f.name !== 'bad-path')];
+    const computed = [
+      ...fresh.filter((f) => f.name === 'bad-path'), ...fromPaths.filter((f) => f.name === 'bad-path'), ...data,
+      ...fromPaths.filter((f) => f.name !== 'bad-path'), ...fresh.filter((f) => f.name !== 'bad-path'),
+    ];
     const keep = (l.checks ?? []).filter(kept);
     const flags = [...keep, ...computed.filter((c) => !keep.some((k) => k.name === c.name))];
     await d.k.setLessonChecks(l.id, flags, LESSON_CHECKS_VERSION);
@@ -105,12 +186,14 @@ export async function recheckLessons(d: RecheckDeps): Promise<{ checked: number;
     for (const f of flags) counts[f.name] = (counts[f.name] ?? 0) + 1;
   }
   const checked = todo.length;
-  d.log?.('lessons re-checked', { checked, flagged, changed, version: LESSON_CHECKS_VERSION, added, removed });
+  d.log?.('lessons re-checked', { checked, flagged, changed, normalized, version: LESSON_CHECKS_VERSION, added, removed });
   await d.activity?.record({
     kind: 'lessons_checked', actor: 'lesson-check', projectKey: null,
-    subject: `${checked} lesson${checked === 1 ? '' : 's'} re-checked (checks v${LESSON_CHECKS_VERSION}): ${flagged} flagged, ${changed} changed`,
-    why: 'their checks were older than the current ones (or a re-check was asked for); the flags are shown on each lesson, nothing else was changed',
-    details: { checked, flagged, changed, version: LESSON_CHECKS_VERSION, flags: counts, added, removed },
+    subject: `${checked} lesson${checked === 1 ? '' : 's'} re-checked (checks v${LESSON_CHECKS_VERSION}): ${flagged} flagged, ${changed} changed${normalized ? `, ${normalized} proposed with paths normalized` : ''}`,
+    why: normalized
+      ? 'their checks were older than the current ones (or a re-check was asked for); the flags are shown on each lesson, and proposed lessons got their paths normalized (approved ones were only flagged)'
+      : 'their checks were older than the current ones (or a re-check was asked for); the flags are shown on each lesson, nothing else was changed',
+    details: { checked, flagged, changed, normalized, version: LESSON_CHECKS_VERSION, flags: counts, added, removed },
     // The lessons whose flags changed, so each one's history shows it (capped: a big backlog is one entry, not a list).
     targets: changedIds.slice(0, MAX_TARGETS),
   });

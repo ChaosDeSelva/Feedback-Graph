@@ -7,6 +7,8 @@ import {
   REPORT_MERGE_MINUTES,
   postmortemState,
   redactSecrets,
+  redactStoredRow,
+  REDACT_PAGE,
   sessionWork,
   trailingToolCalls,
   type Candidate,
@@ -32,6 +34,7 @@ import {
 } from '@fb/core';
 import { iso, toJson, tx, type Db } from './db.ts';
 import { refreshSessionStats } from './sessions.ts';
+import { visibleToRun } from './vector.ts';
 
 /** Labels that count as pushback in stats (repo.ts CANDIDATE_LABELS). */
 const CANDIDATE_LABELS = ['pushback', 'correction'];
@@ -80,20 +83,22 @@ export class PgGraphStore implements GraphStore {
       );
       await c.query(
         `INSERT INTO sessions (id, project_key, source, source_file, cwd, git_branch, started_at, ended_at, final_reply_text, final_reply_ts,
-                               work_edits, work_commits, first_work_at, last_work_at, final_tool_calls)
-         VALUES ($1, $2, $3, $4, $5, $6, $7::timestamptz, $8::timestamptz, $9, $10, $11, $12, $13::timestamptz, $14::timestamptz, $15::jsonb)
+                               work_edits, work_commits, first_work_at, last_work_at, final_tool_calls, instruction_files)
+         VALUES ($1, $2, $3, $4, $5, $6, $7::timestamptz, $8::timestamptz, $9, $10, $11, $12, $13::timestamptz, $14::timestamptz, $15::jsonb, $16::jsonb)
          ON CONFLICT (id) DO UPDATE SET project_key = EXCLUDED.project_key, source = EXCLUDED.source,
            source_file = EXCLUDED.source_file, cwd = EXCLUDED.cwd, git_branch = EXCLUDED.git_branch,
            started_at = EXCLUDED.started_at, ended_at = EXCLUDED.ended_at,
            final_reply_text = EXCLUDED.final_reply_text, final_reply_ts = EXCLUDED.final_reply_ts,
            work_edits = EXCLUDED.work_edits, work_commits = EXCLUDED.work_commits,
-           first_work_at = EXCLUDED.first_work_at, last_work_at = EXCLUDED.last_work_at, final_tool_calls = EXCLUDED.final_tool_calls`,
+           first_work_at = EXCLUDED.first_work_at, last_work_at = EXCLUDED.last_work_at, final_tool_calls = EXCLUDED.final_tool_calls,
+           instruction_files = EXCLUDED.instruction_files`,
         [
           s.sessionId, project.key, s.source ?? 'claude', s.sourceFile ?? null, s.cwd ?? null, s.gitBranch ?? null, maybeTime(s.startedAt), maybeTime(s.endedAt),
           // Redacted by the parser, and again here: it is stored like a turn's text.
           s.finalReply ? redactSecrets(s.finalReply.text) : null,
           s.finalReply?.ts ?? null,
           work.edits, work.commits, work.firstAt, work.lastAt, toJson(trailingToolCalls(s)),
+          s.instructionFiles ? toJson(s.instructionFiles) : null,
         ],
       );
       if (s.turns.length) {
@@ -200,6 +205,12 @@ export class PgGraphStore implements GraphStore {
    * Turns still to classify, newest first so fresh feedback is not stuck behind the history backfill.
    * projectKeys undefined: every project; an empty list: none (nothing is selected).
    */
+  async sessionInstructionFiles(sessionId: string): Promise<string[] | null> {
+    const { rows } = await this.q('SELECT instruction_files FROM sessions WHERE id = $1', [sessionId]);
+    const f = rows[0]?.instruction_files;
+    return Array.isArray(f) ? f.filter((x): x is string => typeof x === 'string') : null;
+  }
+
   async callsAfter(turnUuid: string): Promise<CallsAfter | null> {
     const { rows } = await this.q(
       `SELECT s.final_tool_calls, s.ended_at,
@@ -272,8 +283,9 @@ export class PgGraphStore implements GraphStore {
        FROM candidates k JOIN turns t ON t.uuid = k.turn_uuid
        WHERE ($1::text IS NULL OR k.status = $1) AND ($2::text IS NULL OR k.project_key = $2)
          AND ($4::text[] IS NULL OR k.project_key = ANY($4)) AND ($5::text IS NULL OR coalesce(k.source, 'claude') = $5)
+         AND ${visibleToRun('k', '$7')}
        ORDER BY t.ts DESC, k.id LIMIT $3 OFFSET $6`,
-      [f.status ?? null, f.projectKey ?? null, f.limit ?? 200, f.projectKeys ?? null, f.source ?? null, Math.max(0, Math.floor(f.offset ?? 0))],
+      [f.status ?? null, f.projectKey ?? null, f.limit ?? 200, f.projectKeys ?? null, f.source ?? null, Math.max(0, Math.floor(f.offset ?? 0)), f.run ?? null],
     );
     return rows.map(candidateOf);
   }
@@ -323,6 +335,45 @@ export class PgGraphStore implements GraphStore {
       [q.limit, q.afterId ?? null],
     );
     return rows.map((r) => ({ id: r.id, turnUuid: r.turn_uuid, projectKey: r.project_key, text: r.text, external: r.external }));
+  }
+
+  async setExternalLinks(turnUuid: string, linkedSessionIds: string[]): Promise<boolean> {
+    const { rowCount } = await this.q(
+      `UPDATE turns SET external = jsonb_set(external, '{linkedSessionIds}', $2::jsonb) WHERE uuid = $1 AND external IS NOT NULL`,
+      [turnUuid, toJson(linkedSessionIds)],
+    );
+    return (rowCount ?? 0) > 0;
+  }
+
+  async redactStoredCandidates(): Promise<number> {
+    let changed = 0;
+    for (let after = ''; ;) {
+      const { rows } = await this.q(
+        `SELECT k.id, k.turn_uuid, k.note, k.agent_report, t.text, t.preceding_assistant_text, t.summary
+           FROM candidates k LEFT JOIN turns t ON t.uuid = k.turn_uuid
+          WHERE k.id > $1 ORDER BY k.id LIMIT $2`,
+        [after, REDACT_PAGE],
+      );
+      if (!rows.length) break;
+      after = rows[rows.length - 1].id;
+      const page = rows.flatMap((r: Record<string, unknown>) => redactStoredRow(r, ['note', 'text', 'preceding_assistant_text', 'summary'], ['agent_report']) ?? []);
+      if (!page.length) continue;
+      await tx(this.db, async (c) => {
+        const json = toJson(page);
+        await c.query(
+          `UPDATE candidates x SET note = c.note, agent_report = c.agent_report
+           FROM jsonb_to_recordset($1::jsonb) AS c(id text, note text, agent_report jsonb) WHERE x.id = c.id`,
+          [json],
+        );
+        await c.query(
+          `UPDATE turns x SET text = c.text, preceding_assistant_text = c.preceding_assistant_text, summary = c.summary
+           FROM jsonb_to_recordset($1::jsonb) AS c(turn_uuid text, text text, preceding_assistant_text text, summary text) WHERE x.uuid = c.turn_uuid`,
+          [json],
+        );
+      });
+      changed += page.length;
+    }
+    return changed;
   }
 
   async pendingSessionItems(q: { limit: number; afterId?: string | null }): Promise<PendingSessionItem[]> {
@@ -507,6 +558,8 @@ export class PgGraphStore implements GraphStore {
               count(*) AS human_turns, count(*) FILTER (WHERE t.label = ANY ($1::text[])) AS pushback
        FROM turns t JOIN sessions s ON s.id = t.session_id JOIN projects p ON p.key = s.project_key
        WHERE t.idx > 0 AND NOT (coalesce(s.source, 'claude') = ANY ($2::text[]))
+         -- A sandbox run's report is no one else's pushback.
+         AND NOT EXISTS (SELECT 1 FROM candidates k WHERE k.turn_uuid = t.uuid AND k.sandbox)
        GROUP BY 1, 2 ORDER BY week, project_key`,
       [CANDIDATE_LABELS, EXTERNAL_SOURCES],
     );
@@ -558,7 +611,7 @@ async function mergeIntoReport(x: { query: (sql: string, params?: unknown[]) => 
 }
 
 /** What candidateOf reads: the candidate's columns and the flagged turn's classification and words. */
-const CANDIDATE_COLUMNS = `k.id, k.turn_uuid, k.session_id, k.project_key, k.source, k.status, k.created_at, k.decided_at, k.note, k.decided_by,
+const CANDIDATE_COLUMNS = `k.id, k.turn_uuid, k.session_id, k.project_key, k.source, k.status, k.created_at, k.decided_at, k.note, k.decided_by, k.run, k.sandbox,
   k.manual, k.detected, k.agent_report, t.text AS turn_text, t.preceding_assistant_text AS turn_done,
   t.label, t.confidence, t.summary, t.signals, t.external`;
 
@@ -605,6 +658,8 @@ function candidateOf(r: Row): Candidate {
       turnWhatWasDone: r.turn_done,
       createdAt: iso(r.created_at) as string,
     }),
+    ...(r.run ? { run: r.run as string } : {}),
+    ...(r.sandbox === true && { sandbox: true as const }),
   };
 }
 

@@ -18,9 +18,17 @@ function list(json: string | null | undefined): string[] {
  * sessionWork()), without which it is never linked to a GitHub or Linear comment. 3: Claude Code conversations'
  * fingerprints (ingest/fingerprint.ts), so a Codex import of one is recognised. 4: the branch the files were changed on
  * (not the one the session started on), and the tool calls after the last human turn (trailingToolCalls), the
- * evidence an instruction about git was broken.
+ * evidence an instruction about git was broken. 5: the instruction files the transcript shows the agent had
+ * (ingest/instructions.ts), the evidence a post-mortem judges "did not load AGENTS.md" against.
  */
-export const INGEST_VERSION = 4;
+export const INGEST_VERSION = 5;
+
+/**
+ * Bump when the rule that drops a Codex session as a copy of a Claude Code conversation changes, so Codex rollouts are
+ * read once more under the new one (migrateCodexCopyRule). 1: a Codex session is judged once, the first time it is
+ * read; before, a session read at one turn (too short to judge) was dropped once it grew and matched, frozen at that turn.
+ */
+export const CODEX_COPY_RULE = 1;
 
 /**
  * The worker's own bookkeeping (never in the graph): which memory files and session transcripts were read
@@ -48,6 +56,8 @@ export class FileState {
     this.db.exec('CREATE TABLE IF NOT EXISTS cwds (path TEXT PRIMARY KEY, scanned INTEGER, cwds TEXT)');
     // Claude Code conversations by fingerprint: a Codex session with the same one is an import of it.
     this.db.exec('CREATE TABLE IF NOT EXISTS conversations (fingerprint TEXT PRIMARY KEY, session_id TEXT NOT NULL)');
+    // Codex sessions, judged once: a copy of this Claude Code session (copy_of), or Codex's own (null).
+    this.db.exec('CREATE TABLE IF NOT EXISTS codex_sessions (session_id TEXT PRIMARY KEY, copy_of TEXT)');
   }
 
   private addColumn(table: string, column: string, type: string) {
@@ -151,6 +161,31 @@ export class FileState {
   conversation(fingerprint: string): string | null {
     const row = this.db.prepare('SELECT session_id FROM conversations WHERE fingerprint = ?').get(fingerprint) as { session_id: string } | undefined;
     return row?.session_id ?? null;
+  }
+
+  /** A Codex session's verdict: a copy of a Claude Code session (its id), Codex's own (null), or undefined: not judged yet. */
+  codexVerdict(sessionId: string): string | null | undefined {
+    const row = this.db.prepare('SELECT copy_of FROM codex_sessions WHERE session_id = ?').get(sessionId) as { copy_of: string | null } | undefined;
+    return row ? row.copy_of : undefined;
+  }
+
+  /** Judged once: the first verdict stands (a session read as Codex's own is never later dropped as a copy). */
+  judgeCodexSession(sessionId: string, copyOf: string | null) {
+    this.db.prepare('INSERT INTO codex_sessions (session_id, copy_of) VALUES (?, ?) ON CONFLICT(session_id) DO NOTHING').run(sessionId, copyOf);
+  }
+
+  /**
+   * The copy rule changed (CODEX_COPY_RULE): the Codex rollouts under `dir` are read once more, so a session the old
+   * rule froze is judged again (cycle.ts). Once per rule version; returns how many files were put back.
+   */
+  migrateCodexCopyRule(dir: string): number {
+    if (Number(this.getSetting('codex_copy_rule') ?? 0) >= CODEX_COPY_RULE) return 0;
+    // An empty or root folder would put back every file the worker has read, not only Codex's.
+    if (!dir.trim() || dir.replace(/\/+$/, '') === '') return 0;
+    const prefix = dir.endsWith('/') ? dir : `${dir}/`;
+    const r = this.db.prepare('UPDATE ingested SET version = 0 WHERE substr(path, 1, length(?)) = ?').run(prefix, prefix);
+    this.setSetting('codex_copy_rule', String(CODEX_COPY_RULE));
+    return Number(r.changes);
   }
 
   getHead(path: string): { size: number; cwd: string | null; human: boolean } | null {

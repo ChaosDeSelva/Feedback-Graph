@@ -24,7 +24,10 @@ function setup(o: { allow?: OperatorVerb[]; token?: string | null; apiToken?: st
     listCandidates: async (q: unknown) => { note('listCandidates', q); return [cand('c1', 'claude'), cand('c2', 'github')]; },
     stats: async () => [],
     decide: async (...a: unknown[]) => { note('decide', a); },
-    candidateDetail: async (id: string) => (id === 'c1' ? { candidate: cand('c1', 'claude'), turn: { text: 'no' }, before: [], after: [], commits: [] } : null),
+    // c1 is the owner's; c-run-1 was reported in run-1 (a run decides only on its own).
+    candidateDetail: async (id: string) => (id === 'c1' || id === 'c-run-1'
+      ? { candidate: { ...cand(id, 'claude'), ...(id === 'c-run-1' && { run: 'run-1' }) }, turn: { text: 'no' }, before: [], after: [], commits: [] }
+      : null),
   } as unknown as ApiRepo;
   const settings: SettingsDeps = {
     selection: {
@@ -114,11 +117,12 @@ test('the operator token lists every admin tool, each description naming its ver
   expect(res.status).toBe(200);
   const tools = ((await res.json()) as { result: { tools: { name: string; description: string }[] } }).result.tools;
   expect(tools.map((t) => t.name).sort()).toEqual([
-    'cloud_sync_now', 'inbox_decide', 'inbox_get', 'inbox_list', 'lesson_decide', 'lesson_get', 'lessons_list', 'link_decide', 'list_projects',
-    'pipeline_status', 'rebuild_code_map', 'scan_projects', 'select_projects', 'set_fact_relevance',
+    'cloud_sync_now', 'demo_remove', 'demo_seed', 'inbox_decide', 'inbox_get', 'inbox_list', 'lesson_decide', 'lesson_get', 'lessons_list', 'link_decide', 'list_projects',
+    'pipeline_status', 'rebuild_code_map', 'run_cleanup', 'scan_projects', 'select_projects', 'session_evidence', 'set_fact_relevance',
   ]);
   expect(tools.find((t) => t.name === 'lesson_decide')!.description).toContain('lesson_decide');
   expect(tools.find((t) => t.name === 'rebuild_code_map')!.description).toContain('OPERATOR_ALLOW: scan');
+  expect(tools.find((t) => t.name === 'demo_seed')!.description).toContain('OPERATOR_ALLOW: lesson_decide');
   expect(ADMIN_TOOLS.inbox_decide).toBe('inbox_decide');
   expect(ADMIN_TOOLS.inbox_list).toBeNull();
 });
@@ -296,15 +300,34 @@ test('inbox_get and lesson_get return one item in full', async () => {
   expect(missing.isError).toBe(true);
 });
 
+test('demo_seed and demo_remove go through the demo routes as the agent; another project needs lesson_decide', async () => {
+  const seeded: unknown[] = [];
+  const demo = {
+    knowledge: { upsertLesson: async (l: unknown) => { seeded.push(l); }, saveDemoMiss: async (m: { id: string }) => `miss:${m.id}`, removeDemo: async () => ({ lessons: 4, misses: 1, facts: 3 }) },
+    facts: { listFacts: async () => [], saveFileFacts: async () => {} },
+    embed: async (t: string[]) => t.map(() => [1]),
+    project: () => null,
+  };
+  const s = setup({ extra: { demo: demo as never } });
+  const r = await tool(s.app, 'demo_seed', {});
+  expect(r.isError).toBeFalsy();
+  expect(r.text).toMatch(/approved by you running fg demo seed/);
+  expect(s.logged.find((e) => e.kind === 'demo_seeded')?.actor).toBe('operator:codex');
+  const other = await tool(s.app, 'demo_seed', { project: 'acme' });
+  expect(other.isError).toBe(true);
+  expect(other.text).toMatch(/lesson_decide/);
+  expect((await tool(s.app, 'demo_remove', {})).text).toMatch(/Removed 4 demo lessons/);
+});
+
 test('read tools say they are read-only, so a client need not ask before each call; decisions do not', async () => {
   const { app } = setup();
   const res = await app.request('/mcp/admin', rpc({ method: 'tools/list', params: {} }, bearer(OP)));
   const tools = ((await res.json()) as { result: { tools: { name: string; annotations?: Record<string, boolean> }[] } }).result.tools;
   const reads = tools.filter((t) => t.annotations?.readOnlyHint).map((t) => t.name).sort();
-  expect(reads).toEqual(['inbox_get', 'inbox_list', 'lesson_get', 'lessons_list', 'list_projects', 'pipeline_status']);
+  expect(reads).toEqual(['inbox_get', 'inbox_list', 'lesson_get', 'lessons_list', 'list_projects', 'pipeline_status', 'session_evidence']);
   for (const t of tools) {
     expect(t.annotations, t.name).toBeDefined();
-    expect(t.annotations!.readOnlyHint, t.name).toBe(!(t.name in ADMIN_TOOLS) || ADMIN_TOOLS[t.name as keyof typeof ADMIN_TOOLS] === null);
+    expect(t.annotations!.readOnlyHint, t.name).toBe(!t.name.startsWith('demo_') && (!(t.name in ADMIN_TOOLS) || ADMIN_TOOLS[t.name as keyof typeof ADMIN_TOOLS] === null));
   }
   // Decisions agents learn from cannot be taken back by the tool that made them.
   expect(tools.find((t) => t.name === 'lesson_decide')!.annotations!.destructiveHint).toBe(true);
@@ -339,6 +362,50 @@ test('cloud_sync_now passes the route answer through (sync off here)', async () 
   const r = await tool(setup().app, 'cloud_sync_now', {});
   expect(r.isError).toBe(true);
   expect(r.text).toMatch(/409.*CLOUD_URL/);
+});
+
+test('the run label on the admin endpoint (x-fg-run, or ?run=) reaches every route a tool calls, so its writes record the run', async () => {
+  const s = setup();
+  await tool(s.app, 'inbox_decide', { items: [{ id: 'c-run-1', decision: 'confirm' }] }, { ...bearer(OP, 'tester'), 'x-fg-run': 'run-1', 'x-fg-sandbox': '1' });
+  expect(s.logged.at(-1)).toMatchObject({ kind: 'feedback_decided', actor: 'operator:tester', run: 'run-1', sandbox: true });
+  // The owner's item is not the run's: refused, item by item.
+  const refused = JSON.parse((await tool(s.app, 'inbox_decide', { items: [{ id: 'c1', decision: 'confirm' }] }, { ...bearer(OP, 'tester'), 'x-fg-run': 'run-1', 'x-fg-sandbox': '1' })).text);
+  expect(refused.results).toEqual([{ id: 'c1', ok: false, error: expect.stringMatching(/not run run-1's/) }]);
+  const res = await s.app.request('/mcp/admin?run=run-2', rpc({ method: 'tools/call', params: { name: 'link_decide', arguments: { a: 'acme', b: 'demo-shop', decision: 'confirm' } } }, bearer(OP, 'tester')));
+  expect(res.status).toBe(200);
+  expect(s.logged.at(-1)).toMatchObject({ kind: 'link_decided', run: 'run-2' });
+  expect(s.calls.setLink.at(-1)).toEqual(['acme', 'demo-shop', expect.objectContaining({ run: { id: 'run-2', sandbox: false } })]);
+});
+
+test('run_cleanup shows what a run would remove first, and removes it only when asked to', async () => {
+  const removed: unknown[] = [];
+  const items = [{ kind: 'feedback' as const, id: 'manual:a', projectKey: 'demo-shop', sandbox: true, group: null, merged: false }];
+  // The operator token opened run-1 (RunsStore.claim), so it may clean it up.
+  const owner = { claim: async () => ({ run: 'run-1', principal: 'operator' as const, firstSeen: 't' }), owner: async () => ({ run: 'run-1', principal: 'operator' as const, firstSeen: 't' }) };
+  const s = setup({ extra: { runs: { ...owner, items: async () => items, remove: async (run, keep) => { removed.push([run, keep]); return { feedback: 1, lesson: 0, miss: 0, predone_check: 0, fact: 0, doc: 0, link: 0, chat: 0 }; } } } });
+  const dry = JSON.parse((await tool(s.app, 'run_cleanup', { run: 'run-1' })).text);
+  expect(dry).toMatchObject({ run: 'run-1', dryRun: true, remove: { feedback: 1 } });
+  expect(removed).toEqual([]);
+  const done = JSON.parse((await tool(s.app, 'run_cleanup', { run: 'run-1', apply: true })).text);
+  expect(done).toMatchObject({ dryRun: false, removed: { feedback: 1 } });
+  expect(removed).toEqual([['run-1', []]]);
+  expect(s.logged.at(-1)).toMatchObject({ kind: 'run_cleaned', actor: 'operator:codex' });
+  const refused = await tool(setup({ allow: DEFAULT_ALLOW.filter((v) => v !== 'run_cleanup'), extra: { runs: { ...owner, items: async () => items, remove: async () => ({}) as never } } }).app, 'run_cleanup', { run: 'run-1' });
+  expect(refused.isError).toBe(true);
+  expect(refused.text).toMatch(/403.*run_cleanup/);
+});
+
+test('session_evidence returns what the tool saw in one session', async () => {
+  const s = setup({
+    extra: {
+      evidence: {
+        sessions: { detail: async (id) => (id === 's1' ? ({ id: 's1', projectKey: 'demo-shop', inbox: [], prunedTurns: 0 } as never) : null), turnEvidence: async () => [] },
+        inScope: () => true,
+      },
+    },
+  });
+  expect(JSON.parse((await tool(s.app, 'session_evidence', { id: 's1' })).text)).toMatchObject({ session: { id: 's1' }, turns: { count: 0 }, inbox: [] });
+  expect((await tool(s.app, 'session_evidence', { id: 'nope' })).text).toMatch(/404/);
 });
 
 test('rebuild_code_map queues a remap', async () => {

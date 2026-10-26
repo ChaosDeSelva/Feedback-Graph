@@ -41,7 +41,7 @@ const Lesson = z.object({
   scope: z.enum(['task', 'project', 'global']),
   paths: z.array(z.string().max(300)).max(50).default([]),
   status: z.enum(['proposed', 'approved', 'rejected', 'superseded']),
-  source: z.enum(['postmortem', 'memory', 'manual']).default('postmortem'),
+  source: z.enum(['postmortem', 'memory', 'manual', 'demo']).default('postmortem'),
 });
 
 const Fact = z.object({

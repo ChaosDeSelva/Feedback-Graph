@@ -1,7 +1,7 @@
 import { PRIVATE_DIRS, SECRET_GLOBS } from '../secrets.ts';
 import { mirrorForAgent } from './mirror.ts';
 import { codexArgs, runOnRunner, RunnerUnavailableError } from './codexRunner.ts';
-import { ProviderUnavailableError } from './unavailable.ts';
+import { CliRunError, ProviderUnavailableError } from './unavailable.ts';
 import { basename } from 'node:path';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -243,6 +243,16 @@ function anthropic(id: string, model: string, key: string, o: ProviderOpts): Llm
   };
 }
 
+/** The error claude reported in its JSON result (is_error), or '': never the model's answer. */
+function cliReportedError(stdout: string): string {
+  try {
+    const out = JSON.parse(stdout) as { is_error?: boolean; result?: unknown };
+    return out?.is_error ? String(out.result ?? '') : '';
+  } catch {
+    return '';
+  }
+}
+
 function claudeCli(id: string, model: string | undefined, token: string, o: ProviderOpts): LlmProvider {
   return {
     id,
@@ -264,14 +274,14 @@ function claudeCli(id: string, model: string | undefined, token: string, o: Prov
             return ask(cwd, `${cliPrompt(t)}\n\nThe image${names.length === 1 ? ' is' : 's are'} ${names.join(', ')} in your current directory: open ${names.length === 1 ? 'it' : 'each'} with the Read tool before answering.`);
           }, 'fb-image-')
         : await inTaskFolder(t, (cwd) => ask(cwd, cliPrompt(t)));
-      if (r.code !== 0) throw new Error(`claude exit ${r.code}: ${(r.stderr || r.stdout).slice(0, 500)}`);
+      if (r.code !== 0) throw new CliRunError('claude', r.code, r.stderr.trim() || cliReportedError(r.stdout), r.stdout);
       let out: { is_error?: boolean; result?: string; structured_output?: unknown };
       try {
         out = JSON.parse(r.stdout) as typeof out;
       } catch {
         throw new ModelOutputError('claude printed no JSON result', r.stdout);
       }
-      if (out.is_error) throw new Error(`claude error: ${String(out.result).slice(0, 500)}`);
+      if (out.is_error) throw new CliRunError('claude', null, String(out.result));
       return out.structured_output ?? extractJsonAnswer(out.result ?? '');
     },
   };
@@ -310,7 +320,7 @@ function codexCli(id: string, model: string | undefined, o: ProviderOpts): LlmPr
         await writeFile(schemaPath, JSON.stringify(strictSchema(t.schema)));
         const args = codexArgs({ dir: mirror.dir, schemaPath, outPath, model });
         const r = await (o.exec ?? execCommand)('codex', args, { cwd: mirror.dir, stdin: cliPrompt(t), env: cliEnv({ CODEX_HOME: process.env.CODEX_HOME }), timeoutMs: t.timeoutMs ?? DEFAULT_TIMEOUT });
-        if (r.code !== 0) throw new Error(`codex exit ${r.code}: ${(r.stderr || r.stdout).slice(-500)}`);
+        if (r.code !== 0) throw new CliRunError('codex', r.code, r.stderr, r.stdout);
         return extractJsonAnswer(await readFile(outPath, 'utf8'));
       } finally {
         await rm(dir, { recursive: true, force: true });
@@ -339,7 +349,7 @@ function codexRunnerCli(id: string, model: string | undefined, url: string, scra
         }).catch((err: unknown) => {
           throw err instanceof RunnerUnavailableError ? new ProviderUnavailableError(err.message) : err;
         });
-        if (r.code !== 0) throw new Error(`codex exit ${r.code}: ${(r.stderr || r.stdout).slice(-500)}`);
+        if (r.code !== 0) throw new CliRunError('codex', r.code, r.stderr, r.stdout);
         if (r.output === null) throw new Error('codex exit 0: it wrote no answer');
         return extractJsonAnswer(r.output);
       } finally {

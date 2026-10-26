@@ -33,8 +33,9 @@ Use the test-from-feedback skill: it turns the lessons and past misses for the c
 
 ## Before you say "done"
 
-Call `check_before_done` with `cwd`, the task, a summary of what you built **and how you verified it** (include a diff if it is small), and `files_changed`: the files you changed.
+Call `check_before_done` with `cwd`, the task, a summary of what you built **and how you verified it**, `files_changed`: the files you changed, and `diff`: your change as `git diff <commit you started from>` (staged, unstaged and committed in one; `git add -N` new files first). Without a start commit, pass `git diff HEAD` plus the commits you made. Pass it whole: over about 30 KB the judge reads the files most related to the lessons first, then `files_changed` in order, and the answer names the files it did not read. With no `diff`, the server reads the diff of `files_changed` from the repo itself.
 
+- The judge reads the diff, not just your summary: each gap cites the diff lines it rests on. A lesson listed under **Cannot tell from the diff** applies but the diff did not show it either way: check it yourself; it is not a pass. If the answer says the diff was cut, check the files it names as not shown.
 - If it lists gaps, address each one, or tell the developer plainly why it does not apply.
 - For each changed file it names importers and tests you did not touch: make sure the importers still work and run those tests. If a past miss there applies, make sure it did not happen again.
 - Do not claim the work is finished while a listed gap is unaddressed and unexplained.
@@ -51,6 +52,20 @@ Call `report_feedback` only when:
 Pass `cwd`, the feedback in the developer's words (or a plain description of the miss), a short note of what you had built, and `session_id` when you know your session id. A report that matches pushback already flagged from the transcript is merged into the same Inbox item, so one miss is never reviewed twice.
 
 Skip `report_feedback` for ordinary new requests, and for questions that don't judge the previous work.
+
+## Running headless
+
+`claude -p` never shows a permission prompt: a tool that is not allowed is denied, and the Stop hook then says the check did not run. Allow the Feedback Graph tools and the git commands the check asks for:
+
+```sh
+claude -p "..." \
+  --allowedTools "mcp__plugin_feedback-graph_fg" "Bash(git diff *)" "Bash(git add -N *)"
+```
+
+- The plugin's MCP server is named `fg`, so its tools are `mcp__plugin_feedback-graph_fg__<tool>` (for example `mcp__plugin_feedback-graph_fg__check_before_done`); the bare server name `mcp__plugin_feedback-graph_fg` allows all of them. Installed with `scripts/install-agent.sh claude` instead of the plugin, the server is `feedback-graph`: allow `mcp__feedback-graph`.
+- The tools are read-only except `report_feedback`, which only queues an Inbox item for the developer. To allow less, list them one by one: `get_task_context`, `check_before_done`, `get_module_context`, `impact`, `search_graph`, `get_recent_sessions`, `report_feedback`.
+- The hooks need no permission (they are not tool calls), but they need `node` on the PATH, `FEEDBACK_GRAPH_URL` (default `http://localhost:8787`) and, when the API has a token, `FEEDBACK_GRAPH_TOKEN` in the environment; the MCP server reads the same two. They also read `git rev-parse HEAD` once per session to know where the session started. `--bare` skips plugin hooks, so nothing asks for the check: call `check_before_done` yourself.
+- A plugin that is not installed can be loaded for one run with `--plugin-dir <path to this plugin folder>`.
 
 ## If the MCP server is unavailable
 

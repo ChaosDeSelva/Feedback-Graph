@@ -3,6 +3,7 @@ import { join, posix } from 'node:path';
 import type { HumanTurn, ParsedSession, ToolCall } from '@fb/core';
 import { redactSecrets } from '@fb/core';
 import type { FileInfo } from '../cycle.ts';
+import { addInstructionFiles, codexInstructionFiles } from './instructions.ts';
 
 /**
  * OpenAI Codex CLI / Codex Desktop session transcripts (~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl),
@@ -132,6 +133,10 @@ export function codexSessionParser(file: string): CodexSessionParser {
       const cwd = cwdFromEnvironment(parts);
       if (cwd) s.cwd = cwd;
     }
+    for (const part of parts) {
+      const text = str(obj(part)?.text);
+      if (text) addInstructionFiles(s.instructionFiles!, codexInstructionFiles(text));
+    }
     const human = humanTextOf(parts);
     if (human === null) return;
     s.turns.push({
@@ -241,7 +246,7 @@ export function codexSessionParser(file: string): CodexSessionParser {
 
   return {
     push,
-    finish: () => (human ? segments.map((s) => ({ ...s, turns: [...s.turns], toolCalls: [...s.toolCalls], finalReply: s.finalReply ?? null })) : []),
+    finish: () => (human ? segments.map((s) => ({ ...s, turns: [...s.turns], toolCalls: [...s.toolCalls], instructionFiles: [...(s.instructionFiles ?? [])], finalReply: s.finalReply ?? null })) : []),
   };
 }
 
@@ -280,7 +285,7 @@ function normalise(rec: Obj, beforeMeta: boolean): Normalised | null {
 }
 
 function newSession(sessionId: string, sourceFile: string, cwd: string, gitBranch: string | null, ts: string): ParsedSession {
-  return { sessionId, sourceFile, cwd, gitBranch, startedAt: ts, endedAt: ts, turns: [], toolCalls: [] };
+  return { sessionId, sourceFile, cwd, gitBranch, startedAt: ts, endedAt: ts, turns: [], toolCalls: [], instructionFiles: [] };
 }
 
 /** A session a human typed into, from its session_meta: guardian reviewers and spawned sub-agents are not. */
