@@ -1,4 +1,4 @@
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -39,7 +39,7 @@ describe.skipIf(!dockerUp)('codex-runner container', () => {
   let scratch = '';
   let url = '';
 
-  beforeAll(() => {
+  beforeAll(async () => {
     root = realpathSync(mkdtempSync(join(tmpdir(), 'fb-runner-docker-')));
     scratch = join(root, 'scratch');
     const workerOnly = join(root, 'transcripts');
@@ -51,15 +51,36 @@ describe.skipIf(!dockerUp)('codex-runner container', () => {
     writeFileSync(auth, codexLogin ? readFileSync(authFile) : '');
     docker(['build', '--target', 'codex-runner', '-t', IMAGE, repoRoot], { timeout: 600_000 });
     docker(['network', 'create', `${id}-net`]);
+    // Linux bind mounts keep the host uid: like Compose's HOST_UID/HOST_GID, run both services as the owner
+    // of scratch and auth.json. Docker Desktop translates bind-mount ownership, so keep the image user there.
+    const user = process.platform === 'linux' ? ['--user', `${process.getuid!()}:${process.getgid!()}`] : [];
     // The worker's side: the scratch volume plus a mount and secrets only it has.
-    docker(['run', '-d', '--name', `${id}-worker`, '--network', `${id}-net`, '-v', `${scratch}:/scratch`, '-v', `${workerOnly}:/transcripts:ro`, '-e', `NEO4J_PASSWORD=${SECRET}`, '--entrypoint', 'node', IMAGE, '-e', 'setInterval(() => {}, 1000)']);
+    docker(['run', '-d', ...user, '--name', `${id}-worker`, '--network', `${id}-net`, '-v', `${scratch}:/scratch`, '-v', `${workerOnly}:/transcripts:ro`, '-e', `NEO4J_PASSWORD=${SECRET}`, '--entrypoint', 'node', IMAGE, '-e', 'setInterval(() => {}, 1000)']);
     // The runner with exactly the hardening docker-compose.yml gives it (checked against the file below), published on
     // loopback only for this test.
     docker([
-      'run', '-d', '--name', `${id}-runner`, '--network', `${id}-net`, '--init', '--read-only', '--tmpfs', '/tmp', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges:true', '--security-opt', 'seccomp=unconfined',
+      'run', '-d', ...user, '--name', `${id}-runner`, '--network', `${id}-net`, '--init', '--read-only', '--tmpfs', '/tmp', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges:true', '--security-opt', 'seccomp=unconfined',
       '-e', 'HOME=/tmp', '-v', `${scratch}:/scratch`, '-v', `${id}-home:/codex`, '-v', `${auth}:/codex/auth.json`, '-p', '127.0.0.1::8790', IMAGE,
     ]);
     url = `http://${docker(['port', `${id}-runner`, '8790/tcp']).trim().split('\n')[0]}`;
+    // Fail at startup with the runner's diagnostics, rather than reporting missing tokens or failed docker execs.
+    const logs = () => {
+      const result = spawnSync('docker', ['logs', `${id}-runner`], { encoding: 'utf8', timeout: 20_000 });
+      return `${result.stdout ?? ''}${result.stderr ?? ''}`;
+    };
+    const deadline = Date.now() + 30_000;
+    while (Date.now() < deadline) {
+      const state = JSON.parse(docker(['inspect', '--format', '{{json .State}}', `${id}-runner`])) as { Running: boolean; ExitCode: number };
+      if (!state.Running) throw new Error(`codex-runner exited with ${state.ExitCode}:\n${logs()}`);
+      try {
+        const health = await fetch(`${url}/health`, { signal: AbortSignal.timeout(1000) });
+        if (health.ok) return;
+      } catch {
+        // The process is running but has not started listening yet.
+      }
+      await new Promise((r) => setTimeout(r, 200));
+    }
+    throw new Error(`codex-runner did not become healthy:\n${logs()}`);
   }, 660_000);
 
   afterAll(() => {
