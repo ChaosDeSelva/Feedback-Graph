@@ -367,7 +367,7 @@ test('select rows, Reject selected: one confirm with a note, one request, and th
   await waitFor(() => expect(f.posts).toEqual([{ url: '/api/lessons/decisions', body: { items: [{ id: 'l1', status: 'rejected', note: 'platitudes' }, { id: 'l3', status: 'rejected', note: 'platitudes' }] } }]));
   await waitFor(() => expect(screen.queryByRole('checkbox', { name: 'select Server search' })).toBeNull());
   expect(screen.getByRole('checkbox', { name: 'select Auth checks' })).toBeTruthy();
-  expect(screen.queryByText(/selected$/)).toBeNull();
+  expect(screen.getByText('none selected')).toBeTruthy();
 });
 
 test('"select all with flag" picks exactly the lessons carrying it; Approve selected, and Cancel sends nothing', async () => {
@@ -419,6 +419,21 @@ test('the header says how the lessons the post-mortem wrote were judged: approve
   expect(judged.textContent).toMatch(/90 days/);
 });
 
+test('the header says how many of the decisions an agent made with the operator token, when any did', async () => {
+  const q = (days: number, asWritten: number, rejected: number, byOperator: number) => ({ days, asWritten, edited: 0, rejected, decided: asWritten + rejected, byOperator });
+  vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+    if (url === '/api/lessons/quality') return Response.json({ windows: [q(30, 81, 61, 40), q(90, 81, 61, 40)], projects: { acme: [q(30, 81, 61, 40), q(90, 81, 61, 40)] } });
+    if (url.startsWith('/api/lessons?')) return Response.json([lesson('l1', 'Server search')]);
+    if (url === '/api/lessons/l1') return Response.json(detail('l1', 'Server search'));
+    return Response.json([]);
+  }));
+  render(<Lessons />);
+  const judged = await screen.findByLabelText('how your lessons were judged');
+  expect(judged.textContent).toMatch(/40 by an agent with the operator token \(28%\)/);
+  expect(within(judged).getAllByRole('columnheader').map((h) => h.textContent)).toContain('by operator');
+  expect(within(judged).getAllByRole('row').map((r) => r.textContent)).toEqual(expect.arrayContaining([expect.stringMatching(/^acme.*142.*40 \(28%\)$/)]));
+});
+
 test('no decided lessons yet, or a server that cannot tell: the header says nothing about it', async () => {
   vi.stubGlobal('fetch', vi.fn(async (url: string) => {
     if (url === '/api/lessons/quality') return Response.json({ error: 'this store cannot count lesson decisions' }, { status: 404 });
@@ -464,4 +479,71 @@ test('narrowing a global lesson asks for its project and sends it with the scope
   fireEvent.change(project, { target: { value: 'data-pipeline' } });
   fireEvent.click(screen.getByRole('button', { name: 'Approve' }));
   await waitFor(() => expect(sent).toEqual([{ status: 'approved', scope: 'project', projectKey: 'data-pipeline' }]));
+});
+
+test('the bulk bar never moves the rows: its buttons are there (disabled) before anything is ticked, so a second click lands on the same row', async () => {
+  bulkFetch([flagged('l1', 'Server search', []), flagged('l2', 'Auth checks', []), flagged('l3', 'Cache keys', [])]);
+  render(<Lessons />);
+  await screen.findByRole('checkbox', { name: 'select Server search' });
+  const approve = screen.getByRole('button', { name: 'Approve selected' }) as HTMLButtonElement;
+  const reject = screen.getByRole('button', { name: 'Reject selected' }) as HTMLButtonElement;
+  expect(approve.disabled).toBe(true);
+  expect(reject.disabled).toBe(true);
+  expect(screen.getByText('none selected')).toBeTruthy();
+  const bar = approve.parentElement!;
+  const before = bar.childElementCount;
+  fireEvent.click(screen.getByRole('checkbox', { name: 'select Server search' }));
+  // The same elements, now enabled: nothing is added above the rows.
+  expect(bar.childElementCount).toBe(before);
+  expect(screen.getByRole('button', { name: 'Approve selected' })).toBe(approve);
+  expect(approve.disabled).toBe(false);
+  expect(screen.getByText('1 selected')).toBeTruthy();
+  fireEvent.click(screen.getByRole('checkbox', { name: 'select Auth checks' }));
+  expect((screen.getByRole('checkbox', { name: 'select Auth checks' }) as HTMLInputElement).checked).toBe(true);
+  expect((screen.getByRole('checkbox', { name: 'select Cache keys' }) as HTMLInputElement).checked).toBe(false);
+});
+
+test('an empty list under a filter says nothing matches the filter (not "none yet"), with a way to clear it', async () => {
+  const f = bulkFetch([]);
+  render(<Lessons />);
+  fireEvent.click(await screen.findByRole('button', { name: 'approved' }));
+  expect(await screen.findByText('No approved lessons yet')).toBeTruthy();
+  fireEvent.change(screen.getByLabelText('source'), { target: { value: 'github' } });
+  expect(await screen.findByText('No approved lessons match this filter')).toBeTruthy();
+  expect(screen.queryByText('No approved lessons yet')).toBeNull();
+  fireEvent.click(screen.getByRole('button', { name: 'Clear filters' }));
+  await waitFor(() => expect(f.lists.at(-1)).toBe('/api/lessons?status=approved'));
+  expect(await screen.findByText('No approved lessons yet')).toBeTruthy();
+});
+
+test('what the lesson check found is headed by status: "before you approve" only on a proposed lesson', async () => {
+  const checks = [{ name: 'generic', why: 'names no file, function, value or command' }];
+  const approved = { ...lesson('l1', 'Server search'), status: 'approved', checks };
+  vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+    if (url.startsWith('/api/lessons?')) return Response.json([approved]);
+    if (url === '/api/lessons/l1') return Response.json({ ...detail('l1', 'Server search'), lesson: approved });
+    return Response.json([]);
+  }));
+  render(<Lessons />);
+  fireEvent.click(await screen.findByRole('button', { name: 'approved' }));
+  const found = await screen.findByRole('region', { name: 'what the lesson check found' });
+  expect(found.textContent).toMatch(/what the lesson check found/i);
+  expect(found.textContent).not.toMatch(/before you approve/i);
+});
+
+test('the judged header counts the decisions an agent made with the operator token apart', async () => {
+  const q = (days: number, byOperator: number) => ({ days, asWritten: 5, edited: 3, rejected: 2, decided: 10, byOperator });
+  vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+    if (url === '/api/lessons/quality') return Response.json({ windows: [q(30, 4), q(90, 4)], projects: {} });
+    if (url.startsWith('/api/lessons?')) return Response.json([lesson('l1', 'Server search')]);
+    if (url === '/api/lessons/l1') return Response.json(detail('l1', 'Server search'));
+    return Response.json([]);
+  }));
+  render(<Lessons />);
+  const judged = await screen.findByLabelText('how your lessons were judged');
+  expect(judged.textContent).toMatch(/4 by an agent/);
+  // Said once, with its share: 0.6.3 printed it a second time after the ternary.
+  const summary = judged.querySelector('summary')!.textContent!;
+  expect(summary.match(/by an agent with the operator token/g)).toHaveLength(1);
+  expect(summary).toMatch(/4 by an agent with the operator token \(40%\)/);
 });

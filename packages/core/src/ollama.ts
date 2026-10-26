@@ -50,10 +50,13 @@ export function ollamaTuning(env: Record<string, string | undefined>): OllamaTun
 
 /** A fetch to Ollama that names Ollama, its URL and the model when nothing answers, instead of a bare "fetch failed". */
 async function ollamaFetch(url: string, model: string, what: string, fix: string, init: RequestInit & { timeoutMs: number }, fetchImpl?: typeof fetch): Promise<Response> {
-  const { timeoutMs, ...rest } = init;
+  const { timeoutMs, signal, ...rest } = init;
+  const timeout = AbortSignal.timeout(timeoutMs);
   try {
-    return await (fetchImpl ?? fetch)(`${base(url)}${what}`, { ...rest, signal: AbortSignal.timeout(timeoutMs) });
+    return await (fetchImpl ?? fetch)(`${base(url)}${what}`, { ...rest, signal: signal ? AbortSignal.any([timeout, signal]) : timeout });
   } catch (err) {
+    // The caller gave up (JsonTask.signal): its reason, not a timeout or an outage.
+    if (signal?.aborted) throw signal.reason ?? err;
     if (modelTimeoutReason(err)) {
       // Asked, but no answer in time: this item's failure (it counts), not an outage.
       throw new ModelTimeoutError(`Ollama (${model}) did not answer within ${timeoutMs / 1000} s; raise OLLAMA_TIMEOUT_SECONDS, or lower OLLAMA_NUM_PREDICT if it loops`);
@@ -83,6 +86,8 @@ export type ChatJsonOpts = {
   numCtx?: number;
   /** Base64 images for a vision model, sent with the user message. */
   images?: string[];
+  /** Cancels the request when the caller gives up (JsonTask.signal). */
+  signal?: AbortSignal;
 };
 
 /**
@@ -120,6 +125,7 @@ export async function ollamaChatJson<T>(o: ChatJsonOpts): Promise<T> {
       ],
     }),
     timeoutMs: o.timeoutMs ?? DEFAULT_OLLAMA_TIMEOUT_MS,
+    ...(o.signal && { signal: o.signal }),
   }, o.fetchImpl);
   let res = await ask(!noThinkField.has(server));
   if (!res.ok) {
@@ -150,7 +156,8 @@ export type EmbedOpts = {
 
 /** Batch embeddings via Ollama's /api/embed. */
 export async function ollamaEmbed(o: EmbedOpts): Promise<number[][]> {
-  const numCtx = o.numCtx ?? EMBED_NUM_CTX[o.model.replace(/:latest$/, '')];
+  const name = o.model.replace(/:latest$/, '');
+  const numCtx = o.numCtx ?? (Object.hasOwn(EMBED_NUM_CTX, name) ? EMBED_NUM_CTX[name] : undefined);
   // Embeddings always come from Ollama: search, get_task_context and check_before_done need it running.
   const res = await ollamaFetch(o.url, o.model, '/api/embed', START, {
     method: 'POST',

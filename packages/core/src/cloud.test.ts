@@ -281,7 +281,8 @@ test('a project too large for the cloud (413) goes again with its code map cut t
   const full = bundle('shop', { codeFiles });
   const fullBytes = Buffer.byteLength(JSON.stringify(await syncBundle(store({ shop: full }), 'shop')));
   const limit = Math.floor(fullBytes / 2);
-  const tooBig = Response.json({ error: `bundle larger than ${limit} bytes; sync one project at a time` }, { status: 413 });
+  // The cloud says it keeps a cut code map (features: codeFilesPartial); only then is the code map cut.
+  const tooBig = Response.json({ error: `bundle larger than ${limit} bytes; sync one project at a time`, features: ['codeFilesPartial'] }, { status: 413 });
   const { f, calls } = fakeFetch([tooBig, Response.json(ok)]);
   const memory = new Map();
   const r = await runCloudSync({ cloud, portability: store({ shop: full }), activity, projects: async () => ['shop'], trigger: 'schedule', fetch: f, sleep: noSleep, memory });
@@ -309,7 +310,7 @@ test('a project too large for the cloud (413) goes again with its code map cut t
 });
 
 test('a 413 that the code map cannot explain says what to do: raise SYNC_MAX_BYTES or leave the project out', async () => {
-  const tooBig = () => Response.json({ error: 'bundle larger than 1000 bytes; sync one project at a time' }, { status: 413 });
+  const tooBig = () => Response.json({ error: 'bundle larger than 1000 bytes; sync one project at a time', features: ['codeFilesPartial'] }, { status: 413 });
   // No code map to cut: one request, and the advice fits a bundle that is already one project.
   const plain = fakeFetch([tooBig()]);
   const r = await runCloudSync({ cloud, portability: store({ shop: bundle('shop', { codeFiles: [] }) }), projects: async () => ['shop'], trigger: 'schedule', fetch: plain.f, sleep: noSleep });
@@ -323,6 +324,29 @@ test('a 413 that the code map cannot explain says what to do: raise SYNC_MAX_BYT
   expect(sentBody(both.calls.at(-1)!).codeFiles).toEqual([]);
   expect(both.calls.length).toBeLessThanOrEqual(4);
   expect(r2.error).toMatch(/even without its code map.*SYNC_MAX_BYTES/);
+});
+
+test('a cloud that does not say it keeps a cut code map is never sent one: the project fails with what to do', async () => {
+  // An older cloud drops the codeFilesPartial key, takes the cut bundle as complete and withdraws the files left out
+  // of the team code map. Without `features: ['codeFilesPartial']` in its 413 the code map is not cut at all.
+  const codeFiles = Array.from({ length: 50 }, (_, i) => codeFile(i, i));
+  for (const answer of [
+    () => Response.json({ error: 'bundle larger than 1000 bytes; raise SYNC_MAX_BYTES on the cloud' }, { status: 413 }),
+    () => Response.json({ error: 'bundle larger than 1000 bytes', features: ['somethingElse'] }, { status: 413 }),
+    () => new Response('<html>413 Request Entity Too Large</html>', { status: 413 }),
+  ]) {
+    const memory = new Map();
+    const { f, calls } = fakeFetch([answer(), Response.json(ok)]);
+    const r = await runCloudSync({ cloud, portability: store({ shop: bundle('shop', { codeFiles }) }), projects: async () => ['shop'], trigger: 'schedule', fetch: f, sleep: noSleep, memory });
+    expect(calls).toHaveLength(1);
+    expect(sentBody(calls[0]).codeFiles).toHaveLength(50);
+    expect(r.projects[0]).toMatchObject({ key: 'shop', status: 'failed' });
+    expect(r.projects[0]).not.toHaveProperty('trimmed');
+    expect(r.error).toMatch(/shop.*too large for the cloud \(413\)/);
+    expect(r.error).toMatch(/does not say it keeps a cut code map.*not cut.*SYNC_MAX_BYTES.*update the cloud.*EXCLUDE_PROJECTS/);
+    // Nothing was accepted, so nothing is remembered: the next run tries the whole bundle again.
+    expect(memory.size).toBe(0);
+  }
 });
 
 test('a project the schedule is backing off from waits: it is not exported or sent, and the run is not a failure', async () => {

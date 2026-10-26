@@ -410,3 +410,16 @@ test('the session a comment was worked out against, and how it was matched, are 
   });
   expect(activity[0].details).toMatchObject({ workSession: { id: 's-loader', matchedBy: 'files' } });
 });
+
+test("the lessons shown to the writer as the owner's examples are kept in Activity by id (none shown: an empty list)", async () => {
+  const activity: ActivityInput[] = [];
+  const traces = [['lesson:e1', 'lesson:r1', 'lesson:w1'], undefined];
+  await runPostmortems({
+    k: { feedbackNeedingPostmortem: async () => [input('a'), input('b')], savePostmortem: async () => {}, recordPostmortemFailure: async () => ({ attempts: 1, retryAt: null }) },
+    postmortem: async () => ({ ...pm, trace: { provider: 'fake', agentic: false, standing: [], facts: [], lessonFlags: [], ...(traces[0] && { examples: traces.shift() }) } }),
+    embed: async (texts) => texts.map(() => [1]),
+    batch: 3,
+    activity: { record: async (a) => void activity.push(a) },
+  });
+  expect(activity.map((a) => a.details?.examples)).toEqual([['lesson:e1', 'lesson:r1', 'lesson:w1'], []]);
+});

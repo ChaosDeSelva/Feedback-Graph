@@ -264,3 +264,17 @@ test('ask: picks a project and a question, then opens a new chat on the Ask page
   expect(location.hash).toBe(newChatHref('acme', 'add a modal / dialog?'));
   expect(location.hash).toContain('project=acme');
 });
+
+test('ask: the model to answer with can be chosen here too, and goes with the question to the Ask page', async () => {
+  render(<Dashboard />);
+  const card = await region(/^ask$/i);
+  await waitFor(() => expect((within(card).getByLabelText('ask project') as HTMLSelectElement).value).toBe('demo-shop'));
+  const model = within(card).getByLabelText('ask provider') as HTMLSelectElement;
+  expect(model.value).toBe('');
+  expect([...model.options].map((o) => o.textContent)).toEqual(['Default model', 'Claude', 'Codex', 'Local model']);
+  fireEvent.change(model, { target: { value: 'codex' } });
+  fireEvent.change(within(card).getByLabelText('question'), { target: { value: 'where do routes go?' } });
+  fireEvent.click(within(card).getByRole('button', { name: 'Ask' }));
+  expect(location.hash).toBe(newChatHref('demo-shop', 'where do routes go?', 'codex'));
+  expect(location.hash).toContain('provider=codex');
+});

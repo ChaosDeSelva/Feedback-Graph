@@ -17,9 +17,10 @@ export type MissSubjectDeps = {
 
 /**
  * Bump when isProcessMiss changes. 1: feedback and lesson both about git, not a comment on a file. 2: and neither
- * names a file or code behaviour, and the lesson has no paths; process misses that fail it are restored.
+ * names a file or code behaviour, and the lesson has no paths; process misses that fail it are restored. 3: feedback
+ * that is wholly an instruction about git ("don't push a PR yet") is one too, whatever its lesson's paths or rule.
  */
-export const MISS_SUBJECT_VERSION = 2;
+export const MISS_SUBJECT_VERSION = 3;
 export const MISS_SUBJECT_CURSOR = 'misses-subject';
 const PAGE = 500;
 const MAX_TARGETS = 50;
@@ -69,7 +70,7 @@ export async function sortOldMisses(d: MissSubjectDeps): Promise<{ marked: numbe
     await d.activity?.record({
       kind: 'misses_reclassified', actor: 'deterministic', projectKey,
       subject: `${ids.length} past miss${ids.length === 1 ? '' : 'es'} about branches, merges or pull requests ${ids.length === 1 ? 'is' : 'are'} no longer tied to files`,
-      why: `process misses (rule v${MISS_SUBJECT_VERSION}) are about how the work was handled, not the code the session edited`,
+      why: `process misses (rule v${MISS_SUBJECT_VERSION}) are about how the work was handled, not the code the session edited; an instruction about git ("don't push a PR yet") is one whatever files its lesson names`,
       details: { subject: 'process', count: ids.length, version: MISS_SUBJECT_VERSION },
       targets: ids.slice(0, MAX_TARGETS),
     });

@@ -70,8 +70,8 @@ const CAUSE_TONE: Record<string, Tone> = {
   verification_gap: 'accent',
   implementation_error: 'violet',
 };
-export const causeLabel = (cause: string) => CAUSE_LABEL[cause] ?? cause;
-export const causeTone = (cause: string): Tone => CAUSE_TONE[cause] ?? 'neutral';
+export const causeLabel = (cause: string) => (Object.hasOwn(CAUSE_LABEL, cause) ? CAUSE_LABEL[cause] : cause);
+export const causeTone = (cause: string): Tone => (Object.hasOwn(CAUSE_TONE, cause) ? CAUSE_TONE[cause] : 'neutral');
 
 export function CauseBadge({ cause }: { cause: string }) {
   return <Badge tone={causeTone(cause)} dot>{causeLabel(cause)}</Badge>;
@@ -171,4 +171,21 @@ export function ago(iso: string, now = Date.now()): string {
   if (s < 30 * 86_400) return `${Math.floor(s / 86_400)}d ago`;
   if (s < 365 * 86_400) return `${Math.floor(s / (30 * 86_400))}mo ago`;
   return `${Math.floor(s / (365 * 86_400))}y ago`;
+}
+
+/** A time as people read it: "Oct 26, 08:34", in the viewer's locale and zone (never the ISO string). */
+export const longTime = (iso: string) => new Date(iso).toLocaleString(undefined, { year: 'numeric', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+
+/** A relative time ("3h ago") with the exact one on hover, in words; never wraps. */
+export function Time({ iso, className = '' }: { iso: string; className?: string }) {
+  return <time dateTime={iso} title={longTime(iso)} className={`whitespace-nowrap tabular-nums ${className}`}>{ago(iso)}</time>;
+}
+
+/** A small muted tag for an id (an actor, a run): one line, cut with an ellipsis, the whole value on hover. */
+export function Chip({ children, title, className = '' }: { children: ReactNode; title?: string; className?: string }) {
+  return (
+    <span className={`inline-flex h-[18px] min-w-0 items-center rounded-sm border border-line bg-sunken px-1.5 font-mono text-[11px] leading-none text-muted ${className}`}>
+      <span title={title} className="truncate">{children}</span>
+    </span>
+  );
 }

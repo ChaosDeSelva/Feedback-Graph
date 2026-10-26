@@ -315,12 +315,15 @@ export class CloudSyncError extends Error {
   readonly fatal: boolean;
   /** 413: the most bytes the cloud takes in one request, when it said (its SYNC_MAX_BYTES). */
   readonly limit: number | null;
-  constructor(message: string, status: number, retryable = false, limit: number | null = null) {
+  /** What the cloud said it understands, from its error body (`features`), e.g. `codeFilesPartial`; empty when it did not say. */
+  readonly features: readonly string[];
+  constructor(message: string, status: number, retryable = false, limit: number | null = null, features: readonly string[] = []) {
     super(redactSecrets(message).slice(0, 500));
     this.status = status;
     this.retryable = retryable;
     this.fatal = status === 401 || status === 403 || status === -1;
     this.limit = limit;
+    this.features = features;
   }
 }
 
@@ -412,14 +415,16 @@ export async function pushBundle(o: {
     }
     const text = await res.text().catch(() => '');
     let serverError: string | null = null;
+    let features: string[] = [];
     try {
-      const e = (JSON.parse(text) as { error?: unknown }).error;
-      serverError = typeof e === 'string' ? e.slice(0, 300) : null;
+      const j = JSON.parse(text) as { error?: unknown; features?: unknown };
+      serverError = typeof j.error === 'string' ? j.error.slice(0, 300) : null;
+      if (Array.isArray(j.features)) features = j.features.filter((f): f is string => typeof f === 'string').slice(0, 50);
     } catch {
       /* not JSON */
     }
     const retryable = res.status === 429 || res.status >= 500;
-    last = new CloudSyncError(explain(res.status, serverError, bytes), res.status, retryable, res.status === 413 ? limitOf(serverError) : null);
+    last = new CloudSyncError(explain(res.status, serverError, bytes), res.status, retryable, res.status === 413 ? limitOf(serverError) : null, features);
     if (!retryable) throw last;
     if (attempt < attempts) {
       const after = retryAfterMs(res.headers.get('retry-after'));
@@ -484,17 +489,32 @@ export function fitCodeFiles(b: SyncBundle, maxBytes: number): SyncBundle {
   return { ...b, codeFiles: b.codeFiles.filter((c) => keep.has(c)) };
 }
 
+/** What a cloud lists in `features` (in its 413 answer) when it keeps the files a cut code map leaves out. */
+export const CODE_FILES_PARTIAL = 'codeFilesPartial';
+
 /**
  * Send `bundle`; when the cloud refuses it as too large (413) and it carries a code map, send it again with the code
  * map cut to fit: to the limit the cloud named (else half the body), then half that, then none. The cut bundle says
- * `codeFilesPartial`, so the cloud keeps the files it leaves out (the rest of the bundle is still complete); a cloud
- * from before that flag takes them out of the team's code map until they fit again. The result says how many went. A bundle too large even without its code map fails with what to do.
+ * `codeFilesPartial`, so the cloud keeps the files it leaves out (the rest of the bundle is still complete). Only a
+ * cloud whose 413 lists `codeFilesPartial` in its `features` is sent a cut: an older one drops the key, takes the cut
+ * as complete and withdraws the files left out from the team's code map, so against it the project fails, uncut, with
+ * what to do. The result says how many went. A bundle too large even without its code map fails with what to do.
  */
 async function pushFitting(bundle: SyncBundle, push: (b: SyncBundle) => Promise<SyncResponse>): Promise<{ r: SyncResponse; trimmed?: ProjectSyncResult['trimmed'] }> {
   try {
     return { r: await push(bundle) };
   } catch (err) {
     if (!(err instanceof CloudSyncError) || err.status !== 413 || !bundle.codeFiles.length) throw err;
+    if (!err.features.includes(CODE_FILES_PARTIAL)) {
+      const limit = err.limit;
+      throw new CloudSyncError(
+        `the bundle (${Math.round(bytesOf(bundle) / 1024)} KB) is too large for the cloud (413)${limit ? `, which takes at most ${limit} bytes` : ''}, ` +
+          'and this cloud does not say it keeps a cut code map (codeFilesPartial), so the code map was not cut (an older cloud ' +
+          `would withdraw the files left out from the team code map): ask its operator to raise SYNC_MAX_BYTES${limit ? ` above ${limit} bytes` : ''} ` +
+          'or update the cloud, or leave this project out of sync with EXCLUDE_PROJECTS or SYNC_PROJECTS',
+        413, false, limit, err.features,
+      );
+    }
     const full = bytesOf(bundle);
     let budget = Math.floor(err.limit !== null ? err.limit * 0.95 : full / 2);
     let limit = err.limit;

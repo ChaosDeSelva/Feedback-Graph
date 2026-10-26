@@ -31,6 +31,35 @@ export function relevanceBand(r: number | null): RelevanceBand {
   return r >= EVERYDAY_FROM ? 'everyday' : r >= RARE_BELOW ? 'sometimes' : 'rare';
 }
 
+/**
+ * Kinds that can be needed in most changes (the rubric's "core conventions, invariants, the data model, auth and
+ * security rules, how modules fit together"). One module's API, a config option, a gotcha in one area, a command or a
+ * dependency is needed for some changes: at most SOMETIMES_TOP.
+ */
+const EVERYDAY_KINDS = new Set(['convention', 'invariant', 'architecture', 'data_model', 'security']);
+/** Where a fact the calibration takes out of "everyday" lands: the top of "sometimes". */
+export const SOMETIMES_TOP = 0.7;
+/** The most of a set of scored facts that may be everyday (at least one). Models scored 62% of facts everyday in 0.6.2. */
+export const EVERYDAY_SHARE = 0.25;
+
+/**
+ * Models score generously (0.6.2: 62% of facts "everyday", which then ranks nothing above anything). Calibrated in code,
+ * over one set (a shard's or a file's facts, a scoring batch): a fact of a kind that is about one area
+ * (EVERYDAY_KINDS) is at most SOMETIMES_TOP; past EVERYDAY_SHARE of the scored facts, the least relevant everyday ones
+ * (project-wide ones win a tie) are set to SOMETIMES_TOP too. Facts under everyday, and unscored ones, are left as
+ * they are; calibrating twice changes nothing. Order is kept.
+ */
+export function calibrateRelevance<T extends { kind: string; path: string; relevance?: number | null }>(facts: T[]): T[] {
+  const out = facts.map((f) => (typeof f.relevance === 'number' && f.relevance >= EVERYDAY_FROM && !EVERYDAY_KINDS.has(f.kind) ? { ...f, relevance: SOMETIMES_TOP } : f));
+  const scored = out.filter((f) => typeof f.relevance === 'number').length;
+  const room = Math.max(1, Math.floor(EVERYDAY_SHARE * scored));
+  const everyday = out.map((f, i) => ({ f, i })).filter(({ f }) => typeof f.relevance === 'number' && f.relevance >= EVERYDAY_FROM);
+  if (everyday.length <= room) return out;
+  const wide = (p: string) => (p === '.' || p === '' ? 1 : 0);
+  const keep = new Set(everyday.sort((a, b) => b.f.relevance! - a.f.relevance! || wide(b.f.path) - wide(a.f.path) || a.i - b.i).slice(0, room).map(({ i }) => i));
+  return out.map((f, i) => (everyday.some((e) => e.i === i) && !keep.has(i) ? { ...f, relevance: SOMETIMES_TOP } : f));
+}
+
 const NON_MISS = /^\s*(?:the agent|it|this|there)\s+(?:did not|didn't|was not|wasn't|is not|isn't)\s+(?:miss\b|a miss\b)|^\s*no miss\b|\bnot a (?:real |genuine )?miss\b/i;
 
 /** A post-mortem that concluded the agent missed nothing ("The agent did not miss the feedback, ..."): never served. */

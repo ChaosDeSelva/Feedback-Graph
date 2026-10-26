@@ -645,6 +645,35 @@ test('scripts/fg setup runs ./scripts/setup.sh with its arguments, without Node 
   expect(out).toBe('setup ran: --yes --projects /tmp/x\n');
 });
 
+test('scripts/fg warns loudly, before any command, when this folder\'s Compose name runs from another folder', async () => {
+  const { spawnSync } = await import('node:child_process');
+  const { chmodSync, copyFileSync, mkdirSync, mkdtempSync, writeFileSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const { fileURLToPath } = await import('node:url');
+  const root = fileURLToPath(new URL('../../../', import.meta.url));
+  const fg = (startedIn: string, env = '') => {
+    const repo = mkdtempSync(join(tmpdir(), 'fgguard-'));
+    const bin = join(repo, 'bin');
+    mkdirSync(join(repo, 'scripts'));
+    mkdirSync(bin);
+    copyFileSync(join(root, 'scripts', 'fg'), join(repo, 'scripts', 'fg'));
+    writeFileSync(join(repo, '.env'), env);
+    // No Node new enough here, so fg runs the CLI in the api container; docker says where the containers came from.
+    writeFileSync(join(bin, 'node'), '#!/bin/sh\nexit 1\n');
+    const dir = startedIn === 'HERE' ? repo : startedIn;
+    writeFileSync(join(bin, 'docker'), `#!/bin/sh\ncase "$1 $2" in "ps -a") printf '%s' "$*" | grep -q 'project=${env ? 'feedback-graph-repo' : 'feedback-graph'} ' && echo '${dir}' ;; *) echo "cli ran: $*" ;; esac\n`);
+    for (const f of ['node', 'docker']) chmodSync(join(bin, f), 0o755);
+    return spawnSync('bash', [join(repo, 'scripts', 'fg'), 'status'], { encoding: 'utf8', env: { PATH: `${bin}:/usr/bin:/bin` } });
+  };
+  const other = fg('/srv/acme/feedback-graph');
+  expect(other.stderr).toMatch(/WARNING.*feedback-graph.*started from \/srv\/acme\/feedback-graph, not this folder/);
+  expect(other.stderr).toMatch(/FG_INSTANCE/);
+  expect(other.stdout).toContain('cli ran:');
+  expect(fg('HERE').stderr).toBe('');
+  expect(fg('/srv/acme/feedback-graph', 'FG_INSTANCE=feedback-graph-repo\n').stderr).toMatch(/feedback-graph-repo/);
+});
+
 test('scripts/fg doctor runs ./scripts/doctor.sh with its arguments, without Node or the API', async () => {
   const { execFileSync } = await import('node:child_process');
   const { chmodSync, copyFileSync, mkdirSync, mkdtempSync, writeFileSync } = await import('node:fs');
@@ -772,10 +801,22 @@ test('fg cleanup --run: a dry run by default (counts per kind, what stays and wh
   expect(f.text()).toMatch(/manual:b.*approved lesson "B"/);
   expect(f.text()).toMatch(/c-owner/);
   expect(f.text()).toMatch(/--apply/);
-  const g = fake({ 'DELETE /api/runs/run-1': () => ({ json: plan({ dryRun: false, removed: plan().remove }) }) });
+  // The dry run says the run's Activity entries go with --apply, all but the run_cleaned entry.
+  expect(f.text()).toMatch(/its 4 Activity entries go too with --apply.*run_cleaned/);
+  const g = fake({ 'DELETE /api/runs/run-1': () => ({ json: plan({ dryRun: false, removed: plan().remove, entriesRemoved: 4 }) }) });
   expect(await run(['cleanup', '--run', 'run-1', '--apply'], g.io)).toBe(0);
   expect(g.calls[0].body).toEqual({ dryRun: false });
   expect(g.text()).toMatch(/removed/i);
+  expect(g.text()).toMatch(/removed its 4 Activity entries.*run_cleaned/);
+  // A run with more entries than a plan reads says so.
+  const big = fake({ 'DELETE /api/runs/run-1': () => ({ json: plan({ entries: 5000, entriesCapped: true }) }) });
+  await run(['cleanup', '--run', 'run-1'], big.io);
+  expect(big.text()).toMatch(/at least 5000 Activity entries/);
+  // Only the entries a plan read (and listed) go: the rest wait for the next cleanup, and it says so.
+  expect(big.text()).toMatch(/the 5000 newest go with --apply.*the older ones stay until you run it again/);
+  const bigApply = fake({ 'DELETE /api/runs/run-1': () => ({ json: plan({ dryRun: false, removed: plan().remove, entriesRemoved: 5000, entriesCapped: true }) }) });
+  await run(['cleanup', '--run', 'run-1', '--apply'], bigApply.io);
+  expect(bigApply.text()).toMatch(/older entries may remain: run fg cleanup --run run-1 --apply again/);
   expect(await run(['cleanup', '--run', 'run-1', '--dry-run'], fake({ 'DELETE /api/runs/run-1': () => ({ json: plan() }) }).io)).toBe(0);
   expect(await run(['cleanup'], fake({}).io)).toBe(2);
   expect(await run(['cleanup', '--run', 'run-1', '--apply', '--dry-run'], fake({}).io)).toBe(2);
@@ -839,4 +880,22 @@ test('status says how the lessons were judged in the last 30 days, when the serv
   const none = fake({ 'GET /api/status': () => ({ json: idle }), 'GET /api/pipeline': () => pipeline() });
   expect(await run(['status'], none.io)).toBe(0);
   expect(none.text()).not.toMatch(/approved as written/);
+});
+
+test('lessons quality and status say how many of the decisions an agent made with the operator token', async () => {
+  const op = (q: ReturnType<typeof quality>, byOperator: number) => ({ ...q, byOperator });
+  const f = fake({
+    'GET /api/lessons/quality': () => ({ json: { windows: [op(quality(30, 81, 0, 61), 40), op(quality(90, 81, 0, 61), 40)], projects: {} } }),
+    'GET /api/status': () => ({ json: idle }),
+    'GET /api/pipeline': () => pipeline({ lessons: { proposed: 2, approved: 0, quality: [op(quality(30, 81, 0, 61), 40), op(quality(90, 81, 0, 61), 40)] } }),
+  });
+  expect(await run(['lessons', 'quality'], f.io)).toBe(0);
+  expect(f.text()).toMatch(/PROJECT\s+DAYS\s+DECIDED\s+AS WRITTEN\s+AFTER EDIT\s+REJECTED\s+BY OPERATOR/);
+  expect(f.text()).toMatch(/all\s+30\s+142\s+81 \(57%\)\s+0 \(0%\)\s+61 \(43%\)\s+40 \(28%\)/);
+  expect(await run(['status'], f.io)).toBe(0);
+  expect(f.text()).toMatch(/61 rejected \(43%\); 40 of them by an agent with the operator token/);
+  // None by an operator: not mentioned in status.
+  const mine = fake({ 'GET /api/status': () => ({ json: idle }), 'GET /api/pipeline': () => pipeline({ lessons: { proposed: 0, approved: 0, quality: [op(quality(30, 1, 0, 0), 0)] } }) });
+  expect(await run(['status'], mine.io)).toBe(0);
+  expect(mine.text()).not.toMatch(/operator token/);
 });

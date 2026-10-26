@@ -27,8 +27,13 @@ const DOCS_MAX = 500;
 /** The server only accepts plain file names. */
 const safeName = (n: string) => n.replace(/[^\w .()-]/g, '_').replace(/^[^\w]+/, '') || 'document.txt';
 
-/** An upload's reading, in a few words: what the worker has made of it so far. */
+/** How often a large upload is checked on while it is embedded, at most (15 minutes at the usual 5 s). */
+const EMBED_POLLS = 180;
+
+/** An upload's reading, in a few words: what the worker has made of it so far (or of its new version, being embedded). */
 function ReadState({ d }: { d: DocSummary }) {
+  if (d.embed?.status === 'pending') return <span className="shrink-0 text-xs text-muted">embedding a new version…</span>;
+  if (d.embed?.status === 'failed') return <span className="min-w-0 text-xs text-bad-text [overflow-wrap:anywhere]">new version not stored: {d.embed.error ?? 'unknown error'}</span>;
   if (!d.read) return null;
   const r = d.read;
   if (r.status === 'pending' || r.status === 'reading') {
@@ -42,7 +47,7 @@ function ReadState({ d }: { d: DocSummary }) {
  * Context that isn't code: your uploads (text and images, read into facts by the worker), PR discussions and tickets
  * synced for this project.
  */
-export function ProjectDocs({ projectKey, onError, pollMs = 5000 }: { projectKey: string; onError: (e: string) => void; pollMs?: number }) {
+export function ProjectDocs({ projectKey, onError, pollMs = 5000, maxEmbedPolls = EMBED_POLLS }: { projectKey: string; onError: (e: string) => void; pollMs?: number; maxEmbedPolls?: number }) {
   const [docs, setDocs] = useState<DocSummary[]>([]);
   // Where the next (older) page starts; null when every document is shown.
   const [next, setNext] = useState<string | null>(null);
@@ -86,18 +91,56 @@ export function ProjectDocs({ projectKey, onError, pollMs = 5000 }: { projectKey
     return () => { stale = true; clearInterval(t); };
   }, [reading, projectKey, pollMs]);
 
+  // Large uploads the API embeds in the background (202): each is checked by id (it may be past the first page, or
+  // replace a document already listed) until it is stored, fails, or maxEmbedPolls checks have passed.
+  type Embedding = { id: string; name: string; chunks: number; status: 'pending' | 'failed' | 'waited'; error?: string; polls: number };
+  const [embedding, setEmbedding] = useState<Embedding[]>([]);
+  const pending = embedding.filter((e) => e.status === 'pending');
+  useEffect(() => setEmbedding([]), [projectKey]);
+  useEffect(() => {
+    if (!pending.length) return;
+    let stale = false;
+    const t = setInterval(async () => {
+      const checked = await Promise.all(pending.map(async (e) => {
+        try {
+          return { e, d: await api.doc(e.id) };
+        } catch {
+          return { e, d: undefined }; // not reached: checked again next time
+        }
+      }));
+      if (stale) return;
+      // What each check found, decided here (a state updater may run later): stored ones leave, and the list reloads.
+      const found = new Map(checked.map(({ e, d }): [string, { error: string } | 'stored' | 'pending' | null] => [
+        e.id,
+        d === undefined ? null
+          : d === null ? { error: 'the server no longer has it (it may have restarted); upload it again' }
+          : d.embed?.status === 'failed' ? { error: d.embed.error ?? 'unknown error' }
+          : d.embed ? 'pending' : 'stored',
+      ]));
+      setEmbedding((es) => es.flatMap((x): Embedding[] => {
+        const f = found.get(x.id);
+        if (!f || x.status !== 'pending') return [x];
+        if (f === 'stored') return [];
+        if (f !== 'pending') return [{ ...x, status: 'failed', error: f.error }];
+        const polls = x.polls + 1;
+        return [{ ...x, polls, status: polls >= maxEmbedPolls ? 'waited' : 'pending' }];
+      }));
+      // Not tied to this interval: the entry just removed ends it, and the stored version must still be listed.
+      if ([...found.values()].includes('stored')) void load();
+    }, pollMs);
+    return () => { stale = true; clearInterval(t); };
+  }, [pending.map((e) => e.id).join(' '), projectKey, pollMs, maxEmbedPolls]);
+
   async function upload(files: FileList | null) {
     if (!files?.length) return;
     setBusy(true);
     try {
       for (const f of Array.from(files)) {
         const base = { title: f.name, name: safeName(f.name) };
-        if (isImage(f.type)) {
-          const url = await readFile(f, 'dataUrl');
-          await api.uploadDoc(projectKey, { ...base, image: { mediaType: f.type, data: url.slice(url.indexOf(',') + 1) } });
-        } else {
-          await api.uploadDoc(projectKey, { ...base, text: await readFile(f, 'text') });
-        }
+        const r = isImage(f.type)
+          ? await readFile(f, 'dataUrl').then((url) => api.uploadDoc(projectKey, { ...base, image: { mediaType: f.type, data: url.slice(url.indexOf(',') + 1) } }))
+          : await api.uploadDoc(projectKey, { ...base, text: await readFile(f, 'text') });
+        if (r.pending) setEmbedding((es) => [...es.filter((e) => e.id !== r.id), { id: r.id, name: f.name, chunks: r.chunks, status: 'pending', polls: 0 }]);
       }
       await load();
     } catch (e) {
@@ -137,13 +180,25 @@ export function ProjectDocs({ projectKey, onError, pollMs = 5000 }: { projectKey
     <Card
       title={`Docs and discussions (${docs.length}${next ? '+' : ''})`}
       actions={
-        <label className={buttonClass('secondary', 'sm', `cursor-pointer focus-within:outline-2 focus-within:outline-focus ${busy ? 'opacity-60' : ''}`)}>
+        <label className={buttonClass('secondary', 'sm', `relative cursor-pointer focus-within:outline-2 focus-within:outline-focus ${busy ? 'opacity-60' : ''}`)}>
           <UploadIcon size={13} />
           {busy ? 'uploading…' : 'upload docs or images'}
           <input aria-label="upload document" type="file" multiple accept={ACCEPT} className="sr-only" onChange={(e) => upload(e.target.files)} disabled={busy} />
         </label>
       }
     >
+      {embedding.map((e) => (
+        <p key={e.id} className={`flex items-center justify-between gap-2 border-b border-line px-3 py-2 text-xs ${e.status === 'failed' ? 'text-bad-text' : 'text-muted'}`}>
+          <span className="min-w-0 [overflow-wrap:anywhere]">
+            {e.status === 'pending' && <>{e.name} ({e.chunks.toLocaleString('en-US')} chunks) is being embedded; it shows here once stored.</>}
+            {e.status === 'failed' && <>{e.name} could not be stored: {e.error}</>}
+            {e.status === 'waited' && <>{e.name} is still being embedded; it shows here once stored, and Activity says if it fails.</>}
+          </span>
+          {e.status !== 'pending' && (
+            <Button size="sm" variant="ghost" aria-label={`dismiss ${e.name}`} onClick={() => setEmbedding((es) => es.filter((x) => x.id !== e.id))}>dismiss</Button>
+          )}
+        </p>
+      ))}
       <ul>
         {docs.map((d) => (
           <li key={d.id} className="flex items-center justify-between gap-2 border-b border-line px-3 py-2 last:border-b-0 hover:bg-sunken">

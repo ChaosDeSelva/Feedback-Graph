@@ -1,5 +1,5 @@
 import { expect, test } from 'vitest';
-import { AnswerRefused, askJson, extractJsonAnswer, ModelOutputError, outputTail, STRICT_JSON } from './json.ts';
+import { AnswerRefused, askJson, extractJsonAnswer, MIN_RETRY_MS, ModelOutputError, outputTail, STRICT_JSON } from './json.ts';
 import type { JsonTask, LlmProvider } from './providers.ts';
 
 test('a bare JSON answer parses as is', () => {
@@ -123,4 +123,48 @@ test('askJson with promptOnly gives an agentic provider a fresh folder', async (
   const llm: LlmProvider = { id: 'a', agentic: true, json: async (t) => { seen.push(t); return { a: 1 }; } };
   await askJson(llm, task, isA, { promptOnly: true });
   expect(seen[0].cwd).toMatch(/fb-prompt-/);
+});
+
+test('askJson tells the validator which attempt is the last, whatever made the first one fail (bad JSON included)', async () => {
+  const lasts: boolean[] = [];
+  const v = (raw: unknown, at: { last: boolean }) => { lasts.push(at.last); return isA(raw); };
+  expect(await askJson(fake([new ModelOutputError('no JSON object in the answer', 'prose'), { a: 5 }]).llm, task, v)).toEqual({ a: 5 });
+  // The first answer never reached the validator; the second is the last and is told so.
+  expect(lasts).toEqual([true]);
+  lasts.length = 0;
+  await askJson(fake([{ b: 1 }, { a: 6 }]).llm, task, v);
+  expect(lasts).toEqual([false, true]);
+});
+
+test('askJson within a deadline: each attempt gets the time left as its timeout, and no retry when too little is left', async () => {
+  const { llm, seen } = fake([{ b: 1 }, { a: 7 }]);
+  expect(await askJson(llm, { ...task, timeoutMs: 180_000 }, isA, { deadline: Date.now() + 60_000 })).toEqual({ a: 7 });
+  expect(seen[0].timeoutMs).toBeLessThanOrEqual(60_000);
+  expect(seen[0].timeoutMs).toBeGreaterThan(55_000);
+  expect(seen[1].timeoutMs).toBeLessThanOrEqual(60_000);
+
+  // Less than MIN_RETRY_MS left: no second ask, so the first is the last (and is told so).
+  const lasts: boolean[] = [];
+  const refuse = (raw: unknown, at: { last: boolean }) => {
+    lasts.push(at.last);
+    const a = isA(raw);
+    if (a.a < 0 && !at.last) throw new AnswerRefused('negative');
+    return a;
+  };
+  const short = fake([{ a: -1 }, { a: 8 }]);
+  expect(await askJson(short.llm, task, refuse, { deadline: Date.now() + MIN_RETRY_MS - 1000 })).toEqual({ a: -1 });
+  expect(short.seen).toHaveLength(1);
+  expect(lasts).toEqual([true]);
+  const bad = fake([{ b: 1 }, { a: 9 }]);
+  await expect(askJson(bad.llm, task, isA, { deadline: Date.now() + 1000 })).rejects.toThrow(ModelOutputError);
+  expect(bad.seen).toHaveLength(1);
+});
+
+test('askJson passes the abort signal to the provider and does not ask again once it has fired', async () => {
+  const c = new AbortController();
+  const { llm, seen } = fake([{ b: 1 }, { a: 1 }]);
+  const aborting: LlmProvider = { ...llm, json: async (t) => { const r = await llm.json(t); c.abort(); return r; } };
+  await expect(askJson(aborting, task, isA, { signal: c.signal })).rejects.toThrow();
+  expect(seen).toHaveLength(1);
+  expect(seen[0].signal).toBe(c.signal);
 });

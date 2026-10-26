@@ -24,8 +24,8 @@ x-env: &env
   OLLAMA_REPEAT_PENALTY: ${OLLAMA_REPEAT_PENALTY:-}
   OLLAMA_NUM_CTX: ${OLLAMA_NUM_CTX:-}
   OLLAMA_TIMEOUT_SECONDS: ${OLLAMA_TIMEOUT_SECONDS:-}
-  # Which projects are read is chosen in the UI (Settings). INGEST_PROJECTS only seeds that choice on the first
-  # start; EXCLUDE_PROJECTS is never read, scanned or served, whatever is chosen.
+  # Which projects are read is chosen in the UI (Settings). INGEST_PROJECTS only seeds that choice while none has
+  # been made; EXCLUDE_PROJECTS is never read, scanned or served, whatever is chosen.
   INGEST_PROJECTS: ${INGEST_PROJECTS:-}
   EXCLUDE_PROJECTS: ${EXCLUDE_PROJECTS:-}
   # Feedback Graph Cloud sync, off unless both are set: push your lessons to a team org (see README).
@@ -214,6 +214,8 @@ services:
     environment:
       <<: *env
       CHECK_LLM: ${CHECK_LLM:-}
+      CHECK_CONCURRENCY: ${CHECK_CONCURRENCY:-}
+      CHECK_WAIT_SECONDS: ${CHECK_WAIT_SECONDS:-}
       # Set API_TOKEN (24+ chars, e.g. openssl rand -hex 24) before exposing the API beyond this machine.
       API_TOKEN: ${API_TOKEN:-}
       PUBLIC_HOSTS: ${PUBLIC_HOSTS:-}
@@ -233,6 +235,10 @@ services:
       GITHUB_REPOS: ${GITHUB_REPOS:-}
       LINEAR_API_KEY: ${LINEAR_API_KEY:-}
       INTEGRATIONS_FILE: /settings/integrations.json
+      # The worker's file limits, so answers can say why a named file is not in the code map (over SCAN_MAX_BYTES, or
+      # past the SCAN_MAX_FILES cap). Empty = the defaults.
+      SCAN_MAX_FILES: ${SCAN_MAX_FILES:-}
+      SCAN_MAX_BYTES: ${SCAN_MAX_BYTES:-}
     volumes:
       # Only this folder of ./state: not the worker's database or the Codex login placeholder.
       - ./state/settings:/settings

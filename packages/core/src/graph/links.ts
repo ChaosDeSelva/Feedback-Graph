@@ -124,6 +124,7 @@ export class LinksRepo implements LinksStore {
   async setLink(x: string, y: string, patch: LinkPatch): Promise<ProjectLink> {
     const [a, b] = linkPair(x, y);
     const id = linkIdOf(a, b, patch.run);
+    this.g.sandbox.wrote(patch.run);
     // A run decides only on a link it made (runWriteOwner); the owner's decision makes a run's link the owner's.
     const [cur] = await this.g.run(`MATCH (l:ProjectLink {id: $id}) RETURN l.run AS run`, { id });
     const run = runWriteOwner(`the link ${a} ↔ ${b}`, cur ? (cur.get('run') ?? null) : undefined, patch.run, patch.byOwner);

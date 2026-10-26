@@ -20,6 +20,11 @@ export type JsonTask = {
   schema: object;
   cwd?: string;
   timeoutMs?: number;
+  /**
+   * Aborts the request when the caller gives up (check_before_done's admission deadline). The HTTP providers (Ollama,
+   * OpenAI-compatible, Anthropic, jev) cancel the request; the CLI providers run to their timeoutMs.
+   */
+  signal?: AbortSignal;
   images?: TaskImage[];
   /**
    * The most tokens this job's answer needs (a short label: 256). Ollama sends it as num_predict unless
@@ -90,6 +95,10 @@ export type ProviderEnv = Record<string, string | undefined>;
 export type ProviderOpts = { fetchImpl?: typeof fetch; exec?: Exec };
 
 const DEFAULT_TIMEOUT = 15 * 60_000;
+
+/** A request's signal: its timeout, and the caller's own (JsonTask.signal) when it gives one. */
+export const withSignal = (timeoutMs: number, signal?: AbortSignal): AbortSignal =>
+  (signal ? AbortSignal.any([AbortSignal.timeout(timeoutMs), signal]) : AbortSignal.timeout(timeoutMs));
 
 /** `fn` in the task's folder, or in a fresh empty one when it names none (never the process's own folder). */
 const inTaskFolder = <T>(t: JsonTask, fn: (cwd: string) => Promise<T>): Promise<T> => (t.cwd ? fn(t.cwd) : inEmptyFolder(fn));
@@ -175,6 +184,7 @@ function ollama(id: string, model: string, env: ProviderEnv, o: ProviderOpts): L
       numCtx: tune.numCtx,
       repeatPenalty: tune.repeatPenalty,
       images: t.images?.map((i) => i.data),
+      signal: t.signal,
     }),
   };
 }
@@ -201,7 +211,7 @@ function openaiCompatible(id: string, model: string, baseUrl: string, key: strin
           ],
           response_format: { type: 'json_schema', json_schema: { name: 'result', strict: true, schema: strictSchema(t.schema) } },
         }),
-        signal: AbortSignal.timeout(t.timeoutMs ?? DEFAULT_TIMEOUT),
+        signal: withSignal(t.timeoutMs ?? DEFAULT_TIMEOUT, t.signal),
       });
       if (!res.ok) throw new Error(`${id} ${res.status}: ${(await res.text()).slice(0, 500)}`);
       const body = (await res.json()) as { choices?: { message?: { content?: string } }[] };
@@ -232,7 +242,7 @@ function anthropic(id: string, model: string, key: string, o: ProviderOpts): Llm
           tools: [{ name: 'respond', description: 'Return the result', input_schema: t.schema }],
           tool_choice: { type: 'tool', name: 'respond' },
         }),
-        signal: AbortSignal.timeout(t.timeoutMs ?? DEFAULT_TIMEOUT),
+        signal: withSignal(t.timeoutMs ?? DEFAULT_TIMEOUT, t.signal),
       });
       if (!res.ok) throw new Error(`${id} ${res.status}: ${(await res.text()).slice(0, 500)}`);
       const body = (await res.json()) as { content?: { type: string; input?: unknown }[] };
@@ -385,7 +395,7 @@ function jev(id: string, model: string, key: string, o: ProviderOpts): LlmProvid
           model,
           questions: Object.fromEntries(choices.map(([k, p]) => [k, { type: 'choice', instructions: t.system, criteria: Object.fromEntries(p.enum!.map((e) => [e, e])) }])),
         }),
-        signal: AbortSignal.timeout(t.timeoutMs ?? 60_000),
+        signal: withSignal(t.timeoutMs ?? 60_000, t.signal),
       });
       if (!res.ok) throw new Error(`${id} ${res.status}: ${(await res.text()).slice(0, 500)}`);
       const body = (await res.json()) as { answers?: Record<string, { choice?: string; confidence?: number }> };

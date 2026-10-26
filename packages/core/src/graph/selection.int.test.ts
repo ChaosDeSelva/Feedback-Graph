@@ -72,6 +72,25 @@ describeStores('SelectionStore', (h) => {
     expect(r.selection).toMatchObject({ tracked: [], initialized: false });
   });
 
+  test('a selection never made takes INGEST_PROJECTS set after the first start (setup.sh --select), once; a made one never does', async () => {
+    // Started with nothing chosen: stored empty and not initialized.
+    await sel.ensure({ ingestProjects: [], excludeProjects: [] }, activity);
+    const r = await sel.ensure({ ingestProjects: ['demo-shop', 'secret'], excludeProjects: ['secret'] }, activity);
+    expect(r.seeded).toBe(true);
+    expect(r.selection).toMatchObject({ tracked: ['demo-shop'], initialized: true });
+    const log = await activity.list({ kind: 'projects_selected' });
+    expect(log).toHaveLength(2);
+    expect(log.find((e) => (e.details as { seededFrom?: string }).seededFrom === 'INGEST_PROJECTS')).toMatchObject({ actor: 'deterministic', details: { tracked: ['demo-shop'] } });
+    // Made now: INGEST_PROJECTS changing later does nothing, and nothing more is logged.
+    const again = await sel.ensure({ ingestProjects: ['other'], excludeProjects: [] }, activity);
+    expect(again).toMatchObject({ seeded: false, selection: { tracked: ['demo-shop'] } });
+    // Chosen in Settings, even as nothing at all, is a selection made.
+    await sel.setTracked([]);
+    const kept = await sel.ensure({ ingestProjects: ['other'], excludeProjects: [] }, activity);
+    expect(kept).toMatchObject({ seeded: false, selection: { tracked: [], initialized: true } });
+    expect(await activity.list({ kind: 'projects_selected' })).toHaveLength(2);
+  });
+
   test('setting the selection marks it chosen and returns what it was before', async () => {
     await sel.ensure({ ingestProjects: ['a'], excludeProjects: [] });
     const r = await sel.setTracked(['b', 'a', 'b']);

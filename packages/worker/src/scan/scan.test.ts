@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { ModelTimeoutError, ProviderUnavailableError, STRICT_JSON, type ActivityInput, type CodeFact, type FactScope, type LlmProvider, type ScanJob } from '@fb/core';
 import { expect, test } from 'vitest';
-import { checkCitations, deterministicFacts, extractFileFacts, hasCodeFiles, listCodeFiles, listCodeFilesWithTotal, runScan, ScanPlans, FACT_CHECK_VERSION, SCAN_PROMPT_VERSION, SCANNER_VERSION, type ScanDeps } from './scan.ts';
+import { checkCitations, DEPENDENCY_FACT_MAX, deterministicFacts, extractFileFacts, summarizeDependencies, hasCodeFiles, listCodeFiles, listCodeFilesWithTotal, runScan, ScanPlans, FACT_CHECK_VERSION, SCAN_PROMPT_VERSION, SCANNER_VERSION, type ScanDeps } from './scan.ts';
 
 function repo(git = false) {
   const dir = mkdtempSync(join(tmpdir(), 'fbscan-'));
@@ -74,6 +74,27 @@ test('deterministicFacts also reads pyproject, go.mod, Cargo.toml, Makefile targ
   // never a value from .env.example
   expect(at('.env.example', `API_TOKEN=${'x'.repeat(30)}`).join()).not.toContain('xxxx');
   expect(at('src/main.ts', 'export const a = 1;')).toEqual([]);
+});
+
+test('a dependency fact is a summary (how many, the notable ones), never the full list: the manifest and the code map have that', () => {
+  const deps = Object.fromEntries([
+    ['@types/node', '^22'], ['react', '^18.3.1'], ['eslint-plugin-react', '^7'], ['hono', '^4.6.0'], ['zod', '^3.23.8'],
+    ...Array.from({ length: 115 }, (_, i) => [`@acme/feature-${String(i).padStart(3, '0')}`, `^1.${i}.0`]),
+  ]);
+  const dev = Object.fromEntries(Array.from({ length: 60 }, (_, i) => [`@types/pkg-${i}`, '^1']));
+  const [, dep] = deterministicFacts([{ path: 'package.json', content: JSON.stringify({ scripts: { dev: 'vite' }, dependencies: deps, devDependencies: dev }) }]);
+  expect(dep.kind).toBe('dependency');
+  // 0.6.2 stored lists up to 6,923 characters.
+  expect(dep.statement.length).toBeLessThanOrEqual(DEPENDENCY_FACT_MAX);
+  expect(dep.statement).toMatch(/^Dependencies \(120\): react \^18\.3\.1, hono \^4\.6\.0, zod \^3\.23\.8, .* and \d+ more\. Dev dependencies \(60\): .* and \d+ more\.$/);
+  // Type packages and lint plugins are the least notable.
+  expect(dep.statement.indexOf('@types/node')).toBe(-1);
+  const go = deterministicFacts([{ path: 'go.mod', content: `module example.com/shop\n\ngo 1.22\n\nrequire (\n${Array.from({ length: 300 }, (_, i) => `\tgithub.com/acme/m${i} v1.${i}.0`).join('\n')}\n)\n` }])[0];
+  expect(go.statement.length).toBeLessThanOrEqual(DEPENDENCY_FACT_MAX);
+  expect(go.statement).toMatch(/^Go module example\.com\/shop \(go 1\.22\)\. Requires \(300\): github\.com\/acme\/m0 v1\.0\.0, .* and \d+ more\.$/);
+  // A short list stays whole, and summarizing twice changes nothing.
+  expect(summarizeDependencies('Dependencies: react ^18. Dev dependencies: vitest ^3.')).toBe('Dependencies: react ^18. Dev dependencies: vitest ^3.');
+  expect(summarizeDependencies(dep.statement)).toBe(dep.statement);
 });
 
 test('checkCitations drops facts citing a file that does not exist, fixes lines beyond the file, and grades the evidence', async () => {
@@ -664,24 +685,70 @@ test('a sharded scan gives up its slot after a shard while another scan waits, a
   expect(activity.filter((a) => a.kind === 'scan_finished')).toHaveLength(1);
 });
 
-test('a file an agent asks for while a sharded scan waits its turn is read when it goes on, even in a shard it already got through', async () => {
+test('a scan leaves folders of data out of its plan and says so when it starts', async () => {
+  const dir = workspace();
+  mkdirSync(join(dir, 'transcripts'));
+  for (let i = 0; i < 220; i++) writeFileSync(join(dir, `transcripts/s${i}.json`), '{}');
+  execFileSync('git', ['-C', dir, 'add', '-A']);
+  const agent = shardAgent();
+  const { deps, activity } = fakeDeps({ llm: agent });
+  deps.facts.fileHashes = async () => new Map();
+  await runScan(job(dir), deps);
+  expect(agent.seen.some((s) => s.user.includes('transcripts/'))).toBe(false);
+  const started = activity.find((a) => a.kind === 'scan_started')!;
+  expect(started.why).toContain('220 files in data folders are left out: transcripts/ (220)');
+  expect(started.details).toMatchObject({ dataDirs: [{ dir: 'transcripts', files: 220 }] });
+});
+
+test('a scan calibrates the relevance its model gives before saving: one area\'s facts are not everyday', async () => {
+  const dir = workspace();
+  const agent = llm(() => ({ facts: [
+    { kind: 'api', statement: 'core0 is exported for the api package', path: 'packages/core/src/m0.ts', lines: null, confidence: 0.9, why: 'w', relevance: 0.95 },
+    { kind: 'invariant', statement: 'every module exports one constant', path: '.', lines: null, confidence: 0.9, why: 'w', relevance: 0.95 },
+  ] }), true);
+  const { deps, written } = fakeDeps({ llm: agent });
+  deps.facts.fileHashes = async () => new Map();
+  await runScan(job(dir), deps);
+  const api = written.find((f) => f.statement.startsWith('core0'))!;
+  expect(api.relevance).toBe(0.7);
+  expect(written.find((f) => f.statement.startsWith('every module'))!.relevance).toBe(0.95);
+});
+
+test('a file an agent asks for in a shard the scan already got through is read on its own when it goes on, not the whole shard again, and its facts count once', async () => {
   const dir = workspace();
   const asked: string[] = [];
-  const { deps } = fakeDeps({ llm: shardAgent((s) => asked.push(s)) });
+  const shards = shardAgent((s) => asked.push(s));
+  const agent: LlmProvider = {
+    id: 'claude-cli', agentic: true,
+    json: async (t) => {
+      if (!t.user.startsWith('FILE: ')) return shards.json(t);
+      asked.push(t.user.split('\n')[0]);
+      // One fact the shard already gave (restated with other spacing and a full stop), one new.
+      return { summary: 'S', facts: [
+        { kind: 'api', statement: 'about  README.md.', path: 'README.md', lines: null, confidence: 0.9 },
+        { kind: 'convention', statement: 'the README names the dev script', path: 'README.md', lines: null, confidence: 0.9 },
+      ] };
+    },
+  };
+  const { deps, saved, written } = fakeDeps({ llm: agent });
   deps.facts.fileHashes = async () => new Map();
+  deps.facts.listFacts = async (q) => written.filter((f) => !q.path || f.path === q.path).map((f, i) => ({ ...f, id: `f${i}`, source: 'claude-cli', createdAt: 't', scanJobId: 'j', fileHash: null, fileSummary: null, relevance: null, relevanceBy: null, docId: null }));
   const stored = storedJob(dir, deps);
   deps.yieldTurn = async () => true;
   await runScan(stored.get(), deps);
   expect(asked).toEqual(['.']);
-  // get_task_context named a root file meanwhile: the shard holding it runs first, then the next one.
+  expect(stored.get().factsAdded).toBe(3);
+  // get_task_context named a root file meanwhile: that file is read by itself, then the next shard runs.
   deps.facts.scanRequests = async () => ['README.md'];
   deps.facts.clearScanRequests = async () => { deps.facts.scanRequests = async () => []; };
   await runScan(stored.get(), deps);
-  expect(asked).toEqual(['.', '.']);
+  expect(asked).toEqual(['.', 'FILE: README.md', 'packages/api']);
+  // The file's facts: the one the shard gave, kept once, and the new one; only the new one is counted.
+  expect(saved).toEqual([{ path: 'README.md', facts: 2, version: SCANNER_VERSION }]);
+  expect(stored.get().factsAdded).toBe(3 + 1 + 3);
   await runScan(stored.get(), deps);
-  await runScan(stored.get(), deps);
-  expect(asked).toEqual(['.', '.', 'packages/api', 'packages/core']);
-  expect(stored.get()).toMatchObject({ status: 'done', shards: { total: 3, rescanned: 3 } });
+  expect(asked).toEqual(['.', 'FILE: README.md', 'packages/api', 'packages/core']);
+  expect(stored.get()).toMatchObject({ status: 'done', factsAdded: 10, shards: { total: 3, rescanned: 3 } });
 });
 
 test('a sharded scan that gives way keeps its file list and shard plan for its next turn while HEAD stays, never its mirror, and builds them again once HEAD moves', async () => {

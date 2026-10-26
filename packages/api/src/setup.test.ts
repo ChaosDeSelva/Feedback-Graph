@@ -3,7 +3,10 @@ import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSy
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { expect, test } from 'vitest';
+import { expect, test, vi } from 'vitest';
+
+// Each test runs the real script in a subshell; on a loaded machine that can pass vitest's 5 s default.
+vi.setConfig({ testTimeout: 20_000 });
 
 // scripts/setup.sh, run on a copy of the files it reads (so it never writes this repo's .env), with a throwaway HOME and
 // stand-ins for docker, curl (Ollama not answering) and, to play Linux, uname and id.
@@ -501,4 +504,66 @@ test('FG_INSTANCE given is used as it is; an existing .env is never renamed, onl
   expect(said).toMatch(/FG_INSTANCE=/);
   const bad = sandbox();
   expect(bad.runFailing({ PROJECTS_DIRS: '~/code', FG_INSTANCE: 'Has Spaces' })).toMatch(/FG_INSTANCE/);
+});
+
+test('--help documents a second install: FG_INSTANCE, the ports it moves (OLLAMA_PORT too) and --select', () => {
+  const s = sandbox();
+  const help = s.run({}, undefined, ['--help']);
+  for (const k of ['FG_INSTANCE', 'API_PORT', 'NEO4J_HTTP_PORT', 'NEO4J_BOLT_PORT', 'POSTGRES_PORT', 'OLLAMA_PORT', '--select', 'INGEST_PROJECTS']) expect(help).toContain(k);
+});
+
+test('a hand-written .env under the name another folder\'s install runs as is never started, nor are agents connected', () => {
+  const s = sandbox({ containers: [{ project: 'feedback-graph', dir: '/srv/acme/feedback-graph', ports: PORTS }] });
+  writeFileSync(join(s.repo, '.env'), `NEO4J_PASSWORD=x\nPROJECTS_DIRS=${join(s.home, 'code')}\n`);
+  // --yes would start it and run install-agent.sh: both would take over the other folder's install.
+  const out = s.runFailing({}, ['--yes']);
+  expect(s.ran()).not.toContain('docker compose');
+  expect(s.ran()).not.toContain('install-agent');
+  expect(out).toMatch(/not starting/i);
+  expect(out).toContain('/srv/acme/feedback-graph');
+  expect(out).toMatch(/FG_INSTANCE=feedback-graph-repo/);
+  // Without --yes it says the same instead of the usual "next: docker compose up", and nothing fails.
+  const quiet = s.run();
+  expect(quiet).toMatch(/not starting/i);
+  expect(quiet).not.toMatch(/next: docker compose up/);
+  // Its own folder's containers are no reason to refuse.
+  const own = sandbox();
+  writeFileSync(join(own.base, 'containers'), `feedback-graph\t${own.repo}\t${PORTS}\n`);
+  own.run({ PROJECTS_DIRS: '~/code' }, undefined, ['--yes']);
+  expect(own.ran()).toContain('docker compose up -d --build');
+}, 20_000);
+
+test('--select seeds the projects read until a selection is made: INGEST_PROJECTS in .env, checked against the folders', () => {
+  const s = sandbox();
+  for (const d of ['acme', 'demo-shop', '.hidden']) mkdirSync(join(s.home, 'code', d));
+  const out = s.run({}, undefined, ['--projects', '~/code', '--select', 'acme, demo-shop']);
+  expect(s.value('INGEST_PROJECTS')).toBe('acme,demo-shop');
+  expect(out).toMatch(/INGEST_PROJECTS=acme,demo-shop/);
+  expect(out).toMatch(/until a selection is made/i);
+  // A re-run (the stack already started once with nothing chosen) sets it the same way.
+  s.run({}, undefined, ['--select', 'demo-shop']);
+  expect(s.value('INGEST_PROJECTS')).toBe('demo-shop');
+  // A key that is no folder under the project folders is refused, and .env keeps what it had.
+  expect(s.runFailing({}, ['--select', 'nope'])).toMatch(/nope.*not a folder under your project folders/);
+  expect(s.value('INGEST_PROJECTS')).toBe('demo-shop');
+  expect(s.runFailing({}, ['--select', 'a b'])).toMatch(/--select/);
+  // A nested key (a__b is a/b) whose parts climb out of the project folders, or name a hidden folder, is refused.
+  mkdirSync(join(s.home, 'outside'));
+  for (const k of ['acme__..__..__outside', '..__outside', 'acme__.hidden', 'acme____demo-shop']) expect(s.runFailing({}, ['--select', k])).toMatch(/--select/);
+  expect(s.value('INGEST_PROJECTS')).toBe('demo-shop');
+});
+
+test('a first run in a terminal offers to choose the projects to read from the folders found; Enter leaves it to Settings', () => {
+  const s = sandbox();
+  for (const d of ['acme', 'demo-shop']) mkdirSync(join(s.home, 'code', d));
+  // Answers: projects to read, operator token (n), start (n).
+  const out = s.run({ PROJECTS_DIRS: '~/code' }, 'demo-shop\nn\nn\n');
+  expect(out).toContain('acme');
+  expect(s.value('INGEST_PROJECTS')).toBe('demo-shop');
+  const later = sandbox();
+  mkdirSync(join(later.home, 'code', 'acme'));
+  later.run({ PROJECTS_DIRS: '~/code' }, '\nn\nn\n');
+  expect(later.value('INGEST_PROJECTS')).toBe('');
+  // Not asked again on a re-run: the selection may already be made, in Settings.
+  expect(later.run({}, 'n\nn\n')).not.toMatch(/Which of these projects/);
 });

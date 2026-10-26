@@ -1,6 +1,6 @@
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, expect, test, vi } from 'vitest';
-import { Activity } from './Activity.tsx';
+import { Activity, ActivityEntry } from './Activity.tsx';
 
 const rows = [
   {
@@ -133,11 +133,67 @@ test('each actor says what kind of actor it is: a person, an agent with the oper
   expect(screen.getByLabelText('who did it')).toBeTruthy();
 });
 
-test('an entry made in a labelled run says which run, and whether it was a sandbox', async () => {
+test('an entry made in a labelled run says which run, and whether it was a sandbox (labelled runs shown)', async () => {
   const labelled = { ...rows[2], id: 'a7', subject: 'context for "tune it"', run: 'run-1', sandbox: true };
   vi.stubGlobal('fetch', vi.fn(async (url: string) => (url.startsWith('/api/activity') ? Response.json([labelled, rows[1]]) : Response.json([]))));
   render(<Activity />);
-  await screen.findByText('context for "tune it"');
+  await screen.findByText(rows[1].subject);
+  fireEvent.click(screen.getByLabelText('hide labelled runs'));
+  expect(await screen.findByText('context for "tune it"')).toBeTruthy();
   expect(screen.getByText('run run-1 · sandbox')).toBeTruthy();
   expect(screen.getAllByText(/^run run-/)).toHaveLength(1);
+});
+
+test('one row per entry: the subject on one line (whole on hover), then the time, actor and run as chips; the kind badge on the right', async () => {
+  const long = 'v062-e2e-' + 'x'.repeat(50);
+  const entry = { ...rows[2], id: 'a5', kind: 'feedback_decided', actor: 'operator:v062-e2e', subject: 'confirmed "the modal does not close on Escape"', run: long, ts: new Date(Date.now() - 3 * 3600_000).toISOString(), details: { status: 'confirmed' } };
+  render(<ul><ActivityEntry a={entry as never} /></ul>);
+  const subject = screen.getByText(entry.subject);
+  expect(subject.getAttribute('title')).toBe(entry.subject);
+  expect(subject.className).toMatch(/truncate/);
+  const row = subject.closest('button')!;
+  // The time: relative, with the exact one in words on hover (never the ISO string).
+  const time = row.querySelector('time')!;
+  expect(time.textContent).toBe('3h ago');
+  expect(time.getAttribute('datetime')).toBe(entry.ts);
+  expect(time.getAttribute('title')).not.toMatch(/T\d\d:/);
+  expect(time.className).toMatch(/whitespace-nowrap/);
+  // The actor and the run are chips that cut a long id and show it whole on hover.
+  const actor = screen.getByText('operator:v062-e2e');
+  expect(actor.className).toMatch(/truncate/);
+  const run = screen.getByText(`run ${long}`);
+  expect(run.className).toMatch(/truncate/);
+  expect(run.closest('[title]')!.getAttribute('title')).toContain(long);
+  // The kind badge sits at the end of the first line, never in a column of its own.
+  const badge = screen.getByText('your decision');
+  expect(subject.parentElement!.contains(badge)).toBe(true);
+});
+
+test('labelled runs are hidden by default, saying how many; unhiding asks the API for them too', async () => {
+  const labelled = { ...rows[2], id: 'a7', subject: 'context for "tune it"', run: 'run-1' };
+  vi.stubGlobal('fetch', vi.fn(async (url: string) => { urls.push(url); return url.startsWith('/api/activity') ? Response.json([labelled, rows[1]]) : Response.json([]); }));
+  render(<Activity />);
+  await screen.findByText(rows[1].subject);
+  expect((screen.getByLabelText('hide labelled runs') as HTMLInputElement).checked).toBe(true);
+  expect(screen.queryByText('context for "tune it"')).toBeNull();
+  expect(screen.getByText(/1 entry from a labelled run is hidden/)).toBeTruthy();
+  fireEvent.click(screen.getByLabelText('hide labelled runs'));
+  expect(await screen.findByText('context for "tune it"')).toBeTruthy();
+  await waitFor(() => expect(urls).toContain('/api/activity?limit=300&runs=1'));
+});
+
+test('filters by run: the entries of that one run, whatever the hide setting', async () => {
+  const labelled = { ...rows[2], id: 'a7', subject: 'context for "tune it"', run: 'run-1' };
+  vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+    urls.push(url);
+    if (url.startsWith('/api/activity?run=run-1')) return Response.json([labelled]);
+    return url.startsWith('/api/activity') ? Response.json([rows[1]]) : Response.json([]);
+  }));
+  render(<Activity />);
+  await screen.findByText(rows[1].subject);
+  fireEvent.change(screen.getByLabelText('run'), { target: { value: 'run-1' } });
+  fireEvent.submit(screen.getByLabelText('run').closest('form')!);
+  expect(await screen.findByText('context for "tune it"')).toBeTruthy();
+  expect(urls).toContain('/api/activity?run=run-1&limit=300');
+  expect(screen.queryByText(rows[1].subject)).toBeNull();
 });

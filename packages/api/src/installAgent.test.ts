@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, statSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -302,4 +302,37 @@ test('a second instance with the plugin installed still registers its own server
   // The skills come with the plugin already.
   expect(existsSync(join(s.home, '.claude', 'skills', 'feedback-graph'))).toBe(false);
   expect(out).toMatch(/plugin/);
+});
+
+test('a second instance leaves the first install\'s skill links and Codex guidance alone, and says so; with none there, it adds them', () => {
+  const s = sandbox(['claude', 'codex']);
+  const skills = join(s.home, '.claude', 'skills');
+  const first = join(s.home, 'first-install');
+  const names = ['feedback-graph', 'postmortem', 'test-from-feedback'];
+  mkdirSync(skills, { recursive: true });
+  for (const k of names) {
+    mkdirSync(join(first, 'plugin', 'skills', k), { recursive: true });
+    symlinkSync(join(first, 'plugin', 'skills', k), join(skills, k));
+  }
+  mkdirSync(s.codexDir);
+  const guidance = '# Mine\n\n<!-- BEGIN feedback-graph (managed) -->\nthe first install guidance\n<!-- END feedback-graph -->\n';
+  writeFileSync(s.agentsMd, guidance);
+  const out = s.run([], { FG_INSTANCE: 'feedback-graph-repo', API_PORT: '8797' });
+  for (const k of names) expect(readlinkSync(join(skills, k))).toBe(join(first, 'plugin', 'skills', k));
+  expect(readFileSync(s.agentsMd, 'utf8')).toBe(guidance);
+  expect(backups(s.codexDir, 'AGENTS.md')).toHaveLength(0);
+  expect(out).toMatch(/skill .*another install.*left as it is/i);
+  expect(out).toMatch(/guidance .*left as it is/i);
+  // Its own server is still registered, beside the first's.
+  expect(readFileSync(s.calls, 'utf8')).toContain('mcp add --transport http --scope user feedback-graph-repo http://localhost:8797/mcp');
+  expect(readFileSync(s.config, 'utf8')).toContain('[mcp_servers.feedback-graph-repo]');
+  // Nothing there yet: the second install links and writes them.
+  const bare = sandbox(['claude', 'codex']);
+  bare.run([], { FG_INSTANCE: 'feedback-graph-repo' });
+  expect(existsSync(join(bare.home, '.claude', 'skills', 'postmortem'))).toBe(true);
+  expect(readFileSync(bare.agentsMd, 'utf8')).toContain('BEGIN feedback-graph');
+  // The default install takes its links and its block back, as before.
+  s.run([]);
+  expect(readlinkSync(join(skills, 'postmortem'))).toBe(join(repoRoot, 'plugin', 'skills', 'postmortem'));
+  expect(readFileSync(s.agentsMd, 'utf8')).not.toContain('the first install guidance');
 });

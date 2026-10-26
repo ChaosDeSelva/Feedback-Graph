@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'vitest';
-import { initialSelection, projectScope, selectionNote, shownProjects } from './scope.ts';
+import { selectionSeededActivity } from './graph/selection.ts';
+import { ingestSeedsStored, initialSelection, projectScope, selectionNote, shownProjects } from './scope.ts';
 
 const sel = (tracked: string[], initialized = true) => ({ tracked, initialized, updatedAt: null });
 
@@ -91,5 +92,21 @@ describe('shownProjects', () => {
     expect(s.initialized).toBe(false);
     expect(s.keys).toEqual([]);
     expect(s.has('shop')).toBe(false);
+  });
+});
+
+describe('a selection never made', () => {
+  test('takes INGEST_PROJECTS set after the first start; a selection made (even as nothing) never does', () => {
+    expect(ingestSeedsStored(sel([], false), { ingestProjects: ['demo-shop'] })).toBe(true);
+    expect(ingestSeedsStored(sel([], false), { ingestProjects: [] })).toBe(false);
+    expect(ingestSeedsStored(sel([], true), { ingestProjects: ['demo-shop'] })).toBe(false);
+    expect(ingestSeedsStored(sel(['acme'], false), { ingestProjects: ['demo-shop'] })).toBe(false);
+  });
+
+  test('the log says it was taken from INGEST_PROJECTS because nothing had been chosen yet, not that this is a first start', () => {
+    const a = selectionSeededActivity({ tracked: ['demo-shop'], initialized: true }, 3, true, true);
+    expect(a).toMatchObject({ actor: 'deterministic', subject: 'reading 1 project: demo-shop', details: { seededFrom: 'INGEST_PROJECTS' } });
+    expect(a.why).toMatch(/no selection had been made yet.*INGEST_PROJECTS.*setup\.sh --select.*Settings/);
+    expect(a.why).not.toMatch(/first start/);
   });
 });

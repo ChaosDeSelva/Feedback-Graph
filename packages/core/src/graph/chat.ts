@@ -1,10 +1,17 @@
 import { randomUUID } from 'node:crypto';
+import neo4j from 'neo4j-driver';
 import {
   ChatBusyError, cleanChatAnswer, cleanChatContext, cleanChatError, cleanChatSources, cleanChatText, cleanChatTitle, ORPHANED_TURN, withPackSizes,
-  type ChatAnswer, type ChatConversation, type ChatJob, type ChatPack, type ChatProvider, type ChatSource, type ChatThread, type ChatTurn,
+  type ChatAnswer, type ChatConversation, type ChatJob, type ChatPack, type ChatProvider, type ChatSource, type ChatThread, type ChatTurn, type PendingChatTurn,
 } from '../chat.ts';
+import { REDACT_PAGE, redactedChanges, redactStoredRow } from '../redact.ts';
 import type { ChatStore } from '../store.ts';
 import type { GraphRepo } from './repo.ts';
+
+/** A turn's stored text the redaction re-run reads: the question or answer, the pack, the error, the answer and sources (JSON). */
+const TURN_TEXT = ['id', 'text', 'context', 'error', 'answer', 'sources'] as const;
+/** The fields of a turn the redaction re-run may rewrite. */
+const TURN_FIELDS = ['text', 'context', 'error', 'answer', 'sources'] as const;
 
 export const newChatId = () => `chat-${randomUUID()}`;
 export const newChatTurnId = () => `chatturn-${randomUUID()}`;
@@ -118,12 +125,13 @@ export class ChatRepo implements ChatStore {
     return this.conversation(conversationId);
   }
 
-  async nextPendingTurn(): Promise<ChatJob | null> {
+  async nextPendingTurn(o: { id?: string } = {}): Promise<ChatJob | null> {
     const [r] = await this.g.run(
-      `MATCH (t:ChatTurn {status: 'pending', role: 'assistant'})
+      `MATCH (t:ChatTurn {status: 'pending', role: 'assistant'}) WHERE $id IS NULL OR t.id = $id
        WITH t ORDER BY t.createdAt, t.id LIMIT 1
        OPTIONAL MATCH (q:ChatTurn {conversationId: t.conversationId, seq: t.seq - 1})
        RETURN t.id AS id, t.conversationId AS conversationId, q.id AS questionId, q.context AS context`,
+      { id: o.id ?? null },
     );
     if (!r) return null;
     const conversation = await this.conversation(r.get('conversationId'));
@@ -135,6 +143,22 @@ export class ChatRepo implements ChatStore {
       return null;
     }
     return { conversation, turn, question, context: (r.get('context') as string | null) ?? '' };
+  }
+
+  async pendingTurns(limit = 200): Promise<PendingChatTurn[]> {
+    const rows = await this.g.run(
+      `MATCH (t:ChatTurn {status: 'pending', role: 'assistant'})
+       OPTIONAL MATCH (c:ChatConversation {id: t.conversationId})
+       RETURN t.id AS id, t.conversationId AS conversationId, c.provider AS provider, t.createdAt AS createdAt
+       ORDER BY t.createdAt, t.id LIMIT $limit`,
+      { limit: neo4j.int(limit) },
+    );
+    return rows.map((r) => ({ id: r.get('id'), conversationId: r.get('conversationId'), provider: r.get('provider') ?? null, createdAt: r.get('createdAt') }));
+  }
+
+  async setQueueAhead(updates: { id: string; ahead: number }[]): Promise<void> {
+    if (!updates.length) return;
+    await this.g.run(`UNWIND $u AS u MATCH (t:ChatTurn {id: u.id, status: 'pending'}) SET t.queueAhead = u.ahead`, { u: updates.map((x) => ({ id: x.id, ahead: neo4j.int(x.ahead) })) });
   }
 
   async markAnswering(turnId: string, provider: string): Promise<boolean> {
@@ -200,6 +224,39 @@ export class ChatRepo implements ChatStore {
     return Number(r?.get('n') ?? 0);
   }
 
+  async redactStoredTurns(afterRead?: () => Promise<unknown>): Promise<number> {
+    let changed = 0;
+    for (let after = ''; ;) {
+      const rows = await this.g.run(
+        `MATCH (t:ChatTurn) WHERE t.id > $after
+         RETURN t.id AS id, t.text AS text, t.context AS context, t.error AS error, t.answer AS answer, t.sources AS sources ORDER BY t.id LIMIT $page`,
+        { after, page: neo4j.int(REDACT_PAGE) },
+      );
+      if (!rows.length) break;
+      after = rows[rows.length - 1].get('id');
+      const page = rows.flatMap((r) => {
+        const row = Object.fromEntries(TURN_TEXT.map((k) => [k, r.get(k) ?? null])) as Record<string, unknown> & { id: string };
+        const out = redactStoredRow(row, ['text', 'context', 'error'], ['answer', 'sources']);
+        if (!out) return [];
+        const { id, set, was, fields } = redactedChanges(row, out, TURN_FIELDS);
+        return [{ id, vals: set, prev: was, fields }];
+      });
+      if (!page.length) continue;
+      await afterRead?.();
+      // Each changed field only while it is still what was read: the runner may answer a turn (answer, text) between.
+      const same = (f: string) => `('${f}' IN c.fields AND t.${f} = c.prev.${f})`;
+      const [r] = await this.g.run(
+        `UNWIND $page AS c MATCH (t:ChatTurn {id: c.id})
+         WITH t, c, ${TURN_FIELDS.map((f) => `${same(f)} AS ${f}Same`).join(', ')}
+         SET ${TURN_FIELDS.map((f) => `t.${f} = CASE WHEN ${f}Same THEN c.vals.${f} ELSE t.${f} END`).join(', ')}
+         RETURN count(CASE WHEN ${TURN_FIELDS.map((f) => `${f}Same`).join(' OR ')} THEN 1 END) AS n`,
+        { page },
+      );
+      changed += Number(r?.get('n') ?? 0);
+    }
+    return changed;
+  }
+
   /** Run a guarded SET (a MATCH that finds the turn only in the right state); true when it changed one, and bump its conversation. */
   private async transition(cypher: string, params: Record<string, unknown>): Promise<boolean> {
     const now = new Date().toISOString();
@@ -243,5 +300,6 @@ function turnOf(p: Record<string, unknown>): ChatTurn {
     createdAt: p.createdAt as string,
     startedAt: (p.startedAt as string | null) ?? null,
     finishedAt: (p.finishedAt as string | null) ?? null,
+    queueAhead: p.status === 'pending' && p.queueAhead != null ? Number(p.queueAhead) : null,
   };
 }

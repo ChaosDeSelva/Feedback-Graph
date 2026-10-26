@@ -2,7 +2,7 @@ import { useEffect, useRef, useState, type ReactNode } from 'react';
 import { api, integrationsApi, type Connection, type ConnectionName, type IntegrationKind, type IntegrationsView, type LinearTeam, type ProjectIntegrations, type ServiceView } from './api.ts';
 import { hashFocus } from './links.ts';
 import { Button, Input, Select } from './ui/controls.tsx';
-import { ago, Alert, Badge, Card, EmptyState, plural, Skeleton, tdClass, thClass, type Tone } from './ui/display.tsx';
+import { Alert, Badge, Card, EmptyState, plural, Skeleton, tdClass, thClass, Time, type Tone } from './ui/display.tsx';
 import { ConfirmDialog } from './ui/ConfirmDialog.tsx';
 import { FolderIcon } from './ui/icons.tsx';
 
@@ -164,7 +164,7 @@ function ServiceCard({ kind, view, onChange }: { kind: IntegrationKind; view: In
           <dt className="text-muted">Account</dt>
           <dd>
             {s.account ? (
-              <>{s.account}{s.checkedAt && <span className="text-muted" title={s.checkedAt}> (checked {ago(s.checkedAt)})</span>}</>
+              <>{s.account}{s.checkedAt && <span className="text-muted"> (checked <Time iso={s.checkedAt} />)</span>}</>
             ) : (
               <span className="text-muted">being checked: it is checked on first use and after a sync (or press Test connection)</span>
             )}
@@ -172,7 +172,9 @@ function ServiceCard({ kind, view, onChange }: { kind: IntegrationKind; view: In
           <dt className="text-muted">Token</dt>
           <dd>{fromEnv ? <>from <Mono>{s.envVar}</Mono> in <Mono>.env</Mono></> : 'saved in this app (never shown again)'}</dd>
           <dt className="text-muted">Last sync</dt>
-          <dd title={s.lastSyncAt ?? undefined}>{s.lastSyncAt ? ago(s.lastSyncAt) : 'not yet: the worker syncs within a few minutes'}</dd>
+          <dd>{s.lastSyncAt ? <Time iso={s.lastSyncAt} /> : kind === 'linear' && !view.projects.some((p) => p.linear.teamId)
+            ? 'nothing to sync yet: map a team to a project below to start syncing'
+            : 'not yet: the worker syncs within a few minutes'}</dd>
           {s.rateLimitedUntil && Date.parse(s.rateLimitedUntil) > Date.now() && (
             <>
               <dt className="text-muted">Rate limit</dt>
@@ -257,7 +259,7 @@ function syncCell(x: { lastSyncAt: string | null; items: number; error: string |
   if (!on) return <span className="text-muted">off</span>;
   if (x.error) return <span className="text-bad-text [overflow-wrap:anywhere]" title={x.error}>error: {x.error.slice(0, 120)}</span>;
   if (!x.lastSyncAt) return <span className="text-muted">waiting for the first sync</span>;
-  const synced = <span title={x.lastSyncAt}>{ago(x.lastSyncAt)} · {plural(x.items, 'comment')}</span>;
+  const synced = <span><Time iso={x.lastSyncAt} /> · {plural(x.items, 'comment')}</span>;
   if (!x.backlog) return synced;
   // A sync stopped by its cap: the newest pull requests were read, these are read on the next syncs.
   return (

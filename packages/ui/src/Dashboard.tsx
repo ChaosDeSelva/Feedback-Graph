@@ -1,6 +1,8 @@
 import { Component, useEffect, useRef, useState, type ReactNode } from 'react';
 import type { ModelHealth, ModelJob, WorkQueue, WorkQueues } from '@fb/core';
+import type { ChatProvider } from '@fb/core/chat';
 import { ActivityEntry } from './Activity.tsx';
+import { ProviderSelect } from './Chat.tsx';
 import { api, type Activity, type PatternReport, type PipelineStatus, type ProjectHotspot, type ProjectSummary, type SystemStatus } from './api.ts';
 import { activityKindHref, chatHref, inboxTabHref, moduleHref, newChatHref } from './links.ts';
 import { stageLine } from './FirstRun.tsx';
@@ -8,7 +10,7 @@ import { pct, WeeklyChart } from './Patterns.tsx';
 import { PageHeader } from './ui/PageHeader.tsx';
 import { Button, Select } from './ui/controls.tsx';
 import { AskIcon, ChevronIcon, Mark } from './ui/icons.tsx';
-import { ago, Alert, Badge, Card, Skeleton, SkeletonList, StatGrid, StatTile, StatTileSkeleton, StatusBadge, tableClass, tdClass, thClass } from './ui/display.tsx';
+import { ago, Alert, Badge, Card, Skeleton, SkeletonList, StatGrid, StatTile, StatTileSkeleton, StatusBadge, tableClass, tdClass, thClass, Time } from './ui/display.tsx';
 
 const POLL_MS = 10_000;
 
@@ -264,9 +266,9 @@ function ProjectsTable({ list, globalLessons }: { list: ProjectSummary[]; global
                     {[p.sessions, p.feedback, p.lessons, p.facts].map((n, i) => <td key={i} className={`${tdClass} text-right tabular-nums ${n ? '' : 'text-muted'}`}>{n}</td>)}
                     <td className={`${tdClass} whitespace-nowrap`}>
                       {p.lastScan ? (
-                        <span className="inline-flex items-center gap-2" title={p.lastScan.finishedAt ?? p.lastScan.requestedAt}>
+                        <span className="inline-flex items-center gap-2">
                           <StatusBadge status={p.lastScan.status} />
-                          <span className="text-xs text-muted">{ago(p.lastScan.finishedAt ?? p.lastScan.requestedAt)}</span>
+                          <Time iso={p.lastScan.finishedAt ?? p.lastScan.requestedAt} className="text-xs text-muted" />
                         </span>
                       ) : <span className="text-muted">never</span>}
                     </td>
@@ -364,13 +366,15 @@ const SUGGESTED = 3;
 function Ask({ projects, hotspots }: { projects: ProjectSummary[] | null; hotspots: ProjectHotspot[] | null }) {
   const [project, setProject] = useState('');
   const [text, setText] = useState('');
+  // The model to answer with, as on the Ask page; null: the default model.
+  const [provider, setProvider] = useState<ChatProvider | null>(null);
   const box = useRef<HTMLTextAreaElement>(null);
   const chats = useLoad(() => api.chats());
   const chosen = project || projects?.[0]?.key || '';
   const ready = !!chosen && !!text.trim();
   const go = () => {
     if (!ready) return;
-    location.hash = newChatHref(chosen, text.trim());
+    location.hash = newChatHref(chosen, text.trim(), provider ?? undefined);
   };
   const shown = new Set(projects?.map((p) => p.key));
   const suggested = (Array.isArray(hotspots) ? hotspots : []).filter((h) => shown.has(h.projectKey)).slice(0, SUGGESTED);
@@ -397,11 +401,12 @@ function Ask({ projects, hotspots }: { projects: ProjectSummary[] | null; hotspo
           onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); go(); } }}
           className="min-w-0 resize-none bg-transparent px-2 py-1.5 text-[14px] leading-relaxed text-text placeholder:text-muted focus:outline-none"
         />
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2">
           <Select aria-label="ask project" size="sm" value={chosen} onChange={(e) => setProject(e.target.value)} disabled={!projects?.length} className="w-auto max-w-[16rem]">
             {!projects?.length && <option value="">choose projects in Settings</option>}
             {projects?.map((p) => <option key={p.key} value={p.key}>{p.key}</option>)}
           </Select>
+          <ProviderSelect label="ask provider" value={provider} onChange={setProvider} />
           <span className="ml-auto hidden text-[11px] text-muted sm:inline">Enter to ask · Shift+Enter for a new line</span>
           <Button type="submit" variant="primary" size="sm" aria-label="Ask" disabled={!ready}>
             Ask <ChevronIcon size={12} />
@@ -450,7 +455,7 @@ function Ask({ projects, hotspots }: { projects: ProjectSummary[] | null; hotspo
                   <li key={c.id}>
                     <a href={chatHref(c.id)} className="grid gap-0.5 rounded-md px-2 py-1.5 hover:bg-hover">
                       <span className="truncate text-[13.5px] font-medium">{c.title}</span>
-                      <span className="text-xs text-muted">{c.projectKey} · {ago(c.updatedAt)}{c.pending ? ' · answering' : ''}</span>
+                      <span className="text-xs text-muted">{c.projectKey} · <Time iso={c.updatedAt} />{c.pending ? ' · answering' : ''}</span>
                     </a>
                   </li>
                 ))}

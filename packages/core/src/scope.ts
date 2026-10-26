@@ -53,6 +53,15 @@ export function initialSelection(env: Pick<Config, 'ingestProjects' | 'excludePr
   return { tracked, initialized: env.ingestProjects.length > 0 || tracked.length > 0 };
 }
 
+/**
+ * A stored selection that was never made (a start with nothing chosen: empty, not initialized) still takes
+ * INGEST_PROJECTS set since (setup.sh --select), once: a first run without the UI is not stuck. A selection made in
+ * Settings, even as nothing at all, is initialized and never seeded again.
+ */
+export function ingestSeedsStored(stored: Pick<ProjectSelection, 'tracked' | 'initialized'>, env: Pick<Config, 'ingestProjects'>): boolean {
+  return !stored.initialized && stored.tracked.length === 0 && env.ingestProjects.length > 0;
+}
+
 /** A plain warning when nothing is being read, for /api/status and the worker log. */
 export const NO_ROOTS_NOTE = 'No project folders yet: add a project folder in Settings first.';
 

@@ -50,6 +50,8 @@ const CHECK_LABEL: Record<LessonCheckName, string> = {
   bundled: 'two lessons in one',
   'ambiguous-path': 'ambiguous path',
   'no-miss': 'no miss found',
+  'filler-applies-when': 'vague "applies when"',
+  'may-hold-secret': 'may hold a secret',
 };
 /** Where a lesson came from, in words; the tooltip says it in full. `from` (where its feedback came from) first. */
 const SOURCE_LABEL: Record<string, [label: string, title: string]> = {
@@ -62,7 +64,7 @@ const SOURCE_LABEL: Record<string, [label: string, title: string]> = {
   demo: ['demo', 'a demo lesson from fg demo seed; fg demo remove takes it back'],
 };
 function SourceLabel({ source }: { source: string }) {
-  const [label, title] = SOURCE_LABEL[source] ?? [source, source];
+  const [label, title] = Object.hasOwn(SOURCE_LABEL, source) ? SOURCE_LABEL[source] : [source, source];
   return <span title={title}>{label}</span>;
 }
 
@@ -240,17 +242,18 @@ function Judged({ report }: { report: LessonQualityReport | null }) {
   if (!last30 || !last90?.decided) return null;
   const projects = Object.entries(report!.projects ?? {}).sort(([a], [b]) => a.localeCompare(b));
   const cells = (q: LessonQuality | undefined) =>
-    q ? [String(q.decided), share(q.asWritten, q.decided), share(q.edited, q.decided), share(q.rejected, q.decided)] : ['', '', '', ''];
+    q ? [String(q.decided), share(q.asWritten, q.decided), share(q.edited, q.decided), share(q.rejected, q.decided), share(q.byOperator ?? 0, q.decided)] : ['', '', '', '', ''];
   return (
     <details aria-label="how your lessons were judged" className="text-xs text-muted">
-      <summary className="cursor-pointer tabular-nums" title="Of the post-mortem's lessons you decided. The ones you edited or rejected are shown to the post-mortem as examples.">
+      <summary className="cursor-pointer tabular-nums" title="Of the post-mortem's lessons you decided. The ones you edited or rejected, and some you approved as written, are shown to the post-mortem as examples. Decisions an agent made with the operator token count as yours; how many is said apart.">
         {last30.decided
-          ? <>Last 30 days: {last30.decided} decided · {said(last30.asWritten, 'as written', last30.decided)} · {said(last30.edited, 'after your edit', last30.decided)} · {said(last30.rejected, 'rejected', last30.decided)}</>
+          ? <>Last 30 days: {last30.decided} decided · {said(last30.asWritten, 'as written', last30.decided)} · {said(last30.edited, 'after your edit', last30.decided)} · {said(last30.rejected, 'rejected', last30.decided)}
+              {!!last30.byOperator && <> · {said(last30.byOperator, 'by an agent with the operator token', last30.decided)}</>}</>
           : <>Last 30 days: none decided ({last90.decided} in 90 days)</>}
         {report!.capped && ' (capped)'}
       </summary>
       <table className={`${tableClass} mt-2 tabular-nums`}>
-        <thead><tr>{['project', 'days', 'decided', 'as written', 'after edit', 'rejected'].map((h) => <th key={h} className={tdClass}>{h}</th>)}</tr></thead>
+        <thead><tr>{['project', 'days', 'decided', 'as written', 'after edit', 'rejected', 'by operator'].map((h) => <th key={h} className={tdClass}>{h}</th>)}</tr></thead>
         <tbody>
           {[['all', report!.windows] as const, ...projects].flatMap(([k, ws]) => ws.map((q) => (
             <tr key={`${k}-${q.days}`}>{[k, `${q.days} days`, ...cells(q)].map((c, i) => <td key={i} className={tdClass}>{c}</td>)}</tr>
@@ -456,16 +459,13 @@ export function Lessons() {
                   <option value="">select all with flag…</option>
                   {flagCounts.map(([n, c]) => <option key={n} value={n}>{checkLabel(n)} ({c})</option>)}
                 </Select>
-                <Button size="sm" onClick={() => setPicked(picked.size === items.length ? new Set() : new Set(items.map((l) => l.id)))}>
+                <Button size="sm" className="min-w-[5.5rem]" onClick={() => setPicked(picked.size === items.length ? new Set() : new Set(items.map((l) => l.id)))}>
                   {picked.size === items.length ? 'Clear' : 'Select all'}
                 </Button>
-                {picked.size > 0 && (
-                  <>
-                    <span className="text-xs text-muted tabular-nums">{picked.size} selected</span>
-                    <Button size="sm" variant="primary" onClick={() => openBulk('approved')}>Approve selected</Button>
-                    <Button size="sm" onClick={() => openBulk('rejected')}>Reject selected</Button>
-                  </>
-                )}
+                {/* Always there, disabled until a row is ticked: the bar never grows, so the rows never move under the cursor. */}
+                <span className="min-w-[5.5rem] text-xs text-muted tabular-nums">{picked.size ? `${picked.size} selected` : 'none selected'}</span>
+                <Button size="sm" variant="primary" disabled={!picked.size} onClick={() => openBulk('approved')}>Approve selected</Button>
+                <Button size="sm" disabled={!picked.size} onClick={() => openBulk('rejected')}>Reject selected</Button>
               </div>
             )}
             {loaded && items.length >= LIST_CAP && <span className="w-full text-xs text-muted">Showing the newest {LIST_CAP}: narrow the list with the filters to reach the rest.</span>}
@@ -477,7 +477,11 @@ export function Lessons() {
         notice={error && <Alert>{error}</Alert>}
         list={
           !loaded ? <SkeletonList /> : items.length === 0 ? (
-            <EmptyState compact icon={<LessonIcon />} {...EMPTY[status]} />
+            source || flag ? (
+              <EmptyState compact icon={<LessonIcon />} title={`No ${status} lessons match this filter`} action={<Button size="sm" onClick={() => afterDiscard(() => { setSource(''); setFlag(''); })}>Clear filters</Button>}>
+                {`Other ${status} lessons may come from another source or carry other checks.`}
+              </EmptyState>
+            ) : <EmptyState compact icon={<LessonIcon />} {...EMPTY[status]} />
           ) : (
             <ul>
               {items.map((l, i) => (
@@ -528,7 +532,7 @@ export function Lessons() {
 
                 {!!detail.lesson.checks?.length && (
                   <section aria-label="what the lesson check found" className="grid gap-1.5 rounded-md border border-line bg-sunken px-3 py-2.5">
-                    <SectionLabel>Before you approve</SectionLabel>
+                    <SectionLabel>{detail.lesson.status === 'proposed' ? 'Before you approve' : 'What the lesson check found'}</SectionLabel>
                     <ul className="grid gap-1">
                       {detail.lesson.checks.map((c) => (
                         <li key={c.name} className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5 text-[13px]">

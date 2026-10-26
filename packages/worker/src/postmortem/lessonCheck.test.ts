@@ -123,6 +123,40 @@ test('statements that describe the code are flagged as looking like a fact; rule
   for (const rule of RULE_LIKE) expect(factLike(rule), rule).toBe(false);
 });
 
+/** Rules of the kind a team approves, each starting with an imperative the first verb list did not have. */
+const TEAM_RULES = [
+  'Cap the batch at 500 rows in worker/sync.ts; larger batches time out.',
+  'Refresh the access token in auth/session.ts before it expires, not after a 401.',
+  'Derive the tenant id from the request context in api/tenant.ts; the body is untrusted.',
+  'Coalesce null counts to 0 in reports/totals.sql, since the chart reads them as numbers.',
+  'Reuse the shared retry helper in lib/retry.ts instead of a new loop.',
+  'Drop the cached map in codegraph/cache.ts when the HEAD changes.',
+  'Keep the migration numbers contiguous in db/migrations.',
+  'Pass the abort signal through to fetchAll in api/client.ts.',
+  'Carry the run id on every Activity entry the import writes.',
+  'Fix the off-by-one in pager.ts at the source, not in the caller.',
+  'Debounce search input in ui/Search.tsx; each keystroke hits the API.',
+  'Batch the inserts in store/bulk.ts so a big import is one round trip.',
+  'Bump LESSON_CHECKS_VERSION when a check changes, so stored flags are recomputed.',
+  'Only cap the page size in api/list.ts, never the total that is reported.',
+  'Memoize the selector in ui/state.ts; it is called on every render.',
+  'Strip the trailing slash from the base URL in config/env.ts.',
+  'Invalidate the project cache when a folder is selected.',
+  'Gate the admin routes behind OWNER_ROUTES in api/app.ts.',
+  'Emit one Activity entry per project, not one per item.',
+  'Prefix temp tables with tmp_ in db/etl.sql so cleanup finds them.',
+  'In api/search.ts cap the result set at 100 rows.',
+];
+
+test("a rule that starts with an imperative is a rule, not a fact (the team's kind of rules)", () => {
+  const factLike = (rule: string) => checkLesson(lesson(rule), feedback('this is wrong')).flags.some((f) => f.name === 'looks-like-a-fact');
+  for (const rule of TEAM_RULES) expect(factLike(rule), rule).toBe(false);
+  // Still facts: a statement whose subject is a thing, though its verb is one a rule could start with.
+  for (const rule of ['The poller caps each batch at 500 rows.', 'The session cache is refreshed every ten minutes.', 'Drops in the mirror are rare and logged by sync/mirror.ts.']) {
+    expect(factLike(rule), rule).toBe(true);
+  }
+});
+
 test('a rule field holding the scope word takes the title as the rule and is flagged', () => {
   const r = checkLesson(lesson('task', { title: 'Assert the timezone offset, not its name, in session tests' }), feedback('this fails in CI'));
   expect(r.lesson.rule).toBe('Assert the timezone offset, not its name, in session tests');

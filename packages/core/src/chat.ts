@@ -42,7 +42,15 @@ export type ChatTurn = {
    * gets, and its numbered sources). Null on a user turn, or when the question's pack is not stored.
    */
   pack?: ChatPackSize | null;
+  /**
+   * While pending: how many questions are ahead of it in its model's line (answering or waiting), as the worker last
+   * counted; null when not counted yet, or not waiting any more.
+   */
+  queueAhead?: number | null;
 };
+
+/** A question waiting for an answer, as the worker lines them up (ChatStore.pendingTurns). */
+export type PendingChatTurn = { id: string; conversationId: string; provider: ChatProvider | null; createdAt: string };
 
 /** chars: characters of the stored pack (at most MAX_CHAT_CONTEXT); sources: how many numbered sources it cites. */
 export type ChatPackSize = { chars: number; sources: number };

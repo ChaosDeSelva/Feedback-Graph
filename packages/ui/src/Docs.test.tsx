@@ -44,7 +44,7 @@ test('the Docs page explains the code map, its two agent tools and how hotspots 
   expect(section.getByText('impact')).toBeTruthy();
   expect(section.getByText(/4 × misses \+ log2\(1 \+ churn\) \+ log2\(1 \+ dependents\)/)).toBeTruthy();
   expect(screen.getByRole('button', { name: 'The code map' })).toBeTruthy();
-  expect(screen.getByText('files_changed')).toBeTruthy();
+  expect(screen.getAllByText('files_changed').length).toBeGreaterThan(0);
 });
 
 test('the Docs page explains cloud sync: off by default, what is sent and what never is', () => {
@@ -96,4 +96,33 @@ test('the Docs page names SUMMARY_LLM as a job model and says retention keeps te
   expect(models.getByText('SUMMARY_LLM')).toBeTruthy();
   const limit = within(screen.getByRole('region', { name: 'Limit what it reads' }));
   expect(limit.getByText(/until its session summary covers it/)).toBeTruthy();
+});
+
+test('the Docs page covers 0.6.2: runs, sandboxes, cleanup, evidence and the demo corpus, each with its command', () => {
+  render(<Docs />);
+  const section = within(screen.getByRole('region', { name: 'Runs, sandboxes and testing' }));
+  for (const name of ['x-fg-run: <id>', 'x-fg-sandbox: 1', 'fg cleanup --run <id>', 'fg evidence <session>', 'fg demo seed / fg demo remove']) expect(section.getByText(name)).toBeTruthy();
+  expect(section.getByText(/never exported or synced/)).toBeTruthy();
+  expect(section.getByText(/a dry run first/)).toBeTruthy();
+  expect(screen.getByRole('button', { name: 'Runs, sandboxes and testing' })).toBeTruthy();
+});
+
+test('connecting agents covers how check_before_done reads the diff, headless Claude Code and Codex, and a second install', () => {
+  render(<Docs />);
+  const section = within(screen.getByRole('region', { name: 'Connect your agents' }));
+  expect(section.getByText(/Cannot tell from the diff/)).toBeTruthy();
+  expect(section.getByText(/--allowedTools "mcp__plugin_feedback-graph_fg"/)).toBeTruthy();
+  expect(section.getByText(/default_tools_approval_mode/)).toBeTruthy();
+  expect(section.getByText('FG_INSTANCE')).toBeTruthy();
+  expect(section.getByText('feedback-graph-<name>')).toBeTruthy();
+});
+
+test('Each page explains the queue lines, the lesson quality numbers and the Activity run filter', () => {
+  render(<Docs />);
+  const pages = within(screen.getByRole('region', { name: 'Each page' }));
+  expect(pages.getByText(/a line per busy queue/)).toBeTruthy();
+  expect(pages.getByText(/how your lessons were judged/)).toBeTruthy();
+  expect(pages.getByText('fg lessons quality')).toBeTruthy();
+  expect(pages.getByText(/hide labelled runs/)).toBeTruthy();
+  expect(pages.getByText(/context pack/)).toBeTruthy();
 });

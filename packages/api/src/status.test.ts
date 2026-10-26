@@ -164,3 +164,8 @@ test('a connection failure to Ollama is re-checked on read: Ollama answering now
   expect(await read('Ollama is not reachable at http://o: start it')).toEqual({ provider: 'ollama:gemma4', ok: true, reason: null });
   expect((await read('structured output is unavailable (ollama 501)')).ok).toBe(false);
 });
+
+test('status names the check_before_done judge model', async () => {
+  const app = createApp(repo, { system: { version: '0.2.0', ping: async () => true, worker: async () => null }, context: { judgeId: 'ollama:gemma4', k: {} } as never });
+  expect((await (await app.request('/api/status')).json()).judge).toBe('ollama:gemma4');
+});

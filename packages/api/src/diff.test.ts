@@ -81,7 +81,7 @@ describe('capDiff', () => {
     const c = capDiff(ROUTE + TEST, TEST.length + 10);
     expect(c.text).toBe(TEST);
     expect(c.omitted).toEqual(['src/routes/orders.ts']);
-    expect(c.note).toBe(`diff cut at ${((TEST.length + 10) / 1024).toFixed(1)} KB, files not shown: src/routes/orders.ts`);
+    expect(c.note).toMatch(/^diff cut to fit \([\d.]+ of [\d.]+ KB shown\), files not shown: src\/routes\/orders\.ts$/);
   });
 
   test('one file bigger than the budget keeps the hunks that fit and is named as partly shown', () => {

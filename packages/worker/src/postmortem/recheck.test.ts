@@ -1,9 +1,9 @@
 import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { LESSON_CHECKS_VERSION, type ActivityInput, type Lesson, type LessonCheck, type LessonDetail, type SimilarLesson } from '@fb/core';
+import { LESSON_CHECKS_VERSION, type Activity, type ActivityInput, type Lesson, type LessonCheck, type LessonDetail, type SimilarLesson } from '@fb/core';
 import { expect, test } from 'vitest';
-import { duplicateFlag, recheckLessons } from './recheck.ts';
+import { duplicateFlag, recheckLessons, recordedWorkSession } from './recheck.ts';
 
 test('a stored miss blaming an AGENTS.md the session had is flagged contradicts-evidence; one the evidence does not contradict is not', async () => {
   const web = mkdtempSync(join(tmpdir(), 'fbre-'));
@@ -220,4 +220,99 @@ test('nothing to check: no activity', async () => {
   const activity: ActivityInput[] = [];
   expect(await recheckLessons({ k: f.k, activity: { record: async (a) => void activity.push(a) } })).toEqual({ checked: 0, flagged: 0, changed: 0 });
   expect(activity).toEqual([]);
+});
+
+test('broken-rule is judged on the current rule: kept on a proposed lesson still holding the repair, cleared once the owner fixed it', async () => {
+  const repaired: LessonCheck = { name: 'broken-rule', why: 'the rule field held "project"; the title is used as the rule' };
+  const rule = 'Lock the order row in orders/claim.sql before the status insert';
+  const owner = { title: 'T', rule, appliesWhen: 'changing order claims', scope: 'project' as const, paths: ['src/orders.ts'] };
+  const f = fake([
+    // The writer's lesson, still as the repair left it: the owner has not seen it yet.
+    lesson('lesson:p', rule, { appliesWhen: 'changing order claims', checks: [repaired], checksVersion: 4 }),
+    // Approved since, with the rule the owner wrote: the old field is gone, so is the flag.
+    lesson('lesson:a', 'Claim the order row with SELECT FOR UPDATE in orders/claim.sql', { status: 'approved', appliesWhen: 'changing order claims', proposedAs: owner, checks: [repaired], checksVersion: 4 }),
+    // Still a scope word in the rule field now: flagged on what it holds today.
+    lesson('lesson:s', 'task', { status: 'approved', appliesWhen: 'changing order claims', title: 'Lock the order row', checks: [], checksVersion: 4 }),
+  ]);
+  await recheckLessons({ k: f.k, exists: async () => true });
+  expect(f.saved.get('lesson:p')?.checks).toEqual([repaired]);
+  expect(names(f.saved.get('lesson:a'))).toEqual([]);
+  expect(f.saved.get('lesson:s')?.checks).toContainEqual({ name: 'broken-rule', why: 'the rule field holds "task"; the title reads like the rule' });
+});
+
+test('an approved lesson whose appliesWhen is a filler ("task", "project") is flagged, never rewritten', async () => {
+  const f = fake([
+    lesson('lesson:t', 'Lock the order row in orders/claim.sql', { status: 'approved', appliesWhen: 'task' }),
+    lesson('lesson:p', 'Lock the order row in orders/claim.sql', { status: 'approved', appliesWhen: 'Project.' }),
+    lesson('lesson:ok', 'Lock the order row in orders/claim.sql', { status: 'approved', appliesWhen: 'claiming an order in orders/claim.sql' }),
+  ]);
+  const paths = new Map<string, string[]>();
+  const k = { ...f.k, setLessonPaths: async (id: string, p: string[]) => { paths.set(id, p); return true; } };
+  await recheckLessons({ k, exists: async () => true });
+  expect(f.saved.get('lesson:t')?.checks).toEqual([{ name: 'filler-applies-when', why: 'its "applies when" is just "task": it says nothing about when the rule applies; say the kind of task or the files' }]);
+  expect(names(f.saved.get('lesson:p'))).toEqual(['filler-applies-when']);
+  expect(names(f.saved.get('lesson:ok'))).toEqual([]);
+  expect(paths.size).toBe(0);
+});
+
+test('wrong-session is not read from the miss of a post-mortem that had no session, or whose session was matched by branch or files', async () => {
+  const miss = { missed: 'the agent did not add the index', causeExplanation: 'The comment relates to a different feature than the retry loop; the index belongs in db/schema.sql.' };
+  const ids = ['lesson:alone', 'lesson:branch', 'lesson:files', 'lesson:old'];
+  const f = fake(ids.map((id) => lesson(id, 'Add the index in db/schema.sql', { from: 'github', appliesWhen: 'adding a query' })), { miss: Object.fromEntries(ids.map((id) => [id, miss])) });
+  const k = { ...f.k, lessonDetail: async (id: string) => ({ ...(await f.k.lessonDetail(id)), feedback: { id: `fb-${id}`, text: 'add an index', status: 'open', sessionId: 'pr', ts: 't' } }) as LessonDetail };
+  // What each post-mortem was worked out against (its postmortem_done Activity): none, a branch match, a files match,
+  // and one from before that was recorded.
+  const work: Record<string, { id: string; matchedBy: 'branch' | 'files' | null } | null | undefined> = {
+    'fb-lesson:alone': null, 'fb-lesson:branch': { id: 's1', matchedBy: 'branch' }, 'fb-lesson:files': { id: 's2', matchedBy: 'files' }, 'fb-lesson:old': undefined,
+  };
+  await recheckLessons({ k, workSession: async (fid) => work[fid], exists: async () => true });
+  expect(names(f.saved.get('lesson:alone'))).toEqual([]);
+  expect(names(f.saved.get('lesson:branch'))).toEqual([]);
+  expect(names(f.saved.get('lesson:files'))).toEqual([]);
+  expect(names(f.saved.get('lesson:old'))).toEqual(['wrong-session']);
+});
+
+test('recordedWorkSession reads the newest postmortem_done of the feedback: its session, none (null), or not recorded (undefined)', async () => {
+  const rows: Record<string, Activity[]> = {
+    a: [{ id: '1', ts: 't', kind: 'postmortem_done', actor: 'x', projectKey: 'shop', subject: 's', why: 'w', details: { workSession: { id: 's1', matchedBy: 'branch' } }, targets: ['a'] }],
+    b: [{ id: '2', ts: 't', kind: 'postmortem_done', actor: 'x', projectKey: 'shop', subject: 's', why: 'w', details: { workSession: null }, targets: ['b'] }],
+    c: [{ id: '3', ts: 't', kind: 'postmortem_done', actor: 'x', projectKey: 'shop', subject: 's', why: 'w', details: {}, targets: ['c'] }],
+  };
+  const asked: object[] = [];
+  const read = recordedWorkSession({ list: async (q) => { asked.push(q); return rows[q.target!] ?? []; } });
+  expect(await read('a')).toEqual({ id: 's1', matchedBy: 'branch' });
+  expect(await read('b')).toBeNull();
+  expect(await read('c')).toBeUndefined();
+  expect(await read('d')).toBeUndefined();
+  expect(asked[0]).toEqual({ kind: 'postmortem_done', target: 'a', limit: 1 });
+});
+
+test("a wrong-session flag an earlier re-check read from the miss is worked out again; the post-mortem's and the re-match's are kept", async () => {
+  const stale: LessonCheck = { name: 'wrong-session', why: 'the post-mortem says the matched session did other work: what it took from that session is likely wrong' };
+  const redone: LessonCheck = { name: 'wrong-session', why: 'the matched session x did other work; redone from the comment alone' };
+  const miss = { missed: 'm', causeExplanation: 'No agent session was found; working from the comment alone. The reviewer refers to another function in the same file.' };
+  const f = fake([
+    lesson('lesson:stale', 'Add the index in db/schema.sql', { from: 'github', status: 'approved', appliesWhen: 'adding a query', checks: [stale], checksVersion: 4 }),
+    lesson('lesson:redone', 'Add the index in db/schema.sql', { from: 'github', status: 'approved', appliesWhen: 'adding a query', checks: [redone], checksVersion: 4 }),
+  ], { miss: { 'lesson:stale': miss, 'lesson:redone': miss } });
+  const k = { ...f.k, lessonDetail: async (id: string) => ({ ...(await f.k.lessonDetail(id)), feedback: { id: `fb-${id}`, text: 'x', status: 'open', sessionId: 'pr', ts: 't' } }) as LessonDetail };
+  await recheckLessons({ k, workSession: async () => null, exists: async () => true });
+  expect(names(f.saved.get('lesson:stale'))).toEqual([]);
+  expect(f.saved.get('lesson:redone')?.checks).toEqual([redone]);
+});
+
+test('may-hold-secret is judged on the text as it is now: kept while a rule still reads a credential, dropped once the owner edited it out', async () => {
+  const V = 'Q9x' + 'w'.repeat(12) + '7Zk';
+  const flag: LessonCheck = { name: 'may-hold-secret', why: 'the redaction rules (v4) read a credential in its text' };
+  const f = fake([
+    // The owner edited the secret out (an edit resets checksVersion): the flag goes.
+    lesson('lesson:clean', 'Run the release with the staging token from the vault', { status: 'approved', checks: [flag], checksVersion: null }),
+    // Still there: the flag stays.
+    lesson('lesson:held', `Run with -e API_TOKEN=${V} against staging`, { status: 'approved', checks: [flag], checksVersion: null }),
+    lesson('lesson:when', 'Run the release from CI', { status: 'approved', appliesWhen: `releasing with --password=${V}`, checks: [flag], checksVersion: null }),
+  ]);
+  await recheckLessons({ k: f.k, exists: async () => true });
+  expect(names(f.saved.get('lesson:clean'))).not.toContain('may-hold-secret');
+  expect(names(f.saved.get('lesson:held'))).toContain('may-hold-secret');
+  expect(names(f.saved.get('lesson:when'))).toContain('may-hold-secret');
 });

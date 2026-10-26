@@ -255,6 +255,9 @@ export const LESSON_CHECKS = [
   'bundled',
   'ambiguous-path',
   'no-miss',
+  'filler-applies-when',
+  // An approved lesson the redaction rules read a credential in (redact.ts redactStoredLesson): its text is the owner's.
+  'may-hold-secret',
 ] as const;
 export type LessonCheckName = (typeof LESSON_CHECKS)[number];
 /** `of`: for duplicate-of, the lesson this one repeats. */
@@ -270,9 +273,12 @@ export type LessonCheck = { name: LessonCheckName; why: string; of?: string };
  * naming nothing concrete, only process verbs), bundled (two unrelated instructions in one rule), and paths normalized:
  * a proposed lesson's bare file names resolve to their one repository match, and instruction files, PR refs, bare
  * identifiers, missing files and globs matching nothing are dropped (bad-path says which); an approved lesson's paths
- * are only flagged.
+ * are only flagged. 5: broken-rule judged on the rule as it is now (one the owner fixed is no longer flagged),
+ * looks-like-a-fact knows more imperative verbs ("Cap ...", "Refresh ...", "Coalesce ..."), wrong-session is no longer read
+ * from the words of a post-mortem that had no session or one matched by branch or files, and filler-applies-when (an
+ * appliesWhen of just "task" or "project", flagged only).
  */
-export const LESSON_CHECKS_VERSION = 4;
+export const LESSON_CHECKS_VERSION = 5;
 
 /**
  * Where a lesson's feedback came from: a GitHub or Linear comment, pushback in an agent session, an imported memory
@@ -599,8 +605,12 @@ export class NotTheRunsError extends Error {
  */
 export const RUN_PRINCIPALS = ['operator', 'owner_token', 'browser', 'agent'] as const;
 export type RunPrincipal = (typeof RUN_PRINCIPALS)[number];
-/** A run's owner as stored. firstSeen: ISO time of its first labelled write. */
-export type RunOwner = { run: string; principal: RunPrincipal; firstSeen: string };
+/**
+ * A run's owner as stored. firstSeen: ISO time of its first labelled write. actor: for an operator-token run, the
+ * operator's name as Activity records it (`operator:<name>`, or `operator` with none); null for the other principals,
+ * and for an operator run opened before names were recorded (any operator name may use that one).
+ */
+export type RunOwner = { run: string; principal: RunPrincipal; actor: string | null; firstSeen: string };
 
 /** What a run's id is stored on (RunsStore.items). feedback: an agent's report, with its post-mortem's miss and lesson. */
 export const RUN_ITEM_KINDS = ['feedback', 'lesson', 'miss', 'predone_check', 'fact', 'doc', 'link', 'chat'] as const;
@@ -700,6 +710,8 @@ export type SystemStatus = {
   /** The worker beat within the last few minutes. */
   workerHealthy: boolean;
   authRequired: boolean;
+  /** The model that judges check_before_done (provider:model, e.g. ollama:gemma4); null when unknown or none. */
+  judge?: string | null;
   /**
    * How many project folders are selected for reading, and how many project roots are mounted (unset from older APIs);
    * `note` says plainly when nothing can be read. Null when unknown.

@@ -29,9 +29,9 @@ export type ProbeKind =
 
 /** An embedded record with just the fields its embedding text is built from, as an older store might hold it. */
 export type EmbeddedSeed =
-  | { kind: 'Lesson'; id: string; title: string; rule: string; appliesWhen?: string; embedding: number[] }
+  | { kind: 'Lesson'; id: string; title: string; rule: string; appliesWhen?: string; status?: 'proposed' | 'approved'; embedding: number[] }
   | { kind: 'Miss'; id: string; missed: string; causeExplanation: string; embedding: number[] }
-  | { kind: 'Fact'; id: string; path: string; statement: string; current: boolean; origin?: 'model' | 'you'; embedding: number[] }
+  | { kind: 'Fact'; id: string; path: string; statement: string; current: boolean; origin?: 'model' | 'you'; docId?: string; embedding: number[] }
   | { kind: 'Chunk'; id: string; text: string; embedding: number[] };
 
 /**
@@ -44,7 +44,12 @@ export type StaleTextSeed =
       agentReport: Record<string, unknown> | null; feedbackText: string; missed: string; causeExplanation: string;
     }
   | { kind: 'Session'; id: string; summary: Record<string, unknown>; finalReply: string }
-  | { kind: 'Activity'; id: string; subject: string; why: string; details: Record<string, unknown> };
+  | { kind: 'Activity'; id: string; subject: string; why: string; details: Record<string, unknown> }
+  /**
+   * An Ask conversation `id` with a user turn (question, pack context) and its assistant turn, left pending so
+   * nextPendingTurn returns the stored context, holding an answer and sources.
+   */
+  | { kind: 'ChatTurns'; id: string; question: string; context: string; answer: Record<string, unknown>; sources: Record<string, unknown>[] };
 
 export type PreDoneCheckRow = {
   projectKey: string;

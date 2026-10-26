@@ -1,6 +1,6 @@
-import type { DecidedLesson, Lesson } from '@fb/core';
+import type { DecidedLesson, DecidedLessonsQuery, Lesson } from '@fb/core';
 import { describe, expect, test } from 'vitest';
-import { EXAMPLES_BYTES, pickExamples, renderExamples } from './examples.ts';
+import { EXAMPLE_POOL, EXAMPLES_BYTES, examplePool, pickExamples, renderExamples } from './examples.ts';
 
 let n = 0;
 const lesson = (over: Partial<Lesson> = {}): Lesson => ({
@@ -12,6 +12,28 @@ const writer = { title: 'Verify search', rule: 'Always verify search results', a
 const edited = (over: Partial<Lesson> = {}, score: number | null = null): DecidedLesson => ({ lesson: lesson({ proposedAs: writer, ...over }), score });
 const rejected = (note: string | null, score: number | null = null, over: Partial<Lesson> = {}): DecidedLesson => ({ lesson: lesson({ status: 'rejected', decisionNote: note, rule: 'Treat every review comment as mandatory', ...over }), score });
 const asWritten = (score: number | null = null, over: Partial<Lesson> = {}): DecidedLesson => ({ lesson: lesson(over), score });
+
+describe('examplePool', () => {
+  test('each outcome comes from its own newest decisions, so one bulk approval cannot crowd out the edits and rejections', async () => {
+    // The newest 50 decisions are one bulk approval; the edits and the rejection are older.
+    const bulk = Array.from({ length: 60 }, () => asWritten());
+    const older = [edited(), rejected('too broad')];
+    const asked: DecidedLessonsQuery[] = [];
+    const store = async (q: DecidedLessonsQuery) => {
+      asked.push(q);
+      const all = [...bulk, ...older].filter((d) => !q.outcome || (q.outcome === 'rejected' ? d.lesson.status === 'rejected' : d.lesson.status === 'approved' && !!d.lesson.proposedAs === (q.outcome === 'edited')));
+      return all.slice(0, q.limit);
+    };
+    const pool = await examplePool(store, { projectKeys: ['acme'], since: 'x', embedding: [1] });
+    expect(asked.map((q) => [q.outcome, q.limit, q.embedding])).toEqual([['edited', EXAMPLE_POOL, [1]], ['rejected', EXAMPLE_POOL, [1]], ['unedited', EXAMPLE_POOL, [1]]]);
+    expect(pickExamples(pool).map((x) => x.outcome)).toEqual(['edited', 'rejected', 'as_written', 'as_written']);
+  });
+  test('a store that does not filter by outcome gives each lesson once', async () => {
+    const one = [edited(), rejected('r')];
+    const pool = await examplePool(async () => one, { projectKeys: ['acme'], since: 'x' });
+    expect(pool.map((d) => d.lesson.id)).toEqual(one.map((d) => d.lesson.id));
+  });
+});
 
 describe('pickExamples', () => {
   test('none decided: none', () => {

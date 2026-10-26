@@ -2,7 +2,7 @@ import { useState, type ReactNode } from 'react';
 import { PageHeader } from './ui/PageHeader.tsx';
 import { Kbd } from './ui/display.tsx';
 
-const SECTIONS = ['How it works', 'Your first hour', 'Connect your agents', 'The code map', 'Linked projects, uploads and relevance', 'Each page', 'Choosing models', 'Limit what it reads', 'Share with a team', 'When something looks wrong'];
+const SECTIONS = ['How it works', 'Your first hour', 'Connect your agents', 'The code map', 'Linked projects, uploads and relevance', 'Each page', 'Choosing models', 'Limit what it reads', 'GitHub and Linear', 'Share with a team', 'Runs, sandboxes and testing', 'When something looks wrong'];
 const slug = (t: string) => `doc-${t.toLowerCase().replace(/[^a-z]+/g, '-')}`;
 
 /** How to use the tool, for someone who just opened it. Static: nothing here calls the API. */
@@ -77,7 +77,14 @@ export function Docs() {
           </p>
           <dl className="mt-2 space-y-2">
             <Tool name="get_task_context">At the start of a task: approved lessons, similar past misses, code facts and docs for this project and task. When the agent names the files it will touch, lessons tied to those files come first, and files with no facts are queued for the next scan. <Code>brief: true</Code> gives only lessons, misses on those files, their importers and tests, and PR discussions (about 1,500 characters).</Tool>
-            <Tool name="check_before_done">Before claiming done: compares the work against past misses and lists gaps it should address. Given <Code>files_changed</Code>, it also names the importers and tests of those files the change did not touch, and what the last misses there were about.</Tool>
+            <Tool name="check_before_done">
+              Before claiming done: judges the real change against the lessons <Code>get_task_context</Code> would serve (lessons tied to the changed files always)
+              and past misses, and lists the gaps. It reads the <Code>diff</Code> the agent passes, or the repository&apos;s diff of <Code>files_changed</Code>; each
+              verdict quotes the diff lines it rests on, and one that points to no line of the diff is listed under <b>Cannot tell from the diff</b>: neither a
+              gap nor a pass, check it yourself. About 32 KB of diff is read, the files the lessons and misses name first, and the answer names the files it
+              cut. Given <Code>files_changed</Code>, it also names the importers and tests of those files the change did not touch. It takes{' '}
+              <Code>session_id</Code>, and the plugin passes it.
+            </Tool>
             <Tool name="get_module_context">Before changing a file: what it is, its symbols, who imports it, what it imports, the tests that cover it, and the lessons and misses tied to it.</Tool>
             <Tool name="impact">Before changing files others use: everything that imports them (and how far away), the tests to run, and lessons and misses on all of it.</Tool>
             <Tool name="report_feedback">For <Code>/postmortem</Code>, or a miss you did not put in words: sends it to your Inbox. Pushback you typed is flagged from the session anyway; a report of the same moment joins that Inbox item.</Tool>
@@ -86,6 +93,22 @@ export function Docs() {
           </dl>
           <p className="mt-2">
             If the detector missed some pushback, type <Code>/postmortem what it missed</Code> in Claude Code. It goes to the Inbox like any other item.
+          </p>
+          <p className="mt-2">
+            <b>Headless runs.</b> <Code>claude -p</Code> never prompts: a tool that is not allowed is denied, and the Stop hook says the check did not run. Allow
+            the tools and the git commands the check asks for:
+          </p>
+          <Pre>{'claude -p "..." --allowedTools "mcp__plugin_feedback-graph_fg" "Bash(git diff *)" "Bash(git add -N *)"'}</Pre>
+          <p className="mt-2">
+            Set up with <Code>./scripts/install-agent.sh claude</Code> instead of the plugin, the server is <Code>feedback-graph</Code>: allow{' '}
+            <Code>mcp__feedback-graph</Code>. The agent tools carry MCP annotations (read-only, except <Code>report_feedback</Code>), so{' '}
+            <Code>codex exec</Code> can call them; for one headless Codex run without asking, <Code>install-agent.sh</Code> prints the override:{' '}
+            <Code>{`codex exec -c 'mcp_servers.feedback-graph.default_tools_approval_mode="approve"' ...`}</Code>.
+          </p>
+          <p className="mt-2">
+            <b>A second install</b> (another checkout of the tool on the same machine): <Code>./scripts/setup.sh</Code> gives it its own Docker Compose name
+            (<Code>FG_INSTANCE</Code>), its own ports and Ollama port (<Code>OLLAMA_PORT</Code>), so it never takes over the first one&apos;s containers or data,
+            and <Code>install-agent.sh</Code> registers its MCP server as <Code>feedback-graph-&lt;name&gt;</Code>. An existing install keeps its name, ports and volumes.
           </p>
           <p className="mt-2">
             These tools only read and report. To let an agent or a script make some of your decisions (start scans, confirm Inbox items),
@@ -169,18 +192,19 @@ export function Docs() {
           </p>
           <div className="grid gap-2">
             <PageGuide name="Dashboard" shot="dashboard" summary="Ask first, then where everything stands, each part linked to its page.">
-              <li><b>Ask</b>, at the top: type a question, pick the project, press <Kbd>Enter</Kbd> (<Kbd>Shift</Kbd>+<Kbd>Enter</Kbd> for a new line): it opens a new chat on the Ask page. Starter questions fill the box; <b>suggested questions</b> ask about your hotspots; <b>recent chats</b> open your last conversations.</li>
+              <li><b>Ask</b>, at the top: type a question, pick the project and the model (Default, Claude, Codex, Local model), press <Kbd>Enter</Kbd> (<Kbd>Shift</Kbd>+<Kbd>Enter</Kbd> for a new line): it opens a new chat on the Ask page. Starter questions fill the box; <b>suggested questions</b> ask about your hotspots; <b>recent chats</b> open your last conversations.</li>
               <li><b>Now</b>: the worker (green running, red offline) and the step it is on; one badge per model job (classifier, post-mortem, scan, summaries, docs reader, embeddings), red with the reason when it cannot be reached.</li>
-              <li><b>Pipeline</b> tiles: Inbox waiting on you, turns to classify (<b>1000+</b> when capped; opens Activity filtered to feedback flagged, with the backlog), post-mortems queued (opens the Inbox&apos;s confirmed tab), lessons <b>proposed / approved</b>, scans <b>done / queued / running / failed</b>. A dash means unknown.</li>
+              <li><b>Pipeline</b> tiles: Inbox waiting on you, turns to classify (<b>1000+</b> when capped; opens Activity filtered to feedback flagged, with the backlog), post-mortems queued (opens the Inbox&apos;s confirmed tab), lessons <b>proposed / approved</b>, scans <b>done / queued / running / failed</b>. A dash means unknown. Under the tiles, a line per busy queue (scans, classify, post-mortems, Ask answers): how many wait, the oldest wait, and what runs now for how long, as <Code>fg status</Code> says it.</li>
               <li><b>Quality</b>: <b>repeat rate</b> (confirmed feedback that repeats an earlier kind of miss; lower is better), <b>checks that caught a gap</b> (pre-done checks that found one), and feedback per week: grey first time, red repeats.</li>
-              <li><b>Projects</b> (pinned first), <b>Hotspots</b> (misses and score; a file opens its module panel) and <b>Recent activity</b>. Each card loads on its own, so one error never blanks the page.</li>
+              <li><b>Projects</b> (pinned first), <b>Where agents struggle</b> (files a confirmed miss touched; a file opens its module panel) and <b>Recent activity</b>, rows as on the Activity page. Each card loads on its own, so one error never blanks the page.</li>
             </PageGuide>
 
             <PageGuide name="Ask" shot="ask" summary="Chat about one project; the answer ends with a prompt for your agent.">
               <li>A chat about one project, one conversation per topic. Ask what already exists (&quot;I want to add a modal: what do we have?&quot;) or where something belongs (&quot;where would feature X go?&quot;).</li>
               <li><b>New chat</b>: pick the project and the model (Default, Claude, Codex, Local model; <Code>CHAT_LLM</Code> sets the default). The answer uses the project and its confirmed linked projects. The model gets only your question and that context, never the repository, and secret files are never read.</li>
               <li>While it writes, <b>Answering with Claude… 0:42</b> counts up; a red box with <b>Retry</b> means it failed. The list shows a blue <b>answering</b> badge.</li>
-              <li><b>[S1]</b> in the answer points to <b>Sources</b>: kind badges <b>lesson</b> (green), <b>miss</b> (red), <b>fact</b> (accent), <b>code</b> (blue), doc, session, linked (grey).</li>
+              <li><b>[S1]</b> in the answer points to <b>Sources</b>: kind badges <b>lesson</b> (green), <b>miss</b> (red), <b>fact</b> (accent), <b>code</b> (blue), doc, session, linked (grey). Code and facts open their file&apos;s module panel; a miss is cited by the file its session edited and opens that file&apos;s panel, where its past misses are listed.</li>
+              <li>Under each answer: the model that wrote it and the size of the <b>context pack</b> it was answered from (characters and sources). The list re-sorts when a conversation gets a message, and one answering in the background moves up once answered.</li>
               <li><b>Examples</b>: existing code with <Code>path:lines</Code>, why it fits, and where it is used; each path opens its module panel.</li>
               <li><b>Prompt for your agent</b>: <b>Copy</b> it into Claude Code or Codex. It names the files to read first and the Feedback Graph tools to use. Tip: select the tool&apos;s own folder in Settings and ask about it.</li>
             </PageGuide>
@@ -194,18 +218,20 @@ export function Docs() {
             </PageGuide>
 
             <PageGuide name="Lessons" shot="lessons" summary="Proposed lessons to approve. Approving is what agents learn from.">
-              <li>Tabs <b>proposed</b>, <b>approved</b> (agents get these), <b>rejected</b> (rejected or revoked), <b>superseded</b> (replaced by a newer one).</li>
-              <li>Each row: the project or <b>global</b>, where it came from (<b>post-mortem</b>, <b>memory file</b>, <b>by you</b>; hover for the full wording), the <b>cause</b> with its dot, and red <b>check chips</b> from the automatic lesson check (hover for why), such as <b>needs a path</b>, <b>platitude</b> or <b>not pushback</b>. An accent <b>approved by agent</b> badge means an agent with the operator token decided, not you.</li>
+              <li>Tabs <b>proposed</b>, <b>approved</b> (agents get these), <b>rejected</b> (rejected or revoked), <b>superseded</b> (replaced by a newer one). Filter by source and by check; an empty filtered list says nothing matches, with <b>Clear filters</b>.</li>
+              <li>In the header, <b>how your lessons were judged</b>: of the post-mortem&apos;s lessons decided in the last 30 days, how many you approved as written, approved after an edit, and rejected (open it for 90 days and each project), and how many an agent with the operator token decided. The edited and rejected ones are shown to the post-mortem as examples, so &quot;as written&quot; is the number to watch go up. <Code>fg lessons quality</Code>, <Code>fg status</Code> and <Code>/api/pipeline</Code> give the same numbers.</li>
+              <li>On the proposed tab, tick lessons (or <b>select all with flag</b>) and <b>Approve selected</b> or <b>Reject selected</b> in one confirm; the buttons stay in place, disabled until something is ticked, so the rows never move under the cursor.</li>
+              <li>Each row: the project or <b>global</b>, where it came from (<b>post-mortem</b>, <b>memory file</b>, <b>by you</b>; hover for the full wording), the <b>cause</b> with its dot, and red <b>check chips</b> from the automatic lesson check (hover for why), such as <b>needs a path</b>, <b>platitude</b>, <b>generic</b> (names no file, function, value or command; listed last, with the reason) or <b>two lessons in one</b>. An accent <b>approved by agent</b> badge means an agent with the operator token decided, not you.</li>
               <li>Causes: <b>context missing</b> (blue), <b>context available, ignored</b> (red), <b>requirement unstated</b> (grey), <b>verification gap</b> (accent), <b>implementation error</b> (violet). The same colours on Patterns and the Graph.</li>
-              <li>The pane: <b>Before you approve</b> (the check findings), <b>You said</b>, <b>What was missed</b>, context that would have prevented it (red <b>was available to the agent</b> or grey <b>not loaded in the session</b>), and fix commits.</li>
-              <li>Edit the title, rule, applies when and scope: <b>task</b> (work like this one), <b>project</b>, or <b>global</b> (every project). Prefer the narrowest. <b>Approve</b> saves your edits and serves it; on an approved lesson <b>Save</b> keeps it approved with your edits; <b>Revoke</b> stops agents getting it straight away; <b>Back to proposed</b> reopens a rejected one.</li>
+              <li>The pane: the check findings (headed <b>Before you approve</b> on a proposed lesson, <b>What the lesson check found</b> on any other), <b>You said</b>, <b>What was missed</b>, context that would have prevented it (red <b>was available to the agent</b> or grey <b>not loaded in the session</b>), and fix commits.</li>
+              <li>Edit the title, rule, applies when and scope: <b>task</b> (work like this one), <b>project</b>, or <b>global</b> (every project). Prefer the narrowest; a global lesson narrowed to a project asks which one. <b>Approve</b> saves your edits and serves it; on an approved lesson <b>Save</b> keeps it approved with your edits; <b>Revoke</b> stops agents getting it straight away; <b>Back to proposed</b> reopens a rejected one.</li>
               <li><b>Convert to fact</b>: a lesson that only states how the code is (often flagged <i>looks like a fact</i>) becomes a project fact you wrote. No scan replaces it, agents get it as a fact, and the lesson is rejected with the note <i>converted to a fact</i>.</li>
             </PageGuide>
 
             <PageGuide name="Graph" shot="graph" summary="The evidence chain behind each miss, or a project's code map." extraShot={{ name: 'graph-code', alt: 'The Graph page in Code mode' }}>
               <li><b>Evidence</b> mode: feedback, misses, causes, lessons, context, tasks and fix commits, coloured as in the legend (with counts). Causes are the biggest circles, misses medium. Click a node for its text and connections; click a connection to move to it.</li>
               <li><b>Code</b> mode draws one project&apos;s code map: its top hotspot files sized by score (red when misses touched them; lighter circles are tests), their imports (arrows) and tests (dashed), and the misses (diamonds) and lessons (squares) on them; click a file for its module panel. Files never overlap and folders form their own clusters; a large map takes a few seconds to settle and fit.</li>
-              <li>The top 12 hotspots and files with misses are always captioned; zoom in to name every file. Hover for the full path, score and misses. <b>Find a file by path</b> opens any mapped file. A note says when the drawing or the map is capped.</li>
+              <li>Twelve key files (files with misses first, then hotspot score, then the most connections) and every file with misses are named at every zoom, over other nodes on a halo if need be; a file with misses wears a red ring and its name says how many. Zoom in to name every file. Hover for the full path, score and misses. <b>Find a file by path</b> opens any mapped file. A note says when the drawing or the map is capped.</li>
             </PageGuide>
 
             <PageGuide name="Patterns" shot="patterns" summary="Whether misses repeat, why they happen, and where agents struggle.">
@@ -224,13 +250,14 @@ export function Docs() {
             <PageGuide name="Projects" shot="projects" summary="Links, code map, facts, docs and your data, per project." extraShot={{ name: 'projects-facts', alt: 'Code facts on the Projects page' }}>
               <li><b>Pin</b> lists a project first everywhere. <b>Scan</b> reads its code into facts with the model you choose; the last scan shows status, files, facts and its place in the queue.</li>
               <li><b>Linked projects</b>: confirmed links (accent relation) give agents here the best matches from the other project. <b>Suggested</b> links show the evidence and its strength in %; they do nothing until you <b>Confirm</b> (<b>Undo</b> stays for a few seconds).</li>
-              <li><b>Code map</b>: files (&quot;400 of 10,290&quot; when capped by <Code>SCAN_MAX_FILES</Code>), symbols, edges, last built. Hotspots sort by churn (commits in 90 days), misses, dependents (importers) and <b>score = 4 × misses + log2(1 + churn) + log2(1 + dependents)</b>. A file opens its module panel: what it is, symbols, importers, imports, tests, approved lessons and past misses.</li>
+              <li><b>Code map</b>: files (&quot;400 of 10,290&quot; when capped by <Code>SCAN_MAX_FILES</Code>), symbols, edges, last built. Hotspots sort by churn (commits in 90 days), misses, dependents (importers) and <b>score = 4 × misses + log2(1 + churn) + log2(1 + dependents)</b>. A file opens its module panel: what it is, symbols, importers, imports, tests, approved lessons and past misses. A file past the map&apos;s cap opens a panel that says so, how many files the map keeps, and that <Code>SCAN_MAX_FILES</Code> raises it.</li>
               <li><b>Code facts</b> by relevance: <b>everyday</b> (green, 0.8 and up, agents get it first), <b>sometimes</b> (blue), <b>rare</b> (grey, below 0.4, only when a task is about it), <b>unscored</b>. Evidence: <b>line checked</b>, <b>file only</b>, <b>not checkable (no file)</b>. A <b>manifest</b> badge means read without a model. <b>how was this created?</b> shows the model, reason, file version and scan; the band buttons set relevance yourself.</li>
               <li><b>Docs and discussions</b>: uploads read into facts show queued, reading, <b>not read</b> (with <b>retry</b>) or <b>n facts</b>. <b>Export</b> downloads a JSON bundle; <b>Delete project data</b> removes everything learned, after you type the name. <b>Import bundle</b> brings lessons back as proposed unless you tick keep approved.</li>
             </PageGuide>
 
             <PageGuide name="Activity" shot="activity" summary="The log of everything created or changed, by whom, and why.">
-              <li>The log of everything the tool created or changed, who or what did it, and why, including each <b>code mapped</b> build with its size and duration. Filter by project and kind; click a row for its details and the ids it touched.</li>
+              <li>The log of everything the tool created or changed, who or what did it, and why, including each <b>code mapped</b> build with its size and duration. Each row: what happened on one line (hover for all of it) with its kind on the right; under it when (hover for the exact time), who, and the run as small chips, then why. Click a row for its details and the ids it touched.</li>
+              <li>Filter by project, kind and <b>run</b> (type a run id). <b>hide labelled runs</b> is on by default, so a tester&apos;s or a script&apos;s runs do not bury what you and the worker did; the page says how many it hid.</li>
               <li><b>By</b>: <b>you</b>; <b>operator:&lt;name&gt;</b>, an agent with the operator token acting for you; a model id like <Code>ollama:gemma4</Code>; an agent over MCP like <Code>claude-code</Code>; or a pipeline step such as <b>deterministic</b>, <b>skip-rules</b> or <b>lesson-check</b>. Hover an actor, or read the legend above the list, for which kind it is.</li>
               <li>Kind colours: decisions take the colour of what was decided (green confirmed or approved, red rejected); post-mortem green; failures and deletes red; flags blue.</li>
             </PageGuide>
@@ -239,7 +266,7 @@ export function Docs() {
               <li>Four tabs: <b>Projects</b>, <b>Integrations</b>, <b>Cloud sync</b>, <b>Clean up</b>. A link to a card opens its tab; unsaved folder changes stay in the bar on every tab.</li>
               <li><b>Projects</b>: which project folders are read. Tick folders and press <b>Save selection</b>. Badges: <b>selected</b> (green), <b>adding</b> or <b>stopping</b> (unsaved), <b>excluded</b>, <b>clone of</b> another folder, <b>missing folder</b>, <b>has data</b>. A greyed box says why on hover.</li>
               <li><b>Where folders come from</b> holds the project roots: add or remove them there (there is none by default), and the folders sessions ran in outside them are suggested with their session counts, each one click from being a root. A saved change is mounted when you run <Code>./scripts/setup.sh</Code>, which restarts the containers. A folder that is not a git repo but holds repos one or two levels down is not one project: each git repo inside it is a project of its own.</li>
-              <li><b>Integrations</b> (GitHub, Linear, read-only; a token saved here wins over one in <Code>.env</Code>), the comment <b>skip rules</b> with their counts, <b>Cloud sync</b>, and <b>Clean up</b>, which deletes the data of projects you have not selected. Every other page shows only the selected projects; Settings is the one place that lists every folder.</li>
+              <li><b>Integrations</b> (GitHub, Linear, read-only; a token saved here wins over one in <Code>.env</Code>; Linear syncs nothing until a team is mapped to a project, and says so), the comment <b>skip rules</b> with their counts, <b>Cloud sync</b>, and <b>Clean up</b>, which deletes the data of projects you have not selected. Every other page shows only the selected projects; Settings is the one place that lists every folder.</li>
             </PageGuide>
           </div>
         </Section>
@@ -290,8 +317,8 @@ export function Docs() {
             <li>Every 10 minutes (<Code>INTEGRATION_SYNC_MINUTES</Code>) new comments are read; the first sync goes back 14 days. Bots are skipped.</li>
           </ol>
           <p className="mt-2">
-            A confirmed comment's post-mortem reads the agent session that did the work: one on the pull request's branch, or the only one just before the
-            comment. With none, it works from the comment and its diff lines.
+            A confirmed comment's post-mortem reads the agent session that did the work: only a session that worked on the pull request&apos;s branch or
+            edited its files, never one for being nearest in time. With none, it works from the comment and the pull request alone, and says so.
           </p>
           <p className="mt-2 text-muted">
             Tokens stay on this machine (a mode 600 file, never the database) and are never shown again. A revoked token or a rate limit pauses that
@@ -322,6 +349,36 @@ export function Docs() {
             from a project you have not selected. A project with no shareable git remote lands in your personal space in the
             org, visible only to you.
           </p>
+        </Section>
+
+        <Section title="Runs, sandboxes and testing">
+          <p>
+            For testers and automation: label a run&apos;s requests and everything it writes can be found, kept apart and removed, without touching yours.
+          </p>
+          <dl className="mt-2 space-y-2">
+            <Tool name="x-fg-run: <id>">
+              A run id (1 to 64 letters, digits, dots, dashes or underscores) on the request header, <Code>?run=&lt;id&gt;</Code> on <Code>/mcp</Code>, or{' '}
+              <Code>fg --run &lt;id&gt;</Code> (<Code>FG_RUN</Code>). What the run writes records the id, and Activity shows it (hidden by default there:
+              untick <b>hide labelled runs</b>, or filter by the run). A run belongs to whoever opened it: a write under another caller&apos;s run id is refused,
+              and a run never replaces, decides on or removes your records (a 409); your decision on something a run made makes it yours.
+            </Tool>
+            <Tool name="x-fg-sandbox: 1">
+              With a run id (<Code>fg --run &lt;id&gt; --sandbox</Code>): a sandbox run. Its records reach only that run, in every list, search, count, Ask pack
+              and code map answer, and are never exported or synced.
+            </Tool>
+            <Tool name="fg cleanup --run <id>">
+              Removes only what that run wrote: a dry run first (counts per kind, what stays and why), <Code>--apply</Code> to do it, keeping anything you
+              decided on since. The operator token may clean up only runs it opened.
+            </Tool>
+            <Tool name="fg evidence <session>">
+              What the tool saw in one session and what it decided: its turns, the detector&apos;s call on each and the skip rules, the Inbox items with their
+              post-mortem and lesson, and the context served (<Code>GET /api/sessions/:id/evidence</Code>).
+            </Tool>
+            <Tool name="fg demo seed / fg demo remove">
+              A small corpus marked demo in demo-shop (approved lessons tied to files, a miss, facts), so the lesson path can be tried on a fresh install.
+              Running it is your approval of those demo lessons; <Code>fg demo remove</Code> takes back exactly what it wrote, never a file a scan recorded.
+            </Tool>
+          </dl>
         </Section>
 
         <Section title="When something looks wrong">

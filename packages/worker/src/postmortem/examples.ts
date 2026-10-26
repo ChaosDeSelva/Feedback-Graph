@@ -1,4 +1,4 @@
-import { lessonOutcome, redactSecrets, type DecidedLesson, type Lesson, type LessonDraft, type LessonOutcome } from '@fb/core';
+import { lessonOutcome, redactSecrets, type DecidedLesson, type DecidedLessonsQuery, type Lesson, type LessonDraft, type LessonOutcome } from '@fb/core';
 
 /**
  * Few-shot examples from the owner's own decisions on this project's lessons: what they changed in a lesson before
@@ -11,8 +11,19 @@ export type LessonExample = { lesson: Lesson; outcome: LessonOutcome; score: num
 export const MAX_EXAMPLES = 4;
 /** The whole examples section, at most (bytes). */
 export const EXAMPLES_BYTES = 2048;
-/** How many recent decisions the examples are chosen from. */
-export const EXAMPLE_POOL = 40;
+/** How many recent decisions of each outcome (edited, rejected, approved as written) the examples are chosen from. */
+export const EXAMPLE_POOL = 50;
+
+/**
+ * The decisions the examples are chosen from: each outcome's own newest EXAMPLE_POOL (scored against the feedback when
+ * `q.embedding` is given), not the newest decisions overall, which one bulk approval can fill with no edit or rejection.
+ * A lesson is in it once (a store that cannot filter by outcome returns the same rows for each).
+ */
+export async function examplePool(decided: (q: DecidedLessonsQuery) => Promise<DecidedLesson[]>, q: Omit<DecidedLessonsQuery, 'limit' | 'outcome'>): Promise<DecidedLesson[]> {
+  const kinds = ['edited', 'rejected', 'unedited'] as const;
+  const seen = new Set<string>();
+  return (await Promise.all(kinds.map((outcome) => decided({ ...q, limit: EXAMPLE_POOL, outcome })))).flat().filter((d) => !seen.has(d.lesson.id) && !!seen.add(d.lesson.id));
+}
 
 /** Best first: by similarity to this feedback when known (a scored one before an unscored one), else as given (newest first). */
 const bySimilarity = (xs: LessonExample[]) =>

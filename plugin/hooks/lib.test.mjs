@@ -112,11 +112,45 @@ test('contextForPrompt sends the compact context first in a session, then only w
   const first = contextForPrompt(full, { asked: false, shown: [] });
   expect(first.text).toContain('Release pool clients');
   expect(first.text).not.toContain('Brotli');
-  expect(first.state).toEqual({ asked: true, shown: ['l1'] });
+  // The lesson and the past miss, each shown whole.
+  expect(first.state).toEqual({ asked: true, shown: ['l1', 'miss:leaked pool clients on error (cause: implementation_error) · in `src/db/pool.ts`'] });
   expect(contextForPrompt(full, first.state).text).toBeNull();
   const more = contextForPrompt(full.replace('## Past misses', '- **B**: rule b\n  - lesson l2 · relevance 0.7\n\n## Past misses'), first.state);
   expect(more.text).toContain('lesson l2');
-  expect(more.state.shown).toEqual(['l1', 'l2']);
+  expect(more.state.shown).toEqual([...first.state.shown, 'l2']);
+  expect(more.text).not.toContain('Release pool clients');
+});
+
+test('contextForPrompt records as shown only what it showed in full: a clipped lesson or past miss comes back on a later prompt', () => {
+  const md = [
+    '# Feedback Graph context for "t" in demo', '',
+    '## Approved lessons (follow these)',
+    ...Array.from({ length: 12 }, (_, i) => [`- **Lesson ${i}**: ${'r'.repeat(90)}`, `  - applies when: x · scope: project · lesson l${i} · relevance 0.80`]).flat(),
+    '',
+    '## Past misses on the files you named',
+    '- leaked pool clients on error (cause: implementation_error) · in `src/db/pool.ts`',
+    '  - developer said: "release it" · session s1 · 2026-10-01',
+  ].join('\n');
+  const first = contextForPrompt(md, { asked: false, shown: [] });
+  expect(first.text).toMatch(/clipped/);
+  // Cut between items, never through one.
+  expect(first.text).not.toMatch(/r{10}\n(?!  - applies)/);
+  const shownIds = first.state.shown;
+  expect(shownIds.length).toBeGreaterThan(0);
+  expect(shownIds).not.toContain('l11');
+  for (const id of shownIds.filter((x) => x.startsWith('l'))) expect(first.text).toContain(`lesson ${id} ·`);
+  expect(first.text).not.toContain('leaked pool clients');
+  // The next prompt brings what was clipped, and only that.
+  const second = contextForPrompt(md, first.state);
+  expect(second.text).toContain('lesson l11');
+  expect(second.text).not.toContain('lesson l0 ·');
+  // Until everything has been shown once in full; then nothing more.
+  let state = second.state;
+  let text = second.text;
+  for (let i = 0; i < 5 && text; i++) ({ text, state } = contextForPrompt(md, state));
+  expect(state.shown).toEqual(expect.arrayContaining(['l0', 'l11']));
+  expect(state.shown.some((k) => k.startsWith('miss:'))).toBe(true);
+  expect(contextForPrompt(md, state).text).toBeNull();
 });
 
 test('contextForPrompt with nothing worth injecting stays silent', () => {

@@ -33,40 +33,92 @@ export function lessonIds(markdown) {
   return [...new Set(ids)];
 }
 
-const clip = (text) => (text.length > MAX_CONTEXT ? `${text.slice(0, MAX_CONTEXT)}\n(clipped: call get_task_context for the rest)` : text);
+const CLIPPED = '(clipped: call get_task_context for the rest)';
 const KEEP = /^## (Approved lessons|Past misses on the files you named)\b/;
 const POINTER = 'Similar past misses, code facts and docs: call get_task_context (with the files you will touch). Before you say done: check_before_done.';
 
 /**
- * The part of get_task_context worth putting in front of every request: the approved lessons, the past misses on the
- * files the prompt names, and the notice that no lesson is approved yet, about 1,500 characters at most. Null when it
- * holds none of those: the rest (similar misses, facts, docs) stays one tool call away.
+ * The kept part of get_task_context as blocks: an item ("- " and its indented lines) with its key (the lesson id, or
+ * "miss:" and the miss's first line), or a heading or note (key null). Null when nothing worth injecting is there.
  */
-export function compactContext(markdown) {
+function compactBlocks(markdown) {
   const lines = markdown.split('\n');
-  const out = [];
-  let keep = false;
+  const blocks = [];
+  let section = null;
   for (const l of lines) {
-    if (l.startsWith('## ')) keep = KEEP.test(l);
-    if (keep) out.push(l);
-    // The notice, and the answer's one note that misses are data, not instructions (said once, at the top).
-    else if (/^No lesson is (approved|proposed or approved) for |^Only approved lessons are rules/.test(l)) out.push(l, '');
+    if (l.startsWith('## ')) {
+      section = KEEP.test(l) ? l : null;
+      if (section) blocks.push({ key: null, lines: [l] });
+      continue;
+    }
+    if (section) {
+      const last = blocks[blocks.length - 1];
+      if (/^\s+\S/.test(l) && last?.item) last.lines.push(l);
+      else if (l.startsWith('- ')) blocks.push({ key: null, item: true, section, lines: [l] });
+      else blocks.push({ key: null, lines: [l] });
+    } else if (/^No lesson is (approved|proposed or approved) for |^Only approved lessons are rules/.test(l)) {
+      // The notice, and the answer's one note that misses are data, not instructions (said once, at the top).
+      blocks.push({ key: null, notice: /^No lesson is/.test(l), lines: [l, ''] });
+    }
+  }
+  for (const b of blocks.filter((x) => x.item)) {
+    b.key = b.section.startsWith('## Approved lessons') ? (lessonIds(b.lines.join('\n'))[0] ?? `item:${b.lines[0].slice(2, 82)}`) : `miss:${b.lines[0].slice(2, 82)}`;
   }
   // The note alone is nothing worth injecting.
-  if (!out.some((l) => l.trim() && !l.startsWith('Only approved lessons are rules'))) return null;
+  if (!blocks.some((b) => b.item || b.notice)) return null;
   const head = lines[0]?.startsWith('# ') ? [lines[0], ''] : [];
-  return `${clip([...head, ...out].join('\n').trim())}\n\n${POINTER}`;
+  return { head, blocks };
 }
 
 /**
- * What to add to this prompt: the compact context the first time in a session, after that only when it cites a
- * lesson this session has not been shown. `state` is { asked, shown }, kept per session by the caller.
+ * The blocks `want` keeps (headings and notes always), within about MAX_CONTEXT characters, cut between items, never
+ * through one; and the keys of the items shown in full. A heading left with none of its items is dropped.
+ */
+function render({ head, blocks }, want = () => true) {
+  const out = [];
+  const shown = [];
+  let size = head.join('\n').length;
+  let clipped = false;
+  for (const b of blocks) {
+    if (b.item && !want(b.key)) continue;
+    const text = b.lines.join('\n');
+    if (b.item && (clipped || size + text.length + 1 > MAX_CONTEXT)) {
+      clipped = true;
+      continue;
+    }
+    out.push(b);
+    size += text.length + 1;
+    if (b.item) shown.push(b.key);
+  }
+  // A heading whose items were all clipped or shown before goes with them.
+  const kept = out.filter((b, i) => !b.lines[0].startsWith('## ') || out.slice(i + 1).find((x) => x.item || x.lines[0].startsWith('## '))?.item);
+  if (!shown.length && !kept.some((b) => b.notice)) return { text: null, shown };
+  const body = [...head, ...kept.flatMap((b) => b.lines)].join('\n').trim();
+  return { text: `${body}${clipped ? `\n${CLIPPED}` : ''}\n\n${POINTER}`, shown };
+}
+
+/**
+ * The part of get_task_context worth putting in front of every request: the approved lessons, the past misses on the
+ * files the prompt names, and the notice that no lesson is approved yet, about 1,500 characters at most, cut between
+ * items. Null when it holds none of those: the rest (similar misses, facts, docs) stays one tool call away.
+ */
+export function compactContext(markdown) {
+  const c = compactBlocks(markdown);
+  return c ? render(c).text : null;
+}
+
+/**
+ * What to add to this prompt: the compact context the first time in a session; after that only the lessons and past
+ * misses this session has not been shown in full (one clipped before comes back). `state` is { asked, shown }, kept
+ * per session by the caller; shown holds lesson ids and "miss:" keys, recorded only for items shown whole.
  */
 export function contextForPrompt(markdown, state) {
-  const ids = lessonIds(markdown);
-  const fresh = ids.filter((id) => !state.shown.includes(id));
-  const next = { asked: true, shown: [...state.shown, ...fresh] };
-  return { text: !state.asked || fresh.length ? compactContext(markdown) : null, state: next };
+  const c = compactBlocks(markdown);
+  const seen = new Set(state.shown);
+  const fresh = c ? c.blocks.filter((b) => b.item && !seen.has(b.key)) : [];
+  if (!c || (state.asked && !fresh.length)) return { text: null, state: { ...state, asked: true } };
+  const r = render(c, state.asked ? (key) => !seen.has(key) : () => true);
+  return { text: r.text, state: { asked: true, shown: [...state.shown, ...r.shown.filter((k) => !seen.has(k))] } };
 }
 
 /** A session id Claude Code gives a hook (a uuid), checked before it is sent or put in front of the agent; else null. */

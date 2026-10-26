@@ -1,9 +1,10 @@
 import { readFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
-import { LESSON_CHECKS_VERSION, type ActivityStore, type KnowledgeStore, type Lesson, type LessonCheck, type LessonCheckName, type LessonDetail, type SimilarLesson } from '@fb/core';
+import { LESSON_CHECKS_VERSION, redactSecrets, type ActivityStore, type KnowledgeStore, type Lesson, type LessonCheck, type LessonCheckName, type LessonDetail, type SimilarLesson } from '@fb/core';
 import { MODEL_FACT_WHY, recheckLesson, saysWrongSession } from './lessonCheck.ts';
 import { ambiguousFlag, junkPathReason, normalizeStoredPaths, repoFileList, repoHas, type Normalized } from './paths.ts';
 import { claimsNotLoaded, imports } from './standing.ts';
+import { isFiller } from './shape.ts';
 
 /** More lessons than any instance holds; one pass, so a store that cannot save never loops. */
 const MAX_LESSONS = 10_000;
@@ -15,14 +16,46 @@ const NEIGHBOURS = 5;
 
 const MAX_TARGETS = 500;
 
+/** The why of a wrong-session a re-check read from a stored miss: worked out again each time, never kept. */
+export const RECHECK_WRONG_SESSION_WHY = 'the post-mortem says the matched session did other work: what it took from that session is likely wrong';
+
+/**
+ * may-hold-secret (the redaction re-run's flag on an approved lesson) holds while a rule still reads a credential in
+ * the lesson's text as it is now: once the owner edited the secret out (an edit resets checksVersion), it goes.
+ */
+const mayHoldSecret = (l: Lesson) => [l.title, l.rule, l.appliesWhen ?? ''].some((t) => redactSecrets(t) !== t);
+
 /**
  * Flags a re-check cannot work out again, kept from the earlier checks: made from the comment's metadata (who wrote
- * it, the matched session) or by the model, neither of which is stored with the lesson; or a repair already applied to
- * the lesson (a dropped path, the title used as the rule); or no-miss, which only a post-mortem's own words raise.
+ * it, the matched session: the post-mortem's own redo or the session re-match, not a re-check's reading of the miss) or
+ * by the model, neither of which is stored with the lesson; or a repair already applied to the lesson (a dropped path);
+ * or no-miss, which only a post-mortem's own words raise. broken-rule (the title used as the rule) only while the
+ * lesson is the writer's, as the repair left it: once the owner edited or decided it, the rule is judged as it is now.
  */
-const kept = (c: LessonCheck) =>
-  c.name === 'wrong-session' || c.name === 'self-review' || c.name === 'no-miss' || c.name === 'non-repo-path' || c.name === 'broken-rule' || c.name === 'contradicts-evidence' ||
+const kept = (l: Lesson) => (c: LessonCheck) =>
+  (c.name === 'wrong-session' && c.why !== RECHECK_WRONG_SESSION_WHY) || c.name === 'self-review' || c.name === 'no-miss' || c.name === 'non-repo-path' ||
+  (c.name === 'broken-rule' && l.status === 'proposed' && !l.proposedAs) || c.name === 'contradicts-evidence' ||
+  (c.name === 'may-hold-secret' && mayHoldSecret(l)) ||
   (c.name === 'looks-like-a-fact' && c.why === MODEL_FACT_WHY);
+
+/**
+ * Whether a stored miss says its session did other work. Only a post-mortem whose session is not known can be judged
+ * so: one recorded with no session (the comment alone) had none to be wrong, and one recorded with a session matched by
+ * branch or files was redone from the comment alone at the time if the model said so (postmortem.ts), so its words now
+ * are about the code ("another function"), not the session. Before the match was recorded, the words are all there is.
+ */
+/** RecheckDeps.workSession from Activity: the newest postmortem_done of the feedback, as the post-mortem recorded it. */
+export const recordedWorkSession = (activity: Pick<ActivityStore, 'list'>) => async (feedbackId: string) => {
+  const [a] = await activity.list({ kind: 'postmortem_done', target: feedbackId, limit: 1 });
+  if (!a?.details || !('workSession' in a.details)) return undefined;
+  return a.details.workSession as { id: string; matchedBy: 'branch' | 'files' | null } | null;
+};
+
+async function wrongSession(detail: LessonDetail | null, d: RecheckDeps): Promise<boolean> {
+  if (!detail?.miss || !saysWrongSession(detail.miss)) return false;
+  const work = detail.feedback && d.workSession ? await d.workSession(detail.feedback.id) : undefined;
+  return work === undefined;
+}
 
 /**
  * duplicate-of, when a near-identical lesson of the same project (DUPLICATE_COSINE) is the one to keep: an approved one
@@ -53,6 +86,11 @@ export type RecheckDeps = {
   linkedTickets?: (projectKey: string, ids: string[]) => Promise<string[]>;
   /** The instruction files a session's transcript shows its agent had (GraphStore.sessionInstructionFiles); unset: none known. */
   instructionFiles?: (sessionId: string) => Promise<string[] | null>;
+  /**
+   * The session a comment's post-mortem was worked out against (its postmortem_done Activity, details.workSession):
+   * null when none matched, undefined when not recorded (before 0.6.2) or unknown. Unset: never known.
+   */
+  workSession?: (feedbackId: string) => Promise<{ id: string; matchedBy: 'branch' | 'files' | null } | null | undefined>;
   activity?: Pick<ActivityStore, 'record'>;
   log?: (msg: string, extra?: object) => void;
 };
@@ -155,8 +193,10 @@ export async function recheckLessons(d: RecheckDeps): Promise<{ checked: number;
       data.push({ name: 'needs-path', why: 'no file the evidence supports: as it is, it would apply anywhere in the project' });
     }
     const fromPaths = pathFlags(norm, replaced);
-    if ((l.from === 'github' || l.from === 'linear') && detail?.miss && saysWrongSession(detail.miss)) {
-      data.push({ name: 'wrong-session', why: 'the post-mortem says the matched session did other work: what it took from that session is likely wrong' });
+    if ((l.from === 'github' || l.from === 'linear') && (await wrongSession(detail, d))) data.push({ name: 'wrong-session', why: RECHECK_WRONG_SESSION_WHY });
+    // Flagged only: an approved lesson's words are the owner's (the writer's are repaired when proposed, shape.ts).
+    if (isFiller(l.appliesWhen)) {
+      data.push({ name: 'filler-applies-when', why: `its "applies when" is just "${l.appliesWhen.trim()}": it says nothing about when the rule applies; say the kind of task or the files` });
     }
     const dup = d.k.similarLessons ? duplicateFlag(l, await d.k.similarLessons(l.id, NEIGHBOURS)) : null;
     if (dup) data.push(dup);
@@ -169,7 +209,7 @@ export async function recheckLessons(d: RecheckDeps): Promise<{ checked: number;
       ...fresh.filter((f) => f.name === 'bad-path'), ...fromPaths.filter((f) => f.name === 'bad-path'), ...data,
       ...fromPaths.filter((f) => f.name !== 'bad-path'), ...fresh.filter((f) => f.name !== 'bad-path'),
     ];
-    const keep = (l.checks ?? []).filter(kept);
+    const keep = (l.checks ?? []).filter(kept(l));
     const flags = [...keep, ...computed.filter((c) => !keep.some((k) => k.name === c.name))];
     await d.k.setLessonChecks(l.id, flags, LESSON_CHECKS_VERSION);
     const before = new Set((l.checks ?? []).map((c) => c.name));

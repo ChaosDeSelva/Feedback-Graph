@@ -413,8 +413,9 @@ export type PostMortemTrace = {
 export async function runPostMortem(input: PostMortemInput, deps: PostMortemDeps): Promise<PostMortem & { trace: PostMortemTrace }> {
   const first = await postMortemOnce(input, deps);
   // The session matched to a comment did other work: everything taken from it is wrong, so the comment is worked out
-  // alone, as when no session was found, and the owner is told why.
-  if (input.feedback.external && input.work && saysWrongSession(first)) {
+  // alone, as when no session was found, and the owner is told why. A session that ran on the pull request's branch did
+  // that work: only the marker the prompt asks for says otherwise, not words such as "another feature" about the code.
+  if (input.feedback.external && input.work && saysWrongSession(first, { markerOnly: input.work.matchedBy === 'branch' })) {
     const again = await postMortemOnce({ ...input, work: null }, deps);
     const flag: LessonFlag = { name: 'wrong-session', why: `the matched session ${input.work.sessionId} did other work; redone from the comment alone` };
     return { ...again, lessonChecks: [flag, ...(again.lessonChecks ?? [])], trace: { ...again.trace, lessonFlags: [flag, ...again.trace.lessonFlags] } };
@@ -490,7 +491,8 @@ async function postMortemOnce(input: PostMortemInput, deps: PostMortemDeps): Pro
   for (const a of checkedPaths.ambiguous) pathFlags.push(ambiguousFlag(a));
   if (!checkedPaths.paths.length && !global && !processMiss) pathFlags.push({ name: 'needs-path', why: 'no file the evidence supports: as it is, it would apply anywhere in the project' });
   // Scoped and falsifiable? Narrows what is clearly over-reaching and flags the rest for the owner (lessonCheck.ts).
-  const checked = checkLesson({ ...raw.lesson, paths: checkedPaths.paths }, input.feedback, { about, factLike });
+  // A process miss is on no file: an instruction about git keeps none of the files the session happened to edit.
+  const checked = checkLesson({ ...raw.lesson, paths: processMiss ? [] : checkedPaths.paths }, input.feedback, { about, factLike });
   // A nit or optional remark is never a project-wide lesson, however its rule is worded (feedbackRules.isNitComment).
   if (ext && isNitComment(input.feedback.text) && checked.lesson.scope !== 'task') {
     if (!checked.flags.some((f) => f.name === 'universal-from-nit')) checked.flags.push({ name: 'universal-from-nit', why: `a ${checked.lesson.scope}-wide rule from one nit or optional comment; narrowed to the task` });

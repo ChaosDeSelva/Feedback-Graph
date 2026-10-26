@@ -1,6 +1,6 @@
 import { expect, test } from 'vitest';
 import type { Db } from './db.ts';
-import { pgvectorProblem, searchDocsQuery, searchFactsQuery } from './vector.ts';
+import { pgvectorProblem, relatedMissesQuery, searchDocsQuery, searchFactsQuery, searchLessonsQuery } from './vector.ts';
 
 test('pgvector 0.8.0 and newer serve the searches; older versions and a missing extension are refused with why', () => {
   for (const ok of ['0.8.0', '0.8.7', '0.9.0', '0.10.1', '1.0.0']) expect(pgvectorProblem(ok)).toBeNull();
@@ -15,4 +15,18 @@ test("a search leaves out other runs' sandbox records inside the nearest-k scan,
   const docs = searchDocsQuery(db, { embedding: [1, 0, 0], projectKey: 'demo', k: 2, run: 'sbx-1' });
   expect(inner(docs.sql)).toMatch(/NOT c\.sandbox OR c\.run IS NOT DISTINCT FROM \$4::text/);
   expect(docs.params[3]).toBe('sbx-1');
+});
+
+test('while the database holds no sandbox record the searches carry no run filter, and still name the run parameter', () => {
+  const db = { dims: 3 } as Db;
+  const q = { embedding: [1, 0, 0], projectKey: 'demo', k: 2, run: null };
+  for (const sql of [
+    searchFactsQuery(db, q, 'x.id', { sandbox: false }).sql,
+    searchDocsQuery(db, q, { sandbox: false }).sql,
+    searchLessonsQuery(db, q, { sandbox: false }).sql,
+    relatedMissesQuery(db, q, { sandbox: false }).sql,
+  ]) {
+    expect(sql).not.toMatch(/\.sandbox/);
+    expect(sql).toMatch(/\(true OR \$\d::text IS NULL\)/);
+  }
 });

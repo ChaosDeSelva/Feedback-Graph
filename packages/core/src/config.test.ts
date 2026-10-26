@@ -34,6 +34,13 @@ test('SCAN_MAX_FILES unset scales with the repo (null); set, it is a fixed cap; 
   expect(() => loadConfig({ ...base, SCAN_CONCURRENCY: '0' })).toThrow(/SCAN_CONCURRENCY/);
 });
 
+test('check_before_done takes CHECK_CONCURRENCY judge calls at once (default 2) and answers within CHECK_WAIT_SECONDS (default 300, room for a local model)', () => {
+  expect(loadConfig(base).check).toEqual({ concurrency: 2, waitSeconds: 300 });
+  expect(loadConfig({ ...base, CHECK_CONCURRENCY: '4', CHECK_WAIT_SECONDS: '30' }).check).toEqual({ concurrency: 4, waitSeconds: 30 });
+  expect(() => loadConfig({ ...base, CHECK_CONCURRENCY: '0' })).toThrow(/CHECK_CONCURRENCY/);
+  expect(() => loadConfig({ ...base, CHECK_WAIT_SECONDS: '1' })).toThrow(/CHECK_WAIT_SECONDS must be a number of at least 5/);
+});
+
 test('CODEX_SESSIONS_DIR points the worker at another Codex sessions folder', () => {
   expect(loadConfig({ ...base, CODEX_SESSIONS_DIR: '/elsewhere' }).codexSessionsDir).toBe('/elsewhere');
 });

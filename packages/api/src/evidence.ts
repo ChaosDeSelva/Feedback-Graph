@@ -22,10 +22,13 @@ const MAX_FLAGS = 2000;
 const MAX_ENTRIES = 50;
 
 const entryRow = (a: Activity) => ({ id: a.id, ts: a.ts, kind: a.kind, actor: a.actor, subject: a.subject, ...(a.run ? { run: a.run } : {}) });
-/** The lessons an entry says it served (context_served, predone_check), by id. */
+/**
+ * The lessons an entry says it served (context_served, predone_check), by id. Entries keep {id} or {lessonId}; some
+ * (search_graph, and older not-judged checks) kept plain id strings.
+ */
 const servedLessons = (a: Activity): string[] => {
-  const ls = (a.details?.lessons ?? a.details?.verdicts) as { id?: string; lessonId?: string }[] | undefined;
-  return Array.isArray(ls) ? ls.map((l) => l.id ?? l.lessonId ?? '').filter(Boolean) : [];
+  const ls = (a.details?.lessons ?? a.details?.verdicts) as (string | { id?: string; lessonId?: string })[] | undefined;
+  return Array.isArray(ls) ? ls.map((l) => (typeof l === 'string' ? l : (l?.id ?? l?.lessonId ?? ''))).filter(Boolean) : [];
 };
 
 export function evidenceRoutes(app: Hono, d: EvidenceDeps) {

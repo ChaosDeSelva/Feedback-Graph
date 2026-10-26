@@ -63,3 +63,19 @@ test('a process miss the post-mortem marked under the first rule is checked too,
   expect(await sortOldMisses(deps)).toEqual({ marked: 0, restored: 1 });
   expect(set).toEqual([['miss:f', null]]);
 });
+
+test('v3: an instruction about git ("don\'t push a PR yet") whose lesson carries the session\'s files is detached from them, once', async () => {
+  const tenFiles = Array.from({ length: 10 }, (_, i) => `web/src/chat/f${i}.ts`);
+  const misses = [
+    miss('miss:i', "keep this on its own branch, don't push a PR yet", 'Do not push until the developer has looked', null, 'demo', tenFiles),
+    miss('miss:n', "keep it on its own branch, don't push a PR yet", null),
+    miss('miss:b', "this isn't good enough, filter server-side", 'Filter search on the server in api/search.ts', null, 'demo', ['api/search.ts']),
+  ];
+  const { set, activity, cursors, deps } = fakes(misses, [], 'v2');
+  expect(MISS_SUBJECT_VERSION).toBe(3);
+  expect(await sortOldMisses(deps)).toEqual({ marked: 2, restored: 0 });
+  expect(set).toEqual([['miss:i', 'process'], ['miss:n', 'process']]);
+  expect(activity).toEqual([expect.objectContaining({ kind: 'misses_reclassified', projectKey: 'demo', targets: ['miss:i', 'miss:n'], details: expect.objectContaining({ subject: 'process', version: 3 }) })]);
+  expect(cursors.get(MISS_SUBJECT_CURSOR)).toBe('v3');
+  expect(await sortOldMisses(deps)).toBeNull();
+});

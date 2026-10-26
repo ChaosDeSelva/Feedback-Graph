@@ -31,6 +31,20 @@ setting() {
   printf '%s' "$v"
 }
 
+# Containers under this folder's Compose name (FG_INSTANCE) that another folder started are that folder's install: the
+# API answering here (and docker compose exec) is that one, not this checkout. Said on stderr before every command.
+if command -v docker >/dev/null 2>&1; then
+  instance="$(setting FG_INSTANCE)"; instance="${instance:-feedback-graph}"
+  started_in="$(docker ps -a --filter "label=com.docker.compose.project=$instance" --format '{{.Label "com.docker.compose.project.working_dir"}}' 2>/dev/null | head -n 1 || true)"
+  if [ -n "$started_in" ] && [ "$(cd "$started_in" 2>/dev/null && pwd -P || printf '%s' "$started_in")" != "$(cd "$here" && pwd -P)" ]; then
+    {
+      echo "WARNING: the containers named $instance were started from $started_in, not this folder ($here): the API answering"
+      echo "  is that install's, and docker compose here would take it over. Give this folder its own FG_INSTANCE and ports"
+      echo "  in .env (./scripts/setup.sh --help), or run fg from $started_in."
+    } >&2
+  fi
+fi
+
 native_ts() {
   command -v node >/dev/null 2>&1 &&
     node -e 'const [a,b]=process.versions.node.split(".").map(Number);process.exit(a>23||(a===23&&b>=6)||(a===22&&b>=18)?0:1)' 2>/dev/null

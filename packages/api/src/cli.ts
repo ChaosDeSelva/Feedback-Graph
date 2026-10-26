@@ -261,13 +261,14 @@ const ordinal = (n: number) => `${n}${n % 100 >= 11 && n % 100 <= 13 ? 'th' : ['
 type Pipeline = Record<string, any>;
 
 /** LessonQuality (GET /api/lessons/quality, /api/pipeline lessons.quality). */
-type Quality = { days: number; asWritten: number; edited: number; rejected: number; decided: number };
+type Quality = { days: number; asWritten: number; edited: number; rejected: number; decided: number; byOperator?: number };
 const pct = (n: number, of: number) => `${n} (${of ? Math.round((100 * n) / of) : 0}%)`;
-/** How the owner judged the lessons the post-mortem wrote, in one window. */
+/** How the owner judged the lessons the post-mortem wrote, in one window, and how many an operator-token agent decided. */
 function qualityLine(q: Quality): string {
   const share = (n: number) => `${Math.round((100 * n) / q.decided)}%`;
+  const op = q.byOperator ? `; ${q.byOperator} of them by an agent with the operator token (${share(q.byOperator)})` : '';
   return q.decided
-    ? `last ${q.days} d: ${q.decided} decided: ${q.asWritten} approved as written (${share(q.asWritten)}), ${q.edited} after an edit (${share(q.edited)}), ${q.rejected} rejected (${share(q.rejected)})`
+    ? `last ${q.days} d: ${q.decided} decided: ${q.asWritten} approved as written (${share(q.asWritten)}), ${q.edited} after an edit (${share(q.edited)}), ${q.rejected} rejected (${share(q.rejected)})${op}`
     : `last ${q.days} d: no lessons decided`;
 }
 
@@ -682,8 +683,8 @@ async function lessons(api: Api, io: CliIO, words: string[], f: Flags): Promise<
     const r = await api<{ windows: Quality[]; projects: Record<string, Quality[]>; capped?: true }>('GET', `/api/lessons/quality${qs({ project: f.project })}`);
     if (f.json) { io.out(JSON.stringify(r, null, 2)); return 0; }
     const rows = [['all', r.windows] as const, ...Object.entries(r.projects).sort(([a], [b]) => a.localeCompare(b))].flatMap(([k, ws]) =>
-      ws.map((q) => [k, String(q.days), String(q.decided), pct(q.asWritten, q.decided), pct(q.edited, q.decided), pct(q.rejected, q.decided)]));
-    io.out(table(['PROJECT', 'DAYS', 'DECIDED', 'AS WRITTEN', 'AFTER EDIT', 'REJECTED'], rows, 40));
+      ws.map((q) => [k, String(q.days), String(q.decided), pct(q.asWritten, q.decided), pct(q.edited, q.decided), pct(q.rejected, q.decided), pct(q.byOperator ?? 0, q.decided)]));
+    io.out(table(['PROJECT', 'DAYS', 'DECIDED', 'AS WRITTEN', 'AFTER EDIT', 'REJECTED', 'BY OPERATOR'], rows, 40));
     if (r.capped) io.out('(capped: more decisions than were counted; the oldest are left out)');
     return 0;
   }
@@ -887,8 +888,13 @@ async function cleanupCmd(api: Api, io: CliIO, f: Flags): Promise<number> {
     io.out(`\nchanged by the run but not its own (never undone: put them back by hand if you need to)`);
     io.out(table(['KIND', 'TARGETS', 'SUBJECT'], r.changed.map((c: any) => [c.kind, c.targets.join(','), c.subject]), 80));
   }
-  const n = r.entries ?? 0;
-  io.out(`\nits ${n} Activity ${n === 1 ? 'entry stays' : 'entries stay'} (the log is never edited)${r.dryRun ? `; fg cleanup --run ${r.run} --apply removes the rest` : ''}`);
+  // Its Activity entries go with --apply; the run_cleaned entry (not the run's) records the cleanup and what it changed.
+  const n = r.dryRun ? r.entries ?? 0 : r.entriesRemoved ?? 0;
+  const entries = `${r.dryRun && r.entriesCapped ? 'at least ' : ''}${n} Activity ${n === 1 ? 'entry' : 'entries'}`;
+  // A cleanup removes only the entries its plan read and listed: a bigger run takes more than one.
+  io.out(r.dryRun
+    ? `\nits ${entries} ${n === 1 ? 'goes' : 'go'} too with --apply (a run_cleaned entry, not the run's, records the cleanup and what the run changed)${r.entriesCapped ? `; the ${n} newest go with --apply, the older ones stay until you run it again` : `; fg cleanup --run ${r.run} --apply removes all of it`}`
+    : `\nremoved its ${entries}; the run_cleaned entry in Activity records the cleanup and what the run changed${r.entriesCapped ? `; older entries may remain: run fg cleanup --run ${r.run} --apply again` : ''}`);
   return 0;
 }
 

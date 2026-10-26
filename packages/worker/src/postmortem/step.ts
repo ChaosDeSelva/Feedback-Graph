@@ -142,6 +142,8 @@ export async function runPostmortems(deps: PostmortemStepDeps): Promise<{ done: 
           proposedFacts: pm.facts ?? [],
           // A comment's post-mortem: the session it was worked out against and how it was matched (null: none matched).
           ...(trace?.workSession !== undefined && { workSession: trace.workSession }),
+          // The lessons shown to the writer as the owner's examples (examples.ts), by id: [] when none were.
+          ...(trace && { examples: trace.examples ?? [] }),
           ...(pm.noMiss && { noLesson: pm.noMiss }),
         },
         targets: [input.feedbackId, `miss:${input.feedbackId}`, ...(pm.lessonDropped ? [] : [`lesson:${input.feedbackId}`])],

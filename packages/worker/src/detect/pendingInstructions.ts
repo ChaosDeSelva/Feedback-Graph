@@ -16,6 +16,13 @@ export type PendingInstructionDeps = {
   activity?: Pick<ActivityStore, 'record'>;
   log?: (msg: string, extra?: object) => void;
   now?: () => number;
+  /**
+   * The ingest version the transcripts have been read at (state.ts INGEST_VERSION), part of the stamp: the rule reads
+   * the git calls ingest records after each instruction (ingest v4), so it runs again once they are read again. Run only
+   * after that ingest (evidence.ts): before it, a push that ended the session is not recorded and the instruction looks
+   * kept. Unset: the rules version alone.
+   */
+  ingestVersion?: number;
 };
 
 /** Where the detect rules version last applied to pending items is kept. */
@@ -34,9 +41,15 @@ const SAMPLE_CHARS = 200;
  * failure leaves the old version too.
  */
 export async function resolvePendingInstructions(d: PendingInstructionDeps): Promise<{ resolved: number; reopened: number } | null> {
-  const stamp = `v${DETECT_RULES_VERSION}`;
+  const rules = `v${DETECT_RULES_VERSION}`;
+  const stamp = d.ingestVersion ? `${rules} ingest v${d.ingestVersion}` : rules;
   const last = await d.cursors.getCursor(INSTRUCTION_RULES_CURSOR);
   if (last === stamp) return null;
+  // The rules are the same and only the evidence they read is new.
+  const reread = !!last && last.split(' ')[0] === rules && !!d.ingestVersion;
+  const changed = reread
+    ? `the sessions' transcripts were read again (ingest v${d.ingestVersion}), so the git calls after each instruction are known now`
+    : `the detect rules changed (${last} to ${stamp})`;
   const now = (d.now ?? Date.now)();
   const hits = new Map<string, { id: string; text: string }[]>();
   const back = new Map<string, { id: string; text: string }[]>();
@@ -78,7 +91,7 @@ export async function resolvePendingInstructions(d: PendingInstructionDeps): Pro
     await d.activity?.record({
       kind: 'items_reopened', actor: DETECT_DECIDER, projectKey,
       subject: `${list.length} Inbox item${list.length === 1 ? '' : 's'} back for your decision: pushback that mentions git, not an instruction`,
-      why: `the detect rules changed (${last} to ${stamp}); the earlier rule had resolved ${list.length === 1 ? 'it' : 'them'} as instructions`,
+      why: `${changed}; the earlier ${reread ? 'run' : 'rule'} had resolved ${list.length === 1 ? 'it as an instruction' : 'them as instructions'}`,
       details: {
         rule: 'instruction', reopened: list.length, rulesVersion: DETECT_RULES_VERSION,
         samples: list.slice(0, MAX_SAMPLES).map((h) => ({ turn: h.id, text: h.text.slice(0, SAMPLE_CHARS) })),
@@ -92,7 +105,7 @@ export async function resolvePendingInstructions(d: PendingInstructionDeps): Pro
     await d.activity?.record({
       kind: 'comments_skipped', actor: DETECT_DECIDER, projectKey,
       subject: `${list.length} pending Inbox item${list.length === 1 ? '' : 's'} resolved as not pushback: an instruction, not a correction`,
-      why: `${last ? `the detect rules changed (${last} to ${stamp})` : `the detect rules (${stamp}) had not been run over the Inbox yet`}; instruction: ${list.length}`,
+      why: `${last ? changed : `the detect rules (${stamp}) had not been run over the Inbox yet`}; instruction: ${list.length}`,
       details: {
         rules: { instruction: list.length }, pending: list.length, rulesVersion: DETECT_RULES_VERSION,
         samples: list.slice(0, MAX_SAMPLES).map((h) => ({ rule: 'instruction', turn: h.id, text: h.text.slice(0, SAMPLE_CHARS) })),

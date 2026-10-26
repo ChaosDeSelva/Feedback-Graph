@@ -21,16 +21,18 @@ const entry = (o: Partial<Activity>): Activity => ({
 
 const API = 'a'.repeat(32);
 
-function setup(o: { allow?: OperatorVerb[]; items?: RunItem[]; entries?: Activity[]; extra?: Partial<AppOpts>; ctx?: Partial<ContextDeps>; owners?: Record<string, RunPrincipal>; token?: string } = {}) {
+function setup(o: { allow?: OperatorVerb[]; items?: RunItem[]; entries?: Activity[]; extra?: Partial<AppOpts>; ctx?: Partial<ContextDeps>; owners?: Record<string, RunPrincipal | [RunPrincipal, string]>; token?: string } = {}) {
   const logged: ActivityInput[] = [];
   const listed: unknown[] = [];
   const reports: unknown[] = [];
   const checks: unknown[] = [];
   const searched: unknown[] = [];
   const removed: [string, string[]][] = [];
+  const removedEntries: string[] = [];
+  const removeArgs: { keep: string[]; ids?: string[]; targets?: string[] }[] = [];
   const entries = o.entries ?? [];
   // Who opened each run (RunsStore.claim): the first claim stands.
-  const owners = new Map<string, RunOwner>(Object.entries(o.owners ?? {}).map(([run, principal]) => [run, { run, principal, firstSeen: 't0' }]));
+  const owners = new Map<string, RunOwner>(Object.entries(o.owners ?? {}).map(([run, p]) => [run, { run, principal: Array.isArray(p) ? p[0] : p, actor: Array.isArray(p) ? p[1] : null, firstSeen: 't0' }]));
   const repo = {
     listCandidates: async () => [], stats: async () => [], decide: async () => {},
     // c1 is the owner's; r:<run> was reported in that run (a run decides only on its own).
@@ -55,7 +57,15 @@ function setup(o: { allow?: OperatorVerb[]; items?: RunItem[]; entries?: Activit
     auth: { ...(o.token && { token: o.token }), operator: { token: OP, allow: o.allow ?? [...OPERATOR_VERBS] } },
     activity: {
       record: async (e) => { logged.push(e); },
-      list: async (q) => { listed.push(q); return entries.filter((a) => (!q.run || a.run === q.run) && (!q.target || a.targets.includes(q.target))); },
+      list: async (q) => {
+        listed.push(q);
+        return entries.filter((a) => (!q.run || a.run === q.run) && (!q.target || a.targets.includes(q.target)) && (!q.unlabelled || !a.run) && (!q.noSandbox || !a.sandbox)).slice(0, q.limit ?? Infinity);
+      },
+      removeRun: async (run, keep, opts) => {
+        removedEntries.push(run);
+        removeArgs.push({ keep: [...(keep ?? [])], ids: opts?.ids ? [...opts.ids] : undefined, targets: opts?.targets ? [...opts.targets] : undefined });
+        return entries.filter((a) => a.run === run && (!opts?.ids || opts.ids.includes(a.id)) && !a.targets.some((t) => opts?.targets?.includes(t))).length;
+      },
     },
     context: ctx,
     runs: {
@@ -64,15 +74,15 @@ function setup(o: { allow?: OperatorVerb[]; items?: RunItem[]; entries?: Activit
         removed.push([run, keep]);
         return { feedback: 1, lesson: 1, miss: 1, predone_check: 0, fact: 0, doc: 1, link: 0, chat: 0 } as Record<RunItemKind, number>;
       },
-      claim: async (run, principal) => {
-        if (!owners.has(run)) owners.set(run, { run, principal, firstSeen: 't1' });
+      claim: async (run, principal, actor) => {
+        if (!owners.has(run)) owners.set(run, { run, principal, actor: actor ?? null, firstSeen: 't1' });
         return owners.get(run)!;
       },
       owner: async (run) => owners.get(run) ?? null,
     },
     ...o.extra,
   });
-  return { app, logged, listed, reports, checks, searched, removed, owners };
+  return { app, logged, listed, reports, checks, searched, removed, removedEntries, removeArgs, owners };
 }
 
 const rpc = (name: string, args: object) => ({
@@ -307,12 +317,12 @@ test('a run id belongs to whoever opened it: a write under it by anyone else is 
   expect((await mine.app.request('/api/candidates/r:run-1/decision', json('POST', { status: 'confirmed' }, op('run-1')))).status).toBe(204);
 });
 
-test("the operator token cleans up its own run, and is refused (403) on an owner-token, browser, agent or legacy run; the owner may clean any", async () => {
+test("the operator token cleans up its own run and an agent's, and is refused (403) on an owner-token, browser or legacy run; the owner may clean any", async () => {
   const own = setup({ items });
   expect((await own.app.request('/api/candidates/r:run-1/decision', json('POST', { status: 'confirmed' }, op('run-1')))).status).toBe(204);
   expect((await own.app.request('/api/runs/run-1', json('DELETE', { dryRun: false }, op()))).status).toBe(200);
   expect(own.removed).toHaveLength(1);
-  for (const principal of ['owner_token', 'browser', 'agent'] as const) {
+  for (const principal of ['owner_token', 'browser'] as const) {
     const s = setup({ items, owners: { 'run-1': principal } });
     const refused = await s.app.request('/api/runs/run-1', json('DELETE', { dryRun: false }, op()));
     expect(refused.status).toBe(403);
@@ -329,6 +339,98 @@ test("the operator token cleans up its own run, and is refused (403) on an owner
   // However many Activity entries the run has, the owner record decides, not a scan of them.
   const busy = setup({ items, owners: { 'run-1': 'browser' }, entries: Array.from({ length: 6000 }, () => entry({ run: 'run-1', details: { via: 'operator' } })) });
   expect((await busy.app.request('/api/runs/run-1', json('DELETE', { dryRun: false }, op()))).status).toBe(403);
+});
+
+test('a run belongs to the operator name that opened it: another name gets 409 on a write and 403 on cleanup; a run opened before names were recorded is any operator\'s', async () => {
+  const s = setup({ items });
+  expect((await s.app.request('/api/candidates/r:run-1/decision', json('POST', { status: 'confirmed' }, op('run-1')))).status).toBe(204);
+  expect(s.owners.get('run-1')).toMatchObject({ principal: 'operator', actor: 'operator:tester' });
+  const other = { 'x-fg-operator': 'other' };
+  const write = await s.app.request('/api/candidates/r:run-1/decision', json('POST', { status: 'confirmed' }, op('run-1', other)));
+  expect(write.status).toBe(409);
+  expect(((await write.json()) as { error: string }).error).toMatch(/opened by the operator token as operator:tester/);
+  const clean = await s.app.request('/api/runs/run-1', json('DELETE', { dryRun: false }, op(undefined, other)));
+  expect(clean.status).toBe(403);
+  expect(((await clean.json()) as { error: string }).error).toMatch(/operator:tester/);
+  expect(s.removed).toEqual([]);
+  expect((await s.app.request('/api/runs/run-1', json('DELETE', { dryRun: false }, op()))).status).toBe(200);
+  // The admin MCP endpoint is the same caller under the same name.
+  const mcp = setup({ items, owners: { 'run-1': ['operator', 'operator:other'] } });
+  const req = rpc('run_cleanup', { run: 'run-1', apply: true });
+  const res = await mcp.app.request('/mcp/admin', { ...req, headers: { ...req.headers, ...op() } });
+  expect(await textOf(res)).toMatch(/operator:other/);
+  expect(mcp.removed).toEqual([]);
+  // Opened before names were recorded: any operator name, as before.
+  const legacy = setup({ items, owners: { 'run-1': 'operator' } });
+  expect((await legacy.app.request('/api/candidates/r:run-1/decision', json('POST', { status: 'confirmed' }, op('run-1', other)))).status).toBe(204);
+  expect((await legacy.app.request('/api/runs/run-1', json('DELETE', { dryRun: false }, op(undefined, other)))).status).toBe(200);
+});
+
+test("the operator token cleans up a run an agent without a token opened (sandbox or not): what it wrote, its pre-done checks included, goes; the cleanup is logged as the operator", async () => {
+  const agentItems: RunItem[] = [...items, { kind: 'predone_check', id: 'pdc-1', projectKey: 'demo', sandbox: false, group: null, merged: false }];
+  const s = setup({ items: agentItems, owners: { 'run-1': 'agent' } });
+  const dry = (await (await s.app.request('/api/runs/run-1', json('DELETE', {}, op()))).json()) as Record<string, any>;
+  expect(dry).toMatchObject({ dryRun: true, remove: { predone_check: 1 } });
+  expect((await s.app.request('/api/runs/run-1', json('DELETE', { dryRun: false }, op()))).status).toBe(200);
+  expect(s.removed).toEqual([['run-1', []]]);
+  expect(s.logged.at(-1)).toMatchObject({ kind: 'run_cleaned', actor: 'operator:tester', details: expect.objectContaining({ openedBy: 'agent' }) });
+});
+
+test("cleanup with --apply also removes the run's Activity entries, all but the run_cleaned entry, which keeps what the run changed; the dry run says so", async () => {
+  const { app, removedEntries, logged } = setup({ items, entries: runEntries, owners: { 'run-1': ['operator', 'operator:tester'] } });
+  const dry = (await (await app.request('/api/runs/run-1', json('DELETE', {}, op()))).json()) as Record<string, any>;
+  expect(dry).toMatchObject({ dryRun: true, entries: 4, entriesCapped: false });
+  expect(removedEntries).toEqual([]);
+  const res = (await (await app.request('/api/runs/run-1', json('DELETE', { dryRun: false }, op()))).json()) as Record<string, any>;
+  expect(res).toMatchObject({ dryRun: false, entriesRemoved: 4 });
+  expect(removedEntries).toEqual(['run-1']);
+  const cleaned = logged.at(-1)!;
+  expect(cleaned).toMatchObject({ kind: 'run_cleaned', run: null, details: expect.objectContaining({ entriesRemoved: 4 }) });
+  expect((cleaned.details as { changedItems: unknown[] }).changedItems).toEqual([expect.objectContaining({ kind: 'feedback_decided' }), expect.objectContaining({ kind: 'project_pinned' })]);
+  expect(cleaned.why).toMatch(/its Activity entries go too/);
+});
+
+test('cleanup keeps the history of every record it keeps: the entry that created a record the owner decided on stays', async () => {
+  const created = entry({ kind: 'postmortem_done', actor: 'ollama:m', run: 'run-1', targets: ['manual:b', 'lesson:manual:b'], subject: 'proposed lesson "B"' });
+  const { app, removeArgs } = setup({ items, entries: [...runEntries, created], owners: { 'run-1': ['operator', 'operator:tester'] } });
+  const res = (await (await app.request('/api/runs/run-1', json('DELETE', { dryRun: false }, op()))).json()) as Record<string, any>;
+  // b (decided by the owner) and c (merged into a session's Inbox item) stay, and so do the entries about them.
+  expect([...removeArgs[0].targets!].sort()).toEqual(['lesson:manual:b', 'manual:b', 'manual:c']);
+  expect(res.entriesRemoved).toBe(4);
+});
+
+test('a run with more entries than a cleanup reads: only the entries it read (and listed) go; every change among them is listed; the rest stay for the next cleanup', async () => {
+  const many = Array.from({ length: 5100 }, (_, i) => entry({
+    id: `act:${String(i).padStart(5, '0')}`, run: 'run-1', ...(i % 20 === 0
+      ? { kind: 'project_pinned' as const, actor: 'operator:tester', details: { via: 'operator' }, subject: `pinned ${i}` }
+      : { kind: 'context_served' as const, details: { via: 'api' } }),
+  }));
+  const { app, removeArgs, logged } = setup({ items: [], entries: many, owners: { 'run-1': ['operator', 'operator:tester'] } });
+  const res = (await (await app.request('/api/runs/run-1', json('DELETE', { dryRun: false }, op()))).json()) as Record<string, any>;
+  expect(res).toMatchObject({ entriesCapped: true, entriesRemoved: 5000 });
+  expect(removeArgs[0].ids).toHaveLength(5000);
+  expect(removeArgs[0].ids).not.toContain('act:05099');
+  const cleaned = logged.at(-1)!;
+  // 250 changes in what was read: every one listed, not the first 200.
+  expect((cleaned.details as { changedItems: unknown[] }).changedItems).toHaveLength(250);
+  expect(cleaned.why).toMatch(/more Activity entries than one cleanup reads \(5000\): those not read stay, with what they changed; clean up again/);
+});
+
+test("the default Activity feed leaves out every labelled run's entries; ?run= shows one run's; a record's history (target=) keeps runs but never another's sandbox", async () => {
+  const entries = [entry({ subject: 'owner' }), entry({ run: 'run-1', subject: 'stress', targets: ['l1'] }), entry({ run: 'sbx-1', sandbox: true, subject: 'sandbox', targets: ['l1'] })];
+  const { app, listed } = setup({ entries });
+  const subjects = async (url: string) => ((await (await app.request(url)).json()) as Activity[]).map((a) => a.subject);
+  expect(await subjects('/api/activity')).toEqual(['owner']);
+  expect(listed.at(-1)).toMatchObject({ unlabelled: true });
+  expect(await subjects('/api/activity?kind=context_served')).toEqual(['owner']);
+  expect(await subjects('/api/activity?run=run-1')).toEqual(['stress']);
+  expect(await subjects('/api/activity?run=sbx-1')).toEqual(['sandbox']);
+  expect(await subjects('/api/activity?target=l1')).toEqual(['stress']);
+  expect(listed.at(-1)).toMatchObject({ noSandbox: true });
+  expect((listed.at(-1) as { unlabelled?: boolean }).unlabelled).toBeUndefined();
+  // ?runs=1 (the Activity page with "hide labelled runs" off): every run's entries, but never another's sandbox.
+  expect(await subjects('/api/activity?runs=1')).toEqual(['owner', 'stress']);
+  expect(listed.at(-1)).toMatchObject({ noSandbox: true });
 });
 
 test('a cleanup request never claims a run: the owner cleans an agent run while labelled with it, a dry run of an unused id leaves it free, and run_cleaned is not tagged with the run it removed', async () => {

@@ -60,7 +60,7 @@ const lowerFirst = (s: string) => (/^[A-Z][a-z]/.test(s) ? s[0].toLowerCase() + 
 
 /** What a small model puts in appliesWhen instead of saying when: a scope word, a cause, a word for everything. */
 const FILLERS = new Set([...SCOPE_WORDS, 'work', 'general', 'always', 'any', 'all', 'anywhere', 'everything', 'code', 'coding', 'development', 'implementation', 'n/a', 'na', 'none']);
-const isFiller = (s: string) => FILLERS.has(s.trim().toLowerCase().replace(/[.\s]+$/, ''));
+export const isFiller = (s: string) => FILLERS.has(s.trim().toLowerCase().replace(/[.\s]+$/, ''));
 
 const RULE_WORDS = 6;
 const MIN_RULE_WORDS = 4;

@@ -26,6 +26,17 @@ test('changing the URL hash (links, back button) switches the page', async () =>
   expect(screen.getByRole('button', { name: 'Dashboard' }).getAttribute('aria-current')).toBeNull();
 });
 
+test.each(['constructor', '__proto__', 'toString', 'hasOwnProperty'])('a hash naming no page (#%s) opens the Dashboard', async (word) => {
+  location.hash = `#${word}`;
+  render(<App />);
+  expect(screen.getByRole('heading', { name: 'Dashboard', level: 1 })).toBeTruthy();
+  await act(async () => {
+    location.hash = `#${word}`;
+    window.dispatchEvent(new HashChangeEvent('hashchange'));
+  });
+  expect(screen.getByRole('heading', { name: 'Dashboard', level: 1 })).toBeTruthy();
+});
+
 test('a link to one item (#lessons/<id>) opens its page and keeps the id in the hash', async () => {
   location.hash = '#lessons/l1';
   render(<App />);
@@ -150,7 +161,7 @@ test('a Docs page after Activity explains how to use the tool', async () => {
   for (const heading of ['How it works', 'Your first hour', 'Connect your agents', 'Each page']) {
     expect(screen.getByRole('heading', { name: heading })).toBeTruthy();
   }
-  expect(screen.getByText('get_task_context')).toBeTruthy();
+  expect(screen.getAllByText('get_task_context').length).toBeGreaterThan(0);
 });
 
 test('Settings has its own place in the sidebar and its own #settings address', async () => {

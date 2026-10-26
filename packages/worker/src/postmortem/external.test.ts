@@ -168,6 +168,17 @@ test('the same wrong-session tell in plain words ("pertains to a different PR") 
   expect(calls).toBe(2);
 });
 
+test("a session matched by the pull request's branch did that work: only the WRONG SESSION marker redoes it, not words like \"another feature\"", async () => {
+  const ask = async (causeExplanation: string) => {
+    const replies = [{ ...answer([]), causeExplanation }, answer([])];
+    let calls = 0;
+    const r = await runPostMortem({ ...base, work: { ...work, matchedBy: 'branch' as const } }, { standing: async () => [], facts: async () => [], llm: { id: 'fake', agentic: false, json: async () => { calls++; return replies.shift(); } } });
+    return { calls, flags: (r.lessonChecks ?? []).map((f) => f.name) };
+  };
+  expect(await ask('The retry belongs to a different feature than the agent assumed; the comment is about api/search.ts.')).toEqual({ calls: 1, flags: [] });
+  expect((await ask('WRONG SESSION: the session did the invitations; the comment is about search.')).calls).toBe(2);
+});
+
 test('lesson paths are checked against the repository and the comment: instruction files, PR refs and missing files go, flagged', async () => {
   const exists = async (_i: PostMortemInput, p: string) => ['api/search.ts', 'api/db.ts'].includes(p);
   const r = await runPostMortem({ ...base, work: null }, { standing: async () => [], facts: async () => [], exists, llm: llm(['src/fido/AGENTS.md', 'acme/demo#9', 'api/gone.ts', 'api/search.ts']) });

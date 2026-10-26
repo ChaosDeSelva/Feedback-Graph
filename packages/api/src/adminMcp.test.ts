@@ -381,7 +381,7 @@ test('run_cleanup shows what a run would remove first, and removes it only when 
   const removed: unknown[] = [];
   const items = [{ kind: 'feedback' as const, id: 'manual:a', projectKey: 'demo-shop', sandbox: true, group: null, merged: false }];
   // The operator token opened run-1 (RunsStore.claim), so it may clean it up.
-  const owner = { claim: async () => ({ run: 'run-1', principal: 'operator' as const, firstSeen: 't' }), owner: async () => ({ run: 'run-1', principal: 'operator' as const, firstSeen: 't' }) };
+  const owner = { claim: async () => ({ run: 'run-1', principal: 'operator' as const, actor: null, firstSeen: 't' }), owner: async () => ({ run: 'run-1', principal: 'operator' as const, actor: null, firstSeen: 't' }) };
   const s = setup({ extra: { runs: { ...owner, items: async () => items, remove: async (run, keep) => { removed.push([run, keep]); return { feedback: 1, lesson: 0, miss: 0, predone_check: 0, fact: 0, doc: 0, link: 0, chat: 0 }; } } } });
   const dry = JSON.parse((await tool(s.app, 'run_cleanup', { run: 'run-1' })).text);
   expect(dry).toMatchObject({ run: 'run-1', dryRun: true, remove: { feedback: 1 } });

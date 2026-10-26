@@ -61,6 +61,11 @@ const DELETE: [RunItemKind, string][] = [
             DETACH DELETE x RETURN count(*) AS n`],
 ];
 
+const OWNER = 'o.run AS run, o.principal AS principal, o.actor AS actor, o.firstSeen AS firstSeen';
+const ownerOf = (r: { get(k: string): unknown }): RunOwner => ({
+  run: r.get('run') as string, principal: r.get('principal') as RunPrincipal, actor: (r.get('actor') as string | null) ?? null, firstSeen: r.get('firstSeen') as string,
+});
+
 export class RunsRepo implements RunsStore {
   readonly g: GraphRepo;
   constructor(g: GraphRepo) {
@@ -80,21 +85,23 @@ export class RunsRepo implements RunsStore {
   async remove(run: string, keep: string[]): Promise<Record<RunItemKind, number>> {
     const ids = runRemoval(await this.items(run), keep);
     const out = await this.g.runInTransaction(DELETE.map(([kind, cypher]) => [cypher, { run, ids: ids[kind] }]));
+    // The run's sandbox records may have been the last ones: the searches may skip the run filter again.
+    this.g.sandbox.recheck();
     return removedCounts(Object.fromEntries(DELETE.map(([kind], i) => [kind, Number(out[i]?.[0]?.get('n') ?? 0)])));
   }
 
-  async claim(run: string, principal: RunPrincipal): Promise<RunOwner> {
+  async claim(run: string, principal: RunPrincipal, actor: string | null = null): Promise<RunOwner> {
     // MERGE on the unique run (schema.ts run_owner_run): a claim that loses a race matches the winner's node.
     const [r] = await this.g.run(
-      `MERGE (o:RunOwner {run: $run}) ON CREATE SET o.principal = $principal, o.firstSeen = $now
-       RETURN o.run AS run, o.principal AS principal, o.firstSeen AS firstSeen`,
-      { run, principal, now: new Date().toISOString() },
+      `MERGE (o:RunOwner {run: $run}) ON CREATE SET o.principal = $principal, o.actor = $actor, o.firstSeen = $now
+       RETURN ${OWNER}`,
+      { run, principal, actor: principal === 'operator' ? actor : null, now: new Date().toISOString() },
     );
-    return { run: r.get('run'), principal: r.get('principal'), firstSeen: r.get('firstSeen') };
+    return ownerOf(r);
   }
 
   async owner(run: string): Promise<RunOwner | null> {
-    const [r] = await this.g.run(`MATCH (o:RunOwner {run: $run}) RETURN o.run AS run, o.principal AS principal, o.firstSeen AS firstSeen`, { run });
-    return r ? { run: r.get('run'), principal: r.get('principal'), firstSeen: r.get('firstSeen') } : null;
+    const [r] = await this.g.run(`MATCH (o:RunOwner {run: $run}) RETURN ${OWNER}`, { run });
+    return r ? ownerOf(r) : null;
   }
 }

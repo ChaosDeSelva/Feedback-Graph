@@ -155,6 +155,18 @@ test('lists the project docs and uploads a text file as context', async () => {
   await waitFor(() => expect(calls).toContainEqual({ url: '/api/projects/demo-shop/docs', body: { title: 'spec.md', name: 'spec.md', text: '# Spec\n\nLists are paginated.' } }));
 });
 
+test('a large upload the API takes in the background (202) says so until it is in the list', async () => {
+  const base = (fetch as unknown as { getMockImplementation(): (u: string, i?: RequestInit) => Promise<Response> }).getMockImplementation();
+  vi.stubGlobal('fetch', vi.fn(async (url: string, init?: RequestInit) => {
+    if (url === '/api/projects/demo-shop/docs' && init?.method === 'POST') return Response.json({ id: 'doc:demo-shop:upload:big.md', chunks: 1400, pending: true }, { status: 202 });
+    return base(url, init);
+  }));
+  render(<Projects />);
+  expect(await screen.findByText('me/shop#3: Orders')).toBeTruthy();
+  fireEvent.change(screen.getByLabelText('upload document'), { target: { files: [new File(['x'], 'big.md', { type: 'text/markdown' })] } });
+  expect(await screen.findByText(/big\.md \(1,400 chunks\) is being embedded; it shows here once stored/)).toBeTruthy();
+});
+
 test('a project with many docs shows the newest page and loads older ones on request', async () => {
   const pr = (n: number) => ({ id: `doc:demo-shop:github:github:me/shop#${n}`, projectKey: 'demo-shop', source: 'github', ref: `github:me/shop#${n}`, title: `me/shop#${n}: change ${n}`, url: null, addedAt: 't', chunks: 1, kind: 'text', mediaType: null, read: null });
   const base = (fetch as unknown as { getMockImplementation(): (u: string, i?: RequestInit) => Promise<Response> }).getMockImplementation();
@@ -532,4 +544,27 @@ test('picking a project in the list puts it in the address, so the URL names the
   } finally {
     location.hash = '';
   }
+});
+
+/**
+ * An absolutely positioned box (a visually hidden file input, a pin button) with no positioned ancestor inside its
+ * scrolling pane is placed against the page, not the pane: it stretches the page, which then scrolls as a whole.
+ */
+function escapesItsPane(el: Element): boolean {
+  const positioned = /(^|\s)(relative|absolute|fixed|sticky)(\s|$)/;
+  const scrolls = /(^|\s)(md:)?overflow-(y-)?(auto|scroll)(\s|$)/;
+  for (let p = el.parentElement; p; p = p.parentElement) {
+    if (positioned.test(p.className)) return false;
+    if (scrolls.test(p.className)) return true;
+  }
+  return false;
+}
+
+test('only the panes scroll: nothing hidden or floating on the Projects page is placed against the page', async () => {
+  render(<Projects />);
+  await screen.findByText('Use sendError for all errors');
+  await screen.findByLabelText('upload document');
+  const floating = [...document.querySelectorAll('.sr-only, .absolute')];
+  expect(floating.length).toBeGreaterThan(0);
+  expect(floating.filter(escapesItsPane).map((e) => e.outerHTML.slice(0, 120))).toEqual([]);
 });

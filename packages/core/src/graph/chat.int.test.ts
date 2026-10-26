@@ -82,6 +82,29 @@ describeStores('ChatStore', (h) => {
     expect(next!.turns.map((t) => [t.seq, t.role])).toEqual([[1, 'user'], [2, 'assistant'], [3, 'user'], [4, 'assistant']]);
   });
 
+  test('the worker lists the waiting questions with their chat\'s provider, takes a given one, and marks each with how many are ahead of it', async () => {
+    const a = await c.createConversation({ projectKey: 'demo-shop', title: 'a', provider: 'claude' });
+    const b = await c.createConversation({ projectKey: 'demo-shop', title: 'b', provider: null });
+    const ta = (await c.addUserTurn(a.id, 'a?', { context: 'pack a', sources: [] }))!.turns.at(-1)!;
+    await tick();
+    const tb = (await c.addUserTurn(b.id, 'b?', { context: 'pack b', sources: [] }))!.turns.at(-1)!;
+    expect(await c.pendingTurns()).toEqual([
+      { id: ta.id, conversationId: a.id, provider: 'claude', createdAt: ta.createdAt },
+      { id: tb.id, conversationId: b.id, provider: null, createdAt: tb.createdAt },
+    ]);
+    // The second, not the oldest: another model's line is free.
+    const job = await c.nextPendingTurn({ id: tb.id });
+    expect(job).toMatchObject({ turn: { id: tb.id }, question: { text: 'b?' }, context: 'pack b' });
+    expect(await c.nextPendingTurn({ id: 'chat-turn-missing' })).toBeNull();
+    await c.setQueueAhead([{ id: ta.id, ahead: 2 }, { id: tb.id, ahead: 0 }]);
+    expect((await c.conversation(a.id))!.turns.at(-1)!.queueAhead).toBe(2);
+    expect((await c.conversation(b.id))!.turns.at(-1)!.queueAhead).toBe(0);
+    // Once answering it is not waiting any more: no position.
+    expect(await c.markAnswering(ta.id, 'claude-cli')).toBe(true);
+    expect((await c.conversation(a.id))!.turns.at(-1)!.queueAhead).toBeNull();
+    expect((await c.pendingTurns()).map((t) => t.id)).toEqual([tb.id]);
+  });
+
   test('the question queue: how many wait, since when the oldest has, and which are being answered since when', async () => {
     expect(await c.chatQueue()).toEqual({ waiting: 0, oldestAt: null, running: [] });
     const a = await c.createConversation({ projectKey: 'demo-shop', title: 'modals', provider: null });

@@ -99,3 +99,15 @@ test('gitActions reads pushes, merges, pull requests and commits from shell and 
   ])).toEqual(['push', 'merge', 'pr', 'commit']);
   expect(gitActions([bash('git diff main...HEAD'), bash('gh pr list --head fix/x'), bash('echo "git push later"')])).toEqual([]);
 });
+
+test('a pure instruction about git (no miss in its words) is a process miss whatever the lesson says, and so on no file', () => {
+  const tenFiles = Array.from({ length: 10 }, (_, i) => `web/src/chat/f${i}.ts`);
+  // The post-mortem gave its lesson the session's edited files, or wrote one about code, or none at all.
+  expect(isProcessMiss({ feedbackText: BRANCH_ORDER, rule: 'Do not push until the developer has looked', commentPath: null, paths: tenFiles })).toBe(true);
+  expect(isProcessMiss({ feedbackText: BRANCH_ORDER, rule: 'Run the tests in web/src/chat before pushing', commentPath: null })).toBe(true);
+  expect(isProcessMiss({ feedbackText: "keep this on its own branch, don't push a PR yet", rule: null, commentPath: null })).toBe(true);
+  // A review comment on a file stays on it.
+  expect(isProcessMiss({ feedbackText: BRANCH_ORDER, rule: null, commentPath: 'web/src/chat/f0.ts' })).toBe(false);
+  // A correction about code said with git words is not an instruction.
+  expect(isProcessMiss({ feedbackText: 'you pushed before the tests in api/search.ts passed', rule: null, commentPath: null, paths: ['api/search.ts'] })).toBe(false);
+});

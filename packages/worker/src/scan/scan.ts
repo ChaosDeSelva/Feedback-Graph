@@ -9,9 +9,10 @@ import { extract } from '../codegraph/extract.ts';
 import { langOf } from '../codegraph/lang.ts';
 import { chunkBySymbols, type Chunk } from './chunk.ts';
 import { mapCap, rankCodePaths } from './rank.ts';
+import { withoutDataDirs, type DataDir } from './data.ts';
 import { gitChurn, hotScore, longCommentLines, scanOrder, type ScanSignals } from './priority.ts';
-import { inScope, shardBudget, shardRepo, shardScope, type Shard } from './shard.ts';
-import { askJson, clampRelevance, FACT_KINDS, holdsCredential, SCAN_PROMPT_VERSION, SCANNER_VERSION, type AgentMirror, isSecretPath, modelTimeoutReason, ProviderUnavailableError, providerUnavailableReason, redactSecrets, type ActivityStore, type CodeFact, type FactScope, type FactsStore, type LlmProvider, type ScanJob, type ScanShards } from '@fb/core';
+import { inScope, lowValueBudget, lowValueRule, shardBudget, shardFactBudget, shardRepo, shardScope, type Shard } from './shard.ts';
+import { askJson, calibrateRelevance, clampRelevance, FACT_KINDS, holdsCredential, SCAN_PROMPT_VERSION, SCANNER_VERSION, type AgentMirror, isSecretPath, modelTimeoutReason, ProviderUnavailableError, providerUnavailableReason, redactSecrets, type ActivityStore, type CodeFact, type FactScope, type FactsStore, type LlmProvider, type ScanJob, type ScanShards } from '@fb/core';
 
 const run = promisify(execFile);
 
@@ -73,10 +74,10 @@ export type ListOpts = { maxBytes: number; maxFiles: number | null; priority?: I
  * Source, docs and config worth reading; respects .gitignore when the dir is a git repo. Candidates are ranked before
  * the cap (rank.ts), so a capped list keeps source over config and docs, and `priority` paths (files sessions edited)
  * before anything. maxFiles null: the cap scales with the repo (mapCap). totalCandidates: how many files were worth
- * listing before the cap, so a capped map can say what it left out.
+ * listing before the cap, so a capped map can say what it left out. dataDirs: folders of data left out (data.ts).
  */
-export async function listCodeFilesWithTotal(repoPath: string, o: ListOpts): Promise<{ files: CodeFile[]; totalCandidates: number; cap: number }> {
-  const candidates = ((await gitFiles(repoPath)) ?? (await walk(repoPath))).filter(wanted);
+export async function listCodeFilesWithTotal(repoPath: string, o: ListOpts): Promise<{ files: CodeFile[]; totalCandidates: number; cap: number; dataDirs: DataDir[] }> {
+  const { paths: candidates, dataDirs } = await candidatesOf(repoPath);
   const cap = mapCap(o.maxFiles, candidates.length);
   const files: CodeFile[] = [];
   for (const path of rankCodePaths(candidates, { priority: o.priority })) {
@@ -86,7 +87,15 @@ export async function listCodeFilesWithTotal(repoPath: string, o: ListOpts): Pro
     const content = await readFile(join(repoPath, path));
     files.push({ path, size: s.size, hash: createHash('sha1').update(content).digest('hex'), ...(o.comments && { comments: longCommentLines(path, content.toString('utf8')) }) });
   }
-  return { files, totalCandidates: candidates.length, cap };
+  return { files, totalCandidates: candidates.length, cap, dataDirs };
+}
+
+/**
+ * Every file worth reading, as git lists it (else a walk), less the folders of data (transcripts, logs, exported
+ * records: withoutDataDirs), which are left out of scans and the code map alike.
+ */
+async function candidatesOf(repoPath: string): Promise<{ paths: string[]; dataDirs: DataDir[] }> {
+  return withoutDataDirs(((await gitFiles(repoPath)) ?? (await walk(repoPath))).filter(wanted));
 }
 
 /**
@@ -95,7 +104,7 @@ export async function listCodeFilesWithTotal(repoPath: string, o: ListOpts): Pro
  * index and keeps symbols for the first `cap` once it knows their importers.
  */
 export async function listIndexPaths(repoPath: string, o: ListOpts & { limit: number }): Promise<{ paths: string[]; totalCandidates: number; cap: number }> {
-  const candidates = ((await gitFiles(repoPath)) ?? (await walk(repoPath))).filter(wanted);
+  const { paths: candidates } = await candidatesOf(repoPath);
   const cap = mapCap(o.maxFiles, candidates.length);
   const paths: string[] = [];
   for (const path of rankCodePaths(candidates, { priority: o.priority })) {
@@ -108,12 +117,15 @@ export async function listIndexPaths(repoPath: string, o: ListOpts & { limit: nu
 
 /** The files a scan or a map would consider, before ranking and the cap (repo-relative paths). */
 export async function candidatePaths(repoPath: string): Promise<string[]> {
-  return ((await gitFiles(repoPath)) ?? (await walk(repoPath))).filter(wanted);
+  return (await candidatesOf(repoPath)).paths;
 }
 
-/** Whether the folder has any file worth scanning (a scan of one without finishes at once, with no model call). */
+/**
+ * Whether the folder has any file worth scanning (a scan of one without finishes at once, with no model call). A folder
+ * of only data (transcripts, logs) has none.
+ */
 export async function hasCodeFiles(repoPath: string): Promise<boolean> {
-  return ((await gitFiles(repoPath)) ?? (await walk(repoPath))).some(wanted);
+  return (await candidatesOf(repoPath)).paths.length > 0;
 }
 
 export async function listCodeFiles(repoPath: string, o: ListOpts): Promise<CodeFile[]> {
@@ -154,6 +166,45 @@ const tomlDeps = (body: string | undefined, skip: string[] = []) =>
       return ver ? `${n} ${ver}` : n;
     });
 const sentence = (label: string, xs: string[]) => (xs.length ? `${label}: ${xs.join(', ')}.` : '');
+
+/**
+ * A dependency fact's statement at most: how many, and the notable ones that fit. The full list is the manifest's
+ * (and the code map's): 0.6.2 stored lists of up to 6,923 characters as one fact, which crowded out what agents need.
+ */
+export const DEPENDENCY_FACT_MAX = 300;
+/** The least notable dependencies (type packages, lint and build plugins): listed last, so first left out. */
+const MINOR_DEPENDENCY = /^@types\/|eslint|prettier|^@babel\/|-plugin-|^typescript\b|stylelint|^@commitlint\//;
+const DEP_SECTION = /(Dependencies|Dev dependencies|Requires)(?: \(\d+\))?: (.+?)\.(?= (?:Dependencies|Dev dependencies|Requires)\b|$)/g;
+
+/**
+ * A dependency statement within DEPENDENCY_FACT_MAX: each list ("Dependencies: a 1, b 2, ...") becomes its count and
+ * its most notable entries that fit ("Dependencies (120): react ^18, hono ^4 and 117 more."); what comes before the
+ * lists (the Go module, the Python version) stays. A statement that already fits is returned as it is, so applying it
+ * twice changes nothing.
+ */
+export function summarizeDependencies(statement: string): string {
+  if (statement.length <= DEPENDENCY_FACT_MAX) return statement;
+  const sections = [...statement.matchAll(DEP_SECTION)];
+  if (!sections.length) return `${statement.slice(0, DEPENDENCY_FACT_MAX - 3).trimEnd()}...`;
+  const head = statement.slice(0, sections[0].index).trim();
+  const room = Math.floor((DEPENDENCY_FACT_MAX - head.length - (head ? 1 : 0)) / sections.length) - 1;
+  const lists = sections.map(([whole, label, list]) => {
+    const items = list.split(', ').filter(Boolean);
+    if (whole.length <= room && !/\(\d+\):/.test(whole)) return whole;
+    const notable = [...items.filter((x) => !MINOR_DEPENDENCY.test(x)), ...items.filter((x) => MINOR_DEPENDENCY.test(x))];
+    const shown: string[] = [];
+    const text = (k: number) => `${label} (${items.length}): ${shown.join(', ')}${k ? ` and ${k} more` : ''}.`;
+    for (const x of notable) {
+      shown.push(x);
+      if (text(items.length - shown.length).length > room) {
+        shown.pop();
+        break;
+      }
+    }
+    return text(items.length - shown.length);
+  });
+  return [head, ...lists].filter(Boolean).join(' ');
+}
 
 function packageJsonFacts(path: string, content: string): CodeFact[] {
   let pkg: { scripts?: Record<string, string>; dependencies?: Record<string, string>; devDependencies?: Record<string, string> };
@@ -232,8 +283,15 @@ function envExampleFacts(path: string, content: string): CodeFact[] {
   return keys.length ? [manifestFact('config', `Environment keys (from ${baseName(path)}): ${keys.join(', ')}.`, path, 0.5)] : [];
 }
 
-/** Facts we can read without a model, from the manifests (isManifest): scripts, targets, dependencies, services, env keys. */
+/**
+ * Facts we can read without a model, from the manifests (isManifest): scripts, targets, dependencies, services, env keys.
+ * A dependency fact is a summary (summarizeDependencies), never the full list.
+ */
 export function deterministicFacts(files: { path: string; content: string }[]): CodeFact[] {
+  return manifestFacts(files).map((f) => (f.kind === 'dependency' ? { ...f, statement: summarizeDependencies(f.statement) } : f));
+}
+
+function manifestFacts(files: { path: string; content: string }[]): CodeFact[] {
   return files.flatMap(({ path, content }) => {
     const name = baseName(path);
     if (name === 'package.json') return packageJsonFacts(path, content);
@@ -291,7 +349,7 @@ function checkLines(f: CodeFact, content: string): Pick<CodeFact, 'lines' | 'evi
  * at worker start, facts checked by an older version are checked again once (recheck.ts). check-v2: instruction files
  * (0.6.0) and the enclosing-declaration window (0.6.1).
  */
-export const FACT_CHECK_VERSION = 'check-v2';
+export const FACT_CHECK_VERSION = 'check-v3';
 
 /**
  * Check what a model cited before its facts are saved. `read`: a repo file's text, null when it exists but is not read
@@ -361,7 +419,8 @@ export const FACT_JSON = {
 export const RELEVANCE_RUBRIC = `Give every fact a relevance from 0 to 1: how often an agent doing everyday coding in this project needs it.
 - 0.8 to 1: needed in most changes (core conventions, invariants, the data model, auth and security rules, how modules fit together).
 - 0.4 to 0.7: needed for some changes (one module's API, a config option, a gotcha in one area).
-- 0 to 0.3: rarely needed while coding (installing, setting up or configuring an external tool, CI or deploy steps, editor or machine setup, history).`;
+- 0 to 0.3: rarely needed while coding (installing, setting up or configuring an external tool, CI or deploy steps, editor or machine setup, history).
+Most facts are 0.4 to 0.7: keep 0.8 and above for the few rules that hold across the whole project or service, never for one function's or endpoint's behaviour.`;
 
 const WHAT_TO_KEEP = `Extract durable, non-obvious facts a coding agent would need to change this code correctly:
 conventions and patterns to follow, invariants and assumptions, public APIs and their contracts, data models,
@@ -422,7 +481,8 @@ const AgenticResult = z.object({
  * What one agent run is about: a shard of the repo (shard.ts), its files (best first: priority.ts), and the paths its
  * facts may cite. hot: files to read before the rest (asked for, or hotspots), best first.
  */
-export type ShardTask = { key: string; roots: string[]; scope: FactScope; files: CodeFile[]; hot?: string[] };
+/** lowValue: which of the repo's files are low-value (lowValueRule over the whole listing; absent: over the shard's files). */
+export type ShardTask = { key: string; roots: string[]; scope: FactScope; files: CodeFile[]; hot?: string[]; lowValue?: (path: string) => boolean };
 
 /** A directory with at least this many of a shard's files gets a minimum of facts of its own. */
 const LARGE_DIR_FILES = 30;
@@ -431,41 +491,91 @@ const HOT_LISTED = 25;
 /** What an agent says it did not reach, kept per shard. */
 const MAX_UNREACHED = 100;
 
+/** Low-value files (tests, fixtures, archives: isLowValue) listed to the agent at most, and at least. */
+const LOW_VALUE_LISTED_MAX = 15;
+const LOW_VALUE_LISTED_MIN = 3;
+/** A shard with at least this many source files must return a third of its budget (the floor, enforced in code). */
+const FLOOR_FILES = 20;
+/** How long one agent run over a shard may take; a shard of only low-value files gets the shorter one. */
+const SHARD_TIMEOUT_MS = 30 * 60_000;
+const LOW_VALUE_SHARD_TIMEOUT_MS = 10 * 60_000;
+/** The one top-up run after a pass under the floor: it asks for a few facts more, not a shard's worth. */
+const TOP_UP_TIMEOUT_MS = 5 * 60_000;
+/** Statements an agent asked for more facts is told it already gave, at most. */
+const TOP_UP_LISTED = 60;
+
 const dirOfPath = (p: string) => (p.includes('/') ? p.slice(0, p.lastIndexOf('/')) : '.');
+const underDir = (path: string, dir: string) => dirOfPath(path) === dir;
+/** A fact restated: the same file and the same statement, whatever the case, spacing or final full stop. */
+export const factKey = (f: Pick<CodeFact, 'path' | 'statement'>) => `${f.path.trim().replace(/^\.\//, '')}\u0000${f.statement.trim().toLowerCase().replace(/\s+/g, ' ').replace(/[.\s]+$/, '')}`;
+const relevanceOrMiddling = (f: CodeFact) => (typeof f.relevance === 'number' ? f.relevance : 0.5);
+/** The `n` most relevant of `facts`, in their own order. */
+function mostRelevant<T extends CodeFact>(facts: T[], n: number): T[] {
+  if (facts.length <= n) return facts;
+  const keep = new Set([...facts].sort((a, b) => relevanceOrMiddling(b) - relevanceOrMiddling(a)).slice(0, n));
+  return facts.filter((f) => keep.has(f));
+}
 
 /**
- * The file list an agent is given: hotspots first (`hot`), then every file grouped by directory, directories in the
- * order of their best file; a large directory (LARGE_DIR_FILES) carries its share of the budget as a minimum, half of
- * its proportional share, so one directory cannot take the whole run.
+ * How one shard's run is budgeted, all enforced in code: its source files and its low-value ones (tests, fixtures,
+ * archives), the fact budget from that mix (shardFactBudget), the share low-value files may take (lowValueBudget), the
+ * floor (a third of the budget, for a shard of FLOOR_FILES source files or more) and each large source directory's
+ * minimum (half its proportional share of the source budget, so one directory cannot take the whole run).
  */
-function shardListing(shard: ShardTask, budget: number): string {
+function shardPlan(shard: ShardTask) {
+  const isLow = shard.lowValue ?? lowValueRule(shard.files.map((f) => f.path));
+  const core = shard.files.filter((f) => !isLow(f.path));
+  const low = shard.files.filter((f) => isLow(f.path));
+  const budget = shardFactBudget(core.length, low.length);
+  const coreBudget = core.length ? shardBudget(core.length) : 0;
   const groups = new Map<string, string[]>();
-  for (const f of shard.files) {
+  for (const f of core) {
     const d = dirOfPath(f.path);
     if (!groups.has(d)) groups.set(d, []);
     groups.get(d)!.push(f.path);
   }
+  const mins = new Map([...groups].map(([d, paths]) => [d, paths.length >= LARGE_DIR_FILES ? Math.max(1, Math.round((Math.min(coreBudget, budget) * paths.length) / core.length / 2)) : 0]));
+  return { isLow, core, low, budget, lowBudget: lowValueBudget(low.length), floor: core.length >= FLOOR_FILES ? Math.ceil(budget / 3) : 0, groups, mins };
+}
+
+/**
+ * The file list an agent is given: hotspots first (`hot`), then every source file grouped by directory, directories in
+ * the order of their best file, a large one (LARGE_DIR_FILES) with its minimum; then a sample of the low-value files
+ * (best first), with how many there are and the most facts they may take.
+ */
+function shardListing(shard: ShardTask, plan: ReturnType<typeof shardPlan>): string {
   const hot = (shard.hot ?? []).slice(0, HOT_LISTED);
   const lines = hot.length
     ? ['Read these first (an agent asked for them, they changed recently, PRs discuss them, or they carry long explanatory comments, where traps are written down):', ...hot, '']
     : [];
   lines.push('Files in this part, by directory:');
-  for (const [d, paths] of groups) {
-    const min = paths.length >= LARGE_DIR_FILES ? Math.max(1, Math.round((budget * paths.length) / shard.files.length / 2)) : 0;
+  for (const [d, paths] of plan.groups) {
+    const min = plan.mins.get(d) ?? 0;
     lines.push(`## ${d} (${plural(paths.length, 'file')})${min ? `: at least ${plural(min, 'fact')} from here` : ''}`, ...paths);
+  }
+  if (plan.low.length) {
+    const sample = plan.low.slice(0, Math.min(LOW_VALUE_LISTED_MAX, Math.max(LOW_VALUE_LISTED_MIN, Math.ceil(plan.low.length / 10))));
+    lines.push(`## Tests, fixtures, archived, vendored and generated files (${plural(plan.low.length, 'file')}, ${sample.length} listed): at most ${plural(plan.lowBudget, 'fact')} from these; read the source first`, ...sample.map((f) => f.path));
   }
   return lines.join('\n');
 }
 
+/** What the code cut from a shard's answer: facts past the low-value share, and facts past the budget. */
+export type ShardHidden = { lowValue: number; overBudget: number };
+
 /**
  * One agent run over one shard: the agent works in the whole repo (read-only; `cwd`, the repo or a mirror of it) but
- * is shown the shard's files and asked for facts about them only, within a budget scaled to the shard (shardBudget),
- * and for what it did not reach. Facts about the shard as a whole cite its directory ('.' for the shard holding the
- * rest of the repo). Nothing is filtered here: runScan drops facts outside the shard and checks citations before
- * anything is saved.
+ * is shown the shard's files and asked for facts about them only, within a budget scaled to the shard's mix
+ * (shardPlan), and for what it did not reach. Facts about the shard as a whole cite its directory ('.' for the shard
+ * holding the rest of the repo). The budget is enforced here, not only asked for: an answer under the floor (or
+ * leaving a large directory under its minimum) is followed by one more run asking for the missing facts there
+ * (toppedUp; a fact given twice counts once), facts about low-value files past their share and facts past the budget
+ * are cut, least relevant first (hidden says how many). runScan then drops facts outside the shard and checks citations
+ * before anything is saved.
  */
-export async function extractShardFacts(llm: LlmProvider, cwd: string, shard: ShardTask): Promise<{ facts: CodeFact[]; unreached: string[] }> {
-  const budget = shardBudget(shard.files.length);
+export async function extractShardFacts(llm: LlmProvider, cwd: string, shard: ShardTask, o: { log?: (msg: string, extra?: object) => void } = {}): Promise<{ facts: CodeFact[]; unreached: string[]; hidden: ShardHidden; toppedUp: boolean }> {
+  const plan = shardPlan(shard);
+  const { budget } = plan;
   const whole = shard.scope.prefixes.includes('') && !shard.scope.except.length;
   const rest = shard.scope.prefixes.includes('');
   const named = shard.roots.filter(Boolean);
@@ -476,22 +586,66 @@ export async function extractShardFacts(llm: LlmProvider, cwd: string, shard: Sh
   const intro = whole
     ? 'You analyse a whole codebase (your current directory, read-only). Explore it with your tools.'
     : `You analyse one part of a codebase: ${part}. Your current directory is the whole repository (read-only): explore it with your tools, and read outside this part when that explains it, but report facts only about files in this part.`;
+  const cite = `Every fact must cite the file it comes from (repo-relative)${whole ? '' : ', from the list'}, or '${wide}' for facts about ${whole ? 'the whole project' : 'this part as a whole'}.`;
+  const schema = {
+    type: 'object', required: ['facts', 'unreached'],
+    properties: { facts: { type: 'array', items: FACT_JSON }, unreached: { type: 'array', items: { type: 'string' }, description: 'Repo-relative directories or files of this part you did not read' } },
+  };
+  const timeoutMs = plan.core.length ? SHARD_TIMEOUT_MS : LOW_VALUE_SHARD_TIMEOUT_MS;
+  const usable = (r: z.infer<typeof AgenticResult>) => r.facts.filter((f) => f.confidence >= MIN_CONFIDENCE && !holdsCredential(f.statement)).map((f) => ({ ...f, origin: 'model' as const }));
   // Agents sometimes answer with prose around (or instead of) the object: asked once more, strictly, before it counts.
   const r = await askJson(llm, {
     system: `${intro} ${WHAT_TO_KEEP}
-Return ${Math.ceil(budget / 3)} to ${budget} facts. Every fact must cite the file it comes from (repo-relative)${whole ? '' : ', from the list'}, or '${wide}' for facts about ${whole ? 'the whole project' : 'this part as a whole'}.
+Return ${Math.ceil(budget / 3)} to ${budget} facts. ${cite}
 Read the files listed first before the rest, and cover every directory: a directory marked with a minimum needs at least that many facts from its files.
 In unreached, list the directories (or files) of ${whole ? 'the repository' : 'this part'} you did not get to read, so they can be read another time; an empty list means you read them all.`,
-    user: `SHARD: ${shard.key}\n${shardListing(shard, budget)}`,
-    schema: {
-      type: 'object', required: ['facts', 'unreached'],
-      properties: { facts: { type: 'array', items: FACT_JSON }, unreached: { type: 'array', items: { type: 'string' }, description: 'Repo-relative directories or files of this part you did not read' } },
-    },
+    user: `SHARD: ${shard.key}\n${shardListing(shard, plan)}`,
+    schema,
     cwd,
-    timeoutMs: 30 * 60_000,
+    timeoutMs,
   }, (raw) => AgenticResult.parse(raw));
-  const unreached = [...new Set(r.unreached.map((p) => p.trim().replace(/^\.\//, '').replace(/\/+$/, '')).filter((p) => p && p !== '.' && inScope(p, shard.scope)))];
-  return { facts: r.facts.filter((f) => f.confidence >= MIN_CONFIDENCE && !holdsCredential(f.statement)).map((f) => ({ ...f, origin: 'model' as const })), unreached: unreached.slice(0, MAX_UNREACHED) };
+  const seen = new Set<string>();
+  const once = (fs: CodeFact[]) => fs.filter((f) => !seen.has(factKey(f)) && !!seen.add(factKey(f)));
+  let facts = once(usable(r));
+  const unreachedRaw = [...r.unreached];
+  // The floor, in code: under it (or a large directory under its minimum), one more run asks for what is missing.
+  const inDir = (d: string) => facts.filter((f) => underDir(f.path.trim().replace(/^\.\//, ''), d)).length;
+  const short = [...plan.mins].map(([d, min]) => [d, min - inDir(d)] as const).filter(([, n]) => n > 0);
+  const missing = Math.max(plan.floor - facts.length, short.reduce((n, [, k]) => n + k, 0));
+  let toppedUp = false;
+  if (missing > 0 && facts.length < budget) {
+    const dirs = short.length ? short : [...plan.groups.keys()].map((d) => [d, 0] as const);
+    const listed = facts.slice(0, TOP_UP_LISTED).map((f) => `- ${f.path}: ${f.statement}`).join('\n');
+    // A top-up that fails (times out, answers badly) keeps the first pass: its facts are saved, not thrown away with
+    // the shard. Only the provider being unavailable stops the scan, as for any run.
+    const more = await askJson(llm, {
+      system: `${intro} ${WHAT_TO_KEEP}
+An earlier pass over this part returned ${plural(facts.length, 'fact')}, too few for it. Return at least ${missing} more facts (${budget - facts.length} at most), from the directories listed, that are not already among these:
+${listed || '(none)'}
+${cite}
+In unreached, list the directories (or files) you did not get to read; an empty list means you read them all.`,
+      user: `SHARD: ${shard.key}\nDirectories short of facts:\n${dirs.map(([d, n]) => `## ${d} (${plural(plan.groups.get(d)?.length ?? 0, 'file')})${n ? `: at least ${n} more ${n === 1 ? 'fact' : 'facts'} from here` : ''}\n${(plan.groups.get(d) ?? []).join('\n')}`).join('\n')}`,
+      schema,
+      cwd,
+      timeoutMs: Math.min(timeoutMs, TOP_UP_TIMEOUT_MS),
+    }, (raw) => AgenticResult.parse(raw)).catch((err: unknown) => {
+      if (providerUnavailableReason(err)) throw err;
+      o.log?.(`scan: the top-up for ${shard.key} failed (${redactSecrets(String(err))}); keeping the first pass's ${plural(facts.length, 'fact')}`, { shard: shard.key });
+      return null;
+    });
+    if (more) {
+      facts = [...facts, ...once(usable(more))];
+      unreachedRaw.push(...more.unreached);
+      toppedUp = true;
+    }
+  }
+  // The low-value share and the budget, in code: the least relevant facts past them are cut.
+  const lowFacts = facts.filter((f) => plan.isLow(f.path.trim()));
+  const lowKept = new Set(mostRelevant(lowFacts, plan.lowBudget));
+  const withinLow = facts.filter((f) => !plan.isLow(f.path.trim()) || lowKept.has(f));
+  const kept = mostRelevant(withinLow, budget);
+  const unreached = [...new Set(unreachedRaw.map((p) => p.trim().replace(/^\.\//, '').replace(/\/+$/, '')).filter((p) => p && p !== '.' && inScope(p, shard.scope)))];
+  return { facts: kept, unreached: unreached.slice(0, MAX_UNREACHED), hidden: { lowValue: facts.length - withinLow.length, overBudget: withinLow.length - kept.length }, toppedUp };
 }
 
 /**
@@ -640,7 +794,11 @@ export async function runScan(job: ScanJob, d: ScanDeps): Promise<ScanResult> {
     // discussions, long explanatory comments), so a capped or interrupted run has read the files that matter.
     const touched = (await d.touched?.(job.projectKey).catch(() => [])) ?? [];
     const requested = (await d.facts.scanRequests?.(job.projectKey).catch(() => [])) ?? [];
-    const listed = kept?.listed ?? await listCodeFiles(job.repoPath, { maxBytes: d.maxBytes, maxFiles: LIST_LIMIT, priority: [...requested, ...touched], comments: true });
+    // Folders of data (transcripts, logs: data.ts) are not listed; the scan says which it left out.
+    const fresh = kept ? null : await listCodeFilesWithTotal(job.repoPath, { maxBytes: d.maxBytes, maxFiles: LIST_LIMIT, priority: [...requested, ...touched], comments: true });
+    const listed = kept?.listed ?? fresh!.files;
+    const dataLeft = fresh?.dataDirs ?? [];
+    const dataFiles = dataLeft.reduce((n, x) => n + x.files, 0);
     const signals: ScanSignals = {
       requested, touched, churn: kept?.churn ?? await gitChurn(job.repoPath),
       prPaths: new Set((await d.prPaths?.(job.projectKey).catch(() => [])) ?? []),
@@ -671,7 +829,11 @@ export async function runScan(job: ScanJob, d: ScanDeps): Promise<ScanResult> {
         ...(modelChanged ? [`every file is rescanned because the current facts came from a different model (${sources.join(', ')})`] : []),
         ...(!modelChanged && outdated.length ? [`${plural(outdated.length, 'file')} ${outdated.length === 1 ? 'was' : 'were'} read by an older scanner and ${outdated.length === 1 ? 'is' : 'are'} read again with ${SCANNER_VERSION}`] : []),
         ...(requested.length - gone.length > 0 ? [`${plural(requested.length - gone.length, 'file')} an agent asked for ${requested.length - gone.length === 1 ? 'is' : 'are'} read first`] : []),
-      ].join('; '), { repoPath: job.repoPath, scannerVersion: SCANNER_VERSION, olderScanner: outdated.length, requested: requested.filter((p) => present.has(p)).slice(0, 50) });
+        ...(dataLeft.length ? [`${plural(dataFiles, 'file')} in data folders ${dataFiles === 1 ? 'is' : 'are'} left out: ${dataLeft.slice(0, 5).map((x) => `${x.dir}/ (${x.files})`).join(', ')}${dataLeft.length > 5 ? ', ...' : ''}`] : []),
+      ].join('; '), {
+        repoPath: job.repoPath, scannerVersion: SCANNER_VERSION, olderScanner: outdated.length, requested: requested.filter((p) => present.has(p)).slice(0, 50),
+        ...(dataLeft.length ? { dataDirs: dataLeft.slice(0, 50) } : {}),
+      });
     await d.facts.markFilesRemoved(job.projectKey, removed);
     for (const p of removed) await note('facts_extracted', `facts closed for removed file ${p}`, 'the file is no longer in the project', {}, [fileId(p)]);
 
@@ -691,9 +853,12 @@ export async function runScan(job: ScanJob, d: ScanDeps): Promise<ScanResult> {
       const planned = kept?.planned ?? (files.length ? await shardRepo(job.repoPath, files.map((f) => f.path)) : []);
       const rank = new Map(files.map((f, i) => [f.path, i]));
       const hotOf = (p: string) => hotScore(p, signals);
-      // Shards holding a file an agent asked for run first, then the hottest, then by key.
-      const heat = new Map(planned.map((s) => [s.key, { asked: s.files.some((p) => asked.has(p)), hot: s.files.reduce((m, p) => Math.max(m, hotOf(p)), 0) }]));
-      const shards = [...planned].sort((a, b) => Number(heat.get(b.key)!.asked) - Number(heat.get(a.key)!.asked) || heat.get(b.key)!.hot - heat.get(a.key)!.hot || cmpKey(a.key, b.key));
+      // Shards holding a file an agent asked for run first, then source before shards of only tests or archives (the
+      // attic), then the hottest, then by key.
+      const isLow = lowValueRule(files.map((f) => f.path));
+      const heat = new Map(planned.map((s) => [s.key, { asked: s.files.some((p) => asked.has(p)), low: s.files.every(isLow), hot: s.files.reduce((m, p) => Math.max(m, hotOf(p)), 0) }]));
+      const shards = [...planned].sort((a, b) => Number(heat.get(b.key)!.asked) - Number(heat.get(a.key)!.asked) || Number(heat.get(a.key)!.low) - Number(heat.get(b.key)!.low)
+        || heat.get(b.key)!.hot - heat.get(a.key)!.hot || cmpKey(a.key, b.key));
       const byPath = new Map(files.map((f) => [f.path, f]));
       // A shard is redone for a model switch only while its own facts are another model's: one that failed after the
       // switch keeps its old facts, and must not send every later scan through the whole repo again.
@@ -746,12 +911,57 @@ export async function runScan(job: ScanJob, d: ScanDeps): Promise<ScanResult> {
       };
       // Codex explores a filtered copy of the repo: made once for the whole scan (removed at its end), not per shard.
       const agentCwd = async () => (d.llm.mirror ? (mirror ??= await d.llm.mirror(job.repoPath)).dir : job.repoPath);
+      // A file an agent asked for in a shard this scan already got through is read on its own (0.6.2 ran the whole
+      // shard again: minutes of agent time, and its facts counted twice). Its facts replace the file's, merged with the
+      // ones the shard gave it, a fact given again kept and counted once.
+      const readAskedFiles = async (s: (typeof shards)[number]) => {
+        let added = 0;
+        const read: string[] = [];
+        for (const p of s.files.filter((x) => asked.has(x))) {
+          const f = byPath.get(p)!;
+          let content: string;
+          let extracted: Awaited<ReturnType<typeof extractFileFacts>>;
+          try {
+            content = await readFile(join(job.repoPath, p), 'utf8');
+            extracted = isInstructionFile(p) ? { summary: '', facts: [] } : await extractFileFacts(d.llm, p, content);
+          } catch (err) {
+            if (providerUnavailableReason(err)) throw err;
+            await note('facts_extracted', `could not read ${p}, which an agent asked for`, redactSecrets(String(err)), { shard: s.key }, [fileId(p)]);
+            continue;
+          }
+          const { kept } = await checkCitations(extracted.facts.map((x) => ({ ...x, origin: 'model' as const })), async (q) => (q === p ? content : undefined));
+          const before = ((await d.facts.listFacts?.({ projectKey: job.projectKey, path: p }).catch(() => [])) ?? []).filter((x) => !x.docId && x.origin !== 'you' && x.path === p);
+          const known = new Set(before.map(factKey));
+          const fresh = [...calibrateRelevance(kept), ...deterministicFacts([{ path: p, content }])].map(checked);
+          const seenNow = new Set<string>();
+          const newOnes = fresh.filter((x) => !known.has(factKey(x)) && !seenNow.has(factKey(x)) && !!seenNow.add(factKey(x)));
+          const earlier: CodeFact[] = before.map((x) => ({
+            kind: x.kind, statement: x.statement, path: x.path, lines: x.lines, confidence: x.confidence, why: x.why, relevance: x.relevance,
+            ...(x.origin ? { origin: x.origin } : {}), ...(x.evidence ? { evidence: x.evidence } : {}), checkVersion: x.checkVersion ?? null,
+          }));
+          await d.facts.saveFileFacts(job.projectKey, { path: p, hash: f.hash, summary: extracted.summary, version: SCANNER_VERSION }, await embedFacts([...earlier, ...newOnes], d.embed), d.llm.id, job.id);
+          added += newOnes.length;
+          cited.add(p);
+          read.push(p);
+          await note('facts_extracted', `${plural(newOnes.length, 'new fact')} from ${p}`,
+            `an agent asked for this file after this scan got through ${s.key}: the file was read on its own instead of the whole shard again; ${plural(fresh.length - newOnes.length, 'fact')} it gave again ${fresh.length - newOnes.length === 1 ? 'was' : 'were'} kept once`,
+            { shard: s.key, facts: factLog(newOnes), restated: fresh.length - newOnes.length }, [fileId(p)]);
+        }
+        if (read.length) await d.facts.clearScanRequests?.(job.projectKey, read);
+        factsAdded += added;
+        // Tried once this run, read or not (one that failed stays asked for, for the next scan).
+        for (const p of s.files) asked.delete(p);
+        await progress();
+      };
       for (const s of shards) {
-        if (processed.has(s.key) && !askedAgain(s)) continue;
+        if (processed.has(s.key)) {
+          if (askedAgain(s)) await readAskedFiles(s);
+          continue;
+        }
         const scope = shardScope(s, shards);
         const ordered = [...s.files].sort((a, b) => rank.get(a)! - rank.get(b)!);
         const hot = ordered.filter((p) => asked.has(p) || hotOf(p) > 0);
-        const shard: ShardTask = { key: s.key, roots: s.roots, scope, files: ordered.map((p) => byPath.get(p)!), hot };
+        const shard: ShardTask = { key: s.key, roots: s.roots, scope, files: ordered.map((p) => byPath.get(p)!), hot, lowValue: isLow };
         const dirty = dirtyOf(s, scope);
         if (!dirty.length && !staleModel(scope)) {
           coverage.push({ shard: s.key, files: s.files.length, facts: 0, skipped: true });
@@ -760,8 +970,10 @@ export async function runScan(job: ScanJob, d: ScanDeps): Promise<ScanResult> {
         }
         let raw: CodeFact[];
         let unreached: string[];
+        let hidden: ShardHidden = { lowValue: 0, overBudget: 0 };
+        let toppedUp = false;
         try {
-          ({ facts: raw, unreached } = await extractShardFacts(d.llm, await agentCwd(), shard));
+          ({ facts: raw, unreached, hidden, toppedUp } = await extractShardFacts(d.llm, await agentCwd(), shard, { log: d.log }));
           timeoutsInRow = 0;
         } catch (err) {
           // The model could not be asked: every other shard would fail the same way, so the whole scan waits
@@ -794,7 +1006,7 @@ export async function runScan(job: ScanJob, d: ScanDeps): Promise<ScanResult> {
             return content === null ? null : { path: f.path, content };
           }),
         )).filter((c): c is { path: string; content: string } => c !== null);
-        const facts = [...model, ...deterministicFacts(contents)].map(checked);
+        const facts = [...calibrateRelevance(model), ...deterministicFacts(contents)].map(checked);
         await d.facts.replaceScopeFacts(job.projectKey, scope, await embedFacts(facts, d.embed), d.llm.id, shard.files.map((f) => ({ path: f.path, hash: f.hash, version: SCANNER_VERSION })), job.id);
         factsAdded += facts.length;
         coverage.push({ shard: s.key, files: s.files.length, facts: facts.length, skipped: false, ...(unreached.length ? { unreached } : {}) });
@@ -807,11 +1019,15 @@ export async function runScan(job: ScanJob, d: ScanDeps): Promise<ScanResult> {
           dropped.length ? `${plural(dropped.length, 'fact')} dropped for citing a file that does not exist or an instruction file (AGENTS.md, CLAUDE.md)` : '',
           outside.length ? `${plural(outside.length, 'fact')} dropped for citing a file outside this shard` : '',
           unreached.length ? `the agent did not reach ${unreached.length}: ${unreached.slice(0, 10).join(', ')}${unreached.length > 10 ? ', ...' : ''}` : '',
+          toppedUp ? 'its first answer was under the fact floor, so it was asked once more for the directories short of facts' : '',
+          hidden.lowValue ? `${plural(hidden.lowValue, 'fact')} about tests, fixtures or archived files cut (they get a small share of the budget)` : '',
+          hidden.overBudget ? `${plural(hidden.overBudget, 'fact')} past the budget of this shard cut, least relevant first` : '',
         ].filter(Boolean).map((x) => `; ${x}`).join('');
         const where = shards.length === 1 ? 'the whole repository' : s.key;
         await note('facts_extracted', `${plural(facts.length, 'fact')} from ${where}`,
           `${plural(dirty.length, 'file')} changed, removed or asked for; ${d.llm.id} explored ${where} with read-only tools and replaced its earlier facts there${droppedWhy}`,
-          { shard: s.key, facts: factLog(facts), ...(dropped.length || outside.length ? { dropped: factLog([...dropped, ...outside]) } : {}), changedFiles: dirty, ...(unreached.length ? { unreached } : {}) },
+          { shard: s.key, facts: factLog(facts), ...(dropped.length || outside.length ? { dropped: factLog([...dropped, ...outside]) } : {}), changedFiles: dirty, ...(unreached.length ? { unreached } : {}),
+            ...(hidden.lowValue || hidden.overBudget ? { cut: hidden } : {}), ...(toppedUp ? { toppedUp } : {}) },
           [...new Set(facts.map((f) => fileId(f.path || '.')))]);
         d.log?.('scanned shard', { project: job.projectKey, shard: s.key, files: s.files.length, facts: facts.length, unreached: unreached.length });
         if (await giveWay()) return await paused();
@@ -853,7 +1069,7 @@ export async function runScan(job: ScanJob, d: ScanDeps): Promise<ScanResult> {
         }
         const { summary } = extracted;
         const { kept } = await checkCitations(extracted.facts.map((x) => ({ ...x, origin: 'model' as const })), async (p) => (p === f.path ? content : undefined));
-        const all = [...kept, ...deterministicFacts([{ path: f.path, content }])].map(checked);
+        const all = [...calibrateRelevance(kept), ...deterministicFacts([{ path: f.path, content }])].map(checked);
         await d.facts.saveFileFacts(job.projectKey, { path: f.path, hash: f.hash, summary, version: SCANNER_VERSION }, await embedFacts(all, d.embed), d.llm.id, job.id);
         factsAdded += all.length;
         if (asked.has(f.path)) await d.facts.clearScanRequests?.(job.projectKey, [f.path]);

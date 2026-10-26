@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { askJson, chunkText, holdsCredential, providerUnavailableReason, redactSecrets, type ActivityStore, type CodeFact, type DocsStore, type DocToRead, type LlmProvider } from '@fb/core';
+import { askJson, chunkText, holdsCredential, instructsAgent, providerUnavailableReason, redactSecrets, type ActivityStore, type CodeFact, type DocsStore, type DocToRead, type LlmProvider } from '@fb/core';
 import { FACT_JSON, FactSchema, MIN_CONFIDENCE, RELEVANCE_RUBRIC } from '../scan/scan.ts';
 
 export type ReadDeps = {
@@ -94,11 +94,14 @@ Then: ${WHAT_TO_KEEP} At most ${MAX_FACTS} facts.`,
 
 async function saveReading(d: ReadDeps, job: DocToRead, facts: CodeFact[], description: string | null): Promise<{ read: boolean }> {
   const confident = facts.filter((f) => f.confidence >= MIN_CONFIDENCE).slice(0, MAX_FACTS);
-  // A fact that is a credential ("the admin password is ...") would reach agents ranked high: never kept.
-  const kept = confident
-    .filter((f) => !holdsCredential(f.statement))
+  // A fact that is a credential ("the admin password is ...") would reach agents ranked high: never kept. Nor is one
+  // that is an instruction to the agent: the upload is data.
+  const noCredential = confident.filter((f) => !holdsCredential(f.statement));
+  const kept = noCredential
+    .filter((f) => !instructsAgent(f.statement))
     .map((f) => ({ ...f, path: job.ref, statement: redactSecrets(f.statement), why: redactSecrets(f.why) }));
-  const credentials = confident.length - kept.length;
+  const credentials = confident.length - noCredential.length;
+  const instructions = noCredential.length - kept.length;
   const vectors = kept.length ? await d.embed(kept.map((f) => `${f.path}: ${f.statement}`)) : [];
   const chunks = description ? chunkText(`Image "${job.title}" (${job.ref}): ${description}`) : null;
   const chunkVectors = chunks ? await d.embed(chunks) : [];
@@ -114,8 +117,9 @@ async function saveReading(d: ReadDeps, job: DocToRead, facts: CodeFact[], descr
     kind: 'doc_read', actor: d.llm.id, projectKey: job.projectKey,
     subject: `read "${job.title}": ${kept.length} fact${kept.length === 1 ? '' : 's'}`,
     why: (job.image ? 'you uploaded this image; its description is now searchable and its facts reach agents' : 'you uploaded this document; its facts reach agents ranked by relevance')
-      + (credentials ? `; ${credentials} fact${credentials === 1 ? '' : 's'} held a credential and ${credentials === 1 ? 'was' : 'were'} not kept (remove the secret from the upload and rotate it)` : ''),
-    details: { kind: job.kind, ...(credentials ? { credentialFactsDropped: credentials } : {}), facts: kept.map((f) => ({ kind: f.kind, statement: f.statement, relevance: f.relevance ?? null })), ...(description ? { description: description.slice(0, 2000) } : {}) },
+      + (credentials ? `; ${credentials} fact${credentials === 1 ? '' : 's'} held a credential and ${credentials === 1 ? 'was' : 'were'} not kept (remove the secret from the upload and rotate it)` : '')
+      + (instructions ? `; ${instructions} fact${instructions === 1 ? '' : 's'} read as an instruction to the agent ${instructions === 1 ? 'was' : 'were'} not kept: an upload is data, not instructions` : ''),
+    details: { kind: job.kind, ...(credentials ? { credentialFactsDropped: credentials } : {}), ...(instructions ? { instructionFactsDropped: instructions } : {}), facts: kept.map((f) => ({ kind: f.kind, statement: f.statement, relevance: f.relevance ?? null })), ...(description ? { description: description.slice(0, 2000) } : {}) },
     targets: [job.id],
   });
   return { read: true };

@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import type { Config } from '../config.ts';
-import { EMPTY_SELECTION, initialSelection, projectScope, type ProjectScope, type ProjectSelection } from '../scope.ts';
+import { EMPTY_SELECTION, ingestSeedsStored, initialSelection, projectScope, type ProjectScope, type ProjectSelection } from '../scope.ts';
 import type { ActivityStore, SelectionStore } from '../store.ts';
 import type { ActivityInput } from '../types.ts';
 import type { GraphRepo } from './repo.ts';
@@ -52,9 +52,10 @@ const ID = SELECTION_ID;
 
 /**
  * The activity a first start logs once, when it stores the initial selection. `existing`: projects already stored.
- * `fromIngest`: INGEST_PROJECTS was set (otherwise a non-empty seed came from the projects you invested in).
+ * `fromIngest`: INGEST_PROJECTS was set (otherwise a non-empty seed came from the projects you invested in). `late`: not
+ * a first start, but a selection never made taking INGEST_PROJECTS set since (ingestSeedsStored).
  */
-export function selectionSeededActivity(seed: Pick<ProjectSelection, 'tracked' | 'initialized'>, existing: number, fromIngest = seed.initialized): ActivityInput {
+export function selectionSeededActivity(seed: Pick<ProjectSelection, 'tracked' | 'initialized'>, existing: number, fromIngest = seed.initialized, late = false): ActivityInput {
   const seededFrom = fromIngest ? 'INGEST_PROJECTS' : seed.tracked.length ? 'existing data' : 'nothing';
   const projects = (k: number) => `${k} project${k === 1 ? '' : 's'}`;
   return {
@@ -64,7 +65,9 @@ export function selectionSeededActivity(seed: Pick<ProjectSelection, 'tracked' |
     subject: seed.tracked.length
       ? `reading ${projects(seed.tracked.length)}: ${seed.tracked.join(', ')}`
       : 'no projects are selected yet: no sessions are read until you choose folders in Settings',
-    why: seededFrom === 'INGEST_PROJECTS'
+    why: late
+      ? 'no selection had been made yet, so it was taken from INGEST_PROJECTS (set since, e.g. by ./scripts/setup.sh --select); change it in Settings from now on'
+      : seededFrom === 'INGEST_PROJECTS'
       ? 'first start with a project selection: taken from INGEST_PROJECTS; change it in Settings from now on'
       : seededFrom === 'existing data'
         ? `first start with a project selection after an upgrade; INGEST_PROJECTS was empty, so the projects that hold your approved lessons, confirmed feedback, docs or scans were selected and agents keep getting their lessons (${projects(existing)} in the graph). Review it in Settings`
@@ -107,10 +110,30 @@ export class SelectionRepo implements SelectionStore {
 
   /**
    * First start: store the initial selection (INGEST_PROJECTS, or nothing) and log it. Safe to call from both
-   * services at once: only the call that created the node logs.
+   * services at once: only the call that created the node logs. A selection never made takes INGEST_PROJECTS set
+   * since, once (ingestSeedsStored).
    */
   async ensure(env: Pick<Config, 'ingestProjects' | 'excludeProjects'>, activity?: Pick<ActivityStore, 'record'>): Promise<{ selection: ProjectSelection; seeded: boolean }> {
     const stored = await this.get();
+    if (stored && ingestSeedsStored(stored, env)) {
+      // Never made: INGEST_PROJECTS set since seeds it now. The lock write first, so of two services only one seeds.
+      const seed = initialSelection(env);
+      const [r] = await this.g.run(
+        `MATCH (s:ProjectSelection {id: $id})
+         SET s.seedLock = true
+         WITH s, coalesce(s.initialized, false) = false AND size(coalesce(s.tracked, [])) = 0 AS open
+         REMOVE s.seedLock
+         FOREACH (_ IN CASE WHEN open THEN [1] ELSE [] END | SET s.tracked = $tracked, s.initialized = $initialized, s.updatedAt = $now)
+         RETURN s, open`,
+        { id: ID, tracked: seed.tracked, initialized: seed.initialized, now: new Date().toISOString() },
+      );
+      const seeded = r?.get('open') === true;
+      if (seeded && activity) {
+        const [c] = await this.g.run('MATCH (p:Project) RETURN count(p) AS n');
+        await activity.record(selectionSeededActivity(seed, Number(c?.get('n') ?? 0), true, true));
+      }
+      return { selection: r ? toSelection(r.get('s').properties) : await this.current(), seeded };
+    }
     if (stored) return { selection: stored, seeded: false };
     const seed = initialSelection(env, env.ingestProjects.length ? [] : await this.investedKeys());
     const token = randomUUID();

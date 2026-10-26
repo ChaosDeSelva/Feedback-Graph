@@ -1,5 +1,5 @@
 import { expect, test } from 'vitest';
-import { codeLinkLabel, codeNodeCaption, codeNodeLabel, escapeHtml, evidenceLinkLabel, evidenceNodeLabel, LabelPlacer, shortestSuffixes } from './graphLabels.ts';
+import { codeLinkLabel, codeNodeCaption, codeNodeLabel, escapeHtml, evidenceLinkLabel, evidenceNodeLabel, keyFiles, LabelPlacer, placeCaptions, shortestSuffixes } from './graphLabels.ts';
 
 // force-graph renders nodeLabel/linkLabel strings as HTML: untrusted text (feedback, lesson titles, paths) is escaped.
 const evil = '<img src=x onerror=alert(1)>';
@@ -79,4 +79,53 @@ test('LabelPlacer caps captions per area, so the dense centre of a map does not 
   expect(p.place(150, 0, 20, 5)).toBe(true);
   p.reset();
   expect(p.place(0, 20, 20, 5)).toBe(true);
+});
+
+/** A zoomed-out map as the fit leaves it: 400 nodes 9 px apart on screen, captions 11 px type, wider than the gaps. */
+function denseMap() {
+  const nodes: { x: number; y: number; r: number }[] = [];
+  for (let i = 0; i < 20; i++) for (let j = 0; j < 20; j++) nodes.push({ x: 200 + i * 9, y: 100 + j * 9, r: 4.5 });
+  return nodes;
+}
+const width = (s: string) => s.length * 6;
+
+test('at the default zoom of a dense map the key files are all named: captions of key files may cover nodes, not each other', () => {
+  const nodes = denseMap();
+  // Twelve key files spread over the map, 45 px apart across: closer than their captions are wide.
+  const keys = [0, 5, 10, 15].flatMap((i) => [2, 9, 16].map((j) => i * 20 + j)).map((i) => ({ i, text: `key-${i}.ts` }));
+  const captions = nodes.map((n, i) => {
+    const key = keys.find((k) => k.i === i);
+    return { text: key ? key.text : `file-${i}.ts`, x: n.x, y: n.y, r: n.r, rank: key ? 1e6 - i : 0, key: !!key };
+  });
+  const placed = placeCaptions(captions, { nodes: nodes.map((n) => [n.x - n.r, n.y - n.r, 2 * n.r, 2 * n.r] as [number, number, number, number]), width, height: 13, gap: 2, cell: 160, perCell: 3 });
+  expect(keys.every((k) => placed.some((p) => p.text === k.text))).toBe(true);
+  // No two drawn captions overlap.
+  for (const a of placed) for (const b of placed) {
+    if (a === b) continue;
+    expect(a.x < b.x + b.w && b.x < a.x + a.w && a.y < b.y + b.h && b.y < a.y + a.h).toBe(false);
+  }
+  // The rest stay out of the dense centre (they would cover nodes).
+  expect(placed.filter((p) => p.text.startsWith('file-')).length).toBeLessThan(10);
+});
+
+test('a file with misses is always named, even where every spot around it is taken', () => {
+  const nodes = [{ x: 0, y: 0, r: 4 }, { x: 4, y: 0, r: 4 }];
+  const placed = placeCaptions([
+    { text: 'a-long-hotspot-name.ts', x: 0, y: 0, r: 4, rank: 2e6, key: true },
+    { text: 'missed.ts', x: 4, y: 0, r: 4, rank: 1e6, key: true, must: true },
+  ], { nodes: nodes.map((n) => [n.x - n.r, n.y - n.r, 2 * n.r, 2 * n.r] as [number, number, number, number]), width, height: 13, gap: 2 });
+  expect(placed.map((p) => p.text).sort()).toEqual(['a-long-hotspot-name.ts', 'missed.ts']);
+});
+
+test('importance: files with misses first, then by hotspot score, then by how many edges they have; tests and other kinds never', () => {
+  const ranked = keyFiles([
+    { id: 'file:a', kind: 'file', path: 'a', score: 3, misses: 0 },
+    { id: 'file:b', kind: 'file', path: 'b', score: 0, misses: 0 },
+    { id: 'file:c', kind: 'file', path: 'c', score: 0, misses: 0 },
+    { id: 'file:d', kind: 'file', path: 'd', score: 1, misses: 2 },
+    { id: 'miss:1', kind: 'miss', score: 0, misses: 0 },
+  ], [{ source: 'file:c', target: 'file:a' }, { source: 'file:c', target: 'file:b' }], 3);
+  expect(ranked).toEqual(['d', 'a', 'c']);
+  // With nothing scored (a fresh map) the most connected files are still named.
+  expect(keyFiles([{ id: 'file:x', kind: 'file', path: 'x', score: 0, misses: 0 }, { id: 'file:y', kind: 'file', path: 'y', score: 0, misses: 0 }], [{ source: 'file:y', target: 'file:x' }, { source: 'file:y', target: 'file:z' }], 1)).toEqual(['y']);
 });

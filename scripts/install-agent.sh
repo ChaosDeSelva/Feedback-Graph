@@ -18,6 +18,7 @@
 # When .env (or the environment) sets API_TOKEN, the MCP server is registered with it as a Bearer header.
 # The server is named feedback-graph, or feedback-graph-<name> for an install with its own FG_INSTANCE (setup.sh gives a
 # second checkout on the same machine one, and its own API_PORT), so two installs on one machine each keep a server.
+# Such a second install never repoints the skill links or rewrites the Codex guidance block the first one made.
 # Safe to re-run: a server already registered is left alone, the guidance block is only rewritten when it changed, and
 # a Codex file is copied to <file>.bak.<time> before it is changed. The skills are symlinks into this folder, so a
 # git pull updates them; after moving or deleting this folder, re-run the script (or remove the links).
@@ -44,7 +45,8 @@ Connect Claude Code and Codex to the Feedback Graph's MCP server.
 
 The URL is FEEDBACK_GRAPH_URL, else http://localhost:<API_PORT> (API_PORT from the environment or .env, 8787 when
 unset). With API_TOKEN set, the server is registered with it as a Bearer header (never printed). Re-running is safe.
-An install with its own FG_INSTANCE (a second one on this machine) is registered as feedback-graph-<name> instead.
+An install with its own FG_INSTANCE (a second one on this machine) is registered as feedback-graph-<name> instead,
+and leaves skill links and a Codex guidance block another install made as they are (it adds them only where none is).
 EOF
 }
 
@@ -135,9 +137,13 @@ install_claude() {
   fi
   for s in feedback-graph postmortem test-from-feedback; do
     [ "$plugin" = 0 ] || break
-    local link="$HOME/.claude/skills/$s"
-    if [ "$(readlink "$link" 2>/dev/null || true)" = "$here/plugin/skills/$s" ]; then
+    local link="$HOME/.claude/skills/$s" target
+    target="$(readlink "$link" 2>/dev/null || true)"
+    if [ "$target" = "$here/plugin/skills/$s" ]; then
       echo "skill already linked: ~/.claude/skills/$s"
+    elif [ "$name" != feedback-graph ] && { [ -e "$link" ] || [ -L "$link" ]; }; then
+      # A second install never repoints the first one's skills: they are the same skills, and work with either server.
+      echo "skill ~/.claude/skills/$s belongs to another install (${target:-not a link}); left as it is (this install is the server $name)"
     elif [ "$dry" = 1 ]; then
       if [ -e "$link" ] || [ -L "$link" ]; then would "replace ~/.claude/skills/$s with a link to $here/plugin/skills/$s"
       else would "link ~/.claude/skills/$s -> $here/plugin/skills/$s"; fi
@@ -252,7 +258,10 @@ install_codex() {
 
   local block
   block="$(printf '%s\n%s\n%s' "$BEGIN_MARK" "$(cat "$here/skill/codex/AGENTS.md")" "$END_MARK")"
-  if [ -f "$md" ] && grep -q '^<!-- BEGIN feedback-graph' "$md"; then
+  if [ -f "$md" ] && grep -q '^<!-- BEGIN feedback-graph' "$md" && [ "$name" != feedback-graph ]; then
+    # The first install's block, kept as that install wrote it: one block of the same guidance serves both servers.
+    echo "Codex: the Feedback Graph guidance in $md belongs to the first install; left as it is (this install is the server $name)"
+  elif [ -f "$md" ] && grep -q '^<!-- BEGIN feedback-graph' "$md"; then
     local current
     current="$(awk '/^<!-- BEGIN feedback-graph/{on=1} on{print} /^<!-- END feedback-graph -->/{on=0}' "$md")"
     if [ "$current" = "$block" ]; then

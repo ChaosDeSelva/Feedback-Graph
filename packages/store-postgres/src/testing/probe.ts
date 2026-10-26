@@ -137,8 +137,8 @@ export class PostgresProbe implements StoreProbe {
       case 'Lesson':
         await this.q(
           `INSERT INTO lessons (id, title, rule, applies_when, scope, status, source, created_at, embedding)
-           VALUES ($1, $2, $3, $4, 'global', 'proposed', 'postmortem', now(), $5::vector)`,
-          [row.id, row.title, row.rule, row.appliesWhen ?? null, v],
+           VALUES ($1, $2, $3, $4, 'global', $6, 'postmortem', now(), $5::vector)`,
+          [row.id, row.title, row.rule, row.appliesWhen ?? null, v, row.status ?? 'proposed'],
         );
         return;
       case 'Miss':
@@ -153,11 +153,13 @@ export class PostgresProbe implements StoreProbe {
         return;
       case 'Fact':
         // A fact you wrote hangs off no file (facts_about_one).
-        if (row.origin !== 'you') await this.q(`INSERT INTO code_files (id, project_key, path) VALUES ($1, $2, $3) ON CONFLICT (id) DO NOTHING`, [`${PROBE_PROJECT}:${row.path}`, PROBE_PROJECT, row.path]);
+        if (row.origin !== 'you' && !row.docId) await this.q(`INSERT INTO code_files (id, project_key, path) VALUES ($1, $2, $3) ON CONFLICT (id) DO NOTHING`, [`${PROBE_PROJECT}:${row.path}`, PROBE_PROJECT, row.path]);
+        // A fact read from an upload hangs off its document.
+        if (row.docId) await this.q(`INSERT INTO docs (id, project_key, source, ref, title, added_at) VALUES ($1, $2, 'upload', $3, '', now()) ON CONFLICT (id) DO NOTHING`, [row.docId, PROBE_PROJECT, row.path]);
         await this.q(
-          `INSERT INTO facts (id, project_key, code_file_id, kind, statement, path, source, current, created_at, valid_from, embedding, origin)
-           VALUES ($1, $2, $3, 'convention', $4, $5, 'probe', $6, now(), now(), $7::vector, $8)`,
-          [row.id, PROBE_PROJECT, row.origin === 'you' ? null : `${PROBE_PROJECT}:${row.path}`, row.statement, row.path, row.current, v, row.origin ?? null],
+          `INSERT INTO facts (id, project_key, code_file_id, kind, statement, path, source, current, created_at, valid_from, embedding, origin, doc_id)
+           VALUES ($1, $2, $3, 'convention', $4, $5, 'probe', $6, now(), now(), $7::vector, $8, $9)`,
+          [row.id, PROBE_PROJECT, row.origin === 'you' || row.docId ? null : `${PROBE_PROJECT}:${row.path}`, row.statement, row.path, row.current, v, row.origin ?? null, row.docId ?? null],
         );
         return;
       case 'Chunk':
@@ -198,6 +200,19 @@ export class PostgresProbe implements StoreProbe {
         await this.q(
           `INSERT INTO activity (id, ts, kind, actor, subject, why, details) VALUES ($1, now(), 'doc_added', 'probe', $2, $3, $4::jsonb)`,
           [row.id, row.subject, row.why, toJson(row.details)],
+        );
+        return;
+      case 'ChatTurns':
+        await this.q(`INSERT INTO chat_conversations (id, project_key, title, next_seq, created_at, updated_at) VALUES ($1, $2, 't', 3, now(), now())`, [row.id, PROBE_PROJECT]);
+        await this.q(
+          `INSERT INTO chat_turns (id, conversation_id, project_key, seq, role, text, status, sources, context, created_at, finished_at)
+           VALUES ($1 || ':q', $1, $2, 1, 'user', $3, 'done', '[]', $4, now(), now())`,
+          [row.id, PROBE_PROJECT, row.question, row.context],
+        );
+        await this.q(
+          `INSERT INTO chat_turns (id, conversation_id, project_key, seq, role, text, status, answer, sources, created_at)
+           VALUES ($1 || ':a', $1, $2, 2, 'assistant', '', 'pending', $3::jsonb, $4::jsonb, now())`,
+          [row.id, PROBE_PROJECT, toJson(row.answer), toJson(row.sources)],
         );
         return;
     }

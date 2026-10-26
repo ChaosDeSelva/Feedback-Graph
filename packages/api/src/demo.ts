@@ -1,7 +1,7 @@
 import type { Hono } from 'hono';
 import { z } from 'zod';
 import { DEMO_SOURCE, demoPrefix, type ActivityStore, type Cause, type CodeGraphStore, type FactKind, type FactsStore, type KnowledgeStore, type OperatorConfig, type Project } from '@fb/core';
-import { hasOperatorToken, operatorName, runAs } from './operator.ts';
+import { currentRun, hasOperatorToken, operatorName, runAs } from './operator.ts';
 
 /**
  * fg demo seed / remove: a small, clearly labelled corpus in a demo project, so a tester whose own projects have no
@@ -76,10 +76,13 @@ export type DemoDeps = {
 export type DemoSeeded = { project: string; lessons: number; misses: number; facts: number; skippedFacts: string[]; message: string };
 export type DemoRemovedResult = { project: string; lessons: number; misses: number; facts: number; message: string };
 
-/** Refused: not the owner for another project, a bad key, or a store without the demo methods. status: the HTTP answer. */
+/**
+ * Refused: not the owner for another project, a bad key, or a store without the demo methods; or a seed that failed
+ * part-way and was taken back (500). status: the HTTP answer.
+ */
 export class DemoRefused extends Error {
-  status: 400 | 403 | 501;
-  constructor(message: string, status: 400 | 403 | 501) {
+  status: 400 | 403 | 500 | 501;
+  constructor(message: string, status: 400 | 403 | 500 | 501) {
     super(message);
     this.status = status;
   }
@@ -98,14 +101,19 @@ function target(o: { project?: string; owner?: boolean }): string {
   return key;
 }
 
-/** Seed (again, in place) the demo corpus. Idempotent: ids are fixed, so a second run rewrites the same records. */
+/**
+ * Seed (again, in place) the demo corpus. Idempotent: ids are fixed, so a second run rewrites the same records. All or
+ * nothing: a write that fails part-way takes back what the seed wrote (removeDemo) and says so. In a labelled run
+ * (x-fg-run) the lessons and the miss carry the run, so `fg cleanup --run` removes them as well.
+ */
 export async function seedDemo(o: { project?: string; owner?: boolean }, d: DemoDeps): Promise<DemoSeeded> {
   const key = target(o);
-  const { saveDemoMiss } = d.knowledge;
-  if (!saveDemoMiss || !d.knowledge.removeDemo) throw new DemoRefused('this store cannot hold a demo corpus (no saveDemoMiss / removeDemo)', 501);
+  const k = d.knowledge;
+  if (!k.saveDemoMiss || !k.removeDemo) throw new DemoRefused('this store cannot hold a demo corpus (no saveDemoMiss / removeDemo)', 501);
   const found = d.project(key);
   const project: Project = found ?? { key, name: key, repoPath: '' };
   const prefix = demoPrefix(key);
+  const run = currentRun();
   const c = DEMO_CORPUS;
   const [lessonVecs, missVecs, factVecs] = await Promise.all([
     d.embed(c.lessons.map((l) => `[demo] ${l.title}\n${l.rule}\nApplies when: ${l.appliesWhen}`)),
@@ -113,38 +121,51 @@ export async function seedDemo(o: { project?: string; owner?: boolean }, d: Demo
     d.embed(c.facts.map((f) => `${f.path}: ${f.statement}`)),
   ]);
   const lessonIds: string[] = [];
-  for (const [i, l] of c.lessons.entries()) {
-    const id = `${prefix}${l.slug}`;
-    await d.knowledge.upsertLesson({
-      id, projectKey: key, title: `[demo] ${l.title}`, rule: l.rule, appliesWhen: l.appliesWhen, scope: 'project', paths: l.paths,
-      status: 'approved', source: SOURCE, embedding: lessonVecs[i],
-    });
-    lessonIds.push(id);
-  }
-  // A day ago, edited just before and fixed just after: the code map shows it as a miss on that file, since fixed.
-  const at = Date.now() - 86_400_000;
-  const missSession = `${prefix}${c.miss.slug}`;
-  const missId = await saveDemoMiss({
-    project, id: missSession, ts: new Date(at).toISOString(), feedbackText: c.miss.feedbackText, whatWasDone: c.miss.whatWasDone,
-    missed: c.miss.missed, cause: c.miss.cause, causeExplanation: c.miss.causeExplanation, embedding: missVecs[0],
-  });
-  await d.codegraph?.recordSessionFiles(missSession, c.miss.files.map((path) => ({
-    path, read: true, edited: true, firstEditAt: new Date(at - 60_000).toISOString(), lastEditAt: new Date(at + 60_000).toISOString(),
-  })));
-  // A file that has facts (a scan read it) keeps them: saving demo facts would close them.
+  let missId: string;
   let facts = 0;
   const skippedFacts: string[] = [];
-  for (const [i, f] of c.facts.entries()) {
-    if ((await d.facts.listFacts({ projectKey: key, path: f.path, limit: 1 })).length) {
-      skippedFacts.push(f.path);
-      continue;
+  try {
+    // The miss first: it is what creates the project when there is none, marked as the demo's so removeDemo can take
+    // that back too. Called on the store, never detached: the real stores' methods use `this`.
+    const at = Date.now() - 86_400_000;
+    const missSession = `${prefix}${c.miss.slug}`;
+    missId = await k.saveDemoMiss({
+      project, id: missSession, ts: new Date(at).toISOString(), feedbackText: c.miss.feedbackText, whatWasDone: c.miss.whatWasDone,
+      missed: c.miss.missed, cause: c.miss.cause, causeExplanation: c.miss.causeExplanation, embedding: missVecs[0],
+      ...(run && { run }),
+    });
+    // A day ago, edited just before and fixed just after: the code map shows it as a miss on that file, since fixed.
+    await d.codegraph?.recordSessionFiles(missSession, c.miss.files.map((path) => ({
+      path, read: true, edited: true, firstEditAt: new Date(at - 60_000).toISOString(), lastEditAt: new Date(at + 60_000).toISOString(),
+    })));
+    for (const [i, l] of c.lessons.entries()) {
+      const id = `${prefix}${l.slug}`;
+      await k.upsertLesson({
+        id, projectKey: key, title: `[demo] ${l.title}`, rule: l.rule, appliesWhen: l.appliesWhen, scope: 'project', paths: l.paths,
+        status: 'approved', source: SOURCE, embedding: lessonVecs[i], ...(run && { run }),
+      });
+      lessonIds.push(id);
     }
-    // Hash 'demo' is never a real file's: the next scan of the file reads it and replaces these with what it finds. A
-    // file a scan already recorded keeps its hash and summary (the store adds the file only when there is none).
-    await d.facts.saveFileFacts(key, { path: f.path, hash: SOURCE, summary: '[demo] seeded by fg demo seed' }, [
-      { kind: f.kind, statement: `[demo] ${f.statement}`, path: f.path, lines: f.lines, confidence: 1, why: 'seeded by fg demo seed', embedding: factVecs[i] },
-    ], SOURCE);
-    facts++;
+    // A file that has facts (a scan read it) keeps them: saving demo facts would close them.
+    for (const [i, f] of c.facts.entries()) {
+      if ((await d.facts.listFacts({ projectKey: key, path: f.path, limit: 1 })).length) {
+        skippedFacts.push(f.path);
+        continue;
+      }
+      // Hash 'demo' is never a real file's: the next scan of the file reads it and replaces these with what it finds. A
+      // file a scan already recorded keeps its hash and summary (the store adds the file only when there is none).
+      await d.facts.saveFileFacts(key, { path: f.path, hash: SOURCE, summary: '[demo] seeded by fg demo seed' }, [
+        { kind: f.kind, statement: `[demo] ${f.statement}`, path: f.path, lines: f.lines, confidence: 1, why: 'seeded by fg demo seed', embedding: factVecs[i] },
+      ], SOURCE);
+      facts++;
+    }
+  } catch (e) {
+    const why = e instanceof Error ? e.message : String(e);
+    const undone = await k.removeDemo(key).then(
+      () => 'what it had written was taken back',
+      (u) => `taking back what it had written failed too (${u instanceof Error ? u.message : String(u)}): run fg demo remove${key === DEMO_PROJECT ? '' : ` --project ${key}`}`,
+    );
+    throw new DemoRefused(`demo seed failed in ${key}: ${why}; ${undone}`, 500);
   }
   const selected = d.selected ? await d.selected(key) : null;
   const message = [
@@ -159,7 +180,7 @@ export async function seedDemo(o: { project?: string; owner?: boolean }, d: Demo
     projectKey: key,
     subject: `demo corpus seeded in ${key}: ${n(lessonIds.length, 'approved lesson')}, 1 miss, ${n(facts, 'fact')}`,
     why: 'you ran fg demo seed; its lessons are approved by that and are marked demo (fg demo remove takes them back)',
-    details: { lessons: lessonIds, miss: missId, facts, skippedFacts },
+    details: { lessons: lessonIds, miss: missId, facts, skippedFacts, ...(run && { run: run.id }) },
     targets: [...lessonIds, missId],
   });
   return { project: key, lessons: lessonIds.length, misses: 1, facts, skippedFacts, message };
@@ -170,9 +191,12 @@ export async function removeDemo(o: { project?: string; owner?: boolean }, d: De
   const key = target(o);
   if (!d.knowledge.removeDemo) throw new DemoRefused('this store cannot hold a demo corpus (no removeDemo)', 501);
   const r = await d.knowledge.removeDemo(key);
-  const message = r.lessons + r.misses + r.facts
-    ? `Removed ${n(r.lessons, 'demo lesson')}, ${n(r.misses, 'miss', 'misses')} and ${n(r.facts, 'fact')} from ${key}. Nothing else was touched.`
-    : `No demo corpus in ${key}: nothing removed.`;
+  const message = [
+    r.lessons + r.misses + r.facts
+      ? `Removed ${n(r.lessons, 'demo lesson')}, ${n(r.misses, 'miss', 'misses')} and ${n(r.facts, 'fact')} from ${key}. Nothing else was touched.`
+      : `No demo corpus in ${key}: nothing removed.`,
+    ...(r.projectRemoved ? [`The project ${key} itself, which the seed created and nothing else uses, is gone too.`] : []),
+  ].join(' ');
   await d.activity?.record({
     kind: 'demo_removed',
     actor: 'you',
@@ -205,6 +229,7 @@ export function demoRoutes(app: Hono, d: DemoDeps, auth: { operator?: OperatorCo
       return c.json(await (operator ? runAs(operatorName(c.req.header('x-fg-operator')), go) : go()));
     } catch (e) {
       if (e instanceof DemoRefused) return c.json({ error: e.message }, e.status);
+      if (e instanceof Error) return c.json({ error: `fg demo: ${e.message}` }, 500);
       throw e;
     }
   };

@@ -4,7 +4,7 @@ import type { Root } from './projects.ts';
 import { DEFAULT_NUM_CTX, DEFAULT_NUM_PREDICT, DEFAULT_OLLAMA_TIMEOUT_MS, DEFAULT_REPEAT_PENALTY } from './ollama.ts';
 
 /** Bumped with each release; reported by /api/status and the worker heartbeat. */
-export const VERSION = '0.6.2';
+export const VERSION = '0.6.3';
 
 export class ConfigError extends Error {
   readonly problems: string[];
@@ -89,6 +89,12 @@ export type Config = {
   scanMaxFiles: number | null;
   /** SCAN_CONCURRENCY: scans run at once, beside the worker cycle (default 2; agentic ones one at a time). */
   scanConcurrency: number;
+  /**
+   * check_before_done's judge (api): CHECK_CONCURRENCY calls at once (default 2), the rest queued; a check the judge
+   * has not answered within CHECK_WAIT_SECONDS (default 300, waiting included) is answered "not judged" at once and
+   * its model call cancelled. The judge's attempts (an answer and its one retry) share that same budget.
+   */
+  check: { concurrency: number; waitSeconds: number };
   /** Seeds the project selection on its first start only; from then on the selection (Settings) decides. */
   ingestProjects: string[];
   /** Never ingested, scanned or served, even when INGEST_PROJECTS is empty. */
@@ -387,6 +393,7 @@ export function loadConfig(env: Env): Config {
     scanMaxBytes: num('SCAN_MAX_BYTES', 80_000),
     scanMaxFiles: env.SCAN_MAX_FILES?.trim() ? num('SCAN_MAX_FILES', 400) : null,
     scanConcurrency: num('SCAN_CONCURRENCY', 2),
+    check: { concurrency: num('CHECK_CONCURRENCY', 2), waitSeconds: num('CHECK_WAIT_SECONDS', 300, 5) },
     ingestProjects: list(env.INGEST_PROJECTS),
     excludeProjects: list(env.EXCLUDE_PROJECTS),
     turnRetentionDays: retention,

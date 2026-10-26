@@ -76,6 +76,20 @@ test('items the old rule rejected that the new one would not are back in the Inb
   expect(f.cursors.get(INSTRUCTION_RULES_CURSOR)).toBe(`v${DETECT_RULES_VERSION}`);
 });
 
+test('run before the transcripts recorded the calls after each instruction (0.6.1): once they have, what the agent broke comes back', async () => {
+  // 0.6.1 ran this at start, before ingest v4 had recorded the push that ended the session, and resolved the item.
+  const order = item('o1', ORDER);
+  const f = fakes([item('p1', ORDER)], { 'u-o1': { calls: [bash('git push origin HEAD')], laterTurns: 0, endedAt: ended } }, `v${DETECT_RULES_VERSION}`, [order]);
+  const r = await resolvePendingInstructions({ ...f.deps, ingestVersion: 5 });
+  expect(r).toEqual({ resolved: 1, reopened: 1 });
+  expect(f.reopened).toEqual([{ id: 'o1', rule: 'instruction', by: 'detect-rules' }]);
+  expect(f.activity.find((a) => a.kind === 'items_reopened')?.why).toBe(
+    `the sessions' transcripts were read again (ingest v5), so the git calls after each instruction are known now; the earlier run had resolved it as an instruction`,
+  );
+  expect(f.cursors.get(INSTRUCTION_RULES_CURSOR)).toBe(`v${DETECT_RULES_VERSION} ingest v5`);
+  expect(await resolvePendingInstructions({ ...f.deps, ingestVersion: 5 })).toBeNull();
+});
+
 test('an instruction in a session still active is left pending, whatever came after it', async () => {
   for (const laterTurns of [0, 2]) {
     const f = fakes([item('a', ORDER)], { 'u-a': { calls: [], laterTurns, endedAt: '2026-10-25T11:50:00Z' } });

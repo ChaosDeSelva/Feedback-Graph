@@ -143,3 +143,13 @@ test('generic words match only beside a specific one; matching is by whole words
   // "modal" inside the single word "modaldialogtrigger" is not a match.
   expect(findInCodeMap(big, ['modal']).some((h) => h.name === 'modaldialogtrigger')).toBe(false);
 });
+
+// The synonym table must not answer for Object.prototype: "constructor" in a question crashed Ask with a 500.
+test.each(['constructor', '__proto__', 'toString', 'hasOwnProperty', 'valueOf', 'isPrototypeOf'])('a question with the word %s finds code like any other word', (word) => {
+  const withIt = { ...map, symbols: [...map.symbols, sym('src/ui/Modal.tsx', word, { kind: 'method', exported: false })] };
+  const terms = codeTerms(`what does the ${word} of Modal do?`);
+  expect(() => findInCodeMap(withIt, terms)).not.toThrow();
+  expect(() => findInCodeMap(withIt, [word])).not.toThrow();
+  // A name is matched by its letters and digits, so __proto__ is the word "proto".
+  expect(findInCodeMap(withIt, [word === '__proto__' ? 'proto' : word]).some((h) => h.name === word)).toBe(true);
+});

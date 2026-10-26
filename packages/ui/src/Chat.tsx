@@ -6,13 +6,15 @@ import { askConfirm } from './ui/ConfirmDialog.tsx';
 import { PageHeader } from './ui/PageHeader.tsx';
 import { ListRow, SplitPane } from './ui/SplitPane.tsx';
 import { Button, buttonClass, CopyButton, Select, Textarea } from './ui/controls.tsx';
-import { ago, Alert, Badge, Card, EmptyState, Kbd, SectionLabel, SkeletonDetail, SkeletonList, type Tone } from './ui/display.tsx';
+import { Alert, Badge, Card, EmptyState, Kbd, SectionLabel, plural, SkeletonDetail, SkeletonList, Time, type Tone } from './ui/display.tsx';
 import { AskIcon, TrashIcon } from './ui/icons.tsx';
 import { Markdown } from './ui/Markdown.tsx';
 
 /** How often an open conversation is fetched again while its answer is being written. */
 const MAX_POLL_FAILURES = 5;
 const POLL_MS = 2000;
+/** How often the conversation list is fetched again while one in it is being answered (it may not be the open one). */
+const LIST_POLL_MS = 5000;
 /** The API refuses longer questions. */
 const MAX_QUESTION = 4000;
 const TITLE_MAX = 60;
@@ -32,6 +34,8 @@ function providerName(turnProvider: string | null, chosen: ChatProvider | null):
   if (p === 'local') return 'the local model';
   return p;
 }
+/** Latest message first, as the server sorts them; the page re-sorts after its own sends without waiting for it. */
+const byRecent = (cs: ChatConversation[]) => [...cs].sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt) || (a.id < b.id ? 1 : a.id > b.id ? -1 : 0));
 /** The conversation a link opened the page on (`#ask/<id>`), never the `#ask/new?…` form. */
 const linkedConversation = () => (hashNewChat() ? null : hashFocus('ask'));
 /** Writes the address without a history entry, so Back never re-runs a `#ask/new` link. */
@@ -72,12 +76,20 @@ export function Chat() {
     let stale = false;
     api.chats(project || undefined).then((cs) => {
       if (stale) return;
-      setConvs(cs);
+      setConvs(byRecent(cs));
       // Wider screens open the newest conversation, unless a link or a new chat is on the way.
       setSelected((cur) => cur ?? (holdOpen.current ? null : cs[0]?.id ?? null));
     }, (e) => { if (!stale) { setError(message(e)); setConvs([]); } });
     return () => { stale = true; };
   }, [project, listTick]);
+
+  // A conversation answering in the background (not the open one, which polls itself) moves up and drops its
+  // "answering" badge once answered: the list is fetched again while any listed conversation is pending.
+  useEffect(() => {
+    if (!convs?.some((c) => c.pending)) return;
+    const t = setTimeout(() => setListTick((n) => n + 1), LIST_POLL_MS);
+    return () => clearTimeout(t);
+  }, [convs]);
 
   // The open conversation. One just created or sent to is already in hand and is not fetched again.
   useEffect(() => {
@@ -117,9 +129,11 @@ export function Chat() {
       const link = hashNewChat();
       if (!link) return;
       if (!link.project) { holdOpen.current = false; setAddress('#ask'); setError('That link names no project to ask about.'); return; }
-      if (!link.q) { setAddress('#ask'); setDraft({ project: link.project, provider: '' }); setSelected(null); setOpen(true); return; }
+      // The model the Dashboard picked; anything else in the link is ignored (the default model answers).
+      const provider = (CHAT_PROVIDERS as readonly string[]).includes(link.provider ?? '') ? (link.provider as ChatProvider) : null;
+      if (!link.q) { setAddress('#ask'); setDraft({ project: link.project, provider: provider ?? '' }); setSelected(null); setOpen(true); return; }
       setAddress('#ask');
-      void start(link.project, null, link.q);
+      void start(link.project, provider, link.q);
     };
     if (!linkDone.current) { linkDone.current = true; run(); }
     // A link followed while the page is open: a new chat from it, or another conversation.
@@ -185,8 +199,12 @@ export function Chat() {
     setSending(true);
     setError(null);
     try {
-      setThread(await api.sendChat(thread.id, question));
+      const next = await api.sendChat(thread.id, question);
+      setThread(next);
       setText('');
+      // It has the newest message now: to the top at once, then the list as the server has it.
+      const at = new Date().toISOString();
+      setConvs((cs) => cs && byRecent(cs.map((c) => (c.id === next.id ? { ...c, updatedAt: at, pending: true } : c))));
       setListTick((n) => n + 1);
     } catch (e) {
       setError(message(e));
@@ -301,7 +319,7 @@ export function Chat() {
                     <div className="flex items-center gap-1.5 truncate text-xs text-muted">
                       <span className="truncate">{c.projectKey}</span>
                       <span aria-hidden="true">·</span>
-                      <span title={new Date(c.updatedAt).toLocaleString()}>{ago(c.updatedAt)}</span>
+                      <Time iso={c.updatedAt} />
                       {c.pending && <Badge tone="info" dot>answering</Badge>}
                     </div>
                   </ListRow>
@@ -361,7 +379,7 @@ export function Chat() {
   );
 }
 
-function ProviderSelect({ label, value, onChange }: { label: string; value: ChatProvider | null; onChange: (p: ChatProvider | null) => void }) {
+export function ProviderSelect({ label, value, onChange }: { label: string; value: ChatProvider | null; onChange: (p: ChatProvider | null) => void }) {
   return (
     <Select aria-label={label} size="sm" value={value ?? ''} onChange={(e) => onChange((e.target.value || null) as ChatProvider | null)} className="w-36">
       <option value="">Default model</option>
@@ -408,10 +426,14 @@ function UserTurn({ turn }: { turn: ChatTurn }) {
 function AssistantTurn({ turn, thread, onRetry }: { turn: ChatTurn; thread: ChatThread; onRetry: () => void }) {
   const who = providerName(turn.provider, thread.provider);
   if (isPending(turn)) {
+    // The worker counts the questions ahead of a waiting one in its model's line (other models answer meanwhile).
+    const ahead = turn.status === 'pending' ? (turn.queueAhead ?? 0) : 0;
     return (
       <div role="status" className="flex items-center gap-2 rounded-md border border-line bg-surface px-3 py-2 text-muted">
         <span aria-hidden="true" className="size-2 animate-pulse rounded-full bg-info" />
-        <span>Answering with {who}… <Elapsed since={turn.startedAt ?? turn.createdAt} /></span>
+        {ahead > 0
+          ? <span>Waiting for {who}: {ahead} {ahead === 1 ? 'question' : 'questions'} ahead of this one… <Elapsed since={turn.createdAt} /></span>
+          : <span>Answering with {who}… <Elapsed since={turn.startedAt ?? turn.createdAt} /></span>}
       </div>
     );
   }
@@ -429,7 +451,13 @@ function AssistantTurn({ turn, thread, onRetry }: { turn: ChatTurn; thread: Chat
     <div className="grid gap-3">
       <div className="rounded-md border border-line bg-surface px-3 py-2.5 shadow-card">
         <Markdown text={a.answer} cite={(id) => { const s = turn.sources.find((x) => x.id === id); return s ? sourceHref(thread.projectKey, s) : null; }} />
-        {turn.provider && <p className="mt-2 text-[11px] text-muted">answered by {turn.provider}</p>}
+        {(turn.provider || turn.pack) && (
+          <p className="mt-2 text-[11px] text-muted">
+            {turn.provider && <>answered by {turn.provider}</>}
+            {turn.provider && turn.pack && ' · '}
+            {turn.pack && <span title="what Feedback Graph gathered for this question and gave the model: lessons, misses, code map matches, snippets, facts and documents">answered from a context pack of {turn.pack.chars.toLocaleString()} characters, {plural(turn.pack.sources, 'source')}</span>}
+          </p>
+        )}
       </div>
       {a.examples.length > 0 && (
         <div className="grid gap-1.5">

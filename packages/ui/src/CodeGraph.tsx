@@ -6,7 +6,7 @@ import { IncludeTests, ModulePanel } from './CodeMap.tsx';
 import { inboxHref, lessonHref } from './links.ts';
 import { Alert, CauseBadge, EmptyState, plural, SectionLabel, Skeleton } from './ui/display.tsx';
 import { MAX_FIT_ZOOM, spreadForces, useSize } from './ui/graphCanvas.ts';
-import { codeLinkLabel, codeNodeCaption, codeNodeLabel, LabelPlacer, shortestSuffixes } from './ui/graphLabels.ts';
+import { codeLinkLabel, codeNodeCaption, codeNodeLabel, keyFiles, placeCaptions, shortestSuffixes, type CaptionWish } from './ui/graphLabels.ts';
 import { Input } from './ui/controls.tsx';
 import { GraphIcon } from './ui/icons.tsx';
 import { readToken, useTheme } from './ui/theme.ts';
@@ -16,7 +16,7 @@ type Kind = 'file' | 'test' | 'miss' | 'lesson';
 type CodeNode = { id: string; kind: Kind; label: string; path?: string; score: number; misses: number; short?: string; top?: boolean };
 /** NEAR: not an edge of the code, a faint tie that keeps a file with no drawn neighbour beside the drawing. */
 type CodeLink = { source: string; target: string; type: 'IMPORTS' | 'TESTS' | 'EDITED' | 'APPLIES_TO' | 'NEAR' };
-/** How many of the top hotspots are captioned at every zoom. */
+/** How many key files (misses, then hotspot score, then edges: keyFiles) are named at every zoom, files with misses on top. */
 const ALWAYS_LABELLED = 12;
 /** Captions per square of CAPTION_CELL screen pixels: the dense centre of a big map shows a few names, not a pile. */
 const CAPTION_CELL = 160;
@@ -84,11 +84,10 @@ export function CodeGraph({ projectKey }: { projectKey: string }) {
   // Every mapped file the find box suggests (the top 500 by score, tests included); any other path can still be typed.
   const [known, setKnown] = useState<string[]>([]);
   const [find, setFind] = useState('');
-  // Captions collected while nodes are drawn, placed after the frame: top hotspots first, so they win any overlap.
-  const captions = useRef<{ text: string; x: number; y: number; rank: number }[]>([]);
-  // And every node's box, so no caption covers another node.
+  // Captions collected while nodes are drawn, placed after the frame (placeCaptions): key files first, so they win.
+  const captions = useRef<CaptionWish[]>([]);
+  // And every node's box, so no other caption covers a node.
   const nodeBoxes = useRef<[number, number, number, number][]>([]);
-  const placer = useRef(new LabelPlacer());
   // The legend, find box and notes float over the canvas's top: the fitted drawing goes below them.
   const overlay = useRef<HTMLDivElement>(null);
 
@@ -131,11 +130,12 @@ export function CodeGraph({ projectKey }: { projectKey: string }) {
   const mapCapped = mapCapNote(graph?.meta, graph?.capped);
   // Before anything scores (no misses, churn or importers), the "hotspots" are just docs and config in path order.
   const noHotspots = !!graph && graph.files.length > 0 && graph.files.every((f) => f.score === 0);
-  // The top hotspots by score, captioned at every zoom.
-  const alwaysLabelled = useMemo(
-    () => new Set([...(graph?.files ?? [])].filter((f) => f.top && f.score > 0).sort((a, b) => b.score - a.score).slice(0, ALWAYS_LABELLED).map((f) => f.path)),
-    [graph],
-  );
+  // The key files, named at every zoom (every file with misses is too, beyond these).
+  const alwaysLabelled = useMemo(() => {
+    if (!data) return new Set<string>();
+    const missed = data.nodes.filter((n) => n.path && n.kind === 'file' && n.misses > 0).length;
+    return new Set(keyFiles(data.nodes, data.links, ALWAYS_LABELLED + missed));
+  }, [data]);
 
   const fileButton = (p: string) => (
     <button type="button" onClick={() => setSelected({ kind: 'file', path: p })} className="text-left font-mono text-[12px] [overflow-wrap:anywhere] text-accent-text hover:underline">{p}</button>
@@ -150,7 +150,7 @@ export function CodeGraph({ projectKey }: { projectKey: string }) {
             <ul aria-label="legend" className="flex flex-wrap gap-x-3 gap-y-1">
               {LEGEND.map((l) => (
                 <li key={l.kind} className="flex items-center gap-1.5">
-                  <span aria-hidden="true" className="inline-block size-2.5 rounded-full" style={{ background: l.kind === 'hot' ? palette.miss : palette[l.kind] }} />
+                  <span aria-hidden="true" className="inline-block size-2.5 rounded-full" style={l.kind === 'hot' ? { background: palette.miss, boxShadow: `0 0 0 1.5px ${palette.surface}, 0 0 0 3px ${palette.miss}` } : { background: palette[l.kind] }} />
                   {l.label}
                 </li>
               ))}
@@ -193,17 +193,26 @@ export function CodeGraph({ projectKey }: { projectKey: string }) {
             cooldownTicks={300}
             onRenderFramePre={() => { captions.current = []; nodeBoxes.current = []; }}
             onRenderFramePost={(ctx: CanvasRenderingContext2D, scale: number) => {
-              // At most CAPTIONS_PER_CELL captions per CAPTION_CELL screen pixels square, whatever the zoom.
-              placer.current.reset({ cell: CAPTION_CELL / scale, perCell: CAPTIONS_PER_CELL });
-              for (const b of nodeBoxes.current) placer.current.block(...b);
-              ctx.font = `${11 / scale}px sans-serif`;
+              // Key files and files with misses are named wherever there is room around them (on a halo, over other
+              // nodes if need be); the rest at most CAPTIONS_PER_CELL per CAPTION_CELL screen pixels, covering no node.
+              const font = (bold: boolean) => `${bold ? '600 ' : ''}${11 / scale}px sans-serif`;
+              ctx.font = font(true);
+              const placed = placeCaptions(captions.current, {
+                nodes: nodeBoxes.current, width: (t) => ctx.measureText(t).width, height: 13 / scale, gap: 2 / scale,
+                cell: CAPTION_CELL / scale, perCell: CAPTIONS_PER_CELL,
+              });
               ctx.textAlign = 'left';
               ctx.textBaseline = 'top';
-              ctx.fillStyle = palette.text;
-              const h = 13 / scale;
-              for (const c of [...captions.current].sort((a, b) => b.rank - a.rank)) {
-                const w = ctx.measureText(c.text).width;
-                if (placer.current.place(c.x - w / 2, c.y, w, h)) ctx.fillText(c.text, c.x - w / 2, c.y);
+              ctx.lineJoin = 'round';
+              for (const c of placed) {
+                ctx.font = font(c.key);
+                if (c.key) {
+                  ctx.lineWidth = 3 / scale;
+                  ctx.strokeStyle = palette.surface;
+                  ctx.strokeText(c.text, c.x, c.y + 1 / scale);
+                }
+                ctx.fillStyle = palette.text;
+                ctx.fillText(c.text, c.x, c.y + 1 / scale);
               }
             }}
             onEngineStop={() => {
@@ -253,10 +262,24 @@ export function CodeGraph({ projectKey }: { projectKey: string }) {
               ctx.lineWidth = (on ? 3 : 1.5) / scale;
               ctx.strokeStyle = on ? palette.text : palette.surface;
               ctx.stroke();
+              // A file with misses wears a ring in the miss colour, so it reads apart from a big file at any zoom.
+              const missed = n.path !== undefined && n.misses > 0;
+              if (missed) {
+                ctx.beginPath();
+                ctx.arc(x, y, r + 3 / scale, 0, 2 * Math.PI);
+                ctx.lineWidth = 2 / scale;
+                ctx.strokeStyle = palette.miss;
+                ctx.stroke();
+              }
               // Canvas text is drawn, not parsed, so the path needs no escaping here (the hover label is HTML).
               const top = !!n.path && alwaysLabelled.has(n.path);
               const caption = codeNodeCaption(n, scale, { top, short: n.short });
-              if (caption) captions.current.push({ text: caption, x, y: y + r + 2 / scale, rank: (top ? 1e6 : 0) + n.misses * 1e3 + n.score });
+              if (caption) {
+                captions.current.push({
+                  text: missed ? `${caption} (${plural(n.misses, 'miss', 'misses')})` : caption, x, y, r: r + (missed ? 3 / scale : 0),
+                  rank: (missed ? 2e6 : 0) + (top ? 1e6 : 0) + n.misses * 1e3 + n.score, key: top || missed, must: missed,
+                });
+              }
             }}
             linkColor={() => palette.link}
             linkWidth={(l: CodeLink) => (l.type === 'NEAR' ? 0.3 : 0.6)}
@@ -308,7 +331,7 @@ export function CodeGraph({ projectKey }: { projectKey: string }) {
           </div>
         ) : (
           <p className="text-muted">
-            Click a file to open its module panel, or find one by path; hover one for its full path, or zoom in to see every file's name. Bigger files score higher as hotspots; red ones had misses. Arrows are imports, dashed ones tests; diamonds are misses and squares the approved lessons on those files.
+            Click a file to open its module panel, or find one by path; hover one for its full path, or zoom in to see every file's name. Bigger files score higher as hotspots; red ones with a red ring had misses, and are always named with how many. The twelve key files (misses, then hotspot score, then most connections) are named at every zoom. Arrows are imports, dashed ones tests; diamonds are misses and squares the approved lessons on those files.
           </p>
         )}
       </aside>

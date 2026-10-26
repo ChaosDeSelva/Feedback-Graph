@@ -59,7 +59,7 @@ export function ImportBundle({ onImported, clearAfterMs = 20_000 }: { onImported
         <input type="checkbox" aria-label="keep approved lessons approved" checked={keepApproved} onChange={(e) => setKeepApproved(e.target.checked)} />
         keep approved
       </label>
-      <label className={buttonClass('secondary', 'sm', `cursor-pointer focus-within:outline-2 focus-within:outline-focus ${busy ? 'opacity-60' : ''}`)}>
+      <label className={buttonClass('secondary', 'sm', `relative cursor-pointer focus-within:outline-2 focus-within:outline-focus ${busy ? 'opacity-60' : ''}`)}>
         <UploadIcon size={13} />
         {busy ? 'importing…' : 'Import bundle'}
         <input aria-label="import bundle file" type="file" accept=".json,application/json" className="sr-only" disabled={busy}

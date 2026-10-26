@@ -149,6 +149,11 @@ export function asActor<T extends Pick<ActivityStore, 'record'>>(a: T | undefine
   });
 }
 
+/**
+ * Choosing projects has one more way in, the owner's own on the host: `setup.sh --select` (INGEST_PROJECTS), which the
+ * app takes while no selection has been made, so a first run without the UI is not stuck.
+ */
 export const refusedVerb = (verb: OperatorVerb) => ({
-  error: `the operator token may not ${verb.replace(/_/g, ' ')} (${verb}): add ${verb} to OPERATOR_ALLOW in .env and restart, or do it in the Feedback Graph UI`,
+  error: `the operator token may not ${verb.replace(/_/g, ' ')} (${verb}): add ${verb} to OPERATOR_ALLOW in .env and restart, or do it in the Feedback Graph UI` +
+    (verb === 'select_projects' ? '; before any selection is made, ./scripts/setup.sh --select k1,k2 on the host chooses the first one' : ''),
 });

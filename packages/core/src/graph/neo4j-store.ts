@@ -1,5 +1,5 @@
 import type { Store } from '../store.ts';
-import { ActivityRepo } from './activity.ts';
+import { ActivityRepo, capStoredActivitySubjects } from './activity.ts';
 import { ChatRepo } from './chat.ts';
 import { CodeGraphRepo } from './codegraph.ts';
 import { DocsRepo } from './docs.ts';
@@ -37,6 +37,7 @@ export function neo4jStore(g: GraphRepo): Store {
     ensureSchema: async () => {
       await g.ensureSchema();
       await backfillSessionStats(g);
+      await capStoredActivitySubjects(g);
     },
     ping: () => g.ping(),
     close: () => g.close(),

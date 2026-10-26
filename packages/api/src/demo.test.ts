@@ -2,6 +2,7 @@ import { Hono } from 'hono';
 import type { ActivityInput, DemoMiss, LessonInput, SessionFile } from '@fb/core';
 import { describe, expect, test } from 'vitest';
 import { DEMO_CORPUS, DEMO_PROJECT, demoRoutes, removeDemo, seedDemo, type DemoDeps } from './demo.ts';
+import { runIn } from './operator.ts';
 
 const OP = 'o'.repeat(32);
 
@@ -15,7 +16,7 @@ function deps(over: Partial<DemoDeps> = {}) {
     knowledge: {
       upsertLesson: async (l) => { lessons.push(l); },
       saveDemoMiss: async (m) => { misses.push(m); return `miss:${m.id}`; },
-      removeDemo: async () => ({ lessons: 4, misses: 1, facts: 3 }),
+      removeDemo: async () => ({ lessons: 4, misses: 1, facts: 3, projectRemoved: false }),
     },
     facts: {
       listFacts: async () => [],
@@ -75,6 +76,49 @@ describe('seedDemo', () => {
     await expect(seedDemo({ project: '../etc', owner: true }, t.d)).rejects.toThrow(/project/);
   });
 
+  test("a store whose methods use `this` (the real ones) seeds the whole corpus: the miss and facts land and the seed is logged", async () => {
+    // The 0.6.2 crash: saveDemoMiss was called unbound, so a class-based store threw after the lessons were written.
+    const t = deps();
+    class Store {
+      misses: DemoMiss[] = [];
+      async upsertLesson(l: LessonInput) { t.lessons.push(l); }
+      async saveDemoMiss(m: DemoMiss) { this.misses.push(m); return `miss:${m.id}`; }
+      async removeDemo() { return { lessons: 0, misses: 0, facts: 0, projectRemoved: false }; }
+    }
+    const store = new Store();
+    const r = await seedDemo({}, { ...t.d, knowledge: store });
+    expect(store.misses).toHaveLength(1);
+    expect(r.misses).toBe(1);
+    expect(t.activity.map((a) => a.kind)).toEqual(['demo_seeded']);
+  });
+
+  test('a seed that fails part-way takes back what it wrote and says so: no half-seeded corpus, no seed logged', async () => {
+    const t = deps();
+    const removed: string[] = [];
+    const knowledge: DemoDeps['knowledge'] = {
+      upsertLesson: async (l) => { t.lessons.push(l); },
+      saveDemoMiss: async (m) => `miss:${m.id}`,
+      removeDemo: async (key) => { removed.push(key); return { lessons: 4, misses: 1, facts: 0, projectRemoved: false }; },
+    };
+    // The miss and the lessons are written; the facts fail.
+    const facts: DemoDeps['facts'] = { listFacts: async () => [], saveFileFacts: async () => { throw new Error('store down'); } };
+    await expect(seedDemo({}, { ...t.d, knowledge, facts })).rejects.toThrow(/demo seed failed.*store down.*taken back/s);
+    expect(t.lessons.length).toBe(DEMO_CORPUS.lessons.length);
+    expect(removed).toEqual([DEMO_PROJECT]);
+    expect(t.activity).toEqual([]);
+  });
+
+  test('in a labelled run the lessons and the miss carry the run, so fg cleanup --run takes them back too', async () => {
+    const t = deps();
+    await runIn({ id: 'run-7', sandbox: false }, () => seedDemo({}, t.d));
+    expect(t.lessons.every((l) => l.run?.id === 'run-7')).toBe(true);
+    expect(t.misses[0].run).toEqual({ id: 'run-7', sandbox: false });
+    const plain = deps();
+    await seedDemo({}, plain.d);
+    expect(plain.lessons.every((l) => l.run === undefined)).toBe(true);
+    expect(plain.misses[0].run).toBeUndefined();
+  });
+
   test('a store without the demo methods says so instead of half-seeding', async () => {
     const t = deps({ knowledge: { upsertLesson: async () => {} } });
     await expect(seedDemo({}, t.d)).rejects.toThrow(/demo/);
@@ -88,6 +132,13 @@ test('removeDemo removes what the seed wrote, says how much, and logs it', async
   expect(r.message).toMatch(/Removed 4 demo lessons, 1 miss and 3 facts from demo-shop/);
   expect(t.activity[0]).toMatchObject({ kind: 'demo_removed', projectKey: DEMO_PROJECT });
   await expect(removeDemo({ project: 'acme', owner: false }, t.d)).rejects.toThrow(/owner/);
+});
+
+test('removeDemo says when the project node the seed created went with it', async () => {
+  const t = deps({ knowledge: { upsertLesson: async () => {}, removeDemo: async () => ({ lessons: 4, misses: 1, facts: 3, projectRemoved: true }) } });
+  const r = await removeDemo({}, t.d);
+  expect(r.message).toMatch(/The project demo-shop itself, which the seed created and nothing else uses, is gone too/);
+  expect(t.activity[0].details).toMatchObject({ projectRemoved: true });
 });
 
 describe('routes', () => {
@@ -113,5 +164,12 @@ describe('routes', () => {
     expect((await app(t).request('/api/demo/seed', post('/api/demo/seed', {}))).status).toBe(403);
     expect((await app(t).request('/api/demo/seed', post('/api/demo/seed', { project: 'acme' }, { origin: 'http://localhost:8787' }))).status).toBe(200);
     expect((await app(t).request('/api/demo/remove', post('/api/demo/remove', {}, bearer))).status).toBe(200);
+  });
+
+  test('a seed that failed answers 500 with what happened (and that it was taken back), not a bare crash', async () => {
+    const t = deps({ knowledge: { upsertLesson: async () => {}, saveDemoMiss: async () => { throw new Error('store down'); }, removeDemo: async () => ({ lessons: 4, misses: 0, facts: 0, projectRemoved: false }) } });
+    const res = await app(t).request('/api/demo/seed', post('/api/demo/seed', {}, bearer));
+    expect(res.status).toBe(500);
+    expect(((await res.json()) as { error: string }).error).toMatch(/demo seed failed.*store down/s);
   });
 });

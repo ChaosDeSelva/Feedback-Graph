@@ -2,7 +2,7 @@ import neo4j from 'neo4j-driver';
 import { VERSION } from '../config.ts';
 import type { Cause, Lesson } from '../types.ts';
 import type { Hotspot } from '../codegraph.ts';
-import type { PortabilityStore } from '../store.ts';
+import { DEMO_SOURCE, type PortabilityStore } from '../store.ts';
 import { CodeGraphRepo } from './codegraph.ts';
 import type { GraphRepo } from './repo.ts';
 
@@ -61,13 +61,14 @@ export class PortabilityRepo implements PortabilityStore {
         `MATCH (l:Lesson)
          WHERE ($key IS NULL OR l.projectKey = $key OR (l.projectKey IS NULL AND l.originProjectKey = $key))
            AND ($keys IS NULL OR coalesce(l.projectKey, l.originProjectKey) IS NULL OR coalesce(l.projectKey, l.originProjectKey) IN $keys)
-           AND (NOT $approvedOnly OR l.status = 'approved') AND NOT coalesce(l.sandbox, false)
+           AND (NOT $approvedOnly OR l.status = 'approved') AND NOT coalesce(l.sandbox, false) AND coalesce(l.source, '') <> $demo
          RETURN l ORDER BY l.createdAt, l.id`,
-        { key, keys, approvedOnly: !!o.approvedOnly },
+        { key, keys, approvedOnly: !!o.approvedOnly, demo: DEMO_SOURCE },
       ),
       this.g.run(
         `MATCH (m:Miss)-[:EXPLAINS]->(f:Feedback)
          WHERE ($key IS NULL OR m.projectKey = $key) AND ($keys IS NULL OR m.projectKey IN $keys) AND NOT coalesce(m.sandbox, false)
+           AND NOT m.id STARTS WITH 'miss:demo:'
          OPTIONAL MATCH (ci:ContextItem)-[w:WOULD_HAVE_PREVENTED]->(m)
          WITH m, f, ci, w ORDER BY ci.ref, ci.id
          RETURN m, f.text AS feedbackText, f.createdAt AS ts,
@@ -77,8 +78,9 @@ export class PortabilityRepo implements PortabilityStore {
       ),
       this.g.run(
         `MATCH (x:Fact {current: true}) WHERE ($key IS NULL OR x.projectKey = $key) AND ($keys IS NULL OR x.projectKey IN $keys) AND x.docId IS NULL AND NOT coalesce(x.sandbox, false)
+           AND coalesce(x.source, '') <> $demo
          RETURN x ORDER BY x.projectKey, x.path, x.statement, x.id`,
-        { key, keys },
+        { key, keys, demo: DEMO_SOURCE },
       ),
       this.g.run(`MATCH (d:Doc) WHERE ($key IS NULL OR d.projectKey = $key) AND ($keys IS NULL OR d.projectKey IN $keys) AND NOT coalesce(d.sandbox, false) RETURN d ORDER BY d.projectKey, d.id`, { key, keys }),
     ]);

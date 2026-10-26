@@ -1,6 +1,7 @@
-import { shownProjects, type ActivityInput, type Lesson } from '@fb/core';
+import { extractJsonAnswer, shownProjects, type ActivityInput, type Lesson } from '@fb/core';
 import { describe, expect, test } from 'vitest';
 import { checkBeforeDone, getImpact, getModuleContext, getTaskContext, hashRepoFile, makeJudge, reportFeedback, resolveProject, searchGraph, taskFiles, trackedProject, type ContextDeps } from './context.ts';
+import { Admission } from './admission.ts';
 
 const roots = [{ host: '/Users/j/Vibe', container: '/vibe' }];
 const lesson = (id: string, title: string, over: Partial<Lesson> = {}): Lesson => ({
@@ -64,6 +65,36 @@ test('checkBeforeDone reports gaps and records the check', async () => {
   expect(r.markdown).toContain('Server-side search');
   expect(d.checks).toHaveLength(1);
   expect(d.checks[0]).toMatchObject({ projectKey: 'demo', task: 'order search', gapLessonIds: ['l1'], checkedLessonIds: ['l1'] });
+});
+
+test('checkBeforeDone behind other checks says how many it waited behind, and still judges', async () => {
+  const judgeQueue = new Admission({ concurrency: 1, timeoutMs: 5000 });
+  let release!: () => void;
+  const busy = judgeQueue.run(() => new Promise<void>((r) => { release = r; }));
+  const d = deps({ judgeQueue });
+  const pending = checkBeforeDone({ project: 'demo', task: 'order search', summary: 'added search UI' }, d);
+  setTimeout(() => release(), 20);
+  const r = await pending;
+  await busy;
+  expect(r.gaps.map((g) => g.lessonId)).toEqual(['l1']);
+  expect(r.markdown).toMatch(/Queued behind 1 check for \d+(\.\d)? s before the judge read this one/);
+  expect(d.checks).toHaveLength(1);
+});
+
+test('checkBeforeDone answers at once, deterministically, when the judge cannot take it in time: nothing judged, nothing counted', async () => {
+  const judgeQueue = new Admission({ concurrency: 1, timeoutMs: 30 });
+  let release!: () => void;
+  const busy = judgeQueue.run(() => new Promise<void>((r) => { release = r; }));
+  const d = deps({ judgeQueue });
+  const r = await checkBeforeDone({ project: 'demo', task: 'order search', summary: 'added search UI' }, d);
+  release();
+  await busy;
+  expect(r.gaps).toEqual([]);
+  expect(r.cannotTell?.map((x) => x.lessonId)).toEqual(['l1']);
+  expect(r.markdown).toMatch(/^# Not judged: the judge did not take this check within 0 s \(queued behind 1 check\)/);
+  expect(r.markdown).toContain('Server-side search');
+  // Not a pass and not a gap: the catch rate does not count it.
+  expect(d.checks).toHaveLength(0);
 });
 
 test('checkBeforeDone with no relevant lessons and no close past miss passes without calling the judge', async () => {
@@ -511,7 +542,7 @@ test('a diff over the judge\'s budget keeps the files the judged lessons (or mis
   const filler = Array.from({ length: 8 }, (_, i) => file(`web/page${i}.tsx`)).join('');
   const diff = filler + file('src/db/pool.ts', 3000);
   const seen: string[] = [];
-  const pooled = lesson('l-pool', 'Release pooled clients', { rule: 'Release the client in finally.', paths: ['src/db/**'] });
+  const pooled = lesson('l-pool', 'Release pooled clients', { rule: 'Release the pool client in finally.', paths: ['src/db/**'] });
   const d = deps({
     k: { ...deps().k, searchLessons: async () => [{ lesson: pooled, score: 0.8 }] },
     judge: async (w) => { seen.push(w.diff ?? ''); return [{ lessonId: 'l-pool', status: 'addressed', applies: true, why: 'released in finally' }]; },
@@ -628,7 +659,7 @@ describe('linked projects', () => {
           searchLessons: async (q) => {
             searched.push({ what: 'lessons', projectKey: q.projectKey });
             return q.projectKey === 'api'
-              ? [{ lesson: lesson('la', 'Version every endpoint', { projectKey: 'api' }), score: 0.8 }, { lesson: lesson('lg', 'A global one', { projectKey: null, scope: 'global' }), score: 0.7 }]
+              ? [{ lesson: lesson('la', 'Version every endpoint', { projectKey: 'api', appliesWhen: 'changing an api endpoint' }), score: 0.8 }, { lesson: lesson('lg', 'A global one', { projectKey: null, scope: 'global' }), score: 0.7 }]
               : [{ lesson: lesson('l1', 'Server-side search'), score: 0.91 }];
           },
           relatedMisses: async (q) => {
@@ -669,14 +700,14 @@ describe('linked projects', () => {
   test('context served logs which linked projects were used', async () => {
     const logged: ActivityInput[] = [];
     const t = linkedDeps([link('api', 'demo', 'confirmed')], { activity: { record: async (a) => { logged.push(a); } } });
-    await getTaskContext({ project: 'demo', task: 't' }, t.d);
+    await getTaskContext({ project: 'demo', task: 'show orders from the api' }, t.d);
     expect(logged[0].details).toMatchObject({ linked: [{ project: 'api', lessons: ['la'], misses: ['ma'], facts: ['fa'] }] });
   });
 
   test('checkBeforeDone also checks the work against the linked projects\' lessons', async () => {
     const judged: string[][] = [];
     const t = linkedDeps([link('api', 'demo', 'confirmed')], { judge: async (_w, ls) => { judged.push(ls.map((h) => h.lesson.id)); return ls.map((h) => ({ lessonId: h.lesson.id, status: 'addressed' as const, why: 'ok' })); } });
-    await checkBeforeDone({ project: 'demo', task: 'orders', summary: 'built it' }, t.d);
+    await checkBeforeDone({ project: 'demo', task: 'orders', summary: 'built it on the api' }, t.d);
     expect(judged[0]).toEqual(['l1', 'la']);
   });
 });
@@ -1071,7 +1102,7 @@ index 3b18e51..a9c4f2d 100644
     const r = await checkBeforeDone({ project: 'demo', task: 't', summary: 's', diff: DIFF + big }, d);
     expect(seen).toContain('exportOrders');
     expect(seen).not.toContain('v2999');
-    expect(r.markdown).toMatch(/diff cut at [\d.]+ KB, files not shown: src\/big\.ts/);
+    expect(r.markdown).toMatch(/diff cut to fit \([\d.]+ of [\d.]+ KB shown\), files not shown: src\/big\.ts/);
   });
 
   test('no diff and nothing to read it from: judged from the summary, and the answer says so', async () => {
@@ -1098,5 +1129,130 @@ index 3b18e51..a9c4f2d 100644
     expect(JSON.stringify(schema)).toContain('cannot_tell');
     expect(system).toMatch(/evidence/i);
     expect(system).toMatch(/copy/i);
+  });
+
+  // What gemma4 answers when it flags: the verdict and the line in its reason, no evidence field.
+  const gemmaCatch = { lessonId: 'L1', status: 'not_addressed', applies: true, why: "exportOrders still calls `db.raw().list('orders')` instead of db.scoped" };
+  const gemmaPass = { lessonId: 'L2', status: 'addressed', applies: true, why: 'listOrders paginates', evidence: ["paginate(db.scoped(req.auth.orgId).list('orders'), req.query)"] };
+
+  test('the judge schema requires evidence on every verdict', async () => {
+    let schema: any;
+    const judge = makeJudge({ id: 'f', agentic: false, json: async (t) => { schema = t.schema; return { verdicts: [] }; } });
+    await judge({ task: 't', summary: 's', diff: DIFF }, lessons);
+    expect(schema.properties.verdicts.items.required).toContain('evidence');
+  });
+
+  test('a catch whose line is quoted in its reason (no evidence field, as gemma4 answers) still cites the diff and is a gap', async () => {
+    let calls = 0;
+    const judge = makeJudge({ id: 'ollama:gemma4', agentic: false, json: async () => { calls++; return { verdicts: [gemmaCatch, gemmaPass] }; } });
+    const r = await checkBeforeDone({ project: 'demo', task: 'orders export', summary: 'added export', diff: DIFF }, withLessons({ judge }));
+    expect(calls).toBe(1);
+    expect(r.gaps.map((g) => g.lessonId)).toEqual(['l1']);
+    expect(r.gaps[0].evidence?.[0]).toMatchObject({ path: 'src/routes/orders.ts', line: "+  sendJson(res, 200, db.raw().list('orders'));" });
+    expect(r.markdown).not.toMatch(/cannot tell/i);
+  });
+
+  test('a catch with no evidence anywhere is asked once more, naming the missing field; the second answer is used', async () => {
+    const systems: string[] = [];
+    const answers = [
+      { verdicts: [{ ...gemmaCatch, why: 'exportOrders is not scoped' }, gemmaPass] },
+      { verdicts: [{ ...gemmaCatch, why: 'exportOrders is not scoped', evidence: ["+  sendJson(res, 200, db.raw().list('orders'));"] }, gemmaPass] },
+    ];
+    const judge = makeJudge({ id: 'ollama:gemma4', agentic: false, json: async (t) => { systems.push(t.system); return answers[systems.length - 1]; } });
+    const r = await checkBeforeDone({ project: 'demo', task: 'orders export', summary: 'added export', diff: DIFF }, withLessons({ judge }));
+    expect(systems).toHaveLength(2);
+    expect(systems[1]).toMatch(/evidence/);
+    expect(systems[1]).toMatch(/L1/);
+    expect(r.gaps.map((g) => g.lessonId)).toEqual(['l1']);
+  });
+
+  test('a second answer still without evidence is not an error: that verdict is cannot tell', async () => {
+    let calls = 0;
+    const judge = makeJudge({ id: 'ollama:gemma4', agentic: false, json: async () => { calls++; return { verdicts: [{ ...gemmaCatch, why: 'exportOrders is not scoped' }, gemmaPass] }; } });
+    const r = await checkBeforeDone({ project: 'demo', task: 'orders export', summary: 'added export', diff: DIFF }, withLessons({ judge }));
+    expect(calls).toBe(2);
+    expect(r.cannotTell?.map((c) => c.lessonId)).toEqual(['l1']);
+  });
+
+  test('a first answer that is not JSON, then one without evidence: the second is the last and is taken, the call is cannot tell', async () => {
+    const answers = ['Let me think about the lessons first.', JSON.stringify({ verdicts: [{ ...gemmaCatch, why: 'exportOrders is not scoped' }, gemmaPass] })];
+    let calls = 0;
+    const judge = makeJudge({ id: 'ollama:gemma4', agentic: false, json: async () => extractJsonAnswer(answers[calls++]) });
+    const r = await checkBeforeDone({ project: 'demo', task: 'orders export', summary: 'added export', diff: DIFF }, withLessons({ judge }));
+    expect(calls).toBe(2);
+    expect(r.gaps).toEqual([]);
+    expect(r.cannotTell?.map((c) => c.lessonId)).toEqual(['l1']);
+  });
+
+  test('a judge that fails is never an error to the agent and never a pass: "not judged" with the reason and the lessons to check by hand', async () => {
+    const recorded: ActivityInput[] = [];
+    const d = withLessons({
+      judge: async () => { throw new Error('ollama 500: model crashed'); },
+      activity: { record: async (a) => { recorded.push(a); } },
+    });
+    const r = await checkBeforeDone({ project: 'demo', task: 'orders export', summary: 'added export', diff: DIFF }, d);
+    expect(r.markdown).toMatch(/^# Not judged: the judge failed \(ollama 500: model crashed\)/);
+    expect(r.markdown).toContain('Tenant scoping');
+    expect(r.markdown).toContain('Paginate lists');
+    expect(r.markdown).not.toMatch(/none looks unaddressed/);
+    expect(r.gaps).toEqual([]);
+    expect(r.cannotTell?.map((c) => c.lessonId)).toEqual(['l1', 'l2']);
+    expect(d.checks).toHaveLength(0);
+    const entry = recorded.find((a) => a.kind === 'predone_check')!;
+    expect(entry.subject).toMatch(/not judged, the judge failed/);
+    // The same {id} shape as every other check, so session evidence reads what was served.
+    expect(entry.details?.lessons).toEqual([{ id: 'l1', title: 'Tenant scoping' }, { id: 'l2', title: 'Paginate lists' }]);
+  });
+
+  test('a slow judge model: the check answers "not judged" at CHECK_WAIT_SECONDS, the model call is aborted and its slot freed', async () => {
+    const judgeQueue = new Admission({ concurrency: 1, timeoutMs: 60 });
+    const seen: { timeoutMs?: number; aborted: () => boolean }[] = [];
+    // An Ollama that is still generating: it answers only when its request is cancelled.
+    const slow = makeJudge({ id: 'ollama:gemma4', agentic: false, json: (t) => new Promise((_r, reject) => {
+      seen.push({ timeoutMs: t.timeoutMs, aborted: () => !!t.signal?.aborted });
+      t.signal?.addEventListener('abort', () => reject(t.signal!.reason));
+    }) });
+    const d = withLessons({ judge: slow, judgeQueue });
+    const t = Date.now();
+    const r = await checkBeforeDone({ project: 'demo', task: 'orders export', summary: 'added export', diff: DIFF }, d);
+    expect(Date.now() - t).toBeLessThan(1000);
+    expect(r.markdown).toMatch(/^# Not judged: the judge did not answer within 0 s/);
+    expect(d.checks).toHaveLength(0);
+    // One attempt, given the check's whole budget (not 180 s), and cancelled when the check gave up.
+    expect(seen).toHaveLength(1);
+    expect(seen[0].timeoutMs).toBeLessThanOrEqual(60);
+    expect(seen[0].aborted()).toBe(true);
+    await new Promise((res) => setTimeout(res, 5));
+    expect(judgeQueue.running).toBe(0);
+  });
+
+  test('the judge fits both attempts in the check\'s budget: each is given the time left, the retry only when time remains', async () => {
+    const timeouts: (number | undefined)[] = [];
+    const judge = makeJudge({ id: 'f', agentic: false, json: async (t) => { timeouts.push(t.timeoutMs); return { verdicts: [{ ...gemmaCatch, why: 'not scoped' }, gemmaPass] }; } });
+    const out = await judge({ task: 't', summary: 's', diff: DIFF }, lessons, { deadline: Date.now() + 120_000 });
+    expect(timeouts).toHaveLength(2);
+    expect(timeouts[0]).toBeLessThanOrEqual(120_000);
+    expect(timeouts[0]).toBeGreaterThan(110_000);
+    expect(out.map((v) => v.lessonId)).toEqual(['l1', 'l2']);
+    timeouts.length = 0;
+    // Too little time left for a second ask: the first answer is the last, taken as it is (its unbacked call is
+    // cannot tell in judgeWork).
+    await judge({ task: 't', summary: 's', diff: DIFF }, lessons, { deadline: Date.now() + 3000 });
+    expect(timeouts).toHaveLength(1);
+  });
+
+  test('the answer names the judge model', async () => {
+    const d = withLessons({ judgeId: 'ollama:gemma4', judge: async () => [{ lessonId: 'l1', status: 'not_addressed', applies: true, why: 'raw', evidence: ["db.raw().list('orders')"] }] });
+    const r = await checkBeforeDone({ project: 'demo', task: 't', summary: 's', diff: DIFF }, d);
+    expect(r.markdown).toMatch(/Judged by ollama:gemma4/);
+  });
+
+  test('a cut diff is always said, even when the judge found that no lesson applies', async () => {
+    const extra = (name: string) => `diff --git a/src/${name}.ts b/src/${name}.ts\n--- a/src/${name}.ts\n+++ b/src/${name}.ts\n@@ -1 +1,700 @@\n${Array.from({ length: 700 }, (_, i) => `+export const ${name}${i} = ${i}; // ${'x'.repeat(10)}`).join('\n')}\n`;
+    const d = withLessons({ judge: async () => [{ lessonId: 'l1', status: 'not_applicable', applies: false, why: 'another feature' }, { lessonId: 'l2', status: 'not_applicable', applies: false, why: 'another feature' }] });
+    const r = await checkBeforeDone({ project: 'demo', task: 't', summary: 's', diff: DIFF + extra('a') + extra('b') + extra('c') }, d);
+    expect(r.markdown).toMatch(/None of the \d+ lessons? checked applies/);
+    expect(r.markdown).toMatch(/files not shown: .*src\/c\.ts/);
+    expect(r.markdown).toMatch(/[\d.]+ of [\d.]+ KB shown/);
   });
 });

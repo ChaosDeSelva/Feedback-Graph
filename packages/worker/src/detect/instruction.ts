@@ -107,12 +107,17 @@ const codeTalk = (text: string) => CODE_TALK.some((re) => re.test(splitPasted(te
 
 /**
  * A process miss: about the git process itself (branches, pushing, merging, pull request state, commit hygiene), not
- * the code. The feedback and its lesson are both about git, it is not a review comment on a file, the lesson names no
- * file (`paths`, when known, and none in its rule) and the feedback names no file or code behaviour. It is tied to no
- * file. The post-mortem applies it to new misses and the worker to the misses stored before it (postmortem/subjects.ts).
+ * the code. Either the feedback is wholly an instruction about git ("keep it on its own branch, don't push a PR yet":
+ * gitInstruction, with no complaint about the work), whatever lesson was written from it and whatever files the
+ * session edited; or the feedback and its lesson are both about git, the lesson names no file (`paths`, when known,
+ * and none in its rule) and the feedback names no file or code behaviour. Never a review comment on a file. It is tied
+ * to no file. The post-mortem applies it to new misses and the worker to the misses stored before it
+ * (postmortem/subjects.ts).
  */
 export function isProcessMiss(o: { feedbackText: string; rule: string | null; commentPath: string | null; paths?: string[] }): boolean {
-  return !o.commentPath && !o.paths?.length && aboutGit(o.feedbackText) && !!o.rule && aboutGit(o.rule) && !codeTalk(o.feedbackText) && !codeTalk(o.rule);
+  if (o.commentPath) return false;
+  if (gitInstruction(o.feedbackText, { before: [], after: [] }).instruction) return true;
+  return !o.paths?.length && aboutGit(o.feedbackText) && !!o.rule && aboutGit(o.rule) && !codeTalk(o.feedbackText) && !codeTalk(o.rule);
 }
 
 /**

@@ -1,6 +1,6 @@
 import { expect, test } from 'vitest';
 import type { FactHit, StoredFact } from './graph/facts.ts';
-import { factOrigin, isNonMiss, pathAffinity, rankFacts, rankMisses, relevanceBand, serviceDirs, servicesInTask, SIMILARITY_FLOOR } from './relevance.ts';
+import { calibrateRelevance, EVERYDAY_SHARE, factOrigin, isNonMiss, pathAffinity, rankFacts, rankMisses, relevanceBand, serviceDirs, servicesInTask, SIMILARITY_FLOOR } from './relevance.ts';
 
 const hit = (statement: string, score: number, relevance: number | null): FactHit => ({
   fact: { id: statement, statement, relevance, relevanceBy: relevance === null ? null : 'model' } as StoredFact,
@@ -110,4 +110,43 @@ test('with no files named, the services the task names rank their facts and miss
   expect(rankMisses(misses, 4, [], ['src/webapp'])[0].missId).toMatch(/webapp/);
   // Named files win over words: the services are only a guess.
   expect(rankMisses(misses, 4, ['src/context-graph/internal/x.go'], ['src/webapp'])[0].missId).toMatch(/context-graph/);
+});
+
+test('everyday is the minority of a realistic set: a generous model\'s scores are calibrated by kind and by share', () => {
+  // As a model scored one shard in 0.6.2: 11 of 16 at 0.8 or more ("62% of facts are everyday").
+  const facts = [
+    { kind: 'convention', path: '.', statement: 'All database access goes through the repository layer in src/db; route handlers never query directly.', relevance: 0.95 },
+    { kind: 'invariant', path: 'src/api/auth.ts', statement: 'Every API route calls requireOrg() so queries are scoped to the caller\'s organisation.', relevance: 0.95 },
+    { kind: 'architecture', path: '.', statement: 'The webapp talks to the data pipeline only through the events topic, never its database.', relevance: 0.9 },
+    { kind: 'api', path: 'src/api/orders.ts', statement: 'createOrder returns 409 when the cart changed since checkout started.', relevance: 0.85 },
+    { kind: 'gotcha', path: 'src/lib/date.ts', statement: 'parseDate treats bare dates as UTC, not local time.', relevance: 0.8 },
+    { kind: 'config', path: 'src/config.ts', statement: 'FEATURE_FLAGS_URL defaults to the staging flag service.', relevance: 0.8 },
+    { kind: 'data_model', path: 'src/db/schema.ts', statement: 'Orders hold money as integer cents, never floats.', relevance: 0.9 },
+    { kind: 'convention', path: 'src/ui/Button.tsx', statement: 'Buttons take the variant prop, not className overrides.', relevance: 0.85 },
+    { kind: 'api', path: 'src/api/users.ts', statement: 'GET /users pages with a cursor, not offsets.', relevance: 0.8 },
+    { kind: 'security', path: 'src/api/upload.ts', statement: 'Uploaded file names go through safeName before storage.', relevance: 0.85 },
+    { kind: 'gotcha', path: 'src/jobs/retry.ts', statement: 'Retries reuse the request id, so handlers must be idempotent.', relevance: 0.6 },
+    { kind: 'command', path: 'Makefile', statement: 'make seed loads demo data.', relevance: 0.5 },
+    { kind: 'config', path: 'docker-compose.yml', statement: 'Postgres listens on 5433 locally.', relevance: 0.3 },
+    { kind: 'api', path: 'src/api/search.ts', statement: 'search() caps results at 50.', relevance: 0.5 },
+    { kind: 'convention', path: 'src/lib/log.ts', statement: 'Use log.child per request.', relevance: 0.7 },
+    { kind: 'architecture', path: 'src/worker/main.ts', statement: 'The worker polls for jobs every 5 seconds.', relevance: 0.8 },
+  ];
+  const share = (xs: { relevance?: number | null }[]) => xs.filter((f) => relevanceBand(f.relevance ?? null) === 'everyday').length / xs.length;
+  expect(share(facts)).toBeGreaterThan(0.6);
+  const out = calibrateRelevance(facts);
+  expect(share(out)).toBeLessThanOrEqual(EVERYDAY_SHARE);
+  expect(share(out)).toBeLessThan(0.5);
+  // What every change needs stays everyday: the layering rule, the org scoping, the module boundary, money as cents.
+  expect(out.filter((f) => relevanceBand(f.relevance) === 'everyday').map((f) => f.statement.slice(0, 20))).toEqual([
+    'All database access ', 'Every API route call', 'The webapp talks to ', 'Orders hold money as',
+  ]);
+  // One endpoint's behaviour is needed for some changes, not most: "sometimes", never dropped to rare.
+  expect(relevanceBand(out.find((f) => f.statement.startsWith('createOrder'))!.relevance)).toBe('sometimes');
+  // Facts under everyday are left as they were, and calibrating again changes nothing.
+  expect(out.filter((_, i) => facts[i].relevance < 0.8).map((f) => f.relevance)).toEqual(facts.filter((f) => f.relevance < 0.8).map((f) => f.relevance));
+  expect(calibrateRelevance(out)).toEqual(out);
+  // Unscored facts stay unscored; a small set keeps its one everyday fact.
+  expect(calibrateRelevance([{ kind: 'api', path: 'a.ts', relevance: null }])).toEqual([{ kind: 'api', path: 'a.ts', relevance: null }]);
+  expect(calibrateRelevance([{ kind: 'invariant', path: '.', relevance: 0.9 }, { kind: 'api', path: 'a.ts', relevance: 0.5 }]).map((f) => f.relevance)).toEqual([0.9, 0.5]);
 });

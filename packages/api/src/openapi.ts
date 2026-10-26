@@ -113,7 +113,7 @@ const SCHEMAS: Record<string, JsonSchema> = {
     checks: nullable(arrayOf(ref('LessonCheck'))), decisionNote: nullable(str),
     proposedAs: nullable(obj({ title: str, rule: str, appliesWhen: str, scope: str, paths: arrayOf(str) }, ['title', 'rule', 'appliesWhen', 'scope', 'paths'], 'What the post-mortem proposed, kept when the owner first edited it')),
   }, ['id', 'projectKey', 'title', 'rule', 'appliesWhen', 'scope', 'paths', 'status', 'source', 'cause', 'missId', 'createdAt', 'decidedAt']),
-  LessonQuality: obj({ days: int, asWritten: int, edited: int, rejected: int, decided: int }),
+  LessonQuality: obj({ days: int, asWritten: int, edited: int, rejected: int, decided: int, byOperator: int }),
   LessonQualityReport: obj({
     windows: arrayOf(ref('LessonQuality')),
     projects: { type: 'object', additionalProperties: arrayOf(ref('LessonQuality')), description: 'The same windows, by the project each lesson was learned in' },
@@ -195,7 +195,8 @@ const CLEANUP_PLAN = obj({
   run: str, dryRun: bool, sandbox: bool, remove: PER_KIND,
   kept: arrayOf(obj({ kind: str, id: str, why: str })),
   changed: arrayOf(obj({ kind: str, subject: str, targets: arrayOf(str), ts: str })),
-  entries: int,
+  entries: { type: 'integer', description: "The run's Activity entries: a real cleanup removes them (its run_cleaned entry is not the run's)" },
+  entriesCapped: { type: 'boolean', description: 'More entries than a plan reads: entries is a lower bound' },
 });
 const RESULTS = (item: JsonSchema) => obj({ results: arrayOf(item) });
 
@@ -224,7 +225,7 @@ const routes = (a = appSchemas): Record<string, Partial<Record<Method, Route>>> 
   },
   '/api/agent/project': { GET: { tag: 'system', summary: 'Whether a folder (cwd) is a selected project (for the plugin hooks)', query: CwdQuery, response: 'the tracked project, or why not' } },
 
-  '/api/candidates': { GET: { tag: 'inbox', summary: 'Inbox items of the shown projects', query: a.ListQuery, response: 'Candidate[]' } },
+  '/api/candidates': { GET: { tag: 'inbox', summary: 'Inbox items of the shown projects, a page at a time (X-Next-Offset); long texts cut to 500 characters and no diff hunk (the item itself has them)', query: a.ListQuery, response: 'Candidate[]' } },
   '/api/candidates/{id}': { GET: { tag: 'inbox', summary: 'One Inbox item with its turn and surrounding conversation', response: 'CandidateDetail; 404 when missing or not shown' } },
   '/api/candidates/{id}/decision': { POST: { tag: 'inbox', summary: 'Confirm or reject one Inbox item', body: a.Decision, response: 'no content', status: 204 } },
   '/api/candidates/decisions': { POST: { tag: 'inbox', summary: 'Many Inbox decisions in one call; one not found does not stop the rest', body: a.Decisions, response: '{ results: [{ id, ok, status? | error? }] }' } },
@@ -254,9 +255,12 @@ const routes = (a = appSchemas): Record<string, Partial<Record<Method, Route>>> 
   '/api/projects/{key}/pin': { PUT: { tag: 'projects', summary: 'Pin or unpin a project', body: a.PinRequest, response: 'no content', status: 204 } },
   '/api/projects/{key}/docs': {
     GET: { tag: 'docs', summary: 'A project\'s documents, newest first, a page at a time (limit, default 100; X-Next-Cursor names the next page: send it as cursor)', query: a.DocsQuery, response: 'Doc[]' },
-    POST: { tag: 'docs', summary: 'Upload a text document or an image', body: a.DocUpload, response: '{ id, chunks }', status: 201 },
+    POST: { tag: 'docs', summary: 'Upload a text document or an image; one of more than 64 chunks answers 202 { id, chunks, pending: true } and is stored in the background (GET /api/docs/{id} says pending or failed with why; a failure is also logged in Activity)', body: a.DocUpload, response: '{ id, chunks }', status: 201 },
   },
-  '/api/docs/{id}': { DELETE: { tag: 'docs', summary: 'Remove a document', response: 'no content', status: 204 } },
+  '/api/docs/{id}': {
+    GET: { tag: 'docs', summary: 'One document, with embed { status: pending | failed, error?, chunks } while a large upload of it is embedded in the background (or failed to be); one not stored yet is found while it is pending or failed', response: 'Doc' },
+    DELETE: { tag: 'docs', summary: 'Remove a document', response: 'no content', status: 204 },
+  },
   '/api/docs/{id}/image': { GET: { tag: 'docs', summary: 'An uploaded image', response: 'the image bytes', type: 'image/*' } },
   '/api/docs/{id}/reread': { POST: { tag: 'docs', summary: 'Read a document whose reading failed again', response: 'no content', status: 204 } },
   '/api/projects/{key}/links': { GET: { tag: 'links', summary: 'A project\'s links to other shown projects', response: 'ProjectLink[]' } },
@@ -355,7 +359,7 @@ const SCHEMA_OF: Record<string, JsonSchema> = {
     served: arrayOf(loose('Context served to the session (when the agent passed its session_id), with the lessons it named')),
   }, ['session', 'turns', 'files', 'flags', 'inbox', 'served']),
   'GET /api/runs/{id}': CLEANUP_PLAN,
-  'DELETE /api/runs/{id}': { allOf: [CLEANUP_PLAN, obj({ removed: loose('How many of each kind went (on a real run, not a dry run)') }, [])] },
+  'DELETE /api/runs/{id}': { allOf: [CLEANUP_PLAN, obj({ removed: loose('How many of each kind went (on a real run, not a dry run)'), entriesRemoved: int }, [])] },
 };
 
 /** The 2xx body's schema: the route's own, else the type `response` starts with (`Lesson`, `Candidate[]`). */

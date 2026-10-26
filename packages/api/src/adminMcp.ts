@@ -290,7 +290,7 @@ function buildServer(call: Call, sleep: (ms: number) => Promise<void>) {
     force: z.boolean().optional(),
   }, write({ idempotent: true, openWorld: true }), async (a) => answer(await call('POST', '/api/cloud/sync', a.force === undefined ? {} : { force: a.force })));
 
-  reg('run_cleanup', 'After a test run (requests labelled x-fg-run): remove exactly what that run wrote (its reports with their post-mortems, misses and lessons, pre-done checks, facts, uploads, links, conversations). A dry run unless apply is true: it lists per kind what would go, what stays because someone outside the run touched it since (a lesson the owner approved), and what the run changed that is not its own (never undone). Activity entries stay.', {
+  reg('run_cleanup', 'After a test run (requests labelled x-fg-run): remove exactly what that run wrote (its reports with their post-mortems, misses and lessons, pre-done checks, facts, uploads, links, conversations). A dry run unless apply is true: it lists per kind what would go, what stays because someone outside the run touched it since (a lesson the owner approved), and what the run changed that is not its own (never undone). Its Activity entries go too with apply; the run_cleaned entry records the cleanup. Your own runs (same operator name) and runs an agent without a token opened.', {
     run: z.string().min(1).max(MAX.run).describe('The run id the requests were labelled with'),
     apply: z.boolean().optional().describe('Default false: only say what would go'),
   }, write({ destructive: true, idempotent: true }), async (a) => answer(await call('DELETE', `/api/runs/${enc(a.run)}`, { dryRun: !a.apply })));

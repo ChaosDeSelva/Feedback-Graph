@@ -1,5 +1,6 @@
 import { removedCounts, runItems, runRemoval, type RunItem, type RunItemKind, type RunOwner, type RunPrincipal, type RunRow, type RunsStore } from '@fb/core';
 import { iso, tx, type Db } from './db.ts';
+import { sandboxPresence } from './vector.ts';
 
 /** Each kind's records with a run id, as RunRow columns. A document's facts go with it: only facts written on their own. */
 const ITEMS = `
@@ -26,7 +27,8 @@ export class PgRunsStore implements RunsStore {
 
   async remove(run: string, keep: string[]): Promise<Record<RunItemKind, number>> {
     const ids = runRemoval(await this.items(run), keep);
-    return tx(this.db, async (c) => {
+    // The run's sandbox records may have been the last ones: the searches may skip the run filter again.
+    const removed = await tx(this.db, async (c) => {
       // Each only while it still carries the run's id (an upload the owner replaced since is not the run's any more).
       const del = async (sql: string, list: string[]) => (list.length ? ((await c.query(sql, [run, list])).rowCount ?? 0) : 0);
       const lesson = await del('DELETE FROM lessons WHERE run = $1 AND id = ANY($2::text[])', ids.lesson);
@@ -54,16 +56,21 @@ export class PgRunsStore implements RunsStore {
       const chat = await del('DELETE FROM chat_conversations WHERE run = $1 AND id = ANY($2::text[])', ids.chat);
       return removedCounts({ feedback: reports.length, lesson, miss, predone_check: predone, fact, doc, link, chat });
     });
+    sandboxPresence(this.db).recheck();
+    return removed;
   }
 
-  async claim(run: string, principal: RunPrincipal): Promise<RunOwner> {
+  async claim(run: string, principal: RunPrincipal, actor: string | null = null): Promise<RunOwner> {
     // Two statements: a claim that lost a race waits on the winner's row, and only a fresh snapshot then sees it.
-    await this.db.pool.query('INSERT INTO run_owners (run, principal, first_seen) VALUES ($1, $2, $3) ON CONFLICT (run) DO NOTHING', [run, principal, new Date()]);
+    await this.db.pool.query(
+      'INSERT INTO run_owners (run, principal, actor, first_seen) VALUES ($1, $2, $3, $4) ON CONFLICT (run) DO NOTHING',
+      [run, principal, principal === 'operator' ? actor : null, new Date()],
+    );
     return (await this.owner(run))!;
   }
 
   async owner(run: string): Promise<RunOwner | null> {
-    const { rows } = await this.db.pool.query('SELECT run, principal, first_seen FROM run_owners WHERE run = $1', [run]);
-    return rows[0] ? { run: rows[0].run, principal: rows[0].principal, firstSeen: iso(rows[0].first_seen)! } : null;
+    const { rows } = await this.db.pool.query('SELECT run, principal, actor, first_seen FROM run_owners WHERE run = $1', [run]);
+    return rows[0] ? { run: rows[0].run, principal: rows[0].principal, actor: rows[0].actor ?? null, firstSeen: iso(rows[0].first_seen)! } : null;
   }
 }

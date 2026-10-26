@@ -435,6 +435,15 @@ describeStores('FactsStore', (h) => {
     expect(await probe.factVersions('cites AGENTS.md')).toEqual([{ current: false, closed: true }]);
     // A newer rule lists them all again.
     expect(await f.factsToRecheck({ projectKey: 'demo', version: 'check-v3', limit: 10 })).toHaveLength(3);
+    // A rule may also reword a kept fact in place (a dependency list summarized), with its new embedding.
+    const old = now['older, never checked'];
+    await f.applyFactChecks('check-v3', [{ id: old.id, keep: true, lines: '1-5', evidence: 'line', statement: 'reworded', embedding: vec(5) }, { id: now['lines were wrong'].id, keep: true, lines: null, evidence: 'file' }]);
+    const after = Object.fromEntries((await f.listFacts({ projectKey: 'demo' })).map((x) => [x.statement, x]));
+    expect(after['reworded']).toMatchObject({ id: old.id, createdAt: old.createdAt, lines: '1-5', checkVersion: 'check-v3' });
+    expect(after['lines were wrong']).toBeDefined();
+    expect(after['older, never checked']).toBeUndefined();
+    const [hit] = await f.searchFacts({ embedding: vec(5), projectKey: 'demo', k: 1 });
+    expect(hit.fact.id).toBe(old.id);
   });
 
   test('files asked for a scan queue in request order, once each, until a scan clears them', async () => {

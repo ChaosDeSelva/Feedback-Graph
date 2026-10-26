@@ -39,7 +39,7 @@ function buildServer(ctx: ContextDeps, client: string | undefined) {
         task: z.string().max(MAX.task).describe('What you are about to build or change, in a sentence or two'),
         files: z.array(z.string().max(MAX.path)).max(50).optional().describe('Files you expect to read or change (repo-relative, or absolute inside the project)'),
         brief: z.boolean().optional().describe('Only lessons, misses on the named files, their importers and tests, and PR discussions (about 1,500 characters)'),
-        session_id: z.string().max(MAX.key).optional().describe('Your session id, if you know it: facts refreshed since it started are marked as your own change'),
+        session_id: z.string().max(MAX.key).optional().describe('Your session id, if you know it: facts about files this session edited, refreshed since it started, are marked as your own change'),
       },
     },
     async ({ session_id, ...a }) => text((await getTaskContext({ ...a, sessionId: session_id, client }, ctx)).markdown),

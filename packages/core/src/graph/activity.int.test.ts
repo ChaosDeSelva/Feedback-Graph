@@ -48,6 +48,14 @@ describeStores('ActivityStore', (h) => {
     expect((await a.list({}))[1].details).toEqual({ log: 'x'.repeat(5000) });
   });
 
+  test('a subject over 500 characters is cut at write; details say how long it was', async () => {
+    await a.record({ kind: 'doc_added', actor: 'agent', projectKey: 'shop', subject: `reported: ${'x'.repeat(1024 * 1024)}`, why: 'w', details: { tool: 'report_feedback' } });
+    const [row] = await a.list({});
+    expect(row.subject).toHaveLength(500);
+    expect(row.subject.endsWith('…')).toBe(true);
+    expect(row.details).toEqual({ tool: 'report_feedback', subjectChars: 10 + 1024 * 1024 });
+  });
+
   test('defaults: no details, no targets, global project', async () => {
     await a.record({ kind: 'feedback_decided', actor: 'you', projectKey: null, subject: 's', why: 'w' });
     const [x] = await a.list({});
@@ -83,5 +91,14 @@ describeStores('ActivityStore (Neo4j details are JSON text)', (h) => {
     const rows = await a.list({});
     expect(rows.map((r) => r.subject)).toEqual(['good', 'bad']);
     expect(rows[1].details).toEqual({ unreadable: '{not json' });
+  });
+
+  test('on start, a subject stored over the cap by an older version is cut the same way', async () => {
+    const g = h.store.graph as GraphRepo;
+    await g.run(`CREATE (:Activity {id: 'old', ts: 't', order: 1, kind: 'doc_added', actor: 'x', subject: $s, why: 'w', details: '{"name":"a.md"}', targets: []})`, { s: 'y'.repeat(2000) });
+    await g.run(`CREATE (:Activity {id: 'old2', ts: 't', order: 2, kind: 'doc_added', actor: 'x', subject: $s, why: 'w', details: '{}', targets: []})`, { s: 'z'.repeat(600) });
+    await h.store.ensureSchema();
+    const rows = await a.list({});
+    expect(rows.map((r) => [r.subject.length, r.details])).toEqual([[500, { subjectChars: 600 }], [500, { name: 'a.md', subjectChars: 2000 }]]);
   });
 }, { only: ['neo4j'] });

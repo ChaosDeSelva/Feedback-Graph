@@ -3,7 +3,10 @@ import { chmodSync, copyFileSync, mkdirSync, mkdtempSync, readFileSync, writeFil
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { expect, test } from 'vitest';
+import { expect, test, vi } from 'vitest';
+
+// Each test runs the real script in a subshell; on a loaded machine that can pass vitest's 5 s default.
+vi.setConfig({ testTimeout: 20_000 });
 
 // scripts/doctor.sh, run on a copy with a throwaway HOME and stand-ins for docker, nc and curl, so each check can be made
 // to pass or fail without Docker, Ollama or the stack.
@@ -22,6 +25,8 @@ type World = {
   transcripts?: number;
   status?: object | null;
   env?: string;
+  /** Compose projects Docker has containers of, and the folder each was started from (HERE: the folder checked). */
+  composed?: { project: string; dir: string }[];
 };
 
 const BOTH = '{"models":[{"name":"gemma4:latest"},{"name":"nomic-embed-text:latest"}]}';
@@ -51,6 +56,9 @@ function doctor(w: World = {}) {
     'docker',
     `[ "$1" = info ] && exit ${w.dockerUp === false ? 1 : 0}
 case "$*" in
+  "ps -a "*)
+    p="$(printf '%s\\n' "$@" | sed -n 's/^label=com.docker.compose.project=//p')"
+    case "$p" in ${(w.composed ?? []).map((c) => `'${c.project}') echo '${c.dir === 'HERE' ? repo : c.dir}' ;;`).join(' ')} *) ;; esac ;;
   *" ps "*) printf '%s\\n' ${running.map((s) => `'${s}'`).join(' ')} ;;
   *" port "*)
     svc=$(echo "$*" | sed 's/.* port //' | awk '{print $1}'); inner=$(echo "$*" | awk '{print $NF}')
@@ -123,6 +131,20 @@ test('each broken piece is a FAIL line saying how to fix it, and the exit code i
   expect(out).toContain('official Ollama app');
   expect(out).toContain('FAIL  host.docker.internal: does not resolve inside the worker');
   expect(out).toContain('FAIL  GitHub: GitHub refused the token (401)');
+});
+
+test('another folder\'s containers under this folder\'s Compose name: a loud FAIL naming that folder and FG_INSTANCE', () => {
+  const other = doctor({ composed: [{ project: 'feedback-graph', dir: '/srv/acme/feedback-graph' }] });
+  expect(other.code).toBe(1);
+  expect(other.out).toMatch(/FAIL  install: the containers named feedback-graph were started from \/srv\/acme\/feedback-graph, not this folder/);
+  expect(other.out).toMatch(/docker compose here would take over/);
+  expect(other.out).toMatch(/FG_INSTANCE=/);
+  // FG_INSTANCE in .env is the name looked up.
+  const named = doctor({ env: 'API_PORT=8787\nFG_INSTANCE=feedback-graph-repo\n', composed: [{ project: 'feedback-graph', dir: '/srv/acme/feedback-graph' }] });
+  expect(named.out).toContain('PASS  install: no other folder runs as feedback-graph-repo');
+  const own = doctor({ composed: [{ project: 'feedback-graph', dir: 'HERE' }] });
+  expect(own.code).toBe(0);
+  expect(own.out).toContain('PASS  install: feedback-graph runs from this folder');
 });
 
 test('Docker down, Ollama down and the api not answering: failures and skips, never a crash', () => {

@@ -62,6 +62,8 @@ beforeEach(() => {
       if (!t) return Response.json({ error: 'not found' }, { status: 404 });
       if (m[2] === '/messages') {
         const at = new Date(Date.now() - 23_000).toISOString();
+        // As the server does: the conversation's last message is now, though this fake keeps listing it where it was.
+        convs = convs.map((c) => (c.id === id ? { ...c, updatedAt: new Date().toISOString(), pending: true } : c));
         threads[id] = { ...t, pending: true, title: t.title || body.text, turns: [...t.turns,
           turn({ id: `${id}-u${t.turns.length}`, conversationId: id, seq: t.turns.length + 1, role: 'user', text: body.text, createdAt: at }),
           turn({ id: `${id}-a${t.turns.length}`, conversationId: id, seq: t.turns.length + 2, role: 'assistant', status: 'pending', createdAt: at }),
@@ -167,6 +169,14 @@ test('New chat: picks a project and a provider, sends with Cmd+Enter, then polls
   expect(gets('c2')).toBe(polled);
 });
 
+test('a question waiting behind others for its model says how many are ahead of it', async () => {
+  threads.c1 = { ...threads.c1, pending: true, turns: [threads.c1.turns[0], { ...threads.c1.turns[1], status: 'pending', answer: null, provider: null, queueAhead: 2 }] };
+  location.hash = '#ask/c1';
+  render(<Chat />);
+  const status = (await screen.findByText(/Waiting for Claude: 2 questions ahead of this one/)).closest('[role="status"]')!;
+  expect(status).toBeTruthy();
+});
+
 test('a failed answer shows its error and Retry puts it back in the queue', async () => {
   threads.c1 = { ...threads.c1, turns: [threads.c1.turns[0], { ...threads.c1.turns[1], status: 'failed', answer: null, error: 'claude-cli: not signed in' }] };
   location.hash = '#ask/c1';
@@ -221,4 +231,84 @@ test('a conversation deleted elsewhere while an answer is pending stops the poll
   expect(await screen.findByText(/stopped checking/i)).toBeTruthy();
   await act(async () => { await vi.advanceTimersByTimeAsync(30_000); });
   expect(gets('c2')).toBe(tries);
+});
+
+test('an answer says how big the context pack it was answered from was', async () => {
+  threads.c1.turns[1] = { ...threads.c1.turns[1], pack: { chars: 12_345, sources: 2 } };
+  location.hash = '#ask/c1';
+  render(<Chat />);
+  await screen.findByText('2 modals');
+  expect(screen.getByText(/answered from a context pack of 12,345 characters, 2 sources/)).toBeTruthy();
+});
+
+test('an answer from an API without pack sizes says nothing about it', async () => {
+  location.hash = '#ask/c1';
+  render(<Chat />);
+  await screen.findByText('2 modals');
+  expect(screen.queryByText(/context pack of/)).toBeNull();
+});
+
+test('a miss is cited by the file it happened in, linked to that file; an old one by its id, not linked', async () => {
+  threads.c1.turns[1] = {
+    ...threads.c1.turns[1],
+    sources: [
+      { id: 'S1', kind: 'miss', ref: 'src/ui/Dialog.tsx', title: 'built a second modal from scratch' },
+      { id: 'S2', kind: 'miss', ref: 'miss:9', title: 'forgot the focus trap' },
+    ],
+  };
+  location.hash = '#ask/c1';
+  render(<Chat />);
+  await screen.findByText('2 modals');
+  expect(screen.getByRole('link', { name: '[S1]' }).getAttribute('href')).toBe('#projects/shop/src%2Fui%2FDialog.tsx');
+  const sources = screen.getByText(/Sources \(2\)/).closest('details')!;
+  expect(within(sources).getByRole('link', { name: /built a second modal/ }).getAttribute('href')).toBe('#projects/shop/src%2Fui%2FDialog.tsx');
+  expect(within(sources).getByText('src/ui/Dialog.tsx')).toBeTruthy();
+  expect(within(sources).queryByRole('link', { name: /forgot the focus trap/ })).toBeNull();
+});
+
+test('the conversation list re-sorts when a chat gets a new message: the one you asked in moves to the top', async () => {
+  convs = [conv('c1', { title: 'Newest chat', updatedAt: '2026-10-24T12:00:00Z' }), conv('c3', { title: 'Older chat', updatedAt: '2026-10-20T10:00:00Z' })];
+  threads.c3 = { ...convs[1], turns: answered('c3', 'older question') };
+  location.hash = '#ask/c3';
+  render(<Chat />);
+  await screen.findByText('older question', { selector: 'p, div' });
+  const titles = () => within(screen.getByRole('complementary', { name: 'conversations' })).getAllByRole('button').map((b) => b.querySelector('div')?.textContent);
+  expect(titles()).toEqual(['Newest chat', 'Older chat']);
+  fireEvent.change(screen.getByRole('textbox', { name: 'question' }), { target: { value: 'and the footer?' } });
+  fireEvent.click(screen.getByRole('button', { name: 'Send' }));
+  // The fake server lists them in their old order: the page sorts by each conversation's last message itself.
+  await waitFor(() => expect(titles()).toEqual(['Older chat', 'Newest chat']));
+});
+
+test('a conversation answering in the background is checked again until it is done, then moves up', async () => {
+  vi.useFakeTimers({ shouldAdvanceTime: true });
+  convs = [conv('c1', { title: 'Newest chat', updatedAt: '2026-10-24T12:00:00Z' }), conv('c3', { title: 'Older chat', updatedAt: '2026-10-20T10:00:00Z', pending: true })];
+  location.hash = '#ask/c1';
+  render(<Chat />);
+  await screen.findByText('2 modals');
+  const lists = () => calls.filter((c) => c.method === 'GET' && (c.url === '/api/chats' || c.url.startsWith('/api/chats?'))).length;
+  const before = lists();
+  convs = [conv('c3', { title: 'Older chat', updatedAt: '2026-10-24T13:00:00Z', pending: false }), convs[0]];
+  await act(async () => { await vi.advanceTimersByTimeAsync(5100); });
+  expect(lists()).toBeGreaterThan(before);
+  const list = screen.getByRole('complementary', { name: 'conversations' });
+  await waitFor(() => expect(within(list).getAllByRole('button')[0].textContent).toMatch(/Older chat/));
+  expect(within(list).queryByText('answering')).toBeNull();
+  // Nothing pending any more: the list is not asked for again.
+  const after = lists();
+  await act(async () => { await vi.advanceTimersByTimeAsync(12_000); });
+  expect(lists()).toBe(after);
+});
+
+test('#ask/new?…&provider=codex starts the conversation on the model the Dashboard picked', async () => {
+  location.hash = `#ask/new?project=shop&q=${encodeURIComponent('where do routes go?')}&provider=codex`;
+  render(<Chat />);
+  await waitFor(() => expect(calls.find((c) => c.url === '/api/chats/c2/messages')?.body).toEqual({ text: 'where do routes go?' }));
+  expect(calls.filter((c) => c.method === 'POST' && c.url === '/api/chats').map((c) => c.body)).toEqual([{ project: 'shop', provider: 'codex', title: 'where do routes go?' }]);
+  // An unknown provider in a link is ignored: the default model answers.
+  cleanup();
+  calls = [];
+  location.hash = `#ask/new?project=shop&q=hi&provider=nope`;
+  render(<Chat />);
+  await waitFor(() => expect(calls.filter((c) => c.method === 'POST' && c.url === '/api/chats').map((c) => c.body)).toEqual([{ project: 'shop', title: 'hi' }]));
 });

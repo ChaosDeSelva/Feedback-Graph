@@ -40,3 +40,4 @@ export * from './runs.ts';
 export * from './lessonOutcome.ts';
 export * from './git.ts';
 export * from './lessonRank.ts';
+export * from './sandboxPresence.ts';

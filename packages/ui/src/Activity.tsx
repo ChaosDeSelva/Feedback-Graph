@@ -3,8 +3,8 @@ import { ACTIVITY_KINDS, contextWhy, NO_CONTEXT_WHY, type Activity as Entry, typ
 import { api, type PipelineStatus, type ProjectSummary } from './api.ts';
 import { hashFocus } from './links.ts';
 import { PageHeader } from './ui/PageHeader.tsx';
-import { Button, Select } from './ui/controls.tsx';
-import { Alert, Badge, EmptyState, SkeletonList, statusTone, type Tone } from './ui/display.tsx';
+import { Button, Input, Select } from './ui/controls.tsx';
+import { Alert, Badge, Chip, EmptyState, longTime, plural, SkeletonList, statusTone, Time, type Tone } from './ui/display.tsx';
 import { ActivityIcon, ChevronIcon } from './ui/icons.tsx';
 
 const KIND_LABEL: Record<ActivityKind, string> = {
@@ -101,8 +101,6 @@ export const actorHint = (actor: string) => ACTOR_HINT[actorKind(actor)];
 /** Prose (anything with a space in it) reads in the text font; ids, paths and hashes stay monospaced. */
 const isProse = (s: string) => /\s/.test(s.trim());
 
-const time = (ts: string) => new Date(ts).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
-
 type Item = { statement?: string; title?: string; missed?: string; why?: string; kind?: string; status?: string; path?: string; ref?: string };
 
 /** One value in an activity's details: lists of facts/verdicts get their own "why", everything else stays compact. */
@@ -132,9 +130,13 @@ function Value({ v }: { v: unknown }) {
   return <span className={`[overflow-wrap:anywhere] ${typeof v === 'string' && isProse(v) ? '' : 'font-mono'}`}>{text}</span>;
 }
 
-/** Column layout shared by the rows and the Activity page's header row. */
-export const ACTIVITY_COLS = 'grid grid-cols-[1rem_minmax(0,1fr)_auto] gap-x-3 @3xl:grid-cols-[1rem_minmax(0,1fr)_9.5rem_9rem_6.5rem]';
+const RUN_HINT = 'the run its request was labelled with (x-fg-run): fg cleanup --run removes what the run wrote';
 
+/**
+ * One entry: the subject on one line (whole on hover) with its kind on the right, then a muted line with when (relative,
+ * the exact time on hover), who and, for a labelled run, which run, as chips that cut long ids. Nothing wraps word by
+ * word at any width; a click opens the details.
+ */
 export function ActivityEntry({ a, open: initial = false }: { a: Entry; open?: boolean }) {
   const [open, setOpen] = useState(initial);
   // A list leaves big details out (detailsOmitted): the entry fetches them the first time it is opened.
@@ -147,27 +149,32 @@ export function ActivityEntry({ a, open: initial = false }: { a: Entry; open?: b
     return () => { stale = true; };
   }, [open, a.id, a.detailsOmitted, full]);
   const details = Object.entries(full ?? a.details);
+  const kind = KIND_LABEL[a.kind] ?? a.kind;
+  const run = a.run ? `run ${a.run}${a.sandbox ? ' · sandbox' : ''}` : null;
   return (
     <li className="@container border-b border-line last:border-b-0">
-      <button type="button" aria-expanded={open} onClick={() => setOpen(!open)} className={`${ACTIVITY_COLS} w-full items-start px-3 py-2 text-left transition-colors hover:bg-sunken`}>
-        <ChevronIcon size={12} className={`mt-1 text-faint transition-transform ${open ? 'rotate-90' : ''}`} />
-        <span className="min-w-0">
-          <span className="block text-[13px] [overflow-wrap:anywhere]">{a.subject}</span>
-          <span className="block text-xs text-muted [overflow-wrap:anywhere]">{a.why}</span>
-          <span className="mt-1 block @3xl:hidden"><Badge tone={kindTone(a)}>{KIND_LABEL[a.kind] ?? a.kind}</Badge></span>
-        </span>
-        <span className="hidden min-w-0 @3xl:block">
-          <Badge tone={kindTone(a)}>{KIND_LABEL[a.kind] ?? a.kind}</Badge>
-        </span>
-        <span className="max-w-36 min-w-0 text-right text-xs @3xl:contents">
-          <span title={actorHint(a.actor)} className="block truncate font-mono text-[11.5px] text-muted @3xl:text-left">{a.actor}</span>
-          {a.run && <span title="the run its request was labelled with (x-fg-run): fg cleanup --run removes what the run wrote" className="block truncate font-mono text-[11px] text-muted @3xl:text-left">run {a.run}{a.sandbox ? ' · sandbox' : ''}</span>}
-          <span className="block text-muted tabular-nums @3xl:text-right">{time(a.ts)}</span>
+      <button type="button" aria-expanded={open} onClick={() => setOpen(!open)} className="flex w-full min-w-0 items-start gap-2.5 px-3 py-2 text-left transition-colors hover:bg-sunken">
+        <ChevronIcon size={12} className={`mt-1 shrink-0 text-faint transition-transform ${open ? 'rotate-90' : ''}`} />
+        <span className="grid min-w-0 flex-1 gap-0.5">
+          <span className="flex min-w-0 items-center gap-2">
+            <span title={a.subject} className="min-w-0 flex-1 truncate text-[13px]">{a.subject}</span>
+            <Badge tone={kindTone(a)} className="shrink-0">{kind}</Badge>
+          </span>
+          <span className="flex min-w-0 items-center gap-1.5 text-xs text-muted">
+            <Time iso={a.ts} className="shrink-0" />
+            <Chip title={actorHint(a.actor)} className="max-w-[45%] shrink-0">{a.actor}</Chip>
+            {run && <Chip title={`${run}: ${RUN_HINT}`} className="max-w-[35%] shrink-0">{run}</Chip>}
+            {a.why && <span title={a.why} className="min-w-0 flex-1 truncate">{a.why}</span>}
+          </span>
         </span>
       </button>
       {open && (
-        <dl className="grid gap-x-4 gap-y-2 border-t border-line bg-sunken px-3 py-2.5 pl-10 text-xs @xl:grid-cols-[10rem_minmax(0,1fr)]">
-          <dt className="text-muted">what</dt><dd>{KIND_LABEL[a.kind] ?? a.kind}{a.projectKey ? ` · ${a.projectKey}` : ''}</dd>
+        <dl className="grid gap-x-4 gap-y-2 border-t border-line bg-sunken px-3 py-2.5 pl-8 text-xs @xl:grid-cols-[10rem_minmax(0,1fr)]">
+          <dt className="text-muted">what</dt><dd>{kind}{a.projectKey ? ` · ${a.projectKey}` : ''}</dd>
+          {a.why && <><dt className="text-muted">why</dt><dd className="min-w-0 [overflow-wrap:anywhere]">{a.why}</dd></>}
+          <dt className="text-muted">when</dt><dd className="tabular-nums">{longTime(a.ts)}</dd>
+          <dt className="text-muted">by</dt><dd className="min-w-0 [overflow-wrap:anywhere]"><span className="font-mono">{a.actor}</span> <span className="text-muted">({actorHint(a.actor)})</span></dd>
+          {run && <><dt className="text-muted">run</dt><dd className="min-w-0 font-mono [overflow-wrap:anywhere]">{run}</dd></>}
           {a.detailsOmitted && !full && <><dt className="text-muted">details</dt><dd className="text-muted">{failed ? `could not load them: ${failed}` : 'loading…'}</dd></>}
           {details.map(([k, v]) => (
             <div key={k} className="contents"><dt className="text-muted">{k}</dt><dd className="min-w-0"><Value v={v} /></dd></div>
@@ -187,6 +194,12 @@ export function Activity() {
     const k = hashFocus('activity');
     return ACTIVITY_KINDS.includes(k as ActivityKind) ? (k as ActivityKind) : '';
   });
+  // One labelled run's entries (x-fg-run), typed or picked from the runs seen; and whether to hide every labelled run's
+  // entries (a tester's runs would otherwise bury what you and the worker did). Picking a run shows that run, hidden or not.
+  const [run, setRun] = useState('');
+  const [runDraft, setRunDraft] = useState('');
+  const [hideRuns, setHideRuns] = useState(true);
+  const [seenRuns, setSeenRuns] = useState<string[]>([]);
   const [rows, setRows] = useState<Entry[] | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -195,12 +208,20 @@ export function Activity() {
     setRows(null);
     // A slow answer for filters you have left must not fill the list for the ones you picked.
     let stale = false;
-    api.activity({ project: project || undefined, kind: kind || undefined, limit: 300 })
-      .then((r) => { if (!stale) setRows(r); }, (e) => { if (!stale) { setError(String(e)); setRows([]); } });
+    api.activity({ project: project || undefined, kind: kind || undefined, run: run || undefined, limit: 300, withRuns: !run && !hideRuns })
+      .then((r) => {
+        if (stale) return;
+        setRows(r);
+        const ids = r.map((x) => x.run).filter((x): x is string => !!x);
+        if (ids.length) setSeenRuns((s) => [...new Set([...s, ...ids])].sort());
+      }, (e) => { if (!stale) { setError(String(e)); setRows([]); } });
     return () => { stale = true; };
-  }, [project, kind]);
+  }, [project, kind, run, hideRuns]);
 
-  const filtered = !!(project || kind);
+  const filtered = !!(project || kind || run);
+  const shown = rows && !run && hideRuns ? rows.filter((a) => !a.run) : rows;
+  const hidden = rows && shown ? rows.length - shown.length : 0;
+  const clearFilters = () => { setProject(''); setKind(''); setRun(''); setRunDraft(''); };
 
   // Turns waiting for the classifier are not entries yet: filtered to what the classifier flags, say how many wait.
   const [classify, setClassify] = useState<PipelineStatus['classify']>(null);
@@ -226,6 +247,23 @@ export function Activity() {
               <option value="">everything</option>
               {ACTIVITY_KINDS.map((k) => <option key={k} value={k}>{KIND_LABEL[k]}</option>)}
             </Select>
+            <form className="flex items-center" onSubmit={(e) => { e.preventDefault(); setRun(runDraft.trim()); }}>
+              <Input
+                aria-label="run"
+                list="activity-runs"
+                value={runDraft}
+                onChange={(e) => { setRunDraft(e.target.value); if (!e.target.value) setRun(''); }}
+                onBlur={() => setRun(runDraft.trim())}
+                placeholder="any run"
+                title="one labelled run's entries (x-fg-run): type its id and press Enter"
+                className="w-36 font-mono"
+              />
+              <datalist id="activity-runs">{seenRuns.map((r) => <option key={r} value={r} />)}</datalist>
+            </form>
+            <label className="flex items-center gap-1.5 text-xs text-muted" title="entries written by requests labelled with a run (x-fg-run), such as a tester's or a script's">
+              <input type="checkbox" aria-label="hide labelled runs" checked={hideRuns} disabled={!!run} onChange={(e) => setHideRuns(e.target.checked)} className="size-3.5 accent-[var(--color-accent-edge)]" />
+              hide labelled runs
+            </label>
           </>
         }
       />
@@ -242,20 +280,19 @@ export function Activity() {
         <ul aria-label="who did it" className="mb-2 flex flex-wrap gap-x-4 gap-y-0.5 text-xs text-muted">
           {LEGEND.map(([k, example]) => <li key={k} title={ACTOR_HINT[k]}><span className="font-mono">{example}</span> {ACTOR_HINT[k].split(':')[0]}</li>)}
         </ul>
-        <div className="@container rounded-md border border-line bg-surface shadow-card">
-          <div className={`${ACTIVITY_COLS} sticky top-0 z-[1] rounded-t-md border-b border-line bg-sunken px-3 py-1.5 text-[11px] font-semibold tracking-[0.06em] text-muted uppercase`}>
-            <span />
-            <span>Event</span>
-            <span className="hidden @3xl:block">Kind</span>
-            <span className="hidden @3xl:block">By</span>
-            <span className="text-right">When</span>
-          </div>
-          {rows === null ? (
+        {hidden > 0 && (
+          <p className="mb-2 text-xs text-muted">
+            {hidden === 1 ? '1 entry from a labelled run is hidden' : `${plural(hidden, 'entry', 'entries')} from labelled runs are hidden`}.{' '}
+            <button type="button" onClick={() => setHideRuns(false)} className="underline decoration-line-strong underline-offset-2 hover:text-text">Show them</button>
+          </p>
+        )}
+        <div className="rounded-md border border-line bg-surface shadow-card">
+          {shown === null ? (
             <SkeletonList rows={8} />
-          ) : rows.length === 0 ? (
+          ) : shown.length === 0 ? (
             filtered ? (
-              <EmptyState icon={<ActivityIcon />} title="No entries match these filters" action={<Button onClick={() => { setProject(''); setKind(''); }}>Clear filters</Button>}>
-                Try another project or kind, or clear the filters to see everything.
+              <EmptyState icon={<ActivityIcon />} title="No entries match these filters" action={<Button onClick={clearFilters}>Clear filters</Button>}>
+                Try another project, kind or run, or clear the filters to see everything.
               </EmptyState>
             ) : (
               <EmptyState icon={<ActivityIcon />} title="Nothing logged yet">
@@ -263,7 +300,7 @@ export function Activity() {
               </EmptyState>
             )
           ) : (
-            <ul>{rows.map((a) => <ActivityEntry key={a.id} a={a} />)}</ul>
+            <ul>{shown.map((a) => <ActivityEntry key={a.id} a={a} />)}</ul>
           )}
         </div>
       </div>

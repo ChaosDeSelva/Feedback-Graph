@@ -1,6 +1,6 @@
 import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, beforeEach, expect, test, vi } from 'vitest';
-import { CodeMap } from './CodeMap.tsx';
+import { CodeMap, ModulePanel } from './CodeMap.tsx';
 
 const meta = { fingerprint: 'abc', builtAt: '2026-10-22T12:00:00Z', stats: { files: 40, symbols: 200, imports: 90, tests: 12 }, candidates: null };
 const hotspots = [
@@ -212,4 +212,32 @@ test('a focus request (a fact file name on the Projects page) opens that file pa
   fireEvent.click(screen.getByRole('button', { name: 'close module' }));
   rerender(<CodeMap projectKey="demo" focus={{ path: 'src/deep/a.ts', at: 2 }} />);
   expect(await screen.findByRole('region', { name: 'module src/deep/a.ts' })).toBeTruthy();
+});
+
+test('a file past the code map cap opens a panel that says why it has nothing: the cap, how many files it keeps, and how to raise it', async () => {
+  capped = true;
+  vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+    if (url.startsWith('/api/projects/demo/codemap/hotspots')) return Response.json({ meta: { ...meta, candidates: 10_290 }, hotspots });
+    if (url.startsWith('/api/projects/demo/codemap/module')) return Response.json({ error: 'not in the code map' }, { status: 404 });
+    return Response.json([]);
+  }));
+  render(<ModulePanel projectKey="demo" path="docs/far/away.md" onOpen={() => {}} onClose={() => {}} />);
+  const panel = await screen.findByRole('region', { name: 'module docs/far/away.md' });
+  await waitFor(() => expect(panel.textContent).toMatch(/past the code map's cap/));
+  expect(panel.textContent).toMatch(/40 of 10,290 files/);
+  expect(panel.textContent).toMatch(/SCAN_MAX_FILES/);
+  expect(within(panel).queryByRole('alert')).toBeNull();
+});
+
+test('a file not in an uncapped map says the map does not read it, or it is newer than the map', async () => {
+  vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+    if (url.startsWith('/api/projects/demo/codemap/hotspots')) return Response.json({ meta, hotspots });
+    if (url.startsWith('/api/projects/demo/codemap/module')) return Response.json({ error: 'not in the code map' }, { status: 404 });
+    return Response.json([]);
+  }));
+  render(<ModulePanel projectKey="demo" path="README.md" onOpen={() => {}} onClose={() => {}} />);
+  const panel = await screen.findByRole('region', { name: 'module README.md' });
+  await waitFor(() => expect(panel.textContent).toMatch(/not in the code map/));
+  expect(panel.textContent).toMatch(/Rebuild map/);
+  expect(panel.textContent).not.toMatch(/cap/);
 });

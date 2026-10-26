@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import {
-  EMPTY_SELECTION, initialSelection, projectScope, selectionSeededActivity, SELECTION_ID, toSelection, withClones,
+  EMPTY_SELECTION, ingestSeedsStored, initialSelection, projectScope, selectionSeededActivity, SELECTION_ID, toSelection, withClones,
   type ActivityStore, type CandidateSnapshot, type Config, type ProjectScope, type ProjectSelection, type SelectionStore,
 } from '@fb/core';
 import { iso, toJson, tx, type Db } from './db.ts';
@@ -39,6 +39,22 @@ export class PgSelectionStore implements SelectionStore {
    */
   async ensure(env: Pick<Config, 'ingestProjects' | 'excludeProjects'>, activity?: Pick<ActivityStore, 'record'>): Promise<{ selection: ProjectSelection; seeded: boolean }> {
     const stored = await this.get();
+    if (stored && ingestSeedsStored(stored, env)) {
+      // Never made: INGEST_PROJECTS set since seeds it now. The row lock re-checks the WHERE, so only one service seeds.
+      const seed = initialSelection(env);
+      const updated = await this.db.pool.query<SelectionRow>(
+        `UPDATE project_selection SET tracked = $2::text[], initialized = $3, updated_at = $4
+         WHERE id = $1 AND initialized = false AND coalesce(cardinality(tracked), 0) = 0
+         RETURNING tracked, initialized, updated_at`,
+        [SELECTION_ID, seed.tracked, seed.initialized, new Date()],
+      );
+      const seeded = updated.rows.length > 0;
+      if (seeded && activity) {
+        const { rows } = await this.db.pool.query<{ n: number }>('SELECT count(*) AS n FROM projects');
+        await activity.record(selectionSeededActivity(seed, Number(rows[0]?.n ?? 0), true, true));
+      }
+      return { selection: seeded ? fromRow(updated.rows[0]) : await this.current(), seeded };
+    }
     if (stored) return { selection: stored, seeded: false };
     const seed = initialSelection(env, env.ingestProjects.length ? [] : await this.investedKeys());
     const token = randomUUID();

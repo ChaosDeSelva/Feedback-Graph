@@ -144,8 +144,8 @@ test('activity and patterns cover the selected projects only', async () => {
   await get('/api/patterns');
   await get('/api/patterns?project=shop');
   expect(calls).toEqual([
-    ['activity', { limit: 10, maxDetailBytes: 1024, projectKeys: ['shop', 'shop-2'] }],
-    ['activity', { projectKey: 'old', maxDetailBytes: 1024, projectKeys: [] }],
+    ['activity', { limit: 10, unlabelled: true, maxDetailBytes: 1024, projectKeys: ['shop', 'shop-2'] }],
+    ['activity', { projectKey: 'old', unlabelled: true, maxDetailBytes: 1024, projectKeys: [] }],
     ['patterns', { projectKeys: ['shop', 'shop-2'] }],
     ['patterns', { projectKey: 'shop', projectKeys: ['shop'] }],
   ]);

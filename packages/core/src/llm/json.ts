@@ -133,28 +133,50 @@ const shown = (raw: unknown): string => {
 
 const problemOf = (err: unknown) => (err instanceof Error ? err.message : String(err)).replace(/\s+/g, ' ').slice(0, 300);
 
+/** With a deadline, the retry is asked only when at least this much time is left for it. */
+export const MIN_RETRY_MS = 5_000;
+
+export type AskJsonOpts = {
+  /** The request needs no folder (askPromptOnly). */
+  promptOnly?: boolean;
+  /**
+   * Epoch ms by which both attempts must be done: each is given the time left as its timeout (never more than the
+   * task's own), and the retry is skipped when less than MIN_RETRY_MS is left.
+   */
+  deadline?: number;
+  /** Passed to the provider (JsonTask.signal); once it fires there is no retry. */
+  signal?: AbortSignal;
+};
+
 /**
  * Ask `llm` and check the answer with `validate` (which throws on a wrong shape, e.g. a zod `.parse`). When the
  * answer is not JSON or does not validate, ask once more with STRICT_JSON appended to the system prompt; a second
  * unusable answer throws ModelOutputError naming the problem and the end of the answer. Any other error (a timeout,
- * an unavailable model, an HTTP 400) is not retried here. `promptOnly`: the request needs no folder (askPromptOnly).
+ * an unavailable model, an HTTP 400) is not retried here. `validate` is told whether this answer is the last one
+ * that will be asked for (`last`), counted by attempts whatever made the first fail, so it can take that one as it is.
  */
-export async function askJson<T>(llm: LlmProvider, task: JsonTask, validate: (raw: unknown) => T, o: { promptOnly?: boolean } = {}): Promise<T> {
+export async function askJson<T>(llm: LlmProvider, task: JsonTask, validate: (raw: unknown, at: { last: boolean }) => T, o: AskJsonOpts = {}): Promise<T> {
   const ask = (t: JsonTask) => (o.promptOnly ? askPromptOnly(llm, t) : llm.json(t));
+  const left = () => (o.deadline === undefined ? Infinity : o.deadline - Date.now());
+  const canRetry = () => !o.signal?.aborted && left() >= MIN_RETRY_MS;
+  const timed = (t: JsonTask): JsonTask => {
+    const ms = Math.min(t.timeoutMs ?? Infinity, left());
+    return { ...t, ...(Number.isFinite(ms) && { timeoutMs: Math.max(1, Math.floor(ms)) }), ...(o.signal && { signal: o.signal }) };
+  };
   let refused: string | null = null;
-  const once = async (t: JsonTask): Promise<T> => {
-    const raw = await ask(t);
+  const once = async (t: JsonTask, first: boolean): Promise<T> => {
+    const raw = await ask(timed(t));
     try {
-      return validate(raw);
+      return validate(raw, { last: !first || !canRetry() });
     } catch (err) {
       if (err instanceof AnswerRefused) refused = problemOf(err);
       throw new ModelOutputError(`the answer did not match the schema: ${problemOf(err)}`, shown(raw));
     }
   };
   try {
-    return await once(task);
+    return await once(task, true);
   } catch (err) {
-    if (!(err instanceof ModelOutputError)) throw err;
+    if (!(err instanceof ModelOutputError) || !canRetry()) throw err;
   }
-  return once({ ...task, system: `${task.system}\n\n${STRICT_JSON}${refused ? `\nYour last answer was refused: ${refused}` : ''}` });
+  return once({ ...task, system: `${task.system}\n\n${STRICT_JSON}${refused ? `\nYour last answer was refused: ${refused}` : ''}` }, false);
 }

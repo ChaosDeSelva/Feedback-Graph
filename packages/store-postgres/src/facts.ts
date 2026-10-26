@@ -1,9 +1,9 @@
 import { randomUUID } from 'node:crypto';
 import type pg from 'pg';
-import { clampRelevance, DEMO_SOURCE, FACT_EVIDENCE, factOrigin, requestTimes, scanRequestPaths, MANIFEST_WHY_RE, PROJECT_PATH, provenanceOf, holdsCredential, REDACT_PAGE, redactDeep, redactSecrets, relevanceOf, SCAN_UNAVAILABLE_WAIT_MS, scanRetryAt, redactStoredFact } from '@fb/core';
+import { clampRelevance, DEMO_SOURCE, FACT_EVIDENCE, factOrigin, requestTimes, scanRequestPaths, MANIFEST_WHY_RE, PROJECT_PATH, provenanceOf, holdsCredential, REDACT_PAGE, redactDeep, redactSecrets, relevanceOf, SCAN_UNAVAILABLE_WAIT_MS, scanRetryAt, redactStoredFact, reopensAsFact } from '@fb/core';
 import type { EmbeddedFact, FactCheck, FactHit, FactKind, FactOrigin, FactScope, FactsStore, Project, ScannedFile, ProjectSummary, RelevanceBy, ScanJob, ScanJobPatch, ScanQueueEntry, ScanStatus, StoredFact, RelevanceUpdate, UnscoredFact, RunTag } from '@fb/core';
 import { iso, toJson, toVector, tx, type Db } from './db.ts';
-import { runSearch, searchFactsQuery, visibleToRun } from './vector.ts';
+import { runSearch, sandboxPresence, searchFactsQuery, visibleToRun } from './vector.ts';
 
 type Exec = Pick<pg.PoolClient, 'query'>;
 
@@ -139,6 +139,7 @@ export class PgFactsStore implements FactsStore {
   async addOwnerFact(projectKey: string, rawFact: EmbeddedFact, by: RelevanceBy, run?: RunTag | null): Promise<StoredFact> {
     const fx = redactDeep(rawFact);
     const relevance = relevanceOf(fx);
+    sandboxPresence(this.db).wrote(run);
     return tx(this.db, async (c) => {
       await c.query('INSERT INTO projects (key) VALUES ($1) ON CONFLICT DO NOTHING', [projectKey]);
       const { rows } = await c.query(
@@ -191,46 +192,76 @@ export class PgFactsStore implements FactsStore {
   async applyFactChecks(version: string, checks: FactCheck[]): Promise<number> {
     if (!checks.length) return 0;
     const { rows: [r] } = await this.db.pool.query(
-      `WITH c AS (SELECT * FROM unnest($2::text[], $3::boolean[], $4::text[], $5::text[]) AS c(id, keep, lines, evidence)),
+      `WITH c AS (SELECT * FROM unnest($2::text[], $3::boolean[], $4::text[], $5::text[], $7::text[], $8::text[]) AS c(id, keep, lines, evidence, statement, embedding)),
             u AS (
               UPDATE facts x SET check_version = $1,
                 lines = CASE WHEN c.keep THEN c.lines ELSE x.lines END,
                 evidence = CASE WHEN c.keep THEN c.evidence ELSE x.evidence END,
+                statement = CASE WHEN c.keep AND c.statement IS NOT NULL THEN c.statement ELSE x.statement END,
+                embedding = CASE WHEN c.keep AND c.embedding IS NOT NULL THEN c.embedding::vector ELSE x.embedding END,
                 current = c.keep,
                 valid_to = CASE WHEN c.keep THEN x.valid_to ELSE $6::timestamptz END
               FROM c WHERE x.id = c.id AND x.current
               RETURNING c.keep)
        SELECT count(*) FILTER (WHERE NOT keep)::int AS closed FROM u`,
       [version, checks.map((c) => c.id), checks.map((c) => c.keep), checks.map((c) => c.lines ?? null),
-        checks.map((c) => (c.evidence && FACT_EVIDENCE.includes(c.evidence) ? c.evidence : null)), new Date()],
+        checks.map((c) => (c.evidence && FACT_EVIDENCE.includes(c.evidence) ? c.evidence : null)), new Date(),
+        checks.map((c) => (c.statement ? redactSecrets(c.statement) : null)), checks.map((c) => (c.embedding?.length ? toVector(c.embedding) : null))],
     );
     return r?.closed ?? 0;
   }
 
-  async redactStoredFacts(): Promise<{ redacted: number; closed: number; owner: number }> {
+  async redactStoredFacts(): Promise<{ redacted: number; closed: number; owner: number; instructions: number }> {
     let redacted = 0;
     let closed = 0;
     let owner = 0;
+    let instructions = 0;
     for (let after = ''; ;) {
-      const { rows } = await this.db.pool.query('SELECT id, statement, why, current, origin FROM facts WHERE id > $1 ORDER BY id LIMIT $2', [after, REDACT_PAGE]);
+      const { rows } = await this.db.pool.query(
+        'SELECT id, statement, why, current, origin, doc_id IS NOT NULL AS "fromDoc" FROM facts WHERE id > $1 ORDER BY id LIMIT $2',
+        [after, REDACT_PAGE],
+      );
       if (!rows.length) break;
       after = rows[rows.length - 1].id;
-      const changed = rows.flatMap((r: { id: string; statement: string; why: string | null; current: boolean; origin: string | null }) => {
+      const changed = rows.flatMap((r: { id: string; statement: string; why: string | null; current: boolean; origin: string | null; fromDoc: boolean }) => {
         const x = { id: r.id, owner: r.origin === 'you', ...redactStoredFact(r) };
         return x.statement !== r.statement || x.why !== r.why || x.close ? [x] : [];
       });
       if (!changed.length) continue;
+      // close_reason: why it was closed, so a later rule can serve a fact it no longer reads as an instruction again.
       await this.db.pool.query(
         `UPDATE facts x SET statement = c.statement, why = c.why,
-           current = x.current AND NOT c.close, valid_to = CASE WHEN c.close THEN $5::timestamptz ELSE x.valid_to END
-         FROM unnest($1::text[], $2::text[], $3::text[], $4::boolean[]) AS c(id, statement, why, close) WHERE x.id = c.id`,
-        [changed.map((c) => c.id), changed.map((c) => c.statement), changed.map((c) => c.why), changed.map((c) => c.close), new Date()],
+           current = x.current AND NOT c.close, valid_to = CASE WHEN c.close THEN $5::timestamptz ELSE x.valid_to END,
+           close_reason = CASE WHEN c.close THEN c.reason ELSE x.close_reason END
+         FROM unnest($1::text[], $2::text[], $3::text[], $4::boolean[], $6::text[]) AS c(id, statement, why, close, reason) WHERE x.id = c.id`,
+        [changed.map((c) => c.id), changed.map((c) => c.statement), changed.map((c) => c.why), changed.map((c) => c.close), new Date(),
+          changed.map((c) => (c.instruction ? 'instruction' : 'credential'))],
       );
-      redacted += changed.length;
-      closed += changed.filter((c) => c.close).length;
+      redacted += changed.filter((c) => !c.instruction).length;
+      closed += changed.filter((c) => c.close && !c.instruction).length;
       owner += changed.filter((c) => c.owner).length;
+      instructions += changed.filter((c) => c.instruction).length;
     }
-    return { redacted, closed, owner };
+    return { redacted, closed, owner, instructions };
+  }
+
+  async reopenInstructionFacts(): Promise<number> {
+    let reopened = 0;
+    for (let after = ''; ;) {
+      // Only the re-run closes a document fact (a re-read deletes and rewrites them; a scan never touches them).
+      const { rows } = await this.db.pool.query(
+        `SELECT id, statement, close_reason AS "closeReason" FROM facts
+         WHERE id > $1 AND doc_id IS NOT NULL AND NOT current AND origin IS DISTINCT FROM 'you' ORDER BY id LIMIT $2`,
+        [after, REDACT_PAGE],
+      );
+      if (!rows.length) break;
+      after = rows[rows.length - 1].id;
+      const ids = rows.filter((r: { statement: string; closeReason: string | null }) => reopensAsFact(r)).map((r: { id: string }) => r.id);
+      if (!ids.length) continue;
+      const { rowCount } = await this.db.pool.query('UPDATE facts SET current = true, valid_to = NULL, close_reason = NULL WHERE id = ANY($1::text[]) AND NOT current', [ids]);
+      reopened += rowCount ?? 0;
+    }
+    return reopened;
   }
 
   /** A request is a mark on the file's code_files row (one with no hash yet when it was never scanned). */
@@ -270,7 +301,7 @@ export class PgFactsStore implements FactsStore {
 
   async searchFacts(q: { embedding: number[]; projectKey: string; k: number; run?: string | null }): Promise<FactHit[]> {
     // The project's current facts, nearest first, through the HNSW index when it pays (see vector.ts).
-    const rows = await runSearch(this.db, searchFactsQuery(this.db, q, FACT_COLUMNS), q.k);
+    const rows = await runSearch(this.db, searchFactsQuery(this.db, q, FACT_COLUMNS, { sandbox: await sandboxPresence(this.db).any() }), q.k);
     return rows.map((r) => ({ fact: factOf(r), score: r.score }));
   }
 

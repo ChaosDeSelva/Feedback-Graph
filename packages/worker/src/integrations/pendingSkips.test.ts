@@ -1,6 +1,6 @@
 import { SKIP_RULES_VERSION, type ActivityInput, type ExternalRef, type PendingExternalItem } from '@fb/core';
 import { describe, expect, test } from 'vitest';
-import { SKIP_RULES_CURSOR, skipMatchingPending, skipPendingOnRulesChange, skipRulesStamp } from './pendingSkips.ts';
+import { describeStampChange, SKIP_RULES_CURSOR, skipMatchingPending, skipPendingOnRulesChange, skipRulesStamp } from './pendingSkips.ts';
 
 const ext = (o: Partial<ExternalRef> = {}): ExternalRef => ({
   source: 'github', kind: 'review_comment', author: 'lead', url: 'u', thread: 'acme/shop#9', title: 'Keep cents', threadUrl: 'u',
@@ -129,6 +129,27 @@ describe('skipPendingOnRulesChange', () => {
     expect(skipRulesStamp({})).toMatch(new RegExp(`^v${SKIP_RULES_VERSION}\\b`));
     expect(skipRulesStamp({ botLogins: ['b', 'a'] })).toBe(skipRulesStamp({ botLogins: ['a', 'b'] }));
     expect(skipRulesStamp({ botLogins: ['a'] })).not.toBe(skipRulesStamp({ agentLogins: ['a'] }));
+  });
+
+  test('Activity says what changed: the rules version, the login lists, or both, never the same hash as old and new', async () => {
+    const now = skipRulesStamp({});
+    const hash = now.split(' ')[1];
+    const older = `v${SKIP_RULES_VERSION - 1} ${hash}`;
+    const why = describeStampChange(older, now);
+    expect(why).toBe(`the skip rules changed from version ${SKIP_RULES_VERSION - 1} to ${SKIP_RULES_VERSION} (the bot and agent login lists are unchanged)`);
+    expect(why.split(hash).length - 1).toBeLessThan(2);
+    const logins = skipRulesStamp({ botLogins: ['acme-ci'] });
+    expect(describeStampChange(now, logins)).toBe(`the bot or agent login lists changed (${hash} to ${logins.split(' ')[1]}; skip rules version ${SKIP_RULES_VERSION})`);
+    expect(describeStampChange(older, logins)).toMatch(/^the skip rules changed from version \d+ to \d+ and the bot or agent login lists changed/);
+    expect(describeStampChange(null, now)).toBe(`the skip rules (version ${SKIP_RULES_VERSION}) had not been run over the Inbox yet`);
+    // An older cursor of another shape is quoted as it is.
+    expect(describeStampChange('3', now)).toBe(`the skip rules changed (3 to ${now})`);
+    // Recorded with the entry.
+    const cursors = kv();
+    cursors.m.set(SKIP_RULES_CURSOR, older);
+    const activity: ActivityInput[] = [];
+    await skipPendingOnRulesChange({ graph: fakeGraph([item('a', 'Done.', own)]).graph, cursors, activity: { record: async (a) => void activity.push(a) } });
+    expect(activity[0]?.why).toMatch(/^the skip rules changed from version \d+ to \d+ \(the bot and agent login lists are unchanged\);/);
   });
 
   test('a failure leaves the version unrecorded, so the next start tries again', async () => {

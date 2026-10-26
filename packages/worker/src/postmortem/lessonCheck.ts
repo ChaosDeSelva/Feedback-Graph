@@ -37,8 +37,19 @@ const IDENTIFIER = /`[^`]+`|\w+\/\w+|\w+\.\w+|\w+_\w+|\b[a-z]+[A-Z]\w*|\b\w+\(\)
 /** Words a small model puts in the rule field instead of a rule. */
 export const SCOPE_WORDS = new Set(['task', 'project', 'global', 'context_missing', 'context_available_ignored', 'code_not_read', 'requirement_unstated', 'verification_gap', 'implementation_error']);
 /** The verbs a rule starts with, at the start of the rule or of a clause ("When X, ensure Y"). */
-const DO = 'do|don\'?t|use|avoid|prefer|keep|make|check|ensure|add|remove|read|write|call|pass|set|run|test|assert|lock|validate|verify|carry|label|flag|document|return|reuse|filter|derive|split|resolve|guard|cover|update|fix|rename|move|wait|retry|stop|skip|treat|mark|include|exclude|handle|configure|register|define|declare|put|place|import|export|scope|limit|log|send|store|load|cache|escape|sanitize|redact|sort|close|release|clear|delete|create|replace|look|search|ask|confirm|compare|measure|wrap|catch|throw|raise|emit|parse|normalize|trim|clamp';
-const IMPERATIVE_LEAD = new RegExp(`(^|[,;:]|\\bthen|\\bso)\\s*(${DO})\\b`, 'i');
+const DO = 'do|don\'?t|use|avoid|prefer|keep|make|check|ensure|add|remove|read|write|call|pass|set|run|test|assert|lock|validate|verify|carry|label|flag|document|return|reuse|filter|derive|split|resolve|guard|cover|update|fix|rename|move|wait|retry|stop|skip|treat|mark|include|exclude|handle|configure|register|define|declare|put|place|import|export|scope|limit|log|send|store|load|cache|escape|sanitize|redact|sort|close|release|clear|delete|create|replace|look|search|ask|confirm|compare|measure|wrap|catch|throw|raise|emit|parse|normalize|trim|clamp' +
+  // Verbs a team's approved rules start with that the list above missed (each read as a fact before: "Cap the batch at
+  // 500" matched "caps"). Words as often a noun as a verb (map, index, order, count, page, type) are left out.
+  '|cap|refresh|coalesce|drop|debounce|throttle|batch|bump|memoize|strip|invalidate|gate|prefix|append|prepend|inject|' +
+  'initialize|reset|revert|pin|convert|merge|dedupe|deduplicate|encode|decode|await|rethrow|propagate|forward|mount|' +
+  'migrate|paginate|chunk|flush|persist|save|fetch|hide|render|disable|enable|toggle|preload|prefetch|bind|attach|' +
+  'detach|subscribe|unsubscribe|poll|enqueue|defer|delay|abort|cancel|lint|extract|inline|hoist|consolidate|collapse|' +
+  'expand|track|notify|warn|surface|expose|retain|preserve|prune|truncate|bound|reject|accept|allow|deny|block|' +
+  'require|enforce|default|fall back|lower|raise|increase|decrease|shorten|lengthen|reorder|group by|serialize|' +
+  'deserialize|quote|unquote|lock|unlock|commit|stage|rebase|squash|tag|pull|push|open|reopen|re-run|rerun|regenerate|' +
+  'rebuild|recompute|re-check|recheck|re-read|reread|re-embed|reembed|backfill|seed|stamp|version|namespace|isolate';
+/** At the start of the rule or of a clause, after an adverb ("Only cap ...") or a place with no comma ("In a.ts cap ..."). */
+const IMPERATIVE_LEAD = new RegExp(`(^|[,;:]|\\bthen|\\bso)\\s*(?:(?:in|for|inside|within|on)\\s+\\S+\\s+)?(?:(?:only|also|first|explicitly|still|just)\\s+)?(${DO})\\b`, 'i');
 /**
  * A modal or a rule word anywhere. "never" and "always" only before a verb in its base form: "the web app never sees
  * it" describes the code. ("before", "until", "not in" are not rule words: "migrations run before the server starts".)
@@ -173,8 +184,8 @@ const WRONG_SESSION = [
   /\b(pertains?|relates?|belongs?|refers?|applies) to (a |an )?(different|another|other|unrelated|separate)\b/i,
   /\b(different|another|unrelated|separate) (pull request|PR|feature|task|branch|session)\b/i,
 ];
-export const saysWrongSession = (pm: { missed: string; causeExplanation: string }) =>
-  WRONG_SESSION.some((re) => re.test(pm.causeExplanation ?? '') || re.test(pm.missed ?? ''));
+export const saysWrongSession = (pm: { missed: string; causeExplanation: string }, o: { markerOnly?: boolean } = {}) =>
+  (o.markerOnly ? WRONG_SESSION.slice(0, 1) : WRONG_SESSION).some((re) => re.test(pm.causeExplanation ?? '') || re.test(pm.missed ?? ''));
 
 function statusTable(text: string): boolean {
   const rows = text.split('\n').filter((l) => /^\s*\|.*\|\s*$/.test(l));

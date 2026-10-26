@@ -19,12 +19,13 @@ import type {
   Project,
   RunTag,
 } from '../types.ts';
-import { REDACT_PAGE, redactDeep, redactSecrets, redactStoredRow } from '../redact.ts';
+import { REDACT_PAGE, redactDeep, redactSecrets, redactStoredLesson, redactStoredRow } from '../redact.ts';
 import { LESSON_CHECKS_VERSION } from '../types.ts';
 import { DEMO_SOURCE, demoPrefix, type CommentLesson, type DemoMiss, type DemoRemoved, type KnowledgeStore, type LessonFilter, type SimilarLesson, type DecidedLesson, type DecidedLessonsQuery } from '../store.ts';
-import { editedDraft, ownerDecided } from '../lessonOutcome.ts';
+import { draftOf, editedDraft, ownerDecided } from '../lessonOutcome.ts';
 import type { GraphRepo } from './repo.ts';
 import { matchReport, REPORT_MERGE_MINUTES } from '../dedupe.ts';
+import { nearest, visibleToRun } from './nearest.ts';
 import { VISIBLE_TO_RUN } from './runs.ts';
 
 export const MAX_POSTMORTEM_ATTEMPTS = 5;
@@ -104,6 +105,8 @@ export type LessonInput = {
   status: LessonStatus;
   source: Lesson['source'];
   embedding: number[];
+  /** The run it was written in (x-fg-run; fg demo seed): recorded when the lesson is first written, never moved. */
+  run?: RunTag | null;
 };
 
 const sha = (s: string) => createHash('sha1').update(s).digest('hex').slice(0, 16);
@@ -193,6 +196,11 @@ export class KnowledgeRepo implements KnowledgeStore {
   async savePostmortem(feedbackId: string, raw: PostMortem, embeddings: { miss: number[]; lesson: number[] }) {
     const pm = redactDeep(raw); // model output can quote secrets it read in the repo
     const now = new Date().toISOString();
+    // A sandbox report's miss and lesson are sandbox records: marked before they are written (this may be the worker,
+    // whose searches have not seen the report).
+    const [k] = await this.g.run('MATCH (k:Candidate {id: $fid}) RETURN coalesce(k.sandbox, false) AS sandbox', { fid: feedbackId });
+    // No candidate read back: marked, since an unknown source fails closed.
+    this.g.sandbox.wrote(k ? k.get('sandbox') : true);
     await this.g.run(
       `MATCH (f:Feedback {id: $fid})-[:FROM_TURN]->(t:Turn)<-[:HAS_TURN]-(s:Session)-[:IN]->(p:Project)
        // The report's run (RunTag), carried to the miss and lesson so a sandbox one is served only to its run.
@@ -387,6 +395,8 @@ export class KnowledgeRepo implements KnowledgeStore {
        FOREACH (_ IN CASE WHEN $draft IS NULL OR l.proposedAs IS NOT NULL OR l.status <> 'proposed' THEN [] ELSE [1] END | SET l.proposedAs = $draft)
        // Only the owner's decision or edit makes it yours (a memory file's re-import then leaves it); a machine's does not.
        SET l += $fields, l.decidedByYou = CASE WHEN $owner THEN true ELSE l.decidedByYou END
+       // New words are checked again at the worker's next round: a flag on the old words (broken-rule) must not stay.
+       FOREACH (_ IN CASE WHEN $words THEN [1] ELSE [] END | SET l.checksVersion = 0)
        FOREACH (_ IN CASE WHEN $status IS NULL THEN [] ELSE [1] END | SET l.status = $status, l.decidedAt = $now, l.decidedBy = $by, l.decisionNote = $note)
        FOREACH (_ IN CASE WHEN $embedding IS NULL THEN [] ELSE [1] END | SET l.embedding = $embedding)
        WITH l
@@ -408,9 +418,18 @@ export class KnowledgeRepo implements KnowledgeStore {
          MERGE (l)-[:SUPERSEDES]->(old)
          SET old.status = 'superseded', old.decidedAt = $now, old.validTo = $now)
        RETURN unscoped`,
-      { id, fields, status: status ?? null, now, by: o.by ?? 'you', owner: ownerDecided(o.by ?? 'you'), note: o.note ? redactSecrets(o.note) : null, embedding: o.reembed ?? null, supersedes: supersedes ?? null, draft, projectKey: projectKey ?? null },
+      { id, fields, status: status ?? null, now, by: o.by ?? 'you', owner: ownerDecided(o.by ?? 'you'), note: o.note ? redactSecrets(o.note) : null, embedding: o.reembed ?? null, supersedes: supersedes ?? null, draft, projectKey: projectKey ?? null,
+        words: Object.values(fields).some((v) => v !== undefined) },
     );
     return { unscoped: rows[0]?.get('unscoped') ?? false };
+  }
+
+  async backfillProposedAs(id: string, draft: LessonDraft): Promise<boolean> {
+    const [r] = await this.g.run(
+      `MATCH (l:Lesson {id: $id}) WHERE l.source = 'postmortem' AND l.proposedAs IS NULL SET l.proposedAs = $draft RETURN count(l) AS n`,
+      { id, draft: JSON.stringify(redactDeep(draftOf(draft))) },
+    );
+    return Number(r?.get('n') ?? 0) > 0;
   }
 
   /** editedDraft of the stored lesson, as redacted JSON text; null when the patch edits nothing it keeps. */
@@ -429,10 +448,13 @@ export class KnowledgeRepo implements KnowledgeStore {
          AND coalesce(l.projectKey, l.originProjectKey) IS NOT NULL
          AND ($projectKeys IS NULL OR coalesce(l.projectKey, l.originProjectKey) IN $projectKeys)
          AND ${OWNER_DECIDED}
+         AND ($outcome IS NULL OR ($outcome = 'rejected' AND l.status = 'rejected')
+              OR ($outcome = 'edited' AND l.status = 'approved' AND l.proposedAs IS NOT NULL)
+              OR ($outcome = 'unedited' AND l.status = 'approved' AND l.proposedAs IS NULL))
        WITH l ORDER BY l.decidedAt DESC, l.id DESC LIMIT $limit
        RETURN l, CASE WHEN $embedding IS NOT NULL AND l.embedding IS NOT NULL AND size(l.embedding) = size($embedding)
          THEN 2 * vector.similarity.cosine(l.embedding, $embedding) - 1 ELSE null END AS score`,
-      { since: q.since, projectKeys: q.projectKeys, limit: neo4j.int(q.limit), embedding: q.embedding ?? null },
+      { since: q.since, projectKeys: q.projectKeys, limit: neo4j.int(q.limit), embedding: q.embedding ?? null, outcome: q.outcome ?? null },
     );
     return rows.map((r) => ({ lesson: lessonOf(r.get('l').properties), score: r.get('score') ?? null }));
   }
@@ -459,14 +481,12 @@ export class KnowledgeRepo implements KnowledgeStore {
   }
 
   async searchLessons(q: { embedding: number[]; projectKey: string | null; k: number; status?: LessonStatus; projectKeys?: string[]; run?: string | null }): Promise<LessonHit[]> {
-    const rows = await this.g.run(
-      `MATCH (node:Lesson {status: $status})
-       WHERE (node.projectKey IS NULL OR node.projectKey = $projectKey) AND ${LEARNED_IN('node')} AND ${VISIBLE_TO_RUN('node')}
-         AND node.embedding IS NOT NULL AND size(node.embedding) = size($embedding)
-       WITH node, vector.similarity.cosine(node.embedding, $embedding) AS score
-       RETURN node, score ORDER BY score DESC LIMIT $k`,
-      { embedding: q.embedding, k: neo4j.int(q.k), projectKey: q.projectKey, status: q.status ?? 'approved', projectKeys: q.projectKeys ?? null, run: q.run ?? null },
-    );
+    const rows = await nearest(this.g, {
+      index: 'lesson_embedding', label: 'Lesson', embedding: q.embedding, k: q.k,
+      where: `node.status = $status AND (node.projectKey IS NULL OR node.projectKey = $projectKey) AND ${LEARNED_IN('node')} AND ${await visibleToRun(this.g, 'node')}`,
+      tail: 'RETURN node, score ORDER BY score DESC LIMIT $k',
+      params: { projectKey: q.projectKey, status: q.status ?? 'approved', projectKeys: q.projectKeys ?? null, run: q.run ?? null },
+    });
     return rows.map((r) => ({ lesson: lessonOf(r.get('node').properties), score: r.get('score') }));
   }
 
@@ -506,16 +526,16 @@ export class KnowledgeRepo implements KnowledgeStore {
   }
 
   async relatedMisses(q: { embedding: number[]; projectKey: string | null; k: number; run?: string | null }): Promise<RelatedMiss[]> {
-    const rows = await this.g.run(
-      `MATCH (node:Miss) WHERE ($projectKey IS NULL OR node.projectKey = $projectKey) AND node.embedding IS NOT NULL AND size(node.embedding) = size($embedding)
-         AND ${VISIBLE_TO_RUN('node')}
-       WITH node, vector.similarity.cosine(node.embedding, $embedding) AS score ORDER BY score DESC LIMIT $k
+    const rows = await nearest(this.g, {
+      index: 'miss_embedding', label: 'Miss', embedding: q.embedding, k: q.k,
+      where: `($projectKey IS NULL OR node.projectKey = $projectKey) AND ${await visibleToRun(this.g, 'node')}`,
+      tail: `WITH node, score ORDER BY score DESC LIMIT $k
        MATCH (node)-[:EXPLAINS]->(:Feedback)-[:FROM_TURN]->(t:Turn)
        RETURN node, t, score,
               EXISTS { MATCH (l:Lesson {status: 'rejected'})-[:DERIVED_FROM]->(node) WHERE l.checks CONTAINS '"name":"wrong-session"' } AS wrongSession
        ORDER BY score DESC`,
-      { embedding: q.embedding, k: neo4j.int(q.k), projectKey: q.projectKey, run: q.run ?? null },
-    );
+      params: { projectKey: q.projectKey, run: q.run ?? null },
+    });
     return rows.map((r) => {
       const m = r.get('node').properties;
       const t = r.get('t').properties;
@@ -549,6 +569,7 @@ export class KnowledgeRepo implements KnowledgeStore {
       return hit.id;
     }
     const id = `manual:${randomUUID()}`;
+    this.g.sandbox.wrote(o.run);
     await this.g.run(
       `MERGE (p:Project {key: $project.key}) ON CREATE SET p.name = $project.name, p.repoPath = $project.repoPath
        CREATE (s:Session {id: $id, sourceFile: 'manual', cwd: $cwd, startedAt: $now, endedAt: $now, manual: true})-[:IN]->(p)
@@ -564,6 +585,7 @@ export class KnowledgeRepo implements KnowledgeStore {
 
   async recordPreDoneCheck(check: { projectKey: string; task: string; checkedLessonIds: string[]; gapLessonIds: string[]; run?: RunTag | null; sessionId?: string | null }) {
     const { run, sessionId, ...c } = check;
+    this.g.sandbox.wrote(run);
     await this.g.run(
       `CREATE (x:PreDoneCheck {id: $id, ts: $now, projectKey: $c.projectKey, task: $c.task,
                               checked: size($c.checkedLessonIds), gaps: size($c.gapLessonIds), run: $run, sandbox: $sandbox,
@@ -576,25 +598,30 @@ export class KnowledgeRepo implements KnowledgeStore {
     );
   }
 
-  async redactStoredLessons(): Promise<number> {
-    let changed = 0;
+  async redactStoredLessons(): Promise<{ redacted: number; flagged: number }> {
+    let redacted = 0;
+    let flagged = 0;
     for (let after = ''; ;) {
       const rows = await this.g.run(
-        'MATCH (l:Lesson) WHERE l.id > $after RETURN l.id AS id, l.title AS title, l.rule AS rule, l.appliesWhen AS appliesWhen ORDER BY l.id LIMIT $page',
+        `MATCH (l:Lesson) WHERE l.id > $after
+         RETURN l.id AS id, l.status AS status, l.title AS title, l.rule AS rule, l.appliesWhen AS appliesWhen, l.checks AS checks ORDER BY l.id LIMIT $page`,
         { after, page: neo4j.int(REDACT_PAGE) },
       );
       if (!rows.length) break;
       after = rows[rows.length - 1].get('id');
       const page = rows.flatMap((r) => {
         const was = { title: (r.get('title') ?? '') as string, rule: (r.get('rule') ?? '') as string, appliesWhen: (r.get('appliesWhen') ?? null) as string | null };
-        const x = { id: r.get('id') as string, title: redactSecrets(was.title), rule: redactSecrets(was.rule), appliesWhen: was.appliesWhen === null ? null : redactSecrets(was.appliesWhen) };
-        return x.title !== was.title || x.rule !== was.rule || x.appliesWhen !== was.appliesWhen ? [x] : [];
+        const checks = typeof r.get('checks') === 'string' ? (JSON.parse(r.get('checks')) as LessonCheck[]) : null;
+        const x = redactStoredLesson({ status: r.get('status') as string, ...was, checks });
+        if (!x) return [];
+        if (x.flagged) flagged++;
+        if (x.title !== was.title || x.rule !== was.rule || x.appliesWhen !== was.appliesWhen) redacted++;
+        return [{ id: r.get('id') as string, title: x.title, rule: x.rule, appliesWhen: x.appliesWhen, checks: x.checks === null ? null : JSON.stringify(x.checks) }];
       });
       if (!page.length) continue;
-      await this.g.run('UNWIND $page AS c MATCH (l:Lesson {id: c.id}) SET l.title = c.title, l.rule = c.rule, l.appliesWhen = c.appliesWhen', { page });
-      changed += page.length;
+      await this.g.run('UNWIND $page AS c MATCH (l:Lesson {id: c.id}) SET l.title = c.title, l.rule = c.rule, l.appliesWhen = c.appliesWhen, l.checks = c.checks', { page });
     }
-    return changed;
+    return { redacted, flagged };
   }
 
   /** Feedback text, then what each miss missed and why. The words of the turn a miss quotes are the Inbox item's. */
@@ -622,8 +649,9 @@ export class KnowledgeRepo implements KnowledgeStore {
     const m = { ...input, feedbackText: redactSecrets(input.feedbackText), whatWasDone: redactSecrets(input.whatWasDone), missed: redactSecrets(input.missed), causeExplanation: redactSecrets(input.causeExplanation) };
     const ts = new Date(m.ts).toISOString();
     const missId = `miss:${m.id}`;
+    this.g.sandbox.wrote(m.run);
     await this.g.run(
-      `MERGE (p:Project {key: $project.key}) ON CREATE SET p.name = $project.name, p.repoPath = $project.repoPath
+      `MERGE (p:Project {key: $project.key}) ON CREATE SET p.name = $project.name, p.repoPath = $project.repoPath, p.demoCreated = true
        MERGE (s:Session {id: $id})
          ON CREATE SET s.sourceFile = 'demo', s.cwd = $project.repoPath, s.startedAt = $ts, s.endedAt = $ts, s.manual = true
        MERGE (s)-[:IN]->(p)
@@ -633,19 +661,22 @@ export class KnowledgeRepo implements KnowledgeStore {
        MERGE (s)-[:HAS_TURN]->(t)
        MERGE (k:Candidate {id: $id})
          ON CREATE SET k.turnUuid = $id, k.sessionId = $id, k.projectKey = p.key, k.ts = $ts, k.status = 'confirmed', k.createdAt = $ts,
-                       k.decidedAt = $ts, k.decidedBy = 'demo', k.note = null, k.manual = true
+                       k.decidedAt = $ts, k.decidedBy = 'demo', k.note = null, k.manual = true, k.run = $run, k.sandbox = $sandbox
        MERGE (k)-[:FLAGS]->(t)
        MERGE (f:Feedback {id: $id})
          ON CREATE SET f.status = 'addressed', f.createdAt = $ts, f.projectKey = p.key
        SET f.text = $text
        MERGE (f)-[:FROM_TURN]->(t)
        MERGE (x:Miss {id: $missId})
-         ON CREATE SET x.outcome = 'addressed', x.createdAt = $ts, x.projectKey = p.key
+         ON CREATE SET x.outcome = 'addressed', x.createdAt = $ts, x.projectKey = p.key, x.run = $run, x.sandbox = $sandbox
        SET x.missed = $missed, x.cause = $cause, x.causeExplanation = $why, x.embedding = $embedding
        MERGE (x)-[:EXPLAINS]->(f)
        MERGE (c:Cause {key: $cause})
        MERGE (x)-[:CAUSED_BY]->(c)`,
-      { project: m.project, id: m.id, ts, text: m.feedbackText, done: m.whatWasDone, missId, missed: m.missed, cause: m.cause, why: m.causeExplanation, embedding: m.embedding },
+      {
+        project: { key: m.project.key, name: m.project.name ?? null, repoPath: m.project.repoPath ?? null }, id: m.id, ts, text: m.feedbackText, done: m.whatWasDone,
+        missId, missed: m.missed, cause: m.cause, why: m.causeExplanation, embedding: m.embedding, run: m.run?.id ?? null, sandbox: m.run?.sandbox ? true : null,
+      },
     );
     return missId;
   }
@@ -683,20 +714,34 @@ export class KnowledgeRepo implements KnowledgeStore {
        DETACH DELETE cf`,
       { key: projectKey, demo: DEMO_SOURCE },
     );
+    // The project, when the seed created it (saveDemoMiss) and nothing at all refers to it now: no relationship, and
+    // no node of any label (read from the database, so a label added later counts too) naming its key.
+    // Every data label in use, each quoted (a backtick doubled), none left out: a guard is never dropped for its name.
+    const labels = (await this.g.run('CALL db.labels() YIELD label RETURN label')).map((r) => r.get('label') as string).filter((l) => !NOT_DATA.has(l));
+    const [project] = await this.g.run(
+      `MATCH (p:Project {key: $key}) WHERE coalesce(p.demoCreated, false) AND NOT coalesce(p.pinned, false) AND size(coalesce(p.aliases, [])) = 0
+         AND NOT (p)--()
+         AND NOT EXISTS { MATCH (l:ProjectLink) WHERE l.a = $key OR l.b = $key }
+         AND NOT EXISTS { MATCH (s:ProjectSelection) WHERE $key IN coalesce(s.tracked, []) }
+         ${labels.map((label) => `AND NOT EXISTS { MATCH (x:\`${label.replaceAll('`', '``')}\`) WHERE x.projectKey = $key OR x.originProjectKey = $key }`).join('\n         ')}
+       WITH collect(p) AS ps FOREACH (p IN ps | DELETE p) RETURN size(ps) AS n`,
+      { key: projectKey },
+    );
     const count = (r: { get(k: string): unknown } | undefined) => {
       const v = r?.get('n');
       return neo4j.isInt(v) ? v.toNumber() : Number(v ?? 0);
     };
-    return { lessons: count(lessons), misses: count(misses), facts: count(facts) };
+    return { lessons: count(lessons), misses: count(misses), facts: count(facts), projectRemoved: count(project) > 0 };
   }
 
   async upsertLesson(input: LessonInput) {
     const l = redactDeep(input);
     const now = new Date().toISOString();
+    this.g.sandbox.wrote(input.run);
     await this.g.run(
       `MERGE (l:Lesson {id: $l.id})
          ON CREATE SET l.createdAt = $now, l.status = $l.status, l.decidedAt = CASE WHEN $l.status = 'proposed' THEN null ELSE $now END, l.source = $l.source,
-                       l.projectKey = $l.projectKey, l.originProjectKey = $l.projectKey
+                       l.projectKey = $l.projectKey, l.originProjectKey = $l.projectKey, l.run = $run, l.sandbox = $sandbox
        // Once you have decided on or edited a lesson, re-importing its file never overrides you.
        WITH l, coalesce(l.decidedByYou, false) AS yours
        FOREACH (_ IN CASE WHEN yours THEN [] ELSE [1] END |
@@ -705,10 +750,13 @@ export class KnowledgeRepo implements KnowledgeStore {
        WITH l WHERE $l.projectKey IS NOT NULL
        MERGE (p:Project {key: $l.projectKey})
        MERGE (l)-[:APPLIES_TO]->(p)`,
-      { l, now },
+      { l, now, run: input.run?.id ?? null, sandbox: input.run?.sandbox ? true : null },
     );
   }
 }
+
+/** Labels that name a project by key but are not data under it: the project itself, and the log (the seed logs there). */
+const NOT_DATA = new Set(['Project', 'Activity']);
 
 function turnOf(p: Record<string, unknown>): HumanTurn {
   return {

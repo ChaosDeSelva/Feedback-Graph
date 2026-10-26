@@ -59,7 +59,7 @@ test('facts checked by an older rule are checked again once: instruction-file an
   const { facts: store, applied, removed } = fakeStore(facts);
   const activity: ActivityInput[] = [];
   const r = await recheckFacts({ facts: store, projects: async () => [{ key: 'demo', repoPath: dir }], maxBytes: 80_000, activity: { record: async (a) => { activity.push(a); } }, batch: 3 });
-  expect(r).toEqual({ checked: 7, closed: 2, linesDropped: 1 });
+  expect(r).toEqual({ checked: 7, closed: 2, linesDropped: 1, shortened: 0, recalibrated: 0 });
   const by = Object.fromEntries(applied.map((c) => [facts.find((f) => f.id === c.id)!.statement, c]));
   expect(by['Webapp code lives under core'].keep).toBe(false);
   expect(by['the old router is lazy'].keep).toBe(false);
@@ -79,14 +79,14 @@ test('facts checked by an older rule are checked again once: instruction-file an
   expect(activity[0].details).toMatchObject({ checkVersion: FACT_CHECK_VERSION, closed: [expect.objectContaining({ path: 'AGENTS.md' }), expect.objectContaining({ path: 'src/gone.ts' })] });
 
   // Once: a second run finds nothing to do and logs nothing.
-  expect(await recheckFacts({ facts: store, projects: async () => [{ key: 'demo', repoPath: dir }], maxBytes: 80_000, activity: { record: async (a) => { activity.push(a); } } })).toEqual({ checked: 0, closed: 0, linesDropped: 0 });
+  expect(await recheckFacts({ facts: store, projects: async () => [{ key: 'demo', repoPath: dir }], maxBytes: 80_000, activity: { record: async (a) => { activity.push(a); } } })).toEqual({ checked: 0, closed: 0, linesDropped: 0, shortened: 0, recalibrated: 0 });
   expect(activity).toHaveLength(1);
 });
 
 test('a project whose folder is not there is left alone: its facts are not closed as "missing files"', async () => {
   const { facts: store, applied } = fakeStore([stored('src/pool.ts', 'x')]);
   const r = await recheckFacts({ facts: store, projects: async () => [{ key: 'demo', repoPath: join(tmpdir(), 'fb-no-such-folder') }], maxBytes: 80_000 });
-  expect(r).toEqual({ checked: 0, closed: 0, linesDropped: 0 });
+  expect(r).toEqual({ checked: 0, closed: 0, linesDropped: 0, shortened: 0, recalibrated: 0 });
   expect(applied).toEqual([]);
 });
 
@@ -108,7 +108,7 @@ test('a wrong mount where only package.json and the README exist is skipped for 
   const { facts: store, applied, removed } = fakeStore(facts);
   const log: { msg: string; extra?: object }[] = [];
   const r = await recheckFacts({ facts: store, projects: async () => [{ key: 'demo', repoPath: dir }], maxBytes: 80_000, batch: 3, log: (msg, extra) => log.push({ msg, extra }) });
-  expect(r).toEqual({ checked: 0, closed: 0, linesDropped: 0 });
+  expect(r).toEqual({ checked: 0, closed: 0, linesDropped: 0, shortened: 0, recalibrated: 0 });
   expect(applied).toEqual([]);
   expect(removed).toEqual([]);
   expect(log[0].msg).toMatch(/skipped/);
@@ -124,4 +124,74 @@ test('the missing-file guard is per project, not per batch: one gone file among 
   const r = await recheckFacts({ facts: store, projects: async () => [{ key: 'demo', repoPath: dir }], maxBytes: 80_000, batch: 5 });
   expect(r).toMatchObject({ checked: 11, closed: 5 });
   expect(removed).toEqual(['src/a-gone.ts']);
+});
+
+test('the new rules migrate stored facts once: a long dependency list is summarized (re-embedded), generous relevance calibrated, yours untouched, and it is logged', async () => {
+  const dir = repo();
+  const list = Array.from({ length: 200 }, (_, i) => `@acme/feature-${i} ^1.${i}.0`).join(', ');
+  const facts = [
+    stored('package.json', `Dependencies: react ^18, ${list}.`, null, { kind: 'dependency', origin: 'manifest', relevance: 0.5 }),
+    stored('package.json', '`dev` script runs: vite', null, { kind: 'command', origin: 'manifest', relevance: 0.7 }),
+    ...Array.from({ length: 6 }, (_, i) => stored('src/pool.ts', `\`createPool\` rule ${i}`, null, { kind: 'convention', relevance: 0.9 })),
+    stored('src/pool.ts', '`createPool` returns a new pg Pool', null, { kind: 'api', relevance: 0.95 }),
+    stored('src/pool.ts', '`MAX_CLIENTS` is 10', null, { kind: 'api', relevance: 0.95, relevanceBy: 'you' }),
+  ];
+  const { facts: store, applied } = fakeStore(facts);
+  const relevance: { id: string; relevance: number; by: string }[] = [];
+  const activity: ActivityInput[] = [];
+  const embedded: string[][] = [];
+  const r = await recheckFacts({
+    facts: { ...store, setFactRelevance: async (u) => { relevance.push(...u); return u.length; } },
+    projects: async () => [{ key: 'demo', repoPath: dir }],
+    maxBytes: 80_000,
+    activity: { record: async (a) => { activity.push(a); } },
+    embed: async (texts) => { embedded.push(texts); return texts.map(() => [0.5]); },
+  });
+  const dep = applied.find((c) => c.id === facts[0].id)!;
+  expect(dep.keep).toBe(true);
+  expect(dep.statement!.length).toBeLessThanOrEqual(300);
+  expect(dep.statement).toMatch(/^Dependencies \(201\): react \^18, /);
+  expect(dep.embedding).toEqual([0.5]);
+  expect(embedded.flat()).toEqual([`package.json: ${dep.statement}`]);
+  // A statement that is fine is not rewritten.
+  expect(applied.find((c) => c.id === facts[1].id)!.statement ?? null).toBeNull();
+  // One endpoint's API is not everyday; past a quarter of the scored facts, conventions are not either. Yours stays.
+  const byId = Object.fromEntries(relevance.map((u) => [u.id, u]));
+  expect(byId[facts[8].id]).toEqual({ id: facts[8].id, relevance: 0.7, by: 'model' });
+  expect(byId[facts[9].id]).toBeUndefined();
+  expect(relevance.every((u) => u.by === 'model')).toBe(true);
+  expect(r).toMatchObject({ shortened: 1, recalibrated: relevance.length });
+  expect(activity.some((a) => /summarized/.test(a.subject) && /relevance/.test(a.subject))).toBe(true);
+});
+
+test('a dependency fact is summarized only when its list can be read; the original is kept in Activity so it can be restored', async () => {
+  const dir = repo();
+  const list = Array.from({ length: 200 }, (_, i) => `@acme/feature-${i} ^1.${i}.0`).join(', ');
+  // A model's dependency fact with no "Dependencies:" section: cutting it would lose what it says. It is left alone.
+  const prose = `The workspace pins ${list} through the root lockfile`;
+  const facts = [
+    stored('package.json', `Dependencies: react ^18, ${list}.`, null, { kind: 'dependency', origin: 'manifest' }),
+    stored('package.json', prose, null, { kind: 'dependency' }),
+  ];
+  const { facts: store, applied } = fakeStore(facts);
+  const activity: ActivityInput[] = [];
+  await recheckFacts({ facts: store, projects: async () => [{ key: 'demo', repoPath: dir }], maxBytes: 80_000, activity: { record: async (a) => { activity.push(a); } } });
+  expect(applied.find((c) => c.id === facts[1].id)!.statement ?? null).toBeNull();
+  const shortened = activity.flatMap((a) => (a.details?.shortened ?? []) as { id: string; original?: string }[]);
+  expect(shortened.map((s) => s.id)).toEqual([facts[0].id]);
+  expect(shortened[0].original).toBe(facts[0].statement);
+});
+
+test('every summarized dependency fact keeps its original, past the listing cap too', async () => {
+  const dir = repo();
+  const list = Array.from({ length: 80 }, (_, i) => `@acme/feature-${i} ^1.${i}.0`).join(', ');
+  const facts = Array.from({ length: 120 }, (_, i) => stored(`pkg${i}/package.json`, `Dependencies: react ^18, ${list}.`, null, { kind: 'dependency', origin: 'manifest' }));
+  for (let i = 0; i < 120; i++) mkdirSync(join(dir, `pkg${i}`), { recursive: true }), writeFileSync(join(dir, `pkg${i}/package.json`), '{}');
+  const { facts: store } = fakeStore(facts);
+  const activity: ActivityInput[] = [];
+  const r = await recheckFacts({ facts: store, projects: async () => [{ key: 'demo', repoPath: dir }], maxBytes: 80_000, activity: { record: async (a) => { activity.push(a); } } });
+  expect(r.shortened).toBe(120);
+  const originals = activity.flatMap((a) => (a.details?.shortened ?? []) as { id: string; original?: string }[]);
+  expect(new Set(originals.map((s) => s.id)).size).toBe(120);
+  expect(originals.every((s) => s.original?.startsWith('Dependencies: react ^18, '))).toBe(true);
 });

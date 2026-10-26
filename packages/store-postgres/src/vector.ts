@@ -10,6 +10,7 @@
  * answer. The score is Neo4j's vector.similarity.cosine, (1 + cos) / 2 = 1 - distance / 2.
  */
 import type pg from 'pg';
+import { SandboxPresence } from '@fb/core';
 import { toVector, tx, type Db } from './db.ts';
 
 export type SqlQuery = { sql: string; params: unknown[] };
@@ -63,12 +64,54 @@ const vectorParam = (v: number[]) => (v.length ? toVector(v) : null);
  */
 export const visibleToRun = (t: string, param: string) => `(NOT ${t}.sandbox OR ${t}.run IS NOT DISTINCT FROM ${param}::text)`;
 
-export function searchFactsQuery(db: Db, q: { embedding: number[]; projectKey: string; k: number; run?: string | null }, columns: string): SqlQuery {
+/**
+ * The searches' run filter: visibleToRun while any sandbox record exists (o.sandbox, from sandboxPresence; unset
+ * counts as yes), else none, with the same answer. The parameter stays named so its type is known.
+ */
+const runFilter = (t: string, param: string, o: SearchOpts) => (o.sandbox === false ? `(true OR ${param}::text IS NULL)` : visibleToRun(t, param));
+export type SearchOpts = { sandbox?: boolean };
+
+/** The tables a sandbox run's records carry `sandbox` in (chunks go with their document). */
+const SANDBOX_TABLES = ['candidates', 'lessons', 'misses', 'facts', 'docs', 'project_links'];
+const presence = new Map<string, SandboxPresence>();
+
+/** The database a pool reaches (server, port, name), without its options: two pools on one database share a presence. */
+function databaseKey(pool: pg.Pool): string {
+  const o = (pool as unknown as { options: pg.PoolConfig }).options;
+  try {
+    if (o.connectionString) {
+      const u = new URL(o.connectionString);
+      return `${u.hostname}:${u.port}${u.pathname}`;
+    }
+  } catch {
+    // Not a URL: keyed by the string below.
+  }
+  return `${o.host ?? ''}:${o.port ?? ''}/${o.database ?? ''}|${o.connectionString ?? ''}`;
+}
+
+/**
+ * Whether this database holds any sandbox record (core SandboxPresence): one per database in this process, so a
+ * sandbox write through any pool on it is seen by every store's searches at once.
+ */
+export function sandboxPresence(db: Db): SandboxPresence {
+  const key = databaseKey(db.pool);
+  let p = presence.get(key);
+  if (!p) {
+    p = new SandboxPresence(async () => {
+      const { rows } = await db.pool.query<{ any: boolean }>(`SELECT ${SANDBOX_TABLES.map((t) => `EXISTS (SELECT 1 FROM ${t} WHERE sandbox)`).join(' OR ')} AS any`);
+      return rows[0]?.any === true;
+    });
+    presence.set(key, p);
+  }
+  return p;
+}
+
+export function searchFactsQuery(db: Db, q: { embedding: number[]; projectKey: string; k: number; run?: string | null }, columns: string, o: SearchOpts = {}): SqlQuery {
   const v = vectorTerms(db, 'f.embedding', '$2', q.embedding.length);
   return {
     sql: `SELECT ${columns}, cf.summary AS file_summary, cf.hash_changed_at AS file_changed_at, 1 - x.distance / 2 AS score
           FROM (SELECT f.*, ${v.distance} AS distance FROM facts f
-                WHERE f.project_key = $1 AND f.current AND ${visibleToRun('f', '$4')} AND ${v.where}
+                WHERE f.project_key = $1 AND f.current AND ${runFilter('f', '$4', o)} AND ${v.where}
                 ORDER BY ${v.distance}, f.id LIMIT $3) x
           LEFT JOIN code_files cf ON cf.id = x.code_file_id
           ORDER BY score DESC, x.id`,
@@ -80,12 +123,12 @@ export function searchFactsQuery(db: Db, q: { embedding: number[]; projectKey: s
  * A chunk carries its document's run and sandbox flag (upsertDoc, saveDocReading), so another run's sandbox upload is
  * left out inside the scan, as facts are, and the search still finds k hits when such chunks are the nearest.
  */
-export function searchDocsQuery(db: Db, q: { embedding: number[]; projectKey: string; k: number; run?: string | null }): SqlQuery {
+export function searchDocsQuery(db: Db, q: { embedding: number[]; projectKey: string; k: number; run?: string | null }, o: SearchOpts = {}): SqlQuery {
   const v = vectorTerms(db, 'c.embedding', '$2', q.embedding.length);
   return {
     sql: `SELECT d.id AS doc_id, d.source, d.ref, d.title, d.url, x.text, 1 - x.distance / 2 AS score
           FROM (SELECT c.id, c.doc_id, c.text, ${v.distance} AS distance FROM chunks c
-                WHERE c.project_key = $1 AND ${visibleToRun('c', '$4')} AND ${v.where}
+                WHERE c.project_key = $1 AND ${runFilter('c', '$4', o)} AND ${v.where}
                 ORDER BY ${v.distance}, c.id LIMIT $3) x
           JOIN docs d ON d.id = x.doc_id
           ORDER BY score DESC, x.id`,
@@ -97,12 +140,12 @@ export function searchDocsQuery(db: Db, q: { embedding: number[]; projectKey: st
 export const learnedIn = (t: string, param: string) =>
   `(${param}::text[] IS NULL OR coalesce(${t}.project_key, ${t}.origin_project_key) IS NULL OR coalesce(${t}.project_key, ${t}.origin_project_key) = ANY(${param}))`;
 
-export function searchLessonsQuery(db: Db, q: { embedding: number[]; projectKey: string | null; k: number; status?: string; projectKeys?: string[]; run?: string | null }): SqlQuery {
+export function searchLessonsQuery(db: Db, q: { embedding: number[]; projectKey: string | null; k: number; status?: string; projectKeys?: string[]; run?: string | null }, o: SearchOpts = {}): SqlQuery {
   const v = vectorTerms(db, 'l.embedding', '$1', q.embedding.length);
   return {
     sql: `SELECT x.*, 1 - x.distance / 2 AS score
           FROM (SELECT l.*, ${v.distance} AS distance FROM lessons l
-                WHERE l.status = $2 AND (l.project_key IS NULL OR l.project_key = $3) AND ${learnedIn('l', '$5')} AND ${visibleToRun('l', '$6')} AND ${v.where}
+                WHERE l.status = $2 AND (l.project_key IS NULL OR l.project_key = $3) AND ${learnedIn('l', '$5')} AND ${runFilter('l', '$6', o)} AND ${v.where}
                 ORDER BY ${v.distance}, l.id LIMIT $4) x
           ORDER BY score DESC, x.id`,
     params: [vectorParam(q.embedding), q.status ?? 'approved', q.projectKey, q.k, q.projectKeys ?? null, q.run ?? null],
@@ -110,14 +153,14 @@ export function searchLessonsQuery(db: Db, q: { embedding: number[]; projectKey:
 }
 
 /** The k nearest misses first, then their feedback, as Neo4j does: a miss whose chain is broken drops out after the limit. */
-export function relatedMissesQuery(db: Db, q: { embedding: number[]; projectKey: string | null; k: number; run?: string | null }): SqlQuery {
+export function relatedMissesQuery(db: Db, q: { embedding: number[]; projectKey: string | null; k: number; run?: string | null }, o: SearchOpts = {}): SqlQuery {
   const v = vectorTerms(db, 'm.embedding', '$1', q.embedding.length);
   return {
     sql: `SELECT n.id, n.missed, n.cause, 1 - n.distance / 2 AS score, t.text, t.session_id, t.ts_text,
                  EXISTS (SELECT 1 FROM lessons l WHERE l.miss_id = n.id AND l.status = 'rejected'
                            AND l.checks @> '[{"name": "wrong-session"}]'::jsonb) AS wrong_session
           FROM (SELECT m.id, m.missed, m.cause, m.feedback_id, ${v.distance} AS distance FROM misses m
-                WHERE ($2::text IS NULL OR m.project_key = $2) AND ${visibleToRun('m', '$4')} AND ${v.where}
+                WHERE ($2::text IS NULL OR m.project_key = $2) AND ${runFilter('m', '$4', o)} AND ${v.where}
                 ORDER BY ${v.distance}, m.id LIMIT $3) n
           JOIN feedback f ON f.id = n.feedback_id JOIN turns t ON t.uuid = f.turn_uuid
           ORDER BY score DESC, n.id`,

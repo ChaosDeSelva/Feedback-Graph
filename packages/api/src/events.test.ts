@@ -218,6 +218,23 @@ describe('GET /api/events', () => {
     expect((await app.request('/api/events')).status).toBe(200);
   });
 
+  test('shutting down ends every open stream at once, and refuses new ones', async () => {
+    const closing = new AbortController();
+    const app = createApp(repo, { system: { version: 'x', ping: async () => true, worker: async () => beat('ingest') }, closing: closing.signal });
+    const res = await app.request('/api/events');
+    const reader = res.body!.getReader();
+    await readUntil(reader, (t) => t.includes('event: stage'));
+    closing.abort();
+    let done = false;
+    for (let i = 0; i < 5 && !done; i++) {
+      const r = reader.read().then((x) => x.done);
+      await vi.advanceTimersByTimeAsync(10);
+      done = await r;
+    }
+    expect(done).toBe(true);
+    expect((await app.request('/api/events')).status).toBe(503);
+  });
+
   test('needs the token like every other read', async () => {
     const app = createApp(repo, { auth: { token: 'x'.repeat(30) } });
     expect((await app.request('/api/events')).status).toBe(401);

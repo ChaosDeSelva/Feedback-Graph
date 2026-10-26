@@ -16,7 +16,7 @@ cd "$here"
 
 usage() {
   cat <<'EOF'
-usage: ./scripts/setup.sh [--yes] [--pull-models] [--projects <dirs>] [--github-token-file <file>]
+usage: ./scripts/setup.sh [--yes] [--pull-models] [--projects <dirs>] [--select <keys>] [--github-token-file <file>]
                           [--linear-key-file <file>] [--claude-token-file <file>]
 
 Write .env, mount the project folders, check Ollama (including structured output) and offer to start the stack.
@@ -25,23 +25,37 @@ In a terminal it asks; these answer without one:
   --yes, -y                  yes to every question: pull missing models, start the stack, connect your agents
   --pull-models              pull missing Ollama models (and nothing else unasked)
   --projects <dirs>          the project folders, comma-separated (same as PROJECTS_DIRS=<dirs>)
+  --select <keys>            the projects to read: folder names under the project folders, comma-separated
+                             (acme,demo-shop). Written to .env as INGEST_PROJECTS, which seeds the selection on the next
+                             start until one is made (in Settings); after that Settings decides
   --github-token-file <f>    GITHUB_TOKEN from a file you wrote (read-only token); written to .env, never printed
   --linear-key-file <f>      LINEAR_API_KEY from a file, the same way
   --claude-token-file <f>    CLAUDE_CODE_OAUTH_TOKEN (from claude setup-token) from a file, the same way
   -h, --help                 this text
+
+A second install on this machine (another checkout): Docker Compose names containers and volumes after FG_INSTANCE
+(default feedback-graph), so two folders under one name are one install, and the second takes over the first. A first
+run (no .env yet) in a folder whose name another folder's install already runs under writes
+FG_INSTANCE=feedback-graph-<folder> and moves every port it publishes 10 or more apart: API_PORT (8787),
+NEO4J_HTTP_PORT (7476), NEO4J_BOLT_PORT (7689), POSTGRES_PORT (5434) and OLLAMA_PORT (11435, the bundled ollama
+profile). FG_INSTANCE=<name> ./scripts/setup.sh chooses the name. An existing .env is never renamed: setup says what to
+set, and does not start, or connect agents to, a folder whose name another folder's install runs under.
+./scripts/install-agent.sh registers a second install as its own MCP server, feedback-graph-<name>, and leaves the
+first install's skill links and Codex guidance as they are.
 EOF
 }
 
-yes=0 pull_models=0 github_file="" linear_file="" claude_file=""
+yes=0 pull_models=0 github_file="" linear_file="" claude_file="" select_raw="" select_given=0
 while [ $# -gt 0 ]; do
   case "$1" in
     -h | --help) usage; exit 0 ;;
     -y | --yes) yes=1 ;;
     --pull-models) pull_models=1 ;;
-    --projects | --github-token-file | --linear-key-file | --claude-token-file)
+    --projects | --select | --github-token-file | --linear-key-file | --claude-token-file)
       [ $# -ge 2 ] && [ -n "$2" ] || { echo "$1 needs a value" >&2; usage >&2; exit 1; }
       case "$1" in
         --projects) export PROJECTS_DIRS="$2" ;;
+        --select) select_raw="$2" select_given=1 ;;
         --github-token-file) github_file="$2" ;;
         --linear-key-file) linear_file="$2" ;;
         --claude-token-file) claude_file="$2" ;;
@@ -139,6 +153,51 @@ else
   echo "project folders (from $from): $joined"
 fi
 
+# The projects to read (--select, or the first run's question): folder keys under the project folders, as the app names
+# them (a nested repo a/b is a__b). Checked here, before .env is touched. Prints the keys comma-joined.
+under_roots() { # is $1 a folder under one of the project folders (resolved, so a link cannot lead out)?
+  local d rel="${1//__//}" p root
+  for d in "${dirs[@]+"${dirs[@]}"}"; do
+    p="$(cd "$d/$rel" 2>/dev/null && pwd -P)" || continue
+    root="$(cd "$d" 2>/dev/null && pwd -P)" || continue
+    case "$p" in "$root"/*) return 0 ;; esac
+  done
+  return 1
+}
+select_keys() {
+  local raw="$1" k out="" parts=()
+  IFS=',' read -r -a parts <<< "$raw"
+  for k in "${parts[@]+"${parts[@]}"}"; do
+    k="$(printf '%s' "$k" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+    [ -n "$k" ] || continue
+    case "$k" in
+      .* | *[!A-Za-z0-9._-]*) echo "--select: $k is not a folder name (letters, digits, . _ -, comma-separated); choose it in Settings instead" >&2; return 1 ;;
+    esac
+    # A nested key (a__b is the folder a/b): every part a plain folder name, never empty, hidden, . or .. (which would
+    # climb out of the project folders).
+    local seg segs=()
+    IFS=$'\n' read -r -d '' -a segs < <(printf '%s' "${k//__/$'\n'}"; printf '\0') || true
+    case "$k" in *____* | __* | *__) segs+=('') ;; esac
+    for seg in "${segs[@]+"${segs[@]}"}"; do
+      case "$seg" in '' | .*) echo "--select: $k is not a folder name (each part a plain folder name); choose it in Settings instead" >&2; return 1 ;; esac
+    done
+    under_roots "$k" || { echo "--select: $k is not a folder under your project folders (${joined:-none yet})" >&2; return 1; }
+    case ",$out," in *",$k,"*) ;; *) out="${out:+$out,}$k" ;; esac
+  done
+  printf '%s' "$out"
+}
+# The top-level folders under the project folders, for the first run's question.
+found_projects() {
+  local d
+  for d in "${dirs[@]+"${dirs[@]}"}"; do find "$d" -mindepth 1 -maxdepth 1 -type d ! -name '.*' 2>/dev/null; done |
+    while IFS= read -r p; do basename "$p"; done | sort -u
+}
+selected=""
+if [ "$select_given" = 1 ]; then
+  selected="$(select_keys "$select_raw")" || exit 1
+  [ -n "$selected" ] || { echo "--select: no project named" >&2; exit 1; }
+fi
+
 # Bind-mount sources Docker would otherwise create, owned by root, on first start. (An empty ~/.codex/sessions does not
 # make install-agent.sh think Codex is installed: it looks for the CLI or Codex's own config or login.)
 mkdir -p state/settings "$claude_projects"
@@ -212,6 +271,7 @@ if [ -f .env ]; then
     echo "    HOST_GID=$run_gid"
   fi
 else
+  wrote_env=1
   codex=""
   [ -f "$HOME/.codex/auth.json" ] && codex="$HOME/.codex/auth.json"
   # The folders as given (none, one or several), so .env says what is mounted.
@@ -264,6 +324,26 @@ secret_from_file() {
 secret_from_file "$github_file" GITHUB_TOKEN token
 secret_from_file "$linear_file" LINEAR_API_KEY key
 secret_from_file "$claude_file" CLAUDE_CODE_OAUTH_TOKEN token
+
+# Which projects are read is yours to choose. On a first run in a terminal you can choose here, from the folders found;
+# --select chooses without one (also on a later run, when the stack started before anything was chosen). Either way it
+# is INGEST_PROJECTS, which the app takes only while no selection has been made; after that, Settings decides.
+if [ -z "$selected" ] && [ "${wrote_env:-0}" = 1 ] && typing && [ -z "$(envval INGEST_PROJECTS)" ]; then
+  found="$(set +o pipefail; found_projects || true)"
+  if [ -n "$found" ]; then
+    n="$(printf '%s\n' "$found" | wc -l | tr -d ' ')"
+    echo "Which of these projects should be read? Only the ones you choose are read (Settings changes it later)."
+    echo "  $(printf '%s\n' "$found" | head -n 40 | paste -sd, - | sed 's/,/, /g')$([ "$n" -le 40 ] || echo " (and $((n - 40)) more)")"
+    answer=""
+    read -r -p "Projects to read, comma-separated (Enter to choose later in Settings): " answer || true
+    if [ -n "$answer" ]; then selected="$(select_keys "$answer")" || { echo "nothing chosen here: choose them in Settings"; selected=""; }; fi
+  fi
+fi
+if [ -n "$selected" ]; then
+  setenv INGEST_PROJECTS "$selected"
+  echo "INGEST_PROJECTS=$selected saved to .env: these projects are read from the next start, until a selection is made"
+  echo "  (in Settings, which decides from then on)"
+fi
 
 # Settings shows these as the saved roots, so it agrees with what is mounted (the api compares the two).
 # Not when nothing was chosen at all: then there is nothing to say.
@@ -408,6 +488,16 @@ if [ "$(envval STORE)" = postgres ] && [ -z "$(envval DATABASE_URL)" ] && [ "$(e
 fi
 api_port="$(envval API_PORT)"
 url="http://localhost:${api_port:-8787}"
+if [ -n "$taken_by" ]; then
+  # docker compose here would recreate the other folder's containers from this folder's files (and its data with
+  # them), and install-agent.sh would point its agents here: neither is done, even with --yes.
+  echo "not starting: the install in $taken_by runs under the Docker Compose name $current_name, which this folder's .env"
+  echo "  also uses, so docker compose up here would take over its containers and its data, and connecting agents would"
+  echo "  repoint its skills. Set FG_INSTANCE=feedback-graph-${slug:-2} and other ports (API_PORT, NEO4J_HTTP_PORT,"
+  echo "  NEO4J_BOLT_PORT, POSTGRES_PORT, OLLAMA_PORT) in .env, then run ./scripts/setup.sh again."
+  [ "$yes" = 1 ] && exit 1
+  exit 0
+fi
 if confirm "Start Feedback Graph now (docker compose up -d --build; restarts it to apply .env and project folder changes)? [Y/n]" y; then
   "${compose[@]}" up -d --build
   auth=()

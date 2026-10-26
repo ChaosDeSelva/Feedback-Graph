@@ -1,5 +1,114 @@
 # Changelog
 
+## 0.6.3 (2026-10-26)
+
+From the team's 0.6.2 field report (an upgraded live install, a real ticket, the learning loop with Claude Code and Codex,
+a second install with planted secrets, stress and cloud). 0.6.2 got the plumbing right; this release makes its centre,
+lessons right the first time, visible to the agent and to you.
+
+### Corrections to the 0.6.2 notes
+- "A cut code map keeps the files it left out" needed a cloud that understands it, and none deployed did. Now the client
+  cuts a code map only for a cloud that says it keeps the files (the cloud from this release does); against an older
+  cloud the project fails with what to do, and nothing is withdrawn.
+- "A run belongs to whoever opened it" was per kind of credential; it is now per caller (see Runs).
+- "Sandbox runs reach only that run" did not cover Activity; now it does.
+- "Operator decisions counted apart" were computed but not shown; now they are.
+- "Each cloud project is sent once more": no one-off step; the first sync after the upgrade resends each project because
+  the unchanged-check changed form.
+- "60 only after an edit" was the team's count, not what 0.6.2 showed (81 / 0): the edits made before 0.6.2 are now
+  recovered (see Lessons).
+
+### Upgrading
+- At the first worker start (each once, logged in Activity): the writer's draft of lessons edited before 0.6.2 is
+  recovered from Activity; lesson checks v5; redaction v5 (now over Ask messages too; approved lesson text is never
+  rewritten; subjects are redacted before they are cut); git instructions are detached from files; long dependency facts are shortened; fact relevance is
+  recalibrated (yours untouched); data folders' facts are forgotten. Steps that read session evidence wait for the
+  transcript re-read.
+- **Every project needs one full rescan:** the scanner changed (shards by service, enforced budgets), so `fg status`
+  recommends it. A scan spends your model budget; none starts on its own.
+- Store migrations 0044 to 0046.
+- **A second install** that would run under another folder's Compose name is refused by `setup.sh` (`doctor.sh` fails,
+  `fg` warns), and its `install-agent.sh` leaves the first install's skills and Codex guidance alone.
+  `setup.sh --select acme,demo-shop` chooses the projects to read on a first run without the UI.
+
+### check_before_done
+- **A catch keeps its line:** when the judge model flags a lesson but leaves out its evidence, it is asked once more, or
+  the line it quoted in its reason is used, so a violation is a gap with its diff line, not "cannot tell".
+- **A cut diff is always said** ("diff cut to fit (30.5 of 47.0 KB shown), files not shown: …"), even when no lesson
+  applied, and the answer and `/api/status` name the judge model.
+
+### What agents are served
+- **Approved lessons are chosen by how far they stand out for the task,** not by a fixed floor (on real embeddings an
+  unrelated task scored 0.35 to 0.6 against every lesson): a nonsense task gets none. A lesson is served as a rule only
+  when it is tied to a file you named, stands out clearly, or shares a topic with the task; weaker matches are listed
+  under "Possibly related lessons" and never judged at done.
+- **search_graph** gives misses, facts and docs their room; **impact** lists the nearest dependents first. Each section
+  says what it cut.
+- "Your own change" marks only facts about files your session edited, written after it started. Named files too big or
+  secret-named for the code map say so. `brief: true` keeps the named files. The prompt hook brings back a lesson or
+  miss it had to clip. Session summaries end at a sentence. A git instruction ("don't push a PR yet") is never tied to
+  files.
+
+### Speed and robustness
+- **MCP searches on Neo4j use the vector indexes** (no search did before): 32 concurrent searches went from 16 to 200
+  per second at 2,000 lessons, p95 2.3 s to 0.27 s. Neither store applies the sandbox filter until a sandbox run has
+  written something.
+- **check_before_done queues judge calls** (`CHECK_CONCURRENCY`, default 2), says how many checks it waited behind, and
+  answers "not judged" after `CHECK_WAIT_SECONDS` (default 300, enough for a local model; the judge and its retry share it, and a check that gives up cancels its model call): never a pass, never a gap. A judge that fails answers "not judged" with the reason, never an error.
+- **Ask answers questions to different models at once,** and a waiting question shows its place in line.
+- The largest upload no longer fails: it is embedded in batches, and a big file is taken at once (202) and stored in the
+  background. An API restart ends event streams at once; idle connections are kept 65 s. Inbox list rows stay small;
+  Activity subjects are capped at 500 characters (the entry says how long the original was).
+
+### Safer by default
+- A judge that fails answers "not judged" with the reason, never an error; a project with only a few approved lessons
+  still gets the one on its task in other words (a nonsense task still gets none).
+- A scan's top-up run that fails keeps the first pass's facts. Real source in folders named `archive/` or `spec/` gets
+  its full budget; a folder of game content or decision records is scanned; only big log, transcript, export and dump
+  folders are left out.
+- `fg cleanup` keeps the history of records it keeps and never removes a change it did not list. A large upload shows
+  "embedding" until stored, or why it failed. "May hold a secret" clears once you edit the secret out. A dependency fact
+  is shortened only when its list can be read, and its full text is kept in Activity.
+
+### Lessons
+- **The quality numbers count your edits from before 0.6.2** (recovered from Activity), and show operator-token
+  decisions apart. The post-mortem's examples come from each kind of decision (edited, rejected, approved as written),
+  and Activity records which it was shown.
+- Lesson checks v5: "rule repaired" follows the rule as it is now and an edit re-checks; rules starting "Cap / Refresh /
+  Coalesce …" are not "looks like a fact"; "wrong session" no longer fires on comment-alone or branch- or files-matched
+  post-mortems; new flags "vague applies when" and "may hold a secret".
+
+### Secrets
+- Webhook URLs (Slack, Discord), tokens in a URL's query, slashed secret values and whole flag values
+  (`--password=Secret123!`) are redacted; "the admin password for the system is …" is caught; paging tokens like
+  `nextPageToken` are not blanked.
+- An uploaded document's fact that is an instruction aimed at the agent ("ignore previous instructions", "you are now…",
+  role markers, piping a download into a shell) is not kept; a project convention ("Always run pnpm test before
+  committing") is a fact and stays.
+- An Activity subject is redacted before it is cut to 500 characters, so a token crossing the cut is never half-stored.
+
+### Scans
+- Shards follow service boundaries (nested apps get their own; unrelated services never merge). Tests, fixtures,
+  archived and generated files get a small budget, enforced in code, as are each shard's fact minimum and maximum. A file
+  an agent asks about mid-scan is read on its own. Dependency facts are a count and the notable packages. "Everyday"
+  relevance is a minority. Folders of transcripts, logs and other data are left out.
+
+### Runs, demo and cloud
+- A run belongs to the operator name that opened it. The operator token may clean up runs agents opened without a
+  token. `fg cleanup --apply` also removes the run's Activity entries and checks. The default Activity feed and the
+  Dashboard leave out labelled runs; sandbox entries never show to anyone else.
+- `fg demo seed` no longer fails after writing the lessons: it completes or takes back what it wrote; `fg demo remove`
+  removes the project it created; demo records are never exported or synced.
+
+### UI
+- Activity rows read on one line: subject, kind badge, and time, actor and run as chips; a run filter, labelled runs
+  hidden by default. Times show in words on hover.
+- Graph Code mode names the key files and every file with misses (red ring, miss count). The Projects page no longer
+  scrolls as a whole. The Lessons bulk bar no longer moves rows; filtered empty lists say nothing matches.
+- Ask shows each answer's context pack size, cites misses by their file, re-sorts its list, no longer fails on the word
+  "constructor"; the Dashboard's Ask lets you choose the model. Linear with no team mapped says to map one.
+- The Docs page and the guide cover 0.6.2: runs, sandboxes and testing, the diff-reading check, headless Claude Code.
+
 ## 0.6.2 (2026-10-26)
 
 From the team's 0.6.1 field report (real headless Claude Code and Codex sessions end to end, a fresh install with

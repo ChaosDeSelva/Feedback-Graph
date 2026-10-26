@@ -23,6 +23,7 @@ import { REDACT_PAGE, redactSecrets, redactStoredRow } from '../redact.ts';
 import { latestTime } from '../sessions.ts';
 import { sessionWork, trailingToolCalls } from '../codegraph.ts';
 import { refreshSessionStats } from './sessions.ts';
+import { SandboxPresence } from '../sandboxPresence.ts';
 
 export type ClassifiableTurn = HumanTurn & { projectKey: string };
 
@@ -53,11 +54,21 @@ export type CandidateFilter = { status?: CandidateStatus; projectKey?: string; p
 const CANDIDATE_LABELS = ['pushback', 'correction'];
 export const MAX_CLASSIFY_ATTEMPTS = 3;
 
+/** The labels a sandbox run's records carry `sandbox: true` on (a document's chunks go with their Doc). */
+const SANDBOX_LABELS = ['Candidate', 'Lesson', 'Miss', 'Fact', 'Doc', 'ProjectLink'];
+
 export class GraphRepo implements GraphStore {
   readonly driver: Driver;
+  /** Whether any sandbox record exists: the searches skip the per-record run filter when none does (SandboxPresence). */
+  readonly sandbox: SandboxPresence;
 
   constructor(driver: Driver) {
     this.driver = driver;
+    this.sandbox = new SandboxPresence(async () => {
+      // Through each label's run index: a sandbox record always has its run.
+      const [r] = await this.run(`RETURN ${SANDBOX_LABELS.map((l) => `EXISTS { MATCH (x:${l}) WHERE x.run IS NOT NULL AND x.sandbox = true }`).join(' OR ')} AS any`);
+      return r?.get('any') === true;
+    });
   }
 
   static async connect(url: string, user: string, password: string): Promise<GraphRepo> {

@@ -46,6 +46,28 @@ test('GET /api/candidates pages: offset skips, and a full page says where the ne
   expect((await app.request('/api/candidates?offset=-1')).status).toBe(400);
 });
 
+test('GET /api/candidates keeps each row small: a huge report, summary or diff hunk is cut in the list, whole in the detail', async () => {
+  const big = 'x'.repeat(1024 * 1024);
+  const heavy: Candidate = {
+    ...cand,
+    classification: { ...cand.classification, summary: big, signals: Array.from({ length: 50 }, () => big) },
+    agentReport: { text: big, whatWasDone: big, reportedAt: 't', sessionId: null },
+    external: { source: 'github', kind: 'review_comment', author: 'a', url: 'u', thread: 't', title: big, threadUrl: 'u', path: 'a.ts', line: 1, diffHunk: big, branch: null, createdAt: 't', linkedSessionIds: [] } as Candidate['external'],
+  };
+  const repo = { ...fakeRepo().repo, listCandidates: async () => [heavy], candidateDetail: async () => ({ candidate: heavy, turn: {} as never, before: [], after: [], commits: [], postmortem: null }) };
+  const app = createApp(repo);
+  const res = await app.request('/api/candidates');
+  const text = await res.text();
+  expect(text.length).toBeLessThan(10_000);
+  const [row] = JSON.parse(text) as Candidate[];
+  expect(row.agentReport!.text.length).toBeLessThanOrEqual(500);
+  expect(row.agentReport!.text.endsWith('…')).toBe(true);
+  expect(row.classification.summary.length).toBeLessThanOrEqual(500);
+  expect(row.external!.diffHunk).toBeNull();
+  const detail = (await (await app.request('/api/candidates/c1')).json()) as { candidate: Candidate };
+  expect(detail.candidate.agentReport!.text).toHaveLength(big.length);
+});
+
 test('GET /api/candidates rejects an unknown status', async () => {
   const res = await createApp(fakeRepo().repo).request('/api/candidates?status=bogus');
   expect(res.status).toBe(400);
@@ -158,10 +180,10 @@ test('a request body over the limit is refused before it is read: 1 MB by defaul
   // Streamed without a length: counted as it arrives.
   const streamed = await app.request('/api/candidates/c1/decision', { method: 'POST', body: new Blob([big]).stream(), duplex: 'half', headers: { 'content-type': 'application/json', origin: 'http://localhost' } } as RequestInit);
   expect(streamed.status).toBe(413);
-  // A document upload may be larger.
+  // A document upload may be larger (this one is taken and embedded in the background: 202).
   const doc = JSON.stringify({ title: 'Big', name: 'big.md', text: 'word '.repeat(400_000) });
   const up = await app.request('/api/projects/demo/docs', { method: 'POST', body: doc, headers: { 'content-type': 'application/json', origin: 'http://localhost', 'content-length': String(doc.length) } });
-  expect(up.status).toBe(201);
+  expect(up.status).toBe(202);
 });
 
 test('Sec-Fetch-Site cross-site writes are rejected even without Origin', async () => {

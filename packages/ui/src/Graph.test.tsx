@@ -5,9 +5,11 @@ import { afterEach, beforeEach, expect, test, vi } from 'vitest';
 vi.mock('react-force-graph-2d', async () => {
   const { forwardRef } = await import('react');
   return {
-    default: forwardRef((p: { graphData: { nodes: { id: string; label: string }[] }; onNodeClick: (n: object) => void }, _ref) => (
-      <ul>{p.graphData.nodes.map((n) => <li key={n.id}><button onClick={() => p.onNodeClick(n)}>{n.label}</button></li>)}</ul>
-    )),
+    default: forwardRef((p: { graphData: { nodes: { id: string; label: string }[] }; onNodeClick: (n: object) => void }, _ref) => {
+      // The last props, so a test can draw a frame on a recording canvas (drawFrame).
+      (globalThis as { lastGraphProps?: unknown }).lastGraphProps = p;
+      return <ul>{p.graphData.nodes.map((n) => <li key={n.id}><button onClick={() => p.onNodeClick(n)}>{n.label}</button></li>)}</ul>;
+    }),
   };
 });
 const { Graph } = await import('./Graph.tsx');
@@ -68,6 +70,35 @@ const codeGraph = {
   lessons: [{ id: 'l1', title: 'Release pool clients', paths: ['src/db/pool.ts'] }],
   cap: { limit: 60, eligible: 140, neighbors: 2, neighborsFound: 9 },
 };
+/**
+ * Draws one frame of the code graph as force-graph would at `scale`, its nodes laid out 30 screen pixels apart (a map
+ * map zoomed out to fit), on a canvas that records the captions written.
+ */
+function drawFrame(scale: number): string[] {
+  const p = (globalThis as { lastGraphProps?: any }).lastGraphProps;
+  const texts: string[] = [];
+  let font = '';
+  const ctx = new Proxy({}, {
+    get: (_t, k) => {
+      if (k === 'measureText') return (t: string) => ({ width: (t.length * 6) / scale });
+      if (k === 'fillText') return (t: string) => texts.push(t);
+      if (k === 'font') return font;
+      return () => {};
+    },
+    set: (_t, k, v) => { if (k === 'font') font = v; return true; },
+  }) as unknown as CanvasRenderingContext2D;
+  p.onRenderFramePre?.();
+  p.graphData.nodes.forEach((n: { x?: number; y?: number }, j: number) => {
+    // Spread as a layout would, not in score order: the top files are not all side by side.
+    const i = (j * 37) % p.graphData.nodes.length;
+    n.x = ((i % 12) * 30) / scale;
+    n.y = (Math.floor(i / 12) * 30) / scale;
+    p.nodeCanvasObject(n, ctx, scale);
+  });
+  p.onRenderFramePost(ctx, scale);
+  return texts;
+}
+
 const mod = (path: string) => ({
   file: { path, lang: 'typescript', hash: 'h', loc: 120, isTest: false, churn: null },
   symbols: [{ id: `${path}#createPool`, path, name: 'createPool', kind: 'function', exported: true, lines: '1-9' }],
@@ -201,4 +232,25 @@ test('a project with no evidence graph shows its own pipeline counts', async () 
   expect(await screen.findByText('No evidence graph yet')).toBeTruthy();
   expect((await screen.findByRole('region', { name: 'pipeline' })).textContent).toMatch(/empty: nothing to show here yet/);
   expect(urls).toContain('/api/pipeline?project=empty');
+});
+
+test('Code mode at the default zoom names the key files and every file with misses, and marks those with how many', async () => {
+  // A map zoomed out to fit: 60 files 30 px apart, closer than their captions are wide; one low-scoring file has a miss.
+  const files = Array.from({ length: 60 }, (_, i) => fileOf(`src/mod${i}/index${i}.ts`, 60 - i, 0, true));
+  files[50] = fileOf('src/cart/total.ts', 0.5, 1, false);
+  const big = { ...codeGraph, files, imports: [], tests: [], lessons: [], misses: [{ ...codeGraph.misses[0], paths: ['src/cart/total.ts'] }] };
+  vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+    if (url === '/api/projects') return Response.json([{ key: 'shop', repoPath: '/x', sessions: 3, feedback: 2, lessons: 1, facts: 0, lastScan: null }]);
+    if (url.startsWith('/api/projects/shop/codemap/graph')) return Response.json(big);
+    if (url.startsWith('/api/graph?')) return Response.json(graph);
+    return Response.json([]);
+  }));
+  render(<Graph />);
+  await waitFor(() => expect((screen.getByLabelText('project') as HTMLSelectElement).value).toBe('shop'));
+  fireEvent.click(screen.getByRole('button', { name: 'code' }));
+  await screen.findByText('src/cart/total.ts');
+  const texts = drawFrame(0.4);
+  expect(texts).toContain('total.ts (1 miss)');
+  // The twelve top files by score are named too, not one.
+  for (let i = 0; i < 12; i++) expect(texts).toContain(`index${i}.ts`);
 });

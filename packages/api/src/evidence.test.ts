@@ -72,6 +72,13 @@ test('GET /api/sessions/:id/evidence: the turns read, what the detector made of 
   expect(JSON.stringify(e)).not.toContain('ghp_');
 });
 
+test('served lessons are read from entries that kept plain ids too (an older not-judged check, search_graph)', async () => {
+  const entry = (id: string, details: Record<string, unknown>) => ({ id, ts: 't', kind: 'predone_check', actor: 'a', projectKey: 'demo', subject: 's', why: 'w', details, targets: ['s1'] }) as Activity;
+  const app = createApp(repo, { evidence: deps({ activity: { list: async (q) => (q.target === 's1' ? [entry('act:3', { notJudged: true, lessons: ['lesson:a', 'lesson:b'] }), entry('act:4', { notJudged: true, lessons: [{ id: 'lesson:c', title: 'C' }] })] : []) } }) });
+  const e = (await (await app.request('/api/sessions/s1/evidence')).json()) as Record<string, any>;
+  expect(e.served.map((x: { lessons: string[] }) => x.lessons)).toEqual([['lesson:a', 'lesson:b'], ['lesson:c']]);
+});
+
 test('evidence follows the project selection and says when there is no such session', async () => {
   const app = createApp(repo, { evidence: deps() });
   expect((await app.request('/api/sessions/hidden/evidence')).status).toBe(404);

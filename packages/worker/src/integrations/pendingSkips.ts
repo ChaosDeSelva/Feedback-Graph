@@ -86,7 +86,8 @@ export async function skipMatchingPending(d: PendingSkipDeps & { why: string }):
     if (!(await d.graph.skipPendingItem(i.id, { rule: rule.name, note, by: SKIP_DECIDER }))) continue;
     hits.set(i.projectKey, [...(hits.get(i.projectKey) ?? []), { id: i.id, rule: rule.name, text: i.text }]);
   }
-  const byProject: Record<string, Record<string, number>> = {};
+  // Keyed by folder name: a null-prototype object, so a project called __proto__ is a key like any other.
+  const byProject: Record<string, Record<string, number>> = Object.create(null);
   let skipped = 0;
   for (const [projectKey, list] of hits) {
     const rules: Record<string, number> = {};
@@ -109,6 +110,23 @@ export async function skipMatchingPending(d: PendingSkipDeps & { why: string }):
 }
 
 /**
+ * What changed between two stamps, in words: the rules version, the login lists (their hash), or both. A stamp is
+ * `v<version> <logins hash>`, so printing both whole read as the same hash twice when only the version moved.
+ */
+export function describeStampChange(last: string | null, now: string): string {
+  const parse = (s: string) => /^v(\d+) ([0-9a-f]+)$/.exec(s);
+  const b = parse(now);
+  if (!last) return `the skip rules (${b ? `version ${b[1]}` : now}) had not been run over the Inbox yet`;
+  const a = parse(last);
+  if (!a || !b) return `the skip rules changed (${last} to ${now})`;
+  const version = a[1] !== b[1] ? `the skip rules changed from version ${a[1]} to ${b[1]}` : null;
+  const logins = a[2] !== b[2] ? `the bot or agent login lists changed (${a[2]} to ${b[2]}` : null;
+  if (version && logins) return `${version} and ${logins})`;
+  if (version) return `${version} (the bot and agent login lists are unchanged)`;
+  return `${logins}; skip rules version ${b[1]})`;
+}
+
+/**
  * At worker start: when the rules (or the login lists) differ from the ones last applied, run them over the pending
  * items and record the new stamp. Returns how many were skipped, or null when the rules have not changed. A failure
  * leaves the old stamp, so the next start tries again.
@@ -117,7 +135,7 @@ export async function skipPendingOnRulesChange(d: Omit<PendingSkipDeps, 'project
   const stamp = skipRulesStamp(d);
   const last = await d.cursors.getCursor(SKIP_RULES_CURSOR);
   if (last === stamp) return null;
-  const r = await skipMatchingPending({ ...d, why: last ? `the skip rules changed (${last} to ${stamp})` : `the skip rules (${stamp}) had not been run over the Inbox yet` });
+  const r = await skipMatchingPending({ ...d, why: describeStampChange(last, stamp) });
   await d.cursors.setCursor(SKIP_RULES_CURSOR, stamp);
   return r.skipped;
 }

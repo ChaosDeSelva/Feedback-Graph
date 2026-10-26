@@ -346,6 +346,20 @@ test('a miss about how the work was handled (branches, merges) is a process miss
   expect(code.subject).toBeUndefined();
 });
 
+test('an instruction about git ("don\'t push a PR yet") is a process miss even when the lesson was given the session\'s files: it keeps none', async () => {
+  const order = "keep this on its own branch, don't push a PR yet";
+  const result = await runPostMortem({ ...gitInput, feedback: turn(2, order), turns: [turn(0, 'fix the chart embeds'), turn(1, 'looks good'), turn(2, order)] }, {
+    standing: async () => [], facts: async () => [],
+    touched: async () => ({ edited: ['web/src/markdown/pipeline.ts', 'web/src/markdown/embed.tsx'], fixed: [] }),
+    llm: { id: 'fake', agentic: false, json: async () => ({
+      ...answer({}),
+      lesson: { title: 'Wait before pushing', rule: 'Do not push or open a pull request until the developer has looked', appliesWhen: 'finishing a task', scope: 'project', paths: ['web/src/markdown/pipeline.ts'] },
+    }) },
+  });
+  expect(result.subject).toBe('process');
+  expect(result.lesson.paths).toEqual([]);
+});
+
 test('the lesson comes back in shape: no PR numbers in the rule, a title that is not the rule, an appliesWhen that says when', async () => {
   const result = await runPostMortem(input, {
     standing: async () => [], facts: async () => [],

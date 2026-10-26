@@ -1,7 +1,7 @@
 import { cleanEvidence, cleanNote, linkIdOf, linkPair, runWriteOwner } from '@fb/core';
 import type { DetectedLink, LinkPatch, LinksStore, ProjectLink } from '@fb/core';
 import { iso, toJson, tx, type Db } from './db.ts';
-import { visibleToRun } from './vector.ts';
+import { sandboxPresence, visibleToRun } from './vector.ts';
 
 /** Links between projects, one row per pair (a < b, byte order as in Neo4j). */
 export class PgLinksStore implements LinksStore {
@@ -51,6 +51,7 @@ export class PgLinksStore implements LinksStore {
   async setLink(x: string, y: string, patch: LinkPatch): Promise<ProjectLink> {
     const [a, b] = linkPair(x, y);
     const id = linkIdOf(a, b, patch.run);
+    sandboxPresence(this.db).wrote(patch.run);
     const now = new Date();
     return tx(this.db, async (c) => {
       // A run decides only on a link it made (runWriteOwner); the owner's decision makes a run's link the owner's.

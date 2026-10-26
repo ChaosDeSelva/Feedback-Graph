@@ -1,7 +1,7 @@
 // What an agent receives from the MCP tools, measured on realistic inputs: what is in, what is left out, and how big.
 import type { DocHit, FactHit, FileMiss, Lesson, ModuleContext, RelatedMiss, SessionDetail, SessionListItem, StoredFact } from '@fb/core';
 import { describe, expect, test } from 'vitest';
-import { checkBeforeDone, getRecentSessions, getTaskContext, searchGraph, type ContextDeps } from './context.ts';
+import { checkBeforeDone, getModuleContext, getRecentSessions, getTaskContext, searchGraph, type ContextDeps } from './context.ts';
 
 const roots = [{ host: '/Users/j/Vibe', container: '/vibe' }];
 const lesson = (id: string, title: string, over: Partial<Lesson> = {}): Lesson => ({
@@ -113,18 +113,29 @@ describe('get_task_context on a realistic backlog', () => {
     expect(r.markdown).toMatch(/`web\/src\/chat\/legacy-threads\.ts`: no facts from a scan yet$/m);
   });
 
-  test('facts refreshed after the session started are labelled as the agent\'s own change', async () => {
-    const r = await getTaskContext({ project: 'demo', task, files: named, sessionStartedAt: '2026-10-25T08:30:00Z' }, bigDeps());
+  /** The agent's session 'mine', started at `start`, which edited `edited`. */
+  const mine = (start: string, edited: string[]) => {
+    const d = bigDeps();
+    d.sessions!.detail = async (id) => (id === 'mine' ? ({ ...session('mine', 3, start), startedAt: start } as unknown as SessionDetail) : null);
+    d.codegraph = { ...d.codegraph!, sessionFiles: async (id: string) => (id === 'mine' ? edited.map((path) => ({ path, read: true, edited: true, firstEditAt: start, lastEditAt: start })) : []) };
+    return d;
+  };
+
+  test('a fact is the agent\'s own change only when its session edited the file and the fact was written after the session started', async () => {
+    const r = await getTaskContext({ project: 'demo', task, files: named, sessionId: 'mine' }, mine('2026-10-25T08:30:00Z', [named[0]]));
     expect(r.markdown).toMatch(/`web\/src\/chat\/pipeline\.ts`: 1 fact, last refreshed 2026-10-25, from your own change this session/);
-    const before = await getTaskContext({ project: 'demo', task, files: named, sessionStartedAt: '2026-10-25T09:30:00Z' }, bigDeps());
+    const before = await getTaskContext({ project: 'demo', task, files: named, sessionId: 'mine' }, mine('2026-10-25T09:30:00Z', [named[0]]));
     expect(before.markdown).not.toContain('your own change');
   });
 
-  test('the session start can come from the session id', async () => {
-    const d = bigDeps();
-    d.sessions!.detail = async (id) => (id === 'mine' ? ({ ...session('mine', 3, '2026-10-25T08:30:00Z'), startedAt: '2026-10-25T08:30:00Z' } as unknown as SessionDetail) : null);
+  test('a fact rescanned after the session started, on a file the session did not edit, is not the agent\'s own change', async () => {
+    const d = mine('2026-10-20T07:00:00Z', ['web/src/other.ts']);
     const r = await getTaskContext({ project: 'demo', task, files: named, sessionId: 'mine' }, d);
-    expect(r.markdown).toContain('from your own change this session');
+    // Every fact here was written after this start (the codebase facts on 2026-10-20 08:00, the file's on 2026-10-25).
+    expect(r.markdown).not.toContain('your own change');
+    // Without the session's files nothing is called the agent's own.
+    const bare = await getTaskContext({ project: 'demo', task, files: named, sessionStartedAt: '2026-10-20T07:00:00Z' }, bigDeps());
+    expect(bare.markdown).not.toContain('your own change');
   });
 
   test('recent sessions skip one-turn probe sessions', async () => {
@@ -157,11 +168,22 @@ describe('get_task_context brief', () => {
     const r = await getTaskContext({ project: 'demo', task, files: named, brief: true }, bigDeps());
     expect(r.markdown).toMatch(/left out|cut/i);
   });
+
+  test('keeps the named files even when long lessons, misses and discussions fill the budget', async () => {
+    const long = (i: number) => lesson(`l${i}`, `Lesson ${i}: ${'a long title about rendering archived threads, '.repeat(2)}`);
+    const d = bigDeps({ k: { ...bigDeps().k, searchLessons: async () => [0, 1, 2, 3, 4].map((i) => ({ lesson: long(i), score: 0.8 })) } });
+    const longMisses = new Map([...mods].map(([p, m], i) => [p, { ...m, misses: [fileMiss(`m-long${i}`, `missed ${'the custom tag pairing and the archived thread fallback, '.repeat(3)}`, [p])] }]));
+    d.codegraph = { ...d.codegraph!, moduleContext: async (_k, p) => longMisses.get(p) ?? null };
+    const r = await getTaskContext({ project: 'demo', task, files: named, brief: true }, d);
+    expect(r.markdown).toContain('## Files you named');
+    expect(r.markdown).toMatch(/`web\/src\/chat\/pipeline\.ts`: imported by/);
+    expect(r.markdown.length).toBeLessThan(1_800);
+  });
 });
 
 describe('search_graph', () => {
   test('returns its hits, not the whole task context: no code map, sessions, freshness or done pointer, under ~3k chars, and says what it cut', async () => {
-    const r = await searchGraph({ project: 'demo', query: 'markdown custom tags rehype' }, bigDeps());
+    const r = await searchGraph({ project: 'demo', query: 'chat rendering of markdown custom tags' }, bigDeps());
     expect(r.markdown.length).toBeLessThan(3_300);
     for (const gone of ['Recent sessions', 'Code map', 'How fresh', 'check_before_done', 'From linked projects']) expect(r.markdown).not.toContain(gone);
     expect(r.markdown).toContain('Lesson 0');
@@ -196,5 +218,52 @@ describe('check_before_done on ten changed files sharing one false miss', () => 
     const r = await checkBeforeDone({ project: 'demo', task, summary: 'paired the custom tags', filesChanged: changed }, bigDeps({ k: { ...bigDeps().k, searchLessons: async () => [], relatedMisses: async () => [] } }));
     expect(count(r.markdown, /pushed a branch the developer had said not to push yet/g)).toBe(1);
     expect(r.markdown.length).toBeLessThan(2_000);
+  });
+});
+
+describe('why a named file is not in the code map', () => {
+  const big = 'web/src/generated/schema.ts';
+  const secret = 'web/src/config/secrets.ts';
+  const d = () => bigDeps({ mapMaxBytes: 80_000, fileSize: async (_repo: string, rel: string) => (rel === big ? 120_000 : 2_000) });
+
+  test('a file over SCAN_MAX_BYTES and a secret-named file each get their own reason, not "new or ignored"', async () => {
+    const r = await getTaskContext({ project: 'demo', task, files: [...named, big, secret] }, d());
+    expect(r.markdown).toMatch(/`web\/src\/generated\/schema\.ts`: not in the code map: over 80 kB \(SCAN_MAX_BYTES\)/);
+    expect(r.markdown).toMatch(/`web\/src\/config\/secrets\.ts`: not in the code map: its name marks it as a secret file, which is never read/);
+    const b = await getTaskContext({ project: 'demo', task, files: [big], brief: true }, d());
+    expect(b.markdown).toMatch(/over 80 kB/);
+  });
+
+  test('get_module_context says the same', async () => {
+    const r = await getModuleContext({ project: 'demo', path: big }, d());
+    expect(r.markdown).toMatch(/over 80 kB \(SCAN_MAX_BYTES\)/);
+    expect(r.markdown).not.toMatch(/New, ignored, generated/);
+    const s = await getModuleContext({ project: 'demo', path: secret }, d());
+    expect(s.markdown).toMatch(/secret file, which is never read/);
+  });
+});
+
+describe('recent sessions are cut where a sentence ends', () => {
+  const long = 'Moved the archived thread fallback into the pipeline. Paired self-closing custom tags before parsing so the rest of the message renders. Added a regression test for legacy threads with two artifacts and a table. Left the export path alone for now.';
+  const d = () => {
+    const x = bigDeps();
+    x.sessions = {
+      list: async () => ({ sessions: [{ ...session('real-1', 40, '2026-10-24T10:00:00Z'), snippet: long }], next: null }),
+      detail: async (id) => ({ ...session(id, 40, '2026-10-24T10:00:00Z'), summary: { markdown: Array.from({ length: 40 }, () => long).join('\n') } } as unknown as SessionDetail),
+    };
+    return x;
+  };
+
+  test('in get_task_context', async () => {
+    const r = await getTaskContext({ project: 'demo', task }, d());
+    const line = r.markdown.split('\n').find((l) => l.includes('session real-1'))!;
+    expect(line).toMatch(/so the rest of the message renders\.…/);
+    expect(line).not.toMatch(/two artifacts/);
+  });
+
+  test('in get_recent_sessions', async () => {
+    const r = await getRecentSessions({ project: 'demo' }, d());
+    const body = r.markdown.split('\n').filter((l) => l.trimStart().startsWith('>')).join('\n');
+    expect(body.trimEnd()).toMatch(/(\.|now\.)…$/);
   });
 });

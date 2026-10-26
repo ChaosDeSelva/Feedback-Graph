@@ -3,7 +3,7 @@ import { bodyLimit } from 'hono/body-limit';
 import { streamSSE } from 'hono/streaming';
 import { serveStatic } from '@hono/node-server/serve-static';
 import { z } from 'zod';
-import { ACTIVITY_KINDS, EVERYDAY_FROM, chunkText, mapCapped, MAX_AUTO_MAP_FILES, MODEL_JOBS, cleanLessonPath, cmp, FACT_KINDS, LESSON_CHECKS, LESSON_FROM, redactSecrets, relevanceBand, selectionNote, type ActivityStore, type CodeGraphStore, type DocsStore, type FactsStore, type GraphStore, type InsightsStore, type ModelHealth, type ModelJob, type OllamaHealth, type PipelineStatus, type ProviderHealth, type KnowledgeStore, type Lesson, type LinksStore, IMAGE_MEDIA_TYPES, MAX_IMAGE_BYTES, LINK_RELATIONS, LINK_STATUSES, linkPair, linkEnds, docIdOf, NotTheRunsError, type PortabilityStore, type Project, type ProjectSelection, type RelevanceBy, type ProjectSummary, type ScanQueueEntry, type ShownProjects, type WorkQueue, type WorkQueues, type StoreKind, type SystemStatus, type WorkerStatus, contextWhy, FACT_ORIGINS, SCANNER_VERSION, RUN_ID, type RunPrincipal, type RunsStore, LESSON_QUALITY_DAYS, lessonQualityReport, type LessonQualityReport } from '@fb/core';
+import { ACTIVITY_KINDS, EVERYDAY_FROM, chunkText, mapCapped, MAX_AUTO_MAP_FILES, MODEL_JOBS, cleanLessonPath, cmp, FACT_KINDS, LESSON_CHECKS, LESSON_FROM, redactSecrets, relevanceBand, selectionNote, type ActivityStore, type CodeGraphStore, type DocsStore, type FactsStore, type GraphStore, type InsightsStore, type ModelHealth, type ModelJob, type OllamaHealth, type PipelineStatus, type ProviderHealth, type KnowledgeStore, type Lesson, type LinksStore, IMAGE_MEDIA_TYPES, MAX_IMAGE_BYTES, LINK_RELATIONS, LINK_STATUSES, linkPair, linkEnds, docIdOf, NotTheRunsError, type PortabilityStore, type Project, type ProjectSelection, type RelevanceBy, type ProjectSummary, type ScanQueueEntry, type ShownProjects, type WorkQueue, type WorkQueues, type StoreKind, type SystemStatus, type WorkerStatus, contextWhy, FACT_ORIGINS, SCANNER_VERSION, RUN_ID, type RunPrincipal, type RunsStore, LESSON_QUALITY_DAYS, lessonQualityReport, type LessonQualityReport, type Candidate } from '@fb/core';
 import { chatRoutes, type ChatRouteDeps } from './chat.ts';
 import { trackedProject, type ContextDeps } from './context.ts';
 import { authenticated, needsAuth, SECURITY_HEADERS, sessionCookie, tokenMatches, type AuthOpts } from './auth.ts';
@@ -14,7 +14,7 @@ import { handleMcp } from './mcp.ts';
 import { handleAdminMcp } from './adminMcp.ts';
 import { openApiDocument } from './openapi.ts';
 import { actingAsOperator, asActor, currentActor, currentRun, hasOperatorToken, mayChange, mayChangeAny, operatorName, OWNER_ROUTES, refusedVerb, runAs, runFromOwner, runIn, runLabel, runVia } from './operator.ts';
-import { askingRun, RUN_OPENERS, runAsked, runRoutes, runScoped } from './runs.ts';
+import { askingRun, openerOf, runAsked, runRoutes, runScoped, sameCaller } from './runs.ts';
 import { evidenceRoutes, type EvidenceDeps } from './evidence.ts';
 import { deleteProjects, settingsRoutes, type SettingsDeps } from './settings.ts';
 import { importRoutes, type ImportDeps } from './import.ts';
@@ -61,6 +61,11 @@ const Decisions = z.object({
 }).strict();
 
 const MB = 1024 * 1024;
+/** Chunks per embedding call; an upload of more is answered 202 and embedded in the background. */
+const EMBED_BATCH = 64;
+/** How long a large upload's failed embedding is said on the document (GET /api/docs/:id, the docs list). */
+const EMBED_FAILED_KEPT_MS = 60 * 60_000;
+const DocSourceParam = z.enum(['upload', 'github', 'linear']);
 /** The most any request body may be; the upload routes below take more. */
 export const BODY_LIMIT = 1 * MB;
 /** A document upload (2,000,000 characters of text, or an 8 MB image as base64) and an export bundle being imported. */
@@ -97,7 +102,7 @@ export type AppOpts = {
   /** Folders under the configured roots that can be scanned. */
   projectDirs?: () => Promise<Project[]>;
   insights?: Pick<InsightsStore, 'projectGraph' | 'patterns'>;
-  activity?: Pick<ActivityStore, 'record' | 'list'> & Partial<Pick<ActivityStore, 'get'>>;
+  activity?: Pick<ActivityStore, 'record' | 'list'> & Partial<Pick<ActivityStore, 'get' | 'removeRun'>>;
   docs?: Pick<DocsStore, 'upsertDoc' | 'listDocs' | 'deleteDoc'> & Partial<Pick<DocsStore, 'docImage' | 'requeueDocRead'>>;
   links?: Pick<LinksStore, 'listLinks' | 'setLink' | 'deleteLink'>;
   auth?: AuthOpts;
@@ -145,6 +150,8 @@ export type AppOpts = {
   runs?: Pick<RunsStore, 'items' | 'remove' | 'claim' | 'owner'>;
   /** GET /api/sessions/:id/evidence: what the tool saw in one session and decided (evidence.ts). */
   evidence?: EvidenceDeps;
+  /** Aborted when the server shuts down: every open event stream ends at once, and no new one opens. */
+  closing?: AbortSignal;
 };
 
 /**
@@ -159,6 +166,24 @@ const runWrite = () => {
 const runOnly = () => (mayChangeAny() ? {} : { run: currentRun()!.id });
 /** The 409 for a run's change to a record it does not own (NotTheRunsError). */
 const notTheRuns = (c: Context, what: string) => c.json({ error: new NotTheRunsError(what, currentRun()?.id ?? '').message }, 409);
+
+/** Characters of each free-text field an Inbox list row carries; GET /api/candidates/:id has them whole. */
+const LIST_TEXT = 500;
+const LIST_SIGNALS = 10;
+const clipped = (t: string, max = LIST_TEXT) => (t.length > max ? `${t.slice(0, max - 1)}…` : t);
+
+/**
+ * An Inbox item as a list row: the summary, signals, the agent's report and a comment's title cut short, and no diff
+ * hunk, so a page of the Inbox stays small whatever an agent or a model wrote (a 1 MB report once made every poll 1 MB).
+ */
+export function listedCandidate(k: Candidate): Candidate {
+  return {
+    ...k,
+    classification: { ...k.classification, summary: clipped(k.classification.summary), signals: k.classification.signals.slice(0, LIST_SIGNALS).map((x) => clipped(x, 200)) },
+    ...(k.agentReport && { agentReport: { ...k.agentReport, text: clipped(k.agentReport.text), whatWasDone: clipped(k.agentReport.whatWasDone) } }),
+    ...(k.external && { external: { ...k.external, title: clipped(k.external.title, 300), diffHunk: null } }),
+  };
+}
 
 /** The store's projectKeys for a list: every shown key, or for ?project= that one if it is shown (else none). */
 function keysFor(v: ShownProjects | null, project?: string): string[] | undefined {
@@ -229,6 +254,8 @@ const ActivityQuery = z.object({
   limit: z.coerce.number().int().min(1).max(1000).optional(),
   /** 1: every row with its details, however big (the CLI's --json); else rows over LIST_DETAIL_BYTES leave them out. */
   details: IncludeTests,
+  /** 1: labelled runs' entries too (the Activity page with "hide labelled runs" off); never another run's sandbox. */
+  runs: IncludeTests,
 });
 /** Details bigger than this stay out of an activity list (a scan's whole report is 1 MB): GET /api/activity/:id has them. */
 const LIST_DETAIL_BYTES = 1024;
@@ -469,12 +496,14 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
     const browser = c.req.header('origin') !== undefined;
     const principal: RunPrincipal = operator ? 'operator' : browser ? 'browser' : auth.token && authenticated(c, auth.token) ? 'owner_token' : 'agent';
     // A run id belongs to whoever opened it (its first labelled write): a write under it by anyone else is refused, so
-    // a run cannot be hijacked or mixed, and the operator token cleans up only runs it opened (runs.ts).
+    // a run cannot be hijacked or mixed. With the operator token, "whoever" is the operator's name (X-FG-Operator, fg
+    // --as), so agents sharing the token do not share runs; the cleanup rules are in runs.ts.
     if (run && opts.runs && c.req.method !== 'GET' && c.req.method !== 'HEAD') {
-      const owner = await opts.runs.claim(run.id, principal);
-      if (owner.principal !== principal) {
-        const error = `run id belongs to another caller: ${run.id} was opened by ${RUN_OPENERS[owner.principal]} at ${owner.firstSeen}; label this one with a run id of its own`;
-        log?.('run refused', { method: c.req.method, path: c.req.path, run: run.id, owner: owner.principal, caller: principal });
+      const actor = operator ? operatorName(c.req.header('x-fg-operator')) : null;
+      const owner = await opts.runs.claim(run.id, principal, actor);
+      if (!sameCaller(owner, principal, actor)) {
+        const error = `run id belongs to another caller: ${run.id} was opened by ${openerOf(owner)} at ${owner.firstSeen}; label this one with a run id of its own`;
+        log?.('run refused', { method: c.req.method, path: c.req.path, run: run.id, owner: owner.actor ?? owner.principal, caller: actor ?? principal });
         return mcp ? c.json({ jsonrpc: '2.0', id: null, error: { code: -32600, message: error } }, 409) : c.json({ error }, 409);
       }
     }
@@ -542,6 +571,7 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
       workerHealthy,
       ...stageOf(workerHealthy ? worker : null),
       authRequired: !!auth.token,
+      judge: context?.judgeId ?? null,
       selection: sel && { initialized: sel.initialized, tracked: sel.tracked.length, ...(system?.roots === undefined ? {} : { roots: system.roots }), note: selectionNote(sel, system?.roots) },
       cloud: cloudStatus(cloud?.cloud ?? null, cloudState),
       models: worker ? modelHealth(worker, ollama) : null,
@@ -656,19 +686,23 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
     ...(activity && {
       activity: async () => {
         const v = await view();
-        const entries = await activity.list({ limit: EVENT_ACTIVITY_WINDOW, ...(v && { projectKeys: v.keys }) });
+        // The default feed's entries: none made in a labelled run (GET /api/activity).
+        const entries = await activity.list({ limit: EVENT_ACTIVITY_WINDOW, unlabelled: true, ...(v && { projectKeys: v.keys }) });
         return entries.filter((a) => !v || a.projectKey === null || v.has(a.projectKey));
       },
     }),
   });
   let streams = 0;
   app.get('/api/events', (c) => {
+    if (opts.closing?.aborted) return c.json({ error: 'the API is shutting down' }, 503);
     if (streams >= MAX_EVENT_STREAMS) return c.json({ error: `too many event streams are open (${MAX_EVENT_STREAMS}): close one, or poll /api/status` }, 503);
     streams++;
     return streamSSE(c, async (stream) => {
       let close = () => {};
       const closed = new Promise<void>((resolve) => { close = resolve; });
       stream.onAbort(() => close());
+      // A shutdown does not wait for the browser to hang up: the stream ends, and EventSource reconnects to the new one.
+      opts.closing?.addEventListener('abort', () => close(), { once: true });
       const send = (e: FgEvent) => void stream.writeSSE({ event: e.event, data: JSON.stringify(e.data) }).catch(() => close());
       let off = () => {};
       const beat = setInterval(() => void stream.write(': ping\n\n').catch(() => close()), EVENT_HEARTBEAT_MS);
@@ -708,7 +742,7 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
     const offset = q.data.offset ?? 0;
     const rows = await repo.listCandidates({ status: q.data.status, projectKey: q.data.project, source: q.data.source, limit: limit + 1, offset, ...(projectKeys && { projectKeys }), ...runAsked() });
     if (rows.length > limit) c.header('x-next-offset', String(offset + limit));
-    return c.json(rows.slice(0, limit));
+    return c.json(rows.slice(0, limit).map(listedCandidate));
   });
 
   /** An Inbox item, if it belongs to a shown project. */
@@ -928,6 +962,24 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
   }
 
   if (docs && embed && projectDirs) {
+    /**
+     * Large uploads being embedded in the background (202), and those that failed, by doc id: the status the docs list
+     * and GET /api/docs/:id carry (embed). Kept in this process, which is where the embedding runs: if it stops, so does
+     * the embedding, and the document is either stored or not there. A failure is kept for EMBED_FAILED_KEPT_MS.
+     */
+    type Embedding = { status: 'pending' | 'failed'; error?: string; chunks: number; at: number; doc: { projectKey: string; ref: string; title: string; addedBy: string | null; kind: 'text' | 'image'; mediaType: string | null } };
+    const embedding = new Map<string, Embedding>();
+    const embedOf = (id: string) => {
+      const e = embedding.get(id);
+      if (e?.status === 'failed' && Date.now() - e.at > EMBED_FAILED_KEPT_MS) embedding.delete(id);
+      const kept = embedding.get(id);
+      return kept && { status: kept.status, ...(kept.error && { error: kept.error }), chunks: kept.chunks };
+    };
+    const withEmbed = <D extends { id: string }>(d: D) => {
+      const e = embedOf(d.id);
+      return e ? { ...d, embed: e } : d;
+    };
+
     app.get('/api/projects/:key/docs', async (c) => {
       const key = c.req.param('key');
       if (!(await shows(key))) return c.json(NOT_SHOWN, 404);
@@ -939,7 +991,25 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
       const rows = await docs.listDocs(key, { limit: limit + 1, after, run: askingRun() });
       const page = rows.slice(0, limit);
       if (rows.length > limit) c.header('x-next-cursor', toDocCursor(page.at(-1)!));
-      return c.json(page);
+      return c.json(page.map(withEmbed));
+    });
+
+    // One document by id, with its embed status: what the Projects page checks while a large upload is embedded (the
+    // document may be past the list's first page). Not stored yet: what is known of the upload, while it is pending or failed.
+    app.get('/api/docs/:id', async (c) => {
+      const id = c.req.param('id');
+      // ids are doc[@<run>]:<project>:<source>:<ref>
+      const [, projectKey = '', source = '', ...ref] = id.split(':');
+      if (!(await shows(projectKey))) return c.json({ error: 'not found' }, 404);
+      const src = DocSourceParam.safeParse(source);
+      const stored = src.success ? (await docs.listDocs(projectKey, { source: src.data, ref: ref.join(':'), limit: 5, run: askingRun() })).find((d) => d.id === id) : undefined;
+      if (stored) return c.json(withEmbed(stored));
+      // Another run's sandbox upload (doc@<run>:...) is not shown, as in the list.
+      const run = id.startsWith('doc@') ? id.slice(4, id.indexOf(':')) : null;
+      const e = run === null || run === askingRun() ? embedOf(id) : undefined;
+      const known = embedding.get(id);
+      if (!e || !known) return c.json({ error: 'not found' }, 404);
+      return c.json({ id, ...known.doc, source: 'upload', url: null, addedAt: new Date(known.at).toISOString(), chunks: 0, read: null, embed: e });
     });
 
     app.post('/api/projects/:key/docs', async (c) => {
@@ -952,30 +1022,54 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
       // An image is searchable by a placeholder until the worker reads it; its description then replaces it.
       const chunks = image ? [`Image "${title}" (${name}): not read yet.`] : chunkText(redactSecrets(body.data.text!));
       if (!chunks.length) return c.json({ error: 'document has no text' }, 400);
-      const vectors = await embed(chunks);
       // Same file name, same doc: say so, rather than logging a fresh upload over a silent replacement. A sandbox run's
       // upload is its own document beside the owner's of that name (docIdOf), so only that one is a replacement.
       const replaces = docIdOf({ projectKey: project.key, source: 'upload', ref: redactSecrets(name) }, currentRun());
-      const previous = (await docs.listDocs(project.key, { source: 'upload', ref: name, limit: 2, run: askingRun() })).find((d) => d.id === replaces);
-      let id: string;
-      try {
-        id = await docs.upsertDoc(
+      const add = async (): Promise<string> => {
+        // In batches: one embedding call for a 2,000,000-character upload (1,300+ chunks) outlasts any timeout.
+        const vectors: number[][] = [];
+        for (let i = 0; i < chunks.length; i += EMBED_BATCH) vectors.push(...(await embed(chunks.slice(i, i + EMBED_BATCH))));
+        const previous = (await docs.listDocs(project.key, { source: 'upload', ref: name, limit: 2, run: askingRun() })).find((d) => d.id === replaces);
+        const id = await docs.upsertDoc(
           { projectKey: project.key, source: 'upload', ref: name, title, url: null },
           chunks.map((text, i) => ({ text, embedding: vectors[i] })),
           { read: true, addedBy: currentActor(), ...runWrite(), ...(image && { image }) },
         );
+        const what = image ? `image "${title}"` : `"${title}" (${chunks.length} chunk${chunks.length === 1 ? '' : 's'})`;
+        await activity?.record({
+          kind: 'doc_added', actor: 'you', projectKey: project.key,
+          subject: `${previous ? `replaced "${previous.title}" with` : 'uploaded'} ${what}`,
+          why: 'you added it as context; the worker reads it into facts, and agents get matching excerpts and facts with their task context',
+          details: image ? { name, mediaType: image.mediaType, bytes: Math.floor((image.data.length * 3) / 4) } : { name, chars: body.data.text!.length }, targets: [id],
+        });
+        return id;
+      };
+      if (chunks.length > EMBED_BATCH) {
+        // A large upload is answered now and embedded in the background (the request's run and actor go with it): it is
+        // pending (embed) until stored, the earlier version of that name meanwhile marked so in the list; a failure is
+        // kept on it with why, and logged in Activity.
+        const doc = { projectKey: project.key, ref: name, title, addedBy: currentActor(), kind: image ? 'image' as const : 'text' as const, mediaType: image?.mediaType ?? null };
+        const started = { status: 'pending' as const, chunks: chunks.length, at: Date.now(), doc };
+        embedding.set(replaces, started);
+        void add().then(() => {
+          if (embedding.get(replaces) === started) embedding.delete(replaces);
+        }, async (err) => {
+          const reason = err instanceof NotTheRunsError ? err.message : redactSecrets(err instanceof Error ? err.message : String(err)).slice(0, 300);
+          if (embedding.get(replaces) === started) embedding.set(replaces, { ...started, status: 'failed', error: reason, at: Date.now() });
+          log?.('upload failed', { project: project.key, name, error: reason });
+          await activity?.record({
+            kind: 'doc_added', actor: 'you', projectKey: project.key, subject: `could not add "${title}": ${reason}`,
+            why: 'the upload was accepted, but embedding or storing its text failed; upload it again', details: { name, failed: true }, targets: [replaces],
+          }).catch(() => {});
+        });
+        return c.json({ id: replaces, chunks: chunks.length, pending: true }, 202);
+      }
+      try {
+        return c.json({ id: await add(), chunks: chunks.length }, 201);
       } catch (err) {
         if (err instanceof NotTheRunsError) return c.json({ error: err.message }, 409);
         throw err;
       }
-      const what = image ? `image "${title}"` : `"${title}" (${chunks.length} chunk${chunks.length === 1 ? '' : 's'})`;
-      await activity?.record({
-        kind: 'doc_added', actor: 'you', projectKey: project.key,
-        subject: `${previous ? `replaced "${previous.title}" with` : 'uploaded'} ${what}`,
-        why: 'you added it as context; the worker reads it into facts, and agents get matching excerpts and facts with their task context',
-        details: image ? { name, mediaType: image.mediaType, bytes: Math.floor((image.data.length * 3) / 4) } : { name, chars: body.data.text!.length }, targets: [id],
-      });
-      return c.json({ id, chunks: chunks.length }, 201);
     });
 
     const docImage = docs.docImage?.bind(docs);
@@ -1205,9 +1299,13 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
     app.get('/api/activity', async (c) => {
       const q = ActivityQuery.safeParse(c.req.query());
       if (!q.success) return c.json({ error: q.error.flatten() }, 400);
-      const { project, details, ...rest } = q.data;
+      const { project, details, runs: withRuns, ...rest } = q.data;
       const projectKeys = keysFor(await view(), project);
-      return c.json(await activity.list({ projectKey: project, ...rest, ...(!details && { maxDetailBytes: LIST_DETAIL_BYTES }), ...(projectKeys && { projectKeys }) }));
+      // The default feed is what happened outside test runs: a stress run's thousands of entries never fill it, and
+      // a sandbox run's reach no one but a request for that run (?run=). A record's history (target=) keeps the runs
+      // that touched it, but not a sandbox run's.
+      const runs = rest.run ? {} : rest.target || withRuns ? { noSandbox: true } : { unlabelled: true };
+      return c.json(await activity.list({ projectKey: project, ...rest, ...runs, ...(!details && { maxDetailBytes: LIST_DETAIL_BYTES }), ...(projectKeys && { projectKeys }) }));
     });
     // One entry, details and all (a row the list left them out of: detailsOmitted).
     app.get('/api/activity/:id', async (c) => {

@@ -47,7 +47,8 @@ const GROUPS: NavGroup<View>[] = [
 ];
 
 export function App() {
-  const fromHash = (): View => ((hashView() as View) in VIEWS ? (hashView() as View) : 'dashboard');
+  // Own keys only: a hash such as #constructor names no page (it is on Object.prototype).
+  const fromHash = (): View => (Object.hasOwn(VIEWS, hashView()) ? (hashView() as View) : 'dashboard');
   const [view, setView] = useState<View>(fromHash);
   // A link to one item (#lessons/<id>) keeps its id: only a different page rewrites the hash.
   useEffect(() => { if (hashView() !== view) location.hash = view; }, [view]);

@@ -101,7 +101,9 @@ test('ollamaEmbed sets num_ctx to the embedding model\'s trained context (nomic-
   await ollamaEmbed({ url: 'http://o', model: 'nomic-embed-text:latest', input: ['a'], fetchImpl });
   await ollamaEmbed({ url: 'http://o', model: 'mxbai-embed-large', input: ['a'], fetchImpl });
   await ollamaEmbed({ url: 'http://o', model: 'mxbai-embed-large', input: ['a'], fetchImpl, numCtx: 512 });
-  expect(bodies.map((b) => b.options)).toEqual([{ num_ctx: 2048 }, { num_ctx: 2048 }, undefined, { num_ctx: 512 }]);
+  // A model name that is a word on Object.prototype has no known context.
+  await ollamaEmbed({ url: 'http://o', model: 'constructor', input: ['a'], fetchImpl });
+  expect(bodies.map((b) => b.options)).toEqual([{ num_ctx: 2048 }, { num_ctx: 2048 }, undefined, { num_ctx: 512 }, undefined]);
 });
 
 test('ollamaPing says when Ollama did not answer in time', async () => {

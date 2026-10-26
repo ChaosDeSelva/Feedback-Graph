@@ -109,7 +109,9 @@ export function capDiff(raw: string, maxChars: number, prefer: DiffPreference = 
     }
     omitted.push(f.path);
   }
-  const notes = [omitted.length ? `diff cut at ${kb(maxChars)} KB, files not shown: ${omitted.join(', ')}` : '', secret.length ? `secret files left out: ${secret.join(', ')}` : ''].filter(Boolean);
+  // How much of it was shown, so a cut never reads as the whole change ("30.5 of 47.0 KB shown").
+  const total = open.reduce((n, f) => n + redactSecrets(f.text).length, 0);
+  const notes = [omitted.length ? `diff cut to fit (${kb(text.length)} of ${kb(total)} KB shown), files not shown: ${omitted.join(', ')}` : '', secret.length ? `secret files left out: ${secret.join(', ')}` : ''].filter(Boolean);
   return { text, shown, omitted, secret, note: notes.length ? notes.join('; ') : null };
 }
 
@@ -130,6 +132,15 @@ function partOf(f: FileDiff, maxChars: number): string {
 // A quote shorter than this ("}", "return") would be found in any diff and proves nothing.
 const MIN_QUOTE = 6;
 const norm = (s: string) => s.replace(/^[+\- ]/, '').trim().replace(/\s+/g, ' ');
+
+/**
+ * The code a judge quoted in prose (its `why`): `backticked` and "double-quoted" spans, longest first. A model that
+ * leaves out the evidence field often names the line there; citeDiff decides whether it is in the diff.
+ */
+export function quotedCode(text: string): string[] {
+  const spans = [...text.matchAll(/`([^`\n]+)`|"([^"\n]+)"|\u201c([^\u201d\n]+)\u201d/g)].map((m) => (m[1] ?? m[2] ?? m[3]).trim());
+  return [...new Set(spans.filter((x) => x.length >= MIN_QUOTE))].sort((a, b) => b.length - a.length);
+}
 
 /**
  * Where a line the judge quoted as evidence is in the diff: the first diff line (code, with or without its +/- mark,

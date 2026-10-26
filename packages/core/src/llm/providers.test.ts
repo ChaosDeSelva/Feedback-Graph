@@ -374,3 +374,23 @@ test('vision: providers that cannot read images say so instead of answering with
     await expect(p.json(seeTask)).rejects.toThrow(/cannot read images/);
   }
 });
+
+test('the HTTP providers cancel their request when the task signal fires (a check that gave up)', async () => {
+  // A server that never answers until the request is aborted.
+  const hang = (async (_u: string, init: RequestInit) => new Promise((_r, reject) => {
+    init.signal?.addEventListener('abort', () => reject(init.signal!.reason));
+  })) as unknown as typeof fetch;
+  const specs: [string, Record<string, string>][] = [
+    ['ollama:gemma4', { OLLAMA_URL: 'http://o' }],
+    ['openai:gpt', { OPENAI_API_KEY: 'k' }],
+    ['anthropic:claude-sonnet-5-5', { ANTHROPIC_API_KEY: 'k' }],
+  ];
+  for (const [spec, env] of specs) {
+    const c = new AbortController();
+    const p = makeProvider(spec, env, { fetchImpl: hang }).json({ ...task, timeoutMs: 600_000, signal: c.signal });
+    setTimeout(() => c.abort(new Error('the check gave up')), 10);
+    const t = Date.now();
+    await expect(p).rejects.toThrow(/gave up/);
+    expect(Date.now() - t).toBeLessThan(1000);
+  }
+});

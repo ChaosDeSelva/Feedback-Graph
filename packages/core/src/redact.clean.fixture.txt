@@ -331,3 +331,43 @@ The API key is per project (projects.api_key_hash).
 password is set to null after migration 0012
 token is set to expire_at2 in the session row
 The token is now JwtV2 by default.
+# Rules v4 negatives: URLs with ordinary queries, paths after secret-looking names, flags naming a file, prose with
+# words between a credential word and "is" whose value is no secret, and JSON with paging tokens.
+see https://example.com/docs?page=2&sort=name
+https://example.com/search?q=token&key=name
+https://example.com/api?key=${MAPS_KEY}
+https://maps.example.com/api/js?key={{ mapsKey }}&callback=init
+fetch(`/api/items?cursor=${cursor}&limit=50`)
+const url = `${base}/oauth/authorize?client_id=${id}&response_type=code&state=${state}`;
+https://hooks.example.com/services/ok
+https://docs.slack.dev/messaging/sending-messages-using-incoming-webhooks
+Slack posts go to the incoming webhook set in SLACK_WEBHOOK_URL.
+https://example.com/reset?token=abc
+https://github.com/acme/web/pulls?q=is%3Aopen+label%3Atoken
+TOKEN_PATH=config/tokens/acme.json
+token_file: config/secrets/app2.yml
+secret_path: /run/secrets/db_password
+password_file: secrets/prod/db-password2
+secret: src/Components/Button2
+api_key_path: ~/.config/acme/key.json
+deploy --token-file /run/secrets/token --env prod
+deploy --password-stdin < pw.txt
+docker login --password-stdin --username acme
+git push --force-with-lease origin main
+The password for the admin user is required.
+The token for each session is stored in Redis.
+The secret for the webhook is read from WEBHOOK_SECRET at start.
+The API key for the maps service is set in .env.local
+The token budget for a call is 4096.
+The password for user_id2 is hashed with argon2id.
+The token in the cache is v2:users list
+the api key for prod, by the way, is rotated every 90 days
+The session token, once issued, is valid for 24h.
+The password field on the signup form is optional for SSO users.
+The token count per request is 1200 at most.
+The secret store for staging is https://vault.example.com/v1/kv/web
+Credentials for the CI runner are injected from the environment.
+{ "nextPageToken": "page-2", "tokenizer": "cl100k", "tokenCount": 42 }
+const { nextPageToken, items } = await list({ pageToken });
+The token for the next page is cursor_v2 from the last response.
+The password for the demo account is in 1Password, not in the repo.

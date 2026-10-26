@@ -155,6 +155,9 @@ const qs = (o: Record<string, string | undefined>) => {
   return q.size ? `?${q}` : '';
 };
 
+/** The query parameter that asks GET /api/activity for labelled runs' entries as well as the owner's. */
+export const ACTIVITY_WITH_RUNS = 'runs';
+
 /** Inbox items per page. */
 export const CANDIDATE_PAGE = 200;
 
@@ -207,8 +210,12 @@ export const api = {
 
   graph: (key: string) => request<EvidenceGraph>(`/api/graph${qs({ project: key })}`),
   patterns: (key?: string) => request<PatternReport>(`/api/patterns${qs({ project: key })}`),
-  activity: (o: { project?: string; kind?: ActivityKind; target?: string; limit?: number }) =>
-    request<Activity[]>(`/api/activity${qs({ target: o.target, project: o.project, kind: o.kind, limit: String(o.limit ?? 100) })}`),
+  /**
+   * run: one labelled run's entries. withRuns: ask for labelled runs' entries too (ACTIVITY_WITH_RUNS), for an API
+   * whose default feed leaves them out; the Activity page also hides them itself unless asked.
+   */
+  activity: (o: { project?: string; kind?: ActivityKind; target?: string; run?: string; limit?: number; withRuns?: boolean }) =>
+    request<Activity[]>(`/api/activity${qs({ target: o.target, project: o.project, kind: o.kind, run: o.run, limit: String(o.limit ?? 100), [ACTIVITY_WITH_RUNS]: o.withRuns ? '1' : undefined })}`),
   /** One activity entry with all its details (a list row with detailsOmitted has none). */
   activityEntry: (id: string) => request<Activity>(`/api/activity/${enc(id)}`),
 
@@ -226,7 +233,7 @@ export const api = {
     requestCursorPage<DocSummary>(`/api/projects/${enc(key)}/docs${qs({ cursor: o.cursor, limit: o.limit ? String(o.limit) : undefined })}`),
   // Uploads and imports are not retried: a lost answer can mean it was stored, and a retry would store it twice.
   uploadDoc: (key: string, doc: { title: string; name: string } & ({ text: string } | { image: { mediaType: string; data: string } })) =>
-    request<{ id: string; chunks: number }>(`/api/projects/${enc(key)}/docs`, { method: 'POST', body: doc, retry: false }),
+    request<{ id: string; chunks: number; pending?: true }>(`/api/projects/${enc(key)}/docs`, { method: 'POST', body: doc, retry: false }),
   projectSettings: () => request<ProjectSettings>('/api/settings/projects'),
   saveProjectSelection: (tracked: string[]) => request<ProjectSettings>('/api/settings/projects', { method: 'PUT', body: { tracked } }),
   saveProjectRoots: (roots: string[]) => request<ProjectSettings>('/api/settings/roots', { method: 'PUT', body: { roots } }),
@@ -236,6 +243,14 @@ export const api = {
   syncCloud: () => request<CloudSyncResult>('/api/cloud/sync', { method: 'POST', body: {}, retry: false }),
 
   /** A failed reading, queued again (no re-upload): after DOCS_LLM changed to a model with vision, say. */
+  /** One document by id, with its embed status (DocSummary.embed); null when there is none (any more). */
+  doc: async (id: string): Promise<DocSummary | null> => {
+    const res = await send(`/api/docs/${enc(id)}`, { method: 'GET' }, { write: false, retry: true });
+    if (res.status === 401) window.dispatchEvent(new Event(SIGN_IN_EVENT));
+    if (res.status === 404) return null;
+    if (!res.ok) throw new Error(await errorText(res));
+    return (await res.json()) as DocSummary;
+  },
   rereadDoc: (id: string) => request(`/api/docs/${enc(id)}/reread`, { method: 'POST', body: {} }),
   deleteDoc: (id: string) => request(`/api/docs/${enc(id)}`, { method: 'DELETE', body: {}, retry: false }),
 

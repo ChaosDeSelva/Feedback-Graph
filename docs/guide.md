@@ -15,7 +15,7 @@ Colours mean the same thing on every page:
 | Accent (the brand colour) | Highlights: pinned, flagged as pushback, decided by an agent |
 | Violet | One more distinct colour where a set needs it (a cause, the *Linear* source); never a status |
 
-Times like "5m ago" show the exact time when you hover them.
+Times like "5m ago" show the exact time, in words, when you hover them.
 
 ## A typical session
 
@@ -50,7 +50,7 @@ Bars that can appear above any page:
 
 The landing page: a question box first, then where everything stands, each part linked to the page with the detail. It refreshes the worker and pipeline every 10 seconds. Nothing here changes what agents learn.
 
-**Ask** (top, centre): one box. Type a question, pick the project under it, press **Enter** (**Shift+Enter** is a new line) or **Ask**. It opens a new chat on the Ask page and sends the question.
+**Ask** (top, centre): one box. Type a question, pick the project and the model under it (**Default model**, **Claude**, **Codex** or **Local model**, as on the Ask page), press **Enter** (**Shift+Enter** is a new line) or **Ask**. It opens a new chat on the Ask page and sends the question to that model.
 - The **starter questions** under the box fill it in for you to finish; they do not send.
 - **Suggested questions** ask about your top hotspots ("Before I change *file*, what should I know?"); a click sends it on that file's project.
 - **Recent chats**: your last five conversations, each with its project and when it last changed; **all** opens the Ask page.
@@ -71,6 +71,8 @@ The landing page: a question box first, then where everything stands, each part 
 
 A dash means the count is not known (an older API).
 
+Under the tiles, one line per queue with work in it (**Scan queue**, **Classify queue**, **Post-mortem queue**, **Ask queue**): how many wait (*n+* when capped), how long the oldest has waited, and what runs now and for how long, for example *Scan queue: 7 waiting, oldest 2 h; running shard 12/40 of acme for 14 min*. `fg status` and `/api/pipeline` give the same.
+
 **Quality**
 - **repeat rate**: of all confirmed feedback, the share that was the same kind of miss as an earlier one. Lower is better.
 - **checks that caught a gap**: of the agents' pre-done checks (`check_before_done`), the share that found at least one gap.
@@ -78,9 +80,9 @@ A dash means the count is not known (an older API).
 
 **Projects**: one row per selected project, pinned ones first with a *pinned* badge. Columns: sessions, feedback, lessons, facts, the last scan's status and when, and **links** (confirmed links to other projects). Grey zeros are empty.
 
-**Hotspots**: the top files agents struggle with across projects. **misses** is confirmed misses whose session edited the file; **score** is the hotspot score (see Projects). Click a file to open its module panel on Projects.
+**Where agents struggle**: the files a confirmed miss touched, across projects (a busy file with no miss is a hotspot, not a struggle). **misses** is confirmed misses whose session edited the file; **score** is the hotspot score (see Projects). Click a file to open its module panel on Projects.
 
-**Recent activity**: the last ten Activity entries. Click one to expand it.
+**Recent activity**: the last ten Activity entries, each row as on the Activity page. Click one to expand it.
 
 Each card loads on its own. If one fails, it shows its own error and the rest still work.
 
@@ -92,7 +94,7 @@ Chat about one project. Each conversation is one topic. The answer is built from
 
 **Header**: the project filter narrows the conversation list. **New chat** starts one.
 
-**Conversation list** (left): title (the first question), project, when it was last updated, and a blue **answering** badge while an answer is being written.
+**Conversation list** (left): title (the first question), project, when it was last updated, and a blue **answering** badge while an answer is being written. The latest message comes first: a conversation you ask in moves to the top at once, and one answering in the background is checked every few seconds, so it moves up and drops its badge once answered.
 
 **New chat**: pick the project and the model (**Default model**, **Claude**, **Codex** or **Local model**), type, and press **Send** or `Cmd/Ctrl+Enter`. The answer uses this project and its confirmed linked projects. The question and the gathered context go only to the model you pick.
 
@@ -101,9 +103,9 @@ Chat about one project. Each conversation is one topic. The answer is built from
 - **You**: your question, on the right.
 - *Answering with Claude... 0:42*: the answer is being written; the timer counts up. The page checks every 2 seconds.
 - A red box with **Retry**: the model could not answer, with the reason.
-- **The answer**: formatted text. Citations like `[S1]` point to the sources list. "answered by claude-cli" names the model that wrote it.
+- **The answer**: formatted text. Citations like `[S1]` link to what they cite. Under it, "answered by claude-cli" names the model that wrote it, and *answered from a context pack of 12,345 characters, 9 sources* says how much Feedback Graph gathered for the question and gave the model.
 - **Examples**: existing code that does something similar. Each shows `path:lines`, why it is relevant, and **used in** with the files that use it. Every path opens that file's module panel on Projects.
-- **Sources (n)**: click to open. Each row is `S1`, `S2`... with a kind badge, the title and a reference. Kinds: **lesson** (green), **miss** (red), **fact** (accent), **code** (blue), **doc**, **session**, **linked** (grey; from a linked project).
+- **Sources (n)**: click to open. Each row is `S1`, `S2`... with a kind badge, the title and a reference. Kinds: **lesson** (green), **miss** (red), **fact** (accent), **code** (blue), **doc**, **session**, **linked** (grey; from a linked project). Code and facts (`path:lines`) open their file's module panel. A **miss** is cited by the file its session edited and opens that file's module panel, where its past misses are listed; one from an older answer keeps its miss id and has no link.
 - **Prompt for your agent**: a ready brief for Claude Code or Codex in this project, naming the files to read first and the Feedback Graph tools to use. **Copy** copies it.
 
 The follow-up box is disabled until the current answer arrives.
@@ -149,13 +151,17 @@ Rules drawn from confirmed misses. **This is where you decide what agents learn*
 
 **List** (left)
 - Tabs: **proposed** (waiting for you), **approved** (agents get these), **rejected** (rejected or revoked), **superseded** (replaced by a newer lesson).
+- Filters: **source** (GitHub review, Linear comment, session pushback, memory file, by you) and **check** (one flag). A filtered list with nothing in it says *No approved lessons match this filter*, with **Clear filters**; *No approved lessons yet* means there are none at all.
+- On the proposed tab, a box on each row and a bar above the list: **select all with flag...**, **Select all**, how many are selected, **Approve selected** and **Reject selected** (one confirm for all, with an optional note). The bar is always there, its buttons disabled until you tick a row, so ticking never moves the rows under the cursor.
 - Each row: the project, or **global**; where it came from (*post-mortem*, *memory file* for one imported from a Claude Code memory file, *by you* for one you wrote; hover for the full wording); the cause with its coloured dot; the title.
-- Red **check chips**: what the automatic lesson check found. Hover for the reason. Up to three show; *+n* holds the rest. Labels: *path outside the repo*, *bad path dropped*, *needs a path*, *rule from a nit*, *about feedback*, *platitude*, *rule repaired*, *looks like a fact*, *not pushback*, *wrong session*, *self-review*.
+- Red **check chips**: what the automatic lesson check found. Hover for the reason. Up to three show; *+n* holds the rest. Labels: *path outside the repo*, *bad path dropped*, *needs a path*, *path not in repo*, *ambiguous path*, *rule from a nit*, *about feedback*, *platitude*, *rule repaired*, *looks like a fact*, *not pushback*, *wrong session*, *self-review*, *duplicate*, *cause contradicted*, *another project's ticket*, *no miss found*, *generic* (the rule names no file, function, value or command; these are listed last, with the reason under the title) and *two lessons in one*.
 - An accent **approved by agent** (or *rejected by agent*) badge: an agent holding the operator token made that decision, not you.
+
+**How your lessons were judged** (in the page header): of the lessons the post-mortem wrote that were decided in the last 30 days, how many were approved as written, approved after your edit and rejected, with their shares, and how many of those decisions an agent with the operator token made. Open it for the last 90 days and each project. The post-mortem is shown this project's edited and rejected lessons as examples, so *as written* is the number to watch go up. Automatic rejections never count as yours. `fg lessons quality`, `fg status` and `/api/pipeline` give the same numbers. It shows nothing until a lesson is decided.
 
 **Detail** (right)
 - Badges: project or global, status, and *by agent* if an agent decided it.
-- **Before you approve**: every check finding with its reason. Read these first.
+- **Before you approve** (on a proposed lesson; **What the lesson check found** on any other): every check finding with its reason. Read these first.
 - **You said**: your original feedback, its session and its status.
 - **What was missed**, with a **cause** badge:
   | Cause | Colour | Means |
@@ -167,7 +173,7 @@ Rules drawn from confirmed misses. **This is where you decide what agents learn*
   | implementation error | violet | It knew and still got it wrong |
 - **Context that would have prevented it**: each item (code, doc, session, PR, ticket) with an excerpt and why it matters. Red **was available to the agent** or grey **not loaded in the session**.
 - **Fix commits**: the commits that fixed it.
-- **Lesson for future agents**: edit **Title**, **Rule**, **Applies when** and **Scope** (*task*: work like this one; *project*; *global*: every project). Prefer the narrowest scope the evidence supports. **Paths**: agents get the lesson when they edit these files; with none it applies anywhere in its project.
+- **Lesson for future agents**: edit **Title**, **Rule**, **Applies when** and **Scope** (*task*: work like this one; *project*; *global*: every project). Prefer the narrowest scope the evidence supports. Narrowing a **global** lesson asks which project it will serve (it has none of its own). **Paths**: agents get the lesson when they edit these files; with none it applies anywhere in its project.
 - **History**: every Activity entry about this lesson.
 
 **Actions** (bar at the bottom)
@@ -197,7 +203,7 @@ Two views of one project, picked with the **evidence / code** tabs and the proje
 - Circles are files; lighter circles are **test files**. **Red** circles are files with misses. **Diamonds** are misses, **squares** are approved lessons.
 - **Size** is the hotspot score: bigger files score higher. Files repel each other and never overlap, so folders that import each other form their own clusters; the drawing is fitted under the legend once it settles (a large map takes a few seconds).
 - Lines: solid arrows are imports, dashed lines are tests covering a file, dotted lines tie a miss or lesson to its files. A very faint dotted line only keeps a file with no drawn neighbour close by.
-- **Captions**: the top 12 hotspots and every file with misses are always named; zoom in to name every file. Names are shortened to the shortest unique ending (`read/handler.ts`); hover for the full path, score and misses.
+- **Captions**: twelve key files (files with misses first, then the hotspot score, then the most connections, so a fresh map still names its hubs) and every file with misses are named at every zoom, beside their node on a light halo, over other nodes if need be but never over another name. A file with misses also wears a **red ring**, and its name says how many (`total.ts (1 miss)`). Zoom in to name every file. Names are shortened to the shortest unique ending (`read/handler.ts`); hover for the full path, score and misses.
 - **include tests** adds test files to the hotspots. **Find a file by path** opens any mapped file, drawn or not.
 - Notes may appear: *No hotspots yet* (nothing scores, so these are just the first files), *Showing the top n of m files* (the drawing is capped; Projects lists them all), or *The map holds n of m files* (the map itself is capped by `SCAN_MAX_FILES`).
 - Click a file for its **module panel** (see Projects). Click a miss for its cause, date, *your feedback* and *its lesson* links, and the files its session edited. Click a lesson for its title and the files it applies to.
@@ -273,7 +279,7 @@ Everything known about each selected project folder: its links, code map, facts,
   - **dependents**: files that import it.
   - **score** = 4 × misses + log2(1 + churn) + log2(1 + dependents). Docs and config files score 0 until a miss touches them.
   - 25 rows show; **Show all** lists the rest. **include tests** adds test files. When every score is 0 it says *No hotspots yet*, with **Show the files anyway**.
-- Click a file for its **module panel**: language, lines, commits in 90 days, a *test file* badge, and **link** (a link that opens this panel). Sections: **What it is** (facts citing the file), **Symbols** (*exported* in accent), **Imported by**, **Imports** (`pkg:` for packages), **Tests that cover it**, **Approved lessons**, **Past misses** (cause badge, green *fixed here* when the fix was in this file, *your feedback* and *its lesson* links). Click any file to move to it.
+- Click a file for its **module panel**: language, lines, commits in 90 days, a *test file* badge, and **link** (a link that opens this panel). Sections: **What it is** (facts citing the file), **Symbols** (*exported* in accent), **Imported by**, **Imports** (`pkg:` for packages), **Tests that cover it**, **Approved lessons**, **Past misses** (cause badge, green *fixed here* when the fix was in this file, *your feedback* and *its lesson* links). Click any file to move to it. A file past the map's cap opens a panel that says so: how many files the map keeps, which it keeps first, and that raising `SCAN_MAX_FILES` and rebuilding includes it. A file not in an uncapped map says the map does not read it (ignored by git, a lock file or secret, too large, in a skipped folder, or not a code, docs or config file) or that it is newer than the map.
 
 ![Projects, code facts](../packages/ui/public/guide/projects-facts.png)
 
@@ -298,9 +304,11 @@ Everything known about each selected project folder: its links, code map, facts,
 
 ![Activity](../packages/ui/public/guide/activity.png)
 
-The provenance log: every fact, lesson and decision, who or what made it, and why. Filter by project and by kind. Read-only.
+The provenance log: every fact, lesson and decision, who or what made it, and why. Read-only.
 
-**Columns**: **Event** (what happened, and why underneath), **Kind** (a badge), **By**, **When**. On a narrow screen the kind sits under the event.
+**Filters**: project, kind and **run** (type a run id, or pick one seen; see *Runs, sandboxes and testing* below). **hide labelled runs** is on by default: entries written by requests labelled with a run (a tester's or a script's) stay out of the way, and a line says how many were hidden, with **Show them**. Filtering by a run shows that run's entries whatever the box says.
+
+**Each row**, at any width: what happened on one line (cut with `…`; hover for all of it) with the **kind** badge on the right; under it, in grey, **when** ("3h ago"; hover for the exact time), **who** and, for a labelled run, **run *id*** (with *· sandbox*) as small chips that cut long ids (hover for the whole id), then the **why**.
 
 **Kind colours**: *feedback flagged* is blue, *post-mortem* green, *post-mortem failed* and *project deleted* red. *your decision* and *lesson decision* take the colour of the decision (green confirmed or approved, red rejected). *cloud sync* is green or red by result. The rest are grey.
 
@@ -311,7 +319,7 @@ The provenance log: every fact, lesson and decision, who or what made it, and wh
 - A model id such as `ollama:gemma4` or `claude-cli`: that model produced it (a classification, post-mortem, scan, fact scoring, document reading or summary).
 - A step of the pipeline that uses no model: **deterministic** (code mapped, links suggested), **skip-rules** (comments skipped), **lesson-check**, **github** or **linear** (comments and discussions synced), **memory-file** (an imported memory file), **postmortem** (a failed post-mortem).
 
-Click a row to expand it: the kind and project, every detail (lists of facts or verdicts show each one's "why"), and **touched**: the ids it changed.
+Click a row to expand it: the kind and project, the why, the exact time, who (and which kind of actor), the run, every detail (lists of facts or verdicts show each one's "why"), and **touched**: the ids it changed.
 
 ## Settings
 
@@ -327,10 +335,27 @@ Which project folders are read, where they come from, and the connections, in fo
 
 **Projects tab: Where folders come from**: the project roots. **Add folder** adds one; **Remove** takes one away (asks first). *not mounted yet* means you must run `./scripts/setup.sh` on the host (**Copy command** copies it). Sessions that ran outside your roots are suggested with their counts, each with **Add as root**.
 
-**Integrations tab**: GitHub and Linear cards, each with a state badge (green *connected*, red *error*, grey *not connected*) and *set in .env* or *saved here*. They show the account, where the token comes from, last sync and any rate-limit pause. **Connect** checks a token with one read-only call before keeping it; **Test connection**, **Replace token** (also over a token from `.env`: the one saved here wins), **Disconnect** (asks first; comments already in the Inbox stay; with a token in `.env` it goes back to that one). The **Projects** table turns pull request comments on or off per project, picks each project's Linear team, and shows each sync's time and comment count. **All connections** lists every connection with where it is set. Integrations only read; nothing is written to GitHub or Linear.
+**Integrations tab**: GitHub and Linear cards, each with a state badge (green *connected*, red *error*, grey *not connected*) and *set in .env* or *saved here*. They show the account, where the token comes from, last sync and any rate-limit pause. **Connect** checks a token with one read-only call before keeping it; **Test connection**, **Replace token** (also over a token from `.env`: the one saved here wins), **Disconnect** (asks first; comments already in the Inbox stay; with a token in `.env` it goes back to that one). The **Projects** table turns pull request comments on or off per project, picks each project's Linear team, and shows each sync's time and comment count. Linear reads nothing until a team is mapped to a project: until then its card says *nothing to sync yet: map a team to a project below to start syncing*. **All connections** lists every connection with where it is set. Integrations only read; nothing is written to GitHub or Linear.
 
 **Comments skipped before the classifier**: the rules that keep a comment out of the Inbox (`bot-author`, `pr-author-reply`, `status-note`, `review-trigger`), each with how many it skipped. Read-only.
 
 **Cloud sync tab**: off unless `CLOUD_URL` and `CLOUD_TOKEN` are set. When on: the host, schedule, last sync, which lessons are sent (approved only unless `SYNC_SUGGESTIONS=true`), the projects, and tiles counting what a sync sends. **Sync now** sends it.
 
 **Clean up tab**: removes the stored data of projects you have not selected. It uses the saved selection, so save first. Asks first.
+
+## Runs, sandboxes and testing
+
+For testers, scripts and automated agents. Nothing here is needed for everyday use.
+
+- **A run.** Label requests with `x-fg-run: <id>` (1 to 64 letters, digits, dots, dashes or underscores), `?run=<id>` on `/mcp`, or `fg --run <id>` (`FG_RUN`). Everything the run writes records the id; Activity shows it as a chip and filters by it. A run belongs to whoever opened it with its first labelled write (the operator token, your API token, the browser, or an agent with neither): a write under another caller's run id is refused. A run never replaces, decides on or removes your records: a change to your documents, links, pins, Inbox items, lessons or chats under a run is answered with a 409 unless you opened the run. Your decision on something a run made makes it yours.
+- **A sandbox run** (`x-fg-sandbox: 1` with a run id, or `fg --run <id> --sandbox`): its records reach only that run, in every list, search, count, Ask pack and code map answer, and are never exported or synced to the cloud. A sandbox tester's upload or link decision is its own copy beside yours.
+- **`fg cleanup --run <id>`** removes only what that run wrote. Without `--apply` it is a dry run: counts per kind, and what stays and why. It keeps anything you decided on since. The operator token may clean up only runs it opened.
+- **`fg evidence <session>`** (`GET /api/sessions/:id/evidence`): what the tool saw in one session and what it decided: its turns, the detector's call on each and the skip rules, the Inbox items with their post-mortem and lesson, and the context served.
+- **`fg demo seed`** adds a small corpus marked demo in demo-shop (approved lessons tied to files, a miss, facts), so the lesson path can be tried on a fresh install. Running it is your approval of those demo lessons. **`fg demo remove`** takes back exactly what it wrote, never a file a scan recorded.
+
+## Agents: the done check, headless runs, a second install
+
+- **check_before_done reads the real diff**: the `diff` the agent passes (the plugin's Stop hook asks for `git diff` from the commit the session started at), or the repository's diff of `files_changed`. It judges the work against the lessons `get_task_context` would serve (lessons tied to the changed files always). Each gap quotes the diff lines it rests on; a call that points to no line of the diff is listed under **Cannot tell from the diff**: neither a gap nor a pass, so check it yourself. About 32 KB of diff is read, the files the lessons and misses name first, and the answer names the files it cut. It takes `session_id`, and the plugin passes it. If you deny the tool, the Stop hook says so once and stops asking.
+- **Claude Code headless** (`claude -p`): a tool that is not allowed is denied, never prompted. Allow the tools and the git commands the check needs: `--allowedTools "mcp__plugin_feedback-graph_fg" "Bash(git diff *)" "Bash(git add -N *)"`. Set up with `scripts/install-agent.sh claude` instead of the plugin, allow `mcp__feedback-graph`.
+- **Codex**: the agent tools carry MCP annotations (all read-only except `report_feedback`), so `codex exec` can call them. For one headless run without approval prompts, `install-agent.sh` prints the override: `codex exec -c 'mcp_servers.feedback-graph.default_tools_approval_mode="approve"' ...`.
+- **A second install** (another checkout of the tool on the same machine): `./scripts/setup.sh` gives it its own Docker Compose name (`FG_INSTANCE`), ports and Ollama port (`OLLAMA_PORT`), so it never takes over the first one's containers or data, and `install-agent.sh` registers its MCP server as `feedback-graph-<name>`. An existing install keeps its name, ports and volumes.

@@ -147,7 +147,10 @@ test('writes logged by the Settings routes carry the agent too', async () => {
   const narrow = setup({ allow: ['scan'], extra: { settings } });
   const res = await narrow.app.request('/api/settings/projects', call('PUT', { tracked: [] }, bearer(OP)));
   expect(res.status).toBe(403);
-  expect((await res.json()).error).toContain('select_projects');
+  const { error } = await res.json();
+  expect(error).toContain('select_projects');
+  // A CLI-only first run is not stuck: the owner's own way in from the host is named.
+  expect(error).toMatch(/setup\.sh --select/);
   expect(sel.tracked).toEqual(['demo-shop']);
 });
 

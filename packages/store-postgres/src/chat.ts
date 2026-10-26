@@ -1,9 +1,16 @@
 import {
-  ChatBusyError, cleanChatAnswer, cleanChatContext, cleanChatError, cleanChatSources, cleanChatText, cleanChatTitle, newChatId, newChatTurnId, ORPHANED_TURN, withPackSizes,
-  type ChatAnswer, type ChatConversation, type ChatJob, type ChatPack, type ChatProvider, type ChatStore, type ChatThread, type ChatTurn,
+  ChatBusyError, cleanChatAnswer, cleanChatContext, cleanChatError, cleanChatSources, cleanChatText, cleanChatTitle, newChatId, newChatTurnId, ORPHANED_TURN, REDACT_PAGE, redactedChanges, redactStoredRow, withPackSizes,
+  type ChatAnswer, type ChatConversation, type ChatJob, type ChatPack, type ChatProvider, type ChatStore, type ChatThread, type ChatTurn, type PendingChatTurn,
 } from '@fb/core';
 import type pg from 'pg';
 import { iso, toJson, tx, type Db } from './db.ts';
+
+/** The fields of a turn the redaction re-run reads and may rewrite; answer and sources are jsonb. */
+const TURN_FIELDS = ['text', 'context', 'error', 'answer', 'sources'] as const;
+/** Field f of a jsonb object column of the re-run's page: jsonb for answer and sources, text otherwise. */
+const turnField = (obj: string, f: string) => `(c.${obj}${f === 'answer' || f === 'sources' ? '->' : '->>'}'${f}')`;
+/** A field the re-run changed that is still what it read. */
+const turnSame = (f: string) => `(c.fields ? '${f}' AND x.${f} = ${turnField('prev', f)})`;
 
 const PENDING = `EXISTS (SELECT 1 FROM chat_turns t WHERE t.conversation_id = c.id AND t.status IN ('pending', 'answering'))`;
 
@@ -72,12 +79,13 @@ export class PgChatStore implements ChatStore {
     return added ? this.conversation(conversationId) : null;
   }
 
-  async nextPendingTurn(): Promise<ChatJob | null> {
+  async nextPendingTurn(o: { id?: string } = {}): Promise<ChatJob | null> {
     const { rows: [r] } = await this.db.pool.query(
       `SELECT t.id, t.conversation_id, q.id AS question_id, q.context
        FROM chat_turns t LEFT JOIN chat_turns q ON q.conversation_id = t.conversation_id AND q.seq = t.seq - 1
-       WHERE t.status = 'pending' AND t.role = 'assistant'
+       WHERE t.status = 'pending' AND t.role = 'assistant' AND ($1::text IS NULL OR t.id = $1)
        ORDER BY t.created_at, t.id COLLATE "C" LIMIT 1`,
+      [o.id ?? null],
     );
     if (!r) return null;
     const conversation = await this.conversation(r.conversation_id);
@@ -89,6 +97,23 @@ export class PgChatStore implements ChatStore {
       return null;
     }
     return { conversation, turn, question, context: r.context ?? '' };
+  }
+
+  async pendingTurns(limit = 200): Promise<PendingChatTurn[]> {
+    const { rows } = await this.db.pool.query(
+      `SELECT t.id, t.conversation_id, c.provider, t.created_at FROM chat_turns t LEFT JOIN chat_conversations c ON c.id = t.conversation_id
+       WHERE t.status = 'pending' AND t.role = 'assistant' ORDER BY t.created_at, t.id COLLATE "C" LIMIT $1`,
+      [limit],
+    );
+    return rows.map((r) => ({ id: r.id, conversationId: r.conversation_id, provider: r.provider ?? null, createdAt: iso(r.created_at)! }));
+  }
+
+  async setQueueAhead(updates: { id: string; ahead: number }[]): Promise<void> {
+    if (!updates.length) return;
+    await this.db.pool.query(
+      `UPDATE chat_turns t SET queue_ahead = u.ahead FROM unnest($1::text[], $2::int[]) AS u(id, ahead) WHERE t.id = u.id AND t.status = 'pending'`,
+      [updates.map((x) => x.id), updates.map((x) => x.ahead)],
+    );
   }
 
   async markAnswering(turnId: string, provider: string): Promise<boolean> {
@@ -139,6 +164,35 @@ export class PgChatStore implements ChatStore {
     return rowCount ?? 0;
   }
 
+  async redactStoredTurns(afterRead?: () => Promise<unknown>): Promise<number> {
+    let changed = 0;
+    for (let after = ''; ;) {
+      const { rows } = await this.db.pool.query(
+        'SELECT id, text, context, error, answer, sources FROM chat_turns WHERE id > $1 ORDER BY id LIMIT $2',
+        [after, REDACT_PAGE],
+      );
+      if (!rows.length) break;
+      after = rows[rows.length - 1].id;
+      const page = rows.flatMap((r: Record<string, unknown> & { id: string }) => {
+        const out = redactStoredRow(r, ['text', 'context', 'error'], ['answer', 'sources']);
+        if (!out) return [];
+        const { id, set, was, fields } = redactedChanges(r, out, TURN_FIELDS);
+        return [{ id, vals: set, prev: was, fields }];
+      });
+      if (!page.length) continue;
+      await afterRead?.();
+      // Each changed field only while it is still what was read: the runner may answer a turn (answer, text) between.
+      const { rowCount } = await this.db.pool.query(
+        `UPDATE chat_turns x SET ${TURN_FIELDS.map((f) => `${f} = CASE WHEN ${turnSame(f)} THEN ${turnField('vals', f)} ELSE x.${f} END`).join(', ')}
+         FROM jsonb_to_recordset($1::jsonb) AS c(id text, vals jsonb, prev jsonb, fields jsonb)
+         WHERE x.id = c.id AND (${TURN_FIELDS.map(turnSame).join(' OR ')})`,
+        [toJson(page)],
+      );
+      changed += rowCount ?? 0;
+    }
+    return changed;
+  }
+
   /** A guarded UPDATE of one turn; true when it changed it, and then its conversation's updated_at is bumped. */
   private async transition(sql: string, params: unknown[]): Promise<boolean> {
     return tx(this.db, async (c) => {
@@ -185,5 +239,6 @@ function turnOf(r: Record<string, any>): ChatTurn {
     createdAt: iso(r.created_at)!,
     startedAt: iso(r.started_at),
     finishedAt: iso(r.finished_at),
+    queueAhead: r.status === 'pending' && r.queue_ahead != null ? Number(r.queue_ahead) : null,
   };
 }

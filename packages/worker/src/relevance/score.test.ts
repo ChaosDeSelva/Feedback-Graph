@@ -23,7 +23,7 @@ function deps(todo: UnscoredFact[], answer: (user: string) => unknown, over: Par
 }
 
 test('scoreFacts asks once for a batch of unscored facts and stores each score as the model\'s', async () => {
-  const t = deps([fact('f1', 'Set up the profiler app on your machine'), fact('f2', 'Every query is scoped by orgId')], () => ({ scores: [{ n: 1, relevance: 0.1 }, { n: 2, relevance: 0.95 }] }));
+  const t = deps([fact('f1', 'Set up the profiler app on your machine'), { ...fact('f2', 'Every query is scoped by orgId'), kind: 'invariant' }], () => ({ scores: [{ n: 1, relevance: 0.1 }, { n: 2, relevance: 0.95 }] }));
   expect(await t.d.facts.unscoredFacts({ projectKeys: ['shop'], limit: 9 })).toHaveLength(2);
   const r = await scoreFacts(t.d);
   expect(r).toEqual({ scored: 2 });
@@ -34,6 +34,20 @@ test('scoreFacts asks once for a batch of unscored facts and stores each score a
   expect(t.asked[0].system).toMatch(/external tool/);
   expect(t.set[0]).toEqual([{ id: 'f1', relevance: 0.1, by: 'model' }, { id: 'f2', relevance: 0.95, by: 'model' }]);
   expect(t.activity[0]).toMatchObject({ kind: 'facts_scored', actor: 'ollama:gemma4', projectKey: 'shop', subject: 'scored 2 facts for everyday relevance' });
+});
+
+test('the scores a model gives are calibrated before they are stored: one area\'s facts are not everyday, and everyday stays the minority', async () => {
+  const todo = [
+    { ...fact('f1', 'Every query is scoped by orgId'), kind: 'invariant' as const, path: '.' },
+    { ...fact('f2', 'createOrder returns 409 when the cart changed'), kind: 'api' as const, path: 'src/api/orders.ts' },
+    ...Array.from({ length: 6 }, (_, i) => ({ ...fact(`c${i}`, `convention ${i}`), kind: 'convention' as const, path: `src/m${i}.ts` })),
+  ];
+  const t = deps(todo, () => ({ scores: todo.map((_, i) => ({ n: i + 1, relevance: 0.9 })) }));
+  await scoreFacts(t.d);
+  const by = Object.fromEntries(t.set[0].map((u) => [u.id, u.relevance]));
+  expect(by.f2).toBe(0.7);
+  expect(t.set[0].filter((u) => u.relevance >= 0.8).length).toBeLessThanOrEqual(2);
+  expect(by.f1).toBe(0.9);
 });
 
 test('an answer of the wrong shape is asked again once, more strictly', async () => {
@@ -50,7 +64,7 @@ test('scoreFacts only reads the selected projects, and does nothing when there i
 });
 
 test('a fact the model skipped stays unscored for the next round; numbers it invents are ignored or clamped', async () => {
-  const t = deps([fact('f1', 'a'), fact('f2', 'b')], () => ({ scores: [{ n: 2, relevance: 4 }, { n: 7, relevance: 0.3 }] }));
+  const t = deps([fact('f1', 'a'), { ...fact('f2', 'b'), kind: 'convention' }], () => ({ scores: [{ n: 2, relevance: 4 }, { n: 7, relevance: 0.3 }] }));
   expect(await scoreFacts(t.d)).toEqual({ scored: 1 });
   expect(t.set[0]).toEqual([{ id: 'f2', relevance: 1, by: 'model' }]);
 });

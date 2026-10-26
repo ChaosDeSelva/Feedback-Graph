@@ -5,6 +5,7 @@ import type { TaskImage } from '../llm/providers.ts';
 import { relevanceOf, scanRetryAt, SCAN_UNAVAILABLE_WAIT_MS, type EmbeddedFact } from './facts.ts';
 import type { GraphRepo } from './repo.ts';
 import type { RunTag } from '../types.ts';
+import { nearest } from './nearest.ts';
 import { VISIBLE_TO_RUN } from './runs.ts';
 import { runWriteOwner } from '../runs.ts';
 
@@ -21,7 +22,12 @@ export type DocKind = 'text' | 'image';
 /** addedBy: who uploaded it ('you', or 'operator:<name>'); null for PR discussions, tickets and older uploads. */
 /** listDocs: a page (at most `limit`, after the doc `after` names), or the docs with this source and ref. */
 export type DocListOpts = { limit?: number; after?: { addedAt: string; id: string } | null; source?: DocSource; ref?: string; run?: string | null };
-export type DocSummary = DocInput & { id: string; addedAt: string; addedBy: string | null; chunks: number; kind: DocKind; mediaType: string | null; read: DocReadState | null };
+/**
+ * A large upload the API is embedding in the background (pending), or failed to (with why): set by the API on the
+ * document it replaces, or on the upload not stored yet; absent once it is stored. Stores never set it.
+ */
+export type DocEmbed = { status: 'pending' | 'failed'; error?: string; chunks: number };
+export type DocSummary = DocInput & { id: string; addedAt: string; addedBy: string | null; chunks: number; kind: DocKind; mediaType: string | null; read: DocReadState | null; embed?: DocEmbed };
 /** What the docs stage reads: the text of a text upload (its chunks joined), or the image of an image upload. */
 /**
  * `version`: which upload of the document this is (its addedAt). The reader passes it back, so a reading of a version
@@ -72,6 +78,7 @@ export class DocsRepo implements DocsStore {
     const doc = { ...input, title: redactSecrets(input.title), ref: redactSecrets(input.ref) };
     const chunks = raw.map((c) => ({ ...c, text: redactSecrets(c.text) }));
     const id = docIdOf(doc, o.run);
+    this.g.sandbox.wrote(o.run);
     // A run replaces only its own document (runWriteOwner); the owner's write makes a run's document the owner's.
     const [cur] = await this.g.run(`MATCH (d:Doc {id: $id}) RETURN d.run AS run`, { id });
     const run = runWriteOwner(`the document ${doc.ref}`, cur ? (cur.get('run') ?? null) : undefined, o.run, o.byOwner);
@@ -136,8 +143,10 @@ export class DocsRepo implements DocsStore {
 
   async saveDocReading(id: string, r: { version?: string; chunks?: { text: string; embedding: number[] }[]; facts: EmbeddedFact[]; source: string }): Promise<boolean> {
     // The version read must still be the current one; checked again inside the write, so a re-upload in between wins.
-    const [cur] = await this.g.run(`MATCH (d:Doc {id: $id}) RETURN d.addedAt AS v`, { id });
+    const [cur] = await this.g.run(`MATCH (d:Doc {id: $id}) RETURN d.addedAt AS v, coalesce(d.sandbox, false) AS sandbox`, { id });
     if (!cur || (r.version !== undefined && cur.get('v') !== r.version)) return false;
+    // A sandbox upload's facts and chunks are sandbox records too.
+    this.g.sandbox.wrote(cur.get('sandbox') === true);
     // Model output about a document someone gave you: redact at the door, like code facts.
     const facts = redactDeep(r.facts).map((f) => ({ ...f, relevance: relevanceOf(f) }));
     const chunks = r.chunks?.map((c) => ({ ...c, text: redactSecrets(c.text) })) ?? null;
@@ -287,15 +296,16 @@ export class DocsRepo implements DocsStore {
   }
 
   async searchDocs(q: { embedding: number[]; projectKey: string; k: number; run?: string | null }): Promise<DocHit[]> {
-    const rows = await this.g.run(
-      `MATCH (node:Chunk {projectKey: $projectKey}) WHERE node.embedding IS NOT NULL AND size(node.embedding) = size($embedding)
-         AND NOT EXISTS { MATCH (sd:Doc {id: node.docId}) WHERE NOT ${VISIBLE_TO_RUN('sd')} }
-       WITH node, vector.similarity.cosine(node.embedding, $embedding) AS score
-       ORDER BY score DESC LIMIT $k
+    // A chunk is another run's sandbox upload when its document is (only looked up while any sandbox record exists).
+    const visible = (await this.g.sandbox.any()) ? `NOT EXISTS { MATCH (sd:Doc {id: node.docId}) WHERE NOT ${VISIBLE_TO_RUN('sd')} }` : 'true';
+    const rows = await nearest(this.g, {
+      index: 'chunk_embedding', label: 'Chunk', embedding: q.embedding, k: q.k,
+      where: `node.projectKey = $projectKey AND ${visible}`,
+      tail: `WITH node, score ORDER BY score DESC LIMIT $k
        MATCH (d:Doc {id: node.docId})
        RETURN node.text AS text, score, d`,
-      { embedding: q.embedding, k: neo4j.int(q.k), projectKey: q.projectKey, run: q.run ?? null },
-    );
+      params: { projectKey: q.projectKey, run: q.run ?? null },
+    });
     return rows.map((r) => {
       const p = r.get('d').properties;
       return { docId: p.id, source: p.source, ref: p.ref, title: p.title, url: p.url ?? null, text: r.get('text'), score: r.get('score') };

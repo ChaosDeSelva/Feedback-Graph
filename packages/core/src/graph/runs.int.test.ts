@@ -65,6 +65,37 @@ describeStores('RunsStore and run attribution', (h) => {
     expect((await s.activity.get(all[1].id))).toMatchObject({ run: 'sbx-1', sandbox: true });
   });
 
+  test("the default feed leaves out every run's entries (unlabelled), a record's history leaves out sandbox runs' (noSandbox), and removeRun removes one run's entries only", async () => {
+    await s.activity.record({ kind: 'context_served', actor: 'agent (MCP)', projectKey: 'shop', subject: 'a', why: 'w', run: 'run-1', targets: ['l1'] });
+    await s.activity.record({ kind: 'context_served', actor: 'agent (MCP)', projectKey: 'shop', subject: 'b', why: 'w', run: 'sbx-1', sandbox: true, targets: ['l1'] });
+    await s.activity.record({ kind: 'context_served', actor: 'agent (MCP)', projectKey: 'shop', subject: 'c', why: 'w', targets: ['l1'] });
+    await s.activity.record({ kind: 'context_served', actor: 'agent (MCP)', projectKey: 'shop', subject: 'd', why: 'w', run: 'run-1' });
+    const subjects = async (q: Parameters<Store['activity']['list']>[0]) => (await s.activity.list(q)).map((a) => a.subject);
+    expect(await subjects({ unlabelled: true })).toEqual(['c']);
+    expect(await subjects({ unlabelled: true, limit: 1 })).toEqual(['c']);
+    expect(await subjects({ target: 'l1', noSandbox: true })).toEqual(['c', 'a']);
+    expect(await subjects({ run: 'sbx-1' })).toEqual(['b']);
+    expect(await s.activity.removeRun!('run-1')).toBe(2);
+    expect(await subjects({})).toEqual(['c', 'b']);
+    expect(await s.activity.removeRun!('run-1')).toBe(0);
+  });
+
+  test('removeRun keeps the entries of the kinds it is told to keep: a decision a run made on a record it does not own stays on the record', async () => {
+    await s.activity.record({ kind: 'context_served', actor: 'agent (MCP)', projectKey: 'shop', subject: 'served', why: 'w', run: 'run-2' });
+    await s.activity.record({ kind: 'feedback_decided', actor: 'operator:bot', projectKey: 'shop', subject: 'decided', why: 'w', run: 'run-2', targets: ['c1'] });
+    expect(await s.activity.removeRun!('run-2', ['feedback_decided', 'lesson_decided'])).toBe(1);
+    expect((await s.activity.list({ run: 'run-2' })).map((a) => a.subject)).toEqual(['decided']);
+  });
+
+  test('removeRun keeps the entries about records the cleanup keeps, and removes only the entries it is given', async () => {
+    await s.activity.record({ kind: 'postmortem_done', actor: 'ollama:m', projectKey: 'shop', subject: 'created kept', why: 'w', run: 'run-3', targets: ['manual:b', 'lesson:manual:b'] });
+    await s.activity.record({ kind: 'postmortem_done', actor: 'ollama:m', projectKey: 'shop', subject: 'created gone', why: 'w', run: 'run-3', targets: ['lesson:manual:a'] });
+    await s.activity.record({ kind: 'context_served', actor: 'agent (MCP)', projectKey: 'shop', subject: 'unread', why: 'w', run: 'run-3' });
+    const read = (await s.activity.list({ run: 'run-3' })).filter((a) => a.subject !== 'unread').map((a) => a.id);
+    expect(await s.activity.removeRun!('run-3', [], { ids: read, targets: ['manual:b', 'lesson:manual:b'] })).toBe(1);
+    expect((await s.activity.list({ run: 'run-3' })).map((a) => a.subject).sort()).toEqual(['created kept', 'unread']);
+  });
+
   test("a report's run is carried to the miss and lesson its post-mortem makes; items lists them by kind", async () => {
     const id = await learned(s, 'totals must keep cents', tester, 1);
     await learned(s, 'the owner one', null, 2);
@@ -295,8 +326,9 @@ describeStores('RunsStore and run attribution', (h) => {
 
   test('claim records who opened a run once: a later claim by anyone (even at the same time) gets the first owner back; owner reads it', async () => {
     expect(await s.runs.owner('run-own')).toBeNull();
-    const first = await s.runs.claim('run-own', 'operator');
-    expect(first).toMatchObject({ run: 'run-own', principal: 'operator' });
+    const first = await s.runs.claim('run-own', 'operator', 'operator:tester');
+    expect(first).toMatchObject({ run: 'run-own', principal: 'operator', actor: 'operator:tester' });
+    expect(await s.runs.claim('run-own', 'operator', 'operator:other')).toEqual(first);
     expect(Number.isNaN(Date.parse(first.firstSeen))).toBe(false);
     expect(await s.runs.claim('run-own', 'agent')).toEqual(first);
     expect(await s.runs.claim('run-own', 'operator')).toEqual(first);
@@ -308,5 +340,8 @@ describeStores('RunsStore and run attribution', (h) => {
     // Cleaning up a run keeps its owner: the run id stays the opener's.
     await s.runs.remove('run-own', []);
     expect(await s.runs.owner('run-own')).toEqual(first);
+    // Only an operator run records a name; none given: null (any operator name may use it).
+    expect(await s.runs.claim('run-agent', 'agent', 'operator:x')).toMatchObject({ principal: 'agent', actor: null });
+    expect(await s.runs.claim('run-anon', 'operator')).toMatchObject({ principal: 'operator', actor: null });
   });
 });

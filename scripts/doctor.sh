@@ -2,9 +2,9 @@
 # Is everything Feedback Graph needs in place? One PASS / WARN / FAIL / SKIP line per check, and exit 1 when any check
 # failed. Changes nothing, and never prints a secret (tokens are only ever sent to the service they belong to).
 #   ./scripts/doctor.sh
-# Checks: Docker, the ports the stack publishes, Ollama (answers, structured output with a real schema call, models
-# pulled), from inside the containers (host.docker.internal, Ollama, the transcripts and Codex login mounts), the Codex
-# login on this machine, and GitHub and Linear through the running api's own checks.
+# Checks: Docker, that no other folder's install runs under this one's FG_INSTANCE, the ports the stack publishes, Ollama
+# (answers, structured output with a real schema call, models pulled), from inside the containers (host.docker.internal,
+# Ollama, the transcripts and Codex login mounts), the Codex login here, and GitHub and Linear through the api's checks.
 set -uo pipefail
 here="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$here"
@@ -33,6 +33,22 @@ docker_ok=0
 if ! command -v docker >/dev/null 2>&1; then fail "docker: not installed (https://docs.docker.com/get-docker/)"
 elif docker info >/dev/null 2>&1; then docker_ok=1; pass "docker: the daemon answers"
 else fail "docker: installed, but the daemon does not answer (start Docker Desktop, or: sudo systemctl start docker)"; fi
+
+# One install per folder: Docker Compose names containers and volumes after FG_INSTANCE (default feedback-graph), so
+# containers under this folder's name that another folder started are that folder's install, and docker compose here
+# would take it over (and its data). setup.sh refuses to start then; a hand-written .env can still get here.
+if [ "$docker_ok" = 1 ]; then
+  instance="$(envval FG_INSTANCE)"; instance="${instance:-feedback-graph}"
+  started_in="$(docker ps -a --filter "label=com.docker.compose.project=$instance" --format '{{.Label "com.docker.compose.project.working_dir"}}' 2>/dev/null | head -n 1)"
+  physical() { (cd "$1" 2>/dev/null && pwd -P) || printf '%s' "$1"; }
+  if [ -z "$started_in" ]; then pass "install: no other folder runs as $instance"
+  elif [ "$(physical "$started_in")" = "$(physical "$here")" ]; then pass "install: $instance runs from this folder"
+  else
+    fail "install: the containers named $instance were started from $started_in, not this folder: docker compose here would take over that install and its data"
+    more "give this folder its own name and ports in .env: FG_INSTANCE=feedback-graph-$(basename "$here" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9_-\n' '-'),"
+    more "API_PORT, NEO4J_HTTP_PORT, NEO4J_BOLT_PORT, POSTGRES_PORT and OLLAMA_PORT (see ./scripts/setup.sh --help)"
+  fi
+fi
 
 compose=(docker compose)
 store="$(envval STORE)"

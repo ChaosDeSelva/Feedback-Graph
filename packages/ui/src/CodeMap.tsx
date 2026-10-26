@@ -36,6 +36,8 @@ export function mapCapNote(meta: CodeMapMeta | null | undefined, capped?: MapCap
 /** Names read A to Z; numbers read biggest first. */
 const defaultSort = (key: SortKey): Sort => ({ key, desc: key !== 'path' });
 const ROWS = 25;
+/** The module route's answer for a file the map does not hold (GET /api/projects/:key/codemap/module, 404). */
+const NOT_MAPPED = /not in the code map/;
 
 /** Test files are left out of hotspots unless this is ticked (the API's tests=1). */
 export function IncludeTests({ checked, onChange }: { checked: boolean; onChange: (v: boolean) => void }) {
@@ -248,13 +250,22 @@ const Num = ({ children, strong = false }: { children: ReactNode; strong?: boole
 export function ModulePanel({ projectKey, path, onOpen, onClose, narrow = false }: { projectKey: string; path: string; onOpen: (p: string) => void; onClose: () => void; narrow?: boolean }) {
   const [m, setM] = useState<ModuleContext | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // A file the map does not hold (404 "not in the code map"): cap is the map's cap note when it is capped, else null.
+  const [outside, setOutside] = useState<{ cap: string | null } | null>(null);
   const ref = useRef<HTMLElement>(null);
 
   useEffect(() => {
     setM(null);
     setError(null);
     let stale = false;
-    api.codeModule(projectKey, path).then((r) => { if (!stale) setM(r); }, (e) => { if (!stale) setError(e instanceof Error ? e.message : String(e)); });
+    setOutside(null);
+    api.codeModule(projectKey, path).then((r) => { if (!stale) setM(r); }, (e) => {
+      if (stale) return;
+      const msg = e instanceof Error ? e.message : String(e);
+      if (!NOT_MAPPED.test(msg)) return setError(msg);
+      // Not in the map: say why, from whether the map is capped (the API's own words stay out of it).
+      api.codeMap(projectKey, 1).then((r) => { if (!stale) setOutside({ cap: mapCapNote(r.meta, r.capped) }); }, () => { if (!stale) setOutside({ cap: null }); });
+    });
     scrollIntoPane(ref.current, { smooth: true });
     return () => { stale = true; };
   }, [projectKey, path]);
@@ -285,6 +296,12 @@ export function ModulePanel({ projectKey, path, onOpen, onClose, narrow = false 
 
       {error ? (
         <Alert>{error}</Alert>
+      ) : outside ? (
+        <p role="note" className="text-[13px] text-muted">
+          {outside.cap
+            ? <>This file is past the code map's cap: the map {outside.cap.startsWith('capped') ? 'is' : 'keeps'} {outside.cap}, the ones it ranks first (files sessions edited, then source code over config and docs), so it has no symbols, importers or tests here. Raise <code className="font-mono">SCAN_MAX_FILES</code> and rebuild the map to include it.</>
+            : <>This file is not in the code map: the map does not read it (ignored by git, a lock file or secret, too large, in a skipped folder, or not a code, docs or config file), or it is newer than the map. Rebuild map to check again.</>}
+        </p>
       ) : !m ? (
         <SkeletonDetail />
       ) : (

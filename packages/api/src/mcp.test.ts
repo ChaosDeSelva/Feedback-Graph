@@ -74,11 +74,13 @@ test('MCP search_graph returns its hits, not the task context, and has no check_
 
 test('MCP get_task_context takes brief and session_id', async () => {
   const asked: string[] = [];
-  const app = createApp(repo, { context: { ...ctx, sessions: { list: async () => ({ sessions: [], next: null }), detail: async (id) => { asked.push(id); return null; } } } });
+  // The session's edited files and its start decide which facts are its own change.
+  const codegraph = { lessonsForPaths: async () => [], sessionFiles: async (id: string) => { asked.push(`files:${id}`); return [{ path: 'src/pool.ts', read: true, edited: true, firstEditAt: null, lastEditAt: null }]; } };
+  const app = createApp(repo, { context: { ...ctx, codegraph, sessions: { list: async () => ({ sessions: [], next: null }), detail: async (id) => { asked.push(id); return null; } } } });
   const res = await app.request('/mcp', rpc({ method: 'tools/call', params: { name: 'get_task_context', arguments: { cwd: '/Users/j/Vibe/demo', task: 'tune pool', brief: true } } }));
   expect(((await res.json()) as { result: { content: { text: string }[] } }).result.content[0].text).toMatch(/^# Feedback Graph brief/);
   await app.request('/mcp', rpc({ method: 'tools/call', params: { name: 'get_task_context', arguments: { cwd: '/Users/j/Vibe/demo', task: 'tune pool', session_id: 's-7' } } }));
-  expect(asked).toEqual(['s-7']);
+  expect(asked.sort()).toEqual(['files:s-7', 's-7']);
 });
 
 test('without Ollama, get_task_context and check_before_done say Ollama is not reachable, with its URL and model', async () => {

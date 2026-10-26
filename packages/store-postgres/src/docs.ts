@@ -3,7 +3,7 @@ import { docIdOf, runWriteOwner, REDACT_PAGE, redactDeep, redactSecrets, relevan
 import type { DocHit, DocInput, DocLink, DocListOpts, DocSummary, DocsStore, DocToRead, EmbeddedFact, TaskImage, UpsertDocOpts } from '@fb/core';
 import type pg from 'pg';
 import { iso, toVector, tx, type Db } from './db.ts';
-import { runSearch, searchDocsQuery, visibleToRun } from './vector.ts';
+import { runSearch, sandboxPresence, searchDocsQuery, visibleToRun } from './vector.ts';
 
 /** Documents as embedded chunks, and integration sync cursors. */
 export class PgDocsStore implements DocsStore {
@@ -18,6 +18,7 @@ export class PgDocsStore implements DocsStore {
     const doc = { ...input, title: redactSecrets(input.title), ref: redactSecrets(input.ref) };
     const chunks = raw.map((c) => ({ ...c, text: redactSecrets(c.text) }));
     const id = docIdOf(doc, o.run);
+    sandboxPresence(this.db).wrote(o.run);
     await tx(this.db, async (c) => {
       await c.query('INSERT INTO projects (key) VALUES ($1) ON CONFLICT DO NOTHING', [doc.projectKey]);
       // A run replaces only its own document (runWriteOwner); the owner's write makes a run's document the owner's.
@@ -110,6 +111,8 @@ export class PgDocsStore implements DocsStore {
         [id, r.version ?? null],
       );
       if (!d) return false;
+      // A sandbox upload's facts and chunks are sandbox records too.
+      sandboxPresence(this.db).wrote(d.sandbox === true);
       await c.query('DELETE FROM facts WHERE doc_id = $1', [id]);
       if (r.chunks) {
         const chunks = r.chunks.map((ch) => ({ ...ch, text: redactSecrets(ch.text) }));
@@ -209,7 +212,7 @@ export class PgDocsStore implements DocsStore {
 
   async searchDocs(q: { embedding: number[]; projectKey: string; k: number; run?: string | null }): Promise<DocHit[]> {
     // The project's chunks, nearest first, through the HNSW index when it pays (see vector.ts).
-    const rows = await runSearch(this.db, searchDocsQuery(this.db, q), q.k);
+    const rows = await runSearch(this.db, searchDocsQuery(this.db, q, { sandbox: await sandboxPresence(this.db).any() }), q.k);
     return rows.map((r) => ({ docId: r.doc_id, source: r.source, ref: r.ref, title: r.title, url: r.url ?? null, text: r.text, score: r.score }));
   }
 

@@ -1,6 +1,6 @@
 {
   "name": "@fb/core",
-  "version": "0.6.2",
+  "version": "0.6.3",
   "private": true,
   "type": "module",
   "main": "src/index.ts",
@@ -10,7 +10,8 @@
     "./relevance": "./src/relevance.ts",
     "./feedback-rules": "./src/feedbackRules.ts",
     "./chat": "./src/chat.ts",
-    "./testing": "./src/testing/index.ts"
+    "./testing": "./src/testing/index.ts",
+    "./testing/lessons": "./src/testing/lessonCorpus.ts"
   },
   "scripts": {
     "typecheck": "tsc -p ."

@@ -77,6 +77,17 @@ export class LabelPlacer {
   block(x: number, y: number, w: number, h: number) {
     this.nodes.push([x, y, w, h]);
   }
+  /** Takes the box when it overlaps no caption taken so far, whatever nodes it covers and however full its area is. */
+  placeOver(x: number, y: number, w: number, h: number): boolean {
+    if (this.boxes.some((b) => overlaps(b, x, y, w, h))) return false;
+    this.boxes.push([x, y, w, h]);
+    return true;
+  }
+  /** Takes the box whatever it overlaps (a caption that must be drawn); returns it. */
+  force(x: number, y: number, w: number, h: number): Box {
+    this.boxes.push([x, y, w, h]);
+    return [x, y, w, h];
+  }
   /** Takes the box (left, top, width, height) when it overlaps no caption taken so far and no node, and its area has room. */
   place(x: number, y: number, w: number, h: number): boolean {
     if (this.boxes.some((b) => overlaps(b, x, y, w, h)) || this.nodes.some((b) => overlaps(b, x, y, w, h))) return false;
@@ -91,3 +102,54 @@ export class LabelPlacer {
 
 export const evidenceLinkLabel = (l: { type: string }) => escapeHtml(l.type);
 export const codeLinkLabel = evidenceLinkLabel;
+
+/**
+ * The files named at every zoom, most important first: files with misses (most misses first), then by hotspot score,
+ * then by how many drawn edges they have, so a fresh map with nothing scored still names its most connected files.
+ * Test files and other kinds of node never; at most `n`.
+ */
+export function keyFiles(nodes: { id: string; kind: string; path?: string; score: number; misses: number }[], links: { source: unknown; target: unknown }[], n: number): string[] {
+  const end = (x: unknown) => (typeof x === 'object' && x !== null ? (x as { id: string }).id : String(x));
+  const degree = new Map<string, number>();
+  for (const l of links) for (const id of [end(l.source), end(l.target)]) degree.set(id, (degree.get(id) ?? 0) + 1);
+  return nodes
+    .filter((x) => x.kind === 'file' && x.path)
+    .map((x) => ({ path: x.path!, misses: x.misses, score: x.score, degree: degree.get(x.id) ?? 0 }))
+    .sort((a, b) => b.misses - a.misses || b.score - a.score || b.degree - a.degree || (a.path < b.path ? -1 : 1))
+    .slice(0, n)
+    .map((x) => x.path);
+}
+
+/** A caption to place under (or beside) its node at x, y of radius r. key: a key file's; must: drawn whatever it overlaps. */
+export type CaptionWish = { text: string; x: number; y: number; r: number; rank: number; key?: boolean; must?: boolean };
+export type PlacedCaption = { text: string; x: number; y: number; w: number; h: number; key: boolean };
+
+/**
+ * Where each caption goes this frame, highest rank first. A key file's caption is tried below its node, then above,
+ * right and left: it may cover other nodes (it is drawn on a halo) but never another caption, and one marked `must` (a
+ * file with misses) is drawn even when all four are taken. Any other caption goes below its node only if it covers no
+ * caption and no node and its area (`cell`, `perCell`) has room, so a zoomed-out map names its key files, not a pile.
+ */
+export function placeCaptions(wishes: CaptionWish[], o: { nodes: Box[]; width: (text: string) => number; height: number; gap: number; cell?: number; perCell?: number }): PlacedCaption[] {
+  const placer = new LabelPlacer({ cell: o.cell, perCell: o.perCell });
+  for (const b of o.nodes) placer.block(...b);
+  const out: PlacedCaption[] = [];
+  const h = o.height;
+  for (const c of [...wishes].sort((a, b) => b.rank - a.rank)) {
+    const w = o.width(c.text);
+    const below: Box = [c.x - w / 2, c.y + c.r + o.gap, w, h];
+    if (!c.key) {
+      if (placer.place(...below)) out.push({ text: c.text, x: below[0], y: below[1], w, h, key: false });
+      continue;
+    }
+    const spots: Box[] = [
+      below,
+      [c.x - w / 2, c.y - c.r - o.gap - h, w, h],
+      [c.x + c.r + o.gap, c.y - h / 2, w, h],
+      [c.x - c.r - o.gap - w, c.y - h / 2, w, h],
+    ];
+    const spot = spots.find((s) => placer.placeOver(...s)) ?? (c.must ? placer.force(...below) : null);
+    if (spot) out.push({ text: c.text, x: spot[0], y: spot[1], w, h, key: true });
+  }
+  return out;
+}

@@ -720,8 +720,8 @@ export const GENERIC = new Set(
   ('list item data value type util utils helper component element info base common core main index default config ' +
     'set get handle handler manager service model view state store result error').split(' '),
 );
-/** Words a question may use for the same thing a file is named by (both ways). */
-const SYNONYMS: Record<string, string[]> = { modal: ['dialog'], dialog: ['modal'], popup: ['popover'], popover: ['popup'] };
+/** Words a question may use for the same thing a file is named by (both ways). A Map: a question's word is never looked up on Object.prototype ("constructor"). */
+const SYNONYMS = new Map<string, string[]>([['modal', ['dialog']], ['dialog', ['modal']], ['popup', ['popover']], ['popover', ['popup']]]);
 const MIN_TERM = 3;
 const MAX_TERMS = 24;
 
@@ -793,7 +793,7 @@ function strength(term: string, name: string): number {
   const whole = foldTerm(name.replace(/[^A-Za-z0-9]/g, ''));
   const words = wordsOf(name).map(foldTerm);
   const of = (t: string) => (whole === t ? 3 : words.includes(t) ? 2 : 0);
-  return Math.max(of(term), ...(SYNONYMS[term] ?? []).map((t) => Math.max(0, of(t) - 1)));
+  return Math.max(of(term), ...(SYNONYMS.get(term) ?? []).map((t) => Math.max(0, of(t) - 1)));
 }
 
 /**

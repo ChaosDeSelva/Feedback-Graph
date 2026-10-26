@@ -373,6 +373,49 @@ describeStores('KnowledgeStore', (h) => {
       expect((await k.decidedLessons!({ projectKeys: ['demo'], since: '2000-01-01T00:00:00.000Z', limit: 10 })).map((g) => g.lesson.id)).not.toContain(`lesson:${sbx}`);
     });
 
+    test('decidedLessons by outcome: rejected, approved after an edit (writer draft kept), approved with none kept; each its own newest', async () => {
+      const [a, b, c] = [await confirmedFeedback('s1'), await confirmedFeedback('s2'), await confirmedFeedback('s3')];
+      for (const [i, id] of [a, b, c].entries()) await k.savePostmortem(id, pm({ lesson: { ...pm().lesson, title: `L${i}` } }), { miss: vec(i + 1), lesson: vec(i + 1) });
+      await k.updateLesson(`lesson:${a}`, { status: 'approved' }, {});
+      await k.updateLesson(`lesson:${b}`, { rule: 'Owner wording in api/search.ts' }, {});
+      await k.updateLesson(`lesson:${b}`, { status: 'approved' }, {});
+      await k.updateLesson(`lesson:${c}`, { status: 'rejected' }, { note: 'too broad' });
+      const of = async (outcome: 'rejected' | 'edited' | 'unedited') =>
+        (await k.decidedLessons!({ projectKeys: ['demo'], since: '2000-01-01T00:00:00.000Z', limit: 1, outcome })).map((g) => g.lesson.id);
+      expect(await of('rejected')).toEqual([`lesson:${c}`]);
+      expect(await of('edited')).toEqual([`lesson:${b}`]);
+      expect(await of('unedited')).toEqual([`lesson:${a}`]);
+    });
+
+    test("backfillProposedAs keeps a writer's draft found later (0.6.1's Activity) only on a post-mortem lesson that has none", async () => {
+      const a = await confirmedFeedback('s1');
+      await k.savePostmortem(a, pm(), { miss: vec(1), lesson: vec(1) });
+      await k.updateLesson(`lesson:${a}`, { status: 'approved' }, {});
+      const writer = { title: 'Server-side search', rule: 'Filter on the server', appliesWhen: 'search features', scope: 'project' as const, paths: ['api/**'] };
+      // As 0.6.1 left it: the owner's words, no draft kept.
+      expect(await k.backfillProposedAs!(`lesson:${a}`, { ...writer, rule: 'Filter rows' })).toBe(true);
+      expect((await k.lessonDetail(`lesson:${a}`))!.lesson).toMatchObject({ status: 'approved', rule: 'Filter on the server', proposedAs: { ...writer, rule: 'Filter rows' } });
+      // One kept already stands.
+      expect(await k.backfillProposedAs!(`lesson:${a}`, writer)).toBe(false);
+      expect((await k.lessonDetail(`lesson:${a}`))!.lesson.proposedAs?.rule).toBe('Filter rows');
+      // Never a memory lesson, never one that does not exist.
+      await k.upsertLesson({ id: 'memory:m', projectKey: 'demo', title: 'M', rule: 'r', appliesWhen: '', scope: 'project', paths: [], status: 'approved', source: 'memory', embedding: vec(2) });
+      expect(await k.backfillProposedAs!('memory:m', writer)).toBe(false);
+      expect(await k.backfillProposedAs!('lesson:nope', writer)).toBe(false);
+    });
+
+    test("an edit of a lesson's words asks for its checks again (they judge the words as they are now); a decision alone does not", async () => {
+      const a = await confirmedFeedback('s1');
+      await k.savePostmortem(a, pm(), { miss: vec(1), lesson: vec(1) });
+      const id = `lesson:${a}`;
+      await k.setLessonChecks(id, [{ name: 'broken-rule', why: 'the rule field held "project"; the title is used as the rule' }]);
+      await k.updateLesson(id, { status: 'approved' }, {});
+      expect((await k.lessonDetail(id))!.lesson.checksVersion).toBe(LESSON_CHECKS_VERSION);
+      await k.updateLesson(id, { rule: 'Filter rows in the SQL of api/search.ts' }, {});
+      expect((await k.lessonDetail(id))!.lesson.checksVersion).toBe(0);
+      expect((await k.staleLessonChecks!(LESSON_CHECKS_VERSION, 10)).map((l) => l.id)).toEqual([id]);
+    });
+
     test("a machine's decision (no miss, the session re-match) is not the owner's: decidedLessons leaves it out, an operator's counts", async () => {
       const a = await confirmedFeedback('s1');
       const b = await confirmedFeedback('s2');
@@ -781,13 +824,13 @@ describeStores('KnowledgeStore', (h) => {
       const real = await confirmedFeedback('s-real');
       await k.savePostmortem(real, pm(), { miss: vec(7), lesson: vec(1) });
 
-      expect(await k.removeDemo!('demo')).toEqual({ lessons: 1, misses: 1, facts: 1 });
+      expect(await k.removeDemo!('demo')).toEqual({ lessons: 1, misses: 1, facts: 1, projectRemoved: false });
       expect(await k.lessonDetail('demo:demo:l1')).toBeNull();
       expect(await k.lessonDetail('demo:other:l1')).not.toBeNull();
       expect(await k.lessonDetail('memory:keep')).not.toBeNull();
       expect((await k.relatedMisses({ embedding: vec(7), projectKey: 'demo', k: 5 })).map((m) => m.missId)).toEqual([`miss:${real}`]);
       expect((await h.store.facts.listFacts({ projectKey: 'demo' })).map((f) => f.path)).toEqual(['src/db.ts']);
-      expect(await k.removeDemo!('demo')).toEqual({ lessons: 0, misses: 0, facts: 0 });
+      expect(await k.removeDemo!('demo')).toEqual({ lessons: 0, misses: 0, facts: 0, projectRemoved: false });
     });
 
     test("demo facts never touch a file a scan already recorded (its hash and summary stay), and removeDemo takes back only the file rows the demo added", async () => {
@@ -808,6 +851,73 @@ describeStores('KnowledgeStore', (h) => {
       expect([...(await f.fileScanVersions('demo')).keys()]).toEqual(['src/db.ts']);
       await f.saveFileFacts('demo', { path: 'src/db.ts', hash: 'h-real', summary: 'the real summary', version: 'v1' }, [{ ...fact, path: 'src/db.ts', statement: 'scanned' }], 'ollama:x');
       expect((await f.listFacts({ projectKey: 'demo' })).map((x) => x.fileSummary)).toEqual(['the real summary']);
+    });
+
+    const shop: Project = { key: 'demo-shop', name: 'demo-shop', repoPath: '' };
+    const demoLesson = (key: string, run?: { id: string; sandbox: boolean }) => ({
+      id: `demo:${key}:l1`, projectKey: key, title: '[demo] l1', rule: 'r', appliesWhen: 'w', scope: 'project' as const, paths: ['src/db.ts'],
+      status: 'approved' as const, source: 'demo' as const, embedding: vec(9), ...(run && { run }),
+    });
+    const seed = async (key: string, run?: { id: string; sandbox: boolean }) => {
+      await k.saveDemoMiss!(demo({ project: key === 'demo' ? project : shop, id: `demo:${key}:tenant`, ...(run && { run }) }));
+      await k.upsertLesson(demoLesson(key, run));
+      await h.store.facts.saveFileFacts(key, { path: 'src/db.ts', hash: 'demo', summary: '[demo] seeded' }, [{ ...fact, path: 'src/db.ts' }], 'demo');
+    };
+    const projectKeys = async () => (await h.store.portability.exportData({})).projects.map((p) => p.key);
+
+    test('removeDemo also removes the project the seed created, once nothing else is stored under it; never a project that was there before', async () => {
+      await seed('demo-shop');
+      expect(await projectKeys()).toContain('demo-shop');
+      expect(await k.removeDemo!('demo-shop')).toEqual({ lessons: 1, misses: 1, facts: 1, projectRemoved: true });
+      expect(await projectKeys()).not.toContain('demo-shop');
+
+      // Created by the seed, then used for real (a session): it stays.
+      await seed('demo-shop');
+      await repo.upsertSession(shop, session('s-shop'), []);
+      expect(await k.removeDemo!('demo-shop')).toMatchObject({ projectRemoved: false });
+      expect(await projectKeys()).toContain('demo-shop');
+
+      // There before the seed (a real session in it): it stays.
+      await repo.upsertSession(project, session('s-demo'), []);
+      await seed('demo');
+      expect(await k.removeDemo!('demo')).toMatchObject({ lessons: 1, misses: 1, projectRemoved: false });
+      expect(await projectKeys()).toContain('demo');
+    });
+
+    test('removeDemo keeps the project the seed created while anything at all is stored under its key (a code map, say)', async () => {
+      await seed('demo-shop');
+      // A code map built for it since: no session, fact or document, but it is data under the key.
+      await h.store.codegraph.replaceCodeMap('demo-shop', { files: [], symbols: [], imports: [], tests: [], churn: {}, fingerprint: null });
+      expect(await k.removeDemo!('demo-shop')).toMatchObject({ lessons: 1, misses: 1, projectRemoved: false });
+      expect(await projectKeys()).toContain('demo-shop');
+    });
+
+    test('a seed in a labelled run: its miss, Inbox item and lessons carry the run, so the run\'s cleanup takes them back', async () => {
+      await seed('demo-shop', { id: 'run-demo', sandbox: false });
+      const items = await h.store.runs.items('run-demo');
+      expect(items.map((i) => [i.kind, i.id]).sort()).toEqual([
+        ['feedback', 'demo:demo-shop:tenant'], ['lesson', 'demo:demo-shop:l1'], ['miss', 'miss:demo:demo-shop:tenant'],
+      ].sort());
+      await h.store.runs.remove('run-demo', []);
+      expect(await k.lessonDetail('demo:demo-shop:l1')).toBeNull();
+      expect(await k.relatedMisses({ embedding: vec(7), projectKey: 'demo-shop', k: 5 })).toEqual([]);
+      // A later seed without a run never takes the run's records over, nor the other way round: the label is set once.
+      await seed('demo-shop');
+      await seed('demo-shop', { id: 'run-other', sandbox: false });
+      expect(await h.store.runs.items('run-other')).toEqual([]);
+    });
+
+    test('the demo corpus is never exported (nor, through the export, synced to the cloud)', async () => {
+      await repo.upsertSession(project, session('s-real'), []);
+      await seed('demo');
+      const real = await confirmedFeedback('s-real2');
+      await k.savePostmortem(real, pm(), { miss: vec(7), lesson: vec(1) });
+      await h.store.facts.saveFileFacts('demo', { path: 'src/http.ts', hash: 'h', summary: 's' }, [{ ...fact, path: 'src/http.ts', statement: 'real fact' }], 'ollama:x');
+      for (const b of [await h.store.portability.exportData({ projectKey: 'demo' }), await h.store.portability.exportData({})]) {
+        expect(b.lessons.map((l) => l.source)).not.toContain('demo');
+        expect(b.misses.map((m) => m.id)).toEqual([`miss:${real}`]);
+        expect(b.facts.map((f) => f.statement)).toEqual(['real fact']);
+      }
     });
 
     test('a file the demo added that a scan then read is the scan\'s: removeDemo leaves it', async () => {

@@ -14,7 +14,7 @@
  * - Vectors of a different length than the query are skipped by searches, never an error.
  */
 import type { Config } from './config.ts';
-import type { ActivityInput, Activity, ActivityKind, Candidate, Classification, Commit, FactKind, LessonCheck, LessonCheckName, LessonFrom, LessonStatus, Lesson, ParsedSession, PendingExternalItem, PendingSessionItem, PostMortem, PostMortemInput, Project, ProjectSummary, RelevanceBy, ScanJob, ScanQueueEntry, ScanStatus, WorkerStatus, FactEvidence, FactOrigin, RunItem, RunItemKind, RunOwner, RunPrincipal, RunTag, TurnEvidence, Cause } from './types.ts';
+import type { ActivityInput, Activity, ActivityKind, Candidate, Classification, Commit, FactKind, LessonCheck, LessonCheckName, LessonFrom, LessonStatus, Lesson, ParsedSession, PendingExternalItem, PendingSessionItem, PostMortem, PostMortemInput, Project, ProjectSummary, RelevanceBy, ScanJob, ScanQueueEntry, ScanStatus, WorkerStatus, FactEvidence, FactOrigin, RunItem, RunItemKind, RunOwner, RunPrincipal, RunTag, TurnEvidence, Cause, LessonDraft } from './types.ts';
 import type { ProjectScope, ProjectSelection } from './scope.ts';
 import type { CallsAfter, CandidateDetail, CandidateFilter, ClassifiableTurn, StatsRow } from './graph/repo.ts';
 import type { LessonDetail, LessonHit, LessonInput, LessonPatch, RelatedMiss, UnsortedMiss } from './graph/knowledge.ts';
@@ -28,14 +28,18 @@ import type { CandidateSnapshot } from './graph/selection.ts';
 import type { CodeMapMeta, CodeMapStats, CodeMapWrite, Hotspot, HotspotOpts, Impact, MapGraph, ModuleContext, OutsideFile, SessionFile, StoredCodeMap } from './codegraph.ts';
 import type { ExternalRef, ExternalSource, SessionSource, HumanTurn, SessionDetail, SessionListItem, SessionState } from './types.ts';
 import type { SessionCursor, SummaryWork, SummaryWorkQuery, SummaryWrite } from './sessions.ts';
-import type { ChatAnswer, ChatConversation, ChatJob, ChatPack, ChatProvider, ChatThread } from './chat.ts';
+import type { ChatAnswer, ChatConversation, ChatJob, ChatPack, ChatProvider, ChatThread, PendingChatTurn } from './chat.ts';
 
 /** The paths a scope replace covers (FactsStore.replaceScopeFacts): under one of `prefixes`, under none of `except`. */
 export type FactScope = { prefixes: string[]; except: string[] };
 /** A file a scan read: its hash, and the scanner version that read it (absent: not recorded, read as an old scanner). */
 export type ScannedFile = { path: string; hash: string; version?: string | null };
-/** One fact checked again (FactsStore.applyFactChecks): kept with these lines and evidence, or closed. */
-export type FactCheck = { id: string; keep: boolean; lines: string | null; evidence: FactEvidence | null };
+/**
+ * One fact checked again (FactsStore.applyFactChecks): kept with these lines and evidence, or closed. A kept fact may
+ * also get a new statement (a rule that now words it differently, e.g. a dependency list summarized) with its new
+ * embedding; unset or null: the statement (and embedding) stay.
+ */
+export type FactCheck = { id: string; keep: boolean; lines: string | null; evidence: FactEvidence | null; statement?: string | null; embedding?: number[] | null };
 /** What updateScanJob changes: only the keys given (a key set to null clears it). */
 export type ScanJobPatch = Partial<Pick<ScanJob, 'filesScanned' | 'factsAdded' | 'error' | 'shards'>> & { status?: ScanStatus };
 
@@ -196,9 +200,11 @@ export type SimilarLesson = { id: string; cosine: number; status: LessonStatus; 
 /**
  * Which lessons decidedLessons returns: post-mortem lessons the owner approved or rejected (decidedAt set) since `since`,
  * never a sandbox run's, learned in one of projectKeys (null: any project; a lesson with no project never). embedding:
- * also score each by true cosine (-1..1) against it; null when unset or the sizes differ.
+ * also score each by true cosine (-1..1) against it; null when unset or the sizes differ. outcome: only the rejected,
+ * the approved with the writer's draft kept (edited first; lessonOutcome still tells an edit that changed nothing), or
+ * the approved with none kept, so each kind is drawn from its own newest, not from the newest decisions overall.
  */
-export type DecidedLessonsQuery = { projectKeys: string[] | null; since: string; limit: number; embedding?: number[] | null };
+export type DecidedLessonsQuery = { projectKeys: string[] | null; since: string; limit: number; embedding?: number[] | null; outcome?: 'rejected' | 'edited' | 'unedited' };
 export type DecidedLesson = { lesson: Lesson; score: number | null };
 
 /** Post-mortems (feedback, miss, cause, lesson, context items, fix commits), lessons and their search. */
@@ -237,6 +243,12 @@ export interface KnowledgeStore {
   updateLesson(id: string, patch: LessonPatch, o: { reembed?: number[]; by?: string; note?: string }): Promise<{ unscoped: boolean }>;
   /** The owner's decisions on post-mortem lessons (ownerDecided), newest decision first (DecidedLessonsQuery). */
   decidedLessons?(q: DecidedLessonsQuery): Promise<DecidedLesson[]>;
+  /**
+   * Keep `draft` (redacted) as what the writer proposed (Lesson.proposedAs) on a post-mortem lesson that has none: the
+   * worker's backfill from edits recorded in Activity before the draft was kept (0.6.1). Nothing else changes. False: no
+   * such post-mortem lesson, or one is kept already.
+   */
+  backfillProposedAs?(id: string, draft: LessonDraft): Promise<boolean>;
   /**
    * Store what the lesson check found (redacted), replacing earlier checks, with the checks' version (default
    * LESSON_CHECKS_VERSION); nothing else changes. False: no such lesson. savePostmortem stamps the current version too.
@@ -287,10 +299,12 @@ export interface KnowledgeStore {
   recordPreDoneCheck(c: { projectKey: string; task: string; checkedLessonIds: string[]; gapLessonIds: string[]; run?: RunTag | null; sessionId?: string | null }): Promise<void>;
   upsertLesson(input: LessonInput): Promise<void>;
   /**
-   * The current redaction rules (redactSecrets) over every stored lesson's title, rule and applies-when, in place.
-   * Run once per REDACTION_VERSION at worker start. Returns how many lessons changed.
+   * The current redaction rules over every stored lesson's title, rule and applies-when, in place, as
+   * redactStoredLesson decides: an approved lesson loses only known token shapes and gets the may-hold-secret flag
+   * when a rule reads more. Run once per REDACTION_VERSION at worker start. redacted: lessons whose text changed;
+   * flagged: approved lessons newly flagged.
    */
-  redactStoredLessons?(): Promise<number>;
+  redactStoredLessons?(): Promise<{ redacted: number; flagged: number }>;
   /**
    * The current redaction rules over every miss's feedback text, what was missed and why, in place. Run once per
    * REDACTION_VERSION at worker start. Returns how many misses (feedback included) changed.
@@ -300,12 +314,14 @@ export interface KnowledgeStore {
    * fg demo seed: a confirmed miss with the session, pushback turn, Inbox item (confirmed) and feedback (addressed) it
    * hangs off, all under `m.id` (which must start with `demo:<project key>:`), redacted. Written again in place, so
    * seeding twice keeps one. Returns the miss id (`miss:<id>`). Its session is manual: never listed or summarized.
+   * A project it creates is marked as the demo's, so removeDemo can take that back too (and only that).
    */
   saveDemoMiss?(m: DemoMiss): Promise<string>;
   /**
    * fg demo remove: exactly what the demo seed wrote in this project, and nothing else: lessons with source 'demo'
    * (served there), the sessions under `demo:<key>:` with everything hanging off them (turns, Inbox items, feedback,
-   * misses, the files they touched), and current facts with source 'demo'. Returns how many of each it removed.
+   * misses, the files they touched), and current facts with source 'demo'. Returns how many of each it removed, and
+   * whether the project went too: only one saveDemoMiss created, once nothing else is stored under its key.
    */
   removeDemo?(projectKey: string): Promise<DemoRemoved>;
 }
@@ -321,8 +337,10 @@ export type DemoMiss = {
   cause: Cause;
   causeExplanation: string;
   embedding: number[];
+  /** The run the seed ran in (x-fg-run): its Inbox item and miss carry it, set when first written. */
+  run?: RunTag | null;
 };
-export type DemoRemoved = { lessons: number; misses: number; facts: number };
+export type DemoRemoved = { lessons: number; misses: number; facts: number; projectRemoved: boolean };
 /** The prefix every id the demo seed writes in a project starts with. */
 export const demoPrefix = (projectKey: string) => `demo:${projectKey}:`;
 /**
@@ -428,10 +446,19 @@ export interface FactsStore {
   /**
    * The current redaction rules over every stored fact's statement and why, in place (current or not), as
    * redactStoredFact decides: a current fact a rule matches now is closed (no longer served); a fact you wrote (origin
-   * you) is never closed and loses only known token shapes. Run once per REDACTION_VERSION at worker start. Returns
-   * how many facts changed, how many of them were closed, and how many of them were yours.
+   * you) is never closed and loses only known token shapes; a current fact from an upload that is an instruction to
+   * the agent is closed as it is. Run once per REDACTION_VERSION at worker start. Returns how many facts were
+   * redacted, how many of them were closed as credentials, how many of them were yours, and how many instructions
+   * were closed.
    */
-  redactStoredFacts?(): Promise<{ redacted: number; closed: number; owner: number }>;
+  redactStoredFacts?(): Promise<{ redacted: number; closed: number; owner: number; instructions: number }>;
+  /**
+   * A rule change migrates its data: document facts an older rule closed as instructions to the agent that the
+   * current rule reads as facts (a project convention) are current again (reopensAsFact). The re-run records why it
+   * closes a fact from v5 on; a fact closed before that is judged by the rule v4 closed it with. Run before
+   * redactStoredFacts, once per REDACTION_VERSION. Returns how many were reopened.
+   */
+  reopenInstructionFacts?(): Promise<number>;
 }
 
 /** Documents that are not code (uploads, PR discussions, tickets) as embedded chunks, and integration sync cursors. */
@@ -521,16 +548,30 @@ export interface LinksStore {
 }
 
 /** The provenance log: append-only, newest first. */
+/** ActivityStore.list's filters. */
+export type ActivityQuery = {
+  projectKey?: string; projectKeys?: string[]; kind?: ActivityKind; target?: string; run?: string; limit?: number; maxDetailBytes?: number;
+  unlabelled?: boolean; noSandbox?: boolean;
+};
+
 export interface ActivityStore {
   record(a: ActivityInput): Promise<void>;
   /**
    * projectKeys: entries of other projects are left out; entries with no project stay. maxDetailBytes: details
    * bigger than this (as stored) are left out of the rows (`details: {}`, `detailsOmitted: true`), so a page of the log
-   * does not carry a scan's whole report; get() has them.
+   * does not carry a scan's whole report; get() has them. unlabelled: only entries made outside any run (the default
+   * feed). noSandbox: leaves out sandbox runs' entries.
    */
-  list(q: { projectKey?: string; projectKeys?: string[]; kind?: ActivityKind; target?: string; run?: string; limit?: number; maxDetailBytes?: number }): Promise<Activity[]>;
+  list(q: ActivityQuery): Promise<Activity[]>;
   /** One entry, details and all; null when there is none. */
   get(id: string): Promise<Activity | null>;
+  /**
+   * Every entry made in `run` (fg cleanup --run --apply) but those of the `keep` kinds (a decision the run made on a record
+   * it does not own stays on that record's history); returns how many went. ids: only these entries (the ones the
+   * cleanup read and listed). targets: entries naming any of these records stay (the records the cleanup keeps: the
+   * entry that created one stays with it).
+   */
+  removeRun?(run: string, keep?: readonly ActivityKind[], o?: { ids?: readonly string[]; targets?: readonly string[] }): Promise<number>;
   /**
    * The current redaction rules over every entry's subject, why and details, in place. Run once per REDACTION_VERSION
    * at worker start. Returns how many entries changed.
@@ -549,7 +590,9 @@ export interface InsightsStore {
 export interface PortabilityStore {
   /**
    * projectKey: one project. projectKeys (with no projectKey): only these projects, and global lessons learned in one of
-   * them or in none; an empty list exports nothing. Neither: everything stored.
+   * them or in none; an empty list exports nothing. Neither: everything stored. Never in it (so never synced to the
+   * cloud either): a sandbox run's records, and the demo corpus (fg demo seed: lessons and facts with source 'demo',
+   * misses under a `demo:` session).
    */
   exportData(o?: { projectKey?: string; projectKeys?: string[]; approvedOnly?: boolean }): Promise<ExportBundle>;
   /** Returns how many records were deleted (backends count differently; callers only show it). */
@@ -684,8 +727,15 @@ export interface ChatStore {
    * null when there is no such conversation.
    */
   addUserTurn(conversationId: string, text: string, pack: ChatPack): Promise<ChatThread | null>;
-  /** The oldest pending assistant turn, with its conversation, question and stored pack; null when none waits. */
-  nextPendingTurn(): Promise<ChatJob | null>;
+  /**
+   * The oldest pending assistant turn, with its conversation, question and stored pack; null when none waits. With
+   * `id`: that turn, if it is still pending.
+   */
+  nextPendingTurn(o?: { id?: string }): Promise<ChatJob | null>;
+  /** The pending assistant turns, oldest first, with their conversation's provider (at most `limit`, default 200). */
+  pendingTurns(limit?: number): Promise<PendingChatTurn[]>;
+  /** Record each still-pending turn's place in its model's line (ChatTurn.queueAhead). */
+  setQueueAhead(updates: { id: string; ahead: number }[]): Promise<void>;
   /** Claim a pending turn for `provider` (pending -> answering). False when it is not pending any more. */
   markAnswering(turnId: string, provider: string): Promise<boolean>;
   /** answering -> done with the answer. False when it is not answering (deleted, requeued). */
@@ -702,11 +752,18 @@ export interface ChatStore {
    * answered now, oldest start first.
    */
   chatQueue(): Promise<{ waiting: number; oldestAt: string | null; running: { id: string; projectKey: string; startedAt: string }[] }>;
+  /**
+   * The current redaction rules over every turn's text, stored pack (context), error, answer and sources, in place.
+   * Run once per REDACTION_VERSION at worker start. Returns how many turns changed. Each field is written only when it
+   * changed and is still what was read: a turn answered between the read and the write keeps its answer.
+   * afterRead (tests): runs between reading a page and writing it.
+   */
+  redactStoredTurns?(afterRead?: () => Promise<unknown>): Promise<number>;
 }
 
 /**
  * What runs wrote (RunTag): every write a labelled request makes records its run id, so cleaning up after a test run
- * removes exactly that. Activity entries keep theirs too, but the log is never removed.
+ * removes exactly that. Activity entries keep theirs too, and a cleanup removes those as well (ActivityStore.removeRun).
  */
 export interface RunsStore {
   /** Every record stored with this run id; lessons and misses name the report they came from as `group`. */
@@ -720,9 +777,10 @@ export interface RunsStore {
   remove(run: string, keep: string[]): Promise<Record<RunItemKind, number>>;
   /**
    * Record who opened `run`, if no one has yet, and return its owner: the stored one when the run was already opened
-   * (by this principal or another), else the new one. Atomic, so two first writes race to one owner.
+   * (by this principal or another), else the new one. Atomic, so two first writes race to one owner. actor: the
+   * operator's name for an operator-token run (RunOwner.actor); null otherwise.
    */
-  claim(run: string, principal: RunPrincipal): Promise<RunOwner>;
+  claim(run: string, principal: RunPrincipal, actor?: string | null): Promise<RunOwner>;
   /** Who opened `run`; null for a run never opened, or one opened before owners were recorded. */
   owner(run: string): Promise<RunOwner | null>;
 }

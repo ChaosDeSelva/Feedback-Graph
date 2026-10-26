@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { REDACT_PAGE, redactDeep, redactSecrets, redactStoredRow, type Activity, type ActivityInput, type ActivityKind, type ActivityStore } from '@fb/core';
+import { REDACT_PAGE, redactDeep, redactStoredRow, type Activity, type ActivityInput, type ActivityKind, type ActivityQuery, type ActivityStore, prepareActivity } from '@fb/core';
 import { iso, toJson, type Db } from './db.ts';
 
 type Row = {
@@ -14,8 +14,8 @@ const activityOf = (r: Row): Activity => ({
 });
 
 /**
- * The append-only provenance log. `seq` (an identity column) orders it, as Neo4j's per-process monotonic `order`
- * does; list() is newest first.
+ * The append-only provenance log (cleaning up a test run removes the entries made in it: removeRun). `seq` (an
+ * identity column) orders it, as Neo4j's per-process monotonic `order` does; list() is newest first.
  */
 export class PgActivityStore implements ActivityStore {
   readonly db: Db;
@@ -23,7 +23,8 @@ export class PgActivityStore implements ActivityStore {
     this.db = db;
   }
 
-  async record(a: ActivityInput): Promise<void> {
+  async record(input: ActivityInput): Promise<void> {
+    const a = prepareActivity(input); // redacted, then cut
     await this.db.pool.query(
       `INSERT INTO activity (id, ts, kind, actor, project_key, subject, why, details, targets, run, sandbox)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9::text[], $10, $11)`,
@@ -33,9 +34,8 @@ export class PgActivityStore implements ActivityStore {
         a.kind,
         a.actor,
         a.projectKey ?? null,
-        // Subjects and details quote feedback, PR titles and model output: redact before it is stored.
-        redactSecrets(a.subject),
-        redactSecrets(a.why),
+        a.subject,
+        a.why,
         toJson(redactDeep(a.details ?? {})), // redact values, not JSON text
         a.targets ?? [],
         a.run ?? null,
@@ -62,7 +62,7 @@ export class PgActivityStore implements ActivityStore {
     return changed;
   }
 
-  async list(q: { projectKey?: string; projectKeys?: string[]; kind?: ActivityKind; target?: string; run?: string; limit?: number; maxDetailBytes?: number }): Promise<Activity[]> {
+  async list(q: ActivityQuery): Promise<Activity[]> {
     // The JSON's length, not pg_column_size (compressed: a long repeated log is tiny on disk): details bigger than
     // maxDetailBytes never leave the database.
     const { rows } = await this.db.pool.query<Row & { omitted: boolean }>(
@@ -74,9 +74,10 @@ export class PgActivityStore implements ActivityStore {
           AND ($3::text IS NULL OR targets @> ARRAY[$3::text])
           AND ($5::text[] IS NULL OR project_key IS NULL OR project_key = ANY($5))
           AND ($7::text IS NULL OR run = $7)
+          AND (NOT $8 OR run IS NULL) AND (NOT $9 OR NOT sandbox)
         ORDER BY seq DESC
         LIMIT $4`,
-      [q.projectKey ?? null, q.kind ?? null, q.target ?? null, q.limit ?? 200, q.projectKeys ?? null, q.maxDetailBytes ?? null, q.run ?? null],
+      [q.projectKey ?? null, q.kind ?? null, q.target ?? null, q.limit ?? 200, q.projectKeys ?? null, q.maxDetailBytes ?? null, q.run ?? null, !!q.unlabelled, !!q.noSandbox],
     );
     return rows.map((r) => ({ ...activityOf(r), ...(r.omitted && { detailsOmitted: true }) }));
   }
@@ -87,5 +88,13 @@ export class PgActivityStore implements ActivityStore {
       [id],
     );
     return rows[0] ? activityOf(rows[0]) : null;
+  }
+
+  async removeRun(run: string, keep: readonly ActivityKind[] = [], o: { ids?: readonly string[]; targets?: readonly string[] } = {}): Promise<number> {
+    return (await this.db.pool.query(
+      `DELETE FROM activity WHERE run = $1 AND NOT (kind = ANY($2::text[]))
+         AND ($3::text[] IS NULL OR id = ANY($3::text[])) AND NOT (coalesce(targets, '{}') && $4::text[])`,
+      [run, [...keep], o.ids ? [...o.ids] : null, [...(o.targets ?? [])]],
+    )).rowCount ?? 0;
   }
 }

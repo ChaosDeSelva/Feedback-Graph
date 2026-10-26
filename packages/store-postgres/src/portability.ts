@@ -70,7 +70,7 @@ export class PgPortabilityStore implements PortabilityStore {
            FROM lessons
            WHERE ($1::text IS NULL OR project_key = $1 OR (project_key IS NULL AND origin_project_key = $1))
              AND ($3::text[] IS NULL OR coalesce(project_key, origin_project_key) IS NULL OR coalesce(project_key, origin_project_key) = ANY($3))
-             AND (NOT $2 OR status = 'approved') AND NOT sandbox
+             AND (NOT $2 OR status = 'approved') AND NOT sandbox AND source <> 'demo'
            ORDER BY created_at, id COLLATE "C"`,
           [key, approvedOnly, keys],
         ),
@@ -82,12 +82,14 @@ export class PgPortabilityStore implements PortabilityStore {
                             WHERE w.miss_id = m.id), '[]'::json) AS items
            FROM misses m JOIN feedback f ON f.id = m.feedback_id
            WHERE ($1::text IS NULL OR m.project_key = $1) AND ($2::text[] IS NULL OR m.project_key = ANY($2)) AND NOT m.sandbox
+             AND m.id NOT LIKE 'miss:demo:%'
            ORDER BY f.created_at, m.id COLLATE "C"`,
           [key, keys],
         ),
         await q(
           `SELECT path, lines, kind, statement, why, confidence, source, created_at, project_key
            FROM facts WHERE current AND doc_id IS NULL AND ($1::text IS NULL OR project_key = $1) AND ($2::text[] IS NULL OR project_key = ANY($2)) AND NOT sandbox
+             AND source IS DISTINCT FROM 'demo'
            ORDER BY project_key COLLATE "C", path COLLATE "C", statement COLLATE "C", id COLLATE "C"`,
           [key, keys],
         ),

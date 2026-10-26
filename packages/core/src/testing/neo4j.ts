@@ -132,6 +132,16 @@ export class Neo4jProbe implements StoreProbe {
           { id: row.id, now, subject: row.subject, why: row.why, details: JSON.stringify(row.details) },
         );
         return;
+      case 'ChatTurns':
+        await this.g.run(
+          `CREATE (:ChatConversation {id: $id, projectKey: '__probe__', title: 't', provider: null, nextSeq: 3, createdAt: $now, updatedAt: $now})
+           CREATE (:ChatTurn {id: $id + ':q', conversationId: $id, projectKey: '__probe__', seq: 1, role: 'user', text: $r.question, status: 'done',
+                              error: null, answer: null, sources: '[]', provider: null, context: $r.context, createdAt: $now, startedAt: null, finishedAt: $now})
+           CREATE (:ChatTurn {id: $id + ':a', conversationId: $id, projectKey: '__probe__', seq: 2, role: 'assistant', text: '', status: 'pending',
+                              error: null, answer: $answer, sources: $sources, provider: null, createdAt: $now, startedAt: null, finishedAt: null})`,
+          { id: row.id, now, r: row, answer: JSON.stringify(row.answer), sources: JSON.stringify(row.sources) },
+        );
+        return;
     }
   }
 }

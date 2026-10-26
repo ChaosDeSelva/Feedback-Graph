@@ -2,9 +2,10 @@ import { randomUUID } from 'node:crypto';
 import neo4j from 'neo4j-driver';
 import { FACT_EVIDENCE, FACT_ORIGINS, type CodeFact, type FactEvidence, type FactKind, type FactOrigin, type Project, type ProjectSummary, type RelevanceBy, type ScanJob, type ScanQueueEntry, type ScanShards, type ScanStatus, type RunTag } from '../types.ts';
 import { factOrigin } from '../relevance.ts';
-import { holdsCredential, REDACT_PAGE, redactDeep, redactSecrets, redactStoredFact } from '../redact.ts';
+import { holdsCredential, REDACT_PAGE, redactDeep, redactSecrets, redactStoredFact, reopensAsFact } from '../redact.ts';
 import { DEMO_SOURCE, type FactCheck, type FactScope, type FactsStore, type ScanJobPatch, type ScannedFile } from '../store.ts';
 import type { GraphRepo } from './repo.ts';
+import { nearest, visibleToRun } from './nearest.ts';
 import { VISIBLE_TO_RUN } from './runs.ts';
 
 /**
@@ -225,6 +226,7 @@ export class FactsRepo implements FactsStore {
     const id = randomUUID();
     const now = new Date().toISOString();
     const relevance = relevanceOf(fx);
+    this.g.sandbox.wrote(run);
     const [r] = await this.g.run(
       `MERGE (p:Project {key: $projectKey})
        CREATE (n:Fact {id: $id, projectKey: $projectKey, kind: $fx.kind, statement: $fx.statement, path: $fx.path,
@@ -282,47 +284,83 @@ export class FactsRepo implements FactsStore {
        SET x.checkVersion = $version,
            x.lines = CASE WHEN c.keep THEN c.lines ELSE x.lines END,
            x.evidence = CASE WHEN c.keep THEN c.evidence ELSE x.evidence END,
+           x.statement = CASE WHEN c.keep AND c.statement IS NOT NULL THEN c.statement ELSE x.statement END,
+           x.embedding = CASE WHEN c.keep AND c.embedding IS NOT NULL THEN c.embedding ELSE x.embedding END,
            x.validTo = CASE WHEN c.keep THEN x.validTo ELSE $now END,
            x.current = c.keep
        RETURN count(CASE WHEN c.keep THEN null ELSE 1 END) AS closed`,
       {
         version, now: new Date().toISOString(),
-        checks: checks.map((c) => ({ id: c.id, keep: c.keep, lines: c.lines ?? null, evidence: c.evidence && FACT_EVIDENCE.includes(c.evidence) ? c.evidence : null })),
+        checks: checks.map((c) => ({
+          id: c.id, keep: c.keep, lines: c.lines ?? null, evidence: c.evidence && FACT_EVIDENCE.includes(c.evidence) ? c.evidence : null,
+          statement: c.statement ? redactSecrets(c.statement) : null, embedding: c.embedding?.length ? c.embedding : null,
+        })),
       },
     );
     return r ? Number(r.get('closed')) : 0;
   }
 
-  async redactStoredFacts(): Promise<{ redacted: number; closed: number; owner: number }> {
+  async redactStoredFacts(): Promise<{ redacted: number; closed: number; owner: number; instructions: number }> {
     let redacted = 0;
     let closed = 0;
     let owner = 0;
+    let instructions = 0;
     for (let after = ''; ;) {
       const rows = await this.g.run(
         `MATCH (f:Fact) WHERE f.id > $after
-         RETURN f.id AS id, f.statement AS statement, f.why AS why, f.current AS current, f.origin AS origin ORDER BY f.id LIMIT $page`,
+         RETURN f.id AS id, f.statement AS statement, f.why AS why, f.current AS current, f.origin AS origin, f.docId IS NOT NULL AS fromDoc ORDER BY f.id LIMIT $page`,
         { after, page: neo4j.int(REDACT_PAGE) },
       );
       if (!rows.length) break;
       after = rows[rows.length - 1].get('id');
       const changed = rows.flatMap((r) => {
-        const was = { statement: (r.get('statement') ?? '') as string, why: (r.get('why') ?? null) as string | null, current: r.get('current') === true, origin: (r.get('origin') ?? null) as string | null };
+        const was = {
+          statement: (r.get('statement') ?? '') as string, why: (r.get('why') ?? null) as string | null, current: r.get('current') === true,
+          origin: (r.get('origin') ?? null) as string | null, fromDoc: r.get('fromDoc') === true,
+        };
         const x = { id: r.get('id') as string, owner: was.origin === 'you', ...redactStoredFact(was) };
         return x.statement !== was.statement || x.why !== was.why || x.close ? [x] : [];
       });
       if (!changed.length) continue;
       await this.g.run(
+        // closeReason: why it was closed, so a later rule can serve a fact it no longer reads as an instruction again.
         `UNWIND $changed AS c MATCH (f:Fact {id: c.id})
          SET f.statement = c.statement, f.why = c.why,
              f.validTo = CASE WHEN c.close THEN $now ELSE f.validTo END,
+             f.closeReason = CASE WHEN c.close THEN (CASE WHEN c.instruction THEN 'instruction' ELSE 'credential' END) ELSE f.closeReason END,
              f.current = CASE WHEN c.close THEN false ELSE f.current END`,
         { changed, now: new Date().toISOString() },
       );
-      redacted += changed.length;
-      closed += changed.filter((c) => c.close).length;
+      redacted += changed.filter((c) => !c.instruction).length;
+      closed += changed.filter((c) => c.close && !c.instruction).length;
       owner += changed.filter((c) => c.owner).length;
+      instructions += changed.filter((c) => c.instruction).length;
     }
-    return { redacted, closed, owner };
+    return { redacted, closed, owner, instructions };
+  }
+
+  async reopenInstructionFacts(): Promise<number> {
+    let reopened = 0;
+    for (let after = ''; ;) {
+      // Only the re-run closes a document fact (a re-read deletes and rewrites them; a scan never touches them).
+      const rows = await this.g.run(
+        `MATCH (f:Fact) WHERE f.id > $after AND f.docId IS NOT NULL AND f.current = false AND coalesce(f.origin, '') <> 'you'
+         RETURN f.id AS id, f.statement AS statement, f.closeReason AS closeReason ORDER BY f.id LIMIT $page`,
+        { after, page: neo4j.int(REDACT_PAGE) },
+      );
+      if (!rows.length) break;
+      after = rows[rows.length - 1].get('id');
+      const ids = rows
+        .filter((r) => reopensAsFact({ statement: (r.get('statement') ?? '') as string, closeReason: (r.get('closeReason') ?? null) as string | null }))
+        .map((r) => r.get('id') as string);
+      if (!ids.length) continue;
+      const [n] = await this.g.run(
+        'UNWIND $ids AS id MATCH (f:Fact {id: id}) WHERE f.current = false SET f.current = true, f.validTo = null, f.closeReason = null RETURN count(f) AS n',
+        { ids },
+      );
+      reopened += Number(n?.get('n') ?? 0);
+    }
+    return reopened;
   }
 
   /** A request is a mark on the file's CodeFile (one with no hash yet when it was never scanned). */
@@ -360,15 +398,14 @@ export class FactsRepo implements FactsStore {
   }
 
   async searchFacts(q: { embedding: number[]; projectKey: string; k: number; run?: string | null }): Promise<FactHit[]> {
-    const rows = await this.g.run(
-      `MATCH (node:Fact {projectKey: $projectKey, current: true}) WHERE node.embedding IS NOT NULL AND size(node.embedding) = size($embedding)
-         AND ${VISIBLE_TO_RUN('node')}
-       WITH node, vector.similarity.cosine(node.embedding, $embedding) AS score
-       ORDER BY score DESC LIMIT $k
+    const rows = await nearest(this.g, {
+      index: 'fact_embedding', label: 'Fact', embedding: q.embedding, k: q.k,
+      where: `node.projectKey = $projectKey AND node.current = true AND ${await visibleToRun(this.g, 'node')}`,
+      tail: `WITH node, score ORDER BY score DESC LIMIT $k
        OPTIONAL MATCH (node)-[:ABOUT]->(cf:CodeFile)
        RETURN node, score, cf.summary AS fileSummary, cf.hashChangedAt AS fileChangedAt ORDER BY score DESC`,
-      { embedding: q.embedding, k: neo4j.int(q.k), projectKey: q.projectKey, run: q.run ?? null },
-    );
+      params: { projectKey: q.projectKey, run: q.run ?? null },
+    });
     return rows.map((r) => ({ fact: factOf(r.get('node').properties, r.get('fileSummary'), r.get('fileChangedAt')), score: r.get('score') }));
   }
 

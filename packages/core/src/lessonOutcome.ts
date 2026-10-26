@@ -4,7 +4,8 @@ import type { Lesson, LessonDraft, LessonOutcome, LessonQuality, LessonQualityRe
 export const draftOf = (l: LessonDraft): LessonDraft => ({ title: l.title, rule: l.rule, appliesWhen: l.appliesWhen, scope: l.scope, paths: [...l.paths] });
 
 const norm = (s: string) => s.replace(/\s+/g, ' ').trim();
-const sameDraft = (a: LessonDraft, b: LessonDraft) =>
+/** The same words, scope and paths (whitespace and path order aside). */
+export const sameDraft = (a: LessonDraft, b: LessonDraft) =>
   norm(a.title) === norm(b.title) && norm(a.rule) === norm(b.rule) && norm(a.appliesWhen) === norm(b.appliesWhen) && a.scope === b.scope &&
   [...a.paths].sort().join('\n') === [...b.paths].sort().join('\n');
 
@@ -40,7 +41,7 @@ export function lessonOutcome(l: Lesson): LessonOutcome | null {
  */
 export function editedDraft(current: Lesson, patch: Partial<LessonDraft> & { status?: unknown }): LessonDraft | null {
   if (current.status !== 'proposed' || current.proposedAs) return null;
-  const next = { ...draftOf(current), ...Object.fromEntries(Object.entries(patch).filter(([k, v]) => v !== undefined && k in draftOf(current))) } as LessonDraft;
+  const next = { ...draftOf(current), ...Object.fromEntries(Object.entries(patch).filter(([k, v]) => v !== undefined && Object.hasOwn(draftOf(current), k))) } as LessonDraft;
   return sameDraft(next, current) ? null : draftOf(current);
 }
 

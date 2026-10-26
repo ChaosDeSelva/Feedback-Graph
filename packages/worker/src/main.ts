@@ -7,7 +7,7 @@ import {
 import { openStore } from '@fb/store-postgres';
 import { answerTurn } from './chat/answer.ts';
 import { chatSpec, codexLoggedIn, defaultChatSpec, type ChatSpecOpts } from './chat/provider.ts';
-import { ChatRunner, sharesModel } from './chat/runner.ts';
+import { ChatRunner, laneOf, sharesModel } from './chat/runner.ts';
 import { CloudSyncSchedule } from './cloud/schedule.ts';
 import { EDITED_PATHS_LIMIT, MapStage } from './codegraph/stage.ts';
 import { runCycle, type FileInfo } from './cycle.ts';
@@ -20,7 +20,8 @@ import { containerFolders } from './projects/folders.ts';
 import { importMemories, memoryProjectKey } from './memory/memory.ts';
 import { forgetDeleted } from './forget.ts';
 import { loadStandingContext, memoryDirFor, runPostMortem } from './postmortem/postmortem.ts';
-import { EXAMPLE_POOL } from './postmortem/examples.ts';
+import { examplePool } from './postmortem/examples.ts';
+import { backfillProposedAs } from './postmortem/proposedAs.ts';
 import { huntContext } from './postmortem/hunt.ts';
 import { syncGithub } from './integrations/githubSync.ts';
 import { githubTarget, syncExternalFeedback, type SyncProject } from './integrations/feedbackSync.ts';
@@ -30,19 +31,21 @@ import { resolvePendingInstructions } from './detect/pendingInstructions.ts';
 import { sortOldMisses } from './postmortem/subjects.ts';
 import { attachWorkSession } from './postmortem/work.ts';
 import { repoFileList, repoHas } from './postmortem/paths.ts';
-import { recheckLessons } from './postmortem/recheck.ts';
+import { recheckLessons, recordedWorkSession } from './postmortem/recheck.ts';
 import { rematchOnRuleChange } from './postmortem/rematch.ts';
 import { sessionEvidence } from './postmortem/standing.ts';
 import { providerAnswers, runPostmortems } from './postmortem/step.ts';
 import { migrateDeciderRule } from './postmortem/deciders.ts';
 import { ScanRunner, type ScanTurn } from './scan/runner.ts';
 import { recheckFacts } from './scan/recheck.ts';
+import { forgetDataFiles } from './scan/data.ts';
 import { hasCodeFiles, runScan, ScanPlans } from './scan/scan.ts';
 import { scoreFacts, ScoringPacer } from './relevance/score.ts';
 import { runLinkDetection } from './links/stage.ts';
 import { readOneDoc } from './docs/read.ts';
 import { SummarizeStage } from './summarize/stage.ts';
-import { CODEX_COPY_RULE, FileState } from './state.ts';
+import { CODEX_COPY_RULE, FileState, INGEST_VERSION } from './state.ts';
+import { SessionEvidenceGate } from './evidence.ts';
 import { cycleProgressed, healthSince, StageTracker } from './progress.ts';
 
 const log = (msg: string, extra: object = {}) => console.log(JSON.stringify({ ts: new Date().toISOString(), msg, ...extra }));
@@ -101,7 +104,8 @@ async function main() {
   await facts.requeueStaleScans();
   await docs.requeueStaleDocs();
   // Lessons whose checks are older than the current ones (or that `fg lessons recheck` marked) get today's checks: flags
-  // only, logged in Activity. At start, then each round (a cheap query when there is nothing to do); a failure waits.
+  // only, logged in Activity. At start and each round once the session evidence they read is current (evidence.ts: not
+  // before an ingest version bump's re-read), a cheap query when there is nothing to do; a failure waits.
   const recheckOld = () =>
     recheckLessons({
       k: knowledge, activity, log,
@@ -110,14 +114,35 @@ async function main() {
       repoPaths: async () => new Map((await containerFolders((await facts.listProjects()).map((p) => p.key), config.roots)).map((p) => [p.key, p.repoPath])),
       // What the session's transcript showed its agent had: a miss blaming a file it "did not load" is checked against it.
       instructionFiles: (id) => repo.sessionInstructionFiles(id),
+      // The session a comment's post-mortem used (none, or matched by branch or files): its miss is not read for wrong-session.
+      workSession: recordedWorkSession(activity),
       // A ticket is the project's when it holds it or its PRs name it, or it is from a team whose tickets it holds.
       linkedTickets: async (key, ids) => {
         const held = new Set(await docs.projectTickets({ projectKey: key, ids }));
         const teams = new Set((await docs.listDocs(key)).filter((x) => x.source === 'linear').map((x) => x.ref.replace(/^linear:/, '').split('-')[0]));
         return ids.filter((id) => held.has(id) || teams.has(id.split('-')[0]));
       },
-    }).catch((err) => log('lesson re-check failed', { error: String(err) }));
-  await recheckOld();
+    });
+  // What reads session evidence (the instruction rule, the lesson re-check, the session re-match, post-mortems) runs
+  // after the transcripts are read at the current INGEST_VERSION, never on the evidence of the one before (evidence.ts).
+  const evidence = new SessionEvidenceGate({
+    ingestVersion: INGEST_VERSION,
+    cursors: docs,
+    // The instruction rule ("don't push a PR yet" is not pushback) once per version over what was stored before it, and
+    // again once the calls after each instruction are read again.
+    instructions: () =>
+      resolvePendingInstructions({ graph: repo, cursors: docs, activity, log, ingestVersion: INGEST_VERSION })
+        .then((n) => { if (n !== null) log('instruction rule applied to pending Inbox items', n); }),
+    requestLessonRecheck: knowledge.requestLessonRecheck?.bind(knowledge),
+    recheck: recheckOld,
+    // The session-matching rule (a comment's session ran on its PR's branch or edited the files it changed, never the
+    // nearest in time): pending comments are matched again and proposed lessons built on a session it would not match
+    // are flagged, once per version, after the lesson re-check so its flags are kept.
+    rematch: () =>
+      rematchOnRuleChange({ graph: repo, knowledge, files: (id) => store.codegraph.sessionFiles(id), cursors: docs, activity, log })
+        .then((n) => { if (n !== null) log('session-matching rule applied to stored comments', n); }),
+    log: (msg, extra) => log(msg, extra && 'error' in extra ? { ...extra, error: redactSecrets(String(extra.error)) } : extra),
+  });
 
   const transcripts = config.transcriptsDir;
   const roots = config.roots;
@@ -148,11 +173,11 @@ async function main() {
   const codexRequeued = state.migrateCodexCopyRule(config.codexSessionsDir);
   if (codexRequeued) log('codex copy rule changed: Codex sessions are read again', { files: codexRequeued, rule: CODEX_COPY_RULE });
 
-  // The owner picks the folders to read (Settings). First start: INGEST_PROJECTS seeds the choice, or nothing does.
+  // The owner picks the folders to read (Settings). Until a choice is made, INGEST_PROJECTS seeds it, or nothing does.
   const seeded = await selection.ensure(config, activity);
   log('project selection', { tracked: seeded.selection.tracked, initialized: seeded.selection.initialized, seededNow: seeded.seeded, excluded: config.excludeProjects });
   if (!seeded.seeded && config.ingestProjects.length && config.ingestProjects.join(',') !== seeded.selection.tracked.join(',')) {
-    log('INGEST_PROJECTS only seeded the first selection; the projects read are the ones chosen in Settings', { ingestProjects: config.ingestProjects });
+    log('INGEST_PROJECTS only seeds a selection not made yet; the projects read are the ones chosen in Settings', { ingestProjects: config.ingestProjects });
   }
   let scope: ProjectScope = projectScope(seeded.selection, config);
   let folderOf = new Map<string, string | string[] | null>();
@@ -253,7 +278,7 @@ async function main() {
     },
     classifyBatch: config.classifyBatch,
     // Scans and Ask answers run beside the cycle and may hold the same model; a classify timeout meanwhile is a queue, not the turn.
-    modelBusy: () => scanRunner.running().length > 0 || sharesModel(chatRunner.running(), classifier?.id),
+    modelBusy: () => scanRunner.running().length > 0 || chatRunner.running().some((p) => sharesModel(p, classifier?.id)),
     log,
     classifierId: classifier?.id,
     includeProject: (k: string) => scope.folder(k),
@@ -281,7 +306,7 @@ async function main() {
     unavailableStreak: { feedbackId: null as string | null, count: 0 },
     // A cycle counts toward that only when the provider answers a neutral ask: an outage never uses up attempts.
     providerHealthy: () => providerAnswers(postmortemLlm),
-    modelBusy: () => scanRunner.running().length > 0 || sharesModel(chatRunner.running(), postmortemLlm.id),
+    modelBusy: () => scanRunner.running().length > 0 || chatRunner.running().some((p) => sharesModel(p, postmortemLlm.id)),
     // A comment from GitHub or Linear is worked out against the agent session that did the work, when one is found.
     postmortem: async (raw: Parameters<typeof runPostMortem>[0]) => {
       stage.enter('postmortem', { current: raw.feedbackId });
@@ -295,11 +320,11 @@ async function main() {
         touched: async (i) => touchedAround(await store.codegraph.sessionFiles(i.sessionId), i.feedback.ts),
         sessionSummary: async (i) => (await store.sessions.detail(i.sessionId))?.summary?.markdown ?? null,
         // The owner's latest decisions on this project's lessons only (never another project's, never a sandbox run's),
-        // scored against this feedback so the closest are shown to the writer (postmortem/examples.ts).
+        // each outcome from its own newest, scored against this feedback so the closest are shown (postmortem/examples.ts).
         examples: async (i) => {
           if (!knowledge.decidedLessons) return [];
           const [embedding] = await embed([i.feedback.text.slice(0, 2000)]);
-          return knowledge.decidedLessons({ projectKeys: [i.projectKey], since: new Date(0).toISOString(), limit: EXAMPLE_POOL, embedding });
+          return examplePool((q) => knowledge.decidedLessons!(q), { projectKeys: [i.projectKey], since: new Date(0).toISOString(), embedding });
         },
         // Lesson paths must exist in the repository (postmortem/paths.ts).
         exists: (i, p) => repoHas(i.repoPath, p),
@@ -353,9 +378,14 @@ async function main() {
     return containerFolders(scope.projects, roots);
   }
 
-  // Facts checked by an older citation rule (AGENTS.md citations, wrong lines) are checked again once against their
-  // repo, beside startup (never awaited); what changed is in Activity. A failure waits for the next start.
-  void recheckFacts({ facts, projects: selectedFolders, maxBytes: config.scanMaxBytes, activity, log })
+  // Facts checked by an older rule (AGENTS.md citations, wrong lines, full dependency lists, generous relevance) are
+  // checked again once against their repo, beside startup (never awaited); what changed is in Activity. A failure waits for the next start.
+  // Files scans read in what are now data folders (transcripts, logs: scan/data.ts) are forgotten, so they no longer
+  // count as read by an older scanner and fg status stops asking for a rescan of them. Beside startup, logged.
+  void forgetDataFiles({ facts, projects: selectedFolders, activity, log })
+    .then((r) => r.files && log('data files forgotten', r))
+    .catch((err) => log('forgetting data files failed', { error: redactSecrets(String(err)) }));
+  void recheckFacts({ facts, embed, projects: selectedFolders, maxBytes: config.scanMaxBytes, activity, log })
     .then((r) => r.checked && log('facts rechecked', r))
     .catch((err) => log('fact recheck failed', { error: redactSecrets(String(err)) }));
 
@@ -498,8 +528,10 @@ async function main() {
   // Kept mirrors are removed once the running scans have ended.
   stopScans = () => scanRunner.stop().finally(() => { scanPlans.clear(); });
 
-  // Ask answers, beside the cycle: the oldest pending question every 2 s, one at a time, with its chat's model.
+  // Ask answers, beside the cycle: every 2 s the oldest waiting question of each model's line, with its chat's model
+  // (questions to different models at once, to one model one at a time).
   const chatRunner = new ChatRunner({
+    lane: (p) => laneOf(chatSpec(p, chatOpts())),
     store: store.chats,
     provider: (conversation) => {
       const spec = chatSpec(conversation.provider, chatOpts());
@@ -512,7 +544,7 @@ async function main() {
     log,
   });
   stopChats = () => chatRunner.stop();
-  await chatRunner.start();
+  // Started after the redaction pass over stored data (below): an answer is never written while that pass rewrites turns.
   log('scans', { concurrency: config.scanConcurrency, maxFiles: config.scanMaxFiles ?? 'scales with the repo' });
 
   /** The selected projects with their remotes: the only ones whose PRs and issues are read. */
@@ -659,33 +691,33 @@ async function main() {
     }
   }
 
-  // Changed redaction rules run once over the facts, documents, lessons, misses, Inbox items, session summaries and
+  // Changed redaction rules run once over the facts, documents, lessons, misses, Inbox items, session summaries, Ask and
   // Activity stored under older ones, before any of it is served again; the counts are in Activity. A failure is
   // logged and tried again at the next start.
-  await redactStoredOnRuleChange({ cursors: docs, facts, docs, knowledge, graph: repo, sessions: store.sessions, activity, log })
+  await redactStoredOnRuleChange({ cursors: docs, facts, docs, knowledge, graph: repo, sessions: store.sessions, chats: store.chats, activity, log })
     .catch((err) => log('redaction over stored data failed', { error: redactSecrets(String(err)) }));
+  await chatRunner.start();
   // A skip rule that changed (an upgrade, or new GITHUB_BOT_LOGINS / GITHUB_AGENT_LOGINS) runs once over what is already
   // pending in the Inbox. A failure is logged and tried again at the next start.
   await skipPendingOnRulesChange({ graph: repo, cursors: docs, activity, botLogins: config.github.botLogins, agentLogins: config.github.agentLogins, log })
     .then((n) => { if (n !== null) log('skip rules applied to pending Inbox items', { skipped: n }); })
     .catch((err) => log('skip rules over pending Inbox items failed', { error: redactSecrets(String(err)) }));
-  // The same for the instruction rule ("don't push a PR yet" is not pushback) and the process-miss rule (a miss about
-  // branches or pull requests is on no file): each runs once per version over what was stored before it.
-  await resolvePendingInstructions({ graph: repo, cursors: docs, activity, log })
-    .then((n) => { if (n !== null) log('instruction rule applied to pending Inbox items', n); })
-    .catch((err) => log('instruction rule over pending Inbox items failed', { error: redactSecrets(String(err)) }));
+  // The same for the process-miss rule (a miss about branches or pull requests is on no file): once per version over
+  // what was stored before it. The instruction rule and the session re-match read session evidence: they run after the
+  // first ingest (the evidence gate, below).
   await sortOldMisses({ knowledge, cursors: docs, activity, log })
     .then((n) => { if (n !== null) log('process-miss rule applied to past misses', n); })
     .catch((err) => log('process-miss rule over past misses failed', { error: redactSecrets(String(err)) }));
-  // The session-matching rule (a comment's session ran on its PR's branch or edited the files it changed, never the
-  // nearest in time): pending comments are matched again and proposed lessons built on a session it would not match are
-  // flagged, once per version, after the lesson re-check above so its flags are kept.
-  await rematchOnRuleChange({ graph: repo, knowledge, files: (id) => store.codegraph.sessionFiles(id), cursors: docs, activity, log })
-    .then((n) => { if (n !== null) log('session-matching rule applied to stored comments', n); })
-    .catch((err) => log('session-matching rule over stored comments failed', { error: redactSecrets(String(err)) }));
   // Only the owner's decisions mark a lesson as yours: one a machine decided under the older rule loses the mark, once.
   await migrateDeciderRule({ knowledge, cursors: docs, activity, log })
     .catch((err) => log('lesson decider rule failed', { error: redactSecrets(String(err)) }));
+  // Lessons edited before the writer's draft was kept get it from the edits Activity recorded, once, so "approved as
+  // written" and the writer's examples stop counting a rewritten lesson as approved as written.
+  await backfillProposedAs({ knowledge, activity, cursors: docs, log })
+    .catch((err) => log("writer's draft backfill failed", { error: redactSecrets(String(err)) }));
+  // The lesson re-check now, if the session evidence is current; else after the first cycle has read the transcripts.
+  await evidence.load();
+  await evidence.atStart();
 
   while (!stopping) {
     try {
@@ -702,7 +734,7 @@ async function main() {
       const imported = await importMemories(memDeps);
       if (imported) log('memory lessons imported', { imported });
       await retention();
-      await recheckOld();
+      if (evidence.ready()) await evidence.recheck();
       // Keep going without sleeping while there is still work: backfill, post-mortems, scans.
       let progressed;
       do {
@@ -716,8 +748,12 @@ async function main() {
         const scanned = scanRunner.running().length;
         // Your uploads, like scans, are work you asked for.
         const docRead = await readDocOne();
-        const pm: Awaited<ReturnType<typeof runPostmortems>> = pmDeps ? await runPostmortems(pmDeps) : { done: 0, failed: 0 };
+        // Post-mortems read the session evidence too: they wait for this start's first ingest and the passes after it.
+        const settling = !evidence.settled();
+        const pm: Awaited<ReturnType<typeof runPostmortems>> = pmDeps && !settling ? await runPostmortems(pmDeps) : { done: 0, failed: 0 };
         const { classifierUnavailable, ...r } = await runCycle(cycleDeps);
+        // The transcripts were read through: what judges stored data against them can run now (once per start).
+        await evidence.afterIngest();
         summarizeStage?.kick();
         log('cycle', { ...r, postmortems: pm.done, postmortemFailures: pm.failed, scanned, classifierUnavailable, postmortemUnavailable: pm.unavailable });
         status.lastCycleAt = new Date().toISOString();
@@ -728,7 +764,8 @@ async function main() {
         const scored = r.turnsClassified > 0 || pm.done > 0 || docRead ? 0 : await scoreSome();
         // Failures back off on their own schedule; only real progress keeps the loop from sleeping. Scans are not
         // counted: they run beside the loop and refill their own slots as they finish. Nor is the relevance backfill.
-        progressed = cycleProgressed({ turnsClassified: r.turnsClassified, postmortems: pm.done, docRead: !!docRead, scored });
+        // The round that let post-mortems through goes straight on to them.
+        progressed = cycleProgressed({ turnsClassified: r.turnsClassified, postmortems: pm.done, docRead: !!docRead, scored }) || (settling && !!pmDeps);
         if (scored) log('relevance backfill', { scored });
       } while (progressed && !stopping);
     } catch (err) {

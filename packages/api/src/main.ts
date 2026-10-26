@@ -1,12 +1,15 @@
 import { existsSync } from 'node:fs';
+import type { Server } from 'node:http';
 import { serve } from '@hono/node-server';
 import { ConfigError, credentialFile, Integrations, loadConfig, makeProviderOr, redactSecrets, ollamaEmbed, ollamaPing, projectFolders, refreshLayout, shownProjects, storedSyncMemory, syncProjects, VERSION, worktreeGitArgs, type Project } from '@fb/core';
 import { openStore } from '@fb/store-postgres';
+import { Admission } from './admission.ts';
 import { createApp } from './app.ts';
 import { chatPackBuilder } from './chat.ts';
-import { hashRepoFile, makeJudge, resolveProject, type ContextDeps } from './context.ts';
+import { hashRepoFile, makeJudge, repoFileSize, resolveProject, type ContextDeps } from './context.ts';
 import { readRepoDiff } from './diff.ts';
 import { rootsFile } from './roots.ts';
+import { stopServer, tuneServer } from './server.ts';
 
 const log = (msg: string, extra: object = {}) => console.log(JSON.stringify({ ts: new Date().toISOString(), msg, ...extra }));
 
@@ -98,6 +101,7 @@ const contextDeps: ContextDeps = {
   k: knowledge,
   judge: makeJudge(judgeLlm),
   judgeId: judgeLlm.id,
+  judgeQueue: new Admission({ concurrency: config.check.concurrency, timeoutMs: config.check.waitSeconds * 1000 }),
   activity,
   docs,
   inScope: async (key: string) => (await scope()).folder(key),
@@ -105,6 +109,9 @@ const contextDeps: ContextDeps = {
   servesGlobal: (key: string) => !config.excludeProjects.includes(key),
   exists: existsSync,
   fileHash: hashRepoFile,
+  // Why a named file is not in the code map: over SCAN_MAX_BYTES (the worker does not parse it).
+  fileSize: repoFileSize,
+  mapMaxBytes: config.scanMaxBytes,
   // check_before_done with no diff: the change to files_changed, read-only from the mounted folder.
   repoDiff: async (repoPath: string, files: string[]) => readRepoDiff(repoPath, files, { gitArgs: await worktreeGitArgs(repoPath, roots) }),
   // Files an agent named that have no facts yet go to the front of the project's next scan.
@@ -116,7 +123,10 @@ const contextDeps: ContextDeps = {
   links: store.links,
 };
 
+/** Aborted on SIGTERM: the event streams end at once instead of holding the restart for 10 s (stopServer). */
+const closing = new AbortController();
 const app = createApp(store.graph, {
+  closing: closing.signal,
   staticDir: process.env.STATIC_DIR,
   knowledge,
   embed,
@@ -188,13 +198,14 @@ const app = createApp(store.graph, {
   chat: {
     store: store.chats,
     // As the asking request sees the stores (runScoped): a sandbox run's records reach only its own turns.
-    build: chatPackBuilder({ context: contextDeps, codeMap: (k) => store.codegraph.codeMap(k) }),
+    build: chatPackBuilder({ context: contextDeps, codeMap: (k) => store.codegraph.codeMap(k), sessionFiles: (id) => store.codegraph.sessionFiles(id) }),
   },
   log,
 });
 
 // API_LISTEN is 0.0.0.0 inside the container (compose publishes it on API_BIND); otherwise API_BIND, loopback by default.
-const server = serve({ fetch: app.fetch, port: config.port, hostname: config.apiListen });
+const server = serve({ fetch: app.fetch, port: config.port, hostname: config.apiListen }) as Server;
+tuneServer(server);
 log('api listening', { port: config.port, version: VERSION, bind: config.apiBind, auth: config.apiToken ? 'token' : 'none (loopback only)', operator: config.operator ? config.operator.allow.join(',') : 'off', publicHosts: config.publicHosts, cloudSync: config.cloud ? new URL(config.cloud.url).host : 'off' });
 if (!config.apiToken) log(`no API_TOKEN set: reachable on ${config.apiBind} only; setting API_BIND to anything but loopback requires API_TOKEN`);
 
@@ -204,7 +215,8 @@ function shutdown(signal: string) {
   stopping = true;
   log('shutting down', { signal });
   setTimeout(() => process.exit(0), 10_000).unref();
-  server.close(async () => {
+  // Requests in flight get 5 s to finish; event streams end now (the browser reconnects to the new process).
+  void stopServer(server, closing, { graceMs: 5000 }).then(async () => {
     await store.close();
     log('stopped');
     process.exit(0);

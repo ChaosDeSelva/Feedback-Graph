@@ -39,6 +39,46 @@ test('uploading a document chunks, redacts, embeds and logs it', async () => {
   expect(recorded[0]).toMatchObject({ kind: 'doc_added', actor: 'you', projectKey: 'shop', subject: 'uploaded "Product spec" (1 chunk)', targets: ['doc:shop:upload:spec.md'] });
 });
 
+test('the largest upload is accepted at once (202) and embedded in the background in batches, never one call for all', async () => {
+  const batches: number[] = [];
+  const upserts: number[] = [];
+  const recorded: ActivityInput[] = [];
+  let release!: () => void;
+  const slow = new Promise<void>((r) => { release = r; });
+  const app = createApp(repo, {
+    embed: async (t) => { batches.push(t.length); await slow; return t.map(() => [1]); },
+    projectDirs: async () => [{ key: 'shop', name: 'shop', repoPath: '/vibe/shop' }],
+    docs: { upsertDoc: async (doc, chunks) => { upserts.push(chunks.length); return `doc:shop:upload:${doc.ref}`; }, listDocs: async () => [], deleteDoc: async () => false },
+    activity: { record: async (a) => { recorded.push(a); }, list: async () => [] },
+  });
+  const text = Array.from({ length: 2000 }, (_, i) => `Paragraph ${i}. ${'word '.repeat(198)}`).join('\n\n').slice(0, 2_000_000);
+  const res = await app.request('/api/projects/shop/docs', post({ title: 'Big', name: 'big.md', text }));
+  expect(res.status).toBe(202);
+  const body = (await res.json()) as { id: string; chunks: number; pending: boolean };
+  expect(body).toMatchObject({ id: 'doc:shop:upload:big.md', pending: true });
+  expect(body.chunks).toBeGreaterThan(1000);
+  release();
+  for (let i = 0; i < 100 && !upserts.length; i++) await new Promise((r) => setTimeout(r, 10));
+  expect(upserts).toEqual([body.chunks]);
+  expect(Math.max(...batches)).toBeLessThanOrEqual(64);
+  expect(batches.reduce((a, b) => a + b, 0)).toBe(body.chunks);
+  expect(recorded[0]).toMatchObject({ kind: 'doc_added', subject: `uploaded "Big" (${body.chunks} chunks)` });
+});
+
+test('a background upload that fails is logged in Activity with why, never a crash', async () => {
+  const recorded: ActivityInput[] = [];
+  const app = createApp(repo, {
+    embed: async () => { throw new Error('ollama embed 500: model not loaded'); },
+    projectDirs: async () => [{ key: 'shop', name: 'shop', repoPath: '/vibe/shop' }],
+    docs: { upsertDoc: async () => 'x', listDocs: async () => [], deleteDoc: async () => false },
+    activity: { record: async (a) => { recorded.push(a); }, list: async () => [] },
+  });
+  const res = await app.request('/api/projects/shop/docs', post({ title: 'Big', name: 'big.md', text: 'word '.repeat(200_000) }));
+  expect(res.status).toBe(202);
+  for (let i = 0; i < 100 && !recorded.length; i++) await new Promise((r) => setTimeout(r, 10));
+  expect(recorded[0]).toMatchObject({ kind: 'doc_added', subject: 'could not add "Big": ollama embed 500: model not loaded', details: { name: 'big.md', failed: true } });
+});
+
 test('uploads are validated: unknown project, empty text, oversized text, bad names', async () => {
   const { app } = setup();
   expect((await app.request('/api/projects/nope/docs', post({ title: 't', name: 'a.md', text: 'x' }))).status).toBe(404);
@@ -160,4 +200,59 @@ test('POST /api/docs/:id/reread queues a failed reading again (say, after DOCS_L
   expect(reread).toEqual(['doc:shop:upload:flow.png']);
   expect(recorded[0]).toMatchObject({ kind: 'doc_added', actor: 'you', projectKey: 'shop', subject: 'asked for flow.png to be read again', targets: ['doc:shop:upload:flow.png'] });
   expect((await app.request('/api/docs/doc%3Ashop%3Aupload%3Anope.md/reread', post({}))).status).toBe(404);
+});
+
+test('a background upload carries its embed status: pending, then failed with why, read by id (GET /api/docs/:id), not from the first page', async () => {
+  let fail!: (e: Error) => void;
+  const app = createApp(repo, {
+    embed: () => new Promise((_, reject) => { fail = reject; }),
+    projectDirs: async () => [{ key: 'shop', name: 'shop', repoPath: '/vibe/shop' }],
+    docs: { upsertDoc: async () => 'x', listDocs: async () => [], deleteDoc: async () => false },
+    activity: { record: async () => {}, list: async () => [] },
+  });
+  const res = await app.request('/api/projects/shop/docs', post({ title: 'Big', name: 'big.md', text: 'word '.repeat(200_000) }));
+  expect(res.status).toBe(202);
+  const { id, chunks } = (await res.json()) as { id: string; chunks: number };
+  const pending = await app.request(`/api/docs/${encodeURIComponent(id)}`);
+  expect(pending.status).toBe(200);
+  expect(await pending.json()).toMatchObject({ id, title: 'Big', embed: { status: 'pending', chunks } });
+  fail(new Error('ollama embed 500: model not loaded'));
+  let failed: { embed?: { status: string; error?: string } } = {};
+  for (let i = 0; i < 100 && failed.embed?.status !== 'failed'; i++) {
+    await new Promise((r) => setTimeout(r, 10));
+    failed = await (await app.request(`/api/docs/${encodeURIComponent(id)}`)).json();
+  }
+  expect(failed.embed).toEqual({ status: 'failed', error: 'ollama embed 500: model not loaded', chunks });
+  // A document nobody uploaded, stored or not, is not found.
+  expect((await app.request('/api/docs/doc:shop:upload:none.md')).status).toBe(404);
+  expect((await app.request('/api/docs/doc:other:upload:big.md')).status).toBe(404);
+});
+
+test('re-uploading a large file of the same name marks the listed document pending until the new version is stored', async () => {
+  const old = { id: 'doc:shop:upload:big.md', projectKey: 'shop', source: 'upload' as const, ref: 'big.md', title: 'Big v1', url: null, addedAt: 't', addedBy: 'you', chunks: 3, kind: 'text' as const, mediaType: null, read: null };
+  let release!: () => void;
+  const slow = new Promise<void>((r) => { release = r; });
+  let stored = false;
+  const app = createApp(repo, {
+    embed: async (t) => { await slow; return t.map(() => [1]); },
+    projectDirs: async () => [{ key: 'shop', name: 'shop', repoPath: '/vibe/shop' }],
+    docs: {
+      upsertDoc: async (doc) => { stored = true; return `doc:shop:upload:${doc.ref}`; },
+      listDocs: async (_k, o = {}) => (!o.ref || o.ref === 'big.md' ? [stored ? { ...old, title: 'Big v2', chunks: 999 } : old] : []),
+      deleteDoc: async () => false,
+    },
+    activity: { record: async () => {}, list: async () => [] },
+  });
+  const res = await app.request('/api/projects/shop/docs', post({ title: 'Big v2', name: 'big.md', text: 'word '.repeat(200_000) }));
+  expect(res.status).toBe(202);
+  const listed = (await (await app.request('/api/projects/shop/docs')).json()) as { id: string; embed?: { status: string } }[];
+  expect(listed[0]).toMatchObject({ id: old.id, title: 'Big v1', embed: { status: 'pending' } });
+  expect(await (await app.request(`/api/docs/${encodeURIComponent(old.id)}`)).json()).toMatchObject({ title: 'Big v1', embed: { status: 'pending' } });
+  release();
+  for (let i = 0; i < 100 && !stored; i++) await new Promise((r) => setTimeout(r, 10));
+  await new Promise((r) => setTimeout(r, 10));
+  const done = (await (await app.request(`/api/docs/${encodeURIComponent(old.id)}`)).json()) as { title: string; embed?: object };
+  expect(done.title).toBe('Big v2');
+  expect(done.embed).toBeUndefined();
+  expect(((await (await app.request('/api/projects/shop/docs')).json()) as { embed?: object }[])[0].embed).toBeUndefined();
 });

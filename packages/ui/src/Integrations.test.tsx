@@ -139,7 +139,7 @@ test('a token saved here while .env also sets one can be disconnected, falling b
 test('the account shows when it was checked; a token not checked yet says it is checked on its own', async () => {
   state = view({ github: connected({ checkedAt: new Date(Date.now() - 5 * 60_000).toISOString() }), linear: connected({ envVar: 'LINEAR_API_KEY', account: null, checkedAt: null }) });
   render(<Integrations />);
-  expect(await screen.findByText(/checked 5m ago/)).toBeTruthy();
+  expect((await screen.findByText('5m ago')).parentElement!.textContent).toMatch(/checked 5m ago/);
   expect(screen.getByText(/being checked: it is checked on first use/)).toBeTruthy();
 });
 
@@ -192,4 +192,28 @@ test('with everything fine the indicator counts what is connected', () => {
   const off = { state: 'not_connected' as const, source: null, detail: 'off', href: '#' };
   render(<ConnectionsBadge connections={{ github: ok, linear: off, claude: ok, codex: off, ollama: ok, cloud: off }} />);
   expect(screen.getByRole('button', { name: 'Connections: 3 of 6 connected' })).toBeTruthy();
+});
+
+const ISO = /\d{4}-\d\d-\d\dT\d\d:/;
+
+test('hover titles on times are in words, never the ISO string', async () => {
+  const at = '2026-10-26T08:34:00.000Z';
+  state = view({
+    github: connected({ checkedAt: at, lastSyncAt: at }),
+    projects: [{ ...view().projects[0], github: { ...view().projects[0].github, lastSyncAt: at, items: 3 } }],
+  });
+  render(<Integrations />);
+  await card('GitHub');
+  await screen.findByText(/3 comments/);
+  const titled = [...document.querySelectorAll('[title]')].map((e) => e.getAttribute('title')!);
+  expect(titled.filter((t) => ISO.test(t))).toEqual([]);
+  expect(document.querySelectorAll(`time[datetime="${at}"]`).length).toBeGreaterThanOrEqual(3);
+});
+
+test('Linear connected with no team mapped says to map a team to start syncing, not "not synced yet"', async () => {
+  state = view({ linear: connected({ envVar: 'LINEAR_API_KEY', account: 'me', lastSyncAt: null, connection: { state: 'connected', source: 'app', detail: 'Connected.', href: '#settings/integrations-linear' } }) });
+  render(<Integrations />);
+  const linear = within(await card('Linear'));
+  expect(linear.getByText(/map a team to a project below to start syncing/i)).toBeTruthy();
+  expect(linear.queryByText(/not yet: the worker syncs/)).toBeNull();
 });

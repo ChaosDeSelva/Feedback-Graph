@@ -27,12 +27,68 @@ export const MIN_SHARD_FILES = 5;
  * directory holding more than this many files directly cannot be split (a scope is a set of directories).
  */
 export const MAX_SHARD_FILES = 400;
-/** Directories whose children are taken as shards when the repo declares no workspace. */
+/** Directories whose children are taken as shards when the repo declares no workspace (src/webapp, src/billing). */
 const SOURCE_ROOTS = ['src', 'packages', 'services', 'apps', 'cmd'];
+/**
+ * Folders that hold services or apps, at any depth: each directory directly under one is a shard of its own
+ * (src/webapp/apps/api, services/billing, cmd/server), and small ones merge only with a sibling in the same folder.
+ */
+const CONTAINER_DIRS = new Set(['apps', 'services', 'packages', 'cmd', 'libs', 'crates', 'modules', 'plugins']);
 /** Files that make their directory a package or service of its own, whether or not a workspace file names it. */
 const PACKAGE_MANIFESTS = ['package.json', 'go.mod', 'pyproject.toml', 'setup.py', 'Cargo.toml', 'Package.swift', 'composer.json', 'Gemfile', 'mix.exs', 'pom.xml', 'build.gradle', 'build.gradle.kts'];
 /** A manifest under one of these is test data, not a package. */
 const FIXTURE_DIRS = new Set(['fixtures', '__fixtures__', 'testdata', 'test-fixtures', 'node_modules']);
+/**
+ * Folders whose files are worth little to an agent changing the code. Their files get a small, capped share of a shard's
+ * fact budget (shardFactBudget) and only a sample of them is listed to the agent; a top-level one is a shard of its
+ * own, and no manifest or app folder under one makes a shard. Which folder is one depends on its kind (lowValueRule):
+ * tests, fixtures and snapshots (TEST_DIRS) and vendored or generated code (GENERATED_DIRS) at any depth; shelved code
+ * (SHELVED_DIRS: the attic, archives, specs) only by position, since src/features/archive or a packages/spec library is
+ * real source.
+ */
+const TEST_DIRS = new Set([
+  'test', 'tests', '__tests__', 'e2e', 'fixtures', '__fixtures__', 'testdata', 'test-fixtures', 'test_data', '__mocks__', 'mocks', 'snapshots', '__snapshots__',
+]);
+const GENERATED_DIRS = new Set(['vendor', 'vendored', 'third_party', 'third-party', 'generated', '__generated__', 'node_modules']);
+/**
+ * Low-value only at the repo's top level or directly under a service root (a directory holding a manifest, or one
+ * directly under a CONTAINER_DIRS folder), and never when the folder holds a package manifest itself or sits in a
+ * features/ folder.
+ */
+const SHELVED_DIRS = new Set(['spec', 'specs', 'attic', 'archive', 'archived']);
+/** Test files, snapshots and generated code by name, wherever they are. */
+const LOW_VALUE_FILE = /(\.(test|spec)\.[cm]?[jt]sx?|_test\.go|_test\.py|\.snap|_snapshot\.json|\.generated\.\w+|\.pb\.go|_pb2\.py)$|(^|\/)test_[^/]*\.py$/;
+
+/** Whether the folder dirSegs[0..i] is low-value, given the directories that hold a package manifest. */
+function lowValueDirAt(dirSegs: string[], i: number, manifestDirs: ReadonlySet<string>): boolean {
+  const name = dirSegs[i];
+  if (TEST_DIRS.has(name) || GENERATED_DIRS.has(name)) return true;
+  if (!SHELVED_DIRS.has(name)) return false;
+  if (manifestDirs.has(dirSegs.slice(0, i + 1).join('/'))) return false;
+  if (i === 0) return true;
+  if (dirSegs[i - 1] === 'features') return false;
+  const parent = dirSegs.slice(0, i).join('/');
+  return manifestDirs.has(parent) || (i >= 2 && CONTAINER_DIRS.has(dirSegs[i - 2]));
+}
+
+/** Directories (not the root) holding one of PACKAGE_MANIFESTS, among repo-relative `paths`. */
+const manifestDirsOf = (paths: string[]) => new Set(paths.filter((p) => PACKAGE_MANIFESTS.includes(p.slice(p.lastIndexOf('/') + 1)) && p.includes('/')).map((p) => p.slice(0, p.lastIndexOf('/'))));
+
+/**
+ * Low-value files (tests, fixtures, archives, vendored and generated code; LOW_VALUE_FILE by name) among repo-relative
+ * `paths`, which say where the package manifests are (a shelved name holding one is a package, not the attic).
+ */
+export function lowValueRule(paths: string[]): (path: string) => boolean {
+  const manifests = manifestDirsOf(paths);
+  return (path) => {
+    if (LOW_VALUE_FILE.test(path)) return true;
+    const dirs = path.split('/').slice(0, -1);
+    return dirs.some((_, i) => lowValueDirAt(dirs, i, manifests));
+  };
+}
+
+/** lowValueRule knowing no manifests: what a path alone says. */
+export const isLowValue = lowValueRule([]);
 
 /** The workspace files planShards reads, from the repo root. */
 export const WORKSPACE_FILES = ['pnpm-workspace.yaml', 'package.json', 'go.work', 'Cargo.toml'];
@@ -47,6 +103,16 @@ export const MAX_SHARD_BUDGET = 120;
  * with the file count (one per five files) for big ones, MAX_SHARD_BUDGET at most. 0.6.0 stopped at 60 from 225 files.
  */
 export const shardBudget = (files: number) => Math.min(MAX_SHARD_BUDGET, Math.max(10, Math.round(4 * Math.sqrt(files)), Math.round(files / 5)));
+/** Facts low-value files (isLowValue) add to a shard's budget at most, however many there are. */
+export const MAX_LOW_VALUE_BUDGET = 8;
+/** Facts `files` low-value files are worth: a few, growing slowly, MAX_LOW_VALUE_BUDGET at most; 0 for none. */
+export const lowValueBudget = (files: number) => (files ? Math.min(MAX_LOW_VALUE_BUDGET, Math.max(2, Math.round(Math.sqrt(files) / 2))) : 0);
+/**
+ * A shard's fact budget from its mix: shardBudget over its source files plus lowValueBudget over its tests, fixtures and
+ * archives (0.6.2 gave 300 test files the budget of 300 source files), MAX_SHARD_BUDGET at most. A shard of only
+ * low-value files (the attic) gets lowValueBudget alone.
+ */
+export const shardFactBudget = (core: number, low: number) => Math.min(MAX_SHARD_BUDGET, (core ? shardBudget(core) : 0) + lowValueBudget(low));
 
 /** Its roots, less the deeper roots of other shards (which own their own files and facts). */
 export function shardScope(shard: Shard, all: Shard[]): ShardScope {
@@ -108,24 +174,45 @@ function workspaceRoots(paths: string[], files: Record<string, string>): string[
 }
 
 /** The fallback: each directory directly under a common source root (src/webapp, services/billing, cmd/server). */
-function sourceDirRoots(paths: string[]): string[] {
+function sourceDirRoots(paths: string[], manifests: ReadonlySet<string>): string[] {
   const roots = new Set<string>();
   for (const p of paths) {
     const segs = p.split('/');
-    if (segs.length >= 3 && SOURCE_ROOTS.includes(segs[0])) roots.add(`${segs[0]}/${segs[1]}`);
+    if (segs.length >= 3 && SOURCE_ROOTS.includes(segs[0]) && !lowValueDirAt(segs, 1, manifests)) roots.add(`${segs[0]}/${segs[1]}`);
   }
   return [...roots];
 }
 
-/** Directories other than the repo root that hold a package manifest (PACKAGE_MANIFESTS), outside test fixtures. */
-function manifestRoots(paths: string[]): string[] {
+/** Under a fixture or low-value folder (the attic, tests): no package or app there is a shard of its own. */
+const inLowValueDir = (dirSegs: string[], manifests: ReadonlySet<string>) => dirSegs.some((s, i) => FIXTURE_DIRS.has(s) || lowValueDirAt(dirSegs, i, manifests));
+
+/** Directories other than the repo root that hold a package manifest (PACKAGE_MANIFESTS), outside fixtures and archives. */
+function manifestRoots(paths: string[], manifests: ReadonlySet<string>): string[] {
   const roots = new Set<string>();
   for (const p of paths) {
     const segs = p.split('/');
-    if (segs.length < 2 || !PACKAGE_MANIFESTS.includes(segs.at(-1)!) || segs.slice(0, -1).some((s) => FIXTURE_DIRS.has(s))) continue;
+    if (segs.length < 2 || !PACKAGE_MANIFESTS.includes(segs.at(-1)!) || inLowValueDir(segs.slice(0, -1), manifests)) continue;
     roots.add(segs.slice(0, -1).join('/'));
   }
   return [...roots];
+}
+
+/** Every directory directly under a CONTAINER_DIRS folder, at any depth (src/webapp/apps/api), outside fixtures and archives. */
+function containerRoots(paths: string[], manifests: ReadonlySet<string>): string[] {
+  const roots = new Set<string>();
+  for (const p of paths) {
+    const dirs = p.split('/').slice(0, -1);
+    for (let i = 0; i + 1 < dirs.length; i++) {
+      if (inLowValueDir(dirs.slice(0, i + 2), manifests)) break;
+      if (CONTAINER_DIRS.has(dirs[i])) roots.add(dirs.slice(0, i + 2).join('/'));
+    }
+  }
+  return [...roots];
+}
+
+/** Top-level low-value folders (attic/, tests/): one shard each, so their files never weigh on the rest's budget. */
+function lowValueRoots(paths: string[], manifests: ReadonlySet<string>): string[] {
+  return [...new Set(paths.map((p) => p.split('/')).filter((s) => s.length >= 2 && lowValueDirAt(s, 0, manifests)).map((s) => s[0]))];
 }
 
 /**
@@ -155,17 +242,29 @@ function split(root: string, files: string[]): [string, string[]][] {
 const cmp = (a: string, b: string) => (a < b ? -1 : a > b ? 1 : 0);
 const keyOf = (roots: string[]) => roots.map((r) => r || '.').join('+');
 
+const parentOf = (root: string) => (root.includes('/') ? root.slice(0, root.lastIndexOf('/')) : '');
+
 /**
- * Split repo-relative `paths` into shards: the workspace packages the repo declares (`files` holds the root's
- * WORKSPACE_FILES) together with every directory holding its own package manifest (a Go or Python service in a JS
- * workspace is no workspace member); without either, the directories under SOURCE_ROOTS; else one shard. A shard over
- * MAX_SHARD_FILES is split by its subdirectories. The smallest shards are then merged until none is under
- * MIN_SHARD_FILES and there are at most MAX_SHARDS. Sorted by key; empty when there are no paths.
+ * Split repo-relative `paths` into shards along service boundaries. The roots: the workspace packages the repo declares
+ * (`files` holds the root's WORKSPACE_FILES), every directory holding its own package manifest (a Go or Python service
+ * in a JS workspace is no workspace member), every directory directly under an apps/, services/, packages/ or cmd/
+ * folder at any depth (CONTAINER_DIRS: src/webapp/apps/api), and each top-level low-value folder (attic/, tests/);
+ * without a declared or manifest root, also the directories under SOURCE_ROOTS. Nothing under a fixture or low-value
+ * folder is a root of its own. A shard over MAX_SHARD_FILES is split by its subdirectories.
+ *
+ * Merging only ever joins related folders: a shard under MIN_SHARD_FILES merges with its smallest sibling (same parent
+ * folder) when that parent is a CONTAINER_DIRS folder or neither is a service of its own (a subdirectory split off, a
+ * SOURCE_ROOTS guess), else folds into the shard of the folder above it (the rest of the repo at the top); a tiny rest
+ * of the repo takes in the smallest shard. While there are more than MAX_SHARDS, the two smallest siblings that may
+ * merge are merged (else the smallest folds into the shard above it). 0.6.2 merged the smallest shards whatever they
+ * were, so 27 of 40 shards of a big monorepo joined unrelated services. Sorted by key; empty when there are no paths.
  */
 export function planShards(paths: string[], files: Record<string, string>): Shard[] {
   if (!paths.length) return [];
-  const declared = [...new Set([...workspaceRoots(paths, files), ...manifestRoots(paths)])];
-  const roots = ['', ...(declared.length ? declared : sourceDirRoots(paths))].sort((a, b) => b.length - a.length);
+  const manifests = manifestDirsOf(paths);
+  const declared = [...new Set([...workspaceRoots(paths, files), ...manifestRoots(paths, manifests)])];
+  const services = new Set([...declared, ...containerRoots(paths, manifests)]);
+  const roots = [...new Set(['', ...services, ...lowValueRoots(paths, manifests), ...(declared.length ? [] : sourceDirRoots(paths, manifests))])].sort((a, b) => b.length - a.length);
   const byRoot = new Map<string, string[]>();
   for (const p of paths) {
     const root = roots.find((r) => under(p, r))!;
@@ -174,12 +273,51 @@ export function planShards(paths: string[], files: Record<string, string>): Shar
   }
   const shards: Shard[] = [...byRoot].flatMap(([root, fs]) => split(root, fs)).map(([root, fs]) => ({ key: keyOf([root]), roots: [root], files: fs }));
   const order = (a: Shard, b: Shard) => a.files.length - b.files.length || cmp(a.key, b.key);
+  const merge = (small: Shard, into: Shard) => {
+    shards.splice(shards.indexOf(small), 1);
+    const roots = [...into.roots, ...small.roots];
+    shards.splice(shards.indexOf(into), 1, { key: keyOf(roots), roots, files: [...into.files, ...small.files] });
+  };
+  const first = (s: Shard) => s.roots[0];
+  // The siblings it may merge with, smallest first: same parent folder, and that a container (apps/) or neither a service.
+  const siblings = (s: Shard) => {
+    if (first(s) === '') return [];
+    const parent = parentOf(first(s));
+    const container = CONTAINER_DIRS.has(parent.slice(parent.lastIndexOf('/') + 1));
+    return shards.filter((o) => o !== s && first(o) !== '' && parentOf(first(o)) === parent && (container || (!services.has(first(s)) && !services.has(first(o)))));
+  };
+  // The shard holding the folder above it: the one with the longest root over its first root (the rest at the top).
+  const above = (s: Shard) => {
+    let best: Shard | null = null;
+    let depth = -1;
+    for (const o of shards) {
+      if (o === s) continue;
+      for (const r of o.roots) if (r !== first(s) && under(first(s), r) && r.length > depth) [best, depth] = [o, r.length];
+    }
+    return best;
+  };
+  // A tiny shard with nothing related to merge with (a lone top-level service, no rest of the repo) stays as it is.
+  const alone = new Set<Shard>();
   for (;;) {
     shards.sort(order);
-    if (shards.length < 2 || (shards.length <= MAX_SHARDS && shards[0].files.length >= MIN_SHARD_FILES)) break;
-    const [small, into] = shards.splice(0, 2);
-    const roots = [...into.roots, ...small.roots];
-    shards.push({ key: keyOf(roots), roots, files: [...into.files, ...small.files] });
+    const tiny = shards.find((s) => s.files.length < MIN_SHARD_FILES && !alone.has(s));
+    if (!tiny || shards.length < 2) break;
+    const into = first(tiny) === '' ? null : (siblings(tiny)[0] ?? above(tiny));
+    if (first(tiny) === '') merge(shards.find((o) => o !== tiny)!, tiny);
+    else if (into) merge(tiny, into);
+    else alone.add(tiny);
+  }
+  while (shards.length > MAX_SHARDS) {
+    shards.sort(order);
+    let pair: [Shard, Shard] | null = null;
+    for (const s of shards) {
+      const sib = siblings(s)[0];
+      if (sib && (!pair || s.files.length + sib.files.length < pair[0].files.length + pair[1].files.length)) pair = [s, sib];
+    }
+    const small = pair ? null : shards.find((s) => above(s));
+    if (pair) merge(pair[0], pair[1]);
+    else if (small) merge(small, above(small)!);
+    else break;
   }
   return shards.sort((a, b) => cmp(a.key, b.key));
 }
