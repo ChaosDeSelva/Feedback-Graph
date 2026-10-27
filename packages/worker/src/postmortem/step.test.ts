@@ -369,10 +369,10 @@ test('a post-mortem that says there was no miss is saved with its lesson rejecte
   expect(activity[0]).toMatchObject({ kind: 'postmortem_done', subject: expect.stringMatching(/^no miss, no lesson: /), details: expect.objectContaining({ noLesson: 'The agent did not miss any defects.' }) });
 });
 
-test("a re-saved post-mortem that says no miss never rejects a lesson the owner edited or decided: it is flagged no-miss", async () => {
+test.each([undefined, "empty rule"])("a re-saved no-miss post-mortem preserves owner decisions even with dropped lesson %s", async (lessonDropped) => {
   const decided: unknown[] = [];
   const checks: [string, unknown][] = [];
-  const none = { ...pm, missed: 'Nothing was missed.', noMiss: 'Nothing was missed.' };
+  const none = { ...pm, missed: 'Nothing was missed.', noMiss: 'Nothing was missed.', ...(lessonDropped && { lessonDropped }) };
   const stored: Record<string, Partial<Lesson>> = {
     'lesson:edited': { status: 'proposed', proposedAs: { title: 't', rule: 'r', appliesWhen: 'w', scope: 'project', paths: [] }, checks: [{ name: 'needs-path', why: 'x' }] },
     'lesson:approved': { status: 'approved', proposedAs: null, checks: [] },

@@ -20,7 +20,7 @@ export const EVERYDAY_FROM = 0.8;
 const MIN_RELEVANCE = 0.3;
 const CLOSE_ENOUGH = 0.8;
 /** Similarity below which a past miss or a fact is never served, whatever else ranks: a nonsense task gets nothing. */
-export const SIMILARITY_FLOOR = 0.3;
+export const SIMILARITY_FLOOR = 0.78;
 /** A fact or miss scoring under this share of the best one is noise next to it, and is left out. */
 const RELATIVE_FLOOR = 0.6;
 
@@ -151,10 +151,10 @@ const keepNearBest = <T extends { score: number }>(xs: T[]) => {
  * same, more mildly, for `services` (the folders the task names, servicesInTask). Nothing under SIMILARITY_FLOOR,
  * and nothing far below the best, is kept. `score` becomes the weighted score.
  */
-export function rankFacts<T extends FactHit>(hits: T[], n: number, files: string[] = [], services: string[] = []): T[] {
+export function rankFacts<T extends FactHit>(hits: T[], n: number, files: string[] = [], services: string[] = [], floor = SIMILARITY_FLOOR): T[] {
   return keepNearBest(
     hits
-      .filter((h) => h.score >= SIMILARITY_FLOOR && ((h.fact.relevance ?? UNSCORED_RELEVANCE) >= MIN_RELEVANCE || h.score >= CLOSE_ENOUGH))
+      .filter((h) => h.score >= floor && ((h.fact.relevance ?? UNSCORED_RELEVANCE) >= MIN_RELEVANCE || h.score >= CLOSE_ENOUGH))
       .map((h) => ({ ...h, score: h.score * (0.55 + 0.45 * (h.fact.relevance ?? UNSCORED_RELEVANCE)) * affinity(h.fact.path ?? '.', files, services) }))
       .sort((a, b) => b.score - a.score),
   ).slice(0, n);
@@ -165,10 +165,10 @@ export function rankFacts<T extends FactHit>(hits: T[], n: number, files: string
  * where the paths they mention sit against the named files (pathAffinity), and none far below the best. Never one whose
  * lesson you rejected as worked out from the wrong session (rejectedWrongSession): it is evidence of nothing.
  */
-export function rankMisses<T extends { missed: string; feedbackText: string; score: number; rejectedWrongSession?: boolean }>(hits: T[], n: number, files: string[] = [], services: string[] = []): T[] {
+export function rankMisses<T extends { missed: string; feedbackText: string; score: number; rejectedWrongSession?: boolean }>(hits: T[], n: number, files: string[] = [], services: string[] = [], floor = SIMILARITY_FLOOR): T[] {
   return keepNearBest(
     hits
-      .filter((m) => !m.rejectedWrongSession && !isNonMiss(m.missed) && m.score >= SIMILARITY_FLOOR)
+      .filter((m) => !m.rejectedWrongSession && !isNonMiss(m.missed) && m.score >= floor)
       .map((m) => {
         const paths = mentionedPaths(`${m.missed} ${m.feedbackText}`);
         const w = paths.length ? Math.max(...paths.map((p) => affinity(p, files, services))) : 1;

@@ -311,6 +311,7 @@ function ProjectLinks({ view, onChange }: { view: IntegrationsView; onChange: (v
               <tr>
                 <th className={thClass}>Project</th>
                 <th className={thClass}>GitHub repository</th>
+                <th className={thClass}>PR author</th>
                 <th className={thClass}>GitHub sync</th>
                 <th className={thClass}>Linear team</th>
                 <th className={thClass}>Linear sync</th>
@@ -337,6 +338,7 @@ function ProjectLinks({ view, onChange }: { view: IntegrationsView; onChange: (v
                       <span className="text-muted">no github.com remote</span>
                     )}
                   </td>
+                  <td className={tdClass}><Input key={`${p.key}:${p.github.author ?? ""}`} aria-label={`PR author of ${p.key}`} placeholder="All authors" defaultValue={p.github.author ?? ""} disabled={saving === p.key} onBlur={(e) => { const author = e.target.value.trim() || null; if (author !== (p.github.author ?? null)) void save(p, { githubAuthor: author }); }} /></td>
                   <td className={`${tdClass} text-xs`}>{p.github.repo && githubOn ? syncCell(p.github, p.github.enabled) : <span className="text-muted">-</span>}</td>
                   <td className={tdClass}>
                     {linearOn ? (

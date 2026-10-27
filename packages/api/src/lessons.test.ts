@@ -271,3 +271,11 @@ test('POST /api/lessons/recheck marks every proposed and approved lesson for the
   // Owner-only, under the operator's `retry` verb.
   expect((await app.request('/api/lessons/recheck', post({}, {}))).status).toBe(403);
 });
+
+
+test('Lessons can be filtered by originating PR and feedback author', async () => {
+  const { app, calls } = setup();
+  expect((await app.request('/api/lessons?pr=42&author=Octo')).status).toBe(200);
+  expect(calls[0]).toEqual(['list', expect.objectContaining({ pr: 42, author: 'Octo' })]);
+  expect((await app.request('/api/lessons?pr=-1')).status).toBe(400);
+});

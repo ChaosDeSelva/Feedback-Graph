@@ -6,10 +6,11 @@
  * identifier, path, version or word; code rules leave identifiers, URLs, calls, YAML tags and type names alone.
  * 4: webhook URLs and secrets in a URL's query; slashed values after a secret name; a flag's whole value; prose with
  * words between the credential and "is"; JSON keys such as nextPageToken keep values that are not secrets.
+ * 6: additional provider tokens, Basic auth, Azure AccountKey, Docker auth and pgpass records.
  * 5: an instruction in an upload is one addressed to the reader-as-AI, not a project convention (facts v4 closed as
  * instructions are reopened); the head of a token an older Activity subject cut at its cap is redacted.
  */
-export const REDACTION_VERSION = 5;
+export const REDACTION_VERSION = 6;
 /** Rows a store reads per page when it redacts stored text again under new rules. */
 export const REDACT_PAGE = 1000;
 
@@ -87,6 +88,12 @@ function assignedSecret(v: string): boolean {
 
 /** Known token shapes and URL credentials: a secret wherever they appear, whoever wrote the text. */
 const TOKEN_PATTERNS: RegExp[] = [
+  /\b(?:gsk_|pypi-|whsec_|lin_oauth_|GOCSPX-|xapp-)[A-Za-z0-9_-]{16,}/g,
+  /\b(Basic\s+)[A-Za-z0-9+/]{8,}={0,2}/gi,
+  /\b(AccountKey\s*=\s*)[^;\s"']{16,}/gi,
+  /("auth"\s*:\s*")[A-Za-z0-9+/]{8,}={0,2}(?=")/g,
+  // .pgpass records: host:port:database:user:password; escaped colons stay within a field.
+  /^((?:[^:\r\n\\]|\\.)+:(?:\d+|\*):(?:[^:\r\n\\]|\\.)+:(?:[^:\r\n\\]|\\.)+:)[^\r\n]+/gm,
   /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g,
   /\bsk-(?:proj-|ant-[a-z0-9]+-)?[A-Za-z0-9_-]{20,}/g,
   /\b[sr]k_(?:live|test)_[A-Za-z0-9]{16,}/g,
@@ -352,7 +359,7 @@ export function redactDeep<T>(v: T): T {
   if (v && typeof v === 'object') {
     // A key that names a secret means its value is one, whatever it looks like. A paging or sync token
     // (nextPageToken, continuationToken) names a place in a list, not a credential: its value goes through the rules.
-    return Object.fromEntries(Object.entries(v).map(([k, x]) => [k, SECRET_KEY.test(k) && !CURSOR_KEY.test(k) && typeof x === 'string' && x ? '[REDACTED]' : redactDeep(x)])) as T;
+    return Object.fromEntries(Object.entries(v).map(([k, x]) => [k, (SECRET_KEY.test(k) || /^(?:auth|account[_-]?key)$/i.test(k)) && !CURSOR_KEY.test(k) && typeof x === 'string' && x ? '[REDACTED]' : redactDeep(x)])) as T;
   }
   return v;
 }

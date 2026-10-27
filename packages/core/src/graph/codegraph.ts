@@ -61,7 +61,7 @@ export class CodeGraphRepo implements CodeGraphStore {
       importerCounts: (key) => this.importerCounts(key),
       edgesTouching: (key, paths) => this.edgesTouching(key, paths),
       missesOn: (key, paths, run) => this.missesOn(key, paths, run ?? null),
-      approvedLessons: (key, run) => knowledge.listLessons({ status: 'approved', projectKey: key, limit: LESSON_LIMIT, run }),
+      approvedLessons: (key, run) => knowledge.listLessons({ status: 'approved', projectKey: key, limit: LESSON_LIMIT, run }).then((lessons) => lessons.filter((l) => !l.checks?.some((c) => c.name === 'no-miss'))),
       currentFacts: (key, path, run) => facts.listFacts({ projectKey: key, path, run }),
     };
     this.views = codeGraphViews(reads);
@@ -204,18 +204,35 @@ export class CodeGraphRepo implements CodeGraphStore {
     return map.stats;
   }
 
-  async purgeOrphanCodeFiles(limit: number): Promise<number> {
+  async purgeOrphanCodeFiles(limit: number, now = new Date()): Promise<number> {
+    if (!Number.isFinite(limit) || limit < 1) return 0;
+    const cutoff = new Date(now.getTime() - 24 * 60 * 60_000).toISOString();
+    // Hold the selection's write lock through map removal: a concurrent reselection cannot interleave its deletes.
+    await this.g.runInTransaction([
+      [`MATCH (s:ProjectSelection {id: 'selection'}) SET s.mapPurgeLock = true REMOVE s.mapPurgeLock`, {}],
+      [`MATCH (s:ProjectSelection {id: 'selection'}), (m:CodeMap)
+        WHERE s.initialized = true AND s.updatedAt < $cutoff AND NOT m.projectKey IN s.tracked
+        WITH m LIMIT 1
+        CALL (m) { MATCH (symbol:Symbol {projectKey: m.projectKey}) DETACH DELETE symbol }
+        CALL (m) { MATCH (cf:CodeFile {projectKey: m.projectKey})-[r:IMPORTS|TESTS]-() DELETE r }
+        CALL (m) { MATCH (cf:CodeFile {projectKey: m.projectKey}) SET cf.inMap = false, cf.inIndex = false
+          REMOVE cf.lang, cf.codeHash, cf.loc, cf.isTest, cf.churnCommits, cf.churnLastTs, cf.mappedAt }
+        CALL (m) { MATCH (module:Module {projectKey: m.projectKey}) WHERE NOT EXISTS { ()-[:IMPORTS]->(module) } DETACH DELETE module }
+        DETACH DELETE m`, { cutoff }],
+    ]);
     const [r] = await this.g.run(
       // inMap is unset (not false) on a file that was never mapped: a session's touch creates the node, and when the
       // session is read again without it nothing refers to it. Never mapped and never scanned (no hash, the scan's
-      // memory of the file), it goes whatever its project; a scanned one only once it is gone from the repo.
+      // memory of the file), it goes whatever its project; scanned files also expire when their project is deselected.
       `MATCH (cf:CodeFile) WHERE coalesce(cf.inMap, false) = false AND coalesce(cf.inIndex, false) = false
-         AND (cf.removed = true OR cf.hash IS NULL OR NOT EXISTS { (cf)-[:IN]->(:Project) })
+         AND (cf.removed = true OR cf.hash IS NULL OR NOT EXISTS { (cf)-[:IN]->(:Project) }
+           OR EXISTS { MATCH (selection:ProjectSelection {id: 'selection'})
+             WHERE selection.initialized = true AND selection.updatedAt < $cutoff AND NOT cf.projectKey IN selection.tracked })
          AND NOT EXISTS { (cf)-[r]-() WHERE type(r) <> 'IN' }
        WITH cf LIMIT $limit
        DETACH DELETE cf
        RETURN count(*) AS n`,
-      { limit: neo4j.int(Math.max(0, Math.floor(limit))) },
+      { limit: neo4j.int(Math.max(0, Math.floor(limit))), cutoff },
     );
     return r ? neo4j.integer.toNumber(r.get('n')) : 0;
   }

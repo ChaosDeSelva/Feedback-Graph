@@ -166,6 +166,11 @@ export class PgKnowledgeStore implements KnowledgeStore {
         [taskId, r.pkey, r.sid, pm.taskTitle, now],
       );
       await c.query('UPDATE feedback SET status = $2, updated_at = $3, task_id = $4 WHERE id = $1', [feedbackId, OUTCOME_STATUS[pm.outcome], now, taskId]);
+      if (pm.noMiss) {
+        await c.query("UPDATE feedback SET status = 'rejected' WHERE id = $1", [feedbackId]);
+        await c.query('DELETE FROM misses WHERE feedback_id = $1', [feedbackId]);
+        return; // A false/disputed claim must not become a served miss.
+      }
       await c.query('INSERT INTO causes (key) VALUES ($1) ON CONFLICT DO NOTHING', [pm.cause]);
       await c.query(
         `INSERT INTO misses (id, project_key, feedback_id, missed, cause, cause_explanation, outcome, created_at, embedding, subject, run, sandbox)
@@ -247,8 +252,10 @@ export class PgKnowledgeStore implements KnowledgeStore {
          AND ${learnedIn('l', '$4')}
          AND ($5::text IS NULL OR l.checks @> jsonb_build_array(jsonb_build_object('name', $5::text)))
          AND ($6::text IS NULL OR ${FROM} = $6) AND ${visibleToRun('l', '$7')}
+         AND ($8::text IS NULL OR t.external->>'thread' ~ ('#' || $8 || '$'))
+         AND ($9::text IS NULL OR lower(t.external->>'author') = lower($9))
        ORDER BY l.created_at DESC, l.id LIMIT $3`,
-      [f.status ?? null, f.projectKey ?? null, f.limit ?? 500, f.projectKeys ?? null, f.flag ?? null, f.from ?? null, f.run ?? null],
+      [f.status ?? null, f.projectKey ?? null, f.limit ?? 500, f.projectKeys ?? null, f.flag ?? null, f.from ?? null, f.run ?? null, f.pr ? String(f.pr) : null, f.author ?? null],
     );
     return rows.map(lessonOf);
   }

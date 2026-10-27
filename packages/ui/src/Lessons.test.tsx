@@ -547,3 +547,12 @@ test('the judged header counts the decisions an agent made with the operator tok
   expect(summary.match(/by an agent with the operator token/g)).toHaveLength(1);
   expect(summary).toMatch(/4 by an agent with the operator token \(40%\)/);
 });
+
+
+test('PR number and feedback author filters are sent to the API', async () => {
+  render(<Lessons />);
+  await screen.findByText('filtered on the client');
+  fireEvent.change(screen.getByLabelText('PR number'), { target: { value: '42' } });
+  fireEvent.change(screen.getByLabelText('feedback author'), { target: { value: 'octo' } });
+  await waitFor(() => expect(vi.mocked(fetch).mock.calls.some(([url]) => String(url).includes('pr=42') && String(url).includes('author=octo'))).toBe(true));
+});

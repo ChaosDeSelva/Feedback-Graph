@@ -1,5 +1,5 @@
 import { createServer } from 'node:http';
-import { createCodexRunner, writeRunnerToken } from './codexRunner.ts';
+import { createCodexRunner, writeRunnerToken, purgeStaleRunnerMirrors } from './codexRunner.ts';
 import { killRunningCommands } from './exec.ts';
 
 // The codex-runner container's entry point (Dockerfile target codex-runner). It logs no job content and never the token.
@@ -7,6 +7,7 @@ const log = (msg: string, extra: object = {}) => console.log(JSON.stringify({ ts
 
 const scratch = process.env.RUNNER_SCRATCH || '/scratch';
 const port = Number(process.env.RUNNER_PORT || 8790);
+await purgeStaleRunnerMirrors(scratch);
 const token = await writeRunnerToken(scratch);
 const runner = createCodexRunner({ scratch, token });
 const server = createServer((req, res) => {

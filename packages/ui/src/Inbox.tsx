@@ -32,11 +32,14 @@ export function Inbox() {
   const focus = tabLink ? null : link;
   const [status, setStatus] = useState<CandidateStatus>(tabLink ?? 'pending');
   const [project, setProject] = useState('');
+  const [pr, setPr] = useState('');
+  const [author, setAuthor] = useState('');
+  const filterKey = `${project}:${pr}:${author}`;
   // The tab and project a page was asked for: a page that arrives after you moved on is dropped.
   const statusRef = useRef(status);
   const projectRef = useRef(project);
   statusRef.current = status;
-  projectRef.current = project;
+  projectRef.current = filterKey;
   const [all, setItems] = useState<Candidate[]>([]);
   // Where the next page of this tab starts, or null when every item is loaded.
   const [next, setNext] = useState<number | null>(null);
@@ -70,7 +73,7 @@ export function Inbox() {
     // The answer for a tab or project you have left must not fill the one you are on.
     let stale = false;
     setNext(null);
-    api.candidates(status, project || undefined).then(({ items: page, next: more }) => {
+    api.candidates(status, project || undefined, 0, { pr: pr || undefined, author: author || undefined }).then(({ items: page, next: more }) => {
       if (stale) return;
       const c = stableOrder(status, page);
       setNext(more);
@@ -81,15 +84,15 @@ export function Inbox() {
       setLoaded(true);
     }, (e) => { if (!stale) { setError(String(e)); setLoaded(true); } });
     return () => { stale = true; };
-  }, [status, project]);
+  }, [status, project, pr, author]);
 
   const current = items[selected];
   // The next page joins the list in the same stable order; the item you are on stays selected.
   const loadMore = () => {
     if (next === null || loadingMore) return;
     setLoadingMore(true);
-    const at = { status, project, id: current?.id };
-    api.candidates(status, project || undefined, next).then(({ items: page, next: more }) => {
+    const at = { status, project: filterKey, id: current?.id };
+    api.candidates(status, project || undefined, next, { pr: pr || undefined, author: author || undefined }).then(({ items: page, next: more }) => {
       if (at.status !== statusRef.current || at.project !== projectRef.current) return;
       setItems((xs) => {
         const seen = new Set(xs.map((x) => x.id));
@@ -158,6 +161,8 @@ export function Inbox() {
         description="Possible pushback from your sessions and from comments on your pull requests and Linear issues. Confirm the real misses; only those are learned from."
         actions={
           <>
+            <Input aria-label="PR number" placeholder="PR number" type="number" min="1" value={pr} onChange={(e) => setPr(e.target.value)} className="w-28" />
+            <Input aria-label="feedback author" placeholder="Feedback author" value={author} onChange={(e) => setAuthor(e.target.value)} className="w-40" />
             <Select aria-label="source" value={source} onChange={(e) => setSource(e.target.value as FeedbackSource | '')} className="w-36">
               <option value="">all sources</option>
               {(Object.keys(SOURCE_LABEL) as FeedbackSource[]).map((s) => <option key={s} value={s}>{SOURCE_LABEL[s]}</option>)}

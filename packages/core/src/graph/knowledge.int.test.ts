@@ -97,6 +97,14 @@ describeStores('KnowledgeStore', (h) => {
       expect(await k.postmortemBacklog!()).toBe(0);
     });
 
+    test('a false disputed claim saves no miss or lesson and finishes its queue entry', async () => {
+      const id = await confirmedFeedback('false-claim');
+      await k.savePostmortem(id, pm({ noMiss: 'The feedback was incorrect.' }), { miss: [], lesson: [] });
+      expect(await k.feedbackNeedingPostmortem(5)).toEqual([]);
+      expect(await k.postmortemBacklog!()).toBe(0);
+      expect(await k.listLessons({})).toEqual([]);
+    });
+
     test('postmortemBacklog counts the feedback still waiting for a post-mortem, those backing off after a failure too', async () => {
       const a = await confirmedFeedback('s1');
       const b = await confirmedFeedback('s2');

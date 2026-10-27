@@ -899,3 +899,17 @@ test('lessons quality and status say how many of the decisions an agent made wit
   expect(await run(['status'], mine.io)).toBe(0);
   expect(mine.text()).not.toMatch(/operator token/);
 });
+
+
+test('Inbox and Lessons forward PR and author filters', async () => {
+  const f = fake({ 'GET /api/candidates?status=pending&pr=42&author=octo': () => ({ json: [] }), 'GET /api/lessons?status=proposed&pr=42&author=octo': () => ({ json: [] }) });
+  expect(await run(['inbox', 'list', '--pr', '42', '--author', 'octo'], f.io)).toBe(0);
+  expect(await run(['lessons', 'list', '--pr', '42', '--author', 'octo'], f.io)).toBe(0);
+});
+
+test('Inbox decisions split pasted comma and newline separated ids before sending the batch', async () => {
+  const f = fake({ 'POST /api/candidates/decisions': (b) => ({ json: { results: (b as { items: { id: string }[] }).items.map(({ id }) => ({ id, ok: true, status: 'confirmed' })) } }) });
+  const ids = Array.from({ length: 40 }, (_, i) => `github:acme/shop#42/c${i}`);
+  expect(await run(['inbox', 'confirm', ids.join(',\n')], f.io)).toBe(0);
+  expect(f.calls[0].body).toEqual({ items: ids.map((id) => ({ id, decision: 'confirm' })) });
+});

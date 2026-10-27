@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync,
 import { homedir, tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { afterAll, beforeAll, describe, expect, test } from 'vitest';
-import { RUNNER_TOKEN_FILE, runOnRunner } from './codexRunner.ts';
+import { isolatedRunnerArgs, RUNNER_TOKEN_FILE, runOnRunner } from './codexRunner.ts';
 
 /**
  * The codex-runner container as docker-compose.yml defines it, next to a stand-in for the worker that holds what the
@@ -138,6 +138,32 @@ describe.skipIf(!dockerUp)('codex-runner container', () => {
     expect(out.found).toEqual([`${INSIDE} in /scratch/fb-mirror-job/notes.txt`]);
   }, 320_000);
 
+  test('the job namespace hides pending mirrors, runner token, old home and parent processes without a model call', () => {
+    docker(['exec', `${id}-runner`, 'node', '-e', `
+      const fs = require('fs');
+      fs.mkdirSync('/scratch/fb-mirror-pending', { recursive: true });
+      fs.writeFileSync('/scratch/fb-mirror-pending/private.txt', 'OTHER_PROJECT');
+      fs.writeFileSync('/codex/old-history.txt', 'OLD_HISTORY');
+      fs.mkdirSync('/tmp/isolation-test', { recursive: true });
+    `]);
+    const probe = `
+      const fs = require('fs');
+      const blocked = ['/scratch/.runner-token', '/scratch/fb-mirror-pending/private.txt', '/codex/old-history.txt'];
+      process.stdout.write(JSON.stringify({
+        current: fs.readFileSync('/repo/notes.txt', 'utf8'),
+        leaks: blocked.filter(p => { try { fs.readFileSync(p); return true; } catch { return false; } }),
+        pids: fs.readdirSync('/proc').filter(p => /^\\d+$/.test(p)).length,
+      }));
+    `;
+    const args = isolatedRunnerArgs({ dir: '/scratch/fb-mirror-job', work: '/tmp/isolation-test', auth: '/codex/auth.json', bin: 'node', args: ['-e', probe] });
+    const seen = JSON.parse(docker(['exec', `${id}-runner`, 'bwrap', ...args]));
+    expect(seen.current).toContain(INSIDE);
+    expect(seen.leaks).toEqual([]);
+    expect(seen.pids).toBeLessThanOrEqual(3);
+    // The pending mirror survives for its own queued job, outside this process's mount namespace.
+    expect(docker(['exec', `${id}-runner`, 'cat', '/scratch/fb-mirror-pending/private.txt'])).toBe('OTHER_PROJECT');
+  });
+
   test('the runner wrote its token into the scratch volume and refuses requests without it', async () => {
     for (let i = 0; i < 50 && !existsSync(join(scratch, RUNNER_TOKEN_FILE)); i++) await new Promise((r) => setTimeout(r, 200));
     expect(readFileSync(join(scratch, RUNNER_TOKEN_FILE), 'utf8')).toMatch(/^[0-9a-f]{64}$/);
@@ -150,7 +176,7 @@ describe.skipIf(!dockerUp)('codex-runner container', () => {
 
   test.skipIf(!codexLogin)('codex in the runner reads the mirror but cannot read the worker-only canary', async () => {
     const schema = { type: 'object', additionalProperties: false, required: ['files'], properties: { files: { type: 'array', items: { type: 'object', additionalProperties: false, required: ['path', 'content'], properties: { path: { type: 'string' }, content: { type: 'string' } } } } } };
-    const prompt = 'Run `cat` on each of these files and put each in files with its exact text as content, or the exact error you got: notes.txt, /transcripts/canary.txt, /scratch/fb-mirror-job/notes.txt. Then run `cat /proc/*/environ | tr "\\0" "\\n"` and add it as one more entry with path "environ". Return the JSON.';
+    const prompt = 'Run `cat` on each of these files and put each in files with its exact text as content, or the exact error you got: notes.txt, /repo/notes.txt, /transcripts/canary.txt, /scratch/fb-mirror-job/notes.txt. Then run `cat /proc/*/environ | tr "\\0" "\\n"` and add it as one more entry with path "environ". Return the JSON.';
     const r = await runOnRunner({ url, scratch, job: { prompt, mirror: 'fb-mirror-job', schema, timeoutMs: 240_000 } });
     if (r.code !== 0 && /log ?in|auth|401|unauthori/i.test(r.stdout + r.stderr)) {
       console.warn('the Codex login could not be used in the container; skipping the live codex check');

@@ -103,7 +103,7 @@ export async function runPostmortems(deps: PostmortemStepDeps): Promise<{ done: 
       await deps.k.savePostmortem(input.feedbackId, pm, { miss, lesson });
       done++;
       const lessonId = `lesson:${input.feedbackId}`;
-      const owners = pm.lessonDropped ? null : await ownersLesson(deps, lessonId);
+      const owners = pm.lessonDropped && !pm.noMiss ? null : await ownersLesson(deps, lessonId);
       // Its own miss says there was none: the lesson it wrote is invented, so it is saved rejected, never proposed. One
       // the owner edited or decided is the owner's: it is flagged no-miss for them to decide, never decided here.
       if (pm.noMiss && !owners) await deps.k.updateLesson?.(lessonId, { status: 'rejected' }, { by: NO_MISS_DECIDER, note: `no miss: the post-mortem said "${pm.noMiss.slice(0, 300)}", so no lesson` });
@@ -146,7 +146,7 @@ export async function runPostmortems(deps: PostmortemStepDeps): Promise<{ done: 
           ...(trace && { examples: trace.examples ?? [] }),
           ...(pm.noMiss && { noLesson: pm.noMiss }),
         },
-        targets: [input.feedbackId, `miss:${input.feedbackId}`, ...(pm.lessonDropped ? [] : [`lesson:${input.feedbackId}`])],
+        targets: [input.feedbackId, ...(pm.noMiss ? [] : [`miss:${input.feedbackId}`]), ...(pm.lessonDropped ? [] : [`lesson:${input.feedbackId}`])],
       });
       deps.log?.('postmortem saved', { feedbackId: input.feedbackId, cause: pm.cause });
     } catch (err) {

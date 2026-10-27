@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.6.4 (2026-10-26)
+
+- Inbox and Lessons can filter by GitHub PR number and feedback author in the UI, API, CLI and admin MCP. GitHub sync can be restricted to a PR author. Bulk Inbox confirmation accepts comma- or whitespace-separated IDs.
+- Only lessons tied to files named by the task are served as rules. Unrelated projects' global lessons stay out; facts, misses and documents use a 0.78 semantic similarity floor (hosted lexical embedders can supply their calibrated floor without changing scores). A task's own PR discussions are excluded when their association is known.
+- Pre-done checks return queued within the tool timeout. Judge evidence must cite an added or removed line; a missing verdict is undecided, never a possible gap.
+- Disputed false claims do not create misses. Post-pushback memory writes are excluded from standing context and duplicate memory lessons; mixed git instructions are detached from files.
+- Hooks ignore harness prompts and edits outside the repository, and accept run labels and sandbox flags. Operator-labelled runs use a private `FG_RUN_KEY` capability; a display name alone cannot authorize cleanup. Legacy and uncredentialed runs require owner cleanup.
+- Runner jobs use a separate mount and process namespace containing only the current mirror, runtime, login and fresh temporary files. Rebuild the codex-runner image when upgrading; Linux user namespaces must be available. Stale mirrors are also swept on startup and before jobs.
+- Redaction covers additional provider tokens, Basic authentication, Azure AccountKey, Docker auth and pgpass; scanners skip additional credential files. Stored text is rechecked under redaction rules v6.
+- Deselected code maps expire after a 24-hour grace period. Repeated first-run `setup.sh --yes` uses the saved instance name.
+
 ## 0.6.3 (2026-10-26)
 
 From the team's 0.6.2 field report (an upgraded live install, a real ticket, the learning loop with Claude Code and Codex,

@@ -8,12 +8,12 @@ const hit = (statement: string, score: number, relevance: number | null): FactHi
 });
 
 test('rankFacts weighs similarity by relevance, so an everyday fact beats a slightly closer setup fact', () => {
-  const ranked = rankFacts([hit('setup the linter in your editor', 0.74, 0.1), hit('every query is scoped by orgId', 0.7, 0.9)], 5);
+  const ranked = rankFacts([hit('setup the linter in your editor', 0.79, 0.1), hit('every query is scoped by orgId', 0.78, 0.9)], 5);
   expect(ranked.map((h) => h.fact.statement)).toEqual(['every query is scoped by orgId']);
 });
 
 test('rankFacts keeps a low-relevance fact when the task is very close to it (a setup task)', () => {
-  const ranked = rankFacts([hit('how to configure the deploy tool', 0.85, 0.1), hit('every query is scoped by orgId', 0.6, 0.9)], 5);
+  const ranked = rankFacts([hit('how to configure the deploy tool', 0.85, 0.1), hit('every query is scoped by orgId', 0.79, 0.9)], 5);
   expect(ranked.map((h) => h.fact.statement).sort()).toEqual(['every query is scoped by orgId', 'how to configure the deploy tool']);
 });
 
@@ -62,8 +62,8 @@ test('pathAffinity favours paths in the named files\' folders and service, and d
 test('rankFacts with named files puts the facts of their service first and drops what falls far below the best', () => {
   const at = (statement: string, path: string, score: number): FactHit => ({ fact: { id: statement, statement, path, relevance: 0.8, relevanceBy: 'model' } as StoredFact, score });
   const ranked = rankFacts([
-    at('ingest uses sqlc mutations', 'src/ingest/AGENTS.md', 0.66),
-    at('confirm the router is wired', 'src/webapp/AGENTS.md', 0.6),
+    at('ingest uses sqlc mutations', 'src/ingest/AGENTS.md', 0.86),
+    at('confirm the router is wired', 'src/webapp/AGENTS.md', 0.8),
     at('unrelated gateway rule', 'src/llm-gateway/README.md', 0.3),
   ], 5, ['src/webapp/core/src/features/users/router.ts']);
   expect(ranked.map((h) => h.fact.statement)).toEqual(['confirm the router is wired', 'ingest uses sqlc mutations']);
@@ -73,8 +73,8 @@ test('rankMisses drops non-misses and weak matches, and favours misses that name
   const m = (missed: string, score: number, feedbackText = '') => ({ missId: missed, missed, feedbackText, score });
   const ranked = rankMisses([
     m('The agent did not miss the feedback, it was about another PR', 0.9),
-    m('Missed the exists=true filter in src/context-graph/internal/page.go', 0.66),
-    m('Missed the admin gate in src/webapp/core/src/features/settings/usage.ts', 0.6),
+    m('Missed the exists=true filter in src/context-graph/internal/page.go', 0.86),
+    m('Missed the admin gate in src/webapp/core/src/features/settings/usage.ts', 0.8),
     m('Missed a Brotli CVE bump', 0.2),
   ], 4, ['src/webapp/core/src/features/settings/users/router.ts']);
   expect(ranked.map((x) => x.missId)).toEqual([
@@ -102,11 +102,11 @@ test('servicesInTask finds the services a task names by their folder, never a ge
 
 test('with no files named, the services the task names rank their facts and misses up and other services\' down', () => {
   const at = (statement: string, path: string, score: number): FactHit => ({ fact: { id: statement, statement, path, relevance: 0.8, relevanceBy: 'model' } as StoredFact, score });
-  const facts = [at('graph pages are byte offsets', 'src/context-graph/AGENTS.md', 0.62), at('settings pages use SettingsState', 'src/webapp/core/settings.ts', 0.58)];
+  const facts = [at('graph pages are byte offsets', 'src/context-graph/AGENTS.md', 0.86), at('settings pages use SettingsState', 'src/webapp/core/settings.ts', 0.82)];
   expect(rankFacts(facts, 5).map((h) => h.fact.id)[0]).toBe('graph pages are byte offsets');
   expect(rankFacts(facts, 5, [], ['src/webapp']).map((h) => h.fact.id)[0]).toBe('settings pages use SettingsState');
   const m = (missed: string, score: number) => ({ missId: missed, missed, feedbackText: '', score });
-  const misses = [m('Missed the filter in src/context-graph/internal/page.go', 0.62), m('Missed the admin gate in src/webapp/core/usage.ts', 0.58)];
+  const misses = [m('Missed the filter in src/context-graph/internal/page.go', 0.86), m('Missed the admin gate in src/webapp/core/usage.ts', 0.82)];
   expect(rankMisses(misses, 4, [], ['src/webapp'])[0].missId).toMatch(/webapp/);
   // Named files win over words: the services are only a guess.
   expect(rankMisses(misses, 4, ['src/context-graph/internal/x.go'], ['src/webapp'])[0].missId).toMatch(/context-graph/);
@@ -149,4 +149,21 @@ test('everyday is the minority of a realistic set: a generous model\'s scores ar
   // Unscored facts stay unscored; a small set keeps its one everyday fact.
   expect(calibrateRelevance([{ kind: 'api', path: 'a.ts', relevance: null }])).toEqual([{ kind: 'api', path: 'a.ts', relevance: null }]);
   expect(calibrateRelevance([{ kind: 'invariant', path: '.', relevance: 0.9 }, { kind: 'api', path: 'a.ts', relevance: 0.5 }]).map((f) => f.relevance)).toEqual([0.9, 0.5]);
+});
+
+test('the empirical similarity floor drops facts and misses just below .78', () => {
+  expect(rankFacts([hit('irrelevant', 0.779, 1)], 10)).toEqual([]);
+  expect(rankMisses([{ missed: 'irrelevant', feedbackText: '', score: 0.779 }], 4)).toEqual([]);
+  expect(rankMisses([{ missed: 'relevant', feedbackText: '', score: 0.78 }], 4)).toHaveLength(1);
+});
+
+
+test('an embedder-calibrated floor is explicit and preserves scores; the semantic default stays 0.78', () => {
+  const fact = hit('lexical match', 0.2, 1);
+  const miss = { missed: 'lexical miss', feedbackText: 'check the migration', score: 0.2 };
+  expect(rankFacts([fact], 5)).toEqual([]);
+  expect(rankMisses([miss], 5)).toEqual([]);
+  expect(rankFacts([fact], 5, [], [], 0.05)[0].score).toBe(0.2);
+  expect(rankMisses([miss], 5, [], [], 0.05)[0].score).toBe(0.2);
+  expect(rankFacts([hit('below lexical gate', 0.04, 1)], 5, [], [], 0.05)).toEqual([]);
 });

@@ -145,7 +145,7 @@ export function searchLessonsQuery(db: Db, q: { embedding: number[]; projectKey:
   return {
     sql: `SELECT x.*, 1 - x.distance / 2 AS score
           FROM (SELECT l.*, ${v.distance} AS distance FROM lessons l
-                WHERE l.status = $2 AND (l.project_key IS NULL OR l.project_key = $3) AND ${learnedIn('l', '$5')} AND ${runFilter('l', '$6', o)} AND ${v.where}
+                WHERE l.status = $2 AND NOT coalesce(l.checks @> '[{"name":"no-miss"}]'::jsonb, false) AND (l.project_key IS NULL OR l.project_key = $3) AND ${learnedIn('l', '$5')} AND ${runFilter('l', '$6', o)} AND ${v.where}
                 ORDER BY ${v.distance}, l.id LIMIT $4) x
           ORDER BY score DESC, x.id`,
     params: [vectorParam(q.embedding), q.status ?? 'approved', q.projectKey, q.k, q.projectKeys ?? null, q.run ?? null],

@@ -5,7 +5,7 @@ import { Admission } from './admission.ts';
 
 const roots = [{ host: '/Users/j/Vibe', container: '/vibe' }];
 const lesson = (id: string, title: string, over: Partial<Lesson> = {}): Lesson => ({
-  id, projectKey: 'demo', title, rule: `${title} rule`, appliesWhen: 'search', scope: 'project', paths: [],
+  id, projectKey: 'demo', title, rule: `${title} rule`, appliesWhen: 'search', scope: 'project', paths: ['src/routes/orders.ts'],
   status: 'approved', source: 'postmortem', cause: 'requirement_unstated', missId: `miss:${id}`, createdAt: 't', decidedAt: 't', ...over,
 });
 
@@ -43,7 +43,7 @@ test('resolveProject resolves a repo nested in a folder that is not a repo, by c
 });
 
 test('getTaskContext lists lessons and past misses with citations', async () => {
-  const r = await getTaskContext({ cwd: '/Users/j/Vibe/demo', task: 'build order search' }, deps());
+  const r = await getTaskContext({ files: ['src/routes/orders.ts'], cwd: '/Users/j/Vibe/demo', task: 'build order search' }, deps());
   expect(r.lessons[0].lesson.id).toBe('l1');
   expect(r.markdown).toContain('Server-side search rule');
   expect(r.markdown).toContain('lesson l1');
@@ -60,7 +60,7 @@ test('getTaskContext says so when the project is unknown', async () => {
 
 test('checkBeforeDone reports gaps and records the check', async () => {
   const d = deps();
-  const r = await checkBeforeDone({ project: 'demo', task: 'order search', summary: 'added search UI' }, d);
+  const r = await checkBeforeDone({ filesChanged: ['src/routes/orders.ts'], project: 'demo', task: 'order search', summary: 'added search UI' }, d);
   expect(r.gaps).toEqual([{ lessonId: 'l1', title: 'Server-side search', rule: 'Server-side search rule', why: 'filters in the browser' }]);
   expect(r.markdown).toContain('Server-side search');
   expect(d.checks).toHaveLength(1);
@@ -72,7 +72,7 @@ test('checkBeforeDone behind other checks says how many it waited behind, and st
   let release!: () => void;
   const busy = judgeQueue.run(() => new Promise<void>((r) => { release = r; }));
   const d = deps({ judgeQueue });
-  const pending = checkBeforeDone({ project: 'demo', task: 'order search', summary: 'added search UI' }, d);
+  const pending = checkBeforeDone({ filesChanged: ['src/routes/orders.ts'], project: 'demo', task: 'order search', summary: 'added search UI' }, d);
   setTimeout(() => release(), 20);
   const r = await pending;
   await busy;
@@ -86,7 +86,7 @@ test('checkBeforeDone answers at once, deterministically, when the judge cannot 
   let release!: () => void;
   const busy = judgeQueue.run(() => new Promise<void>((r) => { release = r; }));
   const d = deps({ judgeQueue });
-  const r = await checkBeforeDone({ project: 'demo', task: 'order search', summary: 'added search UI' }, d);
+  const r = await checkBeforeDone({ filesChanged: ['src/routes/orders.ts'], project: 'demo', task: 'order search', summary: 'added search UI' }, d);
   release();
   await busy;
   expect(r.gaps).toEqual([]);
@@ -176,11 +176,11 @@ test('getTaskContext asks for extra facts and serves them by relevance: a rare s
     facts: {
       searchFacts: async (q) => {
         asked = q.k;
-        return [{ fact: f('f1', 'Install the profiler app and point it at port 9000', 0.1), score: 0.75 }, { fact: f('f2', 'Every query is scoped by orgId', 0.9), score: 0.7 }];
+        return [{ fact: f('f1', 'Install the profiler app and point it at port 9000', 0.1), score: 0.75 }, { fact: f('f2', 'Every query is scoped by orgId', 0.9), score: 0.8 }];
       },
     },
   });
-  const r = await getTaskContext({ project: 'demo', task: 'add orders list' }, d);
+  const r = await getTaskContext({ files: ['src/routes/orders.ts'], project: 'demo', task: 'add orders list' }, d);
   expect(asked).toBeGreaterThan(10);
   expect(r.markdown).toContain('Every query is scoped by orgId');
   expect(r.markdown).not.toContain('profiler');
@@ -243,18 +243,18 @@ test('resolveProject rejects keys that could escape the root', () => {
 
 test('getTaskContext logs what it served the agent, so you can see which lessons and facts it was given', async () => {
   const recorded: ActivityInput[] = [];
-  await getTaskContext({ project: 'demo', task: 'build order search', client: 'claude-code' }, deps({ activity: { record: async (a) => { recorded.push(a); } } }));
+  await getTaskContext({ files: ['src/routes/orders.ts'], project: 'demo', task: 'build order search', client: 'claude-code' }, deps({ activity: { record: async (a) => { recorded.push(a); } } }));
   expect(recorded).toEqual([{
     kind: 'context_served', actor: 'claude-code', projectKey: 'demo', subject: 'context for "build order search": 1 lesson, 1 past miss, 0 facts',
     why: 'an agent called get_task_context before starting the task',
-    details: { task: 'build order search', lessons: [{ id: 'l1', title: 'Server-side search', score: 0.91 }], misses: [{ id: 'm1', missed: 'client-side filtering' }], facts: [] },
+    details: { task: 'build order search', files: ['src/routes/orders.ts'], lessons: [{ id: 'l1', title: 'Server-side search', score: 0.91 }], misses: [{ id: 'm1', missed: 'client-side filtering' }], facts: [] },
     targets: ['l1', 'm1'],
   }]);
 });
 
 test('checkBeforeDone logs every verdict with the judge model and its reasons', async () => {
   const recorded: ActivityInput[] = [];
-  await checkBeforeDone({ project: 'demo', task: 'order search', summary: 'added search UI' }, deps({ judgeId: 'ollama:gemma4', activity: { record: async (a) => { recorded.push(a); } } }));
+  await checkBeforeDone({ filesChanged: ['src/routes/orders.ts'], project: 'demo', task: 'order search', summary: 'added search UI' }, deps({ judgeId: 'ollama:gemma4', activity: { record: async (a) => { recorded.push(a); } } }));
   expect(recorded[0]).toMatchObject({
     kind: 'predone_check', actor: 'ollama:gemma4', projectKey: 'demo', subject: 'pre-done check on "order search": 1 gap',
     details: { summary: 'added search UI', verdicts: [{ lessonId: 'l1', title: 'Server-side search', status: 'not_addressed', why: 'filters in the browser' }] },
@@ -319,13 +319,14 @@ test('makeJudge shows the model short ids and maps its answers back to lesson id
   expect(user).not.toContain('lesson:aaaa-1111');
 });
 
-test('a lesson the judge gave no verdict for is reported as a gap, never passed silently', async () => {
-  const r = await checkBeforeDone({ project: 'demo', task: 'order search', summary: 's' }, deps({ judge: async () => [] }));
-  expect(r.gaps).toEqual([{ lessonId: 'l1', title: 'Server-side search', rule: 'Server-side search rule', why: 'the judge gave no verdict for this lesson; check it yourself' }]);
+test('a lesson the judge gave no verdict for is undecided, never a gap', async () => {
+  const r = await checkBeforeDone({ filesChanged: ['src/routes/orders.ts'], project: 'demo', task: 'order search', summary: 's' }, deps({ judge: async () => [] }));
+  expect(r.gaps).toEqual([]);
+  expect(r.cannotTell?.map((x) => x.lessonId)).toEqual(['l1']);
 });
 
 test('several verdicts for one lesson become one gap with all the reasons', async () => {
-  const r = await checkBeforeDone({ project: 'demo', task: 't', summary: 's' }, deps({
+  const r = await checkBeforeDone({ filesChanged: ['src/routes/orders.ts'], project: 'demo', task: 't', summary: 's' }, deps({
     judge: async () => [
       { lessonId: 'l1', status: 'not_addressed', why: 'no sort order' },
       { lessonId: 'l1', status: 'not_addressed', why: 'no cross-tenant test' },
@@ -348,7 +349,7 @@ test('past misses and code facts are fenced as data and cannot inject sections',
     k: { ...deps().k, relatedMisses: async () => [{ missId: 'm1', missed: evil, cause: 'requirement_unstated', feedbackText: evil, sessionId: 's1', ts: '2026-10-01T10:00:00Z', score: 0.8 }] },
     facts: { searchFacts: async () => [{ fact: { id: 'f', projectKey: 'demo', path: 'a.ts', lines: '1', kind: 'convention', statement: evil, why: 'w', confidence: 1, source: 'ollama:gemma4', createdAt: 't', scanJobId: null, fileHash: null, fileSummary: null, relevance: null, relevanceBy: null, docId: null }, score: 0.9 }] },
   });
-  const r = await getTaskContext({ project: 'demo', task: 't' }, d);
+  const r = await getTaskContext({ files: ['src/routes/orders.ts'], project: 'demo', task: 't' }, d);
   const headings = r.markdown.split('\n').filter((l) => l.startsWith('## '));
   expect(headings).toEqual(['## Approved lessons (follow these)', '## Similar past misses in this project', '## Codebase facts relevant to this task (from the code scan and your documents)']);
   // said once, at the top, for every section
@@ -382,15 +383,15 @@ test('a cwd in a second clone of a project resolves to the project it is an alia
   const aliasOf = async (key: string) => (key === 'demo-2' ? { key: 'demo', name: 'demo', repoPath: '/vibe/demo', remote: 'github.com/org/demo' } : null);
   const d = deps({ aliasOf });
   d.k = { ...d.k, searchLessons: async (q) => { searched.push(q.projectKey ?? ''); return [{ lesson: lesson('l1', 'Server-side search'), score: 0.9 }]; } };
-  const ctx = await getTaskContext({ cwd: '/Users/j/Vibe/demo-2/src', task: 'order search' }, d);
+  const ctx = await getTaskContext({ files: ['src/routes/orders.ts'], cwd: '/Users/j/Vibe/demo-2/src', task: 'order search' }, d);
   expect(ctx.markdown).toContain('in demo\n');
-  await checkBeforeDone({ cwd: '/Users/j/Vibe/demo-2', task: 'order search', summary: 'added search UI' }, d);
+  await checkBeforeDone({ filesChanged: ['src/routes/orders.ts'], cwd: '/Users/j/Vibe/demo-2', task: 'order search', summary: 'added search UI' }, d);
   expect(d.checks[0]).toMatchObject({ projectKey: 'demo' });
   await reportFeedback({ cwd: '/Users/j/Vibe/demo-2', feedback: 'no', whatWasDone: 'x' }, d);
   expect(d.manual[0]).toMatchObject({ project: { key: 'demo' }, cwd: '/Users/j/Vibe/demo-2' });
   expect(searched).toEqual(['demo', 'demo']);
   // A folder that is no one's alias is still its own project.
-  expect((await getTaskContext({ cwd: '/Users/j/Vibe/other', task: 't' }, d)).markdown).toContain('in other\n');
+  expect((await getTaskContext({ files: ['src/routes/orders.ts'], cwd: '/Users/j/Vibe/other', task: 't' }, d)).markdown).toContain('in other\n');
 });
 
 test('an alias of a project left out by INGEST_PROJECTS / EXCLUDE_PROJECTS gets no context', async () => {
@@ -428,21 +429,21 @@ describe('global lessons in folders that are not selected', () => {
     const { d, asked, recorded } = unselected();
     const r = await getTaskContext({ cwd: '/Users/j/Vibe/side-project/src', task: 'add a flag, with tests' }, d);
     expect(asked).toEqual(['lessons:null']);
-    expect(r.lessons.map((h) => h.lesson.id)).toEqual(['g1']);
-    expect(r.markdown).toContain('Run the tests before saying done rule');
+    expect(r.lessons.map((h) => h.lesson.id)).toEqual([]);
+    expect(r.markdown).not.toContain('Run the tests before saying done rule');
     expect(r.markdown).toMatch(/side-project is not selected/);
     expect(r.markdown).toMatch(/Settings/);
     expect(r.misses).toEqual([]);
     // Activity notes that global lessons were served, never the task, nor which unselected folder asked.
-    expect(recorded).toEqual([expect.objectContaining({ kind: 'context_served', projectKey: null, targets: ['g1'], details: { globalOnly: true, project: 'unselected', lessons: ['g1'] } })]);
+    expect(recorded).toEqual([expect.objectContaining({ kind: 'context_served', projectKey: null, targets: [], details: { globalOnly: true, project: 'unselected', lessons: [] } })]);
     expect(JSON.stringify(recorded)).not.toMatch(/add a flag|side-project/);
   });
 
   test('get_task_context with brief and search_graph there record no task, query or folder either', async () => {
     const { d, recorded } = unselected();
     // On the global lesson's topic (tests), so it is served (a global lesson off the task's topic is not).
-    expect((await getTaskContext({ cwd: '/Users/j/Vibe/side-project', task: 'add a flag and run the tests', brief: true }, d)).lessons.map((h) => h.lesson.id)).toEqual(['g1']);
-    expect((await searchGraph({ cwd: '/Users/j/Vibe/side-project', query: 'add a flag and run the tests' }, d)).markdown).toContain('Run the tests before saying done');
+    expect((await getTaskContext({ files: ['src/routes/orders.ts'], cwd: '/Users/j/Vibe/side-project', task: 'add a flag and run the tests', brief: true }, d)).lessons.map((h) => h.lesson.id)).toEqual([]);
+    expect((await searchGraph({ cwd: '/Users/j/Vibe/side-project', query: 'add a flag and run the tests' }, d)).markdown).not.toContain('Run the tests before saying done');
     expect(recorded).toHaveLength(2);
     expect(recorded.every((a) => a.projectKey === null && a.details?.project === 'unselected')).toBe(true);
     expect(JSON.stringify(recorded)).not.toMatch(/add a flag|side-project/);
@@ -461,9 +462,9 @@ describe('global lessons in folders that are not selected', () => {
     expect(judged).toEqual([]);
     expect(checks).toEqual([]);
     expect(r.gaps).toEqual([]);
-    expect(r.markdown).toMatch(/not judged: side-project is not selected/i);
-    expect(r.markdown).toContain('Run the tests before saying done');
-    expect(recorded).toEqual([expect.objectContaining({ kind: 'predone_check', projectKey: null, targets: ['g1'], details: { globalOnly: true, project: 'unselected', lessons: ['g1'] } })]);
+    expect(r.markdown).toMatch(/No past lessons apply/i);
+    expect(r.markdown).not.toContain('Run the tests before saying done');
+    expect(recorded).toEqual([]);
     expect(JSON.stringify(recorded)).not.toMatch(/add a flag|added the flag|side-project|diff --git/);
   });
 
@@ -512,10 +513,10 @@ test('lessons whose paths match the files the agent will touch rank first, even 
   // relative to the cwd, absolute inside the project; anything outside it is dropped
   expect(asked).toEqual([['src/db/pool.ts', 'README.md']]);
   expect(r.lessons.map((h) => [h.lesson.id, h.files ?? []])).toEqual([
-    ['l2', ['src/db/pool.ts']], ['l3', ['src/db/pool.ts']], ['l1', []],
+    ['l2', ['src/db/pool.ts']], ['l3', ['src/db/pool.ts']],
   ]);
   expect(r.markdown).toMatch(/Pool connections[\s\S]*touches src\/db\/pool\.ts/);
-  expect(r.markdown.indexOf('Pool connections')).toBeLessThan(r.markdown.indexOf('Server-side search'));
+  expect(r.lessons.map((h) => h.lesson.id)).not.toContain('l1');
 });
 
 test('check_before_done judges what get_task_context would serve: no off-topic global lesson, none under the floor, but a lesson tied to a changed file however it scored', async () => {
@@ -534,7 +535,7 @@ test('check_before_done judges what get_task_context would serve: no off-topic g
     judge: async (_w, ls) => { judged.push(ls.map((h) => h.lesson.id)); return []; },
   });
   await checkBeforeDone({ cwd: '/Users/j/Vibe/demo', task: 'add pagination to the members list', summary: 'added a cursor', filesChanged: ['src/db/pool.ts'] }, d);
-  expect(judged).toEqual([['l-pool', 'l-own']]);
+  expect(judged).toEqual([['l-pool']]);
 });
 
 test('a diff over the judge\'s budget keeps the files the judged lessons (or misses) name first, and says which were cut', async () => {
@@ -547,7 +548,7 @@ test('a diff over the judge\'s budget keeps the files the judged lessons (or mis
     k: { ...deps().k, searchLessons: async () => [{ lesson: pooled, score: 0.8 }] },
     judge: async (w) => { seen.push(w.diff ?? ''); return [{ lessonId: 'l-pool', status: 'addressed', applies: true, why: 'released in finally' }]; },
   });
-  const r = await checkBeforeDone({ project: 'demo', task: 'tune the pool', summary: 'pool size', diff }, d);
+  const r = await checkBeforeDone({ filesChanged: ['src/db/pool.ts'], project: 'demo', task: 'tune the pool', summary: 'pool size', diff }, d);
   expect(seen[0]).toContain('diff --git a/src/db/pool.ts');
   expect(seen[0].indexOf('src/db/pool.ts')).toBeLessThan(seen[0].indexOf('web/page0.tsx'));
   expect(r.markdown).toMatch(/files not shown: web\/page/);
@@ -557,7 +558,7 @@ test('a diff over the judge\'s budget keeps the files the judged lessons (or mis
     k: { ...deps().k, searchLessons: async () => [], relatedMisses: async () => [{ missId: 'm1', missed: 'left a client checked out in src/db/pool.ts', cause: 'implementation_error', feedbackText: 'leak', sessionId: 's1', ts: '2026-10-01T10:00:00Z', score: 0.8 }] },
     judge: async (w) => { misses.push(w.diff ?? ''); return []; },
   });
-  await checkBeforeDone({ project: 'demo', task: 'tune the pool', summary: 'pool size', diff }, m);
+  await checkBeforeDone({ filesChanged: ['src/db/pool.ts'], project: 'demo', task: 'tune the pool', summary: 'pool size', diff }, m);
   expect(misses[0]).toContain('diff --git a/src/db/pool.ts');
 });
 
@@ -574,20 +575,20 @@ test('a global lesson about another topic is not served however the embedding sc
   const d = deps({ k: { ...deps().k, searchLessons: async () => [{ lesson: retention, score: 0.77 }, { lesson: cursor, score: 0.74 }, { lesson: own, score: 0.7 }] } });
   const task = 'add pagination to the members list';
   const r = await getTaskContext({ cwd: '/Users/j/Vibe/demo', task }, d);
-  expect(r.lessons.map((h) => h.lesson.id)).toEqual(['g-cursor', 'l-own']);
+  expect(r.lessons.map((h) => h.lesson.id)).toEqual([]);
   expect(r.markdown).not.toContain('retention');
   const brief = await getTaskContext({ cwd: '/Users/j/Vibe/demo', task, brief: true }, d);
-  expect(brief.lessons.map((h) => h.lesson.id)).toEqual(['g-cursor', 'l-own']);
+  expect(brief.lessons.map((h) => h.lesson.id)).toEqual([]);
 });
 
-test('without files, or without a code graph, lessons rank by the search alone', async () => {
+test('without file ties, semantic matches are never served as rules', async () => {
   let called = false;
   const d = deps({ codegraph: { lessonsForPaths: async () => { called = true; return []; } } });
   const r = await getTaskContext({ cwd: '/Users/j/Vibe/demo', task: 'search' }, d);
   expect(called).toBe(false);
-  expect(r.lessons.map((h) => h.lesson.id)).toEqual(['l1']);
+  expect(r.lessons.map((h) => h.lesson.id)).toEqual([]);
   const r2 = await getTaskContext({ cwd: '/Users/j/Vibe/demo', task: 'search', files: ['a.ts'] }, deps());
-  expect(r2.lessons.map((h) => h.lesson.id)).toEqual(['l1']);
+  expect(r2.lessons.map((h) => h.lesson.id)).toEqual([]);
 });
 
 describe('lessons learned in a project that is not selected are never served to agents', () => {
@@ -618,10 +619,10 @@ describe('lessons learned in a project that is not selected are never served to 
   test('get_task_context and check_before_done search only lessons learned in the selected projects', async () => {
     const { d, asked } = scoped();
     const r = await getTaskContext({ cwd: '/Users/j/Vibe/demo', task: 'add search', files: ['src/a.ts'] }, d);
-    expect(r.lessons.map((h) => h.lesson.id)).toEqual(['l1', 'g-any']);
-    await checkBeforeDone({ project: 'demo', task: 't', summary: 's' }, d);
+    expect(r.lessons.map((h) => h.lesson.id)).toEqual(['l1']);
+    await checkBeforeDone({ filesChanged: ['src/routes/orders.ts'], project: 'demo', task: 't', summary: 's' }, d);
     // A folder that is not selected gets global lessons, still only ones learned in a selected project.
-    await getTaskContext({ cwd: '/Users/j/Vibe/elsewhere', task: 't' }, d);
+    await getTaskContext({ files: ['src/routes/orders.ts'], cwd: '/Users/j/Vibe/elsewhere', task: 't' }, d);
     expect(asked).toEqual([['demo'], ['demo'], ['demo']]);
   });
 
@@ -664,11 +665,11 @@ describe('linked projects', () => {
           },
           relatedMisses: async (q) => {
             searched.push({ what: 'misses', projectKey: q.projectKey });
-            return q.projectKey === 'api' ? [{ missId: 'ma', missed: 'broke the v1 response shape', cause: 'context_missing', feedbackText: 'you broke the app', sessionId: 'sa', ts: '2026-10-02T10:00:00Z', score: 0.7 }] : [];
+            return q.projectKey === 'api' ? [{ missId: 'ma', missed: 'broke the v1 response shape', cause: 'context_missing', feedbackText: 'you broke the app', sessionId: 'sa', ts: '2026-10-02T10:00:00Z', score: 0.8 }] : [];
           },
         },
         facts: { searchFacts: async (q) => (q.projectKey === 'api' ? [{ fact: fact('fa', 'Responses are wrapped in { data, error }'), score: 0.8 }, { fact: fact('fs', 'Install the API profiler', 0.05), score: 0.7 }] : []) },
-        docs: { searchDocs: async (q) => (q.projectKey === 'api' ? [{ docId: 'd', source: 'upload', ref: 'api.md', title: 'API guide', url: null, text: 'All routes need a bearer token.', score: 0.7 }] : []) },
+        docs: { searchDocs: async (q) => (q.projectKey === 'api' ? [{ docId: 'd', source: 'upload', ref: 'api.md', title: 'API guide', url: null, text: 'All routes need a bearer token.', score: 0.8 }] : []) },
         ...over,
       }),
     };
@@ -704,11 +705,11 @@ describe('linked projects', () => {
     expect(logged[0].details).toMatchObject({ linked: [{ project: 'api', lessons: ['la'], misses: ['ma'], facts: ['fa'] }] });
   });
 
-  test('checkBeforeDone also checks the work against the linked projects\' lessons', async () => {
+  test('checkBeforeDone does not judge semantic pointers from linked projects', async () => {
     const judged: string[][] = [];
     const t = linkedDeps([link('api', 'demo', 'confirmed')], { judge: async (_w, ls) => { judged.push(ls.map((h) => h.lesson.id)); return ls.map((h) => ({ lessonId: h.lesson.id, status: 'addressed' as const, why: 'ok' })); } });
     await checkBeforeDone({ project: 'demo', task: 'orders', summary: 'built it on the api' }, t.d);
-    expect(judged[0]).toEqual(['l1', 'la']);
+    expect(judged).toEqual([]);
   });
 });
 
@@ -800,7 +801,7 @@ describe('lesson counts: the project\'s own and the global ones, each said for w
 describe('check_before_done: the judge says whether each lesson or miss applies', () => {
   const proposed = (n: number) => Array.from({ length: n }, (_, i) => lesson(`p${i}`, `Proposed ${i}`, { status: 'proposed' }));
   const noneApproved = { ...deps().k, searchLessons: async () => [], listLessons: async (f: { status?: string }) => (f.status === 'proposed' ? proposed(141) : []) } as ContextDeps['k'];
-  const fourMisses = async () => ['cold start verify', 'input capping', 'router history desync', 'asset prefixes'].map((missed, i) => ({ missId: `m${i}`, missed, cause: 'requirement_unstated' as const, feedbackText: 'x', sessionId: 's', ts: '2026-10-01T10:00:00Z', score: 0.6 }));
+  const fourMisses = async () => ['cold start verify', 'input capping', 'router history desync', 'asset prefixes'].map((missed, i) => ({ missId: `m${i}`, missed, cause: 'requirement_unstated' as const, feedbackText: 'x', sessionId: 's', ts: '2026-10-01T10:00:00Z', score: 0.8 }));
 
   test('misses the judge says do not apply are never printed, and the answer says plainly it is not a pass', async () => {
     const d = deps({
@@ -836,7 +837,7 @@ describe('check_before_done: the judge says whether each lesson or miss applies'
       k: { ...noneApproved, relatedMisses: fourMisses },
       judge: async (_w, ls) => ls.map((h, i) => ({ lessonId: h.lesson.id, status: 'not_addressed' as const, applies: i === 1, why: i === 1 ? 'the input is still uncapped' : 'unrelated' })),
     });
-    const r = await checkBeforeDone({ project: 'demo', task: 'chat input', summary: 's' }, d);
+    const r = await checkBeforeDone({ filesChanged: ['src/routes/orders.ts'], project: 'demo', task: 'chat input', summary: 's' }, d);
     expect(r.gaps.map((g) => g.lessonId)).toEqual(['m1']);
     expect(r.markdown).toMatch(/# 1 possible gap/);
     expect(r.markdown).toContain('input capping');
@@ -844,7 +845,7 @@ describe('check_before_done: the judge says whether each lesson or miss applies'
   });
 
   test('a verdict whose reason says the lesson does not apply is not a gap, even without applies', async () => {
-    const r = await checkBeforeDone({ project: 'demo', task: 't', summary: 's' }, deps({ judge: async () => [{ lessonId: 'l1', status: 'not_addressed', why: 'This lesson does not apply: the work is about markdown, not search' }] }));
+    const r = await checkBeforeDone({ filesChanged: ['src/routes/orders.ts'], project: 'demo', task: 't', summary: 's' }, deps({ judge: async () => [{ lessonId: 'l1', status: 'not_addressed', why: 'This lesson does not apply: the work is about markdown, not search' }] }));
     expect(r.gaps).toEqual([]);
     expect(r.markdown).toMatch(/none of the 1 lesson checked applies to this work/i);
     expect(r.markdown).not.toContain('Server-side search rule');
@@ -852,23 +853,23 @@ describe('check_before_done: the judge says whether each lesson or miss applies'
 
   test('a reason about the code that happens to say "does not apply" is still a gap: applies wins when given', async () => {
     const why = 'The new handler does not apply input validation';
-    const given = await checkBeforeDone({ project: 'demo', task: 't', summary: 's' }, deps({ judge: async () => [{ lessonId: 'l1', status: 'not_addressed', applies: true, why }] }));
+    const given = await checkBeforeDone({ filesChanged: ['src/routes/orders.ts'], project: 'demo', task: 't', summary: 's' }, deps({ judge: async () => [{ lessonId: 'l1', status: 'not_addressed', applies: true, why }] }));
     expect(given.gaps.map((g) => g.lessonId)).toEqual(['l1']);
     expect(given.markdown).toMatch(/# 1 possible gap/);
     // Without applies the text fallback reads only sentences about the lesson itself, never about the code.
-    const absent = await checkBeforeDone({ project: 'demo', task: 't', summary: 's' }, deps({ judge: async () => [{ lessonId: 'l1', status: 'not_addressed', why }] }));
+    const absent = await checkBeforeDone({ filesChanged: ['src/routes/orders.ts'], project: 'demo', task: 't', summary: 's' }, deps({ judge: async () => [{ lessonId: 'l1', status: 'not_addressed', why }] }));
     expect(absent.gaps.map((g) => g.lessonId)).toEqual(['l1']);
     for (const other of ['The code is unrelated to caching but skips the null check', 'the lookup is not relevant here yet the diff drops the guard'])
-      expect((await checkBeforeDone({ project: 'demo', task: 't', summary: 's' }, deps({ judge: async () => [{ lessonId: 'l1', status: 'not_addressed', why: other }] }))).gaps).toHaveLength(1);
+      expect((await checkBeforeDone({ filesChanged: ['src/routes/orders.ts'], project: 'demo', task: 't', summary: 's' }, deps({ judge: async () => [{ lessonId: 'l1', status: 'not_addressed', why: other }] }))).gaps).toHaveLength(1);
   });
 
   test('without applies, a reason that explains the lesson or miss itself away is not a gap', async () => {
     for (const why of ['This lesson does not apply here', 'The miss is unrelated to this change', 'Not relevant to this work', 'unrelated', 'The rule is not applicable: settings page only']) {
-      const r = await checkBeforeDone({ project: 'demo', task: 't', summary: 's' }, deps({ judge: async () => [{ lessonId: 'l1', status: 'not_addressed', why }] }));
+      const r = await checkBeforeDone({ filesChanged: ['src/routes/orders.ts'], project: 'demo', task: 't', summary: 's' }, deps({ judge: async () => [{ lessonId: 'l1', status: 'not_addressed', why }] }));
       expect(r.gaps, why).toEqual([]);
     }
     // applies: true is trusted even over such a sentence.
-    const r = await checkBeforeDone({ project: 'demo', task: 't', summary: 's' }, deps({ judge: async () => [{ lessonId: 'l1', status: 'not_addressed', applies: true, why: 'unrelated' }] }));
+    const r = await checkBeforeDone({ filesChanged: ['src/routes/orders.ts'], project: 'demo', task: 't', summary: 's' }, deps({ judge: async () => [{ lessonId: 'l1', status: 'not_addressed', applies: true, why: 'unrelated' }] }));
     expect(r.gaps).toHaveLength(1);
   });
 
@@ -887,12 +888,12 @@ describe('check_before_done: the judge says whether each lesson or miss applies'
     });
     await checkBeforeDone({ cwd: '/Users/j/Vibe/demo', task: 'pool', summary: 's', filesChanged: ['src/db/pool.ts'] }, d);
     expect(asked).toEqual([['src/db/pool.ts']]);
-    expect(judged).toEqual(['l2', 'l3', 'l1']);
+    expect(judged).toEqual(['l3', 'l2']);
   });
 
   test('an approved lesson the judge says does not apply is not a gap either', async () => {
     const d = deps({ judge: async () => [{ lessonId: 'l1', status: 'not_addressed', applies: false, why: 'about search; this is a settings page' }] });
-    const r = await checkBeforeDone({ project: 'demo', task: 't', summary: 's' }, d);
+    const r = await checkBeforeDone({ filesChanged: ['src/routes/orders.ts'], project: 'demo', task: 't', summary: 's' }, d);
     expect(r.gaps).toEqual([]);
     expect(d.checks[0]).toMatchObject({ gapLessonIds: [] });
   });
@@ -995,8 +996,8 @@ describe('what reaches the agent: misses', () => {
   test('misses about the named files\' service rank above another service\'s', async () => {
     let asked = 0;
     const d = deps({ k: { ...deps().k, relatedMisses: async (q) => { asked = q.k; return [
-      rm('mg', 'missed the exists=true filter in src/graph/internal/page.go', 0.66),
-      rm('mw', 'missed the admin gate in src/webapp/core/settings/usage.ts', 0.6),
+      rm('mg', 'missed the exists=true filter in src/graph/internal/page.go', 0.86),
+      rm('mw', 'missed the admin gate in src/webapp/core/settings/usage.ts', 0.8),
     ]; } } });
     const r = await getTaskContext({ project: 'demo', task: 'list members', files: ['src/webapp/core/settings/users/router.ts'] }, d);
     expect(asked).toBeGreaterThan(4);
@@ -1042,7 +1043,7 @@ index 3b18e51..a9c4f2d 100644
         ];
       },
     });
-    const r = await checkBeforeDone({ project: 'demo', task: 'orders export', summary: 'added export', diff: DIFF }, d);
+    const r = await checkBeforeDone({ filesChanged: ['src/routes/orders.ts'], project: 'demo', task: 'orders export', summary: 'added export', diff: DIFF }, d);
     expect(seen).toBe(DIFF);
     expect(r.gaps.map((g) => g.lessonId)).toEqual(['l1']);
     // The first matching line: the removed one in listOrders reads the same as the added one in exportOrders.
@@ -1059,7 +1060,7 @@ index 3b18e51..a9c4f2d 100644
         { lessonId: 'l2', status: 'not_addressed', applies: true, why: 'no pagination', evidence: ['rateLimit(req, res);'] },
       ],
     });
-    const r = await checkBeforeDone({ project: 'demo', task: 'orders export', summary: 'added export', diff: DIFF }, d);
+    const r = await checkBeforeDone({ filesChanged: ['src/routes/orders.ts'], project: 'demo', task: 'orders export', summary: 'added export', diff: DIFF }, d);
     expect(r.gaps).toEqual([]);
     expect(r.cannotTell?.map((c) => c.lessonId)).toEqual(['l1', 'l2']);
     expect(r.markdown).toMatch(/cannot tell from the diff/i);
@@ -1075,7 +1076,7 @@ index 3b18e51..a9c4f2d 100644
         { lessonId: 'l2', status: 'not_applicable', applies: false, why: 'about another feature' },
       ],
     });
-    const r = await checkBeforeDone({ project: 'demo', task: 't', summary: 's', diff: DIFF }, d);
+    const r = await checkBeforeDone({ filesChanged: ['src/routes/orders.ts'], project: 'demo', task: 't', summary: 's', diff: DIFF }, d);
     expect(r.gaps).toEqual([]);
     expect(r.cannotTell ?? []).toEqual([]);
     expect(r.markdown).toMatch(/none looks unaddressed/);
@@ -1107,7 +1108,7 @@ index 3b18e51..a9c4f2d 100644
 
   test('no diff and nothing to read it from: judged from the summary, and the answer says so', async () => {
     const d = withLessons({ judge: async () => [{ lessonId: 'l1', status: 'addressed', applies: true, why: 'the summary says so' }, { lessonId: 'l2', status: 'addressed', applies: true, why: 'ok' }] });
-    const r = await checkBeforeDone({ project: 'demo', task: 't', summary: 's' }, d);
+    const r = await checkBeforeDone({ filesChanged: ['src/routes/orders.ts'], project: 'demo', task: 't', summary: 's' }, d);
     expect(r.cannotTell ?? []).toEqual([]);
     expect(r.markdown).toMatch(/no diff/i);
     expect(r.markdown).toMatch(/summary only/i);
@@ -1145,7 +1146,7 @@ index 3b18e51..a9c4f2d 100644
   test('a catch whose line is quoted in its reason (no evidence field, as gemma4 answers) still cites the diff and is a gap', async () => {
     let calls = 0;
     const judge = makeJudge({ id: 'ollama:gemma4', agentic: false, json: async () => { calls++; return { verdicts: [gemmaCatch, gemmaPass] }; } });
-    const r = await checkBeforeDone({ project: 'demo', task: 'orders export', summary: 'added export', diff: DIFF }, withLessons({ judge }));
+    const r = await checkBeforeDone({ filesChanged: ['src/routes/orders.ts'], project: 'demo', task: 'orders export', summary: 'added export', diff: DIFF }, withLessons({ judge }));
     expect(calls).toBe(1);
     expect(r.gaps.map((g) => g.lessonId)).toEqual(['l1']);
     expect(r.gaps[0].evidence?.[0]).toMatchObject({ path: 'src/routes/orders.ts', line: "+  sendJson(res, 200, db.raw().list('orders'));" });
@@ -1159,7 +1160,7 @@ index 3b18e51..a9c4f2d 100644
       { verdicts: [{ ...gemmaCatch, why: 'exportOrders is not scoped', evidence: ["+  sendJson(res, 200, db.raw().list('orders'));"] }, gemmaPass] },
     ];
     const judge = makeJudge({ id: 'ollama:gemma4', agentic: false, json: async (t) => { systems.push(t.system); return answers[systems.length - 1]; } });
-    const r = await checkBeforeDone({ project: 'demo', task: 'orders export', summary: 'added export', diff: DIFF }, withLessons({ judge }));
+    const r = await checkBeforeDone({ filesChanged: ['src/routes/orders.ts'], project: 'demo', task: 'orders export', summary: 'added export', diff: DIFF }, withLessons({ judge }));
     expect(systems).toHaveLength(2);
     expect(systems[1]).toMatch(/evidence/);
     expect(systems[1]).toMatch(/L1/);
@@ -1169,7 +1170,7 @@ index 3b18e51..a9c4f2d 100644
   test('a second answer still without evidence is not an error: that verdict is cannot tell', async () => {
     let calls = 0;
     const judge = makeJudge({ id: 'ollama:gemma4', agentic: false, json: async () => { calls++; return { verdicts: [{ ...gemmaCatch, why: 'exportOrders is not scoped' }, gemmaPass] }; } });
-    const r = await checkBeforeDone({ project: 'demo', task: 'orders export', summary: 'added export', diff: DIFF }, withLessons({ judge }));
+    const r = await checkBeforeDone({ filesChanged: ['src/routes/orders.ts'], project: 'demo', task: 'orders export', summary: 'added export', diff: DIFF }, withLessons({ judge }));
     expect(calls).toBe(2);
     expect(r.cannotTell?.map((c) => c.lessonId)).toEqual(['l1']);
   });
@@ -1178,7 +1179,7 @@ index 3b18e51..a9c4f2d 100644
     const answers = ['Let me think about the lessons first.', JSON.stringify({ verdicts: [{ ...gemmaCatch, why: 'exportOrders is not scoped' }, gemmaPass] })];
     let calls = 0;
     const judge = makeJudge({ id: 'ollama:gemma4', agentic: false, json: async () => extractJsonAnswer(answers[calls++]) });
-    const r = await checkBeforeDone({ project: 'demo', task: 'orders export', summary: 'added export', diff: DIFF }, withLessons({ judge }));
+    const r = await checkBeforeDone({ filesChanged: ['src/routes/orders.ts'], project: 'demo', task: 'orders export', summary: 'added export', diff: DIFF }, withLessons({ judge }));
     expect(calls).toBe(2);
     expect(r.gaps).toEqual([]);
     expect(r.cannotTell?.map((c) => c.lessonId)).toEqual(['l1']);
@@ -1190,7 +1191,7 @@ index 3b18e51..a9c4f2d 100644
       judge: async () => { throw new Error('ollama 500: model crashed'); },
       activity: { record: async (a) => { recorded.push(a); } },
     });
-    const r = await checkBeforeDone({ project: 'demo', task: 'orders export', summary: 'added export', diff: DIFF }, d);
+    const r = await checkBeforeDone({ filesChanged: ['src/routes/orders.ts'], project: 'demo', task: 'orders export', summary: 'added export', diff: DIFF }, d);
     expect(r.markdown).toMatch(/^# Not judged: the judge failed \(ollama 500: model crashed\)/);
     expect(r.markdown).toContain('Tenant scoping');
     expect(r.markdown).toContain('Paginate lists');
@@ -1250,9 +1251,81 @@ index 3b18e51..a9c4f2d 100644
   test('a cut diff is always said, even when the judge found that no lesson applies', async () => {
     const extra = (name: string) => `diff --git a/src/${name}.ts b/src/${name}.ts\n--- a/src/${name}.ts\n+++ b/src/${name}.ts\n@@ -1 +1,700 @@\n${Array.from({ length: 700 }, (_, i) => `+export const ${name}${i} = ${i}; // ${'x'.repeat(10)}`).join('\n')}\n`;
     const d = withLessons({ judge: async () => [{ lessonId: 'l1', status: 'not_applicable', applies: false, why: 'another feature' }, { lessonId: 'l2', status: 'not_applicable', applies: false, why: 'another feature' }] });
-    const r = await checkBeforeDone({ project: 'demo', task: 't', summary: 's', diff: DIFF + extra('a') + extra('b') + extra('c') }, d);
+    const r = await checkBeforeDone({ filesChanged: ['src/routes/orders.ts'], project: 'demo', task: 't', summary: 's', diff: DIFF + extra('a') + extra('b') + extra('c') }, d);
     expect(r.markdown).toMatch(/None of the \d+ lessons? checked applies/);
     expect(r.markdown).toMatch(/files not shown: .*src\/c\.ts/);
     expect(r.markdown).toMatch(/[\d.]+ of [\d.]+ KB shown/);
   });
+});
+
+describe('0.6.4 serving and judge policy', () => {
+  test('a skipped file-tied lesson is undecided, never a possible gap', async () => {
+    const l = lesson('l1', 'Scoped search', { paths: ['src/orders.ts'] });
+    const d = deps({ k: { ...deps().k, searchLessons: async () => [{ lesson: l, score: 0.9 }] }, judge: async () => [] });
+    const r = await checkBeforeDone({ project: 'demo', task: 'search', summary: 'implemented', filesChanged: ['src/orders.ts'] }, d);
+    expect(r.gaps).toEqual([]);
+    expect(r.cannotTell?.map((x) => x.lessonId)).toEqual(['l1']);
+    expect(r.markdown).not.toContain('possible gap');
+  });
+
+  test('the commit own PR and session own PR are excluded in full and brief contexts', async () => {
+    const docs = [12, 34, 56].map((n) => ({ docId: `d${n}`, source: 'github' as const, ref: `github:acme/demo#${n}`, title: `PR ${n}`, url: null, text: 'review', score: 0.9 }));
+    const d = deps({ ownPrNumbers: async () => [12], docs: { searchDocs: async () => docs } });
+    for (const brief of [false, true]) {
+      const r = await getTaskContext({ project: 'demo', task: 'search', sessionId: 'github:acme/demo#34', brief }, d);
+      expect(r.docs.map((h) => h.ref)).toEqual(['github:acme/demo#56']);
+    }
+  });
+});
+
+
+test('task prose names file ties without a separate files field', async () => {
+  const d = deps();
+  const context = await getTaskContext({ project: 'demo', task: 'update src/routes/orders.ts' }, d);
+  expect(context.lessons.map((h) => h.lesson.id)).toContain('l1');
+  await checkBeforeDone({ project: 'demo', task: 'update src/routes/orders.ts', summary: 'updated orders' }, d);
+  expect(d.checks.length).toBe(1);
+});
+
+test('own PR lookup stays off for unselected projects, empty docs and upload-only docs', async () => {
+  let lookups = 0;
+  const ownPrNumbers = async () => { lookups++; return [12]; };
+  await getTaskContext({ project: 'demo', task: 'search' }, deps({ ownPrNumbers, docs: { searchDocs: async () => [] } }));
+  await getTaskContext({ project: 'demo', task: 'search' }, deps({ ownPrNumbers, docs: { searchDocs: async () => [{ docId: 'u', source: 'upload', ref: 'notes', title: 'Notes', url: null, text: 'text', score: 0.9 }] } }));
+  await getTaskContext({ project: 'demo', task: 'search' }, deps({ ownPrNumbers, inScope: () => false, servesGlobal: () => true, docs: { searchDocs: async () => { throw new Error('must not search'); } } }));
+  expect(lookups).toBe(0);
+});
+
+test('linked tickets cannot reintroduce the current commit PR', async () => {
+  const d = deps({
+    ownPrNumbers: async () => [12],
+    docs: {
+      searchDocs: async () => [{ docId: 't', source: 'linear', ref: 'linear:ENG-1', title: 'Ticket', url: null, text: 'ticket', score: 0.9 }],
+      linkedDocs: async () => [{ docId: 't', linked: { docId: 'p', source: 'github', ref: 'github:acme/demo#12', title: 'Own PR', url: null } }],
+    },
+  });
+  const r = await getTaskContext({ project: 'demo', task: 'search' }, d);
+  expect(r.markdown).not.toContain('Own PR');
+  expect(r.markdown).not.toContain('Linked tickets and pull requests');
+});
+
+
+test('context composition uses the embedder-calibrated floor for facts, misses and docs', async () => {
+  const make = (floor?: number) => {
+    const d = deps({ similarityFloor: floor });
+    d.k.searchLessons = async () => [];
+    d.k.relatedMisses = async () => [{ missId: 'lexical-miss', missed: 'Migration omitted', cause: 'verification_gap', feedbackText: 'Run migrations', sessionId: 's', ts: 't', score: 0.2 }];
+    d.facts = { searchFacts: async () => [{ fact: { id: 'lexical-fact', path: 'db/migrate.ts', statement: 'Migration command', relevance: 1 } as never, score: 0.2 }] };
+    d.docs = { searchDocs: async () => [{ id: 'lexical-doc', ref: 'migration-guide', title: 'Migration guide', text: 'Migration docs', source: 'upload', score: 0.2 } as never] };
+    return d;
+  };
+  const q = { project: 'demo', task: 'migrations' };
+  const semantic = await getTaskContext(q, make());
+  expect([semantic.facts.length, semantic.misses.length, semantic.docs.length]).toEqual([0, 0, 0]);
+  const lexical = await getTaskContext(q, make(0.05));
+  expect([lexical.facts.length, lexical.misses.length, lexical.docs.length]).toEqual([1, 1, 1]);
+  expect(lexical.misses[0].score).toBe(0.2);
+  const search = await searchGraph({ project: 'demo', query: 'migrations' }, make(0.05));
+  expect(search.markdown).toContain('Migration command');
+  expect(search.markdown).toContain('match 0.20');
 });

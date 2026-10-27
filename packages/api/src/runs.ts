@@ -2,7 +2,7 @@ import type { Hono } from 'hono';
 import { z } from 'zod';
 import { RUN_ID, RUN_ITEM_KINDS, runRemoval, type Activity, type ActivityKind, type ActivityStore, type Lesson, type ProjectLink, type RunItem, type RunItemKind, type RunOwner, type RunPrincipal, type RunsStore } from '@fb/core';
 import type { ContextDeps } from './context.ts';
-import { actingAsOperator, asActor, currentActor, currentRun } from './operator.ts';
+import { actingAsOperator, asActor, currentCaller, currentActor, currentRun } from './operator.ts';
 
 /**
  * Runs: a tester (an automated agent pushing the tool) labels its requests with a run id (x-fg-run, or ?run= on the
@@ -88,14 +88,13 @@ export const RUN_OPENERS: Record<RunPrincipal, string> = {
   operator: 'the operator token', owner_token: "the owner's API token", browser: 'the browser', agent: 'an agent without a token',
 };
 /** The same, naming the operator when the run recorded one. */
-export const openerOf = (o: RunOwner): string => (o.principal === 'operator' && o.actor ? `the operator token as ${o.actor}` : RUN_OPENERS[o.principal]);
+export const openerOf = (o: RunOwner): string => (o.principal === 'operator' && o.actor?.startsWith('run-key:') ? 'the operator token with a private run key' : o.principal === 'operator' && o.actor ? `the operator token as ${o.actor}` : RUN_OPENERS[o.principal]);
 
 /**
- * Whether a request (its principal, and with the operator token its name) is the caller that opened the run. An
- * operator run opened before names were recorded (actor null) is any operator name's, as it was.
+ * Whether a request holds the credential that opened the run. Legacy operator display names cannot authenticate it.
  */
 export const sameCaller = (o: RunOwner, principal: RunPrincipal, actor: string | null): boolean =>
-  o.principal === principal && (principal !== 'operator' || !o.actor || o.actor === actor);
+  o.principal === principal && (principal !== 'operator' || (!!actor && actor.startsWith('run-key:') && o.actor === actor));
 
 /** Activity kinds that change a record: one of these on a run's record, made outside the run, means someone else touched it. */
 const TOUCHES: ReadonlySet<ActivityKind> = new Set(['feedback_decided', 'lesson_decided', 'link_decided', 'fact_relevance_set', 'lesson_to_fact', 'doc_added', 'doc_removed']);
@@ -186,13 +185,13 @@ const summary = (counts: Record<RunItemKind, number>) =>
  */
 function operatorMayClean(owner: RunOwner | null): boolean {
   if (!owner) return false;
-  return owner.principal === 'agent' || sameCaller(owner, 'operator', currentActor());
+  return sameCaller(owner, 'operator', currentCaller());
 }
 
 /**
  * GET /api/runs/:id: the plan (a read). DELETE /api/runs/:id: a dry run unless the body says dryRun: false; owner-only
  * (OWNER_ROUTES), and the operator's run_cleanup verb is on by default because it removes only what a run wrote. The
- * operator token may clean up the runs it opened under its name and the runs agents without a token opened
+ * operator token may clean up the runs opened with its private run key
  * (operatorMayClean); you may clean up any. A real cleanup removes the run's Activity entries as well.
  */
 export function runRoutes(app: Hono, d: RunsDeps) {
@@ -212,13 +211,13 @@ export function runRoutes(app: Hono, d: RunsDeps) {
     // in the browser is the owner's to clean up, and so is one opened before owners were recorded (none stored).
     const owner = await d.store.owner(run.data);
     if (actingAsOperator()) {
-      const empty = !owner && !Object.values(plan.remove).some(Boolean) && !plan.kept.length;
+      const empty = !owner && !Object.values(plan.remove).some(Boolean) && !plan.kept.length && !plan.entries;
       if (!operatorMayClean(owner) && !empty) {
         const by = owner ? `was opened by ${openerOf(owner)}` : 'was opened before run owners were recorded';
         const who = owner?.principal === 'operator' && owner.actor
-          ? `only ${owner.actor} (fg --as ${owner.actor.replace(/^operator:?/, '') || '<none>'}) or you can clean it up`
+          ? 'only the original FG_RUN_KEY or the owner can clean it up; legacy runs require the owner'
           : 'only you can clean it up (from the browser)';
-        return c.json({ error: `run ${run.data} ${by}: ${who}; the operator token cleans up only its own runs (opened under the same --as name) and runs an agent without a token opened` }, 403);
+        return c.json({ error: `run ${run.data} ${by}: ${who}; the operator token cleans up only runs opened with its private FG_RUN_KEY` }, 403);
       }
     }
     if (body.data.dryRun !== false) return c.json({ ...plan, dryRun: true });
@@ -229,7 +228,7 @@ export function runRoutes(app: Hono, d: RunsDeps) {
     // erases the trace of a change it cannot undo.
     // Only the entries the plan read, so every change removed is one listed below (a run with more than RUN_ENTRIES keeps
     // the rest for the next cleanup); and never an entry about a record that stays (the one that created it included).
-    const entriesRemoved = activity.removeRun ? await activity.removeRun(run.data, [...TOUCHES], { ids: entries.map((a) => a.id), targets: keptIds }) : 0;
+    const entriesRemoved = activity.removeRun ? await activity.removeRun(run.data, [...TOUCHES], { ids: entries.filter((a) => !byRequest(a) || (owner?.principal === 'operator' && a.actor === currentActor())).map((a) => a.id), targets: keptIds }) : 0;
     await activity.record({
       // Not tagged with a run (null, not the asking request's): the entry is about the run, not made in it.
       kind: 'run_cleaned', actor: 'you', projectKey: null, run: null,

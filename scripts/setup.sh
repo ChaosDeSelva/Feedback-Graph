@@ -309,6 +309,11 @@ else
   fi
 fi
 
+# Recheck the effective name after first-run auto-isolation wrote .env.
+current_name="${instance:-$(envval FG_INSTANCE)}"
+current_name="${current_name:-feedback-graph}"
+taken_by="$(other_dir "$current_name")"
+
 # Secrets from files a person wrote (--github-token-file and co.): into .env, which stays readable by you only. The
 # value is never printed, and a file with anything but token characters is refused before .env is touched.
 secret_from_file() {

@@ -18,11 +18,11 @@ import { execFileSync } from 'node:child_process';
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { asksForContext, contextForPrompt, mcpText, moduleWorthSaying, sessionBase, stopHook, taskContextArgs } from './lib.mjs';
+import { asksForContext, inRepo, contextForPrompt, mcpText, moduleWorthSaying, sessionBase, stopHook, taskContextArgs } from './lib.mjs';
 
 const BASE = (process.env.FEEDBACK_GRAPH_URL || 'http://localhost:8787').replace(/\/+$/, '');
 const TOKEN = process.env.FEEDBACK_GRAPH_TOKEN || '';
-const headers = { accept: 'application/json, text/event-stream', ...(TOKEN ? { authorization: `Bearer ${TOKEN}` } : {}) };
+const headers = { accept: 'application/json, text/event-stream', ...(TOKEN ? { authorization: `Bearer ${TOKEN}` } : {}), ...(process.env.FG_RUN ? { 'x-fg-run': process.env.FG_RUN } : {}), ...(process.env.FG_RUN_KEY ? { 'x-fg-run-key': process.env.FG_RUN_KEY } : {}), ...(/^(1|true)$/i.test(process.env.FG_SANDBOX || '') ? { 'x-fg-sandbox': 'true' } : {}) };
 const STATE_DIR = join(tmpdir(), 'feedback-graph-hooks');
 
 async function get(path, ms) {
@@ -85,7 +85,7 @@ const handlers = {
 
   async edit(input) {
     const path = input.tool_input?.file_path ?? input.tool_input?.notebook_path;
-    if (!path || !(await tracked(input.cwd))) return;
+    if (!path || !inRepo(path, input.cwd) || !(await tracked(input.cwd))) return;
     const state = withBase(loadState(input.session_id), input.cwd);
     if (state.files.includes(path)) return;
     saveState(input.session_id, { ...state, files: [...state.files, path] });

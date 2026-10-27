@@ -30,3 +30,10 @@ test('while the database holds no sandbox record the searches carry no run filte
     expect(sql).toMatch(/\(true OR \$\d::text IS NULL\)/);
   }
 });
+
+test('lesson vector queries exclude no-miss flags without changing the stored approval', () => {
+  const db = { vector: { kind: 'halfvec', dims: 768 } } as never;
+  const sql = searchLessonsQuery(db, { embedding: [1], projectKey: 'demo', k: 5 }).sql;
+  expect(sql).toContain('no-miss');
+  expect(sql).toContain('NOT coalesce(l.checks @>');
+});

@@ -37,10 +37,10 @@ Usage:
                                                  --with-sessions: only folders with Claude or Codex sessions)
   fg projects unselect --key k1,k2
   fg scan --all | --key k1,k2 [--provider codex-cli] [--wait [--timeout s]]
-  fg inbox list [--status pending|confirmed|rejected] [--source claude|codex|github|linear] [--project k] [--limit n]
+  fg inbox list [--status pending|confirmed|rejected] [--source claude|codex|github|linear] [--project k] [--limit n] [--pr number] [--author login]
   fg inbox show <id>
   fg inbox confirm|reject <id> [<id> ...] [--reason "..."]
-  fg lessons list [--status proposed|approved|rejected|superseded] [--project k] [--flag <check>] [--source github|linear|session|memory|manual]
+  fg lessons list [--status proposed|approved|rejected|superseded] [--project k] [--flag <check>] [--source github|linear|session|memory|manual] [--pr number] [--author login]
   fg lessons show <id>
   fg lessons approve|reject <id> [<id> ...] [--note "..."]   one batch; each lesson is recorded as decided on its own
   fg lessons quality [--project k]               of the lessons decided in the last 30 and 90 days: approved as written, after an edit, rejected
@@ -100,12 +100,12 @@ type Flags = {
   json?: true; watch?: true; all?: true; only?: true; help?: true; wait?: true; force?: true; 'from-stdin'?: true; 'with-sessions'?: true;
   sandbox?: true; apply?: true; 'dry-run'?: true; run?: string;
   key?: string[]; provider?: string; status?: string; project?: string; limit?: string; reason?: string; interval?: string; as?: string; url?: string;
-  until?: string; timeout?: string; kind?: string; q?: string; title?: string; note?: string; relation?: string; source?: string; relevance?: string; flag?: string;
+  until?: string; timeout?: string; kind?: string; q?: string; title?: string; note?: string; relation?: string; source?: string; relevance?: string; flag?: string; pr?: string; author?: string;
 };
 export type Parsed = { words: string[]; flags: Flags };
 
 const BOOLEAN = new Set(['json', 'watch', 'all', 'only', 'help', 'wait', 'force', 'from-stdin', 'with-sessions', 'sandbox', 'apply', 'dry-run']);
-const VALUED = new Set(['key', 'provider', 'status', 'project', 'limit', 'reason', 'interval', 'as', 'url', 'until', 'timeout', 'kind', 'q', 'title', 'note', 'relation', 'source', 'relevance', 'flag', 'run']);
+const VALUED = new Set(['key', 'provider', 'status', 'project', 'limit', 'reason', 'interval', 'as', 'url', 'until', 'timeout', 'kind', 'q', 'title', 'note', 'relation', 'source', 'relevance', 'flag', 'run', 'pr', 'author']);
 
 export function parse(argv: string[]): Parsed {
   const words: string[] = [];
@@ -166,7 +166,7 @@ function client(io: CliIO, flags: Flags, labels = true) {
   const sandbox = labels && (!!flags.sandbox || io.env.FG_SANDBOX?.trim() === '1');
   if (sandbox && !runId) throw new UsageError('--sandbox needs --run <id> (or FG_RUN): a sandbox run is cleaned up by its id');
   const runHeaders: Record<string, string> = runId ? { 'x-fg-run': runId, ...(sandbox && { 'x-fg-sandbox': '1' }) } : {};
-  const authHeaders = (): Record<string, string> => ({ 'x-fg-operator': name, ...runHeaders, ...(token && { authorization: `Bearer ${token}` }) });
+  const authHeaders = (): Record<string, string> => ({ 'x-fg-operator': name, ...runHeaders, ...(io.env.FG_RUN_KEY?.trim() && { 'x-fg-run-key': io.env.FG_RUN_KEY.trim() }), ...(token && { authorization: `Bearer ${token}` }) });
   /** A server-sent event stream; null when the API has none there (an older version) or cannot be reached. */
   const events = async (path: string): Promise<{ events: AsyncGenerator<SseEvent>; close(): void } | null> => {
     const ctl = new AbortController();
@@ -633,7 +633,7 @@ async function inbox(api: Api, io: CliIO, words: string[], f: Flags): Promise<nu
   const [verb, ...ids] = words;
   if (verb === 'list' || verb === undefined) {
     if (f.source !== undefined && !SOURCES.includes(f.source)) throw new UsageError(`--source takes one of ${SOURCES.join(', ')}`);
-    const items = await api<any[]>('GET', `/api/candidates${qs({ status: f.status ?? 'pending', source: f.source, project: f.project, limit: f.limit })}`);
+    const items = await api<any[]>('GET', `/api/candidates${qs({ status: f.status ?? 'pending', source: f.source, project: f.project, limit: f.limit, pr: f.pr, author: f.author })}`);
     if (f.json) { io.out(JSON.stringify(items, null, 2)); return 0; }
     io.out(items.length
       ? table(['ID', 'PROJECT', 'SOURCE', 'LABEL', 'CONF', 'SUMMARY'], items.map((c) => [c.id, c.projectKey, c.source, c.classification?.label, c.classification?.confidence?.toFixed(2), c.classification?.summary]))
@@ -660,7 +660,7 @@ async function inbox(api: Api, io: CliIO, words: string[], f: Flags): Promise<nu
   }
   if (verb !== 'confirm' && verb !== 'reject') throw new UsageError(`unknown inbox command: ${verb}`);
   if (!ids.length) throw new UsageError(`fg inbox ${verb} needs at least one item id (see fg inbox list)`);
-  const items = ids.map((id) => ({ id, decision: verb, ...(f.reason !== undefined && { reason: f.reason }) }));
+  const items = ids.flatMap((id) => id.split(/[\s,]+/).filter(Boolean)).map((id) => ({ id, decision: verb, ...(f.reason !== undefined && { reason: f.reason }) }));
   const { results } = await api<{ results: { id: string; ok: boolean; status?: string; error?: string }[] }>('POST', '/api/candidates/decisions', { items });
   if (f.json) io.out(JSON.stringify(results, null, 2));
   else io.out(table(['ID', 'RESULT'], results.map((r) => [r.id, r.ok ? r.status : r.error])));
@@ -670,7 +670,7 @@ async function inbox(api: Api, io: CliIO, words: string[], f: Flags): Promise<nu
 async function lessons(api: Api, io: CliIO, words: string[], f: Flags): Promise<number> {
   const [verb, id] = words;
   if (verb === 'list' || verb === undefined) {
-    const list = await api<any[]>('GET', `/api/lessons${qs({ status: f.status ?? 'proposed', project: f.project, flag: f.flag, source: f.source })}`);
+    const list = await api<any[]>('GET', `/api/lessons${qs({ status: f.status ?? 'proposed', project: f.project, flag: f.flag, source: f.source, pr: f.pr, author: f.author })}`);
     if (f.json) { io.out(JSON.stringify(list, null, 2)); return 0; }
     io.out(list.length
       ? table(['ID', 'STATUS', 'PROJECT', 'FROM', 'FLAGS', 'TITLE', 'DECIDED BY'], list.map((l) => [

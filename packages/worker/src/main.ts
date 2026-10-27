@@ -337,6 +337,7 @@ async function main() {
             repoPath: i.repoPath,
             stopAt: roots.find((r) => i.repoPath.startsWith(`${r.container}/`))?.container ?? dirname(i.repoPath),
             memoryDir: memoryDirFor(transcripts, i.cwd),
+            before: i.feedback.ts,
             source: i.source,
             evidence: sessionEvidence(i, await repo.sessionInstructionFiles(i.work?.sessionId ?? i.sessionId).catch(() => null)),
             roots,
@@ -371,6 +372,17 @@ async function main() {
     upsertLesson: (l: Parameters<KnowledgeStore['upsertLesson']>[0]) => knowledge.upsertLesson(l),
     activity,
     autoApprove: config.memoryAutoApprove,
+    writtenAfterFeedback: async (projectKey: string, path: string) => {
+      // A feedback memory authored as part of fixing an existing Inbox event is the same event, not a second lesson.
+      const file = path.split('/').at(-1);
+      const candidates = await repo.listCandidates({ projectKey, source: 'claude', limit: 500 });
+      for (const candidate of candidates) {
+        if (candidate.status === 'rejected') continue;
+        const after = await repo.callsAfter(candidate.turnUuid);
+        if (after?.calls.some((call) => /(?:write|edit)/i.test(call.name) && call.filePath?.replaceAll('\\', '/').endsWith(`/memory/${file}`))) return true;
+      }
+      return false;
+    },
   };
 
   /** The folders of the selected projects, under the first root that has them (plain directories only, nested repos too). */
@@ -557,11 +569,14 @@ async function main() {
     const cred = await integrations.credential('github');
     if (!cred) return;
     const repos = new Map<string, string>();
+    const authors = new Map<string, string>();
     for (const p of await syncProjectsList()) {
-      const target = (await integrations.link(p.key)).github ? githubTarget(p, config.github.repos) : null;
+      const link = await integrations.link(p.key);
+      if (link.githubAuthor) authors.set(p.key, link.githubAuthor);
+      const target = link.github ? githubTarget(p, config.github.repos) : null;
       if (target) repos.set(p.key, target);
     }
-    const g = await syncGithub({ repos, token: cred.token, fetchPrs: fetchPullRequestContext, docs, embed, activity, minIntervalMs: config.github.syncHours * 3600_000, log });
+    const g = await syncGithub({ repos, authors, token: cred.token, fetchPrs: fetchPullRequestContext, docs, embed, activity, minIntervalMs: config.github.syncHours * 3600_000, log });
     if (g.prs) log('github synced', g);
   }
 
@@ -731,8 +746,6 @@ async function main() {
       await syncGithubDocs().catch((err) => log('github sync failed', { error: redactSecrets(String(err)) }));
       await syncFeedback().catch((err) => log('comment sync failed', { error: redactSecrets(String(err)) }));
       detectLinksSometimes();
-      const imported = await importMemories(memDeps);
-      if (imported) log('memory lessons imported', { imported });
       await retention();
       if (evidence.ready()) await evidence.recheck();
       // Keep going without sleeping while there is still work: backfill, post-mortems, scans.
@@ -768,6 +781,9 @@ async function main() {
         progressed = cycleProgressed({ turnsClassified: r.turnsClassified, postmortems: pm.done, docRead: !!docRead, scored }) || (settling && !!pmDeps);
         if (scored) log('relevance backfill', { scored });
       } while (progressed && !stopping);
+      // Classify transcript feedback before importing notes written in response to that feedback.
+      const imported = await importMemories(memDeps);
+      if (imported) log('memory lessons imported', { imported });
     } catch (err) {
       status.lastError = redactSecrets(String(err)).slice(0, 500);
       log('cycle failed', { error: status.lastError });

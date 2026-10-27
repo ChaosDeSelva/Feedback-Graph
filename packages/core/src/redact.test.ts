@@ -1,6 +1,6 @@
 import { readFileSync } from 'node:fs';
 import { describe, expect, test } from 'vitest';
-import { holdsCredential, instructsAgent, redactSecrets, redactStoredFact, redactStoredLesson, redactedChanges, redactStoredRow, redactTokens, reopensAsFact } from './redact.ts';
+import { redactDeep, holdsCredential, instructsAgent, redactSecrets, redactStoredFact, redactStoredLesson, redactedChanges, redactStoredRow, redactTokens, reopensAsFact } from './redact.ts';
 
 test('the head of a token an older version cut at the Activity cap (subject ends in …) is redacted', () => {
   const head = ['ghp', 'x'.repeat(24)].join('_');
@@ -508,4 +508,23 @@ describe('redactStoredLesson (the startup re-run over stored lessons)', () => {
     expect(redactStoredLesson(lesson('Always scope orders to the tenant'))).toBeNull();
     expect(redactStoredLesson(lesson('Always scope orders to the tenant', 'proposed'))).toBeNull();
   });
+});
+
+
+test.each([
+  'gsk_' + 'aB12'.repeat(6), 'pypi-' + 'aB12'.repeat(6), 'whsec_' + 'aB12'.repeat(6),
+  'lin_oauth_' + 'aB12'.repeat(6), 'GOCSPX-' + 'aB12'.repeat(6), 'xapp-' + 'aB12'.repeat(6),
+  'Authorization: Basic dXNlcjpwYXNzd29yZA==',
+  'DefaultEndpointsProtocol=https;AccountKey=aB12aB12aB12aB12aB12==;EndpointSuffix=core.windows.net',
+  '{"auths":{"registry.example":{"auth":"dXNlcjpwYXNzd29yZA=="}}}',
+  'db.example:5432:app:alice:unusual-password',
+])('redacts newly covered credentials: %s', (value) => {
+  expect(redactSecrets(value)).toContain('[REDACTED]');
+  expect(redactSecrets(redactSecrets(value))).toBe(redactSecrets(value));
+});
+
+
+test('redacts Docker and Azure credentials in parsed objects as well as text', () => {
+  expect(redactDeep({ auths: { registry: { auth: 'dXNlcjpwYXNzd29yZA==' } }, AccountKey: 'aB12'.repeat(8) }))
+    .toEqual({ auths: { registry: { auth: '[REDACTED]' } }, AccountKey: '[REDACTED]' });
 });

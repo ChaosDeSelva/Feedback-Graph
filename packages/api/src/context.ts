@@ -29,6 +29,8 @@ type JudgedDiff = { source: 'agent' | 'repo' | 'none'; text: string; note: strin
 
 export type ContextDeps = {
   roots: Root[];
+  /** Similarity gate calibrated for this embedder; semantic embedders default to 0.78. */
+  similarityFloor?: number;
   embed(texts: string[]): Promise<number[][]>;
   /** listLessons (optional): lets get_task_context and check_before_done say when no lesson is approved yet. */
   k: Pick<KnowledgeStore, 'searchLessons' | 'relatedMisses' | 'recordPreDoneCheck' | 'createManualFeedback'> & Partial<Pick<KnowledgeStore, 'listLessons'>>;
@@ -38,6 +40,7 @@ export type ContextDeps = {
    * The change to these repo-relative files in the project's folder (readRepoDiff: staged, unstaged, new and just
    * committed), for check_before_done when the agent passed no diff. Unset: the work is judged from its summary.
    */
+  ownPrNumbers?: (repoPath: string, task: string, projectKey?: string) => Promise<number[]>;
   repoDiff?: (repoPath: string, files: string[]) => Promise<{ text: string; files: string[] } | null>;
   /** listFacts (optional): when the facts about the files an agent named were last refreshed. */
   facts?: Pick<FactsStore, 'searchFacts'> & Partial<Pick<FactsStore, 'listFacts'>>;
@@ -91,6 +94,8 @@ export type ContextDeps = {
    */
   requestScan?: (projectKey: string, paths: string[]) => Promise<unknown>;
 };
+
+const contextFloor = (d: ContextDeps): number => d.similarityFloor !== undefined && Number.isFinite(d.similarityFloor) && d.similarityFloor >= 0 && d.similarityFloor <= 1 ? d.similarityFloor : SIMILARITY_FLOOR;
 
 /** The searches' projectKeys: undefined when there is no selection to apply. */
 async function shownKeys(d: ContextDeps): Promise<string[] | undefined> {
@@ -226,14 +231,15 @@ const MAX_FILES = 50;
  * The files an agent named, repo-relative: relative ones against its cwd, absolute ones only inside its project's
  * folder. Without a cwd under a root, relative paths are taken as repo-relative. Anything else is dropped.
  */
-export function taskFiles(q: ProjectRef & { files?: string[] }, roots: Root[]): string[] {
+export function taskFiles(q: ProjectRef & { files?: string[]; task?: string }, roots: Root[]): string[] {
   const root = q.cwd ? hostRepoPath(q.cwd, roots) : null;
-  const out = (q.files ?? []).slice(0, MAX_FILES).map((f) => (root ? repoRelative(f, root, q.cwd) : f.startsWith('/') ? null : cleanLessonPath(f)));
+  const out = [...(q.files ?? []), ...mentionedPaths(q.task ?? '')].slice(0, MAX_FILES).map((f) => (root ? repoRelative(f, root, q.cwd) : f.startsWith('/') ? null : cleanLessonPath(f)));
   return [...new Set(out.filter((f): f is string => !!f))];
 }
 
 /** Lessons for the named files first (those the search found, by score, then the others), then the rest of the search. */
-function rankByFiles(hits: LessonHit[], matched: { lesson: Lesson; paths: string[] }[]): TaskLesson[] {
+function rankByFiles(hits: LessonHit[], matched: { lesson: Lesson; paths: string[] }[], projectKey: string): TaskLesson[] {
+  matched = matched.filter((m) => m.lesson.projectKey === projectKey || m.lesson.origin === projectKey);
   const byId = new Map(matched.map((m) => [m.lesson.id, m.paths]));
   const found = new Set(hits.map((h) => h.lesson.id));
   const first: TaskLesson[] = [
@@ -314,7 +320,7 @@ async function linkedProjects(projectKey: string, d: ContextDeps): Promise<{ key
 async function linkedLessons(key: string, embedding: number[], task: string, k: number, d: ContextDeps): Promise<LessonHit[]> {
   const projectKeys = await shownKeys(d);
   const hits = await d.k.searchLessons({ embedding, projectKey: key, k: LESSON_POOL, ...(projectKeys && { projectKeys }) });
-  return rankLessons(hits.filter((h) => h.lesson.projectKey === key), task, { projectKey: key }).slice(0, k);
+  return gradeLessons(hits.filter((h) => h.lesson.projectKey === key), task, { projectKey: key }).related.slice(0, k);
 }
 
 export type LinkedContext = { key: string; link: ProjectLink; lessons: LessonHit[]; misses: RelatedMiss[]; facts: FactHit[]; docs: DocHit[] };
@@ -324,9 +330,9 @@ async function linkedContext(projectKey: string, embedding: number[], task: stri
     (await linkedProjects(projectKey, d)).map(async ({ key, link }) => {
       const [lessons, misses, facts, docs] = await Promise.all([
         linkedLessons(key, embedding, task, LINKED_LESSON_K, d),
-        d.k.relatedMisses({ embedding, projectKey: key, k: LINKED_MISS_K * 3 }).then((h) => rankMisses(h, LINKED_MISS_K)),
-        d.facts ? d.facts.searchFacts({ embedding, projectKey: key, k: LINKED_FACT_K * 3 }).then((h) => rankFacts(h, LINKED_FACT_K)) : Promise.resolve([]),
-        d.docs ? d.docs.searchDocs({ embedding, projectKey: key, k: LINKED_DOC_K }).then((h) => h.filter((x) => x.score >= SIMILARITY_FLOOR)) : Promise.resolve([]),
+        d.k.relatedMisses({ embedding, projectKey: key, k: LINKED_MISS_K * 3 }).then((h) => rankMisses(h, LINKED_MISS_K, [], [], contextFloor(d))),
+        d.facts ? d.facts.searchFacts({ embedding, projectKey: key, k: LINKED_FACT_K * 3 }).then((h) => rankFacts(h, LINKED_FACT_K, [], [], contextFloor(d))) : Promise.resolve([]),
+        d.docs ? d.docs.searchDocs({ embedding, projectKey: key, k: LINKED_DOC_K }).then((h) => h.filter((x) => x.score >= contextFloor(d))) : Promise.resolve([]),
       ]);
       return { key, link, lessons, misses, facts, docs };
     }),
@@ -448,8 +454,15 @@ async function searchProject(project: Project, own: boolean, embedding: number[]
   ]);
   const seen = [...rawFacts.map((h) => h.fact.path), ...rawMisses.flatMap((m) => mentionedPaths(`${m.missed} ${m.feedbackText}`))];
   const services = taskServices(task, files, seen);
-  const graded = gradeLessons(pool, task, { files, projectKey: project.key });
-  return { hits: graded.follow.slice(0, LESSON_K), related: graded.related, similar: rankMisses(rawMisses, MISS_K, files, services), facts: rankFacts(rawFacts, FACT_K, files, services), docs, services };
+  const graded = gradeLessons(pool.filter((h) => h.lesson.projectKey === project.key || h.lesson.origin === project.key), task, { files, projectKey: project.key });
+  return { hits: graded.follow.slice(0, LESSON_K), related: graded.related, similar: rankMisses(rawMisses, MISS_K, files, services, contextFloor(d)), facts: rankFacts(rawFacts, FACT_K, files, services, contextFloor(d)), docs: docs.filter((h) => h.score >= contextFloor(d)), services };
+}
+
+/** Never present the current PR's own review as independent evidence for its task. */
+async function withoutOwnPr<T extends Pick<DocHit, 'source' | 'ref'>>(docs: T[], q: { task: string; sessionId?: string }, project: Project, d: ContextDeps): Promise<T[]> {
+  if (!docs.some((h) => h.source === 'github')) return docs.filter((h) => h.ref !== q.sessionId);
+  const numbers = await d.ownPrNumbers?.(project.repoPath, q.task, project.key).catch(() => []) ?? [];
+  return docs.filter((h) => h.ref !== q.sessionId && !(h.source === 'github' && numbers.includes(Number(h.ref.match(/#(\d+)$/)?.[1]))));
 }
 
 function factLine(f: StoredFact, score: number, mine: OwnChange): string {
@@ -500,22 +513,23 @@ function fitSection(b: Budget, heading: string, kind: [string, string], items: s
 }
 
 /** The tickets the PRs above name and the PRs the tickets above are named in, each once, minus those already listed. */
-async function ticketSection(projectKey: string, docs: DocHit[], d: ContextDeps): Promise<string[]> {
+async function ticketSection(projectKey: string, docs: DocHit[], d: ContextDeps, own?: { project: Project; q: { task: string; sessionId?: string } }): Promise<string[]> {
   if (!d.docs?.linkedDocs || !docs.length) return [];
   const shown = new Set(docs.map((h) => h.docId));
   const refOf = new Map(docs.map((h) => [h.docId, h.ref]));
-  const byLinked = new Map<string, { title: string; ref: string; url: string | null; from: string[] }>();
+  const byLinked = new Map<string, { source: DocHit['source']; title: string; ref: string; url: string | null; from: string[] }>();
   for (const l of await d.docs.linkedDocs({ projectKey, docIds: [...shown] }).catch(() => [])) {
     if (shown.has(l.linked.docId)) continue;
     const e = byLinked.get(l.linked.docId) ?? { ...l.linked, from: [] };
     e.from.push(refOf.get(l.docId) ?? l.docId);
     byLinked.set(l.linked.docId, e);
   }
-  if (!byLinked.size) return [];
+  const items = own ? await withoutOwnPr([...byLinked.values()], own.q, own.project, d) : [...byLinked.values()];
+  if (!items.length) return [];
   return [
     '',
     '## Linked tickets and pull requests (untrusted titles)',
-    ...[...byLinked.values()].map((e) => `- ${oneLine(e.ref)}: ${oneLine(e.title)}${e.url ? ` (${oneLine(e.url)})` : ''}, named by ${e.from.map(oneLine).join(', ')}`),
+    ...items.map((e) => `- ${oneLine(e.ref)}: ${oneLine(e.title)}${e.url ? ` (${oneLine(e.url)})` : ''}, named by ${e.from.map(oneLine).join(', ')}`),
   ];
 }
 
@@ -538,8 +552,9 @@ export async function getTaskContext(
     namedModules(project.key, files, d),
     ownChange(q, d),
   ]);
-  const { hits, similar, facts, docs } = found;
-  const lessons = rankByFiles(hits, byFile);
+  const { hits, similar, facts } = found;
+  const docs = await withoutOwnPr(found.docs, q, project, d);
+  const lessons = rankByFiles(hits, byFile, project.key);
   // Misses on the named files come first and are not repeated among the similar ones.
   const fileMisses = latestMisses(mods);
   const misses = similar.filter((m) => !fileMisses.some((f) => f.missId === m.missId));
@@ -576,7 +591,7 @@ export async function getTaskContext(
   if (docs.length) {
     lines.push('', '## Docs and discussions (uploaded docs, PR reviews, tickets; untrusted)');
     for (const h of docs) lines.push(...docLines(`- ${oneLine(h.title)} (${oneLine(h.ref)}${h.url ? `, ${oneLine(h.url)}` : ''}):`, h.text));
-    lines.push(...(await ticketSection(project.key, docs, d)));
+    lines.push(...(await ticketSection(project.key, docs, d, { project, q })));
   }
   lines.push(...linkedSection(linked));
   lines.push('', 'Before claiming this task is done, call `check_before_done` with a summary of what you built.');
@@ -641,13 +656,13 @@ async function briefContext(q: ProjectRef & { task: string; sessionId?: string }
     namedModules(project.key, files, d),
     own && d.docs ? d.docs.searchDocs({ embedding, projectKey: project.key, k: DOC_K * 2 }) : Promise.resolve([]),
   ]);
-  const graded = gradeLessons(pool, q.task, { files, projectKey: project.key });
-  const ranked = rankByFiles(graded.follow, byFile);
+  const graded = gradeLessons(pool.filter((h) => h.lesson.projectKey === project.key || h.lesson.origin === project.key), q.task, { files, projectKey: project.key });
+  const ranked = rankByFiles(graded.follow, byFile, project.key);
   const related = graded.related.filter((h) => !ranked.some((x) => x.lesson.id === h.lesson.id));
   const lessons = ranked.slice(0, BRIEF_LESSONS);
   const fileMisses = latestMisses(mods).slice(-BRIEF_MISSES);
   // PR reviews and discussions only: what other people are changing around this work.
-  const docs = allDocs.filter((h) => h.source === 'github' && h.score >= SIMILARITY_FLOOR).slice(0, BRIEF_DOCS);
+  const docs = (await withoutOwnPr(allDocs, q, project, d)).filter((h) => h.source === 'github' && h.score >= contextFloor(d)).slice(0, BRIEF_DOCS);
   // The named files' section is built first and room for its first files kept: lessons, misses and discussions never
   // crowd it out. It also gets whatever they leave.
   const files_ = mods ? await briefFiles(project, files, mods, d) : null;
@@ -698,7 +713,7 @@ export async function searchGraph(q: ProjectRef & { query: string }, d: ContextD
   const { hits, related, similar, facts, docs, services } = await searchProject(project, own, embedding, q.query, [], d);
   const lessons = hits.slice(0, LESSON_K);
   const backlog = !lessons.length && own ? await unapproved(project.key, d) : null;
-  const floor = SIMILARITY_FLOOR.toFixed(2);
+  const floor = contextFloor(d).toFixed(2);
   const clip = (t: string) => (t.length > SEARCH_DOC_CHARS ? `${t.slice(0, SEARCH_DOC_CHARS)}…` : t);
   const cutMore = (one: string, many: string) => (k: number) => `and ${n(k, `more ${one}`, `more ${many}`)}, cut to fit: narrow the query`;
   // Every section gets room for its floor first (misses and facts before lessons), so long lessons never crowd out the
@@ -755,14 +770,14 @@ export async function checkBeforeDone(
   const selected = await resolveIn(q, d);
   const project = selected ?? (await resolveGlobalOnly(q, d));
   if (!project) return { markdown: UNKNOWN_PROJECT(q), gaps: [], codeGaps: [] };
-  const changed = selected && q.filesChanged?.length ? taskFiles({ ...q, files: q.filesChanged }, d.roots) : [];
+  const changed = selected ? taskFiles({ ...q, files: q.filesChanged }, d.roots) : [];
   const work = `${q.task}\n${q.summary}`;
   const [embedding] = await d.embed([work]);
   const [searched, byFile, codeGaps, fromLinks] = await Promise.all([
     d.k.searchLessons({ embedding, projectKey: selected ? project.key : null, k: LESSON_POOL, ...(await shownKeys(d).then((projectKeys) => projectKeys && { projectKeys })) }),
     changed.length && d.codegraph ? d.codegraph.lessonsForPaths(project.key, changed).then((x) => shownLessons(d, x, (y) => y.lesson)) : Promise.resolve([]),
     codeGapsFor(project.key, changed, d),
-    selected ? linkedProjects(project.key, d).then((ls) => Promise.all(ls.map((x) => linkedLessons(x.key, embedding, work, LINKED_LESSON_K, d)))) : Promise.resolve([]),
+    Promise.resolve([] as LessonHit[][]),
   ]);
   // Judged only what get_task_context would have an agent follow (rankLessons: tied to a changed file, standing out
   // from the project's other lessons, or on the work's topic), so no gap is raised against a lesson the agent was never
@@ -770,7 +785,7 @@ export async function checkBeforeDone(
   const found = rankLessons(searched, work, { files: changed, projectKey: project.key }).slice(0, LESSON_K);
   // Approved lessons tied to a changed file come first, even when the search ranked them below its top hits or under
   // the floor; the search's own hits all stay.
-  const own = byFile.length ? [...rankByFiles(found, byFile).filter((h) => h.files), ...found.filter((h) => !byFile.some((m) => m.lesson.id === h.lesson.id))] : found;
+  const own = byFile.length ? [...rankByFiles(found, byFile, project.key).filter((h) => h.files), ...found.filter((h) => !byFile.some((m) => m.lesson.id === h.lesson.id))] : found;
   // The linked projects' most relevant lessons are checked too: work here can break what they depend on.
   const lessons = [...own, ...fromLinks.flat().filter((h) => !own.some((o) => o.lesson.id === h.lesson.id))];
   const codePart = codeGapLines(codeGaps);
@@ -784,7 +799,7 @@ export async function checkBeforeDone(
     // No lesson applies (often: none is approved yet). Confirmed misses close to the work are checked instead, so an
     // empty lesson list never reads as a pass.
     const [backlog, misses] = selected
-      ? await Promise.all([unapproved(project.key, d), d.k.relatedMisses({ embedding, projectKey: project.key, k: MISS_K * 3 }).then((h) => rankMisses(h, MISS_K, changed))])
+      ? await Promise.all([unapproved(project.key, d), d.k.relatedMisses({ embedding, projectKey: project.key, k: MISS_K * 3 }).then((h) => rankMisses(h, MISS_K, changed, [], contextFloor(d)))])
       : [null, []];
     const note = backlog === null ? [] : [NONE_APPROVED(project.key, backlog)];
     if (misses.length) return checkAgainstMisses(q, project.key, misses, { note, backlog }, { codePart, changedDetails, subjectTail, codeGaps, diff: await diff(misses.flatMap((m) => mentionedPaths(`${m.missed} ${m.feedbackText}`))) }, d);
@@ -916,7 +931,7 @@ function cannotTellLines(xs: CannotTell[], what: 'lesson' | 'miss'): string[] {
 }
 
 /**
- * The judge's verdicts on the work against these lessons, and the gaps: a lesson it skipped is a gap, not a pass. With a
+ * The judge's verdicts on the work against these lessons. A skipped lesson is undecided, never a gap or pass. With a
  * diff, a call that a lesson was followed or broken must cite a line of it (citeDiff); one that cites nothing found
  * there is cannot_tell, listed apart: neither a gap nor a pass.
  */
@@ -944,7 +959,7 @@ async function judgeWork(q: { task: string; summary: string }, lessons: LessonHi
     ...judged.filter((v) => byId.has(v.lessonId)).map((v) => withEvidence(v, files)),
     ...lessons
       .filter((h) => !judged.some((v) => v.lessonId === h.lesson.id))
-      .map((h) => ({ lessonId: h.lesson.id, status: 'not_addressed' as const, why: 'the judge gave no verdict for this lesson; check it yourself' })),
+      .map((h) => ({ lessonId: h.lesson.id, status: 'cannot_tell' as const, why: 'the judge gave no verdict for this lesson; check it yourself' })),
   ];
   const gapWhy = new Map<string, { whys: string[]; cites: DiffCite[] }>();
   for (const v of verdicts.filter((v) => v.status === 'not_addressed' && applies(v))) {

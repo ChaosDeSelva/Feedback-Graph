@@ -281,6 +281,37 @@ describeStores('CodeGraphStore', (h) => {
     expect(await store.codegraph.purgeOrphanCodeFiles(100)).toBe(0);
   });
 
+  test('deselected maps expire after grace, reselection cancels expiry, and unreferenced scanned rows go too', async () => {
+    await store.selection.setTracked(['demo']);
+    await store.codegraph.replaceCodeMap('demo', codeMap());
+    await store.facts.saveFileFacts('demo', { path: 'docs/scan-only.md', hash: 'scanned', summary: 's' }, [], 'model');
+    await store.facts.saveFileFacts('demo', { path: 'docs/cited.md', hash: 'cited', summary: 's' }, [
+      { kind: 'convention', statement: 'Keep cited evidence.', path: 'docs/cited.md', lines: '1', confidence: 0.9, why: 'w', embedding: vec(2) },
+    ], 'model');
+    const work = session('retained-work', [edit('src/db.ts', '2026-10-01T10:01:00Z')]);
+    await store.graph.upsertSession(demo, work, []);
+    await store.codegraph.recordSessionFiles(work.sessionId, sessionFiles(work, HOST));
+    const first = await store.selection.setTracked([]);
+    const after = (hours: number) => new Date(Date.parse(first.selection.updatedAt!) + hours * 60 * 60_000);
+    await store.codegraph.purgeOrphanCodeFiles(100, after(23));
+    expect(await store.codegraph.codeMapMeta('demo')).not.toBeNull();
+    expect(await probe.ids('CodeFile')).toContain('demo:docs/scan-only.md');
+
+    await store.selection.setTracked(['demo']);
+    await store.codegraph.purgeOrphanCodeFiles(100, after(48));
+    expect(await store.codegraph.codeMapMeta('demo')).not.toBeNull();
+    expect(await probe.ids('CodeFile')).toContain('demo:docs/scan-only.md');
+
+    await store.selection.setTracked([]);
+    await store.codegraph.purgeOrphanCodeFiles(100, after(49));
+    expect(await store.codegraph.codeMapMeta('demo')).toBeNull();
+    expect(await probe.ids('CodeFile')).not.toContain('demo:docs/scan-only.md');
+    expect(await probe.ids('CodeFile')).not.toContain('demo:src/api.ts');
+    expect(await probe.ids('CodeFile')).toContain('demo:docs/cited.md');
+    expect((await store.codegraph.sessionFiles(work.sessionId)).map(f => f.path)).toEqual(['src/db.ts']);
+    expect(await store.facts.listFacts({ projectKey: 'demo' })).toHaveLength(1);
+  });
+
   test('a rebuild asked for stays requested until the map is built again; a project with no map cannot be asked', async () => {
     expect(await store.codegraph.requestCodeMapRebuild('demo')).toBe(false);
     await store.codegraph.replaceCodeMap('demo', codeMap());

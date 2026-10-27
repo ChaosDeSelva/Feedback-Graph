@@ -49,7 +49,7 @@ export type StatsRow = { projectKey: string; week: string; humanTurns: number; p
 /** source: where the flagged comment came from (a candidate saved before sources were recorded is claude). */
 /** offset: skip that many (newest first), for paging. */
 /** run: the asking run (RunTag.id): a sandbox run's Inbox items are listed only to it; unset or null, to no one. */
-export type CandidateFilter = { status?: CandidateStatus; projectKey?: string; projectKeys?: string[]; source?: FeedbackSource; limit?: number; offset?: number; run?: string | null };
+export type CandidateFilter = { status?: CandidateStatus; projectKey?: string; projectKeys?: string[]; source?: FeedbackSource; pr?: number; author?: string; limit?: number; offset?: number; run?: string | null };
 
 const CANDIDATE_LABELS = ['pushback', 'correction'];
 export const MAX_CLASSIFY_ATTEMPTS = 3;
@@ -355,9 +355,11 @@ export class GraphRepo implements GraphStore {
       `MATCH (k:Candidate)-[:FLAGS]->(t:Turn)
        WHERE ($status IS NULL OR k.status = $status) AND ($projectKey IS NULL OR k.projectKey = $projectKey)
          AND ($projectKeys IS NULL OR k.projectKey IN $projectKeys) AND ($source IS NULL OR coalesce(k.source, 'claude') = $source)
+         AND ($author IS NULL OR toLower(t.external) CONTAINS $author)
+         AND ($pr IS NULL OR t.external =~ $pr)
          AND ${VISIBLE_TO_RUN('k')}
        RETURN k, t ORDER BY t.ts DESC, k.id SKIP $offset LIMIT $limit`,
-      { status: f.status ?? null, projectKey: f.projectKey ?? null, projectKeys: f.projectKeys ?? null, source: f.source ?? null, limit: neo4j.int(f.limit ?? 200), offset: neo4j.int(Math.max(0, Math.floor(f.offset ?? 0))), run: f.run ?? null },
+      { status: f.status ?? null, projectKey: f.projectKey ?? null, projectKeys: f.projectKeys ?? null, source: f.source ?? null, author: f.author ? `"author":${JSON.stringify(f.author.toLowerCase())}` : null, pr: f.pr ? `(?s).*"thread":"[^"]*#${f.pr}".*` : null, limit: neo4j.int(f.limit ?? 200), offset: neo4j.int(Math.max(0, Math.floor(f.offset ?? 0))), run: f.run ?? null },
     );
     return rows.map((r) => toCandidate(r.get('k').properties, r.get('t').properties));
   }

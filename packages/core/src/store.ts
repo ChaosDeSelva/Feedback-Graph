@@ -172,6 +172,8 @@ export interface GraphStore {
  * run's lessons are listed only to that run).
  */
 export type LessonFilter = {
+  pr?: number;
+  author?: string;
   status?: LessonStatus;
   projectKey?: string;
   projectKeys?: string[];
@@ -646,9 +648,11 @@ export interface CodeGraphStore {
    * Delete up to `limit` CodeFile records that no map holds and nothing needs: gone from the repo (removed by a scan)
    * or of no project or never scanned (a file a session touched once), with no fact (current or closed) and no
    * session touch. A scanned file still in the repo stays:
-   * its hash is what lets the next scan skip it. Returns how many went.
+   * its hash is what lets the next scan skip it. Deselected projects lose derived maps after 24 hours without a
+   * selection change, and their unreferenced scanned files may then go too. Returns how many files went.
+   * `now` supplies a deterministic clock for scheduled cleanup and contract tests.
    */
-  purgeOrphanCodeFiles(limit: number): Promise<number>;
+  purgeOrphanCodeFiles(limit: number, now?: Date): Promise<number>;
   /** Rebuilds asked for and not yet done (asked after the map was last built), oldest first. */
   codeMapRebuildsRequested(): Promise<{ projectKey: string; requestedAt: string }[]>;
   /** The stored map in the parser's shape (for an incremental build), or null before the first build. */

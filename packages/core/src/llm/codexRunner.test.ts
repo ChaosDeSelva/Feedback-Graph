@@ -1,10 +1,10 @@
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { utimesSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { createServer, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, afterEach, expect, test } from 'vitest';
-import { createCodexRunner, resolveMirror, runOnRunner, RUNNER_TOKEN_FILE, RunnerUnavailableError, writeRunnerToken, type RunnerOpts } from './codexRunner.ts';
+import { isolatedRunnerArgs, purgeStaleRunnerMirrors, createCodexRunner, resolveMirror, runOnRunner, RUNNER_TOKEN_FILE, RunnerUnavailableError, writeRunnerToken, type RunnerOpts } from './codexRunner.ts';
 import type { Exec } from './exec.ts';
 import { makeProvider } from './providers.ts';
 import { providerUnavailableReason } from './unavailable.ts';
@@ -35,7 +35,7 @@ async function start(o: Partial<RunnerOpts> & { scratch: string }) {
     writeFileSync(args[args.indexOf('-o') + 1], '{"answer":"ok"}');
     return { code: 0, stdout: 'done', stderr: '' };
   };
-  const runner = createCodexRunner({ exec: fake, token, ...o });
+  const runner = createCodexRunner({ exec: fake, token, isolate: false, ...o });
   const server = createServer((req, res) => void runner.handle(req, res));
   servers.push(server);
   await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
@@ -81,7 +81,7 @@ test('an accepted job runs codex exec read-only in the mirror, with the prompt o
     expect(c.cmd).toBe('codex');
     expect(c.args.slice(0, 5)).toEqual(['exec', '-s', 'read-only', '-C', join(scratch, 'fb-mirror-1')]);
     expect(c.args).toEqual(expect.arrayContaining(['--skip-git-repo-check', '--ephemeral', '--output-schema', '-m', 'gpt-5.1-codex']));
-    expect(c.cwd).toBe(join(scratch, 'fb-mirror-1'));
+    expect(c.cwd).toMatch(/fb-codex-/);
     expect(c.stdin).toBe('look around');
     expect(c.env.NEO4J_PASSWORD).toBeUndefined();
     expect(c.env.GITHUB_TOKEN).toBeUndefined();
@@ -239,4 +239,43 @@ test('with CODEX_RUNNER_URL, codex-cli builds the mirror in the scratch volume a
   const down = makeProvider('codex-cli', { CODEX_RUNNER_URL: 'http://127.0.0.1:9', CODEX_RUNNER_SCRATCH: scratch });
   const err = await down.json({ system: 'S', user: 'U', schema: job.schema, cwd: repo }).catch((e: unknown) => e);
   expect(providerUnavailableReason(err)).toMatch(/cannot reach the codex runner/);
+});
+
+
+test('stale mirror sweeping preserves the current job, fresh pending mirrors and non-mirror files', async () => {
+  const { scratch } = fresh();
+  const old = join(scratch, 'fb-mirror-old');
+  const active = join(scratch, 'fb-mirror-active');
+  mkdirSync(old); mkdirSync(active);
+  const before = new Date(Date.now() - 48 * 60 * 60_000);
+  utimesSync(old, before, before); utimesSync(active, before, before);
+  writeFileSync(join(scratch, '.runner-token'), 'keep');
+  await purgeStaleRunnerMirrors(scratch, active);
+  expect(existsSync(old)).toBe(false);
+  expect(existsSync(active)).toBe(true);
+  expect(existsSync(join(scratch, 'fb-mirror-1'))).toBe(true);
+  expect(existsSync(join(scratch, '.runner-token'))).toBe(true);
+});
+
+
+test('isolated jobs expose only their mirror and login, hide scratch and use a fresh process namespace', () => {
+  const args = isolatedRunnerArgs({ dir: '/scratch/fb-mirror-active', work: '/tmp/fb-codex-job', auth: '/codex/auth.json', bin: 'codex', args: ['exec', '-C', '/repo'] });
+  expect(args).toContain('--unshare-pid');
+  expect(args).toContain('--unshare-user');
+  expect(args).toContain('--die-with-parent');
+  expect(args).toContain('--new-session');
+  expect(args.slice(args.indexOf('--ro-bind', args.indexOf('/codex/auth.json') + 1))).toContain('/repo');
+  expect(args).not.toContain('/scratch');
+  expect(args).not.toContain('/');
+  expect(args.filter((v) => v === '/codex').length).toBe(2); // tmpfs and CODEX_HOME, never a bind of old home
+  expect(args.slice(args.indexOf('--') + 1)).toEqual(['codex', 'exec', '-C', '/repo']);
+});
+
+test('production runner fails closed if the isolation launcher fails, never falls back to codex', async () => {
+  const { scratch } = fresh();
+  const commands: string[] = [];
+  const r = await start({ scratch, isolate: true, exec: async (cmd) => { commands.push(cmd); throw new Error('bwrap unavailable'); } });
+  const answer = await (await r.post(job)).json();
+  expect(answer.error).toContain('bwrap unavailable');
+  expect(commands).toEqual(['bwrap']);
 });

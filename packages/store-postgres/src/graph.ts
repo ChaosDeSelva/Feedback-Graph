@@ -284,8 +284,10 @@ export class PgGraphStore implements GraphStore {
        WHERE ($1::text IS NULL OR k.status = $1) AND ($2::text IS NULL OR k.project_key = $2)
          AND ($4::text[] IS NULL OR k.project_key = ANY($4)) AND ($5::text IS NULL OR coalesce(k.source, 'claude') = $5)
          AND ${visibleToRun('k', '$7')}
+         AND ($8::text IS NULL OR t.external->>'thread' ~ ('#' || $8 || '$'))
+         AND ($9::text IS NULL OR lower(t.external->>'author') = lower($9))
        ORDER BY t.ts DESC, k.id LIMIT $3 OFFSET $6`,
-      [f.status ?? null, f.projectKey ?? null, f.limit ?? 200, f.projectKeys ?? null, f.source ?? null, Math.max(0, Math.floor(f.offset ?? 0)), f.run ?? null],
+      [f.status ?? null, f.projectKey ?? null, f.limit ?? 200, f.projectKeys ?? null, f.source ?? null, Math.max(0, Math.floor(f.offset ?? 0)), f.run ?? null, f.pr ? String(f.pr) : null, f.author ?? null],
     );
     return rows.map(candidateOf);
   }

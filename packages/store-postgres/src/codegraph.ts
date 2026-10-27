@@ -53,7 +53,7 @@ export class PgCodeGraphStore implements CodeGraphStore {
       importerCounts: (key) => this.importerCounts(key),
       edgesTouching: (key, paths) => this.edgesTouching(key, paths),
       missesOn: (key, paths, run) => this.missesOn(key, paths, run ?? null),
-      approvedLessons: (key, run) => knowledge.listLessons({ status: 'approved', projectKey: key, limit: LESSON_LIMIT, run }),
+      approvedLessons: (key, run) => knowledge.listLessons({ status: 'approved', projectKey: key, limit: LESSON_LIMIT, run }).then((lessons) => lessons.filter((l) => !l.checks?.some((c) => c.name === 'no-miss'))),
       currentFacts: (key, path, run) => facts.listFacts({ projectKey: key, path, run }),
     };
     this.views = codeGraphViews(reads);
@@ -155,15 +155,37 @@ export class PgCodeGraphStore implements CodeGraphStore {
     return map.stats;
   }
 
-  async purgeOrphanCodeFiles(limit: number): Promise<number> {
+  async purgeOrphanCodeFiles(limit: number, now = new Date()): Promise<number> {
+    if (!Number.isFinite(limit) || limit < 1) return 0;
+    const cutoff = new Date(now.getTime() - 24 * 60 * 60_000);
+    // Retain deselected maps for a day so an accidental untick is reversible, then release derived map data.
+    await tx(this.db, async (c) => {
+      // Serialize against setTracked; re-evaluate selection only after acquiring its lock.
+      await c.query("SELECT id FROM project_selection WHERE id = 'selection' FOR UPDATE");
+      const { rows } = await c.query<{ project_key: string }>(
+        `SELECT m.project_key FROM code_maps m JOIN project_selection s ON s.id = 'selection'
+         WHERE s.initialized AND s.updated_at < $1
+           AND NOT (m.project_key = ANY(s.tracked)) LIMIT 1`,
+        [cutoff],
+      );
+      for (const { project_key: key } of rows) {
+        await c.query('DELETE FROM code_symbols WHERE project_key = $1', [key]);
+        await c.query('DELETE FROM code_imports WHERE project_key = $1', [key]);
+        await c.query('DELETE FROM code_tests WHERE project_key = $1', [key]);
+        await c.query('UPDATE code_files SET in_map = false, in_index = false, mapped_at = NULL, code_hash = NULL WHERE project_key = $1', [key]);
+        await c.query('DELETE FROM code_maps WHERE project_key = $1', [key]);
+      }
+    });
     // Session touches (session_files) need no code_files row; map edges hang off map files only.
     const { rowCount } = await this.q(
       `DELETE FROM code_files WHERE id IN (
          SELECT cf.id FROM code_files cf
-         WHERE NOT cf.in_map AND NOT cf.in_index AND (cf.removed OR cf.hash IS NULL OR NOT EXISTS (SELECT 1 FROM projects p WHERE p.key = cf.project_key))
+         WHERE NOT cf.in_map AND NOT cf.in_index AND (cf.removed OR cf.hash IS NULL OR NOT EXISTS (SELECT 1 FROM projects p WHERE p.key = cf.project_key)
+           OR EXISTS (SELECT 1 FROM project_selection s WHERE s.id = 'selection' AND s.initialized
+             AND s.updated_at < $2 AND NOT (cf.project_key = ANY(s.tracked))))
            AND NOT EXISTS (SELECT 1 FROM facts x WHERE x.code_file_id = cf.id)
          LIMIT $1)`,
-      [Math.max(0, Math.floor(limit))],
+      [Math.max(0, Math.floor(limit)), cutoff],
     );
     return rowCount ?? 0;
   }

@@ -169,3 +169,18 @@ test('a memory file that vanishes mid-import does not stop the others', async ()
   });
   expect(n).toBe(1);
 });
+
+
+test('a memory written after an existing feedback event is not imported as a duplicate lesson', async () => {
+  const transcripts = mkdtempSync(join(tmpdir(), 'fbmem-'));
+  const dir = join(transcripts, '-Users-j-Vibe-AcmeShop', 'memory');
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, 'fix.md'), feedbackMd);
+  let embedded = false;
+  expect(await importMemories({
+    transcriptsDir: transcripts, roots: async () => [{ host: '/Users/j/Vibe', keys: ['AcmeShop'] }], state: new FileState(':memory:'),
+    embed: async () => { embedded = true; return [[1]]; }, upsertLesson: async () => { throw new Error('duplicate'); },
+    writtenAfterFeedback: async (key, path) => key === 'AcmeShop' && path.endsWith('/memory/fix.md'),
+  })).toBe(0);
+  expect(embedded).toBe(false);
+});

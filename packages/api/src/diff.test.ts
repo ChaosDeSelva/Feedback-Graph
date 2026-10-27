@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, readdirSync, rmSync, symlinkSync, writeFileSync
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, describe, expect, test } from 'vitest';
-import { capDiff, citeDiff, readRepoDiff, splitDiff } from './diff.ts';
+import { capDiff, citeDiff, readRepoDiff, readRepoPrNumbers, githubCommitPrLookup, splitDiff } from './diff.ts';
 
 // A realistic two-file diff, as `git diff HEAD` prints it.
 const ROUTE = `diff --git a/src/routes/orders.ts b/src/routes/orders.ts
@@ -130,8 +130,8 @@ describe('citeDiff', () => {
     expect(citeDiff(files, "test('another org cannot read an order'")?.path).toBe('test/orders.test.ts');
   });
 
-  test('a hunk header cites that hunk', () => {
-    expect(citeDiff(files, '@@ -20,4 +25,5 @@')?.hunk).toMatch(/^@@ -20,4 \+25,5 @@/);
+  test('a hunk header is not evidence', () => {
+    expect(citeDiff(files, '@@ -20,4 +25,5 @@')).toBeNull();
   });
 
   test('a quote that is not in the diff, or too short to mean anything, cites nothing', () => {
@@ -234,5 +234,62 @@ describe('readRepoDiff', () => {
     expect(await readRepoDiff(plain, ['a.ts'])).toBeNull();
     expect(await readRepoDiff(dir, [])).toBeNull();
     rmSync(plain, { recursive: true, force: true });
+  });
+});
+
+describe('readRepoPrNumbers', () => {
+  test('recognizes merge and squash PR numbers for HEAD or the task commit', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'fg-own-pr-'));
+    const git = (...a: string[]) => execFileSync('git', ['-C', dir, '-c', 'user.email=t@example.com', '-c', 'user.name=t', ...a], { encoding: 'utf8' }).trim();
+    try {
+      git('init', '-q');
+      git('commit', '--allow-empty', '-qm', 'Merge pull request #12 from acme/topic');
+      const first = git('rev-parse', 'HEAD');
+      git('commit', '--allow-empty', '-qm', 'Fix pagination (#34)');
+      expect(await readRepoPrNumbers(dir, 'fix the current task')).toEqual([34]);
+      expect(await readRepoPrNumbers(dir, `review ${first}`)).toEqual([12]);
+      expect(await readRepoPrNumbers(dir, 'review deadbeef')).toEqual([]);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+});
+
+describe('GitHub commit associations', () => {
+  const sha = 'a'.repeat(40);
+  test('finds PRs for an ordinary commit, shares requests, and expires cached results', async () => {
+    let calls = 0, time = 0;
+    const lookup = githubCommitPrLookup((async (url, init) => {
+      calls++;
+      expect(String(url)).toContain(`/repos/acme/demo/commits/${sha}/pulls?`);
+      expect(new Headers(init?.headers).get('authorization')).toBe('Bearer test-token');
+      return Response.json([{ number: 42 }, { number: 42 }, { number: -1 }]);
+    }) as typeof fetch, () => time);
+    expect(await Promise.all([lookup('acme/demo', sha, 'test-token'), lookup('acme/demo', sha, 'test-token')])).toEqual([[42], [42]]);
+    expect(calls).toBe(1);
+    time = 300_001;
+    expect(await lookup('acme/demo', sha, 'test-token')).toEqual([42]);
+    expect(calls).toBe(2);
+  });
+  test('bounds failures and retries after the short negative-cache period', async () => {
+    let calls = 0, time = 0;
+    const lookup = githubCommitPrLookup((async () => { calls++; throw new Error('offline'); }) as typeof fetch, () => time);
+    expect(await lookup('acme/demo', sha, 'token')).toEqual([]);
+    expect(await lookup('acme/demo', sha, 'token')).toEqual([]);
+    expect(calls).toBe(1);
+    time = 30_001;
+    await lookup('acme/demo', sha, 'token');
+    expect(calls).toBe(2);
+    await lookup('../other', sha, 'token');
+    expect(calls).toBe(2);
+  });
+  test('resolves an ordinary commit SHA before asking GitHub', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'fg-own-pr-api-'));
+    const git = (...a: string[]) => execFileSync('git', ['-C', dir, '-c', 'user.email=t@example.com', '-c', 'user.name=t', ...a], { encoding: 'utf8' }).trim();
+    try {
+      git('init', '-q'); git('commit', '--allow-empty', '-qm', 'Implement search');
+      const commit = git('rev-parse', 'HEAD');
+      const seen: string[] = [];
+      expect(await readRepoPrNumbers(dir, `review ${commit.slice(0, 8)}`, { associatedPulls: async (s) => { seen.push(s); return [99]; } })).toEqual([99]);
+      expect(seen).toEqual([commit]);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 });

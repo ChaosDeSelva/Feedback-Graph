@@ -70,22 +70,13 @@ const TOPIC_STANDS_OUT = 2;
 export const RELATED_K = 3;
 
 export type GradedLessons<T> = {
-  /** Served under "follow these": tied to a named file, standing out from the rest, or on the task's topic and near the best. */
+  /** Served under "follow these": tied to a named file in the project where it was learned. */
   follow: T[];
   /** Served apart, as possibly related: on the task's topic but scored with the crowd, or standing out only a little. */
   related: T[];
 };
 
-/**
- * The lessons a search found that are worth serving for `task`, in the search's order, graded. `hits` should be the
- * search's top LESSON_POOL, so the spread of the project's lessons for this query is known; `files` the files the task
- * names or changed. A lesson tied to one of the files is always followed. Otherwise none under SIMILARITY_FLOOR, and:
- * followed when it stands STANDS_OUT deviations above the rest (a global lesson: only at GLOBAL_CLOSE), or shares a
- * topic word with the task (sharesTopic), is above the median, and is within NEAR_BEST of the best or stands
- * TOPIC_STANDS_OUT out; possibly related (at most RELATED_K) when it shares a topic but scored lower, or stands out only
- * MAYBE_STANDS_OUT. Under SMALL_POOL hits a lesson stands out against the rest of them (onPoolScale), and a project's
- * own lesson at PROJECT_CLOSE is followed; under MIN_POOL, a shared topic is enough. A task about nothing gets nothing.
- */
+/** File ties alone establish rules. Semantic matches remain bounded pointers to inspect. */
 export function gradeLessons<T extends LessonHit>(hits: T[], task: string, opts: { files?: string[]; projectKey?: string | null } = {}): GradedLessons<T> {
   const tied = new Set(opts.files?.length ? lessonsFor(hits.map((h) => h.lesson), opts.files, [], opts.projectKey ?? null).map((m) => m.lesson.id) : []);
   const scores = hits.map((h) => h.score);
@@ -103,7 +94,8 @@ export function gradeLessons<T extends LessonHit>(hits: T[], task: string, opts:
   };
   const out: GradedLessons<T> = { follow: [], related: [] };
   hits.forEach((h, i) => {
-    if (tied.has(h.lesson.id)) {
+    if (h.lesson.checks?.some((c) => c.name === 'no-miss')) return;
+    if (tied.has(h.lesson.id) && (h.lesson.projectKey === opts.projectKey || h.lesson.origin === opts.projectKey)) {
       out.follow.push(h);
       return;
     }
@@ -116,7 +108,7 @@ export function gradeLessons<T extends LessonHit>(hits: T[], task: string, opts:
     const zi = z(i);
     const close = !calibrated || h.score >= best - NEAR_BEST || zi >= TOPIC_STANDS_OUT;
     const projectClose = !global && small && h.score >= PROJECT_CLOSE;
-    if (h.score >= GLOBAL_CLOSE || projectClose || (!global && zi >= STANDS_OUT) || (onTopic && close)) out.follow.push(h);
+    if (h.score >= GLOBAL_CLOSE || projectClose || (!global && zi >= STANDS_OUT) || (onTopic && close)) out.related.push(h);
     else if (onTopic || (!global && zi >= MAYBE_STANDS_OUT)) out.related.push(h);
   });
   out.related = out.related.slice(0, RELATED_K);

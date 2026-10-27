@@ -13,7 +13,7 @@ import { demoRoutes, type DemoDeps } from './demo.ts';
 import { handleMcp } from './mcp.ts';
 import { handleAdminMcp } from './adminMcp.ts';
 import { openApiDocument } from './openapi.ts';
-import { actingAsOperator, asActor, currentActor, currentRun, hasOperatorToken, mayChange, mayChangeAny, operatorName, OWNER_ROUTES, refusedVerb, runAs, runFromOwner, runIn, runLabel, runVia } from './operator.ts';
+import { runCaller, runKey, actingAsOperator, asActor, currentActor, currentRun, hasOperatorToken, mayChange, mayChangeAny, operatorName, OWNER_ROUTES, refusedVerb, runAs, runFromOwner, runIn, runLabel, runVia } from './operator.ts';
 import { askingRun, openerOf, runAsked, runRoutes, runScoped, sameCaller } from './runs.ts';
 import { evidenceRoutes, type EvidenceDeps } from './evidence.ts';
 import { deleteProjects, settingsRoutes, type SettingsDeps } from './settings.ts';
@@ -25,7 +25,9 @@ export type { SettingsDeps } from './settings.ts';
 
 export type ApiRepo = Pick<GraphStore, 'listCandidates' | 'candidateDetail' | 'decide' | 'stats'>;
 
+const ReviewFilters = { pr: z.coerce.number().int().positive().optional(), author: z.string().trim().min(1).max(200).optional() };
 const ListQuery = z.object({
+  ...ReviewFilters,
   status: z.enum(['pending', 'confirmed', 'rejected']).optional(),
   project: z.string().min(1).optional(),
   source: z.enum(['claude', 'codex', 'github', 'linear']).optional(),
@@ -304,6 +306,7 @@ const ProjectParam = z.object({ project: z.string().min(1).max(200) });
 const QualityQuery = z.object({ project: z.string().min(1).max(200).optional() });
 
 const LessonQuery = z.object({
+  ...ReviewFilters,
   status: z.enum(['proposed', 'approved', 'rejected', 'superseded']).optional(),
   project: z.string().min(1).optional(),
   /** Only lessons whose checks hold this flag. */
@@ -496,10 +499,11 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
     const browser = c.req.header('origin') !== undefined;
     const principal: RunPrincipal = operator ? 'operator' : browser ? 'browser' : auth.token && authenticated(c, auth.token) ? 'owner_token' : 'agent';
     // A run id belongs to whoever opened it (its first labelled write): a write under it by anyone else is refused, so
-    // a run cannot be hijacked or mixed. With the operator token, "whoever" is the operator's name (X-FG-Operator, fg
-    // --as), so agents sharing the token do not share runs; the cleanup rules are in runs.ts.
+    // a run cannot be hijacked or mixed. With the operator token, ownership is bound to a private
+    // X-FG-Run-Key capability, so a copied display name cannot hijack a run; the cleanup rules are in runs.ts.
     if (run && opts.runs && c.req.method !== 'GET' && c.req.method !== 'HEAD') {
-      const actor = operator ? operatorName(c.req.header('x-fg-operator')) : null;
+      const actor = operator ? runKey(c.req.header('x-fg-run-key')) : null;
+      if (operator && !actor) return c.json({ error: 'labelled operator writes require X-FG-Run-Key (FG_RUN_KEY): a private random secret of at least 32 characters' }, 403);
       const owner = await opts.runs.claim(run.id, principal, actor);
       if (!sameCaller(owner, principal, actor)) {
         const error = `run id belongs to another caller: ${run.id} was opened by ${openerOf(owner)} at ${owner.firstSeen}; label this one with a run id of its own`;
@@ -510,7 +514,7 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
     // Activity says how each write arrived (operator.ts runVia).
     // A run changes only what it wrote, unless the owner opened it (operator.ts mayChange).
     const fromOwner = principal === 'browser' || principal === 'owner_token';
-    await runVia(operator ? 'operator' : browser ? 'browser' : 'api', () => runFromOwner(fromOwner, () => runIn(run, next)));
+    await runCaller(operator ? runKey(c.req.header('x-fg-run-key')) : null, () => runVia(operator ? 'operator' : browser ? 'browser' : 'api', () => runFromOwner(fromOwner, () => runIn(run, next))));
   });
 
   // Every body has a size limit, checked before anything reads it (the Content-Length, else counted as it arrives):
@@ -740,7 +744,7 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
     // One more than the page tells whether another follows: the x-next-offset header says where it starts.
     const limit = q.data.limit ?? CANDIDATE_PAGE;
     const offset = q.data.offset ?? 0;
-    const rows = await repo.listCandidates({ status: q.data.status, projectKey: q.data.project, source: q.data.source, limit: limit + 1, offset, ...(projectKeys && { projectKeys }), ...runAsked() });
+    const rows = await repo.listCandidates({ status: q.data.status, projectKey: q.data.project, source: q.data.source, pr: q.data.pr, author: q.data.author, limit: limit + 1, offset, ...(projectKeys && { projectKeys }), ...runAsked() });
     if (rows.length > limit) c.header('x-next-offset', String(offset + limit));
     return c.json(rows.slice(0, limit).map(listedCandidate));
   });
@@ -1364,9 +1368,9 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
       const q = LessonQuery.safeParse(c.req.query());
       if (!q.success) return c.json({ error: q.error.flatten() }, 400);
       const projectKeys = keysFor(await view(), q.data.project);
-      const { status, project, flag, source } = q.data;
+      const { status, project, flag, source, pr, author } = q.data;
       return c.json(await knowledge.listLessons({
-        status, projectKey: project, ...(projectKeys && { projectKeys }), ...(flag && { flag }), ...(source && { from: source }), ...runAsked(),
+        status, pr, author, projectKey: project, ...(projectKeys && { projectKeys }), ...(flag && { flag }), ...(source && { from: source }), ...runAsked(),
       }));
     });
 

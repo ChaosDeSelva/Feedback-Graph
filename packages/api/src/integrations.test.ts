@@ -244,3 +244,19 @@ describe('connection states', () => {
     expect(c.cloud).toMatchObject({ state: 'error', detail: expect.stringMatching(/demo-shop failed 2 times in a row.*422.*tried again 2026-10-25 15:00 UTC.*others sync as usual/) });
   });
 });
+
+
+test('per-project PR author is saved, exposed, validated and resets sync cursors', async () => {
+  const { app, store, integrations } = setup();
+  store.m.set('github:shop', 'old');
+  store.m.set('feedback-github:shop', 'old');
+  const res = await app.request('/api/settings/integrations/projects/shop', json('PUT', { githubAuthor: 'octo' }));
+  expect(res.status).toBe(200);
+  expect((await res.json()).projects.find((p: { key: string }) => p.key === 'shop').github.author).toBe('octo');
+  expect((await integrations.link('shop')).githubAuthor).toBe('octo');
+  expect(store.m.get('github:shop')).toBe('');
+  expect(store.m.get('feedback-github:shop')).toBe('');
+  expect((await app.request('/api/settings/integrations/projects/shop', json('PUT', { githubAuthor: 'bad/login' }))).status).toBe(400);
+  expect((await app.request('/api/settings/integrations/projects/shop', json('PUT', { githubAuthor: null }))).status).toBe(200);
+  expect((await integrations.link('shop')).githubAuthor).toBeNull();
+});

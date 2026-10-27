@@ -3,7 +3,7 @@ import { lstat, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:f
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { promisify } from 'node:util';
-import { GIT_SAFE, isSecretPath, redactSecrets } from '@fb/core';
+import { GIT_SAFE, isSecretPath, redactSecrets, tokenFingerprint } from '@fb/core';
 
 /**
  * The diff check_before_done puts to its judge: split into files and hunks, cut to a budget with a note naming what
@@ -144,7 +144,7 @@ export function quotedCode(text: string): string[] {
 
 /**
  * Where a line the judge quoted as evidence is in the diff: the first diff line (code, with or without its +/- mark,
- * whole or in part) or hunk header it matches. A multi-line quote needs every non-empty line found. File headers
+ * whole or in part) it matches. Only added and removed lines count. A multi-line quote needs every non-empty line found. File headers
  * (---, +++, diff --git, index) are not evidence about the code. Null: the quote is not in the diff.
  */
 export function citeDiff(files: FileDiff[], quote: string): DiffCite | null {
@@ -161,11 +161,7 @@ export function citeDiff(files: FileDiff[], quote: string): DiffCite | null {
 
 function findLine(files: FileDiff[], quote: string): DiffCite | null {
   if (/^(\+\+\+|---|diff --git|index) /.test(quote)) return null;
-  if (quote.startsWith('@@')) {
-    const head = quote.replace(/^(@@[^@]*@@).*$/, '$1');
-    for (const f of files) for (const h of f.hunks) if (h.header.startsWith(head)) return { path: f.path, hunk: h.header, line: h.header };
-    return null;
-  }
+  if (quote.startsWith('@@')) return null;
   const q = norm(quote);
   if (q.length < MIN_QUOTE) return null;
   // A quote with its +/- mark is that side of the change first: a removed line can read the same as an added one.
@@ -173,7 +169,7 @@ function findLine(files: FileDiff[], quote: string): DiffCite | null {
   for (const want of mark ? [(l: string) => l[0] === mark, () => true] : [() => true]) {
     for (const f of files) {
       for (const h of f.hunks) {
-        const line = h.lines.find((l) => want(l) && norm(l).includes(q));
+        const line = h.lines.find((l) => /^[+-]/.test(l) && want(l) && norm(l).includes(q));
         if (line) return { path: f.path, hunk: h.header, line };
       }
     }
@@ -207,7 +203,7 @@ const GIT_ENV = {
 const NEUTRAL = ['--no-optional-locks', ...GIT_SAFE];
 const FLAGS = ['--no-ext-diff', '--no-textconv', '--no-color', '--no-renames'];
 
-export type RepoDiffOpts = { gitArgs?: string[] };
+export type RepoDiffOpts = { gitArgs?: string[]; associatedPulls?: (sha: string) => Promise<number[]> };
 
 /**
  * The change to the named files in `repoPath`, read-only: each file as it is now against HEAD (staged and unstaged in
@@ -295,4 +291,55 @@ async function readWorkingFile(repoPath: string, rel: string): Promise<string | 
   if (st.size > MAX_FILE) return '\0';
   const buf = await readFile(abs).catch(() => null);
   return buf ? buf.toString('utf8') : null;
+}
+
+/** PR numbers associated with the commit being worked on (merge and squash commit subjects). */
+export async function readRepoPrNumbers(repoPath: string, task: string, o: RepoDiffOpts = {}): Promise<number[]> {
+  const named = [...task.matchAll(/\b[0-9a-f]{7,40}\b/gi)].slice(0, 5).map((m) => m[0]);
+  const revisions = named.length ? named : ['HEAD'];
+  const messages = await Promise.all(revisions.map((rev) => run('git', [...NEUTRAL, '-C', repoPath, ...(o.gitArgs ?? []), 'log', '-1', '--format=%H%n%B', rev, '--'], {
+    timeout: 2000, maxBuffer: 64_000, env: GIT_ENV,
+  }).then((r) => r.stdout).catch(() => '')));
+  const numbers = messages.flatMap((m) => [...m.matchAll(/(?:Merge pull request #|\(#)(\d+)/gi)].map((x) => Number(x[1])));
+  const associated = o.associatedPulls ? await Promise.all(messages.map((message) => {
+    const sha = message.split('\n')[0];
+    return /^[0-9a-f]{40,64}$/i.test(sha) ? o.associatedPulls!(sha).catch(() => []) : Promise.resolve([]);
+  })) : [];
+  return [...new Set([...numbers, ...associated.flat()])];
+}
+
+/** GitHub's commit association covers rebase/ordinary commits with no PR number in their subject. */
+export function githubCommitPrLookup(fetchImpl: typeof fetch = fetch, now: () => number = Date.now) {
+  const cache = new Map<string, { until: number; value: Promise<number[]> }>();
+  return async (repo: string, sha: string, token: string): Promise<number[]> => {
+    if (!/^[A-Za-z0-9-]+\/[A-Za-z0-9._-]+$/.test(repo) || !/^[0-9a-f]{40,64}$/i.test(sha)) return [];
+    const key = `${tokenFingerprint(token)}:${repo.toLowerCase()}:${sha.toLowerCase()}`;
+    const known = cache.get(key);
+    if (known && known.until > now()) return known.value;
+    const value = (async () => {
+      const numbers: number[] = [];
+      // GitHub lists at most 100 associations per page. Bound time and pages for an interactive context call.
+      const signal = AbortSignal.timeout(3000);
+      for (let page = 1; page <= 3; page++) {
+        const res = await fetchImpl(`https://api.github.com/repos/${repo}/commits/${sha}/pulls?per_page=100&page=${page}`, {
+          headers: { authorization: `Bearer ${token}`, accept: 'application/vnd.github+json', 'x-github-api-version': '2022-11-28' },
+          signal, redirect: 'error',
+        });
+        if (!res.ok) throw new Error('GitHub commit association unavailable');
+        const data: unknown = await res.json();
+        if (!Array.isArray(data)) throw new Error('Invalid GitHub commit association');
+        for (const pr of data) if (pr && Number.isSafeInteger(pr.number) && pr.number > 0) numbers.push(pr.number);
+        if (!res.headers.get('link')?.includes('rel="next"')) break;
+      }
+      return [...new Set(numbers)];
+    })().catch(() => [] as number[]);
+    // Empty/failed lookups can change when the PR is first opened; retry after a short grace period.
+    cache.set(key, { until: now() + 30_000, value });
+    try {
+      const result = await value;
+      if (result.length) cache.set(key, { until: now() + 300_000, value: Promise.resolve(result) });
+      if (cache.size > 1000) cache.delete(cache.keys().next().value!);
+      return result;
+    } catch { return []; }
+  };
 }

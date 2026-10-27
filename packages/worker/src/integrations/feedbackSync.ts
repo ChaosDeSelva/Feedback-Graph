@@ -267,7 +267,7 @@ async function syncKind(kind: IntegrationKind, cred: Credential, projects: SyncP
     const floorMs = (since && !backfill ? Date.parse(since) : started.getTime()) - lookback;
     const fetchSince = since && !backfill ? since : new Date(started.getTime() - lookback).toISOString();
     try {
-      const r = kind === 'github' ? await syncRepo(p, target, cred.token, fetchSince, floorMs, d) : await syncTeam(p, target, link.linearTeamName ?? target, cred.token, fetchSince, floorMs, d, since);
+      const r = kind === 'github' ? await syncRepo(p, target, cred.token, fetchSince, floorMs, d, link.githubAuthor ?? undefined) : await syncTeam(p, target, link.linearTeamName ?? target, cred.token, fetchSince, floorMs, d, since);
       await d.cursors.setCursor(cursorKey, started.toISOString());
       // Only a backfill (or a first sync, which fetches everything with author details) marks them known.
       if (!authorsKnown && (backfill || !since)) await d.cursors.setCursor(authorsCursor(p.key), started.toISOString());
@@ -314,11 +314,12 @@ async function syncKind(kind: IntegrationKind, cred: Credential, projects: SyncP
   return added;
 }
 
-async function syncRepo(p: SyncProject, repo: string, token: string, since: string, floorMs: number, d: FeedbackSyncDeps): Promise<Outcome> {
-  const prs = await d.fetchPrs({ repo, token, since });
+async function syncRepo(p: SyncProject, repo: string, token: string, since: string, floorMs: number, d: FeedbackSyncDeps, author?: string): Promise<Outcome> {
+  const prs = await d.fetchPrs({ repo, token, since, ...(author && { author }) });
   let added = 0;
   let threads = 0;
   for (const pr of prs) {
+    if (author && pr.author.toLowerCase() !== author.toLowerCase()) continue;
     const fresh = pr.comments.filter((c) => c.createdAt && Date.parse(c.createdAt) >= floorMs);
     if (!fresh.length) continue;
     const latest = fresh.map((c) => c.createdAt).sort().at(-1)!;

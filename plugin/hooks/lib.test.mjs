@@ -299,3 +299,18 @@ test('stopHook: a check_before_done denied by permission stops the asking for th
   // Without anything pending, nothing at all.
   expect(stopHook(input, [use('Read')], 'demo', { files: [] }).out).toBeNull();
 });
+
+
+test('harness notifications never request task context', () => {
+  for (const prompt of ['<task-notification>Build task finished successfully</task-notification>', '<local-command-stdout>Updated model configuration</local-command-stdout>', '/model switch to another model']) expect(asksForContext(prompt)).toBe(false);
+});
+
+test('stop checks ignore memory and plan edits outside the repository', () => {
+  const outside = [use('Write', { file_path: '/home/me/.claude/memory/note.md' })];
+  expect(doneCheckPending(outside, '/repo')).toBe(false);
+  expect(editedSince(outside, '/repo')).toEqual([]);
+  expect(stopHook({ cwd: '/repo' }, outside, 'demo', {}).out).toBeNull();
+  const inside = [...outside, use('Edit', { file_path: '/repo/src/app.ts' })];
+  expect(doneCheckPending(inside, '/repo')).toBe(true);
+  expect(editedSince(inside, '/repo')).toEqual(['/repo/src/app.ts']);
+});

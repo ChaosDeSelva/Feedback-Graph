@@ -270,6 +270,8 @@ export function Lessons() {
   const [status, setStatus] = useState<LessonStatus>('proposed');
   // Filters the server applies: where the feedback came from, and one check flag.
   const [source, setSource] = useState<LessonFrom | ''>('');
+  const [pr, setPr] = useState('');
+  const [author, setAuthor] = useState('');
   const [flag, setFlag] = useState<LessonCheckName | ''>('');
   const [items, setItems] = useState<Lesson[]>([]);
   // The rows ticked for a bulk decision (proposed lessons only), and the decision being confirmed.
@@ -300,7 +302,7 @@ export function Lessons() {
     setPicked(new Set());
     // The answer for a tab you have left must not fill the one you are on.
     let stale = false;
-    api.lessons(status, { ...(flag && { flag }), ...(source && { source }) }).then((l) => {
+    api.lessons(status, { pr: pr || undefined, author: author || undefined, ...(flag && { flag }), ...(source && { source }) }).then((l) => {
       if (stale) return;
       const sorted = genericLast(l);
       const at = focus ? sorted.findIndex((x) => x.id === focus) : -1;
@@ -310,7 +312,7 @@ export function Lessons() {
       setLoaded(true);
     }, (e) => { if (!stale) { setError(String(e)); setLoaded(true); } });
     return () => { stale = true; };
-  }, [status, flag, source]);
+  }, [status, flag, source, pr, author]);
 
   const current = items[selected];
   useEffect(() => {
@@ -436,6 +438,8 @@ export function Lessons() {
             <Tabs label="status" value={status} options={TABS} onChange={(s) => { if (s !== status) afterDiscard(() => setStatus(s)); }} />
             {loaded && <span className="ml-auto text-xs text-muted tabular-nums">{plural(items.length, 'lesson')}</span>}
             <div className="flex w-full flex-wrap gap-2">
+              <Input aria-label="PR number" placeholder="PR number" type="number" min="1" value={pr} onChange={(e) => { const value = e.target.value; afterDiscard(() => setPr(value)); }} />
+              <Input aria-label="feedback author" placeholder="Feedback author" value={author} onChange={(e) => { const value = e.target.value; afterDiscard(() => setAuthor(value)); }} />
               <Select aria-label="source" size="sm" value={source} onChange={(e) => { const v = e.target.value as LessonFrom | ''; afterDiscard(() => setSource(v)); }}>
                 <option value="">all sources</option>
                 {LESSON_FROM.map((f) => <option key={f} value={f}>{SOURCE_LABEL[f]?.[0] ?? f}</option>)}
@@ -477,8 +481,8 @@ export function Lessons() {
         notice={error && <Alert>{error}</Alert>}
         list={
           !loaded ? <SkeletonList /> : items.length === 0 ? (
-            source || flag ? (
-              <EmptyState compact icon={<LessonIcon />} title={`No ${status} lessons match this filter`} action={<Button size="sm" onClick={() => afterDiscard(() => { setSource(''); setFlag(''); })}>Clear filters</Button>}>
+            source || flag || pr || author ? (
+              <EmptyState compact icon={<LessonIcon />} title={`No ${status} lessons match this filter`} action={<Button size="sm" onClick={() => afterDiscard(() => { setSource(''); setFlag(''); setPr(''); setAuthor(''); })}>Clear filters</Button>}>
                 {`Other ${status} lessons may come from another source or carry other checks.`}
               </EmptyState>
             ) : <EmptyState compact icon={<LessonIcon />} {...EMPTY[status]} />

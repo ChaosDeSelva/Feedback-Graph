@@ -359,3 +359,12 @@ test('an item only the detector flagged has no agent note', async () => {
   await screen.findByText('turn text c1');
   expect(screen.queryByText(/reported by the agent/i)).toBeNull();
 });
+
+
+test('PR number and feedback author filters are sent to the API', async () => {
+  render(<Inbox />);
+  await screen.findByText('first miss');
+  fireEvent.change(screen.getByLabelText('PR number'), { target: { value: '42' } });
+  fireEvent.change(screen.getByLabelText('feedback author'), { target: { value: 'octo' } });
+  await waitFor(() => expect(vi.mocked(fetch).mock.calls.some(([url]) => String(url).includes('pr=42') && String(url).includes('author=octo'))).toBe(true));
+});

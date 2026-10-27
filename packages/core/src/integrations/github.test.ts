@@ -325,3 +325,11 @@ describe('githubRepoOfRemote', () => {
     expect(githubRepoOfRemote(null)).toBeNull();
   });
 });
+
+
+test('PR author filtering skips other authors before reading their details', async () => {
+  const { fetchImpl, calls } = mockFetch({ '/repos/acme/demo/pulls': [pr(1, '2026-10-20T00:00:00Z'), pr(2, '2026-10-20T00:00:00Z', { user: human('bob') })] });
+  const out = await fetchPullRequestContext({ repo: 'acme/demo', token: 'tok', author: 'ALICE', fetchImpl });
+  expect(out.map((p) => p.number)).toEqual([1]);
+  expect(calls.some((c) => /pulls\/2\//.test(c.url))).toBe(false);
+});

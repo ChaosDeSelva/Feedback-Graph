@@ -225,9 +225,11 @@ function buildServer(call: Call, sleep: (ms: number) => Promise<void>) {
     status: z.enum(['pending', 'confirmed', 'rejected']).optional().describe('Default pending'),
     source: z.enum(FEEDBACK_SOURCES as [string, ...string[]]).optional().describe('Only items from this source'),
     project: z.string().min(1).max(MAX.key).optional(),
+    pr: z.number().int().positive().optional(),
+    author: z.string().trim().min(1).max(200).optional(),
     ...Paging,
   }, READ, async (a) => {
-    const r = await call('GET', `/api/candidates${qs({ status: a.status ?? 'pending', project: a.project, source: a.source, limit: LIST_MAX })}`);
+    const r = await call('GET', `/api/candidates${qs({ status: a.status ?? 'pending', project: a.project, source: a.source, pr: a.pr, author: a.author, limit: LIST_MAX })}`);
     if (!r.ok) return fail(r);
     const all = r.data as Record<string, any>[];
     return json(page(all.filter((c) => !a.source || c.source === a.source), a, inboxRow, all.length >= LIST_MAX));
@@ -248,9 +250,11 @@ function buildServer(call: Call, sleep: (ms: number) => Promise<void>) {
   reg('lessons_list', 'Lessons learned from post-mortems, one compact row each (the rule cut short, check flags by name): proposed ones wait for the owner; approved ones reach agents. lesson_get gives one in full. Paged.', {
     status: z.enum(['proposed', 'approved', 'rejected', 'superseded']).optional(),
     project: z.string().min(1).max(MAX.key).optional(),
+    pr: z.number().int().positive().optional(),
+    author: z.string().trim().min(1).max(200).optional(),
     ...Paging,
   }, READ, async (a) => {
-    const r = await call('GET', `/api/lessons${qs({ status: a.status, project: a.project })}`);
+    const r = await call('GET', `/api/lessons${qs({ status: a.status, project: a.project, pr: a.pr, author: a.author })}`);
     return r.ok ? json(page(r.data as Record<string, any>[], a, lessonRow)) : fail(r);
   });
 
@@ -290,7 +294,7 @@ function buildServer(call: Call, sleep: (ms: number) => Promise<void>) {
     force: z.boolean().optional(),
   }, write({ idempotent: true, openWorld: true }), async (a) => answer(await call('POST', '/api/cloud/sync', a.force === undefined ? {} : { force: a.force })));
 
-  reg('run_cleanup', 'After a test run (requests labelled x-fg-run): remove exactly what that run wrote (its reports with their post-mortems, misses and lessons, pre-done checks, facts, uploads, links, conversations). A dry run unless apply is true: it lists per kind what would go, what stays because someone outside the run touched it since (a lesson the owner approved), and what the run changed that is not its own (never undone). Its Activity entries go too with apply; the run_cleaned entry records the cleanup. Your own runs (same operator name) and runs an agent without a token opened.', {
+  reg('run_cleanup', 'After a test run (requests labelled x-fg-run): remove exactly what that run wrote (its reports with their post-mortems, misses and lessons, pre-done checks, facts, uploads, links, conversations). A dry run unless apply is true: it lists per kind what would go, what stays because someone outside the run touched it since (a lesson the owner approved), and what the run changed that is not its own (never undone). Its Activity entries go too with apply; the run_cleaned entry records the cleanup. Your own runs (the same X-FG-Run-Key capability).', {
     run: z.string().min(1).max(MAX.run).describe('The run id the requests were labelled with'),
     apply: z.boolean().optional().describe('Default false: only say what would go'),
   }, write({ destructive: true, idempotent: true }), async (a) => answer(await call('DELETE', `/api/runs/${enc(a.run)}`, { dryRun: !a.apply })));
@@ -349,7 +353,7 @@ export async function handleAdminMcp(req: Request, deps: AdminMcpDeps): Promise<
   const authorization = req.headers.get('authorization') ?? '';
   // The run label (x-fg-run, ?run=) needs no forwarding: each in-process route call runs inside this request's run.
   const call: Call = async (method, path, body) => {
-    const headers: Record<string, string> = { accept: 'application/json', authorization, ...(name && { 'x-fg-operator': name }) };
+    const headers: Record<string, string> = { accept: 'application/json', authorization, ...(req.headers.get('x-fg-run-key') && { 'x-fg-run-key': req.headers.get('x-fg-run-key')! }), ...(name && { 'x-fg-operator': name }) };
     if (body !== undefined) headers['content-type'] = 'application/json';
     const res = await deps.request(path, { method, headers, ...(body !== undefined && { body: JSON.stringify(body) }) });
     const raw = await res.text();

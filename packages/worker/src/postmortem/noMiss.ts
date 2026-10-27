@@ -5,6 +5,8 @@
  * mentions "no error handling" or "missing" is a miss.
  */
 const NO_MISS = [
+  /\b(?:claim|feedback|pushback|allegation|report) (?:is|was|proved|turned out to be) (?:incorrect|wrong|false|unfounded|invalid)\b/i,
+  /\b(?:correctly|rightly) (?:disputed|rejected|challenged|pushed back)\b/i,
   /\b(?:did not|didn'?t|does not|doesn'?t) (?:actually |really )?miss (?:anything|any\b|a thing)/i,
   /\bnothing (?:was |has been |is )?(?:actually |really )?missed\b/i,
   /^\W*no (?:actual |real )?miss(?:es)?\b/i,

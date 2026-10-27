@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import type { Context } from 'hono';
 import { RUN_ID, type ActivityStore, type OperatorConfig, type OperatorVerb, type RunTag } from '@fb/core';
@@ -157,3 +158,12 @@ export const refusedVerb = (verb: OperatorVerb) => ({
   error: `the operator token may not ${verb.replace(/_/g, ' ')} (${verb}): add ${verb} to OPERATOR_ALLOW in .env and restart, or do it in the Feedback Graph UI` +
     (verb === 'select_projects' ? '; before any selection is made, ./scripts/setup.sh --select k1,k2 on the host chooses the first one' : ''),
 });
+
+/** Run ownership uses a secret capability, never the self-reported operator display name. */
+const caller = new AsyncLocalStorage<string | null>();
+export const runCaller = <T>(key: string | null, fn: () => T): T => caller.run(key, fn);
+export const currentCaller = (): string | null => caller.getStore() ?? null;
+export function runKey(header: string | undefined): string | null {
+  return header && header.length >= 32 && header.length <= 512
+    ? `run-key:${createHash('sha256').update(header).digest('hex')}` : null;
+}

@@ -3,6 +3,7 @@ import { INCREMENTAL_MAX_PRS, parsePrBacklog, prBacklogKey, prContextToChunks, r
 export type GithubSyncDeps = {
   /** project key → owner/repo, from GITHUB_REPOS. */
   repos: Map<string, string>;
+  authors?: Map<string, string>;
   token: string;
   fetchPrs(o: FetchPrOpts): Promise<PrContext[]>;
   docs: Pick<DocsStore, 'upsertDoc' | 'getCursor' | 'setCursor'>;
@@ -39,6 +40,7 @@ export async function syncGithub(d: GithubSyncDeps): Promise<{ prs: number }> {
       const backlog = parsePrBacklog(await d.docs.getCursor(prBacklogKey(projectKey)));
       const store = async (list: PrContext[]) => {
         for (const pr of list) {
+          if (d.authors?.get(projectKey) && pr.author.toLowerCase() !== d.authors.get(projectKey)!.toLowerCase()) continue;
           const chunks = prContextToChunks(pr).map((c) => redactSecrets(c.text));
           const vectors = chunks.length ? await d.embed(chunks) : [];
           await d.docs.upsertDoc(
@@ -50,7 +52,7 @@ export async function syncGithub(d: GithubSyncDeps): Promise<{ prs: number }> {
         }
       };
       let readBackTo = null as string | null; // set by onCap
-      const list = await d.fetchPrs({ repo, token: d.token, since, onCap: (t) => { readBackTo = t; } });
+      const list = await d.fetchPrs({ repo, token: d.token, since, ...(d.authors?.get(projectKey) && { author: d.authors.get(projectKey) }), onCap: (t) => { readBackTo = t; } });
       await store(list);
       // Capped: the newest were read; the rest joins what was left from before (all of it older than the old cursor).
       let left: PrBacklog | null = since && readBackTo ? { since: backlog?.since ?? since, until: readBackTo } : backlog;
@@ -58,7 +60,7 @@ export async function syncGithub(d: GithubSyncDeps): Promise<{ prs: number }> {
       if (!readBackTo && backlog) {
         // Not capped this time: one more batch of the backlog, newest first.
         let back = null as string | null;
-        older = await d.fetchPrs({ repo, token: d.token, since: backlog.since, until: backlog.until, onCap: (t) => { back = t; } });
+        older = await d.fetchPrs({ repo, token: d.token, ...(d.authors?.get(projectKey) && { author: d.authors.get(projectKey) }), since: backlog.since, until: backlog.until, onCap: (t) => { back = t; } });
         await store(older);
         left = back ? { since: backlog.since, until: back } : null;
       }

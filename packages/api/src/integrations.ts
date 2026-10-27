@@ -42,7 +42,7 @@ export type ServiceView = {
 export type ProjectIntegrations = {
   key: string;
   github: {
-    repo: string | null; from: 'remote' | 'GITHUB_REPOS' | null; enabled: boolean; lastSyncAt: string | null; items: number; error: string | null;
+    author?: string | null; repo: string | null; from: 'remote' | 'GITHUB_REPOS' | null; enabled: boolean; lastSyncAt: string | null; items: number; error: string | null;
     /** PRs a sync stopped by its cap has not read yet (updated after `since`, before `until`): read on the next syncs. */
     backlog: PrBacklog | null;
   };
@@ -95,7 +95,7 @@ export const integrationHref = (kind: IntegrationKind) => `#settings/integration
 const Token = z.object({ token: z.string().trim().min(8, 'paste the whole token').max(500) }).strict();
 const Kind = z.enum(['github', 'linear']);
 const LinkPatch = z
-  .object({ github: z.boolean().optional(), linearTeamId: z.string().min(1).max(100).nullable().optional(), linearTeamName: z.string().max(200).nullable().optional() })
+  .object({ githubAuthor: z.string().trim().min(1).max(100).regex(/^[a-zA-Z0-9-]+$/).nullable().optional(), github: z.boolean().optional(), linearTeamId: z.string().min(1).max(100).nullable().optional(), linearTeamName: z.string().max(200).nullable().optional() })
   .strict();
 /** For the OpenAPI document (openapi.ts). */
 export const integrationSchemas = { Token, LinkPatch };
@@ -214,7 +214,7 @@ export async function integrationsView(d: IntegrationsDeps): Promise<Integration
       return {
         key: p.key,
         github: {
-          repo, from: override ? 'GITHUB_REPOS' : repo ? 'remote' : null, enabled: link.github, lastSyncAt: gs?.lastSyncAt ?? null, items: gs?.items ?? 0, error: gs?.error ?? null,
+          author: link.githubAuthor ?? null, repo, from: override ? 'GITHUB_REPOS' : repo ? 'remote' : null, enabled: link.github, lastSyncAt: gs?.lastSyncAt ?? null, items: gs?.items ?? 0, error: gs?.error ?? null,
           backlog: repo ? await d.integrations.prBacklog(p.key) : null,
         },
         linear: { teamId: link.linearTeamId, teamName: link.linearTeamName, lastSyncAt: ls?.lastSyncAt ?? null, items: ls?.items ?? 0, error: ls?.error ?? null },
@@ -301,8 +301,16 @@ export function integrationRoutes(app: Hono, d: IntegrationsDeps) {
     const body = LinkPatch.safeParse(await c.req.json().catch(() => null));
     if (!body.success) return c.json({ error: 'send { "github"?: boolean, "linearTeamId"?: string | null, "linearTeamName"?: string | null }' }, 400);
     const patch = { ...body.data, ...(body.data.linearTeamId === null ? { linearTeamName: null } : {}) };
+    const previous = await i.link(key);
     const next = await i.setLink(key, patch);
+    if (body.data.githubAuthor !== undefined && next.githubAuthor !== previous.githubAuthor) {
+      // Re-read the initial window when the author scope changes; existing rows upsert safely.
+      await i.kv.setCursor(`feedback-github:${key}`, '');
+      await i.kv.setCursor(`github:${key}`, '');
+      await i.kv.setCursor(`github-backlog:${key}`, '');
+    }
     const what = [
+      body.data.githubAuthor !== undefined ? `PR author ${next.githubAuthor ?? 'all'}` : null,
       body.data.github !== undefined ? `GitHub ${next.github ? 'on' : 'off'}` : null,
       body.data.linearTeamId !== undefined ? (next.linearTeamId ? `Linear team ${next.linearTeamName ?? next.linearTeamId}` : 'no Linear team') : null,
     ].filter(Boolean).join(', ');

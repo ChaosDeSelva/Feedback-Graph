@@ -48,7 +48,7 @@ CMD ["node", "src/main.ts"]
 # repo, no other packages, nothing mounted but the scratch volume and the Codex login. Built from the plain Node image,
 # not from runtime, so none of the app is in it.
 FROM node:26.5.0-slim AS codex-runner
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates bubblewrap \
   && rm -rf /var/lib/apt/lists/* \
   && npm i -g @openai/codex@0.162.0 \
   && npm cache clean --force \

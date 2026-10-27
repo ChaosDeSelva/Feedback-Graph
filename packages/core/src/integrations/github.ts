@@ -46,6 +46,8 @@ export type PrContext = {
 };
 
 export type FetchPrOpts = {
+  /** Only pull requests authored by this GitHub login. */
+  author?: string;
   repo: string;
   token: string;
   since?: string;
@@ -311,7 +313,7 @@ export async function fetchPullRequestContext(o: FetchPrOpts): Promise<PrContext
       oldest = t > untilMs ? o.until! : p.updated_at;
       if (t > untilMs) continue;
       seen++;
-      if (!isBot(p.user)) picked.push(p);
+      if (!isBot(p.user) && (!o.author || p.user?.login?.toLowerCase() === o.author.toLowerCase())) picked.push(p);
     }
     if (seen >= maxPrs) break;
   }

@@ -2,9 +2,11 @@ import { OPERATOR_VERBS, type ActivityInput, type Lesson, type OperatorVerb, typ
 import { expect, test } from 'vitest';
 import { createApp, type ApiRepo, type AppOpts, type SettingsDeps } from './app.ts';
 import { ADMIN_TOOLS, handleAdminMcp } from './adminMcp.ts';
+import { runKey } from './operator.ts';
 import type { CloudDeps } from './cloud.ts';
 
 const OP = 'o'.repeat(32);
+const KEY = 'admin-run-capability-'.padEnd(40, 'a');
 const API = 'a'.repeat(32);
 const DEFAULT_ALLOW = OPERATOR_VERBS.filter((v) => v !== 'lesson_decide');
 
@@ -76,7 +78,7 @@ const rpc = (body: object, headers: Record<string, string> = {}) => ({
   headers: { 'content-type': 'application/json', accept: 'application/json, text/event-stream', ...headers },
   body: JSON.stringify({ jsonrpc: '2.0', id: 1, ...body }),
 });
-const bearer = (t: string, name?: string) => ({ authorization: `Bearer ${t}`, ...(name !== undefined && { 'x-fg-operator': name }) });
+const bearer = (t: string, name?: string) => ({ authorization: `Bearer ${t}`, 'x-fg-run-key': KEY, ...(name !== undefined && { 'x-fg-operator': name }) });
 
 type ToolResult = { content: { text: string }[]; isError?: boolean };
 async function tool(app: { request: (p: string, i: RequestInit) => Response | Promise<Response> }, name: string, args: object, headers: Record<string, string> = bearer(OP, 'codex')) {
@@ -381,7 +383,7 @@ test('run_cleanup shows what a run would remove first, and removes it only when 
   const removed: unknown[] = [];
   const items = [{ kind: 'feedback' as const, id: 'manual:a', projectKey: 'demo-shop', sandbox: true, group: null, merged: false }];
   // The operator token opened run-1 (RunsStore.claim), so it may clean it up.
-  const owner = { claim: async () => ({ run: 'run-1', principal: 'operator' as const, actor: null, firstSeen: 't' }), owner: async () => ({ run: 'run-1', principal: 'operator' as const, actor: null, firstSeen: 't' }) };
+  const owner = { claim: async () => ({ run: 'run-1', principal: 'operator' as const, actor: runKey(KEY), firstSeen: 't' }), owner: async () => ({ run: 'run-1', principal: 'operator' as const, actor: runKey(KEY), firstSeen: 't' }) };
   const s = setup({ extra: { runs: { ...owner, items: async () => items, remove: async (run, keep) => { removed.push([run, keep]); return { feedback: 1, lesson: 0, miss: 0, predone_check: 0, fact: 0, doc: 0, link: 0, chat: 0 }; } } } });
   const dry = JSON.parse((await tool(s.app, 'run_cleanup', { run: 'run-1' })).text);
   expect(dry).toMatchObject({ run: 'run-1', dryRun: true, remove: { feedback: 1 } });

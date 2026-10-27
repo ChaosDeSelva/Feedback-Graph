@@ -70,7 +70,8 @@ function hostileRepo() {
 
 test('the stand-in commands do run under plain git, so the test below can see them', () => {
   const r = hostileRepo();
-  execFileSync('git', ['-C', r.repo, 'status', '--porcelain'], { stdio: 'pipe' });
+  // Exercise the clean filter directly; the deliberately invalid process filter makes status abort on some Git versions.
+  execFileSync('git', ['-C', r.repo, 'hash-object', '--path=src/app.ts', 'src/app.ts'], { stdio: 'pipe' });
   expect(r.ran()).toEqual(expect.arrayContaining(['clean']));
 });
 

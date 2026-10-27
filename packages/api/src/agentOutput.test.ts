@@ -5,7 +5,7 @@ import { checkBeforeDone, getModuleContext, getRecentSessions, getTaskContext, s
 
 const roots = [{ host: '/Users/j/Vibe', container: '/vibe' }];
 const lesson = (id: string, title: string, over: Partial<Lesson> = {}): Lesson => ({
-  id, projectKey: 'demo', title, rule: `${title}: ${'keep the rule short and concrete, '.repeat(2)}`, appliesWhen: 'chat rendering', scope: 'project', paths: [],
+  id, projectKey: 'demo', title, rule: `${title}: ${'keep the rule short and concrete, '.repeat(2)}`, appliesWhen: 'chat rendering', scope: 'project', paths: ['web/src/chat/pipeline.ts'],
   status: 'approved', source: 'postmortem', cause: 'requirement_unstated', missId: `miss:${id}`, createdAt: 't', decidedAt: 't', ...over,
 });
 const fact = (id: string, path: string, statement: string, over: Partial<StoredFact> = {}): StoredFact => ({
@@ -38,8 +38,8 @@ const mods = new Map<string, ModuleContext>(named.map((p, i) => [p, {
 /** A project with a real backlog: many lessons, misses, facts, docs, sessions and a linked project. */
 function bigDeps(over: Partial<ContextDeps> = {}): ContextDeps & { scans: [string, string[]][] } {
   const scans: [string, string[]][] = [];
-  const similar = Array.from({ length: 12 }, (_, i) => related(`r${i}`, `missed something in web/src/settings/page${i}.tsx about ${'state handling and the list '.repeat(2)}`, 0.7 - i * 0.02));
-  const facts: FactHit[] = Array.from({ length: 30 }, (_, i) => ({ fact: fact(`f${i}`, i % 3 ? `web/src/chat/f${i}.ts` : `graph/internal/f${i}.go`, `Fact ${i}: ${'the pipeline pairs self-closing custom tags before parsing, '.repeat(3)}`), score: 0.75 - i * 0.01 }));
+  const similar = Array.from({ length: 12 }, (_, i) => related(`r${i}`, `missed something in web/src/settings/page${i}.tsx about ${'state handling and the list '.repeat(2)}`, 0.95 - i * 0.01));
+  const facts: FactHit[] = Array.from({ length: 30 }, (_, i) => ({ fact: fact(`f${i}`, i % 3 ? `web/src/chat/f${i}.ts` : `graph/internal/f${i}.go`, `Fact ${i}: ${'the pipeline pairs self-closing custom tags before parsing, '.repeat(3)}`), score: 0.98 - i * 0.005 }));
   return {
     roots,
     embed: async (t) => t.map(() => [1, 0]),
@@ -56,7 +56,7 @@ function bigDeps(over: Partial<ContextDeps> = {}): ContextDeps & { scans: [strin
     },
     docs: {
       searchDocs: async (q) => q.projectKey === 'demo'
-        ? [doc('github:acme/demo-shop#142', 'Remove legacy thread creation', 'github', 0.62), doc('github:acme/demo-shop#77', 'Settings list refactor', 'github', 0.5), doc('upload:notes.md', 'Release notes', 'upload', 0.45), doc('github:acme/demo-shop#12', 'Old PR', 'github', 0.41), doc('upload:x.md', 'Misc', 'upload', 0.4)]
+        ? [doc('github:acme/demo-shop#142', 'Remove legacy thread creation', 'github', 0.92), doc('github:acme/demo-shop#77', 'Settings list refactor', 'github', 0.85), doc('upload:notes.md', 'Release notes', 'upload', 0.84), doc('github:acme/demo-shop#12', 'Old PR', 'github', 0.82), doc('upload:x.md', 'Misc', 'upload', 0.8)]
         : [doc('upload:linked.md', 'Linked doc', 'upload', 0.1)],
     },
     codegraph: {
@@ -97,7 +97,7 @@ describe('get_task_context on a realistic backlog', () => {
 
   test('misses and facts show their similarity, compactly', async () => {
     const r = await getTaskContext({ project: 'demo', task }, bigDeps());
-    expect(r.markdown).toMatch(/missed something in web\/src\/settings\/page0\.tsx.*· match 0\.70/);
+    expect(r.markdown).toMatch(/missed something in web\/src\/settings\/page0\.tsx.*· match 0\.95/);
     expect(r.markdown).toMatch(/Fact 1:.*· match 0\.\d\d/);
   });
 
@@ -145,7 +145,7 @@ describe('get_task_context on a realistic backlog', () => {
 
   test('with no files, a service the task names by its folder ranks first', async () => {
     const d = bigDeps({
-      k: { ...bigDeps().k, relatedMisses: async () => [related('g', 'missed the page offsets in graph/internal/page.go', 0.62), related('w', 'missed the admin gate in web/src/settings/usage.ts', 0.58)] },
+      k: { ...bigDeps().k, relatedMisses: async () => [related('g', 'missed the page offsets in graph/internal/page.go', 0.86), related('w', 'missed the admin gate in web/src/settings/usage.ts', 0.82)] },
     });
     const r = await getTaskContext({ project: 'demo', task: 'add a members list to the web settings' }, d);
     expect(r.misses.map((m) => m.missId)).toEqual(['w', 'g']);

@@ -196,6 +196,11 @@ export class KnowledgeRepo implements KnowledgeStore {
   async savePostmortem(feedbackId: string, raw: PostMortem, embeddings: { miss: number[]; lesson: number[] }) {
     const pm = redactDeep(raw); // model output can quote secrets it read in the repo
     const now = new Date().toISOString();
+    // A disputed claim that the post-mortem finds false is not a training miss.
+    if (pm.noMiss) {
+      await this.g.run('MATCH (f:Feedback {id: $fid}) SET f.status = $status, f.updatedAt = $now WITH f OPTIONAL MATCH (m:Miss)-[:EXPLAINS]->(f) DETACH DELETE m', { fid: feedbackId, status: 'rejected', now });
+      return;
+    }
     // A sandbox report's miss and lesson are sandbox records: marked before they are written (this may be the worker,
     // whose searches have not seen the report).
     const [k] = await this.g.run('MATCH (k:Candidate {id: $fid}) RETURN coalesce(k.sandbox, false) AS sandbox', { fid: feedbackId });
@@ -276,12 +281,15 @@ export class KnowledgeRepo implements KnowledgeStore {
          AND ($flag IS NULL OR l.checks CONTAINS $flag)
          AND ${VISIBLE_TO_RUN('l')}
        OPTIONAL MATCH (l)-[:DERIVED_FROM]->(:Miss)-[:EXPLAINS]->(:Feedback)-[:FROM_TURN]->(t:Turn)
-       WITH l, ${FROM} AS fromKind
-       WHERE $from IS NULL OR fromKind = $from
+       WITH l, t, ${FROM} AS fromKind
+       WHERE ($from IS NULL OR fromKind = $from)
+         AND ($author IS NULL OR toLower(t.external) CONTAINS $author)
+         AND ($pr IS NULL OR t.external =~ $pr)
        RETURN l, fromKind ORDER BY l.createdAt DESC LIMIT $limit`,
       {
         status: f.status ?? null, projectKey: f.projectKey ?? null, projectKeys: f.projectKeys ?? null, limit: neo4j.int(f.limit ?? 500),
         flag: f.flag ? `"name":${JSON.stringify(f.flag)}` : null, from: f.from ?? null, run: f.run ?? null,
+        author: f.author ? `"author":${JSON.stringify(f.author.toLowerCase())}` : null, pr: f.pr ? `(?s).*"thread":"[^"]*#${f.pr}".*` : null,
       },
     );
     return rows.map((r) => lessonOf(r.get('l').properties, r.get('fromKind')));
@@ -483,7 +491,7 @@ export class KnowledgeRepo implements KnowledgeStore {
   async searchLessons(q: { embedding: number[]; projectKey: string | null; k: number; status?: LessonStatus; projectKeys?: string[]; run?: string | null }): Promise<LessonHit[]> {
     const rows = await nearest(this.g, {
       index: 'lesson_embedding', label: 'Lesson', embedding: q.embedding, k: q.k,
-      where: `node.status = $status AND (node.projectKey IS NULL OR node.projectKey = $projectKey) AND ${LEARNED_IN('node')} AND ${await visibleToRun(this.g, 'node')}`,
+      where: `node.status = $status AND NOT coalesce(node.checks CONTAINS '"name":"no-miss"', false) AND (node.projectKey IS NULL OR node.projectKey = $projectKey) AND ${LEARNED_IN('node')} AND ${await visibleToRun(this.g, 'node')}`,
       tail: 'RETURN node, score ORDER BY score DESC LIMIT $k',
       params: { projectKey: q.projectKey, status: q.status ?? 'approved', projectKeys: q.projectKeys ?? null, run: q.run ?? null },
     });

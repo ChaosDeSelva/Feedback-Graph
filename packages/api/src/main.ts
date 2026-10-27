@@ -1,13 +1,13 @@
 import { existsSync } from 'node:fs';
 import type { Server } from 'node:http';
 import { serve } from '@hono/node-server';
-import { ConfigError, credentialFile, Integrations, loadConfig, makeProviderOr, redactSecrets, ollamaEmbed, ollamaPing, projectFolders, refreshLayout, shownProjects, storedSyncMemory, syncProjects, VERSION, worktreeGitArgs, type Project } from '@fb/core';
+import { ConfigError, credentialFile, githubRepoOfRemote, Integrations, loadConfig, makeProviderOr, redactSecrets, ollamaEmbed, ollamaPing, projectFolders, refreshLayout, shownProjects, storedSyncMemory, syncProjects, VERSION, worktreeGitArgs, type Project } from '@fb/core';
 import { openStore } from '@fb/store-postgres';
 import { Admission } from './admission.ts';
 import { createApp } from './app.ts';
 import { chatPackBuilder } from './chat.ts';
 import { hashRepoFile, makeJudge, repoFileSize, resolveProject, type ContextDeps } from './context.ts';
-import { readRepoDiff } from './diff.ts';
+import { readRepoDiff, readRepoPrNumbers, githubCommitPrLookup } from './diff.ts';
 import { rootsFile } from './roots.ts';
 import { stopServer, tuneServer } from './server.ts';
 
@@ -92,6 +92,8 @@ async function integrationProjects(): Promise<{ key: string; remote: string | nu
   return s.projects.map((key) => ({ key, remote: remotes.get(key) ?? null }));
 }
 
+const commitPrs = githubCommitPrLookup();
+
 /** What get_task_context and the other MCP tools read; Ask builds its context packs from the same. */
 const contextDeps: ContextDeps = {
   roots,
@@ -101,7 +103,7 @@ const contextDeps: ContextDeps = {
   k: knowledge,
   judge: makeJudge(judgeLlm),
   judgeId: judgeLlm.id,
-  judgeQueue: new Admission({ concurrency: config.check.concurrency, timeoutMs: config.check.waitSeconds * 1000 }),
+  judgeQueue: new Admission({ concurrency: config.check.concurrency, timeoutMs: Math.min(50_000, config.check.waitSeconds * 1000) }),
   activity,
   docs,
   inScope: async (key: string) => (await scope()).folder(key),
@@ -113,6 +115,16 @@ const contextDeps: ContextDeps = {
   fileSize: repoFileSize,
   mapMaxBytes: config.scanMaxBytes,
   // check_before_done with no diff: the change to files_changed, read-only from the mounted folder.
+  ownPrNumbers: async (repoPath, task, projectKey) => {
+    const [gitArgs, credential, linked, projects] = await Promise.all([
+      worktreeGitArgs(repoPath, roots), integrations.credential('github'),
+      projectKey ? integrations.link(projectKey) : null, integrationProjects(),
+    ]);
+    const repo = projectKey && (config.github.repos.get(projectKey) ?? githubRepoOfRemote(projects.find((p) => p.key === projectKey)?.remote ?? null));
+    return readRepoPrNumbers(repoPath, task, { gitArgs,
+      ...(repo && credential && linked?.github ? { associatedPulls: (sha: string) => commitPrs(repo, sha, credential.token) } : {}),
+    });
+  },
   repoDiff: async (repoPath: string, files: string[]) => readRepoDiff(repoPath, files, { gitArgs: await worktreeGitArgs(repoPath, roots) }),
   // Files an agent named that have no facts yet go to the front of the project's next scan.
   requestScan: (key: string, paths: string[]) => facts.requestFilesScan(key, paths),

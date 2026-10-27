@@ -117,6 +117,7 @@ const codeTalk = (text: string) => CODE_TALK.some((re) => re.test(splitPasted(te
 export function isProcessMiss(o: { feedbackText: string; rule: string | null; commentPath: string | null; paths?: string[] }): boolean {
   if (o.commentPath) return false;
   if (gitInstruction(o.feedbackText, { before: [], after: [] }).instruction) return true;
+  if (o.rule && aboutGit(o.rule) && !codeTalk(o.rule) && [...o.feedbackText.matchAll(NEGATION)].some((m) => subjectsOf(m[1]).length > 0)) return true;
   return !o.paths?.length && aboutGit(o.feedbackText) && !!o.rule && aboutGit(o.rule) && !codeTalk(o.feedbackText) && !codeTalk(o.rule);
 }
 

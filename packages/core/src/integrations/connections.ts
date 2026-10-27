@@ -38,7 +38,7 @@ export type IntegrationSyncState = {
 };
 
 /** Which integrations a project is linked to: its GitHub repository, its Linear team. */
-export type IntegrationLink = { github: boolean; linearTeamId: string | null; linearTeamName: string | null };
+export type IntegrationLink = { githubAuthor?: string | null; github: boolean; linearTeamId: string | null; linearTeamName: string | null };
 
 export const DEFAULT_LINK: IntegrationLink = { github: true, linearTeamId: null, linearTeamName: null };
 

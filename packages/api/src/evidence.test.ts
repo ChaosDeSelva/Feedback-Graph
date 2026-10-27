@@ -108,7 +108,7 @@ test('what an agent is served, and what it reports, name its session when it pas
 test('check_before_done takes session_id: the check is recorded with it and its Activity entry names the session, against lessons or past misses', async () => {
   const logged: { kind: string; targets?: string[]; details?: Record<string, unknown> }[] = [];
   const checks: unknown[] = [];
-  const lessonHit = { score: 0.9, lesson: { id: 'lesson:a', projectKey: 'demo', title: 'T', rule: 'R', appliesWhen: 'W', scope: 'project', paths: [], status: 'approved', source: 'postmortem', cause: null, missId: null, createdAt: 't', decidedAt: 't' } };
+  const lessonHit = { score: 0.9, lesson: { id: 'lesson:a', projectKey: 'demo', title: 'T', rule: 'R', appliesWhen: 'W', scope: 'project', paths: ['src/total.ts'], status: 'approved', source: 'postmortem', cause: null, missId: null, createdAt: 't', decidedAt: 't' } };
   const miss = { missId: 'miss:a', missed: 'm', cause: 'other', feedbackText: 'f', sessionId: 's0', ts: '2026-10-01T10:00:00Z', score: 0.9 };
   let lessons = true;
   const app = createApp(repo, {
@@ -124,7 +124,7 @@ test('check_before_done takes session_id: the check is recorded with it and its 
   });
   const call = (args: object) => app.request('/mcp', {
     method: 'POST', headers: { 'content-type': 'application/json', accept: 'application/json, text/event-stream' },
-    body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'check_before_done', arguments: { cwd: '/Users/j/Vibe/demo', task: 't', summary: 's', ...args } } }),
+    body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'check_before_done', arguments: { cwd: '/Users/j/Vibe/demo', task: 'update src/total.ts', summary: 's', ...args } } }),
   });
   expect((await call({ session_id: 's-7' })).status).toBe(200);
   expect(checks).toEqual([expect.objectContaining({ projectKey: 'demo', sessionId: 's-7' })]);

@@ -1,3 +1,4 @@
+import { isAbsolute, relative, resolve } from 'node:path';
 // The hooks' decisions, kept free of I/O so they can be tested. feedback-graph.mjs does the reading and the calls.
 
 const MAX_CONTEXT = 1_500;
@@ -11,7 +12,7 @@ const CHANGE = /\b(add|fix|implement|change|refactor|write|update|remove|delete|
  */
 export function asksForContext(prompt) {
   const p = (prompt ?? '').trim();
-  if (p.length < 20 || p.startsWith('/') || p.startsWith('!')) return false;
+  if (p.length < 20 || /^(?:[/!]|<(?:task-notification|local-command|command-name|system-reminder)\b)/i.test(p)) return false;
   return !((QUESTION.test(p) || p.endsWith('?')) && !CHANGE.test(p));
 }
 
@@ -173,38 +174,39 @@ function toolUses(lines) {
 }
 
 const isCheck = (u) => typeof u.name === 'string' && u.name.endsWith('check_before_done');
-const changes = (u) => EDIT_TOOLS.has(u.name) || (u.name === 'Bash' && /\bgit\s+commit\b/.test(u.input?.command ?? ''));
+export const inRepo = (path, cwd) => typeof path === 'string' && (!cwd || (() => { const r = relative(resolve(cwd), resolve(cwd, path)); return r !== '..' && !r.startsWith('../') && !isAbsolute(r); })());
+const changes = (u, cwd) => (EDIT_TOOLS.has(u.name) && (!cwd || inRepo(u.input?.file_path ?? u.input?.notebook_path, cwd))) || (u.name === 'Bash' && /\bgit\s+commit\b/.test(u.input?.command ?? ''));
 // Only a check_before_done that returned its answer: a denied or failed call checked nothing.
 const checks = (u) => isCheck(u) && u.answered;
 
 /** The transcript's lines: did the session change files (or commit) after its last check_before_done? */
-export function doneCheckPending(lines) {
+export function doneCheckPending(lines, cwd) {
   let pending = false;
   for (const u of toolUses(lines)) {
-    if (changes(u)) pending = true;
+    if (changes(u, cwd)) pending = true;
     else if (checks(u)) pending = false;
   }
   return pending;
 }
 
 /** Did the session call check_before_done after its last change, and get no answer (denied, failed)? */
-export function checkUnanswered(lines) {
+export function checkUnanswered(lines, cwd) {
   let unanswered = false;
   for (const u of toolUses(lines)) {
-    if (changes(u)) unanswered = false;
+    if (changes(u, cwd)) unanswered = false;
     else if (typeof u.name === 'string' && u.name.endsWith('check_before_done')) unanswered = !u.answered;
   }
   return unanswered;
 }
 
 /** The files the session edited after its last check_before_done, once each, in the order first edited. */
-export function editedSince(lines) {
+export function editedSince(lines, cwd) {
   let paths = [];
   for (const u of toolUses(lines)) {
     if (checks(u)) paths = [];
     else if (EDIT_TOOLS.has(u.name)) {
       const p = u.input?.file_path ?? u.input?.notebook_path;
-      if (typeof p === 'string' && !paths.includes(p)) paths.push(p);
+      if (inRepo(p, cwd) && !paths.includes(p)) paths.push(p);
     }
   }
   return paths;
@@ -266,7 +268,7 @@ export function stopDecision(input, pending, project, paths = [], unanswered = f
 export function stopHook(input, lines, project, state) {
   const last = toolUses(lines).filter(isCheck).at(-1);
   const checkDenied = last ? last.denied || (!!state.checkDenied && !last.answered) : !!state.checkDenied;
-  if (!checkDenied) return { out: stopDecision(input, doneCheckPending(lines), project, editedSince(lines), checkUnanswered(lines), state.base ?? null), state: { ...state, checkDenied: false, deniedSaid: false } };
+  if (!checkDenied) return { out: stopDecision(input, doneCheckPending(lines, input.cwd), project, editedSince(lines, input.cwd), checkUnanswered(lines, input.cwd), state.base ?? null), state: { ...state, checkDenied: false, deniedSaid: false } };
   const next = { ...state, checkDenied: true, deniedSaid: true };
   if (state.deniedSaid || input?.stop_hook_active) return { out: null, state: next };
   return {

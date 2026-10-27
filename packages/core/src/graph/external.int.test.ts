@@ -72,6 +72,9 @@ describeStores('external feedback threads', (h) => {
     expect(await store.graph.saveClassification('github:acme/shop#7/c1', pushback, true)).toBe('github:acme/shop#7/c1');
     const [c] = await store.graph.listCandidates({ status: 'pending' });
     expect(c).toMatchObject({ source: 'github', projectKey: 'shop', external: { thread: 'acme/shop#7', url: ref(1).url } });
+    expect((await store.graph.listCandidates({ pr: 7, author: 'REVIEWER', limit: 1 })).map((x) => x.id)).toEqual([c.id]);
+    expect(await store.graph.listCandidates({ pr: 70 })).toEqual([]);
+    expect(await store.graph.listCandidates({ author: 'review' })).toEqual([]);
     const d = await store.graph.candidateDetail(c.id);
     expect(d?.turn.external?.author).toBe('reviewer');
     expect(d?.after.map((t) => t.index)).toEqual([2]);
@@ -153,6 +156,9 @@ describeStores('external feedback threads', (h) => {
       contextItems: [],
     }, { miss: unit, lesson: unit });
     const [lesson] = await store.knowledge.listLessons({ status: 'proposed' });
+    expect((await store.knowledge.listLessons({ pr: 7, author: 'REVIEWER' })).map((x) => x.id)).toEqual([lesson.id]);
+    expect(await store.knowledge.listLessons({ pr: 70 })).toEqual([]);
+    expect(await store.knowledge.listLessons({ author: 'review' })).toEqual([]);
     const d = await store.knowledge.lessonDetail(lesson.id);
     expect(d?.feedback?.external).toEqual({ source: 'github', author: 'reviewer', url: ref(1).url, reviewState: 'APPROVED' });
   });

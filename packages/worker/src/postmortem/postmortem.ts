@@ -1,4 +1,4 @@
-import { readdir, readFile } from 'node:fs/promises';
+import { readdir, readFile, stat } from 'node:fs/promises';
 import { checkLesson, saysWrongSession, type LessonFlag } from './lessonCheck.ts';
 import { saysNoMiss } from './noMiss.ts';
 import { ambiguousFlag, validateLessonPaths } from './paths.ts';
@@ -127,6 +127,7 @@ export async function loadStandingContext(o: {
   repoPath: string;
   stopAt?: string;
   memoryDir: string;
+  before?: string;
   source?: FeedbackSource;
   evidence?: string[];
   roots?: { host: string; container: string }[];
@@ -135,6 +136,10 @@ export async function loadStandingContext(o: {
   const dirs = dirsDownTo(o.repoPath, o.stopAt);
   const stop = o.stopAt ? resolve(o.stopAt) : null;
   const read = async (kind: StandingDoc['kind'], ref: string, loaded: boolean): Promise<StandingDoc | null> => {
+    if (kind === 'memory' && o.before) {
+      const info = await stat(ref).catch(() => null);
+      if (!info || info.mtimeMs >= Date.parse(o.before)) return null;
+    }
     const text = await readFile(ref, 'utf8').catch(() => null);
     const seen = kind !== 'memory' && evidenced(ref, stop ? relative(stop, ref) : null, o.evidence ?? [], o.roots);
     return text ? { kind, ref, text: text.slice(0, MAX_STANDING_CHARS), loaded: loaded || seen } : null;

@@ -190,3 +190,13 @@ test('Sec-Fetch-Site cross-site writes are rejected even without Origin', async 
   const res = await createApp(fakeRepo().repo).request('/api/candidates/c1/decision', post({ 'sec-fetch-site': 'cross-site' }));
   expect(res.status).toBe(403);
 });
+
+
+test('Inbox PR and feedback-author filters reach the store before pagination', async () => {
+  const { repo, calls } = fakeRepo();
+  const app = createApp(repo);
+  expect((await app.request('/api/candidates?pr=42&author=Octo&limit=1&offset=4')).status).toBe(200);
+  expect(calls[0]).toEqual(['list', expect.objectContaining({ pr: 42, author: 'Octo', limit: 2, offset: 4 })]);
+  expect((await app.request('/api/candidates?pr=oops')).status).toBe(400);
+  expect((await app.request('/api/candidates?pr=0')).status).toBe(400);
+});

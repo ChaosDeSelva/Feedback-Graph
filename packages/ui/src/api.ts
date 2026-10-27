@@ -169,15 +169,15 @@ export const api = {
   pipeline: (project?: string) => request<PipelineStatus>(`/api/pipeline${qs({ project })}`),
 
   /** One page of the Inbox (CANDIDATE_PAGE items from `offset`), and where the next starts. */
-  candidates: (status: CandidateStatus, project?: string, offset = 0) =>
-    requestPage<Candidate>(`/api/candidates${qs({ status, limit: String(CANDIDATE_PAGE), project, offset: offset ? String(offset) : undefined })}`),
+  candidates: (status: CandidateStatus, project?: string, offset = 0, filters: { pr?: string; author?: string } = {}) =>
+    requestPage<Candidate>(`/api/candidates${qs({ status, ...filters, limit: String(CANDIDATE_PAGE), project, offset: offset ? String(offset) : undefined })}`),
   candidate: (id: string) => request<CandidateDetail>(`/api/candidates/${enc(id)}`),
   decide: (id: string, status: 'confirmed' | 'rejected', note?: string) =>
     request(`/api/candidates/${enc(id)}/decision`, { method: 'POST', body: note ? { status, note } : { status } }),
   stats: () => request<StatsRow[]>('/api/stats'),
 
-  lessons: (status: LessonStatus, o: { project?: string; flag?: LessonCheckName; source?: LessonFrom } = {}) =>
-    request<Lesson[]>(`/api/lessons${qs({ status, project: o.project, flag: o.flag, source: o.source })}`),
+  lessons: (status: LessonStatus, o: { project?: string; flag?: LessonCheckName; source?: LessonFrom; pr?: string; author?: string } = {}) =>
+    request<Lesson[]>(`/api/lessons${qs({ status, project: o.project, flag: o.flag, source: o.source, pr: o.pr, author: o.author })}`),
   /** Many decisions in one call (owner-only); each lesson is recorded as decided on its own. */
   decideLessons: (items: { id: string; status: 'approved' | 'rejected'; note?: string }[]) =>
     request<{ results: { id: string; ok: boolean; status?: string; error?: string }[] }>('/api/lessons/decisions', { method: 'POST', body: { items } }),
@@ -289,7 +289,7 @@ export type ServiceView = {
 export type ProjectIntegrations = {
   key: string;
   github: {
-    repo: string | null; from: 'remote' | 'GITHUB_REPOS' | null; enabled: boolean; lastSyncAt: string | null; items: number; error: string | null;
+    author?: string | null; repo: string | null; from: 'remote' | 'GITHUB_REPOS' | null; enabled: boolean; lastSyncAt: string | null; items: number; error: string | null;
     /** PRs a sync stopped by its cap has not read yet (updated after `since`, before `until`): read on the next syncs. */
     backlog: { since: string; until: string } | null;
   };
@@ -312,7 +312,7 @@ export const integrationsApi = {
   test: (kind: IntegrationKind) => request<{ ok: boolean; account: string | null; error: string | null; view: IntegrationsView }>(`/api/settings/integrations/${kind}/test`, { method: 'POST', body: {} }),
   disconnect: (kind: IntegrationKind) => request<IntegrationsView>(`/api/settings/integrations/${kind}`, { method: 'DELETE', body: {} }),
   linearTeams: () => request<LinearTeam[]>('/api/settings/integrations/linear/teams'),
-  setProject: (key: string, patch: { github?: boolean; linearTeamId?: string | null; linearTeamName?: string | null }) =>
+  setProject: (key: string, patch: { githubAuthor?: string | null; github?: boolean; linearTeamId?: string | null; linearTeamName?: string | null }) =>
     request<IntegrationsView>(`/api/settings/integrations/projects/${enc(key)}`, { method: 'PUT', body: patch }),
 };
 

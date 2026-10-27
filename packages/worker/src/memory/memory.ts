@@ -61,6 +61,8 @@ export type MemoryDeps = {
   activity?: Pick<ActivityStore, 'record'>;
   /** MEMORY_AUTO_APPROVE: import as approved. Default: proposed, waiting for you in Lessons like a post-mortem's lesson. */
   autoApprove?: boolean;
+  /** True when the session wrote this memory after feedback already represented in the Inbox. */
+  writtenAfterFeedback?(projectKey: string, path: string): Promise<boolean>;
 };
 
 /**
@@ -81,7 +83,7 @@ export async function importMemories(d: MemoryDeps): Promise<number> {
       if (!s?.isFile()) continue;
       if (!d.state.changed(path, s.size, s.mtimeMs)) continue;
       const note = parseMemoryFile(await readFile(path, 'utf8'));
-      if (note?.type === 'feedback') {
+      if (note?.type === 'feedback' && !(await d.writtenAfterFeedback?.(projectKey, path))) {
         const [embedding] = await d.embed([`${note.name}\n${note.description}\n${note.body}`]);
         const id = `memory:${dir}/${file}`;
         const title = note.name || file.replace(/\.md$/, '');

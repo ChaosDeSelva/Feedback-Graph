@@ -1,13 +1,16 @@
 import { NotTheRunsError, OPERATOR_VERBS, type Activity, type ActivityInput, type Lesson, type OperatorVerb, type RunItem, type RunItemKind, type RunOwner, type RunPrincipal, type RunTag } from '@fb/core';
 import { expect, test } from 'vitest';
 import { createApp, type ApiRepo, type AppOpts } from './app.ts';
+import { runKey } from './operator.ts';
 import type { ContextDeps } from './context.ts';
 
 const OP = 'o'.repeat(32);
+const KEY = 'test-run-capability-'.padEnd(40, 'a');
+const CALLER = runKey(KEY)!;
 const json = (method: string, body: object, headers: Record<string, string> = {}) => ({
   method, body: JSON.stringify(body), headers: { 'content-type': 'application/json', ...headers },
 });
-const op = (run?: string, more: Record<string, string> = {}) => ({ authorization: `Bearer ${OP}`, 'x-fg-operator': 'tester', ...(run && { 'x-fg-run': run }), ...more });
+const op = (run?: string, more: Record<string, string> = {}) => ({ authorization: `Bearer ${OP}`, 'x-fg-operator': 'tester', 'x-fg-run-key': KEY, ...(run && { 'x-fg-run': run }), ...more });
 const browser = { origin: 'http://localhost' };
 
 const lesson = (id: string, o: Partial<Lesson> = {}): Lesson => ({
@@ -21,7 +24,7 @@ const entry = (o: Partial<Activity>): Activity => ({
 
 const API = 'a'.repeat(32);
 
-function setup(o: { allow?: OperatorVerb[]; items?: RunItem[]; entries?: Activity[]; extra?: Partial<AppOpts>; ctx?: Partial<ContextDeps>; owners?: Record<string, RunPrincipal | [RunPrincipal, string]>; token?: string } = {}) {
+function setup(o: { allow?: OperatorVerb[]; items?: RunItem[]; entries?: Activity[]; extra?: Partial<AppOpts>; ctx?: Partial<ContextDeps>; owners?: Record<string, RunPrincipal | [RunPrincipal, string | null]>; token?: string } = {}) {
   const logged: ActivityInput[] = [];
   const listed: unknown[] = [];
   const reports: unknown[] = [];
@@ -241,7 +244,7 @@ const items: RunItem[] = [
   { kind: 'doc', id: 'doc:demo:upload:a.md', projectKey: 'demo', sandbox: true, group: null, merged: false },
 ];
 const runEntries = [
-  entry({ kind: 'candidate_flagged', run: 'run-1', targets: ['manual:a'], details: { via: 'api' } }),
+  entry({ kind: 'candidate_flagged', actor: 'operator:tester', run: 'run-1', targets: ['manual:a'], details: { via: 'api' } }),
   // The owner approved b's lesson in the browser since: the run did not make that decision, so b stays.
   entry({ kind: 'lesson_decided', actor: 'you', targets: ['lesson:manual:b'], details: { via: 'browser' }, subject: 'approved lesson "B"' }),
   // The worker's own work on the run's records is not a touch.
@@ -250,11 +253,11 @@ const runEntries = [
   entry({ kind: 'feedback_decided', actor: 'operator:tester', run: 'run-1', targets: ['c-owner'], details: { via: 'operator' }, subject: 'confirmed: "x"' }),
   // So is a pin (it names no record), but not what the run was served.
   entry({ kind: 'project_pinned', actor: 'operator:tester', run: 'run-1', targets: [], details: { via: 'operator' }, subject: 'pinned demo' }),
-  entry({ kind: 'context_served', run: 'run-1', targets: ['lesson:owner'], details: { via: 'api' } }),
+  entry({ kind: 'context_served', actor: 'operator:tester', run: 'run-1', targets: ['lesson:owner'], details: { via: 'api' } }),
 ];
 
 test('a dry run (the default) says per kind what would go, what stays and why, and what the run changed that is not its own; nothing is removed', async () => {
-  const { app, removed, logged } = setup({ items, entries: runEntries, owners: { 'run-1': 'operator' } });
+  const { app, removed, logged } = setup({ items, entries: runEntries, owners: { 'run-1': ['operator', CALLER] } });
   const plan = (await (await app.request('/api/runs/run-1', { headers: op() })).json()) as Record<string, any>;
   expect(plan).toMatchObject({ run: 'run-1', dryRun: true, sandbox: true, remove: { feedback: 1, lesson: 1, doc: 1, miss: 0 } });
   expect(plan.kept).toEqual([
@@ -270,7 +273,7 @@ test('a dry run (the default) says per kind what would go, what stays and why, a
 });
 
 test('cleanup removes what the run wrote, keeping what someone else touched since, and logs it', async () => {
-  const { app, removed, logged } = setup({ items, entries: runEntries, owners: { 'run-1': 'operator' } });
+  const { app, removed, logged } = setup({ items, entries: runEntries, owners: { 'run-1': ['operator', CALLER] } });
   const res = await app.request('/api/runs/run-1', json('DELETE', { dryRun: false }, op()));
   expect(res.status).toBe(200);
   expect(await res.json()).toMatchObject({ dryRun: false, removed: { feedback: 1, lesson: 1, doc: 1 } });
@@ -281,7 +284,7 @@ test('cleanup removes what the run wrote, keeping what someone else touched sinc
 
 test("the operator token may clean up by default, only its own run; a plain client never", async () => {
   expect((await setup({ items }).app.request('/api/runs/run-1', json('DELETE', { dryRun: false }))).status).toBe(403);
-  const narrowed = setup({ items, allow: OPERATOR_VERBS.filter((v) => v !== 'run_cleanup'), owners: { 'run-1': 'operator' } });
+  const narrowed = setup({ items, allow: OPERATOR_VERBS.filter((v) => v !== 'run_cleanup'), owners: { 'run-1': ['operator', CALLER] } });
   expect((await narrowed.app.request('/api/runs/run-1', json('DELETE', { dryRun: false }, op()))).status).toBe(403);
   expect((await setup().app.request('/api/runs/not%20a%20run', { headers: op() })).status).toBe(400);
   // A run that wrote nothing: an empty plan, not an error.
@@ -308,7 +311,7 @@ test('a run id belongs to whoever opened it: a write under it by anyone else is 
   expect(res.status).toBe(409);
   expect(((await res.json()) as { error: string }).error).toMatch(/run id belongs to another caller/);
   expect(logged).toEqual([]);
-  const mine = setup({ owners: { 'run-1': 'operator' } });
+  const mine = setup({ owners: { 'run-1': ['operator', CALLER] } });
   const mcp = await mine.app.request('/mcp?run=run-1', rpc('report_feedback', { cwd: '/Users/j/Vibe/demo', feedback: 'x', what_was_done: 'y' }));
   expect(mcp.status).toBe(409);
   expect(mine.reports).toEqual([]);
@@ -317,16 +320,16 @@ test('a run id belongs to whoever opened it: a write under it by anyone else is 
   expect((await mine.app.request('/api/candidates/r:run-1/decision', json('POST', { status: 'confirmed' }, op('run-1')))).status).toBe(204);
 });
 
-test("the operator token cleans up its own run and an agent's, and is refused (403) on an owner-token, browser or legacy run; the owner may clean any", async () => {
+test("the operator token cleans up its own run, and is refused (403) on an owner-token, browser or legacy run; the owner may clean any", async () => {
   const own = setup({ items });
   expect((await own.app.request('/api/candidates/r:run-1/decision', json('POST', { status: 'confirmed' }, op('run-1')))).status).toBe(204);
   expect((await own.app.request('/api/runs/run-1', json('DELETE', { dryRun: false }, op()))).status).toBe(200);
   expect(own.removed).toHaveLength(1);
-  for (const principal of ['owner_token', 'browser'] as const) {
+  for (const principal of ['owner_token', 'browser', 'agent'] as const) {
     const s = setup({ items, owners: { 'run-1': principal } });
     const refused = await s.app.request('/api/runs/run-1', json('DELETE', { dryRun: false }, op()));
     expect(refused.status).toBe(403);
-    expect(((await refused.json()) as { error: string }).error).toMatch(/only its own runs/);
+    expect(((await refused.json()) as { error: string }).error).toMatch(/private FG_RUN_KEY/);
     expect(s.removed).toEqual([]);
     expect((await s.app.request('/api/runs/run-1', json('DELETE', { dryRun: false }, browser))).status).toBe(200);
     expect(s.removed).toHaveLength(1);
@@ -341,43 +344,36 @@ test("the operator token cleans up its own run and an agent's, and is refused (4
   expect((await busy.app.request('/api/runs/run-1', json('DELETE', { dryRun: false }, op()))).status).toBe(403);
 });
 
-test('a run belongs to the operator name that opened it: another name gets 409 on a write and 403 on cleanup; a run opened before names were recorded is any operator\'s', async () => {
+test('run ownership requires a secret capability, independent of the display name', async () => {
   const s = setup({ items });
-  expect((await s.app.request('/api/candidates/r:run-1/decision', json('POST', { status: 'confirmed' }, op('run-1')))).status).toBe(204);
-  expect(s.owners.get('run-1')).toMatchObject({ principal: 'operator', actor: 'operator:tester' });
-  const other = { 'x-fg-operator': 'other' };
-  const write = await s.app.request('/api/candidates/r:run-1/decision', json('POST', { status: 'confirmed' }, op('run-1', other)));
-  expect(write.status).toBe(409);
-  expect(((await write.json()) as { error: string }).error).toMatch(/opened by the operator token as operator:tester/);
-  const clean = await s.app.request('/api/runs/run-1', json('DELETE', { dryRun: false }, op(undefined, other)));
-  expect(clean.status).toBe(403);
-  expect(((await clean.json()) as { error: string }).error).toMatch(/operator:tester/);
+  const path = '/api/candidates/r:run-1/decision';
+  expect((await s.app.request(path, json('POST', { status: 'confirmed' }, op('run-1')))).status).toBe(204);
+  expect(s.owners.get('run-1')).toMatchObject({ principal: 'operator', actor: CALLER });
+  // Copying the display name cannot impersonate the caller.
+  const other = { 'x-fg-run-key': 'another-secret-capability'.padEnd(40, 'b') };
+  expect((await s.app.request(path, json('POST', { status: 'confirmed' }, op('run-1', other)))).status).toBe(409);
+  expect((await s.app.request('/api/runs/run-1', json('DELETE', { dryRun: false }, op(undefined, other)))).status).toBe(403);
   expect(s.removed).toEqual([]);
-  expect((await s.app.request('/api/runs/run-1', json('DELETE', { dryRun: false }, op()))).status).toBe(200);
-  // The admin MCP endpoint is the same caller under the same name.
-  const mcp = setup({ items, owners: { 'run-1': ['operator', 'operator:other'] } });
-  const req = rpc('run_cleanup', { run: 'run-1', apply: true });
-  const res = await mcp.app.request('/mcp/admin', { ...req, headers: { ...req.headers, ...op() } });
-  expect(await textOf(res)).toMatch(/operator:other/);
-  expect(mcp.removed).toEqual([]);
-  // Opened before names were recorded: any operator name, as before.
-  const legacy = setup({ items, owners: { 'run-1': 'operator' } });
-  expect((await legacy.app.request('/api/candidates/r:run-1/decision', json('POST', { status: 'confirmed' }, op('run-1', other)))).status).toBe(204);
-  expect((await legacy.app.request('/api/runs/run-1', json('DELETE', { dryRun: false }, op(undefined, other)))).status).toBe(200);
+  // A different display name with the same capability is still the same caller.
+  expect((await s.app.request(path, json('POST', { status: 'confirmed' }, op('run-1', { 'x-fg-operator': 'renamed' })))).status).toBe(204);
+  expect((await s.app.request('/api/runs/run-1', json('DELETE', { dryRun: false }, op(undefined, { 'x-fg-operator': 'renamed' })))).status).toBe(200);
+  for (const actor of [null, 'operator:tester']) {
+    const legacy = setup({ items, owners: { 'run-1': ['operator', actor] } });
+    expect((await legacy.app.request(path, json('POST', { status: 'confirmed' }, op('run-1')))).status).toBe(409);
+    expect((await legacy.app.request('/api/runs/run-1', json('DELETE', { dryRun: false }, op()))).status).toBe(403);
+    expect((await legacy.app.request('/api/runs/run-1', json('DELETE', { dryRun: false }, browser))).status).toBe(200);
+  }
 });
 
-test("the operator token cleans up a run an agent without a token opened (sandbox or not): what it wrote, its pre-done checks included, goes; the cleanup is logged as the operator", async () => {
-  const agentItems: RunItem[] = [...items, { kind: 'predone_check', id: 'pdc-1', projectKey: 'demo', sandbox: false, group: null, merged: false }];
-  const s = setup({ items: agentItems, owners: { 'run-1': 'agent' } });
-  const dry = (await (await s.app.request('/api/runs/run-1', json('DELETE', {}, op()))).json()) as Record<string, any>;
-  expect(dry).toMatchObject({ dryRun: true, remove: { predone_check: 1 } });
-  expect((await s.app.request('/api/runs/run-1', json('DELETE', { dryRun: false }, op()))).status).toBe(200);
-  expect(s.removed).toEqual([['run-1', []]]);
-  expect(s.logged.at(-1)).toMatchObject({ kind: 'run_cleaned', actor: 'operator:tester', details: expect.objectContaining({ openedBy: 'agent' }) });
+test('an operator cannot clean another agent run; the owner can', async () => {
+  const s = setup({ items, owners: { 'run-1': 'agent' } });
+  expect((await s.app.request('/api/runs/run-1', json('DELETE', { dryRun: false }, op()))).status).toBe(403);
+  expect(s.removed).toEqual([]);
+  expect((await s.app.request('/api/runs/run-1', json('DELETE', { dryRun: false }, browser))).status).toBe(200);
 });
 
 test("cleanup with --apply also removes the run's Activity entries, all but the run_cleaned entry, which keeps what the run changed; the dry run says so", async () => {
-  const { app, removedEntries, logged } = setup({ items, entries: runEntries, owners: { 'run-1': ['operator', 'operator:tester'] } });
+  const { app, removedEntries, logged } = setup({ items, entries: runEntries, owners: { 'run-1': ['operator', CALLER] } });
   const dry = (await (await app.request('/api/runs/run-1', json('DELETE', {}, op()))).json()) as Record<string, any>;
   expect(dry).toMatchObject({ dryRun: true, entries: 4, entriesCapped: false });
   expect(removedEntries).toEqual([]);
@@ -392,7 +388,7 @@ test("cleanup with --apply also removes the run's Activity entries, all but the 
 
 test('cleanup keeps the history of every record it keeps: the entry that created a record the owner decided on stays', async () => {
   const created = entry({ kind: 'postmortem_done', actor: 'ollama:m', run: 'run-1', targets: ['manual:b', 'lesson:manual:b'], subject: 'proposed lesson "B"' });
-  const { app, removeArgs } = setup({ items, entries: [...runEntries, created], owners: { 'run-1': ['operator', 'operator:tester'] } });
+  const { app, removeArgs } = setup({ items, entries: [...runEntries, created], owners: { 'run-1': ['operator', CALLER] } });
   const res = (await (await app.request('/api/runs/run-1', json('DELETE', { dryRun: false }, op()))).json()) as Record<string, any>;
   // b (decided by the owner) and c (merged into a session's Inbox item) stay, and so do the entries about them.
   expect([...removeArgs[0].targets!].sort()).toEqual(['lesson:manual:b', 'manual:b', 'manual:c']);
@@ -401,11 +397,11 @@ test('cleanup keeps the history of every record it keeps: the entry that created
 
 test('a run with more entries than a cleanup reads: only the entries it read (and listed) go; every change among them is listed; the rest stay for the next cleanup', async () => {
   const many = Array.from({ length: 5100 }, (_, i) => entry({
-    id: `act:${String(i).padStart(5, '0')}`, run: 'run-1', ...(i % 20 === 0
-      ? { kind: 'project_pinned' as const, actor: 'operator:tester', details: { via: 'operator' }, subject: `pinned ${i}` }
+    id: `act:${String(i).padStart(5, '0')}`, actor: 'operator:tester', run: 'run-1', ...(i % 20 === 0
+      ? { kind: 'project_pinned' as const, details: { via: 'operator' }, subject: `pinned ${i}` }
       : { kind: 'context_served' as const, details: { via: 'api' } }),
   }));
-  const { app, removeArgs, logged } = setup({ items: [], entries: many, owners: { 'run-1': ['operator', 'operator:tester'] } });
+  const { app, removeArgs, logged } = setup({ items: [], entries: many, owners: { 'run-1': ['operator', CALLER] } });
   const res = (await (await app.request('/api/runs/run-1', json('DELETE', { dryRun: false }, op()))).json()) as Record<string, any>;
   expect(res).toMatchObject({ entriesCapped: true, entriesRemoved: 5000 });
   expect(removeArgs[0].ids).toHaveLength(5000);
@@ -448,7 +444,7 @@ test('a cleanup request never claims a run: the owner cleans an agent run while 
 });
 
 test('the admin MCP run_cleanup, in a request labelled with the run, logs run_cleaned untagged', async () => {
-  const { app, logged } = setup({ items, entries: runEntries, owners: { 'run-1': 'operator' } });
+  const { app, logged } = setup({ items, entries: runEntries, owners: { 'run-1': ['operator', CALLER] } });
   const req = rpc('run_cleanup', { run: 'run-1', apply: true });
   const res = await app.request('/mcp/admin?run=run-1', { ...req, headers: { ...req.headers, ...op() } });
   expect(res.status).toBe(200);
@@ -597,4 +593,24 @@ test("a run never pins, decides on, converts or talks in the owner's records (40
   // A sandbox run, even the owner's, never changes the owner's records.
   const sbx = owned({ owners: { 'run-1': 'browser' } });
   expect((await sbx.app.request('/api/projects/demo/pin', json('PUT', { pinned: true }, { ...browser, ...SANDBOX }))).status).toBe(409);
+});
+
+
+test('operator-labelled writes require a valid run capability', async () => {
+  for (const key of ['', 'short']) {
+    const s = setup();
+    const res = await s.app.request('/api/candidates/r:run-1/decision', json('POST', { status: 'confirmed' }, op('run-1', { 'x-fg-run-key': key })));
+    expect(res.status).toBe(403);
+    expect(s.logged).toEqual([]);
+    expect(s.owners.size).toBe(0);
+  }
+});
+
+test('cleanup preserves request Activity written by another displayed caller', async () => {
+  const mine = entry({ id: 'mine', run: 'run-1', actor: 'operator:tester', details: { via: 'operator' } });
+  const other = entry({ id: 'other', run: 'run-1', actor: 'operator:other', details: { via: 'operator' } });
+  const s = setup({ items: [], entries: [mine, other], owners: { 'run-1': ['operator', CALLER] } });
+  const res = await s.app.request('/api/runs/run-1', json('DELETE', { dryRun: false }, op()));
+  expect(res.status).toBe(200);
+  expect(s.removeArgs[0].ids).toEqual(['mine']);
 });

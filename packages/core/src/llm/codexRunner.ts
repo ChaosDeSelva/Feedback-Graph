@@ -1,5 +1,5 @@
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
-import { mkdtemp, readFile, realpath, rename, rm, stat, writeFile } from 'node:fs/promises';
+import { mkdtemp, readdir, readFile, realpath, rename, rm, stat, writeFile } from 'node:fs/promises';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { tmpdir } from 'node:os';
 import { isAbsolute, join, relative, resolve } from 'node:path';
@@ -17,6 +17,17 @@ import { execCommand, type Exec } from './exec.ts';
  * Node builtins only: the runner image copies this file and exec.ts, nothing else of the repo.
  */
 
+/** Remove abandoned repository copies only; fresh/pending mirrors remain available to their workers. */
+export async function purgeStaleRunnerMirrors(scratch: string, keep?: string, now = Date.now()): Promise<void> {
+  for (const name of await readdir(scratch).catch(() => [] as string[])) {
+    if (!/^fb-mirror-[A-Za-z0-9]+$/.test(name)) continue;
+    const path = join(scratch, name);
+    if (keep && resolve(path) === resolve(keep)) continue;
+    const info = await stat(path).catch(() => null);
+    if (info?.isDirectory() && now - info.mtimeMs > 24 * 60 * 60_000) await rm(path, { recursive: true, force: true });
+  }
+}
+
 export const RUNNER_TOKEN_FILE = '.runner-token';
 export const RUNNER_DEFAULT_TIMEOUT_MS = 15 * 60_000;
 export const RUNNER_MAX_TIMEOUT_MS = 60 * 60_000;
@@ -32,6 +43,17 @@ export function codexArgs(o: { dir: string; schemaPath: string; outPath: string;
   if (o.model) args.push('-m', o.model);
   args.push('-');
   return args;
+}
+
+/** A fresh mount/PID namespace: only this job's mirror, output folder and login are visible. */
+export function isolatedRunnerArgs(o: { dir: string; work: string; auth: string; bin: string; args: string[] }): string[] {
+  return [
+    '--die-with-parent', '--new-session', '--unshare-user', '--unshare-pid', '--unshare-ipc', '--unshare-uts', '--unshare-cgroup-try',
+    '--ro-bind', '/usr', '/usr', '--ro-bind', '/bin', '/bin', '--ro-bind', '/lib', '/lib', '--ro-bind-try', '/lib64', '/lib64',
+    '--ro-bind', '/etc', '/etc', '--proc', '/proc', '--dev', '/dev', '--tmpfs', '/tmp', '--tmpfs', '/codex',
+    '--bind-try', o.auth, '/codex/auth.json', '--ro-bind', o.dir, '/repo', '--bind', o.work, o.work,
+    '--chdir', '/repo', '--setenv', 'CODEX_HOME', '/codex', '--setenv', 'HOME', '/tmp', '--', o.bin, ...o.args,
+  ];
 }
 
 /** One job: `mirror` is a directory in the scratch volume, relative to it (or absolute inside it). */
@@ -102,6 +124,8 @@ export type RunnerOpts = {
   exec?: Exec;
   /** The CLI to run; tests pass a stand-in. */
   bin?: string;
+  /** Disable only for local test stand-ins. Production always uses an outer mount namespace and fails closed. */
+  isolate?: boolean;
   env?: NodeJS.ProcessEnv;
   maxTimeoutMs?: number;
   killGraceMs?: number;
@@ -160,8 +184,12 @@ export function createCodexRunner(o: RunnerOpts) {
       const outPath = join(work, 'out.json');
       await writeFile(schemaPath, JSON.stringify(job.schema));
       const timeoutMs = Math.min(job.timeoutMs ?? RUNNER_DEFAULT_TIMEOUT_MS, max);
-      const r = await exec(o.bin ?? 'codex', codexArgs({ dir, schemaPath, outPath, model: job.model }), {
-        cwd: dir,
+      const isolated = o.isolate !== false;
+      const args = codexArgs({ dir: isolated ? '/repo' : dir, schemaPath, outPath, model: job.model });
+      const r = await exec(isolated ? 'bwrap' : o.bin ?? 'codex', isolated ? isolatedRunnerArgs({
+        dir, work, auth: join((o.env ?? process.env).CODEX_HOME ?? '/codex', 'auth.json'), bin: o.bin ?? 'codex', args,
+      }) : args, {
+        cwd: work,
         stdin: job.prompt,
         env: runnerEnv(o.env ?? process.env),
         timeoutMs,
@@ -193,6 +221,7 @@ export function createCodexRunner(o: RunnerOpts) {
         const status = err instanceof RunnerRequestError ? err.status : 500;
         return send(res, status, { error: err instanceof Error ? err.message : String(err) });
       }
+      await purgeStaleRunnerMirrors(o.scratch, dir);
       // Accepted: headers now, whitespace while codex works, the result at the end (JSON ignores the whitespace).
       res.writeHead(200, { 'content-type': 'application/json' });
       keepalive = setInterval(() => res.write(' '), o.keepaliveMs ?? KEEPALIVE_MS);
