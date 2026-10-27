@@ -62,6 +62,21 @@ describeStores('PortabilityStore', (h) => {
     expect(json).not.toContain('turn 1'); // other turns of the session are not part of the bundle
   });
 
+  test('both backup adapters roundtrip review flags without changing an approved status', async () => {
+    const [original] = await k.listLessons({ projectKey: 'demo' });
+    await k.updateLesson(original.id, { status: 'approved' }, {});
+    const checks = [{ name: 'no-miss' as const, why: 'the disputed claim was false' }];
+    await k.setLessonChecks(original.id, checks);
+    const backup = JSON.parse(JSON.stringify(await p.exportData({ projectKey: 'demo' })));
+    const saved = backup.lessons.find((l: { id: string }) => l.id === original.id);
+    expect(saved).toMatchObject({ status: 'approved', checks });
+    await k.upsertLesson({ ...saved, id: 'restored:flagged', embedding: vec(1) });
+    expect((await k.lessonDetail('restored:flagged'))?.lesson).toMatchObject({ status: 'approved', checks });
+    expect((await p.exportData({ projectKey: 'demo' })).lessons.find((l) => l.id === 'restored:flagged')?.checks).toEqual(checks);
+    expect((await k.listLessons({ status: 'approved', projectKey: 'demo' })).map((l) => l.id)).toContain('restored:flagged');
+    expect((await k.searchLessons({ embedding: vec(1), projectKey: 'demo', k: 10 })).map((h) => h.lesson.id)).not.toContain('restored:flagged');
+  });
+
   test('the bundle carries each project\'s git remote, so clones in differently named folders can be matched', async () => {
     await repo.setProjectRemote('demo', 'github.com/org/demo');
     const one = await p.exportData({ projectKey: 'demo' });

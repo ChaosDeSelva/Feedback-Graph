@@ -219,7 +219,7 @@ export async function syncBundle(p: Pick<PortabilityStore, 'exportData'>, projec
     // Approved ones, and the cloud's copies with their new status (it demotes rejected, superseded or proposed ones).
     // A lesson you never approved stays home unless SYNC_SUGGESTIONS is on.
     lessons: b.lessons
-      .filter((l) => LESSON_STATUSES.has(l.status) && shared(l))
+      .filter((l) => LESSON_STATUSES.has(l.status) && shared(l) && !l.checks?.some((c) => c.name === 'no-miss'))
       .map((l) => ({
         id: l.id, projectKey: l.projectKey, title: l.title, rule: l.rule, appliesWhen: l.appliesWhen, scope: l.scope, paths: [...l.paths],
         status: l.status, source: l.source, cause: l.cause, missId: l.missId, createdAt: l.createdAt, decidedAt: l.decidedAt,

@@ -1,4 +1,4 @@
-import { EXPORT_FORMAT, type ActivityInput, type ExportBundle, type Lesson, type LessonInput } from '@fb/core';
+import { gradeLessons, EXPORT_FORMAT, type ActivityInput, type ExportBundle, type Lesson, type LessonInput } from '@fb/core';
 import { expect, test } from 'vitest';
 import { createApp, type ApiRepo } from './app.ts';
 import { MAX_IMPORT_BYTES, type ImportDeps } from './import.ts';
@@ -122,4 +122,15 @@ test('fields a newer export adds are ignored; misses, docs and the code map are 
   const res = await post(app, { ...bundle({ lessons: [], misses: [{ id: 'miss:1' } as never], docs: [{ id: 'doc:1' } as never], codeFiles: [{ path: 'a' } as never] }), futureField: { x: 1 } });
   expect(res.status).toBe(200);
   expect(((await res.json()) as { notImported: Record<string, number> }).notImported).toEqual({ misses: 1, docs: 1, codeFiles: 1 });
+});
+
+test('a JSON backup roundtrip preserves no-miss quarantine even when keeping approved status', async () => {
+  const checks = [{ name: 'no-miss' as const, why: 'false claim; review this approval' }];
+  const backup = JSON.parse(JSON.stringify(bundle({ lessons: [lesson('lesson:quarantine', { paths: ['src/orders.ts'], checks })] })));
+  const { app, upserted } = deps();
+  expect((await post(app, backup, '?keepApproved=1')).status).toBe(200);
+  expect(upserted[0]).toMatchObject({ status: 'approved', checks });
+  const { run: _run, ...fields } = upserted[0];
+  const restored: Lesson = { ...lesson('lesson:quarantine'), ...fields };
+  expect(gradeLessons([{ lesson: restored, score: 1 }], 'orders', { projectKey: 'demo', files: ['src/orders.ts'] })).toEqual({ follow: [], related: [] });
 });

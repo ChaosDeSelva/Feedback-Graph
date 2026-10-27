@@ -679,3 +679,26 @@ test('a withdrawal that fails is kept and tried again on the next sync', async (
   expect(r.projects[0]).toMatchObject({ key: 'shop', status: 'withdrawn' });
   expect([...memory.keys()]).toEqual([]);
 });
+
+test('no-miss approved lessons never sync and a previously shared copy is withdrawn without revoking local approval', async () => {
+  const data = bundle();
+  const bundles = { shop: data };
+  const memory = new Map();
+  await runCloudSync({ cloud, portability: store(bundles), projects: async () => ['shop'], trigger: 'manual', fetch: fakeFetch([]).f, sleep: noSleep, memory });
+  data.lessons[0].checks = [{ name: 'no-miss', why: 'false claim; approval requires review' }];
+  const fresh = await syncBundle(store(bundles), 'shop', undefined, { suggestions: true });
+  expect(fresh?.lessons.map((l) => l.id)).not.toContain('lesson:1');
+  const second = fakeFetch([]);
+  await runCloudSync({ cloud, portability: store(bundles), projects: async () => ['shop'], trigger: 'manual', fetch: second.f, sleep: noSleep, memory });
+  expect(sentBody(second.calls[0]).withdrawn).toContainEqual({ kind: 'lesson', id: 'lesson:1' });
+  expect(sentBody(second.calls[0]).lessons.map((l) => l.id)).not.toContain('lesson:1');
+  expect(data.lessons[0].status).toBe('approved');
+});
+
+test('cloud allowlist still omits review details of safe lessons', async () => {
+  const data = bundle();
+  data.lessons[0].checks = [{ name: 'needs-path', why: 'local review note' }];
+  const result = await syncBundle(store({ shop: data }), 'shop');
+  expect(result?.lessons[0].id).toBe('lesson:1');
+  expect(result?.lessons[0]).not.toHaveProperty('checks');
+});

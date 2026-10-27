@@ -739,12 +739,12 @@ export class PgKnowledgeStore implements KnowledgeStore {
       // Once you have decided on or edited a lesson, re-importing its file never overrides you.
       await c.query(
         `INSERT INTO lessons (id, created_at, status, decided_at, source, project_key, origin_project_key,
-                              title, rule, applies_when, scope, paths, embedding, run, sandbox)
-         VALUES ($1, $2::timestamptz, $3::text, CASE WHEN $3::text = 'proposed' THEN NULL ELSE $2::timestamptz END, $4, $5, $5, $6, $7, $8, $9, $10, $11::vector, $12, $13)
+                              title, rule, applies_when, scope, paths, embedding, run, sandbox, checks)
+         VALUES ($1, $2::timestamptz, $3::text, CASE WHEN $3::text = 'proposed' THEN NULL ELSE $2::timestamptz END, $4, $5, $5, $6, $7, $8, $9, $10, $11::vector, $12, $13, $14::jsonb)
          ON CONFLICT (id) DO UPDATE SET title = EXCLUDED.title, rule = EXCLUDED.rule, applies_when = EXCLUDED.applies_when,
-           scope = EXCLUDED.scope, paths = EXCLUDED.paths, embedding = EXCLUDED.embedding
+           scope = EXCLUDED.scope, paths = EXCLUDED.paths, embedding = EXCLUDED.embedding, checks = coalesce(EXCLUDED.checks, lessons.checks)
          WHERE NOT lessons.decided_by_you`,
-        [l.id, now, l.status, l.source, l.projectKey ?? null, l.title, l.rule, l.appliesWhen ?? null, l.scope, l.paths ?? [], vectorOf(l.embedding), input.run?.id ?? null, !!input.run?.sandbox],
+        [l.id, now, l.status, l.source, l.projectKey ?? null, l.title, l.rule, l.appliesWhen ?? null, l.scope, l.paths ?? [], vectorOf(l.embedding), input.run?.id ?? null, !!input.run?.sandbox, l.checks == null ? null : toJson(l.checks)],
       );
       if (l.projectKey != null) await c.query('INSERT INTO projects (key) VALUES ($1) ON CONFLICT DO NOTHING', [l.projectKey]);
     });

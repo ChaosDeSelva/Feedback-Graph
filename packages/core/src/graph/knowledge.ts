@@ -105,6 +105,8 @@ export type LessonInput = {
   status: LessonStatus;
   source: Lesson['source'];
   embedding: number[];
+  /** Review/quarantine flags preserved across backup imports. */
+  checks?: LessonCheck[] | null;
   /** The run it was written in (x-fg-run; fg demo seed): recorded when the lesson is first written, never moved. */
   run?: RunTag | null;
 };
@@ -754,11 +756,11 @@ export class KnowledgeRepo implements KnowledgeStore {
        WITH l, coalesce(l.decidedByYou, false) AS yours
        FOREACH (_ IN CASE WHEN yours THEN [] ELSE [1] END |
          SET l.title = $l.title, l.rule = $l.rule, l.appliesWhen = $l.appliesWhen, l.scope = $l.scope, l.paths = $l.paths,
-             l.embedding = $l.embedding)
+             l.embedding = $l.embedding, l.checks = CASE WHEN $checks IS NULL THEN l.checks ELSE $checks END)
        WITH l WHERE $l.projectKey IS NOT NULL
        MERGE (p:Project {key: $l.projectKey})
        MERGE (l)-[:APPLIES_TO]->(p)`,
-      { l, now, run: input.run?.id ?? null, sandbox: input.run?.sandbox ? true : null },
+      { l, now, checks: l.checks == null ? null : JSON.stringify(l.checks), run: input.run?.id ?? null, sandbox: input.run?.sandbox ? true : null },
     );
   }
 }

@@ -110,6 +110,7 @@ export class PortabilityRepo implements PortabilityStore {
           missId: (l.missId as string) ?? null,
           createdAt: l.createdAt as string,
           decidedAt: (l.decidedAt as string) ?? null,
+          ...(typeof l.checks === 'string' && { checks: JSON.parse(l.checks) as NonNullable<Lesson['checks']> }),
         };
       }),
       misses: misses.map((r) => {

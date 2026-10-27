@@ -1,6 +1,6 @@
 import type { Hono } from 'hono';
 import { z } from 'zod';
-import { EXPORT_FORMAT, FACT_KINDS, redactDeep, type ActivityStore, type EmbeddedFact, type FactsStore, type KnowledgeStore, type LessonInput, type LessonStatus } from '@fb/core';
+import { EXPORT_FORMAT, FACT_KINDS, LESSON_CHECKS, redactDeep, type ActivityStore, type EmbeddedFact, type FactsStore, type KnowledgeStore, type LessonInput, type LessonStatus } from '@fb/core';
 
 /**
  * POST /api/import: an export bundle (GET /api/export) back into a store, on this or another machine, either backend.
@@ -42,6 +42,7 @@ const Lesson = z.object({
   paths: z.array(z.string().max(300)).max(50).default([]),
   status: z.enum(['proposed', 'approved', 'rejected', 'superseded']),
   source: z.enum(['postmortem', 'memory', 'manual', 'demo']).default('postmortem'),
+  checks: z.array(z.object({ name: z.enum(LESSON_CHECKS), why: z.string().max(4000), of: z.string().max(300).optional() })).max(100).nullable().optional(),
 });
 
 const Fact = z.object({
@@ -108,6 +109,7 @@ export async function importBundle(raw: ImportBundle, o: { keepApproved: boolean
     const input: LessonInput = {
       id: l.id, projectKey: l.scope === 'global' ? null : l.projectKey, title: l.title, rule: l.rule, appliesWhen: l.appliesWhen,
       scope: l.scope, paths: l.paths, status: l.next, source: l.source, embedding: lessonVectors[i],
+      ...(l.checks != null && { checks: l.checks }),
     };
     await d.knowledge.upsertLesson(input);
     added.push(l.id);

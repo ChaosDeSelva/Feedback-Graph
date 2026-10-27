@@ -66,7 +66,7 @@ export class PgPortabilityStore implements PortabilityStore {
       return [
         await q(`SELECT key, remote FROM projects WHERE ($1::text IS NULL OR key = $1) AND ($2::text[] IS NULL OR key = ANY($2)) ORDER BY key COLLATE "C"`, [key, keys]),
         await q(
-          `SELECT id, project_key, title, rule, applies_when, scope, paths, status, source, cause, miss_id, created_at, decided_at
+          `SELECT id, project_key, title, rule, applies_when, scope, paths, status, source, cause, miss_id, created_at, decided_at, checks
            FROM lessons
            WHERE ($1::text IS NULL OR project_key = $1 OR (project_key IS NULL AND origin_project_key = $1))
              AND ($3::text[] IS NULL OR coalesce(project_key, origin_project_key) IS NULL OR coalesce(project_key, origin_project_key) = ANY($3))
@@ -124,6 +124,7 @@ export class PgPortabilityStore implements PortabilityStore {
           missId: l.miss_id ?? null,
           createdAt: iso(l.created_at) as string,
           decidedAt: iso(l.decided_at),
+          ...(l.checks != null && { checks: l.checks }),
         }),
       ),
       misses: misses.map((m) => ({
