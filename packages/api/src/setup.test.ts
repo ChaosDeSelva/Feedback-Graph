@@ -26,7 +26,7 @@ function sandbox(o: { linuxUid?: number; tags?: string; claude?: boolean; chat?:
   const home = join(base, 'home');
   const bin = join(base, 'bin');
   for (const d of [join(repo, 'scripts', 'lib'), home, bin, join(home, 'code'), join(home, 'work')]) mkdirSync(d, { recursive: true });
-  for (const f of ['scripts/setup.sh', 'scripts/lib/env.sh', 'scripts/lib/ollama.sh', '.env.example']) copyFileSync(join(repoRoot, f), join(repo, f));
+  for (const f of ['scripts/setup.sh', 'scripts/lib/env.sh', 'scripts/lib/ollama.sh', 'scripts/lib/runner-apparmor.sh', '.env.example']) copyFileSync(join(repoRoot, f), join(repo, f));
   const stub = (name: string, body: string) => {
     writeFileSync(join(bin, name), `#!/bin/sh\n${body}\n`);
     chmodSync(join(bin, name), 0o755);

@@ -13,6 +13,7 @@ here="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$here"
 . scripts/lib/env.sh
 . scripts/lib/ollama.sh
+. scripts/lib/runner-apparmor.sh
 
 usage() {
   cat <<'EOF'
@@ -504,6 +505,9 @@ if [ -n "$taken_by" ]; then
   exit 0
 fi
 if confirm "Start Feedback Graph now (docker compose up -d --build; restarts it to apply .env and project folder changes)? [Y/n]" y; then
+  case ",$(envval COMPOSE_PROFILES)," in
+    *,codex,*) runner_apparmor_check /proc/sys/kernel/apparmor_restrict_unprivileged_userns /sys/kernel/security/apparmor/profiles "$(envval CODEX_RUNNER_APPARMOR)" || exit 1 ;;
+  esac
   "${compose[@]}" up -d --build
   auth=()
   api_token="$(envval API_TOKEN)"

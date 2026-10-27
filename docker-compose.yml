@@ -199,7 +199,8 @@ services:
       - seccomp=unconfined
       # Docker's default AppArmor profile denies mount propagation changes inside bwrap's new user namespace.
       # Scope this exception to the runner; its outer mount/PID namespace still hides other jobs and runner state.
-      - apparmor=unconfined
+      # On Ubuntu with restricted userns, load scripts/apparmor/feedback-graph-codex-runner and select its name.
+      - apparmor=${CODEX_RUNNER_APPARMOR:-unconfined}
     restart: unless-stopped
 
   api:

@@ -1,0 +1,9 @@
+abi <abi/4.0>,
+#include <tunables/global>
+
+# Ubuntu restricts capabilities in user namespaces of genuinely unconfined processes.
+# Explicitly grant userns to this named profile; the runner's bubblewrap mount/PID
+# namespace, dropped container capabilities and read-only root remain its boundary.
+profile feedback-graph-codex-runner flags=(unconfined) {
+  userns,
+}
