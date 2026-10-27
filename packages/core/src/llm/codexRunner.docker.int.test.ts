@@ -59,7 +59,7 @@ describe.skipIf(!dockerUp)('codex-runner container', () => {
     // The runner with exactly the hardening docker-compose.yml gives it (checked against the file below), published on
     // loopback only for this test.
     docker([
-      'run', '-d', ...user, '--name', `${id}-runner`, '--network', `${id}-net`, '--init', '--read-only', '--tmpfs', '/tmp', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges:true', '--security-opt', 'seccomp=unconfined',
+      'run', '-d', ...user, '--name', `${id}-runner`, '--network', `${id}-net`, '--init', '--read-only', '--tmpfs', '/tmp', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges:true', '--security-opt', 'seccomp=unconfined', '--security-opt', 'apparmor=unconfined',
       '-e', 'HOME=/tmp', '-v', `${scratch}:/scratch`, '-v', `${id}-home:/codex`, '-v', `${auth}:/codex/auth.json`, '-p', '127.0.0.1::8790', IMAGE,
     ]);
     url = `http://${docker(['port', `${id}-runner`, '8790/tcp']).trim().split('\n')[0]}`;
@@ -106,13 +106,17 @@ describe.skipIf(!dockerUp)('codex-runner container', () => {
     const empty = join(root, 'empty.env');
     writeFileSync(empty, '');
     const env = { PATH: process.env.PATH, HOME: process.env.HOME, DOCKER_HOST: process.env.DOCKER_HOST, DOCKER_CONTEXT: process.env.DOCKER_CONTEXT, NEO4J_PASSWORD: 'x' };
-    const cfg = JSON.parse(docker(['compose', '--env-file', empty, '-f', join(repoRoot, 'docker-compose.yml'), '--profile', 'codex', 'config', '--format', 'json'], { timeout: 30_000, env })) as { services: Record<string, { volumes?: { target: string; source: string }[]; environment?: Record<string, string>; ports?: unknown[]; read_only?: boolean; cap_drop?: string[]; security_opt?: string[]; tmpfs?: string[] }> };
+    const cfg = JSON.parse(docker(['compose', '--env-file', empty, '-f', join(repoRoot, 'docker-compose.yml'), '--profile', 'codex', 'config', '--format', 'json'], { timeout: 30_000, env })) as { services: Record<string, { volumes?: { target: string; source: string }[]; environment?: Record<string, string>; ports?: unknown[]; read_only?: boolean; privileged?: boolean; cap_drop?: string[]; security_opt?: string[]; tmpfs?: string[] }> };
     const runner = cfg.services['codex-runner'];
     expect(runner.volumes!.map((v) => v.target).sort()).toEqual(['/codex', '/codex/auth.json', '/scratch']);
     expect(runner.volumes!.find((v) => v.target === '/codex')!.source).not.toBe(cfg.services.worker.volumes!.find((v) => v.target === '/codex')!.source);
     expect(Object.keys(runner.environment ?? {}).sort()).toEqual(['CODEX_HOME', 'HOME', 'RUNNER_PORT', 'RUNNER_SCRATCH']);
     expect(runner.ports ?? []).toEqual([]);
-    expect(runner).toMatchObject({ read_only: true, cap_drop: ['ALL'], security_opt: ['no-new-privileges:true', 'seccomp=unconfined'], tmpfs: ['/tmp'] });
+    expect(runner).toMatchObject({ read_only: true, cap_drop: ['ALL'], security_opt: ['no-new-privileges:true', 'seccomp=unconfined', 'apparmor=unconfined'], tmpfs: ['/tmp'] });
+    expect(runner.privileged).not.toBe(true);
+    for (const [name, service] of Object.entries(cfg.services)) {
+      if (name !== 'codex-runner') expect(service.security_opt ?? []).not.toContain('apparmor=unconfined');
+    }
     // The scratch volume and the Codex login file are all the two share.
     const shared = cfg.services.worker.volumes!.filter((w) => runner.volumes!.some((r) => r.source === w.source)).map((w) => w.target);
     expect(shared.sort()).toEqual(['/codex/auth.json', '/scratch']);

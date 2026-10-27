@@ -197,6 +197,9 @@ services:
       # unprivileged user namespace, which Docker's default seccomp profile refuses. Without it every command codex
       # runs fails. This container holds nothing but the mirror and the Codex login (SECURITY.md).
       - seccomp=unconfined
+      # Docker's default AppArmor profile denies mount propagation changes inside bwrap's new user namespace.
+      # Scope this exception to the runner; its outer mount/PID namespace still hides other jobs and runner state.
+      - apparmor=unconfined
     restart: unless-stopped
 
   api:
