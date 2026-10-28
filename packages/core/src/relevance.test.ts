@@ -17,11 +17,11 @@ test('rankFacts keeps a low-relevance fact when the task is very close to it (a 
   expect(ranked.map((h) => h.fact.statement).sort()).toEqual(['every query is scoped by orgId', 'how to configure the deploy tool']);
 });
 
-test('rankFacts ranks unscored facts as middling, keeps n, and returns the weighted score', () => {
+test('rankFacts ranks unscored facts as middling, keeps n, and preserves raw similarity', () => {
   const ranked = rankFacts([hit('a', 0.8, null), hit('b', 0.8, 1), hit('c', 0.8, 0.5), hit('d', 0.5, 1)], 2);
   expect(ranked.map((h) => h.fact.statement)).toEqual(['b', 'a']);
   expect(ranked[0].score).toBeCloseTo(0.8);
-  expect(ranked[1].score).toBeCloseTo(0.8 * (0.55 + 0.45 * 0.5));
+  expect(ranked[1].score).toBeCloseTo(0.8);
 });
 
 test('relevanceBand names the three bands, and unscored', () => {

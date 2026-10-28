@@ -1,3 +1,4 @@
+import { repairV6Sources } from './v6Recovery.ts';
 import { REDACTION_VERSION, type ActivityStore, type ChatStore, type DocsStore, type FactsStore, type GraphStore, type KnowledgeStore, type SessionsStore } from '@fb/core';
 
 /**
@@ -21,6 +22,7 @@ export type RedactStoredDeps = {
   /** Ask: each question, its stored pack, the answer and its sources. */
   chats?: Pick<ChatStore, 'redactStoredTurns'>;
   activity?: Pick<ActivityStore, 'record'> & Partial<Pick<ActivityStore, 'list' | 'redactStoredActivity'>>;
+  repair?: Parameters<typeof repairV6Sources>[0];
   log?: (msg: string, extra?: object) => void;
 };
 
@@ -54,6 +56,11 @@ async function v2Counts(d: RedactStoredDeps): Promise<V2Counts | null> {
 export async function redactStoredOnRuleChange(d: RedactStoredDeps): Promise<RedactStoredResult | null> {
   const stamp = `v${REDACTION_VERSION}`;
   const last = await d.cursors.getCursor(REDACTION_CURSOR);
+  if (d.repair && (last === 'v6' || await d.cursors.getCursor('redaction-v6-repair-needed') === 'yes')) {
+    await d.cursors.setCursor('redaction-v6-repair-needed', 'yes');
+    await repairV6Sources(d.repair);
+    await d.cursors.setCursor('redaction-v6-repair-needed', 'done');
+  }
   if (last === stamp) return null;
   // Rules v2 redacted ordinary prose ("the primary key is user_id2") and closed such facts as credentials. Read what
   // it did before this run touches the log.

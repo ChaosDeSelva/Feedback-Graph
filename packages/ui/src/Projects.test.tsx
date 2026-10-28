@@ -90,12 +90,14 @@ test("an agentic scan's line says how many of its shards were rescanned (the oth
   expect(screen.queryByText(/not reached/)).toBeNull();
 });
 
-test('the scan line says how many places its agents did not reach, and names them on hover', async () => {
+test('the scan line says how many places its agents did not reach, and exposes their list through a keyboard-accessible disclosure', async () => {
   projectList = [{ ...projects[0], lastScan: { ...job('done'), shards: { total: 20, rescanned: 12, failed: 0, unreached: ['src/svc/internal', 'src/svc/cmd'] } } }, projects[1]];
   render(<Projects />);
   await screen.findByText('Use sendError for all errors');
   const line = screen.getByText('2 places not reached');
-  expect(line.getAttribute('title')).toContain('src/svc/internal');
+  expect(line.tagName).toBe('SUMMARY');
+  fireEvent.click(line);
+  expect(within(screen.getByRole('list', { name: 'Places not reached' })).getByText('src/svc/internal')).toBeTruthy();
 });
 
 test('each project shows its git remote under its name, and the selected one its other clones', async () => {

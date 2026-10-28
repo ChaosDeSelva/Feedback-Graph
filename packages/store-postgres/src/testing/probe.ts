@@ -118,6 +118,10 @@ export class PostgresProbe implements StoreProbe {
     if ('aliases' in fields) await this.q('UPDATE projects SET aliases = $2 WHERE key = $1', [key, fields.aliases ?? []]);
   }
 
+  async setLessonCreatedAt(ids: string[], at: string) {
+    await this.q('UPDATE lessons SET created_at = $2::timestamptz WHERE id = ANY($1::text[])', [ids, at]);
+  }
+
   async seedOrphan(row: { kind: 'Lesson' | 'Doc'; id: string; projectKey: string }) {
     if (row.kind === 'Lesson') {
       await this.q(

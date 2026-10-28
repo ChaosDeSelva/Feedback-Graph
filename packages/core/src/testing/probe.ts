@@ -84,6 +84,8 @@ export interface StoreProbe {
   embeddings(): Promise<Record<string, number[] | null>>;
   /** Overwrite fields of an existing project directly, bypassing the aliasing rules. */
   setProject(key: string, fields: { remote?: string | null; aliases?: string[] }): Promise<void>;
+  /** Force a creation-time tie so pagination/order contracts never depend on sleeps or wall-clock speed. */
+  setLessonCreatedAt(ids: string[], at: string): Promise<void>;
   /** A record filed under a project key that has no project of its own, as older stores hold them. */
   seedOrphan(row: { kind: 'Lesson' | 'Doc'; id: string; projectKey: string }): Promise<void>;
   /** An embedded record with only the fields its embedding text needs (a backend may add placeholder parents). */

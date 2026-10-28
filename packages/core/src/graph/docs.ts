@@ -203,6 +203,14 @@ export class DocsRepo implements DocsStore {
     await this.g.run(`MATCH (d:Doc {readStatus: 'reading'}) SET d.readStatus = 'pending'`);
   }
 
+  async queueRedactionRepair(id: string): Promise<boolean> {
+    const [r] = await this.g.run(`MATCH (d:Doc {id: $id}) WHERE d.source = 'upload' AND coalesce(d.readStatus, '') <> 'reading'
+      AND (EXISTS { MATCH (b:DocBlob {docId: $id}) } OR
+        (EXISTS { MATCH (d)-[:HAS_CHUNK]->(:Chunk) } AND NOT EXISTS { MATCH (d)-[:HAS_CHUNK]->(c:Chunk) WHERE c.text CONTAINS '[REDACTED]' }))
+      SET d.readStatus = 'pending', d.readAttempts = 0, d.readError = null, d.readRetryAt = null RETURN count(d) AS n`, { id });
+    return Number(r?.get('n') ?? 0) > 0;
+  }
+
   async requeueDocRead(id: string): Promise<boolean> {
     const [r] = await this.g.run(
       `MATCH (d:Doc {id: $id}) WHERE d.readStatus IN ['failed', 'pending']

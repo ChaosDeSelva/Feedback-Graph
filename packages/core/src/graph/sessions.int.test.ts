@@ -59,6 +59,22 @@ describeStores('SessionsStore', (h) => {
   });
   const ids = async (o: Partial<SummaryWorkQuery> = {}) => (await s.work(query(o))).map((w) => w.id);
 
+  test('real transcript session run claims are immutable and candidates inherit the binding', async () => {
+    const run = { id: 'real-run', sandbox: true };
+    expect(await s.claimRun('labelled', run)).toBe(true);
+    expect(await s.claimRun('labelled', run)).toBe(true);
+    expect(await s.claimRun('labelled', { id: 'another', sandbox: true })).toBe(false);
+    await repo.upsertSession(demo, session('labelled', 2, MIN), []);
+    expect(await s.runFor('labelled')).toEqual(run);
+    await repo.saveClassification('labelled-t1', { label: 'pushback', confidence: 0.9, summary: 'missed scoping', signals: [] }, true);
+    expect((await h.probe.rows('Candidate')).find((r) => r.id === 'labelled-t1')).toMatchObject({ run: 'real-run', sandbox: true });
+    await repo.decide('labelled-t1', 'confirmed', null);
+    expect((await h.probe.rows('Feedback')).find((r) => r.id === 'labelled-t1')).toMatchObject({ run: 'real-run', sandbox: true });
+    await repo.upsertSession(demo, session('owner-session', 1, MIN), []);
+    expect(await s.claimRun('owner-session', run)).toBe(false);
+    expect(await s.runFor('owner-session')).toBeNull();
+  });
+
   test('upsertSession keeps the turn count, last turn and last activity; the list is newest first and leaves agent reports out', async () => {
     await repo.upsertSession(demo, session('old', 2, 120 * MIN), []);
     const fresh = session('new', 3, 1 * MIN, { source: 'codex' });

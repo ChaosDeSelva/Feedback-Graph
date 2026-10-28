@@ -981,7 +981,7 @@ export async function runScan(job: ScanJob, d: ScanDeps): Promise<ScanResult> {
           if (providerUnavailableReason(err)) throw err;
           const timeout = modelTimeoutReason(err);
           timeoutsInRow = timeout ? timeoutsInRow + 1 : 0;
-          if (timeout && timeoutsInRow >= MAX_TIMEOUTS_IN_ROW) throw new Error(`${MAX_TIMEOUTS_IN_ROW} shards in a row timed out (last: ${s.key}): ${timeout}`);
+          if (timeout && timeoutsInRow >= MAX_TIMEOUTS_IN_ROW) throw new Error(`${MAX_TIMEOUTS_IN_ROW} shards in a row timed out (last: ${s.key}): ${timeout}`, { cause: err });
           // Not saved, so its hashes stay stale and the next scan tries it again; the other shards go on.
           failedShards.push({ key: s.key, err });
           failedKeys.push(s.key);
@@ -1061,7 +1061,7 @@ export async function runScan(job: ScanJob, d: ScanDeps): Promise<ScanResult> {
           // counted attempt (files saved so far stay) rather than waiting out the timeout on every remaining file.
           const timeout = modelTimeoutReason(err);
           timeoutsInRow = timeout ? timeoutsInRow + 1 : 0;
-          if (timeout && timeoutsInRow >= MAX_TIMEOUTS_IN_ROW) throw new Error(`${MAX_TIMEOUTS_IN_ROW} files in a row timed out (last: ${f.path}): ${timeout}`);
+          if (timeout && timeoutsInRow >= MAX_TIMEOUTS_IN_ROW) throw new Error(`${MAX_TIMEOUTS_IN_ROW} files in a row timed out (last: ${f.path}): ${timeout}`, { cause: err });
           // Not saved, so its hash stays stale and the next scan tries it again.
           failed.push(f.path);
           await note('facts_extracted', `could not extract facts from ${f.path}`, String(err), { hash: f.hash }, [fileId(f.path)]);

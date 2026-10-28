@@ -43,10 +43,10 @@ test('GET /api/sessions lists the selected projects, newest first, with an opaqu
   const body = await res.json();
   expect(body.sessions).toEqual([item('s1')]);
   expect(decodeSessionCursor(body.next)).toEqual({ at: '2026-10-22T10:00:00.000Z', id: 's1' });
-  expect(calls.list).toEqual([{ projectKeys: ['demo', 'other'], state: 'idle', limit: 10, after: null }]);
+  expect(calls.list).toEqual([{ projectKeys: ['demo', 'other'], state: 'idle', limit: 10, after: null, run: null }]);
   const cursor: SessionCursor = { at: '2026-10-22T10:00:00.000Z', id: 's1' };
   await app().request(`/api/sessions?project=demo&cursor=${encodeSessionCursor(cursor)}`);
-  expect(calls.list[1]).toEqual({ projectKeys: ['demo'], state: undefined, limit: 50, after: cursor });
+  expect(calls.list[1]).toEqual({ projectKeys: ['demo'], state: undefined, limit: 50, after: cursor, run: null });
 });
 
 test('the list refuses a bad cursor or state, and a project that is not selected', async () => {

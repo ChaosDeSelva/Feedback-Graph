@@ -1,7 +1,7 @@
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import { mkdtemp, readdir, readFile, realpath, rename, rm, stat, writeFile } from 'node:fs/promises';
 import type { IncomingMessage, ServerResponse } from 'node:http';
-import { tmpdir } from 'node:os';
+import { hostname, tmpdir } from 'node:os';
 import { isAbsolute, join, relative, resolve } from 'node:path';
 import { execCommand, type Exec } from './exec.ts';
 
@@ -17,14 +17,25 @@ import { execCommand, type Exec } from './exec.ts';
  * Node builtins only: the runner image copies this file and exec.ts, nothing else of the repo.
  */
 
-/** Remove abandoned repository copies only; fresh/pending mirrors remain available to their workers. */
-export async function purgeStaleRunnerMirrors(scratch: string, keep?: string, now = Date.now()): Promise<void> {
+/** Lease metadata is beside the mirror, never exposed inside the repository mounted for a job. */
+export const mirrorLeasePath = (dir: string) => join(resolve(dir, '..'), `.${dir.split('/').at(-1)}.lease`);
+/** Sweep abandoned copies in both worker and runner; renewable leases protect live and queued mirrors. */
+export async function purgeStaleRunnerMirrors(scratch: string, keep?: string, now = Date.now(), worker = false): Promise<void> {
   for (const name of await readdir(scratch).catch(() => [] as string[])) {
     if (!/^fb-mirror-[A-Za-z0-9]+$/.test(name)) continue;
     const path = join(scratch, name);
     if (keep && resolve(path) === resolve(keep)) continue;
-    const info = await stat(path).catch(() => null);
-    if (info?.isDirectory() && now - info.mtimeMs > 24 * 60 * 60_000) await rm(path, { recursive: true, force: true });
+    const leasePath = mirrorLeasePath(path);
+    const lease = await readFile(leasePath, 'utf8').then(v => JSON.parse(v) as { pid: number; host: string }).catch(() => null);
+    const info = await stat(lease ? leasePath : path).catch(() => null);
+    let dead = false;
+    if (worker && lease?.host === hostname() && Number.isInteger(lease.pid) && lease.pid > 0) {
+      try { process.kill(lease.pid, 0); } catch (e) { dead = (e as NodeJS.ErrnoException).code === 'ESRCH'; }
+    }
+    if (dead || (info && now - info.mtimeMs > 5 * 60_000)) {
+      await rm(path, { recursive: true, force: true });
+      await rm(leasePath, { force: true });
+    }
   }
 }
 
@@ -130,6 +141,7 @@ export type RunnerOpts = {
   maxTimeoutMs?: number;
   killGraceMs?: number;
   keepaliveMs?: number;
+  healthTimeoutMs?: number;
 };
 
 function readBody(req: IncomingMessage): Promise<string> {
@@ -176,6 +188,31 @@ export function createCodexRunner(o: RunnerOpts) {
   const exec = o.exec ?? execCommand;
   const max = o.maxTimeoutMs ?? RUNNER_MAX_TIMEOUT_MS;
   let busy = false;
+  let checkedAt = 0;
+  let lastHealth: { ok: boolean; sandbox: boolean; error?: string } | null = null;
+  let probing: Promise<{ ok: boolean; sandbox: boolean; error?: string }> | null = null;
+  async function health() {
+    if (o.isolate === false) return { ok: true, sandbox: false };
+    if (lastHealth && (busy || Date.now() - checkedAt < 30_000)) return lastHealth;
+    if (probing) return probing;
+    probing = (async () => {
+      const work = await mkdtemp(join(tmpdir(), 'fb-runner-probe-'));
+      try {
+        const probe = ['-e', "if(require('fs').existsSync('/scratch'))process.exit(2)"];
+        // Exercise the nested user/network/PID/proc sandbox, with no model call or login needed.
+        const inner = isolatedRunnerArgs({ dir: '/repo', work, auth: '/codex/auth.json', bin: 'node', args: probe });
+        inner.unshift('--unshare-net');
+        const args = isolatedRunnerArgs({ dir: work, work, auth: join((o.env ?? process.env).CODEX_HOME ?? '/codex', 'auth.json'), bin: 'bwrap', args: inner });
+        const r = await exec('bwrap', args, { cwd: work, stdin: '', env: runnerEnv(o.env ?? process.env), timeoutMs: o.healthTimeoutMs ?? 5000 });
+        if (r.code !== 0) throw new Error(r.stderr.slice(0, 300) || `sandbox probe exit ${r.code}`);
+        lastHealth = { ok: true, sandbox: true };
+      } catch (e) {
+        lastHealth = { ok: false, sandbox: false, error: `Codex sandbox cannot start: ${String(e).slice(0, 400)}. Rebuild the runner and check the Docker procfs/AppArmor settings in docs/operations.md.` };
+      } finally { await rm(work, { recursive: true, force: true }); checkedAt = Date.now(); }
+      return lastHealth!;
+    })().finally(() => { probing = null; });
+    return probing;
+  }
 
   async function run(job: RunnerJob, dir: string): Promise<RunnerResult> {
     const work = await mkdtemp(join(tmpdir(), 'fb-codex-'));
@@ -203,11 +240,13 @@ export function createCodexRunner(o: RunnerOpts) {
 
   async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const path = (req.url ?? '/').split('?')[0];
-    if (path === '/health' && req.method === 'GET') return send(res, 200, { ok: true, busy });
+    if (path === '/health' && req.method === 'GET') { const h = await health(); return send(res, h.ok ? 200 : 503, { ...h, busy }); }
     if (path !== '/run') return send(res, 404, { error: 'not found' });
     if (req.method !== 'POST') return send(res, 405, { error: 'POST only' }, { allow: 'POST' });
     if (!runnerAuthorized(req.headers.authorization, o.token)) return send(res, 401, { error: 'missing or wrong token' });
-    // One job at a time, so a job never sees another project's mirror in the scratch volume.
+    // One job at a time; a private mount/PID namespace hides all other mirrors.
+    const ready = await health();
+    if (!ready.ok) return send(res, 503, { error: ready.error, code: 'sandbox_unavailable' }, { 'retry-after': '30' });
     if (busy) return send(res, 503, { error: 'busy' }, { 'retry-after': '2' });
     busy = true;
     let keepalive: NodeJS.Timeout | undefined;
@@ -236,7 +275,7 @@ export function createCodexRunner(o: RunnerOpts) {
     }
   }
 
-  return { handle, busy: () => busy };
+  return { handle, health, busy: () => busy };
 }
 
 /** The runner could not be asked at all (not started, unreachable, token missing, busy past the deadline). */
@@ -288,7 +327,10 @@ export async function runOnRunner(o: { url: string; scratch: string; job: Runner
     }
     if (res.status === 503) {
       const wait = o.retryMs ?? 2000;
-      await res.text().catch(() => '');
+      const unavailable = await res.text().catch(() => '');
+      let reason = '';
+      try { const body = JSON.parse(unavailable) as { error?: string; code?: string }; if (body.code === 'sandbox_unavailable') reason = body.error ?? 'sandbox unavailable'; } catch {}
+      if (reason) throw new RunnerUnavailableError(reason);
       if (Date.now() + wait >= deadline) throw new RunnerUnavailableError('the codex runner stayed busy with another job until this one timed out');
       await new Promise((r) => setTimeout(r, wait));
       continue;

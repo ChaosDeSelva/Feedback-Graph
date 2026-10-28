@@ -134,7 +134,7 @@ test('contextForPrompt records as shown only what it showed in full: a clipped l
   const first = contextForPrompt(md, { asked: false, shown: [] });
   expect(first.text).toMatch(/clipped/);
   // Cut between items, never through one.
-  expect(first.text).not.toMatch(/r{10}\n(?!  - applies)/);
+  expect(first.text).not.toMatch(/r{10}\n(?! {2}- applies)/);
   const shownIds = first.state.shown;
   expect(shownIds.length).toBeGreaterThan(0);
   expect(shownIds).not.toContain('l11');
@@ -196,7 +196,7 @@ test('doneCheckPending: only a check_before_done that returned an answer counts,
 
 test('stopDecision says a denied or failed check_before_done returned nothing, never that it was not called', () => {
   const r = stopDecision({ stop_hook_active: false }, true, 'demo', ['/r/a.ts'], true).reason;
-  expect(r).toMatch(/called check_before_done but it returned no answer \(denied or failed\)/);
+  expect(r).toMatch(/called check_before_done but it has not completed \(queued, denied or failed\)/);
   expect(r).not.toMatch(/has not called/);
   expect(r).toMatch(/If it cannot be allowed, tell the developer plainly that the check did not run/);
 });
@@ -288,7 +288,7 @@ test('stopHook: a check_before_done denied by permission stops the asking for th
   }
   // A failure is not a denial: the check is asked for again, as before.
   const err = stopHook(input, [use('Edit', { file_path: '/r/a.ts' }), ...failed], 'demo', { files: [] });
-  expect(err.out.reason).toMatch(/returned no answer \(denied or failed\)/);
+  expect(err.out.reason).toMatch(/has not completed \(queued, denied or failed\)/);
   expect(err.state.checkDenied).toBeFalsy();
   expect(stopHook(input, [use('Edit'), ...failed, use('Edit')], 'demo', err.state).out).toMatchObject({ decision: 'block' });
   // Allowed later and answered: the asking comes back for later edits.
@@ -313,4 +313,14 @@ test('stop checks ignore memory and plan edits outside the repository', () => {
   const inside = [...outside, use('Edit', { file_path: '/repo/src/app.ts' })];
   expect(doneCheckPending(inside, '/repo')).toBe(true);
   expect(editedSince(inside, '/repo')).toEqual(['/repo/src/app.ts']);
+});
+
+
+test.each(['# Queued: pre-done check has not completed\nNothing was decided.', '# Not judged: judge busy'])('queued checks never clear the Stop hook: %s', (text) => {
+  const lines = [use('Edit', { file_path: '/r/a.ts' }), use('mcp__fg__check_before_done', {}, 'queued-check'), result('queued-check', [{ type: 'text', text }])];
+  expect(doneCheckPending(lines, '/r')).toBe(true);
+  const blocked = stopHook({ cwd: '/r', stop_hook_active: true }, lines, 'demo', {});
+  expect(blocked.out.decision).toBe('block');
+  expect(blocked.out.reason).toContain('do not finish while it is queued');
+  expect(doneCheckPending([...lines, ...ran()], '/r')).toBe(false);
 });

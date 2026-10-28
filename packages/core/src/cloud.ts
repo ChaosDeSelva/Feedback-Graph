@@ -222,7 +222,7 @@ export async function syncBundle(p: Pick<PortabilityStore, 'exportData'>, projec
       .filter((l) => LESSON_STATUSES.has(l.status) && shared(l) && !l.checks?.some((c) => c.name === 'no-miss'))
       .map((l) => ({
         id: l.id, projectKey: l.projectKey, title: l.title, rule: l.rule, appliesWhen: l.appliesWhen, scope: l.scope, paths: [...l.paths],
-        status: l.status, source: l.source, cause: l.cause, missId: l.missId, createdAt: l.createdAt, decidedAt: l.decidedAt,
+        status: l.status, source: l.source, ...(l.checks?.some(check => check.name === 'source-pr-unmerged') ? { checks: [{ name: 'source-pr-unmerged' as const, why: 'The source pull request was closed without merging.' }] } : {}), cause: l.cause, missId: l.missId, createdAt: l.createdAt, decidedAt: l.decidedAt,
       })),
     // The quoted feedback is transcript text and excerpts can be source or document text: both stay home.
     misses: b.misses.map((m) => ({
@@ -244,7 +244,7 @@ export async function syncBundle(p: Pick<PortabilityStore, 'exportData'>, projec
   return redactDeep(out);
 }
 
-const LESSON_STATUSES = new Set(['proposed', 'approved', 'rejected', 'superseded']);
+const LESSON_STATUSES = new Set(['proposed', 'approved', 'rejected', 'revoked', 'superseded']);
 
 const factFiles = (b: ExportBundle) => [...new Set(b.facts.map((f) => f.path))];
 

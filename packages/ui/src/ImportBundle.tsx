@@ -13,7 +13,7 @@ const readText = (f: File) =>
   });
 
 function summary(r: ImportResult): string {
-  const parts = [`Imported ${plural(r.lessons.added, 'lesson')} (${r.lessons.approved} approved, ${r.lessons.proposed} proposed), ${plural(r.facts.added, 'fact')}.`];
+  const parts = [`Imported ${plural(r.lessons.added, 'lesson')} (${r.lessons.approved} approved, ${r.lessons.proposed} proposed${r.lessons.revoked ? `, ${r.lessons.revoked} revoked` : ''}), ${plural(r.facts.added, 'fact')}.`];
   if (r.lessons.existing) parts.push(`${plural(r.lessons.existing, 'lesson')} already here, left alone.`);
   if (r.facts.skippedProjects.length) parts.push(`Facts kept for ${r.facts.skippedProjects.join(', ')} (already scanned).`);
   return parts.join(' ');

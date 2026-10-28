@@ -528,3 +528,26 @@ test('redacts Docker and Azure credentials in parsed objects as well as text', (
   expect(redactDeep({ auths: { registry: { auth: 'dXNlcjpwYXNzd29yZA==' } }, AccountKey: 'aB12'.repeat(8) }))
     .toEqual({ auths: { registry: { auth: '[REDACTED]' } }, AccountKey: '[REDACTED]' });
 });
+
+
+test.each([
+  'A basic understanding of the compiler is required.',
+  'file:42:7: error: expected a semicolon',
+  'src/parser.ts:42:7:error:expected a semicolon',
+  '{"auth":"required","mode":"basic"}',
+  'Basic required',
+])('v7 preserves ordinary text damaged by v6: %s', value => {
+  expect(redactSecrets(value)).toBe(value);
+  expect(redactTokens(value)).toBe(value);
+});
+
+test('parsed auth policy is not a Docker credential', () => {
+  expect(redactDeep({ auth: 'required', mode: 'basic' })).toEqual({ auth: 'required', mode: 'basic' });
+});
+
+test.each([
+  'AWS secret access key is wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY',
+  'Twilio auth token: ' + 'ab12'.repeat(8),
+])('provider-labelled prose credentials are redacted: %s', value => {
+  expect(redactSecrets(value)).toContain('[REDACTED]');
+});

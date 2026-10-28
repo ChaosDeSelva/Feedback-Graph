@@ -156,3 +156,13 @@ test('ollamaPing: ok when Ollama answers and has the models; otherwise the reaso
   expect(down).toMatchObject({ url: 'http://o', ok: false });
   expect(down.reason).toMatch(/^Ollama is not reachable at http:\/\/o: start it/);
 });
+
+
+test('ollamaEmbed forwards caller cancellation without relabeling it as a model outage', async () => {
+  const controller = new AbortController();
+  const marker = new Error('check deadline');
+  const fetchImpl = (async (_url, options) => new Promise((_resolve, reject) => (options?.signal as AbortSignal).addEventListener('abort', () => reject(marker), { once: true }))) as typeof fetch;
+  const result = ollamaEmbed({ url: 'http://o', model: 'm', input: ['x'], signal: controller.signal, fetchImpl });
+  controller.abort(marker);
+  await expect(result).rejects.toBe(marker);
+});

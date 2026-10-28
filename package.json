@@ -10,13 +10,17 @@
     "build": "pnpm -r build",
     "check": "./scripts/check.sh",
     "reembed": "docker compose run --rm worker node src/reembed.ts",
-    "backup": "./scripts/backup.sh"
+    "backup": "./scripts/backup.sh",
+    "lint": "eslint . --max-warnings 0"
   },
   "devDependencies": {
+    "@eslint/js": "10.0.1",
     "@types/node": "^24.0.0",
+    "@typescript-eslint/parser": "8.72.1",
+    "eslint": "10.13.0",
     "typescript": "^5.8.0",
     "vitest": "^3.2.0"
   },
-  "version": "0.6.4",
+  "version": "0.6.5",
   "license": "Apache-2.0"
 }

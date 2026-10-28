@@ -167,6 +167,9 @@ export class PortabilityRepo implements PortabilityStore {
        WHERE NOT EXISTS { MATCH (c)<-[:DURING]-(:Session)-[:IN]->(o:Project) WHERE o.key <> $key }
        WITH DISTINCT c LIMIT $batch DETACH DELETE c RETURN count(*) AS n`,
     );
+    // Registry entries have no Session FK: claims can predate ingestion. Remove the owned bindings before sessions.
+    await drain(`MATCH (b:SessionRun) WHERE b.projectKey = $key OR EXISTS { MATCH (:Project {key: $key})<-[:IN]-(s:Session) WHERE s.id = b.sessionId }
+      WITH b LIMIT $batch DETACH DELETE b RETURN count(*) AS n`);
     await drain(`MATCH (:Project {key: $key})<-[:IN]-(s:Session) WITH s LIMIT $batch DETACH DELETE s RETURN count(*) AS n`);
     await drain(`MATCH (l:Lesson) WHERE l.projectKey = $key OR l.originProjectKey = $key WITH l LIMIT $batch DETACH DELETE l RETURN count(*) AS n`);
     for (const label of PROJECT_LABELS) {

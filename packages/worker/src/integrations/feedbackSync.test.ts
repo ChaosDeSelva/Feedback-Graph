@@ -451,3 +451,13 @@ describe('comments synced before their authors were kept', () => {
     expect(asked).toBe(0);
   });
 });
+
+
+test('a PR closing without new comments refreshes old comment metadata so source lessons can be rechecked', async () => {
+  const closed = { ...pr(7, [{ id: '1', createdAt: '2026-10-20T10:00:00Z' }]), state: 'closed' as const };
+  const s = setup({ prs: async () => [closed] });
+  s.store.m.set(feedbackCursor('github', 'shop'), '2026-10-22T10:00:00Z');
+  await syncExternalFeedback(s.deps);
+  expect(s.threads).toHaveLength(1);
+  expect(s.threads[0].items[0].external).toMatchObject({ threadState: 'closed' });
+});

@@ -136,7 +136,7 @@ export async function grepMentions(repoPath: string, needles: string[]): Promise
   const out = new Map<string, Set<string>>();
   if (!wanted.length) return new Map();
   const tests = wanted.map((n) => ({ n, re: new RegExp(mentionNeedle(n), 'i') }));
-  let stdout = '';
+  let stdout: string;
   try {
     ({ stdout } = await run('git', [...GIT_SAFE, '-C', repoPath, 'grep', '--no-textconv', '-z', '-o', '-I', '-i', '-E', '-e', wanted.map(mentionNeedle).join('|'), '--', '.', ...EXCLUDES], { maxBuffer: 64 * 1024 * 1024, timeout: 60_000, env: gitSafeEnv() }));
   } catch (err) {

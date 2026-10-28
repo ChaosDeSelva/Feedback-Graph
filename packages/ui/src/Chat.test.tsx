@@ -263,7 +263,7 @@ test('a miss is cited by the file it happened in, linked to that file; an old on
   const sources = screen.getByText(/Sources \(2\)/).closest('details')!;
   expect(within(sources).getByRole('link', { name: /built a second modal/ }).getAttribute('href')).toBe('#projects/shop/src%2Fui%2FDialog.tsx');
   expect(within(sources).getByText('src/ui/Dialog.tsx')).toBeTruthy();
-  expect(within(sources).queryByRole('link', { name: /forgot the focus trap/ })).toBeNull();
+  expect(within(sources).getByRole('link', { name: /forgot the focus trap/ }).getAttribute('href')).toBe('#inbox/9');
 });
 
 test('the conversation list re-sorts when a chat gets a new message: the one you asked in moves to the top', async () => {

@@ -1,10 +1,11 @@
 import { execFile } from 'node:child_process';
 import { constants } from 'node:fs';
-import { copyFile, lstat, mkdir, mkdtemp, readdir, rm } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
+import { copyFile, lstat, mkdir, mkdtemp, readdir, rm, writeFile, utimes } from 'node:fs/promises';
+import { hostname, tmpdir } from 'node:os';
 import { dirname, join, relative } from 'node:path';
 import { promisify } from 'node:util';
 import { GIT_SAFE, gitSafeEnv } from '../git.ts';
+import { mirrorLeasePath, purgeStaleRunnerMirrors } from './codexRunner.ts';
 import { isSecretPath, SKIP_DIRS } from '../secrets.ts';
 
 const run = promisify(execFile);
@@ -43,19 +44,27 @@ async function listFiles(repo: string): Promise<string[]> {
  * only with ALLOW_UNCONFINED_CODEX=1 (CODEX_UNCONFINED in providers.ts).
  */
 export async function mirrorForAgent(repo: string, parent: string = tmpdir()): Promise<{ dir: string; files: number; dispose(): Promise<void> }> {
+  await purgeStaleRunnerMirrors(parent, undefined, Date.now(), true);
   const dir = await mkdtemp(join(parent, 'fb-mirror-'));
-  let total = 0;
-  let files = 0;
-  for (const rel of (await listFiles(repo)).slice(0, MAX_FILES)) {
-    if (isSecretPath(rel) || rel.split('/').some((seg) => SKIP_DIRS.has(seg))) continue;
-    // lstat, never stat: a tracked symlink (notes.txt -> ../.env, or -> /codex/auth.json) must not be followed.
-    const s = await lstat(join(repo, rel)).catch(() => null);
-    if (!s?.isFile() || s.size > MAX_FILE_BYTES || total + s.size > MAX_TOTAL_BYTES) continue;
-    await mkdir(dirname(join(dir, rel)), { recursive: true });
-    if (await copyFile(join(repo, rel), join(dir, rel), constants.COPYFILE_EXCL).then(() => true, () => false)) {
-      total += s.size;
-      files++;
+  const lease = mirrorLeasePath(dir);
+  await writeFile(lease, JSON.stringify({ pid: process.pid, host: hostname() }), { mode: 0o600 });
+  const heartbeat = setInterval(() => { const now = new Date(); void utimes(lease, now, now).catch(() => {}); }, 10_000);
+  heartbeat.unref();
+  const dispose = async () => { clearInterval(heartbeat); await rm(dir, { recursive: true, force: true }); await rm(lease, { force: true }); };
+  try {
+    let total = 0;
+    let files = 0;
+    for (const rel of (await listFiles(repo)).slice(0, MAX_FILES)) {
+      if (isSecretPath(rel) || rel.split('/').some((seg) => SKIP_DIRS.has(seg))) continue;
+      // lstat, never stat: a tracked symlink (notes.txt -> ../.env, or -> /codex/auth.json) must not be followed.
+      const s = await lstat(join(repo, rel)).catch(() => null);
+      if (!s?.isFile() || s.size > MAX_FILE_BYTES || total + s.size > MAX_TOTAL_BYTES) continue;
+      await mkdir(dirname(join(dir, rel)), { recursive: true });
+      if (await copyFile(join(repo, rel), join(dir, rel), constants.COPYFILE_EXCL).then(() => true, () => false)) {
+        total += s.size;
+        files++;
+      }
     }
-  }
-  return { dir, files, dispose: () => rm(dir, { recursive: true, force: true }) };
+    return { dir, files, dispose };
+  } catch (error) { await dispose(); throw error; }
 }

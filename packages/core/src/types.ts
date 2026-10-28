@@ -2,6 +2,8 @@ import type { CloudSyncStatus } from './cloud.ts';
 export type ToolCall = { name: string; ts: string; filePath?: string; command?: string };
 
 export type HumanTurn = {
+  run?: string;
+  sandbox?: true;
   uuid: string;
   sessionId: string;
   ts: string;
@@ -63,6 +65,8 @@ export type ExternalRef = {
   repliesTo?: string | null;
   /** GitHub: the verdict of the review the comment belongs to. */
   reviewState?: ReviewVerdict | null;
+  /** Current source pull request state; closed means it was closed without merging. */
+  threadState?: 'open' | 'closed' | 'merged';
   /**
    * GitHub, a review's summary: the inline comment (its item uuid) it repeats, when its content is the same as its
    * inline comments (feedbackRules.foldsIntoInline). One item, not two: the summary is skipped (review-folded).
@@ -247,6 +251,7 @@ export const LESSON_CHECKS = [
   'not-pushback',
   'wrong-session',
   'self-review',
+  'source-pr-unmerged',
   'path-missing',
   'duplicate-of',
   'contradicts-evidence',
@@ -278,7 +283,7 @@ export type LessonCheck = { name: LessonCheckName; why: string; of?: string };
  * from the words of a post-mortem that had no session or one matched by branch or files, and filler-applies-when (an
  * appliesWhen of just "task" or "project", flagged only).
  */
-export const LESSON_CHECKS_VERSION = 5;
+export const LESSON_CHECKS_VERSION = 6;
 
 /**
  * Where a lesson's feedback came from: a GitHub or Linear comment, pushback in an agent session, an imported memory
@@ -287,7 +292,7 @@ export const LESSON_CHECKS_VERSION = 5;
 export const LESSON_FROM = ['github', 'linear', 'session', 'memory', 'manual', 'demo'] as const;
 export type LessonFrom = (typeof LESSON_FROM)[number];
 
-export type LessonStatus = 'proposed' | 'approved' | 'rejected' | 'superseded';
+export type LessonStatus = 'proposed' | 'approved' | 'rejected' | 'revoked' | 'superseded';
 export type LessonSource = 'postmortem' | 'memory' | 'manual' | 'demo';
 
 export type Lesson = {
@@ -354,6 +359,8 @@ export type LessonQualityReport = { windows: LessonQuality[]; projects: Record<s
 
 /** Everything the post-mortem needs about one confirmed piece of feedback. */
 export type PostMortemInput = {
+  run?: string;
+  sandbox?: true;
   feedbackId: string;
   projectKey: string;
   repoPath: string;
@@ -592,7 +599,7 @@ export type RunTag = { id: string; sandbox: boolean };
  */
 export class NotTheRunsError extends Error {
   constructor(what: string, run: string) {
-    super(`${what} is not run ${run}'s: a labelled run changes only what it wrote (a sandbox run makes its own copy; drop x-fg-run, or open the run from the owner's browser, to change the owner's)`);
+    super(`${what} is not run ${run}'s: a labelled run changes only what it wrote (use records created in this run, or make the change from the owner's browser)`);
     this.name = 'NotTheRunsError';
   }
 }
@@ -826,6 +833,8 @@ export type SummaryUpdate = {
 
 /** A session in the Sessions list. */
 export type SessionListItem = {
+  run?: string;
+  sandbox?: true;
   id: string;
   projectKey: string;
   source: SessionSource;

@@ -10,7 +10,7 @@
  * 5: an instruction in an upload is one addressed to the reader-as-AI, not a project convention (facts v4 closed as
  * instructions are reopened); the head of a token an older Activity subject cut at its cap is redacted.
  */
-export const REDACTION_VERSION = 6;
+export const REDACTION_VERSION = 7;
 /** Rows a store reads per page when it redacts stored text again under new rules. */
 export const REDACT_PAGE = 1000;
 
@@ -18,7 +18,7 @@ export const REDACT_PAGE = 1000;
  * The end of a name that holds a secret, in any casing and with any separators: DB_PASSWORD, apiKey, client-secret,
  * AWS_SECRET_ACCESS_KEY, secret_key_base. The name must END with it, so TOKEN_URL, tokenizer and passwordHash do not.
  */
-const SECRET_NAME = String.raw`(?:secret|token|password|passwd|passphrase|pass[_-]?code|api[_-]?key|apikey|private[_-]?key|access[_-]?key|signing[_-]?key|encryption[_-]?key|credentials?)(?:[_-]?key(?:[_-]?base)?)?`;
+const SECRET_NAME = String.raw`(?:secret|token|password|passwd|passphrase|pass[_-]?code|api[_-]?key|apikey|private[_-]?key|access[_-]?key|signing[_-]?key|encryption[_-]?key|run[_-]?key|credentials?)(?:[_-]?key(?:[_-]?base)?)?`;
 /** Names whose "token" is a place in a list or a sync, not a credential: nextPageToken, continuation_token, syncToken. */
 const CURSOR = String.raw`(?:next|prev(?:ious)?|page|next[_-]?page|prev[_-]?page|continuation|sync|cursor|resume|start|end|change|delta|marker|pagination)[_-]?token`;
 /** A JSON key that is such a name. */
@@ -88,12 +88,11 @@ function assignedSecret(v: string): boolean {
 
 /** Known token shapes and URL credentials: a secret wherever they appear, whoever wrote the text. */
 const TOKEN_PATTERNS: RegExp[] = [
+  /\b(run-key:)[a-f0-9]{64}\b/gi,
+  /(\bAWS[ \t]+secret(?:[ \t]+access)?[ \t]+key(?:[ \t]+(?:is|was)[ \t]+|[ \t]*[:=][ \t]*|[ \t]+)["']?)[A-Za-z0-9/+]{40}={0,2}(?=$|[\s"',.;])/gi,
+  /(\bTwilio[ \t]+(?:auth(?:entication)?[ \t]+)?(?:token|secret)(?:[ \t]+(?:is|was)[ \t]+|[ \t]*[:=][ \t]*|[ \t]+)["']?)[a-f0-9]{32}\b/gi,
   /\b(?:gsk_|pypi-|whsec_|lin_oauth_|GOCSPX-|xapp-)[A-Za-z0-9_-]{16,}/g,
-  /\b(Basic\s+)[A-Za-z0-9+/]{8,}={0,2}/gi,
   /\b(AccountKey\s*=\s*)[^;\s"']{16,}/gi,
-  /("auth"\s*:\s*")[A-Za-z0-9+/]{8,}={0,2}(?=")/g,
-  // .pgpass records: host:port:database:user:password; escaped colons stay within a field.
-  /^((?:[^:\r\n\\]|\\.)+:(?:\d+|\*):(?:[^:\r\n\\]|\\.)+:(?:[^:\r\n\\]|\\.)+:)[^\r\n]+/gm,
   /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g,
   /\bsk-(?:proj-|ant-[a-z0-9]+-)?[A-Za-z0-9_-]{20,}/g,
   /\b[sr]k_(?:live|test)_[A-Za-z0-9]{16,}/g,
@@ -160,13 +159,32 @@ const CONTEXT_RULES: { re: RegExp; check: (v: string) => boolean }[] = [
   // bare "key" (primary, cache, sort, map, config key) never does, and the value must look like a secret.
   {
     re: new RegExp(String.raw`(?<keep>\b(?:password|passwd|passphrase|pwd|pw|secret|token|credentials?|(?:api|access|private|secret)[ _-]?key)(?:[ \t,]+(?!(?:is|was|are)\b)[\w'-]+){0,6}?,?\s+(?:is|was|are|=)\s+(?:set\s+to\s+|now\s+)?["'“]?)(?<v>${UNQUOTED_SECRET})`, 'gi'),
-    check: looksLikeSecret,
+    check: namedSecret,
   },
 ];
 
-const replaceTokens = (text: string) =>
-  // A pattern's first group, when it has one, is the part that stays (Bearer, user:).
-  TOKEN_PATTERNS.reduce((out, re) => out.replace(re, (_m, keep?: string) => (typeof keep === 'string' ? `${keep}[REDACTED]` : '[REDACTED]')), text);
+/** Basic/Docker auth must decode to printable user:password bytes, not ordinary words such as "required". */
+export function encodedCredential(value: string): boolean {
+  if (!/^[A-Za-z0-9+/]+={0,2}$/.test(value) || value.length % 4 === 1) return false;
+  try {
+    const decoded = atob(value);
+    return /^[\x20-\x7e]*:[\x20-\x7e]+$/.test(decoded)
+      && btoa(decoded).replace(/=+$/, '') === value.replace(/=+$/, '');
+  } catch { return false; }
+}
+
+function replaceTokens(text: string): string {
+  let out = text.replace(/\b(Basic[ \t]+)([A-Za-z0-9+/]+={0,2})(?=$|[\s"',;])/gi,
+    (all, keep: string, value: string) => encodedCredential(value) ? `${keep}[REDACTED]` : all);
+  out = out.replace(/("auth"\s*:\s*")([^"\r\n]+)(")/gi,
+    (all, keep: string, value: string, end: string) => encodedCredential(value) ? `${keep}[REDACTED]${end}` : all);
+  // pgpass has five non-whitespace fields. Compiler file:line:column: error diagnostics are not credentials.
+  out = out.replace(/^((?:[^:\s\\]|\\.)+:(?:\d+|\*):(?:[^:\s\\]|\\.)+:(?:[^:\s\\]|\\.)+:)([^\r\n]+)$/gm,
+    (all, keep: string) => /:\d+:(?:error|warning|note|fatal(?: error)?):$/i.test(keep)
+      ? all : `${keep}[REDACTED]`);
+  return TOKEN_PATTERNS.reduce((value, re) => value.replace(re, (_m, keep?: string) =>
+    typeof keep === 'string' ? `${keep}[REDACTED]` : '[REDACTED]'), out);
+}
 
 /** Known token shapes and URL credentials only: what is redacted from text the owner wrote themselves. */
 export function redactTokens(text: string): string {
@@ -350,7 +368,7 @@ export function redactedChanges<T extends Record<string, unknown> & { id: string
   return { id: row.id, set: Object.fromEntries(fields.map((k) => [k, out[k]])) as Partial<T>, was: Object.fromEntries(fields.map((k) => [k, row[k]])) as Partial<T>, fields };
 }
 
-const SECRET_KEY =/^(.*[_-])?(secret|token|password|passwd|api[_-]?key|apikey|access[_-]?key|private[_-]?key|client[_-]?secret|credentials?)$|(Secret|Token|Password|ApiKey|AccessKey|PrivateKey|Credentials?)$/i;
+const SECRET_KEY =/^(.*[_-])?(secret|token|password|passwd|api[_-]?key|apikey|access[_-]?key|private[_-]?key|client[_-]?secret|run[_-]?key|credentials?)$|(Secret|Token|Password|ApiKey|AccessKey|PrivateKey|Credentials?)$/i;
 
 /** Redact every string inside a value (objects, arrays); numbers such as embeddings pass through untouched. */
 export function redactDeep<T>(v: T): T {
@@ -359,7 +377,7 @@ export function redactDeep<T>(v: T): T {
   if (v && typeof v === 'object') {
     // A key that names a secret means its value is one, whatever it looks like. A paging or sync token
     // (nextPageToken, continuationToken) names a place in a list, not a credential: its value goes through the rules.
-    return Object.fromEntries(Object.entries(v).map(([k, x]) => [k, (SECRET_KEY.test(k) || /^(?:auth|account[_-]?key)$/i.test(k)) && !CURSOR_KEY.test(k) && typeof x === 'string' && x ? '[REDACTED]' : redactDeep(x)])) as T;
+    return Object.fromEntries(Object.entries(v).map(([k, x]) => [k, (SECRET_KEY.test(k) || /^account[_-]?key$/i.test(k) || (/^auth$/i.test(k) && typeof x === 'string' && encodedCredential(x))) && !CURSOR_KEY.test(k) && typeof x === 'string' && x ? '[REDACTED]' : redactDeep(x)])) as T;
   }
   return v;
 }

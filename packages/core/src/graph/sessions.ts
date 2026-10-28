@@ -2,7 +2,7 @@ import neo4j from 'neo4j-driver';
 import { REDACT_PAGE, redactDeep, redactSecrets, redactStoredRow } from '../redact.ts';
 import { latestTime, readSummary, summaryRetryAt, summarySnippet, type SessionCursor, type SummaryWork, type SummaryWorkQuery, type SummaryWrite } from '../sessions.ts';
 import type { SessionsStore } from '../store.ts';
-import type { CandidateStatus, HumanTurn, LessonStatus, SessionDetail, SessionListItem, SessionSource, SessionState, SummaryCursor, SummaryUpdate, TurnEvidence, TurnLabel } from '../types.ts';
+import type { CandidateStatus, RunTag, HumanTurn, LessonStatus, SessionDetail, SessionListItem, SessionSource, SessionState, SummaryCursor, SummaryUpdate, TurnEvidence, TurnLabel } from '../types.ts';
 import type { GraphRepo } from './repo.ts';
 
 /**
@@ -65,6 +65,8 @@ function listItem(s: Props, projectKey: string): SessionListItem {
   const last = s.lastTurnIndex === null || s.lastTurnIndex === undefined ? -1 : Number(s.lastTurnIndex);
   return {
     id: s.id as string,
+    ...(s.run ? { run: s.run as string } : {}),
+    ...(s.sandbox ? { sandbox: true as const } : {}),
     projectKey,
     source: ((s.source as SessionSource) ?? 'claude'),
     cwd: (s.cwd as string) ?? null,
@@ -109,16 +111,35 @@ export class SessionsRepo implements SessionsStore {
     this.g = g;
   }
 
-  async list(q: { projectKeys: string[]; state?: SessionState; limit: number; after?: SessionCursor | null; summarizedOnly?: boolean }) {
+  async claimRun(sessionId: string, run: RunTag): Promise<boolean> {
+    const [r] = await this.g.run(
+      `MERGE (binding:SessionRun {sessionId: $id})
+       SET binding.lock = coalesce(binding.lock, 0) + 1
+       WITH binding OPTIONAL MATCH (s:Session {id: $id})
+       WITH binding, s, CASE WHEN binding.run IS NOT NULL THEN binding.run = $run AND coalesce(binding.sandbox, false) = $sandbox
+         ELSE s IS NULL END AS allowed
+       FOREACH (_ IN CASE WHEN allowed THEN [1] ELSE [] END |
+         SET binding.run = $run, binding.sandbox = $sandbox)
+       RETURN allowed`, { id: sessionId, run: run.id, sandbox: run.sandbox });
+    if (r?.get('allowed') === true) this.g.sandbox.wrote(run);
+    return r?.get('allowed') === true;
+  }
+
+  async runFor(sessionId: string): Promise<RunTag | null> {
+    const [r] = await this.g.run('MATCH (b:SessionRun {sessionId: $id}) WHERE b.run IS NOT NULL RETURN b.run AS run, b.sandbox AS sandbox', { id: sessionId });
+    return r ? { id: r.get('run'), sandbox: r.get('sandbox') === true } : null;
+  }
+
+  async list(q: { projectKeys: string[]; state?: SessionState; limit: number; after?: SessionCursor | null; summarizedOnly?: boolean; run?: string | null }) {
     const rows = await this.g.run(
       `MATCH (p:Project)<-[:IN]-(s:Session)
-       WHERE p.key IN $keys AND NOT coalesce(s.manual, false) AND s.lastTurnIndex IS NOT NULL
+       WHERE p.key IN $keys AND (NOT coalesce(s.sandbox, false) OR coalesce(s.run = $run, false)) AND NOT coalesce(s.manual, false) AND s.lastTurnIndex IS NOT NULL
          AND ($state IS NULL OR coalesce(s.state, 'active') = $state)
          AND (NOT $summarized OR s.summaryJson IS NOT NULL)
          AND ($afterAt IS NULL OR coalesce(s.lastActivityAt, '') < $afterAt OR (coalesce(s.lastActivityAt, '') = $afterAt AND s.id > $afterId))
        RETURN s, p.key AS projectKey ORDER BY coalesce(s.lastActivityAt, '') DESC, s.id LIMIT $limit`,
       {
-        keys: q.projectKeys,
+        keys: q.projectKeys, run: q.run ?? null,
         state: q.state ?? null,
         summarized: !!q.summarizedOnly,
         afterAt: q.after?.at ?? null,
@@ -200,6 +221,8 @@ export class SessionsRepo implements SessionsStore {
       const s = r.get('s').properties as Props;
       return {
         id: s.id as string,
+        ...(s.run ? { run: s.run as string } : {}),
+        ...(s.sandbox === true ? { sandbox: true as const } : {}),
         projectKey: r.get('projectKey'),
         source: (s.source as SessionSource) ?? 'claude',
         cwd: (s.cwd as string) ?? null,

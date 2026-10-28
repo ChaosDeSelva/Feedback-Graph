@@ -40,9 +40,9 @@ Usage:
   fg inbox list [--status pending|confirmed|rejected] [--source claude|codex|github|linear] [--project k] [--limit n] [--pr number] [--author login]
   fg inbox show <id>
   fg inbox confirm|reject <id> [<id> ...] [--reason "..."]
-  fg lessons list [--status proposed|approved|rejected|superseded] [--project k] [--flag <check>] [--source github|linear|session|memory|manual] [--pr number] [--author login]
+  fg lessons list [--status proposed|approved|rejected|revoked|superseded] [--project k] [--flag <check>] [--source github|linear|session|memory|manual] [--pr number] [--author login]
   fg lessons show <id>
-  fg lessons approve|reject <id> [<id> ...] [--note "..."]   one batch; each lesson is recorded as decided on its own
+  fg lessons approve|reject|revoke <id> [<id> ...] [--note "..."]   one batch; each lesson is recorded as decided on its own
   fg lessons quality [--project k]               of the lessons decided in the last 30 and 90 days: approved as written, after an edit, rejected
   fg lessons recheck                             re-run the lesson checks on every proposed and approved lesson (the worker's next round)
   fg lessons to-fact <id> [--kind convention] [--relevance 0.8]   file a lesson that states how the code is as a project fact you wrote; rejects the lesson
@@ -65,6 +65,7 @@ Usage:
                                                  why) unless --apply; never what anyone outside the run touched since
   fg cloud status
   fg cloud sync-now [--force]                    sends what changed since the last sync (--force: everything)
+  fg integrations project <key> --github-author <login|all>  sync PRs by this author (all clears the filter)
   fg integrations status
   fg integrations set github|linear --from-stdin   the token from standard input (never an argument; needs integrations in OPERATOR_ALLOW)
   fg integrations test github|linear             re-check the saved token (a read: no OPERATOR_ALLOW verb needed)
@@ -100,12 +101,12 @@ type Flags = {
   json?: true; watch?: true; all?: true; only?: true; help?: true; wait?: true; force?: true; 'from-stdin'?: true; 'with-sessions'?: true;
   sandbox?: true; apply?: true; 'dry-run'?: true; run?: string;
   key?: string[]; provider?: string; status?: string; project?: string; limit?: string; reason?: string; interval?: string; as?: string; url?: string;
-  until?: string; timeout?: string; kind?: string; q?: string; title?: string; note?: string; relation?: string; source?: string; relevance?: string; flag?: string; pr?: string; author?: string;
+  until?: string; timeout?: string; kind?: string; q?: string; title?: string; note?: string; relation?: string; source?: string; relevance?: string; flag?: string; pr?: string; author?: string; 'github-author'?: string;
 };
 export type Parsed = { words: string[]; flags: Flags };
 
 const BOOLEAN = new Set(['json', 'watch', 'all', 'only', 'help', 'wait', 'force', 'from-stdin', 'with-sessions', 'sandbox', 'apply', 'dry-run']);
-const VALUED = new Set(['key', 'provider', 'status', 'project', 'limit', 'reason', 'interval', 'as', 'url', 'until', 'timeout', 'kind', 'q', 'title', 'note', 'relation', 'source', 'relevance', 'flag', 'run', 'pr', 'author']);
+const VALUED = new Set(['key', 'provider', 'status', 'project', 'limit', 'reason', 'interval', 'as', 'url', 'until', 'timeout', 'kind', 'q', 'title', 'note', 'relation', 'source', 'relevance', 'flag', 'run', 'pr', 'author', 'github-author']);
 
 export function parse(argv: string[]): Parsed {
   const words: string[] = [];
@@ -141,6 +142,7 @@ class ApiError extends Error {
 const PLAIN_HTTP_OK = new Set(['localhost', '127.0.0.1', '[::1]', 'host.docker.internal']);
 
 /** Server text (errors, summaries, model reasons) printed as text, never as terminal escapes. Keeps tabs and newlines. */
+// eslint-disable-next-line no-control-regex -- Deliberately reject or strip control bytes at this boundary.
 const printable = (s: string) => s.replace(/[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/g, '');
 
 type Api = ReturnType<typeof client>;
@@ -187,7 +189,7 @@ function client(io: CliIO, flags: Flags, labels = true) {
       throw new ApiError(`cannot reach Feedback Graph at ${base} (${(e as Error).message}). Is it running? Set FEEDBACK_GRAPH_URL or --url to point elsewhere.`);
     }
     const text = await res.text();
-    let data: unknown = null;
+    let data: unknown;
     try { data = text ? JSON.parse(text) : null; } catch { data = text; }
     if (!res.ok) {
       const e = (data as { error?: unknown } | null)?.error ?? data ?? res.statusText;
@@ -633,11 +635,11 @@ async function inbox(api: Api, io: CliIO, words: string[], f: Flags): Promise<nu
   const [verb, ...ids] = words;
   if (verb === 'list' || verb === undefined) {
     if (f.source !== undefined && !SOURCES.includes(f.source)) throw new UsageError(`--source takes one of ${SOURCES.join(', ')}`);
-    const items = await api<any[]>('GET', `/api/candidates${qs({ status: f.status ?? 'pending', source: f.source, project: f.project, limit: f.limit, pr: f.pr, author: f.author })}`);
+    const items = await api<any[]>('GET', `/api/candidates${qs({ status: f.status, source: f.source, project: f.project, limit: f.limit, pr: f.pr, author: f.author })}`);
     if (f.json) { io.out(JSON.stringify(items, null, 2)); return 0; }
     io.out(items.length
       ? table(['ID', 'PROJECT', 'SOURCE', 'LABEL', 'CONF', 'SUMMARY'], items.map((c) => [c.id, c.projectKey, c.source, c.classification?.label, c.classification?.confidence?.toFixed(2), c.classification?.summary]))
-      : `no ${f.status ?? 'pending'} items${f.source ? ` from ${f.source}` : ''}`);
+      : `no ${f.status ? `${f.status} ` : ''}items${f.source ? ` from ${f.source}` : ''}`);
     return 0;
   }
   if (verb === 'show') {
@@ -670,13 +672,13 @@ async function inbox(api: Api, io: CliIO, words: string[], f: Flags): Promise<nu
 async function lessons(api: Api, io: CliIO, words: string[], f: Flags): Promise<number> {
   const [verb, id] = words;
   if (verb === 'list' || verb === undefined) {
-    const list = await api<any[]>('GET', `/api/lessons${qs({ status: f.status ?? 'proposed', project: f.project, flag: f.flag, source: f.source, pr: f.pr, author: f.author })}`);
+    const list = await api<any[]>('GET', `/api/lessons${qs({ status: f.status, project: f.project, flag: f.flag, source: f.source, pr: f.pr, author: f.author })}`);
     if (f.json) { io.out(JSON.stringify(list, null, 2)); return 0; }
     io.out(list.length
       ? table(['ID', 'STATUS', 'PROJECT', 'FROM', 'FLAGS', 'TITLE', 'DECIDED BY'], list.map((l) => [
         l.id, l.status, l.projectKey ?? 'global', l.from ?? '', (l.checks ?? []).map((c: { name: string }) => c.name).join(','), l.title, l.decidedBy ?? '',
       ]), 70)
-      : `no ${f.status ?? 'proposed'} lessons`);
+      : `no ${f.status ? `${f.status} ` : ''}lessons`);
     return 0;
   }
   if (verb === 'quality') {
@@ -715,10 +717,10 @@ async function lessons(api: Api, io: CliIO, words: string[], f: Flags): Promise<
     io.out(f.json ? JSON.stringify(fact, null, 2) : `${id} converted to a ${fact.kind} fact ${fact.id} (${fact.path}); the lesson is rejected (fg facts list --project <key>)`);
     return 0;
   }
-  if (verb !== 'approve' && verb !== 'reject') throw new UsageError(`unknown lessons command: ${verb}`);
+  if (verb !== 'approve' && verb !== 'reject' && verb !== 'revoke') throw new UsageError(`unknown lessons command: ${verb}`);
   const ids = words.slice(1);
   if (!ids.length) throw new UsageError(`fg lessons ${verb} needs at least one lesson id (see fg lessons list)`);
-  const status = verb === 'approve' ? 'approved' : 'rejected';
+  const status = verb === 'approve' ? 'approved' : verb === 'revoke' ? 'revoked' : 'rejected';
   const items = ids.map((lessonId) => ({ id: lessonId, status, ...(f.note !== undefined && { note: f.note }) }));
   const { results } = await api<{ results: { id: string; ok: boolean; status?: string; error?: string }[] }>('POST', '/api/lessons/decisions', { items });
   if (f.json) io.out(JSON.stringify(results, null, 2));
@@ -931,6 +933,14 @@ const SERVICES = new Set(['github', 'linear']);
 
 async function integrationsCmd(api: Api, io: CliIO, words: string[], f: Flags): Promise<number> {
   const [verb, kind] = words;
+  if (verb === 'project') {
+    if (!kind || f['github-author'] === undefined) throw new UsageError('fg integrations project <key> --github-author <login|all>');
+    const value = f['github-author'].trim();
+    if (value !== 'all' && !/^[a-zA-Z0-9-]+$/.test(value)) throw new UsageError('--github-author needs a GitHub login or all');
+    await api('PUT', `/api/settings/integrations/projects/${encodeURIComponent(kind)}`, { githubAuthor: value === 'all' ? null : value });
+    io.out(f.json ? JSON.stringify({ project: kind, githubAuthor: value === 'all' ? null : value }) : `${kind}: sync PRs by ${value}`);
+    return 0;
+  }
   if (verb === 'set' || verb === 'test') {
     if (!kind || !SERVICES.has(kind)) throw new UsageError(`fg integrations ${verb} github|linear`);
     if (verb === 'test') {

@@ -680,8 +680,8 @@ describe('linked projects', () => {
     const r = await getTaskContext({ project: 'demo', task: 'show orders from the api' }, t.d);
     const section = r.markdown.slice(r.markdown.indexOf('## From linked projects'));
     expect(section).toContain('### api (same product): the app calls this api');
-    expect(section).toContain('**Version every endpoint**');
-    expect(section).toContain('lesson la');
+    expect(section).not.toContain('**Version every endpoint**');
+    expect(section).not.toContain('lesson la');
     expect(section).not.toContain('A global one');
     expect(section).toContain('broke the v1 response shape');
     expect(section).toContain('Responses are wrapped in { data, error }');
@@ -702,7 +702,7 @@ describe('linked projects', () => {
     const logged: ActivityInput[] = [];
     const t = linkedDeps([link('api', 'demo', 'confirmed')], { activity: { record: async (a) => { logged.push(a); } } });
     await getTaskContext({ project: 'demo', task: 'show orders from the api' }, t.d);
-    expect(logged[0].details).toMatchObject({ linked: [{ project: 'api', lessons: ['la'], misses: ['ma'], facts: ['fa'] }] });
+    expect(logged[0].details).toMatchObject({ linked: [{ project: 'api', lessons: [], misses: ['ma'], facts: ['fa'] }] });
   });
 
   test('checkBeforeDone does not judge semantic pointers from linked projects', async () => {

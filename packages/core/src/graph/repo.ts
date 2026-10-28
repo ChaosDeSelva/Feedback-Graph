@@ -1,3 +1,5 @@
+import { storeTimeLeft, storeRequestSignal, StoreDeadlineError } from '../storeDeadline.ts';
+import { reviewPatterns } from '../reviewFilters.ts';
 import neo4j, { type Driver, type Record as NeoRecord } from 'neo4j-driver';
 import type {
   Candidate,
@@ -72,7 +74,7 @@ export class GraphRepo implements GraphStore {
   }
 
   static async connect(url: string, user: string, password: string): Promise<GraphRepo> {
-    const driver = neo4j.driver(url, neo4j.auth.basic(user, password), { disableLosslessIntegers: true });
+    const driver = neo4j.driver(url, neo4j.auth.basic(user, password), { disableLosslessIntegers: true, connectionAcquisitionTimeout: 5000, connectionTimeout: 5000, maxTransactionRetryTime: 0 });
     await driver.verifyConnectivity();
     return new GraphRepo(driver);
   }
@@ -82,8 +84,16 @@ export class GraphRepo implements GraphStore {
   }
 
   async run(cypher: string, params: Record<string, unknown> = {}): Promise<NeoRecord[]> {
-    const res = await this.driver.executeQuery(cypher, params);
-    return res.records;
+    const timeout = storeTimeLeft();
+    const session = this.driver.session();
+    const signal = storeRequestSignal();
+    const cancel = () => { void session.close().catch(() => {}); };
+    signal?.addEventListener('abort', cancel, { once: true });
+    try {
+      const result = await session.run(cypher, params, { timeout });
+      if (signal?.aborted) throw new StoreDeadlineError();
+      return result.records;
+    } finally { signal?.removeEventListener('abort', cancel); await session.close(); }
   }
 
   /** Several statements as one transaction: all of them land, or none do. Returns each statement's records. */
@@ -92,9 +102,10 @@ export class GraphRepo implements GraphStore {
     try {
       return await session.executeWrite(async (tx) => {
         const out: NeoRecord[][] = [];
-        for (const [cypher, params] of statements) out.push((await tx.run(cypher, params)).records);
+        for (const [cypher, params] of statements) { storeTimeLeft(); out.push((await tx.run(cypher, params)).records); }
+        storeTimeLeft();
         return out;
-      });
+      }, { timeout: storeTimeLeft() });
     } finally {
       await session.close();
     }
@@ -112,7 +123,11 @@ export class GraphRepo implements GraphStore {
   }
 
   async wipeForTests() {
-    await this.run('MATCH (n) DETACH DELETE n');
+    for (;;) {
+      const [row] = await this.run('MATCH (n) WITH n LIMIT 1000 DETACH DELETE n RETURN count(*) AS removed');
+      if (Number(row?.get('removed') ?? 0) < 1000) break;
+    }
+    this.sandbox.recheck();
   }
 
   async count(label: string): Promise<number> {
@@ -122,20 +137,22 @@ export class GraphRepo implements GraphStore {
 
   async upsertSession(project: Project, s: ParsedSession, commits: Commit[]) {
     await this.run(
-      `MERGE (p:Project {key: $project.key})
+      `MERGE (binding:SessionRun {sessionId: $s.sessionId})
+       SET binding.lock = coalesce(binding.lock, 0) + 1, binding.projectKey = $project.key
+       WITH binding MERGE (p:Project {key: $project.key})
          SET p.name = $project.name, p.repoPath = $project.repoPath, p.remote = coalesce($project.remote, p.remote)
        MERGE (s:Session {id: $s.sessionId})
          SET s.sourceFile = $s.sourceFile, s.source = $source, s.cwd = $s.cwd, s.gitBranch = $s.gitBranch,
              s.startedAt = $s.startedAt, s.endedAt = $s.endedAt,
              s.finalReplyText = $finalReply.text, s.finalReplyTs = $finalReply.ts, s.finalToolCalls = $finalToolCalls,
              s.workEdits = $work.edits, s.workCommits = $work.commits, s.firstWorkAt = $work.firstAt, s.lastWorkAt = $work.lastAt,
-             s.instructionFiles = $instructionFiles
+             s.instructionFiles = $instructionFiles, s.run = binding.run, s.sandbox = coalesce(binding.sandbox, false)
        MERGE (s)-[:IN]->(p)
        WITH s
        UNWIND $turns AS t
          MERGE (turn:Turn {uuid: t.uuid})
            SET turn.sessionId = t.sessionId, turn.ts = t.ts, turn.index = t.index, turn.text = t.text,
-               turn.precedingAssistantText = t.precedingAssistantText, turn.toolCalls = t.toolCalls
+               turn.precedingAssistantText = t.precedingAssistantText, turn.toolCalls = t.toolCalls, turn.run = s.run, turn.sandbox = s.sandbox
          MERGE (s)-[:HAS_TURN]->(turn)`,
       {
         project: { ...project, remote: project.remote ?? null },
@@ -281,6 +298,7 @@ export class GraphRepo implements GraphStore {
       { uuid: turnUuid, c },
     );
     if (!makeCandidate) return null;
+    this.sandbox.mark(); // A transcript-derived candidate may inherit a sandbox binding from another process.
     const merged = await this.mergeIntoReport(turnUuid);
     if (merged) return merged;
     await this.run(
@@ -289,7 +307,7 @@ export class GraphRepo implements GraphStore {
        MATCH (p:Project)<-[:IN]-(s:Session)-[:HAS_TURN]->(t)
        MERGE (k:Candidate {id: t.uuid})
          ON CREATE SET k.status = 'pending', k.createdAt = $now, k.decidedAt = null, k.note = null
-       SET k.turnUuid = t.uuid, k.sessionId = s.id, k.projectKey = p.key, k.ts = t.ts, k.source = coalesce(s.source, 'claude')
+       SET k.turnUuid = t.uuid, k.sessionId = s.id, k.projectKey = p.key, k.ts = t.ts, k.source = coalesce(s.source, 'claude'), k.run = s.run, k.sandbox = coalesce(s.sandbox, false)
        MERGE (k)-[:FLAGS]->(t)`,
       { uuid: turnUuid, makeCandidate, now: new Date().toISOString() },
     );
@@ -305,7 +323,7 @@ export class GraphRepo implements GraphStore {
     const [turn] = await this.run(
       `MATCH (p:Project)<-[:IN]-(s:Session)-[:HAS_TURN]->(t:Turn {uuid: $uuid})
        WHERE NOT EXISTS { MATCH (:Candidate {id: t.uuid}) } AND t.ts IS NOT NULL AND NOT coalesce(s.source, 'claude') IN $external
-       RETURN t.ts AS ts, t.text AS text, s.id AS sessionId, p.key AS projectKey`,
+       RETURN t.ts AS ts, t.text AS text, s.id AS sessionId, p.key AS projectKey, s.run AS run`,
       { uuid: turnUuid, external: EXTERNAL_SOURCES },
     );
     if (!turn || Number.isNaN(Date.parse(turn.get('ts')))) return null;
@@ -313,10 +331,11 @@ export class GraphRepo implements GraphStore {
     const rows = await this.run(
       `MATCH (k:Candidate {projectKey: $key, manual: true})-[:FLAGS]->(mt:Turn)
        WHERE NOT coalesce(k.detected, false) AND k.status <> 'rejected'
+         AND coalesce(k.run, '') = coalesce($run, '')
          AND datetime(k.createdAt) >= datetime($from) AND datetime(k.createdAt) <= datetime($to)
        RETURN k, mt`,
       {
-        key: turn.get('projectKey'),
+        key: turn.get('projectKey'), run: turn.get('run') ?? null,
         from: new Date(t0 - REPORT_MERGE_MINUTES * 60_000).toISOString(),
         to: new Date(t0 + REPORT_MERGE_MINUTES * 60_000).toISOString(),
       },
@@ -355,11 +374,12 @@ export class GraphRepo implements GraphStore {
       `MATCH (k:Candidate)-[:FLAGS]->(t:Turn)
        WHERE ($status IS NULL OR k.status = $status) AND ($projectKey IS NULL OR k.projectKey = $projectKey)
          AND ($projectKeys IS NULL OR k.projectKey IN $projectKeys) AND ($source IS NULL OR coalesce(k.source, 'claude') = $source)
-         AND ($author IS NULL OR toLower(t.external) CONTAINS $author)
-         AND ($pr IS NULL OR t.external =~ $pr)
+         AND ($author IS NULL OR toLower(t.external) CONTAINS $author OR coalesce(t.text, '') + '\n' + coalesce(t.precedingAssistantText, '') + '\n' + coalesce(t.summary, '') + '\n' + coalesce(k.note, '') + '\n' + coalesce(k.agentReport, '') =~ $authorText)
+         AND ($pr IS NULL OR t.external =~ $pr OR coalesce(t.text, '') + '\n' + coalesce(t.precedingAssistantText, '') + '\n' + coalesce(t.summary, '') + '\n' + coalesce(k.note, '') + '\n' + coalesce(k.agentReport, '') =~ $prText)
          AND ${VISIBLE_TO_RUN('k')}
        RETURN k, t ORDER BY t.ts DESC, k.id SKIP $offset LIMIT $limit`,
-      { status: f.status ?? null, projectKey: f.projectKey ?? null, projectKeys: f.projectKeys ?? null, source: f.source ?? null, author: f.author ? `"author":${JSON.stringify(f.author.toLowerCase())}` : null, pr: f.pr ? `(?s).*"thread":"[^"]*#${f.pr}".*` : null, limit: neo4j.int(f.limit ?? 200), offset: neo4j.int(Math.max(0, Math.floor(f.offset ?? 0))), run: f.run ?? null },
+      { status: f.status ?? null, projectKey: f.projectKey ?? null, projectKeys: f.projectKeys ?? null, source: f.source ?? null, prText: f.pr ? `(?is).*${reviewPatterns(f.pr).pr}.*` : null, authorText: f.author ? `(?is).*${reviewPatterns(undefined, f.author).author}.*` : null,
+        author: f.author ? `"author":${JSON.stringify(f.author.toLowerCase())}` : null, pr: f.pr ? `(?s).*"thread":"[^"]*#${f.pr}".*` : null, limit: neo4j.int(f.limit ?? 200), offset: neo4j.int(Math.max(0, Math.floor(f.offset ?? 0))), run: f.run ?? null },
     );
     return rows.map((r) => toCandidate(r.get('k').properties, r.get('t').properties));
   }
@@ -496,7 +516,7 @@ export class GraphRepo implements GraphStore {
        WITH k, t WHERE $status = 'confirmed'
        MERGE (f:Feedback {id: k.id})
          ON CREATE SET f.status = 'open', f.createdAt = $now, f.projectKey = k.projectKey, f.text = t.text
-       SET f.status = CASE f.status WHEN 'rejected' THEN 'open' ELSE f.status END
+       SET f.status = CASE f.status WHEN 'rejected' THEN 'open' ELSE f.status END, f.run = k.run, f.sandbox = coalesce(k.sandbox, false)
        MERGE (f)-[:FROM_TURN]->(t)`,
       { id, status, note, by, now: new Date().toISOString() },
     );
@@ -557,23 +577,25 @@ export class GraphRepo implements GraphStore {
            SET turn.sessionId = $id, turn.ts = i.ts, turn.index = i.index, turn.text = i.text,
                turn.precedingAssistantText = i.context, turn.toolCalls = '[]', turn.external = i.external
          MERGE (s)-[:HAS_TURN]->(turn)
+         WITH turn, isNew
+         CALL (turn) { MATCH (l:Lesson)-[:DERIVED_FROM]->(:Miss)-[:EXPLAINS]->(:Feedback)-[:FROM_TURN]->(turn) SET l.checksVersion = 0 }
        RETURN sum(CASE WHEN isNew THEN 1 ELSE 0 END) AS added`,
       { project: { key: project.key, name: project.name, repoPath: project.repoPath }, id: t.id, source: t.source, first: times[0], last: times.at(-1), items },
     );
     return Number(r?.get('added') ?? 0);
   }
 
-  async workSessions(q: { projectKey: string; branch: string | null; before: string; after?: string | null; limit: number }): Promise<WorkSession[]> {
+  async workSessions(q: { projectKey: string; branch: string | null; before: string; after?: string | null; limit: number; run?: string | null }): Promise<WorkSession[]> {
     const rows = await this.run(
       `MATCH (p:Project {key: $key})<-[:IN]-(s:Session)
-       WHERE NOT coalesce(s.manual, false) AND s.startedAt IS NOT NULL AND datetime(s.startedAt) <= datetime($before)
+       WHERE (NOT coalesce(s.sandbox, false) OR coalesce(s.run = $run, false)) AND NOT coalesce(s.manual, false) AND s.startedAt IS NOT NULL AND datetime(s.startedAt) <= datetime($before)
          AND coalesce(s.workEdits, 0) + coalesce(s.workCommits, 0) > 0
          AND s.firstWorkAt IS NOT NULL AND datetime(s.firstWorkAt) <= datetime($before)
          AND CASE WHEN $branch IS NULL
                THEN $after IS NOT NULL AND datetime(s.lastWorkAt) >= datetime($after)
                ELSE s.gitBranch = $branch END
        RETURN s ORDER BY s.workEdits DESC, datetime(s.lastWorkAt) DESC, s.id LIMIT $limit`,
-      { key: q.projectKey, branch: q.branch, before: q.before, after: q.after ?? null, limit: neo4j.int(q.limit) },
+      { run: q.run ?? null, key: q.projectKey, branch: q.branch, before: q.before, after: q.after ?? null, limit: neo4j.int(q.limit) },
     );
     return rows.map((r) => {
       const s = r.get('s').properties;
@@ -651,6 +673,8 @@ function isoOrNull(t: unknown): string | null {
 function toTurn(p: Record<string, unknown>): HumanTurn {
   return {
     uuid: p.uuid as string,
+    ...(p.run ? { run: p.run as string } : {}),
+    ...(p.sandbox ? { sandbox: true as const } : {}),
     sessionId: p.sessionId as string,
     ts: p.ts as string,
     index: p.index as number,

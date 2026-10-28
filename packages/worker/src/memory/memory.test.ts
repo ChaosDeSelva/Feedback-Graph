@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { expect, test } from 'vitest';
-import { memoryProjectKey, importMemories, parseMemoryFile, projectKeyForDir } from './memory.ts';
+import { memoryProjectKey, feedbackForMemoryWrite, importMemories, parseMemoryFile, projectKeyForDir } from './memory.ts';
 import { FileState } from '../state.ts';
 
 const feedbackMd = `---
@@ -183,4 +183,47 @@ test('a memory written after an existing feedback event is not imported as a dup
     writtenAfterFeedback: async (key, path) => key === 'AcmeShop' && path.endsWith('/memory/fix.md'),
   })).toBe(0);
   expect(embedded).toBe(false);
+});
+
+
+test('memory deduplication scans past 500 candidates, includes rejected/Codex events and recognizes shell writes', async () => {
+  const first = Array.from({ length: 500 }, (_, i) => ({ id: `c${i}`, turnUuid: `t${i}`, status: 'confirmed', source: 'claude' }));
+  const seen: unknown[] = [];
+  const result = await feedbackForMemoryWrite({
+    listCandidates: async (query) => { seen.push(query); return (query?.offset ? [{ id: 'old', turnUuid: 'old-turn', status: 'rejected', source: 'codex' }] : first) as never; },
+    callsAfter: async (uuid) => ({ calls: uuid === 'old-turn' ? [{ name: 'exec_command', ts: 't', command: "python -c \"Path('/home/me/memory/fix.md').write_text('fixed')\"" }] : [], laterTurns: 1, endedAt: null }),
+  }, 'demo', '/transcripts/project/memory/fix.md');
+  expect(result).toBe('old');
+  expect(seen).toEqual([{ projectKey: 'demo', limit: 500, offset: 0 }, { projectKey: 'demo', limit: 500, offset: 500 }]);
+});
+
+test('upgrade rechecks unchanged memories and withdraws a previously imported duplicate once', async () => {
+  const transcripts = memoryDirs('-Users-j-Vibe-AcmeShop');
+  const state = new FileState(':memory:');
+  const path = join(transcripts, '-Users-j-Vibe-AcmeShop', 'memory', 'no-dashes.md');
+  const fs = await import('node:fs/promises');
+  const info = await fs.stat(path);
+  state.mark(path, info.size, info.mtimeMs, 'AcmeShop');
+  const withdrawn: unknown[] = [];
+  const options = { ...base(transcripts), state, roots: async () => [{ host: '/Users/j/Vibe', keys: ['AcmeShop'] }],
+    upsertLesson: async () => { throw new Error('duplicate'); }, writtenAfterFeedback: async () => 'source-feedback',
+    withdrawDuplicate: async (...args: unknown[]) => { withdrawn.push(args); } };
+  expect(await importMemories(options)).toBe(0);
+  expect(withdrawn).toEqual([['memory:-Users-j-Vibe-AcmeShop/no-dashes.md', 'source-feedback']]);
+  expect(await importMemories(options)).toBe(0);
+  expect(withdrawn).toHaveLength(1);
+});
+
+
+test('feedback classified in a later worker cycle still withdraws an unchanged memory', async () => {
+  const transcripts = memoryDirs('-Users-j-Vibe-AcmeShop');
+  let classified = false;
+  const withdrawn: string[] = [];
+  const options = { ...base(transcripts), roots: async () => [{ host: '/Users/j/Vibe', keys: ['AcmeShop'] }],
+    upsertLesson: async () => {}, writtenAfterFeedback: async () => classified ? 'late-feedback' : null,
+    withdrawDuplicate: async (id: string) => { withdrawn.push(id); } };
+  expect(await importMemories(options)).toBe(1);
+  classified = true;
+  expect(await importMemories(options)).toBe(0);
+  expect(withdrawn).toEqual(['memory:-Users-j-Vibe-AcmeShop/no-dashes.md']);
 });

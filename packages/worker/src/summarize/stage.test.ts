@@ -7,6 +7,7 @@ const NOW = Date.parse('2026-10-23T12:00:00Z');
 const iso = (msAgo: number) => new Date(NOW - msAgo).toISOString();
 
 type Sess = {
+  run?: string; sandbox?: true;
   id: string; projectKey: string; cwd: string; turns: HumanTurn[]; lastActivityAt: string; state: SessionState | null;
   summary: SessionSummary | null; through: SummaryCursor | null; version: number; rebuild: boolean; retryAt: string | null; attempts: number;
   writes: SummaryWrite[]; finalReply: FinalReply | null; replyMark: string | null;
@@ -53,6 +54,7 @@ class MemSessions implements Pick<SessionsStore, 'work' | 'turns' | 'save' | 're
     });
     out.sort((a, b) => b.lastActivityAt.localeCompare(a.lastActivityAt) || a.id.localeCompare(b.id));
     return out.slice(0, q.limit).map((x) => ({
+      ...(x.run ? { run: x.run } : {}), ...(x.sandbox ? { sandbox: true as const } : {}),
       id: x.id, projectKey: x.projectKey, source: 'claude', cwd: x.cwd, lastTurn: { index: x.turns.length - 1, ts: x.turns.at(-1)!.ts },
       lastActivityAt: x.lastActivityAt, turnCount: x.turns.length, state: x.state, summary: x.summary, summarizedThrough: x.through,
       summaryVersion: x.version, rebuild: x.rebuild, retryAt: x.retryAt, pending: Math.max(0, x.turns.length - 1 - (x.through?.index ?? -1)), finalReply: x.finalReply,
@@ -437,4 +439,11 @@ test('an idle session whose final reply arrived late gets it too, and stays idle
   expect(await runSummaries(deps(llm))).toMatchObject({ summarized: 1, idled: 1, reactivated: 0 });
   expect(prompts.at(-1)).toContain('LATE-FINAL-REPLY');
   expect(x.state).toBe('idle');
+});
+
+
+test('summary Activity retains the real session sandbox run attribution', async () => {
+  mem.add('labelled', 3, 15 * MIN, { run: 'test-session', sandbox: true });
+  await runSummaries(deps(fakeModel().llm));
+  expect(activity[0]).toMatchObject({ kind: 'session_summarized', run: 'test-session', sandbox: true });
 });

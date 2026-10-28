@@ -197,6 +197,11 @@ describe('noise reviews (skip rules v3): review content that is not pushback', (
     expect(feedbackSkipRule('LGTM once the timeout is handled.', review())).toBeNull();
   });
 
+  test('a variation selector on an unrelated emoji is not a resolved-review status', () => {
+    const table = '| Field | Value |\n|---|---|\n| A | ☀️ |\n| B | ☀️ |';
+    expect(feedbackSkipRule(table, review())).toBeNull();
+  });
+
   test('a status table relaying earlier review comments is skipped', () => {
     const table = [
       'Status of the review findings:',

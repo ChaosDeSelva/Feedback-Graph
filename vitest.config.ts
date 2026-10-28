@@ -19,6 +19,8 @@ export default defineConfig({
           // Contract suites run once per backend in TEST_STORES (default neo4j); this registers the Postgres one.
           setupFiles: ['./packages/store-postgres/src/testing/register.ts'],
           testTimeout: 30000,
+          // Cold disposable database startup and batched cleanup can exceed the default ten-second hook budget.
+          hookTimeout: 60000,
           fileParallelism: false,
         },
       },

@@ -160,7 +160,7 @@ export interface GraphStore {
    * `branch` whose first work was before `before`; with no branch, those whose work overlaps `after`..`before`. Most
    * edits first, then the most recent work.
    */
-  workSessions(q: { projectKey: string; branch: string | null; before: string; after?: string | null; limit: number }): Promise<WorkSession[]>;
+  workSessions(q: { projectKey: string; branch: string | null; before: string; after?: string | null; limit: number; run?: string | null }): Promise<WorkSession[]>;
   heartbeat(s: WorkerStatus): Promise<void>;
   workerStatus(): Promise<WorkerStatus | null>;
   stats(): Promise<StatsRow[]>;
@@ -461,6 +461,8 @@ export interface FactsStore {
    * redactStoredFacts, once per REDACTION_VERSION. Returns how many were reopened.
    */
   reopenInstructionFacts?(): Promise<number>;
+  /** Suspected destructive redaction, including closed facts; never returns secret text. */
+  redactionRepairCandidates?(after: string, limit: number): Promise<{ id: string; projectKey: string; path: string; docId: string | null }[]>;
 }
 
 /** Documents that are not code (uploads, PR discussions, tickets) as embedded chunks, and integration sync cursors. */
@@ -489,6 +491,8 @@ export interface DocsStore {
    * cleared. False when the doc is gone, is not an upload to read, or is being read or already read.
    */
   requeueDocRead(id: string): Promise<boolean>;
+  /** Queue an upload only if its retained original text or image is available, never masked text. */
+  queueRedactionRepair?(id: string): Promise<boolean>;
   docImage(id: string): Promise<TaskImage | null>;
   /**
    * A project's documents, newest first (ties by id), each with its chunk and fact counts. `limit` and `after` (the
@@ -688,8 +692,11 @@ export interface CodeGraphStore {
  * Summaries are redacted before they are stored and are never part of an export or a sync.
  */
 export interface SessionsStore {
+  /** Bind before transcript ingestion. Never relabel an existing owner session or another run's session. */
+  claimRun(sessionId: string, run: RunTag): Promise<boolean>;
+  runFor(sessionId: string): Promise<RunTag | null>;
   /** Newest activity first. projectKeys: only these (an empty list finds nothing); summarizedOnly: with a summary. */
-  list(q: { projectKeys: string[]; state?: SessionState; limit: number; after?: SessionCursor | null; summarizedOnly?: boolean }): Promise<{ sessions: SessionListItem[]; next: SessionCursor | null }>;
+  list(q: { projectKeys: string[]; state?: SessionState; limit: number; after?: SessionCursor | null; summarizedOnly?: boolean; run?: string | null }): Promise<{ sessions: SessionListItem[]; next: SessionCursor | null }>;
   detail(id: string): Promise<SessionDetail | null>;
   /** Sessions the summarize stage has something to do for, newest activity first (see SummaryWorkQuery). */
   work(q: SummaryWorkQuery): Promise<SummaryWork[]>;

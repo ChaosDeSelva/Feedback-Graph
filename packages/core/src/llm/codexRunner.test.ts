@@ -1,10 +1,10 @@
 import { utimesSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { createServer, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
-import { tmpdir } from 'node:os';
+import { hostname, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, afterEach, expect, test } from 'vitest';
-import { isolatedRunnerArgs, purgeStaleRunnerMirrors, createCodexRunner, resolveMirror, runOnRunner, RUNNER_TOKEN_FILE, RunnerUnavailableError, writeRunnerToken, type RunnerOpts } from './codexRunner.ts';
+import { isolatedRunnerArgs, mirrorLeasePath, purgeStaleRunnerMirrors, createCodexRunner, resolveMirror, runOnRunner, RUNNER_TOKEN_FILE, RunnerUnavailableError, writeRunnerToken, type RunnerOpts } from './codexRunner.ts';
 import type { Exec } from './exec.ts';
 import { makeProvider } from './providers.ts';
 import { providerUnavailableReason } from './unavailable.ts';
@@ -278,4 +278,39 @@ test('production runner fails closed if the isolation launcher fails, never fall
   const answer = await (await r.post(job)).json();
   expect(answer.error).toContain('bwrap unavailable');
   expect(commands).toEqual(['bwrap']);
+});
+
+
+test('readiness probes actual nested sandbox startup and fails closed before accepting jobs', async () => {
+  const { scratch } = fresh();
+  let probes = 0;
+  const r = await start({ scratch, isolate: true, exec: async (_cmd, args, options) => {
+    probes++;
+    expect(args).toContain('--unshare-net');
+    expect(options.timeoutMs).toBe(5_000);
+    return { code: 1, stdout: '', stderr: 'bwrap: mount /proc: permission denied' };
+  } });
+  const health = await fetch(`${r.url}/health`);
+  expect(health.status).toBe(503);
+  expect(await health.json()).toMatchObject({ ok: false, sandbox: false });
+  const run = await r.post(job);
+  expect(run.status).toBe(503);
+  expect(await run.json()).toMatchObject({ code: 'sandbox_unavailable' });
+  expect(probes).toBe(1);
+});
+
+test('worker sweeps recently abandoned mirrors but preserves live renewable leases', async () => {
+  const { scratch } = fresh();
+  const dead = join(scratch, 'fb-mirror-dead');
+  const live = join(scratch, 'fb-mirror-live');
+  for (const [dir, pid] of [[dead, 2147483647], [live, process.pid]] as const) {
+    mkdirSync(dir);
+    writeFileSync(mirrorLeasePath(dir), JSON.stringify({ pid, host: hostname() }));
+  }
+  await purgeStaleRunnerMirrors(scratch, undefined, Date.now(), true);
+  expect(existsSync(dead)).toBe(false);
+  expect(existsSync(mirrorLeasePath(dead))).toBe(false);
+  expect(existsSync(live)).toBe(true);
+  await purgeStaleRunnerMirrors(scratch, undefined, Date.now() + 6 * 60_000);
+  expect(existsSync(live)).toBe(false);
 });

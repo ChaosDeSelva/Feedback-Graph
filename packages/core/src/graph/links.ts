@@ -154,7 +154,7 @@ export class LinksRepo implements LinksStore {
 }
 
 function linkOf(p: Record<string, unknown>): ProjectLink {
-  let evidence: LinkEvidence[] = [];
+  let evidence: LinkEvidence[];
   try {
     evidence = JSON.parse((p.evidence as string) ?? '[]');
   } catch {

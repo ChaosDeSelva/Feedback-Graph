@@ -114,6 +114,8 @@ export function latestTime(...ts: (string | null | undefined)[]): string | null 
 
 /** A session the summarize stage may work on (SessionsStore.work). */
 export type SummaryWork = {
+  run?: string;
+  sandbox?: true;
   id: string;
   projectKey: string;
   source: SessionSource;

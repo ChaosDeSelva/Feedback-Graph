@@ -153,6 +153,7 @@ function toolUses(lines) {
   const out = [];
   const answered = new Map();
   const denied = new Set();
+  const queued = new Set();
   for (const l of lines) {
     let entry;
     try {
@@ -166,11 +167,13 @@ function toolUses(lines) {
     if (entry?.type !== 'user') continue;
     for (const c of content) {
       if (c?.type !== 'tool_result' || !c.tool_use_id) continue;
-      answered.set(c.tool_use_id, c.is_error !== true);
+      const pending = /(?:^|\n)# (?:Queued:|Not judged:)/i.test(resultText(c.content));
+      answered.set(c.tool_use_id, c.is_error !== true && !pending);
+      if (pending) queued.add(c.tool_use_id);
       if (c.is_error === true && PERMISSION_DENIED.test(resultText(c.content))) denied.add(c.tool_use_id);
     }
   }
-  return out.map((u) => ({ ...u, answered: answered.get(u.id) === true, denied: denied.has(u.id) }));
+  return out.map((u) => ({ ...u, answered: answered.get(u.id) === true, denied: denied.has(u.id), queued: queued.has(u.id) }));
 }
 
 const isCheck = (u) => typeof u.name === 'string' && u.name.endsWith('check_before_done');
@@ -250,11 +253,11 @@ export function stopDecision(input, pending, project, paths = [], unanswered = f
   return {
     decision: 'block',
     reason:
-      `Feedback Graph: ${what} and ${unanswered ? 'called check_before_done but it returned no answer (denied or failed), so nothing was checked' : 'has not called check_before_done since'}. ` +
+      `Feedback Graph: ${what} and ${unanswered ? 'called check_before_done but it has not completed (queued, denied or failed), so nothing was checked' : 'has not called check_before_done since'}. ` +
       `Call check_before_done with cwd, the task, a summary of what you built and how you verified it, files_changed${shown.length ? `: ${JSON.stringify(shown)}` : ''}, ` +
       (session ? `session_id: "${session}" (so the check is recorded as this session's), ` : '') +
       `and ${diffAsk(base)}. Pass the whole diff: over about 30 KB the judge reads the files most related to the lessons first, then files_changed in order, and the answer says which files it did not read. ` +
-      'Address each gap it lists, or tell the developer plainly why it does not apply, then finish.' +
+      'A Queued or Not judged response is not a completed check: retry check_before_done until it actually completes; do not finish while it is queued. Address each completed gap it lists, or tell the developer plainly why it does not apply, then finish.' +
       (unanswered ? ' If it cannot be allowed, tell the developer plainly that the check did not run.' : ''),
   };
 }
@@ -268,7 +271,7 @@ export function stopDecision(input, pending, project, paths = [], unanswered = f
 export function stopHook(input, lines, project, state) {
   const last = toolUses(lines).filter(isCheck).at(-1);
   const checkDenied = last ? last.denied || (!!state.checkDenied && !last.answered) : !!state.checkDenied;
-  if (!checkDenied) return { out: stopDecision(input, doneCheckPending(lines, input.cwd), project, editedSince(lines, input.cwd), checkUnanswered(lines, input.cwd), state.base ?? null), state: { ...state, checkDenied: false, deniedSaid: false } };
+  if (!checkDenied) return { out: stopDecision(last?.queued ? { ...input, stop_hook_active: false } : input, doneCheckPending(lines, input.cwd), project, editedSince(lines, input.cwd), checkUnanswered(lines, input.cwd), state.base ?? null), state: { ...state, checkDenied: false, deniedSaid: false } };
   const next = { ...state, checkDenied: true, deniedSaid: true };
   if (state.deniedSaid || input?.stop_hook_active) return { out: null, state: next };
   return {

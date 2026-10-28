@@ -186,7 +186,7 @@ export async function recheckLessons(d: RecheckDeps): Promise<{ checked: number;
       d.log?.('lesson paths normalized', { id: l.id, from: l.paths, to: norm.paths, dropped: norm.dropped, resolved: norm.resolved });
     }
     const replaced = paths !== l.paths;
-    const fresh = recheckLesson({ ...l, paths }, detail?.feedback?.text ?? '');
+    const fresh = recheckLesson({ ...l, paths }, detail?.feedback?.text ?? '', detail?.feedback?.external);
     const usable = paths.filter((p) => !junkPathReason(p));
     const data: LessonCheck[] = [];
     if (!usable.length && l.scope !== 'global' && l.source === 'postmortem') {

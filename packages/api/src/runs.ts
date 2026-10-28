@@ -35,10 +35,17 @@ export function runScoped(d: ContextDeps): ContextDeps {
   const asked = <Q extends object>(q: Q): Q & { run: string | null } => ({ ...q, run: askingRun() });
   // Only inside a labelled run: elsewhere the writes stay as they were.
   const written = <Q extends object>(q: Q) => (currentRun() ? { ...q, run: currentRun() } : q);
-  const { k, facts, docs, codegraph, links } = d;
+  const { k, facts, docs, codegraph, links, sessions } = d;
   return {
     ...d,
     activity: asActor(d.activity),
+    ...(sessions && { sessions: {
+      list: async q => {
+        const page = await sessions.list(asked(q));
+        return { ...page, sessions: page.sessions.filter(visible) };
+      },
+      detail: async id => { const session = await sessions.detail(id); return session && visible(session) ? session : null; },
+    } }),
     k: {
       searchLessons: (q) => k.searchLessons(asked(q)),
       relatedMisses: (q) => k.relatedMisses(asked(q)),
@@ -155,12 +162,17 @@ export async function planCleanup(run: string, d: RunsDeps): Promise<{ plan: Omi
   const changed = entries
     .filter((a) => byRequest(a) && !SERVED.has(a.kind) && (!a.targets.length || a.targets.some((t) => !ids.has(t))))
     .map((a) => ({ kind: a.kind, subject: a.subject, targets: a.targets.filter((t) => !ids.has(t)), ts: a.ts }));
+  // Preview the same permissions and keep rules already enforced by removeRun; leave the deletion path unchanged.
+  const owner = await d.store.owner(run);
+  const previewEntries = entries.filter(a => !TOUCHES.has(a.kind)
+    && !a.targets.some(t => keptIds.includes(t))
+    && (!byRequest(a) || (owner?.principal === 'operator' && a.actor === currentActor())));
   const order = (k: RunItemKind) => RUN_ITEM_KINDS.indexOf(k);
   return {
     plan: {
       run, sandbox: items.some((i) => i.sandbox), remove,
       kept: [...kept.values()].sort((a, b) => order(a.kind) - order(b.kind) || (a.id < b.id ? -1 : 1)),
-      changed, entries: entries.length, entriesCapped: entries.length >= RUN_ENTRIES,
+      changed, entries: previewEntries.length, entriesCapped: entries.length >= RUN_ENTRIES,
     },
     keep,
     keptIds,
@@ -237,7 +249,7 @@ export function runRoutes(app: Hono, d: RunsDeps) {
         + (activity.removeRun && plan.entriesCapped ? `; the run has more Activity entries than one cleanup reads (${RUN_ENTRIES}): those not read stay, with what they changed; clean up again to list and remove them` : ''),
       details: {
         run: run.data, removed, kept: plan.kept.length, keptItems: plan.kept, changed: plan.changed.length, changedItems: plan.changed,
-        entriesRemoved, openedBy: owner ? (owner.actor ?? owner.principal) : null,
+        entriesRemoved, openedBy: owner?.principal ?? null,
       },
       targets: [],
     });

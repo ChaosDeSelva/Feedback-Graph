@@ -94,7 +94,7 @@ const handlers = {
   },
 
   async stop(input) {
-    if (input.stop_hook_active || !input.transcript_path) return;
+    if (!input.transcript_path) return;
     const project = await tracked(input.cwd);
     if (!project) return;
     const lines = readFileSync(input.transcript_path, 'utf8').split('\n');
@@ -105,6 +105,12 @@ const handlers = {
   },
 
   async session(input) {
+    if (process.env.FG_RUN && input.session_id) {
+      const res = await fetch(`${BASE}/api/sessions/${encodeURIComponent(input.session_id)}/run`, {
+        method: 'POST', headers, signal: AbortSignal.timeout(2_000),
+      });
+      if (!res.ok) throw new Error(`Run session binding refused (${res.status})`);
+    }
     // What was shown is forgotten; where the session started is not (its diff still runs from there), nor that the
     // owner denied check_before_done (stopHook).
     const { base, checkDenied, deniedSaid } = loadState(input.session_id);

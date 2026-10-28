@@ -1,7 +1,7 @@
 import { lstat, readdir, readFile, writeFile } from 'node:fs/promises';
 import { basename, dirname, join } from 'node:path';
 import {
-  ConfigError, fetchPullRequestContext, projectFolders, refreshLayout, killRunningCommands, loadConfig, makeProvider, ollamaEmbed, projectScope, providerUnavailableReason, ProviderUnavailableError, redactSecrets, runCloudSync, syncProjects,
+  ConfigError, purgeAgentMirrors, fetchPullRequestContext, projectFolders, refreshLayout, killRunningCommands, loadConfig, makeProvider, ollamaEmbed, projectScope, providerUnavailableReason, ProviderUnavailableError, redactSecrets, runCloudSync, syncProjects,
   credentialFile, fetchLinearIssues, Integrations, searchLinearIssues, selectionNote, storedSyncMemory, touchedAround, VERSION, withHealth, type KnowledgeStore, type LlmProvider, type ModelJob, type ProjectScope, type ScanJob, type SyncMemory, type WorkerStatus,
 } from '@fb/core';
 import { openStore } from '@fb/store-postgres';
@@ -17,7 +17,7 @@ import { cachedRemote, commitsInWindow, projectRemote, worktreeGitArgs } from '.
 import { readLines } from './ingest/lines.ts';
 import { buildCandidates } from './projects/candidates.ts';
 import { containerFolders } from './projects/folders.ts';
-import { importMemories, memoryProjectKey } from './memory/memory.ts';
+import { memoryWriteLookup, importMemories, memoryProjectKey } from './memory/memory.ts';
 import { forgetDeleted } from './forget.ts';
 import { loadStandingContext, memoryDirFor, runPostMortem } from './postmortem/postmortem.ts';
 import { examplePool } from './postmortem/examples.ts';
@@ -47,6 +47,8 @@ import { SummarizeStage } from './summarize/stage.ts';
 import { CODEX_COPY_RULE, FileState, INGEST_VERSION } from './state.ts';
 import { SessionEvidenceGate } from './evidence.ts';
 import { cycleProgressed, healthSince, StageTracker } from './progress.ts';
+
+await purgeAgentMirrors();
 
 const log = (msg: string, extra: object = {}) => console.log(JSON.stringify({ ts: new Date().toISOString(), msg, ...extra }));
 
@@ -360,6 +362,7 @@ async function main() {
     activity,
   };
 
+  const memoryWrites = memoryWriteLookup(repo);
   const memDeps = {
     transcriptsDir: transcripts,
     roots: async () => {
@@ -372,16 +375,19 @@ async function main() {
     upsertLesson: (l: Parameters<KnowledgeStore['upsertLesson']>[0]) => knowledge.upsertLesson(l),
     activity,
     autoApprove: config.memoryAutoApprove,
-    writtenAfterFeedback: async (projectKey: string, path: string) => {
-      // A feedback memory authored as part of fixing an existing Inbox event is the same event, not a second lesson.
-      const file = path.split('/').at(-1);
-      const candidates = await repo.listCandidates({ projectKey, source: 'claude', limit: 500 });
-      for (const candidate of candidates) {
-        if (candidate.status === 'rejected') continue;
-        const after = await repo.callsAfter(candidate.turnUuid);
-        if (after?.calls.some((call) => /(?:write|edit)/i.test(call.name) && call.filePath?.replaceAll('\\', '/').endsWith(`/memory/${file}`))) return true;
-      }
-      return false;
+    beginCorrelation: () => memoryWrites.reset(),
+    writtenAfterFeedback: (projectKey: string, path: string) => memoryWrites.find(projectKey, path),
+    withdrawDuplicate: async (id: string, feedbackId: string | null) => {
+      const detail = await knowledge.lessonDetail(id);
+      const lesson = detail?.lesson;
+      if (!lesson || lesson.source !== 'memory' || lesson.status === 'rejected' || lesson.status === 'superseded' || lesson.status === 'revoked') return;
+      if (lesson.status === 'proposed' && !lesson.decidedAt && !lesson.proposedAs) {
+        await knowledge.updateLesson(id, { status: 'rejected' }, { by: 'memory-deduplication', note: 'the agent wrote this memory after feedback already represented in the Inbox' });
+      } else if (!(lesson.checks ?? []).some((check) => check.name === 'duplicate-of')) {
+        await knowledge.setLessonChecks(id, [...(lesson.checks ?? []), { name: 'duplicate-of', why: 'This memory was written after the same feedback event; review this existing lesson rather than learning it twice.', ...(feedbackId && { of: `lesson:${feedbackId}` }) }]);
+      } else return;
+      await activity.record({ kind: 'lesson_decided', actor: 'memory-deduplication', projectKey: lesson.projectKey,
+        subject: `duplicate feedback memory: ${lesson.title}`, why: 'the persisted agent session wrote this memory after an Inbox feedback event', targets: [id, ...(feedbackId ? [feedbackId] : [])] });
     },
   };
 
@@ -709,7 +715,7 @@ async function main() {
   // Changed redaction rules run once over the facts, documents, lessons, misses, Inbox items, session summaries, Ask and
   // Activity stored under older ones, before any of it is served again; the counts are in Activity. A failure is
   // logged and tried again at the next start.
-  await redactStoredOnRuleChange({ cursors: docs, facts, docs, knowledge, graph: repo, sessions: store.sessions, chats: store.chats, activity, log })
+  await redactStoredOnRuleChange({ cursors: docs, facts, docs, knowledge, graph: repo, sessions: store.sessions, chats: store.chats, activity, log, repair: { facts, docs, knowledge, projects: selectedFolders, activity } })
     .catch((err) => log('redaction over stored data failed', { error: redactSecrets(String(err)) }));
   await chatRunner.start();
   // A skip rule that changed (an upgrade, or new GITHUB_BOT_LOGINS / GITHUB_AGENT_LOGINS) runs once over what is already

@@ -145,6 +145,8 @@ export async function ollamaChatJson<T>(o: ChatJsonOpts): Promise<T> {
 }
 
 export type EmbedOpts = {
+  /** Stop queued/running embeddings when the requesting check has expired. */
+  signal?: AbortSignal;
   url: string;
   model: string;
   input: string[];
@@ -164,6 +166,7 @@ export async function ollamaEmbed(o: EmbedOpts): Promise<number[][]> {
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ model: o.model, input: o.input, ...(numCtx ? { options: { num_ctx: numCtx } } : {}) }),
     timeoutMs: o.timeoutMs ?? DEFAULT_OLLAMA_TIMEOUT_MS,
+    ...(o.signal && { signal: o.signal }),
   }, o.fetchImpl);
   if (!res.ok) throw new Error(`ollama embed ${res.status}: ${await res.text()}`);
   const { embeddings } = (await res.json()) as { embeddings?: number[][] };

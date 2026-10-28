@@ -14,6 +14,7 @@ const repoRoot = fileURLToPath(new URL('../../../', import.meta.url));
 
 type World = {
   dockerUp?: boolean;
+  runnerSandbox?: boolean;
   /** Ports something listens on, and which of them this stack publishes. */
   listening?: number[];
   ours?: number[];
@@ -65,6 +66,7 @@ case "$*" in
     for p in ${ours.join(' ')}; do
       case "$svc:$inner:$p" in api:8787:8787 | neo4j:7474:7476 | neo4j:7687:7689 | postgres:5432:5434) echo "127.0.0.1:$p"; exit 0 ;; esac
     done; exit 1 ;;
+  *"/health"*) exit ${w.runnerSandbox === false ? 1 : 0} ;;
   *"dns"*) exit ${w.dnsInWorker === false ? 1 : 0} ;;
   *"OLLAMA_URL"*) exit ${w.ollama === false ? 1 : 0} ;;
   *"/transcripts"*) echo ${w.transcripts ?? 3} ;;
@@ -136,7 +138,7 @@ test('each broken piece is a FAIL line saying how to fix it, and the exit code i
 test('another folder\'s containers under this folder\'s Compose name: a loud FAIL naming that folder and FG_INSTANCE', () => {
   const other = doctor({ composed: [{ project: 'feedback-graph', dir: '/srv/acme/feedback-graph' }] });
   expect(other.code).toBe(1);
-  expect(other.out).toMatch(/FAIL  install: the containers named feedback-graph were started from \/srv\/acme\/feedback-graph, not this folder/);
+  expect(other.out).toMatch(/FAIL {2}install: the containers named feedback-graph were started from \/srv\/acme\/feedback-graph, not this folder/);
   expect(other.out).toMatch(/docker compose here would take over/);
   expect(other.out).toMatch(/FG_INSTANCE=/);
   // FG_INSTANCE in .env is the name looked up.
@@ -189,4 +191,15 @@ test('an answer that is all thinking and no content is a FAIL that says what to 
   expect(code).toBe(1);
   expect(out).toContain('FAIL  ollama structured output: gemma4 answered only in its thinking, with no content');
   expect(out).toMatch(/think:false/);
+});
+
+
+test('configured runner health requires its actual sandbox probe to succeed', () => {
+  const env = 'API_PORT=8787\nCODEX_RUNNER_URL=http://codex-runner:8790\n';
+  const failed = doctor({ env, runnerSandbox: false });
+  expect(failed.code).toBe(1);
+  expect(failed.out).toContain('FAIL  Codex runner: sandbox cannot start');
+  const healthy = doctor({ env, runnerSandbox: true });
+  expect(healthy.code).toBe(0);
+  expect(healthy.out).toContain('PASS  Codex runner: its nested sandbox starts successfully');
 });

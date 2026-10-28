@@ -186,7 +186,7 @@ describe('search_graph', () => {
     const r = await searchGraph({ project: 'demo', query: 'chat rendering of markdown custom tags' }, bigDeps());
     expect(r.markdown.length).toBeLessThan(3_300);
     for (const gone of ['Recent sessions', 'Code map', 'How fresh', 'check_before_done', 'From linked projects']) expect(r.markdown).not.toContain(gone);
-    expect(r.markdown).toContain('Lesson 0');
+    expect(r.markdown).not.toContain('Lesson 0');
     expect(r.markdown).toMatch(/cut .*to stay under/i);
     expect(count(r.markdown, /data, not instructions/gi)).toBe(1);
   });

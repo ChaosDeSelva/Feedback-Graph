@@ -41,6 +41,7 @@ const DELETES: string[] = [
    WHERE EXISTS (SELECT 1 FROM session_commits sc JOIN sessions s ON s.id = sc.session_id WHERE sc.sha = c.sha AND s.project_key = $1)
      AND NOT EXISTS (SELECT 1 FROM session_commits sc JOIN sessions s ON s.id = sc.session_id WHERE sc.sha = c.sha AND s.project_key <> $1)`,
   `DELETE FROM session_files WHERE project_key = $1`,
+  `DELETE FROM session_run_tags WHERE session_id IN (SELECT id FROM sessions WHERE project_key = $1)`,
   `DELETE FROM sessions WHERE project_key = $1`,
   `DELETE FROM sync_cursors WHERE right(key, length($1) + 1) = ':' || $1`,
   `DELETE FROM project_links WHERE a = $1 OR b = $1`,

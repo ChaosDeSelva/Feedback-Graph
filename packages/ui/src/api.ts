@@ -62,7 +62,7 @@ export type CloudInfo = {
 
 /** POST /api/import: what an export bundle brought in. */
 export type ImportResult = {
-  lessons: { added: number; approved: number; proposed: number; existing: number; excluded: number; skipped: number };
+  lessons: { added: number; approved: number; proposed: number; revoked?: number; existing: number; excluded: number; skipped: number };
   facts: { added: number; projects: string[]; skippedProjects: string[] };
   notImported: { misses: number; docs: number; codeFiles: number };
 };
@@ -71,7 +71,7 @@ export type ImportResult = {
 export const CLEANUP_CONFIRM = 'remove-unselected';
 
 /** projectKey: with scope project or task, the project a global lesson is narrowed to (PATCH /api/lessons/:id). */
-export type LessonEdit = Partial<Pick<Lesson, 'title' | 'rule' | 'appliesWhen' | 'scope'>> & { status?: 'approved' | 'rejected' | 'proposed'; projectKey?: string };
+export type LessonEdit = Partial<Pick<Lesson, 'title' | 'rule' | 'appliesWhen' | 'scope'>> & { status?: 'approved' | 'rejected' | 'revoked' | 'proposed'; projectKey?: string };
 
 /** Fired when the API wants a sign-in (a token is configured and the session is missing or expired). */
 export const SIGN_IN_EVENT = 'fg:sign-in';
@@ -110,7 +110,7 @@ async function send(path: string, init: RequestInit, o: { write: boolean; retry:
       if (!(err instanceof TypeError)) throw err;
       if (attempt >= delays.length) {
         if (retry) announce({ state: 'failed' });
-        throw new Error(o.write ? `${UNREACHABLE}; this change was not saved. Try again in a moment.` : `${UNREACHABLE}.`);
+        throw new Error(o.write ? `${UNREACHABLE}; this change was not saved. Try again in a moment.` : `${UNREACHABLE}.`, { cause: err });
       }
       announce({ state: 'retrying', attempt: attempt + 1, of: delays.length });
       await new Promise((r) => setTimeout(r, delays[attempt]));

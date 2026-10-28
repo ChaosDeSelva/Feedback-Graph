@@ -1,3 +1,4 @@
+import { reviewPatterns } from '@fb/core';
 import {
   candidateProvenance,
   EXTERNAL_SOURCES,
@@ -34,7 +35,7 @@ import {
 } from '@fb/core';
 import { iso, toJson, tx, type Db } from './db.ts';
 import { refreshSessionStats } from './sessions.ts';
-import { visibleToRun } from './vector.ts';
+import { sandboxPresence, visibleToRun } from './vector.ts';
 
 /** Labels that count as pushback in stats (repo.ts CANDIDATE_LABELS). */
 const CANDIDATE_LABELS = ['pushback', 'correction'];
@@ -75,6 +76,7 @@ export class PgGraphStore implements GraphStore {
     const work = sessionWork(s.toolCalls ?? []);
     await tx(this.db, async (c) => {
       await c.query(UTC);
+      await c.query("SELECT pg_advisory_xact_lock(hashtextextended('session-run:' || $1, 0))", [s.sessionId]);
       await c.query(
         `INSERT INTO projects (key, name, repo_path, remote) VALUES ($1, $2, $3, $4)
          ON CONFLICT (key) DO UPDATE SET name = EXCLUDED.name, repo_path = EXCLUDED.repo_path,
@@ -101,6 +103,8 @@ export class PgGraphStore implements GraphStore {
           s.instructionFiles ? toJson(s.instructionFiles) : null,
         ],
       );
+      await c.query(`UPDATE sessions s SET run = b.run, sandbox = b.sandbox FROM session_run_tags b
+        WHERE s.id = $1 AND b.session_id = s.id`, [s.sessionId]);
       if (s.turns.length) {
         // Re-upserting overwrites what the transcript says, never the label, classification, attempts or pruning.
         await c.query(
@@ -226,7 +230,7 @@ export class PgGraphStore implements GraphStore {
 
   async unclassifiedTurns(limit: number, projectKeys?: string[], excludeKeys?: string[]): Promise<ClassifiableTurn[]> {
     const { rows } = await this.q(
-      `SELECT t.*, p.key AS project_key
+      `SELECT t.*, p.key AS project_key, s.run AS run, s.sandbox AS sandbox
        FROM turns t JOIN sessions s ON s.id = t.session_id JOIN projects p ON p.key = s.project_key
        WHERE t.label IS NULL AND t.idx > 0 AND ($2::text[] IS NULL OR p.key = ANY ($2)) AND NOT (p.key = ANY ($3::text[]))
          AND t.classify_attempts < $4
@@ -261,16 +265,17 @@ export class PgGraphStore implements GraphStore {
         c.signals,
       ]);
       if (!makeCandidate) return null;
+      sandboxPresence(this.db).mark(); // The session binding may have been claimed by the API process.
       const merged = await mergeIntoReport(x, turnUuid);
       if (merged) return merged;
       // A decided candidate keeps its status, note and decision time when the turn is flagged again.
       await x.query(
-        `INSERT INTO candidates (id, turn_uuid, session_id, project_key, ts, source, status, created_at)
-         SELECT t.uuid, t.uuid, s.id, p.key, t.ts, coalesce(s.source, 'claude'), 'pending', $2
+        `INSERT INTO candidates (id, turn_uuid, session_id, project_key, ts, source, status, created_at, run, sandbox)
+         SELECT t.uuid, t.uuid, s.id, p.key, t.ts, coalesce(s.source, 'claude'), 'pending', $2, s.run, s.sandbox
          FROM turns t JOIN sessions s ON s.id = t.session_id JOIN projects p ON p.key = s.project_key
          WHERE t.uuid = $1
          ON CONFLICT (id) DO UPDATE SET turn_uuid = EXCLUDED.turn_uuid, session_id = EXCLUDED.session_id,
-           project_key = EXCLUDED.project_key, ts = EXCLUDED.ts, source = EXCLUDED.source`,
+           project_key = EXCLUDED.project_key, ts = EXCLUDED.ts, source = EXCLUDED.source, run = EXCLUDED.run, sandbox = EXCLUDED.sandbox`,
         [turnUuid, new Date()],
       );
       return turnUuid;
@@ -284,10 +289,10 @@ export class PgGraphStore implements GraphStore {
        WHERE ($1::text IS NULL OR k.status = $1) AND ($2::text IS NULL OR k.project_key = $2)
          AND ($4::text[] IS NULL OR k.project_key = ANY($4)) AND ($5::text IS NULL OR coalesce(k.source, 'claude') = $5)
          AND ${visibleToRun('k', '$7')}
-         AND ($8::text IS NULL OR t.external->>'thread' ~ ('#' || $8 || '$'))
-         AND ($9::text IS NULL OR lower(t.external->>'author') = lower($9))
+         AND ($8::text IS NULL OR t.external->>'thread' ~ ('#' || $8 || '$') OR concat_ws(E'\n', t.text, t.preceding_assistant_text, t.summary, k.note, k.agent_report::text) ~* $10)
+         AND ($9::text IS NULL OR lower(t.external->>'author') = lower($9) OR concat_ws(E'\n', t.text, t.preceding_assistant_text, t.summary, k.note, k.agent_report::text) ~* $11)
        ORDER BY t.ts DESC, k.id LIMIT $3 OFFSET $6`,
-      [f.status ?? null, f.projectKey ?? null, f.limit ?? 200, f.projectKeys ?? null, f.source ?? null, Math.max(0, Math.floor(f.offset ?? 0)), f.run ?? null, f.pr ? String(f.pr) : null, f.author ?? null],
+      [f.status ?? null, f.projectKey ?? null, f.limit ?? 200, f.projectKeys ?? null, f.source ?? null, Math.max(0, Math.floor(f.offset ?? 0)), f.run ?? null, f.pr ? String(f.pr) : null, f.author ?? null, reviewPatterns(f.pr).pr, reviewPatterns(undefined, f.author).author],
     );
     return rows.map(candidateOf);
   }
@@ -439,9 +444,9 @@ export class PgGraphStore implements GraphStore {
       if (rowCount && status === 'confirmed') {
         // One Feedback per candidate: confirming again reopens one you rejected, and leaves any other status alone.
         await c.query(
-          `INSERT INTO feedback (id, project_key, turn_uuid, status, text, created_at)
-           SELECT k.id, k.project_key, t.uuid, 'open', t.text, $2 FROM candidates k JOIN turns t ON t.uuid = k.turn_uuid WHERE k.id = $1
-           ON CONFLICT (id) DO UPDATE SET status = CASE feedback.status WHEN 'rejected' THEN 'open' ELSE feedback.status END`,
+          `INSERT INTO feedback (id, project_key, turn_uuid, status, text, created_at, run, sandbox)
+           SELECT k.id, k.project_key, t.uuid, 'open', t.text, $2, k.run, k.sandbox FROM candidates k JOIN turns t ON t.uuid = k.turn_uuid WHERE k.id = $1
+           ON CONFLICT (id) DO UPDATE SET status = CASE feedback.status WHEN 'rejected' THEN 'open' ELSE feedback.status END, run = EXCLUDED.run, sandbox = EXCLUDED.sandbox`,
           [id, now],
         );
       }
@@ -512,22 +517,23 @@ export class PgGraphStore implements GraphStore {
          RETURNING (xmax = 0) AS inserted`,
         [toJson(items.map((i) => ({ uuid: i.uuid, ts: i.ts, idx: i.index, text: i.text, context: i.context, external: i.external }))), t.id, project.key],
       );
+      await c.query('UPDATE lessons SET checks_version = 0 WHERE miss_id IN (SELECT m.id FROM misses m JOIN feedback f ON f.id = m.feedback_id WHERE f.turn_uuid = ANY($1::text[]))', [items.map(i => i.uuid)]);
       return rows.filter((r) => r.inserted).length;
     });
   }
 
-  async workSessions(q: { projectKey: string; branch: string | null; before: string; after?: string | null; limit: number }): Promise<WorkSession[]> {
+  async workSessions(q: { projectKey: string; branch: string | null; before: string; after?: string | null; limit: number; run?: string | null }): Promise<WorkSession[]> {
     const { rows } = await this.q(
       `SELECT s.id, s.source, s.git_branch, s.cwd, s.started_at, coalesce(s.last_activity_at, s.ended_at) AS last_at,
               s.work_edits, s.work_commits
        FROM sessions s
-       WHERE s.project_key = $1 AND NOT s.manual AND s.started_at IS NOT NULL AND s.started_at <= $3::timestamptz
+       WHERE s.project_key = $1 AND (NOT s.sandbox OR coalesce(s.run = $6, false)) AND NOT s.manual AND s.started_at IS NOT NULL AND s.started_at <= $3::timestamptz
          AND s.work_edits + s.work_commits > 0 AND s.first_work_at <= $3::timestamptz
          AND CASE WHEN $2::text IS NULL
                THEN $4::timestamptz IS NOT NULL AND s.last_work_at >= $4::timestamptz
                ELSE s.git_branch = $2 END
        ORDER BY s.work_edits DESC, s.last_work_at DESC, s.id LIMIT $5`,
-      [q.projectKey, q.branch, q.before, q.after ?? null, q.limit],
+      [q.projectKey, q.branch, q.before, q.after ?? null, q.limit, q.run ?? null],
     );
     return rows.map((r) => ({
       id: r.id,
@@ -576,7 +582,7 @@ export class PgGraphStore implements GraphStore {
  */
 async function mergeIntoReport(x: { query: (sql: string, params?: unknown[]) => Promise<{ rows: Row[] }> }, turnUuid: string): Promise<string | null> {
   const { rows: [turn] } = await x.query(
-    `SELECT t.ts, t.ts_text, t.text, s.id AS session_id, s.project_key, coalesce(s.source, 'claude') AS source
+    `SELECT t.ts, t.ts_text, t.text, s.id AS session_id, s.project_key, s.run, coalesce(s.source, 'claude') AS source
      FROM turns t JOIN sessions s ON s.id = t.session_id
      WHERE t.uuid = $1 AND NOT EXISTS (SELECT 1 FROM candidates WHERE id = $1) AND t.external IS NULL`,
     [turnUuid],
@@ -585,9 +591,9 @@ async function mergeIntoReport(x: { query: (sql: string, params?: unknown[]) => 
   const { rows } = await x.query(
     `SELECT k.id, k.status, k.created_at, k.agent_report, mt.text, mt.preceding_assistant_text
      FROM candidates k JOIN turns mt ON mt.uuid = k.turn_uuid
-     WHERE k.project_key = $1 AND k.manual AND NOT k.detected AND k.status <> 'rejected'
+     WHERE k.project_key = $1 AND k.manual AND NOT k.detected AND k.status <> 'rejected' AND k.run IS NOT DISTINCT FROM $4::text
        AND k.created_at BETWEEN $2::timestamptz - make_interval(mins => $3) AND $2::timestamptz + make_interval(mins => $3)`,
-    [turn.project_key, turn.ts, REPORT_MERGE_MINUTES],
+    [turn.project_key, turn.ts, REPORT_MERGE_MINUTES, turn.run],
   );
   const reports = rows.map((r) => {
     const { agentReport } = candidateProvenance({
@@ -623,6 +629,8 @@ type Row = Record<string, any>;
 export function turnOf(r: Row): HumanTurn {
   return {
     uuid: r.uuid,
+    ...(r.run ? { run: r.run } : {}),
+    ...(r.sandbox ? { sandbox: true as const } : {}),
     sessionId: r.session_id,
     ts: r.ts_text,
     index: r.idx,

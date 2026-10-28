@@ -7,6 +7,7 @@ import {
   REDACT_PAGE,
   summaryRetryAt,
   summarySnippet,
+  type RunTag,
   type CandidateStatus,
   type HumanTurn,
   type LessonStatus,
@@ -23,6 +24,7 @@ import {
   type TurnLabel,
 } from '@fb/core';
 import { iso, toJson, tx, type Db } from './db.ts';
+import { sandboxPresence } from './vector.ts';
 import { turnOf } from './graph.ts';
 
 const ERROR_CHARS = 500;
@@ -55,6 +57,8 @@ function listItem(r: Row): SessionListItem {
   const through = cursorOf(r.summarized_through_idx, r.summarized_through_ts);
   return {
     id: r.id,
+    ...(r.run ? { run: r.run } : {}),
+    ...(r.sandbox ? { sandbox: true as const } : {}),
     projectKey: r.project_key,
     source: r.source ?? 'claude',
     cwd: r.cwd ?? null,
@@ -84,16 +88,35 @@ export class PgSessionsStore implements SessionsStore {
     return this.db.pool.query(sql, params);
   }
 
-  async list(q: { projectKeys: string[]; state?: SessionState; limit: number; after?: SessionCursor | null; summarizedOnly?: boolean }) {
+  async claimRun(sessionId: string, run: RunTag): Promise<boolean> {
+    const claimed = await tx(this.db, async c => {
+      await c.query("SELECT pg_advisory_xact_lock(hashtextextended('session-run:' || $1, 0))", [sessionId]);
+      const { rows: bound } = await c.query('SELECT run, sandbox FROM session_run_tags WHERE session_id = $1', [sessionId]);
+      if (bound[0]) return bound[0].run === run.id && bound[0].sandbox === run.sandbox;
+      const { rows: existing } = await c.query('SELECT id FROM sessions WHERE id = $1', [sessionId]);
+      if (existing.length) return false;
+      await c.query('INSERT INTO session_run_tags (session_id, run, sandbox) VALUES ($1, $2, $3)', [sessionId, run.id, run.sandbox]);
+      return true;
+    });
+    if (claimed) sandboxPresence(this.db).wrote(run);
+    return claimed;
+  }
+
+  async runFor(sessionId: string): Promise<RunTag | null> {
+    const { rows } = await this.q('SELECT run, sandbox FROM session_run_tags WHERE session_id = $1', [sessionId]);
+    return rows[0] ? { id: rows[0].run, sandbox: rows[0].sandbox } : null;
+  }
+
+  async list(q: { projectKeys: string[]; state?: SessionState; limit: number; after?: SessionCursor | null; summarizedOnly?: boolean; run?: string | null }) {
     const afterAt = q.after ? (q.after.at ? q.after.at : 'epoch') : null;
     const { rows } = await this.q(
       `SELECT s.* FROM sessions s
-       WHERE s.project_key = ANY ($1::text[]) AND NOT s.manual AND s.last_turn_idx IS NOT NULL
+       WHERE s.project_key = ANY ($1::text[]) AND (NOT coalesce(s.sandbox, false) OR s.run = $7) AND NOT s.manual AND s.last_turn_idx IS NOT NULL
          AND ($2::text IS NULL OR coalesce(s.state, 'active') = $2)
          AND (NOT $3 OR s.summary IS NOT NULL)
          AND ($4::timestamptz IS NULL OR ${ACT} < $4 OR (${ACT} = $4 AND s.id > $5))
        ORDER BY ${ACT} DESC, s.id LIMIT $6`,
-      [q.projectKeys, q.state ?? null, !!q.summarizedOnly, afterAt, q.after?.id ?? '', q.limit + 1],
+      [q.projectKeys, q.state ?? null, !!q.summarizedOnly, afterAt, q.after?.id ?? '', q.limit + 1, q.run ?? null],
     );
     const items = rows.map(listItem);
     const page = items.slice(0, q.limit);
@@ -169,6 +192,8 @@ export class PgSessionsStore implements SessionsStore {
     );
     return rows.map((r) => ({
       id: r.id,
+        ...(r.run ? { run: r.run as string } : {}),
+        ...(r.sandbox === true ? { sandbox: true as const } : {}),
       projectKey: r.project_key,
       source: r.source ?? 'claude',
       cwd: r.cwd ?? null,

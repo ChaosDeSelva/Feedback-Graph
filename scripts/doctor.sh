@@ -84,6 +84,18 @@ elif [ -z "$(envval DATABASE_URL)" ]; then
   port postgres "${pg:-5434}" 5432
 fi
 
+# A listening runner is not enough: /health executes its real nested sandbox, without a model.
+if [ -n "$(envval CODEX_RUNNER_URL)" ]; then
+  if [ "$docker_ok" = 1 ] && is_running worker; then
+    if "${compose[@]}" exec -T worker node -e 'fetch(process.env.CODEX_RUNNER_URL.replace(/\/+$/, "") + "/health", {signal:AbortSignal.timeout(10000)}).then(async r=>{ const h=await r.json(); if(!r.ok||!h.ok||!h.sandbox) throw Error(h.error||"sandbox probe failed"); }).catch(e=>{console.error(e.message);process.exit(1)})' >/dev/null 2>&1; then
+      pass "Codex runner: its nested sandbox starts successfully"
+    else
+      fail "Codex runner: sandbox cannot start or runner is unavailable"
+      more "Rebuild codex-runner and check Docker procfs/AppArmor settings (docs/operations.md)."
+    fi
+  else fail "Codex runner: configured but cannot be checked from a running worker"; fi
+fi
+
 # ── Ollama ──────────────────────────────────────────────────────────────────────────────────────────────────────────
 # OLLAMA_URL is what the containers use; from here the same server is on localhost.
 ollama_url="$(envval OLLAMA_URL)"

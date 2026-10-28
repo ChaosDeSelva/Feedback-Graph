@@ -8,6 +8,7 @@ Node 26.5+ (native TypeScript, no build step), pnpm 11, Docker.
 
 ```sh
 pnpm install
+pnpm lint                                                           # executable correctness checks for TS/JS
 pnpm test                                                           # unit + UI
 docker compose -f docker-compose.test.yml up -d --wait && pnpm test:int   # Neo4j integration
 pnpm test:int:postgres                                              # the same contract suites on Postgres

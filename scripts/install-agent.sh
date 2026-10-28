@@ -153,15 +153,17 @@ install_claude() {
       echo "linked skill: ~/.claude/skills/$s"
     fi
   done
+  # Literal references are expanded by Claude Code when it starts, not when this installer runs.
+  local run_headers=(--header 'X-FG-Run: ${FG_RUN:-}' --header 'X-FG-Sandbox: ${FG_SANDBOX:-0}' --header 'X-FG-Run-Key: ${FG_RUN_KEY:-}')
   if claude mcp get "$name" >/dev/null 2>&1; then
-    echo "Claude Code: MCP server $name already registered (remove it with: claude mcp remove $name --scope user, then re-run)"
+    echo "Claude Code: MCP server $name already registered (remove it with: claude mcp remove $name --scope user, then re-run to install dynamic run headers)"
   elif [ "$dry" = 1 ]; then
     would "claude mcp add --transport http --scope user $name $url/mcp${token:+ --header 'Authorization: Bearer <API_TOKEN>'}"
   elif [ -n "$token" ]; then
-    claude mcp add --transport http --scope user "$name" "$url/mcp" --header "Authorization: Bearer $token"
+    claude mcp add --transport http --scope user "$name" "$url/mcp" --header "Authorization: Bearer $token" "${run_headers[@]}"
     echo "Claude Code: registered $name at $url/mcp with your API_TOKEN"
   else
-    claude mcp add --transport http --scope user "$name" "$url/mcp"
+    claude mcp add --transport http --scope user "$name" "$url/mcp" "${run_headers[@]}"
     echo "Claude Code: registered $name at $url/mcp"
   fi
 }
@@ -173,6 +175,7 @@ interactive() { [ -t 0 ] || [ "${FEEDBACK_INSTALL_INTERACTIVE:-}" = 1 ]; }
 # Codex calls this server's tools without asking, which `codex exec` needs: its approval policy is never, so otherwise
 # every MCP tool call is refused. The tools only read the graph and file reports for you to decide on.
 APPROVE_LINE='default_tools_approval_mode = "approve"'
+RUN_HEADERS_LINE='env_http_headers = { "X-FG-Run" = "FG_RUN", "X-FG-Sandbox" = "FG_SANDBOX", "X-FG-Run-Key" = "FG_RUN_KEY" }'
 # The header line of this install's table in config.toml, bare or quoted (an ERE; the name needs no escaping).
 table_re="^[[:space:]]*\\[mcp_servers\\.(\"$name\"|$name)\\][[:space:]]*\$"
 # Whether this install's table in $1 already sets the approval mode.
@@ -206,13 +209,24 @@ install_codex() {
 
   # Codex config keys for a streamable HTTP MCP server: url, static http_headers for the token, and (when you allow it)
   # default_tools_approval_mode.
-  local approve=0
+  local approve=0 cfg_backed=0
   if grep -Eq "$table_re" "$cfg" 2>/dev/null; then
     echo "Codex: MCP server $name already in $cfg (delete its [mcp_servers.$name] table, then re-run, to change it)"
+    # Preserve custom header maps; otherwise add supported environment-backed headers to old registrations.
+    if ! RE="$table_re" awk '/^[[:space:]]*\[/ { on = ($0 ~ ENVIRON["RE"]); next } on && /^[[:space:]]*env_http_headers[[:space:]]*=/ { found = 1 } END { exit found ? 0 : 1 }' "$cfg"; then
+      if [ "$dry" = 1 ]; then would "add dynamic FG_RUN/FG_SANDBOX/FG_RUN_KEY headers to $cfg";
+      else
+        backup "$cfg"; cfg_backed=1
+        local run_tmp="$cfg.run.$$"
+        cp -p "$cfg" "$run_tmp"
+        LINE="$RUN_HEADERS_LINE" RE="$table_re" awk '{print} !done && $0 ~ ENVIRON["RE"] {print ENVIRON["LINE"]; done=1}' "$cfg" >"$run_tmp"
+        mv "$run_tmp" "$cfg"
+      fi
+    fi
     if table_has_approval "$cfg"; then
       echo "Codex: the approval mode for $name is already set in $cfg"
     elif want_approval; then
-      backup "$cfg"
+      [ "$cfg_backed" = 1 ] || backup "$cfg"
       if [ "$dry" = 1 ]; then
         would "add $APPROVE_LINE to [mcp_servers.$name] in $cfg"
       else
@@ -244,6 +258,7 @@ install_codex() {
         echo "[mcp_servers.$name]"
         echo "url = \"$url/mcp\""
         if [ "$approve" = 1 ]; then echo "$APPROVE_LINE"; fi
+        echo "$RUN_HEADERS_LINE"
         if [ -n "$token" ]; then echo "http_headers = { \"Authorization\" = \"Bearer $token\" }"; fi
       } >>"$cfg"
       if [ -n "$token" ]; then

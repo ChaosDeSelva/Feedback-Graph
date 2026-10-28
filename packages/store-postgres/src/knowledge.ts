@@ -1,3 +1,4 @@
+import { reviewPatterns } from '@fb/core';
 import { randomUUID } from 'node:crypto';
 import {
   matchReport,
@@ -93,7 +94,7 @@ export class PgKnowledgeStore implements KnowledgeStore {
 
   async feedbackNeedingPostmortem(limit: number, now = new Date()): Promise<PostMortemInput[]> {
     const { rows } = await this.q(
-      `SELECT f.id AS feedback_id, row_to_json(t) AS turn, s.id AS sid, s.cwd, s.source, p.key AS pkey, p.repo_path, k.note, k.decided_by AS note_by
+      `SELECT f.id AS feedback_id, f.run AS source_run, f.sandbox AS source_sandbox, row_to_json(t) AS turn, s.id AS sid, s.cwd, s.source, p.key AS pkey, p.repo_path, k.note, k.decided_by AS note_by
        FROM feedback f JOIN turns t ON t.uuid = f.turn_uuid JOIN sessions s ON s.id = t.session_id
          JOIN projects p ON p.key = s.project_key LEFT JOIN candidates k ON k.id = f.id
        WHERE NOT EXISTS (SELECT 1 FROM misses m WHERE m.feedback_id = f.id) AND f.status <> 'rejected'
@@ -107,6 +108,8 @@ export class PgKnowledgeStore implements KnowledgeStore {
     ]);
     return rows.map((r) => ({
       feedbackId: r.feedback_id,
+      ...(r.source_run ? { run: r.source_run as string } : {}),
+      ...(r.source_sandbox === true ? { sandbox: true as const } : {}),
       projectKey: r.pkey,
       repoPath: r.repo_path ?? undefined,
       cwd: r.cwd ?? '',
@@ -252,10 +255,10 @@ export class PgKnowledgeStore implements KnowledgeStore {
          AND ${learnedIn('l', '$4')}
          AND ($5::text IS NULL OR l.checks @> jsonb_build_array(jsonb_build_object('name', $5::text)))
          AND ($6::text IS NULL OR ${FROM} = $6) AND ${visibleToRun('l', '$7')}
-         AND ($8::text IS NULL OR t.external->>'thread' ~ ('#' || $8 || '$'))
-         AND ($9::text IS NULL OR lower(t.external->>'author') = lower($9))
-       ORDER BY l.created_at DESC, l.id LIMIT $3`,
-      [f.status ?? null, f.projectKey ?? null, f.limit ?? 500, f.projectKeys ?? null, f.flag ?? null, f.from ?? null, f.run ?? null, f.pr ? String(f.pr) : null, f.author ?? null],
+         AND ($8::text IS NULL OR t.external->>'thread' ~ ('#' || $8 || '$') OR concat_ws(E'\n', t.text, t.preceding_assistant_text, t.summary, l.title, l.rule, l.applies_when) ~* $10)
+         AND ($9::text IS NULL OR lower(t.external->>'author') = lower($9) OR concat_ws(E'\n', t.text, t.preceding_assistant_text, t.summary, l.title, l.rule, l.applies_when) ~* $11)
+       ORDER BY l.created_at DESC, l.id COLLATE "C" LIMIT $3`,
+      [f.status ?? null, f.projectKey ?? null, f.limit ?? 500, f.projectKeys ?? null, f.flag ?? null, f.from ?? null, f.run ?? null, f.pr ? String(f.pr) : null, f.author ?? null, reviewPatterns(f.pr).pr, reviewPatterns(undefined, f.author).author],
     );
     return rows.map(lessonOf);
   }
@@ -387,6 +390,10 @@ export class PgKnowledgeStore implements KnowledgeStore {
   async updateLesson(id: string, patch: LessonPatch, o: { reembed?: number[]; by?: string; note?: string }): Promise<{ unscoped: boolean }> {
     const now = new Date();
     const { supersedes, status, projectKey, ...fields } = patch;
+    if (status === 'revoked') {
+      const { rows } = await this.q('SELECT status FROM lessons WHERE id = $1', [id]);
+      if (rows[0]?.status !== 'approved') throw new Error('only a previously approved lesson can be revoked');
+    }
     if (supersedes !== undefined) {
       if (supersedes === id) throw new Error('a lesson cannot supersede itself');
       const found = await this.q('SELECT 1 FROM lessons WHERE id = $1', [supersedes]);

@@ -13,7 +13,7 @@ import { Button, Input, Select, Tabs, Textarea } from './ui/controls.tsx';
 import { Alert, Badge, Card, CauseBadge, causeLabel, causeTone, EmptyState, plural, SectionLabel, SkeletonDetail, SkeletonList, StatusBadge, tableClass, tdClass, TONE_FILL } from './ui/display.tsx';
 import { LessonIcon } from './ui/icons.tsx';
 
-const TABS: LessonStatus[] = ['proposed', 'approved', 'rejected', 'superseded'];
+const TABS: LessonStatus[] = ['proposed', 'approved', 'rejected', 'revoked', 'superseded'];
 
 /** The lesson check's generic flag (a rule naming nothing concrete), if it has one. */
 const genericOf = (l: Lesson) => l.checks?.find((c) => c.name === 'generic');
@@ -25,7 +25,8 @@ type Draft = Pick<Lesson, 'title' | 'rule' | 'appliesWhen' | 'scope'>;
 const EMPTY: Record<LessonStatus, { title: string; children: string }> = {
   proposed: { title: 'No lessons to review', children: 'Each feedback item you confirm in the Inbox gets a post-mortem, and its proposed lesson waits here.' },
   approved: { title: 'No approved lessons yet', children: 'Approve a proposed lesson and agents start receiving it with their task context.' },
-  rejected: { title: 'Nothing rejected', children: 'Lessons you reject or revoke stay here, so you can put them back up for review.' },
+  rejected: { title: 'Nothing rejected', children: 'Lessons rejected during review stay here, so you can put them back up for review.' },
+  revoked: { title: 'Nothing revoked', children: 'Previously approved lessons you withdrew stay here and are no longer served.' },
   superseded: { title: 'Nothing superseded', children: 'When a newer lesson replaces an older one, the older one moves here.' },
 };
 
@@ -41,6 +42,7 @@ const CHECK_LABEL: Record<LessonCheckName, string> = {
   'looks-like-a-fact': 'looks like a fact',
   'not-pushback': 'not pushback',
   'wrong-session': 'wrong session',
+  'source-pr-unmerged': 'source PR never merged',
   'self-review': 'self-review',
   'path-missing': 'path not in repo',
   'duplicate-of': 'duplicate',
@@ -114,7 +116,7 @@ function BulkDialog({ action, lessons, onCancel, onDone }: {
           <h2 id={titleId} className="font-semibold">{label}?</h2>
           <p className="text-muted">
             {action === 'approved'
-              ? 'Agents start getting each of them with their task context straight away. Each is recorded as approved by you.'
+              ? 'Agents start getting each of them with their task context straight away. Each is recorded as approved by you. If cloud sync is enabled, they are eligible for the next sync, which may run immediately.'
               : 'Agents never get them. They move to Rejected, where you can put any back up for review.'}
           </p>
           <ul aria-label="lessons" className="grid max-h-48 gap-1 overflow-y-auto">
@@ -233,7 +235,7 @@ const share = (n: number, of: number) => `${n} (${percent(n, of)})`;
 const said = (n: number, what: string, of: number) => `${n} ${what} (${percent(n, of)})`;
 
 /**
- * How you judged the lessons the post-mortem wrote: approved as written, approved after your edit, rejected. The
+ * How you judged the lessons the post-mortem wrote: approved as written, approved after an edit, rejected. The
  * post-mortem learns from the last two (they are shown to it as examples), so this is the number to watch go up.
  * Nothing when none were decided in 90 days or the server cannot tell.
  */
@@ -247,7 +249,7 @@ function Judged({ report }: { report: LessonQualityReport | null }) {
     <details aria-label="how your lessons were judged" className="text-xs text-muted">
       <summary className="cursor-pointer tabular-nums" title="Of the post-mortem's lessons you decided. The ones you edited or rejected, and some you approved as written, are shown to the post-mortem as examples. Decisions an agent made with the operator token count as yours; how many is said apart.">
         {last30.decided
-          ? <>Last 30 days: {last30.decided} decided · {said(last30.asWritten, 'as written', last30.decided)} · {said(last30.edited, 'after your edit', last30.decided)} · {said(last30.rejected, 'rejected', last30.decided)}
+          ? <>Last 30 days: {last30.decided} decided · {said(last30.asWritten, 'as written', last30.decided)} · {said(last30.edited, 'after an edit', last30.decided)} · {said(last30.rejected, 'rejected', last30.decided)}
               {!!last30.byOperator && <> · {said(last30.byOperator, 'by an agent with the operator token', last30.decided)}</>}</>
           : <>Last 30 days: none decided ({last90.decided} in 90 days)</>}
         {report!.capped && ' (capped)'}
@@ -409,7 +411,7 @@ export function Lessons() {
   // Deciding the lesson open with unsaved edits drops them: ask first, as moving away does.
   const openBulk = (action: 'approved' | 'rejected') => (current && picked.has(current.id) ? afterDiscard(() => setBulk(action)) : setBulk(action));
 
-  async function decide(next: 'approved' | 'rejected' | 'proposed') {
+  async function decide(next: 'approved' | 'rejected' | 'revoked' | 'proposed') {
     if (!current || !detail || !draft || detail.lesson.id !== current.id) return;
     setError(null);
     let patch: LessonEdit = { status: next };
@@ -680,7 +682,7 @@ export function Lessons() {
                       Convert to fact
                     </Button>
                     {converting && <ToFactDialog lesson={detail.lesson} onCancel={() => setConverting(false)} onDone={converted} />}
-                    <span className="text-xs text-muted">Approve saves your edits above.</span>
+                    <span className="text-xs text-muted">Approve saves your edits above. If cloud sync is enabled, approval is shared on the next sync, which may run immediately (or use Sync now).</span>
                   </>
                 )}
                 {status === 'approved' && (
@@ -693,14 +695,14 @@ export function Lessons() {
                       confirmLabel="Revoke lesson"
                       items={[detail.lesson.title]}
                       onCancel={() => setRevoking(false)}
-                      onConfirm={() => { setRevoking(false); void decide('rejected'); }}
+                      onConfirm={() => { setRevoking(false); void decide('revoked'); }}
                     >
-                      Agents stop getting it straight away. It moves to Rejected, where you can put it back up for review.
+                      Agents stop getting it straight away. It moves to Revoked, where you can put it back up for review.
                     </ConfirmDialog>
                     <span className="text-xs text-muted">Save keeps it approved with your edits. Revoke and agents stop getting it straight away.</span>
                   </>
                 )}
-                {status === 'rejected' && <Button onClick={() => decide('proposed')}>Back to proposed</Button>}
+                {(status === 'rejected' || status === 'revoked') && <Button onClick={() => decide('proposed')}>Back to proposed</Button>}
               </div>
             </div>
           )}

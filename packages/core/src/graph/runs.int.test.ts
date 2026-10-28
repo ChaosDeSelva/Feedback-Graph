@@ -36,6 +36,7 @@ async function learned(s: Store, text: string, run: RunTag | null, axis: number)
 /** An approved lesson from a report made in `run` against session `id`, whose session edited src/total.ts. */
 async function learnedOnFile(s: Store, id: string, title: string, run: RunTag | null, axis: number): Promise<string> {
   const sess = { ...session(id, true), toolCalls: [{ name: 'Edit', ts: new Date().toISOString(), filePath: '/vibe/shop/src/total.ts' }] };
+  if (run) expect(await s.sessions.claimRun(id, run)).toBe(true);
   await s.graph.upsertSession(project, sess, []);
   await s.codegraph.recordSessionFiles(id, sessionFiles(sess, '/vibe/shop'));
   const report = await s.knowledge.createManualFeedback({ project, cwd: '/vibe/shop', text: 'turn 2', whatWasDone: 'x', sessionId: id, run });
@@ -152,13 +153,15 @@ describeStores('RunsStore and run attribution', (h) => {
     expect(await s.runs.remove('run-1', [kept])).toEqual({ feedback: 0, lesson: 0, miss: 0, predone_check: 0, fact: 0, doc: 0, link: 0, chat: 0 });
   });
 
-  test("a report the detector then found in a real session is that session's item: listed as merged, never removed", async () => {
+  test("a labelled report cannot merge into an owner session or mutate its candidate", async () => {
     await s.graph.upsertSession(project, session('s1', true), []);
     const id = await s.knowledge.createManualFeedback({ project, cwd: '/vibe/shop', text: 'turn 2', whatWasDone: 'x', sessionId: 's1', run: tester });
-    expect(await s.graph.saveClassification('s1-t2', { label: 'pushback', confidence: 0.9, summary: 's', signals: [] } as Classification, true)).toBe(id);
-    expect((await s.runs.items('run-1')).find((i) => i.id === id)).toMatchObject({ kind: 'feedback', merged: true });
+    expect(await s.graph.saveClassification('s1-t2', { label: 'pushback', confidence: 0.9, summary: 's', signals: [] } as Classification, true)).toBe('s1-t2');
+    expect((await s.runs.items('run-1')).find((i) => i.id === id)).toMatchObject({ kind: 'feedback', merged: false });
+    expect((await s.graph.candidateDetail('s1-t2'))?.candidate.run).toBeUndefined();
     await s.runs.remove('run-1', []);
-    expect(await s.graph.candidateDetail(id)).not.toBeNull();
+    expect(await s.graph.candidateDetail(id)).toBeNull();
+    expect(await s.graph.candidateDetail('s1-t2')).not.toBeNull();
     expect((await s.sessions.detail('s1'))?.turnCount).toBe(3);
   });
 

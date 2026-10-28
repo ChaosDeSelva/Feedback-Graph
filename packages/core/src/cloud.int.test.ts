@@ -83,7 +83,7 @@ describeStores('cloud sync', (h) => {
     expect(JSON.stringify(a)).not.toContain(TOKEN);
   });
 
-  test('a lesson approved and then revoked here goes to the cloud as rejected; a removed doc is withdrawn', async () => {
+  test('a lesson approved and then revoked here goes to the cloud as revoked; a removed doc is withdrawn', async () => {
     const bodies: { lessons: { id: string; status: string }[]; withdrawn: { kind: string; id: string }[]; complete: boolean }[] = [];
     const f = (async (_url: string, init: RequestInit) => {
       bodies.push(JSON.parse(init.body as string));
@@ -93,13 +93,13 @@ describeStores('cloud sync', (h) => {
     const run = () => runCloudSync({ cloud: fake, portability: store.portability, projects: async () => ['demo'], trigger: 'schedule', fetch: f, memory });
     await run();
     const approved = bodies[0].lessons.find((l) => l.status === 'approved')!;
-    await store.knowledge.updateLesson(approved.id, { status: 'rejected' }, {});
+    await store.knowledge.updateLesson(approved.id, { status: 'revoked' }, {});
     const [doc] = (await store.portability.exportData({ projectKey: 'demo' })).docs;
     await store.docs.deleteDoc(doc.id);
     await run();
     expect(bodies).toHaveLength(2);
     expect(bodies[1].complete).toBe(true);
-    expect(bodies[1].lessons.find((l) => l.id === approved.id)?.status).toBe('rejected');
+    expect(bodies[1].lessons.find((l) => l.id === approved.id)?.status).toBe('revoked');
     expect(bodies[1].withdrawn).toEqual([{ kind: 'doc', id: doc.id }]);
   });
 

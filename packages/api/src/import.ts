@@ -19,7 +19,7 @@ export type ImportDeps = {
 };
 
 export type ImportResult = {
-  lessons: { added: number; approved: number; proposed: number; existing: number; excluded: number; skipped: number };
+  lessons: { added: number; approved: number; proposed: number; revoked?: number; existing: number; excluded: number; skipped: number };
   facts: { added: number; projects: string[]; skippedProjects: string[] };
   notImported: { misses: number; docs: number; codeFiles: number };
 };
@@ -40,7 +40,7 @@ const Lesson = z.object({
   appliesWhen: z.string().max(1000).default(''),
   scope: z.enum(['task', 'project', 'global']),
   paths: z.array(z.string().max(300)).max(50).default([]),
-  status: z.enum(['proposed', 'approved', 'rejected', 'superseded']),
+  status: z.enum(['proposed', 'approved', 'rejected', 'revoked', 'superseded']),
   source: z.enum(['postmortem', 'memory', 'manual', 'demo']).default('postmortem'),
   checks: z.array(z.object({ name: z.enum(LESSON_CHECKS), why: z.string().max(4000), of: z.string().max(300).optional() })).max(100).nullable().optional(),
 });
@@ -101,7 +101,7 @@ export async function importBundle(raw: ImportBundle, o: { keepApproved: boolean
     if (l.status === 'rejected' || l.status === 'superseded' || (l.scope !== 'global' && !l.projectKey)) r.lessons.skipped++;
     else if (l.projectKey && never.has(l.projectKey)) r.lessons.excluded++;
     else if (await d.knowledge.lessonDetail(l.id)) r.lessons.existing++;
-    else fresh.push({ ...l, next: o.keepApproved && l.status === 'approved' ? 'approved' : 'proposed' });
+    else fresh.push({ ...l, next: l.status === 'revoked' ? 'revoked' : o.keepApproved && l.status === 'approved' ? 'approved' : 'proposed' });
   }
   const lessonVectors = await embedAll(fresh.map((l) => `${l.title}\n${l.rule}\nApplies when: ${l.appliesWhen}`), d.embed);
   const added: string[] = [];
@@ -113,7 +113,8 @@ export async function importBundle(raw: ImportBundle, o: { keepApproved: boolean
     };
     await d.knowledge.upsertLesson(input);
     added.push(l.id);
-    r.lessons[l.next === 'approved' ? 'approved' : 'proposed']++;
+    if (l.next === 'revoked') r.lessons.revoked = (r.lessons.revoked ?? 0) + 1;
+    else r.lessons[l.next === 'approved' ? 'approved' : 'proposed']++;
   }
   r.lessons.added = added.length;
 
@@ -139,10 +140,10 @@ export async function importBundle(raw: ImportBundle, o: { keepApproved: boolean
     kind: 'bundle_imported',
     actor: 'you',
     projectKey: b.projectKey ?? (keys.size === 1 ? [...keys][0] : null),
-    subject: `imported ${n(r.lessons.added, 'lesson')} (${r.lessons.approved} approved, ${r.lessons.proposed} proposed) and ${n(r.facts.added, 'fact')} from a bundle exported ${b.exportedAt.slice(0, 10) || 'at an unknown time'}`,
+    subject: `imported ${n(r.lessons.added, 'lesson')} (${r.lessons.approved} approved, ${r.lessons.proposed} proposed${r.lessons.revoked ? `, ${r.lessons.revoked} revoked` : ''}) and ${n(r.facts.added, 'fact')} from a bundle exported ${b.exportedAt.slice(0, 10) || 'at an unknown time'}`,
     why: o.keepApproved
       ? 'you imported a bundle and kept its approved lessons approved, so agents are given them now'
-      : 'you imported a bundle; its lessons are proposed and reach agents only once you approve them',
+      : 'you imported a bundle; live lessons are proposed and reach agents only once you approve them; revoked lessons stay withdrawn',
     details: { ...r, keepApproved: o.keepApproved, toolVersion: b.toolVersion, exportedAt: b.exportedAt, bundleProject: b.projectKey },
     targets: added,
   });

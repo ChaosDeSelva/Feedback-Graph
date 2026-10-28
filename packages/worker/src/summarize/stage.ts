@@ -140,6 +140,8 @@ export async function runSummaries(d: SummarizeDeps): Promise<SummarizeResult> {
     const from = w.rebuild ? null : w.summarizedThrough;
     await d.activity?.record({
       kind: 'session_summarized',
+      ...(w.run ? { run: w.run } : {}),
+      ...(w.sandbox ? { sandbox: true as const } : {}),
       actor: d.llm.id,
       projectKey: w.projectKey,
       subject: replyOnly

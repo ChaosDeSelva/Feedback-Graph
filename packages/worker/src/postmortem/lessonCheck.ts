@@ -216,6 +216,7 @@ export function checkLesson(lesson: PostMortem['lesson'], feedback: HumanTurn, m
 /** The flags that only read the lesson's text and the comment (nothing is changed). */
 function textFlags(lesson: PostMortem['lesson'], feedback: HumanTurn, model: ModelSays): LessonFlag[] {
   const flags: LessonFlag[] = [];
+  if (feedback.external?.source === 'github' && feedback.external.threadState === 'closed') flags.push({ name: 'source-pr-unmerged', why: 'the source pull request was closed without merging; review whether this lesson describes accepted work' });
   const text = `${lesson.title}. ${lesson.rule}`;
   if (META.some((re) => re.test(text)) || model.about === 'process') flags.push({ name: 'meta-lesson', why: 'about how to treat feedback, not about the work' });
   // generic says more than platitude (which only reads the "Always verify ..." shape), so it stands in for it.
@@ -235,13 +236,14 @@ function textFlags(lesson: PostMortem['lesson'], feedback: HumanTurn, model: Mod
  * The checks on a lesson already stored (proposed before the checks were kept): flags only, the lesson is left as it
  * is, so the owner decides on what they see. A path that could not be a lesson's path is flagged, not dropped.
  */
-export function recheckLesson(lesson: PostMortem['lesson'], feedbackText: string): LessonFlag[] {
+export function recheckLesson(lesson: PostMortem['lesson'], feedbackText: string, external?: { source: string; threadState?: string } | null): LessonFlag[] {
   const bad = lesson.paths.map((p) => [p, junkPathReason(p)] as const).filter(([, why]) => why);
   const flags: LessonFlag[] = bad.length ? [{ name: 'bad-path', why: bad.map(([p, why]) => `${p}: ${why}`).join('; ') }] : [];
   const turn: HumanTurn = { uuid: '', sessionId: '', ts: '', index: 0, text: feedbackText, precedingAssistantText: '', precedingToolCalls: [] };
   const checked = checkLesson({ ...lesson, paths: lesson.paths.filter((p) => !junkPathReason(p)) }, turn);
   return [
     ...flags,
+    ...(external?.source === 'github' && external.threadState === 'closed' ? [{ name: 'source-pr-unmerged' as const, why: 'the source pull request was closed without merging; review whether this lesson describes accepted work' }] : []),
     ...checked.flags.map((f) =>
       f.name === 'universal-from-nit' ? { ...f, why: `a ${lesson.scope}-wide rule from one minor comment; consider narrowing it to the task` }
       : f.name === 'broken-rule' ? { ...f, why: `the rule field holds "${lesson.rule.trim()}"; the title reads like the rule` }

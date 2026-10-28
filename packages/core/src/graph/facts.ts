@@ -339,6 +339,15 @@ export class FactsRepo implements FactsStore {
     return { redacted, closed, owner, instructions };
   }
 
+  async redactionRepairCandidates(after: string, limit: number) {
+    const rows = await this.g.run(`MATCH (f:Fact) WHERE f.id > $after AND coalesce(f.sandbox, false) = false AND
+      (f.closeReason = 'credential' OR f.statement CONTAINS '[REDACTED]' OR f.why CONTAINS '[REDACTED]')
+      RETURN f.id AS id, f.projectKey AS projectKey, f.path AS path, f.docId AS docId ORDER BY f.id LIMIT $limit`,
+      { after, limit: neo4j.int(limit) });
+    return rows.map((r) => ({ id: r.get('id') as string, projectKey: r.get('projectKey') as string,
+      path: r.get('path') as string, docId: (r.get('docId') ?? null) as string | null }));
+  }
+
   async reopenInstructionFacts(): Promise<number> {
     let reopened = 0;
     for (let after = ''; ;) {

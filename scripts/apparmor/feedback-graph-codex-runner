@@ -1,9 +1,52 @@
 abi <abi/4.0>,
 #include <tunables/global>
 
-# Ubuntu restricts capabilities in user namespaces of genuinely unconfined processes.
-# Explicitly grant userns to this named profile; the runner's bubblewrap mount/PID
-# namespace, dropped container capabilities and read-only root remain its boundary.
-profile feedback-graph-codex-runner flags=(unconfined) {
+# Enforced runner-only policy; Docker still runs non-root with cap_drop ALL.
+# Namespace capabilities below are effective only inside newly created userns.
+profile feedback-graph-codex-runner flags=(attach_disconnected,mediate_deleted) {
+  #include <abstractions/base>
+  #include <abstractions/nameservice>
   userns,
+  capability sys_admin,
+  capability sys_chroot,
+  capability setuid,
+  capability setgid,
+  capability net_admin,
+  network inet stream,
+  network inet6 stream,
+  network inet dgram,
+  network inet6 dgram,
+  unix,
+  signal,
+  mount,
+  remount,
+  umount,
+  pivot_root,
+
+  /usr/** mrix,
+  /bin/** mrix,
+  /lib{,32,64}/** mr,
+  /etc/{ld.so.cache,ld.so.preload,localtime,nsswitch.conf,passwd,group,resolv.conf,gai.conf,hosts,host.conf,hostname,os-release} r,
+  /etc/ssl/** r,
+  /dev/{null,zero,random,urandom,tty,ptmx} rw,
+  /dev/pts/** rw,
+  /proc/** r,
+  /proc/*/{uid_map,gid_map,setgroups,oom_score_adj} rw,
+  /proc/*/fd/** rw,
+  /sys/devices/system/cpu/** r,
+  /sys/fs/cgroup/** r,
+  /runner/** r,
+  /repo/ r,
+  /repo/** r,
+  /codex/ rw,
+  /codex/auth.json rwk,
+  /scratch/ rw,
+  /scratch/.runner-token* rw,
+  /scratch/.fb-mirror-*.lease rw,
+  /scratch/fb-mirror-*/ rw,
+  /scratch/fb-mirror-*/** rw,
+  /tmp/ rw,
+  owner /tmp/** rwkl,
+  /newroot/ rw,
+  /newroot/** rwkm,
 }

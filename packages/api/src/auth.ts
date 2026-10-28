@@ -3,6 +3,8 @@ import type { Context } from 'hono';
 import type { OperatorConfig } from '@fb/core';
 
 export type AuthOpts = {
+  /** Private installation salt; never returned or logged. */
+  runKeySalt?: string;
   /** When set, every /api and /mcp call needs it (Bearer header, or the UI's session cookie). */
   token?: string;
   /** Host names besides localhost the API answers to. Only honoured when a token is set. */

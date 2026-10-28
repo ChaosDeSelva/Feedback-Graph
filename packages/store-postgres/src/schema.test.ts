@@ -31,7 +31,7 @@ test('CHECK constraints allow exactly the values the TypeScript types allow (add
   expect(allowed('candidates_status_check')).toEqual(all<CandidateStatus>()(['pending', 'confirmed', 'rejected']));
   expect(allowed('feedback_status_check')).toEqual(all<FeedbackStatus>()(['open', 'addressed', 'verified', 'approved', 'rejected', 'reopened', 'superseded', 'unknown']));
   expect(allowed('misses_outcome_check')).toEqual(all<Outcome>()(['approved', 'addressed', 'unresolved', 'unknown']));
-  expect(allowed('lessons_status_check')).toEqual(all<LessonStatus>()(['proposed', 'approved', 'rejected', 'superseded']));
+  expect(allowed('lessons_status_check')).toEqual(all<LessonStatus>()(['proposed', 'approved', 'rejected', 'revoked', 'superseded']));
   expect(allowed('lessons_scope_check')).toEqual(all<LessonScope>()(['task', 'project', 'global']));
   expect(allowed('lessons_source_check')).toEqual(all<LessonSource>()(['postmortem', 'memory', 'manual', 'demo']));
   expect(allowed('context_items_kind_check')).toEqual(all<ContextKind>()(['code', 'doc', 'claude_md', 'agents_md', 'memory', 'session', 'pr', 'ticket', 'upload']));
@@ -52,4 +52,12 @@ test('the embedding dimension is filled in from config, and only a sane one is a
   expect(() => renderMigration(sql, { embeddingDimensions: 0 })).toThrow(/dimension/);
   expect(() => renderMigration(sql, { embeddingDimensions: 1.5 })).toThrow(/dimension/);
   expect(() => renderMigration(sql, { embeddingDimensions: 2001 })).toThrow(/dimension/);
+});
+
+
+test('real-session run migration supplies the feedback attribution columns used by confirmation', () => {
+  const migration = readFileSync(new URL('0048_session_run_tags.sql', dir), 'utf8');
+  expect(migration).toMatch(/ALTER TABLE feedback ADD COLUMN run text/);
+  expect(migration).toMatch(/ALTER TABLE feedback ADD COLUMN sandbox boolean NOT NULL DEFAULT false/);
+  expect(migration).toContain('UPDATE feedback f SET run = k.run, sandbox = k.sandbox FROM candidates k');
 });

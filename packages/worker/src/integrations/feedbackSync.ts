@@ -167,7 +167,7 @@ export function prThread(pr: PrContext, floorMs: number, linked: string[], login
       const external: ExternalRef = {
         source: 'github', kind: c.kind, author: c.author, url: c.url, thread: `${pr.repo}#${pr.number}`, title: pr.title, threadUrl: pr.url,
         path: c.path, line: c.line, diffHunk: c.diffHunk, branch: pr.headBranch, createdAt: c.createdAt, linkedSessionIds: linked,
-        description: body,
+        description: body, threadState: pr.state,
         ...author('github', c.author, c.body, logins), threadAuthor: pr.author, isReply: !!c.inReplyTo, repliesTo: c.inReplyTo ? authorOf.get(c.inReplyTo) ?? null : null, reviewState: c.reviewState ?? null,
         ...(folded && { foldedInto: uuidOf(folded) }),
         ...(files && { prFiles: files }),
@@ -321,10 +321,10 @@ async function syncRepo(p: SyncProject, repo: string, token: string, since: stri
   for (const pr of prs) {
     if (author && pr.author.toLowerCase() !== author.toLowerCase()) continue;
     const fresh = pr.comments.filter((c) => c.createdAt && Date.parse(c.createdAt) >= floorMs);
-    if (!fresh.length) continue;
-    const latest = fresh.map((c) => c.createdAt).sort().at(-1)!;
+    if (!fresh.length && pr.state === 'open') continue;
+    const latest = (fresh.length ? fresh : pr.comments).map((c) => c.createdAt).sort().at(-1) ?? pr.updatedAt;
     const linked = await linkWorkSessions(d.graph, p.key, pr.headBranch, latest);
-    const n = await d.graph.upsertExternalThread(p, prThread(pr, floorMs, linked, d));
+    const n = await d.graph.upsertExternalThread(p, prThread(pr, pr.state === 'open' ? floorMs : 0, linked, d));
     added += n;
     if (n) threads++;
   }

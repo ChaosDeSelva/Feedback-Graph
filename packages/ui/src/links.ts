@@ -70,7 +70,7 @@ export function sourceHref(project: string, s: { kind: string; ref: string }): s
     case 'fact': return moduleHref(project, file);
     case 'lesson': return lessonHref(s.ref);
     case 'session': return sessionHref(s.ref);
-    case 'miss': return s.ref.startsWith('miss:') ? null : moduleHref(project, file);
+    case 'miss': return s.ref.startsWith('miss:') ? inboxHref(s.ref.slice(5)) : moduleHref(project, file);
     case 'linked': return projectHref(s.ref);
     case 'doc': return /^https?:\/\//.test(s.ref) ? s.ref : projectHref(project);
     default: return null;

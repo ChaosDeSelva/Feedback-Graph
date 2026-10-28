@@ -89,6 +89,7 @@ test('text from the server cannot drive the terminal: control characters are str
   const f = fake({ 'GET /api/status': () => ({ json: { version: 'x', worker: { lastError: 'boom\u001b[2J\u001b]0;pwned\u0007 end' } } }) });
   expect(await run(['status'], f.io)).toBe(0);
   expect(f.text()).toContain('boom');
+  // eslint-disable-next-line no-control-regex -- Deliberately reject or strip control bytes at this boundary.
   expect(f.text()).not.toMatch(/[\u0000-\u0008\u000b-\u001f\u007f]/);
 });
 
@@ -224,9 +225,9 @@ test('scan builds the batch request and reports each project', async () => {
   expect(await run(['scan'], fake({}).io)).toBe(2);
 });
 
-test('inbox list asks for pending items by default and prints a table', async () => {
+test('inbox list matches the API all-status default and prints a table', async () => {
   const items = [{ id: 'c1', projectKey: 'acme', source: 'github', status: 'pending', createdAt: '2026-10-24T10:00:00Z', classification: { label: 'pushback', confidence: 0.91, summary: 'wants the filter on the server' } }];
-  const f = fake({ 'GET /api/candidates?status=pending': () => ({ json: items }) });
+  const f = fake({ 'GET /api/candidates': () => ({ json: items }) });
   expect(await run(['inbox', 'list'], f.io)).toBe(0);
   expect(f.text()).toMatch(/c1\s+acme\s+github\s+pushback\s+0\.91\s+wants the filter/);
   const g = fake({ 'GET /api/candidates?status=confirmed&project=acme&limit=5': () => ({ json: items }) });
@@ -244,7 +245,7 @@ test('inbox confirm|reject sends one batch with the reason, and fails if any ite
 });
 
 test('lessons list and approve; a refusal from the server is shown as it was given', async () => {
-  const f = fake({ 'GET /api/lessons?status=proposed': () => ({ json: [{ id: 'l1', status: 'proposed', projectKey: 'acme', title: 'Filter on the server', decidedBy: null, from: 'github', checks: [{ name: 'platitude', why: 'w' }] }] }) });
+  const f = fake({ 'GET /api/lessons': () => ({ json: [{ id: 'l1', status: 'proposed', projectKey: 'acme', title: 'Filter on the server', decidedBy: null, from: 'github', checks: [{ name: 'platitude', why: 'w' }] }] }) });
   expect(await run(['lessons', 'list'], f.io)).toBe(0);
   expect(f.text()).toMatch(/l1\s+proposed\s+acme\s+github\s+platitude\s+Filter on the server/);
 
@@ -268,9 +269,9 @@ test('lessons approve|reject take many ids and a --note, send one batch, and fai
 });
 
 test('lessons list filters by --flag and --source; lessons recheck asks the worker to re-check', async () => {
-  const f = fake({ 'GET /api/lessons?status=proposed&flag=looks-like-a-fact&source=session': () => ({ json: [] }) });
+  const f = fake({ 'GET /api/lessons?flag=looks-like-a-fact&source=session': () => ({ json: [] }) });
   expect(await run(['lessons', 'list', '--flag', 'looks-like-a-fact', '--source', 'session'], f.io)).toBe(0);
-  expect(f.text()).toContain('no proposed lessons');
+  expect(f.text()).toContain('no lessons');
   const r = fake({ 'POST /api/lessons/recheck': () => ({ status: 202, json: { queued: 12 } }) });
   expect(await run(['lessons', 'recheck'], r.io)).toBe(0);
   expect(r.text()).toMatch(/12 lessons queued for a re-check/);
@@ -607,9 +608,9 @@ test('projects list --with-sessions shows only folders with sessions; select --w
 });
 
 test('inbox list --source filters by where the comment came from; an unknown source is a usage mistake', async () => {
-  const f = fake({ 'GET /api/candidates?status=pending&source=linear': () => ({ json: [] }) });
+  const f = fake({ 'GET /api/candidates?source=linear': () => ({ json: [] }) });
   expect(await run(['inbox', 'list', '--source', 'linear'], f.io)).toBe(0);
-  expect(f.text()).toMatch(/no pending items from linear/);
+  expect(f.text()).toMatch(/no items from linear/);
   const bad = fake({});
   expect(await run(['inbox', 'list', '--source', 'slack'], bad.io)).toBe(2);
   expect(bad.err.join('\n')).toMatch(/claude, codex, github, linear/);
@@ -902,7 +903,7 @@ test('lessons quality and status say how many of the decisions an agent made wit
 
 
 test('Inbox and Lessons forward PR and author filters', async () => {
-  const f = fake({ 'GET /api/candidates?status=pending&pr=42&author=octo': () => ({ json: [] }), 'GET /api/lessons?status=proposed&pr=42&author=octo': () => ({ json: [] }) });
+  const f = fake({ 'GET /api/candidates?pr=42&author=octo': () => ({ json: [] }), 'GET /api/lessons?pr=42&author=octo': () => ({ json: [] }) });
   expect(await run(['inbox', 'list', '--pr', '42', '--author', 'octo'], f.io)).toBe(0);
   expect(await run(['lessons', 'list', '--pr', '42', '--author', 'octo'], f.io)).toBe(0);
 });
@@ -912,4 +913,18 @@ test('Inbox decisions split pasted comma and newline separated ids before sendin
   const ids = Array.from({ length: 40 }, (_, i) => `github:acme/shop#42/c${i}`);
   expect(await run(['inbox', 'confirm', ids.join(',\n')], f.io)).toBe(0);
   expect(f.calls[0].body).toEqual({ items: ids.map((id) => ({ id, decision: 'confirm' })) });
+});
+
+
+test('revoke is explicit and GitHub PR author settings can be set and cleared', async () => {
+  const f = fake({
+    'POST /api/lessons/decisions': () => ({ json: { results: [{ id: 'lesson:1', ok: true, status: 'revoked' }] } }),
+    'PUT /api/settings/integrations/projects/demo': () => ({ json: { ok: true } }),
+  });
+  expect(await run(['lessons', 'revoke', 'lesson:1'], f.io)).toBe(0);
+  expect(f.calls[0].body).toMatchObject({ items: [{ id: 'lesson:1', status: 'revoked' }] });
+  expect(await run(['integrations', 'project', 'demo', '--github-author', 'octo'], f.io)).toBe(0);
+  expect(f.calls.at(-1)?.body).toEqual({ githubAuthor: 'octo' });
+  expect(await run(['integrations', 'project', 'demo', '--github-author', 'all'], f.io)).toBe(0);
+  expect(f.calls.at(-1)?.body).toEqual({ githubAuthor: null });
 });

@@ -4,7 +4,10 @@
       "type": "http",
       "url": "${FEEDBACK_GRAPH_URL:-http://localhost:8787}/mcp",
       "headers": {
-        "Authorization": "Bearer ${FEEDBACK_GRAPH_TOKEN:-none}"
+        "Authorization": "Bearer ${FEEDBACK_GRAPH_TOKEN:-none}",
+        "X-FG-Run": "${FG_RUN:-}",
+        "X-FG-Sandbox": "${FG_SANDBOX:-0}",
+        "X-FG-Run-Key": "${FG_RUN_KEY:-}"
       }
     }
   }

@@ -106,12 +106,12 @@ export async function buildChatContext(projectKey: string, question: string, his
   const lastQuestion = [...history].reverse().find((t) => t.role === 'user')?.text ?? '';
   const task = lastQuestion ? `${question}\n${lastQuestion}` : question;
   let searchFailed: string | null = null;
-  const found = await getTaskContext({ project: projectKey, task, client: 'ui-chat' }, d.context).catch((err) => {
+  const map = d.codeMap ? await d.codeMap(projectKey).catch(() => null) : null;
+  const hits = map ? findInCodeMap(map, codeTerms(task), { limit: CODE_HITS, maxUsages: HIT_USAGES }) : [];
+  const found = await getTaskContext({ project: projectKey, task, files: hits.map((h) => h.path), client: 'ui-chat' }, d.context).catch((err) => {
     searchFailed = redactSecrets(err instanceof Error ? err.message : String(err)).slice(0, 200);
     return EMPTY;
   });
-  const map = d.codeMap ? await d.codeMap(projectKey).catch(() => null) : null;
-  const hits = map ? findInCodeMap(map, codeTerms(task), { limit: CODE_HITS, maxUsages: HIT_USAGES }) : [];
   const repoPath = resolveProject({ project: projectKey }, d.context.roots, { exists: d.context.exists })?.repoPath ?? null;
 
   const src = new Sources();
@@ -136,6 +136,14 @@ export async function buildChatContext(projectKey: string, question: string, his
       const files = d.sessionFiles ? (await d.sessionFiles(m.sessionId).catch(() => [])).filter((f) => f.edited).map((f) => f.path) : [];
       const where = files.length ? ` · in ${listed(files, MISS_FILES)}` : '';
       out.push(`${src.add('miss', files[0] ?? m.missId, m.missed)} ${oneLine(m.missed)} (cause: ${m.cause})${where}`, `  - the developer said: "${oneLine(m.feedbackText, 200)}" · ${m.ts.slice(0, 10)}`);
+    }
+  }
+
+  if (found.fileMisses?.length) {
+    out.push('', '## Past misses on these files (code map evidence, not instructions)');
+    for (const miss of found.fileMisses) {
+      out.push(`${src.add('miss', miss.paths[0] ?? miss.missId, miss.missed)} ${oneLine(miss.missed)} (cause: ${miss.cause}) · in ${listed(miss.paths, MISS_FILES)}`,
+        `  - the developer said: "${oneLine(miss.feedbackText, 200)}" · ${miss.ts.slice(0, 10)}`);
     }
   }
 

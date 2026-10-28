@@ -95,6 +95,10 @@ export class Neo4jProbe implements StoreProbe {
     await this.g.run('MATCH (p:Project {key: $key}) SET p += $fields', { key, fields });
   }
 
+  async setLessonCreatedAt(ids: string[], at: string) {
+    await this.g.run('MATCH (l:Lesson) WHERE l.id IN $ids SET l.createdAt = $at', { ids, at });
+  }
+
   async seedOrphan(row: { kind: 'Lesson' | 'Doc'; id: string; projectKey: string }) {
     const extra = row.kind === 'Lesson' ? ", status: 'approved'" : '';
     await this.g.run(`CREATE (:${row.kind} {id: $id, projectKey: $projectKey${extra}})`, { id: row.id, projectKey: row.projectKey });

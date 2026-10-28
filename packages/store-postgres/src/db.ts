@@ -1,3 +1,4 @@
+import { storeTimeLeft, storeRequestSignal } from '@fb/core';
 /**
  * Shared by every repository class: the connection, transactions, and the conversions between Postgres values and
  * the shapes the Neo4j store returns. Owned by the seam: change it only in coordination with every implementer.
@@ -58,11 +59,30 @@ NulSafeClient.prototype.query = function query(this: pg.Client, ...args: unknown
   else if (config && typeof config === 'object' && typeof (config as { submit?: unknown }).submit !== 'function' && Array.isArray((config as { values?: unknown }).values)) {
     args[0] = { ...config, values: ((config as { values: unknown[] }).values).map(stripNul) };
   }
-  return (plainQuery as (...a: unknown[]) => unknown).apply(this, args);
+  const callback = typeof args.at(-1) === 'function' ? args.pop() as (err: unknown, result?: unknown) => void : null;
+  // Submittables own their lifecycle (e.g. migrations/cursors).
+  if (config && typeof config === 'object' && typeof (config as { submit?: unknown }).submit === 'function') {
+    if (callback) args.push(callback);
+    return (plainQuery as (...a: unknown[]) => unknown).apply(this, args);
+  }
+  const signal = storeRequestSignal();
+  const operation = async () => {
+    const isRollback = typeof config === 'string' && /^ROLLBACK\b/i.test(config);
+    const timeout = isRollback ? 30000 : storeTimeLeft();
+    if (signal && !isRollback) {
+      // PostgreSQL enforces this timeout itself, including lock waits; a JS-only timeout would allow late writes.
+      await (plainQuery as (...a: unknown[]) => Promise<unknown>).call(this, "SELECT set_config('statement_timeout', $1, false)", [String(timeout)]);
+      storeTimeLeft();
+    }
+    return await (plainQuery as (...a: unknown[]) => Promise<unknown>).apply(this, args);
+  };
+  const result = operation();
+  if (callback) { void result.then(value => callback(null, value), error => callback(error)); return; }
+  return result;
 } as typeof plainQuery;
 
 export function openDb(config: PostgresConfig): Db {
-  const pool = new pg.Pool({ connectionString: config.url, max: config.max ?? 10, types, Client: NulSafeClient });
+  const pool = new pg.Pool({ connectionString: config.url, max: config.max ?? 10, connectionTimeoutMillis: 5000, statement_timeout: 30000, idle_in_transaction_session_timeout: 30000, types, Client: NulSafeClient });
   // An idle client losing its connection must not crash the process; the next query reconnects.
   pool.on('error', () => {});
   return { pool, dims: config.embeddingDimensions ?? DEFAULT_EMBEDDING_DIMENSIONS };

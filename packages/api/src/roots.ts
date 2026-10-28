@@ -18,6 +18,7 @@ export type RootsStore = {
 export const MAX_ROOTS = 20;
 
 /** Characters a root cannot hold: `:` splits a Docker mount, `,` the env lists, the rest break .env lines and shells. */
+// eslint-disable-next-line no-control-regex -- Deliberately reject or strip control bytes at this boundary.
 const FORBIDDEN = /[:|\\"$,\u0000-\u001f\u007f]/;
 
 const trimSlash = (p: string) => p.replace(/\/+$/, '') || '/';

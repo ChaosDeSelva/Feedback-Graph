@@ -248,7 +248,7 @@ function buildServer(call: Call, sleep: (ms: number) => Promise<void>) {
   }, write({ destructive: true }), async (a) => answer(await call('POST', '/api/candidates/decisions', { items: a.items })));
 
   reg('lessons_list', 'Lessons learned from post-mortems, one compact row each (the rule cut short, check flags by name): proposed ones wait for the owner; approved ones reach agents. lesson_get gives one in full. Paged.', {
-    status: z.enum(['proposed', 'approved', 'rejected', 'superseded']).optional(),
+    status: z.enum(['proposed', 'approved', 'rejected', 'revoked', 'superseded']).optional(),
     project: z.string().min(1).max(MAX.key).optional(),
     pr: z.number().int().positive().optional(),
     author: z.string().trim().min(1).max(200).optional(),
@@ -264,10 +264,10 @@ function buildServer(call: Call, sleep: (ms: number) => Promise<void>) {
 
   reg('lesson_decide', 'Approve a proposed lesson (agents are given it from then on) or reject it. Off by default: lessons are the owner\'s decision.', {
     id: z.string().min(1).max(MAX.id),
-    decision: z.enum(['approve', 'reject']),
+    decision: z.enum(['approve', 'reject', 'revoke']),
   }, write({ destructive: true, idempotent: true }), async (a) => {
-    const r = await call('PATCH', `/api/lessons/${enc(a.id)}`, { status: a.decision === 'approve' ? 'approved' : 'rejected' });
-    return r.ok ? json({ id: a.id, status: a.decision === 'approve' ? 'approved' : 'rejected' }) : fail(r);
+    const r = await call('PATCH', `/api/lessons/${enc(a.id)}`, { status: a.decision === 'approve' ? 'approved' : a.decision === 'revoke' ? 'revoked' : 'rejected' });
+    return r.ok ? json({ id: a.id, status: a.decision === 'approve' ? 'approved' : a.decision === 'revoke' ? 'revoked' : 'rejected' }) : fail(r);
   });
 
   reg('link_decide', 'Confirm a link between two projects (agents in either get the best matches from the other), dismiss it, or reopen it as a suggestion.', {
@@ -357,7 +357,7 @@ export async function handleAdminMcp(req: Request, deps: AdminMcpDeps): Promise<
     if (body !== undefined) headers['content-type'] = 'application/json';
     const res = await deps.request(path, { method, headers, ...(body !== undefined && { body: JSON.stringify(body) }) });
     const raw = await res.text();
-    let data: unknown = null;
+    let data: unknown;
     try { data = raw ? JSON.parse(raw) : null; } catch { data = raw; }
     return { ok: res.ok, status: res.status, data };
   };

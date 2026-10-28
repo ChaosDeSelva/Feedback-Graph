@@ -4,6 +4,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 pnpm install --frozen-lockfile >/dev/null
+pnpm lint
 pnpm typecheck
 pnpm test
 docker compose -f docker-compose.test.yml up -d --wait neo4j-test postgres-test >/dev/null

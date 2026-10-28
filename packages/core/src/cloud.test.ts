@@ -476,12 +476,13 @@ test('a lesson approved and then revoked locally is sent with its new status, so
   const first = fakeFetch([]);
   await runCloudSync({ cloud, portability: store(bundles), projects: async () => ['shop'], trigger: 'schedule', fetch: first.f, sleep: noSleep, memory });
   expect(sentBody(first.calls[0]).lessons.find((l) => l.id === 'lesson:1')?.status).toBe('approved');
-  bundles.shop = bundle('shop', { lessons: bundle('shop').lessons.map((l) => (l.id === 'lesson:1' ? { ...l, status: 'rejected' as const } : l)) });
+  bundles.shop = bundle('shop', { lessons: bundle('shop').lessons.map((l) => (l.id === 'lesson:1' ? { ...l, status: 'revoked' as const, checks: [{ name: 'source-pr-unmerged' as const, why: 'source PR closed without merge' }] } : l)) });
   const second = fakeFetch([]);
   await runCloudSync({ cloud, portability: store(bundles), projects: async () => ['shop'], trigger: 'schedule', fetch: second.f, sleep: noSleep, memory });
   expect(second.calls).toHaveLength(1);
   const body = sentBody(second.calls[0]);
-  expect(body.lessons.find((l) => l.id === 'lesson:1')?.status).toBe('rejected');
+  expect(body.lessons.find((l) => l.id === 'lesson:1')?.status).toBe('revoked');
+  expect(body.lessons.find((l) => l.id === 'lesson:1')?.checks).toMatchObject([{ name: 'source-pr-unmerged' }]);
   expect(body.complete).toBe(true);
 });
 

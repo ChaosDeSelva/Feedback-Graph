@@ -221,9 +221,10 @@ export function Projects({ pollMs = 5000 }: { pollMs?: number } = {}) {
                     </span>
                   )}
                   {!!current.lastScan.shards?.unreached?.length && (
-                    <span className="text-muted tabular-nums" title={`The scan's agents said they did not read these:\n${current.lastScan.shards.unreached.join('\n')}`}>
-                      {current.lastScan.shards.unreached.length} {current.lastScan.shards.unreached.length === 1 ? 'place' : 'places'} not reached
-                    </span>
+                    <details className="text-muted tabular-nums">
+                      <summary className="cursor-pointer">{current.lastScan.shards.unreached.length} {current.lastScan.shards.unreached.length === 1 ? 'place' : 'places'} not reached</summary>
+                      <ul aria-label="Places not reached" className="mt-1 list-disc pl-5">{current.lastScan.shards.unreached.map((place) => <li key={place}>{place}</li>)}</ul>
+                    </details>
                   )}
                   {(() => {
                     const pos = current.lastScan.status === 'queued' ? queuePosition(projects, current.key) : null;

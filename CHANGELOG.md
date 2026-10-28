@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.6.5 (2026-10-27)
+
+- Runner health and doctor execute a real nested sandbox readiness probe and fail closed when the host cannot start it. Documented the explicit masked-proc Docker Desktop/OrbStack workaround. The installed AppArmor profile is enforced and runner-only; the Docker default remains documented. Fixed the malformed environment example and added renewable worker mirror leases/sweeping.
+- Redaction v7 validates Basic/Docker credentials before masking, preserves compiler diagnostics and ordinary auth policy, and covers more credential files and provider-labelled secrets. Upgrade repair rebuilds damaged facts from original sources, restores only exact safe retained lesson snapshots, and reports when an original or backup is required; it never guesses lost text.
+- Pre-done checks have an end-to-end deadline, cancellable embedding and queue waits, and fresh retry budgets. Explicit added console.log violations have changed-line evidence. Weak lesson pointers are dropped, raw similarity scores remain intact, own-PR lessons/docs are excluded, and Ask includes file misses from the code map.
+- PR/author filters include exact text-only mentions, CLI/API defaults agree, and GitHub author filtering is documented. Lessons have a distinct revoked status and a closed-unmerged source-PR review flag. Cloud upgrades preserve existing team remotes in empty allowlists; approval-triggered sharing is disclosed.
+- Memory imports correlate real Claude and Codex writes even when classification arrives later. Run labels reach MCP and immutable real-session registration; sandbox session reads are isolated. Run keys use a private per-installation salt and are absent from Activity. Cleanup previews count only the Activity entries apply can remove; source transcripts remain retained.
+- HTTP/store deadlines and bounded database waits prevent wedged requests and late mutations. Added actual ESLint checks to both repositories and CI, deterministic timestamp tie ordering and storage regression contracts, and accessible/clickable UI evidence and coverage lists.
+
 ## 0.6.4 (2026-10-26)
 
 - Inbox and Lessons can filter by GitHub PR number and feedback author in the UI, API, CLI and admin MCP. GitHub sync can be restricted to a PR author. Bulk Inbox confirmation accepts comma- or whitespace-separated IDs.

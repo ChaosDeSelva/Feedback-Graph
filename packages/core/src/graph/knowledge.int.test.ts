@@ -55,6 +55,48 @@ describeStores('KnowledgeStore', (h) => {
   }
 
   describe('KnowledgeRepo', () => {
+    test('lesson ordering and limited pages are deterministic when creation timestamps tie', async () => {
+      const ids: string[] = [];
+      for (const id of ['z-last', 'a-first', 'm-middle']) {
+        const feedback = await confirmedFeedback(id);
+        await k.savePostmortem(feedback, pm(), { miss: vec(1), lesson: vec(1) });
+        ids.push(`lesson:${feedback}`);
+      }
+      await probe.setLessonCreatedAt(ids, '2026-10-01T12:00:00.000Z');
+      const sorted = [...ids].sort();
+      expect((await k.listLessons({})).map(l => l.id)).toEqual(sorted);
+      expect((await k.listLessons({ limit: 2 })).map(l => l.id)).toEqual(sorted.slice(0, 2));
+      expect((await k.listLessons({ limit: 2 })).map(l => l.id)).toEqual(sorted.slice(0, 2));
+    });
+
+    test('Inbox and Lessons PR and author filters include exact transcript references without GitHub metadata', async () => {
+      for (const [id, text] of [['right', 'Please fix PR #14194 from @Octo.'], ['wrong-number', 'Please fix #141940 from @Octo.'], ['wrong-author', 'Please fix #14194 from @Octo-more.']]) {
+        const s = session(`mention-${id}`);
+        s.turns[2].text = text;
+        await repo.upsertSession(project, s, []);
+        const fid = `${s.sessionId}-t2`;
+        await repo.saveClassification(fid, pushback, true);
+        await repo.decide(fid, 'confirmed', null);
+        await k.savePostmortem(fid, pm(), { miss: vec(1), lesson: vec(1) });
+      }
+      expect((await repo.listCandidates({ pr: 14194, author: 'octo' })).map(c => c.id)).toEqual(['mention-right-t2']);
+      expect((await k.listLessons({ pr: 14194, author: 'octo' })).map(l => l.id)).toEqual(['lesson:mention-right-t2']);
+      expect(await repo.listCandidates({ pr: 1419 })).toEqual([]);
+      expect(await k.listLessons({ pr: 1419 })).toEqual([]);
+    });
+
+    test('revocation is a separate terminal status for a previously approved lesson and survives export', async () => {
+      const id = await confirmedFeedback('revoked-rule');
+      await k.savePostmortem(id, pm(), { miss: vec(1), lesson: vec(1) });
+      await expect(k.updateLesson(`lesson:${id}`, { status: 'revoked' }, {})).rejects.toThrow(/previously approved/);
+      await k.updateLesson(`lesson:${id}`, { status: 'approved' }, {});
+      await k.updateLesson(`lesson:${id}`, { status: 'revoked' }, {});
+      expect(await k.listLessons({ status: 'approved' })).toEqual([]);
+      expect(await k.listLessons({ status: 'rejected' })).toEqual([]);
+      expect(await k.listLessons({ status: 'revoked' })).toMatchObject([{ id: `lesson:${id}`, status: 'revoked' }]);
+      expect((await h.store.portability.exportData()).lessons).toMatchObject([{ status: 'revoked' }]);
+    });
+
     test('feedbackNeedingPostmortem returns the full input for confirmed feedback', async () => {
       const id = await confirmedFeedback('s1');
       const [input] = await k.feedbackNeedingPostmortem(5);

@@ -1,6 +1,7 @@
 export const SCHEMA = [
   'CREATE CONSTRAINT project_key IF NOT EXISTS FOR (n:Project) REQUIRE n.key IS UNIQUE',
   'CREATE INDEX project_remote IF NOT EXISTS FOR (n:Project) ON (n.remote)',
+  'CREATE CONSTRAINT session_run_id IF NOT EXISTS FOR (n:SessionRun) REQUIRE n.sessionId IS UNIQUE',
   'CREATE CONSTRAINT session_id IF NOT EXISTS FOR (n:Session) REQUIRE n.id IS UNIQUE',
   'CREATE CONSTRAINT turn_uuid IF NOT EXISTS FOR (n:Turn) REQUIRE n.uuid IS UNIQUE',
   'CREATE CONSTRAINT commit_sha IF NOT EXISTS FOR (n:Commit) REQUIRE n.sha IS UNIQUE',

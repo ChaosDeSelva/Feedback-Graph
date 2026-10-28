@@ -32,12 +32,16 @@ export class Admission {
   }
 
   /** `ahead`: the checks running or waiting in front of this one when it arrived (0 when it started at once). */
-  async run<T>(fn: (turn: Turn) => Promise<T>): Promise<Admitted<T>> {
+  async run<T>(fn: (turn: Turn) => Promise<T>, options: { signal?: AbortSignal; deadline?: number } = {}): Promise<Admitted<T>> {
     const started = Date.now();
+    const timeoutMs = Math.max(1, Math.min(this.timeoutMs, (options.deadline ?? Infinity) - started));
     const gaveUp = new AbortController();
     const ahead = this.#running < this.concurrency && !this.#queue.length ? 0 : this.#running + this.#queue.length;
     let timer: NodeJS.Timeout | undefined;
-    const deadline = new Promise<'timeout'>((r) => { timer = setTimeout(() => r('timeout'), this.timeoutMs); });
+    let stop!: () => void;
+    const deadline = new Promise<'timeout'>((r) => { stop = () => r('timeout'); timer = setTimeout(stop, timeoutMs); });
+    options.signal?.addEventListener('abort', stop, { once: true });
+    if (options.signal?.aborted) stop();
     try {
       if (ahead) {
         let go!: () => void;
@@ -53,7 +57,7 @@ export class Admission {
         this.#running++;
       }
       const waitedMs = Date.now() - started;
-      const call = Promise.resolve().then(() => fn({ signal: gaveUp.signal, deadline: started + this.timeoutMs })).finally(() => this.#release());
+      const call = Promise.resolve().then(() => fn({ signal: gaveUp.signal, deadline: started + timeoutMs })).finally(() => this.#release());
       const r = await Promise.race([call.then((value) => ({ value })), deadline]);
       if (r === 'timeout') {
         call.catch(() => {});
@@ -63,6 +67,7 @@ export class Admission {
       return { ok: true, value: r.value, ahead, waitedMs };
     } finally {
       clearTimeout(timer);
+      options.signal?.removeEventListener('abort', stop);
     }
   }
 

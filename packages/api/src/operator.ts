@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto';
+import { createHmac, randomBytes } from 'node:crypto';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import type { Context } from 'hono';
 import { RUN_ID, type ActivityStore, type OperatorConfig, type OperatorVerb, type RunTag } from '@fb/core';
@@ -163,7 +163,8 @@ export const refusedVerb = (verb: OperatorVerb) => ({
 const caller = new AsyncLocalStorage<string | null>();
 export const runCaller = <T>(key: string | null, fn: () => T): T => caller.run(key, fn);
 export const currentCaller = (): string | null => caller.getStore() ?? null;
-export function runKey(header: string | undefined): string | null {
+const processRunSalt = randomBytes(32).toString('hex');
+export function runKey(header: string | undefined, salt = processRunSalt): string | null {
   return header && header.length >= 32 && header.length <= 512
-    ? `run-key:${createHash('sha256').update(header).digest('hex')}` : null;
+    ? `run-key:${createHmac('sha256', salt).update(header).digest('hex')}` : null;
 }

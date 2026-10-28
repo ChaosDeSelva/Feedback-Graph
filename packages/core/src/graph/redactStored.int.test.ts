@@ -15,6 +15,18 @@ describeStores('redaction of stored data under new rules', (h) => {
     probe = h.probe;
   });
 
+  test('recovery enumerates damaged closed facts without exposing or reopening their text and paginates', async () => {
+    await probe.seedEmbedded({ kind: 'Fact', id: 'repair-a', path: 'src/a.ts', statement: 'basic [REDACTED]', current: false, embedding: vec });
+    await probe.seedEmbedded({ kind: 'Fact', id: 'repair-b', path: 'notes.md', docId: 'upload-original', statement: 'compiler [REDACTED]', current: false, embedding: vec });
+    await probe.seedEmbedded({ kind: 'Fact', id: 'repair-c', path: 'src/c.ts', statement: 'ordinary intact fact', current: true, embedding: vec });
+    const first = await s.facts.redactionRepairCandidates!('', 1);
+    expect(first).toEqual([expect.objectContaining({ id: 'repair-a', path: 'src/a.ts', docId: null })]);
+    expect(first[0]).not.toHaveProperty('statement');
+    expect(await s.facts.redactionRepairCandidates!(first[0].id, 1)).toEqual([expect.objectContaining({ id: 'repair-b', docId: 'upload-original' })]);
+    expect(await s.facts.redactionRepairCandidates!('repair-b', 1)).toEqual([]);
+    expect((await probe.rows('Fact')).find(f => f.id === 'repair-a')?.current).toBe(false);
+  });
+
   test('facts: secrets are redacted in place; a current fact that is a credential is closed; clean facts are not touched', async () => {
     await probe.seedEmbedded({ kind: 'Fact', id: 'f-code', path: 'src/aws.ts', statement: `src/aws.ts sets const AWS_SECRET_ACCESS_KEY = "${V}" for uploads`, current: true, embedding: vec });
     await probe.seedEmbedded({ kind: 'Fact', id: 'f-prose', path: 'notes.png', statement: 'The admin password is hunter2', current: true, embedding: vec });

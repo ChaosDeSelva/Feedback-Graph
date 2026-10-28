@@ -165,6 +165,15 @@ export class PgDocsStore implements DocsStore {
     await this.db.pool.query(`UPDATE docs SET read_status = 'pending' WHERE read_status = 'reading'`);
   }
 
+  async queueRedactionRepair(id: string): Promise<boolean> {
+    const result = await this.db.pool.query(`UPDATE docs d SET read_status = 'pending', read_attempts = 0, read_error = NULL, read_retry_at = NULL
+      WHERE d.id = $1 AND d.source = 'upload' AND coalesce(d.read_status, '') <> 'reading' AND
+      (EXISTS (SELECT 1 FROM doc_blobs b WHERE b.doc_id = d.id) OR
+       (EXISTS (SELECT 1 FROM chunks c WHERE c.doc_id = d.id) AND NOT EXISTS
+        (SELECT 1 FROM chunks c WHERE c.doc_id = d.id AND c.text LIKE '%[REDACTED]%')))`, [id]);
+    return (result.rowCount ?? 0) > 0;
+  }
+
   async requeueDocRead(id: string): Promise<boolean> {
     const { rowCount } = await this.db.pool.query(
       `UPDATE docs SET read_status = 'pending', read_attempts = 0, read_error = NULL, read_retry_at = NULL

@@ -140,3 +140,12 @@ test('check_before_done takes session_id: the check is recorded with it and its 
   expect((checks.at(-1) as { sessionId?: unknown }).sessionId ?? null).toBeNull();
   expect(logged.at(-1)!.targets).not.toContain('s-7');
 });
+
+
+test('session evidence hides another run sandbox transcript before reading its turns', async () => {
+  let reads = 0;
+  const d = deps({ sessions: { detail: async () => ({ ...session, run: 'private-run', sandbox: true }), turnEvidence: async () => { reads++; return []; } } });
+  const app = createApp(repo, { evidence: d });
+  expect((await app.request('/api/sessions/s1/evidence')).status).toBe(404);
+  expect(reads).toBe(0);
+});

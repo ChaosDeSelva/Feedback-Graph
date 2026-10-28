@@ -254,3 +254,11 @@ describe('bundled: two unrelated misses in one lesson', () => {
     expect(bundled(rule)).toEqual([]);
   });
 });
+
+
+test('a source PR closed without merge is flagged without rejecting its lesson; merged and open are not', () => {
+  const rule = lesson('Use src/db.ts to scope the query by tenant.');
+  expect(checkLesson(rule, feedback('The query needs tenant scope.', { threadState: 'closed' })).flags.map(f => f.name)).toContain('source-pr-unmerged');
+  for (const threadState of ['open', 'merged'] as const) expect(checkLesson(rule, feedback('The query needs tenant scope.', { threadState })).flags.map(f => f.name)).not.toContain('source-pr-unmerged');
+  expect(recheckLesson(rule, 'The query needs tenant scope.', { source: 'github', threadState: 'closed' }).map(f => f.name)).toContain('source-pr-unmerged');
+});

@@ -126,7 +126,7 @@ describe('GET /api/openapi.json', () => {
     expect(decisions.properties.items).toMatchObject({ type: 'array', minItems: 1, maxItems: 500 });
     expect(decisions.properties.items.items.properties.decision).toEqual({ type: 'string', enum: ['confirm', 'reject'] });
     const lessons = doc.paths['/api/lessons'].get.parameters;
-    expect(lessons).toContainEqual({ name: 'status', in: 'query', required: false, schema: { type: 'string', enum: ['proposed', 'approved', 'rejected', 'superseded'] } });
+    expect(lessons).toContainEqual({ name: 'status', in: 'query', required: false, schema: { type: 'string', enum: ['proposed', 'approved', 'rejected', 'revoked', 'superseded'] } });
     expect(doc.paths['/api/lessons/{id}'].patch.parameters).toContainEqual({ name: 'id', in: 'path', required: true, schema: { type: 'string' } });
   });
 });

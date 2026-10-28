@@ -18,6 +18,17 @@ describeStores('DocsStore', (h) => {
     probe = h.probe;
   });
 
+  test('redaction recovery reads only retained intact originals, not placeholders or PR text', async () => {
+    const intact = await d.upsertDoc(doc('repair-intact.md'), [{ text: 'basic understanding', embedding: vec(1) }], { read: true });
+    const damaged = await d.upsertDoc(doc('repair-damaged.md'), [{ text: 'basic [REDACTED]', embedding: vec(1) }], { read: true });
+    const pr = await d.upsertDoc(doc('repair-pr', 'shop', 'github'), [{ text: 'ordinary review', embedding: vec(1) }]);
+    expect(await d.queueRedactionRepair!(intact)).toBe(true);
+    expect(await d.queueRedactionRepair!(damaged)).toBe(false);
+    expect(await d.queueRedactionRepair!(pr)).toBe(false);
+    await d.markDocReading(intact);
+    expect(await d.queueRedactionRepair!(intact)).toBe(false);
+  });
+
   test('upsertDoc stores chunks; re-upserting the same ref replaces them', async () => {
     const id = await d.upsertDoc(doc('spec.md'), [{ text: 'tenants must be isolated', embedding: vec(1) }, { text: 'lists are paginated', embedding: vec(2) }]);
     expect(id).toBe('doc:shop:upload:spec.md');

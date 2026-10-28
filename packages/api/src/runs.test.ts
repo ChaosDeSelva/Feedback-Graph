@@ -67,7 +67,7 @@ function setup(o: { allow?: OperatorVerb[]; items?: RunItem[]; entries?: Activit
       removeRun: async (run, keep, opts) => {
         removedEntries.push(run);
         removeArgs.push({ keep: [...(keep ?? [])], ids: opts?.ids ? [...opts.ids] : undefined, targets: opts?.targets ? [...opts.targets] : undefined });
-        return entries.filter((a) => a.run === run && (!opts?.ids || opts.ids.includes(a.id)) && !a.targets.some((t) => opts?.targets?.includes(t))).length;
+        return entries.filter((a) => a.run === run && (!opts?.ids || opts.ids.includes(a.id)) && !a.targets.some((t) => opts?.targets?.includes(t)) && !keep?.includes(a.kind)).length;
       },
     },
     context: ctx,
@@ -375,13 +375,14 @@ test('an operator cannot clean another agent run; the owner can', async () => {
 test("cleanup with --apply also removes the run's Activity entries, all but the run_cleaned entry, which keeps what the run changed; the dry run says so", async () => {
   const { app, removedEntries, logged } = setup({ items, entries: runEntries, owners: { 'run-1': ['operator', CALLER] } });
   const dry = (await (await app.request('/api/runs/run-1', json('DELETE', {}, op()))).json()) as Record<string, any>;
-  expect(dry).toMatchObject({ dryRun: true, entries: 4, entriesCapped: false });
+  expect(dry).toMatchObject({ dryRun: true, entries: 3, entriesCapped: false });
   expect(removedEntries).toEqual([]);
   const res = (await (await app.request('/api/runs/run-1', json('DELETE', { dryRun: false }, op()))).json()) as Record<string, any>;
-  expect(res).toMatchObject({ dryRun: false, entriesRemoved: 4 });
+  expect(res).toMatchObject({ dryRun: false, entriesRemoved: 3 });
+  expect(res.entriesRemoved).toBe(dry.entries);
   expect(removedEntries).toEqual(['run-1']);
   const cleaned = logged.at(-1)!;
-  expect(cleaned).toMatchObject({ kind: 'run_cleaned', run: null, details: expect.objectContaining({ entriesRemoved: 4 }) });
+  expect(cleaned).toMatchObject({ kind: 'run_cleaned', run: null, details: expect.objectContaining({ entriesRemoved: 3 }) });
   expect((cleaned.details as { changedItems: unknown[] }).changedItems).toEqual([expect.objectContaining({ kind: 'feedback_decided' }), expect.objectContaining({ kind: 'project_pinned' })]);
   expect(cleaned.why).toMatch(/its Activity entries go too/);
 });
@@ -392,7 +393,7 @@ test('cleanup keeps the history of every record it keeps: the entry that created
   const res = (await (await app.request('/api/runs/run-1', json('DELETE', { dryRun: false }, op()))).json()) as Record<string, any>;
   // b (decided by the owner) and c (merged into a session's Inbox item) stay, and so do the entries about them.
   expect([...removeArgs[0].targets!].sort()).toEqual(['lesson:manual:b', 'manual:b', 'manual:c']);
-  expect(res.entriesRemoved).toBe(4);
+  expect(res.entriesRemoved).toBe(3);
 });
 
 test('a run with more entries than a cleanup reads: only the entries it read (and listed) go; every change among them is listed; the rest stay for the next cleanup', async () => {
@@ -613,4 +614,28 @@ test('cleanup preserves request Activity written by another displayed caller', a
   const res = await s.app.request('/api/runs/run-1', json('DELETE', { dryRun: false }, op()));
   expect(res.status).toBe(200);
   expect(s.removeArgs[0].ids).toEqual(['mine']);
+});
+
+
+test('cleanup Activity never contains a run capability or its fingerprint', async () => {
+  const s = setup({ items, owners: { 'run-1': ['operator', CALLER] } });
+  expect((await s.app.request('/api/runs/run-1', json('DELETE', { dryRun: false }, op()))).status).toBe(200);
+  const text = JSON.stringify(s.logged);
+  expect(text).not.toContain(KEY);
+  expect(text).not.toContain(CALLER);
+  expect(s.logged.at(-1)?.details).toMatchObject({ openedBy: 'operator' });
+});
+
+
+test('MCP recent-session lists and details cannot expose another sandbox run', async () => {
+  const queries: unknown[] = [];
+  const privateSession = { id: 'private', projectKey: 'demo', run: 'other', sandbox: true } as never;
+  const { app } = setup({ ctx: { sessions: {
+    list: async q => { queries.push(q); return { sessions: [privateSession], next: null }; },
+    detail: async () => privateSession,
+  } } });
+  const md = await textOf(await app.request('/mcp?run=mine', rpc('get_recent_sessions', { cwd: '/Users/j/Vibe/demo' })));
+  expect(queries).toEqual([expect.objectContaining({ run: 'mine' })]);
+  expect(md).not.toContain('session private');
+  expect(md).toContain('No session');
 });

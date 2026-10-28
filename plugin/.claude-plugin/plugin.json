@@ -1,6 +1,6 @@
 {
   "name": "feedback-graph",
-  "version": "0.6.4",
+  "version": "0.6.5",
   "description": "Lessons from your own pushback, served to Claude Code: context on each request and file, tests from past misses, and a check before it says done. Needs the local Feedback Graph running.",
   "author": { "name": "Jacob Lashley" },
   "homepage": "https://github.com/ChaosDeSelva/Feedback-Graph",

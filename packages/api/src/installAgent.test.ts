@@ -8,6 +8,7 @@ import { expect, test } from 'vitest';
 // scripts/install-agent.sh, run against a throwaway HOME with stand-in `claude` / `codex` commands.
 const repoRoot = fileURLToPath(new URL('../../../', import.meta.url));
 const script = join(repoRoot, 'scripts', 'install-agent.sh');
+const RUN_HEADERS = 'env_http_headers = { "X-FG-Run" = "FG_RUN", "X-FG-Sandbox" = "FG_SANDBOX", "X-FG-Run-Key" = "FG_RUN_KEY" }';
 const TOKEN = 'a'.repeat(48);
 
 function sandbox(agents: ('claude' | 'codex')[]) {
@@ -54,7 +55,7 @@ test('Codex: existing config and AGENTS.md are kept, backed up, appended once; r
   const cfg = readFileSync(s.config, 'utf8');
   expect(cfg.startsWith(`${mine}\n`)).toBe(true);
   expect(cfg).toContain('\n[mcp_servers.feedback-graph]\nurl = "http://localhost:8787/mcp"\n');
-  expect(cfg).not.toContain('http_headers'); // no API_TOKEN
+  expect(cfg).not.toMatch(/^\s*http_headers\s*=/m); // no API_TOKEN
   expect(readFileSync(s.agentsMd, 'utf8').startsWith('# My rules\n\nAlways write tests.\n')).toBe(true);
   expect(backups(s.codexDir, 'config.toml')).toHaveLength(1);
   expect(backups(s.codexDir, 'AGENTS.md')).toHaveLength(1);
@@ -224,7 +225,7 @@ test('Codex --codex-auto-approve on a server already registered adds the key ins
   writeFileSync(s.config, 'model = "o4"\n\n[mcp_servers.feedback-graph]\nurl = "http://localhost:8787/mcp"\n\n[mcp_servers.other]\ncommand = "x"\n');
   s.run(['codex', '--codex-auto-approve']);
   const cfg = readFileSync(s.config, 'utf8');
-  expect(cfg).toBe(`model = "o4"\n\n[mcp_servers.feedback-graph]\n${APPROVE}\nurl = "http://localhost:8787/mcp"\n\n[mcp_servers.other]\ncommand = "x"\n`);
+  expect(cfg).toBe(`model = "o4"\n\n[mcp_servers.feedback-graph]\n${APPROVE}\n${RUN_HEADERS}\nurl = "http://localhost:8787/mcp"\n\n[mcp_servers.other]\ncommand = "x"\n`);
   expect(backups(s.codexDir, 'config.toml')).toHaveLength(1);
   expect(s.run(['codex', '--codex-auto-approve'])).toMatch(/already/);
   expect(readFileSync(s.config, 'utf8')).toBe(cfg);

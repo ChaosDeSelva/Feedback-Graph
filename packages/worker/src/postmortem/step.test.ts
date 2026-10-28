@@ -423,3 +423,17 @@ test("the lessons shown to the writer as the owner's examples are kept in Activi
   });
   expect(activity.map((a) => a.details?.examples)).toEqual([['lesson:e1', 'lesson:r1', 'lesson:w1'], []]);
 });
+
+
+test('post-mortem Activity inherits the feedback run on success and failure', async () => {
+  for (const fail of [false, true]) {
+    const activity: ActivityInput[] = [];
+    await runPostmortems({
+      k: { feedbackNeedingPostmortem: async () => [{ ...input('labelled'), run: 'source-run', sandbox: true }], savePostmortem: async () => {}, recordPostmortemFailure: async () => ({ attempts: 1, retryAt: null }) },
+      postmortem: async () => { if (fail) throw new Error('failed'); return pm; },
+      embed: async texts => texts.map(() => [1]), batch: 1,
+      activity: { record: async a => { activity.push(a); } },
+    });
+    expect(activity[0]).toMatchObject({ kind: fail ? 'postmortem_failed' : 'postmortem_done', run: 'source-run', sandbox: true });
+  }
+});

@@ -245,6 +245,12 @@ export class PgFactsStore implements FactsStore {
     return { redacted, closed, owner, instructions };
   }
 
+  async redactionRepairCandidates(after: string, limit: number) {
+    const { rows } = await this.db.pool.query(`SELECT id, project_key, path, doc_id FROM facts WHERE id > $1 AND NOT coalesce(sandbox, false) AND
+      (close_reason = 'credential' OR statement LIKE '%[REDACTED]%' OR why LIKE '%[REDACTED]%') ORDER BY id LIMIT $2`, [after, limit]);
+    return rows.map((r) => ({ id: r.id as string, projectKey: r.project_key as string, path: r.path as string, docId: (r.doc_id ?? null) as string | null }));
+  }
+
   async reopenInstructionFacts(): Promise<number> {
     let reopened = 0;
     for (let after = ''; ;) {

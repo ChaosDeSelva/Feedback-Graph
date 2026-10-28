@@ -1,4 +1,5 @@
 import type { Hono } from 'hono';
+import { currentRun } from './operator.ts';
 import { MAX_CLASSIFY_ATTEMPTS, redactDeep, type Activity, type ActivityStore, type CandidateDetail, type CodeGraphStore, type GraphStore, type KnowledgeStore, type LessonDetail, type SessionsStore } from '@fb/core';
 
 /**
@@ -37,7 +38,7 @@ export function evidenceRoutes(app: Hono, d: EvidenceDeps) {
   app.get('/api/sessions/:id/evidence', async (c) => {
     const id = c.req.param('id');
     const s = await d.sessions.detail(id);
-    if (!s || !(await d.inScope(s.projectKey))) return c.json({ error: 'not found' }, 404);
+    if (!s || (s.sandbox && (!s.run || s.run !== currentRun()?.id)) || !(await d.inScope(s.projectKey))) return c.json({ error: 'not found' }, 404);
     const [turns, files, served] = await Promise.all([d.sessions.turnEvidence(id), d.sessionFiles?.(id) ?? Promise.resolve(null), entries(id)]);
     const classified = turns.filter((t) => t.label !== null);
     const inbox = await Promise.all(s.inbox.map(async (item) => {

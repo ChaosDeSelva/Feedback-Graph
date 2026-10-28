@@ -1,3 +1,4 @@
+import { reviewPatterns } from '../reviewFilters.ts';
 import { createHash, randomUUID } from 'node:crypto';
 import neo4j from 'neo4j-driver';
 import type {
@@ -41,11 +42,11 @@ export const OUTCOME_STATUS: Record<Outcome, FeedbackStatus> = {
 };
 
 /** Who wrote a lesson's feedback when it came from GitHub or Linear (ExternalRef, trimmed to what the lesson shows). */
-export type FeedbackAuthor = { source: ExternalRef['source']; author: string; url: string; reviewState: ExternalRef['reviewState'] | null };
+export type FeedbackAuthor = { source: ExternalRef['source']; author: string; url: string; reviewState: ExternalRef['reviewState'] | null; threadState?: ExternalRef['threadState'] };
 /** The FeedbackAuthor of a stored ExternalRef (JSON in Neo4j, jsonb in Postgres), or null. */
 export function feedbackAuthorOf(ext: unknown): FeedbackAuthor | null {
   const e = (typeof ext === 'string' ? JSON.parse(ext) : ext) as Partial<ExternalRef> | null | undefined;
-  return e?.source ? { source: e.source, author: e.author ?? '', url: e.url ?? '', reviewState: e.reviewState ?? null } : null;
+  return e?.source ? { source: e.source, author: e.author ?? '', url: e.url ?? '', reviewState: e.reviewState ?? null, ...(e.threadState && { threadState: e.threadState }) } : null;
 }
 
 export type LessonDetail = {
@@ -154,14 +155,16 @@ export class KnowledgeRepo implements KnowledgeStore {
       `MATCH (f:Feedback)-[:FROM_TURN]->(t:Turn)<-[:HAS_TURN]-(s:Session)-[:IN]->(p:Project)
        WHERE NOT (f)<-[:EXPLAINS]-(:Miss) AND f.status <> 'rejected' AND coalesce(f.attempts, 0) < $max AND coalesce(f.retryAt, '') <= $now
        OPTIONAL MATCH (k:Candidate {id: f.id})
-       WITH f, t, s, p, k ORDER BY f.createdAt LIMIT $limit
+       WITH f, t, s, p, k ORDER BY f.createdAt, f.id LIMIT $limit
        MATCH (s)-[:HAS_TURN]->(st:Turn)
        WITH f, t, s, p, k, st ORDER BY st.index
-       RETURN f.id AS id, t, s, p, k.note AS note, k.decidedBy AS noteBy, collect(st) AS turns`,
+       RETURN f.id AS id, f.run AS sourceRun, f.sandbox AS sourceSandbox, t, s, p, k.note AS note, k.decidedBy AS noteBy, collect(st) AS turns`,
       { max: MAX_POSTMORTEM_ATTEMPTS, limit: neo4j.int(limit), now: now.toISOString() },
     );
     return rows.map((r) => ({
       feedbackId: r.get('id'),
+      ...(r.get('sourceRun') ? { run: r.get('sourceRun') as string } : {}),
+      ...(r.get('sourceSandbox') === true ? { sandbox: true as const } : {}),
       projectKey: r.get('p').properties.key,
       repoPath: r.get('p').properties.repoPath,
       cwd: r.get('s').properties.cwd ?? '',
@@ -285,12 +288,13 @@ export class KnowledgeRepo implements KnowledgeStore {
        OPTIONAL MATCH (l)-[:DERIVED_FROM]->(:Miss)-[:EXPLAINS]->(:Feedback)-[:FROM_TURN]->(t:Turn)
        WITH l, t, ${FROM} AS fromKind
        WHERE ($from IS NULL OR fromKind = $from)
-         AND ($author IS NULL OR toLower(t.external) CONTAINS $author)
-         AND ($pr IS NULL OR t.external =~ $pr)
-       RETURN l, fromKind ORDER BY l.createdAt DESC LIMIT $limit`,
+         AND ($author IS NULL OR toLower(t.external) CONTAINS $author OR coalesce(t.text, '') + '\n' + coalesce(t.precedingAssistantText, '') + '\n' + coalesce(t.summary, '') + '\n' + l.title + '\n' + l.rule + '\n' + coalesce(l.appliesWhen, '') =~ $authorText)
+         AND ($pr IS NULL OR t.external =~ $pr OR coalesce(t.text, '') + '\n' + coalesce(t.precedingAssistantText, '') + '\n' + coalesce(t.summary, '') + '\n' + l.title + '\n' + l.rule + '\n' + coalesce(l.appliesWhen, '') =~ $prText)
+       RETURN l, fromKind ORDER BY l.createdAt DESC, l.id LIMIT $limit`,
       {
         status: f.status ?? null, projectKey: f.projectKey ?? null, projectKeys: f.projectKeys ?? null, limit: neo4j.int(f.limit ?? 500),
         flag: f.flag ? `"name":${JSON.stringify(f.flag)}` : null, from: f.from ?? null, run: f.run ?? null,
+        prText: f.pr ? `(?is).*${reviewPatterns(f.pr).pr}.*` : null, authorText: f.author ? `(?is).*${reviewPatterns(undefined, f.author).author}.*` : null,
         author: f.author ? `"author":${JSON.stringify(f.author.toLowerCase())}` : null, pr: f.pr ? `(?s).*"thread":"[^"]*#${f.pr}".*` : null,
       },
     );
@@ -393,6 +397,10 @@ export class KnowledgeRepo implements KnowledgeStore {
   async updateLesson(id: string, patch: LessonPatch, o: { reembed?: number[]; by?: string; note?: string }): Promise<{ unscoped: boolean }> {
     const now = new Date().toISOString();
     const { supersedes, status, projectKey, ...fields } = patch;
+    if (status === 'revoked') {
+      const [current] = await this.g.run('MATCH (l:Lesson {id: $id}) RETURN l.status AS status', { id });
+      if (current?.get('status') !== 'approved') throw new Error('only a previously approved lesson can be revoked');
+    }
     if (supersedes !== undefined) {
       if (supersedes === id) throw new Error('a lesson cannot supersede itself');
       const [found] = await this.g.run('MATCH (l:Lesson {id: $id}) RETURN l.id AS id', { id: supersedes });

@@ -5,7 +5,7 @@ runner_apparmor_check() {
   if [ -n "$selected" ] && [ "$selected" != unconfined ]; then
     # Kernel profile inventories are often root-only. Docker validates an explicit profile when starting it.
     [ -r "$profiles" ] || return 0
-    if grep -Fxq "$selected (enforce)" "$profiles" || grep -Fxq "$selected (unconfined)" "$profiles"; then return 0; fi
+    if grep -Fxq "$selected (enforce)" "$profiles"; then return 0; fi
   fi
   echo "not starting the Codex runner: this Linux host restricts unprivileged user namespaces."
   echo "  Run: sudo ./scripts/install-runner-apparmor.sh"

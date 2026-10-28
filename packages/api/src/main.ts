@@ -1,3 +1,5 @@
+import { dirname, join } from 'node:path';
+import { loadRunKeySalt } from './runKeySalt.ts';
 import { existsSync } from 'node:fs';
 import type { Server } from 'node:http';
 import { serve } from '@hono/node-server';
@@ -36,7 +38,7 @@ if (!emb.ok) {
   process.exit(1);
 }
 const { knowledge, facts, activity, docs, selection } = store;
-const embed = (input: string[]) => ollamaEmbed({ url: config.ollama.url, model: config.ollama.embedModel, input });
+const embed = (input: string[], options: { signal?: AbortSignal; timeoutMs?: number } = {}) => ollamaEmbed({ url: config.ollama.url, model: config.ollama.embedModel, input, ...options });
 
 const localModel = `ollama:${config.ollama.model}`;
 // A CLI CHECK_LLM never gets here: loadConfig refuses it (the api has no agent CLIs). A missing key still falls back.
@@ -137,6 +139,7 @@ const contextDeps: ContextDeps = {
 
 /** Aborted on SIGTERM: the event streams end at once instead of holding the restart for 10 s (stopServer). */
 const closing = new AbortController();
+const runKeySalt = await loadRunKeySalt(join(dirname(config.rootsFile ?? process.env.INTEGRATIONS_FILE ?? join(process.cwd(), 'state/settings/project-roots.json')), '.run-key-salt'));
 const app = createApp(store.graph, {
   closing: closing.signal,
   staticDir: process.env.STATIC_DIR,
@@ -192,7 +195,7 @@ const app = createApp(store.graph, {
     sessionFiles: (id) => store.codegraph.sessionFiles(id),
     activity,
   },
-  auth: { token: config.apiToken ?? undefined, publicHosts: config.publicHosts, operator: config.operator ?? undefined },
+  auth: { runKeySalt, token: config.apiToken ?? undefined, publicHosts: config.publicHosts, operator: config.operator ?? undefined },
   system: { version: VERSION, store: store.kind, roots: roots.length, ping: () => store.ping(), worker: () => store.graph.workerStatus(), selection: () => selection.current(), givenUpTurns: () => store.graph.givenUpTurns(),
     // The embedding model always; the local chat model too when the api's check_before_done judge uses it.
     ollama: () => ollamaPing({ url: config.ollama.url, models: [config.ollama.embedModel, ...(judgeLlm.id.startsWith('ollama:') ? [judgeLlm.id.slice(7)] : [])], timeoutMs: 2000 }),

@@ -1,3 +1,4 @@
+import { requestDeadline } from './requestDeadline.ts';
 import { Hono, type Context, type Next } from 'hono';
 import { bodyLimit } from 'hono/body-limit';
 import { streamSSE } from 'hono/streaming';
@@ -96,6 +97,8 @@ function originAllowed(origin: string, hostHeader: string): boolean {
 }
 
 export type AppOpts = {
+  /** Entire HTTP request, including middleware/store waits; defaults to55seconds. */
+  requestTimeoutMs?: number;
   staticDir?: string;
   context?: ContextDeps;
   knowledge?: Pick<KnowledgeStore, 'listLessons' | 'lessonDetail' | 'updateLesson'> & Partial<Pick<KnowledgeStore, 'retryPostmortem' | 'postmortemBacklog' | 'postmortemQueue' | 'requestLessonRecheck' | 'decidedLessons'>>;
@@ -200,9 +203,9 @@ function showsLesson(v: ShownProjects | null, l: Pick<Lesson, 'projectKey' | 'or
 }
 
 /** Activity's why for a lesson decision, by you or by an agent with the operator token. */
-function decidedWhy(by: string, status: 'approved' | 'rejected' | 'proposed' | undefined): string {
-  if (by === 'you') return status === 'approved' ? 'you approved it, so agents will now be given it' : status === 'rejected' ? 'you rejected it; agents will not see it' : 'you edited it';
-  return `an agent (${by}) ${status === 'approved' ? 'approved it with the operator token (OPERATOR_ALLOW has lesson_decide), so agents will now be given it' : status === 'rejected' ? 'rejected it with the operator token; agents will not see it' : 'edited it with the operator token'}`;
+function decidedWhy(by: string, status: 'approved' | 'rejected' | 'revoked' | 'proposed' | undefined): string {
+  if (by === 'you') return status === 'revoked' ? 'you revoked a previously approved lesson; agents stop receiving it' : status === 'approved' ? 'you approved it, so agents will now be given it' : status === 'rejected' ? 'you rejected it; agents will not see it' : 'you edited it';
+  return `an agent (${by}) ${status === 'revoked' ? 'revoked a previously approved lesson; agents stop receiving it' : status === 'approved' ? 'approved it with the operator token (OPERATOR_ALLOW has lesson_decide), so agents will now be given it' : status === 'rejected' ? 'rejected it with the operator token; agents will not see it' : 'edited it with the operator token'}`;
 }
 
 const NOT_SHOWN = { error: 'not found: this project is not selected (choose it in Settings to see it)' };
@@ -307,7 +310,7 @@ const QualityQuery = z.object({ project: z.string().min(1).max(200).optional() }
 
 const LessonQuery = z.object({
   ...ReviewFilters,
-  status: z.enum(['proposed', 'approved', 'rejected', 'superseded']).optional(),
+  status: z.enum(['proposed', 'approved', 'rejected', 'revoked', 'superseded']).optional(),
   project: z.string().min(1).optional(),
   /** Only lessons whose checks hold this flag. */
   flag: z.enum(LESSON_CHECKS).optional(),
@@ -319,14 +322,14 @@ const LessonQuery = z.object({
 const LessonDecisions = z.object({
   items: z.array(z.object({
     id: z.string().min(1).max(500),
-    status: z.enum(['approved', 'rejected']),
+    status: z.enum(['approved', 'rejected', 'revoked']),
     note: z.string().max(4000).optional(),
   }).strict()).min(1).max(500),
 }).strict();
 
 const LessonPatch = z
   .object({
-    status: z.enum(['approved', 'rejected', 'proposed']).optional(),
+    status: z.enum(['approved', 'rejected', 'revoked', 'proposed']).optional(),
     title: z.string().min(1).max(300).optional(),
     rule: z.string().min(1).max(4000).optional(),
     appliesWhen: z.string().max(1000).optional(),
@@ -433,6 +436,15 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
     return !v || v.has(key);
   };
   const app = new Hono();
+  app.onError((error, c) => {
+    const code = (error as { code?: string }).code;
+    if (error.name === 'StoreDeadlineError' || code === '57014' || /(?:timeout|timed out|deadline exceeded)/i.test(error.message)) {
+      return c.json({ error: 'request deadline exceeded; retry the request', retryable: true }, 504);
+    }
+    log?.('request failed', { error: redactSecrets(error.message).slice(0, 500) });
+    return c.text('Internal Server Error', 500);
+  });
+  app.use('*', requestDeadline(opts.requestTimeoutMs));
   /** Sync now's progress and last run, once its routes are registered below. */
   let cloudState: CloudState | null = null;
   // Other host names are only safe once a token stands between them and the API.
@@ -502,19 +514,19 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
     // a run cannot be hijacked or mixed. With the operator token, ownership is bound to a private
     // X-FG-Run-Key capability, so a copied display name cannot hijack a run; the cleanup rules are in runs.ts.
     if (run && opts.runs && c.req.method !== 'GET' && c.req.method !== 'HEAD') {
-      const actor = operator ? runKey(c.req.header('x-fg-run-key')) : null;
+      const actor = operator ? runKey(c.req.header('x-fg-run-key'), auth.runKeySalt) : null;
       if (operator && !actor) return c.json({ error: 'labelled operator writes require X-FG-Run-Key (FG_RUN_KEY): a private random secret of at least 32 characters' }, 403);
       const owner = await opts.runs.claim(run.id, principal, actor);
       if (!sameCaller(owner, principal, actor)) {
         const error = `run id belongs to another caller: ${run.id} was opened by ${openerOf(owner)} at ${owner.firstSeen}; label this one with a run id of its own`;
-        log?.('run refused', { method: c.req.method, path: c.req.path, run: run.id, owner: owner.actor ?? owner.principal, caller: actor ?? principal });
+        log?.('run refused', { method: c.req.method, path: c.req.path, run: run.id, owner: owner.principal, caller: principal });
         return mcp ? c.json({ jsonrpc: '2.0', id: null, error: { code: -32600, message: error } }, 409) : c.json({ error }, 409);
       }
     }
     // Activity says how each write arrived (operator.ts runVia).
     // A run changes only what it wrote, unless the owner opened it (operator.ts mayChange).
     const fromOwner = principal === 'browser' || principal === 'owner_token';
-    await runCaller(operator ? runKey(c.req.header('x-fg-run-key')) : null, () => runVia(operator ? 'operator' : browser ? 'browser' : 'api', () => runFromOwner(fromOwner, () => runIn(run, next))));
+    await runCaller(operator ? runKey(c.req.header('x-fg-run-key'), auth.runKeySalt) : null, () => runVia(operator ? 'operator' : browser ? 'browser' : 'api', () => runFromOwner(fromOwner, () => runIn(run, next))));
   });
 
   // Every body has a size limit, checked before anything reads it (the Content-Length, else counted as it arrives):
@@ -552,6 +564,18 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
     await next();
   };
   for (const [method, path, verb] of OWNER_ROUTES) app.on(method, path, ownerOnly(verb));
+
+  app.use('/mcp', async (c, next) => {
+    const run = currentRun();
+    if (run && sessions?.store.claimRun && c.req.method === 'POST') {
+      const body = await c.req.raw.clone().json().catch(() => null) as { method?: string; params?: { arguments?: { session_id?: unknown } } } | null;
+      const id = body?.method === 'tools/call' ? body.params?.arguments?.session_id : null;
+      if (typeof id === 'string' && /^[\w.:-]{1,200}$/.test(id) && !await sessions.store.claimRun(id, run)) {
+        return c.json({ jsonrpc: '2.0', id: null, error: { code: -32600, message: 'session already belongs to the owner or another run; start a new labelled session' } }, 409);
+      }
+    }
+    await next();
+  });
 
   app.get('/api/health', (c) => c.json({ ok: true }));
   // Readiness, unlike health, needs the store: a load balancer should not route here while the database is down.
@@ -1408,6 +1432,7 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
       if (!current) return c.json({ error: 'not found' }, 404);
       if (!mayChange(current.lesson)) return notTheRuns(c, `the lesson ${id}`);
       const p = body.data;
+      if (p.status === 'revoked' && current.lesson.status !== 'approved') return c.json({ error: 'only a previously approved lesson can be revoked; reject a proposal instead' }, 409);
       let reembed: number[] | undefined;
       if (embed && (p.title !== undefined || p.rule !== undefined || p.appliesWhen !== undefined)) {
         const l = { ...current.lesson, ...p };
@@ -1457,6 +1482,7 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
           results.push({ id: item.id, ok: false, error: new NotTheRunsError(`the lesson ${item.id}`, currentRun()!.id).message });
           continue;
         }
+        if (item.status === 'revoked' && current.lesson.status !== 'approved') { results.push({ id: item.id, ok: false, error: 'only a previously approved lesson can be revoked' }); continue; }
         await knowledge.updateLesson(item.id, { status: item.status }, { by, ...(item.note && { note: item.note }) });
         await activity?.record({
           kind: 'lesson_decided',

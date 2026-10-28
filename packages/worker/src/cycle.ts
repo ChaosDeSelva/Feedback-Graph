@@ -321,6 +321,8 @@ export async function runCycle(deps: CycleDeps): Promise<CycleResult> {
       candidates++;
       await deps.activity?.record({
         kind: 'candidate_flagged',
+        ...(turn.run ? { run: turn.run } : {}),
+        ...(turn.sandbox ? { sandbox: true } : {}),
         actor: deps.classifierId ?? 'classifier',
         projectKey: turn.projectKey,
         subject: `flagged as ${c.label}: "${turn.text.slice(0, 80)}${turn.text.length > 80 ? '…' : ''}"`,

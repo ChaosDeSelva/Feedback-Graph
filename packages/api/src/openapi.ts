@@ -108,7 +108,7 @@ const SCHEMAS: Record<string, JsonSchema> = {
   Lesson: obj({
     id: str, projectKey: nullable(str), origin: nullable(str), title: str, rule: str, appliesWhen: str,
     scope: { type: 'string', enum: ['task', 'project', 'global'] }, paths: arrayOf(str),
-    status: { type: 'string', enum: ['proposed', 'approved', 'rejected', 'superseded'] }, source: { type: 'string', enum: ['postmortem', 'memory', 'manual'] },
+    status: { type: 'string', enum: ['proposed', 'approved', 'rejected', 'revoked', 'superseded'] }, source: { type: 'string', enum: ['postmortem', 'memory', 'manual'] },
     cause: nullable(str), missId: nullable(str), createdAt: time, decidedAt: nullable(time), decidedBy: nullable(str),
     checks: nullable(arrayOf(ref('LessonCheck'))), decisionNote: nullable(str),
     proposedAs: nullable(obj({ title: str, rule: str, appliesWhen: str, scope: str, paths: arrayOf(str) }, ['title', 'rule', 'appliesWhen', 'scope', 'paths'], 'What the post-mortem proposed, kept when the owner first edited it')),
@@ -303,6 +303,7 @@ const routes = (a = appSchemas): Record<string, Partial<Record<Method, Route>>> 
 
   '/api/sessions': { GET: { tag: 'sessions', summary: 'Session summaries, newest first, paged by cursor', query: sessionSchemas.ListQuery, response: '{ sessions, next }' } },
   '/api/sessions/{id}': { GET: { tag: 'sessions', summary: 'One session\'s summary and history', response: 'SessionDetail' } },
+  '/api/sessions/{id}/run': { POST: { tag: 'sessions', summary: 'Bind a new real agent session to the authenticated request run; never retag an existing owner session', response: 'No content', status: 204 } },
   '/api/sessions/{id}/resummarize': { POST: { tag: 'sessions', summary: 'Rebuild a session summary from scratch', response: '{ queued: true }', status: 202 } },
   '/api/sessions/{id}/evidence': { GET: { tag: 'sessions', summary: 'What the tool saw in one session and decided: turns, the detector\'s call on each (and the skip rules), Inbox items with their post-mortem, miss and lesson, the context served (redacted)', response: 'SessionEvidence' } },
 

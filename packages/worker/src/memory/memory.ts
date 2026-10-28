@@ -1,6 +1,6 @@
 import { readdir, readFile, stat } from 'node:fs/promises';
 import { join, relative, sep } from 'node:path';
-import { keyOfRel, type ActivityStore, type LessonInput } from '@fb/core';
+import { keyOfRel, type ActivityStore, type LessonInput, type GraphStore } from '@fb/core';
 import type { FileState } from '../state.ts';
 
 export type MemoryNote = { name: string; description: string; type: string; body: string };
@@ -62,7 +62,9 @@ export type MemoryDeps = {
   /** MEMORY_AUTO_APPROVE: import as approved. Default: proposed, waiting for you in Lessons like a post-mortem's lesson. */
   autoApprove?: boolean;
   /** True when the session wrote this memory after feedback already represented in the Inbox. */
-  writtenAfterFeedback?(projectKey: string, path: string): Promise<boolean>;
+  writtenAfterFeedback?(projectKey: string, path: string): Promise<boolean | string | null>;
+  withdrawDuplicate?(id: string, feedbackId: string | null): Promise<void>;
+  beginCorrelation?(): void;
 };
 
 /**
@@ -70,8 +72,10 @@ export type MemoryDeps = {
  * were (re)imported. A lesson you have decided on or edited is never overwritten by a later version of its file.
  */
 export async function importMemories(d: MemoryDeps): Promise<number> {
+  d.beginCorrelation?.();
   const roots = await d.roots();
   let imported = 0;
+  const recheck = d.state.getSetting('memory-dedup-v2') !== 'done';
   for (const dir of await readdir(d.transcriptsDir).catch(() => [] as string[])) {
     const projectKey = keyForDir(dir, roots);
     if (!projectKey || (d.includeProject && !d.includeProject(projectKey))) continue;
@@ -81,9 +85,15 @@ export async function importMemories(d: MemoryDeps): Promise<number> {
       const path = join(memDir, file);
       const s = await stat(path).catch(() => null); // deleted (or a dangling link) since readdir
       if (!s?.isFile()) continue;
-      if (!d.state.changed(path, s.size, s.mtimeMs)) continue;
+      const changed = d.state.changed(path, s.size, s.mtimeMs);
       const note = parseMemoryFile(await readFile(path, 'utf8'));
-      if (note?.type === 'feedback' && !(await d.writtenAfterFeedback?.(projectKey, path))) {
+      const duplicate = note?.type === 'feedback' ? await d.writtenAfterFeedback?.(projectKey, path) : false;
+      if (duplicate && d.state.getSetting(`memory-duplicate:${path}`) !== String(duplicate)) {
+        await d.withdrawDuplicate?.(`memory:${dir}/${file}`, typeof duplicate === 'string' ? duplicate : null);
+        d.state.setSetting(`memory-duplicate:${path}`, String(duplicate));
+      }
+      if (!duplicate && !changed && !recheck) continue;
+      if (note?.type === 'feedback' && !duplicate) {
         const [embedding] = await d.embed([`${note.name}\n${note.description}\n${note.body}`]);
         const id = `memory:${dir}/${file}`;
         const title = note.name || file.replace(/\.md$/, '');
@@ -115,5 +125,38 @@ export async function importMemories(d: MemoryDeps): Promise<number> {
       d.state.mark(path, s.size, s.mtimeMs, projectKey);
     }
   }
+  d.state.setSetting('memory-dedup-v2', 'done');
   return imported;
+}
+
+/** Persisted session calls are authoritative, including shell and Codex writes and old/rejected Inbox events. */
+export async function feedbackForMemoryWrite(repo: Pick<GraphStore, 'listCandidates' | 'callsAfter'>, projectKey: string, path: string): Promise<string | null> {
+  const suffix = `/memory/${path.replaceAll('\\', '/').split('/').at(-1)}`;
+  const seen = new Set<string>();
+  for (let offset = 0; ; offset += 500) {
+    const page = await repo.listCandidates({ projectKey, limit: 500, offset });
+    const fresh = page.filter((candidate) => !seen.has(candidate.id));
+    if (!fresh.length) return null;
+    for (const candidate of fresh) {
+      seen.add(candidate.id);
+      const after = await repo.callsAfter(candidate.turnUuid);
+      if (after?.calls.some((call) => {
+        if (/(?:write|edit|patch)/i.test(call.name) && call.filePath?.replaceAll('\\', '/').endsWith(suffix)) return true;
+        const command = call.command?.replaceAll('\\', '/');
+        return !!command?.includes(suffix) && /(?:>|\btee\b|\bcp\b|\bmv\b|write_text|writeFile|\bsed\s+-i\b)/.test(command);
+      })) return candidate.id;
+    }
+    if (page.length < 500) return null;
+  }
+}
+
+/** Cache transcript queries only for one memory pass; newly classified feedback is visible next cycle. */
+export function memoryWriteLookup(repo: Pick<GraphStore, 'listCandidates' | 'callsAfter'>) {
+  const pages = new Map<string, ReturnType<GraphStore['listCandidates']>>();
+  const calls = new Map<string, ReturnType<GraphStore['callsAfter']>>();
+  const cached: Pick<GraphStore, 'listCandidates' | 'callsAfter'> = {
+    listCandidates: (filter) => { const key = JSON.stringify(filter); if (!pages.has(key)) pages.set(key, repo.listCandidates(filter)); return pages.get(key)!; },
+    callsAfter: (uuid) => { if (!calls.has(uuid)) calls.set(uuid, repo.callsAfter(uuid)); return calls.get(uuid)!; },
+  };
+  return { reset: () => { pages.clear(); calls.clear(); }, find: (projectKey: string, path: string) => feedbackForMemoryWrite(cached, projectKey, path) };
 }

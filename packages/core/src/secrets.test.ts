@@ -9,3 +9,11 @@ test.each(['src/env.ts', 'README.md', 'src/keyboard.ts', 'docs/identity.md', 'sr
   // A file *named* for passwords is skipped on purpose (it often holds them); code that merely mentions them is not.
   expect(isSecretPath(p)).toBe(p.includes('password'));
 });
+
+
+test.each([
+  '.git-credentials', '.htpasswd', '.my.cnf', '.s3cfg', '.boto', '.terraformrc', 'terraform.rc',
+  '.aws/config', '.aws/sso/cache/account.json', '.azure/accessTokens.json', '.azure/msal_token_cache.json',
+  '.config/gcloud/application_default_credentials.json', '.config/gcloud/credentials.db', '.config/gcloud/access_tokens.db',
+  '.config/gh/hosts.yml', '.gem/credentials', '.bundle/config', 'deploy/signing.p8', 'vpn/client.ovpn', 'vault/master.agekey',
+])('credential file is excluded: %s', path => expect(isSecretPath(path)).toBe(true));

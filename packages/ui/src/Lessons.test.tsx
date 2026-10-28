@@ -94,7 +94,7 @@ test('an approved lesson can be revoked, so agents stop getting it', async () =>
   fireEvent.click(await screen.findByRole('button', { name: 'approved' }));
   fireEvent.click(await screen.findByRole('button', { name: /^revoke$/i }));
   fireEvent.click(within(await screen.findByRole('alertdialog')).getByRole('button', { name: 'Revoke lesson' }));
-  await waitFor(() => expect(patches).toEqual([{ url: '/api/lessons/l1', body: { status: 'rejected' } }]));
+  await waitFor(() => expect(patches).toEqual([{ url: '/api/lessons/l1', body: { status: 'revoked' } }]));
   await waitFor(() => expect(screen.queryByRole('alertdialog')).toBeNull());
 });
 
@@ -411,7 +411,7 @@ test('the header says how the lessons the post-mortem wrote were judged: approve
   const judged = await screen.findByLabelText('how your lessons were judged');
   expect(judged.textContent).toMatch(/Last 30 days: 143 decided/);
   expect(judged.textContent).toMatch(/21 as written \(15%\)/);
-  expect(judged.textContent).toMatch(/60 after your edit \(42%\)/);
+  expect(judged.textContent).toMatch(/60 after an edit \(42%\)/);
   expect(judged.textContent).toMatch(/62 rejected \(43%\)/);
   // By project and over 90 days, one click away.
   const rows = within(judged).getAllByRole('row').map((r) => r.textContent);

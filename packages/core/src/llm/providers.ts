@@ -1,6 +1,6 @@
 import { PRIVATE_DIRS, SECRET_GLOBS } from '../secrets.ts';
 import { mirrorForAgent } from './mirror.ts';
-import { codexArgs, runOnRunner, RunnerUnavailableError } from './codexRunner.ts';
+import { purgeStaleRunnerMirrors, codexArgs, runOnRunner, RunnerUnavailableError } from './codexRunner.ts';
 import { CliRunError, ProviderUnavailableError } from './unavailable.ts';
 import { basename } from 'node:path';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
@@ -64,8 +64,10 @@ export type AgentMirror = { dir: string; dispose(): Promise<void> };
  */
 function mirrors(parent?: string) {
   const live = new Set<string>();
+  const swept = purgeStaleRunnerMirrors(parent ?? tmpdir(), undefined, Date.now(), true);
   return {
     async make(repo: string): Promise<AgentMirror> {
+      await swept;
       const m = await mirrorForAgent(repo, parent);
       live.add(m.dir);
       return { dir: m.dir, dispose: async () => { live.delete(m.dir); await m.dispose(); } };
@@ -452,3 +454,9 @@ export function makeProviderOr(spec: string, fallback: string, env: ProviderEnv,
     return { provider: makeProvider(fallback, env, o), fellBack: `${spec}: ${err instanceof Error ? err.message : String(err)}` };
   }
 }
+
+/** Startup housekeeping for both local and sidecar copies, without deleting a live lease. */
+export const purgeAgentMirrors = async (env: NodeJS.ProcessEnv = process.env) => {
+  await purgeStaleRunnerMirrors(tmpdir(), undefined, Date.now(), true);
+  await purgeStaleRunnerMirrors(env.CODEX_RUNNER_SCRATCH || DEFAULT_RUNNER_SCRATCH, undefined, Date.now(), true);
+};

@@ -134,3 +134,12 @@ test('a JSON backup roundtrip preserves no-miss quarantine even when keeping app
   const restored: Lesson = { ...lesson('lesson:quarantine'), ...fields };
   expect(gradeLessons([{ lesson: restored, score: 1 }], 'orders', { projectKey: 'demo', files: ['src/orders.ts'] })).toEqual({ follow: [], related: [] });
 });
+
+
+test('backup imports preserve revoked lessons as revoked, even with keepApproved', async () => {
+  const { app, upserted } = deps();
+  const res = await post(app, bundle({ lessons: [lesson('lesson:revoked', { status: 'revoked' })] }), '?keepApproved=1');
+  expect(res.status).toBe(200);
+  expect(upserted).toMatchObject([{ id: 'lesson:revoked', status: 'revoked' }]);
+  expect((await res.json()).lessons.revoked).toBe(1);
+});

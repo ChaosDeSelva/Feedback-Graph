@@ -53,21 +53,20 @@ describe('approved lessons for a task', () => {
     }
   });
 
-  test('an on-topic task follows the lessons that apply; weaker ones are only "possibly related"', async () => {
+  test('a semantic-only match is dropped, including its possibly-related pointer', async () => {
     const d = acme();
     const r = await getTaskContext({ cwd: '/Users/j/Vibe/acme', task: 'rotate the refresh token when a session is renewed' }, d);
     expect(r.lessons.map((h) => h.lesson.id)).toEqual([]);
     const follow = section(r.markdown, FOLLOW);
     const related = section(r.markdown, RELATED);
     expect(follow).toBe('');
-    expect(related).toContain('Rotate refresh tokens on every use');
-    expect(related).toMatch(/not rules for this task/);
+    expect(related).toBe('');
     expect(related).not.toContain('Late events are accepted for 3 days');
     expect(follow).not.toContain('Late events');
     // The Activity entry tells the two apart.
     const details = d.recorded[0].details as { lessons: { id: string }[]; related: { id: string }[] };
     expect(details.lessons.map((x) => x.id)).toEqual([]);
-    expect(details.related.map((x) => x.id)).toContain('auth-refresh');
+    expect(details.related).toBeUndefined();
   });
 
   test('a lesson tied to a named file is followed whatever the task says', async () => {
@@ -75,10 +74,10 @@ describe('approved lessons for a task', () => {
     expect(r.lessons.map((h) => h.lesson.id)).toContain(PATH_TASK.tied);
   });
 
-  test('brief: the same gate, and the possibly related ones are counted among what it left out', async () => {
+  test('brief drops untied lessons instead of offering possibly-related pointers', async () => {
     const r = await getTaskContext({ cwd: '/Users/j/Vibe/acme', task: 'rotate the refresh token when a session is renewed', brief: true }, acme());
     expect(r.lessons.map((h) => h.lesson.id)).toEqual([]);
-    expect(r.markdown).toMatch(/left out .*possibly related lessons?/);
+    expect(r.markdown).not.toContain('possibly related');
     const none = await getTaskContext({ cwd: '/Users/j/Vibe/acme', task: NONSENSE[0], brief: true }, acme());
     expect(none.lessons).toEqual([]);
   });
@@ -119,16 +118,16 @@ describe('search_graph', () => {
     });
     const md = (await searchGraph({ cwd: '/Users/j/Vibe/acme', query: 'fix the checkout total' }, d)).markdown;
     expect(md.length).toBeLessThan(3_300);
-    expect(md).toContain('Checkout lesson 0');
+    expect(md).not.toContain('Checkout lesson 0');
     expect(md).toContain('missed the checkout total rounding in case 0');
     expect(md).toContain('Checkout fact 0');
     // Each section that held items back says how many.
-    expect(md).toContain('Checkout lesson 0');
-    expect(md).toMatch(/- and \d+ more facts?/);
+    expect(md).not.toContain('Checkout lesson 0');
+    expect(md).toContain('Checkout fact 9');
     const details = d.recorded[0].details as { lessons: string[]; facts: string[]; cut?: string[] };
     // What was served is what was shown.
     expect(details.facts.every((id) => md.includes(`Checkout fact ${id.slice(1)}:`))).toBe(true);
-    expect(md).toMatch(/Possibly related lessons/);
+    expect(md).not.toContain('Possibly related lessons');
   });
 });
 

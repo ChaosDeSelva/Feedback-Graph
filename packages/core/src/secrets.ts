@@ -1,11 +1,15 @@
 /** Files that hold credentials. The scanner never reads them and agent CLIs are denied them; one list for both. */
 export const SECRET_FILE =
-  /(^|\/)(\.env(\..*)?|\.envrc|\.pgpass|\.vault-token|(?:[^/]*[-_])?kubeconfig(?:\.[^/]*)?|\.kube\/config|\.docker\/config\.json|[^/]*service[-_]account[^/]*\.json|\.mcp\.json|\.npmrc|\.netrc|\.pypirc|\.git\/config|id_[a-z0-9]+|[^/]*\.(pem|key|p12|pfx|tfvars|tfstate|keystore|jks)|[^/]*(secret|credential|password)[^/]*)$/i;
+  /(^|\/)(\.env(\..*)?|\.git-credentials|\.htpasswd|\.my\.cnf|\.s3cfg|\.boto|\.terraformrc|terraform\.rc|\.aws\/(?:config|sso\/cache\/[^/]+\.json)|\.azure\/(?:accessTokens\.json|msal_token_cache[^/]*)|\.config\/gcloud\/(?:application_default_credentials\.json|credentials\.db|access_tokens\.db)|\.config\/gh\/hosts\.ya?ml|\.gem\/credentials|\.bundle\/config|[^/]*\.(?:p8|ovpn|agekey)|\.envrc|\.pgpass|\.vault-token|(?:[^/]*[-_])?kubeconfig(?:\.[^/]*)?|\.kube\/config|\.docker\/config\.json|[^/]*service[-_]account[^/]*\.json|\.mcp\.json|\.npmrc|\.netrc|\.pypirc|\.git\/config|id_[a-z0-9]+|[^/]*\.(pem|key|p12|pfx|tfvars|tfstate|keystore|jks)|[^/]*(secret|credential|password)[^/]*)$/i;
 
-export const isSecretPath = (path: string) => SECRET_FILE.test(path);
+export const isSecretPath = (path: string) => SECRET_FILE.test(path.replaceAll('\\', '/'));
 
 /** The same files as SECRET_FILE, as globs for Claude Code's Read() deny rules. */
 export const SECRET_GLOBS = [
+  '**/.git-credentials', '**/.htpasswd', '**/.my.cnf', '**/.s3cfg', '**/.boto', '**/.terraformrc', '**/terraform.rc',
+  '**/.aws/config', '**/.aws/sso/cache/*.json', '**/.azure/accessTokens.json', '**/.azure/msal_token_cache*',
+  '**/.config/gcloud/application_default_credentials.json', '**/.config/gcloud/credentials.db', '**/.config/gcloud/access_tokens.db',
+  '**/.config/gh/hosts.yml', '**/.config/gh/hosts.yaml', '**/.gem/credentials', '**/.bundle/config', '**/*.p8', '**/*.ovpn', '**/*.agekey',
   '**/.env*', '**/.pgpass', '**/.vault-token', '**/*kubeconfig*', '**/.kube/config', '**/.docker/config.json', '**/*service-account*.json', '**/*service_account*.json', '**/.mcp.json', '**/.npmrc', '**/.netrc', '**/.pypirc', '**/.git/config', '**/id_*',
   '**/*.pem', '**/*.key', '**/*.p12', '**/*.pfx', '**/*.tfvars', '**/*.tfstate', '**/*.keystore', '**/*.jks',
   '**/*secret*', '**/*credential*', '**/*password*',

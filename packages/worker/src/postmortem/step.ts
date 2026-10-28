@@ -121,6 +121,8 @@ export async function runPostmortems(deps: PostmortemStepDeps): Promise<{ done: 
       }
       await deps.activity?.record({
         kind: 'postmortem_done',
+        ...(input.run ? { run: input.run } : {}),
+        ...(input.sandbox ? { sandbox: true as const } : {}),
         actor: trace?.provider ?? 'postmortem',
         projectKey: input.projectKey,
         subject: pm.noMiss ? `no miss, no lesson: ${pm.missed}` : `missed: ${pm.missed}`,
@@ -173,7 +175,7 @@ export async function runPostmortems(deps: PostmortemStepDeps): Promise<{ done: 
       const error = redactSecrets(charged ? `${charged} (${String(err)})` : String(err));
       const next = await deps.k.recordPostmortemFailure(input.feedbackId, error);
       await deps.activity?.record({
-        kind: 'postmortem_failed', actor: 'postmortem', projectKey: input.projectKey,
+        kind: 'postmortem_failed', ...(input.run ? { run: input.run } : {}), ...(input.sandbox ? { sandbox: true as const } : {}), actor: 'postmortem', projectKey: input.projectKey,
         subject: `post-mortem failed (attempt ${next.attempts}); ${next.retryAt ? `retrying at ${next.retryAt}` : 'gave up, retry it from the API'}`,
         why: error, targets: [input.feedbackId],
       });

@@ -15,7 +15,7 @@
     ],
     "SessionStart": [
       {
-        "matcher": "clear|compact",
+        "matcher": "startup|resume|clear|compact",
         "hooks": [{ "type": "command", "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/feedback-graph.mjs\" session", "timeout": 5 }]
       }
     ]

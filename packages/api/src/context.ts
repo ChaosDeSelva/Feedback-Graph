@@ -31,7 +31,11 @@ export type ContextDeps = {
   roots: Root[];
   /** Similarity gate calibrated for this embedder; semantic embedders default to 0.78. */
   similarityFloor?: number;
-  embed(texts: string[]): Promise<number[][]>;
+  /** End-to-end check budget; production never permits more than 50 seconds. */
+  checkTimeoutMs?: number;
+  checkSignal?: AbortSignal;
+  checkDeadline?: number;
+  embed(texts: string[], options?: { signal?: AbortSignal; timeoutMs?: number }): Promise<number[][]>;
   /** listLessons (optional): lets get_task_context and check_before_done say when no lesson is approved yet. */
   k: Pick<KnowledgeStore, 'searchLessons' | 'relatedMisses' | 'recordPreDoneCheck' | 'createManualFeedback'> & Partial<Pick<KnowledgeStore, 'listLessons'>>;
   /** `o`: when check_before_done gives up (judgeQueue): the deadline to fit every attempt in, and a signal to stop. */
@@ -371,6 +375,7 @@ export type TaskContext = {
   markdown: string;
   lessons: TaskLesson[];
   misses: RelatedMiss[];
+  fileMisses?: FileMiss[];
   facts: FactHit[];
   docs: DocHit[];
   sessions: SessionListItem[];
@@ -459,10 +464,20 @@ async function searchProject(project: Project, own: boolean, embedding: number[]
 }
 
 /** Never present the current PR's own review as independent evidence for its task. */
-async function withoutOwnPr<T extends Pick<DocHit, 'source' | 'ref'>>(docs: T[], q: { task: string; sessionId?: string }, project: Project, d: ContextDeps): Promise<T[]> {
+const prNumberOf = (ref: string): number | null => {
+  const found = ref.match(/github\.com\/[^/]+\/[^/]+\/pull\/(\d+)(?:[/?#]|$)/i) ?? ref.match(/#(\d+)(?:\/|$)/);
+  return found ? Number(found[1]) : null;
+};
+async function withoutOwnPr<T extends { source: string; ref: string; url?: string | null }>(docs: T[], q: { task: string; sessionId?: string }, project: Project, d: ContextDeps): Promise<T[]> {
   if (!docs.some((h) => h.source === 'github')) return docs.filter((h) => h.ref !== q.sessionId);
   const numbers = await d.ownPrNumbers?.(project.repoPath, q.task, project.key).catch(() => []) ?? [];
-  return docs.filter((h) => h.ref !== q.sessionId && !(h.source === 'github' && numbers.includes(Number(h.ref.match(/#(\d+)$/)?.[1]))));
+  const sessionPr = q.sessionId ? prNumberOf(q.sessionId) : null;
+  if (sessionPr) numbers.push(sessionPr);
+  return docs.filter((h) => h.ref !== q.sessionId && !(h.source === 'github' && numbers.includes(prNumberOf(h.ref) ?? prNumberOf(h.url ?? '') ?? -1)));
+}
+async function withoutOwnPrLessons<T extends LessonHit>(hits: T[], q: { task: string; sessionId?: string }, project: Project, d: ContextDeps): Promise<T[]> {
+  const refs = hits.map((hit) => ({ hit, source: /github[:/]/i.test(`${hit.lesson.id} ${hit.lesson.missId ?? ''}`) ? 'github' : 'lesson', ref: prNumberOf(hit.lesson.missId ?? '') ? hit.lesson.missId! : hit.lesson.id }));
+  return (await withoutOwnPr(refs, q, project, d)).map(({ hit }) => hit);
 }
 
 function factLine(f: StoredFact, score: number, mine: OwnChange): string {
@@ -554,7 +569,7 @@ export async function getTaskContext(
   ]);
   const { hits, similar, facts } = found;
   const docs = await withoutOwnPr(found.docs, q, project, d);
-  const lessons = rankByFiles(hits, byFile, project.key);
+  const lessons = await withoutOwnPrLessons(rankByFiles(hits, byFile, project.key), q, project, d);
   // Misses on the named files come first and are not repeated among the similar ones.
   const fileMisses = latestMisses(mods);
   const misses = similar.filter((m) => !fileMisses.some((f) => f.missId === m.missId));
@@ -619,7 +634,7 @@ export async function getTaskContext(
     },
     targets: [...lessons.map((h) => h.lesson.id), ...fileMisses.map((m) => m.missId), ...misses.map((m) => m.missId), ...sessionTarget(q)],
   });
-  return { markdown: lines.join('\n'), lessons, misses, facts, docs, sessions: recent, linked, project };
+  return { markdown: lines.join('\n'), lessons, misses, fileMisses, facts, docs, sessions: recent, linked, project };
 }
 
 const BRIEF_MAX = 1_500;
@@ -657,7 +672,7 @@ async function briefContext(q: ProjectRef & { task: string; sessionId?: string }
     own && d.docs ? d.docs.searchDocs({ embedding, projectKey: project.key, k: DOC_K * 2 }) : Promise.resolve([]),
   ]);
   const graded = gradeLessons(pool.filter((h) => h.lesson.projectKey === project.key || h.lesson.origin === project.key), q.task, { files, projectKey: project.key });
-  const ranked = rankByFiles(graded.follow, byFile, project.key);
+  const ranked = await withoutOwnPrLessons(rankByFiles(graded.follow, byFile, project.key), q, project, d);
   const related = graded.related.filter((h) => !ranked.some((x) => x.lesson.id === h.lesson.id));
   const lessons = ranked.slice(0, BRIEF_LESSONS);
   const fileMisses = latestMisses(mods).slice(-BRIEF_MISSES);
@@ -694,7 +709,7 @@ async function briefContext(q: ProjectRef & { task: string; sessionId?: string }
     details: { task: q.task, brief: true, ...(files.length ? { files } : {}), lessons: lessons.map((h) => ({ id: h.lesson.id, title: h.lesson.title, score: h.score })), fileMisses: fileMisses.map((m) => ({ id: m.missId, missed: m.missed, paths: m.paths })), docs: docs.map((h) => ({ ref: h.ref, title: h.title, score: h.score })), ...(cut.length ? { cut } : {}) },
     targets: [...lessons.map((h) => h.lesson.id), ...fileMisses.map((m) => m.missId), ...sessionTarget(q)],
   });
-  return { markdown: lines.join('\n'), lessons, misses: [], facts: [], docs, sessions: [], linked: [], project };
+  return { markdown: lines.join('\n'), lessons, misses: [], fileMisses, facts: [], docs, sessions: [], linked: [], project };
 }
 
 const SEARCH_MAX = 2_900;
@@ -710,7 +725,10 @@ export async function searchGraph(q: ProjectRef & { query: string }, d: ContextD
   if (!project) return { markdown: UNKNOWN_PROJECT(q) };
   const own = !!selected;
   const [embedding] = await d.embed([q.query]);
-  const { hits, related, similar, facts, docs, services } = await searchProject(project, own, embedding, q.query, [], d);
+  const found = await searchProject(project, own, embedding, q.query, taskFiles({ ...q, task: q.query }, d.roots), d);
+  const { related, similar, facts, services } = found;
+  const hits = await withoutOwnPrLessons(found.hits, { task: q.query }, project, d);
+  const docs = await withoutOwnPr(found.docs, { task: q.query }, project, d);
   const lessons = hits.slice(0, LESSON_K);
   const backlog = !lessons.length && own ? await unapproved(project.key, d) : null;
   const floor = contextFloor(d).toFixed(2);
@@ -763,7 +781,50 @@ export async function searchGraph(q: ProjectRef & { query: string }, d: ContextD
   return { markdown: lines.join('\n') };
 }
 
+/** A check's deadline includes stores, embedding, admission, retries and provenance writes. */
 export async function checkBeforeDone(
+  q: ProjectRef & { task: string; summary: string; diff?: string; filesChanged?: string[]; sessionId?: string },
+  d: ContextDeps,
+): Promise<{ markdown: string; gaps: Gap[]; codeGaps: CodeGap[]; cannotTell?: CannotTell[]; queued?: boolean }> {
+  const controller = new AbortController();
+  const budget = Math.max(1, Math.min(50_000, d.checkTimeoutMs ?? 50_000));
+  const deadline = Date.now() + budget;
+  let timer: ReturnType<typeof setTimeout>;
+  const expired = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => { controller.abort(new Error('check deadline reached')); reject(controller.signal.reason); }, budget);
+  });
+  const guard = <T>(value: T): T => {
+    if (typeof value === 'function') return ((...args: unknown[]) => {
+      controller.signal.throwIfAborted();
+      const result = (value as (...args: unknown[]) => unknown)(...args);
+      return result && typeof (result as Promise<unknown>).then === 'function' ? Promise.race([result, expired]) : result;
+    }) as T;
+    if (value && typeof value === 'object') return new Proxy(value, { get(target, key) {
+      const member = Reflect.get(target, key);
+      return typeof member === 'function' ? guard(member.bind(target)) : member;
+    } });
+    return value;
+  };
+  const bounded = Object.fromEntries(Object.entries(d).map(([key, value]) => [key, key === 'judgeQueue' ? value : guard(value)])) as ContextDeps;
+  bounded.embed = (texts) => {
+    controller.signal.throwIfAborted();
+    return Promise.race([d.embed(texts, { signal: controller.signal, timeoutMs: Math.max(1, deadline - Date.now()) }), expired]);
+  };
+  bounded.checkSignal = controller.signal;
+  bounded.checkDeadline = deadline;
+  const judge = d.judge;
+  bounded.judge = (work, lessons, turn = {}) => {
+    controller.signal.throwIfAborted();
+    return judge(work, lessons, { deadline: Math.min(deadline, turn.deadline ?? deadline), signal: turn.signal ? AbortSignal.any([controller.signal, turn.signal]) : controller.signal });
+  };
+  try { return await Promise.race([checkBeforeDoneWork(q, bounded), expired]); }
+  catch (error) {
+    if (!controller.signal.aborted) throw error;
+    return { markdown: '# Queued: pre-done check has not completed\nThe check reached its response deadline while waiting for context or the judge. Nothing was decided. Retry check_before_done; a queued response is not a completed check.', gaps: [], codeGaps: [], queued: true };
+  } finally { clearTimeout(timer!); }
+}
+
+async function checkBeforeDoneWork(
   q: ProjectRef & { task: string; summary: string; diff?: string; filesChanged?: string[]; sessionId?: string },
   d: ContextDeps,
 ): Promise<{ markdown: string; gaps: Gap[]; codeGaps: CodeGap[]; cannotTell?: CannotTell[] }> {
@@ -787,7 +848,7 @@ export async function checkBeforeDone(
   // the floor; the search's own hits all stay.
   const own = byFile.length ? [...rankByFiles(found, byFile, project.key).filter((h) => h.files), ...found.filter((h) => !byFile.some((m) => m.lesson.id === h.lesson.id))] : found;
   // The linked projects' most relevant lessons are checked too: work here can break what they depend on.
-  const lessons = [...own, ...fromLinks.flat().filter((h) => !own.some((o) => o.lesson.id === h.lesson.id))];
+  const lessons = await withoutOwnPrLessons([...own, ...fromLinks.flat().filter((h) => !own.some((o) => o.lesson.id === h.lesson.id))], q, project, d);
   const codePart = codeGapLines(codeGaps);
   // The agent's session (session_id), on the check and its Activity entry: the session's evidence lists it.
   const changedDetails = { ...(changed.length ? { filesChanged: changed, codeGaps } : {}), ...(q.sessionId ? { sessionId: q.sessionId } : {}) };
@@ -939,10 +1000,11 @@ async function judgeWork(q: { task: string; summary: string }, lessons: LessonHi
   const ask = (turn?: Turn) => d.judge({ task: q.task, summary: q.summary, ...(diff.text && { diff: diff.text }) }, lessons, turn ?? {});
   let slot: Admitted<Verdict[]>;
   try {
-    slot = d.judgeQueue ? await d.judgeQueue.run(ask) : { ok: true as const, value: await ask(), ahead: 0, waitedMs: 0 };
+    slot = d.judgeQueue ? await d.judgeQueue.run(ask, { signal: d.checkSignal, deadline: d.checkDeadline }) : { ok: true as const, value: await ask(), ahead: 0, waitedMs: 0 };
   } catch (err) {
     // A model that failed (an unusable answer twice, an outage, an HTTP error) is never an error to the agent, and
     // never a pass: the lessons are listed to check by hand.
+    if (d.checkSignal?.aborted || (d.checkDeadline !== undefined && d.checkDeadline - Date.now() < 250)) return { notJudged: { cause: 'busy' as const, why: 'the check response budget was exhausted while waiting; retry the check with a fresh budget', ahead: 0, seconds: 50 } };
     const reason = oneLine(redactSecrets(err instanceof Error ? err.message : String(err))).slice(0, 300);
     return { notJudged: { cause: 'failed' as const, why: `the judge failed (${reason})`, ahead: 0, seconds: 0 } };
   }
@@ -1474,7 +1536,7 @@ export async function getModuleContext(q: ProjectRef & { path: string }, d: Cont
   const path = onePath(q, q.path, d.roots);
   if (!path) return { markdown: `${code(q.path)} is not a file in ${project.key}: give a path relative to your cwd, or an absolute path inside the project.`, module: null };
   const [found, meta] = await Promise.all([cg.moduleContext(project.key, path), cg.codeMapMeta?.(project.key) ?? null]);
-  const m = found && { ...found, misses: realMisses(found.misses), lessons: await shownLessons(d, found.lessons, (l) => l) };
+  const m = found && { ...found, misses: realMisses(found.misses), lessons: (await withoutOwnPrLessons((await shownLessons(d, found.lessons, (l) => l)).map((lesson) => ({ lesson, score: 1 })), { task: q.path }, project, d)).map((hit) => hit.lesson) };
   const past = m ? undefined : (await outsideOf(project.key, [path], d)).get(path);
   const answer = m ? moduleMarkdown(project.key, m, graphGaps(project.key, meta)) : null;
   const markdown = answer ? answer.markdown : past && meta ? outsideMarkdown(project.key, past, meta) : await notMapped(project, [path], d);
@@ -1569,7 +1631,7 @@ export async function getImpact(q: ProjectRef & { paths: string[]; depth?: numbe
   const depth = Math.min(MAX_DEPTH, Math.max(1, Math.floor(q.depth ?? DEFAULT_DEPTH)));
   const [all, meta] = await Promise.all([cg.impact(project.key, paths, depth), cg.codeMapMeta?.(project.key) ?? null]);
   const gaps = graphGaps(project.key, meta);
-  const r = { ...all, misses: realMisses(all.misses), lessons: await shownLessons(d, all.lessons, (l) => l) };
+  const r = { ...all, misses: realMisses(all.misses), lessons: (await withoutOwnPrLessons((await shownLessons(d, all.lessons, (l) => l)).map((lesson) => ({ lesson, score: 1 })), { task: q.paths.join(' ') }, project, d)).map((hit) => hit.lesson) };
   const missing = paths.filter((p) => !r.paths.includes(p));
   let markdown: string;
   let served: Served = { lessons: [], misses: [] };
@@ -1745,9 +1807,47 @@ function unbacked(verdicts: z.infer<typeof VerdictList>['verdicts'], files: Retu
     && !citesOf(files, v.evidence ?? []).length && !citesOf(files, quotedCode(v.why)).length);
 }
 
+/** An explicit no-console policy and an added console call are directly observable evidence. */
+function directConsoleViolations(work: { diff?: string }, lessons: LessonHit[]): Verdict[] {
+  const files = work.diff ? splitDiff(work.diff) : [];
+  return lessons.flatMap(({ lesson }) => {
+    const rule = lesson.rule;
+    if (/\b(?:allow|permit|disable|except|unless|only when|when|if)\b/i.test(rule)) return [];
+    if (!/\bno[- ]console\b|\b(?:never|do not|don't)\s+(?:use|call|add)\s+(?:the\s+)?console(?:\.log)?\b/i.test(rule)) return [];
+    const calls = /console\.log\b/i.test(rule) ? /\bconsole\s*\.\s*log\s*\(/ : /\bconsole\s*\.\s*[a-zA-Z_$][\w$]*\s*\(/;
+    const evidence: string[] = [];
+    for (const file of files.filter((f) => !lesson.paths.length || lesson.paths.some((p) => pathMatches(p, f.path)))) {
+      for (const hunk of file.hunks) {
+        let block = false;
+        let quote = '';
+        for (const line of hunk.lines) {
+          if (line.startsWith('-')) continue;
+          let code = '';
+          const body = line.slice(1);
+          for (let i = 0; i < body.length; i++) {
+            const c = body[i], next = body[i + 1];
+            if (block) { if (c === '*' && next === '/') { block = false; i++; } continue; }
+            if (quote) { if (c === '\\') i++; else if (c === quote) quote = ''; continue; }
+            if (c === '/' && next === '/') break;
+            if (c === '/' && next === '*') { block = true; i++; continue; }
+            if (c === '"' || c === "'" || c === '`') { quote = c; code += ' '; continue; }
+            code += c;
+          }
+          if (quote !== '`') quote = '';
+          if (line.startsWith('+') && calls.test(code) && evidence.length < 3) evidence.push(line);
+        }
+      }
+    }
+    return evidence.length ? [{ lessonId: lesson.id, status: 'not_addressed' as const, applies: true, why: 'The diff adds a console call forbidden by this explicit lesson.', evidence }] : [];
+  });
+}
+
 /** Judge whether each lesson is addressed by the described work, with any configured provider. */
 export function makeJudge(llm: LlmProvider): ContextDeps['judge'] {
   return async (work, lessons, o = {}) => {
+    const certain = directConsoleViolations(work, lessons);
+    lessons = lessons.filter((h) => !certain.some((v) => v.lessonId === h.lesson.id));
+    if (!lessons.length) return certain;
     // Models copy short ids reliably; long ids get garbled and the verdict is lost.
     const short = lessons.map((_, i) => `L${i + 1}`);
     const files = work.diff ? splitDiff(work.diff) : [];
@@ -1768,13 +1868,13 @@ export function makeJudge(llm: LlmProvider): ContextDeps['judge'] {
       system: `You review an AI coding agent's finished work against lessons learned from past developer feedback.
 For each lesson first decide applies: true when the lesson is about behaviour this work touches, false when it is about something else (another feature, file or kind of change).
 Then status: addressed (the work clearly handles it), not_addressed (it applies and the work does not show it was handled), not_applicable (applies is false), or cannot_tell (it applies but the diff shows neither way, for example the code it is about is not in the diff).
-A lesson that does not apply is never not_addressed. Be strict about the ones that apply: no evidence in the summary/diff means not_addressed.
-evidence: required on every verdict. When there is a DIFF, every addressed or not_addressed verdict must cite it, a not_addressed one as much as an addressed one: copy, exactly, the diff lines (with their + or - mark) or the @@ hunk header your verdict rests on. A verdict you cannot back with a line of the diff is cannot_tell. Never invent or paraphrase a line. Use [] only for not_applicable, cannot_tell, or when there is no diff. why: one short sentence.`,
+A lesson that does not apply is never not_addressed. Be strict about the ones that apply: no evidence in the summary/diff means not_addressed. An added call that a lesson explicitly forbids is direct evidence of not_addressed, not cannot_tell. For example, a no-console lesson and an added console.log call are a violation; cite the added call exactly.
+evidence: required on every verdict. When there is a DIFF, every addressed or not_addressed verdict must cite it, a not_addressed one as much as an addressed one: copy, exactly, the diff lines (with their + or - mark) your verdict rests on. Never cite a hunk header, file header, or unchanged context line. A verdict you cannot back with a line of the diff is cannot_tell. Never invent or paraphrase a line. Use [] only for not_applicable, cannot_tell, or when there is no diff. why: one short sentence.`,
       user: redactSecrets([
         `TASK: ${work.task}`,
         `AGENT'S SUMMARY OF THE WORK:\n${work.summary}`,
         work.diff ? `DIFF:\n${work.diff}` : '',
-        `LESSONS:\n${lessons.map((h, i) => `- id=${short[i]} | ${h.lesson.title}: ${h.lesson.rule} (applies when: ${h.lesson.appliesWhen})`).join('\n')}`,
+        `LESSONS:\n${lessons.map((h, i) => `- id=${short[i]} | ${h.lesson.title}: ${h.lesson.rule} (applies when: ${h.lesson.appliesWhen}; files: ${(h.lesson.paths ?? []).join(', ') || 'not specified'})`).join('\n')}`,
       ]
         .filter(Boolean)
         .join('\n\n')),
@@ -1799,10 +1899,10 @@ evidence: required on every verdict. When there is a DIFF, every addressed or no
         },
       },
     }, validate, { promptOnly: true, ...(o.deadline !== undefined && { deadline: o.deadline }), ...(o.signal && { signal: o.signal }) });
-    return verdicts.flatMap((v) => {
+    return [...certain, ...verdicts.flatMap((v) => {
       const i = short.indexOf(v.lessonId.trim().toUpperCase());
       const lessonId = i >= 0 ? lessons[i].lesson.id : v.lessonId;
       return lessons.some((h) => h.lesson.id === lessonId) ? [{ ...v, lessonId }] : [];
-    });
+    })];
   };
 }

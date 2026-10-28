@@ -37,6 +37,7 @@ jobs:
       - run: pnpm install --frozen-lockfile
       # A push publishes every commit: no real home folders, planning documents or private names anywhere in history.
       - run: ./scripts/check-public-history.sh HEAD
+      - run: pnpm lint
       - run: pnpm typecheck
       - run: pnpm test
       - name: Allow isolated runner user namespaces on Ubuntu

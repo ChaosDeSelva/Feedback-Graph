@@ -95,7 +95,7 @@ function approvalOnly(text: string, ext: ExternalRef): boolean {
 
 const TABLE_ROW = /^\s*\|.*\|\s*$/;
 const TABLE_RULE = /^\s*\|[\s:|-]+\|\s*$/;
-const STATUS_CELL = /\b(?:fixed|resolved|addressed|done|open|pending|deferred|wontfix|won'?t fix|not applicable|n\/a|in progress|outdated)\b|[✅❌⏳✔️]/i;
+const STATUS_CELL = /\b(?:fixed|resolved|addressed|done|open|pending|deferred|wontfix|won'?t fix|not applicable|n\/a|in progress|outdated)\b|(?:[✅❌⏳]|✔️?)/i;
 
 /** A markdown table that relays where earlier findings stand: most of the comment, most rows with a status. */
 function statusTable(text: string): boolean {
