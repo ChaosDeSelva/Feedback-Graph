@@ -39,7 +39,7 @@ test('installed runner policy enforces its filesystem allowlist without raw netw
   expect(profile).toMatch(/profile feedback-graph-codex-runner flags=\(attach_disconnected,mediate_deleted\)/);
   expect(profile).not.toMatch(/^\s*(?:ptrace|network\s+\S+\s+raw|capability\s+(?:sys_ptrace|net_raw))[,\s]/m);
   expect(profile).toMatch(/^ {2}\/ r,$/m);
-  expect(profile).toMatch(/^ {2}\/proc\/ r,$/m);
+  expect(profile).toMatch(/^ {2}\/proc\/ rw,$/m);
   expect(profile).toContain('/scratch/fb-mirror-*/** rw,');
   expect(profile).not.toMatch(/^\s*\/\*\*\s+[rwm]/m);
 });

@@ -27,7 +27,8 @@ profile feedback-graph-codex-runner flags=(attach_disconnected,mediate_deleted) 
   # Directory reads do not grant access to any files beneath these paths.
   / r,
   /etc/ r,
-  /proc/ r,
+  # Bubblewrap creates the temporary proc mount point after its first pivot_root.
+  /proc/ rw,
   /dev/ r,
   /usr/** mrix,
   /bin/** mrix,
