@@ -23,6 +23,12 @@ profile feedback-graph-codex-runner flags=(attach_disconnected,mediate_deleted) 
   umount,
   pivot_root,
 
+  # Bubblewrap opens the source root and mount-point directories before constructing its private root.
+  # Directory reads do not grant access to any files beneath these paths.
+  / r,
+  /etc/ r,
+  /proc/ r,
+  /dev/ r,
   /usr/** mrix,
   /bin/** mrix,
   /lib{,32,64}/** mr,

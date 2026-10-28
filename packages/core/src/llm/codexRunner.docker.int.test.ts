@@ -69,19 +69,27 @@ describe.skipIf(!dockerUp)('codex-runner container', () => {
       const result = spawnSync('docker', ['logs', `${id}-runner`], { encoding: 'utf8', timeout: 20_000 });
       return `${result.stdout ?? ''}${result.stderr ?? ''}`;
     };
+    let lastHealth = 'no HTTP response';
+    const diagnostics = () => {
+      const kernel = spawnSync('sudo', ['-n', 'dmesg', '--ctime'], { encoding: 'utf8', timeout: 5_000 });
+      const denials = (kernel.stdout ?? '').split('\n').filter(line => /apparmor=.*DENIED|profile=.*feedback-graph-codex-runner/.test(line)).slice(-40).join('\n');
+      return `${logs()}\nLast /health response: ${lastHealth}\nAppArmor diagnostics:\n${denials || kernel.stderr || 'no kernel denials available'}`;
+    };
     const deadline = Date.now() + 30_000;
     while (Date.now() < deadline) {
       const state = JSON.parse(docker(['inspect', '--format', '{{json .State}}', `${id}-runner`])) as { Running: boolean; ExitCode: number };
-      if (!state.Running) throw new Error(`codex-runner exited with ${state.ExitCode}:\n${logs()}`);
+      if (!state.Running) throw new Error(`codex-runner exited with ${state.ExitCode}:\n${diagnostics()}`);
       try {
-        const health = await fetch(`${url}/health`, { signal: AbortSignal.timeout(1000) });
+        const health = await fetch(`${url}/health`, { signal: AbortSignal.timeout(7_000) });
+        lastHealth = `${health.status} ${await health.text()}`;
         if (health.ok) return;
-      } catch {
+      } catch (error) {
+        lastHealth = String(error);
         // The process is running but has not started listening yet.
       }
       await new Promise((r) => setTimeout(r, 200));
     }
-    throw new Error(`codex-runner did not become healthy:\n${logs()}`);
+    throw new Error(`codex-runner did not become healthy:\n${diagnostics()}`);
   }, 660_000);
 
   afterAll(() => {
