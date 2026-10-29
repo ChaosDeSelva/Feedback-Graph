@@ -199,6 +199,8 @@ test('configured runner health requires its actual sandbox probe to succeed', ()
   const failed = doctor({ env, runnerSandbox: false });
   expect(failed.code).toBe(1);
   expect(failed.out).toContain('FAIL  Codex runner: sandbox cannot start');
+  expect(failed.out).toContain('setup.sh --runner-procfs-compat');
+  expect(failed.out).toContain('explicit opt-in reduces system-path protection');
   const healthy = doctor({ env, runnerSandbox: true });
   expect(healthy.code).toBe(0);
   expect(healthy.out).toContain('PASS  Codex runner: its nested sandbox starts successfully');

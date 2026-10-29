@@ -2,6 +2,8 @@
 
 ## 0.6.7 (2026-10-28)
 
+- Replace unrestricted runner seccomp with a pinned Docker-derived default-deny profile, keeping the namespace operations required by the sandbox. Doctor and runner errors name the explicit macOS procfs setup option and its tradeoff. Make the process-group timeout regression wait reliably for both child processes.
+
 - Fix deadline setup during PostgreSQL exports: use a snapshot-free timeout command so repeatable-read transaction isolation can be selected before the first data query. Includes the 0.6.6 field-report fixes below.
 
 ## 0.6.6 (2026-10-28)

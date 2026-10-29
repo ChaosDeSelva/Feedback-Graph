@@ -238,7 +238,7 @@ export function createCodexRunner(o: RunnerOpts) {
         if (r.code !== 0) throw new Error(r.stderr.slice(0, 300) || `sandbox probe exit ${r.code}`);
         lastHealth = { ok: true, sandbox: true };
       } catch (e) {
-        lastHealth = { ok: false, sandbox: false, error: `Codex sandbox cannot start: ${String(e).slice(0, 400)}. Rebuild the runner and check the Docker procfs/AppArmor settings in docs/operations.md.` };
+        lastHealth = { ok: false, sandbox: false, error: `Codex sandbox cannot start: ${String(e).slice(0, 400)}. Rebuild the runner with its checked-in seccomp profile. For Docker Desktop/OrbStack procfs mount errors, review setup.sh --runner-procfs-compat: this optional runner-only systempaths exception reduces Docker system-path protection; otherwise select Claude Code or an API provider. Check AppArmor and docs/operations.md.` };
       } finally { await rm(work, { recursive: true, force: true }); checkedAt = Date.now(); }
       return lastHealth!;
     })().finally(() => { probing = null; });

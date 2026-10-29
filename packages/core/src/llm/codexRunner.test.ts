@@ -169,18 +169,23 @@ test('a job past its timeout is killed with its whole process group and reported
   // A stand-in codex that starts a grandchild and ignores SIGTERM, like a CLI stuck in a tool call.
   const bin = join(root, `fake-codex-${n}`);
   const pidFile = join(root, `grandchild-${n}.pid`);
-  writeFileSync(bin, `#!/bin/sh\ntrap '' TERM\nsleep 30 &\necho $! > ${pidFile}\nwait\n`);
+  const parentPidFile = join(root, `parent-${n}.pid`);
+  writeFileSync(bin, `#!/bin/sh\ntrap '' TERM\necho $$ > ${parentPidFile}\nsleep 30 &\necho $! > ${pidFile}\nwait\n`);
   chmodSync(bin, 0o755);
-  const r = await start({ scratch, bin, exec: undefined, killGraceMs: 100, maxTimeoutMs: 300 });
+  const r = await start({ scratch, bin, exec: undefined, killGraceMs: 100, maxTimeoutMs: 2_000 });
   const t0 = Date.now();
   const res = await r.post({ ...job, timeoutMs: 60_000 });
   const body = (await res.json()) as { code: number; stderr: string };
   expect(body.code).toBe(124);
-  expect(body.stderr).toMatch(/timed out after 300ms/);
+  expect(body.stderr).toMatch(/timed out after 2000ms/);
   expect(Date.now() - t0).toBeLessThan(10_000);
-  const pid = Number(readFileSync(pidFile, 'utf8'));
-  await new Promise((x) => setTimeout(x, 200));
-  expect(() => process.kill(pid, 0)).toThrow();
+  // Both must have actually started: an absent PID file is a failure, never an optional assertion.
+  const pids = [parentPidFile, pidFile].map(file => Number(readFileSync(file, 'utf8')));
+  for (const pid of pids) expect(Number.isInteger(pid) && pid > 0).toBe(true);
+  const gone = (pid: number) => { try { process.kill(pid, 0); return false; } catch (error) { return (error as NodeJS.ErrnoException).code === 'ESRCH'; } };
+  const deadline = Date.now() + 3_000;
+  while (!pids.every(gone) && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 25));
+  for (const pid of pids) expect(gone(pid), `timed-out process ${pid} must be gone`).toBe(true);
 }, 20_000);
 
 test('the client sends the job with the token, waits while the runner is busy, and re-reads a rotated token once', async () => {
@@ -292,7 +297,7 @@ test('readiness probes actual nested sandbox startup and fails closed before acc
   } });
   const health = await fetch(`${r.url}/health`);
   expect(health.status).toBe(503);
-  expect(await health.json()).toMatchObject({ ok: false, sandbox: false });
+  expect(await health.json()).toMatchObject({ ok: false, sandbox: false, error: expect.stringContaining('setup.sh --runner-procfs-compat') });
   const run = await r.post(job);
   expect(run.status).toBe(503);
   expect(await run.json()).toMatchObject({ code: 'sandbox_unavailable' });

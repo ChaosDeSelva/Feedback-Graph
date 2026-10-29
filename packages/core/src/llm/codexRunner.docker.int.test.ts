@@ -65,7 +65,7 @@ describe.skipIf(!dockerUp)('codex-runner container', () => {
     // The runner with exactly the hardening docker-compose.yml gives it (checked against the file below), published on
     // loopback only for this test.
     const launch = (compatibility: string[]) => docker([
-      'run', '-d', ...user, ...compatibility, '--name', `${id}-runner`, '--network', `${id}-net`, '--init', '--read-only', '--tmpfs', '/tmp', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges:true', '--security-opt', 'seccomp=unconfined', '--security-opt', `apparmor=${runnerAppArmor}`,
+      'run', '-d', ...user, ...compatibility, '--name', `${id}-runner`, '--network', `${id}-net`, '--init', '--read-only', '--tmpfs', '/tmp', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges:true', '--security-opt', `seccomp=${join(repoRoot, 'scripts/seccomp/codex-runner.json')}`, '--security-opt', `apparmor=${runnerAppArmor}`,
       '-e', 'HOME=/tmp', '-v', `${scratch}:/scratch`, '-v', `${home}:/codex`, '-v', `${auth}:/codex/auth.json`, '-p', '127.0.0.1::8790', IMAGE,
     ]);
     // Exercise the unchanged masked default before explicitly selecting test-only compatibility.
@@ -153,7 +153,7 @@ describe.skipIf(!dockerUp)('codex-runner container', () => {
     expect(runner.volumes!.find((v) => v.target === '/codex')!.source).not.toBe(cfg.services.worker.volumes!.find((v) => v.target === '/codex')!.source);
     expect(Object.keys(runner.environment ?? {}).sort()).toEqual(['CODEX_HOME', 'HOME', 'RUNNER_PORT', 'RUNNER_SCRATCH']);
     expect(runner.ports ?? []).toEqual([]);
-    expect(runner).toMatchObject({ read_only: true, cap_drop: ['ALL'], security_opt: ['no-new-privileges:true', 'seccomp=unconfined', `apparmor=${runnerAppArmor}`], tmpfs: ['/tmp'] });
+    expect(runner).toMatchObject({ read_only: true, cap_drop: ['ALL'], security_opt: ['no-new-privileges:true', expect.stringMatching(/seccomp=.*scripts\/seccomp\/codex-runner\.json$/), `apparmor=${runnerAppArmor}`], tmpfs: ['/tmp'] });
     expect(runner.privileged).not.toBe(true);
     for (const [name, service] of Object.entries(cfg.services)) {
       if (name !== 'codex-runner') expect((service.security_opt ?? []).filter(opt => opt.startsWith('apparmor='))).toEqual([]);

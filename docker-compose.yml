@@ -195,9 +195,9 @@ services:
     security_opt:
       - no-new-privileges:true
       # Codex's own read-only sandbox (bubblewrap: no writes, no network for the commands codex runs) needs an
-      # unprivileged user namespace, which Docker's default seccomp profile refuses. Without it every command codex
-      # runs fails. This container holds nothing but the mirror and the Codex login (SECURITY.md).
-      - seccomp=unconfined
+      # unprivileged namespaces. Keep a deny-by-default Docker-derived allowlist with only the required namespace
+      # exceptions, rather than disabling syscall filtering. See scripts/seccomp/README.md and SECURITY.md.
+      - seccomp=./scripts/seccomp/codex-runner.json
       # Docker's default AppArmor profile denies mount propagation changes inside bwrap's new user namespace.
       # Scope this exception to the runner; its outer mount/PID namespace still hides other jobs and runner state.
       # On Ubuntu with restricted userns, load scripts/apparmor/feedback-graph-codex-runner and select its name.

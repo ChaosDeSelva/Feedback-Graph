@@ -91,7 +91,7 @@ if [ -n "$(envval CODEX_RUNNER_URL)" ]; then
       pass "Codex runner: its nested sandbox starts successfully"
     else
       fail "Codex runner: sandbox cannot start or runner is unavailable"
-      more "Rebuild codex-runner and check Docker procfs/AppArmor settings (docs/operations.md)."
+      more "Rebuild codex-runner with scripts/seccomp/codex-runner.json. Docker Desktop/OrbStack procfs errors: review setup.sh --runner-procfs-compat (explicit opt-in reduces system-path protection), or select Claude/API. Check AppArmor and docs/operations.md."
     fi
   else fail "Codex runner: configured but cannot be checked from a running worker"; fi
 fi
