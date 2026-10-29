@@ -1,3 +1,4 @@
+import { publicRedactionArchive, setRedactionArchive } from '@fb/core';
 import { cloudLocalOnlyProjects } from '@fb/core';
 import { dirname, join } from 'node:path';
 import { loadRunKeySalt } from './runKeySalt.ts';
@@ -39,6 +40,9 @@ if (!emb.ok) {
   process.exit(1);
 }
 const { knowledge, facts, activity, docs, selection } = store;
+const archiveDirectory = process.env.REDACTION_ARCHIVE_DIR ?? join(dirname(config.integrationsFile ?? join(process.cwd(), 'state/settings/integrations.json')), 'redaction-archive');
+const archive = await publicRedactionArchive(archiveDirectory, { retentionDays: Number(process.env.REDACTION_ARCHIVE_RETENTION_DAYS ?? 30) });
+setRedactionArchive(archive.save);
 const embed = (input: string[], options: { signal?: AbortSignal; timeoutMs?: number } = {}) => ollamaEmbed({ url: config.ollama.url, model: config.ollama.embedModel, input, ...options });
 
 const localModel = `ollama:${config.ollama.model}`;

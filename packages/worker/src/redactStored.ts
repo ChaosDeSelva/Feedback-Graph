@@ -56,7 +56,7 @@ async function v2Counts(d: RedactStoredDeps): Promise<V2Counts | null> {
 export async function redactStoredOnRuleChange(d: RedactStoredDeps): Promise<RedactStoredResult | null> {
   const stamp = `v${REDACTION_VERSION}`;
   const last = await d.cursors.getCursor(REDACTION_CURSOR);
-  if (d.repair && (last === 'v6' || await d.cursors.getCursor('redaction-v6-repair-needed') === 'yes')) {
+  if (d.repair && (last === 'v6' || (!!last && last !== stamp) || await d.cursors.getCursor('redaction-v6-repair-needed') === 'yes')) {
     await d.cursors.setCursor('redaction-v6-repair-needed', 'yes');
     await repairV6Sources(d.repair);
     await d.cursors.setCursor('redaction-v6-repair-needed', 'done');

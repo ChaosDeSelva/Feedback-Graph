@@ -1,6 +1,6 @@
 import type { ScanJob } from '@fb/core';
-import { describe, expect, test } from 'vitest';
-import { ScanRunner, type ScanRunnerDeps } from './runner.ts';
+import { describe, expect, test, vi } from 'vitest';
+import { parkScanProvider, ScanRunner, type ScanRunnerDeps } from './runner.ts';
 
 const job = (id: string, provider: string | null = null): ScanJob => ({
   id, projectKey: id, repoPath: `/vibe/${id}`, provider, status: 'queued', requestedAt: 't', startedAt: null, finishedAt: null,
@@ -240,4 +240,57 @@ test('an unavailable provider is parked with exponential readiness backoff while
   healthy = true; now = 360_000; runner.kick(); await f.settle(); await f.settle();
   expect(probes).toBe(3); expect(f.started).toEqual(['other', 'blocked']);
   await f.release('blocked'); await runner.idle();
+});
+
+
+test('readiness has its own timer while the main worker cycle is busy, and stops cleanly', async () => {
+  vi.useFakeTimers();
+  let probes = 0;
+  const runner = new ScanRunner({
+    next: async () => job('blocked'), empty: async () => false, agentic: () => true,
+    run: async () => { throw Error('must not run'); }, concurrency: 1,
+    ready: async () => { probes++; throw Error('unavailable'); },
+  });
+  try {
+    runner.startPolling();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(probes).toBe(1);
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(probes).toBe(2);
+    await runner.stop();
+    await vi.advanceTimersByTimeAsync(600_000);
+    expect(probes).toBe(2);
+  } finally { vi.useRealTimers(); }
+});
+
+test('default and explicit provider aliases share one probe and one persisted provider-wide park', async () => {
+  const parks: unknown[] = [];
+  let probes = 0;
+  const f = fakes([job('implicit'), job('explicit', 'codex-cli'), job('blank', '  ')], {
+    providerKey: j => j.provider?.trim() || 'codex-cli',
+    now: () => 0,
+    ready: async () => { probes++; throw Error('cannot mount proc'); },
+    parkProvider: async (...args) => { parks.push(args); },
+  });
+  const runner = new ScanRunner(f.deps);
+  runner.kick(); await runner.idle();
+  expect(probes).toBe(1);
+  expect(parks).toEqual([['codex-cli', 'Error: cannot mount proc', '1970-01-01T00:02:00.000Z']]);
+  expect(f.started).toEqual([]);
+});
+
+
+test('provider outage refreshes all queued peers, preserving attempts and excluding active/other jobs', async () => {
+  const queue = [job('blank', ''), job('explicit', 'codex-cli'), job('other', 'ollama:local'), { ...job('active', 'codex-cli'), status: 'running' as const }];
+  queue[0].error = 'stale error'; queue[0].retryAt = '2000-01-01T00:00:00Z'; queue[0].attempts = 3;
+  queue[1].retryAt = '2999-01-01T00:00:00Z';
+  const updates: unknown[] = [];
+  await parkScanProvider({
+    scanQueue: async () => queue.map(j => ({ ...j, waitingSince: j.requestedAt })),
+    updateScanJob: async (id, patch) => { updates.push({ id, patch }); },
+  }, 'codex-cli', 'codex-cli', 'new sandbox error', '2030-01-01T00:02:00Z');
+  expect(updates).toEqual(['blank', 'explicit'].map(id => ({ id, patch: {
+    error: 'scan parked: new sandbox error; checking readiness with backoff before copying the repository', retryAt: '2030-01-01T00:02:00Z',
+  } })));
+  expect(queue[0].attempts).toBe(3);
 });

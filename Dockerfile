@@ -30,7 +30,7 @@ FROM runtime AS worker
 RUN npm i -g @anthropic-ai/claude-code@2.1.309 @openai/codex@0.162.0 \
   # CODEX_HOME and the codex-runner scratch live on named volumes, which start as a copy of these folders: writable by
   # whichever uid runs the worker (the default node, or HOST_UID), sticky so one uid cannot remove another's files.
-  && mkdir -p /codex /scratch && chown node:node /codex /scratch && chmod 1777 /codex /scratch
+  && mkdir -p /codex /scratch /redaction-key && chown node:node /codex /scratch /redaction-key && chmod 1777 /codex /scratch /redaction-key
 WORKDIR /app/packages/worker
 USER node
 HEALTHCHECK --interval=60s --timeout=5s --start-period=120s --retries=3 \

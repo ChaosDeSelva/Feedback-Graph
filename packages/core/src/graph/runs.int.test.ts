@@ -56,6 +56,16 @@ describeStores('RunsStore and run attribution', (h) => {
     probe = h.probe;
   });
 
+  test('sandbox provenance includes session-only registrations', async () => {
+    expect(await s.sessions.claimRun('sandbox-only-session', { id: 'sandbox-only', sandbox: true })).toBe(true);
+    expect(await s.sessions.claimRun('ordinary-only-session', { id: 'ordinary-only', sandbox: false })).toBe(true);
+    expect(await s.runs.items('sandbox-only')).toEqual([]);
+    expect(await s.activity.list({ run: 'sandbox-only' })).toEqual([]);
+    expect(await s.runs.sandbox?.('sandbox-only')).toBe(true);
+    expect(await s.runs.sandbox?.('ordinary-only')).toBe(false);
+    expect(await s.runs.sandbox?.('unknown-run')).toBe(false);
+  });
+
   test('activity records the run, lists it back, and filters by it', async () => {
     await s.activity.record({ kind: 'context_served', actor: 'agent (MCP)', projectKey: 'shop', subject: 'a', why: 'w', run: 'run-1' });
     await s.activity.record({ kind: 'context_served', actor: 'agent (MCP)', projectKey: 'shop', subject: 'b', why: 'w', run: 'sbx-1', sandbox: true });

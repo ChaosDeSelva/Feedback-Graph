@@ -1,3 +1,4 @@
+import { archiveRedactionInput } from '@fb/core';
 import type { Hono } from 'hono';
 import { z } from 'zod';
 import { EXPORT_FORMAT, FACT_KINDS, LESSON_CHECKS, redactDeep, type ActivityStore, type PortabilityStore, type EmbeddedFact, type FactsStore, type KnowledgeStore, type LessonInput, type LessonStatus } from '@fb/core';
@@ -88,6 +89,8 @@ export async function importBundle(raw: ImportBundle, o: { keepApproved: boolean
   // Redact again: the bundle may come from an older version, another machine, or have been edited by hand.
   const b = redactDeep(raw);
   const never = new Set(d.excluded);
+  if (!d.portability?.restorePrivateProject && b.projects.some(p => p.demoCreated && !never.has(p.key))) throw new Error('this importer cannot preserve private-project provenance; upgrade before importing the bundle');
+  await archiveRedactionInput('import', raw.projectKey ?? 'bundle', raw, b);
   const r: ImportResult = {
     lessons: { added: 0, approved: 0, proposed: 0, existing: 0, excluded: 0, skipped: 0 },
     facts: { added: 0, projects: [], skippedProjects: [] },

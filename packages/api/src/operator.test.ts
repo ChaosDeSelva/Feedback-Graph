@@ -98,7 +98,7 @@ test('deciding lessons stays with you unless OPERATOR_ALLOW names lesson_decide;
 
 test('a lesson an allowed agent approves is marked as approved by that agent', async () => {
   const { app, updates, logged } = setup({ allow: ['lesson_decide'] });
-  expect((await app.request('/api/lessons/l1', call('PATCH', { status: 'approved' }, bearer(OP, 'codex')))).status).toBe(204);
+  expect((await app.request('/api/lessons/l1', call('PATCH', { status: 'approved' }, bearer(OP, 'codex')))).status).toBe(200);
   expect(updates[0][2]).toEqual(expect.objectContaining({ by: 'operator:codex' }));
   expect(logged[0]).toEqual(expect.objectContaining({ kind: 'lesson_decided', actor: 'operator:codex' }));
   expect(logged[0].why).toMatch(/agent/);
@@ -108,7 +108,7 @@ test('a lesson an allowed agent approves is marked as approved by that agent', a
 
 test('the owner approving from the UI is recorded as you', async () => {
   const { app, updates } = setup();
-  expect((await app.request('/api/lessons/l1', call('PATCH', { status: 'approved' }, { origin: 'http://localhost' }))).status).toBe(204);
+  expect((await app.request('/api/lessons/l1', call('PATCH', { status: 'approved' }, { origin: 'http://localhost' }))).status).toBe(200);
   expect(updates[0][2]).toEqual(expect.objectContaining({ by: 'you' }));
 });
 

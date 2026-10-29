@@ -1,10 +1,11 @@
+import { createRequire } from 'node:module';
 import { parseLogins } from './feedbackRules.ts';
 import { parseGithubRepos } from './integrations/github.ts';
 import type { Root } from './projects.ts';
 import { DEFAULT_NUM_CTX, DEFAULT_NUM_PREDICT, DEFAULT_OLLAMA_TIMEOUT_MS, DEFAULT_REPEAT_PENALTY } from './ollama.ts';
 
 /** Bumped with each release; reported by /api/status and the worker heartbeat. */
-export const VERSION = '0.6.7';
+export const VERSION: string = createRequire(import.meta.url)('../package.json').version;
 
 export class ConfigError extends Error {
   readonly problems: string[];

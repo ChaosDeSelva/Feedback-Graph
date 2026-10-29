@@ -114,6 +114,8 @@ export const STORE_WRITE_POLICY = {
     requeueStaleDocs: 'write',
     requeueDocRead: 'internal',
     queueRedactionRepair: 'write',
+    githubRepairDocs: 'read',
+    githubDocChunks: 'read',
     docImage: 'read',
     listDocs: 'read',
     deleteDoc: 'internal',
@@ -217,6 +219,7 @@ export const STORE_WRITE_POLICY = {
     redactStoredTurns: 'write',
   } satisfies Policy<ChatStore>,
   runs: {
+    sandbox: 'read',
     items: 'read',
     remove: 'write',
     claim: 'write',

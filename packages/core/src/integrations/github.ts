@@ -46,6 +46,17 @@ export type PrContext = {
 };
 
 export type FetchPrOpts = {
+  /** Read these exact PRs instead of walking unrelated repository history. */
+  numbers?: number[];
+  /** Backfill metadata without spending requests on comments and changed files. */
+  metadataOnly?: boolean;
+  /** One REST page for resumable metadata-only walks; callback follows completed per-PR callbacks. */
+  metadataPage?: number;
+  onMetadataPage?: (next: number | null) => void;
+  includeFiles?: boolean;
+  /** Persist progress as each complete PR arrives, before a later request can fail. */
+  onPr?: (pr: PrContext) => Promise<void>;
+
   /** Only pull requests authored by this GitHub login. */
   author?: string;
   repo: string;
@@ -297,31 +308,47 @@ export async function fetchPullRequestContext(o: FetchPrOpts): Promise<PrContext
   const listUrl = `${API}/repos/${o.repo}/pulls?state=all&sort=updated&direction=desc&per_page=${perPage}`;
 
   const picked: z.infer<typeof PullSchema>[] = [];
-  let seen = 0;
-  // Newest first: reaching `since` (or the end of the list) means everything since was read.
-  let reachedSince = false;
-  let oldest: string | null = null;
-  const listing = { more: false };
-  outer: for await (const page of pages(listUrl, PullSchema, o.token, fetchImpl, o.until ? MAX_PAGES + SKIP_PAGES : MAX_PAGES, listing)) {
-    for (const p of page) {
-      const t = Date.parse(p.updated_at);
-      if (t < sinceMs) {
-        reachedSince = true;
-        break outer;
-      }
-      if (seen >= maxPrs) break outer;
-      oldest = t > untilMs ? o.until! : p.updated_at;
-      if (t > untilMs) continue;
-      seen++;
-      if (!isBot(p.user) && (!o.author || p.user?.login?.toLowerCase() === o.author.toLowerCase())) picked.push(p);
+  let nextMetadataPage: number | null = null;
+  if (o.numbers) {
+    for (const number of [...new Set(o.numbers)]) {
+      if (!Number.isSafeInteger(number) || number < 1) throw new Error('github: invalid PR number');
+      const response = await ghFetch(`${API}/repos/${o.repo}/pulls/${number}`, o.token, fetchImpl);
+      picked.push(PullSchema.parse(await response.json()));
     }
-    if (seen >= maxPrs) break;
+  } else if (o.metadataOnly && o.metadataPage !== undefined) {
+    if (!Number.isSafeInteger(o.metadataPage) || o.metadataPage < 1) throw new Error('github: invalid metadata page');
+    const response = await ghFetch(`${listUrl}&page=${o.metadataPage}`, o.token, fetchImpl);
+    const rows = z.array(PullSchema).parse(await response.json());
+    picked.push(...rows.filter(p => !isBot(p.user) && (!o.author || p.user?.login?.toLowerCase() === o.author.toLowerCase())));
+    const next = nextLink(response.headers.get('link'));
+    nextMetadataPage = next ? Number(new URL(next).searchParams.get('page')) : null;
+  } else {
+    let seen = 0;
+    // Newest first: reaching `since` (or the end of the list) means everything since was read.
+    let reachedSince = false;
+    let oldest: string | null = null;
+    const listing = { more: false };
+    outer: for await (const page of pages(listUrl, PullSchema, o.token, fetchImpl, o.until ? MAX_PAGES + SKIP_PAGES : MAX_PAGES, listing)) {
+      for (const p of page) {
+        const t = Date.parse(p.updated_at);
+        if (t < sinceMs) {
+          reachedSince = true;
+          break outer;
+        }
+        if (seen >= maxPrs) break outer;
+        oldest = t > untilMs ? o.until! : p.updated_at;
+        if (t > untilMs) continue;
+        seen++;
+        if (!isBot(p.user) && (!o.author || p.user?.login?.toLowerCase() === o.author.toLowerCase())) picked.push(p);
+      }
+      if (seen >= maxPrs) break;
+    }
+    if (o.since && o.onCap && oldest && !reachedSince && (seen >= maxPrs || listing.more)) o.onCap(oldest);
   }
-  if (o.since && o.onCap && oldest && !reachedSince && (seen >= maxPrs || listing.more)) o.onCap(oldest);
 
   const out: PrContext[] = [];
   for (const p of picked) {
-    out.push({
+    const pr: PrContext = {
       repo: o.repo,
       number: p.number,
       title: p.title,
@@ -331,10 +358,13 @@ export async function fetchPullRequestContext(o: FetchPrOpts): Promise<PrContext
       updatedAt: p.updated_at,
       headBranch: p.head?.ref ?? null,
       body: p.body ?? '',
-      comments: await commentsFor(o.repo, p.number, o.token, fetchImpl),
-      ...await filesFor(o.repo, p.number, o.token, fetchImpl),
-    });
+      comments: o.metadataOnly ? [] : await commentsFor(o.repo, p.number, o.token, fetchImpl),
+      ...(!o.metadataOnly && o.includeFiles !== false ? await filesFor(o.repo, p.number, o.token, fetchImpl) : {}),
+    };
+    out.push(pr);
+    await o.onPr?.(pr);
   }
+  if (o.metadataOnly && o.metadataPage !== undefined) o.onMetadataPage?.(nextMetadataPage);
   return out;
 }
 

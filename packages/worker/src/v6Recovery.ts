@@ -2,7 +2,7 @@ import { realpath, stat } from 'node:fs/promises';
 import { relative, resolve, isAbsolute } from 'node:path';
 import { redactSecrets, type ActivityStore, type DocsStore, type FactsStore, type KnowledgeStore } from '@fb/core';
 
-export const V6_REPAIR_CURSOR = 'redaction-v6-source-repair';
+export const V6_REPAIR_CURSOR = 'redaction-v6-source-repair-v9';
 /** Reproduce only the three defective v6 patterns, to match an exact retained snapshot. */
 export function v6FalsePositiveMask(text: string): string {
   return text.replace(/\b(Basic\s+)[A-Za-z0-9+/]{8,}={0,2}/gi, '$1[REDACTED]')
@@ -21,7 +21,7 @@ type Deps = {
 };
 /** Never reopen masked facts: rebuild them from verified local sources, or request the owner's original. */
 export async function repairV6Sources(d: Deps) {
-  if (await d.docs.getCursor(V6_REPAIR_CURSOR) === 'done') return null;
+  if (await d.docs.getCursor(V6_REPAIR_CURSOR) === 'scheduled') return null;
   const result = { suspectedFacts: 0, filesQueued: 0, uploadsQueued: 0, lessonsRestored: 0, lessonsNeedOriginal: 0, factsNeedOriginal: 0 };
   const projects = new Map((await d.projects()).map(p => [p.key, p]));
   const paths = new Map<string, Set<string>>();
@@ -78,7 +78,7 @@ export async function repairV6Sources(d: Deps) {
   await d.activity?.record({ kind: 'secrets_redacted', actor: 'deterministic', projectKey: null,
     subject: 'Redaction v6 source recovery scheduled',
     why: `File rescans and retained upload originals are queued, not restored yet. Masked facts stay closed. ${result.lessonsRestored ? `${result.lessonsRestored} exact safe retained lesson snapshots restored.` : 'No lesson originals were restored.'} Unavailable originals require re-upload, source review or a backup. Counts are suspected damage, not proof of a false positive.`,
-    details: { version: 7, recovery: 'v6-source-repair', ...result } });
-  await d.docs.setCursor(V6_REPAIR_CURSOR, 'done');
+    details: { version: 9, recovery: 'v6-source-repair', ...result } });
+  await d.docs.setCursor(V6_REPAIR_CURSOR, 'scheduled');
   return result;
 }

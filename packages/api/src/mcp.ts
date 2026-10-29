@@ -1,3 +1,5 @@
+import { createHmac, randomBytes } from 'node:crypto';
+import { currentCaller } from './operator.ts';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { WebStandardStreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js';
 import { z } from 'zod';
@@ -177,20 +179,25 @@ export async function initializeClientInfo(req: Request): Promise<{ found: boole
   return init ? { found: true, info: init.params?.clientInfo } : { found: false, info: undefined };
 }
 
+const retryIdentitySalt = randomBytes(32);
+
 async function initializeClient(req: Request): Promise<string | undefined> {
   const init = await initializeClientInfo(req);
   return init.found ? mcpClientLabel(init.info) : undefined;
 }
 
 /** Stateless Streamable HTTP: a fresh server + transport per request. */
-export async function handleMcp(req: Request, ctx: ContextDeps): Promise<Response> {
+export async function handleMcp(req: Request, ctx: ContextDeps, authenticatedIdentity?: string): Promise<Response> {
   // A client ending its session (Codex does on every exit). Stateless: there is nothing to end, so it simply succeeds.
   if (req.method === 'DELETE') return new Response(null, { status: 204 });
   // The stream a GET opens is for messages the server sends unasked, and this one never does: the stateless transport
   // closed it at once, and every client reopened it, twice a second. 405 is the spec's way to say there is none.
   if (req.method === 'GET') return new Response(null, { status: 405, headers: { allow: 'POST, DELETE' } });
   const initialized = await initializeClient(req);
-  const server = buildServer(ctx, initialized ?? decodeClient(req.headers.get('mcp-session-id')));
+  const capability = currentCaller();
+  // Only the embedding authenticated route can vouch for a credential; arbitrary headers are not identity.
+  const identity = authenticatedIdentity ? createHmac('sha256', retryIdentitySalt).update(JSON.stringify([authenticatedIdentity, capability, req.headers.get('origin')])).digest('hex') : undefined;
+  const server = buildServer({ ...ctx, checkRetryIdentity: identity }, initialized ?? decodeClient(req.headers.get('mcp-session-id')));
   const transport = new WebStandardStreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true });
   await server.connect(transport);
   try {

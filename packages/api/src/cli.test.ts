@@ -934,9 +934,10 @@ test('legacy cleanup --owner explicitly uses API_TOKEN and owner authorization',
   const f = fake({ 'DELETE /api/runs/legacy': () => ({ json: { run: 'legacy', dryRun: true, remove: {}, kept: [], changed: [], entries: 0 } }) }, { FG_OPERATOR_TOKEN: OP, API_TOKEN: 'owner-api-token' });
   expect(await run(['cleanup', '--run', 'legacy', '--owner'], f.io)).toBe(0);
   expect(f.calls[0].headers).toMatchObject({ authorization: 'Bearer owner-api-token', origin: 'http://localhost:8787', 'x-fg-owner-cleanup': 'true' });
-  const missing = fake({});
-  expect(await run(['cleanup', '--run', 'legacy', '--owner'], missing.io)).toBe(2);
-  expect(missing.calls).toEqual([]);
+  const missing = fake({ 'DELETE /api/runs/legacy': () => ({ json: { run: 'legacy', dryRun: true, remove: {}, kept: [], changed: [], entries: 0 } }) });
+  expect(await run(['cleanup', '--run', 'legacy', '--owner'], missing.io)).toBe(0);
+  expect(missing.calls[0].headers).toMatchObject({ origin: 'http://localhost:8787', 'x-fg-owner-cleanup': 'true' });
+  expect(missing.calls[0].headers.authorization).toBeUndefined();
 });
 
 test('Codex actual thread id is registered early using inherited run context', async () => {

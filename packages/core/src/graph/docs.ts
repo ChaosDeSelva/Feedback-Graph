@@ -64,7 +64,7 @@ export const MAX_IMAGE_BYTES = 8 * 1024 * 1024;
  */
 export const docIdOf = (d: Pick<DocInput, 'projectKey' | 'source' | 'ref'>, run?: RunTag | null) =>
   `doc${run?.sandbox ? `@${run.id}` : ''}:${d.projectKey}:${d.source}:${d.ref}`;
-export type DocHit = { docId: string; source: DocSource; ref: string; title: string; url: string | null; text: string; score: number };
+export type DocHit = { docId: string; source: DocSource; ref: string; title: string; url: string | null; text: string; score: number; rankingScore?: number };
 
 /** Context that isn't code: uploaded documents, PR discussions, tickets. Stored as embedded chunks per document. */
 export class DocsRepo implements DocsStore {
@@ -205,6 +205,20 @@ export class DocsRepo implements DocsStore {
 
   async requeueStaleDocs() {
     await this.g.run(`MATCH (d:Doc {readStatus: 'reading'}) SET d.readStatus = 'pending'`);
+  }
+
+  async githubDocChunks(id: string): Promise<string[] | null> {
+    const rows = await this.g.run(`MATCH (d:Doc {id: $id, source: 'github'}) OPTIONAL MATCH (d)-[:HAS_CHUNK]->(c:Chunk)
+      WITH d, c ORDER BY c.idx RETURN d.id AS id, collect(c.text) AS chunks`, { id });
+    return rows.length ? rows[0].get('chunks') as string[] : null;
+  }
+
+  async githubRepairDocs(projectKey: string, afterId: string, limit: number) {
+    const rows = await this.g.run(`MATCH (d:Doc {projectKey: $key, source: 'github'}) WHERE d.id > $after
+      AND EXISTS { MATCH (d)-[:HAS_CHUNK]->(c:Chunk) WHERE c.text CONTAINS '[REDACTED]' }
+      WITH d ORDER BY d.id LIMIT $limit MATCH (d)-[:HAS_CHUNK]->(c:Chunk) WHERE c.text CONTAINS '[REDACTED]'
+      RETURN d.id AS id, d.ref AS ref, collect(c.text) AS chunks ORDER BY id`, { key: projectKey, after: afterId, limit: neo4j.int(limit) });
+    return rows.map(r => ({ id: String(r.get('id')), ref: String(r.get('ref')), chunks: r.get('chunks') as string[] }));
   }
 
   async queueRedactionRepair(id: string): Promise<boolean> {

@@ -52,9 +52,15 @@ services:
   neo4j:
     # 5.26 is the long-term-support line: patch updates only.
     image: neo4j:5.26-community
+    mem_limit: ${NEO4J_MEMORY_LIMIT:-2G}
     environment:
       NEO4J_AUTH: neo4j/${NEO4J_PASSWORD}
+      NEO4J_server_memory_heap_initial__size: ${NEO4J_HEAP:-1G}
       NEO4J_server_memory_heap_max__size: ${NEO4J_HEAP:-1G}
+      NEO4J_server_memory_pagecache_size: ${NEO4J_PAGECACHE:-512M}
+      NEO4J_dbms_memory_transaction_total_max: ${NEO4J_TRANSACTION_TOTAL_MAX:-256M}
+      NEO4J_db_memory_transaction_total_max: ${NEO4J_TRANSACTION_DATABASE_MAX:-256M}
+      NEO4J_db_memory_transaction_max: ${NEO4J_TRANSACTION_MAX:-64M}
     ports:
       - "127.0.0.1:${NEO4J_HTTP_PORT:-7476}:7474"
       - "127.0.0.1:${NEO4J_BOLT_PORT:-7689}:7687"
@@ -129,6 +135,9 @@ services:
       TURN_RETENTION_DAYS: ${TURN_RETENTION_DAYS:-}
       # true: Claude Code feedback memories become approved lessons on import; default false (proposed, you approve them).
       MEMORY_AUTO_APPROVE: ${MEMORY_AUTO_APPROVE:-false}
+      REDACTION_ARCHIVE_DIR: /state/settings/redaction-archive
+      REDACTION_ARCHIVE_KEY_DIR: /redaction-key/private
+      REDACTION_ARCHIVE_RETENTION_DAYS: ${REDACTION_ARCHIVE_RETENTION_DAYS:-30}
       STATE_DB: /state/worker.sqlite
       POLL_SECONDS: ${POLL_SECONDS:-30}
       # Empty = the defaults: 50 turns per cycle; files per project scale with its size (40% of the candidates, at least
@@ -153,6 +162,7 @@ services:
       # CODEX_AUTH_FILE=~/.codex/auth.json (set by scripts/setup.sh when you use Codex); the default is an empty placeholder.
       - ${CODEX_AUTH_FILE:-./state/codex-auth.json}:/codex/auth.json
       - ./state:/state
+      - redaction-key:/redaction-key
       # Shared with codex-runner only: the per-job repository mirrors and the runner's token.
       - codex-scratch:/scratch
     extra_hosts:
@@ -218,6 +228,7 @@ services:
       - /tmp
     environment:
       <<: *env
+      CODEX_RUNNER_URL: ${CODEX_RUNNER_URL:-}
       CHECK_LLM: ${CHECK_LLM:-}
       CHECK_CONCURRENCY: ${CHECK_CONCURRENCY:-}
       CHECK_WAIT_SECONDS: ${CHECK_WAIT_SECONDS:-}
@@ -234,6 +245,8 @@ services:
       # Where Settings saves the project roots you choose; ./scripts/setup.sh mounts them (they are bind mounts, so a
       # change needs that restart).
       ROOTS_FILE: /settings/project-roots.json
+      REDACTION_ARCHIVE_DIR: /settings/redaction-archive
+      REDACTION_ARCHIVE_RETENTION_DAYS: ${REDACTION_ARCHIVE_RETENTION_DAYS:-30}
       # GitHub and Linear: Settings tests a token with one call and shows the account; one in .env wins and is shown
       # as "set in .env". A pasted token is saved here (mode 600) and read by the worker as /state/settings/....
       GITHUB_TOKEN: ${GITHUB_TOKEN:-}
@@ -295,6 +308,7 @@ services:
       - "127.0.0.1:${OLLAMA_PORT:-11435}:11434"
 
 volumes:
+  redaction-key:
   neo4j-data:
   postgres-data:
   ollama-models:

@@ -28,6 +28,14 @@ export class PgRunsStore implements RunsStore {
     this.db = db;
   }
 
+  async sandbox(run: string): Promise<boolean> {
+    const { rows } = await this.db.pool.query(
+      `SELECT EXISTS (SELECT 1 FROM session_run_tags WHERE run = $1 AND sandbox) OR
+              EXISTS (SELECT 1 FROM sessions WHERE run = $1 AND sandbox) OR
+              EXISTS (SELECT 1 FROM activity WHERE run = $1 AND sandbox) AS sandbox`, [run]);
+    return rows[0]?.sandbox === true || (await this.items(run)).some(x => x.sandbox);
+  }
+
   async items(run: string): Promise<RunItem[]> {
     const { rows } = await this.db.pool.query(ITEMS, [run]);
     return runItems(rows.map((r): RunRow => ({ kind: r.kind, id: r.id, projectKey: r.project_key ?? null, sandbox: r.sandbox === true, merged: r.merged === true })));

@@ -312,6 +312,27 @@ describeStores('CodeGraphStore', (h) => {
     expect(await store.facts.listFacts({ projectKey: 'demo' })).toHaveLength(1);
   });
 
+  test('large orphan maps are drained in bounded batches and partial cleanup is rebuilt after reselection', async () => {
+    const files = Array.from({ length: 300 }, (_, i) => file(`src/file${i}.ts`));
+    await store.selection.setTracked(['demo']);
+    await store.codegraph.replaceCodeMap('demo', codeMap({ files, imports: [], tests: [], churn: {},
+      symbols: files.map(f => ({ id: `${f.path}#f`, path: f.path, name: 'f', kind: 'function', exported: true, lines: '1' })) }));
+    const removed = await store.selection.setTracked([]);
+    const future = new Date(Date.parse(removed.selection.updatedAt!) + 48 * 60 * 60_000);
+    expect(await store.codegraph.purgeOrphanCodeFiles(7, future)).toBeLessThanOrEqual(7);
+    expect(await store.codegraph.codeMapMeta('demo')).not.toBeNull();
+    expect((await store.codegraph.codeMapRebuildsRequested()).map(x => x.projectKey)).toContain('demo');
+    const remaining = (await probe.ids('CodeFile')).length;
+    expect(remaining).toBeGreaterThanOrEqual(293);
+    await store.selection.setTracked(['demo']);
+    await store.codegraph.purgeOrphanCodeFiles(5000, future);
+    expect((await probe.ids('CodeFile')).length).toBe(remaining);
+    await store.selection.setTracked([]);
+    for (let n = 0; n < 6; n++) await store.codegraph.purgeOrphanCodeFiles(5000, future);
+    expect(await store.codegraph.codeMapMeta('demo')).toBeNull();
+    expect(await probe.ids('CodeFile')).toEqual([]);
+  });
+
   test('a rebuild asked for stays requested until the map is built again; a project with no map cannot be asked', async () => {
     expect(await store.codegraph.requestCodeMapRebuild('demo')).toBe(false);
     await store.codegraph.replaceCodeMap('demo', codeMap());

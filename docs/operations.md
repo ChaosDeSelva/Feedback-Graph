@@ -94,23 +94,22 @@ A Docker-masked parent `/proc` can prevent Linux from mounting a new private `/p
 
 Linux Docker hosts with masked system paths, including GitHub-hosted CI, can have the same restriction. A supported operator-controlled workaround is Docker's runner-only `systempaths=unconfined` option in a hand-written Compose override. It removes Docker's masked/read-only system-path list inside that container, so it is a security relaxation and is **not enabled automatically**. Retain all existing `cap_drop`, read-only root, no-new-privileges, seccomp and AppArmor settings. The job's private mount/PID namespace still creates its own `/proc` and hides shared scratch, runner tokens and parent processes. Do not apply the option to the worker or API. Recreate the runner and require a successful real sandbox health check before scanning. If the host still refuses the sandbox, use Claude Code or an API provider rather than disabling isolation.
 
+On macOS, this opt-in has **no AppArmor enforcement and no Docker masked/read-only system-path protection**. The runner still uses uid 1000, dropped capabilities, no-new-privileges, a read-only root, the checked-in seccomp allowlist (which permits namespace construction), and per-job bubblewrap mount/PID/user namespaces. Those remaining controls do not replace the two removed protections. Choose Claude/API instead if that tradeoff is unacceptable. `./scripts/setup.sh --runner-procfs-compat` offers the same explicit opt-in and generates the separate override below; ordinary setup does not enable it.
+
 For macOS Docker Desktop or OrbStack, first enable the runner in `.env` (`COMPOSE_PROFILES=codex`, `CODEX_RUNNER_URL=http://codex-runner:8790`). If its real health probe reports the procfs error above and you accept the security tradeoff, create this **optional** file in the repository root. It affects only the runner. Keep it separate from the generated `docker-compose.override.yml`, which setup rewrites for your project mounts:
 
 ```yaml
-# docker-compose.codex-procfs.yml
+# docker-compose.runner-procfs.yml
 services:
   codex-runner:
     security_opt:
-      - no-new-privileges:true
-      - seccomp=./scripts/seccomp/codex-runner.json
-      - apparmor=${CODEX_RUNNER_APPARMOR:-unconfined}
       - systempaths=unconfined
 ```
 
 After the normal setup has generated `docker-compose.override.yml`, add this opt-in to `.env`. Preserve any other Compose files you already use; the generated project-mount override must remain included:
 
 ```dotenv
-COMPOSE_FILE=docker-compose.yml:docker-compose.override.yml:docker-compose.codex-procfs.yml
+COMPOSE_FILE=docker-compose.yml:docker-compose.override.yml:docker-compose.runner-procfs.yml
 ```
 
 Recreate the runner. Compose reads that list from `.env`, so later setup and restart commands retain both your project mounts and this explicit choice; no host kernel setting changes:
@@ -123,7 +122,7 @@ docker compose exec -T worker node -e 'fetch(process.env.CODEX_RUNNER_URL + "/he
 ./scripts/doctor.sh
 ```
 
-To remove the exception, remove only `:docker-compose.codex-procfs.yml` from `COMPOSE_FILE` in `.env`, preserving your generated project mounts and any other custom files, then recreate:
+To remove the exception, remove only `:docker-compose.runner-procfs.yml` from `COMPOSE_FILE` in `.env`, preserving your generated project mounts and any other custom files, then recreate:
 
 ```sh
 docker compose --profile codex up -d --no-deps --force-recreate codex-runner
@@ -359,9 +358,11 @@ codex exec -c 'mcp_servers.feedback-graph.bearer_token_env_var="FG_OPERATOR_TOKE
 
 In its first shell call, run the installation's `scripts/fg sessions register` so it reads the actual `CODEX_THREAD_ID`; keep passing that id as `session_id` on MCP context/check/report tools. Codex exposes `CODEX_THREAD_ID` to its shell tools; do not assume the HTTP MCP connection automatically sends it. MCP initialization and tool discovery do not claim run ownership. A failed registration now reports a warning, and an already ingested unlabelled session must be replaced rather than relabelled.
 
-For an old run whose pre-capability ownership record cannot be authenticated by an operator, use owner-authorized cleanup explicitly: `API_TOKEN` must match this installation's configured owner token, then `scripts/fg cleanup --run OLD_RUN --owner` previews it and adding `--apply` removes the same previewed derived records. This uses the owner API token, not `FG_OPERATOR_TOKEN`, and keeps immutable real transcript bindings and protected record history. A changed display name does not affect a modern run's cleanup; its validated principal and private run key do.
+For an old run whose pre-capability ownership record cannot be authenticated by an operator, run `scripts/fg cleanup --run OLD_RUN --owner` to preview, then add `--apply`. On a loopback-only installation without `API_TOKEN`, this explicitly uses the same local-owner boundary as the browser. If an owner token is configured, it must match; a remote server always needs it. `FG_OPERATOR_TOKEN` never becomes an owner token. Cleanup pages through all Activity entries rather than stopping at 5,000, preserves immutable real transcripts and protected record history, and derives sandbox status from the run's records and Activity.
 
-Stored redaction migrations now encrypt each affected fact, lesson, document title and chunk before replacing it. The worker keeps AES-256-GCM originals in `state/settings/redaction-archive` (directory 0700, key and entries 0600); `REDACTION_ARCHIVE_DIR` overrides this local path. Back up the directory and key together, separately from exported knowledge. No archive contents are sent to APIs or Cloud. Archive write/authentication failures stop the migration before that page is changed. Each kind/id/rule-version keeps its first original; later safe repair can inspect that exact text rather than guess. Existing damage from releases that kept no original cannot be reconstructed from ciphertext created later: unavailable old facts still need their source or a backup.
+Redaction originals use per-entry AES-256-GCM keys wrapped by the worker's RSA public key. The API receives only the public key and ciphertext in `state/settings/redaction-archive`; it can archive uploads, owner facts, imports and lesson edits but cannot decrypt them. The worker's private key is in the separate `redaction-key` Docker volume, under `private/`, not in either API mount or the project tree. On upgrade, the worker moves the old symmetric key out of the shared directory before the API archive starts. Archive directories are 0700 and files 0600. Failed archive writes stop a redacting write before its original is discarded.
+
+`backup.sh` creates owner-only backups and deliberately excludes legacy or private decryption keys. Store any recovery-key backup separately with 0600 permissions; restoring ordinary state alone does not restore access to encrypted originals. `REDACTION_ARCHIVE_RETENTION_DAYS` defaults to 30 (allowed 1–365); the worker removes expired ciphertext at startup and hourly. Archive paths are explicitly excluded from scanners and agent reads, independently of `.gitignore`. `REDACTION_ARCHIVE_DIR` overrides the ciphertext directory; `REDACTION_ARCHIVE_KEY_DIR` must be outside it and must never be mounted into the API. These archives can preserve future originals; wording already lost before archival existed still needs the source or an older backup, and a scheduled rescan is not reported as a restoration.
 GitHub document source repair uses its own versioned checkpoint, even if stored-redaction v7 already completed: it re-fetches existing PR documents from GitHub under current redaction rules without importing historical PR documents. Activity distinguishes re-fetched documents and queued rescans from actual restored lessons.
 Local-only project keys can also be saved in Settings → Cloud sync, or via owner-only `PUT /api/cloud/local-only` with `{ "projects": ["sandbox"] }`. API and worker share this policy. `CLOUD_LOCAL_ONLY_PROJECTS` is an additional boundary the UI cannot remove.
 
@@ -373,12 +374,20 @@ For Linux runner procfs restrictions, `./scripts/setup.sh --runner-procfs-compat
 
 ### Isolated hooks, memory and judge probes
 
-Use only the checked-in `examples/demo-shop` fixture for these probes. Before selecting or seeding it, mark its project key local-only in Cloud Settings (or the owner-only `PUT /api/cloud/local-only`), and verify the cloud status shows that exclusion. The demo corpus is also excluded from cloud export by its `source: demo`; do not seed approved probe rules into a real project.
+Use the checked-in `examples/demo-shop` only as the copy source, never as the agent working directory. Run `node scripts/demo-probe.mjs prepare --apply` to create the standalone `~/Code/demo-shop` fixture. See [Dedicated demo probe](demo-probe.md) for reversible owner-authorized selection/privacy preparation, hook registration and cleanup. The reserved `demo-shop` identity is local-only by default even for legacy records; do not seed approved probe rules into a real project.
 
 Set a fresh `FG_RUN`, `FG_SANDBOX=1` and a random private `FG_RUN_KEY`, then run `scripts/fg demo seed` against the dedicated `demo-shop` project. This existing demo-only path creates clearly labelled approved fixtures without enabling `lesson_decide`; it now includes the literal rule “Do not call console.log in src/probes/no-console.ts.” Register the actual agent session first as described above. Ask `get_task_context` for that exact file, and verify the rule appears before testing hooks or submitting a diff to `check_before_done` that adds `console.log` there. A clean diff should not report that violation. Keep both responses and their run Activity as evidence.
 
 For memory/post-mortem probes, use only synthetic notes and transcript fixtures in that demo project; do not write probe notes to your personal/global agent memory, approve a real lesson, or use another project's feedback. The automated memory/post-mortem suites cover post-pushback note exclusion and disputed claims without cloud rows. Preview `scripts/fg cleanup --run RUN_ID` before applying it; for remaining demo corpus use the existing `scripts/fg demo remove` only when this dedicated demo project is not shared with another active probe. Original real transcripts and immutable session bindings remain for provenance. These instructions are an explicit testing recipe; installing or upgrading does not execute probes or seed any lesson.
 
-The encrypted archive also protects incoming facts, document text/readings and post-mortem/seeded lesson writes when redaction actually changes their input. Stable content identities retain distinct edits without archiving untouched input. Owner edits are retained locally as entered; future stored-redaction migrations archive them before any destructive replacement.
+The encrypted archive also protects incoming facts, document text/readings and post-mortem/seeded lesson writes when redaction actually changes their input. Stable content identities retain distinct edits without archiving untouched input. Uploads, imports and owner edits are archived before redaction as well; no private decryption key is mounted into the API.
 
-Projects created by the demo seed are local-only by provenance, even after ordinary background scans, hook activity or code-map rebuilds; merely naming a real project `demo-shop` does not hide it. Cloud preview names this reason. To intentionally convert a demo-created fixture into a shared project, the owner may `PUT /api/cloud/local-only` with `{ "projects": [], "shareDemoProjects": ["demo-shop"] }`; keep any other required local-only keys in `projects`. This explicit opt-in is shared with the worker; removing it restores the boundary and withdraws a previously shared copy at the next sync. A separate local-only/environment exclusion still wins. No automatic conversion follows the appearance of real-source content.
+The reserved `demo-shop` project identity and projects created by the demo seed are local-only, even after ordinary scans, hook activity or code-map rebuilds. This covers old `demo-shop` fixtures without `demoCreated`; it does not relabel stored records or match another project merely because its remote ends in `demo-shop`. Cloud preview names this reason. To intentionally convert a demo-created fixture into a shared project, the owner may `PUT /api/cloud/local-only` with `{ "projects": [], "shareDemoProjects": ["demo-shop"] }`; keep any other required local-only keys in `projects`. This explicit opt-in is shared with the worker; removing it restores the boundary and withdraws a previously shared copy at the next sync. A separate local-only/environment exclusion still wins. No automatic conversion follows the appearance of real-source content.
+
+Neo4j has a 2 GiB container limit (`NEO4J_MEMORY_LIMIT`); its memory defaults reserve a 1 GiB heap, 512 MiB page cache, a 256 MiB DBMS/database transaction budget and 64 MiB per transaction. Override `NEO4J_MEMORY_LIMIT`, `NEO4J_HEAP`, `NEO4J_PAGECACHE`, `NEO4J_TRANSACTION_TOTAL_MAX`, `NEO4J_TRANSACTION_DATABASE_MAX`, and `NEO4J_TRANSACTION_MAX` together to fit the Docker VM; leave room for the OS and other services. Orphan map cleanup runs bounded batches so deselecting a large repository does not require one transaction holding its whole graph.
+
+The Neo4j budget settings follow the [official memory configuration guidance](https://neo4j.com/docs/operations-manual/current/performance/memory-configuration/). A transaction exceeding its budget fails without taking down the database; raising only the heap without accounting for page cache and native memory can still exhaust the Docker VM.
+
+GitHub recovery in 0.6.9 checks retained masked PR documents directly, at most five per project per pass. It uses a new v9 checkpoint even if an older repair recorded `done`. Per-document fingerprints distinguish source text that literally says `[REDACTED]` from repaired text and credentials that remain protected; those verified outcomes are not repeatedly fetched. Failed targets retain retry time and progress, and Activity distinguishes waiting, verified documents and fewer masks. PR-state backfill separately saves the REST page and completed PR ids after each record, fetching metadata only. Both jobs and ordinary GitHub sync share a persisted budget of 1,200 HTTP requests per token per hour; a GitHub response reporting fewer than 100 remaining pauses them until the reported reset. A new token has its own budget identity.
+
+Local lesson PATCH responses now return 200 with `{ id, status, sharing }`. Bulk decision responses include the same sharing notice; Activity and CLI JSON report it too. Approval or editing saves locally and does not dispatch a cloud sync: eligible changes leave at the next scheduled sync or Sync now.

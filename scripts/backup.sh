@@ -4,6 +4,7 @@
 #   postgres:        pg_dump -Fc of the bundled postgres service, or of DATABASE_URL. Nothing stops.
 # Restore with ./scripts/restore.sh backups/<timestamp>.
 set -euo pipefail
+umask 077
 cd "$(dirname "$0")/.."
 . scripts/lib/store.sh
 
@@ -13,25 +14,27 @@ project="$(printf '%s' "$compose_json" | json_field name)"
 
 if [ "$STORE" = postgres ]; then
   mkdir -p "$out"
+  chmod 700 "$out"
   echo "dumping Postgres ($(pg_target)) while everything keeps running"
   if ! pg_run pg_dump --format=custom --no-owner > "$out/postgres.dump"; then
     rm -rf "$out"
     echo "pg_dump failed; no backup written" >&2
     exit 1
   fi
-  tar -czf "$out/state.tgz" state
+  tar --exclude='state/settings/redaction-archive/key' --exclude='state/redaction-key' -czf "$out/state.tgz" state
   echo postgres > "$out/STORE"
   ( cd "$out" && shasum -a 256 postgres.dump state.tgz STORE > SHA256SUMS )
 else
   image="$(printf '%s' "$compose_json" | json_field services.neo4j.image)"
   mkdir -p "$out"
+  chmod 700 "$out"
   running="$(docker compose ps --services --status running)"
   echo "stopping the stack for a consistent dump"
   docker compose stop api worker neo4j >/dev/null
   trap 'echo "restarting"; [ -n "$running" ] && docker compose up -d >/dev/null' EXIT
   docker run --rm -v "${project}_neo4j-data:/data" -v "$PWD/$out:/backups" "$image" \
     neo4j-admin database dump neo4j --to-path=/backups >/dev/null
-  tar -czf "$out/state.tgz" state
+  tar --exclude='state/settings/redaction-archive/key' --exclude='state/redaction-key' -czf "$out/state.tgz" state
   echo neo4j > "$out/STORE"
   ( cd "$out" && shasum -a 256 neo4j.dump state.tgz STORE > SHA256SUMS )
 fi

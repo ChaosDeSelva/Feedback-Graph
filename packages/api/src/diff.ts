@@ -134,11 +134,11 @@ const MIN_QUOTE = 6;
 const norm = (s: string) => s.replace(/^[+\- ]/, '').trim().replace(/\s+/g, ' ');
 
 /**
- * The code a judge quoted in prose (its `why`): `backticked` and "double-quoted" spans, longest first. A model that
+ * The code a judge quoted in prose (its `why`): `backticked`, single-quoted and "double-quoted" spans, longest first. A model that
  * leaves out the evidence field often names the line there; citeDiff decides whether it is in the diff.
  */
 export function quotedCode(text: string): string[] {
-  const spans = [...text.matchAll(/`([^`\n]+)`|"([^"\n]+)"|\u201c([^\u201d\n]+)\u201d/g)].map((m) => (m[1] ?? m[2] ?? m[3]).trim());
+  const spans = [...text.matchAll(/`([^`\n]+)`|"([^"\n]+)"|\u201c([^\u201d\n]+)\u201d|(?<![\w])'([^'\n]+)'(?![\w])/g)].map((m) => (m[1] ?? m[2] ?? m[3] ?? m[4]).trim());
   return [...new Set(spans.filter((x) => x.length >= 3 && /[a-zA-Z0-9_$]/.test(x)))].sort((a, b) => b.length - a.length);
 }
 
@@ -168,7 +168,7 @@ function findLine(files: FileDiff[], quote: string): DiffCite | null {
   const tokenLiteral = /^[a-zA-Z0-9_]{3,}$/.test(q) ? new RegExp(`["']${q}["']`) : null;
   // A quote with its +/- mark is that side of the change first: a removed line can read the same as an added one.
   const mark = /^[+-]/.test(quote) ? quote[0] : null;
-  for (const want of mark ? [(l: string) => l[0] === mark, () => true] : [() => true]) {
+  for (const want of mark ? [(l: string) => l[0] === mark] : [() => true]) {
     for (const f of files) {
       for (const h of f.hunks) {
         const line = h.lines.find((l) => /^[+-]/.test(l) && want(l) && norm(l).includes(q) && (q.length >= MIN_QUOTE || literal || tokenLiteral?.test(norm(l)) || norm(l) === q));

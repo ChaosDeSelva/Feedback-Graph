@@ -59,3 +59,13 @@ test('conditional rollback invalidates only authorization created by that transa
     expect(claims).toBe(previouslyDurable ? 1 : 2);
   }
 });
+
+test('a refused archive write never reaches the disk sink', async () => {
+  const { archiveRedactionInput, setRedactionArchive } = await import('./redactionArchive.ts');
+  const saved: unknown[] = [];
+  setRedactionArchive(async item => { saved.push(item); });
+  try {
+    await expect(withStoreWriteAuthorizer(async () => { throw Error('wrong caller'); }, () => archiveRedactionInput('upload', 'fixture', 'original', '[REDACTED]'))).rejects.toThrow('wrong caller');
+    expect(saved).toEqual([]);
+  } finally { setRedactionArchive(undefined); }
+});

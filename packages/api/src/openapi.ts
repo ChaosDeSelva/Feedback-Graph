@@ -104,6 +104,7 @@ const SCHEMAS: Record<string, JsonSchema> = {
   }, ['id', 'turnUuid', 'sessionId', 'projectKey', 'source', 'classification', 'status', 'createdAt', 'decidedAt', 'note']),
   CandidateDetail: obj({ candidate: ref('Candidate'), turn: loose('The flagged turn (text, role, ts)'), before: arrayOf(loose('A turn')), after: arrayOf(loose('A turn')), commits: arrayOf(loose('A commit')), postmortem: nullable(loose('Post-mortem progress')) }, ['candidate', 'turn']),
   ProjectStats: obj({ projectKey: str, week: str, humanTurns: int, pushback: int }),
+  LessonMutation: obj({ id: str, status: str, sharing: obj({ mode: { const: 'next_sync_if_enabled' }, message: str }) }),
   LessonCheck: obj({ name: str, why: str }),
   Lesson: obj({
     id: str, projectKey: nullable(str), origin: nullable(str), title: str, rule: str, appliesWhen: str,
@@ -237,7 +238,7 @@ const routes = (a = appSchemas): Record<string, Partial<Record<Method, Route>>> 
   '/api/lessons': { GET: { tag: 'lessons', summary: 'Lessons of the shown projects (and global ones)', query: a.LessonQuery, response: 'Lesson[]' } },
   '/api/lessons/{id}': {
     GET: { tag: 'lessons', summary: 'One lesson with its evidence', response: 'LessonDetail' },
-    PATCH: { tag: 'lessons', summary: 'Approve, reject or edit a lesson', body: a.LessonPatch, response: 'no content; 409 when a lesson with no project is narrowed', status: 204 },
+    PATCH: { tag: 'lessons', summary: 'Approve, reject or edit a lesson', body: a.LessonPatch, response: 'LessonMutation' },
   },
   '/api/lessons/quality': { GET: { tag: 'lessons', summary: 'Of the decided post-mortem lessons in the last 30 and 90 days: approved as written, approved after an edit, rejected; in all and by project', query: a.QualityQuery, response: 'LessonQualityReport' } },
   '/api/lessons/decisions': { POST: { tag: 'lessons', summary: 'Approve or reject many lessons in one call, each recorded on its own (decidedBy, Activity); one not found does not stop the rest', body: a.LessonDecisions, response: '{ results: [{ id, ok, status? | error? }] }' } },

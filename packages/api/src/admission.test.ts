@@ -190,3 +190,56 @@ test('a waiter aborted just after its slot is granted releases that slot once wi
   expect([a.running, a.waiting]).toEqual([0, 0]);
   expect(a.snapshot().estimate.samples).toBe(2);
 });
+
+
+test('a fresh slow-tail call is not described as past its response deadline', async () => {
+  vi.useFakeTimers(); vi.setSystemTime(0);
+  try {
+    const admission = new Admission({ concurrency: 1, timeoutMs: 5000 });
+    const sample = admission.run(() => new Promise(resolve => setTimeout(resolve, 10)));
+    await vi.advanceTimersByTimeAsync(10); await sample;
+    const held = gate('done'); const active = admission.run(held.fn);
+    await vi.advanceTimersByTimeAsync(50);
+    expect(admission.snapshot().estimate.overdue).toBe(false);
+    held.release(); await active;
+  } finally { vi.useRealTimers(); }
+});
+
+
+test.each([false, true])('queued retry preserves relative priority only within TTL (expired=%s)', async expired => {
+  vi.useFakeTimers(); vi.setSystemTime(0);
+  try {
+    const admission = new Admission({ concurrency: 1, timeoutMs: 10000, retryPriorityMs: 100 });
+    const held = gate('held'); const active = admission.run(held.fn);
+    let abandonedCalls = 0;
+    const first = admission.run(async () => { abandonedCalls++; }, { retryKey: 'callerA:check', deadline: 10 });
+    await vi.advanceTimersByTimeAsync(10); expect(await first).toMatchObject({ ok: false, ran: false });
+    expect(admission.waiting).toBe(0); expect(admission.running).toBe(1);
+    if (expired) await vi.advanceTimersByTimeAsync(101);
+    const order: string[] = [];
+    const newer = admission.run(async () => { order.push('newer'); });
+    let restored = false;
+    const retry = admission.run(async () => { order.push('retry'); }, { retryKey: 'callerA:check', onState: state => { restored ||= !!state.retryPriority?.restored; } });
+    held.release(); await active; await newer; await retry;
+    expect(order).toEqual(expired ? ['newer', 'retry'] : ['retry', 'newer']);
+    expect(restored).toBe(!expired); expect(abandonedCalls).toBe(0);
+    expect([admission.running, admission.waiting]).toEqual([0, 0]);
+  } finally { vi.useRealTimers(); }
+});
+
+test('different retry identities cannot inherit priority and absent retry holds no physical queue slot', async () => {
+  vi.useFakeTimers(); vi.setSystemTime(0);
+  try {
+    const admission = new Admission({ concurrency: 1, timeoutMs: 10000 });
+    const held = gate('held'); const active = admission.run(held.fn);
+    const first = admission.run(async () => 'never', { retryKey: 'callerA', deadline: 10 });
+    await vi.advanceTimersByTimeAsync(10); await first;
+    expect(admission.waiting).toBe(0);
+    const order: string[] = [];
+    const newer = admission.run(async () => { order.push('newer'); });
+    const stranger = admission.run(async () => { order.push('stranger'); }, { retryKey: 'callerB' });
+    held.release(); await active; await newer; await stranger;
+    expect(order).toEqual(['newer', 'stranger']);
+    expect(await admission.run(async () => 'free')).toMatchObject({ ok: true, ahead: 0 });
+  } finally { vi.useRealTimers(); }
+});

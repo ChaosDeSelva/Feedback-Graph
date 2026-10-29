@@ -115,18 +115,19 @@ export class ActivityRepo implements ActivityStore {
   async list(q: ActivityQuery): Promise<Activity[]> {
     // details is a JSON string: one bigger than maxDetailBytes is never sent from the database.
     const rows = await this.g.run(
-      `MATCH (x:Activity)
-       WHERE ($projectKey IS NULL OR x.projectKey = $projectKey) AND ($kind IS NULL OR x.kind = $kind)
+      `OPTIONAL MATCH (cursor:Activity {id: $before})
+       WITH cursor MATCH (x:Activity)
+       WHERE ($before IS NULL OR x.order < cursor.order OR (x.order = cursor.order AND x.id < cursor.id)) AND ($projectKey IS NULL OR x.projectKey = $projectKey) AND ($kind IS NULL OR x.kind = $kind)
          AND ($projectKeys IS NULL OR x.projectKey IS NULL OR x.projectKey IN $projectKeys)
          AND ($target IS NULL OR $target IN x.targets) AND ($run IS NULL OR x.run = $run)
          AND (NOT $unlabelled OR x.run IS NULL) AND (NOT $noSandbox OR NOT coalesce(x.sandbox, false))
        WITH x, $max IS NOT NULL AND size(coalesce(x.details, '')) > $max AS omitted
        RETURN x {.id, .ts, .kind, .actor, .projectKey, .subject, .why, .targets, .run, .sandbox, details: CASE WHEN omitted THEN null ELSE x.details END} AS row, omitted
-       ORDER BY x.order DESC LIMIT $limit`,
+       ORDER BY x.order DESC, x.id DESC LIMIT $limit`,
       {
         projectKey: q.projectKey ?? null, projectKeys: q.projectKeys ?? null, kind: q.kind ?? null, target: q.target ?? null, run: q.run ?? null,
         limit: neo4j.int(q.limit ?? 200), max: q.maxDetailBytes === undefined ? null : neo4j.int(q.maxDetailBytes),
-        unlabelled: !!q.unlabelled, noSandbox: !!q.noSandbox,
+        unlabelled: !!q.unlabelled, noSandbox: !!q.noSandbox, before: q.before ?? null,
       },
     );
     return rows.map((r) => ({ ...activityOf(r.get('row')), ...(r.get('omitted') && { detailsOmitted: true }) }));

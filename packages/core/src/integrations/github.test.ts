@@ -333,3 +333,32 @@ test('PR author filtering skips other authors before reading their details', asy
   expect(out.map((p) => p.number)).toEqual([1]);
   expect(calls.some((c) => /pulls\/2\//.test(c.url))).toBe(false);
 });
+
+
+test('targeted PR reads do not walk unrelated history or fetch file metadata when disabled', async () => {
+  const { fetchImpl, calls } = mockFetch({ '/repos/acme/demo/pulls/14297': pr(14297, '2026-10-29T00:00:00Z') });
+  const found = await fetchPullRequestContext({ repo: 'acme/demo', token: 'token', numbers: [14297], includeFiles: false, fetchImpl });
+  expect(found.map(value => value.number)).toEqual([14297]);
+  expect(calls.some(call => new URL(call.url).pathname === '/repos/acme/demo/pulls')).toBe(false);
+  expect(calls.some(call => call.url.includes('/files'))).toBe(false);
+});
+test('metadata backfill avoids comment requests and checkpoints each PR before the next callback', async () => {
+  const { fetchImpl, calls } = mockFetch({ '/repos/acme/demo/pulls': [pr(1, '2026-10-29T00:00:00Z'), pr(2, '2026-10-28T00:00:00Z')] });
+  const saved: number[] = [];
+  await expect(fetchPullRequestContext({ repo: 'acme/demo', token: 'token', metadataOnly: true, maxPrs: 100, fetchImpl,
+    onPr: async value => { if (value.number === 2) throw new Error('persistence interrupted'); saved.push(value.number); },
+  })).rejects.toThrow('persistence interrupted');
+  expect(saved).toEqual([1]);
+  expect(calls).toHaveLength(1);
+});
+
+
+test('a metadata checkpoint requests its exact REST page and exposes the next page without fetching comments', async () => {
+  const { fetchImpl, calls } = mockFetch({ '/repos/acme/demo/pulls?page=2': () => Response.json([pr(55, '2026-10-01T00:00:00Z')], { headers: { link: '<https://api.github.com/repos/acme/demo/pulls?page=3>; rel="next"' } }) });
+  let next: number | null = null;
+  const values = await fetchPullRequestContext({ repo: 'acme/demo', token: 'token', metadataOnly: true, metadataPage: 2, maxPrs: 100, fetchImpl, onMetadataPage: value => { next = value; } });
+  expect(values.map(value => value.number)).toEqual([55]);
+  expect(next).toBe(3);
+  expect(calls).toHaveLength(1);
+  expect(new URL(calls[0].url).searchParams.get('page')).toBe('2');
+});

@@ -9,3 +9,5 @@ backups/
 docker-compose.override.yml
 
 docker-compose.runner-procfs.yml
+
+.pnpm-store/

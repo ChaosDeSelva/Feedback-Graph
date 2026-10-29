@@ -10,7 +10,7 @@
  * 5: an instruction in an upload is one addressed to the reader-as-AI, not a project convention (facts v4 closed as
  * instructions are reopened); the head of a token an older Activity subject cut at its cap is redacted.
  */
-export const REDACTION_VERSION = 8;
+export const REDACTION_VERSION = 9;
 /** Rows a store reads per page when it redacts stored text again under new rules. */
 export const REDACT_PAGE = 1000;
 
@@ -93,10 +93,12 @@ const TOKEN_PATTERNS: RegExp[] = [
   /(\bTwilio[ \t]+(?:auth(?:entication)?(?:[ \t]+(?:token|secret))?|token|secret)(?:[ \t]+(?:is|was)[ \t]+|[ \t]*[:=][ \t]*|[ \t]+)["']?)[a-f0-9]{32}\b/gi,
   /\b(AccountKey\s*=\s*)(?![<${])[^;\s"']{16,}/gi,
   /-----BEGIN PGP PRIVATE KEY BLOCK-----[\s\S]*?-----END PGP PRIVATE KEY BLOCK-----/g,
-  /PuTTY-User-Key-File-[23]:[\s\S]*?Private-MAC:\s*[a-f0-9]+/gi,
-  /\bkey-[a-f0-9]{32}\b/gi,
-  /\b(?:mfa\.[A-Za-z0-9_-]{40,}|[A-Za-z0-9_-]{23,28}\.[A-Za-z0-9_-]{6}\.[A-Za-z0-9_-]{27,})\b/g,
-  /\$(?:2[aby]\$\d{2}\$[./A-Za-z0-9]{53}|apr1\$[./A-Za-z0-9]{1,8}\$[./A-Za-z0-9]{22}|[156]\$[^\s:]+)|\{SHA\}[A-Za-z0-9+/]{27}=/g,
+  /-----BEGIN PGP PRIVATE KEY BLOCK-----\r?\n(?:(?:Version|Comment):[^\r\n]*\r?\n|[ \t]*\r?\n|[A-Za-z0-9+/=]{8,}(?:\r?\n|$))+/g,
+  /^PuTTY-User-Key-File-[23]: (?:ssh-|ecdsa-)[^\r\n]+\r?\n(?:(?!^PuTTY-User-Key-File-)[\s\S])*?^Private-Lines: \d+\r?\n(?:[A-Za-z0-9+/=]+\r?\n)+Private-MAC:[ \t]*[a-f0-9]+/gim,
+  /(\bmailgun(?:[ \t]+(?:api[ \t]+)?key)?[ \t]*(?:is[ \t]+|[:=][ \t]*)?)["']?(?:key-)?[a-f0-9]{32}(?:-[a-f0-9]{8,32}){0,3}\b/gi,
+  /\bSK[a-f0-9]{32}\b/gi,
+  /\bmfa\.[A-Za-z0-9_-]{40,}\b/g,
+  /\$(?:2[aby]\$\d{2}\$[./A-Za-z0-9]{53}|(?:apr1|1)\$[./A-Za-z0-9]{1,8}\$[./A-Za-z0-9]{22}|5\$(?:rounds=\d+\$)?[./A-Za-z0-9]{1,16}\$[./A-Za-z0-9]{43}|6\$(?:rounds=\d+\$)?[./A-Za-z0-9]{1,16}\$[./A-Za-z0-9]{86}|argon2(?:id|i|d)\$v=\d+\$m=\d+,t=\d+,p=\d+\$[A-Za-z0-9+/]+=*\$[A-Za-z0-9+/]+=*)|\{SHA\}[A-Za-z0-9+/]{27}=/g,
   /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g,
   /\bsk-(?:proj-|ant-[a-z0-9]+-)?[A-Za-z0-9_-]{20,}/g,
   /\b[sr]k_(?:live|test)_[A-Za-z0-9]{16,}/g,
@@ -135,8 +137,9 @@ const TOKEN_PATTERNS: RegExp[] = [
  * a <v> group (the value), and a check the value must pass; text the check refuses is left exactly as it was.
  */
 const CONTEXT_RULES: { re: RegExp; check: (v: string) => boolean }[] = [
-  { re: /(?<keep>\bdefine\(\s*["'][^"']*(?:PASSWORD|PASSWD|SECRET|TOKEN|API_KEY)["']\s*,\s*["'])(?<v>[^"'\r\n]+)(?=["']\s*\))/gi, check: assignedSecret },
-  { re: /(?<keep>;[ \t]*(?:Password|Pwd)\s*=\s*)(?<v>[^;\r\n]+)(?=;|$)/gi, check: assignedSecret },
+  { re: /(?<keep>\bdefine\(\s*["'][^"']*(?:PASSWORD|PASSWD|SECRET|TOKEN|API_KEY|(?:AUTH|SECURE_AUTH|LOGGED_IN|NONCE)_(?:KEY|SALT))["']\s*,\s*["'])(?<v>[^"'\r\n]+)(?=["']\s*\))/gi, check: assignedSecret },
+  { re: /(?<keep>(?:^|;)[ \t]*(?:Password|Pwd)=)(?<v>[^\s;"'()]+)(?=;|$)/gim, check: assignedSecret },
+  { re: /(?<keep>\b(?:AUTH|SECURE_AUTH|LOGGED_IN|NONCE)_(?:KEY|SALT)\s*(?::|=)\s*["']?)(?<v>[^"'\r\n;]+)(?=["']|;|$)/gim, check: assignedSecret },
   // Env-style assignments whose name ends in a secret word: KEY=value, export KEY="value". A $VAR reference, a call
   // (os.environ.get(...)) or a value that is a URL or names a secret is not a secret.
   {
@@ -181,13 +184,17 @@ export function encodedCredential(value: string): boolean {
 
 function replaceTokens(text: string): string {
   let out = text.replace(/\b(?:gsk_|pypi-|whsec_|lin_oauth_|GOCSPX-|xapp-)([A-Za-z0-9_-]{16,})/g, (all, value: string) => namedSecret(value) ? '[REDACTED]' : all);
+  out = out.replace(/\b[A-Za-z0-9_-]{23,28}\.[A-Za-z0-9_-]{6}\.[A-Za-z0-9_-]{27,}\b/g, value => {
+    const id = Buffer.from(value.split('.')[0], 'base64url').toString('utf8');
+    return /^\d{17,22}$/.test(id) ? '[REDACTED]' : value;
+  });
   out = out.replace(/\b(Basic[ \t]+)([A-Za-z0-9+/]+={0,2})(?=$|[\s"',;])/gi,
     (all, keep: string, value: string) => encodedCredential(value) ? `${keep}[REDACTED]` : all);
   out = out.replace(/("auth"\s*:\s*")([^"\r\n]+)(")/gi,
     (all, keep: string, value: string, end: string) => encodedCredential(value) ? `${keep}[REDACTED]${end}` : all);
   // pgpass has five non-whitespace fields. Compiler file:line:column: error diagnostics are not credentials.
   out = out.replace(/^((?:[^:\s\\]|\\.)+:(?:\d+|\*):(?:[^:\s\\]|\\.)+:(?:[^:\s\\]|\\.)+:)([^\r\n]+)$/gm,
-    (all, keep: string) => /:\d+:(?:error|warning|note|fatal(?: error)?|[A-Z]\d+):$/i.test(keep)
+    (all, keep: string) => /:\d+:(?:error|warning|note|fatal(?: error)?|vet|Werror|AssertionError|[A-Z]\d+):$/i.test(keep)
       ? all : `${keep}[REDACTED]`);
   return TOKEN_PATTERNS.reduce((value, re) => value.replace(re, (_m, keep?: string) =>
     typeof keep === 'string' ? `${keep}[REDACTED]` : '[REDACTED]'), out);

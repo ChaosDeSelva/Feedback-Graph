@@ -146,8 +146,10 @@ describe.skipIf(!dockerUp)('codex-runner container', () => {
     // Your own .env stays out of it: an empty env file and only the one required variable.
     const empty = join(root, 'empty.env');
     writeFileSync(empty, '');
-    const env = { PATH: process.env.PATH, HOME: process.env.HOME, DOCKER_HOST: process.env.DOCKER_HOST, DOCKER_CONTEXT: process.env.DOCKER_CONTEXT, NEO4J_PASSWORD: 'x', CODEX_RUNNER_APPARMOR: runnerAppArmor };
+    const env = { PATH: process.env.PATH, HOME: process.env.HOME, DOCKER_HOST: process.env.DOCKER_HOST, DOCKER_CONTEXT: process.env.DOCKER_CONTEXT, NEO4J_PASSWORD: 'x', CODEX_RUNNER_APPARMOR: runnerAppArmor, CODEX_RUNNER_URL: 'http://codex-runner:8790' };
     const cfg = JSON.parse(docker(['compose', '--env-file', empty, '-f', join(repoRoot, 'docker-compose.yml'), '--profile', 'codex', 'config', '--format', 'json'], { timeout: 30_000, env })) as { services: Record<string, { volumes?: { target: string; source: string }[]; environment?: Record<string, string>; ports?: unknown[]; read_only?: boolean; privileged?: boolean; cap_drop?: string[]; security_opt?: string[]; tmpfs?: string[] }> };
+    expect(cfg.services.api.environment?.CODEX_RUNNER_URL).toBe('http://codex-runner:8790');
+    expect(cfg.services.worker.environment?.CODEX_RUNNER_URL).toBe('http://codex-runner:8790');
     const runner = cfg.services['codex-runner'];
     expect(runner.volumes!.map((v) => v.target).sort()).toEqual(['/codex', '/codex/auth.json', '/scratch']);
     expect(runner.volumes!.find((v) => v.target === '/codex')!.source).not.toBe(cfg.services.worker.volumes!.find((v) => v.target === '/codex')!.source);
@@ -161,6 +163,24 @@ describe.skipIf(!dockerUp)('codex-runner container', () => {
     // The scratch volume and the Codex login file are all the two share.
     const shared = cfg.services.worker.volumes!.filter((w) => runner.volumes!.some((r) => r.source === w.source)).map((w) => w.target);
     expect(shared.sort()).toEqual(['/codex/auth.json', '/scratch']);
+  });
+
+  test('the documented procfs override adds only the explicit system-path exception', () => {
+    const docs = readFileSync(join(repoRoot, 'docs/operations.md'), 'utf8');
+    const snippet = docs.match(/```yaml\n# docker-compose\.runner-procfs\.yml\n([\s\S]*?)```/)?.[1];
+    expect(snippet).toBeDefined();
+    const override = join(root, 'docker-compose.runner-procfs.yml');
+    writeFileSync(override, snippet!);
+    const empty = join(root, 'procfs-empty.env'); writeFileSync(empty, '');
+    const env = { PATH: process.env.PATH, HOME: process.env.HOME, NEO4J_PASSWORD: 'x', CODEX_RUNNER_APPARMOR: runnerAppArmor };
+    const cfg = JSON.parse(docker(['compose', '--env-file', empty, '-f', join(repoRoot, 'docker-compose.yml'), '-f', override, '--profile', 'codex', 'config', '--format', 'json'], { env }));
+    const runner = cfg.services['codex-runner'];
+    expect(runner.security_opt).toHaveLength(4);
+    expect(runner.security_opt).toEqual(expect.arrayContaining(['no-new-privileges:true', 'systempaths=unconfined', `apparmor=${runnerAppArmor}`]));
+    expect(runner.security_opt.some((s: string) => s.startsWith('seccomp=') && s.endsWith('codex-runner.json'))).toBe(true);
+    expect(runner).toMatchObject({ cap_drop: ['ALL'], read_only: true });
+    expect(cfg.services.api.security_opt).not.toContain('systempaths=unconfined');
+    expect(cfg.services.worker.security_opt).not.toContain('systempaths=unconfined');
   });
 
   test('nothing in the runner container holds the worker-only canary or the worker secrets; the mirror is there', () => {

@@ -23,7 +23,7 @@ test('approving a lesson or deciding feedback needs the UI (a browser Origin); a
 });
 
 test('the same requests from the UI origin are accepted', async () => {
-  expect((await app.request('/api/lessons/l1', req('PATCH', { status: 'approved' }, 'http://localhost'))).status).toBe(204);
+  expect((await app.request('/api/lessons/l1', req('PATCH', { status: 'approved' }, 'http://localhost'))).status).toBe(200);
   expect((await app.request('/api/candidates/c1/decision', req('POST', { status: 'confirmed' }, 'http://localhost'))).status).toBe(204);
 });
 

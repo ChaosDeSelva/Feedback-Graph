@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.6.9 (2026-10-29)
+
+- Wire API runner readiness into shipped Compose configuration, refresh parked scans independently of external sync, bound code-map cleanup, and keep long worker ingest locks until the operation ends. Correct the macOS procfs override and diagnostics.
+- Repair only damaged GitHub documents, verify outcomes before completion, respect shared rate limits, and checkpoint historical PR state. Explain the next-sync sharing schedule in lesson decisions and offer explicit reconciliation of allowlist-declined personal projects.
+- Accept single-quoted literal evidence, apply the weighted fact relevance floor, bound and expose ranks, exclude own-PR misses, and include named-file code-map symbols. Improve queue estimates and completed timing reports.
+- Narrow redaction false positives and cover additional credential forms and files. Separate archive encryption from decryption, archive API writes, enforce retention and secure backups, and retry legacy source recovery without claiming unavailable wording was restored.
+- Page complete run cleanup, preserve sandbox identity in its report, support explicit local-owner cleanup without a configured token, and refuse anonymous session registration. Keep legacy demo probes local and report one consistent release version throughout core and cloud.
+
 ## 0.6.8 (2026-10-29)
 
 - Reserve labelled run IDs at the first validated write, rather than on request arrival. Session binding and ownership commit together; failed conditional writes roll back both. Competing callers cannot hijack a run, and historical ownerless runs require explicit owner cleanup. Apply the same authorization before changing credentials, project roots or dispatching cloud sync.

@@ -50,7 +50,7 @@ test('GET /api/lessons/:id never shows a context item why that is only a field n
 test('PATCH approving without text changes does not re-embed', async () => {
   const { app, calls, embedded } = setup();
   const res = await app.request('/api/lessons/lesson%3Aa', patch({ status: 'approved' }));
-  expect(res.status).toBe(204);
+  expect(res.status).toBe(200);
   expect(embedded).toEqual([]);
   expect(calls).toContainEqual(['update', 'lesson:a', { status: 'approved' }, { reembed: undefined, by: 'you' }]);
 });
@@ -89,7 +89,7 @@ describe('narrowing a global lesson to a project', () => {
 
   test('with a known project it is narrowed to that project', async () => {
     const { app, calls } = narrowSetup();
-    expect((await app.request('/api/lessons/lesson%3Ag', patch({ scope: 'project', projectKey: 'data-pipeline' }))).status).toBe(204);
+    expect((await app.request('/api/lessons/lesson%3Ag', patch({ scope: 'project', projectKey: 'data-pipeline' }))).status).toBe(200);
     expect(calls).toContainEqual(['update', 'lesson:g', { scope: 'project', projectKey: 'data-pipeline' }]);
   });
 
@@ -99,7 +99,7 @@ describe('narrowing a global lesson to a project', () => {
     expect((await app.request('/api/lessons/lesson%3Ag', patch({ scope: 'project', projectKey: 'data-pipeline' }))).status).toBe(400);
     expect((await app.request('/api/lessons/lesson%3Ag', patch({ projectKey: 'web' }))).status).toBe(400);
     expect(calls).toEqual([]);
-    expect((await app.request('/api/lessons/lesson%3Ag', patch({ scope: 'task', projectKey: 'web' }))).status).toBe(204);
+    expect((await app.request('/api/lessons/lesson%3Ag', patch({ scope: 'task', projectKey: 'web' }))).status).toBe(200);
   });
 
   test('a project lesson cannot be moved to another project with projectKey', async () => {
@@ -279,4 +279,32 @@ test('Lessons can be filtered by originating PR and feedback author', async () =
   expect((await app.request('/api/lessons?pr=42&author=Octo')).status).toBe(200);
   expect(calls[0]).toEqual(['list', expect.objectContaining({ pr: 42, author: 'Octo' })]);
   expect((await app.request('/api/lessons?pr=-1')).status).toBe(400);
+});
+
+
+test('lesson edits and bulk decisions disclose next-sync sharing in responses and Activity', async () => {
+  const { app, logged } = bulkSetup();
+  const edit = await app.request('/api/lessons/lesson%3Aa', patch({ rule: 'Use scoped reads' }));
+  expect(edit.status).toBe(200);
+  const edited = await edit.json();
+  expect(edited.sharing).toMatchObject({ mode: 'next_sync_if_enabled', message: expect.stringContaining('next scheduled sync') });
+  expect(logged[0].why).toContain('does not start a cloud sync');
+  expect(logged[0].details?.sharing).toEqual(edited.sharing);
+  const bulk = await app.request('/api/lessons/decisions', post({ items: [{ id: 'lesson:b', status: 'approved' }] }));
+  expect((await bulk.json()).sharing).toEqual(edited.sharing);
+  expect(logged[1].details?.sharing).toEqual(edited.sharing);
+});
+
+test('lesson edit embeddings never send credential values to a provider', async () => {
+  const { app, embedded } = setup();
+  const secret = 'ghp_' + 'aB12'.repeat(9);
+  expect((await app.request('/api/lessons/lesson%3Aa', patch({ rule: `Use ${secret} in CI` }))).status).toBe(200);
+  expect(embedded.flat().join(' ')).toContain('[REDACTED]');
+  expect(embedded.flat().join(' ')).not.toContain(secret);
+});
+
+test('refused lesson edits do not call an embedding provider', async () => {
+  const { app, embedded } = setup();
+  expect((await app.request('/api/lessons/lesson%3Aa', patch({ rule: 'New wording', supersedes: 'lesson:a' }))).status).toBe(400);
+  expect(embedded).toEqual([]);
 });

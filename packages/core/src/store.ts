@@ -41,7 +41,7 @@ export type ScannedFile = { path: string; hash: string; version?: string | null 
  */
 export type FactCheck = { id: string; keep: boolean; lines: string | null; evidence: FactEvidence | null; statement?: string | null; embedding?: number[] | null };
 /** What updateScanJob changes: only the keys given (a key set to null clears it). */
-export type ScanJobPatch = Partial<Pick<ScanJob, 'filesScanned' | 'factsAdded' | 'error' | 'shards'>> & { status?: ScanStatus };
+export type ScanJobPatch = Partial<Pick<ScanJob, 'filesScanned' | 'factsAdded' | 'error' | 'shards' | 'retryAt'>> & { status?: ScanStatus };
 
 /**
  * A pull request's or Linear issue's comments as one stand-in session (`id`, e.g. `github:acme/shop#12`): never
@@ -495,6 +495,8 @@ export interface DocsStore {
   requeueDocRead(id: string): Promise<boolean>;
   /** Queue an upload only if its retained original text or image is available, never masked text. */
   queueRedactionRepair?(id: string): Promise<boolean>;
+  githubDocChunks?(id: string): Promise<string[] | null>;
+  githubRepairDocs?(projectKey: string, afterId: string, limit: number): Promise<{ id: string; ref: string; chunks: string[] }[]>;
   docImage(id: string): Promise<TaskImage | null>;
   /**
    * A project's documents, newest first (ties by id), each with its chunk and fact counts. `limit` and `after` (the
@@ -559,7 +561,7 @@ export interface LinksStore {
 /** ActivityStore.list's filters. */
 export type ActivityQuery = {
   projectKey?: string; projectKeys?: string[]; kind?: ActivityKind; target?: string; run?: string; limit?: number; maxDetailBytes?: number;
-  unlabelled?: boolean; noSandbox?: boolean;
+  unlabelled?: boolean; noSandbox?: boolean; before?: string;
 };
 
 export interface ActivityStore {
@@ -781,6 +783,8 @@ export interface ChatStore {
  * removes exactly that. Activity entries keep theirs too, and a cleanup removes those as well (ActivityStore.removeRun).
  */
 export interface RunsStore {
+  /** Sandbox provenance, including a registered session before it writes any records. */
+  sandbox?(run: string): Promise<boolean>;
   /** Every record stored with this run id; lessons and misses name the report they came from as `group`. */
   items(run: string): Promise<RunItem[]>;
   /**

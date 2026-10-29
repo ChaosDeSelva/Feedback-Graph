@@ -402,6 +402,9 @@ export class KnowledgeRepo implements KnowledgeStore {
 
   /** `unscoped`: you narrowed it but its project is unknown, so it went back to proposed instead of serving everywhere. */
   async updateLesson(id: string, patch: LessonPatch, o: { reembed?: number[]; by?: string; note?: string }): Promise<{ unscoped: boolean }> {
+    const safePatch = redactDeep(patch);
+    await archiveRedactionInput('lesson-edit', id, patch, safePatch);
+    patch = safePatch;
     const now = new Date().toISOString();
     const { supersedes, status, projectKey, ...fields } = patch;
     if (status === 'revoked') {

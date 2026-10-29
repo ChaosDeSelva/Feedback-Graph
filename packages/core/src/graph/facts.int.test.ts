@@ -332,6 +332,18 @@ describeStores('FactsStore', (h) => {
     expect((await f.requestScan(p, 'ollama:gemma4')).id).not.toBe(job.id);
   });
 
+  test('refreshing a parked scan persists the new retry time without counting a failed attempt', async () => {
+    const job = await f.requestScan({ key: 'demo', name: 'demo', repoPath: '/vibe/demo' }, 'codex-cli');
+    await f.recordScanFailure(job.id, 'old error', { counted: true }, new Date('2026-10-01T10:00:00Z'));
+    const retryAt = '2026-10-29T10:02:00.000Z';
+    await f.updateScanJob(job.id, { error: 'new sandbox error', retryAt });
+    expect(await f.scanJob(job.id)).toMatchObject({ error: 'new sandbox error', retryAt, attempts: 1, status: 'queued' });
+    expect(await f.nextScanJob(new Date('2026-10-29T10:01:59Z'))).toBeNull();
+    expect((await f.nextScanJob(new Date(retryAt)))?.id).toBe(job.id);
+    await f.updateScanJob(job.id, { retryAt: null });
+    expect((await f.nextScanJob(new Date('2026-10-29T10:01:59Z')))?.id).toBe(job.id);
+  });
+
   test('asking for a scan while one is queued or running returns that one instead of queueing another', async () => {
     const p = { key: 'demo', name: 'demo', repoPath: '/vibe/demo' };
     const a = await f.requestScan(p, 'ollama:gemma4');

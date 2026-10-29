@@ -1,3 +1,4 @@
+import { githubBudgetFetch } from './integrations/githubBudget.ts';
 import { setRedactionArchive } from '@fb/core';
 import { encryptedRedactionArchive } from './redactionArchive.ts';
 import { cloudLocalOnlyProjects, cloudSharedDemoProjects } from '@fb/core';
@@ -39,7 +40,7 @@ import { rematchOnRuleChange } from './postmortem/rematch.ts';
 import { sessionEvidence } from './postmortem/standing.ts';
 import { providerAnswers, runPostmortems } from './postmortem/step.ts';
 import { migrateDeciderRule } from './postmortem/deciders.ts';
-import { ScanRunner, type ScanTurn } from './scan/runner.ts';
+import { parkScanProvider, ScanRunner, type ScanTurn } from './scan/runner.ts';
 import { recheckFacts } from './scan/recheck.ts';
 import { forgetDataFiles } from './scan/data.ts';
 import { hasCodeFiles, runScan, ScanPlans } from './scan/scan.ts';
@@ -541,16 +542,12 @@ async function main() {
   const scanRunner = new ScanRunner({
     next: (exclude) => facts.nextScanJob(new Date(), exclude),
     agentic: (job) => AGENTIC_SPEC.test(job.provider || defaultScan),
+    providerKey: (job) => job.provider?.trim() || defaultScan,
     ready: async (job) => {
-      const llm = tracked('scan', provider('scan readiness', job.provider || defaultScan));
-      if (!llm?.ready) return;
-      try { await llm.ready(); }
-      catch (err) {
-        const error = `scan parked: ${providerUnavailableReason(err) ?? String(err)}; checking readiness with backoff before copying the repository`;
-        if (job.error !== error) await facts.updateScanJob(job.id, { error });
-        throw err;
-      }
+      const llm = tracked('scan', provider('scan readiness', job.provider?.trim() || defaultScan));
+      await llm?.ready?.();
     },
+    parkProvider: (key, reason, retryAt) => parkScanProvider(facts, key, defaultScan, reason, retryAt),
     empty: async (job) => !(await hasCodeFiles(job.repoPath)),
     run: scanJob,
     concurrency: config.scanConcurrency,
@@ -583,6 +580,9 @@ async function main() {
     return Promise.all((await selectedFolders()).map(async (f) => ({ key: f.key, name: f.key, repoPath: f.repoPath, remote: await cycleDeps.remote(f.repoPath) })));
   }
 
+  const sharedGithubFetch = githubBudgetFetch(docs);
+  const fetchGithubPrs: typeof fetchPullRequestContext = options => fetchPullRequestContext({ ...options, fetchImpl: sharedGithubFetch });
+
   /** PR discussions as project context (docs), every GITHUB_SYNC_HOURS, for every selected project linked to a repository. */
   async function syncGithubDocs() {
     const cred = await integrations.credential('github');
@@ -595,7 +595,7 @@ async function main() {
       const target = link.github ? githubTarget(p, config.github.repos) : null;
       if (target) repos.set(p.key, target);
     }
-    const g = await syncGithub({ repos, authors, token: cred.token, fetchPrs: fetchPullRequestContext, docs, embed, activity, minIntervalMs: config.github.syncHours * 3600_000, log });
+    const g = await syncGithub({ repos, authors, token: cred.token, fetchPrs: fetchGithubPrs, docs, embed, activity, minIntervalMs: config.github.syncHours * 3600_000, log });
     if (g.prs) log('github synced', g);
   }
 
@@ -610,7 +610,7 @@ async function main() {
       githubOverride: config.github.repos,
       botLogins: config.github.botLogins,
       agentLogins: config.github.agentLogins,
-      fetchPrs: fetchPullRequestContext,
+      fetchPrs: fetchGithubPrs,
       fetchLinearIssues,
       docs,
       embed,
@@ -728,8 +728,9 @@ async function main() {
   // Changed redaction rules run once over the facts, documents, lessons, misses, Inbox items, session summaries, Ask and
   // Activity stored under older ones, before any of it is served again; the counts are in Activity. A failure is
   // logged and tried again at the next start.
-  const redactionArchive = await encryptedRedactionArchive(process.env.REDACTION_ARCHIVE_DIR ?? join(dirname(config.stateDb), 'settings', 'redaction-archive'));
+  const redactionArchive = await encryptedRedactionArchive(process.env.REDACTION_ARCHIVE_DIR ?? join(dirname(config.stateDb), 'settings', 'redaction-archive'), { keyDirectory: process.env.REDACTION_ARCHIVE_KEY_DIR ?? join(dirname(config.stateDb), 'redaction-key'), retentionDays: Number(process.env.REDACTION_ARCHIVE_RETENTION_DAYS ?? 30) });
   setRedactionArchive(redactionArchive.save);
+  setInterval(() => { void redactionArchive.purge().catch(error => log('redaction archive retention failed', { error: String(error) })); }, 3600_000).unref();
   await redactStoredOnRuleChange({ cursors: docs, facts, docs, knowledge, graph: repo, sessions: store.sessions, chats: store.chats, activity, log, repair: { facts, docs, knowledge, projects: selectedFolders, activity } })
     .catch((err) => log('redaction over stored data failed', { error: redactSecrets(String(err)) }));
   await chatRunner.start();
@@ -755,6 +756,7 @@ async function main() {
   await evidence.load();
   await evidence.atStart();
 
+  scanRunner.startPolling();
   while (!stopping) {
     try {
       await refreshScope();

@@ -15,7 +15,7 @@ test('encrypted originals survive restart, preserve the first version and never 
     const reopened = await encryptedRedactionArchive(directory);
     expect(await reopened.read(r)).toEqual(r);
     expect((await stat(directory)).mode & 0o777).toBe(0o700);
-    expect((await stat(join(directory, 'key'))).mode & 0o777).toBe(0o600);
+    expect((await stat(join(directory + '-keys', 'private.pem'))).mode & 0o777).toBe(0o600);
     const files = (await readdir(directory)).filter(file => file.endsWith('.enc'));
     expect(files).toHaveLength(1);
     const stored = await readFile(join(directory, files[0]), 'utf8');
@@ -24,7 +24,7 @@ test('encrypted originals survive restart, preserve the first version and never 
     expect((await stat(join(directory, files[0]))).mode & 0o777).toBe(0o600);
     await archive.save({ ...r, version: 9 });
     expect((await readdir(directory)).filter(file => file.endsWith('.enc'))).toHaveLength(2);
-  } finally { await rm(directory, { recursive: true, force: true }); }
+  } finally { await rm(directory, { recursive: true, force: true }); await rm(directory + '-keys', { recursive: true, force: true }); }
 });
 
 test('tampered originals fail authentication and cannot be silently overwritten', async () => {
@@ -40,7 +40,7 @@ test('tampered originals fail authentication and cannot be silently overwritten'
     await writeFile(file, JSON.stringify(envelope));
     await expect(archive.read(r)).rejects.toThrow();
     await expect(archive.save(r)).rejects.toThrow();
-  } finally { await rm(directory, { recursive: true, force: true }); }
+  } finally { await rm(directory, { recursive: true, force: true }); await rm(directory + '-keys', { recursive: true, force: true }); }
 });
 
 

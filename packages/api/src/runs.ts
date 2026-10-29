@@ -116,7 +116,7 @@ const ownRequestEntry = (a: Activity, owner: RunOwner | null): boolean => {
   return via !== null && a.details?.via === via;
 };
 /** How many of a run's Activity entries a plan reads at most. */
-const RUN_ENTRIES = 5000;
+const RUN_ENTRIES = 500;
 
 export type CleanupPlan = {
   run: string;
@@ -136,11 +136,21 @@ export type CleanupPlan = {
 };
 
 /** activity: as createApp wraps it (asActor), so the cleanup is logged as whoever asked for it. */
-export type RunsDeps = { store: Pick<RunsStore, 'items' | 'remove' | 'owner'>; activity: Pick<ActivityStore, 'record' | 'list'> & Partial<Pick<ActivityStore, 'removeRun'>> };
+export type RunsDeps = { store: Pick<RunsStore, 'items' | 'remove' | 'owner' | 'sandbox'>; activity: Pick<ActivityStore, 'record' | 'list'> & Partial<Pick<ActivityStore, 'removeRun'>> };
 
 /** What cleaning up `run` would do (see CleanupPlan), and the ids it keeps. */
 export async function planCleanup(run: string, d: RunsDeps): Promise<{ plan: Omit<CleanupPlan, 'dryRun'>; keep: string[]; keptIds: string[]; entries: Activity[] }> {
-  const [items, entries] = await Promise.all([d.store.items(run), d.activity.list({ run, limit: RUN_ENTRIES })]);
+  const items = await d.store.items(run);
+  const entries: Activity[] = [];
+  let before: string | undefined;
+  for (;;) {
+    const page = await d.activity.list({ run, limit: RUN_ENTRIES, ...(before && { before }) });
+    entries.push(...page);
+    if (page.length < RUN_ENTRIES) break;
+    const next = page.at(-1)!.id;
+    if (next === before) throw new Error('run Activity pagination did not advance');
+    before = next;
+  }
   const ids = new Set(items.map((i) => i.id));
   const report = (i: RunItem) => i.group ?? i.id;
   const kept = new Map<string, { kind: RunItemKind; id: string; why: string }>();
@@ -176,9 +186,9 @@ export async function planCleanup(run: string, d: RunsDeps): Promise<{ plan: Omi
   const order = (k: RunItemKind) => RUN_ITEM_KINDS.indexOf(k);
   return {
     plan: {
-      run, sandbox: items.some((i) => i.sandbox), remove,
+      run, sandbox: (await d.store.sandbox?.(run)) === true || items.some((i) => i.sandbox) || entries.some(a => a.sandbox), remove,
       kept: [...kept.values()].sort((a, b) => order(a.kind) - order(b.kind) || (a.id < b.id ? -1 : 1)),
-      changed, entries: previewEntries.length, entriesCapped: entries.length >= RUN_ENTRIES,
+      changed, entries: previewEntries.length, entriesCapped: false,
     },
     keep,
     keptIds,

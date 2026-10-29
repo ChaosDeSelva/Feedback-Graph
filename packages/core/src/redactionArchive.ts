@@ -1,3 +1,4 @@
+import { authorizeStoreWrite } from './storeWrites.ts';
 import { createHash } from 'node:crypto';
 /** Local-only archive hook: adapters await it BEFORE mutating stored originals. */
 import { REDACTION_VERSION } from './redact.ts';
@@ -5,7 +6,9 @@ export type RedactionOriginal = { kind: string; id: string; version: number; val
 let archive: ((record: RedactionOriginal) => Promise<void>) | undefined;
 export function setRedactionArchive(writer: ((record: RedactionOriginal) => Promise<void>) | undefined): void { archive = writer; }
 export async function archiveBeforeRedaction(kind: string, id: string, value: unknown): Promise<void> {
-  await archive?.({ kind, id, value, version: REDACTION_VERSION });
+  if (!archive) return;
+  await authorizeStoreWrite();
+  await archive({ kind, id, value, version: REDACTION_VERSION });
 }
 
 /** Archive only incoming values that redaction actually changes; content identity preserves successive edits. */

@@ -1,3 +1,5 @@
+import { archiveRedactionInput, authorizeStoreWrite } from '@fb/core';
+import { LESSON_SHARING_NOTICE } from '@fb/core';
 import { guardApiStoreWrites, mcpDiscoveryOnly } from './storeWriteGuard.ts';
 import { LegacyRunClaimError, withoutStoreWriteAuthorizer, withStoreWriteAuthorizer } from '@fb/core';
 import { requestDeadline } from './requestDeadline.ts';
@@ -16,7 +18,7 @@ import { demoRoutes, type DemoDeps } from './demo.ts';
 import { handleMcp } from './mcp.ts';
 import { handleAdminMcp } from './adminMcp.ts';
 import { openApiDocument } from './openapi.ts';
-import { runCaller, runKey, actingAsOperator, asActor, currentActor, currentRun, hasOperatorToken, mayChange, mayChangeAny, operatorName, OWNER_ROUTES, refusedVerb, runAs, runFromOwner, runIn, runLabel, runVia } from './operator.ts';
+import { runCaller, runKey, actingAsOperator, currentCaller, asActor, currentActor, currentRun, hasOperatorToken, mayChange, mayChangeAny, operatorName, OWNER_ROUTES, refusedVerb, runAs, runFromOwner, runIn, runLabel, runVia } from './operator.ts';
 import { askingRun, openerOf, runAsked, runRoutes, runScoped, sameCaller } from './runs.ts';
 import { evidenceRoutes, type EvidenceDeps } from './evidence.ts';
 import { deleteProjects, settingsRoutes, type SettingsDeps } from './settings.ts';
@@ -436,6 +438,7 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
   if (context && sessions?.store.claimRun) {
     context.registerSession = async id => {
       const run = currentRun();
+      if (run && !currentCaller() && !mayChangeAny()) throw new Error('labelled session registration requires an authenticated operator with FG_RUN_KEY or the local owner');
       if (run && !await sessions.store.claimRun!(id, run)) throw new Error('session already belongs to the owner or another run; start a new labelled session');
     };
   }
@@ -495,7 +498,11 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
       return c.json({ error: 'the admin MCP endpoint takes FG_OPERATOR_TOKEN as the Bearer: check it against the .env this Feedback Graph runs with' }, 401);
     }
     const operator = hasOperatorToken(c, auth.operator);
-    if (c.req.header('x-fg-owner-cleanup') === 'true' && !(auth.token && tokenMatches(bearerOf(c) ?? '', auth.token))) return c.json({ error: 'owner cleanup requires the configured API_TOKEN' }, 403);
+    if (c.req.header('x-fg-owner-cleanup') === 'true') {
+      if (auth.token && !tokenMatches(bearerOf(c) ?? '', auth.token)) return c.json({ error: 'owner cleanup requires the configured API_TOKEN' }, 403);
+      // Without API_TOKEN, preserve the local owner's browser-Origin model; normal origin validation follows.
+      if (!auth.token && c.req.header('origin') === undefined) return c.json({ error: 'tokenless owner cleanup requires the local owner Origin' }, 403);
+    }
     if (needsAuth(c.req.path)) {
       if (!authenticated(c, auth.token) && !operator) return bearerOf(c) ? unrecognised(c) : c.json({ error: 'sign in required' }, 401);
       // A bearer that is neither configured token is refused on reads too (an agent with a stale token would otherwise
@@ -585,6 +592,7 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
     const browser = c.req.header('origin') !== undefined;
     const principal: RunPrincipal = operator ? 'operator' : browser ? 'browser' : auth.token && authenticated(c, auth.token) ? 'owner_token' : 'agent';
     if (run && opts.runs && c.req.method !== 'GET' && c.req.method !== 'HEAD') {
+      if (principal === 'agent' && /^\/api\/sessions\/[^/]+\/run$/.test(c.req.path)) return c.json({ error: 'labelled session registration requires an authenticated operator with FG_RUN_KEY or the local owner' }, 403);
       const actor = operator ? runKey(c.req.header('x-fg-run-key'), auth.runKeySalt) : null;
       if (operator && !actor) return c.json({ error: 'labelled operator writes require X-FG-Run-Key (FG_RUN_KEY): a private random secret of at least 32 characters with adequate diversity (generate: openssl rand -hex 32)' }, 403);
       // Refused attempts to edit an owner's existing record must not reserve an otherwise unused run id.
@@ -896,7 +904,11 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
 
   // A labelled run's writes carry it, and a sandbox run's records are served only to that run (runs.ts).
   const mcpContext = context && runScoped(context);
-  if (mcpContext) app.all('/mcp', (c) => handleMcp(c.req.raw, mcpContext));
+  if (mcpContext) app.all('/mcp', (c) => {
+    const credential = bearerOf(c);
+    const verified = credential && (hasOperatorToken(c, auth.operator) || (auth.token && tokenMatches(credential, auth.token)));
+    return handleMcp(c.req.raw, mcpContext, verified ? credential : undefined);
+  });
   // Owner decisions for an agent holding the operator token (adminMcp.ts): each tool calls the REST route in-process,
   // so the OPERATOR_ALLOW gate, validation and Activity are the route's own. Not mounted without FG_OPERATOR_TOKEN.
   if (auth.operator?.token) app.all(ADMIN_MCP, (c) => handleAdminMcp(c.req.raw, { request: (path, init) => app.request(path, init) }));
@@ -1111,12 +1123,16 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
       const project = (await projectDirs()).find((p) => p.key === c.req.param('key'));
       if (!project) return c.json({ error: 'no such project' }, 404);
       // An image is searchable by a placeholder until the worker reads it; its description then replaces it.
-      const chunks = image ? [`Image "${title}" (${name}): not read yet.`] : chunkText(redactSecrets(body.data.text!));
+      const chunks = image ? [redactSecrets(`Image "${title}" (${name}): not read yet.`)] : chunkText(redactSecrets(body.data.text!));
       if (!chunks.length) return c.json({ error: 'document has no text' }, 400);
       // Same file name, same doc: say so, rather than logging a fresh upload over a silent replacement. A sandbox run's
       // upload is its own document beside the owner's of that name (docIdOf), so only that one is a replacement.
       const replaces = docIdOf({ projectKey: project.key, source: 'upload', ref: redactSecrets(name) }, currentRun());
       const add = async (): Promise<string> => {
+        if (!image) {
+          await authorizeStoreWrite();
+          await archiveRedactionInput('upload', replaces, body.data.text!, redactSecrets(body.data.text!));
+        }
         // In batches: one embedding call for a 2,000,000-character upload (1,300+ chunks) outlasts any timeout.
         const vectors: number[][] = [];
         for (let i = 0; i < chunks.length; i += EMBED_BATCH) vectors.push(...(await embed(chunks.slice(i, i + EMBED_BATCH))));
@@ -1499,11 +1515,6 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
       if (!mayChange(current.lesson)) return notTheRuns(c, `the lesson ${id}`);
       const p = body.data;
       if (p.status === 'revoked' && current.lesson.status !== 'approved') return c.json({ error: 'only a previously approved lesson can be revoked; reject a proposal instead' }, 409);
-      let reembed: number[] | undefined;
-      if (embed && (p.title !== undefined || p.rule !== undefined || p.appliesWhen !== undefined)) {
-        const l = { ...current.lesson, ...p };
-        [reembed] = await embed([`${l.title}\n${l.rule}\nApplies when: ${l.appliesWhen}`]);
-      }
       if (p.projectKey !== undefined) {
         const narrowing = current.lesson.scope === 'global' && (p.scope === 'project' || p.scope === 'task');
         if (!narrowing) return c.json({ error: 'projectKey only narrows a global lesson: send it with scope project or task' }, 400);
@@ -1513,6 +1524,11 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
       if (p.supersedes !== undefined && !(await shownLesson(p.supersedes))) return c.json({ error: `no lesson ${p.supersedes} to supersede` }, 400);
       const scope = p.scope ?? current.lesson.scope;
       if ((p.scope !== undefined || p.status === 'approved') && ['project', 'task'].includes(scope) && !(p.projectKey ?? current.lesson.origin ?? current.lesson.projectKey)) return c.json({ error: 'this lesson has no known project; name projectKey before narrowing it (nothing changed)' }, 409);
+      let reembed: number[] | undefined;
+      if (embed && (p.title !== undefined || p.rule !== undefined || p.appliesWhen !== undefined)) {
+        const l = { ...current.lesson, ...p };
+        [reembed] = await embed([redactSecrets(`${l.title}\n${l.rule}\nApplies when: ${l.appliesWhen}`)]);
+      }
       const by = currentActor();
       const { unscoped } = await knowledge.updateLesson(id, p, { reembed, by });
       if (unscoped) return c.json({ error: 'this lesson has no known project, so it cannot be narrowed without one; it was set back to proposed. Name the project (projectKey), make it global, or reject it.' }, 409);
@@ -1526,11 +1542,11 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
         actor: 'you',
         projectKey: p.projectKey ?? current.lesson.projectKey,
         subject: `${p.status ?? 'edited'} lesson "${p.title ?? current.lesson.title}"`,
-        why: decidedWhy(by, p.status),
-        details: { status: p.status ?? current.lesson.status, changed, supersedes: p.supersedes ?? null },
+        why: `${decidedWhy(by, p.status)}. ${LESSON_SHARING_NOTICE.message}`,
+        details: { sharing: LESSON_SHARING_NOTICE, status: p.status ?? current.lesson.status, changed, supersedes: p.supersedes ?? null },
         targets: [id],
       });
-      return c.body(null, 204);
+      return c.json({ id, status: p.status ?? current.lesson.status, sharing: LESSON_SHARING_NOTICE });
     });
 
     // Owner-only (OWNER_ROUTES, the operator's lesson_decide, off by default). Each lesson is decided and recorded on
@@ -1557,13 +1573,13 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
           actor: 'you',
           projectKey: current.lesson.projectKey,
           subject: `${item.status} lesson "${current.lesson.title}"`,
-          why: decidedWhy(by, item.status),
-          details: { status: item.status, changed: {}, supersedes: null, bulk: true, ...(item.note && { note: item.note }) },
+          why: `${decidedWhy(by, item.status)}. ${LESSON_SHARING_NOTICE.message}`,
+          details: { sharing: LESSON_SHARING_NOTICE, status: item.status, changed: {}, supersedes: null, bulk: true, ...(item.note && { note: item.note }) },
           targets: [item.id],
         });
         results.push({ id: item.id, ok: true, status: item.status });
       }
-      return c.json({ results });
+      return c.json({ results, sharing: LESSON_SHARING_NOTICE });
     });
 
     // Owner-only (the operator's `retry`): flags only, so not a decision. The worker re-checks them at its next round.

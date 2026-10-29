@@ -169,6 +169,21 @@ export class PgDocsStore implements DocsStore {
     await this.db.pool.query(`UPDATE docs SET read_status = 'pending' WHERE read_status = 'reading'`);
   }
 
+  async githubDocChunks(id: string): Promise<string[] | null> {
+    const { rows } = await this.db.pool.query(`SELECT array_agg(c.text ORDER BY c.idx) FILTER (WHERE c.id IS NOT NULL) AS chunks
+      FROM docs d LEFT JOIN chunks c ON c.doc_id = d.id WHERE d.id = $1 AND d.source = 'github' GROUP BY d.id`, [id]);
+    return rows.length ? rows[0].chunks ?? [] : null;
+  }
+
+  async githubRepairDocs(projectKey: string, afterId: string, limit: number) {
+    const { rows } = await this.db.pool.query(`WITH candidates AS (
+      SELECT d.id, d.ref FROM docs d WHERE d.project_key = $1 AND d.source = 'github' AND d.id > $2
+      AND EXISTS (SELECT 1 FROM chunks c WHERE c.doc_id = d.id AND c.text LIKE '%[REDACTED]%') ORDER BY d.id LIMIT $3
+    ) SELECT d.id, d.ref, array_agg(c.text ORDER BY c.id) AS chunks FROM candidates d JOIN chunks c ON c.doc_id = d.id
+      WHERE c.text LIKE '%[REDACTED]%' GROUP BY d.id, d.ref ORDER BY d.id`, [projectKey, afterId, limit]);
+    return rows.map(r => ({ id: String(r.id), ref: String(r.ref), chunks: r.chunks as string[] }));
+  }
+
   async queueRedactionRepair(id: string): Promise<boolean> {
     const result = await this.db.pool.query(`UPDATE docs d SET read_status = 'pending', read_attempts = 0, read_error = NULL, read_retry_at = NULL
       WHERE d.id = $1 AND d.source = 'upload' AND coalesce(d.read_status, '') <> 'reading' AND

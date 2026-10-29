@@ -1,4 +1,13 @@
-import type { ScanJob } from '@fb/core';
+import type { FactsStore, ScanJob } from '@fb/core';
+
+/** Refresh even old/future parked jobs so every project explains the same provider outage. */
+export async function parkScanProvider(facts: Pick<FactsStore, 'scanQueue' | 'updateScanJob'>, provider: string, fallback: string, reason: string, retryAt: string): Promise<void> {
+  const error = `scan parked: ${reason}; checking readiness with backoff before copying the repository`;
+  for (const job of await facts.scanQueue()) {
+    if (job.status === 'queued' && (job.provider?.trim() || fallback) === provider)
+      await facts.updateScanJob(job.id, { error, retryAt });
+  }
+}
 
 /** What a running scan can ask the runner. */
 export type ScanTurn = {
@@ -26,6 +35,8 @@ export type ScanRunnerDeps = {
   concurrency: number;
   /** A failed probe parks this provider with exponential backoff; no scan or mirror starts. */
   ready?(job: ScanJob): Promise<void>;
+  providerKey?(job: ScanJob): string;
+  parkProvider?(provider: string, error: string, retryAt: string): Promise<void>;
   now?(): number;
   log?: (msg: string, extra?: object) => void;
 };
@@ -54,6 +65,7 @@ export class ScanRunner {
   private filling: Promise<void> | null = null;
   private refill = false;
   private stopped = false;
+  private timer: ReturnType<typeof setInterval> | undefined;
   /** Jobs already found to have files, so a job waiting for a slot is not listed again on every fill. */
   private readonly blocked = new Map<string, { until: number; failures: number }>();
   private readonly hasFiles = new Set<string>();
@@ -66,6 +78,14 @@ export class ScanRunner {
 
   constructor(d: ScanRunnerDeps) {
     this.d = d;
+  }
+
+  /** Independent of sync/ingest latency; kick serializes queue fills. */
+  startPolling(intervalMs = 2_000): void {
+    if (this.stopped || this.timer) return;
+    this.kick();
+    this.timer = setInterval(() => this.kick(), intervalMs);
+    this.timer.unref?.();
   }
 
   /** Ids of the scans running now, in the order they started. */
@@ -102,6 +122,8 @@ export class ScanRunner {
   /** Nothing new starts; resolves once the scans running now have finished. */
   async stop(): Promise<void> {
     this.stopped = true;
+    clearInterval(this.timer);
+    this.timer = undefined;
     await this.idle();
   }
 
@@ -122,7 +144,7 @@ export class ScanRunner {
         this.hasFiles.add(job.id);
       }
       if (this.d.ready) {
-        const key = job.provider ?? '';
+        const key = this.d.providerKey?.(job) || job.provider?.trim() || 'default';
         const blocked = this.blocked.get(key);
         const now = this.d.now?.() ?? Date.now();
         if (blocked && now < blocked.until) {
@@ -135,6 +157,7 @@ export class ScanRunner {
           const failures = (blocked?.failures ?? 0) + 1;
           const delay = Math.min(30 * 60_000, 120_000 * 2 ** Math.min(failures - 1, 4));
           this.blocked.set(key, { until: now + delay, failures });
+          await this.d.parkProvider?.(key, String(err), new Date(now + delay).toISOString());
           this.d.log?.('scan provider parked; readiness will be checked without copying repositories', { provider: key, retryAt: new Date(now + delay).toISOString(), error: String(err) });
           passedOver.push(job.id);
           if (passedOver.length >= MAX_PASSED_OVER) return;

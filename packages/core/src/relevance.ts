@@ -21,6 +21,9 @@ const MIN_RELEVANCE = 0.3;
 const CLOSE_ENOUGH = 0.8;
 /** Similarity below which a past miss or a fact is never served, whatever else ranks: a nonsense task gets nothing. */
 export const SIMILARITY_FLOOR = 0.78;
+/** Field-calibrated weighted fact rank threshold; custom low-scale embedders keep their explicit calibration. */
+export const FACT_RANK_FLOOR = 0.80;
+export const boundedScore = (score: number): number => Number.isFinite(score) ? Math.max(0, Math.min(1, score)) : 0;
 /** A fact or miss scoring under this share of the best one is noise next to it, and is left out. */
 const RELATIVE_FLOOR = 0.6;
 
@@ -151,12 +154,13 @@ const keepNearBest = <T extends { score: number }>(xs: T[]) => {
  * same, more mildly, for `services` (the folders the task names, servicesInTask). Nothing under SIMILARITY_FLOOR,
  * and nothing far below the best, is kept. Similarity stays unchanged; only the sort key is weighted.
  */
-export function rankFacts<T extends FactHit>(hits: T[], n: number, files: string[] = [], services: string[] = [], floor = SIMILARITY_FLOOR): (T & { rankingScore: number })[] {
+export function rankFacts<T extends FactHit>(hits: T[], n: number, files: string[] = [], services: string[] = [], floor = SIMILARITY_FLOOR, minimumRank = 0): (T & { rankingScore: number })[] {
   return keepNearBest(
-    hits.filter((h) => h.score >= floor && ((h.fact.relevance ?? UNSCORED_RELEVANCE) >= MIN_RELEVANCE || h.score >= CLOSE_ENOUGH))
-      .map((hit) => ({ hit, score: hit.score * (0.55 + 0.45 * (hit.fact.relevance ?? UNSCORED_RELEVANCE)) * affinity(hit.fact.path ?? '.', files, services) }))
+    hits.filter((h) => boundedScore(h.score) >= floor && ((h.fact.relevance ?? UNSCORED_RELEVANCE) >= MIN_RELEVANCE || h.score >= CLOSE_ENOUGH))
+      .map((hit) => ({ hit, score: boundedScore(hit.score) * (0.55 + 0.45 * boundedScore(hit.fact.relevance ?? UNSCORED_RELEVANCE)) * affinity(hit.fact.path ?? '.', files, services) }))
+      .filter(({ score }) => score >= minimumRank)
       .sort((a, b) => b.score - a.score),
-  ).slice(0, n).map(({ hit, score }) => ({ ...hit, rankingScore: score }));
+  ).slice(0, n).map(({ hit, score }) => ({ ...hit, score: boundedScore(hit.score), rankingScore: boundedScore(score) }));
 }
 
 /**
@@ -166,11 +170,11 @@ export function rankFacts<T extends FactHit>(hits: T[], n: number, files: string
  */
 export function rankMisses<T extends { missed: string; feedbackText: string; score: number; rejectedWrongSession?: boolean }>(hits: T[], n: number, files: string[] = [], services: string[] = [], floor = SIMILARITY_FLOOR): (T & { rankingScore: number })[] {
   return keepNearBest(
-    hits.filter((m) => !m.rejectedWrongSession && !isNonMiss(m.missed) && m.score >= floor)
+    hits.filter((m) => !m.rejectedWrongSession && !isNonMiss(m.missed) && boundedScore(m.score) >= floor)
       .map((hit) => {
         const paths = mentionedPaths(`${hit.missed} ${hit.feedbackText}`);
         const weight = paths.length ? Math.max(...paths.map((p) => affinity(p, files, services))) : 1;
-        return { hit, score: hit.score * weight };
+        return { hit, score: boundedScore(hit.score) * weight };
       }).sort((a, b) => b.score - a.score),
-  ).slice(0, n).map(({ hit, score }) => ({ ...hit, rankingScore: score }));
+  ).slice(0, n).map(({ hit, score }) => ({ ...hit, score: boundedScore(hit.score), rankingScore: boundedScore(score) }));
 }

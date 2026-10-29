@@ -208,17 +208,32 @@ export class CodeGraphRepo implements CodeGraphStore {
   async purgeOrphanCodeFiles(limit: number, now = new Date()): Promise<number> {
     if (!Number.isFinite(limit) || limit < 1) return 0;
     const cutoff = new Date(now.getTime() - 24 * 60 * 60_000).toISOString();
-    // Hold the selection's write lock through map removal: a concurrent reselection cannot interleave its deletes.
+    // Every phase is bounded, including symbols/edges of a large deselected map. Keep the
+    // metadata until the last batch so a subsequent retention pass resumes unfinished work.
+    const batch = neo4j.int(Math.min(250, Math.floor(limit)));
+    const selectedMap = `MATCH (s:ProjectSelection {id: 'selection'}), (m:CodeMap)
+      WHERE s.initialized = true AND s.updatedAt < $cutoff AND NOT m.projectKey IN s.tracked
+      WITH m ORDER BY m.projectKey LIMIT 1`;
     await this.g.runInTransaction([
       [`MATCH (s:ProjectSelection {id: 'selection'}) SET s.mapPurgeLock = true REMOVE s.mapPurgeLock`, {}],
-      [`MATCH (s:ProjectSelection {id: 'selection'}), (m:CodeMap)
-        WHERE s.initialized = true AND s.updatedAt < $cutoff AND NOT m.projectKey IN s.tracked
-        WITH m LIMIT 1
-        CALL (m) { MATCH (symbol:Symbol {projectKey: m.projectKey}) DETACH DELETE symbol }
-        CALL (m) { MATCH (cf:CodeFile {projectKey: m.projectKey})-[r:IMPORTS|TESTS]-() DELETE r }
-        CALL (m) { MATCH (cf:CodeFile {projectKey: m.projectKey}) SET cf.inMap = false, cf.inIndex = false
-          REMOVE cf.lang, cf.codeHash, cf.loc, cf.isTest, cf.churnCommits, cf.churnLastTs, cf.mappedAt }
-        CALL (m) { MATCH (module:Module {projectKey: m.projectKey}) WHERE NOT EXISTS { ()-[:IMPORTS]->(module) } DETACH DELETE module }
+      [`${selectedMap} SET m.rebuildRequestedAt = $now`, { cutoff, now: now.toISOString() }],
+      [`${selectedMap} MATCH (symbol:Symbol {projectKey: m.projectKey})
+        WITH symbol LIMIT $batch DETACH DELETE symbol`, { cutoff, batch }],
+      [`${selectedMap} MATCH (cf:CodeFile {projectKey: m.projectKey})-[r:IMPORTS|TESTS]->()
+        WITH r LIMIT $batch DELETE r`, { cutoff, batch }],
+      [`${selectedMap} MATCH (cf:CodeFile {projectKey: m.projectKey})
+        WHERE coalesce(cf.inMap, false) OR coalesce(cf.inIndex, false) OR cf.codeHash IS NOT NULL
+        WITH cf LIMIT $batch SET cf.inMap = false, cf.inIndex = false
+        REMOVE cf.lang, cf.codeHash, cf.loc, cf.isTest, cf.churnCommits, cf.churnLastTs, cf.mappedAt`, { cutoff, batch }],
+      [`${selectedMap} MATCH (module:Module {projectKey: m.projectKey})
+        WHERE NOT EXISTS { ()-[:IMPORTS]->(module) }
+        WITH module LIMIT $batch DETACH DELETE module`, { cutoff, batch }],
+      [`${selectedMap} WITH m
+        WHERE NOT EXISTS { (:Symbol {projectKey: m.projectKey}) }
+          AND NOT EXISTS { (:CodeFile {projectKey: m.projectKey})-[:IMPORTS|TESTS]->() }
+          AND NOT EXISTS { MATCH (cf:CodeFile {projectKey: m.projectKey})
+            WHERE coalesce(cf.inMap, false) OR coalesce(cf.inIndex, false) OR cf.codeHash IS NOT NULL }
+          AND NOT EXISTS { MATCH (module:Module {projectKey: m.projectKey}) WHERE NOT EXISTS { ()-[:IMPORTS]->(module) } }
         DETACH DELETE m`, { cutoff }],
     ]);
     const [r] = await this.g.run(
@@ -233,7 +248,7 @@ export class CodeGraphRepo implements CodeGraphStore {
        WITH cf LIMIT $limit
        DETACH DELETE cf
        RETURN count(*) AS n`,
-      { limit: neo4j.int(Math.max(0, Math.floor(limit))), cutoff },
+      { limit: batch, cutoff },
     );
     return r ? neo4j.integer.toNumber(r.get('n')) : 0;
   }

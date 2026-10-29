@@ -761,12 +761,16 @@ test('a seed-created demo stays local after scans until explicit owner opt-in; o
   const onlyMap = bundle('demo-shop', { lessons: [], misses: [], facts: [], docs: [], projects: [{ key: 'demo-shop', remote: 'github.com/acme/demo-shop', demoCreated: true }] });
   expect(await syncBundle(store({ 'demo-shop': onlyMap }), 'demo-shop')).toBeNull();
   const existingOrdinary = { ...onlyMap, projects: [{ key: 'demo-shop', remote: 'github.com/acme/demo-shop' }] };
-  expect((await syncBundle(store({ 'demo-shop': existingOrdinary }), 'demo-shop'))?.codeFiles).toHaveLength(1);
+  expect(await syncBundle(store({ 'demo-shop': existingOrdinary }), 'demo-shop')).toBeNull();
+  expect(existingOrdinary.projects[0]).not.toHaveProperty('demoCreated');
+  expect((await syncBundle(store({ 'demo-shop': existingOrdinary }), 'demo-shop', undefined, { shareDemoCreated: true }))?.codeFiles).toHaveLength(1);
+  const bystander = { ...existingOrdinary, projectKey: 'real-shop', projects: [{ key: 'real-shop', remote: 'github.com/acme/demo-shop' }] };
+  expect((await syncBundle(store({ 'real-shop': bystander }), 'real-shop'))?.codeFiles).toHaveLength(1);
   const withRealKnowledge = { ...onlyMap, facts: bundle('demo-shop').facts };
   expect(await syncBundle(store({ 'demo-shop': withRealKnowledge }), 'demo-shop')).toBeNull();
   expect((await syncBundle(store({ 'demo-shop': withRealKnowledge }), 'demo-shop', undefined, { shareDemoCreated: true }))?.facts).toHaveLength(1);
   const preview = await previewCloudSync(store({ 'demo-shop': withRealKnowledge }), ['demo-shop']);
-  expect(preview.projects[0].reason).toContain('Created by demo seed');
+  expect(preview.projects[0].reason).toContain('Reserved demo-shop fixture');
 });
 
 

@@ -1,3 +1,4 @@
+import { LESSON_SHARING_NOTICE } from '@fb/core';
 /**
  * fg: drive Feedback Graph from a terminal or an agent, over its HTTP API. No dependencies beyond Node itself, so it
  * runs on the host (scripts/fg) and inside the api container (docker compose exec api node src/cli.ts ...).
@@ -153,8 +154,8 @@ const UNLABELLED = new Set(['cleanup', 'activity', 'evidence']);
 
 function client(io: CliIO, flags: Flags, labels = true) {
   const base = (flags.url ?? io.env.FEEDBACK_GRAPH_URL ?? 'http://localhost:8787').replace(/\/+$/, '');
-  if (flags.owner && !io.env.API_TOKEN?.trim()) throw new UsageError('--owner requires the configured API_TOKEN; FG_OPERATOR_TOKEN cannot authorize legacy-run cleanup');
-  const token = flags.owner ? io.env.API_TOKEN!.trim() : io.env.FG_OPERATOR_TOKEN?.trim() || io.env.API_TOKEN?.trim() || '';
+  if (flags.owner && !io.env.API_TOKEN?.trim() && !PLAIN_HTTP_OK.has(new URL(base).hostname)) throw new UsageError('--owner requires API_TOKEN for a remote server; tokenless owner cleanup is local only');
+  const token = flags.owner ? io.env.API_TOKEN?.trim() ?? '' : io.env.FG_OPERATOR_TOKEN?.trim() || io.env.API_TOKEN?.trim() || '';
   const name = flags.as ?? io.env.FG_OPERATOR_NAME ?? 'fg';
   if (token) {
     let u: URL;
@@ -725,8 +726,8 @@ async function lessons(api: Api, io: CliIO, words: string[], f: Flags): Promise<
   if (!ids.length) throw new UsageError(`fg lessons ${verb} needs at least one lesson id (see fg lessons list)`);
   const status = verb === 'approve' ? 'approved' : verb === 'revoke' ? 'revoked' : 'rejected';
   const items = ids.map((lessonId) => ({ id: lessonId, status, ...(f.note !== undefined && { note: f.note }) }));
-  const { results } = await api<{ results: { id: string; ok: boolean; status?: string; error?: string }[] }>('POST', '/api/lessons/decisions', { items });
-  if (f.json) io.out(JSON.stringify(results, null, 2));
+  const { results, sharing } = await api<{ results: { id: string; ok: boolean; status?: string; error?: string }[]; sharing?: typeof LESSON_SHARING_NOTICE }>('POST', '/api/lessons/decisions', { items });
+  if (f.json) io.out(JSON.stringify(results.map(result => result.ok ? { ...result, sharing: sharing ?? LESSON_SHARING_NOTICE } : result), null, 2));
   else io.out(table(['ID', 'RESULT'], results.map((r) => [r.id, r.ok ? r.status : r.error])));
   if (!f.json && verb === 'approve' && results.some(r => r.ok)) io.out('Approval does not trigger cloud sync. Eligible projects share on the next scheduled sync, or use fg cloud sync-now.');
   return results.every((r) => r.ok) ? 0 : 1;

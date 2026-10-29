@@ -51,3 +51,5 @@ export { runnerReadiness } from './llm/codexRunner.ts';
 export * from './redactionArchive.ts';
 
 export * from './storeWrites.ts';
+
+export { encryptedRedactionArchive, publicRedactionArchive } from './encryptedArchive.ts';

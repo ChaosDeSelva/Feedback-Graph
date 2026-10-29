@@ -1,4 +1,5 @@
-import { INCREMENTAL_MAX_PRS, parsePrBacklog, prBacklogKey, prContextToChunks, redactSecrets, ticketIdsIn, type ActivityStore, type DocsStore, type FetchPrOpts, type PrBacklog, type PrContext } from '@fb/core';
+import { repairGithubDocs } from './githubRepair.ts';
+import { INCREMENTAL_MAX_PRS, IntegrationError, parsePrBacklog, prBacklogKey, prContextToChunks, redactSecrets, ticketIdsIn, type ActivityStore, type DocsStore, type FetchPrOpts, type PrBacklog, type PrContext } from '@fb/core';
 
 export type GithubSyncDeps = {
   /** project key → owner/repo, from GITHUB_REPOS. */
@@ -6,7 +7,7 @@ export type GithubSyncDeps = {
   authors?: Map<string, string>;
   token: string;
   fetchPrs(o: FetchPrOpts): Promise<PrContext[]>;
-  docs: Pick<DocsStore, 'upsertDoc' | 'getCursor' | 'setCursor'> & Partial<Pick<DocsStore, 'listDocs'>>;
+  docs: Pick<DocsStore, 'upsertDoc' | 'getCursor' | 'setCursor'> & Partial<Pick<DocsStore, 'listDocs' | 'githubRepairDocs' | 'githubDocChunks'>>;
   embed(texts: string[]): Promise<number[][]>;
   activity?: Pick<ActivityStore, 'record'>;
   /** Skip a project synced less than this long ago. */
@@ -31,16 +32,16 @@ export async function syncGithub(d: GithubSyncDeps): Promise<{ prs: number }> {
   for (const [projectKey, repo] of d.repos) {
     const key = `github:${projectKey}`;
     const cursor = (await d.docs.getCursor(key)) ?? undefined;
-    if (cursor && Date.parse(now()) - Date.parse(cursor) < (d.minIntervalMs ?? 0)) continue;
+    const due = !cursor || Date.parse(now()) - Date.parse(cursor) >= (d.minIntervalMs ?? 0);
     const started = now();
     const ticketsKnown = !!(await d.docs.getCursor(ticketsCursor(projectKey)));
     const backfillFrom = new Date(Date.parse(started) - TICKETS_BACKFILL_DAYS * 86_400_000).toISOString();
     const since = cursor && !ticketsKnown && backfillFrom < cursor ? backfillFrom : cursor;
     try {
       const backlog = parsePrBacklog(await d.docs.getCursor(prBacklogKey(projectKey)));
-      const store = async (list: PrContext[]) => {
+      const store = async (list: PrContext[], repairing = false) => {
         for (const pr of list) {
-          if (d.authors?.get(projectKey) && pr.author.toLowerCase() !== d.authors.get(projectKey)!.toLowerCase()) continue;
+          if (!repairing && d.authors?.get(projectKey) && pr.author.toLowerCase() !== d.authors.get(projectKey)!.toLowerCase()) continue;
           const chunks = prContextToChunks(pr).map((c) => redactSecrets(c.text));
           const vectors = chunks.length ? await d.embed(chunks) : [];
           await d.docs.upsertDoc(
@@ -51,23 +52,14 @@ export async function syncGithub(d: GithubSyncDeps): Promise<{ prs: number }> {
           );
         }
       };
-      // Independent of the redaction-rules cursor: installs that already completed v7 still repair PR chunks.
-      const repairKey = `github-redaction-source-repair-v8:${projectKey}`;
-      const repairAt = await d.docs.getCursor(repairKey);
-      if (repairAt !== 'done' && d.docs.listDocs) {
-        const existing = new Set((await d.docs.listDocs(projectKey, { source: 'github', limit: 2147483647 })).map(doc => doc.ref));
-        let cappedAt: string | null = null;
-        const originals = existing.size ? await d.fetchPrs({ repo, token: d.token, since: '1970-01-01T00:00:00.000Z', maxPrs: 100,
-          ...(repairAt ? { until: repairAt } : {}), onCap: at => { cappedAt = at; }, ...(d.authors?.get(projectKey) ? { author: d.authors.get(projectKey) } : {}) }) : [];
-        const restored = originals.filter(pr => existing.has(`github:${repo}#${pr.number}`));
-        await store(restored);
-        await d.docs.setCursor(repairKey, cappedAt ?? 'done');
-        if (restored.length) await d.activity?.record({ kind: 'doc_added', actor: 'github', projectKey,
-          subject: `re-fetched ${restored.length} existing GitHub documents after redaction`,
-          why: 'Rebuilt stored PR chunks from GitHub under the current redaction rules; this does not recover unavailable fact or lesson originals.',
-          details: { recovery: 'redaction-v8-source', documentsRefetched: restored.length, complete: !cappedAt },
-          targets: restored.map(pr => `doc:${projectKey}:github:github:${repo}#${pr.number}`) });
-      }
+      const repair = await repairGithubDocs({ projectKey, repo, token: d.token, docs: d.docs, fetchPrs: d.fetchPrs, store: pr => store([pr], true), now: started });
+      if (repair.attemptedDocs) await d.activity?.record({ kind: 'doc_added', actor: 'github', projectKey,
+        subject: repair.progress.status === 'waiting' ? `GitHub document repair waiting: ${repair.progress.pending} pending` : `verified ${repair.fetchedDocs} masked GitHub documents against their source; ${repair.repairedMasks} fewer masks`,
+        why: 'Only damaged stored documents were fetched. Literal masks in the source remain literal; protected credentials stay redacted.',
+        details: { recovery: 'redaction-v9-targeted', fetchedDocs: repair.fetchedDocs, repairedMasks: repair.repairedMasks, ...repair.progress } });
+      if (repair.attemptedDocs) d.log?.('github document repair progress', { projectKey, ...repair.progress, fetchedDocs: repair.fetchedDocs, repairedMasks: repair.repairedMasks });
+      if (repair.rateLimited) break;
+      if (!due) continue;
       let readBackTo = null as string | null; // set by onCap
       const list = await d.fetchPrs({ repo, token: d.token, since, ...(d.authors?.get(projectKey) && { author: d.authors.get(projectKey) }), onCap: (t) => { readBackTo = t; } });
       await store(list);
@@ -104,6 +96,7 @@ export async function syncGithub(d: GithubSyncDeps): Promise<{ prs: number }> {
       }
     } catch (err) {
       d.log?.('github sync failed', { projectKey, repo, error: String(err) });
+      if (err instanceof IntegrationError && err.kind === 'rate_limit') break;
     }
   }
   return { prs };

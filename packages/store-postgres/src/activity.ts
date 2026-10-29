@@ -75,9 +75,10 @@ export class PgActivityStore implements ActivityStore {
           AND ($5::text[] IS NULL OR project_key IS NULL OR project_key = ANY($5))
           AND ($7::text IS NULL OR run = $7)
           AND (NOT $8 OR run IS NULL) AND (NOT $9 OR NOT sandbox)
+          AND ($10::text IS NULL OR seq < (SELECT seq FROM activity WHERE id = $10))
         ORDER BY seq DESC
         LIMIT $4`,
-      [q.projectKey ?? null, q.kind ?? null, q.target ?? null, q.limit ?? 200, q.projectKeys ?? null, q.maxDetailBytes ?? null, q.run ?? null, !!q.unlabelled, !!q.noSandbox],
+      [q.projectKey ?? null, q.kind ?? null, q.target ?? null, q.limit ?? 200, q.projectKeys ?? null, q.maxDetailBytes ?? null, q.run ?? null, !!q.unlabelled, !!q.noSandbox, q.before ?? null],
     );
     return rows.map((r) => ({ ...activityOf(r), ...(r.omitted && { detailsOmitted: true }) }));
   }

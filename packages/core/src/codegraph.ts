@@ -778,7 +778,7 @@ export type CodeMapHit = {
   outside: boolean;
 };
 
-export type FindOpts = { limit?: number; maxUsages?: number };
+export type FindOpts = { limit?: number; maxUsages?: number; paths?: string[] };
 
 const FIND_LIMIT = 8;
 const FIND_USAGES = 12;
@@ -805,7 +805,8 @@ function strength(term: string, name: string): number {
  */
 export function findInCodeMap(map: Pick<StoredCodeMap, 'files' | 'symbols' | 'imports'> & { outside?: MapFile[] }, terms: string[], opts: FindOpts = {}): CodeMapHit[] {
   const want = [...new Set(terms.map(foldTerm).filter((t) => t.length >= MIN_TERM))];
-  if (!want.length) return [];
+  const exact = new Set(opts.paths ?? []);
+  if (!want.length && !exact.size) return [];
   // Next to a specific word, a hit on generic words only is dropped.
   const specific = want.some((t) => !GENERIC.has(t));
   const tells = (matched: string[]) => !specific || matched.some((t) => !GENERIC.has(t));
@@ -829,7 +830,7 @@ export function findInCodeMap(map: Pick<StoredCodeMap, 'files' | 'symbols' | 'im
     const near = direct.filter((x) => !isTest(x)).flatMap(importersOf);
     return [...new Set([...direct, ...near].filter(isTest))].sort(cmp);
   };
-  const usable = (f: MapFile | undefined): f is MapFile => !!f && !f.isTest && isCodeLang(f.lang) && !isSecretPath(f.path);
+  const usable = (f: MapFile | undefined): f is MapFile => !!f && (!f.isTest || exact.has(f.path)) && isCodeLang(f.lang) && !isSecretPath(f.path);
   const around = (p: string, name: string | null) => {
     const users = importersOf(p).filter((x) => !isTest(x));
     const byName = name ? [...new Set((importers.get(p) ?? []).filter((i) => i.names.includes(name)).map((i) => i.from))].filter((x) => !isTest(x)).sort(cmp) : [];
@@ -841,11 +842,11 @@ export function findInCodeMap(map: Pick<StoredCodeMap, 'files' | 'symbols' | 'im
   for (const s of map.symbols) {
     if (!usable(byPath.get(s.path))) continue;
     const matched = want.map((t) => [t, strength(t, s.name)] as const).filter(([, n]) => n > 0);
-    if (!matched.length || !tells(matched.map(([t]) => t))) continue;
+    if (!exact.has(s.path) && (!matched.length || !tells(matched.map(([t]) => t)))) continue;
     withSymbols.add(s.path);
     hits.push({
       kind: 'symbol', path: s.path, name: s.name, symbolKind: s.kind, lines: s.lines, exported: s.exported,
-      matched: matched.map(([t]) => t), score: matched.reduce((n, [, x]) => n + x, 0), outside: false, ...around(s.path, s.name),
+      matched: exact.has(s.path) ? [s.path, ...matched.map(([t]) => t)] : matched.map(([t]) => t), score: (exact.has(s.path) ? 1000 : 0) + matched.reduce((n, [, x]) => n + x, 0), outside: false, ...around(s.path, s.name),
     });
   }
   for (const f of allFiles) {
@@ -855,10 +856,10 @@ export function findInCodeMap(map: Pick<StoredCodeMap, 'files' | 'symbols' | 'im
     const matched = want
       .map((t) => [t, Math.max(strength(t, name), ...segments.map((d) => Math.min(1, strength(t, d))))] as const)
       .filter(([, n]) => n > 0);
-    if (!matched.length || !tells(matched.map(([t]) => t))) continue;
+    if (!exact.has(f.path) && (!matched.length || !tells(matched.map(([t]) => t)))) continue;
     hits.push({
       kind: 'file', path: f.path, name: null, symbolKind: null, lines: null, exported: false,
-      matched: matched.map(([t]) => t), score: matched.reduce((n, [, x]) => n + x, 0), outside: past.has(f.path), ...around(f.path, null),
+      matched: exact.has(f.path) ? [f.path, ...matched.map(([t]) => t)] : matched.map(([t]) => t), score: (exact.has(f.path) ? 1000 : 0) + matched.reduce((n, [, x]) => n + x, 0), outside: past.has(f.path), ...around(f.path, null),
     });
   }
   hits.sort((a, b) => b.score - a.score || Number(b.exported) - Number(a.exported) || b.dependents - a.dependents || cmp(a.path, b.path) || cmp(a.name ?? '', b.name ?? ''));
@@ -866,7 +867,7 @@ export function findInCodeMap(map: Pick<StoredCodeMap, 'files' | 'symbols' | 'im
   const out: CodeMapHit[] = [];
   for (const h of hits) {
     const n = perFile.get(h.path) ?? 0;
-    if (n >= PER_FILE) continue;
+    if (n >= (exact.has(h.path) ? limit : PER_FILE)) continue;
     perFile.set(h.path, n + 1);
     out.push(h);
     if (out.length >= limit) break;

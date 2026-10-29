@@ -267,18 +267,26 @@ async function syncKind(kind: IntegrationKind, cred: Credential, projects: SyncP
     const floorMs = (since && !backfill ? Date.parse(since) : started.getTime()) - lookback;
     const fetchSince = since && !backfill ? since : new Date(started.getTime() - lookback).toISOString();
     try {
-      // PR state was not retained before 0.6.6. Walk old PR metadata once, without importing old feedback.
-      const stateKey = `feedback-github-pr-state-v1:${p.key}`;
+      // Metadata walks use a REST page and completed ids: no rescanning page 1 or replaying completed PRs after a failure.
+      const stateKey = `feedback-github-pr-state-v2:${p.key}`;
       const stateProgress = kind === 'github' ? await d.cursors.getCursor(stateKey) : 'done';
       if (kind === 'github' && stateProgress !== 'done' && d.graph.refreshExternalThreadState) {
-        let cappedAt: string | null = null;
-        const history = await d.fetchPrs({ repo: target, token: cred.token, since: '1970-01-01T00:00:00.000Z',
-          ...(stateProgress ? { until: stateProgress } : {}), onCap: at => { cappedAt = at; }, ...(link.githubAuthor ? { author: link.githubAuthor } : {}) });
-        for (const pr of history) {
-          if (link.githubAuthor && pr.author.toLowerCase() !== link.githubAuthor.toLowerCase()) continue;
-          await d.graph.refreshExternalThreadState(`github:${pr.repo}#${pr.number}`, pr.state);
-        }
-        await d.cursors.setCursor(stateKey, cappedAt ?? 'done');
+        let checkpoint: { page: number; completed: number[] } = { page: 1, completed: [] };
+        try { if (stateProgress) checkpoint = JSON.parse(stateProgress) as typeof checkpoint; } catch { /* restart malformed legacy progress */ }
+        if (!Number.isSafeInteger(checkpoint.page) || checkpoint.page < 1 || !Array.isArray(checkpoint.completed)) checkpoint = { page: 1, completed: [] };
+        const handled = new Set(checkpoint.completed);
+        let next: number | null = null;
+        const save = async (pr: PrContext) => {
+          if (handled.has(pr.number) || (link.githubAuthor && pr.author.toLowerCase() !== link.githubAuthor.toLowerCase())) return;
+          await d.graph.refreshExternalThreadState!(`github:${pr.repo}#${pr.number}`, pr.state);
+          handled.add(pr.number);
+          await d.cursors.setCursor(stateKey, JSON.stringify({ page: checkpoint.page, completed: [...handled] }));
+        };
+        const history = await d.fetchPrs({ repo: target, token: cred.token, maxPrs: 100, metadataOnly: true, metadataPage: checkpoint.page,
+          onMetadataPage: page => { next = page; }, onPr: save,
+          ...(link.githubAuthor ? { author: link.githubAuthor } : {}) });
+        for (const pr of history) await save(pr);
+        await d.cursors.setCursor(stateKey, next === null ? 'done' : JSON.stringify({ page: next, completed: [] }));
       }
       const r = kind === 'github' ? await syncRepo(p, target, cred.token, fetchSince, floorMs, d, link.githubAuthor ?? undefined) : await syncTeam(p, target, link.linearTeamName ?? target, cred.token, fetchSince, floorMs, d, since);
       await d.cursors.setCursor(cursorKey, started.toISOString());

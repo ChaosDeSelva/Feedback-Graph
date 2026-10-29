@@ -106,13 +106,13 @@ describe('buildChatContext', () => {
       facts: {
         searchFacts: async () => [
           { fact: { id: 'fact:d', path: 'whiteboard.png', lines: 'Over 10,000 rows: email a link', docId: 'doc:9', kind: 'constraint', statement: 'Big exports are emailed', why: '', confidence: 1, relevance: 0.8 } as never, score: 0.9 },
-          { fact: { id: 'fact:c', path: 'src/routes/exports.ts', lines: 'export function exportCustomers(', docId: null, kind: 'api', statement: 'Exports use sendJson', why: '', confidence: 1, relevance: 0.8 } as never, score: 0.85 },
+          { fact: { id: 'fact:c', path: 'src/routes/exports.ts', lines: 'export function exportCustomers(', docId: null, kind: 'api', statement: 'Exports use sendJson', why: '', confidence: 1, relevance: 0.8 } as never, score: 0.95 },
         ],
       },
     });
     const pack = await buildChatContext('demo-shop', 'add an invoices export', [], d);
     const facts = pack.sources.filter((s) => s.title !== 'Reuse the shared Modal' && s.kind !== 'miss' && s.ref !== 'design.md');
-    expect(facts.map((s) => [s.kind, s.ref])).toEqual([['doc', 'whiteboard.png'], ['fact', 'src/routes/exports.ts']]);
+    expect(facts.map((s) => [s.kind, s.ref])).toEqual([['fact', 'src/routes/exports.ts'], ['doc', 'whiteboard.png']]);
   });
 
   test('the search is about the question and the previous question', async () => {

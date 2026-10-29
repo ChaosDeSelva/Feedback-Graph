@@ -469,7 +469,7 @@ test('PR state backfill refreshes stored metadata without importing historical c
   s.deps.graph.refreshExternalThreadState = async (id, state) => { refreshed.push([id, state]); };
   s.store.m.set(feedbackCursor('github', 'shop'), '2026-10-20T00:00:00Z');
   s.store.m.set(authorsCursor('shop'), '2026-10-20T00:00:00Z');
-  s.deps.fetchPrs = async opts => opts.since === '1970-01-01T00:00:00.000Z'
+  s.deps.fetchPrs = async opts => opts.metadataOnly
     ? [{ ...pr(7, [{ id: 'old', createdAt: '2024-01-01T00:00:00Z' }]), state: 'closed' }]
     : [];
   await syncExternalFeedback(s.deps);
@@ -485,7 +485,28 @@ test('PR state history backfill checkpoints a capped page before continuing', as
   s.deps.graph.refreshExternalThreadState = async () => {};
   s.store.m.set(feedbackCursor('github', 'shop'), '2026-10-20T00:00:00Z');
   s.store.m.set(authorsCursor('shop'), '2026-10-20T00:00:00Z');
-  s.deps.fetchPrs = async opts => { if (opts.since === '1970-01-01T00:00:00.000Z') opts.onCap?.('2025-01-01T00:00:00Z'); return []; };
+  s.deps.fetchPrs = async opts => { if (opts.metadataOnly) opts.onMetadataPage?.(2); return []; };
   await syncExternalFeedback(s.deps);
-  expect(s.store.m.get('feedback-github-pr-state-v1:shop')).toBe('2025-01-01T00:00:00Z');
+  expect(s.store.m.get('feedback-github-pr-state-v2:shop')).toBe(JSON.stringify({ page: 2, completed: [] }));
+});
+
+
+test('state backfill resumes its last saved PR after a later interruption', async () => {
+  const s = setup();
+  s.store.m.set(feedbackCursor('github', 'shop'), '2026-10-20T00:00:00Z');
+  s.store.m.set(authorsCursor('shop'), '2026-10-20T00:00:00Z');
+  s.deps.graph.refreshExternalThreadState = async () => {};
+  const checkpoints: (number | undefined)[] = [];
+  let interrupted = false;
+  s.deps.fetchPrs = async opts => {
+    if (!opts.metadataOnly) return [];
+    checkpoints.push(opts.metadataPage);
+    if (!interrupted) { interrupted = true; await opts.onPr!({ ...pr(1, []), updatedAt: '2026-10-18T00:00:00Z' }); throw new Error('interrupted'); }
+    return [];
+  };
+  await syncExternalFeedback(s.deps);
+  expect(s.store.m.get('feedback-github-pr-state-v2:shop')).toBe(JSON.stringify({ page: 1, completed: [1] }));
+  await syncExternalFeedback(s.deps);
+  expect(checkpoints).toEqual([1, 1]);
+  expect(s.store.m.get('feedback-github-pr-state-v2:shop')).toBe('done');
 });

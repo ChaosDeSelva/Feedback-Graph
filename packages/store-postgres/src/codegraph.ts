@@ -159,6 +159,7 @@ export class PgCodeGraphStore implements CodeGraphStore {
   async purgeOrphanCodeFiles(limit: number, now = new Date()): Promise<number> {
     if (!Number.isFinite(limit) || limit < 1) return 0;
     const cutoff = new Date(now.getTime() - 24 * 60 * 60_000);
+    const batch = Math.min(250, Math.floor(limit));
     // Retain deselected maps for a day so an accidental untick is reversible, then release derived map data.
     await tx(this.db, async (c) => {
       // Serialize against setTracked; re-evaluate selection only after acquiring its lock.
@@ -170,11 +171,18 @@ export class PgCodeGraphStore implements CodeGraphStore {
         [cutoff],
       );
       for (const { project_key: key } of rows) {
-        await c.query('DELETE FROM code_symbols WHERE project_key = $1', [key]);
-        await c.query('DELETE FROM code_imports WHERE project_key = $1', [key]);
-        await c.query('DELETE FROM code_tests WHERE project_key = $1', [key]);
-        await c.query('UPDATE code_files SET in_map = false, in_index = false, mapped_at = NULL, code_hash = NULL WHERE project_key = $1', [key]);
-        await c.query('DELETE FROM code_maps WHERE project_key = $1', [key]);
+        await c.query('UPDATE code_maps SET rebuild_requested_at = $2 WHERE project_key = $1', [key, now]);
+        for (const table of ['code_symbols', 'code_imports', 'code_tests']) {
+          await c.query(`DELETE FROM ${table} WHERE ctid IN (SELECT ctid FROM ${table} WHERE project_key = $1 LIMIT $2)`, [key, batch]);
+        }
+        await c.query(`UPDATE code_files SET in_map = false, in_index = false, mapped_at = NULL, code_hash = NULL,
+          lang = NULL, loc = NULL, is_test = false, churn_commits = NULL, churn_last_ts = NULL
+          WHERE id IN (SELECT id FROM code_files WHERE project_key = $1 AND (in_map OR in_index OR code_hash IS NOT NULL) LIMIT $2)`, [key, batch]);
+        await c.query(`DELETE FROM code_maps WHERE project_key = $1
+          AND NOT EXISTS (SELECT 1 FROM code_symbols WHERE project_key = $1)
+          AND NOT EXISTS (SELECT 1 FROM code_imports WHERE project_key = $1)
+          AND NOT EXISTS (SELECT 1 FROM code_tests WHERE project_key = $1)
+          AND NOT EXISTS (SELECT 1 FROM code_files WHERE project_key = $1 AND (in_map OR in_index OR code_hash IS NOT NULL))`, [key]);
       }
     });
     // Session touches (session_files) need no code_files row; map edges hang off map files only.
@@ -185,8 +193,11 @@ export class PgCodeGraphStore implements CodeGraphStore {
            OR EXISTS (SELECT 1 FROM project_selection s WHERE s.id = 'selection' AND s.initialized
              AND s.updated_at < $2 AND NOT (cf.project_key = ANY(s.tracked))))
            AND NOT EXISTS (SELECT 1 FROM facts x WHERE x.code_file_id = cf.id)
+           AND NOT EXISTS (SELECT 1 FROM code_symbols x WHERE x.code_file_id = cf.id)
+           AND NOT EXISTS (SELECT 1 FROM code_imports x WHERE x.from_file_id = cf.id OR x.to_file_id = cf.id)
+           AND NOT EXISTS (SELECT 1 FROM code_tests x WHERE x.test_file_id = cf.id OR x.target_file_id = cf.id)
          LIMIT $1)`,
-      [Math.max(0, Math.floor(limit)), cutoff],
+      [batch, cutoff],
     );
     return rowCount ?? 0;
   }

@@ -7,14 +7,14 @@ import type { ContextDeps } from './context.ts';
 const repo = { listCandidates: async () => [], candidateDetail: async () => null, decide: async () => {}, stats: async () => [] } as unknown as ApiRepo;
 const lesson: Lesson = { id: 'l', projectKey: 'demo', title: 'Tenant reads', rule: 'Scope database reads to the tenant.', appliesWhen: 'database reads', paths: ['src/a.ts'], status: 'approved', scope: 'project', source: 'postmortem', cause: null, missId: null, createdAt: 't', decidedAt: 't' };
 function gate() { let release!: () => void; const promise = new Promise<void>(resolve => { release = resolve; }); return { promise, release }; }
-function appFor(queue: Admission, budget: number) {
+function appFor(queue: Admission, budget: number, secured = false) {
   const context: ContextDeps = { roots: [{ host: '/projects', container: '/projects' }], exists: () => true, checkTimeoutMs: budget, judgeQueue: queue, embed: async () => [[1]],
     k: { searchLessons: async () => [{ lesson, score: .9 }], relatedMisses: async () => [], recordPreDoneCheck: async () => {}, createManualFeedback: async () => 'f' },
     judge: async () => [{ lessonId: 'l', status: 'addressed', applies: true, why: 'Tenant read is handled.' }],
   };
-  return createApp(repo, { context });
+  return createApp(repo, { context, ...(secured && { auth: { token: "owner-token-".repeat(4), operator: { token: "operator-token-".repeat(4), allow: [] } } }) });
 }
-const call = (app: ReturnType<typeof createApp>) => app.request('/mcp', { method: 'POST', headers: { 'content-type': 'application/json', accept: 'application/json, text/event-stream' }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'check_before_done', arguments: { project: 'demo', task: 'edit src/a.ts', summary: 'done', files_changed: ['src/a.ts'] } } }) });
+const call = (app: ReturnType<typeof createApp>, token?: string) => app.request('/mcp', { method: 'POST', headers: { 'content-type': 'application/json', accept: 'application/json, text/event-stream', ...(token && { authorization: `Bearer ${token}` }) }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'check_before_done', arguments: { project: 'demo', task: 'edit src/a.ts', summary: 'done', files_changed: ['src/a.ts'] } } }) });
 
 test('real MCP queued response carries observed ETA, capacity and retry state; later retry succeeds', async () => {
   vi.useFakeTimers(); vi.setSystemTime(0);
@@ -39,7 +39,7 @@ test('real MCP queued response carries observed ETA, capacity and retry state; l
     const success = call(app); await vi.advanceTimersByTimeAsync(0);
     const completed = await (await success).json();
     expect(completed.result.structuredContent).toMatchObject({ queued: false, queue: { state: 'completed', retained: false, position: null } });
-    expect(completed.result.content[0].text).toContain('This judge call completed.');
+    expect(completed.result.content[0].text).toContain('Judge completed');
     expect(queue.waiting).toBe(0);
   } finally { vi.useRealTimers(); }
 });
@@ -59,5 +59,46 @@ test('real MCP busy response exposes a still-occupied overdue slot and does not 
     expect(result.content[0].text).toContain('upper estimate unavailable');
     held.release(); await active; await vi.advanceTimersByTimeAsync(0);
     expect(queue.running).toBe(0);
+  } finally { vi.useRealTimers(); }
+});
+
+
+test('real authenticated MCP retries restore priority without sharing it across callers', async () => {
+  vi.useFakeTimers(); vi.setSystemTime(0);
+  try {
+    const queue = new Admission({ concurrency: 1, timeoutMs: 10000 });
+    const held = gate(); const active = queue.run(() => held.promise);
+    const app = appFor(queue, 100, true);
+    const owner = 'owner-token-'.repeat(4), operator = 'operator-token-'.repeat(4);
+    const first = call(app, owner);
+    await vi.advanceTimersByTimeAsync(100);
+    const firstBody = await (await first).json();
+    expect(firstBody.result.structuredContent.queue).toMatchObject({ retained: false, position: null, retryPriority: { retained: true, restored: false, remainingMs: 120000 } });
+    const other = call(app, operator); await vi.advanceTimersByTimeAsync(0);
+    const retry = call(app, owner); await vi.advanceTimersByTimeAsync(0);
+    expect(queue.waiting).toBe(2);
+    held.release(); await active; await vi.advanceTimersByTimeAsync(0);
+    const retried = await (await retry).json(), unrelated = await (await other).json();
+    expect(retried.result.structuredContent.queue).toMatchObject({ state: 'completed', arrivalAhead: 1, retryPriority: { restored: true } });
+    expect(unrelated.result.structuredContent.queue.retryPriority.restored).toBe(false);
+    expect(retried.result.content[0].text).toContain('Earlier retry priority was restored');
+    expect(JSON.stringify([firstBody, retried, unrelated])).not.toContain(owner);
+    expect(JSON.stringify([firstBody, retried, unrelated])).not.toContain(operator);
+    expect(queue.running).toBe(0); expect(queue.waiting).toBe(0);
+  } finally { vi.useRealTimers(); }
+});
+
+
+test('public MCP does not treat an arbitrary Bearer header as authenticated retry identity', async () => {
+  vi.useFakeTimers(); vi.setSystemTime(0);
+  try {
+    const queue = new Admission({ concurrency: 1, timeoutMs: 10000 });
+    const held = gate(); const active = queue.run(() => held.promise);
+    const pending = call(appFor(queue, 100), 'unverified-arbitrary-bearer');
+    await vi.advanceTimersByTimeAsync(100);
+    const body = await (await pending).json();
+    expect(body.result.structuredContent.queue).toMatchObject({ state: 'retry_required', retained: false });
+    expect(body.result.structuredContent.queue.retryPriority).toBeUndefined();
+    held.release(); await active;
   } finally { vi.useRealTimers(); }
 });

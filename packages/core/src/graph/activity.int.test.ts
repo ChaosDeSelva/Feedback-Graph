@@ -9,6 +9,15 @@ describeStores('ActivityStore', (h) => {
     a = h.store.activity;
   });
 
+  test('cursor pagination reads every run entry without duplicates', async () => {
+    for (let i = 0; i < 7; i++) await a.record({ kind: 'context_served', actor: 'fixture', projectKey: null, subject: String(i), why: 'fixture', run: 'paged', sandbox: true });
+    const first = await a.list({ run: 'paged', limit: 3 });
+    const second = await a.list({ run: 'paged', before: first.at(-1)!.id, limit: 3 });
+    const last = await a.list({ run: 'paged', before: second.at(-1)!.id, limit: 3 });
+    expect([...first, ...second, ...last].map(x => x.subject)).toEqual(['6', '5', '4', '3', '2', '1', '0']);
+    expect(await a.list({ run: 'paged', before: last.at(-1)!.id, limit: 3 })).toEqual([]);
+  });
+
   test('records an activity and lists it back with details and targets', async () => {
     await a.record({
       kind: 'facts_extracted', actor: 'ollama:gemma4', projectKey: 'shop', subject: '3 facts from src/db.ts',

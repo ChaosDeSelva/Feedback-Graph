@@ -87,11 +87,12 @@ fi
 # A listening runner is not enough: /health executes its real nested sandbox, without a model.
 if [ -n "$(envval CODEX_RUNNER_URL)" ]; then
   if [ "$docker_ok" = 1 ] && is_running worker; then
-    if "${compose[@]}" exec -T worker node -e 'fetch(process.env.CODEX_RUNNER_URL.replace(/\/+$/, "") + "/health", {signal:AbortSignal.timeout(10000)}).then(async r=>{ const h=await r.json(); if(!r.ok||!h.ok||!h.sandbox) throw Error(h.error||"sandbox probe failed"); }).catch(e=>{console.error(e.message);process.exit(1)})' >/dev/null 2>&1; then
+    if runner_detail="$("${compose[@]}" exec -T worker node -e 'fetch(process.env.CODEX_RUNNER_URL.replace(/\/+$/, "") + "/health", {signal:AbortSignal.timeout(10000)}).then(async r=>{ const h=await r.json(); if(!r.ok||!h.ok||!h.sandbox) throw Error(h.error||"sandbox probe failed"); }).catch(e=>{console.error(e.message);process.exit(1)})' 2>&1)"; then
       pass "Codex runner: its nested sandbox starts successfully"
     else
       fail "Codex runner: sandbox cannot start or runner is unavailable"
-      more "Rebuild codex-runner with scripts/seccomp/codex-runner.json. Docker Desktop/OrbStack procfs errors: review setup.sh --runner-procfs-compat (explicit opt-in reduces system-path protection), or select Claude/API. Check AppArmor and docs/operations.md."
+      more "$runner_detail"
+      more "For procfs mount errors on Docker Desktop/OrbStack or Linux, review setup.sh --runner-procfs-compat (explicit opt-in removes Docker system-path protection); Claude/API avoids that exception. Rebuild codex-runner with scripts/seccomp/codex-runner.json. Check AppArmor and docs/operations.md."
     fi
   else fail "Codex runner: configured but cannot be checked from a running worker"; fi
 fi

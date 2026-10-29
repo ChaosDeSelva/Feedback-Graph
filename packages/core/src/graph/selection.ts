@@ -196,23 +196,25 @@ export class SelectionRepo implements SelectionStore {
   /** A write to one IngestLock node, held until fn settles: another section's write waits for the commit. */
   async exclusive<T>(fn: () => Promise<T>): Promise<T> {
     const session = this.g.driver.session();
-    const tx = session.beginTransaction({ timeout: storeTimeLeft() });
     const signal = storeRequestSignal();
-    const cancel = () => { void tx.rollback().catch(() => {}); void session.close().catch(() => {}); };
-    signal?.addEventListener('abort', cancel, { once: true });
+    let tx: ReturnType<typeof session.beginTransaction> | undefined;
+    let rollback: Promise<void> | undefined;
+    const rollbackOnce = () => rollback ??= tx ? tx.rollback().catch(() => {}) : Promise.resolve();
+    const cancel = () => { void rollbackOnce(); void session.close().catch(() => {}); };
     try {
+      // Worker sections can legitimately last hours: the lock must outlive their work.
+      // HTTP sections retain their deadline, including while waiting to acquire this lock.
+      tx = session.beginTransaction({ timeout: signal ? storeTimeLeft() : 0 });
+      signal?.addEventListener('abort', cancel, { once: true });
       await tx.run('MERGE (l:IngestLock {id: $id}) SET l.heldAt = $now', { id: ID, now: new Date().toISOString() });
       storeTimeLeft();
-      let out: T;
-      try {
-        out = await fn();
-      } catch (err) {
-        await tx.rollback().catch(() => {});
-        throw err;
-      }
+      const out = await fn();
       storeTimeLeft();
       await tx.commit();
       return out;
+    } catch (err) {
+      await rollbackOnce();
+      throw err;
     } finally {
       signal?.removeEventListener('abort', cancel);
       await session.close();

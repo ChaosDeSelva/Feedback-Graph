@@ -426,10 +426,11 @@ export class PgFactsStore implements FactsStore {
          error = CASE WHEN $7::boolean THEN $8::text ELSE error END,
          started_at = CASE WHEN $2::text = 'running' THEN $9 ELSE started_at END,
          finished_at = CASE WHEN $2::text IN ('done', 'failed') THEN $9 ELSE finished_at END,
-         shards = CASE WHEN $10::boolean THEN $11::jsonb ELSE shards END
+         shards = CASE WHEN $10::boolean THEN $11::jsonb ELSE shards END,
+         retry_at = CASE WHEN $12::boolean THEN $13::timestamptz ELSE retry_at END
        WHERE id = $1`,
       [id, status, has('filesScanned'), patch.filesScanned ?? null, has('factsAdded'), patch.factsAdded ?? null, has('error'), patch.error == null ? null : redactSecrets(patch.error), new Date(),
-        has('shards') && patch.shards !== undefined, patch.shards ? toJson(patch.shards) : null],
+        has('shards') && patch.shards !== undefined, patch.shards ? toJson(patch.shards) : null, has('retryAt'), patch.retryAt ?? null],
     );
   }
 

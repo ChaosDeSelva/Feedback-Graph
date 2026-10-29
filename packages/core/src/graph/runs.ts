@@ -82,6 +82,14 @@ export class RunsRepo implements RunsStore {
     this.g = g;
   }
 
+  async sandbox(run: string): Promise<boolean> {
+    const [row] = await this.g.run(
+      `RETURN EXISTS { MATCH (x:SessionRun {run: $run, sandbox: true}) } OR
+              EXISTS { MATCH (x:Session {run: $run, sandbox: true}) } OR
+              EXISTS { MATCH (x:Activity {run: $run, sandbox: true}) } AS sandbox`, { run });
+    return row?.get('sandbox') === true || (await this.items(run)).some(x => x.sandbox);
+  }
+
   async items(run: string): Promise<RunItem[]> {
     const rows: RunRow[] = [];
     for (const kind of RUN_ITEM_KINDS) {

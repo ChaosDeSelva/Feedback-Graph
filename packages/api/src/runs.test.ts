@@ -24,7 +24,7 @@ const entry = (o: Partial<Activity>): Activity => ({
 
 const API = 'a'.repeat(32);
 
-function setup(o: { allow?: OperatorVerb[]; items?: RunItem[]; entries?: Activity[]; extra?: Partial<AppOpts>; ctx?: Partial<ContextDeps>; owners?: Record<string, RunPrincipal | [RunPrincipal, string | null]>; token?: string } = {}) {
+function setup(o: { allow?: OperatorVerb[]; items?: RunItem[]; entries?: Activity[]; extra?: Partial<AppOpts>; ctx?: Partial<ContextDeps>; owners?: Record<string, RunPrincipal | [RunPrincipal, string | null]>; token?: string; sandbox?: boolean } = {}) {
   const logged: ActivityInput[] = [];
   const listed: unknown[] = [];
   const reports: unknown[] = [];
@@ -62,7 +62,7 @@ function setup(o: { allow?: OperatorVerb[]; items?: RunItem[]; entries?: Activit
       record: async (e) => { logged.push(e); },
       list: async (q) => {
         listed.push(q);
-        return entries.filter((a) => (!q.run || a.run === q.run) && (!q.target || a.targets.includes(q.target)) && (!q.unlabelled || !a.run) && (!q.noSandbox || !a.sandbox)).slice(0, q.limit ?? Infinity);
+        return entries.slice(q.before ? entries.findIndex(a => a.id === q.before) + 1 : 0).filter((a) => (!q.run || a.run === q.run) && (!q.target || a.targets.includes(q.target)) && (!q.unlabelled || !a.run) && (!q.noSandbox || !a.sandbox)).slice(0, q.limit ?? Infinity);
       },
       removeRun: async (run, keep, opts) => {
         removedEntries.push(run);
@@ -72,6 +72,7 @@ function setup(o: { allow?: OperatorVerb[]; items?: RunItem[]; entries?: Activit
     },
     context: ctx,
     runs: {
+      ...(o.sandbox !== undefined && { sandbox: async () => o.sandbox! }),
       items: async (run) => (run === 'run-1' ? o.items ?? [] : []),
       remove: async (run, keep) => {
         removed.push([run, keep]);
@@ -404,13 +405,13 @@ test('a run with more entries than a cleanup reads: only the entries it read (an
   }));
   const { app, removeArgs, logged } = setup({ items: [], entries: many, owners: { 'run-1': ['operator', CALLER] } });
   const res = (await (await app.request('/api/runs/run-1', json('DELETE', { dryRun: false }, op()))).json()) as Record<string, any>;
-  expect(res).toMatchObject({ entriesCapped: true, entriesRemoved: 5000 });
-  expect(removeArgs[0].ids).toHaveLength(5000);
-  expect(removeArgs[0].ids).not.toContain('act:05099');
+  expect(res).toMatchObject({ entriesCapped: false, entriesRemoved: 5100 });
+  expect(removeArgs[0].ids).toHaveLength(5100);
+  expect(removeArgs[0].ids).toContain('act:05099');
   const cleaned = logged.at(-1)!;
   // 250 changes in what was read: every one listed, not the first 200.
-  expect((cleaned.details as { changedItems: unknown[] }).changedItems).toHaveLength(250);
-  expect(cleaned.why).toMatch(/more Activity entries than one cleanup reads \(5000\): those not read stay, with what they changed; clean up again/);
+  expect((cleaned.details as { changedItems: unknown[] }).changedItems).toHaveLength(255);
+  expect(cleaned.why).not.toMatch(/clean up again/);
 });
 
 test("the default Activity feed leaves out every labelled run's entries; ?run= shows one run's; a record's history (target=) keeps runs but never another's sandbox", async () => {
@@ -584,13 +585,13 @@ test("a run never pins, decides on, converts or talks in the owner's records (40
   expect(got.chats).toEqual([]);
 
   // Its own: changed.
-  expect((await app.request('/api/lessons/mine', json('PATCH', { status: 'approved' }, op(undefined, RUN)))).status).toBe(204);
+  expect((await app.request('/api/lessons/mine', json('PATCH', { status: 'approved' }, op(undefined, RUN)))).status).toBe(200);
   expect((await app.request('/api/chats/chat:mine', json('PATCH', { title: 'x' }, op(undefined, RUN)))).status).toBe(200);
 
   // The owner, in a run the browser opened (not a sandbox): theirs to change.
   const owner = owned({ owners: { 'run-1': 'browser' } });
   expect((await owner.app.request('/api/projects/demo/pin', json('PUT', { pinned: true }, { ...browser, ...RUN }))).status).toBe(204);
-  expect((await owner.app.request('/api/lessons/owner', json('PATCH', { status: 'approved' }, { ...browser, ...RUN }))).status).toBe(204);
+  expect((await owner.app.request('/api/lessons/owner', json('PATCH', { status: 'approved' }, { ...browser, ...RUN }))).status).toBe(200);
   // A sandbox run, even the owner's, never changes the owner's records.
   const sbx = owned({ owners: { 'run-1': 'browser' } });
   expect((await sbx.app.request('/api/projects/demo/pin', json('PUT', { pinned: true }, { ...browser, ...SANDBOX }))).status).toBe(409);
@@ -697,4 +698,39 @@ test('nested admin cleanup cannot inherit and reserve an unrelated outer run', a
   expect(s.owners.has('unrelated-outer')).toBe(false);
   expect(s.removed).toEqual([['target', []]]);
   expect(s.logged.at(-1)).toMatchObject({ kind: 'run_cleaned', run: null });
+});
+
+test('sandbox cleanup recognizes Activity-only runs', async () => {
+  const s = setup({ entries: [entry({ run: 'run-1', sandbox: true })] });
+  const result = await (await s.app.request('/api/runs/run-1')).json();
+  expect(result.sandbox).toBe(true);
+});
+
+test('anonymous labelled session registration creates neither owner nor binding', async () => {
+  let claims = 0;
+  const s = setup({ extra: { sessions: { projects: () => ['demo'], inScope: () => true, store: { list: async () => ({ sessions: [], next: null }), detail: async () => null, requestRebuild: async () => false, claimRun: async () => { claims++; return true; } } } } });
+  const response = await s.app.request('/api/sessions/anonymous/run', json('POST', {}, { 'x-fg-run': 'anonymous-run' }));
+  expect(response.status).toBe(403); expect(claims).toBe(0); expect(s.owners.size).toBe(0);
+  const mcp = await s.app.request('/mcp?run=anonymous-run', rpc('get_task_context', { cwd: '/repo/demo', task: 'fixture', session_id: 'anonymous' }));
+  const result = await mcp.json(); expect(result.result?.isError).toBe(true);
+  expect(claims).toBe(0); expect(s.owners.size).toBe(0);
+});
+
+
+test('tokenless local owner cleanup works with a valid Origin and never grants anonymous or cross-origin cleanup', async () => {
+  const s = setup({ owners: { legacy: ['operator', 'old-display-name'] } });
+  const marker = { 'x-fg-owner-cleanup': 'true' };
+  expect((await s.app.request('/api/runs/legacy', json('DELETE', { dryRun: true }, marker))).status).toBe(403);
+  expect((await s.app.request('/api/runs/legacy', json('DELETE', { dryRun: true }, { ...marker, origin: 'https://evil.example' }))).status).toBe(403);
+  expect((await s.app.request('/api/runs/legacy', json('DELETE', { dryRun: true }, { ...marker, origin: 'http://localhost' }))).status).toBe(200);
+  expect(s.removed).toEqual([]);
+});
+
+
+test('sandbox cleanup recognizes session-only registration provenance', async () => {
+  const s = setup({ sandbox: true });
+  const result = await (await s.app.request('/api/runs/run-1')).json();
+  expect(result.sandbox).toBe(true);
+  expect(result.entries).toBe(0);
+  expect(Object.values(result.remove)).toEqual(expect.arrayContaining([0]));
 });

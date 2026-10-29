@@ -240,9 +240,10 @@ export async function syncBundle(p: Pick<PortabilityStore, 'exportData'>, projec
     withdrawn: [],
   };
   // A seed-created fixture can acquire a genuine scan/code map when selected locally. That alone must not
-  // publish the probe. Only an explicit owner policy can share it; pre-existing ordinary projects are unaffected.
-  if (b.projects.find(project => project.key === projectKey)?.demoCreated && !o.shareDemoCreated) {
-    o.onLocalOnly?.('Created by demo seed: local only, including scans and code maps. The owner can explicitly enable sharing through PUT /api/cloud/local-only shareDemoProjects.');
+  // publish the probe. The reserved demo-shop key also covers legacy fixtures without demoCreated.
+  // This is a read-time privacy boundary: no existing project is relabelled or changed.
+  if ((projectKey === 'demo-shop' || b.projects.find(project => project.key === projectKey)?.demoCreated) && !o.shareDemoCreated) {
+    o.onLocalOnly?.(`${projectKey === 'demo-shop' ? 'Reserved demo-shop fixture' : 'Created by demo seed'}: local only, including legacy scans and code maps. The owner can explicitly enable sharing through PUT /api/cloud/local-only shareDemoProjects.`);
     return null;
   }
   // Export deliberately strips sandbox/demo records and unapproved suggestions. Metadata alone must not
@@ -736,3 +737,9 @@ export async function cloudSharedDemoProjects(docs: Pick<DocsStore, 'getCursor'>
   if (!Array.isArray(saved) || saved.some(key => typeof key !== 'string')) throw new Error('invalid demo sharing policy');
   return [...new Set(saved)];
 }
+
+/** A local lesson decision never dispatches cloud work itself. */
+export const LESSON_SHARING_NOTICE = {
+  mode: 'next_sync_if_enabled',
+  message: 'Saved locally. If cloud sharing is enabled for this project, this change is sent on the next scheduled sync or Sync now. This action does not start a cloud sync.',
+} as const;
