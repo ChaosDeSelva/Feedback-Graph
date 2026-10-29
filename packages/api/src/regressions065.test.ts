@@ -91,3 +91,32 @@ test('the response deadline cancels the underlying embedding request instead of 
   expect(result.queued).toBe(true);
   expect(signal?.aborted).toBe(true);
 });
+
+test('task-named PR excludes its lessons and docs without commit lookup or a session identity', async () => {
+  const own = lesson('lesson:github:acme/demo#14194/review/9');
+  const d = deps({ k: { ...deps().k, searchLessons: async () => [{ lesson: own, score: .95 }] }, docs: { searchDocs: async () => [{ docId: 'own', source: 'github', ref: 'github:acme/demo#14194', title: 'own', text: 'x', score: .95, url: null }] } });
+  const result = await getTaskContext({ project: 'demo', task: 'review PR #14194 in src/app.ts' }, d);
+  expect(result.lessons).toEqual([]);
+  expect(result.docs).toEqual([]);
+});
+
+test('Ask requests the exact named file even when token matching prefers siblings', async () => {
+  const wanted = 'src/dialog/workos-invite-dialog.tsx';
+  const requested: string[] = [];
+  const miss = { missId: 'miss:exact', missed: 'Named file miss', cause: 'implementation_error', feedbackId: 'f', feedbackText: 'fix', sessionId: 's', ts: '2026-10-28', paths: [wanted], fixedHere: false, lessonId: null };
+  const context = deps({ codegraph: { lessonsForPaths: async () => [], moduleContext: async (_key: string, path: string) => {
+    requested.push(path); return { file: {}, symbols: [], importers: [], imports: [], tests: [], facts: [], misses: path === wanted ? [miss] : [], lessons: [] };
+  } } as never });
+  const files = [...Array.from({ length: 30 }, (_, i) => ({ path: `src/dialog/workos-invite-dialog-sibling-${i}.tsx`, lang: 'typescript', hash: 'h', loc: 1, isTest: false })), { path: wanted, lang: 'typescript', hash: 'h', loc: 1, isTest: false }];
+  const pack = await buildChatContext('demo', 'What went wrong in workos-invite-dialog.tsx?', [], { context, codeMap: async () => ({ fingerprint: null, builtAt: 't', stats: {}, candidates: null, files, symbols: [], imports: [], outside: [] }) as never });
+  expect(requested).toContain(wanted);
+  expect(pack.context).toContain('Named file miss');
+});
+
+test('deadline response exposes judge capacity and honestly reports an unknown wait and no retained position', async () => {
+  const queue = new Admission({ concurrency: 5, timeoutMs: 1000 });
+  const result = await checkBeforeDone({ project: 'demo', task: 'edit src/app.ts', summary: 's' }, deps({ checkTimeoutMs: 10, judgeQueue: queue, embed: async () => new Promise(() => {}) }));
+  expect(result.markdown).toContain('Judge capacity: 5');
+  expect(result.markdown).toContain('Estimated wait: unknown');
+  expect(result.markdown).toContain('does not retain a queue position');
+});

@@ -928,3 +928,33 @@ test('revoke is explicit and GitHub PR author settings can be set and cleared', 
   expect(await run(['integrations', 'project', 'demo', '--github-author', 'all'], f.io)).toBe(0);
   expect(f.calls.at(-1)?.body).toEqual({ githubAuthor: null });
 });
+
+
+test('legacy cleanup --owner explicitly uses API_TOKEN and owner authorization', async () => {
+  const f = fake({ 'DELETE /api/runs/legacy': () => ({ json: { run: 'legacy', dryRun: true, remove: {}, kept: [], changed: [], entries: 0 } }) }, { FG_OPERATOR_TOKEN: OP, API_TOKEN: 'owner-api-token' });
+  expect(await run(['cleanup', '--run', 'legacy', '--owner'], f.io)).toBe(0);
+  expect(f.calls[0].headers).toMatchObject({ authorization: 'Bearer owner-api-token', origin: 'http://localhost:8787', 'x-fg-owner-cleanup': 'true' });
+  const missing = fake({});
+  expect(await run(['cleanup', '--run', 'legacy', '--owner'], missing.io)).toBe(2);
+  expect(missing.calls).toEqual([]);
+});
+
+test('Codex actual thread id is registered early using inherited run context', async () => {
+  const f = fake({ 'POST /api/sessions/real-thread/run': () => ({ status: 204 }) }, { FG_OPERATOR_TOKEN: OP, FG_RUN: 'labelled', FG_RUN_KEY: 'test-capability-adequate-diversity-1234', CODEX_THREAD_ID: 'real-thread' });
+  expect(await run(['sessions', 'register'], f.io)).toBe(0);
+  expect(f.calls[0]).toMatchObject({ body: {}, headers: { 'content-type': 'application/json', 'x-fg-run': 'labelled' } });
+});
+
+
+test('scan prints blocked runner warnings, including JSON mode stderr', async () => {
+  const warning = 'Scan queued but parked: sandbox cannot start.';
+  const routes = { 'POST /api/projects/scan': () => ({ status: 202, json: { results: [{ key: 'acme', queued: true, blocked: true, warning, job: { id: 's', status: 'queued' } }] } }) };
+  const f = fake(routes);
+  expect(await run(['scan', '--key', 'acme'], f.io)).toBe(0);
+  expect(f.text()).toContain('parked');
+  expect(f.err).toContain(`acme: ${warning}`);
+  const j = fake(routes);
+  expect(await run(['scan', '--key', 'acme', '--json'], j.io)).toBe(0);
+  expect(JSON.parse(j.text())[0].blocked).toBe(true);
+  expect(j.err).toContain(`acme: ${warning}`);
+});

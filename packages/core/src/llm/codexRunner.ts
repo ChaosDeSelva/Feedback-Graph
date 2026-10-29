@@ -17,6 +17,18 @@ import { execCommand, type Exec } from './exec.ts';
  * Node builtins only: the runner image copies this file and exec.ts, nothing else of the repo.
  */
 
+const PROCESS_NONCE = randomBytes(16).toString('hex');
+async function processStart(pid: number): Promise<string | null> {
+  try {
+    const raw = await readFile(`/proc/${pid}/stat`, 'utf8');
+    return raw.slice(raw.lastIndexOf(')') + 2).split(/\s+/)[19] ?? null;
+  } catch { return null; }
+}
+/** PID alone is not identity: container workers commonly restart as PID6. */
+export async function mirrorLeaseOwner() {
+  return { pid: process.pid, host: hostname(), nonce: PROCESS_NONCE, started: await processStart(process.pid) };
+}
+
 /** Lease metadata is beside the mirror, never exposed inside the repository mounted for a job. */
 export const mirrorLeasePath = (dir: string) => join(resolve(dir, '..'), `.${dir.split('/').at(-1)}.lease`);
 /** Sweep abandoned copies in both worker and runner; renewable leases protect live and queued mirrors. */
@@ -26,16 +38,35 @@ export async function purgeStaleRunnerMirrors(scratch: string, keep?: string, no
     const path = join(scratch, name);
     if (keep && resolve(path) === resolve(keep)) continue;
     const leasePath = mirrorLeasePath(path);
-    const lease = await readFile(leasePath, 'utf8').then(v => JSON.parse(v) as { pid: number; host: string }).catch(() => null);
+    const lease = await readFile(leasePath, 'utf8').then(v => JSON.parse(v) as { pid: number; host: string; nonce?: string; started?: string | null }).catch(() => null);
     const info = await stat(lease ? leasePath : path).catch(() => null);
     let dead = false;
     if (worker && lease?.host === hostname() && Number.isInteger(lease.pid) && lease.pid > 0) {
-      try { process.kill(lease.pid, 0); } catch (e) { dead = (e as NodeJS.ErrnoException).code === 'ESRCH'; }
+      if (lease.pid === process.pid && lease.nonce && lease.nonce !== PROCESS_NONCE) dead = true;
+      else {
+        try { process.kill(lease.pid, 0); } catch (e) { dead = (e as NodeJS.ErrnoException).code === 'ESRCH'; }
+        if (!dead && lease.started) {
+          const current = await processStart(lease.pid);
+          if (current && current !== lease.started) dead = true;
+        }
+      }
     }
     if (dead || (info && now - info.mtimeMs > 5 * 60_000)) {
       await rm(path, { recursive: true, force: true });
       await rm(leasePath, { force: true });
     }
+  }
+}
+
+/** Check the real sandbox before preparing a repository copy. No token or model call is required. */
+export async function runnerReadiness(url: string, fetchImpl: typeof fetch = fetch): Promise<{ ok: boolean; reason: string | null }> {
+  try {
+    const response = await fetchImpl(`${url.replace(/\/+$/, '')}/health`, { signal: AbortSignal.timeout(7_000) });
+    const body = await response.json() as { ok?: boolean; error?: string };
+    if (response.ok && body.ok === true) return { ok: true, reason: null };
+    return { ok: false, reason: typeof body.error === 'string' ? body.error : `codex runner readiness failed (HTTP ${response.status})` };
+  } catch (err) {
+    return { ok: false, reason: `cannot reach the codex runner at ${url}: ${err instanceof Error ? err.message : String(err)}` };
   }
 }
 

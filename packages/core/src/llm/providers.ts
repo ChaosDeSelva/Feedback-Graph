@@ -1,6 +1,6 @@
 import { PRIVATE_DIRS, SECRET_GLOBS } from '../secrets.ts';
 import { mirrorForAgent } from './mirror.ts';
-import { purgeStaleRunnerMirrors, codexArgs, runOnRunner, RunnerUnavailableError } from './codexRunner.ts';
+import { purgeStaleRunnerMirrors, runnerReadiness, codexArgs, runOnRunner, RunnerUnavailableError } from './codexRunner.ts';
 import { CliRunError, ProviderUnavailableError } from './unavailable.ts';
 import { basename } from 'node:path';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
@@ -47,6 +47,8 @@ export interface LlmProvider {
   /** True when it can read `images`; one that cannot refuses a task that has any. Absent: false. */
   vision?: boolean;
   json(task: JsonTask): Promise<unknown>;
+  /** Cheap readiness check before listing or copying a repository. */
+  ready?(): Promise<void>;
   /**
    * For providers that explore a filtered copy of the repo (codex-cli): make that copy once, so many jobs over one repo
    * (the shards of a scan) do not copy it each. A job whose cwd is a mirror this provider made and has not disposed
@@ -345,11 +347,17 @@ function codexCli(id: string, model: string | undefined, o: ProviderOpts): LlmPr
 /** Confined: the mirror goes into the scratch volume and the codex-runner sidecar runs codex on it (codexRunner.ts). */
 function codexRunnerCli(id: string, model: string | undefined, url: string, scratch: string, o: ProviderOpts): LlmProvider {
   const own = mirrors(scratch);
+  const ready = async () => {
+    const health = await runnerReadiness(url, o.fetchImpl);
+    if (!health.ok) throw new ProviderUnavailableError(health.reason ?? 'codex runner sandbox unavailable');
+  };
   return {
     id,
     agentic: true,
-    mirror: (repo) => own.make(repo),
+    ready,
+    mirror: async (repo) => { await ready(); return own.make(repo); },
     json: (t) => inTaskFolder(t, async (cwd) => {
+      await ready();
       const mirror = await own.forJob(cwd);
       try {
         const r = await runOnRunner({

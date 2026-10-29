@@ -48,6 +48,7 @@ type Call = { url: string; init: RequestInit };
 function fakeFetch(responses: (Response | Error)[]) {
   const calls: Call[] = [];
   const f = vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+    if (String(url).endsWith('/api/v1/sync-policy')) return new Response(null, { status: 404 });
     calls.push({ url: String(url), init: init ?? {} });
     const r = responses.shift() ?? Response.json(ok);
     if (r instanceof Error) throw r;
@@ -702,4 +703,26 @@ test('cloud allowlist still omits review details of safe lessons', async () => {
   const result = await syncBundle(store({ shop: data }), 'shop');
   expect(result?.lessons[0].id).toBe('lesson:1');
   expect(result?.lessons[0]).not.toHaveProperty('checks');
+});
+
+
+test('a cloud policy change resends unchanged projects without force', async () => {
+  const memory = new Map();
+  const { f, calls } = fakeFetch([]);
+  let revision = 'a'.repeat(64);
+  const fetcher: typeof fetch = async (url, init) => String(url).endsWith('/sync-policy') ? Response.json({ revision }) : f(url, init);
+  const deps = { cloud, portability: store({ shop: bundle() }), projects: async () => ['shop'], trigger: 'schedule' as const, memory, fetch: fetcher, sleep: noSleep };
+  await runCloudSync(deps);
+  expect((await runCloudSync(deps)).projects[0].status).toBe('unchanged');
+  revision = 'b'.repeat(64);
+  expect((await runCloudSync(deps)).projects[0].status).toBe('sent');
+  expect(calls).toHaveLength(2);
+});
+
+test('local-only project data never exports even under forced manual cloud sync', async () => {
+  const portability = store({ sandbox: bundle('sandbox') });
+  const { f, calls } = fakeFetch([]);
+  await runCloudSync({ cloud: { ...cloud, localOnlyProjects: ['sandbox'] }, portability, projects: async () => ['sandbox'], trigger: 'manual', force: true, fetch: f });
+  expect(portability.exportData).not.toHaveBeenCalled();
+  expect(calls).toEqual([]);
 });

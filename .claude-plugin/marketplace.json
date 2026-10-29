@@ -6,7 +6,7 @@
       "name": "feedback-graph",
       "source": "./plugin",
       "description": "Lessons from your own pushback, served to Claude Code through hooks, skills and MCP.",
-      "version": "0.6.5"
+      "version": "0.6.6"
     }
   ]
 }

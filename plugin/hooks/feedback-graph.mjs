@@ -7,7 +7,7 @@
 //   stop     Stop: once, asks the agent to run check_before_done, naming the files it edited since its last check
 //            and its session id (so the check is recorded as the session's; get_task_context gets it too)
 //            (a check counts only when it returned an answer: a denied or failed call checked nothing)
-//   session  SessionStart after /clear or a compaction: forgets what this session was shown, so it is shown again
+//   session  SessionStart registers a labelled run; after /clear or a compaction it forgets what this session was shown, so it is shown again
 // The first hook that runs in a tracked project records the commit the session started from (HEAD then), so the
 // Stop hook can ask for one diff covering staged, unstaged and committed work.
 // Every hook is silent outside a project selected in the Feedback Graph, and when the Feedback Graph is unreachable:
@@ -106,10 +106,20 @@ const handlers = {
 
   async session(input) {
     if (process.env.FG_RUN && input.session_id) {
-      const res = await fetch(`${BASE}/api/sessions/${encodeURIComponent(input.session_id)}/run`, {
-        method: 'POST', headers, signal: AbortSignal.timeout(2_000),
-      });
-      if (!res.ok) throw new Error(`Run session binding refused (${res.status})`);
+      let failure = '';
+      try {
+        const res = await fetch(`${BASE}/api/sessions/${encodeURIComponent(input.session_id)}/run`, {
+          method: 'POST', headers: { ...headers, 'content-type': 'application/json' }, body: '{}', signal: AbortSignal.timeout(2_000),
+        });
+        if (!res.ok) failure = `HTTP ${res.status}`;
+      } catch { failure = 'server unavailable or timed out'; }
+      if (failure) {
+        // Status only: server responses and exceptions can contain secrets or untrusted text.
+        const warning = `Feedback Graph run registration failed (${failure}). This session was not tagged. Check the API connection and run credentials, then start a new labelled session before testing sandbox behavior.`;
+        process.stderr.write(`${warning}\n`);
+        addContext('SessionStart', warning);
+        return;
+      }
     }
     // What was shown is forgotten; where the session started is not (its diff still runs from there), nor that the
     // owner denied check_before_done (stopHook).

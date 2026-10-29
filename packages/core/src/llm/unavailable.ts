@@ -135,6 +135,15 @@ export function withHealth(p: LlmProvider, report: (h: ProviderHealth) => void):
     agentic: p.agentic,
     vision: p.vision ?? false,
     ...(p.mirror ? { mirror: p.mirror } : {}),
+    ...(p.ready ? { ready: async () => {
+      try {
+        await p.ready!();
+        report({ provider: p.id, ok: true, reason: null, at: new Date().toISOString() });
+      } catch (err) {
+        report({ provider: p.id, ok: false, reason: providerUnavailableReason(err) ?? String(err), at: new Date().toISOString() });
+        throw err;
+      }
+    } } : {}),
     async json(t) {
       try {
         const out = await p.json(t);

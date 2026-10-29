@@ -1,3 +1,4 @@
+import { setRedactionArchive, type RedactionOriginal } from '../redactionArchive.ts';
 import { beforeAll, expect, test } from 'vitest';
 import type { Store } from '../store.ts';
 import { describeStores, type StoreProbe } from '../testing/index.ts';
@@ -13,6 +14,21 @@ describeStores('redaction of stored data under new rules', (h) => {
   beforeAll(() => {
     s = h.store;
     probe = h.probe;
+  });
+
+  test('archives original text before replacement and refuses mutation if the archive fails', async () => {
+    const original = `const AWS_SECRET_ACCESS_KEY = "${V}"`;
+    await probe.seedEmbedded({ kind: 'Fact', id: 'archive-fact', path: 'src/keys.ts', statement: original, current: true, embedding: vec });
+    const originals: RedactionOriginal[] = [];
+    setRedactionArchive(async record => { originals.push(record); throw new Error('archive unavailable'); });
+    try {
+      await expect(s.facts.redactStoredFacts!()).rejects.toThrow('archive unavailable');
+      expect((await probe.rows('Fact')).find(row => row.id === 'archive-fact')?.statement).toBe(original);
+      expect(originals[0]).toMatchObject({ kind: 'fact', id: 'archive-fact', value: { statement: original } });
+      setRedactionArchive(async record => { originals.push(record); });
+      await s.facts.redactStoredFacts!();
+      expect((await probe.rows('Fact')).find(row => row.id === 'archive-fact')?.statement).toContain('[REDACTED]');
+    } finally { setRedactionArchive(undefined); }
   });
 
   test('recovery enumerates damaged closed facts without exposing or reopening their text and paginates', async () => {
@@ -189,4 +205,14 @@ describeStores('redaction of stored data under new rules', (h) => {
     expect(await s.sessions.redactStoredSummaries!()).toBe(0);
     expect(await s.activity.redactStoredActivity!()).toBe(0);
   });
+  test('old run-cleaned Activity hashes are removed when v8 stored redaction runs', async () => {
+    const oldHash = 'ab12'.repeat(16);
+    await probe.seedStaleText({ kind: 'Activity', id: 'legacy-run-hash', subject: 'cleaned a run', why: 'owner requested', details: { openedBy: `run-key:${oldHash}` } });
+    expect(await s.activity.redactStoredActivity!()).toBe(1);
+    const entry = (await s.activity.list({ limit: 10 })).find(a => a.id === 'legacy-run-hash');
+    expect(entry?.details.openedBy).toBe('run-key:[REDACTED]');
+    expect(JSON.stringify(entry)).not.toContain(oldHash);
+    expect(await s.activity.redactStoredActivity!()).toBe(0);
+  });
+
 });

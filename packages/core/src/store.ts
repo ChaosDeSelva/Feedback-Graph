@@ -154,6 +154,8 @@ export interface GraphStore {
    * its classification. Returns how many of its comments were new.
    */
   upsertExternalThread(project: Project, t: ExternalThread): Promise<number>;
+  /** Refresh only already-stored PR metadata; never imports historical comments. */
+  refreshExternalThreadState(threadId: string, state: 'open' | 'closed' | 'merged'): Promise<void>;
   /**
    * Agent sessions of a project (stand-in sessions never) that did the work: a session counts only when it edited files
    * or ran a git commit (sessionWork(), recorded by upsertSession), so a review or a Q&A session never does. Those on

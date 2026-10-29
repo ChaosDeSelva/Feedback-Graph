@@ -172,6 +172,7 @@ const SCHEMAS: Record<string, JsonSchema> = {
   SessionDetail: loose('One session: its summary and history'),
   SettingsBody: obj({ tracked: arrayOf(str), candidates: arrayOf(loose('A project folder: key, path, exists, tracked, excluded, aliasOf, sessions')) }, ['tracked', 'candidates']),
   IntegrationsView: loose('GitHub and Linear: connection state, where the token comes from, per-project links, skip rules'),
+  LocalOnlyProjects: obj({ projects: arrayOf(str) }, ['projects']),
   CloudInfo: loose('Cloud sync: enabled, host, schedule, projects, preview counts, last result'),
   CloudSyncResult: loose('One sync: ok, error, per-project status, what was sent'),
   ExportBundle: loose('An export bundle: format, schemaVersion, lessons, facts, misses, docs, codeFiles'),
@@ -299,6 +300,7 @@ const routes = (a = appSchemas): Record<string, Partial<Record<Method, Route>>> 
 
   '/api/cloud': { GET: { tag: 'cloud', summary: 'Cloud sync: settings, preview and last run', response: 'CloudInfo' } },
   '/api/cloud/progress': { GET: { tag: 'cloud', summary: 'Sync now\'s progress', response: '{ running, lastManual }' } },
+  '/api/cloud/local-only': { PUT: { tag: 'cloud', summary: 'Keep selected project keys local; never send their new content to Cloud', body: cloudSchemas.LocalOnly, response: 'LocalOnlyProjects' } },
   '/api/cloud/sync': { POST: { tag: 'cloud', summary: 'Sync now', body: cloudSchemas.SyncRequest, response: 'CloudSyncResult' } },
 
   '/api/sessions': { GET: { tag: 'sessions', summary: 'Session summaries, newest first, paged by cursor', query: sessionSchemas.ListQuery, response: '{ sessions, next }' } },

@@ -139,7 +139,7 @@ const norm = (s: string) => s.replace(/^[+\- ]/, '').trim().replace(/\s+/g, ' ')
  */
 export function quotedCode(text: string): string[] {
   const spans = [...text.matchAll(/`([^`\n]+)`|"([^"\n]+)"|\u201c([^\u201d\n]+)\u201d/g)].map((m) => (m[1] ?? m[2] ?? m[3]).trim());
-  return [...new Set(spans.filter((x) => x.length >= MIN_QUOTE))].sort((a, b) => b.length - a.length);
+  return [...new Set(spans.filter((x) => x.length >= 3 && /[a-zA-Z0-9_$]/.test(x)))].sort((a, b) => b.length - a.length);
 }
 
 /**
@@ -163,13 +163,15 @@ function findLine(files: FileDiff[], quote: string): DiffCite | null {
   if (/^(\+\+\+|---|diff --git|index) /.test(quote)) return null;
   if (quote.startsWith('@@')) return null;
   const q = norm(quote);
-  if (q.length < MIN_QUOTE) return null;
+  if (!q || !/[a-zA-Z0-9_$]/.test(q)) return null;
+  const literal = /^(?:'[^'\n]{3,}'|"[^"\n]{3,}")$/.test(q);
+  const tokenLiteral = /^[a-zA-Z0-9_]{3,}$/.test(q) ? new RegExp(`["']${q}["']`) : null;
   // A quote with its +/- mark is that side of the change first: a removed line can read the same as an added one.
   const mark = /^[+-]/.test(quote) ? quote[0] : null;
   for (const want of mark ? [(l: string) => l[0] === mark, () => true] : [() => true]) {
     for (const f of files) {
       for (const h of f.hunks) {
-        const line = h.lines.find((l) => /^[+-]/.test(l) && want(l) && norm(l).includes(q));
+        const line = h.lines.find((l) => /^[+-]/.test(l) && want(l) && norm(l).includes(q) && (q.length >= MIN_QUOTE || literal || tokenLiteral?.test(norm(l)) || norm(l) === q));
         if (line) return { path: f.path, hunk: h.header, line };
       }
     }
@@ -293,9 +295,17 @@ async function readWorkingFile(repoPath: string, rel: string): Promise<string | 
   return buf ? buf.toString('utf8') : null;
 }
 
-/** PR numbers associated with the commit being worked on (merge and squash commit subjects). */
+/** PR identities explicitly named by the task, independent of the repository's current HEAD. */
+export function taskPrNumbers(task: string): number[] {
+  return [...new Set([...task.matchAll(/(?:github\.com\/[^\s/]+\/[^\s/]+\/pull\/|\b(?:PR|pull request)\s*#?|#)(\d+)\b/gi)]
+    .map(m => Number(m[1])).filter(n => Number.isSafeInteger(n) && n > 0))];
+}
+
+/** PR numbers associated with the task or commit being worked on (merge and squash commit subjects). */
 export async function readRepoPrNumbers(repoPath: string, task: string, o: RepoDiffOpts = {}): Promise<number[]> {
   const named = [...task.matchAll(/\b[0-9a-f]{7,40}\b/gi)].slice(0, 5).map((m) => m[0]);
+  const explicit = taskPrNumbers(task);
+  if (explicit.length && !named.length) return explicit;
   const revisions = named.length ? named : ['HEAD'];
   const messages = await Promise.all(revisions.map((rev) => run('git', [...NEUTRAL, '-C', repoPath, ...(o.gitArgs ?? []), 'log', '-1', '--format=%H%n%B', rev, '--'], {
     timeout: 2000, maxBuffer: 64_000, env: GIT_ENV,
@@ -305,7 +315,7 @@ export async function readRepoPrNumbers(repoPath: string, task: string, o: RepoD
     const sha = message.split('\n')[0];
     return /^[0-9a-f]{40,64}$/i.test(sha) ? o.associatedPulls!(sha).catch(() => []) : Promise.resolve([]);
   })) : [];
-  return [...new Set([...numbers, ...associated.flat()])];
+  return [...new Set([...explicit, ...numbers, ...associated.flat()])];
 }
 
 /** GitHub's commit association covers rebase/ordinary commits with no PR number in their subject. */

@@ -123,6 +123,7 @@ describe('search_graph', () => {
     expect(md).toContain('Checkout fact 0');
     // Each section that held items back says how many.
     expect(md).not.toContain('Checkout lesson 0');
+    expect(md).toMatch(/match 0\.\d\d\/0\.\d\d/);
     expect(md).toContain('Checkout fact 9');
     const details = d.recorded[0].details as { lessons: string[]; facts: string[]; cut?: string[] };
     // What was served is what was shown.
@@ -155,4 +156,14 @@ describe('impact on a hub file', () => {
     expect(md).toMatch(/- and \d+ more approved lessons?/);
     expect(md).toMatch(/- and \d+ more dependents?/);
   });
+});
+
+test('structural file lookup cannot reintroduce a no-miss lesson excluded by ranking', async () => {
+  const lesson = { id: 'invalid-feedback', projectKey: 'acme', origin: 'acme', title: 'Invalid feedback', rule: 'Use the old implementation.', appliesWhen: 'editing src/app.ts', paths: ['src/app.ts'], status: 'approved', checks: [{ name: 'no-miss', why: 'The disputed claim was incorrect.' }] } as Lesson;
+  const d = acme({ codegraph: { lessonsForPaths: async () => [{ lesson, paths: ['src/app.ts'] }] } as never,
+    k: { ...acme().k, searchLessons: async () => [{ lesson, score: .99 }] } });
+  expect((await getTaskContext({ cwd: '/Users/j/Vibe/acme', task: 'edit src/app.ts' }, d)).lessons).toEqual([]);
+  expect((await getTaskContext({ cwd: '/Users/j/Vibe/acme', task: 'edit src/app.ts', brief: true }, d)).lessons).toEqual([]);
+  expect((await checkBeforeDone({ cwd: '/Users/j/Vibe/acme', task: 'edit src/app.ts', summary: 'done', filesChanged: ['src/app.ts'] }, d)).gaps).toEqual([]);
+  expect(d.judged).toEqual([]);
 });

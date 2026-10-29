@@ -77,7 +77,7 @@ export async function repairV6Sources(d: Deps) {
   }
   await d.activity?.record({ kind: 'secrets_redacted', actor: 'deterministic', projectKey: null,
     subject: 'Redaction v6 source recovery scheduled',
-    why: 'File rescans and retained upload originals are queued, not restored yet. Masked facts stay closed. Exact safe retained lesson snapshots were restored; unavailable originals require re-upload, source review or a backup. Counts are suspected damage, not proof of a false positive.',
+    why: `File rescans and retained upload originals are queued, not restored yet. Masked facts stay closed. ${result.lessonsRestored ? `${result.lessonsRestored} exact safe retained lesson snapshots restored.` : 'No lesson originals were restored.'} Unavailable originals require re-upload, source review or a backup. Counts are suspected damage, not proof of a false positive.`,
     details: { version: 7, recovery: 'v6-source-repair', ...result } });
   await d.docs.setCursor(V6_REPAIR_CURSOR, 'done');
   return result;

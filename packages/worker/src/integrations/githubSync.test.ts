@@ -127,3 +127,19 @@ test('a sync stopped by its PR cap keeps what it did not read as a backlog, read
   expect(s.activity.at(-1)!.why).toMatch(/caught up/i);
   expect(s.upserts).toHaveLength(5);
 });
+
+
+test('source repair re-fetches only existing GitHub docs even when the old redaction cursor is done', async () => {
+  const s = setup();
+  s.cursors.set('redaction-rules', 'v7');
+  s.cursors.set('github:shop', '2026-10-22T11:00:00Z');
+  s.deps.docs.listDocs = async () => [{ id: 'doc:old', projectKey: 'shop', source: 'github', ref: 'github:acme/shop#1', title: 'old', url: null, addedAt: 't', addedBy: null, chunks: 1, kind: 'text', mediaType: null, read: null }];
+  s.deps.fetchPrs = async opts => opts.since === '1970-01-01T00:00:00.000Z' ? [pr(1, 'Basic concepts remain intact'), pr(2)] : [];
+  await syncGithub(s.deps);
+  expect(s.upserts.map(item => item.doc.ref)).toEqual(['github:acme/shop#1']);
+  expect(s.upserts[0].chunks.map(chunk => chunk.text).join(' ')).toContain('Basic concepts remain intact');
+  expect(s.cursors.get('github-redaction-source-repair-v8:shop')).toBe('done');
+  expect(s.activity[0].details).toMatchObject({ documentsRefetched: 1 });
+  await syncGithub(s.deps);
+  expect(s.upserts).toHaveLength(1);
+});

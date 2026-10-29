@@ -1,8 +1,8 @@
 import type { Hono } from 'hono';
 import { z } from 'zod';
 import {
-  previewCloudSync, redactSecrets, runCloudSync,
-  type ActivityStore, type CloudConfig, type CloudSyncResult, type ManualSync, type PortabilityStore, type SyncCounts, type SyncMemory,
+  previewCloudSync, redactSecrets, runCloudSync, cloudLocalOnlyProjects, CLOUD_LOCAL_ONLY_CURSOR,
+  type ActivityStore, type DocsStore, type CloudConfig, type CloudSyncResult, type ManualSync, type PortabilityStore, type SyncCounts, type SyncMemory,
   type SyncProgress, type SyncTrigger, type WorkerStatus,
 } from '@fb/core';
 
@@ -16,6 +16,7 @@ export type CloudDeps = {
   worker: () => Promise<WorkerStatus | null>;
   /** What the cloud last accepted (storedSyncMemory: the same record the worker's schedule uses). Default: in memory. */
   memory?: SyncMemory;
+  localOnlyStore?: Pick<DocsStore, 'getCursor' | 'setCursor'>;
   fetch?: typeof fetch;
 };
 
@@ -30,6 +31,9 @@ export type CloudInfo = {
   intervalMinutes: number | null;
   /** SYNC_SUGGESTIONS: lessons you have not approved are sent too (proposed ones as suggestions). */
   suggestions: boolean;
+  localOnlyProjects?: string[];
+  localOnlyEditable?: boolean;
+  savedLocalOnlyProjects?: string[];
   projects: string[];
   preview: { total: SyncCounts; projects: { key: string; counts: SyncCounts | null }[] } | null;
   previewError: string | null;
@@ -58,8 +62,9 @@ const manualOf = (r: CloudSyncResult): ManualSync => ({
 });
 
 const SyncRequest = z.object({ force: z.boolean().optional() }).strict();
+const LocalOnly = z.object({ projects: z.array(z.string().min(1).max(200)).max(2000) }).strict();
 /** For the OpenAPI document (openapi.ts). */
-export const cloudSchemas = { SyncRequest };
+export const cloudSchemas = { SyncRequest, LocalOnly };
 
 /**
  * The card and Sync now. POST /api/cloud/sync is owner-only (guarded in createApp); it sends what changed since the
@@ -79,6 +84,9 @@ export function cloudRoutes(app: Hono, d: CloudDeps): CloudState {
       host: cloud ? new URL(cloud.url).host : null,
       intervalMinutes: cloud?.intervalMinutes ?? null,
       suggestions: cloud?.suggestions ?? false,
+      localOnlyProjects: d.localOnlyStore ? await cloudLocalOnlyProjects(d.localOnlyStore, cloud?.localOnlyProjects) : cloud?.localOnlyProjects ?? [],
+      localOnlyEditable: !!d.localOnlyStore,
+      savedLocalOnlyProjects: d.localOnlyStore ? await cloudLocalOnlyProjects(d.localOnlyStore) : [],
       projects: [],
       preview: null,
       previewError: null,
@@ -87,7 +95,7 @@ export function cloudRoutes(app: Hono, d: CloudDeps): CloudState {
       neverSent: NEVER_SENT,
     };
     if (!cloud) return c.json(info);
-    info.projects = await d.projects();
+    info.projects = (await d.projects()).filter(key => !info.localOnlyProjects?.includes(key));
     try {
       info.preview = await previewCloudSync(d.portability, info.projects, { suggestions: cloud.suggestions, memory });
     } catch (err) {
@@ -104,6 +112,14 @@ export function cloudRoutes(app: Hono, d: CloudDeps): CloudState {
 
   app.get('/api/cloud/progress', (c) => c.json({ running: progress, lastManual }));
 
+  app.put('/api/cloud/local-only', async (c) => {
+    if (!d.localOnlyStore) return c.json({ error: 'local-only policy storage is unavailable' }, 503);
+    const body = LocalOnly.safeParse(await c.req.json().catch(() => null));
+    if (!body.success) return c.json({ error: body.error.flatten() }, 400);
+    await d.localOnlyStore.setCursor(CLOUD_LOCAL_ONLY_CURSOR, JSON.stringify([...new Set(body.data.projects)].sort()));
+    return c.json({ projects: await cloudLocalOnlyProjects(d.localOnlyStore, d.cloud?.localOnlyProjects) });
+  });
+
   app.post('/api/cloud/sync', async (c) => {
     const cloud = d.cloud;
     if (!cloud) return c.json({ error: 'cloud sync is off: set CLOUD_URL and CLOUD_TOKEN in .env and restart' }, 409);
@@ -112,7 +128,7 @@ export function cloudRoutes(app: Hono, d: CloudDeps): CloudState {
     if (!body.success) return c.json({ error: body.error.flatten() }, 400);
     const startedAt = new Date().toISOString();
     const run = runCloudSync({
-      cloud, portability: d.portability, activity: d.activity, projects: d.projects, trigger: 'manual', fetch: d.fetch, memory,
+      cloud: { ...cloud, localOnlyProjects: d.localOnlyStore ? await cloudLocalOnlyProjects(d.localOnlyStore, cloud.localOnlyProjects) : cloud.localOnlyProjects }, portability: d.portability, activity: d.activity, projects: d.projects, trigger: 'manual', fetch: d.fetch, memory,
       force: body.data.force ?? false,
       onProgress: (p) => { progress = { ...p, startedAt }; },
     });

@@ -187,3 +187,24 @@ test('GET /api/projects counts the files an older scanner read (the next scan yo
 function plainFacts() {
   return { listProjects: async () => [summary('alpha', 5)], requestScan: async () => ({}) as never, listFacts: async () => [], searchFacts: async () => [] };
 }
+
+
+test('single and batch scan APIs expose blocked readiness and poll status clears once healthy', async () => {
+  let healthy = false, probes = 0;
+  const scan = { id: 'scan:blocked', projectKey: 'beta', provider: 'codex-cli', status: 'queued' };
+  const app = createApp(repo, {
+    facts: { requestScan: async () => scan, scanJob: async () => scan, listProjects: async () => [] } as never,
+    projectDirs: async () => [{ key: 'beta', name: 'beta', repoPath: '/vibe/beta' }],
+    system: { worker: async () => ({ providers: { scan: 'codex-cli' } }), runner: async () => { probes++; return { ok: healthy, reason: healthy ? 'healthy' : 'sandbox cannot start' }; } } as never,
+  });
+  const single = await app.request('/api/projects/beta/scan', json('POST', {}));
+  expect(single.status).toBe(202);
+  expect(await single.json()).toMatchObject({ blocked: true, warning: expect.stringContaining('sandbox cannot start') });
+  const batch = await app.request('/api/projects/scan', json('POST', { keys: ['beta'] }));
+  expect(batch.status).toBe(202);
+  expect((await batch.json()).results[0]).toMatchObject({ queued: true, blocked: true, warning: expect.stringContaining('parked'), job: { blocked: true } });
+  expect(await (await app.request('/api/scans/scan:blocked')).json()).toMatchObject({ blocked: true });
+  healthy = true;
+  expect(await (await app.request('/api/scans/scan:blocked')).json()).not.toHaveProperty('blocked');
+  expect(probes).toBe(4);
+});

@@ -82,6 +82,7 @@ Options:
   --as <name>      the agent name Activity records (default: FG_OPERATOR_NAME, else fg)
   --run <id>       label every request with this run (x-fg-run; default: FG_RUN), so fg cleanup --run removes what it wrote;
                    on cleanup and activity it names the run, and cleanup, activity and evidence are never labelled
+  --owner          fg cleanup only: use the configured API_TOKEN to clean a legacy run (never an operator bypass)
   --sandbox        with --run: a sandbox run (x-fg-sandbox; default: FG_SANDBOX=1): what it writes is served only to its own agents
   --url <url>      the API (default: FEEDBACK_GRAPH_URL, else http://localhost:8787)
   --help           this text (fg help <command>: that command only)
@@ -99,13 +100,13 @@ Environment:
 
 type Flags = {
   json?: true; watch?: true; all?: true; only?: true; help?: true; wait?: true; force?: true; 'from-stdin'?: true; 'with-sessions'?: true;
-  sandbox?: true; apply?: true; 'dry-run'?: true; run?: string;
+  owner?: true; sandbox?: true; apply?: true; 'dry-run'?: true; run?: string;
   key?: string[]; provider?: string; status?: string; project?: string; limit?: string; reason?: string; interval?: string; as?: string; url?: string;
   until?: string; timeout?: string; kind?: string; q?: string; title?: string; note?: string; relation?: string; source?: string; relevance?: string; flag?: string; pr?: string; author?: string; 'github-author'?: string;
 };
 export type Parsed = { words: string[]; flags: Flags };
 
-const BOOLEAN = new Set(['json', 'watch', 'all', 'only', 'help', 'wait', 'force', 'from-stdin', 'with-sessions', 'sandbox', 'apply', 'dry-run']);
+const BOOLEAN = new Set(['json', 'watch', 'all', 'only', 'help', 'wait', 'force', 'from-stdin', 'with-sessions', 'sandbox', 'apply', 'dry-run', 'owner']);
 const VALUED = new Set(['key', 'provider', 'status', 'project', 'limit', 'reason', 'interval', 'as', 'url', 'until', 'timeout', 'kind', 'q', 'title', 'note', 'relation', 'source', 'relevance', 'flag', 'run', 'pr', 'author', 'github-author']);
 
 export function parse(argv: string[]): Parsed {
@@ -152,7 +153,8 @@ const UNLABELLED = new Set(['cleanup', 'activity', 'evidence']);
 
 function client(io: CliIO, flags: Flags, labels = true) {
   const base = (flags.url ?? io.env.FEEDBACK_GRAPH_URL ?? 'http://localhost:8787').replace(/\/+$/, '');
-  const token = io.env.FG_OPERATOR_TOKEN?.trim() || io.env.API_TOKEN?.trim() || '';
+  if (flags.owner && !io.env.API_TOKEN?.trim()) throw new UsageError('--owner requires the configured API_TOKEN; FG_OPERATOR_TOKEN cannot authorize legacy-run cleanup');
+  const token = flags.owner ? io.env.API_TOKEN!.trim() : io.env.FG_OPERATOR_TOKEN?.trim() || io.env.API_TOKEN?.trim() || '';
   const name = flags.as ?? io.env.FG_OPERATOR_NAME ?? 'fg';
   if (token) {
     let u: URL;
@@ -168,7 +170,7 @@ function client(io: CliIO, flags: Flags, labels = true) {
   const sandbox = labels && (!!flags.sandbox || io.env.FG_SANDBOX?.trim() === '1');
   if (sandbox && !runId) throw new UsageError('--sandbox needs --run <id> (or FG_RUN): a sandbox run is cleaned up by its id');
   const runHeaders: Record<string, string> = runId ? { 'x-fg-run': runId, ...(sandbox && { 'x-fg-sandbox': '1' }) } : {};
-  const authHeaders = (): Record<string, string> => ({ 'x-fg-operator': name, ...runHeaders, ...(io.env.FG_RUN_KEY?.trim() && { 'x-fg-run-key': io.env.FG_RUN_KEY.trim() }), ...(token && { authorization: `Bearer ${token}` }) });
+  const authHeaders = (): Record<string, string> => ({ 'x-fg-operator': name, ...(flags.owner ? { origin: new URL(base).origin, 'x-fg-owner-cleanup': 'true' } : {}), ...runHeaders, ...(io.env.FG_RUN_KEY?.trim() && { 'x-fg-run-key': io.env.FG_RUN_KEY.trim() }), ...(token && { authorization: `Bearer ${token}` }) });
   /** A server-sent event stream; null when the API has none there (an older version) or cannot be reached. */
   const events = async (path: string): Promise<{ events: AsyncGenerator<SseEvent>; close(): void } | null> => {
     const ctl = new AbortController();
@@ -561,20 +563,21 @@ async function projects(api: Api, io: CliIO, verb: string | undefined, f: Flags)
   return 0;
 }
 
-type ScanResult = { key: string; queued: boolean; job?: { id: string; status: string }; error?: string };
+type ScanResult = { key: string; queued: boolean; blocked?: boolean; warning?: string; job?: { id: string; status: string }; error?: string };
 
 async function scan(api: Api, io: CliIO, f: Flags): Promise<number> {
   if (!f.all && !f.key?.length) throw new UsageError('fg scan needs --all or --key k1,k2');
   const body = { ...(f.all ? { all: true } : { keys: f.key }), ...(f.provider && { provider: f.provider }) };
   const { results } = await api<{ results: ScanResult[] }>('POST', '/api/projects/scan', body);
+  for (const result of results) if (result.warning) io.err(`${result.key}: ${result.warning}`);
   if (f.wait) return waitForScans(api, io, f, results);
   if (f.json) io.out(JSON.stringify(results, null, 2));
-  else io.out(results.length ? table(['PROJECT', 'RESULT'], results.map((r) => [r.key, r.queued ? `queued (${r.job?.id ?? ''})` : r.error])) : 'nothing to scan: no selected folders');
+  else io.out(results.length ? table(['PROJECT', 'RESULT'], results.map((r) => [r.key, r.queued ? `${r.blocked ? 'parked' : 'queued'} (${r.job?.id ?? ''})${r.warning ? `: ${r.warning}` : ''}` : r.error])) : 'nothing to scan: no selected folders');
   return results.every((r) => r.queued) ? 0 : 1;
 }
 
 type ScanJobView = {
-  id: string; projectKey: string; status: string; filesScanned?: number; factsAdded?: number; error?: string | null; queuePosition?: number | null;
+  id: string; projectKey: string; status: string; filesScanned?: number; factsAdded?: number; error?: string | null; queuePosition?: number | null; blocked?: boolean; warning?: string;
   /** An agentic scan's shards: done (so far, while it runs) of total. */
   shards?: { total: number; done?: number; rescanned: number; failed: number } | null;
 };
@@ -588,7 +591,7 @@ function progressLine(j: ScanJobView): string {
   const where = j.status === 'queued' && j.queuePosition ? ` (${ordinal(j.queuePosition)} in the queue)` : '';
   const shards = j.shards?.total ? `, shard ${j.shards.done ?? j.shards.rescanned} of ${j.shards.total}` : '';
   const facts = j.status === 'running' ? `, ${plural(j.factsAdded ?? 0, 'fact')} so far` : '';
-  return `${j.projectKey}: ${j.status}${where}${shards}${facts}`;
+  return `${j.projectKey}: ${j.blocked ? 'parked' : j.status}${where}${shards}${facts}${j.warning ? ` — ${j.warning}` : ''}`;
 }
 
 /** Poll GET /api/scans/:id for each queued job until all are done or failed, or --timeout runs out. */
@@ -725,6 +728,7 @@ async function lessons(api: Api, io: CliIO, words: string[], f: Flags): Promise<
   const { results } = await api<{ results: { id: string; ok: boolean; status?: string; error?: string }[] }>('POST', '/api/lessons/decisions', { items });
   if (f.json) io.out(JSON.stringify(results, null, 2));
   else io.out(table(['ID', 'RESULT'], results.map((r) => [r.id, r.ok ? r.status : r.error])));
+  if (!f.json && verb === 'approve' && results.some(r => r.ok)) io.out('Approval does not trigger cloud sync. Eligible projects share on the next scheduled sync, or use fg cloud sync-now.');
   return results.every((r) => r.ok) ? 0 : 1;
 }
 
@@ -874,7 +878,7 @@ async function activityCmd(api: Api, io: CliIO, f: Flags): Promise<number> {
 
 /** fg cleanup --run <id>: what the run wrote, removed with --apply (DELETE /api/runs/:id); a dry run otherwise. */
 async function cleanupCmd(api: Api, io: CliIO, f: Flags): Promise<number> {
-  if (!f.run) throw new UsageError('fg cleanup --run <id> [--apply]');
+  if (!f.run) throw new UsageError('fg cleanup --run <id> [--apply] [--owner]');
   if (f.apply && f['dry-run']) throw new UsageError('--apply and --dry-run: choose one');
   const r = await api<any>('DELETE', `/api/runs/${encodeURIComponent(f.run)}`, { dryRun: !f.apply });
   if (f.json) { io.out(JSON.stringify(r, null, 2)); return 0; }
@@ -919,7 +923,16 @@ async function evidenceCmd(api: Api, io: CliIO, words: string[], f: Flags): Prom
   return 0;
 }
 
-async function sessionsCmd(api: Api, io: CliIO, f: Flags): Promise<number> {
+async function sessionsCmd(api: Api, io: CliIO, words: string[], f: Flags): Promise<number> {
+  if (words[0] === 'register') {
+    const id = words[1] ?? io.env.CODEX_THREAD_ID;
+    if (!id || !/^[\w.:-]{1,200}$/.test(id)) throw new UsageError('fg sessions register [session-id]: pass the actual id or launch inside a Codex shell with CODEX_THREAD_ID');
+    if (!(f.run ?? io.env.FG_RUN)) throw new UsageError('session registration requires --run or FG_RUN');
+    await api('POST', `/api/sessions/${encodeURIComponent(id)}/run`, {});
+    io.out(f.json ? JSON.stringify({ id, registered: true }) : `registered session ${id} for this run`);
+    return 0;
+  }
+  if (words.length) throw new UsageError('fg sessions [register [session-id]]');
   const r = await api<{ sessions: any[]; next: string | null }>('GET', `/api/sessions${qs({ project: f.project, limit: f.limit })}`);
   if (f.json) { io.out(JSON.stringify(r, null, 2)); return 0; }
   io.out(r.sessions.length
@@ -1009,6 +1022,7 @@ export async function run(argv: string[], raw: CliIO): Promise<number> {
   if (words[0] === 'help') { io.out(helpFor(words[1])); return 0; }
   if (flags.help || !words.length) { io.out(words.length ? helpFor(words[0]) : USAGE); return 0; }
   try {
+    if (flags.owner && words[0] !== 'cleanup') throw new UsageError('--owner is only supported for cleanup');
     const api = client(io, flags, !UNLABELLED.has(words[0]));
     switch (words[0]) {
       case 'status': return await status(api, io, flags);
@@ -1017,7 +1031,7 @@ export async function run(argv: string[], raw: CliIO): Promise<number> {
       case 'facts': return await factsCmd(api, io, words.slice(1), flags);
       case 'docs': return await docs(api, io, words.slice(1), flags);
       case 'activity': return await activityCmd(api, io, flags);
-      case 'sessions': return await sessionsCmd(api, io, flags);
+      case 'sessions': return await sessionsCmd(api, io, words.slice(1), flags);
       case 'evidence': return await evidenceCmd(api, io, words.slice(1), flags);
       case 'cleanup': return await cleanupCmd(api, io, flags);
       case 'integrations': return await integrationsCmd(api, io, words.slice(1), flags);

@@ -52,6 +52,9 @@ export type CloudInfo = {
   intervalMinutes: number | null;
   /** SYNC_SUGGESTIONS: lessons you have not approved are sent too (proposed ones as suggestions). Older APIs leave it out. */
   suggestions?: boolean;
+  localOnlyProjects?: string[];
+  localOnlyEditable?: boolean;
+  savedLocalOnlyProjects?: string[];
   projects: string[];
   preview: { total: SyncCounts; projects: { key: string; counts: SyncCounts | null }[] } | null;
   previewError: string | null;
@@ -203,7 +206,7 @@ export const api = {
   pinProject: (key: string, pinned: boolean) => request(`/api/projects/${enc(key)}/pin`, { method: 'PUT', body: { pinned } }),
   setFactRelevance: (key: string, id: string, relevance: number) =>
     request(`/api/projects/${enc(key)}/facts/${enc(id)}/relevance`, { method: 'PATCH', body: { relevance } }),
-  scan: (key: string, provider?: string) => request<ScanJob>(`/api/projects/${enc(key)}/scan`, { method: 'POST', body: provider ? { provider } : {} }),
+  scan: (key: string, provider?: string) => request<ScanJob & { blocked?: boolean; warning?: string }>(`/api/projects/${enc(key)}/scan`, { method: 'POST', body: provider ? { provider } : {} }),
   deleteProject: (key: string) => request(`/api/projects/${enc(key)}`, { method: 'DELETE', body: { confirm: key }, retry: false }),
   exportUrl: (key?: string) => `/api/export${qs({ project: key })}`,
   importBundle: (bundle: unknown, keepApproved: boolean) => request<ImportResult>(`/api/import${qs({ keepApproved: keepApproved ? '1' : undefined })}`, { method: 'POST', body: bundle, retry: false }),
@@ -240,6 +243,7 @@ export const api = {
   cleanupUnselected: () => request<{ removed: string[]; nodesRemoved: number }>('/api/settings/cleanup', { method: 'POST', body: { confirm: CLEANUP_CONFIRM }, retry: false }),
 
   cloud: () => request<CloudInfo>('/api/cloud'),
+  cloudLocalOnly: (projects: string[]) => request<{ projects: string[] }>('/api/cloud/local-only', { method: 'PUT', body: JSON.stringify({ projects }) }),
   syncCloud: () => request<CloudSyncResult>('/api/cloud/sync', { method: 'POST', body: {}, retry: false }),
 
   /** A failed reading, queued again (no re-upload): after DOCS_LLM changed to a model with vision, say. */

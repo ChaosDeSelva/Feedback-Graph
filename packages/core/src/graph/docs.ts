@@ -1,3 +1,4 @@
+import { archiveBeforeRedaction, archiveRedactionInput } from '../redactionArchive.ts';
 import neo4j from 'neo4j-driver';
 import { REDACT_PAGE, redactDeep, redactSecrets } from '../redact.ts';
 import type { DocsStore } from '../store.ts';
@@ -77,6 +78,7 @@ export class DocsRepo implements DocsStore {
     // Docs come from outside (uploads, PRs, tickets): redact here so no caller can skip it.
     const doc = { ...input, title: redactSecrets(input.title), ref: redactSecrets(input.ref) };
     const chunks = raw.map((c) => ({ ...c, text: redactSecrets(c.text) }));
+    await archiveRedactionInput('document', `${input.projectKey}:${input.source}:${input.ref}`, { doc: input, chunks: raw }, { doc, chunks });
     const id = docIdOf(doc, o.run);
     this.g.sandbox.wrote(o.run);
     // A run replaces only its own document (runWriteOwner); the owner's write makes a run's document the owner's.
@@ -149,6 +151,7 @@ export class DocsRepo implements DocsStore {
     this.g.sandbox.wrote(cur.get('sandbox') === true);
     // Model output about a document someone gave you: redact at the door, like code facts.
     const facts = redactDeep(r.facts).map((f) => ({ ...f, relevance: relevanceOf(f) }));
+    await archiveRedactionInput('document-reading', id, { facts: r.facts, chunks: r.chunks }, { facts: redactDeep(r.facts), chunks: r.chunks?.map(c => ({ ...c, text: redactSecrets(c.text) })) });
     const chunks = r.chunks?.map((c) => ({ ...c, text: redactSecrets(c.text) })) ?? null;
     const now = new Date().toISOString();
     const version = r.version ?? cur.get('v');
@@ -330,6 +333,7 @@ export class DocsRepo implements DocsStore {
         after = rows[rows.length - 1].get('id');
         const page = rows.flatMap((r) => { const was: string = r.get('text') ?? ''; const text = redactSecrets(was); return text === was ? [] : [{ id: r.get('id') as string, text }]; });
         if (!page.length) continue;
+        for (const r of rows) if (page.some(c => c.id === r.get('id'))) await archiveBeforeRedaction(label.toLowerCase(), String(r.get('id')), { [prop]: r.get('text') ?? '' });
         await this.g.run(`UNWIND $page AS c MATCH (x:${label} {id: c.id}) SET x.${prop} = c.text`, { page });
         changed += page.length;
       }

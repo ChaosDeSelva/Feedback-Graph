@@ -48,7 +48,7 @@ export type WithdrawnItem = { kind: 'lesson' | 'miss' | 'doc'; id: string } | { 
 export type SyncBundle = ExportBundle & { complete: boolean; withdrawn: WithdrawnItem[]; codeFilesPartial?: boolean };
 
 /** What the cloud last accepted for a project: enough to name what has since gone, and to skip an unchanged bundle. */
-export type SentRecord = { fingerprint: string; remote: string | null; lessons: string[]; misses: string[]; docs: string[]; files: string[] };
+export type SentRecord = { policyRevision?: string; fingerprint: string; remote: string | null; lessons: string[]; misses: string[]; docs: string[]; files: string[] };
 
 /**
  * What the cloud last accepted, per project key. A Map works (tests, a one-off run); the services use
@@ -566,14 +566,29 @@ export async function runCloudSync(d: {
   waiting?: (key: string) => string | null;
   onProgress?: (p: SyncProgress) => void;
 }): Promise<CloudSyncResult> {
+  const localOnly = new Set(d.cloud.localOnlyProjects ?? []);
+  const keys = [...new Set(await d.projects())].filter(key => !localOnly.has(key));
+  d.onProgress?.({ done: 0, total: keys.length, current: keys[0] ?? null });
+  // Older clouds do not expose policy revisions. Never send the token to a refused URL or a redirect.
+  let policyRevision: string | undefined;
+  if (!cloudUrlProblem(d.cloud.url)) {
+    try {
+      const response = await (d.fetch ?? fetch)(`${d.cloud.url.replace(/\/+$/, '')}/api/v1/sync-policy`, {
+        headers: { authorization: `Bearer ${d.cloud.token}` }, redirect: 'error', signal: AbortSignal.timeout(10_000),
+      });
+      if (response.ok) {
+        const policy = await response.json() as { revision?: unknown };
+        if (typeof policy.revision === 'string' && /^[a-f0-9]{64}$/.test(policy.revision)) policyRevision = policy.revision;
+      }
+    } catch { /* Compatibility with older/offline clouds; normal sync reports connectivity errors. */ }
+  }
   const host = new URL(d.cloud.url).host;
   const sent = zero();
   const results: ProjectSyncResult[] = [];
   let error: string | null = null;
   let stopped = false;
-  const keys = [...new Set(await d.projects())];
   for (const [i, key] of keys.entries()) {
-    d.onProgress?.({ done: i, total: keys.length, current: key });
+    if (i > 0) d.onProgress?.({ done: i, total: keys.length, current: key });
     if (stopped) {
       results.push({ key, status: 'not sent', counts: null });
       continue;
@@ -592,14 +607,14 @@ export async function runCloudSync(d: {
     const bundle = stored ?? tombstone(key, previous!);
     const counts = bundleCounts(bundle);
     const print = fingerprint(bundle);
-    if (!d.force && previous?.fingerprint === print && !bundle.withdrawn.length) {
+    if (!d.force && previous?.fingerprint === print && (!policyRevision || previous.policyRevision === policyRevision) && !bundle.withdrawn.length) {
       results.push({ key, status: 'unchanged', counts });
       continue;
     }
     try {
       const { r, trimmed } = await pushFitting(bundle, (b) => pushBundle({ cloud: d.cloud, bundle: b, fetch: d.fetch, sleep: d.sleep, baseDelayMs: d.baseDelayMs }));
       // The whole bundle's fingerprint even when its code map was cut: an unchanged project is not cut and resent each run.
-      if (stored) await d.memory?.set(key, record(key, bundle, print));
+      if (stored) await d.memory?.set(key, { ...record(key, bundle, print), ...(policyRevision ? { policyRevision } : {}) });
       else await d.memory?.delete(key);
       const went = trimmed ? { ...counts, codeFiles: trimmed.codeFiles.sent } : counts;
       for (const k of Object.keys(sent) as (keyof SyncCounts)[]) sent[k] += went[k];
@@ -687,4 +702,14 @@ const DAY_MS = 86_400_000;
 export function nextSyncDelayMs(intervalMinutes: number, failures: number): number {
   const base = intervalMinutes * 60_000;
   return Math.min(DAY_MS, base * 2 ** Math.min(failures, 20));
+}
+
+/** Shared durable local privacy policy, used by API and worker before export. Malformed storage fails closed. */
+export const CLOUD_LOCAL_ONLY_CURSOR = 'cloud-local-only-projects';
+export async function cloudLocalOnlyProjects(docs: Pick<DocsStore, 'getCursor'>, configured: string[] = []): Promise<string[]> {
+  const raw = await docs.getCursor(CLOUD_LOCAL_ONLY_CURSOR);
+  if (raw === null) return configured;
+  const saved: unknown = JSON.parse(raw);
+  if (!Array.isArray(saved) || saved.some(key => typeof key !== 'string')) throw new Error('invalid local-only cloud policy; repair it in Settings before syncing');
+  return [...new Set([...configured, ...saved])];
 }

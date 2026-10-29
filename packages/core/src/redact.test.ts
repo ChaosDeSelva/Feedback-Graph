@@ -551,3 +551,26 @@ test.each([
 ])('provider-labelled prose credentials are redacted: %s', value => {
   expect(redactSecrets(value)).toContain('[REDACTED]');
 });
+
+
+test.each([
+  'file:12:3:E501: line too long', 'xapp-application-event-handler', 'whsec_webhook_identifier_name',
+  'pypi-package-distribution-identifier', 'AccountKey=<replace-with-your-account-key>',
+  'credential hash is SHA-256', 'credential hash is bcrypt-12', 'credential hash is AES-256',
+])('0.6.6 preserves reported benign wording: %s', text => expect(redactSecrets(text)).toBe(text));
+
+test.each([
+  'twilio auth ' + 'ab12'.repeat(8),
+  "define('DB_PASSWORD', 'StrongPassword123!');",
+  'Server=db;User Id=sa;Password=StrongPassword123!;Database=app;',
+  'user:$2b$12$' + 'a'.repeat(53),
+  '-----BEGIN PGP PRIVATE KEY BLOCK-----\nYWJjZGVmMTIz\n-----END PGP PRIVATE KEY BLOCK-----',
+  'PuTTY-User-Key-File-3: ssh-ed25519\nEncryption: none\nPrivate-Lines: 1\nYWJjZGVmMTIz\nPrivate-MAC: ' + 'ab12'.repeat(8),
+  'bot token: ' + 'aB1'.repeat(8) + '.Ab12cd.' + 'aB12'.repeat(8),
+  'mailgun key-' + 'ab12'.repeat(8),
+])('0.6.6 removes reported credential form: %s', text => expect(redactSecrets(text)).not.toBe(text));
+
+
+test('Azure credential placeholders stay placeholders in structured config too', () => {
+  expect(redactDeep({ AccountKey: '<replace-with-your-account-key>' })).toEqual({ AccountKey: '<replace-with-your-account-key>' });
+});

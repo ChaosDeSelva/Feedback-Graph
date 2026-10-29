@@ -109,6 +109,12 @@ const TOUCHES: ReadonlySet<ActivityKind> = new Set(['feedback_decided', 'lesson_
 const SERVED: ReadonlySet<ActivityKind> = new Set(['context_served', 'predone_check', 'run_cleaned']);
 /** Entries made by a request (asActor records how it arrived), not the worker's own processing. */
 const byRequest = (a: Activity) => typeof a.details?.via === 'string';
+/** The server stamps transport principal; display names and model/provider actors are not authentication. */
+const ownRequestEntry = (a: Activity, owner: RunOwner | null): boolean => {
+  if (!byRequest(a)) return true;
+  const via = owner?.principal === 'operator' ? 'operator' : owner?.principal === 'browser' ? 'browser' : owner ? 'api' : null;
+  return via !== null && a.details?.via === via;
+};
 /** How many of a run's Activity entries a plan reads at most. */
 const RUN_ENTRIES = 5000;
 
@@ -166,7 +172,7 @@ export async function planCleanup(run: string, d: RunsDeps): Promise<{ plan: Omi
   const owner = await d.store.owner(run);
   const previewEntries = entries.filter(a => !TOUCHES.has(a.kind)
     && !a.targets.some(t => keptIds.includes(t))
-    && (!byRequest(a) || (owner?.principal === 'operator' && a.actor === currentActor())));
+    && ownRequestEntry(a, owner));
   const order = (k: RunItemKind) => RUN_ITEM_KINDS.indexOf(k);
   return {
     plan: {
@@ -240,7 +246,7 @@ export function runRoutes(app: Hono, d: RunsDeps) {
     // erases the trace of a change it cannot undo.
     // Only the entries the plan read, so every change removed is one listed below (a run with more than RUN_ENTRIES keeps
     // the rest for the next cleanup); and never an entry about a record that stays (the one that created it included).
-    const entriesRemoved = activity.removeRun ? await activity.removeRun(run.data, [...TOUCHES], { ids: entries.filter((a) => !byRequest(a) || (owner?.principal === 'operator' && a.actor === currentActor())).map((a) => a.id), targets: keptIds }) : 0;
+    const entriesRemoved = activity.removeRun ? await activity.removeRun(run.data, [...TOUCHES], { ids: entries.filter(a => ownRequestEntry(a, owner)).map((a) => a.id), targets: keptIds }) : 0;
     await activity.record({
       // Not tagged with a run (null, not the asking request's): the entry is about the run, not made in it.
       kind: 'run_cleaned', actor: 'you', projectKey: null, run: null,

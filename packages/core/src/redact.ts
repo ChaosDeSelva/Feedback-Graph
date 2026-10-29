@@ -10,7 +10,7 @@
  * 5: an instruction in an upload is one addressed to the reader-as-AI, not a project convention (facts v4 closed as
  * instructions are reopened); the head of a token an older Activity subject cut at its cap is redacted.
  */
-export const REDACTION_VERSION = 7;
+export const REDACTION_VERSION = 8;
 /** Rows a store reads per page when it redacts stored text again under new rules. */
 export const REDACT_PAGE = 1000;
 
@@ -33,14 +33,14 @@ const NAME_START = String.raw`(?<![\w$.-])[\w$.-]*?`;
  * os.environ[...], sha256 and the like stay). Ends at a space, the end of the line or a closing quote or full stop.
  * looksLikeSecret then decides.
  */
-const UNQUOTED_SECRET = String.raw`(?![$<{%/~.\-!&*])(?!(?:sha|md|utf|base|bcrypt|argon|aes|rsa)\d)(?=[^\s"'\x60“”,;()<>{}\[\]]*[0-9!@#%^&*])[^\s"'\x60“”,;()<>{}\[\]]{5,}[^\s"'\x60“”,;()<>{}\[\].!?:](?=["'”]?(?:$|\s|[.,;:!?)](?:\s|$)))`;
+const UNQUOTED_SECRET = String.raw`(?![$<{%/~.\-!&*])(?!(?:sha|md|utf|base|bcrypt|argon|aes|rsa)[-_]?\d)(?=[^\s"'\x60“”,;()<>{}\[\]]*[0-9!@#%^&*])[^\s"'\x60“”,;()<>{}\[\]]{5,}[^\s"'\x60“”,;()<>{}\[\].!?:](?=["'”]?(?:$|\s|[.,;:!?)](?:\s|$)))`;
 
 /** snake_case, kebab-case, dotted or namespaced identifiers: user_id2, refresh_token_v2, item.id2, session:v3:user_id. */
 const IDENT = /^[A-Za-z]+\d*(?:[_.:-][A-Za-z]+\d*)+$/;
 /** camelCase and PascalCase identifiers: authToken2, tenantId42, JwtV2 (one capitalised word such as Summer2026 is not). */
 const CAMEL = /^(?:[a-z]+|[A-Z][a-z]+)(?:[A-Z][a-z]*\d*)+$/;
 /** Algorithm, encoding and format names: sha256, argon2id, base64url, ed25519, x509, oauth2, v2. */
-const ALGO = /^(?:sha|md|utf|base|bcrypt|argon|aes|rsa|hs|rs|es|ps|ed|x|oauth|http|ipv|u?int|float|crc|blake|scrypt|pbkdf|jwt|v)\d+[a-z]*$/i;
+const ALGO = /^(?:sha|md|utf|base|bcrypt|argon|aes|rsa|hs|rs|es|ps|ed|x|oauth|http|ipv|u?int|float|crc|blake|scrypt|pbkdf|jwt|v)[-_]?\d+[a-z]*$/i;
 const URL_START = /^[a-z][a-z0-9+.-]*:\/\//i;
 const SECRET_WORD = /secret|token|password|passwd|key|auth|credential/i;
 /** Values that name a type or stand in for a secret rather than hold one. */
@@ -90,9 +90,13 @@ function assignedSecret(v: string): boolean {
 const TOKEN_PATTERNS: RegExp[] = [
   /\b(run-key:)[a-f0-9]{64}\b/gi,
   /(\bAWS[ \t]+secret(?:[ \t]+access)?[ \t]+key(?:[ \t]+(?:is|was)[ \t]+|[ \t]*[:=][ \t]*|[ \t]+)["']?)[A-Za-z0-9/+]{40}={0,2}(?=$|[\s"',.;])/gi,
-  /(\bTwilio[ \t]+(?:auth(?:entication)?[ \t]+)?(?:token|secret)(?:[ \t]+(?:is|was)[ \t]+|[ \t]*[:=][ \t]*|[ \t]+)["']?)[a-f0-9]{32}\b/gi,
-  /\b(?:gsk_|pypi-|whsec_|lin_oauth_|GOCSPX-|xapp-)[A-Za-z0-9_-]{16,}/g,
-  /\b(AccountKey\s*=\s*)[^;\s"']{16,}/gi,
+  /(\bTwilio[ \t]+(?:auth(?:entication)?(?:[ \t]+(?:token|secret))?|token|secret)(?:[ \t]+(?:is|was)[ \t]+|[ \t]*[:=][ \t]*|[ \t]+)["']?)[a-f0-9]{32}\b/gi,
+  /\b(AccountKey\s*=\s*)(?![<${])[^;\s"']{16,}/gi,
+  /-----BEGIN PGP PRIVATE KEY BLOCK-----[\s\S]*?-----END PGP PRIVATE KEY BLOCK-----/g,
+  /PuTTY-User-Key-File-[23]:[\s\S]*?Private-MAC:\s*[a-f0-9]+/gi,
+  /\bkey-[a-f0-9]{32}\b/gi,
+  /\b(?:mfa\.[A-Za-z0-9_-]{40,}|[A-Za-z0-9_-]{23,28}\.[A-Za-z0-9_-]{6}\.[A-Za-z0-9_-]{27,})\b/g,
+  /\$(?:2[aby]\$\d{2}\$[./A-Za-z0-9]{53}|apr1\$[./A-Za-z0-9]{1,8}\$[./A-Za-z0-9]{22}|[156]\$[^\s:]+)|\{SHA\}[A-Za-z0-9+/]{27}=/g,
   /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g,
   /\bsk-(?:proj-|ant-[a-z0-9]+-)?[A-Za-z0-9_-]{20,}/g,
   /\b[sr]k_(?:live|test)_[A-Za-z0-9]{16,}/g,
@@ -131,6 +135,8 @@ const TOKEN_PATTERNS: RegExp[] = [
  * a <v> group (the value), and a check the value must pass; text the check refuses is left exactly as it was.
  */
 const CONTEXT_RULES: { re: RegExp; check: (v: string) => boolean }[] = [
+  { re: /(?<keep>\bdefine\(\s*["'][^"']*(?:PASSWORD|PASSWD|SECRET|TOKEN|API_KEY)["']\s*,\s*["'])(?<v>[^"'\r\n]+)(?=["']\s*\))/gi, check: assignedSecret },
+  { re: /(?<keep>;[ \t]*(?:Password|Pwd)\s*=\s*)(?<v>[^;\r\n]+)(?=;|$)/gi, check: assignedSecret },
   // Env-style assignments whose name ends in a secret word: KEY=value, export KEY="value". A $VAR reference, a call
   // (os.environ.get(...)) or a value that is a URL or names a secret is not a secret.
   {
@@ -174,13 +180,14 @@ export function encodedCredential(value: string): boolean {
 }
 
 function replaceTokens(text: string): string {
-  let out = text.replace(/\b(Basic[ \t]+)([A-Za-z0-9+/]+={0,2})(?=$|[\s"',;])/gi,
+  let out = text.replace(/\b(?:gsk_|pypi-|whsec_|lin_oauth_|GOCSPX-|xapp-)([A-Za-z0-9_-]{16,})/g, (all, value: string) => namedSecret(value) ? '[REDACTED]' : all);
+  out = out.replace(/\b(Basic[ \t]+)([A-Za-z0-9+/]+={0,2})(?=$|[\s"',;])/gi,
     (all, keep: string, value: string) => encodedCredential(value) ? `${keep}[REDACTED]` : all);
   out = out.replace(/("auth"\s*:\s*")([^"\r\n]+)(")/gi,
     (all, keep: string, value: string, end: string) => encodedCredential(value) ? `${keep}[REDACTED]${end}` : all);
   // pgpass has five non-whitespace fields. Compiler file:line:column: error diagnostics are not credentials.
   out = out.replace(/^((?:[^:\s\\]|\\.)+:(?:\d+|\*):(?:[^:\s\\]|\\.)+:(?:[^:\s\\]|\\.)+:)([^\r\n]+)$/gm,
-    (all, keep: string) => /:\d+:(?:error|warning|note|fatal(?: error)?):$/i.test(keep)
+    (all, keep: string) => /:\d+:(?:error|warning|note|fatal(?: error)?|[A-Z]\d+):$/i.test(keep)
       ? all : `${keep}[REDACTED]`);
   return TOKEN_PATTERNS.reduce((value, re) => value.replace(re, (_m, keep?: string) =>
     typeof keep === 'string' ? `${keep}[REDACTED]` : '[REDACTED]'), out);
@@ -377,7 +384,7 @@ export function redactDeep<T>(v: T): T {
   if (v && typeof v === 'object') {
     // A key that names a secret means its value is one, whatever it looks like. A paging or sync token
     // (nextPageToken, continuationToken) names a place in a list, not a credential: its value goes through the rules.
-    return Object.fromEntries(Object.entries(v).map(([k, x]) => [k, (SECRET_KEY.test(k) || /^account[_-]?key$/i.test(k) || (/^auth$/i.test(k) && typeof x === 'string' && encodedCredential(x))) && !CURSOR_KEY.test(k) && typeof x === 'string' && x ? '[REDACTED]' : redactDeep(x)])) as T;
+    return Object.fromEntries(Object.entries(v).map(([k, x]) => [k, (SECRET_KEY.test(k) || (/^account[_-]?key$/i.test(k) && !(typeof x === 'string' && /^(?:<[^>]+>|\$\{[^}]+\}|\{\{[^}]+\}\})$/.test(x))) || (/^auth$/i.test(k) && typeof x === 'string' && encodedCredential(x))) && !CURSOR_KEY.test(k) && typeof x === 'string' && x ? '[REDACTED]' : redactDeep(x)])) as T;
   }
   return v;
 }

@@ -24,6 +24,9 @@ export type ScanRunnerDeps = {
   run(job: ScanJob, turn: ScanTurn): Promise<boolean>;
   /** SCAN_CONCURRENCY. */
   concurrency: number;
+  /** A failed probe parks this provider with exponential backoff; no scan or mirror starts. */
+  ready?(job: ScanJob): Promise<void>;
+  now?(): number;
   log?: (msg: string, extra?: object) => void;
 };
 
@@ -52,6 +55,7 @@ export class ScanRunner {
   private refill = false;
   private stopped = false;
   /** Jobs already found to have files, so a job waiting for a slot is not listed again on every fill. */
+  private readonly blocked = new Map<string, { until: number; failures: number }>();
   private readonly hasFiles = new Set<string>();
   /**
    * Jobs that gave way (waiting() said true), with whether they held the agentic slot: passed over while any other job
@@ -116,6 +120,26 @@ export class ScanRunner {
           continue;
         }
         this.hasFiles.add(job.id);
+      }
+      if (this.d.ready) {
+        const key = job.provider ?? '';
+        const blocked = this.blocked.get(key);
+        const now = this.d.now?.() ?? Date.now();
+        if (blocked && now < blocked.until) {
+          passedOver.push(job.id);
+          if (passedOver.length >= MAX_PASSED_OVER) return;
+          continue;
+        }
+        try { await this.d.ready(job); this.blocked.delete(key); }
+        catch (err) {
+          const failures = (blocked?.failures ?? 0) + 1;
+          const delay = Math.min(30 * 60_000, 120_000 * 2 ** Math.min(failures - 1, 4));
+          this.blocked.set(key, { until: now + delay, failures });
+          this.d.log?.('scan provider parked; readiness will be checked without copying repositories', { provider: key, retryAt: new Date(now + delay).toISOString(), error: String(err) });
+          passedOver.push(job.id);
+          if (passedOver.length >= MAX_PASSED_OVER) return;
+          continue;
+        }
       }
       const agentic = this.d.agentic(job);
       const full = this.active.size >= Math.max(1, this.d.concurrency);

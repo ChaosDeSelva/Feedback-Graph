@@ -1,3 +1,4 @@
+import { archiveBeforeRedaction, archiveRedactionInput } from '@fb/core';
 import { randomUUID } from 'node:crypto';
 import { docIdOf, runWriteOwner, REDACT_PAGE, redactDeep, redactSecrets, relevanceOf, scanRetryAt, SCAN_UNAVAILABLE_WAIT_MS } from '@fb/core';
 import type { DocHit, DocInput, DocLink, DocListOpts, DocSummary, DocsStore, DocToRead, EmbeddedFact, TaskImage, UpsertDocOpts } from '@fb/core';
@@ -17,6 +18,7 @@ export class PgDocsStore implements DocsStore {
     // Docs come from outside (uploads, PRs, tickets): redact here so no caller can skip it.
     const doc = { ...input, title: redactSecrets(input.title), ref: redactSecrets(input.ref) };
     const chunks = raw.map((c) => ({ ...c, text: redactSecrets(c.text) }));
+    await archiveRedactionInput('document', `${input.projectKey}:${input.source}:${input.ref}`, { doc: input, chunks: raw }, { doc, chunks });
     const id = docIdOf(doc, o.run);
     sandboxPresence(this.db).wrote(o.run);
     await tx(this.db, async (c) => {
@@ -103,6 +105,7 @@ export class PgDocsStore implements DocsStore {
   async saveDocReading(id: string, r: { version?: string; chunks?: { text: string; embedding: number[] }[]; facts: EmbeddedFact[]; source: string }): Promise<boolean> {
     // Model output about a document someone gave you: redact at the door, like code facts.
     const facts = redactDeep(r.facts);
+    await archiveRedactionInput('document-reading', id, { facts: r.facts, chunks: r.chunks }, { facts: redactDeep(r.facts), chunks: r.chunks?.map(c => ({ ...c, text: redactSecrets(c.text) })) });
     const now = new Date();
     return tx(this.db, async (c: pg.PoolClient) => {
       // Locked, so a re-upload either lands before (and the version no longer matches) or waits until this is saved.
@@ -235,6 +238,7 @@ export class PgDocsStore implements DocsStore {
         after = rows[rows.length - 1].id;
         const page = rows.flatMap((r: { id: string; text: string }) => { const text = redactSecrets(r.text); return text === r.text ? [] : [{ id: r.id, text }]; });
         if (!page.length) continue;
+        for (const r of rows) if (page.some(c => c.id === r.id)) await archiveBeforeRedaction(table === 'chunks' ? 'chunk' : 'doc', r.id, { [column]: r.text });
         await this.db.pool.query(
           `UPDATE ${table} x SET ${column} = c.text FROM unnest($1::text[], $2::text[]) AS c(id, text) WHERE x.id = c.id`,
           [page.map((c) => c.id), page.map((c) => c.text)],

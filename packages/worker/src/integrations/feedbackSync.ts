@@ -23,7 +23,7 @@ export type SyncProject = Project & { remote: string | null };
 export type FeedbackSyncDeps = {
   integrations: Pick<Integrations, 'credential' | 'sync' | 'saveSync' | 'link'>;
   /** pendingExternalItems and skipPendingItem: the pending Inbox items a skip rule matches after a backfill are skipped (unset: not looked at). */
-  graph: Pick<GraphStore, 'upsertExternalThread' | 'workSessions'> & Partial<Pick<GraphStore, 'pendingExternalItems' | 'skipPendingItem'>>;
+  graph: Pick<GraphStore, 'upsertExternalThread' | 'workSessions'> & Partial<Pick<GraphStore, 'pendingExternalItems' | 'skipPendingItem' | 'refreshExternalThreadState'>>;
   cursors: Pick<DocsStore, 'getCursor' | 'setCursor'>;
   /** The tracked (and not excluded) projects, with their canonical remotes. */
   projects(): Promise<SyncProject[]>;
@@ -267,6 +267,19 @@ async function syncKind(kind: IntegrationKind, cred: Credential, projects: SyncP
     const floorMs = (since && !backfill ? Date.parse(since) : started.getTime()) - lookback;
     const fetchSince = since && !backfill ? since : new Date(started.getTime() - lookback).toISOString();
     try {
+      // PR state was not retained before 0.6.6. Walk old PR metadata once, without importing old feedback.
+      const stateKey = `feedback-github-pr-state-v1:${p.key}`;
+      const stateProgress = kind === 'github' ? await d.cursors.getCursor(stateKey) : 'done';
+      if (kind === 'github' && stateProgress !== 'done' && d.graph.refreshExternalThreadState) {
+        let cappedAt: string | null = null;
+        const history = await d.fetchPrs({ repo: target, token: cred.token, since: '1970-01-01T00:00:00.000Z',
+          ...(stateProgress ? { until: stateProgress } : {}), onCap: at => { cappedAt = at; }, ...(link.githubAuthor ? { author: link.githubAuthor } : {}) });
+        for (const pr of history) {
+          if (link.githubAuthor && pr.author.toLowerCase() !== link.githubAuthor.toLowerCase()) continue;
+          await d.graph.refreshExternalThreadState(`github:${pr.repo}#${pr.number}`, pr.state);
+        }
+        await d.cursors.setCursor(stateKey, cappedAt ?? 'done');
+      }
       const r = kind === 'github' ? await syncRepo(p, target, cred.token, fetchSince, floorMs, d, link.githubAuthor ?? undefined) : await syncTeam(p, target, link.linearTeamName ?? target, cred.token, fetchSince, floorMs, d, since);
       await d.cursors.setCursor(cursorKey, started.toISOString());
       // Only a backfill (or a first sync, which fetches everything with author details) marks them known.

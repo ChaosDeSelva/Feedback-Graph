@@ -1,3 +1,4 @@
+import { archiveBeforeRedaction, archiveRedactionInput } from '../redactionArchive.ts';
 import { reviewPatterns } from '../reviewFilters.ts';
 import { createHash, randomUUID } from 'node:crypto';
 import neo4j from 'neo4j-driver';
@@ -75,6 +76,8 @@ export type LessonPatch = Partial<Pick<Lesson, 'title' | 'rule' | 'appliesWhen' 
 export type LessonHit = { lesson: Lesson; score: number };
 
 export type RelatedMiss = {
+  /** Task-local ordering weight; score remains raw embedding similarity. */
+  rankingScore?: number;
   missId: string;
   missed: string;
   cause: Cause;
@@ -199,7 +202,8 @@ export class KnowledgeRepo implements KnowledgeStore {
   }
 
   async savePostmortem(feedbackId: string, raw: PostMortem, embeddings: { miss: number[]; lesson: number[] }) {
-    const pm = redactDeep(raw); // model output can quote secrets it read in the repo
+    const pm = redactDeep(raw);
+    await archiveRedactionInput('postmortem', feedbackId, raw, pm); // model output can quote secrets it read in the repo
     const now = new Date().toISOString();
     // A disputed claim that the post-mortem finds false is not a training miss.
     if (pm.noMiss) {
@@ -443,6 +447,7 @@ export class KnowledgeRepo implements KnowledgeStore {
   }
 
   async backfillProposedAs(id: string, draft: LessonDraft): Promise<boolean> {
+    await archiveRedactionInput('lesson-draft', id, draftOf(draft), redactDeep(draftOf(draft)));
     const [r] = await this.g.run(
       `MATCH (l:Lesson {id: $id}) WHERE l.source = 'postmortem' AND l.proposedAs IS NULL SET l.proposedAs = $draft RETURN count(l) AS n`,
       { id, draft: JSON.stringify(redactDeep(draftOf(draft))) },
@@ -455,6 +460,7 @@ export class KnowledgeRepo implements KnowledgeStore {
     if (!Object.values(fields).some((v) => v !== undefined)) return null;
     const [r] = await this.g.run('MATCH (l:Lesson {id: $id}) RETURN l', { id });
     const draft = r ? editedDraft(lessonOf(r.get('l').properties), fields) : null;
+    if (draft) await archiveRedactionInput('lesson-draft', id, draft, redactDeep(draft));
     return draft ? JSON.stringify(redactDeep(draft)) : null;
   }
 
@@ -637,6 +643,7 @@ export class KnowledgeRepo implements KnowledgeStore {
         return [{ id: r.get('id') as string, title: x.title, rule: x.rule, appliesWhen: x.appliesWhen, checks: x.checks === null ? null : JSON.stringify(x.checks) }];
       });
       if (!page.length) continue;
+      for (const r of rows) if (page.some(c => c.id === r.get('id'))) await archiveBeforeRedaction('lesson', String(r.get('id')), Object.fromEntries(['status', 'title', 'rule', 'appliesWhen', 'checks'].map(k => [k, r.get(k) ?? null])));
       await this.g.run('UNWIND $page AS c MATCH (l:Lesson {id: c.id}) SET l.title = c.title, l.rule = c.rule, l.appliesWhen = c.appliesWhen, l.checks = c.checks', { page });
     }
     return { redacted, flagged };
@@ -754,6 +761,7 @@ export class KnowledgeRepo implements KnowledgeStore {
 
   async upsertLesson(input: LessonInput) {
     const l = redactDeep(input);
+    await archiveRedactionInput('lesson', input.id, input, l);
     const now = new Date().toISOString();
     this.g.sandbox.wrote(input.run);
     await this.g.run(

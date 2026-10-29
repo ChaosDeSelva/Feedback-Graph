@@ -4,7 +4,7 @@ import type { Root } from './projects.ts';
 import { DEFAULT_NUM_CTX, DEFAULT_NUM_PREDICT, DEFAULT_OLLAMA_TIMEOUT_MS, DEFAULT_REPEAT_PENALTY } from './ollama.ts';
 
 /** Bumped with each release; reported by /api/status and the worker heartbeat. */
-export const VERSION = '0.6.5';
+export const VERSION = '0.6.6';
 
 export class ConfigError extends Error {
   readonly problems: string[];
@@ -159,6 +159,8 @@ export type CloudConfig = {
    * false (the default): only approved lessons leave, plus the new status of any lesson the cloud already has.
    */
   suggestions: boolean;
+  /** Explicit privacy boundary: these project keys never export new content to cloud. */
+  localOnlyProjects?: string[];
 };
 
 /** fgc_pat_<16 hex lookup id>_<43 base64url chars>: what the cloud issues. */
@@ -341,7 +343,7 @@ export function loadConfig(env: Env): Config {
     const machine = env.CLOUD_MACHINE?.trim() || null;
     if (machine && !/^[\w.-]{1,64}$/.test(machine)) problems.push('CLOUD_MACHINE must be 1 to 64 letters, digits, dots, dashes or underscores');
     if (problems.length === before) {
-      cloud = { url: cloudUrl.replace(/\/+$/, ''), token: cloudToken, intervalMinutes: interval, projects: list(env.SYNC_PROJECTS), suggestions: syncSuggestions === 'true', machine };
+      cloud = { url: cloudUrl.replace(/\/+$/, ''), token: cloudToken, intervalMinutes: interval, projects: list(env.SYNC_PROJECTS), ...(env.CLOUD_LOCAL_ONLY_PROJECTS?.trim() ? { localOnlyProjects: list(env.CLOUD_LOCAL_ONLY_PROJECTS) } : {}), suggestions: syncSuggestions === 'true', machine };
     }
   } else {
     if (syncSuggestions === 'true') problems.push('SYNC_SUGGESTIONS needs CLOUD_URL and CLOUD_TOKEN');

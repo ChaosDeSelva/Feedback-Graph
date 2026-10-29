@@ -1,3 +1,6 @@
+import { setRedactionArchive } from '@fb/core';
+import { encryptedRedactionArchive } from './redactionArchive.ts';
+import { cloudLocalOnlyProjects } from '@fb/core';
 import { lstat, readdir, readFile, writeFile } from 'node:fs/promises';
 import { basename, dirname, join } from 'node:path';
 import {
@@ -177,7 +180,7 @@ async function main() {
 
   // The owner picks the folders to read (Settings). Until a choice is made, INGEST_PROJECTS seeds it, or nothing does.
   const seeded = await selection.ensure(config, activity);
-  log('project selection', { tracked: seeded.selection.tracked, initialized: seeded.selection.initialized, seededNow: seeded.seeded, excluded: config.excludeProjects });
+  log('project selection', { tracked: seeded.selection.tracked, initialized: seeded.selection.initialized, seededNow: seeded.seeded, excluded: [...config.excludeProjects, ...await cloudLocalOnlyProjects(store.docs, config.cloud?.localOnlyProjects)] });
   if (!seeded.seeded && config.ingestProjects.length && config.ingestProjects.join(',') !== seeded.selection.tracked.join(',')) {
     log('INGEST_PROJECTS only seeds a selection not made yet; the projects read are the ones chosen in Settings', { ingestProjects: config.ingestProjects });
   }
@@ -538,6 +541,16 @@ async function main() {
   const scanRunner = new ScanRunner({
     next: (exclude) => facts.nextScanJob(new Date(), exclude),
     agentic: (job) => AGENTIC_SPEC.test(job.provider || defaultScan),
+    ready: async (job) => {
+      const llm = tracked('scan', provider('scan readiness', job.provider || defaultScan));
+      if (!llm?.ready) return;
+      try { await llm.ready(); }
+      catch (err) {
+        const error = `scan parked: ${providerUnavailableReason(err) ?? String(err)}; checking readiness with backoff before copying the repository`;
+        if (job.error !== error) await facts.updateScanJob(job.id, { error });
+        throw err;
+      }
+    },
     empty: async (job) => !(await hasCodeFiles(job.repoPath)),
     run: scanJob,
     concurrency: config.scanConcurrency,
@@ -627,7 +640,7 @@ async function main() {
             waiting,
             portability: store.portability,
             activity,
-            projects: async () => syncProjects({ configured: cloud.projects, selected: scope.projects, excluded: config.excludeProjects }),
+            projects: async () => syncProjects({ configured: cloud.projects, selected: scope.projects, excluded: [...config.excludeProjects, ...await cloudLocalOnlyProjects(store.docs, config.cloud?.localOnlyProjects)] }),
             trigger: 'schedule',
             memory: memory ?? undefined,
           }),
@@ -715,6 +728,8 @@ async function main() {
   // Changed redaction rules run once over the facts, documents, lessons, misses, Inbox items, session summaries, Ask and
   // Activity stored under older ones, before any of it is served again; the counts are in Activity. A failure is
   // logged and tried again at the next start.
+  const redactionArchive = await encryptedRedactionArchive(process.env.REDACTION_ARCHIVE_DIR ?? join(dirname(config.stateDb), 'settings', 'redaction-archive'));
+  setRedactionArchive(redactionArchive.save);
   await redactStoredOnRuleChange({ cursors: docs, facts, docs, knowledge, graph: repo, sessions: store.sessions, chats: store.chats, activity, log, repair: { facts, docs, knowledge, projects: selectedFolders, activity } })
     .catch((err) => log('redaction over stored data failed', { error: redactSecrets(String(err)) }));
   await chatRunner.start();

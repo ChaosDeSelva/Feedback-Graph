@@ -328,3 +328,9 @@ test('STORE=postgres with the bundled service and an empty POSTGRES_PASSWORD is 
   // Your own server may authenticate another way: no password is not an error there.
   expect(loadConfig({ PROJECT_ROOTS: '/vibe', HOST_PROJECT_ROOTS: '/h', STORE: 'postgres', DATABASE_URL: 'postgres://fg@db.internal:5432/feedback' }).postgres).not.toBeNull();
 });
+
+
+test('CLOUD_LOCAL_ONLY_PROJECTS keeps chosen projects local without deselecting them', () => {
+  const c = loadConfig({ ...base, CLOUD_URL: 'https://cloud.example.com', CLOUD_TOKEN: TOKEN, CLOUD_LOCAL_ONLY_PROJECTS: ' sandbox, private ' });
+  expect(c.cloud?.localOnlyProjects).toEqual(['sandbox', 'private']);
+});

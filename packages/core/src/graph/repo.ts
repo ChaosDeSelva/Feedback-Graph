@@ -559,6 +559,19 @@ export class GraphRepo implements GraphStore {
     return r?.get('n') ?? 0;
   }
 
+  async refreshExternalThreadState(threadId: string, state: 'open' | 'closed' | 'merged'): Promise<void> {
+    const rows = await this.run('MATCH (:Session {id: $id})-[:HAS_TURN]->(t:Turn) WHERE t.external IS NOT NULL RETURN t.uuid AS uuid, t.external AS external', { id: threadId });
+    const items = rows.flatMap(r => {
+      try {
+        const external = JSON.parse(String(r.get('external')));
+        return external.threadState === state ? [] : [{ uuid: String(r.get('uuid')), external: JSON.stringify({ ...external, threadState: state }) }];
+      } catch { return []; }
+    });
+    if (!items.length) return;
+    await this.run(`UNWIND $items AS i MATCH (t:Turn {uuid: i.uuid}) SET t.external = i.external
+      WITH t CALL (t) { MATCH (l:Lesson)-[:DERIVED_FROM]->(:Miss)-[:EXPLAINS]->(:Feedback)-[:FROM_TURN]->(t) SET l.checksVersion = 0 } RETURN count(t)`, { items });
+  }
+
   async upsertExternalThread(project: Project, t: ExternalThread): Promise<number> {
     if (!t.items.length) return 0;
     const items = redactDeep(t.items).map((i) => ({ ...i, external: JSON.stringify(i.external) }));

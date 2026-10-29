@@ -1,3 +1,4 @@
+import { archiveBeforeRedaction, archiveRedactionInput } from '@fb/core';
 import { reviewPatterns } from '@fb/core';
 import { randomUUID } from 'node:crypto';
 import {
@@ -146,7 +147,8 @@ export class PgKnowledgeStore implements KnowledgeStore {
   }
 
   async savePostmortem(feedbackId: string, raw: PostMortem, embeddings: { miss: number[]; lesson: number[] }): Promise<void> {
-    const pm = redactDeep(raw); // model output can quote secrets it read in the repo
+    const pm = redactDeep(raw);
+    await archiveRedactionInput('postmortem', feedbackId, raw, pm); // model output can quote secrets it read in the repo
     const now = new Date();
     await tx(this.db, async (c) => {
       // The report's run (RunTag), carried to the miss and lesson so a sandbox one is served only to its run.
@@ -314,6 +316,7 @@ export class PgKnowledgeStore implements KnowledgeStore {
   }
 
   async backfillProposedAs(id: string, draft: LessonDraft): Promise<boolean> {
+    await archiveRedactionInput('lesson-draft', id, draftOf(draft), redactDeep(draftOf(draft)));
     const { rowCount } = await this.q(
       `UPDATE lessons SET proposed_as = $2 WHERE id = $1 AND source = 'postmortem' AND proposed_as IS NULL`,
       [id, toJson(redactDeep(draftOf(draft)))],
@@ -405,6 +408,7 @@ export class PgKnowledgeStore implements KnowledgeStore {
       if (Object.values(fields).some((v) => v !== undefined)) {
         const cur = await c.query('SELECT * FROM lessons WHERE id = $1 FOR UPDATE', [id]);
         const draft = cur.rows[0] ? editedDraft(lessonOf(cur.rows[0]), fields) : null;
+        if (draft) await archiveRedactionInput('lesson-draft', id, draft, redactDeep(draft));
         if (draft) await c.query('UPDATE lessons SET proposed_as = $2 WHERE id = $1 AND proposed_as IS NULL', [id, toJson(redactDeep(draft))]);
       }
       const { rows } = await c.query(
@@ -626,6 +630,7 @@ export class PgKnowledgeStore implements KnowledgeStore {
         return [{ id: r.id, title: x.title, rule: x.rule, applies_when: x.appliesWhen, checks: x.checks }];
       });
       if (!page.length) continue;
+      for (const r of rows) if (page.some(c => c.id === r.id)) await archiveBeforeRedaction('lesson', r.id, r);
       await this.q(
         `UPDATE lessons x SET title = c.title, rule = c.rule, applies_when = c.applies_when, checks = c.checks
          FROM jsonb_to_recordset($1::jsonb) AS c(id text, title text, rule text, applies_when text, checks jsonb) WHERE x.id = c.id`,
@@ -740,6 +745,7 @@ export class PgKnowledgeStore implements KnowledgeStore {
 
   async upsertLesson(input: LessonInput): Promise<void> {
     const l = redactDeep(input);
+    await archiveRedactionInput('lesson', input.id, input, l);
     const now = new Date();
     sandboxPresence(this.db).wrote(input.run);
     await tx(this.db, async (c) => {

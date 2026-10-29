@@ -8,3 +8,7 @@ Tiny multi-tenant shop API (Node 26, no framework, `node --test`).
 - **Pagination:** list endpoints paginate server-side with `paginate(rows, req.query)` (default 20, max 50). Never return an unbounded list.
 - **Errors:** respond with `{ error: { code, message } }` via `sendError`, never a bare string.
 - Every route gets a test in `test/` that covers a cross-tenant request.
+
+## Isolated lesson probe
+
+- `src/probes/no-console.ts` must not call `console.log`. The demo seed provides the approved, file-tied lesson for this probe.

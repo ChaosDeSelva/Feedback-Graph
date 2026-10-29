@@ -6,7 +6,7 @@ import { runKey } from './operator.ts';
 import type { CloudDeps } from './cloud.ts';
 
 const OP = 'o'.repeat(32);
-const KEY = 'admin-run-capability-'.padEnd(40, 'a');
+const KEY = 'c2ad856fb97403e18a2e7dc9015b6f438670dcaeb3219a845f0d7c8b6e109234';
 const API = 'a'.repeat(32);
 const DEFAULT_ALLOW = OPERATOR_VERBS.filter((v) => v !== 'lesson_decide');
 
@@ -415,4 +415,11 @@ test('rebuild_code_map queues a remap', async () => {
   const r = await tool(s.app, 'rebuild_code_map', { project: 'demo-shop' });
   expect(JSON.parse(r.text)).toEqual({ queued: true });
   expect(s.calls.rebuild).toEqual(['demo-shop']);
+});
+
+
+test('inbox_list without a status preserves the API all-status default', async () => {
+  const s = setup();
+  await tool(s.app, 'inbox_list', {});
+  expect(s.calls.listCandidates[0]).not.toHaveProperty('status', 'pending');
 });

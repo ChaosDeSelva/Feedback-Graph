@@ -7,3 +7,5 @@ coverage
 backups/
 .claude/
 docker-compose.override.yml
+
+docker-compose.runner-procfs.yml

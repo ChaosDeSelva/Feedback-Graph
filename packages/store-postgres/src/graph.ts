@@ -492,6 +492,16 @@ export class PgGraphStore implements GraphStore {
     return rowCount ?? 0;
   }
 
+  async refreshExternalThreadState(threadId: string, state: 'open' | 'closed' | 'merged'): Promise<void> {
+    await this.q(`WITH changed AS (
+      UPDATE turns SET external = external || jsonb_build_object('threadState', $2::text)
+      WHERE session_id = $1 AND external IS NOT NULL AND external->>'threadState' IS DISTINCT FROM $2
+      RETURNING uuid
+    ) UPDATE lessons SET checks_version = 0 WHERE miss_id IN (
+      SELECT m.id FROM misses m JOIN feedback f ON f.id = m.feedback_id JOIN changed c ON c.uuid = f.turn_uuid
+    )`, [threadId, state]);
+  }
+
   async upsertExternalThread(project: Project, t: ExternalThread): Promise<number> {
     if (!t.items.length) return 0;
     const items = redactDeep(lastOf(t.items, (i) => i.uuid));

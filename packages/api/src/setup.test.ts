@@ -567,3 +567,43 @@ test('a first run in a terminal offers to choose the projects to read from the f
   // Not asked again on a re-run: the selection may already be made, in Settings.
   expect(later.run({}, 'n\nn\n')).not.toMatch(/Which of these projects/);
 });
+
+test('--yes alone never opts in to relaxed runner system paths', () => {
+  const s = sandbox();
+  s.run({}, undefined, ['--yes', '--projects', '~/code']);
+  expect(existsSync(join(s.repo, 'docker-compose.runner-procfs.yml'))).toBe(false);
+  expect(s.value('COMPOSE_FILE')).toBeUndefined();
+});
+
+test('explicit procfs opt-in generates only a separate runner override and preserves existing Compose files', () => {
+  const s = sandbox();
+  const out = s.run({ COMPOSE_FILE: 'docker-compose.yml:custom.yml:docker-compose.override.yml' }, undefined,
+    ['--runner-procfs-compat', '--yes', '--projects', '~/code']);
+  const compatibility = readFileSync(join(s.repo, 'docker-compose.runner-procfs.yml'), 'utf8');
+  expect(compatibility).toContain('  codex-runner:');
+  expect(compatibility).toContain('systempaths=unconfined');
+  expect(compatibility).not.toContain('privileged');
+  expect(compatibility).not.toContain('cap_add');
+  expect(readFileSync(s.override, 'utf8')).not.toContain('systempaths');
+  expect(s.value('COMPOSE_FILE')).toBe('docker-compose.yml:custom.yml:docker-compose.override.yml:docker-compose.runner-procfs.yml');
+  expect(out.indexOf('removes an outer Docker filesystem defense')).toBeLessThan(out.indexOf('Saved runner procfs opt-in'));
+  s.run({}, undefined, ['--runner-procfs-compat', '--yes']);
+  expect(s.value('COMPOSE_FILE')?.split(':').filter(f => f === 'docker-compose.runner-procfs.yml')).toHaveLength(1);
+});
+
+test('explicit procfs flag without confirmation leaves Docker protections unchanged', () => {
+  const s = sandbox();
+  const out = s.run({ PROJECTS_DIRS: '~/code' }, undefined, ['--runner-procfs-compat']);
+  expect(out).toContain('Runner procfs compatibility was not enabled.');
+  expect(existsSync(join(s.repo, 'docker-compose.runner-procfs.yml'))).toBe(false);
+  expect(s.value('COMPOSE_FILE')).toBeUndefined();
+});
+
+test('procfs opt-in refuses to overwrite an owner-authored override', () => {
+  const s = sandbox();
+  const file = join(s.repo, 'docker-compose.runner-procfs.yml');
+  writeFileSync(file, '# owner settings\nservices: {}\n');
+  expect(s.runFailing({ PROJECTS_DIRS: '~/code' }, ['--runner-procfs-compat', '--yes'])).toContain('refusing to overwrite');
+  expect(readFileSync(file, 'utf8')).toBe('# owner settings\nservices: {}\n');
+  expect(s.value('COMPOSE_FILE')).toBeUndefined();
+});

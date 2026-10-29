@@ -222,3 +222,22 @@ describe.each([
     expect(gaveWay).toBe(1);
   });
 });
+
+
+test('an unavailable provider is parked with exponential readiness backoff while unrelated scans proceed', async () => {
+  let now = 0, probes = 0, healthy = false;
+  const f = fakes([job('blocked', 'codex-cli'), job('other', 'ollama:local')], {
+    now: () => now,
+    ready: async j => { if (j.provider === 'codex-cli') { probes++; if (!healthy) throw new Error('sandbox unavailable'); } },
+  });
+  const runner = new ScanRunner(f.deps);
+  runner.kick(); await f.settle(); await f.settle();
+  expect(f.started).toEqual(['other']); expect(probes).toBe(1);
+  await f.release('other');
+  now = 119_999; runner.kick(); await runner.idle(); expect(probes).toBe(1);
+  now = 120_000; runner.kick(); await runner.idle(); expect(probes).toBe(2);
+  now = 359_999; runner.kick(); await runner.idle(); expect(probes).toBe(2);
+  healthy = true; now = 360_000; runner.kick(); await f.settle(); await f.settle();
+  expect(probes).toBe(3); expect(f.started).toEqual(['other', 'blocked']);
+  await f.release('blocked'); await runner.idle();
+});

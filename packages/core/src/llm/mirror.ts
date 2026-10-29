@@ -1,11 +1,11 @@
 import { execFile } from 'node:child_process';
 import { constants } from 'node:fs';
 import { copyFile, lstat, mkdir, mkdtemp, readdir, rm, writeFile, utimes } from 'node:fs/promises';
-import { hostname, tmpdir } from 'node:os';
+import { tmpdir } from 'node:os';
 import { dirname, join, relative } from 'node:path';
 import { promisify } from 'node:util';
 import { GIT_SAFE, gitSafeEnv } from '../git.ts';
-import { mirrorLeasePath, purgeStaleRunnerMirrors } from './codexRunner.ts';
+import { mirrorLeaseOwner, mirrorLeasePath, purgeStaleRunnerMirrors } from './codexRunner.ts';
 import { isSecretPath, SKIP_DIRS } from '../secrets.ts';
 
 const run = promisify(execFile);
@@ -47,7 +47,7 @@ export async function mirrorForAgent(repo: string, parent: string = tmpdir()): P
   await purgeStaleRunnerMirrors(parent, undefined, Date.now(), true);
   const dir = await mkdtemp(join(parent, 'fb-mirror-'));
   const lease = mirrorLeasePath(dir);
-  await writeFile(lease, JSON.stringify({ pid: process.pid, host: hostname() }), { mode: 0o600 });
+  await writeFile(lease, JSON.stringify(await mirrorLeaseOwner()), { mode: 0o600 });
   const heartbeat = setInterval(() => { const now = new Date(); void utimes(lease, now, now).catch(() => {}); }, 10_000);
   heartbeat.unref();
   const dispose = async () => { clearInterval(heartbeat); await rm(dir, { recursive: true, force: true }); await rm(lease, { force: true }); };

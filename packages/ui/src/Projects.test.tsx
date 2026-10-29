@@ -18,8 +18,10 @@ const fact = (id: string, statement: string, kind = 'convention', relevance: num
 
 let calls: { url: string; body?: unknown }[];
 let projectList: unknown[];
+let scanWarning: string | undefined;
 beforeEach(() => {
   calls = [];
+  scanWarning = undefined;
   projectList = projects;
   vi.stubGlobal('fetch', vi.fn(async (url: string, init?: RequestInit) => {
     calls.push({ url, body: init?.body ? JSON.parse(init.body as string) : undefined });
@@ -31,7 +33,7 @@ beforeEach(() => {
     if (url === '/api/projects/demo-shop/docs' && init?.method === 'POST') return Response.json({ id: 'doc:demo-shop:upload:spec.md', chunks: 2 }, { status: 201 });
     if (url === '/api/projects/demo-shop/docs') return Response.json([{ id: 'doc:demo-shop:github:github:me/shop#3', projectKey: 'demo-shop', source: 'github', ref: 'github:me/shop#3', title: 'me/shop#3: Orders', url: 'https://github.com/me/shop/pull/3', addedAt: 't', chunks: 4 }]);
     if (url.startsWith('/api/docs/') && init?.method === 'DELETE') return new Response(null, { status: 204 });
-    if (url.endsWith('/scan')) return Response.json(job('queued'), { status: 202 });
+    if (url.endsWith('/scan')) return Response.json({ ...job('queued'), ...(scanWarning ? { blocked: true, warning: scanWarning } : {}) }, { status: 202 });
     if (url.startsWith('/api/projects/demo-shop/codemap/module')) return Response.json({ file: { path: 'src/db.ts', lang: 'typescript', hash: 'h', loc: 10, isTest: false, churn: null }, symbols: [], importers: [], imports: [], tests: [], facts: [], misses: [], lessons: [] });
     if (url.startsWith('/api/projects/demo-shop/codemap/hotspots')) return Response.json({ meta: { fingerprint: 'x', builtAt: '2026-10-22T12:00:00Z', stats: { files: 40, symbols: 200, imports: 90, tests: 12 } }, hotspots: [{ path: 'src/routes/orders.ts', churn: 5, misses: 1, dependents: 2, score: 8.17 }] });
     return Response.json([]);
@@ -569,4 +571,13 @@ test('only the panes scroll: nothing hidden or floating on the Projects page is 
   const floating = [...document.querySelectorAll('.sr-only, .absolute')];
   expect(floating.length).toBeGreaterThan(0);
   expect(floating.filter(escapesItsPane).map((e) => e.outerHTML.slice(0, 120))).toEqual([]);
+});
+
+
+test('Scan displays a parked-runner warning instead of silently accepting the queue', async () => {
+  scanWarning = 'Scan queued but parked: sandbox cannot start. No repository will be copied until runner readiness succeeds.';
+  render(<Projects />);
+  const button = await screen.findByRole('button', { name: /^Scan$/ });
+  fireEvent.click(button);
+  expect(await screen.findByText(scanWarning)).toBeTruthy();
 });

@@ -293,3 +293,17 @@ describe('GitHub commit associations', () => {
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 });
+
+test('short literal evidence and complete meaningful changed lines are retained, not punctuation fragments', () => {
+  const files = splitDiff('diff --git a/schema.ts b/schema.ts\n--- a/schema.ts\n+++ b/schema.ts\n@@ -1 +1,2 @@\n-key = old;\n+KeyPrefix = "005";\n+x=1\n');
+  expect(citeDiff(files, '"005"')?.line).toBe('+KeyPrefix = "005";');
+  expect(citeDiff(files, '005')?.line).toBe('+KeyPrefix = "005";');
+  expect(citeDiff(files, '+x=1')?.line).toBe('+x=1');
+  expect(citeDiff(files, '+=1')).toBe(null);
+  expect(citeDiff(files, '+}')).toBe(null);
+});
+
+test('an explicit task PR is independent of an unrelated HEAD and works without a repository', async () => {
+  expect(await readRepoPrNumbers('/not/a/repository', 'review PR #14194')).toEqual([14194]);
+  expect(await readRepoPrNumbers('/not/a/repository', 'review https://github.com/acme/repo/pull/14194')).toEqual([14194]);
+});

@@ -3,7 +3,7 @@ import { join } from 'node:path';
 import type { Context, Hono } from 'hono';
 import { z } from 'zod';
 import {
-  ChatBusyError, chatTitle, CHAT_PROVIDERS, cleanLessonPath, codeTerms, findInCodeMap, isSecretPath, MAX_CHAT_TEXT, MAX_CHAT_TITLE, NotTheRunsError, redactSecrets,
+  ChatBusyError, chatTitle, CHAT_PROVIDERS, cleanLessonPath, codeTerms, findInCodeMap, mentionedPaths, isSecretPath, MAX_CHAT_TEXT, MAX_CHAT_TITLE, NotTheRunsError, redactSecrets,
   type ChatPack, type ChatSource, type ChatStore, type ChatTurn, type CodeGraphStore, type CodeMapHit, type ShownProjects,
 } from '@fb/core';
 import { getTaskContext, resolveProject, type ContextDeps, type TaskContext } from './context.ts';
@@ -108,7 +108,10 @@ export async function buildChatContext(projectKey: string, question: string, his
   let searchFailed: string | null = null;
   const map = d.codeMap ? await d.codeMap(projectKey).catch(() => null) : null;
   const hits = map ? findInCodeMap(map, codeTerms(task), { limit: CODE_HITS, maxUsages: HIT_USAGES }) : [];
-  const found = await getTaskContext({ project: projectKey, task, files: hits.map((h) => h.path), client: 'ui-chat' }, d.context).catch((err) => {
+  const named = [...mentionedPaths(task), ...[...task.matchAll(/(?<![\w/.-])([\w@-]+\.[\w.-]*[\w])(?![\w/.-])/g)].map(m => m[1])];
+  const exact = map ? map.files.filter(f => named.some(p => p === f.path || (!p.includes('/') && f.path.split('/').pop() === p))).map(f => f.path) : named;
+  const files = [...new Set([...exact, ...hits.map(h => h.path), ...named])];
+  const found = await getTaskContext({ project: projectKey, task, files, client: 'ui-chat' }, d.context).catch((err) => {
     searchFailed = redactSecrets(err instanceof Error ? err.message : String(err)).slice(0, 200);
     return EMPTY;
   });

@@ -123,6 +123,7 @@ export type AppOpts = {
     /** How many project roots are mounted: with none, the status note points to Settings to add one. */ roots?: number;
     /** Turns the classifier gave up on. */ givenUpTurns?(): Promise<number>;
     /** Whether Ollama answers (embeddings always need it; so do ollama:<model> jobs). */ ollama?(): Promise<OllamaHealth>;
+    runner?(): Promise<{ ok: boolean; reason: string | null }>;
   };
   /** Turns the classifier gave up on, and re-queueing them (owner-only). */
   classifyQueue?: Pick<GraphStore, 'givenUpTurns' | 'requeueGivenUpTurns'>;
@@ -373,7 +374,7 @@ function stale(job: ModelJob, h: ProviderHealth, w: WorkerStatus, ollama: Ollama
 
 /** Each job's model as the worker last reported it. A job with no model (it could not be built) is unavailable, and
  * so is an Ollama model while Ollama does not answer, whether or not a job has asked it yet. */
-function modelHealth(w: WorkerStatus, ollama: OllamaHealth | null): Record<ModelJob, ModelHealth> {
+function modelHealth(w: WorkerStatus, ollama: OllamaHealth | null, runner: { ok: boolean; reason: string | null } | null = null): Record<ModelJob, ModelHealth> {
   const out = {} as Record<ModelJob, ModelHealth>;
   for (const job of MODEL_JOBS) {
     const provider = w.providers[job] ?? null;
@@ -386,6 +387,8 @@ function modelHealth(w: WorkerStatus, ollama: OllamaHealth | null): Record<Model
       ? { provider: null, ok: true, reason: null, off: true }
       : unbuilt
       ? { provider: null, ok: false, reason: job === 'classify' ? 'no classifier is configured (see the worker log)' : 'no summary model could be built (SUMMARY_LLM; see the worker log): summaries are paused' }
+      : runner && !runner.ok && current?.startsWith('codex-cli')
+        ? { provider: current, ok: false, reason: runner.reason ?? 'codex runner sandbox unavailable' }
       : ollama && !ollama.ok && current?.startsWith('ollama:')
         ? { provider: current, ok: false, reason: ollama.reason }
         : h && !h.ok
@@ -481,6 +484,7 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
       return c.json({ error: 'the admin MCP endpoint takes FG_OPERATOR_TOKEN as the Bearer: check it against the .env this Feedback Graph runs with' }, 401);
     }
     const operator = hasOperatorToken(c, auth.operator);
+    if (c.req.header('x-fg-owner-cleanup') === 'true' && !(auth.token && tokenMatches(bearerOf(c) ?? '', auth.token))) return c.json({ error: 'owner cleanup requires the configured API_TOKEN' }, 403);
     if (needsAuth(c.req.path)) {
       if (!authenticated(c, auth.token) && !operator) return bearerOf(c) ? unrecognised(c) : c.json({ error: 'sign in required' }, 401);
       // A bearer that is neither configured token is refused on reads too (an agent with a stale token would otherwise
@@ -513,16 +517,6 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
     // A run id belongs to whoever opened it (its first labelled write): a write under it by anyone else is refused, so
     // a run cannot be hijacked or mixed. With the operator token, ownership is bound to a private
     // X-FG-Run-Key capability, so a copied display name cannot hijack a run; the cleanup rules are in runs.ts.
-    if (run && opts.runs && c.req.method !== 'GET' && c.req.method !== 'HEAD') {
-      const actor = operator ? runKey(c.req.header('x-fg-run-key'), auth.runKeySalt) : null;
-      if (operator && !actor) return c.json({ error: 'labelled operator writes require X-FG-Run-Key (FG_RUN_KEY): a private random secret of at least 32 characters' }, 403);
-      const owner = await opts.runs.claim(run.id, principal, actor);
-      if (!sameCaller(owner, principal, actor)) {
-        const error = `run id belongs to another caller: ${run.id} was opened by ${openerOf(owner)} at ${owner.firstSeen}; label this one with a run id of its own`;
-        log?.('run refused', { method: c.req.method, path: c.req.path, run: run.id, owner: owner.principal, caller: principal });
-        return mcp ? c.json({ jsonrpc: '2.0', id: null, error: { code: -32600, message: error } }, 409) : c.json({ error }, 409);
-      }
-    }
     // Activity says how each write arrived (operator.ts runVia).
     // A run changes only what it wrote, unless the owner opened it (operator.ts mayChange).
     const fromOwner = principal === 'browser' || principal === 'owner_token';
@@ -565,6 +559,52 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
   };
   for (const [method, path, verb] of OWNER_ROUTES) app.on(method, path, ownerOnly(verb));
 
+  // Claim only after body limits and owner-only authorization. MCP discovery/initialization are reads,
+  // so a stale or unlabelled initialization cannot reserve a run id or make the client's tools disappear.
+  app.use('*', async (c, next) => {
+    const run = currentRun();
+    const mcp = c.req.path === '/mcp' || c.req.path === ADMIN_MCP;
+    if (mcp && c.req.method === 'POST') {
+      const body = await c.req.raw.clone().json().catch(() => null) as { method?: string } | null;
+      if (body?.method !== 'tools/call') return next();
+    }
+    const operator = hasOperatorToken(c, auth.operator);
+    const browser = c.req.header('origin') !== undefined;
+    const principal: RunPrincipal = operator ? 'operator' : browser ? 'browser' : auth.token && authenticated(c, auth.token) ? 'owner_token' : 'agent';
+    if (run && opts.runs && c.req.method !== 'GET' && c.req.method !== 'HEAD') {
+      const actor = operator ? runKey(c.req.header('x-fg-run-key'), auth.runKeySalt) : null;
+      if (operator && !actor) return c.json({ error: 'labelled operator writes require X-FG-Run-Key (FG_RUN_KEY): a private random secret of at least 32 characters with adequate diversity (generate: openssl rand -hex 32)' }, 403);
+      // Refused attempts to edit an owner's existing record must not reserve an otherwise unused run id.
+      if (!(await opts.runs.owner(run.id)) && !mayChangeAny()) {
+        const lessonPath = /^\/api\/lessons\/([^/]+)(?:\/to-fact)?$/.exec(c.req.path);
+        const candidatePath = /^\/api\/candidates\/([^/]+)\/decision$/.exec(c.req.path);
+        const sessionPath = /^\/api\/sessions\/([^/]+)\/run$/.exec(c.req.path);
+        if (sessionPath && sessions?.store.runFor && c.req.method === 'POST') {
+          const id = decodeURIComponent(sessionPath[1]);
+          const binding = await sessions.store.runFor(id);
+          const existing = await sessions.store.detail(id);
+          if ((binding && (binding.id !== run.id || binding.sandbox !== run.sandbox)) || (existing && !binding)) return c.json({ error: 'session already belongs to the owner or another run; start a new labelled session' }, 409);
+        }
+        if (lessonPath && !['decisions', 'recheck'].includes(lessonPath[1]) && knowledge && ['PATCH', 'POST'].includes(c.req.method)) {
+          const existing = await knowledge.lessonDetail(decodeURIComponent(lessonPath[1]));
+          if (existing && !mayChange(existing.lesson)) return notTheRuns(c, `the lesson ${existing.lesson.id}`);
+        }
+        if (candidatePath && c.req.method === 'POST') {
+          const existing = await repo.candidateDetail(decodeURIComponent(candidatePath[1]));
+          if (existing && !mayChange(existing.candidate)) return notTheRuns(c, `the Inbox item ${existing.candidate.id}`);
+        }
+        if (/^\/api\/projects\/[^/]+\/pin$/.test(c.req.path)) return notTheRuns(c, 'the project pin');
+      }
+      const owner = await opts.runs.claim(run.id, principal, actor);
+      if (!sameCaller(owner, principal, actor)) {
+        const error = `run id belongs to another caller: ${run.id} was opened by ${openerOf(owner)} at ${owner.firstSeen}; label this one with a run id of its own`;
+        log?.('run refused', { method: c.req.method, path: c.req.path, run: run.id, owner: owner.principal, caller: principal });
+        return mcp ? c.json({ jsonrpc: '2.0', id: null, error: { code: -32600, message: error } }, 409) : c.json({ error }, 409);
+      }
+    }
+    await next();
+  });
+
   app.use('/mcp', async (c, next) => {
     const run = currentRun();
     if (run && sessions?.store.claimRun && c.req.method === 'POST') {
@@ -590,6 +630,7 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
     const sel = graph && system?.selection ? await system.selection().catch(() => null) : null;
     const givenUpTurns = graph && system?.givenUpTurns ? await system.givenUpTurns().catch(() => null) : null;
     const ollama = system?.ollama ? await system.ollama().catch(() => null) : null;
+    const runner = system?.runner ? await system.runner().catch(() => ({ ok: false, reason: 'codex runner health check failed' })) : null;
     const workerHealthy = !!worker && Date.now() - Date.parse(worker.lastBeat) < WORKER_STALE_MS;
     const s: SystemStatus = {
       version: system?.version ?? 'dev',
@@ -602,7 +643,7 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
       judge: context?.judgeId ?? null,
       selection: sel && { initialized: sel.initialized, tracked: sel.tracked.length, ...(system?.roots === undefined ? {} : { roots: system.roots }), note: selectionNote(sel, system?.roots) },
       cloud: cloudStatus(cloud?.cloud ?? null, cloudState),
-      models: worker ? modelHealth(worker, ollama) : null,
+      models: worker ? modelHealth(worker, ollama, runner) : null,
       givenUpTurns,
       ollama,
       connections: await connectionsStatus({ integrations: graph ? (integrations?.integrations ?? null) : null, deps: integrations, worker, ollama, cloud: cloud?.cloud ?? null, manualSync: cloudState?.lastManual() ?? null }).catch(() => null),
@@ -882,12 +923,19 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
       return c.json(all.sort((a, b) => Number(b.pinned) - Number(a.pinned) || a.key.localeCompare(b.key)));
     });
 
+    const scanReadiness = async (provider?: string | null) => {
+      const selected = provider ?? (await system?.worker().catch(() => null))?.providers.scan;
+      const runner = selected?.startsWith('codex-cli') ? await system?.runner?.().catch(() => ({ ok: false, reason: 'runner readiness could not be checked' })) : null;
+      return runner && !runner.ok ? { blocked: true, warning: `Scan queued but parked: ${runner.reason}. No repository will be copied until runner readiness succeeds.` } : {};
+    };
+
     app.post('/api/projects/:key/scan', async (c) => {
       const body = ScanRequest.safeParse(await c.req.json().catch(() => ({})));
       if (!body.success) return c.json({ error: body.error.flatten() }, 400);
       const project = (await projectDirs()).find((p) => p.key === c.req.param('key'));
       if (!project) return c.json({ error: 'no such folder under the configured roots' }, 404);
-      return c.json(await facts.requestScan(project, body.data.provider ?? null), 202);
+      const job = await facts.requestScan(project, body.data.provider ?? null);
+      return c.json({ ...job, ...await scanReadiness(body.data.provider) }, 202);
     });
 
     // Scan many folders in one call: `all` (every selected folder) or `keys`. Each is queued like the route above;
@@ -898,12 +946,13 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
       const folders = await projectDirs();
       const v = await view();
       const keys = body.data.all ? folders.map((p) => p.key).filter((k) => !v || v.has(k)) : [...new Set(body.data.keys)];
+      const readiness = await scanReadiness(body.data.provider);
       const results = [];
       for (const key of keys) {
         const project = folders.find((p) => p.key === key);
         if (!project) results.push({ key, queued: false, error: 'no such folder under the configured roots' });
         else if (v && !v.has(key)) results.push({ key, queued: false, error: 'not selected: choose it in Settings first' });
-        else results.push({ key, queued: true, job: await facts.requestScan(project, body.data.provider ?? null) });
+        else results.push({ key, queued: true, ...readiness, job: { ...await facts.requestScan(project, body.data.provider ?? null), ...readiness } });
       }
       return c.json({ results }, 202);
     });
@@ -925,7 +974,7 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
           const ahead = (await facts.listProjects()).filter((p) => p.lastScan?.status === 'queued' && p.lastScan.id !== job.id && p.lastScan.requestedAt < job.requestedAt).length;
           queuePosition = ahead + 1;
         }
-        return c.json({ ...job, queuePosition });
+        return c.json({ ...job, queuePosition, ...(job.status === 'queued' ? await scanReadiness(job.provider) : {}) });
       });
     }
 

@@ -221,15 +221,15 @@ function buildServer(call: Call, sleep: (ms: number) => Promise<void>) {
     return json({ jobs: [...jobs.values()], refused: results.filter((x) => !x.queued) });
   });
 
-  reg('inbox_list', 'Inbox items (flagged developer pushback waiting for a decision), newest first, one compact row each: id, project, source, label, summary, author and link. inbox_get gives one item in full. Paged.', {
-    status: z.enum(['pending', 'confirmed', 'rejected']).optional().describe('Default pending'),
+  reg('inbox_list', 'Inbox items (flagged developer pushback; all statuses unless filtered), newest first, one compact row each: id, project, source, label, summary, author and link. inbox_get gives one item in full. Paged.', {
+    status: z.enum(['pending', 'confirmed', 'rejected']).optional().describe('Omit for all statuses'),
     source: z.enum(FEEDBACK_SOURCES as [string, ...string[]]).optional().describe('Only items from this source'),
     project: z.string().min(1).max(MAX.key).optional(),
     pr: z.number().int().positive().optional(),
     author: z.string().trim().min(1).max(200).optional(),
     ...Paging,
   }, READ, async (a) => {
-    const r = await call('GET', `/api/candidates${qs({ status: a.status ?? 'pending', project: a.project, source: a.source, pr: a.pr, author: a.author, limit: LIST_MAX })}`);
+    const r = await call('GET', `/api/candidates${qs({ status: a.status, project: a.project, source: a.source, pr: a.pr, author: a.author, limit: LIST_MAX })}`);
     if (!r.ok) return fail(r);
     const all = r.data as Record<string, any>[];
     return json(page(all.filter((c) => !a.source || c.source === a.source), a, inboxRow, all.length >= LIST_MAX));
@@ -262,12 +262,12 @@ function buildServer(call: Call, sleep: (ms: number) => Promise<void>) {
     id: z.string().min(1).max(MAX.id),
   }, READ, async (a) => answer(await call('GET', `/api/lessons/${enc(a.id)}`)));
 
-  reg('lesson_decide', 'Approve a proposed lesson (agents are given it from then on) or reject it. Off by default: lessons are the owner\'s decision.', {
+  reg('lesson_decide', 'Approval updates local agents immediately. It does not trigger cloud sync: eligible projects share on the next schedule or cloud_sync_now. Approve a proposed lesson (agents are given it from then on) or reject it. Off by default: lessons are the owner\'s decision.', {
     id: z.string().min(1).max(MAX.id),
     decision: z.enum(['approve', 'reject', 'revoke']),
   }, write({ destructive: true, idempotent: true }), async (a) => {
     const r = await call('PATCH', `/api/lessons/${enc(a.id)}`, { status: a.decision === 'approve' ? 'approved' : a.decision === 'revoke' ? 'revoked' : 'rejected' });
-    return r.ok ? json({ id: a.id, status: a.decision === 'approve' ? 'approved' : a.decision === 'revoke' ? 'revoked' : 'rejected' }) : fail(r);
+    return r.ok ? json({ id: a.id, sharing: 'Local decision saved. Cloud sharing, if enabled for this project, waits for the next scheduled sync or cloud_sync_now.', status: a.decision === 'approve' ? 'approved' : a.decision === 'revoke' ? 'revoked' : 'rejected' }) : fail(r);
   });
 
   reg('link_decide', 'Confirm a link between two projects (agents in either get the best matches from the other), dismiss it, or reopen it as a suggestion.', {

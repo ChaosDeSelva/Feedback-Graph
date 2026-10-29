@@ -1,9 +1,10 @@
+import { cloudLocalOnlyProjects } from '@fb/core';
 import { dirname, join } from 'node:path';
 import { loadRunKeySalt } from './runKeySalt.ts';
 import { existsSync } from 'node:fs';
 import type { Server } from 'node:http';
 import { serve } from '@hono/node-server';
-import { ConfigError, credentialFile, githubRepoOfRemote, Integrations, loadConfig, makeProviderOr, redactSecrets, ollamaEmbed, ollamaPing, projectFolders, refreshLayout, shownProjects, storedSyncMemory, syncProjects, VERSION, worktreeGitArgs, type Project } from '@fb/core';
+import { runnerReadiness, ConfigError, credentialFile, githubRepoOfRemote, Integrations, loadConfig, makeProviderOr, redactSecrets, ollamaEmbed, ollamaPing, projectFolders, refreshLayout, shownProjects, storedSyncMemory, syncProjects, VERSION, worktreeGitArgs, type Project } from '@fb/core';
 import { openStore } from '@fb/store-postgres';
 import { Admission } from './admission.ts';
 import { createApp } from './app.ts';
@@ -156,10 +157,11 @@ const app = createApp(store.graph, {
   mapMaxFiles: config.scanMaxFiles,
   cloud: {
     cloud: config.cloud,
+    localOnlyStore: store.docs,
     memory: config.cloud ? storedSyncMemory(store.docs, config.cloud) : undefined,
     portability: store.portability,
     activity,
-    projects: async () => syncProjects({ configured: config.cloud?.projects ?? [], selected: (await scope()).projects, excluded: config.excludeProjects }),
+    projects: async () => syncProjects({ configured: config.cloud?.projects ?? [], selected: (await scope()).projects, excluded: [...config.excludeProjects, ...await cloudLocalOnlyProjects(store.docs, config.cloud?.localOnlyProjects)] }),
     worker: () => store.graph.workerStatus(),
   },
   inScope: async (key: string) => (await scope()).project(key),
@@ -197,6 +199,7 @@ const app = createApp(store.graph, {
   },
   auth: { runKeySalt, token: config.apiToken ?? undefined, publicHosts: config.publicHosts, operator: config.operator ?? undefined },
   system: { version: VERSION, store: store.kind, roots: roots.length, ping: () => store.ping(), worker: () => store.graph.workerStatus(), selection: () => selection.current(), givenUpTurns: () => store.graph.givenUpTurns(),
+    ...(process.env.CODEX_RUNNER_URL ? { runner: () => runnerReadiness(process.env.CODEX_RUNNER_URL!) } : {}),
     // The embedding model always; the local chat model too when the api's check_before_done judge uses it.
     ollama: () => ollamaPing({ url: config.ollama.url, models: [config.ollama.embedModel, ...(judgeLlm.id.startsWith('ollama:') ? [judgeLlm.id.slice(7)] : [])], timeoutMs: 2000 }),
   },

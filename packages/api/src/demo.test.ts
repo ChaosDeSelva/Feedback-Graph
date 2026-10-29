@@ -173,3 +173,21 @@ describe('routes', () => {
     expect(((await res.json()) as { error: string }).error).toMatch(/demo seed failed.*store down/s);
   });
 });
+
+
+test('the seed returns the isolated file-tied plain-console violation as a JSON probe fixture', async () => {
+  const t = deps();
+  const r = await seedDemo({}, t.d);
+  expect(r.probe.diff).toContain('+console.log("request started");');
+  const rule = DEMO_CORPUS.lessons.find(lesson => lesson.slug === r.probe.expectedLessonSlug)!;
+  expect(rule.paths).toEqual(r.probe.files);
+  expect(rule.rule).toBe('Do not call console.log in src/probes/no-console.ts.');
+  expect(r.probe.expectedVerdict).toBe('gap');
+});
+
+
+test('demo seed provides a literal no-console rule in a dedicated file without a lesson decision', async () => {
+  const t = deps();
+  await seedDemo({}, t.d);
+  expect(t.lessons.find(l => l.id.endsWith(':no-console-probe'))).toMatchObject({ projectKey: DEMO_PROJECT, source: 'demo', status: 'approved', rule: 'Do not call console.log in src/probes/no-console.ts.', paths: ['src/probes/no-console.ts'] });
+});

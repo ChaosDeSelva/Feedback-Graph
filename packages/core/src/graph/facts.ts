@@ -1,3 +1,4 @@
+import { archiveBeforeRedaction, archiveRedactionInput } from '../redactionArchive.ts';
 import { randomUUID } from 'node:crypto';
 import neo4j from 'neo4j-driver';
 import { FACT_EVIDENCE, FACT_ORIGINS, type CodeFact, type FactEvidence, type FactKind, type FactOrigin, type Project, type ProjectSummary, type RelevanceBy, type ScanJob, type ScanQueueEntry, type ScanShards, type ScanStatus, type RunTag } from '../types.ts';
@@ -40,7 +41,7 @@ export const provenanceOf = (f: Pick<CodeFact, 'origin' | 'evidence'>) => ({
   origin: f.origin && FACT_ORIGINS.includes(f.origin) ? f.origin : null,
   evidence: f.evidence && FACT_EVIDENCE.includes(f.evidence) ? f.evidence : null,
 });
-export type FactHit = { fact: StoredFact; score: number };
+export type FactHit = { fact: StoredFact; score: number; rankingScore?: number };
 export type EmbeddedFact = CodeFact & { embedding: number[] };
 
 /** The reason the manifest reader gives, as a whole-string regex (Cypher =~, Postgres ~): marks older manifest facts. */
@@ -133,6 +134,7 @@ export class FactsRepo implements FactsStore {
     // Facts are model output about code that may contain credentials: redact at the door.
     const file = redactDeep(rawFile);
     const facts = redactDeep(rawFacts);
+    await archiveRedactionInput('facts', projectKey, { file: rawFile, facts: rawFacts }, { file, facts });
     const now = new Date().toISOString();
     const fields = `cf.projectKey = $projectKey, cf.path = $file.path, cf.hash = $file.hash, cf.summary = $file.summary,
            cf.scannedAt = $now, cf.removed = false, cf.scanVersion = $file.version`;
@@ -185,6 +187,7 @@ export class FactsRepo implements FactsStore {
   async replaceScopeFacts(projectKey: string, scope: FactScope, rawFacts: EmbeddedFact[], source: string, rawFiles: ScannedFile[], scanJobId: string | null = null) {
     const files = rawFiles.map((fl) => ({ path: fl.path, hash: fl.hash, version: fl.version ?? null }));
     const facts = redactDeep(rawFacts);
+    await archiveRedactionInput('facts', projectKey, rawFacts, redactDeep(rawFacts));
     const now = new Date().toISOString();
     // One transaction: if writing the new facts fails, the old ones stay current and the hashes stay stale,
     // so the next scan tries again instead of finding "nothing changed" over an empty project.
@@ -223,6 +226,7 @@ export class FactsRepo implements FactsStore {
   /** Your fact: under the project, about no code file, so a scan has nothing of it to close. */
   async addOwnerFact(projectKey: string, rawFact: EmbeddedFact, by: RelevanceBy, run?: RunTag | null): Promise<StoredFact> {
     const fx = redactDeep(rawFact);
+    await archiveRedactionInput('fact', projectKey, rawFact, fx);
     const id = randomUUID();
     const now = new Date().toISOString();
     const relevance = relevanceOf(fx);
@@ -322,6 +326,7 @@ export class FactsRepo implements FactsStore {
         return x.statement !== was.statement || x.why !== was.why || x.close ? [x] : [];
       });
       if (!changed.length) continue;
+      for (const r of rows) if (changed.some(c => c.id === r.get('id'))) await archiveBeforeRedaction('fact', String(r.get('id')), Object.fromEntries(['statement', 'why', 'current', 'origin', 'fromDoc'].map(k => [k, r.get(k) ?? null])));
       await this.g.run(
         // closeReason: why it was closed, so a later rule can serve a fact it no longer reads as an instruction again.
         `UNWIND $changed AS c MATCH (f:Fact {id: c.id})

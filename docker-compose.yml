@@ -33,6 +33,7 @@ x-env: &env
   # host.docker.internal: the host as the containers see it). CLOUD_TOKEN is a token with the sync scope. Never logged.
   CLOUD_URL: ${CLOUD_URL:-}
   CLOUD_TOKEN: ${CLOUD_TOKEN:-}
+  CLOUD_LOCAL_ONLY_PROJECTS: ${CLOUD_LOCAL_ONLY_PROJECTS:-}
   # This machine's name on the cloud's sync log (inside a container the hostname is a random id). setup.sh fills it.
   CLOUD_MACHINE: ${CLOUD_MACHINE:-}
   # Minutes between automatic syncs (at least 5); empty syncs only when you press Sync now in Settings.

@@ -51,6 +51,7 @@ export function Projects({ pollMs = 5000 }: { pollMs?: number } = {}) {
   const [query, setQuery] = useState('');
   const [provider, setProvider] = useState('');
   const [error, setError] = useState<string | null>(null);
+  const [scanWarning, setScanWarning] = useState<{ jobId: string; text: string } | null>(null);
   // On a phone the list and the project take turns; this is true while the project is showing.
   const [open, setOpen] = useState(!!link);
 
@@ -105,6 +106,7 @@ export function Projects({ pollMs = 5000 }: { pollMs?: number } = {}) {
     if (!current) return;
     try {
       const job = await api.scan(current.key, provider || undefined);
+      setScanWarning(job.warning ? { jobId: job.id, text: job.warning } : null);
       setProjects((ps) => ps && ps.map((p) => (p.key === current.key ? { ...p, lastScan: job } : p)));
     } catch (e) {
       setError(String(e));
@@ -172,6 +174,7 @@ export function Projects({ pollMs = 5000 }: { pollMs?: number } = {}) {
       >
         <div className="mx-auto w-full max-w-4xl px-4 py-5 md:px-6">
           {error && <Alert className="mb-4">{error}</Alert>}
+          {scanWarning && current?.lastScan?.id === scanWarning.jobId && current.lastScan.status === 'queued' && <Alert className="mb-4">{scanWarning.text}</Alert>}
           {!projects ? (
             <SkeletonDetail />
           ) : !current ? (

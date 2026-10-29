@@ -169,3 +169,13 @@ test('status names the check_before_done judge model', async () => {
   const app = createApp(repo, { system: { version: '0.2.0', ping: async () => true, worker: async () => null }, context: { judgeId: 'ollama:gemma4', k: {} } as never });
   expect((await (await app.request('/api/status')).json()).judge).toBe('ollama:gemma4');
 });
+
+
+test('runner readiness overrides stale healthy reports for Codex docs, Ask and scans', async () => {
+  const worker: WorkerStatus = { ...beat(10), providers: { classify: 'ollama:local', docs: 'codex-cli', chat: 'codex-cli:gpt', scan: 'codex-cli' } };
+  const app = createApp(repo, { system: { version: 'test', ping: async () => true, worker: async () => worker,
+    runner: async () => ({ ok: false, reason: 'private proc cannot mount' }) } });
+  const status = await (await app.request('/api/status')).json();
+  for (const job of ['docs', 'chat', 'scan']) expect(status.models[job]).toMatchObject({ ok: false, reason: 'private proc cannot mount' });
+  expect(status.models.classify.ok).toBe(true);
+});

@@ -461,3 +461,31 @@ test('a PR closing without new comments refreshes old comment metadata so source
   expect(s.threads).toHaveLength(1);
   expect(s.threads[0].items[0].external).toMatchObject({ threadState: 'closed' });
 });
+
+
+test('PR state backfill refreshes stored metadata without importing historical comments and runs only once', async () => {
+  const s = setup();
+  const refreshed: [string, string][] = [];
+  s.deps.graph.refreshExternalThreadState = async (id, state) => { refreshed.push([id, state]); };
+  s.store.m.set(feedbackCursor('github', 'shop'), '2026-10-20T00:00:00Z');
+  s.store.m.set(authorsCursor('shop'), '2026-10-20T00:00:00Z');
+  s.deps.fetchPrs = async opts => opts.since === '1970-01-01T00:00:00.000Z'
+    ? [{ ...pr(7, [{ id: 'old', createdAt: '2024-01-01T00:00:00Z' }]), state: 'closed' }]
+    : [];
+  await syncExternalFeedback(s.deps);
+  expect(refreshed).toEqual([['github:acme/shop#7', 'closed']]);
+  expect(s.threads).toEqual([]);
+  s.store.m.set(feedbackCursor('github', 'shop'), '2026-10-20T00:00:00Z');
+  await syncExternalFeedback(s.deps);
+  expect(refreshed).toHaveLength(1);
+});
+
+test('PR state history backfill checkpoints a capped page before continuing', async () => {
+  const s = setup();
+  s.deps.graph.refreshExternalThreadState = async () => {};
+  s.store.m.set(feedbackCursor('github', 'shop'), '2026-10-20T00:00:00Z');
+  s.store.m.set(authorsCursor('shop'), '2026-10-20T00:00:00Z');
+  s.deps.fetchPrs = async opts => { if (opts.since === '1970-01-01T00:00:00.000Z') opts.onCap?.('2025-01-01T00:00:00Z'); return []; };
+  await syncExternalFeedback(s.deps);
+  expect(s.store.m.get('feedback-github-pr-state-v1:shop')).toBe('2025-01-01T00:00:00Z');
+});

@@ -1,3 +1,4 @@
+import { archiveBeforeRedaction, archiveRedactionInput } from '@fb/core';
 import { randomUUID } from 'node:crypto';
 import type pg from 'pg';
 import { clampRelevance, DEMO_SOURCE, FACT_EVIDENCE, factOrigin, requestTimes, scanRequestPaths, MANIFEST_WHY_RE, PROJECT_PATH, provenanceOf, holdsCredential, REDACT_PAGE, redactDeep, redactSecrets, relevanceOf, SCAN_UNAVAILABLE_WAIT_MS, scanRetryAt, redactStoredFact, reopensAsFact } from '@fb/core';
@@ -59,6 +60,7 @@ export class PgFactsStore implements FactsStore {
     // Facts are model output about code that may contain credentials: redact at the door.
     const file = redactDeep(rawFile);
     const facts = redactDeep(rawFacts);
+    await archiveRedactionInput('facts', projectKey, { file: rawFile, facts: rawFacts }, { file, facts });
     const now = new Date();
     const cf = fileId(projectKey, file.path);
     // One Cypher statement in Neo4j, so all or nothing here too.
@@ -101,6 +103,7 @@ export class PgFactsStore implements FactsStore {
   /** One shard of an agentic scan: only the current facts in `scope` are closed (FactsStore.replaceScopeFacts). */
   async replaceScopeFacts(projectKey: string, scope: FactScope, rawFacts: EmbeddedFact[], source: string, files: ScannedFile[], scanJobId: string | null = null): Promise<void> {
     const facts = redactDeep(rawFacts).map((f) => ({ ...f, path: f.path || PROJECT_PATH }));
+    await archiveRedactionInput('facts', projectKey, rawFacts, redactDeep(rawFacts));
     const now = new Date();
     // Neo4j MERGEs file by file, so a path listed twice ends with the last hash.
     const latest = new Map(files.map((fl) => [fl.path, fl]));
@@ -138,6 +141,7 @@ export class PgFactsStore implements FactsStore {
   /** Your fact: under the project, about no code file, so a scan has nothing of it to close. */
   async addOwnerFact(projectKey: string, rawFact: EmbeddedFact, by: RelevanceBy, run?: RunTag | null): Promise<StoredFact> {
     const fx = redactDeep(rawFact);
+    await archiveRedactionInput('fact', projectKey, rawFact, fx);
     const relevance = relevanceOf(fx);
     sandboxPresence(this.db).wrote(run);
     return tx(this.db, async (c) => {
@@ -228,6 +232,7 @@ export class PgFactsStore implements FactsStore {
         return x.statement !== r.statement || x.why !== r.why || x.close ? [x] : [];
       });
       if (!changed.length) continue;
+      for (const r of rows) if (changed.some(c => c.id === r.id)) await archiveBeforeRedaction('fact', r.id, r);
       // close_reason: why it was closed, so a later rule can serve a fact it no longer reads as an instruction again.
       await this.db.pool.query(
         `UPDATE facts x SET statement = c.statement, why = c.why,

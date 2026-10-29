@@ -113,7 +113,10 @@ export class SessionsRepo implements SessionsStore {
 
   async claimRun(sessionId: string, run: RunTag): Promise<boolean> {
     const [r] = await this.g.run(
-      `MERGE (binding:SessionRun {sessionId: $id})
+      `OPTIONAL MATCH (existing:Session {id: $id})
+       OPTIONAL MATCH (prior:SessionRun {sessionId: $id})
+       WITH existing, prior WHERE existing IS NULL OR prior.run IS NOT NULL
+       MERGE (binding:SessionRun {sessionId: $id})
        SET binding.lock = coalesce(binding.lock, 0) + 1
        WITH binding OPTIONAL MATCH (s:Session {id: $id})
        WITH binding, s, CASE WHEN binding.run IS NOT NULL THEN binding.run = $run AND coalesce(binding.sandbox, false) = $sandbox

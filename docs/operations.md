@@ -94,6 +94,43 @@ A Docker-masked parent `/proc` can prevent Linux from mounting a new private `/p
 
 Linux Docker hosts with masked system paths, including GitHub-hosted CI, can have the same restriction. A supported operator-controlled workaround is Docker's runner-only `systempaths=unconfined` option in a hand-written Compose override. It removes Docker's masked/read-only system-path list inside that container, so it is a security relaxation and is **not enabled automatically**. Retain all existing `cap_drop`, read-only root, no-new-privileges, seccomp and AppArmor settings. The job's private mount/PID namespace still creates its own `/proc` and hides shared scratch, runner tokens and parent processes. Do not apply the option to the worker or API. Recreate the runner and require a successful real sandbox health check before scanning. If the host still refuses the sandbox, use Claude Code or an API provider rather than disabling isolation.
 
+For macOS Docker Desktop or OrbStack, first enable the runner in `.env` (`COMPOSE_PROFILES=codex`, `CODEX_RUNNER_URL=http://codex-runner:8790`). If its real health probe reports the procfs error above and you accept the security tradeoff, create this **optional** file in the repository root. It affects only the runner. Keep it separate from the generated `docker-compose.override.yml`, which setup rewrites for your project mounts:
+
+```yaml
+# docker-compose.codex-procfs.yml
+services:
+  codex-runner:
+    security_opt:
+      - no-new-privileges:true
+      - seccomp=unconfined
+      - apparmor=${CODEX_RUNNER_APPARMOR:-unconfined}
+      - systempaths=unconfined
+```
+
+After the normal setup has generated `docker-compose.override.yml`, add this opt-in to `.env`. Preserve any other Compose files you already use; the generated project-mount override must remain included:
+
+```dotenv
+COMPOSE_FILE=docker-compose.yml:docker-compose.override.yml:docker-compose.codex-procfs.yml
+```
+
+Recreate the runner. Compose reads that list from `.env`, so later setup and restart commands retain both your project mounts and this explicit choice; no host kernel setting changes:
+
+```sh
+docker compose --profile codex config --quiet
+docker compose --profile codex up -d --no-deps --force-recreate codex-runner
+# Run the real sandbox check from the worker. Require HTTP200 and ok:true, sandbox:true.
+docker compose exec -T worker node -e 'fetch(process.env.CODEX_RUNNER_URL + "/health").then(async r => { console.log(r.status, await r.text()); process.exit(r.ok ? 0 : 1); }).catch(() => process.exit(1))'
+./scripts/doctor.sh
+```
+
+To remove the exception, remove only `:docker-compose.codex-procfs.yml` from `COMPOSE_FILE` in `.env`, preserving your generated project mounts and any other custom files, then recreate:
+
+```sh
+docker compose --profile codex up -d --no-deps --force-recreate codex-runner
+```
+
+This explicitly removes Docker's masked/read-only system-path protection **in the runner**. It does not make the setting a safe default; the container retains its Codex login, so apply it only when you accept that reduced protection. A masked host will again report unhealthy after removal. To avoid this exception entirely, select Claude Code or an API provider for scans; do not remove the runner's private PID/proc sandbox, add privileged mode, or disable host security controls. There is no automatic fallback: using the host's existing `/proc` would undermine the PID isolation the readiness test checks.
+
 Check it: `docker compose ps codex-runner` (healthy), `docker compose logs codex-runner` (one line per job: status and duration, never the prompt or the token). The worker's `provider` log line says `codex-cli` at startup. On Linux, the `codex-scratch` and `codex-runner-home` volumes are owned by uid 1000 like `codex-home` (see [Linux](#linux)).
 
 ## Backups
@@ -301,3 +338,45 @@ Keep the key private and retain it for cleanup. Desktop apps need these variable
 
 
 The Docker integration suite selects this compatibility setting explicitly with `FG_TEST_RUNNER_UNMASK_SYSTEM_PATHS=1` in CI. It first probes the original masked configuration and verifies503 when its sandbox cannot start, then recreates only the disposable test runner with compatibility enabled for the complete outer/nested isolation checks. Both launches retain the enforced named AppArmor profile, non-root user, read-only root, dropped capabilities and no-new-privileges. The test-only variable does not change production Compose defaults.
+
+
+For one database contract suite, pass the test file directly to Vitest (a `--testPathPattern` option from other runners is not supported):
+
+```sh
+TEST_STORES=neo4j,postgres pnpm exec vitest run --project integration --no-file-parallelism packages/core/src/graph/runs.int.test.ts
+```
+
+Run host checks with dependencies installed for that host. A Linux container's native `node_modules` is not usable by macOS Node; do not install Linux dependencies into a checkout mounted from macOS and then run host tests against them. Keep container dependencies inside image/container storage and run host `pnpm install --frozen-lockfile` from macOS when setting up host tests. This does not require starting Docker.
+
+For a sandbox or private project that should remain available locally but never send new content to Cloud, set `CLOUD_LOCAL_ONLY_PROJECTS=project-key,other-key` and restart. Settings → Cloud sync lists this boundary. It overrides scheduled and forced manual sync; selection and ordinary export stay local features. Previously shared data is withdrawn by the next sync, not deleted from the cloud immediately. Approval itself does not start cloud sync: use Sync now or wait for the configured schedule.
+
+
+For a headless labelled Codex run, launch it with `FG_RUN`, `FG_SANDBOX=1`, a private random `FG_RUN_KEY` (`openssl rand -hex 32`), and `FG_OPERATOR_TOKEN` inherited. For an operator connection in that one run, use Codex's bearer environment option rather than an unauthenticated initialization or a token in command-line text:
+
+```sh
+codex exec -c 'mcp_servers.feedback-graph.bearer_token_env_var="FG_OPERATOR_TOKEN"' '...'
+```
+
+In its first shell call, run the installation's `scripts/fg sessions register` so it reads the actual `CODEX_THREAD_ID`; keep passing that id as `session_id` on MCP context/check/report tools. Codex exposes `CODEX_THREAD_ID` to its shell tools; do not assume the HTTP MCP connection automatically sends it. MCP initialization and tool discovery do not claim run ownership. A failed registration now reports a warning, and an already ingested unlabelled session must be replaced rather than relabelled.
+
+For an old run whose pre-capability ownership record cannot be authenticated by an operator, use owner-authorized cleanup explicitly: `API_TOKEN` must match this installation's configured owner token, then `scripts/fg cleanup --run OLD_RUN --owner` previews it and adding `--apply` removes the same previewed derived records. This uses the owner API token, not `FG_OPERATOR_TOKEN`, and keeps immutable real transcript bindings and protected record history. A changed display name does not affect a modern run's cleanup; its validated principal and private run key do.
+
+Stored redaction migrations now encrypt each affected fact, lesson, document title and chunk before replacing it. The worker keeps AES-256-GCM originals in `state/settings/redaction-archive` (directory 0700, key and entries 0600); `REDACTION_ARCHIVE_DIR` overrides this local path. Back up the directory and key together, separately from exported knowledge. No archive contents are sent to APIs or Cloud. Archive write/authentication failures stop the migration before that page is changed. Each kind/id/rule-version keeps its first original; later safe repair can inspect that exact text rather than guess. Existing damage from releases that kept no original cannot be reconstructed from ciphertext created later: unavailable old facts still need their source or a backup.
+GitHub document source repair uses its own versioned checkpoint, even if stored-redaction v7 already completed: it re-fetches existing PR documents from GitHub under current redaction rules without importing historical PR documents. Activity distinguishes re-fetched documents and queued rescans from actual restored lessons.
+Local-only project keys can also be saved in Settings → Cloud sync, or via owner-only `PUT /api/cloud/local-only` with `{ "projects": ["sandbox"] }`. API and worker share this policy. `CLOUD_LOCAL_ONLY_PROJECTS` is an additional boundary the UI cannot remove.
+
+A safe product probe uses a dedicated selected sandbox project. Mark its key local-only in Settings or the owner API and verify it appears in `GET /api/cloud` localOnlyProjects before registering a sandbox run or creating test evidence. Only then exercise local lesson approval/revocation; leave real project data and cloud sync untouched. The demo seed remains excluded from cloud export as well. This is a procedure/fixture path, not an instruction to seed the operator's database.
+
+For the bundled probe fixture, first save `demo-shop` as local-only and select it locally. Register the sandbox run using the session-registration procedure above, then use `fg demo seed --run <label> --sandbox --json`; the response includes a synthetic `probe` task, file list and plain-console diff that violates its seeded isolated no-console lesson. Feed those literal fields to check_before_done with the registered session id. This approves only clearly marked demo lessons; no real owner's lesson needs editing. Revoke/approve only that demo corpus if testing decisions, then use the same caller's `fg cleanup --run <label> --apply` (or owner `fg demo remove`) to remove the fixture. Do not run this recipe on a real project or force a cloud sync.
+For Linux runner procfs restrictions, `./scripts/setup.sh --runner-procfs-compat` explicitly generates `docker-compose.runner-procfs.yml` after confirmation. It preserves base/generated mounts and custom Compose files; ordinary setup and `--yes` alone do not opt in. See the existing manual runner-procfs override guidance for the tradeoff.
+
+
+### Isolated hooks, memory and judge probes
+
+Use only the checked-in `examples/demo-shop` fixture for these probes. Before selecting or seeding it, mark its project key local-only in Cloud Settings (or the owner-only `PUT /api/cloud/local-only`), and verify the cloud status shows that exclusion. The demo corpus is also excluded from cloud export by its `source: demo`; do not seed approved probe rules into a real project.
+
+Set a fresh `FG_RUN`, `FG_SANDBOX=1` and a random private `FG_RUN_KEY`, then run `scripts/fg demo seed` against the dedicated `demo-shop` project. This existing demo-only path creates clearly labelled approved fixtures without enabling `lesson_decide`; it now includes the literal rule “Do not call console.log in src/probes/no-console.ts.” Register the actual agent session first as described above. Ask `get_task_context` for that exact file, and verify the rule appears before testing hooks or submitting a diff to `check_before_done` that adds `console.log` there. A clean diff should not report that violation. Keep both responses and their run Activity as evidence.
+
+For memory/post-mortem probes, use only synthetic notes and transcript fixtures in that demo project; do not write probe notes to your personal/global agent memory, approve a real lesson, or use another project's feedback. The automated memory/post-mortem suites cover post-pushback note exclusion and disputed claims without cloud rows. Preview `scripts/fg cleanup --run RUN_ID` before applying it; for remaining demo corpus use the existing `scripts/fg demo remove` only when this dedicated demo project is not shared with another active probe. Original real transcripts and immutable session bindings remain for provenance. These instructions are an explicit testing recipe; installing or upgrading does not execute probes or seed any lesson.
+
+The encrypted archive also protects incoming facts, document text/readings and post-mortem/seeded lesson writes when redaction actually changes their input. Stable content identities retain distinct edits without archiving untouched input. Owner edits are retained locally as entered; future stored-redaction migrations archive them before any destructive replacement.

@@ -17,3 +17,8 @@ test.each([
   '.config/gcloud/application_default_credentials.json', '.config/gcloud/credentials.db', '.config/gcloud/access_tokens.db',
   '.config/gh/hosts.yml', '.gem/credentials', '.bundle/config', 'deploy/signing.p8', 'vpn/client.ovpn', 'vault/master.agekey',
 ])('credential file is excluded: %s', path => expect(isSecretPath(path)).toBe(true));
+
+
+test.each(['.dev.vars', 'login.ppk', 'terraform.tfstate.backup', 'pip.conf', '.yarnrc.yml', 'private.gpg', 'appsettings.Production.json', 'wp-config.php', 'local_settings.py'])(
+  '0.6.6 never scans credential file %s', path => { expect(isSecretPath(path)).toBe(true); expect(isSecretPath(`nested/${path}`)).toBe(true); },
+);

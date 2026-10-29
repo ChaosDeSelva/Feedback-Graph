@@ -6,7 +6,7 @@ export type GithubSyncDeps = {
   authors?: Map<string, string>;
   token: string;
   fetchPrs(o: FetchPrOpts): Promise<PrContext[]>;
-  docs: Pick<DocsStore, 'upsertDoc' | 'getCursor' | 'setCursor'>;
+  docs: Pick<DocsStore, 'upsertDoc' | 'getCursor' | 'setCursor'> & Partial<Pick<DocsStore, 'listDocs'>>;
   embed(texts: string[]): Promise<number[][]>;
   activity?: Pick<ActivityStore, 'record'>;
   /** Skip a project synced less than this long ago. */
@@ -51,6 +51,23 @@ export async function syncGithub(d: GithubSyncDeps): Promise<{ prs: number }> {
           );
         }
       };
+      // Independent of the redaction-rules cursor: installs that already completed v7 still repair PR chunks.
+      const repairKey = `github-redaction-source-repair-v8:${projectKey}`;
+      const repairAt = await d.docs.getCursor(repairKey);
+      if (repairAt !== 'done' && d.docs.listDocs) {
+        const existing = new Set((await d.docs.listDocs(projectKey, { source: 'github', limit: 2147483647 })).map(doc => doc.ref));
+        let cappedAt: string | null = null;
+        const originals = existing.size ? await d.fetchPrs({ repo, token: d.token, since: '1970-01-01T00:00:00.000Z', maxPrs: 100,
+          ...(repairAt ? { until: repairAt } : {}), onCap: at => { cappedAt = at; }, ...(d.authors?.get(projectKey) ? { author: d.authors.get(projectKey) } : {}) }) : [];
+        const restored = originals.filter(pr => existing.has(`github:${repo}#${pr.number}`));
+        await store(restored);
+        await d.docs.setCursor(repairKey, cappedAt ?? 'done');
+        if (restored.length) await d.activity?.record({ kind: 'doc_added', actor: 'github', projectKey,
+          subject: `re-fetched ${restored.length} existing GitHub documents after redaction`,
+          why: 'Rebuilt stored PR chunks from GitHub under the current redaction rules; this does not recover unavailable fact or lesson originals.',
+          details: { recovery: 'redaction-v8-source', documentsRefetched: restored.length, complete: !cappedAt },
+          targets: restored.map(pr => `doc:${projectKey}:github:github:${repo}#${pr.number}`) });
+      }
       let readBackTo = null as string | null; // set by onCap
       const list = await d.fetchPrs({ repo, token: d.token, since, ...(d.authors?.get(projectKey) && { author: d.authors.get(projectKey) }), onCap: (t) => { readBackTo = t; } });
       await store(list);

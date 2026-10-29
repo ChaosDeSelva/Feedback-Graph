@@ -1,3 +1,4 @@
+import { storeTimeLeft, storeRequestSignal } from '../storeDeadline.ts';
 import { randomUUID } from 'node:crypto';
 import type { Config } from '../config.ts';
 import { EMPTY_SELECTION, ingestSeedsStored, initialSelection, projectScope, type ProjectScope, type ProjectSelection } from '../scope.ts';
@@ -195,9 +196,13 @@ export class SelectionRepo implements SelectionStore {
   /** A write to one IngestLock node, held until fn settles: another section's write waits for the commit. */
   async exclusive<T>(fn: () => Promise<T>): Promise<T> {
     const session = this.g.driver.session();
-    const tx = session.beginTransaction();
+    const tx = session.beginTransaction({ timeout: storeTimeLeft() });
+    const signal = storeRequestSignal();
+    const cancel = () => { void tx.rollback().catch(() => {}); void session.close().catch(() => {}); };
+    signal?.addEventListener('abort', cancel, { once: true });
     try {
       await tx.run('MERGE (l:IngestLock {id: $id}) SET l.heldAt = $now', { id: ID, now: new Date().toISOString() });
+      storeTimeLeft();
       let out: T;
       try {
         out = await fn();
@@ -205,9 +210,11 @@ export class SelectionRepo implements SelectionStore {
         await tx.rollback().catch(() => {});
         throw err;
       }
+      storeTimeLeft();
       await tx.commit();
       return out;
     } finally {
+      signal?.removeEventListener('abort', cancel);
       await session.close();
     }
   }

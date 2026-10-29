@@ -35,6 +35,7 @@ export const OWNER_ROUTES: readonly (readonly ['POST' | 'PUT' | 'PATCH' | 'DELET
   ['PUT', '/api/settings/roots', 'settings'],
   ['POST', '/api/settings/cleanup', 'settings'],
   ['POST', '/api/cloud/sync', 'sync_now'],
+  ['PUT', '/api/cloud/local-only', 'settings'],
   ['POST', '/api/turns/requeue', 'requeue'],
   ['POST', '/api/import', 'import'],
   ['POST', '/api/sessions/:id/resummarize', 'resummarize'],
@@ -165,6 +166,8 @@ export const runCaller = <T>(key: string | null, fn: () => T): T => caller.run(k
 export const currentCaller = (): string | null => caller.getStore() ?? null;
 const processRunSalt = randomBytes(32).toString('hex');
 export function runKey(header: string | undefined, salt = processRunSalt): string | null {
-  return header && header.length >= 32 && header.length <= 512
+  return header && header.length >= 32 && header.length <= 512 && new Set(header).size >= 8
+    && !/^(.{1,256})\1+$/.test(header)
+    && [...new Set(header)].every(char => header.split(char).length - 1 <= header.length / 2)
     ? `run-key:${createHmac('sha256', salt).update(header).digest('hex')}` : null;
 }

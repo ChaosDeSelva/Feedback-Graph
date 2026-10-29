@@ -14,6 +14,13 @@ import { currentRun, hasOperatorToken, operatorName, runAs } from './operator.ts
 /** examples/demo-shop: a small multi-tenant API whose CLAUDE.md states the rules the corpus is about. */
 export const DEMO_PROJECT = 'demo-shop';
 const SOURCE = DEMO_SOURCE;
+/** Synthetic diff only: no host repository is edited or probed. */
+export const DEMO_PROBE = {
+  task: 'Edit src/probes/no-console.ts', files: ['src/probes/no-console.ts'],
+  diff: 'diff --git a/src/probes/no-console.ts b/src/probes/no-console.ts\n--- a/src/probes/no-console.ts\n+++ b/src/probes/no-console.ts\n@@ -0,0 +1 @@\n+console.log("request started");\n',
+  expectedLessonSlug: 'no-console-probe', expectedVerdict: 'gap',
+};
+
 
 type DemoLesson = { slug: string; title: string; rule: string; appliesWhen: string; paths: string[] };
 type DemoFact = { path: string; kind: FactKind; statement: string; lines: string | null };
@@ -24,6 +31,11 @@ export const DEMO_CORPUS: {
   facts: DemoFact[];
 } = {
   lessons: [
+    {
+      slug: 'no-console-probe', title: 'No console.log in the isolated probe module',
+      rule: 'Do not call console.log in src/probes/no-console.ts.',
+      appliesWhen: 'editing src/probes/no-console.ts', paths: ['src/probes/no-console.ts'],
+    },
     {
       slug: 'tenant-scoping', title: 'Routes read data only through db.scoped(orgId)',
       rule: 'Every route query goes through db.scoped(req.auth.orgId). Never call db.raw() from src/routes: it returns every org\'s rows.',
@@ -73,7 +85,7 @@ export type DemoDeps = {
   selected?: (key: string) => Promise<boolean>;
 };
 
-export type DemoSeeded = { project: string; lessons: number; misses: number; facts: number; skippedFacts: string[]; message: string };
+export type DemoSeeded = { probe: typeof DEMO_PROBE; project: string; lessons: number; misses: number; facts: number; skippedFacts: string[]; message: string };
 export type DemoRemovedResult = { project: string; lessons: number; misses: number; facts: number; message: string };
 
 /**
@@ -183,7 +195,7 @@ export async function seedDemo(o: { project?: string; owner?: boolean }, d: Demo
     details: { lessons: lessonIds, miss: missId, facts, skippedFacts, ...(run && { run: run.id }) },
     targets: [...lessonIds, missId],
   });
-  return { project: key, lessons: lessonIds.length, misses: 1, facts, skippedFacts, message };
+  return { probe: DEMO_PROBE, project: key, lessons: lessonIds.length, misses: 1, facts, skippedFacts, message };
 }
 
 /** Remove exactly what the demo seed wrote in the project. */

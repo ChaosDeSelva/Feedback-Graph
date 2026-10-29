@@ -4,7 +4,7 @@ import type { AddressInfo } from 'node:net';
 import { hostname, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, afterEach, expect, test } from 'vitest';
-import { isolatedRunnerArgs, mirrorLeasePath, purgeStaleRunnerMirrors, createCodexRunner, resolveMirror, runOnRunner, RUNNER_TOKEN_FILE, RunnerUnavailableError, writeRunnerToken, type RunnerOpts } from './codexRunner.ts';
+import { isolatedRunnerArgs, mirrorLeaseOwner, mirrorLeasePath, purgeStaleRunnerMirrors, createCodexRunner, resolveMirror, runOnRunner, RUNNER_TOKEN_FILE, RunnerUnavailableError, writeRunnerToken, type RunnerOpts } from './codexRunner.ts';
 import type { Exec } from './exec.ts';
 import { makeProvider } from './providers.ts';
 import { providerUnavailableReason } from './unavailable.ts';
@@ -313,4 +313,34 @@ test('worker sweeps recently abandoned mirrors but preserves live renewable leas
   expect(existsSync(live)).toBe(true);
   await purgeStaleRunnerMirrors(scratch, undefined, Date.now() + 6 * 60_000);
   expect(existsSync(live)).toBe(false);
+});
+
+
+test('runner readiness rejects unavailable sandbox before any repository mirror is created', async () => {
+  const { scratch } = fresh();
+  let healthCalls = 0;
+  const fetchImpl = (async (url: string) => {
+    expect(String(url)).toMatch(/\/health$/);
+    healthCalls++;
+    return new Response(JSON.stringify({ ok: false, sandbox: false, error: 'Cannot mount private proc' }), { status: 503 });
+  }) as typeof fetch;
+  const provider = makeProvider('codex-cli', { CODEX_RUNNER_URL: 'http://runner', CODEX_RUNNER_SCRATCH: scratch }, { fetchImpl });
+  await expect(provider.mirror!(join(scratch, 'nonexistent-repo'))).rejects.toThrow(/Cannot mount private proc/);
+  await expect(provider.json({ system: 's', user: 'u', schema: job.schema, cwd: join(scratch, 'nonexistent-repo') })).rejects.toThrow(/Cannot mount private proc/);
+  expect(healthCalls).toBe(2);
+  const { readdir } = await import('node:fs/promises');
+  expect((await readdir(scratch)).filter(name => name.startsWith('fb-mirror-'))).toEqual(['fb-mirror-1']);
+});
+
+
+test('a reused worker PID cannot keep an abandoned mirror alive with an old process nonce', async () => {
+  const { scratch } = fresh();
+  const old = join(scratch, 'fb-mirror-reused'), live = join(scratch, 'fb-mirror-live');
+  mkdirSync(old); mkdirSync(live);
+  const owner = await mirrorLeaseOwner();
+  writeFileSync(mirrorLeasePath(old), JSON.stringify({ ...owner, nonce: 'previous-process-instance' }));
+  writeFileSync(mirrorLeasePath(live), JSON.stringify(owner));
+  await purgeStaleRunnerMirrors(scratch, undefined, Date.now(), true);
+  expect(existsSync(old)).toBe(false);
+  expect(existsSync(live)).toBe(true);
 });

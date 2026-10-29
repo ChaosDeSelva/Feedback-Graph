@@ -151,12 +151,12 @@ const keepNearBest = <T extends { score: number }>(xs: T[]) => {
  * same, more mildly, for `services` (the folders the task names, servicesInTask). Nothing under SIMILARITY_FLOOR,
  * and nothing far below the best, is kept. Similarity stays unchanged; only the sort key is weighted.
  */
-export function rankFacts<T extends FactHit>(hits: T[], n: number, files: string[] = [], services: string[] = [], floor = SIMILARITY_FLOOR): T[] {
+export function rankFacts<T extends FactHit>(hits: T[], n: number, files: string[] = [], services: string[] = [], floor = SIMILARITY_FLOOR): (T & { rankingScore: number })[] {
   return keepNearBest(
     hits.filter((h) => h.score >= floor && ((h.fact.relevance ?? UNSCORED_RELEVANCE) >= MIN_RELEVANCE || h.score >= CLOSE_ENOUGH))
       .map((hit) => ({ hit, score: hit.score * (0.55 + 0.45 * (hit.fact.relevance ?? UNSCORED_RELEVANCE)) * affinity(hit.fact.path ?? '.', files, services) }))
       .sort((a, b) => b.score - a.score),
-  ).slice(0, n).map(({ hit }) => hit);
+  ).slice(0, n).map(({ hit, score }) => ({ ...hit, rankingScore: score }));
 }
 
 /**
@@ -164,7 +164,7 @@ export function rankFacts<T extends FactHit>(hits: T[], n: number, files: string
  * where the paths they mention sit against the named files (pathAffinity), and none far below the best. Never one whose
  * lesson you rejected as worked out from the wrong session (rejectedWrongSession): it is evidence of nothing.
  */
-export function rankMisses<T extends { missed: string; feedbackText: string; score: number; rejectedWrongSession?: boolean }>(hits: T[], n: number, files: string[] = [], services: string[] = [], floor = SIMILARITY_FLOOR): T[] {
+export function rankMisses<T extends { missed: string; feedbackText: string; score: number; rejectedWrongSession?: boolean }>(hits: T[], n: number, files: string[] = [], services: string[] = [], floor = SIMILARITY_FLOOR): (T & { rankingScore: number })[] {
   return keepNearBest(
     hits.filter((m) => !m.rejectedWrongSession && !isNonMiss(m.missed) && m.score >= floor)
       .map((hit) => {
@@ -172,5 +172,5 @@ export function rankMisses<T extends { missed: string; feedbackText: string; sco
         const weight = paths.length ? Math.max(...paths.map((p) => affinity(p, files, services))) : 1;
         return { hit, score: hit.score * weight };
       }).sort((a, b) => b.score - a.score),
-  ).slice(0, n).map(({ hit }) => hit);
+  ).slice(0, n).map(({ hit, score }) => ({ ...hit, rankingScore: score }));
 }

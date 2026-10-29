@@ -5,7 +5,7 @@ import { runKey } from './operator.ts';
 import type { ContextDeps } from './context.ts';
 
 const OP = 'o'.repeat(32);
-const KEY = 'test-run-capability-'.padEnd(40, 'a');
+const KEY = 'c2ad856fb97403e18a2e7dc9015b6f438670dcaeb3219a845f0d7c8b6e109234';
 const CALLER = runKey(KEY)!;
 const json = (method: string, body: object, headers: Record<string, string> = {}) => ({
   method, body: JSON.stringify(body), headers: { 'content-type': 'application/json', ...headers },
@@ -244,7 +244,7 @@ const items: RunItem[] = [
   { kind: 'doc', id: 'doc:demo:upload:a.md', projectKey: 'demo', sandbox: true, group: null, merged: false },
 ];
 const runEntries = [
-  entry({ kind: 'candidate_flagged', actor: 'operator:tester', run: 'run-1', targets: ['manual:a'], details: { via: 'api' } }),
+  entry({ kind: 'candidate_flagged', actor: 'operator:tester', run: 'run-1', targets: ['manual:a'], details: { via: 'operator' } }),
   // The owner approved b's lesson in the browser since: the run did not make that decision, so b stays.
   entry({ kind: 'lesson_decided', actor: 'you', targets: ['lesson:manual:b'], details: { via: 'browser' }, subject: 'approved lesson "B"' }),
   // The worker's own work on the run's records is not a touch.
@@ -253,7 +253,7 @@ const runEntries = [
   entry({ kind: 'feedback_decided', actor: 'operator:tester', run: 'run-1', targets: ['c-owner'], details: { via: 'operator' }, subject: 'confirmed: "x"' }),
   // So is a pin (it names no record), but not what the run was served.
   entry({ kind: 'project_pinned', actor: 'operator:tester', run: 'run-1', targets: [], details: { via: 'operator' }, subject: 'pinned demo' }),
-  entry({ kind: 'context_served', actor: 'operator:tester', run: 'run-1', targets: ['lesson:owner'], details: { via: 'api' } }),
+  entry({ kind: 'context_served', actor: 'operator:tester', run: 'run-1', targets: ['lesson:owner'], details: { via: 'operator' } }),
 ];
 
 test('a dry run (the default) says per kind what would go, what stays and why, and what the run changed that is not its own; nothing is removed', async () => {
@@ -293,7 +293,7 @@ test("the operator token may clean up by default, only its own run; a plain clie
 
 test('the first labelled write stamps who opened the run: the operator token, the API token, the browser or an agent', async () => {
   const s = setup({ token: API });
-  await s.app.request('/api/candidates/c1/decision', json('POST', { status: 'confirmed' }, op('run-op')));
+  await s.app.request('/api/candidates/r:run-op/decision', json('POST', { status: 'confirmed' }, op('run-op')));
   await s.app.request('/api/candidates/c1/decision', json('POST', { status: 'confirmed' }, { ...browser, authorization: `Bearer ${API}`, 'x-fg-run': 'run-web' }));
   await s.app.request('/mcp?run=run-tok', { ...rpc('report_feedback', { cwd: '/Users/j/Vibe/demo', feedback: 'x', what_was_done: 'y' }), headers: { ...rpc('x', {}).headers, authorization: `Bearer ${API}` } });
   const open = setup();
@@ -400,7 +400,7 @@ test('a run with more entries than a cleanup reads: only the entries it read (an
   const many = Array.from({ length: 5100 }, (_, i) => entry({
     id: `act:${String(i).padStart(5, '0')}`, actor: 'operator:tester', run: 'run-1', ...(i % 20 === 0
       ? { kind: 'project_pinned' as const, details: { via: 'operator' }, subject: `pinned ${i}` }
-      : { kind: 'context_served' as const, details: { via: 'api' } }),
+      : { kind: 'context_served' as const, details: { via: 'operator' } }),
   }));
   const { app, removeArgs, logged } = setup({ items: [], entries: many, owners: { 'run-1': ['operator', CALLER] } });
   const res = (await (await app.request('/api/runs/run-1', json('DELETE', { dryRun: false }, op()))).json()) as Record<string, any>;
@@ -607,13 +607,14 @@ test('operator-labelled writes require a valid run capability', async () => {
   }
 });
 
-test('cleanup preserves request Activity written by another displayed caller', async () => {
+test('cleanup follows validated principal across display names and preserves another principal', async () => {
   const mine = entry({ id: 'mine', run: 'run-1', actor: 'operator:tester', details: { via: 'operator' } });
-  const other = entry({ id: 'other', run: 'run-1', actor: 'operator:other', details: { via: 'operator' } });
-  const s = setup({ items: [], entries: [mine, other], owners: { 'run-1': ['operator', CALLER] } });
+  const renamed = entry({ id: 'renamed', run: 'run-1', actor: 'claude-code (MCP)', details: { via: 'operator' } });
+  const other = entry({ id: 'other', run: 'run-1', actor: 'you', details: { via: 'browser' } });
+  const s = setup({ items: [], entries: [mine, renamed, other], owners: { 'run-1': ['operator', CALLER] } });
   const res = await s.app.request('/api/runs/run-1', json('DELETE', { dryRun: false }, op()));
   expect(res.status).toBe(200);
-  expect(s.removeArgs[0].ids).toEqual(['mine']);
+  expect(s.removeArgs[0].ids).toEqual(['mine', 'renamed']);
 });
 
 
@@ -638,4 +639,50 @@ test('MCP recent-session lists and details cannot expose another sandbox run', a
   expect(queries).toEqual([expect.objectContaining({ run: 'mine' })]);
   expect(md).not.toContain('session private');
   expect(md).toContain('No session');
+});
+
+
+test('forbidden operator writes and MCP initialization do not reserve new run ids', async () => {
+  const s = setup({ allow: [] });
+  expect((await s.app.request('/api/lessons/l1', json('PATCH', { status: 'approved' }, op('refused-new')))).status).toBe(403);
+  expect(s.owners.has('refused-new')).toBe(false);
+  const initialized = await s.app.request('/mcp?run=init-new', json('POST', { jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-03-26', capabilities: {}, clientInfo: { name: 'codex', version: 'test' } } }));
+  expect(initialized.status).not.toBe(409);
+  expect(s.owners.has('init-new')).toBe(false);
+});
+
+
+test('a refused first run write to an owner record does not claim the run id', async () => {
+  const s = setup();
+  const refused = await s.app.request('/api/candidates/c1/decision', json('POST', { status: 'confirmed' }, op('refused-owner')));
+  expect(refused.status).toBe(409);
+  expect(s.owners.has('refused-owner')).toBe(false);
+});
+
+
+test('legacy owner cleanup requires the actual configured owner token', async () => {
+  const s = setup({ token: API, owners: { legacy: ['operator', 'old-display-name'] } });
+  const base = { origin: 'http://localhost', 'x-fg-owner-cleanup': 'true' };
+  expect((await s.app.request('/api/runs/legacy', json('DELETE', { dryRun: true }, { ...base, authorization: `Bearer ${OP}` }))).status).toBe(403);
+  expect((await s.app.request('/api/runs/legacy', json('DELETE', { dryRun: true }, { ...base, authorization: `Bearer ${API}` }))).status).toBe(200);
+});
+
+
+test('labelled415 refuses before reserving a run id', async () => {
+  const s = setup();
+  const response = await s.app.request('/api/sessions/already/run', { method: 'POST', headers: op('bad-content-type') });
+  expect(response.status).toBe(415);
+  expect(s.owners.has('bad-content-type')).toBe(false);
+});
+
+test('labelled session409 preflight reserves neither run ownership nor a session binding', async () => {
+  let claims = 0;
+  const s = setup({ extra: { sessions: { projects: () => ['demo'], inScope: () => true, store: {
+    list: async () => ({ sessions: [], next: null }), detail: async () => ({ id: 'already', projectKey: 'demo' } as never), requestRebuild: async () => false,
+    runFor: async () => null, claimRun: async () => { claims++; return false; },
+  } } } });
+  const response = await s.app.request('/api/sessions/already/run', json('POST', {}, op('refused-session')));
+  expect(response.status).toBe(409);
+  expect(s.owners.has('refused-session')).toBe(false);
+  expect(claims).toBe(0);
 });

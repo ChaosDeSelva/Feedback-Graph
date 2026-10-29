@@ -28,7 +28,7 @@ function deps(o: Partial<CloudDeps> = {}) {
     },
     projects: async () => ['shop'],
     worker: async () => null,
-    fetch: (async (url: string) => { fetchCalls.push(url); return Response.json(syncOk); }) as unknown as typeof fetch,
+    fetch: (async (url: string) => { if (url.endsWith('/sync-policy')) return new Response(null, { status: 404 }); fetchCalls.push(url); return Response.json(syncOk); }) as unknown as typeof fetch,
     ...o,
   };
   return { d, log, fetchCalls };
@@ -158,4 +158,21 @@ test('preview errors do not break the card', async () => {
   const res = await createApp(repo, { cloud: d }).request('/api/cloud');
   expect(res.status).toBe(200);
   expect((await res.json()).preview).toBeNull();
+});
+
+
+test('local-only settings are owner protected, durable, and prevent forced manual export', async () => {
+  const saved = new Map<string, string>();
+  const localOnlyStore = { getCursor: async (key: string) => saved.get(key) ?? null, setCursor: async (key: string, value: string) => { saved.set(key, value); } };
+  const { d, fetchCalls } = deps({ localOnlyStore });
+  const app = createApp(repo, { cloud: d });
+  const request = (origin?: string) => ({ method: 'PUT', body: JSON.stringify({ projects: ['shop'] }), headers: { 'content-type': 'application/json', ...(origin ? { origin } : {}) } });
+  expect((await app.request('/api/cloud/local-only', request())).status).toBe(403);
+  expect((await app.request('/api/cloud/local-only', request('http://localhost'))).status).toBe(200);
+  expect((await (await app.request('/api/cloud')).json()).projects).toEqual([]);
+  const result = await app.request('/api/cloud/sync', { ...post('http://localhost'), body: JSON.stringify({ force: true }) });
+  expect(result.status).toBe(200);
+  expect(fetchCalls).toEqual([]);
+  const restarted = createApp(repo, { cloud: { ...d, localOnlyStore } });
+  expect((await (await restarted.request('/api/cloud')).json()).localOnlyProjects).toEqual(['shop']);
 });

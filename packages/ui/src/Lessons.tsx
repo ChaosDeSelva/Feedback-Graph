@@ -116,7 +116,7 @@ function BulkDialog({ action, lessons, onCancel, onDone }: {
           <h2 id={titleId} className="font-semibold">{label}?</h2>
           <p className="text-muted">
             {action === 'approved'
-              ? 'Agents start getting each of them with their task context straight away. Each is recorded as approved by you. If cloud sync is enabled, they are eligible for the next sync, which may run immediately.'
+              ? 'Agents start getting each of them with their task context straight away. Each is recorded as approved by you. If cloud sync is enabled, they are eligible for the next scheduled sync. Approval does not trigger a sync; use Sync now to send them.'
               : 'Agents never get them. They move to Rejected, where you can put any back up for review.'}
           </p>
           <ul aria-label="lessons" className="grid max-h-48 gap-1 overflow-y-auto">
@@ -682,7 +682,7 @@ export function Lessons() {
                       Convert to fact
                     </Button>
                     {converting && <ToFactDialog lesson={detail.lesson} onCancel={() => setConverting(false)} onDone={converted} />}
-                    <span className="text-xs text-muted">Approve saves your edits above. If cloud sync is enabled, approval is shared on the next sync, which may run immediately (or use Sync now).</span>
+                    <span className="text-xs text-muted">Approve saves your edits above. If cloud sync is enabled, approval is shared on the next scheduled sync. Approval does not trigger a sync; use Sync now to send it.</span>
                   </>
                 )}
                 {status === 'approved' && (

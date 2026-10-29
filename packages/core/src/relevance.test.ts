@@ -167,3 +167,14 @@ test('an embedder-calibrated floor is explicit and preserves scores; the semanti
   expect(rankMisses([miss], 5, [], [], 0.05)[0].score).toBe(0.2);
   expect(rankFacts([hit('below lexical gate', 0.04, 1)], 5, [], [], 0.05)).toEqual([]);
 });
+
+test('serves raw similarity separately from the task-weighted score without mutating source hits', () => {
+  const original = { fact: { id: 'x', path: 'src/a.ts', relevance: .4 } as never, score: .82 };
+  const [ranked] = rankFacts([original], 1);
+  expect(ranked.score).toBe(.82);
+  expect(ranked.rankingScore).toBeCloseTo(.82 * (.55 + .45 * .4));
+  expect(original).not.toHaveProperty('rankingScore');
+  const [miss] = rankMisses([{ missed: 'services/billing/src/b.ts omitted validation', feedbackText: '', score: .82 }], 1, ['services/auth/src/a.ts']);
+  expect(miss.score).toBe(.82);
+  expect(miss.rankingScore).toBeLessThan(.82);
+});

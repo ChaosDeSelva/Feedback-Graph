@@ -215,6 +215,15 @@ describeStores('external feedback threads', (h) => {
     expect((await store.knowledge.commentLessons!({ status: 'proposed', limit: 10 })).map((l) => l.id)).toEqual([all[1].id]);
   });
 
+  test('PR metadata refresh updates stored comments without creating historical feedback', async () => {
+    await store.graph.upsertExternalThread(project, thread(1));
+    await store.graph.refreshExternalThreadState('github:acme/shop#7', 'closed');
+    await store.graph.refreshExternalThreadState('github:acme/shop#999', 'merged');
+    const items = await store.graph.unclassifiedTurns(10);
+    expect(items).toHaveLength(1);
+    expect(items[0].external).toMatchObject({ threadState: 'closed', author: 'reviewer', linkedSessionIds: [] });
+  });
+
   test('an agent report never merges into a synced comment', async () => {
     const now = new Date().toISOString();
     await store.graph.upsertExternalThread(project, {
