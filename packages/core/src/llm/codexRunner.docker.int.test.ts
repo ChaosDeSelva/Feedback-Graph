@@ -223,6 +223,45 @@ describe.skipIf(!dockerUp)('codex-runner container', () => {
     expect(docker(['exec', `${id}-runner`, 'cat', '/scratch/fb-mirror-pending/private.txt'])).toBe('OTHER_PROJECT');
   });
 
+  test('the pinned Codex CLI runs its real read-only tool sandbox without login or a model', () => {
+    // rust-v0.162.0 cli/src/main.rs selects the host backend: `sandbox -- COMMAND`, not `sandbox linux`.
+    // cli/src/debug_sandbox.rs launches that backend directly, independently of model execution/authentication.
+    docker(['exec', `${id}-runner`, 'node', '-e', `
+      const fs = require('fs');
+      fs.mkdirSync('/scratch/fb-mirror-pending', { recursive: true });
+      fs.writeFileSync('/scratch/fb-mirror-pending/private.txt', 'OTHER_PROJECT');
+      fs.mkdirSync('/tmp/codex-real-sandbox-probe', { recursive: true });
+    `]);
+    const marker = 'FG_CODEX_SANDBOX_PROBE ';
+    const probe = `
+      const fs = require('fs');
+      const { forbidden } = JSON.parse(Buffer.from(process.argv[1], 'base64').toString());
+      const blocked = ['/scratch/.runner-token', '/scratch/fb-mirror-pending/private.txt', '/codex/old-history.txt'];
+      const pids = fs.readdirSync('/proc').filter(p => /^\\d+$/.test(p));
+      const parents = pids.filter(pid => { try { const text = fs.readFileSync('/proc/' + pid + '/cmdline', 'utf8'); return forbidden.some(value => text.includes(value)); } catch { return false; } });
+      process.stdout.write('FG_CODEX_SANDBOX_PROBE ' + JSON.stringify({
+        current: fs.readFileSync('/repo/notes.txt', 'utf8'),
+        leaks: blocked.filter(path => { try { fs.readFileSync(path); return true; } catch { return false; } }),
+        parents, pids: pids.length,
+      }) + '\\n');
+    `;
+    // Empty private CODEX_HOME and absent API credentials ensure this mandatory probe cannot use a login/model.
+    const args = isolatedRunnerArgs({
+      dir: '/scratch/fb-mirror-job', work: '/tmp/codex-real-sandbox-probe', auth: '/codex/auth.json', bin: 'env',
+      args: ['-u', 'OPENAI_API_KEY', '-u', 'CODEX_API_KEY', '-u', 'OPENAI_BASE_URL',
+        'CODEX_HOME=/tmp/codex-noauth-home', 'codex', '-c', 'sandbox_mode="read-only"', 'sandbox', '--', 'node', '-e', probe,
+        Buffer.from(JSON.stringify({ forbidden: ['codexRunnerMain.ts', 'setInterval(() => {}, 1000)'] })).toString('base64')],
+    });
+    const output = docker(['exec', `${id}-runner`, 'bwrap', ...args], { timeout: 30_000 });
+    const line = output.split('\n').find(line => line.startsWith(marker));
+    expect(line, 'real Codex sandbox must execute the probe command successfully').toBeDefined();
+    const seen = JSON.parse(line!.slice(marker.length));
+    expect(seen.current).toContain(INSIDE);
+    expect(seen.leaks).toEqual([]);
+    expect(seen.parents).toEqual([]);
+    expect(seen.pids).toBeLessThanOrEqual(3);
+  }, 40_000);
+
   test('the runner wrote its token into the scratch volume and refuses requests without it', async () => {
     for (let i = 0; i < 50 && !existsSync(join(scratch, RUNNER_TOKEN_FILE)); i++) await new Promise((r) => setTimeout(r, 200));
     expect(readFileSync(join(scratch, RUNNER_TOKEN_FILE), 'utf8')).toMatch(/^[0-9a-f]{64}$/);
