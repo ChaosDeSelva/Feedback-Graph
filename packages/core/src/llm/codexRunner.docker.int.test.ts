@@ -50,6 +50,9 @@ describe.skipIf(!dockerUp)('codex-runner container', () => {
     mkdirSync(workerOnly);
     writeFileSync(join(workerOnly, 'canary.txt'), `${CANARY}\n`);
     writeFileSync(join(scratch, 'fb-mirror-job', 'notes.txt'), `${INSIDE}\n`);
+    const home = join(root, 'codex-home');
+    mkdirSync(home);
+    writeFileSync(join(home, 'old-history.txt'), 'OLD_HISTORY');
     const auth = join(root, 'auth.json');
     writeFileSync(auth, codexLogin ? readFileSync(authFile) : '');
     docker(['build', '--target', 'codex-runner', '-t', IMAGE, repoRoot], { timeout: 600_000 });
@@ -63,7 +66,7 @@ describe.skipIf(!dockerUp)('codex-runner container', () => {
     // loopback only for this test.
     const launch = (compatibility: string[]) => docker([
       'run', '-d', ...user, ...compatibility, '--name', `${id}-runner`, '--network', `${id}-net`, '--init', '--read-only', '--tmpfs', '/tmp', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges:true', '--security-opt', 'seccomp=unconfined', '--security-opt', `apparmor=${runnerAppArmor}`,
-      '-e', 'HOME=/tmp', '-v', `${scratch}:/scratch`, '-v', `${id}-home:/codex`, '-v', `${auth}:/codex/auth.json`, '-p', '127.0.0.1::8790', IMAGE,
+      '-e', 'HOME=/tmp', '-v', `${scratch}:/scratch`, '-v', `${home}:/codex`, '-v', `${auth}:/codex/auth.json`, '-p', '127.0.0.1::8790', IMAGE,
     ]);
     // Exercise the unchanged masked default before explicitly selecting test-only compatibility.
     if (systemPathsOptions.length) {
@@ -163,29 +166,36 @@ describe.skipIf(!dockerUp)('codex-runner container', () => {
   test('nothing in the runner container holds the worker-only canary or the worker secrets; the mirror is there', () => {
     // The worker stand-in can read both, so the strings exist and the search below works.
     expect(docker(['exec', `${id}-worker`, 'node', '-e', 'process.stdout.write(require("fs").readFileSync("/transcripts/canary.txt","utf8") + process.env.NEO4J_PASSWORD)'])).toContain(SECRET);
-    // Every file the runner can open, /proc environments included, searched for the strings.
+    // Explicit roots cover readable descendants even when AppArmor denies listing an intermediate directory.
+    const roots = ['/', '/usr/bin', '/usr/local/bin', '/usr/lib', '/runner', '/etc', '/scratch', '/codex', '/transcripts'];
+    const paths = ['/scratch/fb-mirror-job/notes.txt', '/transcripts/canary.txt', '/etc/passwd', '/runner/codexRunner.ts', '/usr/local/bin/node', '/proc/self/environ', '/proc/self/cmdline'];
     const walk = `
       const fs = require('fs'), path = require('path');
-      const want = JSON.parse(Buffer.from(process.argv[1], 'base64').toString()); const found = new Set(); let files = 0;
-      const look = (p) => { try { const b = fs.readFileSync(p).subarray(0, 4e6).toString('latin1'); files++; for (const w of want) if (b.includes(w)) found.add(w + ' in ' + p); } catch {} };
-      const walk = (d) => { let es; try { es = fs.readdirSync(d, { withFileTypes: true }); } catch { return; }
+      const { want, roots, paths } = JSON.parse(Buffer.from(process.argv[1], 'base64').toString());
+      const found = new Set(), visited = new Set(), reads = {}, enumerated = {};
+      const look = (p) => { try { const b = fs.readFileSync(p).subarray(0, 4e6).toString('latin1'); for (const w of want) if (b.includes(w)) found.add(w + ' in ' + p); return true; } catch { return false; } };
+      const walk = (d) => { if (visited.has(d)) return; visited.add(d); let es; try { es = fs.readdirSync(d, { withFileTypes: true }); enumerated[d] = true; } catch { enumerated[d] = false; return; }
         for (const e of es) { const p = path.join(d, e.name);
           if (d === '/' && ['proc', 'sys', 'dev'].includes(e.name)) continue;
           if (e.isDirectory()) walk(p); else if (e.isFile()) look(p); } };
-      walk('/');
+      for (const root of roots) walk(root);
+      for (const p of paths) reads[p] = look(p);
       for (const pid of fs.readdirSync('/proc').filter((x) => /^\\d+$/.test(x))) { look('/proc/' + pid + '/environ'); look('/proc/' + pid + '/cmdline'); }
-      process.stdout.write(JSON.stringify({ files, found: [...found] }));`;
-    const out = JSON.parse(docker(['exec', `${id}-runner`, 'node', '-e', walk, Buffer.from(JSON.stringify([CANARY, SECRET, INSIDE])).toString('base64')], { timeout: 300_000 })) as { files: number; found: string[] };
-    expect(out.files).toBeGreaterThan(100);
+      process.stdout.write(JSON.stringify({ roots: Object.fromEntries(roots.map(p => [p, enumerated[p]])), reads, found: [...found] }));`;
+    const out = JSON.parse(docker(['exec', `${id}-runner`, 'node', '-e', walk, Buffer.from(JSON.stringify({ want: [CANARY, SECRET, INSIDE], roots, paths })).toString('base64')], { timeout: 300_000 })) as { roots: Record<string, boolean>; reads: Record<string, boolean>; found: string[] };
+    expect(Object.keys(out.roots)).toEqual(roots);
+    expect(Object.keys(out.reads)).toEqual(paths);
+    for (const p of paths.filter(p => p !== '/transcripts/canary.txt')) expect(out.reads[p], `read positive control ${p}`).toBe(true);
+    expect(out.reads['/transcripts/canary.txt']).toBe(false);
     expect(out.found).toEqual([`${INSIDE} in /scratch/fb-mirror-job/notes.txt`]);
   }, 320_000);
 
   test('the job namespace hides pending mirrors, runner token, old home and parent processes without a model call', () => {
+    expect(readFileSync(join(root, 'codex-home', 'old-history.txt'), 'utf8')).toBe('OLD_HISTORY');
     docker(['exec', `${id}-runner`, 'node', '-e', `
       const fs = require('fs');
       fs.mkdirSync('/scratch/fb-mirror-pending', { recursive: true });
       fs.writeFileSync('/scratch/fb-mirror-pending/private.txt', 'OTHER_PROJECT');
-      fs.writeFileSync('/codex/old-history.txt', 'OLD_HISTORY');
       fs.mkdirSync('/tmp/isolation-test', { recursive: true });
     `]);
     const probe = `
