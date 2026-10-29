@@ -48,4 +48,4 @@ jobs:
         run: sudo apparmor_parser -r scripts/apparmor/feedback-graph-codex-runner
       # The contract suites, once per backend: both must pass the same tests.
       - run: pnpm test:int
-        env: { CODEX_RUNNER_APPARMOR: feedback-graph-codex-runner, TEST_STORES: 'neo4j,postgres', NEO4J_TEST_URL: bolt://127.0.0.1:7688, TEST_PG_URL: 'postgres://fg:fg@127.0.0.1:5433/fg_test' }
+        env: { FG_TEST_RUNNER_UNMASK_SYSTEM_PATHS: '1', CODEX_RUNNER_APPARMOR: feedback-graph-codex-runner, TEST_STORES: 'neo4j,postgres', NEO4J_TEST_URL: bolt://127.0.0.1:7688, TEST_PG_URL: 'postgres://fg:fg@127.0.0.1:5433/fg_test' }

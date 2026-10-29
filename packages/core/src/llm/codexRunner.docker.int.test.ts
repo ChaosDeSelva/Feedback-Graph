@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync,
 import { homedir, tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { afterAll, beforeAll, describe, expect, test } from 'vitest';
+import { runnerTestSystemPaths } from './codexRunner.testOptions.ts';
 import { isolatedRunnerArgs, RUNNER_TOKEN_FILE, runOnRunner } from './codexRunner.ts';
 
 /**
@@ -30,6 +31,7 @@ const codexLogin = existsSync(authFile) && statSync(authFile).size > 0 && proces
 
 const id = `fgrt${process.pid}${Date.now().toString(36)}`;
 const IMAGE = 'fg-codex-runner:test';
+const systemPathsOptions = runnerTestSystemPaths(process.env.FG_TEST_RUNNER_UNMASK_SYSTEM_PATHS);
 const runnerAppArmor = process.env.CODEX_RUNNER_APPARMOR || 'unconfined';
 const CANARY = `CANARY-${id}-7d1e`;
 const SECRET = `WORKERSECRET-${id}-99a0`;
@@ -59,10 +61,37 @@ describe.skipIf(!dockerUp)('codex-runner container', () => {
     docker(['run', '-d', ...user, '--name', `${id}-worker`, '--network', `${id}-net`, '-v', `${scratch}:/scratch`, '-v', `${workerOnly}:/transcripts:ro`, '-e', `NEO4J_PASSWORD=${SECRET}`, '--entrypoint', 'node', IMAGE, '-e', 'setInterval(() => {}, 1000)']);
     // The runner with exactly the hardening docker-compose.yml gives it (checked against the file below), published on
     // loopback only for this test.
-    docker([
-      'run', '-d', ...user, '--name', `${id}-runner`, '--network', `${id}-net`, '--init', '--read-only', '--tmpfs', '/tmp', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges:true', '--security-opt', 'seccomp=unconfined', '--security-opt', `apparmor=${runnerAppArmor}`,
+    const launch = (compatibility: string[]) => docker([
+      'run', '-d', ...user, ...compatibility, '--name', `${id}-runner`, '--network', `${id}-net`, '--init', '--read-only', '--tmpfs', '/tmp', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges:true', '--security-opt', 'seccomp=unconfined', '--security-opt', `apparmor=${runnerAppArmor}`,
       '-e', 'HOME=/tmp', '-v', `${scratch}:/scratch`, '-v', `${id}-home:/codex`, '-v', `${auth}:/codex/auth.json`, '-p', '127.0.0.1::8790', IMAGE,
     ]);
+    // Exercise the unchanged masked default before explicitly selecting test-only compatibility.
+    if (systemPathsOptions.length) {
+      launch([]);
+      const maskedUrl = `http://${docker(['port', `${id}-runner`, '8790/tcp']).trim().split('\n')[0]}`;
+      let masked: Response | undefined;
+      const deadline = Date.now() + 20_000;
+      while (!masked && Date.now() < deadline) {
+        try { masked = await fetch(`${maskedUrl}/health`, { signal: AbortSignal.timeout(7_000) }); }
+        catch { await new Promise(resolve => setTimeout(resolve, 200)); }
+      }
+      expect(masked, 'default runner must answer its actual sandbox readiness probe').toBeDefined();
+      const readiness = await masked!.json();
+      if (!masked!.ok) {
+        expect(masked!.status).toBe(503);
+        expect(readiness).toMatchObject({ ok: false, sandbox: false });
+        expect(readiness.error).toMatch(/sandbox cannot start/i);
+        const refused = await fetch(`${maskedUrl}/run`, {
+          method: 'POST', headers: { authorization: `Bearer ${readFileSync(join(scratch, RUNNER_TOKEN_FILE), 'utf8')}`, 'content-type': 'application/json' },
+          body: JSON.stringify({ prompt: 'probe only', mirror: 'fb-mirror-job', schema: { type: 'object' } }),
+          signal: AbortSignal.timeout(7_000),
+        });
+        expect(refused.status).toBe(503);
+        expect(await refused.json()).toMatchObject({ code: 'sandbox_unavailable' });
+      } else expect(readiness).toMatchObject({ ok: true, sandbox: true });
+      docker(['rm', '-f', '-v', `${id}-runner`]);
+    }
+    launch(systemPathsOptions);
     url = `http://${docker(['port', `${id}-runner`, '8790/tcp']).trim().split('\n')[0]}`;
     // Fail at startup with the runner's diagnostics, rather than reporting missing tokens or failed docker execs.
     const logs = () => {
