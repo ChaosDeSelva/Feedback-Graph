@@ -230,7 +230,7 @@ describe.skipIf(!dockerUp)('codex-runner container', () => {
       const fs = require('fs');
       fs.mkdirSync('/scratch/fb-mirror-pending', { recursive: true });
       fs.writeFileSync('/scratch/fb-mirror-pending/private.txt', 'OTHER_PROJECT');
-      fs.mkdirSync('/tmp/codex-real-sandbox-probe', { recursive: true });
+      fs.mkdirSync('/tmp/codex-real-sandbox-probe/home', { recursive: true });
     `]);
     const marker = 'FG_CODEX_SANDBOX_PROBE ';
     const probe = `
@@ -249,7 +249,7 @@ describe.skipIf(!dockerUp)('codex-runner container', () => {
     const args = isolatedRunnerArgs({
       dir: '/scratch/fb-mirror-job', work: '/tmp/codex-real-sandbox-probe', auth: '/codex/auth.json', bin: 'env',
       args: ['-u', 'OPENAI_API_KEY', '-u', 'CODEX_API_KEY', '-u', 'OPENAI_BASE_URL',
-        'CODEX_HOME=/tmp/codex-noauth-home', 'codex', '-c', 'sandbox_mode="read-only"', 'sandbox', '--', 'node', '-e', probe,
+        'CODEX_HOME=/tmp/codex-real-sandbox-probe/home', 'codex', '-c', 'sandbox_mode="read-only"', 'sandbox', '--', 'node', '-e', probe,
         Buffer.from(JSON.stringify({ forbidden: ['codexRunnerMain.ts', 'setInterval(() => {}, 1000)'] })).toString('base64')],
     });
     const output = docker(['exec', `${id}-runner`, 'bwrap', ...args], { timeout: 30_000 });
