@@ -44,6 +44,7 @@ export async function seedSyncProject(store: Store, key: string, remote: string 
 }
 
 const TOKEN = `fgc_pat_0123456789abcdef_${'A'.repeat(43)}`;
+const POLICY_REVISION = 'a'.repeat(64);
 const fake: CloudConfig = { url: 'https://cloud.example.com', token: TOKEN, intervalMinutes: null, projects: [], suggestions: false, machine: null };
 
 describeStores('cloud sync', (h) => {
@@ -57,12 +58,18 @@ describeStores('cloud sync', (h) => {
 
   test('what is sent is the project with its approved lessons only: no proposed lesson, no transcript text, no excerpts, no document text, no vectors', async () => {
     const bodies: string[] = [];
+    const policyRequests: RequestInit[] = [];
     const f = (async (_url: string, init: RequestInit) => {
+      if (_url.endsWith('/api/v1/sync-policy')) { policyRequests.push(init); return Response.json({ revision: POLICY_REVISION }); }
+      expect(init.method).toBe('POST');
       bodies.push(init.body as string);
       return Response.json({ syncId: 's', org: 'acme', projects: [{ localKey: 'demo', key: 'github.com/acme/demo', remote: 'github.com/acme/demo', namespace: 'team' }], lessons: { team: 1, suggested: 0, skipped: 0 }, misses: 2, facts: { files: 1, unchanged: 0 }, docs: 1 });
     }) as unknown as typeof fetch;
     const r = await runCloudSync({ cloud: fake, portability: store.portability, activity: store.activity, projects: async () => ['demo'], trigger: 'manual', fetch: f });
     expect(r.ok).toBe(true);
+    expect(policyRequests).toHaveLength(1);
+    expect(policyRequests[0].body).toBeUndefined();
+    expect(policyRequests[0].headers).toEqual({ authorization: `Bearer ${TOKEN}` });
     expect(bodies).toHaveLength(1);
     const body = JSON.parse(bodies[0]);
     expect(body.lessons.map((l: { title: string; status: string }) => [l.title, l.status])).toEqual([['Scope by org', 'approved']]);
@@ -86,6 +93,8 @@ describeStores('cloud sync', (h) => {
   test('a lesson approved and then revoked here goes to the cloud as revoked; a removed doc is withdrawn', async () => {
     const bodies: { lessons: { id: string; status: string }[]; withdrawn: { kind: string; id: string }[]; complete: boolean }[] = [];
     const f = (async (_url: string, init: RequestInit) => {
+      if (_url.endsWith('/api/v1/sync-policy')) return Response.json({ revision: POLICY_REVISION });
+      expect(init.method).toBe('POST');
       bodies.push(JSON.parse(init.body as string));
       return Response.json({ syncId: 's', org: 'acme', projects: [], lessons: { team: 0, suggested: 0, skipped: 0 }, misses: 0, facts: { files: 0, unchanged: 0 }, docs: 0 });
     }) as unknown as typeof fetch;
@@ -107,12 +116,15 @@ describeStores('cloud sync', (h) => {
     await seedSyncProject(store, 'blog', 'github.com/acme/blog', 'Blog lesson');
     const bodies: { projectKey: string; lessons: unknown[]; withdrawn: { kind: string; id: string }[]; complete: boolean }[] = [];
     const f = (async (_url: string, init: RequestInit) => {
+      if (_url.endsWith('/api/v1/sync-policy')) return Response.json({ revision: POLICY_REVISION });
+      expect(init.method).toBe('POST');
       bodies.push(JSON.parse(init.body as string));
       return Response.json({ syncId: 's', org: 'acme', projects: [], lessons: { team: 0, suggested: 0, skipped: 0 }, misses: 0, facts: { files: 0, unchanged: 0 }, docs: 0 });
     }) as unknown as typeof fetch;
     // A fresh memory each run, as a restarted worker or the api's Sync now would have: only the store carries over.
     const run = (projects: string[], force = false) => runCloudSync({ cloud: fake, portability: store.portability, projects: async () => projects, trigger: 'manual', fetch: f, memory: storedSyncMemory(store.docs, fake), force });
     await run(['demo', 'blog']);
+    expect(await storedSyncMemory(store.docs, fake).get('demo')).toMatchObject({ policyRevision: POLICY_REVISION });
     const [doc] = (await store.portability.exportData({ projectKey: 'demo' })).docs;
     await store.docs.deleteDoc(doc.id);
     const r = await run(['demo']);

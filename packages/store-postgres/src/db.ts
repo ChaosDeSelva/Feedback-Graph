@@ -71,7 +71,8 @@ NulSafeClient.prototype.query = function query(this: pg.Client, ...args: unknown
     const timeout = isRollback ? 30000 : storeTimeLeft();
     if (signal && !isRollback) {
       // PostgreSQL enforces this timeout itself, including lock waits; a JS-only timeout would allow late writes.
-      await (plainQuery as (...a: unknown[]) => Promise<unknown>).call(this, "SELECT set_config('statement_timeout', $1, false)", [String(timeout)]);
+      // Utility SET does not acquire a snapshot before an export's SET TRANSACTION.
+      await (plainQuery as (...a: unknown[]) => Promise<unknown>).call(this, `SET statement_timeout = ${Math.max(1, Math.floor(timeout))}`);
       storeTimeLeft();
     }
     return await (plainQuery as (...a: unknown[]) => Promise<unknown>).apply(this, args);

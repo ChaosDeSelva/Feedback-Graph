@@ -1,3 +1,4 @@
+import { withStoreDeadline } from '../storeDeadline.ts';
 import { beforeAll, beforeEach, expect, test } from 'vitest';
 import type { GraphStore, KnowledgeStore, PortabilityStore, Store } from '../store.ts';
 import { describeStores, type StoreProbe } from '../testing/index.ts';
@@ -50,7 +51,7 @@ describeStores('PortabilityStore', (h) => {
   });
 
   test('export is a versioned bundle of one project\'s derived knowledge, without raw transcripts or vectors', async () => {
-    const x = await p.exportData({ projectKey: 'demo' });
+    const x = await withStoreDeadline({ signal: new AbortController().signal, expiresAt: Date.now() + 30_000 }, () => p.exportData({ projectKey: 'demo' }));
     expect(x).toMatchObject({ format: EXPORT_FORMAT, schemaVersion: 1, projectKey: 'demo' });
     expect(x.lessons.map((l) => l.title)).toEqual(['Scope by org']);
     expect(x.misses).toEqual([expect.objectContaining({ missed: 'no tenant scoping', cause: 'context_available_ignored', feedbackText: 'turn 2' })]);

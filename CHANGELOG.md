@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.6.7 (2026-10-28)
+
+- Fix deadline setup during PostgreSQL exports: use a snapshot-free timeout command so repeatable-read transaction isolation can be selected before the first data query. Includes the 0.6.6 field-report fixes below.
+
 ## 0.6.6 (2026-10-28)
 
 - Claude session registration sends JSON and reports refusals. Refused registration/auth requests do not reserve run ownership or create empty session bindings; MCP discovery stays available before registration. Codex sessions have an explicit thread-registration command. Run cleanup uses authenticated provenance, supports explicit owner cleanup of legacy runs, and rejects weak run keys.
