@@ -3,6 +3,7 @@ import { redactSecrets } from './redact.ts';
 import { isSecretPath } from './secrets.ts';
 
 test.each([
+  "define('AUTH_KEY', 'put your unique phrase here');",
   "awk '{ print $1$2 }'", "perl -e 'print $1$2'", 'cache key-' + 'a1'.repeat(16),
   'package.subpackage.module_name.long_module_name.handlers.method_name',
   'PuTTY-User-Key-File-3: is a header mentioned here. Later Private-MAC: abcd is documented.',

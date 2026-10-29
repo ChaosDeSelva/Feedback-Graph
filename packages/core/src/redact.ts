@@ -82,6 +82,7 @@ const namedSecret = (v: string) => looksLikeSecret(v) || slashedSecret(v);
 function assignedSecret(v: string): boolean {
   if (URL_START.test(v) || /^\.{0,2}[/~]/.test(v) || /\$[({\w]/.test(v)) return false;
   if (/^(?:change[-_.]?me|your[-_]|example|placeholder|x{3,}|\*+$)/i.test(v)) return false;
+  if (/^put your unique phrase here$/i.test(v)) return false;
   if (/^\d+(?:ms|[smhdw])?$/.test(v) || TYPE_WORD.test(v) || ALGO.test(v)) return false;
   return !((IDENT.test(v) || /^[A-Za-z]+$/.test(v)) && SECRET_WORD.test(v));
 }
