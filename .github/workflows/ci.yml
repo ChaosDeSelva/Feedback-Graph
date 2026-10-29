@@ -40,11 +40,12 @@ jobs:
       - run: pnpm lint
       - run: pnpm typecheck
       - run: pnpm test
+      # Verify builds even when an integration environment cannot start its sandbox.
+      - run: pnpm -F @fb/ui build
+      - name: Docker images build
+        run: docker build --target worker -t fg-worker . && docker build --target api -t fg-api .
       - name: Allow isolated runner user namespaces on Ubuntu
         run: sudo apparmor_parser -r scripts/apparmor/feedback-graph-codex-runner
       # The contract suites, once per backend: both must pass the same tests.
       - run: pnpm test:int
         env: { CODEX_RUNNER_APPARMOR: feedback-graph-codex-runner, TEST_STORES: 'neo4j,postgres', NEO4J_TEST_URL: bolt://127.0.0.1:7688, TEST_PG_URL: 'postgres://fg:fg@127.0.0.1:5433/fg_test' }
-      - run: pnpm -F @fb/ui build
-      - name: Docker images build
-        run: docker build --target worker -t fg-worker . && docker build --target api -t fg-api .
