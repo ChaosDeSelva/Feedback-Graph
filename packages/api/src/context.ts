@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import { lstat, readFile, realpath } from 'node:fs/promises';
 import { join } from 'node:path';
 import { z } from 'zod';
-import type { Admission, Admitted, Turn } from './admission.ts';
+import type { Admission, Admitted, Turn, QueueInfo } from './admission.ts';
 import { capDiff, citeDiff, splitDiff, type DiffCite, quotedCode, taskPrNumbers } from './diff.ts';
 import { askPromptOnly, CODE_MAP_VERSION, gradeLessons, LESSON_POOL, rankLessons, cleanLessonPath, factOrigin, isNonMiss, mentionedPaths, serviceDirs, servicesInTask, SIMILARITY_FLOOR, isSecretPath, mapCapped, rankFacts, rankMisses, hostRepoPath, MODULE_TESTS_DEPTH, projectFromCwd, redactSecrets, relOfKey, repoRelative, type ActivityStore, type CodeGraphStore, type CodeMapMeta, type SessionListItem, type SessionsStore, type DocHit, type FileMiss, type Impact, type ModuleContext, type OutsideFile, type DocsStore, type FactHit, type FactsStore, type StoredFact, type KnowledgeStore, type Lesson, type LessonHit, type LlmProvider, type Project, type RelatedMiss, type Root, type ShownProjects, type LinksStore, type ProjectLink, otherEnd, isManifestDependency, pathMatches, AnswerRefused, ModelOutputError, askJson } from '@fb/core';
 
@@ -65,6 +65,8 @@ export type ContextDeps = {
    * the rest queued; one not answered in time is a deterministic "not judged". Unset: every call goes straight in.
    */
   judgeQueue?: Admission;
+  /** Per-request queue telemetry; the bounded check wrapper owns this callback. */
+  checkQueueState?: (state: QueueInfo) => void;
   activity?: Pick<ActivityStore, 'record'>;
   /** ProjectScope.folder (the Settings selection and EXCLUDE_PROJECTS): projects outside it are treated as untracked. */
   inScope?: (key: string) => boolean | Promise<boolean>;
@@ -84,6 +86,7 @@ export type ContextDeps = {
    */
   codegraph?: Pick<CodeGraphStore, 'lessonsForPaths'> & Partial<Pick<CodeGraphStore, 'moduleContext' | 'impact' | 'codeMapMeta' | 'outsideMap' | 'sessionFiles'>>;
   /** Session summaries (SessionsStore.list): get_recent_sessions, and the recent sessions in get_task_context. */
+  registerSession?: (id: string) => Promise<void>;
   sessions?: Pick<SessionsStore, 'list' | 'detail'>;
   /**
    * The selected projects (shownProjects). A lesson learned in any other project, a global one included, is never
@@ -783,12 +786,24 @@ export async function searchGraph(q: ProjectRef & { query: string }, d: ContextD
   return { markdown: lines.join('\n') };
 }
 
+export function queueDescription(queue: QueueInfo): string {
+  const window = ([low, high]: [number, number | null]) => high === null ? `${Math.ceil(low / 1000)} s or more (upper estimate unavailable)` : `${Math.ceil(low / 1000)}–${Math.ceil(high / 1000)} s`;
+  const basis = queue.estimate.source === 'observed' ? `${queue.estimate.samples} recent completed judge calls` : 'cold-start response-budget scenario; no completed calls yet';
+  return `Judge capacity: ${queue.capacity}; ${queue.running} running and ${queue.waiting} waiting. `
+    + (queue.state === 'completed' ? 'This judge call completed. ' : queue.state === 'running' ? 'This judge call is running. ' : queue.position === null ? `No retained queue position; a retry would currently enter at waiting position ${queue.nextRetryPosition}. ` : `Waiting position ${queue.position}; `)
+    + (queue.arrivalAhead === null ? '' : `On arrival: ${queue.arrivalAhead} checks ahead. `)
+    + `Estimated start: ${window(queue.estimate.startMs)}; estimated completion: ${window(queue.estimate.completionMs)} (${basis}). Estimates are not guarantees.`
+    + (queue.estimate.overdue ? ' A running call has exceeded the observed range or response deadline and still occupies its slot.' : '')
+    + (queue.retryAfterMs === null ? '' : ` Retry after about ${Math.ceil(queue.retryAfterMs / 1000)} s; retrying starts a new request.`);
+}
+
 /** A check's deadline includes stores, embedding, admission, retries and provenance writes. */
 export async function checkBeforeDone(
   q: ProjectRef & { task: string; summary: string; diff?: string; filesChanged?: string[]; sessionId?: string },
   d: ContextDeps,
-): Promise<{ markdown: string; gaps: Gap[]; codeGaps: CodeGap[]; cannotTell?: CannotTell[]; queued?: boolean }> {
+): Promise<{ markdown: string; gaps: Gap[]; codeGaps: CodeGap[]; cannotTell?: CannotTell[]; queued?: boolean; queue?: QueueInfo }> {
   const controller = new AbortController();
+  let queueState: QueueInfo | undefined;
   const budget = Math.max(1, Math.min(50_000, d.checkTimeoutMs ?? 50_000));
   const deadline = Date.now() + budget;
   let timer: ReturnType<typeof setTimeout>;
@@ -812,6 +827,7 @@ export async function checkBeforeDone(
     controller.signal.throwIfAborted();
     return Promise.race([d.embed(texts, { signal: controller.signal, timeoutMs: Math.max(1, deadline - Date.now()) }), expired]);
   };
+  bounded.checkQueueState = (state) => { queueState = state; };
   bounded.checkSignal = controller.signal;
   bounded.checkDeadline = deadline;
   const judge = d.judge;
@@ -819,11 +835,15 @@ export async function checkBeforeDone(
     controller.signal.throwIfAborted();
     return judge(work, lessons, { deadline: Math.min(deadline, turn.deadline ?? deadline), signal: turn.signal ? AbortSignal.any([controller.signal, turn.signal]) : controller.signal });
   };
-  try { return await Promise.race([checkBeforeDoneWork(q, bounded), expired]); }
+  try {
+    const result = await Promise.race([checkBeforeDoneWork(q, bounded), expired]);
+    const queue = queueState;
+    return queue ? { ...result, ...(queue.state === 'retry_required' && { queued: true }), queue, markdown: `${result.markdown}\n\n${queueDescription(queue)}` } : result;
+  }
   catch (error) {
     if (!controller.signal.aborted) throw error;
-    const queue = d.judgeQueue ? ` Judge capacity: ${d.judgeQueue.concurrency}; ${d.judgeQueue.running} running and ${d.judgeQueue.waiting} waiting at this response. Estimated wait: unknown; model duration is variable.` : '';
-    return { markdown: '# Queued: pre-done check has not completed\nThe check reached its response deadline while waiting for context or the judge. Nothing was decided.' + queue + ' This timed-out request does not retain a queue position. Retry check_before_done; a queued response is not a completed check.', gaps: [], codeGaps: [], queued: true };
+    const queue = d.judgeQueue?.snapshot('retry_required', null, queueState?.arrivalAhead ?? null);
+    return { markdown: '# Queued: pre-done check has not completed\nThe check reached its response deadline while waiting for context or the judge. Nothing was decided.' + (queue ? `\n${queueDescription(queue)}` : '') + ' This timed-out request does not retain a queue position. Retry check_before_done; a queued response is not a completed check.', gaps: [], codeGaps: [], queued: true, ...(queue && { queue }) };
   } finally { clearTimeout(timer!); }
 }
 
@@ -1003,7 +1023,7 @@ async function judgeWork(q: { task: string; summary: string }, lessons: LessonHi
   const ask = (turn?: Turn) => d.judge({ task: q.task, summary: q.summary, ...(diff.text && { diff: diff.text }) }, lessons, turn ?? {});
   let slot: Admitted<Verdict[]>;
   try {
-    slot = d.judgeQueue ? await d.judgeQueue.run(ask, { signal: d.checkSignal, deadline: d.checkDeadline }) : { ok: true as const, value: await ask(), ahead: 0, waitedMs: 0 };
+    slot = d.judgeQueue ? await d.judgeQueue.run(ask, { signal: d.checkSignal, deadline: d.checkDeadline, onState: d.checkQueueState }) : { ok: true as const, value: await ask(), ahead: 0, waitedMs: 0 };
   } catch (err) {
     // A model that failed (an unusable answer twice, an outage, an HTTP error) is never an error to the agent, and
     // never a pass: the lessons are listed to check by hand.
@@ -1078,7 +1098,6 @@ async function notJudged(
   return {
     markdown: [
       `# Not judged: ${why}`,
-      ...(busy.cause === 'busy' && d.judgeQueue ? [`Judge capacity: ${d.judgeQueue.concurrency}; ${d.judgeQueue.running} running and ${d.judgeQueue.waiting} waiting at this response. Arrival position: behind ${busy.ahead} checks. Estimated wait: unknown. This timed-out request does not retain a queue position.`] : []),
       `Nothing was decided about this work. Check it yourself against ${items.length === 1 ? `this ${kind === 'lesson' ? 'lesson' : 'past miss'}` : `these ${kind === 'lesson' ? 'lessons' : 'past misses'}`}, or call check_before_done again in a minute:`,
       ...items.map(({ lesson: l }) => (kind === 'lesson' ? `- **${l.title}**: ${l.rule} · lesson ${l.id}` : `- **${l.title}** · miss ${l.id}`)),
       ...codePart,

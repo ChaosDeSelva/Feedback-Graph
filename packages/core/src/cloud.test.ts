@@ -726,3 +726,64 @@ test('local-only project data never exports even under forced manual cloud sync'
   expect(portability.exportData).not.toHaveBeenCalled();
   expect(calls).toEqual([]);
 });
+
+
+test('metadata-only and entirely unshared proposed content do not create cloud project rows', async () => {
+  const empty = bundle('sandbox', { lessons: [], misses: [], facts: [], docs: [], codeFiles: [] });
+  const proposed = { ...empty, lessons: [{ ...bundle('sandbox').lessons[1] }] };
+  for (const exported of [empty, proposed]) {
+    const { f, calls } = fakeFetch([]);
+    const result = await runCloudSync({ cloud, portability: store({ sandbox: exported }), projects: async () => ['sandbox'], trigger: 'manual', force: true, fetch: f });
+    expect(result.projects).toMatchObject([{ key: 'sandbox', status: 'empty' }]);
+    expect(calls).toEqual([]);
+  }
+});
+
+test('a genuine code-map-only export is sent and clearing it sends a single complete tombstone', async () => {
+  const onlyMap = bundle('shop', { lessons: [], misses: [], facts: [], docs: [] });
+  const bundles = { shop: onlyMap };
+  const memory = new Map();
+  const first = fakeFetch([]);
+  await runCloudSync({ cloud, portability: store(bundles), projects: async () => ['shop'], trigger: 'manual', fetch: first.f, memory });
+  expect(sentBody(first.calls[0]).codeFiles).toHaveLength(1);
+  bundles.shop = { ...onlyMap, codeFiles: [] };
+  const cleared = fakeFetch([]);
+  await runCloudSync({ cloud, portability: store(bundles), projects: async () => ['shop'], trigger: 'manual', fetch: cleared.f, memory });
+  expect(sentBody(cleared.calls[0])).toMatchObject({ complete: true, codeFiles: [], projects: [{ key: 'shop', remote: 'github.com/acme/shop' }] });
+  expect(memory.has('shop')).toBe(false);
+  const again = fakeFetch([]);
+  await runCloudSync({ cloud, portability: store(bundles), projects: async () => ['shop'], trigger: 'manual', fetch: again.f, memory });
+  expect(again.calls).toEqual([]);
+});
+
+
+test('a seed-created demo stays local after scans until explicit owner opt-in; ordinary maps stay shareable', async () => {
+  const onlyMap = bundle('demo-shop', { lessons: [], misses: [], facts: [], docs: [], projects: [{ key: 'demo-shop', remote: 'github.com/acme/demo-shop', demoCreated: true }] });
+  expect(await syncBundle(store({ 'demo-shop': onlyMap }), 'demo-shop')).toBeNull();
+  const existingOrdinary = { ...onlyMap, projects: [{ key: 'demo-shop', remote: 'github.com/acme/demo-shop' }] };
+  expect((await syncBundle(store({ 'demo-shop': existingOrdinary }), 'demo-shop'))?.codeFiles).toHaveLength(1);
+  const withRealKnowledge = { ...onlyMap, facts: bundle('demo-shop').facts };
+  expect(await syncBundle(store({ 'demo-shop': withRealKnowledge }), 'demo-shop')).toBeNull();
+  expect((await syncBundle(store({ 'demo-shop': withRealKnowledge }), 'demo-shop', undefined, { shareDemoCreated: true }))?.facts).toHaveLength(1);
+  const preview = await previewCloudSync(store({ 'demo-shop': withRealKnowledge }), ['demo-shop']);
+  expect(preview.projects[0].reason).toContain('Created by demo seed');
+});
+
+
+test('a revoked token reported by policy discovery cannot turn an unchanged sync into false success', async () => {
+  const memory = new Map();
+  const portability = store({ shop: bundle() });
+  let revoked = false;
+  const { f, calls } = fakeFetch([]);
+  const fetcher: typeof fetch = async (url, init) => String(url).endsWith('/sync-policy')
+    ? revoked ? new Response(null, { status: 401 }) : Response.json({ revision: 'a'.repeat(64) })
+    : f(url, init);
+  const deps = { cloud, memory, portability, fetch: fetcher, projects: async () => ['shop'], trigger: 'schedule' as const };
+  expect((await runCloudSync(deps)).ok).toBe(true);
+  portability.exportData.mockClear();
+  revoked = true;
+  const result = await runCloudSync(deps);
+  expect(result).toMatchObject({ ok: false, stopped: true, error: expect.stringMatching(/refused the token/) });
+  expect(portability.exportData).not.toHaveBeenCalled();
+  expect(calls).toHaveLength(1);
+});

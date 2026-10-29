@@ -1,6 +1,6 @@
 import { setRedactionArchive } from '@fb/core';
 import { encryptedRedactionArchive } from './redactionArchive.ts';
-import { cloudLocalOnlyProjects } from '@fb/core';
+import { cloudLocalOnlyProjects, cloudSharedDemoProjects } from '@fb/core';
 import { lstat, readdir, readFile, writeFile } from 'node:fs/promises';
 import { basename, dirname, join } from 'node:path';
 import {
@@ -180,7 +180,7 @@ async function main() {
 
   // The owner picks the folders to read (Settings). Until a choice is made, INGEST_PROJECTS seeds it, or nothing does.
   const seeded = await selection.ensure(config, activity);
-  log('project selection', { tracked: seeded.selection.tracked, initialized: seeded.selection.initialized, seededNow: seeded.seeded, excluded: [...config.excludeProjects, ...await cloudLocalOnlyProjects(store.docs, config.cloud?.localOnlyProjects)] });
+  log('project selection', { tracked: seeded.selection.tracked, initialized: seeded.selection.initialized, seededNow: seeded.seeded, excluded: config.excludeProjects, localOnlyForCloud: await cloudLocalOnlyProjects(store.docs, config.cloud?.localOnlyProjects) });
   if (!seeded.seeded && config.ingestProjects.length && config.ingestProjects.join(',') !== seeded.selection.tracked.join(',')) {
     log('INGEST_PROJECTS only seeds a selection not made yet; the projects read are the ones chosen in Settings', { ingestProjects: config.ingestProjects });
   }
@@ -634,9 +634,9 @@ async function main() {
         intervalMinutes: cloud.intervalMinutes,
         log,
         // A project that failed waits alone (its own backoff); the others keep the interval.
-        run: (waiting) =>
+        run: async (waiting) =>
           runCloudSync({
-            cloud,
+            cloud: { ...cloud, shareDemoProjects: await cloudSharedDemoProjects(store.docs) },
             waiting,
             portability: store.portability,
             activity,

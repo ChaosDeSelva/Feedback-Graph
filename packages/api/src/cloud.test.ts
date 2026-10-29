@@ -176,3 +176,25 @@ test('local-only settings are owner protected, durable, and prevent forced manua
   const restarted = createApp(repo, { cloud: { ...d, localOnlyStore } });
   expect((await (await restarted.request('/api/cloud')).json()).localOnlyProjects).toEqual(['shop']);
 });
+
+
+test('only an explicit owner sharing setting converts a demo-created project, and internal provenance never goes on the wire', async () => {
+  const saved = new Map<string, string>();
+  const localOnlyStore = { getCursor: async (key: string) => saved.get(key) ?? null, setCursor: async (key: string, value: string) => { saved.set(key, value); } };
+  const posts: string[] = [];
+  const { d } = deps({ localOnlyStore, portability: { exportData: async () => ({ ...bundle('shop'), projects: [{ key: 'shop', remote: 'github.com/acme/shop', demoCreated: true }] }) },
+    fetch: (async (url: string, init: RequestInit) => { if (url.endsWith('/sync-policy')) return new Response(null, { status: 404 }); posts.push(init.body as string); return Response.json(syncOk); }) as unknown as typeof fetch });
+  const app = createApp(repo, { cloud: d });
+  await app.request('/api/cloud/sync', { ...post('http://localhost'), body: JSON.stringify({ force: true }) });
+  expect(posts).toEqual([]);
+  const preview = await (await app.request('/api/cloud')).json();
+  expect(preview.preview.projects[0].reason).toContain('Created by demo seed');
+  const write = (origin?: string) => ({ method: 'PUT', body: JSON.stringify({ projects: [], shareDemoProjects: ['shop'] }), headers: { 'content-type': 'application/json', ...(origin ? { origin } : {}) } });
+  expect((await app.request('/api/cloud/local-only', write())).status).toBe(403);
+  expect(saved.size).toBe(0);
+  expect((await app.request('/api/cloud/local-only', write('http://localhost'))).status).toBe(200);
+  await app.request('/api/cloud/sync', { ...post('http://localhost'), body: JSON.stringify({ force: true }) });
+  expect(posts).toHaveLength(1);
+  expect(posts[0]).not.toContain('demoCreated');
+  expect(JSON.parse(posts[0]).projects).toEqual([{ key: 'shop', remote: 'github.com/acme/shop' }]);
+});

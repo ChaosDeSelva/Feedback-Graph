@@ -55,6 +55,10 @@ export class PgPortabilityStore implements PortabilityStore {
     this.db = db;
   }
 
+  async restorePrivateProject(project: { key: string; remote: string | null }): Promise<void> {
+    await this.db.pool.query("INSERT INTO projects (key, name, repo_path, remote, demo_created) VALUES ($1, $1, '', $2, true) ON CONFLICT (key) DO NOTHING", [project.key, project.remote]);
+  }
+
   async exportData(o: { projectKey?: string; projectKeys?: string[]; approvedOnly?: boolean } = {}): Promise<ExportBundle> {
     const key = o.projectKey ?? null;
     // null: no list to apply (one project by key, or everything).
@@ -65,7 +69,7 @@ export class PgPortabilityStore implements PortabilityStore {
       await c.query('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY');
       const q = async (sql: string, params: unknown[]) => (await c.query(sql, params)).rows;
       return [
-        await q(`SELECT key, remote FROM projects WHERE ($1::text IS NULL OR key = $1) AND ($2::text[] IS NULL OR key = ANY($2)) ORDER BY key COLLATE "C"`, [key, keys]),
+        await q(`SELECT key, remote, demo_created FROM projects WHERE ($1::text IS NULL OR key = $1) AND ($2::text[] IS NULL OR key = ANY($2)) ORDER BY key COLLATE "C"`, [key, keys]),
         await q(
           `SELECT id, project_key, title, rule, applies_when, scope, paths, status, source, cause, miss_id, created_at, decided_at, checks
            FROM lessons
@@ -109,7 +113,7 @@ export class PgPortabilityStore implements PortabilityStore {
       toolVersion: VERSION,
       exportedAt: new Date().toISOString(),
       projectKey: key,
-      projects: projects.map((r) => ({ key: r.key as string, remote: (r.remote as string) ?? null })),
+      projects: projects.map((r) => ({ key: r.key as string, remote: (r.remote as string) ?? null, ...(r.demo_created ? { demoCreated: true as const } : {}) })),
       lessons: lessons.map(
         (l): Lesson => ({
           id: l.id,

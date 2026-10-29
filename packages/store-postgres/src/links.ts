@@ -1,3 +1,4 @@
+import { conditionalWrite } from './conditionalWrite.ts';
 import { cleanEvidence, cleanNote, linkIdOf, linkPair, runWriteOwner } from '@fb/core';
 import type { DetectedLink, LinkPatch, LinksStore, ProjectLink } from '@fb/core';
 import { iso, toJson, tx, type Db } from './db.ts';
@@ -75,7 +76,9 @@ export class PgLinksStore implements LinksStore {
   }
 
   async deleteLink(id: string, o: { run?: string | null } = {}): Promise<boolean> {
-    return ((await this.db.pool.query('DELETE FROM project_links WHERE id = $1 AND ($2::text IS NULL OR run = $2)', [id, o.run ?? null])).rowCount ?? 0) > 0;
+    return conditionalWrite(this.db, async query => {
+      return ((await query('DELETE FROM project_links WHERE id = $1 AND ($2::text IS NULL OR run = $2)', [id, o.run ?? null])).rowCount ?? 0) > 0;
+    }, Boolean);
   }
 }
 

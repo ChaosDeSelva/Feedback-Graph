@@ -1,3 +1,4 @@
+import { conditionalWrite } from './conditionalWrite.ts';
 import {
   ChatBusyError, cleanChatAnswer, cleanChatContext, cleanChatError, cleanChatSources, cleanChatText, cleanChatTitle, newChatId, newChatTurnId, ORPHANED_TURN, REDACT_PAGE, redactedChanges, redactStoredRow, withPackSizes,
   type ChatAnswer, type ChatConversation, type ChatJob, type ChatPack, type ChatProvider, type ChatStore, type ChatThread, type ChatTurn, type PendingChatTurn,
@@ -136,11 +137,13 @@ export class PgChatStore implements ChatStore {
   }
 
   async retryTurn(conversationId: string, turnId: string): Promise<ChatThread | null> {
-    const ok = await this.transition(
-      `UPDATE chat_turns SET status = 'pending', error = NULL, answer = NULL, text = '', started_at = NULL, finished_at = NULL
-       WHERE id = $1 AND conversation_id = $2 AND role = 'assistant' AND status = 'failed'`,
-      [turnId, conversationId],
-    );
+    const ok = await conditionalWrite(this.db, async query => {
+      const { rows } = await query(`UPDATE chat_turns SET status = 'pending', error = NULL, answer = NULL, text = '', started_at = NULL, finished_at = NULL
+        WHERE id = $1 AND conversation_id = $2 AND role = 'assistant' AND status = 'failed' RETURNING conversation_id`, [turnId, conversationId]);
+      if (!rows.length) return false;
+      await query('UPDATE chat_conversations SET updated_at = $2 WHERE id = $1', [conversationId, new Date()]);
+      return true;
+    }, Boolean);
     return ok ? this.conversation(conversationId) : null;
   }
 

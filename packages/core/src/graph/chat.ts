@@ -1,3 +1,4 @@
+import { conditionalWrite } from './conditionalWrite.ts';
 import { randomUUID } from 'node:crypto';
 import neo4j from 'neo4j-driver';
 import {
@@ -186,11 +187,13 @@ export class ChatRepo implements ChatStore {
   }
 
   async retryTurn(conversationId: string, turnId: string): Promise<ChatThread | null> {
-    const ok = await this.transition(
-      `MATCH (t:ChatTurn {id: $id, conversationId: $conversationId, role: 'assistant', status: 'failed'})
-       SET t.status = 'pending', t.error = null, t.answer = null, t.text = '', t.startedAt = null, t.finishedAt = null`,
-      { id: turnId, conversationId },
-    );
+    const ok = await conditionalWrite(this.g, async query => {
+      const [r] = await query(`MATCH (t:ChatTurn {id: $id, conversationId: $conversationId, role: 'assistant', status: 'failed'})
+        SET t.status = 'pending', t.error = null, t.answer = null, t.text = '', t.startedAt = null, t.finishedAt = null
+        WITH t OPTIONAL MATCH (c:ChatConversation {id: t.conversationId}) SET c.updatedAt = $now RETURN count(t) AS n`,
+        { id: turnId, conversationId, now: new Date().toISOString() });
+      return Number(r?.get('n') ?? 0) > 0;
+    }, Boolean);
     return ok ? this.conversation(conversationId) : null;
   }
 

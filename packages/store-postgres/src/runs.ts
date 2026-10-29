@@ -1,4 +1,4 @@
-import { removedCounts, runItems, runRemoval, type RunItem, type RunItemKind, type RunOwner, type RunPrincipal, type RunRow, type RunsStore } from '@fb/core';
+import { LegacyRunClaimError, runClaimExecutor, removedCounts, runItems, runRemoval, type RunItem, type RunItemKind, type RunOwner, type RunPrincipal, type RunRow, type RunsStore } from '@fb/core';
 import { iso, tx, type Db } from './db.ts';
 import { sandboxPresence } from './vector.ts';
 
@@ -14,6 +14,14 @@ const ITEMS = `
   UNION ALL SELECT 'chat', id, project_key, false, false FROM chat_conversations WHERE run = $1`;
 
 /** What runs wrote (see RunsStore); the Neo4j twin is core's graph/runs.ts. */
+export async function claimRunOwnerWith(query: (sql: string, values?: unknown[]) => Promise<{ rows: Record<string, any>[] }>, run: string, principal: RunPrincipal, actor: string | null): Promise<RunOwner> {
+  const legacy = ['candidates', 'lessons', 'misses', 'facts', 'docs', 'chunks', 'project_links', 'predone_checks', 'chat_conversations', 'activity', 'sessions', 'session_run_tags', 'feedback'].map(table => `EXISTS (SELECT 1 FROM ${table} WHERE run = $1)`).join(' OR ');
+  await query(`INSERT INTO run_owners (run, principal, actor, first_seen) SELECT $1, $2, $3, $4 WHERE NOT (${legacy}) ON CONFLICT (run) DO NOTHING`, [run, principal, principal === 'operator' ? actor : null, new Date()]);
+  const { rows } = await query('SELECT run, principal, actor, first_seen FROM run_owners WHERE run = $1', [run]);
+  if (!rows[0]) throw new LegacyRunClaimError(run);
+  return { run: rows[0].run, principal: rows[0].principal, actor: rows[0].actor ?? null, firstSeen: iso(rows[0].first_seen)! };
+}
+
 export class PgRunsStore implements RunsStore {
   readonly db: Db;
   constructor(db: Db) {
@@ -61,12 +69,8 @@ export class PgRunsStore implements RunsStore {
   }
 
   async claim(run: string, principal: RunPrincipal, actor: string | null = null): Promise<RunOwner> {
-    // Two statements: a claim that lost a race waits on the winner's row, and only a fresh snapshot then sees it.
-    await this.db.pool.query(
-      'INSERT INTO run_owners (run, principal, actor, first_seen) VALUES ($1, $2, $3, $4) ON CONFLICT (run) DO NOTHING',
-      [run, principal, principal === 'operator' ? actor : null, new Date()],
-    );
-    return (await this.owner(run))!;
+    const executor = runClaimExecutor(this.db);
+    return executor ? executor(run, principal, actor) : claimRunOwnerWith(this.db.pool.query.bind(this.db.pool), run, principal, actor);
   }
 
   async owner(run: string): Promise<RunOwner | null> {

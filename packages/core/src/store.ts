@@ -596,6 +596,8 @@ export interface InsightsStore {
 
 /** Export of derived knowledge, and deleting a project with everything learned from it. */
 export interface PortabilityStore {
+  /** Restore demo privacy only on creation; never relabel an existing genuine project from imported metadata. */
+  restorePrivateProject(project: { key: string; remote: string | null }): Promise<void>;
   /**
    * projectKey: one project. projectKeys (with no projectKey): only these projects, and global lessons learned in one of
    * them or in none; an empty list exports nothing. Neither: everything stored. Never in it (so never synced to the

@@ -55,8 +55,9 @@ export type CloudInfo = {
   localOnlyProjects?: string[];
   localOnlyEditable?: boolean;
   savedLocalOnlyProjects?: string[];
+  shareDemoProjects?: string[];
   projects: string[];
-  preview: { total: SyncCounts; projects: { key: string; counts: SyncCounts | null }[] } | null;
+  preview: { total: SyncCounts; projects: { key: string; counts: SyncCounts | null; reason?: string }[] } | null;
   previewError: string | null;
   last: { at: string; ok: boolean; trigger: SyncTrigger; error: string | null; sent: SyncCounts | null; projects: string[]; failed: string[] } | null;
   nextAt: string | null;

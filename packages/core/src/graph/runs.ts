@@ -1,4 +1,5 @@
 import { removedCounts, runItems, runRemoval, type RunRow } from '../runs.ts';
+import { LegacyRunClaimError, runClaimExecutor } from '../storeWrites.ts';
 import type { RunsStore } from '../store.ts';
 import { RUN_ITEM_KINDS, type RunItem, type RunItemKind, type RunOwner, type RunPrincipal } from '../types.ts';
 import type { GraphRepo } from './repo.ts';
@@ -66,6 +67,15 @@ const ownerOf = (r: { get(k: string): unknown }): RunOwner => ({
   run: r.get('run') as string, principal: r.get('principal') as RunPrincipal, actor: (r.get('actor') as string | null) ?? null, firstSeen: r.get('firstSeen') as string,
 });
 
+export async function claimRunOwnerWith(query: GraphRepo['run'], run: string, principal: RunPrincipal, actor: string | null): Promise<RunOwner> {
+  const legacy = ['Candidate', 'Lesson', 'Miss', 'Fact', 'Doc', 'Chunk', 'ProjectLink', 'PreDoneCheck', 'ChatConversation', 'Activity', 'Session', 'SessionRun', 'Feedback'].map(label => `EXISTS { MATCH (x:${label} {run: $run}) }`).join(' OR ');
+  const [record] = await query(`OPTIONAL MATCH (existing:RunOwner {run: $run}) WITH existing WHERE existing IS NOT NULL OR NOT (${legacy})
+    MERGE (o:RunOwner {run: $run}) ON CREATE SET o.principal = $principal, o.actor = $actor, o.firstSeen = $now RETURN ${OWNER}`,
+    { run, principal, actor: principal === 'operator' ? actor : null, now: new Date().toISOString() });
+  if (!record) throw new LegacyRunClaimError(run);
+  return ownerOf(record);
+}
+
 export class RunsRepo implements RunsStore {
   readonly g: GraphRepo;
   constructor(g: GraphRepo) {
@@ -91,13 +101,8 @@ export class RunsRepo implements RunsStore {
   }
 
   async claim(run: string, principal: RunPrincipal, actor: string | null = null): Promise<RunOwner> {
-    // MERGE on the unique run (schema.ts run_owner_run): a claim that loses a race matches the winner's node.
-    const [r] = await this.g.run(
-      `MERGE (o:RunOwner {run: $run}) ON CREATE SET o.principal = $principal, o.actor = $actor, o.firstSeen = $now
-       RETURN ${OWNER}`,
-      { run, principal, actor: principal === 'operator' ? actor : null, now: new Date().toISOString() },
-    );
-    return ownerOf(r);
+    const executor = runClaimExecutor(this.g);
+    return executor ? executor(run, principal, actor) : claimRunOwnerWith(this.g.run.bind(this.g), run, principal, actor);
   }
 
   async owner(run: string): Promise<RunOwner | null> {

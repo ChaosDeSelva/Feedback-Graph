@@ -196,7 +196,7 @@ export const bundleCounts = (b: ExportBundle): SyncCounts => ({
 });
 
 /** Which lessons a bundle carries: `suggestions` is SYNC_SUGGESTIONS. */
-export type SyncOptions = { suggestions?: boolean };
+export type SyncOptions = { suggestions?: boolean; shareDemoCreated?: boolean; onLocalOnly?: (reason: string) => void };
 
 /**
  * The sync body for one project, or null when nothing is stored for it. The export is the whole project (nothing
@@ -208,7 +208,7 @@ export async function syncBundle(p: Pick<PortabilityStore, 'exportData'>, projec
   const b = await p.exportData({ projectKey, approvedOnly: false });
   const received = new Set(previous?.lessons ?? []);
   const shared = (l: { id: string; status: string }) => l.status === 'approved' || received.has(l.id) || !!o.suggestions;
-  if (!b.projects.length && !b.lessons.length && !b.misses.length && !b.facts.length && !b.docs.length) return null;
+  if (!b.projects.length && !b.lessons.length && !b.misses.length && !b.facts.length && !b.docs.length && !b.codeFiles?.length) return null;
   const out: SyncBundle = {
     format: b.format,
     schemaVersion: b.schemaVersion,
@@ -239,6 +239,16 @@ export async function syncBundle(p: Pick<PortabilityStore, 'exportData'>, projec
     complete: b.projectKey === projectKey,
     withdrawn: [],
   };
+  // A seed-created fixture can acquire a genuine scan/code map when selected locally. That alone must not
+  // publish the probe. Only an explicit owner policy can share it; pre-existing ordinary projects are unaffected.
+  if (b.projects.find(project => project.key === projectKey)?.demoCreated && !o.shareDemoCreated) {
+    o.onLocalOnly?.('Created by demo seed: local only, including scans and code maps. The owner can explicitly enable sharing through PUT /api/cloud/local-only shareDemoProjects.');
+    return null;
+  }
+  // Export deliberately strips sandbox/demo records and unapproved suggestions. Metadata alone must not
+  // create a personal/team cloud project for a corpus whose entire contents stayed local. A prior send is
+  // handled by runCloudSync's tombstone path, including clearing a previously exported code map.
+  if (!out.lessons.length && !out.misses.length && !out.facts.length && !out.docs.length && !out.codeFiles?.length) return null;
   out.withdrawn = previous ? withdrawnSince(previous, out) : [];
   // Stored text was redacted on the way in; this catches anything stored before a pattern existed.
   return redactDeep(out);
@@ -289,17 +299,18 @@ const record = (key: string, b: SyncBundle, fingerprint: string): SentRecord => 
 /** Projects the preview exports at once: enough to overlap the store's round trips, few enough not to crowd it. */
 export const PREVIEW_CONCURRENCY = 4;
 
-export async function previewCloudSync(p: Pick<PortabilityStore, 'exportData'>, keys: string[], o: SyncOptions & { memory?: SyncMemory } = {}) {
+export async function previewCloudSync(p: Pick<PortabilityStore, 'exportData'>, keys: string[], o: SyncOptions & { memory?: SyncMemory; shareDemoProjects?: string[] } = {}) {
   const total = zero();
   // A few at a time, each into its own slot, so the list keeps the order of `keys`.
-  const projects: { key: string; counts: SyncCounts | null }[] = new Array(keys.length);
+  const projects: { key: string; counts: SyncCounts | null; reason?: string }[] = new Array(keys.length);
   let at = 0;
   const lane = async () => {
     while (at < keys.length) {
       const i = at++;
       const key = keys[i];
-      const b = await syncBundle(p, key, await o.memory?.get(key), o);
-      projects[i] = { key, counts: b && bundleCounts(b) };
+      let reason: string | undefined;
+      const b = await syncBundle(p, key, await o.memory?.get(key), { ...o, shareDemoCreated: o.shareDemoProjects?.includes(key), onLocalOnly: value => { reason = value; } });
+      projects[i] = { key, counts: b && bundleCounts(b), ...(reason ? { reason } : {}) };
     }
   };
   await Promise.all(Array.from({ length: Math.min(PREVIEW_CONCURRENCY, keys.length) }, lane));
@@ -571,11 +582,13 @@ export async function runCloudSync(d: {
   d.onProgress?.({ done: 0, total: keys.length, current: keys[0] ?? null });
   // Older clouds do not expose policy revisions. Never send the token to a refused URL or a redirect.
   let policyRevision: string | undefined;
+  let policyFailure: CloudSyncError | null = null;
   if (!cloudUrlProblem(d.cloud.url)) {
     try {
       const response = await (d.fetch ?? fetch)(`${d.cloud.url.replace(/\/+$/, '')}/api/v1/sync-policy`, {
         headers: { authorization: `Bearer ${d.cloud.token}` }, redirect: 'error', signal: AbortSignal.timeout(10_000),
       });
+      if (response.status === 401 || response.status === 403) policyFailure = new CloudSyncError(explain(response.status, null, 0), response.status);
       if (response.ok) {
         const policy = await response.json() as { revision?: unknown };
         if (typeof policy.revision === 'string' && /^[a-f0-9]{64}$/.test(policy.revision)) policyRevision = policy.revision;
@@ -585,12 +598,12 @@ export async function runCloudSync(d: {
   const host = new URL(d.cloud.url).host;
   const sent = zero();
   const results: ProjectSyncResult[] = [];
-  let error: string | null = null;
-  let stopped = false;
+  let error: string | null = policyFailure?.message ?? null;
+  let stopped = policyFailure !== null;
   for (const [i, key] of keys.entries()) {
     if (i > 0) d.onProgress?.({ done: i, total: keys.length, current: key });
     if (stopped) {
-      results.push({ key, status: 'not sent', counts: null });
+      results.push(policyFailure ? { key, status: 'failed', counts: null, error: policyFailure.message } : { key, status: 'not sent', counts: null });
       continue;
     }
     const until = d.waiting?.(key) ?? null;
@@ -599,7 +612,7 @@ export async function runCloudSync(d: {
       continue;
     }
     const previous = await d.memory?.get(key);
-    const stored = await syncBundle(d.portability, key, previous, { suggestions: d.cloud.suggestions });
+    const stored = await syncBundle(d.portability, key, previous, { suggestions: d.cloud.suggestions, shareDemoCreated: d.cloud.shareDemoProjects?.includes(key) });
     if (!stored && !previous) {
       results.push({ key, status: 'empty', counts: null });
       continue;
@@ -712,4 +725,14 @@ export async function cloudLocalOnlyProjects(docs: Pick<DocsStore, 'getCursor'>,
   const saved: unknown = JSON.parse(raw);
   if (!Array.isArray(saved) || saved.some(key => typeof key !== 'string')) throw new Error('invalid local-only cloud policy; repair it in Settings before syncing');
   return [...new Set([...configured, ...saved])];
+}
+
+/** Only an owner-protected settings write may explicitly opt demo-created projects into cloud sharing. */
+export const CLOUD_SHARED_DEMOS_CURSOR = 'cloud-shared-demo-projects';
+export async function cloudSharedDemoProjects(docs: Pick<DocsStore, 'getCursor'>): Promise<string[]> {
+  const raw = await docs.getCursor(CLOUD_SHARED_DEMOS_CURSOR);
+  if (raw === null) return [];
+  const saved: unknown = JSON.parse(raw);
+  if (!Array.isArray(saved) || saved.some(key => typeof key !== 'string')) throw new Error('invalid demo sharing policy');
+  return [...new Set(saved)];
 }

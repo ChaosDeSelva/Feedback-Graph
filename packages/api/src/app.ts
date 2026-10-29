@@ -1,3 +1,5 @@
+import { guardApiStoreWrites, mcpDiscoveryOnly } from './storeWriteGuard.ts';
+import { LegacyRunClaimError, withoutStoreWriteAuthorizer, withStoreWriteAuthorizer } from '@fb/core';
 import { requestDeadline } from './requestDeadline.ts';
 import { Hono, type Context, type Next } from 'hono';
 import { bodyLimit } from 'hono/body-limit';
@@ -426,8 +428,17 @@ function stageOf(w: WorkerStatus | null): Pick<PipelineStatus, 'stage' | 'progre
 }
 
 export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
-  const { staticDir, context, knowledge, embed, facts, projectDirs, insights, docs, links, auth = {}, system, portability, settings, log, codegraph, classifyQueue, inScope, sessions, shown } = opts;
+  repo = guardApiStoreWrites(repo);
+  opts = guardApiStoreWrites(opts);
+  const { staticDir, context: sourceContext, knowledge, embed, facts, projectDirs, insights, docs, links, auth = {}, system, portability, settings, log, codegraph, classifyQueue, inScope, sessions, shown } = opts;
   // Writes made with the operator token are logged as the agent that made them, wherever the route lives.
+  const context = sourceContext ? { ...sourceContext } : undefined;
+  if (context && sessions?.store.claimRun) {
+    context.registerSession = async id => {
+      const run = currentRun();
+      if (run && !await sessions.store.claimRun!(id, run)) throw new Error('session already belongs to the owner or another run; start a new labelled session');
+    };
+  }
   const activity = asActor(opts.activity);
   const cloud = opts.cloud && { ...opts.cloud, activity: asActor(opts.cloud.activity) };
   const importer = opts.importer && { ...opts.importer, activity: asActor(opts.importer.activity) };
@@ -562,11 +573,13 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
   // Claim only after body limits and owner-only authorization. MCP discovery/initialization are reads,
   // so a stale or unlabelled initialization cannot reserve a run id or make the client's tools disappear.
   app.use('*', async (c, next) => {
+    // Nested admin calls inherit ALS; cleanup is explicitly outside the caller's run and its lazy writer.
+    if (RUN_PATH.test(c.req.path)) return withoutStoreWriteAuthorizer(next);
     const run = currentRun();
     const mcp = c.req.path === '/mcp' || c.req.path === ADMIN_MCP;
     if (mcp && c.req.method === 'POST') {
-      const body = await c.req.raw.clone().json().catch(() => null) as { method?: string } | null;
-      if (body?.method !== 'tools/call') return next();
+      const body: unknown = await c.req.raw.clone().json().catch(() => null);
+      if (mcpDiscoveryOnly(body)) return next();
     }
     const operator = hasOperatorToken(c, auth.operator);
     const browser = c.req.header('origin') !== undefined;
@@ -595,24 +608,25 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
         }
         if (/^\/api\/projects\/[^/]+\/pin$/.test(c.req.path)) return notTheRuns(c, 'the project pin');
       }
-      const owner = await opts.runs.claim(run.id, principal, actor);
-      if (!sameCaller(owner, principal, actor)) {
-        const error = `run id belongs to another caller: ${run.id} was opened by ${openerOf(owner)} at ${owner.firstSeen}; label this one with a run id of its own`;
-        log?.('run refused', { method: c.req.method, path: c.req.path, run: run.id, owner: owner.principal, caller: principal });
+      let conflict: string | undefined;
+      const claim = async () => {
+        let owner;
+        try { owner = await opts.runs!.claim(run.id, principal, actor); }
+        catch (error) { if (error instanceof LegacyRunClaimError) conflict = error.message; throw error; }
+        if (!sameCaller(owner, principal, actor)) {
+          conflict = `run id belongs to another caller: ${run.id} was opened by ${openerOf(owner)} at ${owner.firstSeen}; label this one with a run id of its own`;
+          throw new Error(conflict);
+        }
+      };
+      const existing = await opts.runs.owner(run.id);
+      if (existing && !sameCaller(existing, principal, actor)) {
+        const error = `run id belongs to another caller: ${run.id} was opened by ${openerOf(existing)} at ${existing.firstSeen}; label this one with a run id of its own`;
         return mcp ? c.json({ jsonrpc: '2.0', id: null, error: { code: -32600, message: error } }, 409) : c.json({ error }, 409);
       }
-    }
-    await next();
-  });
-
-  app.use('/mcp', async (c, next) => {
-    const run = currentRun();
-    if (run && sessions?.store.claimRun && c.req.method === 'POST') {
-      const body = await c.req.raw.clone().json().catch(() => null) as { method?: string; params?: { arguments?: { session_id?: unknown } } } | null;
-      const id = body?.method === 'tools/call' ? body.params?.arguments?.session_id : null;
-      if (typeof id === 'string' && /^[\w.:-]{1,200}$/.test(id) && !await sessions.store.claimRun(id, run)) {
-        return c.json({ jsonrpc: '2.0', id: null, error: { code: -32600, message: 'session already belongs to the owner or another run; start a new labelled session' } }, 409);
-      }
+      await withStoreWriteAuthorizer(claim, next);
+      // The SDK turns handler exceptions into tool errors; retain the ownership conflict's HTTP/JSON-RPC contract.
+      if (conflict) c.res = mcp ? c.json({ jsonrpc: '2.0', id: null, error: { code: -32600, message: conflict } }, 409) : c.json({ error: conflict }, 409);
+      return;
     }
     await next();
   });
@@ -1270,6 +1284,7 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
       // Owner-only (OWNER_ROUTES, the operator's `scan` verb): the worker remaps the project from scratch at its next pass.
       app.post('/api/projects/:key/codemap/rebuild', async (c) => {
         const key = c.req.param('key');
+        if (!(await codegraph.codeMapMeta(key))) return c.json({ error: 'no code map yet: the worker builds the first one within a few minutes' }, 404);
         if (!(await request(key))) return c.json({ error: 'no code map yet: the worker builds the first one within a few minutes' }, 404);
         await activity?.record({
           kind: 'code_mapped', actor: 'you', projectKey: key,
@@ -1432,6 +1447,8 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
       const id = c.req.param('id');
       // Feedback ids are the Inbox item's.
       if (shown && !(await shownCandidate(id))) return c.json({ error: 'not found' }, 404);
+      const current = await repo.candidateDetail(id);
+      if (!current?.postmortem || current.postmortem.done) return c.json({ error: 'not found or already done' }, 404);
       return (await retry(id)) ? c.json({ queued: true }, 202) : c.json({ error: 'not found or already done' }, 404);
     });
   }
@@ -1494,6 +1511,8 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
       }
       if (p.supersedes === id) return c.json({ error: 'a lesson cannot supersede itself' }, 400);
       if (p.supersedes !== undefined && !(await shownLesson(p.supersedes))) return c.json({ error: `no lesson ${p.supersedes} to supersede` }, 400);
+      const scope = p.scope ?? current.lesson.scope;
+      if ((p.scope !== undefined || p.status === 'approved') && ['project', 'task'].includes(scope) && !(p.projectKey ?? current.lesson.origin ?? current.lesson.projectKey)) return c.json({ error: 'this lesson has no known project; name projectKey before narrowing it (nothing changed)' }, 409);
       const by = currentActor();
       const { unscoped } = await knowledge.updateLesson(id, p, { reembed, by });
       if (unscoped) return c.json({ error: 'this lesson has no known project, so it cannot be narrowed without one; it was set back to proposed. Name the project (projectKey), make it global, or reject it.' }, 409);

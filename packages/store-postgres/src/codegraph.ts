@@ -1,3 +1,4 @@
+import { conditionalWrite } from './conditionalWrite.ts';
 import {
   codeGraphViews,
   normalizeCodeMap,
@@ -191,8 +192,10 @@ export class PgCodeGraphStore implements CodeGraphStore {
   }
 
   async requestCodeMapRebuild(projectKey: string): Promise<boolean> {
-    const { rowCount } = await this.q('UPDATE code_maps SET rebuild_requested_at = $2 WHERE project_key = $1', [projectKey, new Date()]);
-    return (rowCount ?? 0) > 0;
+    return conditionalWrite(this.db, async query => {
+      const { rowCount } = await query('UPDATE code_maps SET rebuild_requested_at = $2 WHERE project_key = $1', [projectKey, new Date()]);
+      return (rowCount ?? 0) > 0;
+    }, Boolean);
   }
 
   async codeMapRebuildsRequested(): Promise<{ projectKey: string; requestedAt: string }[]> {

@@ -1,3 +1,4 @@
+import { conditionalWrite } from './conditionalWrite.ts';
 import { archiveBeforeRedaction, archiveRedactionInput } from '@fb/core';
 import { randomUUID } from 'node:crypto';
 import type pg from 'pg';
@@ -328,17 +329,19 @@ export class PgFactsStore implements FactsStore {
 
   /** A model's score never replaces yours or an agent's (the operator token). Returns how many facts changed. */
   async setFactRelevance(updates: RelevanceUpdate[]): Promise<number> {
-    if (!updates.length) return 0;
-    const { rowCount } = await this.db.pool.query(
-      `UPDATE facts x SET relevance = u.relevance, relevance_by = u.by,
-         run = CASE WHEN u.owner THEN NULL ELSE x.run END, sandbox = CASE WHEN u.owner THEN false ELSE x.sandbox END
-       FROM unnest($1::text[], $2::float8[], $3::text[], $4::text[], $5::text[], $6::boolean[]) AS u(id, relevance, by, project_key, run, owner)
-       WHERE x.id = u.id AND (u.project_key IS NULL OR x.project_key = u.project_key)
-         AND (u.by <> 'model' OR coalesce(x.relevance_by, 'model') = 'model')
-         AND (u.run IS NULL OR x.run = u.run)`,
-      [updates.map((u) => u.id), updates.map((u) => clampRelevance(u.relevance)), updates.map((u) => u.by), updates.map((u) => u.projectKey ?? null), updates.map((u) => u.run ?? null), updates.map((u) => u.run === null)],
-    );
-    return rowCount ?? 0;
+    return conditionalWrite(this.db, async query => {
+      if (!updates.length) return 0;
+      const { rowCount } = await query(
+        `UPDATE facts x SET relevance = u.relevance, relevance_by = u.by,
+           run = CASE WHEN u.owner THEN NULL ELSE x.run END, sandbox = CASE WHEN u.owner THEN false ELSE x.sandbox END
+         FROM unnest($1::text[], $2::float8[], $3::text[], $4::text[], $5::text[], $6::boolean[]) AS u(id, relevance, by, project_key, run, owner)
+         WHERE x.id = u.id AND (u.project_key IS NULL OR x.project_key = u.project_key)
+           AND (u.by <> 'model' OR coalesce(x.relevance_by, 'model') = 'model')
+           AND (u.run IS NULL OR x.run = u.run)`,
+        [updates.map((u) => u.id), updates.map((u) => clampRelevance(u.relevance)), updates.map((u) => u.by), updates.map((u) => u.projectKey ?? null), updates.map((u) => u.run ?? null), updates.map((u) => u.run === null)],
+      );
+      return rowCount ?? 0;
+    }, result => result > 0);
   }
 
   async requestScan(project: Project, provider: string | null): Promise<ScanJob> {

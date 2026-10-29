@@ -50,6 +50,16 @@ describeStores('PortabilityStore', (h) => {
     await seed({ key: 'other', name: 'other', repoPath: '/vibe/other' }, 's2');
   });
 
+  test('private-project restore preserves provenance only for newly created projects', async () => {
+    await p.restorePrivateProject({ key: 'private-restored', remote: 'github.com/acme/fixture' });
+    expect((await p.exportData({ projectKey: 'private-restored' })).projects).toEqual([{ key: 'private-restored', remote: 'github.com/acme/fixture', demoCreated: true }]);
+    // The existing fixture project has real data and was not created by demo seed. Imported metadata cannot hide it.
+    await p.restorePrivateProject({ key: 'demo', remote: 'github.com/untrusted/override' });
+    const existing = (await p.exportData({ projectKey: 'demo' })).projects[0];
+    expect(existing.demoCreated).toBeUndefined();
+    expect(existing.remote).not.toBe('github.com/untrusted/override');
+  });
+
   test('export is a versioned bundle of one project\'s derived knowledge, without raw transcripts or vectors', async () => {
     const x = await withStoreDeadline({ signal: new AbortController().signal, expiresAt: Date.now() + 30_000 }, () => p.exportData({ projectKey: 'demo' }));
     expect(x).toMatchObject({ format: EXPORT_FORMAT, schemaVersion: 1, projectKey: 'demo' });

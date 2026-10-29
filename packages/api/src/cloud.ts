@@ -1,7 +1,8 @@
+import { authorizeStoreWrite } from '@fb/core';
 import type { Hono } from 'hono';
 import { z } from 'zod';
 import {
-  previewCloudSync, redactSecrets, runCloudSync, cloudLocalOnlyProjects, CLOUD_LOCAL_ONLY_CURSOR,
+  previewCloudSync, redactSecrets, runCloudSync, cloudLocalOnlyProjects, CLOUD_LOCAL_ONLY_CURSOR, cloudSharedDemoProjects, CLOUD_SHARED_DEMOS_CURSOR,
   type ActivityStore, type DocsStore, type CloudConfig, type CloudSyncResult, type ManualSync, type PortabilityStore, type SyncCounts, type SyncMemory,
   type SyncProgress, type SyncTrigger, type WorkerStatus,
 } from '@fb/core';
@@ -34,8 +35,9 @@ export type CloudInfo = {
   localOnlyProjects?: string[];
   localOnlyEditable?: boolean;
   savedLocalOnlyProjects?: string[];
+  shareDemoProjects?: string[];
   projects: string[];
-  preview: { total: SyncCounts; projects: { key: string; counts: SyncCounts | null }[] } | null;
+  preview: { total: SyncCounts; projects: { key: string; counts: SyncCounts | null; reason?: string }[] } | null;
   previewError: string | null;
   last: { at: string; ok: boolean; trigger: SyncTrigger; error: string | null; sent: SyncCounts | null; projects: string[]; failed: string[] } | null;
   nextAt: string | null;
@@ -62,7 +64,8 @@ const manualOf = (r: CloudSyncResult): ManualSync => ({
 });
 
 const SyncRequest = z.object({ force: z.boolean().optional() }).strict();
-const LocalOnly = z.object({ projects: z.array(z.string().min(1).max(200)).max(2000) }).strict();
+const ProjectKeys = z.array(z.string().min(1).max(200)).max(2000);
+const LocalOnly = z.object({ projects: ProjectKeys, shareDemoProjects: ProjectKeys.optional() }).strict();
 /** For the OpenAPI document (openapi.ts). */
 export const cloudSchemas = { SyncRequest, LocalOnly };
 
@@ -87,6 +90,7 @@ export function cloudRoutes(app: Hono, d: CloudDeps): CloudState {
       localOnlyProjects: d.localOnlyStore ? await cloudLocalOnlyProjects(d.localOnlyStore, cloud?.localOnlyProjects) : cloud?.localOnlyProjects ?? [],
       localOnlyEditable: !!d.localOnlyStore,
       savedLocalOnlyProjects: d.localOnlyStore ? await cloudLocalOnlyProjects(d.localOnlyStore) : [],
+      shareDemoProjects: d.localOnlyStore ? await cloudSharedDemoProjects(d.localOnlyStore) : [],
       projects: [],
       preview: null,
       previewError: null,
@@ -97,7 +101,7 @@ export function cloudRoutes(app: Hono, d: CloudDeps): CloudState {
     if (!cloud) return c.json(info);
     info.projects = (await d.projects()).filter(key => !info.localOnlyProjects?.includes(key));
     try {
-      info.preview = await previewCloudSync(d.portability, info.projects, { suggestions: cloud.suggestions, memory });
+      info.preview = await previewCloudSync(d.portability, info.projects, { suggestions: cloud.suggestions, memory, shareDemoProjects: info.shareDemoProjects });
     } catch (err) {
       info.previewError = redactSecrets(String(err)).slice(0, 300);
     }
@@ -117,7 +121,8 @@ export function cloudRoutes(app: Hono, d: CloudDeps): CloudState {
     const body = LocalOnly.safeParse(await c.req.json().catch(() => null));
     if (!body.success) return c.json({ error: body.error.flatten() }, 400);
     await d.localOnlyStore.setCursor(CLOUD_LOCAL_ONLY_CURSOR, JSON.stringify([...new Set(body.data.projects)].sort()));
-    return c.json({ projects: await cloudLocalOnlyProjects(d.localOnlyStore, d.cloud?.localOnlyProjects) });
+    if (body.data.shareDemoProjects) await d.localOnlyStore.setCursor(CLOUD_SHARED_DEMOS_CURSOR, JSON.stringify([...new Set(body.data.shareDemoProjects)].sort()));
+    return c.json({ projects: await cloudLocalOnlyProjects(d.localOnlyStore, d.cloud?.localOnlyProjects), shareDemoProjects: await cloudSharedDemoProjects(d.localOnlyStore) });
   });
 
   app.post('/api/cloud/sync', async (c) => {
@@ -126,9 +131,10 @@ export function cloudRoutes(app: Hono, d: CloudDeps): CloudState {
     if (running) return c.json({ error: 'a sync is already running' }, 409);
     const body = SyncRequest.safeParse(await c.req.json().catch(() => ({})));
     if (!body.success) return c.json({ error: body.error.flatten() }, 400);
+    await authorizeStoreWrite();
     const startedAt = new Date().toISOString();
     const run = runCloudSync({
-      cloud: { ...cloud, localOnlyProjects: d.localOnlyStore ? await cloudLocalOnlyProjects(d.localOnlyStore, cloud.localOnlyProjects) : cloud.localOnlyProjects }, portability: d.portability, activity: d.activity, projects: d.projects, trigger: 'manual', fetch: d.fetch, memory,
+      cloud: { ...cloud, shareDemoProjects: d.localOnlyStore ? await cloudSharedDemoProjects(d.localOnlyStore) : [], localOnlyProjects: d.localOnlyStore ? await cloudLocalOnlyProjects(d.localOnlyStore, cloud.localOnlyProjects) : cloud.localOnlyProjects }, portability: d.portability, activity: d.activity, projects: d.projects, trigger: 'manual', fetch: d.fetch, memory,
       force: body.data.force ?? false,
       onProgress: (p) => { progress = { ...p, startedAt }; },
     });

@@ -1,3 +1,6 @@
+import { authorizeStoreWrite, storeWriteAuthorizationCheckpoint, withRunClaimExecutor } from '../storeWrites.ts';
+import { storeRequestSignal, storeTimeLeft } from '../storeDeadline.ts';
+import { claimRunOwnerWith } from './runs.ts';
 import neo4j from 'neo4j-driver';
 import { REDACT_PAGE, redactDeep, redactSecrets, redactStoredRow } from '../redact.ts';
 import { latestTime, readSummary, summaryRetryAt, summarySnippet, type SessionCursor, type SummaryWork, type SummaryWorkQuery, type SummaryWrite } from '../sessions.ts';
@@ -112,20 +115,33 @@ export class SessionsRepo implements SessionsStore {
   }
 
   async claimRun(sessionId: string, run: RunTag): Promise<boolean> {
-    const [r] = await this.g.run(
-      `OPTIONAL MATCH (existing:Session {id: $id})
-       OPTIONAL MATCH (prior:SessionRun {sessionId: $id})
-       WITH existing, prior WHERE existing IS NULL OR prior.run IS NOT NULL
-       MERGE (binding:SessionRun {sessionId: $id})
-       SET binding.lock = coalesce(binding.lock, 0) + 1
-       WITH binding OPTIONAL MATCH (s:Session {id: $id})
-       WITH binding, s, CASE WHEN binding.run IS NOT NULL THEN binding.run = $run AND coalesce(binding.sandbox, false) = $sandbox
-         ELSE s IS NULL END AS allowed
-       FOREACH (_ IN CASE WHEN allowed THEN [1] ELSE [] END |
-         SET binding.run = $run, binding.sandbox = $sandbox)
-       RETURN allowed`, { id: sessionId, run: run.id, sandbox: run.sandbox });
-    if (r?.get('allowed') === true) this.g.sandbox.wrote(run);
-    return r?.get('allowed') === true;
+    const reset = storeWriteAuthorizationCheckpoint();
+    const session = this.g.driver.session();
+    const signal = storeRequestSignal();
+    const cancel = () => { void session.close().catch(() => {}); };
+    signal?.addEventListener('abort', cancel, { once: true });
+    try {
+    const tx = await session.beginTransaction({ timeout: storeTimeLeft() });
+    try {
+      const result = await tx.run(`MERGE (binding:SessionRun {sessionId: $id})
+        SET binding.lock = coalesce(binding.lock, 0) + 1
+        WITH binding OPTIONAL MATCH (s:Session {id: $id})
+        RETURN binding.run AS run, binding.sandbox AS sandbox, s IS NOT NULL AS existing`, { id: sessionId });
+      const row = result.records[0];
+      if (row.get('run') !== null || row.get('existing')) {
+        const same = row.get('run') === run.id && (row.get('sandbox') === true) === run.sandbox;
+        await tx.rollback();
+        return same;
+      }
+      storeTimeLeft();
+      await withRunClaimExecutor(this.g, (id, principal, actor) => claimRunOwnerWith(async (query, params) => (await tx.run(query, params)).records, id, principal, actor), authorizeStoreWrite);
+      await tx.run('MATCH (b:SessionRun {sessionId: $id}) SET b.run = $run, b.sandbox = $sandbox', { id: sessionId, run: run.id, sandbox: run.sandbox });
+      storeTimeLeft();
+      await tx.commit();
+      this.g.sandbox.wrote(run);
+      return true;
+    } catch (error) { await tx.rollback().catch(() => {}); reset(); throw error; }
+    } finally { signal?.removeEventListener('abort', cancel); await session.close(); }
   }
 
   async runFor(sessionId: string): Promise<RunTag | null> {

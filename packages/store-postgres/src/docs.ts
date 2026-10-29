@@ -1,3 +1,4 @@
+import { conditionalWrite } from './conditionalWrite.ts';
 import { archiveBeforeRedaction, archiveRedactionInput } from '@fb/core';
 import { randomUUID } from 'node:crypto';
 import { docIdOf, runWriteOwner, REDACT_PAGE, redactDeep, redactSecrets, relevanceOf, scanRetryAt, SCAN_UNAVAILABLE_WAIT_MS } from '@fb/core';
@@ -178,12 +179,14 @@ export class PgDocsStore implements DocsStore {
   }
 
   async requeueDocRead(id: string): Promise<boolean> {
-    const { rowCount } = await this.db.pool.query(
-      `UPDATE docs SET read_status = 'pending', read_attempts = 0, read_error = NULL, read_retry_at = NULL
-       WHERE id = $1 AND read_status IN ('failed', 'pending')`,
-      [id],
-    );
-    return (rowCount ?? 0) > 0;
+    return conditionalWrite(this.db, async query => {
+      const { rowCount } = await query(
+        `UPDATE docs SET read_status = 'pending', read_attempts = 0, read_error = NULL, read_retry_at = NULL
+         WHERE id = $1 AND read_status IN ('failed', 'pending')`,
+        [id],
+      );
+      return (rowCount ?? 0) > 0;
+    }, Boolean);
   }
 
   async docImage(id: string): Promise<TaskImage | null> {
@@ -192,9 +195,11 @@ export class PgDocsStore implements DocsStore {
   }
 
   async deleteDoc(id: string, o: { run?: string | null } = {}): Promise<boolean> {
-    // Chunks go with their doc (ON DELETE CASCADE).
-    const { rowCount } = await this.db.pool.query('DELETE FROM docs WHERE id = $1 AND ($2::text IS NULL OR run = $2)', [id, o.run ?? null]);
-    return (rowCount ?? 0) > 0;
+    return conditionalWrite(this.db, async query => {
+      // Chunks go with their doc (ON DELETE CASCADE).
+      const { rowCount } = await query('DELETE FROM docs WHERE id = $1 AND ($2::text IS NULL OR run = $2)', [id, o.run ?? null]);
+      return (rowCount ?? 0) > 0;
+    }, Boolean);
   }
 
   async linkedDocs(q: { projectKey: string; docIds: string[]; run?: string | null }): Promise<DocLink[]> {

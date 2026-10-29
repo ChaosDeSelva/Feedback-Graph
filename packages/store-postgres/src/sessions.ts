@@ -1,3 +1,5 @@
+import { authorizeStoreWrite, storeWriteAuthorizationCheckpoint, withRunClaimExecutor } from '@fb/core';
+import { claimRunOwnerWith } from './runs.ts';
 import {
   latestTime,
   readSummary,
@@ -89,15 +91,18 @@ export class PgSessionsStore implements SessionsStore {
   }
 
   async claimRun(sessionId: string, run: RunTag): Promise<boolean> {
-    const claimed = await tx(this.db, async c => {
+    const reset = storeWriteAuthorizationCheckpoint();
+    let claimed: boolean;
+    try { claimed = await tx(this.db, async c => {
       await c.query("SELECT pg_advisory_xact_lock(hashtextextended('session-run:' || $1, 0))", [sessionId]);
       const { rows: bound } = await c.query('SELECT run, sandbox FROM session_run_tags WHERE session_id = $1', [sessionId]);
       if (bound[0]) return bound[0].run === run.id && bound[0].sandbox === run.sandbox;
       const { rows: existing } = await c.query('SELECT id FROM sessions WHERE id = $1', [sessionId]);
       if (existing.length) return false;
+      await withRunClaimExecutor(this.db, (id, principal, actor) => claimRunOwnerWith(c.query.bind(c), id, principal, actor), authorizeStoreWrite);
       await c.query('INSERT INTO session_run_tags (session_id, run, sandbox) VALUES ($1, $2, $3)', [sessionId, run.id, run.sandbox]);
       return true;
-    });
+    }); } catch (error) { reset(); throw error; }
     if (claimed) sandboxPresence(this.db).wrote(run);
     return claimed;
   }

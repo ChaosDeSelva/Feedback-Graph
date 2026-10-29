@@ -1,3 +1,4 @@
+import { conditionalWrite } from './conditionalWrite.ts';
 import { archiveBeforeRedaction, archiveRedactionInput } from '@fb/core';
 import { reviewPatterns } from '@fb/core';
 import { randomUUID } from 'node:crypto';
@@ -139,11 +140,13 @@ export class PgKnowledgeStore implements KnowledgeStore {
 
   /** Start a given-up (or waiting) post-mortem again now. */
   async retryPostmortem(feedbackId: string): Promise<boolean> {
-    const { rowCount } = await this.q(
-      `UPDATE feedback f SET attempts = 0, retry_at = NULL WHERE f.id = $1 AND NOT EXISTS (SELECT 1 FROM misses m WHERE m.feedback_id = f.id)`,
-      [feedbackId],
-    );
-    return (rowCount ?? 0) > 0;
+    return conditionalWrite(this.db, async query => {
+      const { rowCount } = await query(
+        `UPDATE feedback f SET attempts = 0, retry_at = NULL WHERE f.id = $1 AND NOT EXISTS (SELECT 1 FROM misses m WHERE m.feedback_id = f.id)`,
+        [feedbackId],
+      );
+      return (rowCount ?? 0) > 0;
+    }, Boolean);
   }
 
   async savePostmortem(feedbackId: string, raw: PostMortem, embeddings: { miss: number[]; lesson: number[] }): Promise<void> {

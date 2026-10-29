@@ -113,6 +113,7 @@ export function CloudSync() {
               {info.projects.length ? info.projects.join(', ') : <span className="text-muted">none: select projects above (SYNC_PROJECTS narrows them)</span>}
             </dd>
           </dl>
+          {info.preview?.projects.filter(project => project.reason).map(project => <p key={project.key} className="text-xs text-muted">{project.key}: {project.reason}</p>)}
           {!!info.localOnlyProjects?.length && <p className="text-xs text-muted">Local only (never sends new content): {info.localOnlyProjects.join(', ')}. Environment-enforced projects remain local even if removed below.</p>}
           {info.localOnlyEditable && <div className="grid gap-2"><label htmlFor="cloud-local-only">Keep these project keys local (comma separated)</label><input id="cloud-local-only" value={localOnly} onChange={e => setLocalOnly(e.target.value)} /><Button disabled={busy} onClick={async () => { setBusy(true); setError(null); try { await api.cloudLocalOnly(localOnly.split(',').map(key => key.trim()).filter(Boolean)); await load(); } catch (e) { setError(message(e)); } finally { setBusy(false); } }}>Save local-only projects</Button><p className="text-xs text-muted">These projects stay selected locally. Forced sync never sends new content; previously shared copies are withdrawn on the next sync.</p></div>}
           {result && <p role="status" className="text-ok-text">{result}</p>}

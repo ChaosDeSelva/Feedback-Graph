@@ -1,3 +1,4 @@
+import { conditionalWrite } from './conditionalWrite.ts';
 import { archiveBeforeRedaction, archiveRedactionInput } from '../redactionArchive.ts';
 import neo4j from 'neo4j-driver';
 import { REDACT_PAGE, redactDeep, redactSecrets } from '../redact.ts';
@@ -215,13 +216,15 @@ export class DocsRepo implements DocsStore {
   }
 
   async requeueDocRead(id: string): Promise<boolean> {
-    const [r] = await this.g.run(
-      `MATCH (d:Doc {id: $id}) WHERE d.readStatus IN ['failed', 'pending']
-       SET d.readStatus = 'pending', d.readAttempts = 0, d.readError = null, d.readRetryAt = null
-       RETURN count(d) AS n`,
-      { id },
-    );
-    return Number(r?.get('n') ?? 0) > 0;
+    return conditionalWrite(this.g, async query => {
+      const [r] = await query(
+        `MATCH (d:Doc {id: $id}) WHERE d.readStatus IN ['failed', 'pending']
+         SET d.readStatus = 'pending', d.readAttempts = 0, d.readError = null, d.readRetryAt = null
+         RETURN count(d) AS n`,
+        { id },
+      );
+      return Number(r?.get('n') ?? 0) > 0;
+    }, Boolean);
   }
 
   async docImage(id: string): Promise<TaskImage | null> {
@@ -259,22 +262,24 @@ export class DocsRepo implements DocsStore {
   }
 
   async deleteDoc(id: string, o: { run?: string | null } = {}): Promise<boolean> {
-    const [r] = await this.g.run(
-      `OPTIONAL MATCH (d:Doc {id: $id}) WHERE $run IS NULL OR d.run = $run
-       OPTIONAL MATCH (d)-[:HAS_CHUNK]->(c:Chunk)
-       WITH d, collect(c) AS cs, d IS NOT NULL AS existed
-       OPTIONAL MATCH (x:Fact {docId: $id}) WHERE existed
-       WITH d, cs, existed, collect(x) AS xs
-       OPTIONAL MATCH (b:DocBlob {docId: $id}) WHERE existed
-       WITH d, cs, existed, xs, collect(b) AS bs
-       FOREACH (x IN xs | DETACH DELETE x)
-       FOREACH (b IN bs | DETACH DELETE b)
-       FOREACH (c IN cs | DETACH DELETE c)
-       FOREACH (_ IN CASE WHEN existed THEN [1] ELSE [] END | DETACH DELETE d)
-       RETURN existed`,
-      { id, run: o.run ?? null },
-    );
-    return r.get('existed');
+    return conditionalWrite(this.g, async query => {
+      const [r] = await query(
+        `OPTIONAL MATCH (d:Doc {id: $id}) WHERE $run IS NULL OR d.run = $run
+         OPTIONAL MATCH (d)-[:HAS_CHUNK]->(c:Chunk)
+         WITH d, collect(c) AS cs, d IS NOT NULL AS existed
+         OPTIONAL MATCH (x:Fact {docId: $id}) WHERE existed
+         WITH d, cs, existed, collect(x) AS xs
+         OPTIONAL MATCH (b:DocBlob {docId: $id}) WHERE existed
+         WITH d, cs, existed, xs, collect(b) AS bs
+         FOREACH (x IN xs | DETACH DELETE x)
+         FOREACH (b IN bs | DETACH DELETE b)
+         FOREACH (c IN cs | DETACH DELETE c)
+         FOREACH (_ IN CASE WHEN existed THEN [1] ELSE [] END | DETACH DELETE d)
+         RETURN existed`,
+        { id, run: o.run ?? null },
+      );
+      return r?.get('existed') === true;
+    }, Boolean);
   }
 
   async linkedDocs(q: { projectKey: string; docIds: string[]; run?: string | null }): Promise<DocLink[]> {

@@ -80,10 +80,11 @@ describe('narrowing a global lesson to a project', () => {
   }
 
   test('with no project named it is still refused (409), and the error says to name one', async () => {
-    const { app } = narrowSetup();
+    const { app, calls } = narrowSetup();
     const res = await app.request('/api/lessons/lesson%3Ag', patch({ scope: 'project' }));
     expect(res.status).toBe(409);
     expect((await res.json()).error).toMatch(/projectKey/);
+    expect(calls).toEqual([]);
   });
 
   test('with a known project it is narrowed to that project', async () => {

@@ -166,7 +166,7 @@ const app = createApp(store.graph, {
   },
   inScope: async (key: string) => (await scope()).project(key),
   shown,
-  importer: { knowledge, facts, embed, activity, excluded: config.excludeProjects },
+  importer: { knowledge, facts, embed, activity, portability: store.portability, excluded: config.excludeProjects },
   demo: {
     knowledge,
     facts,

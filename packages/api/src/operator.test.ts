@@ -256,7 +256,7 @@ test('a link decision records who made it on the link itself', async () => {
 });
 
 test('asking for a code map rebuild is recorded in Activity, as the agent that asked', async () => {
-  const codegraph = { hotspots: async () => [], moduleContext: async () => null, impact: async () => null, codeMapMeta: async () => null, requestCodeMapRebuild: async (k: string) => k === 'shop' };
+  const codegraph = { hotspots: async () => [], moduleContext: async () => null, impact: async () => null, codeMapMeta: async (key: string) => key === 'shop' ? { fingerprint: 'fixture', builtAt: 't', stats: { files: 1, symbols: 0, imports: 0, tests: 0 } } : null, requestCodeMapRebuild: async (k: string) => k === 'shop' };
   const { app, logged } = setup({ extra: { codegraph: codegraph as never } });
   expect((await app.request('/api/projects/shop/codemap/rebuild', call('POST', {}, bearer(OP, 'codex')))).status).toBe(202);
   expect(logged).toEqual([expect.objectContaining({ kind: 'code_mapped', actor: 'operator:codex', projectKey: 'shop', subject: expect.stringMatching(/rebuild/) })]);

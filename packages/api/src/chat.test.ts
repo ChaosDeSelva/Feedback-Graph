@@ -366,7 +366,13 @@ describe('chat routes', () => {
     const conv = await s.store.createConversation({ projectKey: 'demo-shop', title: 'x', provider: null });
     const t = (await s.store.addUserTurn(conv.id, 'q', { context: '', sources: [] }))!;
     const answer = s.turns.find((x) => x.id === t.turns[1].id)!;
+    const originalRetry = s.store.retryTurn;
+    let retryCalls = 0;
+    s.store.retryTurn = async (...args) => { retryCalls++; return originalRetry(...args); };
     expect((await app().request(`/api/chats/${conv.id}/turns/${answer.id}/retry`, send('POST', {}))).status).toBe(404);
+    expect(retryCalls).toBe(0);
+    expect((await app().request(`/api/chats/${conv.id}/turns/missing/retry`, send('POST', {}))).status).toBe(404);
+    expect(retryCalls).toBe(0);
     answer.status = 'failed';
     answer.error = 'model unavailable';
     const retried = await app().request(`/api/chats/${conv.id}/turns/${answer.id}/retry`, send('POST', {}));

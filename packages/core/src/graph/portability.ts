@@ -20,7 +20,7 @@ export type ExportBundle = {
   exportedAt: string;
   projectKey: string | null;
   /** remote = normalizeRemote(origin): the id that matches one repo across differently named folders and machines. */
-  projects: { key: string; remote: string | null }[];
+  projects: { key: string; remote: string | null; /** Created exclusively for a demo fixture, not inferred from its name. */ demoCreated?: true }[];
   lessons: Lesson[];
   misses: {
     id: string;
@@ -51,12 +51,16 @@ export class PortabilityRepo implements PortabilityStore {
     this.g = g;
   }
 
+  async restorePrivateProject(project: { key: string; remote: string | null }): Promise<void> {
+    await this.g.run("MERGE (p:Project {key: $key}) ON CREATE SET p.name = $key, p.repoPath = '', p.remote = $remote, p.demoCreated = true", project);
+  }
+
   async exportData(o: { projectKey?: string; projectKeys?: string[]; approvedOnly?: boolean } = {}): Promise<ExportBundle> {
     const key = o.projectKey ?? null;
     // null: no list to apply (one project by key, or everything).
     const keys = key === null && o.projectKeys ? o.projectKeys : null;
     const [projects, lessons, misses, facts, docs] = await Promise.all([
-      this.g.run(`MATCH (p:Project) WHERE ($key IS NULL OR p.key = $key) AND ($keys IS NULL OR p.key IN $keys) RETURN p.key AS key, p.remote AS remote ORDER BY p.key`, { key, keys }),
+      this.g.run(`MATCH (p:Project) WHERE ($key IS NULL OR p.key = $key) AND ($keys IS NULL OR p.key IN $keys) RETURN p.key AS key, p.remote AS remote, p.demoCreated AS demoCreated ORDER BY p.key`, { key, keys }),
       this.g.run(
         `MATCH (l:Lesson)
          WHERE ($key IS NULL OR l.projectKey = $key OR (l.projectKey IS NULL AND l.originProjectKey = $key))
@@ -93,7 +97,7 @@ export class PortabilityRepo implements PortabilityStore {
       toolVersion: VERSION,
       exportedAt: new Date().toISOString(),
       projectKey: key,
-      projects: projects.map((r) => ({ key: r.get('key') as string, remote: (r.get('remote') as string) ?? null })),
+      projects: projects.map((r) => ({ key: r.get('key') as string, remote: (r.get('remote') as string) ?? null, ...(r.get('demoCreated') === true ? { demoCreated: true as const } : {}) })),
       lessons: lessons.map((r) => {
         const l = props(r, 'l');
         return {

@@ -1,4 +1,4 @@
-import { openNeo4jStore, redactUrl, type Config, type Neo4jConfig, type Store } from '@fb/core';
+import { guardStore, openNeo4jStore, redactUrl, type Config, type Neo4jConfig, type Store } from '@fb/core';
 import type { PostgresConfig } from './db.ts';
 import { openPostgresStore } from './store.ts';
 
@@ -15,7 +15,7 @@ export async function openStore(config: Pick<Config, 'store' | 'neo4j' | 'postgr
     if (!config.postgres) throw new Error('STORE=postgres needs DATABASE_URL');
     const { url } = config.postgres;
     try {
-      return await openers.postgres({ url });
+      return guardStore(await openers.postgres({ url }));
     } catch (err) {
       // Driver messages can echo the connection string; never let the password reach a log.
       const msg = String((err as Error)?.message ?? err).split(url).join(redactUrl(url));
@@ -23,5 +23,5 @@ export async function openStore(config: Pick<Config, 'store' | 'neo4j' | 'postgr
     }
   }
   if (!config.neo4j) throw new Error('STORE=neo4j needs the NEO4J_* settings');
-  return openers.neo4j(config.neo4j);
+  return guardStore(await openers.neo4j(config.neo4j));
 }

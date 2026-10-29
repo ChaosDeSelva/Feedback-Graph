@@ -1,6 +1,6 @@
 import type { Hono } from 'hono';
 import { z } from 'zod';
-import { EXPORT_FORMAT, FACT_KINDS, LESSON_CHECKS, redactDeep, type ActivityStore, type EmbeddedFact, type FactsStore, type KnowledgeStore, type LessonInput, type LessonStatus } from '@fb/core';
+import { EXPORT_FORMAT, FACT_KINDS, LESSON_CHECKS, redactDeep, type ActivityStore, type PortabilityStore, type EmbeddedFact, type FactsStore, type KnowledgeStore, type LessonInput, type LessonStatus } from '@fb/core';
 
 /**
  * POST /api/import: an export bundle (GET /api/export) back into a store, on this or another machine, either backend.
@@ -16,6 +16,7 @@ export type ImportDeps = {
   activity?: Pick<ActivityStore, 'record'>;
   /** EXCLUDE_PROJECTS: never imported either. */
   excluded: string[];
+  portability?: Pick<PortabilityStore, 'restorePrivateProject'>;
 };
 
 export type ImportResult = {
@@ -62,6 +63,7 @@ const Bundle = z.object({
   toolVersion: z.string().max(50).default('unknown'),
   exportedAt: z.string().max(50).default(''),
   projectKey: Key.nullable().default(null),
+  projects: z.array(z.object({ key: Key, remote: z.string().max(2000).nullable(), demoCreated: z.literal(true).optional() })).max(2000).default([]),
   lessons: z.array(Lesson).max(20_000).default([]),
   facts: z.array(Fact).max(200_000).default([]),
   misses: z.array(z.unknown()).default([]),
@@ -91,6 +93,12 @@ export async function importBundle(raw: ImportBundle, o: { keepApproved: boolean
     facts: { added: 0, projects: [], skippedProjects: [] },
     notImported: { misses: b.misses.length, docs: b.docs.length, codeFiles: b.codeFiles.length },
   };
+
+  for (const project of b.projects) {
+    if (!project.demoCreated || never.has(project.key)) continue;
+    if (!d.portability?.restorePrivateProject) throw new Error('this importer cannot preserve private-project provenance; upgrade before importing the bundle');
+    await d.portability.restorePrivateProject({ key: project.key, remote: project.remote });
+  }
 
   const fresh: (z.infer<typeof Lesson> & { next: LessonStatus })[] = [];
   const seen = new Set<string>();

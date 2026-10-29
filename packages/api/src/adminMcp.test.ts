@@ -63,7 +63,7 @@ function setup(o: { allow?: OperatorVerb[]; token?: string | null; apiToken?: st
     projectDirs: async () => [project, { key: 'acme', name: 'acme', repoPath: '/vibe/acme' }],
     links: { listLinks: async () => [], deleteLink: async () => true, setLink: async (a: string, b: string, p: object) => { note('setLink', [a, b, p]); return { id: `link:${a}|${b}`, a, b, status: 'confirmed', relation: 'related' }; } } as never,
     codegraph: {
-      hotspots: async () => [], moduleContext: async () => null, impact: async () => null, codeMapMeta: async () => null,
+      hotspots: async () => [], moduleContext: async () => null, impact: async () => null, codeMapMeta: async (key: string) => key === 'demo-shop' ? { fingerprint: 'fixture', builtAt: 't', stats: { files: 1, symbols: 0, imports: 0, tests: 0 } } : null,
       requestCodeMapRebuild: async (k: string) => { note('rebuild', k); return true; },
     } as never,
     settings,
@@ -422,4 +422,12 @@ test('inbox_list without a status preserves the API all-status default', async (
   const s = setup();
   await tool(s.app, 'inbox_list', {});
   expect(s.calls.listCandidates[0]).not.toHaveProperty('status', 'pending');
+});
+
+
+test('rebuild_code_map rejects a project without a map before invoking a semantic mutator', async () => {
+  const s = setup();
+  const result = await tool(s.app, 'rebuild_code_map', { project: 'acme' });
+  expect(result.isError).toBe(true);
+  expect(s.calls.rebuild ?? []).toEqual([]);
 });

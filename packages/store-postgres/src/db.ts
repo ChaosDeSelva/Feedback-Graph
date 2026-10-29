@@ -1,4 +1,4 @@
-import { storeTimeLeft, storeRequestSignal } from '@fb/core';
+import { storeTimeLeft } from '@fb/core';
 /**
  * Shared by every repository class: the connection, transactions, and the conversions between Postgres values and
  * the shapes the Neo4j store returns. Owned by the seam: change it only in coordination with every implementer.
@@ -65,13 +65,13 @@ NulSafeClient.prototype.query = function query(this: pg.Client, ...args: unknown
     if (callback) args.push(callback);
     return (plainQuery as (...a: unknown[]) => unknown).apply(this, args);
   }
-  const signal = storeRequestSignal();
   const operation = async () => {
     const isRollback = typeof config === 'string' && /^ROLLBACK\b/i.test(config);
     const timeout = isRollback ? 30000 : storeTimeLeft();
-    if (signal && !isRollback) {
+    if (!isRollback) {
       // PostgreSQL enforces this timeout itself, including lock waits; a JS-only timeout would allow late writes.
       // Utility SET does not acquire a snapshot before an export's SET TRANSACTION.
+      // Reset the fallback for background work too: a prior request's short timeout persists on a pooled client.
       await (plainQuery as (...a: unknown[]) => Promise<unknown>).call(this, `SET statement_timeout = ${Math.max(1, Math.floor(timeout))}`);
       storeTimeLeft();
     }

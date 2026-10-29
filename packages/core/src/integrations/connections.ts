@@ -1,3 +1,4 @@
+import { authorizeStoreWrite } from '../storeWrites.ts';
 import { createHash } from 'node:crypto';
 import { chmod, mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
@@ -127,6 +128,7 @@ export class Integrations {
   async saveCredential(kind: IntegrationKind, token: string): Promise<void> {
     if (!this.file) throw new Error('no INTEGRATIONS_FILE is configured: set the token in .env instead');
     const all = await this.file.read();
+    await authorizeStoreWrite();
     await this.file.write({ ...all, [kind]: { token, savedAt: new Date().toISOString() } });
   }
 
@@ -135,8 +137,10 @@ export class Integrations {
     if (this.file) {
       const rest = { ...(await this.file.read()) };
       delete rest[kind];
+      await authorizeStoreWrite();
       await this.file.write(rest);
     }
+    await authorizeStoreWrite();
     await this.kv.setCursor(key(kind, 'check'), '');
   }
 
@@ -145,6 +149,7 @@ export class Integrations {
   }
 
   async saveCheck(kind: IntegrationKind, c: IntegrationCheck): Promise<void> {
+    await authorizeStoreWrite();
     await this.kv.setCursor(key(kind, 'check'), JSON.stringify(c));
   }
 
@@ -153,6 +158,7 @@ export class Integrations {
   }
 
   async saveSync(kind: IntegrationKind, s: IntegrationSyncState): Promise<void> {
+    await authorizeStoreWrite();
     await this.kv.setCursor(key(kind, 'sync'), JSON.stringify(s));
   }
 
@@ -172,6 +178,7 @@ export class Integrations {
   async setLink(projectKey: string, patch: Partial<IntegrationLink>): Promise<IntegrationLink> {
     const all = await this.links();
     const next = { ...DEFAULT_LINK, ...all[projectKey], ...patch };
+    await authorizeStoreWrite();
     await this.kv.setCursor(LINKS, JSON.stringify({ ...all, [projectKey]: next }));
     return next;
   }

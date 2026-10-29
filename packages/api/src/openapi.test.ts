@@ -10,7 +10,7 @@ const anything: any = new Proxy({}, { get: (_, k) => (k === 'then' ? undefined :
 /** The app with every optional dependency given, so every route there is gets registered. */
 function fullApp() {
   return createApp(anything as ApiRepo, {
-    context: anything, knowledge: anything, embed: async () => [], facts: anything, projectDirs: async () => [], insights: anything,
+    context: { roots: [], embed: async () => [], judge: async () => [], k: anything, activity: anything }, knowledge: anything, embed: async () => [], facts: anything, projectDirs: async () => [], insights: anything,
     activity: anything, docs: anything, links: anything, portability: anything, auth: { operator: { token: 'o'.repeat(32), allow: [] } }, log: () => {},
     system: { version: '9.9.9', ping: async () => true, worker: async () => null },
     classifyQueue: anything, settings: anything, codegraph: anything, mapMaxFiles: null, cloud: anything, inScope: () => true,

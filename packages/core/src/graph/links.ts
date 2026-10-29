@@ -1,3 +1,4 @@
+import { conditionalWrite } from './conditionalWrite.ts';
 import { redactSecrets } from '../redact.ts';
 import type { LinksStore } from '../store.ts';
 import type { RunTag } from '../types.ts';
@@ -144,12 +145,14 @@ export class LinksRepo implements LinksStore {
   }
 
   async deleteLink(id: string, o: { run?: string | null } = {}): Promise<boolean> {
-    const [r] = await this.g.run(
-      `OPTIONAL MATCH (l:ProjectLink {id: $id}) WHERE $run IS NULL OR l.run = $run
-       WITH l, l IS NOT NULL AS existed DETACH DELETE l RETURN existed`,
-      { id, run: o.run ?? null },
-    );
-    return r.get('existed');
+    return conditionalWrite(this.g, async query => {
+      const [r] = await query(
+        `OPTIONAL MATCH (l:ProjectLink {id: $id}) WHERE $run IS NULL OR l.run = $run
+         WITH l, l IS NOT NULL AS existed DETACH DELETE l RETURN existed`,
+        { id, run: o.run ?? null },
+      );
+      return r?.get('existed') === true;
+    }, Boolean);
   }
 }
 

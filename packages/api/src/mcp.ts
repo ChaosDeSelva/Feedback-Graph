@@ -39,10 +39,10 @@ function buildServer(ctx: ContextDeps, client: string | undefined) {
         task: z.string().max(MAX.task).describe('What you are about to build or change, in a sentence or two'),
         files: z.array(z.string().max(MAX.path)).max(50).optional().describe('Files you expect to read or change (repo-relative, or absolute inside the project)'),
         brief: z.boolean().optional().describe('Only lessons, misses on the named files, their importers and tests, and PR discussions (about 1,500 characters)'),
-        session_id: z.string().max(MAX.key).optional().describe('Your session id, if you know it: facts about files this session edited, refreshed since it started, are marked as your own change'),
+        session_id: z.string().min(1).max(200).regex(/^[\w.:-]+$/, 'a real session id').optional().describe('Your session id, if you know it: facts about files this session edited, refreshed since it started, are marked as your own change'),
       },
     },
-    async ({ session_id, ...a }) => text((await getTaskContext({ ...a, sessionId: session_id, client }, ctx)).markdown),
+    async ({ session_id, ...a }) => { if (session_id) await ctx.registerSession?.(session_id); return text((await getTaskContext({ ...a, sessionId: session_id, client }, ctx)).markdown); },
   );
 
   server.registerTool(
@@ -61,10 +61,14 @@ function buildServer(ctx: ContextDeps, client: string | undefined) {
           .optional()
           .describe('Your change as a unified diff: `git diff <commit this session started from>` (staged, unstaged and committed; run `git add -N` on new files first). The judge reads about 32 KB of it, the files most related to the lessons first, then files_changed in order, and the answer names the files it cut. Omitted: the diff of files_changed is read from the repo.'),
         files_changed: z.array(z.string().max(MAX.path)).max(50).optional().describe('Files you changed (repo-relative, or absolute inside the project)'),
-        session_id: z.string().max(MAX.key).optional().describe("Your session id, if you know it: the check is recorded as your session's"),
+        session_id: z.string().min(1).max(200).regex(/^[\w.:-]+$/, 'a real session id').optional().describe("Your session id, if you know it: the check is recorded as your session's"),
       },
     },
-    async ({ files_changed, session_id, ...a }) => text((await checkBeforeDone({ ...a, filesChanged: files_changed, sessionId: session_id, client }, ctx)).markdown),
+    async ({ files_changed, session_id, ...a }) => {
+      if (session_id) await ctx.registerSession?.(session_id);
+      const result = await checkBeforeDone({ ...a, filesChanged: files_changed, sessionId: session_id, client }, ctx);
+      return { ...text(result.markdown), ...(result.queue && { structuredContent: { queue: result.queue, queued: result.queued ?? false } }) };
+    },
   );
 
   server.registerTool(
@@ -106,10 +110,10 @@ function buildServer(ctx: ContextDeps, client: string | undefined) {
         ...where,
         feedback: z.string().max(MAX.prose).describe("The developer's feedback, in their words"),
         what_was_done: z.string().max(MAX.prose).describe('What you had built or claimed before the feedback'),
-        session_id: z.string().max(MAX.key).optional().describe('Your session id, if you know it: lets the report join the same pushback flagged from this session'),
+        session_id: z.string().min(1).max(200).regex(/^[\w.:-]+$/, 'a real session id').optional().describe('Your session id, if you know it: lets the report join the same pushback flagged from this session'),
       },
     },
-    async (a) => text((await reportFeedback({ ...a, whatWasDone: a.what_was_done, sessionId: a.session_id, client }, ctx)).markdown),
+    async (a) => { if (a.session_id) await ctx.registerSession?.(a.session_id); return text((await reportFeedback({ ...a, whatWasDone: a.what_was_done, sessionId: a.session_id, client }, ctx)).markdown); },
   );
 
   server.registerTool(
@@ -190,7 +194,11 @@ export async function handleMcp(req: Request, ctx: ContextDeps): Promise<Respons
   const transport = new WebStandardStreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true });
   await server.connect(transport);
   try {
-    const res = await transport.handleRequest(req);
+    const streamed = await transport.handleRequest(req);
+    // JSON transport creates its Response before an async tool callback finishes. Wait for the JSON result so
+    // request authorization and cleanup observe that callback's outcome; do not buffer event streams.
+    const res = streamed.body && streamed.headers.get('content-type')?.includes('application/json')
+      ? new Response(await streamed.text(), { status: streamed.status, statusText: streamed.statusText, headers: streamed.headers }) : streamed;
     if (!initialized || !res.ok) return res;
     const headers = new Headers(res.headers);
     headers.set('mcp-session-id', encodeClient(initialized));

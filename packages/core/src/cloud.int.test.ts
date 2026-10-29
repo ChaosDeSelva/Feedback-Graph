@@ -56,6 +56,32 @@ describeStores('cloud sync', (h) => {
     await seedSyncProject(store, 'demo', 'github.com/acme/demo', 'Scope by org');
   });
 
+  test('a demo-only project stays local without creating a cloud project from its leftover metadata', async () => {
+    const key = 'isolated-demo';
+    await store.knowledge.saveDemoMiss!({ project: { key, name: key, repoPath: '' }, id: `demo:${key}:probe`, ts: '2026-10-01T00:00:00Z', feedbackText: '[demo] probe', whatWasDone: 'fixture only', missed: '[demo] no-console probe', cause: 'verification_gap', causeExplanation: 'fixture', embedding: vec(1) });
+    await store.knowledge.upsertLesson({ id: `lesson:demo:${key}:probe`, projectKey: key, title: '[demo] No console', rule: 'Do not call console.log.', appliesWhen: 'editing probe.ts', scope: 'project', paths: ['probe.ts'], status: 'approved', source: 'demo', embedding: vec(1) });
+    await store.facts.saveFileFacts(key, { path: 'probe.ts', hash: 'demo', summary: '[demo]' }, [{ path: 'probe.ts', lines: null, kind: 'convention', statement: '[demo] fixture', why: '', confidence: 1, embedding: vec(2) }], 'demo');
+    await store.codegraph.replaceCodeMap(key, { files: [{ path: 'probe.ts', lang: 'typescript', hash: 'fixture', loc: 1, isTest: false }], symbols: [], imports: [], tests: [], churn: {}, fingerprint: 'fixture-map' });
+    const exported = await store.portability.exportData({ projectKey: key });
+    expect(exported.projects[0]).toMatchObject({ demoCreated: true });
+    expect(exported.codeFiles).toHaveLength(1);
+    expect(exported.projects.map(project => project.key)).toEqual([key]);
+    expect([exported.lessons, exported.misses, exported.facts, exported.docs]).toEqual([[], [], [], []]);
+    let posts = 0;
+    const fetcher = (async (_url: string, init: RequestInit) => {
+      if (init.method === 'POST') posts++;
+      return Response.json({ revision: POLICY_REVISION });
+    }) as unknown as typeof fetch;
+    const result = await runCloudSync({ cloud: fake, portability: store.portability, projects: async () => [key], trigger: 'manual', force: true, fetch: fetcher });
+    expect(result.projects).toMatchObject([{ key, status: 'empty' }]);
+    expect(posts).toBe(0);
+    // A background scan produces ordinary-source facts; it must not silently promote the probe into sharing.
+    await store.facts.saveFileFacts(key, { path: 'probe.ts', hash: 'real-scan', summary: 'scanned fixture' }, [{ path: 'probe.ts', lines: null, kind: 'convention', statement: 'background scan fact', why: '', confidence: 1, embedding: vec(2) }], 'ollama:scanner');
+    await runCloudSync({ cloud: fake, portability: store.portability, projects: async () => [key], trigger: 'manual', force: true, fetch: fetcher });
+    expect(posts).toBe(0);
+
+  });
+
   test('what is sent is the project with its approved lessons only: no proposed lesson, no transcript text, no excerpts, no document text, no vectors', async () => {
     const bodies: string[] = [];
     const policyRequests: RequestInit[] = [];

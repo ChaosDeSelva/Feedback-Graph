@@ -686,3 +686,15 @@ test('labelled session409 preflight reserves neither run ownership nor a session
   expect(s.owners.has('refused-session')).toBe(false);
   expect(claims).toBe(0);
 });
+
+
+test('nested admin cleanup cannot inherit and reserve an unrelated outer run', async () => {
+  const s = setup({ owners: { target: ['operator', CALLER] } });
+  const response = await s.app.request('/mcp/admin?run=unrelated-outer', { ...rpc('run_cleanup', { run: 'target', apply: true }), headers: { ...rpc('x', {}).headers, ...op() } });
+  expect(response.status).toBe(200);
+  const result = await response.json();
+  expect(result.result?.isError).not.toBe(true);
+  expect(s.owners.has('unrelated-outer')).toBe(false);
+  expect(s.removed).toEqual([['target', []]]);
+  expect(s.logged.at(-1)).toMatchObject({ kind: 'run_cleaned', run: null });
+});

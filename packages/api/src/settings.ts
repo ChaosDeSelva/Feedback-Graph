@@ -1,6 +1,6 @@
 import type { Hono } from 'hono';
 import { z } from 'zod';
-import { projectScope, type ActivityStore, type FolderCandidate, type OutsideFolder, type PortabilityStore, type ProjectScope, type SelectionStore } from '@fb/core';
+import { authorizeStoreWrite, projectScope, type ActivityStore, type FolderCandidate, type OutsideFolder, type PortabilityStore, type ProjectScope, type SelectionStore } from '@fb/core';
 import { MAX_ROOTS, normalizeRoots, type RootsStore } from './roots.ts';
 
 export type SettingsDeps = {
@@ -204,6 +204,7 @@ export function settingsRoutes(
     const norm = normalizeRoots(body.data.roots, d.hostHome ?? null);
     if ('error' in norm) return c.json({ error: norm.error }, 400);
     const before = (await d.savedRoots.read())?.roots ?? d.roots;
+    await authorizeStoreWrite();
     const { roots } = await d.savedRoots.write(norm.roots);
     const added = roots.filter((r) => !before.includes(r));
     const removed = before.filter((r) => !roots.includes(r));

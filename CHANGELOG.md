@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.6.8 (2026-10-29)
+
+- Reserve labelled run IDs at the first validated write, rather than on request arrival. Session binding and ownership commit together; failed conditional writes roll back both. Competing callers cannot hijack a run, and historical ownerless runs require explicit owner cleanup. Apply the same authorization before changing credentials, project roots or dispatching cloud sync.
+- Report queue position, capacity and observed wait/completion ranges. Estimates account for active jobs and real slot lifetimes, including providers that ignore cancellation; stalled capacity is reported as unknown, and expired queued requests do not retain a slot.
+- Keep demo-created projects local through scans, memory imports and backup/restore until the owner explicitly allows sharing. Do not upload empty project bundles, and report rejected cloud policy requests instead of claiming a successful sync.
+
 ## 0.6.7 (2026-10-28)
 
 - Replace unrestricted runner seccomp with a pinned Docker-derived default-deny profile, keeping the namespace operations required by the sandbox. Doctor and runner errors name the explicit macOS procfs setup option and its tradeoff. Make the process-group timeout regression wait reliably for both child processes.

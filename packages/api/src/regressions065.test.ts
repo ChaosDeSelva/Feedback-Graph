@@ -113,10 +113,11 @@ test('Ask requests the exact named file even when token matching prefers sibling
   expect(pack.context).toContain('Named file miss');
 });
 
-test('deadline response exposes judge capacity and honestly reports an unknown wait and no retained position', async () => {
+test('deadline response exposes judge capacity, a labeled cold-start estimate and no retained position', async () => {
   const queue = new Admission({ concurrency: 5, timeoutMs: 1000 });
   const result = await checkBeforeDone({ project: 'demo', task: 'edit src/app.ts', summary: 's' }, deps({ checkTimeoutMs: 10, judgeQueue: queue, embed: async () => new Promise(() => {}) }));
   expect(result.markdown).toContain('Judge capacity: 5');
-  expect(result.markdown).toContain('Estimated wait: unknown');
+  expect(result.markdown).toContain('cold-start response-budget scenario');
+  expect(result.queue).toMatchObject({ retained: false, estimate: { source: 'response_budget', samples: 0 } });
   expect(result.markdown).toContain('does not retain a queue position');
 });

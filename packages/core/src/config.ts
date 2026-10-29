@@ -161,6 +161,8 @@ export type CloudConfig = {
   suggestions: boolean;
   /** Explicit privacy boundary: these project keys never export new content to cloud. */
   localOnlyProjects?: string[];
+  /** Explicit owner opt-in, loaded from shared Settings, never inferred from scanned content. */
+  shareDemoProjects?: string[];
 };
 
 /** fgc_pat_<16 hex lookup id>_<43 base64url chars>: what the cloud issues. */

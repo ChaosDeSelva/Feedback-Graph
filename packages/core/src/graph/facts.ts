@@ -1,3 +1,4 @@
+import { conditionalWrite } from './conditionalWrite.ts';
 import { archiveBeforeRedaction, archiveRedactionInput } from '../redactionArchive.ts';
 import { randomUUID } from 'node:crypto';
 import neo4j from 'neo4j-driver';
@@ -437,17 +438,19 @@ export class FactsRepo implements FactsStore {
 
   /** A model's score never replaces yours or an agent's (the operator token). Returns how many facts changed. */
   async setFactRelevance(updates: RelevanceUpdate[]): Promise<number> {
-    if (!updates.length) return 0;
-    const [r] = await this.g.run(
-      `UNWIND $updates AS u
-       MATCH (x:Fact {id: u.id}) WHERE (u.projectKey IS NULL OR x.projectKey = u.projectKey) AND (u.by <> 'model' OR coalesce(x.relevanceBy, 'model') = 'model')
-         AND (u.run IS NULL OR x.run = u.run)
-       SET x.relevance = u.relevance, x.relevanceBy = u.by
-       FOREACH (_ IN CASE WHEN u.owner THEN [1] ELSE [] END | SET x.run = null, x.sandbox = false)
-       RETURN count(x) AS n`,
-      { updates: updates.map((u) => ({ id: u.id, by: u.by, projectKey: u.projectKey ?? null, relevance: clampRelevance(u.relevance), run: u.run ?? null, owner: u.run === null })) },
-    );
-    return Number(r.get('n'));
+    return conditionalWrite(this.g, async query => {
+      if (!updates.length) return 0;
+      const [r] = await query(
+        `UNWIND $updates AS u
+         MATCH (x:Fact {id: u.id}) WHERE (u.projectKey IS NULL OR x.projectKey = u.projectKey) AND (u.by <> 'model' OR coalesce(x.relevanceBy, 'model') = 'model')
+           AND (u.run IS NULL OR x.run = u.run)
+         SET x.relevance = u.relevance, x.relevanceBy = u.by
+         FOREACH (_ IN CASE WHEN u.owner THEN [1] ELSE [] END | SET x.run = null, x.sandbox = false)
+         RETURN count(x) AS n`,
+        { updates: updates.map((u) => ({ id: u.id, by: u.by, projectKey: u.projectKey ?? null, relevance: clampRelevance(u.relevance), run: u.run ?? null, owner: u.run === null })) },
+      );
+      return Number(r.get('n'));
+    }, result => result > 0);
   }
 
   async requestScan(project: Project, provider: string | null): Promise<ScanJob> {

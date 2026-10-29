@@ -1,3 +1,4 @@
+import { conditionalWrite } from './conditionalWrite.ts';
 import neo4j from 'neo4j-driver';
 import {
   cmp,
@@ -238,11 +239,13 @@ export class CodeGraphRepo implements CodeGraphStore {
   }
 
   async requestCodeMapRebuild(projectKey: string): Promise<boolean> {
-    const rows = await this.g.run('MATCH (m:CodeMap {projectKey: $key}) SET m.rebuildRequestedAt = $now RETURN m.projectKey AS key', {
-      key: projectKey,
-      now: new Date().toISOString(),
-    });
-    return rows.length > 0;
+    return conditionalWrite(this.g, async query => {
+      const rows = await query('MATCH (m:CodeMap {projectKey: $key}) SET m.rebuildRequestedAt = $now RETURN m.projectKey AS key', {
+        key: projectKey,
+        now: new Date().toISOString(),
+      });
+      return rows.length > 0;
+    }, Boolean);
   }
 
   async codeMapRebuildsRequested(): Promise<{ projectKey: string; requestedAt: string }[]> {

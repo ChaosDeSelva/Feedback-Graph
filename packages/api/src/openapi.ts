@@ -172,7 +172,7 @@ const SCHEMAS: Record<string, JsonSchema> = {
   SessionDetail: loose('One session: its summary and history'),
   SettingsBody: obj({ tracked: arrayOf(str), candidates: arrayOf(loose('A project folder: key, path, exists, tracked, excluded, aliasOf, sessions')) }, ['tracked', 'candidates']),
   IntegrationsView: loose('GitHub and Linear: connection state, where the token comes from, per-project links, skip rules'),
-  LocalOnlyProjects: obj({ projects: arrayOf(str) }, ['projects']),
+  LocalOnlyProjects: obj({ projects: arrayOf(str), shareDemoProjects: arrayOf(str) }, ['projects']),
   CloudInfo: loose('Cloud sync: enabled, host, schedule, projects, preview counts, last result'),
   CloudSyncResult: loose('One sync: ok, error, per-project status, what was sent'),
   ExportBundle: loose('An export bundle: format, schemaVersion, lessons, facts, misses, docs, codeFiles'),

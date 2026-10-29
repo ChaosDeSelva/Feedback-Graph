@@ -4,7 +4,7 @@ import { createApp, type ApiRepo } from './app.ts';
 const cand = { id: 'c1', projectKey: 'shop', classification: { label: 'pushback', confidence: 1 } };
 const repo = {
   listCandidates: async () => [], stats: async () => [], decide: async () => {},
-  candidateDetail: async () => ({ candidate: cand, turn: { text: 't' }, before: [], after: [], commits: [] }),
+  candidateDetail: async () => ({ candidate: cand, turn: { text: 't' }, before: [], after: [], commits: [], postmortem: { done: false, attempts: 3, lastError: 'fixture', retryAt: null, gaveUp: true } }),
 } as unknown as ApiRepo;
 const lesson = { id: 'l1', projectKey: 'shop', title: 'T', rule: 'R', appliesWhen: 'W', scope: 'project', status: 'proposed' };
 const app = createApp(repo, {

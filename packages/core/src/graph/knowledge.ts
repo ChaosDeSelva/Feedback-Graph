@@ -1,3 +1,4 @@
+import { conditionalWrite } from './conditionalWrite.ts';
 import { archiveBeforeRedaction, archiveRedactionInput } from '../redactionArchive.ts';
 import { reviewPatterns } from '../reviewFilters.ts';
 import { createHash, randomUUID } from 'node:crypto';
@@ -194,11 +195,13 @@ export class KnowledgeRepo implements KnowledgeStore {
 
   /** Start a given-up (or waiting) post-mortem again now. */
   async retryPostmortem(feedbackId: string): Promise<boolean> {
-    const [r] = await this.g.run(
-      `MATCH (f:Feedback {id: $id}) WHERE NOT (f)<-[:EXPLAINS]-(:Miss) SET f.attempts = 0, f.retryAt = null RETURN count(f) AS n`,
-      { id: feedbackId },
-    );
-    return (r?.get('n') ?? 0) > 0;
+    return conditionalWrite(this.g, async query => {
+      const [r] = await query(
+        `MATCH (f:Feedback {id: $id}) WHERE NOT (f)<-[:EXPLAINS]-(:Miss) SET f.attempts = 0, f.retryAt = null RETURN count(f) AS n`,
+        { id: feedbackId },
+      );
+      return (r?.get('n') ?? 0) > 0;
+    }, Boolean);
   }
 
   async savePostmortem(feedbackId: string, raw: PostMortem, embeddings: { miss: number[]; lesson: number[] }) {

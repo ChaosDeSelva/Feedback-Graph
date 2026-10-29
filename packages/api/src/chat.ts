@@ -316,6 +316,7 @@ export function chatRoutes(app: Hono, d: ChatRouteDeps, view: () => Promise<Show
     const t = await shownThread(c.req.param('id'));
     if (!t) return c.json(NOT_FOUND, 404);
     if (!mayChange(t)) return notTheRuns(c, t.id);
+    if (!t.turns.some(turn => turn.id === c.req.param('turnId') && turn.role === 'assistant' && turn.status === 'failed')) return c.json({ error: 'not found: only a failed answer can be retried' }, 404);
     const retried = await d.store.retryTurn(t.id, c.req.param('turnId'));
     return retried ? c.json(retried, 202) : c.json({ error: 'not found: only a failed answer can be retried' }, 404);
   });

@@ -143,3 +143,13 @@ test('backup imports preserve revoked lessons as revoked, even with keepApproved
   expect(upserted).toMatchObject([{ id: 'lesson:revoked', status: 'revoked' }]);
   expect((await res.json()).lessons.revoked).toBe(1);
 });
+
+
+test('backup import retains private-project provenance through the creation-only restore hook', async () => {
+  const restored: { key: string; remote: string | null }[] = [];
+  const { app } = deps({ portability: { restorePrivateProject: async project => { restored.push(project); } } });
+  const b = bundle({ projects: [{ key: 'private-demo', remote: null, demoCreated: true }], lessons: [], facts: [] });
+  const response = await app.request('/api/import', { method: 'POST', body: JSON.stringify(b), headers: { origin: 'http://localhost', 'content-type': 'application/json' } });
+  expect(response.status).toBe(200);
+  expect(restored).toEqual([{ key: 'private-demo', remote: null }]);
+});
