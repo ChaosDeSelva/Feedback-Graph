@@ -6,7 +6,7 @@ import { expect, test } from 'vitest';
 // This repository is public. Example paths in tests, fixtures and docs use placeholder home folders, never a
 // contributor's real one, and private planning documents live elsewhere.
 const repo = join(import.meta.dirname, '../../..');
-const PLACEHOLDER_USERS = new Set(['you', 'me', 'j', 'a', 'x', 'dev', 'H']);
+const PLACEHOLDER_USERS = new Set(['you', 'me', 'j', 'a', 'x', 'dev', 'H', 'test']);
 
 function trackedFiles(): string[] | null {
   try {

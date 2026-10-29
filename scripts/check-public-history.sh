@@ -11,7 +11,7 @@ ref="${1:-HEAD}"
 git rev-parse --verify -q "$ref^{commit}" >/dev/null || { echo "no such ref: $ref" >&2; exit 2; }
 names_file="${PRIVATE_NAMES_FILE:-$(git rev-parse --git-path info/private-names)}"
 # Kept in step with PLACEHOLDER_USERS in packages/core/src/publicTree.test.ts.
-placeholders='you me j a x dev H'
+placeholders='you me j a x dev H test'
 
 found=0
 report() { echo "$1"; found=1; }
