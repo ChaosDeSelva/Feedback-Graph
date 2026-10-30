@@ -57,16 +57,10 @@ export async function prepare({ folder = defaultFolder(), source = join(repo, 'e
 
 /** Explicit local-owner mode uses same-origin owner authorization; it never bypasses a configured token. */
 function ownerHeaders(base, { token, localOwner = false }) {
-  const url = new URL(base);
-  if (localOwner) {
-    if (token) throw Error('--local-owner is tokenless only; omit the flag when API_TOKEN is available.');
-    if (!['http:', 'https:'].includes(url.protocol) || !['localhost', '127.0.0.1', '[::1]'].includes(url.hostname) || url.username || url.password) {
-      throw Error('--local-owner is permitted only for an explicit loopback HTTP(S) API URL.');
-    }
-    return { origin: url.origin, 'x-fg-owner': 'true' };
-  }
-  if (!token) throw Error('Owner preparation requires API_TOKEN or explicit --local-owner for a tokenless loopback install. Do not broaden OPERATOR_ALLOW for this probe.');
-  return { authorization: `Bearer ${token}`, origin: url.origin };
+  new URL(base);
+  if (localOwner) throw Error('--local-owner was removed: use the actual browser UI on tokenless installs, or configure API_TOKEN for headless owner actions.');
+  if (!token) throw Error('Owner preparation requires API_TOKEN. Use the browser UI for a tokenless install; do not broaden OPERATOR_ALLOW.');
+  return { authorization: `Bearer ${token}`, 'x-fg-owner': 'true' };
 }
 
 export async function configure(folder, { apiURL, token, localOwner = false, fetch: request = fetch } = {}) {

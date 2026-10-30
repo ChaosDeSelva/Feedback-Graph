@@ -19,7 +19,7 @@ const lesson = (id: string, projectKey: string | null, origin: string | null): L
   status: 'approved', source: 'postmortem', cause: null, missId: null, createdAt: 't', decidedAt: null,
 });
 const summary = (key: string, aliases: string[] = []): ProjectSummary => ({ key, repoPath: `/vibe/${key}`, remote: null, aliases, sessions: 1, feedback: 1, lessons: 0, facts: 0, lastScan: null, pinned: false });
-const json = (method: string, body: object) => ({ method, headers: { 'content-type': 'application/json', origin: 'http://localhost' }, body: JSON.stringify(body) });
+const json = (method: string, body: object) => ({ method, headers: { 'content-type': 'application/json', 'sec-fetch-site': 'same-origin', origin: 'http://localhost' }, body: JSON.stringify(body) });
 
 const LESSONS = [lesson('lesson:shop', 'shop', 'shop'), lesson('lesson:old-global', null, 'old'), lesson('lesson:old', 'old', 'old'), lesson('memory:any', null, null)];
 

@@ -124,8 +124,8 @@ export async function seedDemo(o: { project?: string; owner?: boolean }, d: Demo
   if (!k.saveDemoMiss || !k.removeDemo) throw new DemoRefused('this store cannot hold a demo corpus (no saveDemoMiss / removeDemo)', 501);
   const found = d.project(key);
   const project: Project = found ?? { key, name: key, repoPath: '' };
-  const prefix = demoPrefix(key);
   const run = currentRun();
+  const prefix = `${demoPrefix(key)}${run ? `run:${run.id}:` : ""}`;
   const c = DEMO_CORPUS;
   const [lessonVecs, missVecs, factVecs] = await Promise.all([
     d.embed(c.lessons.map((l) => `[demo] ${l.title}\n${l.rule}\nApplies when: ${l.appliesWhen}`)),
@@ -160,7 +160,7 @@ export async function seedDemo(o: { project?: string; owner?: boolean }, d: Demo
     }
     // A file that has facts (a scan read it) keeps them: saving demo facts would close them.
     for (const [i, f] of c.facts.entries()) {
-      if ((await d.facts.listFacts({ projectKey: key, path: f.path, limit: 1 })).length) {
+      if ((await d.facts.listFacts({ projectKey: key, path: f.path, limit: 1, run: run?.id ?? null })).length) {
         skippedFacts.push(f.path);
         continue;
       }
@@ -168,12 +168,12 @@ export async function seedDemo(o: { project?: string; owner?: boolean }, d: Demo
       // file a scan already recorded keeps its hash and summary (the store adds the file only when there is none).
       await d.facts.saveFileFacts(key, { path: f.path, hash: SOURCE, summary: '[demo] seeded by fg demo seed' }, [
         { kind: f.kind, statement: `[demo] ${f.statement}`, path: f.path, lines: f.lines, confidence: 1, why: 'seeded by fg demo seed', embedding: factVecs[i] },
-      ], SOURCE);
+      ], SOURCE, null, run);
       facts++;
     }
   } catch (e) {
     const why = e instanceof Error ? e.message : String(e);
-    const undone = await k.removeDemo(key).then(
+    const undone = await k.removeDemo(key, run).then(
       () => 'what it had written was taken back',
       (u) => `taking back what it had written failed too (${u instanceof Error ? u.message : String(u)}): run fg demo remove${key === DEMO_PROJECT ? '' : ` --project ${key}`}`,
     );
@@ -202,7 +202,7 @@ export async function seedDemo(o: { project?: string; owner?: boolean }, d: Demo
 export async function removeDemo(o: { project?: string; owner?: boolean }, d: DemoDeps): Promise<DemoRemovedResult> {
   const key = target(o);
   if (!d.knowledge.removeDemo) throw new DemoRefused('this store cannot hold a demo corpus (no removeDemo)', 501);
-  const r = await d.knowledge.removeDemo(key);
+  const r = await d.knowledge.removeDemo(key, currentRun());
   const message = [
     r.lessons + r.misses + r.facts
       ? `Removed ${n(r.lessons, 'demo lesson')}, ${n(r.misses, 'miss', 'misses')} and ${n(r.facts, 'fact')} from ${key}. Nothing else was touched.`
@@ -232,9 +232,10 @@ export function demoRoutes(app: Hono, d: DemoDeps, auth: { operator?: OperatorCo
     const parsed = Body.safeParse(await c.req.json().catch(() => ({})));
     if (!parsed.success) return c.json({ error: parsed.error.flatten() }, 400);
     const operator = hasOperatorToken(c, auth.operator);
-    if (!operator && c.req.header('origin') === undefined) {
+    if (!operator && (c.req.header('origin') === undefined || c.req.header('sec-fetch-site') !== 'same-origin')) {
       return c.json({ error: 'only you can seed or remove the demo corpus: from the Feedback Graph UI, or with FG_OPERATOR_TOKEN as a Bearer (fg demo seed)' }, 403);
     }
+    if (operator && !auth.operator?.allow.some(verb => verb === 'demo' || verb === 'lesson_decide')) return c.json({ error: 'demo seed/remove requires demo in OPERATOR_ALLOW (or lesson_decide)' }, 403);
     const owner = operator ? !!auth.operator?.allow.includes('lesson_decide') : true;
     const go = () => fn({ ...parsed.data, owner }, d);
     try {

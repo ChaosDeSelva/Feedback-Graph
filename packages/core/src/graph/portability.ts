@@ -1,3 +1,4 @@
+import { purgeRedactionOriginals } from '../redactionArchive.ts';
 import neo4j from 'neo4j-driver';
 import { VERSION } from '../config.ts';
 import type { Cause, Lesson } from '../types.ts';
@@ -154,6 +155,13 @@ export class PortabilityRepo implements PortabilityStore {
 
   /** Remove a project and everything learned from it. Returns how many nodes were deleted. */
   async deleteProject(key: string): Promise<number> {
+    const archiveRows = await this.g.run(`
+      MATCH (n:Fact {projectKey: $key}) RETURN n.id AS id, 'fact' AS kind
+      UNION ALL MATCH (n:Doc {projectKey: $key}) RETURN n.id AS id, 'doc' AS kind
+      UNION ALL MATCH (n:Chunk {projectKey: $key}) RETURN n.id AS id, 'chunk' AS kind
+      UNION ALL MATCH (n:Lesson) WHERE n.projectKey = $key OR n.originProjectKey = $key RETURN n.id AS id, 'lesson' AS kind
+      UNION ALL MATCH (n:Feedback {projectKey: $key}) RETURN n.id AS id, 'feedback' AS kind`, { key });
+    const archiveSelectors = [{ kind: 'project', id: key }, ...archiveRows.map(row => ({ kind: String(row.get('kind')), id: String(row.get('id')) }))];
     let removed = 0;
     // Batched so a project with years of history does not need one giant transaction.
     const drain = async (cypher: string) => {
@@ -182,6 +190,7 @@ export class PortabilityRepo implements PortabilityStore {
     await drain(`MATCH (c:SyncCursor) WHERE c.key ENDS WITH ':' + $key WITH c LIMIT $batch DETACH DELETE c RETURN count(*) AS n`);
     await drain(`MATCH (l:ProjectLink) WHERE l.a = $key OR l.b = $key WITH l LIMIT $batch DETACH DELETE l RETURN count(*) AS n`);
     await drain(`MATCH (p:Project {key: $key}) DETACH DELETE p RETURN count(*) AS n`);
+    await purgeRedactionOriginals(archiveSelectors);
     return removed;
   }
 }

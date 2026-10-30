@@ -105,7 +105,7 @@ export class PgInsightsStore implements InsightsStore {
       pool.query<{ checks: number; with_gaps: number; gaps_found: number }>(
         `SELECT count(*) AS checks, coalesce(sum(CASE WHEN gaps > 0 THEN 1 ELSE 0 END), 0) AS with_gaps,
                 coalesce(sum(gaps), 0) AS gaps_found
-           FROM predone_checks WHERE ($1::text IS NULL OR project_key = $1) AND ($2::text[] IS NULL OR project_key = ANY($2)) AND NOT sandbox`,
+           FROM predone_checks WHERE ($1::text IS NULL OR project_key = $1) AND ($2::text[] IS NULL OR project_key = ANY($2)) AND NOT sandbox AND status = 'lesson_judged'`,
         [projectKey, projectKeys],
       ),
     ]);

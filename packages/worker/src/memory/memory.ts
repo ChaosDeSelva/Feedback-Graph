@@ -1,6 +1,6 @@
 import { readdir, readFile, stat } from 'node:fs/promises';
 import { join, relative, sep } from 'node:path';
-import { keyOfRel, type ActivityStore, type LessonInput, type GraphStore } from '@fb/core';
+import { keyOfRel, type ActivityStore, type LessonInput, type GraphStore, type RunTag } from '@fb/core';
 import type { FileState } from '../state.ts';
 
 export type MemoryNote = { name: string; description: string; type: string; body: string };
@@ -61,6 +61,7 @@ export type MemoryDeps = {
   activity?: Pick<ActivityStore, 'record'>;
   /** MEMORY_AUTO_APPROVE: import as approved. Default: proposed, waiting for you in Lessons like a post-mortem's lesson. */
   autoApprove?: boolean;
+  runForWrite?(projectKey: string, path: string): Promise<RunTag | null>;
   /** True when the session wrote this memory after feedback already represented in the Inbox. */
   writtenAfterFeedback?(projectKey: string, path: string): Promise<boolean | string | null>;
   withdrawDuplicate?(id: string, feedbackId: string | null): Promise<void>;
@@ -75,7 +76,7 @@ export async function importMemories(d: MemoryDeps): Promise<number> {
   d.beginCorrelation?.();
   const roots = await d.roots();
   let imported = 0;
-  const recheck = d.state.getSetting('memory-dedup-v2') !== 'done';
+  const recheck = d.state.getSetting('memory-dedup-v3') !== 'done';
   for (const dir of await readdir(d.transcriptsDir).catch(() => [] as string[])) {
     const projectKey = keyForDir(dir, roots);
     if (!projectKey || (d.includeProject && !d.includeProject(projectKey))) continue;
@@ -87,6 +88,7 @@ export async function importMemories(d: MemoryDeps): Promise<number> {
       if (!s?.isFile()) continue;
       const changed = d.state.changed(path, s.size, s.mtimeMs);
       const note = parseMemoryFile(await readFile(path, 'utf8'));
+      const run = await d.runForWrite?.(projectKey, path);
       const duplicate = note?.type === 'feedback' ? await d.writtenAfterFeedback?.(projectKey, path) : false;
       if (duplicate && d.state.getSetting(`memory-duplicate:${path}`) !== String(duplicate)) {
         await d.withdrawDuplicate?.(`memory:${dir}/${file}`, typeof duplicate === 'string' ? duplicate : null);
@@ -95,7 +97,9 @@ export async function importMemories(d: MemoryDeps): Promise<number> {
       if (!duplicate && !changed && !recheck) continue;
       if (note?.type === 'feedback' && !duplicate) {
         const [embedding] = await d.embed([`${note.name}\n${note.description}\n${note.body}`]);
-        const id = `memory:${dir}/${file}`;
+        const oldId = `memory:${dir}/${file}`;
+        if (run) await d.withdrawDuplicate?.(oldId, null);
+        const id = run ? `${oldId}:run:${run.id}` : oldId;
         const title = note.name || file.replace(/\.md$/, '');
         await d.upsertLesson({
           id,
@@ -107,9 +111,11 @@ export async function importMemories(d: MemoryDeps): Promise<number> {
           paths: [],
           status: d.autoApprove ? 'approved' : 'proposed',
           source: 'memory',
+          ...(run && { run }),
           embedding,
         });
         await d.activity?.record({
+          ...(run && { run: run.id, sandbox: run.sandbox }),
           kind: 'memory_imported',
           actor: 'memory-file',
           projectKey,
@@ -125,7 +131,7 @@ export async function importMemories(d: MemoryDeps): Promise<number> {
       d.state.mark(path, s.size, s.mtimeMs, projectKey);
     }
   }
-  d.state.setSetting('memory-dedup-v2', 'done');
+  d.state.setSetting('memory-dedup-v3', 'done');
   return imported;
 }
 
@@ -134,7 +140,7 @@ export async function feedbackForMemoryWrite(repo: Pick<GraphStore, 'listCandida
   const suffix = `/memory/${path.replaceAll('\\', '/').split('/').at(-1)}`;
   const seen = new Set<string>();
   for (let offset = 0; ; offset += 500) {
-    const page = await repo.listCandidates({ projectKey, limit: 500, offset });
+    const page = await repo.listCandidates({ projectKey, limit: 500, offset, includeSandbox: true });
     const fresh = page.filter((candidate) => !seen.has(candidate.id));
     if (!fresh.length) return null;
     for (const candidate of fresh) {

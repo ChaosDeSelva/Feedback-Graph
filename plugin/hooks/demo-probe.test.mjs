@@ -73,55 +73,15 @@ test('partial configuration retries without replacing its original restoration s
   expect(state.previous.projects).toEqual([]); expect(state.configured).toBe(true);
 }));
 
-test('explicit tokenless local-owner mode sends same-origin intent on loopback and supports restore', async () => fixture(async (folder, parent) => {
-  await prepare({ folder, apply: true });
-  let tracked = ['real'], projects = [];
-  const calls = [];
-  const request = async (url, options) => {
-    calls.push({ url, options });
-    const path = new URL(url).pathname;
-    if (options.method === 'PUT') {
-      const body = JSON.parse(options.body);
-      if (path === '/api/cloud/local-only') projects = body.projects;
-      else tracked = body.tracked;
-    }
-    return Response.json(path === '/api/settings/projects' ? { tracked, roots: [parent] } : { savedLocalOnlyProjects: projects, localOnlyProjects: projects, shareDemoProjects: [] });
-  };
-  await configure(folder, { apiURL: 'http://127.0.0.1:8787', localOwner: true, fetch: request });
-  await restore(folder, { localOwner: true, fetch: request });
-  expect(tracked).toEqual(['real']); expect(projects).toEqual([]);
-  expect(calls.length).toBeGreaterThan(0);
-  for (const { options } of calls) {
-    expect(options.headers).toMatchObject({ origin: 'http://127.0.0.1:8787', 'x-fg-owner': 'true' });
-    expect(options.headers).not.toHaveProperty('authorization');
-    expect(options.redirect).toBe('error');
-  }
-}));
-
-test('local-owner mode rejects non-loopback targets before any request and never substitutes for a configured token', async () => fixture(async folder => {
-  await prepare({ folder, apply: true });
-  let calls = 0;
-  const request = async () => { calls++; return new Response(null, { status: 401 }); };
-  for (const apiURL of ['https://example.invalid', 'http://localhost.example.invalid', 'http://192.168.1.2:8787', 'file://127.0.0.1/api']) {
-    await expect(configure(folder, { apiURL, localOwner: true, fetch: request })).rejects.toThrow('loopback');
-  }
-  expect(calls).toBe(0);
-  await expect(configure(folder, { apiURL: 'http://127.0.0.1:8787', localOwner: true, fetch: request })).rejects.toThrow('HTTP 401');
-  expect(calls).toBe(1);
-  expect(JSON.parse(await readFile(join(folder, '.fg-probe-state.json'), 'utf8'))).not.toHaveProperty('previous');
-}));
-
-test('ordinary configure remains token-required and local-owner must be an explicit unambiguous choice', async () => fixture(async folder => {
-  await prepare({ folder, apply: true });
-  let calls = 0;
+test('removed tokenless local-owner mode refuses before any owner request', async () => fixture(async folder => {
+  await prepare({ folder, apply: true }); let calls = 0;
   const request = async () => { calls++; return Response.json({}); };
+  await expect(configure(folder, { apiURL: 'http://127.0.0.1:8787', localOwner: true, fetch: request })).rejects.toThrow('removed');
   await expect(configure(folder, { fetch: request })).rejects.toThrow('requires API_TOKEN');
-  await expect(configure(folder, { localOwner: true, token: 'owner-token', fetch: request })).rejects.toThrow('tokenless only');
   expect(calls).toBe(0);
 }));
 
-
-test.each([false, true])('real HTTP owner configuration works with tokenless=%s', async localOwner => fixture(async (folder, parent) => {
+test.each([false])('real HTTP owner configuration works with tokenless=%s', async localOwner => fixture(async (folder, parent) => {
   await prepare({ folder, apply: true });
   let tracked = [], discovered = false;
   const cursors = new Map();

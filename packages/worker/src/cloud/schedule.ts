@@ -11,6 +11,7 @@ export class CloudSyncSchedule {
   readonly status: CloudSyncStatus;
   private readonly d: {
     host: string;
+    last?: CloudSyncResult | null;
     intervalMinutes: number | null;
     /** `waiting(key)`: when a backing-off project is tried again (ISO), else null (runCloudSync's `waiting`). */
     run: (waiting: (key: string) => string | null) => Promise<CloudSyncResult>;
@@ -24,7 +25,7 @@ export class CloudSyncSchedule {
 
   constructor(d: CloudSyncSchedule['d']) {
     this.d = d;
-    this.status = { host: d.host, intervalMinutes: d.intervalMinutes, lastAt: null, lastOk: null, lastError: null, lastSent: null, nextAt: null, failures: 0, waiting: [] };
+    this.status = { host: d.host, intervalMinutes: d.intervalMinutes, lastAt: d.last?.at ?? null, lastOk: d.last?.ok ?? null, lastError: d.last?.error ?? null, lastSent: d.last?.sent ?? null, nextAt: null, failures: 0, waiting: [] };
   }
 
   private now() {

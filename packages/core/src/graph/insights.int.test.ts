@@ -99,6 +99,7 @@ describeStores('InsightsStore', (h) => {
       await k.recordPreDoneCheck({ projectKey: 'shop', task: 'a', checkedLessonIds: ['lesson:s1-t1'], gapLessonIds: ['lesson:s1-t1'] });
       await k.recordPreDoneCheck({ projectKey: 'shop', task: 'b', checkedLessonIds: ['lesson:s1-t1'], gapLessonIds: [] });
       await k.recordPreDoneCheck({ projectKey: 'blog', task: 'c', checkedLessonIds: [], gapLessonIds: [] });
+      for (const status of ['queued', 'failed', 'no_applicable_rules', 'miss_judged']) await k.recordPreDoneCheck({ projectKey: 'shop', task: status, status, checkedLessonIds: [], gapLessonIds: [] });
       expect((await ins.patterns({})).preDone).toEqual({ checks: 3, withGaps: 1, gapsFound: 1 });
       expect((await ins.patterns({ projectKey: 'shop' })).preDone).toEqual({ checks: 2, withGaps: 1, gapsFound: 1 });
     });

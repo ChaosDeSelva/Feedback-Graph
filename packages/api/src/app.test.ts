@@ -90,15 +90,15 @@ test('GET /api/candidates/:id returns 404 for unknown ids', async () => {
 test('POST decision validates the body', async () => {
   const { repo, calls } = fakeRepo();
   const app = createApp(repo);
-  const bad = await app.request('/api/candidates/c1/decision', { method: 'POST', body: JSON.stringify({ status: 'maybe' }), headers: { 'content-type': 'application/json', origin: 'http://localhost' } });
+  const bad = await app.request('/api/candidates/c1/decision', { method: 'POST', body: JSON.stringify({ status: 'maybe' }), headers: { 'content-type': 'application/json', 'sec-fetch-site': 'same-origin', origin: 'http://localhost' } });
   expect(bad.status).toBe(400);
-  const ok = await app.request('/api/candidates/c1/decision', { method: 'POST', body: JSON.stringify({ status: 'confirmed', note: 'yes' }), headers: { 'content-type': 'application/json', origin: 'http://localhost' } });
+  const ok = await app.request('/api/candidates/c1/decision', { method: 'POST', body: JSON.stringify({ status: 'confirmed', note: 'yes' }), headers: { 'content-type': 'application/json', 'sec-fetch-site': 'same-origin', origin: 'http://localhost' } });
   expect(ok.status).toBe(204);
   expect(calls).toContainEqual(['decide', 'c1', 'confirmed', 'yes', 'you']);
 });
 
 test('POST decision on an unknown id is 404', async () => {
-  const res = await createApp(fakeRepo().repo).request('/api/candidates/nope/decision', { method: 'POST', body: JSON.stringify({ status: 'rejected' }), headers: { 'content-type': 'application/json', origin: 'http://localhost' } });
+  const res = await createApp(fakeRepo().repo).request('/api/candidates/nope/decision', { method: 'POST', body: JSON.stringify({ status: 'rejected' }), headers: { 'content-type': 'application/json', 'sec-fetch-site': 'same-origin', origin: 'http://localhost' } });
   expect(res.status).toBe(404);
 });
 
@@ -134,7 +134,7 @@ test('rejects writes that are not application/json (no simple-request CSRF)', as
 });
 
 test('same-origin writes are allowed', async () => {
-  const res = await createApp(fakeRepo().repo).request('http://localhost:8787/api/candidates/c1/decision', post({ origin: 'http://localhost:8787', host: 'localhost:8787' }));
+  const res = await createApp(fakeRepo().repo).request('http://localhost:8787/api/candidates/c1/decision', post({ 'sec-fetch-site': 'same-origin', origin: 'http://localhost:8787', host: 'localhost:8787' }));
   expect(res.status).toBe(204);
 });
 
@@ -144,12 +144,12 @@ test('an opaque "null" origin is rejected, not a 500', async () => {
 });
 
 test('writes from another localhost port are rejected', async () => {
-  const res = await createApp(fakeRepo().repo).request('http://localhost:8787/api/candidates/c1/decision', post({ origin: 'http://localhost:3000', host: 'localhost:8787' }));
+  const res = await createApp(fakeRepo().repo).request('http://localhost:8787/api/candidates/c1/decision', post({ 'sec-fetch-site': 'same-origin', origin: 'http://localhost:3000', host: 'localhost:8787' }));
   expect(res.status).toBe(403);
 });
 
 test('the vite dev origin is allowed', async () => {
-  const res = await createApp(fakeRepo().repo).request('http://localhost:8787/api/candidates/c1/decision', post({ origin: 'http://localhost:5173', host: 'localhost:8787' }));
+  const res = await createApp(fakeRepo().repo).request('http://localhost:8787/api/candidates/c1/decision', post({ 'sec-fetch-site': 'same-origin', origin: 'http://localhost:5173', host: 'localhost:8787' }));
   expect(res.status).toBe(204);
 });
 
@@ -173,16 +173,16 @@ test('a request body over the limit is refused before it is read: 1 MB by defaul
   const docs = { listDocs: async () => [], deleteDoc: async () => true, upsertDoc: async () => 'doc:demo:upload:big.md' };
   const app = createApp(repo, { docs: docs as never, embed: async (t) => t.map(() => [0]), projectDirs: async () => [{ key: 'demo', name: 'demo', repoPath: '/v/demo' }] });
   const big = JSON.stringify({ status: 'confirmed', note: 'x'.repeat(1_100_000) });
-  const res = await app.request('/api/candidates/c1/decision', { method: 'POST', body: big, headers: { 'content-type': 'application/json', origin: 'http://localhost', 'content-length': String(big.length) } });
+  const res = await app.request('/api/candidates/c1/decision', { method: 'POST', body: big, headers: { 'content-type': 'application/json', 'sec-fetch-site': 'same-origin', origin: 'http://localhost', 'content-length': String(big.length) } });
   expect(res.status).toBe(413);
   expect((await res.json()).error).toMatch(/1 MB/);
   expect(calls.filter((c) => c[0] === 'decide')).toEqual([]);
   // Streamed without a length: counted as it arrives.
-  const streamed = await app.request('/api/candidates/c1/decision', { method: 'POST', body: new Blob([big]).stream(), duplex: 'half', headers: { 'content-type': 'application/json', origin: 'http://localhost' } } as RequestInit);
+  const streamed = await app.request('/api/candidates/c1/decision', { method: 'POST', body: new Blob([big]).stream(), duplex: 'half', headers: { 'content-type': 'application/json', 'sec-fetch-site': 'same-origin', origin: 'http://localhost' } } as RequestInit);
   expect(streamed.status).toBe(413);
   // A document upload may be larger (this one is taken and embedded in the background: 202).
   const doc = JSON.stringify({ title: 'Big', name: 'big.md', text: 'word '.repeat(400_000) });
-  const up = await app.request('/api/projects/demo/docs', { method: 'POST', body: doc, headers: { 'content-type': 'application/json', origin: 'http://localhost', 'content-length': String(doc.length) } });
+  const up = await app.request('/api/projects/demo/docs', { method: 'POST', body: doc, headers: { 'content-type': 'application/json', 'sec-fetch-site': 'same-origin', origin: 'http://localhost', 'content-length': String(doc.length) } });
   expect(up.status).toBe(202);
 });
 

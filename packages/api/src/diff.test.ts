@@ -246,7 +246,7 @@ describe('readRepoPrNumbers', () => {
       git('commit', '--allow-empty', '-qm', 'Merge pull request #12 from acme/topic');
       const first = git('rev-parse', 'HEAD');
       git('commit', '--allow-empty', '-qm', 'Fix pagination (#34)');
-      expect(await readRepoPrNumbers(dir, 'fix the current task')).toEqual([34]);
+      expect(await readRepoPrNumbers(dir, 'fix the current task')).toEqual([]);
       expect(await readRepoPrNumbers(dir, `review ${first}`)).toEqual([12]);
       expect(await readRepoPrNumbers(dir, 'review deadbeef')).toEqual([]);
     } finally { rmSync(dir, { recursive: true, force: true }); }

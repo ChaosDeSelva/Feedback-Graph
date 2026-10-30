@@ -195,7 +195,7 @@ test('every agent MCP tool carries annotations: reads are read-only, report_feed
   const res = await app.request('/mcp', rpc({ method: 'tools/list', params: {} }));
   type Tool = { name: string; title?: string; annotations?: Record<string, unknown> };
   const tools = ((await res.json()) as { result: { tools: Tool[] } }).result.tools;
-  const writes = new Set(['report_feedback']);
+  const writes = new Set(['get_task_context', 'check_before_done', 'get_module_context', 'impact', 'get_recent_sessions', 'search_graph', 'report_feedback']);
   expect(tools).toHaveLength(7);
   for (const t of tools) {
     expect(t.annotations, t.name).toBeDefined();

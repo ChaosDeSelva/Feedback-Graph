@@ -145,7 +145,8 @@ export function AppShell<K extends string>({ groups, current, onNavigate, health
         </div>
       </aside>
       {menuOpen && <div aria-hidden="true" onClick={() => setMenuOpen(false)} className="fixed inset-0 z-20 bg-text/20 md:hidden" />}
-      <div className="flex min-h-0 min-w-0 flex-1 flex-col">{children}</div>
+      <a href="#main-content" onClick={e => { e.preventDefault(); document.getElementById("main-content")?.focus(); }} className="sr-only focus:not-sr-only focus:fixed focus:left-3 focus:top-3 focus:z-50 focus:rounded focus:bg-surface focus:p-3 focus:text-text">Skip to main content</a>
+      <main id="main-content" tabIndex={-1} className="flex min-h-0 min-w-0 flex-1 flex-col">{children}</main>
     </div>
   );
 }

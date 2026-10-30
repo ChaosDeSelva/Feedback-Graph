@@ -29,7 +29,7 @@ function setup() {
   });
   return { app, recorded, listed };
 }
-const json = (method: string, body: object) => ({ method, headers: { 'content-type': 'application/json', origin: 'http://localhost' }, body: JSON.stringify(body) });
+const json = (method: string, body: object) => ({ method, headers: { 'content-type': 'application/json', 'sec-fetch-site': 'same-origin', origin: 'http://localhost' }, body: JSON.stringify(body) });
 
 test('confirming a candidate logs your decision with the feedback text and your note', async () => {
   const { app, recorded } = setup();

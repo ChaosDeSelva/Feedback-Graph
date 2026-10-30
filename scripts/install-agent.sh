@@ -88,6 +88,11 @@ case "$instance" in
 esac
 if [ -n "${FEEDBACK_GRAPH_URL:-}" ]; then
   url="$FEEDBACK_GRAPH_URL"
+  expected_url="http://localhost:$(setting API_PORT)"; expected_url="${expected_url%:}"
+  [ "$expected_url" != http://localhost ] || expected_url=http://localhost:8787
+  if [ "${url%/}" != "$expected_url" ] && [ "${url%/}" != "${expected_url/localhost/127.0.0.1}" ]; then
+    echo "WARNING: FEEDBACK_GRAPH_URL overrides this checkout's $expected_url; registration will target that explicit override. Unset it for this install." >&2
+  fi
 else
   # The address docker compose publishes the API on (docker-compose.yml: API_BIND:API_PORT).
   port="$(setting API_PORT)"

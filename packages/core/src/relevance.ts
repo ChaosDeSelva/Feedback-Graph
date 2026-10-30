@@ -158,7 +158,7 @@ export function rankFacts<T extends FactHit>(hits: T[], n: number, files: string
   return keepNearBest(
     hits.filter((h) => boundedScore(h.score) >= floor && ((h.fact.relevance ?? UNSCORED_RELEVANCE) >= MIN_RELEVANCE || h.score >= CLOSE_ENOUGH))
       .map((hit) => ({ hit, score: boundedScore(hit.score) * (0.55 + 0.45 * boundedScore(hit.fact.relevance ?? UNSCORED_RELEVANCE)) * affinity(hit.fact.path ?? '.', files, services) }))
-      .filter(({ score }) => score >= minimumRank)
+      .filter(({ hit, score }) => score >= minimumRank || files.includes(hit.fact.path))
       .sort((a, b) => b.score - a.score),
   ).slice(0, n).map(({ hit, score }) => ({ ...hit, score: boundedScore(hit.score), rankingScore: boundedScore(score) }));
 }
@@ -168,13 +168,24 @@ export function rankFacts<T extends FactHit>(hits: T[], n: number, files: string
  * where the paths they mention sit against the named files (pathAffinity), and none far below the best. Never one whose
  * lesson you rejected as worked out from the wrong session (rejectedWrongSession): it is evidence of nothing.
  */
-export function rankMisses<T extends { missed: string; feedbackText: string; score: number; rejectedWrongSession?: boolean }>(hits: T[], n: number, files: string[] = [], services: string[] = [], floor = SIMILARITY_FLOOR): (T & { rankingScore: number })[] {
+export function rankMisses<T extends { missed: string; feedbackText: string; score: number; rejectedWrongSession?: boolean }>(hits: T[], n: number, files: string[] = [], services: string[] = [], floor = SIMILARITY_FLOOR, minimumRank = 0): (T & { rankingScore: number })[] {
   return keepNearBest(
     hits.filter((m) => !m.rejectedWrongSession && !isNonMiss(m.missed) && boundedScore(m.score) >= floor)
       .map((hit) => {
         const paths = mentionedPaths(`${hit.missed} ${hit.feedbackText}`);
         const weight = paths.length ? Math.max(...paths.map((p) => affinity(p, files, services))) : 1;
         return { hit, score: boundedScore(hit.score) * weight };
-      }).sort((a, b) => b.score - a.score),
+      }).filter(({ score }) => score >= minimumRank).sort((a, b) => b.score - a.score),
   ).slice(0, n).map(({ hit, score }) => ({ ...hit, score: boundedScore(hit.score), rankingScore: boundedScore(score) }));
+}
+
+
+/** Document chunks use the same raw/weighted gates as misses; explicit file references determine affinity. */
+export function rankDocs<T extends { score: number; ref: string; text: string; title: string }>(hits: T[], n: number, files: string[] = [], services: string[] = [], floor = SIMILARITY_FLOOR, minimumRank = 0): (T & { rankingScore: number })[] {
+  return keepNearBest(hits.filter(hit => boundedScore(hit.score) >= floor).map(hit => {
+    const paths = mentionedPaths(`${hit.ref} ${hit.title} ${hit.text}`);
+    const weight = paths.length ? Math.max(...paths.map(path => affinity(path, files, services))) : 1;
+    return { hit, score: boundedScore(boundedScore(hit.score) * weight) };
+  }).filter(({ score }) => score >= minimumRank).sort((a, b) => b.score - a.score))
+    .slice(0, n).map(({ hit, score }) => ({ ...hit, score: boundedScore(hit.score), rankingScore: score }));
 }

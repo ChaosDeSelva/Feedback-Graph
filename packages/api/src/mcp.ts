@@ -20,11 +20,10 @@ const where = {
 const text = (markdown: string) => ({ content: [{ type: 'text' as const, text: markdown }] });
 
 /**
- * MCP ToolAnnotations. Codex will not call a tool without them, so every tool says what it is: the reads change nothing
- * the agent would notice (the provenance log aside) and may be repeated; report_feedback queues a new inbox item each
+ * MCP ToolAnnotations. Codex will not call a tool without them, so every tool says what it is: context tools can record provenance, request scans or resolve GitHub metadata, so they do not advertise read-only; report_feedback queues a new inbox item each
  * call, but never removes or overwrites anything. None reaches past this machine's graph.
  */
-const read = (title: string) => ({ title, annotations: { title, readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false } });
+const read = (title: string) => ({ title, annotations: { title, readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false } });
 const write = (title: string) => ({ title, annotations: { title, readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false } });
 
 function buildServer(ctx: ContextDeps, client: string | undefined) {
@@ -69,7 +68,7 @@ function buildServer(ctx: ContextDeps, client: string | undefined) {
     async ({ files_changed, session_id, ...a }) => {
       if (session_id) await ctx.registerSession?.(session_id);
       const result = await checkBeforeDone({ ...a, filesChanged: files_changed, sessionId: session_id, client }, ctx);
-      return { ...text(result.markdown), ...(result.queue && { structuredContent: { queue: result.queue, queued: result.queued ?? false } }) };
+      return { ...text(result.markdown), structuredContent: { ...result, queued: result.queued ?? false } };
     },
   );
 

@@ -100,3 +100,10 @@ test('one failing project backs off alone: the others keep their interval, and i
   await s.tick();
   expect(s.status.waiting).toEqual([]);
 });
+
+
+test('a worker restart restores the previous scheduled result before another tick', () => {
+  const last = result(true);
+  const schedule = new CloudSyncSchedule({ host: last.host, last, intervalMinutes: 60, run: async () => last, log: () => {} });
+  expect(schedule.status).toMatchObject({ lastAt: last.at, lastOk: true, lastSent: last.sent });
+});

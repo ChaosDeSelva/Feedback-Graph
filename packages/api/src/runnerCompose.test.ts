@@ -21,3 +21,13 @@ test('the manual procfs override contains only its additive option and uses the 
   expect(docs).not.toContain('docker-compose.codex-procfs.yml');
   expect(read('scripts/setup.sh')).toContain('docker-compose.runner-procfs.yml');
 });
+
+
+test('the small profile budgets fit its container and both Codex login mounts are read-only', () => {
+  const small = read('docker-compose.small.yml');
+  expect(small).toContain('mem_limit: 1G');
+  expect(small).toContain('NEO4J_server_memory_heap_max__size: 512M');
+  expect(small).toContain('NEO4J_server_memory_pagecache_size: 128M');
+  const compose = read('docker-compose.yml');
+  expect(compose.match(/CODEX_AUTH_FILE[^\n]+:\/codex\/auth\.json:ro/g)).toHaveLength(2);
+});

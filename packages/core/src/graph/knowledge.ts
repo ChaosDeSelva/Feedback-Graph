@@ -210,15 +210,15 @@ export class KnowledgeRepo implements KnowledgeStore {
     const now = new Date().toISOString();
     // A disputed claim that the post-mortem finds false is not a training miss.
     if (pm.noMiss) {
-      await this.g.run('MATCH (f:Feedback {id: $fid}) SET f.status = $status, f.updatedAt = $now WITH f OPTIONAL MATCH (m:Miss)-[:EXPLAINS]->(f) DETACH DELETE m', { fid: feedbackId, status: 'rejected', now });
-      return;
+      const [saved] = await this.g.run('MATCH (f:Feedback {id: $fid}) SET f.status = $status, f.updatedAt = $now WITH f OPTIONAL MATCH (m:Miss)-[:EXPLAINS]->(f) DETACH DELETE m RETURN count(DISTINCT f) AS n', { fid: feedbackId, status: 'rejected', now });
+      return Number(saved?.get('n') ?? 0) > 0;
     }
     // A sandbox report's miss and lesson are sandbox records: marked before they are written (this may be the worker,
     // whose searches have not seen the report).
     const [k] = await this.g.run('MATCH (k:Candidate {id: $fid}) RETURN coalesce(k.sandbox, false) AS sandbox', { fid: feedbackId });
     // No candidate read back: marked, since an unknown source fails closed.
     this.g.sandbox.wrote(k ? k.get('sandbox') : true);
-    await this.g.run(
+    const saved = await this.g.run(
       `MATCH (f:Feedback {id: $fid})-[:FROM_TURN]->(t:Turn)<-[:HAS_TURN]-(s:Session)-[:IN]->(p:Project)
        // The report's run (RunTag), carried to the miss and lesson so a sandbox one is served only to its run.
        OPTIONAL MATCH (k:Candidate {id: $fid})
@@ -260,12 +260,15 @@ export class KnowledgeRepo implements KnowledgeStore {
          MATCH (s)-[:DURING]->(k:Commit) WHERE datetime(k.ts) > datetime(t.ts) // committers' offsets differ
          MERGE (k)-[:ADDRESSES]->(f)
        }
-       WITH s, p, m
+       WITH f, s, p, m
+       CALL (s, p, m) {
        UNWIND $items AS it
          MERGE (ci:ContextItem {id: it.id})
          SET ci.kind = it.kind, ci.ref = it.ref, ci.excerpt = it.excerpt, ci.projectKey = p.key
          MERGE (ci)-[w:WOULD_HAVE_PREVENTED]->(m) SET w.why = it.why
-         FOREACH (_ IN CASE WHEN it.wasAvailable THEN [1] ELSE [] END | MERGE (ci)-[:WAS_AVAILABLE_IN]->(s))`,
+         FOREACH (_ IN CASE WHEN it.wasAvailable THEN [1] ELSE [] END | MERGE (ci)-[:WAS_AVAILABLE_IN]->(s))
+       }
+       RETURN f.id AS saved`,
       {
         fid: feedbackId,
         pm: { ...pm, contextItems: undefined, lessonChecks: undefined, facts: undefined, lessonDropped: undefined },
@@ -281,6 +284,7 @@ export class KnowledgeRepo implements KnowledgeStore {
         items: pm.contextItems.map((c) => ({ ...c, id: contextItemId(feedbackId, c.kind, c.ref) })),
       },
     );
+    return saved.length > 0;
   }
 
   async listLessons(f: LessonFilter): Promise<Lesson[]> {
@@ -295,7 +299,7 @@ export class KnowledgeRepo implements KnowledgeStore {
        OPTIONAL MATCH (l)-[:DERIVED_FROM]->(:Miss)-[:EXPLAINS]->(:Feedback)-[:FROM_TURN]->(t:Turn)
        WITH l, t, ${FROM} AS fromKind
        WHERE ($from IS NULL OR fromKind = $from)
-         AND ($author IS NULL OR toLower(t.external) CONTAINS $author OR coalesce(t.text, '') + '\n' + coalesce(t.precedingAssistantText, '') + '\n' + coalesce(t.summary, '') + '\n' + l.title + '\n' + l.rule + '\n' + coalesce(l.appliesWhen, '') =~ $authorText)
+         AND ($author IS NULL OR toLower(t.external) CONTAINS $author)
          AND ($pr IS NULL OR t.external =~ $pr OR coalesce(t.text, '') + '\n' + coalesce(t.precedingAssistantText, '') + '\n' + coalesce(t.summary, '') + '\n' + l.title + '\n' + l.rule + '\n' + coalesce(l.appliesWhen, '') =~ $prText)
        RETURN l, fromKind ORDER BY l.createdAt DESC, l.id LIMIT $limit`,
       {
@@ -613,18 +617,18 @@ export class KnowledgeRepo implements KnowledgeStore {
     return id;
   }
 
-  async recordPreDoneCheck(check: { projectKey: string; task: string; checkedLessonIds: string[]; gapLessonIds: string[]; run?: RunTag | null; sessionId?: string | null }) {
+  async recordPreDoneCheck(check: { projectKey: string; task: string; checkedLessonIds: string[]; gapLessonIds: string[]; status?: string; run?: RunTag | null; sessionId?: string | null }) {
     const { run, sessionId, ...c } = check;
     this.g.sandbox.wrote(run);
     await this.g.run(
       `CREATE (x:PreDoneCheck {id: $id, ts: $now, projectKey: $c.projectKey, task: $c.task,
                               checked: size($c.checkedLessonIds), gaps: size($c.gapLessonIds), run: $run, sandbox: $sandbox,
-                              sessionId: $sessionId})
+                              sessionId: $sessionId, status: $c.status})
        WITH x
        UNWIND $c.checkedLessonIds AS lid
          MATCH (l:Lesson {id: lid})
          MERGE (x)-[r:CHECKED]->(l) SET r.gap = lid IN $c.gapLessonIds`,
-      { id: randomUUID(), now: new Date().toISOString(), c: { ...c, task: redactSecrets(c.task) }, run: run?.id ?? null, sandbox: !!run?.sandbox, sessionId: sessionId ?? null },
+      { id: randomUUID(), now: new Date().toISOString(), c: { ...c, status: c.status ?? 'lesson_judged', task: redactSecrets(c.task) }, run: run?.id ?? null, sandbox: !!run?.sandbox, sessionId: sessionId ?? null },
     );
   }
 
@@ -712,8 +716,8 @@ export class KnowledgeRepo implements KnowledgeStore {
     return missId;
   }
 
-  async removeDemo(projectKey: string): Promise<DemoRemoved> {
-    const prefix = demoPrefix(projectKey);
+  async removeDemo(projectKey: string, run: RunTag | null = null): Promise<DemoRemoved> {
+    const prefix = `${demoPrefix(projectKey)}${run ? `run:${run.id}:` : ""}`;
     const [misses] = await this.g.run(
       `MATCH (s:Session)-[:IN]->(:Project {key: $key}) WHERE s.id STARTS WITH $prefix AND s.manual
        OPTIONAL MATCH (s)-[:HAS_TURN]->(t:Turn)
@@ -728,18 +732,19 @@ export class KnowledgeRepo implements KnowledgeStore {
       { key: projectKey, prefix },
     );
     const [lessons] = await this.g.run(
-      `MATCH (l:Lesson {source: 'demo'}) WHERE l.projectKey = $key OR (l.projectKey IS NULL AND l.originProjectKey = $key)
+      `MATCH (l:Lesson {source: 'demo'}) WHERE (l.projectKey = $key OR (l.projectKey IS NULL AND l.originProjectKey = $key)) AND ($run IS NULL OR l.run = $run)
        WITH collect(l) AS ls FOREACH (l IN ls | DETACH DELETE l) RETURN size(ls) AS n`,
-      { key: projectKey },
+      { key: projectKey, run: run?.id ?? null },
     );
     const [facts] = await this.g.run(
-      `MATCH (x:Fact {projectKey: $key, source: 'demo'}) WITH collect(x) AS xs FOREACH (x IN xs | DETACH DELETE x) RETURN size(xs) AS n`,
-      { key: projectKey },
+      `MATCH (x:Fact {projectKey: $key, source: 'demo'}) WHERE $run IS NULL OR x.run = $run WITH collect(x) AS xs FOREACH (x IN xs | DETACH DELETE x) RETURN size(xs) AS n`,
+      { key: projectKey, run: run?.id ?? null },
     );
     // The file nodes the demo added (hash DEMO_SOURCE: a scan that read the file since gave it a real one): unscanned
     // again, and gone unless the code map or other facts hold them.
     await this.g.run(
       `MATCH (cf:CodeFile {projectKey: $key, hash: $demo})
+       WHERE NOT EXISTS { MATCH (:Fact {current: true})-[:ABOUT]->(cf) }
        REMOVE cf.hash, cf.summary, cf.scannedAt, cf.scanVersion, cf.hashChangedAt
        WITH cf WHERE NOT coalesce(cf.inMap, false) AND NOT coalesce(cf.inIndex, false) AND NOT EXISTS { MATCH (:Fact)-[:ABOUT]->(cf) }
        DETACH DELETE cf`,
@@ -756,7 +761,7 @@ export class KnowledgeRepo implements KnowledgeStore {
          AND NOT EXISTS { MATCH (s:ProjectSelection) WHERE $key IN coalesce(s.tracked, []) }
          ${labels.map((label) => `AND NOT EXISTS { MATCH (x:\`${label.replaceAll('`', '``')}\`) WHERE x.projectKey = $key OR x.originProjectKey = $key }`).join('\n         ')}
        WITH collect(p) AS ps FOREACH (p IN ps | DELETE p) RETURN size(ps) AS n`,
-      { key: projectKey },
+      { key: projectKey, run: run?.id ?? null },
     );
     const count = (r: { get(k: string): unknown } | undefined) => {
       const v = r?.get('n');

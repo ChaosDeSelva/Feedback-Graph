@@ -42,7 +42,7 @@ export function SplitPane({ listHeader, list, listFooter, children, listWidth = 
         <div className="relative min-h-0 flex-1 overflow-y-auto">{list}</div>
         {listFooter && <div className="hidden shrink-0 border-t border-line px-3 py-2 md:block">{listFooter}</div>}
       </aside>
-      <main className={`${detailOpen ? 'block' : 'hidden'} relative min-h-0 min-w-0 flex-1 overflow-y-auto md:block`}>
+      <section aria-label="item detail" className={`${detailOpen ? 'block' : 'hidden'} relative min-h-0 min-w-0 flex-1 overflow-y-auto md:block`}>
         {onBack && (
           <div className="sticky top-0 z-10 border-b border-line bg-surface/95 px-2 py-1.5 backdrop-blur md:hidden">
             <button type="button" onClick={onBack} className="flex h-8 items-center gap-1 rounded-sm px-2 text-[13px] font-medium text-muted hover:bg-hover hover:text-text">
@@ -52,7 +52,7 @@ export function SplitPane({ listHeader, list, listFooter, children, listWidth = 
           </div>
         )}
         {children}
-      </main>
+      </section>
     </div>
   );
 }

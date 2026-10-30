@@ -344,6 +344,18 @@ describeStores('FactsStore', (h) => {
     expect((await f.nextScanJob(new Date('2026-10-29T10:01:59Z')))?.id).toBe(job.id);
   });
 
+  test('queued cancellation and worker claiming are atomic and cannot revive each other', async () => {
+    const project = { key: 'demo', name: 'demo', repoPath: '/vibe/demo' };
+    const first = await f.requestScan(project, 'codex-cli');
+    expect(await f.cancelQueuedScan(first.id)).toBe(true);
+    expect(await f.claimQueuedScan(first.id)).toBe(false);
+    expect(await f.scanJob(first.id)).toMatchObject({ status: 'failed', error: 'Cancelled by you before the scan started' });
+    const next = await f.requestScan(project, 'claude-cli');
+    const [claimed, cancelled] = await Promise.all([f.claimQueuedScan(next.id), f.cancelQueuedScan(next.id)]);
+    expect(Number(claimed) + Number(cancelled)).toBe(1);
+    expect(await f.scanJob(next.id)).toMatchObject({ status: claimed ? 'running' : 'failed' });
+  });
+
   test('asking for a scan while one is queued or running returns that one instead of queueing another', async () => {
     const p = { key: 'demo', name: 'demo', repoPath: '/vibe/demo' };
     const a = await f.requestScan(p, 'ollama:gemma4');

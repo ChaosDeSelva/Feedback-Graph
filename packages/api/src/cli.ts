@@ -154,7 +154,7 @@ const UNLABELLED = new Set(['cleanup', 'activity', 'evidence']);
 
 function client(io: CliIO, flags: Flags, labels = true) {
   const base = (flags.url ?? io.env.FEEDBACK_GRAPH_URL ?? 'http://localhost:8787').replace(/\/+$/, '');
-  if (flags.owner && !io.env.API_TOKEN?.trim() && !PLAIN_HTTP_OK.has(new URL(base).hostname)) throw new UsageError('--owner requires API_TOKEN for a remote server; tokenless owner cleanup is local only');
+  if (flags.owner && !io.env.API_TOKEN?.trim()) throw new UsageError('--owner requires API_TOKEN; tokenless owner actions use the same-origin browser UI');
   const token = flags.owner ? io.env.API_TOKEN?.trim() ?? '' : io.env.FG_OPERATOR_TOKEN?.trim() || io.env.API_TOKEN?.trim() || '';
   const name = flags.as ?? io.env.FG_OPERATOR_NAME ?? 'fg';
   if (token) {
@@ -171,7 +171,7 @@ function client(io: CliIO, flags: Flags, labels = true) {
   const sandbox = labels && (!!flags.sandbox || io.env.FG_SANDBOX?.trim() === '1');
   if (sandbox && !runId) throw new UsageError('--sandbox needs --run <id> (or FG_RUN): a sandbox run is cleaned up by its id');
   const runHeaders: Record<string, string> = runId ? { 'x-fg-run': runId, ...(sandbox && { 'x-fg-sandbox': '1' }) } : {};
-  const authHeaders = (): Record<string, string> => ({ 'x-fg-operator': name, ...(flags.owner ? { origin: new URL(base).origin, 'x-fg-owner-cleanup': 'true' } : {}), ...runHeaders, ...(io.env.FG_RUN_KEY?.trim() && { 'x-fg-run-key': io.env.FG_RUN_KEY.trim() }), ...(token && { authorization: `Bearer ${token}` }) });
+  const authHeaders = (): Record<string, string> => ({ 'x-fg-operator': name, ...(flags.owner ? { 'x-fg-owner-cleanup': 'true' } : {}), ...runHeaders, ...(io.env.FG_RUN_KEY?.trim() && { 'x-fg-run-key': io.env.FG_RUN_KEY.trim() }), ...(token && { authorization: `Bearer ${token}` }) });
   /** A server-sent event stream; null when the API has none there (an older version) or cannot be reached. */
   const events = async (path: string): Promise<{ events: AsyncGenerator<SseEvent>; close(): void } | null> => {
     const ctl = new AbortController();
@@ -331,6 +331,10 @@ function statusLines(s: Record<string, any>, p: Pipeline | null): string[] {
     `store     ${s.graph === false ? 'NOT answering' : 'ok'}`,
     `worker    ${s.workerHealthy ? 'ok' : w ? 'stale (no heartbeat lately)' : 'not reported'}${w?.lastCycleAt ? `, last cycle ${w.lastCycleAt}` : ''}`,
   ];
+  if (s.databaseMemory) {
+    const m = s.databaseMemory, mib = (n: number) => `${Math.round(n / 1048576)} MiB`;
+    lines.push(`neo4j     ${mib(m.usedBytes)} / ${mib(m.limitBytes)}, headroom ${mib(m.headroomBytes)}, swap ${mib(m.swapBytes)}${typeof m.swapHeadroomBytes === 'number' ? `, swap headroom ${mib(m.swapHeadroomBytes)}` : ' (swap limit unknown/unlimited)'} (host snapshot)${m.headroomBytes / m.limitBytes < 0.15 || m.swapBytes > 0 ? ' WARNING: memory pressure' : ''}`);
+  }
   if (s.stage) {
     const pr = s.progress;
     const count = pr ? ` (${pr.total === null ? `${pr.done} done` : `${pr.done} of ${pr.total}`})` : '';
@@ -393,6 +397,7 @@ async function status(api: Api, io: CliIO, f: Flags): Promise<number> {
   let waited = 0;
   for (;;) {
     const s = await api<Record<string, any>>('GET', '/api/status');
+    if (io.env.FG_DATABASE_MEMORY) { try { s.databaseMemory = JSON.parse(io.env.FG_DATABASE_MEMORY); } catch {} }
     // The backlog is a second call; an older API without it still gets the rest.
     const p = await api<Pipeline>('GET', '/api/pipeline').catch(() => null);
     const reached = until === 'idle' ? isIdle(s, p) : until !== undefined && s.stage?.name === until;
@@ -735,18 +740,21 @@ async function lessons(api: Api, io: CliIO, words: string[], f: Flags): Promise<
 
 async function cloud(api: Api, io: CliIO, verb: string | undefined, f: Flags): Promise<number> {
   if (verb === 'status') {
-    const c = await api<any>('GET', '/api/cloud');
+    const c = await api<any>('GET', `/api/cloud${f.project ? `?project=${encodeURIComponent(f.project)}` : ''}`);
     if (f.json) { io.out(JSON.stringify(c, null, 2)); return 0; }
     if (!c.enabled) { io.out('cloud sync is off: set CLOUD_URL and CLOUD_TOKEN in .env and restart'); return 0; }
     const t = c.preview?.total;
     io.out(table(['FIELD', 'VALUE'], [
       ['host', `${c.host}, ${c.intervalMinutes ? `every ${c.intervalMinutes} min${c.nextAt ? `, next ${at(c.nextAt)}` : ''}` : 'only on Sync now'}`],
-      ['projects', `${c.projects.length}: ${c.projects.join(', ')}`],
+      ['projects', `${c.projects.length} selected for cloud sync; eligibility below`],
       ['lessons', c.suggestions ? 'approved and proposed (SYNC_SUGGESTIONS)' : 'approved only'],
       ...(t ? [['would send', `${t.projects} projects, ${t.lessons} lessons, ${t.misses} misses, ${t.facts} facts, ${t.docs} docs, ${t.codeFiles} code files`]] : []),
       ...(c.previewError ? [['preview', `failed: ${c.previewError}`]] : []),
       ['last', c.last ? `${at(c.last.at)} (${c.last.trigger}) ${c.last.ok ? 'ok' : `FAILED: ${c.last.error ?? ''}`}` : 'never'],
     ], 200));
+    for (const project of c.preview?.projects ?? c.projects.map((key: string) => ({ key, counts: null, reason: 'preview unavailable' })))
+      io.out(`project   ${project.key}: ${project.counts ? `eligible (${project.counts.lessons} lessons, ${project.counts.misses} misses, ${project.counts.facts} facts, ${project.counts.docs} docs, ${project.counts.codeFiles} code files)` : `not sent: ${project.reason ?? 'no shareable knowledge'}`}`);
+    for (const message of new Set<string>((c.last?.teamLessons ?? []).map((t: { message: string }) => t.message))) io.out(`team      ${message}`);
     return 0;
   }
   if (verb !== 'sync-now' && verb !== 'sync') throw new UsageError('usage: fg cloud status | fg cloud sync-now [--force]');
@@ -768,6 +776,7 @@ async function cloud(api: Api, io: CliIO, verb: string | undefined, f: Flags): P
   for (const p of (r?.projects ?? []) as { status: string }[]) by[p.status] = (by[p.status] ?? 0) + 1;
   const summary = Object.entries(by).map(([k, v]) => `${v} ${k}`).join(', ');
   io.out(`cloud sync ${r?.ok === false ? `failed: ${r.error ?? ''}` : 'done'}${summary ? `: ${summary}` : ''}${r?.sent?.projects ? `; sent ${JSON.stringify(r.sent)}` : ''}`);
+  for (const message of new Set<string>((r?.projects ?? []).flatMap((p: { teamLessons?: { message: string } }) => p.teamLessons ? [p.teamLessons.message] : []))) io.out(`team      ${message}`);
   return r?.ok === false ? 1 : 0;
 }
 

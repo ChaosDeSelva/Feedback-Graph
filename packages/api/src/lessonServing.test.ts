@@ -123,7 +123,7 @@ describe('search_graph', () => {
     expect(md).toContain('Checkout fact 0');
     // Each section that held items back says how many.
     expect(md).not.toContain('Checkout lesson 0');
-    expect(md).toMatch(/match 0\.\d\d\/0\.\d\d/);
+    expect(md).toMatch(/match 0\.\d\d\/0\.\d\d\d/);
     expect(md).toContain('Checkout fact 9');
     const details = d.recorded[0].details as { lessons: string[]; facts: string[]; cut?: string[] };
     // What was served is what was shown.

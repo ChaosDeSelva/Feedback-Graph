@@ -1,3 +1,5 @@
+import { conditionalWrite } from './conditionalWrite.ts';
+import { writesMemory, type RunTag } from '@fb/core';
 import { reviewPatterns } from '@fb/core';
 import {
   candidateProvenance,
@@ -215,6 +217,17 @@ export class PgGraphStore implements GraphStore {
     return Array.isArray(f) ? f.filter((x): x is string => typeof x === 'string') : null;
   }
 
+  async memoryWriteRun(projectKey: string, path: string): Promise<RunTag | null> {
+    const suffix = `/memory/${path.replaceAll('\\', '/').split('/').at(-1)}`;
+    const { rows } = await this.q(`SELECT s.run, s.sandbox, s.final_tool_calls,
+      coalesce((SELECT jsonb_agg(t.tool_calls) FROM turns t WHERE t.session_id = s.id), '[]'::jsonb) AS turns
+      FROM sessions s WHERE s.project_key = $1
+        AND (position($2 in s.final_tool_calls::text) > 0 OR EXISTS (SELECT 1 FROM turns t WHERE t.session_id = s.id AND position($2 in t.tool_calls::text) > 0))
+      ORDER BY s.ended_at DESC NULLS LAST, s.id`, [projectKey, suffix]);
+    for (const row of rows) if (writesMemory([...(row.final_tool_calls ?? []), ...(row.turns ?? []).flat()], path)) return row.run ? { id: row.run, sandbox: row.sandbox === true } : null;
+    return null;
+  }
+
   async callsAfter(turnUuid: string): Promise<CallsAfter | null> {
     const { rows } = await this.q(
       `SELECT s.final_tool_calls, s.ended_at,
@@ -288,11 +301,11 @@ export class PgGraphStore implements GraphStore {
        FROM candidates k JOIN turns t ON t.uuid = k.turn_uuid
        WHERE ($1::text IS NULL OR k.status = $1) AND ($2::text IS NULL OR k.project_key = $2)
          AND ($4::text[] IS NULL OR k.project_key = ANY($4)) AND ($5::text IS NULL OR coalesce(k.source, 'claude') = $5)
-         AND ${visibleToRun('k', '$7')}
+         AND ($11::boolean OR ${visibleToRun('k', '$7')})
          AND ($8::text IS NULL OR t.external->>'thread' ~ ('#' || $8 || '$') OR concat_ws(E'\n', t.text, t.preceding_assistant_text, t.summary, k.note, k.agent_report::text) ~* $10)
-         AND ($9::text IS NULL OR lower(t.external->>'author') = lower($9) OR concat_ws(E'\n', t.text, t.preceding_assistant_text, t.summary, k.note, k.agent_report::text) ~* $11)
+         AND ($9::text IS NULL OR lower(t.external->>'author') = lower($9))
        ORDER BY t.ts DESC, k.id LIMIT $3 OFFSET $6`,
-      [f.status ?? null, f.projectKey ?? null, f.limit ?? 200, f.projectKeys ?? null, f.source ?? null, Math.max(0, Math.floor(f.offset ?? 0)), f.run ?? null, f.pr ? String(f.pr) : null, f.author ?? null, reviewPatterns(f.pr).pr, reviewPatterns(undefined, f.author).author],
+      [f.status ?? null, f.projectKey ?? null, f.limit ?? 200, f.projectKeys ?? null, f.source ?? null, Math.max(0, Math.floor(f.offset ?? 0)), f.run ?? null, f.pr ? String(f.pr) : null, f.author ?? null, reviewPatterns(f.pr).pr, !!f.includeSandbox],
     );
     return rows.map(candidateOf);
   }
@@ -435,6 +448,22 @@ export class PgGraphStore implements GraphStore {
       await c.query(`UPDATE turns SET signals = array_remove(signals, $2) WHERE uuid = $1`, [rows[0].turn_uuid, `skip:${s.rule}`]);
       return true;
     });
+  }
+
+  async undoDecision(id: string, decidedAt: string): Promise<boolean> {
+    return conditionalWrite(this.db, async query => {
+      await query('SELECT id FROM candidates WHERE id = $1 FOR UPDATE', [id]);
+      await query('SELECT id FROM feedback WHERE id = $1 FOR UPDATE', [id]);
+      const { rows } = await query(`UPDATE candidates k SET status = 'pending', note = NULL, decided_at = NULL, decided_by = NULL
+        WHERE k.id = $1 AND k.status IN ('confirmed', 'rejected') AND k.decided_at = $2::timestamptz
+          AND NOT EXISTS (SELECT 1 FROM feedback f WHERE f.id = k.id AND coalesce(f.attempts, 0) > 0)
+          AND NOT EXISTS (SELECT 1 FROM misses m WHERE m.feedback_id = k.id)
+          AND NOT EXISTS (SELECT 1 FROM lessons l WHERE l.id = 'lesson:' || k.id)
+        RETURNING k.id`, [id, decidedAt]);
+      if (!rows.length) return false;
+      await query('DELETE FROM feedback WHERE id = $1', [id]);
+      return true;
+    }, Boolean);
   }
 
   async decide(id: string, status: 'confirmed' | 'rejected', note: string | null, by = 'you'): Promise<void> {

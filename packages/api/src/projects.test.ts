@@ -25,7 +25,7 @@ function setup(projects = [summary('alpha', 5)], dirs: { key: string; name: stri
   return { app, calls, activity };
 }
 
-const json = (method: string, body: object) => ({ method, headers: { 'content-type': 'application/json', origin: 'http://localhost' }, body: JSON.stringify(body) });
+const json = (method: string, body: object) => ({ method, headers: { 'content-type': 'application/json', 'sec-fetch-site': 'same-origin', origin: 'http://localhost' }, body: JSON.stringify(body) });
 
 test('GET /api/projects merges graph projects with local folders that have no data yet', async () => {
   const { app } = setup();
@@ -207,4 +207,19 @@ test('single and batch scan APIs expose blocked readiness and poll status clears
   healthy = true;
   expect(await (await app.request('/api/scans/scan:blocked')).json()).not.toHaveProperty('blocked');
   expect(probes).toBe(4);
+});
+
+
+test('only a queued scan in the requested project can be cancelled', async () => {
+  let status = 'queued', cancelled = 0;
+  const app = createApp(repo, {
+    facts: { listProjects: async () => [], scanJob: async (id: string) => id === 'scan:1' ? { id, projectKey: 'beta', status } : null,
+      cancelQueuedScan: async () => { if (status !== 'queued') return false; status = 'failed'; cancelled++; return true; } } as never,
+    projectDirs: async () => [{ key: 'beta', name: 'beta', repoPath: '/vibe/beta' }],
+  });
+  expect((await app.request('/api/projects/beta/scan/scan:1/cancel', json('POST', {}))).status).toBe(204);
+  expect(cancelled).toBe(1);
+  expect((await app.request('/api/projects/beta/scan/scan:1/cancel', json('POST', {}))).status).toBe(409);
+  expect((await app.request('/api/projects/other/scan/scan:1/cancel', json('POST', {}))).status).toBe(404);
+  expect(cancelled).toBe(1);
 });

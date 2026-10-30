@@ -28,6 +28,17 @@ expand() { local p="${1/#\~/$HOME}"; printf '%s' "${p%/}"; }
 
 [ -f .env ] || warn ".env: not found; run ./scripts/setup.sh first (the checks below use the defaults)"
 
+expected_url="http://localhost:$(envval API_PORT)"; expected_url="${expected_url%:}"
+[ "$expected_url" != http://localhost ] || expected_url=http://localhost:8787
+if [ -n "${FEEDBACK_GRAPH_URL:-}" ] && [ "${FEEDBACK_GRAPH_URL%/}" != "$expected_url" ] && [ "${FEEDBACK_GRAPH_URL%/}" != "${expected_url/localhost/127.0.0.1}" ]; then
+  warn "FEEDBACK_GRAPH_URL overrides this install ($expected_url); fg and install-agent.sh may target another install"
+  more "Unset FEEDBACK_GRAPH_URL for this checkout, or keep it only for an intentional remote target."
+fi
+
+if [ "$(envval OPERATOR_ALLOW)" = all ]; then
+  warn "OPERATOR_ALLOW=all lets operator-token holders make every configured decision; narrow it for a shared install"
+fi
+
 # ── Docker ──────────────────────────────────────────────────────────────────────────────────────────────────────────
 docker_ok=0
 if ! command -v docker >/dev/null 2>&1; then fail "docker: not installed (https://docs.docker.com/get-docker/)"
@@ -95,6 +106,16 @@ if [ -n "$(envval CODEX_RUNNER_URL)" ]; then
       more "For procfs mount errors on Docker Desktop/OrbStack or Linux, review setup.sh --runner-procfs-compat (explicit opt-in removes Docker system-path protection); Claude/API avoids that exception. Rebuild codex-runner with scripts/seccomp/codex-runner.json. Check AppArmor and docs/operations.md."
     fi
   else fail "Codex runner: configured but cannot be checked from a running worker"; fi
+fi
+
+if [ "$docker_ok" = 1 ] && is_running neo4j; then
+  memory="$(database_memory "${compose[@]}")"
+  if [ -n "$memory" ]; then
+    report="$(printf '%s' "$memory" | awk -F'[:,}]' '{printf "Neo4j memory: %.0f MiB used / %.0f MiB limit; %.0f MiB headroom; %.0f MiB swap",$2/1048576,$4/1048576,$6/1048576,$8/1048576; if ($12 != "null") printf "; %.0f MiB swap headroom",$12/1048576}')"
+    if printf '%s' "$memory" | awk -F'[:,}]' '{exit !($6/$4 < 0.15 || $8 > 0)}'; then
+      warn "$report"; more "Increase NEO4J_MEMORY_LIMIT or use the small profile in docs/install.md; leave Docker VM headroom."
+    else pass "$report"; fi
+  else skip "Neo4j memory: cgroup counters unavailable"; fi
 fi
 
 # ── Ollama ──────────────────────────────────────────────────────────────────────────────────────────────────────────

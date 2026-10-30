@@ -20,7 +20,7 @@ function setup() {
   return { app, calls, embedded };
 }
 
-const patch = (body: object) => ({ method: 'PATCH', headers: { 'content-type': 'application/json', origin: 'http://localhost' }, body: JSON.stringify(body) });
+const patch = (body: object) => ({ method: 'PATCH', headers: { 'content-type': 'application/json', 'sec-fetch-site': 'same-origin', origin: 'http://localhost' }, body: JSON.stringify(body) });
 
 test('GET /api/lessons filters by status and project', async () => {
   const { app, calls } = setup();
@@ -135,7 +135,7 @@ function factSetup(l: Lesson = lesson, o: { auth?: AppOpts['auth'] } = {}) {
   return { app, calls, logged, embedded };
 }
 
-const post = (body: object, headers: Record<string, string> = { origin: 'http://localhost' }) => ({ method: 'POST', headers: { 'content-type': 'application/json', ...headers }, body: JSON.stringify(body) });
+const post = (body: object, headers: Record<string, string> = { 'sec-fetch-site': 'same-origin', origin: 'http://localhost' }) => ({ method: 'POST', headers: { 'content-type': 'application/json', ...headers }, body: JSON.stringify(body) });
 
 test('POST /api/lessons/:id/to-fact files the rule as your fact (convention, everyday) and rejects the lesson with a note', async () => {
   const { app, calls, logged, embedded } = factSetup({ ...lesson, rule: 'Orders are read from the source table, not the mirror' });
@@ -307,4 +307,14 @@ test('refused lesson edits do not call an embedding provider', async () => {
   const { app, embedded } = setup();
   expect((await app.request('/api/lessons/lesson%3Aa', patch({ rule: 'New wording', supersedes: 'lesson:a' }))).status).toBe(400);
   expect(embedded).toEqual([]);
+});
+
+
+test('an all-failed bulk decision never claims it was saved locally', async () => {
+  const { app } = bulkSetup();
+  const res = await app.request('/api/lessons/decisions', post({ items: [{ id: 'lesson:missing', status: 'approved' }] }));
+  const data = await res.json();
+  expect(data.results).toEqual([{ id: 'lesson:missing', ok: false, error: expect.any(String) }]);
+  expect(data).not.toHaveProperty('sharing');
+  expect(JSON.stringify(data)).not.toContain('Saved locally');
 });

@@ -659,6 +659,8 @@ test('scripts/fg warns loudly, before any command, when this folder\'s Compose n
     mkdirSync(join(repo, 'scripts'));
     mkdirSync(bin);
     copyFileSync(join(root, 'scripts', 'fg'), join(repo, 'scripts', 'fg'));
+    mkdirSync(join(repo, 'scripts', 'lib'), { recursive: true });
+    copyFileSync(join(root, 'scripts', 'lib', 'env.sh'), join(repo, 'scripts', 'lib', 'env.sh'));
     writeFileSync(join(repo, '.env'), env);
     // No Node new enough here, so fg runs the CLI in the api container; docker says where the containers came from.
     writeFileSync(join(bin, 'node'), '#!/bin/sh\nexit 1\n');
@@ -933,11 +935,10 @@ test('revoke is explicit and GitHub PR author settings can be set and cleared', 
 test('legacy cleanup --owner explicitly uses API_TOKEN and owner authorization', async () => {
   const f = fake({ 'DELETE /api/runs/legacy': () => ({ json: { run: 'legacy', dryRun: true, remove: {}, kept: [], changed: [], entries: 0 } }) }, { FG_OPERATOR_TOKEN: OP, API_TOKEN: 'owner-api-token' });
   expect(await run(['cleanup', '--run', 'legacy', '--owner'], f.io)).toBe(0);
-  expect(f.calls[0].headers).toMatchObject({ authorization: 'Bearer owner-api-token', origin: 'http://localhost:8787', 'x-fg-owner-cleanup': 'true' });
+  expect(f.calls[0].headers).toMatchObject({ authorization: 'Bearer owner-api-token', 'x-fg-owner-cleanup': 'true' });
   const missing = fake({ 'DELETE /api/runs/legacy': () => ({ json: { run: 'legacy', dryRun: true, remove: {}, kept: [], changed: [], entries: 0 } }) });
-  expect(await run(['cleanup', '--run', 'legacy', '--owner'], missing.io)).toBe(0);
-  expect(missing.calls[0].headers).toMatchObject({ origin: 'http://localhost:8787', 'x-fg-owner-cleanup': 'true' });
-  expect(missing.calls[0].headers.authorization).toBeUndefined();
+  expect(await run(['cleanup', '--run', 'legacy', '--owner'], missing.io)).not.toBe(0);
+  expect(missing.calls).toEqual([]);
 });
 
 test('Codex actual thread id is registered early using inherited run context', async () => {
@@ -958,4 +959,45 @@ test('scan prints blocked runner warnings, including JSON mode stderr', async ()
   expect(await run(['scan', '--key', 'acme', '--json'], j.io)).toBe(0);
   expect(JSON.parse(j.text())[0].blocked).toBe(true);
   expect(j.err).toContain(`acme: ${warning}`);
+});
+
+
+test('fresh clone with native Node but missing workspace dependencies falls back to the API container', async () => {
+  const { spawnSync } = await import('node:child_process');
+  const { mkdtempSync, mkdirSync, copyFileSync, writeFileSync, chmodSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const { fileURLToPath } = await import('node:url');
+  const root = fileURLToPath(new URL('../../../', import.meta.url)), repo = mkdtempSync(join(tmpdir(), 'fgfresh-'));
+  try {
+    const bin = join(repo, 'bin');
+    for (const dir of [bin, join(repo, 'scripts/lib'), join(repo, 'packages/api')]) mkdirSync(dir, { recursive: true });
+    for (const path of ['scripts/fg', 'scripts/lib/env.sh']) copyFileSync(join(root, path), join(repo, path));
+    writeFileSync(join(bin, 'node'), '#!/bin/sh\ncase "$*" in *process.versions*) exit 0 ;; *import.meta.resolve*) exit 1 ;; *) echo NATIVE_UNEXPECTED ;; esac\n');
+    writeFileSync(join(bin, 'docker'), '#!/bin/sh\ncase "$*" in *"ps -a"*) ;; *"exec -T"*) echo CONTAINER_CLI ;; esac\n');
+    for (const path of ['node', 'docker']) chmodSync(join(bin, path), 0o755);
+    const result = spawnSync('bash', [join(repo, 'scripts/fg'), 'projects', 'list'], { encoding: 'utf8', env: { PATH: `${bin}:/usr/bin:/bin` } });
+    expect(result.status).toBe(0); expect(result.stdout).toContain('CONTAINER_CLI');
+    expect(result.stdout).not.toContain('NATIVE_UNEXPECTED'); expect(result.stderr).toContain('workspace dependencies are missing');
+  } finally { rmSync(repo, { recursive: true, force: true }); }
+});
+
+
+test('host status includes database memory and swap headroom without a Docker socket in the API', async () => {
+  const f = fake({ 'GET /api/status': () => ({ json: { version: 'x' } }), 'GET /api/pipeline': () => ({ json: {} }) });
+  f.io.env.FG_DATABASE_MEMORY = JSON.stringify({ usedBytes: 900 * 1048576, limitBytes: 1024 * 1048576, headroomBytes: 124 * 1048576, swapBytes: 16 * 1048576, swapLimitBytes: 128 * 1048576, swapHeadroomBytes: 112 * 1048576 });
+  expect(await run(['status'], f.io)).toBe(0);
+  expect(f.out.join('\n')).toContain('neo4j     900 MiB / 1024 MiB, headroom 124 MiB, swap 16 MiB, swap headroom 112 MiB (host snapshot) WARNING: memory pressure');
+});
+
+
+test('cloud status lists every project eligibility without truncating late keys and explains admin approval', async () => {
+  const projects = [...Array.from({ length: 80 }, (_, i) => `long-project-name-${i}`), 'cap', 'next-ai-chat-langchain'];
+  const f = fake({ 'GET /api/cloud': () => ({ json: { enabled: true, host: 'cloud.example.com', projects,
+    preview: { projects: projects.map(key => ({ key, counts: null, reason: 'No shareable knowledge' })) },
+    last: { at: '2026-10-23T10:00:00Z', ok: true, trigger: 'manual', teamLessons: [{ message: 'An admin must approve team lessons.' }] } } }) });
+  expect(await run(['cloud', 'status'], f.io)).toBe(0);
+  expect(f.out.join('\n')).toContain('project   cap: not sent: No shareable knowledge');
+  expect(f.out.join('\n')).toContain('project   next-ai-chat-langchain: not sent: No shareable knowledge');
+  expect(f.out.join('\n')).toContain('team      An admin must approve team lessons.');
 });

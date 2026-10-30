@@ -31,7 +31,7 @@ test('real MCP queued response carries observed ETA, capacity and retry state; l
     const response = await pending; expect(response.status).toBe(200);
     const { result } = await response.json();
     expect(result.structuredContent).toMatchObject({ queued: true, queue: { state: 'retry_required', capacity: 1, running: 1, waiting: 0, position: null, nextRetryPosition: 1, arrivalAhead: 1, retained: false,
-      estimate: { source: 'observed', samples: 1, startMs: [900, 900], completionMs: [1900, 1900] } } });
+      estimate: { source: 'observed', samples: 1, startMs: [910, 910], completionMs: [1910, 1910] } } });
     expect(result.content[0].text).toContain('Estimated start:');
     expect(result.content[0].text).toContain('1 recent completed judge calls');
     expect(result.content[0].text).toContain('not retain a queue position');

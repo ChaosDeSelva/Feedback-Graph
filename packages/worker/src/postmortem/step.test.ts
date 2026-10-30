@@ -437,3 +437,12 @@ test('post-mortem Activity inherits the feedback run on success and failure', as
     expect(activity[0]).toMatchObject({ kind: fail ? 'postmortem_failed' : 'postmortem_done', run: 'source-run', sandbox: true });
   }
 });
+
+
+test('an undone decision while the model runs emits no false completed Activity or lesson actions', async () => {
+  const activity: ActivityInput[] = []; let checks = 0;
+  const result = await runPostmortems({ k: { feedbackNeedingPostmortem: async () => [input('undone')], savePostmortem: async () => false,
+    recordPostmortemFailure: async () => ({ attempts: 1, retryAt: null }), setLessonChecks: async () => { checks++; return true; } },
+    postmortem: async () => pm, embed: async texts => texts.map(() => [1]), batch: 1, activity: { record: async a => { activity.push(a); } } });
+  expect(result).toEqual({ done: 0, failed: 0 }); expect(activity).toEqual([]); expect(checks).toBe(0);
+});

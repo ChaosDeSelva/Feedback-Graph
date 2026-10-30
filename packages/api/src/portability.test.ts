@@ -20,7 +20,7 @@ function app() {
   });
   return { a, calls, log };
 }
-const ui = { origin: 'http://localhost', 'content-type': 'application/json' };
+const ui = { 'sec-fetch-site': 'same-origin', origin: 'http://localhost', 'content-type': 'application/json' };
 
 test('export downloads a JSON bundle for a project, optionally approved lessons only', async () => {
   const { a, calls } = app();

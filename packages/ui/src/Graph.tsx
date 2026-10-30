@@ -90,7 +90,7 @@ export function Graph() {
         title="Graph"
         description={mode === 'code'
           ? 'The code map: the files agents struggle with most, what they import, the tests that cover them, and the misses and lessons on them.'
-          : 'How each piece of feedback links to its miss, cause, lesson and the context behind it.'}
+          : 'Evidence for up to 150 recent confirmed misses and their linked lessons. Counts below describe this graph sample; project totals include feedback without a completed post-mortem.'}
         actions={
           <div className="flex flex-wrap items-center gap-2">
             <Tabs label="view" value={mode} options={MODES} onChange={setMode} />

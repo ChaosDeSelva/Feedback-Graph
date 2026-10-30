@@ -178,7 +178,7 @@ export class InsightsRepo implements InsightsStore {
       ),
       this.g.run(
         `MATCH (x:PreDoneCheck) WHERE ($projectKey IS NULL OR x.projectKey = $projectKey) AND ($projectKeys IS NULL OR x.projectKey IN $projectKeys)
-           AND NOT coalesce(x.sandbox, false)
+           AND NOT coalesce(x.sandbox, false) AND coalesce(x.status, 'lesson_judged') = 'lesson_judged'
          RETURN count(x) AS checks, sum(CASE WHEN x.gaps > 0 THEN 1 ELSE 0 END) AS withGaps, coalesce(sum(x.gaps), 0) AS gapsFound`,
         { projectKey, projectKeys },
       ),

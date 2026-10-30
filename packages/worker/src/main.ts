@@ -1,11 +1,11 @@
 import { githubBudgetFetch } from './integrations/githubBudget.ts';
-import { setRedactionArchive } from '@fb/core';
+import { setRedactionArchive, setRedactionArchivePurger } from '@fb/core';
 import { encryptedRedactionArchive } from './redactionArchive.ts';
 import { cloudLocalOnlyProjects, cloudSharedDemoProjects } from '@fb/core';
 import { lstat, readdir, readFile, writeFile } from 'node:fs/promises';
 import { basename, dirname, join } from 'node:path';
 import {
-  ConfigError, purgeAgentMirrors, fetchPullRequestContext, projectFolders, refreshLayout, killRunningCommands, loadConfig, makeProvider, ollamaEmbed, projectScope, providerUnavailableReason, ProviderUnavailableError, redactSecrets, runCloudSync, syncProjects,
+  runnerReadiness, RUNNER_READINESS_CURSOR, ConfigError, purgeAgentMirrors, fetchPullRequestContext, projectFolders, refreshLayout, killRunningCommands, loadConfig, makeProvider, ollamaEmbed, projectScope, providerUnavailableReason, ProviderUnavailableError, redactSecrets, runCloudSync, syncProjects,
   credentialFile, fetchLinearIssues, Integrations, searchLinearIssues, selectionNote, storedSyncMemory, touchedAround, VERSION, withHealth, type KnowledgeStore, type LlmProvider, type ModelJob, type ProjectScope, type ScanJob, type SyncMemory, type WorkerStatus,
 } from '@fb/core';
 import { openStore } from '@fb/store-postgres';
@@ -380,6 +380,7 @@ async function main() {
     activity,
     autoApprove: config.memoryAutoApprove,
     beginCorrelation: () => memoryWrites.reset(),
+    runForWrite: (projectKey: string, path: string) => repo.memoryWriteRun?.(projectKey, path) ?? Promise.resolve(null),
     writtenAfterFeedback: (projectKey: string, path: string) => memoryWrites.find(projectKey, path),
     withdrawDuplicate: async (id: string, feedbackId: string | null) => {
       const detail = await knowledge.lessonDetail(id);
@@ -549,12 +550,26 @@ async function main() {
     },
     parkProvider: (key, reason, retryAt) => parkScanProvider(facts, key, defaultScan, reason, retryAt),
     empty: async (job) => !(await hasCodeFiles(job.repoPath)),
-    run: scanJob,
+    run: async (job, turn) => await facts.claimQueuedScan(job.id) ? scanJob(job, turn) : true,
     concurrency: config.scanConcurrency,
     log,
   });
+  // Publish readiness without giving the API network access to the runner.
+  let runnerReport: Promise<void> | undefined;
+  const reportRunner = (): Promise<void> => {
+    if (!process.env.CODEX_RUNNER_URL) return Promise.resolve();
+    return runnerReport ??= (async () => {
+      try {
+        const result = await runnerReadiness(process.env.CODEX_RUNNER_URL!);
+        await docs.setCursor(RUNNER_READINESS_CURSOR, JSON.stringify({ ...result, reason: result.reason ? redactSecrets(result.reason) : null, at: Date.now() }));
+      } catch (err) { log('runner readiness report failed', { error: redactSecrets(String(err)) }); }
+    })().finally(() => { runnerReport = undefined; });
+  };
+  const runnerReports = process.env.CODEX_RUNNER_URL ? setInterval(() => { void reportRunner(); }, 15_000) : undefined;
+  runnerReports?.unref();
+  void reportRunner();
   // Kept mirrors are removed once the running scans have ended.
-  stopScans = () => scanRunner.stop().finally(() => { scanPlans.clear(); });
+  stopScans = () => { clearInterval(runnerReports); return Promise.all([scanRunner.stop(), runnerReport]).then(() => { scanPlans.clear(); }); };
 
   // Ask answers, beside the cycle: every 2 s the oldest waiting question of each model's line, with its chat's model
   // (questions to different models at once, to one model one at a time).
@@ -630,6 +645,7 @@ async function main() {
   const memory: SyncMemory | null = cloud && storedSyncMemory(store.docs, cloud);
   const cloudSchedule = cloud
     ? new CloudSyncSchedule({
+        last: await memory?.last?.('schedule'),
         host: new URL(cloud.url).host,
         intervalMinutes: cloud.intervalMinutes,
         log,
@@ -730,6 +746,7 @@ async function main() {
   // logged and tried again at the next start.
   const redactionArchive = await encryptedRedactionArchive(process.env.REDACTION_ARCHIVE_DIR ?? join(dirname(config.stateDb), 'settings', 'redaction-archive'), { keyDirectory: process.env.REDACTION_ARCHIVE_KEY_DIR ?? join(dirname(config.stateDb), 'redaction-key'), retentionDays: Number(process.env.REDACTION_ARCHIVE_RETENTION_DAYS ?? 30) });
   setRedactionArchive(redactionArchive.save);
+  setRedactionArchivePurger(redactionArchive.remove);
   setInterval(() => { void redactionArchive.purge().catch(error => log('redaction archive retention failed', { error: String(error) })); }, 3600_000).unref();
   await redactStoredOnRuleChange({ cursors: docs, facts, docs, knowledge, graph: repo, sessions: store.sessions, chats: store.chats, activity, log, repair: { facts, docs, knowledge, projects: selectedFolders, activity } })
     .catch((err) => log('redaction over stored data failed', { error: redactSecrets(String(err)) }));

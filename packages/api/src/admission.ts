@@ -5,7 +5,7 @@ export type QueueInfo = {
   state: QueueState; capacity: number; running: number; waiting: number;
   /** 1 is next waiting; null means this request holds no waiting position. */
   position: number | null; nextRetryPosition: number; arrivalAhead: number | null; retained: boolean;
-  estimate: { scope: 'judge'; source: 'observed' | 'response_budget'; samples: number; startMs: [number, number | null]; completionMs: [number, number | null]; medianStartMs?: number | null; medianCompletionMs?: number | null; overdue: boolean };
+  estimate: { scope: 'judge'; source: 'observed' | 'response_budget' | 'measured'; samples: number; startMs: [number, number | null]; completionMs: [number, number | null]; medianStartMs?: number | null; medianCompletionMs?: number | null; overdue: boolean };
   retryAfterMs: number | null;
   observed?: { waitedMs: number; serviceMs: number };
   retryPriority?: { retained: boolean; restored: boolean; remainingMs: number };
@@ -52,7 +52,7 @@ export class Admission {
       if (now >= active.deadline) overdue = true;
       available[0].push(Math.max(0, low - elapsed));
       available[1].push(unknown ? Infinity : Math.max(0, high - elapsed));
-      available[2].push(now >= active.deadline ? Infinity : Math.max(0, median - elapsed));
+      available[2].push(now >= active.deadline ? Infinity : (elapsed >= median ? median : Math.max(0, median - elapsed)));
     }
     while (available[0].length < this.concurrency) { available[0].push(0); available[1].push(0); available[2].push(0); }
     const order = position ?? retryPosition ?? this.waiting + 1;
@@ -164,7 +164,9 @@ export class Admission {
         ticket.notify?.(this.#info(ticket, 'retry_required'));
         return { ok: false, ahead, waitedMs, ran: called };
       }
-      ticket.notify?.({ ...this.#info(ticket, 'completed'), observed: { waitedMs, serviceMs: Math.max(0, Date.now() - serviceStarted) } });
+      const serviceMs = Math.max(0, Date.now() - serviceStarted);
+      const completed = this.#info(ticket, 'completed');
+      ticket.notify?.({ ...completed, observed: { waitedMs, serviceMs }, estimate: { ...completed.estimate, source: 'measured', startMs: [waitedMs, waitedMs], completionMs: [waitedMs + serviceMs, waitedMs + serviceMs], medianStartMs: waitedMs, medianCompletionMs: waitedMs + serviceMs } });
       return { ok: true, value: r.value, ahead, waitedMs };
     } catch (error) {
       if (error === cancelledBeforeStart) { ticket.notify?.(this.#info(ticket, 'retry_required')); return { ok: false, ahead, waitedMs: Date.now() - started, ran: false }; }

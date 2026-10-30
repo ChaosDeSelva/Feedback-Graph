@@ -100,7 +100,10 @@ export async function runPostmortems(deps: PostmortemStepDeps): Promise<{ done: 
       const t = embedTexts(pm);
       // A dropped lesson (no rule even after the retry, postmortem.ts) is not saved, so it needs no embedding.
       const [miss, lesson = []] = await deps.embed(pm.lessonDropped ? [t.miss] : [t.miss, t.lesson]);
-      await deps.k.savePostmortem(input.feedbackId, pm, { miss, lesson });
+      if (await deps.k.savePostmortem(input.feedbackId, pm, { miss, lesson }) === false) {
+        deps.log?.('post-mortem discarded: its feedback was removed or its decision undone', { feedbackId: input.feedbackId });
+        continue;
+      }
       done++;
       const lessonId = `lesson:${input.feedbackId}`;
       const owners = pm.lessonDropped && !pm.noMiss ? null : await ownersLesson(deps, lessonId);

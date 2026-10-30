@@ -23,7 +23,7 @@ function setup() {
   });
   return { app, upserts, deleted, reread, recorded };
 }
-const post = (body: object) => ({ method: 'POST', headers: { 'content-type': 'application/json', origin: 'http://localhost' }, body: JSON.stringify(body) });
+const post = (body: object) => ({ method: 'POST', headers: { 'content-type': 'application/json', 'sec-fetch-site': 'same-origin', origin: 'http://localhost' }, body: JSON.stringify(body) });
 
 test('uploading a document chunks, redacts, embeds and logs it', async () => {
   const { app, upserts, recorded } = setup();
@@ -89,8 +89,8 @@ test('uploads are validated: unknown project, empty text, oversized text, bad na
 
 test('DELETE /api/docs/:id removes a doc, 404 when missing', async () => {
   const { app, deleted } = setup();
-  expect((await app.request('/api/docs/doc:shop:upload:a.md', { method: 'DELETE', headers: { 'content-type': 'application/json', origin: 'http://localhost' } })).status).toBe(204);
-  expect((await app.request('/api/docs/doc:shop:upload:zzz', { method: 'DELETE', headers: { 'content-type': 'application/json', origin: 'http://localhost' } })).status).toBe(404);
+  expect((await app.request('/api/docs/doc:shop:upload:a.md', { method: 'DELETE', headers: { 'content-type': 'application/json', 'sec-fetch-site': 'same-origin', origin: 'http://localhost' } })).status).toBe(204);
+  expect((await app.request('/api/docs/doc:shop:upload:zzz', { method: 'DELETE', headers: { 'content-type': 'application/json', 'sec-fetch-site': 'same-origin', origin: 'http://localhost' } })).status).toBe(404);
   expect(deleted).toEqual(['doc:shop:upload:a.md', 'doc:shop:upload:zzz']);
 });
 

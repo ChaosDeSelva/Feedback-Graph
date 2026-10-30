@@ -17,6 +17,7 @@ const detail = (id: string, title: string) => ({
 
 let patches: { url: string; body: unknown }[];
 beforeEach(() => {
+  location.hash = '';
   patches = [];
   vi.stubGlobal('fetch', vi.fn(async (url: string, init?: RequestInit) => {
     if (init?.method === 'PATCH') { patches.push({ url, body: JSON.parse(init.body as string) }); return new Response(null, { status: 204 }); }
@@ -555,4 +556,14 @@ test('PR number and feedback author filters are sent to the API', async () => {
   fireEvent.change(screen.getByLabelText('PR number'), { target: { value: '42' } });
   fireEvent.change(screen.getByLabelText('feedback author'), { target: { value: 'octo' } });
   await waitFor(() => expect(vi.mocked(fetch).mock.calls.some(([url]) => String(url).includes('pr=42') && String(url).includes('author=octo'))).toBe(true));
+});
+
+
+test('a deleted lesson link never opens an unrelated lesson', async () => {
+  location.hash = '#lessons/deleted';
+  const original = vi.mocked(fetch).getMockImplementation()!;
+  vi.mocked(fetch).mockImplementation(async (url, init) => String(url) === '/api/lessons/deleted' ? new Response(null, { status: 404 }) : original(url, init));
+  render(<Lessons />);
+  expect(await screen.findByText('Linked lesson is unavailable')).toBeTruthy();
+  expect(screen.queryByText('filtered on the client')).toBeNull();
 });

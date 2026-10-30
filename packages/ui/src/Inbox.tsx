@@ -4,7 +4,7 @@ import { isSelfReview } from '@fb/core/feedback-rules';
 import { SelfReviewBadge, SOURCE_LABEL, SourceBadge } from './CandidateDetail.tsx';
 import { CandidateDetail } from './CandidateDetail.tsx';
 import { FirstRun } from './FirstRun.tsx';
-import { hashFocus } from './links.ts';
+import { hashFocus, hashFilters, saveHashFilters } from './links.ts';
 import { PageHeader } from './ui/PageHeader.tsx';
 import { ListRow, SplitPane } from './ui/SplitPane.tsx';
 import { Button, buttonClass, Input, Select, Tabs } from './ui/controls.tsx';
@@ -30,10 +30,10 @@ export function Inbox() {
   const [link] = useState(() => hashFocus('inbox'));
   const tabLink = TABS.find((t) => t === link);
   const focus = tabLink ? null : link;
-  const [status, setStatus] = useState<CandidateStatus>(tabLink ?? 'pending');
-  const [project, setProject] = useState('');
-  const [pr, setPr] = useState('');
-  const [author, setAuthor] = useState('');
+  const [status, setStatus] = useState<CandidateStatus>(tabLink ?? (TABS.includes(hashFilters().get('status') as CandidateStatus) ? hashFilters().get('status') as CandidateStatus : 'pending'));
+  const [project, setProject] = useState(() => (hashFilters().get('project') ?? '') as string);
+  const [pr, setPr] = useState(() => (hashFilters().get('pr') ?? '') as string);
+  const [author, setAuthor] = useState(() => (hashFilters().get('author') ?? '') as string);
   const filterKey = `${project}:${pr}:${author}`;
   // The tab and project a page was asked for: a page that arrives after you moved on is dropped.
   const statusRef = useRef(status);
@@ -45,7 +45,9 @@ export function Inbox() {
   const [next, setNext] = useState<number | null>(null);
   const [loadingMore, setLoadingMore] = useState(false);
   // Where the feedback came from: a Claude Code or Codex session, or a comment on GitHub or Linear. Filtered here.
-  const [source, setSource] = useState<FeedbackSource | ''>('');
+  const [source, setSource] = useState<FeedbackSource | ''>(() => (hashFilters().get('source') ?? '') as FeedbackSource | '');
+
+  useEffect(() => saveHashFilters('inbox', { status, pr, author, source, project }), [status, pr, author, source, project]);
   const items = source ? all.filter((c) => (c.source ?? 'claude') === source) : all;
   useEffect(() => { setSelected(0); setOpen(false); }, [source]);
   const [selected, setSelected] = useState(0);
@@ -61,6 +63,7 @@ export function Inbox() {
   // One decision at a time: until it is saved the list has not moved on, so a second one would land on the same item.
   const deciding = useRef(false);
   const [busy, setBusy] = useState(false);
+  const [undo, setUndo] = useState<{ item: Candidate; decidedAt: string } | null>(null);
 
   useEffect(() => {
     if (focus) api.candidate(focus).then((d) => { if (d?.candidate) setStatus(d.candidate.status); }).catch(() => {});
@@ -79,7 +82,7 @@ export function Inbox() {
       setNext(more);
       const at = focus ? c.findIndex((x) => x.id === focus) : -1;
       setItems(c);
-      setSelected(Math.max(0, at));
+      setSelected(focus && at < 0 ? -1 : Math.max(0, at));
       setOpen(at >= 0);
       setLoaded(true);
     }, (e) => { if (!stale) { setError(String(e)); setLoaded(true); } });
@@ -125,6 +128,8 @@ export function Inbox() {
       setError(null);
       try {
         await api.decide(current.id, decision, note.trim() || undefined);
+        const decided = await api.candidate(current.id).catch(() => null);
+        setUndo(decided?.candidate.decidedAt ? { item: current, decidedAt: decided.candidate.decidedAt } : null);
         setItems((xs) => xs.filter((x) => x.id !== current.id));
         setSelected((i) => Math.min(i, items.length - 2));
       } catch (e) {
@@ -174,6 +179,7 @@ export function Inbox() {
           </>
         }
       />
+      {undo && <div role="status" className="flex items-center justify-between border-b border-line bg-sunken px-4 py-2 text-sm"><span>Decision saved.</span><Button size="sm" disabled={busy} onClick={async () => { setBusy(true); try { await api.undoDecision(undo.item.id, undo.decidedAt); setItems(xs => stableOrder('pending', [...xs.filter(x => x.id !== undo.item.id), undo.item])); setStatus('pending'); setUndo(null); } catch (e) { setError(String(e)); setUndo(null); } finally { setBusy(false); } }}>Undo decision</Button></div>}
       <SplitPane
         listLabel="feedback"
         listHeader={
@@ -187,7 +193,7 @@ export function Inbox() {
         notice={error && <Alert>{error}</Alert>}
         list={
           !loaded ? <SkeletonList /> : items.length === 0 ? (
-            status === 'pending' ? <PendingEmpty /> : (
+            project || source || pr || author ? <EmptyState compact icon={<InboxIcon />} title="No feedback matches these filters" action={<Button size="sm" onClick={() => { setProject(''); setSource(''); setPr(''); setAuthor(''); }}>Clear filters</Button>}>Try another project, source, PR number or feedback author.</EmptyState> : status === 'pending' ? <PendingEmpty /> : (
               <EmptyState compact icon={<InboxIcon />} {...EMPTY[status]} action={status === 'confirmed' ? <Button size="sm" onClick={() => setStatus('pending')}>Show pending</Button> : undefined} />
             )
           ) : (
@@ -232,7 +238,7 @@ export function Inbox() {
               </>
             ) : current ? (
               <SkeletonDetail />
-            ) : loaded && status === 'pending' && (project || source) ? (
+            ) : loaded && focus && selected < 0 ? <EmptyState icon={<InboxIcon />} title="Linked feedback is unavailable">It may have been deleted, moved outside the current filters, or not loaded yet. Select an item explicitly to continue.</EmptyState> : loaded && status === 'pending' && (project || source) && !pr && !author ? (
               // Filtered to nothing: where the pipeline stands for this project (or, filtered by source, overall).
               <div className="-mx-4 -mt-5 md:-mx-6"><FirstRun view="inbox" project={project || undefined} force /></div>
             ) : null}

@@ -1,3 +1,4 @@
+export { RUNNER_READINESS_CURSOR, reportedRunnerReadiness } from './llm/runnerReadinessReport.ts';
 export * from './types.ts';
 export * from './graph/repo.ts';
 export * from './ollama.ts';
@@ -53,3 +54,5 @@ export * from './redactionArchive.ts';
 export * from './storeWrites.ts';
 
 export { encryptedRedactionArchive, publicRedactionArchive } from './encryptedArchive.ts';
+
+export { writesMemory } from './memoryWrite.ts';

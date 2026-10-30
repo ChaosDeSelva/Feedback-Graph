@@ -1,6 +1,6 @@
 import { useEffect, useId, useState, type ReactNode } from 'react';
 import { ActivityEntry } from './Activity.tsx';
-import { hashFocus } from './links.ts';
+import { hashFocus, hashFilters, saveHashFilters } from './links.ts';
 import type { FactKind, LessonCheck, LessonCheckName, LessonFrom } from '@fb/core';
 import { FACT_KINDS, LESSON_CHECKS, LESSON_FROM } from '@fb/core/types';
 import { EVERYDAY_FROM } from '@fb/core/relevance';
@@ -269,12 +269,14 @@ function Judged({ report }: { report: LessonQualityReport | null }) {
 export function Lessons() {
   const [judged, setJudged] = useState<LessonQualityReport | null>(null);
   useEffect(() => { api.lessonQuality().then(setJudged, () => setJudged(null)); }, []);
-  const [status, setStatus] = useState<LessonStatus>('proposed');
+  const [status, setStatus] = useState<LessonStatus>(() => ['proposed', 'approved', 'rejected', 'revoked', 'superseded'].includes(hashFilters().get('status') ?? '') ? hashFilters().get('status') as LessonStatus : 'proposed');
   // Filters the server applies: where the feedback came from, and one check flag.
-  const [source, setSource] = useState<LessonFrom | ''>('');
-  const [pr, setPr] = useState('');
-  const [author, setAuthor] = useState('');
-  const [flag, setFlag] = useState<LessonCheckName | ''>('');
+  const [source, setSource] = useState<LessonFrom | ''>(() => (hashFilters().get('source') ?? '') as LessonFrom | '');
+  const [pr, setPr] = useState(() => (hashFilters().get('pr') ?? '') as string);
+  const [author, setAuthor] = useState(() => (hashFilters().get('author') ?? '') as string);
+  const [flag, setFlag] = useState<LessonCheckName | ''>(() => (hashFilters().get('flag') ?? '') as LessonCheckName | '');
+
+  useEffect(() => saveHashFilters('lessons', { status, pr, author, source, flag }), [status, pr, author, source, flag]);
   const [items, setItems] = useState<Lesson[]>([]);
   // The rows ticked for a bulk decision (proposed lessons only), and the decision being confirmed.
   const [picked, setPicked] = useState<Set<string>>(new Set());
@@ -309,7 +311,7 @@ export function Lessons() {
       const sorted = genericLast(l);
       const at = focus ? sorted.findIndex((x) => x.id === focus) : -1;
       setItems(sorted);
-      setSelected(Math.max(0, at));
+      setSelected(focus && at < 0 ? -1 : Math.max(0, at));
       setOpen(at >= 0);
       setLoaded(true);
     }, (e) => { if (!stale) { setError(String(e)); setLoaded(true); } });
@@ -665,7 +667,7 @@ export function Lessons() {
               </div>
             ) : current ? (
               <SkeletonDetail />
-            ) : null}
+            ) : loaded && focus && selected < 0 ? <EmptyState icon={<LessonIcon />} title="Linked lesson is unavailable">It may have been deleted or excluded by the current filters. Select a lesson explicitly to continue.</EmptyState> : null}
           </div>
           {detail && draft && status !== 'superseded' && (
             <div className="sticky bottom-0 border-t border-line bg-surface/95 backdrop-blur">

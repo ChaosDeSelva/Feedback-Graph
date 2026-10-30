@@ -199,6 +199,7 @@ export function Activity() {
   const [run, setRun] = useState('');
   const [runDraft, setRunDraft] = useState('');
   const [hideRuns, setHideRuns] = useState(true);
+  const [collapseRetries, setCollapseRetries] = useState(true);
   const [seenRuns, setSeenRuns] = useState<string[]>([]);
   const [rows, setRows] = useState<Entry[] | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -219,8 +220,16 @@ export function Activity() {
   }, [project, kind, run, hideRuns]);
 
   const filtered = !!(project || kind || run);
-  const shown = rows && !run && hideRuns ? rows.filter((a) => !a.run) : rows;
-  const hidden = rows && shown ? rows.length - shown.length : 0;
+  const runFiltered = rows && !run && hideRuns ? rows.filter((a) => !a.run) : rows;
+  const seenRetries = new Set<string>();
+  const shown = runFiltered?.filter(a => {
+    if (!collapseRetries || !/^scan_/.test(a.kind) || !/retry|parked|unavailable|backoff/i.test(`${a.subject} ${a.why}`)) return true;
+    const key = JSON.stringify([a.kind, a.projectKey, a.subject, a.why]);
+    if (seenRetries.has(key)) return false;
+    seenRetries.add(key); return true;
+  }) ?? null;
+  const collapsed = (runFiltered?.length ?? 0) - (shown?.length ?? 0);
+  const hidden = rows && runFiltered ? rows.length - runFiltered.length : 0;
   const clearFilters = () => { setProject(''); setKind(''); setRun(''); setRunDraft(''); };
 
   // Turns waiting for the classifier are not entries yet: filtered to what the classifier flags, say how many wait.
@@ -264,6 +273,7 @@ export function Activity() {
               <input type="checkbox" aria-label="hide labelled runs" checked={hideRuns} disabled={!!run} onChange={(e) => setHideRuns(e.target.checked)} className="size-3.5 accent-[var(--color-accent-edge)]" />
               hide labelled runs
             </label>
+            <label className="flex items-center gap-1.5 text-xs text-muted"><input type="checkbox" checked={collapseRetries} onChange={e => setCollapseRetries(e.target.checked)} />Collapse repeated scan retries</label>
           </>
         }
       />
@@ -280,6 +290,7 @@ export function Activity() {
         <ul aria-label="who did it" className="mb-2 flex flex-wrap gap-x-4 gap-y-0.5 text-xs text-muted">
           {LEGEND.map(([k, example]) => <li key={k} title={ACTOR_HINT[k]}><span className="font-mono">{example}</span> {ACTOR_HINT[k].split(':')[0]}</li>)}
         </ul>
+        {collapsed > 0 && <p role="status" className="mb-2 text-xs text-muted">{collapsed} repeated scan retry entries collapsed in this loaded page. Uncheck the filter to inspect every entry; history is retained.</p>}
         {hidden > 0 && (
           <p className="mb-2 text-xs text-muted">
             {hidden === 1 ? '1 entry from a labelled run is hidden' : `${plural(hidden, 'entry', 'entries')} from labelled runs are hidden`}.{' '}

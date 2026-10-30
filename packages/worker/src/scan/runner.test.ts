@@ -275,7 +275,7 @@ test('default and explicit provider aliases share one probe and one persisted pr
   const runner = new ScanRunner(f.deps);
   runner.kick(); await runner.idle();
   expect(probes).toBe(1);
-  expect(parks).toEqual([['codex-cli', 'Error: cannot mount proc', '1970-01-01T00:02:00.000Z']]);
+  expect(parks).toEqual([['codex-cli', 'cannot mount proc', '1970-01-01T00:02:00.000Z']]);
   expect(f.started).toEqual([]);
 });
 

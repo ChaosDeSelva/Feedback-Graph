@@ -7,3 +7,6 @@ For the standard semantic embedder, facts must pass both the existing 0.78 raw-s
 A task naming its own PR excludes that PR's lessons, misses and documents from independent context. Answers report the excluded PR numbers. Structural file evidence remains available for other PRs and sessions.
 
 Ask prioritizes exact named paths and basename matches before token-ranked siblings and includes the actual symbols of those files within its existing hit budget. A known file is not described as absent merely because its symbol names differ from the question.
+
+
+The weighted .80 gate applies to semantic misses and document chunks as well as facts, including linked-project results. Raw similarity must still meet .78 (or the explicitly calibrated embedder floor). Ranks are shown to three decimal places so a value just below .80 cannot look like an accepted .80. A fact tied to the exact file explicitly named by the task keeps its raw-floor match even when relevance weighting puts it below .80; this exception does not extend to sibling or unrelated files. PR exclusion uses explicit task PR identities or an explicitly named commit, never the checkout's unrelated HEAD. Text such as “PR1 of 2” is not a PR identity.

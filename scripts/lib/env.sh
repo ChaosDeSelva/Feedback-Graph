@@ -24,3 +24,31 @@ setenv() {
   chmod 600 "$tmp"
   mv "$tmp" .env
 }
+
+# Read only the database container's cgroup counters; no Docker socket enters the API.
+database_memory() {
+  "$@" exec -T neo4j sh -c '
+    base=/sys/fs/cgroup
+    if [ -r "$base/memory.current" ]; then
+      for name in memory.current memory.max memory.swap.current memory.swap.max; do
+        printf "%s=" "$name"; cat "$base/$name" 2>/dev/null || echo unknown
+      done
+    elif [ -r "$base/memory/memory.usage_in_bytes" ]; then
+      for name in memory.usage_in_bytes memory.limit_in_bytes memory.memsw.usage_in_bytes memory.memsw.limit_in_bytes; do
+        printf "%s=" "$name"; cat "$base/memory/$name" 2>/dev/null || echo unknown
+      done
+    fi' 2>/dev/null | awk -F= '
+      $1=="memory.current" || $1=="memory.usage_in_bytes" { used=$2 }
+      $1=="memory.max" || $1=="memory.limit_in_bytes" { limit=$2 }
+      $1=="memory.swap.current" { swap=$2 }
+      $1=="memory.swap.max" { swaplimit=$2 }
+      $1=="memory.memsw.limit_in_bytes" { combinedlimit=$2 }
+      $1=="memory.memsw.usage_in_bytes" { combined=$2 }
+      END { if (used ~ /^[0-9]+$/ && limit ~ /^[0-9]+$/ && limit>0) {
+        if (swap=="") swap=(combined>used ? combined-used : 0)
+        if (swaplimit=="" && combinedlimit>limit) swaplimit=combinedlimit-limit
+        swaphead=(swaplimit ~ /^[0-9]+$/ ? sprintf("%.0f",swaplimit-swap) : "null")
+        swaplimit=(swaplimit ~ /^[0-9]+$/ ? sprintf("%.0f",swaplimit) : "null")
+        printf "{\"usedBytes\":%.0f,\"limitBytes\":%.0f,\"headroomBytes\":%.0f,\"swapBytes\":%.0f,\"swapLimitBytes\":%s,\"swapHeadroomBytes\":%s}", used,limit,limit-used,swap,swaplimit,swaphead
+      }}'
+}

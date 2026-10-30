@@ -153,7 +153,7 @@ export class Neo4jProbe implements StoreProbe {
 /** The Neo4j test database: NEO4J_TEST_URL (default: docker-compose.test.yml's neo4j-test). Never the real stack. */
 export async function openNeo4jTestStore(): Promise<{ store: Store; probe: StoreProbe }> {
   const url = process.env.NEO4J_TEST_URL ?? 'bolt://127.0.0.1:7688';
-  const g = await GraphRepo.connect(url, 'neo4j', 'testpassword');
+  const g = await GraphRepo.connect(url, process.env.NEO4J_TEST_USER ?? 'neo4j', process.env.NEO4J_TEST_PASSWORD ?? 'testpassword');
   const store = neo4jStore(g);
   await store.ensureSchema();
   return { store, probe: new Neo4jProbe(g) };

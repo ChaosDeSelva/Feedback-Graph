@@ -16,6 +16,7 @@ const detail = (id: string) => ({
 let posts: { url: string; body: unknown }[];
 
 beforeEach(() => {
+  location.hash = '';
   posts = [];
   vi.stubGlobal('fetch', vi.fn(async (url: string, init?: RequestInit) => {
     if (init?.method === 'POST') {
@@ -231,7 +232,7 @@ test('the project filter lists every project, and keeps showing the one picked w
   await waitFor(() => expect([...select.options].map((o) => o.value)).toEqual(['', 'demo', 'other']));
   fireEvent.change(select, { target: { value: 'demo' } });
   fireEvent.click(screen.getByRole('button', { name: 'rejected' }));
-  expect(await screen.findByText('Nothing rejected')).toBeTruthy();
+  expect(await screen.findByText('No feedback matches these filters')).toBeTruthy();
   expect(select.value).toBe('demo');
   expect([...select.options].map((o) => o.value)).toEqual(['', 'demo', 'other']);
 });
@@ -367,4 +368,39 @@ test('PR number and feedback author filters are sent to the API', async () => {
   fireEvent.change(screen.getByLabelText('PR number'), { target: { value: '42' } });
   fireEvent.change(screen.getByLabelText('feedback author'), { target: { value: 'octo' } });
   await waitFor(() => expect(vi.mocked(fetch).mock.calls.some(([url]) => String(url).includes('pr=42') && String(url).includes('author=octo'))).toBe(true));
+});
+
+
+test('a deleted deep link never opens the first unrelated feedback item', async () => {
+  location.hash = '#inbox/deleted';
+  const original = vi.mocked(fetch).getMockImplementation()!;
+  vi.mocked(fetch).mockImplementation(async (url, init) => String(url) === '/api/candidates/deleted' ? new Response(null, { status: 404 }) : original(url, init));
+  render(<Inbox />);
+  expect(await screen.findByText('Linked feedback is unavailable')).toBeTruthy();
+  expect(screen.queryByText('turn text c1')).toBeNull();
+});
+
+test('Inbox filters restore from and persist to the URL without changing the linked item', async () => {
+  location.hash = '#inbox?pr=42&author=andy&status=confirmed';
+  render(<Inbox />);
+  expect((screen.getByLabelText('PR number') as HTMLInputElement).value).toBe('42');
+  expect((screen.getByLabelText('feedback author') as HTMLInputElement).value).toBe('andy');
+  fireEvent.change(screen.getByLabelText('PR number'), { target: { value: '43' } });
+  await waitFor(() => expect(location.hash).toContain('pr=43'));
+  expect(location.hash).toContain('author=andy');
+});
+
+test('an Inbox decision offers audited Undo and reports a refusal after processing starts', async () => {
+  let decided = false;
+  const original = vi.mocked(fetch).getMockImplementation()!;
+  vi.mocked(fetch).mockImplementation(async (url, init) => {
+    if (String(url).endsWith('/undo')) return Response.json({ error: 'post-mortem has started' }, { status: 409 });
+    if (String(url).endsWith('/decision')) decided = true;
+    if (url === '/api/candidates/c1' && decided) return Response.json({ ...detail('c1'), candidate: { ...cand('c1', 'first miss'), status: 'confirmed', decidedAt: '2026-10-01T10:01:00.000Z' } });
+    return original(url, init);
+  });
+  render(<Inbox />); await screen.findByText('turn text c1');
+  fireEvent.keyDown(window, { key: 'c' });
+  fireEvent.click(await screen.findByRole('button', { name: 'Undo decision' }));
+  expect(await screen.findByText(/post-mortem has started/)).toBeTruthy();
 });

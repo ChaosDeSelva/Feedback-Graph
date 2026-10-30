@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { api, type CloudInfo, type SyncCounts } from './api.ts';
-import { Button } from './ui/controls.tsx';
+import { Input, Button } from './ui/controls.tsx';
 import { ago, Alert, Badge, Card, plural, StatGrid, StatTile, type Tone } from './ui/display.tsx';
 
 const message = (e: unknown) => (e instanceof Error ? e.message : String(e));
@@ -113,9 +113,10 @@ export function CloudSync() {
               {info.projects.length ? info.projects.join(', ') : <span className="text-muted">none: select projects above (SYNC_PROJECTS narrows them)</span>}
             </dd>
           </dl>
-          {info.preview?.projects.filter(project => project.reason).map(project => <p key={project.key} className="text-xs text-muted">{project.key}: {project.reason}</p>)}
+          {info.preview && <ul aria-label="Cloud project eligibility" className="space-y-1 text-xs text-muted">{info.preview.projects.map(project => <li key={project.key}>{project.key}: {project.counts ? `eligible (${project.counts.lessons} lessons, ${project.counts.misses} misses, ${project.counts.facts} facts, ${project.counts.docs} docs, ${project.counts.codeFiles} code files)` : `not sent: ${project.reason ?? 'no shareable knowledge'}`}</li>)}</ul>}
+          {[...new Set(info.last?.teamLessons?.map(t => t.message) ?? [])].map(message => <Alert key={message}>{message}</Alert>)}
           {!!info.localOnlyProjects?.length && <p className="text-xs text-muted">Local only (never sends new content): {info.localOnlyProjects.join(', ')}. Environment-enforced projects remain local even if removed below.</p>}
-          {info.localOnlyEditable && <div className="grid gap-2"><label htmlFor="cloud-local-only">Keep these project keys local (comma separated)</label><input id="cloud-local-only" value={localOnly} onChange={e => setLocalOnly(e.target.value)} /><Button disabled={busy} onClick={async () => { setBusy(true); setError(null); try { await api.cloudLocalOnly(localOnly.split(',').map(key => key.trim()).filter(Boolean)); await load(); } catch (e) { setError(message(e)); } finally { setBusy(false); } }}>Save local-only projects</Button><p className="text-xs text-muted">These projects stay selected locally. Forced sync never sends new content; previously shared copies are withdrawn on the next sync.</p></div>}
+          {info.localOnlyEditable && <div className="grid gap-2"><label htmlFor="cloud-local-only">Keep these project keys local (comma separated)</label><Input id="cloud-local-only" value={localOnly} onChange={e => setLocalOnly(e.target.value)} /><Button disabled={busy} onClick={async () => { setBusy(true); setError(null); try { await api.cloudLocalOnly(localOnly.split(',').map(key => key.trim()).filter(Boolean)); await load(); } catch (e) { setError(message(e)); } finally { setBusy(false); } }}>Save local-only projects</Button><p className="text-xs text-muted">These projects stay selected locally. Forced sync never sends new content; previously shared copies are withdrawn on the next sync.</p></div>}
           {result && <p role="status" className="text-ok-text">{result}</p>}
           {lastError && <Alert>{lastError}</Alert>}
           <div className="grid gap-1.5">

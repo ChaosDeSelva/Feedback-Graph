@@ -51,8 +51,8 @@ x-env: &env
 services:
   neo4j:
     # 5.26 is the long-term-support line: patch updates only.
-    image: neo4j:5.26-community
-    mem_limit: ${NEO4J_MEMORY_LIMIT:-2G}
+    image: neo4j:5.26-community@sha256:249a1ec6e3c52d82101a5ed33d6ed2b5ed5b0017b21a28c0bfebc335e87fb177
+    mem_limit: ${NEO4J_MEMORY_LIMIT:-3G}
     environment:
       NEO4J_AUTH: neo4j/${NEO4J_PASSWORD}
       NEO4J_server_memory_heap_initial__size: ${NEO4J_HEAP:-1G}
@@ -79,7 +79,30 @@ services:
       retries: 30
     restart: unless-stopped
 
+  # One-shot volume ownership fix for upgrades and Linux HOST_UID; no API, state, network or host mounts.
+  archive-key-init:
+    build: { context: ., target: runtime }
+    user: "0:0"
+    network_mode: none
+    read_only: true
+    cap_drop: [ALL]
+    cap_add: [CHOWN, FOWNER, DAC_OVERRIDE]
+    security_opt: ["no-new-privileges:true"]
+    environment:
+      ARCHIVE_UID: ${HOST_UID:-1000}
+      ARCHIVE_GID: ${HOST_GID:-1000}
+    volumes: ["redaction-key:/redaction-key"]
+    entrypoint: ["sh", "-eu", "-c"]
+    command:
+      - |
+        case "$$ARCHIVE_UID:$$ARCHIVE_GID" in *[!0-9:]*|:*|*:) exit 1;; esac
+        [ ! -L /redaction-key/private ] || exit 1
+        mkdir -p /redaction-key/private
+        chmod 0700 /redaction-key /redaction-key/private
+        chown -hR "$$ARCHIVE_UID:$$ARCHIVE_GID" /redaction-key
+
   worker:
+    networks: [default, runner-private]
     build: { context: ., target: worker }
     # Linux: setup.sh sets HOST_UID/HOST_GID in .env to your id -u / id -g, so the worker can write ./state and read
     # transcripts only you may read. Default 1000 (the image's node user); macOS and Windows need nothing.
@@ -128,7 +151,7 @@ services:
       LINEAR_API_KEY: ${LINEAR_API_KEY:-}
       INTEGRATION_SYNC_MINUTES: ${INTEGRATION_SYNC_MINUTES:-}
       LINK_SCAN_MINUTES: ${LINK_SCAN_MINUTES:-}
-      INTEGRATIONS_FILE: /state/settings/integrations.json
+      INTEGRATIONS_FILE: /state/api-settings/integrations.json
       # TypeSafe Jev: set CLASSIFY_LLM=jev to classify pushback with it (classification only)
       TYPESAFE_API_KEY: ${TYPESAFE_API_KEY:-}
       # Days to keep the text of turns nobody flagged; empty keeps everything.
@@ -160,7 +183,7 @@ services:
       # Only the Codex login, not all of ~/.codex (config, history, other sessions). Writable so token refreshes stick.
       - codex-home:/codex
       # CODEX_AUTH_FILE=~/.codex/auth.json (set by scripts/setup.sh when you use Codex); the default is an empty placeholder.
-      - ${CODEX_AUTH_FILE:-./state/codex-auth.json}:/codex/auth.json
+      - ${CODEX_AUTH_FILE:-./state/codex-auth.json}:/codex/auth.json:ro
       - ./state:/state
       - redaction-key:/redaction-key
       # Shared with codex-runner only: the per-job repository mirrors and the runner's token.
@@ -168,6 +191,7 @@ services:
     extra_hosts:
       - host.docker.internal:host-gateway
     depends_on:
+      archive-key-init: { condition: service_completed_successfully }
       neo4j: { condition: service_healthy }
       # Only with --profile postgres; without it this dependency is skipped.
       postgres: { condition: service_healthy, required: false }
@@ -182,6 +206,7 @@ services:
   # Not published on any host port; the worker reaches it on the compose network with a token the runner writes into
   # the scratch volume at startup.
   codex-runner:
+    networks: [runner-private, runner-egress]
     build: { context: ., target: codex-runner }
     profiles: ["codex"]
     # The same uid as the worker: the runner's token (mode 0600) and the worker's mirrors (mode 0700) are each readable
@@ -197,7 +222,7 @@ services:
       - codex-scratch:/scratch
       # Its own CODEX_HOME (not the worker's), with only the login file from the host in it.
       - codex-runner-home:/codex
-      - ${CODEX_AUTH_FILE:-./state/codex-auth.json}:/codex/auth.json
+      - ${CODEX_AUTH_FILE:-./state/codex-auth.json}:/codex/auth.json:ro
     read_only: true
     tmpfs:
       - /tmp
@@ -244,22 +269,23 @@ services:
       API_LISTEN: 0.0.0.0
       # Where Settings saves the project roots you choose; ./scripts/setup.sh mounts them (they are bind mounts, so a
       # change needs that restart).
-      ROOTS_FILE: /settings/project-roots.json
-      REDACTION_ARCHIVE_DIR: /settings/redaction-archive
+      ROOTS_FILE: /api-settings/project-roots.json
+      REDACTION_ARCHIVE_DIR: /redaction-archive
       REDACTION_ARCHIVE_RETENTION_DAYS: ${REDACTION_ARCHIVE_RETENTION_DAYS:-30}
       # GitHub and Linear: Settings tests a token with one call and shows the account; one in .env wins and is shown
       # as "set in .env". A pasted token is saved here (mode 600) and read by the worker as /state/settings/....
       GITHUB_TOKEN: ${GITHUB_TOKEN:-}
       GITHUB_REPOS: ${GITHUB_REPOS:-}
       LINEAR_API_KEY: ${LINEAR_API_KEY:-}
-      INTEGRATIONS_FILE: /settings/integrations.json
+      INTEGRATIONS_FILE: /api-settings/integrations.json
       # The worker's file limits, so answers can say why a named file is not in the code map (over SCAN_MAX_BYTES, or
       # past the SCAN_MAX_FILES cap). Empty = the defaults.
       SCAN_MAX_FILES: ${SCAN_MAX_FILES:-}
       SCAN_MAX_BYTES: ${SCAN_MAX_BYTES:-}
     volumes:
       # Only this folder of ./state: not the worker's database or the Codex login placeholder.
-      - ./state/settings:/settings
+      - ./state/api-settings:/api-settings
+      - ./state/settings/redaction-archive:/redaction-archive
     extra_hosts:
       - host.docker.internal:host-gateway
     ports:
@@ -280,7 +306,7 @@ services:
   #   STORE=postgres docker compose --profile postgres up -d
   # Back it up with pg_dump (docs/operations.md). Needs POSTGRES_PASSWORD in .env (letters and digits: it goes in a URL).
   postgres:
-    image: pgvector/pgvector:0.8.7-pg17
+    image: pgvector/pgvector:0.8.7-pg17@sha256:ac08538c6f8b9904c33c8224c5e5706dbe760aca29db1d096972b4052c22a75d
     profiles: ["postgres"]
     environment:
       POSTGRES_USER: fg
@@ -300,7 +326,7 @@ services:
   # Free, fully containerised model server (CPU on macOS, GPU on Linux with the nvidia runtime).
   # Use with: docker compose --profile ollama up -d  and  OLLAMA_URL=http://ollama:11434
   ollama:
-    image: ollama/ollama:0.40.2
+    image: ollama/ollama:0.40.2@sha256:b86366bb528bbf7f1424435d165028497a5b69bf6ddb4fa5a87102e2b79f44fb
     profiles: ["ollama"]
     volumes:
       - ollama-models:/root/.ollama
@@ -315,3 +341,10 @@ volumes:
   codex-home:
   codex-scratch:
   codex-runner-home:
+
+# Only the worker can reach the runner control port. A separate egress bridge keeps
+# Codex provider HTTPS working without joining the API/database network.
+networks:
+  runner-private:
+    internal: true
+  runner-egress: {}

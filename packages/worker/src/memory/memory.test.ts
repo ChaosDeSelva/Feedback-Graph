@@ -194,7 +194,7 @@ test('memory deduplication scans past 500 candidates, includes rejected/Codex ev
     callsAfter: async (uuid) => ({ calls: uuid === 'old-turn' ? [{ name: 'exec_command', ts: 't', command: "python -c \"Path('/home/me/memory/fix.md').write_text('fixed')\"" }] : [], laterTurns: 1, endedAt: null }),
   }, 'demo', '/transcripts/project/memory/fix.md');
   expect(result).toBe('old');
-  expect(seen).toEqual([{ projectKey: 'demo', limit: 500, offset: 0 }, { projectKey: 'demo', limit: 500, offset: 500 }]);
+  expect(seen).toEqual([{ projectKey: 'demo', limit: 500, offset: 0, includeSandbox: true }, { projectKey: 'demo', limit: 500, offset: 500, includeSandbox: true }]);
 });
 
 test('upgrade rechecks unchanged memories and withdraws a previously imported duplicate once', async () => {
@@ -226,4 +226,18 @@ test('feedback classified in a later worker cycle still withdraws an unchanged m
   classified = true;
   expect(await importMemories(options)).toBe(0);
   expect(withdrawn).toEqual(['memory:-Users-j-Vibe-AcmeShop/no-dashes.md']);
+});
+
+
+test('memory import inherits persisted sandbox write provenance without using a project-wide run', async () => {
+  const transcripts = mkdtempSync(join(tmpdir(), 'fbmem-run-'));
+  const dir = join(transcripts, '-Users-j-Vibe-AcmeShop', 'memory'); mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, 'probe.md'), feedbackMd);
+  const lessons: unknown[] = []; const activity: ActivityInput[] = []; const withdrawn: unknown[] = [];
+  await importMemories({ transcriptsDir: transcripts, roots: async () => [{ host: '/Users/j/Vibe', keys: ['AcmeShop'] }], state: new FileState(':memory:'),
+    embed: async texts => texts.map(() => [1]), upsertLesson: async l => { lessons.push(l); }, activity: { record: async a => { activity.push(a); } },
+    runForWrite: async () => ({ id: 'probe-2', sandbox: true }), withdrawDuplicate: async (...args) => { withdrawn.push(args); } });
+  expect(lessons).toEqual([expect.objectContaining({ id: 'memory:-Users-j-Vibe-AcmeShop/probe.md:run:probe-2', run: { id: 'probe-2', sandbox: true } })]);
+  expect(activity[0]).toMatchObject({ run: 'probe-2', sandbox: true });
+  expect(withdrawn).toEqual([['memory:-Users-j-Vibe-AcmeShop/probe.md', null]]);
 });

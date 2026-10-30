@@ -288,3 +288,10 @@ test('the header tooltip says what the worker is doing, and since when a model h
   expect(title).toMatch(/ollama:gemma4: timed out \(since /);
   expect(title).toMatch(/now: Scanning a project, for \d+s \(demo-shop\)/);
 });
+
+
+test('the application exposes one main landmark and a keyboard skip link', async () => {
+  render(<App />);
+  expect(screen.getAllByRole('main')).toHaveLength(1);
+  expect(screen.getByRole('link', { name: 'Skip to main content' }).getAttribute('href')).toBe('#main-content');
+});

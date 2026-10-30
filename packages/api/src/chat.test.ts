@@ -288,7 +288,7 @@ const app = (o: { operator?: string[] } = {}) =>
     },
     ...(o.operator ? { auth: { operator: { token: 'o'.repeat(32), allow: o.operator as never } } } : {}),
   });
-const UI = { 'content-type': 'application/json', origin: 'http://localhost' };
+const UI = { 'content-type': 'application/json', 'sec-fetch-site': 'same-origin', origin: 'http://localhost' };
 const send = (method: string, body?: unknown, headers: Record<string, string> = UI) => ({ method, headers, ...(body === undefined ? {} : { body: JSON.stringify(body) }) });
 
 describe('chatPackBuilder', () => {

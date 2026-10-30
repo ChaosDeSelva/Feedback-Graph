@@ -35,7 +35,7 @@ beforeEach(() => {
   };
 });
 const app = () => createApp(repo, { sessions: { store, projects: () => ['demo', 'other'], inScope: (k) => k !== 'secret' } });
-const post = (path: string, origin?: string) => ({ method: 'POST', body: '{}', headers: { 'content-type': 'application/json', ...(origin ? { origin } : {}) } });
+const post = (path: string, origin?: string) => ({ method: 'POST', body: '{}', headers: { 'content-type': 'application/json', ...(origin ? { origin, 'sec-fetch-site': 'same-origin' } : {}) } });
 
 test('GET /api/sessions lists the selected projects, newest first, with an opaque cursor for the next page', async () => {
   const res = await app().request('/api/sessions?state=idle&limit=10');

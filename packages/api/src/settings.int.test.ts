@@ -30,7 +30,7 @@ describeStores('settings api', (h) => {
     };
   }
 
-  const ui = { origin: 'http://localhost', 'content-type': 'application/json' };
+  const ui = { 'sec-fetch-site': 'same-origin', origin: 'http://localhost', 'content-type': 'application/json' };
 
   test('selection round-trips through the graph, and cleanup deletes only unselected projects', async () => {
     const { app: a, selection, activity } = app();

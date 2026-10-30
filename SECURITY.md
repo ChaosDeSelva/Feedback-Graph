@@ -50,3 +50,17 @@ The default setup uses Ollama on your own machine for everything, so nothing lea
 - **Transcript format.** Claude Code's JSONL format is undocumented and may change; parsing failures are logged and skipped, never guessed at.
 
 - **Encrypted redaction originals contain secrets.** The API has only the encryption public key. Private keys live on the worker-only `redaction-key` volume, outside shared settings/project mounts. Ordinary state backups are owner-only and exclude decryption keys, which require a separate protected backup. Ciphertext expires after 30 days by default (configurable 1–365). The archive and key paths are scanner exclusions even when a repository ignores nothing. Existing v8 keys move out of the API-visible settings folder on upgrade; the API refuses archive startup until that migration has happened.
+
+
+### Runner network boundary
+
+The Codex runner joins an internal control network shared only with the worker, plus a separate egress bridge for model-provider HTTPS. It does not join the API/database bridge. The worker publishes timestamped sandbox readiness through the database; the API fails closed on missing or stale reports instead of connecting to the runner directly. Docker integration tests verify API DNS and direct container-IP access are blocked (including a forged Host header), while worker control access and provider-network HTTP still work. This boundary does not promise that every host-published service or external address is unreachable: keep API ports on loopback, configure authentication before publishing beyond it, and protect any intentionally exposed host gateway.
+
+
+### Archive deletion and settings mounts
+
+The key volume root and its private directory are mode 0700. A networkless, one-shot init container changes only that volume's ownership to HOST_UID/HOST_GID before the ordinary worker starts; it has no state or project mounts. The worker retires the v8 symmetric key when no retained v8 ciphertext remains, including after retention purges.
+
+Encrypted envelopes carry only hashed lifecycle tags outside their ciphertext. Authorized project, document and run cleanup deletes matching originals and leaves other projects, other runs and kept records alone. Purge markers contain hashes, never original text, and expire with the archive retention window. The worker indexes earlier envelopes using its private key without renewing their original age. Historical batches whose original format omitted a sandbox or ownership identity are not reassigned by guesswork; any ambiguous original expires under its original retention deadline.
+
+The API mounts only `state/api-settings` (roots, integration credentials and the run-key salt) and the encrypted archive directory. It no longer mounts all worker settings read-write. Setup migrates those three files without overwriting conflicting originals and refuses symlinked settings paths; keep the containers on the same checkout and rerun setup on upgrade.

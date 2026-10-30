@@ -1,5 +1,5 @@
 import { conditionalWrite } from './conditionalWrite.ts';
-import { archiveBeforeRedaction, archiveRedactionInput } from '../redactionArchive.ts';
+import { archiveRunFileSelector, archiveBeforeRedaction, archiveRedactionInput } from '../redactionArchive.ts';
 import { randomUUID } from 'node:crypto';
 import neo4j from 'neo4j-driver';
 import { FACT_EVIDENCE, FACT_ORIGINS, type CodeFact, type FactEvidence, type FactKind, type FactOrigin, type Project, type ProjectSummary, type RelevanceBy, type ScanJob, type ScanQueueEntry, type ScanShards, type ScanStatus, type RunTag } from '../types.ts';
@@ -131,11 +131,12 @@ export class FactsRepo implements FactsStore {
   }
 
   /** Replace the current facts of one file (old facts are closed, not deleted). */
-  async saveFileFacts(projectKey: string, rawFile: ScannedFile & { summary: string }, rawFacts: EmbeddedFact[], source: string, scanJobId: string | null = null) {
+  async saveFileFacts(projectKey: string, rawFile: ScannedFile & { summary: string }, rawFacts: EmbeddedFact[], source: string, scanJobId: string | null = null, run: RunTag | null = null) {
     // Facts are model output about code that may contain credentials: redact at the door.
     const file = redactDeep(rawFile);
     const facts = redactDeep(rawFacts);
-    await archiveRedactionInput('facts', projectKey, { file: rawFile, facts: rawFacts }, { file, facts });
+    await archiveRedactionInput('facts', projectKey, { file: rawFile, facts: rawFacts }, { file, facts }, [{ kind: 'project', id: projectKey }, ...(run ? [{ kind: 'run', id: run.id }, archiveRunFileSelector(run.id, projectKey, file.path)] : [])]);
+    this.g.sandbox.wrote(run);
     const now = new Date().toISOString();
     const fields = `cf.projectKey = $projectKey, cf.path = $file.path, cf.hash = $file.hash, cf.summary = $file.summary,
            cf.scannedAt = $now, cf.removed = false, cf.scanVersion = $file.version`;
@@ -150,7 +151,7 @@ export class FactsRepo implements FactsStore {
        ${setFile}
        MERGE (cf)-[:IN]->(p)
        WITH cf
-       OPTIONAL MATCH (old:Fact {current: true})-[:ABOUT]->(cf) WHERE coalesce(old.origin, '') <> 'you'
+       OPTIONAL MATCH (old:Fact {current: true})-[:ABOUT]->(cf) WHERE coalesce(old.origin, '') <> 'you' AND (old.run = $run OR (old.run IS NULL AND $run IS NULL))
        SET old.current = false, old.validTo = $now
        WITH DISTINCT cf
        UNWIND $facts AS fx
@@ -158,9 +159,9 @@ export class FactsRepo implements FactsStore {
                          lines: fx.lines, confidence: fx.confidence, why: fx.why, embedding: fx.embedding, source: $source,
                          origin: fx.origin, evidence: fx.evidence, checkVersion: fx.checkVersion,
                          relevance: fx.relevance, relevanceBy: CASE WHEN fx.relevance IS NULL THEN null ELSE 'model' END,
-                         scanJobId: $scanJobId, fileHash: $file.hash, current: true, createdAt: $now, validFrom: $now})
+                         run: $run, sandbox: $sandbox, scanJobId: $scanJobId, fileHash: $file.hash, current: true, createdAt: $now, validFrom: $now})
          CREATE (n)-[:ABOUT]->(cf)`,
-      { projectKey, file: { ...file, version: file.version ?? null }, facts: facts.map((fx) => ({ ...fx, ...provenanceOf(fx), checkVersion: fx.checkVersion ?? null, relevance: relevanceOf(fx) })), source, now, scanJobId },
+      { projectKey, file: { ...file, version: file.version ?? null }, facts: facts.map((fx) => ({ ...fx, ...provenanceOf(fx), checkVersion: fx.checkVersion ?? null, relevance: relevanceOf(fx) })), source, now, scanJobId, run: run?.id ?? null, sandbox: !!run?.sandbox },
     );
   }
 
@@ -170,7 +171,7 @@ export class FactsRepo implements FactsStore {
       `MATCH (cf:CodeFile {projectKey: $projectKey}) WHERE cf.path IN $paths
        SET cf.removed = true
        WITH cf
-       OPTIONAL MATCH (x:Fact {current: true})-[:ABOUT]->(cf) WHERE coalesce(x.origin, '') <> 'you'
+       OPTIONAL MATCH (x:Fact {current: true})-[:ABOUT]->(cf) WHERE coalesce(x.origin, '') <> 'you' AND NOT coalesce(x.sandbox, false)
        SET x.current = false, x.validTo = $now`,
       { projectKey, paths, now: new Date().toISOString() },
     );
@@ -194,7 +195,7 @@ export class FactsRepo implements FactsStore {
     // so the next scan tries again instead of finding "nothing changed" over an empty project.
     await this.g.runInTransaction([
       // Facts read from your documents, and facts you wrote, are not the code's: a scan never closes them.
-      [`MATCH (x:Fact {projectKey: $projectKey, current: true}) WHERE x.docId IS NULL AND coalesce(x.origin, '') <> 'you'
+      [`MATCH (x:Fact {projectKey: $projectKey, current: true}) WHERE x.docId IS NULL AND coalesce(x.origin, '') <> 'you' AND NOT coalesce(x.sandbox, false)
           AND any(pre IN $prefixes WHERE pre = '' OR x.path = pre OR x.path STARTS WITH pre + '/')
           AND none(ex IN $except WHERE x.path = ex OR x.path STARTS WITH ex + '/')
         SET x.current = false, x.validTo = $now`, { projectKey, now, prefixes: scope.prefixes, except: scope.except }],
@@ -488,6 +489,19 @@ export class FactsRepo implements FactsStore {
       { now: now.toISOString(), exclude },
     );
     return r ? jobOf(r.get('j').properties) : null;
+  }
+
+  async claimQueuedScan(id: string): Promise<boolean> {
+    return conditionalWrite(this.g, async query => (await query(`MATCH (j:ScanJob {id: $id})
+      SET j.scanControlLock = true REMOVE j.scanControlLock WITH j
+      WHERE j.status = 'queued' SET j.status = 'running', j.startedAt = $now RETURN j.id`, { id, now: new Date().toISOString() })).length > 0, Boolean);
+  }
+
+  async cancelQueuedScan(id: string): Promise<boolean> {
+    return conditionalWrite(this.g, async query => (await query(`MATCH (j:ScanJob {id: $id})
+      SET j.scanControlLock = true REMOVE j.scanControlLock WITH j
+      WHERE j.status = 'queued' SET j.status = 'failed', j.error = 'Cancelled by you before the scan started',
+      j.finishedAt = $now REMOVE j.retryAt RETURN j.id`, { id, now: new Date().toISOString() })).length > 0, Boolean);
   }
 
   async requeueScanJob(id: string, now = new Date()): Promise<void> {

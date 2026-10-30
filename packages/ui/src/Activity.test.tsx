@@ -197,3 +197,14 @@ test('filters by run: the entries of that one run, whatever the hide setting', a
   expect(urls).toContain('/api/activity?run=run-1&limit=300');
   expect(screen.queryByText(rows[1].subject)).toBeNull();
 });
+
+
+test('repeated scan retry entries can collapse without deleting historical entries', async () => {
+  const retry = { ...rows[0], kind: 'scan_finished', subject: 'scan parked: provider unavailable', why: 'retry with backoff', details: {} };
+  vi.stubGlobal('fetch', vi.fn(async (url: string) => Response.json(url.startsWith('/api/activity') ? [{ ...retry, id: 'r2' }, { ...retry, id: 'r1' }] : [])));
+  render(<Activity />);
+  expect(await screen.findByText(/1 repeated scan retry entries collapsed/)).toBeTruthy();
+  expect(screen.getAllByText('scan parked: provider unavailable')).toHaveLength(1);
+  fireEvent.click(screen.getByRole('checkbox', { name: 'Collapse repeated scan retries' }));
+  expect(screen.getAllByText('scan parked: provider unavailable')).toHaveLength(2);
+});

@@ -70,7 +70,7 @@ function setup(o: { roots?: number; selection?: ProjectSelection; snapshot?: Can
   return { app, log, deleted, locked, forgotten, sel: () => sel, saved: () => saved };
 }
 
-const ui = { origin: 'http://localhost', 'content-type': 'application/json' };
+const ui = { 'sec-fetch-site': 'same-origin', origin: 'http://localhost', 'content-type': 'application/json' };
 const put = (body: unknown, headers: Record<string, string> = ui) => ({ method: 'PUT', headers, body: JSON.stringify(body) });
 
 test('GET lists every candidate folder with its sessions, selection, exclusion, alias and data', async () => {
@@ -105,7 +105,7 @@ test('PUT is yours alone: from the UI, as JSON', async () => {
   const { app } = setup();
   expect((await app.request('/api/settings/projects', put({ tracked: ['demo-shop'] }, { 'content-type': 'application/json' }))).status).toBe(403);
   expect((await app.request('/api/settings/projects', put({ tracked: ['demo-shop'] }, { origin: 'http://evil.example', 'content-type': 'application/json' }))).status).toBe(403);
-  expect((await app.request('/api/settings/projects', { method: 'PUT', headers: { origin: 'http://localhost' }, body: '{}' })).status).toBe(415);
+  expect((await app.request('/api/settings/projects', { method: 'PUT', headers: { 'sec-fetch-site': 'same-origin', origin: 'http://localhost' }, body: '{}' })).status).toBe(415);
 });
 
 test('PUT saves the selection, logs who changed what and why, and returns the new list', async () => {

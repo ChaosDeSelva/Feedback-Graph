@@ -4,12 +4,12 @@ const repo = { listCandidates: async () => [], stats: async () => [], candidateD
 
 test('real session registration needs a run and refuses retagging', async () => {
   const claims: unknown[] = [];
-  const app = createApp(repo, { sessions: { projects: () => [], inScope: () => true, store: {
+  const app = createApp(repo, { auth: { operator: { token: 'o'.repeat(32), allow: [] } }, sessions: { projects: () => [], inScope: () => true, store: {
     list: async () => ({ sessions: [], next: null }), detail: async () => null, requestRebuild: async () => false,
     claimRun: async (id, run) => { claims.push([id, run]); return id !== 'existing'; },
   } } });
   const send = (id: string, labelled: boolean) => app.request(`/api/sessions/${id}/run`, {
-    method: 'POST', headers: { 'content-type': 'application/json', ...(labelled && { 'x-fg-run': 'test-1', 'x-fg-sandbox': '1' }) }, body: '{}',
+    method: 'POST', headers: { authorization: `Bearer ${'o'.repeat(32)}`, 'x-fg-run-key': 'session-registration-private-key-123456789', 'content-type': 'application/json', ...(labelled && { 'x-fg-run': 'test-1', 'x-fg-sandbox': '1' }) }, body: '{}',
   });
   expect((await send('new-session', false)).status).toBe(400);
   expect(claims).toEqual([]);

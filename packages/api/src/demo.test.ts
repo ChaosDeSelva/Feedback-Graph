@@ -1,5 +1,5 @@
 import { Hono } from 'hono';
-import type { ActivityInput, DemoMiss, LessonInput, SessionFile } from '@fb/core';
+import type { ActivityInput, DemoMiss, LessonInput, SessionFile, RunTag } from '@fb/core';
 import { describe, expect, test } from 'vitest';
 import { DEMO_CORPUS, DEMO_PROJECT, demoRoutes, removeDemo, seedDemo, type DemoDeps } from './demo.ts';
 import { runIn } from './operator.ts';
@@ -10,7 +10,7 @@ function deps(over: Partial<DemoDeps> = {}) {
   const lessons: LessonInput[] = [];
   const misses: DemoMiss[] = [];
   const touched: [string, SessionFile[]][] = [];
-  const facts: { key: string; path: string; source: string; statements: string[] }[] = [];
+  const facts: { key: string; path: string; source: string; statements: string[]; run?: RunTag | null }[] = [];
   const activity: ActivityInput[] = [];
   const d: DemoDeps = {
     knowledge: {
@@ -20,7 +20,7 @@ function deps(over: Partial<DemoDeps> = {}) {
     },
     facts: {
       listFacts: async () => [],
-      saveFileFacts: async (key, file, fx, source) => { facts.push({ key, path: file.path, source, statements: fx.map((f) => f.statement) }); },
+      saveFileFacts: async (key, file, fx, source, _job, run) => { facts.push({ key, path: file.path, source, run, statements: fx.map((f) => f.statement) }); },
     },
     codegraph: { recordSessionFiles: async (id, files) => { touched.push([id, files]); } },
     embed: async (texts) => texts.map(() => [1, 0]),
@@ -142,7 +142,7 @@ test('removeDemo says when the project node the seed created went with it', asyn
 });
 
 describe('routes', () => {
-  const app = (t: ReturnType<typeof deps>, allow: string[] = []) => {
+  const app = (t: ReturnType<typeof deps>, allow: string[] = ['demo']) => {
     const a = new Hono();
     demoRoutes(a, t.d, { operator: { token: OP, allow: allow as never } });
     return a;
@@ -162,7 +162,7 @@ describe('routes', () => {
   test('without the operator token only the owner in the UI may seed (a local client sending no Origin is refused)', async () => {
     const t = deps();
     expect((await app(t).request('/api/demo/seed', post('/api/demo/seed', {}))).status).toBe(403);
-    expect((await app(t).request('/api/demo/seed', post('/api/demo/seed', { project: 'acme' }, { origin: 'http://localhost:8787' }))).status).toBe(200);
+    expect((await app(t).request('/api/demo/seed', post('/api/demo/seed', { project: 'acme' }, { 'sec-fetch-site': 'same-origin', origin: 'http://localhost:8787' }))).status).toBe(200);
     expect((await app(t).request('/api/demo/remove', post('/api/demo/remove', {}, bearer))).status).toBe(200);
   });
 
@@ -190,4 +190,22 @@ test('demo seed provides a literal no-console rule in a dedicated file without a
   const t = deps();
   await seedDemo({}, t.d);
   expect(t.lessons.find(l => l.id.endsWith(':no-console-probe'))).toMatchObject({ projectKey: DEMO_PROJECT, source: 'demo', status: 'approved', rule: 'Do not call console.log in src/probes/no-console.ts.', paths: ['src/probes/no-console.ts'] });
+});
+
+
+test('an explicit operator allowlist cannot bypass demo permission', async () => {
+  const app = new Hono(); const t = deps();
+  demoRoutes(app, t.d, { operator: { token: OP, allow: [] } });
+  const res = await app.request('/api/demo/seed', { method: 'POST', headers: { authorization: `Bearer ${OP}`, 'content-type': 'application/json' }, body: '{}' });
+  expect(res.status).toBe(403); expect(t.lessons).toEqual([]);
+});
+
+
+test('concurrent demo seeds use independent run ids and tag every fact', async () => {
+  const t = deps();
+  await Promise.all(['one', 'two'].map(id => runIn({ id, sandbox: true }, () => seedDemo({}, t.d))));
+  expect(new Set(t.lessons.map(l => l.id)).size).toBe(DEMO_CORPUS.lessons.length * 2);
+  expect(new Set(t.misses.map(m => m.id)).size).toBe(2);
+  expect(t.facts.filter(f => f.run?.id === 'one')).toHaveLength(3);
+  expect(t.facts.filter(f => f.run?.id === 'two')).toHaveLength(3);
 });

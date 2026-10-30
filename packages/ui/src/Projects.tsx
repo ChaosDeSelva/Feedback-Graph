@@ -113,6 +113,15 @@ export function Projects({ pollMs = 5000 }: { pollMs?: number } = {}) {
     }
   }
 
+  async function cancelScan(replace = false) {
+    if (!current?.lastScan) return;
+    try {
+      await api.cancelScan(current.key, current.lastScan.id);
+      if (replace) await scan();
+      else await load();
+    } catch (e) { setError(String(e)); }
+  }
+
   async function pin(p: ProjectSummary) {
     try {
       await api.pinProject(p.key, !p.pinned);
@@ -197,16 +206,20 @@ export function Projects({ pollMs = 5000 }: { pollMs?: number } = {}) {
                   <Select aria-label="provider" value={provider} onChange={(e) => setProvider(e.target.value)} className="w-56">
                     {PROVIDERS.map((p) => <option key={p.value} value={p.value}>{p.label}</option>)}
                   </Select>
-                  <Button variant="primary" onClick={scan} disabled={!!scanning}>Scan</Button>
+                  <Button variant="primary" onClick={scan} disabled={!!scanning} title={scanning ? current.lastScan?.error || `Scan ${current.lastScan?.status}; wait for completion or cancel a queued scan` : undefined}>Scan</Button>
+                  {current.lastScan?.status === 'queued' && <>
+                    <Button onClick={() => cancelScan()}>Cancel queued scan</Button>
+                    <Button onClick={() => cancelScan(true)}>Switch provider and scan</Button>
+                  </>}
                 </div>
               </header>
 
               <StatGrid className="grid-cols-2 sm:grid-cols-4">
-                <StatTile label="sessions" value={current.sessions} hint="read from this folder" />
+                <StatTile label="sessions" value={current.sessions} hint="all stored session records, including synced comment threads and manual reports; Sessions lists agent work sessions" />
                 <StatTile label="feedback" value={current.feedback} hint="pushback flagged" />
                 <StatTile label="lessons" value={current.lessons} hint="drawn from confirmed misses" />
                 {current.factsByOrigin
-                  ? <StatTile label="facts" value={current.factsByOrigin.model} hint={`read from the code by a model; ${current.factsByOrigin.manifest} from manifests, ${current.factsByOrigin.document} from documents${current.factsByOrigin.you ? `, ${current.factsByOrigin.you} you wrote` : ''}`} />
+                  ? <StatTile label="facts" value={current.facts} hint={`${current.factsByOrigin.model} from code models; ${current.factsByOrigin.manifest} from manifests, ${current.factsByOrigin.document} from documents${current.factsByOrigin.you ? `, ${current.factsByOrigin.you} you wrote` : ''}`} />
                   : <StatTile label="facts" value={current.facts} hint="extracted from the code" />}
               </StatGrid>
 

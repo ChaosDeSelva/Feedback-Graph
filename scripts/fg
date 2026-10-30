@@ -45,12 +45,23 @@ if command -v docker >/dev/null 2>&1; then
   fi
 fi
 
+if [ -n "${FEEDBACK_GRAPH_URL:-}" ]; then
+  local_port="$(setting API_PORT)"; expected_url="http://localhost:${local_port:-8787}"
+  if [ "${FEEDBACK_GRAPH_URL%/}" != "$expected_url" ] && [ "${FEEDBACK_GRAPH_URL%/}" != "${expected_url/localhost/127.0.0.1}" ]; then
+    echo "WARNING: FEEDBACK_GRAPH_URL overrides this checkout's $expected_url; unset it to address this install." >&2
+  fi
+fi
+if [ "${1:-}" = status ] && command -v docker >/dev/null 2>&1; then
+  . "$here/scripts/lib/env.sh"
+  export FG_DATABASE_MEMORY="$(database_memory docker compose --project-directory "$here")"
+fi
+
 native_ts() {
   command -v node >/dev/null 2>&1 &&
     node -e 'const [a,b]=process.versions.node.split(".").map(Number);process.exit(a>23||(a===23&&b>=6)||(a===22&&b>=18)?0:1)' 2>/dev/null
 }
 
-if native_ts; then
+if native_ts && (cd "$here/packages/api" && node --input-type=module -e 'import.meta.resolve("@fb/core")' >/dev/null 2>&1); then
   if [ -z "${FEEDBACK_GRAPH_URL:-}" ]; then
     port="$(setting API_PORT)"
     export FEEDBACK_GRAPH_URL="http://localhost:${port:-8787}"
@@ -59,9 +70,12 @@ if native_ts; then
     exec node "$here/packages/api/src/cli.ts" "$@"
 fi
 
+if native_ts; then
+  echo 'fg: local workspace dependencies are missing; using the API container (or run pnpm install).' >&2
+fi
 if command -v docker >/dev/null 2>&1; then
   # Inside the container the API is on localhost:8787 and FG_OPERATOR_TOKEN comes from compose (.env).
-  exec docker compose --project-directory "$here" exec -T ${FG_OPERATOR_NAME:+-e FG_OPERATOR_NAME="$FG_OPERATOR_NAME"} api node src/cli.ts "$@"
+  exec docker compose --project-directory "$here" exec -T -e "FG_DATABASE_MEMORY=${FG_DATABASE_MEMORY:-}" ${FEEDBACK_GRAPH_URL:+-e FEEDBACK_GRAPH_URL} ${FG_OPERATOR_NAME:+-e FG_OPERATOR_NAME="$FG_OPERATOR_NAME"} api node src/cli.ts "$@"
 fi
 
 echo "fg needs Node 22.18+ (or 23.6+) on the host, or docker to run it inside the api container" >&2

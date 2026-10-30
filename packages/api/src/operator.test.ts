@@ -55,7 +55,7 @@ test('the operator token passes the owner-only gate and the write is logged as t
 
 test('the browser is still you, and a bare local client is still refused', async () => {
   const { app, logged } = setup();
-  expect((await app.request('/api/candidates/c1/decision', call('POST', { status: 'confirmed' }, { origin: 'http://localhost' }))).status).toBe(204);
+  expect((await app.request('/api/candidates/c1/decision', call('POST', { status: 'confirmed' }, { 'sec-fetch-site': 'same-origin', origin: 'http://localhost' }))).status).toBe(204);
   expect(logged[0].actor).toBe('you');
   expect((await app.request('/api/candidates/c1/decision', call('POST', { status: 'confirmed' }))).status).toBe(403);
 });
@@ -108,7 +108,7 @@ test('a lesson an allowed agent approves is marked as approved by that agent', a
 
 test('the owner approving from the UI is recorded as you', async () => {
   const { app, updates } = setup();
-  expect((await app.request('/api/lessons/l1', call('PATCH', { status: 'approved' }, { origin: 'http://localhost' }))).status).toBe(200);
+  expect((await app.request('/api/lessons/l1', call('PATCH', { status: 'approved' }, { 'sec-fetch-site': 'same-origin', origin: 'http://localhost' }))).status).toBe(200);
   expect(updates[0][2]).toEqual(expect.objectContaining({ by: 'you' }));
 });
 
@@ -215,7 +215,7 @@ test('in the UI the same writes still say you', async () => {
       projectDirs: async () => [{ key: 'shop', name: 'shop', repoPath: '/vibe/shop' }],
     },
   });
-  await app.request('/api/projects/shop/pin', call('PUT', { pinned: true }, { origin: 'http://localhost' }));
+  await app.request('/api/projects/shop/pin', call('PUT', { pinned: true }, { 'sec-fetch-site': 'same-origin', origin: 'http://localhost' }));
   expect(logged[0].why).toMatch(/^you pinned it/);
 });
 
@@ -242,7 +242,7 @@ test('a wrong bearer on a read is 401 with a log line, whichever token is config
 test('Activity records how a write arrived: via the operator token or from a browser', async () => {
   const { app, logged } = setup({ extra: { facts: { listProjects: async () => [], requestScan: async () => ({}) as never, listFacts: async () => [], searchFacts: async () => [], setPinned: async () => {} } as never, projectDirs: async () => [{ key: 'shop', name: 'shop', repoPath: '/vibe/shop' }] } });
   await app.request('/api/projects/shop/pin', call('PUT', { pinned: true }, bearer(OP, 'codex')));
-  await app.request('/api/projects/shop/pin', call('PUT', { pinned: false }, { origin: 'http://localhost' }));
+  await app.request('/api/projects/shop/pin', call('PUT', { pinned: false }, { 'sec-fetch-site': 'same-origin', origin: 'http://localhost' }));
   expect(logged.map((e) => [e.actor, e.details?.via])).toEqual([['operator:codex', 'operator'], ['you', 'browser']]);
 });
 
@@ -251,7 +251,7 @@ test('a link decision records who made it on the link itself', async () => {
   const links = { listLinks: async () => [], deleteLink: async () => true, setLink: async (_a: string, _b: string, p: unknown) => { patches.push(p); return { id: 'link:shop|web', a: 'shop', b: 'web', status: 'confirmed', relation: 'related' }; } };
   const { app } = setup({ extra: { links: links as never } });
   await app.request('/api/links', call('PUT', { a: 'shop', b: 'web', status: 'confirmed' }, bearer(OP, 'codex')));
-  await app.request('/api/links', call('PUT', { a: 'shop', b: 'web', status: 'dismissed' }, { origin: 'http://localhost' }));
+  await app.request('/api/links', call('PUT', { a: 'shop', b: 'web', status: 'dismissed' }, { 'sec-fetch-site': 'same-origin', origin: 'http://localhost' }));
   expect(patches).toEqual([{ status: 'confirmed', decidedBy: 'operator:codex' }, { status: 'dismissed', decidedBy: 'you' }]);
 });
 

@@ -1,5 +1,5 @@
 import { conditionalWrite } from './conditionalWrite.ts';
-import { archiveBeforeRedaction, archiveRedactionInput } from '@fb/core';
+import { archiveRunFileSelector, archiveBeforeRedaction, archiveRedactionInput } from '@fb/core';
 import { randomUUID } from 'node:crypto';
 import type pg from 'pg';
 import { clampRelevance, DEMO_SOURCE, FACT_EVIDENCE, factOrigin, requestTimes, scanRequestPaths, MANIFEST_WHY_RE, PROJECT_PATH, provenanceOf, holdsCredential, REDACT_PAGE, redactDeep, redactSecrets, relevanceOf, SCAN_UNAVAILABLE_WAIT_MS, scanRetryAt, redactStoredFact, reopensAsFact } from '@fb/core';
@@ -57,11 +57,12 @@ export class PgFactsStore implements FactsStore {
   }
 
   /** Replace the current facts of one file (old facts are closed, not deleted). */
-  async saveFileFacts(projectKey: string, rawFile: ScannedFile & { summary: string }, rawFacts: EmbeddedFact[], source: string, scanJobId: string | null = null): Promise<void> {
+  async saveFileFacts(projectKey: string, rawFile: ScannedFile & { summary: string }, rawFacts: EmbeddedFact[], source: string, scanJobId: string | null = null, run: RunTag | null = null): Promise<void> {
     // Facts are model output about code that may contain credentials: redact at the door.
     const file = redactDeep(rawFile);
     const facts = redactDeep(rawFacts);
-    await archiveRedactionInput('facts', projectKey, { file: rawFile, facts: rawFacts }, { file, facts });
+    await archiveRedactionInput('facts', projectKey, { file: rawFile, facts: rawFacts }, { file, facts }, [{ kind: 'project', id: projectKey }, ...(run ? [{ kind: 'run', id: run.id }, archiveRunFileSelector(run.id, projectKey, file.path)] : [])]);
+    sandboxPresence(this.db).wrote(run);
     const now = new Date();
     const cf = fileId(projectKey, file.path);
     // One Cypher statement in Neo4j, so all or nothing here too.
@@ -75,8 +76,8 @@ export class PgFactsStore implements FactsStore {
            ${HASH_CHANGED}`}`,
         [cf, projectKey, file.path, file.hash, file.summary, now, file.version ?? null],
       );
-      await c.query(`UPDATE facts SET current = false, valid_to = $2 WHERE code_file_id = $1 AND current AND origin IS DISTINCT FROM 'you'`, [cf, now]);
-      await insertFacts(c, projectKey, facts.map((fx) => ({ ...fx, codeFileId: cf })), source, scanJobId, now, file.hash);
+      await c.query(`UPDATE facts SET current = false, valid_to = $2 WHERE code_file_id = $1 AND current AND origin IS DISTINCT FROM 'you' AND run IS NOT DISTINCT FROM $3`, [cf, now, run?.id ?? null]);
+      await insertFacts(c, projectKey, facts.map((fx) => ({ ...fx, codeFileId: cf })), source, scanJobId, now, file.hash, run);
     });
   }
 
@@ -89,7 +90,7 @@ export class PgFactsStore implements FactsStore {
         [projectKey, paths],
       );
       if (!rows.length) return;
-      await c.query(`UPDATE facts SET current = false, valid_to = $2 WHERE code_file_id = ANY($1::text[]) AND current AND origin IS DISTINCT FROM 'you'`, [rows.map((r) => r.id), now]);
+      await c.query(`UPDATE facts SET current = false, valid_to = $2 WHERE code_file_id = ANY($1::text[]) AND current AND origin IS DISTINCT FROM 'you' AND NOT coalesce(sandbox, false)`, [rows.map((r) => r.id), now]);
     });
   }
 
@@ -111,7 +112,7 @@ export class PgFactsStore implements FactsStore {
     await tx(this.db, async (c) => {
       // Facts read from your documents, and facts you wrote, are not the code's: a scan never closes them.
       await c.query(
-        `UPDATE facts x SET current = false, valid_to = $2 WHERE x.project_key = $1 AND x.current AND x.doc_id IS NULL AND x.origin IS DISTINCT FROM 'you'
+        `UPDATE facts x SET current = false, valid_to = $2 WHERE x.project_key = $1 AND x.current AND x.doc_id IS NULL AND x.origin IS DISTINCT FROM 'you' AND NOT coalesce(x.sandbox, false)
            AND EXISTS (SELECT 1 FROM unnest($3::text[]) AS p(pre) WHERE p.pre = '' OR x.path = p.pre OR left(x.path, length(p.pre) + 1) = p.pre || '/')
            AND NOT EXISTS (SELECT 1 FROM unnest($4::text[]) AS e(ex) WHERE x.path = e.ex OR left(x.path, length(e.ex) + 1) = e.ex || '/')`,
         [projectKey, now, scope.prefixes, scope.except],
@@ -386,6 +387,17 @@ export class PgFactsStore implements FactsStore {
     return r ? jobOf(r) : null;
   }
 
+  async claimQueuedScan(id: string): Promise<boolean> {
+    return conditionalWrite(this.db, async query => ((await query(`UPDATE scan_jobs SET status = 'running', started_at = $2
+      WHERE id = $1 AND status = 'queued' RETURNING id`, [id, new Date()])).rowCount ?? 0) > 0, Boolean);
+  }
+
+  async cancelQueuedScan(id: string): Promise<boolean> {
+    return conditionalWrite(this.db, async query => ((await query(`UPDATE scan_jobs SET status = 'failed',
+      error = 'Cancelled by you before the scan started', finished_at = $2, retry_at = NULL
+      WHERE id = $1 AND status = 'queued' RETURNING id`, [id, new Date()])).rowCount ?? 0) > 0, Boolean);
+  }
+
   async requeueScanJob(id: string, now = new Date()): Promise<void> {
     await this.db.pool.query(`UPDATE scan_jobs SET status = 'queued', served_at = $2 WHERE id = $1 AND status IN ('queued', 'running')`, [id, now]);
   }
@@ -488,14 +500,14 @@ type FactRow = EmbeddedFact & { codeFileId: string };
  * Insert new current facts in one statement. fileHash null takes each fact's CodeFile hash as it stands
  * (replaceProjectFacts' `fileHash: cf.hash`); otherwise every fact gets that hash.
  */
-async function insertFacts(c: Exec, projectKey: string, facts: FactRow[], source: string, scanJobId: string | null, now: Date, fileHash: string | null) {
+async function insertFacts(c: Exec, projectKey: string, facts: FactRow[], source: string, scanJobId: string | null, now: Date, fileHash: string | null, run: RunTag | null = null) {
   if (!facts.length) return;
   await c.query(
     `INSERT INTO facts (id, project_key, code_file_id, kind, statement, path, lines, confidence, why, source, scan_job_id,
-                        file_hash, current, created_at, valid_from, embedding, relevance, relevance_by, origin, evidence, check_version)
+                        file_hash, current, created_at, valid_from, embedding, relevance, relevance_by, origin, evidence, check_version, run, sandbox)
      SELECT n.id, $1, n.code_file_id, n.kind, n.statement, n.path, n.lines, n.confidence, n.why, $2, $3,
             CASE WHEN $4::boolean THEN $5 ELSE cf.hash END, true, $6, $6, n.embedding::vector,
-            n.relevance, CASE WHEN n.relevance IS NULL THEN NULL ELSE 'model' END, n.origin, n.evidence, n.check_version
+            n.relevance, CASE WHEN n.relevance IS NULL THEN NULL ELSE 'model' END, n.origin, n.evidence, n.check_version, $20, $21
      FROM unnest($7::text[], $8::text[], $9::text[], $10::text[], $11::text[], $12::text[], $13::float8[], $14::text[], $15::text[], $16::float8[], $17::text[], $18::text[], $19::text[])
             WITH ORDINALITY AS n(id, code_file_id, kind, statement, path, lines, confidence, why, embedding, relevance, origin, evidence, check_version, ord)
      LEFT JOIN code_files cf ON cf.id = n.code_file_id
@@ -514,7 +526,7 @@ async function insertFacts(c: Exec, projectKey: string, facts: FactRow[], source
       facts.map((f) => relevanceOf(f)),
       facts.map((f) => provenanceOf(f).origin),
       facts.map((f) => provenanceOf(f).evidence),
-      facts.map((f) => f.checkVersion ?? null),
+      facts.map((f) => f.checkVersion ?? null), run?.id ?? null, !!run?.sandbox,
     ],
   );
 }

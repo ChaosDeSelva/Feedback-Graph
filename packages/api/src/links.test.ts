@@ -23,7 +23,7 @@ function setup(links: ProjectLink[] = [link('api', 'game', 'suggested'), link('g
   return { app, calls, activity };
 }
 
-const json = (method: string, body: object) => ({ method, headers: { 'content-type': 'application/json', origin: 'http://localhost' }, body: JSON.stringify(body) });
+const json = (method: string, body: object) => ({ method, headers: { 'content-type': 'application/json', 'sec-fetch-site': 'same-origin', origin: 'http://localhost' }, body: JSON.stringify(body) });
 
 test('GET /api/projects/:key/links lists the project links whose other end is shown', async () => {
   const { app } = setup();

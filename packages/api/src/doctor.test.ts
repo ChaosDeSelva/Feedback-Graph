@@ -14,6 +14,8 @@ const repoRoot = fileURLToPath(new URL('../../../', import.meta.url));
 
 type World = {
   dockerUp?: boolean;
+  shellUrl?: string;
+  memory?: { used: number; limit: number; swap: number };
   runnerSandbox?: boolean;
   /** Ports something listens on, and which of them this stack publishes. */
   listening?: number[];
@@ -66,6 +68,7 @@ case "$*" in
     for p in ${ours.join(' ')}; do
       case "$svc:$inner:$p" in api:8787:8787 | neo4j:7474:7476 | neo4j:7687:7689 | postgres:5432:5434) echo "127.0.0.1:$p"; exit 0 ;; esac
     done; exit 1 ;;
+  *"memory.current"*) ${w.memory ? `printf 'memory.current=${w.memory.used}\\nmemory.max=${w.memory.limit}\\nmemory.swap.current=${w.memory.swap}\\n'` : "true"} ;;
   *"/health"*) echo "${w.runnerSandbox === false ? "Can't mount proc /proc: Operation not permitted" : "ok"}"; exit ${w.runnerSandbox === false ? 1 : 0} ;;
   *"dns"*) exit ${w.dnsInWorker === false ? 1 : 0} ;;
   *"OLLAMA_URL"*) exit ${w.ollama === false ? 1 : 0} ;;
@@ -88,7 +91,7 @@ esac`,
     try { return readFileSync(join(base, 'chat-args'), 'utf8'); } catch { return ''; }
   };
   try {
-    const out = execFileSync('bash', [join(repo, 'scripts', 'doctor.sh')], { env: { PATH: `${bin}:/usr/bin:/bin`, HOME: home }, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] });
+    const out = execFileSync('bash', [join(repo, 'scripts', 'doctor.sh')], { env: { PATH: `${bin}:/usr/bin:/bin`, HOME: home, ...(w.shellUrl ? { FEEDBACK_GRAPH_URL: w.shellUrl } : {}) }, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] });
     return { out, code: 0, chatArgs: chatArgs() };
   } catch (e) {
     const x = e as { stdout?: string; status?: number };
@@ -205,4 +208,16 @@ test('configured runner health requires its actual sandbox probe to succeed', ()
   const healthy = doctor({ env, runnerSandbox: true });
   expect(healthy.code).toBe(0);
   expect(healthy.out).toContain('PASS  Codex runner: its nested sandbox starts successfully');
+});
+
+
+test('doctor warns about a shell URL targeting another install and unrestricted operators', () => {
+  const checked = doctor({ env: 'API_PORT=8797\nOPERATOR_ALLOW=all\n', shellUrl: 'http://localhost:8787' });
+  expect(checked.out).toContain('FEEDBACK_GRAPH_URL overrides this install (http://localhost:8797)');
+  expect(checked.out).toContain('OPERATOR_ALLOW=all');
+});
+
+test('doctor reports actual cgroup memory, swap and low headroom', () => {
+  const checked = doctor({ memory: { used: 950 * 1048576, limit: 1024 * 1048576, swap: 16 * 1048576 } });
+  expect(checked.out).toContain('WARN  Neo4j memory: 950 MiB used / 1024 MiB limit; 74 MiB headroom; 16 MiB swap');
 });

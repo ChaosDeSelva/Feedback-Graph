@@ -1,4 +1,4 @@
-import { EXPORT_FORMAT, type Activity, type ActivityInput, type CloudConfig, type ExportBundle, type WorkerStatus } from '@fb/core';
+import { storedSyncMemory, EXPORT_FORMAT, type Activity, type ActivityInput, type CloudConfig, type ExportBundle, type WorkerStatus } from '@fb/core';
 import { expect, test, vi } from 'vitest';
 import { createApp, type ApiRepo } from './app.ts';
 import type { CloudDeps } from './cloud.ts';
@@ -34,7 +34,7 @@ function deps(o: Partial<CloudDeps> = {}) {
   return { d, log, fetchCalls };
 }
 
-const post = (origin?: string) => ({ method: 'POST', body: '{}', headers: { 'content-type': 'application/json', ...(origin ? { origin } : {}) } });
+const post = (origin?: string) => ({ method: 'POST', body: '{}', headers: { 'content-type': 'application/json', ...(origin ? { origin, 'sec-fetch-site': 'same-origin' } : {}) } });
 
 test('with cloud sync off, the card says so and Sync now refuses; nothing is sent', async () => {
   const { d, fetchCalls } = deps({ cloud: null });
@@ -166,7 +166,7 @@ test('local-only settings are owner protected, durable, and prevent forced manua
   const localOnlyStore = { getCursor: async (key: string) => saved.get(key) ?? null, setCursor: async (key: string, value: string) => { saved.set(key, value); } };
   const { d, fetchCalls } = deps({ localOnlyStore });
   const app = createApp(repo, { cloud: d });
-  const request = (origin?: string) => ({ method: 'PUT', body: JSON.stringify({ projects: ['shop'] }), headers: { 'content-type': 'application/json', ...(origin ? { origin } : {}) } });
+  const request = (origin?: string) => ({ method: 'PUT', body: JSON.stringify({ projects: ['shop'] }), headers: { 'content-type': 'application/json', ...(origin ? { origin, 'sec-fetch-site': 'same-origin' } : {}) } });
   expect((await app.request('/api/cloud/local-only', request())).status).toBe(403);
   expect((await app.request('/api/cloud/local-only', request('http://localhost'))).status).toBe(200);
   expect((await (await app.request('/api/cloud')).json()).projects).toEqual([]);
@@ -189,7 +189,7 @@ test('only an explicit owner sharing setting converts a demo-created project, an
   expect(posts).toEqual([]);
   const preview = await (await app.request('/api/cloud')).json();
   expect(preview.preview.projects[0].reason).toContain('Created by demo seed');
-  const write = (origin?: string) => ({ method: 'PUT', body: JSON.stringify({ projects: [], shareDemoProjects: ['shop'] }), headers: { 'content-type': 'application/json', ...(origin ? { origin } : {}) } });
+  const write = (origin?: string) => ({ method: 'PUT', body: JSON.stringify({ projects: [], shareDemoProjects: ['shop'] }), headers: { 'content-type': 'application/json', ...(origin ? { origin, 'sec-fetch-site': 'same-origin' } : {}) } });
   expect((await app.request('/api/cloud/local-only', write())).status).toBe(403);
   expect(saved.size).toBe(0);
   expect((await app.request('/api/cloud/local-only', write('http://localhost'))).status).toBe(200);
@@ -197,4 +197,29 @@ test('only an explicit owner sharing setting converts a demo-created project, an
   expect(posts).toHaveLength(1);
   expect(posts[0]).not.toContain('demoCreated');
   expect(JSON.parse(posts[0]).projects).toEqual([{ key: 'shop', remote: 'github.com/acme/shop' }]);
+});
+
+
+test('cloud preview explains an unselected project without selecting or sending it', async () => {
+  const { d } = deps(); const app = createApp(repo, { cloud: { ...d, projects: async () => [] } });
+  const res = await app.request('/api/cloud?project=demo-shop');
+  expect(res.status).toBe(200);
+  const body = await res.json();
+  expect(body.projects).toEqual([]);
+  expect(body.preview.projects).toContainEqual({ key: 'demo-shop', counts: null, reason: expect.stringMatching(/not selected/) });
+});
+
+
+test('API restart restores last sync and manual status after Activity retention removes its entry', async () => {
+  const values = new Map<string, string>();
+  const docs = { getCursor: async (key: string) => values.get(key) ?? null, setCursor: async (key: string, value: string) => { values.set(key, value); },
+    deleteCursor: async (key: string) => { values.delete(key); }, cursorsWithPrefix: async (prefix: string) => [...values].filter(([key]) => key.startsWith(prefix)).map(([key, value]) => ({ key, value })) };
+  const { d, log } = deps({ memory: storedSyncMemory(docs, cloud) });
+  const first = createApp(repo, { cloud: d });
+  expect((await first.request('/api/cloud/sync', post('http://localhost'))).status).toBe(200);
+  log.splice(0);
+  const restarted = createApp(repo, { cloud: { ...d, memory: storedSyncMemory(docs, cloud) } });
+  expect((await (await restarted.request('/api/cloud')).json()).last).toMatchObject({ ok: true, trigger: 'manual', sent: { lessons: 1 } });
+  expect((await (await restarted.request('/api/cloud/progress')).json()).lastManual).toMatchObject({ ok: true, sent: { lessons: 1 } });
+  expect((await (await restarted.request('/api/status')).json()).cloud.lastManual).toMatchObject({ ok: true, sent: { lessons: 1 } });
 });

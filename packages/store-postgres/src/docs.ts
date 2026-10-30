@@ -1,5 +1,5 @@
 import { conditionalWrite } from './conditionalWrite.ts';
-import { archiveBeforeRedaction, archiveRedactionInput } from '@fb/core';
+import { archiveBeforeRedaction, archiveRedactionInput, purgeRedactionOriginals } from '@fb/core';
 import { randomUUID } from 'node:crypto';
 import { docIdOf, runWriteOwner, REDACT_PAGE, redactDeep, redactSecrets, relevanceOf, scanRetryAt, SCAN_UNAVAILABLE_WAIT_MS } from '@fb/core';
 import type { DocHit, DocInput, DocLink, DocListOpts, DocSummary, DocsStore, DocToRead, EmbeddedFact, TaskImage, UpsertDocOpts } from '@fb/core';
@@ -19,7 +19,7 @@ export class PgDocsStore implements DocsStore {
     // Docs come from outside (uploads, PRs, tickets): redact here so no caller can skip it.
     const doc = { ...input, title: redactSecrets(input.title), ref: redactSecrets(input.ref) };
     const chunks = raw.map((c) => ({ ...c, text: redactSecrets(c.text) }));
-    await archiveRedactionInput('document', `${input.projectKey}:${input.source}:${input.ref}`, { doc: input, chunks: raw }, { doc, chunks });
+    await archiveRedactionInput('document', `${input.projectKey}:${input.source}:${input.ref}`, { doc: input, chunks: raw }, { doc, chunks }, [{ kind: 'project', id: input.projectKey }, { kind: 'doc', id: docIdOf(doc, o.run) }, ...(o.run ? [{ kind: 'run', id: o.run.id }] : [])]);
     const id = docIdOf(doc, o.run);
     sandboxPresence(this.db).wrote(o.run);
     await tx(this.db, async (c) => {
@@ -210,11 +210,18 @@ export class PgDocsStore implements DocsStore {
   }
 
   async deleteDoc(id: string, o: { run?: string | null } = {}): Promise<boolean> {
-    return conditionalWrite(this.db, async query => {
+    const selectors: { kind: string; id: string }[] = [];
+    const removed = await conditionalWrite(this.db, async query => {
+      const { rows } = await query(`SELECT 'doc' AS kind, d.id FROM docs d WHERE d.id = $1 AND ($2::text IS NULL OR d.run = $2)
+        UNION ALL SELECT 'chunk', c.id FROM chunks c JOIN docs d ON d.id = c.doc_id WHERE d.id = $1 AND ($2::text IS NULL OR d.run = $2)
+        UNION ALL SELECT 'fact', f.id FROM facts f JOIN docs d ON d.id = f.doc_id WHERE d.id = $1 AND ($2::text IS NULL OR d.run = $2)`, [id, o.run ?? null]);
+      selectors.push(...rows.map(row => ({ kind: String(row.kind), id: String(row.id) })));
       // Chunks go with their doc (ON DELETE CASCADE).
       const { rowCount } = await query('DELETE FROM docs WHERE id = $1 AND ($2::text IS NULL OR run = $2)', [id, o.run ?? null]);
       return (rowCount ?? 0) > 0;
     }, Boolean);
+    if (removed) await purgeRedactionOriginals(selectors);
+    return removed;
   }
 
   async linkedDocs(q: { projectKey: string; docIds: string[]; run?: string | null }): Promise<DocLink[]> {

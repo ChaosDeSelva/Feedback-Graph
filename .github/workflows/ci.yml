@@ -10,7 +10,7 @@ jobs:
     timeout-minutes: 20
     services:
       neo4j:
-        image: neo4j:5.26-community
+        image: neo4j:5.26-community@sha256:249a1ec6e3c52d82101a5ed33d6ed2b5ed5b0017b21a28c0bfebc335e87fb177
         env:
           NEO4J_AUTH: neo4j/testpassword
         ports: ["7688:7687"]
@@ -18,7 +18,7 @@ jobs:
           --health-cmd "wget -qO- http://localhost:7474 >/dev/null || exit 1"
           --health-interval 5s --health-retries 40
       postgres:
-        image: pgvector/pgvector:0.8.7-pg17
+        image: pgvector/pgvector:0.8.7-pg17@sha256:ac08538c6f8b9904c33c8224c5e5706dbe760aca29db1d096972b4052c22a75d
         env:
           POSTGRES_USER: fg
           POSTGRES_PASSWORD: fg

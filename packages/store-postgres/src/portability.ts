@@ -1,4 +1,4 @@
-import { EXPORT_FORMAT, VERSION, type Cause, type ExportBundle, type Lesson, type PortabilityStore } from '@fb/core';
+import { purgeRedactionOriginals, EXPORT_FORMAT, VERSION, type Cause, type ExportBundle, type Lesson, type PortabilityStore } from '@fb/core';
 import type pg from 'pg';
 import { PgCodeGraphStore } from './codegraph.ts';
 import { iso, tx, type Db } from './db.ts';
@@ -160,10 +160,17 @@ export class PgPortabilityStore implements PortabilityStore {
 
   /** Remove a project and everything learned from it, in one transaction. Returns how many records were deleted. */
   async deleteProject(key: string): Promise<number> {
-    return tx(this.db, async (c) => {
+    const selectors: { kind: string; id: string }[] = [{ kind: 'project', id: key }];
+    const removed = await tx(this.db, async (c) => {
+      for (const [table, kind] of [['facts', 'fact'], ['docs', 'doc'], ['chunks', 'chunk'], ['lessons', 'lesson'], ['feedback', 'feedback']]) {
+        const { rows } = await c.query(`SELECT id FROM ${table} WHERE project_key = $1${table === 'lessons' ? ' OR origin_project_key = $1' : ''}`, [key]);
+        selectors.push(...rows.map(row => ({ kind, id: String(row.id) })));
+      }
       let removed = 0;
       for (const sql of DELETES) removed += (await c.query(sql, [key])).rowCount ?? 0;
       return removed;
     });
+    await purgeRedactionOriginals(selectors);
+    return removed;
   }
 }

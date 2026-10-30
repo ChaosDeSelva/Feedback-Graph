@@ -16,6 +16,7 @@ const cand = (id: string, summary: string, source: string, ext?: object) => ({
 const list = [cand('c1', 'from the session', 'claude'), cand('g1', 'from the review', 'github', external)];
 
 beforeEach(() => {
+  location.hash = '';
   vi.stubGlobal('fetch', vi.fn(async (url: string) => {
     if (url.startsWith('/api/candidates?')) return Response.json(list);
     if (url === '/api/candidates/g1') {

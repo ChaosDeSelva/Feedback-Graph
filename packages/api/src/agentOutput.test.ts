@@ -148,7 +148,7 @@ describe('get_task_context on a realistic backlog', () => {
       k: { ...bigDeps().k, relatedMisses: async () => [related('g', 'missed the page offsets in graph/internal/page.go', 0.86), related('w', 'missed the admin gate in web/src/settings/usage.ts', 0.82)] },
     });
     const r = await getTaskContext({ project: 'demo', task: 'add a members list to the web settings' }, d);
-    expect(r.misses.map((m) => m.missId)).toEqual(['w', 'g']);
+    expect(r.misses.map((m) => m.missId)).toEqual(['w']);
   });
 });
 

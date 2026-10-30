@@ -196,7 +196,7 @@ export const OPERATOR_VERBS = [
   'select_projects', 'settings', 'scan', 'inbox_decide', 'lesson_decide', 'relevance', 'pin', 'links', 'links_delete', 'docs', 'docs_delete',
   'delete_project', 'retry', 'requeue', 'sync_now', 'import', 'resummarize', 'integrations', 'chat', 'chat_delete',
   // Removes what one labelled run (x-fg-run) wrote and nothing else, so it is on by default (DELETE /api/runs/:id).
-  'run_cleanup',
+  'run_cleanup', 'demo',
 ] as const;
 export type OperatorVerb = (typeof OPERATOR_VERBS)[number];
 /**

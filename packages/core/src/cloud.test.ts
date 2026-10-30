@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { expect, test, vi } from 'vitest';
 import { bundleCounts, CloudSyncError, nextSyncDelayMs, PREVIEW_CONCURRENCY, previewCloudSync, pushBundle, runCloudSync, storedSyncMemory, syncBundle, syncMemoryCursor, syncProjects, type SyncResponse } from './cloud.ts';
 import type { CloudConfig } from './config.ts';
@@ -405,7 +406,7 @@ test('a sync reports its progress, one project at a time', async () => {
 test('the preview counts what a sync would send, per project, without sending', async () => {
   const p = await previewCloudSync(store({ shop: bundle('shop') }), ['shop', 'empty']);
   expect(p.total).toEqual({ projects: 1, lessons: 1, misses: 1, facts: 1, docs: 1, codeFiles: 1 });
-  expect(p.projects).toEqual([{ key: 'shop', counts: { projects: 1, lessons: 1, misses: 1, facts: 1, docs: 1, codeFiles: 1 } }, { key: 'empty', counts: null }]);
+  expect(p.projects).toEqual([{ key: 'shop', counts: { projects: 1, lessons: 1, misses: 1, facts: 1, docs: 1, codeFiles: 1 } }, { key: 'empty', counts: null, reason: expect.stringContaining('No shareable knowledge') }]);
   expect(bundleCounts(bundle())).toEqual({ projects: 1, lessons: 2, misses: 1, facts: 1, docs: 1, codeFiles: 1 });
 });
 
@@ -578,7 +579,7 @@ test('what the cloud last accepted is kept in the store: a restarted process (or
   const bundles = { shop: bundle('shop') };
   await runCloudSync({ cloud, portability: store(bundles), projects: async () => ['shop'], trigger: 'schedule', fetch: fakeFetch([]).f, sleep: noSleep, memory: storedSyncMemory(docs, cloud) });
   // One record per project, keyed without the token in it.
-  expect([...docs.m.keys()]).toEqual([`${syncMemoryCursor(cloud)}/shop`]);
+  expect([...docs.m.keys()].filter(key => key.startsWith(`${syncMemoryCursor(cloud)}/`))).toEqual([`${syncMemoryCursor(cloud)}/shop`]);
   expect([...docs.m.keys(), ...docs.m.values()].join(' ')).not.toContain(TOKEN);
   bundles.shop = bundle('shop', { docs: [] });
   // A new process: a fresh memory over the same store.
@@ -790,4 +791,57 @@ test('a revoked token reported by policy discovery cannot turn an unchanged sync
   expect(result).toMatchObject({ ok: false, stopped: true, error: expect.stringMatching(/refused the token/) });
   expect(portability.exportData).not.toHaveBeenCalled();
   expect(calls).toHaveLength(1);
+});
+
+
+test('tool-version-only upgrades do not resend and proven 0.6.9 fingerprints migrate without uploading', async () => {
+  const legacy = await syncBundle(store({ shop: bundle('shop', { toolVersion: '0.6.9' }) }), 'shop');
+  const sorted = <T>(rows: T[]) => rows.map(r => [JSON.stringify(r), r] as const).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0).map(([, r]) => r);
+  const hash = createHash('sha256').update(JSON.stringify({ ...legacy!, exportedAt: '', withdrawn: [],
+    projects: sorted(legacy!.projects), lessons: sorted(legacy!.lessons), misses: sorted(legacy!.misses.map(m => ({ ...m, contextItems: sorted(m.contextItems) }))),
+    facts: sorted(legacy!.facts), docs: sorted(legacy!.docs), codeFiles: sorted(legacy!.codeFiles ?? []),
+  })).digest('hex');
+  const memory = new Map([['shop', { fingerprint: hash, remote: 'github.com/acme/shop', lessons: ['lesson:1'], misses: ['miss:1'], docs: ['doc:shop:upload:a.md'], files: ['src/checkout.ts'] }]]);
+  const bundles = { shop: bundle('shop', { toolVersion: '0.7.0' }) }, sent = fakeFetch([]);
+  const deps = { cloud, portability: store(bundles), projects: async () => ['shop'], trigger: 'schedule' as const, fetch: sent.f, sleep: noSleep, memory };
+  expect((await runCloudSync(deps)).projects[0].status).toBe('unchanged');
+  expect(sent.calls).toHaveLength(0);
+  expect(memory.get('shop')).toMatchObject({ fingerprintVersion: 2 });
+  bundles.shop.toolVersion = '0.7.1';
+  expect((await runCloudSync(deps)).projects[0].status).toBe('unchanged');
+  bundles.shop.lessons[0].rule = 'a real content edit';
+  expect((await runCloudSync(deps)).projects[0].status).toBe('sent');
+  expect(sent.calls).toHaveLength(1);
+});
+
+test('sync history survives both services restarting, keeps newest completion and isolates cloud credentials', async () => {
+  const docs = cursors(), memory = storedSyncMemory(docs, cloud);
+  const sent = fakeFetch([Response.json({ ...ok, teamLessons: { adminApprovalRequired: true, approved: 0, suggested: 1, blocked: true, message: 'An admin must approve team lessons.' } })]);
+  const manual = await runCloudSync({ cloud, portability: store({ shop: bundle() }), projects: async () => ['shop'], trigger: 'manual', fetch: sent.f, memory });
+  const restarted = storedSyncMemory(docs, cloud);
+  expect(await restarted.last?.('manual')).toEqual(manual);
+  expect(manual.projects[0].teamLessons?.blocked).toBe(true);
+  const newest = { ...manual, at: '2099-01-01T00:00:00.000Z', trigger: 'schedule' as const };
+  await restarted.recordLast?.(newest);
+  await memory.recordLast?.({ ...manual, at: '2000-01-01T00:00:00.000Z' });
+  expect((await restarted.last?.())?.at).toBe(newest.at);
+  expect((await restarted.last?.('manual'))?.at).toBe(manual.at);
+  expect(await storedSyncMemory(docs, { ...cloud, token: 'different-credential' }).last?.()).toBeNull();
+  expect([...(await memory.keys())]).toEqual(['shop']);
+});
+
+
+test('policy discovery explains admin approval even when an unchanged project needs no upload', async () => {
+  const memory = new Map(), first = fakeFetch([]), portability = store({ shop: bundle() });
+  await runCloudSync({ cloud, portability, projects: async () => ['shop'], trigger: 'manual', fetch: first.f, memory });
+  const gate = { adminApprovalRequired: true, approved: 0, suggested: 81, blocked: true, message: 'An admin must approve team lessons.' };
+  let posts = 0;
+  const fetch = (async (url: string) => {
+    if (url.endsWith('/sync-policy')) return Response.json({ teamLessons: gate });
+    posts++; return Response.json(ok);
+  }) as unknown as typeof globalThis.fetch;
+  const next = await runCloudSync({ cloud, portability, projects: async () => ['shop'], trigger: 'schedule', fetch, memory });
+  expect(posts).toBe(0);
+  expect(next.projects[0]).toMatchObject({ status: 'unchanged', teamLessons: gate });
+  expect(memory.get('shop')).toMatchObject({ teamLessons: gate });
 });

@@ -1,5 +1,5 @@
 import { conditionalWrite } from './conditionalWrite.ts';
-import { archiveBeforeRedaction, archiveRedactionInput } from '../redactionArchive.ts';
+import { archiveBeforeRedaction, archiveRedactionInput, purgeRedactionOriginals } from '../redactionArchive.ts';
 import neo4j from 'neo4j-driver';
 import { REDACT_PAGE, redactDeep, redactSecrets } from '../redact.ts';
 import type { DocsStore } from '../store.ts';
@@ -79,7 +79,7 @@ export class DocsRepo implements DocsStore {
     // Docs come from outside (uploads, PRs, tickets): redact here so no caller can skip it.
     const doc = { ...input, title: redactSecrets(input.title), ref: redactSecrets(input.ref) };
     const chunks = raw.map((c) => ({ ...c, text: redactSecrets(c.text) }));
-    await archiveRedactionInput('document', `${input.projectKey}:${input.source}:${input.ref}`, { doc: input, chunks: raw }, { doc, chunks });
+    await archiveRedactionInput('document', `${input.projectKey}:${input.source}:${input.ref}`, { doc: input, chunks: raw }, { doc, chunks }, [{ kind: 'project', id: input.projectKey }, { kind: 'doc', id: docIdOf(doc, o.run) }, ...(o.run ? [{ kind: 'run', id: o.run.id }] : [])]);
     const id = docIdOf(doc, o.run);
     this.g.sandbox.wrote(o.run);
     // A run replaces only its own document (runWriteOwner); the owner's write makes a run's document the owner's.
@@ -276,7 +276,15 @@ export class DocsRepo implements DocsStore {
   }
 
   async deleteDoc(id: string, o: { run?: string | null } = {}): Promise<boolean> {
-    return conditionalWrite(this.g, async query => {
+    const selectors: { kind: string; id: string }[] = [];
+    const removed = await conditionalWrite(this.g, async query => {
+      const identities = await query(`MATCH (d:Doc {id: $id}) WHERE $run IS NULL OR d.run = $run
+        OPTIONAL MATCH (d)-[:HAS_CHUNK]->(c:Chunk) WITH d, collect(DISTINCT c.id) AS chunks
+        OPTIONAL MATCH (f:Fact {docId: $id})
+        RETURN d.id AS doc, chunks, collect(DISTINCT f.id) AS facts`, { id, run: o.run ?? null });
+      for (const row of identities) {
+        selectors.push({ kind: 'doc', id: row.get('doc') }, ...row.get('chunks').map((id: string) => ({ kind: 'chunk', id })), ...row.get('facts').map((id: string) => ({ kind: 'fact', id })));
+      }
       const [r] = await query(
         `OPTIONAL MATCH (d:Doc {id: $id}) WHERE $run IS NULL OR d.run = $run
          OPTIONAL MATCH (d)-[:HAS_CHUNK]->(c:Chunk)
@@ -294,6 +302,8 @@ export class DocsRepo implements DocsStore {
       );
       return r?.get('existed') === true;
     }, Boolean);
+    if (removed) await purgeRedactionOriginals(selectors);
+    return removed;
   }
 
   async linkedDocs(q: { projectKey: string; docIds: string[]; run?: string | null }): Promise<DocLink[]> {

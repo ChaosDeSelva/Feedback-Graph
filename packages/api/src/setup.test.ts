@@ -26,7 +26,7 @@ function sandbox(o: { linuxUid?: number; tags?: string; claude?: boolean; chat?:
   const home = join(base, 'home');
   const bin = join(base, 'bin');
   for (const d of [join(repo, 'scripts', 'lib'), home, bin, join(home, 'code'), join(home, 'work')]) mkdirSync(d, { recursive: true });
-  for (const f of ['scripts/setup.sh', 'scripts/lib/env.sh', 'scripts/lib/ollama.sh', 'scripts/lib/runner-apparmor.sh', '.env.example']) copyFileSync(join(repoRoot, f), join(repo, f));
+  for (const f of ['scripts/setup.sh', 'scripts/lib/env.sh', 'scripts/lib/ollama.sh', 'scripts/lib/runner-apparmor.sh', 'scripts/lib/api-settings.sh', '.env.example']) copyFileSync(join(repoRoot, f), join(repo, f));
   const stub = (name: string, body: string) => {
     writeFileSync(join(bin, name), `#!/bin/sh\n${body}\n`);
     chmodSync(join(bin, name), 0o755);
@@ -76,12 +76,12 @@ function sandbox(o: { linuxUid?: number; tags?: string; claude?: boolean; chat?:
   const ran = () => (existsSync(calls) ? readFileSync(calls, 'utf8') : '');
   const env = () => readFileSync(join(repo, '.env'), 'utf8');
   const value = (k: string) => env().match(new RegExp(`^${k}=(.*)$`, 'm'))?.[1];
-  const rootsFile = join(repo, 'state', 'settings', 'project-roots.json');
+  const rootsFile = join(repo, 'state', 'api-settings', 'project-roots.json');
   /** The roots in the file Settings writes, read the way the api reads it. */
   const saved = () => (existsSync(rootsFile) ? (JSON.parse(readFileSync(rootsFile, 'utf8')) as { roots: string[] }).roots : null);
   /** What the api writes when you save roots in Settings. */
   const saveInSettings = (roots: string[]) => {
-    mkdirSync(join(repo, 'state', 'settings'), { recursive: true });
+    mkdirSync(join(repo, 'state', 'api-settings'), { recursive: true });
     writeFileSync(rootsFile, `${JSON.stringify({ roots, updatedAt: '2026-10-24T00:00:00.000Z' }, null, 2)}\n`);
   };
   const runFailing = (env: Record<string, string> = {}, args: string[] = []) => {
@@ -606,4 +606,36 @@ test('procfs opt-in refuses to overwrite an owner-authored override', () => {
   expect(s.runFailing({ PROJECTS_DIRS: '~/code' }, ['--runner-procfs-compat', '--yes'])).toContain('refusing to overwrite');
   expect(readFileSync(file, 'utf8')).toBe('# owner settings\nservices: {}\n');
   expect(s.value('COMPOSE_FILE')).toBeUndefined();
+});
+
+
+test('isolated setup can skip all agent registration and real transcript/auth mounts', () => {
+  const s = sandbox();
+  mkdirSync(join(s.home, '.codex'), { recursive: true });
+  writeFileSync(join(s.home, '.codex', 'auth.json'), 'PLANTED_PRIVATE_LOGIN');
+  s.run({}, undefined, ['--yes', '--skip-agents', '--no-transcripts']);
+  expect(s.ran()).not.toContain('install-agent');
+  expect(s.value('CODEX_AUTH_FILE')).toBe('');
+  expect(s.value('CLAUDE_PROJECTS_DIR')).toBe(join(s.repo, 'state/empty-claude'));
+  expect(s.value('CODEX_SESSIONS_DIR')).toBe(join(s.repo, 'state/empty-codex'));
+  expect(readFileSync(join(s.home, '.codex', 'auth.json'), 'utf8')).toBe('PLANTED_PRIVATE_LOGIN');
+});
+
+test('an explicit fresh FG_INSTANCE gets separate ports even without a name collision', () => {
+  const s = sandbox();
+  s.run({ FG_INSTANCE: 'feedback-graph-pilot' });
+  expect(s.value('FG_INSTANCE')).toBe('feedback-graph-pilot');
+  expect(s.value('API_PORT')).toBe('8797');
+  expect(s.value('NEO4J_HTTP_PORT')).toBe('7486');
+});
+
+
+test('new installs grant Codex login access only with an explicit provider and explicit file', () => {
+  const local = sandbox();
+  local.run({ CODEX_AUTH_FILE: '/private/explicit-auth.json' });
+  expect(local.value('CODEX_AUTH_FILE')).toBe('');
+  const codex = sandbox();
+  const auth = codex.secretFile('auth.json', 'planted test login');
+  codex.run({ CODEX_AUTH_FILE: auth, COMPOSE_PROFILES: 'codex' });
+  expect(codex.value('CODEX_AUTH_FILE')).toBe(auth);
 });

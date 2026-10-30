@@ -1,5 +1,5 @@
 # Pinned: Node 26.5 (native TypeScript), pnpm 11.13.1.
-FROM node:26.5.0-slim AS build
+FROM node:26.5.0-slim@sha256:715e55e4b84e4bb0ff48e49b398a848f08e55daed8eb6a0ea1839ae53bc57583 AS build
 RUN npm i -g pnpm@11.13.1
 WORKDIR /app
 COPY package.json pnpm-workspace.yaml pnpm-lock.yaml tsconfig.base.json LICENSE NOTICE ./
@@ -12,7 +12,7 @@ RUN pnpm install --frozen-lockfile
 COPY packages packages
 RUN pnpm -F @fb/ui build
 
-FROM node:26.5.0-slim AS runtime
+FROM node:26.5.0-slim@sha256:715e55e4b84e4bb0ff48e49b398a848f08e55daed8eb6a0ea1839ae53bc57583 AS runtime
 RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates \
   && rm -rf /var/lib/apt/lists/* \
   && git config --system --add safe.directory '*'
@@ -29,8 +29,8 @@ FROM runtime AS worker
 # claude-code in particular: the worker relies on its --restricted and dontAsk flags to keep agents inside the repo.
 RUN npm i -g @anthropic-ai/claude-code@2.1.309 @openai/codex@0.162.0 \
   # CODEX_HOME and the codex-runner scratch live on named volumes, which start as a copy of these folders: writable by
-  # whichever uid runs the worker (the default node, or HOST_UID), sticky so one uid cannot remove another's files.
-  && mkdir -p /codex /scratch /redaction-key && chown node:node /codex /scratch /redaction-key && chmod 1777 /codex /scratch /redaction-key
+  # whichever uid runs the worker (the default node, or HOST_UID), sticky for shared scratch; the key root is private.
+  && mkdir -p /codex /scratch /redaction-key && chown node:node /codex /scratch /redaction-key && chmod 1777 /codex /scratch && chmod 0700 /redaction-key
 WORKDIR /app/packages/worker
 USER node
 HEALTHCHECK --interval=60s --timeout=5s --start-period=120s --retries=3 \
@@ -47,7 +47,7 @@ CMD ["node", "src/main.ts"]
 # The codex-runner sidecar (docker-compose.yml, profile "codex"): only the Codex CLI, the runner script and Node. No
 # repo, no other packages, nothing mounted but the scratch volume and the Codex login. Built from the plain Node image,
 # not from runtime, so none of the app is in it.
-FROM node:26.5.0-slim AS codex-runner
+FROM node:26.5.0-slim@sha256:715e55e4b84e4bb0ff48e49b398a848f08e55daed8eb6a0ea1839ae53bc57583 AS codex-runner
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates bubblewrap \
   && rm -rf /var/lib/apt/lists/* \
   && npm i -g @openai/codex@0.162.0 \

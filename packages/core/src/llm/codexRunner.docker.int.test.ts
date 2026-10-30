@@ -52,6 +52,9 @@ describe.skipIf(!dockerUp)('codex-runner container', () => {
     writeFileSync(join(scratch, 'fb-mirror-job', 'notes.txt'), `${INSIDE}\n`);
     const home = join(root, 'codex-home');
     mkdirSync(home);
+    // Docker Desktop's virtiofs cannot create a nested bind mount target outside its rootfs.
+    // Precreate only the empty mountpoint; the credential stays in its separate read-only fixture mount.
+    writeFileSync(join(home, 'auth.json'), '');
     writeFileSync(join(home, 'old-history.txt'), 'OLD_HISTORY');
     const auth = join(root, 'auth.json');
     writeFileSync(auth, codexLogin ? readFileSync(authFile) : '');
@@ -66,7 +69,7 @@ describe.skipIf(!dockerUp)('codex-runner container', () => {
     // loopback only for this test.
     const launch = (compatibility: string[]) => docker([
       'run', '-d', ...user, ...compatibility, '--name', `${id}-runner`, '--network', `${id}-net`, '--init', '--read-only', '--tmpfs', '/tmp', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges:true', '--security-opt', `seccomp=${join(repoRoot, 'scripts/seccomp/codex-runner.json')}`, '--security-opt', `apparmor=${runnerAppArmor}`,
-      '-e', 'HOME=/tmp', '-v', `${scratch}:/scratch`, '-v', `${home}:/codex`, '-v', `${auth}:/codex/auth.json`, '-p', '127.0.0.1::8790', IMAGE,
+      '-e', 'HOME=/tmp', '-v', `${scratch}:/scratch`, '-v', `${home}:/codex`, '-v', `${auth}:/codex/auth.json:ro`, '-p', '127.0.0.1::8790', IMAGE,
     ]);
     // Exercise the unchanged masked default before explicitly selecting test-only compatibility.
     if (systemPathsOptions.length) {

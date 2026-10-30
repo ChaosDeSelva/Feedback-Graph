@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.7.0 (2026-10-29)
+
+- Return complete pre-done verdicts to both Claude Code and Codex. Persist explicit outcomes for checks, accept backed clean-call evidence, report measured completed timings, and improve queued estimates without promising an exact start time.
+- Raise the default Neo4j container budget to 3 GiB and report memory/swap headroom. Isolate the runner from the API network, publish worker-observed readiness, and let users cancel parked scans or change their provider. Pin external container images to manifest digests.
+- Label memory imports from actual session writes, correlate sandbox pushback, isolate concurrent demo seeds and facts, and keep cleanup scoped to authenticated ownership. Require same-origin browser mutation metadata or explicit authenticated owner mode; warn about unrestricted operator permissions.
+- Redact the additional held-out credential cases while preserving placeholders and ordinary source expressions. Refuse secret-bearing Ask file paths. Lock down archive key permissions and API settings mounts, retire unused legacy keys, and purge identifiable originals with project, document and run deletion.
+- Add a safe installation guide, explicit agent/transcript skips, separate instance ports, a small Neo4j profile, read-only opt-in Codex credentials, URL mismatch warnings and fresh-clone CLI fallback.
+- Apply weighted miss/document relevance floors, preserve exact named-file facts, remove implicit checkout-HEAD PR exclusion, and distinguish condensed Ask citations from source code. Persist sync history, avoid version-only resends, and explain every project's sync eligibility and cloud review status.
+- Improve filter URLs, author matching, filtered empty states, deleted links, decision undo, count scopes, contrast, keyboard navigation and Activity retry grouping. Undo refuses work already consumed by post-mortems.
+
 ## 0.6.9 (2026-10-29)
 
 - Wire API runner readiness into shipped Compose configuration, refresh parked scans independently of external sync, bound code-map cleanup, and keep long worker ingest locks until the operation ends. Correct the macOS procfs override and diagnostics.

@@ -89,6 +89,8 @@ export interface GraphStore {
   recordClassifyFailure(turnUuid: string): Promise<void>;
   /** What the agent did after this turn (later turns' tool calls, then those after the last turn); null: no such turn. */
   callsAfter(turnUuid: string): Promise<CallsAfter | null>;
+  /** Internal memory importer: registered run of the latest persisted write to this exact memory file. */
+  memoryWriteRun?(projectKey: string, path: string): Promise<RunTag | null>;
   /**
    * The instruction files the session's transcript shows its agent had (ParsedSession.instructionFiles); null when the
    * session is unknown or was read before they were recorded.
@@ -147,6 +149,8 @@ export interface GraphStore {
   setExternalLinks(turnUuid: string, linkedSessionIds: string[]): Promise<boolean>;
   /** by: who decided ('you', or 'operator:<name>' for an agent with the operator token); default 'you'. */
   decide(id: string, status: 'confirmed' | 'rejected', note: string | null, by?: string): Promise<void>;
+  /** Reopen exactly this decision only before any post-mortem attempt or derived lesson/miss exists. */
+  undoDecision?(id: string, decidedAt: string): Promise<boolean>;
   /** keepUnsummarized: only turns a session summary already covers lose their text (summaries stay either way). */
   pruneTurnText(before: Date, limit?: number, o?: { keepUnsummarized?: boolean }): Promise<number>;
   /**
@@ -220,7 +224,7 @@ export interface KnowledgeStore {
   postmortemQueue?(): Promise<{ waiting: number; oldestAt: string | null }>;
   recordPostmortemFailure(feedbackId: string, error: string, now?: Date): Promise<{ attempts: number; retryAt: string | null }>;
   retryPostmortem(feedbackId: string): Promise<boolean>;
-  savePostmortem(feedbackId: string, raw: PostMortem, embeddings: { miss: number[]; lesson: number[] }): Promise<void>;
+  savePostmortem(feedbackId: string, raw: PostMortem, embeddings: { miss: number[]; lesson: number[] }): Promise<void | boolean>;
   /** Misses with no subject, by id after `afterId`: what the process-miss rule looks at again when it changes. */
   missesWithoutSubject(q: { limit: number; afterId?: string | null }): Promise<UnsortedMiss[]>;
   /** The process misses, the same way: what a changed process-miss rule looks at again. */
@@ -300,7 +304,7 @@ export interface KnowledgeStore {
    */
   createManualFeedback(input: { project: Project; cwd: string; text: string; whatWasDone: string; sessionId?: string | null; run?: RunTag | null }): Promise<string>;
   /** sessionId: the agent's session (check_before_done's session_id), so the session's evidence can list the check. */
-  recordPreDoneCheck(c: { projectKey: string; task: string; checkedLessonIds: string[]; gapLessonIds: string[]; run?: RunTag | null; sessionId?: string | null }): Promise<void>;
+  recordPreDoneCheck(c: { projectKey: string; task: string; checkedLessonIds: string[]; gapLessonIds: string[]; status?: string; run?: RunTag | null; sessionId?: string | null }): Promise<void>;
   upsertLesson(input: LessonInput): Promise<void>;
   /**
    * The current redaction rules over every stored lesson's title, rule and applies-when, in place, as
@@ -327,7 +331,7 @@ export interface KnowledgeStore {
    * misses, the files they touched), and current facts with source 'demo'. Returns how many of each it removed, and
    * whether the project went too: only one saveDemoMiss created, once nothing else is stored under its key.
    */
-  removeDemo?(projectKey: string): Promise<DemoRemoved>;
+  removeDemo?(projectKey: string, run?: RunTag | null): Promise<DemoRemoved>;
 }
 
 /** A demo miss (KnowledgeStore.saveDemoMiss). ts: when the pushback was made (ISO). */
@@ -371,7 +375,7 @@ export interface FactsStore {
    * moves only when its hash differs from the stored one. Source DEMO_SOURCE (fg demo seed) never touches a file that
    * is already recorded (its hash and summary stay a scan's): it adds the file only when there is none.
    */
-  saveFileFacts(projectKey: string, rawFile: ScannedFile & { summary: string }, rawFacts: EmbeddedFact[], source: string, scanJobId?: string | null): Promise<void>;
+  saveFileFacts(projectKey: string, rawFile: ScannedFile & { summary: string }, rawFacts: EmbeddedFact[], source: string, scanJobId?: string | null, run?: RunTag | null): Promise<void>;
   markFilesRemoved(projectKey: string, paths: string[]): Promise<void>;
   /** All or nothing: a failure part way leaves the old facts current and the old hashes in place. */
   replaceProjectFacts(projectKey: string, rawFacts: EmbeddedFact[], source: string, files: ScannedFile[], scanJobId?: string | null): Promise<void>;
@@ -421,6 +425,8 @@ export interface FactsStore {
   setFactRelevance(updates: RelevanceUpdate[]): Promise<number>;
   requestScan(project: Project, provider: string | null): Promise<ScanJob>;
   scanJob(id: string): Promise<ScanJob | null>;
+  claimQueuedScan(id: string): Promise<boolean>;
+  cancelQueuedScan(id: string): Promise<boolean>;
   /**
    * The queued job that is due (its retryAt, if any, has passed) and has waited longest, other than the `exclude` ids.
    * A job that gave up its slot (requeueScanJob) waits from then, behind every job queued before, so a big scan run

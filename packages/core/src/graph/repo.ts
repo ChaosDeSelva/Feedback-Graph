@@ -1,3 +1,6 @@
+import { conditionalWrite } from './conditionalWrite.ts';
+import { writesMemory } from '../memoryWrite.ts';
+import type { RunTag } from '../types.ts';
 import { storeTimeLeft, storeRequestSignal, StoreDeadlineError } from '../storeDeadline.ts';
 import { reviewPatterns } from '../reviewFilters.ts';
 import neo4j, { type Driver, type Record as NeoRecord } from 'neo4j-driver';
@@ -51,7 +54,7 @@ export type StatsRow = { projectKey: string; week: string; humanTurns: number; p
 /** source: where the flagged comment came from (a candidate saved before sources were recorded is claude). */
 /** offset: skip that many (newest first), for paging. */
 /** run: the asking run (RunTag.id): a sandbox run's Inbox items are listed only to it; unset or null, to no one. */
-export type CandidateFilter = { status?: CandidateStatus; projectKey?: string; projectKeys?: string[]; source?: FeedbackSource; pr?: number; author?: string; limit?: number; offset?: number; run?: string | null };
+export type CandidateFilter = { /** Worker-only correlation; never accept from API input. */ includeSandbox?: boolean; status?: CandidateStatus; projectKey?: string; projectKeys?: string[]; source?: FeedbackSource; pr?: number; author?: string; limit?: number; offset?: number; run?: string | null };
 
 const CANDIDATE_LABELS = ['pushback', 'correction'];
 export const MAX_CLASSIFY_ATTEMPTS = 3;
@@ -251,6 +254,20 @@ export class GraphRepo implements GraphStore {
     return rows.map((r) => ({ ...toTurn(r.get('t').properties), projectKey: r.get('projectKey') }));
   }
 
+  async memoryWriteRun(projectKey: string, path: string): Promise<RunTag | null> {
+    const suffix = `/memory/${path.replaceAll('\\', '/').split('/').at(-1)}`;
+    const rows = await this.run(`MATCH (s:Session)-[:IN]->(:Project {key: $projectKey})
+      OPTIONAL MATCH (s)-[:HAS_TURN]->(t:Turn)
+      WITH s, collect(t.toolCalls) AS turns
+      WHERE coalesce(s.finalToolCalls, '') CONTAINS $suffix OR any(c IN turns WHERE c CONTAINS $suffix)
+      RETURN s.run AS run, s.sandbox AS sandbox, s.finalToolCalls AS final, turns ORDER BY s.endedAt DESC, s.id`, { projectKey, suffix });
+    for (const row of rows) {
+      const calls = [...JSON.parse(row.get('final') ?? '[]'), ...(row.get('turns') as string[]).flatMap(x => JSON.parse(x ?? '[]'))];
+      if (writesMemory(calls, path)) return row.get('run') ? { id: row.get('run'), sandbox: row.get('sandbox') === true } : null;
+    }
+    return null;
+  }
+
   async callsAfter(turnUuid: string): Promise<CallsAfter | null> {
     const [r] = await this.run(
       `MATCH (s:Session)-[:HAS_TURN]->(t:Turn {uuid: $uuid})
@@ -374,11 +391,11 @@ export class GraphRepo implements GraphStore {
       `MATCH (k:Candidate)-[:FLAGS]->(t:Turn)
        WHERE ($status IS NULL OR k.status = $status) AND ($projectKey IS NULL OR k.projectKey = $projectKey)
          AND ($projectKeys IS NULL OR k.projectKey IN $projectKeys) AND ($source IS NULL OR coalesce(k.source, 'claude') = $source)
-         AND ($author IS NULL OR toLower(t.external) CONTAINS $author OR coalesce(t.text, '') + '\n' + coalesce(t.precedingAssistantText, '') + '\n' + coalesce(t.summary, '') + '\n' + coalesce(k.note, '') + '\n' + coalesce(k.agentReport, '') =~ $authorText)
+         AND ($author IS NULL OR toLower(t.external) CONTAINS $author)
          AND ($pr IS NULL OR t.external =~ $pr OR coalesce(t.text, '') + '\n' + coalesce(t.precedingAssistantText, '') + '\n' + coalesce(t.summary, '') + '\n' + coalesce(k.note, '') + '\n' + coalesce(k.agentReport, '') =~ $prText)
-         AND ${VISIBLE_TO_RUN('k')}
+         AND ($includeSandbox OR ${VISIBLE_TO_RUN('k')})
        RETURN k, t ORDER BY t.ts DESC, k.id SKIP $offset LIMIT $limit`,
-      { status: f.status ?? null, projectKey: f.projectKey ?? null, projectKeys: f.projectKeys ?? null, source: f.source ?? null, prText: f.pr ? `(?is).*${reviewPatterns(f.pr).pr}.*` : null, authorText: f.author ? `(?is).*${reviewPatterns(undefined, f.author).author}.*` : null,
+      { includeSandbox: !!f.includeSandbox, status: f.status ?? null, projectKey: f.projectKey ?? null, projectKeys: f.projectKeys ?? null, source: f.source ?? null, prText: f.pr ? `(?is).*${reviewPatterns(f.pr).pr}.*` : null, authorText: f.author ? `(?is).*${reviewPatterns(undefined, f.author).author}.*` : null,
         author: f.author ? `"author":${JSON.stringify(f.author.toLowerCase())}` : null, pr: f.pr ? `(?s).*"thread":"[^"]*#${f.pr}".*` : null, limit: neo4j.int(f.limit ?? 200), offset: neo4j.int(Math.max(0, Math.floor(f.offset ?? 0))), run: f.run ?? null },
     );
     return rows.map((r) => toCandidate(r.get('k').properties, r.get('t').properties));
@@ -507,6 +524,21 @@ export class GraphRepo implements GraphStore {
       { id, by: s.by, signal: `skip:${s.rule}` },
     );
     return Number(r?.get('n') ?? 0) > 0;
+  }
+
+  async undoDecision(id: string, decidedAt: string): Promise<boolean> {
+    return conditionalWrite(this, async query => {
+      await query(`MATCH (k:Candidate {id: $id}) SET k.undoLock = true REMOVE k.undoLock
+        WITH k OPTIONAL MATCH (f:Feedback {id: $id}) SET f.undoLock = true REMOVE f.undoLock`, { id });
+      const rows = await query(`MATCH (k:Candidate {id: $id}) WHERE k.status IN ['confirmed', 'rejected'] AND k.decidedAt = $decidedAt
+        OPTIONAL MATCH (f:Feedback {id: $id})
+        WITH k, f WHERE coalesce(f.attempts, 0) = 0 AND NOT EXISTS { MATCH (:Miss)-[:EXPLAINS]->(f) }
+          AND NOT EXISTS { MATCH (:Lesson {id: 'lesson:' + $id}) }
+        SET k.status = 'pending', k.note = null, k.decidedAt = null, k.decidedBy = null
+        FOREACH (item IN CASE WHEN f IS NULL THEN [] ELSE [f] END | DETACH DELETE item)
+        RETURN k.id AS id`, { id, decidedAt });
+      return rows.length > 0;
+    }, Boolean);
   }
 
   async decide(id: string, status: 'confirmed' | 'rejected', note: string | null, by = 'you') {

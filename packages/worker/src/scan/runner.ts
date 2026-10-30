@@ -1,4 +1,4 @@
-import type { FactsStore, ScanJob } from '@fb/core';
+import { providerUnavailableReason, type FactsStore, type ScanJob } from '@fb/core';
 
 /** Refresh even old/future parked jobs so every project explains the same provider outage. */
 export async function parkScanProvider(facts: Pick<FactsStore, 'scanQueue' | 'updateScanJob'>, provider: string, fallback: string, reason: string, retryAt: string): Promise<void> {
@@ -157,8 +157,9 @@ export class ScanRunner {
           const failures = (blocked?.failures ?? 0) + 1;
           const delay = Math.min(30 * 60_000, 120_000 * 2 ** Math.min(failures - 1, 4));
           this.blocked.set(key, { until: now + delay, failures });
-          await this.d.parkProvider?.(key, String(err), new Date(now + delay).toISOString());
-          this.d.log?.('scan provider parked; readiness will be checked without copying repositories', { provider: key, retryAt: new Date(now + delay).toISOString(), error: String(err) });
+          const reason = providerUnavailableReason(err) ?? (err instanceof Error ? err.message : String(err));
+          await this.d.parkProvider?.(key, reason, new Date(now + delay).toISOString());
+          this.d.log?.('scan provider parked; readiness will be checked without copying repositories', { provider: key, retryAt: new Date(now + delay).toISOString(), error: reason });
           passedOver.push(job.id);
           if (passedOver.length >= MAX_PASSED_OVER) return;
           continue;

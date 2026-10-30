@@ -22,3 +22,6 @@ test.each([
 test.each(['.dev.vars', 'login.ppk', 'terraform.tfstate.backup', 'pip.conf', '.yarnrc.yml', 'private.gpg', 'appsettings.Production.json', 'wp-config.php', 'local_settings.py'])(
   '0.6.6 never scans credential file %s', path => { expect(isSecretPath(path)).toBe(true); expect(isSecretPath(`nested/${path}`)).toBe(true); },
 );
+
+
+test.each(['state/settings/integrations.json', '.run-key-salt', '.codex/auth.json', '.vault_pass', 'deploy/vault.yml', 'firebase-adminsdk-test.json', 'backups/2026-10-30/state.tgz'])('0.7.0 credential path excluded from scans: %s', path => expect(isSecretPath(path)).toBe(true));

@@ -53,6 +53,7 @@ export function App() {
   // A link to one item (#lessons/<id>) keeps its id: only a different page rewrites the hash.
   useEffect(() => { if (hashView() !== view) location.hash = view; }, [view]);
   // Leaving a page with unsaved edits (Settings selection, a lesson being edited) asks first.
+  const [hashRevision, setHashRevision] = useState(0);
   const viewRef = useRef(view);
   viewRef.current = view;
   const lastHash = useRef(location.hash);
@@ -62,6 +63,7 @@ export function App() {
       const next = fromHash();
       const target = location.hash;
       if (next === viewRef.current) {
+        if (target !== lastHash.current && ['inbox', 'lessons', 'sessions', 'ask'].includes(next)) setHashRevision(n => n + 1);
         lastHash.current = target;
         return setView(next);
       }
@@ -105,7 +107,7 @@ export function App() {
       <NetworkBanner />
       {nothingSelected && view !== 'settings' && view !== 'docs' && <NothingSelected />}
       {!nothingSelected && (view === 'inbox' || view === 'lessons' || view === 'graph') && <FirstRun key={view} view={view} />}
-      <div className="flex min-h-0 flex-1 flex-col">{VIEWS[view].el}</div>
+      <div key={`${view}:${hashRevision}`} className="flex min-h-0 flex-1 flex-col">{VIEWS[view].el}</div>
     </AppShell>
   );
 }

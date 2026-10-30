@@ -37,7 +37,7 @@ function setup(o: { env?: Record<string, string>; file?: boolean; viewer?: Integ
 const json = (method: string, body?: unknown, origin: string | null = ORIGIN) => ({
   method,
   body: body === undefined ? undefined : JSON.stringify(body),
-  headers: { 'content-type': 'application/json', ...(origin ? { origin } : {}) },
+  headers: { 'content-type': 'application/json', ...(origin ? { origin, 'sec-fetch-site': 'same-origin' } : {}) },
 });
 
 describe('the skip rules in Settings > Integrations', () => {

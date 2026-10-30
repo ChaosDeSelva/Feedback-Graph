@@ -31,6 +31,7 @@ import type { ActivityStore, DocsStore, PortabilityStore } from './store.ts';
 export type SyncResponse = {
   syncId: string;
   org: string;
+  teamLessons?: { adminApprovalRequired: boolean; approved: number; suggested: number; blocked: boolean; message: string };
   projects: { localKey: string; key: string; remote: string | null; namespace: 'team' | 'personal' }[];
   lessons: { team: number; suggested: number; skipped: number; pendingRevisions?: number };
   /** What this sync took out of the team graph (older clouds leave it out). */
@@ -48,7 +49,7 @@ export type WithdrawnItem = { kind: 'lesson' | 'miss' | 'doc'; id: string } | { 
 export type SyncBundle = ExportBundle & { complete: boolean; withdrawn: WithdrawnItem[]; codeFilesPartial?: boolean };
 
 /** What the cloud last accepted for a project: enough to name what has since gone, and to skip an unchanged bundle. */
-export type SentRecord = { policyRevision?: string; fingerprint: string; remote: string | null; lessons: string[]; misses: string[]; docs: string[]; files: string[] };
+export type SentRecord = { fingerprintVersion?: 2; toolVersion?: string; teamLessons?: SyncResponse['teamLessons']; policyRevision?: string; fingerprint: string; remote: string | null; lessons: string[]; misses: string[]; docs: string[]; files: string[] };
 
 /**
  * What the cloud last accepted, per project key. A Map works (tests, a one-off run); the services use
@@ -59,6 +60,8 @@ export type SyncMemory = {
   set(key: string, r: SentRecord): unknown;
   delete(key: string): unknown;
   keys(): Iterable<string> | Promise<Iterable<string>>;
+  last?(trigger?: SyncTrigger): Promise<CloudSyncResult | null>;
+  recordLast?(result: CloudSyncResult): Promise<void>;
 };
 
 /** The store cursor naming one cloud org (URL and token; the token itself is never stored): its records are under `<it>/`. */
@@ -106,6 +109,30 @@ export function storedSyncMemory(docs: Pick<DocsStore, 'getCursor' | 'setCursor'
       throw err;
     }));
   return {
+    last: async (trigger) => {
+      const rows = await docs.cursorsWithPrefix(`${legacy}:last/`);
+      const results = rows.flatMap(row => {
+        try {
+          const value = JSON.parse(row.value) as CloudSyncResult;
+          return value && typeof value.at === 'string' && Number.isFinite(Date.parse(value.at)) && value.host === new URL(cloud.url).host
+            && ['manual', 'schedule'].includes(value.trigger) && (!trigger || value.trigger === trigger)
+            && typeof value.ok === 'boolean' && Array.isArray(value.projects)
+            && value.projects.every(p => p && typeof p.key === 'string' && typeof p.status === 'string' && (!p.teamLessons || typeof p.teamLessons.message === 'string')) && value.sent
+            && ['projects', 'lessons', 'misses', 'facts', 'docs', 'codeFiles'].every(key => typeof value.sent[key as keyof SyncCounts] === 'number' && Number.isFinite(value.sent[key as keyof SyncCounts])) ? [value] : [];
+        } catch { return []; }
+      });
+      return results.sort((a, b) => Date.parse(b.at) - Date.parse(a.at))[0] ?? null;
+    },
+    recordLast: async (result) => {
+      // Independent append records prevent an older API/worker completion overwriting a
+      // newer one. Keep a small bounded journal; readers choose the latest timestamp.
+      const prefix = `${legacy}:last/`;
+      const value = JSON.stringify(result);
+      await docs.setCursor(`${prefix}${result.trigger}/${result.at}/${createHash('sha256').update(value).digest('hex').slice(0, 16)}`, value);
+      const rows = await docs.cursorsWithPrefix(`${prefix}${result.trigger}/`);
+      const chronological = rows.sort((a, b) => b.key.localeCompare(a.key));
+      for (const row of chronological.slice(4)) await docs.deleteCursor(row.key);
+    },
     get: async (key) => {
       await ready();
       return parse(await docs.getCursor(prefix + key));
@@ -142,6 +169,7 @@ export type ProjectSyncResult = {
   cloudKey?: string;
   namespace?: 'team' | 'personal';
   lessons?: SyncResponse['lessons'];
+  teamLessons?: SyncResponse['teamLessons'];
   syncId?: string;
   /** Items this bundle named in `withdrawn`. */
   withdrawn?: number;
@@ -167,7 +195,7 @@ export type CloudSyncResult = {
 };
 
 /** The last Sync now the api ran: when, whether it worked, what it sent, and how many projects had nothing new. */
-export type ManualSync = { at: string; ok: boolean; error: string | null; sent: SyncCounts; unchanged: number; failed: number };
+export type ManualSync = { at: string; ok: boolean; error: string | null; sent: SyncCounts; unchanged: number; failed: number; teamLessons?: NonNullable<SyncResponse['teamLessons']>[] };
 
 /** What the worker reports about sync in its heartbeat (WorkerStatus.cloudSync). */
 export type CloudSyncStatus = {
@@ -289,6 +317,8 @@ function tombstone(key: string, previous: SentRecord): SyncBundle {
 
 const record = (key: string, b: SyncBundle, fingerprint: string): SentRecord => ({
   fingerprint,
+  fingerprintVersion: 2,
+  toolVersion: b.toolVersion,
   remote: b.projects.find((x) => x.key === key)?.remote ?? null,
   lessons: b.lessons.map((l) => l.id),
   misses: b.misses.map((m) => m.id),
@@ -311,6 +341,7 @@ export async function previewCloudSync(p: Pick<PortabilityStore, 'exportData'>, 
       const key = keys[i];
       let reason: string | undefined;
       const b = await syncBundle(p, key, await o.memory?.get(key), { ...o, shareDemoCreated: o.shareDemoProjects?.includes(key), onLocalOnly: value => { reason = value; } });
+      if (!b && !reason) reason = 'No shareable knowledge: no stored content, or only unapproved, sandbox or local fixture records.';
       projects[i] = { key, counts: b && bundleCounts(b), ...(reason ? { reason } : {}) };
     }
   };
@@ -468,8 +499,9 @@ const sorted = <T>(rows: T[]) => rows.map((r) => [JSON.stringify(r), r] as const
  * export time and `withdrawn` left out), so a store that hands back tied rows in another order (Neo4j reads have no
  * snapshot, and its five queries run apart) is not a change that resends the whole project.
  */
-const fingerprint = (b: SyncBundle) => createHash('sha256').update(JSON.stringify({
+const fingerprint = (b: SyncBundle, legacyVersion?: string) => createHash('sha256').update(JSON.stringify({
   ...b,
+  toolVersion: legacyVersion ?? '',
   exportedAt: '',
   withdrawn: [],
   projects: sorted(b.projects),
@@ -583,6 +615,7 @@ export async function runCloudSync(d: {
   d.onProgress?.({ done: 0, total: keys.length, current: keys[0] ?? null });
   // Older clouds do not expose policy revisions. Never send the token to a refused URL or a redirect.
   let policyRevision: string | undefined;
+  let policyTeamLessons: SyncResponse['teamLessons'];
   let policyFailure: CloudSyncError | null = null;
   if (!cloudUrlProblem(d.cloud.url)) {
     try {
@@ -591,7 +624,10 @@ export async function runCloudSync(d: {
       });
       if (response.status === 401 || response.status === 403) policyFailure = new CloudSyncError(explain(response.status, null, 0), response.status);
       if (response.ok) {
-        const policy = await response.json() as { revision?: unknown };
+        const policy = await response.json() as { revision?: unknown; teamLessons?: SyncResponse['teamLessons'] };
+        const team = policy.teamLessons;
+        if (team && typeof team.adminApprovalRequired === 'boolean' && typeof team.blocked === 'boolean' && typeof team.message === 'string'
+          && Number.isFinite(team.approved) && Number.isFinite(team.suggested)) policyTeamLessons = { ...team, message: redactSecrets(team.message).slice(0, 1000) };
         if (typeof policy.revision === 'string' && /^[a-f0-9]{64}$/.test(policy.revision)) policyRevision = policy.revision;
       }
     } catch { /* Compatibility with older/offline clouds; normal sync reports connectivity errors. */ }
@@ -621,19 +657,23 @@ export async function runCloudSync(d: {
     const bundle = stored ?? tombstone(key, previous!);
     const counts = bundleCounts(bundle);
     const print = fingerprint(bundle);
-    if (!d.force && previous?.fingerprint === print && (!policyRevision || previous.policyRevision === policyRevision) && !bundle.withdrawn.length) {
-      results.push({ key, status: 'unchanged', counts });
+    const sameContent = previous?.fingerprint === print || !!previous && previous.fingerprintVersion !== 2 &&
+      [...new Set(['0.6.9', previous.toolVersion].filter((v): v is string => !!v))].some(version => previous.fingerprint === fingerprint(bundle, version));
+    if (!d.force && sameContent && (!policyRevision || previous?.policyRevision === policyRevision) && !bundle.withdrawn.length) {
+      if (previous && (previous.fingerprint !== print || policyTeamLessons)) await d.memory?.set(key, { ...previous, fingerprint: print, fingerprintVersion: 2, toolVersion: bundle.toolVersion, ...(policyTeamLessons ? { teamLessons: policyTeamLessons } : {}) });
+      const teamLessons = policyTeamLessons ?? previous?.teamLessons;
+      results.push({ key, status: 'unchanged', counts, ...(teamLessons ? { teamLessons } : {}) });
       continue;
     }
     try {
       const { r, trimmed } = await pushFitting(bundle, (b) => pushBundle({ cloud: d.cloud, bundle: b, fetch: d.fetch, sleep: d.sleep, baseDelayMs: d.baseDelayMs }));
       // The whole bundle's fingerprint even when its code map was cut: an unchanged project is not cut and resent each run.
-      if (stored) await d.memory?.set(key, { ...record(key, bundle, print), ...(policyRevision ? { policyRevision } : {}) });
+      if (stored) await d.memory?.set(key, { ...record(key, bundle, print), ...(r.teamLessons ? { teamLessons: r.teamLessons } : {}), ...(policyRevision ? { policyRevision } : {}) });
       else await d.memory?.delete(key);
       const went = trimmed ? { ...counts, codeFiles: trimmed.codeFiles.sent } : counts;
       for (const k of Object.keys(sent) as (keyof SyncCounts)[]) sent[k] += went[k];
       const filed = r.projects?.find((p) => p.localKey === key) ?? r.projects?.[0];
-      results.push({ key, status: 'sent', counts: went, cloudKey: filed?.key, namespace: filed?.namespace, lessons: r.lessons, syncId: r.syncId, withdrawn: bundle.withdrawn.length, ...(trimmed ? { trimmed } : {}) });
+      results.push({ key, status: 'sent', counts: went, cloudKey: filed?.key, namespace: filed?.namespace, lessons: r.lessons, ...(r.teamLessons ? { teamLessons: r.teamLessons } : {}), syncId: r.syncId, withdrawn: bundle.withdrawn.length, ...(trimmed ? { trimmed } : {}) });
     } catch (err) {
       const e = err instanceof CloudSyncError ? err : new CloudSyncError(String(err), 0);
       results.push({ key, status: 'failed', counts, error: e.message });
@@ -668,6 +708,7 @@ export async function runCloudSync(d: {
   }
   d.onProgress?.({ done: keys.length, total: keys.length, current: null });
   const result: CloudSyncResult = { at: new Date().toISOString(), trigger: d.trigger, host, ok: error === null, sent, projects: results, error, stopped };
+  await d.memory?.recordLast?.(result);
   const sentKeys = results.filter((r) => r.status === 'sent').map((r) => r.key);
   const failedKeys = results.filter((r) => r.status === 'failed').map((r) => r.key);
   const withdrawnKeys = results.filter((r) => r.status === 'withdrawn').map((r) => r.key);

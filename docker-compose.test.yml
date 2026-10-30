@@ -1,6 +1,6 @@
 services:
   neo4j-test:
-    image: neo4j:5.26-community
+    image: neo4j:5.26-community@sha256:249a1ec6e3c52d82101a5ed33d6ed2b5ed5b0017b21a28c0bfebc335e87fb177
     environment:
       NEO4J_AUTH: neo4j/testpassword
     ports:
@@ -16,7 +16,7 @@ services:
   # The Postgres backend (@fb/store-postgres): pgvector 0.8.7 on Postgres 17. Throwaway: data lives in tmpfs.
   # Each contract-test run may use its own database name (TEST_PG_URL); the harness creates it when missing.
   postgres-test:
-    image: pgvector/pgvector:0.8.7-pg17
+    image: pgvector/pgvector:0.8.7-pg17@sha256:ac08538c6f8b9904c33c8224c5e5706dbe760aca29db1d096972b4052c22a75d
     environment:
       POSTGRES_USER: fg
       POSTGRES_PASSWORD: fg

@@ -28,7 +28,7 @@ import { connectionsStatus, integrationRoutes, type IntegrationsDeps } from './i
 
 export type { SettingsDeps } from './settings.ts';
 
-export type ApiRepo = Pick<GraphStore, 'listCandidates' | 'candidateDetail' | 'decide' | 'stats'>;
+export type ApiRepo = Pick<GraphStore, 'listCandidates' | 'candidateDetail' | 'decide' | 'undoDecision' | 'stats'>;
 
 const ReviewFilters = { pr: z.coerce.number().int().positive().optional(), author: z.string().trim().min(1).max(200).optional() };
 const ListQuery = z.object({
@@ -107,7 +107,7 @@ export type AppOpts = {
   context?: ContextDeps;
   knowledge?: Pick<KnowledgeStore, 'listLessons' | 'lessonDetail' | 'updateLesson'> & Partial<Pick<KnowledgeStore, 'retryPostmortem' | 'postmortemBacklog' | 'postmortemQueue' | 'requestLessonRecheck' | 'decidedLessons'>>;
   embed?: (texts: string[]) => Promise<number[][]>;
-  facts?: Pick<FactsStore, 'listProjects' | 'requestScan' | 'listFacts' | 'searchFacts'> & Partial<Pick<FactsStore, 'setFactRelevance' | 'setPinned' | 'scanJob' | 'addOwnerFact' | 'olderScannerFiles' | 'scanQueue'>>;
+  facts?: Pick<FactsStore, 'listProjects' | 'requestScan' | 'listFacts' | 'searchFacts'> & Partial<Pick<FactsStore, 'setFactRelevance' | 'setPinned' | 'cancelQueuedScan' | 'scanJob' | 'addOwnerFact' | 'olderScannerFiles' | 'scanQueue'>>;
   /** Folders under the configured roots that can be scanned. */
   projectDirs?: () => Promise<Project[]>;
   insights?: Pick<InsightsStore, 'projectGraph' | 'patterns'>;
@@ -157,7 +157,7 @@ export type AppOpts = {
   /** Ask: conversations answered by the worker from a context pack built here (chat.ts). */
   chat?: ChatRouteDeps;
   /** What labelled runs wrote (x-fg-run): GET and DELETE /api/runs/:id, `fg cleanup --run` (runs.ts). */
-  runs?: Pick<RunsStore, 'items' | 'remove' | 'claim' | 'owner'>;
+  runs?: Pick<RunsStore, 'items' | 'remove' | 'claim' | 'owner' | 'sandbox'>;
   /** GET /api/sessions/:id/evidence: what the tool saw in one session and decided (evidence.ts). */
   evidence?: EvidenceDeps;
   /** Aborted when the server shuts down: every open event stream ends at once, and no new one opens. */
@@ -501,7 +501,7 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
     if (c.req.header('x-fg-owner-cleanup') === 'true') {
       if (auth.token && !tokenMatches(bearerOf(c) ?? '', auth.token)) return c.json({ error: 'owner cleanup requires the configured API_TOKEN' }, 403);
       // Without API_TOKEN, preserve the local owner's browser-Origin model; normal origin validation follows.
-      if (!auth.token && c.req.header('origin') === undefined) return c.json({ error: 'tokenless owner cleanup requires the local owner Origin' }, 403);
+      if (!auth.token && c.req.header('sec-fetch-site') !== 'same-origin') return c.json({ error: 'tokenless owner cleanup requires the same-origin browser UI; fg --owner requires API_TOKEN' }, 403);
     }
     if (needsAuth(c.req.path)) {
       if (!authenticated(c, auth.token) && !operator) return bearerOf(c) ? unrecognised(c) : c.json({ error: 'sign in required' }, 401);
@@ -532,6 +532,17 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
     const run = RUN_PATH.test(c.req.path) ? null : label;
     const browser = c.req.header('origin') !== undefined;
     const principal: RunPrincipal = operator ? 'operator' : browser ? 'browser' : auth.token && authenticated(c, auth.token) ? 'owner_token' : 'agent';
+    // A sandbox run name is an identifier, not a credential. Reads need the same private
+    // capability as writes; the owner can inspect runs through the authenticated owner path.
+    const sandboxRunId = run?.id ?? (RUN_PATH.test(c.req.path) ? decodeURIComponent(c.req.path.split('/').filter(Boolean).at(-1)!) : c.req.query('run'));
+    if (sandboxRunId && (run?.sandbox || await opts.runs?.sandbox?.(sandboxRunId))) {
+      const ownerAccess = !!(auth.token && tokenMatches(bearerOf(c) ?? '', auth.token)) || c.req.header('sec-fetch-site') === 'same-origin';
+      const capability = operator ? runKey(c.req.header('x-fg-run-key'), auth.runKeySalt) : null;
+      const owner = await opts.runs?.owner(sandboxRunId);
+      if (!ownerAccess && !(capability && (!owner || (owner.principal === 'operator' && owner.actor === capability)))) {
+        return c.json({ error: 'sandbox run access requires its operator token and private FG_RUN_KEY, or the authenticated owner' }, 403);
+      }
+    }
     // A run id belongs to whoever opened it (its first labelled write): a write under it by anyone else is refused, so
     // a run cannot be hijacked or mixed. With the operator token, ownership is bound to a private
     // X-FG-Run-Key capability, so a copied display name cannot hijack a run; the cleanup rules are in runs.ts.
@@ -566,11 +577,16 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
       if (!allowed.has(verb)) return c.json(refusedVerb(verb), 403);
       return runAs(operatorName(c.req.header('x-fg-operator')), next);
     }
+    if (c.req.header('x-fg-owner') === 'true' && auth.token && tokenMatches(bearerOf(c) ?? '', auth.token)) {
+      log?.('owner token decision', { method: c.req.method, path: c.req.path });
+      return next();
+    }
     // A token was offered for this decision and it is neither token (with the operator token configured): say so. The
     // API token is recognised, it just cannot decide: that stays the 403 below.
     const offered = bearerOf(c);
     if (auth.operator?.token && offered && !(auth.token && tokenMatches(offered, auth.token))) return unrecognised(c);
-    if (c.req.header('origin') === undefined) {
+    if (c.req.header('origin') === undefined || c.req.header('sec-fetch-site') !== 'same-origin') {
+      log?.('owner decision refused', { method: c.req.method, path: c.req.path, reason: 'missing same-origin browser provenance' });
       return c.json({ error: 'only you can make this decision, from the Feedback Graph UI, or with FG_OPERATOR_TOKEN as a Bearer for the verbs OPERATOR_ALLOW names' }, 403);
     }
     await next();
@@ -647,6 +663,7 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
     return ok ? c.json(body) : c.json(body, 503);
   });
   app.get('/api/status', async (c) => {
+    await cloudState?.restore?.();
     const graph = (await system?.ping().catch(() => false)) ?? false;
     const worker = graph ? ((await system?.worker().catch(() => null)) ?? null) : null;
     const sel = graph && system?.selection ? await system.selection().catch(() => null) : null;
@@ -867,6 +884,17 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
     return true;
   };
 
+  app.post('/api/candidates/:id/undo', async c => {
+    const body = z.object({ decidedAt: z.string().datetime() }).strict().safeParse(await c.req.json().catch(() => null));
+    if (!body.success) return c.json({ error: body.error.flatten() }, 400);
+    const detail = await shownCandidate(c.req.param('id'));
+    if (!detail) return c.json({ error: 'not found' }, 404);
+    if (!mayChange(detail.candidate)) return c.json({ error: 'this Inbox item belongs to another run' }, 409);
+    if (!repo.undoDecision || !await repo.undoDecision(detail.candidate.id, body.data.decidedAt)) return c.json({ error: 'This decision changed or its post-mortem has started. Review the item and any resulting lessons before changing it.' }, 409);
+    await activity?.record({ kind: 'items_reopened', actor: 'you', projectKey: detail.candidate.projectKey, subject: 'Inbox decision undone', why: 'you reopened this decision before any post-mortem attempt or derived lesson', targets: [detail.candidate.id] });
+    return c.body(null, 204);
+  });
+
   app.post('/api/candidates/:id/decision', async (c) => {
     const body = Decision.safeParse(await c.req.json().catch(() => null));
     if (!body.success) return c.json({ error: body.error.flatten() }, 400);
@@ -952,7 +980,7 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
     const scanReadiness = async (provider?: string | null) => {
       const selected = provider ?? (await system?.worker().catch(() => null))?.providers.scan;
       const runner = selected?.startsWith('codex-cli') ? await system?.runner?.().catch(() => ({ ok: false, reason: 'runner readiness could not be checked' })) : null;
-      return runner && !runner.ok ? { blocked: true, warning: `Scan queued but parked: ${runner.reason}. No repository will be copied until runner readiness succeeds.` } : {};
+      return runner && !runner.ok ? { blocked: true, warning: `Scan queued but parked: ${(runner.reason ?? 'runner unavailable').trim().replace(/[.]+$/, '')}. No repository will be copied until runner readiness succeeds.` } : {};
     };
 
     app.post('/api/projects/:key/scan', async (c) => {
@@ -962,6 +990,16 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
       if (!project) return c.json({ error: 'no such folder under the configured roots' }, 404);
       const job = await facts.requestScan(project, body.data.provider ?? null);
       return c.json({ ...job, ...await scanReadiness(body.data.provider) }, 202);
+    });
+
+    app.post('/api/projects/:key/scan/:id/cancel', async c => {
+      const facts = opts.facts!;
+      if (!(await projectDirs()).some(p => p.key === c.req.param('key'))) return c.json({ error: 'no such project' }, 404);
+      const job = await facts.scanJob?.(c.req.param('id'));
+      if (!job || job.projectKey !== c.req.param('key')) return c.json({ error: 'no such scan' }, 404);
+      if (!facts.cancelQueuedScan || job.status !== 'queued') return c.json({ error: 'only queued scans can be cancelled' }, 409);
+      if (!await facts.cancelQueuedScan(job.id)) return c.json({ error: 'scan already started; it cannot be cancelled' }, 409);
+      return c.body(null, 204);
     });
 
     // Scan many folders in one call: `all` (every selected folder) or `keys`. Each is queued like the route above;
@@ -1579,7 +1617,7 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
         });
         results.push({ id: item.id, ok: true, status: item.status });
       }
-      return c.json({ results, sharing: LESSON_SHARING_NOTICE });
+      return c.json({ results, ...(results.some(r => r.ok) ? { sharing: LESSON_SHARING_NOTICE } : {}) });
     });
 
     // Owner-only (the operator's `retry`): flags only, so not a decision. The worker re-checks them at its next round.

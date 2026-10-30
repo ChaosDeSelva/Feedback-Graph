@@ -24,6 +24,8 @@ Write .env, mount the project folders, check Ollama (including structured output
 In a terminal it asks; these answer without one:
 
   --yes, -y                  yes to every question: pull missing models, start the stack, connect your agents
+  --skip-agents              never register agents, including with --yes
+  --no-transcripts           mount empty install-local transcript folders
   --pull-models              pull missing Ollama models (and nothing else unasked)
   --runner-procfs-compat     explicitly offer a runner-only Docker masked-path exception for nested procfs
                              (security tradeoff printed before confirmation; --yes alone never enables it)
@@ -48,12 +50,14 @@ first install's skill links and Codex guidance as they are.
 EOF
 }
 
-yes=0 pull_models=0 runner_procfs_compat=0 github_file="" linear_file="" claude_file="" select_raw="" select_given=0
+yes=0 skip_agents=0 no_transcripts=0 pull_models=0 runner_procfs_compat=0 github_file="" linear_file="" claude_file="" select_raw="" select_given=0
 while [ $# -gt 0 ]; do
   case "$1" in
     -h | --help) usage; exit 0 ;;
     -y | --yes) yes=1 ;;
     --pull-models) pull_models=1 ;;
+    --skip-agents) skip_agents=1 ;;
+    --no-transcripts) no_transcripts=1 ;;
     --runner-procfs-compat) runner_procfs_compat=1 ;;
     --projects | --select | --github-token-file | --linear-key-file | --claude-token-file)
       [ $# -ge 2 ] && [ -n "$2" ] || { echo "$1 needs a value" >&2; usage >&2; exit 1; }
@@ -85,6 +89,10 @@ typing() { [ "$yes" = 0 ] && interactive; }
 
 expand() { local p="${1/#\~/$HOME}"; p="${p%/}"; printf '%s' "${p:-/}"; }
 
+if [ "$no_transcripts" = 1 ]; then
+  export CLAUDE_PROJECTS_DIR="$here/state/empty-claude"
+  export CODEX_SESSIONS_DIR="$here/state/empty-codex"
+fi
 # Claude Code's transcripts (CLAUDE_PROJECTS_DIR, default ~/.claude/projects).
 claude_projects="$(expand "$(envval CLAUDE_PROJECTS_DIR)")"
 [ "$claude_projects" = / ] && claude_projects="$HOME/.claude/projects"
@@ -106,7 +114,9 @@ suggest() {
 # The project roots: the folders the containers may see, each read-only. There is no default and no guess: the folders
 # saved in Settings (state/settings/project-roots.json), else PROJECTS_DIRS (comma list, from .env; PROJECTS_DIR from
 # older versions), else asked in a terminal. PROJECTS_DIRS in the environment wins over all of them (and is saved).
-roots_file=state/settings/project-roots.json
+source scripts/lib/api-settings.sh
+prepare_api_settings .
+roots_file=state/api-settings/project-roots.json
 # The roots in the file Settings writes, one per line. Paths there never hold " or \ (the api refuses them).
 saved_roots() {
   tr -d '\n' <"$roots_file" | sed -n 's/.*"roots"[[:space:]]*:[[:space:]]*\[//p' | grep -oE '"[^"]*"|\]' |
@@ -238,13 +248,17 @@ if [ -n "$instance" ]; then
   esac
   [ -z "$bad" ] || { echo "FG_INSTANCE=$instance: use lowercase letters, digits, - and _ (starting with a letter or digit)" >&2; exit 1; }
 fi
+if [ "$no_transcripts" = 1 ] && [ -f .env ]; then
+  setenv CLAUDE_PROJECTS_DIR "$CLAUDE_PROJECTS_DIR"
+  setenv CODEX_SESSIONS_DIR "$CODEX_SESSIONS_DIR"
+fi
 current_name="${instance:-$(envval FG_INSTANCE)}"
 current_name="${current_name:-feedback-graph}"
 taken_by="$(other_dir "$current_name")"
 slug="$(basename "$here" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9_-' '-' | sed -e 's/^[^a-z0-9]*//' -e 's/-*$//')"
 new_instance="" port_offset=0
-if [ ! -f .env ] && [ -z "$instance" ] && [ -n "$taken_by" ]; then
-  new_instance="feedback-graph-${slug:-2}"
+if [ ! -f .env ] && { [ -n "$instance" ] || [ -n "$taken_by" ]; }; then
+  new_instance="${instance:-feedback-graph-${slug:-2}}"
   n=2 base_name="$new_instance"
   while [ -n "$(other_dir "$new_instance")" ]; do new_instance="$base_name-$n"; n=$((n + 1)); done
   # Ports 10 apart from the defaults until none is published by another container.
@@ -277,7 +291,17 @@ if [ -f .env ]; then
 else
   wrote_env=1
   codex=""
-  [ -f "$HOME/.codex/auth.json" ] && codex="$HOME/.codex/auth.json"
+  # Credential access is explicit; Ollama/Claude installs need no Codex login.
+  codex_enabled=0
+  case ",$(envval COMPOSE_PROFILES)," in *,codex,*) codex_enabled=1 ;; esac
+  [ -z "$(envval CODEX_RUNNER_URL)" ] || codex_enabled=1
+  for job in CLASSIFY_LLM POSTMORTEM_LLM SCAN_LLM DOCS_LLM CHAT_LLM SUMMARY_LLM; do
+    case "$(envval "$job")" in codex-cli | codex-cli:*) codex_enabled=1 ;; esac
+  done
+  if [ "$codex_enabled" = 1 ]; then
+    codex="$(envval CODEX_AUTH_FILE)"
+    if [ -n "$codex" ] && [ ! -f "$codex" ]; then echo "CODEX_AUTH_FILE must name an existing login file; clear it if Codex is not used" >&2; exit 1; fi
+  fi
   # The folders as given (none, one or several), so .env says what is mounted.
   sed -e "s|^NEO4J_PASSWORD=.*|NEO4J_PASSWORD=$(openssl rand -hex 18)|" \
       -e "s|^POSTGRES_PASSWORD=.*|POSTGRES_PASSWORD=$(openssl rand -hex 18)|" \
@@ -291,7 +315,8 @@ else
   if [ -n "$instance" ]; then
     setenv FG_INSTANCE "$instance"
     [ -z "$taken_by" ] || echo "note: FG_INSTANCE=$instance is also the name of the install in $taken_by: docker compose here would take over its containers and data"
-  elif [ -n "$new_instance" ]; then
+  fi
+  if [ -n "$new_instance" ]; then
     setenv FG_INSTANCE "$new_instance"
     if [ "$port_offset" -gt 0 ]; then
       setenv API_PORT $((8787 + port_offset))
@@ -300,8 +325,12 @@ else
       setenv POSTGRES_PORT $((5434 + port_offset))
       setenv OLLAMA_PORT $((11435 + port_offset))
     fi
-    echo "another install of Feedback Graph, in $taken_by, already uses the Docker Compose name $current_name. So that"
-    echo "  this folder never takes over its containers or its data, .env here sets FG_INSTANCE=$new_instance"
+    if [ -n "$taken_by" ]; then
+      echo "another install of Feedback Graph, in $taken_by, already uses the Docker Compose name $current_name. So that"
+      echo "  this folder never takes over its containers or its data, .env here sets FG_INSTANCE=$new_instance"
+    else
+      echo "new named install: FG_INSTANCE=$new_instance with separate published ports"
+    fi
     if [ "$port_offset" -gt 0 ]; then
       echo "  and its own ports: API_PORT=$((8787 + port_offset)) (http://localhost:$((8787 + port_offset))), NEO4J_HTTP_PORT=$((7476 + port_offset)), NEO4J_BOLT_PORT=$((7689 + port_offset)), POSTGRES_PORT=$((5434 + port_offset)),"
       echo "  OLLAMA_PORT=$((11435 + port_offset)) (the bundled ollama profile)."
@@ -314,6 +343,11 @@ else
 fi
 
 # Recheck the effective name after first-run auto-isolation wrote .env.
+if [ "$no_transcripts" = 1 ]; then
+  setenv CLAUDE_PROJECTS_DIR "$CLAUDE_PROJECTS_DIR"
+  setenv CODEX_SESSIONS_DIR "$CODEX_SESSIONS_DIR"
+fi
+
 current_name="${instance:-$(envval FG_INSTANCE)}"
 current_name="${current_name:-feedback-graph}"
 taken_by="$(other_dir "$current_name")"
@@ -572,7 +606,7 @@ if confirm "Start Feedback Graph now (docker compose up -d --build; restarts it 
     exit 1
   fi
   echo "running: $url (Settings: add project folders and choose the projects to read)"
-  if confirm "Connect Claude Code and Codex to it (./scripts/install-agent.sh)? [Y/n]" y; then
+  if [ "$skip_agents" = 0 ] && confirm "Connect Claude Code and Codex to it (./scripts/install-agent.sh)? [Y/n]" y; then
     ./scripts/install-agent.sh || echo "install-agent.sh did not finish; fix what it says and re-run it"
   fi
 else

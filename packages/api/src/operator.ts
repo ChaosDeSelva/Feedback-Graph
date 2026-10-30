@@ -13,12 +13,14 @@ import { tokenMatches } from './auth.ts';
 /** Which OPERATOR_ALLOW verb each owner-only route is. */
 export const OWNER_ROUTES: readonly (readonly ['POST' | 'PUT' | 'PATCH' | 'DELETE', string, OperatorVerb])[] = [
   ['POST', '/api/candidates/:id/decision', 'inbox_decide'],
+  ['POST', '/api/candidates/:id/undo', 'inbox_decide'],
   ['POST', '/api/candidates/decisions', 'inbox_decide'],
   ['PATCH', '/api/lessons/:id', 'lesson_decide'],
   ['POST', '/api/lessons/decisions', 'lesson_decide'],
   ['POST', '/api/lessons/recheck', 'retry'],
   ['POST', '/api/lessons/:id/to-fact', 'lesson_decide'],
   ['POST', '/api/projects/:key/scan', 'scan'],
+  ['POST', '/api/projects/:key/scan/:id/cancel', 'scan'],
   ['POST', '/api/projects/scan', 'scan'],
   ['POST', '/api/projects/:key/codemap/rebuild', 'scan'],
   ['PATCH', '/api/projects/:key/facts/:id/relevance', 'relevance'],

@@ -59,7 +59,7 @@ export type CloudInfo = {
   projects: string[];
   preview: { total: SyncCounts; projects: { key: string; counts: SyncCounts | null; reason?: string }[] } | null;
   previewError: string | null;
-  last: { at: string; ok: boolean; trigger: SyncTrigger; error: string | null; sent: SyncCounts | null; projects: string[]; failed: string[] } | null;
+  last: { at: string; ok: boolean; trigger: SyncTrigger; error: string | null; sent: SyncCounts | null; projects: string[]; failed: string[]; teamLessons?: { message: string }[] } | null;
   nextAt: string | null;
   neverSent: string;
 };
@@ -176,6 +176,7 @@ export const api = {
   candidates: (status: CandidateStatus, project?: string, offset = 0, filters: { pr?: string; author?: string } = {}) =>
     requestPage<Candidate>(`/api/candidates${qs({ status, ...filters, limit: String(CANDIDATE_PAGE), project, offset: offset ? String(offset) : undefined })}`),
   candidate: (id: string) => request<CandidateDetail>(`/api/candidates/${enc(id)}`),
+  undoDecision: (id: string, decidedAt: string) => request<void>(`/api/candidates/${encodeURIComponent(id)}/undo`, { method: 'POST', body: { decidedAt } }),
   decide: (id: string, status: 'confirmed' | 'rejected', note?: string) =>
     request(`/api/candidates/${enc(id)}/decision`, { method: 'POST', body: note ? { status, note } : { status } }),
   stats: () => request<StatsRow[]>('/api/stats'),
@@ -208,6 +209,7 @@ export const api = {
   setFactRelevance: (key: string, id: string, relevance: number) =>
     request(`/api/projects/${enc(key)}/facts/${enc(id)}/relevance`, { method: 'PATCH', body: { relevance } }),
   scan: (key: string, provider?: string) => request<ScanJob & { blocked?: boolean; warning?: string }>(`/api/projects/${enc(key)}/scan`, { method: 'POST', body: provider ? { provider } : {} }),
+  cancelScan: (key: string, id: string) => request(`/api/projects/${enc(key)}/scan/${enc(id)}/cancel`, { method: 'POST', body: {}, retry: false }),
   deleteProject: (key: string) => request(`/api/projects/${enc(key)}`, { method: 'DELETE', body: { confirm: key }, retry: false }),
   exportUrl: (key?: string) => `/api/export${qs({ project: key })}`,
   importBundle: (bundle: unknown, keepApproved: boolean) => request<ImportResult>(`/api/import${qs({ keepApproved: keepApproved ? '1' : undefined })}`, { method: 'POST', body: bundle, retry: false }),

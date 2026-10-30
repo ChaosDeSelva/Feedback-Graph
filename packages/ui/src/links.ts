@@ -11,11 +11,11 @@ export const activityKindHref = (kind: string) => `#activity/${encodeURIComponen
 export const sessionHref = (sessionId: string) => `#sessions/${encodeURIComponent(sessionId)}`;
 
 /** The page part of the hash: `lessons` for `#lessons/l1`. */
-export const hashView = () => location.hash.slice(1).split('/')[0];
+export const hashView = () => location.hash.slice(1).split('?')[0].split('/')[0];
 
 /** The item a link opened this page on, or null. */
 export function hashFocus(view: string): string | null {
-  const [v, ...rest] = location.hash.slice(1).split('/');
+  const [v, ...rest] = location.hash.slice(1).split('?')[0].split('/');
   if (v !== view || !rest.length) return null;
   try {
     return decodeURIComponent(rest.join('/')) || null;
@@ -48,7 +48,7 @@ export const moduleHref = (project: string, path: string) => `#projects/${encode
 
 /** The project, and the file whose module panel to open, that a Projects link names. */
 export function hashModule(): { project: string; path: string | null } | null {
-  const [v, key, path] = location.hash.slice(1).split('/');
+  const [v, key, path] = location.hash.slice(1).split('?')[0].split('/');
   if (v !== 'projects' || !key) return null;
   try {
     return { project: decodeURIComponent(key), path: path ? decodeURIComponent(path) : null };
@@ -75,4 +75,12 @@ export function sourceHref(project: string, s: { kind: string; ref: string }): s
     case 'doc': return /^https?:\/\//.test(s.ref) ? s.ref : projectHref(project);
     default: return null;
   }
+}
+
+export const hashFilters = () => new URLSearchParams(location.hash.split('?')[1] ?? '');
+export function saveHashFilters(view: string, values: Record<string, string>) {
+  const base = location.hash.split('?')[0];
+  if (hashView() !== view) return;
+  const q = new URLSearchParams(Object.entries(values).filter(([key, value]) => !!value && !(key === 'status' && value === (view === 'inbox' ? 'pending' : 'proposed'))));
+  history.replaceState(history.state, '', `${base}${q.size ? `?${q}` : ''}`);
 }

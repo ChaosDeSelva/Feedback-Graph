@@ -89,7 +89,7 @@ export function Sessions() {
     <div className="flex h-full min-h-0 flex-col">
       <PageHeader
         title="Sessions"
-        description="What each agent session set out to do, did, decided and left open, summarized as it goes."
+        description="Agent work sessions with recorded turns, summarized as they go. Synced comment threads and manual reports are counted in Projects but excluded here."
         actions={
           <>
             <Select aria-label="project" value={project} onChange={(e) => { setProject(e.target.value); setSelected(null); }} className="w-40">

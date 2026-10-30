@@ -139,3 +139,14 @@ test('an API without cloud sync renders nothing', async () => {
   await new Promise((r) => setTimeout(r, 10));
   expect(container.textContent).toBe('');
 });
+
+
+test('eligibility and the cloud admin approval gate are visible beside sync status', async () => {
+  state = info({ projects: ['shop', 'cap'], preview: { total: counts, projects: [{ key: 'shop', counts }, { key: 'cap', counts: null, reason: 'No shareable knowledge' }] },
+    last: { at: '2026-10-23T10:00:00Z', ok: true, trigger: 'manual', error: null, sent: counts, projects: ['shop'], failed: [],
+      teamLessons: [{ message: 'An admin must approve team lessons before the team MCP serves them.' }] } });
+  render(<CloudSync />);
+  const c = await card();
+  expect(c.getByLabelText('Cloud project eligibility').textContent).toContain('cap: not sent: No shareable knowledge');
+  expect(c.getByText('An admin must approve team lessons before the team MCP serves them.')).toBeTruthy();
+});

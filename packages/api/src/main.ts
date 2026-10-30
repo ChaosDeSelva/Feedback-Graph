@@ -1,11 +1,11 @@
-import { publicRedactionArchive, setRedactionArchive } from '@fb/core';
+import { publicRedactionArchive, setRedactionArchive, setRedactionArchivePurger } from '@fb/core';
 import { cloudLocalOnlyProjects } from '@fb/core';
 import { dirname, join } from 'node:path';
 import { loadRunKeySalt } from './runKeySalt.ts';
 import { existsSync } from 'node:fs';
 import type { Server } from 'node:http';
 import { serve } from '@hono/node-server';
-import { runnerReadiness, ConfigError, credentialFile, githubRepoOfRemote, Integrations, loadConfig, makeProviderOr, redactSecrets, ollamaEmbed, ollamaPing, projectFolders, refreshLayout, shownProjects, storedSyncMemory, syncProjects, VERSION, worktreeGitArgs, type Project } from '@fb/core';
+import { reportedRunnerReadiness, RUNNER_READINESS_CURSOR, ConfigError, credentialFile, githubRepoOfRemote, Integrations, loadConfig, makeProviderOr, redactSecrets, ollamaEmbed, ollamaPing, projectFolders, refreshLayout, shownProjects, storedSyncMemory, syncProjects, VERSION, worktreeGitArgs, type Project } from '@fb/core';
 import { openStore } from '@fb/store-postgres';
 import { Admission } from './admission.ts';
 import { createApp } from './app.ts';
@@ -43,6 +43,7 @@ const { knowledge, facts, activity, docs, selection } = store;
 const archiveDirectory = process.env.REDACTION_ARCHIVE_DIR ?? join(dirname(config.integrationsFile ?? join(process.cwd(), 'state/settings/integrations.json')), 'redaction-archive');
 const archive = await publicRedactionArchive(archiveDirectory, { retentionDays: Number(process.env.REDACTION_ARCHIVE_RETENTION_DAYS ?? 30) });
 setRedactionArchive(archive.save);
+setRedactionArchivePurger(archive.remove);
 const embed = (input: string[], options: { signal?: AbortSignal; timeoutMs?: number } = {}) => ollamaEmbed({ url: config.ollama.url, model: config.ollama.embedModel, input, ...options });
 
 const localModel = `ollama:${config.ollama.model}`;
@@ -203,7 +204,7 @@ const app = createApp(store.graph, {
   },
   auth: { runKeySalt, token: config.apiToken ?? undefined, publicHosts: config.publicHosts, operator: config.operator ?? undefined },
   system: { version: VERSION, store: store.kind, roots: roots.length, ping: () => store.ping(), worker: () => store.graph.workerStatus(), selection: () => selection.current(), givenUpTurns: () => store.graph.givenUpTurns(),
-    ...(process.env.CODEX_RUNNER_URL ? { runner: () => runnerReadiness(process.env.CODEX_RUNNER_URL!) } : {}),
+    ...(process.env.CODEX_RUNNER_URL ? { runner: async () => reportedRunnerReadiness(await store.docs.getCursor(RUNNER_READINESS_CURSOR)) } : {}),
     // The embedding model always; the local chat model too when the api's check_before_done judge uses it.
     ollama: () => ollamaPing({ url: config.ollama.url, models: [config.ollama.embedModel, ...(judgeLlm.id.startsWith('ollama:') ? [judgeLlm.id.slice(7)] : [])], timeoutMs: 2000 }),
   },

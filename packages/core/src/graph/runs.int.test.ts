@@ -56,6 +56,61 @@ describeStores('RunsStore and run attribution', (h) => {
     probe = h.probe;
   });
 
+  test('concurrent sandbox demo facts stay visible only to their run and cleanup preserves the other run', async () => {
+    const write = (id: string) => s.facts.saveFileFacts('shop', { path: 'src/probe.ts', hash: 'demo', summary: 'fixture' }, [
+      { kind: 'convention', statement: id, path: 'src/probe.ts', lines: null, confidence: 1, why: 'fixture', embedding: vec(1) },
+    ], 'demo', null, { id, sandbox: true });
+    await Promise.all([write('fact-one'), write('fact-two')]);
+    expect(await s.facts.listFacts({ projectKey: 'shop', path: 'src/probe.ts' })).toEqual([]);
+    expect((await s.facts.listFacts({ projectKey: 'shop', path: 'src/probe.ts', run: 'fact-one' })).map(f => f.statement)).toEqual(['fact-one']);
+    expect((await s.facts.listFacts({ projectKey: 'shop', path: 'src/probe.ts', run: 'fact-two' })).map(f => f.statement)).toEqual(['fact-two']);
+    await s.facts.replaceProjectFacts('shop', [], 'model', []);
+    expect((await s.facts.listFacts({ projectKey: 'shop', path: 'src/probe.ts', run: 'fact-two' })).map(f => f.statement)).toEqual(['fact-two']);
+    expect((await s.runs.remove('fact-one', [])).fact).toBe(1);
+    expect((await s.facts.listFacts({ projectKey: 'shop', path: 'src/probe.ts', run: 'fact-two' })).map(f => f.statement)).toEqual(['fact-two']);
+  });
+
+  test('removing a labelled demo seed preserves another run in the same demo project', async () => {
+    for (const id of ['demo-one', 'demo-two']) {
+      const run = { id, sandbox: true };
+      await s.knowledge.saveDemoMiss!({ project, id: `demo:shop:run:${id}:miss`, ts: '2026-10-01T10:00:00Z', feedbackText: 'fixture', whatWasDone: 'fixture', missed: 'fixture', cause: 'requirement_unstated', causeExplanation: 'fixture', embedding: vec(1), run });
+      await s.knowledge.upsertLesson({ id: `demo:shop:run:${id}:lesson`, projectKey: 'shop', title: id, rule: 'Fixture', appliesWhen: 'fixture', scope: 'project', paths: ['src/probe.ts'], status: 'approved', source: 'demo', embedding: vec(1), run });
+    }
+    await s.knowledge.removeDemo!('shop', { id: 'demo-one', sandbox: true });
+    expect(await s.runs.items('demo-one')).toEqual([]);
+    expect((await s.runs.items('demo-two')).map(x => x.kind)).toEqual(expect.arrayContaining(['feedback', 'lesson', 'miss']));
+  });
+
+  test('undo reopens only an unchanged unprocessed Inbox decision', async () => {
+    const id = await s.knowledge.createManualFeedback({ project, cwd: '/vibe/shop', text: 'undo fixture', whatWasDone: 'fixture' });
+    await s.graph.decide(id, 'confirmed', null);
+    const decidedAt = (await s.graph.candidateDetail(id))!.candidate.decidedAt!;
+    expect(await s.graph.undoDecision!(id, '2000-01-01T00:00:00.000Z')).toBe(false);
+    expect(await s.graph.undoDecision!(id, decidedAt)).toBe(true);
+    expect((await s.graph.candidateDetail(id))!.candidate.status).toBe('pending');
+    expect(await s.knowledge.savePostmortem(id, pm('Late model'), { miss: vec(1), lesson: vec(1) })).toBe(false);
+    expect(await s.knowledge.lessonDetail(`lesson:${id}`)).toBeNull();
+    expect(await s.graph.undoDecision!(id, decidedAt)).toBe(false);
+    await s.graph.decide(id, 'confirmed', null);
+    await s.knowledge.savePostmortem(id, pm('Already processed'), { miss: vec(1), lesson: vec(1) });
+    const processed = (await s.graph.candidateDetail(id))!.candidate.decidedAt!;
+    expect(await s.graph.undoDecision!(id, processed)).toBe(false);
+    expect(await s.knowledge.lessonDetail(`lesson:${id}`)).not.toBeNull();
+  });
+
+  test('persisted memory writes inherit their own session run and a later owner write clears attribution', async () => {
+    const path = '/transcripts/project/memory/probe.md';
+    const run = { id: 'memory-probe', sandbox: true };
+    await s.sessions.claimRun('memory-session', run);
+    const first = { ...session('memory-session'), toolCalls: [{ name: 'Write', ts: '2026-10-01T10:03:00Z', filePath: path }] };
+    await s.graph.upsertSession(project, first, []);
+    expect(await s.graph.memoryWriteRun?.('shop', path)).toEqual(run);
+    const owner = { ...session('memory-owner'), endedAt: '2026-10-02T10:03:00Z', toolCalls: [{ name: 'Edit', ts: '2026-10-02T10:02:00Z', filePath: path }] };
+    await s.graph.upsertSession(project, owner, []);
+    expect(await s.graph.memoryWriteRun?.('shop', path)).toBeNull();
+    expect(await s.graph.memoryWriteRun?.('shop', '/memory/other.md')).toBeNull();
+  });
+
   test('sandbox provenance includes session-only registrations', async () => {
     expect(await s.sessions.claimRun('sandbox-only-session', { id: 'sandbox-only', sandbox: true })).toBe(true);
     expect(await s.sessions.claimRun('ordinary-only-session', { id: 'ordinary-only', sandbox: false })).toBe(true);

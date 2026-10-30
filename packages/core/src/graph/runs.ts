@@ -1,3 +1,4 @@
+import { archiveRunFileSelector, purgeRedactionOriginals } from '../redactionArchive.ts';
 import { removedCounts, runItems, runRemoval, type RunRow } from '../runs.ts';
 import { LegacyRunClaimError, runClaimExecutor } from '../storeWrites.ts';
 import type { RunsStore } from '../store.ts';
@@ -28,12 +29,12 @@ const FIND: Record<RunItemKind, string> = {
  * since is not the run's any more). Lessons and misses first, so a report's chain goes from its end.
  */
 const DELETE: [RunItemKind, string][] = [
-  ['lesson', `UNWIND $ids AS id MATCH (x:Lesson {id: id, run: $run}) DETACH DELETE x RETURN count(*) AS n`],
+  ['lesson', `UNWIND $ids AS id MATCH (x:Lesson {id: id, run: $run}) WITH x, x.id AS removedId DETACH DELETE x RETURN count(*) AS n, collect(removedId) AS removedIds`],
   ['miss', `UNWIND $ids AS id MATCH (x:Miss {id: id, run: $run})
             OPTIONAL MATCH (ci:ContextItem)-[:WOULD_HAVE_PREVENTED]->(x)
             WITH x, collect(ci) AS items
             FOREACH (ci IN items | DETACH DELETE ci)
-            DETACH DELETE x RETURN count(*) AS n`],
+            WITH x, x.id AS removedId DETACH DELETE x RETURN count(*) AS n, collect(removedId) AS removedIds`],
   // The report's stand-in session and turn (never a real session's: a merged report is not deleted), its feedback and task.
   ['feedback', `UNWIND $ids AS id MATCH (x:Candidate {id: id, run: $run}) WHERE NOT coalesce(x.detected, false)
                 OPTIONAL MATCH (x)-[:FLAGS]->(t:Turn)<-[:HAS_TURN]-(s:Session {manual: true})
@@ -41,9 +42,9 @@ const DELETE: [RunItemKind, string][] = [
                 OPTIONAL MATCH (task:Task {id: 'task:' + id})
                 WITH x, collect(t) + collect(s) + collect(f) + collect(task) AS rest
                 FOREACH (r IN rest | DETACH DELETE r)
-                DETACH DELETE x RETURN count(*) AS n`],
-  ['predone_check', `UNWIND $ids AS id MATCH (x:PreDoneCheck {id: id, run: $run}) DETACH DELETE x RETURN count(*) AS n`],
-  ['fact', `UNWIND $ids AS id MATCH (x:Fact {id: id, run: $run}) WHERE x.docId IS NULL DETACH DELETE x RETURN count(*) AS n`],
+                WITH x, x.id AS removedId DETACH DELETE x RETURN count(*) AS n, collect(removedId) AS removedIds`],
+  ['predone_check', `UNWIND $ids AS id MATCH (x:PreDoneCheck {id: id, run: $run}) WITH x, x.id AS removedId DETACH DELETE x RETURN count(*) AS n, collect(removedId) AS removedIds`],
+  ['fact', `UNWIND $ids AS id MATCH (x:Fact {id: id, run: $run}) WHERE x.docId IS NULL WITH x, x.id AS removedId DETACH DELETE x RETURN count(*) AS n, collect(removedId) AS removedIds`],
   ['doc', `UNWIND $ids AS id MATCH (x:Doc {id: id, run: $run})
            OPTIONAL MATCH (x)-[:HAS_CHUNK]->(c:Chunk)
            WITH x, id, collect(c) AS chunks
@@ -53,13 +54,13 @@ const DELETE: [RunItemKind, string][] = [
            WITH x, chunks, facts, collect(b) AS blobs
            WITH x, chunks + facts + blobs AS rest
            FOREACH (r IN rest | DETACH DELETE r)
-           DETACH DELETE x RETURN count(*) AS n`],
-  ['link', `UNWIND $ids AS id MATCH (x:ProjectLink {id: id, run: $run}) DETACH DELETE x RETURN count(*) AS n`],
+           WITH x, x.id AS removedId DETACH DELETE x RETURN count(*) AS n, collect(removedId) AS removedIds`],
+  ['link', `UNWIND $ids AS id MATCH (x:ProjectLink {id: id, run: $run}) WITH x, x.id AS removedId DETACH DELETE x RETURN count(*) AS n, collect(removedId) AS removedIds`],
   ['chat', `UNWIND $ids AS id MATCH (x:ChatConversation {id: id, run: $run})
             OPTIONAL MATCH (t:ChatTurn {conversationId: id})
             WITH x, collect(t) AS turns
             FOREACH (t IN turns | DETACH DELETE t)
-            DETACH DELETE x RETURN count(*) AS n`],
+            WITH x, x.id AS removedId DETACH DELETE x RETURN count(*) AS n, collect(removedId) AS removedIds`],
 ];
 
 const OWNER = 'o.run AS run, o.principal AS principal, o.actor AS actor, o.firstSeen AS firstSeen';
@@ -83,11 +84,9 @@ export class RunsRepo implements RunsStore {
   }
 
   async sandbox(run: string): Promise<boolean> {
-    const [row] = await this.g.run(
-      `RETURN EXISTS { MATCH (x:SessionRun {run: $run, sandbox: true}) } OR
-              EXISTS { MATCH (x:Session {run: $run, sandbox: true}) } OR
-              EXISTS { MATCH (x:Activity {run: $run, sandbox: true}) } AS sandbox`, { run });
-    return row?.get('sandbox') === true || (await this.items(run)).some(x => x.sandbox);
+    const labels = ['SessionRun', 'Session', 'Activity', 'Candidate', 'Lesson', 'Miss', 'Fact', 'Doc', 'ProjectLink'];
+    const [row] = await this.g.run(`RETURN ${labels.map(label => `EXISTS { MATCH (x:${label} {run: $run, sandbox: true}) }`).join(' OR ')} AS sandbox`, { run });
+    return row?.get('sandbox') === true;
   }
 
   async items(run: string): Promise<RunItem[]> {
@@ -102,8 +101,22 @@ export class RunsRepo implements RunsStore {
 
   async remove(run: string, keep: string[]): Promise<Record<RunItemKind, number>> {
     const ids = runRemoval(await this.items(run), keep);
+    const files = await this.g.run(`MATCH (f:Fact {run: $run}) WHERE f.id IN $ids RETURN DISTINCT f.projectKey AS project, f.path AS path`, { run, ids: ids.fact });
+    const childRows = await this.g.run(`MATCH (d:Doc {run: $run}) WHERE d.id IN $ids
+      OPTIONAL MATCH (d)-[:HAS_CHUNK]->(c:Chunk) WITH d, collect(DISTINCT c.id) AS chunks
+      OPTIONAL MATCH (f:Fact {docId: d.id})
+      RETURN d.id AS doc, chunks, collect(DISTINCT f.id) AS facts`, { run, ids: ids.doc });
     const out = await this.g.runInTransaction(DELETE.map(([kind, cypher]) => [cypher, { run, ids: ids[kind] }]));
     // The run's sandbox records may have been the last ones: the searches may skip the run filter again.
+    const fileSelectors: { kind: string; id: string }[] = [];
+    for (const file of files) {
+      const [left] = await this.g.run(`MATCH (f:Fact {run: $run, projectKey: $project, path: $path}) RETURN count(f) AS n`, { run, project: file.get('project'), path: file.get('path') });
+      if (Number(left?.get('n') ?? 0) === 0) fileSelectors.push(archiveRunFileSelector(run, file.get('project'), file.get('path')));
+    }
+    const actual = DELETE.flatMap(([kind], i) => ((out[i]?.[0]?.get('removedIds') ?? []) as string[]).map(id => ({ kind, id })));
+    const deletedDocs = new Set(actual.filter(row => row.kind === 'doc').map(row => row.id));
+    const children = childRows.filter(row => deletedDocs.has(row.get('doc'))).flatMap(row => [...row.get('chunks').map((id: string) => ({ kind: 'chunk', id })), ...row.get('facts').map((id: string) => ({ kind: 'fact', id }))]);
+    await purgeRedactionOriginals([...fileSelectors, ...actual, ...children]);
     this.g.sandbox.recheck();
     return removedCounts(Object.fromEntries(DELETE.map(([kind], i) => [kind, Number(out[i]?.[0]?.get('n') ?? 0)])));
   }

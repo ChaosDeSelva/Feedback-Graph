@@ -94,7 +94,8 @@ test('checkBeforeDone answers at once, deterministically, when the judge cannot 
   expect(r.markdown).toMatch(/^# Not judged: the judge did not take this check within 0 s \(queued behind 1 check\)/);
   expect(r.markdown).toContain('Server-side search');
   // Not a pass and not a gap: the catch rate does not count it.
-  expect(d.checks).toHaveLength(0);
+  expect(d.checks).toHaveLength(1);
+  expect(d.checks[0]).toMatchObject({ status: expect.stringMatching(/queued|failed/) });
 });
 
 test('checkBeforeDone with no relevant lessons and no close past miss passes without calling the judge', async () => {
@@ -1001,7 +1002,7 @@ describe('what reaches the agent: misses', () => {
     ]; } } });
     const r = await getTaskContext({ project: 'demo', task: 'list members', files: ['src/webapp/core/settings/users/router.ts'] }, d);
     expect(asked).toBeGreaterThan(4);
-    expect(r.misses.map((m) => m.missId)).toEqual(['mw', 'mg']);
+    expect(r.misses.map((m) => m.missId)).toEqual(['mw']);
   });
 });
 
@@ -1198,7 +1199,8 @@ index 3b18e51..a9c4f2d 100644
     expect(r.markdown).not.toMatch(/none looks unaddressed/);
     expect(r.gaps).toEqual([]);
     expect(r.cannotTell?.map((c) => c.lessonId)).toEqual(['l1', 'l2']);
-    expect(d.checks).toHaveLength(0);
+    expect(d.checks).toHaveLength(1);
+  expect(d.checks[0]).toMatchObject({ status: expect.stringMatching(/queued|failed/) });
     const entry = recorded.find((a) => a.kind === 'predone_check')!;
     expect(entry.subject).toMatch(/not judged, the judge failed/);
     // The same {id} shape as every other check, so session evidence reads what was served.
@@ -1218,7 +1220,8 @@ index 3b18e51..a9c4f2d 100644
     const r = await checkBeforeDone({ project: 'demo', task: 'orders export', summary: 'added export', diff: DIFF }, d);
     expect(Date.now() - t).toBeLessThan(1000);
     expect(r.markdown).toMatch(/^# Not judged: the judge did not answer within 0 s/);
-    expect(d.checks).toHaveLength(0);
+    expect(d.checks).toHaveLength(1);
+  expect(d.checks[0]).toMatchObject({ status: expect.stringMatching(/queued|failed/) });
     // One attempt, given the check's whole budget (not 180 s), and cancelled when the check gave up.
     expect(seen).toHaveLength(1);
     expect(seen[0].timeoutMs).toBeLessThanOrEqual(60);

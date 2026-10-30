@@ -38,9 +38,9 @@ test('MCP needs the token too', async () => {
 
 test('signing in from the UI sets an HttpOnly session cookie that authenticates later requests', async () => {
   const app = secured();
-  const bad = await app.request('/api/session', { method: 'POST', headers: { 'content-type': 'application/json', origin: 'http://localhost' }, body: JSON.stringify({ token: 'nope' }) });
+  const bad = await app.request('/api/session', { method: 'POST', headers: { 'content-type': 'application/json', 'sec-fetch-site': 'same-origin', origin: 'http://localhost' }, body: JSON.stringify({ token: 'nope' }) });
   expect(bad.status).toBe(401);
-  const res = await app.request('/api/session', { method: 'POST', headers: { 'content-type': 'application/json', origin: 'http://localhost' }, body: JSON.stringify({ token: TOKEN }) });
+  const res = await app.request('/api/session', { method: 'POST', headers: { 'content-type': 'application/json', 'sec-fetch-site': 'same-origin', origin: 'http://localhost' }, body: JSON.stringify({ token: TOKEN }) });
   expect(res.status).toBe(204);
   const cookie = res.headers.get('set-cookie')!;
   expect(cookie).toMatch(/HttpOnly/i);
@@ -65,7 +65,7 @@ test('a public host name is accepted only when a token protects the API', async 
 test('behind a TLS proxy, the https origin of the same host may write', async () => {
   const res = await secured().request('http://fg.corp.example/api/candidates/c1/decision', {
     method: 'POST',
-    headers: { host: 'fg.corp.example', origin: 'https://fg.corp.example', 'content-type': 'application/json', ...bearer },
+    headers: { host: 'fg.corp.example', 'sec-fetch-site': 'same-origin', origin: 'https://fg.corp.example', 'content-type': 'application/json', ...bearer },
     body: JSON.stringify({ status: 'rejected' }),
   });
   expect(res.status).toBe(204);
@@ -77,4 +77,19 @@ test('responses carry security headers', async () => {
   expect(res.headers.get('x-frame-options')).toBe('DENY');
   expect(res.headers.get('referrer-policy')).toBe('no-referrer');
   expect(res.headers.get('content-security-policy')).toMatch(/default-src 'self'/);
+});
+
+
+test('Origin alone is insufficient owner proof; browser fetch metadata is required', async () => {
+  const app = createApp(repo);
+  const res = await app.request('/api/candidates/c1/decision', { method: 'POST', headers: { origin: 'http://localhost', 'content-type': 'application/json' }, body: JSON.stringify({ status: 'rejected' }) });
+  expect(res.status).toBe(403);
+});
+
+
+test('headless owner decisions need the explicit owner intent and configured API token', async () => {
+  const app = createApp(repo, { auth: { token: 'owner-test-token-12345678901234567890' } });
+  const request = (headers: Record<string, string>) => app.request('/api/candidates/c1/decision', { method: 'POST', headers: { 'content-type': 'application/json', ...headers }, body: JSON.stringify({ status: 'rejected' }) });
+  expect((await request({ authorization: 'Bearer owner-test-token-12345678901234567890' })).status).toBe(403);
+  expect((await request({ authorization: 'Bearer owner-test-token-12345678901234567890', 'x-fg-owner': 'true' })).status).toBe(204);
 });

@@ -149,11 +149,11 @@ export class PgKnowledgeStore implements KnowledgeStore {
     }, Boolean);
   }
 
-  async savePostmortem(feedbackId: string, raw: PostMortem, embeddings: { miss: number[]; lesson: number[] }): Promise<void> {
+  async savePostmortem(feedbackId: string, raw: PostMortem, embeddings: { miss: number[]; lesson: number[] }): Promise<boolean> {
     const pm = redactDeep(raw);
     await archiveRedactionInput('postmortem', feedbackId, raw, pm); // model output can quote secrets it read in the repo
     const now = new Date();
-    await tx(this.db, async (c) => {
+    return tx(this.db, async (c) => {
       // The report's run (RunTag), carried to the miss and lesson so a sandbox one is served only to its run.
       const { rows } = await c.query(
         `SELECT f.id, t.uuid, s.id AS sid, p.key AS pkey, k.run, coalesce(k.sandbox, false) AS sandbox
@@ -163,7 +163,7 @@ export class PgKnowledgeStore implements KnowledgeStore {
         [feedbackId],
       );
       const r = rows[0];
-      if (!r) return;
+      if (!r) return false;
       // A sandbox report's miss and lesson are sandbox records (this may be the worker, whose searches have not seen it).
       sandboxPresence(this.db).wrote(r.sandbox ?? true);
       const taskId = `task:${r.sid}`;
@@ -177,7 +177,7 @@ export class PgKnowledgeStore implements KnowledgeStore {
       if (pm.noMiss) {
         await c.query("UPDATE feedback SET status = 'rejected' WHERE id = $1", [feedbackId]);
         await c.query('DELETE FROM misses WHERE feedback_id = $1', [feedbackId]);
-        return; // A false/disputed claim must not become a served miss.
+        return true; // A false/disputed claim must not become a served miss.
       }
       await c.query('INSERT INTO causes (key) VALUES ($1) ON CONFLICT DO NOTHING', [pm.cause]);
       await c.query(
@@ -250,6 +250,7 @@ export class PgKnowledgeStore implements KnowledgeStore {
           await c.query('INSERT INTO context_item_sessions (context_item_id, session_id) VALUES ($1, $2) ON CONFLICT DO NOTHING', [id, r.sid]);
         }
       }
+      return true;
     });
   }
 
@@ -261,9 +262,9 @@ export class PgKnowledgeStore implements KnowledgeStore {
          AND ($5::text IS NULL OR l.checks @> jsonb_build_array(jsonb_build_object('name', $5::text)))
          AND ($6::text IS NULL OR ${FROM} = $6) AND ${visibleToRun('l', '$7')}
          AND ($8::text IS NULL OR t.external->>'thread' ~ ('#' || $8 || '$') OR concat_ws(E'\n', t.text, t.preceding_assistant_text, t.summary, l.title, l.rule, l.applies_when) ~* $10)
-         AND ($9::text IS NULL OR lower(t.external->>'author') = lower($9) OR concat_ws(E'\n', t.text, t.preceding_assistant_text, t.summary, l.title, l.rule, l.applies_when) ~* $11)
+         AND ($9::text IS NULL OR lower(t.external->>'author') = lower($9))
        ORDER BY l.created_at DESC, l.id COLLATE "C" LIMIT $3`,
-      [f.status ?? null, f.projectKey ?? null, f.limit ?? 500, f.projectKeys ?? null, f.flag ?? null, f.from ?? null, f.run ?? null, f.pr ? String(f.pr) : null, f.author ?? null, reviewPatterns(f.pr).pr, reviewPatterns(undefined, f.author).author],
+      [f.status ?? null, f.projectKey ?? null, f.limit ?? 500, f.projectKeys ?? null, f.flag ?? null, f.from ?? null, f.run ?? null, f.pr ? String(f.pr) : null, f.author ?? null, reviewPatterns(f.pr).pr],
     );
     return rows.map(lessonOf);
   }
@@ -596,11 +597,11 @@ export class PgKnowledgeStore implements KnowledgeStore {
     return id;
   }
 
-  async recordPreDoneCheck(c: { projectKey: string; task: string; checkedLessonIds: string[]; gapLessonIds: string[]; run?: RunTag | null; sessionId?: string | null }): Promise<void> {
+  async recordPreDoneCheck(c: { projectKey: string; task: string; checkedLessonIds: string[]; gapLessonIds: string[]; status?: string; run?: RunTag | null; sessionId?: string | null }): Promise<void> {
     const id = randomUUID();
     sandboxPresence(this.db).wrote(c.run);
     await tx(this.db, async (x) => {
-      await x.query('INSERT INTO predone_checks (id, project_key, ts, task, checked, gaps, run, sandbox, session_id) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)', [
+      await x.query('INSERT INTO predone_checks (id, project_key, ts, task, checked, gaps, run, sandbox, session_id, status) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)', [
         id,
         c.projectKey,
         new Date(),
@@ -610,6 +611,7 @@ export class PgKnowledgeStore implements KnowledgeStore {
         c.run?.id ?? null,
         !!c.run?.sandbox,
         c.sessionId ?? null,
+        c.status ?? 'lesson_judged',
       ]);
       // Lesson ids that do not exist are not linked.
       await x.query(
@@ -709,8 +711,8 @@ export class PgKnowledgeStore implements KnowledgeStore {
     return missId;
   }
 
-  async removeDemo(projectKey: string): Promise<DemoRemoved> {
-    const like = `${demoPrefix(projectKey).replace(/[\\%_]/g, '\\$&')}%`;
+  async removeDemo(projectKey: string, run: RunTag | null = null): Promise<DemoRemoved> {
+    const like = `${(demoPrefix(projectKey) + (run ? `run:${run.id}:` : "")).replace(/[\\%_]/g, '\\$&')}%`;
     return tx(this.db, async (c) => {
       const misses = await c.query(
         `SELECT count(*)::int AS n FROM misses m JOIN feedback f ON f.id = m.feedback_id JOIN turns t ON t.uuid = f.turn_uuid
@@ -719,13 +721,13 @@ export class PgKnowledgeStore implements KnowledgeStore {
       );
       // Turns, Inbox items, feedback, misses, tasks and touched files all hang off the session (ON DELETE CASCADE).
       await c.query('DELETE FROM sessions WHERE id LIKE $1 AND project_key = $2 AND manual', [like, projectKey]);
-      const lessons = await c.query(`DELETE FROM lessons WHERE source = 'demo' AND (project_key = $1 OR (project_key IS NULL AND origin_project_key = $1))`, [projectKey]);
-      const facts = await c.query(`DELETE FROM facts WHERE project_key = $1 AND source = 'demo'`, [projectKey]);
+      const lessons = await c.query(`DELETE FROM lessons WHERE source = 'demo' AND (project_key = $1 OR (project_key IS NULL AND origin_project_key = $1)) AND ($2::text IS NULL OR run = $2)`, [projectKey, run?.id ?? null]);
+      const facts = await c.query(`DELETE FROM facts WHERE project_key = $1 AND source = 'demo' AND ($2::text IS NULL OR run = $2)`, [projectKey, run?.id ?? null]);
       // The file rows the demo added (hash DEMO_SOURCE: a scan that read the file since gave it a real one): unscanned
       // again, and gone unless the code map or other facts hold them.
       const added = await c.query(
         `UPDATE code_files SET hash = NULL, summary = NULL, scanned_at = NULL, scan_version = NULL, hash_changed_at = NULL
-         WHERE project_key = $1 AND hash = $2 RETURNING id`,
+         WHERE project_key = $1 AND hash = $2 AND NOT EXISTS (SELECT 1 FROM facts f WHERE f.code_file_id = code_files.id AND f.current) RETURNING id`,
         [projectKey, DEMO_SOURCE],
       );
       if (added.rows.length) {

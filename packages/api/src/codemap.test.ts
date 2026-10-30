@@ -253,7 +253,7 @@ test('check_before_done with files_changed lists importers and tests that were n
   expect(r.markdown).toMatch(/no past lessons/i);
   expect(d.recorded[0]).toMatchObject({ kind: 'predone_check', details: { filesChanged: ['src/db/pool.ts', 'src/api/users.ts'], codeGaps: r.codeGaps } });
   // the lesson catch-rate counts lesson gaps only
-  expect(d.checks).toEqual([]);
+  expect(d.checks).toEqual([expect.objectContaining({ status: 'no_applicable_rules', checkedLessonIds: [] })]);
 });
 
 test('check_before_done adds code gaps after the lesson gaps', async () => {
@@ -396,7 +396,7 @@ test('hotspots can list a whole map: the limit goes up to the map cap', async ()
 test('POST /api/projects/:key/codemap/rebuild asks the worker for a fresh map; only you (or an operator allowed to scan) may', async () => {
   const { app, asked } = restApp();
   const json = { 'content-type': 'application/json' };
-  const post = (key: string, headers: Record<string, string> = { origin: 'http://localhost' }) =>
+  const post = (key: string, headers: Record<string, string> = { 'sec-fetch-site': 'same-origin', origin: 'http://localhost' }) =>
     app.request(`/api/projects/${key}/codemap/rebuild`, { method: 'POST', headers: { ...json, ...headers }, body: '{}' });
   expect((await post('demo', {})).status).toBe(403);
   expect(asked).toEqual([]);

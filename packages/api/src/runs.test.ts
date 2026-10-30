@@ -11,7 +11,7 @@ const json = (method: string, body: object, headers: Record<string, string> = {}
   method, body: JSON.stringify(body), headers: { 'content-type': 'application/json', ...headers },
 });
 const op = (run?: string, more: Record<string, string> = {}) => ({ authorization: `Bearer ${OP}`, 'x-fg-operator': 'tester', 'x-fg-run-key': KEY, ...(run && { 'x-fg-run': run }), ...more });
-const browser = { origin: 'http://localhost' };
+const browser = { 'sec-fetch-site': 'same-origin', origin: 'http://localhost' };
 
 const lesson = (id: string, o: Partial<Lesson> = {}): Lesson => ({
   id, projectKey: 'demo', title: `Lesson ${id}`, rule: 'R', appliesWhen: 'W', scope: 'project', paths: ['src/**'], status: 'approved',
@@ -118,7 +118,7 @@ test('a request labelled x-fg-run records the run on what it logs; x-fg-sandbox 
 
 test("an MCP agent labels its connection with ?run= (or the header): its report and pre-done check carry the run, and what it was served is logged with it", async () => {
   const { app, logged, reports } = setup();
-  const res = await app.request('/mcp?run=run-1&sandbox=1', rpc('report_feedback', { cwd: '/Users/j/Vibe/demo', feedback: 'missed auth', what_was_done: 'endpoint' }));
+  const res = await app.request('/mcp?run=run-1&sandbox=1', { ...rpc('report_feedback', { cwd: '/Users/j/Vibe/demo', feedback: 'missed auth', what_was_done: 'endpoint' }), headers: { ...rpc('x', {}).headers, ...op() } });
   expect(await textOf(res)).toContain('manual:9');
   expect(reports).toEqual([expect.objectContaining({ text: 'missed auth', run: { id: 'run-1', sandbox: true } satisfies RunTag })]);
   expect(logged.at(-1)).toMatchObject({ kind: 'candidate_flagged', run: 'run-1', sandbox: true });
@@ -161,7 +161,7 @@ test("every store read an MCP agent's answer comes from is asked for its run: th
       links: { listLinks: async (q) => { asked.push(['listLinks', q.run]); return []; } },
     },
   });
-  const call = (url: string, name: string, args: object) => app.request(url, rpc(name, { cwd: '/Users/j/Vibe/demo', ...args }));
+  const call = (url: string, name: string, args: object) => app.request(url, { ...rpc(name, { cwd: '/Users/j/Vibe/demo', ...args }), headers: { ...rpc('x', {}).headers, ...op() } });
   for (const url of ['/mcp?run=run-1&sandbox=1', '/mcp']) {
     asked.length = 0;
     await call(url, 'get_task_context', { task: 'tune it', files: ['src/a.ts'] });
@@ -663,7 +663,7 @@ test('a refused first run write to an owner record does not claim the run id', a
 
 test('legacy owner cleanup requires the actual configured owner token', async () => {
   const s = setup({ token: API, owners: { legacy: ['operator', 'old-display-name'] } });
-  const base = { origin: 'http://localhost', 'x-fg-owner-cleanup': 'true' };
+  const base = { 'sec-fetch-site': 'same-origin', origin: 'http://localhost', 'x-fg-owner-cleanup': 'true' };
   expect((await s.app.request('/api/runs/legacy', json('DELETE', { dryRun: true }, { ...base, authorization: `Bearer ${OP}` }))).status).toBe(403);
   expect((await s.app.request('/api/runs/legacy', json('DELETE', { dryRun: true }, { ...base, authorization: `Bearer ${API}` }))).status).toBe(200);
 });
@@ -722,15 +722,26 @@ test('tokenless local owner cleanup works with a valid Origin and never grants a
   const marker = { 'x-fg-owner-cleanup': 'true' };
   expect((await s.app.request('/api/runs/legacy', json('DELETE', { dryRun: true }, marker))).status).toBe(403);
   expect((await s.app.request('/api/runs/legacy', json('DELETE', { dryRun: true }, { ...marker, origin: 'https://evil.example' }))).status).toBe(403);
-  expect((await s.app.request('/api/runs/legacy', json('DELETE', { dryRun: true }, { ...marker, origin: 'http://localhost' }))).status).toBe(200);
+  expect((await s.app.request('/api/runs/legacy', json('DELETE', { dryRun: true }, { ...marker, 'sec-fetch-site': 'same-origin', origin: 'http://localhost' }))).status).toBe(200);
   expect(s.removed).toEqual([]);
 });
 
 
 test('sandbox cleanup recognizes session-only registration provenance', async () => {
   const s = setup({ sandbox: true });
-  const result = await (await s.app.request('/api/runs/run-1')).json();
+  const result = await (await s.app.request('/api/runs/run-1', { headers: op() })).json();
   expect(result.sandbox).toBe(true);
   expect(result.entries).toBe(0);
   expect(Object.values(result.remove)).toEqual(expect.arrayContaining([0]));
+});
+
+
+test('knowing a sandbox run name cannot read its records without the private capability', async () => {
+  const s = setup({ sandbox: true, owners: { 'run-1': ['operator', CALLER] } });
+  const bare = await s.app.request('/api/lessons?run=run-1', { headers: { 'x-fg-run': 'run-1' } });
+  expect(bare.status).toBe(403);
+  expect((await s.app.request('/api/activity?run=run-1')).status).toBe(403);
+  expect((await s.app.request('/api/runs/run-1')).status).toBe(403);
+  const wrong = await s.app.request('/api/lessons', { headers: op('run-1', { 'x-fg-run-key': 'different-high-entropy-operator-key-123456' }) });
+  expect(wrong.status).toBe(403);
 });

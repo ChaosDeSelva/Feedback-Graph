@@ -12,7 +12,7 @@ const app = createApp(repo, {
 });
 const req = (method: string, body: object, origin?: string) => ({
   method, body: JSON.stringify(body),
-  headers: { 'content-type': 'application/json', ...(origin ? { origin } : {}) },
+  headers: { 'content-type': 'application/json', ...(origin ? { origin, 'sec-fetch-site': 'same-origin' } : {}) },
 });
 
 test('approving a lesson or deciding feedback needs the UI (a browser Origin); a bare local client is refused', async () => {
@@ -45,4 +45,18 @@ test('turns the classifier gave up on are re-queued from the UI only, and the re
   expect(res.status).toBe(200);
   expect(await res.json()).toEqual({ requeued: 4 });
   expect(logged).toEqual([expect.objectContaining({ kind: 'turns_requeued', actor: 'you', subject: 're-queued 4 turns the classifier had given up on' })]);
+});
+
+
+test('Undo validates and authorizes before mutation, audits success and refuses processed decisions', async () => {
+  let writes = 0; let ok = false; const history: unknown[] = [];
+  const a = createApp({ ...repo, undoDecision: async () => { writes++; return ok; } }, { activity: { list: async () => [], record: async e => { history.push(e); } } });
+  const path = '/api/candidates/c1/undo'; const when = '2026-10-01T10:00:00.000Z';
+  expect((await a.request(path, req('POST', { decidedAt: when }))).status).toBe(403);
+  expect((await a.request(path, req('POST', { decidedAt: 'bad' }, 'http://localhost'))).status).toBe(400);
+  expect(writes).toBe(0);
+  expect((await a.request(path, req('POST', { decidedAt: when }, 'http://localhost'))).status).toBe(409);
+  expect(history).toEqual([]); ok = true;
+  expect((await a.request(path, req('POST', { decidedAt: when }, 'http://localhost'))).status).toBe(204);
+  expect(history).toEqual([expect.objectContaining({ kind: 'items_reopened', targets: ['c1'] })]);
 });

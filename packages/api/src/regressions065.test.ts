@@ -69,7 +69,7 @@ test('own PR review lessons and docs are both excluded, including comment identi
 test('Ask includes a code-map file miss even when vector search finds no miss', async () => {
   const miss = { missId: 'miss:file', missed: 'Forgot authentication', cause: 'implementation_error', causeExplanation: 'x', feedbackId: 'f1', feedbackText: 'check auth', sessionId: 's1', ts: '2026-10-27', paths: ['src/app.ts'], fixedHere: false, lessonId: null };
   const context = deps({ codegraph: { lessonsForPaths: async () => [], moduleContext: async () => ({ file: {}, symbols: [], importers: [], imports: [], tests: [], facts: [], misses: [miss], lessons: [] }) } as never });
-  const pack = await buildChatContext('demo', 'what does app do?', [], { context, codeMap: async () => ({ fingerprint: null, builtAt: 't', stats: {}, candidates: null, files: [{ path: 'src/app.ts', lang: 'typescript', hash: 'h', loc: 1, isTest: false }], symbols: [], imports: [], outside: [] }) as never });
+  const pack = await buildChatContext('demo', 'what does src/app.ts do?', [], { context, codeMap: async () => ({ fingerprint: null, builtAt: 't', stats: {}, candidates: null, files: [{ path: 'src/app.ts', lang: 'typescript', hash: 'h', loc: 1, isTest: false }], symbols: [], imports: [], outside: [] }) as never });
   expect(pack.context).toContain('Forgot authentication');
   expect(pack.sources.some((s) => s.kind === 'miss' && s.ref === 'src/app.ts')).toBe(true);
 });

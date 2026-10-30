@@ -69,7 +69,7 @@ describeStores('KnowledgeStore', (h) => {
       expect((await k.listLessons({ limit: 2 })).map(l => l.id)).toEqual(sorted.slice(0, 2));
     });
 
-    test('Inbox and Lessons PR and author filters include exact transcript references without GitHub metadata', async () => {
+    test('PR filters match exact transcript references while author filters require source metadata', async () => {
       for (const [id, text] of [['right', 'Please fix PR #14194 from @Octo.'], ['wrong-number', 'Please fix #141940 from @Octo.'], ['wrong-author', 'Please fix #14194 from @Octo-more.']]) {
         const s = session(`mention-${id}`);
         s.turns[2].text = text;
@@ -79,8 +79,10 @@ describeStores('KnowledgeStore', (h) => {
         await repo.decide(fid, 'confirmed', null);
         await k.savePostmortem(fid, pm(), { miss: vec(1), lesson: vec(1) });
       }
-      expect((await repo.listCandidates({ pr: 14194, author: 'octo' })).map(c => c.id)).toEqual(['mention-right-t2']);
-      expect((await k.listLessons({ pr: 14194, author: 'octo' })).map(l => l.id)).toEqual(['lesson:mention-right-t2']);
+      expect((await repo.listCandidates({ pr: 14194 })).map(c => c.id).sort()).toEqual(['mention-right-t2', 'mention-wrong-author-t2']);
+      expect((await k.listLessons({ pr: 14194 })).map(l => l.id).sort()).toEqual(['lesson:mention-right-t2', 'lesson:mention-wrong-author-t2']);
+      expect(await repo.listCandidates({ author: 'octo' })).toEqual([]);
+      expect(await k.listLessons({ author: 'octo' })).toEqual([]);
       expect(await repo.listCandidates({ pr: 1419 })).toEqual([]);
       expect(await k.listLessons({ pr: 1419 })).toEqual([]);
     });
@@ -619,6 +621,16 @@ describeStores('KnowledgeStore', (h) => {
         origins: ['agent'],
         agentReport: { text: 'you missed auth checks', whatWasDone: 'added /api/orders', sessionId: null },
       });
+    });
+
+    test('recordPreDoneCheck durably distinguishes queued and no-rule attempts from lesson judgments', async () => {
+      for (const status of ['queued', 'failed', 'no_applicable_rules', 'miss_judged']) {
+        await k.recordPreDoneCheck({ projectKey: 'demo', task: status, checkedLessonIds: [], gapLessonIds: [], status });
+      }
+      const rows = await probe.rows('PreDoneCheck');
+      expect(rows).toHaveLength(4);
+      expect(rows.map(row => row.status).sort()).toEqual(['failed', 'miss_judged', 'no_applicable_rules', 'queued']);
+      expect((await probe.preDoneChecks()).every(row => row.checked === 0 && row.lessons.length === 0)).toBe(true);
     });
 
     test('recordPreDoneCheck stores which lessons were checked and which were gaps', async () => {

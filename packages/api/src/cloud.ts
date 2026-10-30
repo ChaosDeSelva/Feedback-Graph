@@ -4,7 +4,7 @@ import { z } from 'zod';
 import {
   previewCloudSync, redactSecrets, runCloudSync, cloudLocalOnlyProjects, CLOUD_LOCAL_ONLY_CURSOR, cloudSharedDemoProjects, CLOUD_SHARED_DEMOS_CURSOR,
   type ActivityStore, type DocsStore, type CloudConfig, type CloudSyncResult, type ManualSync, type PortabilityStore, type SyncCounts, type SyncMemory,
-  type SyncProgress, type SyncTrigger, type WorkerStatus,
+  type SyncProgress, type SyncTrigger, type SyncResponse, type WorkerStatus,
 } from '@fb/core';
 
 export type CloudDeps = {
@@ -39,7 +39,7 @@ export type CloudInfo = {
   projects: string[];
   preview: { total: SyncCounts; projects: { key: string; counts: SyncCounts | null; reason?: string }[] } | null;
   previewError: string | null;
-  last: { at: string; ok: boolean; trigger: SyncTrigger; error: string | null; sent: SyncCounts | null; projects: string[]; failed: string[] } | null;
+  last: { at: string; ok: boolean; trigger: SyncTrigger; error: string | null; sent: SyncCounts | null; projects: string[]; failed: string[]; teamLessons?: NonNullable<SyncResponse['teamLessons']>[] } | null;
   nextAt: string | null;
   neverSent: string;
 };
@@ -48,7 +48,7 @@ export type CloudInfo = {
 export type RunningSync = SyncProgress & { startedAt: string };
 
 /** What this api process knows about Sync now: the run in progress and the last one it finished. */
-export type CloudState = { running(): RunningSync | null; lastManual(): ManualSync | null };
+export type CloudState = { running(): RunningSync | null; lastManual(): ManualSync | null; restore?(): Promise<void> };
 
 /**
  * What /api/status says about sync: whether it is on and where it goes, the last Sync now this api ran and the one
@@ -61,6 +61,7 @@ const manualOf = (r: CloudSyncResult): ManualSync => ({
   at: r.at, ok: r.ok, error: r.error, sent: r.sent,
   unchanged: r.projects.filter((p) => p.status === 'unchanged').length,
   failed: r.projects.filter((p) => p.status === 'failed').length,
+  ...(r.projects.some(p => p.teamLessons) ? { teamLessons: r.projects.flatMap(p => p.teamLessons ? [p.teamLessons] : []) } : {}),
 });
 
 const SyncRequest = z.object({ force: z.boolean().optional() }).strict();
@@ -79,8 +80,14 @@ export function cloudRoutes(app: Hono, d: CloudDeps): CloudState {
   let lastManual: ManualSync | null = null;
   // What the cloud last accepted per project, for `withdrawn` on the next Sync now; shared with the worker's schedule.
   const memory: SyncMemory = d.memory ?? new Map();
+  const restore = async () => {
+    const saved = await memory.last?.('manual');
+    if (saved && (!lastManual || Date.parse(saved.at) > Date.parse(lastManual.at))) lastManual = manualOf(saved);
+  };
 
   app.get('/api/cloud', async (c) => {
+    const requestedProject = c.req.query('project');
+    if (requestedProject !== undefined && !/^[\w][\w./-]{0,199}$/.test(requestedProject)) return c.json({ error: 'invalid project key' }, 400);
     const cloud = d.cloud;
     const info: CloudInfo = {
       enabled: !!cloud,
@@ -105,7 +112,16 @@ export function cloudRoutes(app: Hono, d: CloudDeps): CloudState {
     } catch (err) {
       info.previewError = redactSecrets(String(err)).slice(0, 300);
     }
-    const [a] = await d.activity.list({ kind: 'cloud_synced', limit: 1 }).catch(() => []);
+    if (requestedProject && !info.projects.includes(requestedProject)) {
+      info.preview ??= { total: { projects: 0, lessons: 0, misses: 0, facts: 0, docs: 0, codeFiles: 0 }, projects: [] };
+      info.preview.projects.push({ key: requestedProject, counts: null, reason: info.localOnlyProjects?.includes(requestedProject) ? 'Project is local-only; it will not be sent.' : 'Project is not selected for cloud sync; it will not be sent.' });
+    }
+    await restore();
+    const saved = await memory.last?.();
+    if (saved) info.last = { at: saved.at, ok: saved.ok, trigger: saved.trigger, error: saved.error, sent: saved.sent,
+      projects: saved.projects.filter(p => p.status === 'sent').map(p => p.key), failed: saved.projects.filter(p => p.status === 'failed').map(p => p.key),
+      ...(saved.projects.some(p => p.teamLessons) ? { teamLessons: saved.projects.flatMap(p => p.teamLessons ? [p.teamLessons] : []) } : {}) };
+    const [a] = saved ? [] : await d.activity.list({ kind: 'cloud_synced', limit: 1 }).catch(() => []);
     if (a) {
       const x = a.details as { ok?: boolean; trigger?: SyncTrigger; error?: string | null; sent?: SyncCounts; projects?: string[]; failed?: string[] };
       info.last = { at: a.ts, ok: !!x.ok, trigger: x.trigger ?? 'schedule', error: x.error ?? null, sent: x.sent ?? null, projects: x.projects ?? [], failed: x.failed ?? [] };
@@ -114,7 +130,7 @@ export function cloudRoutes(app: Hono, d: CloudDeps): CloudState {
     return c.json(info);
   });
 
-  app.get('/api/cloud/progress', (c) => c.json({ running: progress, lastManual }));
+  app.get('/api/cloud/progress', async (c) => { await restore(); return c.json({ running: progress, lastManual }); });
 
   app.put('/api/cloud/local-only', async (c) => {
     if (!d.localOnlyStore) return c.json({ error: 'local-only policy storage is unavailable' }, 503);
@@ -149,5 +165,5 @@ export function cloudRoutes(app: Hono, d: CloudDeps): CloudState {
     }
   });
 
-  return { running: () => progress, lastManual: () => lastManual };
+  return { running: () => progress, lastManual: () => lastManual, restore };
 }

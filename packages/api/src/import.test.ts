@@ -4,7 +4,7 @@ import { createApp, type ApiRepo } from './app.ts';
 import { MAX_IMPORT_BYTES, type ImportDeps } from './import.ts';
 
 const repo = { listCandidates: async () => [], candidateDetail: async () => null, decide: async () => {}, stats: async () => [] } as unknown as ApiRepo;
-const ui = { origin: 'http://localhost', 'content-type': 'application/json' };
+const ui = { 'sec-fetch-site': 'same-origin', origin: 'http://localhost', 'content-type': 'application/json' };
 
 const lesson = (id: string, over: Partial<Lesson> = {}): Lesson => ({
   id, projectKey: 'demo', title: `T ${id}`, rule: `R ${id}`, appliesWhen: 'w', scope: 'project', paths: [], status: 'approved',
@@ -149,7 +149,7 @@ test('backup import retains private-project provenance through the creation-only
   const restored: { key: string; remote: string | null }[] = [];
   const { app } = deps({ portability: { restorePrivateProject: async project => { restored.push(project); } } });
   const b = bundle({ projects: [{ key: 'private-demo', remote: null, demoCreated: true }], lessons: [], facts: [] });
-  const response = await app.request('/api/import', { method: 'POST', body: JSON.stringify(b), headers: { origin: 'http://localhost', 'content-type': 'application/json' } });
+  const response = await app.request('/api/import', { method: 'POST', body: JSON.stringify(b), headers: { 'sec-fetch-site': 'same-origin', origin: 'http://localhost', 'content-type': 'application/json' } });
   expect(response.status).toBe(200);
   expect(restored).toEqual([{ key: 'private-demo', remote: null }]);
 });

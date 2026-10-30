@@ -30,8 +30,10 @@ test('docker-compose.yml mounts no project folder: the roots come only from the 
   }
   // The api saves the roots chosen in Settings in a folder of its own, never next to the worker's database or logins.
   const api = compose.slice(compose.indexOf('\n  api:'), compose.indexOf('\n  postgres:'));
-  expect(api).toContain('- ./state/settings:/settings');
-  expect(api).toContain('ROOTS_FILE: /settings/project-roots.json');
+  expect(api).toContain('- ./state/api-settings:/api-settings');
+  expect(api).toContain('- ./state/settings/redaction-archive:/redaction-archive');
+  expect(api).not.toContain('- ./state/settings:/settings');
+  expect(api).toContain('ROOTS_FILE: /api-settings/project-roots.json');
   expect(api).not.toContain('./state:/state');
 });
 
@@ -80,4 +82,21 @@ test('the bundled ollama publishes on OLLAMA_PORT (11435 by default), so a secon
   const ollama = compose.slice(compose.indexOf('\n  ollama:'), compose.indexOf('\nvolumes:'));
   expect(ollama).toContain('- "127.0.0.1:${OLLAMA_PORT:-11435}:11434"');
   expect(readFileSync(join(repo, '.env.example'), 'utf8')).toMatch(/^OLLAMA_PORT=$/m);
+});
+
+test('external container images use immutable manifest digests in production and verification', () => {
+  for (const file of ['Dockerfile', 'docker-compose.yml', 'docker-compose.test.yml', '.github/workflows/ci.yml']) {
+    const source = readFileSync(join(repo, file), 'utf8');
+    const images = [...source.matchAll(/(?:^FROM |^\s+image:\s*)([^\s]+)/gm)].map(m => m[1]);
+    for (const image of images.filter(x => x.includes(':'))) expect(image, `${file}: ${image}`).toMatch(/@sha256:[0-9a-f]{64}$/);
+  }
+});
+
+
+test('archive volume initialization creates its private directory before chown so Docker cannot overwrite fresh HOST_UID ownership by copy-up', () => {
+  const compose = readFileSync(join(repo, 'docker-compose.yml'), 'utf8');
+  const init = compose.slice(compose.indexOf('  archive-key-init:'), compose.indexOf('  worker:'));
+  expect(init.indexOf('mkdir -p /redaction-key/private')).toBeGreaterThan(0);
+  expect(init.indexOf('mkdir -p /redaction-key/private')).toBeLessThan(init.indexOf('chown -hR'));
+  expect(init).toContain('[ ! -L /redaction-key/private ] || exit 1');
 });

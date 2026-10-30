@@ -176,7 +176,7 @@ a confirmed one gets a post-mortem.
    active in the two days before it. Its post-mortem then reads that session (its turns, edited files and summary) beside the
    comment; with no session found it works from the comment and the diff lines alone.
 
-A token pasted in Settings is kept in `state/settings/integrations.json` (mode 600, `INTEGRATIONS_FILE`): never in the
+A token pasted in Settings is kept in `state/api-settings/integrations.json` (mode 600, `INTEGRATIONS_FILE`): never in the
 database, never returned by the API, logged, exported or synced. Comment text is redacted before it is stored or sent to a
 model, and calls go only to `api.github.com` and `api.linear.app`. A rejected token (revoked or expired) pauses that service
 until you replace it, and a rate limit pauses it until the limit lifts; both show in Settings and in the sidebar's
@@ -238,3 +238,5 @@ pnpm test                                                                 # unit
 docker compose -f docker-compose.test.yml up -d --wait && TEST_STORES=neo4j,postgres pnpm test:int   # contract suites on both backends
 ./scripts/check.sh                                                        # everything CI runs
 ```
+
+See the [installation guide](docs/install.md) for a fresh installation, a second local instance and the small memory profile.
