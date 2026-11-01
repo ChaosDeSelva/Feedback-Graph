@@ -54,6 +54,7 @@ test('weighted misses/docs drop below .80 while exact named source facts survive
   expect(rankFacts([fact], 5, ['src/org_clock.py'], [], .78, .8)).toHaveLength(1);
   expect(rankFacts([fact], 5, ['src/other.py'], [], .78, .8)).toEqual([]);
   expect(taskPrNumbers('PR1 of 2')).toEqual([]);
+  expect(taskPrNumbers('(PR 1 of 2)')).toEqual([]);
   expect(taskPrNumbers('review PR 14299')).toEqual([14299]);
 });
 

@@ -556,6 +556,14 @@ if [ -n "$(envval CLOUD_URL)" ] && [ -z "$(envval CLOUD_MACHINE)" ]; then
   [ -n "$machine" ] && setenv CLOUD_MACHINE "$machine" && echo "CLOUD_MACHINE set to $machine (the name the cloud shows for this machine's syncs)"
 fi
 
+# Fetch Metadata is a browser/CSRF guard, not authentication against another local process. Make authenticated local
+# installs the normal path; agents receive this read/API token, never the separate headless owner credential.
+if [ -z "$(envval API_TOKEN)" ] &&
+  confirm "Create an API token (recommended: the only owner boundary against other local processes)? [Y/n]" y; then
+  setenv API_TOKEN "$(openssl rand -hex 24)"
+  echo "API_TOKEN saved to .env (not printed). The UI will ask you to sign in with that value; agents receive it for read/tool access, but it cannot make owner decisions."
+fi
+
 # The operator token lets an agent or ./scripts/fg make the owner decisions OPERATOR_ALLOW names (by default not
 # deciding lessons or deleting data). Made only when you say yes (or pass --yes), before the start so the api has it.
 if [ -z "$(envval FG_OPERATOR_TOKEN)" ] &&

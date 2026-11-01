@@ -10,7 +10,7 @@
  * 5: an instruction in an upload is one addressed to the reader-as-AI, not a project convention (facts v4 closed as
  * instructions are reopened); the head of a token an older Activity subject cut at its cap is redacted.
  */
-export const REDACTION_VERSION = 10;
+export const REDACTION_VERSION = 11;
 /** Rows a store reads per page when it redacts stored text again under new rules. */
 export const REDACT_PAGE = 1000;
 
@@ -68,7 +68,7 @@ export function looksLikeSecret(v: string): boolean {
 function slashedSecret(v: string): boolean {
   if (!/[/\\]/.test(v) || URL_START.test(v) || /^[./~\\]/.test(v) || /\.[a-z][a-z0-9]{0,4}$/i.test(v)) return false;
   if (v.length < 16 || !/[A-Z]/.test(v) || !/[a-z]/.test(v) || !/\d/.test(v)) return false;
-  return !v.split(/[/\\]/).every((seg) => /^[A-Za-z][a-z]*\d*$/.test(seg) || IDENT.test(seg));
+  return !v.split(/[/\\]/).every((seg) => /^\d+$|^[A-Za-z][a-z]*\d*$/.test(seg) || IDENT.test(seg) || CAMEL.test(seg));
 }
 
 /** An unquoted value after a secret name: one that looks like a secret, slashes and all. */
@@ -102,7 +102,8 @@ const TOKEN_PATTERNS: RegExp[] = [
   /\bmfa\.[A-Za-z0-9_-]{40,}\b/g,
   /\$(?:2[aby]\$\d{2}\$[./A-Za-z0-9]{53}|(?:apr1|1)\$[./A-Za-z0-9]{1,8}\$[./A-Za-z0-9]{22}|5\$(?:rounds=\d+\$)?[./A-Za-z0-9]{1,16}\$[./A-Za-z0-9]{43}|6\$(?:rounds=\d+\$)?[./A-Za-z0-9]{1,16}\$[./A-Za-z0-9]{86}|argon2(?:id|i|d)\$v=\d+\$m=\d+,t=\d+,p=\d+\$[A-Za-z0-9+/]+=*\$[A-Za-z0-9+/]+=*)|\{SHA\}[A-Za-z0-9+/]{27}=/g,
   /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g,
-  /-----BEGIN (?:RSA |EC |OPENSSH |ENCRYPTED )?PRIVATE KEY-----\r?\n(?:[A-Za-z0-9+/=]{8,}(?:\r?\n|$))+/g,
+  /-----BEGIN (?:RSA |DSA |EC |OPENSSH |ENCRYPTED )?PRIVATE KEY-----\r?\n(?:(?:Proc-Type|DEK-Info):[^\r\n]*\r?\n|[ \t]*\r?\n|[A-Za-z0-9+/=]{8,}(?:\r?\n|$))+/g,
+  /-----BEGIN (?:RSA |DSA |EC |OPENSSH |ENCRYPTED )?PRIVATE KEY-----\\n(?:(?:Proc-Type|DEK-Info):[^\\]*(?:\\n|$)|[A-Za-z0-9+/=]{8,}(?:\\n|$))+/g,
   /\bsk-(?:proj-|ant-[a-z0-9]+-)?[A-Za-z0-9_-]{20,}/g,
   /\b[sr]k_(?:live|test)_[A-Za-z0-9]{16,}/g,
   /\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{30,}/g,
@@ -120,13 +121,17 @@ const TOKEN_PATTERNS: RegExp[] = [
   /\bhf_[A-Za-z0-9]{30,}/g,
   /\bnpm_[A-Za-z0-9]{36,}/g,
   /\blin_api_[A-Za-z0-9]{32,}/g,
+  /\bdapi[a-f0-9]{32,}\b/gi,
   // Feedback Graph Cloud personal access tokens: fgc_pat_<16 hex lookup id>_<secret>.
   /\bfgc_pat_[0-9a-f]{16}_[A-Za-z0-9_-]{20,}/g,
   // The head of a token cut at a length cap (an Activity subject before v5 was cut before it was redacted): a known
   // token prefix running into the cut's ellipsis at the end of the text. The ellipsis stays.
   /\b(?:(?:ghp|gho|ghu|ghs|ghr|github_pat|glpat|hf|npm|lin_api|fgc_pat|[sr]k_(?:live|test))_|sk-|xox[abprs]-|AKIA|ASIA|ya29\.|AIza|eyJ)[A-Za-z0-9_.-]{4,}(?=…$)/g,
   // user:password@ in a URL; the user name stays. A ${VAR} in its place is a reference, not a secret.
-  /\b([a-z][a-z0-9+.-]*:\/\/[^\s:/@]+:)(?!\$\{)[^\s@/]+(?=@)/gi,
+  /\b([a-z][a-z0-9+.-]*:\/\/[^\s:/@]*:)(?!\$\{)[^\s@/]+(?=@)/gi,
+  /(\bcurl\s+[^\r\n]*?-u\s+[^\s:'"]+:)([^\s'"]+)/gi,
+  /(\bmysql\s+[^\r\n]*?--password=)(?!\s|\$)[^\s'"]+/gi,
+  /(\bmysql\s+[^\r\n]*?\s-p)(?!\s|\$)[^\s'"]+/gi,
   // A webhook URL is its own secret: the host and kind stay, the path that grants access goes.
   /\b(https?:\/\/hooks\.slack\.com\/(?:services|workflows|triggers)\/)[A-Za-z0-9_/-]{8,}/g,
   /\b(https?:\/\/(?:ptb\.|canary\.)?discord(?:app)?\.com\/api\/webhooks\/)\d+\/[A-Za-z0-9_-]{20,}/g,
@@ -140,8 +145,8 @@ const TOKEN_PATTERNS: RegExp[] = [
  * a <v> group (the value), and a check the value must pass; text the check refuses is left exactly as it was.
  */
 const CONTEXT_RULES: { re: RegExp; check: (v: string) => boolean }[] = [
-  { re: /(?<keep>\bdefine\(\s*["'][^"']*(?:PASSWORD|PASSWD|SECRET|TOKEN|API_KEY|(?:AUTH|SECURE_AUTH|LOGGED_IN|NONCE)_(?:KEY|SALT))["']\s*,\s*["'])(?<v>[^"'\r\n]+)(?=["']\s*\))/gi, check: assignedSecret },
-  { re: /(?<keep>\b(?:Password|Pwd)[ \t]*=(?![=>])[ \t]*)(?<v>[^;\r\n]+)(?=;)/gi, check: value => assignedSecret(value.trim()) },
+  { re: /(?<keep>\bdefine\(\s*["'][^"']*(?:PASSWORD|PASSWD|SECRET|TOKEN|API_KEY|(?:AUTH|SECURE_AUTH|LOGGED_IN|NONCE)_(?:KEY|SALT))["']\s*,\s*["'])(?<v>[^"'\r\n]+)(?=["']\s*\))/gi, check: value => assignedSecret(value) || (/^[A-Za-z]+[([]/.test(value) && /[A-Z0-9!@#$%^&*]/.test(value)) },
+  { re: /(?<keep>(?<![\w.])(?:Password|Pwd)[ \t]*=(?![=>])[ \t]*)(?<v>[^;\r\n]+)(?=;|$)/gi, check: value => !/\s/.test(value.trim()) && !/^["']/.test(value.trim()) && assignedSecret(value.trim()) },
   { re: /(?<keep>\b(?:AUTH|SECURE_AUTH|LOGGED_IN|NONCE)_(?:KEY|SALT)(?:\s*=\s*["']?|\s*:\s*["']))(?<v>[^"'\r\n;]+)(?=["']|;|$)/gim, check: assignedSecret },
   // Env-style assignments whose name ends in a secret word: KEY=value, export KEY="value". A $VAR reference, a call
   // (os.environ.get(...)) or a value that is a URL or names a secret is not a secret.
@@ -191,7 +196,12 @@ function replaceTokens(text: string): string {
     const id = Buffer.from(value.split('.')[0], 'base64url').toString('utf8');
     return /^\d{17,22}$/.test(id) ? '[REDACTED]' : value;
   });
-  out = out.replace(/(?<![A-Za-z0-9/+])[A-Za-z0-9/+]{40}(?![A-Za-z0-9/+])/g, value => /[/+]/.test(value) && slashedSecret(value.replaceAll('+', '/')) && new Set(value).size >= 16 ? '[REDACTED]' : value);
+  out = out.replace(/(?<![A-Za-z0-9])[A-Za-z0-9]{40}(?![A-Za-z0-9])/g, value => {
+    const highEntropy = /[A-Z]/.test(value) && /[a-z]/.test(value) && /\d/.test(value) && new Set(value).size >= 16;
+    return highEntropy && !CAMEL.test(value) ? '[REDACTED]' : value;
+  });
+  out = out.replace(/(?<![A-Za-z0-9/+])(?=[A-Za-z0-9+\/]{40}(?![A-Za-z0-9/+]))(?=[A-Za-z0-9+\/]*\/)[A-Za-z0-9+\/]{40}/g,
+    value => slashedSecret(value) && new Set(value).size >= 16 ? '[REDACTED]' : value);
   out = out.replace(/\b(Basic[ \t]+)([A-Za-z0-9+/]+={0,2})(?=$|[\s"',;])/gi,
     (all, keep: string, value: string) => encodedCredential(value) ? `${keep}[REDACTED]` : all);
   out = out.replace(/("auth"\s*:\s*")([^"\r\n]+)(")/gi,

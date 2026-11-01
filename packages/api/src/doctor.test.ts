@@ -199,13 +199,13 @@ test('an answer that is all thinking and no content is a FAIL that says what to 
 
 test('configured runner health requires its actual sandbox probe to succeed', () => {
   const env = 'API_PORT=8787\nCODEX_RUNNER_URL=http://codex-runner:8790\n';
-  const failed = doctor({ env, runnerSandbox: false });
+  const failed = doctor({ env, runnerSandbox: false, running: ['neo4j', 'worker', 'api', 'codex-runner'] });
   expect(failed.code).toBe(1);
   expect(failed.out).toContain('FAIL  Codex runner: sandbox cannot start');
   expect(failed.out).toContain('setup.sh --runner-procfs-compat');
   expect(failed.out).toContain('explicit opt-in removes Docker system-path protection');
   expect(failed.out).toContain("Can't mount proc /proc: Operation not permitted");
-  const healthy = doctor({ env, runnerSandbox: true });
+  const healthy = doctor({ env, runnerSandbox: true, running: ['neo4j', 'worker', 'api', 'codex-runner'] });
   expect(healthy.code).toBe(0);
   expect(healthy.out).toContain('PASS  Codex runner: its nested sandbox starts successfully');
 });

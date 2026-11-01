@@ -24,7 +24,7 @@ const entry = (o: Partial<Activity>): Activity => ({
 
 const API = 'a'.repeat(32);
 
-function setup(o: { allow?: OperatorVerb[]; items?: RunItem[]; entries?: Activity[]; extra?: Partial<AppOpts>; ctx?: Partial<ContextDeps>; owners?: Record<string, RunPrincipal | [RunPrincipal, string | null]>; token?: string; sandbox?: boolean } = {}) {
+function setup(o: { allow?: OperatorVerb[]; items?: RunItem[]; entries?: Activity[]; extra?: Partial<AppOpts>; ctx?: Partial<ContextDeps>; owners?: Record<string, RunPrincipal | [RunPrincipal, string | null]>; token?: string; ownerToken?: string; sandbox?: boolean } = {}) {
   const logged: ActivityInput[] = [];
   const listed: unknown[] = [];
   const reports: unknown[] = [];
@@ -57,7 +57,7 @@ function setup(o: { allow?: OperatorVerb[]; items?: RunItem[]; entries?: Activit
     ...o.ctx,
   };
   const app = createApp(repo, {
-    auth: { ...(o.token && { token: o.token }), operator: { token: OP, allow: o.allow ?? [...OPERATOR_VERBS] } },
+    auth: { ...(o.token && { token: o.token }), ...(o.ownerToken && { ownerToken: o.ownerToken }), operator: { token: OP, allow: o.allow ?? [...OPERATOR_VERBS] } },
     activity: {
       record: async (e) => { logged.push(e); },
       list: async (q) => {
@@ -295,7 +295,9 @@ test("the operator token may clean up by default, only its own run; a plain clie
 test('the first labelled write stamps who opened the run: the operator token, the API token, the browser or an agent', async () => {
   const s = setup({ token: API });
   await s.app.request('/api/candidates/r:run-op/decision', json('POST', { status: 'confirmed' }, op('run-op')));
-  await s.app.request('/api/candidates/c1/decision', json('POST', { status: 'confirmed' }, { ...browser, authorization: `Bearer ${API}`, 'x-fg-run': 'run-web' }));
+  const login = await s.app.request('/api/session', json('POST', { token: API }, browser));
+  const cookie = login.headers.get('set-cookie')!.split(';')[0];
+  await s.app.request('/api/candidates/c1/decision', json('POST', { status: 'confirmed' }, { ...browser, cookie, 'x-fg-run': 'run-web' }));
   await s.app.request('/mcp?run=run-tok', { ...rpc('report_feedback', { cwd: '/Users/j/Vibe/demo', feedback: 'x', what_was_done: 'y' }), headers: { ...rpc('x', {}).headers, authorization: `Bearer ${API}` } });
   const open = setup();
   await open.app.request('/mcp?run=run-agent', rpc('report_feedback', { cwd: '/Users/j/Vibe/demo', feedback: 'x', what_was_done: 'y' }));
@@ -662,10 +664,11 @@ test('a refused first run write to an owner record does not claim the run id', a
 
 
 test('legacy owner cleanup requires the actual configured owner token', async () => {
-  const s = setup({ token: API, owners: { legacy: ['operator', 'old-display-name'] } });
+  const s = setup({ token: API, ownerToken: 'w'.repeat(32), owners: { legacy: ['operator', 'old-display-name'] } });
   const base = { 'sec-fetch-site': 'same-origin', origin: 'http://localhost', 'x-fg-owner-cleanup': 'true' };
   expect((await s.app.request('/api/runs/legacy', json('DELETE', { dryRun: true }, { ...base, authorization: `Bearer ${OP}` }))).status).toBe(403);
-  expect((await s.app.request('/api/runs/legacy', json('DELETE', { dryRun: true }, { ...base, authorization: `Bearer ${API}` }))).status).toBe(200);
+  expect((await s.app.request('/api/runs/legacy', json('DELETE', { dryRun: true }, { ...base, authorization: `Bearer ${API}` }))).status).toBe(403);
+  expect((await s.app.request('/api/runs/legacy', json('DELETE', { dryRun: true }, { ...base, authorization: `Bearer ${'w'.repeat(32)}` }))).status).toBe(200);
 });
 
 

@@ -59,7 +59,7 @@ export async function prepare({ folder = defaultFolder(), source = join(repo, 'e
 function ownerHeaders(base, { token, localOwner = false }) {
   new URL(base);
   if (localOwner) throw Error('--local-owner was removed: use the actual browser UI on tokenless installs, or configure API_TOKEN for headless owner actions.');
-  if (!token) throw Error('Owner preparation requires API_TOKEN. Use the browser UI for a tokenless install; do not broaden OPERATOR_ALLOW.');
+  if (!token) throw Error('Owner preparation requires FG_OWNER_TOKEN. Use the browser UI for a tokenless install; do not broaden OPERATOR_ALLOW.');
   return { authorization: `Bearer ${token}`, 'x-fg-owner': 'true' };
 }
 
@@ -118,12 +118,12 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
     const folder = resolve(value('--folder') ?? defaultFolder());
     if (command === 'restore') {
       if (!args.includes('--apply')) console.log('Dry run: restore only the demo-shop selection/privacy membership saved by prepare; leave files and unrelated settings intact.');
-      else { await restore(folder, { token: process.env.API_TOKEN, localOwner: args.includes('--local-owner') }); console.log('Restored demo-shop settings membership. Run fg cleanup for your labelled run; fixture files were retained.'); }
+      else { await restore(folder, { token: process.env.FG_OWNER_TOKEN, localOwner: args.includes('--local-owner') }); console.log('Restored demo-shop settings membership. Run fg cleanup for your labelled run; fixture files were retained.'); }
     } else if (command === 'prepare') {
       const result = await prepare({ folder, source: value('--source'), apply: args.includes('--apply') });
       if (args.includes('--configure')) {
         if (!args.includes('--apply')) throw Error('--configure requires --apply; the default makes no API changes.');
-        await configure(result.folder, { apiURL: value('--api-url'), token: process.env.API_TOKEN, localOwner: args.includes('--local-owner') });
+        await configure(result.folder, { apiURL: value('--api-url'), token: process.env.FG_OWNER_TOKEN, localOwner: args.includes('--local-owner') });
       }
       console.log(`${args.includes('--apply') ? 'Prepared' : 'Dry run'}: ${result.folder}. Use this as the agent working directory, never examples/demo-shop.`);
       console.log('Register a fresh FG_RUN/FG_SANDBOX=1 session, seed only the demo corpus, test the returned console probe, then fg cleanup --run YOUR_RUN --apply. This command does not launch agents or change lesson decisions.');

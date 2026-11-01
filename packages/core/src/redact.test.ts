@@ -574,3 +574,21 @@ test.each([
 test('Azure credential placeholders stay placeholders in structured config too', () => {
   expect(redactDeep({ AccountKey: '<replace-with-your-account-key>' })).toEqual({ AccountKey: '<replace-with-your-account-key>' });
 });
+
+test.each([
+  'AWS_SECRET_ACCESS_KEY=' + 'Ab1cDef2Gh3iJk4Lm5nOp6Qr7St8Uv9Wx0YzABCD',
+  'databricks token dapi' + 'ab12'.repeat(8),
+  'mysql -uroot -pStrongPassword123!',
+  'curl -u alice:StrongPassword123! https://example.test',
+  'redis://:StrongPassword123!@cache.local/0',
+  'Server=db;User=sa;Password=StrongPassword123!',
+  "define('AUTH_KEY', 'word(StrongPassword123!)');",
+  '-----BEGIN DSA PRIVATE KEY-----\nProc-Type: 4,ENCRYPTED\nDEK-Info: AES-256-CBC,0123456789ABCDEF\nYWJjZGVmMTIzNDU2Nzg5MA==\n',
+  '"key":"-----BEGIN PRIVATE KEY-----\\nYWJjZGVmMTIzNDU2Nzg5MA==\\n"',
+])('0.7.1 removes held-out credential form: %s', text => expect(redactSecrets(text)).toContain('[REDACTED]'));
+
+test.each([
+  'org/drawingml/2006/wordprocessingDrawing',
+  'maxMaterializedIndexedFilterCandidates+1',
+  "u.password = '***';",
+])('0.7.1 preserves held-out ordinary code: %s', text => expect(redactSecrets(text)).toBe(text));

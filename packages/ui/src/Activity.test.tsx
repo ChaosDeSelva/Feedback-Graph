@@ -208,3 +208,10 @@ test('repeated scan retry entries can collapse without deleting historical entri
   fireEvent.click(screen.getByRole('checkbox', { name: 'Collapse repeated scan retries' }));
   expect(screen.getAllByText('scan parked: provider unavailable')).toHaveLength(2);
 });
+
+test('legacy “you asked for a scan” retry wording collapses too', async () => {
+  const retry = { ...rows[0], kind: 'scan_started', subject: 'you asked for a scan', why: 'you asked for it', details: {} };
+  vi.stubGlobal('fetch', vi.fn(async (url: string) => Response.json(url.startsWith('/api/activity') ? [{ ...retry, id: 'old2' }, { ...retry, id: 'old1' }] : [])));
+  render(<Activity />);
+  expect(await screen.findByText(/1 repeated scan retry entries collapsed/)).toBeTruthy();
+});

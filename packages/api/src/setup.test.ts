@@ -177,7 +177,7 @@ test('without a terminal it only reports: no pulls, no token question, no start,
 
 test('asked in a terminal, it pulls only the missing models, from the Ollama it checked', () => {
   const s = sandbox({ tags: '{"models":[{"name":"nomic-embed-text:latest"}]}' });
-  s.run({ PROJECTS_DIRS: '~/code' }, 'y\nn\nn\n');
+  s.run({ PROJECTS_DIRS: '~/code' }, 'y\nn\nn\nn\n');
   expect(s.ran()).toBe('OLLAMA_HOST=http://localhost:11434 ollama pull gemma4\n');
 });
 
@@ -221,7 +221,7 @@ test('yes to starting: compose up, wait until it answers, then connect the agent
 
 test('STORE=postgres without the profile set: the start includes the bundled database', () => {
   const s = sandbox({ tags: both });
-  s.run({ PROJECTS_DIRS: '~/code', STORE: 'postgres' }, 'n\ny\nn\n');
+  s.run({ PROJECTS_DIRS: '~/code', STORE: 'postgres' }, 'n\nn\ny\nn\n');
   expect(s.ran()).toBe('docker compose --profile postgres up -d --build\n');
 });
 
@@ -299,12 +299,12 @@ test('an install from before Settings keeps its PROJECTS_DIR, and the bundled ex
 
 test('asked in a terminal: the folders typed are mounted; Enter mounts none, with no default taken', () => {
   const s = sandbox({ tags: both });
-  const out = s.run({}, `~/work\nn\nn\n`);
+  const out = s.run({}, `~/work\nn\nn\nn\n`);
   expect(out).toContain('Which folders hold your projects');
   expect(s.saved()).toEqual([join(s.home, 'work')]);
   expect(s.ran()).toBe(''); // the next answer was no to starting
   const none = sandbox({ tags: both });
-  none.run({}, '\nn\n');
+  none.run({}, '\nn\nn\nn\n');
   expect(none.value('PROJECTS_DIRS')).toBe('');
   expect(none.saved()).toEqual([]);
 });
@@ -418,10 +418,10 @@ test('the operator token is generated only with --yes or a yes answer, never pri
   s.run({ PROJECTS_DIRS: '~/code' });
   expect(s.value('FG_OPERATOR_TOKEN')).toBe('');
   // Asked: no keeps it empty.
-  s.run({}, 'n\nn\n');
+  s.run({}, 'n\nn\nn\n');
   expect(s.value('FG_OPERATOR_TOKEN')).toBe('');
   // Asked: yes makes one (48 hex characters), mentioned but not printed.
-  const out = s.run({}, 'y\nn\n');
+  const out = s.run({}, 'n\ny\nn\n');
   const token = s.value('FG_OPERATOR_TOKEN')!;
   expect(token).toMatch(/^[0-9a-f]{48}$/);
   expect(out).toContain('FG_OPERATOR_TOKEN saved to .env');

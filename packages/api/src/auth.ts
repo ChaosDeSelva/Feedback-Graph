@@ -7,6 +7,8 @@ export type AuthOpts = {
   runKeySalt?: string;
   /** When set, every /api and /mcp call needs it (Bearer header, or the UI's session cookie). */
   token?: string;
+  /** Headless owner bearer. It is never a general read token and never installed into agents. */
+  ownerToken?: string;
   /** Host names besides localhost the API answers to. Only honoured when a token is set. */
   publicHosts?: string[];
   /** FG_OPERATOR_TOKEN: as a Bearer it signs in like the token and passes ownerOnly for the verbs in `allow`. */

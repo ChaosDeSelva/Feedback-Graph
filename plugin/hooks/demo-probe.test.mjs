@@ -77,7 +77,7 @@ test('removed tokenless local-owner mode refuses before any owner request', asyn
   await prepare({ folder, apply: true }); let calls = 0;
   const request = async () => { calls++; return Response.json({}); };
   await expect(configure(folder, { apiURL: 'http://127.0.0.1:8787', localOwner: true, fetch: request })).rejects.toThrow('removed');
-  await expect(configure(folder, { fetch: request })).rejects.toThrow('requires API_TOKEN');
+  await expect(configure(folder, { fetch: request })).rejects.toThrow('requires FG_OWNER_TOKEN');
   expect(calls).toBe(0);
 }));
 
@@ -86,7 +86,7 @@ test.each([false])('real HTTP owner configuration works with tokenless=%s', asyn
   let tracked = [], discovered = false;
   const cursors = new Map();
   const app = createApp({ listCandidates: async () => [], candidateDetail: async () => null, decide: async () => {}, stats: async () => [] }, {
-    auth: localOwner ? {} : { token: 'owner-secret-token-12345678901234567890' },
+    auth: localOwner ? {} : { ownerToken: 'owner-secret-token-12345678901234567890' },
     settings: { roots: [parent], excluded: [], folders: async () => discovered ? [{ key: 'demo-shop', path: folder }] : [], selection: {
       current: async () => ({ tracked, initialized: true }), candidates: async () => null, aliases: async () => new Map(), keysWithData: async () => [],
       exclusive: async fn => fn(), forgetReads: async () => {}, setTracked: async next => { const before = tracked; tracked = next; return { before, selection: { tracked, initialized: true } }; },

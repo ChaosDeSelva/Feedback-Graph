@@ -25,3 +25,7 @@ test.each(['.dev.vars', 'login.ppk', 'terraform.tfstate.backup', 'pip.conf', '.y
 
 
 test.each(['state/settings/integrations.json', '.run-key-salt', '.codex/auth.json', '.vault_pass', 'deploy/vault.yml', 'firebase-adminsdk-test.json', 'backups/2026-10-30/state.tgz'])('0.7.0 credential path excluded from scans: %s', path => expect(isSecretPath(path)).toBe(true));
+
+test.each(['worker.sqlite', 'project-roots.json', 'neo4j.dump', 'rclone.conf', '.config/hub', '.m2/settings.xml', 'gradle.properties', 'codex-auth.json'])(
+  '0.7.1 install/credential path excluded from scans: %s', path => expect(isSecretPath(path)).toBe(true),
+);

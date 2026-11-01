@@ -223,7 +223,7 @@ export function Activity() {
   const runFiltered = rows && !run && hideRuns ? rows.filter((a) => !a.run) : rows;
   const seenRetries = new Set<string>();
   const shown = runFiltered?.filter(a => {
-    if (!collapseRetries || !/^scan_/.test(a.kind) || !/retry|parked|unavailable|backoff/i.test(`${a.subject} ${a.why}`)) return true;
+    if (!collapseRetries || !/^scan_/.test(a.kind) || !/retry|parked|unavailable|backoff|asked for (?:it|a scan)/i.test(`${a.subject} ${a.why}`)) return true;
     const key = JSON.stringify([a.kind, a.projectKey, a.subject, a.why]);
     if (seenRetries.has(key)) return false;
     seenRetries.add(key); return true;

@@ -55,7 +55,8 @@ services:
     mem_limit: ${NEO4J_MEMORY_LIMIT:-3G}
     environment:
       NEO4J_AUTH: neo4j/${NEO4J_PASSWORD}
-      NEO4J_server_memory_heap_initial__size: ${NEO4J_HEAP:-1G}
+      # Commit less heap while idle; Neo4j may grow to NEO4J_HEAP under load.
+      NEO4J_server_memory_heap_initial__size: ${NEO4J_HEAP_INITIAL:-512M}
       NEO4J_server_memory_heap_max__size: ${NEO4J_HEAP:-1G}
       NEO4J_server_memory_pagecache_size: ${NEO4J_PAGECACHE:-512M}
       NEO4J_dbms_memory_transaction_total_max: ${NEO4J_TRANSACTION_TOTAL_MAX:-256M}
@@ -134,6 +135,7 @@ services:
       CODEX_RUNNER_SCRATCH: /scratch
       ALLOW_UNCONFINED_CODEX: ${ALLOW_UNCONFINED_CODEX:-}
       SCAN_LLM: ${SCAN_LLM:-}
+      SCAN_PROVIDER_ALLOW: ${SCAN_PROVIDER_ALLOW:-}
       DOCS_LLM: ${DOCS_LLM:-}
       # Ask: the default model of chats that pick none (empty: claude-cli, else codex-cli, else the local model).
       CHAT_LLM: ${CHAT_LLM:-}
@@ -259,6 +261,7 @@ services:
       CHECK_WAIT_SECONDS: ${CHECK_WAIT_SECONDS:-}
       # Set API_TOKEN (24+ chars, e.g. openssl rand -hex 24) before exposing the API beyond this machine.
       API_TOKEN: ${API_TOKEN:-}
+      FG_OWNER_TOKEN: ${FG_OWNER_TOKEN:-}
       PUBLIC_HOSTS: ${PUBLIC_HOSTS:-}
       # Lets agents (the fg CLI) make the owner decisions OPERATOR_ALLOW names. Empty: only the UI can.
       FG_OPERATOR_TOKEN: ${FG_OPERATOR_TOKEN:-}

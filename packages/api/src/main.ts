@@ -135,7 +135,9 @@ const contextDeps: ContextDeps = {
   },
   repoDiff: async (repoPath: string, files: string[]) => readRepoDiff(repoPath, files, { gitArgs: await worktreeGitArgs(repoPath, roots) }),
   // Files an agent named that have no facts yet go to the front of the project's next scan.
-  requestScan: (key: string, paths: string[]) => facts.requestFilesScan(key, paths),
+  // Context reads are side-effect free. Scans require the explicit scan route/admin verb; an unauthenticated MCP read
+  // on a tokenless local install must not enqueue repository work.
+  requestScan: undefined,
   aliasOf: (key: string) => store.graph.projectByAlias(key),
   codegraph: store.codegraph,
   sessions: store.sessions,
@@ -202,7 +204,7 @@ const app = createApp(store.graph, {
     sessionFiles: (id) => store.codegraph.sessionFiles(id),
     activity,
   },
-  auth: { runKeySalt, token: config.apiToken ?? undefined, publicHosts: config.publicHosts, operator: config.operator ?? undefined },
+  auth: { runKeySalt, token: config.apiToken ?? undefined, ownerToken: config.ownerToken ?? undefined, publicHosts: config.publicHosts, operator: config.operator ?? undefined },
   system: { version: VERSION, store: store.kind, roots: roots.length, ping: () => store.ping(), worker: () => store.graph.workerStatus(), selection: () => selection.current(), givenUpTurns: () => store.graph.givenUpTurns(),
     ...(process.env.CODEX_RUNNER_URL ? { runner: async () => reportedRunnerReadiness(await store.docs.getCursor(RUNNER_READINESS_CURSOR)) } : {}),
     // The embedding model always; the local chat model too when the api's check_before_done judge uses it.

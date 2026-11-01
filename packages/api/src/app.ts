@@ -271,6 +271,12 @@ const ActivityQuery = z.object({
 const LIST_DETAIL_BYTES = 1024;
 
 const ScanProvider = z.string().regex(/^[a-z][a-z-]*(:[\w./:-]+)?$/);
+/** Optional owner boundary for per-request provider overrides; unset preserves existing installs. */
+const scanProviderAllowed = (provider?: string) => {
+  if (!provider) return true;
+  const allowed = (process.env.SCAN_PROVIDER_ALLOW ?? '').split(',').map((v) => v.trim()).filter(Boolean);
+  return !allowed.length || allowed.some((v) => provider === v || provider.startsWith(`${v}:`));
+};
 const ScanRequest = z.object({ provider: ScanProvider.optional() }).strict();
 const BatchScanRequest = z
   .object({ keys: z.array(z.string().min(1).max(200)).min(1).max(2000).optional(), all: z.literal(true).optional(), provider: ScanProvider.optional() })
@@ -498,18 +504,24 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
       return c.json({ error: 'the admin MCP endpoint takes FG_OPERATOR_TOKEN as the Bearer: check it against the .env this Feedback Graph runs with' }, 401);
     }
     const operator = hasOperatorToken(c, auth.operator);
+    const ownerRoute = OWNER_ROUTES.some(([method, path]) => method === c.req.method
+      && path.split('/').length === c.req.path.split('/').length
+      && path.split('/').every((part, i) => part.startsWith(':') || part === c.req.path.split('/')[i]));
+    const ownerCredential = !!auth.ownerToken && tokenMatches(bearerOf(c) ?? '', auth.ownerToken)
+      && (c.req.method === 'GET' || c.req.method === 'HEAD' || ownerRoute);
+    const ownerBearer = (c.req.header('x-fg-owner') === 'true' || c.req.header('x-fg-owner-cleanup') === 'true') && ownerCredential;
     if (c.req.header('x-fg-owner-cleanup') === 'true') {
-      if (auth.token && !tokenMatches(bearerOf(c) ?? '', auth.token)) return c.json({ error: 'owner cleanup requires the configured API_TOKEN' }, 403);
-      // Without API_TOKEN, preserve the local owner's browser-Origin model; normal origin validation follows.
-      if (!auth.token && c.req.header('sec-fetch-site') !== 'same-origin') return c.json({ error: 'tokenless owner cleanup requires the same-origin browser UI; fg --owner requires API_TOKEN' }, 403);
+      if (auth.ownerToken && !tokenMatches(bearerOf(c) ?? '', auth.ownerToken)) return c.json({ error: 'headless owner cleanup requires the configured FG_OWNER_TOKEN' }, 403);
+      // Without FG_OWNER_TOKEN, preserve the local owner's browser-Origin model; normal origin validation follows.
+      if (!auth.ownerToken && c.req.header('sec-fetch-site') !== 'same-origin') return c.json({ error: 'tokenless owner cleanup requires the same-origin browser UI; fg --owner requires FG_OWNER_TOKEN' }, 403);
     }
     if (needsAuth(c.req.path)) {
-      if (!authenticated(c, auth.token) && !operator) return bearerOf(c) ? unrecognised(c) : c.json({ error: 'sign in required' }, 401);
+      if (!authenticated(c, auth.token) && !operator && !ownerCredential) return bearerOf(c) ? unrecognised(c) : c.json({ error: 'sign in required' }, 401);
       // A bearer that is neither configured token is refused on reads too (an agent with a stale token would otherwise
       // read on and never learn its writes will fail). With no token configured there is nothing to check it against;
       // "Bearer none" is the plugin's placeholder for no token.
       const offered = bearerOf(c);
-      if (offered && offered !== 'none' && !operator && (auth.token || auth.operator?.token) && !(auth.token && tokenMatches(offered, auth.token))) return unrecognised(c);
+      if (offered && offered !== 'none' && !operator && !ownerCredential && (auth.token || auth.ownerToken || auth.operator?.token) && !(auth.token && tokenMatches(offered, auth.token))) return unrecognised(c);
     }
     if (c.req.method !== 'GET' && c.req.method !== 'HEAD') {
       const site = c.req.header('sec-fetch-site');
@@ -531,12 +543,12 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
     // owner on an agent's run; a dry run of an unused id would open it).
     const run = RUN_PATH.test(c.req.path) ? null : label;
     const browser = c.req.header('origin') !== undefined;
-    const principal: RunPrincipal = operator ? 'operator' : browser ? 'browser' : auth.token && authenticated(c, auth.token) ? 'owner_token' : 'agent';
+    const principal: RunPrincipal = operator ? 'operator' : browser ? 'browser' : ownerBearer || auth.token && authenticated(c, auth.token) ? 'owner_token' : 'agent';
     // A sandbox run name is an identifier, not a credential. Reads need the same private
     // capability as writes; the owner can inspect runs through the authenticated owner path.
     const sandboxRunId = run?.id ?? (RUN_PATH.test(c.req.path) ? decodeURIComponent(c.req.path.split('/').filter(Boolean).at(-1)!) : c.req.query('run'));
     if (sandboxRunId && (run?.sandbox || await opts.runs?.sandbox?.(sandboxRunId))) {
-      const ownerAccess = !!(auth.token && tokenMatches(bearerOf(c) ?? '', auth.token)) || c.req.header('sec-fetch-site') === 'same-origin';
+      const ownerAccess = ownerBearer || !!(auth.token && tokenMatches(bearerOf(c) ?? '', auth.token)) || c.req.header('sec-fetch-site') === 'same-origin';
       const capability = operator ? runKey(c.req.header('x-fg-run-key'), auth.runKeySalt) : null;
       const owner = await opts.runs?.owner(sandboxRunId);
       if (!ownerAccess && !(capability && (!owner || (owner.principal === 'operator' && owner.actor === capability)))) {
@@ -577,14 +589,18 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
       if (!allowed.has(verb)) return c.json(refusedVerb(verb), 403);
       return runAs(operatorName(c.req.header('x-fg-operator')), next);
     }
-    if (c.req.header('x-fg-owner') === 'true' && auth.token && tokenMatches(bearerOf(c) ?? '', auth.token)) {
+    if ((c.req.header('x-fg-owner') === 'true' || c.req.header('x-fg-owner-cleanup') === 'true') && auth.ownerToken && tokenMatches(bearerOf(c) ?? '', auth.ownerToken)) {
       log?.('owner token decision', { method: c.req.method, path: c.req.path });
       return next();
     }
     // A token was offered for this decision and it is neither token (with the operator token configured): say so. The
     // API token is recognised, it just cannot decide: that stays the 403 below.
     const offered = bearerOf(c);
+    if (offered && auth.ownerToken && tokenMatches(offered, auth.ownerToken)) return c.json({ error: 'FG_OWNER_TOKEN owner writes require X-FG-Owner: true' }, 403);
     if (auth.operator?.token && offered && !(auth.token && tokenMatches(offered, auth.token))) return unrecognised(c);
+    // A bearer request is an API client, even if it forges browser Fetch Metadata. API_TOKEN is deliberately an
+    // agent/read credential; it never inherits the browser owner's authority.
+    if (offered) return c.json({ error: 'this Bearer is not an owner credential; use the browser session, FG_OWNER_TOKEN with X-FG-Owner: true, or FG_OPERATOR_TOKEN with an allowed verb' }, 403);
     if (c.req.header('origin') === undefined || c.req.header('sec-fetch-site') !== 'same-origin') {
       log?.('owner decision refused', { method: c.req.method, path: c.req.path, reason: 'missing same-origin browser provenance' });
       return c.json({ error: 'only you can make this decision, from the Feedback Graph UI, or with FG_OPERATOR_TOKEN as a Bearer for the verbs OPERATOR_ALLOW names' }, 403);
@@ -856,7 +872,10 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
   /** An Inbox item, if it belongs to a shown project. */
   const shownCandidate = async (id: string) => {
     const d = await repo.candidateDetail(id);
-    return d && (await shows(d.candidate.projectKey)) ? d : null;
+    if (!d || !(await shows(d.candidate.projectKey))) return null;
+    // A sandbox id is not a capability. Lists already scope by run; direct reads must do the same.
+    if (d.candidate.sandbox && (!d.candidate.run || d.candidate.run !== currentRun()?.id)) return null;
+    return d;
   };
 
   app.get('/api/candidates/:id', async (c) => {
@@ -986,6 +1005,7 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
     app.post('/api/projects/:key/scan', async (c) => {
       const body = ScanRequest.safeParse(await c.req.json().catch(() => ({})));
       if (!body.success) return c.json({ error: body.error.flatten() }, 400);
+      if (!scanProviderAllowed(body.data.provider)) return c.json({ error: `scan provider ${body.data.provider} is not in SCAN_PROVIDER_ALLOW` }, 403);
       const project = (await projectDirs()).find((p) => p.key === c.req.param('key'));
       if (!project) return c.json({ error: 'no such folder under the configured roots' }, 404);
       const job = await facts.requestScan(project, body.data.provider ?? null);
@@ -1007,6 +1027,7 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
     app.post('/api/projects/scan', async (c) => {
       const body = BatchScanRequest.safeParse(await c.req.json().catch(() => null));
       if (!body.success) return c.json({ error: body.error.flatten() }, 400);
+      if (!scanProviderAllowed(body.data.provider)) return c.json({ error: `scan provider ${body.data.provider} is not in SCAN_PROVIDER_ALLOW` }, 403);
       const folders = await projectDirs();
       const v = await view();
       const keys = body.data.all ? folders.map((p) => p.key).filter((k) => !v || v.has(k)) : [...new Set(body.data.keys)];
@@ -1169,7 +1190,11 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
       const add = async (): Promise<string> => {
         if (!image) {
           await authorizeStoreWrite();
-          await archiveRedactionInput('upload', replaces, body.data.text!, redactSecrets(body.data.text!));
+          await archiveRedactionInput('upload', replaces, body.data.text!, redactSecrets(body.data.text!), [
+            { kind: 'project', id: project.key },
+            { kind: 'doc', id: replaces },
+            ...(currentRun() ? [{ kind: 'run' as const, id: currentRun()!.id }] : []),
+          ]);
         }
         // In batches: one embedding call for a 2,000,000-character upload (1,300+ chunks) outlasts any timeout.
         const vectors: number[][] = [];

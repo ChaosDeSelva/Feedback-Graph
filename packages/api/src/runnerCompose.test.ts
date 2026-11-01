@@ -25,7 +25,8 @@ test('the manual procfs override contains only its additive option and uses the 
 
 test('the small profile budgets fit its container and both Codex login mounts are read-only', () => {
   const small = read('docker-compose.small.yml');
-  expect(small).toContain('mem_limit: 1G');
+  expect(small).toContain('mem_limit: 1536M');
+  expect(small).toContain('NEO4J_server_memory_heap_initial__size: 256M');
   expect(small).toContain('NEO4J_server_memory_heap_max__size: 512M');
   expect(small).toContain('NEO4J_server_memory_pagecache_size: 128M');
   const compose = read('docker-compose.yml');

@@ -118,6 +118,8 @@ export type Config = {
   /** Minutes between rounds of looking for links between the selected projects (LINK_SCAN_MINUTES, default 30). */
   linkScanMinutes: number;
   apiToken: string | null;
+  /** FG_OWNER_TOKEN: optional bearer used only for explicit headless owner writes; never given to agents. */
+  ownerToken: string | null;
   /** FG_OPERATOR_TOKEN and OPERATOR_ALLOW; null (the default): no request can make owner decisions without the UI. */
   operator: OperatorConfig | null;
   publicHosts: string[];
@@ -264,6 +266,9 @@ export function loadConfig(env: Env): Config {
 
   const apiToken = env.API_TOKEN?.trim() || null;
   if (apiToken && apiToken.length < 24) problems.push('API_TOKEN must be at least 24 characters (try: openssl rand -hex 24)');
+  const ownerToken = env.FG_OWNER_TOKEN?.trim() || null;
+  if (ownerToken && ownerToken.length < 24) problems.push('FG_OWNER_TOKEN must be at least 24 characters (try: openssl rand -hex 24)');
+  if (ownerToken && ownerToken === apiToken) problems.push('FG_OWNER_TOKEN must differ from API_TOKEN: agent/read credentials must not authorize owner writes');
   const publicHosts = list(env.PUBLIC_HOSTS);
   if (publicHosts.length && !apiToken) problems.push('PUBLIC_HOSTS needs API_TOKEN: other machines must not reach the API unauthenticated');
   const apiBind = env.API_BIND?.trim() || '127.0.0.1';
@@ -276,6 +281,7 @@ export function loadConfig(env: Env): Config {
   if (operatorToken) {
     if (operatorToken.length < 24) problems.push('FG_OPERATOR_TOKEN must be at least 24 characters (try: openssl rand -hex 24)');
     if (operatorToken === apiToken) problems.push('FG_OPERATOR_TOKEN must differ from API_TOKEN: the operator token can make owner decisions');
+    if (operatorToken === ownerToken) problems.push('FG_OPERATOR_TOKEN must differ from FG_OWNER_TOKEN: operator permissions remain limited by OPERATOR_ALLOW');
     const asked = list(env.OPERATOR_ALLOW);
     const isVerb = (v: string): v is OperatorVerb => (OPERATOR_VERBS as readonly string[]).includes(v);
     const unknown = asked.filter((v) => v !== 'all' && !isVerb(v));
@@ -408,6 +414,7 @@ export function loadConfig(env: Env): Config {
     integrationSyncMinutes: num('INTEGRATION_SYNC_MINUTES', 10),
     linkScanMinutes: num('LINK_SCAN_MINUTES', 30),
     apiToken,
+    ownerToken,
     operator,
     publicHosts,
     cloud,

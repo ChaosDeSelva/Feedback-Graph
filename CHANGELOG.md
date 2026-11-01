@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.7.1 (2026-10-31)
+
+- Separate API, operator and headless-owner credentials; make authenticated setup the default, keep context reads side-effect free, constrain scan provider overrides, and add live runner isolation diagnostics.
+- Restore judge throughput by filtering misses before model calls and accept single-verdict responses. Correct ranked document output, PR parsing and task-file scan safety.
+- Increase Neo4j native-memory headroom, repair the small profile, expand secret redaction and secret-file denial coverage, and scope upload originals to project/document/run cleanup.
+- Add scan confirmations and safer provider switching, exact-author guidance, visible cloud loading, legacy Activity grouping, and stronger setup and operations guidance.
+
 ## 0.7.0 (2026-10-29)
 
 - Return complete pre-done verdicts to both Claude Code and Codex. Persist explicit outcomes for checks, accept backed clean-call evidence, report measured completed timings, and improve queued estimates without promising an exact start time.

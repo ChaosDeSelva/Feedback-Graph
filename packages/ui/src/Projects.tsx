@@ -8,7 +8,7 @@ import { ImportBundle } from './ImportBundle.tsx';
 import { ProjectDocs } from './ProjectDocs.tsx';
 import { ProjectLinks } from './ProjectLinks.tsx';
 import { api, type Activity, type ProjectSummary, type StoredFact } from './api.ts';
-import { ConfirmDialog } from './ui/ConfirmDialog.tsx';
+import { askConfirm, ConfirmDialog } from './ui/ConfirmDialog.tsx';
 import { PageHeader } from './ui/PageHeader.tsx';
 import { ListRow, SplitPane } from './ui/SplitPane.tsx';
 import { Button, buttonClass, Input, Select } from './ui/controls.tsx';
@@ -115,6 +115,16 @@ export function Projects({ pollMs = 5000 }: { pollMs?: number } = {}) {
 
   async function cancelScan(replace = false) {
     if (!current?.lastScan) return;
+    if (replace && (!provider || provider === current.lastScan.provider)) {
+      setError('Choose a different explicit provider before switching. “default” may resolve to the same provider that is parked.');
+      return;
+    }
+    const confirmed = await askConfirm({
+      title: replace ? `Cancel this scan and switch ${current.key} to ${provider}?` : `Cancel the queued scan for ${current.key}?`,
+      message: replace ? 'The queued job is removed, then a new scan is queued on the provider you selected.' : 'The queued job is removed. No scan is started in its place.',
+      confirmLabel: replace ? 'Cancel and switch provider' : 'Cancel queued scan',
+    });
+    if (!confirmed) return;
     try {
       await api.cancelScan(current.key, current.lastScan.id);
       if (replace) await scan();

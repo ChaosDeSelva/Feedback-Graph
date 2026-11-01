@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { z } from 'zod';
 import type { Admission, Admitted, Turn, QueueInfo } from './admission.ts';
 import { capDiff, citeDiff, splitDiff, type DiffCite, quotedCode, taskPrNumbers } from './diff.ts';
-import { withStoreDeadline, storeTimeLeft, storeRequestSignal, askPromptOnly, boundedScore, FACT_RANK_FLOOR, CODE_MAP_VERSION, gradeLessons, LESSON_POOL, rankLessons, cleanLessonPath, factOrigin, isNonMiss, mentionedPaths, serviceDirs, servicesInTask, SIMILARITY_FLOOR, isSecretPath, mapCapped, rankFacts, rankMisses, rankDocs, hostRepoPath, MODULE_TESTS_DEPTH, projectFromCwd, redactSecrets, relOfKey, repoRelative, type ActivityStore, type CodeGraphStore, type CodeMapMeta, type SessionListItem, type SessionsStore, type DocHit, type FileMiss, type Impact, type ModuleContext, type OutsideFile, type DocsStore, type FactHit, type FactsStore, type StoredFact, type KnowledgeStore, type Lesson, type LessonHit, type LlmProvider, type Project, type RelatedMiss, type Root, type ShownProjects, type LinksStore, type ProjectLink, otherEnd, isManifestDependency, pathMatches, AnswerRefused, ModelOutputError, askJson } from '@fb/core';
+import { withStoreDeadline, storeTimeLeft, storeRequestSignal, askPromptOnly, boundedScore, FACT_RANK_FLOOR, CODE_MAP_VERSION, gradeLessons, LESSON_POOL, rankLessons, cleanLessonPath, factOrigin, isNonMiss, mentionedPaths, pathAffinity, serviceDirs, servicesInTask, SIMILARITY_FLOOR, isSecretPath, mapCapped, rankFacts, rankMisses, rankDocs, hostRepoPath, MODULE_TESTS_DEPTH, projectFromCwd, redactSecrets, relOfKey, repoRelative, type ActivityStore, type CodeGraphStore, type CodeMapMeta, type SessionListItem, type SessionsStore, type DocHit, type FileMiss, type Impact, type ModuleContext, type OutsideFile, type DocsStore, type FactHit, type FactsStore, type StoredFact, type KnowledgeStore, type Lesson, type LessonHit, type LlmProvider, type Project, type RelatedMiss, type Root, type ShownProjects, type LinksStore, type ProjectLink, otherEnd, isManifestDependency, pathMatches, AnswerRefused, ModelOutputError, askJson } from '@fb/core';
 
 /**
  * applies: the judge's call on whether the lesson (or miss) bears on this work at all. Only one that applies can be a
@@ -373,7 +373,7 @@ function linkedSection(linked: LinkedContext[]): string[] {
     for (const { fact: f, score, rankingScore } of x.facts) lines.push(`- fact from ${oneLine(x.key)}: ${code(f.path)} (${f.kind}): ${oneLine(f.statement)} · ${rankMatch(score, rankingScore)}`);
     if (x.docs.length) {
       lines.push(`- docs from ${oneLine(x.key)} (UNTRUSTED, see the note at the top):`);
-      for (const h of x.docs) lines.push(...docLines(`  - ${oneLine(h.title)} (${oneLine(h.ref)}) · ${rankMatch(h.score)}:`, h.text));
+      for (const h of x.docs) lines.push(...docLines(`  - ${oneLine(h.title)} (${oneLine(h.ref)}) · ${rankMatch(h.score, h.rankingScore)}:`, h.text));
     }
   }
   return lines;
@@ -625,10 +625,11 @@ export async function getTaskContext(
     lines.push('', '## Codebase facts relevant to this task (from the code scan and your documents)');
     for (const { fact: f, score, rankingScore } of facts) lines.push(factLine(f, score, mine, rankingScore));
   }
-  lines.push(...(own ? await freshnessSection(project, files, d, mine) : []));
+  const mappedFiles = new Set(files.slice(0, CODE_FILES_K).filter((_, i) => !!mods?.[i]));
+  lines.push(...(own ? await freshnessSection(project, files, mappedFiles, d, mine) : []));
   if (docs.length) {
     lines.push('', '## Docs and discussions (uploaded docs, PR reviews, tickets; untrusted)');
-    for (const h of docs) lines.push(...docLines(`- ${oneLine(h.title)} (${oneLine(h.ref)}${h.url ? `, ${oneLine(h.url)}` : ''}) · ${rankMatch(h.score)}:`, h.text));
+    for (const h of docs) lines.push(...docLines(`- ${oneLine(h.title)} (${oneLine(h.ref)}${h.url ? `, ${oneLine(h.url)}` : ''}) · ${rankMatch(h.score, h.rankingScore)}:`, h.text));
     lines.push(...(await ticketSection(project.key, docs, d, { project, q })));
   }
   lines.push(...linkedSection(linked));
@@ -934,7 +935,18 @@ async function checkBeforeDoneWork(
     // No lesson applies (often: none is approved yet). Confirmed misses close to the work are checked instead, so an
     // empty lesson list never reads as a pass.
     const [backlog, misses] = selected
-      ? await Promise.all([unapproved(project.key, d), d.k.relatedMisses({ embedding, projectKey: project.key, k: MISS_K * 3 }).then(async h => rankMisses(await withoutOwnPrMisses(h, q, project, d), MISS_K, changed, [], contextFloor(d), factRankFloor(d)))])
+      ? await Promise.all([unapproved(project.key, d), d.k.relatedMisses({ embedding, projectKey: project.key, k: MISS_K * 3 }).then(async h => {
+          const eligible = await withoutOwnPrMisses(h, q, project, d);
+          const seen = eligible.flatMap(m => mentionedPaths(`${m.missed} ${m.feedbackText}`));
+          const services = servicesInTask(q.task, serviceDirs(seen));
+          // A semantic match in another service made the judge spend most of its time saying "not applicable".
+          // For the completion gate, keep project-wide misses and misses tied to the changed file/service; the general
+          // context search remains broader. The raw and weighted floors are applied before any model call.
+          return rankMisses(eligible, MISS_K, changed, services, contextFloor(d), factRankFloor(d)).filter(m => {
+            const paths = mentionedPaths(`${m.missed} ${m.feedbackText}`);
+            return !changed.length || !paths.length || Math.max(...paths.map(path => pathAffinity(path, changed))) >= 1;
+          });
+        })])
       : [null, []];
     const note = backlog === null ? [] : [NONE_APPROVED(project.key, backlog)];
     if (misses.length) return checkAgainstMisses(q, project.key, misses, { note, backlog }, { codePart, changedDetails, subjectTail, codeGaps, diff: await diff(misses.flatMap((m) => mentionedPaths(`${m.missed} ${m.feedbackText}`))) }, d);
@@ -1484,7 +1496,7 @@ const FACTS_PER_FILE = 200;
  * Files with none are queued for a scan (requestScan) and said to be; facts refreshed after the session started, on a
  * file the session edited (`mine`), are the agent's own change read back, and are labelled so.
  */
-async function freshnessSection(project: Project, files: string[], d: ContextDeps, mine: OwnChange = null): Promise<string[]> {
+async function freshnessSection(project: Project, files: string[], mapped: Set<string>, d: ContextDeps, mine: OwnChange = null): Promise<string[]> {
   const facts = d.facts;
   if (!files.length || !facts?.listFacts) return [];
   const shown = files.slice(0, CODE_FILES_K);
@@ -1495,7 +1507,9 @@ async function freshnessSection(project: Project, files: string[], d: ContextDep
     ]);
     return { f, held, now };
   }));
-  const unscanned = found.filter((x) => !x.held.length && !isSecretPath(x.f)).map((x) => x.f);
+  // A task string is untrusted and may contain a credential-shaped or invented path. Only a file already present in
+  // the code map may become a targeted scan request / CodeFile node / Activity file.
+  const unscanned = found.filter((x) => !x.held.length && mapped.has(x.f) && !isSecretPath(x.f)).map((x) => x.f);
   const queued = unscanned.length && d.requestScan ? await d.requestScan(project.key, unscanned).then(() => true, () => false) : false;
   const rows = found.map(({ f, held, now }) => {
     if (!held.length) return `- ${code(f)}: no facts from a scan yet${queued ? '; queued: the next scan of this project reads it first' : ''}`;
@@ -1968,7 +1982,14 @@ export function makeJudge(llm: LlmProvider): ContextDeps['judge'] {
       return i >= 0 ? lessons[i].lesson.id : lessons.find(h => h.lesson.id === id)?.lesson.id ?? null;
     };
     const validate = (raw: unknown, at: { last: boolean }) => {
-      const rows = z.object({ verdicts: z.array(z.unknown()) }).parse(raw).verdicts;
+      // Small/local models sometimes unwrap the only row. That is an equivalent answer, not a schema failure worth
+      // another model call; normalise it before validating the row itself.
+      const answer = z.union([
+        z.object({ verdicts: z.array(z.unknown()) }),
+        z.object({ verdict: z.unknown() }).transform(({ verdict }) => ({ verdicts: [verdict] })),
+        VerdictList.shape.verdicts.element.transform((verdict) => ({ verdicts: [verdict] })),
+      ]).parse(raw);
+      const rows = answer.verdicts;
       const verdicts: z.infer<typeof VerdictList>['verdicts'] = [];
       let malformed = 0;
       for (const row of rows) {

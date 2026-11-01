@@ -112,6 +112,15 @@ test('a public host name needs a token, and a token must be long enough to resis
   expect(loadConfig({ ...base, API_TOKEN: 'x'.repeat(32), PUBLIC_HOSTS: 'fg.corp.example' }).publicHosts).toEqual(['fg.corp.example']);
 });
 
+test('the headless owner credential is long, separate, and optional', () => {
+  expect(loadConfig(base).ownerToken).toBeNull();
+  expect(() => loadConfig({ ...base, FG_OWNER_TOKEN: 'short' })).toThrow(/FG_OWNER_TOKEN.*24/);
+  const owner = 'w'.repeat(32);
+  expect(loadConfig({ ...base, FG_OWNER_TOKEN: owner }).ownerToken).toBe(owner);
+  expect(() => loadConfig({ ...base, API_TOKEN: owner, FG_OWNER_TOKEN: owner })).toThrow(/FG_OWNER_TOKEN.*API_TOKEN/);
+  expect(() => loadConfig({ ...base, FG_OPERATOR_TOKEN: owner, FG_OWNER_TOKEN: owner })).toThrow(/FG_OPERATOR_TOKEN.*FG_OWNER_TOKEN/);
+});
+
 test('model specs are checked for a known provider', () => {
   for (const ok of ['ollama:gemma4', 'claude-cli', 'claude-cli:opus', 'codex-cli', 'openai:gpt-5-nano', 'anthropic:claude-haiku-5-5', 'openrouter:x/y', 'groq:llama']) {
     expect(() => loadConfig({ ...base, SCAN_LLM: ok, ALLOW_UNCONFINED_CODEX: '1' })).not.toThrow();

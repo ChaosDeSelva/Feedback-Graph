@@ -1,6 +1,6 @@
 # Install Feedback Graph
 
-Install Docker (Desktop/OrbStack on macOS), Node 26.5+ and pnpm 11. Clone the repository, run `pnpm install`, then run `./scripts/setup.sh`. Choose project roots deliberately: mounted project folders are read-only, but selected transcripts contain the conversations and file access from those sessions. Review `.env` before starting a shared installation. The API binds to loopback by default.
+Install Docker (Desktop/OrbStack on macOS), Node 26.5+ and pnpm 11. Clone the repository, enable Corepack if `pnpm` is not already installed (`corepack enable && corepack prepare pnpm@11 --activate`), run `pnpm install`, then run `./scripts/setup.sh`. Choose project roots deliberately: mounted project folders are read-only, but selected transcripts contain the conversations and file access from those sessions. Review `.env` before starting a shared installation. The API binds to loopback by default. Accept setup's recommended `API_TOKEN`: without it, Fetch Metadata prevents web CSRF but is not an owner boundary against another local process that can forge browser headers.
 
 For a local-only trial without your real transcripts or agent registration:
 
@@ -29,7 +29,7 @@ Run `./scripts/install-agent.sh --dry-run` from the new checkout before register
 
 ## Memory profiles
 
-The default Neo4j container has a 3 GiB limit, 1 GiB heap and 512 MiB page cache. Transaction memory is part of heap accounting, not an additional reserve; native JVM, threads and mapped pages still need headroom. Reserve additional Docker VM memory for the worker, API, OS and any local model. `fg status` and doctor show container memory, remaining headroom and swap when host Docker cgroup counters are available. `status --watch` labels its startup host measurement as a snapshot; rerun status for a fresh measurement. No Docker socket is exposed to the API.
+The default Neo4j container has a 3 GiB limit, a 512 MiB initial / 1 GiB maximum heap and 512 MiB page cache. Starting below the maximum avoids committing a full gigabyte while idle; the heap grows when work needs it. Transaction memory is part of heap accounting, not an additional reserve; native JVM, threads and mapped pages still need headroom. Reserve additional Docker VM memory for the worker, API, OS and any local model. `fg status` and doctor show container memory, remaining headroom and swap when host Docker cgroup counters are available. `status --watch` labels its startup host measurement as a snapshot; rerun status for a fresh measurement. No Docker socket is exposed to the API.
 
 For a small pilot, add the checked-in small override after the base file and generated project mounts:
 
@@ -37,7 +37,7 @@ For a small pilot, add the checked-in small override after the base file and gen
 COMPOSE_FILE=docker-compose.yml:docker-compose.override.yml:docker-compose.small.yml
 ```
 
-This sets a 1 GiB container limit, 512 MiB heap, 128 MiB page cache and 128 MiB transaction pool (32 MiB per transaction). Smaller memory trades throughput for headroom; start with low concurrent requests. Preserve any separately chosen runner compatibility override in the list. Run `docker compose config --quiet`, recreate Neo4j, then check doctor. If swap is nonzero or headroom falls below 15%, reduce load or increase the Docker VM/container budget; increasing heap alone can make host pressure worse.
+This sets a 1.5 GiB container limit, a 256 MiB initial / 512 MiB maximum heap, 128 MiB page cache and 128 MiB transaction pool (32 MiB per transaction). The previous 1 GiB profile left effectively no native-memory headroom and is not supported. Smaller memory trades throughput for headroom; start with low concurrent requests. Preserve any separately chosen runner compatibility override in the list. Run `docker compose config --quiet`, recreate Neo4j, then check doctor. If swap is nonzero or headroom falls below 15%, reduce load or increase the Docker VM/container budget; increasing heap alone can make host pressure worse.
 
 ## Tests on the host
 

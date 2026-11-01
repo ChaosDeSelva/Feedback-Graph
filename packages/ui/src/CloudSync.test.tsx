@@ -133,11 +133,10 @@ test('a Sync now the server refuses shows the server reason', async () => {
   await waitFor(() => expect(c.getByRole('alert').textContent).toMatch(/already running/));
 });
 
-test('an API without cloud sync renders nothing', async () => {
+test('an API without cloud sync explains that the panel is unavailable', async () => {
   vi.stubGlobal('fetch', vi.fn(async () => Response.json([])));
   const { container } = render(<CloudSync />);
-  await new Promise((r) => setTimeout(r, 10));
-  expect(container.textContent).toBe('');
+  await waitFor(() => expect(container.textContent).toContain('Cloud sync is unavailable'));
 });
 
 

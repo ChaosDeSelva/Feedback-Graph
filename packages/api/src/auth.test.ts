@@ -62,11 +62,23 @@ test('a public host name is accepted only when a token protects the API', async 
   expect((await createApp(repo, { auth: { publicHosts: ['fg.corp.example'] } }).request('http://fg.corp.example/api/candidates', { headers })).status).toBe(403);
 });
 
-test('behind a TLS proxy, the https origin of the same host may write', async () => {
-  const res = await secured().request('http://fg.corp.example/api/candidates/c1/decision', {
+test('behind a TLS proxy, the signed-in browser session may write but its API bearer cannot impersonate it', async () => {
+  const app = secured();
+  const login = await app.request('http://fg.corp.example/api/session', {
     method: 'POST',
-    headers: { host: 'fg.corp.example', 'sec-fetch-site': 'same-origin', origin: 'https://fg.corp.example', 'content-type': 'application/json', ...bearer },
+    headers: { host: 'fg.corp.example', 'sec-fetch-site': 'same-origin', origin: 'https://fg.corp.example', 'content-type': 'application/json' },
+    body: JSON.stringify({ token: TOKEN }),
+  });
+  const cookie = login.headers.get('set-cookie')!.split(';')[0];
+  const headers = { host: 'fg.corp.example', 'sec-fetch-site': 'same-origin', origin: 'https://fg.corp.example', 'content-type': 'application/json' };
+  const forged = await app.request('http://fg.corp.example/api/candidates/c1/decision', {
+    method: 'POST',
+    headers: { ...headers, ...bearer, 'x-fg-owner': 'true' },
     body: JSON.stringify({ status: 'rejected' }),
+  });
+  expect(forged.status).toBe(403);
+  const res = await app.request('http://fg.corp.example/api/candidates/c1/decision', {
+    method: 'POST', headers: { ...headers, cookie }, body: JSON.stringify({ status: 'rejected' }),
   });
   expect(res.status).toBe(204);
 });
@@ -87,9 +99,12 @@ test('Origin alone is insufficient owner proof; browser fetch metadata is requir
 });
 
 
-test('headless owner decisions need the explicit owner intent and configured API token', async () => {
-  const app = createApp(repo, { auth: { token: 'owner-test-token-12345678901234567890' } });
+test('headless owner decisions need the separate owner token and explicit owner intent', async () => {
+  const apiToken = 'api-test-token-123456789012345678901';
+  const ownerToken = 'owner-test-token-12345678901234567890';
+  const app = createApp(repo, { auth: { token: apiToken, ownerToken } });
   const request = (headers: Record<string, string>) => app.request('/api/candidates/c1/decision', { method: 'POST', headers: { 'content-type': 'application/json', ...headers }, body: JSON.stringify({ status: 'rejected' }) });
-  expect((await request({ authorization: 'Bearer owner-test-token-12345678901234567890' })).status).toBe(403);
-  expect((await request({ authorization: 'Bearer owner-test-token-12345678901234567890', 'x-fg-owner': 'true' })).status).toBe(204);
+  expect((await request({ authorization: `Bearer ${apiToken}`, 'x-fg-owner': 'true' })).status).toBe(403);
+  expect((await request({ authorization: `Bearer ${ownerToken}` })).status).toBe(403);
+  expect((await request({ authorization: `Bearer ${ownerToken}`, 'x-fg-owner': 'true' })).status).toBe(204);
 });

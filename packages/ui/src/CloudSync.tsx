@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import { api, type CloudInfo, type SyncCounts } from './api.ts';
 import { Input, Button } from './ui/controls.tsx';
-import { ago, Alert, Badge, Card, plural, StatGrid, StatTile, type Tone } from './ui/display.tsx';
+import { ago, Alert, Badge, Card, plural, SkeletonList, StatGrid, StatTile, type Tone } from './ui/display.tsx';
 
 const message = (e: unknown) => (e instanceof Error ? e.message : String(e));
 
@@ -19,6 +19,7 @@ const Mono = ({ children }: { children: string }) => <code className="font-mono 
 /** Settings: Feedback Graph Cloud sync. Off unless CLOUD_URL and CLOUD_TOKEN are set; Sync now is yours only. */
 export function CloudSync() {
   const [info, setInfo] = useState<CloudInfo | null>(null);
+  const [loaded, setLoaded] = useState(false);
   const [localOnly, setLocalOnly] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -27,8 +28,8 @@ export function CloudSync() {
   const load = () =>
     api.cloud().then(
       // An API from before cloud sync answers with something else: show nothing rather than a broken card.
-      (d) => setInfo(d && typeof d === 'object' && typeof (d as CloudInfo).enabled === 'boolean' ? d : null),
-      () => setInfo(null),
+      (d) => { setInfo(d && typeof d === 'object' && typeof (d as CloudInfo).enabled === 'boolean' ? d : null); setLoaded(true); },
+      () => { setInfo(null); setLoaded(true); },
     );
   useEffect(() => { load(); }, []);
   useEffect(() => { setLocalOnly(info?.savedLocalOnlyProjects?.join(', ') ?? ''); }, [info]);
@@ -56,7 +57,7 @@ export function CloudSync() {
     }
   }
 
-  if (!info) return null;
+  if (!info) return <Card title="Cloud sync">{loaded ? <p className="p-4 text-muted">Cloud sync is unavailable on this API.</p> : <SkeletonList rows={3} />}</Card>;
   const s = state(info);
   const total = info.preview?.total;
   const lastError = error ?? (info.last && !info.last.ok ? info.last.error : null);

@@ -444,6 +444,7 @@ export function Lessons() {
             <div className="flex w-full flex-wrap gap-2">
               <Input aria-label="PR number" placeholder="PR number" type="number" min="1" value={pr} onChange={(e) => { const value = e.target.value; afterDiscard(() => setPr(value)); }} />
               <Input aria-label="feedback author" placeholder="Feedback author" value={author} onChange={(e) => { const value = e.target.value; afterDiscard(() => setAuthor(value)); }} />
+              {author && <span className="self-center text-[11px] text-muted">Exact match; use the full GitHub or Linear login.</span>}
               <Select aria-label="source" size="sm" value={source} onChange={(e) => { const v = e.target.value as LessonFrom | ''; afterDiscard(() => setSource(v)); }}>
                 <option value="">all sources</option>
                 {LESSON_FROM.map((f) => <option key={f} value={f}>{SOURCE_LABEL[f]?.[0] ?? f}</option>)}

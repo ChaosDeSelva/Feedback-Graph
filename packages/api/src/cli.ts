@@ -154,8 +154,8 @@ const UNLABELLED = new Set(['cleanup', 'activity', 'evidence']);
 
 function client(io: CliIO, flags: Flags, labels = true) {
   const base = (flags.url ?? io.env.FEEDBACK_GRAPH_URL ?? 'http://localhost:8787').replace(/\/+$/, '');
-  if (flags.owner && !io.env.API_TOKEN?.trim()) throw new UsageError('--owner requires API_TOKEN; tokenless owner actions use the same-origin browser UI');
-  const token = flags.owner ? io.env.API_TOKEN?.trim() ?? '' : io.env.FG_OPERATOR_TOKEN?.trim() || io.env.API_TOKEN?.trim() || '';
+  if (flags.owner && !io.env.FG_OWNER_TOKEN?.trim()) throw new UsageError('--owner requires FG_OWNER_TOKEN; tokenless owner actions use the same-origin browser UI');
+  const token = flags.owner ? io.env.FG_OWNER_TOKEN?.trim() ?? '' : io.env.FG_OPERATOR_TOKEN?.trim() || io.env.API_TOKEN?.trim() || '';
   const name = flags.as ?? io.env.FG_OPERATOR_NAME ?? 'fg';
   if (token) {
     let u: URL;

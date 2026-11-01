@@ -298,7 +298,7 @@ async function readWorkingFile(repoPath: string, rel: string): Promise<string | 
 
 /** PR identities explicitly named by the task, independent of the repository's current HEAD. */
 export function taskPrNumbers(task: string): number[] {
-  return [...new Set([...task.matchAll(/(?:github\.com\/[^\s/]+\/[^\s/]+\/pull\/|\b(?:PR|pull request)(?:\s*#|\s+)|#)(\d+)\b/gi)]
+  return [...new Set([...task.matchAll(/(?:github\.com\/[^\s/]+\/[^\s/]+\/pull\/|\b(?:PR|pull request)(?:\s*#|\s+)|#)(\d+)\b(?!\s+of\s+\d+)/gi)]
     .map(m => Number(m[1])).filter(n => Number.isSafeInteger(n) && n > 0))];
 }
 

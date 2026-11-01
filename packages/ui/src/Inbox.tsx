@@ -168,6 +168,7 @@ export function Inbox() {
           <>
             <Input aria-label="PR number" placeholder="PR number" type="number" min="1" value={pr} onChange={(e) => setPr(e.target.value)} className="w-28" />
             <Input aria-label="feedback author" placeholder="Feedback author" value={author} onChange={(e) => setAuthor(e.target.value)} className="w-40" />
+            {author && <span className="text-[11px] text-muted">Exact match; use the full GitHub or Linear login.</span>}
             <Select aria-label="source" value={source} onChange={(e) => setSource(e.target.value as FeedbackSource | '')} className="w-36">
               <option value="">all sources</option>
               {(Object.keys(SOURCE_LABEL) as FeedbackSource[]).map((s) => <option key={s} value={s}>{SOURCE_LABEL[s]}</option>)}

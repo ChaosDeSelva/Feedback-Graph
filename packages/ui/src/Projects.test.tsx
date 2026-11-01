@@ -590,6 +590,7 @@ test('parked queued scans show the reason and allow cancellation or changing pro
   await screen.findByText('sandbox cannot mount proc');
   fireEvent.change(screen.getByLabelText('provider'), { target: { value: 'claude-cli' } });
   fireEvent.click(screen.getByRole('button', { name: 'Switch provider and scan' }));
+  fireEvent.click(await screen.findByRole('button', { name: 'Cancel and switch provider' }));
   await waitFor(() => expect(calls.some(c => c.url.endsWith('/cancel'))).toBe(true));
   await waitFor(() => expect(calls.find(c => c.url.endsWith('/scan'))?.body).toEqual({ provider: 'claude-cli' }));
 });

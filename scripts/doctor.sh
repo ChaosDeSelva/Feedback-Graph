@@ -105,6 +105,32 @@ if [ -n "$(envval CODEX_RUNNER_URL)" ]; then
       more "$runner_detail"
       more "For procfs mount errors on Docker Desktop/OrbStack or Linux, review setup.sh --runner-procfs-compat (explicit opt-in removes Docker system-path protection); Claude/API avoids that exception. Rebuild codex-runner with scripts/seccomp/codex-runner.json. Check AppArmor and docs/operations.md."
     fi
+    # Docker Desktop implementations do not all enforce bridge-network isolation alike. Probe the actual runner,
+    # including an explicit Host header (fetch() silently discards it), rather than trusting the Compose topology.
+    if is_running codex-runner; then
+      api_id="$("${compose[@]}" ps -q api 2>/dev/null || true)"
+      api_ip="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}' "$api_id" 2>/dev/null | awk '{print $1}')"
+      targets="host.docker.internal:$api_port"
+      [ -n "$api_ip" ] && targets="$targets,$api_ip:8787"
+      pg_probe="$(envval POSTGRES_PORT)"; [ "$store" = postgres ] && targets="$targets,host.docker.internal:${pg_probe:-5434}"
+      [ "$store" != postgres ] && targets="$targets,host.docker.internal:${neo_http:-7476}"
+      ollama_port="$(envval OLLAMA_PORT)"; targets="$targets,host.docker.internal:${ollama_port:-11435}"
+      if isolation_detail="$("${compose[@]}" exec -T -e FG_ISOLATION_TARGETS="$targets" codex-runner node -e '
+        const http=require("node:http"), net=require("node:net");
+        const targets=process.env.FG_ISOLATION_TARGETS.split(",").filter(Boolean);
+        const probe=([host,port], api)=>new Promise(resolve=>{
+          if(api){const r=http.request({host,port:+port,path:"/api/health",headers:{Host:"localhost"},timeout:1200},x=>{x.resume();resolve(`${host}:${port} HTTP ${x.statusCode}`)});r.on("error",()=>resolve(null));r.on("timeout",()=>r.destroy());r.end();return}
+          const s=net.connect({host,port:+port});s.setTimeout(1200);s.once("connect",()=>{s.destroy();resolve(`${host}:${port} TCP`)});s.once("error",()=>resolve(null));s.once("timeout",()=>{s.destroy();resolve(null)});
+        });
+        Promise.all(targets.map((t,i)=>probe(t.split(":"),i<2))).then(xs=>{const open=xs.filter(Boolean);if(open.length){console.error(`runner reached protected endpoint(s): ${open.join(", ")}`);process.exit(1)}})
+      ' 2>&1)"; then
+        pass "Codex runner: live network probe cannot reach the API, database or host Ollama"
+      else
+        fail "Codex runner: container/network isolation does not hold on this Docker implementation"
+        more "$isolation_detail"
+        more "Do not use codex-cli scans on this host. Disable the codex profile and choose claude-cli or an API scan provider; the runner can reach protected local services."
+      fi
+    else fail "Codex runner: configured, but its container is not running for the live isolation probe"; fi
   else fail "Codex runner: configured but cannot be checked from a running worker"; fi
 fi
 
@@ -113,7 +139,7 @@ if [ "$docker_ok" = 1 ] && is_running neo4j; then
   if [ -n "$memory" ]; then
     report="$(printf '%s' "$memory" | awk -F'[:,}]' '{printf "Neo4j memory: %.0f MiB used / %.0f MiB limit; %.0f MiB headroom; %.0f MiB swap",$2/1048576,$4/1048576,$6/1048576,$8/1048576; if ($12 != "null") printf "; %.0f MiB swap headroom",$12/1048576}')"
     if printf '%s' "$memory" | awk -F'[:,}]' '{exit !($6/$4 < 0.15 || $8 > 0)}'; then
-      warn "$report"; more "Increase NEO4J_MEMORY_LIMIT or use the small profile in docs/install.md; leave Docker VM headroom."
+      warn "$report"; more "Increase NEO4J_MEMORY_LIMIT or lower NEO4J_HEAP_INITIAL/NEO4J_HEAP and NEO4J_PAGECACHE together; leave Docker VM headroom. The small profile is for smaller hosts, not a remedy for a container already short on headroom."
     else pass "$report"; fi
   else skip "Neo4j memory: cgroup counters unavailable"; fi
 fi
