@@ -58,7 +58,7 @@ export async function prepare({ folder = defaultFolder(), source = join(repo, 'e
 /** Explicit local-owner mode uses same-origin owner authorization; it never bypasses a configured token. */
 function ownerHeaders(base, { token, localOwner = false }) {
   new URL(base);
-  if (localOwner) throw Error('--local-owner was removed: use the actual browser UI on tokenless installs, or configure API_TOKEN for headless owner actions.');
+  if (localOwner) throw Error('--local-owner was removed: use the authenticated browser UI, or configure the separate FG_OWNER_TOKEN for headless owner actions.');
   if (!token) throw Error('Owner preparation requires FG_OWNER_TOKEN. Use the browser UI for a tokenless install; do not broaden OPERATOR_ALLOW.');
   return { authorization: `Bearer ${token}`, 'x-fg-owner': 'true' };
 }

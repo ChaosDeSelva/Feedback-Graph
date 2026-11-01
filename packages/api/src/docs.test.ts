@@ -1,4 +1,4 @@
-import type { ActivityInput } from '@fb/core';
+import { setRedactionArchive, type ActivityInput, type RedactionOriginal } from '@fb/core';
 import { expect, test } from 'vitest';
 import { createApp, type ApiRepo } from './app.ts';
 
@@ -37,6 +37,23 @@ test('uploading a document chunks, redacts, embeds and logs it', async () => {
   // Uploads are queued to be read into facts.
   expect(upserts[0].opts).toEqual({ read: true, addedBy: 'you' });
   expect(recorded[0]).toMatchObject({ kind: 'doc_added', actor: 'you', projectKey: 'shop', subject: 'uploaded "Product spec" (1 chunk)', targets: ['doc:shop:upload:spec.md'] });
+});
+
+test('a redacted upload original is scoped to its project and document for lifecycle cleanup', async () => {
+  const archived: RedactionOriginal[] = [];
+  setRedactionArchive(async record => { archived.push(record); });
+  try {
+    const { app } = setup();
+    const text = `Runbook token: sk-ant-api03-${'a'.repeat(40)}`;
+    expect((await app.request('/api/projects/shop/docs', post({ title: 'Runbook', name: 'runbook.md', text }))).status).toBe(201);
+    expect(archived).toHaveLength(1);
+    expect(archived[0]).toMatchObject({
+      kind: 'upload-incoming',
+      scope: [{ kind: 'project', id: 'shop' }, { kind: 'doc', id: 'doc:shop:upload:runbook.md' }],
+    });
+  } finally {
+    setRedactionArchive(undefined);
+  }
 });
 
 test('the largest upload is accepted at once (202) and embedded in the background in batches, never one call for all', async () => {

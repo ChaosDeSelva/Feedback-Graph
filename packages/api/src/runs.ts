@@ -244,7 +244,7 @@ export function runRoutes(app: Hono, d: RunsDeps) {
         const by = owner ? `was opened by ${openerOf(owner)}` : 'was opened before run owners were recorded';
         const who = owner?.principal === 'operator' && owner.actor
           ? 'only the original FG_RUN_KEY or the owner can clean it up; legacy runs require the owner'
-          : 'only the owner can clean it up: use fg cleanup --run <id> --owner with API_TOKEN, or the authenticated browser UI';
+          : 'only the owner can clean it up: use fg cleanup --run <id> --owner with FG_OWNER_TOKEN, or the authenticated browser UI';
         return c.json({ error: `run ${run.data} ${by}: ${who}; the operator token cleans up only runs opened with its private FG_RUN_KEY` }, 403);
       }
     }

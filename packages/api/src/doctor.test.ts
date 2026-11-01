@@ -217,6 +217,16 @@ test('doctor warns about a shell URL targeting another install and unrestricted 
   expect(checked.out).toContain('OPERATOR_ALLOW=all');
 });
 
+test('--no-transcripts empty mounts are intentional skips, not warnings about wrong folders', () => {
+  const checked = doctor({
+    env: 'API_PORT=8787\nCLAUDE_PROJECTS_DIR=/install/state/empty-claude\nCODEX_SESSIONS_DIR=/install/state/empty-codex\n',
+    transcripts: 0,
+  });
+  expect(checked.out).toContain('SKIP  Claude Code transcripts: intentionally empty (--no-transcripts');
+  expect(checked.out).toContain('SKIP  Codex sessions: intentionally empty (--no-transcripts');
+  expect(checked.out).not.toContain('folder is set wrong');
+});
+
 test('doctor reports actual cgroup memory, swap and low headroom', () => {
   const checked = doctor({ memory: { used: 950 * 1048576, limit: 1024 * 1048576, swap: 16 * 1048576 } });
   expect(checked.out).toContain('WARN  Neo4j memory: 950 MiB used / 1024 MiB limit; 74 MiB headroom; 16 MiB swap');

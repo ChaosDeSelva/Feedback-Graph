@@ -207,13 +207,17 @@ else
     if n="$(in_worker sh -c "test -r '$1' && test -x '$1' && ls -1 '$1' | wc -l")"; then
       n="$(printf '%s' "$n" | tr -dc 0-9)"
       if [ "${n:-0}" -gt 0 ]; then pass "$2: mounted and readable in the worker ($n entries, from $3)"
+      elif [ "${4:-}" = intentional-empty ]; then skip "$2: intentionally empty (--no-transcripts, from $3)"
       else warn "$2: mounted but empty in the worker (from $3); no sessions yet, or the folder is set wrong in .env"; fi
     else fail "$2: not readable in the worker (from $3); check the folder exists and that the containers' user may read it"; fi
   }
   claude_dir="$(expand "$(envval CLAUDE_PROJECTS_DIR)")"; claude_dir="${claude_dir:-$HOME/.claude/projects}"
   codex_dir="$(expand "$(envval CODEX_SESSIONS_DIR)")"; codex_dir="${codex_dir:-$HOME/.codex/sessions}"
-  mount_check /transcripts "Claude Code transcripts" "$claude_dir"
-  mount_check /codex-sessions "Codex sessions" "$codex_dir"
+  claude_empty=""; codex_empty=""
+  case "$claude_dir" in */state/empty-claude) claude_empty=intentional-empty ;; esac
+  case "$codex_dir" in */state/empty-codex) codex_empty=intentional-empty ;; esac
+  mount_check /transcripts "Claude Code transcripts" "$claude_dir" "$claude_empty"
+  mount_check /codex-sessions "Codex sessions" "$codex_dir" "$codex_empty"
   if in_worker sh -c 'test -s /codex/auth.json' >/dev/null; then pass "Codex login: present in the worker"
   else skip "Codex login: none in the worker (only needed for codex-cli scans and post-mortems)"; fi
 fi
@@ -221,9 +225,10 @@ fi
 # ── Codex login on this machine ─────────────────────────────────────────────────────────────────────────────────────
 codex_auth="$(expand "$(envval CODEX_AUTH_FILE)")"
 codex_home="${CODEX_HOME:-$HOME/.codex}"
+codex_configured="$(printf '%s,%s,%s,%s,%s' "$(envval SCAN_LLM)" "$(envval POSTMORTEM_LLM)" "$(envval DOCS_LLM)" "$(envval CHAT_LLM)" "$(envval COMPOSE_PROFILES)" | grep -o 'codex-cli\|codex' | head -n 1 || true)"
 if [ -n "$codex_auth" ] && [ -s "$codex_auth" ]; then pass "Codex login: $codex_auth (CODEX_AUTH_FILE)"
 elif [ -n "$codex_auth" ]; then fail "Codex login: CODEX_AUTH_FILE is $codex_auth, which is missing or empty (codex login, then run this again)"
-elif [ -s "$codex_home/auth.json" ]; then warn "Codex login: $codex_home/auth.json exists but is not mounted; set CODEX_AUTH_FILE=$codex_home/auth.json in .env to use codex-cli"
+elif [ -s "$codex_home/auth.json" ] && [ -n "$codex_configured" ]; then warn "Codex login: $codex_home/auth.json exists but is not mounted; set CODEX_AUTH_FILE=$codex_home/auth.json in .env to use codex-cli"
 else skip "Codex login: none (only needed for codex-cli)"; fi
 
 # ── GitHub and Linear, as the running api sees them ─────────────────────────────────────────────────────────────────

@@ -39,7 +39,9 @@ const DELETE: [RunItemKind, string][] = [
   ['feedback', `UNWIND $ids AS id MATCH (x:Candidate {id: id, run: $run}) WHERE NOT coalesce(x.detected, false)
                 OPTIONAL MATCH (x)-[:FLAGS]->(t:Turn)<-[:HAS_TURN]-(s:Session {manual: true})
                 OPTIONAL MATCH (f:Feedback {id: id})
-                OPTIONAL MATCH (task:Task {id: 'task:' + id})
+                // Post-mortems key the Task by session id, not candidate id. Follow the session relationship so run
+                // cleanup removes that derived task too (the manual session itself is already run-owned here).
+                OPTIONAL MATCH (s)-[:WORKED_ON]->(task:Task)
                 WITH x, collect(t) + collect(s) + collect(f) + collect(task) AS rest
                 FOREACH (r IN rest | DETACH DELETE r)
                 WITH x, x.id AS removedId DETACH DELETE x RETURN count(*) AS n, collect(removedId) AS removedIds`],

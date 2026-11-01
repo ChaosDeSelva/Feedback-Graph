@@ -83,7 +83,7 @@ Options:
   --as <name>      the agent name Activity records (default: FG_OPERATOR_NAME, else fg)
   --run <id>       label every request with this run (x-fg-run; default: FG_RUN), so fg cleanup --run removes what it wrote;
                    on cleanup and activity it names the run, and cleanup, activity and evidence are never labelled
-  --owner          fg cleanup only: use the configured API_TOKEN to clean a legacy run (never an operator bypass)
+  --owner          fg cleanup only: use the separate FG_OWNER_TOKEN to clean a legacy run (never an operator bypass)
   --sandbox        with --run: a sandbox run (x-fg-sandbox; default: FG_SANDBOX=1): what it writes is served only to its own agents
   --url <url>      the API (default: FEEDBACK_GRAPH_URL, else http://localhost:8787)
   --help           this text (fg help <command>: that command only)

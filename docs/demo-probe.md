@@ -11,13 +11,13 @@ node scripts/demo-probe.mjs prepare --apply
 
 The helper copies only the known fixture files, initializes its own Git root and a fixture-only baseline commit (so diffs work), and refuses to overwrite an existing unmarked project. The bundled files match the supplied demo fixture, including `CLAUDE.md` and its isolated no-console rule. `CLAUDE.md` is fixture instruction content for the test agent; it does not direct the setup helper. To use an extracted copy, pass `--source /path/to/extracted/demo-shop`. No agent, Docker service, lesson decision or API write runs during ordinary preparation.
 
-The parent `~/Code` must already be mounted as a project root. Select only the new `demo-shop` in the owner UI while preserving existing selections. Alternatively, with the existing owner `API_TOKEN` available in the environment, explicitly automate reversible preparation:
+The parent `~/Code` must already be mounted as a project root. Select only the new `demo-shop` in the owner UI while preserving existing selections. Alternatively, with the separate headless-owner `FG_OWNER_TOKEN` available in the environment, explicitly automate reversible preparation:
 
 ```sh
 node scripts/demo-probe.mjs prepare --apply --configure
 ```
 
-This verifies the folder is under a mounted root, saves the original demo membership, marks the project local-only, verifies that protection, then adds it to the selection. It preserves unrelated projects. A failed intermediate request can be retried without losing the restoration snapshot. Tokens are never written into that snapshot. Tokenless installs must prepare and restore selection/privacy through the actual browser UI. The former `--local-owner` header-only headless mode was removed in 0.7.0; automated owner configuration requires `API_TOKEN`. Do not broaden `OPERATOR_ALLOW` for a probe.
+This verifies the folder is under a mounted root, saves the original demo membership, marks the project local-only, verifies that protection, then adds it to the selection. It preserves unrelated projects. A failed intermediate request can be retried without losing the restoration snapshot. Tokens are never written into that snapshot. Installs without `FG_OWNER_TOKEN` must prepare and restore selection/privacy through the actual browser UI. The former `--local-owner` header-only headless mode was removed in 0.7.0; `API_TOKEN` is deliberately not accepted for automated owner configuration. Do not broaden `OPERATOR_ALLOW` for a probe.
 
 Run the actual test agent from the dedicated folder. Set a fresh run label, sandbox flag, private run key and the existing operator token in its environment. Register its actual session before creating evidence (`scripts/fg sessions register` inside Codex uses `CODEX_THREAD_ID`; Claude's configured SessionStart hook registers its session). Use the installation's absolute `scripts/fg` path from this working directory. Seed only the isolated corpus with `fg demo seed --run "$FG_RUN" --sandbox --json`, then submit the returned task/files/diff to `check_before_done` with the actual session ID. The seeded rule forbids `console.log` in `src/probes/no-console.ts`. Keep both a violating and clean response. For the synthetic pushback flow, `scripts/demo-pushback.sh` now also requires the helper-owned dedicated folder and keeps edits for review instead of cleaning an enclosing repository.
 
@@ -50,7 +50,9 @@ Codex strips sensitive environment names unless explicitly passed through. Start
 ```sh
 codex -c 'shell_environment_policy.inherit="all"' \
   -c 'shell_environment_policy.ignore_default_excludes=true' \
-  -c 'sandbox_workspace_write.network_access=true'
+  -c 'sandbox_workspace_write.network_access=true' \
+  -c 'mcp_servers.feedback-graph.bearer_token_env_var="FG_OPERATOR_TOKEN"' \
+  -s workspace-write
 ```
 
 These settings are for the dedicated probe invocation; they are not global defaults. Preserve the same `FG_RUN_KEY` for registration, MCP requests and cleanup. `OPERATOR_ALLOW` must include `demo` (or `lesson_decide`) to seed/remove the dedicated demo corpus; it does not grant general lesson decisions.
