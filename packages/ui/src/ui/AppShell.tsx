@@ -63,6 +63,7 @@ export function AppShell<K extends string>({ groups, current, onNavigate, health
 
   return (
     <div className="flex h-full min-h-0 flex-col md:flex-row">
+      <a href="#main-content" onClick={e => { e.preventDefault(); document.getElementById('main-content')?.focus(); }} className="sr-only focus:not-sr-only focus:fixed focus:top-3 focus:left-3 focus:z-50 focus:rounded focus:bg-surface focus:p-3 focus:text-text">Skip to main content</a>
       <aside ref={aside} className={`relative z-30 flex shrink-0 flex-col border-b border-line bg-canvas md:h-full md:border-r md:border-b-0 ${collapsed ? 'md:w-[52px]' : 'md:w-[212px]'}`}>
         <div className={`flex h-12 shrink-0 items-center gap-2 px-3 ${collapsed ? 'md:justify-center md:px-0' : ''}`}>
           <Mark />
@@ -145,7 +146,6 @@ export function AppShell<K extends string>({ groups, current, onNavigate, health
         </div>
       </aside>
       {menuOpen && <div aria-hidden="true" onClick={() => setMenuOpen(false)} className="fixed inset-0 z-20 bg-text/20 md:hidden" />}
-      <a href="#main-content" onClick={e => { e.preventDefault(); document.getElementById("main-content")?.focus(); }} className="sr-only focus:not-sr-only focus:fixed focus:left-3 focus:top-3 focus:z-50 focus:rounded focus:bg-surface focus:p-3 focus:text-text">Skip to main content</a>
       <main id="main-content" tabIndex={-1} className="flex min-h-0 min-w-0 flex-1 flex-col">{children}</main>
     </div>
   );

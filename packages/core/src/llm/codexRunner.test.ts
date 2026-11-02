@@ -297,7 +297,10 @@ test('readiness probes actual nested sandbox startup and fails closed before acc
   } });
   const health = await fetch(`${r.url}/health`);
   expect(health.status).toBe(503);
-  expect(await health.json()).toMatchObject({ ok: false, sandbox: false, error: expect.stringContaining('setup.sh --runner-procfs-compat') });
+  const body = await health.json() as { ok: boolean; sandbox: boolean; error: string };
+  expect(body).toMatchObject({ ok: false, sandbox: false, error: expect.stringContaining('setup.sh --runner-procfs-compat') });
+  expect(body.error.indexOf('Select Claude Code')).toBeLessThan(body.error.indexOf('setup.sh --runner-procfs-compat'));
+  expect(body.error).not.toContain('operations.md.;');
   const run = await r.post(job);
   expect(run.status).toBe(503);
   expect(await run.json()).toMatchObject({ code: 'sandbox_unavailable' });

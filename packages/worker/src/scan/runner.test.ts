@@ -290,7 +290,7 @@ test('provider outage refreshes all queued peers, preserving attempts and exclud
     updateScanJob: async (id, patch) => { updates.push({ id, patch }); },
   }, 'codex-cli', 'codex-cli', 'new sandbox error', '2030-01-01T00:02:00Z');
   expect(updates).toEqual(['blank', 'explicit'].map(id => ({ id, patch: {
-    error: 'scan parked: new sandbox error; checking readiness with backoff before copying the repository', retryAt: '2030-01-01T00:02:00Z',
+    error: 'scan parked on codex-cli: new sandbox error. Readiness will be checked again with backoff before the repository is copied.', retryAt: '2030-01-01T00:02:00Z',
   } })));
   expect(queue[0].attempts).toBe(3);
 });

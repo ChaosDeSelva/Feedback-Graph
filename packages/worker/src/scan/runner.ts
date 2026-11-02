@@ -2,9 +2,11 @@ import { providerUnavailableReason, type FactsStore, type ScanJob } from '@fb/co
 
 /** Refresh even old/future parked jobs so every project explains the same provider outage. */
 export async function parkScanProvider(facts: Pick<FactsStore, 'scanQueue' | 'updateScanJob'>, provider: string, fallback: string, reason: string, retryAt: string): Promise<void> {
-  const error = `scan parked: ${reason}; checking readiness with backoff before copying the repository`;
+  const clean = reason.trim().replace(/[.;:\s]+$/, '');
+  const error = `scan parked on ${provider}: ${clean}. Readiness will be checked again with backoff before the repository is copied.`;
   for (const job of await facts.scanQueue()) {
     if (job.status === 'queued' && (job.provider?.trim() || fallback) === provider)
+      // The error names the resolved default even when the immutable request field is null, so the UI can avoid it.
       await facts.updateScanJob(job.id, { error, retryAt });
   }
 }

@@ -19,9 +19,11 @@ const fact = (id: string, statement: string, kind = 'convention', relevance: num
 let calls: { url: string; body?: unknown }[];
 let projectList: unknown[];
 let scanWarning: string | undefined;
+let cancelError: string | undefined;
 beforeEach(() => {
   calls = [];
   scanWarning = undefined;
+  cancelError = undefined;
   projectList = projects;
   vi.stubGlobal('fetch', vi.fn(async (url: string, init?: RequestInit) => {
     calls.push({ url, body: init?.body ? JSON.parse(init.body as string) : undefined });
@@ -33,7 +35,10 @@ beforeEach(() => {
     if (url === '/api/projects/demo-shop/docs' && init?.method === 'POST') return Response.json({ id: 'doc:demo-shop:upload:spec.md', chunks: 2 }, { status: 201 });
     if (url === '/api/projects/demo-shop/docs') return Response.json([{ id: 'doc:demo-shop:github:github:me/shop#3', projectKey: 'demo-shop', source: 'github', ref: 'github:me/shop#3', title: 'me/shop#3: Orders', url: 'https://github.com/me/shop/pull/3', addedAt: 't', chunks: 4 }]);
     if (url.startsWith('/api/docs/') && init?.method === 'DELETE') return new Response(null, { status: 204 });
-    if (url.endsWith('/cancel')) { projectList = projects; return new Response(null, { status: 204 }); }
+    if (url.endsWith('/cancel')) {
+      if (cancelError) return Response.json({ error: cancelError }, { status: 409 });
+      projectList = projects; return new Response(null, { status: 204 });
+    }
     if (url.endsWith('/scan')) return Response.json({ ...job('queued'), ...(scanWarning ? { blocked: true, warning: scanWarning } : {}) }, { status: 202 });
     if (url.startsWith('/api/projects/demo-shop/codemap/module')) return Response.json({ file: { path: 'src/db.ts', lang: 'typescript', hash: 'h', loc: 10, isTest: false, churn: null }, symbols: [], importers: [], imports: [], tests: [], facts: [], misses: [], lessons: [] });
     if (url.startsWith('/api/projects/demo-shop/codemap/hotspots')) return Response.json({ meta: { fingerprint: 'x', builtAt: '2026-10-22T12:00:00Z', stats: { files: 40, symbols: 200, imports: 90, tests: 12 } }, hotspots: [{ path: 'src/routes/orders.ts', churn: 5, misses: 1, dependents: 2, score: 8.17 }] });
@@ -52,6 +57,15 @@ test('lists projects with counts and shows facts for the selected one', async ()
   expect(screen.getByText('Pagination max 50')).toBeTruthy();
   expect(screen.getByText(/3 sessions · 2 lessons · 12 facts/)).toBeTruthy();
   expect(await row('other')).toBeTruthy();
+});
+
+test('an unknown project deep link says so and never substitutes the first project', async () => {
+  history.replaceState(null, '', '#projects/not-here/src%2Fdb.ts');
+  render(<Projects />);
+  expect(await screen.findByText('Project not found')).toBeTruthy();
+  expect(screen.getByText(/link names “not-here”/)).toBeTruthy();
+  expect(screen.queryByText('Use sendError for all errors')).toBeNull();
+  expect(calls.some((c) => c.url.includes('/api/projects/demo-shop/facts'))).toBe(false);
 });
 
 test('files an older scanner read are counted, with what to do: no scan starts on its own', async () => {
@@ -585,12 +599,36 @@ test('Scan displays a parked-runner warning instead of silently accepting the qu
 
 
 test('parked queued scans show the reason and allow cancellation or changing provider', async () => {
-  projectList = [{ ...projects[0], lastScan: { ...job('queued'), error: 'sandbox cannot mount proc' } }];
+  const legacy = 'scan parked on codex-cli: sandbox cannot mount proc; see docs/operations.md.; checking readiness with backoff before copying the repository';
+  projectList = [{ ...projects[0], lastScan: { ...job('queued'), provider: null, error: legacy } }];
   render(<Projects />);
-  await screen.findByText('sandbox cannot mount proc');
+  expect(await screen.findByText(/Readiness will be checked again with backoff/)).toBeTruthy();
+  expect(screen.queryByText(/operations\.md\.;/)).toBeNull();
+  const switcher = screen.getByRole('button', { name: 'Switch provider and scan' }) as HTMLButtonElement;
+  expect(switcher.disabled).toBe(true);
+  expect(screen.getByRole('button', { name: /^Scan$/ }).getAttribute('title')).not.toContain(legacy);
+  fireEvent.change(screen.getByLabelText('provider'), { target: { value: 'codex-cli' } });
+  expect(switcher.disabled).toBe(true);
   fireEvent.change(screen.getByLabelText('provider'), { target: { value: 'claude-cli' } });
-  fireEvent.click(screen.getByRole('button', { name: 'Switch provider and scan' }));
+  expect(switcher.disabled).toBe(false);
+  fireEvent.click(switcher);
+  expect(await screen.findByRole('button', { name: 'Keep queued scan' })).toBeTruthy();
   fireEvent.click(await screen.findByRole('button', { name: 'Cancel and switch provider' }));
   await waitFor(() => expect(calls.some(c => c.url.endsWith('/cancel'))).toBe(true));
   await waitFor(() => expect(calls.find(c => c.url.endsWith('/scan'))?.body).toEqual({ provider: 'claude-cli' }));
+});
+
+test('a scan action error clears when a valid provider is picked', async () => {
+  cancelError = 'that queued scan has already changed';
+  projectList = [{ ...projects[0], lastScan: { ...job('queued'), provider: 'claude-cli', error: 'provider unavailable' } }];
+  render(<Projects />);
+  await screen.findByText('provider unavailable');
+  fireEvent.change(screen.getByLabelText('provider'), { target: { value: 'claude-cli' } });
+  expect((screen.getByRole('button', { name: 'Switch provider and scan' }) as HTMLButtonElement).disabled).toBe(true);
+  fireEvent.change(screen.getByLabelText('provider'), { target: { value: 'codex-cli' } });
+  fireEvent.click(screen.getByRole('button', { name: 'Switch provider and scan' }));
+  fireEvent.click(await screen.findByRole('button', { name: 'Cancel and switch provider' }));
+  expect(await screen.findAllByText(/queued scan has already changed/)).not.toHaveLength(0);
+  fireEvent.change(screen.getByLabelText('provider'), { target: { value: 'ollama:gemma4' } });
+  expect(screen.queryByText(/queued scan has already changed/)).toBeNull();
 });

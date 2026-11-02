@@ -14,6 +14,8 @@ export type ConfirmOptions = {
   items?: string[];
   /** The destructive button's label: the action, not "OK". */
   confirmLabel: string;
+  /** A specific safe outcome when plain “Cancel” would be ambiguous beside the action being confirmed. */
+  cancelLabel?: string;
   /** Shown on the confirm button while `busy`. */
   busyLabel?: string;
   /** A phrase to type before confirm is enabled, for removals that cannot be undone and reach far. */
@@ -37,7 +39,7 @@ const FOCUSABLE = 'button:not([disabled]), input:not([disabled]), [href], [tabin
  * Asks before anything is removed. Cancel has the focus, so Enter or a stray click keeps your data; Escape and a click
  * outside cancel too. The confirm button is the only red one and says what it does.
  */
-export function ConfirmDialog({ open, title, message, items, confirmLabel, busyLabel, typeToConfirm, onConfirm, onCancel, busy = false, error = null, children }: Props) {
+export function ConfirmDialog({ open, title, message, items, confirmLabel, cancelLabel = 'Cancel', busyLabel, typeToConfirm, onConfirm, onCancel, busy = false, error = null, children }: Props) {
   const titleId = useId();
   const descId = useId();
   const dialog = useRef<HTMLDivElement>(null);
@@ -111,7 +113,7 @@ export function ConfirmDialog({ open, title, message, items, confirmLabel, busyL
           {error && <Alert>{error}</Alert>}
         </div>
         <footer className="flex flex-wrap justify-end gap-2 rounded-b-md border-t border-line bg-sunken px-4 py-3">
-          <Button data-cancel onClick={onCancel} disabled={busy}>Cancel</Button>
+          <Button data-cancel onClick={onCancel} disabled={busy}>{cancelLabel}</Button>
           <Button variant="danger" onClick={() => { if (ready) onConfirm(); }} disabled={!ready}>{busy && busyLabel ? busyLabel : confirmLabel}</Button>
         </footer>
       </div>

@@ -17,6 +17,16 @@ function shell(onNavigate = vi.fn()) {
   return onNavigate;
 }
 
+test('the skip link is the first Tab stop and moves focus to the page', async () => {
+  const user = userEvent.setup();
+  shell();
+  await user.tab();
+  const skip = screen.getByRole('link', { name: 'Skip to main content' });
+  expect(document.activeElement).toBe(skip);
+  await user.keyboard('{Enter}');
+  expect(document.activeElement).toBe(document.getElementById('main-content'));
+});
+
 test('opening the phone menu moves focus into it, and Tab stays inside until it closes', async () => {
   const user = userEvent.setup();
   shell();

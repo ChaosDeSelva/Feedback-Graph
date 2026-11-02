@@ -43,6 +43,12 @@ test('the confirm button is the destructive one and confirms', () => {
   expect(onCancel).not.toHaveBeenCalled();
 });
 
+test('a caller can name the safe outcome instead of showing an ambiguous Cancel', () => {
+  open({ cancelLabel: 'Keep queued scan' });
+  expect(screen.getByRole('button', { name: 'Keep queued scan' })).toBe(document.activeElement);
+  expect(screen.queryByRole('button', { name: 'Cancel' })).toBeNull();
+});
+
 test('Cancel, Escape and a click on the backdrop all cancel; a click inside does not', () => {
   const { onCancel, dialog } = open();
   fireEvent.click(dialog);

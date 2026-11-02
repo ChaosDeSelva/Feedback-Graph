@@ -83,6 +83,35 @@ test('Settings is split into tabs: Projects first, each other tab one click away
   expect(location.hash).toBe('#settings/cleanup');
 });
 
+test('Settings tabs use arrow, Home and End keys with one tab in the keyboard order', async () => {
+  render(<Settings />);
+  const projects = await screen.findByRole('tab', { name: 'Projects' });
+  expect(projects.tabIndex).toBe(0);
+  projects.focus();
+  fireEvent.keyDown(projects, { key: 'ArrowRight' });
+  const integrations = screen.getByRole('tab', { name: 'Integrations' });
+  expect(document.activeElement).toBe(integrations);
+  expect(integrations.getAttribute('aria-selected')).toBe('true');
+  expect(projects.tabIndex).toBe(-1);
+  fireEvent.keyDown(integrations, { key: 'End' });
+  expect(document.activeElement).toBe(screen.getByRole('tab', { name: 'Clean up' }));
+  fireEvent.keyDown(document.activeElement!, { key: 'ArrowRight' });
+  expect(document.activeElement).toBe(projects);
+  fireEvent.keyDown(projects, { key: 'ArrowLeft' });
+  expect(document.activeElement).toBe(screen.getByRole('tab', { name: 'Clean up' }));
+  fireEvent.keyDown(document.activeElement!, { key: 'Home' });
+  expect(document.activeElement).toBe(projects);
+});
+
+test('selection counts canonical projects once while explaining per-folder session counts', async () => {
+  render(<Settings />);
+  await screen.findByRole('row', { name: 'demo-shop' });
+  const selected = screen.getByRole('button', { name: /Selected projects/ });
+  expect(selected.textContent).toContain('1');
+  expect(screen.getByText(/cloned folders follow one selected project/)).toBeTruthy();
+  expect(screen.getByRole('button', { name: /All folders/ }).textContent).toContain('6');
+});
+
 test('a link to a card opens the tab that holds it', async () => {
   history.replaceState(null, '', '#settings/integrations-linear');
   render(<Settings />);

@@ -38,6 +38,15 @@ export function queuePosition(projects: ProjectSummary[], key: string, now = Dat
   return i < 0 ? null : i + 1;
 }
 
+/** Make old persisted park messages readable too; new workers already store this punctuation and copy cleanly. */
+export const scanErrorText = (error: string) => error
+  .replace(/operations\.md\.\s*;/g, 'operations.md;')
+  .replace(/;\s*checking readiness with backoff before copying the repository\.?$/i, '. Readiness will be checked again with backoff before the repository is copied.');
+
+const parkedProvider = (scan: ProjectSummary['lastScan']) => scan?.provider?.trim()
+  || scan?.error?.match(/^scan parked on ([^:]+):/i)?.[1]?.trim()
+  || null;
+
 export function Projects({ pollMs = 5000 }: { pollMs?: number } = {}) {
   const [projects, setProjects] = useState<ProjectSummary[] | null>(null);
   // A module link (#projects/<key>/<path>, from Ask or the Dashboard) opens on that project with the file's panel open.
@@ -56,8 +65,10 @@ export function Projects({ pollMs = 5000 }: { pollMs?: number } = {}) {
   const [open, setOpen] = useState(!!link);
 
   const load = () => api.projects().then((ps) => {
+    setError(null);
     setProjects(ps);
-    setSelected((s) => (s && ps.some((p) => p.key === s) ? s : null) ?? ps.find((p) => p.facts > 0)?.key ?? ps[0]?.key ?? null);
+    // A deep link must never silently substitute another project: keep its unknown key so the detail says not found.
+    setSelected((s) => (s && ps.some((p) => p.key === s) ? s : s === link?.project ? s : ps.find((p) => p.facts > 0)?.key ?? ps[0]?.key ?? null));
   }, (e) => { setError(String(e)); setProjects((ps) => ps ?? []); });
   useEffect(() => { load(); }, []);
   // A link followed while the page is open (Ask, the Dashboard, a module's "link") switches to the project it names, so
@@ -75,6 +86,7 @@ export function Projects({ pollMs = 5000 }: { pollMs?: number } = {}) {
   }, []);
   /** Pick a project: the address names it too (without a history entry), so a reload or a copied link opens the same one. */
   const pick = (key: string) => {
+    setError(null);
     setSelected(key);
     setOpen(true);
     history.replaceState(history.state, '', projectHref(key));
@@ -82,6 +94,7 @@ export function Projects({ pollMs = 5000 }: { pollMs?: number } = {}) {
 
   const current = projects?.find((p) => p.key === selected);
   const scanning = current?.lastScan && ['queued', 'running'].includes(current.lastScan.status);
+  const canSwitchProvider = !!provider && provider !== parkedProvider(current?.lastScan ?? null);
 
   // Refetch when the selection or filter changes, and when a scan finishes (its status flips to done).
   const scanState = current?.lastScan ? `${current.lastScan.id}:${current.lastScan.status}` : '';
@@ -106,6 +119,7 @@ export function Projects({ pollMs = 5000 }: { pollMs?: number } = {}) {
     if (!current) return;
     try {
       const job = await api.scan(current.key, provider || undefined);
+      setError(null);
       setScanWarning(job.warning ? { jobId: job.id, text: job.warning } : null);
       setProjects((ps) => ps && ps.map((p) => (p.key === current.key ? { ...p, lastScan: job } : p)));
     } catch (e) {
@@ -123,12 +137,14 @@ export function Projects({ pollMs = 5000 }: { pollMs?: number } = {}) {
       title: replace ? `Cancel this scan and switch ${current.key} to ${provider}?` : `Cancel the queued scan for ${current.key}?`,
       message: replace ? 'The queued job is removed, then a new scan is queued on the provider you selected.' : 'The queued job is removed. No scan is started in its place.',
       confirmLabel: replace ? 'Cancel and switch provider' : 'Cancel queued scan',
+      cancelLabel: 'Keep queued scan',
     });
     if (!confirmed) return;
     try {
       await api.cancelScan(current.key, current.lastScan.id);
       if (replace) await scan();
       else await load();
+      setError(null);
     } catch (e) { setError(String(e)); }
   }
 
@@ -136,6 +152,7 @@ export function Projects({ pollMs = 5000 }: { pollMs?: number } = {}) {
     try {
       await api.pinProject(p.key, !p.pinned);
       await load();
+      setError(null);
     } catch (e) {
       setError(String(e));
     }
@@ -145,6 +162,7 @@ export function Projects({ pollMs = 5000 }: { pollMs?: number } = {}) {
     if (!selected) return;
     try {
       await api.setFactRelevance(selected, f.id, relevance);
+      setError(null);
       setFacts((fs) => fs && fs.map((x) => (x.id === f.id ? { ...x, relevance, relevanceBy: 'you' } : x)));
     } catch (e) {
       setError(String(e));
@@ -155,7 +173,7 @@ export function Projects({ pollMs = 5000 }: { pollMs?: number } = {}) {
     e.preventDefault();
     if (!selected) return;
     const n = ++factsReq.current;
-    api.facts(selected, query.trim() ? { q: query.trim() } : { kind: kind || undefined }).then((f) => { if (n === factsReq.current) setFacts(f); }, (err) => { if (n === factsReq.current) setError(String(err)); });
+    api.facts(selected, query.trim() ? { q: query.trim() } : { kind: kind || undefined }).then((f) => { if (n === factsReq.current) { setError(null); setFacts(f); } }, (err) => { if (n === factsReq.current) setError(String(err)); });
   }
 
   return (
@@ -197,8 +215,8 @@ export function Projects({ pollMs = 5000 }: { pollMs?: number } = {}) {
           {!projects ? (
             <SkeletonDetail />
           ) : !current ? (
-            <EmptyState icon={<FolderIcon />} title="No project selected">
-              Projects appear once the worker has read a session from their folder. Pick one on the left to scan its code and manage its docs.
+            <EmptyState icon={<FolderIcon />} title={link ? 'Project not found' : 'No project selected'}>
+              {link ? `The link names “${link.project}”, which is not among the selected projects. Select it in Settings or choose a project on the left.` : 'Projects appear once the worker has read a session from their folder. Pick one on the left to scan its code and manage its docs.'}
             </EmptyState>
           ) : (
             <div className="flex flex-col gap-4">
@@ -213,13 +231,13 @@ export function Projects({ pollMs = 5000 }: { pollMs?: number } = {}) {
                     <PinIcon size={13} filled={current.pinned} />
                     {current.pinned ? 'Pinned' : 'Pin'}
                   </Button>
-                  <Select aria-label="provider" value={provider} onChange={(e) => setProvider(e.target.value)} className="w-56">
+                  <Select aria-label="provider" value={provider} onChange={(e) => { setProvider(e.target.value); setError(null); }} className="w-56">
                     {PROVIDERS.map((p) => <option key={p.value} value={p.value}>{p.label}</option>)}
                   </Select>
-                  <Button variant="primary" onClick={scan} disabled={!!scanning} title={scanning ? current.lastScan?.error || `Scan ${current.lastScan?.status}; wait for completion or cancel a queued scan` : undefined}>Scan</Button>
+                  <Button variant="primary" onClick={scan} disabled={!!scanning} title={scanning ? `Scan ${current.lastScan?.status}; see Last scan below for details, or cancel a queued scan` : undefined}>Scan</Button>
                   {current.lastScan?.status === 'queued' && <>
                     <Button onClick={() => cancelScan()}>Cancel queued scan</Button>
-                    <Button onClick={() => cancelScan(true)}>Switch provider and scan</Button>
+                    <Button disabled={!canSwitchProvider} title={!provider ? 'Choose an explicit provider first; default may be the one that is parked' : !canSwitchProvider ? 'Choose a different provider from the parked scan' : undefined} onClick={() => cancelScan(true)}>Switch provider and scan</Button>
                   </>}
                 </div>
               </header>
@@ -262,7 +280,7 @@ export function Projects({ pollMs = 5000 }: { pollMs?: number } = {}) {
                       {current.lastScan.attempts ? ` (attempt ${current.lastScan.attempts + 1})` : ''}
                     </span>
                   )}
-                  {current.lastScan.error && <div className="w-full text-bad-text">{current.lastScan.error}</div>}
+                  {current.lastScan.error && <div className="w-full text-bad-text">{scanErrorText(current.lastScan.error)}</div>}
                 </div>
               )}
 

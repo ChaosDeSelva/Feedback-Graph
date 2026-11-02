@@ -31,8 +31,8 @@ export function tabOf(focus: string | null): Tab {
 
 type Filter = 'all' | 'selected' | 'sessions' | 'data';
 const FILTERS: { key: Filter; label: string }[] = [
-  { key: 'all', label: 'All' },
-  { key: 'selected', label: 'Selected' },
+  { key: 'all', label: 'All folders' },
+  { key: 'selected', label: 'Selected projects' },
   { key: 'sessions', label: 'With sessions' },
   { key: 'data', label: 'Has data' },
 ];
@@ -87,6 +87,14 @@ export function Settings() {
   }, []);
   // Kept in the address without a history entry or a hashchange (which the app's router would act on).
   const openTab = (t: Tab) => { setTab(t); history.replaceState(null, '', `#settings/${t}`); };
+  const moveTab = (from: Tab, key: string) => {
+    const i = TABS.findIndex((t) => t.key === from);
+    const next = key === 'Home' ? 0 : key === 'End' ? TABS.length - 1
+      : key === 'ArrowRight' ? (i + 1) % TABS.length : key === 'ArrowLeft' ? (i + TABS.length - 1) % TABS.length : -1;
+    if (next < 0) return;
+    openTab(TABS[next].key);
+    document.getElementById(`settings-tab-${TABS[next].key}`)?.focus();
+  };
 
   const load = () =>
     api.projectSettings().then(
@@ -168,7 +176,8 @@ export function Settings() {
   const counts: Record<Filter, number> = data
     ? {
         all: data.candidates.length,
-        selected: data.candidates.filter(selected).length,
+        // Cloned folders follow one canonical project; Projects lists that project once, so this count does too.
+        selected: new Set(data.candidates.filter(selected).map((c) => c.aliasOf ?? c.key)).size,
         sessions: data.candidates.filter((c) => c.claudeSessions + c.codexSessions > 0).length,
         data: data.candidates.filter((c) => c.hasData).length,
       }
@@ -188,7 +197,9 @@ export function Settings() {
             id={`settings-tab-${t.key}`}
             aria-selected={tab === t.key}
             aria-controls="settings-panel"
+            tabIndex={tab === t.key ? 0 : -1}
             onClick={() => openTab(t.key)}
+            onKeyDown={(e) => { if (['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(e.key)) { e.preventDefault(); moveTab(t.key, e.key); } }}
             className={`-mb-px shrink-0 border-b-2 px-3 py-2 text-[13px] font-medium transition-colors ${
               tab === t.key ? 'border-accent text-text' : 'border-transparent text-muted hover:text-text'
             }`}
@@ -224,7 +235,7 @@ export function Settings() {
           {tab === 'projects' && data && (
             <section aria-labelledby="settings-folders" className="grid gap-2.5">
               <SectionHead id="settings-folders" title="Project folders">
-                Tick a folder to read its Claude Code and Codex sessions. Unticking stops reading it and keeps what was learned.
+                Tick a folder to read its Claude Code and Codex sessions. Unticking stops reading it and keeps what was learned. Counts here are per folder; cloned folders follow one selected project, while Projects lists that project once with deduplicated sessions.
               </SectionHead>
 
               <div className="flex flex-wrap items-center gap-2">
