@@ -10,7 +10,7 @@
  * 5: an instruction in an upload is one addressed to the reader-as-AI, not a project convention (facts v4 closed as
  * instructions are reopened); the head of a token an older Activity subject cut at its cap is redacted.
  */
-export const REDACTION_VERSION = 11;
+export const REDACTION_VERSION = 12;
 /** Rows a store reads per page when it redacts stored text again under new rules. */
 export const REDACT_PAGE = 1000;
 
@@ -80,6 +80,7 @@ const namedSecret = (v: string) => looksLikeSecret(v) || slashedSecret(v);
  * "refresh_token_v2", "acme.token"). The name is the signal here, so a plain word such as a passphrase still counts.
  */
 function assignedSecret(v: string): boolean {
+  if (/^(?:password|passwd|secret|token|api[_-]?key)$/i.test(v)) return false;
   if (URL_START.test(v) || /^\.{0,2}[/~]/.test(v) || /\$[({\w]/.test(v)) return false;
   if (/^(?:<[^>]+>|\{\{[^}]+\}\})$/.test(v) || /^[A-Za-z_][\w.]*\s*(?:\(|\[)/.test(v)) return false;
   if (/^(?:change[-_.]?me|your[-_]|example|placeholder|x{3,}|\*+$)/i.test(v)) return false;
@@ -89,21 +90,25 @@ function assignedSecret(v: string): boolean {
 }
 
 /** Known token shapes and URL credentials: a secret wherever they appear, whoever wrote the text. */
+/** Multi-line key blocks run before token fragments: replacing one body line first would break the block match. */
+const BLOCK_PATTERNS: RegExp[] = [
+  /-----BEGIN PGP PRIVATE KEY BLOCK-----[\s\S]*?-----END PGP PRIVATE KEY BLOCK-----/g,
+  /-----BEGIN PGP PRIVATE KEY BLOCK-----\r?\n(?:(?:Version|Comment):[^\r\n]*\r?\n|[ \t]*\r?\n|[A-Za-z0-9+/=]{8,}(?:\r?\n|$))+/g,
+  /-----BEGIN (?:RSA |DSA |EC |OPENSSH |ENCRYPTED )?PRIVATE KEY-----[\s\S]*?-----END (?:RSA |DSA |EC |OPENSSH |ENCRYPTED )?PRIVATE KEY-----/g,
+  /(?:^[ \t-]*(?:[\w.-]+:[ \t]*[>|][+-]?[ \t]*\r?\n)?^[ \t-]*)-----BEGIN (?:RSA |DSA |EC |OPENSSH |ENCRYPTED )?PRIVATE KEY-----\r?\n(?:(?:[ \t]*(?:Proc-Type|DEK-Info):[^\r\n]*\r?\n)|[ \t]*\r?\n|[ \t]*[A-Za-z0-9+/=]{8,}(?:\r?\n|$))+/gim,
+  /-----BEGIN (?:RSA |DSA |EC |OPENSSH |ENCRYPTED )?PRIVATE KEY-----\\n(?:(?:(?:Proc-Type|DEK-Info):[^\\]*(?:\\n|$))|[A-Za-z0-9+/=]{8,}(?:\\n|$))+/g,
+  /^PuTTY-User-Key-File-[23]: (?:ssh-|ecdsa-)[^\r\n]+\r?\n(?:(?!^PuTTY-User-Key-File-)[\s\S])*?^Private-Lines: \d+\r?\n(?:[A-Za-z0-9+/=]+\r?\n)+Private-MAC:[ \t]*[a-f0-9]+/gim,
+];
+
 const TOKEN_PATTERNS: RegExp[] = [
   /\b(run-key:)[a-f0-9]{64}\b/gi,
   /(\bAWS[ \t]+secret(?:[ \t]+access)?[ \t]+key(?:[ \t]+(?:is|was)[ \t]+|[ \t]*[:=][ \t]*|[ \t]+)["']?)[A-Za-z0-9/+]{40}={0,2}(?=$|[\s"',.;])/gi,
   /(\bTwilio[ \t]+(?:auth(?:entication)?(?:[ \t]+(?:token|secret))?|token|secret)(?:[ \t]+(?:is|was)[ \t]+|[ \t]*[:=][ \t]*|[ \t]+)["']?)[a-f0-9]{32}\b/gi,
   /\b(AccountKey\s*=\s*)(?![<${])[^;\s"']{16,}/gi,
-  /-----BEGIN PGP PRIVATE KEY BLOCK-----[\s\S]*?-----END PGP PRIVATE KEY BLOCK-----/g,
-  /-----BEGIN PGP PRIVATE KEY BLOCK-----\r?\n(?:(?:Version|Comment):[^\r\n]*\r?\n|[ \t]*\r?\n|[A-Za-z0-9+/=]{8,}(?:\r?\n|$))+/g,
-  /^PuTTY-User-Key-File-[23]: (?:ssh-|ecdsa-)[^\r\n]+\r?\n(?:(?!^PuTTY-User-Key-File-)[\s\S])*?^Private-Lines: \d+\r?\n(?:[A-Za-z0-9+/=]+\r?\n)+Private-MAC:[ \t]*[a-f0-9]+/gim,
   /(\bmailgun(?:[ \t]+(?:api[ \t]+)?key)?[ \t]*(?:is[ \t]+|[:=][ \t]*)?)["']?(?:key-)?[a-f0-9]{32}(?:-[a-f0-9]{8,32}){0,3}\b/gi,
   /\bSK[a-fA-F0-9]{32}\b/g,
   /\bmfa\.[A-Za-z0-9_-]{40,}\b/g,
   /\$(?:2[aby]\$\d{2}\$[./A-Za-z0-9]{53}|(?:apr1|1)\$[./A-Za-z0-9]{1,8}\$[./A-Za-z0-9]{22}|5\$(?:rounds=\d+\$)?[./A-Za-z0-9]{1,16}\$[./A-Za-z0-9]{43}|6\$(?:rounds=\d+\$)?[./A-Za-z0-9]{1,16}\$[./A-Za-z0-9]{86}|argon2(?:id|i|d)\$v=\d+\$m=\d+,t=\d+,p=\d+\$[A-Za-z0-9+/]+=*\$[A-Za-z0-9+/]+=*)|\{SHA\}[A-Za-z0-9+/]{27}=/g,
-  /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g,
-  /-----BEGIN (?:RSA |DSA |EC |OPENSSH |ENCRYPTED )?PRIVATE KEY-----\r?\n(?:(?:Proc-Type|DEK-Info):[^\r\n]*\r?\n|[ \t]*\r?\n|[A-Za-z0-9+/=]{8,}(?:\r?\n|$))+/g,
-  /-----BEGIN (?:RSA |DSA |EC |OPENSSH |ENCRYPTED )?PRIVATE KEY-----\\n(?:(?:Proc-Type|DEK-Info):[^\\]*(?:\\n|$)|[A-Za-z0-9+/=]{8,}(?:\\n|$))+/g,
   /\bsk-(?:proj-|ant-[a-z0-9]+-)?[A-Za-z0-9_-]{20,}/g,
   /\b[sr]k_(?:live|test)_[A-Za-z0-9]{16,}/g,
   /\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{30,}/g,
@@ -122,6 +127,10 @@ const TOKEN_PATTERNS: RegExp[] = [
   /\bnpm_[A-Za-z0-9]{36,}/g,
   /\blin_api_[A-Za-z0-9]{32,}/g,
   /\bdapi[a-f0-9]{32,}\b/gi,
+  /\b(?:sq0csp-|ATATT|figd_|ntn_|glsa_)[A-Za-z0-9_-]{16,}\b/g,
+  /\bPMAK-[A-Za-z0-9_-]{16,}\b/g,
+  /\b\d{7,12}:[A-Za-z0-9_-]{30,}\b/g,
+  /\b(SSWS[ \t]+)[A-Za-z0-9_-]{16,}\b/gi,
   // Feedback Graph Cloud personal access tokens: fgc_pat_<16 hex lookup id>_<secret>.
   /\bfgc_pat_[0-9a-f]{16}_[A-Za-z0-9_-]{20,}/g,
   // The head of a token cut at a length cap (an Activity subject before v5 was cut before it was redacted): a known
@@ -130,8 +139,12 @@ const TOKEN_PATTERNS: RegExp[] = [
   // user:password@ in a URL; the user name stays. A ${VAR} in its place is a reference, not a secret.
   /\b([a-z][a-z0-9+.-]*:\/\/[^\s:/@]*:)(?!\$\{)[^\s@/]+(?=@)/gi,
   /(\bcurl\s+[^\r\n]*?-u\s+[^\s:'"]+:)([^\s'"]+)/gi,
-  /(\bmysql\s+[^\r\n]*?--password=)(?!\s|\$)[^\s'"]+/gi,
-  /(\bmysql\s+[^\r\n]*?\s-p)(?!\s|\$)[^\s'"]+/gi,
+  /(\bcurl\s+[^\r\n]*?--user(?:=|\s+)[^\s:'"]+:)([^\s'"]+)/gi,
+  /(\bmysql(?:dump)?\s+[^\r\n]*?--password=)(?!\s|\$)[^\s'"]+/gi,
+  /(\bmysql(?:dump)?\s+[^\r\n]*?\s-p)(?!\s|\$)[^\s'"]+/gi,
+  /(\b(?:docker\s+login|sshpass|redis-cli)\b[^\r\n]*?\s-(?:p|a)(?:=|\s+)["']?)(?!\s|\$)[^\s'"]+/gi,
+  /(\brequests\.[a-z]+\([^\r\n]*?\bauth\s*=\s*\(\s*["'][^"']+["']\s*,\s*["'])([^"']+)(?=["']\s*\))/gi,
+  /(<password(?:\s[^>]*)?>)([^<\r\n]+)(?=<\/password>)/gi,
   // A webhook URL is its own secret: the host and kind stay, the path that grants access goes.
   /\b(https?:\/\/hooks\.slack\.com\/(?:services|workflows|triggers)\/)[A-Za-z0-9_/-]{8,}/g,
   /\b(https?:\/\/(?:ptb\.|canary\.)?discord(?:app)?\.com\/api\/webhooks\/)\d+\/[A-Za-z0-9_-]{20,}/g,
@@ -145,8 +158,8 @@ const TOKEN_PATTERNS: RegExp[] = [
  * a <v> group (the value), and a check the value must pass; text the check refuses is left exactly as it was.
  */
 const CONTEXT_RULES: { re: RegExp; check: (v: string) => boolean }[] = [
-  { re: /(?<keep>\bdefine\(\s*["'][^"']*(?:PASSWORD|PASSWD|SECRET|TOKEN|API_KEY|(?:AUTH|SECURE_AUTH|LOGGED_IN|NONCE)_(?:KEY|SALT))["']\s*,\s*["'])(?<v>[^"'\r\n]+)(?=["']\s*\))/gi, check: value => assignedSecret(value) || (/^[A-Za-z]+[([]/.test(value) && /[A-Z0-9!@#$%^&*]/.test(value)) },
-  { re: /(?<keep>(?<![\w.])(?:Password|Pwd)[ \t]*=(?![=>])[ \t]*)(?<v>[^;\r\n]+)(?=;|$)/gi, check: value => !/\s/.test(value.trim()) && !/^["']/.test(value.trim()) && assignedSecret(value.trim()) },
+  { re: /(?<keep>\bdefine\(\s*["'][^"']*(?:PASSWORD|PASSWD|SECRET|TOKEN|API_KEY|(?:AUTH|SECURE_AUTH|LOGGED_IN|NONCE)_(?:KEY|SALT))["']\s*,\s*["'])(?<v>[^"'\r\n]+)(?=["']\s*\))/gi, check: value => assignedSecret(value) || (/^[~/]/.test(value) && value.length >= 16) || (/^[A-Za-z]+[([]/.test(value) && /[A-Z0-9!@#$%^&*]/.test(value)) },
+  { re: /(?<keep>(?<![\w.])(?:Password|Pwd)[ \t]*=(?![=>])[ \t]*)(?<v>[^;,)}"'\r\n]+)(?=\s*(?:[;,)}"']|$))/gi, check: value => { const v = value.trim(); return !!v && !/\s/.test(v) && !/^["'{]/.test(v) && !IDENT.test(v) && assignedSecret(v); } },
   { re: /(?<keep>\b(?:AUTH|SECURE_AUTH|LOGGED_IN|NONCE)_(?:KEY|SALT)(?:\s*=\s*["']?|\s*:\s*["']))(?<v>[^"'\r\n;]+)(?=["']|;|$)/gim, check: assignedSecret },
   // Env-style assignments whose name ends in a secret word: KEY=value, export KEY="value". A $VAR reference, a call
   // (os.environ.get(...)) or a value that is a URL or names a secret is not a secret.
@@ -191,14 +204,20 @@ export function encodedCredential(value: string): boolean {
 }
 
 function replaceTokens(text: string): string {
-  let out = text.replace(/\b(?:gsk_|pypi-|whsec_|lin_oauth_|GOCSPX-|xapp-)([A-Za-z0-9_-]{16,})/g, (all, value: string) => namedSecret(value) ? '[REDACTED]' : all);
+  // Whole key blocks must go first. Fragment redaction can otherwise split a body line and make an unterminated block
+  // impossible for the structural rule to recognize, leaking the remaining lines.
+  let out = BLOCK_PATTERNS.reduce((value, re) => value.replace(re, '[REDACTED]'), text);
+  out = out.replace(/\b(?:gsk_|pypi-|whsec_|lin_oauth_|GOCSPX-|xapp-)([A-Za-z0-9_-]{16,})/g, (all, value: string) => namedSecret(value) ? '[REDACTED]' : all);
   out = out.replace(/\b[A-Za-z0-9_-]{23,28}\.[A-Za-z0-9_-]{6}\.[A-Za-z0-9_-]{27,}\b/g, value => {
     const id = Buffer.from(value.split('.')[0], 'base64url').toString('utf8');
     return /^\d{17,22}$/.test(id) ? '[REDACTED]' : value;
   });
-  out = out.replace(/(?<![A-Za-z0-9])[A-Za-z0-9]{40}(?![A-Za-z0-9])/g, value => {
+  out = out.replace(/(?<![A-Za-z0-9+/_-])[A-Za-z0-9+]{40}(?![A-Za-z0-9+/_-])/g, (value, offset: number, source: string) => {
     const highEntropy = /[A-Z]/.test(value) && /[a-z]/.test(value) && /\d/.test(value) && new Set(value).size >= 16;
-    return highEntropy && !CAMEL.test(value) ? '[REDACTED]' : value;
+    const prefix = source.slice(Math.max(0, offset - 24), offset);
+    const integrity = /(?:sha(?:256|384|512)|integrity|code[_ -]?challenge)[=:\s-]*$/i.test(prefix);
+    const expression = /^[A-Za-z][A-Za-z]+\+\d+$/.test(value);
+    return highEntropy && !integrity && !expression ? '[REDACTED]' : value;
   });
   out = out.replace(/(?<![A-Za-z0-9/+])(?=[A-Za-z0-9+\/]{40}(?![A-Za-z0-9/+]))(?=[A-Za-z0-9+\/]*\/)[A-Za-z0-9+\/]{40}/g,
     value => slashedSecret(value) && new Set(value).size >= 16 ? '[REDACTED]' : value);
@@ -210,6 +229,8 @@ function replaceTokens(text: string): string {
   out = out.replace(/^((?:[^:\s\\]|\\.)+:(?:\d+|\*):(?:[^:\s\\]|\\.)+:(?:[^:\s\\]|\\.)+:)([^\r\n]+)$/gm,
     (all, keep: string, value: string) => value.trim() === '*' || /^<[^>]+>$/.test(value.trim()) || /:\d+:(?:error|warning|note|fatal(?: error)?|vet|Werror|AssertionError|[A-Z]\d+):$/i.test(keep)
       ? all : `${keep}[REDACTED]`);
+  out = out.replace(/(^\s*_auth\s*=\s*)(?![$<{])[A-Za-z0-9+/]{12,}={0,2}\s*$/gim, '$1[REDACTED]');
+  out = out.replace(/(^data:\s*$[\s\S]{0,2000}?^\s*(?:password|passwd|token|secret|api[_-]?key)\s*:\s*)(?![$<{])[A-Za-z0-9+/]{8,}={0,2}\s*$/gim, '$1[REDACTED]');
   return TOKEN_PATTERNS.reduce((value, re) => value.replace(re, (_m, keep?: string) =>
     typeof keep === 'string' ? `${keep}[REDACTED]` : '[REDACTED]'), out);
 }

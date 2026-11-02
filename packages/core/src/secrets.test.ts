@@ -29,3 +29,11 @@ test.each(['state/settings/integrations.json', '.run-key-salt', '.codex/auth.jso
 test.each(['worker.sqlite', 'project-roots.json', 'neo4j.dump', 'rclone.conf', '.config/hub', '.m2/settings.xml', 'gradle.properties', 'codex-auth.json'])(
   '0.7.1 install/credential path excluded from scans: %s', path => expect(isSecretPath(path)).toBe(true),
 );
+
+test.each([
+  'worker.sqlite-wal', 'worker.sqlite-shm', 'worker.sqlite-journal', 'backups/snapshot.dump',
+  'backups/2026/11/state.tgz', '.dockercfg', '.yarnrc', 'sops/age/keys.txt', '.sentryclirc', '.databrickscfg',
+])('0.7.2 adjacent state/credential path excluded from scans: %s', path => {
+  expect(isSecretPath(path)).toBe(true);
+  expect(isSecretPath(`nested/${path}`)).toBe(true);
+});
