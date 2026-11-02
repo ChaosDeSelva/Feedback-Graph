@@ -3,7 +3,7 @@ import { z } from 'zod';
 import {
   DEFAULT_LINK, ENV_VAR, FEEDBACK_SKIP_RULES, githubRepoOfRemote, githubViewer, integrationErrorKind, linearViewer, listLinearTeams, redactSecrets, tokenFingerprint,
   type ActivityStore, type CloudConfig, type Connection, type ConnectionName, type IntegrationCheck, type IntegrationKind, type Integrations,
-  type IntegrationSyncState, type LinearTeam, type ManualSync, type OllamaHealth, type PrBacklog, type WorkerStatus,
+  type IntegrationSyncState, type LinearTeam, type ManualSync, type ModelHealth, type ModelJob, type OllamaHealth, type PrBacklog, type WorkerStatus,
 } from '@fb/core';
 
 /**
@@ -320,7 +320,7 @@ export function integrationRoutes(app: Hono, d: IntegrationsDeps) {
 }
 
 /** Model connections from the worker's heartbeat: which jobs use Claude or Codex, and whether they answered. */
-function agentConnection(name: 'claude' | 'codex', w: WorkerStatus | null): Connection {
+function agentConnection(name: 'claude' | 'codex', w: WorkerStatus | null, models?: Partial<Record<ModelJob, ModelHealth>> | null): Connection {
   const href = '#settings/connections';
   const label = name === 'claude' ? 'Claude' : 'Codex';
   if (!w) return { state: 'not_connected', source: null, detail: 'The worker has not reported yet.', href };
@@ -330,7 +330,9 @@ function agentConnection(name: 'claude' | 'codex', w: WorkerStatus | null): Conn
     const how = name === 'claude' ? 'set CLAUDE_CODE_OAUTH_TOKEN (./scripts/setup.sh) or ANTHROPIC_API_KEY, or POSTMORTEM_LLM=claude-cli' : 'set POSTMORTEM_LLM or SCAN_LLM to codex-cli';
     return { state: 'not_connected', source: null, detail: `No job uses ${label}: ${how}.`, href };
   }
-  const down = jobs.map((j) => w.health?.[j as keyof NonNullable<WorkerStatus['health']>]).find((h) => h && !h.ok);
+  // /api/status applies live Ollama and codex-runner readiness on top of the worker's last report. Use that effective
+  // state here too: a configured provider is not "connected" while its runner/sandbox is unavailable.
+  const down = jobs.map((j) => models?.[j as ModelJob] ?? w.health?.[j as keyof NonNullable<WorkerStatus['health']>]).find((h) => h && !h.ok);
   if (down) return { state: 'error', source: 'env', detail: `${label} did not answer: ${down.reason}`, href };
   return { state: 'connected', source: 'env', detail: `${label} runs: ${jobs.join(', ')}.`, href };
 }
@@ -370,6 +372,8 @@ export async function connectionsStatus(o: {
   cloud: CloudConfig | null;
   /** The api's last Sync now, when it ran one. */
   manualSync?: ManualSync | null;
+  /** Effective per-job health after live runner/Ollama probes. */
+  models?: Partial<Record<ModelJob, ModelHealth>> | null;
 }): Promise<Record<ConnectionName, Connection>> {
   const one = async (kind: IntegrationKind): Promise<Connection> => {
     if (!o.integrations) return { state: 'not_connected', source: null, detail: 'Not available in this setup.', href: integrationHref(kind) };
@@ -384,8 +388,8 @@ export async function connectionsStatus(o: {
   return {
     github,
     linear,
-    claude: agentConnection('claude', o.worker),
-    codex: agentConnection('codex', o.worker),
+    claude: agentConnection('claude', o.worker, o.models),
+    codex: agentConnection('codex', o.worker, o.models),
     ollama: ollamaConnection(o.ollama),
     cloud: cloudConnection(o.cloud, o.worker, o.manualSync ?? null),
   };

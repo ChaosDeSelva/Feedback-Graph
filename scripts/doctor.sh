@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Is everything Feedback Graph needs in place? One PASS / WARN / FAIL / SKIP line per check, and exit 1 when any check
-# failed. Changes nothing, and never prints a secret (tokens are only ever sent to the service they belong to).
+# failed. It never prints a secret. The sole fail-safe mutation is stopping codex-runner when its live sandbox/network
+# isolation check fails, so a warning cannot leave unsafe Codex jobs running.
 #   ./scripts/doctor.sh
 # Checks: Docker, that no other folder's install runs under this one's FG_INSTANCE, the ports the stack publishes, Ollama
 # (answers, structured output with a real schema call, models pulled), from inside the containers (host.docker.internal,
@@ -97,6 +98,7 @@ fi
 
 # A listening runner is not enough: /health executes its real nested sandbox, without a model.
 if [ -n "$(envval CODEX_RUNNER_URL)" ]; then
+  runner_unsafe=0
   if [ "$docker_ok" = 1 ] && is_running worker; then
     if runner_detail="$("${compose[@]}" exec -T worker node -e 'fetch(process.env.CODEX_RUNNER_URL.replace(/\/+$/, "") + "/health", {signal:AbortSignal.timeout(10000)}).then(async r=>{ const h=await r.json(); if(!r.ok||!h.ok||!h.sandbox) throw Error(h.error||"sandbox probe failed"); }).catch(e=>{console.error(e.message);process.exit(1)})' 2>&1)"; then
       pass "Codex runner: its nested sandbox starts successfully"
@@ -104,6 +106,7 @@ if [ -n "$(envval CODEX_RUNNER_URL)" ]; then
       fail "Codex runner: sandbox cannot start or runner is unavailable"
       more "$runner_detail"
       more "For procfs mount errors on Docker Desktop/OrbStack or Linux, review setup.sh --runner-procfs-compat (explicit opt-in removes Docker system-path protection); Claude/API avoids that exception. Rebuild codex-runner with scripts/seccomp/codex-runner.json. Check AppArmor and docs/operations.md."
+      runner_unsafe=1
     fi
     # Docker Desktop implementations do not all enforce bridge-network isolation alike. Probe the actual runner,
     # including an explicit Host header (fetch() silently discards it), rather than trusting the Compose topology.
@@ -112,8 +115,10 @@ if [ -n "$(envval CODEX_RUNNER_URL)" ]; then
       api_ip="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}' "$api_id" 2>/dev/null | awk '{print $1}')"
       targets="host.docker.internal:$api_port"
       [ -n "$api_ip" ] && targets="$targets,$api_ip:8787"
-      pg_probe="$(envval POSTGRES_PORT)"; [ "$store" = postgres ] && targets="$targets,host.docker.internal:${pg_probe:-5434}"
-      [ "$store" != postgres ] && targets="$targets,host.docker.internal:${neo_http:-7476}"
+      # Probe both this stack and common local service ports. The runner must not be able to reach another project's
+      # database/cache or Feedback Graph Cloud merely because those are outside this Compose project.
+      pg_probe="$(envval POSTGRES_PORT)"; targets="$targets,host.docker.internal:${pg_probe:-5434},host.docker.internal:5432,host.docker.internal:5442,host.docker.internal:6379"
+      targets="$targets,host.docker.internal:${neo_http:-7476},host.docker.internal:${neo_bolt:-7689},host.docker.internal:8788"
       ollama_port="$(envval OLLAMA_PORT)"; targets="$targets,host.docker.internal:${ollama_port:-11435}"
       if isolation_detail="$("${compose[@]}" exec -T -e FG_ISOLATION_TARGETS="$targets" codex-runner node -e '
         const http=require("node:http"), net=require("node:net");
@@ -128,10 +133,15 @@ if [ -n "$(envval CODEX_RUNNER_URL)" ]; then
       else
         fail "Codex runner: container/network isolation does not hold on this Docker implementation"
         more "$isolation_detail"
-        more "Do not use codex-cli scans on this host. Disable the codex profile and choose claude-cli or an API scan provider; the runner can reach protected local services."
+        more "Codex runner is being stopped now. Choose claude-cli or an API scan provider; only restart it after the isolation probe passes."
+        runner_unsafe=1
       fi
-    else fail "Codex runner: configured, but its container is not running for the live isolation probe"; fi
-  else fail "Codex runner: configured but cannot be checked from a running worker"; fi
+    else fail "Codex runner: configured, but its container is not running for the live isolation probe"; runner_unsafe=1; fi
+  else fail "Codex runner: configured but cannot be checked from a running worker"; runner_unsafe=1; fi
+  if [ "$runner_unsafe" = 1 ]; then
+    if "${compose[@]}" stop codex-runner >/dev/null 2>&1; then more "Stopped codex-runner: queued codex-cli jobs will remain parked."
+    else more "Could not stop codex-runner automatically; stop it before allowing more jobs."; fi
+  fi
 fi
 
 if [ "$docker_ok" = 1 ] && is_running neo4j; then
@@ -258,6 +268,20 @@ else
   pass "api: answers at http://localhost:$api_port"
   connection github GitHub
   connection linear Linear
+fi
+
+# Exercise the same authenticated MCP initialization agents use. This catches a newly-added or rotated API_TOKEN that
+# was not propagated: status may answer while every installed agent gets 401. No response body or credential is shown.
+if [ -z "$status" ]; then
+  skip "MCP credential: the api is unavailable"
+elif [ -z "$api_token" ]; then
+  skip "MCP credential: API_TOKEN is not set (tokenless local install)"
+elif curl -fsS --max-time 10 -o /dev/null -H "Authorization: Bearer $api_token" -H 'Content-Type: application/json' \
+  --data '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"doctor","version":"1"}}}' \
+  "http://localhost:$api_port/mcp" >/dev/null 2>&1; then
+  pass "MCP credential: this install's API_TOKEN initializes the agent endpoint"
+else
+  fail "MCP credential: this install's API_TOKEN is refused by /mcp; rerun ./scripts/install-agent.sh after fixing it"
 fi
 
 echo

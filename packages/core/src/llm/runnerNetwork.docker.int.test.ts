@@ -29,7 +29,9 @@ describe.skipIf(!available)('runner network boundary', () => {
     for (const name of networks) { try { docker(['network', 'rm', name]); } catch {} }
     if (pulled) { try { docker(['image', 'rm', image]); } catch {} }
   });
-  const get = (container: string, target: string) => JSON.parse(docker(['exec', container, 'node', '-e', `fetch(${JSON.stringify(target)},{headers:{host:"localhost"},signal:AbortSignal.timeout(1500)}).then(async r=>console.log(JSON.stringify(await r.text()))).catch(()=>console.log("null"))`]));
+  // fetch is allowed to discard/replace Host. Use the raw client so this covers the forged-Host path that bypassed
+  // virtual-host checks on Docker Desktop in the field.
+  const get = (container: string, target: string) => JSON.parse(docker(['exec', container, 'node', '-e', `const u=new URL(${JSON.stringify(target)}),http=require("node:http");const r=http.request({hostname:u.hostname,port:u.port,path:u.pathname,headers:{Host:"localhost"},timeout:1500},x=>{let b="";x.on("data",c=>b+=c);x.on("end",()=>console.log(JSON.stringify(b)))});r.on("timeout",()=>r.destroy());r.on("error",()=>console.log("null"));r.end()`]));
   test('Compose separates runner/API while preserving the worker control channel and provider egress', () => {
     const config = JSON.parse(execFileSync('docker', ['compose', '--env-file', '/dev/null', '-f', resolve(root, 'docker-compose.yml'), '--profile', 'codex', 'config', '--format', 'json'], { encoding: 'utf8', env: { ...process.env, NEO4J_PASSWORD: 'test-only' } }));
     const attached = (name: string) => Object.keys(config.services[name].networks);

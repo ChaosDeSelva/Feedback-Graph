@@ -9,6 +9,7 @@ import { connectionsStatus, serviceConnection, type IntegrationsDeps } from './i
 const repo = { listCandidates: async () => [], candidateDetail: async () => null, decide: async () => {}, stats: async () => [] } as ApiRepo;
 // Built at runtime: push protection rejects token-shaped literals.
 const TOKEN = ['github', 'pat', '11AAAA', 'x'.repeat(40)].join('_');
+const OWNER = 'owner-test-token-01234567890123456789';
 const ORIGIN = 'http://localhost';
 
 function kv() {
@@ -30,14 +31,14 @@ function setup(o: { env?: Record<string, string>; file?: boolean; viewer?: Integ
     viewer: o.viewer ?? { github: async () => 'octo', linear: async () => 'Pat (Acme)' },
     teams: async () => [{ id: 't1', key: 'WEB', name: 'Web' }],
   };
-  const app = createApp(repo, { integrations: d });
+  const app = createApp(repo, { auth: { ownerToken: OWNER }, integrations: d });
   return { app, d, store, path, integrations, activity };
 }
 
 const json = (method: string, body?: unknown, origin: string | null = ORIGIN) => ({
   method,
   body: body === undefined ? undefined : JSON.stringify(body),
-  headers: { 'content-type': 'application/json', ...(origin ? { origin, 'sec-fetch-site': 'same-origin' } : {}) },
+  headers: { 'content-type': 'application/json', ...(origin ? { authorization: `Bearer ${OWNER}`, 'x-fg-owner': 'true' } : {}) },
 });
 
 describe('the skip rules in Settings > Integrations', () => {
@@ -232,6 +233,13 @@ describe('connection states', () => {
     expect(c.ollama.state).toBe('connected');
     expect(c.cloud).toMatchObject({ state: 'not_connected', detail: expect.stringMatching(/nothing is sent/) });
     expect(JSON.stringify(c)).not.toContain('x'.repeat(20));
+  });
+
+  test('effective runner readiness makes a configured Codex connection unavailable', async () => {
+    const worker = { providers: { scan: 'codex-cli' }, health: {} } as unknown as WorkerStatus;
+    const models = { scan: { provider: 'codex-cli', ok: false, reason: 'runner isolation check failed' } };
+    const c = await connectionsStatus({ integrations: null, worker, models, ollama: null, cloud: null });
+    expect(c.codex).toMatchObject({ state: 'error', detail: expect.stringContaining('runner isolation check failed') });
   });
 
   test('a project the sync schedule is backing off from is named, though the last run was fine for the rest', async () => {
