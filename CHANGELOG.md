@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.7.2 (2026-11-02)
+
+- Separate random owner sessions from agent credentials, bind sandbox runs to private capabilities, refresh installed Claude/Codex credentials on rotation, and keep the bundled demo probe local without granting owner or operator authority.
+- Close live redaction gaps and secret-path coverage, verify every globally installed npm tarball, fail closed on runner isolation, and return retryable Neo4j capacity errors while batching code-map maintenance.
+- Improve judge miss selection, queue estimates, cleanup completeness, Ask redaction, project-specific code-map retention and scoped map removal.
+- Complete the core and cloud accessibility/mobile walkthrough, clarify scan switching and runner errors, harden cloud database defaults and add bulk project reconciliation.
+
 ## 0.7.1 (2026-10-31)
 
 - Separate API, operator and headless-owner credentials; make authenticated setup the default, keep context reads side-effect free, constrain scan provider overrides, and add live runner isolation diagnostics.
