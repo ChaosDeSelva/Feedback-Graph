@@ -134,7 +134,7 @@ export type AppOpts = {
   /** The Settings page: which project folders are read. */
   settings?: SettingsDeps;
   /** The code map, for the Projects page (stats, hotspots, a file's module panel) and the Patterns page. */
-  codegraph?: Pick<CodeGraphStore, 'hotspots' | 'moduleContext' | 'impact' | 'codeMapMeta'> & Partial<Pick<CodeGraphStore, 'mapGraph' | 'requestCodeMapRebuild'>>;
+  codegraph?: Pick<CodeGraphStore, 'hotspots' | 'moduleContext' | 'impact' | 'codeMapMeta'> & Partial<Pick<CodeGraphStore, 'mapGraph' | 'requestCodeMapRebuild' | 'dropCodeMap'>>;
   /** SCAN_MAX_FILES (null: the cap scales with the repo): how many hotspots one page may list, and whether a map is capped. */
   mapMaxFiles?: number | null;
   /** Feedback Graph Cloud sync: the Settings card and Sync now. */
@@ -1364,6 +1364,17 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
       const [meta, hotspots] = await Promise.all([codegraph.codeMapMeta(key), codegraph.hotspots(key, q.data.limit, { includeTests: q.data.tests, ...runAsked() })]);
       return c.json({ meta, capped: mapCapped(meta, mapMaxFiles), hotspots });
     });
+    if (codegraph.dropCodeMap) {
+      const drop = codegraph.dropCodeMap.bind(codegraph);
+      app.delete('/api/projects/:key/codemap', async c => {
+        const key = c.req.param('key');
+        const removed = await drop(key);
+        await activity?.record({ kind: 'code_mapped', actor: 'you', projectKey: key,
+          subject: `dropped the code map of ${key}`, why: 'you requested scoped removal of derived map data; facts and immutable session evidence remain',
+          details: { dropped: true, removed }, targets: [] });
+        return c.json({ key, removed });
+      });
+    }
     if (codegraph.requestCodeMapRebuild) {
       const request = codegraph.requestCodeMapRebuild.bind(codegraph);
       // Owner-only (OWNER_ROUTES, the operator's `scan` verb): the worker remaps the project from scratch at its next pass.

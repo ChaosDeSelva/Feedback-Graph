@@ -41,7 +41,7 @@ export class Admission {
     const samples = [...this.#durations].sort((a, b) => a - b);
     const observed = samples.length > 0;
     const low = observed ? samples[Math.floor((samples.length - 1) * .25)] : 0;
-    const high = observed ? samples[Math.ceil((samples.length - 1) * .9)] : this.timeoutMs;
+    const high = observed ? Math.max(samples.at(-1)!, Math.ceil(samples[Math.ceil((samples.length - 1) * .9)] * 2.5)) : this.timeoutMs;
     const median = observed ? samples[Math.floor((samples.length - 1) / 2)] : 0;
     const now = Date.now();
     let overdue = false;

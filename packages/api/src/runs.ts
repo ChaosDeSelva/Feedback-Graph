@@ -139,7 +139,7 @@ export type CleanupPlan = {
 export type RunsDeps = { store: Pick<RunsStore, 'items' | 'remove' | 'owner' | 'sandbox'>; activity: Pick<ActivityStore, 'record' | 'list'> & Partial<Pick<ActivityStore, 'removeRun'>> };
 
 /** What cleaning up `run` would do (see CleanupPlan), and the ids it keeps. */
-export async function planCleanup(run: string, d: RunsDeps): Promise<{ plan: Omit<CleanupPlan, 'dryRun'>; keep: string[]; keptIds: string[]; entries: Activity[] }> {
+export async function planCleanup(run: string, d: RunsDeps): Promise<{ plan: Omit<CleanupPlan, 'dryRun'>; keep: string[]; keptIds: string[]; entries: Activity[]; items: RunItem[] }> {
   const items = await d.store.items(run);
   const entries: Activity[] = [];
   let before: string | undefined;
@@ -180,7 +180,8 @@ export async function planCleanup(run: string, d: RunsDeps): Promise<{ plan: Omi
     .map((a) => ({ kind: a.kind, subject: a.subject, targets: a.targets.filter((t) => !ids.has(t)), ts: a.ts }));
   // Preview the same permissions and keep rules already enforced by removeRun; leave the deletion path unchanged.
   const owner = await d.store.owner(run);
-  const previewEntries = entries.filter(a => !TOUCHES.has(a.kind)
+  const removableIds = new Set(items.filter(i => !keep.includes(i.id) && !keptIds.includes(i.id) && !i.merged).map(i => i.id));
+  const previewEntries = entries.filter(a => (!TOUCHES.has(a.kind) || (a.targets.length > 0 && a.targets.every(id => removableIds.has(id))))
     && !a.targets.some(t => keptIds.includes(t))
     && ownRequestEntry(a, owner));
   const order = (k: RunItemKind) => RUN_ITEM_KINDS.indexOf(k);
@@ -193,6 +194,7 @@ export async function planCleanup(run: string, d: RunsDeps): Promise<{ plan: Omi
     keep,
     keptIds,
     entries,
+    items,
   };
 }
 
@@ -234,7 +236,7 @@ export function runRoutes(app: Hono, d: RunsDeps) {
     if (!run.success) return c.json({ error: run.error.issues[0].message }, 400);
     const body = CleanupBody.safeParse((await c.req.json().catch(() => null)) ?? {});
     if (!body.success) return c.json({ error: body.error.flatten() }, 400);
-    const { plan, keep, keptIds, entries } = await planCleanup(run.data, d);
+    const { plan, keep, keptIds, entries, items } = await planCleanup(run.data, d);
     // Who opened the run (RunsStore.claim), not what its Activity says: a run opened with the API token, by an agent or
     // in the browser is the owner's to clean up, and so is one opened before owners were recorded (none stored).
     const owner = await d.store.owner(run.data);
@@ -256,7 +258,9 @@ export function runRoutes(app: Hono, d: RunsDeps) {
     // erases the trace of a change it cannot undo.
     // Only the entries the plan read, so every change removed is one listed below (a run with more than RUN_ENTRIES keeps
     // the rest for the next cleanup); and never an entry about a record that stays (the one that created it included).
-    const entriesRemoved = activity.removeRun ? await activity.removeRun(run.data, [...TOUCHES], { ids: entries.filter(a => ownRequestEntry(a, owner)).map((a) => a.id), targets: keptIds }) : 0;
+    const removedIds = new Set(items.filter(item => !keep.includes(item.id) && !keptIds.includes(item.id) && !item.merged).map(item => item.id));
+    const removableEntries = entries.filter(a => ownRequestEntry(a, owner) && (!TOUCHES.has(a.kind) || (a.targets.length > 0 && a.targets.every(id => removedIds.has(id)))));
+    const entriesRemoved = activity.removeRun ? await activity.removeRun(run.data, [], { ids: removableEntries.map(a => a.id), targets: keptIds }) : 0;
     await activity.record({
       // Not tagged with a run (null, not the asking request's): the entry is about the run, not made in it.
       kind: 'run_cleaned', actor: 'you', projectKey: null, run: null,

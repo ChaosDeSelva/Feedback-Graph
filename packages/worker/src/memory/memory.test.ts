@@ -177,12 +177,15 @@ test('a memory written after an existing feedback event is not imported as a dup
   mkdirSync(dir, { recursive: true });
   writeFileSync(join(dir, 'fix.md'), feedbackMd);
   let embedded = false;
+  const notices: ActivityInput[] = [];
   expect(await importMemories({
     transcriptsDir: transcripts, roots: async () => [{ host: '/Users/j/Vibe', keys: ['AcmeShop'] }], state: new FileState(':memory:'),
     embed: async () => { embedded = true; return [[1]]; }, upsertLesson: async () => { throw new Error('duplicate'); },
+    activity: { record: async entry => { notices.push(entry); } },
     writtenAfterFeedback: async (key, path) => key === 'AcmeShop' && path.endsWith('/memory/fix.md'),
   })).toBe(0);
   expect(embedded).toBe(false);
+  expect(notices).toContainEqual(expect.objectContaining({ kind: 'memory_imported', details: { duplicate: true } }));
 });
 
 

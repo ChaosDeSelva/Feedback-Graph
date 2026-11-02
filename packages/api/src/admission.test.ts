@@ -87,8 +87,8 @@ test('warm ETA simulates FIFO across actual capacity and removes cancelled waite
     await vi.advanceTimersByTimeAsync(100);
     const abort = new AbortController();
     const waiting = a.run(async () => 'never', { signal: abort.signal });
-    expect(a.snapshot('waiting', 1).estimate).toMatchObject({ source: 'observed', samples: 1, startMs: [900, 900], completionMs: [1900, 1900] });
-    expect(a.snapshot('waiting', 3).estimate.startMs).toEqual([1900, 1900]);
+    expect(a.snapshot('waiting', 1).estimate).toMatchObject({ source: 'observed', samples: 1, startMs: [900, 2400], completionMs: [1900, 4900] });
+    expect(a.snapshot('waiting', 3).estimate.startMs).toEqual([1900, 4900]);
     abort.abort();
     expect(a.waiting).toBe(0); // cancellation removes the entry synchronously, before a response snapshot
     expect((await waiting).ok).toBe(false);
@@ -109,7 +109,7 @@ test('a hung call keeps capacity and makes an overdue upper ETA unknown until th
     await vi.advanceTimersByTimeAsync(500);
     expect(a.snapshot()).toMatchObject({ running: 1, estimate: { source: 'response_budget', samples: 0, overdue: true, startMs: [0, null] } });
     hung.release(); await vi.advanceTimersByTimeAsync(0);
-    expect(a.snapshot()).toMatchObject({ running: 0, estimate: { source: 'observed', samples: 1, completionMs: [600, 600] } });
+    expect(a.snapshot()).toMatchObject({ running: 0, estimate: { source: 'observed', samples: 1, completionMs: [600, 1500] } });
     expect(await a.run(async () => 'recovered')).toMatchObject({ ok: true });
   } finally { vi.useRealTimers(); }
 });
@@ -135,7 +135,7 @@ test('observed ETA widens for variable service times instead of substituting the
     }
     const held = gate('done'); const active = a.run(held.fn);
     await vi.advanceTimersByTimeAsync(50);
-    expect(a.snapshot().estimate).toMatchObject({ source: 'observed', samples: 4, startMs: [50, 750], completionMs: [150, 1550], overdue: false });
+    expect(a.snapshot().estimate).toMatchObject({ source: 'observed', samples: 4, startMs: [50, 1950], completionMs: [150, 3950], overdue: false });
     held.release(); await active;
   } finally { vi.useRealTimers(); }
 });
@@ -150,8 +150,8 @@ test('a hung lane does not erase usable capacity or finite FIFO estimates from a
     const hung = gate('hung'); const first = a.run(hung.fn);
     await vi.advanceTimersByTimeAsync(1000); await first;
     expect(a.snapshot().estimate).toMatchObject({ overdue: true, startMs: [0, 0] });
-    expect(a.snapshot('waiting', 2).estimate.startMs).toEqual([0, 100]);
-    expect(a.snapshot('waiting', 4).estimate.startMs).toEqual([100, 300]);
+    expect(a.snapshot('waiting', 2).estimate.startMs).toEqual([0, 250]);
+    expect(a.snapshot('waiting', 4).estimate.startMs).toEqual([100, 750]);
     const other = gate('other'); const second = a.run(other.fn);
     await vi.advanceTimersByTimeAsync(1000); await second;
     expect(a.snapshot().estimate.startMs).toEqual([0, null]);

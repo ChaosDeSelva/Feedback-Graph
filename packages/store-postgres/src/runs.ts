@@ -70,7 +70,9 @@ export class PgRunsStore implements RunsStore {
         : [];
       actual.push(...reports.map(id => ({ kind: 'feedback', id })));
       if (reports.length) {
+        const taskIds = (await c.query('SELECT DISTINCT task_id FROM feedback WHERE id = ANY($1::text[]) AND task_id IS NOT NULL', [reports])).rows.map(row => row.task_id);
         await c.query('DELETE FROM feedback WHERE id = ANY($1::text[])', [reports]);
+        await c.query('DELETE FROM tasks WHERE id = ANY($1::text[]) AND NOT EXISTS (SELECT 1 FROM feedback WHERE feedback.task_id = tasks.id)', [taskIds]);
         await c.query('DELETE FROM sessions WHERE id = ANY($1::text[]) AND manual', [reports]);
       }
       const predone = await del('DELETE FROM predone_checks WHERE run = $1 AND id = ANY($2::text[])', ids.predone_check);

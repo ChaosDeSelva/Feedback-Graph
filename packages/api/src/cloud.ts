@@ -2,7 +2,7 @@ import { authorizeStoreWrite } from '@fb/core';
 import type { Hono } from 'hono';
 import { z } from 'zod';
 import {
-  previewCloudSync, redactSecrets, runCloudSync, cloudLocalOnlyProjects, CLOUD_LOCAL_ONLY_CURSOR, cloudSharedDemoProjects, CLOUD_SHARED_DEMOS_CURSOR,
+  previewCloudSync, redactSecrets, cloudUrlProblem, runCloudSync, cloudLocalOnlyProjects, CLOUD_LOCAL_ONLY_CURSOR, cloudSharedDemoProjects, CLOUD_SHARED_DEMOS_CURSOR,
   type ActivityStore, type DocsStore, type CloudConfig, type CloudSyncResult, type ManualSync, type PortabilityStore, type SyncCounts, type SyncMemory,
   type SyncProgress, type SyncTrigger, type SyncResponse, type WorkerStatus,
 } from '@fb/core';
@@ -42,6 +42,8 @@ export type CloudInfo = {
   last: { at: string; ok: boolean; trigger: SyncTrigger; error: string | null; sent: SyncCounts | null; projects: string[]; failed: string[]; teamLessons?: NonNullable<SyncResponse['teamLessons']>[] } | null;
   nextAt: string | null;
   neverSent: string;
+  teamLessons?: SyncResponse['teamLessons'];
+  policyError?: string;
 };
 
 /** A Sync now in progress (GET /api/cloud/progress, /api/status). */
@@ -61,7 +63,7 @@ const manualOf = (r: CloudSyncResult): ManualSync => ({
   at: r.at, ok: r.ok, error: r.error, sent: r.sent,
   unchanged: r.projects.filter((p) => p.status === 'unchanged').length,
   failed: r.projects.filter((p) => p.status === 'failed').length,
-  ...(r.projects.some(p => p.teamLessons) ? { teamLessons: r.projects.flatMap(p => p.teamLessons ? [p.teamLessons] : []) } : {}),
+  ...(r.projects.some(p => p.teamLessons) ? { teamLessons: [...new Map(r.projects.flatMap(p => p.teamLessons ? [[p.teamLessons.message, p.teamLessons] as const] : [])).values()] } : {}),
 });
 
 const SyncRequest = z.object({ force: z.boolean().optional() }).strict();
@@ -78,6 +80,15 @@ export function cloudRoutes(app: Hono, d: CloudDeps): CloudState {
   let running: Promise<unknown> | null = null;
   let progress: RunningSync | null = null;
   let lastManual: ManualSync | null = null;
+  let policyCache: { until: number; value: Promise<SyncResponse['teamLessons']> } | null = null;
+  const teamPolicy = () => {
+    if (!d.cloud || cloudUrlProblem(d.cloud.url)) return Promise.resolve(undefined);
+    if (policyCache && policyCache.until > Date.now()) return policyCache.value;
+    const cloud = d.cloud;
+    const value = (d.fetch ?? fetch)(`${cloud.url.replace(/\/+$/, '')}/api/v1/sync-policy`, { headers: { authorization: `Bearer ${cloud.token}` }, redirect: 'error', signal: AbortSignal.timeout(3000) })
+      .then(async response => { if (!response.ok) return undefined; const body = await response.json() as { teamLessons?: SyncResponse['teamLessons'] }; const team = body.teamLessons; return team && typeof team.message === 'string' && typeof team.adminApprovalRequired === 'boolean' ? { ...team, message: redactSecrets(team.message).slice(0, 1000) } : undefined; }).catch(() => undefined);
+    policyCache = { until: Date.now() + 60_000, value }; return value;
+  };
   // What the cloud last accepted per project, for `withdrawn` on the next Sync now; shared with the worker's schedule.
   const memory: SyncMemory = d.memory ?? new Map();
   const restore = async () => {
@@ -112,15 +123,16 @@ export function cloudRoutes(app: Hono, d: CloudDeps): CloudState {
     } catch (err) {
       info.previewError = redactSecrets(String(err)).slice(0, 300);
     }
+    if (requestedProject) { info.teamLessons = await teamPolicy(); if (!info.teamLessons) info.policyError = 'Team approval policy is unavailable; verify it in cloud Settings before selecting this project for sync.'; }
     if (requestedProject && !info.projects.includes(requestedProject)) {
       info.preview ??= { total: { projects: 0, lessons: 0, misses: 0, facts: 0, docs: 0, codeFiles: 0 }, projects: [] };
-      info.preview.projects.push({ key: requestedProject, counts: null, reason: info.localOnlyProjects?.includes(requestedProject) ? 'Project is local-only; it will not be sent.' : 'Project is not selected for cloud sync; it will not be sent.' });
+      info.preview.projects.push({ key: requestedProject, counts: null, reason: info.localOnlyProjects?.includes(requestedProject) ? 'Project is local-only; it will not be sent.' : 'Project is not selected for cloud sync; inspect local-only settings and the team approval policy before selecting it.' });
     }
     await restore();
     const saved = await memory.last?.();
     if (saved) info.last = { at: saved.at, ok: saved.ok, trigger: saved.trigger, error: saved.error, sent: saved.sent,
       projects: saved.projects.filter(p => p.status === 'sent').map(p => p.key), failed: saved.projects.filter(p => p.status === 'failed').map(p => p.key),
-      ...(saved.projects.some(p => p.teamLessons) ? { teamLessons: saved.projects.flatMap(p => p.teamLessons ? [p.teamLessons] : []) } : {}) };
+      ...(saved.projects.some(p => p.teamLessons) ? { teamLessons: [...new Map(saved.projects.flatMap(p => p.teamLessons ? [[p.teamLessons.message, p.teamLessons] as const] : [])).values()] } : {}) };
     const [a] = saved ? [] : await d.activity.list({ kind: 'cloud_synced', limit: 1 }).catch(() => []);
     if (a) {
       const x = a.details as { ok?: boolean; trigger?: SyncTrigger; error?: string | null; sent?: SyncCounts; projects?: string[]; failed?: string[] };

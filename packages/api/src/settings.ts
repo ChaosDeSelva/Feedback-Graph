@@ -185,7 +185,7 @@ export function settingsRoutes(
     const added = next.filter((k) => !before.includes(k));
     const removed = before.filter((k) => !next.includes(k));
     await o.activity?.record({
-      kind: 'projects_selected',
+      kind: 'projects_selected', run: null,
       actor: 'you',
       projectKey: null,
       subject: next.length

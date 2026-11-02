@@ -660,12 +660,13 @@ export interface CodeGraphStore {
   replaceCodeMap(projectKey: string, map: CodeMapWrite): Promise<CodeMapStats>;
   /** Ask the worker to remap the project from scratch; false when it has no map yet (the first one is on its way). */
   requestCodeMapRebuild(projectKey: string): Promise<boolean>;
+  /** Drop one derived map without deleting project facts, feedback or transcripts. */
+  dropCodeMap(projectKey: string): Promise<boolean>;
   /**
    * Delete up to `limit` CodeFile records that no map holds and nothing needs: gone from the repo (removed by a scan)
    * or of no project or never scanned (a file a session touched once), with no fact (current or closed) and no
    * session touch. A scanned file still in the repo stays:
-   * its hash is what lets the next scan skip it. Deselected projects lose derived maps after 24 hours without a
-   * selection change, and their unreferenced scanned files may then go too. Returns how many files went.
+   * its hash is what lets the next scan skip it. Deselected projects lose derived maps 24 hours after that project was deselected, and their unreferenced scanned files may then go too. Returns how many files went.
    * `now` supplies a deterministic clock for scheduled cleanup and contract tests.
    */
   purgeOrphanCodeFiles(limit: number, now?: Date): Promise<number>;

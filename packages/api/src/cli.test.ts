@@ -825,7 +825,7 @@ test('fg cleanup --run: a dry run by default (counts per kind, what stays and wh
   expect(await run(['cleanup', '--run', 'run-1', '--apply', '--dry-run'], fake({}).io)).toBe(2);
 });
 
-test('fg cleanup, activity and evidence never label their requests with a run: --run names what to clean or list, and FG_RUN is not sent', async () => {
+test('fg cleanup and activity stay unlabelled; evidence carries the run capability for sandbox reads', async () => {
   const env = { FG_OPERATOR_TOKEN: OP, FG_RUN: 'run-2', FG_SANDBOX: '1' };
   const f = fake({ 'DELETE /api/runs/run-1': () => ({ json: plan() }) }, env);
   expect(await run(['cleanup', '--run', 'run-1', '--sandbox'], f.io)).toBe(0);
@@ -833,10 +833,12 @@ test('fg cleanup, activity and evidence never label their requests with a run: -
   expect(await run(['activity', '--run', 'run-1'], g.io)).toBe(0);
   const h = fake({ 'GET /api/sessions/s1/evidence': () => ({ json: { session: { id: 's1', projectKey: 'demo', source: 'claude', state: 'idle' }, turns: { count: 0, classified: 0, waiting: 0, givenUp: 0 }, flags: [], inbox: [], served: [] } }) }, env);
   expect(await run(['evidence', 's1'], h.io)).toBe(0);
-  for (const c of [...f.calls, ...g.calls, ...h.calls]) {
+  for (const c of [...f.calls, ...g.calls]) {
     expect(c.headers['x-fg-run']).toBeUndefined();
     expect(c.headers['x-fg-sandbox']).toBeUndefined();
   }
+  expect(h.calls[0].headers['x-fg-run']).toBe('run-2');
+  expect(h.calls[0].headers['x-fg-sandbox']).toBe('1');
 });
 
 test('fg activity --run lists one run; fg evidence <session> shows what the tool saw and decided', async () => {

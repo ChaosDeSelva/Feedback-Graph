@@ -176,6 +176,7 @@ export const STORE_WRITE_POLICY = {
   codegraph: {
     replaceCodeMap: 'write',
     requestCodeMapRebuild: 'internal',
+    dropCodeMap: 'write',
     purgeOrphanCodeFiles: 'write',
     codeMapRebuildsRequested: 'read',
     codeMap: 'read',

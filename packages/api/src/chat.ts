@@ -110,8 +110,9 @@ export async function buildChatContext(projectKey: string, question: string, his
   const named = taskFiles({ files: [...mentionedPaths(task), ...[...task.matchAll(/(?<![\w/.-])([\w@-]+\.[\w.-]*[\w])(?![\w/.-])/g)].map(m => m[1])] }, d.context.roots).filter(path => !isSecretPath(path));
   const exact = map ? map.files.filter(f => named.some(p => p === f.path || (!p.includes('/') && f.path.split('/').pop() === p))).map(f => f.path) : named;
   const hits = map ? findInCodeMap(map, codeTerms(task), { limit: CODE_HITS, maxUsages: HIT_USAGES, paths: exact }) : [];
-  const namedFiles = [...new Set([...exact, ...named])];
-  const found = await getTaskContext({ project: projectKey, task, files: namedFiles, client: 'ui-chat' }, d.context).catch((err) => {
+  // Only mapped files are evidence of a real repo path; arbitrary prompt fragments must not enter Activity.
+  const namedFiles = map ? [...new Set(exact)] : [];
+  const found = await getTaskContext({ project: projectKey, task, files: namedFiles, trustedFilesOnly: true, client: 'ui-chat' }, d.context).catch((err) => {
     searchFailed = redactSecrets(err instanceof Error ? err.message : String(err)).slice(0, 200);
     return EMPTY;
   });

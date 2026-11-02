@@ -179,7 +179,10 @@ export class SelectionRepo implements SelectionStore {
       `MERGE (s:ProjectSelection {id: $id})
        WITH s, coalesce(s.tracked, []) AS before
        SET s.tracked = $tracked, s.initialized = true, s.updatedAt = $now
-       RETURN s, before`,
+       WITH s, before OPTIONAL MATCH (m:CodeMap)
+       FOREACH (_ IN CASE WHEN m IS NULL THEN [] ELSE [1] END |
+         SET m.unselectedAt = CASE WHEN m.projectKey IN $tracked THEN null ELSE coalesce(m.unselectedAt, $now) END)
+       RETURN DISTINCT s, before`,
       { id: ID, tracked: next, now: new Date().toISOString() },
     );
     return { before: (r.get('before') as string[]) ?? [], selection: toSelection(r.get('s').properties) };

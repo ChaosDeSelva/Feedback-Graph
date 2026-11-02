@@ -23,6 +23,7 @@ export const OWNER_ROUTES: readonly (readonly ['POST' | 'PUT' | 'PATCH' | 'DELET
   ['POST', '/api/projects/:key/scan/:id/cancel', 'scan'],
   ['POST', '/api/projects/scan', 'scan'],
   ['POST', '/api/projects/:key/codemap/rebuild', 'scan'],
+  ['DELETE', '/api/projects/:key/codemap', 'scan'],
   ['PATCH', '/api/projects/:key/facts/:id/relevance', 'relevance'],
   ['PUT', '/api/projects/:key/pin', 'pin'],
   ['PUT', '/api/links', 'links'],

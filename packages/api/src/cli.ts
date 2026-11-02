@@ -150,7 +150,7 @@ const printable = (s: string) => s.replace(/[\u0000-\u0008\u000b-\u001f\u007f-\u
 type Api = ReturnType<typeof client>;
 
 /** Verbs whose requests are never part of a run (cleanup, and reading what runs did). */
-const UNLABELLED = new Set(['cleanup', 'activity', 'evidence']);
+const UNLABELLED = new Set(['cleanup', 'activity']);
 
 function client(io: CliIO, flags: Flags, labels = true) {
   const base = (flags.url ?? io.env.FEEDBACK_GRAPH_URL ?? 'http://localhost:8787').replace(/\/+$/, '');
@@ -754,6 +754,8 @@ async function cloud(api: Api, io: CliIO, verb: string | undefined, f: Flags): P
     ], 200));
     for (const project of c.preview?.projects ?? c.projects.map((key: string) => ({ key, counts: null, reason: 'preview unavailable' })))
       io.out(`project   ${project.key}: ${project.counts ? `eligible (${project.counts.lessons} lessons, ${project.counts.misses} misses, ${project.counts.facts} facts, ${project.counts.docs} docs, ${project.counts.codeFiles} code files)` : `not sent: ${project.reason ?? 'no shareable knowledge'}`}`);
+    if (c.teamLessons?.message) io.out(`team      ${c.teamLessons.message}`);
+    if (c.policyError) io.out(`team      ${c.policyError}`);
     for (const message of new Set<string>((c.last?.teamLessons ?? []).map((t: { message: string }) => t.message))) io.out(`team      ${message}`);
     return 0;
   }
@@ -782,8 +784,9 @@ async function cloud(api: Api, io: CliIO, verb: string | undefined, f: Flags): P
 
 async function map(api: ReturnType<typeof client>, io: CliIO, words: string[], f: Flags): Promise<number> {
   const [verb, key] = words;
-  if (verb !== 'rebuild') throw new UsageError('usage: fg map rebuild <key>');
+  if (verb !== 'rebuild' && verb !== 'drop') throw new UsageError('usage: fg map rebuild|drop <key>');
   if (!key) throw new UsageError('fg map rebuild needs a project key (see fg projects list)');
+  if (verb === 'drop') { const result = await api('DELETE', `/api/projects/${encodeURIComponent(key)}/codemap`, {}); io.out(f.json ? JSON.stringify(result) : `${key}: code map dropped; facts and transcripts retained`); return 0; }
   const r = await api<{ queued: boolean }>('POST', `/api/projects/${encodeURIComponent(key)}/codemap/rebuild`, {});
   io.out(f.json ? JSON.stringify({ key, ...r }) : `${key}: rebuild queued; the worker remaps it at its next pass (watch Activity for code_mapped)`);
   return 0;

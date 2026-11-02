@@ -37,12 +37,13 @@ const DELETE: [RunItemKind, string][] = [
             WITH x, x.id AS removedId DETACH DELETE x RETURN count(*) AS n, collect(removedId) AS removedIds`],
   // The report's stand-in session and turn (never a real session's: a merged report is not deleted), its feedback and task.
   ['feedback', `UNWIND $ids AS id MATCH (x:Candidate {id: id, run: $run}) WHERE NOT coalesce(x.detected, false)
-                OPTIONAL MATCH (x)-[:FLAGS]->(t:Turn)<-[:HAS_TURN]-(s:Session {manual: true})
+                OPTIONAL MATCH (x)-[:FLAGS]->(t:Turn)<-[:HAS_TURN]-(s:Session)
                 OPTIONAL MATCH (f:Feedback {id: id})
                 // Post-mortems key the Task by session id, not candidate id. Follow the session relationship so run
                 // cleanup removes that derived task too (the manual session itself is already run-owned here).
-                OPTIONAL MATCH (s)-[:WORKED_ON]->(task:Task)
-                WITH x, collect(t) + collect(s) + collect(f) + collect(task) AS rest
+                OPTIONAL MATCH (f)-[:CRITICIZES]->(task:Task)
+                WHERE NOT EXISTS { MATCH (other:Feedback)-[:CRITICIZES]->(task) WHERE other.id <> id }
+                WITH x, [turn IN collect(CASE WHEN s.manual = true THEN t ELSE null END) WHERE turn IS NOT NULL] + [session IN collect(s) WHERE session.manual = true] + collect(f) + collect(task) AS rest
                 FOREACH (r IN rest | DETACH DELETE r)
                 WITH x, x.id AS removedId DETACH DELETE x RETURN count(*) AS n, collect(removedId) AS removedIds`],
   ['predone_check', `UNWIND $ids AS id MATCH (x:PreDoneCheck {id: id, run: $run}) WITH x, x.id AS removedId DETACH DELETE x RETURN count(*) AS n, collect(removedId) AS removedIds`],

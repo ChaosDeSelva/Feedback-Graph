@@ -166,7 +166,7 @@ export class PgCodeGraphStore implements CodeGraphStore {
       await c.query("SELECT id FROM project_selection WHERE id = 'selection' FOR UPDATE");
       const { rows } = await c.query<{ project_key: string }>(
         `SELECT m.project_key FROM code_maps m JOIN project_selection s ON s.id = 'selection'
-         WHERE s.initialized AND s.updated_at < $1
+         WHERE s.initialized AND coalesce(m.unselected_at, s.updated_at) < $1
            AND NOT (m.project_key = ANY(s.tracked)) LIMIT 1`,
         [cutoff],
       );
@@ -200,6 +200,21 @@ export class PgCodeGraphStore implements CodeGraphStore {
       [batch, cutoff],
     );
     return rowCount ?? 0;
+  }
+
+  async dropCodeMap(projectKey: string): Promise<boolean> {
+    if (!(await this.codeMapMeta(projectKey))) return false;
+    for (const table of ['code_symbols', 'code_imports', 'code_tests']) {
+      for (;;) { const result = await this.q(`DELETE FROM ${table} WHERE ctid IN (SELECT ctid FROM ${table} WHERE project_key = $1 LIMIT 250)`, [projectKey]); if ((result.rowCount ?? 0) < 250) break; }
+    }
+    for (;;) {
+      const result = await this.q(`UPDATE code_files SET in_map = false, in_index = false, mapped_at = NULL, code_hash = NULL,
+        lang = NULL, loc = NULL, is_test = false, churn_commits = NULL, churn_last_ts = NULL
+        WHERE id IN (SELECT id FROM code_files WHERE project_key = $1 AND (in_map OR in_index OR code_hash IS NOT NULL) LIMIT 250)`, [projectKey]);
+      if ((result.rowCount ?? 0) < 250) break;
+    }
+    await this.q('DELETE FROM code_maps WHERE project_key = $1', [projectKey]);
+    return true;
   }
 
   async requestCodeMapRebuild(projectKey: string): Promise<boolean> {

@@ -105,6 +105,7 @@ export class PgSelectionStore implements SelectionStore {
          RETURNING tracked, initialized, updated_at`,
         [SELECTION_ID, next, new Date()],
       );
+      await c.query('UPDATE code_maps SET unselected_at = CASE WHEN project_key = ANY($1::text[]) THEN NULL ELSE coalesce(unselected_at, $2) END', [next, new Date()]);
       return { before: old.rows[0]?.tracked ?? [], selection: fromRow(rows[0]) };
     });
   }

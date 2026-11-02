@@ -1,4 +1,4 @@
-import { beforeAll, expect, test } from 'vitest';
+import { beforeAll, expect, test, vi } from 'vitest';
 import { CODE_MAP_VERSION, MODULE_TESTS_DEPTH, sessionFiles, type CodeMapWrite } from '../codegraph.ts';
 import type { Store } from '../store.ts';
 import { describeStores, type StoreProbe } from '../testing/index.ts';
@@ -279,6 +279,32 @@ describeStores('CodeGraphStore', (h) => {
     expect(ids).toEqual(expect.arrayContaining(['demo:docs/kept.md', 'demo:src/db.ts']));
     expect((await store.codegraph.sessionFiles('s-once')).map((f) => f.path)).toEqual(['lib/still.ts']);
     expect(await store.codegraph.purgeOrphanCodeFiles(100)).toBe(0);
+  });
+
+  test('saving another selection does not restart a deselected map grace period', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    try {
+      const start = Date.parse('2030-01-01T00:00:00Z'); vi.setSystemTime(start);
+      await store.selection.setTracked(['demo']);
+      await store.codegraph.replaceCodeMap('demo', codeMap());
+      await store.selection.setTracked([]);
+      vi.setSystemTime(start + 23 * 60 * 60_000);
+      await store.selection.setTracked([]);
+      await store.codegraph.purgeOrphanCodeFiles(250, new Date(start + 25 * 60 * 60_000));
+      expect(await store.codegraph.codeMapMeta('demo')).toBeNull();
+    } finally { vi.useRealTimers(); }
+  });
+
+  test('dropping one map preserves facts and other projects', async () => {
+    await store.codegraph.replaceCodeMap('demo', codeMap());
+    await store.codegraph.replaceCodeMap('other', codeMap());
+    await store.facts.saveFileFacts('demo', { path: 'src/db.ts', hash: 'fact-hash', summary: 's' }, [
+      { kind: 'convention', statement: 'Keep this fact.', path: 'src/db.ts', lines: '1', confidence: 1, why: 'w', embedding: vec(2) },
+    ], 'model');
+    expect(await store.codegraph.dropCodeMap('demo')).toBe(true);
+    expect(await store.codegraph.codeMapMeta('demo')).toBeNull();
+    expect(await store.codegraph.codeMapMeta('other')).not.toBeNull();
+    expect((await store.facts.listFacts({ projectKey: 'demo' })).map(fact => fact.statement)).toContain('Keep this fact.');
   });
 
   test('deselected maps expire after grace, reselection cancels expiry, and unreferenced scanned rows go too', async () => {

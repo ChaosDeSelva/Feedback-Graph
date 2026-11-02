@@ -90,9 +90,15 @@ export async function importMemories(d: MemoryDeps): Promise<number> {
       const note = parseMemoryFile(await readFile(path, 'utf8'));
       const run = await d.runForWrite?.(projectKey, path);
       const duplicate = note?.type === 'feedback' ? await d.writtenAfterFeedback?.(projectKey, path) : false;
-      if (duplicate && d.state.getSetting(`memory-duplicate:${path}`) !== String(duplicate)) {
+      if (duplicate && (d.state.getSetting(`memory-duplicate:${path}`) !== String(duplicate) || d.state.getSetting(`memory-duplicate-notice:${path}`) !== String(duplicate))) {
         await d.withdrawDuplicate?.(`memory:${dir}/${file}`, typeof duplicate === 'string' ? duplicate : null);
+        await d.activity?.record({ kind: 'memory_imported', actor: 'memory-deduplication', projectKey,
+          subject: `skipped duplicate feedback memory: ${note?.name || file.replace(/\.md$/, '')}`,
+          why: 'the agent wrote this memory after feedback already represented in the Inbox; no duplicate lesson was imported',
+          details: { duplicate: true, ...(typeof duplicate === 'string' && { feedbackId: duplicate }) },
+          targets: typeof duplicate === 'string' ? [duplicate] : [] });
         d.state.setSetting(`memory-duplicate:${path}`, String(duplicate));
+        d.state.setSetting(`memory-duplicate-notice:${path}`, String(duplicate));
       }
       if (!duplicate && !changed && !recheck) continue;
       if (note?.type === 'feedback' && !duplicate) {
