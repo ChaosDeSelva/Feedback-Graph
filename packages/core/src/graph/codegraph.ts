@@ -159,9 +159,11 @@ export class CodeGraphRepo implements CodeGraphStore {
         { key, now },
       ],
       // A file that left the map and that nothing else refers to (never scanned, no fact about it, no session touched
-      // it) goes: its symbols and edges are gone already, only its IN edge is left.
+      // it) goes: its symbols and edges are gone already, only its IN edge is left. Files in the capped import index
+      // are current map data too; their edges are written below, so never remove them here before those writes.
       [
-        `MATCH (cf:CodeFile {projectKey: $key}) WHERE coalesce(cf.inMap, false) = false AND cf.hash IS NULL
+        `MATCH (cf:CodeFile {projectKey: $key}) WHERE coalesce(cf.inMap, false) = false
+           AND coalesce(cf.inIndex, false) = false AND cf.hash IS NULL
            AND COUNT { (cf)-[r]-() WHERE type(r) <> 'IN' } = 0
          DETACH DELETE cf`,
         { key },
@@ -228,7 +230,7 @@ export class CodeGraphRepo implements CodeGraphStore {
         WHERE coalesce(cf.inMap, false) OR coalesce(cf.inIndex, false) OR cf.codeHash IS NOT NULL
         WITH cf, m LIMIT $batch SET cf.inMap = false, cf.inIndex = false,
           cf.mapUnselectedAt = coalesce(m.unselectedAt, $now)
-        REMOVE cf.lang, cf.codeHash, cf.loc, cf.isTest, cf.churnCommits, cf.churnLastTs, cf.mappedAt`, { cutoff, batch }],
+        REMOVE cf.lang, cf.codeHash, cf.loc, cf.isTest, cf.churnCommits, cf.churnLastTs, cf.mappedAt`, { cutoff, batch, now: now.toISOString() }],
       [`${selectedMap} MATCH (module:Module {projectKey: m.projectKey})
         WHERE NOT EXISTS { ()-[:IMPORTS]->(module) }
         WITH module LIMIT $batch DETACH DELETE module`, { cutoff, batch }],

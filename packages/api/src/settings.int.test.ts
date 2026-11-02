@@ -3,6 +3,8 @@ import { describeStores, type StoreProbe } from '@fb/core/testing';
 import { beforeAll, expect, test } from 'vitest';
 import { createApp } from './app.ts';
 
+const OWNER = 'settings-owner-token-0123456789012345';
+
 const session = (id: string): ParsedSession => ({
   sessionId: id, sourceFile: 'f', cwd: '/x', gitBranch: null, startedAt: '2026-10-01T10:00:00Z', endedAt: '2026-10-01T10:00:00Z',
   turns: [{ uuid: `${id}-t0`, sessionId: id, ts: '2026-10-01T10:00:00Z', index: 0, text: 'hi', precedingAssistantText: '', precedingToolCalls: [] }],
@@ -23,6 +25,7 @@ describeStores('settings api', (h) => {
       selection,
       activity,
       app: createApp(store.graph, {
+        auth: { ownerToken: OWNER },
         settings: { selection, folders: async () => [{ key: 'keep', path: '/Users/me/Vibe/keep' }], excluded: [], roots: ['/Users/me/Vibe'] },
         activity,
         portability: store.portability,
@@ -30,7 +33,7 @@ describeStores('settings api', (h) => {
     };
   }
 
-  const ui = { 'sec-fetch-site': 'same-origin', origin: 'http://localhost', 'content-type': 'application/json' };
+  const ui = { authorization: `Bearer ${OWNER}`, 'x-fg-owner': 'true', 'sec-fetch-site': 'same-origin', origin: 'http://localhost', 'content-type': 'application/json' };
 
   test('selection round-trips through the graph, and cleanup deletes only unselected projects', async () => {
     const { app: a, selection, activity } = app();
