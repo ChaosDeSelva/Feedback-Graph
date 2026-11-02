@@ -4,6 +4,9 @@ import { createApp, type ApiRepo } from './app.ts';
 import type { CloudDeps } from './cloud.ts';
 
 const TOKEN = `fgc_pat_0123456789abcdef_${'Q'.repeat(43)}`;
+const OWNER = 'owner-test-token-01234567890123456789';
+const auth = { ownerToken: OWNER };
+const ownerHeaders = { authorization: `Bearer ${OWNER}`, 'x-fg-owner': 'true' };
 const cloud: CloudConfig = { url: 'https://cloud.example.com', token: TOKEN, intervalMinutes: 60, projects: [], suggestions: false, machine: null };
 const repo = { listCandidates: async () => [], candidateDetail: async () => null, decide: async () => {}, stats: async () => [] } as ApiRepo;
 
@@ -34,11 +37,11 @@ function deps(o: Partial<CloudDeps> = {}) {
   return { d, log, fetchCalls };
 }
 
-const post = (origin?: string) => ({ method: 'POST', body: '{}', headers: { 'content-type': 'application/json', ...(origin ? { origin, 'sec-fetch-site': 'same-origin' } : {}) } });
+const post = (origin?: string) => ({ method: 'POST', body: '{}', headers: { 'content-type': 'application/json', ...(origin ? ownerHeaders : {}) } });
 
 test('with cloud sync off, the card says so and Sync now refuses; nothing is sent', async () => {
   const { d, fetchCalls } = deps({ cloud: null });
-  const app = createApp(repo, { cloud: d });
+  const app = createApp(repo, { auth, cloud: d });
   const info = await (await app.request('/api/cloud')).json();
   expect(info).toMatchObject({ enabled: false, host: null, last: null, preview: null });
   expect(info.neverSent).toMatch(/transcripts/);
@@ -50,7 +53,7 @@ test('with cloud sync off, the card says so and Sync now refuses; nothing is sen
 
 test('the card shows the host, schedule, projects and what a sync would send; never the token', async () => {
   const { d } = deps();
-  const app = createApp(repo, { cloud: d });
+  const app = createApp(repo, { auth, cloud: d });
   const res = await app.request('/api/cloud');
   const text = await res.text();
   expect(text).not.toContain(TOKEN);
@@ -61,14 +64,14 @@ test('the card shows the host, schedule, projects and what a sync would send; ne
 
 test('Sync now is yours only: a request without a browser Origin is refused', async () => {
   const { d, fetchCalls } = deps();
-  const app = createApp(repo, { cloud: d });
+  const app = createApp(repo, { auth, cloud: d });
   expect((await app.request('/api/cloud/sync', post())).status).toBe(403);
   expect(fetchCalls).toHaveLength(0);
 });
 
 test('Sync now from the UI sends, records Activity, and the card then shows the last sync', async () => {
   const { d, log, fetchCalls } = deps();
-  const app = createApp(repo, { cloud: d });
+  const app = createApp(repo, { auth, cloud: d });
   const res = await app.request('/api/cloud/sync', post('http://localhost'));
   expect(res.status).toBe(200);
   const r = await res.json();
@@ -81,7 +84,7 @@ test('Sync now from the UI sends, records Activity, and the card then shows the 
 
 test('a failed sync is reported with its reason, and the card shows the error', async () => {
   const { d } = deps({ fetch: (async () => new Response('', { status: 401 })) as unknown as typeof fetch });
-  const app = createApp(repo, { cloud: d });
+  const app = createApp(repo, { auth, cloud: d });
   const r = await (await app.request('/api/cloud/sync', post('http://localhost'))).json();
   expect(r.ok).toBe(false);
   expect(r.error).toMatch(/refused the token/);
@@ -92,7 +95,7 @@ test('one Sync now at a time', async () => {
   let release!: () => void;
   const gate = new Promise<void>((r) => { release = r; });
   const { d } = deps({ fetch: (async () => { await gate; return Response.json(syncOk); }) as unknown as typeof fetch });
-  const app = createApp(repo, { cloud: d });
+  const app = createApp(repo, { auth, cloud: d });
   const first = app.request('/api/cloud/sync', post('http://localhost'));
   await new Promise((r) => setTimeout(r, 5));
   expect((await app.request('/api/cloud/sync', post('http://localhost'))).status).toBe(409);
@@ -103,23 +106,23 @@ test('one Sync now at a time', async () => {
 test('the card shows when the worker syncs next', async () => {
   const worker = { cloudSync: { host: 'cloud.example.com', intervalMinutes: 60, lastAt: null, lastOk: null, lastError: null, lastSent: null, nextAt: '2026-10-23T11:00:00.000Z', failures: 0 } } as unknown as WorkerStatus;
   const { d } = deps({ worker: async () => worker });
-  const info = await (await createApp(repo, { cloud: d }).request('/api/cloud')).json();
+  const info = await (await createApp(repo, { auth, cloud: d }).request('/api/cloud')).json();
   expect(info.nextAt).toBe('2026-10-23T11:00:00.000Z');
 });
 
 test('/api/status says whether cloud sync is on, with the token redacted', async () => {
   const { d } = deps();
-  const app = createApp(repo, { cloud: d, system: { version: '0.2.0', ping: async () => true, worker: async () => null } });
+  const app = createApp(repo, { auth, cloud: d, system: { version: '0.2.0', ping: async () => true, worker: async () => null } });
   const text = await (await app.request('/api/status')).text();
   expect(text).not.toContain(TOKEN);
   expect(JSON.parse(text).cloud).toEqual({ host: 'cloud.example.com', token: '[REDACTED]', intervalMinutes: 60, lastManual: null, syncing: null });
-  const off = createApp(repo, { cloud: deps({ cloud: null }).d, system: { version: '0.2.0', ping: async () => true, worker: async () => null } });
+  const off = createApp(repo, { auth, cloud: deps({ cloud: null }).d, system: { version: '0.2.0', ping: async () => true, worker: async () => null } });
   expect((await (await off.request('/api/status')).json()).cloud).toBeNull();
 });
 
 test('Sync now sends only what changed since the last sync, and resends everything with force', async () => {
   const { d, fetchCalls, log } = deps({ memory: new Map() });
-  const app = createApp(repo, { cloud: d });
+  const app = createApp(repo, { auth, cloud: d });
   await app.request('/api/cloud/sync', post('http://localhost'));
   const again = await (await app.request('/api/cloud/sync', post('http://localhost'))).json();
   expect(again.projects).toEqual([expect.objectContaining({ key: 'shop', status: 'unchanged' })]);
@@ -135,7 +138,7 @@ test('a running Sync now reports its progress; afterwards /api/status shows when
   let release!: () => void;
   const gate = new Promise<void>((r) => { release = r; });
   const { d } = deps({ projects: async () => ['shop', 'blog'], fetch: (async () => { await gate; return Response.json(syncOk); }) as unknown as typeof fetch });
-  const app = createApp(repo, { cloud: d, system: { version: '0.5.0', ping: async () => true, worker: async () => null } });
+  const app = createApp(repo, { auth, cloud: d, system: { version: '0.5.0', ping: async () => true, worker: async () => null } });
   expect(await (await app.request('/api/cloud/progress')).json()).toEqual({ running: null, lastManual: null });
   const run = app.request('/api/cloud/sync', post('http://localhost'));
   await new Promise((r) => setTimeout(r, 5));
@@ -155,7 +158,7 @@ test('a running Sync now reports its progress; afterwards /api/status shows when
 
 test('preview errors do not break the card', async () => {
   const { d } = deps({ portability: { exportData: vi.fn(async () => { throw new Error('store down'); }) } });
-  const res = await createApp(repo, { cloud: d }).request('/api/cloud');
+  const res = await createApp(repo, { auth, cloud: d }).request('/api/cloud');
   expect(res.status).toBe(200);
   expect((await res.json()).preview).toBeNull();
 });
@@ -165,15 +168,15 @@ test('local-only settings are owner protected, durable, and prevent forced manua
   const saved = new Map<string, string>();
   const localOnlyStore = { getCursor: async (key: string) => saved.get(key) ?? null, setCursor: async (key: string, value: string) => { saved.set(key, value); } };
   const { d, fetchCalls } = deps({ localOnlyStore });
-  const app = createApp(repo, { cloud: d });
-  const request = (origin?: string) => ({ method: 'PUT', body: JSON.stringify({ projects: ['shop'] }), headers: { 'content-type': 'application/json', ...(origin ? { origin, 'sec-fetch-site': 'same-origin' } : {}) } });
+  const app = createApp(repo, { auth, cloud: d });
+  const request = (origin?: string) => ({ method: 'PUT', body: JSON.stringify({ projects: ['shop'] }), headers: { 'content-type': 'application/json', ...(origin ? ownerHeaders : {}) } });
   expect((await app.request('/api/cloud/local-only', request())).status).toBe(403);
   expect((await app.request('/api/cloud/local-only', request('http://localhost'))).status).toBe(200);
   expect((await (await app.request('/api/cloud')).json()).projects).toEqual([]);
   const result = await app.request('/api/cloud/sync', { ...post('http://localhost'), body: JSON.stringify({ force: true }) });
   expect(result.status).toBe(200);
   expect(fetchCalls).toEqual([]);
-  const restarted = createApp(repo, { cloud: { ...d, localOnlyStore } });
+  const restarted = createApp(repo, { auth, cloud: { ...d, localOnlyStore } });
   expect((await (await restarted.request('/api/cloud')).json()).localOnlyProjects).toEqual(['shop']);
 });
 
@@ -184,12 +187,12 @@ test('only an explicit owner sharing setting converts a demo-created project, an
   const posts: string[] = [];
   const { d } = deps({ localOnlyStore, portability: { exportData: async () => ({ ...bundle('shop'), projects: [{ key: 'shop', remote: 'github.com/acme/shop', demoCreated: true }] }) },
     fetch: (async (url: string, init: RequestInit) => { if (url.endsWith('/sync-policy')) return new Response(null, { status: 404 }); posts.push(init.body as string); return Response.json(syncOk); }) as unknown as typeof fetch });
-  const app = createApp(repo, { cloud: d });
+  const app = createApp(repo, { auth, cloud: d });
   await app.request('/api/cloud/sync', { ...post('http://localhost'), body: JSON.stringify({ force: true }) });
   expect(posts).toEqual([]);
   const preview = await (await app.request('/api/cloud')).json();
   expect(preview.preview.projects[0].reason).toContain('Created by demo seed');
-  const write = (origin?: string) => ({ method: 'PUT', body: JSON.stringify({ projects: [], shareDemoProjects: ['shop'] }), headers: { 'content-type': 'application/json', ...(origin ? { origin, 'sec-fetch-site': 'same-origin' } : {}) } });
+  const write = (origin?: string) => ({ method: 'PUT', body: JSON.stringify({ projects: [], shareDemoProjects: ['shop'] }), headers: { 'content-type': 'application/json', ...(origin ? ownerHeaders : {}) } });
   expect((await app.request('/api/cloud/local-only', write())).status).toBe(403);
   expect(saved.size).toBe(0);
   expect((await app.request('/api/cloud/local-only', write('http://localhost'))).status).toBe(200);
@@ -201,7 +204,7 @@ test('only an explicit owner sharing setting converts a demo-created project, an
 
 
 test('cloud preview explains an unselected project without selecting or sending it', async () => {
-  const { d } = deps(); const app = createApp(repo, { cloud: { ...d, projects: async () => [] } });
+  const { d } = deps(); const app = createApp(repo, { auth, cloud: { ...d, projects: async () => [] } });
   const res = await app.request('/api/cloud?project=demo-shop');
   expect(res.status).toBe(200);
   const body = await res.json();
@@ -215,10 +218,10 @@ test('API restart restores last sync and manual status after Activity retention 
   const docs = { getCursor: async (key: string) => values.get(key) ?? null, setCursor: async (key: string, value: string) => { values.set(key, value); },
     deleteCursor: async (key: string) => { values.delete(key); }, cursorsWithPrefix: async (prefix: string) => [...values].filter(([key]) => key.startsWith(prefix)).map(([key, value]) => ({ key, value })) };
   const { d, log } = deps({ memory: storedSyncMemory(docs, cloud) });
-  const first = createApp(repo, { cloud: d });
+  const first = createApp(repo, { auth, cloud: d });
   expect((await first.request('/api/cloud/sync', post('http://localhost'))).status).toBe(200);
   log.splice(0);
-  const restarted = createApp(repo, { cloud: { ...d, memory: storedSyncMemory(docs, cloud) } });
+  const restarted = createApp(repo, { auth, cloud: { ...d, memory: storedSyncMemory(docs, cloud) } });
   expect((await (await restarted.request('/api/cloud')).json()).last).toMatchObject({ ok: true, trigger: 'manual', sent: { lessons: 1 } });
   expect((await (await restarted.request('/api/cloud/progress')).json()).lastManual).toMatchObject({ ok: true, sent: { lessons: 1 } });
   expect((await (await restarted.request('/api/status')).json()).cloud.lastManual).toMatchObject({ ok: true, sent: { lessons: 1 } });

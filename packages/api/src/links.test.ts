@@ -3,6 +3,8 @@ import { expect, test } from 'vitest';
 import { createApp, type ApiRepo } from './app.ts';
 
 const repo = { listCandidates: async () => [], candidateDetail: async () => null, decide: async () => {}, stats: async () => [] } as unknown as ApiRepo;
+const OWNER = 'owner-test-token-01234567890123456789';
+const ownerHeaders = { authorization: `Bearer ${OWNER}`, 'x-fg-owner': 'true' };
 const link = (a: string, b: string, status: ProjectLink['status']): ProjectLink => ({
   id: `link:${a}|${b}`, a, b, relation: 'related', note: '', status, source: 'detected', score: 0.9,
   evidence: [{ signal: 'manifest', detail: `${b} depends on ${a}`, path: 'package.json', from: b }], createdAt: 't', updatedAt: 't', decidedBy: null,
@@ -12,6 +14,7 @@ function setup(links: ProjectLink[] = [link('api', 'game', 'suggested'), link('g
   const calls: unknown[][] = [];
   const activity: ActivityInput[] = [];
   const app = createApp(repo, {
+    auth: { ownerToken: OWNER },
     links: {
       listLinks: async (q) => links.filter((l) => !q.projectKey || l.a === q.projectKey || l.b === q.projectKey),
       setLink: async (x, y, patch) => { calls.push(['set', x, y, patch]); return { ...link(x < y ? x : y, x < y ? y : x, patch.status ?? 'confirmed'), note: patch.note ?? '' }; },
@@ -23,7 +26,7 @@ function setup(links: ProjectLink[] = [link('api', 'game', 'suggested'), link('g
   return { app, calls, activity };
 }
 
-const json = (method: string, body: object) => ({ method, headers: { 'content-type': 'application/json', 'sec-fetch-site': 'same-origin', origin: 'http://localhost' }, body: JSON.stringify(body) });
+const json = (method: string, body: object) => ({ method, headers: { 'content-type': 'application/json', ...ownerHeaders }, body: JSON.stringify(body) });
 
 test('GET /api/projects/:key/links lists the project links whose other end is shown', async () => {
   const { app } = setup();

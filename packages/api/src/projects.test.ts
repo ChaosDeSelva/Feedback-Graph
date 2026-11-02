@@ -3,6 +3,8 @@ import { expect, test } from 'vitest';
 import { createApp, type ApiRepo } from './app.ts';
 
 const repo = { listCandidates: async () => [], candidateDetail: async () => null, decide: async () => {}, stats: async () => [] } as unknown as ApiRepo;
+const OWNER = 'owner-test-token-01234567890123456789';
+const ownerHeaders = { authorization: `Bearer ${OWNER}`, 'x-fg-owner': 'true' };
 const summary = (key: string, facts = 0, over: Partial<ProjectSummary> = {}): ProjectSummary => ({ key, repoPath: `/vibe/${key}`, remote: null, aliases: [], sessions: 2, feedback: 1, lessons: 1, facts, lastScan: null, pinned: false, ...over });
 
 function setup(projects = [summary('alpha', 5)], dirs: { key: string; name: string; repoPath: string; remote?: string | null }[] = [{ key: 'alpha', name: 'alpha', repoPath: '/vibe/alpha' }, { key: 'beta', name: 'beta', repoPath: '/vibe/beta' }]) {
@@ -17,6 +19,7 @@ function setup(projects = [summary('alpha', 5)], dirs: { key: string; name: stri
   };
   const activity: { kind: string; subject: string }[] = [];
   const app = createApp(repo, {
+    auth: { ownerToken: OWNER },
     facts,
     embed: async (t) => t.map(() => [1]),
     projectDirs: async () => dirs,
@@ -25,7 +28,7 @@ function setup(projects = [summary('alpha', 5)], dirs: { key: string; name: stri
   return { app, calls, activity };
 }
 
-const json = (method: string, body: object) => ({ method, headers: { 'content-type': 'application/json', 'sec-fetch-site': 'same-origin', origin: 'http://localhost' }, body: JSON.stringify(body) });
+const json = (method: string, body: object) => ({ method, headers: { 'content-type': 'application/json', ...ownerHeaders }, body: JSON.stringify(body) });
 
 test('GET /api/projects merges graph projects with local folders that have no data yet', async () => {
   const { app } = setup();
@@ -193,6 +196,7 @@ test('single and batch scan APIs expose blocked readiness and poll status clears
   let healthy = false, probes = 0;
   const scan = { id: 'scan:blocked', projectKey: 'beta', provider: 'codex-cli', status: 'queued' };
   const app = createApp(repo, {
+    auth: { ownerToken: OWNER },
     facts: { requestScan: async () => scan, scanJob: async () => scan, listProjects: async () => [] } as never,
     projectDirs: async () => [{ key: 'beta', name: 'beta', repoPath: '/vibe/beta' }],
     system: { worker: async () => ({ providers: { scan: 'codex-cli' } }), runner: async () => { probes++; return { ok: healthy, reason: healthy ? 'healthy' : 'sandbox cannot start' }; } } as never,
@@ -213,6 +217,7 @@ test('single and batch scan APIs expose blocked readiness and poll status clears
 test('only a queued scan in the requested project can be cancelled', async () => {
   let status = 'queued', cancelled = 0;
   const app = createApp(repo, {
+    auth: { ownerToken: OWNER },
     facts: { listProjects: async () => [], scanJob: async (id: string) => id === 'scan:1' ? { id, projectKey: 'beta', status } : null,
       cancelQueuedScan: async () => { if (status !== 'queued') return false; status = 'failed'; cancelled++; return true; } } as never,
     projectDirs: async () => [{ key: 'beta', name: 'beta', repoPath: '/vibe/beta' }],

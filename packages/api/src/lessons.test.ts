@@ -3,6 +3,8 @@ import { describe, expect, test } from 'vitest';
 import { createApp, type ApiRepo, type AppOpts } from './app.ts';
 
 const repo = { listCandidates: async () => [], candidateDetail: async () => null, decide: async () => {}, stats: async () => [] } as unknown as ApiRepo;
+const OWNER = 'owner-test-token-01234567890123456789';
+const ownerHeaders = { authorization: `Bearer ${OWNER}`, 'x-fg-owner': 'true' };
 const lesson: Lesson = {
   id: 'lesson:a', projectKey: 'demo', title: 'T', rule: 'R', appliesWhen: 'W', scope: 'project', paths: [],
   status: 'proposed', source: 'postmortem', cause: 'verification_gap', missId: 'miss:a', createdAt: 't', decidedAt: null,
@@ -16,11 +18,11 @@ function setup() {
     updateLesson: async (...a: unknown[]) => { calls.push(['update', ...a]); return { unscoped: false }; },
   };
   const embedded: string[][] = [];
-  const app = createApp(repo, { knowledge, embed: async (t) => { embedded.push(t); return t.map(() => [0.5]); } });
+  const app = createApp(repo, { auth: { ownerToken: OWNER }, knowledge, embed: async (t) => { embedded.push(t); return t.map(() => [0.5]); } });
   return { app, calls, embedded };
 }
 
-const patch = (body: object) => ({ method: 'PATCH', headers: { 'content-type': 'application/json', 'sec-fetch-site': 'same-origin', origin: 'http://localhost' }, body: JSON.stringify(body) });
+const patch = (body: object) => ({ method: 'PATCH', headers: { 'content-type': 'application/json', ...ownerHeaders }, body: JSON.stringify(body) });
 
 test('GET /api/lessons filters by status and project', async () => {
   const { app, calls } = setup();
@@ -36,7 +38,7 @@ test('GET /api/lessons/:id is 404 for unknown ids', async () => {
 });
 
 test('a direct lesson URL cannot expose a sandbox lesson outside its run', async () => {
-  const sandbox = { ...lesson, id: 'lesson:sandbox', run: 'probe-a', sandbox: true };
+  const sandbox = { ...lesson, id: 'lesson:sandbox', run: 'probe-a', sandbox: true as const };
   const app = createApp(repo, { knowledge: {
     listLessons: async () => [sandbox],
     lessonDetail: async () => ({ lesson: sandbox, miss: null, feedback: null, contextItems: [], fixCommits: [], supersedes: [] }),
@@ -86,7 +88,7 @@ describe('narrowing a global lesson to a project', () => {
     const projectDirs = async () => [{ key: 'web', name: 'web', repoPath: '/repos/web' }, { key: 'data-pipeline', name: 'data-pipeline', repoPath: '/repos/data-pipeline' }];
     const keys = o.shown;
     const shown = keys && (async () => ({ initialized: true, keys, has: (k: string) => keys.includes(k) }) as ShownProjects);
-    const app = createApp(repo, { knowledge, projectDirs, ...(shown && { shown }) } as AppOpts);
+    const app = createApp(repo, { auth: { ownerToken: OWNER }, knowledge, projectDirs, ...(shown && { shown }) } as AppOpts);
     return { app, calls };
   }
 
@@ -139,14 +141,14 @@ function factSetup(l: Lesson = lesson, o: { auth?: AppOpts['auth'] } = {}) {
     addOwnerFact: async (...a: unknown[]) => { calls.push(['fact', ...a]); return { id: 'fact:1', ...(a[1] as object), origin: 'you' }; },
   };
   const app = createApp(repo, {
-    knowledge, facts: facts as never, ...(o.auth && { auth: o.auth }),
+    knowledge, facts: facts as never, auth: o.auth ?? { ownerToken: OWNER },
     embed: async (t) => { embedded.push(t); return t.map(() => [0.25]); },
     activity: { record: async (e) => { logged.push(e); }, list: async () => [] },
   });
   return { app, calls, logged, embedded };
 }
 
-const post = (body: object, headers: Record<string, string> = { 'sec-fetch-site': 'same-origin', origin: 'http://localhost' }) => ({ method: 'POST', headers: { 'content-type': 'application/json', ...headers }, body: JSON.stringify(body) });
+const post = (body: object, headers: Record<string, string> = ownerHeaders) => ({ method: 'POST', headers: { 'content-type': 'application/json', ...headers }, body: JSON.stringify(body) });
 
 test('POST /api/lessons/:id/to-fact files the rule as your fact (convention, everyday) and rejects the lesson with a note', async () => {
   const { app, calls, logged, embedded } = factSetup({ ...lesson, rule: 'Orders are read from the source table, not the mirror' });
@@ -224,7 +226,7 @@ function bulkSetup(o: { auth?: AppOpts['auth'] } = {}) {
     requestLessonRecheck: async () => { calls.push(['recheck']); return 7; },
   };
   const app = createApp(repo, {
-    knowledge, ...(o.auth && { auth: o.auth }),
+    knowledge, auth: o.auth ?? { ownerToken: OWNER },
     activity: { record: async (e) => { logged.push(e); }, list: async () => [] },
     shown: async () => shownProjects({ tracked: ['demo'], initialized: true }, { excludeProjects: [] }),
   });
