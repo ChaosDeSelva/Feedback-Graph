@@ -48,12 +48,17 @@ test('signing in from the UI sets an HttpOnly session cookie that authenticates 
   expect(cookie).not.toContain(TOKEN);
   const session = cookie.split(';')[0];
   expect((await app.request('/api/candidates', { headers: { cookie: session } })).status).toBe(200);
+  const second = await app.request('/api/session', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ token: TOKEN }) });
+  expect(second.headers.get('set-cookie')!.split(';')[0]).not.toBe(session);
+  await app.request('/api/session', { method: 'DELETE', headers: { cookie: session } });
+  expect((await app.request('/api/candidates', { headers: { cookie: session } })).status).toBe(401);
 });
 
 test('the UI can ask whether it needs to sign in', async () => {
-  expect(await (await secured().request('/api/session')).json()).toEqual({ authRequired: true, authenticated: false });
-  expect(await (await secured().request('/api/session', { headers: bearer })).json()).toEqual({ authRequired: true, authenticated: true });
-  expect(await (await createApp(repo).request('/api/session')).json()).toEqual({ authRequired: false, authenticated: true });
+  expect(await (await secured().request('/api/session')).json()).toEqual({ authRequired: true, authenticated: false, ownerSession: false });
+  expect(await (await secured().request('/api/session', { headers: bearer })).json()).toEqual({ authRequired: true, authenticated: true, ownerSession: false });
+  expect(await (await createApp(repo).request('/api/session')).json()).toEqual({ authRequired: false, authenticated: true, ownerSession: false });
+  expect((await createApp(repo).request('/api/session', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ token: 'anything' }) })).status).toBe(403);
 });
 
 test('a public host name is accepted only when a token protects the API', async () => {

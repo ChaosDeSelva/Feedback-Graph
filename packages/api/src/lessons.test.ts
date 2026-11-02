@@ -35,6 +35,17 @@ test('GET /api/lessons/:id is 404 for unknown ids', async () => {
   expect((await app.request('/api/lessons/nope')).status).toBe(404);
 });
 
+test('a direct lesson URL cannot expose a sandbox lesson outside its run', async () => {
+  const sandbox = { ...lesson, id: 'lesson:sandbox', run: 'probe-a', sandbox: true };
+  const app = createApp(repo, { knowledge: {
+    listLessons: async () => [sandbox],
+    lessonDetail: async () => ({ lesson: sandbox, miss: null, feedback: null, contextItems: [], fixCommits: [], supersedes: [] }),
+    updateLesson: async () => ({ unscoped: false }),
+  } });
+  expect((await app.request('/api/lessons/lesson%3Asandbox')).status).toBe(404);
+  expect((await app.request('/api/lessons/lesson%3Asandbox', { headers: { 'x-fg-run': 'probe-b' } })).status).toBe(404);
+});
+
 test('GET /api/lessons/:id never shows a context item why that is only a field name (stored before the check)', async () => {
   const item = (why: string) => ({ kind: 'code' as const, ref: 'api/search.ts', excerpt: 'x', why, wasAvailable: true });
   const knowledge = {

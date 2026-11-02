@@ -221,7 +221,7 @@ const routes = (a = appSchemas): Record<string, Partial<Record<Method, Route>>> 
   '/api/events': { GET: { tag: 'system', summary: 'Server-sent events: stage, pipeline, scan, chat, activity (of the shown projects); a heartbeat comment every 15 s; at most 20 streams', response: 'text/event-stream; 503 when 20 streams are open', type: 'text/event-stream' } },
   '/api/openapi.json': { GET: { tag: 'system', summary: 'This document', response: 'OpenAPI 3.1 document' } },
   '/api/session': {
-    GET: { tag: 'system', summary: 'Whether sign-in is needed and whether this request is signed in', response: '{ authRequired, authenticated }' },
+    GET: { tag: 'system', summary: 'Whether sign-in is needed and whether this request is signed in, including owner-browser authority', response: '{ authRequired, authenticated, ownerSession }' },
     POST: { tag: 'system', summary: 'Sign in with API_TOKEN: sets the UI session cookie', body: SessionToken, response: 'no content; 401 on a wrong token', status: 204 },
     DELETE: { tag: 'system', summary: 'Sign out: clears the session cookie', response: 'no content', status: 204 },
   },
@@ -336,7 +336,7 @@ const SCHEMA_OF: Record<string, JsonSchema> = {
   'GET /api/ready': obj({ ok: bool, store: { type: 'string', enum: ['neo4j', 'postgres'] } }, ['ok']),
   'GET /api/events': { type: 'string', description: 'text/event-stream: events stage, pipeline, scan, chat, activity; data is JSON' },
   'GET /api/openapi.json': { type: 'object', description: 'An OpenAPI 3.1 document', additionalProperties: true },
-  'GET /api/session': obj({ authRequired: bool, authenticated: bool }),
+  'GET /api/session': obj({ authRequired: bool, authenticated: bool, ownerSession: bool }),
   'GET /api/agent/project': loose('The selected project the folder belongs to, or why it is not one'),
   'POST /api/lessons/decisions': RESULTS(obj({ id: str, ok: bool, status: str, error: str }, ['id', 'ok'])),
   'POST /api/lessons/recheck': obj({ queued: int }),

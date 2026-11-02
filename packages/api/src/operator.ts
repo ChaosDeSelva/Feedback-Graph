@@ -40,6 +40,8 @@ export const OWNER_ROUTES: readonly (readonly ['POST' | 'PUT' | 'PATCH' | 'DELET
   ['PUT', '/api/cloud/local-only', 'settings'],
   ['POST', '/api/turns/requeue', 'requeue'],
   ['POST', '/api/import', 'import'],
+  ['POST', '/api/demo/seed', 'demo'],
+  ['POST', '/api/demo/remove', 'demo'],
   ['POST', '/api/sessions/:id/resummarize', 'resummarize'],
   ['PUT', '/api/settings/integrations/:kind', 'integrations'],
   // Not POST /api/settings/integrations/:kind/test: it re-checks the token already saved, a read (fg integrations test).

@@ -232,10 +232,9 @@ export function demoRoutes(app: Hono, d: DemoDeps, auth: { operator?: OperatorCo
     const parsed = Body.safeParse(await c.req.json().catch(() => ({})));
     if (!parsed.success) return c.json({ error: parsed.error.flatten() }, 400);
     const operator = hasOperatorToken(c, auth.operator);
-    if (!operator && (c.req.header('origin') === undefined || c.req.header('sec-fetch-site') !== 'same-origin')) {
-      return c.json({ error: 'only you can seed or remove the demo corpus: from the Feedback Graph UI, or with FG_OPERATOR_TOKEN as a Bearer (fg demo seed)' }, 403);
-    }
     if (operator && !auth.operator?.allow.some(verb => verb === 'demo' || verb === 'lesson_decide')) return c.json({ error: 'demo seed/remove requires demo in OPERATOR_ALLOW (or lesson_decide)' }, 403);
+    // Authentication/owner intent is enforced by OWNER_ROUTES before this handler. Keep the project-scope distinction:
+    // the narrow `demo` operator verb may touch only demo-shop; lesson_decide may seed another explicit project.
     const owner = operator ? !!auth.operator?.allow.includes('lesson_decide') : true;
     const go = () => fn({ ...parsed.data, owner }, d);
     try {

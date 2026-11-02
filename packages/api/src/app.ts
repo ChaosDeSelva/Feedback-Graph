@@ -11,7 +11,7 @@ import { z } from 'zod';
 import { ACTIVITY_KINDS, EVERYDAY_FROM, chunkText, mapCapped, MAX_AUTO_MAP_FILES, MODEL_JOBS, cleanLessonPath, cmp, FACT_KINDS, LESSON_CHECKS, LESSON_FROM, redactSecrets, relevanceBand, selectionNote, type ActivityStore, type CodeGraphStore, type DocsStore, type FactsStore, type GraphStore, type InsightsStore, type ModelHealth, type ModelJob, type OllamaHealth, type PipelineStatus, type ProviderHealth, type KnowledgeStore, type Lesson, type LinksStore, IMAGE_MEDIA_TYPES, MAX_IMAGE_BYTES, LINK_RELATIONS, LINK_STATUSES, linkPair, linkEnds, docIdOf, NotTheRunsError, type PortabilityStore, type Project, type ProjectSelection, type RelevanceBy, type ProjectSummary, type ScanQueueEntry, type ShownProjects, type WorkQueue, type WorkQueues, type StoreKind, type SystemStatus, type WorkerStatus, contextWhy, FACT_ORIGINS, SCANNER_VERSION, RUN_ID, type RunPrincipal, type RunsStore, LESSON_QUALITY_DAYS, lessonQualityReport, type LessonQualityReport, type Candidate } from '@fb/core';
 import { chatRoutes, type ChatRouteDeps } from './chat.ts';
 import { trackedProject, type ContextDeps } from './context.ts';
-import { authenticated, needsAuth, SECURITY_HEADERS, sessionCookie, tokenMatches, type AuthOpts } from './auth.ts';
+import { authenticated, needsAuth, ownerSession, OwnerSessions, SECURITY_HEADERS, SESSION_COOKIE, sessionCookie, tokenMatches, type AuthOpts } from './auth.ts';
 import { cloudRoutes, cloudStatus, type CloudDeps, type CloudState } from './cloud.ts';
 import { createEventHub, type FgEvent } from './events.ts';
 import { demoRoutes, type DemoDeps } from './demo.ts';
@@ -459,8 +459,13 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
     return !v || v.has(key);
   };
   const app = new Hono();
+  const ownerSessions = new OwnerSessions();
   app.onError((error, c) => {
     const code = (error as { code?: string }).code;
+    if (code === 'Neo.TransientError.General.MemoryPoolOutOfMemoryError' || /transaction(?:al)? memory|memory pool/i.test(error.message)) {
+      c.header('retry-after', '2');
+      return c.json({ error: 'the graph store is temporarily at its transaction-memory limit; retry the request', retryable: true }, 503);
+    }
     if (error.name === 'StoreDeadlineError' || code === '57014' || /(?:timeout|timed out|deadline exceeded)/i.test(error.message)) {
       return c.json({ error: 'request deadline exceeded; retry the request', retryable: true }, 504);
     }
@@ -516,7 +521,7 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
       if (!auth.ownerToken && c.req.header('sec-fetch-site') !== 'same-origin') return c.json({ error: 'tokenless owner cleanup requires the same-origin browser UI; fg --owner requires FG_OWNER_TOKEN' }, 403);
     }
     if (needsAuth(c.req.path)) {
-      if (!authenticated(c, auth.token) && !operator && !ownerCredential) return bearerOf(c) ? unrecognised(c) : c.json({ error: 'sign in required' }, 401);
+      if (!authenticated(c, auth.token, ownerSessions) && !operator && !ownerCredential) return bearerOf(c) ? unrecognised(c) : c.json({ error: 'sign in required' }, 401);
       // A bearer that is neither configured token is refused on reads too (an agent with a stale token would otherwise
       // read on and never learn its writes will fail). With no token configured there is nothing to check it against;
       // "Bearer none" is the plugin's placeholder for no token.
@@ -542,13 +547,13 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
     // Cleaning a run up is not part of any run: a label there would claim the run for whoever cleans it (409 for the
     // owner on an agent's run; a dry run of an unused id would open it).
     const run = RUN_PATH.test(c.req.path) ? null : label;
-    const browser = c.req.header('origin') !== undefined;
-    const principal: RunPrincipal = operator ? 'operator' : browser ? 'browser' : ownerBearer || auth.token && authenticated(c, auth.token) ? 'owner_token' : 'agent';
+    const browser = ownerSession(c, ownerSessions);
+    const principal: RunPrincipal = operator ? 'operator' : browser ? 'browser' : ownerBearer ? 'owner_token' : 'agent';
     // A sandbox run name is an identifier, not a credential. Reads need the same private
     // capability as writes; the owner can inspect runs through the authenticated owner path.
     const sandboxRunId = run?.id ?? (RUN_PATH.test(c.req.path) ? decodeURIComponent(c.req.path.split('/').filter(Boolean).at(-1)!) : c.req.query('run'));
     if (sandboxRunId && (run?.sandbox || await opts.runs?.sandbox?.(sandboxRunId))) {
-      const ownerAccess = ownerBearer || !!(auth.token && tokenMatches(bearerOf(c) ?? '', auth.token)) || c.req.header('sec-fetch-site') === 'same-origin';
+      const ownerAccess = ownerBearer || browser;
       const capability = operator ? runKey(c.req.header('x-fg-run-key'), auth.runKeySalt) : null;
       const owner = await opts.runs?.owner(sandboxRunId);
       if (!ownerAccess && !(capability && (!owner || (owner.principal === 'operator' && owner.actor === capability)))) {
@@ -601,7 +606,7 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
     // A bearer request is an API client, even if it forges browser Fetch Metadata. API_TOKEN is deliberately an
     // agent/read credential; it never inherits the browser owner's authority.
     if (offered) return c.json({ error: 'this Bearer is not an owner credential; use the browser session, FG_OWNER_TOKEN with X-FG-Owner: true, or FG_OPERATOR_TOKEN with an allowed verb' }, 403);
-    if (c.req.header('origin') === undefined || c.req.header('sec-fetch-site') !== 'same-origin') {
+    if (!ownerSession(c, ownerSessions)) {
       log?.('owner decision refused', { method: c.req.method, path: c.req.path, reason: 'missing same-origin browser provenance' });
       return c.json({ error: 'only you can make this decision, from the Feedback Graph UI, or with FG_OPERATOR_TOKEN as a Bearer for the verbs OPERATOR_ALLOW names' }, 403);
     }
@@ -621,8 +626,8 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
       if (mcpDiscoveryOnly(body)) return next();
     }
     const operator = hasOperatorToken(c, auth.operator);
-    const browser = c.req.header('origin') !== undefined;
-    const principal: RunPrincipal = operator ? 'operator' : browser ? 'browser' : auth.token && authenticated(c, auth.token) ? 'owner_token' : 'agent';
+    const browser = ownerSession(c, ownerSessions);
+    const principal: RunPrincipal = operator ? 'operator' : browser ? 'browser' : 'agent';
     if (run && opts.runs && c.req.method !== 'GET' && c.req.method !== 'HEAD') {
       if (principal === 'agent' && /^\/api\/sessions\/[^/]+\/run$/.test(c.req.path)) return c.json({ error: 'labelled session registration requires an authenticated operator with FG_RUN_KEY or the local owner' }, 403);
       const actor = operator ? runKey(c.req.header('x-fg-run-key'), auth.runKeySalt) : null;
@@ -635,8 +640,7 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
         if (sessionPath && sessions?.store.runFor && c.req.method === 'POST') {
           const id = decodeURIComponent(sessionPath[1]);
           const binding = await sessions.store.runFor(id);
-          const existing = await sessions.store.detail(id);
-          if ((binding && (binding.id !== run.id || binding.sandbox !== run.sandbox)) || (existing && !binding)) return c.json({ error: 'session already belongs to the owner or another run; start a new labelled session' }, 409);
+          if (binding && (binding.id !== run.id || binding.sandbox !== run.sandbox)) return c.json({ error: 'session already belongs to the owner or another run; start a new labelled session' }, 409);
         }
         if (lessonPath && !['decisions', 'recheck'].includes(lessonPath[1]) && knowledge && ['PATCH', 'POST'].includes(c.req.method)) {
           const existing = await knowledge.lessonDetail(decodeURIComponent(lessonPath[1]));
@@ -844,16 +848,18 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
   });
 
   const secure = (c: Context) => c.req.header('x-forwarded-proto') === 'https' || new URL(c.req.url).protocol === 'https:';
-  app.get('/api/session', (c) => c.json({ authRequired: !!auth.token, authenticated: authenticated(c, auth.token) }));
+  app.get('/api/session', (c) => c.json({ authRequired: !!auth.token, authenticated: authenticated(c, auth.token, ownerSessions), ownerSession: ownerSession(c, ownerSessions) }));
   app.post('/api/session', async (c) => {
-    if (!auth.token) return c.body(null, 204);
+    if (!auth.token) return c.json({ error: 'API_TOKEN is required to create an owner browser session' }, 403);
     const body = await c.req.json().catch(() => null);
     if (!tokenMatches(body?.token, auth.token)) return c.json({ error: 'wrong token' }, 401);
-    c.header('set-cookie', sessionCookie(auth.token, secure(c)));
+    c.header('set-cookie', sessionCookie(ownerSessions.create(), secure(c)));
     return c.body(null, 204);
   });
   app.delete('/api/session', (c) => {
-    if (auth.token) c.header('set-cookie', sessionCookie(auth.token, secure(c), true));
+    const value = c.req.header('cookie')?.split(';').map(v => v.trim()).find(v => v.startsWith(`${SESSION_COOKIE}=`))?.slice(SESSION_COOKIE.length + 1);
+    ownerSessions.remove(value);
+    c.header('set-cookie', sessionCookie('', secure(c), true));
     return c.body(null, 204);
   });
 
@@ -1560,6 +1566,7 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
     /** A lesson, if it was learned in (or serves) a shown project, or has no project. */
     const shownLesson = async (id: string) => {
       const d = await knowledge.lessonDetail(id);
+      if (d?.lesson.sandbox && (!d.lesson.run || d.lesson.run !== currentRun()?.id)) return null;
       // A why stored before the worker checked it (a model's echoed field name) reads as no reason, not as the word.
       return d && showsLesson(await view(), d.lesson) ? { ...d, contextItems: (d.contextItems ?? []).map((ci) => ({ ...ci, why: contextWhy(ci.why) })) } : null;
     };

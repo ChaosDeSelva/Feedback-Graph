@@ -301,7 +301,7 @@ test('the first labelled write stamps who opened the run: the operator token, th
   await s.app.request('/mcp?run=run-tok', { ...rpc('report_feedback', { cwd: '/Users/j/Vibe/demo', feedback: 'x', what_was_done: 'y' }), headers: { ...rpc('x', {}).headers, authorization: `Bearer ${API}` } });
   const open = setup();
   await open.app.request('/mcp?run=run-agent', rpc('report_feedback', { cwd: '/Users/j/Vibe/demo', feedback: 'x', what_was_done: 'y' }));
-  expect([...s.owners.values()].map((r) => [r.run, r.principal])).toEqual([['run-op', 'operator'], ['run-web', 'browser'], ['run-tok', 'owner_token']]);
+  expect([...s.owners.values()].map((r) => [r.run, r.principal])).toEqual([['run-op', 'operator'], ['run-web', 'browser'], ['run-tok', 'agent']]);
   expect(open.owners.get('run-agent')?.principal).toBe('agent');
   // A read never opens a run.
   await s.app.request('/api/stats', { headers: { 'x-fg-run': 'run-read' } });
@@ -679,16 +679,16 @@ test('labelled415 refuses before reserving a run id', async () => {
   expect(s.owners.has('bad-content-type')).toBe(false);
 });
 
-test('labelled session409 preflight reserves neither run ownership nor a session binding', async () => {
+test('an already-ingested unbound session may be adopted by its labelled run', async () => {
   let claims = 0;
   const s = setup({ extra: { sessions: { projects: () => ['demo'], inScope: () => true, store: {
     list: async () => ({ sessions: [], next: null }), detail: async () => ({ id: 'already', projectKey: 'demo' } as never), requestRebuild: async () => false,
-    runFor: async () => null, claimRun: async () => { claims++; return false; },
+    runFor: async () => null, claimRun: async () => { claims++; return true; },
   } } } });
   const response = await s.app.request('/api/sessions/already/run', json('POST', {}, op('refused-session')));
-  expect(response.status).toBe(409);
-  expect(s.owners.has('refused-session')).toBe(false);
-  expect(claims).toBe(0);
+  expect(response.status).toBe(204);
+  expect(s.owners.has('refused-session')).toBe(true);
+  expect(claims).toBe(1);
 });
 
 
@@ -720,12 +720,12 @@ test('anonymous labelled session registration creates neither owner nor binding'
 });
 
 
-test('tokenless local owner cleanup works with a valid Origin and never grants anonymous or cross-origin cleanup', async () => {
+test('tokenless cleanup is refused even with forged same-origin browser headers', async () => {
   const s = setup({ owners: { legacy: ['operator', 'old-display-name'] } });
   const marker = { 'x-fg-owner-cleanup': 'true' };
   expect((await s.app.request('/api/runs/legacy', json('DELETE', { dryRun: true }, marker))).status).toBe(403);
   expect((await s.app.request('/api/runs/legacy', json('DELETE', { dryRun: true }, { ...marker, origin: 'https://evil.example' }))).status).toBe(403);
-  expect((await s.app.request('/api/runs/legacy', json('DELETE', { dryRun: true }, { ...marker, 'sec-fetch-site': 'same-origin', origin: 'http://localhost' }))).status).toBe(200);
+  expect((await s.app.request('/api/runs/legacy', json('DELETE', { dryRun: true }, { ...marker, 'sec-fetch-site': 'same-origin', origin: 'http://localhost' }))).status).toBe(403);
   expect(s.removed).toEqual([]);
 });
 

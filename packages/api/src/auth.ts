@@ -1,4 +1,4 @@
-import { createHash, timingSafeEqual } from 'node:crypto';
+import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import type { Context } from 'hono';
 import type { OperatorConfig } from '@fb/core';
 
@@ -18,8 +18,25 @@ export type AuthOpts = {
 export const SESSION_COOKIE = 'fg_session';
 const SESSION_MAX_AGE = 30 * 24 * 3600;
 
-/** The cookie holds a digest of the token, never the token itself. */
-export const sessionValue = (token: string) => createHash('sha256').update(`feedback-graph-ui-session:${token}`).digest('hex');
+/** Browser sessions are random server-side capabilities, never a reusable derivation of API_TOKEN. */
+export class OwnerSessions {
+  private readonly sessions = new Map<string, number>();
+  private digest(value: string) { return createHash('sha256').update(`feedback-graph-ui-session:${value}`).digest('hex'); }
+  create(now = Date.now()): string {
+    this.purge(now);
+    const value = randomBytes(32).toString('base64url');
+    this.sessions.set(this.digest(value), now + SESSION_MAX_AGE * 1000);
+    return value;
+  }
+  has(value: string | undefined, now = Date.now()): boolean {
+    if (!value) return false;
+    const key = this.digest(value), expires = this.sessions.get(key);
+    if (!expires || expires <= now) { this.sessions.delete(key); return false; }
+    return true;
+  }
+  remove(value: string | undefined) { if (value) this.sessions.delete(this.digest(value)); }
+  private purge(now: number) { for (const [key, expires] of this.sessions) if (expires <= now) this.sessions.delete(key); }
+}
 
 function same(a: string, b: string): boolean {
   const x = Buffer.from(a);
@@ -35,22 +52,26 @@ function cookie(header: string | undefined, name: string): string | undefined {
   return undefined;
 }
 
-export function authenticated(c: Context, token: string | undefined): boolean {
+export function ownerSession(c: Context, sessions: OwnerSessions): boolean {
+  return sessions.has(cookie(c.req.header('cookie'), SESSION_COOKIE));
+}
+
+export function authenticated(c: Context, token: string | undefined, sessions: OwnerSessions): boolean {
+  if (ownerSession(c, sessions)) return true;
   if (!token) return true;
   const auth = c.req.header('authorization');
   if (auth?.startsWith('Bearer ') && same(auth.slice(7).trim(), token)) return true;
-  const s = cookie(c.req.header('cookie'), SESSION_COOKIE);
-  return s !== undefined && same(s, sessionValue(token));
+  return false;
 }
 
 export function tokenMatches(given: unknown, token: string): boolean {
   return typeof given === 'string' && same(given, token);
 }
 
-export function sessionCookie(token: string, secure: boolean, clear = false): string {
+export function sessionCookie(value: string, secure: boolean, clear = false): string {
   const attrs = ['Path=/', 'HttpOnly', 'SameSite=Strict', `Max-Age=${clear ? 0 : SESSION_MAX_AGE}`];
   if (secure) attrs.push('Secure');
-  return `${SESSION_COOKIE}=${clear ? '' : sessionValue(token)}; ${attrs.join('; ')}`;
+  return `${SESSION_COOKIE}=${clear ? '' : value}; ${attrs.join('; ')}`;
 }
 
 /** Paths anyone may call: liveness, readiness (the container health check; it says only ok and the store kind), and

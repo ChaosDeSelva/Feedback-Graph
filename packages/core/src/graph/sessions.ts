@@ -128,14 +128,15 @@ export class SessionsRepo implements SessionsStore {
         WITH binding OPTIONAL MATCH (s:Session {id: $id})
         RETURN binding.run AS run, binding.sandbox AS sandbox, s IS NOT NULL AS existing`, { id: sessionId });
       const row = result.records[0];
-      if (row.get('run') !== null || row.get('existing')) {
+      if (row.get('run') !== null) {
         const same = row.get('run') === run.id && (row.get('sandbox') === true) === run.sandbox;
         await tx.rollback();
         return same;
       }
       storeTimeLeft();
       await withRunClaimExecutor(this.g, (id, principal, actor) => claimRunOwnerWith(async (query, params) => (await tx.run(query, params)).records, id, principal, actor), authorizeStoreWrite);
-      await tx.run('MATCH (b:SessionRun {sessionId: $id}) SET b.run = $run, b.sandbox = $sandbox', { id: sessionId, run: run.id, sandbox: run.sandbox });
+      await tx.run(`MATCH (b:SessionRun {sessionId: $id}) SET b.run = $run, b.sandbox = $sandbox
+        WITH b OPTIONAL MATCH (s:Session {id: $id}) SET s.run = $run, s.sandbox = $sandbox`, { id: sessionId, run: run.id, sandbox: run.sandbox });
       storeTimeLeft();
       await tx.commit();
       this.g.sandbox.wrote(run);
