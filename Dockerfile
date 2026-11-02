@@ -1,6 +1,6 @@
 # Pinned: Node 26.5 (native TypeScript), pnpm 11.13.1.
 FROM node:26.5.0-slim@sha256:715e55e4b84e4bb0ff48e49b398a848f08e55daed8eb6a0ea1839ae53bc57583 AS build
-ARG PNPM_TGZ_SHA512=b2fc949b77f3f95906440d043c84f0aab8c20e06541875f1b0cc4416bed312f7144eb6f3e1dfa48807fd8d61492aa5f237ababe43c3bed94949a43990f945f25
+ARG PNPM_TGZ_SHA512=b2fc7683b8a6525414e7d13e1ba28caaddde96bf66ec540bfaeb7e702b81f3e0be4d1f295edf7f9fe0396740a8dce4509c582ddf79891f4543fea32d37645f25
 RUN npm pack pnpm@11.13.1 --pack-destination /tmp >/dev/null \
   && echo "$PNPM_TGZ_SHA512  /tmp/pnpm-11.13.1.tgz" | sha512sum -c - \
   && npm install --global /tmp/pnpm-11.13.1.tgz --ignore-scripts --no-audit --no-fund \
