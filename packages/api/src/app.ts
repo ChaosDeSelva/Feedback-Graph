@@ -509,11 +509,7 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
       return c.json({ error: 'the admin MCP endpoint takes FG_OPERATOR_TOKEN as the Bearer: check it against the .env this Feedback Graph runs with' }, 401);
     }
     const operator = hasOperatorToken(c, auth.operator);
-    const ownerRoute = OWNER_ROUTES.some(([method, path]) => method === c.req.method
-      && path.split('/').length === c.req.path.split('/').length
-      && path.split('/').every((part, i) => part.startsWith(':') || part === c.req.path.split('/')[i]));
-    const ownerCredential = !!auth.ownerToken && tokenMatches(bearerOf(c) ?? '', auth.ownerToken)
-      && (c.req.method === 'GET' || c.req.method === 'HEAD' || ownerRoute);
+    const ownerCredential = !!auth.ownerToken && tokenMatches(bearerOf(c) ?? '', auth.ownerToken);
     const ownerBearer = (c.req.header('x-fg-owner') === 'true' || c.req.header('x-fg-owner-cleanup') === 'true') && ownerCredential;
     if (c.req.header('x-fg-owner-cleanup') === 'true') {
       if (auth.ownerToken && !tokenMatches(bearerOf(c) ?? '', auth.ownerToken)) return c.json({ error: 'headless owner cleanup requires the configured FG_OWNER_TOKEN' }, 403);
@@ -521,7 +517,11 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
       if (!auth.ownerToken && c.req.header('sec-fetch-site') !== 'same-origin') return c.json({ error: 'tokenless owner cleanup requires the same-origin browser UI; fg --owner requires FG_OWNER_TOKEN' }, 403);
     }
     if (needsAuth(c.req.path)) {
-      if (!authenticated(c, auth.token, ownerSessions) && !operator && !ownerCredential) return bearerOf(c) ? unrecognised(c) : c.json({ error: 'sign in required' }, 401);
+      if (!authenticated(c, auth.token, ownerSessions) && !operator && !ownerCredential) {
+        if (bearerOf(c)) return unrecognised(c);
+        if (c.req.path === '/mcp') return c.json({ error: 'MCP authentication required; rerun scripts/install-agent.sh so this client uses the current API_TOKEN' }, 401);
+        return c.json({ error: 'sign in required' }, 401);
+      }
       // A bearer that is neither configured token is refused on reads too (an agent with a stale token would otherwise
       // read on and never learn its writes will fail). With no token configured there is nothing to check it against;
       // "Bearer none" is the plugin's placeholder for no token.
@@ -549,15 +549,16 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
     const run = RUN_PATH.test(c.req.path) ? null : label;
     const browser = ownerSession(c, ownerSessions);
     const principal: RunPrincipal = operator ? 'operator' : browser ? 'browser' : ownerBearer ? 'owner_token' : 'agent';
+    const runCapability = (operator || (!!auth.token && tokenMatches(bearerOf(c) ?? '', auth.token)))
+      ? runKey(c.req.header('x-fg-run-key'), auth.runKeySalt) : null;
     // A sandbox run name is an identifier, not a credential. Reads need the same private
     // capability as writes; the owner can inspect runs through the authenticated owner path.
     const sandboxRunId = run?.id ?? (RUN_PATH.test(c.req.path) ? decodeURIComponent(c.req.path.split('/').filter(Boolean).at(-1)!) : c.req.query('run'));
     if (sandboxRunId && (run?.sandbox || await opts.runs?.sandbox?.(sandboxRunId))) {
       const ownerAccess = ownerBearer || browser;
-      const capability = operator ? runKey(c.req.header('x-fg-run-key'), auth.runKeySalt) : null;
       const owner = await opts.runs?.owner(sandboxRunId);
-      if (!ownerAccess && !(capability && (!owner || (owner.principal === 'operator' && owner.actor === capability)))) {
-        return c.json({ error: 'sandbox run access requires its operator token and private FG_RUN_KEY, or the authenticated owner' }, 403);
+      if (!ownerAccess && !(runCapability && (!owner || owner.actor === runCapability))) {
+        return c.json({ error: 'sandbox run access requires API_TOKEN or FG_OPERATOR_TOKEN plus its private FG_RUN_KEY, or the authenticated owner' }, 403);
       }
     }
     // A run id belongs to whoever opened it (its first labelled write): a write under it by anyone else is refused, so
@@ -566,7 +567,7 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
     // Activity says how each write arrived (operator.ts runVia).
     // A run changes only what it wrote, unless the owner opened it (operator.ts mayChange).
     const fromOwner = principal === 'browser' || principal === 'owner_token';
-    await runCaller(operator ? runKey(c.req.header('x-fg-run-key'), auth.runKeySalt) : null, () => runVia(operator ? 'operator' : browser ? 'browser' : 'api', () => runFromOwner(fromOwner, () => runIn(run, next))));
+    await runCaller(runCapability, () => runVia(operator ? 'operator' : browser ? 'browser' : 'api', () => runFromOwner(fromOwner, () => runIn(run, next))));
   });
 
   // Every body has a size limit, checked before anything reads it (the Content-Length, else counted as it arrives):
@@ -594,6 +595,12 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
       if (!allowed.has(verb)) return c.json(refusedVerb(verb), 403);
       return runAs(operatorName(c.req.header('x-fg-operator')), next);
     }
+    // The bundled demo is deliberately local-only and disposable. Let an authenticated sandbox run prepare/remove
+    // only that fixture without handing the probed agent an operator credential. The private run key binds every
+    // resulting write and cleanup to this one labelled probe; all real project and lesson decisions remain owner-only.
+    const run = currentRun();
+    if (verb === 'demo' && run?.sandbox && auth.token && tokenMatches(bearerOf(c) ?? '', auth.token)
+      && runKey(c.req.header('x-fg-run-key'), auth.runKeySalt)) return next();
     if ((c.req.header('x-fg-owner') === 'true' || c.req.header('x-fg-owner-cleanup') === 'true') && auth.ownerToken && tokenMatches(bearerOf(c) ?? '', auth.ownerToken)) {
       log?.('owner token decision', { method: c.req.method, path: c.req.path });
       return next();
@@ -627,10 +634,14 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
     }
     const operator = hasOperatorToken(c, auth.operator);
     const browser = ownerSession(c, ownerSessions);
-    const principal: RunPrincipal = operator ? 'operator' : browser ? 'browser' : 'agent';
+    const ownerBearer = (c.req.header('x-fg-owner') === 'true' || c.req.header('x-fg-owner-cleanup') === 'true')
+      && !!auth.ownerToken && tokenMatches(bearerOf(c) ?? '', auth.ownerToken);
+    const principal: RunPrincipal = operator ? 'operator' : browser ? 'browser' : ownerBearer ? 'owner_token' : 'agent';
     if (run && opts.runs && c.req.method !== 'GET' && c.req.method !== 'HEAD') {
+      const sessionRegistration = /^\/api\/sessions\/[^/]+\/run$/.test(c.req.path) && c.req.method === 'POST';
       if (principal === 'agent' && /^\/api\/sessions\/[^/]+\/run$/.test(c.req.path)) return c.json({ error: 'labelled session registration requires an authenticated operator with FG_RUN_KEY or the local owner' }, 403);
-      const actor = operator ? runKey(c.req.header('x-fg-run-key'), auth.runKeySalt) : null;
+      const agent = !!auth.token && tokenMatches(bearerOf(c) ?? '', auth.token);
+      const actor = (operator || agent) ? runKey(c.req.header('x-fg-run-key'), auth.runKeySalt) : null;
       if (operator && !actor) return c.json({ error: 'labelled operator writes require X-FG-Run-Key (FG_RUN_KEY): a private random secret of at least 32 characters with adequate diversity (generate: openssl rand -hex 32)' }, 403);
       // Refused attempts to edit an owner's existing record must not reserve an otherwise unused run id.
       if (!(await opts.runs.owner(run.id)) && !mayChangeAny()) {
@@ -667,6 +678,10 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
         const error = `run id belongs to another caller: ${run.id} was opened by ${openerOf(existing)} at ${existing.firstSeen}; label this one with a run id of its own`;
         return mcp ? c.json({ jsonrpc: '2.0', id: null, error: { code: -32600, message: error } }, 409) : c.json({ error }, 409);
       }
+      // Registration itself is the run claim. Session binding is not one of the guarded graph repositories, so do
+      // this explicitly after its binding/conflict checks; otherwise a successfully adopted Codex rollout would be
+      // bound to the label while the run id remained available to another caller.
+      if (sessionRegistration) await claim();
       await withStoreWriteAuthorizer(claim, next);
       // The SDK turns handler exceptions into tool errors; retain the ownership conflict's HTTP/JSON-RPC contract.
       if (conflict) c.res = mcp ? c.json({ jsonrpc: '2.0', id: null, error: { code: -32600, message: conflict } }, 409) : c.json({ error: conflict }, 409);
@@ -691,6 +706,7 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
     const ollama = system?.ollama ? await system.ollama().catch(() => null) : null;
     const runner = system?.runner ? await system.runner().catch(() => ({ ok: false, reason: 'codex runner health check failed' })) : null;
     const workerHealthy = !!worker && Date.now() - Date.parse(worker.lastBeat) < WORKER_STALE_MS;
+    const models = worker ? modelHealth(worker, ollama, runner) : null;
     const s: SystemStatus = {
       version: system?.version ?? 'dev',
       store: system?.store ?? null,
@@ -702,10 +718,10 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
       judge: context?.judgeId ?? null,
       selection: sel && { initialized: sel.initialized, tracked: sel.tracked.length, ...(system?.roots === undefined ? {} : { roots: system.roots }), note: selectionNote(sel, system?.roots) },
       cloud: cloudStatus(cloud?.cloud ?? null, cloudState),
-      models: worker ? modelHealth(worker, ollama, runner) : null,
+      models,
       givenUpTurns,
       ollama,
-      connections: await connectionsStatus({ integrations: graph ? (integrations?.integrations ?? null) : null, deps: integrations, worker, ollama, cloud: cloud?.cloud ?? null, manualSync: cloudState?.lastManual() ?? null }).catch(() => null),
+      connections: await connectionsStatus({ integrations: graph ? (integrations?.integrations ?? null) : null, deps: integrations, worker, models, ollama, cloud: cloud?.cloud ?? null, manualSync: cloudState?.lastManual() ?? null }).catch(() => null),
     };
     return c.json(s);
   });
@@ -848,11 +864,11 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
   });
 
   const secure = (c: Context) => c.req.header('x-forwarded-proto') === 'https' || new URL(c.req.url).protocol === 'https:';
-  app.get('/api/session', (c) => c.json({ authRequired: !!auth.token, authenticated: authenticated(c, auth.token, ownerSessions), ownerSession: ownerSession(c, ownerSessions) }));
+  app.get('/api/session', (c) => c.json({ authRequired: !!auth.ownerToken, authenticated: ownerSession(c, ownerSessions), ownerSession: ownerSession(c, ownerSessions) }));
   app.post('/api/session', async (c) => {
-    if (!auth.token) return c.json({ error: 'API_TOKEN is required to create an owner browser session' }, 403);
+    if (!auth.ownerToken) return c.json({ error: 'FG_OWNER_TOKEN is required to create an owner browser session; run setup to create one' }, 403);
     const body = await c.req.json().catch(() => null);
-    if (!tokenMatches(body?.token, auth.token)) return c.json({ error: 'wrong token' }, 401);
+    if (!tokenMatches(body?.token, auth.ownerToken)) return c.json({ error: 'wrong owner token' }, 401);
     c.header('set-cookie', sessionCookie(ownerSessions.create(), secure(c)));
     return c.body(null, 204);
   });

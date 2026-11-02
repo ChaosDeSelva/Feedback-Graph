@@ -197,7 +197,7 @@ describe('buildChatContext', () => {
     const pack = await buildChatContext('demo-shop', 'how do I add a modal in src/ui/Modal.tsx?', [], { ...d, sessionFiles });
     const miss = pack.sources.find((s) => s.kind === 'miss')!;
     expect(miss.ref).toBe('src/ui/Dialog.tsx');
-    expect(pack.context).toMatch(/\[S2\] built a second modal from scratch \(cause: context_available_ignored\) · in `src\/ui\/Dialog\.tsx`/);
+    expect(pack.context).toMatch(/\[S1\] built a second modal from scratch \(cause: context_available_ignored\) · in `src\/ui\/Dialog\.tsx`/);
     // A failing lookup leaves the id.
     const failed = await buildChatContext('demo-shop', 'how do I add a modal in src/ui/Modal.tsx?', [], { ...d, sessionFiles: async () => { throw new Error('db down'); } });
     expect(failed.sources.find((s) => s.kind === 'miss')!.ref).toBe('miss:1');
@@ -215,6 +215,7 @@ describe('buildChatContext', () => {
 // ── Routes ─────────────────────────────────────────────────────────────
 
 const repo = { listCandidates: async () => [], candidateDetail: async () => null, decide: async () => {}, stats: async () => [] } as unknown as ApiRepo;
+const OWNER = 'owner-test-token-01234567890123456789';
 
 /** An in-memory ChatStore with the semantics of the real ones (for the routes). */
 function fakeStore() {
@@ -286,9 +287,9 @@ const app = (o: { operator?: string[] } = {}) =>
         return { context: `pack for ${question}`, sources: [{ id: 'S1', kind: 'code', ref: 'src/ui/Modal.tsx:1-9', title: 'Modal' }] };
       },
     },
-    ...(o.operator ? { auth: { operator: { token: 'o'.repeat(32), allow: o.operator as never } } } : {}),
+    auth: { ownerToken: OWNER, ...(o.operator ? { operator: { token: 'o'.repeat(32), allow: o.operator as never } } : {}) },
   });
-const UI = { 'content-type': 'application/json', 'sec-fetch-site': 'same-origin', origin: 'http://localhost' };
+const UI = { 'content-type': 'application/json', authorization: `Bearer ${OWNER}`, 'x-fg-owner': 'true' };
 const send = (method: string, body?: unknown, headers: Record<string, string> = UI) => ({ method, headers, ...(body === undefined ? {} : { body: JSON.stringify(body) }) });
 
 describe('chatPackBuilder', () => {

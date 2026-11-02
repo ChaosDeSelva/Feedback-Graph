@@ -5,13 +5,14 @@ import { runKey } from './operator.ts';
 import type { ContextDeps } from './context.ts';
 
 const OP = 'o'.repeat(32);
+const OWNER = 'z'.repeat(48);
 const KEY = 'c2ad856fb97403e18a2e7dc9015b6f438670dcaeb3219a845f0d7c8b6e109234';
 const CALLER = runKey(KEY)!;
 const json = (method: string, body: object, headers: Record<string, string> = {}) => ({
   method, body: JSON.stringify(body), headers: { 'content-type': 'application/json', ...headers },
 });
 const op = (run?: string, more: Record<string, string> = {}) => ({ authorization: `Bearer ${OP}`, 'x-fg-operator': 'tester', 'x-fg-run-key': KEY, ...(run && { 'x-fg-run': run }), ...more });
-const browser = { 'sec-fetch-site': 'same-origin', origin: 'http://localhost' };
+const browser = { authorization: `Bearer ${OWNER}`, 'x-fg-owner': 'true' };
 
 const lesson = (id: string, o: Partial<Lesson> = {}): Lesson => ({
   id, projectKey: 'demo', title: `Lesson ${id}`, rule: 'R', appliesWhen: 'W', scope: 'project', paths: ['src/**'], status: 'approved',
@@ -24,7 +25,7 @@ const entry = (o: Partial<Activity>): Activity => ({
 
 const API = 'a'.repeat(32);
 
-function setup(o: { allow?: OperatorVerb[]; items?: RunItem[]; entries?: Activity[]; extra?: Partial<AppOpts>; ctx?: Partial<ContextDeps>; owners?: Record<string, RunPrincipal | [RunPrincipal, string | null]>; token?: string; ownerToken?: string; sandbox?: boolean } = {}) {
+function setup(o: { allow?: OperatorVerb[]; items?: RunItem[]; entries?: Activity[]; extra?: Partial<AppOpts>; ctx?: Partial<ContextDeps>; owners?: Record<string, RunPrincipal | [RunPrincipal, string | null]>; token?: string; ownerToken?: string | null; sandbox?: boolean } = {}) {
   const logged: ActivityInput[] = [];
   const listed: unknown[] = [];
   const reports: unknown[] = [];
@@ -57,7 +58,7 @@ function setup(o: { allow?: OperatorVerb[]; items?: RunItem[]; entries?: Activit
     ...o.ctx,
   };
   const app = createApp(repo, {
-    auth: { ...(o.token && { token: o.token }), ...(o.ownerToken && { ownerToken: o.ownerToken }), operator: { token: OP, allow: o.allow ?? [...OPERATOR_VERBS] } },
+    auth: { ...(o.token && { token: o.token }), ...(o.ownerToken !== null && { ownerToken: o.ownerToken ?? OWNER }), operator: { token: OP, allow: o.allow ?? [...OPERATOR_VERBS] } },
     activity: {
       record: async (e) => { logged.push(e); },
       list: async (q) => {
@@ -295,9 +296,9 @@ test("the operator token may clean up by default, only its own run; a plain clie
 test('the first labelled write stamps who opened the run: the operator token, the API token, the browser or an agent', async () => {
   const s = setup({ token: API });
   await s.app.request('/api/candidates/r:run-op/decision', json('POST', { status: 'confirmed' }, op('run-op')));
-  const login = await s.app.request('/api/session', json('POST', { token: API }, browser));
+  const login = await s.app.request('/api/session', json('POST', { token: OWNER }, { 'sec-fetch-site': 'same-origin', origin: 'http://localhost' }));
   const cookie = login.headers.get('set-cookie')!.split(';')[0];
-  await s.app.request('/api/candidates/c1/decision', json('POST', { status: 'confirmed' }, { ...browser, cookie, 'x-fg-run': 'run-web' }));
+  await s.app.request('/api/candidates/c1/decision', json('POST', { status: 'confirmed' }, { cookie, 'x-fg-run': 'run-web' }));
   await s.app.request('/mcp?run=run-tok', { ...rpc('report_feedback', { cwd: '/Users/j/Vibe/demo', feedback: 'x', what_was_done: 'y' }), headers: { ...rpc('x', {}).headers, authorization: `Bearer ${API}` } });
   const open = setup();
   await open.app.request('/mcp?run=run-agent', rpc('report_feedback', { cwd: '/Users/j/Vibe/demo', feedback: 'x', what_was_done: 'y' }));
@@ -527,7 +528,7 @@ test("an upload in a run says whether the owner opened it (byOwner); a store's r
   expect(got.docs[0]).toMatchObject({ run: { id: 'run-1', sandbox: false } });
   expect((got.docs[0] as { byOwner?: boolean }).byOwner).toBeFalsy();
 
-  const owner = owned({ owners: { 'run-1': 'browser' } });
+  const owner = owned({ owners: { 'run-1': 'owner_token' } });
   expect((await owner.app.request('/api/projects/demo/docs', json('POST', body, { ...browser, ...RUN }))).status).toBe(201);
   expect(owner.got.docs[0]).toMatchObject({ run: { id: 'run-1', sandbox: false }, byOwner: true });
 
@@ -591,11 +592,11 @@ test("a run never pins, decides on, converts or talks in the owner's records (40
   expect((await app.request('/api/chats/chat:mine', json('PATCH', { title: 'x' }, op(undefined, RUN)))).status).toBe(200);
 
   // The owner, in a run the browser opened (not a sandbox): theirs to change.
-  const owner = owned({ owners: { 'run-1': 'browser' } });
+  const owner = owned({ owners: { 'run-1': 'owner_token' } });
   expect((await owner.app.request('/api/projects/demo/pin', json('PUT', { pinned: true }, { ...browser, ...RUN }))).status).toBe(204);
   expect((await owner.app.request('/api/lessons/owner', json('PATCH', { status: 'approved' }, { ...browser, ...RUN }))).status).toBe(200);
   // A sandbox run, even the owner's, never changes the owner's records.
-  const sbx = owned({ owners: { 'run-1': 'browser' } });
+  const sbx = owned({ owners: { 'run-1': 'owner_token' } });
   expect((await sbx.app.request('/api/projects/demo/pin', json('PUT', { pinned: true }, { ...browser, ...SANDBOX }))).status).toBe(409);
 });
 

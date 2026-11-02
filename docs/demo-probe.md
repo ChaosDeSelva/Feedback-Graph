@@ -43,7 +43,7 @@ For a tokenless installation, restore the saved membership through the actual ow
 If worker discovery has not yet listed the new folder, configuration stops before changing privacy or selection. Wait for the discovery pass, verify that `demo-shop` is selectable in Settings, and rerun the same command. Existing prepared files are preserved. Token-authenticated owner requests also send the matching Origin required by the owner API.
 
 
-Claude Code uses `FEEDBACK_GRAPH_TOKEN` for the MCP/Stop hooks. Set it to the existing operator token alongside `FG_RUN`, `FG_RUN_KEY` and `FG_SANDBOX=1`; `FG_OPERATOR_TOKEN` is what the `fg` CLI uses. Do not put tokens into prompts or fixture files.
+Claude Code uses `FEEDBACK_GRAPH_TOKEN` for the MCP/Stop hooks. Set it to this install's `API_TOKEN` alongside a private random `FG_RUN_KEY`, `FG_RUN` and `FG_SANDBOX=1`. The API token plus that sandbox run capability may prepare and remove only the bundled local-only demo fixture; it cannot approve lessons or mutate real projects. Do not give the probe `FG_OWNER_TOKEN` or `FG_OPERATOR_TOKEN`, and never put tokens into prompts or fixture files.
 
 Codex strips sensitive environment names unless explicitly passed through. Start the isolated session with these shell-environment settings and permit network access for the loopback API:
 
@@ -51,10 +51,10 @@ Codex strips sensitive environment names unless explicitly passed through. Start
 codex -c 'shell_environment_policy.inherit="all"' \
   -c 'shell_environment_policy.ignore_default_excludes=true' \
   -c 'sandbox_workspace_write.network_access=true' \
-  -c 'mcp_servers.feedback-graph.bearer_token_env_var="FG_OPERATOR_TOKEN"' \
+  -c 'mcp_servers.feedback-graph.bearer_token_env_var="FEEDBACK_GRAPH_TOKEN"' \
   -s workspace-write
 ```
 
-These settings are for the dedicated probe invocation; they are not global defaults. Preserve the same `FG_RUN_KEY` for registration, MCP requests and cleanup. `OPERATOR_ALLOW` must include `demo` (or `lesson_decide`) to seed/remove the dedicated demo corpus; it does not grant general lesson decisions.
+These settings are for the dedicated probe invocation; they are not global defaults. Preserve the same `FG_RUN_KEY` for registration, MCP requests and cleanup. No operator permission is needed for the bundled demo: the authenticated sandbox run and its private run key scope preparation, testing and cleanup to that local-only fixture.
 
 Cloud preview works before selection: `fg cloud status --project demo-shop --json` (or `GET /api/cloud?project=demo-shop`) reports why the unselected/local-only project will not be sent, without selecting it. Deselected code-map data has a 24-hour grace period; derived map fields are purged in bounded worker passes. Facts and real transcript evidence remain until their run cleanup or explicit data removal.

@@ -804,6 +804,16 @@ describe('check_before_done: the judge says whether each lesson or miss applies'
   const noneApproved = { ...deps().k, searchLessons: async () => [], listLessons: async (f: { status?: string }) => (f.status === 'proposed' ? proposed(141) : []) } as ContextDeps['k'];
   const fourMisses = async () => ['cold start verify', 'input capping', 'router history desync', 'asset prefixes'].map((missed, i) => ({ missId: `m${i}`, missed, cause: 'requirement_unstated' as const, feedbackText: 'x', sessionId: 's', ts: '2026-10-01T10:00:00Z', score: 0.8 }));
 
+  test('the completion judge is capped at the two strongest pathless misses', async () => {
+    const judged: string[][] = [];
+    const d = deps({
+      k: { ...noneApproved, relatedMisses: fourMisses },
+      judge: async (_w, ls) => { judged.push(ls.map((h) => h.lesson.id)); return ls.map((h) => ({ lessonId: h.lesson.id, status: 'not_applicable' as const, why: 'different work' })); },
+    });
+    await checkBeforeDone({ project: 'demo', task: 'markdown custom tags', summary: 'paired the self-closing tags' }, d);
+    expect(judged).toEqual([['m0', 'm1']]);
+  });
+
   test('misses the judge says do not apply are never printed, and the answer says plainly it is not a pass', async () => {
     const d = deps({
       k: { ...noneApproved, relatedMisses: fourMisses },

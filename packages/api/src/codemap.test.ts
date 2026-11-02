@@ -307,6 +307,7 @@ test('check_before_done without files_changed asks the code map nothing', async 
 // ── MCP ─────────────────────────────────────────────────────────────────
 
 const repo = { listCandidates: async () => [], candidateDetail: async () => null, decide: async () => {}, stats: async () => [] } as unknown as ApiRepo;
+const OWNER = 'owner-test-token-01234567890123456789';
 const rpc = (body: object) => ({
   method: 'POST',
   headers: { 'content-type': 'application/json', accept: 'application/json, text/event-stream' },
@@ -346,6 +347,7 @@ function restApp(over: Record<string, unknown> = {}, opts: Record<string, unknow
     ...over,
   };
   const app = createApp(repo, {
+    auth: { ownerToken: OWNER },
     codegraph: store,
     projectDirs: async () => [{ key: 'demo', name: 'demo', repoPath: '/vibe/demo' }, { key: 'beta', name: 'beta', repoPath: '/vibe/beta' }],
     ...opts,
@@ -396,7 +398,7 @@ test('hotspots can list a whole map: the limit goes up to the map cap', async ()
 test('POST /api/projects/:key/codemap/rebuild asks the worker for a fresh map; only you (or an operator allowed to scan) may', async () => {
   const { app, asked } = restApp();
   const json = { 'content-type': 'application/json' };
-  const post = (key: string, headers: Record<string, string> = { 'sec-fetch-site': 'same-origin', origin: 'http://localhost' }) =>
+  const post = (key: string, headers: Record<string, string> = { authorization: `Bearer ${OWNER}`, 'x-fg-owner': 'true' }) =>
     app.request(`/api/projects/${key}/codemap/rebuild`, { method: 'POST', headers: { ...json, ...headers }, body: '{}' });
   expect((await post('demo', {})).status).toBe(403);
   expect(asked).toEqual([]);

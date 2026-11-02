@@ -18,7 +18,7 @@ cd "$here"
 usage() {
   cat <<'EOF'
 usage: ./scripts/setup.sh [--yes] [--pull-models] [--projects <dirs>] [--select <keys>] [--github-token-file <file>]
-                          [--linear-key-file <file>] [--claude-token-file <file>] [--runner-procfs-compat]
+                          [--linear-key-file <file>] [--claude-token-file <file>] [--runner-procfs-compat] [--small]
 
 Write .env, mount the project folders, check Ollama (including structured output) and offer to start the stack.
 In a terminal it asks; these answer without one:
@@ -29,6 +29,7 @@ In a terminal it asks; these answer without one:
   --pull-models              pull missing Ollama models (and nothing else unasked)
   --runner-procfs-compat     explicitly offer a runner-only Docker masked-path exception for nested procfs
                              (security tradeoff printed before confirmation; --yes alone never enables it)
+  --small                    use the checked-in 1.5 GiB Neo4j profile before the first start
   --projects <dirs>          the project folders, comma-separated (same as PROJECTS_DIRS=<dirs>)
   --select <keys>            the projects to read: folder names under the project folders, comma-separated
                              (acme,demo-shop). Written to .env as INGEST_PROJECTS, which seeds the selection on the next
@@ -50,7 +51,7 @@ first install's skill links and Codex guidance as they are.
 EOF
 }
 
-yes=0 skip_agents=0 no_transcripts=0 pull_models=0 runner_procfs_compat=0 github_file="" linear_file="" claude_file="" select_raw="" select_given=0
+yes=0 skip_agents=0 no_transcripts=0 pull_models=0 runner_procfs_compat=0 small=0 github_file="" linear_file="" claude_file="" select_raw="" select_given=0
 while [ $# -gt 0 ]; do
   case "$1" in
     -h | --help) usage; exit 0 ;;
@@ -59,6 +60,7 @@ while [ $# -gt 0 ]; do
     --skip-agents) skip_agents=1 ;;
     --no-transcripts) no_transcripts=1 ;;
     --runner-procfs-compat) runner_procfs_compat=1 ;;
+    --small) small=1 ;;
     --projects | --select | --github-token-file | --linear-key-file | --claude-token-file)
       [ $# -ge 2 ] && [ -n "$2" ] || { echo "$1 needs a value" >&2; usage >&2; exit 1; }
       case "$1" in
@@ -436,6 +438,17 @@ else
   echo "mounted ${#dirs[@]} project folder$([ ${#dirs[@]} -eq 1 ] || echo s) ($override)"
 fi
 
+# Select the constrained memory profile before the first `docker compose up`; this avoids briefly starting Neo4j with
+# the 3 GiB default on small hosts. Preserve generated mounts and any explicitly configured compose files.
+if [ "$small" = 1 ]; then
+  files="$(envval COMPOSE_FILE)"
+  [ -n "$files" ] || files='docker-compose.yml:docker-compose.override.yml'
+  case ":$files:" in *":docker-compose.small.yml:"*) ;; *) files="$files:docker-compose.small.yml" ;; esac
+  setenv COMPOSE_FILE "$files"
+  export COMPOSE_FILE="$files"
+  echo 'Small profile selected: Neo4j will start with the 1.5 GiB budget in docker-compose.small.yml.'
+fi
+
 # Security compatibility is separate from the regenerated project mounts and never implied by --yes.
 if [ "$runner_procfs_compat" = 1 ]; then
   echo 'Runner procfs compatibility relaxes Docker masked/read-only system paths for codex-runner only (systempaths=unconfined).'
@@ -561,7 +574,16 @@ fi
 if [ -z "$(envval API_TOKEN)" ] &&
   confirm "Create an API token (recommended: the only owner boundary against other local processes)? [Y/n]" y; then
   setenv API_TOKEN "$(openssl rand -hex 24)"
-  echo "API_TOKEN saved to .env (not printed). The UI will ask you to sign in with that value; agents receive it for read/tool access, but it cannot make owner decisions."
+  echo "API_TOKEN saved to .env (not printed). Agents receive it for read/tool access; it cannot create a browser owner session or make owner decisions."
+fi
+
+# Browser owner sessions are minted only from this separate credential. Agents receive API_TOKEN, never this value;
+# keeping them distinct makes the agent token safe for ordinary MCP/CLI reads without granting lesson decisions,
+# project selection, demo seeding or access to another run's sandbox records.
+if [ -z "$(envval FG_OWNER_TOKEN)" ] &&
+  confirm "Create a separate owner sign-in token for the browser UI? [Y/n]" y; then
+  setenv FG_OWNER_TOKEN "$(openssl rand -hex 24)"
+  echo "FG_OWNER_TOKEN saved to .env (not printed). Use this value to sign in to the UI; never give it to agents."
 fi
 
 # The operator token lets an agent or ./scripts/fg make the owner decisions OPERATOR_ALLOW names (by default not

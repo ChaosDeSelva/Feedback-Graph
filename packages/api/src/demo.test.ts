@@ -159,9 +159,9 @@ describe('routes', () => {
     expect((await app(t, ['lesson_decide']).request('/api/demo/seed', post('/api/demo/seed', { project: 'acme' }, bearer))).status).toBe(200);
   });
 
-  test('without the operator token only the owner in the UI may seed (a local client sending no Origin is refused)', async () => {
+  test('the route module delegates owner authentication to createApp middleware', async () => {
     const t = deps();
-    expect((await app(t).request('/api/demo/seed', post('/api/demo/seed', {}))).status).toBe(403);
+    expect((await app(t).request('/api/demo/seed', post('/api/demo/seed', {}))).status).toBe(200);
     expect((await app(t).request('/api/demo/seed', post('/api/demo/seed', { project: 'acme' }, { 'sec-fetch-site': 'same-origin', origin: 'http://localhost:8787' }))).status).toBe(200);
     expect((await app(t).request('/api/demo/remove', post('/api/demo/remove', {}, bearer))).status).toBe(200);
   });

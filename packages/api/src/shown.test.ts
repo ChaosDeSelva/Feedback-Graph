@@ -19,7 +19,8 @@ const lesson = (id: string, projectKey: string | null, origin: string | null): L
   status: 'approved', source: 'postmortem', cause: null, missId: null, createdAt: 't', decidedAt: null,
 });
 const summary = (key: string, aliases: string[] = []): ProjectSummary => ({ key, repoPath: `/vibe/${key}`, remote: null, aliases, sessions: 1, feedback: 1, lessons: 0, facts: 0, lastScan: null, pinned: false });
-const json = (method: string, body: object) => ({ method, headers: { 'content-type': 'application/json', 'sec-fetch-site': 'same-origin', origin: 'http://localhost' }, body: JSON.stringify(body) });
+const OWNER = 'owner-test-token-01234567890123456789';
+const json = (method: string, body: object) => ({ method, headers: { 'content-type': 'application/json', authorization: `Bearer ${OWNER}`, 'x-fg-owner': 'true' }, body: JSON.stringify(body) });
 
 const LESSONS = [lesson('lesson:shop', 'shop', 'shop'), lesson('lesson:old-global', null, 'old'), lesson('lesson:old', 'old', 'old'), lesson('memory:any', null, null)];
 
@@ -41,6 +42,7 @@ function setup(shown = SELECTED, over: Partial<AppOpts> = {}) {
   };
   const module = (key: string, path: string) => ({ file: { path }, symbols: [], imports: [], importers: [], tests: [], facts: [], misses: [], lessons: LESSONS }) as never;
   const app = createApp(repo, {
+    auth: { ownerToken: OWNER },
     shown: async () => shown,
     facts: {
       listProjects: async () => [summary('old'), summary('shop', ['shop-2'])],

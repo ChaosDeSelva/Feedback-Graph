@@ -79,9 +79,6 @@ export class CodeGraphRepo implements CodeGraphStore {
     const key = projectKey;
     const now = new Date().toISOString();
     const files = map.files.map((f) => ({ ...f, churnCommits: map.churn[f.path]?.commits ?? null, churnLastTs: map.churn[f.path]?.lastTs ?? null }));
-    const mapped = files.map((f) => f.path);
-    const outsidePaths = map.outside.map((f) => f.path);
-    const paths = [...mapped, ...outsidePaths];
     const [storedSymbols, storedImports] = await Promise.all([
       this.g.run('MATCH (s:Symbol {projectKey: $key}) RETURN s', { key }),
       this.g.run(
@@ -118,27 +115,6 @@ export class CodeGraphRepo implements CodeGraphStore {
         `MATCH (s:Symbol {projectKey: $key}) WHERE s.path IN $paths DETACH DELETE s`,
         { key, paths: part },
       ]),
-      [
-        `MATCH (cf:CodeFile {projectKey: $key}) WHERE cf.inMap = true AND NOT cf.path IN $paths
-         SET cf.inMap = false
-         REMOVE cf.lang, cf.codeHash, cf.loc, cf.isTest, cf.churnCommits, cf.churnLastTs, cf.mappedAt`,
-        { key, paths: mapped },
-      ],
-      [
-        `MATCH (cf:CodeFile {projectKey: $key}) WHERE cf.inIndex = true AND NOT cf.path IN $paths
-         REMOVE cf.inIndex
-         WITH cf WHERE coalesce(cf.inMap, false) = false
-         REMOVE cf.lang, cf.codeHash, cf.loc, cf.isTest, cf.mappedAt`,
-        { key, paths: outsidePaths },
-      ],
-      // A file that left the map and that nothing else refers to (never scanned, no fact about it, no session touched
-      // it) goes: its symbols and edges are gone already, only its IN edge is left.
-      [
-        `MATCH (cf:CodeFile {projectKey: $key}) WHERE coalesce(cf.inMap, false) = false AND NOT cf.path IN $paths AND cf.hash IS NULL
-           AND COUNT { (cf)-[r]-() WHERE type(r) <> 'IN' } = 0
-         DETACH DELETE cf`,
-        { key, paths },
-      ],
       ...slices(files).map((part): [string, Props] => [
         `MERGE (p:Project {key: $key})
          WITH p
@@ -147,6 +123,7 @@ export class CodeGraphRepo implements CodeGraphStore {
              ON CREATE SET cf.projectKey = $key, cf.path = f.path, cf.removed = false
            SET cf.inMap = true, cf.lang = f.lang, cf.codeHash = f.hash, cf.loc = f.loc, cf.isTest = f.isTest,
                cf.churnCommits = f.churnCommits, cf.churnLastTs = f.churnLastTs, cf.mappedAt = $now
+          REMOVE cf.mapUnselectedAt
            REMOVE cf.inIndex
            MERGE (cf)-[:IN]->(p)`,
         { key, files: part, now },
@@ -159,10 +136,36 @@ export class CodeGraphRepo implements CodeGraphStore {
              ON CREATE SET cf.projectKey = $key, cf.path = f.path, cf.removed = false
            SET cf.inMap = false, cf.inIndex = true, cf.lang = f.lang, cf.codeHash = f.hash, cf.loc = f.loc, cf.isTest = f.isTest,
                cf.mappedAt = $now
+          REMOVE cf.mapUnselectedAt
            REMOVE cf.churnCommits, cf.churnLastTs
            MERGE (cf)-[:IN]->(p)`,
         { key, files: part, now },
       ]),
+      // Use this build's timestamp as a generation marker. Passing every path to `NOT IN $paths` made one large
+      // parameter retain the whole map inside a transaction and exhausted Neo4j's per-transaction memory on large
+      // repositories. All current rows were stamped in the sliced writes immediately above, so stale rows need no
+      // path list at all.
+      [
+        `MATCH (cf:CodeFile {projectKey: $key}) WHERE cf.inMap = true AND cf.mappedAt <> $now
+         SET cf.inMap = false
+         REMOVE cf.lang, cf.codeHash, cf.loc, cf.isTest, cf.churnCommits, cf.churnLastTs, cf.mappedAt`,
+        { key, now },
+      ],
+      [
+        `MATCH (cf:CodeFile {projectKey: $key}) WHERE cf.inIndex = true AND cf.mappedAt <> $now
+         REMOVE cf.inIndex
+         WITH cf WHERE coalesce(cf.inMap, false) = false
+         REMOVE cf.lang, cf.codeHash, cf.loc, cf.isTest, cf.mappedAt`,
+        { key, now },
+      ],
+      // A file that left the map and that nothing else refers to (never scanned, no fact about it, no session touched
+      // it) goes: its symbols and edges are gone already, only its IN edge is left.
+      [
+        `MATCH (cf:CodeFile {projectKey: $key}) WHERE coalesce(cf.inMap, false) = false AND cf.hash IS NULL
+           AND COUNT { (cf)-[r]-() WHERE type(r) <> 'IN' } = 0
+         DETACH DELETE cf`,
+        { key },
+      ],
       ...slices(diff.symbols).map((part): [string, Props] => [
         `UNWIND $symbols AS s
            MATCH (cf:CodeFile {id: $key + ':' + s.path})
@@ -212,7 +215,7 @@ export class CodeGraphRepo implements CodeGraphStore {
     // metadata until the last batch so a subsequent retention pass resumes unfinished work.
     const batch = neo4j.int(Math.min(250, Math.floor(limit)));
     const selectedMap = `MATCH (s:ProjectSelection {id: 'selection'}), (m:CodeMap)
-      WHERE s.initialized = true AND s.updatedAt < $cutoff AND NOT m.projectKey IN s.tracked
+      WHERE s.initialized = true AND coalesce(m.unselectedAt, s.updatedAt) < $cutoff AND NOT m.projectKey IN s.tracked
       WITH m ORDER BY m.projectKey LIMIT 1`;
     await this.g.runInTransaction([
       [`MATCH (s:ProjectSelection {id: 'selection'}) SET s.mapPurgeLock = true REMOVE s.mapPurgeLock`, {}],
@@ -223,7 +226,8 @@ export class CodeGraphRepo implements CodeGraphStore {
         WITH r LIMIT $batch DELETE r`, { cutoff, batch }],
       [`${selectedMap} MATCH (cf:CodeFile {projectKey: m.projectKey})
         WHERE coalesce(cf.inMap, false) OR coalesce(cf.inIndex, false) OR cf.codeHash IS NOT NULL
-        WITH cf LIMIT $batch SET cf.inMap = false, cf.inIndex = false
+        WITH cf, m LIMIT $batch SET cf.inMap = false, cf.inIndex = false,
+          cf.mapUnselectedAt = coalesce(m.unselectedAt, $now)
         REMOVE cf.lang, cf.codeHash, cf.loc, cf.isTest, cf.churnCommits, cf.churnLastTs, cf.mappedAt`, { cutoff, batch }],
       [`${selectedMap} MATCH (module:Module {projectKey: m.projectKey})
         WHERE NOT EXISTS { ()-[:IMPORTS]->(module) }
@@ -243,7 +247,8 @@ export class CodeGraphRepo implements CodeGraphStore {
       `MATCH (cf:CodeFile) WHERE coalesce(cf.inMap, false) = false AND coalesce(cf.inIndex, false) = false
          AND (cf.removed = true OR cf.hash IS NULL OR NOT EXISTS { (cf)-[:IN]->(:Project) }
            OR EXISTS { MATCH (selection:ProjectSelection {id: 'selection'})
-             WHERE selection.initialized = true AND selection.updatedAt < $cutoff AND NOT cf.projectKey IN selection.tracked })
+             WHERE selection.initialized = true AND coalesce(cf.mapUnselectedAt, selection.updatedAt) < $cutoff
+               AND NOT cf.projectKey IN selection.tracked })
          AND NOT EXISTS { (cf)-[r]-() WHERE type(r) <> 'IN' }
        WITH cf LIMIT $limit
        DETACH DELETE cf
@@ -251,6 +256,23 @@ export class CodeGraphRepo implements CodeGraphStore {
       { limit: batch, cutoff },
     );
     return r ? neo4j.integer.toNumber(r.get('n')) : 0;
+  }
+
+  /** Drop only derived map data; source facts and immutable session evidence stay. */
+  async dropCodeMap(projectKey: string): Promise<boolean> {
+    if (!(await this.codeMapMeta(projectKey))) return false;
+    const phases = [
+      'MATCH (x:Symbol {projectKey: $key}) WITH x LIMIT 250 DETACH DELETE x RETURN count(*) AS n',
+      'MATCH (f:CodeFile {projectKey: $key})-[x:IMPORTS|TESTS]->() WITH x LIMIT 250 DELETE x RETURN count(*) AS n',
+      `MATCH (x:CodeFile {projectKey: $key}) WHERE coalesce(x.inMap, false) OR coalesce(x.inIndex, false) OR x.codeHash IS NOT NULL
+       WITH x LIMIT 250 SET x.inMap = false, x.inIndex = false, x.mapUnselectedAt = $now
+       REMOVE x.lang, x.codeHash, x.loc, x.isTest, x.churnCommits, x.churnLastTs, x.mappedAt RETURN count(*) AS n`,
+      'MATCH (x:Module {projectKey: $key}) WITH x LIMIT 250 DETACH DELETE x RETURN count(*) AS n',
+    ];
+    const now = new Date().toISOString();
+    for (const query of phases) { for (;;) { const [row] = await this.g.run(query, { key: projectKey, now }); if (Number(row?.get('n') ?? 0) < 250) break; } }
+    await this.g.run('MATCH (m:CodeMap {projectKey: $key}) DETACH DELETE m', { key: projectKey });
+    return true;
   }
 
   async requestCodeMapRebuild(projectKey: string): Promise<boolean> {

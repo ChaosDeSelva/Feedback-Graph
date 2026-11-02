@@ -3,6 +3,8 @@ import { expect, test } from 'vitest';
 import { createApp, type ApiRepo } from './app.ts';
 
 const repo = { listCandidates: async () => [], candidateDetail: async () => null, decide: async () => {}, stats: async () => [] } as unknown as ApiRepo;
+const OWNER = 'owner-test-token-01234567890123456789';
+const ownerHeaders = { authorization: `Bearer ${OWNER}`, 'x-fg-owner': 'true' };
 
 function setup() {
   const upserts: { doc: object; chunks: { text: string }[]; opts?: object }[] = [];
@@ -10,6 +12,7 @@ function setup() {
   const reread: string[] = [];
   const recorded: ActivityInput[] = [];
   const app = createApp(repo, {
+    auth: { ownerToken: OWNER },
     embed: async (t) => t.map(() => [1]),
     projectDirs: async () => [{ key: 'shop', name: 'shop', repoPath: '/vibe/shop' }],
     docs: {
@@ -23,7 +26,7 @@ function setup() {
   });
   return { app, upserts, deleted, reread, recorded };
 }
-const post = (body: object) => ({ method: 'POST', headers: { 'content-type': 'application/json', 'sec-fetch-site': 'same-origin', origin: 'http://localhost' }, body: JSON.stringify(body) });
+const post = (body: object) => ({ method: 'POST', headers: { 'content-type': 'application/json', ...ownerHeaders }, body: JSON.stringify(body) });
 
 test('uploading a document chunks, redacts, embeds and logs it', async () => {
   const { app, upserts, recorded } = setup();
@@ -63,6 +66,7 @@ test('the largest upload is accepted at once (202) and embedded in the backgroun
   let release!: () => void;
   const slow = new Promise<void>((r) => { release = r; });
   const app = createApp(repo, {
+    auth: { ownerToken: OWNER },
     embed: async (t) => { batches.push(t.length); await slow; return t.map(() => [1]); },
     projectDirs: async () => [{ key: 'shop', name: 'shop', repoPath: '/vibe/shop' }],
     docs: { upsertDoc: async (doc, chunks) => { upserts.push(chunks.length); return `doc:shop:upload:${doc.ref}`; }, listDocs: async () => [], deleteDoc: async () => false },
@@ -85,6 +89,7 @@ test('the largest upload is accepted at once (202) and embedded in the backgroun
 test('a background upload that fails is logged in Activity with why, never a crash', async () => {
   const recorded: ActivityInput[] = [];
   const app = createApp(repo, {
+    auth: { ownerToken: OWNER },
     embed: async () => { throw new Error('ollama embed 500: model not loaded'); },
     projectDirs: async () => [{ key: 'shop', name: 'shop', repoPath: '/vibe/shop' }],
     docs: { upsertDoc: async () => 'x', listDocs: async () => [], deleteDoc: async () => false },
@@ -106,8 +111,8 @@ test('uploads are validated: unknown project, empty text, oversized text, bad na
 
 test('DELETE /api/docs/:id removes a doc, 404 when missing', async () => {
   const { app, deleted } = setup();
-  expect((await app.request('/api/docs/doc:shop:upload:a.md', { method: 'DELETE', headers: { 'content-type': 'application/json', 'sec-fetch-site': 'same-origin', origin: 'http://localhost' } })).status).toBe(204);
-  expect((await app.request('/api/docs/doc:shop:upload:zzz', { method: 'DELETE', headers: { 'content-type': 'application/json', 'sec-fetch-site': 'same-origin', origin: 'http://localhost' } })).status).toBe(404);
+  expect((await app.request('/api/docs/doc:shop:upload:a.md', { method: 'DELETE', headers: { 'content-type': 'application/json', ...ownerHeaders } })).status).toBe(204);
+  expect((await app.request('/api/docs/doc:shop:upload:zzz', { method: 'DELETE', headers: { 'content-type': 'application/json', ...ownerHeaders } })).status).toBe(404);
   expect(deleted).toEqual(['doc:shop:upload:a.md', 'doc:shop:upload:zzz']);
 });
 
@@ -115,6 +120,7 @@ test('uploading a file with the name of an existing upload says it replaced it',
   const recorded: ActivityInput[] = [];
   // listDocs reports an earlier upload with the same file name.
   const replacing = createApp(repo, {
+    auth: { ownerToken: OWNER },
     embed: async (t) => t.map(() => [1]),
     projectDirs: async () => [{ key: 'shop', name: 'shop', repoPath: '/vibe/shop' }],
     docs: {
@@ -135,6 +141,7 @@ test('the docs list comes a page at a time, newest first, with x-next-cursor whi
   }));
   const asked: object[] = [];
   const app = createApp(repo, {
+    auth: { ownerToken: OWNER },
     embed: async (t) => t.map(() => [1]),
     projectDirs: async () => [{ key: 'shop', name: 'shop', repoPath: '/vibe/shop' }],
     docs: {
@@ -168,6 +175,7 @@ test('the docs list comes a page at a time, newest first, with x-next-cursor whi
 test('an upload looks up an earlier one with its name, not by listing every document', async () => {
   const asked: object[] = [];
   const app = createApp(repo, {
+    auth: { ownerToken: OWNER },
     embed: async (t) => t.map(() => [1]),
     projectDirs: async () => [{ key: 'shop', name: 'shop', repoPath: '/vibe/shop' }],
     docs: { upsertDoc: async () => 'doc:shop:upload:spec.md', deleteDoc: async () => true, listDocs: async (_k, o) => { asked.push(o ?? {}); return []; } },
@@ -222,6 +230,7 @@ test('POST /api/docs/:id/reread queues a failed reading again (say, after DOCS_L
 test('a background upload carries its embed status: pending, then failed with why, read by id (GET /api/docs/:id), not from the first page', async () => {
   let fail!: (e: Error) => void;
   const app = createApp(repo, {
+    auth: { ownerToken: OWNER },
     embed: () => new Promise((_, reject) => { fail = reject; }),
     projectDirs: async () => [{ key: 'shop', name: 'shop', repoPath: '/vibe/shop' }],
     docs: { upsertDoc: async () => 'x', listDocs: async () => [], deleteDoc: async () => false },
@@ -251,6 +260,7 @@ test('re-uploading a large file of the same name marks the listed document pendi
   const slow = new Promise<void>((r) => { release = r; });
   let stored = false;
   const app = createApp(repo, {
+    auth: { ownerToken: OWNER },
     embed: async (t) => { await slow; return t.map(() => [1]); },
     projectDirs: async () => [{ key: 'shop', name: 'shop', repoPath: '/vibe/shop' }],
     docs: {

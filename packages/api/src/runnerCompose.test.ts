@@ -14,6 +14,15 @@ test('API and worker both receive the configured runner endpoint', () => {
   }
 });
 
+test('API and worker both receive the scan provider allowlist', () => {
+  const compose = read('docker-compose.yml');
+  for (const service of ['worker', 'api']) {
+    const block = compose.match(new RegExp(`^  ${service}:\\n([\\s\\S]*?)(?=^  [a-z][a-z-]*:|^volumes:)`, 'm'))?.[1];
+    expect(block).toBeDefined();
+    expect(block).toContain('SCAN_PROVIDER_ALLOW: ${SCAN_PROVIDER_ALLOW:-}');
+  }
+});
+
 test('the manual procfs override contains only its additive option and uses the installer filename', () => {
   const docs = read('docs/operations.md');
   const snippet = docs.match(/```yaml\n# docker-compose\.runner-procfs\.yml\n([\s\S]*?)```/)?.[1];

@@ -91,6 +91,10 @@ if [ -n "${FEEDBACK_GRAPH_URL:-}" ]; then
   expected_url="http://localhost:$(setting API_PORT)"; expected_url="${expected_url%:}"
   [ "$expected_url" != http://localhost ] || expected_url=http://localhost:8787
   if [ "${url%/}" != "$expected_url" ] && [ "${url%/}" != "${expected_url/localhost/127.0.0.1}" ]; then
+    if [ -f "$env_file" ] && grep -q '^API_TOKEN=' "$env_file"; then
+      echo "refusing to send this install's API_TOKEN to FEEDBACK_GRAPH_URL=$url (this checkout is $expected_url); unset FEEDBACK_GRAPH_URL or configure the URL in this install" >&2
+      exit 1
+    fi
     echo "WARNING: FEEDBACK_GRAPH_URL overrides this checkout's $expected_url; registration will target that explicit override. Unset it for this install." >&2
   fi
 else
@@ -134,7 +138,31 @@ install_claude() {
   local plugin=0
   if claude plugin list 2>/dev/null | grep -q 'feedback-graph@'; then
     if [ "$name" = feedback-graph ]; then
-      echo "Claude Code: the feedback-graph plugin is installed and already provides the MCP server and skills; nothing to do"
+      local settings_dir="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+      local settings="$settings_dir/settings.json"
+      if [ "$dry" = 1 ]; then
+        would "refresh the feedback-graph plugin environment in $settings with this install's current URL and API_TOKEN"
+        return
+      fi
+      mkdir -p "$settings_dir"
+      backup "$settings"
+      SETTINGS="$settings" FG_PLUGIN_URL="$url" FG_PLUGIN_TOKEN="$token" node -e '
+        const fs = require("node:fs");
+        const file = process.env.SETTINGS;
+        let value = {};
+        try { value = JSON.parse(fs.readFileSync(file, "utf8")); } catch (error) {
+          if (error.code !== "ENOENT") throw new Error(`${file} is not valid JSON; left it unchanged`);
+        }
+        value.env = value.env && typeof value.env === "object" && !Array.isArray(value.env) ? value.env : {};
+        value.env.FEEDBACK_GRAPH_URL = process.env.FG_PLUGIN_URL;
+        if (process.env.FG_PLUGIN_TOKEN) value.env.FEEDBACK_GRAPH_TOKEN = process.env.FG_PLUGIN_TOKEN;
+        else delete value.env.FEEDBACK_GRAPH_TOKEN;
+        const tmp = `${file}.tmp.${process.pid}`;
+        fs.writeFileSync(tmp, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
+        fs.renameSync(tmp, file);
+        fs.chmodSync(file, 0o600);
+      '
+      echo "Claude Code: refreshed the feedback-graph plugin URL and API_TOKEN in $settings (restart Claude Code)"
       return
     fi
     plugin=1
@@ -161,12 +189,21 @@ install_claude() {
   # Literal references are expanded by Claude Code when it starts, not when this installer runs.
   local run_headers=(--header 'X-FG-Run: ${FG_RUN:-}' --header 'X-FG-Sandbox: ${FG_SANDBOX:-0}' --header 'X-FG-Run-Key: ${FG_RUN_KEY:-}')
   if claude mcp get "$name" >/dev/null 2>&1; then
-    echo "Claude Code: MCP server $name already registered (remove it with: claude mcp remove $name --scope user, then re-run to install dynamic run headers)"
-  elif [ "$dry" = 1 ]; then
+    if [ "$dry" = 1 ]; then
+      would "refresh Claude Code MCP server $name at $url/mcp with this install's current URL, API_TOKEN and dynamic run headers"
+      return
+    fi
+    # `mcp add` does not update an existing entry. Remove and recreate our named entry so an upgrade that introduces
+    # or rotates API_TOKEN cannot leave Claude connected with stale credentials (the rest of Claude's config is not
+    # touched). The server name is instance-specific, so a second install never removes the first one's entry.
+    claude mcp remove "$name" --scope user >/dev/null
+    echo "Claude Code: refreshing existing MCP server $name"
+  fi
+  if [ "$dry" = 1 ]; then
     would "claude mcp add --transport http --scope user $name $url/mcp${token:+ --header 'Authorization: Bearer <API_TOKEN>'}"
   elif [ -n "$token" ]; then
     claude mcp add --transport http --scope user "$name" "$url/mcp" --header "Authorization: Bearer $token" "${run_headers[@]}"
-    echo "Claude Code: registered $name at $url/mcp with your API_TOKEN"
+    echo "Claude Code: registered $name at $url/mcp with your current API_TOKEN"
   else
     claude mcp add --transport http --scope user "$name" "$url/mcp" "${run_headers[@]}"
     echo "Claude Code: registered $name at $url/mcp"
@@ -216,7 +253,39 @@ install_codex() {
   # default_tools_approval_mode.
   local approve=0 cfg_backed=0
   if grep -Eq "$table_re" "$cfg" 2>/dev/null; then
-    echo "Codex: MCP server $name already in $cfg (delete its [mcp_servers.$name] table, then re-run, to change it)"
+    # Bring old registrations forward when an install gains or rotates API_TOKEN. Match only this instance's table;
+    # other Feedback Graph installs and custom headers remain untouched.
+    local expected_url="url = \"$url/mcp\"" expected_auth="http_headers = { \"Authorization\" = \"Bearer $token\" }"
+    if ! RE="$table_re" WANT_URL="$expected_url" WANT_AUTH="$expected_auth" HAVE_TOKEN="${token:+1}" awk '
+      /^[[:space:]]*\[/ { if (on) exit; on = ($0 ~ ENVIRON["RE"]); next }
+      on && $0 == ENVIRON["WANT_URL"] { url = 1 }
+      on && /^[[:space:]]*http_headers[[:space:]]*=/ { auth = ($0 == ENVIRON["WANT_AUTH"]) }
+      END { exit !(url && ((ENVIRON["HAVE_TOKEN"] && auth) || (!ENVIRON["HAVE_TOKEN"] && !auth))) }
+    ' "$cfg"; then
+      if [ "$dry" = 1 ]; then would "refresh $name in $cfg with this install's current URL and API_TOKEN"
+      else
+        backup "$cfg"; cfg_backed=1
+        local connection_tmp="$cfg.connection.$$"
+        RE="$table_re" URL="$expected_url" AUTH="$expected_auth" HAVE_TOKEN="${token:+1}" awk '
+          /^[[:space:]]*\[/ {
+            if (on && !url) print ENVIRON["URL"]
+            on = ($0 ~ ENVIRON["RE"]); url = 0
+            print
+            if (on && ENVIRON["HAVE_TOKEN"]) print ENVIRON["AUTH"]
+            next
+          }
+          on && /^[[:space:]]*url[[:space:]]*=/ { if (!url) print ENVIRON["URL"]; url = 1; next }
+          on && /^[[:space:]]*http_headers[[:space:]]*=/ { next }
+          { print }
+          END { if (on && !url) print ENVIRON["URL"] }
+        ' "$cfg" >"$connection_tmp"
+        mv "$connection_tmp" "$cfg"
+        [ -z "$token" ] || chmod 600 "$cfg"
+        echo "Codex: refreshed $name with this install's current URL and API_TOKEN"
+      fi
+    else
+      echo "Codex: MCP server $name already registered with the current URL and credentials"
+    fi
     # Preserve custom header maps; otherwise add supported environment-backed headers to old registrations.
     if ! RE="$table_re" awk '/^[[:space:]]*\[/ { on = ($0 ~ ENVIRON["RE"]); next } on && /^[[:space:]]*env_http_headers[[:space:]]*=/ { found = 1 } END { exit found ? 0 : 1 }' "$cfg"; then
       if [ "$dry" = 1 ]; then would "add dynamic FG_RUN/FG_SANDBOX/FG_RUN_KEY headers to $cfg";

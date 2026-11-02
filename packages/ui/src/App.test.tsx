@@ -68,7 +68,7 @@ test('with a token configured, the UI asks you to sign in first', async () => {
   const { fireEvent } = await import('@testing-library/react');
   const s = server({ authRequired: true, token: 'secret-token' });
   render(<App />);
-  const input = await screen.findByLabelText('access token');
+  const input = await screen.findByLabelText('owner token');
   fireEvent.change(input, { target: { value: 'wrong' } });
   fireEvent.click(screen.getByRole('button', { name: 'Sign in' }));
   expect(await screen.findByText('wrong token')).toBeTruthy();

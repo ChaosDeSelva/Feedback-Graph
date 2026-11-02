@@ -1,6 +1,6 @@
 # Install Feedback Graph
 
-Install Docker (Desktop/OrbStack on macOS), Node 26.5+ and pnpm 11. Clone the repository, enable Corepack if `pnpm` is not already installed (`corepack enable && corepack prepare pnpm@11 --activate`), run `pnpm install`, then run `./scripts/setup.sh`. Choose project roots deliberately: mounted project folders are read-only, but selected transcripts contain the conversations and file access from those sessions. Review `.env` before starting a shared installation. The API binds to loopback by default. Accept setup's recommended `API_TOKEN`: without it, Fetch Metadata prevents web CSRF but is not an owner boundary against another local process that can forge browser headers.
+Install Docker (Desktop/OrbStack on macOS), Node 26.5+ and pnpm 11. Clone the repository. If `pnpm` is absent, use `corepack enable && corepack prepare pnpm@11 --activate` on Node releases that include Corepack, or `npx -y pnpm@11 install` on releases such as Node 26 that do not. Then run `pnpm install` and `./scripts/setup.sh`. Choose project roots deliberately: mounted project folders are read-only, but selected transcripts contain the conversations and file access from those sessions. Review `.env` before starting a shared installation. The API binds to loopback by default. Accept setup's recommended authentication credentials: without them, local processes are not separated by an owner boundary.
 
 For a local-only trial without your real transcripts or agent registration:
 

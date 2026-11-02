@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { z } from 'zod';
 import type { Admission, Admitted, Turn, QueueInfo } from './admission.ts';
 import { capDiff, citeDiff, splitDiff, type DiffCite, quotedCode, taskPrNumbers } from './diff.ts';
-import { withStoreDeadline, storeTimeLeft, storeRequestSignal, askPromptOnly, boundedScore, FACT_RANK_FLOOR, CODE_MAP_VERSION, gradeLessons, LESSON_POOL, rankLessons, cleanLessonPath, factOrigin, isNonMiss, mentionedPaths, pathAffinity, serviceDirs, servicesInTask, SIMILARITY_FLOOR, isSecretPath, mapCapped, rankFacts, rankMisses, rankDocs, hostRepoPath, MODULE_TESTS_DEPTH, projectFromCwd, redactSecrets, relOfKey, repoRelative, type ActivityStore, type CodeGraphStore, type CodeMapMeta, type SessionListItem, type SessionsStore, type DocHit, type FileMiss, type Impact, type ModuleContext, type OutsideFile, type DocsStore, type FactHit, type FactsStore, type StoredFact, type KnowledgeStore, type Lesson, type LessonHit, type LlmProvider, type Project, type RelatedMiss, type Root, type ShownProjects, type LinksStore, type ProjectLink, otherEnd, isManifestDependency, pathMatches, AnswerRefused, ModelOutputError, askJson } from '@fb/core';
+import { withStoreDeadline, storeTimeLeft, storeRequestSignal, askPromptOnly, boundedScore, sharesTopic, FACT_RANK_FLOOR, CODE_MAP_VERSION, gradeLessons, LESSON_POOL, rankLessons, cleanLessonPath, factOrigin, isNonMiss, mentionedPaths, pathAffinity, serviceDirs, servicesInTask, SIMILARITY_FLOOR, isSecretPath, mapCapped, rankFacts, rankMisses, rankDocs, hostRepoPath, MODULE_TESTS_DEPTH, projectFromCwd, redactSecrets, relOfKey, repoRelative, type ActivityStore, type CodeGraphStore, type CodeMapMeta, type SessionListItem, type SessionsStore, type DocHit, type FileMiss, type Impact, type ModuleContext, type OutsideFile, type DocsStore, type FactHit, type FactsStore, type StoredFact, type KnowledgeStore, type Lesson, type LessonHit, type LlmProvider, type Project, type RelatedMiss, type Root, type ShownProjects, type LinksStore, type ProjectLink, otherEnd, isManifestDependency, pathMatches, AnswerRefused, ModelOutputError, askJson } from '@fb/core';
 
 /**
  * applies: the judge's call on whether the lesson (or miss) bears on this work at all. Only one that applies can be a
@@ -71,6 +71,8 @@ export type ContextDeps = {
    * the rest queued; one not answered in time is a deterministic "not judged". Unset: every call goes straight in.
    */
   judgeQueue?: Admission;
+  /** All verdicts in this check were deterministic diff evidence. */
+  checkDirect?: boolean;
   excludedPrNumbers?: Set<number>;
   /** Per-request queue telemetry; the bounded check wrapper owns this callback. */
   checkQueueState?: (state: QueueInfo) => void;
@@ -348,7 +350,7 @@ async function linkedContext(projectKey: string, embedding: number[], task: stri
         linkedLessons(key, embedding, task, LINKED_LESSON_K, d),
         d.k.relatedMisses({ embedding, projectKey: key, k: LINKED_MISS_K * 3 }).then((h) => rankMisses(h, LINKED_MISS_K, [], [], contextFloor(d), factRankFloor(d))),
         d.facts ? d.facts.searchFacts({ embedding, projectKey: key, k: LINKED_FACT_K * 3 }).then((h) => rankFacts(h, LINKED_FACT_K, [], [], contextFloor(d), factRankFloor(d))) : Promise.resolve([]),
-        d.docs ? d.docs.searchDocs({ embedding, projectKey: key, k: LINKED_DOC_K }).then((h) => rankDocs(h, LINKED_DOC_K, [], [], contextFloor(d), factRankFloor(d))) : Promise.resolve([]),
+        d.docs ? d.docs.searchDocs({ embedding, projectKey: key, k: LINKED_DOC_K }).then((h) => rankDocs(h.filter(doc => sharesTopic(task, { title: doc.title, rule: doc.text, appliesWhen: '', paths: [] })), LINKED_DOC_K, [], [], contextFloor(d), factRankFloor(d))) : Promise.resolve([]),
       ]);
       return { key, link, lessons, misses, facts, docs };
     }),
@@ -571,7 +573,7 @@ async function ticketSection(projectKey: string, docs: DocHit[], d: ContextDeps,
 }
 
 export async function getTaskContext(
-  q: ProjectRef & { task: string; files?: string[]; brief?: boolean; sessionId?: string; sessionStartedAt?: string | null },
+  q: ProjectRef & { task: string; files?: string[]; brief?: boolean; trustedFilesOnly?: boolean; sessionId?: string; sessionStartedAt?: string | null },
   d: ContextDeps,
 ): Promise<TaskContext> {
   d = { ...d, excludedPrNumbers: new Set() };
@@ -580,7 +582,7 @@ export async function getTaskContext(
   if (!project) return { markdown: UNKNOWN_PROJECT(q), lessons: [], misses: [], facts: [], docs: [], sessions: [], linked: [], project: null };
   const own = !!selected;
   const [embedding] = await d.embed([q.task]);
-  const files = own ? taskFiles(q, d.roots) : [];
+  const files = own ? taskFiles(q.trustedFilesOnly ? { ...q, task: '' } : q, d.roots) : [];
   if (q.brief) return briefContext(q, project, own, files, embedding, d);
   const [found, byFile, recent, linked, mods, mine] = await Promise.all([
     searchProject(project, own, embedding, q.task, files, d),
@@ -596,7 +598,8 @@ export async function getTaskContext(
   // Misses on the named files come first and are not repeated among the similar ones.
   const fileMisses = await withoutOwnPrMisses(latestMisses(mods), q, project, d);
   const misses = similar.filter((m) => !fileMisses.some((f) => f.missId === m.missId));
-  const lines = [`# Feedback Graph context for "${q.task}" in ${project.key}`, '', ...excludedPrNote(d)];
+  const safeTask = oneLine(redactSecrets(q.task)).slice(0, 300);
+  const lines = [`# Feedback Graph context for "${safeTask}" in ${project.key}`, '', ...excludedPrNote(d)];
   if (!own) lines.push(GLOBAL_ONLY(project.key), '');
   if (fileMisses.length || misses.length || facts.length || docs.length || recent.length || mods || linked.length) lines.push(DATA_NOTE, '');
   if (lessons.length) {
@@ -639,10 +642,10 @@ export async function getTaskContext(
     kind: 'context_served',
     actor: q.client ?? 'agent (MCP)',
     projectKey: project.key,
-    subject: `context for "${q.task}": ${n(lessons.length, 'lesson')}, ${n(misses.length, 'past miss', 'past misses')}, ${n(facts.length, 'fact')}`,
+    subject: `context for "${safeTask}": ${n(lessons.length, 'lesson')}, ${n(misses.length, 'past miss', 'past misses')}, ${n(facts.length, 'fact')}`,
     why: 'an agent called get_task_context before starting the task',
     details: {
-      task: q.task,
+      task: redactSecrets(q.task),
       ...(files.length ? { files } : {}),
       ...(found.services.length ? { services: found.services } : {}),
       lessons: lessons.map((h) => ({ id: h.lesson.id, title: h.lesson.title, score: h.score, ...(h.files ? { files: h.files } : {}) })),
@@ -814,8 +817,8 @@ export function queueDescription(queue: QueueInfo): string {
     + (queue.state === 'running' ? 'This judge call is running. ' : queue.position === null ? `No retained queue position; a retry would currently enter at waiting position ${queue.nextRetryPosition}. ` : `Waiting position ${queue.position}; `)
     + (queue.retryPriority?.retained ? `Retry priority is held for ${Math.ceil(queue.retryPriority.remainingMs / 1000)} s for this same authorized check; no physical slot is reserved. ` : queue.retryPriority?.restored ? 'Earlier retry priority was restored ahead of newer waiting checks. ' : '')
     + (queue.arrivalAhead === null ? '' : `On arrival: ${queue.arrivalAhead} checks ahead. `)
-    + (queue.estimate.medianStartMs == null ? '' : `Median scenario: start in about ${Math.ceil(queue.estimate.medianStartMs / 1000)} s, finish in about ${Math.ceil((queue.estimate.medianCompletionMs ?? 0) / 1000)} s. `)
-    + `Estimated start: ${window(queue.estimate.startMs)}; estimated completion: ${window(queue.estimate.completionMs)} (${basis}). Estimates are not guarantees.`
+    + ''
+    + `Estimated start: ${window(queue.estimate.startMs)}; estimated completion: ${window(queue.estimate.completionMs)} (${basis}). These planning windows include observed service variation, not a promise or a reserved place.`
     + (queue.estimate.overdue ? ' A provider call is past its response deadline; its cancellation may still be settling. The occupied lane is excluded from the upper estimate.' : '')
     + (queue.retryAfterMs === null ? '' : ` Retry after about ${Math.ceil(queue.retryAfterMs / 1000)} s; retrying starts a fresh-budget request; retained priority applies only to the identical authorized check.`);
 }
@@ -827,6 +830,7 @@ export async function checkBeforeDone(
 ): Promise<{ markdown: string; gaps: Gap[]; codeGaps: CodeGap[]; cannotTell?: CannotTell[]; queued?: boolean; queue?: QueueInfo; status?: string; verdicts?: Verdict[]; recorded?: boolean | null }> {
   const controller = new AbortController();
   let queueState: QueueInfo | undefined;
+  let activityRecorded = false;
   let outcome = { checkedLessonIds: [] as string[], gapLessonIds: [] as string[], status: 'not_judged', verdicts: [] as Verdict[] };
   const budget = Math.max(1, Math.min(50_000, d.checkTimeoutMs ?? 50_000));
   const responseDeadline = Date.now() + budget;
@@ -870,6 +874,7 @@ export async function checkBeforeDone(
     controller.signal.throwIfAborted();
     return Promise.race([d.embed(texts, { signal: controller.signal, timeoutMs: Math.max(1, deadline - Date.now()) }), expired]);
   };
+  if (d.activity) { const original = guard(d.activity.record.bind(d.activity)); bounded.activity = { record: async input => { const result = await original(input); if (input.kind === 'predone_check') activityRecorded = true; return result; } }; }
   bounded.checkRetryBase = d.checkRetryIdentity ? createHash('sha256').update(JSON.stringify([d.checkRetryIdentity, currentRun(), q.project, q.cwd, q.task, q.summary, q.sessionId, [...(q.filesChanged ?? [])].sort()])).digest('hex') : undefined;
   bounded.checkRecord = (checkedLessonIds, gapLessonIds, status, verdicts = []) => { outcome = { checkedLessonIds, gapLessonIds, status, verdicts }; };
   bounded.excludedPrNumbers = new Set();
@@ -891,6 +896,15 @@ export async function checkBeforeDone(
   catch (error) {
     if (!controller.signal.aborted) { await persist('failed'); throw error; }
     const recorded = await persist('queued');
+    if (!activityRecorded && bounded.checkRetryProject && d.activity) {
+      const remaining = Math.max(1, Math.min(1000, responseDeadline - Date.now()));
+      await withStoreDeadline({ signal: AbortSignal.timeout(remaining), expiresAt: Date.now() + remaining }, () => d.activity!.record({
+        kind: 'predone_check', actor: q.client ?? 'agent (MCP)', projectKey: bounded.checkRetryProject!,
+        subject: `pre-done check on "${redactSecrets(q.task)}": queued`,
+        why: 'the response deadline expired before a verdict; retry the same check with a fresh budget',
+        details: { status: 'queued', notJudged: true, recorded, ...(q.sessionId && { sessionId: q.sessionId }) }, targets: sessionTarget(q),
+      })).catch(() => {});
+    }
     const queue = d.judgeQueue ? { ...d.judgeQueue.snapshot('retry_required', null, queueState?.arrivalAhead ?? null, queueState?.retryPriority?.retained ? queueState.nextRetryPosition : undefined), ...(queueState?.retryPriority && { retryPriority: queueState.retryPriority }) } : undefined;
     return { markdown: '# Queued: pre-done check has not completed\nThe check reached its response deadline while waiting for context or the judge. Nothing was decided.' + (queue ? `\n${queueDescription(queue)}` : '') + ' This timed-out request does not retain a queue position. Retry check_before_done; a queued response is not a completed check.', gaps: [], codeGaps: [], queued: true, status: 'queued', recorded, verdicts: [], ...(queue && { queue }) };
   } finally { clearTimeout(timer!); }
@@ -945,7 +959,7 @@ async function checkBeforeDoneWork(
           return rankMisses(eligible, MISS_K, changed, services, contextFloor(d), factRankFloor(d)).filter(m => {
             const paths = mentionedPaths(`${m.missed} ${m.feedbackText}`);
             return !changed.length || !paths.length || Math.max(...paths.map(path => pathAffinity(path, changed))) >= 1;
-          });
+          }).slice(0, 2);
         })])
       : [null, []];
     const note = backlog === null ? [] : [NONE_APPROVED(project.key, backlog)];
@@ -987,7 +1001,7 @@ async function checkBeforeDoneWork(
   d.checkRecord?.(lessons.map(h => h.lesson.id), gaps.map(g => g.lessonId), 'lesson_judged', verdicts);
   await d.activity?.record({
     kind: 'predone_check',
-    actor: d.judgeId ?? 'judge',
+    actor: d.checkDirect ? 'diff-rule-check' : d.judgeId ?? 'judge',
     projectKey: project.key,
     subject: `pre-done check on "${q.task}": ${gaps.length} gap${gaps.length === 1 ? '' : 's'}${subjectTail}`,
     why: gaps.length ? 'past feedback applies and the work shows no sign of handling it' : 'no relevant lesson looked unaddressed',
@@ -1052,7 +1066,7 @@ function diffNote(x: JudgedDiff, applied: boolean): string[] {
 }
 
 /** Which model judged the work (provider:model), so a verdict can be weighed by who gave it. */
-const judgedBy = (d: ContextDeps) => (d.judgeId ? ['', `Judged by ${d.judgeId}.`] : []);
+const judgedBy = (d: ContextDeps) => d.checkDirect ? ['', 'Checked directly against the changed code; no model call or judge queue was needed.'] : (d.judgeId ? ['', `Judged by ${d.judgeId}.`] : []);
 
 const diffDetails = (x: JudgedDiff) => ({ source: x.source, chars: x.text.length, files: x.shown, ...(x.omitted.length && { omitted: x.omitted }) });
 const verdictDetails = (v: Verdict) => ({ status: v.status, ...(v.applies !== undefined && { applies: v.applies }), why: v.why, ...(v.cites?.length && { cites: v.cites }) });
@@ -1077,10 +1091,14 @@ function cannotTellLines(xs: CannotTell[], what: 'lesson' | 'miss'): string[] {
  * there is cannot_tell, listed apart: neither a gap nor a pass.
  */
 async function judgeWork(q: { task: string; summary: string }, lessons: LessonHit[], diff: JudgedDiff, d: ContextDeps) {
-  const ask = (turn?: Turn) => d.judge({ task: q.task, summary: q.summary, ...(diff.text && { diff: diff.text }) }, lessons, turn ?? {});
+  const work = { task: q.task, summary: q.summary, ...(diff.text && { diff: diff.text }) };
+  const direct = directConsoleViolations(work, lessons);
+  const pending = lessons.filter(hit => !direct.some(v => v.lessonId === hit.lesson.id));
+  const ask = async (turn?: Turn) => [...direct, ...await d.judge(work, pending, turn ?? {})];
+  d.checkDirect = direct.length > 0 && pending.length === 0;
   let slot: Admitted<Verdict[]>;
   try {
-    slot = d.judgeQueue ? await d.judgeQueue.run(ask, { signal: d.checkSignal, deadline: d.checkDeadline, onState: d.checkQueueState, ...(d.checkRetryBase && { retryKey: createHash('sha256').update(JSON.stringify([d.checkRetryBase, d.checkRetryProject, diff.text, lessons.map(hit => hit.lesson.id).sort()])).digest('hex') }) }) : { ok: true as const, value: await ask(), ahead: 0, waitedMs: 0 };
+    slot = d.checkDirect ? { ok: true as const, value: direct, ahead: 0, waitedMs: 0 } : d.judgeQueue ? await d.judgeQueue.run(ask, { signal: d.checkSignal, deadline: d.checkDeadline, onState: d.checkQueueState, ...(d.checkRetryBase && { retryKey: createHash('sha256').update(JSON.stringify([d.checkRetryBase, d.checkRetryProject, diff.text, lessons.map(hit => hit.lesson.id).sort()])).digest('hex') }) }) : { ok: true as const, value: await ask(), ahead: 0, waitedMs: 0 };
   } catch (err) {
     // A model that failed (an unusable answer twice, an outage, an HTTP error) is never an error to the agent, and
     // never a pass: the lessons are listed to check by hand.
@@ -1262,7 +1280,7 @@ async function checkAgainstMisses(
 
   await d.activity?.record({
     kind: 'predone_check',
-    actor: d.judgeId ?? 'judge',
+    actor: d.checkDirect ? 'diff-rule-check' : d.judgeId ?? 'judge',
     projectKey: key,
     subject: `pre-done check on "${q.task}" against past misses: ${gaps.length} gap${gaps.length === 1 ? '' : 's'}${c.subjectTail}`,
     why: gaps.length ? 'no lesson applies; a confirmed past miss looks repeated' : 'no lesson applies; no close confirmed miss looked repeated',

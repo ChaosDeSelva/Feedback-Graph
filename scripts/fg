@@ -48,6 +48,10 @@ fi
 if [ -n "${FEEDBACK_GRAPH_URL:-}" ]; then
   local_port="$(setting API_PORT)"; expected_url="http://localhost:${local_port:-8787}"
   if [ "${FEEDBACK_GRAPH_URL%/}" != "$expected_url" ] && [ "${FEEDBACK_GRAPH_URL%/}" != "${expected_url/localhost/127.0.0.1}" ]; then
+    if [ -f "$env_file" ] && grep -q '^API_TOKEN=' "$env_file"; then
+      echo "fg: refusing to send this install's API_TOKEN to FEEDBACK_GRAPH_URL=$FEEDBACK_GRAPH_URL (this checkout is $expected_url); unset FEEDBACK_GRAPH_URL" >&2
+      exit 1
+    fi
     echo "WARNING: FEEDBACK_GRAPH_URL overrides this checkout's $expected_url; unset it to address this install." >&2
   fi
 fi
@@ -75,7 +79,16 @@ if native_ts; then
 fi
 if command -v docker >/dev/null 2>&1; then
   # Inside the container the API is on localhost:8787 and FG_OPERATOR_TOKEN comes from compose (.env).
-  exec docker compose --project-directory "$here" exec -T -e "FG_DATABASE_MEMORY=${FG_DATABASE_MEMORY:-}" ${FEEDBACK_GRAPH_URL:+-e FEEDBACK_GRAPH_URL} ${FG_OPERATOR_NAME:+-e FG_OPERATOR_NAME="$FG_OPERATOR_NAME"} api node src/cli.ts "$@"
+  # A host-local URL such as localhost:8797 is this checkout's published port; passing it through would make the api
+  # container call itself on the wrong container port. Only preserve an intentional remote override.
+  container_url=()
+  if [ -n "${FEEDBACK_GRAPH_URL:-}" ]; then
+    local_port="$(setting API_PORT)"; own_url="http://localhost:${local_port:-8787}"
+    if [ "${FEEDBACK_GRAPH_URL%/}" != "$own_url" ] && [ "${FEEDBACK_GRAPH_URL%/}" != "${own_url/localhost/127.0.0.1}" ]; then
+      container_url=(-e "FEEDBACK_GRAPH_URL=$FEEDBACK_GRAPH_URL")
+    fi
+  fi
+  exec docker compose --project-directory "$here" exec -T -e "FG_DATABASE_MEMORY=${FG_DATABASE_MEMORY:-}" "${container_url[@]+"${container_url[@]}"}" ${FG_OPERATOR_NAME:+-e FG_OPERATOR_NAME="$FG_OPERATOR_NAME"} api node src/cli.ts "$@"
 fi
 
 echo "fg needs Node 22.18+ (or 23.6+) on the host, or docker to run it inside the api container" >&2

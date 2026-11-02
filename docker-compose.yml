@@ -182,9 +182,10 @@ services:
       - ${CLAUDE_PROJECTS_DIR:-${HOME}/.claude/projects}:/transcripts:ro
       # Codex CLI / Desktop session transcripts. Read only for the folders you select.
       - ${CODEX_SESSIONS_DIR:-${HOME}/.codex/sessions}:/codex-sessions:ro
-      # Only the Codex login, not all of ~/.codex (config, history, other sessions). Writable so token refreshes stick.
+      # Only a snapshot of the Codex login, not all of ~/.codex (config, history, other sessions). Read-only here;
+      # refresh it with Codex on the host, then recreate the worker/runner mounts.
       - codex-home:/codex
-      # CODEX_AUTH_FILE=~/.codex/auth.json (set by scripts/setup.sh when you use Codex); the default is an empty placeholder.
+      # Set CODEX_AUTH_FILE explicitly when using Codex; setup otherwise mounts an empty local placeholder.
       - ${CODEX_AUTH_FILE:-./state/codex-auth.json}:/codex/auth.json:ro
       - ./state:/state
       - redaction-key:/redaction-key
@@ -256,6 +257,9 @@ services:
     environment:
       <<: *env
       CODEX_RUNNER_URL: ${CODEX_RUNNER_URL:-}
+      # The API enforces provider admission before a scan is queued. The worker has the same setting as defense in
+      # depth, but without this API copy SCAN_PROVIDER_ALLOW would not protect the request boundary.
+      SCAN_PROVIDER_ALLOW: ${SCAN_PROVIDER_ALLOW:-}
       CHECK_LLM: ${CHECK_LLM:-}
       CHECK_CONCURRENCY: ${CHECK_CONCURRENCY:-}
       CHECK_WAIT_SECONDS: ${CHECK_WAIT_SECONDS:-}

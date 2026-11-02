@@ -1,7 +1,7 @@
 import { execFileSync } from 'node:child_process';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { expect, test } from 'vitest';
 
@@ -22,7 +22,7 @@ function sandbox(agents: ('claude' | 'codex')[]) {
   for (const f of readdirSync(bin)) chmodSync(join(bin, f), 0o755);
   const run = (args: string[] = [], env: Record<string, string> = {}) =>
     execFileSync('bash', [script, ...args], {
-      env: { PATH: `${bin}:/usr/bin:/bin`, HOME: home, FEEDBACK_GRAPH_ENV: join(home, 'no.env'), ...env },
+      env: { PATH: `${bin}:${dirname(process.execPath)}:/usr/bin:/bin`, HOME: home, FEEDBACK_GRAPH_ENV: join(home, 'no.env'), ...env },
       encoding: 'utf8',
     });
   const codexDir = join(home, '.codex');
@@ -102,6 +102,41 @@ test('Claude Code: links the three skills and registers the MCP server with the 
   expect(readlinkSync(join(s.home, '.claude', 'skills', 'test-from-feedback'))).toBe(join(repoRoot, 'plugin', 'skills', 'test-from-feedback'));
   expect(readFileSync(s.calls, 'utf8')).toContain(`mcp add --transport http --scope user feedback-graph http://localhost:8787/mcp --header Authorization: Bearer ${TOKEN}`);
   expect(existsSync(s.codexDir)).toBe(false);
+});
+
+test('Claude Code: an existing registration is recreated when credentials may have changed', () => {
+  const s = sandbox(['claude']);
+  writeFileSync(join(s.home, 'bin', 'claude'), `#!/bin/sh\necho "$*" >> '${s.calls}'\n[ "$2" = get ] && exit 0\nexit 0\n`);
+  s.run(['claude'], { API_TOKEN: TOKEN });
+  const calls = readFileSync(s.calls, 'utf8');
+  expect(calls).toContain('mcp remove feedback-graph --scope user');
+  expect(calls).toContain(`mcp add --transport http --scope user feedback-graph http://localhost:8787/mcp --header Authorization: Bearer ${TOKEN}`);
+});
+
+test('Claude Code: an installed plugin receives the current URL and token for its MCP server and hooks', () => {
+  const s = sandbox(['claude']);
+  writeFileSync(join(s.home, 'bin', 'claude'), `#!/bin/sh\necho "$*" >> '${s.calls}'\n[ "$1 $2" = "plugin list" ] && echo 'feedback-graph@feedback-graph'\nexit 0\n`);
+  const settingsDir = join(s.home, '.claude');
+  mkdirSync(settingsDir);
+  writeFileSync(join(settingsDir, 'settings.json'), JSON.stringify({ theme: 'dark', env: { MINE: 'kept' } }));
+  const out = s.run(['claude'], { API_TOKEN: TOKEN });
+  const settings = JSON.parse(readFileSync(join(settingsDir, 'settings.json'), 'utf8'));
+  expect(settings).toEqual({ theme: 'dark', env: { MINE: 'kept', FEEDBACK_GRAPH_URL: 'http://localhost:8787', FEEDBACK_GRAPH_TOKEN: TOKEN } });
+  expect(statSync(join(settingsDir, 'settings.json')).mode & 0o077).toBe(0);
+  expect(readFileSync(s.calls, 'utf8')).not.toContain('mcp add');
+  expect(out).toContain('restart Claude Code');
+  expect(out).not.toContain(TOKEN);
+});
+
+test('Codex: an existing registration receives a newly configured token without changing other servers', () => {
+  const s = sandbox(['codex']);
+  mkdirSync(s.codexDir);
+  writeFileSync(s.config, '[mcp_servers.feedback-graph]\nurl = "http://localhost:8787/mcp"\n\n[mcp_servers.other]\nurl = "https://other.example/mcp"\n');
+  s.run(['codex'], { API_TOKEN: TOKEN });
+  const cfg = readFileSync(s.config, 'utf8');
+  expect(cfg).toMatch(new RegExp(`\\[mcp_servers\\.feedback-graph\\][\\s\\S]*http_headers = \\{ "Authorization" = "Bearer ${TOKEN}" \\}[\\s\\S]*url = "http://localhost:8787/mcp"`));
+  expect(cfg).toContain('[mcp_servers.other]\nurl = "https://other.example/mcp"');
+  expect(statSync(s.config).mode & 0o077).toBe(0);
 });
 
 test('both agents found: both set up; naming one sets up only that one; none found is an error', () => {
@@ -198,7 +233,7 @@ test('a bare ~/.codex/sessions (setup.sh creates it for the Docker mount) does n
   expect(t.run()).toMatch(/Codex: registered/);
 });
 
-test('Claude Code with the feedback-graph plugin installed: nothing is registered or linked, so the tools are not doubled', () => {
+test('Claude Code with the feedback-graph plugin installed: refreshes its environment without doubling tools or skills', () => {
   const s = sandbox(['claude']);
   // `claude plugin list` names the plugin.
   writeFileSync(join(s.home, 'bin', 'claude'), `#!/bin/sh\necho "$*" >> '${s.calls}'\n[ "$1" = plugin ] && echo '  ❯ feedback-graph@feedback-graph'\n[ "$2" = get ] && exit 1\nexit 0\n`);
@@ -206,6 +241,7 @@ test('Claude Code with the feedback-graph plugin installed: nothing is registere
   expect(out).toMatch(/plugin/);
   expect(readFileSync(s.calls, 'utf8')).not.toContain('mcp add');
   expect(existsSync(join(s.home, '.claude', 'skills', 'feedback-graph'))).toBe(false);
+  expect(JSON.parse(readFileSync(join(s.home, '.claude', 'settings.json'), 'utf8')).env.FEEDBACK_GRAPH_URL).toBe('http://localhost:8787');
 });
 
 // Codex refuses MCP tool calls under `codex exec` (approval policy "never") unless the server's table says

@@ -5,6 +5,7 @@ import { getRecentSessions, getTaskContext, type ContextDeps } from './context.t
 import type { SessionsDeps } from './sessions.ts';
 
 const repo = { listCandidates: async () => [], candidateDetail: async () => null, decide: async () => {}, stats: async () => [] } as unknown as ApiRepo;
+const OWNER = 'owner-test-token-01234567890123456789';
 
 const item = (id: string, projectKey = 'demo', o: Partial<SessionListItem> = {}): SessionListItem => ({
   id, projectKey, source: 'claude', cwd: `/vibe/${projectKey}`, gitBranch: 'main', startedAt: '2026-10-22T09:00:00.000Z', lastActivityAt: '2026-10-22T10:00:00.000Z',
@@ -34,8 +35,8 @@ beforeEach(() => {
     requestRebuild: async (id) => { calls.rebuild.push(id); return true; },
   };
 });
-const app = () => createApp(repo, { sessions: { store, projects: () => ['demo', 'other'], inScope: (k) => k !== 'secret' } });
-const post = (path: string, origin?: string) => ({ method: 'POST', body: '{}', headers: { 'content-type': 'application/json', ...(origin ? { origin, 'sec-fetch-site': 'same-origin' } : {}) } });
+const app = () => createApp(repo, { auth: { ownerToken: OWNER }, sessions: { store, projects: () => ['demo', 'other'], inScope: (k) => k !== 'secret' } });
+const post = (path: string, origin?: string) => ({ method: 'POST', body: '{}', headers: { 'content-type': 'application/json', ...(origin ? { authorization: `Bearer ${OWNER}`, 'x-fg-owner': 'true' } : {}) } });
 
 test('GET /api/sessions lists the selected projects, newest first, with an opaque cursor for the next page', async () => {
   const res = await app().request('/api/sessions?state=idle&limit=10');

@@ -249,6 +249,8 @@ const routes = (a = appSchemas): Record<string, Partial<Record<Method, Route>>> 
   },
 
   '/api/projects': { GET: { tag: 'projects', summary: 'The shown projects, pinned first', response: 'ProjectSummary[]' } },
+  '/api/demo/seed': { POST: { tag: 'projects', summary: 'Prepare the bundled local-only demo probe corpus', response: '{ project, lessons, misses, facts, message, probe }' } },
+  '/api/demo/remove': { POST: { tag: 'projects', summary: 'Remove the bundled local-only demo probe corpus', response: '{ project, lessons, misses, facts, message }' } },
   '/api/projects/scan': { POST: { tag: 'projects', summary: 'Queue scans of many folders (keys, or all: true)', body: a.BatchScanRequest, response: '{ results: [{ key, queued, job? | error? }] }', status: 202 } },
   '/api/projects/{key}': { DELETE: { tag: 'projects', summary: 'Delete everything learned from a project', body: ConfirmKey, response: '{ removed, note }' } },
   '/api/projects/{key}/scan/{id}/cancel': { POST: { tag: 'projects', summary: 'Cancel a queued scan before it starts', response: 'no content', status: 204 } },
@@ -272,6 +274,7 @@ const routes = (a = appSchemas): Record<string, Partial<Record<Method, Route>>> 
   '/api/links/{id}': { DELETE: { tag: 'links', summary: 'Remove a link', response: 'no content', status: 204 } },
 
   '/api/projects/{key}/codemap/hotspots': { GET: { tag: 'codemap', summary: 'A project\'s hotspots', query: a.hotspotQuery(null), response: '{ meta, capped, hotspots }' } },
+  '/api/projects/{key}/codemap': { DELETE: { tag: 'codemap', summary: 'Drop one project\'s derived code map while preserving source facts and session evidence', response: 'no content', status: 204 } },
   '/api/projects/{key}/codemap/rebuild': { POST: { tag: 'codemap', summary: 'Remap a project from scratch at the worker\'s next pass', response: '{ queued: true }', status: 202 } },
   '/api/projects/{key}/codemap/graph': { GET: { tag: 'codemap', summary: 'The Graph page\'s code mode', query: a.MapGraphQuery, response: 'MapGraph & { meta, capped }' } },
   '/api/projects/{key}/codemap/module': { GET: { tag: 'codemap', summary: 'One file\'s module context', query: z.object({ path: a.RepoPath }), response: 'ModuleContext' } },
@@ -343,6 +346,8 @@ const SCHEMA_OF: Record<string, JsonSchema> = {
   'POST /api/candidates/decisions': RESULTS(obj({ id: str, ok: bool, status: str, error: str }, ['id', 'ok'])),
   'POST /api/feedback/{id}/retry': QUEUED,
   'POST /api/turns/requeue': obj({ requeued: int }),
+  'POST /api/demo/seed': loose('The prepared local-only demo corpus and its isolated judge probe'),
+  'POST /api/demo/remove': loose('Counts and cleanup note for the removed local-only demo corpus'),
   'POST /api/projects/scan': RESULTS(obj({ key: str, queued: bool, job: ref('ScanJob'), error: str }, ['key', 'queued'])),
   'DELETE /api/projects/{key}': obj({ removed: loose('What was deleted, by kind'), note: str }),
   'GET /api/scans/{id}': { allOf: [ref('ScanJob'), obj({ queuePosition: nullable(int) })] },

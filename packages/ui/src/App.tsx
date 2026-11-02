@@ -199,10 +199,10 @@ function SignIn({ onDone }: { onDone: () => void }) {
           <div>
             <p className="font-semibold">Sign in</p>
             <p className="mt-0.5 text-muted">
-              This server is protected. Enter the access token (<code className="font-mono text-xs">API_TOKEN</code> in its <code className="font-mono text-xs">.env</code>).
+              This server is protected. Enter the owner sign-in token (<code className="font-mono text-xs">FG_OWNER_TOKEN</code> in its <code className="font-mono text-xs">.env</code>). Do not use the agent <code className="font-mono text-xs">API_TOKEN</code> here.
             </p>
           </div>
-          <Input aria-label="access token" type="password" autoComplete="current-password" autoFocus value={token} onChange={(e) => setToken(e.target.value)} placeholder="access token" />
+          <Input aria-label="owner token" type="password" autoComplete="current-password" autoFocus value={token} onChange={(e) => setToken(e.target.value)} placeholder="owner token" />
           {error && <Alert>{error}</Alert>}
           <Button type="submit" variant="primary" disabled={!token.trim()}>Sign in</Button>
         </div>

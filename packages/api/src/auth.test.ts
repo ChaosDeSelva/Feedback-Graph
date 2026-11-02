@@ -11,7 +11,8 @@ const repo: ApiRepo = {
 };
 
 const TOKEN = 'a-long-random-token-0123456789';
-const secured = () => createApp(repo, { auth: { token: TOKEN, publicHosts: ['fg.corp.example'] } });
+const OWNER = 'an-owner-only-token-0123456789012345';
+const secured = () => createApp(repo, { auth: { token: TOKEN, ownerToken: OWNER, publicHosts: ['fg.corp.example'] } });
 const bearer = { authorization: `Bearer ${TOKEN}` };
 
 test('with a token configured, the API refuses requests without it', async () => {
@@ -40,7 +41,7 @@ test('signing in from the UI sets an HttpOnly session cookie that authenticates 
   const app = secured();
   const bad = await app.request('/api/session', { method: 'POST', headers: { 'content-type': 'application/json', 'sec-fetch-site': 'same-origin', origin: 'http://localhost' }, body: JSON.stringify({ token: 'nope' }) });
   expect(bad.status).toBe(401);
-  const res = await app.request('/api/session', { method: 'POST', headers: { 'content-type': 'application/json', 'sec-fetch-site': 'same-origin', origin: 'http://localhost' }, body: JSON.stringify({ token: TOKEN }) });
+  const res = await app.request('/api/session', { method: 'POST', headers: { 'content-type': 'application/json', 'sec-fetch-site': 'same-origin', origin: 'http://localhost' }, body: JSON.stringify({ token: OWNER }) });
   expect(res.status).toBe(204);
   const cookie = res.headers.get('set-cookie')!;
   expect(cookie).toMatch(/HttpOnly/i);
@@ -48,16 +49,16 @@ test('signing in from the UI sets an HttpOnly session cookie that authenticates 
   expect(cookie).not.toContain(TOKEN);
   const session = cookie.split(';')[0];
   expect((await app.request('/api/candidates', { headers: { cookie: session } })).status).toBe(200);
-  const second = await app.request('/api/session', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ token: TOKEN }) });
+  const second = await app.request('/api/session', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ token: OWNER }) });
   expect(second.headers.get('set-cookie')!.split(';')[0]).not.toBe(session);
-  await app.request('/api/session', { method: 'DELETE', headers: { cookie: session } });
+  expect((await app.request('/api/session', { method: 'DELETE', headers: { cookie: session, 'content-type': 'application/json' } })).status).toBe(204);
   expect((await app.request('/api/candidates', { headers: { cookie: session } })).status).toBe(401);
 });
 
 test('the UI can ask whether it needs to sign in', async () => {
   expect(await (await secured().request('/api/session')).json()).toEqual({ authRequired: true, authenticated: false, ownerSession: false });
-  expect(await (await secured().request('/api/session', { headers: bearer })).json()).toEqual({ authRequired: true, authenticated: true, ownerSession: false });
-  expect(await (await createApp(repo).request('/api/session')).json()).toEqual({ authRequired: false, authenticated: true, ownerSession: false });
+  expect(await (await secured().request('/api/session', { headers: bearer })).json()).toEqual({ authRequired: true, authenticated: false, ownerSession: false });
+  expect(await (await createApp(repo).request('/api/session')).json()).toEqual({ authRequired: false, authenticated: false, ownerSession: false });
   expect((await createApp(repo).request('/api/session', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ token: 'anything' }) })).status).toBe(403);
 });
 
@@ -72,7 +73,7 @@ test('behind a TLS proxy, the signed-in browser session may write but its API be
   const login = await app.request('http://fg.corp.example/api/session', {
     method: 'POST',
     headers: { host: 'fg.corp.example', 'sec-fetch-site': 'same-origin', origin: 'https://fg.corp.example', 'content-type': 'application/json' },
-    body: JSON.stringify({ token: TOKEN }),
+    body: JSON.stringify({ token: OWNER }),
   });
   const cookie = login.headers.get('set-cookie')!.split(';')[0];
   const headers = { host: 'fg.corp.example', 'sec-fetch-site': 'same-origin', origin: 'https://fg.corp.example', 'content-type': 'application/json' };

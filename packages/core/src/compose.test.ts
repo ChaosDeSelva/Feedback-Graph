@@ -92,6 +92,17 @@ test('external container images use immutable manifest digests in production and
   }
 });
 
+test('the build verifies pinned npm tarballs before installing them globally', () => {
+  const dockerfile = readFileSync(join(repo, 'Dockerfile'), 'utf8');
+  expect(dockerfile).toContain('npm pack pnpm@11.13.1');
+  expect(dockerfile).toMatch(/ARG PNPM_TGZ_SHA512=[0-9a-f]{128}/);
+  expect(dockerfile).toMatch(/ARG CLAUDE_TGZ_SHA512=[0-9a-f]{128}/);
+  expect(dockerfile.match(/ARG CODEX_TGZ_SHA512=[0-9a-f]{128}/g)).toHaveLength(2);
+  expect(dockerfile).toContain('sha512sum -c -');
+  expect(dockerfile).toContain('npm install --global /tmp/pnpm-11.13.1.tgz --ignore-scripts');
+  expect(dockerfile).not.toMatch(/npm (?:i|install) -g /);
+});
+
 
 test('archive volume initialization creates its private directory before chown so Docker cannot overwrite fresh HOST_UID ownership by copy-up', () => {
   const compose = readFileSync(join(repo, 'docker-compose.yml'), 'utf8');

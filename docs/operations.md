@@ -40,7 +40,7 @@ Logs are one JSON object per line (`docker compose logs -f worker api`). The API
 
 1. Put it behind a TLS reverse proxy (Caddy, nginx, a cloud load balancer) that forwards `X-Forwarded-Proto`.
 2. In `.env`: `API_TOKEN=$(openssl rand -hex 24)`, `PUBLIC_HOSTS=feedback.example.com`, `API_BIND=0.0.0.0`. The API refuses to start with a non-loopback `API_BIND` and no `API_TOKEN`.
-3. People sign in once in the browser with the token. Agents: `FEEDBACK_GRAPH_URL=https://feedback.example.com ./scripts/install-agent.sh` registers the MCP server with the token, for Claude Code and for Codex (in `~/.codex/config.toml` as a static `Authorization` header in `http_headers`; the file is then made readable by you only).
+3. People sign in once in the browser with `FG_OWNER_TOKEN`. Never give that credential to an agent. Agents use the separate `API_TOKEN`: `FEEDBACK_GRAPH_URL=https://feedback.example.com ./scripts/install-agent.sh` registers the MCP server with it for Claude Code and Codex (in `~/.codex/config.toml` as a static `Authorization` header in `http_headers`; the file is then made readable by you only).
 
 Without a token the API refuses every host name except localhost, by design. This is still one person's graph; see [Editions](editions.md) for the team edition.
 
@@ -393,7 +393,7 @@ GitHub recovery in 0.6.9 checks retained masked PR documents directly, at most f
 Local lesson PATCH responses now return 200 with `{ id, status, sharing }`. Bulk decision responses include the same sharing notice; Activity and CLI JSON report it too. Approval or editing saves locally and does not dispatch a cloud sync: eligible changes leave at the next scheduled sync or Sync now.
 
 
-For the isolated hooks probe, follow [the canonical probe launch instructions](demo-probe.md): Claude hooks read `FEEDBACK_GRAPH_TOKEN`; the CLI reads `FG_OPERATOR_TOKEN`. Codex requires explicit shell-environment pass-through and workspace network access for the local API. Owner routes require an authenticated browser session, or explicit `FG_OWNER_TOKEN` plus `X-FG-Owner: true`; API and operator tokens cannot become owner credentials. Headless `--owner` requires `FG_OWNER_TOKEN`, and `--local-owner` is no longer supported.
+For the isolated hooks probe, follow [the canonical probe launch instructions](demo-probe.md): Claude hooks and Codex MCP read `FEEDBACK_GRAPH_TOKEN` (the install's API token) plus the private sandbox `FG_RUN_KEY`. That capability can manage only the bundled local-only demo fixture. Codex requires explicit shell-environment pass-through and workspace network access for the local API. Owner routes require an authenticated browser session, or explicit `FG_OWNER_TOKEN` plus `X-FG-Owner: true`; API and operator tokens cannot become owner credentials. Headless `--owner` requires `FG_OWNER_TOKEN`, and `--local-owner` is no longer supported.
 
 
 Inbox and Lessons filter values are preserved in their URL hash so a refreshed or shared link reopens the same view. A link whose target is deleted or outside the loaded filters never opens an unrelated first item. Inbox decisions offer Undo while the decision is unchanged and no post-mortem attempt or derived miss/lesson exists; once processing starts, Undo refuses and asks you to review the resulting data. The audited reopen preserves decision history. Activity can collapse identical repeated scan-retry entries in the loaded page; the full historical entries remain available by unchecking the filter.
