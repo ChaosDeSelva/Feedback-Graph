@@ -7,12 +7,14 @@ const repo = {
   candidateDetail: async () => ({ candidate: cand, turn: { text: 't' }, before: [], after: [], commits: [], postmortem: { done: false, attempts: 3, lastError: 'fixture', retryAt: null, gaveUp: true } }),
 } as unknown as ApiRepo;
 const lesson = { id: 'l1', projectKey: 'shop', title: 'T', rule: 'R', appliesWhen: 'W', scope: 'project', status: 'proposed' };
+const OWNER = 'owner-route-test-token-01234567890123456789';
 const app = createApp(repo, {
+  auth: { ownerToken: OWNER },
   knowledge: { listLessons: async () => [], lessonDetail: async () => ({ lesson }), updateLesson: async () => ({ unscoped: false }), retryPostmortem: async () => true } as never,
 });
 const req = (method: string, body: object, origin?: string) => ({
   method, body: JSON.stringify(body),
-  headers: { 'content-type': 'application/json', ...(origin ? { origin, 'sec-fetch-site': 'same-origin' } : {}) },
+  headers: { 'content-type': 'application/json', ...(origin ? { authorization: `Bearer ${OWNER}`, 'x-fg-owner': 'true' } : {}) },
 });
 
 test('approving a lesson or deciding feedback needs the UI (a browser Origin); a bare local client is refused', async () => {
@@ -36,6 +38,7 @@ test('turns the classifier gave up on are re-queued from the UI only, and the re
   const logged: { kind: string; actor: string; subject: string }[] = [];
   let requeued = 0;
   const a = createApp(repo, {
+    auth: { ownerToken: OWNER },
     classifyQueue: { givenUpTurns: async () => 4, requeueGivenUpTurns: async () => { requeued++; return 4; } },
     activity: { record: async (e: { kind: string; actor: string; subject: string }) => { logged.push(e); }, list: async () => [] } as never,
   });
@@ -50,7 +53,7 @@ test('turns the classifier gave up on are re-queued from the UI only, and the re
 
 test('Undo validates and authorizes before mutation, audits success and refuses processed decisions', async () => {
   let writes = 0; let ok = false; const history: unknown[] = [];
-  const a = createApp({ ...repo, undoDecision: async () => { writes++; return ok; } }, { activity: { list: async () => [], record: async e => { history.push(e); } } });
+  const a = createApp({ ...repo, undoDecision: async () => { writes++; return ok; } }, { auth: { ownerToken: OWNER }, activity: { list: async () => [], record: async e => { history.push(e); } } });
   const path = '/api/candidates/c1/undo'; const when = '2026-10-01T10:00:00.000Z';
   expect((await a.request(path, req('POST', { decidedAt: when }))).status).toBe(403);
   expect((await a.request(path, req('POST', { decidedAt: 'bad' }, 'http://localhost'))).status).toBe(400);

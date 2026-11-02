@@ -4,6 +4,7 @@ import { createApp, type ApiRepo, type SettingsDeps } from './app.ts';
 import type { SavedRoots } from './roots.ts';
 
 const repo = { listCandidates: async () => [], candidateDetail: async () => null, decide: async () => {}, stats: async () => [] } as ApiRepo;
+const OWNER = 'settings-owner-token-01234567890123456789';
 
 const snapshot: CandidateSnapshot = {
   builtAt: '2026-10-23T00:00:00Z',
@@ -62,6 +63,7 @@ function setup(o: { roots?: number; selection?: ProjectSelection; snapshot?: Can
     }),
   };
   const app = createApp(repo, {
+    auth: { ownerToken: OWNER },
     settings,
     activity: { record: async (a) => { log.push(a); }, list: async () => [] },
     portability: { exportData: async () => { throw new Error('unused'); }, deleteProject: async (k) => { deleted.push(k); locked.push(inSection ? `delete ${k}` : `delete ${k} OUTSIDE`); return 10; } },
@@ -70,7 +72,8 @@ function setup(o: { roots?: number; selection?: ProjectSelection; snapshot?: Can
   return { app, log, deleted, locked, forgotten, sel: () => sel, saved: () => saved };
 }
 
-const ui = { 'sec-fetch-site': 'same-origin', origin: 'http://localhost', 'content-type': 'application/json' };
+const owner = { authorization: `Bearer ${OWNER}`, 'x-fg-owner': 'true' };
+const ui = { ...owner, 'content-type': 'application/json' };
 const put = (body: unknown, headers: Record<string, string> = ui) => ({ method: 'PUT', headers, body: JSON.stringify(body) });
 
 test('GET lists every candidate folder with its sessions, selection, exclusion, alias and data', async () => {
@@ -105,7 +108,7 @@ test('PUT is yours alone: from the UI, as JSON', async () => {
   const { app } = setup();
   expect((await app.request('/api/settings/projects', put({ tracked: ['demo-shop'] }, { 'content-type': 'application/json' }))).status).toBe(403);
   expect((await app.request('/api/settings/projects', put({ tracked: ['demo-shop'] }, { origin: 'http://evil.example', 'content-type': 'application/json' }))).status).toBe(403);
-  expect((await app.request('/api/settings/projects', { method: 'PUT', headers: { 'sec-fetch-site': 'same-origin', origin: 'http://localhost' }, body: '{}' })).status).toBe(415);
+  expect((await app.request('/api/settings/projects', { method: 'PUT', headers: owner, body: '{}' })).status).toBe(415);
 });
 
 test('PUT saves the selection, logs who changed what and why, and returns the new list', async () => {
@@ -117,7 +120,7 @@ test('PUT saves the selection, logs who changed what and why, and returns the ne
   expect(body.tracked).toEqual(['brand-new', 'demo-shop', 'gone']);
   expect(log).toEqual([expect.objectContaining({
     kind: 'projects_selected', actor: 'you', projectKey: null,
-    details: { added: ['brand-new', 'gone'], removed: [], tracked: ['brand-new', 'demo-shop', 'gone'], via: 'browser' },
+    details: { added: ['brand-new', 'gone'], removed: [], tracked: ['brand-new', 'demo-shop', 'gone'], via: 'api' },
   })]);
   expect(log[0].why).toMatch(/next cycle/);
 });
@@ -183,7 +186,7 @@ test('cleanup removes the data of every project that is not selected, and only t
   expect(res.status).toBe(200);
   expect(await res.json()).toEqual({ removed: ['client', 'old-one'], nodesRemoved: 20 });
   expect(deleted).toEqual(['client', 'old-one']);
-  expect(log).toEqual([expect.objectContaining({ kind: 'projects_cleaned', actor: 'you', projectKey: null, details: { projects: ['client', 'old-one'], nodesRemoved: 20, via: 'browser' } })]);
+  expect(log).toEqual([expect.objectContaining({ kind: 'projects_cleaned', actor: 'you', projectKey: null, details: { projects: ['client', 'old-one'], nodesRemoved: 20, via: 'api' } })]);
 });
 
 test('cleanup keeps data filed under a clone of a selected project, and deletes a clone of an unselected one', async () => {
@@ -264,7 +267,7 @@ test('PUT /api/settings/roots saves the roots for setup.sh to mount, and logs it
   expect(body.pendingRoots).toEqual(['/Users/me/Vibe', '/Users/me/work', '/Users/me/games']);
   expect(log).toEqual([expect.objectContaining({
     kind: 'roots_saved', actor: 'you', projectKey: null,
-    details: { roots: ['/Users/me/Vibe', '/Users/me/work', '/Users/me/games'], added: ['/Users/me/work', '/Users/me/games'], removed: [], via: 'browser' },
+    details: { roots: ['/Users/me/Vibe', '/Users/me/work', '/Users/me/games'], added: ['/Users/me/work', '/Users/me/games'], removed: [], via: 'api' },
   })]);
   expect(log[0].why).toContain('./scripts/setup.sh');
 });

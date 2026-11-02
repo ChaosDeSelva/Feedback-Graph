@@ -4,11 +4,13 @@ import { createApp, type ApiRepo } from './app.ts';
 
 const repo = { listCandidates: async () => [], candidateDetail: async () => null, decide: async () => {}, stats: async () => [] } as ApiRepo;
 const bundle = { format: 'feedback-graph-export', schemaVersion: 1, exportedAt: '2026-10-22T00:00:00Z', projectKey: 'demo', lessons: [], misses: [], facts: [], docs: [] } as unknown as ExportBundle;
+const OWNER = 'portability-owner-token-0123456789012345';
 
 function app() {
   const calls: unknown[] = [];
   const log: ActivityInput[] = [];
   const a = createApp(repo, {
+    auth: { ownerToken: OWNER },
     portability: {
       exportData: async (o) => { calls.push(['export', o]); return bundle; },
       deleteProject: async (k) => { calls.push(['delete', k]); return 42; },
@@ -20,7 +22,7 @@ function app() {
   });
   return { a, calls, log };
 }
-const ui = { 'sec-fetch-site': 'same-origin', origin: 'http://localhost', 'content-type': 'application/json' };
+const ui = { authorization: `Bearer ${OWNER}`, 'x-fg-owner': 'true', 'content-type': 'application/json' };
 
 test('export downloads a JSON bundle for a project, optionally approved lessons only', async () => {
   const { a, calls } = app();

@@ -8,6 +8,7 @@ const repo = {
   candidateDetail: async (id: string) => (id === 'c1' ? { candidate: cand, turn: { text: 'not good enough' }, before: [], after: [], commits: [] } : null),
 } as unknown as ApiRepo;
 const lesson = { id: 'lesson:1', projectKey: 'shop', title: 'Scope queries', rule: 'use scoped', appliesWhen: 'routes', scope: 'project', status: 'proposed' };
+const OWNER = 'activity-owner-token-01234567890123456789';
 
 const entry = (projectKey: string) => ({ id: 'act:1', ts: 't', kind: 'scan_finished' as const, actor: 'm', projectKey, subject: 's', why: 'w', details: { log: 'long' }, targets: [] });
 
@@ -15,6 +16,7 @@ function setup() {
   const recorded: ActivityInput[] = [];
   const listed: object[] = [];
   const app = createApp(repo, {
+    auth: { ownerToken: OWNER },
     knowledge: {
       listLessons: async () => [],
       lessonDetail: async (id: string) => (id === lesson.id ? { lesson, miss: null, feedback: null, contextItems: [], fixCommits: [], supersedes: [] } : null),
@@ -29,14 +31,14 @@ function setup() {
   });
   return { app, recorded, listed };
 }
-const json = (method: string, body: object) => ({ method, headers: { 'content-type': 'application/json', 'sec-fetch-site': 'same-origin', origin: 'http://localhost' }, body: JSON.stringify(body) });
+const json = (method: string, body: object) => ({ method, headers: { 'content-type': 'application/json', authorization: `Bearer ${OWNER}`, 'x-fg-owner': 'true' }, body: JSON.stringify(body) });
 
 test('confirming a candidate logs your decision with the feedback text and your note', async () => {
   const { app, recorded } = setup();
   await app.request('/api/candidates/c1/decision', json('POST', { status: 'confirmed', note: 'missed tenant scoping' }));
   expect(recorded).toEqual([{
     kind: 'feedback_decided', actor: 'you', projectKey: 'shop', subject: 'confirmed: "not good enough"',
-    why: 'missed tenant scoping', details: { status: 'confirmed', classifier: { label: 'pushback', confidence: 0.9 }, via: 'browser' }, targets: ['c1'],
+    why: 'missed tenant scoping', details: { status: 'confirmed', classifier: { label: 'pushback', confidence: 0.9 }, via: 'api' }, targets: ['c1'],
   }]);
 });
 
