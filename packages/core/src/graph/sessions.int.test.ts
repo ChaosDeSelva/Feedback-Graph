@@ -73,7 +73,10 @@ describeStores('SessionsStore', (h) => {
     await repo.upsertSession(demo, session('owner-session', 1, MIN), []);
     expect(await s.claimRun('owner-session', run)).toBe(false);
     expect(await s.runFor('owner-session')).toBeNull();
-    expect((await h.probe.rows('Session')).find((r) => r.id === 'owner-session')).not.toHaveProperty('run');
+    // Neo4j omits an unset property while Postgres exposes its nullable column.
+    // In either store, the important invariant is that the existing owner session
+    // was not attributed to the sandbox run.
+    expect((await h.probe.rows('Session')).find((r) => r.id === 'owner-session')?.run ?? null).toBeNull();
   });
 
   test('upsertSession keeps the turn count, last turn and last activity; the list is newest first and leaves agent reports out', async () => {

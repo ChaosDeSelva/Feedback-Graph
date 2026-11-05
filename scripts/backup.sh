@@ -34,19 +34,29 @@ if [ "$STORE" = postgres ]; then
   ( cd "$out" && shasum -a 256 postgres.dump state.tgz STORE > SHA256SUMS )
 else
   image="$(printf '%s' "$compose_json" | json_field services.neo4j.image)"
+  neo4j_volume="$(printf '%s' "$compose_json" | json_field volumes.neo4j-data.name)"
+  [ -n "$neo4j_volume" ] || neo4j_volume="${project}_neo4j-data"
   mkdir -p "$out"
   chmod 700 "$out"
   running="$(docker compose ps --services --status running)"
+  dump_container="${project}_neo4j-backup-$$"
   echo "stopping the stack for a consistent dump"
   docker compose stop api worker neo4j >/dev/null
   restart_stack() {
+    docker rm -f "$dump_container" >/dev/null 2>&1 || true
     echo "restarting"
     # shellcheck disable=SC2086 # one service name per word, captured from compose ps
     [ -z "$running" ] || docker compose up -d $running >/dev/null
   }
   trap 'restart_stack; cleanup_incomplete' EXIT
-  docker run --rm -v "${project}_neo4j-data:/data" -v "$PWD/$out:/backups" "$image" \
-    neo4j-admin database dump neo4j --to-path=/backups >/dev/null
+  # Do not bind the owner-only backup directory into the image: the image intentionally drops to its unprivileged
+  # neo4j user, which cannot traverse a host directory created with mode 0700. Keep the dump in the short-lived
+  # container and let the Docker daemon copy the completed file to the host instead.
+  docker create --name "$dump_container" -v "$neo4j_volume:/data" "$image" \
+    neo4j-admin database dump neo4j --to-path=/tmp >/dev/null
+  docker start -a "$dump_container" >/dev/null
+  docker cp "$dump_container:/tmp/neo4j.dump" "$out/neo4j.dump"
+  docker rm "$dump_container" >/dev/null
   tar --exclude='state/settings/redaction-archive/key' --exclude='state/redaction-key' -czf "$out/state.tgz" state
   echo neo4j > "$out/STORE"
   ( cd "$out" && shasum -a 256 neo4j.dump state.tgz STORE > SHA256SUMS )
