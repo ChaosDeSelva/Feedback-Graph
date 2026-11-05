@@ -57,15 +57,24 @@ if [ "$kind" = postgres ]; then
   # shellcheck disable=SC2086 # one service name per word
   [ -z "$running" ] || docker compose up -d $running >/dev/null
 else
-  project="$(docker compose config --format json | json_field name)"
-  image="$(docker compose config --format json | json_field services.neo4j.image)"
+  compose_json="$(docker compose config --format json)"
+  project="$(printf '%s' "$compose_json" | json_field name)"
+  image="$(printf '%s' "$compose_json" | json_field services.neo4j.image)"
+  neo4j_volume="$(printf '%s' "$compose_json" | json_field volumes.neo4j-data.name)"
+  [ -n "$neo4j_volume" ] || neo4j_volume="${project}_neo4j-data"
   running="$(docker compose ps --services --status running)"
   docker compose stop api worker neo4j >/dev/null
-  docker run --rm -v "${project}_neo4j-data:/data" -v "$PWD/$src:/backups:ro" "$image" \
-    neo4j-admin database load neo4j --from-path=/backups --overwrite-destination=true >/dev/null
+  load_container="${project}_neo4j-restore-$$"
+  # The backup folder is owner-only. Copy the archive through the Docker daemon instead of bind-mounting it into the
+  # unprivileged Neo4j image; this also works when the caller supplies an absolute backup path.
+  docker create --name "$load_container" -v "$neo4j_volume:/data" "$image" \
+    neo4j-admin database load neo4j --from-path=/tmp --overwrite-destination=true >/dev/null
+  docker cp "$src/neo4j.dump" "$load_container:/tmp/neo4j.dump"
+  docker start -a "$load_container" >/dev/null
+  docker rm "$load_container" >/dev/null
   rm -rf state && tar -xzf "$src/state.tgz"
   restore_runner_disabled
   # shellcheck disable=SC2086 # one service name per word
-  [ -z "$running" ] || docker compose up -d $running >/dev/null
+  [ -z "$running" ] || docker compose up -d --wait --wait-timeout 120 $running >/dev/null
 fi
 echo "restored from $src"
