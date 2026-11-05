@@ -646,7 +646,7 @@ export async function getTaskContext(
     why: 'an agent called get_task_context before starting the task',
     details: {
       task: redactSecrets(q.task),
-      ...(files.length ? { files } : {}),
+      ...((q.files?.length ?? 0) ? { files: taskFiles({ ...q, task: '' }, d.roots) } : {}),
       ...(found.services.length ? { services: found.services } : {}),
       lessons: lessons.map((h) => ({ id: h.lesson.id, title: h.lesson.title, score: h.score, ...(h.files ? { files: h.files } : {}) })),
       ...(related.length ? { related: related.map((h) => ({ id: h.lesson.id, title: h.lesson.title, score: h.score })) } : {}),
@@ -690,7 +690,7 @@ async function briefFiles(project: Project, files: string[], mods: (ModuleContex
  * get_task_context with brief: the approved lessons, the misses on the named files, who imports and tests them, and
  * PR discussions, in about BRIEF_MAX characters; nothing else is searched. Says what it left out.
  */
-async function briefContext(q: ProjectRef & { task: string; sessionId?: string }, project: Project, own: boolean, files: string[], embedding: number[], d: ContextDeps): Promise<TaskContext> {
+async function briefContext(q: ProjectRef & { task: string; files?: string[]; sessionId?: string }, project: Project, own: boolean, files: string[], embedding: number[], d: ContextDeps): Promise<TaskContext> {
   const projectKeys = await shownKeys(d);
   const [pool, byFile, mods, allDocs] = await Promise.all([
     d.k.searchLessons({ embedding, projectKey: own ? project.key : null, k: LESSON_POOL, ...(projectKeys && { projectKeys }) }),
@@ -731,9 +731,9 @@ async function briefContext(q: ProjectRef & { task: string; sessionId?: string }
     kind: 'context_served',
     actor: q.client ?? 'agent (MCP)',
     projectKey: project.key,
-    subject: `brief context for "${q.task}": ${n(lessons.length, 'lesson')}, ${n(fileMisses.length, 'past miss', 'past misses')} on the named files`,
+    subject: `brief context for "${oneLine(redactSecrets(q.task)).slice(0, 300)}": ${n(lessons.length, 'lesson')}, ${n(fileMisses.length, 'past miss', 'past misses')} on the named files`,
     why: 'an agent called get_task_context with brief',
-    details: { task: q.task, brief: true, ...(files.length ? { files } : {}), lessons: lessons.map((h) => ({ id: h.lesson.id, title: h.lesson.title, score: h.score })), fileMisses: fileMisses.map((m) => ({ id: m.missId, missed: m.missed, paths: m.paths })), docs: docs.map((h) => ({ ref: h.ref, title: h.title, score: h.score })), ...(cut.length ? { cut } : {}) },
+    details: { task: redactSecrets(q.task), brief: true, ...((q.files?.length ?? 0) ? { files: taskFiles({ ...q, task: '' }, d.roots) } : {}), lessons: lessons.map((h) => ({ id: h.lesson.id, title: h.lesson.title, score: h.score })), fileMisses: fileMisses.map((m) => ({ id: m.missId, missed: m.missed, paths: m.paths })), docs: docs.map((h) => ({ ref: h.ref, title: h.title, score: h.score })), ...(cut.length ? { cut } : {}) },
     targets: [...lessons.map((h) => h.lesson.id), ...fileMisses.map((m) => m.missId), ...sessionTarget(q)],
   });
   return { markdown: lines.join('\n'), lessons, misses: [], fileMisses, facts: [], docs, sessions: [], linked: [], project };
@@ -781,7 +781,7 @@ export async function searchGraph(q: ProjectRef & { query: string }, d: ContextD
         ]
       : []),
   ];
-  const top = [...excludedPrNote(d), `# Feedback Graph search for "${oneLine(q.query).slice(0, 200)}" in ${project.key}`, '', ...(own ? [DATA_NOTE] : [GLOBAL_ONLY(project.key)])];
+  const top = [...excludedPrNote(d), `# Feedback Graph search for "${oneLine(redactSecrets(q.query)).slice(0, 200)}" in ${project.key}`, '', ...(own ? [DATA_NOTE] : [GLOBAL_ONLY(project.key)])];
   const cutOf = (shown: number[]) => sections.flatMap((x, i) => (x.items.length > shown[i] ? [n(x.items.length - shown[i], x.kind[0], x.kind[1])] : []));
   const a = cappedAnswer(top, sections, SEARCH_MAX, (max, shown) => `Cut ${cutOf(shown).join(', ')} to stay under ${max.toLocaleString('en-US')} characters: narrow the query, or call get_task_context with the files you will touch.`);
   const lines = a.lines;
@@ -797,10 +797,10 @@ export async function searchGraph(q: ProjectRef & { query: string }, d: ContextD
     kind: 'context_served',
     actor: q.client ?? 'agent (MCP)',
     projectKey: project.key,
-    subject: `search for "${q.query}": ${n(servedLessons.length, 'lesson')}, ${n(servedMisses.length, 'past miss', 'past misses')}, ${n(servedFacts.length, 'fact')}`,
+    subject: `search for "${oneLine(redactSecrets(q.query)).slice(0, 200)}": ${n(servedLessons.length, 'lesson')}, ${n(servedMisses.length, 'past miss', 'past misses')}, ${n(servedFacts.length, 'fact')}`,
     why: 'an agent called search_graph',
     details: {
-      tool: 'search_graph', query: q.query, ...(services.length ? { services } : {}), lessons: servedLessons.map((h) => h.lesson.id),
+      tool: 'search_graph', query: redactSecrets(q.query), ...(services.length ? { services } : {}), lessons: servedLessons.map((h) => h.lesson.id),
       ...(related.length ? { related: related.slice(0, shownOf('possibly related lesson')).map((h) => h.lesson.id) } : {}),
       misses: servedMisses.map((m) => m.missId), facts: servedFacts.map((h) => h.fact.id), docs: servedDocs.map((h) => h.ref), ...(cut.length ? { cut } : {}),
     },
@@ -874,7 +874,7 @@ export async function checkBeforeDone(
     controller.signal.throwIfAborted();
     return Promise.race([d.embed(texts, { signal: controller.signal, timeoutMs: Math.max(1, deadline - Date.now()) }), expired]);
   };
-  if (d.activity) { const original = guard(d.activity.record.bind(d.activity)); bounded.activity = { record: async input => { const result = await original(input); if (input.kind === 'predone_check') activityRecorded = true; return result; } }; }
+  if (d.activity) { const original = guard(d.activity.record.bind(d.activity)); bounded.activity = { record: async input => { if (input.kind === 'predone_check') activityRecorded = true; return original(input); } }; }
   bounded.checkRetryBase = d.checkRetryIdentity ? createHash('sha256').update(JSON.stringify([d.checkRetryIdentity, currentRun(), q.project, q.cwd, q.task, q.summary, q.sessionId, [...(q.filesChanged ?? [])].sort()])).digest('hex') : undefined;
   bounded.checkRecord = (checkedLessonIds, gapLessonIds, status, verdicts = []) => { outcome = { checkedLessonIds, gapLessonIds, status, verdicts }; };
   bounded.excludedPrNumbers = new Set();
@@ -1599,6 +1599,7 @@ const INCOMPLETE = 'import graph incomplete';
 function graphGaps(key: string, meta: CodeMapMeta | null | undefined): string | null {
   if (!meta) return null;
   const parts: string[] = [];
+  if (meta.lastFailureAt) parts.push(`the latest rebuild failed at ${meta.lastFailureAt}${meta.lastFailure ? ` (${oneLine(redactSecrets(meta.lastFailure)).slice(0, 160)})` : ''}`);
   // Until the worker rebuilds a map from older map rules, nothing it says about importers can be called complete.
   const current = (meta.version ?? 0) >= CODE_MAP_VERSION;
   if (!current) parts.push(`the map of ${key} was built by older map rules (the worker rebuilds it from scratch on its next pass)`);
@@ -1900,7 +1901,7 @@ export async function reportFeedback(
     kind: 'candidate_flagged',
     actor: q.client ?? 'agent (MCP)',
     projectKey: project.key,
-    subject: `reported by an agent: "${q.feedback.slice(0, 80)}${q.feedback.length > 80 ? '…' : ''}"`,
+    subject: `reported by an agent: "${redactSecrets(q.feedback).slice(0, 80)}${q.feedback.length > 80 ? '…' : ''}"`,
     why: merged
       ? 'an agent called report_feedback about the same miss the detector had already flagged; the report was added to that inbox item'
       : 'an agent called report_feedback (for example from /postmortem); it waits in your inbox for your decision',

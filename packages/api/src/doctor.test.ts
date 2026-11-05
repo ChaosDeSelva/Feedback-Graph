@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { chmodSync, copyFileSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -84,18 +84,22 @@ exit 0`,
   *api/tags*) ${w.ollama === false ? 'exit 7' : `printf '%s' '${w.tags ?? BOTH}'`} ;;
   *api/chat*) printf '%s\n' "$*" >> '${join(base, 'chat-args')}'; cat '${join(base, 'chat')}' ;;
   *api/status*) [ -s '${join(base, 'status')}' ] || exit 7; cat '${join(base, 'status')}' ;;
+  */mcp*) printf '%s\n' "$*" >> '${join(base, 'mcp-args')}'; exit 0 ;;
   *) exit 7 ;;
 esac`,
   );
   const chatArgs = () => {
     try { return readFileSync(join(base, 'chat-args'), 'utf8'); } catch { return ''; }
   };
+  const mcpArgs = () => {
+    try { return readFileSync(join(base, 'mcp-args'), 'utf8'); } catch { return ''; }
+  };
   try {
     const out = execFileSync('bash', [join(repo, 'scripts', 'doctor.sh')], { env: { PATH: `${bin}:/usr/bin:/bin`, HOME: home, ...(w.shellUrl ? { FEEDBACK_GRAPH_URL: w.shellUrl } : {}) }, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] });
-    return { out, code: 0, chatArgs: chatArgs() };
+    return { out, code: 0, chatArgs: chatArgs(), mcpArgs: mcpArgs(), runnerDisabled: existsSync(join(repo, 'state/settings/codex-runner-disabled')) };
   } catch (e) {
     const x = e as { stdout?: string; status?: number };
-    return { out: String(x.stdout ?? ''), code: x.status ?? -1, chatArgs: chatArgs() };
+    return { out: String(x.stdout ?? ''), code: x.status ?? -1, chatArgs: chatArgs(), mcpArgs: mcpArgs(), runnerDisabled: existsSync(join(repo, 'state/settings/codex-runner-disabled')) };
   }
 }
 
@@ -176,6 +180,13 @@ test('never prints a secret from .env', () => {
   expect(out).toContain('PASS  Linear: signed in as Acme');
 });
 
+test('the token MCP probe requests the streamable HTTP response types', () => {
+  const checked = doctor({ env: `API_PORT=8787\nAPI_TOKEN=${'a'.repeat(32)}\n`, status: {} });
+  expect(checked.code).toBe(0);
+  expect(checked.out).toContain('PASS  MCP credential');
+  expect(checked.mcpArgs).toContain('Accept: application/json, text/event-stream');
+});
+
 test('the classifier on another provider skips the structured-output probe', () => {
   const { out } = doctor({ env: 'CLASSIFY_LLM=claude-cli\n', chat: { code: 501, body: '{}' }, status: {} });
   expect(out).toContain('SKIP  ollama structured output: the classifier runs on claude-cli');
@@ -205,9 +216,11 @@ test('configured runner health requires its actual sandbox probe to succeed', ()
   expect(failed.out).toContain('setup.sh --runner-procfs-compat');
   expect(failed.out).toContain('explicit opt-in removes Docker system-path protection');
   expect(failed.out).toContain("Can't mount proc /proc: Operation not permitted");
+  expect(failed.runnerDisabled).toBe(true);
   const healthy = doctor({ env, runnerSandbox: true, running: ['neo4j', 'worker', 'api', 'codex-runner'] });
   expect(healthy.code).toBe(0);
   expect(healthy.out).toContain('PASS  Codex runner: its nested sandbox starts successfully');
+  expect(healthy.runnerDisabled).toBe(false);
 });
 
 

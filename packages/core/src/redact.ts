@@ -10,7 +10,7 @@
  * 5: an instruction in an upload is one addressed to the reader-as-AI, not a project convention (facts v4 closed as
  * instructions are reopened); the head of a token an older Activity subject cut at its cap is redacted.
  */
-export const REDACTION_VERSION = 12;
+export const REDACTION_VERSION = 13;
 /** Rows a store reads per page when it redacts stored text again under new rules. */
 export const REDACT_PAGE = 1000;
 
@@ -96,6 +96,9 @@ const BLOCK_PATTERNS: RegExp[] = [
   /-----BEGIN PGP PRIVATE KEY BLOCK-----\r?\n(?:(?:Version|Comment):[^\r\n]*\r?\n|[ \t]*\r?\n|[A-Za-z0-9+/=]{8,}(?:\r?\n|$))+/g,
   /-----BEGIN (?:RSA |DSA |EC |OPENSSH |ENCRYPTED )?PRIVATE KEY-----[\s\S]*?-----END (?:RSA |DSA |EC |OPENSSH |ENCRYPTED )?PRIVATE KEY-----/g,
   /(?:^[ \t-]*(?:[\w.-]+:[ \t]*[>|][+-]?[ \t]*\r?\n)?^[ \t-]*)-----BEGIN (?:RSA |DSA |EC |OPENSSH |ENCRYPTED )?PRIVATE KEY-----\r?\n(?:(?:[ \t]*(?:Proc-Type|DEK-Info):[^\r\n]*\r?\n)|[ \t]*\r?\n|[ \t]*[A-Za-z0-9+/=]{8,}(?:\r?\n|$))+/gim,
+  // Unterminated keys pasted after prose or a field name. Keep this unanchored fallback after the structured
+  // line-start rule: a paste such as `key: -----BEGIN ...` is just as sensitive as a block on its own line.
+  /-----BEGIN (?:RSA |DSA |EC |OPENSSH |ENCRYPTED )?PRIVATE KEY-----\r?\n(?:(?:[ \t]*(?:Proc-Type|DEK-Info):[^\r\n]*\r?\n)|[ \t]*\r?\n|[ \t]*[A-Za-z0-9+/=]{8,}(?:\r?\n|$))+/gi,
   /-----BEGIN (?:RSA |DSA |EC |OPENSSH |ENCRYPTED )?PRIVATE KEY-----\\n(?:(?:(?:Proc-Type|DEK-Info):[^\\]*(?:\\n|$))|[A-Za-z0-9+/=]{8,}(?:\\n|$))+/g,
   /^PuTTY-User-Key-File-[23]: (?:ssh-|ecdsa-)[^\r\n]+\r?\n(?:(?!^PuTTY-User-Key-File-)[\s\S])*?^Private-Lines: \d+\r?\n(?:[A-Za-z0-9+/=]+\r?\n)+Private-MAC:[ \t]*[a-f0-9]+/gim,
 ];
@@ -107,6 +110,9 @@ const TOKEN_PATTERNS: RegExp[] = [
   /\b(AccountKey\s*=\s*)(?![<${])[^;\s"']{16,}/gi,
   /(\bmailgun(?:[ \t]+(?:api[ \t]+)?key)?[ \t]*(?:is[ \t]+|[:=][ \t]*)?)["']?(?:key-)?[a-f0-9]{32}(?:-[a-f0-9]{8,32}){0,3}\b/gi,
   /\bSK[a-fA-F0-9]{32}\b/g,
+  /\bAGE-SECRET-KEY-1[A-Z0-9]{40,}\b/g,
+  /\b(?:dckr_pat_|pscale_pw_|pplx-|nvapi-|xai-|r8_)[A-Za-z0-9_-]{16,}\b/g,
+  /\b(?:pul-[A-Za-z0-9_-]{20,}|1\/\/0[A-Za-z0-9_-]{20,}|EAAB[A-Za-z0-9_-]{20,})\b/g,
   /\bmfa\.[A-Za-z0-9_-]{40,}\b/g,
   /\$(?:2[aby]\$\d{2}\$[./A-Za-z0-9]{53}|(?:apr1|1)\$[./A-Za-z0-9]{1,8}\$[./A-Za-z0-9]{22}|5\$(?:rounds=\d+\$)?[./A-Za-z0-9]{1,16}\$[./A-Za-z0-9]{43}|6\$(?:rounds=\d+\$)?[./A-Za-z0-9]{1,16}\$[./A-Za-z0-9]{86}|argon2(?:id|i|d)\$v=\d+\$m=\d+,t=\d+,p=\d+\$[A-Za-z0-9+/]+=*\$[A-Za-z0-9+/]+=*)|\{SHA\}[A-Za-z0-9+/]{27}=/g,
   /\bsk-(?:proj-|ant-[a-z0-9]+-)?[A-Za-z0-9_-]{20,}/g,
@@ -129,7 +135,7 @@ const TOKEN_PATTERNS: RegExp[] = [
   /\bdapi[a-f0-9]{32,}\b/gi,
   /\b(?:sq0csp-|ATATT|figd_|ntn_|glsa_)[A-Za-z0-9_-]{16,}\b/g,
   /\bPMAK-[A-Za-z0-9_-]{16,}\b/g,
-  /\b\d{7,12}:[A-Za-z0-9_-]{30,}\b/g,
+  /\b(?:bot\s+|telegram(?:[ _-]?(?:token|url))?[^\r\n]{0,20})\d{7,12}:[A-Za-z0-9_-]{30,}\b/gi,
   /\b(SSWS[ \t]+)[A-Za-z0-9_-]{16,}\b/gi,
   // Feedback Graph Cloud personal access tokens: fgc_pat_<16 hex lookup id>_<secret>.
   /\bfgc_pat_[0-9a-f]{16}_[A-Za-z0-9_-]{20,}/g,
@@ -142,12 +148,15 @@ const TOKEN_PATTERNS: RegExp[] = [
   /(\bcurl\s+[^\r\n]*?--user(?:=|\s+)[^\s:'"]+:)([^\s'"]+)/gi,
   /(\bmysql(?:dump)?\s+[^\r\n]*?--password=)(?!\s|\$)[^\s'"]+/gi,
   /(\bmysql(?:dump)?\s+[^\r\n]*?\s-p)(?!\s|\$)[^\s'"]+/gi,
-  /(\b(?:docker\s+login|sshpass|redis-cli)\b[^\r\n]*?\s-(?:p|a)(?:=|\s+)["']?)(?!\s|\$)[^\s'"]+/gi,
+  /(\b(?:docker\s+login|sshpass)\b[^\r\n]*?\s-p(?:=|\s+)["']?)(?!\s|\$)[^\s'"]+/gi,
+  /(\bredis-cli\b[^\r\n]*?\s-a(?:=|\s+)["']?)(?!\s|\$)[^\s'"]+/gi,
   /(\brequests\.[a-z]+\([^\r\n]*?\bauth\s*=\s*\(\s*["'][^"']+["']\s*,\s*["'])([^"']+)(?=["']\s*\))/gi,
-  /(<password(?:\s[^>]*)?>)([^<\r\n]+)(?=<\/password>)/gi,
+  /(<password(?:\s[^>]*)?>)((?!\$\{|\{\{|<)[^<\r\n]+)(?=<\/password>)/gi,
   // A webhook URL is its own secret: the host and kind stay, the path that grants access goes.
   /\b(https?:\/\/hooks\.slack\.com\/(?:services|workflows|triggers)\/)[A-Za-z0-9_/-]{8,}/g,
   /\b(https?:\/\/(?:ptb\.|canary\.)?discord(?:app)?\.com\/api\/webhooks\/)\d+\/[A-Za-z0-9_-]{20,}/g,
+  /\b(https?:\/\/(?:api\.)?telegram\.org\/bot)\d{7,12}:[A-Za-z0-9_-]{30,}/gi,
+  /(^|\n)(\/\/[^\s:]+\/:_auth\s*=\s*)(?![$<{])[A-Za-z0-9+/]{12,}={0,2}(?=\s|$)/g,
   // A secret in a URL's query or fragment: ?token=, &api_key=, &sig=, #access_token=. Only values of 8+ characters with
   // a digit, a capital or an escape in them; a ${VAR}, {{template}} or <placeholder> stays, and so does ?key=name.
   /([?&#](?:[\w-]*[_-])?(?:token|api_?key|key|sig|signature|secret|password|passwd|pwd|X-Amz-Signature|X-Amz-Credential|X-Goog-Signature)=)(?![$<{])(?=[^\s&#"'<>\x60]*[0-9A-Z%])[^\s&#"'<>\x60]{8,}/gi,
@@ -217,7 +226,8 @@ function replaceTokens(text: string): string {
     const prefix = source.slice(Math.max(0, offset - 24), offset);
     const integrity = /(?:sha(?:256|384|512)|integrity|code[_ -]?challenge)[=:\s-]*$/i.test(prefix);
     const expression = /^[A-Za-z][A-Za-z]+\+\d+$/.test(value);
-    return highEntropy && !integrity && !expression ? '[REDACTED]' : value;
+    const functionCall = source[offset + value.length] === '(' && /^[A-Za-z_$][\w$]*$/.test(value);
+    return highEntropy && !integrity && !expression && !functionCall ? '[REDACTED]' : value;
   });
   out = out.replace(/(?<![A-Za-z0-9/+])(?=[A-Za-z0-9+\/]{40}(?![A-Za-z0-9/+]))(?=[A-Za-z0-9+\/]*\/)[A-Za-z0-9+\/]{40}/g,
     value => slashedSecret(value) && new Set(value).size >= 16 ? '[REDACTED]' : value);

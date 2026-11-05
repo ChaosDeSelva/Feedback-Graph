@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.7.3 (2026-11-04)
+
+- Preserve secure loopback owner access across Compose-only upgrades, explain owner-token setup in the UI and installation guide, and allow API-token demo sessions only with a sandbox flag and private run key.
+- Close mid-line private-key, MCP/query provenance and newly reported credential leaks while reducing redaction false positives and denying additional CLI credential stores.
+- Batch large Neo4j code-map cleanup, retain and surface rebuild failures, persist failed runner isolation, sanitize MCP capacity failures, and make identical check retries join in-flight work.
+- Correct stacked-PR parsing, cross-instance CLI credential guards, mobile lesson tables and disabled scan guidance; make cloud bulk reconciliation safe, observable and resumable.
+
 ## 0.7.2 (2026-11-02)
 
 - Separate random owner sessions from agent credentials, bind sandbox runs to private capabilities, refresh installed Claude/Codex credentials on rotation, and keep the bundled demo probe local without granting owner or operator authority.

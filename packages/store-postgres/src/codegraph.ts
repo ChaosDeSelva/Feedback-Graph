@@ -149,11 +149,18 @@ export class PgCodeGraphStore implements CodeGraphStore {
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
          ON CONFLICT (project_key) DO UPDATE SET fingerprint = EXCLUDED.fingerprint, built_at = EXCLUDED.built_at, files = EXCLUDED.files,
            symbols = EXCLUDED.symbols, imports = EXCLUDED.imports, tests = EXCLUDED.tests, candidates = EXCLUDED.candidates, unresolved = EXCLUDED.unresolved,
-           version = EXCLUDED.version`,
+           version = EXCLUDED.version, last_failure_at = NULL, last_failure = NULL`,
         [key, map.fingerprint, now, map.stats.files, map.stats.symbols, map.stats.imports, map.stats.tests, map.candidates, map.unresolved ?? null, map.version],
       );
     });
     return map.stats;
+  }
+
+  async recordCodeMapFailure(projectKey: string, error: string, now = new Date()): Promise<void> {
+    await this.q(`INSERT INTO code_maps (project_key, built_at, files, symbols, imports, tests, last_failure_at, last_failure)
+      VALUES ($1, $2, 0, 0, 0, 0, $2, $3)
+      ON CONFLICT (project_key) DO UPDATE SET last_failure_at = EXCLUDED.last_failure_at, last_failure = EXCLUDED.last_failure`,
+      [projectKey, now, error.slice(0, 500)]);
   }
 
   async purgeOrphanCodeFiles(limit: number, now = new Date()): Promise<number> {
@@ -235,7 +242,7 @@ export class PgCodeGraphStore implements CodeGraphStore {
   async codeMapMeta(projectKey: string): Promise<CodeMapMeta | null> {
     const { rows: [m] } = await this.q('SELECT * FROM code_maps WHERE project_key = $1', [projectKey]);
     if (!m) return null;
-    return { fingerprint: m.fingerprint ?? null, builtAt: iso(m.built_at)!, stats: { files: m.files, symbols: m.symbols, imports: m.imports, tests: m.tests }, candidates: m.candidates ?? null, unresolved: m.unresolved ?? null, version: m.version ?? null };
+    return { fingerprint: m.fingerprint ?? null, builtAt: iso(m.built_at)!, stats: { files: m.files, symbols: m.symbols, imports: m.imports, tests: m.tests }, candidates: m.candidates ?? null, unresolved: m.unresolved ?? null, version: m.version ?? null, lastFailureAt: iso(m.last_failure_at), lastFailure: m.last_failure ?? null };
   }
 
   async codeMap(projectKey: string): Promise<StoredCodeMap | null> {

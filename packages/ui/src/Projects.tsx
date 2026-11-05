@@ -237,7 +237,8 @@ export function Projects({ pollMs = 5000 }: { pollMs?: number } = {}) {
                   <Button variant="primary" onClick={scan} disabled={!!scanning} title={scanning ? `Scan ${current.lastScan?.status}; see Last scan below for details, or cancel a queued scan` : undefined}>Scan</Button>
                   {current.lastScan?.status === 'queued' && <>
                     <Button onClick={() => cancelScan()}>Cancel queued scan</Button>
-                    <Button disabled={!canSwitchProvider} title={!provider ? 'Choose an explicit provider first; default may be the one that is parked' : !canSwitchProvider ? 'Choose a different provider from the parked scan' : undefined} onClick={() => cancelScan(true)}>Switch provider and scan</Button>
+                    <Button disabled={!canSwitchProvider} aria-describedby={!canSwitchProvider ? 'switch-provider-help' : undefined} onClick={() => cancelScan(true)}>Switch provider and scan</Button>
+                    {!canSwitchProvider && <span id="switch-provider-help" className="basis-full text-xs text-muted">{!provider ? 'Choose an explicit provider first; the default may be the parked one.' : 'Choose a different provider from the parked scan.'}</span>}
                   </>}
                 </div>
               </header>

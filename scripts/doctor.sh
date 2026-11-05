@@ -139,6 +139,9 @@ if [ -n "$(envval CODEX_RUNNER_URL)" ]; then
     else fail "Codex runner: configured, but its container is not running for the live isolation probe"; runner_unsafe=1; fi
   else fail "Codex runner: configured but cannot be checked from a running worker"; runner_unsafe=1; fi
   if [ "$runner_unsafe" = 1 ]; then
+    mkdir -p state/settings
+    printf '%s\n' "disabled by doctor after a failed runner isolation probe" > state/settings/codex-runner-disabled
+    chmod 600 state/settings/codex-runner-disabled
     if "${compose[@]}" stop codex-runner >/dev/null 2>&1; then more "Stopped codex-runner: queued codex-cli jobs will remain parked."
     else more "Could not stop codex-runner automatically; stop it before allowing more jobs."; fi
   fi
@@ -277,6 +280,7 @@ if [ -z "$status" ]; then
 elif [ -z "$api_token" ]; then
   skip "MCP credential: API_TOKEN is not set (tokenless local install)"
 elif curl -fsS --max-time 10 -o /dev/null -H "Authorization: Bearer $api_token" -H 'Content-Type: application/json' \
+  -H 'Accept: application/json, text/event-stream' \
   --data '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"doctor","version":"1"}}}' \
   "http://localhost:$api_port/mcp" >/dev/null 2>&1; then
   pass "MCP credential: this install's API_TOKEN initializes the agent endpoint"

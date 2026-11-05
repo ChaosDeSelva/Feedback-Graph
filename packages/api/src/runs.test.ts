@@ -720,6 +720,21 @@ test('anonymous labelled session registration creates neither owner nor binding'
   expect(claims).toBe(0); expect(s.owners.size).toBe(0);
 });
 
+test('the API token may register a sandbox probe session only with its private run key', async () => {
+  let claims = 0;
+  const s = setup({ token: API, extra: { sessions: { projects: () => ['demo-shop'], inScope: () => true, store: {
+    list: async () => ({ sessions: [], next: null }), detail: async () => null, requestRebuild: async () => false,
+    runFor: async () => null, claimRun: async () => { claims++; return true; },
+  } } } });
+  const headers = { authorization: `Bearer ${API}`, 'x-fg-run': 'probe', 'x-fg-sandbox': '1', 'x-fg-run-key': KEY };
+  expect((await s.app.request('/api/sessions/probe-session/run', json('POST', {}, headers))).status).toBe(204);
+  expect(claims).toBe(1);
+  expect(s.owners.get('probe')).toMatchObject({ principal: 'agent', actor: CALLER });
+  const noSandbox = { ...headers, 'x-fg-run': 'unsafe', 'x-fg-sandbox': '0' };
+  expect((await s.app.request('/api/sessions/nope/run', json('POST', {}, noSandbox))).status).toBe(403);
+  expect(s.owners.has('unsafe')).toBe(false);
+});
+
 
 test('tokenless cleanup is refused even with forged same-origin browser headers', async () => {
   const s = setup({ owners: { legacy: ['operator', 'old-display-name'] } });

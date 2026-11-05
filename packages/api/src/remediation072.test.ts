@@ -12,9 +12,11 @@ import { buildChatContext } from './chat.ts';
 const OWNER = 'z'.repeat(48);
 const repo = { listCandidates: async () => [], candidateDetail: async () => null, decide: async () => {}, stats: async () => [] } as unknown as ApiRepo;
 
-test('series counters are not PR identities but real PR N of M prose remains a PR identity', () => {
+test('series counters in common stack notation are not PR identities', () => {
   expect(taskPrNumbers('review (PR 1/2) and (PR 2 of 3)')).toEqual([]);
-  expect(taskPrNumbers('review PR 17 of 30 selected PRs; #42')).toEqual([17, 42]);
+  expect(taskPrNumbers('review PR 17 of 30 selected PRs; #42')).toEqual([42]);
+  expect(taskPrNumbers('(PR #1 of 2), Stack: PR 1 of 2, see #14036')).toEqual([14036]);
+  expect(taskPrNumbers('PR 1/2 [PR 2/3] (#3 of 4)')).toEqual([]);
 });
 
 test('scoped map deletion requires owner authorization and never deletes the project', async () => {

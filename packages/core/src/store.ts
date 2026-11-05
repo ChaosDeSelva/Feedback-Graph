@@ -658,6 +658,8 @@ export interface CodeGraphStore {
    * back with a null fingerprint, never as current).
    */
   replaceCodeMap(projectKey: string, map: CodeMapWrite): Promise<CodeMapStats>;
+  /** Retain the last failed build so stale maps are never silently presented as current. */
+  recordCodeMapFailure(projectKey: string, error: string, now?: Date): Promise<void>;
   /** Ask the worker to remap the project from scratch; false when it has no map yet (the first one is on its way). */
   requestCodeMapRebuild(projectKey: string): Promise<boolean>;
   /** Drop one derived map without deleting project facts, feedback or transcripts. */

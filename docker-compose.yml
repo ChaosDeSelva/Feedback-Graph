@@ -226,6 +226,8 @@ services:
       # Its own CODEX_HOME (not the worker's), with only the login file from the host in it.
       - codex-runner-home:/codex
       - ${CODEX_AUTH_FILE:-./state/codex-auth.json}:/codex/auth.json:ro
+      # doctor persists an isolation failure here, so backup/restore/compose cannot silently revive an unsafe runner.
+      - ./state/settings:/runner-control:ro
     read_only: true
     tmpfs:
       - /tmp

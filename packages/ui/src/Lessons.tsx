@@ -254,7 +254,8 @@ function Judged({ report }: { report: LessonQualityReport | null }) {
           : <>Last 30 days: none decided ({last90.decided} in 90 days)</>}
         {report!.capped && ' (capped)'}
       </summary>
-      <table className={`${tableClass} mt-2 tabular-nums`}>
+      <div className="mt-2 max-w-full overflow-x-auto" tabIndex={0} aria-label="Lesson decision quality table">
+      <table className={`${tableClass} tabular-nums`}>
         <thead><tr>{['project', 'days', 'decided', 'as written', 'after edit', 'rejected', 'by operator'].map((h) => <th key={h} className={tdClass}>{h}</th>)}</tr></thead>
         <tbody>
           {[['all', report!.windows] as const, ...projects].flatMap(([k, ws]) => ws.map((q) => (
@@ -262,6 +263,7 @@ function Judged({ report }: { report: LessonQualityReport | null }) {
           )))}
         </tbody>
       </table>
+      </div>
     </details>
   );
 }

@@ -18,6 +18,20 @@ const where = {
 };
 
 const text = (markdown: string) => ({ content: [{ type: 'text' as const, text: markdown }] });
+const retryableToolError = (error: unknown) => {
+  const e = error instanceof Error ? error : new Error(String(error));
+  const code = (e as Error & { code?: string }).code;
+  if (code === 'Neo.TransientError.General.MemoryPoolOutOfMemoryError' || /transaction(?:al)? memory|memory pool/i.test(e.message)) {
+    return { ...text('The graph store is temporarily at its transaction-memory limit. Retry this tool call in about 2 seconds.'), isError: true };
+  }
+  if (e.name === 'StoreDeadlineError' || code === '57014' || /(?:timeout|timed out|deadline exceeded)/i.test(e.message)) {
+    return { ...text('The graph request exceeded its deadline. Retry this tool call.'), isError: true };
+  }
+  throw error;
+};
+const safe = <A, R>(fn: (args: A) => Promise<R>) => async (args: A): Promise<R | ReturnType<typeof retryableToolError>> => {
+  try { return await fn(args); } catch (error) { return retryableToolError(error); }
+};
 
 /**
  * MCP ToolAnnotations. Codex will not call a tool without them, so every tool says what it is: context tools can record provenance, request scans or resolve GitHub metadata, so they do not advertise read-only; report_feedback queues a new inbox item each
@@ -43,7 +57,7 @@ function buildServer(ctx: ContextDeps, client: string | undefined) {
         session_id: z.string().min(1).max(200).regex(/^[\w.:-]+$/, 'a real session id').optional().describe('Your session id, if you know it: facts about files this session edited, refreshed since it started, are marked as your own change'),
       },
     },
-    async ({ session_id, ...a }) => { if (session_id) await ctx.registerSession?.(session_id); return text((await getTaskContext({ ...a, sessionId: session_id, client }, ctx)).markdown); },
+    safe(async ({ session_id, ...a }) => { if (session_id) await ctx.registerSession?.(session_id); return text((await getTaskContext({ ...a, sessionId: session_id, client }, ctx)).markdown); }),
   );
 
   server.registerTool(
@@ -65,11 +79,11 @@ function buildServer(ctx: ContextDeps, client: string | undefined) {
         session_id: z.string().min(1).max(200).regex(/^[\w.:-]+$/, 'a real session id').optional().describe("Your session id, if you know it: the check is recorded as your session's"),
       },
     },
-    async ({ files_changed, session_id, ...a }) => {
+    safe(async ({ files_changed, session_id, ...a }) => {
       if (session_id) await ctx.registerSession?.(session_id);
       const result = await checkBeforeDone({ ...a, filesChanged: files_changed, sessionId: session_id, client }, ctx);
       return { ...text(result.markdown), structuredContent: { ...result, queued: result.queued ?? false } };
-    },
+    }),
   );
 
   server.registerTool(
@@ -83,7 +97,7 @@ function buildServer(ctx: ContextDeps, client: string | undefined) {
         path: z.string().max(1000).describe('The file (repo-relative, relative to cwd, or absolute inside the project)'),
       },
     },
-    async (a) => text((await getModuleContext({ ...a, client }, ctx)).markdown),
+    safe(async (a) => text((await getModuleContext({ ...a, client }, ctx)).markdown)),
   );
 
   server.registerTool(
@@ -98,7 +112,7 @@ function buildServer(ctx: ContextDeps, client: string | undefined) {
         depth: z.number().int().min(1).max(MAX_DEPTH).optional().describe('How many import hops to follow (default 3)'),
       },
     },
-    async (a) => text((await getImpact({ ...a, client }, ctx)).markdown),
+    safe(async (a) => text((await getImpact({ ...a, client }, ctx)).markdown)),
   );
 
   server.registerTool(
@@ -114,7 +128,7 @@ function buildServer(ctx: ContextDeps, client: string | undefined) {
         session_id: z.string().min(1).max(200).regex(/^[\w.:-]+$/, 'a real session id').optional().describe('Your session id, if you know it: lets the report join the same pushback flagged from this session'),
       },
     },
-    async (a) => { if (a.session_id) await ctx.registerSession?.(a.session_id); return text((await reportFeedback({ ...a, whatWasDone: a.what_was_done, sessionId: a.session_id, client }, ctx)).markdown); },
+    safe(async (a) => { if (a.session_id) await ctx.registerSession?.(a.session_id); return text((await reportFeedback({ ...a, whatWasDone: a.what_was_done, sessionId: a.session_id, client }, ctx)).markdown); }),
   );
 
   server.registerTool(
@@ -128,7 +142,7 @@ function buildServer(ctx: ContextDeps, client: string | undefined) {
         limit: z.number().int().min(1).max(RECENT_MAX).optional().describe(`How many sessions (default 5, at most ${RECENT_MAX})`),
       },
     },
-    async (a) => text((await getRecentSessions(a, ctx)).markdown),
+    safe(async (a) => text((await getRecentSessions(a, ctx)).markdown)),
   );
 
   server.registerTool(
@@ -138,7 +152,7 @@ function buildServer(ctx: ContextDeps, client: string | undefined) {
       description: 'Search the feedback graph by meaning: approved lessons, past misses, code facts and docs closest to the query, in about 3,000 characters. Each section says when nothing is close enough.',
       inputSchema: { ...where, query: z.string().max(MAX.query) },
     },
-    async (a) => text((await searchGraph({ ...a, client }, ctx)).markdown),
+    safe(async (a) => text((await searchGraph({ ...a, client }, ctx)).markdown)),
   );
 
   return server;

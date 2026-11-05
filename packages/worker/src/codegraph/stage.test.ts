@@ -95,6 +95,7 @@ function fakes(over: Partial<MapStageDeps> = {}) {
   const writes: CodeMapWrite[] = [];
   const builds: { repo: string; prev: CodeMap | undefined }[] = [];
   const activity: ActivityInput[] = [];
+  const failures: { key: string; error: string }[] = [];
   const logs: string[] = [];
   let clock = 1_000_000;
   let fp: string | null = 'fp1';
@@ -108,6 +109,7 @@ function fakes(over: Partial<MapStageDeps> = {}) {
         stored = { fingerprint: w.fingerprint, builtAt: 't', stats, candidates: w.candidates ?? null, files: w.files, outside: w.outside ?? [], symbols: w.symbols, imports: w.imports, write: w };
         return stats;
       },
+      recordCodeMapFailure: async (key, error) => { failures.push({ key, error }); },
     },
     activity: { record: async (a) => { activity.push(a); } },
     projects: async () => [{ key: 'demo', repoPath: '/vibe/demo' }],
@@ -122,7 +124,7 @@ function fakes(over: Partial<MapStageDeps> = {}) {
     ...over,
   };
   return {
-    deps, writes, builds, activity, logs,
+    deps, writes, builds, activity, logs, failures,
     tick: (ms: number) => { clock += ms; },
     setFingerprint: (v: string | null) => { fp = v; },
   };
@@ -397,6 +399,8 @@ test('a failing build is logged and the pass goes on; kick() never throws and ru
   await stage.idle();
   expect(f.logs).toContain('code map failed');
   expect(f.writes).toHaveLength(1);
+  expect(f.failures).toEqual([{ key: 'bad', error: 'Error: boom' }]);
+  expect(f.activity).toContainEqual(expect.objectContaining({ projectKey: 'bad', subject: expect.stringContaining('failed') }));
 });
 
 test('the map is written inside the exclusive section cleanup and project delete use, never beside one', async () => {

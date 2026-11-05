@@ -78,4 +78,4 @@ EXPOSE 8790
 USER node
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
   CMD node -e "fetch('http://localhost:8790/health').then(r=>process.exit(r.ok?0:1),()=>process.exit(1))"
-CMD ["node", "codexRunnerMain.ts"]
+CMD ["sh", "-c", "if [ -f /runner-control/codex-runner-disabled ]; then echo 'codex-runner disabled: remove the persisted flag only after its isolation probe passes' >&2; exit 78; fi; exec node codexRunnerMain.ts"]

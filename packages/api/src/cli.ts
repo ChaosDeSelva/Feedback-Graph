@@ -160,6 +160,11 @@ function client(io: CliIO, flags: Flags, labels = true) {
   if (token) {
     let u: URL;
     try { u = new URL(base); } catch { throw new UsageError(`not a URL: ${base}`); }
+    if (flags.url && ['localhost', '127.0.0.1', '[::1]'].includes(u.hostname)) {
+      const expectedPort = io.env.API_PORT?.trim() || '8787';
+      const actualPort = u.port || (u.protocol === 'https:' ? '443' : '80');
+      if (actualPort !== expectedPort) throw new UsageError(`refusing to send this install's token to local port ${actualPort}; this checkout's API_PORT is ${expectedPort}`);
+    }
     // A bearer token over plain http is readable on the way: only to this machine (or the host, from a container).
     if (u.protocol !== 'https:' && !(u.protocol === 'http:' && PLAIN_HTTP_OK.has(u.hostname))) {
       throw new UsageError(`refusing to send the token to ${u.host} over ${u.protocol.replace(':', '')}: use https:// for another machine`);
@@ -340,6 +345,7 @@ function statusLines(s: Record<string, any>, p: Pipeline | null): string[] {
     const count = pr ? ` (${pr.total === null ? `${pr.done} done` : `${pr.done} of ${pr.total}`})` : '';
     lines.push(`stage     ${s.stage.name}${s.stage.current ? ` ${s.stage.current}` : ''}${count} since ${at(s.stage.startedAt)}`);
   }
+  for (const m of s.codeMaps ?? []) lines.push(`code map  ${m.projectKey} built ${m.builtAt} (${m.ageDays}d old)${m.lastFailureAt ? `; last rebuild failed ${m.lastFailureAt}${m.lastFailure ? `: ${m.lastFailure}` : ''}` : ''}`);
   if (p) lines.push(`pipeline  ${pipelineLine(p)}`, ...queueLines(p.queues));
   const judged = (p?.lessons?.quality as Quality[] | undefined)?.[0];
   if (judged) lines.push(`lessons   ${qualityLine(judged)}`);

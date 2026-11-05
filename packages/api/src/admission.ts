@@ -13,7 +13,7 @@ export type QueueInfo = {
 export type Admitted<T> =
   | { ok: true; value: T; ahead: number; waitedMs: number }
   | { ok: false; ahead: number; waitedMs: number; ran: boolean };
-type Ticket = { go: () => void; notify?: (info: QueueInfo) => void; ahead: number; removed?: boolean; ordinal: number; retryKey?: string; priorityUntil?: number; restored?: boolean; queued?: boolean; started?: boolean };
+type Ticket = { go: () => void; notify?: (info: QueueInfo) => void; ahead: number; removed?: boolean; ordinal: number; retryKey?: string; priorityUntil?: number; restored?: boolean; queued?: boolean; started?: boolean; result?: Promise<unknown>; serviceStarted?: number };
 
 export class Admission {
   readonly concurrency: number;
@@ -69,7 +69,7 @@ export class Admission {
     return { state, capacity: this.concurrency, running: this.running, waiting: this.waiting,
       position: state === 'waiting' ? position : null, nextRetryPosition: retryPosition ?? this.waiting + 1, arrivalAhead, retained: state === 'waiting' || state === 'running',
       estimate: { scope: 'judge', source: observed ? 'observed' : 'response_budget', samples: samples.length, startMs, completionMs, ...(observed && { medianStartMs: Number.isFinite(starts[2]) ? starts[2] : null, medianCompletionMs: Number.isFinite(starts[2]) ? starts[2] + median : null }), overdue },
-      retryAfterMs: state === 'retry_required' ? Math.max(1000, Math.min(60_000, Math.ceil((startMs[1] ?? this.timeoutMs) / 2))) : null };
+      retryAfterMs: state === 'retry_required' ? Math.max(1000, Math.min(60_000, Math.ceil(Number.isFinite(starts[2]) ? starts[2] : (startMs[0] || this.timeoutMs)))) : null };
   }
   #notifyWaiting() {
     this.#queue.forEach((ticket, index) => ticket.notify?.(this.#info(ticket, 'waiting', index + 1)));
@@ -95,6 +95,16 @@ export class Admission {
   async run<T>(fn: (turn: Turn) => Promise<T>, options: { signal?: AbortSignal; deadline?: number; onState?: (info: QueueInfo) => void; retryKey?: string } = {}): Promise<Admitted<T>> {
     const started = Date.now();
     const timeoutMs = Math.max(1, Math.min(this.timeoutMs, (options.deadline ?? Infinity) - started));
+    const existing = options.retryKey ? this.#requests.get(options.retryKey) : undefined;
+    if (existing?.started && existing.result) {
+      options.onState?.(this.#info(existing, 'running'));
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const timeout = new Promise<'timeout'>((resolve) => { timer = setTimeout(() => resolve('timeout'), timeoutMs); });
+      const completed = await Promise.race([existing.result.then(value => ({ value })), timeout]);
+      clearTimeout(timer);
+      if (completed === 'timeout') return { ok: false, ahead: existing.ahead, waitedMs: Date.now() - started, ran: true };
+      return { ok: true, value: completed.value as T, ahead: existing.ahead, waitedMs: Date.now() - started };
+    }
     const gaveUp = new AbortController();
     let ahead = this.#running < this.concurrency && !this.#queue.length ? 0 : this.#running + this.#queue.length;
     this.#prune();
@@ -140,6 +150,7 @@ export class Admission {
         return { ok: false, ahead, waitedMs, ran: false };
       }
       const serviceStarted = Date.now();
+      ticket.serviceStarted = serviceStarted;
       let called = false;
       this.#active.set(ticket, { started: serviceStarted, deadline: started + timeoutMs });
       ticket.notify?.(this.#info(ticket, 'running'));
@@ -157,7 +168,9 @@ export class Admission {
           if (this.#durations.length > 64) this.#durations.shift();
         }
         this.#active.delete(ticket); this.#release();
+        if (ticket.retryKey && this.#requests.get(ticket.retryKey) === ticket) this.#requests.delete(ticket.retryKey);
       });
+      ticket.result = call;
       const r = await Promise.race([call.then((value) => ({ value })), deadline]);
       if (r === 'timeout') {
         call.catch(() => {}); gaveUp.abort(new Error(`gave up after ${Math.round(this.timeoutMs / 1000)} s`));
@@ -174,7 +187,7 @@ export class Admission {
       throw error;
     } finally {
       clearTimeout(timer); options.signal?.removeEventListener('abort', stop);
-      if (ticket.retryKey && this.#requests.get(ticket.retryKey) === ticket) this.#requests.delete(ticket.retryKey);
+      if (!ticket.started && ticket.retryKey && this.#requests.get(ticket.retryKey) === ticket) this.#requests.delete(ticket.retryKey);
     }
   }
   #release() {

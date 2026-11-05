@@ -115,7 +115,7 @@ export async function fileFingerprint(repoPath: string): Promise<string> {
 }
 
 export type MapStageDeps = {
-  store: Pick<CodeGraphStore, 'codeMap' | 'codeMapMeta' | 'replaceCodeMap'> & Partial<Pick<CodeGraphStore, 'codeMapRebuildsRequested' | 'purgeOrphanCodeFiles'>>;
+  store: Pick<CodeGraphStore, 'codeMap' | 'codeMapMeta' | 'replaceCodeMap'> & Partial<Pick<CodeGraphStore, 'codeMapRebuildsRequested' | 'purgeOrphanCodeFiles' | 'recordCodeMapFailure'>>;
   activity?: Pick<ActivityStore, 'record'>;
   /** The selected projects (scope) and their folders, as the worker sees them. */
   projects(): Promise<{ key: string; repoPath: string }[]>;
@@ -332,7 +332,15 @@ export class MapStage {
       return { ...stats, durationMs };
     } catch (err) {
       if (this.stopping.signal.aborted) d.log?.('code map skipped', { project: p.key, reason: 'the worker is shutting down' });
-      else d.log?.('code map failed', { project: p.key, error: String(err) });
+      else {
+        const error = String(err);
+        await d.store.recordCodeMapFailure?.(p.key, error).catch(() => {});
+        await d.activity?.record({ kind: 'code_mapped', actor: 'deterministic', projectKey: p.key,
+          subject: 'code map rebuild failed; the previous map is stale',
+          why: 'the worker could not replace the code map; it retained the last good map and will retry',
+          details: { failed: true, error: error.slice(0, 500) } }).catch(() => {});
+        d.log?.('code map failed', { project: p.key, error });
+      }
       return null;
     }
   }

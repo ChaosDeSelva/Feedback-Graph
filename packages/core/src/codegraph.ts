@@ -60,7 +60,7 @@ export type CodeMapStats = { files: number; symbols: number; imports: number; te
  * unresolved: imports the map could not follow to a file although they look local, so importer and test lists may be
  * short (null: not counted).
  */
-export type CodeMapMeta = { fingerprint: string | null; builtAt: string; stats: CodeMapStats; candidates: number | null; unresolved?: number | null; /** CODE_MAP_VERSION it was built by; null before maps were versioned. */ version?: number | null };
+export type CodeMapMeta = { fingerprint: string | null; builtAt: string; stats: CodeMapStats; candidates: number | null; unresolved?: number | null; lastFailureAt?: string | null; lastFailure?: string | null; /** CODE_MAP_VERSION it was built by; null before maps were versioned. */ version?: number | null };
 
 /**
  * Whether what a map says about importers and tests may be short for a reason the map itself cannot count: it was

@@ -75,7 +75,7 @@ export async function claimRunOwnerWith(query: GraphRepo['run'], run: string, pr
   const legacy = ['Candidate', 'Lesson', 'Miss', 'Fact', 'Doc', 'Chunk', 'ProjectLink', 'PreDoneCheck', 'ChatConversation', 'Activity', 'Session', 'SessionRun', 'Feedback'].map(label => `EXISTS { MATCH (x:${label} {run: $run}) }`).join(' OR ');
   const [record] = await query(`OPTIONAL MATCH (existing:RunOwner {run: $run}) WITH existing WHERE existing IS NOT NULL OR NOT (${legacy})
     MERGE (o:RunOwner {run: $run}) ON CREATE SET o.principal = $principal, o.actor = $actor, o.firstSeen = $now RETURN ${OWNER}`,
-    { run, principal, actor: principal === 'operator' ? actor : null, now: new Date().toISOString() });
+    { run, principal, actor: principal === 'operator' || principal === 'agent' ? actor : null, now: new Date().toISOString() });
   if (!record) throw new LegacyRunClaimError(run);
   return ownerOf(record);
 }

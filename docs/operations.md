@@ -130,6 +130,11 @@ docker compose --profile codex up -d --no-deps --force-recreate codex-runner
 
 This explicitly removes Docker's masked/read-only system-path protection **in the runner**. It does not make the setting a safe default; the container retains its Codex login, so apply it only when you accept that reduced protection. A masked host will again report unhealthy after removal. To avoid this exception entirely, select Claude Code or an API provider for scans; do not remove the runner's private PID/proc sandbox, add privileged mode, or disable host security controls. There is no automatic fallback: using the host's existing `/proc` would undermine the PID isolation the readiness test checks.
 
+If `doctor` stops the runner after an isolation failure, it also writes `state/settings/codex-runner-disabled`. Routine
+Compose, backup and restore commands cannot revive job execution while that file exists. Prefer rerunning
+`./scripts/setup.sh --runner-procfs-compat` after reviewing the tradeoff; otherwise remove the flag manually only after
+you have changed the isolation configuration and verified the live runner probe.
+
 Check it: `docker compose ps codex-runner` (healthy), `docker compose logs codex-runner` (one line per job: status and duration, never the prompt or the token). The worker's `provider` log line says `codex-cli` at startup. On Linux, the `codex-scratch` and `codex-runner-home` volumes are owned by uid 1000 like `codex-home` (see [Linux](#linux)).
 
 ## Backups

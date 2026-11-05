@@ -48,8 +48,8 @@ fi
 if [ -n "${FEEDBACK_GRAPH_URL:-}" ]; then
   local_port="$(setting API_PORT)"; expected_url="http://localhost:${local_port:-8787}"
   if [ "${FEEDBACK_GRAPH_URL%/}" != "$expected_url" ] && [ "${FEEDBACK_GRAPH_URL%/}" != "${expected_url/localhost/127.0.0.1}" ]; then
-    if [ -f "$env_file" ] && grep -q '^API_TOKEN=' "$env_file"; then
-      echo "fg: refusing to send this install's API_TOKEN to FEEDBACK_GRAPH_URL=$FEEDBACK_GRAPH_URL (this checkout is $expected_url); unset FEEDBACK_GRAPH_URL" >&2
+    if [ -f "$env_file" ] && grep -Eq '^(API_TOKEN|FG_OPERATOR_TOKEN|FG_OWNER_TOKEN)=' "$env_file"; then
+      echo "fg: refusing to send this install's token to FEEDBACK_GRAPH_URL=$FEEDBACK_GRAPH_URL (this checkout is $expected_url); unset FEEDBACK_GRAPH_URL" >&2
       exit 1
     fi
     echo "WARNING: FEEDBACK_GRAPH_URL overrides this checkout's $expected_url; unset it to address this install." >&2
@@ -70,7 +70,7 @@ if native_ts && (cd "$here/packages/api" && node --input-type=module -e 'import.
     port="$(setting API_PORT)"
     export FEEDBACK_GRAPH_URL="http://localhost:${port:-8787}"
   fi
-  FG_OPERATOR_TOKEN="$(setting FG_OPERATOR_TOKEN)" API_TOKEN="$(setting API_TOKEN)" \
+  API_PORT="$(setting API_PORT)" FG_OPERATOR_TOKEN="$(setting FG_OPERATOR_TOKEN)" API_TOKEN="$(setting API_TOKEN)" \
     exec node "$here/packages/api/src/cli.ts" "$@"
 fi
 

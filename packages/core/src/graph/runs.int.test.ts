@@ -408,8 +408,8 @@ describeStores('RunsStore and run attribution', (h) => {
     // Cleaning up a run keeps its owner: the run id stays the opener's.
     await s.runs.remove('run-own', []);
     expect(await s.runs.owner('run-own')).toEqual(first);
-    // Only an operator run records a name; none given: null (any operator name may use it).
-    expect(await s.runs.claim('run-agent', 'agent', 'operator:x')).toMatchObject({ principal: 'agent', actor: null });
+    // Authenticated agents retain their private run-key hash; it is proof, unlike a display name.
+    expect(await s.runs.claim('run-agent', 'agent', 'agent:key-hash')).toMatchObject({ principal: 'agent', actor: 'agent:key-hash' });
     expect(await s.runs.claim('run-anon', 'operator')).toMatchObject({ principal: 'operator', actor: null });
   });
 });

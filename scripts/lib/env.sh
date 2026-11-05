@@ -33,18 +33,21 @@ database_memory() {
       for name in memory.current memory.max memory.swap.current memory.swap.max; do
         printf "%s=" "$name"; cat "$base/$name" 2>/dev/null || echo unknown
       done
+      awk '$1 == "anon" { print "memory.anon=" $2 }' "$base/memory.stat" 2>/dev/null || true
     elif [ -r "$base/memory/memory.usage_in_bytes" ]; then
       for name in memory.usage_in_bytes memory.limit_in_bytes memory.memsw.usage_in_bytes memory.memsw.limit_in_bytes; do
         printf "%s=" "$name"; cat "$base/memory/$name" 2>/dev/null || echo unknown
       done
     fi' 2>/dev/null | awk -F= '
       $1=="memory.current" || $1=="memory.usage_in_bytes" { used=$2 }
+      $1=="memory.anon" { anon=$2 }
       $1=="memory.max" || $1=="memory.limit_in_bytes" { limit=$2 }
       $1=="memory.swap.current" { swap=$2 }
       $1=="memory.swap.max" { swaplimit=$2 }
       $1=="memory.memsw.limit_in_bytes" { combinedlimit=$2 }
       $1=="memory.memsw.usage_in_bytes" { combined=$2 }
       END { if (used ~ /^[0-9]+$/ && limit ~ /^[0-9]+$/ && limit>0) {
+        if (anon ~ /^[0-9]+$/) used=anon
         if (swap=="") swap=(combined>used ? combined-used : 0)
         if (swaplimit=="" && combinedlimit>limit) swaplimit=combinedlimit-limit
         swaphead=(swaplimit ~ /^[0-9]+$/ ? sprintf("%.0f",swaplimit-swap) : "null")

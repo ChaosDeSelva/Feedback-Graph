@@ -29,6 +29,8 @@ import { VISIBLE_TO_RUN } from './runs.ts';
 const SLICE = 5000;
 /** Files per symbol-delete statement: a file can define many symbols, so fewer of them per transaction. */
 const PATH_SLICE = 500;
+/** Relationships/nodes per cleanup transaction; deletes retain more transaction memory than UNWIND writes. */
+const DELETE_SLICE = 250;
 const slices = <T>(xs: T[], size = SLICE): T[][] => (xs.length ? Array.from({ length: Math.ceil(xs.length / size) }, (_, i) => xs.slice(i * size, (i + 1) * size)) : []);
 
 /** Enough for any project's approved lessons; path matching happens after the read. */
@@ -99,10 +101,21 @@ export class CodeGraphRepo implements CodeGraphStore {
     );
     const fileImports = diff.newImports.filter((i) => !i.to.startsWith('pkg:'));
     const pkgImports = diff.newImports.filter((i) => i.to.startsWith('pkg:'));
+    const drain = async (cypher: string): Promise<void> => {
+      for (;;) {
+        const [row] = await this.g.run(cypher, { key, limit: neo4j.int(DELETE_SLICE) });
+        const removed = row ? neo4j.integer.toNumber(row.get('removed')) : 0;
+        if (removed < DELETE_SLICE) return;
+      }
+    };
+    // Clear the generation marker before any destructive work. The two unbounded deletes below used to be single
+    // transactions and could exceed Neo4j's transaction-memory budget on large repositories.
+    await this.g.run('MATCH (m:CodeMap {projectKey: $key}) SET m.fingerprint = null', { key });
+    await drain(`MATCH (:CodeFile {projectKey: $key})-[r:TESTS]->()
+      WITH r LIMIT $limit DELETE r RETURN count(*) AS removed`);
     const statements: [string, Props][] = [
       // The project exists even for a map with no files, as in Postgres (the file slices below MERGE it otherwise).
       [`MERGE (:Project {key: $key})`, { key }],
-      [`MATCH (m:CodeMap {projectKey: $key}) SET m.fingerprint = null`, { key }],
       ...slices(diff.staleImports).map((part): [string, Props] => [
         `UNWIND $pairs AS e
            MATCH (a:CodeFile {id: $key + ':' + e.from})-[r:IMPORTS]->(b)
@@ -110,7 +123,6 @@ export class CodeGraphRepo implements CodeGraphStore {
            DELETE r`,
         { key, pairs: part },
       ]),
-      [`MATCH (:CodeFile {projectKey: $key})-[r:TESTS]->() DELETE r`, { key }],
       ...slices(diff.symbolPaths, PATH_SLICE).map((part): [string, Props] => [
         `MATCH (s:Symbol {projectKey: $key}) WHERE s.path IN $paths DETACH DELETE s`,
         { key, paths: part },
@@ -189,8 +201,6 @@ export class CodeGraphRepo implements CodeGraphStore {
            CREATE (a)-[:IMPORTS {names: i.names, spec: i.spec}]->(m)`,
         { key, imports: part },
       ]),
-      // A package nothing imports any more.
-      [`MATCH (m:Module {projectKey: $key}) WHERE NOT EXISTS { ()-[:IMPORTS]->(m) } DETACH DELETE m`, { key }],
       ...slices(map.tests).map((part): [string, Props] => [
         `UNWIND $tests AS t
            MATCH (a:CodeFile {id: $key + ':' + t.test})
@@ -202,12 +212,23 @@ export class CodeGraphRepo implements CodeGraphStore {
         `MERGE (m:CodeMap {projectKey: $key})
          SET m.fingerprint = $fingerprint, m.builtAt = $now, m.files = $stats.files, m.symbols = $stats.symbols,
              m.imports = $stats.imports, m.tests = $stats.tests, m.candidates = $candidates, m.unresolved = $unresolved,
-             m.version = $version`,
+             m.version = $version
+         REMOVE m.lastFailureAt, m.lastFailure`,
         { key, fingerprint: map.fingerprint, now, stats: map.stats, candidates: map.candidates, unresolved: map.unresolved ?? null, version: map.version },
       ],
     ];
+    // Publish metadata only after every bounded cleanup and write succeeds. A partial build therefore remains stale.
+    const publish = statements.pop()!;
     for (const [cypher, params] of statements) await this.g.run(cypher, params);
+    await drain(`MATCH (m:Module {projectKey: $key}) WHERE NOT EXISTS { ()-[:IMPORTS]->(m) }
+      WITH m LIMIT $limit DETACH DELETE m RETURN count(*) AS removed`);
+    await this.g.run(publish[0], publish[1]);
     return map.stats;
+  }
+
+  async recordCodeMapFailure(projectKey: string, error: string, now = new Date()): Promise<void> {
+    await this.g.run(`MERGE (m:CodeMap {projectKey: $key})
+      SET m.lastFailureAt = $now, m.lastFailure = $error`, { key: projectKey, now: now.toISOString(), error: error.slice(0, 500) });
   }
 
   async purgeOrphanCodeFiles(limit: number, now = new Date()): Promise<number> {
@@ -306,6 +327,8 @@ export class CodeGraphRepo implements CodeGraphStore {
       candidates: m.candidates ?? null,
       unresolved: m.unresolved ?? null,
       version: m.version == null ? null : Number(m.version),
+      lastFailureAt: m.lastFailureAt ?? null,
+      lastFailure: m.lastFailure ?? null,
     };
   }
 

@@ -243,3 +243,19 @@ test('different retry identities cannot inherit priority and absent retry holds 
     expect(await admission.run(async () => 'free')).toMatchObject({ ok: true, ahead: 0 });
   } finally { vi.useRealTimers(); }
 });
+
+test('retrying an identical check already in service joins its result instead of starting judge work again', async () => {
+  vi.useFakeTimers(); vi.setSystemTime(0);
+  try {
+    const admission = new Admission({ concurrency: 1, timeoutMs: 1000 });
+    let calls = 0;
+    const first = admission.run(async () => { calls++; await new Promise(resolve => setTimeout(resolve, 40)); return 'verdict'; }, { retryKey: 'caller:check', deadline: 10 });
+    await vi.advanceTimersByTimeAsync(10);
+    expect(await first).toMatchObject({ ok: false, ran: true });
+    const retry = admission.run(async () => { calls++; return 'duplicate'; }, { retryKey: 'caller:check', deadline: 100 });
+    await vi.advanceTimersByTimeAsync(30);
+    expect(await retry).toMatchObject({ ok: true, value: 'verdict' });
+    expect(calls).toBe(1);
+    expect([admission.running, admission.waiting]).toEqual([0, 0]);
+  } finally { vi.useRealTimers(); }
+});

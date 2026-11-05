@@ -487,6 +487,8 @@ EOF
     setenv COMPOSE_FILE "$files"
     export COMPOSE_FILE="$files"
     echo "Saved runner procfs opt-in in $compat; COMPOSE_FILE keeps the base, project mounts and existing custom files."
+    # This explicit security decision is the only setup path that may clear doctor's persisted fail-closed gate.
+    rm -f state/settings/codex-runner-disabled
   else
     echo 'Runner procfs compatibility was not enabled.'
   fi

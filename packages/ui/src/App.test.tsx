@@ -45,7 +45,7 @@ test('a link to one item (#lessons/<id>) opens its page and keeps the id in the 
   expect(location.hash).toBe('#lessons/l1');
 });
 
-function server(o: { authRequired?: boolean; token?: string; workerHealthy?: boolean; tracked?: number; roots?: number; models?: object; ollama?: object }) {
+function server(o: { authRequired?: boolean; ownerSetupRequired?: boolean; token?: string; workerHealthy?: boolean; tracked?: number; roots?: number; models?: object; ollama?: object }) {
   let signedIn = !o.authRequired;
   const posts: unknown[] = [];
   vi.stubGlobal('fetch', vi.fn(async (url: string, init?: RequestInit) => {
@@ -56,7 +56,7 @@ function server(o: { authRequired?: boolean; token?: string; workerHealthy?: boo
       signedIn = true;
       return new Response(null, { status: 204 });
     }
-    if (url === '/api/session') return Response.json({ authRequired: !!o.authRequired, authenticated: signedIn });
+    if (url === '/api/session') return Response.json({ authRequired: !!o.authRequired, authenticated: signedIn, ownerSetupRequired: !!o.ownerSetupRequired });
     if (!signedIn) return Response.json({ error: 'sign in required' }, { status: 401 });
     if (url === '/api/status') return Response.json({ version: '0.2.0', graph: true, worker: null, workerHealthy: o.workerHealthy ?? true, authRequired: !!o.authRequired, selection: o.tracked === undefined ? null : { initialized: true, tracked: o.tracked, roots: o.roots, note: o.roots === 0 ? 'No project folders yet: add a project folder in Settings first.' : o.tracked ? null : 'No projects are selected yet, so no sessions are being read.' }, models: o.models ?? null, ollama: o.ollama ?? null });
     return Response.json([]);
@@ -76,6 +76,14 @@ test('with a token configured, the UI asks you to sign in first', async () => {
   fireEvent.click(screen.getByRole('button', { name: 'Sign in' }));
   expect(await screen.findByRole('button', { name: 'Inbox' })).toBeTruthy();
   expect(s.posts).toEqual(['wrong', 'secret-token']);
+});
+
+test('an upgraded protected install without an owner token explains the required migration instead of offering a broken sign-in', async () => {
+  server({ authRequired: true, ownerSetupRequired: true });
+  render(<App />);
+  expect(await screen.findByText('Owner sign-in needs setup')).toBeTruthy();
+  expect(screen.getByText(/setup\.sh --yes/)).toBeTruthy();
+  expect(screen.queryByLabelText('owner token')).toBeNull();
 });
 
 test('the header warns when the worker has stopped reporting', async () => {

@@ -175,6 +175,7 @@ export const STORE_WRITE_POLICY = {
   } satisfies Policy<SelectionStore>,
   codegraph: {
     replaceCodeMap: 'write',
+    recordCodeMapFailure: 'internal',
     requestCodeMapRebuild: 'internal',
     dropCodeMap: 'write',
     purgeOrphanCodeFiles: 'write',

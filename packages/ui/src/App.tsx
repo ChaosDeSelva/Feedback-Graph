@@ -79,9 +79,13 @@ export function App() {
     return () => window.removeEventListener('hashchange', onHash);
   }, []);
   const [needsSignIn, setNeedsSignIn] = useState(false);
+  const [ownerSetupRequired, setOwnerSetupRequired] = useState(false);
   const [status, setStatus] = useState<SystemStatus | null>(null);
   useEffect(() => {
-    api.session().then((s) => setNeedsSignIn(!!s.authRequired && !s.authenticated), () => {});
+    api.session().then((s) => {
+      setOwnerSetupRequired(!!s.ownerSetupRequired);
+      setNeedsSignIn(!!s.authRequired && !s.authenticated);
+    }, () => {});
     const onSignIn = () => setNeedsSignIn(true);
     window.addEventListener(SIGN_IN_EVENT, onSignIn);
     return () => window.removeEventListener(SIGN_IN_EVENT, onSignIn);
@@ -94,7 +98,7 @@ export function App() {
     return () => clearInterval(t);
   }, [needsSignIn]);
 
-  if (needsSignIn) return <SignIn onDone={() => setNeedsSignIn(false)} />;
+  if (needsSignIn) return <SignIn ownerSetupRequired={ownerSetupRequired} onDone={() => setNeedsSignIn(false)} />;
   const nothingSelected = !!status?.selection && (!status.selection.initialized || status.selection.tracked === 0);
   return (
     <AppShell
@@ -176,7 +180,7 @@ function NothingSelected() {
   );
 }
 
-function SignIn({ onDone }: { onDone: () => void }) {
+function SignIn({ onDone, ownerSetupRequired = false }: { onDone: () => void; ownerSetupRequired?: boolean }) {
   const [token, setToken] = useState('');
   const [error, setError] = useState<string | null>(null);
   async function submit(e: React.FormEvent) {
@@ -197,14 +201,18 @@ function SignIn({ onDone }: { onDone: () => void }) {
         </div>
         <div className="grid gap-3 rounded-md border border-line bg-surface p-5 shadow-card">
           <div>
-            <p className="font-semibold">Sign in</p>
+            <p className="font-semibold">{ownerSetupRequired ? 'Owner sign-in needs setup' : 'Sign in'}</p>
             <p className="mt-0.5 text-muted">
-              This server is protected. Enter the owner sign-in token (<code className="font-mono text-xs">FG_OWNER_TOKEN</code> in its <code className="font-mono text-xs">.env</code>). Do not use the agent <code className="font-mono text-xs">API_TOKEN</code> here.
+              {ownerSetupRequired
+                ? <>This upgraded install has an agent token but no owner token. Run <code className="font-mono text-xs">./scripts/setup.sh --yes</code> in the install folder to create <code className="font-mono text-xs">FG_OWNER_TOKEN</code>, restart the API, then reload this page. The agent <code className="font-mono text-xs">API_TOKEN</code> cannot approve owner actions.</>
+                : <>This server is protected. Enter the owner sign-in token (<code className="font-mono text-xs">FG_OWNER_TOKEN</code> in its <code className="font-mono text-xs">.env</code>). Do not use the agent <code className="font-mono text-xs">API_TOKEN</code> here.</>}
             </p>
           </div>
-          <Input aria-label="owner token" type="password" autoComplete="current-password" autoFocus value={token} onChange={(e) => setToken(e.target.value)} placeholder="owner token" />
-          {error && <Alert>{error}</Alert>}
-          <Button type="submit" variant="primary" disabled={!token.trim()}>Sign in</Button>
+          {!ownerSetupRequired && <>
+            <Input aria-label="owner token" type="password" autoComplete="current-password" autoFocus value={token} onChange={(e) => setToken(e.target.value)} placeholder="owner token" />
+            {error && <Alert>{error}</Alert>}
+            <Button type="submit" variant="primary" disabled={!token.trim()}>Sign in</Button>
+          </>}
         </div>
       </form>
     </main>

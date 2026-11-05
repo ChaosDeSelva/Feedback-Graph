@@ -56,10 +56,22 @@ test('signing in from the UI sets an HttpOnly session cookie that authenticates 
 });
 
 test('the UI can ask whether it needs to sign in', async () => {
-  expect(await (await secured().request('/api/session')).json()).toEqual({ authRequired: true, authenticated: false, ownerSession: false });
-  expect(await (await secured().request('/api/session', { headers: bearer })).json()).toEqual({ authRequired: true, authenticated: false, ownerSession: false });
-  expect(await (await createApp(repo).request('/api/session')).json()).toEqual({ authRequired: false, authenticated: false, ownerSession: false });
+  expect(await (await secured().request('/api/session')).json()).toEqual({ authRequired: true, authenticated: false, ownerSession: false, ownerSetupRequired: false });
+  expect(await (await secured().request('/api/session', { headers: bearer })).json()).toEqual({ authRequired: true, authenticated: false, ownerSession: false, ownerSetupRequired: false });
+  expect(await (await createApp(repo).request('/api/session')).json()).toEqual({ authRequired: false, authenticated: false, ownerSession: false, ownerSetupRequired: false });
   expect((await createApp(repo).request('/api/session', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ token: 'anything' }) })).status).toBe(403);
+});
+
+test('an upgraded install without FG_OWNER_TOKEN is usable only from its real loopback same-origin UI', async () => {
+  const local = createApp(repo);
+  const body = JSON.stringify({ status: 'rejected' });
+  const sameOrigin = { 'content-type': 'application/json', 'sec-fetch-site': 'same-origin', origin: 'http://localhost' };
+  expect((await local.request('http://localhost/api/candidates/c1/decision', { method: 'POST', headers: sameOrigin, body })).status).toBe(204);
+  expect((await local.request('http://localhost/api/candidates/c1/decision', { method: 'POST', headers: { 'content-type': 'application/json', origin: 'http://localhost' }, body })).status).toBe(403);
+  expect((await local.request('http://localhost/api/candidates/c1/decision', { method: 'POST', headers: { ...sameOrigin, authorization: 'Bearer forged' }, body })).status).toBe(403);
+
+  const protectedUpgrade = createApp(repo, { auth: { token: TOKEN } });
+  expect(await (await protectedUpgrade.request('/api/session')).json()).toEqual({ authRequired: true, authenticated: false, ownerSession: false, ownerSetupRequired: true });
 });
 
 test('a public host name is accepted only when a token protects the API', async () => {

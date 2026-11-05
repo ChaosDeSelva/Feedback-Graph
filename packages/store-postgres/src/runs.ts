@@ -17,7 +17,7 @@ const ITEMS = `
 /** What runs wrote (see RunsStore); the Neo4j twin is core's graph/runs.ts. */
 export async function claimRunOwnerWith(query: (sql: string, values?: unknown[]) => Promise<{ rows: Record<string, any>[] }>, run: string, principal: RunPrincipal, actor: string | null): Promise<RunOwner> {
   const legacy = ['candidates', 'lessons', 'misses', 'facts', 'docs', 'chunks', 'project_links', 'predone_checks', 'chat_conversations', 'activity', 'sessions', 'session_run_tags', 'feedback'].map(table => `EXISTS (SELECT 1 FROM ${table} WHERE run = $1)`).join(' OR ');
-  await query(`INSERT INTO run_owners (run, principal, actor, first_seen) SELECT $1, $2, $3, $4 WHERE NOT (${legacy}) ON CONFLICT (run) DO NOTHING`, [run, principal, principal === 'operator' ? actor : null, new Date()]);
+  await query(`INSERT INTO run_owners (run, principal, actor, first_seen) SELECT $1, $2, $3, $4 WHERE NOT (${legacy}) ON CONFLICT (run) DO NOTHING`, [run, principal, principal === 'operator' || principal === 'agent' ? actor : null, new Date()]);
   const { rows } = await query('SELECT run, principal, actor, first_seen FROM run_owners WHERE run = $1', [run]);
   if (!rows[0]) throw new LegacyRunClaimError(run);
   return { run: rows[0].run, principal: rows[0].principal, actor: rows[0].actor ?? null, firstSeen: iso(rows[0].first_seen)! };

@@ -298,8 +298,11 @@ async function readWorkingFile(repoPath: string, rel: string): Promise<string | 
 
 /** PR identities explicitly named by the task, independent of the repository's current HEAD. */
 export function taskPrNumbers(task: string): number[] {
-  // Parenthesized series counters describe this prompt, not a GitHub PR identity.
-  const text = task.replace(/\(\s*PR\s+\d+\s*(?:\/|of)\s*\d+\s*\)/gi, '');
+  // Series counters describe this prompt/stack, not a GitHub PR identity. Accept the common wrappers and optional #;
+  // a real PR elsewhere in the same sentence ("see #14036") remains available to the matcher.
+  const text = task
+    .replace(/(?:\bStack:\s*)?\bPR\s*#?\d+\s*(?:\/|of)\s*\d+/gi, '')
+    .replace(/[([]\s*#\d+\s*(?:\/|of)\s*\d+\s*[)\]]/gi, '');
   return [...new Set([...text.matchAll(/(?:github\.com\/[^\s/]+\/[^\s/]+\/pull\/|\b(?:PR|pull request)(?:\s*#|\s+)|#)(\d+)\b/gi)]
     .map(m => Number(m[1])).filter(n => Number.isSafeInteger(n) && n > 0))];
 }

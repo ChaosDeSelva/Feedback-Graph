@@ -1,6 +1,11 @@
 # Install Feedback Graph
 
-Install Docker (Desktop/OrbStack on macOS), Node 26.5+ and pnpm 11. Clone the repository. If `pnpm` is absent, use `corepack enable && corepack prepare pnpm@11 --activate` on Node releases that include Corepack, or `npx -y pnpm@11 install` on releases such as Node 26 that do not. Then run `pnpm install` and `./scripts/setup.sh`. Choose project roots deliberately: mounted project folders are read-only, but selected transcripts contain the conversations and file access from those sessions. Review `.env` before starting a shared installation. The API binds to loopback by default. Accept setup's recommended authentication credentials: without them, local processes are not separated by an owner boundary.
+Install Docker (Desktop/OrbStack on macOS) and Node 26.5+. Clone the repository. Use pnpm 11 through Corepack (`corepack enable && corepack prepare pnpm@11 --activate`) when available; on Node releases without Corepack, run `npx -y pnpm@11 install` and continue with `npx -y pnpm@11 <command>` instead of assuming `pnpm` was installed globally. Then install dependencies and run `./scripts/setup.sh` (add `--small` for the supported 1.5 GiB pilot profile). Choose project roots deliberately: mounted project folders are read-only, but selected transcripts contain the conversations and file access from those sessions. Review the generated `.env` at the absolute path `<clone>/.env` before starting a shared installation. The API binds to loopback by default.
+
+Setup writes `FG_OWNER_TOKEN` to that private `.env`. Open the localhost URL setup prints; when the sign-in card appears,
+paste that owner token. It is distinct from `API_TOKEN`: agents may use the latter, but it cannot approve lessons, change
+settings or delete owner data. A tokenless loopback-only upgrade keeps same-origin browser access; rerun
+`./scripts/setup.sh --yes` to create the explicit owner credential before exposing the API or enabling API-token auth.
 
 For a local-only trial without your real transcripts or agent registration:
 

@@ -590,6 +590,13 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
   // The exception you opt into: FG_OPERATOR_TOKEN as the Bearer, for the verbs OPERATOR_ALLOW names. Its writes are
   // logged as operator:<name> (X-FG-Operator), never as you.
   const allowed = new Set(auth.operator?.allow ?? []);
+  // Compatibility for pre-0.7.2 local installs upgraded with `docker compose up` only. With no credential configured,
+  // a real same-origin browser on a loopback host is the local owner. A Bearer request never qualifies, and public
+  // host names are already refused above unless an API token protects them.
+  const tokenlessLoopbackOwner = (c: Context) => !auth.token && !auth.ownerToken && !bearerOf(c)
+    && LOCAL_HOSTS.has(hostname(c.req.header('host') ?? new URL(c.req.url).host))
+    && c.req.header('sec-fetch-site') === 'same-origin'
+    && originAllowed(c.req.header('origin') ?? '', c.req.header('host') ?? new URL(c.req.url).host);
   const ownerOnly = (verb: (typeof OWNER_ROUTES)[number][2]) => async (c: Context, next: Next) => {
     if (hasOperatorToken(c, auth.operator)) {
       if (!allowed.has(verb)) return c.json(refusedVerb(verb), 403);
@@ -613,6 +620,7 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
     // A bearer request is an API client, even if it forges browser Fetch Metadata. API_TOKEN is deliberately an
     // agent/read credential; it never inherits the browser owner's authority.
     if (offered) return c.json({ error: 'this Bearer is not an owner credential; use the browser session, FG_OWNER_TOKEN with X-FG-Owner: true, or FG_OPERATOR_TOKEN with an allowed verb' }, 403);
+    if (tokenlessLoopbackOwner(c)) return next();
     if (!ownerSession(c, ownerSessions)) {
       log?.('owner decision refused', { method: c.req.method, path: c.req.path, reason: 'missing same-origin browser provenance' });
       return c.json({ error: 'only you can make this decision, from the Feedback Graph UI, or with FG_OPERATOR_TOKEN as a Bearer for the verbs OPERATOR_ALLOW names' }, 403);
@@ -639,9 +647,9 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
     const principal: RunPrincipal = operator ? 'operator' : browser ? 'browser' : ownerBearer ? 'owner_token' : 'agent';
     if (run && opts.runs && c.req.method !== 'GET' && c.req.method !== 'HEAD') {
       const sessionRegistration = /^\/api\/sessions\/[^/]+\/run$/.test(c.req.path) && c.req.method === 'POST';
-      if (principal === 'agent' && /^\/api\/sessions\/[^/]+\/run$/.test(c.req.path)) return c.json({ error: 'labelled session registration requires an authenticated operator with FG_RUN_KEY or the local owner' }, 403);
       const agent = !!auth.token && tokenMatches(bearerOf(c) ?? '', auth.token);
       const actor = (operator || agent) ? runKey(c.req.header('x-fg-run-key'), auth.runKeySalt) : null;
+      if (principal === 'agent' && sessionRegistration && (!agent || !actor || !run.sandbox)) return c.json({ error: 'labelled session registration requires the API token, a private FG_RUN_KEY, and FG_SANDBOX=1, or an authenticated operator/local owner' }, 403);
       if (operator && !actor) return c.json({ error: 'labelled operator writes require X-FG-Run-Key (FG_RUN_KEY): a private random secret of at least 32 characters with adequate diversity (generate: openssl rand -hex 32)' }, 403);
       // Refused attempts to edit an owner's existing record must not reserve an otherwise unused run id.
       if (!(await opts.runs.owner(run.id)) && !mayChangeAny()) {
@@ -707,6 +715,12 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
     const runner = system?.runner ? await system.runner().catch(() => ({ ok: false, reason: 'codex runner health check failed' })) : null;
     const workerHealthy = !!worker && Date.now() - Date.parse(worker.lastBeat) < WORKER_STALE_MS;
     const models = worker ? modelHealth(worker, ollama, runner) : null;
+    const staleCodeMaps = graph && facts && codegraph ? await Promise.all((await facts.listProjects()).filter((p) => !sel || sel.tracked.includes(p.key)).map(async p => {
+      const meta = await codegraph.codeMapMeta(p.key).catch(() => null);
+      if (!meta) return null;
+      const ageDays = Math.max(0, Math.floor((Date.now() - Date.parse(meta.builtAt)) / 86_400_000));
+      return ageDays > 0 || meta.lastFailureAt ? { projectKey: p.key, builtAt: meta.builtAt, ageDays, lastFailureAt: meta.lastFailureAt, lastFailure: meta.lastFailure } : null;
+    })).then(rows => rows.filter((x): x is NonNullable<typeof x> => !!x)) : undefined;
     const s: SystemStatus = {
       version: system?.version ?? 'dev',
       store: system?.store ?? null,
@@ -715,6 +729,7 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
       workerHealthy,
       ...stageOf(workerHealthy ? worker : null),
       authRequired: !!auth.token,
+      ...(staleCodeMaps && { codeMaps: staleCodeMaps }),
       judge: context?.judgeId ?? null,
       selection: sel && { initialized: sel.initialized, tracked: sel.tracked.length, ...(system?.roots === undefined ? {} : { roots: system.roots }), note: selectionNote(sel, system?.roots) },
       cloud: cloudStatus(cloud?.cloud ?? null, cloudState),
@@ -864,7 +879,12 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
   });
 
   const secure = (c: Context) => c.req.header('x-forwarded-proto') === 'https' || new URL(c.req.url).protocol === 'https:';
-  app.get('/api/session', (c) => c.json({ authRequired: !!auth.ownerToken, authenticated: ownerSession(c, ownerSessions), ownerSession: ownerSession(c, ownerSessions) }));
+  app.get('/api/session', (c) => c.json({
+    authRequired: !!auth.ownerToken || !!auth.token,
+    authenticated: ownerSession(c, ownerSessions),
+    ownerSession: ownerSession(c, ownerSessions),
+    ownerSetupRequired: !!auth.token && !auth.ownerToken,
+  }));
   app.post('/api/session', async (c) => {
     if (!auth.ownerToken) return c.json({ error: 'FG_OWNER_TOKEN is required to create an owner browser session; run setup to create one' }, 403);
     const body = await c.req.json().catch(() => null);

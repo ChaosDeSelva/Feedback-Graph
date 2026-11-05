@@ -584,6 +584,8 @@ test.each([
   'Server=db;User=sa;Password=StrongPassword123!',
   "define('AUTH_KEY', 'word(StrongPassword123!)');",
   '-----BEGIN DSA PRIVATE KEY-----\nProc-Type: 4,ENCRYPTED\nDEK-Info: AES-256-CBC,0123456789ABCDEF\nYWJjZGVmMTIzNDU2Nzg5MA==\n',
+  'pasted it here. -----BEGIN RSA PRIVATE KEY-----\nYWJjZGVmMTIzNDU2Nzg5MA==\n',
+  'key: -----BEGIN OPENSSH PRIVATE KEY-----\nYWJjZGVmMTIzNDU2Nzg5MA==\n',
   '"key":"-----BEGIN PRIVATE KEY-----\\nYWJjZGVmMTIzNDU2Nzg5MA==\\n"',
 ])('0.7.1 removes held-out credential form: %s', text => expect(redactSecrets(text)).toContain('[REDACTED]'));
 
@@ -592,3 +594,17 @@ test.each([
   'maxMaterializedIndexedFilterCandidates+1',
   "u.password = '***';",
 ])('0.7.1 preserves held-out ordinary code: %s', text => expect(redactSecrets(text)).toBe(text));
+
+test.each([
+  'redis-cli -p 6379 ping',
+  '<password>${DB_PASSWORD}</password>',
+  'job-123456789:abcdefghijklmnopqrstuvwxyzABCDEFGH',
+  'convertValuesToInt64SliceForMeshRecordV2(v)',
+])('0.7.3 preserves newly reported ordinary text: %s', text => expect(redactSecrets(text)).toBe(text));
+
+test.each([
+  `https://api.telegram.org/bot123456789:${'aB1_'.repeat(10)}/sendMessage`,
+  `//registry.example/:_auth=${Buffer.from('user:Secret123!').toString('base64')}`,
+  `AGE-SECRET-KEY-1${'A2BC'.repeat(12)}`,
+  `dckr_pat_${'aB1_'.repeat(8)}`,
+])('0.7.3 removes newly reported secret form: %s', text => expect(redactSecrets(text)).toContain('[REDACTED]'));
