@@ -411,9 +411,15 @@ describeStores('RunsStore and run attribution', (h) => {
     const raced = await Promise.all([s.runs.claim('run-race', 'browser'), s.runs.claim('run-race', 'owner_token')]);
     expect(raced[0]).toEqual(raced[1]);
     expect(await s.runs.owner('run-race')).toEqual(raced[0]);
-    // Cleaning up a run keeps its owner: the run id stays the opener's.
+    // Cleaning up a run releases its owner reservation as part of the run's data.
+    // A later, explicit registration may reuse the label without inheriting stale ownership.
     await s.runs.remove('run-own', []);
-    expect(await s.runs.owner('run-own')).toEqual(first);
+    expect(await s.runs.owner('run-own')).toBeNull();
+    expect(await s.runs.claim('run-own', 'operator', 'operator:other')).toMatchObject({
+      run: 'run-own',
+      principal: 'operator',
+      actor: 'operator:other',
+    });
     // Authenticated agents retain their private run-key hash; it is proof, unlike a display name.
     expect(await s.runs.claim('run-agent', 'agent', 'agent:key-hash')).toMatchObject({ principal: 'agent', actor: 'agent:key-hash' });
     expect(await s.runs.claim('run-anon', 'operator')).toMatchObject({ principal: 'operator', actor: null });
