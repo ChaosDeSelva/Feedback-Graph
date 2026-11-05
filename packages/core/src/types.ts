@@ -720,7 +720,7 @@ export type SystemStatus = {
   /** API auth is on but the separate browser-owner credential is missing. */
   ownerSetupRequired?: boolean;
   /** Stale or failed code maps that need attention; omitted when code maps are unavailable. */
-  codeMaps?: { projectKey: string; builtAt: string; ageDays: number; lastFailureAt?: string | null; lastFailure?: string | null }[];
+  codeMaps?: { projectKey: string; builtAt: string; ageDays: number; interrupted?: boolean; lastFailureAt?: string | null; lastFailure?: string | null }[];
   /** The model that judges check_before_done (provider:model, e.g. ollama:gemma4); null when unknown or none. */
   judge?: string | null;
   /**

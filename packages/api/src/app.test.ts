@@ -154,14 +154,21 @@ test('writes from another localhost port are rejected', async () => {
 
 test('tokenless loopback compatibility refuses forwarded requests', async () => {
   const base = { 'sec-fetch-site': 'same-origin', origin: 'http://localhost:8787', host: 'localhost:8787' };
-  expect((await createApp(fakeRepo().repo).request('http://localhost:8787/api/candidates/c1/decision', post(base))).status).toBe(204);
+  const local = () => createApp(fakeRepo().repo, { peerAddress: () => '127.0.0.1' });
+  expect((await local().request('http://localhost:8787/api/candidates/c1/decision', post(base))).status).toBe(204);
+  expect((await createApp(fakeRepo().repo, { peerAddress: () => '172.20.0.9' }).request('http://localhost:8787/api/candidates/c1/decision', post(base))).status).toBe(403);
+  expect((await createApp(fakeRepo().repo, { peerAddress: () => '::ffff:127.0.0.2' }).request('http://127.0.0.2:8787/api/candidates/c1/decision', post({ ...base, host: '127.0.0.2:8787', origin: 'http://127.0.0.2:8787' }))).status).toBe(204);
   for (const forwarded of [
     { forwarded: 'for=192.0.2.10;host=localhost:8787' },
     { 'x-forwarded-for': '192.0.2.10' },
     { 'x-forwarded-host': 'localhost:8787' },
     { 'x-forwarded-proto': 'http' },
+    { 'x-forwarded-port': '' },
+    { 'x-real-ip': '192.0.2.10' },
+    { via: '1.1 proxy' },
+    { 'cf-connecting-ip': '192.0.2.10' },
   ] as Record<string, string>[]) {
-    expect((await createApp(fakeRepo().repo).request('http://localhost:8787/api/candidates/c1/decision', post({ ...base, ...forwarded }))).status).toBe(403);
+    expect((await local().request('http://localhost:8787/api/candidates/c1/decision', post({ ...base, ...forwarded }))).status).toBe(403);
   }
 });
 

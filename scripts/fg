@@ -63,6 +63,9 @@ if [ -n "${FEEDBACK_GRAPH_URL:-}" ]; then
   fi
 fi
 if [ "${1:-}" = status ] && command -v docker >/dev/null 2>&1; then
+  if [ -f "$here/state/runner-control/codex-runner-disabled" ]; then
+    echo "WARN codex runner disabled: $(head -n 1 "$here/state/runner-control/codex-runner-disabled" 2>/dev/null || echo reason unavailable)" >&2
+  fi
   . "$here/scripts/lib/env.sh"
   export FG_DATABASE_MEMORY="$(database_memory docker compose --project-directory "$here")"
 fi
@@ -98,7 +101,7 @@ if command -v docker >/dev/null 2>&1; then
   token_env=()
   [ "${FG_OPERATOR_TOKEN+x}" = x ] && token_env+=(-e "FG_OPERATOR_TOKEN=${FG_OPERATOR_TOKEN}")
   [ "${API_TOKEN+x}" = x ] && token_env+=(-e "API_TOKEN=${API_TOKEN}")
-  exec docker compose --project-directory "$here" exec -T -e "FG_DATABASE_MEMORY=${FG_DATABASE_MEMORY:-}" "${container_url[@]+"${container_url[@]}"}" "${token_env[@]+"${token_env[@]}"}" ${FG_OPERATOR_NAME:+-e FG_OPERATOR_NAME="$FG_OPERATOR_NAME"} api node src/cli.ts "$@"
+  exec docker compose --project-directory "$here" exec -T -e "FG_DATABASE_MEMORY=${FG_DATABASE_MEMORY:-}" -e "API_PORT=$(setting API_PORT)" "${container_url[@]+"${container_url[@]}"}" "${token_env[@]+"${token_env[@]}"}" ${FG_OPERATOR_NAME:+-e FG_OPERATOR_NAME="$FG_OPERATOR_NAME"} api node src/cli.ts "$@"
 fi
 
 echo "fg needs Node 22.18+ (or 23.6+) on the host, or docker to run it inside the api container" >&2

@@ -80,11 +80,14 @@ export function App() {
   }, []);
   const [needsSignIn, setNeedsSignIn] = useState(false);
   const [ownerSetupRequired, setOwnerSetupRequired] = useState(false);
+  const [canSignOut, setCanSignOut] = useState(false);
+  const [signOutError, setSignOutError] = useState<string | null>(null);
   const [status, setStatus] = useState<SystemStatus | null>(null);
   useEffect(() => {
     api.session().then((s) => {
       setOwnerSetupRequired(!!s.ownerSetupRequired);
       setNeedsSignIn(!!s.authRequired && !s.authenticated);
+      setCanSignOut(!!s.authRequired && !!s.ownerSession);
     }, () => {});
     const onSignIn = () => setNeedsSignIn(true);
     window.addEventListener(SIGN_IN_EVENT, onSignIn);
@@ -98,7 +101,7 @@ export function App() {
     return () => clearInterval(t);
   }, [needsSignIn]);
 
-  if (needsSignIn) return <SignIn ownerSetupRequired={ownerSetupRequired} onDone={() => setNeedsSignIn(false)} />;
+  if (needsSignIn) return <SignIn ownerSetupRequired={ownerSetupRequired} onDone={() => { setCanSignOut(true); setNeedsSignIn(false); }} />;
   const nothingSelected = !!status?.selection && (!status.selection.initialized || status.selection.tracked === 0);
   return (
     <AppShell
@@ -107,7 +110,11 @@ export function App() {
       onNavigate={navigate}
       health={health(status)}
       connections={status?.connections ? (collapsed) => <ConnectionsBadge connections={status.connections!} collapsed={collapsed} /> : undefined}
+      onSignOut={canSignOut ? () => { void api.signOut().then(() => {
+        setSignOutError(null); setCanSignOut(false); setStatus(null); setNeedsSignIn(true);
+      }, (error) => setSignOutError(error instanceof Error ? error.message : String(error))); } : undefined}
     >
+      {signOutError && <div className="shrink-0 px-4 pt-3 md:px-6"><Alert>Sign out failed: {signOutError}. You are still signed in.</Alert></div>}
       <NetworkBanner />
       {nothingSelected && view !== 'settings' && view !== 'docs' && <NothingSelected />}
       {!nothingSelected && (view === 'inbox' || view === 'lessons' || view === 'graph') && <FirstRun key={view} view={view} />}

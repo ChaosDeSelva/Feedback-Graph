@@ -166,7 +166,7 @@ export const ACTIVITY_WITH_RUNS = 'runs';
 export const CANDIDATE_PAGE = 200;
 
 export const api = {
-  session: () => request<{ authRequired: boolean; authenticated: boolean; ownerSetupRequired?: boolean }>('/api/session'),
+  session: () => request<{ authRequired: boolean; authenticated: boolean; ownerSession: boolean; ownerSetupRequired?: boolean }>('/api/session'),
   signIn: (token: string) => request('/api/session', { method: 'POST', body: { token } }),
   signOut: () => request('/api/session', { method: 'DELETE', body: {} }),
   status: () => request<SystemStatus>('/api/status'),

@@ -1,4 +1,6 @@
 import { createHash, createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
+import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { dirname } from 'node:path';
 import type { Context } from 'hono';
 import type { OperatorConfig } from '@fb/core';
 
@@ -13,6 +15,8 @@ export type AuthOpts = {
   publicHosts?: string[];
   /** FG_OPERATOR_TOKEN: as a Bearer it signs in like the token and passes ownerOnly for the verbs in `allow`. */
   operator?: OperatorConfig;
+  /** Owner-cookie revocations survive API restarts here (an owner-only API settings mount). */
+  sessionStateFile?: string;
 };
 
 export const SESSION_COOKIE = 'fg_session';
@@ -23,7 +27,22 @@ export class OwnerSessions {
   private readonly sessions = new Map<string, number>();
   private readonly revoked = new Map<string, number>();
   private readonly signingKey?: string;
-  constructor(signingKey?: string) { this.signingKey = signingKey; }
+  private readonly stateFile?: string;
+  readonly cookieName: string;
+  constructor(signingKey?: string, stateFile?: string) {
+    this.signingKey = signingKey;
+    this.stateFile = stateFile;
+    this.cookieName = signingKey ? `${SESSION_COOKIE}_${createHash('sha256').update(signingKey).digest('hex').slice(0, 12)}` : SESSION_COOKIE;
+    if (stateFile) {
+      try {
+        const saved = JSON.parse(readFileSync(stateFile, 'utf8')) as Record<string, number>;
+        for (const [key, expiry] of Object.entries(saved)) if (this.validExpiry(expiry, Date.now())) this.revoked.set(key, expiry);
+      } catch { /* a missing or invalid state file starts empty */ }
+    }
+  }
+  private validExpiry(value: number, now: number) {
+    return Number.isSafeInteger(value) && value > now && value <= now + SESSION_MAX_AGE * 1000;
+  }
   private digest(value: string) { return createHash('sha256').update(`feedback-graph-ui-session:${value}`).digest('hex'); }
   private sign(value: string) { return createHmac('sha256', this.signingKey!).update(`feedback-graph-ui-session:${value}`).digest('base64url'); }
   create(now = Date.now()): string {
@@ -44,7 +63,8 @@ export class OwnerSessions {
       const parts = value.split('.');
       if (parts.length === 3) {
         const body = `${parts[0]}.${parts[1]}`;
-        if (tokenMatches(parts[2], this.sign(body))) expires = Number(parts[0]);
+        const claimed = Number(parts[0]);
+        if (tokenMatches(parts[2], this.sign(body)) && this.validExpiry(claimed, now)) expires = claimed;
       }
     }
     if (!expires || expires <= now) { this.sessions.delete(key); return false; }
@@ -55,11 +75,22 @@ export class OwnerSessions {
     const key = this.digest(value);
     const expiry = this.sessions.get(key) ?? Number(value.split('.')[0]);
     this.sessions.delete(key);
-    if (Number.isFinite(expiry)) this.revoked.set(key, expiry);
+    if (this.validExpiry(expiry, Date.now())) {
+      this.revoked.set(key, expiry);
+      this.persist();
+    }
   }
   private purge(now: number) {
     for (const [key, expires] of this.sessions) if (expires <= now) this.sessions.delete(key);
     for (const [key, expires] of this.revoked) if (expires <= now) this.revoked.delete(key);
+  }
+  private persist() {
+    if (!this.stateFile) return;
+    this.purge(Date.now());
+    mkdirSync(dirname(this.stateFile), { recursive: true, mode: 0o700 });
+    const tmp = `${this.stateFile}.${process.pid}.tmp`;
+    writeFileSync(tmp, `${JSON.stringify(Object.fromEntries(this.revoked))}\n`, { mode: 0o600 });
+    renameSync(tmp, this.stateFile);
   }
 }
 
@@ -78,7 +109,7 @@ function cookie(header: string | undefined, name: string): string | undefined {
 }
 
 export function ownerSession(c: Context, sessions: OwnerSessions): boolean {
-  return sessions.has(cookie(c.req.header('cookie'), SESSION_COOKIE));
+  return sessions.has(cookie(c.req.header('cookie'), sessions.cookieName));
 }
 
 export function authenticated(c: Context, token: string | undefined, sessions: OwnerSessions): boolean {
@@ -93,10 +124,10 @@ export function tokenMatches(given: unknown, token: string): boolean {
   return typeof given === 'string' && same(given, token);
 }
 
-export function sessionCookie(value: string, secure: boolean, clear = false): string {
+export function sessionCookie(value: string, secure: boolean, clear = false, name = SESSION_COOKIE): string {
   const attrs = ['Path=/', 'HttpOnly', 'SameSite=Strict', `Max-Age=${clear ? 0 : SESSION_MAX_AGE}`];
   if (secure) attrs.push('Secure');
-  return `${SESSION_COOKIE}=${clear ? '' : value}; ${attrs.join('; ')}`;
+  return `${name}=${clear ? '' : value}; ${attrs.join('; ')}`;
 }
 
 /** Paths anyone may call: health/readiness (the container checks; they expose only ok and, for readiness, store kind), and

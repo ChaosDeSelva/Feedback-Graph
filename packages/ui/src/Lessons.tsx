@@ -405,7 +405,8 @@ export function Lessons() {
     setPicked(new Set(failed.map((r) => r.id)));
     const keep = at ? rest.findIndex((x) => x.id === at) : -1;
     setSelected(keep >= 0 ? keep : Math.max(0, Math.min(selected, rest.length - 1)));
-    setError(failed.length ? `${plural(failed.length, 'lesson')} could not be decided (still selected): ${failed.map((r) => `${r.id}: ${r.error ?? 'failed'}`).join('; ')}` : null);
+    const displayedFailures = failed.slice(0, 3);
+    setError(failed.length ? `${plural(failed.length, 'lesson')} could not be decided (still selected): ${displayedFailures.map((r) => `${r.id}: ${r.error ?? 'failed'}`).join('; ')}${failed.length > displayedFailures.length ? `; and ${failed.length - displayedFailures.length} more` : ''}` : null);
   }
   const pickedLessons = items.filter((l) => picked.has(l.id));
   const toggle = (id: string) => setPicked((p) => { const n = new Set(p); if (n.has(id)) n.delete(id); else n.add(id); return n; });

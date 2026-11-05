@@ -307,9 +307,13 @@ export function taskPrNumbers(task: string): number[] {
   };
   const text = task
     .replace(/(?:\bStack:\s*)?\bPR\s*#?(\d+)\s*(?:\/|of)\s*(\d+)/gi, counter)
-    .replace(/[([]\s*#(\d+)\s*(?:\/|of)\s*(\d+)\s*[)\]]/gi, counter);
-  return [...new Set([...text.matchAll(/(?:github\.com\/[^\s/]+\/[^\s/]+\/pull\/|\b(?:PR|pull request)(?:\s*#|\s+)|#)(\d+)\b/gi)]
-    .map(m => Number(m[1])).filter(n => Number.isSafeInteger(n) && n > 0))];
+    .replace(/[([]\s*(?:PR|pull request)?\s*#?(\d+)\s*(?:\/|of)\s*(\d+)\s*[)\]]/gi, counter)
+    .replace(/#(\d+)\s*(?:\/|of)\s*(\d+)/gi, counter);
+  const pairs = [...text.matchAll(/\b(?:PR|pull request)\s*#?(\d+)\s*\/\s*#?(\d+)\b/gi)]
+    .flatMap(m => [Number(m[1]), Number(m[2])]);
+  const singles = [...text.matchAll(/(?:github\.com\/[^\s/]+\/[^\s/]+\/pull\/|\b(?:PR|pull request)(?:\s*#|\s+)|#)(\d+)\b/gi)]
+    .map(m => Number(m[1]));
+  return [...new Set([...pairs, ...singles].filter(n => Number.isSafeInteger(n) && n > 0))];
 }
 
 /** PR numbers associated with the task or commit being worked on (merge and squash commit subjects). */

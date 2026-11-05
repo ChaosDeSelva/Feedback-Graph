@@ -18,13 +18,14 @@ const focusables = (root: HTMLElement | null) =>
  * The frame around every page: a sidebar with the product, grouped pages and the worker's health,
  * collapsible to icons on wide screens and folded into a top bar with a menu on phones.
  */
-export function AppShell<K extends string>({ groups, current, onNavigate, health, connections, children }: {
+export function AppShell<K extends string>({ groups, current, onNavigate, health, connections, onSignOut, children }: {
   groups: NavGroup<K>[];
   current: K;
   onNavigate: (k: K) => void;
   health: Health | null;
   /** The connections indicator, shown above the health badge; given whether the sidebar is collapsed. */
   connections?: (collapsed: boolean) => ReactNode;
+  onSignOut?: () => void;
   children: ReactNode;
 }) {
   const [collapsed, setCollapsed] = useState(() => loadPref(COLLAPSED) === '1');
@@ -121,6 +122,7 @@ export function AppShell<K extends string>({ groups, current, onNavigate, health
           <div className="grid shrink-0 gap-1 border-t border-line p-2">
             {connections?.(collapsed)}
             {health && <HealthBadge health={health} collapsed={collapsed} />}
+            {onSignOut && <button type="button" onClick={onSignOut} title="Sign out" className={`flex h-8 items-center rounded-sm px-2 text-xs text-muted hover:bg-hover hover:text-text ${collapsed ? 'md:justify-center md:px-0' : ''}`}><span className={hide}>Sign out</span><span className={collapsed ? 'hidden md:inline' : 'hidden'} aria-hidden="true">↪</span></button>}
             <div className={`flex gap-1 ${collapsed ? 'md:flex-col' : ''}`}>
               <button
                 type="button"

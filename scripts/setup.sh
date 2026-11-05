@@ -18,7 +18,7 @@ cd "$here"
 usage() {
   cat <<'EOF'
 usage: ./scripts/setup.sh [--yes] [--pull-models] [--projects <dirs>] [--select <keys>] [--github-token-file <file>]
-                          [--linear-key-file <file>] [--claude-token-file <file>] [--runner-procfs-compat] [--small]
+                          [--linear-key-file <file>] [--claude-token-file <file>] [--enable-auth] [--runner-procfs-compat] [--small]
 
 Write .env, mount the project folders, check Ollama (including structured output) and offer to start the stack.
 In a terminal it asks; these answer without one:
@@ -27,6 +27,8 @@ In a terminal it asks; these answer without one:
   --skip-agents              never register agents, including with --yes
   --no-transcripts           mount empty install-local transcript folders
   --pull-models              pull missing Ollama models (and nothing else unasked)
+  --enable-auth              explicitly add missing API, owner and operator tokens to an existing tokenless install
+                             (combine with --yes for non-interactive upgrade, then reconnect agents)
   --runner-procfs-compat     explicitly offer a runner-only Docker masked-path exception for nested procfs
                              (security tradeoff printed before confirmation; --yes alone never enables it)
   --small                    use the checked-in 1.5 GiB Neo4j profile before the first start
@@ -51,12 +53,13 @@ first install's skill links and Codex guidance as they are.
 EOF
 }
 
-yes=0 skip_agents=0 no_transcripts=0 pull_models=0 runner_procfs_compat=0 small=0 github_file="" linear_file="" claude_file="" select_raw="" select_given=0
+yes=0 skip_agents=0 no_transcripts=0 pull_models=0 enable_auth=0 runner_procfs_compat=0 small=0 github_file="" linear_file="" claude_file="" select_raw="" select_given=0
 while [ $# -gt 0 ]; do
   case "$1" in
     -h | --help) usage; exit 0 ;;
     -y | --yes) yes=1 ;;
     --pull-models) pull_models=1 ;;
+    --enable-auth) enable_auth=1 ;;
     --skip-agents) skip_agents=1 ;;
     --no-transcripts) no_transcripts=1 ;;
     --runner-procfs-compat) runner_procfs_compat=1 ;;
@@ -77,6 +80,25 @@ while [ $# -gt 0 ]; do
 done
 env_existed=0
 [ -f .env ] && env_existed=1
+
+# Selecting a Compose name and free published ports is one machine-wide critical section. The lock cannot be scoped to
+# this checkout: two fresh installs in different folders would otherwise both observe the same ports as free.
+setup_lock="${TMPDIR:-/tmp}/feedback-graph-setup-ports-$(id -u).lock"
+take_setup_lock() {
+  if mkdir "$setup_lock" 2>/dev/null; then printf '%s\n' "$$" > "$setup_lock/pid"; return 0; fi
+  owner="$(cat "$setup_lock/pid" 2>/dev/null || true)"
+  case "$owner" in ''|*[!0-9]*) ;; *) kill -0 "$owner" 2>/dev/null && return 1 ;; esac
+  # A process killed without running its trap must not permanently block future setup attempts.
+  rm -f "$setup_lock/pid" 2>/dev/null || true
+  rmdir "$setup_lock" 2>/dev/null || return 1
+  mkdir "$setup_lock" 2>/dev/null || return 1
+  printf '%s\n' "$$" > "$setup_lock/pid"
+}
+if ! take_setup_lock; then
+  echo "another Feedback Graph setup is reserving ports on this machine ($setup_lock); wait for it to finish and retry" >&2
+  exit 1
+fi
+trap 'rm -f "$setup_lock/pid" 2>/dev/null || true; rmdir "$setup_lock" 2>/dev/null || true' EXIT INT TERM
 
 need() { command -v "$1" >/dev/null 2>&1 || { echo "missing: $1 ($2)"; exit 1; }; }
 need docker "https://docs.docker.com/get-docker/"
@@ -366,6 +388,11 @@ secret_from_file() {
   v="$(tr -d '[:space:]' <"$file")"
   if [ -z "$v" ]; then echo "$file is empty (for $key)" >&2; exit 1; fi
   case "$v" in *[!A-Za-z0-9._-]*) echo "$file does not look like a $what (letters, digits, . _ - only); $key not saved" >&2; exit 1 ;; esac
+  if [ "$key" = CLAUDE_CODE_OAUTH_TOKEN ]; then
+    case "$v" in sk-ant-*) [ "${#v}" -ge 20 ] || { echo "$file does not look like a Claude setup token (expected sk-ant-… and at least 20 characters); $key not saved" >&2; exit 1; } ;;
+      *) echo "$file does not look like a Claude setup token (expected sk-ant-…); $key not saved" >&2; exit 1 ;;
+    esac
+  fi
   setenv "$key" "$v"
   echo "$key saved to .env (from $file; you can delete that file now)"
 }
@@ -490,8 +517,11 @@ EOF
     setenv COMPOSE_FILE "$files"
     export COMPOSE_FILE="$files"
     echo "Saved runner procfs opt-in in $compat; COMPOSE_FILE keeps the base, project mounts and existing custom files."
-    # This explicit security decision is the only setup path that may clear doctor's persisted fail-closed gate.
-    rm -f state/runner-control/codex-runner-disabled state/settings/codex-runner-disabled
+    # This opt-in addresses only the procfs mount failure. Never erase a fail-closed network/sandbox finding: changing
+    # Docker system paths does not repair it.
+    for flag in state/runner-control/codex-runner-disabled state/settings/codex-runner-disabled; do
+      [ ! -f "$flag" ] || if grep -q '^procfs:' "$flag"; then rm -f "$flag"; else echo "Kept $flag: procfs compatibility does not clear its non-procfs isolation failure."; fi
+    done
   else
     echo 'Runner procfs compatibility was not enabled.'
   fi
@@ -561,8 +591,9 @@ if typing && command -v claude >/dev/null 2>&1 && [ -z "$(envval CLAUDE_CODE_OAU
     echo "skipped: post-mortems and Ask stay on Ollama (re-run ./scripts/setup.sh to add the token later)"
   else
     case "$token" in
-      *[!A-Za-z0-9._-]*) echo "that does not look like a token (letters, digits, . _ - only); nothing saved" ;;
-      *) setenv CLAUDE_CODE_OAUTH_TOKEN "$token" && echo "saved to .env: post-mortems now run on Claude (classifying and summaries stay on Ollama)" ;;
+      sk-ant-*) if [ "${#token}" -ge 20 ]; then setenv CLAUDE_CODE_OAUTH_TOKEN "$token" && echo "saved to .env: post-mortems now run on Claude (classifying and summaries stay on Ollama)";
+        else echo "that does not look like a token: Claude setup tokens start sk-ant- and are at least 20 characters; nothing saved"; fi ;;
+      *) echo "that does not look like a token: expected a Claude setup token starting sk-ant-; nothing saved" ;;
     esac
   fi
   unset token
@@ -576,7 +607,7 @@ fi
 
 # Fetch Metadata is a browser/CSRF guard, not authentication against another local process. Make authenticated local
 # installs the normal path; agents receive this read/API token, never the separate headless owner credential.
-if [ -z "$(envval API_TOKEN)" ] && { [ "$env_existed" = 0 ] || [ "$yes" = 0 ]; } &&
+if [ -z "$(envval API_TOKEN)" ] && { [ "$env_existed" = 0 ] || [ "$yes" = 0 ] || [ "$enable_auth" = 1 ]; } &&
   confirm "Create an API token (recommended: the only owner boundary against other local processes)? [Y/n]" y; then
   setenv API_TOKEN "$(openssl rand -hex 24)"
   echo "API_TOKEN saved to .env (not printed). Agents receive it for read/tool access; it cannot create a browser owner session or make owner decisions."
@@ -585,7 +616,7 @@ fi
 # Browser owner sessions are minted only from this separate credential. Agents receive API_TOKEN, never this value;
 # keeping them distinct makes the agent token safe for ordinary MCP/CLI reads without granting lesson decisions,
 # project selection, demo seeding or access to another run's sandbox records.
-if [ -z "$(envval FG_OWNER_TOKEN)" ] && { [ "$env_existed" = 0 ] || [ "$yes" = 0 ]; } &&
+if [ -z "$(envval FG_OWNER_TOKEN)" ] && { [ "$env_existed" = 0 ] || [ "$yes" = 0 ] || [ -n "$(envval API_TOKEN)" ] || [ "$enable_auth" = 1 ]; } &&
   confirm "Create a separate owner sign-in token for the browser UI? [Y/n]" y; then
   setenv FG_OWNER_TOKEN "$(openssl rand -hex 24)"
   echo "FG_OWNER_TOKEN saved to .env (not printed). Use this value to sign in to the UI; never give it to agents."
@@ -593,7 +624,7 @@ fi
 
 # The operator token lets an agent or ./scripts/fg make the owner decisions OPERATOR_ALLOW names (by default not
 # deciding lessons or deleting data). Made only when you say yes (or pass --yes), before the start so the api has it.
-if [ -z "$(envval FG_OPERATOR_TOKEN)" ] && { [ "$env_existed" = 0 ] || [ "$yes" = 0 ]; } &&
+if [ -z "$(envval FG_OPERATOR_TOKEN)" ] && { [ "$env_existed" = 0 ] || [ "$yes" = 0 ] || [ "$enable_auth" = 1 ]; } &&
   confirm "Create an operator token, so agents and ./scripts/fg can scan, triage the Inbox and sync (lessons stay yours)? [Y/n]" y; then
   setenv FG_OPERATOR_TOKEN "$(openssl rand -hex 24)"
   echo "FG_OPERATOR_TOKEN saved to .env (not printed; ./scripts/fg reads it from there). It turns on the admin MCP at /mcp/admin"
@@ -602,9 +633,9 @@ if [ -z "$(envval FG_OPERATOR_TOKEN)" ] && { [ "$env_existed" = 0 ] || [ "$yes" 
   echo "  ask in Ask (which spends your subscription); OPERATOR_ALLOW in .env widens or narrows that. Remove the line to turn it off."
 fi
 
-if [ "$env_existed" = 1 ] && [ "$yes" = 1 ] && { [ -z "$(envval API_TOKEN)" ] || [ -z "$(envval FG_OWNER_TOKEN)" ] || [ -z "$(envval FG_OPERATOR_TOKEN)" ]; }; then
-  echo "existing .env kept unchanged: --yes never opts an existing tokenless install into authentication."
-  echo "  Run ./scripts/setup.sh interactively to choose tokens; then rerun ./scripts/install-agent.sh so existing agents receive the new API token."
+if [ "$env_existed" = 1 ] && [ "$yes" = 1 ] && [ "$enable_auth" = 0 ] && { [ -z "$(envval API_TOKEN)" ] || [ -z "$(envval FG_OWNER_TOKEN)" ] || [ -z "$(envval FG_OPERATOR_TOKEN)" ]; }; then
+  echo "existing .env kept: --yes adds a missing owner token to an authenticated install, but never opts a tokenless install into authentication."
+  echo "  Run ./scripts/setup.sh interactively, or ./scripts/setup.sh --yes --enable-auth, then rerun ./scripts/install-agent.sh so existing agents receive the new API token."
 fi
 
 compose=(docker compose)

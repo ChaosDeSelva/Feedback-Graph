@@ -18,6 +18,7 @@ import { execCommand, type Exec } from './exec.ts';
  */
 
 const PROCESS_NONCE = randomBytes(16).toString('hex');
+const START_HINT = 'start it with docker compose --profile codex up -d (docs/operations.md)';
 async function processStart(pid: number): Promise<string | null> {
   try {
     const raw = await readFile(`/proc/${pid}/stat`, 'utf8');
@@ -64,9 +65,10 @@ export async function runnerReadiness(url: string, fetchImpl: typeof fetch = fet
     const response = await fetchImpl(`${url.replace(/\/+$/, '')}/health`, { signal: AbortSignal.timeout(7_000) });
     const body = await response.json() as { ok?: boolean; error?: string };
     if (response.ok && body.ok === true) return { ok: true, reason: null };
-    return { ok: false, reason: typeof body.error === 'string' ? body.error : `codex runner readiness failed (HTTP ${response.status})` };
+    const reason = typeof body.error === 'string' ? body.error : `codex runner readiness failed (HTTP ${response.status})`;
+    return { ok: false, reason: `${reason}; ${START_HINT}` };
   } catch (err) {
-    return { ok: false, reason: `cannot reach the codex runner at ${url}: ${err instanceof Error ? err.message : String(err)}` };
+    return { ok: false, reason: `cannot reach the codex runner at ${url}: ${err instanceof Error ? err.message : String(err)}; ${START_HINT}` };
   }
 }
 
@@ -316,8 +318,6 @@ export class RunnerUnavailableError extends Error {
     this.name = 'RunnerUnavailableError';
   }
 }
-
-const START_HINT = 'start it with docker compose --profile codex up -d (docs/operations.md)';
 
 async function readToken(scratch: string): Promise<string> {
   const t = await readFile(join(scratch, RUNNER_TOKEN_FILE), 'utf8').catch(() => '');

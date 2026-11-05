@@ -38,7 +38,7 @@ test('clean ReferenceID prose evidence resolves to actual added executable call,
 
 test('secret-like Ask paths cannot reach scans, code-file identities or Activity files', async () => {
   const secret = `ghp_${'a'.repeat(36)}/src.ts`;
-  expect(taskFiles({ files: [secret, '.env', 'src/good.ts'] }, [])).toEqual(['.env', 'src/good.ts']);
+  expect(taskFiles({ files: [secret, '.env', 'src/good.ts'] }, [])).toEqual(['src/good.ts']);
   const requested: string[][] = [], activities: unknown[] = [];
   const context = deps({ requestScan: async (_project, paths) => { requested.push(paths); }, activity: { record: async value => { activities.push(value); } } });
   await buildChatContext('demo', `Explain ${secret} and src/good.ts`, [], { context });

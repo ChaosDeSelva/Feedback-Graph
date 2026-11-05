@@ -144,6 +144,9 @@ export function asActor<T extends Pick<ActivityStore, 'record'>>(a: T | undefine
     // The run it was made in, unless the entry names one itself.
     const e = run && e0.run === undefined ? { ...e0, run: run.id, ...(run.sandbox && { sandbox: true }) } : e0;
     const actor = acting.getStore();
+    // An explicit owner credential may arrive over the API rather than a browser session. It is still the owner's
+    // decision and must remain "you"; only non-owner API callers are relabelled as API clients.
+    if (!actor && via === 'api' && fromOwner.getStore() !== true && e.actor === 'you') return a.record({ ...e, actor: 'api client', why: e.why.startsWith('you ') ? `an API client ${e.why.slice(4)}` : e.why });
     if (!actor || e.actor !== 'you') return a.record(e);
     return a.record({ ...e, actor, why: e.why.startsWith('you ') ? `an agent (${actor}) ${e.why.slice(4)}` : e.why });
   };

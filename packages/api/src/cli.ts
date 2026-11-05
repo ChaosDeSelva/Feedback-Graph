@@ -201,9 +201,11 @@ function client(io: CliIO, flags: Flags, labels = true) {
     try { data = text ? JSON.parse(text) : null; } catch { data = text; }
     if (!res.ok) {
       const e = (data as { error?: unknown } | null)?.error ?? data ?? res.statusText;
-      const hint = res.status === 401 ? ' (set FG_OPERATOR_TOKEN or API_TOKEN)'
-        : res.status === 403 && !io.env.FG_OPERATOR_TOKEN?.trim() ? ' (set FG_OPERATOR_TOKEN in .env, restart, and run fg with it to let agents make this decision)' : '';
-      throw new ApiError(`${method} ${path}: ${res.status} ${typeof e === 'string' ? e : JSON.stringify(e)}${hint}`, res.status);
+      const message = typeof e === 'string' ? e : JSON.stringify(e);
+      const ownerPermission = /only you|owner credential|operator token|allowed verb|OPERATOR_ALLOW/i.test(message);
+      const hint = res.status === 401 ? ' (check FG_OPERATOR_TOKEN or API_TOKEN against this install)'
+        : res.status === 403 && ownerPermission && !io.env.FG_OPERATOR_TOKEN?.trim() ? ' (set FG_OPERATOR_TOKEN in .env, restart, and run fg with it to let agents make this decision)' : '';
+      throw new ApiError(`${method} ${path}: ${res.status} ${message}${hint}`, res.status);
     }
     return data as T;
   };
@@ -346,7 +348,7 @@ function statusLines(s: Record<string, any>, p: Pipeline | null): string[] {
     const count = pr ? ` (${pr.total === null ? `${pr.done} done` : `${pr.done} of ${pr.total}`})` : '';
     lines.push(`stage     ${s.stage.name}${s.stage.current ? ` ${s.stage.current}` : ''}${count} since ${at(s.stage.startedAt)}`);
   }
-  for (const m of s.codeMaps ?? []) lines.push(`code map  ${m.projectKey} built ${m.builtAt} (${m.ageDays}d old)${m.lastFailureAt ? `; last rebuild failed ${m.lastFailureAt}${m.lastFailure ? `: ${m.lastFailure}` : ''}` : ''}`);
+  for (const m of s.codeMaps ?? []) lines.push(`code map  ${m.projectKey} built ${m.builtAt} (${m.ageDays}d since rebuild; unchanged maps are not stale)${m.interrupted ? '; rebuild was interrupted and will be retried' : m.lastFailureAt ? `; last rebuild failed ${m.lastFailureAt}${m.lastFailure ? `: ${m.lastFailure}` : ''}` : ''}`);
   if (p) lines.push(`pipeline  ${pipelineLine(p)}`, ...queueLines(p.queues));
   const judged = (p?.lessons?.quality as Quality[] | undefined)?.[0];
   if (judged) lines.push(`lessons   ${qualityLine(judged)}`);

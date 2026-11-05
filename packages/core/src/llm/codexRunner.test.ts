@@ -4,7 +4,7 @@ import type { AddressInfo } from 'node:net';
 import { hostname, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, afterEach, expect, test } from 'vitest';
-import { isolatedRunnerArgs, mirrorLeaseOwner, mirrorLeasePath, purgeStaleRunnerMirrors, createCodexRunner, resolveMirror, runOnRunner, RUNNER_TOKEN_FILE, RunnerUnavailableError, writeRunnerToken, type RunnerOpts } from './codexRunner.ts';
+import { isolatedRunnerArgs, mirrorLeaseOwner, mirrorLeasePath, purgeStaleRunnerMirrors, createCodexRunner, resolveMirror, runnerReadiness, runOnRunner, RUNNER_TOKEN_FILE, RunnerUnavailableError, writeRunnerToken, type RunnerOpts } from './codexRunner.ts';
 import type { Exec } from './exec.ts';
 import { makeProvider } from './providers.ts';
 import { providerUnavailableReason } from './unavailable.ts';
@@ -338,6 +338,13 @@ test('runner readiness rejects unavailable sandbox before any repository mirror 
   expect(healthCalls).toBe(2);
   const { readdir } = await import('node:fs/promises');
   expect((await readdir(scratch)).filter(name => name.startsWith('fb-mirror-'))).toEqual(['fb-mirror-1']);
+});
+
+test('runner readiness failures say how to start the runner', async () => {
+  const down = await runnerReadiness('http://runner', (async () => new Response(JSON.stringify({ ok: false, error: 'sandbox unavailable' }), { status: 503 })) as typeof fetch);
+  expect(down.reason).toMatch(/sandbox unavailable.*docker compose --profile codex up -d/);
+  const unreachable = await runnerReadiness('http://runner', (async () => { throw new Error('connection refused'); }) as typeof fetch);
+  expect(unreachable.reason).toMatch(/connection refused.*docker compose --profile codex up -d/);
 });
 
 

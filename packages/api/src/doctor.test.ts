@@ -181,7 +181,7 @@ test('never prints a secret from .env', () => {
 });
 
 test('the token MCP probe requests the streamable HTTP response types', () => {
-  const checked = doctor({ env: `API_PORT=8787\nAPI_TOKEN=${'a'.repeat(32)}\n`, status: {} });
+  const checked = doctor({ env: `API_PORT=8787\nAPI_TOKEN=${'a'.repeat(32)}\nFG_OWNER_TOKEN=${'b'.repeat(32)}\n`, status: {} });
   expect(checked.code).toBe(0);
   expect(checked.out).toContain('PASS  MCP credential');
   expect(checked.mcpArgs).toContain('Accept: application/json, text/event-stream');

@@ -326,3 +326,76 @@ test('a timed-out burst receives distinct retained retry positions', async () =>
     held.release(); await active;
   } finally { vi.useRealTimers(); }
 });
+
+test('a completed keyed result remains available to an obedient retry', async () => {
+  const admission = new Admission({ concurrency: 1, timeoutMs: 1000 });
+  let calls = 0;
+  expect(await admission.run(async () => { calls++; return 'verdict'; }, { retryKey: 'same' })).toMatchObject({ ok: true });
+  expect(await admission.run(async () => { calls++; return 'duplicate'; }, { retryKey: 'same' })).toMatchObject({ ok: true, value: 'verdict' });
+  expect(calls).toBe(1);
+});
+
+test('a rejected keyed call is not cached: an identical retry can recover', async () => {
+  const admission = new Admission({ concurrency: 1, timeoutMs: 1000 });
+  let calls = 0;
+  await expect(admission.run(async () => { calls++; throw new Error('transient'); }, { retryKey: 'same' })).rejects.toThrow('transient');
+  await expect(admission.run(async () => { calls++; return 'verdict'; }, { retryKey: 'same' })).resolves.toMatchObject({ ok: true, value: 'verdict' });
+  expect(calls).toBe(2);
+});
+
+test('staggered joiners survive expiry of their queued original and share one replacement', async () => {
+  vi.useFakeTimers(); vi.setSystemTime(0);
+  try {
+    const admission = new Admission({ concurrency: 1, timeoutMs: 1000 });
+    const held = gate('held'); const active = admission.run(held.fn);
+    let calls = 0;
+    const original = admission.run(async () => { calls++; return 'old'; }, { retryKey: 'same', deadline: 10 });
+    const early = admission.run(async () => { calls++; return 'replacement'; }, { retryKey: 'same', deadline: 400 });
+    await vi.advanceTimersByTimeAsync(5);
+    const late = admission.run(async () => { calls++; return 'duplicate'; }, { retryKey: 'same', deadline: 500 });
+    await vi.advanceTimersByTimeAsync(5);
+    expect(await original).toMatchObject({ ok: false, ran: false });
+    held.release(); await active; await vi.advanceTimersByTimeAsync(0);
+    expect(await early).toMatchObject({ ok: true, value: 'replacement' });
+    expect(await late).toMatchObject({ ok: true, value: 'replacement' });
+    expect(calls).toBe(1);
+  } finally { vi.useRealTimers(); }
+});
+
+test('completed retention expires and permits a genuinely fresh call', async () => {
+  vi.useFakeTimers(); vi.setSystemTime(0);
+  try {
+    const admission = new Admission({ concurrency: 1, timeoutMs: 1000, retryPriorityMs: 20 });
+    let calls = 0;
+    await admission.run(async () => ++calls, { retryKey: 'same' });
+    expect(await admission.run(async () => ++calls, { retryKey: 'same' })).toMatchObject({ value: 1 });
+    await vi.advanceTimersByTimeAsync(20);
+    expect(await admission.run(async () => ++calls, { retryKey: 'same' })).toMatchObject({ value: 2 });
+  } finally { vi.useRealTimers(); }
+});
+
+test('one extreme outlier does not dominate ETA after a useful sample exists', async () => {
+  vi.useFakeTimers(); vi.setSystemTime(0);
+  try {
+    const admission = new Admission({ concurrency: 1, timeoutMs: 10000 });
+    for (const duration of [...Array(9).fill(100), 5000]) {
+      const call = admission.run(() => new Promise(resolve => setTimeout(resolve, duration)));
+      await vi.advanceTimersByTimeAsync(duration); await call;
+    }
+    expect(admission.snapshot().estimate.completionMs[1]).toBe(250);
+  } finally { vi.useRealTimers(); }
+});
+
+test('a timed-out join renews retry priority from the latest attempt', async () => {
+  vi.useFakeTimers(); vi.setSystemTime(0);
+  try {
+    const admission = new Admission({ concurrency: 1, timeoutMs: 1000, retryPriorityMs: 100 });
+    const held = gate('held');
+    const original = admission.run(held.fn, { retryKey: 'same', deadline: 500 });
+    const joiner = admission.run(async () => 'duplicate', { retryKey: 'same', deadline: 10 });
+    await vi.advanceTimersByTimeAsync(10); expect(await joiner).toMatchObject({ ok: false, ran: true });
+    await vi.advanceTimersByTimeAsync(95);
+    expect(admission.snapshot().nextRetryPosition).toBe(1);
+    held.release(); await original;
+  } finally { vi.useRealTimers(); }
+});

@@ -86,6 +86,20 @@ port() {
   else fail "port $host ($svc): used by something else; stop it, or set a different port in .env"; fi
 }
 api_port="$(envval API_PORT)"; api_port="${api_port:-8787}"
+api_bind="$(envval API_BIND)"; api_bind="${api_bind:-127.0.0.1}"
+api_token="$(envval API_TOKEN)"
+owner_token="$(envval FG_OWNER_TOKEN)"
+if printf '%s\n' "$api_bind" | grep -Eq '^(127(\.[0-9]{1,3}){3}|localhost|::1|\[::1\])$'; then
+  pass "API bind: loopback only ($api_bind)"
+elif [ -z "$api_token" ]; then
+  fail "API bind: $api_bind exposes a tokenless owner-compatible API; set API_BIND=127.0.0.1 or create API_TOKEN and FG_OWNER_TOKEN"
+else
+  warn "API bind: $api_bind is reachable beyond loopback; confirm the firewall/reverse proxy restricts it"
+fi
+if [ -n "$api_token" ] && [ -z "$owner_token" ]; then
+  fail "Owner sign-in: FG_OWNER_TOKEN is missing; run ./scripts/setup.sh --yes to create it, then restart the api"
+elif [ -n "$owner_token" ]; then pass "Owner sign-in: configured"
+else warn "Owner sign-in: tokenless compatibility is enabled; another local process can act as owner"; fi
 neo_http="$(envval NEO4J_HTTP_PORT)"; neo_bolt="$(envval NEO4J_BOLT_PORT)"
 port api "$api_port" 8787
 if [ "$store" != postgres ]; then
@@ -99,11 +113,13 @@ fi
 # A listening runner is not enough: /health executes its real nested sandbox, without a model.
 if [ -n "$(envval CODEX_RUNNER_URL)" ]; then
   runner_unsafe=0
+  runner_reasons=""
   runner_flag="state/runner-control/codex-runner-disabled"
-  legacy_runner_flag="state/settings/codex-runner-disabled"
-  if [ -f "$runner_flag" ] || [ -f "$legacy_runner_flag" ]; then
+  if [ -f "$runner_flag" ]; then
     warn "Codex runner: disabled by its persisted isolation-safety flag"
-    more "Reason: $(cat "$runner_flag" 2>/dev/null || cat "$legacy_runner_flag" 2>/dev/null || echo unknown). Clear it only by rerunning setup.sh --runner-procfs-compat after reviewing the isolation tradeoff."
+    more "Reason: $(cat "$runner_flag" 2>/dev/null || echo unknown). Clear it only by rerunning setup.sh --runner-procfs-compat after reviewing the isolation tradeoff."
+  elif [ "$docker_ok" = 1 ] && ! is_running codex-runner; then
+    warn "Codex runner: configured but stopped; doctor left it stopped and did not create a safety flag"
   elif [ "$docker_ok" = 1 ] && is_running worker; then
     if runner_detail="$("${compose[@]}" exec -T worker node -e 'fetch(process.env.CODEX_RUNNER_URL.replace(/\/+$/, "") + "/health", {signal:AbortSignal.timeout(10000)}).then(async r=>{ const h=await r.json(); if(!r.ok||!h.ok||!h.sandbox) throw Error(h.error||"sandbox probe failed"); }).catch(e=>{console.error(e.message);process.exit(1)})' 2>&1)"; then
       pass "Codex runner: its nested sandbox starts successfully"
@@ -112,6 +128,7 @@ if [ -n "$(envval CODEX_RUNNER_URL)" ]; then
       more "$runner_detail"
       more "For procfs mount errors on Docker Desktop/OrbStack or Linux, review setup.sh --runner-procfs-compat (explicit opt-in removes Docker system-path protection); Claude/API avoids that exception. Rebuild codex-runner with scripts/seccomp/codex-runner.json. Check AppArmor and docs/operations.md."
       runner_unsafe=1
+      case "$runner_detail" in *proc*mount*|*mount*proc*) runner_reasons="${runner_reasons}procfs: nested sandbox could not mount proc\n";; *) runner_reasons="${runner_reasons}sandbox: nested sandbox startup failed\n";; esac
     fi
     # Docker Desktop implementations do not all enforce bridge-network isolation alike. Probe the actual runner,
     # including an explicit Host header (fetch() silently discards it), rather than trusting the Compose topology.
@@ -140,12 +157,13 @@ if [ -n "$(envval CODEX_RUNNER_URL)" ]; then
         more "$isolation_detail"
         more "Codex runner is being stopped now. Choose claude-cli or an API scan provider; only restart it after the isolation probe passes."
         runner_unsafe=1
+        runner_reasons="${runner_reasons}network: runner reached a protected host or service endpoint\n"
       fi
     else fail "Codex runner: configured, but its container is not running for the live isolation probe"; runner_unsafe=1; fi
   else fail "Codex runner: configured but cannot be checked from a running worker"; runner_unsafe=1; fi
   if [ "$runner_unsafe" = 1 ]; then
     mkdir -p state/runner-control
-    printf '%s\n' "disabled by doctor after a failed runner isolation probe" > "$runner_flag"
+    printf '%b' "${runner_reasons:-isolation: runner safety probe failed\n}" > "$runner_flag"
     chmod 600 "$runner_flag"
     if "${compose[@]}" stop codex-runner >/dev/null 2>&1; then more "Stopped codex-runner: queued codex-cli jobs will remain parked."
     else more "Could not stop codex-runner automatically; stop it before allowing more jobs."; fi
@@ -276,6 +294,12 @@ if [ -z "$status" ]; then
   skip "GitHub, Linear: the api does not answer at http://localhost:$api_port (docker compose up -d), so their tokens were not checked"
 else
   pass "api: answers at http://localhost:$api_port"
+  count="$(printf '%s' "$status" | node -e 'let s="";process.stdin.on("data",c=>s+=c).on("end",()=>console.log(JSON.parse(s).codeMaps?.length ?? 0))' 2>/dev/null || echo '?')"
+  case "$count" in
+    0) pass "Code maps: no failed or interrupted rebuilds reported" ;;
+    '?') skip "Code maps: the api status response could not be read" ;;
+    *) fail "Code maps: $count project(s) have a failed or interrupted rebuild; open their Code map cards or run fg status for details" ;;
+  esac
   connection github GitHub
   connection linear Linear
 fi

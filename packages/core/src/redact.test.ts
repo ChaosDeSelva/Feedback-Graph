@@ -627,7 +627,6 @@ test.each([
   `Endpoint=sb://example/;SharedAccessKey=${'A1b2'.repeat(10)}`,
   `dp.st.${'A1b_'.repeat(8)}`,
   `NRAK-${'A1b2'.repeat(8)}`,
-  `${'a1'.repeat(16)}-us12`,
 ])('0.7.4 removes held-out credential syntax: %s', text => expect(redactSecrets(text)).toContain('[REDACTED]'));
 
 test.each([
@@ -636,3 +635,54 @@ test.each([
   `paste -----BEGIN OPENSSH PRIVATE KEY----- ${'YWJjZGVm'.repeat(3)}`,
   `-----BEGIN PRIVATE KEY-----\\\\n${'YWJjZGVm'.repeat(3)}\\\\n`,
 ])('0.7.4 removes incomplete and quoted private-key pastes: %s', text => expect(redactSecrets(text)).toContain('[REDACTED]'));
+
+test.each([
+  'ldapsearch -W -H ldap://example.test',
+  'az login -p /tmp/client.pem',
+  'openssl pass: is the documented prefix',
+  'SharedAccessKey=YOUR_SHARED_ACCESS_KEY',
+  'SharedAccessKey=process.env.AZURE_KEY',
+  `${'a1'.repeat(16)}-us1`,
+  `${'a1'.repeat(16)}-us12`,
+  `NRAK-${'X'.repeat(32)}`,
+  'this.dp.st.method()',
+])('0.7.5 preserves reported benign command/config text: %s', text => expect(redactSecrets(text)).toBe(text));
+
+test.each([
+  `the token 123456789:AA${'a'.repeat(32)}-`,
+  `dp.st.prd.${'A1b_'.repeat(8)}`,
+  `xoxe-1-${'aB1'.repeat(12)}`,
+  `tvly-${'aB1_'.repeat(8)}`,
+  `pat-na1-${'aB1_'.repeat(8)}`,
+  `fw_${'aB1_'.repeat(8)}`,
+  `pnu_${'aB1_'.repeat(8)}`,
+  `dt0c01.${'aB1_'.repeat(8)}`,
+  `00D${'A1b'.repeat(5)}!AQ${'aB1_'.repeat(8)}`,
+])('0.7.5 removes newly reported vendor secret: %s', text => expect(redactSecrets(text)).toContain('[REDACTED]'));
+
+test.each([
+  `// -----BEGIN PRIVATE KEY-----\n// ${'YWJjZGVm'.repeat(3)}   \n`,
+  ` * -----BEGIN RSA PRIVATE KEY-----\n * ${'YWJjZGVm'.repeat(3)} \n`,
+  `; -----BEGIN OPENSSH PRIVATE KEY-----\n; ${'YWJjZGVm'.repeat(3)} \n`,
+  `> > -----BEGIN PRIVATE KEY-----\n> > ${'YWJjZGVm'.repeat(3)} \n`,
+  `# key: -----BEGIN PRIVATE KEY-----\n# ${'YWJjZGVm'.repeat(3)} \n`,
+  `// -----BEGIN PRIVATE KEY-----\\n// ${'YWJjZGVm'.repeat(3)} \\n`,
+  `paste -----BEGIN PRIVATE KEY-----   \n${'YWJjZGVm'.repeat(3)} \n`,
+])('0.7.5 removes every reported quoted unterminated key: %s', text => expect(redactSecrets(text)).toContain('[REDACTED]'));
+
+test.each([
+  'mysqladmin -uroot -pStrongPassword123! status',
+  'rabbitmqctl add_user admin StrongPassword123!',
+  'xfreerdp /u:admin /p:StrongPassword123! /v:host',
+  'network={ ssid="office" psk="StrongPassword123!" }',
+  'password: StrongPassword123!',
+  '--api-key StrongKey123!',
+])('0.7.5 removes generic reported credential syntax: %s', text => expect(redactSecrets(text)).toContain('[REDACTED]'));
+
+test.each([
+  `access-sandbox-${'aB1_'.repeat(8)}`,
+  `v1.0-${'a1'.repeat(12)}-${'b2'.repeat(24)}`,
+  `the api key is ${'aB1_'.repeat(8)}`,
+  `-----BEGIN OpenVPN Static key V1-----\n${'a1'.repeat(64)}\n-----END OpenVPN Static key V1-----`,
+  `untrusted comment: minisign secret key\n${'YWJjZGVm'.repeat(8)}`,
+])('0.7.5 removes remaining block, vendor and prose credential: %s', text => expect(redactSecrets(text)).toContain('[REDACTED]'));

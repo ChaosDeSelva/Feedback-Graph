@@ -46,7 +46,12 @@ else
     docker rm -f "$dump_container" >/dev/null 2>&1 || true
     echo "restarting"
     # shellcheck disable=SC2086 # one service name per word, captured from compose ps
-    [ -z "$running" ] || docker compose up -d --wait --wait-timeout 120 $running >/dev/null
+    [ -z "$running" ] || docker compose up -d --no-deps $running >/dev/null
+    core="$(printf '%s\n' $running | grep -E '^(api|worker|neo4j|postgres)$' || true)"
+    # Wait only for Feedback Graph's data/API services. An optional runner or unrelated sidecar may intentionally be
+    # unhealthy and must neither mask a failed restore nor make a sound backup command fail.
+    # shellcheck disable=SC2086 # one service name per word
+    [ -z "$core" ] || docker compose up -d --no-deps --wait --wait-timeout 120 $core >/dev/null
   }
   trap 'restart_stack; cleanup_incomplete' EXIT
   # Do not bind the owner-only backup directory into the image: the image intentionally drops to its unprivileged
@@ -54,8 +59,9 @@ else
   # container and let the Docker daemon copy the completed file to the host instead.
   docker create --name "$dump_container" -v "$neo4j_volume:/data" "$image" \
     neo4j-admin database dump neo4j --to-path=/tmp >/dev/null
-  docker start -a "$dump_container" >/dev/null
+  docker start -a "$dump_container" >/dev/null 2>&1
   docker cp "$dump_container:/tmp/neo4j.dump" "$out/neo4j.dump"
+  chmod 600 "$out/neo4j.dump"
   docker rm "$dump_container" >/dev/null
   tar --exclude='state/settings/redaction-archive/key' --exclude='state/redaction-key' -czf "$out/state.tgz" state
   echo neo4j > "$out/STORE"

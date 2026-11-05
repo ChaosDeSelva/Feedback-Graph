@@ -1,5 +1,9 @@
+import { mkdtempSync, readFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { expect, test } from 'vitest';
 import { createApp, type ApiRepo } from './app.ts';
+import { OwnerSessions } from './auth.ts';
 
 const repo: ApiRepo = {
   listCandidates: async () => [],
@@ -58,6 +62,30 @@ test('signing in from the UI sets an HttpOnly session cookie that authenticates 
   expect((await app.request('/api/candidates', { headers: { cookie: session } })).status).toBe(401);
 });
 
+test('sign-out revocation survives an API restart and anonymous sign-out stores nothing', async () => {
+  const stateFile = join(mkdtempSync(join(tmpdir(), 'fg-session-')), 'revoked.json');
+  const opts = { auth: { token: TOKEN, ownerToken: OWNER, sessionStateFile: stateFile } };
+  const app = createApp(repo, opts);
+  const login = await app.request('/api/session', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ token: OWNER }) });
+  const session = login.headers.get('set-cookie')!.split(';')[0];
+  await app.request('/api/session', { method: 'DELETE', headers: { cookie: session, 'content-type': 'application/json' } });
+  expect(Object.keys(JSON.parse(readFileSync(stateFile, 'utf8')))).toHaveLength(1);
+  expect((await createApp(repo, opts).request('/api/candidates', { headers: { cookie: session } })).status).toBe(401);
+  await createApp(repo, opts).request('/api/session', { method: 'DELETE', headers: { 'content-type': 'application/json' } });
+  expect(Object.keys(JSON.parse(readFileSync(stateFile, 'utf8')))).toHaveLength(1);
+});
+
+test('owner cookies are isolated per install and non-finite expiry claims are refused', async () => {
+  const one = createApp(repo, { auth: { token: TOKEN, ownerToken: OWNER } });
+  const login = await one.request('/api/session', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ token: OWNER }) });
+  const cookie = login.headers.get('set-cookie')!.split(';')[0];
+  expect(cookie).toMatch(/^fg_session_[0-9a-f]{12}=/);
+  const other = createApp(repo, { auth: { token: TOKEN, ownerToken: `${OWNER}-other` } });
+  expect((await other.request('/api/candidates', { headers: { cookie } })).status).toBe(401);
+  const sessions = new OwnerSessions(OWNER);
+  expect(sessions.has(`Infinity.value.${'x'.repeat(43)}`)).toBe(false);
+});
+
 test('the UI can ask whether it needs to sign in', async () => {
   expect(await (await secured().request('/api/session')).json()).toEqual({ authRequired: true, authenticated: false, ownerSession: false, ownerSetupRequired: false });
   expect(await (await secured().request('/api/session', { headers: bearer })).json()).toEqual({ authRequired: true, authenticated: false, ownerSession: false, ownerSetupRequired: false });
@@ -66,7 +94,7 @@ test('the UI can ask whether it needs to sign in', async () => {
 });
 
 test('an upgraded install without FG_OWNER_TOKEN is usable only from its real loopback same-origin UI', async () => {
-  const local = createApp(repo);
+  const local = createApp(repo, { peerAddress: () => '127.0.0.1' });
   const body = JSON.stringify({ status: 'rejected' });
   const sameOrigin = { 'content-type': 'application/json', 'sec-fetch-site': 'same-origin', origin: 'http://localhost' };
   expect((await local.request('http://localhost/api/candidates/c1/decision', { method: 'POST', headers: sameOrigin, body })).status).toBe(204);

@@ -377,7 +377,7 @@ test('the --*-file flags put a secret a person wrote into .env, private, and nev
   const s = sandbox({ tags: both });
   const gh = 'g'.repeat(36);
   const lin = 'l'.repeat(40);
-  const claude = 'c'.repeat(20) + '-_.x';
+  const claude = 'sk-ant-' + 'c'.repeat(20) + '-_.x';
   const out = s.run({}, undefined, [
     '--projects', '~/code',
     '--github-token-file', s.secretFile('gh', `${gh}\n`),
@@ -437,6 +437,16 @@ test('the operator token is generated only with --yes or a yes answer, never pri
   expect(fresh.value('FG_OPERATOR_TOKEN')).toMatch(/^[0-9a-f]{48}$/);
 }, 20_000);
 
+test('--yes --enable-auth explicitly upgrades an existing tokenless install non-interactively', () => {
+  const s = sandbox({ tags: both });
+  s.run({ PROJECTS_DIRS: '~/code' });
+  expect([s.value('API_TOKEN'), s.value('FG_OWNER_TOKEN'), s.value('FG_OPERATOR_TOKEN')]).toEqual(['', '', '']);
+  const out = s.run({}, undefined, ['--yes', '--enable-auth']);
+  for (const key of ['API_TOKEN', 'FG_OWNER_TOKEN', 'FG_OPERATOR_TOKEN']) expect(s.value(key)).toMatch(/^[0-9a-f]{48}$/);
+  expect(out).toContain('API_TOKEN saved to .env');
+  expect(out).not.toContain(String(s.value('API_TOKEN')));
+}, 20_000);
+
 // ── Two installs on one machine ────────────────────────────────────────
 
 const PORTS = '127.0.0.1:8787->8787/tcp, 127.0.0.1:7476->7474/tcp, 127.0.0.1:7689->7687/tcp';
@@ -454,6 +464,17 @@ test('another folder\'s install is running: a new .env gets its own instance nam
   s.run();
   expect(s.value('FG_INSTANCE')).toBe('feedback-graph-repo');
   expect(s.value('API_PORT')).toBe('8797');
+});
+
+test('parallel setup across checkouts is refused before both processes can reserve the same ports', () => {
+  const s = sandbox();
+  const tmp = join(s.base, 'locks');
+  const lock = join(tmp, `feedback-graph-setup-ports-${process.getuid!()}.lock`);
+  mkdirSync(lock, { recursive: true });
+  writeFileSync(join(lock, 'pid'), `${process.pid}\n`);
+  const out = s.runFailing({ PROJECTS_DIRS: '~/code', TMPDIR: tmp });
+  expect(out).toContain('another Feedback Graph setup is reserving ports on this machine');
+  expect(s.ran()).toBe('');
 });
 
 test('the install running is this folder\'s own, or none is: the name and ports stay the defaults (existing volumes keep their names)', () => {

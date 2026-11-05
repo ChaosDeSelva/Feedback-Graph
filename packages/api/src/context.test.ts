@@ -4,6 +4,11 @@ import { checkBeforeDone, getImpact, getModuleContext, getTaskContext, hashRepoF
 import { Admission } from './admission.ts';
 
 const roots = [{ host: '/Users/j/Vibe', container: '/vibe' }];
+
+test('task files never echo credential paths or lone private-key body lines', () => {
+  expect(taskFiles({ project: 'demo', cwd: '/Users/j/Vibe/demo', files: ['.netrc', `${'YWJjZGVm'.repeat(3)}/YWJjZGVm`] }, roots)).toEqual([]);
+  expect(taskFiles({ project: 'demo', cwd: '/Users/j/Vibe/demo', task: `read ${'YWJjZGVm'.repeat(3)}/YWJjZGVm` }, roots)).toEqual([]);
+});
 const lesson = (id: string, title: string, over: Partial<Lesson> = {}): Lesson => ({
   id, projectKey: 'demo', title, rule: `${title} rule`, appliesWhen: 'search', scope: 'project', paths: ['src/routes/orders.ts'],
   status: 'approved', source: 'postmortem', cause: 'requirement_unstated', missId: `miss:${id}`, createdAt: 't', decidedAt: 't', ...over,

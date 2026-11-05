@@ -114,7 +114,9 @@ export class RunsRepo implements RunsStore {
     // both reservations and any legacy tags without deleting the real sessions.
     await this.g.runInTransaction([
       [`MATCH (s:Session {run: $run}) REMOVE s.run, s.sandbox RETURN count(s) AS n`, { run }],
+      [`MATCH (:Session)-[:HAS_TURN]->(t:Turn {run: $run}) REMOVE t.run, t.sandbox RETURN count(t) AS n`, { run }],
       [`MATCH (b:SessionRun {run: $run}) DETACH DELETE b RETURN count(*) AS n`, { run }],
+      [`MATCH (o:RunOwner {run: $run}) DETACH DELETE o RETURN count(*) AS n`, { run }],
     ]);
     // The run's sandbox records may have been the last ones: the searches may skip the run filter again.
     const fileSelectors: { kind: string; id: string }[] = [];

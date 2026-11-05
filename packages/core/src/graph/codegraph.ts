@@ -39,6 +39,22 @@ const LESSON_LIMIT = 5000;
 
 type Props = Record<string, unknown>;
 
+/** Mark the old test graph in bounded transactions before a replacement revives the current generation. */
+export async function markTestsPending(g: Pick<GraphRepo, 'run'>, key: string, now: string): Promise<void> {
+  for (;;) {
+    const [row] = await g.run(
+      `MATCH (:CodeFile {projectKey: $key})-[r:TESTS]->()
+       WHERE r.pendingRemoval IS NULL
+       WITH r LIMIT $limit
+       SET r.pendingRemoval = $now
+       RETURN count(r) AS marked`,
+      { key, now, limit: neo4j.int(DELETE_SLICE) },
+    );
+    const marked = row ? neo4j.integer.toNumber(row.get('marked')) : 0;
+    if (marked < DELETE_SLICE) return;
+  }
+}
+
 /**
  * The code map on Neo4j. Files are the CodeFile nodes facts are ABOUT (id `<projectKey>:<path>`), marked inMap with
  * the map's own properties (codeHash, lang, loc, isTest, churn), next to the scanner's hash/summary/removed. Files of
@@ -118,7 +134,7 @@ export class CodeGraphRepo implements CodeGraphStore {
     // Keep the last good TESTS graph visible until the replacement has been written. Mark old edges, revive the ones
     // present in this generation below, and delete only the remainder after every slice succeeds. A failed rebuild
     // therefore cannot empty test reachability.
-    await this.g.run(`MATCH (:CodeFile {projectKey: $key})-[r:TESTS]->() SET r.pendingRemoval = $now`, { key, now });
+    await markTestsPending(this.g, key, now);
     const statements: [string, Props][] = [
       // The project exists even for a map with no files, as in Postgres (the file slices below MERGE it otherwise).
       [`MERGE (:Project {key: $key})`, { key }],

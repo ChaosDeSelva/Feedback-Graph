@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.7.5 (2026-11-05)
+
+- Bound large code-map maintenance transactions and add a production-sized 210,000-edge Neo4j regression; preserve interrupted-map visibility, age and actionable scan diagnostics.
+- Make queued judge retries share and retain verdicts correctly, report measured wait/service timing, recover after transient provider errors and tighten evidence, PR and document relevance.
+- Require real loopback socket provenance for tokenless owner writes, persist revocations safely, complete run cleanup on both stores and expand redaction and credential-file coverage without echoing secret paths.
+- Harden setup reruns, explicit authentication upgrades, runner safety flags and live network checks; make backup/restore wait for the actual core services while ignoring optional unhealthy sidecars.
+- Improve mobile and keyboard UI behavior, safe sign-out, map navigation and cloud bulk reconciliation, cancellation, synced-folder counts and failure reporting.
+
 ## 0.7.4 (2026-11-04)
 
 - Prevent API-token sandbox runs from claiming existing owner sessions and make authenticated cleanup remove temporary run bindings without deleting transcripts.

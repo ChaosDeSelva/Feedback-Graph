@@ -69,7 +69,7 @@ export function Projects({ pollMs = 5000 }: { pollMs?: number } = {}) {
     setProjects(ps);
     // A deep link must never silently substitute another project: keep its unknown key so the detail says not found.
     setSelected((s) => (s && ps.some((p) => p.key === s) ? s : s === link?.project ? s : ps.find((p) => p.facts > 0)?.key ?? ps[0]?.key ?? null));
-  }, (e) => { setError(String(e)); setProjects((ps) => ps ?? []); });
+  }, (e) => { setError(String(e)); });
   useEffect(() => { load(); }, []);
   // A link followed while the page is open (Ask, the Dashboard, a module's "link") switches to the project it names, so
   // what the page shows, and what Rebuild or Scan acts on, is always what the address says.
@@ -178,7 +178,7 @@ export function Projects({ pollMs = 5000 }: { pollMs?: number } = {}) {
 
   return (
     <div className="flex h-full min-h-0 flex-col">
-      <PageHeader title="Projects" description="The code map, code facts, docs and your data for each project folder the worker reads." actions={<><a href="#project-scan-controls" className={buttonClass('ghost', 'sm')}>Jump to scan controls</a><ImportBundle onImported={load} /></>} />
+      <PageHeader title="Projects" description="The code map, code facts, docs and your data for each project folder the worker reads." actions={<><a href="#project-scan-controls" onClick={(event) => { event.preventDefault(); const target = document.getElementById('project-scan-controls'); target?.scrollIntoView?.({ block: 'start' }); target?.focus(); }} className={buttonClass('ghost', 'sm')}>Jump to scan controls</a><ImportBundle onImported={load} /></>} />
       <SplitPane
         listLabel="projects"
         listWidth="19rem"

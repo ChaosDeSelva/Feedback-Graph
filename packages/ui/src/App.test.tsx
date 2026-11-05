@@ -45,8 +45,8 @@ test('a link to one item (#lessons/<id>) opens its page and keeps the id in the 
   expect(location.hash).toBe('#lessons/l1');
 });
 
-function server(o: { authRequired?: boolean; ownerSetupRequired?: boolean; token?: string; workerHealthy?: boolean; tracked?: number; roots?: number; models?: object; ollama?: object }) {
-  let signedIn = !o.authRequired;
+function server(o: { authRequired?: boolean; ownerSetupRequired?: boolean; token?: string; signedIn?: boolean; signOutFails?: boolean; workerHealthy?: boolean; tracked?: number; roots?: number; models?: object; ollama?: object }) {
+  let signedIn = o.signedIn ?? !o.authRequired;
   const posts: unknown[] = [];
   vi.stubGlobal('fetch', vi.fn(async (url: string, init?: RequestInit) => {
     if (url === '/api/session' && init?.method === 'POST') {
@@ -56,7 +56,11 @@ function server(o: { authRequired?: boolean; ownerSetupRequired?: boolean; token
       signedIn = true;
       return new Response(null, { status: 204 });
     }
-    if (url === '/api/session') return Response.json({ authRequired: !!o.authRequired, authenticated: signedIn, ownerSetupRequired: !!o.ownerSetupRequired });
+    if (url === '/api/session' && init?.method === 'DELETE') {
+      if (o.signOutFails) return Response.json({ error: 'store unavailable' }, { status: 503 });
+      signedIn = false; return new Response(null, { status: 204 });
+    }
+    if (url === '/api/session') return Response.json({ authRequired: !!o.authRequired, authenticated: signedIn, ownerSession: !!o.authRequired && signedIn, ownerSetupRequired: !!o.ownerSetupRequired });
     if (!signedIn) return Response.json({ error: 'sign in required' }, { status: 401 });
     if (url === '/api/status') return Response.json({ version: '0.2.0', graph: true, worker: null, workerHealthy: o.workerHealthy ?? true, authRequired: !!o.authRequired, selection: o.tracked === undefined ? null : { initialized: true, tracked: o.tracked, roots: o.roots, note: o.roots === 0 ? 'No project folders yet: add a project folder in Settings first.' : o.tracked ? null : 'No projects are selected yet, so no sessions are being read.' }, models: o.models ?? null, ollama: o.ollama ?? null });
     return Response.json([]);
@@ -84,6 +88,19 @@ test('an upgraded protected install without an owner token explains the required
   expect(await screen.findByText('Owner sign-in needs setup')).toBeTruthy();
   expect(screen.getByText(/setup\.sh --yes/)).toBeTruthy();
   expect(screen.queryByLabelText('owner token')).toBeNull();
+});
+
+test('tokenless installs show no dead sign-out action; a failed protected sign-out keeps the app and reports it', async () => {
+  const { fireEvent } = await import('@testing-library/react');
+  server({}); render(<App />);
+  await screen.findByRole('button', { name: 'Inbox' });
+  expect(screen.queryByRole('button', { name: 'Sign out' })).toBeNull();
+  cleanup();
+  server({ authRequired: true, token: 'owner', signedIn: true, signOutFails: true }); render(<App />);
+  const signOut = await screen.findByRole('button', { name: 'Sign out' });
+  fireEvent.click(signOut);
+  expect(await screen.findByText(/Sign out failed: store unavailable.*still signed in/)).toBeTruthy();
+  expect(screen.getByRole('button', { name: 'Inbox' })).toBeTruthy();
 });
 
 test('the header warns when the worker has stopped reporting', async () => {

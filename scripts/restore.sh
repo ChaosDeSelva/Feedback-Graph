@@ -56,12 +56,20 @@ if [ "$kind" = postgres ]; then
   restore_runner_disabled
   # shellcheck disable=SC2086 # one service name per word
   [ -z "$running" ] || docker compose up -d $running >/dev/null
+  core="$(printf '%s\n' $running | grep -E '^(api|worker|postgres)$' || true)"
+  # shellcheck disable=SC2086 # one service name per word
+  [ -z "$core" ] || docker compose up -d --no-deps --wait --wait-timeout 120 $core >/dev/null
 else
   compose_json="$(docker compose config --format json)"
   project="$(printf '%s' "$compose_json" | json_field name)"
   image="$(printf '%s' "$compose_json" | json_field services.neo4j.image)"
   neo4j_volume="$(printf '%s' "$compose_json" | json_field volumes.neo4j-data.name)"
   [ -n "$neo4j_volume" ] || neo4j_volume="${project}_neo4j-data"
+  # docker create would otherwise make an unlabeled named volume when restoring a fresh install. Compose then warns
+  # that the volume is foreign on every subsequent `up`; create it with the ownership labels Compose itself uses.
+  if ! docker volume inspect "$neo4j_volume" >/dev/null 2>&1; then
+    docker volume create --label "com.docker.compose.project=$project" --label 'com.docker.compose.volume=neo4j-data' "$neo4j_volume" >/dev/null
+  fi
   running="$(docker compose ps --services --status running)"
   docker compose stop api worker neo4j >/dev/null
   load_container="${project}_neo4j-restore-$$"
@@ -70,11 +78,14 @@ else
   docker create --name "$load_container" -v "$neo4j_volume:/data" "$image" \
     neo4j-admin database load neo4j --from-path=/tmp --overwrite-destination=true >/dev/null
   docker cp "$src/neo4j.dump" "$load_container:/tmp/neo4j.dump"
-  docker start -a "$load_container" >/dev/null
+  docker start -a "$load_container" >/dev/null 2>&1
   docker rm "$load_container" >/dev/null
   rm -rf state && tar -xzf "$src/state.tgz"
   restore_runner_disabled
   # shellcheck disable=SC2086 # one service name per word
-  [ -z "$running" ] || docker compose up -d --wait --wait-timeout 120 $running >/dev/null
+  [ -z "$running" ] || docker compose up -d --no-deps $running >/dev/null
+  core="$(printf '%s\n' $running | grep -E '^(api|worker|neo4j)$' || true)"
+  # shellcheck disable=SC2086 # one service name per word
+  [ -z "$core" ] || docker compose up -d --no-deps --wait --wait-timeout 120 $core >/dev/null
 fi
 echo "restored from $src"

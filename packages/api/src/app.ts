@@ -11,7 +11,7 @@ import { z } from 'zod';
 import { ACTIVITY_KINDS, EVERYDAY_FROM, chunkText, mapCapped, MAX_AUTO_MAP_FILES, MODEL_JOBS, cleanLessonPath, cmp, FACT_KINDS, LESSON_CHECKS, LESSON_FROM, redactSecrets, relevanceBand, selectionNote, type ActivityStore, type CodeGraphStore, type DocsStore, type FactsStore, type GraphStore, type InsightsStore, type ModelHealth, type ModelJob, type OllamaHealth, type PipelineStatus, type ProviderHealth, type KnowledgeStore, type Lesson, type LinksStore, IMAGE_MEDIA_TYPES, MAX_IMAGE_BYTES, LINK_RELATIONS, LINK_STATUSES, linkPair, linkEnds, docIdOf, NotTheRunsError, type PortabilityStore, type Project, type ProjectSelection, type RelevanceBy, type ProjectSummary, type ScanQueueEntry, type ShownProjects, type WorkQueue, type WorkQueues, type StoreKind, type SystemStatus, type WorkerStatus, contextWhy, FACT_ORIGINS, SCANNER_VERSION, RUN_ID, type RunPrincipal, type RunsStore, LESSON_QUALITY_DAYS, lessonQualityReport, type LessonQualityReport, type Candidate } from '@fb/core';
 import { chatRoutes, type ChatRouteDeps } from './chat.ts';
 import { trackedProject, type ContextDeps } from './context.ts';
-import { authenticated, needsAuth, ownerSession, OwnerSessions, SECURITY_HEADERS, SESSION_COOKIE, sessionCookie, tokenMatches, type AuthOpts } from './auth.ts';
+import { authenticated, needsAuth, ownerSession, OwnerSessions, SECURITY_HEADERS, sessionCookie, tokenMatches, type AuthOpts } from './auth.ts';
 import { cloudRoutes, cloudStatus, type CloudDeps, type CloudState } from './cloud.ts';
 import { createEventHub, type FgEvent } from './events.ts';
 import { demoRoutes, type DemoDeps } from './demo.ts';
@@ -88,6 +88,8 @@ const ADMIN_MCP = '/mcp/admin';
 const RUN_PATH = /^\/api\/runs\/[^/]+\/?$/;
 
 const LOCAL_HOSTS = new Set(['localhost', '127.0.0.1', '[::1]']);
+const loopbackHost = (host: string) => LOCAL_HOSTS.has(host) || /^127(?:\.\d{1,3}){3}$/.test(host);
+const loopbackPeer = (address: string | undefined) => !!address && (address === '::1' || /^127(?:\.\d{1,3}){3}$/.test(address) || /^::ffff:127(?:\.\d{1,3}){3}$/i.test(address));
 
 function hostname(hostHeader: string | undefined): string {
   return (hostHeader ?? '').replace(/:\d+$/, '').toLowerCase();
@@ -103,6 +105,8 @@ function originAllowed(origin: string, hostHeader: string): boolean {
 export type AppOpts = {
   /** Entire HTTP request, including middleware/store waits; defaults to55seconds. */
   requestTimeoutMs?: number;
+  /** Actual transport peer address. The Node entrypoint supplies the socket peer; unknown peers fail closed. */
+  peerAddress?: (c: Context) => string | undefined;
   staticDir?: string;
   context?: ContextDeps;
   knowledge?: Pick<KnowledgeStore, 'listLessons' | 'lessonDetail' | 'updateLesson'> & Partial<Pick<KnowledgeStore, 'retryPostmortem' | 'postmortemBacklog' | 'postmortemQueue' | 'requestLessonRecheck' | 'decidedLessons'>>;
@@ -461,8 +465,10 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
   const app = new Hono();
   // Signed owner cookies survive an API restart/upgrade; logout still revokes
   // the current process copy and clears the browser cookie.
-  const ownerSessions = new OwnerSessions(auth.ownerToken);
+  const ownerSessions = new OwnerSessions(auth.ownerToken, auth.sessionStateFile);
   app.onError((error, c) => {
+    // Hono dispatches route errors through onError before outer middleware can classify a disconnected client.
+    if (c.req.raw.signal.aborted) return new Response(null, { status: 499, statusText: 'Client Closed Request' });
     const code = (error as { code?: string }).code;
     if (code === 'Neo.TransientError.General.MemoryPoolOutOfMemoryError' || /transaction(?:al)? memory|memory pool/i.test(error.message)) {
       c.header('retry-after', '2');
@@ -499,10 +505,23 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
     return c.json({ error: 'token not recognised: check FG_OPERATOR_TOKEN (or API_TOKEN) against the .env this Feedback Graph runs with' }, 401);
   };
 
+  // Compatibility for pre-0.7.2 local installs upgraded with `docker compose up` only. Keep this predicate in one
+  // place: it is both the authorization decision below and the provenance used by Activity. Otherwise an authorized
+  // tokenless UI write is incorrectly recorded as an API-client write.
+  const tokenlessLoopbackOwner = (c: Context) => !auth.token && !auth.ownerToken && !bearerOf(c)
+    // A reverse proxy or port-forward can make a remote request look same-origin.
+    // Tokenless compatibility is deliberately unavailable once forwarding metadata exists.
+    && !['forwarded', 'x-forwarded-for', 'x-forwarded-host', 'x-forwarded-proto', 'x-forwarded-port', 'x-real-ip', 'via', 'cf-connecting-ip']
+      .some((name) => c.req.header(name) !== undefined)
+    && loopbackHost(hostname(c.req.header('host') ?? new URL(c.req.url).host))
+    && loopbackPeer(opts.peerAddress?.(c))
+    && c.req.header('sec-fetch-site') === 'same-origin'
+    && originAllowed(c.req.header('origin') ?? '', c.req.header('host') ?? new URL(c.req.url).host);
+
   // Refuse DNS-rebinding hosts and cross-site writes; with a token configured, require it.
   app.use('*', async (c, next) => {
     const host = hostname(c.req.header('host') ?? new URL(c.req.url).host);
-    if (!hosts.has(host)) return c.json({ error: 'forbidden host' }, 403);
+    if (!hosts.has(host) && !loopbackHost(host)) return c.json({ error: 'forbidden host' }, 403);
     // The admin MCP endpoint answers only the operator token: without it, it does not exist (no token sent, or
     // FG_OPERATOR_TOKEN unset); a bearer that is not the operator token (the API token included) is refused.
     if (c.req.path === ADMIN_MCP && !hasOperatorToken(c, auth.operator)) {
@@ -550,14 +569,15 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
     // owner on an agent's run; a dry run of an unused id would open it).
     const run = RUN_PATH.test(c.req.path) ? null : label;
     const browser = ownerSession(c, ownerSessions);
-    const principal: RunPrincipal = operator ? 'operator' : browser ? 'browser' : ownerBearer ? 'owner_token' : 'agent';
+    const localBrowser = tokenlessLoopbackOwner(c);
+    const principal: RunPrincipal = operator ? 'operator' : (browser || localBrowser) ? 'browser' : ownerBearer ? 'owner_token' : 'agent';
     const runCapability = (operator || (!!auth.token && tokenMatches(bearerOf(c) ?? '', auth.token)))
       ? runKey(c.req.header('x-fg-run-key'), auth.runKeySalt) : null;
     // A sandbox run name is an identifier, not a credential. Reads need the same private
     // capability as writes; the owner can inspect runs through the authenticated owner path.
     const sandboxRunId = run?.id ?? (RUN_PATH.test(c.req.path) ? decodeURIComponent(c.req.path.split('/').filter(Boolean).at(-1)!) : c.req.query('run'));
     if (sandboxRunId && (run?.sandbox || await opts.runs?.sandbox?.(sandboxRunId))) {
-      const ownerAccess = ownerBearer || browser;
+      const ownerAccess = ownerBearer || browser || localBrowser;
       const owner = await opts.runs?.owner(sandboxRunId);
       if (!ownerAccess && !(runCapability && (!owner || owner.actor === runCapability))) {
         return c.json({ error: 'sandbox run access requires API_TOKEN or FG_OPERATOR_TOKEN plus its private FG_RUN_KEY, or the authenticated owner' }, 403);
@@ -569,7 +589,7 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
     // Activity says how each write arrived (operator.ts runVia).
     // A run changes only what it wrote, unless the owner opened it (operator.ts mayChange).
     const fromOwner = principal === 'browser' || principal === 'owner_token';
-    await runCaller(runCapability, () => runVia(operator ? 'operator' : browser ? 'browser' : 'api', () => runFromOwner(fromOwner, () => runIn(run, next))));
+    await runCaller(runCapability, () => runVia(operator ? 'operator' : (browser || localBrowser) ? 'browser' : 'api', () => runFromOwner(fromOwner, () => runIn(run, next))));
   });
 
   // Every body has a size limit, checked before anything reads it (the Content-Length, else counted as it arrives):
@@ -592,16 +612,6 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
   // The exception you opt into: FG_OPERATOR_TOKEN as the Bearer, for the verbs OPERATOR_ALLOW names. Its writes are
   // logged as operator:<name> (X-FG-Operator), never as you.
   const allowed = new Set(auth.operator?.allow ?? []);
-  // Compatibility for pre-0.7.2 local installs upgraded with `docker compose up` only. With no credential configured,
-  // a real same-origin browser on a loopback host is the local owner. A Bearer request never qualifies, and public
-  // host names are already refused above unless an API token protects them.
-  const tokenlessLoopbackOwner = (c: Context) => !auth.token && !auth.ownerToken && !bearerOf(c)
-    // A reverse proxy or port-forward can make a remote request look same-origin.
-    // Tokenless compatibility is deliberately unavailable once forwarding metadata exists.
-    && !c.req.header('forwarded') && !c.req.header('x-forwarded-for') && !c.req.header('x-forwarded-host') && !c.req.header('x-forwarded-proto')
-    && LOCAL_HOSTS.has(hostname(c.req.header('host') ?? new URL(c.req.url).host))
-    && c.req.header('sec-fetch-site') === 'same-origin'
-    && originAllowed(c.req.header('origin') ?? '', c.req.header('host') ?? new URL(c.req.url).host);
   const ownerOnly = (verb: (typeof OWNER_ROUTES)[number][2]) => async (c: Context, next: Next) => {
     if (hasOperatorToken(c, auth.operator)) {
       if (!allowed.has(verb)) return c.json(refusedVerb(verb), 403);
@@ -687,13 +697,13 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
         try { owner = await opts.runs!.claim(run.id, principal, actor); }
         catch (error) { if (error instanceof LegacyRunClaimError) conflict = error.message; throw error; }
         if (!sameCaller(owner, principal, actor)) {
-          conflict = `run id belongs to another caller: ${run.id} was opened by ${openerOf(owner)} at ${owner.firstSeen}; label this one with a run id of its own`;
+          conflict = `run id belongs to another caller: ${run.id} was opened by ${openerOf(owner)} at ${owner.firstSeen}; use the same credential and FG_RUN_KEY that opened it, or choose another run id only for a genuinely separate run`;
           throw new Error(conflict);
         }
       };
       const existing = await opts.runs.owner(run.id);
       if (existing && !sameCaller(existing, principal, actor)) {
-        const error = `run id belongs to another caller: ${run.id} was opened by ${openerOf(existing)} at ${existing.firstSeen}; label this one with a run id of its own`;
+        const error = `run id belongs to another caller: ${run.id} was opened by ${openerOf(existing)} at ${existing.firstSeen}; use the same credential and FG_RUN_KEY that opened it, or choose another run id only for a genuinely separate run`;
         return mcp ? c.json({ jsonrpc: '2.0', id: null, error: { code: -32600, message: error } }, 409) : c.json({ error }, 409);
       }
       // Registration itself is the run claim. Session binding is not one of the guarded graph repositories, so do
@@ -734,7 +744,9 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
       if (!meta) return null;
       const ageDays = Math.max(0, Math.floor((Date.now() - Date.parse(meta.builtAt)) / 86_400_000));
       // Age alone is not stale: unchanged repositories legitimately keep an old, still-current map.
-      return meta.lastFailureAt ? { projectKey: p.key, builtAt: meta.builtAt, ageDays, lastFailureAt: meta.lastFailureAt, lastFailure: meta.lastFailure } : null;
+      return meta.lastFailureAt || meta.fingerprint === null
+        ? { projectKey: p.key, builtAt: meta.builtAt, ageDays, ...(meta.fingerprint === null ? { interrupted: true } : {}), lastFailureAt: meta.lastFailureAt, lastFailure: meta.lastFailure }
+        : null;
     })).then(rows => rows.filter((x): x is NonNullable<typeof x> => !!x)) : undefined;
     const s: SystemStatus = {
       version: system?.version ?? 'dev',
@@ -905,13 +917,15 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
     if (!auth.ownerToken) return c.json({ error: 'FG_OWNER_TOKEN is required to create an owner browser session; run setup to create one' }, 403);
     const body = await c.req.json().catch(() => null);
     if (!tokenMatches(body?.token, auth.ownerToken)) return c.json({ error: 'wrong owner token' }, 401);
-    c.header('set-cookie', sessionCookie(ownerSessions.create(), secure(c)));
+    c.header('set-cookie', sessionCookie(ownerSessions.create(), secure(c), false, ownerSessions.cookieName));
     return c.body(null, 204);
   });
   app.delete('/api/session', (c) => {
-    const value = c.req.header('cookie')?.split(';').map(v => v.trim()).find(v => v.startsWith(`${SESSION_COOKIE}=`))?.slice(SESSION_COOKIE.length + 1);
-    ownerSessions.remove(value);
-    c.header('set-cookie', sessionCookie('', secure(c), true));
+    const prefix = `${ownerSessions.cookieName}=`;
+    const value = c.req.header('cookie')?.split(';').map(v => v.trim()).find(v => v.startsWith(prefix))?.slice(prefix.length);
+    // Anonymous DELETEs only clear the browser cookie; they must not grow the durable revocation set.
+    if (ownerSessions.has(value)) ownerSessions.remove(value);
+    c.header('set-cookie', sessionCookie('', secure(c), true, ownerSessions.cookieName));
     return c.body(null, 204);
   });
 

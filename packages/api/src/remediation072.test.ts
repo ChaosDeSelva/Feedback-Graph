@@ -18,7 +18,7 @@ test('series counters in common stack notation are not PR identities', () => {
   expect(taskPrNumbers('(PR #1 of 2), Stack: PR 1 of 2, see #14036')).toEqual([14036]);
   expect(taskPrNumbers('PR 1/2 [PR 2/3] (#3 of 4)')).toEqual([]);
   expect(taskPrNumbers('Address review on PR 14036 of 2 open PRs')).toEqual([14036]);
-  expect(taskPrNumbers('PR 14036/14037')).toEqual([14036]);
+  expect(taskPrNumbers('PR 14036/14037')).toEqual([14036, 14037]);
   expect(taskPrNumbers('PR #14036 of 3 queued')).toEqual([14036]);
 });
 
@@ -74,11 +74,21 @@ test('an unrelated memory-size line cannot substantiate a gap for another config
   const org: Lesson = { ...literal, id: 'org', title: 'Keep organization ids scoped', rule: 'Use the authenticated organization id for every request.', paths: ['config.yml'] };
   const d = context({
     k: { ...context().k, searchLessons: async () => [{ lesson: org, score: .9 }] },
-    judge: async () => [{ lessonId: 'org', status: 'not_addressed', applies: true, why: 'organization scoping is absent', evidence: ['+memory: 1GiB'] }],
+    judge: async () => [{ lessonId: 'org', status: 'not_addressed', applies: true, why: 'organization scoping is absent', evidence: ['+memory: 1Gi'] }],
   });
-  const result = await checkBeforeDone({ project: 'demo', task: 'increase memory', summary: 'raised the limit', filesChanged: ['config.yml'], diff: 'diff --git a/config.yml b/config.yml\n--- a/config.yml\n+++ b/config.yml\n@@ -1 +1 @@\n-memory: 512MiB\n+memory: 1GiB\n' }, d);
+  const result = await checkBeforeDone({ project: 'demo', task: 'increase memory', summary: 'raised the limit', filesChanged: ['config.yml'], diff: 'diff --git a/config.yml b/config.yml\n--- a/config.yml\n+++ b/config.yml\n@@ -1 +1 @@\n-memory: 256Mi\n+memory: 1Gi\n' }, d);
   expect(result.gaps).toEqual([]);
   expect(result.cannotTell?.map(item => item.lessonId)).toEqual(['org']);
+});
+
+test('a Kubernetes cpu millicore value is not misclassified as memory evidence', async () => {
+  const cpu: Lesson = { ...literal, id: 'cpu', title: 'Keep the CPU guard', rule: 'Keep the Kubernetes CPU limit at 250m.', paths: ['config.yml'] };
+  const d = context({
+    k: { ...context().k, searchLessons: async () => [{ lesson: cpu, score: .9 }] },
+    judge: async () => [{ lessonId: 'cpu', status: 'not_addressed', applies: true, why: 'the CPU guard changed', evidence: ['+cpu: 500m'] }],
+  });
+  const result = await checkBeforeDone({ project: 'demo', task: 'edit CPU limits', summary: 'changed CPU', filesChanged: ['config.yml'], diff: 'diff --git a/config.yml b/config.yml\n--- a/config.yml\n+++ b/config.yml\n@@ -1 +1 @@\n-cpu: 250m\n+cpu: 500m\n' }, d);
+  expect(result.gaps.map(gap => gap.lessonId)).toEqual(['cpu']);
 });
 
 test('a topical task does not receive high-scoring documents about an unrelated product', async () => {
@@ -95,6 +105,16 @@ test('a context deadline stores both the queued record and its Activity entry', 
   const result = await checkBeforeDone({ project: 'demo', task: 'edit src/a.ts', summary: 'done' }, d);
   expect(result.queued).toBe(true); expect(records).toBe(1);
   expect(activity).toContainEqual(expect.objectContaining({ kind: 'predone_check', details: expect.objectContaining({ status: 'queued' }) }));
+});
+
+test('a deadline racing an in-flight Activity write does not append a duplicate queued entry', async () => {
+  const activity: ActivityInput[] = [];
+  const result = await checkBeforeDone({ project: 'demo', task: 'edit src/a.ts', summary: 'added logging', filesChanged: ['src/a.ts'], diff: 'diff --git a/src/a.ts b/src/a.ts\n--- a/src/a.ts\n+++ b/src/a.ts\n@@ -0,0 +1 @@\n+console.log(42);\n' }, context({
+    checkTimeoutMs: 30,
+    activity: { record: async value => { activity.push(value); if (value.kind === 'predone_check') await new Promise(() => {}); } },
+  }));
+  expect(result.queued).toBe(true);
+  expect(activity.filter(entry => entry.kind === 'predone_check')).toHaveLength(1);
 });
 
 test('Ask only sends mapped paths to context Activity, never fake prompt paths', async () => {

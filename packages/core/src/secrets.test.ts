@@ -1,5 +1,5 @@
 import { expect, test } from 'vitest';
-import { isSecretPath } from './secrets.ts';
+import { isSecretPath, SECRET_GLOBS } from './secrets.ts';
 
 test.each(['.envrc', '.pgpass', '.vault-token', '.kube/config', 'config/kubeconfig', '.docker/config.json', 'deploy/service-account.json', '.env', 'app/.env.local', '.mcp.json', 'deploy/key.pem', 'ssh/id_rsa', 'aws/credentials', 'config/db-password.txt', 'infra/terraform.tfstate', 'android/release.keystore', 'certs/a.p12', '.pypirc', '.git/config'])('%s is a secret file', (p) => {
   expect(isSecretPath(p)).toBe(true);
@@ -44,3 +44,15 @@ test.each([
   '.config/hcloud/cli.toml', '.config/linode-cli', '.config/gcloud/legacy_credentials/me/adc.json',
   'Library/Application Support/doctl/config.yaml',
 ])('0.7.4 default credential-store path excluded: %s', path => expect(isSecretPath(path)).toBe(true));
+
+test.each([
+  ['.config/glab-cli/config.yml', '**/.config/glab-cli/**'],
+  ['.config/linode-cli/config', '**/.config/linode-cli/**'],
+  ['.fly/config.yml', '**/.fly/**'], ['.op/config', '**/.op/**'], ['.circleci/config.yml', '**/.circleci/**'],
+  ['.supabase/access-token', '**/.supabase/**'], ['.railway/config.json', '**/.railway/**'],
+  ['Library/Application Support/1Password/settings.json', '**/Library/Application Support/1Password/**'],
+  ['Library/Application Support/ngrok/ngrok.yml', '**/Library/Application Support/ngrok/**'],
+])('0.7.5 scanner and Claude deny the same credential store: %s', (path, glob) => {
+  expect(isSecretPath(path)).toBe(true);
+  expect(SECRET_GLOBS).toContain(glob);
+});

@@ -10,7 +10,7 @@
  * 5: an instruction in an upload is one addressed to the reader-as-AI, not a project convention (facts v4 closed as
  * instructions are reopened); the head of a token an older Activity subject cut at its cap is redacted.
  */
-export const REDACTION_VERSION = 14;
+export const REDACTION_VERSION = 15;
 /** Rows a store reads per page when it redacts stored text again under new rules. */
 export const REDACT_PAGE = 1000;
 
@@ -102,8 +102,12 @@ const BLOCK_PATTERNS: RegExp[] = [
   /-----BEGIN (?:RSA |DSA |EC |OPENSSH |ENCRYPTED )?PRIVATE KEY-----\\n(?:(?:(?:Proc-Type|DEK-Info):[^\\]*(?:\\n|$))|[A-Za-z0-9+/=]{8,}(?:\\n|$))+/g,
   /(?:^|\n)[ \t]*(?:[#>][ \t]*)?-----BEGIN (?:RSA |DSA |EC |OPENSSH |ENCRYPTED )?PRIVATE KEY-----[ \t]*\r?\n(?:(?:[ \t]*(?:[#>][ \t]*)?(?:Proc-Type|DEK-Info):[^\r\n]*|[ \t]*(?:[#>][ \t]*)?[A-Za-z0-9+/=]{8,}[ \t]*)\r?(?:\n|$))+/gim,
   /-----BEGIN (?:RSA |DSA |EC |OPENSSH |ENCRYPTED )?PRIVATE KEY-----[ \t]+[A-Za-z0-9+/=]{16,}(?:[ \t]+[A-Za-z0-9+/=]{8,})*/gi,
+  /-----BEGIN (?:RSA |DSA |EC |OPENSSH |ENCRYPTED )?PRIVATE KEY-----[ \t]*(?:\r?\n|\\n)(?:(?:[ \t]*(?:(?:\/\/|\*|;|#|>(?:[ \t]*>)*)[ \t]*)?[A-Za-z0-9+/=]{8,}[ \t]*(?:\r?\n|\\n|$)))+/gi,
   /-----BEGIN (?:RSA |DSA |EC |OPENSSH |ENCRYPTED )?PRIVATE KEY-----\\\\n(?:[#>][ \t]*)?[A-Za-z0-9+/=]{8,}(?:(?:\\\\n|[ \t]+)(?:[#>][ \t]*)?[A-Za-z0-9+/=]{8,})*/gi,
+  new RegExp('(?:^|\\n)[ \\t]*(?:(?:\\/\\/|\\*|;|#(?:[ \\t]+key:)?|>(?:[ \\t]*>)*))[ \\t]*-----BEGIN (?:RSA |DSA |EC |OPENSSH |ENCRYPTED )?PRIVATE KEY-----[ \\t]*(?:\\r?\\n|\\\\n)(?:(?:[ \\t]*(?:(?:\\/\\/|\\*|;|#|>(?:[ \\t]*>)*)[ \\t]*)?[A-Za-z0-9+/=]{8,}[ \\t]*(?:\\r?\\n|\\\\n|$)))+', 'gim'),
   /^PuTTY-User-Key-File-[23]: (?:ssh-|ecdsa-)[^\r\n]+\r?\n(?:(?!^PuTTY-User-Key-File-)[\s\S])*?^Private-Lines: \d+\r?\n(?:[A-Za-z0-9+/=]+\r?\n)+Private-MAC:[ \t]*[a-f0-9]+/gim,
+  /-----BEGIN OpenVPN Static key V1-----[\s\S]*?-----END OpenVPN Static key V1-----/gi,
+  /untrusted comment:[^\r\n]*minisign secret key[^\r\n]*\r?\n[A-Za-z0-9+/=]{32,}/gi,
 ];
 
 const TOKEN_PATTERNS: RegExp[] = [
@@ -124,14 +128,18 @@ const TOKEN_PATTERNS: RegExp[] = [
   /\b[sr]k_(?:live|test)_[A-Za-z0-9]{16,}/g,
   /\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{30,}/g,
   /\bgithub_pat_[A-Za-z0-9_]{30,}/g,
-  /\bxox[abprs]-[A-Za-z0-9-]{10,}/g,
+  /\bxox[abeprs]-[A-Za-z0-9-]{10,}/g,
+  /\b(?:tvly-|pat-na1-|fw_|pnu_)[A-Za-z0-9_-]{16,}/g,
+  /\baccess-(?:sandbox|development|production)-[A-Za-z0-9_-]{16,}/g,
+  /\bv1\.0-[A-Fa-f0-9]{20,}-[A-Fa-f0-9]{40,}/g,
+  /\bdt0c01\.[A-Za-z0-9_-]{20,}\b/g,
+  /\b00D[A-Za-z0-9]{12,}!AQ[A-Za-z0-9._-]{20,}/g,
   /\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/g,
   /\bSG\.[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43}\b/g,
   /\bshp(?:at|ss|ca|pa)_[0-9a-fA-F]{32}\b/g,
   /\bdop_v1_[0-9a-f]{64}\b/g,
-  /\bdp\.(?:st|pt)\.[A-Za-z0-9_-]{20,}\b/g,
-  /\b(?:NRAK|NRAA)-[A-Za-z0-9]{20,}\b/g,
-  /\b[a-f0-9]{32}-us\d{1,2}\b/gi,
+  /\bdp\.(?:st|pt)(?:\.[a-z][a-z0-9_-]{1,15})?\.(?=[A-Za-z0-9_-]{20,}\b)(?=[A-Za-z0-9_-]*[0-9A-Z])[A-Za-z0-9_-]{20,}\b/g,
+  /\b(?:NRAK|NRAA)-(?!X{8,}\b)(?=[A-Za-z0-9]{20,}\b)(?=[A-Za-z0-9]*[0-9])[A-Za-z0-9]{20,}\b/g,
   /\bya29\.[0-9A-Za-z_-]{30,}/g,
   /\bAIza[0-9A-Za-z_-]{30,}/g,
   /\beyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/g,
@@ -143,8 +151,8 @@ const TOKEN_PATTERNS: RegExp[] = [
   /\bdapi[a-f0-9]{32,}\b/gi,
   /\b(?:sq0csp-|ATATT|figd_|ntn_|glsa_)[A-Za-z0-9_-]{16,}\b/g,
   /\bPMAK-[A-Za-z0-9_-]{16,}\b/g,
-  /\b\d{8,10}:AA[A-Za-z0-9_-]{33}\b/g,
-  /\b(?:bot\s+|telegram(?:[ _-]?(?:token|url))?[^\r\n]{0,20})\d{7,12}:[A-Za-z0-9_-]{30,}\b/gi,
+  /\b\d{8,10}:AA[A-Za-z0-9_-]{33}(?![A-Za-z0-9_-])/g,
+  /\b(?:bot\s+|telegram(?:[ _-]?(?:token|url))?[^\r\n]{0,20})\d{7,12}:[A-Za-z0-9_-]{30,}(?![A-Za-z0-9_-])/gi,
   /\b(SSWS[ \t]+)[A-Za-z0-9_-]{16,}\b/gi,
   // Feedback Graph Cloud personal access tokens: fgc_pat_<16 hex lookup id>_<secret>.
   /\bfgc_pat_[0-9a-f]{16}_[A-Za-z0-9_-]{20,}/g,
@@ -159,17 +167,21 @@ const TOKEN_PATTERNS: RegExp[] = [
   /(\bmysql(?:dump)?\s+[^\r\n]*?\s-p)(?!\s|\$)[^\s'"]+/gi,
   /(\b(?:docker\s+login|sshpass)\b[^\r\n]*?\s-p(?:=|\s+)["']?)(?!\s|\$)[^\s'"]+/gi,
   /(\bredis-cli\b[^\r\n]*?\s-a(?:=|\s+)["']?)(?!\s|\$)[^\s'"]+/gi,
-  /(\baz\s+login\b[^\r\n]*?\s-p(?:=|\s+)["']?)(?!\s|\$)[^\s'"]+/gi,
-  /(\bopenssl\b[^\r\n]*?\bpass:)(?!\s|\$)[^\s'"]+/gi,
-  /(\bldapsearch\b[^\r\n]*?\s-w(?:=|\s+)["']?)(?!\s|\$)[^\s'"]+/gi,
+  /(\bmysqladmin\b[^\r\n]*?\s-p)(?!\s|\$)[^\s'"]+/gi,
+  /(\brabbitmqctl\s+add_user\s+\S+\s+)(?!\$)[^\s'"]+/gi,
+  /(\bxfreerdp\b[^\r\n]*?\/p:)(?!\s|\$)[^\s'"]+/gi,
+  /(\bpsk\s*=\s*["']?)(?!\$|\{|<)[^\s'"]{8,}/gi,
+  /(\baz\s+login\b[^\r\n]*?\s-p(?:=|\s+)["']?)(?![-~/.<$]|\s|\$)[^\s'"]+/g,
+  /(\bopenssl\b[^\r\n]*?\bpass:)(?![-~/.<$]|\s|\$)[^\s'"]+/g,
+  /(\bldapsearch\b[^\r\n]*?\s-w(?:=|\s+)["']?)(?![-~/.<$]|\s|\$)[^\s'"]+/g,
   /(\bsmbclient\b[^\r\n]*?\s-U\s+[^\s%'"=]+%)(?!\s|\$)[^\s'"]+/gi,
-  /(\bSharedAccessKey\s*=\s*)(?![<\${])[^;\s"']{12,}/gi,
+  /(\bSharedAccessKey\s*=\s*)(?![<\${]|YOUR[_-]|process\.env\.)[^;\s"']{12,}/gi,
   /(\brequests\.[a-z]+\([^\r\n]*?\bauth\s*=\s*\(\s*["'][^"']+["']\s*,\s*["'])([^"']+)(?=["']\s*\))/gi,
   /(<password(?:\s[^>]*)?>)((?!\$\{|\{\{|<)[^<\r\n]+)(?=<\/password>)/gi,
   // A webhook URL is its own secret: the host and kind stay, the path that grants access goes.
   /\b(https?:\/\/hooks\.slack\.com\/(?:services|workflows|triggers)\/)[A-Za-z0-9_/-]{8,}/g,
   /\b(https?:\/\/(?:ptb\.|canary\.)?discord(?:app)?\.com\/api\/webhooks\/)\d+\/[A-Za-z0-9_-]{20,}/g,
-  /\b(https?:\/\/(?:api\.)?telegram\.org\/bot)\d{7,12}:[A-Za-z0-9_-]{30,}/gi,
+  /\b(https?:\/\/(?:api\.)?telegram\.org\/bot)\d{7,12}:[A-Za-z0-9_-]{30,}(?![A-Za-z0-9_-])/gi,
   /(^|\n)(\/\/[^\s:]+\/:_auth\s*=\s*)(?![$<{])[A-Za-z0-9+/]{12,}={0,2}(?=\s|$)/g,
   // A secret in a URL's query or fragment: ?token=, &api_key=, &sig=, #access_token=. Only values of 8+ characters with
   // a digit, a capital or an escape in them; a ${VAR}, {{template}} or <placeholder> stays, and so does ?key=name.
@@ -181,6 +193,9 @@ const TOKEN_PATTERNS: RegExp[] = [
  * a <v> group (the value), and a check the value must pass; text the check refuses is left exactly as it was.
  */
 const CONTEXT_RULES: { re: RegExp; check: (v: string) => boolean }[] = [
+  { re: /(?<keep>\b(?:password|passwd|api[_ -]?key|token|secret)\s*:\s*["']?)(?<v>[^\s'"]{6,})/gi, check: value => { const v = value.replace(/[:;,)}|!]+$/, ''); return !/^[$<{%~&*!/.]/.test(v) && !/[/\\]/.test(v) && assignedSecret(v) && (looksLikeSecret(v) || /[^a-z0-9]/i.test(value)); } },
+  { re: /(?<keep>(?:^|\s)--?(?:api-?key|password|passwd|token|secret)(?:=|\s+))(?<v>[^\s'"]{6,})/gim, check: value => { const v = value.replace(/[:;,)}!]+$/, ''); return !/^[$<{%~&*!/.]/.test(v) && assignedSecret(v) && (looksLikeSecret(v) || /[^a-z0-9]/i.test(value)); } },
+  { re: /(?<keep>\b(?:password|passwd|api[_ -]?key|access[_ -]?token|secret)\s+(?:is|was|equals?)\s+["']?)(?<v>[^\s'",;)}]{8,})/gi, check: value => assignedSecret(value) && looksLikeSecret(value) },
   { re: /(?<keep>\bdefine\(\s*["'][^"']*(?:PASSWORD|PASSWD|SECRET|TOKEN|API_KEY|(?:AUTH|SECURE_AUTH|LOGGED_IN|NONCE)_(?:KEY|SALT))["']\s*,\s*["'])(?<v>[^"'\r\n]+)(?=["']\s*\))/gi, check: value => assignedSecret(value) || (/^[~/]/.test(value) && value.length >= 16) || (/^[A-Za-z]+[([]/.test(value) && /[A-Z0-9!@#$%^&*]/.test(value)) },
   { re: /(?<keep>(?<![\w.])(?:Password|Pwd)[ \t]*=(?![=>])[ \t]*)(?<v>[^;,)}"'\r\n]+)(?=\s*(?:[;,)}"']|$))/gi, check: value => { const v = value.trim(); return !!v && !/\s/.test(v) && !/^["'{]/.test(v) && !IDENT.test(v) && assignedSecret(v); } },
   { re: /(?<keep>\b(?:AUTH|SECURE_AUTH|LOGGED_IN|NONCE)_(?:KEY|SALT)(?:\s*=\s*["']?|\s*:\s*["']))(?<v>[^"'\r\n;]+)(?=["']|;|$)/gim, check: assignedSecret },

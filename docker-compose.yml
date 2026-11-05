@@ -223,9 +223,11 @@ services:
     environment:
       CONTROL_UID: ${HOST_UID:-1000}
       CONTROL_GID: ${HOST_GID:-1000}
-    volumes: ["./state/runner-control:/runner-control"]
+    volumes:
+      - ./state/runner-control:/runner-control
+      - ./state/settings:/legacy-settings:ro
     entrypoint: ["sh", "-eu", "-c"]
-    command: ['case "$$CONTROL_UID:$$CONTROL_GID" in *[!0-9:]*|:*|*:) exit 1;; esac; chmod 0700 /runner-control; chown "$$CONTROL_UID:$$CONTROL_GID" /runner-control']
+    command: ['case "$$CONTROL_UID:$$CONTROL_GID" in *[!0-9:]*|:*|*:) exit 1;; esac; if [ ! -e /runner-control/codex-runner-disabled ] && [ -f /legacy-settings/codex-runner-disabled ]; then cp /legacy-settings/codex-runner-disabled /runner-control/codex-runner-disabled; chmod 0600 /runner-control/codex-runner-disabled; fi; chmod 0700 /runner-control; chown -R "$$CONTROL_UID:$$CONTROL_GID" /runner-control']
 
   codex-runner:
     networks: [runner-private, runner-egress]

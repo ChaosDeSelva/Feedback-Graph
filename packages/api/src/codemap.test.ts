@@ -79,6 +79,7 @@ test('get_module_context describes a file: facts, exported symbols, importers, i
   expect(md).toContain('src/config.ts');
   expect(md).toContain('pkg:pg');
   expect(md).toContain('test/pool.test.ts');
+  expect(md).toMatch(/Code map rebuilt .*unchanged maps are not rewritten.*not a staleness signal/);
   expect(md).toMatch(/Release pool clients[\s\S]*lesson l1/);
   expect(md).toMatch(/leaked pool clients on error[\s\S]*session s1/);
   expect(md.indexOf('Every client is released')).toBeLessThan(md.indexOf('createPool'));
@@ -154,9 +155,11 @@ test('a stored non-miss on a file is never served by get_module_context, impact 
   expect(mod.markdown).not.toContain('did not miss');
   expect(mod.module?.misses.map((x) => x.missId)).toEqual(['miss:1']);
   const imp = await getImpact({ project: 'demo', paths: ['src/db/pool.ts'] }, d);
+  expect(imp.markdown).toMatch(/Code map rebuilt .*unchanged maps are not rewritten.*not a staleness signal/);
   expect(imp.markdown).not.toContain('did not miss');
   expect(imp.markdown).not.toContain('## Past misses');
   const task = await getTaskContext({ project: 'demo', task: 'pool', files: ['src/db/pool.ts'] }, deps({ codegraph: codegraph({ moduleContext: async () => ({ ...pool, misses: [miss(), non] }) }).cg }));
+  expect(task.markdown).toMatch(/Last map rebuild: \d+d ago .*not a staleness signal/);
   expect(task.markdown).not.toContain('did not miss');
 });
 

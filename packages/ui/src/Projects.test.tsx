@@ -59,6 +59,22 @@ test('lists projects with counts and shows facts for the selected one', async ()
   expect(await row('other')).toBeTruthy();
 });
 
+test('jump to scan controls stays on Projects and focuses the controls', async () => {
+  render(<Projects />);
+  await screen.findByText('Use sendError for all errors');
+  const jump = screen.getByRole('link', { name: 'Jump to scan controls' });
+  fireEvent.click(jump);
+  expect(location.hash).not.toBe('#project-scan-controls');
+  expect(document.activeElement?.id).toBe('project-scan-controls');
+});
+
+test('an API outage is an error, not an empty or missing-project state', async () => {
+  vi.stubGlobal('fetch', vi.fn(async () => { throw new Error('api unavailable'); }));
+  render(<Projects />);
+  expect(await screen.findByText(/api unavailable/)).toBeTruthy();
+  expect(screen.queryByText(/0 projects|Project not found|No project folders/)).toBeNull();
+});
+
 test('an unknown project deep link says so and never substitutes the first project', async () => {
   history.replaceState(null, '', '#projects/not-here/src%2Fdb.ts');
   render(<Projects />);

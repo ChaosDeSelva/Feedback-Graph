@@ -19,7 +19,7 @@
 # The server is named feedback-graph, or feedback-graph-<name> for an install with its own FG_INSTANCE (setup.sh gives a
 # second checkout on the same machine one, and its own API_PORT), so two installs on one machine each keep a server.
 # Such a second install never repoints the skill links or rewrites the Codex guidance block the first one made.
-# Safe to re-run: a server already registered is left alone, the guidance block is only rewritten when it changed, and
+# Safe to re-run: this install's server registration is refreshed with its current URL/token, the guidance block is only rewritten when it changed, and
 # a Codex file is copied to <file>.bak.<time> before it is changed. The skills are symlinks into this folder, so a
 # git pull updates them; after moving or deleting this folder, re-run the script (or remove the links).
 set -euo pipefail

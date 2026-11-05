@@ -251,8 +251,18 @@ const MAX_FILES = 50;
 export function taskFiles(q: ProjectRef & { files?: string[]; task?: string }, roots: Root[]): string[] {
   const root = q.cwd ? hostRepoPath(q.cwd, roots) : null;
   const out = [...(q.files ?? []), ...mentionedPaths(redactSecrets(q.task ?? ''))].slice(0, MAX_FILES).map((f) => (root ? repoRelative(f, root, q.cwd) : f.startsWith('/') ? null : cleanLessonPath(f)));
-  return [...new Set(out.filter((f): f is string => !!f && redactSecrets(f) === f && !(/\s/.test(f) || [...f].some(char => char.charCodeAt(0) < 32))))];
+  return [...new Set(out.filter((f): f is string => !!f && redactSecrets(f) === f && !isSecretPath(f)
+    && !/^(?=.{16,}$)[A-Za-z0-9+/=]+$/.test(f)
+    && !(/\s/.test(f) || [...f].some(char => char.charCodeAt(0) < 32))))];
 }
+
+/** Explicit credential-file names are never returned as task files or recorded, but the response may explain why. */
+const namedSecretFiles = (q: ProjectRef & { files?: string[] }, roots: Root[]): string[] => {
+  const root = q.cwd ? hostRepoPath(q.cwd, roots) : null;
+  return [...new Set((q.files ?? []).slice(0, MAX_FILES)
+    .map(f => root ? repoRelative(f, root, q.cwd) : f.startsWith('/') ? null : cleanLessonPath(f))
+    .filter((f): f is string => !!f && redactSecrets(f) === f && isSecretPath(f) && !/\s/.test(f)))];
+};
 
 /** Lessons for the named files first (those the search found, by score, then the others), then the rest of the search. */
 function rankByFiles(hits: LessonHit[], matched: { lesson: Lesson; paths: string[] }[], projectKey: string): TaskLesson[] {
@@ -350,7 +360,7 @@ async function linkedContext(projectKey: string, embedding: number[], task: stri
         linkedLessons(key, embedding, task, LINKED_LESSON_K, d),
         d.k.relatedMisses({ embedding, projectKey: key, k: LINKED_MISS_K * 3 }).then((h) => rankMisses(h, LINKED_MISS_K, [], [], contextFloor(d), factRankFloor(d))),
         d.facts ? d.facts.searchFacts({ embedding, projectKey: key, k: LINKED_FACT_K * 3 }).then((h) => rankFacts(h, LINKED_FACT_K, [], [], contextFloor(d), factRankFloor(d))) : Promise.resolve([]),
-        d.docs ? d.docs.searchDocs({ embedding, projectKey: key, k: LINKED_DOC_K }).then((h) => rankDocs(h.filter(doc => sharesTopic(task, { title: doc.title, rule: doc.text, appliesWhen: '', paths: [] })), LINKED_DOC_K, [], [], contextFloor(d), factRankFloor(d))) : Promise.resolve([]),
+        d.docs ? d.docs.searchDocs({ embedding, projectKey: key, k: LINKED_DOC_K }).then((h) => rankDocs(topicalDocs(task, h), LINKED_DOC_K, [], [], contextFloor(d), factRankFloor(d))) : Promise.resolve([]),
       ]);
       return { key, link, lessons, misses, facts, docs };
     }),
@@ -452,16 +462,18 @@ const isOwn = (f: { path: string; createdAt: string }, own: OwnChange) => !!own 
 const taskServices = (task: string, files: string[], seen: string[]) => (files.length ? [] : servicesInTask(task, serviceDirs(seen)));
 
 /** Documents are semantic data, not rules: require a shared concrete topic when the task actually names one. */
-const topicalDocs = <T extends { title: string; text: string; ref: string }>(task: string, docs: T[], fileScoped = false) => {
-  // A named file is already a concrete relevance signal; keep semantic document results for that file-scoped task.
-  if (fileScoped) return docs;
-  const generic = /^(?:add|build|change|configure|create|ensure|fix|make|setup|support|task|update|work|code|with|from)$/i;
-  const terms = (text: string) => text.split(/[^\p{L}\p{N}_-]+/u).map(word => word.toLowerCase()).filter(word => word.length >= 4 && !generic.test(word));
+const topicalDocs = <T extends { title: string; text: string; ref: string }>(task: string, docs: T[], _fileScoped = false) => {
+  // Naming an arbitrary/nonexistent file must not bypass topical relevance.
+  const generic = /^(?:add|and|are|build|change|configure|create|ensure|fix|for|from|has|have|make|new|not|one|only|setup|support|task|the|this|that|update|use|was|were|with|work|code)$/i;
+  const terms = (text: string) => text.split(/[^\p{L}\p{N}_-]+/u).map(word => word.toLowerCase()).filter(word => word.length >= 3 && !generic.test(word));
+  const aliases: Record<string, string[]> = { modal: ['dialog'], modals: ['dialog'], dialog: ['modal'], dialogs: ['modal'] };
+  const forms = (word: string) => new Set([word, ...(word.length >= 6 && word.endsWith('s') ? [word.slice(0, -1)] : []), ...(aliases[word] ?? [])]);
   const wanted = terms(task);
   if (!wanted.length) return docs;
   return docs.filter(doc => {
     const have = terms(`${doc.title} ${doc.text} ${doc.ref}`);
-    return wanted.some(want => have.some(term => want === term || (want.length >= 6 && term.length >= 6 && want.slice(0, 6) === term.slice(0, 6))));
+    const available = new Set(have.flatMap(word => [...forms(word)]));
+    return wanted.some(want => [...forms(want)].some(form => available.has(form)));
   });
 };
 
@@ -598,6 +610,7 @@ export async function getTaskContext(
   const own = !!selected;
   const [embedding] = await d.embed([q.task]);
   const files = own ? taskFiles(q.trustedFilesOnly ? { ...q, task: '' } : q, d.roots) : [];
+  const secretFiles = own ? namedSecretFiles(q, d.roots) : [];
   if (q.brief) return briefContext(q, project, own, files, embedding, d);
   const [found, byFile, recent, linked, mods, mine] = await Promise.all([
     searchProject(project, own, embedding, q.task, files, d),
@@ -635,6 +648,10 @@ export async function getTaskContext(
   const unmapped = mods ? files.slice(0, CODE_FILES_K).filter((_, i) => !mods[i]) : [];
   const [outside, why] = await Promise.all([outsideOf(project.key, unmapped, d), unmappedReasons(project, unmapped, d)]);
   lines.push(...codeMapSection(project.key, files, mods, mods ? await d.codegraph?.codeMapMeta?.(project.key) : null, outside, why));
+  if (secretFiles.length) {
+    if (!files.length) lines.push('', '## Code map for the files you named');
+    lines.push(`- ${n(secretFiles.length, 'named credential file')} omitted: secret-file paths and contents are never read, mapped, logged or echoed.`);
+  }
   if (recent.length) {
     lines.push('', '## Recent sessions in this project', 'Call `get_recent_sessions` for the full summaries.');
     for (const s of recent) lines.push(sessionLine(s));
@@ -830,7 +847,7 @@ export function queueDescription(queue: QueueInfo): string {
   const window = ([low, high]: [number, number | null]) => high === null ? `${Math.ceil(low / 1000)} s or more (upper estimate unavailable)` : `${Math.ceil(low / 1000)}–${Math.ceil(high / 1000)} s`;
   const basis = queue.estimate.source === 'observed' ? `${queue.estimate.samples} recent completed judge calls` : 'cold-start response-budget scenario; no completed calls yet';
   return `Judge capacity: ${queue.capacity}; ${queue.running} running and ${queue.waiting} waiting. `
-    + (queue.state === 'running' ? 'This judge call is running. ' : queue.position === null ? `No retained queue position; a retry would currently enter at waiting position ${queue.nextRetryPosition}. ` : `Waiting position ${queue.position}; `)
+    + (queue.state === 'running' ? 'This judge call is running. ' : queue.position === null ? `No physical queue slot is retained; a retry would currently enter at logical position ${queue.nextRetryPosition}. ` : `Waiting position ${queue.position}; `)
     + (queue.retryPriority?.retained ? `Retry priority is held for ${Math.ceil(queue.retryPriority.remainingMs / 1000)} s for this same authorized check; no physical slot is reserved. ` : queue.retryPriority?.restored ? 'Earlier retry priority was restored ahead of newer waiting checks. ' : '')
     + (queue.arrivalAhead === null ? '' : `On arrival: ${queue.arrivalAhead} checks ahead. `)
     + ''
@@ -890,7 +907,7 @@ export async function checkBeforeDone(
     controller.signal.throwIfAborted();
     return Promise.race([d.embed(texts, { signal: controller.signal, timeoutMs: Math.max(1, deadline - Date.now()) }), expired]);
   };
-  if (d.activity) { const original = guard(d.activity.record.bind(d.activity)); bounded.activity = { record: async input => { const saved = await original(input); if (input.kind === 'predone_check') activityRecorded = true; return saved; } }; }
+  if (d.activity) { const original = guard(d.activity.record.bind(d.activity)); bounded.activity = { record: async input => { if (input.kind === 'predone_check') activityRecorded = true; return original(input); } }; }
   bounded.checkRetryBase = d.checkRetryIdentity ? createHash('sha256').update(JSON.stringify([d.checkRetryIdentity, currentRun(), q.project, q.cwd, q.task, q.summary, q.sessionId, [...(q.filesChanged ?? [])].sort()])).digest('hex') : undefined;
   bounded.checkRecord = (checkedLessonIds, gapLessonIds, status, verdicts = []) => { outcome = { checkedLessonIds, gapLessonIds, status, verdicts }; };
   bounded.excludedPrNumbers = new Set();
@@ -974,7 +991,8 @@ async function checkBeforeDoneWork(
           // A semantic match in another service made the judge spend most of its time saying "not applicable".
           // For the completion gate, keep project-wide misses and misses tied to the changed file/service; the general
           // context search remains broader. The raw and weighted floors are applied before any model call.
-          const issueRefs = [...work.matchAll(/\b[A-Z][A-Z0-9]{1,15}-\d+\b/g)].map(match => match[0]);
+          const issueRefs = [...work.matchAll(/\b[A-Z][A-Z0-9]{1,15}-\d+\b/g)].map(match => match[0])
+            .filter(ref => !/^(?:SHA|UTF|ISO|GPT)-/.test(ref));
           return rankMisses(eligible, MISS_K, changed, services, contextFloor(d), factRankFloor(d)).filter(m => {
             const paths = mentionedPaths(`${m.missed} ${m.feedbackText}`);
             const topical = sharesTopic(work, { title: m.missed, rule: m.feedbackText, appliesWhen: '', paths });
@@ -1233,8 +1251,8 @@ function withEvidence(v: Verdict, files: ReturnType<typeof splitDiff>, lesson?: 
   // A memory-size change is not evidence for an unrelated rule merely because both touch the same broad config file.
   // This is deliberately narrow: ordinary code evidence can use different vocabulary than the rule describing it.
   if (cites.length && v.status === 'not_addressed' && lesson
-    && cites.every(c => /\b\d+(?:\.\d+)?\s*(?:[KMGT]i?B|[KMGT])\b/i.test(c.line))
-    && !/\b(?:memory|heap|ram|rss|swap|[KMGT]i?B)\b/i.test(`${lesson.title} ${lesson.rule} ${lesson.appliesWhen}`)) {
+    && cites.every(c => /\b\d+(?:\.\d+)?\s*(?:Ki|Mi|Gi|Ti|[KMGT](?:i?B)?)\b/.test(c.line))
+    && !/\b(?:memory|heap|ram|rss|swap|Ki|Mi|Gi|Ti|[KMGT](?:i?B)?)\b/i.test(`${lesson.title} ${lesson.rule} ${lesson.appliesWhen}`)) {
     return { ...v, status: 'cannot_tell', why: `${v.why} (the cited changed line does not concern this lesson)` };
   }
   if (cites.length) return { ...v, cites };
@@ -1604,7 +1622,7 @@ function codeMapSection(key: string, files: string[], mods: (ModuleContext | nul
   if (meta) {
     const built = Date.parse(meta.builtAt);
     const ageDays = Number.isFinite(built) ? Math.max(0, Math.floor((Date.now() - built) / 86_400_000)) : null;
-    if (ageDays !== null && ageDays >= 1) lines.push(`Map age: ${ageDays}d.`);
+    if (ageDays !== null && ageDays >= 1) lines.push(`Last map rebuild: ${ageDays}d ago (unchanged maps are not rewritten; this is not a staleness signal).`);
   }
   if (gaps) lines.push(gaps);
   shown.forEach((f, i) => {
@@ -1642,6 +1660,14 @@ function graphGaps(key: string, meta: CodeMapMeta | null | undefined): string | 
   // A current map keeps the import index past the cap, so importers outside the map are counted.
   if (!current && meta.candidates !== null && meta.candidates > meta.stats.files) parts.push(`the map holds ${meta.stats.files} of ${meta.candidates} files (capped), so files outside it are not counted`);
   return parts.length ? `The ${INCOMPLETE}: ${parts.join('; ')}. Search the code for importers and tests before relying on these lists.` : null;
+}
+
+function mapBuildNote(meta: CodeMapMeta | null | undefined): string | null {
+  if (!meta) return null;
+  const built = Date.parse(meta.builtAt);
+  if (!Number.isFinite(built)) return null;
+  const ageDays = Math.max(0, Math.floor((Date.now() - built) / 86_400_000));
+  return `Code map rebuilt ${ageDays === 0 ? 'today' : `${ageDays}d ago`}; unchanged maps are not rewritten, so this is not a staleness signal.`;
 }
 
 /** A list's count for a heading: plain when the graph is complete, else what was found and that it is incomplete. */
@@ -1698,12 +1724,14 @@ export async function getModuleContext(q: ProjectRef & { path: string }, d: Cont
   if (!project) return { markdown: UNKNOWN_PROJECT(q), module: null };
   const cg = d.codegraph;
   if (!cg?.moduleContext) return { markdown: NO_CODEGRAPH, module: null };
+  const secret = namedSecretFiles({ ...q, files: [q.path] }, d.roots)[0];
+  if (secret) return { markdown: `That path names a secret file. Secret-file paths and contents are never read, mapped, logged or echoed.`, module: null };
   const path = onePath(q, q.path, d.roots);
   if (!path) return { markdown: `${code(q.path)} is not a file in ${project.key}: give a path relative to your cwd, or an absolute path inside the project.`, module: null };
   const [found, meta] = await Promise.all([cg.moduleContext(project.key, path), cg.codeMapMeta?.(project.key) ?? null]);
   const m = found && { ...found, misses: await withoutOwnPrMisses(realMisses(found.misses), { task: q.path }, project, d), lessons: (await withoutOwnPrLessons((await shownLessons(d, found.lessons, (l) => l)).map((lesson) => ({ lesson, score: 1 })), { task: q.path }, project, d)).map((hit) => hit.lesson) };
   const past = m ? undefined : (await outsideOf(project.key, [path], d)).get(path);
-  const answer = m ? moduleMarkdown(project.key, m, graphGaps(project.key, meta)) : null;
+  const answer = m ? moduleMarkdown(project.key, m, graphGaps(project.key, meta), mapBuildNote(meta)) : null;
   const markdown = answer ? answer.markdown : past && meta ? outsideMarkdown(project.key, past, meta) : await notMapped(project, [path], d);
   const served = answer?.served ?? { lessons: [], misses: [] };
   await d.activity?.record({
@@ -1738,6 +1766,7 @@ function outsideMarkdown(key: string, o: OutsideFile, meta: CodeMapMeta): string
   const top = [
     `# Module context for ${code(o.path)} in ${key}`,
     CODE_NOTE,
+    ...(mapBuildNote(meta) ? [mapBuildNote(meta)!] : []),
     `${code(o.path)} is outside the code map of ${key} (${size}: source and the most imported and changed files first), so its symbols are not listed. The import index past the cap still has it: ${o.importers.length ? `${n(o.importers.length, 'file')} import this path` : 'no file imports this path'}.`,
   ];
   return cappedAnswer(top, [
@@ -1750,10 +1779,10 @@ const moreTests = (from: 'file' | 'change') => (k: number) => `and ${n(k, 'more 
 type Served = { lessons: string[]; misses: string[] };
 
 /** The answer, and the ids of the lessons and misses it showed. */
-function moduleMarkdown(key: string, m: ModuleContext, gaps: string | null): { markdown: string; served: Served; squeezed: boolean } {
+function moduleMarkdown(key: string, m: ModuleContext, gaps: string | null, buildNote: string | null): { markdown: string; served: Served; squeezed: boolean } {
   const f = m.file;
   const churn = f.churn ? `${n(f.churn.commits, 'commit')} in the last 90 days (last ${f.churn.lastTs.slice(0, 10)})` : 'no commits in the last 90 days';
-  const top = [`# Module context for ${code(f.path)} in ${key}`, CODE_NOTE, `- ${oneLine(f.lang)} · ${n(f.loc, 'line')} · ${churn}${f.isTest ? ' · test file' : ''}`];
+  const top = [`# Module context for ${code(f.path)} in ${key}`, CODE_NOTE, ...(buildNote ? [buildNote] : []), `- ${oneLine(f.lang)} · ${n(f.loc, 'line')} · ${churn}${f.isTest ? ' · test file' : ''}`];
   const exported = m.symbols.filter((s) => s.exported);
   const misses = missItems(m.misses);
   const LESSONS = '## Approved lessons tied to this file (follow these)';
@@ -1803,7 +1832,7 @@ export async function getImpact(q: ProjectRef & { paths: string[]; depth?: numbe
   let squeezed = false;
   if (!r.paths.length) markdown = await notMapped(project, paths, d);
   else {
-    const top = [`# Impact of changing ${n(r.paths.length, 'file')} in ${project.key}`, CODE_NOTE, `- changing: ${listed(r.paths, 20)}`];
+    const top = [`# Impact of changing ${n(r.paths.length, 'file')} in ${project.key}`, CODE_NOTE, ...(mapBuildNote(meta) ? [mapBuildNote(meta)!] : []), `- changing: ${listed(r.paths, 20)}`];
     if (missing.length) top.push(`- not in the code map: ${listed(missing, 20)}`);
     const misses = missItems(r.misses);
     const LESSONS = '## Approved lessons on these files (follow these)';

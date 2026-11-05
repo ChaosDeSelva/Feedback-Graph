@@ -229,7 +229,8 @@ describe('why a named file is not in the code map', () => {
   test('a file over SCAN_MAX_BYTES and a secret-named file each get their own reason, not "new or ignored"', async () => {
     const r = await getTaskContext({ project: 'demo', task, files: [...named, big, secret] }, d());
     expect(r.markdown).toMatch(/`web\/src\/generated\/schema\.ts`: not in the code map: over 80 kB \(SCAN_MAX_BYTES\)/);
-    expect(r.markdown).toMatch(/`web\/src\/config\/secrets\.ts`: not in the code map: its name marks it as a secret file, which is never read/);
+    expect(r.markdown).toMatch(/1 named credential file omitted: secret-file paths and contents are never read, mapped, logged or echoed/);
+    expect(r.markdown).not.toContain(secret);
     const b = await getTaskContext({ project: 'demo', task, files: [big], brief: true }, d());
     expect(b.markdown).toMatch(/over 80 kB/);
   });
@@ -239,7 +240,8 @@ describe('why a named file is not in the code map', () => {
     expect(r.markdown).toMatch(/over 80 kB \(SCAN_MAX_BYTES\)/);
     expect(r.markdown).not.toMatch(/New, ignored, generated/);
     const s = await getModuleContext({ project: 'demo', path: secret }, d());
-    expect(s.markdown).toMatch(/secret file, which is never read/);
+    expect(s.markdown).toMatch(/secret file.*never read, mapped, logged or echoed/);
+    expect(s.markdown).not.toContain(secret);
   });
 });
 

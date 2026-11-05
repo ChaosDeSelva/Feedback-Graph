@@ -39,7 +39,7 @@ Logs are one JSON object per line (`docker compose logs -f worker api`). The API
 ## Running it for more than one machine
 
 1. Put it behind a TLS reverse proxy (Caddy, nginx, a cloud load balancer) that forwards `X-Forwarded-Proto`.
-2. In `.env`: `API_TOKEN=$(openssl rand -hex 24)`, `PUBLIC_HOSTS=feedback.example.com`, `API_BIND=0.0.0.0`. The API refuses to start with a non-loopback `API_BIND` and no `API_TOKEN`.
+2. In `.env`: set distinct `API_TOKEN=$(openssl rand -hex 24)` and `FG_OWNER_TOKEN=$(openssl rand -hex 24)`, plus `PUBLIC_HOSTS=feedback.example.com`, `API_BIND=0.0.0.0`. The API refuses to start with a non-loopback `API_BIND` and no `API_TOKEN`.
 3. People sign in once in the browser with `FG_OWNER_TOKEN`. Never give that credential to an agent. Agents use the separate `API_TOKEN`: `FEEDBACK_GRAPH_URL=https://feedback.example.com ./scripts/install-agent.sh` registers the MCP server with it for Claude Code and Codex (in `~/.codex/config.toml` as a static `Authorization` header in `http_headers`; the file is then made readable by you only).
 
 Without a token the API refuses every host name except localhost, by design. This is still one person's graph; see [Editions](editions.md) for the team edition.
@@ -130,7 +130,7 @@ docker compose --profile codex up -d --no-deps --force-recreate codex-runner
 
 This explicitly removes Docker's masked/read-only system-path protection **in the runner**. It does not make the setting a safe default; the container retains its Codex login, so apply it only when you accept that reduced protection. A masked host will again report unhealthy after removal. To avoid this exception entirely, select Claude Code or an API provider for scans; do not remove the runner's private PID/proc sandbox, add privileged mode, or disable host security controls. There is no automatic fallback: using the host's existing `/proc` would undermine the PID isolation the readiness test checks.
 
-If `doctor` stops the runner after an isolation failure, it also writes `state/settings/codex-runner-disabled`. Routine
+If `doctor` stops the runner after an isolation failure, it also writes `state/runner-control/codex-runner-disabled`. Routine
 Compose, backup and restore commands cannot revive job execution while that file exists. Prefer rerunning
 `./scripts/setup.sh --runner-procfs-compat` after reviewing the tradeoff; otherwise remove the flag manually only after
 you have changed the isolation configuration and verified the live runner probe.
@@ -159,7 +159,7 @@ git pull && docker compose up -d --build
 ```
 
 The schema is created idempotently at startup. Read `CHANGELOG.md` for anything that needs a step. If the upgraded
-install has `API_TOKEN` but no `FG_OWNER_TOKEN`, run `./scripts/setup.sh` interactively, choose the separate owner token,
+install has `API_TOKEN` but no `FG_OWNER_TOKEN`, run `./scripts/setup.sh --yes` to create the separate owner token,
 restart the API and rerun `./scripts/install-agent.sh`. Unattended `setup.sh --yes` deliberately does not add credentials
 to an existing tokenless `.env`.
 
@@ -394,7 +394,7 @@ The reserved `demo-shop` project identity and projects created by the demo seed 
 
 Neo4j has a 3 GiB container limit (`NEO4J_MEMORY_LIMIT`); its memory defaults start with a 512 MiB heap (`NEO4J_HEAP_INITIAL`) that may grow to 1 GiB (`NEO4J_HEAP`), a 512 MiB page cache, a 256 MiB DBMS/database transaction budget and 64 MiB per transaction. Override `NEO4J_MEMORY_LIMIT`, `NEO4J_HEAP_INITIAL`, `NEO4J_HEAP`, `NEO4J_PAGECACHE`, `NEO4J_TRANSACTION_TOTAL_MAX`, `NEO4J_TRANSACTION_DATABASE_MAX`, and `NEO4J_TRANSACTION_MAX` together to fit the Docker VM; leave room for the OS and other services. Orphan map cleanup runs bounded batches so deselecting a large repository does not require one transaction holding its whole graph.
 
-For a new low-memory pilot, `./scripts/setup.sh --small` installs the checked-in supported 1.5 GiB profile; do not hand-tune only the heap. Existing installs can follow the exact `docker-compose.small.yml` procedure in [Install](install.md#small-memory-profile).
+For a new low-memory pilot, `./scripts/setup.sh --small` installs the checked-in supported 1.5 GiB profile; do not hand-tune only the heap. Existing installs can follow the exact `docker-compose.small.yml` procedure in [Install](install.md#memory-profiles).
 
 The Neo4j budget settings follow the [official memory configuration guidance](https://neo4j.com/docs/operations-manual/current/performance/memory-configuration/). A transaction exceeding its budget fails without taking down the database; raising only the heap without accounting for page cache and native memory can still exhaust the Docker VM.
 
