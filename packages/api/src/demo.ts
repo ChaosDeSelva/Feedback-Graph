@@ -1,7 +1,8 @@
 import type { Hono } from 'hono';
 import { z } from 'zod';
 import { DEMO_SOURCE, demoPrefix, type ActivityStore, type Cause, type CodeGraphStore, type FactKind, type FactsStore, type KnowledgeStore, type OperatorConfig, type Project } from '@fb/core';
-import { currentRun, hasOperatorToken, operatorName, runAs } from './operator.ts';
+import { tokenMatches } from './auth.ts';
+import { currentActor, currentRun, hasOperatorToken, operatorName, runAs } from './operator.ts';
 
 /**
  * fg demo seed / remove: a small, clearly labelled corpus in a demo project, so a tester whose own projects have no
@@ -181,14 +182,14 @@ export async function seedDemo(o: { project?: string; owner?: boolean }, d: Demo
   }
   const selected = d.selected ? await d.selected(key) : null;
   const message = [
-    `Seeded the demo corpus into ${key}: ${n(lessonIds.length, 'approved lesson')} tied to files, ${n(1, 'miss', 'misses')} on ${c.miss.files.join(', ')}, ${n(facts, 'fact')}${skippedFacts.length ? ` (none for ${skippedFacts.join(', ')}: a scan's facts are there)` : ''}. Every one is marked demo.`,
+    `Seeded the demo corpus into ${key}: ${n(lessonIds.length, 'approved lesson')} tied to files, ${n(1, 'miss', 'misses')} on ${c.miss.files.join(', ')}, ${facts ? n(facts, 'demo fact') : 'no new demo facts'}${skippedFacts.length ? `; kept the existing scan facts for ${skippedFacts.join(', ')}` : ''}. Every seeded record is marked demo.`,
     `These lessons are approved by you running fg demo seed: agents working in ${key} are given them. Take them back with fg demo remove${key === DEMO_PROJECT ? '' : ` --project ${key}`}.`,
     ...(found ? [] : [`No folder for ${key} is under the project roots, so agents cannot work in it yet (the lessons are stored by key).`]),
     ...(selected === false ? [`${key} is not selected: run fg projects select --key ${key} so agents get these.`] : []),
   ].join('\n');
   await d.activity?.record({
     kind: 'demo_seeded',
-    actor: 'you',
+    actor: currentActor(),
     projectKey: key,
     subject: `demo corpus seeded in ${key}: ${n(lessonIds.length, 'approved lesson')}, 1 miss, ${n(facts, 'fact')}`,
     why: 'you ran fg demo seed; its lessons are approved by that and are marked demo (fg demo remove takes them back)',
@@ -211,7 +212,7 @@ export async function removeDemo(o: { project?: string; owner?: boolean }, d: De
   ].join(' ');
   await d.activity?.record({
     kind: 'demo_removed',
-    actor: 'you',
+    actor: currentActor(),
     projectKey: key,
     subject: `demo corpus removed from ${key}: ${n(r.lessons, 'lesson')}, ${n(r.misses, 'miss', 'misses')}, ${n(r.facts, 'fact')}`,
     why: 'you ran fg demo remove',
@@ -227,15 +228,16 @@ const Body = z.object({ project: z.string().min(1).max(200).optional() }).strict
  * when OPERATOR_ALLOW has lesson_decide (the lessons are approved). Without it: only from the UI (a browser write
  * carries Origin), like every owner decision; a local client sending none is refused.
  */
-export function demoRoutes(app: Hono, d: DemoDeps, auth: { operator?: OperatorConfig }) {
+export function demoRoutes(app: Hono, d: DemoDeps, auth: { token?: string; operator?: OperatorConfig }) {
   const handle = (fn: typeof seedDemo | typeof removeDemo) => async (c: import('hono').Context) => {
     const parsed = Body.safeParse(await c.req.json().catch(() => ({})));
     if (!parsed.success) return c.json({ error: parsed.error.flatten() }, 400);
     const operator = hasOperatorToken(c, auth.operator);
+    const agent = !!auth.token && tokenMatches(c.req.header('authorization')?.replace(/^Bearer\s+/i, '').trim() ?? '', auth.token);
     if (operator && !auth.operator?.allow.some(verb => verb === 'demo' || verb === 'lesson_decide')) return c.json({ error: 'demo seed/remove requires demo in OPERATOR_ALLOW (or lesson_decide)' }, 403);
     // Authentication/owner intent is enforced by OWNER_ROUTES before this handler. Keep the project-scope distinction:
     // the narrow `demo` operator verb may touch only demo-shop; lesson_decide may seed another explicit project.
-    const owner = operator ? !!auth.operator?.allow.includes('lesson_decide') : true;
+    const owner = agent ? false : operator ? !!auth.operator?.allow.includes('lesson_decide') : true;
     const go = () => fn({ ...parsed.data, owner }, d);
     try {
       return c.json(await (operator ? runAs(operatorName(c.req.header('x-fg-operator')), go) : go()));

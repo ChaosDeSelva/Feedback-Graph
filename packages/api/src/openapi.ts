@@ -153,7 +153,7 @@ const SCHEMAS: Record<string, JsonSchema> = {
   }, ['id', 'ts', 'kind', 'actor', 'projectKey', 'subject', 'why', 'details', 'targets']),
   SystemStatus: obj({
     version: str, store: nullable({ type: 'string', enum: ['neo4j', 'postgres'] }), graph: bool, worker: nullable(loose('The worker heartbeat')), workerHealthy: bool,
-    authRequired: bool, selection: nullable(obj({ initialized: bool, tracked: int, roots: int, note: nullable(str) }, ['initialized', 'tracked', 'note'])),
+    authRequired: bool, ownerSetupRequired: bool, selection: nullable(obj({ initialized: bool, tracked: int, roots: int, note: nullable(str) }, ['initialized', 'tracked', 'note'])),
     cloud: nullable(loose('Cloud sync: host, interval, last Sync now, progress (token always [REDACTED])')), models: nullable(loose('Each job\'s model and whether it answers')),
     givenUpTurns: nullable(int), ollama: nullable(loose('Whether Ollama answers')), connections: nullable(loose('GitHub, Linear, Claude, Codex, Ollama and cloud')),
     stage: nullable(obj({ name: str, startedAt: time, current: nullable(str) })), progress: nullable(obj({ done: int, total: nullable(int) })),
@@ -214,7 +214,7 @@ const KeepApproved = z.object({ keepApproved: z.enum(['1', 'true']).optional() }
  * app.ts imports this module, so its schemas are read only once both are loaded.
  */
 const routes = (a = appSchemas): Record<string, Partial<Record<Method, Route>>> => ({
-  '/api/health': { GET: { tag: 'system', summary: 'Liveness (no sign-in needed)', response: '{ ok: true }' } },
+  '/api/health': { GET: { tag: 'system', summary: 'Health including the configured store (no sign-in needed)', response: '{ ok: boolean }' } },
   '/api/ready': { GET: { tag: 'system', summary: 'Readiness: the store answers (no sign-in needed)', response: '{ ok, store? }; 503 while the store is down' } },
   '/api/status': { GET: { tag: 'system', summary: 'Store, worker heartbeat and stage, model health, selection, connections', response: 'SystemStatus' } },
   '/api/pipeline': { GET: { tag: 'system', summary: 'Every stage\'s count (sessions, classify backlog, Inbox, post-mortems, lessons, scans)', query: ProjectQuery, response: 'PipelineStatus; a count that could not be read is null' } },
@@ -335,7 +335,7 @@ const routes = (a = appSchemas): Record<string, Partial<Record<Method, Route>>> 
 
 /** The 2xx bodies `response` describes in words, as JSON Schema (by "METHOD path"). */
 const SCHEMA_OF: Record<string, JsonSchema> = {
-  'GET /api/health': obj({ ok: { const: true } }),
+  'GET /api/health': obj({ ok: { type: 'boolean' } }),
   'GET /api/ready': obj({ ok: bool, store: { type: 'string', enum: ['neo4j', 'postgres'] } }, ['ok']),
   'GET /api/events': { type: 'string', description: 'text/event-stream: events stage, pipeline, scan, chat, activity; data is JSON' },
   'GET /api/openapi.json': { type: 'object', description: 'An OpenAPI 3.1 document', additionalProperties: true },

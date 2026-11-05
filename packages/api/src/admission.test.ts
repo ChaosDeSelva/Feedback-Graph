@@ -259,3 +259,70 @@ test('retrying an identical check already in service joins its result instead of
     expect([admission.running, admission.waiting]).toEqual([0, 0]);
   } finally { vi.useRealTimers(); }
 });
+
+test('a response timeout keeps retry-keyed provider work alive for an identical retry', async () => {
+  vi.useFakeTimers(); vi.setSystemTime(0);
+  try {
+    const admission = new Admission({ concurrency: 1, timeoutMs: 100 });
+    let calls = 0;
+    const first = admission.run(async ({ signal }) => {
+      calls++;
+      await new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(resolve, 40);
+        signal.addEventListener('abort', () => { clearTimeout(timer); reject(signal.reason); }, { once: true });
+      });
+      return 'real verdict';
+    }, { retryKey: 'same', deadline: 10 });
+    await vi.advanceTimersByTimeAsync(10);
+    expect(await first).toMatchObject({ ok: false, ran: true });
+    const states: string[] = [];
+    const retry = admission.run(async () => { calls++; return 'duplicate'; }, { retryKey: 'same', deadline: 100, onState: s => states.push(s.state) });
+    await vi.advanceTimersByTimeAsync(30);
+    expect(await retry).toMatchObject({ ok: true, value: 'real verdict' });
+    expect(calls).toBe(1);
+    expect(states).toEqual(['running', 'completed']);
+  } finally { vi.useRealTimers(); }
+});
+
+test('identical checks join while the original is still queued', async () => {
+  vi.useFakeTimers(); vi.setSystemTime(0);
+  try {
+    const admission = new Admission({ concurrency: 1, timeoutMs: 1000 });
+    const held = gate('held'); const active = admission.run(held.fn);
+    let calls = 0;
+    const original = admission.run(async () => { calls++; return 'one verdict'; }, { retryKey: 'same', deadline: 500 });
+    const duplicate = admission.run(async () => { calls++; return 'duplicate'; }, { retryKey: 'same', deadline: 500 });
+    held.release(); await active;
+    expect(await original).toMatchObject({ ok: true, value: 'one verdict' });
+    expect(await duplicate).toMatchObject({ ok: true, value: 'one verdict' });
+    expect(calls).toBe(1);
+  } finally { vi.useRealTimers(); }
+});
+
+test('a retry-keyed call is not started with less than 250ms of response budget', async () => {
+  vi.useFakeTimers(); vi.setSystemTime(0);
+  try {
+    const admission = new Admission({ concurrency: 1, timeoutMs: 1000 });
+    const held = gate('held'); const active = admission.run(held.fn);
+    let calls = 0;
+    const waiting = admission.run(async () => { calls++; return 'too late'; }, { retryKey: 'late', deadline: 200 });
+    await vi.advanceTimersByTimeAsync(100);
+    held.release(); await active;
+    expect(await waiting).toMatchObject({ ok: false, ran: false });
+    expect(calls).toBe(0);
+  } finally { vi.useRealTimers(); }
+});
+
+test('a timed-out burst receives distinct retained retry positions', async () => {
+  vi.useFakeTimers(); vi.setSystemTime(0);
+  try {
+    const admission = new Admission({ concurrency: 1, timeoutMs: 1000 });
+    const held = gate('held'); const active = admission.run(held.fn);
+    const positions: number[] = [];
+    const waits = [1, 2, 3].map(n => admission.run(async () => n, { retryKey: `burst:${n}`, deadline: 10,
+      onState: state => { if (state.state === 'retry_required') positions[n - 1] = state.nextRetryPosition; } }));
+    await vi.advanceTimersByTimeAsync(10); await Promise.all(waits);
+    expect(positions).toEqual([1, 2, 3]);
+    held.release(); await active;
+  } finally { vi.useRealTimers(); }
+});

@@ -7,6 +7,29 @@ cd "$(dirname "$0")/.."
 src="${1:?usage: restore.sh backups/<timestamp>}"
 . scripts/lib/store.sh
 
+# A safety decision made after the backup must survive restoring older worker state. Keep it outside the archive while
+# state is replaced, then put it back with owner-only permissions.
+runner_disabled=""
+runner_disabled_path="state/runner-control/codex-runner-disabled"
+if [ -f "$runner_disabled_path" ]; then
+  runner_disabled="$(mktemp)"
+  cp "$runner_disabled_path" "$runner_disabled"
+  chmod 600 "$runner_disabled"
+elif [ -f state/settings/codex-runner-disabled ]; then
+  runner_disabled="$(mktemp)"
+  cp state/settings/codex-runner-disabled "$runner_disabled"
+  chmod 600 "$runner_disabled"
+fi
+restore_runner_disabled() {
+  [ -n "$runner_disabled" ] || return 0
+  mkdir -p state/runner-control
+  cp "$runner_disabled" "$runner_disabled_path"
+  chmod 600 "$runner_disabled_path"
+  rm -f "$runner_disabled"
+  runner_disabled=""
+}
+trap restore_runner_disabled EXIT
+
 if [ -f "$src/postgres.dump" ]; then kind=postgres
 elif [ -f "$src/neo4j.dump" ]; then kind=neo4j
 else echo "no neo4j.dump or postgres.dump in $src" >&2; exit 1
@@ -30,15 +53,19 @@ if [ "$kind" = postgres ]; then
   { printf 'SET client_min_messages = warning;\nDROP SCHEMA IF EXISTS public CASCADE;\nCREATE SCHEMA public;\n'; pg_script < "$src/postgres.dump"; } |
     pg_run psql -X -q -v ON_ERROR_STOP=1 --single-transaction >/dev/null
   rm -rf state && tar -xzf "$src/state.tgz"
+  restore_runner_disabled
   # shellcheck disable=SC2086 # one service name per word
   [ -z "$running" ] || docker compose up -d $running >/dev/null
 else
   project="$(docker compose config --format json | json_field name)"
   image="$(docker compose config --format json | json_field services.neo4j.image)"
+  running="$(docker compose ps --services --status running)"
   docker compose stop api worker neo4j >/dev/null
   docker run --rm -v "${project}_neo4j-data:/data" -v "$PWD/$src:/backups:ro" "$image" \
     neo4j-admin database load neo4j --from-path=/backups --overwrite-destination=true >/dev/null
   rm -rf state && tar -xzf "$src/state.tgz"
-  docker compose up -d >/dev/null
+  restore_runner_disabled
+  # shellcheck disable=SC2086 # one service name per word
+  [ -z "$running" ] || docker compose up -d $running >/dev/null
 fi
 echo "restored from $src"

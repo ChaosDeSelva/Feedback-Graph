@@ -160,7 +160,7 @@ function client(io: CliIO, flags: Flags, labels = true) {
   if (token) {
     let u: URL;
     try { u = new URL(base); } catch { throw new UsageError(`not a URL: ${base}`); }
-    if (flags.url && ['localhost', '127.0.0.1', '[::1]'].includes(u.hostname)) {
+    if (flags.url && ['localhost', '127.0.0.1', '[::1]', 'host.docker.internal'].includes(u.hostname)) {
       const expectedPort = io.env.API_PORT?.trim() || '8787';
       const actualPort = u.port || (u.protocol === 'https:' ? '443' : '80');
       if (actualPort !== expectedPort) throw new UsageError(`refusing to send this install's token to local port ${actualPort}; this checkout's API_PORT is ${expectedPort}`);
@@ -336,6 +336,7 @@ function statusLines(s: Record<string, any>, p: Pipeline | null): string[] {
     `store     ${s.graph === false ? 'NOT answering' : 'ok'}`,
     `worker    ${s.workerHealthy ? 'ok' : w ? 'stale (no heartbeat lately)' : 'not reported'}${w?.lastCycleAt ? `, last cycle ${w.lastCycleAt}` : ''}`,
   ];
+  if (s.ownerSetupRequired) lines.push('owner     SETUP REQUIRED: run ./scripts/setup.sh interactively to create FG_OWNER_TOKEN, then sign in and reinstall agent credentials');
   if (s.databaseMemory) {
     const m = s.databaseMemory, mib = (n: number) => `${Math.round(n / 1048576)} MiB`;
     lines.push(`neo4j     ${mib(m.usedBytes)} / ${mib(m.limitBytes)}, headroom ${mib(m.headroomBytes)}, swap ${mib(m.swapBytes)}${typeof m.swapHeadroomBytes === 'number' ? `, swap headroom ${mib(m.swapHeadroomBytes)}` : ' (swap limit unknown/unlimited)'} (host snapshot)${m.headroomBytes / m.limitBytes < 0.15 || m.swapBytes > 0 ? ' WARNING: memory pressure' : ''}`);

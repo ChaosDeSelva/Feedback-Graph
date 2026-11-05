@@ -133,6 +133,13 @@ export class SessionsRepo implements SessionsStore {
         await tx.rollback();
         return same;
       }
+      // A registration reserves an id before its transcript arrives. It must never
+      // adopt a transcript that is already in the owner's graph: API-token callers
+      // can read session ids, so allowing that would let a sandbox hide real work.
+      if (row.get('existing') === true) {
+        await tx.rollback();
+        return false;
+      }
       storeTimeLeft();
       await withRunClaimExecutor(this.g, (id, principal, actor) => claimRunOwnerWith(async (query, params) => (await tx.run(query, params)).records, id, principal, actor), authorizeStoreWrite);
       await tx.run(`MATCH (b:SessionRun {sessionId: $id}) SET b.run = $run, b.sandbox = $sandbox

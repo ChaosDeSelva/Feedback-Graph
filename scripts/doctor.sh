@@ -99,7 +99,12 @@ fi
 # A listening runner is not enough: /health executes its real nested sandbox, without a model.
 if [ -n "$(envval CODEX_RUNNER_URL)" ]; then
   runner_unsafe=0
-  if [ "$docker_ok" = 1 ] && is_running worker; then
+  runner_flag="state/runner-control/codex-runner-disabled"
+  legacy_runner_flag="state/settings/codex-runner-disabled"
+  if [ -f "$runner_flag" ] || [ -f "$legacy_runner_flag" ]; then
+    warn "Codex runner: disabled by its persisted isolation-safety flag"
+    more "Reason: $(cat "$runner_flag" 2>/dev/null || cat "$legacy_runner_flag" 2>/dev/null || echo unknown). Clear it only by rerunning setup.sh --runner-procfs-compat after reviewing the isolation tradeoff."
+  elif [ "$docker_ok" = 1 ] && is_running worker; then
     if runner_detail="$("${compose[@]}" exec -T worker node -e 'fetch(process.env.CODEX_RUNNER_URL.replace(/\/+$/, "") + "/health", {signal:AbortSignal.timeout(10000)}).then(async r=>{ const h=await r.json(); if(!r.ok||!h.ok||!h.sandbox) throw Error(h.error||"sandbox probe failed"); }).catch(e=>{console.error(e.message);process.exit(1)})' 2>&1)"; then
       pass "Codex runner: its nested sandbox starts successfully"
     else
@@ -139,9 +144,9 @@ if [ -n "$(envval CODEX_RUNNER_URL)" ]; then
     else fail "Codex runner: configured, but its container is not running for the live isolation probe"; runner_unsafe=1; fi
   else fail "Codex runner: configured but cannot be checked from a running worker"; runner_unsafe=1; fi
   if [ "$runner_unsafe" = 1 ]; then
-    mkdir -p state/settings
-    printf '%s\n' "disabled by doctor after a failed runner isolation probe" > state/settings/codex-runner-disabled
-    chmod 600 state/settings/codex-runner-disabled
+    mkdir -p state/runner-control
+    printf '%s\n' "disabled by doctor after a failed runner isolation probe" > "$runner_flag"
+    chmod 600 "$runner_flag"
     if "${compose[@]}" stop codex-runner >/dev/null 2>&1; then more "Stopped codex-runner: queued codex-cli jobs will remain parked."
     else more "Could not stop codex-runner automatically; stop it before allowing more jobs."; fi
   fi
@@ -196,6 +201,7 @@ else
 fi
 
 # ── Inside the containers ───────────────────────────────────────────────────────────────────────────────────────────
+codex_login_reported=""
 if [ "$docker_ok" != 1 ]; then
   skip "containers: Docker does not answer"
 elif ! is_running worker; then
@@ -233,6 +239,7 @@ else
   mount_check /codex-sessions "Codex sessions" "$codex_dir" "$codex_empty"
   if in_worker sh -c 'test -s /codex/auth.json' >/dev/null; then pass "Codex login: present in the worker"
   else skip "Codex login: none in the worker (only needed for codex-cli scans and post-mortems)"; fi
+  codex_login_reported=1
 fi
 
 # ── Codex login on this machine ─────────────────────────────────────────────────────────────────────────────────────
@@ -242,7 +249,7 @@ codex_configured="$(printf '%s,%s,%s,%s,%s' "$(envval SCAN_LLM)" "$(envval POSTM
 if [ -n "$codex_auth" ] && [ -s "$codex_auth" ]; then pass "Codex login: $codex_auth (CODEX_AUTH_FILE)"
 elif [ -n "$codex_auth" ]; then fail "Codex login: CODEX_AUTH_FILE is $codex_auth, which is missing or empty (codex login, then run this again)"
 elif [ -s "$codex_home/auth.json" ] && [ -n "$codex_configured" ]; then warn "Codex login: $codex_home/auth.json exists but is not mounted; set CODEX_AUTH_FILE=$codex_home/auth.json in .env to use codex-cli"
-else skip "Codex login: none (only needed for codex-cli)"; fi
+elif [ -z "$codex_login_reported" ]; then skip "Codex login: none (only needed for codex-cli)"; fi
 
 # ── GitHub and Linear, as the running api sees them ─────────────────────────────────────────────────────────────────
 status=""

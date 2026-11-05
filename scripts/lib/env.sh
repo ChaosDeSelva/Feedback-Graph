@@ -33,7 +33,7 @@ database_memory() {
       for name in memory.current memory.max memory.swap.current memory.swap.max; do
         printf "%s=" "$name"; cat "$base/$name" 2>/dev/null || echo unknown
       done
-      awk '$1 == "anon" { print "memory.anon=" $2 }' "$base/memory.stat" 2>/dev/null || true
+      awk '"'"'$1 == "anon" { print "memory.anon=" $2 }'"'"' "$base/memory.stat" 2>/dev/null || true
     elif [ -r "$base/memory/memory.usage_in_bytes" ]; then
       for name in memory.usage_in_bytes memory.limit_in_bytes memory.memsw.usage_in_bytes memory.memsw.limit_in_bytes; do
         printf "%s=" "$name"; cat "$base/memory/$name" 2>/dev/null || echo unknown

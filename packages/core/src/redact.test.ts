@@ -608,3 +608,31 @@ test.each([
   `AGE-SECRET-KEY-1${'A2BC'.repeat(12)}`,
   `dckr_pat_${'aB1_'.repeat(8)}`,
 ])('0.7.3 removes newly reported secret form: %s', text => expect(redactSecrets(text)).toContain('[REDACTED]'));
+
+test.each([
+  `the token 123456789:AA${'a'.repeat(33)}`,
+  `send 12345678:AA${'Z'.repeat(33)} to the bot`,
+])('0.7.4 removes a Telegram token by shape in ordinary prose: %s', text => expect(redactSecrets(text)).toContain('[REDACTED]'));
+
+test.each([
+  'xai-grok-4-fast-reasoning-latest',
+  'pplx-embed-context-v1-0.6b',
+])('0.7.4 preserves provider model and resource ids: %s', text => expect(redactSecrets(text)).toBe(text));
+
+test.each([
+  'az login -u bot@example.test -p Secret123!',
+  'openssl enc -pass pass:Secret123!',
+  'ldapsearch -x -D cn=admin -w Secret123!',
+  'smbclient //host/share -U alice%Secret123!',
+  `Endpoint=sb://example/;SharedAccessKey=${'A1b2'.repeat(10)}`,
+  `dp.st.${'A1b_'.repeat(8)}`,
+  `NRAK-${'A1b2'.repeat(8)}`,
+  `${'a1'.repeat(16)}-us12`,
+])('0.7.4 removes held-out credential syntax: %s', text => expect(redactSecrets(text)).toContain('[REDACTED]'));
+
+test.each([
+  `# -----BEGIN PRIVATE KEY-----\n# ${'YWJjZGVm'.repeat(3)}   \n`,
+  `> -----BEGIN RSA PRIVATE KEY-----\n> ${'YWJjZGVm'.repeat(3)} \n`,
+  `paste -----BEGIN OPENSSH PRIVATE KEY----- ${'YWJjZGVm'.repeat(3)}`,
+  `-----BEGIN PRIVATE KEY-----\\\\n${'YWJjZGVm'.repeat(3)}\\\\n`,
+])('0.7.4 removes incomplete and quoted private-key pastes: %s', text => expect(redactSecrets(text)).toContain('[REDACTED]'));

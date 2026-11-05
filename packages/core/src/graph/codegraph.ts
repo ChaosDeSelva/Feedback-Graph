@@ -111,8 +111,10 @@ export class CodeGraphRepo implements CodeGraphStore {
     // Clear the generation marker before any destructive work. The two unbounded deletes below used to be single
     // transactions and could exceed Neo4j's transaction-memory budget on large repositories.
     await this.g.run('MATCH (m:CodeMap {projectKey: $key}) SET m.fingerprint = null', { key });
-    await drain(`MATCH (:CodeFile {projectKey: $key})-[r:TESTS]->()
-      WITH r LIMIT $limit DELETE r RETURN count(*) AS removed`);
+    // Keep the last good TESTS graph visible until the replacement has been written. Mark old edges, revive the ones
+    // present in this generation below, and delete only the remainder after every slice succeeds. A failed rebuild
+    // therefore cannot empty test reachability.
+    await this.g.run(`MATCH (:CodeFile {projectKey: $key})-[r:TESTS]->() SET r.pendingRemoval = $now`, { key, now });
     const statements: [string, Props][] = [
       // The project exists even for a map with no files, as in Postgres (the file slices below MERGE it otherwise).
       [`MERGE (:Project {key: $key})`, { key }],
@@ -205,7 +207,8 @@ export class CodeGraphRepo implements CodeGraphStore {
         `UNWIND $tests AS t
            MATCH (a:CodeFile {id: $key + ':' + t.test})
            MATCH (b:CodeFile {id: $key + ':' + t.target})
-           CREATE (a)-[:TESTS]->(b)`,
+           MERGE (a)-[r:TESTS]->(b)
+           REMOVE r.pendingRemoval`,
         { key, tests: part },
       ]),
       [
@@ -220,6 +223,8 @@ export class CodeGraphRepo implements CodeGraphStore {
     // Publish metadata only after every bounded cleanup and write succeeds. A partial build therefore remains stale.
     const publish = statements.pop()!;
     for (const [cypher, params] of statements) await this.g.run(cypher, params);
+    await drain(`MATCH (:CodeFile {projectKey: $key})-[r:TESTS]->() WHERE r.pendingRemoval IS NOT NULL
+      WITH r LIMIT $limit DELETE r RETURN count(*) AS removed`);
     await drain(`MATCH (m:Module {projectKey: $key}) WHERE NOT EXISTS { ()-[:IMPORTS]->(m) }
       WITH m LIMIT $limit DETACH DELETE m RETURN count(*) AS removed`);
     await this.g.run(publish[0], publish[1]);

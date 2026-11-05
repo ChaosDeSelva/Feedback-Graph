@@ -228,6 +228,7 @@ describeStores('CodeGraphStore', (h) => {
 
   test('a replace that fails part way leaves the previous map as it was', async () => {
     await store.codegraph.replaceCodeMap('demo', codeMap());
+    const testsBefore = (await store.codegraph.impact('demo', ['src/db.ts'], MODULE_TESTS_DEPTH)).tests;
     const bad = codeMap({
       files: [file('src/only.ts')],
       symbols: [{ id: 'src/only.ts#x', path: 'src/only.ts', name: 'x', kind: { not: 'a primitive' } as never, exported: true, lines: '1-1' }],
@@ -238,6 +239,7 @@ describeStores('CodeGraphStore', (h) => {
     // fingerprint first. Either way a failed write is never taken for a current map: a null one is reparsed whole.
     const meta = (await store.codegraph.codeMapMeta('demo'))!;
     expect(meta.fingerprint).not.toBe('head:bad');
+    expect((await store.codegraph.impact('demo', ['src/db.ts'], MODULE_TESTS_DEPTH)).tests).toEqual(testsBefore);
     if (meta.fingerprint !== null) {
       const m = (await store.codegraph.codeMap('demo'))!;
       expect(m.fingerprint).toBe('head:abc');

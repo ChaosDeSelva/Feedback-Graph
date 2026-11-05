@@ -37,3 +37,10 @@ test.each([
   expect(isSecretPath(path)).toBe(true);
   expect(isSecretPath(`nested/${path}`)).toBe(true);
 });
+
+test.each([
+  '.config/fly/config.yml', '.config/stripe/config.toml', '.config/ngrok/ngrok.yml', '.config/circleci/cli.yml',
+  '.config/glab-cli/config.yml', '.config/supabase/access-token', '.config/railway/config.json',
+  '.config/hcloud/cli.toml', '.config/linode-cli', '.config/gcloud/legacy_credentials/me/adc.json',
+  'Library/Application Support/doctl/config.yaml',
+])('0.7.4 default credential-store path excluded: %s', path => expect(isSecretPath(path)).toBe(true));

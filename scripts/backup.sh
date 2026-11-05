@@ -9,6 +9,14 @@ cd "$(dirname "$0")/.."
 . scripts/lib/store.sh
 
 out="backups/$(date -u +%Y%m%dT%H%M%SZ)"
+complete=0
+cleanup_incomplete() {
+  if [ "$complete" != 1 ] && [ -d "$out" ]; then
+    rm -rf -- "$out"
+    echo "backup failed; incomplete output removed" >&2
+  fi
+}
+trap cleanup_incomplete EXIT
 compose_json="$(docker compose config --format json)"
 project="$(printf '%s' "$compose_json" | json_field name)"
 
@@ -31,11 +39,17 @@ else
   running="$(docker compose ps --services --status running)"
   echo "stopping the stack for a consistent dump"
   docker compose stop api worker neo4j >/dev/null
-  trap 'echo "restarting"; [ -n "$running" ] && docker compose up -d >/dev/null' EXIT
+  restart_stack() {
+    echo "restarting"
+    # shellcheck disable=SC2086 # one service name per word, captured from compose ps
+    [ -z "$running" ] || docker compose up -d $running >/dev/null
+  }
+  trap 'restart_stack; cleanup_incomplete' EXIT
   docker run --rm -v "${project}_neo4j-data:/data" -v "$PWD/$out:/backups" "$image" \
     neo4j-admin database dump neo4j --to-path=/backups >/dev/null
   tar --exclude='state/settings/redaction-archive/key' --exclude='state/redaction-key' -czf "$out/state.tgz" state
   echo neo4j > "$out/STORE"
   ( cd "$out" && shasum -a 256 neo4j.dump state.tgz STORE > SHA256SUMS )
 fi
+complete=1
 echo "backup written to $out ($(du -sh "$out" | cut -f1))"

@@ -246,7 +246,7 @@ function Judged({ report }: { report: LessonQualityReport | null }) {
   const cells = (q: LessonQuality | undefined) =>
     q ? [String(q.decided), share(q.asWritten, q.decided), share(q.edited, q.decided), share(q.rejected, q.decided), share(q.byOperator ?? 0, q.decided)] : ['', '', '', '', ''];
   return (
-    <details aria-label="how your lessons were judged" className="text-xs text-muted">
+    <details aria-label="how your lessons were judged" className="min-w-0 text-xs text-muted">
       <summary className="cursor-pointer tabular-nums" title="Of the post-mortem's lessons you decided. The ones you edited or rejected, and some you approved as written, are shown to the post-mortem as examples. Decisions an agent made with the operator token count as yours; how many is said apart.">
         {last30.decided
           ? <>Last 30 days: {last30.decided} decided · {said(last30.asWritten, 'as written', last30.decided)} · {said(last30.edited, 'after an edit', last30.decided)} · {said(last30.rejected, 'rejected', last30.decided)}
@@ -621,7 +621,7 @@ export function Lessons() {
                         {detail.fixCommits.map((c) => (
                           <tr key={c.sha} className="last:[&>td]:border-b-0">
                             <td className={`${tdClass} w-20 font-mono text-xs text-accent-text`}>{c.sha.slice(0, 7)}</td>
-                            <td className={tdClass}>{c.subject}</td>
+                            <td className={`${tdClass} max-w-0 [overflow-wrap:anywhere]`}>{c.subject}</td>
                           </tr>
                         ))}
                       </tbody>

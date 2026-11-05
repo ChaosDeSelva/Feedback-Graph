@@ -49,6 +49,9 @@ test('signing in from the UI sets an HttpOnly session cookie that authenticates 
   expect(cookie).not.toContain(TOKEN);
   const session = cookie.split(';')[0];
   expect((await app.request('/api/candidates', { headers: { cookie: session } })).status).toBe(200);
+  // The cookie is signed by the owner credential, so a routine API restart or
+  // Compose upgrade does not log the browser out.
+  expect((await secured().request('/api/candidates', { headers: { cookie: session } })).status).toBe(200);
   const second = await app.request('/api/session', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ token: OWNER }) });
   expect(second.headers.get('set-cookie')!.split(';')[0]).not.toBe(session);
   expect((await app.request('/api/session', { method: 'DELETE', headers: { cookie: session, 'content-type': 'application/json' } })).status).toBe(204);

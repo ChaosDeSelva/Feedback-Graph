@@ -3,7 +3,7 @@ import type { Activity, ActivityInput, Lesson } from '@fb/core';
 import { createApp, type ApiRepo } from './app.ts';
 import { taskPrNumbers } from './diff.ts';
 import { planCleanup } from './runs.ts';
-import { checkBeforeDone, type ContextDeps } from './context.ts';
+import { checkBeforeDone, getTaskContext, type ContextDeps } from './context.ts';
 import { Admission } from './admission.ts';
 import { Hono } from 'hono';
 import { cloudRoutes } from './cloud.ts';
@@ -14,9 +14,12 @@ const repo = { listCandidates: async () => [], candidateDetail: async () => null
 
 test('series counters in common stack notation are not PR identities', () => {
   expect(taskPrNumbers('review (PR 1/2) and (PR 2 of 3)')).toEqual([]);
-  expect(taskPrNumbers('review PR 17 of 30 selected PRs; #42')).toEqual([42]);
+  expect(taskPrNumbers('review PR 17 of 30 selected PRs; #42')).toEqual([17, 42]);
   expect(taskPrNumbers('(PR #1 of 2), Stack: PR 1 of 2, see #14036')).toEqual([14036]);
   expect(taskPrNumbers('PR 1/2 [PR 2/3] (#3 of 4)')).toEqual([]);
+  expect(taskPrNumbers('Address review on PR 14036 of 2 open PRs')).toEqual([14036]);
+  expect(taskPrNumbers('PR 14036/14037')).toEqual([14036]);
+  expect(taskPrNumbers('PR #14036 of 3 queued')).toEqual([14036]);
 });
 
 test('scoped map deletion requires owner authorization and never deletes the project', async () => {
@@ -51,6 +54,38 @@ test('a literal violation bypasses an occupied model queue and reports direct pr
   expect(result.gaps.map(gap => gap.lessonId)).toEqual(['l']);
   expect(result.markdown).toContain('Checked directly');
   expect(result.markdown).not.toContain('Judged by model:test');
+});
+
+test('an explicit issue task does not judge unrelated pathless misses', async () => {
+  const judged: string[][] = [];
+  const misses = [
+    { missId: 'other', missed: 'END-14105 used the wrong cache', feedbackText: '', cause: 'requirement_unstated' as const, sessionId: 's', ts: 't', score: .9 },
+    { missId: 'same', missed: 'END-9697 forgot to validate the payload', feedbackText: '', cause: 'requirement_unstated' as const, sessionId: 's', ts: 't', score: .85 },
+  ];
+  const d = context({
+    k: { ...context().k, searchLessons: async () => [], relatedMisses: async () => misses },
+    judge: async (_work, lessons) => { judged.push(lessons.map(hit => hit.lesson.id)); return lessons.map(hit => ({ lessonId: hit.lesson.id, status: 'not_applicable' as const, why: 'unrelated' })); },
+  });
+  await checkBeforeDone({ project: 'demo', task: 'Finish END-9697', summary: 'implemented it' }, d);
+  expect(judged).toEqual([['same']]);
+});
+
+test('an unrelated memory-size line cannot substantiate a gap for another config rule', async () => {
+  const org: Lesson = { ...literal, id: 'org', title: 'Keep organization ids scoped', rule: 'Use the authenticated organization id for every request.', paths: ['config.yml'] };
+  const d = context({
+    k: { ...context().k, searchLessons: async () => [{ lesson: org, score: .9 }] },
+    judge: async () => [{ lessonId: 'org', status: 'not_addressed', applies: true, why: 'organization scoping is absent', evidence: ['+memory: 1GiB'] }],
+  });
+  const result = await checkBeforeDone({ project: 'demo', task: 'increase memory', summary: 'raised the limit', filesChanged: ['config.yml'], diff: 'diff --git a/config.yml b/config.yml\n--- a/config.yml\n+++ b/config.yml\n@@ -1 +1 @@\n-memory: 512MiB\n+memory: 1GiB\n' }, d);
+  expect(result.gaps).toEqual([]);
+  expect(result.cannotTell?.map(item => item.lessonId)).toEqual(['org']);
+});
+
+test('a topical task does not receive high-scoring documents about an unrelated product', async () => {
+  const d = context({ docs: { searchDocs: async () => [{ docId: 'terminus', source: 'github', ref: 'github:acme/demo#14203', title: 'Terminus terminal setup', url: null, text: 'Configure terminal profiles and shell startup.', score: .95 }] } });
+  const result = await getTaskContext({ project: 'demo', task: 'Configure Pi-hole DNS blocklists' }, d);
+  expect(result.docs).toEqual([]);
+  expect(result.markdown).not.toContain('Terminus');
 });
 
 test('a context deadline stores both the queued record and its Activity entry', async () => {

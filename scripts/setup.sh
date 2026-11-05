@@ -75,6 +75,8 @@ while [ $# -gt 0 ]; do
   esac
   shift
 done
+env_existed=0
+[ -f .env ] && env_existed=1
 
 need() { command -v "$1" >/dev/null 2>&1 || { echo "missing: $1 ($2)"; exit 1; }; }
 need docker "https://docs.docker.com/get-docker/"
@@ -216,7 +218,8 @@ fi
 
 # Bind-mount sources Docker would otherwise create, owned by root, on first start. (An empty ~/.codex/sessions does not
 # make install-agent.sh think Codex is installed: it looks for the CLI or Codex's own config or login.)
-mkdir -p state/settings "$claude_projects"
+mkdir -p state/settings state/runner-control "$claude_projects"
+chmod 700 state/runner-control
 codex_sessions="$(expand "$(envval CODEX_SESSIONS_DIR)")"
 [ "$codex_sessions" = / ] && codex_sessions="$HOME/.codex/sessions"
 mkdir -p "$codex_sessions"
@@ -488,7 +491,7 @@ EOF
     export COMPOSE_FILE="$files"
     echo "Saved runner procfs opt-in in $compat; COMPOSE_FILE keeps the base, project mounts and existing custom files."
     # This explicit security decision is the only setup path that may clear doctor's persisted fail-closed gate.
-    rm -f state/settings/codex-runner-disabled
+    rm -f state/runner-control/codex-runner-disabled state/settings/codex-runner-disabled
   else
     echo 'Runner procfs compatibility was not enabled.'
   fi
@@ -573,7 +576,7 @@ fi
 
 # Fetch Metadata is a browser/CSRF guard, not authentication against another local process. Make authenticated local
 # installs the normal path; agents receive this read/API token, never the separate headless owner credential.
-if [ -z "$(envval API_TOKEN)" ] &&
+if [ -z "$(envval API_TOKEN)" ] && { [ "$env_existed" = 0 ] || [ "$yes" = 0 ]; } &&
   confirm "Create an API token (recommended: the only owner boundary against other local processes)? [Y/n]" y; then
   setenv API_TOKEN "$(openssl rand -hex 24)"
   echo "API_TOKEN saved to .env (not printed). Agents receive it for read/tool access; it cannot create a browser owner session or make owner decisions."
@@ -582,7 +585,7 @@ fi
 # Browser owner sessions are minted only from this separate credential. Agents receive API_TOKEN, never this value;
 # keeping them distinct makes the agent token safe for ordinary MCP/CLI reads without granting lesson decisions,
 # project selection, demo seeding or access to another run's sandbox records.
-if [ -z "$(envval FG_OWNER_TOKEN)" ] &&
+if [ -z "$(envval FG_OWNER_TOKEN)" ] && { [ "$env_existed" = 0 ] || [ "$yes" = 0 ]; } &&
   confirm "Create a separate owner sign-in token for the browser UI? [Y/n]" y; then
   setenv FG_OWNER_TOKEN "$(openssl rand -hex 24)"
   echo "FG_OWNER_TOKEN saved to .env (not printed). Use this value to sign in to the UI; never give it to agents."
@@ -590,13 +593,18 @@ fi
 
 # The operator token lets an agent or ./scripts/fg make the owner decisions OPERATOR_ALLOW names (by default not
 # deciding lessons or deleting data). Made only when you say yes (or pass --yes), before the start so the api has it.
-if [ -z "$(envval FG_OPERATOR_TOKEN)" ] &&
+if [ -z "$(envval FG_OPERATOR_TOKEN)" ] && { [ "$env_existed" = 0 ] || [ "$yes" = 0 ]; } &&
   confirm "Create an operator token, so agents and ./scripts/fg can scan, triage the Inbox and sync (lessons stay yours)? [Y/n]" y; then
   setenv FG_OPERATOR_TOKEN "$(openssl rand -hex 24)"
   echo "FG_OPERATOR_TOKEN saved to .env (not printed; ./scripts/fg reads it from there). It turns on the admin MCP at /mcp/admin"
   echo "  and the fg CLI for scans, Inbox triage and sync. By default it cannot decide lessons, choose which projects are read,"
   echo "  delete data, change settings or"
   echo "  ask in Ask (which spends your subscription); OPERATOR_ALLOW in .env widens or narrows that. Remove the line to turn it off."
+fi
+
+if [ "$env_existed" = 1 ] && [ "$yes" = 1 ] && { [ -z "$(envval API_TOKEN)" ] || [ -z "$(envval FG_OWNER_TOKEN)" ] || [ -z "$(envval FG_OPERATOR_TOKEN)" ]; }; then
+  echo "existing .env kept unchanged: --yes never opts an existing tokenless install into authentication."
+  echo "  Run ./scripts/setup.sh interactively to choose tokens; then rerun ./scripts/install-agent.sh so existing agents receive the new API token."
 fi
 
 compose=(docker compose)

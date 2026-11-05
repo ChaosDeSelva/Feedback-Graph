@@ -21,12 +21,19 @@ if [ "${1:-}" = doctor ]; then shift; exec "$here/scripts/doctor.sh" "$@"; fi
 # Setup (Docker, .env, models, the stack) is the host's job too: never inside the api container.
 if [ "${1:-}" = setup ]; then shift; exec "$here/scripts/setup.sh" "$@"; fi
 env_file="${FEEDBACK_GRAPH_ENV:-$here/.env}"
+if [ "${1:-}" = status ] && [ ! -f "$env_file" ] && [ -z "${FEEDBACK_GRAPH_URL:-}" ] && [ -z "${API_PORT:-}" ]; then
+  echo "fg status: this checkout is not set up (missing $env_file); run ./scripts/setup.sh first, or set FEEDBACK_GRAPH_URL for another install" >&2
+  exit 1
+fi
 # KEY's value: the environment's when set, else the last KEY= line of the env file, surrounding quotes removed.
 setting() {
   local v
-  v="$(printenv "$1" 2>/dev/null || true)"
-  if [ -z "$v" ] && [ -f "$env_file" ]; then
+  if [ "${!1+x}" = x ]; then
+    v="${!1}"
+  elif [ -f "$env_file" ]; then
     v="$(grep -E "^$1=" "$env_file" | tail -n 1 | cut -d= -f2- | sed -e "s/^[\"']//" -e "s/[\"']\$//" || true)"
+  else
+    v=""
   fi
   printf '%s' "$v"
 }
@@ -88,7 +95,10 @@ if command -v docker >/dev/null 2>&1; then
       container_url=(-e "FEEDBACK_GRAPH_URL=$FEEDBACK_GRAPH_URL")
     fi
   fi
-  exec docker compose --project-directory "$here" exec -T -e "FG_DATABASE_MEMORY=${FG_DATABASE_MEMORY:-}" "${container_url[@]+"${container_url[@]}"}" ${FG_OPERATOR_NAME:+-e FG_OPERATOR_NAME="$FG_OPERATOR_NAME"} api node src/cli.ts "$@"
+  token_env=()
+  [ "${FG_OPERATOR_TOKEN+x}" = x ] && token_env+=(-e "FG_OPERATOR_TOKEN=${FG_OPERATOR_TOKEN}")
+  [ "${API_TOKEN+x}" = x ] && token_env+=(-e "API_TOKEN=${API_TOKEN}")
+  exec docker compose --project-directory "$here" exec -T -e "FG_DATABASE_MEMORY=${FG_DATABASE_MEMORY:-}" "${container_url[@]+"${container_url[@]}"}" "${token_env[@]+"${token_env[@]}"}" ${FG_OPERATOR_NAME:+-e FG_OPERATOR_NAME="$FG_OPERATOR_NAME"} api node src/cli.ts "$@"
 fi
 
 echo "fg needs Node 22.18+ (or 23.6+) on the host, or docker to run it inside the api container" >&2

@@ -102,7 +102,14 @@ export function CodeMap({ projectKey, initialModule = null, focus = null, pollMs
         return;
       }
       api.codeMap(projectKey, undefined, tests).then((r) => {
-        if (stale || !r?.meta || r.meta.builtAt === awaiting.builtAt) return;
+        if (stale || !r?.meta) return;
+        if (r.meta.lastFailureAt && Date.parse(r.meta.lastFailureAt) >= awaiting.since) {
+          setReport({ meta: r.meta, hotspots: r.hotspots ?? [], capped: r.capped });
+          setAwaiting(null);
+          setRebuild({ busy: false, said: null, error: `The rebuild failed: ${r.meta.lastFailure ?? 'see Activity for details'}. The last good map is still available below.` });
+          return;
+        }
+        if (r.meta.builtAt === awaiting.builtAt) return;
         setReport({ meta: r.meta, hotspots: r.hotspots ?? [], capped: r.capped });
         setAwaiting(null);
         setRebuild({ busy: false, said: `Map rebuilt ${new Date(r.meta.builtAt).toLocaleString()}.`, error: null });
@@ -143,6 +150,9 @@ export function CodeMap({ projectKey, initialModule = null, focus = null, pollMs
     >
       {error && <Alert>{error}</Alert>}
       {rebuild.error && <Alert>{rebuild.error}</Alert>}
+      {!rebuild.error && meta?.lastFailureAt && (
+        <Alert>Last rebuild failed {new Date(meta.lastFailureAt).toLocaleString()}: {meta.lastFailure ?? 'see Activity for details'}. The last good map remains available.</Alert>
+      )}
       {rebuild.said && <p role="status" className="text-xs text-muted">{rebuild.said}</p>}
       {!report && !error ? (
         <SkeletonList rows={3} />

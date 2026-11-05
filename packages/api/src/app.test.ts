@@ -152,6 +152,19 @@ test('writes from another localhost port are rejected', async () => {
   expect(res.status).toBe(403);
 });
 
+test('tokenless loopback compatibility refuses forwarded requests', async () => {
+  const base = { 'sec-fetch-site': 'same-origin', origin: 'http://localhost:8787', host: 'localhost:8787' };
+  expect((await createApp(fakeRepo().repo).request('http://localhost:8787/api/candidates/c1/decision', post(base))).status).toBe(204);
+  for (const forwarded of [
+    { forwarded: 'for=192.0.2.10;host=localhost:8787' },
+    { 'x-forwarded-for': '192.0.2.10' },
+    { 'x-forwarded-host': 'localhost:8787' },
+    { 'x-forwarded-proto': 'http' },
+  ] as Record<string, string>[]) {
+    expect((await createApp(fakeRepo().repo).request('http://localhost:8787/api/candidates/c1/decision', post({ ...base, ...forwarded }))).status).toBe(403);
+  }
+});
+
 test('the vite dev origin is allowed', async () => {
   const res = await createApp(fakeRepo().repo, ownerAuth).request('http://localhost:8787/api/candidates/c1/decision', post({ ...ownerHeaders, 'sec-fetch-site': 'same-origin', origin: 'http://localhost:5173', host: 'localhost:8787' }));
   expect(res.status).toBe(204);

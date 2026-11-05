@@ -48,6 +48,16 @@ test('MCP capacity failures are retryable tool results without raw store details
   expect(body.result.content[0].text).not.toContain('dbms.memory');
 });
 
+test('MCP driver failures are sanitized instead of exposing database details', async () => {
+  const embed = async () => { throw Object.assign(new Error('Failed to connect to server neo4j.internal:7687 with secret topology'), { name: 'ServiceUnavailable' }); };
+  const app = createApp(repo, { context: { ...ctx, embed } });
+  const res = await app.request('/mcp', rpc({ method: 'tools/call', params: { name: 'get_task_context', arguments: { cwd: '/Users/j/Vibe/demo', task: 'search' } } }));
+  const body = (await res.json()) as { result: { isError?: boolean; content: { text: string }[] } };
+  expect(body.result.isError).toBe(true);
+  expect(body.result.content[0].text).toMatch(/store.*unavailable.*retry/i);
+  expect(body.result.content[0].text).not.toContain('neo4j.internal');
+});
+
 test('MCP report_feedback records manual feedback', async () => {
   const app = createApp(repo, { context: ctx });
   const res = await app.request('/mcp', rpc({ method: 'tools/call', params: { name: 'report_feedback', arguments: { cwd: '/Users/j/Vibe/demo', feedback: 'missed auth', what_was_done: 'endpoint' } } }));

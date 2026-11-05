@@ -119,6 +119,12 @@ describeStores('RunsStore and run attribution', (h) => {
     expect(await s.runs.sandbox?.('sandbox-only')).toBe(true);
     expect(await s.runs.sandbox?.('ordinary-only')).toBe(false);
     expect(await s.runs.sandbox?.('unknown-run')).toBe(false);
+    await s.runs.remove('sandbox-only', []);
+    expect(await s.sessions.runFor('sandbox-only-session')).toBeNull();
+    // Cleanup released the reservation; a later real transcript is not tagged
+    // or hidden merely because the probe once reserved the same session id.
+    await s.graph.upsertSession(project, session('sandbox-only-session'), []);
+    expect(await s.sessions.runFor('sandbox-only-session')).toBeNull();
   });
 
   test('activity records the run, lists it back, and filters by it', async () => {

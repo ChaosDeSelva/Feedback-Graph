@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.7.4 (2026-11-04)
+
+- Prevent API-token sandbox runs from claiming existing owner sessions and make authenticated cleanup remove temporary run bindings without deleting transcripts.
+- Make stock Neo4j backups shut down cleanly and verify backup/restore in CI; preserve runner-disable state across restores, isolate its control mount and bound failed restarts.
+- Restore Neo4j cgroup memory diagnostics, sanitize unavailable-store MCP failures, fail health checks with the store, retain the last good code-map test graph and surface rebuild failures and map age.
+- Keep judge work alive for advertised retries, deduplicate queued and running identical checks, preserve durable Activity, improve queue positions, PR parsing, miss relevance, clean-diff evidence and irrelevant-document suppression.
+- Expand redaction and credential-path coverage without masking provider/resource identifiers, redact task-context headers and paths, harden loopback/forwarded ownership, setup reruns and demo probes, and persist signed owner sessions across API restarts.
+- Correct mobile Lessons and Projects states, visible scan guidance and cloud bulk reconciliation counts, cancellation and failure details.
+
 ## 0.7.3 (2026-11-04)
 
 - Preserve secure loopback owner access across Compose-only upgrades, explain owner-token setup in the UI and installation guide, and allow API-token demo sessions only with a sandbox flag and private run key.

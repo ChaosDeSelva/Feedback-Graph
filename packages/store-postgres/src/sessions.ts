@@ -97,6 +97,8 @@ export class PgSessionsStore implements SessionsStore {
       await c.query("SELECT pg_advisory_xact_lock(hashtextextended('session-run:' || $1, 0))", [sessionId]);
       const { rows: bound } = await c.query('SELECT run, sandbox FROM session_run_tags WHERE session_id = $1', [sessionId]);
       if (bound[0]) return bound[0].run === run.id && bound[0].sandbox === run.sandbox;
+      const { rows: existing } = await c.query('SELECT 1 FROM sessions WHERE id = $1', [sessionId]);
+      if (existing[0]) return false;
       await withRunClaimExecutor(this.db, (id, principal, actor) => claimRunOwnerWith(c.query.bind(c), id, principal, actor), authorizeStoreWrite);
       await c.query('INSERT INTO session_run_tags (session_id, run, sandbox) VALUES ($1, $2, $3)', [sessionId, run.id, run.sandbox]);
       await c.query('UPDATE sessions SET run = $2, sandbox = $3 WHERE id = $1', [sessionId, run.id, run.sandbox]);

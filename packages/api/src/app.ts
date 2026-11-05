@@ -459,7 +459,9 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
     return !v || v.has(key);
   };
   const app = new Hono();
-  const ownerSessions = new OwnerSessions();
+  // Signed owner cookies survive an API restart/upgrade; logout still revokes
+  // the current process copy and clears the browser cookie.
+  const ownerSessions = new OwnerSessions(auth.ownerToken);
   app.onError((error, c) => {
     const code = (error as { code?: string }).code;
     if (code === 'Neo.TransientError.General.MemoryPoolOutOfMemoryError' || /transaction(?:al)? memory|memory pool/i.test(error.message)) {
@@ -594,6 +596,9 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
   // a real same-origin browser on a loopback host is the local owner. A Bearer request never qualifies, and public
   // host names are already refused above unless an API token protects them.
   const tokenlessLoopbackOwner = (c: Context) => !auth.token && !auth.ownerToken && !bearerOf(c)
+    // A reverse proxy or port-forward can make a remote request look same-origin.
+    // Tokenless compatibility is deliberately unavailable once forwarding metadata exists.
+    && !c.req.header('forwarded') && !c.req.header('x-forwarded-for') && !c.req.header('x-forwarded-host') && !c.req.header('x-forwarded-proto')
     && LOCAL_HOSTS.has(hostname(c.req.header('host') ?? new URL(c.req.url).host))
     && c.req.header('sec-fetch-site') === 'same-origin'
     && originAllowed(c.req.header('origin') ?? '', c.req.header('host') ?? new URL(c.req.url).host);
@@ -607,6 +612,11 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
     // resulting write and cleanup to this one labelled probe; all real project and lesson decisions remain owner-only.
     const run = currentRun();
     if (verb === 'demo' && run?.sandbox && auth.token && tokenMatches(bearerOf(c) ?? '', auth.token)
+      && runKey(c.req.header('x-fg-run-key'), auth.runKeySalt)) return next();
+    // Cleanup is unlabelled by design (the path names the run). An API-token
+    // probe may reach it with its private caller key; runRoutes verifies that
+    // the stored run owner has the same salted caller before deleting anything.
+    if (verb === 'run_cleanup' && auth.token && tokenMatches(bearerOf(c) ?? '', auth.token)
       && runKey(c.req.header('x-fg-run-key'), auth.runKeySalt)) return next();
     if ((c.req.header('x-fg-owner') === 'true' || c.req.header('x-fg-owner-cleanup') === 'true') && auth.ownerToken && tokenMatches(bearerOf(c) ?? '', auth.ownerToken)) {
       log?.('owner token decision', { method: c.req.method, path: c.req.path });
@@ -698,7 +708,11 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
     await next();
   });
 
-  app.get('/api/health', (c) => c.json({ ok: true }));
+  // Health must fail closed with the store: an HTTP process whose database is crash-looping is not a healthy app.
+  app.get('/api/health', async (c) => {
+    const ok = (await system?.ping().catch(() => false)) ?? true;
+    return ok ? c.json({ ok }) : c.json({ ok }, 503);
+  });
   // Readiness, unlike health, needs the store: a load balancer should not route here while the database is down.
   app.get('/api/ready', async (c) => {
     const ok = (await system?.ping().catch(() => false)) ?? true;
@@ -719,7 +733,8 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
       const meta = await codegraph.codeMapMeta(p.key).catch(() => null);
       if (!meta) return null;
       const ageDays = Math.max(0, Math.floor((Date.now() - Date.parse(meta.builtAt)) / 86_400_000));
-      return ageDays > 0 || meta.lastFailureAt ? { projectKey: p.key, builtAt: meta.builtAt, ageDays, lastFailureAt: meta.lastFailureAt, lastFailure: meta.lastFailure } : null;
+      // Age alone is not stale: unchanged repositories legitimately keep an old, still-current map.
+      return meta.lastFailureAt ? { projectKey: p.key, builtAt: meta.builtAt, ageDays, lastFailureAt: meta.lastFailureAt, lastFailure: meta.lastFailure } : null;
     })).then(rows => rows.filter((x): x is NonNullable<typeof x> => !!x)) : undefined;
     const s: SystemStatus = {
       version: system?.version ?? 'dev',
@@ -729,6 +744,7 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
       workerHealthy,
       ...stageOf(workerHealthy ? worker : null),
       authRequired: !!auth.token,
+      ownerSetupRequired: !!auth.token && !auth.ownerToken,
       ...(staleCodeMaps && { codeMaps: staleCodeMaps }),
       judge: context?.judgeId ?? null,
       selection: sel && { initialized: sel.initialized, tracked: sel.tracked.length, ...(system?.roots === undefined ? {} : { roots: system.roots }), note: selectionNote(sel, system?.roots) },
@@ -1513,7 +1529,7 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
   if (cloud) cloudState = cloudRoutes(app, cloud);
   if (integrations) integrationRoutes(app, integrations);
   if (importer) importRoutes(app, importer);
-  if (opts.demo) demoRoutes(app, { ...opts.demo, activity: opts.demo.activity ? asActor(opts.demo.activity) : activity }, { operator: auth.operator });
+  if (opts.demo) demoRoutes(app, { ...opts.demo, activity: opts.demo.activity ? asActor(opts.demo.activity) : activity }, { token: auth.token, operator: auth.operator });
   if (sessions) sessionRoutes(app, sessions);
   if (opts.chat) chatRoutes(app, opts.chat, view);
   if (opts.runs && activity) runRoutes(app, { store: opts.runs, activity });

@@ -155,6 +155,8 @@ describe.skipIf(!dockerUp)('codex-runner container', () => {
     expect(cfg.services.worker.environment?.CODEX_RUNNER_URL).toBe('http://codex-runner:8790');
     const runner = cfg.services['codex-runner'];
     expect(runner.volumes!.map((v) => v.target).sort()).toEqual(['/codex', '/codex/auth.json', '/runner-control', '/scratch']);
+    expect(runner.volumes!.find((v) => v.target === '/runner-control')!.source).toMatch(/state\/runner-control$/);
+    expect(runner).toMatchObject({ restart: 'on-failure:3' });
     expect(runner.volumes!.find((v) => v.target === '/codex')!.source).not.toBe(cfg.services.worker.volumes!.find((v) => v.target === '/codex')!.source);
     expect(Object.keys(runner.environment ?? {}).sort()).toEqual(['CODEX_HOME', 'HOME', 'RUNNER_PORT', 'RUNNER_SCRATCH']);
     expect(runner.ports ?? []).toEqual([]);

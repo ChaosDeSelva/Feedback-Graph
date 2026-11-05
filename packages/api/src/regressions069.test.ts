@@ -25,7 +25,7 @@ test('context applies weighted fact rank .80 and returns bounded explicit ranks 
   const context = await getTaskContext({ project: 'demo', task: 'edit schema' }, deps({
     facts: { searchFacts: async () => [fact('weak', .99, .5), fact('boundary', .8, 1), fact('rounding', 1.01, 1)] },
     k: { ...deps().k, relatedMisses: async () => [{ missId: 'm', missed: 'Omitted a check', feedbackText: '', sessionId: 's', ts: 't', cause: 'requirement_unstated', score: 1.2 }] },
-    docs: { searchDocs: async () => [{ docId: 'd', source: 'upload', ref: 'd', title: 'Guide', text: 'text', url: null, score: 1.2 }] },
+    docs: { searchDocs: async () => [{ docId: 'd', source: 'upload', ref: 'd', title: 'Schema guide', text: 'schema conventions', url: null, score: 1.2 }] },
   }));
   expect(context.facts.map(h => h.fact.id)).toEqual(['rounding', 'boundary']);
   expect(context.facts.every(h => h.score <= 1 && h.rankingScore! <= 1 && h.rankingScore! >= .8)).toBe(true);

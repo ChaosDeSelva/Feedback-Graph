@@ -11,6 +11,7 @@ export function requestDeadline(timeoutMs = 55_000): MiddlewareHandler {
     return withStoreDeadline({ signal, expiresAt }, async () => {
       let timer: ReturnType<typeof setTimeout> | undefined;
       const expired = () => c.json({ error: 'request deadline exceeded; retry the request', retryable: true }, 504);
+      const cancelled = () => new Response(null, { status: 499, statusText: 'Client Closed Request' });
       try {
         return await Promise.race([
           next().then(() => c.res),
@@ -20,6 +21,7 @@ export function requestDeadline(timeoutMs = 55_000): MiddlewareHandler {
           }, timeoutMs); }),
         ]);
       } catch (error) {
+        if (c.req.raw.signal.aborted) return cancelled();
         if (error instanceof StoreDeadlineError || signal.aborted) return expired();
         throw error;
       } finally { if (timer) clearTimeout(timer); }

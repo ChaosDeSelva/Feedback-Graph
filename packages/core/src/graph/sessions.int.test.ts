@@ -71,9 +71,9 @@ describeStores('SessionsStore', (h) => {
     await repo.decide('labelled-t1', 'confirmed', null);
     expect((await h.probe.rows('Feedback')).find((r) => r.id === 'labelled-t1')).toMatchObject({ run: 'real-run', sandbox: true });
     await repo.upsertSession(demo, session('owner-session', 1, MIN), []);
-    expect(await s.claimRun('owner-session', run)).toBe(true);
-    expect(await s.runFor('owner-session')).toEqual(run);
-    expect((await h.probe.rows('Session')).find((r) => r.id === 'owner-session')).toMatchObject({ run: 'real-run', sandbox: true });
+    expect(await s.claimRun('owner-session', run)).toBe(false);
+    expect(await s.runFor('owner-session')).toBeNull();
+    expect((await h.probe.rows('Session')).find((r) => r.id === 'owner-session')).not.toHaveProperty('run');
   });
 
   test('upsertSession keeps the turn count, last turn and last activity; the list is newest first and leaves agent reports out', async () => {

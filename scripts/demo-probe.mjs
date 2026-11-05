@@ -63,9 +63,15 @@ function ownerHeaders(base, { token, localOwner = false }) {
   return { authorization: `Bearer ${token}`, 'x-fg-owner': 'true' };
 }
 
-export async function configure(folder, { apiURL, token, localOwner = false, fetch: request = fetch } = {}) {
-  const base = apiURL ?? 'http://127.0.0.1:8787';
+export async function configure(folder, { apiURL, token, localOwner = false, fetch: request } = {}) {
+  if (localOwner) throw Error('--local-owner was removed: use the authenticated browser UI, or configure the separate FG_OWNER_TOKEN for headless owner actions.');
+  if (!token) throw Error('Owner preparation requires FG_OWNER_TOKEN. Use the browser UI for a tokenless install; do not broaden OPERATOR_ALLOW.');
+  // A supplied fetch is a test harness and never sends over the network; the CLI
+  // path must identify the intended install explicitly.
+  const base = apiURL ?? process.env.FEEDBACK_GRAPH_URL ?? (request ? 'http://127.0.0.1:8787' : undefined);
+  if (!base) throw Error('Owner preparation needs --api-url (or FEEDBACK_GRAPH_URL); no default port is used because it could send FG_OWNER_TOKEN to another local install.');
   const headers = ownerHeaders(base, { token, localOwner });
+  request ??= fetch;
   const state = await readState(folder);
   if (state.kind !== 'feedback-graph-demo-probe' || state.folder !== resolve(folder)) throw Error('Not a helper-owned probe folder.');
   const call = async (path, body) => {

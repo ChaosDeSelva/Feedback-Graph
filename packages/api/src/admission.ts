@@ -13,7 +13,7 @@ export type QueueInfo = {
 export type Admitted<T> =
   | { ok: true; value: T; ahead: number; waitedMs: number }
   | { ok: false; ahead: number; waitedMs: number; ran: boolean };
-type Ticket = { go: () => void; notify?: (info: QueueInfo) => void; ahead: number; removed?: boolean; ordinal: number; retryKey?: string; priorityUntil?: number; restored?: boolean; queued?: boolean; started?: boolean; result?: Promise<unknown>; serviceStarted?: number };
+type Ticket = { go: () => void; notify?: (info: QueueInfo) => void; ahead: number; removed?: boolean; ordinal: number; retryKey?: string; priorityUntil?: number; restored?: boolean; queued?: boolean; started?: boolean; result?: Promise<unknown>; ready?: Promise<{ result: Promise<unknown> }>; readyResolve?: (value: { result: Promise<unknown> }) => void; serviceStarted?: number };
 
 export class Admission {
   readonly concurrency: number;
@@ -87,7 +87,12 @@ export class Admission {
   #info(ticket: Ticket, state: QueueState, position: number | null = null): QueueInfo {
     this.#prune();
     const priority = ticket.retryKey ? this.#priorities.get(ticket.retryKey) : undefined;
-    const retryPosition = priority ? this.#queue.filter(other => other.ordinal < priority.ordinal).length + 1 : undefined;
+    const retryPosition = priority ? (() => {
+      const ahead = new Set<number>();
+      for (const other of this.#queue) if (other.ordinal < priority.ordinal) ahead.add(other.ordinal);
+      for (const other of this.#priorities.values()) if (other.ordinal < priority.ordinal) ahead.add(other.ordinal);
+      return ahead.size + 1;
+    })() : undefined;
     return { ...this.snapshot(state, position, ticket.ahead, retryPosition), ...(ticket.retryKey && { retryPriority: {
       retained: !!priority, restored: !!ticket.restored, remainingMs: priority ? Math.max(0, priority.expiresAt - Date.now()) : 0,
     } }) };
@@ -96,14 +101,18 @@ export class Admission {
     const started = Date.now();
     const timeoutMs = Math.max(1, Math.min(this.timeoutMs, (options.deadline ?? Infinity) - started));
     const existing = options.retryKey ? this.#requests.get(options.retryKey) : undefined;
-    if (existing?.started && existing.result) {
-      options.onState?.(this.#info(existing, 'running'));
+    if (existing && (existing.result || existing.ready)) {
+      options.onState?.(this.#info(existing, existing.started ? 'running' : 'waiting', existing.started ? null : this.#queue.indexOf(existing) + 1));
       let timer: ReturnType<typeof setTimeout> | undefined;
       const timeout = new Promise<'timeout'>((resolve) => { timer = setTimeout(() => resolve('timeout'), timeoutMs); });
-      const completed = await Promise.race([existing.result.then(value => ({ value })), timeout]);
+      const joined = existing.result ?? existing.ready!.then(box => box.result);
+      const completed = await Promise.race([joined.then(value => ({ value })), timeout]);
       clearTimeout(timer);
-      if (completed === 'timeout') return { ok: false, ahead: existing.ahead, waitedMs: Date.now() - started, ran: true };
-      return { ok: true, value: completed.value as T, ahead: existing.ahead, waitedMs: Date.now() - started };
+      if (completed === 'timeout') return { ok: false, ahead: existing.ahead, waitedMs: Date.now() - started, ran: !!existing.started };
+      const observed = { waitedMs: Date.now() - started, serviceMs: Math.max(0, Date.now() - (existing.serviceStarted ?? started)) };
+      const done = this.#info(existing, 'completed');
+      options.onState?.({ ...done, observed, estimate: { ...done.estimate, source: 'measured', startMs: [0, 0], completionMs: [observed.waitedMs, observed.waitedMs], medianStartMs: 0, medianCompletionMs: observed.waitedMs } });
+      return { ok: true, value: completed.value as T, ahead: existing.ahead, waitedMs: observed.waitedMs };
     }
     const gaveUp = new AbortController();
     let ahead = this.#running < this.concurrency && !this.#queue.length ? 0 : this.#running + this.#queue.length;
@@ -113,7 +122,10 @@ export class Admission {
     if (key) this.#priorities.delete(key);
     const ticket: Ticket = { go: () => {}, ahead, notify: options.onState, ordinal: priority?.ordinal ?? ++this.#ordinal,
       retryKey: key, priorityUntil: priority?.expiresAt, restored: !!priority };
-    if (key) this.#requests.set(key, ticket);
+    if (key) {
+      ticket.ready = new Promise(resolve => { ticket.readyResolve = resolve; });
+      this.#requests.set(key, ticket);
+    }
     let timer: NodeJS.Timeout | undefined;
     let stop!: () => void;
     let timedOut = false;
@@ -150,9 +162,18 @@ export class Admission {
         return { ok: false, ahead, waitedMs, ran: false };
       }
       const serviceStarted = Date.now();
+      // A provider call with only a few milliseconds left cannot produce a verdict and poisons the duration sample.
+      // Retain the retry's priority instead of starting work that is certain to be aborted.
+      if (ticket.retryKey && waitedMs > 0 && started + timeoutMs - serviceStarted < 250) {
+        this.#retain(ticket); this.#release(); ticket.notify?.(this.#info(ticket, 'retry_required'));
+        return { ok: false, ahead, waitedMs, ran: false };
+      }
       ticket.serviceStarted = serviceStarted;
       let called = false;
-      this.#active.set(ticket, { started: serviceStarted, deadline: started + timeoutMs });
+      // A check response may have to return at ~50 s, but identical retries must be able to join the in-flight
+      // provider result. Give admitted retry-keyed work one full service window after it actually starts.
+      const serviceDeadline = ticket.retryKey ? serviceStarted + this.timeoutMs : started + timeoutMs;
+      this.#active.set(ticket, { started: serviceStarted, deadline: serviceDeadline });
       ticket.notify?.(this.#info(ticket, 'running'));
       if (expired()) {
         this.#active.delete(ticket); this.#release(); ticket.notify?.(this.#info(ticket, 'retry_required'));
@@ -161,7 +182,7 @@ export class Admission {
       const call = Promise.resolve().then(() => {
         if (expired()) throw cancelledBeforeStart;
         called = true; ticket.started = true;
-        return fn({ signal: gaveUp.signal, deadline: started + timeoutMs });
+        return fn({ signal: gaveUp.signal, deadline: serviceDeadline });
       }).finally(() => {
         if (called) {
           this.#durations.push(Math.max(1, Date.now() - serviceStarted));
@@ -171,9 +192,13 @@ export class Admission {
         if (ticket.retryKey && this.#requests.get(ticket.retryKey) === ticket) this.#requests.delete(ticket.retryKey);
       });
       ticket.result = call;
+      ticket.readyResolve?.({ result: call });
       const r = await Promise.race([call.then((value) => ({ value })), deadline]);
       if (r === 'timeout') {
-        call.catch(() => {}); gaveUp.abort(new Error(`gave up after ${Math.round(this.timeoutMs / 1000)} s`));
+        call.catch(() => {});
+        // The response deadline is not the provider deadline. Keep retry-keyed work alive so the advertised retry
+        // can join it; unkeyed callers retain the old cancellation behaviour.
+        if (!ticket.retryKey) gaveUp.abort(new Error(`gave up after ${Math.round(this.timeoutMs / 1000)} s`));
         ticket.notify?.(this.#info(ticket, 'retry_required'));
         return { ok: false, ahead, waitedMs, ran: called };
       }

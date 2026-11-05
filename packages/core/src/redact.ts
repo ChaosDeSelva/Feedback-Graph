@@ -10,7 +10,7 @@
  * 5: an instruction in an upload is one addressed to the reader-as-AI, not a project convention (facts v4 closed as
  * instructions are reopened); the head of a token an older Activity subject cut at its cap is redacted.
  */
-export const REDACTION_VERSION = 13;
+export const REDACTION_VERSION = 14;
 /** Rows a store reads per page when it redacts stored text again under new rules. */
 export const REDACT_PAGE = 1000;
 
@@ -100,6 +100,9 @@ const BLOCK_PATTERNS: RegExp[] = [
   // line-start rule: a paste such as `key: -----BEGIN ...` is just as sensitive as a block on its own line.
   /-----BEGIN (?:RSA |DSA |EC |OPENSSH |ENCRYPTED )?PRIVATE KEY-----\r?\n(?:(?:[ \t]*(?:Proc-Type|DEK-Info):[^\r\n]*\r?\n)|[ \t]*\r?\n|[ \t]*[A-Za-z0-9+/=]{8,}(?:\r?\n|$))+/gi,
   /-----BEGIN (?:RSA |DSA |EC |OPENSSH |ENCRYPTED )?PRIVATE KEY-----\\n(?:(?:(?:Proc-Type|DEK-Info):[^\\]*(?:\\n|$))|[A-Za-z0-9+/=]{8,}(?:\\n|$))+/g,
+  /(?:^|\n)[ \t]*(?:[#>][ \t]*)?-----BEGIN (?:RSA |DSA |EC |OPENSSH |ENCRYPTED )?PRIVATE KEY-----[ \t]*\r?\n(?:(?:[ \t]*(?:[#>][ \t]*)?(?:Proc-Type|DEK-Info):[^\r\n]*|[ \t]*(?:[#>][ \t]*)?[A-Za-z0-9+/=]{8,}[ \t]*)\r?(?:\n|$))+/gim,
+  /-----BEGIN (?:RSA |DSA |EC |OPENSSH |ENCRYPTED )?PRIVATE KEY-----[ \t]+[A-Za-z0-9+/=]{16,}(?:[ \t]+[A-Za-z0-9+/=]{8,})*/gi,
+  /-----BEGIN (?:RSA |DSA |EC |OPENSSH |ENCRYPTED )?PRIVATE KEY-----\\\\n(?:[#>][ \t]*)?[A-Za-z0-9+/=]{8,}(?:(?:\\\\n|[ \t]+)(?:[#>][ \t]*)?[A-Za-z0-9+/=]{8,})*/gi,
   /^PuTTY-User-Key-File-[23]: (?:ssh-|ecdsa-)[^\r\n]+\r?\n(?:(?!^PuTTY-User-Key-File-)[\s\S])*?^Private-Lines: \d+\r?\n(?:[A-Za-z0-9+/=]+\r?\n)+Private-MAC:[ \t]*[a-f0-9]+/gim,
 ];
 
@@ -111,7 +114,9 @@ const TOKEN_PATTERNS: RegExp[] = [
   /(\bmailgun(?:[ \t]+(?:api[ \t]+)?key)?[ \t]*(?:is[ \t]+|[:=][ \t]*)?)["']?(?:key-)?[a-f0-9]{32}(?:-[a-f0-9]{8,32}){0,3}\b/gi,
   /\bSK[a-fA-F0-9]{32}\b/g,
   /\bAGE-SECRET-KEY-1[A-Z0-9]{40,}\b/g,
-  /\b(?:dckr_pat_|pscale_pw_|pplx-|nvapi-|xai-|r8_)[A-Za-z0-9_-]{16,}\b/g,
+  /\b(?:dckr_pat_|pscale_pw_|nvapi-|r8_)[A-Za-z0-9_-]{16,}\b/g,
+  // xAI and Perplexity keys are opaque values; model/resource ids contain internal hyphens.
+  /\b(?:pplx-|xai-)[A-Za-z0-9_]{16,}\b/g,
   /\b(?:pul-[A-Za-z0-9_-]{20,}|1\/\/0[A-Za-z0-9_-]{20,}|EAAB[A-Za-z0-9_-]{20,})\b/g,
   /\bmfa\.[A-Za-z0-9_-]{40,}\b/g,
   /\$(?:2[aby]\$\d{2}\$[./A-Za-z0-9]{53}|(?:apr1|1)\$[./A-Za-z0-9]{1,8}\$[./A-Za-z0-9]{22}|5\$(?:rounds=\d+\$)?[./A-Za-z0-9]{1,16}\$[./A-Za-z0-9]{43}|6\$(?:rounds=\d+\$)?[./A-Za-z0-9]{1,16}\$[./A-Za-z0-9]{86}|argon2(?:id|i|d)\$v=\d+\$m=\d+,t=\d+,p=\d+\$[A-Za-z0-9+/]+=*\$[A-Za-z0-9+/]+=*)|\{SHA\}[A-Za-z0-9+/]{27}=/g,
@@ -124,6 +129,9 @@ const TOKEN_PATTERNS: RegExp[] = [
   /\bSG\.[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43}\b/g,
   /\bshp(?:at|ss|ca|pa)_[0-9a-fA-F]{32}\b/g,
   /\bdop_v1_[0-9a-f]{64}\b/g,
+  /\bdp\.(?:st|pt)\.[A-Za-z0-9_-]{20,}\b/g,
+  /\b(?:NRAK|NRAA)-[A-Za-z0-9]{20,}\b/g,
+  /\b[a-f0-9]{32}-us\d{1,2}\b/gi,
   /\bya29\.[0-9A-Za-z_-]{30,}/g,
   /\bAIza[0-9A-Za-z_-]{30,}/g,
   /\beyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/g,
@@ -135,6 +143,7 @@ const TOKEN_PATTERNS: RegExp[] = [
   /\bdapi[a-f0-9]{32,}\b/gi,
   /\b(?:sq0csp-|ATATT|figd_|ntn_|glsa_)[A-Za-z0-9_-]{16,}\b/g,
   /\bPMAK-[A-Za-z0-9_-]{16,}\b/g,
+  /\b\d{8,10}:AA[A-Za-z0-9_-]{33}\b/g,
   /\b(?:bot\s+|telegram(?:[ _-]?(?:token|url))?[^\r\n]{0,20})\d{7,12}:[A-Za-z0-9_-]{30,}\b/gi,
   /\b(SSWS[ \t]+)[A-Za-z0-9_-]{16,}\b/gi,
   // Feedback Graph Cloud personal access tokens: fgc_pat_<16 hex lookup id>_<secret>.
@@ -150,6 +159,11 @@ const TOKEN_PATTERNS: RegExp[] = [
   /(\bmysql(?:dump)?\s+[^\r\n]*?\s-p)(?!\s|\$)[^\s'"]+/gi,
   /(\b(?:docker\s+login|sshpass)\b[^\r\n]*?\s-p(?:=|\s+)["']?)(?!\s|\$)[^\s'"]+/gi,
   /(\bredis-cli\b[^\r\n]*?\s-a(?:=|\s+)["']?)(?!\s|\$)[^\s'"]+/gi,
+  /(\baz\s+login\b[^\r\n]*?\s-p(?:=|\s+)["']?)(?!\s|\$)[^\s'"]+/gi,
+  /(\bopenssl\b[^\r\n]*?\bpass:)(?!\s|\$)[^\s'"]+/gi,
+  /(\bldapsearch\b[^\r\n]*?\s-w(?:=|\s+)["']?)(?!\s|\$)[^\s'"]+/gi,
+  /(\bsmbclient\b[^\r\n]*?\s-U\s+[^\s%'"=]+%)(?!\s|\$)[^\s'"]+/gi,
+  /(\bSharedAccessKey\s*=\s*)(?![<\${])[^;\s"']{12,}/gi,
   /(\brequests\.[a-z]+\([^\r\n]*?\bauth\s*=\s*\(\s*["'][^"']+["']\s*,\s*["'])([^"']+)(?=["']\s*\))/gi,
   /(<password(?:\s[^>]*)?>)((?!\$\{|\{\{|<)[^<\r\n]+)(?=<\/password>)/gi,
   // A webhook URL is its own secret: the host and kind stay, the path that grants access goes.

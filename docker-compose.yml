@@ -70,7 +70,10 @@ services:
     # The image's entrypoint starts as root, fixes the ownership of /data and switches to the neo4j user: it keeps only
     # the capabilities that needs, and no process in it may gain more (a setuid binary included).
     cap_drop: [ALL]
-    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID]
+    # tini must signal Neo4j during `compose stop`; without KILL Docker hard-kills the database and leaves an active
+    # logical log that makes the next offline backup fail.
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, KILL, SETUID, SETGID]
+    stop_grace_period: 60s
     security_opt:
       - no-new-privileges:true
     healthcheck:
@@ -208,6 +211,22 @@ services:
   #   COMPOSE_PROFILES=codex and CODEX_RUNNER_URL=http://codex-runner:8790 in .env, then docker compose up -d
   # Not published on any host port; the worker reaches it on the compose network with a token the runner writes into
   # the scratch volume at startup.
+  runner-control-init:
+    build: { context: ., target: runtime }
+    profiles: ["codex"]
+    user: "0:0"
+    network_mode: none
+    read_only: true
+    cap_drop: [ALL]
+    cap_add: [CHOWN, FOWNER, DAC_OVERRIDE]
+    security_opt: ["no-new-privileges:true"]
+    environment:
+      CONTROL_UID: ${HOST_UID:-1000}
+      CONTROL_GID: ${HOST_GID:-1000}
+    volumes: ["./state/runner-control:/runner-control"]
+    entrypoint: ["sh", "-eu", "-c"]
+    command: ['case "$$CONTROL_UID:$$CONTROL_GID" in *[!0-9:]*|:*|*:) exit 1;; esac; chmod 0700 /runner-control; chown "$$CONTROL_UID:$$CONTROL_GID" /runner-control']
+
   codex-runner:
     networks: [runner-private, runner-egress]
     build: { context: ., target: codex-runner }
@@ -216,6 +235,8 @@ services:
     # only by their owner.
     user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
     init: true # codex runs in its own process group; a timeout kills the group, and init reaps what is left
+    depends_on:
+      runner-control-init: { condition: service_completed_successfully }
     environment:
       CODEX_HOME: /codex
       RUNNER_SCRATCH: /scratch
@@ -226,8 +247,8 @@ services:
       # Its own CODEX_HOME (not the worker's), with only the login file from the host in it.
       - codex-runner-home:/codex
       - ${CODEX_AUTH_FILE:-./state/codex-auth.json}:/codex/auth.json:ro
-      # doctor persists an isolation failure here, so backup/restore/compose cannot silently revive an unsafe runner.
-      - ./state/settings:/runner-control:ro
+      # A dedicated host folder: the runner sees only its fail-closed flag, never settings or redaction archives.
+      - ./state/runner-control:/runner-control:ro
     read_only: true
     tmpfs:
       - /tmp
@@ -242,7 +263,8 @@ services:
       # Scope this exception to the runner; its outer mount/PID namespace still hides other jobs and runner state.
       # On Ubuntu with restricted userns, load scripts/apparmor/feedback-graph-codex-runner and select its name.
       - apparmor=${CODEX_RUNNER_APPARMOR:-unconfined}
-    restart: unless-stopped
+    # A fail-closed flag exits 78. Bound retries avoid a permanent restart loop while still recovering transient exits.
+    restart: "on-failure:3"
 
   api:
     build: { context: ., target: api }

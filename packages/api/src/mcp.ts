@@ -27,6 +27,10 @@ const retryableToolError = (error: unknown) => {
   if (e.name === 'StoreDeadlineError' || code === '57014' || /(?:timeout|timed out|deadline exceeded)/i.test(e.message)) {
     return { ...text('The graph request exceeded its deadline. Retry this tool call.'), isError: true };
   }
+  if (e.name === 'ServiceUnavailable' || e.name === 'SessionExpired' || /^08/.test(code ?? '') || ['57P01', '57P02', '57P03'].includes(code ?? '')
+    || /failed to connect to server|routing table|connection acquisition|database (?:is )?unavailable|connection terminated/i.test(e.message)) {
+    return { ...text('The graph store is temporarily unavailable. Retry this tool call after the database is healthy.'), isError: true };
+  }
   throw error;
 };
 const safe = <A, R>(fn: (args: A) => Promise<R>) => async (args: A): Promise<R | ReturnType<typeof retryableToolError>> => {

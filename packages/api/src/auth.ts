@@ -1,4 +1,4 @@
-import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
+import { createHash, createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
 import type { Context } from 'hono';
 import type { OperatorConfig } from '@fb/core';
 
@@ -21,21 +21,46 @@ const SESSION_MAX_AGE = 30 * 24 * 3600;
 /** Browser sessions are random server-side capabilities, never a reusable derivation of API_TOKEN. */
 export class OwnerSessions {
   private readonly sessions = new Map<string, number>();
+  private readonly revoked = new Map<string, number>();
+  private readonly signingKey?: string;
+  constructor(signingKey?: string) { this.signingKey = signingKey; }
   private digest(value: string) { return createHash('sha256').update(`feedback-graph-ui-session:${value}`).digest('hex'); }
+  private sign(value: string) { return createHmac('sha256', this.signingKey!).update(`feedback-graph-ui-session:${value}`).digest('base64url'); }
   create(now = Date.now()): string {
     this.purge(now);
-    const value = randomBytes(32).toString('base64url');
-    this.sessions.set(this.digest(value), now + SESSION_MAX_AGE * 1000);
+    const expires = now + SESSION_MAX_AGE * 1000;
+    const body = `${expires}.${randomBytes(32).toString('base64url')}`;
+    const value = this.signingKey ? `${body}.${this.sign(body)}` : body;
+    this.sessions.set(this.digest(value), expires);
     return value;
   }
   has(value: string | undefined, now = Date.now()): boolean {
     if (!value) return false;
-    const key = this.digest(value), expires = this.sessions.get(key);
+    const key = this.digest(value);
+    const revokedUntil = this.revoked.get(key);
+    if (revokedUntil && revokedUntil > now) return false;
+    let expires = this.sessions.get(key);
+    if (!expires && this.signingKey) {
+      const parts = value.split('.');
+      if (parts.length === 3) {
+        const body = `${parts[0]}.${parts[1]}`;
+        if (tokenMatches(parts[2], this.sign(body))) expires = Number(parts[0]);
+      }
+    }
     if (!expires || expires <= now) { this.sessions.delete(key); return false; }
     return true;
   }
-  remove(value: string | undefined) { if (value) this.sessions.delete(this.digest(value)); }
-  private purge(now: number) { for (const [key, expires] of this.sessions) if (expires <= now) this.sessions.delete(key); }
+  remove(value: string | undefined) {
+    if (!value) return;
+    const key = this.digest(value);
+    const expiry = this.sessions.get(key) ?? Number(value.split('.')[0]);
+    this.sessions.delete(key);
+    if (Number.isFinite(expiry)) this.revoked.set(key, expiry);
+  }
+  private purge(now: number) {
+    for (const [key, expires] of this.sessions) if (expires <= now) this.sessions.delete(key);
+    for (const [key, expires] of this.revoked) if (expires <= now) this.revoked.delete(key);
+  }
 }
 
 function same(a: string, b: string): boolean {
@@ -74,7 +99,7 @@ export function sessionCookie(value: string, secure: boolean, clear = false): st
   return `${SESSION_COOKIE}=${clear ? '' : value}; ${attrs.join('; ')}`;
 }
 
-/** Paths anyone may call: liveness, readiness (the container health check; it says only ok and the store kind), and
+/** Paths anyone may call: health/readiness (the container checks; they expose only ok and, for readiness, store kind), and
  * the sign-in endpoint itself. */
 export const isOpenPath = (path: string) => path === '/api/health' || path === '/api/ready' || path === '/api/session';
 export const needsAuth = (path: string) => (path.startsWith('/api/') || path === '/mcp') && !isOpenPath(path);

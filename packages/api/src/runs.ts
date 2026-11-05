@@ -92,7 +92,7 @@ export function runScoped(d: ContextDeps): ContextDeps {
 
 /** Who opened a run, in words (a refused cleanup, and the 409 for a write under someone else's run in app.ts). */
 export const RUN_OPENERS: Record<RunPrincipal, string> = {
-  operator: 'the operator token', owner_token: "the owner's API token", browser: 'the browser', agent: 'an agent without a token',
+  operator: 'the operator token', owner_token: "the owner's API token", browser: 'the browser', agent: 'an API agent',
 };
 /** The same, naming the operator when the run recorded one. */
 export const openerOf = (o: RunOwner): string => (o.principal === 'operator' && o.actor?.startsWith('run-key:') ? 'the operator token with a private run key' : o.principal === 'operator' && o.actor ? `the operator token as ${o.actor}` : RUN_OPENERS[o.principal]);
@@ -240,6 +240,9 @@ export function runRoutes(app: Hono, d: RunsDeps) {
     // Who opened the run (RunsStore.claim), not what its Activity says: a run opened with the API token, by an agent or
     // in the browser is the owner's to clean up, and so is one opened before owners were recorded (none stored).
     const owner = await d.store.owner(run.data);
+    if (!actingAsOperator() && currentCaller() && (owner?.principal !== 'agent' || owner.actor !== currentCaller())) {
+      return c.json({ error: `run ${run.data} belongs to another caller; use the same FG_RUN_KEY that opened it, or the authenticated owner UI` }, 403);
+    }
     if (actingAsOperator()) {
       const empty = !owner && !Object.values(plan.remove).some(Boolean) && !plan.kept.length && !plan.entries;
       if (!operatorMayClean(owner) && !empty) {

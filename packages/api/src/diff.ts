@@ -299,10 +299,15 @@ async function readWorkingFile(repoPath: string, rel: string): Promise<string | 
 /** PR identities explicitly named by the task, independent of the repository's current HEAD. */
 export function taskPrNumbers(task: string): number[] {
   // Series counters describe this prompt/stack, not a GitHub PR identity. Accept the common wrappers and optional #;
-  // a real PR elsewhere in the same sentence ("see #14036") remains available to the matcher.
+  // a real PR elsewhere in the same sentence ("see #14036") remains available to the matcher. It is a counter only
+  // when the ordinal is plausible (n <= total <= 20); "PR 14036 of 2 open PRs" names PR 14036.
+  const counter = (all: string, n: string, total: string) => {
+    const ordinal = Number(n), count = Number(total);
+    return ordinal > 0 && ordinal <= count && count <= 20 ? '' : all;
+  };
   const text = task
-    .replace(/(?:\bStack:\s*)?\bPR\s*#?\d+\s*(?:\/|of)\s*\d+/gi, '')
-    .replace(/[([]\s*#\d+\s*(?:\/|of)\s*\d+\s*[)\]]/gi, '');
+    .replace(/(?:\bStack:\s*)?\bPR\s*#?(\d+)\s*(?:\/|of)\s*(\d+)/gi, counter)
+    .replace(/[([]\s*#(\d+)\s*(?:\/|of)\s*(\d+)\s*[)\]]/gi, counter);
   return [...new Set([...text.matchAll(/(?:github\.com\/[^\s/]+\/[^\s/]+\/pull\/|\b(?:PR|pull request)(?:\s*#|\s+)|#)(\d+)\b/gi)]
     .map(m => Number(m[1])).filter(n => Number.isSafeInteger(n) && n > 0))];
 }

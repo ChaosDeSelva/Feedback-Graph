@@ -85,6 +85,8 @@ export class PgRunsStore implements RunsStore {
       actual.push(...childRows.filter(row => actualDocs.has(row.doc)).map(row => ({ kind: String(row.kind), id: String(row.id) })));
       const link = await del('DELETE FROM project_links WHERE run = $1 AND id = ANY($2::text[])', ids.link);
       const chat = await del('DELETE FROM chat_conversations WHERE run = $1 AND id = ANY($2::text[])', ids.chat);
+      await c.query('UPDATE sessions SET run = NULL, sandbox = false WHERE run = $1', [run]);
+      await c.query('DELETE FROM session_run_tags WHERE run = $1', [run]);
       return removedCounts({ feedback: reports.length, lesson, miss, predone_check: predone, fact, doc, link, chat });
     });
     const fileSelectors: { kind: string; id: string }[] = [];

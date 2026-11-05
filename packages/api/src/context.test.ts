@@ -1282,7 +1282,7 @@ describe('0.6.4 serving and judge policy', () => {
   });
 
   test('the commit own PR and session own PR are excluded in full and brief contexts', async () => {
-    const docs = [12, 34, 56].map((n) => ({ docId: `d${n}`, source: 'github' as const, ref: `github:acme/demo#${n}`, title: `PR ${n}`, url: null, text: 'review', score: 0.9 }));
+    const docs = [12, 34, 56].map((n) => ({ docId: `d${n}`, source: 'github' as const, ref: `github:acme/demo#${n}`, title: `Search PR ${n}`, url: null, text: 'search review', score: 0.9 }));
     const d = deps({ ownPrNumbers: async () => [12], docs: { searchDocs: async () => docs } });
     for (const brief of [false, true]) {
       const r = await getTaskContext({ project: 'demo', task: 'search', sessionId: 'github:acme/demo#34', brief }, d);

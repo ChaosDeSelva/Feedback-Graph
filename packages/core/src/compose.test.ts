@@ -66,7 +66,10 @@ test('neo4j keeps only the capabilities its entrypoint needs and cannot gain pri
   const compose = readFileSync(join(repo, 'docker-compose.yml'), 'utf8');
   const neo4j = compose.slice(compose.indexOf('\n  neo4j:'), compose.indexOf('\n  worker:'));
   expect(neo4j).toContain('cap_drop: [ALL]');
-  expect(neo4j).toContain('cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID]');
+  expect(neo4j).toContain('cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, KILL, SETUID, SETGID]');
+  expect(neo4j).toContain('stop_grace_period: 60s');
+  expect(compose).toContain('runner-control-init:');
+  expect(compose).toContain('./state/runner-control:/runner-control');
   expect(neo4j).toContain('- no-new-privileges:true');
 });
 

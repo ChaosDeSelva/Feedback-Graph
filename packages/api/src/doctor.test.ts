@@ -96,10 +96,10 @@ esac`,
   };
   try {
     const out = execFileSync('bash', [join(repo, 'scripts', 'doctor.sh')], { env: { PATH: `${bin}:/usr/bin:/bin`, HOME: home, ...(w.shellUrl ? { FEEDBACK_GRAPH_URL: w.shellUrl } : {}) }, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] });
-    return { out, code: 0, chatArgs: chatArgs(), mcpArgs: mcpArgs(), runnerDisabled: existsSync(join(repo, 'state/settings/codex-runner-disabled')) };
+    return { out, code: 0, chatArgs: chatArgs(), mcpArgs: mcpArgs(), runnerDisabled: existsSync(join(repo, 'state/runner-control/codex-runner-disabled')) };
   } catch (e) {
     const x = e as { stdout?: string; status?: number };
-    return { out: String(x.stdout ?? ''), code: x.status ?? -1, chatArgs: chatArgs(), mcpArgs: mcpArgs(), runnerDisabled: existsSync(join(repo, 'state/settings/codex-runner-disabled')) };
+    return { out: String(x.stdout ?? ''), code: x.status ?? -1, chatArgs: chatArgs(), mcpArgs: mcpArgs(), runnerDisabled: existsSync(join(repo, 'state/runner-control/codex-runner-disabled')) };
   }
 }
 

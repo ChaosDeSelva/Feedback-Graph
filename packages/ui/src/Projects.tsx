@@ -178,7 +178,7 @@ export function Projects({ pollMs = 5000 }: { pollMs?: number } = {}) {
 
   return (
     <div className="flex h-full min-h-0 flex-col">
-      <PageHeader title="Projects" description="The code map, code facts, docs and your data for each project folder the worker reads." actions={<ImportBundle onImported={load} />} />
+      <PageHeader title="Projects" description="The code map, code facts, docs and your data for each project folder the worker reads." actions={<><a href="#project-scan-controls" className={buttonClass('ghost', 'sm')}>Jump to scan controls</a><ImportBundle onImported={load} /></>} />
       <SplitPane
         listLabel="projects"
         listWidth="19rem"
@@ -202,7 +202,7 @@ export function Projects({ pollMs = 5000 }: { pollMs?: number } = {}) {
                   <PinButton project={p} onToggle={() => pin(p)} className="absolute top-2 right-2" />
                 </li>
               ))}
-              {projects.length === 0 && (
+              {projects.length === 0 && !error && (
                 <li className="px-3 py-4 text-xs text-muted">No project folders found under the configured roots.</li>
               )}
             </ul>
@@ -226,7 +226,7 @@ export function Projects({ pollMs = 5000 }: { pollMs?: number } = {}) {
                   <div className="font-mono text-[11.5px] [overflow-wrap:anywhere] text-muted">{current.repoPath}</div>
                   {current.aliases.length > 0 && <div className="text-xs text-muted">also cloned in {current.aliases.join(", ")}</div>}
                 </div>
-                <div className="flex flex-wrap items-center gap-2">
+                <div id="project-scan-controls" className="flex flex-wrap items-center gap-2" tabIndex={-1}>
                   <Button size="md" aria-pressed={current.pinned} onClick={() => pin(current)} title={current.pinned ? 'pinned: listed first everywhere' : 'pin to list it first everywhere'}>
                     <PinIcon size={13} filled={current.pinned} />
                     {current.pinned ? 'Pinned' : 'Pin'}
@@ -234,7 +234,8 @@ export function Projects({ pollMs = 5000 }: { pollMs?: number } = {}) {
                   <Select aria-label="provider" value={provider} onChange={(e) => { setProvider(e.target.value); setError(null); }} className="w-56">
                     {PROVIDERS.map((p) => <option key={p.value} value={p.value}>{p.label}</option>)}
                   </Select>
-                  <Button variant="primary" onClick={scan} disabled={!!scanning} title={scanning ? `Scan ${current.lastScan?.status}; see Last scan below for details, or cancel a queued scan` : undefined}>Scan</Button>
+                  <Button variant="primary" onClick={scan} disabled={!!scanning} aria-describedby={scanning ? 'scan-disabled-help' : undefined} title={scanning ? `Scan ${current.lastScan?.status}; see Last scan below for details, cancel a queued scan, or switch provider` : undefined}>Scan</Button>
+                  {scanning && <span id="scan-disabled-help" className="basis-full text-xs text-muted">{`Scan ${current.lastScan?.status}; see Last scan below for details, cancel a queued scan, or switch to a healthy provider.`}</span>}
                   {current.lastScan?.status === 'queued' && <>
                     <Button onClick={() => cancelScan()}>Cancel queued scan</Button>
                     <Button disabled={!canSwitchProvider} aria-describedby={!canSwitchProvider ? 'switch-provider-help' : undefined} onClick={() => cancelScan(true)}>Switch provider and scan</Button>

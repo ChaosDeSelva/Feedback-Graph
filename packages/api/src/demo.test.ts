@@ -159,6 +159,15 @@ describe('routes', () => {
     expect((await app(t, ['lesson_decide']).request('/api/demo/seed', post('/api/demo/seed', { project: 'acme' }, bearer))).status).toBe(200);
   });
 
+  test('the API token is confined to the reserved demo project', async () => {
+    const t = deps();
+    const api = new Hono();
+    demoRoutes(api, t.d, { token: 'api-token-for-demo-probe-123456789' });
+    const auth = { authorization: 'Bearer api-token-for-demo-probe-123456789' };
+    expect((await api.request('/api/demo/seed', post('/api/demo/seed', {}, auth))).status).toBe(200);
+    expect((await api.request('/api/demo/seed', post('/api/demo/seed', { project: 'acme' }, auth))).status).toBe(403);
+  });
+
   test('the route module delegates owner authentication to createApp middleware', async () => {
     const t = deps();
     expect((await app(t).request('/api/demo/seed', post('/api/demo/seed', {}))).status).toBe(200);

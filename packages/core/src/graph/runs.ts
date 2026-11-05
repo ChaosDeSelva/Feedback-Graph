@@ -110,6 +110,12 @@ export class RunsRepo implements RunsStore {
       OPTIONAL MATCH (f:Fact {docId: d.id})
       RETURN d.id AS doc, chunks, collect(DISTINCT f.id) AS facts`, { run, ids: ids.doc });
     const out = await this.g.runInTransaction(DELETE.map(([kind, cypher]) => [cypher, { run, ids: ids[kind] }]));
+    // A run binding is a reservation, not owned transcript data. Cleanup releases
+    // both reservations and any legacy tags without deleting the real sessions.
+    await this.g.runInTransaction([
+      [`MATCH (s:Session {run: $run}) REMOVE s.run, s.sandbox RETURN count(s) AS n`, { run }],
+      [`MATCH (b:SessionRun {run: $run}) DETACH DELETE b RETURN count(*) AS n`, { run }],
+    ]);
     // The run's sandbox records may have been the last ones: the searches may skip the run filter again.
     const fileSelectors: { kind: string; id: string }[] = [];
     for (const file of files) {
