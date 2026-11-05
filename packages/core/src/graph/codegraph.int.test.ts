@@ -89,7 +89,7 @@ describeStores('CodeGraphStore', (h) => {
     expect(m.imports.toSorted((a, b) => `${a.from} ${a.to}`.localeCompare(`${b.from} ${b.to}`))).toEqual(
       codeMap().imports.toSorted((a, b) => `${a.from} ${a.to}`.localeCompare(`${b.from} ${b.to}`)),
     );
-    expect(await store.codegraph.codeMapMeta('demo')).toEqual({ fingerprint: 'head:abc', builtAt: m.builtAt, stats, candidates: null, unresolved: null, version: null });
+    expect(await store.codegraph.codeMapMeta('demo')).toEqual({ fingerprint: 'head:abc', builtAt: m.builtAt, stats, candidates: null, unresolved: null, version: null, lastFailure: null, lastFailureAt: null });
     expect(m.outside).toEqual([]);
     expect(await store.codegraph.codeMap('other')).toBeNull();
   });
