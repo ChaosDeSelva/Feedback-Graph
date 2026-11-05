@@ -57,9 +57,15 @@ else
   # Do not bind the owner-only backup directory into the image: the image intentionally drops to its unprivileged
   # neo4j user, which cannot traverse a host directory created with mode 0700. Keep the dump in the short-lived
   # container and let the Docker daemon copy the completed file to the host instead.
-  docker create --name "$dump_container" -v "$neo4j_volume:/data" "$image" \
+  # Bound the offline admin JVM as well as the server. On a small Docker host the otherwise auto-sized admin heap can
+  # compete with the primary test/install database and be killed without producing a dump.
+  docker create --name "$dump_container" -e "HEAP_SIZE=${NEO4J_ADMIN_HEAP_SIZE:-256m}" -v "$neo4j_volume:/data" "$image" \
     neo4j-admin database dump neo4j --to-path=/tmp >/dev/null
-  docker start -a "$dump_container" >/dev/null 2>&1
+  if ! docker start -a "$dump_container" >"$out/neo4j-admin.log" 2>&1; then
+    cat "$out/neo4j-admin.log" >&2
+    exit 1
+  fi
+  rm -f "$out/neo4j-admin.log"
   docker cp "$dump_container:/tmp/neo4j.dump" "$out/neo4j.dump"
   chmod 600 "$out/neo4j.dump"
   docker rm "$dump_container" >/dev/null

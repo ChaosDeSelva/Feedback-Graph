@@ -73,13 +73,25 @@ else
   running="$(docker compose ps --services --status running)"
   docker compose stop api worker neo4j >/dev/null
   load_container="${project}_neo4j-restore-$$"
+  load_log="$(mktemp)"
+  cleanup_load_container() {
+    docker rm -f "$load_container" >/dev/null 2>&1 || true
+    rm -f "$load_log"
+  }
+  trap 'cleanup_load_container; restore_runner_disabled' EXIT
   # The backup folder is owner-only. Copy the archive through the Docker daemon instead of bind-mounting it into the
   # unprivileged Neo4j image; this also works when the caller supplies an absolute backup path.
-  docker create --name "$load_container" -v "$neo4j_volume:/data" "$image" \
+  # Bound the offline admin JVM as well as the server. Auto-sizing can overcommit a small Docker host when another
+  # project is running Neo4j, causing a silent restore failure.
+  docker create --name "$load_container" -e "HEAP_SIZE=${NEO4J_ADMIN_HEAP_SIZE:-256m}" -v "$neo4j_volume:/data" "$image" \
     neo4j-admin database load neo4j --from-path=/tmp --overwrite-destination=true >/dev/null
   docker cp "$src/neo4j.dump" "$load_container:/tmp/neo4j.dump"
-  docker start -a "$load_container" >/dev/null 2>&1
+  if ! docker start -a "$load_container" >"$load_log" 2>&1; then
+    cat "$load_log" >&2
+    exit 1
+  fi
   docker rm "$load_container" >/dev/null
+  rm -f "$load_log"
   rm -rf state && tar -xzf "$src/state.tgz"
   restore_runner_disabled
   # shellcheck disable=SC2086 # one service name per word
