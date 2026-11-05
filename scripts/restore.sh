@@ -79,14 +79,13 @@ else
     rm -f "$load_log"
   }
   trap 'cleanup_load_container; restore_runner_disabled' EXIT
-  # The backup folder is owner-only. Copy the archive through the Docker daemon instead of bind-mounting it into the
+  # The backup folder is owner-only. Stream the archive through stdin instead of bind-mounting it into the
   # unprivileged Neo4j image; this also works when the caller supplies an absolute backup path.
   # Bound the offline admin JVM as well as the server. Auto-sizing can overcommit a small Docker host when another
   # project is running Neo4j, causing a silent restore failure.
-  docker create --name "$load_container" -e "HEAP_SIZE=${NEO4J_ADMIN_HEAP_SIZE:-256m}" -v "$neo4j_volume:/data" "$image" \
-    neo4j-admin database load neo4j --from-path=/tmp --overwrite-destination=true >/dev/null
-  docker cp "$src/neo4j.dump" "$load_container:/tmp/neo4j.dump"
-  if ! docker start -a "$load_container" >"$load_log" 2>&1; then
+  docker create -i --name "$load_container" -e "HEAP_SIZE=${NEO4J_ADMIN_HEAP_SIZE:-256m}" -v "$neo4j_volume:/data" "$image" \
+    neo4j-admin database load neo4j --from-stdin --overwrite-destination=true >/dev/null
+  if ! docker start -ai "$load_container" <"$src/neo4j.dump" >"$load_log" 2>&1; then
     cat "$load_log" >&2
     exit 1
   fi
