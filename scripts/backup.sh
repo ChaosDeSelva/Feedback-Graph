@@ -46,7 +46,7 @@ else
     docker rm -f "$dump_container" >/dev/null 2>&1 || true
     echo "restarting"
     # shellcheck disable=SC2086 # one service name per word, captured from compose ps
-    [ -z "$running" ] || docker compose up -d $running >/dev/null
+    [ -z "$running" ] || docker compose up -d --wait --wait-timeout 120 $running >/dev/null
   }
   trap 'restart_stack; cleanup_incomplete' EXIT
   # Do not bind the owner-only backup directory into the image: the image intentionally drops to its unprivileged
