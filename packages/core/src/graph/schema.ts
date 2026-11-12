@@ -88,6 +88,24 @@ export const SCHEMA = [
   'CREATE INDEX decision_note_decision IF NOT EXISTS FOR (n:DecisionNote) ON (n.decisionId)',
   'CREATE CONSTRAINT lesson_signals_lesson IF NOT EXISTS FOR (n:LessonSignals) REQUIRE n.lessonId IS UNIQUE',
   'CREATE CONSTRAINT loop_calibration_key IF NOT EXISTS FOR (n:LoopCalibration) REQUIRE n.key IS UNIQUE',
+  // Knowledge intake (graph/intake.ts). Claims are reviewed by project and status, questions and conflicts by status;
+  // a conflict's sides are found by the records they name (conflictsFor), a source's records by their Doc.
+  'CREATE CONSTRAINT person_id IF NOT EXISTS FOR (n:Person) REQUIRE n.id IS UNIQUE',
+  'CREATE CONSTRAINT claim_id IF NOT EXISTS FOR (n:Claim) REQUIRE n.id IS UNIQUE',
+  'CREATE CONSTRAINT question_id IF NOT EXISTS FOR (n:Question) REQUIRE n.id IS UNIQUE',
+  'CREATE CONSTRAINT conflict_id IF NOT EXISTS FOR (n:Conflict) REQUIRE n.id IS UNIQUE',
+  'CREATE CONSTRAINT person_alias_norm IF NOT EXISTS FOR (n:PersonAlias) REQUIRE n.norm IS UNIQUE',
+  'CREATE INDEX claim_project_status IF NOT EXISTS FOR (n:Claim) ON (n.projectKey, n.status)',
+  // Export and sync find the claim behind each claim fact (graph/portability.ts).
+  'CREATE INDEX claim_fact IF NOT EXISTS FOR (n:Claim) ON (n.factId)',
+  'CREATE INDEX conflict_status IF NOT EXISTS FOR (n:Conflict) ON (n.status)',
+  'CREATE INDEX question_status IF NOT EXISTS FOR (n:Question) ON (n.status)',
+  'CREATE INDEX conflict_side_a IF NOT EXISTS FOR (n:Conflict) ON (n.aId)',
+  'CREATE INDEX conflict_side_b IF NOT EXISTS FOR (n:Conflict) ON (n.bId)',
+  ...['Claim', 'Question'].map((label) => `CREATE INDEX ${label.toLowerCase()}_doc IF NOT EXISTS FOR (n:${label}) ON (n.docId)`),
+  ...['Claim', 'Question', 'Conflict'].map((label) => `CREATE INDEX ${label.toLowerCase()}_run IF NOT EXISTS FOR (n:${label}) ON (n.run)`),
+  `CREATE VECTOR INDEX claim_embedding IF NOT EXISTS FOR (n:Claim) ON n.embedding
+     OPTIONS {indexConfig: {\`vector.dimensions\`: 768, \`vector.similarity_function\`: 'cosine'}}`,
   // One GraphConfig per id. Two services MERGEing one at once before this constraint could make two: the newest
   // (updatedAt) is kept, so the constraint can be created on a store that has them.
   `MATCH (c:GraphConfig) WITH c ORDER BY coalesce(c.updatedAt, '') DESC, elementId(c)

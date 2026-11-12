@@ -54,6 +54,7 @@ test('status says which model is unavailable and why, and how many turns the cla
     summary: { provider: null, ok: true, reason: null },
     // A worker from before the docs reader (or Ask) does not report one: unknown, not broken.
     docs: { provider: null, ok: true, reason: null },
+    intake: { provider: null, ok: true, reason: null },
     chat: { provider: null, ok: true, reason: null },
   });
   expect(s.givenUpTurns).toBe(7);
@@ -91,6 +92,7 @@ test('status reports whether Ollama answers; an Ollama job is unavailable while 
     scan: { provider: 'ollama:gemma4', ok: false, reason: down.reason },
     summary: { provider: null, ok: true, reason: null },
     docs: { provider: null, ok: true, reason: null },
+    intake: { provider: null, ok: true, reason: null },
     chat: { provider: null, ok: true, reason: null },
   });
   const up = createApp(repo, { system: { version: '0.2.0', ping: async () => true, worker: async () => w, ollama: async () => ({ ...down, ok: true, reason: null }) } });

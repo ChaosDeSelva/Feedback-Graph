@@ -1,5 +1,7 @@
 import type { Activity, ActivityKind, Connection, ConnectionName, ExternalRef, FeedbackSource, CloudSyncResult, SyncCounts, SyncTrigger, Candidate, CodeMapMeta as StoredCodeMapMeta, Hotspot, MapGraph, ModuleContext, FolderCandidate, OutsideFolder, PipelineStatus, DocSummary, CandidateDetail, CandidateStatus, EvidenceGraph, FactHit, FactKind, Lesson as StoredLesson, LessonCheckName, LessonDetail as StoredLessonDetail, LessonFrom, LessonQuality, LessonQualityReport, LessonStatus, LessonTriggers, PatternReport, ProjectSummary, ProjectLink, LinkRelation, LinkStatus, ScanJob, SessionDetail, SessionListItem, SessionState, StatsRow, StoredFact, SystemStatus } from '@fb/core';
 import type { ChatConversation, ChatProvider, ChatThread } from '@fb/core/chat';
+import type { Utterance } from '@fb/core';
+import type { Claim, ClaimScope, ClaimSpan, ClaimStatus, ClaimType, Conflict, ConflictChoice, ConflictDismissReason, ConflictStatus, IntakeKind, IntakeMeta, IntakeRef, Person, PersonStatus, Question, QuestionStatus } from '@fb/core/types';
 
 export type { Connection, ConnectionName, ExternalRef, FeedbackSource, CloudSyncResult, SyncCounts, Activity, Candidate, Hotspot, MapGraph, ModuleContext, DocSummary, CandidateDetail, CandidateStatus, EvidenceGraph, LessonQuality, LessonQualityReport, LessonStatus, PatternReport, ProjectSummary, ProjectLink, LinkRelation, LinkStatus, ScanJob, PipelineStatus, SessionDetail, SessionListItem, SessionState, StatsRow, StoredFact, SystemStatus };
 /** A lesson as the API serves it: changedByLoop when a learning-loop decision still applied changed it. */
@@ -356,7 +358,7 @@ export type SessionPage = { sessions: SessionListItem[]; next: string | null };
 // docs/learning-loop-api.md is the contract the API implements. Lookups keyed by these enums fall back at runtime
 // (loop.ts), because a newer server may send a value this build does not know.
 
-export const DECISION_TYPES = ['link_misses', 'merge_duplicates', 'rank_weight', 'retire_lesson', 'reject_lesson', 'approve_lesson', 'reword_lesson', 'narrow_scope', 'record_fact', 'triage_inbox', 'tune_threshold'] as const;
+export const DECISION_TYPES = ['link_misses', 'merge_duplicates', 'rank_weight', 'retire_lesson', 'reject_lesson', 'approve_lesson', 'reword_lesson', 'narrow_scope', 'record_fact', 'triage_inbox', 'tune_threshold', 'resolve_conflict', 'remove_source'] as const;
 export type DecisionType = (typeof DECISION_TYPES)[number];
 export const DECISION_STATUSES = ['observed', 'proposed', 'applying', 'applied', 'rejected', 'rolled_back', 'overridden', 'expired'] as const;
 export type DecisionStatus = (typeof DECISION_STATUSES)[number];
@@ -365,11 +367,11 @@ export type DecisionTier = 'H' | 'A' | 'P';
 export type DecisionMode = 'observe' | 'propose' | 'auto';
 export const LOOP_MODES = ['off', 'observe', 'propose', 'auto'] as const;
 export type LoopMode = (typeof LOOP_MODES)[number];
-export type DecisionTargetKind = 'lesson' | 'fact' | 'miss' | 'candidate' | 'project';
+export type DecisionTargetKind = 'lesson' | 'fact' | 'miss' | 'candidate' | 'project' | 'claim' | 'conflict';
 export type DecisionTarget = { kind: DecisionTargetKind; id: string; role: 'primary' | 'keeper' | 'merged' | 'created' };
 /** A target's redacted fields at one moment, and the sha256 of its canonical fields. */
 export type TargetSnapshot = { kind: DecisionTargetKind; id: string; fields: Record<string, unknown>; fingerprint: string };
-export type EvidenceKind = 'activity' | 'miss' | 'lesson' | 'fact' | 'check' | 'session' | 'candidate';
+export type EvidenceKind = 'activity' | 'miss' | 'lesson' | 'fact' | 'check' | 'session' | 'candidate' | 'claim' | 'conflict';
 export type EvidenceRef = { kind: EvidenceKind; id: string; role: string; weight: number; observedAt: string };
 export type DecisionConfidence = { p: number; lower: number; n: number; band: number };
 export type DecisionRollback = { at: string; by: string; reason: RollbackReason | null; note: string | null; cascade: string[] };
@@ -402,6 +404,8 @@ export type Decision = {
   ratifiedAt?: string;
   ratifiedBy?: string;
   syncHoldUntil?: string;
+  /** loop, or owner: a change you made through a decision (a conflict resolved). Absent on older answers: the loop's. */
+  author?: 'loop' | 'owner';
 };
 export const NOTE_REASONS = ['wrong_evidence', 'too_broad', 'wording', 'not_now', 'other'] as const;
 export type RollbackReason = (typeof NOTE_REASONS)[number];
@@ -551,4 +555,82 @@ export const loopApi = {
   events: (after?: string) => request<LoopEventPage>(`/api/loop/events${qs({ after })}`),
   track: (lessonId: string) => request<TrackRecord>(`/api/loop/lessons/${enc(lessonId)}/track`),
   metrics: () => request<LoopMetrics>('/api/loop/metrics'),
+};
+
+// ── Knowledge intake (0.9.0; the Intake page) ───────────────────────────
+// Sources are step 4's routes (/api/intake/sources); claims, questions and people are intakeReview.ts's.
+
+/** One source as GET /api/intake/sources lists it: the Doc, its intake details (null while it is being stored), and a
+ * background embedding's state while there is one. */
+export type IntakeSource = DocSummary & { intake: IntakeMeta | null };
+/** GET /api/intake/sources/:id: the source, its text (null until stored), utterances, and where each claim drawn from it is. */
+export type IntakeSourceDetail = IntakeSource & {
+  text: string | null; utterances: Utterance[]; claims: { id: string; type: ClaimType; status: ClaimStatus; span: ClaimSpan | null }[];
+};
+/** A claim as listed: the open conflicts naming it, and the other side of each. */
+export type ListedClaim = Claim & { conflicts: { id: string; with: IntakeRef }[] };
+export type ClaimDetail = { claim: ListedClaim; fingerprint: string; speaker: Person | null; source: IntakeMeta | null };
+/** PATCH /api/claims/:id: only the keys given change. asFact false keeps it as an opinion; kind, relevance and projectKey say how its fact is filed. */
+export type ClaimEdit = {
+  status?: 'proposed' | 'accepted' | 'rejected'; statement?: string; type?: ClaimType; scope?: ClaimScope; about?: string; asFact?: boolean;
+  kind?: FactKind; relevance?: number; projectKey?: string; expect?: string;
+};
+export type QuestionDetail = { question: Question; askedBy: Person | null; assignee: Person | null; answer: Claim | null; source: IntakeMeta | null };
+export type BulkResults = { results: { id: string; ok: boolean; status?: string; factId?: string | null; error?: string }[] };
+
+/** One side of a conflict as GET /api/conflicts shows it: what it says, the quote, who said it and when, and whether agents see it now. */
+export type ConflictSideView = IntakeRef & {
+  fingerprint: string; assertedAt: string | null; text: string; quote: string | null; type: string | null; status: string | null;
+  speaker: { id: string; displayName: string; isOwner: boolean } | null; origin: string | null; path: string | null; docId: string | null;
+  source: { docId: string; kind: IntakeMeta['kind']; occurredAt: string | null; origin: string | null } | null; agentsSee: boolean; gone: boolean;
+};
+export type ConflictView = Conflict & { fingerprint: string; sides: { a: ConflictSideView; b: ConflictSideView } };
+/** POST /api/conflicts/:id/resolve. */
+export type ConflictResolveBody = {
+  choice: ConflictChoice; note?: string; reason?: ConflictDismissReason; statement?: string; projectKey?: string; factKind?: FactKind; expect?: string;
+};
+
+/** Claims, questions and people per page. */
+export const INTAKE_PAGE = 100;
+
+/** What POST /api/intake takes. name: the file it came from (sending it again replaces it); private: never synced. */
+export type IntakeUpload = {
+  projectKey: string; kind: IntakeKind; title: string; text: string; name?: string; occurredAt?: string | null;
+  participants?: string[]; origin?: string | null; private?: boolean;
+};
+
+export const intakeApi = {
+  sources: (project?: string) => request<IntakeSource[]>(`/api/intake/sources${qs({ project })}`),
+  source: (id: string) => request<IntakeSourceDetail>(`/api/intake/sources/${enc(id)}`),
+  rereadSource: (id: string) => request(`/api/intake/sources/${enc(id)}/reread`, { method: 'POST', body: {}, retry: false }),
+  /** POST /api/intake: a pasted or uploaded transcript, notes or doc, read into claims in the background. 202: still being stored. */
+  addSource: (b: IntakeUpload) => request<{ id: string; chunks: number; pending?: true }>('/api/intake', { method: 'POST', body: b, retry: false }),
+  /** keep facts: the text, chunks, unaccepted claims and questions go; none: its facts are closed too. */
+  deleteSource: (id: string, keep: 'facts' | 'none') => request(`/api/intake/sources/${enc(id)}${qs({ keep })}`, { method: 'DELETE', body: {}, retry: false }),
+
+  claims: (f: { status: ClaimStatus; type?: ClaimType; project?: string; person?: string; source?: string; offset?: number }) =>
+    requestPage<ListedClaim>(`/api/claims${qs({ status: f.status, type: f.type, project: f.project, person: f.person, source: f.source, limit: String(INTAKE_PAGE), offset: f.offset ? String(f.offset) : undefined })}`),
+  claim: (id: string) => request<ClaimDetail>(`/api/claims/${enc(id)}`),
+  editClaim: (id: string, edit: ClaimEdit) => request<{ claim: Claim; fact: StoredFact | null }>(`/api/claims/${enc(id)}`, { method: 'PATCH', body: edit }),
+  /** Many claims, or every proposed claim of one source; each is decided on its own. */
+  decideClaims: (body: { items: { id: string; status: 'accepted' | 'rejected' }[] } | { source: string; status: 'accepted' | 'rejected' }) =>
+    request<BulkResults>('/api/claims/decisions', { method: 'POST', body }),
+
+  questions: (f: { status: QuestionStatus; project?: string; source?: string; offset?: number }) =>
+    requestPage<Question>(`/api/questions${qs({ status: f.status, project: f.project, source: f.source, limit: String(INTAKE_PAGE), offset: f.offset ? String(f.offset) : undefined })}`),
+  question: (id: string) => request<QuestionDetail>(`/api/questions/${enc(id)}`),
+  updateQuestion: (id: string, patch: { assignee?: string | null; status?: 'open' | 'dismissed' }) => request<Question>(`/api/questions/${enc(id)}`, { method: 'PATCH', body: patch }),
+  answerQuestion: (id: string, body: { text: string; type: ClaimType; projectKey?: string }) =>
+    request<{ question: Question; claim: Claim; fact: StoredFact | null }>(`/api/questions/${enc(id)}/answer`, { method: 'POST', body, retry: false }),
+
+  conflicts: (f: { status: ConflictStatus; project?: string; offset?: number }) =>
+    requestPage<ConflictView>(`/api/conflicts${qs({ status: f.status, project: f.project, limit: String(INTAKE_PAGE), offset: f.offset ? String(f.offset) : undefined })}`),
+  conflict: (id: string) => request<ConflictView & { decision: Decision | null }>(`/api/conflicts/${enc(id)}`),
+  /** Not retried: a second resolve after a lost answer would answer 409 for the first one's change. */
+  resolveConflict: (id: string, body: ConflictResolveBody) => request<{ conflict: ConflictView; decision: Decision }>(`/api/conflicts/${enc(id)}/resolve`, { method: 'POST', body, retry: false }),
+  people: (status?: PersonStatus) => request<Person[]>(`/api/people${qs({ status })}`),
+  updatePerson: (id: string, patch: { displayName?: string; status?: 'proposed' | 'confirmed'; addAliases?: string[]; removeAliases?: string[] }) =>
+    request<Person>(`/api/people/${enc(id)}`, { method: 'PATCH', body: patch }),
+  mergePeople: (keepId: string, mergedId: string) => request<Person>('/api/people/merge', { method: 'POST', body: { keepId, mergedId }, retry: false }),
+  forgetPerson: (id: string) => request<{ person: Person; claimsRemoved: number }>(`/api/people/${enc(id)}/forget`, { method: 'POST', body: { confirm: id }, retry: false }),
 };

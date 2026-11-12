@@ -15,6 +15,7 @@ function fullApp() {
     system: { version: '9.9.9', ping: async () => true, worker: async () => null },
     classifyQueue: anything, settings: anything, codegraph: anything, mapMaxFiles: null, cloud: anything, inScope: () => true,
     importer: anything, sessions: anything, shown: undefined, integrations: anything, chat: anything, runs: anything, evidence: anything, loop: anything,
+    intake: { store: anything, archive: false, decide: anything }, intakeReview: { intake: anything, facts: anything, embed: async () => [], activity: anything, conflicts: anything },
   });
 }
 

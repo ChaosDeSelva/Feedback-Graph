@@ -94,6 +94,22 @@ proposal. `observe` records `observed` decisions only; `propose` makes every cal
 round that a later round makes again under `propose` or `auto` moves on from it, recorded with the mode, score and
 confidence it is made with then: `mode` always says what the loop did (applied it, proposed it, only observed it).
 
+## Decisions only you make: `resolve_conflict`, `remove_source`
+
+Two decision types are the owner's, never the loop's (`OWNER_DECISION_TYPES` in core `types.ts`, `author: 'owner'`).
+They exist so a change you make to what agents see is audited and rolls back through the same executor, not to be
+proposed: no loop type returns them, and they have no file in `worker/src/loop/types/`.
+
+| Type | What it records | Rollback |
+|---|---|---|
+| `resolve_conflict` | Your choice on a knowledge-intake conflict (A is true, B is true, both partly, not a conflict). The API builds the decision with the conflict, the losing side (both, for both partly) and any reconciled fact as targets, and applies it at once (`apply(id, { by: 'you' })`). The loser is superseded, never deleted: a claim marked superseded and the fact it became closed, a fact closed, a lesson superseded, with a `SUPERSEDED_BY` link to the winner. | Reopens the conflict and restores the loser exactly, removing the links; rolling back a loop decision it built on (a reworded lesson) undoes it first. |
+| `remove_source` | Deleting an intake source with `keep=none`: the facts its accepted claims became are closed. | Re-opens those facts. |
+
+Both are tier P in `LOOP_TYPE_INFO`, so they never apply on their own under any mode, and they are left out of
+`LOOP_DECISION_TYPES`: never in `LOOP_TYPES`, the loop's settings, its engine, its budgets or its metrics. The
+calibration fold (`loop/calibrate.ts`) skips owner-authored decisions (`author: 'owner'`): they carry no loop score, so they never raise or lower a type's earned confidence and never
+count as the loop's proposals or rollbacks.
+
 ## Applying and rolling back
 
 The engine and the API apply and undo every decision through one executor, `decisionExecutor(store, { embed })` in
@@ -170,5 +186,6 @@ Types with their own handler:
 | `tune_threshold` | the project's own floors (`setProjectThresholds`, `expect` the `from` fingerprint) |
 | `reword_lesson` | the new words are the generic lesson write; a split also creates the lesson it splits off (role `created`, ABSENT before) with `addLoopLesson`, from the same miss and marked `splitFrom`. Rollback removes it first (`removeLoopLesson`, only a lesson the loop split off, only as `from` has it) and then restores the original; each step moves back what it wrote when the next fails |
 | `record_fact` | a fact the decision creates is added as the loop's (`addOwnerFact(..., { id, origin: 'loop' })`: no scan closes, replaces or re-checks it), then the generic write rejects the lesson; the fact is closed again when that fails. Rollback is the generic one (the fact closed, the lesson restored); a redo reopens the fact |
+| `resolve_conflict` | the fact and lesson targets through the generic write (a created reconciled fact under its planned id), then the claims and the conflict with the `SUPERSEDED_BY` links in one intake transaction (`IntakeStore.writeSnapshots`); the facts and lessons are moved back when that fails. Rollback is the reverse |
 
 `rank_weight`, `approve_lesson`, `narrow_scope` and `triage_inbox` have no handler of their own: `genericHandler`.

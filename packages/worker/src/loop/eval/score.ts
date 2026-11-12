@@ -95,6 +95,9 @@ const AGREES: Record<DecisionType, (d: Decision, as: OwnerAction[]) => Verdict> 
   link_misses: () => 'unlabelled',
   rank_weight: () => 'unlabelled',
   tune_threshold: () => 'unlabelled',
+  // The owner's own decision: nothing of the loop's to score.
+  resolve_conflict: () => 'unlabelled',
+  remove_source: () => 'unlabelled',
 };
 
 /** The owner's verdict on a would-be decision: his verdict on the loop's real decision for the same call, else the type's rule. */

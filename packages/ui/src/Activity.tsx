@@ -59,6 +59,13 @@ const KIND_LABEL: Record<ActivityKind | LoopActivityKind, string> = {
   decision_noted: 'decision note',
   loop_settings_changed: 'loop settings',
   loop_paused: 'loop paused',
+  source_added: 'source added',
+  source_read: 'source read',
+  claim_decided: 'claim decided',
+  question_changed: 'question changed',
+  conflict_found: 'conflict found',
+  conflict_resolved: 'conflict resolved',
+  person_changed: 'person changed',
 };
 /** Every kind the kind filter offers: the core ones, then the learning loop's. */
 const KINDS = [...ACTIVITY_KINDS, ...LOOP_ACTIVITY_KINDS.filter((k) => !(ACTIVITY_KINDS as readonly string[]).includes(k))] as (ActivityKind | LoopActivityKind)[];

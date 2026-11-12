@@ -1,5 +1,5 @@
 import { repairV6Sources } from './v6Recovery.ts';
-import { REDACTION_VERSION, type ActivityStore, type ChatStore, type DecisionsStore, type DocsStore, type FactsStore, type GraphStore, type KnowledgeStore, type SessionsStore } from '@fb/core';
+import { INTAKE_REDACTION_VERSION, REDACTION_VERSION, type ActivityStore, type ChatStore, type DecisionsStore, type DocsStore, type FactsStore, type GraphStore, type KnowledgeStore, type SessionsStore } from '@fb/core';
 
 /**
  * A redaction rule change migrates its data. Everything is redacted on the way in, but only by the rules of the day:
@@ -114,5 +114,45 @@ export async function redactStoredOnRuleChange(d: RedactStoredDeps): Promise<Red
   }
   await d.cursors.setCursor(REDACTION_CURSOR, stamp);
   d.log?.('redaction rules applied to stored data', { version: REDACTION_VERSION, previous: last, ...r });
+  return r;
+}
+
+/** Where the rules last applied to stored intake are kept: the secret and the contact rules' versions together. */
+export const INTAKE_REDACTION_CURSOR = 'intake-redaction-rules';
+
+/** What the intake store's re-run changed, per kind (rows written; a row the rules leave alone is not). */
+export type IntakeRedactedCounts = { sources: number; claims: number; questions: number };
+
+export type RedactStoredIntakeDeps = {
+  cursors: Pick<DocsStore, 'getCursor' | 'setCursor'>;
+  /** Runs redactStoredIntake (core redact.ts) over each source's text and chunks, and each claim and question. */
+  intake: { redactStoredIntake(): Promise<IntakeRedactedCounts> };
+  activity: Pick<ActivityStore, 'record'>;
+  log?: (msg: string, extra?: object) => void;
+};
+
+/**
+ * The intake re-run: stored transcripts, notes and the claims and questions read from them, under the current secret
+ * rules and contact rules (redactIntakeText). Runs once per pair of versions, so a new secret rule reaches claims too.
+ * Null when stored intake is already under both; a failure leaves the old stamp, so the next start runs it again.
+ */
+export async function redactStoredIntakeOnRuleChange(d: RedactStoredIntakeDeps): Promise<IntakeRedactedCounts | null> {
+  const stamp = `v${REDACTION_VERSION}.i${INTAKE_REDACTION_VERSION}`;
+  const last = await d.cursors.getCursor(INTAKE_REDACTION_CURSOR);
+  if (last === stamp) return null;
+  const r = await d.intake.redactStoredIntake();
+  const changed = [
+    r.sources && n(r.sources, 'intake source'), r.claims && n(r.claims, 'claim'), r.questions && n(r.questions, 'question'),
+  ].filter(Boolean) as string[];
+  if (changed.length) {
+    await d.activity.record({
+      kind: 'secrets_redacted', actor: 'deterministic', projectKey: null,
+      subject: `intake redaction rules ${stamp} applied to stored intake: ${changed.join(', ')} changed`,
+      why: `${last ? `the redaction rules changed (${last} to ${stamp})` : `intake stored before redaction rules ${stamp}`}: credentials, e-mail addresses, phone numbers and URL query tokens in transcripts, notes and what was read from them are redacted`,
+      details: { version: REDACTION_VERSION, intakeVersion: INTAKE_REDACTION_VERSION, previous: last, ...r },
+    });
+  }
+  await d.cursors.setCursor(INTAKE_REDACTION_CURSOR, stamp);
+  d.log?.('intake redaction rules applied to stored intake', { stamp, previous: last, ...r });
   return r;
 }

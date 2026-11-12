@@ -8,6 +8,7 @@ import { retireLesson } from './retire_lesson.ts';
 import { tuneThreshold } from './tune_threshold.ts';
 import { recordFact } from './record_fact.ts';
 import { rewordLesson } from './reword_lesson.ts';
+import { resolveConflict } from './resolve_conflict.ts';
 
 export type * from './handler.ts';
 
@@ -24,6 +25,9 @@ export const DECISION_HANDLERS: Partial<Record<DecisionType, DecisionTypeHandler
   tune_threshold: tuneThreshold,
   reword_lesson: rewordLesson,
   record_fact: recordFact,
+  resolve_conflict: resolveConflict,
+  // A removed source's claims rejected and their facts closed: the same claim and fact moves, with no conflict.
+  remove_source: resolveConflict,
 };
 
 export const handlerFor = (type: DecisionType): DecisionTypeHandler => DECISION_HANDLERS[type] ?? genericHandler;

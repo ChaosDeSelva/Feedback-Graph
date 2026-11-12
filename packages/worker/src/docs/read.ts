@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { askJson, chunkText, holdsCredential, instructsAgent, providerUnavailableReason, redactSecrets, type ActivityStore, type CodeFact, type DocsStore, type DocToRead, type LlmProvider } from '@fb/core';
+import { askJson, chunkText, fenced, oneLine, holdsCredential, instructsAgent, providerUnavailableReason, redactSecrets, type ActivityStore, type CodeFact, type DocsStore, type DocToRead, type LlmProvider } from '@fb/core';
 import { FACT_JSON, FactSchema, MIN_CONFIDENCE, RELEVANCE_RUBRIC } from '../scan/scan.ts';
 
 export type ReadDeps = {
@@ -28,11 +28,6 @@ const TextResult = z.object({ summary: z.string().default(''), facts: z.array(Fa
 const ImageResult = z.object({ description: z.string().min(1), facts: z.array(FactSchema).max(30) });
 
 const factsJson = { type: 'array', items: FACT_JSON };
-
-/** Like the Ask pack's fences: a line of the upload starting with --- or === is quoted, so it cannot close ours. */
-const defuse = (s: string) => s.replace(/^(\s*)(===|---)/gm, '$1> $2');
-const oneLine = (s: string) => defuse(s.replace(/\s+/g, ' ').trim()).slice(0, 200);
-const fenced = (label: string, text: string) => `--- begin untrusted document ${oneLine(label)} ---\n${defuse(text)}\n--- end of untrusted document ---`;
 
 /**
  * One upload read into facts (the oldest waiting). A text document: facts from its text. An image: a description of

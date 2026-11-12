@@ -337,6 +337,8 @@ push project knowledge to a Feedback Graph Cloud org.
   explanation, but an empty `feedbackText` and context items without their excerpts), current code facts, document
   metadata (title, link, no text) and `codeFiles` (paths and hotspot numbers). Everything passes redaction again on
   the way out. No transcripts, no source, no excerpts, no vectors.
+  Facts from accepted intake claims go only with `SYNC_CLAIMS=true`, and never their quotes or a private source's
+  ([Knowledge intake](#knowledge-intake)).
 - **Which lessons.** Nothing is shared until it is approved, by you or by the learning loop (`approve_lesson`). A lesson
   or fact the loop changed on its own is sent as it was before until you **Keep** that decision or
   `LOOP_SYNC_HOLD_DAYS` (7) pass without a rollback; after that the loop's change is sent like yours. By default a
@@ -391,6 +393,84 @@ push project knowledge to a Feedback Graph Cloud org.
   ones), makes an org and token through dev login and turns the org's review gate off (a new org reviews synced
   lessons, which would then arrive as suggestions), syncs a seeded project on both backends and checks the lesson
   arrived as a team lesson and is taken back out when the project is unselected, then removes everything it started.
+
+## Knowledge intake
+
+Off by default. With it on, transcripts of calls and notes are read into proposed claims and questions for you to
+review on the Intake page ([guide](guide.md#intake)), and claims, facts and approved lessons are checked against each
+other for conflicts you settle. Agents only ever see the claims you accept.
+
+- **Turning it on.** Set `INTAKE_ENABLED=1` in `.env` (`1`, `true`, `yes` or `on`) and run `docker compose up -d`, so
+  both the api and the worker restart with it. **Intake** then appears in the sidebar's Review group, between Inbox and
+  Ask, and `/api/status` reports `intake.enabled`. Unset, the intake routes answer 404, the MCP tools
+  `find_contradictions` and `submit_notes` are not offered, and the worker's intake stages do not run. Turning it off
+  again keeps what was stored; claims already accepted stay facts.
+- **Adding a source.** **Add a source** on the Intake page's Sources tab, or `POST /api/intake` with `projectKey`, `title` and `text` (txt, md, vtt or srt; up to 2,000,000
+  characters), and optionally `kind` (`transcript`, the default, `notes` or `doc`), `occurredAt`, `participants`,
+  `origin` and `private`. Over 64 chunks it answers 202 and is stored in the background. It is an owner route, reads
+  included; the operator token may add sources under the `intake` verb (on by default), which is also how the admin
+  MCP tool `intake_submit` reaches it. An agent hands you its notes with `submit_notes` (below).
+- **Settings.**
+
+  | Variable | Default | What |
+  |---|---|---|
+  | `INTAKE_ENABLED` | off | Turns knowledge intake on. |
+  | `INTAKE_LLM` | `DOCS_LLM`, then `SCAN_LLM`, then the local model | The model that reads sources into claims and questions, skipping any the allow list refuses. Its health shows on the Dashboard as *intake reader*. |
+  | `INTAKE_PROVIDER_ALLOW` | `ollama,claude-cli` | The providers what people said may be sent to. An `INTAKE_LLM` or `CONFLICT_LLM` outside it stops the services at startup with a configuration error. Add `openai` or `anthropic` only if you accept sending transcripts to that API. |
+  | `INTAKE_LLM_CALLS_PER_DAY` | 200 | Extraction's model calls a day. Past it a source waits for the next day and says so; `0` reads nothing. |
+  | `INTAKE_ARCHIVE` | on | `off` keeps no source's original text in the [redaction archive](#encrypted-redaction-archive). |
+  | `CONFLICT_LLM` | intake's model | The judge of candidate conflicts, held to `INTAKE_PROVIDER_ALLOW` since it reads what people said. |
+  | `CONFLICT_LLM_CALLS_PER_DAY` | 60 | The judge's calls a day; `0` keeps only the deterministic checks, so no new conflict is recorded. |
+  | `CONFLICT_SWEEP_MINUTES` | 360 | How often the sweep pages through current facts and approved lessons for conflicts. |
+  | `SYNC_CLAIMS` | `false` | `true`: facts with origin `claim` (accepted claims) go to [team sync](#team-sync) too; see below. Needs `CLOUD_URL` and `CLOUD_TOKEN`. |
+  | `SYNC_PEOPLE` | `false` | `true`: a synced claim fact names who said it; otherwise it says "a participant". Needs `SYNC_CLAIMS=true`. |
+
+  `SYNC_CLAIMS` and `SYNC_PEOPLE` take only `true` or `false`; a value that breaks a rule above stops the services at
+  startup with a configuration error. The candidate threshold (cosine 0.72 to a neighbour, 0.85 to go to the judge
+  with no differing value) is fixed, not a setting.
+- **Privacy.**
+  - Credentials and contact details (e-mail addresses, phone numbers, URL query tokens) are redacted before the text
+    is stored and before any model call. The original goes to the encrypted redaction archive, as uploads do, unless
+    `INTAKE_ARCHIVE=off`.
+  - Speakers reach the model only as S1, S2, ..., and the list of who was there is never sent. Names spoken inside the
+    text cannot be found reliably and do reach the model, which is why the default is the local one.
+  - Sources are private by default: a transcript and an agent's notes are marked private unless you send
+    `private: false`; notes and docs you add are not.
+  - Transcript text, quotes, questions and sources are never served to agents, exported or synced. The doc searches
+    behind `get_task_context`, its brief, `search_graph`, linked-project context and post-mortem context hunts leave
+    intake sources out, and the ordinary document reader never reads one into facts.
+  - **Cloud sync.** A fact with origin `claim` never goes to the cloud unless `SYNC_CLAIMS=true`. Even then its quote
+    never goes, a fact from a private source never goes, and the speaker is named only with `SYNC_PEOPLE=true`
+    (otherwise "a participant"). Open conflicts and questions never go. A claim fact that is superseded (it lost a
+    conflict) or deleted is withdrawn from the cloud on the next sync, as other withdrawn items are.
+- **Deleting a source.** On the Sources tab, or `DELETE /api/intake/sources/:id?keep=facts|none` (the operator token
+  needs `docs_delete`).
+  - `keep=facts` (the default) removes the text, its chunks, the claims you have not accepted and its questions, and
+    its archived original in the redaction archive. Claims you accepted stay, as the facts they became.
+  - `keep=none` also closes the facts its claims became. That is recorded as a `remove_source` decision by you on the
+    Decisions page, and rolling it back re-opens them.
+- **Forgetting a person** (People tab, `POST /api/people/:id/forget` with `confirm` set to their id; cannot be undone):
+  their name is replaced by "former participant", their aliases and the claims of theirs you have not accepted are
+  deleted, and their name is removed from the facts their accepted claims became and from earlier person Activity
+  entries. The archived originals of sources they attended are not purged: they expire with the archive's lifetime
+  (`REDACTION_ARCHIVE_RETENTION_DAYS`), or delete the source to purge its original now.
+- **Agent notes.** `submit_notes` (MCP, not read-only) takes up to 200 KB and stores it as a private notes source marked
+  `agent:<client>`. Its claims are only ever proposed and never accepted for you. It is untrusted input: its text is fenced
+  as data like any source, a statement drawn from it that instructs an agent or holds a credential is dropped, and
+  every quote must be in the notes.
+- **Operator verbs.** `intake` (add, read and re-read sources) is on by default. `claims_decide` (accept, edit or
+  reject claims, answer or assign questions, rename, merge or forget people) and `conflict_decide` (settle a
+  conflict) are off unless `OPERATOR_ALLOW` names them. The admin MCP tools `intake_submit`, `claims_list`,
+  `claim_decide`, `questions_list`, `question_answer`, `conflicts_list` and `conflict_resolve` follow those verbs.
+- **Settling conflicts.** Each choice is a `resolve_conflict` decision by you, applied at once: it is on the Decisions
+  page, exported with them, and rolled back like any other (the conflict reopens and the loser is restored). The
+  learning loop never makes one, and your resolutions are never calibrated or counted as the loop's.
+- **Cost on local models.** An hour-long call is about 60,000 characters, about 8 windows of 8,000 characters. At
+  about 45 s a window with gemma4 that is about 6 minutes, in the background, one window a round; the Sources tab
+  shows *reading window 3/8*, and a restart resumes at the next window. The conflict judge only sees pairs the
+  deterministic pre-filters flag (numbers, dates, versions, negation or named choices that differ) or that are very
+  close, at most `CONFLICT_LLM_CALLS_PER_DAY` (60) a day, and each judged pair is remembered, so an unchanged pair is
+  never judged twice.
 
 ## Agents with the operator token
 

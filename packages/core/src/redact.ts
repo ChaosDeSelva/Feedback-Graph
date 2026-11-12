@@ -1011,3 +1011,81 @@ export function redactDeep<T>(v: T): T {
   }
   return v;
 }
+
+/**
+ * The version of the contact rules below (redactContact), kept apart from REDACTION_VERSION because they run only on
+ * intake text: a transcript, notes or a doc sent to /api/intake, and the claims and questions read from it. Raise it
+ * whenever a contact pattern is added, widened or narrowed: the worker then runs redactStoredIntake over stored intake
+ * once (worker redactStored.ts). 1: e-mail addresses, phone numbers, URL query tokens.
+ */
+export const INTAKE_REDACTION_VERSION = 1;
+
+/** An e-mail address: local part, @, a dotted domain ending in letters. Each part is bounded, so it stays linear. */
+const EMAIL = /(?<![\w.%+-])[A-Za-z0-9][\w.%+-]{0,63}@(?:[A-Za-z0-9][A-Za-z0-9-]{0,62}\.){1,8}[A-Za-z]{2,24}(?![\w-]|\.[A-Za-z0-9])/g;
+/** A URL's query (to the fragment or the end of the URL); a meeting link carries its passcode and ids there. */
+const URL_QUERY = /(\bhttps?:\/\/[^\s?#<>"'`()[\]]{1,2048})\?([^\s#<>"'`()[\]]{1,4096})/gi;
+/** A query value long enough to be a token or an id rather than a page number or a flag. */
+const QUERY_TOKEN = /(?:^|&)[^=&]{1,128}=[^&]{6,}/;
+/**
+ * A candidate phone number: digits in groups joined by single spaces, dots, dashes or parentheses, 7 to 24 characters,
+ * after an optional + or 00. Not inside a word, a number, a path, a version or a time; phoneShape then decides.
+ */
+const PHONE = /(?<![\w+.\-/:@#$%,])(\+|00(?=[1-9]))?(\(?\d[\d .\-()\u00a0]{5,22}\d)(?![\w\-/@%]|[.,:]\d)/g;
+/** Words that say the number after them is a phone number, however it is written. */
+const PHONE_WORD = /\b(?:phone|tel|telephone|mobile|cell|cellphone|whats\s?app|fax|sms|text\s+me|call\s+me|reach\s+me|ring\s+me|contact)\b[^\n\d]{0,12}$/i;
+
+function phoneShape(prefix: string | undefined, body: string, before: string): boolean {
+  if (/[ .\-()\u00a0]{3,}/.test(body) || /[ .\-\u00a0]{2}/.test(body)) return false;
+  const groups = body.split(/[ .\-()\u00a0]+/).filter(Boolean);
+  const digits = groups.join('').length;
+  if (digits < 7 || digits > 15) return false;
+  // Parentheses only around the area code: the first group, or the one after a country code.
+  const opens = body.split('(').length - 1;
+  if (opens !== body.split(')').length - 1 || opens > 1 || (opens === 1 && !/^(?:\d{1,3}[ .-]?)?\(\d{1,5}\)/.test(body))) return false;
+  if (prefix) return digits >= 8 && groups.every((g) => g.length <= 8 || groups.length === 1);
+  if (opens === 1) return true;
+  // North American: 555-123-4567, 1 555 123 4567.
+  if (/^(?:1[ .-])?\d{3}[ .-]\d{3}[ .-]\d{4}$/.test(body)) return true;
+  // A national number with its trunk 0: 020 7946 0958, 07700 900123, 06 12 34 56 78.
+  if (groups.length >= 2 && /^0\d{1,4}$/.test(groups[0]) && digits >= 9 && digits <= 11 && groups.every((g) => g.length <= 8)) return true;
+  // Any other run of digits counts only after a word that says it is a phone number: "call me on 5551234".
+  return PHONE_WORD.test(before) && (groups.length === 1 || groups.every((g) => g.length <= 5));
+}
+
+/**
+ * Contact details in what people said: e-mail addresses become [email], phone numbers [phone], and a URL's query that
+ * holds a token or id becomes ?[query] (the host and path stay). Run after redactSecrets, on intake text only: an
+ * address in code or a scanned file is not a person's contact (redactIntakeText).
+ */
+export function redactContact(text: string): string {
+  return text
+    .replace(URL_QUERY, (all, head: string, query: string) => (QUERY_TOKEN.test(query) ? `${head}?[query]` : all))
+    .replace(EMAIL, '[email]')
+    .replace(PHONE, (all, prefix: string | undefined, body: string, offset: number, source: string) =>
+      (phoneShape(prefix, body, source.slice(Math.max(0, offset - 40), offset)) ? '[phone]' : all));
+}
+
+/** Every pattern the contact rules run over text, for the test that holds each to a time budget. */
+export const CONTACT_PATTERNS: readonly RegExp[] = [EMAIL, URL_QUERY, PHONE];
+
+/** Intake text as it is stored and sent to a model: credentials first (redactSecrets), then contact details. */
+export function redactIntakeText(text: string): string {
+  return redactContact(redactSecrets(text));
+}
+
+/**
+ * A stored intake row (a source's text or chunk, a claim, a question) under the current secret and contact rules, for
+ * the worker's re-run: the whole row with its `text` fields run through redactIntakeText. Null when nothing changes,
+ * so a store writes only rows that do (redactedChanges says which fields).
+ */
+export function redactStoredIntake<T extends Record<string, unknown>>(row: T, text: readonly (keyof T)[]): T | null {
+  const out: Record<string, unknown> = { ...row };
+  let changed = false;
+  for (const k of text) {
+    const v = row[k];
+    if (typeof v !== 'string') continue;
+    const r = redactIntakeText(v);
+    if (r !== v) { out[k as string] = r; changed = true; }
+  }
+  return changed ? (out as T) : null;
+}

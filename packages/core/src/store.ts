@@ -19,7 +19,7 @@ import type { ProjectScope, ProjectSelection } from './scope.ts';
 import type { CallsAfter, CandidateDetail, CandidateFilter, ClassifiableTurn, StatsRow } from './graph/repo.ts';
 import type { LessonDetail, LessonHit, LessonInput, LessonPatch, RelatedMiss, UnsortedMiss } from './graph/knowledge.ts';
 import type { EmbeddedFact, FactHit, RelevanceUpdate, StoredFact, UnscoredFact } from './graph/facts.ts';
-import type { DocHit, DocInput, DocLink, DocListOpts, DocSummary, DocToRead, UpsertDocOpts } from './graph/docs.ts';
+import type { DocHit, DocInput, DocSearch, DocLink, DocListOpts, DocSummary, DocToRead, UpsertDocOpts } from './graph/docs.ts';
 import type { TaskImage } from './llm/providers.ts';
 import type { DetectedLink, LinkPatch, ProjectLink } from './graph/links.ts';
 import type { EvidenceGraph, PatternReport } from './graph/insights.ts';
@@ -30,6 +30,8 @@ import type { ExternalRef, ExternalSource, SessionSource, HumanTurn, SessionDeta
 import type { SessionCursor, SummaryWork, SummaryWorkQuery, SummaryWrite } from './sessions.ts';
 import type { ChatAnswer, ChatConversation, ChatJob, ChatPack, ChatProvider, ChatThread, PendingChatTurn } from './chat.ts';
 import type { Decision, DecisionInput, DecisionNote, CalibrationBucket, DecisionType, LessonSignals, ProjectThresholds, TargetSnapshot } from './types.ts';
+import type { Claim, ClaimLink, Conflict, ConflictInput, IntakeMeta, IntakeMetaInput, Person, Question, QuestionDraft, Supersession } from './types.ts';
+import type { AnswerInput, ClaimFilter, ClaimHit, ClaimPatch, ClaimSearch, ConflictFilter, IntakeRedacted, IntakeRemoved, IntakeRunItem, IntakeSnapshotWrite, PersonPatch, QuestionFilter, QuestionPatch, WindowSave } from './intake/records.ts';
 import type { CalibrationBump, DecisionCount, DecisionCountFilter, DecisionCountKey, DecisionFilter, DecisionNoteInput, DecisionStatusPatch, FactSnapshotWrite, FingerprintedFact, LessonSnapshotFields, LessonSnapshotWrite, MissLink, SupersedeLink } from './decisions/record.ts';
 
 /** The paths a scope replace covers (FactsStore.replaceScopeFacts): under one of `prefixes`, under none of `except`. */
@@ -576,8 +578,17 @@ export interface FactsStore {
 export interface DocsStore {
   /** Insert or replace; a replaced document loses what was read from it (its facts, its image) and is read again if `read`. */
   upsertDoc(input: DocInput, raw: { text: string; embedding: number[] }[], o?: UpsertDocOpts): Promise<string>;
-  /** The oldest upload waiting to be read whose retryAt (if any) has passed. */
-  nextDocToRead(now?: Date): Promise<DocToRead | null>;
+  /**
+   * The oldest upload waiting to be read whose retryAt (if any) has passed. Never a knowledge intake source (what people
+   * said is not read into facts agents are served) unless `intake`, which picks only those (worker intake/extract.ts).
+   */
+  nextDocToRead(now?: Date, o?: { intake?: boolean }): Promise<DocToRead | null>;
+  /**
+   * A reading that goes on over several rounds (an intake source, window by window) made progress: its error, retry
+   * time and attempts are cleared, and it is done, or waits (pending) for its next round. Only while it is still that
+   * upload (`version`); false when it was replaced or is gone.
+   */
+  recordDocProgress(id: string, version: string, o: { done: boolean }): Promise<boolean>;
   /** version: only if it is still that upload. False when it was replaced (or is gone). */
   markDocReading(id: string, version?: string): Promise<boolean>;
   /**
@@ -611,8 +622,10 @@ export interface DocsStore {
   listDocs(projectKey: string, o?: DocListOpts): Promise<DocSummary[]>;
   /** run: only a document that run uploaded (false for anyone else's); unset: any (the owner). */
   deleteDoc(id: string, o?: { run?: string | null }): Promise<boolean>;
-  /** run: see KnowledgeStore.relatedMisses (a chunk is its document's). */
-  searchDocs(q: { embedding: number[]; projectKey: string; k: number; run?: string | null }): Promise<DocHit[]>;
+  /** run: see KnowledgeStore.relatedMisses (a chunk is its document's). excludeSources: see DocSearch. */
+  searchDocs(q: DocSearch): Promise<DocHit[]>;
+  /** A document's text as the reader gets it (DocToRead.text: its chunks in order, joined by a blank line); null when gone. */
+  docText(id: string): Promise<string | null>;
   /**
    * Pull requests and the Linear tickets they name, from either end: for a pull request's document, the project's
    * tickets it names; for a ticket's, the project's pull requests that name it. Ordered by title. run: see
@@ -1003,6 +1016,120 @@ export interface DecisionsStore {
   redactStoredDecisions(): Promise<number>;
 }
 
+/**
+ * Knowledge intake (0.9.0): sources' details (a source is a Doc with source 'intake'), the claims and questions drawn
+ * from them, the people who said them, and conflicts between what agents may be told. Texts are redacted at the door.
+ * Writes given `expect` compare fingerprints (claimFingerprint, conflictFingerprint) and throw TargetChangedError,
+ * writing nothing, when the record changed since.
+ */
+export interface IntakeStore {
+  /** Set a source's details and who attended (replacing the earlier list). False when there is no such Doc. */
+  upsertMeta(meta: IntakeMetaInput): Promise<boolean>;
+  /** The details of these sources, those that have any, in any order. */
+  metas(docIds: string[]): Promise<IntakeMeta[]>;
+  /**
+   * The window extraction goes on from, and the upload it belongs to: windowsDone, or 0 when the Doc was replaced since
+   * the last save. Null when the Doc or its details are gone.
+   */
+  nextWindow(docId: string): Promise<{ window: number; version: string } | null>;
+  /**
+   * Save one window's claims (proposed) and questions (open), idempotently: saving it again updates the records it
+   * made while they are still proposed or open, and removes those of them the new save no longer has; a claim already
+   * decided stays as it was. The first save of a new upload removes the old upload's undecided records. Claims take
+   * the source's project, run and sandbox flag. False when the Doc is gone or was replaced (`version`).
+   */
+  saveWindow(docId: string, w: WindowSave): Promise<boolean>;
+  /**
+   * A source's text is going away (delete, keeping accepted facts): its undecided claims (proposed, rejected), all of
+   * its questions and its details go. Accepted and superseded claims stay. keep: claims that stay whatever their status (the ones a remove_source decision rejected, which its rollback restores). Returns how many claims and questions went.
+   */
+  removeSource(docId: string, o?: { keep?: string[] }): Promise<{ claim: number; question: number }>;
+
+  /** Newest first, then by id. Default limit 100. */
+  listClaims(f?: ClaimFilter): Promise<Claim[]>;
+  claim(id: string): Promise<Claim | null>;
+  /**
+   * The owner's review: only the patch's keys change; a status change records `by` and the time. With `expect`, only
+   * while the claim's fingerprint reads it. Null when the claim is gone.
+   */
+  decideClaim(id: string, patch: ClaimPatch, o: { by: string; expect?: string }): Promise<Claim | null>;
+  /** The k nearest claims by embedding (Neo4j's cosine score), nearest first. */
+  searchClaims(q: ClaimSearch): Promise<ClaimHit[]>;
+  /** Record REFINES / CORROBORATES links from claims; existing ones and those whose ends are missing are skipped. Returns how many are new. */
+  addLinks(links: ClaimLink[]): Promise<number>;
+  /** Links with any of these records at either end. */
+  links(ids: string[]): Promise<ClaimLink[]>;
+
+  /** Everyone, owner first, then by display name and id; status: only these. */
+  people(f?: { status?: Person['status'][] }): Promise<Person[]>;
+  person(id: string): Promise<Person | null>;
+  /** The owner's Person, created confirmed (with this name as an alias) the first time. */
+  ensureOwner(displayName: string): Promise<Person>;
+  /**
+   * The Person a speaker label or participant name stands for (aliasNorm). With create, a name nobody has makes a
+   * proposed Person with it as the alias. Null for an empty name, or no match without create.
+   */
+  resolveAlias(name: string, o?: { create?: boolean }): Promise<{ person: Person; created: boolean } | null>;
+  /** Rename, confirm, add or remove aliases. Throws AliasTakenError for another person's alias. Null when gone. */
+  updatePerson(id: string, patch: PersonPatch): Promise<Person | null>;
+  /**
+   * `mergedId` becomes `keepId`: its aliases, claims, questions and attendance move over, and it goes. Throws for a
+   * person and itself, and when the merged one is the owner. Null when either is gone.
+   */
+  mergePeople(keepId: string, mergedId: string): Promise<Person | null>;
+  /**
+   * The person becomes FORGOTTEN_NAME: aliases gone, undecided claims they said (proposed, rejected) gone; accepted ones
+   * stay, attributed to the forgotten person. Throws for the owner. Null when gone.
+   */
+  forgetPerson(id: string): Promise<{ person: Person; claimsRemoved: number } | null>;
+
+  /** Newest first, then by id. Default limit 100. */
+  listQuestions(f?: QuestionFilter): Promise<Question[]>;
+  question(id: string): Promise<Question | null>;
+  /** A question found outside the windows (a contradiction inside one source), open; idempotent on its source and text. */
+  addQuestion(q: QuestionDraft & { docId: string; projectKey: string | null; run?: RunTag | null }): Promise<{ question: Question; created: boolean }>;
+  /** Only the patch's keys change; records `by` and the time. Null when gone. */
+  updateQuestion(id: string, patch: QuestionPatch, by: string): Promise<Question | null>;
+  /**
+   * The owner's answer: an accepted claim (docId answerSourceOf(id), decided by `by`, the question's project), and the
+   * question answered by it. Answering again replaces the answer. Null when the question is gone.
+   */
+  answerQuestion(id: string, answer: AnswerInput, by: string): Promise<{ question: Question; claim: Claim } | null>;
+
+  /**
+   * Record a conflict, one per pair (conflictIdOf). Found again: the stored one, unchanged (created false), except a
+   * dismissed one whose side changed since (a fingerprint differs), which opens again with the new sides, signals and
+   * judge (created true).
+   */
+  openConflict(input: ConflictInput): Promise<{ conflict: Conflict; created: boolean }>;
+  conflict(id: string): Promise<Conflict | null>;
+  /** Newest first, then by id. Default limit 100. */
+  listConflicts(f?: ConflictFilter): Promise<Conflict[]>;
+  /**
+   * The conflicts naming any of these records as a side, or the claim one of these facts was accepted from (default: open
+   * ones only), in one read.
+   */
+  conflictsFor(ids: string[], o?: { status?: Conflict['status'][] }): Promise<Conflict[]>;
+  /**
+   * A decision's write: every claim and conflict compared with its `expect` before any is written, then all written,
+   * with the SUPERSEDED_BY links added and removed, in one transaction.
+   */
+  writeSnapshots(writes: IntakeSnapshotWrite[], o?: { supersede?: Supersession[]; unsupersede?: Supersession[] }): Promise<void>;
+  /** SUPERSEDED_BY links with any of these records at either end. */
+  supersessions(ids: string[]): Promise<Supersession[]>;
+
+  /**
+   * The current secret and contact rules (core redactStoredIntake, redactIntakeText) over every intake source's title and
+   * chunks, every claim's statement, quote and about, and every question's text and quote, in place. Run once per pair
+   * of REDACTION_VERSION and INTAKE_REDACTION_VERSION. Returns how many sources, claims and questions changed.
+   */
+  redactStoredIntake(): Promise<IntakeRedacted>;
+  /** The claims, questions and conflicts a run made. */
+  runItems(run: string): Promise<IntakeRunItem[]>;
+  /** Delete what runItems lists, except `keep` (record ids). Returns how many of each kind went. */
+  removeRun(run: string, keep?: string[]): Promise<IntakeRemoved>;
+}
+
 /** LessonSignals and the lesson's own fields the holdout comparison filters on (DecisionsStore.listSignals). */
 export type LessonSignalsRow = LessonSignals & { projectKey: string | null; source: Lesson['source']; status: LessonStatus; run: string | null; sandbox: boolean };
 
@@ -1033,6 +1160,7 @@ export interface Store {
   readonly chats: ChatStore;
   readonly runs: RunsStore;
   readonly decisions: DecisionsStore;
+  readonly intake: IntakeStore;
   /**
    * Create or upgrade the schema (Neo4j constraints and indexes; Postgres migrations). Safe from two services at once.
    * `log`: where a Neo4j upgrade left to run in the background reports progress and failures.

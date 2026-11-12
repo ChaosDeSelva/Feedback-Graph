@@ -281,3 +281,26 @@ test('the agent MCP tool list and instructions stay within an agent context budg
   const init = await (await app.request('/mcp', rpc({ method: 'initialize', params: { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'plain', version: '1' } } }))).json() as { result: { instructions: string } };
   expect(JSON.stringify((JSON.parse(list) as { result: unknown }).result).length + init.result.instructions.length).toBeLessThan(9_800);
 });
+
+test('with INTAKE_ENABLED, find_contradictions (read-only) and submit_notes (a write, capped at 200 KB) are listed; without it, neither', async () => {
+  const submitted: object[] = [];
+  const intake = {
+    store: { conflictsFor: async () => [], claim: async () => null, person: async () => null, metas: async () => [] },
+    fact: async () => null, lesson: async () => null,
+    submit: async (_p: unknown, n: object) => { submitted.push(n); return { id: 'doc:demo:intake:paste-1', utterances: 2 }; },
+  } as ContextDeps['intake'];
+  const app = createApp(repo, { context: { ...ctx, intake } });
+  const tools = ((await (await app.request('/mcp', rpc({ method: 'tools/list', params: {} }))).json()) as { result: { tools: { name: string; annotations: Record<string, boolean> }[] } }).result.tools;
+  expect(tools.find((t) => t.name === 'find_contradictions')!.annotations).toMatchObject({ readOnlyHint: true, destructiveHint: false });
+  expect(tools.find((t) => t.name === 'submit_notes')!.annotations).toMatchObject({ readOnlyHint: false, destructiveHint: false, idempotentHint: false });
+  const call = async (name: string, args: object) => ((await (await app.request('/mcp', rpc({ method: 'tools/call', params: { name, arguments: args } }))).json()) as { result: { isError?: boolean; content: { text: string }[] } }).result;
+  const ok = await call('submit_notes', { cwd: '/Users/j/Vibe/demo', notes: 'Bo: ship Friday\nAna: agreed' });
+  expect(ok.isError).toBeFalsy();
+  expect(submitted).toEqual([expect.objectContaining({ text: 'Bo: ship Friday\nAna: agreed', origin: 'agent:unknown' })]);
+  const big = await call('submit_notes', { cwd: '/Users/j/Vibe/demo', notes: 'x'.repeat(200 * 1024 + 1) });
+  expect(big.isError).toBe(true);
+  expect(submitted).toHaveLength(1);
+  const without = ((await (await createApp(repo, { context: ctx }).request('/mcp', rpc({ method: 'tools/list', params: {} }))).json()) as { result: { tools: { name: string }[] } }).result.tools.map((t) => t.name);
+  expect(without).not.toContain('find_contradictions');
+  expect(without).not.toContain('submit_notes');
+});

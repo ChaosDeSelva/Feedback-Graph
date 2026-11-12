@@ -1,5 +1,5 @@
 import { readdirSync, readFileSync } from 'node:fs';
-import { ACTIVITY_KINDS, DECISION_MODES, DECISION_NOTE_REASONS, DECISION_STATUSES, DECISION_TARGET_KINDS, DECISION_TARGET_ROLES, DECISION_TIERS, DECISION_TYPES, CAUSES, CHAT_PROVIDERS, CHAT_TURN_STATUSES, FACT_EVIDENCE, FACT_KINDS, FACT_ORIGINS, RUN_PRINCIPALS, SESSION_STATES, SYMBOL_KINDS, TURN_LABELS, type CandidateStatus, type FeedbackSource, type ContextKind, type DocSource, type FeedbackStatus, type LessonScope, type LessonSource, type LessonStatus, type Outcome, type ScanStatus } from '@fb/core';
+import { ACTIVITY_KINDS, CLAIM_LINK_RELS, CLAIM_STATUSES, CLAIM_TYPES, CONFLICT_KINDS, CONFLICT_SIDE_KINDS, CONFLICT_STATUSES, INTAKE_FORMATS, INTAKE_KINDS, PERSON_STATUSES, QUESTION_KINDS, QUESTION_STATUSES, DECISION_MODES, DECISION_NOTE_REASONS, DECISION_STATUSES, DECISION_TARGET_KINDS, DECISION_TARGET_ROLES, DECISION_TIERS, DECISION_TYPES, DECISION_AUTHORS, LOOP_DECISION_TYPES, CAUSES, CHAT_PROVIDERS, CHAT_TURN_STATUSES, FACT_EVIDENCE, FACT_KINDS, FACT_ORIGINS, RUN_PRINCIPALS, SESSION_STATES, SYMBOL_KINDS, TURN_LABELS, type CandidateStatus, type FeedbackSource, type ContextKind, type DocSource, type FeedbackStatus, type LessonScope, type LessonSource, type LessonStatus, type Outcome, type ScanStatus } from '@fb/core';
 import { expect, test } from 'vitest';
 import { renderMigration } from './migrate.ts';
 
@@ -39,11 +39,13 @@ test('CHECK constraints allow exactly the values the TypeScript types allow (add
   expect(allowed('chat_turns_status_check')).toEqual([...CHAT_TURN_STATUSES].sort());
   expect(allowed('chat_conversations_provider_check')).toEqual([...CHAT_PROVIDERS].sort());
   expect(allowed('run_owners_principal_check')).toEqual([...RUN_PRINCIPALS].sort());
-  expect(allowed('docs_source_check')).toEqual(all<DocSource>()(['upload', 'github', 'linear']));
+  expect(allowed('docs_source_check')).toEqual(all<DocSource>()(['upload', 'github', 'linear', 'intake']));
   expect(allowed('facts_origin_check')).toEqual([...FACT_ORIGINS].sort());
   expect(allowed('facts_evidence_check')).toEqual([...FACT_EVIDENCE].sort());
   expect(allowed('decisions_type_check')).toEqual([...DECISION_TYPES].sort());
-  expect(allowed('loop_calibration_type_check')).toEqual([...DECISION_TYPES].sort());
+  // The owner's own types (resolve_conflict) are never calibrated.
+  expect(allowed('loop_calibration_type_check')).toEqual([...LOOP_DECISION_TYPES].sort());
+  expect(allowed('decisions_author_check')).toEqual([...DECISION_AUTHORS].sort());
   expect(allowed('decisions_status_check')).toEqual([...DECISION_STATUSES].sort());
   expect(allowed('decisions_tier_check')).toEqual([...DECISION_TIERS].sort());
   expect(allowed('decisions_mode_check')).toEqual([...DECISION_MODES].sort());
@@ -51,6 +53,20 @@ test('CHECK constraints allow exactly the values the TypeScript types allow (add
   expect(allowed('decision_targets_role_check')).toEqual([...DECISION_TARGET_ROLES].sort());
   expect(allowed('decision_notes_verdict_check')).toEqual(['agree', 'disagree']);
   expect(allowed('decision_notes_reason_check')).toEqual([...DECISION_NOTE_REASONS].sort());
+  expect(allowed('people_status_check')).toEqual([...PERSON_STATUSES].sort());
+  expect(allowed('intake_sources_kind_check')).toEqual([...INTAKE_KINDS].sort());
+  expect(allowed('intake_sources_format_check')).toEqual([...INTAKE_FORMATS].sort());
+  expect(allowed('claims_type_check')).toEqual([...CLAIM_TYPES].sort());
+  expect(allowed('claims_status_check')).toEqual([...CLAIM_STATUSES].sort());
+  expect(allowed('questions_kind_check')).toEqual([...QUESTION_KINDS].sort());
+  expect(allowed('questions_status_check')).toEqual([...QUESTION_STATUSES].sort());
+  expect(allowed('conflicts_kind_check')).toEqual([...CONFLICT_KINDS].sort());
+  expect(allowed('conflicts_status_check')).toEqual([...CONFLICT_STATUSES].sort());
+  expect(allowed('conflict_sides_kind_check')).toEqual([...CONFLICT_SIDE_KINDS].sort());
+  expect(allowed('supersessions_from_kind_check')).toEqual([...CONFLICT_SIDE_KINDS].sort());
+  expect(allowed('supersessions_to_kind_check')).toEqual([...CONFLICT_SIDE_KINDS].sort());
+  expect(allowed('claim_links_to_kind_check')).toEqual([...CONFLICT_SIDE_KINDS].sort());
+  expect(allowed('claim_links_rel_check')).toEqual([...CLAIM_LINK_RELS].sort());
 });
 
 test('the embedding dimension is filled in from config, and only a sane one is accepted', () => {

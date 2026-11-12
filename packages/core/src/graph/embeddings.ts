@@ -9,7 +9,7 @@ export const LEGACY_EMBED_MODEL = 'nomic-embed-text';
 const SOURCES: { label: string; text: string; where?: string }[] = [
   { label: 'Lesson', text: `n.title + '\\n' + n.rule + '\\nApplies when: ' + coalesce(n.appliesWhen, '')` },
   { label: 'Miss', text: `n.missed + '\\n' + coalesce(n.causeExplanation, '')` },
-  { label: 'Fact', text: `n.path + ': ' + n.statement`, where: 'n.current = true' },
+  { label: 'Fact', text: `CASE WHEN n.origin = 'claim' OR n.path STARTS WITH 'conflict:' THEN n.statement ELSE n.path + ': ' + n.statement END`, where: 'n.current = true' },
   { label: 'Chunk', text: 'n.text' },
 ];
 

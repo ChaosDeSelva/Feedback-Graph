@@ -1,9 +1,13 @@
 import { z, type ZodTypeAny } from 'zod';
+import { DECISION_AUTHORS, DECISION_TARGET_KINDS, EVIDENCE_KINDS } from '@fb/core';
 import { appSchemas } from './app.ts';
 import { chatSchemas } from './chat.ts';
 import { cloudSchemas } from './cloud.ts';
 import { loopSchemas } from './decisions.ts';
 import { importSchemas } from './import.ts';
+import { intakeSchemas } from './intake.ts';
+import { intakeReviewSchemas as ir } from './intakeReview.ts';
+import { conflictSchemas } from './conflicts.ts';
 import { integrationSchemas } from './integrations.ts';
 import { OWNER_ROUTES } from './operator.ts';
 import { runSchemas } from './runs.ts';
@@ -143,6 +147,22 @@ const SCHEMAS: Record<string, JsonSchema> = {
     id: str, projectKey: str, source: str, ref: str, title: str, url: nullable(str), addedAt: time, addedBy: nullable(str), chunks: int,
     kind: { type: 'string', enum: ['text', 'image'] }, mediaType: nullable(str), read: nullable(loose('How the worker read it: status, facts, error')),
   }, ['id', 'projectKey', 'source', 'ref', 'title', 'addedAt', 'chunks']),
+  IntakeSource: {
+    allOf: [ref('Doc'), obj({
+      intake: nullable(obj({
+        docId: str, kind: { type: 'string', enum: ['transcript', 'notes', 'doc'] }, format: { type: 'string', enum: ['txt', 'md', 'vtt', 'srt'] }, occurredAt: nullable(str), origin: nullable(str),
+        private: bool, participants: arrayOf(str), windowsDone: int, windowsTotal: nullable(int),
+      }, ['docId', 'kind', 'format', 'occurredAt', 'origin', 'private', 'participants', 'windowsDone', 'windowsTotal'])),
+      embed: loose('While it is stored in the background: status pending or failed, error, chunks'),
+    }, ['intake'])],
+  },
+  IntakeSourceDetail: {
+    allOf: [ref('IntakeSource'), obj({
+      text: nullable(str),
+      utterances: arrayOf(obj({ idx: int, speaker: nullable(str), startMs: nullable(int), text: str, offset: int }, ['idx', 'speaker', 'startMs', 'text', 'offset'])),
+      claims: arrayOf(obj({ id: str, type: str, status: str, span: nullable(obj({ utt: int, start: int, end: int }, ['utt', 'start', 'end'])) }, ['id', 'type', 'status', 'span'])),
+    }, ['text', 'utterances', 'claims'])],
+  },
   ProjectLink: obj({
     id: str, a: str, b: str, relation: { type: 'string', enum: ['depends_on', 'same_product', 'shares_code', 'related'] }, note: str,
     status: { type: 'string', enum: ['suggested', 'confirmed', 'dismissed'] }, source: { type: 'string', enum: ['detected', 'you'] }, score: num,
@@ -190,8 +210,8 @@ const SCHEMAS: Record<string, JsonSchema> = {
   Patterns: loose('Recurring patterns'),
   LinearTeam: obj({ id: str, key: str, name: str }),
   // The learning loop (decisions.ts, docs/learning-loop-api.md). Optional Decision fields are absent rather than null.
-  TargetSnapshot: obj({ kind: { type: 'string', enum: ['lesson', 'fact', 'miss', 'candidate', 'project'] }, id: str, fields: { type: 'object', additionalProperties: true, description: 'The target\'s fields as stored (redacted)' }, fingerprint: str }),
-  EvidenceRef: obj({ kind: { type: 'string', enum: ['activity', 'miss', 'lesson', 'fact', 'candidate', 'check', 'session'] }, id: str, role: str, weight: num, observedAt: str }),
+  TargetSnapshot: obj({ kind: { type: 'string', enum: [...DECISION_TARGET_KINDS] }, id: str, fields: { type: 'object', additionalProperties: true, description: 'The target\'s fields as stored (redacted)' }, fingerprint: str }),
+  EvidenceRef: obj({ kind: { type: 'string', enum: [...EVIDENCE_KINDS] }, id: str, role: str, weight: num, observedAt: str }),
   Decision: obj({
     id: str, type: str, projectKey: nullable(str),
     targets: arrayOf(obj({ kind: str, id: str, role: { type: 'string', enum: ['primary', 'keeper', 'merged', 'created'] } })),
@@ -203,6 +223,7 @@ const SCHEMAS: Record<string, JsonSchema> = {
     dependsOn: arrayOf(str), supersededBy: str, createdAt: time, appliedAt: time, decidedAt: time,
     decidedBy: { type: 'string', description: "'loop:<v>', 'you' or 'operator:<name>'" },
     rollback: obj({ at: time, by: str, reason: nullable(str), note: nullable(str), cascade: arrayOf(str) }), ratifiedAt: time, ratifiedBy: str, syncHoldUntil: time,
+    author: { type: 'string', enum: [...DECISION_AUTHORS], description: 'loop, or owner: a change you made through a decision (a conflict resolved), never calibrated or counted as the loop\'s' },
   }, ['id', 'type', 'projectKey', 'targets', 'before', 'after', 'evidence', 'features', 'score', 'confidence', 'tier', 'mode', 'rationale', 'model', 'policyVersion', 'status', 'dependsOn', 'createdAt']),
   DecisionNote: obj({ id: str, decisionId: str, ts: time, by: str, text: str, verdict: nullable({ type: 'string', enum: ['agree', 'disagree'] }), reason: str }, ['id', 'decisionId', 'ts', 'by', 'text']),
   DecisionSummary: obj({ id: str, type: str, status: str, createdAt: time, projectKey: nullable(str), label: str }),
@@ -239,6 +260,34 @@ const SCHEMAS: Record<string, JsonSchema> = {
   }),
   JsonRpc: obj({ jsonrpc: { const: '2.0' }, id: { anyOf: [str, int, { type: 'null' }] }, method: str, params: { type: 'object', additionalProperties: true } }, ['jsonrpc', 'method'], 'A JSON-RPC 2.0 message (MCP Streamable HTTP)'),
   JsonRpcResult: loose('A JSON-RPC 2.0 answer: result, or error { code, message }'),
+  // Knowledge intake's review (intakeReview.ts, 0.9.0).
+  Claim: obj({
+    id: str, projectKey: nullable(str), docId: str, window: nullable(int), span: nullable(obj({ utt: int, start: int, end: int })),
+    type: { type: 'string', enum: ['fact', 'decision', 'opinion', 'plan', 'commitment'] }, statement: str, quote: str, speakerId: nullable(str), assertedAt: nullable(str),
+    confidence: num, scope: obj({ area: nullable(str), files: arrayOf(str) }), about: str, due: nullable(str), flags: arrayOf(str),
+    status: { type: 'string', enum: ['proposed', 'accepted', 'rejected', 'superseded'] }, decidedBy: nullable(str), decidedAt: nullable(str), factId: nullable(str),
+    createdAt: time, run: nullable(str), sandbox: bool,
+    conflicts: arrayOf(obj({ id: str, with: obj({ kind: str, id: str }) })),
+  }, ['id', 'projectKey', 'docId', 'type', 'statement', 'quote', 'speakerId', 'status', 'factId', 'createdAt']),
+  Question: obj({
+    id: str, projectKey: nullable(str), docId: str, window: nullable(int), text: str, kind: { type: 'string', enum: ['unanswered', 'contradictory', 'needs_owner'] },
+    quote: nullable(str), askedBy: nullable(str), assignee: nullable(str), status: { type: 'string', enum: ['open', 'assigned', 'answered', 'dismissed'] },
+    answerClaimId: nullable(str), decidedBy: nullable(str), decidedAt: nullable(str), createdAt: time, run: nullable(str), sandbox: bool,
+  }, ['id', 'projectKey', 'docId', 'text', 'kind', 'status', 'createdAt']),
+  ConflictSide: obj({
+    kind: { type: 'string', enum: ['claim', 'fact', 'lesson'] }, id: str, fingerprint: str, assertedAt: nullable(str), text: str, quote: nullable(str),
+    type: nullable(str), status: nullable(str), speaker: nullable(obj({ id: str, displayName: str, isOwner: bool })), origin: nullable(str), path: nullable(str),
+    docId: nullable(str), source: nullable(loose('The claim\'s intake source: docId, kind, occurredAt, origin')), agentsSee: bool, gone: bool,
+  }, ['kind', 'id', 'text', 'agentsSee', 'gone']),
+  Conflict: obj({
+    id: str, kind: { type: 'string', enum: ['disagreement', 'supersession'] }, status: { type: 'string', enum: ['open', 'resolved', 'dismissed'] },
+    projectKey: nullable(str), a: loose('Side A as found: kind, id, fingerprint, assertedAt'), b: loose('Side B as found'), signals: arrayOf(loose('A pre-filter finding')),
+    judge: nullable(loose('The judge\'s answer: relation, aQuote, bQuote, explanation, confidence, model')),
+    resolution: nullable(obj({ choice: { type: 'string', enum: ['a', 'b', 'both', 'none'] }, note: nullable(str), reason: nullable(str), createdFactId: nullable(str) })),
+    decisionId: nullable(str), createdAt: time, resolvedAt: nullable(str), resolvedBy: nullable(str), run: nullable(str), sandbox: bool,
+    fingerprint: str, sides: obj({ a: ref('ConflictSide'), b: ref('ConflictSide') }),
+  }, ['id', 'kind', 'status', 'projectKey', 'a', 'b', 'fingerprint', 'sides']),
+  Person: obj({ id: str, displayName: str, isOwner: bool, status: { type: 'string', enum: ['proposed', 'confirmed', 'forgotten'] }, aliases: arrayOf(str), claims: int, createdAt: time }),
 };
 
 const QUEUED = obj({ queued: { const: true } });
@@ -322,6 +371,16 @@ const routes = (a = appSchemas): Record<string, Partial<Record<Method, Route>>> 
   },
   '/api/docs/{id}/image': { GET: { tag: 'docs', summary: 'An uploaded image', response: 'the image bytes', type: 'image/*' } },
   '/api/docs/{id}/reread': { POST: { tag: 'docs', summary: 'Read a document whose reading failed again', response: 'no content', status: 204 } },
+  // Knowledge intake: only while INTAKE_ENABLED is set (404 otherwise).
+  '/api/intake': {
+    POST: { tag: 'intake', summary: 'Add a source (a transcript, notes or a doc: txt, md, vtt or srt) to be read into claims for review; credentials and contact details are redacted before it is stored, and its text is never served to agents. Over 64 chunks it answers 202 { ..., pending: true } and is stored in the background. INTAKE_ENABLED only', body: intakeSchemas.IntakeUpload, response: '{ id, chunks, format, utterances }', status: 201 },
+  },
+  '/api/intake/sources': { GET: { tag: 'intake', summary: 'Intake sources, newest first, with their details (kind, format, occurredAt, origin, private, participants, windows read)', query: intakeSchemas.SourcesQuery, response: 'IntakeSource[]' } },
+  '/api/intake/sources/{id}': {
+    GET: { tag: 'intake', summary: 'One source: its details, its text as the worker reads it, its utterances, and the span of each claim drawn from it', response: 'IntakeSourceDetail' },
+    DELETE: { tag: 'intake', summary: 'Remove a source: its text, chunks, details, unaccepted claims and questions. keep=facts (default) keeps accepted claims and their facts; keep=none is refused (409) while any accepted claim is a fact', query: intakeSchemas.DeleteQuery, response: '{ removed }' },
+  },
+  '/api/intake/sources/{id}/reread': { POST: { tag: 'intake', summary: 'Read a source whose reading failed again', response: 'no content', status: 204 } },
   '/api/projects/{key}/links': { GET: { tag: 'links', summary: 'A project\'s links to other shown projects', response: 'ProjectLink[]' } },
   '/api/links': { PUT: { tag: 'links', summary: 'Confirm, dismiss or edit a link between two projects', body: a.LinkRequest, response: 'ProjectLink' } },
   '/api/links/{id}': { DELETE: { tag: 'links', summary: 'Remove a link', response: 'no content', status: 204 } },
@@ -394,6 +453,27 @@ const routes = (a = appSchemas): Record<string, Partial<Record<Method, Route>>> 
     DELETE: { tag: 'activity', summary: 'Clean up a run: a dry run unless dryRun is false; removes only what the run wrote and nobody outside it touched since; logged in Activity', body: runSchemas.CleanupBody, response: 'CleanupPlan & { removed }' },
   },
 
+  // Knowledge intake's review (intakeReview.ts): only while INTAKE_ENABLED; reads refuse the agent credential (API_TOKEN).
+  '/api/claims': { GET: { tag: 'intake', summary: 'Claims drawn from what people said, newest first, filtered; with the open conflicts naming each; paged by offset (x-next-offset header)', query: ir.ClaimsQuery, response: 'Claim[]' } },
+  '/api/claims/{id}': {
+    GET: { tag: 'intake', summary: 'One claim: its fingerprint (for expect), who said it and its source\'s details', response: '{ claim, fingerprint, speaker, source }' },
+    PATCH: { tag: 'intake', summary: 'Edit, re-type, accept or reject a claim; accepting one that is not an opinion files it as a project fact (origin claim); 409 when it changed since (expect) or is already a fact', body: ir.ClaimPatchBody, response: '{ claim, fact }' },
+  },
+  '/api/claims/decisions': { POST: { tag: 'intake', summary: 'Accept or reject many claims, or every proposed claim of one source, each recorded on its own; one refused does not stop the rest', body: ir.ClaimDecisions, response: '{ results: [{ id, ok, status?, factId? | error? }] }' } },
+  '/api/questions': { GET: { tag: 'intake', summary: 'Questions a source left open, newest first, filtered; paged by offset (x-next-offset header)', query: ir.QuestionsQuery, response: 'Question[]' } },
+  '/api/questions/{id}': {
+    GET: { tag: 'intake', summary: 'One question with who asked it, who it is assigned to, its answer and its source\'s details', response: '{ question, askedBy, assignee, answer, source }' },
+    PATCH: { tag: 'intake', summary: 'Assign a question to a person (null: unassign), reopen or dismiss it', body: ir.QuestionPatchBody, response: 'Question' },
+  },
+  '/api/questions/{id}/answer': { POST: { tag: 'intake', summary: 'Answer a question: an accepted claim said by you; one that is not an opinion is filed as a project fact', body: ir.AnswerBody, response: '{ question, claim, fact }', status: 201 } },
+  '/api/people': { GET: { tag: 'intake', summary: 'Everyone who said something, you first, with aliases and claim counts', query: ir.PeopleQuery, response: 'Person[]' } },
+  '/api/people/{id}': { PATCH: { tag: 'intake', summary: 'Rename, confirm, add or remove aliases; 409 for another person\'s alias (merge them instead)', body: ir.PersonPatchBody, response: 'Person' } },
+  '/api/people/merge': { POST: { tag: 'intake', summary: 'Merge one person into another: aliases, claims, questions and attendance move over', body: ir.MergeBody, response: 'Person' } },
+  '/api/people/{id}/forget': { POST: { tag: 'intake', summary: 'Forget a person: name and aliases gone, claims not accepted removed; cannot be undone', body: ir.ForgetBody, response: '{ person, claimsRemoved }' } },
+
+  '/api/conflicts': { GET: { tag: 'intake', summary: 'Conflicts between things agents may be told, newest first, filtered; each with both sides, who said them, when, and whether agents see them; paged by offset (x-next-offset header)', query: conflictSchemas.ConflictsQuery, response: 'Conflict[]' } },
+  '/api/conflicts/{id}': { GET: { tag: 'intake', summary: 'One conflict with both sides and the resolve_conflict decision that settled it (roll that back to undo)', response: 'Conflict & { decision }' } },
+  '/api/conflicts/{id}/resolve': { POST: { tag: 'intake', summary: 'Settle a conflict: A or B is true (the other superseded, never deleted), both partly (a note; optionally a reconciled statement filed as your fact), or not a conflict; recorded as a resolve_conflict decision by you, undone by rolling it back; 409 when it changed since (expect)', body: conflictSchemas.ResolveBody, response: '{ conflict, decision }' } },
   '/api/chats': {
     GET: { tag: 'ask', summary: 'Ask conversations of the shown projects', query: chatSchemas.ListChats, response: 'ChatConversation[]' },
     POST: { tag: 'ask', summary: 'Start a conversation', body: chatSchemas.CreateChat, response: 'ChatConversation', status: 201 },
@@ -409,6 +489,13 @@ const routes = (a = appSchemas): Record<string, Partial<Record<Method, Route>>> 
 
 /** The 2xx bodies `response` describes in words, as JSON Schema (by "METHOD path"). */
 const SCHEMA_OF: Record<string, JsonSchema> = {
+  'GET /api/claims/{id}': obj({ claim: ref('Claim'), fingerprint: str, speaker: nullable(ref('Person')), source: nullable(loose('The source\'s details (IntakeMeta)')) }),
+  'PATCH /api/claims/{id}': obj({ claim: ref('Claim'), fact: nullable(ref('StoredFact')) }),
+  'POST /api/conflicts/{id}/resolve': obj({ conflict: ref('Conflict'), decision: ref('Decision') }, ['conflict', 'decision']),
+  'POST /api/claims/decisions': obj({ results: arrayOf(obj({ id: str, ok: bool, status: str, factId: nullable(str), error: str }, ['id', 'ok'])) }),
+  'GET /api/questions/{id}': obj({ question: ref('Question'), askedBy: nullable(ref('Person')), assignee: nullable(ref('Person')), answer: nullable(ref('Claim')), source: nullable(loose('The source\'s details (IntakeMeta)')) }),
+  'POST /api/questions/{id}/answer': obj({ question: ref('Question'), claim: ref('Claim'), fact: nullable(ref('StoredFact')) }),
+  'POST /api/people/{id}/forget': obj({ person: ref('Person'), claimsRemoved: int }),
   'GET /api/health': obj({ ok: { type: 'boolean' } }),
   'GET /api/ready': obj({ ok: bool, store: { type: 'string', enum: ['neo4j', 'postgres'] } }, ['ok']),
   'GET /api/events': { type: 'string', description: 'text/event-stream: events stage, pipeline, scan, chat, activity; data is JSON' },
@@ -429,6 +516,8 @@ const SCHEMA_OF: Record<string, JsonSchema> = {
   'GET /api/projects/{key}/facts': { anyOf: [arrayOf(ref('StoredFact')), arrayOf(ref('FactHit'))], description: 'StoredFact[]; with ?q= the search hits, best first' },
   'POST /api/projects/{key}/docs': obj({ id: str, chunks: int }),
   'GET /api/docs/{id}/image': { type: 'string', format: 'binary' },
+  'POST /api/intake': obj({ id: str, chunks: int, format: { type: 'string', enum: ['txt', 'md', 'vtt', 'srt'] }, utterances: int, pending: bool }, ['id', 'chunks', 'format', 'utterances']),
+  'DELETE /api/intake/sources/{id}': obj({ removed: obj({ claim: int, question: int, facts: int, keep: { type: 'string', enum: ['facts', 'none'] } }, ['claim', 'question', 'facts', 'keep']), decision: nullable({ type: 'object' }) }, ['removed', 'decision']),
   'GET /api/projects/{key}/codemap/hotspots': obj({ meta: nullable(loose('The map: files, symbols, imports, built at')), capped: bool, hotspots: arrayOf(ref('Hotspot')) }),
   'POST /api/projects/{key}/codemap/rebuild': QUEUED,
   'POST /api/settings/cleanup': obj({ removed: arrayOf(str), nodesRemoved: int }),

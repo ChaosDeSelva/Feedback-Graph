@@ -12,7 +12,7 @@ import { retryDeadlock, type GraphRepo } from './repo.ts';
  */
 const DECISION = `d {.id, .type, .projectKey, .targets, .before, .after, .evidence, .features, .score, .confidence, .tier, .mode,
   .rationale, .model, .policyVersion, .status, .dependsOn, .supersededBy, .createdAt, .appliedAt, .decidedAt, .decidedBy,
-  .rollback, .ratifiedAt, .ratifiedBy, .syncHoldUntil}`;
+  .rollback, .ratifiedAt, .ratifiedBy, .syncHoldUntil, .author}`;
 const NOTE = 'n {.id, .decisionId, .ts, .by, .text, .verdict, .reason}';
 const CALIBRATION = 'c {.type, .band, .policyVersion, .alpha, .beta, .n, .updatedAt}';
 /** Take the node's write lock before reading what a compare-and-set compares (docs.ts does the same). */
@@ -27,6 +27,8 @@ const decisionOf = (p: Record<string, any>): Decision => ({
   dependsOn: p.dependsOn, supersededBy: p.supersededBy, createdAt: p.createdAt, appliedAt: p.appliedAt,
   decidedAt: p.decidedAt, decidedBy: p.decidedBy, rollback: json(p.rollback), ratifiedAt: p.ratifiedAt,
   ratifiedBy: p.ratifiedBy, syncHoldUntil: p.syncHoldUntil,
+  // Decisions before 0.9.0 have none: the loop's.
+  author: p.author ?? 'loop',
 });
 
 /** DecisionsStore.count's groups over decision d: the ISO week of its createdAt (stored as UTC text) as `2026-W45`. */
@@ -45,6 +47,7 @@ function decisionMatch(f: DecisionFilter, p: Record<string, unknown>): string {
   const add = (name: string, v: unknown, cond: string) => { p[name] = v; w.push(cond); };
   if (f.status) add('status', f.status, 'd.status IN $status');
   if (f.type) add('type', f.type, 'd.type = $type');
+  if (f.author) add('author', f.author, "coalesce(d.author, 'loop') = $author");
   if (f.projectKey !== undefined) add('projectKey', f.projectKey, 'd.projectKey = $projectKey');
   if (f.projectKeys) add('projectKeys', f.projectKeys, '(d.projectKey IS NULL OR d.projectKey IN $projectKeys)');
   if (f.mode) add('mode', f.mode, 'd.mode = $mode');
@@ -70,7 +73,7 @@ function decisionMatch(f: DecisionFilter, p: Record<string, unknown>): string {
 }
 
 /** Edges to the records a decision targets and rests on, where they exist (the properties are the record). */
-const TARGET_NODES = [['lesson', 'Lesson', 'id'], ['fact', 'Fact', 'id'], ['miss', 'Miss', 'id'], ['candidate', 'Candidate', 'id'], ['project', 'Project', 'key']] as const;
+const TARGET_NODES = [['lesson', 'Lesson', 'id'], ['fact', 'Fact', 'id'], ['miss', 'Miss', 'id'], ['candidate', 'Candidate', 'id'], ['project', 'Project', 'key'], ['claim', 'Claim', 'id'], ['conflict', 'Conflict', 'id']] as const;
 
 /**
  * The learning loop's decisions as (:Decision) nodes: -[:TARGETS {role}]-> the records decided on, -[:EVIDENCE]-> the
@@ -92,7 +95,7 @@ export class DecisionsRepo implements DecisionsStore {
       targets: JSON.stringify(d.targets), targetIds: d.targets.map((t) => t.id), before: JSON.stringify(d.before), after: JSON.stringify(d.after),
       evidence: JSON.stringify(d.evidence), features: JSON.stringify(d.features), score: d.score, confidence: JSON.stringify(d.confidence),
       band: neo4j.int(d.confidence.band), rationale: d.rationale, model: d.model, policyVersion: neo4j.int(d.policyVersion),
-      dependsOn: d.dependsOn, createdAt: new Date().toISOString(),
+      dependsOn: d.dependsOn, createdAt: new Date().toISOString(), author: d.author ?? 'loop',
     };
     const rows = (kind: string, list: { kind: string }[]) => list.filter((x) => x.kind === kind);
     // Only the creator writes past the MERGE (it holds the new node's lock): a matcher that wrote too would race the
@@ -204,12 +207,14 @@ export class DecisionsRepo implements DecisionsStore {
 
   async addNote(decisionId: string, input: DecisionNoteInput): Promise<DecisionNote | null> {
     const note = await prepareNote(decisionId, input);
-    // seq: the notes already on the decision, counted under its lock, so two in the same millisecond keep their order.
-    // Concurrent notes on one decision can still deadlock on its relationship locks; Neo4j aborts one, which wrote
-    // nothing, and it is run again.
+    // seq: a counter on the decision, moved under its lock, so two in the same millisecond keep their order. Counting
+    // the notes already there (still how a decision noted before the counter starts it) gave a later note the seq of an
+    // earlier one now and then. Concurrent notes on one decision can still deadlock on its relationship locks; Neo4j
+    // aborts one, which wrote nothing, and it is run again.
     const [r] = await retryDeadlock(() => this.g.run(
-      `MATCH (d:Decision {id: $decisionId}) ${LOCK('d')} WITH d OPTIONAL MATCH (o:DecisionNote)-[:ON]->(d) WITH d, count(o) AS seq
-       CREATE (n:DecisionNote)-[:ON]->(d) SET n = $note, n.seq = seq RETURN ${NOTE} AS n`,
+      `MATCH (d:Decision {id: $decisionId}) ${LOCK('d')} WITH d OPTIONAL MATCH (o:DecisionNote)-[:ON]->(d) WITH d, count(o) AS had
+       SET d.noteSeq = coalesce(d.noteSeq, had - 1) + 1
+       CREATE (n:DecisionNote)-[:ON]->(d) SET n = $note, n.seq = d.noteSeq RETURN ${NOTE} AS n`,
       { decisionId, note },
     ), 12);
     return r ? r.get('n') : null;

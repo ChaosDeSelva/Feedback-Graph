@@ -4,6 +4,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { WebStandardStreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js';
 import { z } from 'zod';
 import { VERSION } from '@fb/core';
+import { findContradictions, NOTES_MAX_BYTES, submitNotes } from './agentIntake.ts';
 import { checkBeforeDone, getImpact, getModuleContext, getRecentSessions, getTaskContext, MAX_DEPTH, RECENT_MAX, reportFeedback, searchGraph, type ContextDeps } from './context.ts';
 
 /**
@@ -177,6 +178,43 @@ function buildServer(ctx: ContextDeps, client: string | undefined) {
     },
     safe(async (a) => text((await searchGraph({ ...a, client }, ctx)).markdown)),
   );
+
+  // Knowledge intake's agent tools, only while INTAKE_ENABLED.
+  if (ctx.intake) {
+    server.registerTool(
+      'find_contradictions',
+      {
+        ...read('Find contradictions'),
+        description:
+          'Before stating something as settled (a timeout, a version, a choice made): checks it against the facts and approved lessons agents are told on that scope, with no model, and lists what may contradict it (numbers, dates, versions, negations or named choices that differ) and the open conflicts there, which the developer has not settled. Send statement (what you are about to say is true) or topic.',
+        inputSchema: {
+          ...where,
+          statement: z.string().max(MAX.query).optional().describe('What you are about to state as true, in one sentence'),
+          topic: z.string().max(MAX.query).optional().describe('What it is about, when you have no statement yet'),
+          files: z.array(z.string().max(MAX.path)).max(50).optional().describe('Files it concerns (repo-relative)'),
+        },
+      },
+      safe(async (a) => text((await findContradictions({ ...a, client }, ctx)).markdown)),
+    );
+    server.registerTool(
+      'submit_notes',
+      {
+        ...write('Submit notes'),
+        description:
+          `Hand the developer notes worth keeping (what was decided, who said what, open questions) as a source to review: it is read into proposed claims, marked as submitted by an agent, and nothing from it reaches agents until the developer accepts it. Up to ${NOTES_MAX_BYTES / 1024} KB.`,
+        inputSchema: {
+          ...where,
+          notes: z.string().min(1).max(NOTES_MAX_BYTES).describe('The notes, as text or markdown (lines like "Name: what they said" keep who said it)'),
+          title: z.string().max(300).optional().describe('A short title for the source'),
+          occurred_at: z.string().max(40).regex(/^\d{4}-\d{2}-\d{2}/, 'a date (YYYY-MM-DD)').optional().describe('When what the notes describe happened (YYYY-MM-DD)'),
+        },
+      },
+      safe(async ({ occurred_at, ...a }) => {
+        const r = await submitNotes({ ...a, occurredAt: occurred_at ?? null, client }, ctx);
+        return { ...text(r.markdown), ...(r.isError && { isError: true }) };
+      }),
+    );
+  }
 
   return server;
 }

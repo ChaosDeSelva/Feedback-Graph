@@ -11,7 +11,8 @@ import { nearest } from './nearest.ts';
 import { VISIBLE_TO_RUN } from './runs.ts';
 import { runWriteOwner } from '../runs.ts';
 
-export type DocSource = 'upload' | 'github' | 'linear';
+/** intake: a knowledge intake source (a transcript, notes), with its details in IntakeStore. */
+export type DocSource = 'upload' | 'github' | 'linear' | 'intake';
 export type DocInput = { projectKey: string; source: DocSource; ref: string; title: string; url: string | null };
 /**
  * Reading an upload into facts (the worker's docs stage). pending: waiting (again after a failure, until retryAt);
@@ -65,6 +66,13 @@ export const MAX_IMAGE_BYTES = 8 * 1024 * 1024;
  */
 export const docIdOf = (d: Pick<DocInput, 'projectKey' | 'source' | 'ref'>, run?: RunTag | null) =>
   `doc${run?.sandbox ? `@${run.id}` : ''}:${d.projectKey}:${d.source}:${d.ref}`;
+/**
+ * Sources whose text is never served to agents: an intake source is what people said, reviewed as claims first. The
+ * searches behind get_task_context, search_graph and linked context pass it as searchDocs' excludeSources.
+ */
+export const AGENT_HIDDEN_DOC_SOURCES: readonly DocSource[] = ['intake'];
+/** DocsStore.searchDocs. excludeSources: chunks of documents with these sources are left out before the k nearest are taken. */
+export type DocSearch = { embedding: number[]; projectKey: string; k: number; run?: string | null; excludeSources?: readonly DocSource[] };
 export type DocHit = { docId: string; source: DocSource; ref: string; title: string; url: string | null; text: string; score: number; rankingScore?: number };
 
 /** Context that isn't code: uploaded documents, PR discussions, tickets. Stored as embedded chunks per document. */
@@ -119,16 +127,16 @@ export class DocsRepo implements DocsStore {
     return id;
   }
 
-  async nextDocToRead(now = new Date()): Promise<DocToRead | null> {
+  async nextDocToRead(now = new Date(), o: { intake?: boolean } = {}): Promise<DocToRead | null> {
     const [r] = await this.g.run(
-      `MATCH (d:Doc {readStatus: 'pending'}) WHERE coalesce(d.readRetryAt, '') <= $now
+      `MATCH (d:Doc {readStatus: 'pending'}) WHERE coalesce(d.readRetryAt, '') <= $now AND (coalesce(d.source, '') = 'intake') = $intake
        WITH d ORDER BY d.addedAt, d.id LIMIT 1
        OPTIONAL MATCH (d)-[:HAS_CHUNK]->(c:Chunk)
        WITH d, c ORDER BY c.idx
        WITH d, collect(c.text) AS texts
        OPTIONAL MATCH (d)-[:HAS_BLOB]->(b:DocBlob)
        RETURN d, texts, b`,
-      { now: now.toISOString() },
+      { now: now.toISOString(), intake: !!o.intake },
     );
     if (!r) return null;
     const p = r.get('d').properties;
@@ -202,6 +210,17 @@ export class DocsRepo implements DocsStore {
       { id, attempts: neo4j.int(attempts), error: redactSecrets(error).slice(0, 2000), retryAt, version: o.version ?? null },
     );
     return { attempts, retryAt };
+  }
+
+  async recordDocProgress(id: string, version: string, o: { done: boolean }): Promise<boolean> {
+    const [r] = await this.g.run(
+      `MATCH (d:Doc {id: $id}) WHERE d.addedAt = $version
+       SET d.readStatus = $status, d.readAttempts = 0, d.readError = null, d.readRetryAt = null,
+           d.readAt = CASE WHEN $done THEN $now ELSE d.readAt END
+       RETURN count(d) AS n`,
+      { id, version, status: o.done ? 'done' : 'pending', done: o.done, now: new Date().toISOString() },
+    );
+    return Number(r.get('n')) > 0;
   }
 
   async requeueStaleDocs() {
@@ -336,21 +355,28 @@ export class DocsRepo implements DocsStore {
     return rows.map((r) => r.get('id') as string);
   }
 
-  async searchDocs(q: { embedding: number[]; projectKey: string; k: number; run?: string | null }): Promise<DocHit[]> {
+  async searchDocs(q: DocSearch): Promise<DocHit[]> {
     // A chunk is another run's sandbox upload when its document is (only looked up while any sandbox record exists).
     const visible = (await this.g.sandbox.any()) ? `NOT EXISTS { MATCH (sd:Doc {id: node.docId}) WHERE NOT ${VISIBLE_TO_RUN('sd')} }` : 'true';
+    const excluded = q.excludeSources?.length ? 'NOT EXISTS { MATCH (xd:Doc {id: node.docId}) WHERE xd.source IN $exclude }' : 'true';
     const rows = await nearest(this.g, {
       index: 'chunk_embedding', label: 'Chunk', embedding: q.embedding, k: q.k,
-      where: `node.projectKey = $projectKey AND ${visible}`,
+      where: `node.projectKey = $projectKey AND ${visible} AND ${excluded}`,
       tail: `WITH node, score ORDER BY score DESC LIMIT $k
        MATCH (d:Doc {id: node.docId})
        RETURN node.text AS text, score, d`,
-      params: { projectKey: q.projectKey, run: q.run ?? null },
+      params: { projectKey: q.projectKey, run: q.run ?? null, exclude: [...(q.excludeSources ?? [])] },
     });
     return rows.map((r) => {
       const p = r.get('d').properties;
       return { docId: p.id, source: p.source, ref: p.ref, title: p.title, url: p.url ?? null, text: r.get('text'), score: r.get('score') };
     });
+  }
+
+  async docText(id: string): Promise<string | null> {
+    const rows = await this.g.run(`MATCH (d:Doc {id: $id}) OPTIONAL MATCH (d)-[:HAS_CHUNK]->(c:Chunk)
+      WITH d, c ORDER BY c.idx RETURN d.id AS id, collect(c.text) AS texts`, { id });
+    return rows.length ? (rows[0].get('texts') as string[]).join('\n\n') : null;
   }
 
   /** Small key/value store for integration sync cursors (e.g. last GitHub sync time per project). */

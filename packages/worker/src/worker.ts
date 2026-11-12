@@ -57,6 +57,10 @@ import { hasCodeFiles, runScan, ScanPlans } from './scan/scan.ts';
 import { scoreFacts, ScoringPacer } from './relevance/score.ts';
 import { runLinkDetection } from './links/stage.ts';
 import { readOneDoc } from './docs/read.ts';
+import { budgetedLlm, CONFLICT_BUDGET_CURSOR, IntakeBudget } from './intake/budget.ts';
+import { conflictSweepRound, conflictTriggerRound, logTally, type ConflictStageDeps } from './conflicts/stage.ts';
+import { extractIntakeOne } from './intake/extract.ts';
+import { intakeModelSpec } from './intake/model.ts';
 import { SummarizeStage } from './summarize/stage.ts';
 import { CODEX_COPY_RULE, FileState, INGEST_VERSION } from './state.ts';
 import { SessionEvidenceGate } from './evidence.ts';
@@ -143,6 +147,19 @@ export async function runWorker(io: WorkerIo): Promise<void> {
   const defaultScan = config.llm.scan ?? localModel;
   // Reads your uploads (documents and images) into facts; images need a model with vision.
   const docsLlm = tracked('docs', provider('docs', config.llm.docs ?? defaultScan));
+  // Knowledge intake (INTAKE_ENABLED): reads what people said into claims for review, with a model the allow list takes
+  // (INTAKE_PROVIDER_ALLOW: no company API key by default), each call metered by INTAKE_LLM_CALLS_PER_DAY.
+  const intakeModel = config.intake.enabled ? intakeModelSpec(config, localModel) : null;
+  if (intakeModel?.skipped.length) log('intake skips models INTAKE_PROVIDER_ALLOW refuses', { skipped: intakeModel.skipped, allow: config.intake.providerAllow, using: intakeModel.spec });
+  const intakeLlm = intakeModel?.spec ? tracked('intake', provider('intake', intakeModel.spec)) : null;
+  const intakeBudget = new IntakeBudget({ cursors: store.docs, perDay: config.intake.llmCallsPerDay, now: Date.now });
+  // Contradiction detection's judge: CONFLICT_LLM (held to the same allow list at startup), else intake's model, with
+  // its own daily calls (CONFLICT_LLM_CALLS_PER_DAY).
+  const conflictLlm = !config.intake.enabled ? null : config.conflicts.llm ? tracked('intake', provider('intake', config.conflicts.llm)) : intakeLlm;
+  const conflictBudget = new IntakeBudget({
+    cursors: store.docs, perDay: config.conflicts.llmCallsPerDay, now: Date.now, cursor: CONFLICT_BUDGET_CURSOR,
+    spent: 'conflict judge calls are used (CONFLICT_LLM_CALLS_PER_DAY): detection goes on tomorrow',
+  });
   // An unavailable summary model only pauses summaries; /api/status and the badge say so. SUMMARY_LLM=off is reported as off.
   const summaryLlm = config.summary.enabled ? tracked('summary', provider('summary', config.summary.llm ?? localModel)) : null;
   // Ask: CHAT_LLM, else claude-cli with a Claude token, else codex-cli with a Codex login, else the local model. A chat
@@ -190,9 +207,9 @@ export async function runWorker(io: WorkerIo): Promise<void> {
     lastCycleAt: null,
     lastCycle: null,
     lastError: null,
-    providers: { classify: classifier?.id ?? null, postmortem: postmortemLlm.id, scan: defaultScan, summary: summaryLlm?.id ?? null, docs: docsLlm?.id ?? null, chat: defaultChat },
+    providers: { classify: classifier?.id ?? null, postmortem: postmortemLlm.id, scan: defaultScan, summary: summaryLlm?.id ?? null, docs: docsLlm?.id ?? null, chat: defaultChat, intake: intakeLlm?.id ?? null },
     health,
-    off: config.summary.enabled ? [] : ['summary'],
+    off: [...(config.summary.enabled ? [] : ['summary' as const]), ...(config.intake.enabled ? [] : ['intake' as const])],
   };
   const heartbeat = new Heartbeat({ status, file: env.HEARTBEAT_FILE ?? '/tmp/fg-heartbeat', writeFile, repo, log });
   heartbeat.start();
@@ -420,10 +437,47 @@ export async function runWorker(io: WorkerIo): Promise<void> {
     },
   });
 
+  // Contradiction detection (knowledge intake): each minute the Activity entries that change what is known, and every
+  // CONFLICT_SWEEP_MINUTES a capped page of the sweep, one after the other so a pair is never judged twice at once.
+  let sweptAt = 0;
+  const conflictDeps: ConflictStageDeps = {
+    store, embed, llm: conflictLlm && budgetedLlm(conflictLlm, conflictBudget), log,
+    projects: async () => (await selectedFolders()).map((f) => f.key),
+  };
+  const conflicts = config.intake.enabled
+    ? new Sometimes({
+      everyMs: 60_000,
+      what: 'contradiction detection',
+      log,
+      run: async () => {
+        logTally(conflictDeps, 'conflicts checked after changes', await conflictTriggerRound(conflictDeps));
+        if (Date.now() - sweptAt < config.conflicts.sweepMinutes * 60_000) return;
+        sweptAt = Date.now();
+        logTally(conflictDeps, 'conflict sweep', await conflictSweepRound(conflictDeps));
+      },
+    })
+    : null;
+
   async function readDocOne(): Promise<boolean> {
-    if (!docsLlm) return false;
-    stage.enter('docs');
-    return readDocsRound(() => readOneDoc({ docs, llm: docsLlm, embed, inScope: async (key) => ws.scope.project(key), activity, log }), log);
+    let read = false;
+    if (docsLlm) {
+      stage.enter('docs');
+      read = await readDocsRound(() => readOneDoc({ docs, llm: docsLlm, embed, inScope: async (key) => ws.scope.project(key), activity, log }), log);
+    }
+    if (intakeLlm) {
+      stage.enter('docs');
+      // One pass (a window) of an intake source a round, so a long call never holds up the rest of the loop.
+      const extracted = await readDocsRound(() => extractIntakeOne({
+        docs, intake: store.intake, llm: budgetedLlm(intakeLlm, intakeBudget), budgetSpent: () => intakeBudget.spent(), perDay: config.intake.llmCallsPerDay,
+        embed, inScope: async (key) => ws.scope.project(key), activity, log,
+        knownFiles: async (key) => {
+          const map = await store.codegraph.codeMap(key);
+          return map ? new Set(map.files.map((f) => f.path)) : null;
+        },
+      }), log);
+      read ||= extracted;
+    }
+    return read;
   }
 
   /** A sharded scan's listing, shard plan and mirror, kept while it waits its turn again (same HEAD). */
@@ -620,6 +674,7 @@ export async function runWorker(io: WorkerIo): Promise<void> {
     syncGithubDocs, syncFeedback,
     kickMapStage: () => mapStage.kick(),
     detectLinks: () => { void links.tick(); },
+    detectConflicts: () => { void conflicts?.tick(); },
     retention: () => retention.tick(),
     evidence,
     cloudTick: () => { void cloudSchedule?.tick(); },

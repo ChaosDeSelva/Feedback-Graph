@@ -7,7 +7,7 @@ const TOKEN = `fgc_pat_0123456789abcdef_${'Q'.repeat(43)}`;
 const OWNER = 'owner-test-token-01234567890123456789';
 const auth = { ownerToken: OWNER };
 const owner = { authorization: `Bearer ${OWNER}`, 'x-fg-owner': 'true', 'content-type': 'application/json' };
-const cloud: CloudConfig = { url: 'https://cloud.example.com', token: TOKEN, intervalMinutes: 60, projects: [], suggestions: false, machine: null };
+const cloud: CloudConfig = { url: 'https://cloud.example.com', token: TOKEN, intervalMinutes: 60, projects: [], suggestions: false, claims: false, people: false, machine: null };
 const repo = { undoDecision: async () => false, listCandidates: async () => [], candidateDetail: async () => null, decide: async () => {}, stats: async () => [] } as ApiRepo;
 const bundle = (key: string): ExportBundle => ({
   format: EXPORT_FORMAT, schemaVersion: 1, toolVersion: '0.2.0', exportedAt: 't', projectKey: key, projects: [{ key, remote: `github.com/acme/${key}` }],

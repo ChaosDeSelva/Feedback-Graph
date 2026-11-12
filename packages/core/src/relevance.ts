@@ -23,6 +23,14 @@ const CLOSE_ENOUGH = 0.8;
 export const SIMILARITY_FLOOR = 0.78;
 /** Field-calibrated weighted fact rank threshold; custom low-scale embedders keep their explicit calibration. */
 export const FACT_RANK_FLOOR = 0.80;
+/**
+ * What a fact is embedded from (and re-embedded from: graph/embeddings.ts and the Postgres one say the same). Its path
+ * first, where it names a file; a fact an accepted claim became (origin claim, filed under source:<doc id> when it scopes
+ * no file) or a conflict's reconciled statement (conflict:<id>) by its statement alone: those ids are noise a task's
+ * words never match, and cost such a fact the similarity it needs to be served.
+ */
+export const factEmbeddingText = (f: { path: string; statement: string; origin?: string | null }) =>
+  f.origin === 'claim' || f.path.startsWith('conflict:') ? f.statement : `${f.path}: ${f.statement}`;
 export const boundedScore = (score: number): number => Number.isFinite(score) ? Math.max(0, Math.min(1, score)) : 0;
 /** A fact or miss scoring under this share of the best one is noise next to it, and is left out. */
 const RELATIVE_FLOOR = 0.6;

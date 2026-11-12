@@ -128,7 +128,7 @@ describeStores('worker wiring', (h) => {
     expect(logs.find((l) => l.msg.startsWith('scan provider parked'))?.extra).toMatchObject({ provider: 'codex-cli' });
     const status = await h.store.graph.workerStatus();
     expect(status?.providers).toMatchObject({ classify: null, postmortem: 'claude-cli', scan: 'openai:gpt-test', summary: null, docs: null });
-    expect(status?.off).toEqual(['summary']);
+    expect(status?.off).toEqual(['summary', 'intake']);
     expect(status?.cloudSync).toMatchObject({ host: new URL(cloud.url).host });
     // With no classifier the flagged turn waits for one, and /api/status says why.
     expect(status?.lastError).toBe('classifier unavailable: no classifier could be built (see the provider log line at startup)');

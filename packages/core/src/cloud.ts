@@ -225,8 +225,22 @@ export const bundleCounts = (b: ExportBundle): SyncCounts => ({
   codeFiles: b.codeFiles.length,
 });
 
-/** Which lessons a bundle carries: `suggestions` is SYNC_SUGGESTIONS. */
-export type SyncOptions = { suggestions?: boolean; shareDemoCreated?: boolean; onLocalOnly?: (reason: string) => void };
+/**
+ * Which lessons a bundle carries: `suggestions` is SYNC_SUGGESTIONS. `claims` (SYNC_CLAIMS): facts accepted claims
+ * became go too, never one from a private source; `people` (SYNC_PEOPLE): with the speaker's name, else "a participant".
+ */
+export type SyncOptions = { suggestions?: boolean; claims?: boolean; people?: boolean; shareDemoCreated?: boolean; onLocalOnly?: (reason: string) => void };
+
+/**
+ * A claim's fact as it may leave: its `why` ("Ana, 2026-11-10 call") names the speaker only with SYNC_PEOPLE, and a
+ * fact filed under its source (`source:<doc id>`, the id carrying the file's name) goes under a hash of it.
+ */
+function claimFactOut(f: ExportBundle['facts'][number], people: boolean): Pick<ExportBundle['facts'][number], 'path' | 'why'> {
+  const path = f.path.startsWith('source:') ? `source:${createHash('sha256').update(f.path).digest('hex').slice(0, 16)}` : f.path;
+  if (people) return { path, why: f.why };
+  const speaker = f.claim?.speaker;
+  return { path, why: speaker && f.why.startsWith(`${speaker}, `) ? `a participant${f.why.slice(speaker.length)}` : 'a participant' };
+}
 
 /**
  * The sync body for one project, or null when nothing is stored for it. The export is the whole project (nothing
@@ -262,8 +276,11 @@ export async function syncBundle(p: Pick<PortabilityStore, 'exportData'>, projec
       id: m.id, projectKey: m.projectKey, missed: m.missed, cause: m.cause, causeExplanation: m.causeExplanation, feedbackText: '', ts: m.ts,
       contextItems: m.contextItems.map((c) => ({ kind: c.kind, ref: c.ref, excerpt: '', why: c.why })),
     })),
-    facts: b.facts.map((f) => ({
+    // What people said stays home unless SYNC_CLAIMS, and a private source's (a transcript's, by default) always does.
+    // A claim's fact superseded or closed is no longer current, so it drops out here and `withdrawn` takes it back.
+    facts: b.facts.filter((f) => !f.claim || (o.claims && !f.claim.private)).map((f) => ({
       path: f.path, lines: f.lines, kind: f.kind, statement: f.statement, why: f.why, confidence: f.confidence, source: f.source, createdAt: f.createdAt, projectKey: f.projectKey,
+      ...(f.claim && claimFactOut(f, !!o.people)),
     })),
     docs: b.docs.map((d) => ({ id: d.id, projectKey: d.projectKey, source: d.source, ref: d.ref, title: d.title, url: d.url })),
     codeFiles: b.codeFiles.map((c) => ({
@@ -651,7 +668,7 @@ export async function runCloudSync(d: {
       continue;
     }
     const previous = await d.memory?.get(key);
-    const stored = await syncBundle(d.portability, key, previous, { suggestions: d.cloud.suggestions, shareDemoCreated: d.cloud.shareDemoProjects?.includes(key) });
+    const stored = await syncBundle(d.portability, key, previous, { suggestions: d.cloud.suggestions, claims: d.cloud.claims, people: d.cloud.people, shareDemoCreated: d.cloud.shareDemoProjects?.includes(key) });
     if (!stored && !previous) {
       results.push({ key, status: 'empty', counts: null });
       continue;

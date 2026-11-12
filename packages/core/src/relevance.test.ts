@@ -1,6 +1,6 @@
 import { expect, test } from 'vitest';
 import type { FactHit, StoredFact } from './graph/facts.ts';
-import { calibrateRelevance, EVERYDAY_SHARE, factOrigin, isNonMiss, mentionedPaths, MISS_CLOSE, missAdmitted, missTouches, pathAffinity, rankDocs, rankFacts, rankMisses, relevanceBand, serviceDirs, servicesInTask, SIMILARITY_FLOOR } from './relevance.ts';
+import { calibrateRelevance, EVERYDAY_SHARE, factEmbeddingText, factOrigin, isNonMiss, mentionedPaths, MISS_CLOSE, missAdmitted, missTouches, pathAffinity, rankDocs, rankFacts, rankMisses, relevanceBand, serviceDirs, servicesInTask, SIMILARITY_FLOOR } from './relevance.ts';
 
 const hit = (statement: string, score: number, relevance: number | null): FactHit => ({
   fact: { id: statement, statement, relevance, relevanceBy: relevance === null ? null : 'model' } as StoredFact,
@@ -244,4 +244,11 @@ test(`missAdmitted: a past miss is served or judged when it shares a file with t
   // The bar is the caller's to set (MISS_MIN_SIMILARITY).
   expect(missAdmitted(m('leaked a client', 0.8), [], 0.78)).toBe(true);
   expect(MISS_CLOSE).toBeGreaterThan(SIMILARITY_FLOOR);
+});
+
+test('factEmbeddingText: a file path leads; a claim\'s fact and a reconciled statement are embedded by their words alone', () => {
+  expect(factEmbeddingText({ path: 'src/retry.ts', statement: 'Retries wait 30 s' })).toBe('src/retry.ts: Retries wait 30 s');
+  expect(factEmbeddingText({ path: 'source:doc:shop:intake:sync.vtt', statement: 'Retries wait 30 s', origin: 'claim' })).toBe('Retries wait 30 s');
+  expect(factEmbeddingText({ path: 'src/retry.ts', statement: 'Retries wait 30 s', origin: 'claim' })).toBe('Retries wait 30 s');
+  expect(factEmbeddingText({ path: 'conflict:abc', statement: 'Retries wait 45 s', origin: 'you' })).toBe('Retries wait 45 s');
 });

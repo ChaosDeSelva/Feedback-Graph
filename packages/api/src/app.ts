@@ -28,6 +28,8 @@ import { importRoutes, Triggers, type ImportDeps } from './import.ts';
 import { sessionRoutes, type SessionsDeps } from './sessions.ts';
 import { connectionsStatus, integrationRoutes, type IntegrationsDeps } from './integrations.ts';
 import { loopRoutes, ownerOverrides, type LoopDeps } from './decisions.ts';
+import { intakeRoutes, type IntakeRouteDeps } from './intake.ts';
+import { intakeReviewRoutes, type IntakeReviewDeps } from './intakeReview.ts';
 
 export type { SettingsDeps } from './settings.ts';
 
@@ -81,6 +83,8 @@ export const BODY_LIMIT = 1 * MB;
 /** A document upload (2,000,000 characters of text, or an 8 MB image as base64) and an export bundle being imported. */
 const UPLOAD_LIMITS: readonly [RegExp, number][] = [
   [/^\/api\/projects\/[^/]+\/docs$/, 16 * MB],
+  // A knowledge intake source: 2,000,000 characters, as a document upload.
+  [/^\/api\/intake$/, 16 * MB],
   [/^\/api\/import$/, 256 * MB],
   // check_before_done's diff, as JSON (MCP_BODY_LIMIT).
   [/^\/mcp$/, MCP_BODY_LIMIT],
@@ -128,7 +132,7 @@ export type AppOpts = {
   projectDirs?: () => Promise<Project[]>;
   insights?: Pick<InsightsStore, 'projectGraph' | 'patterns'>;
   activity?: Pick<ActivityStore, 'record' | 'list' | 'removeRun'> & Partial<Pick<ActivityStore, 'get'>>;
-  docs?: Pick<DocsStore, 'upsertDoc' | 'listDocs' | 'deleteDoc'> & Partial<Pick<DocsStore, 'docImage' | 'requeueDocRead'>>;
+  docs?: Pick<DocsStore, 'upsertDoc' | 'listDocs' | 'deleteDoc'> & Partial<Pick<DocsStore, 'docImage' | 'requeueDocRead' | 'docText'>>;
   links?: Pick<LinksStore, 'listLinks' | 'setLink' | 'deleteLink'>;
   auth?: AuthOpts;
   /** JSON access log: method, path, status, ms. Query strings are left out (they can carry search text). */
@@ -182,6 +186,13 @@ export type AppOpts = {
   loop?: LoopDeps;
   /** Aborted when the server shuts down: every open event stream ends at once, and no new one opens. */
   closing?: AbortSignal;
+  /** Knowledge intake (intake.ts), set only with INTAKE_ENABLED: unset, its routes are not there (404). Needs docs with docText, embed and projectDirs. */
+  intake?: IntakeRouteDeps;
+  /**
+   * Knowledge intake's review (intakeReview.ts): claims, questions and people. Set only while INTAKE_ENABLED is on;
+   * unset, those routes are not there (404) and /api/status says intake is off.
+   */
+  intakeReview?: IntakeReviewDeps;
 };
 
 /**
@@ -396,6 +407,12 @@ function stale(job: ModelJob, h: ProviderHealth, w: WorkerStatus, ollama: Ollama
   return answeredSince || (h.provider.startsWith('ollama:') && !!ollama?.ok && UNREACHABLE.test(h.reason ?? ''));
 }
 
+const UNBUILT_REASON = {
+  classify: 'no classifier is configured (see the worker log)',
+  summary: 'no summary model could be built (SUMMARY_LLM; see the worker log): summaries are paused',
+  intake: 'no intake model could be built (INTAKE_LLM, INTAKE_PROVIDER_ALLOW; see the worker log): intake sources wait',
+} as const;
+
 /** Each job's model as the worker last reported it. A job with no model (it could not be built) is unavailable, and
  * so is an Ollama model while Ollama does not answer, whether or not a job has asked it yet. */
 function modelHealth(w: WorkerStatus, ollama: OllamaHealth | null, runner: RunnerReadiness | null = null): Record<ModelJob, ModelHealth> {
@@ -406,11 +423,11 @@ function modelHealth(w: WorkerStatus, ollama: OllamaHealth | null, runner: Runne
     const h = reported && !reported.ok && stale(job, reported, w, ollama) ? { ...reported, ok: true, reason: null } : reported;
     const current = h?.provider ?? provider;
     // A worker older than the summary report leaves the key out: unknown, not broken.
-    const unbuilt = !provider && (job === 'classify' || (job === 'summary' && job in w.providers));
+    const unbuilt = !provider && (job === 'classify' || ((job === 'summary' || job === 'intake') && job in w.providers));
     out[job] = w.off?.includes(job)
       ? { provider: null, ok: true, reason: null, off: true }
       : unbuilt
-      ? { provider: null, ok: false, reason: job === 'classify' ? 'no classifier is configured (see the worker log)' : 'no summary model could be built (SUMMARY_LLM; see the worker log): summaries are paused' }
+      ? { provider: null, ok: false, reason: UNBUILT_REASON[job as 'classify' | 'summary' | 'intake'] }
       : runner && !runner.ok && current?.startsWith('codex-cli')
         ? { provider: current, ok: false, reason: runner.reason ?? 'codex runner sandbox unavailable', ...(runner.disabled && { disabled: true as const }) }
       : ollama && !ollama.ok && current?.startsWith('ollama:')
@@ -834,6 +851,7 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
       givenUpTurns,
       agent,
       ollama,
+      intake: { enabled: !!(opts.intake || opts.intakeReview) },
       connections: await connectionsStatus({ integrations: graph ? (integrations?.integrations ?? null) : null, deps: integrations, worker, models, ollama, cloud: cloud?.cloud ?? null, manualSync: cloudState?.lastManual() ?? null }).catch(() => null),
     };
     return c.json(s);
@@ -1141,7 +1159,7 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
   });
   // Owner decisions for an agent holding the operator token (adminMcp.ts): each tool calls the REST route in-process,
   // so the OPERATOR_ALLOW gate, validation and Activity are the route's own. Not mounted without FG_OPERATOR_TOKEN.
-  if (auth.operator?.token) app.all(ADMIN_MCP, (c) => handleAdminMcp(c.req.raw, { request: (path, init) => app.request(path, init) }));
+  if (auth.operator?.token) app.all(ADMIN_MCP, (c) => handleAdminMcp(c.req.raw, { request: (path, init) => app.request(path, init), intake: !!(opts.intake || opts.intakeReview) }));
   // Read-only, for the Claude Code plugin's hooks: is this folder a selected project?
   if (context) app.get('/api/agent/project', async (c) => c.json(await trackedProject({ cwd: c.req.query('cwd') ?? undefined }, context)));
 
@@ -1477,6 +1495,8 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
       const id = c.req.param('id');
       const parts = docIdParts(id);
       if (!parts || !(await shows(parts.projectKey))) return c.json({ error: 'not found' }, 404);
+      // An intake source goes with its claims and questions: DELETE /api/intake/sources/:id.
+      if (parts.source === 'intake') return c.json({ error: 'an intake source is removed with DELETE /api/intake/sources/:id' }, 409);
       // In a run, only a document the run uploaded (runOnly).
       if (!(await docs.deleteDoc(id, runOnly()))) return c.json({ error: currentRun() ? 'not found among the documents this run uploaded' : 'not found' }, 404);
       await activity?.record({
@@ -1675,7 +1695,15 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
   if (opts.chat) chatRoutes(app, opts.chat, view);
   if (opts.runs && activity) runRoutes(app, { store: opts.runs, activity });
   if (opts.evidence) evidenceRoutes(app, opts.evidence);
+  if (opts.intake && docs?.docText && embed && projectDirs) intakeRoutes(app, { ...opts.intake, docs, docText: docs.docText.bind(docs), embed, projectDirs, activity, view, log });
   // Tokenless installs are read-only for owner actions, so the loop runs at most in observe there (loop/state.ts).
+  if (opts.intakeReview) {
+    intakeReviewRoutes(app, { ...opts.intakeReview, activity: asActor(opts.intakeReview.activity) }, {
+      view,
+      // The agent credential, not also the owner's or operator's: what an agent holding API_TOKEN sends.
+      agentCaller: (c) => !!auth.token && tokenMatches(bearerOf(c), auth.token) && !hasOperatorToken(c, auth.operator),
+    });
+  }
   if (opts.loop) loopRoutes(app, { ...opts.loop, activity: asActor(opts.loop.activity) }, { tokenless: !auth.token && !auth.ownerToken, view });
   /** The owner's own write to these lessons or facts overrides the loop decisions it changed (decisions.ts ownerOverrides). */
   const overrideLoop = opts.loop ? ownerOverrides({ ...opts.loop, activity: asActor(opts.loop.activity) }) : async () => {};

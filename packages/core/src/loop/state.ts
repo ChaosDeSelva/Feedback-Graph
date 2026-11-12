@@ -1,6 +1,6 @@
 import { LOOP_MODES, type LoopConfig, type LoopMode } from '../config.ts';
 import type { DocsStore } from '../store.ts';
-import { DECISION_TYPES, type DecisionTarget, type DecisionTier, type DecisionType } from '../types.ts';
+import { LOOP_DECISION_TYPES, type DecisionTarget, type DecisionTier, type DecisionType } from '../types.ts';
 
 /**
  * The learning loop's state shared by the worker (which runs it) and the api (which shows and sets it), kept in the
@@ -20,7 +20,7 @@ export const LOOP_DEFAULT_MODE: LoopMode = 'auto';
 const rank = (m: LoopMode) => LOOP_MODES.indexOf(m);
 const atMost = (m: LoopMode, cap: LoopMode): LoopMode => (rank(m) > rank(cap) ? cap : m);
 const isMode = (v: unknown): v is LoopMode => typeof v === 'string' && (LOOP_MODES as readonly string[]).includes(v);
-const isType = (v: string): v is DecisionType => (DECISION_TYPES as readonly string[]).includes(v);
+const isType = (v: string): v is DecisionType => (LOOP_DECISION_TYPES as readonly string[]).includes(v);
 
 /**
  * Per type: its tier; τ, the bar the 10th percentile of its calibrated Beta must clear to apply on its own (raised by
@@ -35,7 +35,7 @@ const P: LoopTypeInfo = { tier: 'P', tauDefault: 1, prior: { alpha: 1, beta: 4 }
 export const LOOP_TYPE_INFO: Record<DecisionType, LoopTypeInfo> = {
   link_misses: H, merge_duplicates: H, rank_weight: H, retire_lesson: H,
   reject_lesson: A(0.85), approve_lesson: A(0.9), reword_lesson: A(0.88), narrow_scope: A(0.85), record_fact: A(0.88),
-  triage_inbox: P, tune_threshold: P,
+  triage_inbox: P, tune_threshold: P, resolve_conflict: P, remove_source: P,
 };
 
 /** Scores fall in 5 calibration bands: [0, .2) is 0 ... [.8, 1] is 4. */

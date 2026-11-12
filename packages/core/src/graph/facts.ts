@@ -608,11 +608,12 @@ export class FactsRepo implements FactsStore {
             count(CASE WHEN x.docId IS NOT NULL THEN 1 END) AS documentFacts,
             count(CASE WHEN x.docId IS NULL AND (x.origin = 'manifest' OR (x.origin IS NULL AND x.why =~ $manifestWhy)) THEN 1 END) AS manifestFacts,
             count(CASE WHEN x.docId IS NULL AND x.origin = 'you' THEN 1 END) AS yourFacts,
-            count(CASE WHEN x.docId IS NULL AND x.origin = 'loop' THEN 1 END) AS loopFacts
+            count(CASE WHEN x.docId IS NULL AND x.origin = 'loop' THEN 1 END) AS loopFacts,
+            count(CASE WHEN x.docId IS NULL AND x.origin = 'claim' THEN 1 END) AS claimFacts
        OPTIONAL MATCH (j:ScanJob {projectKey: p.key})
-       WITH p, sessions, feedback, lessons, facts, documentFacts, manifestFacts, yourFacts, loopFacts, j ORDER BY j.requestedAt DESC
-       WITH p, sessions, feedback, lessons, facts, documentFacts, manifestFacts, yourFacts, loopFacts, collect(j)[0] AS last
-       RETURN p, sessions, feedback, lessons, facts, documentFacts, manifestFacts, yourFacts, loopFacts, last
+       WITH p, sessions, feedback, lessons, facts, documentFacts, manifestFacts, yourFacts, loopFacts, claimFacts, j ORDER BY j.requestedAt DESC
+       WITH p, sessions, feedback, lessons, facts, documentFacts, manifestFacts, yourFacts, loopFacts, claimFacts, collect(j)[0] AS last
+       RETURN p, sessions, feedback, lessons, facts, documentFacts, manifestFacts, yourFacts, loopFacts, claimFacts, last
        ORDER BY p.key`,
       { manifestWhy: MANIFEST_WHY_RE },
     );
@@ -626,8 +627,8 @@ export class FactsRepo implements FactsStore {
       lessons: r.get('lessons'),
       facts: r.get('facts'),
       factsByOrigin: {
-        model: r.get('facts') - r.get('documentFacts') - r.get('manifestFacts') - r.get('yourFacts') - r.get('loopFacts'),
-        manifest: r.get('manifestFacts'), document: r.get('documentFacts'), you: r.get('yourFacts'), loop: r.get('loopFacts'),
+        model: r.get('facts') - r.get('documentFacts') - r.get('manifestFacts') - r.get('yourFacts') - r.get('loopFacts') - r.get('claimFacts'),
+        manifest: r.get('manifestFacts'), document: r.get('documentFacts'), you: r.get('yourFacts'), loop: r.get('loopFacts'), claim: r.get('claimFacts'),
       },
       lastScan: r.get('last') ? jobOf(r.get('last').properties) : null,
       pinned: r.get('p').properties.pinned === true,

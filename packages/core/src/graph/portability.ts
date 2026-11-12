@@ -6,6 +6,7 @@ import type { Hotspot } from '../codegraph.ts';
 import { DEMO_SOURCE, type PortabilityStore } from '../store.ts';
 import { heldIds, heldTargets, holdFacts, holdLessons, type HeldDecision } from '../loop/syncHold.ts';
 import { CodeGraphRepo } from './codegraph.ts';
+import { DELETE_PROJECT_CONFLICTS } from './intake.ts';
 import type { GraphRepo } from './repo.ts';
 
 export const EXPORT_FORMAT = 'feedback-graph-export';
@@ -34,7 +35,11 @@ export type ExportBundle = {
     ts: string;
     contextItems: { kind: string; ref: string; excerpt: string; why: string }[];
   }[];
-  facts: { path: string; lines: string | null; kind: string; statement: string; why: string; confidence: number; source: string; createdAt: string; projectKey: string }[];
+  /**
+   * claim: on a fact an accepted claim became (origin claim), whether its source is private and the speaker's name;
+   * syncBundle reads both and never sends either.
+   */
+  facts: { path: string; lines: string | null; kind: string; statement: string; why: string; confidence: number; source: string; createdAt: string; projectKey: string; claim?: { private: boolean; speaker: string | null } }[];
   docs: { id: string; projectKey: string; source: string; ref: string; title: string; url: string | null }[];
   /** The code map's files with their hotspot numbers: paths and stats only, never source, symbols or edges. */
   codeFiles: ExportCodeFile[];
@@ -43,7 +48,7 @@ export type ExportBundle = {
 export type ExportCodeFile = { projectKey: string; path: string; lang: string; loc: number; isTest: boolean } & Omit<Hotspot, 'path'>;
 
 /** Labels whose nodes belong to one project through their projectKey. */
-const PROJECT_LABELS = ['Candidate', 'Feedback', 'Miss', 'Task', 'ContextItem', 'Fact', 'Symbol', 'Module', 'CodeMap', 'CodeFile', 'ScanJob', 'Doc', 'DocBlob', 'Chunk', 'Activity', 'PreDoneCheck', 'ChatTurn', 'ChatConversation'];
+const PROJECT_LABELS = ['Candidate', 'Feedback', 'Miss', 'Task', 'ContextItem', 'Fact', 'Symbol', 'Module', 'CodeMap', 'CodeFile', 'ScanJob', 'Doc', 'DocBlob', 'Chunk', 'Activity', 'PreDoneCheck', 'ChatTurn', 'ChatConversation', 'Claim', 'Question', 'Conflict'];
 
 const BATCH = 5000;
 
@@ -103,12 +108,20 @@ export class PortabilityRepo implements PortabilityStore {
         { key, keys },
       ),
       this.g.run(
+        // A claim's fact carries whether its source is private (an answer's: its question's source; a source gone or
+        // unknown: private) and who said it, for syncBundle's SYNC_CLAIMS and SYNC_PEOPLE guards.
         `MATCH (x:Fact {current: true}) WHERE ($key IS NULL OR x.projectKey = $key) AND ($keys IS NULL OR x.projectKey IN $keys) AND x.docId IS NULL AND NOT coalesce(x.sandbox, false)
            AND coalesce(x.source, '') <> $demo
-         RETURN x ORDER BY x.projectKey, x.path, x.statement, x.id`,
+         OPTIONAL MATCH (c:Claim {factId: x.id}) WHERE x.origin = 'claim'
+         OPTIONAL MATCH (q:Question {id: substring(c.docId, 7)}) WHERE c.docId STARTS WITH 'answer:'
+         OPTIONAL MATCH (d:Doc {id: coalesce(q.docId, c.docId)})
+         OPTIONAL MATCH (p:Person {id: c.speakerId})
+         RETURN x, d.private AS claimPrivate, p.displayName AS claimSpeaker ORDER BY x.projectKey, x.path, x.statement, x.id`,
         { key, keys, demo: DEMO_SOURCE },
       ),
-      this.g.run(`MATCH (d:Doc) WHERE ($key IS NULL OR d.projectKey = $key) AND ($keys IS NULL OR d.projectKey IN $keys) AND NOT coalesce(d.sandbox, false) RETURN d ORDER BY d.projectKey, d.id`, { key, keys }),
+      // Intake sources (what people said) are never exported, so never synced either (syncBundle reads this).
+      this.g.run(`MATCH (d:Doc) WHERE ($key IS NULL OR d.projectKey = $key) AND ($keys IS NULL OR d.projectKey IN $keys) AND NOT coalesce(d.sandbox, false) AND d.source <> 'intake'
+        RETURN d ORDER BY d.projectKey, d.id`, { key, keys }),
     ]);
     const codegraph = new CodeGraphRepo(this.g);
     const codeFiles = (await Promise.all(projects.map((r) => codegraph.exportFiles(r.get('key') as string)))).flat();
@@ -167,6 +180,7 @@ export class PortabilityRepo implements PortabilityStore {
           source: f.source as string,
           createdAt: f.createdAt as string,
           projectKey: f.projectKey as string,
+          ...(f.origin === 'claim' && { claim: { private: r.get('claimPrivate') !== false, speaker: (r.get('claimSpeaker') as string | null) ?? null } }),
         };
       }), held).map(({ id: _, ...f }) => f),
       docs: firstById(docs.map((r) => {
@@ -207,6 +221,7 @@ export class PortabilityRepo implements PortabilityStore {
     await drain(`MATCH (b:SessionRun) WHERE b.projectKey = $key OR EXISTS { MATCH (:Project {key: $key})<-[:IN]-(s:Session) WHERE s.id = b.sessionId }
       WITH b LIMIT $batch DETACH DELETE b RETURN count(*) AS n`);
     await drain(`MATCH (:Project {key: $key})<-[:IN]-(s:Session) WITH s LIMIT $batch DETACH DELETE s RETURN count(*) AS n`);
+    await drain(DELETE_PROJECT_CONFLICTS);
     await drain(`MATCH (l:Lesson) WHERE l.projectKey = $key OR l.originProjectKey = $key WITH l LIMIT $batch DETACH DELETE l RETURN count(*) AS n`);
     for (const label of PROJECT_LABELS) {
       await drain(`MATCH (n:${label} {projectKey: $key}) WITH n LIMIT $batch DETACH DELETE n RETURN count(*) AS n`);

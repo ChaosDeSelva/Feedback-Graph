@@ -98,7 +98,7 @@ test('invalid roots and credential bodies do not claim a run or write configurat
 const bundle: ExportBundle = { format: EXPORT_FORMAT, schemaVersion: 1, toolVersion: 'test', exportedAt: '2026-10-29T00:00:00Z', projectKey: 'shop', projects: [{ key: 'shop', remote: 'github.com/acme/shop' }], lessons: [{ id: 'lesson:shop', projectKey: 'shop', title: 'T', rule: 'R', appliesWhen: '', scope: 'project', paths: [], status: 'approved', source: 'postmortem', cause: null, missId: null, createdAt: 't', decidedAt: 't' }], misses: [], facts: [], docs: [], codeFiles: [] };
 test('manual cloud dispatch rejects a competing caller before any export/upload, and invalid input claims nothing', async () => {
   let exports = 0, uploads = 0;
-  const cloud = { cloud: { url: 'https://cloud.example.com', token: 'cloud-token', intervalMinutes: 60, projects: [], suggestions: false, machine: null },
+  const cloud = { cloud: { url: 'https://cloud.example.com', token: 'cloud-token', intervalMinutes: 60, projects: [], suggestions: false, claims: false, people: false, machine: null },
     portability: { exportData: async () => { exports++; return bundle; } }, projects: async () => ['shop'], worker: async () => null,
     activity: { record: async () => {}, list: async () => [] }, fetch: (async (url: string) => {
       if (url.endsWith('/sync-policy')) return new Response(null, { status: 404 });

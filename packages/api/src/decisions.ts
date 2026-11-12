@@ -1,7 +1,7 @@
 import type { Context, Hono } from 'hono';
 import { z } from 'zod';
 import {
-  ABSENT, betaSummary, DECISION_MODES, redactSecrets, type DecisionNoteInput, IsoInstant, DECISION_NOTE_REASONS, DECISION_STATUSES, DECISION_TYPES, effectiveLoopMode, effectiveTypeMode, LOOP_ACTOR,
+  ABSENT, betaSummary, DECISION_MODES, redactSecrets, type DecisionNoteInput, IsoInstant, DECISION_NOTE_REASONS, DECISION_STATUSES, DECISION_TYPES, LOOP_DECISION_TYPES, type LoopDecisionType, effectiveLoopMode, effectiveTypeMode, LOOP_ACTOR,
   LOOP_BANDS, LOOP_MODES, LOOP_POLICY_VERSION, LOOP_ROUNDS_KEPT, LOOP_TYPE_INFO, readLoopBreaker, readLoopBudget, readLoopRound, readLoopRounds,
   readLoopSettings, loopHoldout, lessonHeldOut, readLoopMetrics, REPEAT_SIMILARITY, resetLoopBreaker, TargetChangedError, typeTau, writeLoopSettings, CascadeBlockedError, DecisionStateError, UnsupportedTargetError,
   type CascadePlan, type DecisionExecutor, type RollbackOptions,
@@ -159,7 +159,7 @@ const NoteBody = z.object({
 const Mode = z.enum(LOOP_MODES);
 const SettingsBody = z.object({
   mode: Mode.optional(),
-  types: z.record(z.enum(DECISION_TYPES), z.object({ mode: Mode.nullable().optional(), tau: z.number().nullable().optional() }).strict()).optional(),
+  types: z.record(z.enum(LOOP_DECISION_TYPES as [LoopDecisionType, ...LoopDecisionType[]]), z.object({ mode: Mode.nullable().optional(), tau: z.number().nullable().optional() }).strict()).optional(),
 }).strict();
 const EventsQuery = z.object({ after: z.string().min(1).max(1000).optional() });
 
@@ -295,12 +295,12 @@ export function loopRoutes(app: Hono, d: LoopDeps, ctx: LoopRouteContext) {
     const t = now();
     const runtime = { tokenless: ctx.tokenless };
     const effective = effectiveLoopMode(settings, d.config, runtime);
-    const types = await Promise.all(DECISION_TYPES.map(async (type) => {
+    const types = await Promise.all(LOOP_DECISION_TYPES.map(async (type) => {
       const info = LOOP_TYPE_INFO[type];
       const [breaker, buckets, recent] = await Promise.all([
         readLoopBreaker(d.cursors, type),
         store.calibration(type, LOOP_POLICY_VERSION),
-        store.list({ type, status: ['applied', 'rolled_back', 'overridden'], order: 'applied', limit: TYPE_RATE_OF }),
+        store.list({ type, author: 'loop', status: ['applied', 'rolled_back', 'overridden'], order: 'applied', limit: TYPE_RATE_OF }),
       ]);
       const bands = Array.from({ length: LOOP_BANDS }, (_, band) => {
         const b = buckets.find((x) => x.band === band);
@@ -324,9 +324,10 @@ export function loopRoutes(app: Hono, d: LoopDeps, ctx: LoopRouteContext) {
     // Counted in the store, so the counts hold however many decisions there are, at a fixed number of queries.
     const [budget, proposed, week, month, round] = await Promise.all([
       readLoopBudget(d.cursors, t),
-      store.count({ status: ['proposed'], ...shown }, []),
-      store.count({ since: new Date(t - 7 * DAY).toISOString(), ...shown }, ['mode', 'status', 'applied']),
-      store.count({ since: new Date(t - 30 * DAY).toISOString(), ...shown }, ['status', 'applied']),
+      store.count({ status: ['proposed'], author: 'loop', ...shown }, []),
+      // The loop's own: the owner's decisions (conflicts resolved) are his, not proposals or the loop's rollbacks.
+      store.count({ since: new Date(t - 7 * DAY).toISOString(), author: 'loop', ...shown }, ['mode', 'status', 'applied']),
+      store.count({ since: new Date(t - 30 * DAY).toISOString(), author: 'loop', ...shown }, ['status', 'applied']),
       readLoopRound(d.cursors),
     ]);
     return {

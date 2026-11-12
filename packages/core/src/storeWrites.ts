@@ -1,5 +1,5 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
-import type { GraphStore, KnowledgeStore, FactsStore, DocsStore, LinksStore, ActivityStore, InsightsStore, PortabilityStore, EmbeddingsStore, SelectionStore, CodeGraphStore, SessionsStore, ChatStore, RunsStore, DecisionsStore, Store } from './store.ts';
+import type { GraphStore, KnowledgeStore, FactsStore, DocsStore, LinksStore, ActivityStore, InsightsStore, PortabilityStore, EmbeddingsStore, SelectionStore, CodeGraphStore, SessionsStore, ChatStore, RunsStore, DecisionsStore, IntakeStore, Store } from './store.ts';
 import type { RunOwner, RunPrincipal } from './types.ts';
 
 type Mode = 'read' | 'write' | 'internal';
@@ -130,6 +130,7 @@ export const STORE_WRITE_POLICY = {
   docs: {
     upsertDoc: 'write',
     nextDocToRead: 'read',
+    recordDocProgress: 'write',
     markDocReading: 'write',
     saveDocReading: 'write',
     recordDocFailure: 'write',
@@ -142,6 +143,7 @@ export const STORE_WRITE_POLICY = {
     listDocs: 'read',
     deleteDoc: 'internal',
     searchDocs: 'read',
+    docText: 'read',
     linkedDocs: 'read',
     projectTickets: 'read',
     getCursor: 'read',
@@ -277,6 +279,40 @@ export const STORE_WRITE_POLICY = {
     loopMisses: 'read',
     redactStoredDecisions: 'write',
   } satisfies Policy<DecisionsStore>,
+  intake: {
+    upsertMeta: 'write',
+    metas: 'read',
+    nextWindow: 'read',
+    saveWindow: 'write',
+    removeSource: 'write',
+    listClaims: 'read',
+    claim: 'read',
+    decideClaim: 'write',
+    searchClaims: 'read',
+    addLinks: 'write',
+    links: 'read',
+    people: 'read',
+    person: 'read',
+    ensureOwner: 'write',
+    resolveAlias: 'write',
+    updatePerson: 'write',
+    mergePeople: 'write',
+    forgetPerson: 'write',
+    listQuestions: 'read',
+    question: 'read',
+    addQuestion: 'write',
+    updateQuestion: 'write',
+    answerQuestion: 'write',
+    openConflict: 'write',
+    conflict: 'read',
+    listConflicts: 'read',
+    conflictsFor: 'read',
+    writeSnapshots: 'write',
+    supersessions: 'read',
+    redactStoredIntake: 'write',
+    runItems: 'read',
+    removeRun: 'write',
+  } satisfies Policy<IntakeStore>,
   store: {
     ensureSchema: 'write',
     ping: 'read',
@@ -326,7 +362,7 @@ export function guardStoreMethods<T extends object>(value: T, policy: object): T
 
 export function guardStore(store: Store): Store {
   const out = guardStoreMethods(store, STORE_WRITE_POLICY.store);
-  const groups = ['graph', 'knowledge', 'facts', 'docs', 'links', 'activity', 'insights', 'portability', 'embeddings', 'selection', 'codegraph', 'sessions', 'chats', 'runs', 'decisions'] as const;
+  const groups = ['graph', 'knowledge', 'facts', 'docs', 'links', 'activity', 'insights', 'portability', 'embeddings', 'selection', 'codegraph', 'sessions', 'chats', 'runs', 'decisions', 'intake'] as const;
   const parts = Object.fromEntries(groups.filter(key => store[key] && typeof store[key] === 'object').map(key => [key, guardStoreMethods(store[key], STORE_WRITE_POLICY[key === 'chats' ? 'chat' : key])]));
   return new Proxy(out, { get(target, key) { return key in parts ? parts[key as string] : Reflect.get(target, key); } });
 }

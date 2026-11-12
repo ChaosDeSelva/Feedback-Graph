@@ -1,3 +1,4 @@
+import type { IntakeFormat } from './intake/parse.ts';
 import type { CloudSyncStatus } from './cloud.ts';
 export type ToolCall = { name: string; ts: string; filePath?: string; command?: string };
 
@@ -462,6 +463,10 @@ export const FACT_KINDS = [
   'command',
   'data_model',
   'security',
+  // What people decided, planned or committed to (0.9.0: an accepted claim of that type, origin 'claim').
+  'decision',
+  'plan',
+  'commitment',
 ] as const;
 export type FactKind = (typeof FACT_KINDS)[number];
 
@@ -485,13 +490,14 @@ export type CodeFact = {
 /**
  * model: a model read the code. manifest: read from package.json, go.mod, a Makefile... without a model. document: from
  * an upload. you: the owner (or an agent with the operator token) wrote it, e.g. a lesson converted to a fact. loop: the
- * learning loop recorded it (record_fact: a lesson that states how the code is, or what you said more than once). No scan
- * closes or replaces a fact of yours or the loop's (FACT_ORIGINS_KEPT).
+ * learning loop recorded it (record_fact: a lesson that states how the code is, or what you said more than once). claim:
+ * the owner accepted a claim drawn from what someone said (knowledge intake). No scan closes or replaces a fact of
+ * yours, the loop's or a claim's (FACT_ORIGINS_KEPT).
  */
-export const FACT_ORIGINS = ['model', 'manifest', 'document', 'you', 'loop'] as const;
+export const FACT_ORIGINS = ['model', 'manifest', 'document', 'you', 'loop', 'claim'] as const;
 export type FactOrigin = (typeof FACT_ORIGINS)[number];
 /** The origins of facts filed under their project, not read from code: a scan never closes, replaces or re-checks them. */
-export const FACT_ORIGINS_KEPT = ['you', 'loop'] as const satisfies readonly FactOrigin[];
+export const FACT_ORIGINS_KEPT = ['you', 'loop', 'claim'] as const satisfies readonly FactOrigin[];
 export type OwnFactOrigin = (typeof FACT_ORIGINS_KEPT)[number];
 /**
  * line: the cited lines exist and hold what the statement names. file: the file exists, the lines were missing, wrong
@@ -641,6 +647,15 @@ export const ACTIVITY_KINDS = [
   'decision_noted',
   'loop_settings_changed',
   'loop_paused',
+  // Knowledge intake (0.9.0): a source added or read, a claim or question decided, a conflict found or resolved, a
+  // person renamed, merged or forgotten.
+  'source_added',
+  'source_read',
+  'claim_decided',
+  'question_changed',
+  'conflict_found',
+  'conflict_resolved',
+  'person_changed',
 ] as const;
 export type ActivityKind = (typeof ACTIVITY_KINDS)[number];
 
@@ -685,8 +700,20 @@ export const DECISION_TYPES = [
   'record_fact',
   'triage_inbox',
   'tune_threshold',
+  // The owner settling a conflict (0.9.0 §6): never the loop's (author owner), recorded so it rolls back like any other.
+  'resolve_conflict',
+  // The owner removing a source with everything drawn from it: its accepted claims rejected, their facts closed.
+  'remove_source',
 ] as const;
 export type DecisionType = (typeof DECISION_TYPES)[number];
+/** The types only the owner makes (author owner): the loop never proposes, schedules, calibrates or configures them. */
+export const OWNER_DECISION_TYPES = ['resolve_conflict', 'remove_source'] as const satisfies readonly DecisionType[];
+export type LoopDecisionType = Exclude<DecisionType, (typeof OWNER_DECISION_TYPES)[number]>;
+/** The learning loop's own types: what LOOP_TYPES, its settings, its engine and its metrics cover. */
+export const LOOP_DECISION_TYPES = DECISION_TYPES.filter((t): t is LoopDecisionType => !(OWNER_DECISION_TYPES as readonly string[]).includes(t));
+/** owner: a change the owner made through a decision (resolve_conflict), never calibrated or counted as the loop's. */
+export const DECISION_AUTHORS = ['loop', 'owner'] as const;
+export type DecisionAuthor = (typeof DECISION_AUTHORS)[number];
 
 /**
  * observed: recorded only (observe mode). proposed: waits for the owner. applying: its target write is under way (a
@@ -700,9 +727,12 @@ export const DECISION_TIERS = ['H', 'A', 'P'] as const;
 export type DecisionTier = (typeof DECISION_TIERS)[number];
 export const DECISION_MODES = ['observe', 'propose', 'auto'] as const;
 export type DecisionMode = (typeof DECISION_MODES)[number];
-export const DECISION_TARGET_KINDS = ['lesson', 'fact', 'miss', 'candidate', 'project'] as const;
+export const DECISION_TARGET_KINDS = ['lesson', 'fact', 'miss', 'candidate', 'project', 'claim', 'conflict'] as const;
 export type DecisionTargetKind = (typeof DECISION_TARGET_KINDS)[number];
-/** primary: the record decided on. keeper / merged: a merge's survivor and the duplicate. created: what the decision made. */
+/**
+ * primary: the record decided on. keeper / merged: a merge's survivor and the duplicate, or a conflict's winner and
+ * loser. created: what the decision made.
+ */
 export const DECISION_TARGET_ROLES = ['primary', 'keeper', 'merged', 'created'] as const;
 export type DecisionTargetRole = (typeof DECISION_TARGET_ROLES)[number];
 export type DecisionTarget = { kind: DecisionTargetKind; id: string; role: DecisionTargetRole };
@@ -714,7 +744,7 @@ export type DecisionTarget = { kind: DecisionTargetKind; id: string; role: Decis
 export type TargetSnapshot = { kind: DecisionTargetKind; id: string; fields: Record<string, unknown>; fingerprint: string };
 
 /** What a decision rests on, by pointer: an Activity entry, a miss, a lesson, a lesson check... with its weight. */
-export const EVIDENCE_KINDS = ['activity', 'miss', 'lesson', 'fact', 'candidate', 'check', 'session'] as const;
+export const EVIDENCE_KINDS = ['activity', 'miss', 'lesson', 'fact', 'candidate', 'check', 'session', 'claim', 'conflict'] as const;
 export type EvidenceKind = (typeof EVIDENCE_KINDS)[number];
 export type EvidenceRef = { kind: EvidenceKind; id: string; role: string; weight: number; observedAt: string };
 
@@ -744,6 +774,8 @@ export type DecisionInput = {
   status: 'observed' | 'proposed';
   /** Earlier loop decisions whose `after` this one's `before` is: rolled back first when this one is. */
   dependsOn?: string[];
+  /** Who made it (default loop): an owner's decision is never calibrated, budgeted or counted as a loop proposal. */
+  author?: DecisionAuthor;
 };
 
 export type Decision = Omit<DecisionInput, 'status' | 'dependsOn'> & {
@@ -853,7 +885,7 @@ export type WorkerStatus = {
   providers: Record<string, string | null>;
   /** Feedback Graph Cloud sync; absent or null when CLOUD_URL is not set. */
   cloudSync?: CloudSyncStatus | null;
-  /** How each job's model last fared (classify, postmortem, scan, summary, docs, chat); missing until it is first asked. */
+  /** How each job's model last fared (classify, postmortem, scan, summary, docs, chat, intake); missing until it is first asked. */
   health?: Partial<Record<ModelJob, ProviderHealth>>;
   /** Jobs turned off on purpose (SUMMARY_LLM=off), so a missing model is not reported as broken. */
   off?: ModelJob[];
@@ -883,7 +915,7 @@ export type WorkerBacklog = { classify: number; classifyCapped: boolean; at: str
  */
 export type ProviderHealth = { provider: string; ok: boolean; reason: string | null; at: string; since?: string };
 
-export const MODEL_JOBS = ['classify', 'postmortem', 'scan', 'summary', 'docs', 'chat'] as const;
+export const MODEL_JOBS = ['classify', 'postmortem', 'scan', 'summary', 'docs', 'chat', 'intake'] as const;
 export type ModelJob = (typeof MODEL_JOBS)[number];
 /** A job's model as /api/status reports it: ok until it was last found unavailable (or, for an Ollama model, while
  * Ollama does not answer), with the reason. */
@@ -970,6 +1002,8 @@ export type SystemStatus = {
   ollama?: OllamaHealth | null;
   /** GitHub, Linear, Claude, Codex, Ollama and cloud sync; null when unknown (an older api leaves it out). */
   connections?: Record<ConnectionName, Connection> | null;
+  /** Knowledge intake (INTAKE_ENABLED): whether its routes and the Intake page are on. Unset from older APIs: off. */
+  intake?: { enabled: boolean };
   /** The worker's current step and since when; null when the worker is offline or has not said. */
   stage?: { name: WorkerStageName; startedAt: string; current: string | null } | null;
   /** That step's items done of total (total null when it has none); null when the step does not count items. */
@@ -1103,3 +1137,122 @@ export type SessionDetail = SessionListItem & {
   summaryRetryAt: string | null;
   inbox: SessionInboxItem[];
 };
+
+// ── Knowledge intake (0.9.0) ───────────────────────────────────────────
+// IntakeFormat and INTAKE_FORMATS live with the parsers (intake/parse.ts).
+
+/**
+ * A source: what people said, stored as a Doc with source 'intake' plus this record (IntakeStore.upsertMeta).
+ * transcript: a call or meeting. notes: someone's notes. doc: any other text.
+ */
+export const INTAKE_KINDS = ['transcript', 'notes', 'doc'] as const;
+export type IntakeKind = (typeof INTAKE_KINDS)[number];
+
+/**
+ * A source's details. occurredAt: when it was said (the meeting date, as given). origin: free text ("Zoom weekly
+ * sync") or a URL. private: never synced, even with SYNC_CLAIMS. participants: the Person ids who attended.
+ * windowsDone: how many extraction windows of the current upload are saved (IntakeStore.saveWindow); windowsTotal:
+ * how many there are, once known.
+ */
+export type IntakeMeta = {
+  docId: string; kind: IntakeKind; format: IntakeFormat; occurredAt: string | null; origin: string | null; private: boolean;
+  participants: string[]; windowsDone: number; windowsTotal: number | null;
+};
+export type IntakeMetaInput = Pick<IntakeMeta, 'docId' | 'kind' | 'format' | 'occurredAt' | 'origin' | 'private' | 'participants'>;
+
+/** What a claim says: a fact, a decision, an opinion, a plan or a commitment. Only an opinion is never served to agents. */
+export const CLAIM_TYPES = ['fact', 'decision', 'opinion', 'plan', 'commitment'] as const;
+export type ClaimType = (typeof CLAIM_TYPES)[number];
+/** proposed: waits for review. accepted: the owner's (a non-opinion becomes a Fact). superseded: lost a conflict. */
+export const CLAIM_STATUSES = ['proposed', 'accepted', 'rejected', 'superseded'] as const;
+export type ClaimStatus = (typeof CLAIM_STATUSES)[number];
+/** quote-fuzzy: the quote matched the source only approximately. statement-adds: the statement names what the quote does not. */
+export const CLAIM_FLAGS = ['quote-fuzzy', 'statement-adds'] as const;
+export type ClaimFlag = (typeof CLAIM_FLAGS)[number];
+/** area: a part of the product or code ("billing"); files: repo-relative paths that resolved against the code map. */
+export type ClaimScope = { area: string | null; files: string[] };
+/** Where a quote is in its source: the utterance and the character range inside the source text. */
+export type ClaimSpan = { utt: number; start: number; end: number };
+
+/**
+ * One statement drawn from a source. docId: its source, or `answer:<questionId>` for the owner's answer to a question.
+ * window: the extraction window it came from (null for an answer). speakerId: the Person who said it. assertedAt:
+ * when it was said. factId: the Fact accepting it created. run, sandbox: the run its source was added in.
+ */
+export type Claim = {
+  id: string; projectKey: string | null; docId: string; window: number | null; span: ClaimSpan | null;
+  type: ClaimType; statement: string; quote: string; speakerId: string | null; assertedAt: string | null;
+  confidence: number; scope: ClaimScope; about: string; due: string | null; flags: ClaimFlag[];
+  status: ClaimStatus; decidedBy: string | null; decidedAt: string | null; factId: string | null; createdAt: string;
+  run: string | null; sandbox: boolean;
+};
+/** A claim as extraction makes it (IntakeStore.saveWindow): always proposed. */
+export type ClaimDraft = Pick<Claim, 'type' | 'statement' | 'quote' | 'speakerId' | 'span' | 'assertedAt' | 'confidence' | 'scope' | 'about' | 'due' | 'flags'> & {
+  embedding: number[] | null;
+};
+
+/** unanswered: asked and not answered. contradictory: the source contradicts itself. needs_owner: a plan or commitment with no owner. */
+export const QUESTION_KINDS = ['unanswered', 'contradictory', 'needs_owner'] as const;
+export type QuestionKind = (typeof QUESTION_KINDS)[number];
+export const QUESTION_STATUSES = ['open', 'assigned', 'answered', 'dismissed'] as const;
+export type QuestionStatus = (typeof QUESTION_STATUSES)[number];
+/** askedBy, assignee: Person ids. answerClaimId: the claim answering it (IntakeStore.answerQuestion). */
+export type Question = {
+  id: string; projectKey: string | null; docId: string; window: number | null; text: string; kind: QuestionKind;
+  quote: string | null; askedBy: string | null; assignee: string | null; status: QuestionStatus; answerClaimId: string | null;
+  decidedBy: string | null; decidedAt: string | null; createdAt: string; run: string | null; sandbox: boolean;
+};
+export type QuestionDraft = Pick<Question, 'text' | 'kind' | 'quote' | 'askedBy'>;
+
+/** proposed: made from a speaker label nobody has confirmed. forgotten: its name and aliases are gone (forgetPerson). */
+export const PERSON_STATUSES = ['proposed', 'confirmed', 'forgotten'] as const;
+export type PersonStatus = (typeof PERSON_STATUSES)[number];
+/** aliases: the normalised names that resolve to it (aliasNorm). claims: how many claims it said. */
+export type Person = {
+  id: string; displayName: string; isOwner: boolean; status: PersonStatus; aliases: string[]; claims: number; createdAt: string;
+};
+
+/** supersession: the newer side probably replaces the older (same speaker, later decision); disagreement: anything else. */
+export const CONFLICT_KINDS = ['disagreement', 'supersession'] as const;
+export type ConflictKind = (typeof CONFLICT_KINDS)[number];
+/** dismissed: "not a conflict"; the pair stays suppressed until either side changes (its fingerprint). */
+export const CONFLICT_STATUSES = ['open', 'resolved', 'dismissed'] as const;
+export type ConflictStatus = (typeof CONFLICT_STATUSES)[number];
+export const CONFLICT_SIDE_KINDS = ['claim', 'fact', 'lesson'] as const;
+export type ConflictSideKind = (typeof CONFLICT_SIDE_KINDS)[number];
+/** a / b: that side is true. both: both partly, with a note. none: not a conflict (with a reason). */
+export const CONFLICT_CHOICES = ['a', 'b', 'both', 'none'] as const;
+export type ConflictChoice = (typeof CONFLICT_CHOICES)[number];
+export const CONFLICT_DISMISS_REASONS = ['scope', 'refines', 'handled'] as const;
+export type ConflictDismissReason = (typeof CONFLICT_DISMISS_REASONS)[number];
+
+/** A record a conflict, supersession or claim link names. */
+export type IntakeRef = { kind: ConflictSideKind; id: string };
+/**
+ * One side as it was when the conflict was found: its fingerprint (claimFingerprint, factFingerprint or
+ * lessonFingerprint) decides whether a dismissed pair has changed since, and assertedAt when it was said or recorded.
+ */
+export type ConflictSide = IntakeRef & { fingerprint: string; assertedAt: string | null };
+/** A deterministic pre-filter's finding ("numbers differ: 30 s vs 60 s"), kept as the pre-filter made it. */
+/** One pre-filter finding that made a pair worth judging (conflicts/prefilter.ts). */
+export type ConflictSignal = import('./conflicts/prefilter.ts').PrefilterSignal;
+/** The judge's answer: aQuote and bQuote are cited from each side's stored text. */
+export type ConflictJudge = {
+  relation: 'contradicts' | 'refines' | 'same' | 'unrelated'; aQuote: string; bQuote: string; explanation: string; confidence: number; model: string | null;
+};
+/** How the owner settled it. createdFactId: the reconciled statement's owner fact (both partly). */
+export type ConflictResolution = { choice: ConflictChoice; note: string | null; reason: ConflictDismissReason | null; createdFactId: string | null };
+/** decisionId: the resolve_conflict decision that settled it. */
+export type Conflict = {
+  id: string; kind: ConflictKind; status: ConflictStatus; projectKey: string | null; a: ConflictSide; b: ConflictSide;
+  signals: ConflictSignal[]; judge: ConflictJudge | null; resolution: ConflictResolution | null; decisionId: string | null;
+  createdAt: string; resolvedAt: string | null; resolvedBy: string | null; run: string | null; sandbox: boolean;
+};
+export type ConflictInput = Pick<Conflict, 'kind' | 'projectKey' | 'a' | 'b' | 'signals' | 'judge'> & { run?: RunTag | null };
+
+/** `from` lost conflict `conflictId` to `to`: (from)-[:SUPERSEDED_BY {conflictId}]->(to). */
+export type Supersession = { from: IntakeRef; to: IntakeRef; conflictId: string };
+export const CLAIM_LINK_RELS = ['refines', 'corroborates'] as const;
+export type ClaimLinkRel = (typeof CLAIM_LINK_RELS)[number];
+/** (claim)-[:REFINES|CORROBORATES]->(to). */
+export type ClaimLink = { from: string; to: IntakeRef; rel: ClaimLinkRel };

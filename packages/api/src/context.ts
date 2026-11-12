@@ -5,9 +5,10 @@ import { lstat, readFile, realpath } from 'node:fs/promises';
 import { join } from 'node:path';
 import { z } from 'zod';
 import { fileMaxBytes } from '@fb/worker/codegraph';
+import { DISPUTED_HEAD, disputedItems, disputeMark, disputesOf, openConflicts, type IntakeContext } from './disputes.ts';
 import { ServiceOverrun, type Admission, type Admitted, type Turn, type QueueInfo } from './admission.ts';
 import { capDiff, citeDiff, splitDiff, type DiffCite, quotedCode, taskPrNumbers } from './diff.ts';
-import { MIN_RELEVANCE, UNSCORED_RELEVANCE, withStoreDeadline, storeTimeLeft, storeRequestSignal, askPromptOnly, boundedScore, sharesTopic, FACT_RANK_FLOOR, CODE_MAP_VERSION, LESSON_POOL, rankLessons, orderByServingWeight, TUNE_MARGIN, cleanLessonPath, factOrigin, isNonMiss, mentionedPaths, slashPath, pathAffinity, serviceDirs, servicesInTask, SIMILARITY_FLOOR, isSecretPath, mapCapped, rankFacts, rankMisses, rankDocs, missAdmitted, MISS_CLOSE, addedLines, MAX_ADDED_LINES, hasTriggers, servedTriggered, triggered, triggerWhy, type AddedLine, type TriggerHit, hostRepoPath, DEMO_SOURCE, MODULE_TESTS_DEPTH, projectFromCwd, redactSecrets, relOfKey, repoRelative, type ActivityStore, type CodeGraphStore, type CodeMapMeta, type SessionListItem, type SessionsStore, type DocHit, type FileMiss, type Impact, type ModuleContext, type MapSymbol, type DocsStore, type FactHit, type FactsStore, type StoredFact, type KnowledgeStore, type Lesson, type LessonHit, type LlmProvider, type Project, type RelatedMiss, type Root, type ShownProjects, type LinksStore, type ProjectLink, otherEnd, isManifestDependency, lessonsFor, pathMatches, AnswerRefused, ModelOutputError, askJson, storedLabel } from '@fb/core';
+import { AGENT_HIDDEN_DOC_SOURCES, MIN_RELEVANCE, UNSCORED_RELEVANCE, withStoreDeadline, storeTimeLeft, storeRequestSignal, askPromptOnly, boundedScore, sharesTopic, FACT_RANK_FLOOR, CODE_MAP_VERSION, LESSON_POOL, rankLessons, orderByServingWeight, TUNE_MARGIN, cleanLessonPath, factOrigin, isNonMiss, mentionedPaths, slashPath, pathAffinity, serviceDirs, servicesInTask, SIMILARITY_FLOOR, isSecretPath, mapCapped, rankFacts, rankMisses, rankDocs, missAdmitted, MISS_CLOSE, addedLines, MAX_ADDED_LINES, hasTriggers, servedTriggered, triggered, triggerWhy, type AddedLine, type TriggerHit, hostRepoPath, DEMO_SOURCE, MODULE_TESTS_DEPTH, projectFromCwd, redactSecrets, relOfKey, repoRelative, type ActivityStore, type CodeGraphStore, type CodeMapMeta, type SessionListItem, type SessionsStore, type DocHit, type FileMiss, type Impact, type ModuleContext, type MapSymbol, type DocsStore, type FactHit, type FactsStore, type StoredFact, type KnowledgeStore, type Lesson, type LessonHit, type LlmProvider, type Project, type RelatedMiss, type Root, type ShownProjects, type LinksStore, type ProjectLink, otherEnd, isManifestDependency, lessonsFor, pathMatches, AnswerRefused, ModelOutputError, askJson, storedLabel } from '@fb/core';
 
 /**
  * applies: the judge's call on whether the lesson (or miss) bears on this work at all. Only one that applies can be a
@@ -28,7 +29,7 @@ export type Verdict = {
 /** kind 'miss': no lesson applied, and lessonId is a confirmed miss the work looks like it repeats. evidence: where in the diff. */
 export type Gap = { lessonId: string; title: string; rule: string; why: string; kind?: 'miss'; evidence?: DiffCite[]; missing?: string[] };
 /** A lesson (or miss) that applies but whose verdict pointed to nothing in the diff: neither a gap nor a pass. */
-export type CannotTell = { lessonId: string; title: string; rule: string; why: string; kind?: 'miss' };
+export type CannotTell = { lessonId: string; title: string; rule: string; why: string; kind?: 'miss'; /** The open conflict the lesson is in: a gap on it is not called. */ conflictId?: string };
 /** The diff the judge was given: from the agent, read from the repo for files_changed, or none. note: what a cut hid. */
 type JudgedDiff = { source: 'agent' | 'repo' | 'none'; text: string; note: string | null; shown: string[]; omitted: string[] };
 
@@ -133,7 +134,15 @@ export type ContextDeps = {
    * have no facts yet. Unset: those files are only said to have none.
    */
   requestScan?: (projectKey: string, paths: string[]) => Promise<unknown>;
+  /**
+   * Knowledge intake (INTAKE_ENABLED): conflicts served as caveats (disputes.ts), find_contradictions and submit_notes.
+   * Unset: none of that.
+   */
+  intake?: IntakeContext;
 };
+
+/** Open conflicts a full task context lists in its Disputed section, at most. */
+const DISPUTED_K = 5;
 
 const contextFloor = (d: ContextDeps): number => d.similarityFloor !== undefined && Number.isFinite(d.similarityFloor) && d.similarityFloor >= 0 && d.similarityFloor <= 1 ? d.similarityFloor : SIMILARITY_FLOOR;
 /** The miss bar (missAdmitted): as configured, else MISS_CLOSE, or an embedder's own lower calibrated floor (as factRankFloor). */
@@ -201,7 +210,7 @@ const RECORD_RETRY_MAX_MS = 2000;
 /** What the judge reads of a diff; capDiff names what it cut. */
 export const MAX_DIFF_CHARS = 32_000;
 
-async function resolveIn(q: ProjectRef, d: ContextDeps): Promise<Project | null> {
+export async function resolveIn(q: ProjectRef, d: ContextDeps): Promise<Project | null> {
   const folder = resolveProject(q, d.roots, { exists: d.exists });
   const p = folder && ((await d.aliasOf?.(folder.key)) ?? folder);
   if (!p || !folder) return null;
@@ -445,7 +454,7 @@ const NOTHING_APPLIES = (key: string, b: Backlog | null) => {
   return 'No confirmed miss resembles this work and no lesson is approved or proposed yet, so this is not a pass.';
 };
 
-const UNKNOWN_PROJECT = (ref: ProjectRef) =>
+export const UNKNOWN_PROJECT = (ref: ProjectRef) =>
   `${ref.cwd || !ref.project ? 'This directory' : 'This project key'} is not a tracked project (${ref.cwd ?? ref.project ?? 'no cwd given'}). Only folders under the Feedback Graph's project roots are covered, and only the ones selected on its Settings page (never one in EXCLUDE_PROJECTS); if none are selected yet, the owner chooses them there.`;
 
 /** Confirmed links to projects that are shown and in scope, at most LINKED_MAX, as (other project, link). */
@@ -473,7 +482,7 @@ async function linkedContext(projectKey: string, embedding: number[], task: stri
       const [misses, facts, docs] = await Promise.all([
         d.k.relatedMisses({ embedding, projectKey: key, k: LINKED_MISS_K * 3 }).then((h) => rankMisses(h.filter((m) => missAdmitted(m, [], missClose(d))), LINKED_MISS_K, [], [], f.similarity, f.factRank)),
         d.facts ? d.facts.searchFacts({ embedding, projectKey: key, k: LINKED_FACT_K * 3 }).then((h) => rankFacts(h, LINKED_FACT_K, [], [], f.similarity, f.factRank)) : Promise.resolve([]),
-        d.docs ? d.docs.searchDocs({ embedding, projectKey: key, k: LINKED_DOC_K }).then((h) => rankDocs(topicalDocs(task, h, key), LINKED_DOC_K, [], [], f.similarity, f.factRank)) : Promise.resolve([]),
+        d.docs ? d.docs.searchDocs({ embedding, projectKey: key, k: LINKED_DOC_K, excludeSources: AGENT_HIDDEN_DOC_SOURCES }).then((h) => rankDocs(topicalDocs(task, h, key), LINKED_DOC_K, [], [], f.similarity, f.factRank)) : Promise.resolve([]),
       ]);
       return { key, link, misses, facts, docs };
     }),
@@ -618,7 +627,7 @@ async function searchProject(project: Project, own: boolean, embedding: number[]
     d.k.searchLessons({ embedding, projectKey: own ? project.key : null, k: LESSON_POOL, ...(projectKeys && { projectKeys }) }),
     own ? d.k.relatedMisses({ embedding, projectKey: project.key, k: MISS_K * 3 }) : Promise.resolve([]),
     own && d.facts ? d.facts.searchFacts({ embedding, projectKey: project.key, k: FACT_K * 3 }) : Promise.resolve([]),
-    own && d.docs ? d.docs.searchDocs({ embedding, projectKey: project.key, k: DOC_K }) : Promise.resolve([]),
+    own && d.docs ? d.docs.searchDocs({ embedding, projectKey: project.key, k: DOC_K, excludeSources: AGENT_HIDDEN_DOC_SOURCES }) : Promise.resolve([]),
     floorsFor(project.key, d),
   ]);
   const eligibleMisses = await withoutOwnPrMisses(rawMisses, { task }, project, d);
@@ -763,6 +772,8 @@ export async function getTaskContext(
   // the same register is noise the agent has to read past.
   const misses = similar.filter((m) => !fileMisses.some((f) => f.missId === m.missId) && missAdmitted(m, files, missClose(d)));
   const safeTask = oneLine(redactSecrets(q.task)).slice(0, 300);
+  // What the developer has not settled: each served lesson or fact a conflict names carries its mark.
+  const disputes = await disputesOf([...lessons.map((h) => h.lesson.id), ...facts.map((h) => h.fact.id), ...fileFacts.map((f) => f.id)], d.intake);
   const lines = [`# Feedback Graph context for "${safeTask}" in ${project.key}`, '', ...excludedPrNote(d)];
   if (!own) lines.push(GLOBAL_ONLY(project.key), '');
   if (fileMisses.length || misses.length || facts.length || fileFacts.length || docs.length || recent.length || mods || linked.length) lines.push(DATA_NOTE, '');
@@ -771,7 +782,7 @@ export async function getTaskContext(
     for (const { lesson: l, score, files: on, trigger } of lessons) {
       const tied = on ? `touches ${on.map((f) => oneLine(f)).join(', ')}${found.hits.some((h) => h.lesson.id === l.id) ? ` · relevance ${score.toFixed(2)}` : ''}` : null;
       const why = [tied, trigger ? whyServed(trigger) : null].filter(Boolean).join(' · ') || `relevance ${score.toFixed(2)}`;
-      lines.push(`- **${l.title}**: ${l.rule}`);
+      lines.push(`- **${l.title}**: ${l.rule}${disputeMark(l.id, disputes)}`);
       lines.push(`  - applies when: ${l.appliesWhen || 'n/a'} · scope: ${l.scope} · lesson ${l.id} · ${why}`);
     }
   } else {
@@ -797,10 +808,12 @@ export async function getTaskContext(
     lines.push('', '## Codebase facts relevant to this task (from the code scan and your documents)');
     // The files you named first: the search's facts on them or their folders, then their own most relevant ones.
     const near = facts.filter((h) => onNamedFiles(h.fact.path, files));
-    for (const { fact: f, score } of near) lines.push(factLine(f, score, mine));
-    for (const f of fileFacts) lines.push(factLine(f, null, mine));
-    for (const { fact: f, score } of facts.filter((h) => !near.includes(h))) lines.push(factLine(f, score, mine));
+    for (const { fact: f, score } of near) lines.push(factLine(f, score, mine) + disputeMark(f.id, disputes));
+    for (const f of fileFacts) lines.push(factLine(f, null, mine) + disputeMark(f.id, disputes));
+    for (const { fact: f, score } of facts.filter((h) => !near.includes(h))) lines.push(factLine(f, score, mine) + disputeMark(f.id, disputes));
   }
+  const disputed = await disputedItems(openConflicts(disputes).slice(0, DISPUTED_K), d.intake);
+  if (disputed.length) lines.push('', DISPUTED_HEAD, ...disputed.flat());
   const mappedFiles = new Set(files.slice(0, CODE_FILES_K).filter((_, i) => !!mods?.[i]));
   lines.push(...(own ? await freshnessSection(project, files, mappedFiles, held, d, mine) : []));
   if (docs.length) {
@@ -886,7 +899,7 @@ async function briefContext(q: ProjectRef & { task: string; files?: string[]; se
     d.k.searchLessons({ embedding, projectKey: own ? project.key : null, k: LESSON_POOL, ...(projectKeys && { projectKeys }) }),
     files.length && d.codegraph ? d.codegraph.lessonsForPaths(project.key, files).then((x) => shownLessons(d, x, (y) => y.lesson)) : Promise.resolve([]),
     namedModules(project.key, files, d),
-    own && d.docs ? d.docs.searchDocs({ embedding, projectKey: project.key, k: DOC_K * 2 }) : Promise.resolve([]),
+    own && d.docs ? d.docs.searchDocs({ embedding, projectKey: project.key, k: DOC_K * 2, excludeSources: AGENT_HIDDEN_DOC_SOURCES }) : Promise.resolve([]),
     own ? agentDocsOf(project, files, d) : Promise.resolve([]),
     own ? triggerPool(project, d) : Promise.resolve([]),
     floorsFor(project.key, d),
@@ -907,11 +920,14 @@ async function briefContext(q: ProjectRef & { task: string; files?: string[]; se
   const lines = b.take([`# Feedback Graph brief for "${safeTask}" in ${project.key}`, ...excludedPrNote(d)]);
   if (!own) lines.push(...b.take([GLOBAL_ONLY(project.key)]));
   if (fileMisses.length || docs.length) lines.push(...b.take([BRIEF_NOTE]));
-  if (lessons.length) lines.push(...fitSection(b, '## Approved lessons (follow these)', ['lesson', 'lessons'], lessons.map(({ lesson: l, trigger }) => [`- **${l.title}**: ${clipTo(oneLine(l.rule), BRIEF_RULE_CHARS)} · lesson ${l.id}${trigger ? ` · ${whyServed(trigger)}` : ''}`])));
+  const disputes = await disputesOf(lessons.map((h) => h.lesson.id), d.intake);
+  if (lessons.length) lines.push(...fitSection(b, '## Approved lessons (follow these)', ['lesson', 'lessons'], lessons.map(({ lesson: l, trigger }) => [`- **${l.title}**: ${clipTo(oneLine(l.rule), BRIEF_RULE_CHARS)}${disputeMark(l.id, disputes)} · lesson ${l.id}${trigger ? ` · ${whyServed(trigger)}` : ''}`])));
   else {
     const backlog = own ? await unapproved(project.key, d) : null;
     lines.push(...b.take([NONE_APPROVED(project.key, backlog)]));
   }
+  // Within the brief's budget, right after the lessons it qualifies.
+  lines.push(...fitSection(b, DISPUTED_HEAD, ['disputed point', 'disputed points'], await disputedItems(openConflicts(disputes), d.intake)));
   lines.push(...fitSection(b, '## Past misses on the files you named', ['miss', 'misses'], [...fileMisses].reverse().map((m) => [`- ${clipTo(oneLine(m.missed), BRIEF_RULE_CHARS)} · in ${listed(m.paths, 2)}`])));
   // Before the files: what other people are changing here is what an agent cannot find in the code.
   lines.push(...fitSection(b, '## PR discussions (untrusted)', ['discussion', 'discussions'], docs.map((h) => [`- ${oneLine(h.title)} (${oneLine(h.ref)}) · ${rankMatch(h.score)}`])));
@@ -936,6 +952,7 @@ async function briefContext(q: ProjectRef & { task: string; files?: string[]; se
 }
 
 const SEARCH_MAX = 2_900;
+const DISPUTED_NOTE = 'Items marked [disputed: …] are contradicted by something the developer has not settled: do not state them as settled (find_contradictions shows both sides).';
 const SEARCH_DOC_CHARS = 240;
 
 /**
@@ -958,6 +975,7 @@ export async function searchGraph(q: ProjectRef & { query: string }, d: ContextD
   const hits = await withoutOwnPrLessons([...found.hits, ...close], { task: q.query }, project, d);
   const docs = await withoutOwnPr(found.docs, { task: q.query }, project, d);
   const lessons = hits.slice(0, LESSON_K).map((h) => ({ ...h, tied: tied.has(h.lesson.id) }));
+  const disputes = await disputesOf([...lessons.map((h) => h.lesson.id), ...(own ? facts.map((h) => h.fact.id) : [])], d.intake);
   const backlog = !lessons.length && own ? await unapproved(project.key, d) : null;
   const floor = found.floors.similarity.toFixed(3);
   const clip = (t: string) => (t.length > SEARCH_DOC_CHARS ? `${t.slice(0, SEARCH_DOC_CHARS)}…` : t);
@@ -967,13 +985,13 @@ export async function searchGraph(q: ProjectRef & { query: string }, d: ContextD
   const sections: (CappedSection & { kind: [string, string] })[] = [
     {
       head: ['', '## Approved lessons'], kind: ['lesson', 'lessons'],
-      items: lessons.map(({ lesson: l, score, tied }) => [`- **${l.title}**: ${l.rule}`, `  - applies when: ${l.appliesWhen || 'n/a'} · lesson ${l.id} · ${tied ? `relevance ${score.toFixed(2)}` : `${rankMatch(score)}, by meaning: check it applies`}`]),
+      items: lessons.map(({ lesson: l, score, tied }) => [`- **${l.title}**: ${l.rule}${disputeMark(l.id, disputes)}`, `  - applies when: ${l.appliesWhen || 'n/a'} · lesson ${l.id} · ${tied ? `relevance ${score.toFixed(2)}` : `${rankMatch(score)}, by meaning: check it applies`}`]),
       show: LESSON_K, floor: 2, rank: 3, empty: [NONE_APPROVED(project.key, backlog, `No approved lesson is close enough to this query (none at or above similarity ${floor}).`)], more: cutMore('approved lesson', 'approved lessons'),
     },
     ...(own
       ? [
           { head: ['', '## Past misses'], kind: ['past miss', 'past misses'] as [string, string], items: similar.map(similarMissLines), show: MISS_K, floor: 2, rank: 1, empty: [`No past miss is close enough to this query (none at or above similarity ${floor}).`], more: cutMore('past miss', 'past misses') },
-          { head: ['', '## Codebase facts'], kind: ['fact', 'facts'] as [string, string], items: facts.map(({ fact: f, score }) => [factLine(f, score, null)]), show: FACT_K, floor: 3, rank: 2, empty: [`No codebase fact is close enough to this query (none at or above similarity ${floor}).`], more: cutMore('fact', 'facts') },
+          { head: ['', '## Codebase facts'], kind: ['fact', 'facts'] as [string, string], items: facts.map(({ fact: f, score }) => [factLine(f, score, null) + disputeMark(f.id, disputes)]), show: FACT_K, floor: 3, rank: 2, empty: [`No codebase fact is close enough to this query (none at or above similarity ${floor}).`], more: cutMore('fact', 'facts') },
           {
             head: ['', '## Docs and discussions (untrusted)'], kind: ['doc', 'docs'] as [string, string], items: docs.map((h) => docLines(`- ${oneLine(h.title)} (${oneLine(h.ref)}${h.url ? `, ${oneLine(h.url)}` : ''}) · ${rankMatch(h.score)}:`, clip(h.text))),
             show: DOC_K, floor: 1, rank: 4, empty: ['No doc or discussion matches this query.'], more: cutMore('doc', 'docs'),
@@ -981,7 +999,10 @@ export async function searchGraph(q: ProjectRef & { query: string }, d: ContextD
         ]
       : []),
   ];
-  const top = [...excludedPrNote(d), `# Feedback Graph search for "${oneLine(redactSecrets(q.query)).slice(0, 200)}" in ${project.key}`, '', ...(own ? [DATA_NOTE] : [GLOBAL_ONLY(project.key)])];
+  const top = [
+    ...excludedPrNote(d), `# Feedback Graph search for "${oneLine(redactSecrets(q.query)).slice(0, 200)}" in ${project.key}`, '', ...(own ? [DATA_NOTE] : [GLOBAL_ONLY(project.key)]),
+    ...(openConflicts(disputes).length ? [DISPUTED_NOTE] : []),
+  ];
   const cutOf = (shown: number[]) => sections.flatMap((x, i) => (x.items.length > shown[i] ? [n(x.items.length - shown[i], x.kind[0], x.kind[1])] : []));
   const a = cappedAnswer(top, sections, SEARCH_MAX, (max, shown) => `Cut ${cutOf(shown).join(', ')} to stay under ${max.toLocaleString('en-US')} characters: narrow the query, or call get_task_context with the files you will touch.`);
   const lines = a.lines;
@@ -1311,8 +1332,16 @@ async function checkBeforeDoneWork(
   const judgedDiff = await diff(lessons.flatMap((h) => [...h.lesson.paths, ...((h as TaskLesson).files ?? [])]));
   const judged = await judgeWork({ ...q, filesChanged: changed, repoPath: project.repoPath }, lessons, judgedDiff, d);
   if ('notJudged' in judged) return { ...(await notJudged(q, project.key, lessons, 'lesson', judged.notJudged!, codePart, d)), codeGaps };
-  const { verdicts, gaps, cannotTell, byId, applying, queued } = judged;
-  d.checkRecord?.(lessons.map(h => h.lesson.id), gaps.map(g => g.lessonId), 'lesson_judged', verdicts);
+  const { verdicts, byId, applying, queued } = judged;
+  // A gap that rests on a lesson in an open conflict is not called: which side holds is the developer's to say.
+  const disputes = await disputesOf(judged.gaps.map((g) => g.lessonId), d.intake);
+  const disputedOf = (id: string) => (disputes.get(id) ?? []).find((k) => k.status === 'open');
+  const gaps = judged.gaps.filter((g) => !disputedOf(g.lessonId));
+  const cannotTell: CannotTell[] = [
+    ...judged.cannotTell,
+    ...judged.gaps.filter((g) => disputedOf(g.lessonId)).map((g) => ({ lessonId: g.lessonId, title: g.title, rule: g.rule, why: g.why, conflictId: disputedOf(g.lessonId)!.id })),
+  ];
+  d.checkRecord?.(lessons.map(h => h.lesson.id), judged.gaps.map(g => g.lessonId), 'lesson_judged', verdicts);
   await d.activity?.record({
     kind: 'predone_check',
     actor: d.checkDirect ? 'diff-rule-check' : d.judgeId ?? 'judge',
@@ -1398,7 +1427,9 @@ function cannotTellLines(xs: CannotTell[], what: 'lesson' | 'miss'): string[] {
   return [
     '',
     `## Cannot tell from the diff (${xs.length})`,
-    ...xs.map((x) => `- **${x.title}**${what === 'lesson' ? `: ${x.rule}` : ''}\n  - the judge pointed to no line of the diff for its call (${oneLine(x.why)}): check it yourself · ${what} ${x.lessonId}`),
+    ...xs.map((x) => `- **${x.title}**${what === 'lesson' ? `: ${x.rule}` : ''}\n  - ${x.conflictId
+      ? `this lesson is disputed (${x.conflictId}): the developer has not settled whether it holds, so the gap it shows (${oneLine(x.why)}) is not called: ask the developer`
+      : `the judge pointed to no line of the diff for its call (${oneLine(x.why)}): check it yourself`} · ${what} ${x.lessonId}`),
   ];
 }
 

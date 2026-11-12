@@ -27,7 +27,7 @@ const rpc = (method: string, params: object, headers: Record<string, string> = {
 });
 async function tool(routes: Routes, name: string, args: object = {}, o: { headers?: Record<string, string>; sleep?: (ms: number) => Promise<void> } = {}) {
   const a = app(routes);
-  const res = await handleAdminMcp(rpc('tools/call', { name, arguments: args }, o.headers), { request: a.request, ...(o.sleep && { sleep: o.sleep }) });
+  const res = await handleAdminMcp(rpc('tools/call', { name, arguments: args }, o.headers), { intake: true, request: a.request, ...(o.sleep && { sleep: o.sleep }) });
   const { result } = (await res.json()) as { result: Result };
   return { result, seen: a.seen, data: result.structuredContent, text: result.content[0].text };
 }
@@ -146,8 +146,8 @@ test('set_fact_relevance and demo_remove: a refusal fails; another project is na
 
 test('the admin endpoint ends sessions with 204 and has no stream; without a bearer the tools forward none', async () => {
   const a = app({});
-  expect((await handleAdminMcp(new Request('http://x/mcp/admin', { method: 'DELETE' }), { request: a.request })).status).toBe(204);
-  const get = await handleAdminMcp(new Request('http://x/mcp/admin'), { request: a.request });
+  expect((await handleAdminMcp(new Request('http://x/mcp/admin', { method: 'DELETE' }), { intake: true, request: a.request })).status).toBe(204);
+  const get = await handleAdminMcp(new Request('http://x/mcp/admin'), { intake: true, request: a.request });
   expect([get.status, get.headers.get('allow')]).toEqual([405, 'POST, DELETE']);
   const r = await tool({ 'GET /api/lessons/l1': { body: {} } }, 'lesson_get', { id: 'l1' }, { headers: {} });
   expect(r.seen[0].headers.authorization).toBe('');
@@ -155,7 +155,7 @@ test('the admin endpoint ends sessions with 204 and has no stream; without a bea
 
 test('an initialize whose client name is not a string names no agent', async () => {
   const a = app({});
-  const res = await handleAdminMcp(rpc('initialize', { protocolVersion: '2025-03-26', capabilities: {}, clientInfo: { name: 42, version: '1' } }), { request: a.request });
+  const res = await handleAdminMcp(rpc('initialize', { protocolVersion: '2025-03-26', capabilities: {}, clientInfo: { name: 42, version: '1' } }), { intake: true, request: a.request });
   expect(res.status).toBe(200);
   expect(res.headers.get('mcp-session-id')).toBeNull();
 });

@@ -2,12 +2,13 @@ import { createHash } from 'node:crypto';
 import { redactDeep } from '../redact.ts';
 import type { StoredFact } from '../graph/facts.ts';
 import type { Store } from '../store.ts';
-import type { Candidate, DecisionTarget, Lesson, TargetSnapshot } from '../types.ts';
+import type { Candidate, Claim, Conflict, DecisionTarget, Lesson, TargetSnapshot } from '../types.ts';
+import { claimFingerprint, conflictFingerprint, type ClaimSnapshotFields, type ConflictSnapshotFields } from '../intake/records.ts';
 import { ABSENT, canonicalJson, factStateFingerprint, lessonFingerprint, type FingerprintedFact, type LessonSnapshotFields, type MissLink } from './record.ts';
 import { thresholdsSnapshot } from '../loop/snapshots.ts';
 
 /** What the executors read and write. */
-export type DecisionExecStore = Pick<Store, 'knowledge' | 'facts' | 'graph' | 'decisions' | 'docs'>;
+export type DecisionExecStore = Pick<Store, 'knowledge' | 'facts' | 'graph' | 'decisions' | 'docs' | 'intake'>;
 
 const sha256 = (s: string) => createHash('sha256').update(s).digest('hex');
 
@@ -46,6 +47,22 @@ export function candidateSnapshot(c: Pick<Candidate, 'id' | 'status' | 'note' | 
   return { kind: 'candidate', id: c.id, fields, fingerprint: sha256(canonicalJson(['candidate', c.id, fields])) };
 }
 
+/** A claim as a conflict's resolution changes it (the fields IntakeStore.writeSnapshots sets), and its project. */
+export function claimSnapshot(c: Claim): TargetSnapshot {
+  const fields: ClaimSnapshotFields & Pick<Claim, 'projectKey'> = {
+    projectKey: c.projectKey, status: c.status, statement: c.statement, type: c.type, scope: c.scope, decidedBy: c.decidedBy, decidedAt: c.decidedAt, factId: c.factId,
+  };
+  return { kind: 'claim', id: c.id, fields, fingerprint: claimFingerprint(c) };
+}
+
+/** A conflict as its resolution changes it, and its project. */
+export function conflictSnapshot(c: Conflict): TargetSnapshot {
+  const fields: ConflictSnapshotFields & Pick<Conflict, 'projectKey'> = {
+    projectKey: c.projectKey, status: c.status, resolution: c.resolution, resolvedBy: c.resolvedBy, resolvedAt: c.resolvedAt, decisionId: c.decisionId,
+  };
+  return { kind: 'conflict', id: c.id, fields, fingerprint: conflictFingerprint(c) };
+}
+
 /** A target as it is now. A project's state is its own floors (tune_threshold). */
 export async function snapshotTarget(s: DecisionExecStore, t: Pick<DecisionTarget, 'kind' | 'id'>): Promise<TargetSnapshot> {
   switch (t.kind) {
@@ -65,6 +82,14 @@ export async function snapshotTarget(s: DecisionExecStore, t: Pick<DecisionTarge
     }
     case 'project':
       return thresholdsSnapshot(t.id, await s.facts.projectThresholds(t.id));
+    case 'claim': {
+      const c = await s.intake.claim(t.id);
+      return c ? claimSnapshot(c) : absentSnapshot(t);
+    }
+    case 'conflict': {
+      const c = await s.intake.conflict(t.id);
+      return c ? conflictSnapshot(c) : absentSnapshot(t);
+    }
   }
 }
 

@@ -53,7 +53,8 @@ export async function foldLabels(entries: readonly Activity[], d: { decisions: P
     const label = ownerLabel(e);
     if (!label || (await d.cursors.getCursor(LABEL_PREFIX + e.id))) continue;
     const dec = await d.decisions.get(label.decisionId);
-    if (!dec) continue;
+    // The owner's own decision (a conflict resolved, rolled back) carries no loop score to calibrate.
+    if (!dec || dec.author === 'owner') continue;
     // Marked first: a failure after it loses this one label rather than counting it again.
     await d.cursors.setCursor(LABEL_PREFIX + e.id, e.ts);
     await d.decisions.bumpCalibration({

@@ -157,6 +157,8 @@ export const IsoInstant = z.string().datetime({ offset: true })
  */
 export type DecisionFilter = {
   status?: Decision['status'][];
+  /** Only the loop's, or only the owner's (Decision.author). */
+  author?: Decision['author'];
   type?: Decision['type'];
   projectKey?: string;
   projectKeys?: string[];
@@ -186,7 +188,7 @@ export type DecisionKey = { createdAt: string; id: string };
 export const DECISION_COUNT_KEYS = ['status', 'mode', 'type', 'applied', 'createdWeek'] as const;
 export type DecisionCountKey = (typeof DECISION_COUNT_KEYS)[number];
 /** The filters DecisionsStore.count applies, as list's. */
-export type DecisionCountFilter = Pick<DecisionFilter, 'status' | 'type' | 'mode' | 'projectKeys' | 'since' | 'appliedSince'>;
+export type DecisionCountFilter = Pick<DecisionFilter, 'status' | 'author' | 'type' | 'mode' | 'projectKeys' | 'since' | 'appliedSince'>;
 /** One group of DecisionsStore.count: the keys asked for, and how many decisions have them. */
 export type DecisionCount = Partial<Pick<Decision, 'status' | 'mode' | 'type'> & { applied: boolean; createdWeek: string }> & { n: number };
 

@@ -505,6 +505,7 @@ export class PgFactsStore implements FactsStore {
                  AND (x.origin = 'manifest' OR (x.origin IS NULL AND x.why ~ $1))) AS manifest_facts,
               (SELECT count(*) FROM facts x WHERE x.project_key = p.key AND x.current AND NOT x.sandbox AND x.doc_id IS NULL AND x.origin = 'you') AS your_facts,
               (SELECT count(*) FROM facts x WHERE x.project_key = p.key AND x.current AND NOT x.sandbox AND x.doc_id IS NULL AND x.origin = 'loop') AS loop_facts,
+              (SELECT count(*) FROM facts x WHERE x.project_key = p.key AND x.current AND NOT x.sandbox AND x.doc_id IS NULL AND x.origin = 'claim') AS claim_facts,
               to_jsonb(last) AS last
        FROM projects p
        LEFT JOIN LATERAL (SELECT * FROM scan_jobs j WHERE j.project_key = p.key ORDER BY j.requested_at DESC, j.id DESC LIMIT 1) last ON true
@@ -520,7 +521,7 @@ export class PgFactsStore implements FactsStore {
       feedback: r.feedback,
       lessons: r.lessons,
       facts: r.facts,
-      factsByOrigin: { model: r.facts - r.document_facts - r.manifest_facts - r.your_facts - r.loop_facts, manifest: r.manifest_facts, document: r.document_facts, you: r.your_facts, loop: r.loop_facts },
+      factsByOrigin: { model: r.facts - r.document_facts - r.manifest_facts - r.your_facts - r.loop_facts - r.claim_facts, manifest: r.manifest_facts, document: r.document_facts, you: r.your_facts, loop: r.loop_facts, claim: r.claim_facts },
       lastScan: r.last ? jobOf(r.last) : null,
       pinned: r.pinned === true,
     }));

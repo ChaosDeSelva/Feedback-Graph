@@ -11,7 +11,7 @@ import { bearerToken, tokenMatches } from './auth.ts';
  */
 
 /** Which OPERATOR_ALLOW verb each owner-only route is. */
-export const OWNER_ROUTES: readonly (readonly ['POST' | 'PUT' | 'PATCH' | 'DELETE', string, OperatorVerb])[] = [
+export const OWNER_ROUTES: readonly (readonly ['GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE', string, OperatorVerb])[] = [
   ['POST', '/api/candidates/:id/decision', 'inbox_decide'],
   ['POST', '/api/candidates/:id/undo', 'inbox_decide'],
   ['POST', '/api/candidates/decisions', 'inbox_decide'],
@@ -64,6 +64,22 @@ export const OWNER_ROUTES: readonly (readonly ['POST' | 'PUT' | 'PATCH' | 'DELET
   ['PUT', '/api/loop/settings', 'loop_settings'],
   ['POST', '/api/loop/pause', 'loop_settings'],
   ['POST', '/api/loop/resume', 'loop_settings'],
+  // Knowledge intake (intake.ts): reads too, since a source is what people said and never reaches an agent. Removing
+  // one is docs_delete, off by default.
+  ['POST', '/api/intake', 'intake'],
+  ['GET', '/api/intake/sources', 'intake'],
+  ['GET', '/api/intake/sources/:id', 'intake'],
+  ['POST', '/api/intake/sources/:id/reread', 'intake'],
+  ['DELETE', '/api/intake/sources/:id', 'docs_delete'],
+  // Knowledge intake's review (intakeReview.ts): what is accepted reaches agents, so off for the operator token by default.
+  ['PATCH', '/api/claims/:id', 'claims_decide'],
+  ['POST', '/api/claims/decisions', 'claims_decide'],
+  ['PATCH', '/api/questions/:id', 'claims_decide'],
+  ['POST', '/api/questions/:id/answer', 'claims_decide'],
+  ['PATCH', '/api/people/:id', 'claims_decide'],
+  ['POST', '/api/people/merge', 'claims_decide'],
+  ['POST', '/api/people/:id/forget', 'claims_decide'],
+  ['POST', '/api/conflicts/:id/resolve', 'conflict_decide'],
 ];
 
 const MAX_NAME = 40;

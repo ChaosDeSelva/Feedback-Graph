@@ -1,0 +1,23 @@
+WEBVTT
+
+NOTE Recording of the importer sync
+
+1
+00:00:02.000 --> 00:00:06.000
+<v Wren>Importer sync. I have the dates first.
+
+2
+00:00:07.000 --> 00:00:12.000
+<v Wren>The importer ships in January. Finance asked for the holidays to be clear.
+
+3
+00:00:13.000 --> 00:00:21.000
+<v Mara>Decision: we're raising the import batch cap to 2000 rows. The 500-row batches made the nightly run take four hours.
+
+4
+00:00:22.000 --> 00:00:28.000
+<v Oskar>Import jobs time out after five minutes.
+
+5
+00:00:29.000 --> 00:00:35.000
+<v Wren>Has anyone checked whether the January date works for the finance team?

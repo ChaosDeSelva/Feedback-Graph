@@ -9,7 +9,7 @@ import { toVector, type Db } from './db.ts';
 const SOURCES: { label: string; table: string; text: string; where?: string }[] = [
   { label: 'Lesson', table: 'lessons', text: `title || E'\\n' || rule || E'\\nApplies when: ' || coalesce(applies_when, '')` },
   { label: 'Miss', table: 'misses', text: `missed || E'\\n' || coalesce(cause_explanation, '')` },
-  { label: 'Fact', table: 'facts', text: `path || ': ' || statement`, where: 'current' },
+  { label: 'Fact', table: 'facts', text: `CASE WHEN origin = 'claim' OR path LIKE 'conflict:%' THEN statement ELSE path || ': ' || statement END`, where: 'current' },
   { label: 'Chunk', table: 'chunks', text: 'text' },
 ];
 

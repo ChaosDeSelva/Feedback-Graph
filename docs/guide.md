@@ -40,7 +40,7 @@ A read-only install (one with no tokens) needs no sign-in, but you cannot make o
 
 ## The sidebar
 
-Pages are grouped: **Overview** (Dashboard), **Review** (Inbox, Ask, Lessons, Decisions), **Insights** (Learning loop, Graph, Patterns, Sessions), **Data** (Projects, Activity), **Help** (Docs) and **Setup** (Settings). The highlighted entry is the page you are on. A count beside **Decisions** is how many of the learning loop's proposals wait for you (in the tooltip when the sidebar is collapsed).
+Pages are grouped: **Overview** (Dashboard), **Review** (Inbox, Intake when knowledge intake is on, Ask, Lessons, Decisions), **Insights** (Learning loop, Graph, Patterns, Sessions), **Data** (Projects, Activity), **Help** (Docs) and **Setup** (Settings). The highlighted entry is the page you are on. A count beside **Decisions** is how many of the learning loop's proposals wait for you (in the tooltip when the sidebar is collapsed).
 
 At the bottom:
 
@@ -167,6 +167,46 @@ Possible pushback from your sessions and from comments on your pull requests and
 **When the list is empty**: it says why. *No project folders yet* or *Nothing is being read* links to Settings. If the classifier gave up on some turns (say its model was missing), **Re-queue *n* turns that were given up** tries them again.
 
 **Keys** (outside text fields): `j` next, `k` previous, `c` confirm, `r` reject. `Cmd`, `Ctrl` and `Alt` combinations are ignored, so copying never decides.
+
+## Intake
+
+Only on an install with knowledge intake turned on (`INTAKE_ENABLED=1` in `.env`, then `docker compose up -d`); otherwise it is not in the sidebar, and opening it says *Knowledge intake is off*. What people said in calls and notes, broken into claims and questions for you to review, and the conflicts between what agents may be told. **Agents only see the claims you accept**; an accepted opinion is never given to them, and the transcript itself never is.
+
+A source comes in through **Add a source** on the Sources tab (paste the text or pick a `.txt`, `.md`, `.vtt` or `.srt` file, with its project, kind, title, date, who was there and whether it is private; a transcript is private by default), `POST /api/intake`, the admin MCP tool `intake_submit`, or an agent's `submit_notes`; this page reviews what was drawn from it. Settings, privacy and cost: [operations](operations.md#knowledge-intake).
+
+**Header**: the **project** filter (*all projects* by default) and five tabs: **Sources**, **Claims** (the default), **Questions**, **Conflicts** and **People**. The address keeps the tab and filters (`#intake/claims?project=shop`), so a view can be linked. Each tab is a list on the left and the open item on the right, as on the Inbox: `j` and `k` move, and the keys below act on the open item (outside text fields). On a read-only install everything can be read, and every action and key is off.
+
+**Sources**
+- Each row: the kind (*call*, *notes*, *doc*), the project and the meeting date, and its state: *queued* (blue), *reading window 3/8*, *done* (green) or *failed* (red).
+- Detail: the badges (a grey **private** one on a source never synced, even with `SYNC_CLAIMS`: the default for a transcript and an agent's notes), when it happened, where it came from, who was there, when it was added, how many claims, and **What was said**, the redacted text with the quotes claims were drawn from marked. A failed reading says why.
+- **Review its claims** opens the Claims tab filtered to this source. **Read again** queues a failed source to be read once more. **Delete** asks what to keep: **Keep the facts from claims you accepted** (the default) removes its text, excerpts, the claims you have not accepted and its questions; **Remove everything from it** also closes the facts its claims became, as a `remove_source` decision on the [Decisions](#decisions) page that a rollback re-opens.
+
+**Claims**
+- Tabs: **proposed** (waiting for you), **accepted**, **rejected**, **superseded** (lost a conflict; kept, not deleted). Filter by **type** and **speaker**.
+- Each row: the type badge (*fact*, *decision*, *plan*, *commitment*, *opinion*), the speaker, what it is about, how sure the extraction was, the statement, and a red count of its conflicts. Flags in accent: **quote matched loosely** (`quote-fuzzy`: the source's own words are shown) and **statement adds to the quote** (`statement-adds`: it names a number, version, date or name the quote does not say; check it).
+- Detail: the statement, **Agents see this: yes or no** and why, who said it and when with the verbatim quote, and in red **Conflicts with what is already known** when it disagrees with a fact, lesson or claim (accepting it then gives agents both sides, marked disputed, until you settle the conflict).
+- **Accept as fact** (`a`; *Accept as opinion* for an opinion) files it as a project fact agents are given. **Keep as opinion** accepts it attributed, not given to agents. **Reject** (`r`). `e` jumps to the statement to edit; you can also change the type, what it is about, the area, the files, the fact's kind, and for a global claim the project its fact is filed under, then **Save edits**. An accepted opinion stays editable: re-typing it as a fact, decision, plan or commitment gives it to agents.
+- Tick rows for **Accept selected** or **Reject selected**; filtered to one source, **Accept all from this source** (opinions are accepted as opinions).
+- After a reject or keep as opinion, a bar offers **Undo**.
+
+**Questions**
+- Tabs: **open**, **assigned**, **answered**, **dismissed**. Each is *unanswered*, *contradictory* (a source contradicted itself) or *needs an owner* (a plan or commitment nobody took on), with the quote and who asked.
+- **Assign** it to a person. **Answer** it with a statement and a type (and for a global question, the project to file it under): your answer is an accepted claim, so a fact, decision, plan or commitment is given to agents. **Dismiss** (`d`); a dismissed one can be reopened.
+
+**Conflicts**
+- Tabs: **open**, **resolved**, **dismissed**. Each row: the kind, *disagreement* (red) or *supersession* (blue: the newer side, said later by the same person or by you, probably replaces the older), the project, and both sides in one line each.
+- Detail: the judge's explanation, the differences found (*numbers differ: 30 s vs 60 s*) and how far apart the two were said, the quotes the judge cited, then **two columns, A and B**. Each shows whether it is a claim, fact or lesson, its type and status, what it says, the verbatim quote, who said it and when, **Agents see this: yes or no**, and for a claim **open in source**. On a supersession the newer side is marked *probably replaces the other* and its button is preselected.
+- Choose:
+  - **A is true** (`1`) or **B is true** (`2`): the other side is superseded, never deleted. Agents stop being given it: a claim is marked superseded and the fact it became closed, a fact closed, a lesson superseded.
+  - **Both partly** (`3`): needs a **note** saying how each is true; both stay and are served with your note. With a **reconciled statement**, that statement is filed as your fact and both sides are superseded by it.
+  - **Not a conflict** (`4`): needs a reason (*different scope*, *one refines the other*, *already handled*). The pair is not flagged again until one side changes.
+  - Leave it open for later: until then agents are given both sides marked disputed.
+- Each choice is a `resolve_conflict` decision by you on the [Decisions](#decisions) page. **Undo**, in the bar right after, or **Undo this choice** on a resolved conflict, rolls it back: the conflict opens again and the loser is restored exactly. You can also roll it back from the Decisions page.
+
+**People**
+- Tabs: **confirmed**, **proposed** (a speaker label nobody has yet), **forgotten**. Each row shows how many claims they made.
+- **Confirm** (`c`) a proposed person, or merge them into someone you know (everything they said, their aliases and questions become that person's). **Rename**, add or remove **aliases**.
+- **Forget this person** (asks first; cannot be undone): their name becomes *former participant*, their aliases and the claims of theirs you have not accepted are deleted, and their name is removed from the facts their accepted claims became and from earlier Activity entries. You cannot forget yourself.
 
 ## Lessons
 

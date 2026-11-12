@@ -27,7 +27,11 @@ export type ProbeKind =
   | 'Activity'
   | 'SyncCursor'
   | 'Decision'
-  | 'DecisionNote';
+  | 'DecisionNote'
+  | 'Person'
+  | 'Claim'
+  | 'Question'
+  | 'Conflict';
 
 /** An embedded record with just the fields its embedding text is built from, as an older store might hold it. */
 export type EmbeddedSeed =
@@ -98,6 +102,11 @@ export interface StoreProbe {
   seedEmbedded(row: EmbeddedSeed): Promise<void>;
   /** Text stored under older redaction rules (StaleTextSeed), with placeholder parents where a backend needs them. */
   seedStaleText(row: StaleTextSeed): Promise<void>;
+  /**
+   * Intake text as older redaction rules left it, written past the redaction at the door: a claim's statement and quote,
+   * a question's text, and the source document's first chunk all become `text`.
+   */
+  seedIntakeText(row: { claimId: string; questionId: string; docId: string; text: string }): Promise<void>;
   /** Mark a lesson decided by you, as the rule before 0.6.2 marked every decision, a machine's too. */
   seedOwnerMark(lessonId: string): Promise<void>;
   /**

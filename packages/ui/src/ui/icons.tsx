@@ -51,6 +51,10 @@ export const SessionIcon = (p: P) => (
 export const AskIcon = (p: P) => (
   <Icon {...p}><path d="M2.5 3.5h11v7.5H8l-3 2.5V11H2.5Z" /><path d="M6.6 5.9a1.4 1.4 0 1 1 1.9 1.3c-.3.1-.5.4-.5.7v.3" /><path d="M8 9.6v.01" /></Icon>
 );
+/** A speech bubble with lines drawn out of it: the Intake page. */
+export const IntakeIcon = (p: P) => (
+  <Icon {...p}><path d="M2.5 3h7v5h-4l-2 1.8V8h-1Z" /><path d="M11 6.5h2.5M11 9h2.5M7 11.5h6.5" /></Icon>
+);
 export const DocIcon = (p: P) => (
   <Icon {...p}><path d="M4 1.8h5.3L12.5 5v9.2H4Z" /><path d="M9 1.8V5.3h3.5M6 8.5h4.5M6 11h4.5" /></Icon>
 );

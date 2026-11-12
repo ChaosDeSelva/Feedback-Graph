@@ -154,6 +154,14 @@ export class Neo4jProbe implements StoreProbe {
     await this.g.run(`CREATE (n:${label(kind)}) SET n = $props`, { props });
   }
 
+  async seedIntakeText(row: { claimId: string; questionId: string; docId: string; text: string }) {
+    await this.g.run(
+      `MATCH (c:Claim {id: $claimId}), (q:Question {id: $questionId}), (:Doc {id: $docId})-[:HAS_CHUNK]->(k:Chunk {idx: 0})
+       SET c.statement = $text, c.quote = $text, q.text = $text, k.text = $text`,
+      row,
+    );
+  }
+
   async seedOwnerMark(lessonId: string) {
     await this.g.run('MATCH (l:Lesson {id: $id}) SET l.decidedByYou = true', { id: lessonId });
   }

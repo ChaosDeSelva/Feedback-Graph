@@ -26,6 +26,8 @@ export type WorkerLoopDeps = {
   syncFeedback: () => Promise<void>;
   /** Link detection, beside the loop (never awaited). */
   detectLinks: () => void;
+  /** Contradiction detection (knowledge intake), beside the loop (never awaited); unset while intake is off. */
+  detectConflicts?: () => void;
   retention: () => Promise<void>;
   evidence: Pick<SessionEvidenceGate, 'ready' | 'recheck' | 'settled' | 'afterIngest'>;
   // Each round.
@@ -103,6 +105,7 @@ export async function runWake(d: WorkerLoopDeps): Promise<void> {
   await d.syncGithubDocs().catch((err) => d.log('github sync failed', { error: redactSecrets(String(err)) }));
   await d.syncFeedback().catch((err) => d.log('comment sync failed', { error: redactSecrets(String(err)) }));
   d.detectLinks();
+  d.detectConflicts?.();
   await d.retention();
   if (d.evidence.ready()) await d.evidence.recheck();
   // Keep going without sleeping while there is still work: backfill, post-mortems, scans. The learning loop is

@@ -9,6 +9,7 @@ import { PgEmbeddingsStore } from './embeddings.ts';
 import { PgFactsStore } from './facts.ts';
 import { PgGraphStore } from './graph.ts';
 import { PgInsightsStore } from './insights.ts';
+import { PgIntakeStore } from './intake.ts';
 import { PgKnowledgeStore } from './knowledge.ts';
 import { PgLinksStore } from './links.ts';
 import { migrate } from './migrate.ts';
@@ -40,6 +41,7 @@ export function postgresStore(db: Db): PostgresStore {
     chats: new PgChatStore(db),
     runs: new PgRunsStore(db),
     decisions: new PgDecisionsStore(db),
+    intake: new PgIntakeStore(db),
     ensureSchema: async () => {
       await migrate(db.pool, { embeddingDimensions: db.dims });
       await checkPgvector(db);

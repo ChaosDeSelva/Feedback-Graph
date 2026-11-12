@@ -1,10 +1,11 @@
 import { createRequire } from 'node:module';
 import { apiAuthConfigured } from './authState.ts';
 import { parseLogins } from './feedbackRules.ts';
+import { intakeEnabled } from './intake/enabled.ts';
 import { parseGithubRepos } from './integrations/github.ts';
 import type { Root } from './projects.ts';
 import { MISS_CLOSE } from './relevance.ts';
-import { DECISION_TYPES, type DecisionType } from './types.ts';
+import { LOOP_DECISION_TYPES, type DecisionType } from './types.ts';
 import { DEFAULT_NUM_CTX, DEFAULT_NUM_PREDICT, DEFAULT_OLLAMA_TIMEOUT_MS, DEFAULT_REPEAT_PENALTY } from './ollama.ts';
 
 /** Bumped with each release; reported by /api/status and the worker heartbeat. */
@@ -83,6 +84,10 @@ export type Config = {
    * when a Claude token is set, else codex-cli when a Codex login exists, else the local model.
    */
   llm: { classify: string | null; postmortem: string | null; scan: string | null; check: string | null; docs: string | null; chat: string | null };
+  /** Knowledge intake (0.9.0): INTAKE_ENABLED, INTAKE_LLM, INTAKE_PROVIDER_ALLOW, INTAKE_LLM_CALLS_PER_DAY. */
+  intake: IntakeConfig;
+  /** Contradiction detection (0.9.0, with intake): CONFLICT_LLM, CONFLICT_LLM_CALLS_PER_DAY, CONFLICT_SWEEP_MINUTES. */
+  conflicts: ConflictConfig;
   pollSeconds: number;
   classifyBatch: number;
   scanMaxBytes: number;
@@ -175,6 +180,23 @@ export type SummaryConfig = {
 export const LOOP_MODES = ['off', 'observe', 'propose', 'auto'] as const;
 export type LoopMode = (typeof LOOP_MODES)[number];
 
+/**
+ * config.intake. enabled: INTAKE_ENABLED (intakeEnabled). llm: INTAKE_LLM; null: DOCS_LLM, then SCAN_LLM, then the local
+ * model, skipping any the allow list refuses. providerAllow: INTAKE_PROVIDER_ALLOW, the provider kinds intake may send
+ * what people said to (default ollama and claude-cli: no company API key unless the owner widens it). llmCallsPerDay:
+ * INTAKE_LLM_CALLS_PER_DAY (default 200; 0: no extraction).
+ */
+export type IntakeConfig = { enabled: boolean; llm: string | null; providerAllow: string[]; llmCallsPerDay: number };
+/**
+ * config.conflicts. llm: CONFLICT_LLM, the judge; null: intake's model. It is held to INTAKE_PROVIDER_ALLOW, since it
+ * reads what people said. llmCallsPerDay: CONFLICT_LLM_CALLS_PER_DAY (default 60; 0: pairs are only pre-filtered).
+ * sweepMinutes: CONFLICT_SWEEP_MINUTES (default 360), how often the sweep pages through facts and approved lessons.
+ */
+export type ConflictConfig = { llm: string | null; llmCallsPerDay: number; sweepMinutes: number };
+export const INTAKE_PROVIDER_ALLOW_DEFAULT = ['ollama', 'claude-cli'] as const;
+/** The provider kind of a model spec ("ollama:gemma4" -> "ollama"). */
+export const providerKind = (spec: string) => (spec.includes(':') ? spec.slice(0, spec.indexOf(':')) : spec).trim().toLowerCase();
+
 /** config.loop: the LOOP_* settings (the loop's shared state, which reads them, is loop/state.ts). */
 export type LoopConfig = {
   /** LOOP_MODE: the mode on first start only; null (unset): LOOP_DEFAULT_MODE. From then on Settings decides. */
@@ -211,6 +233,13 @@ export type CloudConfig = {
    * false (the default): only approved lessons leave, plus the new status of any lesson the cloud already has.
    */
   suggestions: boolean;
+  /**
+   * SYNC_CLAIMS=true: facts accepted claims became (origin claim) are sent too, without their quotes, never one from a
+   * private source. false (the default): none leaves.
+   */
+  claims: boolean;
+  /** SYNC_PEOPLE=true (needs SYNC_CLAIMS): a claim's fact names who said it; false (the default): "a participant". */
+  people: boolean;
   /** Explicit privacy boundary: these project keys never export new content to cloud. */
   localOnlyProjects?: string[];
   /** Explicit owner opt-in, loaded from shared Settings, never inferred from scanned content. */
@@ -250,6 +279,12 @@ export const OPERATOR_VERBS = [
   'run_cleanup', 'demo',
   // The learning loop: approve, reject, keep or roll back its decisions and note on them; its mode, pause and resume.
   'loop_decide', 'loop_settings',
+  // Knowledge intake (INTAKE_ENABLED): add a source (a transcript, notes) to be read into claims, read one back, read it again.
+  'intake',
+  // Knowledge intake (0.9.0): accept, edit or reject claims, answer or assign questions, rename, merge or forget people.
+  'claims_decide',
+  // Knowledge intake (0.9.0): settle a conflict, choosing which of two things agents may be told is true.
+  'conflict_decide',
 ] as const;
 export type OperatorVerb = (typeof OPERATOR_VERBS)[number];
 /**
@@ -257,9 +292,11 @@ export type OperatorVerb = (typeof OPERATOR_VERBS)[number];
  * (projects are the owner's opt-in), and what deletes data (deleting a project, an uploaded document, a link between
  * projects or an Ask conversation; settings, whose cleanup deletes unselected projects' data), imports lessons from a
  * file, or sets integration keys; `chat` (asking in Ask), which spends the owner's Claude or Codex subscription; and the
- * learning loop's decisions and settings (an agent must not judge, or switch on, what the loop teaches agents).
+ * learning loop's decisions and settings (an agent must not judge, or switch on, what the loop teaches agents); and
+ * deciding claims drawn from what people said (claims_decide: an accepted claim becomes a fact agents are given), and
+ * settling conflicts (conflict_decide: choosing which of two things agents are told is true is the owner's call).
  */
-const OPERATOR_DEFAULT_OFF: readonly OperatorVerb[] = ['lesson_decide', 'select_projects', 'delete_project', 'docs_delete', 'links_delete', 'settings', 'import', 'integrations', 'chat', 'chat_delete', 'loop_decide', 'loop_settings'];
+const OPERATOR_DEFAULT_OFF: readonly OperatorVerb[] = ['lesson_decide', 'select_projects', 'delete_project', 'docs_delete', 'links_delete', 'settings', 'import', 'integrations', 'chat', 'chat_delete', 'loop_decide', 'loop_settings', 'claims_decide', 'conflict_decide'];
 /** What the operator token may do with OPERATOR_ALLOW empty. A list given there replaces these, not adds to them. */
 export const OPERATOR_DEFAULT_VERBS: readonly OperatorVerb[] = OPERATOR_VERBS.filter((v) => !OPERATOR_DEFAULT_OFF.includes(v));
 
@@ -366,7 +403,7 @@ export function loadConfig(env: Env): Config {
     if (u && u.protocol !== 'http:' && u.protocol !== 'https:') problems.push(`CODEX_RUNNER_URL must be http:// or https:// (got ${u.protocol})`);
     else if (u && (u.username || u.password)) problems.push('CODEX_RUNNER_URL must not carry a user name or password (the runner token is in the scratch volume)');
   }
-  for (const k of ['CLASSIFY_LLM', 'POSTMORTEM_LLM', 'SCAN_LLM', 'SUMMARY_LLM', 'DOCS_LLM', 'CHAT_LLM', 'LOOP_LLM']) {
+  for (const k of ['CLASSIFY_LLM', 'POSTMORTEM_LLM', 'SCAN_LLM', 'SUMMARY_LLM', 'DOCS_LLM', 'CHAT_LLM', 'LOOP_LLM', 'INTAKE_LLM']) {
     if (/^codex-cli(:|$)/.test(env[k]?.trim() ?? '') && !runnerUrl && env.ALLOW_UNCONFINED_CODEX?.trim() !== '1') {
       problems.push(`${k}: codex-cli inside the worker can read every file the worker can (all transcripts, every project's .env, the worker's secrets); run it in the codex-runner sidecar (CODEX_RUNNER_URL with docker compose --profile codex), set ALLOW_UNCONFINED_CODEX=1 to accept that, or use claude-cli (SECURITY.md)`);
     }
@@ -401,6 +438,14 @@ export function loadConfig(env: Env): Config {
 
   const syncSuggestions = env.SYNC_SUGGESTIONS?.trim().toLowerCase() || 'false';
   if (syncSuggestions !== 'true' && syncSuggestions !== 'false') problems.push(`SYNC_SUGGESTIONS must be true or false (got ${JSON.stringify(env.SYNC_SUGGESTIONS)})`);
+  const syncFlag = (name: 'SYNC_CLAIMS' | 'SYNC_PEOPLE') => {
+    const v = env[name]?.trim().toLowerCase() || 'false';
+    if (v !== 'true' && v !== 'false') problems.push(`${name} must be true or false (got ${JSON.stringify(env[name])})`);
+    return v === 'true';
+  };
+  const syncClaims = syncFlag('SYNC_CLAIMS');
+  const syncPeople = syncFlag('SYNC_PEOPLE');
+  if (syncPeople && !syncClaims) problems.push('SYNC_PEOPLE needs SYNC_CLAIMS=true: names go only with the claims they said');
   const cloudUrl = env.CLOUD_URL?.trim() || '';
   const cloudToken = env.CLOUD_TOKEN?.trim() || '';
   let cloud: Config['cloud'] = null;
@@ -416,10 +461,11 @@ export function loadConfig(env: Env): Config {
     const machine = env.CLOUD_MACHINE?.trim() || null;
     if (machine && !/^[\w.-]{1,64}$/.test(machine)) problems.push('CLOUD_MACHINE must be 1 to 64 letters, digits, dots, dashes or underscores');
     if (problems.length === before) {
-      cloud = { url: cloudUrl.replace(/\/+$/, ''), token: cloudToken, intervalMinutes: interval, projects: list(env.SYNC_PROJECTS), ...(env.CLOUD_LOCAL_ONLY_PROJECTS?.trim() ? { localOnlyProjects: list(env.CLOUD_LOCAL_ONLY_PROJECTS) } : {}), suggestions: syncSuggestions === 'true', machine };
+      cloud = { url: cloudUrl.replace(/\/+$/, ''), token: cloudToken, intervalMinutes: interval, projects: list(env.SYNC_PROJECTS), ...(env.CLOUD_LOCAL_ONLY_PROJECTS?.trim() ? { localOnlyProjects: list(env.CLOUD_LOCAL_ONLY_PROJECTS) } : {}), suggestions: syncSuggestions === 'true', claims: syncClaims, people: syncPeople, machine };
     }
   } else {
     if (syncSuggestions === 'true') problems.push('SYNC_SUGGESTIONS needs CLOUD_URL and CLOUD_TOKEN');
+    if (syncClaims) problems.push('SYNC_CLAIMS needs CLOUD_URL and CLOUD_TOKEN');
     if (env.SYNC_INTERVAL_MINUTES?.trim()) problems.push('SYNC_INTERVAL_MINUTES needs CLOUD_URL and CLOUD_TOKEN');
     if (env.SYNC_PROJECTS?.trim()) problems.push('SYNC_PROJECTS needs CLOUD_URL and CLOUD_TOKEN');
   }
@@ -453,8 +499,23 @@ export function loadConfig(env: Env): Config {
   const holdout = holdoutRaw ? Number(holdoutRaw) : 0.2;
   if ((holdoutRaw && !/^(\d+(\.\d*)?|\.\d+)$/.test(holdoutRaw)) || !Number.isFinite(holdout) || holdout < 0 || holdout > 0.5) problems.push(`LOOP_HOLDOUT must be a share from 0 to 0.5 (got ${JSON.stringify(holdoutRaw)})`);
   const loopTypes = list(env.LOOP_TYPES);
-  const unknownTypes = loopTypes.filter((t) => !(DECISION_TYPES as readonly string[]).includes(t));
-  if (unknownTypes.length) problems.push(`LOOP_TYPES names unknown decision types: ${unknownTypes.join(', ')} (known: ${DECISION_TYPES.join(', ')})`);
+  const unknownTypes = loopTypes.filter((t) => !(LOOP_DECISION_TYPES as readonly string[]).includes(t));
+  if (unknownTypes.length) problems.push(`LOOP_TYPES names unknown decision types: ${unknownTypes.join(', ')} (known: ${LOOP_DECISION_TYPES.join(', ')})`);
+  const intakeAllow = list(env.INTAKE_PROVIDER_ALLOW).map((k) => k.toLowerCase());
+  for (const k of intakeAllow) if (!PROVIDERS.has(k)) problems.push(`INTAKE_PROVIDER_ALLOW: unknown provider ${JSON.stringify(k)} (use ${[...PROVIDERS].join(', ')})`);
+  const intake: IntakeConfig = {
+    enabled: intakeEnabled(env),
+    llm: spec('INTAKE_LLM'),
+    providerAllow: intakeAllow.length ? [...new Set(intakeAllow)] : [...INTAKE_PROVIDER_ALLOW_DEFAULT],
+    llmCallsPerDay: count('INTAKE_LLM_CALLS_PER_DAY', 200),
+  };
+  if (intake.llm && !intake.providerAllow.includes(providerKind(intake.llm))) {
+    problems.push(`INTAKE_LLM: ${providerKind(intake.llm)} is not in INTAKE_PROVIDER_ALLOW (${intake.providerAllow.join(', ')}): what people said goes only to the providers listed there; use ollama:<model> or claude-cli, or add the provider to INTAKE_PROVIDER_ALLOW`);
+  }
+  const conflicts: ConflictConfig = { llm: spec('CONFLICT_LLM'), llmCallsPerDay: count('CONFLICT_LLM_CALLS_PER_DAY', 60), sweepMinutes: count('CONFLICT_SWEEP_MINUTES', 360, 1) };
+  if (conflicts.llm && !intake.providerAllow.includes(providerKind(conflicts.llm))) {
+    problems.push(`CONFLICT_LLM: ${providerKind(conflicts.llm)} is not in INTAKE_PROVIDER_ALLOW (${intake.providerAllow.join(', ')}): the judge reads what people said; use ollama:<model> or claude-cli, or add the provider to INTAKE_PROVIDER_ALLOW`);
+  }
   const loop: LoopConfig = {
     mode: loopMode as LoopMode | null,
     disabled: loopDisabled === '1' || loopDisabled === 'true',
@@ -503,6 +564,8 @@ export function loadConfig(env: Env): Config {
     memoryAutoApprove: autoApproveRaw === 'true',
     summary,
     loop,
+    intake,
+    conflicts,
     github,
     integrationSyncMinutes: num('INTEGRATION_SYNC_MINUTES', 10),
     linkScanMinutes: num('LINK_SCAN_MINUTES', 30),

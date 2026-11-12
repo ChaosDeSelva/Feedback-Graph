@@ -6,7 +6,7 @@ import { EXPORT_FORMAT, type ExportBundle } from './graph/portability.ts';
 import type { ActivityInput } from './types.ts';
 
 const TOKEN = `fgc_pat_0123456789abcdef_${'A'.repeat(43)}`;
-const cloud: CloudConfig = { url: 'https://cloud.example.com', token: TOKEN, intervalMinutes: 60, projects: [], suggestions: false, machine: null };
+const cloud: CloudConfig = { url: 'https://cloud.example.com', token: TOKEN, intervalMinutes: 60, projects: [], suggestions: false, claims: false, people: false, machine: null };
 
 const TRANSCRIPT = 'no, you broke checkout again, read the README first';
 const SOURCE = 'export function charge(card) { return stripe.charge(card) }';

@@ -1,7 +1,7 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { WebStandardStreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js';
 import { z } from 'zod';
-import { DECISION_NOTE_REASONS, DECISION_STATUSES, DECISION_TYPES, FEEDBACK_SOURCES, isoOffsetValid, LINK_RELATIONS, VERSION, type OperatorVerb } from '@fb/core';
+import { CLAIM_STATUSES, CLAIM_TYPES, CONFLICT_CHOICES, CONFLICT_DISMISS_REASONS, CONFLICT_STATUSES, INTAKE_KINDS, QUESTION_STATUSES, DECISION_NOTE_REASONS, DECISION_STATUSES, DECISION_TYPES, FEEDBACK_SOURCES, isoOffsetValid, LINK_RELATIONS, VERSION, type OperatorVerb } from '@fb/core';
 import { initializeClientInfo } from './mcp.ts';
 import { operatorName, OWNER_ROUTES } from './operator.ts';
 
@@ -19,6 +19,8 @@ import { operatorName, OWNER_ROUTES } from './operator.ts';
 export type AdminMcpDeps = {
   /** The app, in-process (app.request). */
   request: (path: string, init: RequestInit) => Response | Promise<Response>;
+  /** INTAKE_ENABLED: knowledge intake's tools are offered (intake_submit, claims_list, ... conflict_resolve). */
+  intake: boolean;
   /** For scan_projects' wait; default: a timer. */
   sleep?: (ms: number) => Promise<void>;
 };
@@ -56,6 +58,14 @@ const ROUTES = {
   decision_rollback: ['POST', '/api/decisions/:id/rollback'],
   decision_note: ['POST', '/api/decisions/:id/notes'],
   loop_pause: ['POST', '/api/loop/pause'],
+  // Knowledge intake (INTAKE_ENABLED; otherwise these routes answer 404).
+  intake_submit: ['POST', '/api/intake'],
+  claims_list: ['GET', '/api/claims'],
+  claim_decide: ['PATCH', '/api/claims/:id'],
+  questions_list: ['GET', '/api/questions'],
+  question_answer: ['POST', '/api/questions/:id/answer'],
+  conflicts_list: ['GET', '/api/conflicts'],
+  conflict_resolve: ['POST', '/api/conflicts/:id/resolve'],
 } as const satisfies Record<string, Route>;
 type ToolName = keyof typeof ROUTES;
 
@@ -145,13 +155,36 @@ const decisionRow = (d: Record<string, any>) => ({
   confidence: d.confidence, rationale: cut(d.rationale, 240), createdAt: d.createdAt, decidedBy: d.decidedBy ?? null,
 });
 
+/** A claim as a list row: what was said, by whom (a Person id), and where it stands (claims_list). */
+const claimRow = (c: Record<string, any>) => ({
+  id: c.id, projectKey: c.projectKey, type: c.type, status: c.status, statement: cut(c.statement, 300), quote: cut(c.quote, 200), speakerId: c.speakerId,
+  assertedAt: c.assertedAt, flags: c.flags, factId: c.factId, conflicts: (c.conflicts ?? []).map((k: { id: string }) => k.id),
+});
+/** A conflict as a list row: both sides in a line each, and whether agents see them. */
+const conflictRow = (k: Record<string, any>) => ({
+  id: k.id, kind: k.kind, status: k.status, projectKey: k.projectKey, fingerprint: k.fingerprint, explanation: cut(k.judge?.explanation, 240),
+  a: { kind: k.sides?.a?.kind, id: k.sides?.a?.id, text: cut(k.sides?.a?.text, 240), speaker: k.sides?.a?.speaker?.displayName ?? null, agentsSee: k.sides?.a?.agentsSee },
+  b: { kind: k.sides?.b?.kind, id: k.sides?.b?.id, text: cut(k.sides?.b?.text, 240), speaker: k.sides?.b?.speaker?.displayName ?? null, agentsSee: k.sides?.b?.agentsSee },
+  resolution: k.resolution, decisionId: k.decisionId,
+});
+/** A list route paged by offset (x-next-offset): limit + 1 asked, so `more` is known. */
+const pagedList = async (call: Call, path: string, q: Record<string, string | number | undefined>, a: { limit?: number; offset?: number }, row: (x: Record<string, any>) => unknown) => {
+  const offset = a.offset ?? 0;
+  const limit = a.limit ?? PAGE_DEFAULT;
+  const r = await call('GET', `${path}${qs({ ...q, limit: limit + 1, offset })}`);
+  if (!r.ok) return fail(r);
+  const rows = r.data as Record<string, any>[];
+  const more = rows.length > limit;
+  return json({ offset, items: rows.slice(0, limit).map(row), more, ...(more && { note: `more: pass offset: ${offset + limit} for the next page` }) });
+};
+
 /** What a client may assume about a tool (MCP ToolAnnotations): a read needs no approval; a write says how far it reaches. */
 const READ = { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false } as const;
 const write = (o: { destructive?: boolean; idempotent?: boolean; openWorld?: boolean } = {}) =>
   ({ readOnlyHint: false, destructiveHint: !!o.destructive, idempotentHint: !!o.idempotent, openWorldHint: !!o.openWorld });
 type Annotations = typeof READ | ReturnType<typeof write>;
 
-function buildServer(call: Call, sleep: (ms: number) => Promise<void>) {
+function buildServer(call: Call, sleep: (ms: number) => Promise<void>, intake: boolean) {
   const server = new McpServer({ name: 'feedback-graph-admin', version: VERSION });
   /** A decision's status now, for a call that did not say what it expects; the failed read when there is none. */
   const statusOf = async (id: string): Promise<string | Answer> => {
@@ -385,6 +418,71 @@ function buildServer(call: Call, sleep: (ms: number) => Promise<void>) {
   reg('loop_pause', 'Pause the learning loop at once: it records, proposes and applies nothing until the owner resumes it. Off by default: needs loop_settings in OPERATOR_ALLOW.', {}, write({ idempotent: true }),
     async () => answer(await call('POST', '/api/loop/pause', {})));
 
+  // Knowledge intake's tools exist only while INTAKE_ENABLED is on, as its routes do.
+  if (intake) {
+    reg('intake_submit', 'Add a transcript, notes or a doc (pasted text: txt, md, vtt or srt) to knowledge intake: it is redacted, stored and read into proposed claims and questions for the owner to review; agents see none of it until a claim is accepted.', {
+      project: z.string().min(1).max(MAX.key),
+      title: z.string().min(1).max(300),
+      text: z.string().min(1).max(2_000_000),
+      kind: z.enum(INTAKE_KINDS).optional().describe('Default transcript'),
+      occurred_at: z.string().max(40).optional().describe('When it happened (YYYY-MM-DD)'),
+      participants: z.array(z.string().min(1).max(200)).max(100).optional(),
+      origin: z.string().min(1).max(500).optional().describe('Where it came from ("weekly sync", a URL)'),
+    }, write(), async (a) => answer(await call('POST', '/api/intake', {
+      projectKey: a.project, title: a.title, text: a.text, ...(a.kind && { kind: a.kind }), ...(a.occurred_at && { occurredAt: a.occurred_at }),
+      ...(a.participants && { participants: a.participants }), ...(a.origin && { origin: a.origin }),
+    })));
+
+    reg('claims_list', 'Claims drawn from what people said, newest first, one compact row each (statement, quote, type, status, speaker, open conflicts). Paged.', {
+      status: z.enum(CLAIM_STATUSES).optional().describe('Default proposed'),
+      type: z.enum(CLAIM_TYPES).optional(),
+      project: z.string().min(1).max(MAX.key).optional(),
+      source: z.string().min(1).max(MAX.id).optional().describe('One source (its doc id)'),
+      ...Paging,
+    }, READ, (a) => pagedList(call, '/api/claims', { status: a.status ?? 'proposed', type: a.type, project: a.project, source: a.source }, a, claimRow));
+
+    reg('claim_decide', "Accept, reject or edit a claim. Accepting one that is not an opinion files it as a project fact agents are given; as_fact false keeps it as an opinion (never given to agents). Off by default.", {
+      id: z.string().min(1).max(MAX.id),
+      status: z.enum(['accepted', 'rejected', 'proposed']).optional(),
+      statement: z.string().trim().min(1).max(2000).optional(),
+      type: z.enum(CLAIM_TYPES).optional(),
+      as_fact: z.boolean().optional(),
+    }, write(), async (a) => answer(await call('PATCH', `/api/claims/${enc(a.id)}`, {
+      ...(a.status && { status: a.status }), ...(a.statement && { statement: a.statement }), ...(a.type && { type: a.type }), ...(a.as_fact !== undefined && { asFact: a.as_fact }),
+    })));
+
+    reg('questions_list', 'Questions a source left open (unanswered, contradictory, needing an owner), newest first. Paged.', {
+      status: z.enum(QUESTION_STATUSES).optional().describe('Default open'),
+      project: z.string().min(1).max(MAX.key).optional(),
+      ...Paging,
+    }, READ, (a) => pagedList(call, '/api/questions', { status: a.status ?? 'open', project: a.project }, a, (q) => ({
+      id: q.id, projectKey: q.projectKey, kind: q.kind, status: q.status, text: cut(q.text, 300), quote: cut(q.quote, 200), askedBy: q.askedBy, assignee: q.assignee,
+    })));
+
+    reg('question_answer', "Answer a question as the owner: the answer is an accepted claim, and one that is not an opinion is filed as a project fact agents are given. Off by default.", {
+      id: z.string().min(1).max(MAX.id),
+      text: z.string().trim().min(1).max(4000),
+      type: z.enum(CLAIM_TYPES).optional().describe('Default fact'),
+    }, write(), async (a) => answer(await call('POST', `/api/questions/${enc(a.id)}/answer`, { text: a.text, ...(a.type && { type: a.type }) })));
+
+    reg('conflicts_list', 'Conflicts between things agents may be told, newest first: both sides, who said them, and whether agents see each. Paged.', {
+      status: z.enum(CONFLICT_STATUSES).optional().describe('Default open'),
+      project: z.string().min(1).max(MAX.key).optional(),
+      ...Paging,
+    }, READ, (a) => pagedList(call, '/api/conflicts', { status: a.status ?? 'open', project: a.project }, a, conflictRow));
+
+    reg('conflict_resolve', "Settle a conflict: a or b is true (the other is superseded, never deleted), both partly (a note is required), or none (not a conflict, with a reason). Recorded as a resolve_conflict decision; decision_rollback undoes it. Choosing what is true is the owner's call: off by default.", {
+      id: z.string().min(1).max(MAX.id),
+      choice: z.enum(CONFLICT_CHOICES),
+      note: z.string().trim().min(1).max(2000).optional(),
+      reason: z.enum(CONFLICT_DISMISS_REASONS).optional().describe('With none'),
+      statement: z.string().trim().min(1).max(2000).optional().describe('With both: a reconciled statement filed as the owner\'s fact'),
+      expect: z.string().min(1).max(200).optional().describe('The fingerprint conflicts_list showed: a conflict changed since is refused'),
+    }, write({ destructive: true }), async (a) => answer(await call('POST', `/api/conflicts/${enc(a.id)}/resolve`, {
+      choice: a.choice, ...(a.note && { note: a.note }), ...(a.reason && { reason: a.reason }), ...(a.statement && { statement: a.statement }), ...(a.expect && { expect: a.expect }),
+    })));
+  }
+
   reg('rebuild_code_map', "Remap a project's code from scratch at the worker's next pass.", {
     project: z.string().min(1).max(MAX.key),
   }, write({ idempotent: true }), async (a) => answer(await call('POST', `/api/projects/${enc(a.project)}/codemap/rebuild`, {})));
@@ -443,7 +541,7 @@ export async function handleAdminMcp(req: Request, deps: AdminMcpDeps): Promise<
     try { data = raw ? JSON.parse(raw) : null; } catch { data = raw; }
     return { ok: res.ok, status: res.status, data };
   };
-  const server = buildServer(call, deps.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms))));
+  const server = buildServer(call, deps.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms))), deps.intake);
   const transport = new WebStandardStreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true });
   await server.connect(transport);
   try {

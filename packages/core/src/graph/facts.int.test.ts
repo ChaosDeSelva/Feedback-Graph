@@ -68,7 +68,7 @@ describeStores('FactsStore', (h) => {
     ], 'claude-cli', []);
     const p = (await f.listProjects()).find((x) => x.key === 'demo')!;
     expect(p.facts).toBe(4);
-    expect(p.factsByOrigin).toEqual({ model: 2, manifest: 2, document: 0, you: 0, loop: 0 });
+    expect(p.factsByOrigin).toEqual({ model: 2, manifest: 2, document: 0, you: 0, loop: 0, claim: 0 });
   });
 
   test('addOwnerFact saves your fact (origin you, your relevance); no scan closes or replaces it', async () => {
@@ -87,7 +87,7 @@ describeStores('FactsStore', (h) => {
     // The background scorer never sees it: it has your relevance already, and a model update leaves it alone.
     expect((await f.unscoredFacts({ projectKeys: ['demo'], limit: 10 })).map((x) => x.id)).not.toContain(mine.id);
     expect(await f.setFactRelevance([{ id: mine.id, relevance: 0.1, by: 'model' }])).toBe(0);
-    expect((await f.listProjects()).find((p) => p.key === 'demo')?.factsByOrigin).toEqual({ model: 1, manifest: 0, document: 0, you: 1, loop: 0 });
+    expect((await f.listProjects()).find((p) => p.key === 'demo')?.factsByOrigin).toEqual({ model: 1, manifest: 0, document: 0, you: 1, loop: 0, claim: 0 });
   });
 
   test("addOwnerFact with origin loop saves the learning loop's fact under its planned id; scans never close, replace or re-check it", async () => {
@@ -105,7 +105,7 @@ describeStores('FactsStore', (h) => {
     expect((await f.factsToRecheck({ projectKey: 'demo', version: 'check-v9', limit: 10 })).map((x) => x.id)).not.toContain(id);
     // A model update leaves the loop's relevance alone, like yours.
     expect(await f.setFactRelevance([{ id, relevance: 0.1, by: 'model' }])).toBe(0);
-    expect((await f.listProjects()).find((p) => p.key === 'demo')?.factsByOrigin).toEqual({ model: 1, manifest: 0, document: 0, you: 0, loop: 1 });
+    expect((await f.listProjects()).find((p) => p.key === 'demo')?.factsByOrigin).toEqual({ model: 1, manifest: 0, document: 0, you: 0, loop: 1, claim: 0 });
   });
 
   test('facts keep the relevance the extractor gave; facts without one are unscored', async () => {

@@ -39,7 +39,7 @@ describeStores('DecisionsStore', (h) => {
     expect(first.created).toBe(true);
     expect(first.decision).toEqual({
       ...input(), id: decisionId(input({ dependsOn: ['dec:earlier'] })), status: 'proposed', dependsOn: ['dec:earlier'], createdAt: expect.any(String), appliedAt: null,
-      decidedAt: null, decidedBy: null, supersededBy: null, rollback: null, ratifiedAt: null, ratifiedBy: null, syncHoldUntil: null,
+      decidedAt: null, decidedBy: null, supersededBy: null, rollback: null, ratifiedAt: null, ratifiedBy: null, syncHoldUntil: null, author: 'loop',
     });
     expect(first.decision.id).toMatch(/^dec:[0-9a-f]{64}$/);
     // Recomputed weights, a new rationale and the same targets in another order: the same decision.

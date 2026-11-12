@@ -1,7 +1,7 @@
 import { isoWeek, type PatternReport } from '../graph/insights.ts';
 import type { DecisionCount } from '../decisions/record.ts';
 import type { DecisionsStore, InsightsStore, LessonSignalsRow } from '../store.ts';
-import { DECISION_TYPES, type DecisionType } from '../types.ts';
+import { LOOP_DECISION_TYPES, type DecisionType } from '../types.ts';
 import { holdoutEligible, proportion, type Proportion } from './holdout.ts';
 
 /**
@@ -68,7 +68,7 @@ export function loopMetrics(i: LoopMetricsInput): LoopMetrics {
     gapsFixedPerServed: proportion(Math.min(fixed, served), served),
     notApplicableShare: proportion(noise, verdicts),
     proposalsPerWeek: [...proposals].map(([week, n]) => ({ week, proposals: n })),
-    rollbackRate: DECISION_TYPES.map((type) => {
+    rollbackRate: LOOP_DECISION_TYPES.map((type) => {
       const of = i.applied.filter((c) => c.type === type);
       const n = of.reduce((s, c) => s + c.n, 0);
       const rolledBack = of.filter((c) => c.status === 'rolled_back').reduce((s, c) => s + c.n, 0);
@@ -93,8 +93,9 @@ export async function readLoopMetrics(
   const [patterns, signals, proposals, applied] = await Promise.all([
     s.insights.patterns(scope),
     s.decisions.listSignals(scope),
-    s.decisions.count({ ...made, mode: 'propose' }, ['createdWeek']),
-    s.decisions.count({ ...made, appliedSince: windowStart(o.now, weeks) }, ['type', 'status']),
+    // The loop's own: an owner's decision (a conflict resolved) neither asked for the owner's time nor can be undone as the loop's.
+    s.decisions.count({ ...made, mode: 'propose', author: 'loop' }, ['createdWeek']),
+    s.decisions.count({ ...made, appliedSince: windowStart(o.now, weeks), author: 'loop' }, ['type', 'status']),
   ]);
   return loopMetrics({ patterns, signals, proposals, applied, now: o.now, weeks });
 }

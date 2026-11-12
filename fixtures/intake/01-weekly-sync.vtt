@@ -1,0 +1,29 @@
+WEBVTT
+
+1
+00:00:03.000 --> 00:00:08.000
+<v Mara>Morning, everyone. Three things on Larkspur today, then the importer.
+
+2
+00:00:09.000 --> 00:00:15.500
+<v Mara>The retry timeout for the ledger client is 30 seconds.
+
+3
+00:00:16.000 --> 00:00:23.000
+<v Tobin>For sessions, we will use Redis for the session cache. The in-process map was only ever a stopgap.
+
+4
+00:00:24.000 --> 00:00:31.000
+<v Mara>Decision: we cap each import batch at 500 rows. Anything bigger gets split before it reaches the ledger.
+
+5
+00:00:32.000 --> 00:00:37.000
+<v Oskar>I'll write the importer runbook by Friday.
+
+6
+00:00:38.000 --> 00:00:43.000
+<v Oskar>Who owns the rollback plan for the importer?
+
+7
+00:00:44.000 --> 00:00:47.000
+<v Mara>Let's take that offline. Thanks, all.

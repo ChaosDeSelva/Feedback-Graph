@@ -63,10 +63,10 @@ describe.skipIf(!testStores().includes('postgres'))('Postgres migrations', () =>
     );
     const columns = Object.fromEntries(rows.map((r) => [r.table_name, r.columns as string[]]));
     expect(Object.keys(columns).sort()).toEqual([
-      'activity', 'candidates', 'causes', 'chat_conversations', 'chat_turns', 'chunks', 'code_files', 'code_imports', 'code_maps', 'code_symbols', 'code_tests', 'commit_feedback', 'commits', 'context_item_misses',
-      'context_item_sessions', 'context_items', 'decision_deps', 'decision_notes', 'decision_targets', 'decisions', 'doc_blobs', 'docs', 'facts', 'feedback', 'graph_config', 'lesson_signals', 'lesson_supersedes', 'lessons',
-      'loop_calibration', 'miss_links', 'misses', 'predone_check_lessons', 'predone_checks', 'project_candidates', 'project_links', 'project_selection', 'projects', 'read_resets', 'run_owners',
-      'scan_jobs', 'schema_migrations', 'session_commits', 'session_files', 'session_run_tags', 'session_summary_updates', 'sessions', 'sync_cursors', 'tasks', 'turns', 'worker_status',
+      'activity', 'candidates', 'causes', 'chat_conversations', 'chat_turns', 'chunks', 'claim_links', 'claims', 'code_files', 'code_imports', 'code_maps', 'code_symbols', 'code_tests', 'commit_feedback', 'commits', 'conflict_sides', 'conflicts', 'context_item_misses',
+      'context_item_sessions', 'context_items', 'decision_deps', 'decision_notes', 'decision_targets', 'decisions', 'doc_blobs', 'docs', 'facts', 'feedback', 'graph_config', 'intake_sources', 'lesson_signals', 'lesson_supersedes', 'lessons',
+      'loop_calibration', 'miss_links', 'misses', 'people', 'person_aliases', 'predone_check_lessons', 'predone_checks', 'project_candidates', 'project_links', 'project_selection', 'projects', 'questions', 'read_resets', 'run_owners',
+      'scan_jobs', 'schema_migrations', 'session_commits', 'session_files', 'session_run_tags', 'session_summary_updates', 'sessions', 'source_people', 'supersessions', 'sync_cursors', 'tasks', 'turns', 'worker_status',
     ]);
     for (const t of ['sessions', 'turns', 'candidates', 'feedback', 'tasks', 'misses', 'lessons', 'context_items', 'predone_checks', 'code_files', 'facts', 'scan_jobs', 'docs', 'chunks', 'activity', 'code_symbols', 'code_imports', 'code_tests', 'code_maps', 'session_files', 'session_summary_updates', 'chat_conversations', 'chat_turns', 'decisions']) {
       expect(columns[t], t).toContain('project_key');
@@ -131,13 +131,41 @@ describe.skipIf(!testStores().includes('postgres'))('Postgres migrations', () =>
     await migrate(p, { dir });
     await p.query(`INSERT INTO lessons (id, title, rule, applies_when, scope, status, source, created_at, triggers)
                    VALUES ('lesson:1', 't', 'r', 'a', 'project', 'approved', 'postmortem', now(), '{"paths":["**/*.sql"],"patterns":[],"symbols":[]}')`);
-    const to083 = all.slice(upTo082.length);
+    const to083 = all.slice(upTo082.length, all.indexOf('0061_scan_parked_at.sql') + 1);
     expect(to083).toEqual(['0060_trigger_version.sql', '0061_scan_parked_at.sql']);
     for (const f of to083) writeFileSync(join(dir, f), readFileSync(new URL(f, MIGRATIONS), 'utf8'));
     expect(await migrate(p, { dir })).toEqual(to083);
     expect((await p.query(`SELECT title, triggers, triggers_version FROM lessons`)).rows).toEqual([{ title: 't', triggers: { paths: ['**/*.sql'], patterns: [], symbols: [] }, triggers_version: null }]);
     expect((await p.query(`SELECT data_type FROM information_schema.columns WHERE table_name = 'scan_jobs' AND column_name = 'parked_at'`)).rows)
       .toEqual([{ data_type: 'timestamp with time zone' }]);
+    expect(await migrate(p, { dir })).toEqual([]);
+  });
+
+  test('a 0.8.3 database (through 0061) upgrades to 0.9.0: 0062 adds intake, its data kept, the widened checks usable', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'fb-migrations-'));
+    const all = await migrationIds();
+    const upTo083 = all.slice(0, all.indexOf('0061_scan_parked_at.sql') + 1);
+    for (const f of upTo083) writeFileSync(join(dir, f), readFileSync(new URL(f, MIGRATIONS), 'utf8'));
+    const p = pool();
+    await migrate(p, { dir });
+    await p.query(`INSERT INTO projects (key) VALUES ('demo')`);
+    await p.query(`INSERT INTO lessons (id, project_key, title, rule, applies_when, scope, status, source, created_at, triggers_version)
+                   VALUES ('lesson:1', 'demo', 't', 'r', 'a', 'project', 'approved', 'postmortem', now(), 3)`);
+    await p.query(`INSERT INTO decisions (id, type, project_key, status, tier, mode, score, confidence, band, rationale, policy_version, created_at)
+                   VALUES ('dec:1', 'approve_lesson', 'demo', 'applied', 'A', 'auto', 0.9, '{}', 4, 'r', 1, now())`);
+    const to090 = all.slice(upTo083.length);
+    expect(to090).toEqual(['0062_intake.sql']);
+    for (const f of to090) writeFileSync(join(dir, f), readFileSync(new URL(f, MIGRATIONS), 'utf8'));
+    expect(await migrate(p, { dir })).toEqual(to090);
+    expect((await p.query(`SELECT title, triggers_version FROM lessons`)).rows).toEqual([{ title: 't', triggers_version: 3 }]);
+    // A decision made before is the loop's; the owner's resolve_conflict on a claim and a conflict is taken.
+    expect((await p.query(`SELECT author FROM decisions`)).rows).toEqual([{ author: 'loop' }]);
+    await p.query(`INSERT INTO decisions (id, type, project_key, status, tier, mode, score, confidence, band, rationale, policy_version, created_at, author)
+                   VALUES ('dec:2', 'resolve_conflict', 'demo', 'applied', 'P', 'propose', 1, '{}', 4, 'r', 1, now(), 'owner')`);
+    await p.query(`INSERT INTO decision_targets (decision_id, idx, kind, target_id, role) VALUES ('dec:2', 0, 'conflict', 'conflict:1', 'primary'), ('dec:2', 1, 'claim', 'claim:1', 'merged')`);
+    // The widened activity check takes intake's kinds.
+    await p.query(`INSERT INTO activity (id, ts, kind, actor, subject, why) VALUES ('a1', now(), 'conflict_resolved', 'you', 'conflict:1', 's')`);
+    expect((await p.query(`SELECT count(*)::int AS n FROM claims`)).rows).toEqual([{ n: 0 }]);
     expect(await migrate(p, { dir })).toEqual([]);
   });
 
@@ -182,9 +210,9 @@ describe.skipIf(!testStores().includes('postgres'))('Postgres migrations', () =>
       `SELECT c.table_name, c.udt_name FROM information_schema.columns c
        WHERE c.table_schema = 'public' AND c.column_name = 'embedding' ORDER BY 1`,
     );
-    expect(rows).toEqual(['chunks', 'facts', 'lessons', 'misses'].map((table_name) => ({ table_name, udt_name: 'vector' })));
+    expect(rows).toEqual(['chunks', 'claims', 'facts', 'lessons', 'misses'].map((table_name) => ({ table_name, udt_name: 'vector' })));
     const idx = await p.query(`SELECT tablename, indexdef FROM pg_indexes WHERE indexdef LIKE '%hnsw%' ORDER BY tablename`);
-    expect(idx.rows.map((r) => r.tablename)).toEqual(['chunks', 'facts', 'lessons', 'misses']);
+    expect(idx.rows.map((r) => r.tablename)).toEqual(['chunks', 'claims', 'facts', 'lessons', 'misses']);
     for (const r of idx.rows) expect(r.indexdef).toMatch(/vector\(1024\).*vector_cosine_ops/);
   });
 });

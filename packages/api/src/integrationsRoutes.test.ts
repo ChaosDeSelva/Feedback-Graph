@@ -109,7 +109,7 @@ test('project links: GitHub off, a team named by id only, and clearing the team 
   expect(cleared.projects[0].linear).toMatchObject({ teamId: null, teamName: null });
 });
 
-const cloud: CloudConfig = { url: 'https://cloud.example.com', token: 't', intervalMinutes: 60, projects: [], suggestions: false, machine: null };
+const cloud: CloudConfig = { url: 'https://cloud.example.com', token: 't', intervalMinutes: 60, projects: [], suggestions: false, claims: false, people: false, machine: null };
 const worker = (cloudSync: WorkerStatus['cloudSync']) => ({ providers: {}, cloudSync } as unknown as WorkerStatus);
 
 test('cloud connection: a newer failed Sync now without a reason, and projects backing off, are errors that say so', async () => {

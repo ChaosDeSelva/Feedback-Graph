@@ -11,4 +11,5 @@ export { PgPortabilityStore } from './portability.ts';
 export { PgEmbeddingsStore } from './embeddings.ts';
 export { PgSelectionStore } from './selection.ts';
 export { PgSessionsStore } from './sessions.ts';
+export { PgIntakeStore } from './intake.ts';
 export { openStore } from './open.ts';

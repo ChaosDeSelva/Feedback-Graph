@@ -1,0 +1,8 @@
+Larkspur ledger review - recording transcript
+
+[00:00:04] Tobin: Thanks for joining. This is about the ledger client.
+[00:00:11] Tobin: Just to restate it: the ledger client's retry timeout is 60 seconds.
+[00:00:19] Tobin: Ledger retries use exponential backoff.
+[00:00:27] Mara: And the audit log lives in Postgres, same cluster as the ledger tables.
+[00:00:36] Mara: Do we alert when the ledger client exhausts its retries?
+[00:00:44] Tobin: Not yet. I'll add an alert for exhausted retries this sprint.

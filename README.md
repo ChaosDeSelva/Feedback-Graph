@@ -148,6 +148,27 @@ The MCP tools only read and report. Decisions (choosing projects, scanning, conf
 
 It runs in `auto` by default. In `auto`, housekeeping (linking repeated misses, merging duplicates, re-ranking, retiring lessons that never help) applies on its own. A change to what agents are told (approving, rejecting, rewording or narrowing a lesson, turning one into a fact) applies on its own only once your own verdicts on that type's proposals have earned it, counted per type and per confidence band (one of 5, by the call's score): at least 20 of them in the call's band, with that band's lower bound at the type's bar τ or above (0.9 for `approve_lesson`, which **approves a proposed lesson without you**), and then at most 5 such changes a day, 2 per project. Until then it proposes, and you approve or reject on the Decisions page. An operator token's verdicts never count. `observe` records what it would do and changes nothing; `propose` asks you about everything; `off` stops it. Set the mode in Settings > Learning loop or with `fg loop mode propose`; `LOOP_MODE` in `.env` seeds it on the first start only, and `LOOP_DISABLED=1` stops it whatever Settings says. **Upgrading to 0.8.0** with `API_TOKEN` or `FG_OWNER_TOKEN` set, the first start seeds `auto`, so housekeeping starts applying on its own: to start more cautiously, put `LOOP_MODE=observe` or `LOOP_MODE=propose` in `.env` before that first start. An install with neither token only observes.
 
+## Knowledge intake (0.9.0, opt-in)
+
+Hand Feedback Graph what people said, a call transcript (txt, md, vtt, srt) or notes, and it breaks it into **claims**
+(facts, decisions, plans, commitments and opinions, each with who said it, when and the quote) and the **questions** it
+left open, for you to review on the **Intake** page. It also checks claims, facts and approved lessons against each
+other and flags **conflicts**: two things agents may be told that disagree, shown side by side for you to say which is
+true. Agents only ever see the claims you accept (an accepted opinion stays attributed and is never given to them),
+and each conflict you settle is a decision on the Decisions page that you can roll back.
+
+It is **off by default**. To turn it on, set `INTAKE_ENABLED=1` in `.env` and run `docker compose up -d`; **Intake**
+then appears in the sidebar's Review group. Add a source with **Add a source** on its Sources tab (paste it or pick a
+`.txt`, `.md`, `.vtt` or `.srt` file), `POST /api/intake` or the admin MCP tool `intake_submit`; an agent can hand you its notes with `submit_notes`. It reads on the local model by default
+(`INTAKE_LLM`), and only Ollama or `claude-cli` unless you widen `INTAKE_PROVIDER_ALLOW`.
+
+Privacy: credentials and contact details are redacted before anything is stored or sent to a model, and speakers reach
+the model only as S1, S2, ... (names spoken inside the text do reach it). Transcript text, quotes, questions and
+sources are never served to agents, exported or synced, and claim facts leave for the cloud only with `SYNC_CLAIMS=true`.
+
+How to use the page: [docs/guide.md](docs/guide.md#intake). Settings, privacy, deleting and cost:
+[docs/operations.md](docs/operations.md#knowledge-intake).
+
 ## UI
 
 | Page | What |
@@ -204,6 +225,7 @@ The sidebar shows whether the worker is running, and a connections list (GitHub,
 | `INTEGRATION_SYNC_MINUTES`, `GITHUB_SYNC_HOURS` | How often each project's review comments and Linear comments are read into the Inbox (10), and how often PR discussions are refreshed as context (6). |
 | `STORE`, `DATABASE_URL`, `POSTGRES_PASSWORD`, `COMPOSE_PROFILES` | Storage backend: `neo4j` (default) or `postgres`. With the bundled Postgres, `COMPOSE_PROFILES=postgres` includes it in every `docker compose` command. See [Storage](#storage). |
 | `CLOUD_URL`, `CLOUD_TOKEN`, `SYNC_INTERVAL_MINUTES`, `SYNC_PROJECTS`, `SYNC_SUGGESTIONS` | Optional team sync to a Feedback Graph Cloud org. Off unless the first two are set. See [Team sync](#team-sync-optional). |
+| `INTAKE_ENABLED`, `INTAKE_LLM`, `INTAKE_PROVIDER_ALLOW`, `INTAKE_LLM_CALLS_PER_DAY`, `INTAKE_ARCHIVE`, `CONFLICT_LLM`, `CONFLICT_LLM_CALLS_PER_DAY`, `CONFLICT_SWEEP_MINUTES`, `SYNC_CLAIMS`, `SYNC_PEOPLE` | Knowledge intake, off unless `INTAKE_ENABLED=1`. See [Knowledge intake](#knowledge-intake-090-opt-in) and [docs/operations.md](docs/operations.md#knowledge-intake). |
 
 The Codex provider uses your ChatGPT login: `CODEX_AUTH_FILE` (only that file is mounted). It explores a copy of the repository without secret files, in the codex-runner container when `CODEX_RUNNER_URL` is set.
 

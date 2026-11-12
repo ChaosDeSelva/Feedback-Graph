@@ -1,4 +1,4 @@
-import { redactSecrets, type DocsStore, type FactsStore, type LinearIssue, type PostMortemInput, type SearchLinearOpts } from '@fb/core';
+import { AGENT_HIDDEN_DOC_SOURCES, redactSecrets, type DocsStore, type FactsStore, type LinearIssue, type PostMortemInput, type SearchLinearOpts } from '@fb/core';
 
 export type HuntDeps = {
   embed(texts: string[]): Promise<number[][]>;
@@ -35,7 +35,7 @@ export async function huntContext(input: PostMortemInput, d: HuntDeps): Promise<
   };
   const [facts, docs, issues] = await Promise.all([
     safe('facts', async () => (d.facts ? d.facts.searchFacts({ embedding, projectKey: input.projectKey, k: FACT_K }) : [])),
-    safe('docs', async () => (d.docs?.searchDocs ? d.docs.searchDocs({ embedding, projectKey: input.projectKey, k: DOC_K }) : [])),
+    safe('docs', async () => (d.docs?.searchDocs ? d.docs.searchDocs({ embedding, projectKey: input.projectKey, k: DOC_K, excludeSources: AGENT_HIDDEN_DOC_SOURCES }) : [])),
     safe('linear', async () => (d.linear ? ours(await d.linear.search({ query: input.feedback.text.slice(0, 200), apiKey: d.linear.apiKey, first: LINEAR_SEARCH_K })) : [])),
   ]);
 

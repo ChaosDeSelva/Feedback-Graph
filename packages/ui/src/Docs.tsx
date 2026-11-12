@@ -4,7 +4,7 @@ import { PageHeader } from './ui/PageHeader.tsx';
 import { ScrollArea } from './ui/ScrollArea.tsx';
 import { architectureSvg, NARROW_WIDTH } from './ui/architecture.ts';
 
-const SECTIONS = ['How it works', 'Your first hour', 'Connect your agents', 'The code map', 'Linked projects, uploads and relevance', 'Each page', 'The learning loop', 'Choosing models', 'Limit what it reads', 'GitHub and Linear', 'Share with a team', 'Runs, sandboxes and testing', 'When something looks wrong'];
+const SECTIONS = ['How it works', 'Your first hour', 'Connect your agents', 'The code map', 'Linked projects, uploads and relevance', 'Each page', 'The learning loop', 'Knowledge intake', 'Choosing models', 'Limit what it reads', 'GitHub and Linear', 'Share with a team', 'Runs, sandboxes and testing', 'When something looks wrong'];
 const slug = (t: string) => `doc-${t.toLowerCase().replace(/[^a-z]+/g, '-')}`;
 
 /** The skills `install-agent.sh` links for Claude Code (plugin/skills, one folder each). */
@@ -409,6 +409,22 @@ export function Docs() {
                 <li><b>Modes.</b> <i>off</i>, <i>observe</i> (records what it would do), <i>propose</i> (asks first) and <i>auto</i>, globally or per type, on the Learning loop page or with <Code>fg loop mode</Code>. An install with neither <Code>API_TOKEN</Code> nor <Code>FG_OWNER_TOKEN</Code> runs it in <i>observe</i> only. Upgrading with tokens set, the first start seeds <i>auto</i>; put <Code>LOOP_MODE=observe</Code> or <Code>propose</Code> in <Code>.env</Code> before it to start cautiously.</li>
               </ul>
               <p className="text-muted">The full reference is <Code>docs/guide.md</Code> (Decisions, Learning loop) and <Code>docs/learning-loop-types.md</Code>.</p>
+            </Section>
+
+            <Section title="Knowledge intake">
+              <p>
+                Off by default. With <Code>INTAKE_ENABLED=1</Code> in <Code>.env</Code> (then <Code>docker compose up -d</Code>), give it what people said, a call
+                transcript or notes, and the worker breaks it into <b>claims</b> (facts, decisions, plans, commitments and opinions, each with who said it, when and
+                the quote) and the <b>questions</b> it left open. The <b>Intake</b> page appears in the Review group, with Sources, Claims, Questions, Conflicts
+                and People tabs.
+              </p>
+              <ul className="list-disc space-y-2 pl-6 marker:text-faint">
+                <li><b>You decide what agents see.</b> A claim you accept (<Code>a</Code>) becomes a project fact agents are given; an opinion stays attributed and is never given to them. Reject with <Code>r</Code>.</li>
+                <li><b>Conflicts.</b> When two things agents may be told disagree, both are shown side by side: <b>A is true</b> (<Code>1</Code>), <b>B is true</b> (<Code>2</Code>), <b>Both partly</b> (<Code>3</Code>, with a note) or <b>Not a conflict</b> (<Code>4</Code>). The loser is superseded, never deleted, and each choice is a decision on the <b>Decisions</b> page that <b>Undo</b> rolls back. Until you choose, agents are told both sides are disputed.</li>
+                <li><b>Adding a source.</b> <b>Add a source</b> on the Sources tab (paste it or pick a file), <Code>POST /api/intake</Code> or the admin MCP tool <Code>intake_submit</Code>; an agent can hand you its notes with <Code>submit_notes</Code>, and their claims only ever wait for your review.</li>
+                <li><b>Privacy.</b> Credentials and contact details are redacted before anything is stored or sent to a model, and speakers reach it only as S1, S2, …; names spoken inside the text do reach it, so the default model is local. Transcript text, quotes, questions and sources are never given to agents, exported or synced, and claim facts go to a team only with <Code>SYNC_CLAIMS=true</Code>.</li>
+              </ul>
+              <p className="text-muted">The full reference is <Code>docs/guide.md</Code> (Intake) and <Code>docs/operations.md</Code> (Knowledge intake).</p>
             </Section>
 
             <Section title="Choosing models">

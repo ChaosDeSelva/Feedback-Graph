@@ -1,0 +1,19 @@
+1
+00:00:01,000 --> 00:00:05,000
+Wren: Ops stand-up. Short one.
+
+2
+00:00:06,000 --> 00:00:11,000
+Wren: We're keeping the audit log in MySQL.
+
+3
+00:00:12,000 --> 00:00:17,000
+Priya: Ledger retries use exponential backoff with full jitter.
+
+4
+00:00:18,000 --> 00:00:23,000
+Wren: The cutover is on Monday the 23rd.
+
+5
+00:00:24,000 --> 00:00:30,000
+Priya: I have the cutover on Wednesday the 25th in my notes.

@@ -20,6 +20,8 @@ const TYPE_LABEL: Record<DecisionType, string> = {
   record_fact: 'record fact',
   triage_inbox: 'triage Inbox',
   tune_threshold: 'tune threshold',
+  resolve_conflict: 'conflict resolved',
+  remove_source: 'source removed',
 };
 export const typeLabel = (t: string) => lookup(TYPE_LABEL, t, words(t));
 /**

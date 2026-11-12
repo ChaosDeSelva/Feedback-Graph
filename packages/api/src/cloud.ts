@@ -23,7 +23,7 @@ export type CloudDeps = {
 
 /** The plain sentence the Settings card and the Docs page show. */
 export const NEVER_SENT =
-  'Never sent: session transcripts (including the feedback you typed), source code, file excerpts, document text, embeddings, or anything new from a project you have not selected (one synced before gets a last bundle that takes it back out).';
+  'Never sent: session transcripts (including the feedback you typed), intake sources and their quotes and questions, facts from claims you accepted (unless SYNC_CLAIMS, and never a private source\'s), source code, file excerpts, document text, embeddings, or anything new from a project you have not selected (one synced before gets a last bundle that takes it back out).';
 
 /** GET /api/cloud: the Settings card. */
 export type CloudInfo = {
@@ -119,7 +119,7 @@ export function cloudRoutes(app: Hono, d: CloudDeps): CloudState {
     if (!cloud) return c.json(info);
     info.projects = (await d.projects()).filter(key => !info.localOnlyProjects?.includes(key));
     try {
-      info.preview = await previewCloudSync(d.portability, info.projects, { suggestions: cloud.suggestions, memory, shareDemoProjects: info.shareDemoProjects });
+      info.preview = await previewCloudSync(d.portability, info.projects, { suggestions: cloud.suggestions, claims: cloud.claims, people: cloud.people, memory, shareDemoProjects: info.shareDemoProjects });
     } catch (err) {
       info.previewError = redactSecrets(String(err)).slice(0, 300);
     }

@@ -10,7 +10,7 @@
  * answer. The score is Neo4j's vector.similarity.cosine, (1 + cos) / 2 = 1 - distance / 2.
  */
 import type pg from 'pg';
-import { SandboxPresence } from '@fb/core';
+import { SandboxPresence, type DocSearch } from '@fb/core';
 import { toVector, tx, type Db } from './db.ts';
 
 export type SqlQuery = { sql: string; params: unknown[] };
@@ -123,16 +123,17 @@ export function searchFactsQuery(db: Db, q: { embedding: number[]; projectKey: s
  * A chunk carries its document's run and sandbox flag (upsertDoc, saveDocReading), so another run's sandbox upload is
  * left out inside the scan, as facts are, and the search still finds k hits when such chunks are the nearest.
  */
-export function searchDocsQuery(db: Db, q: { embedding: number[]; projectKey: string; k: number; run?: string | null }, o: SearchOpts = {}): SqlQuery {
+export function searchDocsQuery(db: Db, q: DocSearch, o: SearchOpts = {}): SqlQuery {
   const v = vectorTerms(db, 'c.embedding', '$2', q.embedding.length);
   return {
     sql: `SELECT d.id AS doc_id, d.source, d.ref, d.title, d.url, x.text, 1 - x.distance / 2 AS score
           FROM (SELECT c.id, c.doc_id, c.text, ${v.distance} AS distance FROM chunks c
                 WHERE c.project_key = $1 AND ${runFilter('c', '$4', o)} AND ${v.where}
+                  AND ($5::text[] IS NULL OR NOT EXISTS (SELECT 1 FROM docs xd WHERE xd.id = c.doc_id AND xd.source = ANY($5)))
                 ORDER BY ${v.distance}, c.id LIMIT $3) x
           JOIN docs d ON d.id = x.doc_id
           ORDER BY score DESC, x.id`,
-    params: [q.projectKey, vectorParam(q.embedding), q.k, q.run ?? null],
+    params: [q.projectKey, vectorParam(q.embedding), q.k, q.run ?? null, q.excludeSources?.length ? [...q.excludeSources] : null],
   };
 }
 

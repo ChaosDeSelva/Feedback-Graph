@@ -204,12 +204,13 @@ test('CLOUD_MACHINE names this machine to the cloud (a label for provenance); a 
 test('cloud sync is off unless CLOUD_URL and CLOUD_TOKEN are both set', () => {
   expect(loadConfig(base).cloud).toBeNull();
   const c = loadConfig({ ...base, CLOUD_URL: 'https://cloud.example.com/', CLOUD_TOKEN: TOKEN });
-  expect(c.cloud).toEqual({ url: 'https://cloud.example.com', token: TOKEN, intervalMinutes: null, projects: [], suggestions: false, machine: null });
+  expect(c.cloud).toEqual({ url: 'https://cloud.example.com', token: TOKEN, intervalMinutes: null, projects: [], suggestions: false, claims: false, people: false, machine: null });
   expect(loadConfig({ ...base, CLOUD_URL: 'http://localhost:8788', CLOUD_TOKEN: TOKEN, SYNC_INTERVAL_MINUTES: '60', SYNC_PROJECTS: 'shop, api', SYNC_SUGGESTIONS: ' TRUE ' }).cloud)
-    .toEqual({ url: 'http://localhost:8788', token: TOKEN, intervalMinutes: 60, projects: ['shop', 'api'], suggestions: true, machine: null });
+    .toEqual({ url: 'http://localhost:8788', token: TOKEN, intervalMinutes: 60, projects: ['shop', 'api'], suggestions: true, claims: false, people: false, machine: null });
   expect(loadConfig({ ...base, CLOUD_URL: 'https://cloud.example.com', CLOUD_TOKEN: TOKEN, SYNC_SUGGESTIONS: 'false' }).cloud?.suggestions).toBe(false);
+  expect(loadConfig({ ...base, CLOUD_URL: 'https://cloud.example.com', CLOUD_TOKEN: TOKEN, SYNC_CLAIMS: 'true', SYNC_PEOPLE: ' True ' }).cloud).toMatchObject({ claims: true, people: true });
   // Off without a cloud is simply off.
-  expect(loadConfig({ ...base, SYNC_SUGGESTIONS: 'false' }).cloud).toBeNull();
+  expect(loadConfig({ ...base, SYNC_SUGGESTIONS: 'false', SYNC_CLAIMS: 'false' }).cloud).toBeNull();
 });
 
 test('cloud settings are checked with everything else, and the token is never echoed', () => {
@@ -223,6 +224,9 @@ test('cloud settings are checked with everything else, and the token is never ec
     [{ CLOUD_URL: 'https://cloud.example.com', CLOUD_TOKEN: TOKEN, SYNC_INTERVAL_MINUTES: '1' }, /SYNC_INTERVAL_MINUTES must be a number of at least 5/],
     [{ SYNC_INTERVAL_MINUTES: '60' }, /SYNC_INTERVAL_MINUTES needs CLOUD_URL and CLOUD_TOKEN/],
     [{ SYNC_PROJECTS: 'shop' }, /SYNC_PROJECTS needs CLOUD_URL and CLOUD_TOKEN/],
+    [{ SYNC_CLAIMS: 'true' }, /SYNC_CLAIMS needs CLOUD_URL and CLOUD_TOKEN/],
+    [{ CLOUD_URL: 'https://cloud.example.com', CLOUD_TOKEN: TOKEN, SYNC_CLAIMS: 'yes' }, /SYNC_CLAIMS must be true or false/],
+    [{ CLOUD_URL: 'https://cloud.example.com', CLOUD_TOKEN: TOKEN, SYNC_PEOPLE: 'true' }, /SYNC_PEOPLE needs SYNC_CLAIMS=true/],
     [{ CLOUD_URL: 'https://cloud.example.com', CLOUD_TOKEN: TOKEN, SYNC_SUGGESTIONS: 'yes' }, /SYNC_SUGGESTIONS must be true or false/],
     [{ SYNC_SUGGESTIONS: 'maybe' }, /SYNC_SUGGESTIONS must be true or false/],
     [{ SYNC_SUGGESTIONS: 'true' }, /SYNC_SUGGESTIONS needs CLOUD_URL and CLOUD_TOKEN/],
@@ -273,7 +277,9 @@ test('an operator token lets agents make owner decisions; unset, there is none, 
   expect(op.token).toBe('o'.repeat(32));
   // By default not deciding lessons (what agents learn stays the owner's call), nor anything that deletes data, changes
   // what is mounted, imports lessons from a file, or touches integration keys.
-  const off = ['lesson_decide', 'delete_project', 'docs_delete', 'settings', 'import', 'integrations', 'chat', 'chat_delete', 'select_projects', 'links_delete', 'loop_decide', 'loop_settings'];
+  const off = ['lesson_decide', 'delete_project', 'docs_delete', 'settings', 'import', 'integrations', 'chat', 'chat_delete', 'select_projects', 'links_delete', 'loop_decide', 'loop_settings', 'claims_decide', 'conflict_decide'];
+  // Accepting a claim files a fact agents are given: the owner's call.
+  expect(op.allow).not.toContain('claims_decide');
   // The learning loop's decisions and its mode are the owner's: an agent must not vote the loop into autonomy.
   expect(op.allow).not.toContain('loop_decide');
   expect(op.allow).not.toContain('loop_settings');
@@ -406,4 +412,11 @@ test('authConfigured: the API has a token, or a worker run on its own is told so
   for (const no of ['0', 'false', 'no', 'off', '11', ' ', '']) expect(loadConfig({ ...base, FG_AUTH_CONFIGURED: no }).authConfigured, no).toBe(false);
   expect(loadConfig({ ...base, AUTH_STATE_FILE: ' /state/api-settings/auth-state.json ' }).authStateFile).toBe('/state/api-settings/auth-state.json');
   expect(loadConfig(base).authStateFile).toBeNull();
+});
+
+test('contradiction detection: its judge defaults to intake\'s model, 60 calls a day and a sweep every 6 hours; the allow list holds', () => {
+  expect(loadConfig(base).conflicts).toEqual({ llm: null, llmCallsPerDay: 60, sweepMinutes: 360 });
+  expect(loadConfig({ ...base, CONFLICT_LLM: 'ollama:gemma4', CONFLICT_LLM_CALLS_PER_DAY: '0', CONFLICT_SWEEP_MINUTES: '30' }).conflicts).toEqual({ llm: 'ollama:gemma4', llmCallsPerDay: 0, sweepMinutes: 30 });
+  expect(() => loadConfig({ ...base, CONFLICT_LLM: 'anthropic:claude' })).toThrow(/CONFLICT_LLM: anthropic is not in INTAKE_PROVIDER_ALLOW/);
+  expect(() => loadConfig({ ...base, CONFLICT_SWEEP_MINUTES: '0' })).toThrow(/CONFLICT_SWEEP_MINUTES/);
 });

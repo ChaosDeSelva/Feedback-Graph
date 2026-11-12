@@ -64,11 +64,11 @@ test('readLoopMetrics counts the window in the store, for the projects a viewer 
   // Made in the window and a week before it; applied from the Monday its first week (2026-W39) starts.
   expect(seen).toEqual([
     { patterns: { projectKeys: ['p'] } }, { signals: { projectKeys: ['p'] } },
-    { count: { since: '2026-09-09T12:00:00.000Z', projectKeys: ['p'], mode: 'propose' }, by: ['createdWeek'] },
-    { count: { since: '2026-09-09T12:00:00.000Z', projectKeys: ['p'], appliedSince: '2026-09-21T00:00:00.000Z' }, by: ['type', 'status'] },
+    { count: { since: '2026-09-09T12:00:00.000Z', projectKeys: ['p'], mode: 'propose', author: 'loop' }, by: ['createdWeek'] },
+    { count: { since: '2026-09-09T12:00:00.000Z', projectKeys: ['p'], appliedSince: '2026-09-21T00:00:00.000Z', author: 'loop' }, by: ['type', 'status'] },
   ]);
   seen.length = 0;
   await readLoopMetrics(s, { now: NOW, weeks: 2 });
   expect(seen[0]).toEqual({ patterns: {} });
-  expect(seen[2]).toEqual({ count: { since: '2026-10-21T12:00:00.000Z', mode: 'propose' }, by: ['createdWeek'] });
+  expect(seen[2]).toEqual({ count: { since: '2026-10-21T12:00:00.000Z', mode: 'propose', author: 'loop' }, by: ['createdWeek'] });
 });

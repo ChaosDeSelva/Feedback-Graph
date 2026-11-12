@@ -7,6 +7,7 @@ import { DocsRepo } from './docs.ts';
 import { EmbeddingsRepo } from './embeddings.ts';
 import { FactsRepo } from './facts.ts';
 import { InsightsRepo } from './insights.ts';
+import { IntakeRepo } from './intake.ts';
 import { KnowledgeRepo } from './knowledge.ts';
 import { LinksRepo } from './links.ts';
 import { PortabilityRepo } from './portability.ts';
@@ -38,6 +39,7 @@ export function neo4jStore(g: GraphRepo): Store {
     chats: new ChatRepo(g),
     runs: new RunsRepo(g),
     decisions: new DecisionsRepo(g),
+    intake: new IntakeRepo(g),
     ensureSchema: async (o) => {
       await g.ensureSchema();
       // The api and the worker start together: one of them runs these while the other waits, rather than both

@@ -138,7 +138,7 @@ const LinkAction = ({ href, children }: { href: string; children: ReactNode }) =
   <a href={href} className="text-xs font-medium text-accent-text underline decoration-accent/40 underline-offset-2 hover:decoration-accent">{children}</a>
 );
 
-const JOB_LABEL: Record<ModelJob, string> = { classify: 'classifier', postmortem: 'post-mortem', scan: 'scan', summary: 'summaries', docs: 'docs reader', chat: 'chat' };
+const JOB_LABEL: Record<ModelJob, string> = { classify: 'classifier', postmortem: 'post-mortem', scan: 'scan', summary: 'summaries', docs: 'docs reader', chat: 'chat', intake: 'intake reader' };
 
 function Now({ load }: { load: Load<SystemStatus> }) {
   return (

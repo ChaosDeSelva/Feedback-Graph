@@ -54,6 +54,15 @@ test('foldLabels bumps the decision\'s own bucket from the type\'s prior and pen
   expect(await readPenalties(cursors, 'approve_lesson')).toEqual({ evidence: 0, scope: 1 });
 });
 
+test('foldLabels never calibrates the owner\'s own decision: a conflict resolved, then rolled back, is no label', async () => {
+  const cursors = memory();
+  const dec = { id: 'dec:1', type: 'resolve_conflict', author: 'owner', confidence: { band: 4 }, policyVersion: 1 } as Decision;
+  const decisions = { get: vi.fn(async () => dec), bumpCalibration: vi.fn(async () => bucket(4, 1, 1, 1)) };
+  expect(await foldLabels([e('decision_rolled_back', { status: 'rolled_back', reason: 'wording' }), e('decision_applied', { status: 'applied' })], { decisions, cursors })).toBe(0);
+  expect(decisions.bumpCalibration).not.toHaveBeenCalled();
+  expect(await readPenalties(cursors, 'resolve_conflict')).toEqual({ evidence: 0, scope: 0 });
+});
+
 test('labelUntouched: an auto-applied decision left alone 14 days while served is kept, once', async () => {
   const now = Date.parse('2026-11-30T00:00:00Z');
   const dec = (id: string, o: Partial<Decision> = {}) => ({

@@ -243,7 +243,7 @@ describe('connection states', () => {
   });
 
   test('a project the sync schedule is backing off from is named, though the last run was fine for the rest', async () => {
-    const cloud = { url: 'https://cloud.example.com', token: 't', intervalMinutes: 60, projects: [], suggestions: false, machine: null };
+    const cloud = { url: 'https://cloud.example.com', token: 't', intervalMinutes: 60, projects: [], suggestions: false, claims: false, people: false, machine: null };
     const cloudSync = {
       host: 'cloud.example.com', intervalMinutes: 60, lastAt: '2026-10-25T11:00:00.000Z', lastOk: true, lastError: null, lastSent: null, nextAt: null, failures: 0,
       waiting: [{ key: 'demo-shop', failures: 2, until: '2026-10-25T15:00:00.000Z', error: 'the cloud rejected the bundle (422)' }],

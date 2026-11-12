@@ -114,15 +114,28 @@ test('with no token it is not found; with a wrong one (or the API token) it is r
   expect(names.filter((n) => n in ADMIN_TOOLS)).toEqual([]);
 });
 
+/** INTAKE_ENABLED on: knowledge intake's admin tools are offered (its routes are mounted by the opts alone). */
+const intakeOn = { extra: { intake: { store: {} as never, archive: false, decide: {} as never } } };
+
+test('knowledge intake\'s admin tools exist only while INTAKE_ENABLED is on', async () => {
+  const list = async (o: Parameters<typeof setup>[0]) => ((await (await setup(o).app.request('/mcp/admin', rpc({ method: 'tools/list', params: {} }, bearer(OP)))).json()) as { result: { tools: { name: string }[] } }).result.tools.map((t) => t.name);
+  const intakeTools = ['claim_decide', 'claims_list', 'conflict_resolve', 'conflicts_list', 'intake_submit', 'question_answer', 'questions_list'];
+  expect((await list({})).filter((n) => intakeTools.includes(n))).toEqual([]);
+  expect((await list(intakeOn)).filter((n) => intakeTools.includes(n)).sort()).toEqual(intakeTools);
+});
+
 test('the operator token lists every admin tool, each description naming its verb', async () => {
-  const { app } = setup();
+  const { app } = setup(intakeOn);
   const res = await app.request('/mcp/admin', rpc({ method: 'tools/list', params: {} }, bearer(OP)));
   expect(res.status).toBe(200);
   const tools = ((await res.json()) as { result: { tools: { name: string; description: string }[] } }).result.tools;
   expect(tools.map((t) => t.name).sort()).toEqual([
-    'cloud_sync_now', 'decision_decide', 'decision_get', 'decision_note', 'decision_rollback', 'decisions_list', 'demo_remove', 'demo_seed', 'inbox_decide', 'inbox_get',
-    'inbox_list', 'lesson_decide', 'lesson_get', 'lessons_list', 'link_decide', 'list_projects', 'loop_pause', 'loop_status', 'pipeline_status', 'rebuild_code_map', 'run_cleanup', 'scan_projects', 'select_projects', 'session_evidence', 'set_fact_relevance',
+    'claim_decide', 'claims_list', 'cloud_sync_now', 'conflict_resolve', 'conflicts_list', 'decision_decide', 'decision_get', 'decision_note', 'decision_rollback', 'decisions_list', 'demo_remove', 'demo_seed', 'inbox_decide', 'inbox_get',
+    'inbox_list', 'intake_submit', 'lesson_decide', 'lesson_get', 'lessons_list', 'link_decide', 'list_projects', 'loop_pause', 'loop_status', 'pipeline_status', 'question_answer', 'questions_list', 'rebuild_code_map', 'run_cleanup', 'scan_projects', 'select_projects', 'session_evidence', 'set_fact_relevance',
   ]);
+  expect(tools.find((t) => t.name === 'conflict_resolve')!.description).toContain('OPERATOR_ALLOW: conflict_decide');
+  expect(tools.find((t) => t.name === 'claim_decide')!.description).toContain('OPERATOR_ALLOW: claims_decide');
+  expect(tools.find((t) => t.name === 'intake_submit')!.description).toContain('OPERATOR_ALLOW: intake');
   expect(tools.find((t) => t.name === 'lesson_decide')!.description).toContain('lesson_decide');
   expect(tools.find((t) => t.name === 'rebuild_code_map')!.description).toContain('OPERATOR_ALLOW: scan');
   expect(tools.find((t) => t.name === 'decision_rollback')!.description).toContain('OPERATOR_ALLOW: loop_decide');
@@ -220,7 +233,7 @@ test('scan_projects with wait follows each job until it is done', async () => {
     return Response.json({ id: 'j1', projectKey: 'acme', status: polls < 2 ? 'running' : 'done', filesScanned: 3 });
   };
   const req = new Request('http://localhost/mcp/admin', rpc({ method: 'tools/call', params: { name: 'scan_projects', arguments: { all: true, wait: true } } }, bearer(OP)));
-  const res = await handleAdminMcp(req, { request, sleep: async () => {} });
+  const res = await handleAdminMcp(req, { intake: true, request, sleep: async () => {} });
   const r = ((await res.json()) as { result: ToolResult }).result;
   expect(JSON.parse(r.content[0].text).jobs).toEqual([expect.objectContaining({ id: 'j1', status: 'done' })]);
   expect(seen).toEqual(['POST /api/projects/scan', 'GET /api/scans/j1', 'GET /api/scans/j1']);
@@ -265,7 +278,7 @@ function many(n: number) {
   };
   const call = async (name: string, args: object) => {
     const req = new Request('http://localhost/mcp/admin', rpc({ method: 'tools/call', params: { name, arguments: args } }, bearer(OP)));
-    const res = await handleAdminMcp(req, { request });
+    const res = await handleAdminMcp(req, { intake: true, request });
     return ((await res.json()) as { result: ToolResult & { structuredContent?: any } }).result;
   };
   return { call, asked, description };
@@ -325,11 +338,11 @@ test('demo_seed and demo_remove go through the demo routes as the agent; another
 });
 
 test('read tools say they are read-only, so a client need not ask before each call; decisions do not', async () => {
-  const { app } = setup();
+  const { app } = setup(intakeOn);
   const res = await app.request('/mcp/admin', rpc({ method: 'tools/list', params: {} }, bearer(OP)));
   const tools = ((await res.json()) as { result: { tools: { name: string; annotations?: Record<string, boolean> }[] } }).result.tools;
   const reads = tools.filter((t) => t.annotations?.readOnlyHint).map((t) => t.name).sort();
-  expect(reads).toEqual(['decision_get', 'decisions_list', 'inbox_get', 'inbox_list', 'lesson_get', 'lessons_list', 'list_projects', 'loop_status', 'pipeline_status', 'session_evidence']);
+  expect(reads).toEqual(['claims_list', 'conflicts_list', 'decision_get', 'decisions_list', 'inbox_get', 'inbox_list', 'lesson_get', 'lessons_list', 'list_projects', 'loop_status', 'pipeline_status', 'questions_list', 'session_evidence']);
   for (const t of tools) {
     expect(t.annotations, t.name).toBeDefined();
     expect(t.annotations!.readOnlyHint, t.name).toBe(!t.name.startsWith('demo_') && (!(t.name in ADMIN_TOOLS) || ADMIN_TOOLS[t.name as keyof typeof ADMIN_TOOLS] === null));
@@ -437,4 +450,25 @@ test('rebuild_code_map rejects a project without a map before invoking a semanti
   const result = await tool(s.app, 'rebuild_code_map', { project: 'acme' });
   expect(result.isError).toBe(true);
   expect(s.calls.rebuild ?? []).toEqual([]);
+});
+
+test('intake tools: lists are reads; claim and conflict decisions need their verbs, and a conflict is resolved through its route', async () => {
+  const asked: string[] = [];
+  const intake = {
+    listClaims: async (f: object) => { asked.push(`claims ${JSON.stringify(f)}`); return []; },
+    listConflicts: async (f: object) => { asked.push(`conflicts ${JSON.stringify(f)}`); return []; },
+    conflict: async () => null,
+    conflictsFor: async () => [],
+  };
+  const extra = { intakeReview: { intake: intake as never, facts: {} as never, embed: async () => [], activity: { record: async () => {} }, conflicts: { store: { intake } as never, exec: {} as never } } };
+  const { app } = setup({ allow: DEFAULT_ALLOW.filter((v) => v !== 'conflict_decide'), extra });
+  expect(JSON.parse((await tool(app, 'conflicts_list', {})).text)).toEqual({ offset: 0, items: [], more: false });
+  expect(JSON.parse((await tool(app, 'claims_list', { status: 'accepted' })).text)).toEqual({ offset: 0, items: [], more: false });
+  expect(asked).toEqual([expect.stringContaining('"status":["open"]'), expect.stringContaining('"status":["accepted"]')]);
+  const refused = await tool(app, 'conflict_resolve', { id: 'conflict:1', choice: 'a' });
+  expect(refused.isError).toBe(true);
+  expect(refused.text).toContain('conflict_decide');
+  const allowed = setup({ allow: ['conflict_decide'], extra });
+  const missing = await tool(allowed.app, 'conflict_resolve', { id: 'conflict:1', choice: 'a' });
+  expect(missing).toMatchObject({ isError: true, text: '404: not found' });
 });

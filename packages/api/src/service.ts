@@ -2,7 +2,7 @@ import { dirname, join } from 'node:path';
 import { existsSync } from 'node:fs';
 import type { Server } from 'node:http';
 import { getConnInfo } from '@hono/node-server/conninfo';
-import { cloudLocalOnlyProjects, credentialFile, decisionExecutor, githubRepoOfRemote, Integrations, makeProviderOr, ollamaEmbed, ollamaPing, projectFolders, publicRedactionArchive, redactSecrets, refreshLayout, reportedRunnerReadiness, RUNNER_READINESS_CURSOR, setRedactionArchive, setRedactionArchivePurger, shownProjects, storedSyncMemory, syncProjects, VERSION, worktreeGitArgs, writeAuthState, type Config, type Project, type Store } from '@fb/core';
+import { cloudLocalOnlyProjects, credentialFile, decisionExecutor, githubRepoOfRemote, Integrations, intakeEnabled, makeProviderOr, ollamaEmbed, ollamaPing, projectFolders, publicRedactionArchive, redactSecrets, refreshLayout, reportedRunnerReadiness, RUNNER_READINESS_CURSOR, setRedactionArchive, setRedactionArchivePurger, shownProjects, storedSyncMemory, syncProjects, VERSION, worktreeGitArgs, writeAuthState, type Config, type Project, type Store } from '@fb/core';
 import { Admission } from './admission.ts';
 import { symbolsOnDemand } from './symbolsOnDemand.ts';
 import { agentDocsFor } from './agentDocs.ts';
@@ -14,6 +14,11 @@ import { readRepoDiff, readRepoPrNumbers, githubCommitPrLookup } from './diff.ts
 import { rootsFile } from './roots.ts';
 import { loadRunKeySalt } from './runKeySalt.ts';
 import { stopServer } from './server.ts';
+import type { AgentNotes } from './disputes.ts';
+import { prepareIntakeSource, storeIntakeSource } from './intake.ts';
+
+/** INTAKE_ARCHIVE=off: no original intake text is kept in the redaction archive. */
+const intakeArchive = (env: Record<string, string | undefined>) => env.INTAKE_ARCHIVE?.trim().toLowerCase() !== 'off';
 
 export type Log = (msg: string, extra?: object) => void;
 
@@ -168,6 +173,22 @@ export async function createApiService(config: Config, store: Store, env: NodeJS
     sessions: store.sessions,
     shown,
     links: store.links,
+    ...(intakeEnabled(env) && {
+      intake: {
+        store: store.intake,
+        fact: (id: string) => store.facts.fact(id),
+        lesson: async (id: string) => (await knowledge.lessonDetail(id))?.lesson ?? null,
+        // submit_notes: the agent's notes as a notes source, private (never synced), read into claims for the owner.
+        submit: async (project: Project, n: AgentNotes) => {
+          const prepared = prepareIntakeSource(project, { projectKey: project.key, kind: 'notes', format: 'md', title: n.title, text: n.text, occurredAt: n.occurredAt, origin: n.origin, private: true });
+          if ('error' in prepared) throw new Error(prepared.error);
+          const id = await storeIntakeSource({ store: store.intake, archive: intakeArchive(env), docs, embed, activity }, prepared, {
+            actor: n.origin, why: 'an agent submitted notes (submit_notes): their claims wait for your review and are never accepted for you',
+          });
+          return { id, utterances: prepared.utterances.length };
+        },
+      },
+    }),
   };
 
   /** Aborted on SIGTERM: the event streams end at once instead of holding the restart for 10 s (stopServer). */
@@ -261,11 +282,14 @@ export async function createApiService(config: Config, store: Store, env: NodeJS
       hostHome: config.hostHome,
     },
     context: contextDeps,
+    ...(intakeEnabled(env) && { intakeReview: { intake: store.intake, facts, embed, activity, conflicts: { store, exec: decisionExecutor(store, { embed }) } } }),
     chat: {
       store: store.chats,
       // As the asking request sees the stores (runScoped): a sandbox run's records reach only its own turns.
       build: chatPackBuilder({ context: contextDeps, codeMap: (k) => store.codegraph.codeMap(k), sessionFiles: (id) => store.codegraph.sessionFiles(id) }),
     },
+    // Knowledge intake: dark until INTAKE_ENABLED. INTAKE_ARCHIVE=off keeps no original transcript anywhere.
+    ...(intakeEnabled(env) ? { intake: { store: store.intake, archive: intakeArchive(env), decide: { store, exec: decisionExecutor(store, { embed }) } } } : {}),
     log,
   });
   return { app, closing };

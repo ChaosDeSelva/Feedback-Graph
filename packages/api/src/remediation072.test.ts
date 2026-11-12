@@ -128,7 +128,7 @@ test('Ask only sends mapped paths to context Activity, never fake prompt paths',
 test('cloud status explains team approval before any project is selected and caches that policy', async () => {
   let calls = 0; const app = new Hono();
   const team = { adminApprovalRequired: true, approved: 0, suggested: 5, blocked: true, message: 'An admin must approve Suggested lessons before the team can use them.' };
-  cloudRoutes(app, { cloud: { url: 'https://cloud.example.com', token: 'token', intervalMinutes: 60, projects: [], suggestions: false, machine: null },
+  cloudRoutes(app, { cloud: { url: 'https://cloud.example.com', token: 'token', intervalMinutes: 60, projects: [], suggestions: false, claims: false, people: false, machine: null },
     projects: async () => [], portability: { exportData: async () => { throw new Error('must not export an unselected project'); } },
     activity: { record: async () => {}, list: async () => [] }, worker: async () => null,
     fetch: (async () => { calls++; return Response.json({ teamLessons: team }); }) as typeof fetch,

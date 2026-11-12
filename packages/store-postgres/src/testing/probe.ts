@@ -26,6 +26,10 @@ export const TABLES: Record<ProbeKind, { table: string; id: string }> = {
   SyncCursor: { table: 'sync_cursors', id: 'key' },
   Decision: { table: 'decisions', id: 'id' },
   DecisionNote: { table: 'decision_notes', id: 'id' },
+  Person: { table: 'people', id: 'id' },
+  Claim: { table: 'claims', id: 'id' },
+  Question: { table: 'questions', id: 'id' },
+  Conflict: { table: 'conflicts', id: 'id' },
 };
 
 /** Placeholder parents for seeded records, filed under a project no test uses. */
@@ -129,7 +133,7 @@ export class PostgresProbe implements StoreProbe {
 
   async filedUnder(key: string): Promise<ProbeKind[]> {
     const parts = (Object.entries(TABLES) as [ProbeKind, { table: string }][])
-      .filter(([kind]) => !['Project', 'Commit', 'Cause', 'SyncCursor', 'Lesson', 'DecisionNote'].includes(kind))
+      .filter(([kind]) => !['Project', 'Commit', 'Cause', 'SyncCursor', 'Lesson', 'DecisionNote', 'Person'].includes(kind))
       .map(([kind, t]) => `SELECT '${kind}' AS kind FROM ${t.table} WHERE project_key = $1`);
     parts.push(`SELECT 'Project' FROM projects WHERE key = $1`, `SELECT 'Lesson' FROM lessons WHERE project_key = $1 OR origin_project_key = $1`);
     const { rows } = await this.q(`SELECT DISTINCT kind FROM (${parts.join(' UNION ALL ')}) x ORDER BY kind`, [key]);
@@ -206,6 +210,12 @@ export class PostgresProbe implements StoreProbe {
         await this.q(`INSERT INTO chunks (id, doc_id, project_key, idx, text, embedding) VALUES ($1, $2, $3, 0, $4, $5::vector)`, [row.id, p, PROBE_PROJECT, row.text, v]);
         return;
     }
+  }
+
+  async seedIntakeText(row: { claimId: string; questionId: string; docId: string; text: string }) {
+    await this.q('UPDATE claims SET statement = $2, quote = $2 WHERE id = $1', [row.claimId, row.text]);
+    await this.q('UPDATE questions SET text = $2 WHERE id = $1', [row.questionId, row.text]);
+    await this.q('UPDATE chunks SET text = $2 WHERE doc_id = $1 AND idx = 0', [row.docId, row.text]);
   }
 
   async seedOwnerMark(lessonId: string) {

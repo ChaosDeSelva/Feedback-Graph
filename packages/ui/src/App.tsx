@@ -12,6 +12,7 @@ import { FirstRun, stageLine } from './FirstRun.tsx';
 import { Graph } from './Graph.tsx';
 import { hashView } from './links.ts';
 import { Inbox } from './Inbox.tsx';
+import { Intake } from './Intake.tsx';
 import { LearningLoop } from './LearningLoop.tsx';
 import { Lessons } from './Lessons.tsx';
 import { Patterns } from './Patterns.tsx';
@@ -25,11 +26,12 @@ import { AppShell, type Health, type NavGroup } from './ui/AppShell.tsx';
 import { Button, Input } from './ui/controls.tsx';
 import { Alert } from './ui/display.tsx';
 import { PageHeader } from './ui/PageHeader.tsx';
-import { ActivityIcon, AskIcon, DashboardIcon, DecisionIcon, DocIcon, FolderIcon, GearIcon, GraphIcon, InboxIcon, LessonIcon, LoopIcon, Mark, PatternIcon, SessionIcon } from './ui/icons.tsx';
+import { ActivityIcon, AskIcon, DashboardIcon, DecisionIcon, DocIcon, FolderIcon, GearIcon, GraphIcon, InboxIcon, IntakeIcon, LessonIcon, LoopIcon, Mark, PatternIcon, SessionIcon } from './ui/icons.tsx';
 
 const VIEWS = {
   dashboard: { label: 'Dashboard', el: <Dashboard />, icon: <DashboardIcon /> },
   inbox: { label: 'Inbox', el: <Inbox />, icon: <InboxIcon /> },
+  intake: { label: 'Intake', el: <Intake />, icon: <IntakeIcon /> },
   ask: { label: 'Ask', el: <Chat />, icon: <AskIcon /> },
   lessons: { label: 'Lessons', el: <Lessons />, icon: <LessonIcon /> },
   decisions: { label: 'Decisions', el: <Decisions />, icon: <DecisionIcon /> },
@@ -45,10 +47,10 @@ const VIEWS = {
 type View = keyof typeof VIEWS;
 
 const item = (key: View, badge?: number) => ({ key, label: VIEWS[key].label, icon: VIEWS[key].icon, badge });
-/** The sidebar; `proposals`: the learning loop's decisions waiting for you, a badge on Decisions. */
-const groups = (proposals?: number): NavGroup<View>[] => [
+/** The sidebar; `proposals`: the learning loop's decisions waiting for you, a badge on Decisions. `intake`: INTAKE_ENABLED. */
+const groups = (proposals?: number, intake = false): NavGroup<View>[] => [
   { label: 'Overview', items: [item('dashboard')] },
-  { label: 'Review', items: [item('inbox'), item('ask'), item('lessons'), item('decisions', proposals)] },
+  { label: 'Review', items: [item('inbox'), ...(intake ? [item('intake')] : []), item('ask'), item('lessons'), item('decisions', proposals)] },
   { label: 'Insights', items: [item('loop'), item('graph'), item('patterns'), item('sessions')] },
   { label: 'Data', items: [item('projects'), item('activity')] },
   { label: 'Help', items: [item('docs')] },
@@ -72,7 +74,7 @@ export function App() {
       const next = fromHash();
       const target = location.hash;
       if (next === viewRef.current) {
-        if (target !== lastHash.current && ['inbox', 'lessons', 'decisions', 'sessions', 'ask'].includes(next)) setHashRevision(n => n + 1);
+        if (target !== lastHash.current && ['inbox', 'intake', 'lessons', 'decisions', 'sessions', 'ask'].includes(next)) setHashRevision(n => n + 1);
         lastHash.current = target;
         return setView(next);
       }
@@ -132,7 +134,7 @@ export function App() {
   const nothingSelected = !!status?.selection && (!status.selection.initialized || status.selection.tracked === 0);
   return (
     <AppShell
-      groups={groups(proposals)}
+      groups={groups(proposals, !!status?.intake?.enabled)}
       current={view}
       onNavigate={navigate}
       health={health(status)}

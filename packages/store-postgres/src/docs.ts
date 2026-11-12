@@ -2,7 +2,7 @@ import { conditionalWrite } from './conditionalWrite.ts';
 import { archiveBeforeRedaction, archiveRedactionInput, purgeRedactionOriginals } from '@fb/core';
 import { randomUUID } from 'node:crypto';
 import { docIdOf, runWriteOwner, REDACT_PAGE, redactDeep, redactSecrets, relevanceOf, scanRetryAt, SCAN_UNAVAILABLE_WAIT_MS } from '@fb/core';
-import type { DocHit, DocInput, DocLink, DocListOpts, DocSummary, DocsStore, DocToRead, EmbeddedFact, TaskImage, UpsertDocOpts } from '@fb/core';
+import type { DocHit, DocInput, DocLink, DocListOpts, DocSearch, DocSummary, DocsStore, DocToRead, EmbeddedFact, TaskImage, UpsertDocOpts } from '@fb/core';
 import type pg from 'pg';
 import { iso, toVector, tx, type Db } from './db.ts';
 import { runSearch, sandboxPresence, searchDocsQuery, visibleToRun } from './vector.ts';
@@ -81,14 +81,14 @@ export class PgDocsStore implements DocsStore {
     }));
   }
 
-  async nextDocToRead(now = new Date()): Promise<DocToRead | null> {
+  async nextDocToRead(now = new Date(), o: { intake?: boolean } = {}): Promise<DocToRead | null> {
     const { rows: [d] } = await this.db.pool.query(
       `SELECT d.*, b.media_type AS blob_type, encode(b.data, 'base64') AS blob_data,
               (SELECT string_agg(c.text, E'\n\n' ORDER BY c.idx) FROM chunks c WHERE c.doc_id = d.id) AS text
        FROM docs d LEFT JOIN doc_blobs b ON b.doc_id = d.id
-       WHERE d.read_status = 'pending' AND (d.read_retry_at IS NULL OR d.read_retry_at <= $1)
+       WHERE d.read_status = 'pending' AND (d.read_retry_at IS NULL OR d.read_retry_at <= $1) AND (d.source = 'intake') = $2
        ORDER BY d.added_at, d.id LIMIT 1`,
-      [now],
+      [now, !!o.intake],
     );
     if (!d) return null;
     const image = d.blob_data ? { mediaType: d.blob_type, data: d.blob_data.replace(/\n/g, '') } : null;
@@ -163,6 +163,16 @@ export class PgDocsStore implements DocsStore {
       [id, attempts, redactSecrets(error).slice(0, 2000), retryAt, o.version ?? null],
     );
     return { attempts, retryAt };
+  }
+
+  async recordDocProgress(id: string, version: string, o: { done: boolean }): Promise<boolean> {
+    const { rowCount } = await this.db.pool.query(
+      `UPDATE docs SET read_status = $3, read_attempts = 0, read_error = NULL, read_retry_at = NULL,
+         read_at = CASE WHEN $4 THEN $5 ELSE read_at END
+       WHERE id = $1 AND added_at = $2`,
+      [id, version, o.done ? 'done' : 'pending', o.done, new Date()],
+    );
+    return (rowCount ?? 0) > 0;
   }
 
   async requeueStaleDocs(): Promise<void> {
@@ -249,10 +259,16 @@ export class PgDocsStore implements DocsStore {
     return rows.map((r) => r.tid as string);
   }
 
-  async searchDocs(q: { embedding: number[]; projectKey: string; k: number; run?: string | null }): Promise<DocHit[]> {
+  async searchDocs(q: DocSearch): Promise<DocHit[]> {
     // The project's chunks, nearest first, through the HNSW index when it pays (see vector.ts).
     const rows = await runSearch(this.db, searchDocsQuery(this.db, q, { sandbox: await sandboxPresence(this.db).any() }), q.k);
     return rows.map((r) => ({ docId: r.doc_id, source: r.source, ref: r.ref, title: r.title, url: r.url ?? null, text: r.text, score: r.score }));
+  }
+
+  async docText(id: string): Promise<string | null> {
+    const { rows } = await this.db.pool.query(`SELECT (SELECT string_agg(c.text, E'\\n\\n' ORDER BY c.idx) FROM chunks c WHERE c.doc_id = d.id) AS text
+      FROM docs d WHERE d.id = $1`, [id]);
+    return rows.length ? rows[0].text ?? '' : null;
   }
 
   /** Small key/value store for integration sync cursors (e.g. last GitHub sync time per project). */

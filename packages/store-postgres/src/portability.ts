@@ -5,6 +5,7 @@ import {
 import type pg from 'pg';
 import { PgCodeGraphStore } from './codegraph.ts';
 import { iso, tx, type Db } from './db.ts';
+import { DELETE_PROJECT_INTAKE } from './intake.ts';
 
 /*
  * Ordering: Neo4j compares strings by code point, so every text ORDER BY here uses COLLATE "C" (byte order of UTF-8,
@@ -17,6 +18,7 @@ import { iso, tx, type Db } from './db.ts';
  * Commits and sessions are matched through this project's sessions, as Neo4j matches them through (:Session)-[:IN].
  */
 const DELETES: string[] = [
+  ...DELETE_PROJECT_INTAKE,
   `DELETE FROM chat_turns WHERE project_key = $1`,
   `DELETE FROM chat_conversations WHERE project_key = $1`,
   `DELETE FROM lessons WHERE project_key = $1 OR origin_project_key = $1`,
@@ -109,14 +111,23 @@ export class PgPortabilityStore implements PortabilityStore {
           [key, keys],
         ),
         await q(
-          `SELECT id, path, lines, kind, statement, why, confidence, source, created_at, project_key
-           FROM facts WHERE current AND doc_id IS NULL AND ($1::text IS NULL OR project_key = $1) AND ($2::text[] IS NULL OR project_key = ANY($2)) AND NOT sandbox
-             AND source IS DISTINCT FROM 'demo'
-           ORDER BY project_key COLLATE "C", path COLLATE "C", statement COLLATE "C", id COLLATE "C"`,
+          // A claim's fact carries whether its source is private (an answer's: its question's source; a source gone or
+          // unknown: private) and who said it, for syncBundle's SYNC_CLAIMS and SYNC_PEOPLE guards.
+          `SELECT f.id, f.path, f.lines, f.kind, f.statement, f.why, f.confidence, f.source, f.created_at, f.project_key, f.origin,
+                  coalesce(s.private, true) AS claim_private, p.display_name AS claim_speaker
+           FROM facts f
+           LEFT JOIN claims c ON f.origin = 'claim' AND c.fact_id = f.id
+           LEFT JOIN intake_sources s ON s.doc_id = CASE WHEN c.doc_id LIKE 'answer:%' THEN (SELECT q.doc_id FROM questions q WHERE q.id = substr(c.doc_id, 8)) ELSE c.doc_id END
+           LEFT JOIN people p ON p.id = c.speaker_id
+           WHERE f.current AND f.doc_id IS NULL AND ($1::text IS NULL OR f.project_key = $1) AND ($2::text[] IS NULL OR f.project_key = ANY($2)) AND NOT f.sandbox
+             AND f.source IS DISTINCT FROM 'demo'
+           ORDER BY f.project_key COLLATE "C", f.path COLLATE "C", f.statement COLLATE "C", f.id COLLATE "C"`,
           [key, keys],
         ),
         await q(
+          // Intake sources (what people said) are never exported, so never synced either (syncBundle reads this).
           `SELECT id, project_key, source, ref, title, url FROM docs WHERE ($1::text IS NULL OR project_key = $1) AND ($2::text[] IS NULL OR project_key = ANY($2)) AND NOT sandbox
+             AND source <> 'intake'
            ORDER BY project_key COLLATE "C", id COLLATE "C"`,
           [key, keys],
         ),
@@ -171,6 +182,7 @@ export class PgPortabilityStore implements PortabilityStore {
         source: f.source,
         createdAt: iso(f.created_at) as string,
         projectKey: f.project_key,
+        ...(f.origin === 'claim' && { claim: { private: f.claim_private as boolean, speaker: (f.claim_speaker as string | null) ?? null } }),
       })), held).map(({ id: _, ...f }) => f),
       docs: docs.map((d) => ({ id: d.id, projectKey: d.project_key, source: d.source, ref: d.ref, title: d.title, url: d.url ?? null })),
       codeFiles,

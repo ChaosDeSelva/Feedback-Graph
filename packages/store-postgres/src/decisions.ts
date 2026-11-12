@@ -41,7 +41,7 @@ const decisionOf = (r: Row): Decision => ({
   rationale: r.rationale, model: r.model, policyVersion: r.policy_version, status: r.status, dependsOn: r.depends_on,
   supersededBy: r.superseded_by, createdAt: iso(r.created_at)!, appliedAt: iso(r.applied_at), decidedAt: iso(r.decided_at),
   decidedBy: r.decided_by, rollback: r.rollback, ratifiedAt: iso(r.ratified_at), ratifiedBy: r.ratified_by,
-  syncHoldUntil: iso(r.sync_hold_until),
+  syncHoldUntil: iso(r.sync_hold_until), author: r.author,
 });
 const signalsOf = (r: Row): LessonSignals => ({
   lessonId: r.lesson_id, counts: r.counts, lastServed: iso(r.last_served), lastOwnerTouch: iso(r.last_owner_touch), updatedAt: iso(r.updated_at)!,
@@ -66,6 +66,7 @@ function decisionWhere(f: DecisionFilter, p: unknown[]): string {
   const w: string[] = [];
   if (f.status) w.push(`d.status = ANY(${$(f.status)}::text[])`);
   if (f.type) w.push(`d.type = ${$(f.type)}`);
+  if (f.author) w.push(`d.author = ${$(f.author)}`);
   if (f.projectKey !== undefined) w.push(`d.project_key = ${$(f.projectKey)}`);
   if (f.projectKeys) w.push(`(d.project_key IS NULL OR d.project_key = ANY(${$(f.projectKeys)}::text[]))`);
   if (f.mode) w.push(`d.mode = ${$(f.mode)}`);
@@ -104,11 +105,11 @@ export class PgDecisionsStore implements DecisionsStore {
     const created = await tx(this.db, async (c) => {
       const { rowCount } = await c.query(
         `INSERT INTO decisions (id, type, project_key, status, tier, mode, before, after, evidence, features, score, confidence, band,
-                                rationale, model, policy_version, created_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8::jsonb, $9::jsonb, $10::jsonb, $11, $12::jsonb, $13, $14, $15, $16, $17)
+                                rationale, model, policy_version, created_at, author)
+         VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8::jsonb, $9::jsonb, $10::jsonb, $11, $12::jsonb, $13, $14, $15, $16, $17, $18)
          ON CONFLICT (id) DO NOTHING`,
         [d.id, d.type, d.projectKey, d.status, d.tier, d.mode, toJson(d.before), toJson(d.after), toJson(d.evidence), toJson(d.features),
-          d.score, toJson(d.confidence), d.confidence.band, d.rationale, d.model, d.policyVersion, new Date()],
+          d.score, toJson(d.confidence), d.confidence.band, d.rationale, d.model, d.policyVersion, new Date(), d.author ?? 'loop'],
       );
       if (!rowCount) return false;
       await c.query(

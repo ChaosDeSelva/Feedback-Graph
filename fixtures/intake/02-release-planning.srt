@@ -1,0 +1,23 @@
+1
+00:00:02,000 --> 00:00:07,000
+Oskar: Okay, release planning for the importer.
+
+2
+00:00:08,000 --> 00:00:13,000
+Oskar: We ship the importer on 12 December.
+
+3
+00:00:14,000 --> 00:00:20,000
+Priya: The build agents run Node 20.
+
+4
+00:00:21,000 --> 00:00:27,000
+Oskar: Every schema change needs a migration review before merge.
+
+5
+00:00:28,000 --> 00:00:34,000
+Priya: What happens to in-flight batches during a deploy?
+
+6
+00:00:35,000 --> 00:00:40,000
+Priya: Honestly I think the release checklist is too long, but that's a separate fight.
