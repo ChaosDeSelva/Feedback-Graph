@@ -80,6 +80,12 @@ do {
     eq(classify(healthy + [row("x", "restarting", "Restarting (1) 2 seconds ago")]).status, .problem, "a restarting service")
     eq(classify(healthy + [row("x", "exited", "Exited (137) 1 minute ago")]).status, .problem, "a service that died")
     eq(classify(healthy + [row("runner-control-init", "exited", "Exited (0) 3 minutes ago")]).status, .running, "the codex profile's init container finished")
+    // codex-runner exits 78 when its persisted isolation-safety flag turns it off, which the doctor only warns about.
+    let runnerOff = classify(healthy + [row("codex-runner", "exited", "Exited (78) 48 minutes ago")])
+    eq(runnerOff.status, .running, "a codex runner its safety flag turned off is not a problem")
+    expect(runnerOff.headline.contains("Codex runner off"), "says the codex runner is off")
+    eq(classify(healthy + [row("codex-runner", "exited", "Exited (1) 1 minute ago")]).status, .problem, "a codex runner that crashed is a problem")
+    eq(classify(healthy + [row("codex-runner", "exited", "Exited (78) 1 minute ago")], api: false).status, .starting, "starting wins over the runner note")
     // As the 0.8.0 doctor fails them: "worker: stopped" and "worker: paused, so it does nothing".
     let workerStopped = classify(healthy.map { var r = $0; if r.service == "worker" { r.state = "exited"; r.status = "Exited (0) 1 minute ago" }; return r })
     eq(workerStopped.status, .problem, "a long-running service stopped while the rest run")

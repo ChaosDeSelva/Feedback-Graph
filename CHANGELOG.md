@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.8.2 (2026-11-11)
+
+- Mac app: a Codex runner its isolation-safety flag keeps off (it exits 78, as on a Mac where the runner's sandbox cannot start) is shown as "Running · Codex runner off: scans paused", as the Dashboard and the doctor show it, instead of "Running with a problem". A runner that crashed is still a problem.
+
 ## 0.8.1 (2026-11-11)
 
 0.8.1 adds a **Mac app**: a menu bar companion that watches and drives the install you already have. The stack, its data and its upgrades are unchanged from 0.8.0.

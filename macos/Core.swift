@@ -87,6 +87,9 @@ struct ContainerRow: Equatable {
     /// An init container that ran and finished, as archive-key-init does on every start. A long-running service that
     /// exited 0 was stopped, which the doctor fails ("worker: stopped").
     var exitedCleanly: Bool { state == "exited" && status.hasPrefix("Exited (0)") && Self.initServices.contains(service) }
+    /// codex-runner exits 78 while its persisted isolation-safety flag keeps it off (Dockerfile); the doctor warns,
+    /// the Dashboard shows "Codex runner off", and everything else runs.
+    var runnerOff: Bool { service == "codex-runner" && state == "exited" && status.hasPrefix("Exited (78)") }
 }
 
 /// What the stack is doing, and one line that says so.
@@ -110,7 +113,7 @@ func classifyStack(engineRunning: Bool, engineName: String, rows allRows: [Conta
     let up = rows.filter { $0.state == "running" || $0.state == "restarting" }
     if up.isEmpty { return StackReport(status: .stopped, headline: "Stopped") }
     // A paused service does nothing, as the doctor says ("worker: paused, so it does nothing").
-    let failed = rows.filter { $0.state == "restarting" || $0.state == "dead" || $0.state == "paused" || $0.unhealthy || ($0.state == "exited" && !$0.exitedCleanly) }
+    let failed = rows.filter { $0.state == "restarting" || $0.state == "dead" || $0.state == "paused" || $0.unhealthy || ($0.state == "exited" && !$0.exitedCleanly && !$0.runnerOff) }
     if !failed.isEmpty {
         let names = failed.map(\.service).sorted().joined(separator: ", ")
         return StackReport(status: .problem, headline: "Running with a problem: \(names) \(failed.count == 1 ? "is" : "are") not healthy")
@@ -119,6 +122,7 @@ func classifyStack(engineRunning: Bool, engineName: String, rows allRows: [Conta
         return StackReport(status: .starting, headline: "Starting…")
     }
     if let ollamaProblem { return StackReport(status: .problem, headline: "Running, but \(ollamaProblem)") }
+    if rows.contains(where: \.runnerOff) { return StackReport(status: .running, headline: "Running · Codex runner off: scans paused") }
     return StackReport(status: .running, headline: "Running")
 }
 
