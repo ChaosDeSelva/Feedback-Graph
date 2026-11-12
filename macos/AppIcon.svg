@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <!-- The app icon: packages/ui's Mark (three linked nodes, one lit) on the macOS icon grid (an 824 px body, 100 px margin). -->
+  <g transform="translate(100 100) scale(41.2)">
+    <rect width="20" height="20" rx="4.5" fill="#1d1e20"/>
+    <path d="M6 6.5 13.5 9 7.5 14" stroke="#f2f1ec" stroke-width="1.4" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+    <circle cx="6" cy="6.5" r="2" fill="#f2f1ec"/>
+    <circle cx="7.5" cy="14" r="2" fill="#f2f1ec"/>
+    <circle cx="13.5" cy="9" r="2.6" fill="#f2ae0c"/>
+  </g>
+</svg>

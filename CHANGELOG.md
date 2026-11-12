@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.8.1 (2026-11-11)
+
+0.8.1 adds a **Mac app**: a menu bar companion that watches and drives the install you already have. The stack, its data and its upgrades are unchanged from 0.8.0.
+
+- **Feedback Graph.app** sits in the menu bar of macOS 13 or newer. Its dot shows whether Feedback Graph is running (green), starting or stopping (orange), stopped (grey) or has a problem (red, with what is wrong: the Docker engine not running, a service crash-looping, unhealthy, paused or stopped while the rest run, Ollama not answering or a model missing, or another folder's install running under this one's name).
+- From its menu or its window you can Start, Stop and Restart (`docker compose up -d` and `down` in the install folder, never removing volumes); open the dashboard in your browser or in a window, signed in through a one-time `fg signin` link it never shows or keeps; see the learning loop's mode and the proposals waiting, and pause or resume it; run a Health Check (`./scripts/doctor.sh`, its FAIL and WARN lines first); Back Up Now; Show Logs; Upgrade (a backup, then the checked-out branch pulled or the newest release tag checked out, then `./scripts/setup.sh --yes`; refused while tracked files are changed); and turn on launch at login. Quitting it leaves Feedback Graph running.
+- Pausing the loop from the app needs `loop_settings` in `OPERATOR_ALLOW`, which is off by default. When it is missing the app shows the whole `OPERATOR_ALLOW=` line `fg` printed (a list replaces the default verbs, so that line keeps the token's current verbs and adds `loop_settings`) to put in `.env` before a Restart, and offers the dashboard's Learning loop page meanwhile.
+- It uses the install folder you choose, or clones this repository and opens Terminal on `./scripts/setup.sh` (Get Feedback Graph…); otherwise `~/Code/feedback-graph` when that folder is an install. `-installFolder <path>` points one run at another install without changing the saved folder.
+- It needs a Docker engine (OrbStack, Docker Desktop or Colima) and Ollama, and bundles neither. From `.env` it reads only `FG_INSTANCE`, `API_PORT` and the Ollama settings, never a token or password; it talks only to the Docker engine, localhost, your Ollama host and, for Upgrade and Get Feedback Graph, git. No analytics.
+- Build it from a checkout with the Xcode Command Line Tools on macOS 14 or newer: `./scripts/build-mac-app.sh` (Apple silicon and Intel), then `./scripts/build-dmg.sh` for `dist/Feedback-Graph-<version>.dmg`. Builds are ad hoc signed for the Mac that built them; set `FG_SIGN_IDENTITY` and run `./scripts/notarize-mac-app.sh` to share one. `./scripts/test-mac-app.sh` tests its logic. See [docs/install.md](docs/install.md#mac-app).
+
 ## 0.8.0 (2026-11-11)
 
 0.8.0 adds the **learning loop**: the worker reads what happened to each lesson (served, judged, caught a gap, repeated, pushed back on) and your verdicts, and makes decisions about the graph, each one audited on a new **Decisions** page and reversible.

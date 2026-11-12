@@ -65,6 +65,17 @@ To change folders later, use **Settings** and rerun setup. To see the whole loop
 - Secrets are redacted before anything is stored or sent to a model, and secret files are never read (see [SECURITY.md](SECURITY.md)).
 - Health, backups, upgrades, running it behind TLS with a token: [docs/operations.md](docs/operations.md).
 
+## Mac app
+
+On a Mac, a small menu bar app can watch and drive your install: a dot shows whether Feedback Graph is running (green), starting or stopping (orange), stopped (grey) or has a problem (red, with what is wrong), and its menu and window start, stop and restart it, open the dashboard signed in, pause or resume the learning loop and show the proposals waiting, run a health check (`./scripts/doctor.sh`, beside the Docker engine and Ollama as its last status check saw them), back up, show logs and upgrade. It needs macOS 13 or newer and the same Docker engine (OrbStack, Docker Desktop or Colima) and Ollama as the stack; it bundles neither. Build it from a checkout (the Xcode Command Line Tools, macOS 14 or newer to build):
+
+```sh
+./scripts/build-mac-app.sh   # dist/Feedback Graph.app
+./scripts/build-dmg.sh       # dist/Feedback-Graph-<version>.dmg: open it and drag the app to Applications
+```
+
+It uses the folder you chose (Choose Install Folder…) or that Get Feedback Graph… cloned (it clones this repository and opens Terminal on `./scripts/setup.sh`); with neither, `~/Code/feedback-graph` when that folder is an install. A saved folder that is no longer an install leaves it with none until you choose again. Quitting it leaves Feedback Graph running. What it runs, what it reads and how to sign a build to share: [docs/install.md](docs/install.md#mac-app).
+
 ## Connect your agents
 
 ### Claude Code plugin (recommended for Claude Code)
