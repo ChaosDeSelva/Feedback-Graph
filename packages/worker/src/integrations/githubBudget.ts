@@ -29,7 +29,8 @@ export function githubBudgetFetch(cursors: Pick<DocsStore, 'getCursor' | 'setCur
     const retryTime = retryAfter ? (Number.isFinite(retrySeconds) ? now() + retrySeconds * 1000 : Date.parse(retryAfter)) : 0;
     if (response.status === 429 || (response.status === 403 && !!retryAfter) || (response.headers.has('x-ratelimit-remaining') && remaining < 100)) {
       await serialized(async () => {
-        const state = JSON.parse(await cursors.getCursor(key) ?? '{}') as BudgetState;
+        // Set by the reservation above.
+        const state = JSON.parse((await cursors.getCursor(key))!) as BudgetState;
         state.blockedUntil = Number.isFinite(reset) && reset > now() ? reset : Number.isFinite(retryTime) && retryTime > now() ? retryTime : now() + 60_000;
         await cursors.setCursor(key, JSON.stringify(state));
       });

@@ -15,6 +15,17 @@ const GRAMMAR: Record<string, string> = {
   typescript: 'typescript', tsx: 'tsx', javascript: 'javascript', python: 'python', go: 'go', rust: 'rust', csharp: 'c_sharp', swift: 'swift',
 };
 
+/** A file the code map parses for symbols and imports (a grammar, or GDScript's line reader): its own size limit applies. */
+export const isParsedPath = (path: string) => Object.hasOwn(BY_EXT, extname(path.split('/').pop()!).toLowerCase());
+
+/**
+ * The size limit for one file: `sourceMaxBytes` (CODE_MAP_MAX_BYTES) for a parsed source file, `maxBytes`
+ * (SCAN_MAX_BYTES) for anything else. A hub file (a router, generated queries) is often far over the scan's limit,
+ * and is the file most worth mapping.
+ */
+export const fileMaxBytes = (path: string, o: { maxBytes: number; sourceMaxBytes?: number }) =>
+  o.sourceMaxBytes !== undefined && isParsedPath(path) ? Math.max(o.sourceMaxBytes, o.maxBytes) : o.maxBytes;
+
 export function langOf(path: string): string {
   const name = path.split('/').pop()!;
   const ext = extname(name).toLowerCase();

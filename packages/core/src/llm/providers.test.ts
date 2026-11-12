@@ -1,7 +1,8 @@
-import { expect, test } from 'vitest';
-import { makeProvider, makeProviderOr, strictSchema, type Exec } from './providers.ts';
+import { describe, expect, test, vi } from 'vitest';
+import { makeProvider, makeProviderOr, purgeAgentMirrors, strictSchema, type Exec } from './providers.ts';
 import { ModelOutputError } from './json.ts';
-import { withHealth } from './unavailable.ts';
+import { ProviderUnavailableError, withHealth } from './unavailable.ts';
+import { SCRIPT_TEST_TIMEOUT_MS } from '../testing/exec.ts';
 
 const schema = { type: 'object', properties: { answer: { type: 'string' }, n: { type: 'number' } }, required: ['answer'] };
 const task = { system: 'S', user: 'U', schema };
@@ -218,12 +219,27 @@ test('makeProviderOr falls back, and says why, when the preferred provider canno
 
 test('a CLI that ignores SIGTERM is killed after the grace period and reported as timed out', async () => {
   const { execCommand } = await import('./providers.ts');
-  const started = Date.now();
-  const r = await execCommand('sh', ['-c', 'trap "" TERM; sleep 30'], { cwd: '/', stdin: '', env: { PATH: process.env.PATH }, timeoutMs: 100, killGraceMs: 200 });
-  expect(Date.now() - started).toBeLessThan(5000);
+  const { existsSync, mkdtempSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const { setTimeout: sleep } = await import('node:timers/promises');
+  const ready = join(mkdtempSync(join(tmpdir(), 'fb-grace-')), 'ready');
+  // The timeout and the grace period run on fake timers, so SIGTERM comes only once the CLI ignores it, however slowly
+  // a loaded machine starts it; without the SIGKILL that follows, the call would wait out the 30 s sleep.
+  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+  let r: Awaited<ReturnType<typeof execCommand>>;
+  try {
+    const pending = execCommand('sh', ['-c', `trap "" TERM; : > '${ready}'; sleep 30`], { cwd: '/', stdin: '', env: { PATH: process.env.PATH }, timeoutMs: 100, killGraceMs: 200 });
+    while (!existsSync(ready)) await sleep(10);
+    vi.advanceTimersByTime(100);
+    vi.advanceTimersByTime(200);
+    r = await pending;
+  } finally {
+    vi.useRealTimers();
+  }
   expect(r.code).not.toBe(0);
   expect(r.stderr).toMatch(/timed out after 100ms/);
-});
+}, SCRIPT_TEST_TIMEOUT_MS);
 
 test('codex explores a mirror of the repo that has no secret files, removed afterwards', async () => {
   const { mkdtempSync, mkdirSync, writeFileSync, existsSync } = await import('node:fs');
@@ -310,9 +326,9 @@ test('claude-cli may not read any secret file or the worker\'s own private folde
   await makeProvider('claude-cli', { CLAUDE_CODE_OAUTH_TOKEN: 't' }, { exec }).json(task);
   const denied = args[args.indexOf('--disallowedTools') + 1].split(',');
   // Under the cwd (gitignore-style, relative) ...
-  for (const p of ['**/.env*', '**/.git/config', '**/*credential*', '**/id_*', '**/*.p12', '**/*.tfstate', '**/.pypirc']) expect(denied).toContain(`Read(${p})`);
+  for (const p of ['**/.env*', '**/.git/config', '**/*credentials', '**/*credential*.json', '**/.ssh/id_*', '**/[iI][dD]_[rR][sS][aA]', '**/*.p12', '**/*.tfstate', '**/.pypirc']) expect(denied).toContain(`Read(${p})`);
   // ... and anywhere on the filesystem: an absolute path in a permission rule needs `//` (a single `/` is the project root).
-  for (const p of ['//**/.env*', '//**/.git/config', '//**/*credential*', '//**/id_*', '//codex/**', '//state/**', '//transcripts/**', '//codex-sessions/**', '//proc/**']) {
+  for (const p of ['//**/.env*', '//**/.git/config', '//**/*credentials', '//**/*credential*.json', '//**/.ssh/id_*', '//codex/**', '//state/**', '//transcripts/**', '//codex-sessions/**', '//proc/**']) {
     expect(denied).toContain(`Read(${p})`);
   }
   expect(denied.filter((r) => /^Read\(\/[^/]/.test(r))).toEqual([]);
@@ -389,8 +405,152 @@ test('the HTTP providers cancel their request when the task signal fires (a chec
     const c = new AbortController();
     const p = makeProvider(spec, env, { fetchImpl: hang }).json({ ...task, timeoutMs: 600_000, signal: c.signal });
     setTimeout(() => c.abort(new Error('the check gave up')), 10);
-    const t = Date.now();
+    // The stand-in only ever settles by its request being aborted: rejecting at all is the cancellation.
     await expect(p).rejects.toThrow(/gave up/);
-    expect(Date.now() - t).toBeLessThan(1000);
   }
+});
+
+test('openrouter and groq without a model say which spec to write, not an internal key name', () => {
+  expect(() => makeProvider('openrouter', { OPENROUTER_API_KEY: 'k' })).toThrow('openrouter needs a model: openrouter:<model>');
+  expect(() => makeProvider('groq:', { GROQ_API_KEY: 'k' })).toThrow('groq needs a model: groq:<model>');
+});
+
+const replies = (status: number, body: unknown) =>
+  (async () => (typeof body === 'string' ? new Response(body, { status }) : Response.json(body, { status }))) as unknown as typeof fetch;
+
+test('an HTTP provider that refuses the request throws its id, status and the start of what it said', async () => {
+  const long = `bad ${'x'.repeat(600)}`;
+  await expect(makeProvider('openai:gpt', { OPENAI_API_KEY: 'k' }, { fetchImpl: replies(400, long) }).json(task)).rejects.toThrow(new RegExp(`^openai:gpt 400: bad x{496}$`));
+  await expect(makeProvider('anthropic:m', { ANTHROPIC_API_KEY: 'k' }, { fetchImpl: replies(529, 'overloaded') }).json(task)).rejects.toThrow('anthropic:m 529: overloaded');
+  await expect(makeProvider('jev', { TYPESAFE_API_KEY: 'k' }, { fetchImpl: replies(401, 'no') }).json({ ...task, schema: classifySchema })).rejects.toThrow('jev 401: no');
+});
+
+test('a malformed provider answer is an unusable answer, never a crash: no choices, no tool call', async () => {
+  await expect(makeProvider('groq:llama', { GROQ_API_KEY: 'k' }, { fetchImpl: replies(200, {}) }).json(task)).rejects.toBeInstanceOf(ModelOutputError);
+  await expect(makeProvider('openai:gpt', { OPENAI_API_KEY: 'k' }, { fetchImpl: replies(200, { choices: [{ message: {} }] }) }).json(task)).rejects.toThrow(/the answer was empty/);
+  await expect(makeProvider('anthropic:m', { ANTHROPIC_API_KEY: 'k' }, { fetchImpl: replies(200, { content: [{ type: 'text', text: 'sure!' }] }) }).json(task)).rejects.toThrow('anthropic:m: no tool_use in response');
+  await expect(makeProvider('anthropic:m', { ANTHROPIC_API_KEY: 'k' }, { fetchImpl: replies(200, {}) }).json(task)).rejects.toThrow(/no tool_use/);
+});
+
+test('claude-cli: what the CLI reported decides the error, and a plain result is read when there is no structured output', async () => {
+  const env = { CLAUDE_CODE_OAUTH_TOKEN: 't' };
+  const run = (r: { code: number; stdout: string; stderr?: string }) => makeProvider('claude-cli', env, { exec: async () => ({ stderr: '', ...r }) }).json(task);
+  // exit 1 with nothing on stderr: the is_error result is what it said
+  await expect(run({ code: 1, stdout: JSON.stringify({ is_error: true, result: 'Credit balance is too low' }) })).rejects.toMatchObject({ name: 'CliRunError', exit: 1, said: 'Credit balance is too low' });
+  await expect(run({ code: 1, stdout: JSON.stringify({ is_error: true }) })).rejects.toMatchObject({ said: '' });
+  await expect(run({ code: 2, stdout: 'null' })).rejects.toMatchObject({ said: '' });
+  // exit 0 but the run reported an error
+  await expect(run({ code: 0, stdout: JSON.stringify({ is_error: true, result: 'Reached max turns' }) })).rejects.toMatchObject({ exit: null, said: 'Reached max turns' });
+  await expect(run({ code: 0, stdout: 'Done!' })).rejects.toThrow(/^claude printed no JSON result; the answer ended: Done!/);
+  expect(await run({ code: 0, stdout: JSON.stringify({ result: 'Here it is: {"answer":"r"}' }) })).toEqual({ answer: 'r' });
+  await expect(run({ code: 0, stdout: '{}' })).rejects.toThrow(/the answer was empty/);
+});
+
+test('a CLI job without its own limit gets 15 minutes', async () => {
+  const limits: number[] = [];
+  const exec: Exec = async (_c, args, o) => {
+    limits.push(o.timeoutMs);
+    if (args.includes('-o')) {
+      const { writeFile } = await import('node:fs/promises');
+      await writeFile(args[args.indexOf('-o') + 1], '{"answer":"x"}');
+    }
+    return { code: 0, stdout: JSON.stringify({ structured_output: {} }), stderr: '' };
+  };
+  await makeProvider('claude-cli', { CLAUDE_CODE_OAUTH_TOKEN: 't' }, { exec }).json(task);
+  await makeProvider('codex-cli', CODEX_OK, { exec }).json(task);
+  await makeProvider('claude-cli', { CLAUDE_CODE_OAUTH_TOKEN: 't' }, { exec }).json({ ...task, timeoutMs: 5000 });
+  expect(limits).toEqual([900_000, 900_000, 5000]);
+});
+
+test('codex-cli in the worker reports a failed run with its exit status and stderr', async () => {
+  const exec: Exec = async () => ({ code: 3, stdout: 'transcript', stderr: 'boom' });
+  await expect(makeProvider('codex-cli', CODEX_OK, { exec }).json(task)).rejects.toMatchObject({ name: 'CliRunError', tool: 'codex', exit: 3, said: 'boom' });
+});
+
+test('vision: claude-cli names every image file when there are several', async () => {
+  let prompt = '';
+  const exec: Exec = async (_c, _a, o) => { prompt = o.stdin; return { code: 0, stdout: JSON.stringify({ structured_output: {} }), stderr: '' }; };
+  const images = [{ mediaType: 'image/png' as const, data: 'AA==' }, { mediaType: 'image/webp' as const, data: 'AA==' }];
+  await makeProvider('claude-cli', { CLAUDE_CODE_OAUTH_TOKEN: 't' }, { exec }).json({ ...task, images });
+  expect(prompt).toMatch(/The images are image-1\.png, image-2\.webp in your current directory: open each with the Read tool/);
+});
+
+describe('codex-cli on the runner', () => {
+  const healthy = (run: (body: { mirror: string }) => Response) =>
+    (async (u: string, init?: RequestInit) => (String(u).endsWith('/health') ? Response.json({ ok: true }) : run(JSON.parse(String(init!.body))))) as unknown as typeof fetch;
+  async function scratchDir() {
+    const { mkdtemp, mkdir, writeFile } = await import('node:fs/promises');
+    const { tmpdir } = await import('node:os');
+    const { join } = await import('node:path');
+    const root = await mkdtemp(join(tmpdir(), 'fb-prov-'));
+    await mkdir(join(root, 'scratch'));
+    await mkdir(join(root, 'repo'));
+    await writeFile(join(root, 'repo', 'a.ts'), 'export {}');
+    await writeFile(join(root, 'scratch', '.runner-token'), 'tok');
+    return { scratch: join(root, 'scratch'), repo: join(root, 'repo') };
+  }
+  const provider = (scratch: string, fetchImpl: typeof fetch) => makeProvider('codex-cli', { CODEX_RUNNER_URL: 'http://runner', CODEX_RUNNER_SCRATCH: scratch }, { fetchImpl });
+
+  test('a failed run, a run that wrote no answer and an unreachable runner each say so', async () => {
+    const { scratch, repo } = await scratchDir();
+    await expect(provider(scratch, healthy(() => Response.json({ code: 2, stdout: '', stderr: 'stream disconnected', output: null }))).json({ ...task, cwd: repo }))
+      .rejects.toMatchObject({ name: 'CliRunError', exit: 2, said: 'stream disconnected' });
+    await expect(provider(scratch, healthy(() => Response.json({ code: 0, stdout: '', stderr: '', output: null }))).json({ ...task, cwd: repo }))
+      .rejects.toThrow('codex exit 0: it wrote no answer');
+    const gone = (async (u: string) => {
+      if (String(u).endsWith('/health')) return Response.json({ ok: true });
+      throw new TypeError('fetch failed');
+    }) as unknown as typeof fetch;
+    // the runner going away mid-way is unavailability: the stage waits instead of failing the item
+    await expect(provider(scratch, gone).json({ ...task, cwd: repo })).rejects.toBeInstanceOf(ProviderUnavailableError);
+    // a runner error that is not about reaching it stays the item's failure
+    await expect(provider(scratch, healthy(() => new Response('<html>', { status: 502 }))).json({ ...task, cwd: repo })).rejects.toThrow('codex runner 502: <html>');
+    // every job's mirror is removed after it
+    const { readdir } = await import('node:fs/promises');
+    expect((await readdir(scratch)).filter((n) => n.startsWith('fb-mirror-'))).toEqual([]);
+  });
+
+  test('the runner gets the mirror by its name in the volume and answers from its output', async () => {
+    const { scratch, repo } = await scratchDir();
+    let mirror = '';
+    const p = provider(scratch, healthy((body) => { mirror = body.mirror; return Response.json({ code: 0, stdout: '', stderr: '', output: '{"answer":"ran"}' }); }));
+    const made = await p.mirror!(repo);
+    expect(await p.json({ ...task, cwd: made.dir })).toEqual({ answer: 'ran' });
+    expect(mirror).toMatch(/^fb-mirror-[A-Za-z0-9]+$/);
+    expect(made.dir.endsWith(`/${mirror}`)).toBe(true);
+    await made.dispose();
+  });
+});
+
+test('specs without a model take each provider\'s default', async () => {
+  const bodies: { model: string }[] = [];
+  const fetchImpl = (async (_u: string, init: RequestInit) => {
+    bodies.push(JSON.parse(init.body as string));
+    return Response.json({ message: { content: '{}' }, choices: [{ message: { content: '{}' } }], content: [{ type: 'tool_use', input: {} }] });
+  }) as unknown as typeof fetch;
+  await makeProvider('ollama', {}, { fetchImpl }).json(task);
+  await makeProvider('openai:', { OPENAI_API_KEY: 'k' }, { fetchImpl }).json(task);
+  await makeProvider('anthropic', { ANTHROPIC_API_KEY: 'k' }, { fetchImpl }).json(task);
+  expect(bodies.map((b) => b.model)).toEqual(['gemma4', 'gpt-5.1', 'claude-sonnet-5-5']);
+});
+
+test('jev answers what it was not asked as empty, and a missing answer as no choice with zero confidence', async () => {
+  const p = makeProvider('jev', { TYPESAFE_API_KEY: 'k' }, { fetchImpl: replies(200, {}) });
+  const s = { type: 'object', properties: { ...classifySchema.properties, score: { type: 'number' } } };
+  expect(await p.json({ system: 's', user: 'u', schema: s })).toEqual({ label: undefined, confidence: 0, summary: '', score: 0 });
+  await expect(p.json({ system: 's', user: 'u', schema: { type: 'object' } })).rejects.toThrow(/cannot fill a schema without enums/);
+});
+
+test('purgeAgentMirrors sweeps abandoned mirrors in the runner scratch volume at startup and keeps other files', async () => {
+  const { mkdtemp, mkdir, readdir, utimes, writeFile } = await import('node:fs/promises');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const scratch = await mkdtemp(join(tmpdir(), 'fb-purge-'));
+  const old = new Date(Date.now() - 10 * 60_000);
+  await mkdir(join(scratch, 'fb-mirror-abandoned'));
+  await utimes(join(scratch, 'fb-mirror-abandoned'), old, old);
+  await mkdir(join(scratch, 'fb-mirror-fresh'));
+  await writeFile(join(scratch, '.runner-token'), 't');
+  await purgeAgentMirrors({ CODEX_RUNNER_SCRATCH: scratch });
+  expect((await readdir(scratch)).sort()).toEqual(['.runner-token', 'fb-mirror-fresh']);
 });

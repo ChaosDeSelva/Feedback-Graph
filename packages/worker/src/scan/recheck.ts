@@ -109,7 +109,8 @@ export async function recheckFacts(d: RecheckDeps): Promise<RecheckResult> {
       const embedding = new Map(keptReworded.map((f, i) => [f.id, vectors[i] ?? null]));
       const checks: FactCheck[] = [
         ...facts.filter((f) => dirs.has(f.id)).map((f) => ({ id: f.id, keep: true, lines: null, evidence: 'none' as const })),
-        ...kept.map((f) => ({ id: f.id, keep: true, lines: f.lines, evidence: f.evidence ?? null, ...(reworded.has(f.id) ? { statement: reworded.get(f.id)!, embedding: embedding.get(f.id) ?? null } : {}) })),
+        // checkCitations gives every kept fact its evidence level.
+        ...kept.map((f) => ({ id: f.id, keep: true, lines: f.lines, evidence: f.evidence!, ...(reworded.has(f.id) ? { statement: reworded.get(f.id)!, embedding: embedding.get(f.id) ?? null } : {}) })),
         ...dropped.map((f) => ({ id: f.id, keep: false, lines: f.lines, evidence: f.evidence ?? null })),
       ];
       mine.closed += await d.facts.applyFactChecks(FACT_CHECK_VERSION, checks);

@@ -16,12 +16,12 @@ test('repoHas looks in the repository on disk; no repository known is not a reas
   expect(await repoHas(join(repo, 'not-mounted'), 'api/gone.ts')).toBe(true);
 });
 
-const repo = new Set(['src/webapp/core/src/tasks/tasks-page.tsx', 'src/webapp/core/src/upload/constants.ts', 'api/search.ts', 'api/db.ts', 'cmd/migrate/main.go', 'src/fido/notion-page-form.tsx']);
+const repo = new Set(['src/portal/main/src/order/order-page.tsx', 'src/portal/main/src/upload/constants.ts', 'api/search.ts', 'api/db.ts', 'cmd/migrate/main.go', 'src/mail/survey-page-form.tsx']);
 const exists = async (p: string) => repo.has(p) || [...repo].some((f) => f.startsWith(`${p}/`));
 
 describe('junkPathReason', () => {
   test('instruction files, PR refs, bare identifiers, home or absolute paths and malformed globs are not lesson paths', () => {
-    expect(junkPathReason('src/webapp/AGENTS.md')).toMatch(/instruction file/);
+    expect(junkPathReason('src/portal/AGENTS.md')).toMatch(/instruction file/);
     expect(junkPathReason('CLAUDE.md')).toMatch(/instruction file/);
     expect(junkPathReason('acme/shop#13513')).toMatch(/pull request/);
     expect(junkPathReason('#13513')).toMatch(/pull request/);
@@ -39,15 +39,15 @@ describe('junkPathReason', () => {
   });
 
   test('repo paths, bare file names and globs pass', () => {
-    for (const p of ['api/search.ts', 'tasks-page.tsx', 'src/**', 'src/**/*.test.ts', 'Makefile', 'docs/README.md']) expect(junkPathReason(p), p).toBeNull();
+    for (const p of ['api/search.ts', 'order-page.tsx', 'src/**', 'src/**/*.test.ts', 'Makefile', 'docs/README.md']) expect(junkPathReason(p), p).toBeNull();
   });
 });
 
 describe('validateLessonPaths', () => {
   test('a review comment: the commented file is in the set; junk and unsupported paths go', async () => {
-    const r = await validateLessonPaths(['src/fido/AGENTS.md', 'api/search.ts', 'src/webapp/core/src/settings/users/**'], { commentPath: 'api/search.ts', named: '', touched: { edited: [], fixed: [] }, exists });
+    const r = await validateLessonPaths(['src/mail/AGENTS.md', 'api/search.ts', 'src/portal/main/src/settings/users/**'], { commentPath: 'api/search.ts', named: '', touched: { edited: [], fixed: [] }, exists });
     expect(r.paths).toEqual(['api/search.ts']);
-    expect(r.dropped.map((d) => d.path)).toEqual(['src/fido/AGENTS.md', 'src/webapp/core/src/settings/users/**']);
+    expect(r.dropped.map((d) => d.path)).toEqual(['src/mail/AGENTS.md', 'src/portal/main/src/settings/users/**']);
   });
 
   test('a review comment whose lesson names other files: the commented file is added; a file the comment names may stay', async () => {
@@ -56,9 +56,9 @@ describe('validateLessonPaths', () => {
   });
 
   test('bare file names and partial paths resolve to the one known file they name, else drop', async () => {
-    const touched = { edited: ['src/webapp/core/src/tasks/tasks-page.tsx'], fixed: ['src/webapp/core/src/upload/constants.ts'] };
-    const r = await validateLessonPaths(['tasks-page.tsx', 'core/src/upload/constants.ts', 'missing.tsx'], { named: '', touched, exists, transcript: true });
-    expect(r.paths).toEqual(['src/webapp/core/src/tasks/tasks-page.tsx', 'src/webapp/core/src/upload/constants.ts']);
+    const touched = { edited: ['src/portal/main/src/order/order-page.tsx'], fixed: ['src/portal/main/src/upload/constants.ts'] };
+    const r = await validateLessonPaths(['order-page.tsx', 'main/src/upload/constants.ts', 'missing.tsx'], { named: '', touched, exists, transcript: true });
+    expect(r.paths).toEqual(['src/portal/main/src/order/order-page.tsx', 'src/portal/main/src/upload/constants.ts']);
     expect(r.dropped).toEqual([{ path: 'missing.tsx', why: expect.stringMatching(/bare file name/) }]);
   });
 
@@ -69,7 +69,7 @@ describe('validateLessonPaths', () => {
   });
 
   test('a review or issue comment with no file: only paths the comment, its diff or the session evidence; never the session edits as a fallback', async () => {
-    const touched = { edited: ['src/webapp/core/src/tasks/tasks-page.tsx'], fixed: [] };
+    const touched = { edited: ['src/portal/main/src/order/order-page.tsx'], fixed: [] };
     const r = await validateLessonPaths(['cmd/migrate/main.go', 'api/db.ts'], { named: 'Atlas partial hashes in cmd/migrate/main.go', touched, exists });
     expect(r.paths).toEqual(['cmd/migrate/main.go']);
     const none = await validateLessonPaths(['api/db.ts'], { named: 'this races', touched, exists });
@@ -78,7 +78,7 @@ describe('validateLessonPaths', () => {
 
   test('a transcript: the model paths the repo has stand; with none, the files edited to fix it, never everything edited', async () => {
     const touched = { edited: ['api/db.ts', 'cmd/migrate/main.go'], fixed: ['api/search.ts'] };
-    expect((await validateLessonPaths(['src/fido/notion-page-form.tsx'], { named: '', touched, exists, transcript: true })).paths).toEqual(['src/fido/notion-page-form.tsx']);
+    expect((await validateLessonPaths(['src/mail/survey-page-form.tsx'], { named: '', touched, exists, transcript: true })).paths).toEqual(['src/mail/survey-page-form.tsx']);
     expect((await validateLessonPaths(['handleUpload'], { named: '', touched, exists, transcript: true })).paths).toEqual(['api/search.ts']);
     expect((await validateLessonPaths([], { named: '', touched: { edited: ['api/db.ts'], fixed: [] }, exists, transcript: true })).paths).toEqual([]);
   });

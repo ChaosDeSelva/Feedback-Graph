@@ -19,6 +19,7 @@ function view(o: Partial<IntegrationsView> = {}): IntegrationsView {
       { key: 'shop', github: { repo: 'acme/shop', from: 'remote', enabled: true, lastSyncAt: null, items: 0, error: null, backlog: null }, linear: { teamId: null, teamName: null, lastSyncAt: null, items: 0, error: null } },
       { key: 'notes', github: { repo: null, from: null, enabled: true, lastSyncAt: null, items: 0, error: null, backlog: null }, linear: { teamId: null, teamName: null, lastSyncAt: null, items: 0, error: null } },
     ],
+    rules: [], skippedSince: null,
     ...o,
   };
 }
@@ -216,4 +217,166 @@ test('Linear connected with no team mapped says to map a team to start syncing, 
   const linear = within(await card('Linear'));
   expect(linear.getByText(/map a team to a project below to start syncing/i)).toBeTruthy();
   expect(linear.queryByText(/not yet: the worker syncs/)).toBeNull();
+});
+
+/** The fake API, with the given answers in front of it. */
+function answering(over: (url: string, method: string) => Response | null) {
+  const inner = fetch as unknown as (url: string, init?: RequestInit) => Promise<Response>;
+  vi.stubGlobal('fetch', vi.fn(async (url: string, init?: RequestInit) => over(url, init?.method ?? 'GET') ?? inner(url, init)));
+}
+
+test('Test connection with a token the service refuses names the service and its reason', async () => {
+  state = view({ github: connected() });
+  answering((url) => (url === '/api/settings/integrations/github/test' ? Response.json({ ok: false, account: null, error: 'Bad credentials', view: state }) : null));
+  render(<Integrations />);
+  const gh = await card('GitHub');
+  fireEvent.click(within(gh).getByRole('button', { name: 'Test connection' }));
+  expect(await within(gh).findByText('GitHub refused the token: Bad credentials')).toBeTruthy();
+});
+
+test('a rate-limited service says until when it is paused; a pause already over is not mentioned', async () => {
+  const until = new Date(Date.now() + 10 * 60_000).toISOString();
+  state = view({ github: connected({ rateLimitedUntil: until }), linear: connected({ envVar: 'LINEAR_API_KEY', rateLimitedUntil: new Date(Date.now() - 60_000).toISOString() }) });
+  render(<Integrations />);
+  const gh = await card('GitHub');
+  expect(within(gh).getByText(`paused until ${new Date(until).toLocaleTimeString()}, then it carries on by itself`)).toBeTruthy();
+  expect(within(await card('Linear')).queryByText('Rate limit')).toBeNull();
+});
+
+test('where tokens cannot be saved from the page, it says to set them in .env instead', async () => {
+  state = view({ canSave: false });
+  render(<Integrations />);
+  const gh = await card('GitHub');
+  expect(within(gh).getByText((_, el) => el?.tagName === 'P' && /^Tokens cannot be saved from here in this setup\. Set GITHUB_TOKEN in \.env and restart\.$/.test(el.textContent ?? ''))).toBeTruthy();
+});
+
+test('a project setting the server refuses says why', async () => {
+  state = view({ github: connected() });
+  answering((url) => (url.startsWith('/api/settings/integrations/projects/') ? Response.json({ error: 'project is not selected' }, { status: 400 }) : null));
+  render(<Integrations />);
+  fireEvent.click(await screen.findByLabelText('read pull request comments of shop'));
+  expect(await screen.findByText('project is not selected')).toBeTruthy();
+});
+
+test('All connections lists each connection the server reports, with its state and where it is set', async () => {
+  answering((url) => (url === '/api/status' ? Response.json({ connections: {
+    claude: { state: 'connected', source: 'env', detail: 'Claude token set.', href: '' },
+    ollama: { state: 'error', source: null, detail: 'Ollama does not answer.', href: '' },
+  } }) : null));
+  render(<Integrations />);
+  const all = await card('All connections');
+  const rows = [...all.querySelectorAll('div.flex')].map((r) => r.textContent);
+  expect(rows).toHaveLength(2);
+  expect(rows[0]).toMatch(/Claude.*connected.*Claude token set\. Set with \.\/scripts\/setup\.sh/);
+  expect(rows[1]).toMatch(/error.*Ollama does not answer\. Runs on your machine; OLLAMA_URL in \.env\./);
+});
+
+test('settings that cannot be loaded say why, and Try again loads them', async () => {
+  answering((url) => (url === '/api/settings/integrations' && !calls.some((c) => c.url === url) ? (calls.push({ url, method: 'GET' }), Response.json({ error: 'the store is starting' }, { status: 503 })) : null));
+  render(<Integrations />);
+  expect(await screen.findByText('the store is starting')).toBeTruthy();
+  fireEvent.click(screen.getByRole('button', { name: 'Try again' }));
+  expect(await card('GitHub')).toBeTruthy();
+  expect(screen.queryByText('the store is starting')).toBeNull();
+});
+
+test('a link to the GitHub card scrolls it into view once loaded', async () => {
+  const scrolled = vi.fn();
+  Element.prototype.scrollIntoView = scrolled;
+  try {
+    location.hash = '#settings/integrations-github';
+    render(<Integrations />);
+    await card('GitHub');
+    await waitFor(() => expect(scrolled).toHaveBeenCalledWith({ block: 'start' }));
+  } finally {
+    delete (Element.prototype as { scrollIntoView?: unknown }).scrollIntoView;
+    location.hash = '';
+  }
+});
+
+test('a token the service accepts without naming an account says "your account"; disconnecting with .env set says .env is used again', async () => {
+  answering((url, method) => (url === '/api/settings/integrations/github' && method === 'PUT'
+    ? Response.json((state = view({ github: connected({ account: null, envSet: true }) })))
+    : null));
+  render(<Integrations />);
+  const gh = await card('GitHub');
+  fireEvent.change(within(gh).getByLabelText('GitHub token'), { target: { value: 'github_pat_abcdefgh' } });
+  fireEvent.click(within(gh).getByRole('button', { name: 'Connect' }));
+  expect(await within(gh).findByText('Connected as your account.')).toBeTruthy();
+  fireEvent.click(within(gh).getByRole('button', { name: 'Disconnect' }));
+  fireEvent.click(within(await screen.findByRole('alertdialog')).getByRole('button', { name: 'Disconnect GitHub' }));
+  expect(await within(gh).findByText('Removed the token saved here; GITHUB_TOKEN in .env is used again.')).toBeTruthy();
+});
+
+test('per project: a sync error is shown cut short; a repository from GITHUB_REPOS says so; a team no longer listed is kept by name; None clears it', async () => {
+  state = view({
+    github: connected(), linear: connected({ envVar: 'LINEAR_API_KEY', account: 'Pat' }),
+    projects: [{ key: 'shop', github: { repo: 'acme/shop', from: 'GITHUB_REPOS', enabled: true, lastSyncAt: null, items: 0, error: 'x'.repeat(200), backlog: null }, linear: { teamId: 'gone', teamName: 'Old team', lastSyncAt: null, items: 0, error: null } }],
+  });
+  render(<Integrations />);
+  expect((await screen.findByText(/^error: x+$/)).textContent).toHaveLength('error: '.length + 120);
+  expect(screen.getByTitle('set by GITHUB_REPOS in .env')).toBeTruthy();
+  const select = screen.getByLabelText('Linear team of shop') as HTMLSelectElement;
+  await within(select).findByText('Web (WEB)');
+  expect(within(select).getByRole('option', { name: 'Old team' })).toBeTruthy();
+  fireEvent.change(select, { target: { value: '' } });
+  await waitFor(() => expect(calls.find((c) => c.url === '/api/settings/integrations/projects/shop')?.body).toEqual({ linearTeamId: null, linearTeamName: null }));
+});
+
+test('a team with no stored name is listed by its id; teams that cannot be listed say why', async () => {
+  state = view({ linear: connected({ envVar: 'LINEAR_API_KEY', account: 'Pat' }), projects: [{ key: 'shop', github: { repo: null, from: null, enabled: true, lastSyncAt: null, items: 0, error: null, backlog: null }, linear: { teamId: 'gone', teamName: null, lastSyncAt: null, items: 0, error: null } }] });
+  answering((url) => (url === '/api/settings/integrations/linear/teams' ? Response.json({ error: 'Linear is down' }, { status: 502 }) : null));
+  render(<Integrations />);
+  expect(await screen.findByText('Linear is down')).toBeTruthy();
+  expect(within(screen.getByLabelText('Linear team of shop')).getByRole('option', { name: 'gone' })).toBeTruthy();
+});
+
+test('Linear with a team mapped and no sync yet says the worker syncs soon; no project selected says to select some', async () => {
+  state = view({
+    linear: connected({ envVar: 'LINEAR_API_KEY', account: 'me', lastSyncAt: null }),
+    projects: [{ key: 'shop', github: { repo: null, from: null, enabled: true, lastSyncAt: null, items: 0, error: null, backlog: null }, linear: { teamId: 't1', teamName: 'Web', lastSyncAt: null, items: 0, error: null } }],
+  });
+  const { unmount } = render(<Integrations />);
+  expect(within(await card('Linear')).getByText(/not yet: the worker syncs within a few minutes/)).toBeTruthy();
+  unmount();
+  state = view({ projects: [] });
+  render(<Integrations />);
+  expect(await screen.findByText('No projects selected')).toBeTruthy();
+});
+
+test('a service or connection in a state this release does not know shows the state as stored', async () => {
+  const paused = { state: 'paused' as never, source: null, detail: 'Paused.', href: '#settings/integrations-github' };
+  state = view({ github: svc({ connection: paused }) });
+  vi.mocked(fetch).mockImplementation(async (url) => (url === '/api/status'
+    ? Response.json({ connections: { github: paused, linear: { state: 'connected', source: 'env', detail: 'ok', href: '#' } } })
+    : Response.json(state)));
+  render(<Integrations />);
+  await waitFor(() => expect(screen.getAllByText('paused')).toHaveLength(2));
+});
+
+test('a keyboard Try again after a failed load leaves focus on the Integrations heading', async () => {
+  const working = fetch;
+  let failing = true;
+  vi.stubGlobal('fetch', vi.fn(async (url: string, init?: RequestInit) => (failing && url === '/api/settings/integrations' ? Response.json({ error: 'graph unreachable' }, { status: 503 }) : working(url, init))));
+  render(<Integrations />);
+  await screen.findByText(/graph unreachable/);
+  failing = false;
+  screen.getByRole('button', { name: 'Try again' }).focus();
+  const { default: userEvent } = await import('@testing-library/user-event');
+  await userEvent.keyboard('{Enter}');
+  await waitFor(() => expect(screen.queryByRole('button', { name: 'Try again' })).toBeNull());
+  await waitFor(() => expect(document.activeElement).toBe(screen.getByRole('heading', { name: 'Integrations' })));
+});
+
+test('Escape from inside the connections list closes it and puts focus back on its button', async () => {
+  const ok = { state: 'connected' as const, source: 'env' as const, detail: 'fine', href: '#' };
+  render(<ConnectionsBadge connections={{ github: ok, linear: ok, claude: ok, codex: ok, ollama: ok, cloud: ok }} />);
+  const button = screen.getByRole('button', { name: /Connections/ });
+  fireEvent.click(button);
+  within(screen.getByRole('dialog', { name: 'Connections' })).getAllByRole('link')[0].focus();
+  fireEvent.keyDown(document, { key: 'ArrowDown' });
+  expect(screen.getByRole('dialog', { name: 'Connections' })).toBeTruthy();
+  fireEvent.keyDown(document, { key: 'Escape' });
+  expect(screen.queryByRole('dialog')).toBeNull();
+  expect(document.activeElement).toBe(button);
 });

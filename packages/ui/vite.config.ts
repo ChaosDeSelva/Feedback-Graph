@@ -8,5 +8,5 @@ export default defineConfig({
   // Fonts as files: the CSP refuses data: fonts (build/assets.ts).
   build: { assetsInlineLimit: inlineAsset },
   server: { proxy: { '/api': 'http://localhost:8787' } },
-  test: { name: 'ui', environment: 'jsdom', include: ['src/**/*.test.tsx'] },
+  test: { name: 'ui', environment: 'jsdom', include: ['src/**/*.test.tsx'], setupFiles: ['../core/src/testing/cleanEnvSetup.ts', './src/testSetup.ts', './src/testing/setup.ts'], testTimeout: 30_000 },
 });

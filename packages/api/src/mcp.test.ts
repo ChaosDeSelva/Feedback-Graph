@@ -10,7 +10,7 @@ const ctx: ContextDeps = {
   embed: async (t) => t.map(() => [1]),
   k: {
     searchLessons: async () => [],
-    relatedMisses: async () => [],
+    missesNaming: async () => [], relatedMisses: async () => [],
     recordPreDoneCheck: async () => {},
     createManualFeedback: async () => 'manual:9',
   },
@@ -133,6 +133,40 @@ test('MCP Activity names the client from initialize, carried in the session id t
   expect(recorded.map((a) => a.actor)).toEqual(['claude-code 2.1.309 (MCP)', 'agent (MCP)']);
 });
 
+test('the first tool call from a client that named itself at initialize is stored as the first agent, once; fg demo context and probes are not', async () => {
+  const marks: [string, string][] = [];
+  let seen: { client: string; at: string } | null = null;
+  const system = {
+    version: 't', ping: async () => true, worker: async () => null,
+    agentSeen: async () => seen,
+    markAgentSeen: async (client: string, at: string) => { marks.push([client, at]); seen ??= { client, at }; },
+  };
+  const app = createApp(repo, { context: ctx, system });
+  // fg demo context / check: tools/call with no initialize (the CLI never names itself).
+  await app.request('/mcp', taskCall);
+  // doctor.sh: initialize only, no tool call.
+  const init = await app.request('/mcp', rpc({ method: 'initialize', params: { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'claude-code', version: '2.1.309' } } }));
+  expect(marks).toEqual([]);
+  expect(((await (await app.request('/api/status')).json()) as { agent: unknown }).agent).toBeNull();
+  // The agent's first call is stored; later ones are not written again.
+  await app.request('/mcp', withSession(init.headers.get('mcp-session-id')!));
+  await app.request('/mcp', withSession(init.headers.get('mcp-session-id')!));
+  expect(marks.map(([c]) => c)).toEqual(['claude-code 2.1.309 (MCP)']);
+  expect(((await (await app.request('/api/status')).json()) as { agent: unknown }).agent).toEqual({ client: 'claude-code 2.1.309 (MCP)', at: marks[0][1] });
+});
+
+test('a store that cannot record the first agent does not fail the agent\'s tool call, and it is tried again', async () => {
+  let tries = 0;
+  const system = { version: 't', ping: async () => true, worker: async () => null, markAgentSeen: async () => { tries++; throw new Error('store offline'); } };
+  const app = createApp(repo, { context: ctx, system });
+  const init = await app.request('/mcp', rpc({ method: 'initialize', params: { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'codex', version: '1' } } }));
+  for (let i = 0; i < 2; i++) {
+    const body = (await (await app.request('/mcp', withSession(init.headers.get('mcp-session-id')!))).json()) as { result: { content: { text: string }[] } };
+    expect(body.result.content[0].text).toContain('No approved lessons');
+  }
+  expect(tries).toBe(2);
+});
+
 test('MCP client labels are cleaned, and a forged or foreign session id is ignored', async () => {
   expect(mcpClientLabel({ name: 'codex-mcp-client', version: '0.162.0' })).toBe('codex-mcp-client 0.162.0 (MCP)');
   expect(mcpClientLabel({ name: 'evil\n<script>x</script>', version: '1\u0000' })).toBe('evilscriptx/script 1 (MCP)');
@@ -215,7 +249,7 @@ test('every agent MCP tool carries annotations: reads are read-only, report_feed
   const res = await app.request('/mcp', rpc({ method: 'tools/list', params: {} }));
   type Tool = { name: string; title?: string; annotations?: Record<string, unknown> };
   const tools = ((await res.json()) as { result: { tools: Tool[] } }).result.tools;
-  const writes = new Set(['get_task_context', 'check_before_done', 'get_module_context', 'impact', 'get_recent_sessions', 'search_graph', 'report_feedback']);
+  const writes = new Set(['report_feedback']);
   expect(tools).toHaveLength(7);
   for (const t of tools) {
     expect(t.annotations, t.name).toBeDefined();
@@ -228,4 +262,22 @@ test('every agent MCP tool carries annotations: reads are read-only, report_feed
   // Each report queues a new inbox item, so calling it twice is not the same as calling it once.
   expect(tools.find((t) => t.name === 'report_feedback')!.annotations!.idempotentHint).toBe(false);
   expect(tools.filter((t) => !writes.has(t.name)).every((t) => t.annotations!.idempotentHint === true)).toBe(true);
+});
+
+test('initialize tells an agent without the skill which tool to call when, and every parameter is described', async () => {
+  const app = createApp(repo, { context: ctx });
+  const init = await app.request('/mcp', rpc({ method: 'initialize', params: { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'plain', version: '1' } } }));
+  const instructions = ((await init.json()) as { result: { instructions?: string } }).result.instructions ?? '';
+  for (const tool of ['get_task_context', 'check_before_done', 'report_feedback']) expect(instructions).toContain(tool);
+  const res = await app.request('/mcp', rpc({ method: 'tools/list', params: {} }));
+  const tools = ((await res.json()) as { result: { tools: { name: string; inputSchema: { properties: Record<string, { description?: string }> } }[] } }).result.tools;
+  for (const t of tools) for (const [k, v] of Object.entries(t.inputSchema.properties)) expect(v.description, `${t.name}.${k}`).toMatch(/\w/);
+});
+
+test('the agent MCP tool list and instructions stay within an agent context budget', async () => {
+  // Every session pays for these bytes before it does anything: in 0.7.6 the list was 9.0 KB and the instructions 0.5 KB.
+  const app = createApp(repo, { context: ctx });
+  const list = await (await app.request('/mcp', rpc({ method: 'tools/list', params: {} }))).text();
+  const init = await (await app.request('/mcp', rpc({ method: 'initialize', params: { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'plain', version: '1' } } }))).json() as { result: { instructions: string } };
+  expect(JSON.stringify((JSON.parse(list) as { result: unknown }).result).length + init.result.instructions.length).toBeLessThan(9_800);
 });

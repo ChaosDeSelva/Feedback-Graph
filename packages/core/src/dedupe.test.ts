@@ -1,5 +1,5 @@
-import { expect, test } from 'vitest';
-import { matchReport, REPORT_MERGE_MINUTES, similarReports } from './dedupe.ts';
+import { describe, expect, test } from 'vitest';
+import { candidateProvenance, matchReport, REPORT_MERGE_MINUTES, similarReports } from './dedupe.ts';
 
 const at = (min: number) => new Date(Date.UTC(2026, 9, 23, 10, 0) + min * 60_000).toISOString();
 
@@ -34,4 +34,24 @@ test('the same session counts as the same report even when the words differ, wit
 
 test('a time that cannot be read never matches', () => {
   expect(matchReport({ ts: 'soon', text: 'still broken, the login page 500s' }, [{ id: 'a', ts: at(0), text: 'still broken, the login page 500s' }])).toBeNull();
+});
+
+describe('candidateProvenance', () => {
+  const base = { manual: false, detected: false, agentReport: null, turnText: 'the login 500s', turnWhatWasDone: 'edited login.ts', createdAt: '2026-10-01T00:00:00Z' };
+  const report = { text: 'missed auth', whatWasDone: 'added auth', reportedAt: '2026-10-01T00:01:00Z', sessionId: 's1' };
+  test('a detected item is the detector\'s; with a stored report it is the agent\'s too', () => {
+    expect(candidateProvenance(base)).toEqual({ origins: ['detector'], agentReport: null });
+    expect(candidateProvenance({ ...base, agentReport: report })).toEqual({ origins: ['detector', 'agent'], agentReport: report });
+  });
+  test('a report_feedback item is the agent\'s alone, until the detector also found it', () => {
+    expect(candidateProvenance({ ...base, manual: true, agentReport: report })).toEqual({ origins: ['agent'], agentReport: report });
+    expect(candidateProvenance({ ...base, manual: true, detected: true, agentReport: report }).origins).toEqual(['detector', 'agent']);
+  });
+  test('a report_feedback item from before reports were stored takes its words from its own turn', () => {
+    expect(candidateProvenance({ ...base, manual: true })).toEqual({
+      origins: ['agent'],
+      agentReport: { text: 'the login 500s', whatWasDone: 'edited login.ts', reportedAt: '2026-10-01T00:00:00Z', sessionId: null },
+    });
+    expect(candidateProvenance({ ...base, manual: true, turnText: null, turnWhatWasDone: undefined }).agentReport).toMatchObject({ text: '', whatWasDone: '' });
+  });
 });

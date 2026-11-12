@@ -1,6 +1,6 @@
 import { finalReplyDue, ModelOutputError, ModelTimeoutError, ProviderUnavailableError, STRICT_JSON, type ActivityInput, type FinalReply, type HumanTurn, type JsonTask, type LlmProvider, type SessionState, type SessionSummary, type SessionsStore, type SummaryCursor, type SummaryWork, type SummaryWorkQuery, type SummaryWrite } from '@fb/core';
 import { beforeEach, expect, test } from 'vitest';
-import { runSummaries, type SummarizeDeps } from './stage.ts';
+import { runSummaries, SummarizeStage, type SummarizeDeps } from './stage.ts';
 
 const MIN = 60_000;
 const NOW = Date.parse('2026-10-23T12:00:00Z');
@@ -446,4 +446,83 @@ test('summary Activity retains the real session sandbox run attribution', async 
   mem.add('labelled', 3, 15 * MIN, { run: 'test-session', sandbox: true });
   await runSummaries(deps(fakeModel().llm));
   expect(activity[0]).toMatchObject({ kind: 'session_summarized', run: 'test-session', sandbox: true });
+});
+
+test('the stage beside the loop runs one pass at a time, logs what it did, and keeps the last result', async () => {
+  mem.add('s1', 3, 20 * MIN);
+  const { llm } = fakeModel();
+  const extras: object[] = [];
+  const stage = new SummarizeStage(deps(llm, { log: (m, e) => { logs.push(m); if (e) extras.push(e); } }));
+  stage.kick();
+  stage.kick(); // a pass is running: no second one
+  await stage.idle();
+  expect(mem.s.get('s1')!.writes).toHaveLength(1);
+  expect(logs.filter((m) => m === 'sessions summarized')).toHaveLength(1);
+  expect(stage.last).toMatchObject({ summarized: 1 });
+
+  // A pass with nothing to do logs nothing.
+  stage.kick();
+  await stage.idle();
+  expect(logs.filter((m) => m === 'sessions summarized')).toHaveLength(1);
+  expect(stage.last).toEqual({ summarized: 0, idled: 0, reactivated: 0, failed: 0 });
+});
+
+test('a pass that fails (the store down) is logged without secrets and the next kick runs again', async () => {
+  mem.add('s1', 3, 20 * MIN);
+  let down = true;
+  const work = mem.work.bind(mem);
+  mem.work = async (q) => { if (down) throw new Error('connection to postgres://fg:hunter2hunter2@db/fg refused'); return work(q); };
+  const errors: string[] = [];
+  const stage = new SummarizeStage(deps(fakeModel().llm, { log: (m, e) => { logs.push(m); if (m === 'summary pass failed') errors.push(String((e as { error: string }).error)); } }));
+  stage.kick();
+  await stage.idle();
+  expect(errors).toHaveLength(1);
+  expect(errors[0]).not.toContain('hunter2hunter2');
+  down = false;
+  stage.kick();
+  await stage.idle();
+  expect(mem.s.get('s1')!.writes).toHaveLength(1);
+});
+
+test('a final reply that reaches an idle session is taken in at once, before the session is quiet again', async () => {
+  mem.add('s1', 3, 60 * MIN);
+  const { llm, prompts } = fakeModel();
+  await runSummaries(deps(llm));
+  const x = mem.s.get('s1')!;
+  x.finalReply = { text: 'LATE-FINAL-REPLY', ts: iso(2 * MIN) };
+  x.lastActivityAt = iso(2 * MIN);
+  expect(await runSummaries(deps(llm))).toMatchObject({ summarized: 1 });
+  expect(prompts.at(-1)).toContain('LATE-FINAL-REPLY');
+});
+
+test('a long session id is shortened in the Activity subject', async () => {
+  mem.add('0f8c2a9e-1b7d-4c3a-9e2f-5a6b7c8d9e0f', 3, 15 * MIN);
+  await runSummaries(deps(fakeModel().llm));
+  expect(activity[0].subject).toBe('summarized session 0f8c2a9e…: turns 0 to 2 (3 new)');
+});
+
+test('a session whose turns are gone by the time they are read (deleted meanwhile) is left as it is', async () => {
+  mem.add('s1', 3, 15 * MIN);
+  mem.turns = async () => [];
+  expect(await runSummaries(deps(fakeModel().llm))).toEqual({ summarized: 0, idled: 0, reactivated: 0, failed: 0 });
+  expect(mem.s.get('s1')!.version).toBe(0);
+});
+
+test('an idle session with new turns backing off after a failure is reactivated but waits; at most perPass updates a pass', async () => {
+  mem.add('s1', 3, 60 * MIN);
+  const { llm, prompts } = fakeModel();
+  await runSummaries(deps(llm));
+  mem.addTurns('s1', 1, 50 * MIN);
+  mem.s.get('s1')!.retryAt = iso(-5 * MIN); // its next try is in five minutes
+  mem.add('s2', 3, 15 * MIN);
+  mem.add('s3', 3, 16 * MIN);
+  expect(await runSummaries(deps(llm, { perPass: 1 }))).toMatchObject({ summarized: 1, reactivated: 1 });
+  expect(prompts).toHaveLength(2); // s1 once before; now only s2
+  expect(mem.s.get('s3')!.version).toBe(0);
+});
+
+test('on the wall clock, sessions from long ago are summarized by the backfill', async () => {
+  mem.add('s1', 3, 15 * MIN); // weeks before today's wall clock
+  const { now: _, ...wall } = deps(fakeModel().llm);
+  expect(await runSummaries(wall)).toMatchObject({ summarized: 1, idled: 1 });
 });

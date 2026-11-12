@@ -1,11 +1,11 @@
 import type { AddressInfo } from 'node:net';
 import type { Server } from 'node:http';
 import { serve } from '@hono/node-server';
-import { expect, test } from 'vitest';
+import { expect, test, vi } from 'vitest';
 import { createApp, type ApiRepo } from './app.ts';
 import { KEEP_ALIVE_MS, stopServer, tuneServer } from './server.ts';
 
-const repo = { listCandidates: async () => [], candidateDetail: async () => null, decide: async () => {}, stats: async () => [] } as ApiRepo;
+const repo = { undoDecision: async () => false, listCandidates: async () => [], candidateDetail: async () => null, decide: async () => {}, stats: async () => [] } as ApiRepo;
 
 test('idle connections are kept 65 s (past the usual 60 s proxy and load balancer timeouts), headers a second longer', () => {
   const server = { keepAliveTimeout: 5000, headersTimeout: 60_000 } as Server;
@@ -26,9 +26,13 @@ test('a shutdown with an event stream open stops at once: the stream ends, the s
   const res = await fetch(`http://127.0.0.1:${port}/api/events`);
   const reader = res.body!.getReader();
   await reader.read();
-  const started = Date.now();
-  await stopServer(server, closing, { graceMs: 5000 });
-  expect(Date.now() - started).toBeLessThan(2000);
+  // The grace period runs on a fake timer that never fires: stopping must not wait for it, however busy the machine is.
+  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+  try {
+    await stopServer(server, closing, { graceMs: 5000 });
+  } finally {
+    vi.useRealTimers();
+  }
   // The stream ended (or was cut): no hang.
   const drain = async (): Promise<boolean> => {
     for (;;) if ((await reader.read()).done) return true;

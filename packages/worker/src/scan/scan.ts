@@ -6,13 +6,13 @@ import { promisify } from 'node:util';
 import { z } from 'zod';
 import { GIT_SAFE, gitSafeEnv } from '../ingest/git.ts';
 import { extract } from '../codegraph/extract.ts';
-import { langOf } from '../codegraph/lang.ts';
+import { fileMaxBytes, langOf } from '../codegraph/lang.ts';
 import { chunkBySymbols, type Chunk } from './chunk.ts';
 import { mapCap, rankCodePaths } from './rank.ts';
 import { withoutDataDirs, type DataDir } from './data.ts';
 import { gitChurn, hotScore, longCommentLines, scanOrder, type ScanSignals } from './priority.ts';
 import { inScope, lowValueBudget, lowValueRule, shardBudget, shardFactBudget, shardRepo, shardScope, type Shard } from './shard.ts';
-import { askJson, calibrateRelevance, clampRelevance, FACT_KINDS, holdsCredential, SCAN_PROMPT_VERSION, SCANNER_VERSION, type AgentMirror, isSecretPath, modelTimeoutReason, ProviderUnavailableError, providerUnavailableReason, redactSecrets, type ActivityStore, type CodeFact, type FactScope, type FactsStore, type LlmProvider, type ScanJob, type ScanShards } from '@fb/core';
+import { askJson, calibrateRelevance, nfcPaths, clampRelevance, FACT_KINDS, holdsCredential, SCAN_PROMPT_VERSION, SCANNER_VERSION, type AgentMirror, isSecretPath, modelTimeoutReason, ProviderUnavailableError, providerUnavailableReason, redactSecrets, type ActivityStore, type CodeFact, type FactScope, type FactsStore, type LlmProvider, type ScanJob, type ScanShards } from '@fb/core';
 
 const run = promisify(execFile);
 
@@ -47,8 +47,8 @@ const wanted = (path: string) => {
 
 async function gitFiles(repoPath: string): Promise<string[] | null> {
   try {
-    const { stdout } = await run('git', [...GIT_SAFE, '-C', repoPath, 'ls-files', '--cached', '--others', '--exclude-standard'], { maxBuffer: 64 * 1024 * 1024, timeout: 60_000, env: gitSafeEnv() });
-    return stdout.split('\n').filter(Boolean);
+    const { stdout } = await run('git', [...GIT_SAFE, '-C', repoPath, 'ls-files', '-z', '--cached', '--others', '--exclude-standard'], { maxBuffer: 64 * 1024 * 1024, timeout: 60_000, env: gitSafeEnv() });
+    return stdout.split('\0').filter(Boolean);
   } catch {
     return null;
   }
@@ -74,20 +74,25 @@ export type ListOpts = { maxBytes: number; maxFiles: number | null; priority?: I
  * Source, docs and config worth reading; respects .gitignore when the dir is a git repo. Candidates are ranked before
  * the cap (rank.ts), so a capped list keeps source over config and docs, and `priority` paths (files sessions edited)
  * before anything. maxFiles null: the cap scales with the repo (mapCap). totalCandidates: how many files were worth
- * listing before the cap, so a capped map can say what it left out. dataDirs: folders of data left out (data.ts).
+ * listing before the cap (those found over the size limit are not), so a capped list can say what it left out.
+ * dataDirs: folders of data left out (data.ts).
  */
 export async function listCodeFilesWithTotal(repoPath: string, o: ListOpts): Promise<{ files: CodeFile[]; totalCandidates: number; cap: number; dataDirs: DataDir[] }> {
   const { paths: candidates, dataDirs } = await candidatesOf(repoPath);
   const cap = mapCap(o.maxFiles, candidates.length);
   const files: CodeFile[] = [];
+  let unfit = 0;
   for (const path of rankCodePaths(candidates, { priority: o.priority })) {
     if (files.length >= cap) break;
     const s = await lstat(join(repoPath, path)).catch(() => null); // a symlink could point at a secret or outside the repo
-    if (!s?.isFile() || s.size > o.maxBytes) continue;
+    if (!s?.isFile() || s.size > o.maxBytes) {
+      unfit++;
+      continue;
+    }
     const content = await readFile(join(repoPath, path));
     files.push({ path, size: s.size, hash: createHash('sha1').update(content).digest('hex'), ...(o.comments && { comments: longCommentLines(path, content.toString('utf8')) }) });
   }
-  return { files, totalCandidates: candidates.length, cap, dataDirs };
+  return { files, totalCandidates: candidates.length - unfit, cap, dataDirs };
 }
 
 /**
@@ -95,24 +100,26 @@ export async function listCodeFilesWithTotal(repoPath: string, o: ListOpts): Pro
  * records: withoutDataDirs), which are left out of scans and the code map alike.
  */
 async function candidatesOf(repoPath: string): Promise<{ paths: string[]; dataDirs: DataDir[] }> {
-  return withoutDataDirs(((await gitFiles(repoPath)) ?? (await walk(repoPath))).filter(wanted));
+  return withoutDataDirs((await nfcPaths(repoPath, (await gitFiles(repoPath)) ?? (await walk(repoPath)))).filter(wanted));
 }
 
 /**
- * What the code map reads: every candidate that is a regular file within maxBytes, ranked by tier (rank.ts) with
+ * What the code map reads: every candidate that is a regular file within its limit (fileMaxBytes), ranked by tier (rank.ts) with
  * `priority` first, at most `limit` of them; and the map's cap (mapCap). The map parses all of them for its import
- * index and keeps symbols for the first `cap` once it knows their importers.
+ * index and keeps symbols for the first `cap` once it knows their importers. totalCandidates: the candidates within
+ * their limit, past `limit` too, so a map is called capped only when the cap left files out.
  */
-export async function listIndexPaths(repoPath: string, o: ListOpts & { limit: number }): Promise<{ paths: string[]; totalCandidates: number; cap: number }> {
+export async function listIndexPaths(repoPath: string, o: ListOpts & { limit: number; sourceMaxBytes?: number }): Promise<{ paths: string[]; totalCandidates: number; cap: number }> {
   const { paths: candidates } = await candidatesOf(repoPath);
   const cap = mapCap(o.maxFiles, candidates.length);
   const paths: string[] = [];
+  let unfit = 0;
   for (const path of rankCodePaths(candidates, { priority: o.priority })) {
-    if (paths.length >= o.limit) break;
     const s = await lstat(join(repoPath, path)).catch(() => null); // a symlink could point at a secret or outside the repo
-    if (s?.isFile() && s.size <= o.maxBytes) paths.push(path);
+    if (!s?.isFile() || s.size > fileMaxBytes(path, o)) unfit++;
+    else if (paths.length < o.limit) paths.push(path);
   }
-  return { paths, totalCandidates: candidates.length, cap };
+  return { paths, totalCandidates: candidates.length - unfit, cap };
 }
 
 /** The files a scan or a map would consider, before ranking and the cap (repo-relative paths). */
@@ -550,7 +557,7 @@ function shardListing(shard: ShardTask, plan: ReturnType<typeof shardPlan>): str
     : [];
   lines.push('Files in this part, by directory:');
   for (const [d, paths] of plan.groups) {
-    const min = plan.mins.get(d) ?? 0;
+    const min = plan.mins.get(d)!;
     lines.push(`## ${d} (${plural(paths.length, 'file')})${min ? `: at least ${plural(min, 'fact')} from here` : ''}`, ...paths);
   }
   if (plan.low.length) {
@@ -624,7 +631,7 @@ An earlier pass over this part returned ${plural(facts.length, 'fact')}, too few
 ${listed || '(none)'}
 ${cite}
 In unreached, list the directories (or files) you did not get to read; an empty list means you read them all.`,
-      user: `SHARD: ${shard.key}\nDirectories short of facts:\n${dirs.map(([d, n]) => `## ${d} (${plural(plan.groups.get(d)?.length ?? 0, 'file')})${n ? `: at least ${n} more ${n === 1 ? 'fact' : 'facts'} from here` : ''}\n${(plan.groups.get(d) ?? []).join('\n')}`).join('\n')}`,
+      user: `SHARD: ${shard.key}\nDirectories short of facts:\n${dirs.map(([d, n]) => `## ${d} (${plural(plan.groups.get(d)!.length, 'file')})${n ? `: at least ${n} more ${n === 1 ? 'fact' : 'facts'} from here` : ''}\n${plan.groups.get(d)!.join('\n')}`).join('\n')}`,
       schema,
       cwd,
       timeoutMs: Math.min(timeoutMs, TOP_UP_TIMEOUT_MS),
@@ -737,11 +744,11 @@ export class ScanPlans {
   }
 }
 
-/** The repo's HEAD commit, or null (not a repo, no commit yet). */
+/** The repo's HEAD commit, or null (not a repo, no commit yet: rev-parse --verify fails). */
 async function repoHead(repoPath: string): Promise<string | null> {
   try {
     const { stdout } = await run('git', [...GIT_SAFE, '-C', repoPath, 'rev-parse', '-q', '--verify', 'HEAD'], { timeout: 10_000 });
-    return stdout.trim() || null;
+    return stdout.trim();
   } catch {
     return null;
   }
@@ -772,13 +779,21 @@ export type ScanResult = { filesScanned: number; factsAdded: number; failed: num
 const LIST_LIMIT = 20_000;
 /** What the agents said they did not reach, kept on the job at most. */
 const JOB_UNREACHED = 200;
-const cmpKey = (a: string, b: string) => (a < b ? -1 : a > b ? 1 : 0);
 
 export async function runScan(job: ScanJob, d: ScanDeps): Promise<ScanResult> {
+  // Codex's mirror of the repo, made by the first shard that needs it: removed at the end, whatever happened.
+  const mirror: { current: AgentMirror | null } = { current: null };
+  try {
+    return await scanJob(job, d, mirror);
+  } finally {
+    await mirror.current?.dispose().catch(() => {});
+  }
+}
+
+async function scanJob(job: ScanJob, d: ScanDeps, mirror: { current: AgentMirror | null }): Promise<ScanResult> {
   const note = (kind: 'scan_started' | 'facts_extracted' | 'scan_finished', subject: string, why: string, details: Record<string, unknown> = {}, targets: string[] = []) =>
     d.activity?.record({ kind, actor: d.llm.id, projectKey: job.projectKey, subject, why, details: { scanJobId: job.id, promptVersion: SCAN_PROMPT_VERSION, ...details }, targets });
   const fileId = (path: string) => `${job.projectKey}:${path}`;
-  let mirror: AgentMirror | null = null;
   // A sharded scan that gave up its slot earlier goes on from where it was (ScanShards.processed).
   const resume = d.llm.agentic && job.shards?.processed ? job.shards : null;
   /** The shard progress last saved on the job (by this run, or the one it goes on from). */
@@ -799,10 +814,12 @@ export async function runScan(job: ScanJob, d: ScanDeps): Promise<ScanResult> {
     const listed = kept?.listed ?? fresh!.files;
     const dataLeft = fresh?.dataDirs ?? [];
     const dataFiles = dataLeft.reduce((n, x) => n + x.files, 0);
+    const churn = kept?.churn ?? await gitChurn(job.repoPath);
     const signals: ScanSignals = {
-      requested, touched, churn: kept?.churn ?? await gitChurn(job.repoPath),
+      requested, touched, churn,
       prPaths: new Set((await d.prPaths?.(job.projectKey).catch(() => [])) ?? []),
-      comments: new Map(listed.map((f) => [f.path, f.comments ?? 0])),
+      // Listed with comments: true, so every file has its count.
+      comments: new Map(listed.map((f) => [f.path, f.comments!])),
     };
     const files = scanOrder(listed, signals);
     const asked = new Set(requested);
@@ -829,7 +846,7 @@ export async function runScan(job: ScanJob, d: ScanDeps): Promise<ScanResult> {
         ...(modelChanged ? [`every file is rescanned because the current facts came from a different model (${sources.join(', ')})`] : []),
         ...(!modelChanged && outdated.length ? [`${plural(outdated.length, 'file')} ${outdated.length === 1 ? 'was' : 'were'} read by an older scanner and ${outdated.length === 1 ? 'is' : 'are'} read again with ${SCANNER_VERSION}`] : []),
         ...(requested.length - gone.length > 0 ? [`${plural(requested.length - gone.length, 'file')} an agent asked for ${requested.length - gone.length === 1 ? 'is' : 'are'} read first`] : []),
-        ...(dataLeft.length ? [`${plural(dataFiles, 'file')} in data folders ${dataFiles === 1 ? 'is' : 'are'} left out: ${dataLeft.slice(0, 5).map((x) => `${x.dir}/ (${x.files})`).join(', ')}${dataLeft.length > 5 ? ', ...' : ''}`] : []),
+        ...(dataLeft.length ? [`${plural(dataFiles, 'file')} in data folders are left out: ${dataLeft.slice(0, 5).map((x) => `${x.dir}/ (${x.files})`).join(', ')}${dataLeft.length > 5 ? ', ...' : ''}`] : []),
       ].join('; '), {
         repoPath: job.repoPath, scannerVersion: SCANNER_VERSION, olderScanner: outdated.length, requested: requested.filter((p) => present.has(p)).slice(0, 50),
         ...(dataLeft.length ? { dataDirs: dataLeft.slice(0, 50) } : {}),
@@ -854,11 +871,11 @@ export async function runScan(job: ScanJob, d: ScanDeps): Promise<ScanResult> {
       const rank = new Map(files.map((f, i) => [f.path, i]));
       const hotOf = (p: string) => hotScore(p, signals);
       // Shards holding a file an agent asked for run first, then source before shards of only tests or archives (the
-      // attic), then the hottest, then by key.
+      // attic), then the hottest, then by key (planned is sorted by key, and the sort is stable).
       const isLow = lowValueRule(files.map((f) => f.path));
       const heat = new Map(planned.map((s) => [s.key, { asked: s.files.some((p) => asked.has(p)), low: s.files.every(isLow), hot: s.files.reduce((m, p) => Math.max(m, hotOf(p)), 0) }]));
       const shards = [...planned].sort((a, b) => Number(heat.get(b.key)!.asked) - Number(heat.get(a.key)!.asked) || Number(heat.get(a.key)!.low) - Number(heat.get(b.key)!.low)
-        || heat.get(b.key)!.hot - heat.get(a.key)!.hot || cmpKey(a.key, b.key));
+        || heat.get(b.key)!.hot - heat.get(a.key)!.hot);
       const byPath = new Map(files.map((f) => [f.path, f]));
       // A shard is redone for a model switch only while its own facts are another model's: one that failed after the
       // switch keeps its old facts, and must not send every later scan through the whole repo again.
@@ -903,14 +920,14 @@ export async function runScan(job: ScanJob, d: ScanDeps): Promise<ScanResult> {
       // Gave way to another scan: back in the queue with its progress (saved after the shard), to go on from there.
       const paused = async (): Promise<ScanResult> => {
         // Kept for its next turn; the mirror is not (removed below with the rest of this turn).
-        if (head) d.plans!.keep(job.id, { head, repoPath: job.repoPath, listed, churn: signals.churn ?? new Map(), planned });
+        if (head) d.plans!.keep(job.id, { head, repoPath: job.repoPath, listed, churn, planned });
         await d.facts.requeueScanJob!(job.id);
         const remaining = shards.filter(toRun).length;
         d.log?.('scan gave way to another scan', { project: job.projectKey, shardsDone: shards.filter((x) => processed.has(x.key)).length, shards: shards.length, remaining });
         return { filesScanned: citedBefore + cited.size, factsAdded, failed: failedKeys.length, remaining, shards: coverage, paused: true };
       };
       // Codex explores a filtered copy of the repo: made once for the whole scan (removed at its end), not per shard.
-      const agentCwd = async () => (d.llm.mirror ? (mirror ??= await d.llm.mirror(job.repoPath)).dir : job.repoPath);
+      const agentCwd = async () => (d.llm.mirror ? (mirror.current ??= await d.llm.mirror(job.repoPath)).dir : job.repoPath);
       // A file an agent asked for in a shard this scan already got through is read on its own (0.6.2 ran the whole
       // shard again: minutes of agent time, and its facts counted twice). Its facts replace the file's, merged with the
       // ones the shard gave it, a fact given again kept and counted once.
@@ -929,7 +946,8 @@ export async function runScan(job: ScanJob, d: ScanDeps): Promise<ScanResult> {
             await note('facts_extracted', `could not read ${p}, which an agent asked for`, redactSecrets(String(err)), { shard: s.key }, [fileId(p)]);
             continue;
           }
-          const { kept } = await checkCitations(extracted.facts.map((x) => ({ ...x, origin: 'model' as const })), async (q) => (q === p ? content : undefined));
+          // extractFileFacts pins every fact to the file, so the file is all there is to read.
+          const { kept } = await checkCitations(extracted.facts.map((x) => ({ ...x, origin: 'model' as const })), async () => content);
           const before = ((await d.facts.listFacts?.({ projectKey: job.projectKey, path: p }).catch(() => [])) ?? []).filter((x) => !x.docId && x.origin !== 'you' && x.path === p);
           const known = new Set(before.map(factKey));
           const fresh = [...calibrateRelevance(kept), ...deterministicFacts([{ path: p, content }])].map(checked);
@@ -1028,7 +1046,7 @@ export async function runScan(job: ScanJob, d: ScanDeps): Promise<ScanResult> {
           `${plural(dirty.length, 'file')} changed, removed or asked for; ${d.llm.id} explored ${where} with read-only tools and replaced its earlier facts there${droppedWhy}`,
           { shard: s.key, facts: factLog(facts), ...(dropped.length || outside.length ? { dropped: factLog([...dropped, ...outside]) } : {}), changedFiles: dirty, ...(unreached.length ? { unreached } : {}),
             ...(hidden.lowValue || hidden.overBudget ? { cut: hidden } : {}), ...(toppedUp ? { toppedUp } : {}) },
-          [...new Set(facts.map((f) => fileId(f.path || '.')))]);
+          [...new Set(facts.map((f) => fileId(f.path)))]);
         d.log?.('scanned shard', { project: job.projectKey, shard: s.key, files: s.files.length, facts: facts.length, unreached: unreached.length });
         if (await giveWay()) return await paused();
       }
@@ -1068,7 +1086,8 @@ export async function runScan(job: ScanJob, d: ScanDeps): Promise<ScanResult> {
           continue;
         }
         const { summary } = extracted;
-        const { kept } = await checkCitations(extracted.facts.map((x) => ({ ...x, origin: 'model' as const })), async (p) => (p === f.path ? content : undefined));
+        // extractFileFacts pins every fact to the file, so the file is all there is to read.
+        const { kept } = await checkCitations(extracted.facts.map((x) => ({ ...x, origin: 'model' as const })), async () => content);
         const all = [...calibrateRelevance(kept), ...deterministicFacts([{ path: f.path, content }])].map(checked);
         await d.facts.saveFileFacts(job.projectKey, { path: f.path, hash: f.hash, summary, version: SCANNER_VERSION }, await embedFacts(all, d.embed), d.llm.id, job.id);
         factsAdded += all.length;
@@ -1122,7 +1141,5 @@ export async function runScan(job: ScanJob, d: ScanDeps): Promise<ScanResult> {
     await note('scan_finished', `scan failed (attempt ${next.attempts}); ${next.retryAt ? `retrying at ${next.retryAt}` : 'gave up, request a new scan to try again'}`,
       error, { attempts: next.attempts, retryAt: next.retryAt });
     throw err;
-  } finally {
-    await (mirror as AgentMirror | null)?.dispose().catch(() => {});
   }
 }

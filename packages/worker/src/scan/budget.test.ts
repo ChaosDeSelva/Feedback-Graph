@@ -145,3 +145,47 @@ test('a top-up stopped by the provider being unavailable still stops the scan', 
   };
   await expect(extractShardFacts(llm, '/repo', task(a))).rejects.toThrow(/usage limit/);
 });
+
+test('the shard holding the rest of the repo names the folders merged into it', async () => {
+  const { llm, asked } = agent({ facts: [], unreached: [] });
+  const shard: ShardTask = { key: '.+tools', roots: ['', 'tools'], scope: { prefixes: [''], except: ['packages/api'] }, files: files('tools', 3) };
+  await extractShardFacts(llm, '/repo', shard);
+  expect(asked[0].system).toContain('the repository outside packages/api (its top level and tools)');
+});
+
+test('an answer under the floor with no large directory short asks again over every directory, with no per-directory minimum', async () => {
+  const fs = [...files('packages/api/src', 10), ...files('packages/api/lib', 10)];
+  const { llm, asked } = agent({ facts: [], unreached: [] }, { facts: [fact('packages/api/src/f0.ts', 'more')], unreached: [] });
+  const r = await extractShardFacts(llm, '/repo', task(fs));
+  expect(r.toppedUp).toBe(true);
+  expect(asked[1].user).toContain('## packages/api/src (10 files)\npackages/api/src/f0.ts');
+  expect(asked[1].user).not.toMatch(/at least \d+ more/);
+});
+
+test('a large directory one fact short is asked for exactly one more fact', async () => {
+  const dir = files('packages/api/src', 30);
+  const plenty = (n: number) => dir.slice(0, n).map((f, i) => fact(f.path, `fact ${i}`));
+  // Find how many facts the directory needs: answered with none, the top-up names its minimum.
+  const probe = agent({ facts: [], unreached: [] });
+  await extractShardFacts(probe.llm, '/repo', task(dir));
+  const min = Number(probe.asked[1].user.match(/at least (\d+) more facts from here/)![1]);
+  const { llm, asked } = agent({ facts: plenty(min - 1), unreached: [] }, { facts: [], unreached: [] });
+  await extractShardFacts(llm, '/repo', task(dir));
+  expect(asked[1].user).toContain('at least 1 more fact from here');
+});
+
+test('facts past the budget are cut least relevant first, an unscored fact counting as middling', async () => {
+  const fs = files('packages/api/src', 5);
+  const budget = shardFactBudget(5, 0);
+  const answer = {
+    facts: [
+      ...Array.from({ length: budget }, (_, i) => fact(fs[0].path, `kept ${i}`, 0.9)),
+      { ...fact(fs[1].path, 'unscored'), relevance: null },
+      fact(fs[2].path, 'low', 0.1),
+    ],
+    unreached: [],
+  };
+  const r = await extractShardFacts(agent(answer).llm, '/repo', task(fs));
+  expect(r.facts.map((f) => f.statement)).toEqual(Array.from({ length: budget }, (_, i) => `kept ${i}`));
+  expect(r.hidden).toEqual({ lowValue: 0, overBudget: 2 });
+});

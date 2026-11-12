@@ -1,5 +1,5 @@
 import { readdirSync, readFileSync } from 'node:fs';
-import { ACTIVITY_KINDS, CAUSES, CHAT_PROVIDERS, CHAT_TURN_STATUSES, FACT_EVIDENCE, FACT_KINDS, FACT_ORIGINS, RUN_PRINCIPALS, SESSION_STATES, SYMBOL_KINDS, TURN_LABELS, type CandidateStatus, type FeedbackSource, type ContextKind, type DocSource, type FeedbackStatus, type LessonScope, type LessonSource, type LessonStatus, type Outcome, type ScanStatus } from '@fb/core';
+import { ACTIVITY_KINDS, DECISION_MODES, DECISION_NOTE_REASONS, DECISION_STATUSES, DECISION_TARGET_KINDS, DECISION_TARGET_ROLES, DECISION_TIERS, DECISION_TYPES, CAUSES, CHAT_PROVIDERS, CHAT_TURN_STATUSES, FACT_EVIDENCE, FACT_KINDS, FACT_ORIGINS, RUN_PRINCIPALS, SESSION_STATES, SYMBOL_KINDS, TURN_LABELS, type CandidateStatus, type FeedbackSource, type ContextKind, type DocSource, type FeedbackStatus, type LessonScope, type LessonSource, type LessonStatus, type Outcome, type ScanStatus } from '@fb/core';
 import { expect, test } from 'vitest';
 import { renderMigration } from './migrate.ts';
 
@@ -42,6 +42,15 @@ test('CHECK constraints allow exactly the values the TypeScript types allow (add
   expect(allowed('docs_source_check')).toEqual(all<DocSource>()(['upload', 'github', 'linear']));
   expect(allowed('facts_origin_check')).toEqual([...FACT_ORIGINS].sort());
   expect(allowed('facts_evidence_check')).toEqual([...FACT_EVIDENCE].sort());
+  expect(allowed('decisions_type_check')).toEqual([...DECISION_TYPES].sort());
+  expect(allowed('loop_calibration_type_check')).toEqual([...DECISION_TYPES].sort());
+  expect(allowed('decisions_status_check')).toEqual([...DECISION_STATUSES].sort());
+  expect(allowed('decisions_tier_check')).toEqual([...DECISION_TIERS].sort());
+  expect(allowed('decisions_mode_check')).toEqual([...DECISION_MODES].sort());
+  expect(allowed('decision_targets_kind_check')).toEqual([...DECISION_TARGET_KINDS].sort());
+  expect(allowed('decision_targets_role_check')).toEqual([...DECISION_TARGET_ROLES].sort());
+  expect(allowed('decision_notes_verdict_check')).toEqual(['agree', 'disagree']);
+  expect(allowed('decision_notes_reason_check')).toEqual([...DECISION_NOTE_REASONS].sort());
 });
 
 test('the embedding dimension is filled in from config, and only a sane one is accepted', () => {

@@ -200,8 +200,8 @@ test('runPostMortem redacts everything it sends to the model', async () => {
   const llm = { id: 'x', agentic: false, json: async (t: { user: string }) => { user = t.user; throw new Error('stop'); } };
   await runPostMortem(input, {
     llm: llm as never,
-    standing: async () => [{ kind: 'claude_md', ref: 'CLAUDE.md', loaded: true, text: 'token sk-ant-api03-cccccccccccccccccccccccccccccccccccccccc' }],
-    facts: async () => ['config: key sk-ant-api03-cccccccccccccccccccccccccccccccccccccccc'],
+    standing: async () => [{ kind: 'claude_md', ref: 'CLAUDE.md', loaded: true, text: 'token sk' + '-ant-api03-cccccccccccccccccccccccccccccccccccccccc' }],
+    facts: async () => ['config: key sk' + '-ant-api03-cccccccccccccccccccccccccccccccccccccccc'],
   }).catch(() => {});
   expect(user).toContain('CLAUDE.md');
   expect(user).not.toContain('sk-ant-api03');

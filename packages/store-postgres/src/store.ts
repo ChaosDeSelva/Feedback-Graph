@@ -3,6 +3,7 @@ import { PgActivityStore } from './activity.ts';
 import { PgChatStore } from './chat.ts';
 import { PgCodeGraphStore } from './codegraph.ts';
 import { openDb, type Db, type PostgresConfig } from './db.ts';
+import { PgDecisionsStore } from './decisions.ts';
 import { PgDocsStore } from './docs.ts';
 import { PgEmbeddingsStore } from './embeddings.ts';
 import { PgFactsStore } from './facts.ts';
@@ -38,6 +39,7 @@ export function postgresStore(db: Db): PostgresStore {
     sessions: new PgSessionsStore(db),
     chats: new PgChatStore(db),
     runs: new PgRunsStore(db),
+    decisions: new PgDecisionsStore(db),
     ensureSchema: async () => {
       await migrate(db.pool, { embeddingDimensions: db.dims });
       await checkPgvector(db);

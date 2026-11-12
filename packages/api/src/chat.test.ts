@@ -39,7 +39,7 @@ function deps(root: string, map: Partial<StoredCodeMap>, over: Partial<ContextDe
     embed: async (texts) => texts.map(() => [1, 0]),
     k: {
       searchLessons: async () => [{ lesson: lesson('lesson:a', 'Reuse the shared Modal'), score: 0.9 }],
-      relatedMisses: async () => [{ missId: 'miss:1', missed: 'built a second modal from scratch', cause: 'context_available_ignored', feedbackText: 'we already have one', sessionId: 's1', ts: '2026-10-01T10:00:00Z', score: 0.8 }],
+      missesNaming: async () => [], relatedMisses: async () => [{ missId: 'miss:1', missed: 'built a second modal from scratch', cause: 'context_available_ignored', feedbackText: 'we already have one', sessionId: 's1', ts: '2026-10-01T10:00:00Z', score: 0.86 }],
       recordPreDoneCheck: async () => {},
       createManualFeedback: async () => 'manual:1',
     },
@@ -136,7 +136,7 @@ describe('buildChatContext', () => {
     }
     files['src/modals/Modal0.tsx'] = `const key = '${token()}';\n${files['src/modals/Modal0.tsx']}`;
     const { root } = project(files);
-    const pack = await buildChatContext('demo-shop', 'modal', [], deps(root, map, { k: { searchLessons: async () => [], relatedMisses: async () => [], recordPreDoneCheck: async () => {}, createManualFeedback: async () => '' }, facts: undefined, docs: undefined }));
+    const pack = await buildChatContext('demo-shop', 'modal', [], deps(root, map, { k: { searchLessons: async () => [], missesNaming: async () => [], relatedMisses: async () => [], recordPreDoneCheck: async () => {}, createManualFeedback: async () => '' }, facts: undefined, docs: undefined }));
     const snippets = [...pack.context.matchAll(/--- begin untrusted code [^\n]* ---\n([\s\S]*?)\n--- end of untrusted code ---/g)].map((m) => m[1]);
     expect(snippets.length).toBeGreaterThan(0);
     for (const s of snippets) expect(s.split('\n').length).toBeLessThanOrEqual(SNIPPET_LINES);

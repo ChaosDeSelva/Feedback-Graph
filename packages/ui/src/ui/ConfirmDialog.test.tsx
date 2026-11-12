@@ -86,7 +86,11 @@ test('with a phrase to type, confirm stays disabled until it matches', () => {
 
 test('while busy, neither button can be pressed twice and Escape does not close it', () => {
   const { onCancel, onConfirm, dialog } = open({ busy: true });
-  expect((screen.getByRole('button', { name: /Remove document|Removing/ }) as HTMLButtonElement).disabled).toBe(true);
+  // The confirm button keeps focus while busy (aria-disabled), and a press does nothing.
+  const confirm = screen.getByRole('button', { name: /Remove document|Removing/ });
+  expect(confirm.getAttribute('aria-disabled')).toBe('true');
+  fireEvent.click(confirm);
+  expect((screen.getByRole('button', { name: 'Cancel' }) as HTMLButtonElement).disabled).toBe(true);
   fireEvent.keyDown(dialog, { key: 'Escape' });
   expect(onCancel).not.toHaveBeenCalled();
   expect(onConfirm).not.toHaveBeenCalled();
@@ -107,4 +111,37 @@ test('askConfirm resolves with the answer and closes the dialog', async () => {
   fireEvent.keyDown(await screen.findByRole('alertdialog'), { key: 'Escape' });
   expect(await answer!).toBe(false);
   expect(screen.queryByRole('alertdialog')).toBeNull();
+});
+
+test('Tab between the first and last control is left to the browser', () => {
+  open({ typeToConfirm: 'shop' });
+  const field = screen.getByLabelText('type shop to confirm');
+  field.focus();
+  // fireEvent returns false only when the handler called preventDefault.
+  expect(fireEvent.keyDown(field, { key: 'Tab' })).toBe(true);
+  expect(document.activeElement).toBe(field);
+});
+
+test('a newer askConfirm answers the open one with false and shows itself', async () => {
+  let first: Promise<boolean>, second: Promise<boolean>;
+  act(() => { first = askConfirm({ title: 'Leave the Inbox?', confirmLabel: 'Leave' }); });
+  await screen.findByRole('alertdialog', { name: 'Leave the Inbox?' });
+  act(() => { second = askConfirm({ title: 'Leave Lessons?', confirmLabel: 'Discard' }); });
+  expect(await first!).toBe(false);
+  fireEvent.click(await screen.findByRole('button', { name: 'Discard' }));
+  expect(await second!).toBe(true);
+  expect(screen.queryByRole('alertdialog')).toBeNull();
+});
+
+test("a page shortcut typed in the dialog does not reach the page behind it", () => {
+  const onPageKey = vi.fn();
+  document.addEventListener('keydown', onPageKey);
+  try {
+    const { dialog, onCancel } = open();
+    fireEvent.keyDown(dialog, { key: 'c' });
+    expect(onPageKey).not.toHaveBeenCalled();
+    expect(onCancel).not.toHaveBeenCalled();
+  } finally {
+    document.removeEventListener('keydown', onPageKey);
+  }
 });

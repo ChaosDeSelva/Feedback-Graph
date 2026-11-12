@@ -1,5 +1,6 @@
 import { extractJsonAnswer, shownProjects, type ActivityInput, type Lesson } from '@fb/core';
-import { describe, expect, test } from 'vitest';
+import { setImmediate as nextTurn } from 'node:timers/promises';
+import { describe, expect, test, vi } from 'vitest';
 import { checkBeforeDone, getImpact, getModuleContext, getTaskContext, hashRepoFile, makeJudge, reportFeedback, resolveProject, searchGraph, taskFiles, trackedProject, type ContextDeps } from './context.ts';
 import { Admission } from './admission.ts';
 
@@ -22,7 +23,7 @@ function deps(over: Partial<ContextDeps> = {}): ContextDeps & { checks: unknown[
     embed: async (texts) => texts.map(() => [1, 0]),
     k: {
       searchLessons: async () => [{ lesson: lesson('l1', 'Server-side search'), score: 0.91 }],
-      relatedMisses: async () => [{ missId: 'm1', missed: 'client-side filtering', cause: 'requirement_unstated', feedbackText: "this isn't good enough", sessionId: 's1', ts: '2026-10-01T10:00:00Z', score: 0.8 }],
+      relatedMisses: async () => [{ missId: 'm1', missed: 'client-side filtering', cause: 'requirement_unstated', feedbackText: "this isn't good enough", sessionId: 's1', ts: '2026-10-01T10:00:00Z', score: 0.86 }],
       recordPreDoneCheck: async (c) => { checks.push(c); },
       createManualFeedback: async (o) => { manual.push(o); return 'manual:1'; },
     },
@@ -44,7 +45,7 @@ test('resolveProject resolves a repo nested in a folder that is not a repo, by c
   const want = { key: 'github.com__org__repo', name: 'github.com/org/repo', repoPath: '/vibe/github.com/org/repo' };
   expect(resolveProject({ cwd: '/Users/j/src/github.com/org/repo/pkg' }, nested)).toEqual(want);
   expect(resolveProject({ project: 'github.com__org__repo' }, nested, { exists: (p) => p === want.repoPath })).toEqual(want);
-  expect(taskFiles({ cwd: '/Users/j/src/github.com/org/repo/pkg', files: ['a.ts', '/Users/j/src/github.com/org/repo/b.ts'] }, nested)).toEqual(['pkg/a.ts', 'b.ts']);
+  expect(taskFiles({ cwd: '/Users/j/src/github.com/org/repo/pkg', files: ['pkg/a.ts', '/Users/j/src/github.com/org/repo/b.ts'] }, nested)).toEqual(['pkg/a.ts', 'b.ts']);
 });
 
 test('getTaskContext lists lessons and past misses with citations', async () => {
@@ -240,6 +241,18 @@ test('getTaskContext labels a fact the owner wrote (a converted lesson) as the o
   });
   const r = await getTaskContext({ project: 'demo', task: 'change orders' }, d);
   expect(r.markdown).toContain('- from the project owner, about `src/orders` (convention): Orders are read from the source table');
+});
+
+test("getTaskContext labels the learning loop's fact (a lesson that stated a fact) as learned from feedback, not as the owner's", async () => {
+  const base = { confidence: 1, why: 'w', source: 'loop:1', createdAt: 't', scanJobId: null, fileHash: null, fileSummary: null, relevance: 0.8, relevanceBy: 'loop:1' as const, docId: null };
+  const d = deps({
+    facts: { searchFacts: async () => [
+      { fact: { ...base, id: 'fl', kind: 'convention' as const, statement: 'Amounts are stored in cents', path: 'src/money.ts', lines: null, origin: 'loop' as const }, score: 0.95 },
+    ] },
+  });
+  const r = await getTaskContext({ project: 'demo', task: 'change money' }, d);
+  expect(r.markdown).toContain('- learned from past feedback, about `src/money.ts` (convention): Amounts are stored in cents');
+  expect(r.markdown).not.toContain('from the project owner');
 });
 
 test('resolveProject rejects keys that could escape the root', () => {
@@ -455,23 +468,30 @@ describe('global lessons in folders that are not selected', () => {
     expect(JSON.stringify(recorded)).not.toMatch(/add a flag|side-project/);
   });
 
-  test('check_before_done there sends nothing to the judge: it lists the global lessons as not judged, and keeps no summary', async () => {
+  test('check_before_done there sends nothing to a model: no embedding, search or judge, and keeps no summary', async () => {
     const { d, asked, recorded } = unselected();
     const judged: unknown[] = [];
+    const embedded: string[][] = [];
     const checks: unknown[] = [];
+    // A lesson learned in this folder, on the file the work changed: the closest thing there is to one that applies.
+    const tied = { ...global, id: 'g-tied', origin: 'side-project', paths: ['src/flag.ts'] };
     const r = await checkBeforeDone(
-      // On the global lesson's topic (tests): check_before_done judges only what get_task_context would serve.
-      { cwd: '/Users/j/Vibe/side-project', task: 'add a flag and run the tests', summary: 'added the flag', diff: 'diff --git a/x b/x' },
-      { ...d, judge: async (...a) => { judged.push(a); return [{ lessonId: 'g1', status: 'not_addressed', why: 'no tests run' }]; }, k: { ...d.k, recordPreDoneCheck: async (x) => { checks.push(x); } } },
+      { cwd: '/Users/j/Vibe/side-project', task: 'add a flag and run the tests', summary: 'added the flag', diff: 'diff --git a/src/flag.ts b/src/flag.ts', filesChanged: ['src/flag.ts'] },
+      {
+        ...d,
+        embed: async (t) => { embedded.push(t); return t.map(() => [1]); },
+        judge: async (...a) => { judged.push(a); return [{ lessonId: 'g-tied', status: 'not_addressed', why: 'no tests run' }]; },
+        k: { ...d.k, searchLessons: async (q) => { asked.push(`lessons:${q.projectKey}`); return [{ lesson: tied, score: 1 }]; }, recordPreDoneCheck: async (x) => { checks.push(x); } },
+      },
     );
-    expect(asked).toEqual(['lessons:null']);
+    expect(asked).toEqual([]);
+    expect(embedded).toEqual([]);
     expect(judged).toEqual([]);
     expect(checks).toEqual([]);
-    expect(r.gaps).toEqual([]);
-    expect(r.markdown).toMatch(/No past lessons apply/i);
-    expect(r.markdown).not.toContain('Run the tests before saying done');
+    expect(r).toMatchObject({ gaps: [], codeGaps: [] });
+    expect(r.markdown).toMatch(/^# Not judged: side-project is not selected in the Feedback Graph, so this work is not sent to a model/);
+    expect(r.markdown).toMatch(/select the project in the Feedback Graph's Settings/);
     expect(recorded).toEqual([]);
-    expect(JSON.stringify(recorded)).not.toMatch(/add a flag|added the flag|side-project|diff --git/);
   });
 
   test('an excluded folder, or a clone of an excluded project, still gets nothing at all', async () => {
@@ -515,8 +535,8 @@ test('lessons whose paths match the files the agent will touch rank first, even 
       },
     },
   });
-  const r = await getTaskContext({ cwd: '/Users/j/Vibe/demo/src', task: 'pool tuning', files: ['db/pool.ts', '/Users/j/Vibe/demo/README.md', '/etc/passwd', '../../x'] }, d);
-  // relative to the cwd, absolute inside the project; anything outside it is dropped
+  const r = await getTaskContext({ cwd: '/Users/j/Vibe/demo/src', task: 'pool tuning', files: ['src/db/pool.ts', '/Users/j/Vibe/demo/README.md', '/etc/passwd', '../../x'] }, d);
+  // repo-relative, absolute inside the project; anything outside it is dropped
   expect(asked).toEqual([['src/db/pool.ts', 'README.md']]);
   expect(r.lessons.map((h) => [h.lesson.id, h.files ?? []])).toEqual([
     ['l2', ['src/db/pool.ts']], ['l3', ['src/db/pool.ts']],
@@ -561,7 +581,7 @@ test('a diff over the judge\'s budget keeps the files the judged lessons (or mis
   // No lesson: the misses it is judged against name the file instead.
   const misses: string[] = [];
   const m = deps({
-    k: { ...deps().k, searchLessons: async () => [], relatedMisses: async () => [{ missId: 'm1', missed: 'left a client checked out in src/db/pool.ts', cause: 'implementation_error', feedbackText: 'leak', sessionId: 's1', ts: '2026-10-01T10:00:00Z', score: 0.8 }] },
+    k: { ...deps().k, searchLessons: async () => [], relatedMisses: async () => [{ missId: 'm1', missed: 'left a client checked out in src/db/pool.ts', cause: 'implementation_error', feedbackText: 'leak', sessionId: 's1', ts: '2026-10-01T10:00:00Z', score: 0.86 }] },
     judge: async (w) => { misses.push(w.diff ?? ''); return []; },
   });
   await checkBeforeDone({ filesChanged: ['src/db/pool.ts'], project: 'demo', task: 'tune the pool', summary: 'pool size', diff }, m);
@@ -671,7 +691,7 @@ describe('linked projects', () => {
           },
           relatedMisses: async (q) => {
             searched.push({ what: 'misses', projectKey: q.projectKey });
-            return q.projectKey === 'api' ? [{ missId: 'ma', missed: 'broke the v1 response shape', cause: 'context_missing', feedbackText: 'you broke the app', sessionId: 'sa', ts: '2026-10-02T10:00:00Z', score: 0.8 }] : [];
+            return q.projectKey === 'api' ? [{ missId: 'ma', missed: 'broke the v1 response shape', cause: 'context_missing', feedbackText: 'you broke the app', sessionId: 'sa', ts: '2026-10-02T10:00:00Z', score: 0.86 }] : [];
           },
         },
         facts: { searchFacts: async (q) => (q.projectKey === 'api' ? [{ fact: fact('fa', 'Responses are wrapped in { data, error }', 1), score: 0.95 }, { fact: fact('fs', 'Install the API profiler', 0.05), score: 0.7 }] : []) },
@@ -681,7 +701,7 @@ describe('linked projects', () => {
     };
   }
 
-  test('a confirmed link brings the linked project\'s best lessons, misses, facts and docs, each labelled with where it came from', async () => {
+  test('a confirmed link brings the linked project\'s best misses, facts and docs, each labelled with where it came from', async () => {
     const t = linkedDeps([link('api', 'demo', 'confirmed', 'the app calls this api')]);
     const r = await getTaskContext({ project: 'demo', task: 'show orders from the api' }, t.d);
     const section = r.markdown.slice(r.markdown.indexOf('## From linked projects'));
@@ -696,6 +716,13 @@ describe('linked projects', () => {
     expect(section).toMatch(/UNTRUSTED/);
   });
 
+  test('a stored link whose relation this release no longer knows is named as stored', async () => {
+    const t = linkedDeps([{ ...link('api', 'demo', 'confirmed'), relation: 'forked_from' } as unknown as ReturnType<typeof link>]);
+    const r = await getTaskContext({ project: 'demo', task: 'show orders from the api' }, t.d);
+    expect(r.markdown).toContain('### api (forked from)');
+    expect(r.markdown).not.toContain('undefined');
+  });
+
   test('suggested and dismissed links bring nothing; neither does a link to a project that is not shown', async () => {
     const t = linkedDeps([link('api', 'demo', 'suggested'), link('demo', 'tools', 'dismissed')]);
     expect((await getTaskContext({ project: 'demo', task: 't' }, t.d)).markdown).not.toContain('From linked projects');
@@ -708,7 +735,7 @@ describe('linked projects', () => {
     const logged: ActivityInput[] = [];
     const t = linkedDeps([link('api', 'demo', 'confirmed')], { activity: { record: async (a) => { logged.push(a); } } });
     await getTaskContext({ project: 'demo', task: 'show orders from the api' }, t.d);
-    expect(logged[0].details).toMatchObject({ linked: [{ project: 'api', lessons: [], misses: ['ma'], facts: ['fa'] }] });
+    expect(logged[0].details).toMatchObject({ linked: [{ project: 'api', misses: ['ma'], facts: ['fa'] }] });
   });
 
   test('checkBeforeDone does not judge semantic pointers from linked projects', async () => {
@@ -807,7 +834,7 @@ describe('lesson counts: the project\'s own and the global ones, each said for w
 describe('check_before_done: the judge says whether each lesson or miss applies', () => {
   const proposed = (n: number) => Array.from({ length: n }, (_, i) => lesson(`p${i}`, `Proposed ${i}`, { status: 'proposed' }));
   const noneApproved = { ...deps().k, searchLessons: async () => [], listLessons: async (f: { status?: string }) => (f.status === 'proposed' ? proposed(141) : []) } as ContextDeps['k'];
-  const fourMisses = async () => ['cold start verify', 'input capping', 'router history desync', 'asset prefixes'].map((missed, i) => ({ missId: `m${i}`, missed, cause: 'requirement_unstated' as const, feedbackText: 'x', sessionId: 's', ts: '2026-10-01T10:00:00Z', score: 0.8 }));
+  const fourMisses = async () => ['cold start verify', 'input capping', 'router history desync', 'asset prefixes'].map((missed, i) => ({ missId: `m${i}`, missed, cause: 'requirement_unstated' as const, feedbackText: 'x', sessionId: 's', ts: '2026-10-01T10:00:00Z', score: 0.86 }));
 
   test('the completion judge is capped at the two strongest pathless misses', async () => {
     const judged: string[][] = [];
@@ -976,7 +1003,7 @@ describe('what reaches the agent: misses', () => {
 
   test('a miss whose feedback text is empty (the cloud blanks it) has no empty "developer said" fragment', async () => {
     for (const text of ['', '   ']) {
-      const d = deps({ k: { ...deps().k, relatedMisses: async () => [rm('m1', 'client-side filtering', 0.8, text)] } });
+      const d = deps({ k: { ...deps().k, relatedMisses: async () => [rm('m1', 'client-side filtering', 0.86, text)] } });
       const r = await getTaskContext({ project: 'demo', task: 't' }, d);
       expect(r.markdown).toContain('client-side filtering');
       expect(r.markdown).not.toContain('developer said');
@@ -985,7 +1012,7 @@ describe('what reaches the agent: misses', () => {
   });
 
   test('what the developer said is redacted again as it is served (feedback stored under older rules)', async () => {
-    const d = deps({ k: { ...deps().k, relatedMisses: async () => [rm('m1', 'client-side filtering', 0.8, 'no, the staging password is hunter2, use it')] } });
+    const d = deps({ k: { ...deps().k, relatedMisses: async () => [rm('m1', 'client-side filtering', 0.86, 'no, the staging password is hunter2, use it')] } });
     const r = await getTaskContext({ project: 'demo', task: 't' }, d);
     expect(r.markdown).toContain('developer said: "no, the staging password is [REDACTED], use it"');
     expect(r.markdown).not.toContain('hunter2');
@@ -1001,7 +1028,7 @@ describe('what reaches the agent: misses', () => {
   test('a stored non-miss ("the agent did not miss ...") is never served, and weak matches stay out', async () => {
     const d = deps({ k: { ...deps().k, relatedMisses: async () => [
       rm('m0', 'The agent did not miss the feedback, as it was directed at a different pull request', 0.95),
-      rm('m1', 'client-side filtering', 0.8),
+      rm('m1', 'client-side filtering', 0.86),
       rm('m2', 'a Brotli CVE bump', 0.25),
     ] } });
     const r = await getTaskContext({ project: 'demo', task: 't' }, d);
@@ -1013,9 +1040,9 @@ describe('what reaches the agent: misses', () => {
     let asked = 0;
     const d = deps({ k: { ...deps().k, relatedMisses: async (q) => { asked = q.k; return [
       rm('mg', 'missed the exists=true filter in src/graph/internal/page.go', 0.86),
-      rm('mw', 'missed the admin gate in src/webapp/core/settings/usage.ts', 0.8),
+      rm('mw', 'missed the admin gate in src/portal/main/settings/usage.ts', 0.86),
     ]; } } });
-    const r = await getTaskContext({ project: 'demo', task: 'list members', files: ['src/webapp/core/settings/users/router.ts'] }, d);
+    const r = await getTaskContext({ project: 'demo', task: 'list members', files: ['src/portal/main/settings/users/router.ts'] }, d);
     expect(asked).toBeGreaterThan(4);
     expect(r.misses.map((m) => m.missId)).toEqual(['mw']);
   });
@@ -1231,9 +1258,17 @@ index 3b18e51..a9c4f2d 100644
       t.signal?.addEventListener('abort', () => reject(t.signal!.reason));
     }) });
     const d = withLessons({ judge: slow, judgeQueue });
-    const t = Date.now();
-    const r = await checkBeforeDone({ project: 'demo', task: 'orders export', summary: 'added export', diff: DIFF }, d);
-    expect(Date.now() - t).toBeLessThan(1000);
+    // The 60 ms judge deadline runs on fake timers: the check answers when it passes, however busy the machine is.
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+    let r: Awaited<ReturnType<typeof checkBeforeDone>>;
+    try {
+      const pending = checkBeforeDone({ project: 'demo', task: 'orders export', summary: 'added export', diff: DIFF }, d);
+      await vi.advanceTimersByTimeAsync(60);
+      await nextTurn();
+      r = await pending;
+    } finally {
+      vi.useRealTimers();
+    }
     expect(r.markdown).toMatch(/^# Not judged: the judge did not answer within 0 s/);
     expect(d.checks).toHaveLength(1);
   expect(d.checks[0]).toMatchObject({ status: expect.stringMatching(/queued|failed/) });

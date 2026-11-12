@@ -2,6 +2,7 @@ import { conditionalWrite } from './conditionalWrite.ts';
 import {
   codeGraphViews,
   normalizeCodeMap,
+  redactSecrets,
   type Cause,
   type CodeGraphReads,
   type CodeGraphStore,
@@ -36,6 +37,9 @@ type Row = Record<string, any>;
  * the cap are code_files rows with in_index (0026): their columns and edges, no symbols. Text is ordered with
  * COLLATE "C" to match Neo4j's code-point order.
  */
+/** A C# file's namespaces as one text (a namespace has no line break), for unnest; null for any other file. */
+const joinNamespaces = (f: MapFile) => (f.namespaces ? f.namespaces.join('\n') : null);
+
 export class PgCodeGraphStore implements CodeGraphStore {
   readonly db: Db;
   private readonly views: ReturnType<typeof codeGraphViews>;
@@ -75,13 +79,13 @@ export class PgCodeGraphStore implements CodeGraphStore {
       await c.query('DELETE FROM code_imports WHERE project_key = $1', [key]);
       await c.query('DELETE FROM code_symbols WHERE project_key = $1', [key]);
       await c.query(
-        `UPDATE code_files SET in_map = false, lang = NULL, code_hash = NULL, loc = NULL, is_test = false,
+        `UPDATE code_files SET in_map = false, lang = NULL, code_hash = NULL, cs_namespaces = NULL, loc = NULL, is_test = false,
                 churn_commits = NULL, churn_last_ts = NULL, mapped_at = NULL
          WHERE project_key = $1 AND in_map AND NOT (path = ANY($2::text[]))`,
         [key, map.files.map((f) => f.path)],
       );
       await c.query(
-        `UPDATE code_files SET in_index = false, lang = NULL, code_hash = NULL, loc = NULL, is_test = false, mapped_at = NULL
+        `UPDATE code_files SET in_index = false, lang = NULL, code_hash = NULL, cs_namespaces = NULL, loc = NULL, is_test = false, mapped_at = NULL
          WHERE project_key = $1 AND in_index AND NOT (path = ANY($2::text[]))`,
         [key, map.outside.map((f) => f.path)],
       );
@@ -94,30 +98,31 @@ export class PgCodeGraphStore implements CodeGraphStore {
         [key, [...map.files, ...map.outside].map((f) => f.path)],
       );
       await c.query(
-        `INSERT INTO code_files (id, project_key, path, removed, in_map, lang, code_hash, loc, is_test, churn_commits, churn_last_ts, mapped_at)
-         SELECT f.id, $1, f.path, false, true, f.lang, f.hash, f.loc, f.is_test, f.churn, f.last_ts, $2
-         FROM unnest($3::text[], $4::text[], $5::text[], $6::text[], $7::int[], $8::boolean[], $9::int[], $10::text[])
-              AS f(id, path, lang, hash, loc, is_test, churn, last_ts)
+        `INSERT INTO code_files (id, project_key, path, removed, in_map, lang, code_hash, loc, is_test, churn_commits, churn_last_ts, mapped_at, cs_namespaces)
+         SELECT f.id, $1, f.path, false, true, f.lang, f.hash, f.loc, f.is_test, f.churn, f.last_ts, $2, string_to_array(f.ns, E'\\n')
+         FROM unnest($3::text[], $4::text[], $5::text[], $6::text[], $7::int[], $8::boolean[], $9::int[], $10::text[], $11::text[])
+              AS f(id, path, lang, hash, loc, is_test, churn, last_ts, ns)
          ON CONFLICT (id) DO UPDATE SET in_map = true, in_index = false, lang = EXCLUDED.lang, code_hash = EXCLUDED.code_hash, loc = EXCLUDED.loc,
            is_test = EXCLUDED.is_test, churn_commits = EXCLUDED.churn_commits, churn_last_ts = EXCLUDED.churn_last_ts,
-           mapped_at = EXCLUDED.mapped_at`,
+           mapped_at = EXCLUDED.mapped_at, cs_namespaces = EXCLUDED.cs_namespaces`,
         [
           key, now,
           map.files.map((f) => id(f.path)), map.files.map((f) => f.path), map.files.map((f) => f.lang), map.files.map((f) => f.hash),
           map.files.map((f) => f.loc), map.files.map((f) => f.isTest),
           map.files.map((f) => map.churn[f.path]?.commits ?? null), map.files.map((f) => map.churn[f.path]?.lastTs ?? null),
+          map.files.map(joinNamespaces),
         ],
       );
       await c.query(
-        `INSERT INTO code_files (id, project_key, path, removed, in_map, in_index, lang, code_hash, loc, is_test, mapped_at)
-         SELECT f.id, $1, f.path, false, false, true, f.lang, f.hash, f.loc, f.is_test, $2
-         FROM unnest($3::text[], $4::text[], $5::text[], $6::text[], $7::int[], $8::boolean[]) AS f(id, path, lang, hash, loc, is_test)
+        `INSERT INTO code_files (id, project_key, path, removed, in_map, in_index, lang, code_hash, loc, is_test, mapped_at, cs_namespaces)
+         SELECT f.id, $1, f.path, false, false, true, f.lang, f.hash, f.loc, f.is_test, $2, string_to_array(f.ns, E'\\n')
+         FROM unnest($3::text[], $4::text[], $5::text[], $6::text[], $7::int[], $8::boolean[], $9::text[]) AS f(id, path, lang, hash, loc, is_test, ns)
          ON CONFLICT (id) DO UPDATE SET in_map = false, in_index = true, lang = EXCLUDED.lang, code_hash = EXCLUDED.code_hash, loc = EXCLUDED.loc,
-           is_test = EXCLUDED.is_test, churn_commits = NULL, churn_last_ts = NULL, mapped_at = EXCLUDED.mapped_at`,
+           is_test = EXCLUDED.is_test, churn_commits = NULL, churn_last_ts = NULL, mapped_at = EXCLUDED.mapped_at, cs_namespaces = EXCLUDED.cs_namespaces`,
         [
           key, now,
           map.outside.map((f) => id(f.path)), map.outside.map((f) => f.path), map.outside.map((f) => f.lang), map.outside.map((f) => f.hash),
-          map.outside.map((f) => f.loc), map.outside.map((f) => f.isTest),
+          map.outside.map((f) => f.loc), map.outside.map((f) => f.isTest), map.outside.map(joinNamespaces),
         ],
       );
       await c.query(
@@ -156,11 +161,12 @@ export class PgCodeGraphStore implements CodeGraphStore {
     return map.stats;
   }
 
+  async markCodeMapChecked(projectKey: string, now = new Date()): Promise<void> {
+    await this.q('UPDATE code_maps SET checked_at = $2 WHERE project_key = $1', [projectKey, now]);
+  }
+
   async recordCodeMapFailure(projectKey: string, error: string, now = new Date()): Promise<void> {
-    await this.q(`INSERT INTO code_maps (project_key, built_at, files, symbols, imports, tests, last_failure_at, last_failure)
-      VALUES ($1, $2, 0, 0, 0, 0, $2, $3)
-      ON CONFLICT (project_key) DO UPDATE SET last_failure_at = EXCLUDED.last_failure_at, last_failure = EXCLUDED.last_failure`,
-      [projectKey, now, error.slice(0, 500)]);
+    await this.q('UPDATE code_maps SET last_failure_at = $2, last_failure = $3 WHERE project_key = $1', [projectKey, now, redactSecrets(error).slice(0, 500)]);
   }
 
   async purgeOrphanCodeFiles(limit: number, now = new Date()): Promise<number> {
@@ -182,7 +188,7 @@ export class PgCodeGraphStore implements CodeGraphStore {
         for (const table of ['code_symbols', 'code_imports', 'code_tests']) {
           await c.query(`DELETE FROM ${table} WHERE ctid IN (SELECT ctid FROM ${table} WHERE project_key = $1 LIMIT $2)`, [key, batch]);
         }
-        await c.query(`UPDATE code_files SET in_map = false, in_index = false, mapped_at = NULL, code_hash = NULL,
+        await c.query(`UPDATE code_files SET in_map = false, in_index = false, mapped_at = NULL, code_hash = NULL, cs_namespaces = NULL,
           lang = NULL, loc = NULL, is_test = false, churn_commits = NULL, churn_last_ts = NULL
           WHERE id IN (SELECT id FROM code_files WHERE project_key = $1 AND (in_map OR in_index OR code_hash IS NOT NULL) LIMIT $2)`, [key, batch]);
         await c.query(`DELETE FROM code_maps WHERE project_key = $1
@@ -215,7 +221,7 @@ export class PgCodeGraphStore implements CodeGraphStore {
       for (;;) { const result = await this.q(`DELETE FROM ${table} WHERE ctid IN (SELECT ctid FROM ${table} WHERE project_key = $1 LIMIT 250)`, [projectKey]); if ((result.rowCount ?? 0) < 250) break; }
     }
     for (;;) {
-      const result = await this.q(`UPDATE code_files SET in_map = false, in_index = false, mapped_at = NULL, code_hash = NULL,
+      const result = await this.q(`UPDATE code_files SET in_map = false, in_index = false, mapped_at = NULL, code_hash = NULL, cs_namespaces = NULL,
         lang = NULL, loc = NULL, is_test = false, churn_commits = NULL, churn_last_ts = NULL
         WHERE id IN (SELECT id FROM code_files WHERE project_key = $1 AND (in_map OR in_index OR code_hash IS NOT NULL) LIMIT 250)`, [projectKey]);
       if ((result.rowCount ?? 0) < 250) break;
@@ -242,7 +248,8 @@ export class PgCodeGraphStore implements CodeGraphStore {
   async codeMapMeta(projectKey: string): Promise<CodeMapMeta | null> {
     const { rows: [m] } = await this.q('SELECT * FROM code_maps WHERE project_key = $1', [projectKey]);
     if (!m) return null;
-    return { fingerprint: m.fingerprint ?? null, builtAt: iso(m.built_at)!, stats: { files: m.files, symbols: m.symbols, imports: m.imports, tests: m.tests }, candidates: m.candidates ?? null, unresolved: m.unresolved ?? null, version: m.version ?? null, lastFailureAt: iso(m.last_failure_at), lastFailure: m.last_failure ?? null };
+    const checked = m.checked_at && m.checked_at > m.built_at ? m.checked_at : m.built_at;
+    return { fingerprint: m.fingerprint ?? null, builtAt: iso(m.built_at)!, checkedAt: iso(checked)!, stats: { files: m.files, symbols: m.symbols, imports: m.imports, tests: m.tests }, candidates: m.candidates ?? null, unresolved: m.unresolved ?? null, version: m.version ?? null, lastFailureAt: iso(m.last_failure_at), lastFailure: m.last_failure ?? null };
   }
 
   async codeMap(projectKey: string): Promise<StoredCodeMap | null> {
@@ -317,10 +324,6 @@ export class PgCodeGraphStore implements CodeGraphStore {
     return this.views.lessonsForPaths(projectKey, paths, run ?? null);
   }
 
-  outsideMap(projectKey: string, paths: string[]) {
-    return this.views.outsideMap(projectKey, paths);
-  }
-
   /** The export's per-file view of a project's map. */
   exportFiles(projectKey: string) {
     return this.views.exportFiles(projectKey);
@@ -332,7 +335,7 @@ export class PgCodeGraphStore implements CodeGraphStore {
   private async mapFiles(projectKey: string, paths?: string[], mark: 'in_map' | 'in_index' = 'in_map'): Promise<(MapFile & { churn: FileChurn | null })[]> {
     if (paths && !paths.length) return [];
     const { rows } = await this.q(
-      `SELECT path, lang, code_hash, loc, is_test, churn_commits, churn_last_ts FROM code_files
+      `SELECT path, lang, code_hash, loc, is_test, churn_commits, churn_last_ts, cs_namespaces FROM code_files
        WHERE project_key = $1 AND ${mark} AND ($2::text[] IS NULL OR path = ANY($2::text[]))
        ORDER BY path COLLATE "C"`,
       [projectKey, paths ?? null],
@@ -343,6 +346,7 @@ export class PgCodeGraphStore implements CodeGraphStore {
       hash: f.code_hash,
       loc: f.loc,
       isTest: f.is_test,
+      ...(f.cs_namespaces != null && { namespaces: f.cs_namespaces as string[] }),
       churn: f.churn_commits == null ? null : { commits: f.churn_commits, lastTs: f.churn_last_ts },
     }));
   }

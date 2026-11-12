@@ -195,3 +195,40 @@ test('every summarized dependency fact keeps its original, past the listing cap 
   expect(new Set(originals.map((s) => s.id)).size).toBe(120);
   expect(originals.every((s) => s.original?.startsWith('Dependencies: react ^18, '))).toBe(true);
 });
+
+test('facts that all still hold are stamped without an Activity entry, also when the last batch is exactly full', async () => {
+  const dir = repo();
+  const facts = [stored('src/pool.ts', '`createPool` returns a pool', '2-4'), stored('src/pool.ts', '`MAX_CLIENTS` is 10', '5')];
+  const { facts: store, applied } = fakeStore(facts);
+  const activity: ActivityInput[] = [];
+  const logged: [string, object | undefined][] = [];
+  const r = await recheckFacts({
+    facts: store, projects: async () => [{ key: 'demo', repoPath: dir }], maxBytes: 80_000, batch: 2,
+    activity: { record: async (a) => { activity.push(a); } }, log: (m, e) => logged.push([m, e]),
+  });
+  expect(r).toEqual({ checked: 2, closed: 0, linesDropped: 0, shortened: 0, recalibrated: 0 });
+  expect(applied.map((c) => [c.keep, c.lines, c.evidence])).toEqual([[true, '2-4', 'line'], [true, '5', 'line']]);
+  expect(activity).toEqual([]);
+  expect(logged).toEqual([]);
+});
+
+test('a project where only relevance was calibrated is logged as such; a short dependency list is not reworded', async () => {
+  const dir = repo();
+  const facts = [
+    stored('package.json', 'Dependencies (2): react ^18, vite ^5.', null, { kind: 'dependency', origin: 'manifest', relevance: null, relevanceBy: null }),
+    ...Array.from({ length: 6 }, (_, i) => stored('src/pool.ts', `\`createPool\` rule ${i}`, null, { kind: 'convention', relevance: 0.9 })),
+  ];
+  const { facts: store, applied } = fakeStore(facts);
+  const activity: ActivityInput[] = [];
+  const logged: [string, object | undefined][] = [];
+  const r = await recheckFacts({
+    facts: { ...store, setFactRelevance: async (u) => u.length },
+    projects: async () => [{ key: 'demo', repoPath: dir }], maxBytes: 80_000,
+    activity: { record: async (a) => { activity.push(a); } }, log: (m, e) => logged.push([m, e]),
+  });
+  expect(applied.find((c) => c.id === facts[0].id)!.statement).toBeUndefined();
+  expect(r.shortened).toBe(0);
+  expect(r.recalibrated).toBeGreaterThan(0);
+  expect(activity.map((a) => a.subject)).toEqual([`rechecked 7 facts of demo: 0 closed, 0 lost their line range, ${r.recalibrated} relevance scores calibrated`]);
+  expect(logged).toEqual([['facts rechecked', { project: 'demo', checked: 7, closed: 0, linesDropped: 0, shortened: 0, recalibrated: r.recalibrated }]]);
+});

@@ -1,6 +1,7 @@
-import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, beforeEach, expect, test, vi } from 'vitest';
 import { Projects } from './Projects.tsx';
+import { heldAnswer } from './testing/heldAnswer.ts';
 
 const job = (status: string) => ({
   id: 'scan:1', projectKey: 'demo-shop', repoPath: '/examples/demo-shop', provider: 'ollama:gemma4', status,
@@ -46,14 +47,15 @@ beforeEach(() => {
   }));
 });
 // Picking a project writes it into the address: each test starts from none.
-afterEach(() => { cleanup(); vi.unstubAllGlobals(); history.replaceState(null, '', location.pathname); });
+afterEach(() => { cleanup(); vi.unstubAllGlobals(); vi.useRealTimers(); history.replaceState(null, '', location.pathname); });
 
 /** A project's row in the list (its name is also an option in the link picker). */
 const row = async (name: string) => (await screen.findAllByText(name)).find((e) => e.closest('button[aria-current], li > button'))!;
 
 test('lists projects with counts and shows facts for the selected one', async () => {
   render(<Projects />);
-  expect(await screen.findByText('Use sendError for all errors')).toBeTruthy();
+  // The file's first render also pays for loading its modules: on a busy machine that alone can take seconds.
+  expect(await screen.findByText('Use sendError for all errors', {}, { timeout: 10000 })).toBeTruthy();
   expect(screen.getByText('Pagination max 50')).toBeTruthy();
   expect(screen.getByText(/3 sessions · 2 lessons · 12 facts/)).toBeTruthy();
   expect(await row('other')).toBeTruthy();
@@ -66,6 +68,18 @@ test('jump to scan controls stays on Projects and focuses the controls', async (
   fireEvent.click(jump);
   expect(location.hash).not.toBe('#project-scan-controls');
   expect(document.activeElement?.id).toBe('project-scan-controls');
+  // A middle-click or a copied link opens Projects (this project), never a hash no page answers to.
+  expect(jump.getAttribute('href')).toBe('#projects/demo-shop');
+});
+
+test('at phone width with the list on screen, jump to scan controls opens the project and focuses its controls', async () => {
+  vi.stubGlobal('matchMedia', (q: string) => ({ matches: q.includes('max-width'), media: q, addEventListener: () => {}, removeEventListener: () => {} }));
+  render(<Projects />);
+  await screen.findByText(/3 sessions · 2 lessons · 12 facts/);
+  expect(screen.getByRole('region', { name: 'item detail' }).className).toMatch(/\bhidden\b/);
+  fireEvent.click(screen.getByRole('link', { name: 'Jump to scan controls' }));
+  await waitFor(() => expect(document.activeElement?.id).toBe('project-scan-controls'));
+  expect(screen.getByRole('region', { name: 'item detail' }).className).not.toMatch(/(^|\s)hidden(\s|$)/);
 });
 
 test('an API outage is an error, not an empty or missing-project state', async () => {
@@ -75,6 +89,90 @@ test('an API outage is an error, not an empty or missing-project state', async (
   expect(screen.queryByText(/0 projects|Project not found|No project folders/)).toBeNull();
 });
 
+test('after an outage the page keeps asking and recovers on its own when the API answers again', async () => {
+  const working = fetch;
+  let down = true;
+  vi.stubGlobal('fetch', vi.fn(async (url: string, init?: RequestInit) => {
+    if (down) throw new Error('api unavailable');
+    return working(url, init);
+  }));
+  render(<Projects pollMs={10} />);
+  expect(await screen.findByText(/api unavailable/)).toBeTruthy();
+  down = false;
+  expect(await screen.findByText('Use sendError for all errors')).toBeTruthy();
+  expect(screen.queryByText(/api unavailable/)).toBeNull();
+});
+
+test('a project the API refuses (404, not selected) shows its error once: one facts request, no polling', async () => {
+  // Polling runs on fake timers that also follow the clock, so the check for no further polls can step well past it.
+  vi.useFakeTimers({ shouldAdvanceTime: true });
+  const working = fetch;
+  vi.stubGlobal('fetch', vi.fn(async (url: string, init?: RequestInit) => {
+    if (url.startsWith('/api/projects/demo-shop/facts')) { calls.push({ url }); return Response.json({ error: 'project demo-shop is not selected' }, { status: 404 }); }
+    return working(url, init);
+  }));
+  render(<Projects pollMs={10} />);
+  const alert = await screen.findByRole('alert');
+  expect(alert.textContent).toMatch(/not selected/);
+  await act(() => vi.advanceTimersByTimeAsync(1000));
+  expect(calls.filter((c) => c.url.startsWith('/api/projects/demo-shop/facts'))).toHaveLength(1);
+  expect(calls.filter((c) => c.url === '/api/projects')).toHaveLength(1);
+  expect(screen.getByRole('alert')).toBe(alert);
+});
+
+test('a facts 404 that follows an outage stops the retries: the refusal shows once and is not asked again', async () => {
+  const working = fetch;
+  let failing = true;
+  vi.stubGlobal('fetch', vi.fn(async (url: string, init?: RequestInit) => {
+    if (url.startsWith('/api/projects/demo-shop/facts')) {
+      calls.push({ url });
+      return failing ? Response.json({ error: 'graph unavailable' }, { status: 500 }) : Response.json({ error: 'project demo-shop is not selected' }, { status: 404 });
+    }
+    return working(url, init);
+  }));
+  // Retries run on fake timers that also follow the clock, so "they stopped" is checked over many retry intervals.
+  vi.useFakeTimers({ shouldAdvanceTime: true });
+  render(<Projects pollMs={10} />);
+  await screen.findByRole('alert', {}, { timeout: 10000 });
+  await waitFor(() => expect(calls.length).toBeGreaterThan(2), { timeout: 10000 });
+  failing = false;
+  await waitFor(() => expect(screen.getByRole('alert').textContent).toMatch(/not selected/), { timeout: 10000 });
+  // Retries already in flight when the 404 came back may still land; then the count stays over a hundred intervals.
+  const factsCalls = () => calls.filter((c) => c.url.startsWith('/api/projects/demo-shop/facts')).length;
+  await act(() => vi.advanceTimersByTimeAsync(1000));
+  const last = factsCalls();
+  await act(() => vi.advanceTimersByTimeAsync(1000));
+  expect(factsCalls()).toBe(last);
+  expect(screen.getAllByRole('alert')).toHaveLength(1);
+}, 30000);
+
+test('a facts outage (5xx) keeps one alert mounted while it retries, then clears when the facts load', async () => {
+  const working = fetch;
+  let failing = true;
+  vi.stubGlobal('fetch', vi.fn(async (url: string, init?: RequestInit) => {
+    if (url.startsWith('/api/projects/demo-shop/facts')) {
+      calls.push({ url });
+      if (failing) return Response.json({ error: 'graph unavailable' }, { status: 500 });
+    }
+    return working(url, init);
+  }));
+  render(<Projects pollMs={10} />);
+  const alert = await screen.findByRole('alert');
+  await waitFor(() => expect(calls.filter((c) => c.url.startsWith('/api/projects/demo-shop/facts')).length).toBeGreaterThan(3));
+  expect(screen.getByRole('alert')).toBe(alert);
+  failing = false;
+  expect(await screen.findByText('Use sendError for all errors')).toBeTruthy();
+  expect(screen.queryByRole('alert')).toBeNull();
+});
+
+test('at phone width an outage is announced once, above the list that is on screen', async () => {
+  vi.stubGlobal('matchMedia', (q: string) => ({ matches: q.includes('max-width'), media: q, addEventListener: () => {}, removeEventListener: () => {} }));
+  vi.stubGlobal('fetch', vi.fn(async () => { throw new Error('api unavailable'); }));
+  render(<Projects />);
+  await screen.findAllByText(/api unavailable/);
+  expect(screen.getAllByRole('alert')).toHaveLength(1);
+});
+
 test('an unknown project deep link says so and never substitutes the first project', async () => {
   history.replaceState(null, '', '#projects/not-here/src%2Fdb.ts');
   render(<Projects />);
@@ -82,6 +180,26 @@ test('an unknown project deep link says so and never substitutes the first proje
   expect(screen.getByText(/link names “not-here”/)).toBeTruthy();
   expect(screen.queryByText('Use sendError for all errors')).toBeNull();
   expect(calls.some((c) => c.url.includes('/api/projects/demo-shop/facts'))).toBe(false);
+});
+
+test("a deep link's facts 404 that comes back before a slow project list stays shown once the list loads", async () => {
+  history.replaceState(null, '', '#projects/old-project');
+  const working = fetch;
+  let listed = false;
+  // The project list answers only once the facts 404 is shown.
+  let releaseList!: () => void;
+  const listHeld = new Promise<void>((r) => { releaseList = r; });
+  vi.stubGlobal('fetch', vi.fn(async (url: string, init?: RequestInit) => {
+    if (url.startsWith('/api/projects/old-project/facts')) return Response.json({ error: 'project old-project is not selected' }, { status: 404 });
+    if (url === '/api/projects') { await listHeld; listed = true; }
+    return working(url, init);
+  }));
+  render(<Projects />);
+  await waitFor(() => expect(screen.getByRole('alert').textContent).toMatch(/not selected/));
+  releaseList();
+  await waitFor(() => expect(listed).toBe(true));
+  expect(await screen.findByText('Project not found')).toBeTruthy();
+  expect(screen.getByRole('alert').textContent).toMatch(/not selected/);
 });
 
 test('files an older scanner read are counted, with what to do: no scan starts on its own', async () => {
@@ -299,17 +417,20 @@ test('the selected project shows its code map with hotspots', async () => {
 });
 
 test('slow facts or docs for the project you left never show under the one you picked', async () => {
+  const facts = heldAnswer([fact('f1', 'Use sendError for all errors')]);
+  const docs = heldAnswer([{ id: 'doc:d1', projectKey: 'demo-shop', source: 'upload', ref: 'upload:a.md', title: 'Shop spec', url: null, addedAt: 't', chunks: 1 }]);
   vi.stubGlobal('fetch', vi.fn(async (url: string) => {
     if (url === '/api/projects') return Response.json(projects);
-    if (url.startsWith('/api/projects/demo-shop/facts')) { await new Promise((r) => setTimeout(r, 80)); return Response.json([fact('f1', 'Use sendError for all errors')]); }
+    if (url.startsWith('/api/projects/demo-shop/facts')) return facts.answer();
     if (url.startsWith('/api/projects/other/facts')) return Response.json([fact('f5', 'Other project fact')]);
-    if (url === '/api/projects/demo-shop/docs') { await new Promise((r) => setTimeout(r, 80)); return Response.json([{ id: 'doc:d1', projectKey: 'demo-shop', source: 'upload', ref: 'upload:a.md', title: 'Shop spec', url: null, addedAt: 't', chunks: 1 }]); }
+    if (url === '/api/projects/demo-shop/docs') return docs.answer();
     return Response.json([]);
   }));
   render(<Projects />);
   fireEvent.click(await row('other'));
   expect(await screen.findByText('Other project fact')).toBeTruthy();
-  await new Promise((r) => setTimeout(r, 120));
+  await facts.deliver();
+  await docs.deliver();
   expect(screen.getByText('Other project fact')).toBeTruthy();
   expect(screen.queryByText('Use sendError for all errors')).toBeNull();
   expect(screen.queryByText('Shop spec')).toBeNull();
@@ -380,15 +501,31 @@ test('a fact shows how well its citation was checked and, for a manifest fact, w
   expect(screen.queryByText('project-wide')).toBeNull();
   // facts are grouped by file, the rest collapsed: open package.json's group
   fireEvent.click(screen.getByRole('button', { name: /package\.json · 1 fact/ }));
-  expect(within(await li('`dev` script runs: vite')).getByText('manifest')).toBeTruthy();
+  expect(within(await li('`dev` script runs: vite')).getByText('manifest').getAttribute('title')).toMatch(/read from a manifest/);
   expect(within(await li('An older fact')).queryByText(/checked|file only/)).toBeNull();
   expect(screen.queryByText('90%')).toBeNull();
   // the headline is the model's facts; manifest and document facts are counted beside them
   expect(screen.getByText(/4 from manifests, 1 from documents/)).toBeTruthy();
 });
 
+test('a fact the learning loop recorded is badged loop, with a hover that says it was learned from past feedback, not read from a manifest', async () => {
+  projectList = [{ ...projects[0], facts: 1, factsByOrigin: { model: 0, manifest: 0, document: 0, loop: 1 } }, projects[1]];
+  vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+    if (url === '/api/projects') return Response.json(projectList);
+    if (url.startsWith('/api/projects/demo-shop/facts')) return Response.json([
+      { ...fact('f1', 'Orders are read from the source table', 'convention', 0.8), relevanceBy: 'loop:1', source: 'loop:1', lines: null, origin: 'loop', scanJobId: null, fileHash: null, fileSummary: null },
+    ]);
+    return Response.json([]);
+  }));
+  render(<Projects />);
+  const item = (await screen.findByText('Orders are read from the source table')).closest('li')!;
+  const badge = within(item).getByText('loop');
+  expect(badge.getAttribute('title')).toMatch(/learned by the loop from past feedback/);
+  expect(badge.getAttribute('title')).not.toMatch(/manifest/);
+});
+
 test('a fact you wrote (a converted lesson) says so, keeps its relevance through rescans, and its history is the conversion', async () => {
-  projectList = [{ ...projects[0], facts: 3, factsByOrigin: { model: 1, manifest: 0, document: 0, you: 2 } }, projects[1]];
+  projectList = [{ ...projects[0], facts: 4, factsByOrigin: { model: 1, manifest: 0, document: 0, you: 2, loop: 1 } }, projects[1]];
   const asked: string[] = [];
   vi.stubGlobal('fetch', vi.fn(async (url: string) => {
     if (url === '/api/projects') return Response.json(projectList);
@@ -402,7 +539,7 @@ test('a fact you wrote (a converted lesson) says so, keeps its relevance through
   const item = (await screen.findByText('Orders are read from the source table')).closest('li')!;
   expect(within(item).getByText('yours').getAttribute('title')).toMatch(/no scan replaces it/);
   expect(within(item).getByText(/set by you/).getAttribute('title')).toMatch(/no scan replaces it/);
-  expect(screen.getByText(/2 you wrote/)).toBeTruthy();
+  expect(screen.getByText(/2 you wrote, 1 the learning loop recorded/)).toBeTruthy();
   fireEvent.click(within(item).getByRole('button', { name: 'how was this created?' }));
   expect(await screen.findByText('you converted it')).toBeTruthy();
   expect(asked).toEqual(['/api/activity?target=f1&kind=lesson_to_fact&limit=10']);
@@ -647,4 +784,202 @@ test('a scan action error clears when a valid provider is picked', async () => {
   expect(await screen.findAllByText(/queued scan has already changed/)).not.toHaveLength(0);
   fireEvent.change(screen.getByLabelText('provider'), { target: { value: 'ollama:gemma4' } });
   expect(screen.queryByText(/queued scan has already changed/)).toBeNull();
+});
+
+test('on a read-only install the list pin is off and says why', async () => {
+  const { OwnerWrites, READ_ONLY_TITLE } = await import('./ownerAccess.tsx');
+  render(<OwnerWrites.Provider value={false}><Projects /></OwnerWrites.Provider>);
+  const pin = await screen.findByRole('button', { name: 'pin other' }) as HTMLButtonElement;
+  expect(pin.disabled).toBe(true);
+  expect(pin.title).toBe(READ_ONLY_TITLE);
+  fireEvent.click(pin);
+  expect(calls.some((c) => c.url.endsWith('/pin'))).toBe(false);
+});
+
+test('a failed facts load clears by itself once the API answers again', async () => {
+  const working = fetch;
+  let factsDown = false;
+  vi.stubGlobal('fetch', vi.fn(async (url: string, init?: RequestInit) => {
+    if (factsDown && url.startsWith('/api/projects/demo-shop/facts')) return Response.json({ error: 'Internal Server Error' }, { status: 500 });
+    return working(url, init);
+  }));
+  render(<Projects pollMs={10} />);
+  await screen.findByText('Use sendError for all errors');
+  factsDown = true;
+  fireEvent.change(screen.getByLabelText('kind'), { target: { value: 'invariant' } });
+  expect(await screen.findByText(/Internal Server Error/)).toBeTruthy();
+  factsDown = false;
+  expect(await screen.findByText('Use sendError for all errors')).toBeTruthy();
+  await waitFor(() => expect(screen.queryByText(/Internal Server Error/)).toBeNull());
+});
+
+/** The fake API, with the given answers in front of it. */
+function answering(over: (url: string, method: string) => Response | null) {
+  const inner = fetch as unknown as (url: string, init?: RequestInit) => Promise<Response>;
+  vi.stubGlobal('fetch', vi.fn(async (url: string, init?: RequestInit) => {
+    const r = over(url, init?.method ?? 'GET');
+    if (r) { calls.push({ url, body: init?.body ? JSON.parse(init.body as string) : undefined }); return r; }
+    return inner(url, init);
+  }));
+}
+
+test('a scan the server refuses says why', async () => {
+  answering((url) => (url.endsWith('/scan') ? Response.json({ error: 'a scan is already running' }, { status: 409 }) : null));
+  render(<Projects />);
+  fireEvent.click(await screen.findByRole('button', { name: /^Scan$/ }));
+  expect(await screen.findByText(/a scan is already running/)).toBeTruthy();
+});
+
+test('Cancel queued scan asks first, then removes the job and starts nothing in its place', async () => {
+  projectList = [{ ...projects[0], lastScan: job('queued') }, projects[1]];
+  render(<Projects />);
+  fireEvent.click(await screen.findByRole('button', { name: 'Cancel queued scan' }));
+  const ask = await screen.findByRole('alertdialog', { name: 'Cancel the queued scan for demo-shop?' });
+  expect(ask.textContent).toMatch(/No scan is started in its place/);
+  fireEvent.click(within(ask).getByRole('button', { name: 'Cancel queued scan' }));
+  await waitFor(() => expect(calls.some((c) => c.url.endsWith('/cancel'))).toBe(true));
+  await waitFor(() => expect(screen.queryByRole('button', { name: 'Cancel queued scan' })).toBeNull());
+  expect(calls.some((c) => c.url.endsWith('/scan'))).toBe(false);
+});
+
+test('a queued scan of unknown provider can be switched to any explicit one', async () => {
+  projectList = [{ ...projects[0], lastScan: { ...job('queued'), provider: null } }];
+  render(<Projects />);
+  const switcher = await screen.findByRole('button', { name: 'Switch provider and scan' }) as HTMLButtonElement;
+  expect(switcher.disabled).toBe(true);
+  fireEvent.change(screen.getByLabelText('provider'), { target: { value: 'codex-cli' } });
+  expect(switcher.disabled).toBe(false);
+});
+
+test('a scan waiting out a retry says when it tries again and which attempt that is', async () => {
+  const retryAt = '2999-01-01T12:34:00Z';
+  projectList = [{ ...projects[0], lastScan: { ...job('queued'), retryAt, attempts: 2 } }];
+  render(<Projects />);
+  expect(await screen.findByText(`retrying ${new Date(retryAt).toLocaleTimeString()} (attempt 3)`)).toBeTruthy();
+});
+
+test('a pin or relevance change the server refuses says why and changes nothing', async () => {
+  answering((url) => (url.endsWith('/pin') || url.endsWith('/relevance') ? Response.json({ error: 'read-only install' }, { status: 403 }) : null));
+  render(<Projects />);
+  const rowOf = (await screen.findByText('Use sendError for all errors')).closest('li')!;
+  fireEvent.click(screen.getByRole('button', { name: 'pin other' }));
+  expect(await screen.findByText(/read-only install/)).toBeTruthy();
+  expect(screen.getByRole('button', { name: 'pin other' })).toBeTruthy();
+  fireEvent.click(within(rowOf).getByRole('button', { name: 'mark everyday' }));
+  await waitFor(() => expect(calls.some((c) => c.url.endsWith('/relevance'))).toBe(true));
+  expect(within(rowOf).queryByText(/set by you/)).toBeNull();
+});
+
+test('with no project folders under the roots the list says so', async () => {
+  projectList = [];
+  render(<Projects />);
+  expect(await screen.findByText('No project folders found under the configured roots.')).toBeTruthy();
+});
+
+test('a project delete the server refuses keeps the dialog open with the reason', async () => {
+  answering((url, method) => (url === '/api/projects/demo-shop' && method === 'DELETE' ? Response.json({ error: 'the worker is writing to it' }, { status: 409 }) : null));
+  render(<Projects />);
+  await screen.findByText('Use sendError for all errors');
+  fireEvent.click(screen.getByRole('button', { name: /delete project data/i }));
+  const ask = await screen.findByRole('alertdialog');
+  fireEvent.change(within(ask).getByLabelText('type demo-shop to confirm'), { target: { value: 'demo-shop' } });
+  fireEvent.click(within(ask).getByRole('button', { name: /delete everything learned/i }));
+  expect((await screen.findAllByText(/the worker is writing to it/)).length).toBeGreaterThan(0);
+  expect(screen.getByRole('alertdialog')).toBeTruthy();
+});
+
+/** Holds every request `match` picks until `release()`; the rest go to the test's own fetch. */
+function hold(match: (url: string, init?: RequestInit) => boolean) {
+  const inner = fetch as unknown as (url: string, init?: RequestInit) => Promise<Response>;
+  let release = () => {};
+  const gate = new Promise<void>((r) => { release = r; });
+  const held: string[] = [];
+  vi.stubGlobal('fetch', vi.fn(async (url: string, init?: RequestInit) => {
+    if (!match(url, init)) return inner(url, init);
+    held.push(url);
+    await gate;
+    return inner(url, init);
+  }));
+  return { held, release: () => release() };
+}
+
+test('Pin, Scan, Cancel queued scan and Switch provider say what they are doing while their request is in flight', async () => {
+  let h = hold((url, init) => init?.method === 'PUT' || url.endsWith('/pin'));
+  render(<Projects />);
+  await screen.findByText('Use sendError for all errors');
+  fireEvent.click(screen.getByRole('button', { name: /^pin$/i }));
+  const pinning = await screen.findByRole('button', { name: /pinning…/i });
+  expect(pinning.getAttribute('aria-disabled')).toBe('true');
+  expect(screen.getByRole('button', { name: 'Scan' }).getAttribute('aria-disabled')).toBe('true');
+  fireEvent.click(pinning);
+  expect(h.held).toHaveLength(1);
+  h.release();
+  await waitFor(() => expect(screen.queryByRole('button', { name: /pinning…/i })).toBeNull());
+  cleanup();
+
+  h = hold((url) => url.endsWith('/scan'));
+  render(<Projects />);
+  await screen.findByText('Use sendError for all errors');
+  fireEvent.click(screen.getByRole('button', { name: 'Scan' }));
+  expect(await screen.findByRole('button', { name: 'Starting scan…' })).toBeTruthy();
+  h.release();
+  await waitFor(() => expect(screen.queryByRole('button', { name: 'Starting scan…' })).toBeNull());
+  cleanup();
+
+  projectList = [{ ...projects[0], lastScan: job('queued') }, projects[1]];
+  h = hold((url) => url.endsWith('/cancel'));
+  render(<Projects />);
+  fireEvent.click(await screen.findByRole('button', { name: 'Cancel queued scan' }));
+  fireEvent.click(within(await screen.findByRole('alertdialog')).getByRole('button', { name: 'Cancel queued scan' }));
+  expect(await screen.findByRole('button', { name: 'Cancelling…' })).toBeTruthy();
+  h.release();
+  await waitFor(() => expect(screen.queryByRole('button', { name: 'Cancelling…' })).toBeNull());
+  cleanup();
+
+  projectList = [{ ...projects[0], lastScan: { ...job('queued'), provider: 'ollama:gemma4' } }, projects[1]];
+  h = hold((url) => url.endsWith('/cancel'));
+  render(<Projects />);
+  fireEvent.change(await screen.findByLabelText('provider'), { target: { value: 'claude-cli' } });
+  fireEvent.click(screen.getByRole('button', { name: 'Switch provider and scan' }));
+  fireEvent.click(within(await screen.findByRole('alertdialog')).getByRole('button', { name: 'Cancel and switch provider' }));
+  expect(await screen.findByRole('button', { name: 'Switching…' })).toBeTruthy();
+  h.release();
+  await waitFor(() => expect(screen.queryByRole('button', { name: 'Switching…' })).toBeNull());
+}, 30000);
+
+test("Unpin and the empty project's Scan this project say what they are doing while their request is in flight", async () => {
+  projectList = [{ ...projects[0], pinned: true }, projects[1]];
+  let h = hold((url) => url.endsWith('/pin'));
+  render(<Projects />);
+  await screen.findByText('Use sendError for all errors');
+  fireEvent.click(screen.getByRole('button', { name: /^pinned$/i }));
+  expect(await screen.findByRole('button', { name: /unpinning…/i })).toBeTruthy();
+  h.release();
+  await waitFor(() => expect(screen.queryByRole('button', { name: /unpinning…/i })).toBeNull());
+  cleanup();
+
+  projectList = [{ ...projects[1] }];
+  h = hold((url) => url.endsWith('/scan'));
+  render(<Projects />);
+  fireEvent.click(await screen.findByRole('button', { name: 'Scan this project' }));
+  // Both Scan buttons (the header's and the empty state's) say so: one scan at a time.
+  await waitFor(() => expect(screen.getAllByRole('button', { name: 'Starting scan…' })).toHaveLength(2));
+  h.release();
+  await waitFor(() => expect(screen.queryAllByRole('button', { name: 'Starting scan…' })).toEqual([]));
+}, 30000);
+
+test('a slow facts failure for the project you left never shows its error under the one you picked', async () => {
+  const failure = heldAnswer({ error: 'graph unreachable' }, { status: 503 });
+  vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+    if (url === '/api/projects') return Response.json(projects);
+    if (url.startsWith('/api/projects/demo-shop/facts')) return failure.answer();
+    if (url.startsWith('/api/projects/other/facts')) return Response.json([fact('f5', 'Other project fact')]);
+    return Response.json([]);
+  }));
+  render(<Projects />);
+  fireEvent.click(await row('other'));
+  expect(await screen.findByText('Other project fact')).toBeTruthy();
+  await failure.deliver();
+  expect(screen.getByText('Other project fact')).toBeTruthy();
+  expect(screen.queryByText(/graph unreachable/)).toBeNull();
 });

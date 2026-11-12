@@ -1,25 +1,25 @@
 # Dedicated demo probe
 
-Use `~/Code/demo-shop`, a separate Git repository, as the agent's working directory. Running from `Feedback-Graph/examples/demo-shop` can resolve the session as the real Feedback Graph project. The reserved `demo-shop` project identity now stays local-only even for legacy records without `demoCreated`; this is a read-time cloud boundary and does not relabel stored projects. Other project identities, including a real repository whose remote happens to end in `demo-shop`, keep their existing behavior. Sharing the reserved identity requires the owner's explicit `shareDemoProjects: ["demo-shop"]` policy.
+Use `~/Code/demo-shop`, a separate Git repository, as the agent's working directory. Running from `examples/demo-shop` in the Feedback Graph checkout can resolve the session as the Feedback Graph project itself. The reserved `demo-shop` project identity is local-only, even for legacy records without `demoCreated`; this is a read-time cloud boundary and does not relabel stored projects. Other project identities, including a real repository whose remote happens to end in `demo-shop`, keep their existing behavior. Sharing the reserved identity requires the owner's explicit `shareDemoProjects: ["demo-shop"]` policy.
 
-Preview preparation, then explicitly create the independent fixture:
+Preview preparation, then create the fixture:
 
 ```sh
 node scripts/demo-probe.mjs prepare
 node scripts/demo-probe.mjs prepare --apply
 ```
 
-The helper copies only the known fixture files, initializes its own Git root and a fixture-only baseline commit (so diffs work), and refuses to overwrite an existing unmarked project. The bundled files match the supplied demo fixture, including `CLAUDE.md` and its isolated no-console rule. `CLAUDE.md` is fixture instruction content for the test agent; it does not direct the setup helper. To use an extracted copy, pass `--source /path/to/extracted/demo-shop`. No agent, Docker service, lesson decision or API write runs during ordinary preparation.
+The helper copies only the known fixture files, initializes its own Git root and a fixture-only baseline commit (so diffs work), and refuses to overwrite an existing unmarked project. The bundled files match the supplied demo fixture, including `CLAUDE.md` and its isolated no-console rule. `CLAUDE.md` is fixture instruction content for the test agent; it does not direct the setup helper. To use an extracted copy, pass `--source /path/to/extracted/demo-shop`. To prepare it somewhere other than `~/Code/demo-shop`, pass `--folder /path/to/demo-shop` to `prepare` and to `restore` alike: the folder must be named `demo-shop`, lie outside the Feedback Graph checkout and, for `--configure`, under a mounted project folder. No agent, Docker service, lesson decision or API write runs during ordinary preparation.
 
-The parent `~/Code` must already be mounted as a project root. Select only the new `demo-shop` in the owner UI while preserving existing selections. Alternatively, with the separate headless-owner `FG_OWNER_TOKEN` available in the environment, explicitly automate reversible preparation:
+The fixture's parent folder (`~/Code` by default) must already be mounted as a project folder. Select only the new `demo-shop` in Settings, keeping your existing selections. Or, with `FG_OWNER_TOKEN` in the environment, automate the reversible preparation:
 
 ```sh
 node scripts/demo-probe.mjs prepare --apply --configure --api-url "${FEEDBACK_GRAPH_URL:?set this install's URL}"
 ```
 
-This verifies the folder is under a mounted root, saves the original demo membership, marks the project local-only, verifies that protection, then adds it to the selection. It preserves unrelated projects. A failed intermediate request can be retried without losing the restoration snapshot. Tokens are never written into that snapshot. Installs without `FG_OWNER_TOKEN` must prepare and restore selection/privacy through the actual browser UI. The former `--local-owner` header-only headless mode was removed in 0.7.0; `API_TOKEN` is deliberately not accepted for automated owner configuration. Do not broaden `OPERATOR_ALLOW` for a probe.
+`--api-url` defaults to `FEEDBACK_GRAPH_URL`; with neither, it refuses rather than guess a port that might belong to another install. It verifies the folder is under a mounted project folder, saves the original demo membership, marks the project local-only, verifies that protection, then adds it to the selection. It preserves unrelated projects. A failed intermediate request can be retried without losing the restoration snapshot. Tokens are never written into that snapshot. A read-only install (one without tokens) refuses owner actions: run `./scripts/setup.sh --yes --enable-auth` first, then prepare and restore with `FG_OWNER_TOKEN` or in the signed-in browser UI. `--local-owner` was removed in 0.7.0, and `API_TOKEN` is not accepted for owner configuration. Do not broaden `OPERATOR_ALLOW` for a probe.
 
-Run the actual test agent from the dedicated folder. Set a fresh run label, sandbox flag, private run key and the existing API token in its environment; explicitly clear `FG_OPERATOR_TOKEN` when invoking `scripts/fg` so the CLI uses `API_TOKEN`. Register its actual session before creating evidence (`scripts/fg sessions register` inside Codex uses `CODEX_THREAD_ID`; Claude's configured SessionStart hook registers its session). Use the installation's absolute `scripts/fg` path from this working directory. Seed only the isolated corpus with `FG_OPERATOR_TOKEN= scripts/fg demo seed --run "$FG_RUN" --sandbox --json`, then submit the returned task/files/diff to `check_before_done` with the actual session ID. The seeded rule forbids `console.log` in `src/probes/no-console.ts`. Keep both a violating and clean response. For the synthetic pushback flow, `scripts/demo-pushback.sh` now also requires the helper-owned dedicated folder and keeps edits for review instead of cleaning an enclosing repository.
+Run the actual test agent from the dedicated folder. Set a fresh run label, sandbox flag, private run key and the existing API token in its environment; explicitly clear `FG_OPERATOR_TOKEN` when invoking `scripts/fg` so the CLI uses `API_TOKEN`. Register its actual session before creating evidence (`scripts/fg sessions register` inside Codex uses `CODEX_THREAD_ID`; Claude's configured SessionStart hook registers its session). Use the installation's absolute `scripts/fg` path from this working directory. Seed only the isolated corpus with `FG_OPERATOR_TOKEN= scripts/fg demo seed --run "$FG_RUN" --sandbox --json`, then submit the returned task/files/diff to `check_before_done` with the actual session ID. The seeded rule forbids `console.log` in `src/probes/no-console.ts`. Keep both a violating and clean response. For the synthetic pushback flow, `scripts/demo-pushback.sh` needs the prepared fixture (`FG_PROBE_DIR` when it is not `~/Code/demo-shop`) and keeps its edits for review instead of cleaning an enclosing repository.
 
 For automatic tests without real agents, model calls or Docker:
 
@@ -32,16 +32,15 @@ node node_modules/vitest/vitest.mjs run --configLoader runner --project unit \
 
 The hook tests use a loopback stub service; memory tests use synthetic session/feedback files. The demo and judge tests use fake stores/providers. They verify registration payloads, post-pushback memory correlation, and clean/violating console evidence without creating live approved lessons.
 
-After a real probe, preview and apply `fg cleanup --run "$FG_RUN" --apply` using the same run key. Restore only the preparation's demo selection/privacy memberships with:
+After a real probe, preview `fg cleanup --run "$FG_RUN"`, then apply it with `--apply`, using the same run key. Restore only the preparation's demo selection/privacy memberships with:
 
 ```sh
-node scripts/demo-probe.mjs restore --apply
+FG_OWNER_TOKEN="${FG_OWNER_TOKEN:?the owner token from this install's .env}" node scripts/demo-probe.mjs restore --apply
 ```
 
-For a tokenless installation, restore the saved membership through the actual owner UI. Unrelated changes made during the probe are preserved. Fixture files and agent edits remain for inspection; the helper never deletes an existing project or personal memory. If preparation was done through the UI, restore its prior demo selection/privacy memberships there instead.
+Without `--apply` it is a dry run. Like preparation it needs `FG_OWNER_TOKEN` in the environment, and it calls the URL preparation saved; pass the same `--folder` if you prepared one elsewhere. Without `FG_OWNER_TOKEN` in the environment, restore the saved membership in the signed-in owner UI. Unrelated changes made during the probe are preserved. Fixture files and agent edits remain for inspection; the helper never deletes an existing project or personal memory. If preparation was done through the UI, restore its prior demo selection/privacy memberships there instead.
 
 If worker discovery has not yet listed the new folder, configuration stops before changing privacy or selection. Wait for the discovery pass, verify that `demo-shop` is selectable in Settings, and rerun the same command. Existing prepared files are preserved. Token-authenticated owner requests also send the matching Origin required by the owner API.
-
 
 Claude Code uses `FEEDBACK_GRAPH_TOKEN` for the MCP/Stop hooks. Set it to this install's `API_TOKEN` alongside a private random `FG_RUN_KEY`, `FG_RUN` and `FG_SANDBOX=1`. The API token plus that sandbox run capability may prepare and remove only the bundled local-only demo fixture; it cannot approve lessons or mutate real projects. Do not give the probe `FG_OWNER_TOKEN` or `FG_OPERATOR_TOKEN`, and never put tokens into prompts or fixture files.
 

@@ -21,7 +21,7 @@ function setup(links: ProjectLink[] = [link('api', 'game', 'suggested'), link('g
       deleteLink: async (id) => { calls.push(['delete', id]); return id !== 'link:no|pe'; },
     },
     shown: () => shownProjects({ tracked: ['api', 'game', 'web'], initialized: true }, { excludeProjects: [] }),
-    activity: { record: async (a) => { activity.push(a); }, list: async () => [] },
+    activity: { removeRun: async () => 0, record: async (a) => { activity.push(a); }, list: async () => [] },
   });
   return { app, calls, activity };
 }

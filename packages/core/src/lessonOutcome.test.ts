@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'vitest';
-import { draftOf, lessonOutcome, lessonQuality, editedDraft, ownerDecided } from './lessonOutcome.ts';
+import { LOOP_ACTOR, LOOP_BREAKER_ACTOR } from './loop/state.ts';
+import { draftOf, lessonOutcome, lessonQuality, lessonQualityReport, editedDraft, ownerDecided } from './lessonOutcome.ts';
 import type { Lesson } from './types.ts';
 
 const lesson = (over: Partial<Lesson> = {}): Lesson => ({
@@ -49,6 +50,9 @@ describe('ownerDecided', () => {
     for (const by of ['you', 'operator', 'operator:codex', null, undefined]) expect(ownerDecided(by)).toBe(true);
     for (const by of ['postmortem', 'session-match', 'detector', 'demo', 'operatorx']) expect(ownerDecided(by)).toBe(false);
   });
+  test('the learning loop is never the owner: its decisions do not mark a lesson as yours nor teach the writer', () => {
+    for (const by of [LOOP_ACTOR, LOOP_BREAKER_ACTOR, 'loop:2']) expect(ownerDecided(by)).toBe(false);
+  });
 });
 
 describe('editedDraft', () => {
@@ -83,5 +87,26 @@ describe('lessonQuality', () => {
     ];
     expect(lessonQuality(ls, 30, now)).toEqual({ days: 30, asWritten: 1, edited: 1, rejected: 1, decided: 3, byOperator: 1 });
     expect(lessonQuality(ls, 90, now)).toEqual({ days: 90, asWritten: 1, edited: 1, rejected: 2, decided: 4, byOperator: 1 });
+  });
+});
+
+describe('lessonQualityReport', () => {
+  const now = new Date('2026-11-01T00:00:00.000Z');
+  const daysAgo = (d: number) => new Date(now.getTime() - d * 86_400_000).toISOString();
+  test('counts the 30- and 90-day windows overall and per project (origin when there is no project), skipping non-decisions', () => {
+    const report = lessonQualityReport([
+      lesson({ id: 'lesson:1', decidedAt: daysAgo(5) }),
+      lesson({ id: 'lesson:2', status: 'rejected', decidedAt: daysAgo(60), decidedBy: 'operator:ci' }),
+      lesson({ id: 'lesson:3', projectKey: null, origin: 'github.com/acme/web', decidedAt: daysAgo(10), proposedAs: { ...draftOf(lesson()), rule: 'other' } }),
+      // not an owner decision: in neither the windows nor the projects
+      lesson({ id: 'lesson:4', projectKey: 'other', status: 'rejected', decidedBy: 'postmortem', decidedAt: daysAgo(1) }),
+    ], { now });
+    const w = (days: number, asWritten: number, edited: number, rejected: number, byOperator = 0) =>
+      ({ days, asWritten, edited, rejected, decided: asWritten + edited + rejected, byOperator });
+    expect(report).toEqual({
+      windows: [w(30, 1, 1, 0), w(90, 1, 1, 1, 1)],
+      projects: { acme: [w(30, 1, 0, 0), w(90, 1, 0, 1, 1)], 'github.com/acme/web': [w(30, 0, 1, 0), w(90, 0, 1, 0)] },
+    });
+    expect(lessonQualityReport([], { now, capped: true })).toEqual({ windows: [w(30, 0, 0, 0), w(90, 0, 0, 0)], projects: {}, capped: true });
   });
 });

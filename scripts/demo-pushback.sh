@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Creates a real Claude Code session in a prepared ~/Code/demo-shop fixture with a pushback turn, for an end-to-end test
-# of Feedback Graph. Uses your Claude subscription via the local `claude` CLI. Edits are reverted at the end.
+# of Feedback Graph. Uses your Claude subscription via the local `claude` CLI. Edits stay in the probe copy; demo-probe.mjs restore --apply cleans up.
 set -euo pipefail
 . "$(dirname "$0")/lib/json.sh"
 probe="${FG_PROBE_DIR:-$HOME/Code/demo-shop}"

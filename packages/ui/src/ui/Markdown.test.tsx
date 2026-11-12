@@ -28,3 +28,17 @@ test('code inside bold stays code', () => {
   expect(container.querySelector('strong code')?.textContent).toBe('src/db.ts');
   expect(container.textContent).toBe('src/db.ts: the table');
 });
+
+test('an indented line under a list item continues that item instead of starting a paragraph', () => {
+  const { container } = render(<Markdown text={'1. first step\n   which wraps here\n2. second step\n\nafter'} />);
+  expect(container.querySelector('ol')).not.toBeNull();
+  expect([...container.querySelectorAll('li')].map((li) => li.textContent)).toEqual(['first step which wraps here', 'second step']);
+  expect(container.querySelector('p')?.textContent).toBe('after');
+});
+
+test('underscore emphasis renders like the asterisk kind', () => {
+  const { container } = render(<Markdown text={'a __strong__ and _soft_ word'} />);
+  expect(container.querySelector('strong')?.textContent).toBe('strong');
+  expect(container.querySelector('em')?.textContent).toBe('soft');
+  expect(container.textContent).toBe('a strong and soft word');
+});

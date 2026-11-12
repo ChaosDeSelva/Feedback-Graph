@@ -1,5 +1,6 @@
-import { expect, test } from 'vitest';
-import { spreadForces } from './graphCanvas.ts';
+import { act, render, screen } from '@testing-library/react';
+import { expect, test, vi } from 'vitest';
+import { spreadForces, useSize } from './graphCanvas.ts';
 
 type Force = Record<string, unknown> & { _: Record<string, unknown> };
 /** A stand-in for force-graph's d3 forces: records what each setter was given. */
@@ -45,6 +46,8 @@ test('spreadForces gives links room by type: a faint NEAR tie is long and weak',
   const strength = link.strength as (l: { type?: string }) => number;
   expect(distance({ type: 'IMPORTS' })).toBeGreaterThan(30);
   expect(distance({ type: 'NEAR' })).toBeGreaterThan(distance({ type: 'IMPORTS' }));
+  // a test sits close to the file it tests
+  expect(distance({ type: 'TESTS' })).toBeLessThan(distance({ type: 'IMPORTS' }));
   expect(strength({ type: 'NEAR' })).toBeLessThan(strength({ type: 'IMPORTS' }));
 });
 
@@ -58,4 +61,19 @@ test('spreadForces pulls every node gently toward the middle, so a loosely tied 
     expect(s).toBeGreaterThan(0);
     expect(s).toBeLessThan(0.2);
   }
+});
+
+test('useSize follows its box as it resizes, and stops watching it once unmounted', () => {
+  let resize: ((entries: { contentRect: { width: number; height: number } }[]) => void) | undefined;
+  const disconnect = vi.fn();
+  vi.stubGlobal('ResizeObserver', class { constructor(cb: typeof resize) { resize = cb; } observe() {} disconnect = disconnect; });
+  function Box() { const [ref, size] = useSize<HTMLDivElement>(); return <div ref={ref}>{size.width}x{size.height}</div>; }
+  try {
+    const { unmount } = render(<Box />);
+    expect(screen.getByText('800x600')).toBeTruthy();
+    act(() => resize!([{ contentRect: { width: 320, height: 240 } }]));
+    expect(screen.getByText('320x240')).toBeTruthy();
+    unmount();
+    expect(disconnect).toHaveBeenCalled();
+  } finally { vi.unstubAllGlobals(); }
 });

@@ -1,8 +1,8 @@
 import type { Hono } from 'hono';
 import { z } from 'zod';
 import { DEMO_SOURCE, demoPrefix, type ActivityStore, type Cause, type CodeGraphStore, type FactKind, type FactsStore, type KnowledgeStore, type OperatorConfig, type Project } from '@fb/core';
-import { tokenMatches } from './auth.ts';
-import { currentActor, currentRun, hasOperatorToken, operatorName, runAs } from './operator.ts';
+import { bearerToken, tokenMatches } from './auth.ts';
+import { actingAsOperator, currentActor, currentRun, hasOperatorToken, operatorName, runAs } from './operator.ts';
 
 /**
  * fg demo seed / remove: a small, clearly labelled corpus in a demo project, so a tester whose own projects have no
@@ -75,7 +75,7 @@ export const DEMO_CORPUS: {
 };
 
 export type DemoDeps = {
-  knowledge: Pick<KnowledgeStore, 'upsertLesson'> & Partial<Pick<KnowledgeStore, 'saveDemoMiss' | 'removeDemo'>>;
+  knowledge: Pick<KnowledgeStore, 'upsertLesson' | 'saveDemoMiss' | 'removeDemo'>;
   facts: Pick<FactsStore, 'listFacts' | 'saveFileFacts'>;
   codegraph?: Pick<CodeGraphStore, 'recordSessionFiles'>;
   embed(texts: string[]): Promise<number[][]>;
@@ -90,12 +90,12 @@ export type DemoSeeded = { probe: typeof DEMO_PROBE; project: string; lessons: n
 export type DemoRemovedResult = { project: string; lessons: number; misses: number; facts: number; message: string };
 
 /**
- * Refused: not the owner for another project, a bad key, or a store without the demo methods; or a seed that failed
+ * Refused: not the owner for another project, or a bad key; or a seed that failed
  * part-way and was taken back (500). status: the HTTP answer.
  */
 export class DemoRefused extends Error {
-  status: 400 | 403 | 500 | 501;
-  constructor(message: string, status: 400 | 403 | 500 | 501) {
+  status: 400 | 403 | 500;
+  constructor(message: string, status: 400 | 403 | 500) {
     super(message);
     this.status = status;
   }
@@ -122,7 +122,6 @@ function target(o: { project?: string; owner?: boolean }): string {
 export async function seedDemo(o: { project?: string; owner?: boolean }, d: DemoDeps): Promise<DemoSeeded> {
   const key = target(o);
   const k = d.knowledge;
-  if (!k.saveDemoMiss || !k.removeDemo) throw new DemoRefused('this store cannot hold a demo corpus (no saveDemoMiss / removeDemo)', 501);
   const found = d.project(key);
   const project: Project = found ?? { key, name: key, repoPath: '' };
   const run = currentRun();
@@ -137,6 +136,7 @@ export async function seedDemo(o: { project?: string; owner?: boolean }, d: Demo
   let missId: string;
   let facts = 0;
   const skippedFacts: string[] = [];
+  const keptDemoFacts: string[] = [];
   try {
     // The miss first: it is what creates the project when there is none, marked as the demo's so removeDemo can take
     // that back too. Called on the store, never detached: the real stores' methods use `this`.
@@ -161,8 +161,10 @@ export async function seedDemo(o: { project?: string; owner?: boolean }, d: Demo
     }
     // A file that has facts (a scan read it) keeps them: saving demo facts would close them.
     for (const [i, f] of c.facts.entries()) {
-      if ((await d.facts.listFacts({ projectKey: key, path: f.path, limit: 1, run: run?.id ?? null })).length) {
-        skippedFacts.push(f.path);
+      const existing = await d.facts.listFacts({ projectKey: key, path: f.path, limit: 1, run: run?.id ?? null });
+      if (existing.length) {
+        // The demo's own fact from an earlier seed is kept as it is, and said so, not taken for a scan's.
+        (existing.every((x) => x.statement.startsWith('[demo] ')) ? keptDemoFacts : skippedFacts).push(f.path);
         continue;
       }
       // Hash 'demo' is never a real file's: the next scan of the file reads it and replaces these with what it finds. A
@@ -182,8 +184,10 @@ export async function seedDemo(o: { project?: string; owner?: boolean }, d: Demo
   }
   const selected = d.selected ? await d.selected(key) : null;
   const message = [
-    `Seeded the demo corpus into ${key}: ${n(lessonIds.length, 'approved lesson')} tied to files, ${n(1, 'miss', 'misses')} on ${c.miss.files.join(', ')}, ${facts ? n(facts, 'demo fact') : 'no new demo facts'}${skippedFacts.length ? `; kept the existing scan facts for ${skippedFacts.join(', ')}` : ''}. Every seeded record is marked demo.`,
-    `These lessons are approved by you running fg demo seed: agents working in ${key} are given them. Take them back with fg demo remove${key === DEMO_PROJECT ? '' : ` --project ${key}`}.`,
+    `Seeded the demo corpus into ${key}: ${n(lessonIds.length, 'approved lesson')} tied to files, ${n(1, 'miss', 'misses')} on ${c.miss.files.join(', ')}, ${facts ? n(facts, 'demo fact') : 'no new demo facts'}${keptDemoFacts.length ? `; the demo facts for ${keptDemoFacts.join(', ')} were already there` : ''}${skippedFacts.length ? `; kept the existing scan facts for ${skippedFacts.join(', ')}` : ''}. Every seeded record is marked demo.`,
+    run
+      ? `These lessons are approved within run ${run.id}${run.sandbox ? ', a sandbox: only that run\'s agents' : ': agents'} working in ${key} are given them. Take them back with fg cleanup --run ${run.id} --apply.`
+      : `These lessons are approved by ${actingAsOperator() ? `the operator token (${currentActor()})` : 'you'} running fg demo seed: agents working in ${key} are given them. Take them back with fg demo remove${key === DEMO_PROJECT ? '' : ` --project ${key}`}.`,
     ...(found ? [] : [`No folder for ${key} is under the project roots, so agents cannot work in it yet (the lessons are stored by key).`]),
     ...(selected === false ? [`${key} is not selected: run fg projects select --key ${key} so agents get these.`] : []),
   ].join('\n');
@@ -202,7 +206,6 @@ export async function seedDemo(o: { project?: string; owner?: boolean }, d: Demo
 /** Remove exactly what the demo seed wrote in the project. */
 export async function removeDemo(o: { project?: string; owner?: boolean }, d: DemoDeps): Promise<DemoRemovedResult> {
   const key = target(o);
-  if (!d.knowledge.removeDemo) throw new DemoRefused('this store cannot hold a demo corpus (no removeDemo)', 501);
   const r = await d.knowledge.removeDemo(key, currentRun());
   const message = [
     r.lessons + r.misses + r.facts
@@ -224,8 +227,8 @@ export async function removeDemo(o: { project?: string; owner?: boolean }, d: De
 const Body = z.object({ project: z.string().min(1).max(200).optional() }).strict();
 
 /**
- * POST /api/demo/seed and /api/demo/remove. With the operator token: the demo project always, another project only
- * when OPERATOR_ALLOW has lesson_decide (the lessons are approved). Without it: only from the UI (a browser write
+ * POST /api/demo/seed and /api/demo/remove. With the operator token (the owner route already required `demo`): the demo
+ * project always, another project only when OPERATOR_ALLOW also has lesson_decide (the lessons are approved). Without it: only from the UI (a browser write
  * carries Origin), like every owner decision; a local client sending none is refused.
  */
 export function demoRoutes(app: Hono, d: DemoDeps, auth: { token?: string; operator?: OperatorConfig }) {
@@ -233,8 +236,8 @@ export function demoRoutes(app: Hono, d: DemoDeps, auth: { token?: string; opera
     const parsed = Body.safeParse(await c.req.json().catch(() => ({})));
     if (!parsed.success) return c.json({ error: parsed.error.flatten() }, 400);
     const operator = hasOperatorToken(c, auth.operator);
-    const agent = !!auth.token && tokenMatches(c.req.header('authorization')?.replace(/^Bearer\s+/i, '').trim() ?? '', auth.token);
-    if (operator && !auth.operator?.allow.some(verb => verb === 'demo' || verb === 'lesson_decide')) return c.json({ error: 'demo seed/remove requires demo in OPERATOR_ALLOW (or lesson_decide)' }, 403);
+    const agent = !!auth.token && tokenMatches(bearerToken(c.req.header('authorization')) ?? '', auth.token);
+    if (operator && !auth.operator?.allow.some(verb => verb === 'demo' || verb === 'lesson_decide')) return c.json({ error: 'demo seed/remove requires demo in OPERATOR_ALLOW' }, 403);
     // Authentication/owner intent is enforced by OWNER_ROUTES before this handler. Keep the project-scope distinction:
     // the narrow `demo` operator verb may touch only demo-shop; lesson_decide may seed another explicit project.
     const owner = agent ? false : operator ? !!auth.operator?.allow.includes('lesson_decide') : true;
@@ -243,8 +246,7 @@ export function demoRoutes(app: Hono, d: DemoDeps, auth: { token?: string; opera
       return c.json(await (operator ? runAs(operatorName(c.req.header('x-fg-operator')), go) : go()));
     } catch (e) {
       if (e instanceof DemoRefused) return c.json({ error: e.message }, e.status);
-      if (e instanceof Error) return c.json({ error: `fg demo: ${e.message}` }, 500);
-      throw e;
+      return c.json({ error: `fg demo: ${e instanceof Error ? e.message : String(e)}` }, 500);
     }
   };
   app.post('/api/demo/seed', handle(seedDemo));

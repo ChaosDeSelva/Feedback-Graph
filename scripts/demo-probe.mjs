@@ -59,13 +59,13 @@ export async function prepare({ folder = defaultFolder(), source = join(repo, 'e
 function ownerHeaders(base, { token, localOwner = false }) {
   new URL(base);
   if (localOwner) throw Error('--local-owner was removed: use the authenticated browser UI, or configure the separate FG_OWNER_TOKEN for headless owner actions.');
-  if (!token) throw Error('Owner preparation requires FG_OWNER_TOKEN. Use the browser UI for a tokenless install; do not broaden OPERATOR_ALLOW.');
+  if (!token) throw Error('Owner preparation requires FG_OWNER_TOKEN. A tokenless install is read-only for owner actions: run ./scripts/setup.sh --yes --enable-auth first; do not broaden OPERATOR_ALLOW.');
   return { authorization: `Bearer ${token}`, 'x-fg-owner': 'true' };
 }
 
 export async function configure(folder, { apiURL, token, localOwner = false, fetch: request } = {}) {
   if (localOwner) throw Error('--local-owner was removed: use the authenticated browser UI, or configure the separate FG_OWNER_TOKEN for headless owner actions.');
-  if (!token) throw Error('Owner preparation requires FG_OWNER_TOKEN. Use the browser UI for a tokenless install; do not broaden OPERATOR_ALLOW.');
+  if (!token) throw Error('Owner preparation requires FG_OWNER_TOKEN. A tokenless install is read-only for owner actions: run ./scripts/setup.sh --yes --enable-auth first; do not broaden OPERATOR_ALLOW.');
   // A supplied fetch is a test harness and never sends over the network; the CLI
   // path must identify the intended install explicitly.
   const base = apiURL ?? process.env.FEEDBACK_GRAPH_URL ?? (request ? 'http://127.0.0.1:8787' : undefined);
@@ -117,22 +117,26 @@ export async function restore(folder, { token, localOwner = false, fetch: reques
   await writeFile(join(folder, MARKER), JSON.stringify(state, null, 2), { mode: 0o600 });
 }
 
-if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  const [command = 'prepare', ...args] = process.argv.slice(2);
-  const value = flag => { const index = args.indexOf(flag); return index < 0 ? undefined : args[index + 1]; };
+/** The command line: `prepare|restore [--apply] [--configure] [--folder PATH] [--source FIXTURE] [--api-url URL]`; returns the exit code. */
+export async function cli(args, { env = process.env, log = console.log, error = console.error, fetch: request } = {}) {
+  const [command = 'prepare', ...rest] = args;
+  const value = flag => { const index = rest.indexOf(flag); return index < 0 ? undefined : rest[index + 1]; };
   try {
     const folder = resolve(value('--folder') ?? defaultFolder());
     if (command === 'restore') {
-      if (!args.includes('--apply')) console.log('Dry run: restore only the demo-shop selection/privacy membership saved by prepare; leave files and unrelated settings intact.');
-      else { await restore(folder, { token: process.env.FG_OWNER_TOKEN, localOwner: args.includes('--local-owner') }); console.log('Restored demo-shop settings membership. Run fg cleanup for your labelled run; fixture files were retained.'); }
+      if (!rest.includes('--apply')) log('Dry run: restore only the demo-shop selection/privacy membership saved by prepare; leave files and unrelated settings intact.');
+      else { await restore(folder, { token: env.FG_OWNER_TOKEN, localOwner: rest.includes('--local-owner'), ...(request && { fetch: request }) }); log('Restored demo-shop settings membership. Run fg cleanup for your labelled run; fixture files were retained.'); }
     } else if (command === 'prepare') {
-      const result = await prepare({ folder, source: value('--source'), apply: args.includes('--apply') });
-      if (args.includes('--configure')) {
-        if (!args.includes('--apply')) throw Error('--configure requires --apply; the default makes no API changes.');
-        await configure(result.folder, { apiURL: value('--api-url'), token: process.env.FG_OWNER_TOKEN, localOwner: args.includes('--local-owner') });
+      const result = await prepare({ folder, source: value('--source'), apply: rest.includes('--apply') });
+      if (rest.includes('--configure')) {
+        if (!rest.includes('--apply')) throw Error('--configure requires --apply; the default makes no API changes.');
+        await configure(result.folder, { apiURL: value('--api-url'), token: env.FG_OWNER_TOKEN, localOwner: rest.includes('--local-owner'), fetch: request });
       }
-      console.log(`${args.includes('--apply') ? 'Prepared' : 'Dry run'}: ${result.folder}. Use this as the agent working directory, never examples/demo-shop.`);
-      console.log('Register a fresh FG_RUN/FG_SANDBOX=1 session, seed only the demo corpus, test the returned console probe, then fg cleanup --run YOUR_RUN --apply. This command does not launch agents or change lesson decisions.');
+      log(`${rest.includes('--apply') ? 'Prepared' : 'Dry run'}: ${result.folder}. Use this as the agent working directory, never examples/demo-shop.`);
+      log('Register a fresh FG_RUN/FG_SANDBOX=1 session, seed only the demo corpus, test the returned console probe, then fg cleanup --run YOUR_RUN --apply. This command does not launch agents or change lesson decisions.');
     } else throw Error('Usage: node scripts/demo-probe.mjs prepare|restore [--apply] [--configure] [--folder PATH] [--source FIXTURE] [--api-url URL] [--local-owner]');
-  } catch (error) { console.error(error.message); process.exitCode = 1; }
+    return 0;
+  } catch (e) { error(e.message); return 1; }
 }
+
+if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) process.exitCode = await cli(process.argv.slice(2));

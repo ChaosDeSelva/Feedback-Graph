@@ -2,11 +2,13 @@ import { conditionalWrite } from './conditionalWrite.ts';
 import { archiveRunFileSelector, archiveBeforeRedaction, archiveRedactionInput } from '../redactionArchive.ts';
 import { randomUUID } from 'node:crypto';
 import neo4j from 'neo4j-driver';
-import { FACT_EVIDENCE, FACT_ORIGINS, type CodeFact, type FactEvidence, type FactKind, type FactOrigin, type Project, type ProjectSummary, type RelevanceBy, type ScanJob, type ScanQueueEntry, type ScanShards, type ScanStatus, type RunTag } from '../types.ts';
+import { FACT_EVIDENCE, FACT_ORIGINS, FACT_ORIGINS_KEPT, type CodeFact, type FactEvidence, type FactKind, type FactOrigin, type OwnFactOrigin, type Project, type ProjectSummary, type RelevanceBy, type ScanJob, type ScanQueueEntry, type ScanShards, type ScanStatus, type RunTag, type ProjectThresholds } from '../types.ts';
 import { factOrigin } from '../relevance.ts';
+import { factFingerprint, factStateFingerprint, TargetChangedError, type FactSnapshotWrite, type FingerprintedFact } from '../decisions/record.ts';
+import { thresholdsSnapshot } from '../loop/snapshots.ts';
 import { holdsCredential, REDACT_PAGE, redactDeep, redactSecrets, redactStoredFact, reopensAsFact } from '../redact.ts';
 import { DEMO_SOURCE, type FactCheck, type FactScope, type FactsStore, type ScanJobPatch, type ScannedFile } from '../store.ts';
-import type { GraphRepo } from './repo.ts';
+import { retryDeadlock, type GraphRepo } from './repo.ts';
 import { nearest, visibleToRun } from './nearest.ts';
 import { VISIBLE_TO_RUN } from './runs.ts';
 
@@ -32,11 +34,14 @@ export type UnscoredFact = { id: string; projectKey: string; kind: FactKind; sta
  * projectKey: only a fact of that project is changed. run: a decision made in that run changes only a fact the run
  * wrote; null: the owner's decision, which makes a run's fact the owner's; unset (the scorer): ownership is left alone.
  */
-export type RelevanceUpdate = { id: string; relevance: number; by: RelevanceBy; projectKey?: string; run?: string | null };
+export type RelevanceUpdate = { id: string; relevance: number; by: RelevanceBy; projectKey?: string; run?: string | null; expect?: string };
 /** 0..1, so a model's or a request's stray number cannot skew ranking. */
 export const clampRelevance = (r: number) => (Number.isFinite(r) ? Math.min(1, Math.max(0, r)) : 0.5);
 /** Store form of an extracted fact's relevance: a number in range, or null (not scored). */
 export const relevanceOf = (f: Pick<CodeFact, 'relevance'>) => (typeof f.relevance === 'number' ? clampRelevance(f.relevance) : null);
+/** A fact a scan may close or replace: not one filed under its project by you or the loop (FACT_ORIGINS_KEPT). */
+const scanned = (v: string) => `NOT coalesce(${v}.origin, '') IN [${FACT_ORIGINS_KEPT.map((o) => `'${o}'`).join(', ')}]`;
+
 /** Store form of a fact's origin and evidence: known values, or null (Neo4j and Postgres both refuse undefined). */
 export const provenanceOf = (f: Pick<CodeFact, 'origin' | 'evidence'>) => ({
   origin: f.origin && FACT_ORIGINS.includes(f.origin) ? f.origin : null,
@@ -132,9 +137,10 @@ export class FactsRepo implements FactsStore {
 
   /** Replace the current facts of one file (old facts are closed, not deleted). */
   async saveFileFacts(projectKey: string, rawFile: ScannedFile & { summary: string }, rawFacts: EmbeddedFact[], source: string, scanJobId: string | null = null, run: RunTag | null = null) {
-    // Facts are model output about code that may contain credentials: redact at the door.
-    const file = redactDeep(rawFile);
-    const facts = redactDeep(rawFacts);
+    // Facts are model output about code that may contain credentials: redact at the door. The file's path is the
+    // repository's (as saveFileHashes stores it): redacted, two files would share one id.
+    const file = { ...redactDeep(rawFile), path: rawFile.path };
+    const facts = redactDeep(rawFacts).map((fx, i) => (rawFacts[i].path === rawFile.path ? { ...fx, path: rawFile.path } : fx));
     await archiveRedactionInput('facts', projectKey, { file: rawFile, facts: rawFacts }, { file, facts }, [{ kind: 'project', id: projectKey }, ...(run ? [{ kind: 'run', id: run.id }, archiveRunFileSelector(run.id, projectKey, file.path)] : [])]);
     this.g.sandbox.wrote(run);
     const now = new Date().toISOString();
@@ -151,7 +157,7 @@ export class FactsRepo implements FactsStore {
        ${setFile}
        MERGE (cf)-[:IN]->(p)
        WITH cf
-       OPTIONAL MATCH (old:Fact {current: true})-[:ABOUT]->(cf) WHERE coalesce(old.origin, '') <> 'you' AND (old.run = $run OR (old.run IS NULL AND $run IS NULL))
+       OPTIONAL MATCH (old:Fact {current: true})-[:ABOUT]->(cf) WHERE ${scanned('old')} AND (old.run = $run OR (old.run IS NULL AND $run IS NULL))
        SET old.current = false, old.validTo = $now
        WITH DISTINCT cf
        UNWIND $facts AS fx
@@ -171,7 +177,7 @@ export class FactsRepo implements FactsStore {
       `MATCH (cf:CodeFile {projectKey: $projectKey}) WHERE cf.path IN $paths
        SET cf.removed = true
        WITH cf
-       OPTIONAL MATCH (x:Fact {current: true})-[:ABOUT]->(cf) WHERE coalesce(x.origin, '') <> 'you' AND NOT coalesce(x.sandbox, false)
+       OPTIONAL MATCH (x:Fact {current: true})-[:ABOUT]->(cf) WHERE ${scanned('x')} AND NOT coalesce(x.sandbox, false)
        SET x.current = false, x.validTo = $now`,
       { projectKey, paths, now: new Date().toISOString() },
     );
@@ -194,8 +200,8 @@ export class FactsRepo implements FactsStore {
     // One transaction: if writing the new facts fails, the old ones stay current and the hashes stay stale,
     // so the next scan tries again instead of finding "nothing changed" over an empty project.
     await this.g.runInTransaction([
-      // Facts read from your documents, and facts you wrote, are not the code's: a scan never closes them.
-      [`MATCH (x:Fact {projectKey: $projectKey, current: true}) WHERE x.docId IS NULL AND coalesce(x.origin, '') <> 'you' AND NOT coalesce(x.sandbox, false)
+      // Facts read from your documents, and facts you or the loop wrote, are not the code's: a scan never closes them.
+      [`MATCH (x:Fact {projectKey: $projectKey, current: true}) WHERE x.docId IS NULL AND ${scanned('x')} AND NOT coalesce(x.sandbox, false)
           AND any(pre IN $prefixes WHERE pre = '' OR x.path = pre OR x.path STARTS WITH pre + '/')
           AND none(ex IN $except WHERE x.path = ex OR x.path STARTS WITH ex + '/')
         SET x.current = false, x.validTo = $now`, { projectKey, now, prefixes: scope.prefixes, except: scope.except }],
@@ -225,11 +231,11 @@ export class FactsRepo implements FactsStore {
     ]);
   }
 
-  /** Your fact: under the project, about no code file, so a scan has nothing of it to close. */
-  async addOwnerFact(projectKey: string, rawFact: EmbeddedFact, by: RelevanceBy, run?: RunTag | null): Promise<StoredFact> {
+  /** Your fact (or the loop's): under the project, about no code file, so a scan has nothing of it to close. */
+  async addOwnerFact(projectKey: string, rawFact: EmbeddedFact, by: RelevanceBy, run?: RunTag | null, o: { id?: string; origin?: OwnFactOrigin } = {}): Promise<StoredFact> {
     const fx = redactDeep(rawFact);
     await archiveRedactionInput('fact', projectKey, rawFact, fx);
-    const id = randomUUID();
+    const id = o.id ?? randomUUID();
     const now = new Date().toISOString();
     const relevance = relevanceOf(fx);
     this.g.sandbox.wrote(run);
@@ -237,18 +243,45 @@ export class FactsRepo implements FactsStore {
       `MERGE (p:Project {key: $projectKey})
        CREATE (n:Fact {id: $id, projectKey: $projectKey, kind: $fx.kind, statement: $fx.statement, path: $fx.path,
                        lines: $fx.lines, confidence: $fx.confidence, why: $fx.why, embedding: $fx.embedding, source: $by,
-                       origin: 'you', evidence: null, relevance: $relevance, relevanceBy: CASE WHEN $relevance IS NULL THEN null ELSE $by END,
+                       origin: $origin, evidence: null, relevance: $relevance, relevanceBy: CASE WHEN $relevance IS NULL THEN null ELSE $by END,
                        scanJobId: null, fileHash: null, current: true, createdAt: $now, validFrom: $now, run: $run, sandbox: $sandbox})
        RETURN n`,
-      { projectKey, id, fx: { ...fx, path: fx.path || PROJECT_PATH, lines: fx.lines ?? null }, by, relevance, now, run: run?.id ?? null, sandbox: !!run?.sandbox },
+      { projectKey, id, fx: { ...fx, path: fx.path || PROJECT_PATH, lines: fx.lines ?? null }, by, origin: o.origin ?? 'you', relevance, now, run: run?.id ?? null, sandbox: !!run?.sandbox },
     );
     return factOf(r.get('n').properties);
+  }
+
+  async fact(id: string): Promise<(StoredFact & FingerprintedFact & { projectKey: string }) | null> {
+    const [r] = await this.g.run('MATCH (x:Fact {id: $id}) RETURN x', { id });
+    if (!r) return null;
+    const p = r.get('x').properties;
+    return { ...factOf(p), projectKey: p.projectKey, current: p.current === true };
+  }
+
+  async writeFactSnapshots(writes: FactSnapshotWrite[]): Promise<void> {
+    if (!writes.length) return;
+    // A deadlock-aborted write (two at once on one fact) wrote nothing and runs again, comparing afresh.
+    await retryDeadlock(() => conditionalWrite(this.g, async (query) => {
+      const rows = await query('UNWIND $ids AS id MATCH (x:Fact {id: id}) SET x._lock = coalesce(x._lock, 0) + 1 REMOVE x._lock RETURN x', { ids: writes.map((w) => w.id) });
+      const now = new Map(rows.map((r) => { const p = r.get('x').properties; return [p.id as string, factStateFingerprint({ ...factOf(p), current: p.current === true })]; }));
+      for (const w of writes) {
+        const actual = now.get(w.id) ?? factStateFingerprint(null);
+        if (actual !== w.expect) throw new TargetChangedError(w.id, w.expect, now.has(w.id) ? actual : null);
+      }
+      await query(
+        `UNWIND $writes AS w MATCH (x:Fact {id: w.id})
+         SET x.validTo = CASE WHEN w.f.current THEN null WHEN x.current THEN $now ELSE x.validTo END,
+           x.relevance = w.f.relevance, x.relevanceBy = w.f.relevanceBy, x.current = w.f.current`,
+        { writes: writes.map((w) => ({ id: w.id, f: w.fields })), now: new Date().toISOString() },
+      );
+      return true;
+    }, () => true));
   }
 
   /** Which models wrote the project's current facts; a scan with a different one rescans every file. */
   async currentSources(projectKey: string): Promise<string[]> {
     const rows = await this.g.run(
-      `MATCH (x:Fact {projectKey: $projectKey, current: true}) WHERE x.docId IS NULL AND coalesce(x.origin, '') <> 'you'
+      `MATCH (x:Fact {projectKey: $projectKey, current: true}) WHERE x.docId IS NULL AND ${scanned('x')}
        RETURN DISTINCT x.source AS s ORDER BY s`,
       { projectKey },
     );
@@ -273,7 +306,7 @@ export class FactsRepo implements FactsStore {
   async factsToRecheck(q: { projectKey: string; version: string; limit: number }): Promise<StoredFact[]> {
     const rows = await this.g.run(
       `MATCH (x:Fact {projectKey: $projectKey, current: true})
-       WHERE x.docId IS NULL AND coalesce(x.origin, '') <> 'you' AND coalesce(x.checkVersion, '') <> $version
+       WHERE x.docId IS NULL AND ${scanned('x')} AND coalesce(x.checkVersion, '') <> $version
        OPTIONAL MATCH (x)-[:ABOUT]->(cf:CodeFile)
        RETURN x, cf.summary AS fileSummary, cf.hashChangedAt AS fileChangedAt ORDER BY x.path, x.createdAt, x.id LIMIT $limit`,
       { projectKey: q.projectKey, version: q.version, limit: neo4j.int(Math.max(0, Math.floor(q.limit))) },
@@ -441,6 +474,16 @@ export class FactsRepo implements FactsStore {
   async setFactRelevance(updates: RelevanceUpdate[]): Promise<number> {
     return conditionalWrite(this.g, async query => {
       if (!updates.length) return 0;
+      const expected = updates.filter((u) => u.expect !== undefined);
+      if (expected.length) {
+        const rows = await query(
+          `UNWIND $ids AS id MATCH (x:Fact {id: id}) SET x._lock = coalesce(x._lock, 0) + 1 REMOVE x._lock
+           RETURN x {.id, .kind, .statement, .path, .lines, .relevance, .relevanceBy, .current} AS f`,
+          { ids: expected.map((u) => u.id) },
+        );
+        const actual = new Map(rows.map((r) => { const f = r.get('f'); return [f.id as string, factFingerprint({ ...f, current: f.current === true })]; }));
+        for (const u of expected) if (actual.get(u.id) !== u.expect) throw new TargetChangedError(u.id, u.expect!, actual.get(u.id) ?? null);
+      }
       const [r] = await query(
         `UNWIND $updates AS u
          MATCH (x:Fact {id: u.id}) WHERE (u.projectKey IS NULL OR x.projectKey = u.projectKey) AND (u.by <> 'model' OR coalesce(x.relevanceBy, 'model') = 'model')
@@ -564,11 +607,12 @@ export class FactsRepo implements FactsStore {
        WITH p, sessions, feedback, lessons, count(x) AS facts,
             count(CASE WHEN x.docId IS NOT NULL THEN 1 END) AS documentFacts,
             count(CASE WHEN x.docId IS NULL AND (x.origin = 'manifest' OR (x.origin IS NULL AND x.why =~ $manifestWhy)) THEN 1 END) AS manifestFacts,
-            count(CASE WHEN x.docId IS NULL AND x.origin = 'you' THEN 1 END) AS yourFacts
+            count(CASE WHEN x.docId IS NULL AND x.origin = 'you' THEN 1 END) AS yourFacts,
+            count(CASE WHEN x.docId IS NULL AND x.origin = 'loop' THEN 1 END) AS loopFacts
        OPTIONAL MATCH (j:ScanJob {projectKey: p.key})
-       WITH p, sessions, feedback, lessons, facts, documentFacts, manifestFacts, yourFacts, j ORDER BY j.requestedAt DESC
-       WITH p, sessions, feedback, lessons, facts, documentFacts, manifestFacts, yourFacts, collect(j)[0] AS last
-       RETURN p, sessions, feedback, lessons, facts, documentFacts, manifestFacts, yourFacts, last
+       WITH p, sessions, feedback, lessons, facts, documentFacts, manifestFacts, yourFacts, loopFacts, j ORDER BY j.requestedAt DESC
+       WITH p, sessions, feedback, lessons, facts, documentFacts, manifestFacts, yourFacts, loopFacts, collect(j)[0] AS last
+       RETURN p, sessions, feedback, lessons, facts, documentFacts, manifestFacts, yourFacts, loopFacts, last
        ORDER BY p.key`,
       { manifestWhy: MANIFEST_WHY_RE },
     );
@@ -582,12 +626,26 @@ export class FactsRepo implements FactsStore {
       lessons: r.get('lessons'),
       facts: r.get('facts'),
       factsByOrigin: {
-        model: r.get('facts') - r.get('documentFacts') - r.get('manifestFacts') - r.get('yourFacts'),
-        manifest: r.get('manifestFacts'), document: r.get('documentFacts'), you: r.get('yourFacts'),
+        model: r.get('facts') - r.get('documentFacts') - r.get('manifestFacts') - r.get('yourFacts') - r.get('loopFacts'),
+        manifest: r.get('manifestFacts'), document: r.get('documentFacts'), you: r.get('yourFacts'), loop: r.get('loopFacts'),
       },
       lastScan: r.get('last') ? jobOf(r.get('last').properties) : null,
       pinned: r.get('p').properties.pinned === true,
     }));
+  }
+
+  async projectThresholds(projectKey: string): Promise<ProjectThresholds> {
+    const [r] = await this.g.run('MATCH (p:Project {key: $key}) RETURN p.similarityFloor AS s, p.factRankFloor AS f', { key: projectKey });
+    return { similarityFloor: r?.get('s') ?? null, factRankFloor: r?.get('f') ?? null };
+  }
+
+  async setProjectThresholds(projectKey: string, t: ProjectThresholds, o: { expect: string }): Promise<void> {
+    await conditionalWrite(this.g, async (query) => {
+      const [cur] = await query('MATCH (p:Project {key: $key}) SET p._lock = coalesce(p._lock, 0) + 1 REMOVE p._lock RETURN p.similarityFloor AS s, p.factRankFloor AS f', { key: projectKey });
+      const actual = cur ? thresholdsSnapshot(projectKey, { similarityFloor: cur.get('s') ?? null, factRankFloor: cur.get('f') ?? null }).fingerprint : null;
+      if (actual !== o.expect) throw new TargetChangedError(projectKey, o.expect, actual);
+      await query('MATCH (p:Project {key: $key}) SET p.similarityFloor = $s, p.factRankFloor = $f', { key: projectKey, s: t.similarityFloor, f: t.factRankFloor });
+    }, () => true);
   }
 
   async setPinned(project: Project, pinned: boolean) {

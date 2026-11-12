@@ -1,11 +1,12 @@
-import { expect, test } from 'vitest';
-import { gradeLessons, rankFacts, rankMisses, type Lesson } from '@fb/core';
+import { setImmediate as nextTurn } from 'node:timers/promises';
+import { expect, test, vi } from 'vitest';
+import { rankLessons, rankFacts, rankMisses, type Lesson } from '@fb/core';
 import { Admission } from './admission.ts';
 import { checkBeforeDone, getTaskContext, makeJudge, type ContextDeps } from './context.ts';
 import { buildChatContext } from './chat.ts';
 
 const lesson = (id = 'lesson:a', rule = 'Do not use console.log'): Lesson => ({ id, projectKey: 'demo', title: 'No console', rule, appliesWhen: 'editing app', scope: 'project', paths: ['src/app.ts'], status: 'approved', source: 'postmortem', cause: null, missId: null, createdAt: 't', decidedAt: 't' });
-const deps = (extra: Partial<ContextDeps> = {}): ContextDeps => ({ roots: [{ host: '/projects', container: '/projects' }], exists: () => true, embed: async () => [[1]], k: { searchLessons: async () => [{ lesson: lesson(), score: .9 }], relatedMisses: async () => [], createManualFeedback: async () => 'f1', recordPreDoneCheck: async () => {} }, judge: async () => [], ...extra });
+const deps = (extra: Partial<ContextDeps> = {}): ContextDeps => ({ roots: [{ host: '/projects', container: '/projects' }], exists: () => true, embed: async () => [[1]], k: { searchLessons: async () => [{ lesson: lesson(), score: .9 }], missesNaming: async () => [], relatedMisses: async () => [], createManualFeedback: async () => 'f1', recordPreDoneCheck: async () => {} }, judge: async () => [], ...extra });
 const diff = 'diff --git a/src/app.ts b/src/app.ts\n--- a/src/app.ts\n+++ b/src/app.ts\n@@ -1 +1 @@\n-export const a = 1;\n+console.log("debug");\n';
 
 test('an explicit no-console violation is evidence-backed on every run without a model guess', async () => {
@@ -28,23 +29,44 @@ test('console strings, comments and unrelated files do not become direct violati
   }
 });
 
+// The response budget runs on fake timers and a fake clock, so these tests assert what happens when it expires, not
+// how quickly a loaded machine gets there. Waits for real work use node:timers, which stays real.
+const budgetClock = () => vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+
 test('150 checks queued behind a wedged embedder obey the total response budget', async () => {
-  const d = deps({ checkTimeoutMs: 20, embed: async () => new Promise(() => {}) });
-  const start = Date.now();
-  const results = await Promise.all(Array.from({ length: 150 }, () => checkBeforeDone({ project: 'demo', task: 'edit src/app.ts', summary: 's' }, d)));
-  expect(Date.now() - start).toBeLessThan(500);
-  expect(results.every((r) => r.queued && !r.gaps.length && r.markdown.startsWith('# Queued:'))).toBe(true);
+  budgetClock();
+  try {
+    const d = deps({ checkTimeoutMs: 20, embed: async () => new Promise(() => {}) });
+    let settled = 0;
+    const checks = Promise.all(Array.from({ length: 150 }, () => checkBeforeDone({ project: 'demo', task: 'edit src/app.ts', summary: 's' }, d).finally(() => settled++)));
+    await vi.advanceTimersByTimeAsync(20);
+    await nextTurn();
+    expect(settled).toBe(150);
+    const results = await checks;
+    expect(results.every((r) => r.queued && !r.gaps.length && r.markdown.startsWith('# Queued:'))).toBe(true);
+  } finally {
+    vi.useRealTimers();
+  }
 });
 
 test('queued judge admission cancels with its end-to-end caller and retry gets a fresh budget', async () => {
-  const queue = new Admission({ concurrency: 1, timeoutMs: 10_000 });
-  let calls = 0;
-  const judge = async () => { calls++; return new Promise<never>(() => {}); };
-  const d = deps({ checkTimeoutMs: 20, judgeQueue: queue, judge });
-  await Promise.all(Array.from({ length: 20 }, () => checkBeforeDone({ project: 'demo', task: 'edit src/app.ts', summary: 's' }, d)));
-  await new Promise((r) => setTimeout(r, 5));
-  expect(queue.waiting).toBe(0);
-  expect(calls).toBe(1);
+  budgetClock();
+  try {
+    const queue = new Admission({ concurrency: 1, timeoutMs: 10_000 });
+    let calls = 0;
+    const judge = async () => { calls++; return new Promise<never>(() => {}); };
+    const d = deps({ checkTimeoutMs: 20, judgeQueue: queue, judge });
+    const checks = Promise.all(Array.from({ length: 20 }, () => checkBeforeDone({ project: 'demo', task: 'edit src/app.ts', summary: 's' }, d)));
+    // The first check holds the one judge slot and the rest wait behind it before the budget runs out.
+    while (calls === 0 || queue.waiting < 19) await nextTurn();
+    await vi.advanceTimersByTimeAsync(20);
+    await checks;
+    await nextTurn();
+    expect(queue.waiting).toBe(0);
+    expect(calls).toBe(1);
+  } finally {
+    vi.useRealTimers();
+  }
   const retry = await checkBeforeDone({ project: 'demo', task: 'edit src/app.ts', summary: 's' }, deps({ checkTimeoutMs: 100, judge: async () => [{ lessonId: 'lesson:a', status: 'addressed', why: 'done' }] }));
   expect(retry.queued).toBeUndefined();
 });
@@ -54,7 +76,7 @@ test('weighted ordering preserves the actual similarity and never serves a score
   expect(misses.map((m) => m.score)).toEqual([.79]);
   const facts = rankFacts([{ fact: { path: 'src/other/file.ts', relevance: .3 } as never, score: .79 }, { fact: { path: 'src/app.ts', relevance: 1 } as never, score: .59 }], 5, ['src/app.ts']);
   expect(facts.map((h) => h.score)).toEqual([.79]);
-  expect(gradeLessons([{ lesson: lesson(), score: .99 }], 'console', { projectKey: 'demo' })).toEqual({ follow: [], related: [] });
+  expect(rankLessons([{ lesson: lesson(), score: .99 }], 'console', { projectKey: 'demo' })).toEqual([]);
 });
 
 test('own PR review lessons and docs are both excluded, including comment identities', async () => {
@@ -101,23 +123,21 @@ test('task-named PR excludes its lessons and docs without commit lookup or a ses
 });
 
 test('Ask requests the exact named file even when token matching prefers siblings', async () => {
-  const wanted = 'src/dialog/workos-invite-dialog.tsx';
+  const wanted = 'src/dialog/member-invite-dialog.tsx';
   const requested: string[] = [];
   const miss = { missId: 'miss:exact', missed: 'Named file miss', cause: 'implementation_error', feedbackId: 'f', feedbackText: 'fix', sessionId: 's', ts: '2026-10-28', paths: [wanted], fixedHere: false, lessonId: null };
   const context = deps({ codegraph: { lessonsForPaths: async () => [], moduleContext: async (_key: string, path: string) => {
     requested.push(path); return { file: {}, symbols: [], importers: [], imports: [], tests: [], facts: [], misses: path === wanted ? [miss] : [], lessons: [] };
   } } as never });
-  const files = [...Array.from({ length: 30 }, (_, i) => ({ path: `src/dialog/workos-invite-dialog-sibling-${i}.tsx`, lang: 'typescript', hash: 'h', loc: 1, isTest: false })), { path: wanted, lang: 'typescript', hash: 'h', loc: 1, isTest: false }];
-  const pack = await buildChatContext('demo', 'What went wrong in workos-invite-dialog.tsx?', [], { context, codeMap: async () => ({ fingerprint: null, builtAt: 't', stats: {}, candidates: null, files, symbols: [], imports: [], outside: [] }) as never });
+  const files = [...Array.from({ length: 30 }, (_, i) => ({ path: `src/dialog/member-invite-dialog-sibling-${i}.tsx`, lang: 'typescript', hash: 'h', loc: 1, isTest: false })), { path: wanted, lang: 'typescript', hash: 'h', loc: 1, isTest: false }];
+  const pack = await buildChatContext('demo', 'What went wrong in member-invite-dialog.tsx?', [], { context, codeMap: async () => ({ fingerprint: null, builtAt: 't', stats: {}, candidates: null, files, symbols: [], imports: [], outside: [] }) as never });
   expect(requested).toContain(wanted);
   expect(pack.context).toContain('Named file miss');
 });
 
-test('deadline response exposes judge capacity, a labeled cold-start estimate and no retained position', async () => {
+test('deadline response says plainly when to retry, with capacity, a labeled cold-start estimate and no retained position in the structured queue', async () => {
   const queue = new Admission({ concurrency: 5, timeoutMs: 1000 });
   const result = await checkBeforeDone({ project: 'demo', task: 'edit src/app.ts', summary: 's' }, deps({ checkTimeoutMs: 10, judgeQueue: queue, embed: async () => new Promise(() => {}) }));
-  expect(result.markdown).toContain('Judge capacity: 5');
-  expect(result.markdown).toContain('cold-start response-budget scenario');
-  expect(result.queue).toMatchObject({ retained: false, estimate: { source: 'response_budget', samples: 0 } });
-  expect(result.markdown).toContain('does not retain a queue position');
+  expect(result.markdown).toMatch(/Call check_before_done again with the same arguments in about \d+ s\.$/);
+  expect(result.queue).toMatchObject({ capacity: 5, retained: false, estimate: { source: 'response_budget', samples: 0 } });
 });

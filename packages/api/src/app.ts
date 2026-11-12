@@ -1,30 +1,33 @@
 import { archiveRedactionInput, authorizeStoreWrite } from '@fb/core';
 import { LESSON_SHARING_NOTICE } from '@fb/core';
+import { CODE_MAP_LEASE_MS, OPERATOR_DEFAULT_VERBS } from '@fb/core';
 import { guardApiStoreWrites, mcpDiscoveryOnly } from './storeWriteGuard.ts';
 import { LegacyRunClaimError, withoutStoreWriteAuthorizer, withStoreWriteAuthorizer } from '@fb/core';
 import { requestDeadline } from './requestDeadline.ts';
+import { localPeers, loopbackPeer } from './peer.ts';
 import { Hono, type Context, type Next } from 'hono';
 import { bodyLimit } from 'hono/body-limit';
 import { streamSSE } from 'hono/streaming';
 import { serveStatic } from '@hono/node-server/serve-static';
 import { z } from 'zod';
-import { ACTIVITY_KINDS, EVERYDAY_FROM, chunkText, mapCapped, MAX_AUTO_MAP_FILES, MODEL_JOBS, cleanLessonPath, cmp, FACT_KINDS, LESSON_CHECKS, LESSON_FROM, redactSecrets, relevanceBand, selectionNote, type ActivityStore, type CodeGraphStore, type DocsStore, type FactsStore, type GraphStore, type InsightsStore, type ModelHealth, type ModelJob, type OllamaHealth, type PipelineStatus, type ProviderHealth, type KnowledgeStore, type Lesson, type LinksStore, IMAGE_MEDIA_TYPES, MAX_IMAGE_BYTES, LINK_RELATIONS, LINK_STATUSES, linkPair, linkEnds, docIdOf, NotTheRunsError, type PortabilityStore, type Project, type ProjectSelection, type RelevanceBy, type ProjectSummary, type ScanQueueEntry, type ShownProjects, type WorkQueue, type WorkQueues, type StoreKind, type SystemStatus, type WorkerStatus, contextWhy, FACT_ORIGINS, SCANNER_VERSION, RUN_ID, type RunPrincipal, type RunsStore, LESSON_QUALITY_DAYS, lessonQualityReport, type LessonQualityReport, type Candidate } from '@fb/core';
+import { ACTIVITY_KINDS, EVERYDAY_FROM, chunkText, mapCapped, MAX_AUTO_MAP_FILES, MODEL_JOBS, cleanLessonPath, lessonToFact, cmp, FACT_KINDS, LESSON_CHECKS, LESSON_FROM, redactSecrets, relevanceBand, selectionNote, type ActivityStore, type CodeGraphStore, type DocsStore, type FactsStore, type GraphStore, type InsightsStore, type ModelHealth, type ModelJob, type OllamaHealth, type PipelineStatus, type ProviderHealth, type KnowledgeStore, type Lesson, type LinksStore, IMAGE_MEDIA_TYPES, MAX_IMAGE_BYTES, LINK_RELATIONS, LINK_STATUSES, linkPair, linkEnds, docIdOf, NotTheRunsError, type PortabilityStore, type Project, type ProjectSelection, type RelevanceBy, type ProjectSummary, type ScanQueueEntry, type ShownProjects, type WorkQueue, type WorkQueues, type StoreKind, type SystemStatus, type WorkerStatus, type AgentSeen, type RunnerReadiness, DEMO_SOURCE, contextWhy, FACT_ORIGINS, SCANNER_VERSION, RUN_ID, type RunPrincipal, type RunsStore, LESSON_QUALITY_DAYS, lessonQualityReport, type LessonQualityReport, type Candidate } from '@fb/core';
 import { chatRoutes, type ChatRouteDeps } from './chat.ts';
 import { trackedProject, type ContextDeps } from './context.ts';
-import { authenticated, needsAuth, ownerSession, OwnerSessions, SECURITY_HEADERS, sessionCookie, tokenMatches, type AuthOpts } from './auth.ts';
+import { authenticated, bearerToken, needsAuth, ownerSession, OwnerSessions, sessionValue, SECURITY_HEADERS, sessionCookie, SignInLinks, SIGNIN_LINK_TTL_MS, tokenMatches, type AuthOpts } from './auth.ts';
 import { cloudRoutes, cloudStatus, type CloudDeps, type CloudState } from './cloud.ts';
 import { createEventHub, type FgEvent } from './events.ts';
 import { demoRoutes, type DemoDeps } from './demo.ts';
-import { handleMcp } from './mcp.ts';
+import { handleMcp, MCP_BODY_LIMIT } from './mcp.ts';
 import { handleAdminMcp } from './adminMcp.ts';
 import { openApiDocument } from './openapi.ts';
-import { runCaller, runKey, actingAsOperator, currentCaller, asActor, currentActor, currentRun, hasOperatorToken, mayChange, mayChangeAny, operatorName, OWNER_ROUTES, refusedVerb, runAs, runFromOwner, runIn, runLabel, runVia } from './operator.ts';
-import { askingRun, openerOf, runAsked, runRoutes, runScoped, sameCaller } from './runs.ts';
+import { runCaller, runKey, sentRunKey, actingAsOperator, currentCaller, asActor, currentActor, currentRun, hasOperatorToken, mayChange, mayChangeAny, operatorName, OWNER_ROUTES, allowLine, refusedVerb, RUN_KEY_FORMAT, runAs, runFromOwner, runIn, runLabel, runVia } from './operator.ts';
+import { askingRun, runAsked, runConflict, runRoutes, runScoped, sameCaller } from './runs.ts';
 import { evidenceRoutes, type EvidenceDeps } from './evidence.ts';
 import { deleteProjects, settingsRoutes, type SettingsDeps } from './settings.ts';
-import { importRoutes, type ImportDeps } from './import.ts';
+import { importRoutes, Triggers, type ImportDeps } from './import.ts';
 import { sessionRoutes, type SessionsDeps } from './sessions.ts';
 import { connectionsStatus, integrationRoutes, type IntegrationsDeps } from './integrations.ts';
+import { loopRoutes, ownerOverrides, type LoopDeps } from './decisions.ts';
 
 export type { SettingsDeps } from './settings.ts';
 
@@ -79,6 +82,8 @@ export const BODY_LIMIT = 1 * MB;
 const UPLOAD_LIMITS: readonly [RegExp, number][] = [
   [/^\/api\/projects\/[^/]+\/docs$/, 16 * MB],
   [/^\/api\/import$/, 256 * MB],
+  // check_before_done's diff, as JSON (MCP_BODY_LIMIT).
+  [/^\/mcp$/, MCP_BODY_LIMIT],
 ];
 export const bodyLimitFor = (path: string) => UPLOAD_LIMITS.find(([re]) => re.test(path))?.[1] ?? BODY_LIMIT;
 
@@ -86,13 +91,17 @@ export const bodyLimitFor = (path: string) => UPLOAD_LIMITS.find(([re]) => re.te
 const ADMIN_MCP = '/mcp/admin';
 /** GET and DELETE /api/runs/:id: what a run wrote, and its cleanup. */
 const RUN_PATH = /^\/api\/runs\/[^/]+\/?$/;
+// Says only the refused key's length, never the key.
+const runKeyRefused = (sentKey: string) => `the run key sent is not one this API accepts (${sentKey.length} characters); it must be ${RUN_KEY_FORMAT}`;
 
+/** Host names a loopback-bound install answers to (a DNS-rebinding guard; the Host header never grants access). */
 const LOCAL_HOSTS = new Set(['localhost', '127.0.0.1', '[::1]']);
-const loopbackHost = (host: string) => LOCAL_HOSTS.has(host) || /^127(?:\.\d{1,3}){3}$/.test(host);
-const loopbackPeer = (address: string | undefined) => !!address && (address === '::1' || /^127(?:\.\d{1,3}){3}$/.test(address) || /^::ffff:127(?:\.\d{1,3}){3}$/i.test(address));
+/** Headers a reverse proxy or port-forward adds: a request carrying one did not come straight to this machine's port. */
+const FORWARDING = ['forwarded', 'x-forwarded-for', 'x-forwarded-host', 'x-forwarded-proto', 'x-forwarded-port', 'x-real-ip', 'via', 'cf-connecting-ip'];
+const loopbackHost = (host: string) => LOCAL_HOSTS.has(host);
 
-function hostname(hostHeader: string | undefined): string {
-  return (hostHeader ?? '').replace(/:\d+$/, '').toLowerCase();
+function hostname(hostHeader: string): string {
+  return hostHeader.replace(/:\d+$/, '').toLowerCase();
 }
 
 const DEV_ORIGINS = (process.env.ALLOWED_ORIGINS ?? 'http://localhost:5173,http://127.0.0.1:5173').split(',');
@@ -105,17 +114,20 @@ function originAllowed(origin: string, hostHeader: string): boolean {
 export type AppOpts = {
   /** Entire HTTP request, including middleware/store waits; defaults to55seconds. */
   requestTimeoutMs?: number;
-  /** Actual transport peer address. The Node entrypoint supplies the socket peer; unknown peers fail closed. */
+  /** Actual transport peer address. The Node entrypoint supplies the socket peer; unknown peers fail closed. Requests
+   * made in-process (app.request, tests) have no transport and no peer check. */
   peerAddress?: (c: Context) => string | undefined;
+  /** Peers a tokenless API answers (peer.ts localPeers: loopback and the API's own networks). */
+  localPeer?: (address: string | undefined) => boolean;
   staticDir?: string;
   context?: ContextDeps;
-  knowledge?: Pick<KnowledgeStore, 'listLessons' | 'lessonDetail' | 'updateLesson'> & Partial<Pick<KnowledgeStore, 'retryPostmortem' | 'postmortemBacklog' | 'postmortemQueue' | 'requestLessonRecheck' | 'decidedLessons'>>;
+  knowledge?: Pick<KnowledgeStore, 'listLessons' | 'lessonDetail' | 'updateLesson' | 'postmortemBacklog' | 'postmortemQueue' | 'requestLessonRecheck' | 'decidedLessons'> & Partial<Pick<KnowledgeStore, 'retryPostmortem'>>;
   embed?: (texts: string[]) => Promise<number[][]>;
   facts?: Pick<FactsStore, 'listProjects' | 'requestScan' | 'listFacts' | 'searchFacts'> & Partial<Pick<FactsStore, 'setFactRelevance' | 'setPinned' | 'cancelQueuedScan' | 'scanJob' | 'addOwnerFact' | 'olderScannerFiles' | 'scanQueue'>>;
   /** Folders under the configured roots that can be scanned. */
   projectDirs?: () => Promise<Project[]>;
   insights?: Pick<InsightsStore, 'projectGraph' | 'patterns'>;
-  activity?: Pick<ActivityStore, 'record' | 'list'> & Partial<Pick<ActivityStore, 'get' | 'removeRun'>>;
+  activity?: Pick<ActivityStore, 'record' | 'list' | 'removeRun'> & Partial<Pick<ActivityStore, 'get'>>;
   docs?: Pick<DocsStore, 'upsertDoc' | 'listDocs' | 'deleteDoc'> & Partial<Pick<DocsStore, 'docImage' | 'requeueDocRead'>>;
   links?: Pick<LinksStore, 'listLinks' | 'setLink' | 'deleteLink'>;
   auth?: AuthOpts;
@@ -130,8 +142,10 @@ export type AppOpts = {
     selection?(): Promise<ProjectSelection>;
     /** How many project roots are mounted: with none, the status note points to Settings to add one. */ roots?: number;
     /** Turns the classifier gave up on. */ givenUpTurns?(): Promise<number>;
+    /** The first agent seen (GraphStore.agentSeen), and recording it. */ agentSeen?(): Promise<AgentSeen | null>;
+    markAgentSeen?(client: string, at: string): Promise<void>;
     /** Whether Ollama answers (embeddings always need it; so do ollama:<model> jobs). */ ollama?(): Promise<OllamaHealth>;
-    runner?(): Promise<{ ok: boolean; reason: string | null }>;
+    runner?(): Promise<RunnerReadiness>;
   };
   /** Turns the classifier gave up on, and re-queueing them (owner-only). */
   classifyQueue?: Pick<GraphStore, 'givenUpTurns' | 'requeueGivenUpTurns'>;
@@ -164,6 +178,8 @@ export type AppOpts = {
   runs?: Pick<RunsStore, 'items' | 'remove' | 'claim' | 'owner' | 'sandbox'>;
   /** GET /api/sessions/:id/evidence: what the tool saw in one session and decided (evidence.ts). */
   evidence?: EvidenceDeps;
+  /** The learning loop: its decisions, state, settings and live events (decisions.ts). Unset: those routes are not there (404). */
+  loop?: LoopDeps;
   /** Aborted when the server shuts down: every open event stream ends at once, and no new one opens. */
   closing?: AbortSignal;
 };
@@ -179,7 +195,7 @@ const runWrite = () => {
 /** A store delete's ownership filter: in a run that may not change everything, only what the run wrote. */
 const runOnly = () => (mayChangeAny() ? {} : { run: currentRun()!.id });
 /** The 409 for a run's change to a record it does not own (NotTheRunsError). */
-const notTheRuns = (c: Context, what: string) => c.json({ error: new NotTheRunsError(what, currentRun()?.id ?? '').message }, 409);
+const notTheRuns = (c: Context, what: string) => c.json({ error: new NotTheRunsError(what, currentRun()!.id).message }, 409);
 
 /** Characters of each free-text field an Inbox list row carries; GET /api/candidates/:id has them whole. */
 const LIST_TEXT = 500;
@@ -299,14 +315,6 @@ const RelevanceRequest = z.object({ relevance: z.number().min(0).max(1) });
 /** Converting a lesson to a fact: the kind you chose (default convention) and how often everyday coding needs it. */
 const LessonToFact = z.object({ kind: z.enum(FACT_KINDS).default('convention'), relevance: z.number().min(0).max(1).default(EVERYDAY_FROM) }).strict();
 
-/** Where a fact from a lesson is filed: the lesson's first path (a glob cut back to its folder), else the project ('.'). */
-export function lessonFactPath(paths: string[]): string {
-  const first = paths.length ? cleanLessonPath(paths[0]) : null;
-  if (!first) return '.';
-  const segments = first.split('/');
-  const glob = segments.findIndex((s) => /[*?[\]{}]/.test(s));
-  return (glob < 0 ? segments : segments.slice(0, glob)).join('/').replace(/\/+$/, '') || '.';
-}
 /** Facts per page at most. A listing says where the next page starts in X-Next-Offset; no header: that was the last. */
 const MAX_FACTS_PAGE = 500;
 const FactsQuery = z.object({
@@ -350,6 +358,8 @@ const LessonPatch = z
     appliesWhen: z.string().max(1000).optional(),
     scope: z.enum(['task', 'project', 'global']).optional(),
     paths: z.array(z.string().max(300)).max(50).optional(),
+    // What in a later change shows it applies (LessonTriggers); replaces all three lists.
+    triggers: Triggers.optional(),
     supersedes: z.string().optional(),
     // Narrowing a global lesson (scope project or task): the project it now serves. Only for a lesson that is global.
     projectKey: z.string().min(1).max(200).optional(),
@@ -365,10 +375,7 @@ export const appSchemas = {
 };
 
 /** The Bearer token a request carries, trimmed; null when there is none (or it is empty). */
-const bearerOf = (c: Context): string | null => {
-  const h = c.req.header('authorization');
-  return h?.startsWith('Bearer ') && h.slice(7).trim() ? h.slice(7).trim() : null;
-};
+const bearerOf = (c: Context): string | null => bearerToken(c.req.header('authorization'));
 
 /** Could not reach the server at all, as opposed to a server that answered with a refusal. */
 const UNREACHABLE = /ECONNREFUSED|ECONNRESET|ENOTFOUND|EAI_AGAIN|EHOSTUNREACH|fetch failed|not reachable|socket hang up/i;
@@ -388,7 +395,7 @@ function stale(job: ModelJob, h: ProviderHealth, w: WorkerStatus, ollama: Ollama
 
 /** Each job's model as the worker last reported it. A job with no model (it could not be built) is unavailable, and
  * so is an Ollama model while Ollama does not answer, whether or not a job has asked it yet. */
-function modelHealth(w: WorkerStatus, ollama: OllamaHealth | null, runner: { ok: boolean; reason: string | null } | null = null): Record<ModelJob, ModelHealth> {
+function modelHealth(w: WorkerStatus, ollama: OllamaHealth | null, runner: RunnerReadiness | null = null): Record<ModelJob, ModelHealth> {
   const out = {} as Record<ModelJob, ModelHealth>;
   for (const job of MODEL_JOBS) {
     const provider = w.providers[job] ?? null;
@@ -402,7 +409,7 @@ function modelHealth(w: WorkerStatus, ollama: OllamaHealth | null, runner: { ok:
       : unbuilt
       ? { provider: null, ok: false, reason: job === 'classify' ? 'no classifier is configured (see the worker log)' : 'no summary model could be built (SUMMARY_LLM; see the worker log): summaries are paused' }
       : runner && !runner.ok && current?.startsWith('codex-cli')
-        ? { provider: current, ok: false, reason: runner.reason ?? 'codex runner sandbox unavailable' }
+        ? { provider: current, ok: false, reason: runner.reason ?? 'codex runner sandbox unavailable', ...(runner.disabled && { disabled: true as const }) }
       : ollama && !ollama.ok && current?.startsWith('ollama:')
         ? { provider: current, ok: false, reason: ollama.reason }
         : h && !h.ok
@@ -466,6 +473,7 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
   // Signed owner cookies survive an API restart/upgrade; logout still revokes
   // the current process copy and clears the browser cookie.
   const ownerSessions = new OwnerSessions(auth.ownerToken, auth.sessionStateFile);
+  if (ownerSessions.stateProblem) log?.('owner sessions reset', { reason: ownerSessions.stateProblem });
   app.onError((error, c) => {
     // Hono dispatches route errors through onError before outer middleware can classify a disconnected client.
     if (c.req.raw.signal.aborted) return new Response(null, { status: 499, statusText: 'Client Closed Request' });
@@ -511,17 +519,43 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
   const tokenlessLoopbackOwner = (c: Context) => !auth.token && !auth.ownerToken && !bearerOf(c)
     // A reverse proxy or port-forward can make a remote request look same-origin.
     // Tokenless compatibility is deliberately unavailable once forwarding metadata exists.
-    && !['forwarded', 'x-forwarded-for', 'x-forwarded-host', 'x-forwarded-proto', 'x-forwarded-port', 'x-real-ip', 'via', 'cf-connecting-ip']
-      .some((name) => c.req.header(name) !== undefined)
+    && !FORWARDING.some((name) => c.req.header(name) !== undefined)
     && loopbackHost(hostname(c.req.header('host') ?? new URL(c.req.url).host))
     && loopbackPeer(opts.peerAddress?.(c))
     && c.req.header('sec-fetch-site') === 'same-origin'
     && originAllowed(c.req.header('origin') ?? '', c.req.header('host') ?? new URL(c.req.url).host);
 
+  // Without any owner credential, owner actions need a loopback peer, which Docker's published port never gives (the
+  // API sees the bridge gateway): the containerised install is read-only for owner actions until --enable-auth.
+  const tokenlessOwnerRefused = (c: Context) => !auth.token && !auth.ownerToken && !loopbackPeer(opts.peerAddress?.(c));
+  /** Why a tokenless install refuses an owner action, and what works instead: fg --owner is taken by cleanup only. */
+  const readOnly = (verb: (typeof OWNER_ROUTES)[number][2], path: string) => 'this install has no owner token, so owner actions are read-only (the API cannot tell your browser or ./scripts/fg from any other program on the machine). '
+    + 'Run ./scripts/setup.sh --yes --enable-auth in the install folder (it restarts the API), then sign in with FG_OWNER_TOKEN in the browser (./scripts/fg signin), '
+    + (verb === 'run_cleanup' ? 'or run ./scripts/fg cleanup --owner'
+      : OPERATOR_DEFAULT_VERBS.includes(verb) ? `or let ./scripts/fg do it with FG_OPERATOR_TOKEN (it may ${verb} by default)`
+        : `or let ./scripts/fg do it with FG_OPERATOR_TOKEN and ${allowLine(OPERATOR_DEFAULT_VERBS, verb)} in .env (the defaults and ${verb})`)
+    + (path.startsWith('/api/loop') ? '. Until then the learning loop only observes; to stop it, set LOOP_DISABLED=1 in .env and run docker compose up -d' : '');
+  const localPeer = opts.localPeer ?? localPeers();
+
+  // One-time sign-in links (`fg signin`): asked for with the owner token, opened once in the browser on this machine.
+  const signInLinks = new SignInLinks();
+  /** Whether the code of each GET /api/session/link was live, read when it arrived (below). */
+  const signInAttempts = new WeakMap<Request, boolean>();
+  // A code is spent on any attempt, before any guard can refuse the request (a host that is not this install's
+  // included), so a code that reached the wrong host cannot be tried again on the right one.
+  app.get('/api/session/link', async (c, next) => {
+    signInAttempts.set(c.req.raw, signInLinks.redeem(c.req.query('code')));
+    await next();
+  });
   // Refuse DNS-rebinding hosts and cross-site writes; with a token configured, require it.
   app.use('*', async (c, next) => {
     const host = hostname(c.req.header('host') ?? new URL(c.req.url).host);
     if (!hosts.has(host) && !loopbackHost(host)) return c.json({ error: 'forbidden host' }, 403);
+    // Without API_TOKEN reads are open, so only this machine may make them: the socket peer decides, never the Host.
+    if (!auth.token && needsAuth(c.req.path) && opts.peerAddress && !localPeer(opts.peerAddress(c))) {
+      log?.('auth refused', { method: c.req.method, path: c.req.path, reason: 'tokenless install, peer not on this machine' });
+      return c.json({ error: 'this install has no API_TOKEN, so it answers only this machine; run ./scripts/setup.sh --yes --enable-auth to reach it from elsewhere' }, 403);
+    }
     // The admin MCP endpoint answers only the operator token: without it, it does not exist (no token sent, or
     // FG_OPERATOR_TOKEN unset); a bearer that is not the operator token (the API token included) is refused.
     if (c.req.path === ADMIN_MCP && !hasOperatorToken(c, auth.operator)) {
@@ -530,12 +564,12 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
       return c.json({ error: 'the admin MCP endpoint takes FG_OPERATOR_TOKEN as the Bearer: check it against the .env this Feedback Graph runs with' }, 401);
     }
     const operator = hasOperatorToken(c, auth.operator);
-    const ownerCredential = !!auth.ownerToken && tokenMatches(bearerOf(c) ?? '', auth.ownerToken);
+    const ownerCredential = !!auth.ownerToken && tokenMatches(bearerOf(c), auth.ownerToken);
     const ownerBearer = (c.req.header('x-fg-owner') === 'true' || c.req.header('x-fg-owner-cleanup') === 'true') && ownerCredential;
     if (c.req.header('x-fg-owner-cleanup') === 'true') {
-      if (auth.ownerToken && !tokenMatches(bearerOf(c) ?? '', auth.ownerToken)) return c.json({ error: 'headless owner cleanup requires the configured FG_OWNER_TOKEN' }, 403);
+      if (auth.ownerToken && !tokenMatches(bearerOf(c), auth.ownerToken)) return c.json({ error: 'headless owner cleanup requires the configured FG_OWNER_TOKEN' }, 403);
       // Without FG_OWNER_TOKEN, preserve the local owner's browser-Origin model; normal origin validation follows.
-      if (!auth.ownerToken && c.req.header('sec-fetch-site') !== 'same-origin') return c.json({ error: 'tokenless owner cleanup requires the same-origin browser UI; fg --owner requires FG_OWNER_TOKEN' }, 403);
+      if (!auth.ownerToken && c.req.header('sec-fetch-site') !== 'same-origin') return c.json({ error: 'a tokenless install is read-only for owner actions: run ./scripts/setup.sh --yes --enable-auth, then ./scripts/fg cleanup --owner' }, 403);
     }
     if (needsAuth(c.req.path)) {
       if (!authenticated(c, auth.token, ownerSessions) && !operator && !ownerCredential) {
@@ -571,15 +605,18 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
     const browser = ownerSession(c, ownerSessions);
     const localBrowser = tokenlessLoopbackOwner(c);
     const principal: RunPrincipal = operator ? 'operator' : (browser || localBrowser) ? 'browser' : ownerBearer ? 'owner_token' : 'agent';
-    const runCapability = (operator || (!!auth.token && tokenMatches(bearerOf(c) ?? '', auth.token)))
-      ? runKey(c.req.header('x-fg-run-key'), auth.runKeySalt) : null;
+    const runCredential = operator || (!!auth.token && tokenMatches(bearerOf(c), auth.token));
+    const runCapability = runCredential ? runKey(sentRunKey(c.req.header('x-fg-run-key')), auth.runKeySalt) : null;
     // A sandbox run name is an identifier, not a credential. Reads need the same private
     // capability as writes; the owner can inspect runs through the authenticated owner path.
     const sandboxRunId = run?.id ?? (RUN_PATH.test(c.req.path) ? decodeURIComponent(c.req.path.split('/').filter(Boolean).at(-1)!) : c.req.query('run'));
-    if (sandboxRunId && (run?.sandbox || await opts.runs?.sandbox?.(sandboxRunId))) {
+    if (sandboxRunId && (run?.sandbox || await opts.runs?.sandbox(sandboxRunId))) {
       const ownerAccess = ownerBearer || browser || localBrowser;
       const owner = await opts.runs?.owner(sandboxRunId);
       if (!ownerAccess && !(runCapability && (!owner || owner.actor === runCapability))) {
+        // The token with a run key that runKey refused: the key, not the token, is what to change.
+        const sentKey = sentRunKey(c.req.header('x-fg-run-key'));
+        if (runCredential && !runCapability && sentKey !== undefined) return c.json({ error: runKeyRefused(sentKey) }, 403);
         return c.json({ error: 'sandbox run access requires API_TOKEN or FG_OPERATOR_TOKEN plus its private FG_RUN_KEY, or the authenticated owner' }, 403);
       }
     }
@@ -596,7 +633,7 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
   // a 3 MB note is refused here, not read whole before the 4,000-character check.
   app.use('*', (c, next) => {
     const maxSize = bodyLimitFor(c.req.path);
-    const error = `request body too large: this route takes at most ${maxSize / MB} MB`;
+    const error = `request body too large: this route takes at most ${Math.round(maxSize / MB * 10) / 10} MB`;
     return bodyLimit({
       maxSize,
       // An MCP client reads a JSON-RPC error, not a REST one.
@@ -614,21 +651,21 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
   const allowed = new Set(auth.operator?.allow ?? []);
   const ownerOnly = (verb: (typeof OWNER_ROUTES)[number][2]) => async (c: Context, next: Next) => {
     if (hasOperatorToken(c, auth.operator)) {
-      if (!allowed.has(verb)) return c.json(refusedVerb(verb), 403);
+      if (!allowed.has(verb)) return c.json(refusedVerb(verb, [...allowed]), 403);
       return runAs(operatorName(c.req.header('x-fg-operator')), next);
     }
     // The bundled demo is deliberately local-only and disposable. Let an authenticated sandbox run prepare/remove
     // only that fixture without handing the probed agent an operator credential. The private run key binds every
     // resulting write and cleanup to this one labelled probe; all real project and lesson decisions remain owner-only.
     const run = currentRun();
-    if (verb === 'demo' && run?.sandbox && auth.token && tokenMatches(bearerOf(c) ?? '', auth.token)
-      && runKey(c.req.header('x-fg-run-key'), auth.runKeySalt)) return next();
+    if (verb === 'demo' && run?.sandbox && auth.token && tokenMatches(bearerOf(c), auth.token)
+      && runKey(sentRunKey(c.req.header('x-fg-run-key')), auth.runKeySalt)) return next();
     // Cleanup is unlabelled by design (the path names the run). An API-token
     // probe may reach it with its private caller key; runRoutes verifies that
     // the stored run owner has the same salted caller before deleting anything.
-    if (verb === 'run_cleanup' && auth.token && tokenMatches(bearerOf(c) ?? '', auth.token)
-      && runKey(c.req.header('x-fg-run-key'), auth.runKeySalt)) return next();
-    if ((c.req.header('x-fg-owner') === 'true' || c.req.header('x-fg-owner-cleanup') === 'true') && auth.ownerToken && tokenMatches(bearerOf(c) ?? '', auth.ownerToken)) {
+    if (verb === 'run_cleanup' && auth.token && tokenMatches(bearerOf(c), auth.token)
+      && runKey(sentRunKey(c.req.header('x-fg-run-key')), auth.runKeySalt)) return next();
+    if ((c.req.header('x-fg-owner') === 'true' || c.req.header('x-fg-owner-cleanup') === 'true') && auth.ownerToken && tokenMatches(bearerOf(c), auth.ownerToken)) {
       log?.('owner token decision', { method: c.req.method, path: c.req.path });
       return next();
     }
@@ -637,12 +674,20 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
     const offered = bearerOf(c);
     if (offered && auth.ownerToken && tokenMatches(offered, auth.ownerToken)) return c.json({ error: 'FG_OWNER_TOKEN owner writes require X-FG-Owner: true' }, 403);
     if (auth.operator?.token && offered && !(auth.token && tokenMatches(offered, auth.token))) return unrecognised(c);
+    // The API token with a run key that runKey refused, on a cleanup: the key, not the token, is what to change. (A
+    // sandbox run's demo with a refused key never gets here: the run check in the first middleware answers it.)
+    const sentKey = sentRunKey(c.req.header('x-fg-run-key'));
+    if (sentKey !== undefined && verb === 'run_cleanup' && auth.token && tokenMatches(offered, auth.token)) {
+      return c.json({ error: runKeyRefused(sentKey) }, 403);
+    }
     // A bearer request is an API client, even if it forges browser Fetch Metadata. API_TOKEN is deliberately an
     // agent/read credential; it never inherits the browser owner's authority.
     if (offered) return c.json({ error: 'this Bearer is not an owner credential; use the browser session, FG_OWNER_TOKEN with X-FG-Owner: true, or FG_OPERATOR_TOKEN with an allowed verb' }, 403);
     if (tokenlessLoopbackOwner(c)) return next();
     if (!ownerSession(c, ownerSessions)) {
       log?.('owner decision refused', { method: c.req.method, path: c.req.path, reason: 'missing same-origin browser provenance' });
+      // Tokenless, every caller but the loopback same-origin UI (a CLI inside the container included) is read-only.
+      if (!auth.token && !auth.ownerToken) return c.json({ error: readOnly(verb, c.req.path), readOnly: true }, 403);
       return c.json({ error: 'only you can make this decision, from the Feedback Graph UI, or with FG_OPERATOR_TOKEN as a Bearer for the verbs OPERATOR_ALLOW names' }, 403);
     }
     await next();
@@ -663,14 +708,14 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
     const operator = hasOperatorToken(c, auth.operator);
     const browser = ownerSession(c, ownerSessions);
     const ownerBearer = (c.req.header('x-fg-owner') === 'true' || c.req.header('x-fg-owner-cleanup') === 'true')
-      && !!auth.ownerToken && tokenMatches(bearerOf(c) ?? '', auth.ownerToken);
+      && !!auth.ownerToken && tokenMatches(bearerOf(c), auth.ownerToken);
     const principal: RunPrincipal = operator ? 'operator' : browser ? 'browser' : ownerBearer ? 'owner_token' : 'agent';
     if (run && opts.runs && c.req.method !== 'GET' && c.req.method !== 'HEAD') {
       const sessionRegistration = /^\/api\/sessions\/[^/]+\/run$/.test(c.req.path) && c.req.method === 'POST';
-      const agent = !!auth.token && tokenMatches(bearerOf(c) ?? '', auth.token);
-      const actor = (operator || agent) ? runKey(c.req.header('x-fg-run-key'), auth.runKeySalt) : null;
+      const agent = !!auth.token && tokenMatches(bearerOf(c), auth.token);
+      const actor = (operator || agent) ? runKey(sentRunKey(c.req.header('x-fg-run-key')), auth.runKeySalt) : null;
       if (principal === 'agent' && sessionRegistration && (!agent || !actor || !run.sandbox)) return c.json({ error: 'labelled session registration requires the API token, a private FG_RUN_KEY, and FG_SANDBOX=1, or an authenticated operator/local owner' }, 403);
-      if (operator && !actor) return c.json({ error: 'labelled operator writes require X-FG-Run-Key (FG_RUN_KEY): a private random secret of at least 32 characters with adequate diversity (generate: openssl rand -hex 32)' }, 403);
+      if (operator && !actor) return c.json({ error: `labelled operator writes require ${RUN_KEY_FORMAT}` }, 403);
       // Refused attempts to edit an owner's existing record must not reserve an otherwise unused run id.
       if (!(await opts.runs.owner(run.id)) && !mayChangeAny()) {
         const lessonPath = /^\/api\/lessons\/([^/]+)(?:\/to-fact)?$/.exec(c.req.path);
@@ -697,13 +742,13 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
         try { owner = await opts.runs!.claim(run.id, principal, actor); }
         catch (error) { if (error instanceof LegacyRunClaimError) conflict = error.message; throw error; }
         if (!sameCaller(owner, principal, actor)) {
-          conflict = `run id belongs to another caller: ${run.id} was opened by ${openerOf(owner)} at ${owner.firstSeen}; use the same credential and FG_RUN_KEY that opened it, or choose another run id only for a genuinely separate run`;
+          conflict = runConflict(run.id, owner, principal);
           throw new Error(conflict);
         }
       };
       const existing = await opts.runs.owner(run.id);
       if (existing && !sameCaller(existing, principal, actor)) {
-        const error = `run id belongs to another caller: ${run.id} was opened by ${openerOf(existing)} at ${existing.firstSeen}; use the same credential and FG_RUN_KEY that opened it, or choose another run id only for a genuinely separate run`;
+        const error = runConflict(run.id, existing, principal);
         return mcp ? c.json({ jsonrpc: '2.0', id: null, error: { code: -32600, message: error } }, 409) : c.json({ error }, 409);
       }
       // Registration itself is the run claim. Session binding is not one of the guarded graph repositories, so do
@@ -735,6 +780,7 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
     const worker = graph ? ((await system?.worker().catch(() => null)) ?? null) : null;
     const sel = graph && system?.selection ? await system.selection().catch(() => null) : null;
     const givenUpTurns = graph && system?.givenUpTurns ? await system.givenUpTurns().catch(() => null) : null;
+    const agent = graph && system?.agentSeen ? await system.agentSeen().catch(() => null) : null;
     const ollama = system?.ollama ? await system.ollama().catch(() => null) : null;
     const runner = system?.runner ? await system.runner().catch(() => ({ ok: false, reason: 'codex runner health check failed' })) : null;
     const workerHealthy = !!worker && Date.now() - Date.parse(worker.lastBeat) < WORKER_STALE_MS;
@@ -742,11 +788,17 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
     const staleCodeMaps = graph && facts && codegraph ? await Promise.all((await facts.listProjects()).filter((p) => !sel || sel.tracked.includes(p.key)).map(async p => {
       const meta = await codegraph.codeMapMeta(p.key).catch(() => null);
       if (!meta) return null;
-      const ageDays = Math.max(0, Math.floor((Date.now() - Date.parse(meta.builtAt)) / 86_400_000));
+      // No build time: a CodeMap node 0.7.5 made to record the failure of a first build that never finished (Neo4j).
+      const builtAt = meta.builtAt || null;
+      const ageDays = builtAt ? Math.max(0, Math.floor((Date.now() - Date.parse(builtAt)) / 86_400_000)) : null;
       // Age alone is not stale: unchanged repositories legitimately keep an old, still-current map.
-      return meta.lastFailureAt || meta.fingerprint === null
-        ? { projectKey: p.key, builtAt: meta.builtAt, ageDays, ...(meta.fingerprint === null ? { interrupted: true } : {}), lastFailureAt: meta.lastFailureAt, lastFailure: meta.lastFailure }
-        : null;
+      if (!meta.lastFailureAt && meta.fingerprint !== null) return null;
+      // A cleared fingerprint is a write in progress while its lease is renewed (the worker writing it is alive), that
+      // worker started before it and has recorded no failure since; otherwise that write was cut short.
+      const rebuilding = meta.fingerprint === null && !!meta.writingAt && !!meta.writingBeat && Date.now() - Date.parse(meta.writingBeat) < CODE_MAP_LEASE_MS
+        && workerHealthy && Date.parse(worker!.startedAt) <= Date.parse(meta.writingAt)
+        && !(meta.lastFailureAt && meta.lastFailureAt >= meta.writingAt);
+      return { projectKey: p.key, builtAt, ageDays, checkedAt: meta.checkedAt || builtAt, ...(rebuilding ? { rebuilding: true } : meta.fingerprint === null ? { interrupted: true } : {}), lastFailureAt: meta.lastFailureAt, lastFailure: meta.lastFailure };
     })).then(rows => rows.filter((x): x is NonNullable<typeof x> => !!x)) : undefined;
     const s: SystemStatus = {
       version: system?.version ?? 'dev',
@@ -763,6 +815,7 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
       cloud: cloudStatus(cloud?.cloud ?? null, cloudState),
       models,
       givenUpTurns,
+      agent,
       ollama,
       connections: await connectionsStatus({ integrations: graph ? (integrations?.integrations ?? null) : null, deps: integrations, worker, models, ollama, cloud: cloud?.cloud ?? null, manualSync: cloudState?.lastManual() ?? null }).catch(() => null),
     };
@@ -772,9 +825,9 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
   // The first-run panel: every stage's count in one call. Each count fails on its own (null), never the whole answer.
   // ?project=: one project's counts (an empty state filtered to it); the classify backlog and the stage stay worker-wide.
   // How the owner decided the post-mortem's lessons (approved as written, after an edit, rejected), in the shown
-  // projects or the one asked for. Null: the store cannot tell.
+  // projects or the one asked for. Null: no knowledge store.
   const lessonQualityFor = async (project?: string): Promise<LessonQualityReport | null> => {
-    if (!knowledge?.decidedLessons) return null;
+    if (!knowledge) return null;
     const v = await view();
     const keys = project ? (keysFor(v, project) ?? [project]) : keysFor(v);
     const since = new Date(Date.now() - Math.max(...LESSON_QUALITY_DAYS) * 86_400_000).toISOString();
@@ -804,9 +857,9 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
       count(() => pending('confirmed')),
       knowledge ? count(() => lessons('proposed')) : null,
       knowledge ? count(() => lessons('approved')) : null,
-      knowledge?.postmortemBacklog ? count(() => knowledge.postmortemBacklog!()) : null,
+      knowledge ? count(() => knowledge.postmortemBacklog()) : null,
       facts?.scanQueue ? count(() => facts.scanQueue!()) : null,
-      knowledge?.postmortemQueue ? count(() => knowledge.postmortemQueue!()) : null,
+      knowledge ? count(() => knowledge.postmortemQueue()) : null,
       opts.chat?.store.chatQueue ? count(() => opts.chat!.store.chatQueue!()) : null,
       count(() => lessonQualityFor(project)),
     ]);
@@ -834,6 +887,7 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
       // global: the lessons with no project of their own (they serve every project), which no project's row counts.
       lessons: proposed === null || approved === null ? null : {
         proposed: proposed.length, approved: approved.length, global: [...proposed, ...approved].filter((l) => !l.projectKey).length,
+        demo: { proposed: proposed.filter((l) => l.source === DEMO_SOURCE).length, approved: approved.filter((l) => l.source === DEMO_SOURCE).length },
         ...(quality && { quality: quality.windows }),
       },
       scans,
@@ -912,20 +966,45 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
     authenticated: ownerSession(c, ownerSessions),
     ownerSession: ownerSession(c, ownerSessions),
     ownerSetupRequired: !!auth.token && !auth.ownerToken,
+    // False: this browser cannot make owner decisions here (a tokenless install reached through Docker's published port).
+    ownerWrites: auth.token || auth.ownerToken ? ownerSession(c, ownerSessions) : !tokenlessOwnerRefused(c),
   }));
   app.post('/api/session', async (c) => {
     if (!auth.ownerToken) return c.json({ error: 'FG_OWNER_TOKEN is required to create an owner browser session; run setup to create one' }, 403);
     const body = await c.req.json().catch(() => null);
     if (!tokenMatches(body?.token, auth.ownerToken)) return c.json({ error: 'wrong owner token' }, 401);
-    c.header('set-cookie', sessionCookie(ownerSessions.create(), secure(c), false, ownerSessions.cookieName));
+    c.header('set-cookie', sessionCookie(ownerSessions.create(), secure(c), false, ownerSessions.cookieName(c.req.header('host'))));
     return c.body(null, 204);
   });
+  /** Reached as localhost, directly: a link is for the browser on this machine, never through a proxy or a public name. */
+  const localOnly = (c: Context) => loopbackHost(hostname(c.req.header('host') ?? new URL(c.req.url).host)) && !FORWARDING.some((name) => c.req.header(name) !== undefined);
+  app.post('/api/session/link', (c) => {
+    if (!auth.ownerToken) return c.json({ error: 'FG_OWNER_TOKEN is required to sign in; run ./scripts/setup.sh --yes --enable-auth' }, 403);
+    if (!tokenMatches(bearerOf(c) ?? '', auth.ownerToken)) return c.json({ error: 'a sign-in link needs FG_OWNER_TOKEN as the Bearer' }, 401);
+    if (!localOnly(c)) return c.json({ error: 'sign-in links are only for this machine: ask for one at localhost' }, 403);
+    return c.json({ path: `/api/session/link?code=${signInLinks.create()}`, expiresInSeconds: SIGNIN_LINK_TTL_MS / 1000 });
+  });
+  app.get('/api/session/link', (c) => {
+    const live = signInAttempts.get(c.req.raw);
+    const refuse = (why: string) => c.text(`${why} Run ./scripts/fg signin in the Feedback Graph folder for a new link.`, 403);
+    if (!auth.ownerToken) return refuse('This install has no owner sign-in (FG_OWNER_TOKEN).');
+    if (!localOnly(c)) return refuse('Sign-in links work only at localhost on this machine.');
+    if (!live) return refuse('This sign-in link has expired or was already used.');
+    c.header('set-cookie', sessionCookie(ownerSessions.create(), secure(c), false, ownerSessions.cookieName(c.req.header('host'))));
+    c.header('cache-control', 'no-store');
+    return c.redirect('/', 303);
+  });
   app.delete('/api/session', (c) => {
-    const prefix = `${ownerSessions.cookieName}=`;
-    const value = c.req.header('cookie')?.split(';').map(v => v.trim()).find(v => v.startsWith(prefix))?.slice(prefix.length);
+    const value = sessionValue(c, ownerSessions);
     // Anonymous DELETEs only clear the browser cookie; they must not grow the durable revocation set.
-    if (ownerSessions.has(value)) ownerSessions.remove(value);
-    c.header('set-cookie', sessionCookie('', secure(c), true, ownerSessions.cookieName));
+    if (value) {
+      try { ownerSessions.remove(value); }
+      catch (error) {
+        log?.('sign-out not saved', { error: String(error) });
+        return c.json({ error: 'the sign-out could not be saved (check that the API settings folder is writable), so this session was not revoked' }, 500);
+      }
+    }
+    c.header('set-cookie', sessionCookie('', secure(c), true, ownerSessions.cookieName(c.req.header('host'))));
     return c.body(null, 204);
   });
 
@@ -961,6 +1040,7 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
     if (!detail) return false;
     if (!mayChange(detail.candidate)) throw new NotTheRunsError(`the Inbox item ${id}`, currentRun()!.id);
     await repo.decide(id, status, note, currentActor());
+    await overrideLoop([id]);
     const text = detail.turn.text ?? '';
     const who = actingAsOperator() ? `an agent (${currentActor()})` : 'you';
     await activity?.record({
@@ -981,7 +1061,7 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
     const detail = await shownCandidate(c.req.param('id'));
     if (!detail) return c.json({ error: 'not found' }, 404);
     if (!mayChange(detail.candidate)) return c.json({ error: 'this Inbox item belongs to another run' }, 409);
-    if (!repo.undoDecision || !await repo.undoDecision(detail.candidate.id, body.data.decidedAt)) return c.json({ error: 'This decision changed or its post-mortem has started. Review the item and any resulting lessons before changing it.' }, 409);
+    if (!await repo.undoDecision(detail.candidate.id, body.data.decidedAt)) return c.json({ error: 'This decision changed or its post-mortem has started. Review the item and any resulting lessons before changing it.' }, 409);
     await activity?.record({ kind: 'items_reopened', actor: 'you', projectKey: detail.candidate.projectKey, subject: 'Inbox decision undone', why: 'you reopened this decision before any post-mortem attempt or derived lesson', targets: [detail.candidate.id] });
     return c.body(null, 204);
   });
@@ -1023,10 +1103,19 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
 
   // A labelled run's writes carry it, and a sandbox run's records are served only to that run (runs.ts).
   const mcpContext = context && runScoped(context);
+  // The Dashboard's "Connect your agent" step: the first tool call from an agent's MCP client is stored, once.
+  let agentMarked = false;
+  const markAgent = system?.markAgentSeen && (async (client: string) => {
+    if (agentMarked) return;
+    await system.markAgentSeen!(client, new Date().toISOString()).then(
+      () => { agentMarked = true; },
+      (e: unknown) => log?.('first agent not recorded', { error: redactSecrets(e instanceof Error ? e.message : String(e)).slice(0, 300) }),
+    );
+  });
   if (mcpContext) app.all('/mcp', (c) => {
     const credential = bearerOf(c);
     const verified = credential && (hasOperatorToken(c, auth.operator) || (auth.token && tokenMatches(credential, auth.token)));
-    return handleMcp(c.req.raw, mcpContext, verified ? credential : undefined);
+    return handleMcp(c.req.raw, mcpContext, verified ? credential : undefined, markAgent || undefined);
   });
   // Owner decisions for an agent holding the operator token (adminMcp.ts): each tool calls the REST route in-process,
   // so the OPERATOR_ALLOW gate, validation and Activity are the route's own. Not mounted without FG_OPERATOR_TOKEN.
@@ -1074,12 +1163,18 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
       return runner && !runner.ok ? { blocked: true, warning: `Scan queued but parked: ${(runner.reason ?? 'runner unavailable').trim().replace(/[.]+$/, '')}. No repository will be copied until runner readiness succeeds.` } : {};
     };
 
+    // A folder that is not among the selected ones: one that exists but is not selected says so (projectDirs lists only
+    // the selected), rather than "no such folder" for a folder fg projects list shows.
+    const notScannable = async (key: string) => ((await settings?.folders().catch(() => []))?.some((f) => f.key === key)
+      ? `${key} is not selected: choose it in Settings first (fg projects select --key ${key})`
+      : 'no such folder under the configured roots');
+
     app.post('/api/projects/:key/scan', async (c) => {
       const body = ScanRequest.safeParse(await c.req.json().catch(() => ({})));
       if (!body.success) return c.json({ error: body.error.flatten() }, 400);
       if (!scanProviderAllowed(body.data.provider)) return c.json({ error: `scan provider ${body.data.provider} is not in SCAN_PROVIDER_ALLOW` }, 403);
       const project = (await projectDirs()).find((p) => p.key === c.req.param('key'));
-      if (!project) return c.json({ error: 'no such folder under the configured roots' }, 404);
+      if (!project) return c.json({ error: await notScannable(c.req.param('key')) }, 404);
       const job = await facts.requestScan(project, body.data.provider ?? null);
       return c.json({ ...job, ...await scanReadiness(body.data.provider) }, 202);
     });
@@ -1107,7 +1202,7 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
       const results = [];
       for (const key of keys) {
         const project = folders.find((p) => p.key === key);
-        if (!project) results.push({ key, queued: false, error: 'no such folder under the configured roots' });
+        if (!project) results.push({ key, queued: false, error: await notScannable(key) });
         else if (v && !v.has(key)) results.push({ key, queued: false, error: 'not selected: choose it in Settings first' });
         else results.push({ key, queued: true, ...readiness, job: { ...await facts.requestScan(project, body.data.provider ?? null), ...readiness } });
       }
@@ -1184,6 +1279,7 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
         // In a run, only a fact the run wrote; otherwise the owner's setting (a run's fact becomes the owner's).
         const changed = await setRelevance([{ id, relevance: body.data.relevance, by: currentActor() as RelevanceBy, projectKey, run: mayChangeAny() ? null : currentRun()!.id }]);
         if (!changed) return c.json({ error: currentRun() ? 'no such fact in this project among the facts this run wrote' : 'no such fact in this project' }, 404);
+        await overrideLoop([id]);
         await activity?.record({
           kind: 'fact_relevance_set', actor: 'you', projectKey,
           subject: `set a fact to ${relevanceBand(body.data.relevance)} (${body.data.relevance})`,
@@ -1209,6 +1305,11 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
       const kept = embedding.get(id);
       return kept && { status: kept.status, ...(kept.error && { error: kept.error }), chunks: kept.chunks };
     };
+    /** A document id's parts (doc[@<run>]:<project>:<source>:<ref>); null for anything else. */
+    const docIdParts = (id: string) => {
+      const parts = id.split(':');
+      return parts.length >= 4 ? { projectKey: parts[1], source: parts[2], ref: parts.slice(3).join(':') } : null;
+    };
     const withEmbed = <D extends { id: string }>(d: D) => {
       const e = embedOf(d.id);
       return e ? { ...d, embed: e } : d;
@@ -1232,11 +1333,10 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
     // document may be past the list's first page). Not stored yet: what is known of the upload, while it is pending or failed.
     app.get('/api/docs/:id', async (c) => {
       const id = c.req.param('id');
-      // ids are doc[@<run>]:<project>:<source>:<ref>
-      const [, projectKey = '', source = '', ...ref] = id.split(':');
-      if (!(await shows(projectKey))) return c.json({ error: 'not found' }, 404);
-      const src = DocSourceParam.safeParse(source);
-      const stored = src.success ? (await docs.listDocs(projectKey, { source: src.data, ref: ref.join(':'), limit: 5, run: askingRun() })).find((d) => d.id === id) : undefined;
+      const parts = docIdParts(id);
+      if (!parts || !(await shows(parts.projectKey))) return c.json({ error: 'not found' }, 404);
+      const src = DocSourceParam.safeParse(parts.source);
+      const stored = src.success ? (await docs.listDocs(parts.projectKey, { source: src.data, ref: parts.ref, limit: 5, run: askingRun() })).find((d) => d.id === id) : undefined;
       if (stored) return c.json(withEmbed(stored));
       // Another run's sandbox upload (doc@<run>:...) is not shown, as in the list.
       const run = id.startsWith('doc@') ? id.slice(4, id.indexOf(':')) : null;
@@ -1290,7 +1390,8 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
         // A large upload is answered now and embedded in the background (the request's run and actor go with it): it is
         // pending (embed) until stored, the earlier version of that name meanwhile marked so in the list; a failure is
         // kept on it with why, and logged in Activity.
-        const doc = { projectKey: project.key, ref: name, title, addedBy: currentActor(), kind: image ? 'image' as const : 'text' as const, mediaType: image?.mediaType ?? null };
+        // Only text runs past one batch: an image is one placeholder chunk.
+        const doc = { projectKey: project.key, ref: name, title, addedBy: currentActor(), kind: 'text' as const, mediaType: null };
         const started = { status: 'pending' as const, chunks: chunks.length, at: Date.now(), doc };
         embedding.set(replaces, started);
         void add().then(() => {
@@ -1318,8 +1419,8 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
     if (docImage) {
       app.get('/api/docs/:id/image', async (c) => {
         const id = c.req.param('id');
-        // ids are doc:<project>:<source>:<ref>
-        if (!(await shows(id.split(':')[1] ?? ''))) return c.json({ error: 'not found' }, 404);
+        const parts = docIdParts(id);
+        if (!parts || !(await shows(parts.projectKey))) return c.json({ error: 'not found' }, 404);
         const img = await docImage(id);
         if (!img) return c.json({ error: 'not found' }, 404);
         return c.body(Buffer.from(img.data, 'base64'), 200, {
@@ -1336,13 +1437,12 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
     if (requeueDocRead) {
       app.post('/api/docs/:id/reread', async (c) => {
         const id = c.req.param('id');
-        // ids are doc:<project>:<source>:<ref>
-        const [, projectKey = '', , ...ref] = id.split(':');
-        if (!(await shows(projectKey))) return c.json({ error: 'not found' }, 404);
+        const parts = docIdParts(id);
+        if (!parts || !(await shows(parts.projectKey))) return c.json({ error: 'not found' }, 404);
         if (!(await requeueDocRead(id))) return c.json({ error: 'not found, or not waiting to be read again' }, 404);
         await activity?.record({
-          kind: 'doc_added', actor: 'you', projectKey,
-          subject: `asked for ${ref.join(':') || id} to be read again`, why: 'its reading failed; the worker reads it again on its next cycle', details: {}, targets: [id],
+          kind: 'doc_added', actor: 'you', projectKey: parts.projectKey,
+          subject: `asked for ${parts.ref} to be read again`, why: 'its reading failed; the worker reads it again on its next cycle', details: {}, targets: [id],
         });
         return c.body(null, 204);
       });
@@ -1350,14 +1450,13 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
 
     app.delete('/api/docs/:id', async (c) => {
       const id = c.req.param('id');
-      // ids are doc:<project>:<source>:<ref>
-      if (!(await shows(id.split(':')[1] ?? ''))) return c.json({ error: 'not found' }, 404);
+      const parts = docIdParts(id);
+      if (!parts || !(await shows(parts.projectKey))) return c.json({ error: 'not found' }, 404);
       // In a run, only a document the run uploaded (runOnly).
       if (!(await docs.deleteDoc(id, runOnly()))) return c.json({ error: currentRun() ? 'not found among the documents this run uploaded' : 'not found' }, 404);
-      // ids are doc:<project>:<source>:<ref>
       await activity?.record({
-        kind: 'doc_removed', actor: 'you', projectKey: id.split(':')[1] ?? null,
-        subject: `removed ${id.split(':').slice(3).join(':') || id}`, why: 'you removed it from the Projects page', details: {}, targets: [id],
+        kind: 'doc_removed', actor: 'you', projectKey: parts.projectKey,
+        subject: `removed ${parts.ref}`, why: 'you removed it from the Projects page', details: {}, targets: [id],
       });
       return c.body(null, 204);
     });
@@ -1476,8 +1575,11 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
     app.get('/api/projects/:key/codemap/module', async (c) => {
       const path = RepoPath.safeParse(c.req.query('path'));
       if (!path.success) return c.json({ error: 'path must be a repo-relative file path' }, 400);
-      const m = await codegraph.moduleContext(c.req.param('key'), path.data, askingRun());
-      if (!m) return c.json({ error: 'not in the code map' }, 404);
+      const found = await codegraph.moduleContext(c.req.param('key'), path.data, askingRun());
+      if (!found) return c.json({ error: 'not in the code map' }, 404);
+      // Past the cap the map keeps no symbols: parse them from the file now, as get_module_context does.
+      const repoPath = found.outside && context?.parseSymbols ? (await projectDirs?.())?.find((p) => p.key === c.req.param('key'))?.repoPath : undefined;
+      const m = repoPath ? { ...found, symbols: (await context!.parseSymbols!(repoPath, path.data).catch(() => null)) ?? [] } : found;
       const v = await view();
       return c.json({ ...m, lessons: m.lessons.filter((l) => showsLesson(v, l)) });
     });
@@ -1548,6 +1650,10 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
   if (opts.chat) chatRoutes(app, opts.chat, view);
   if (opts.runs && activity) runRoutes(app, { store: opts.runs, activity });
   if (opts.evidence) evidenceRoutes(app, opts.evidence);
+  // Tokenless installs are read-only for owner actions, so the loop runs at most in observe there (loop/state.ts).
+  if (opts.loop) loopRoutes(app, { ...opts.loop, activity: asActor(opts.loop.activity) }, { tokenless: !auth.token && !auth.ownerToken, view });
+  /** The owner's own write to these lessons or facts overrides the loop decisions it changed (decisions.ts ownerOverrides). */
+  const overrideLoop = opts.loop ? ownerOverrides({ ...opts.loop, activity: asActor(opts.loop.activity) }) : async () => {};
 
   if (activity) {
     app.get('/api/activity', async (c) => {
@@ -1616,14 +1722,25 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
   }
 
   if (knowledge) {
+    /**
+     * changedByLoop on each lesson a learning-loop decision still applied changed (its `after` names the lesson): the
+     * Lessons page's chip. A reword, narrow_scope or rank_weight leaves the lesson's decidedBy as it was, so that alone
+     * misses them. One read of the applied decisions naming these lessons (an indexed target lookup); none without a loop.
+     */
+    const withLoopChanges = async <L extends { id: string }>(lessons: L[]): Promise<(L & { changedByLoop?: true })[]> => {
+      if (!opts.loop || !lessons.length) return lessons;
+      const changed = new Set(await opts.loop.decisions.loopChanged(lessons.map((l) => l.id)));
+      return lessons.map((l) => (changed.has(l.id) ? { ...l, changedByLoop: true as const } : l));
+    };
+
     app.get('/api/lessons', async (c) => {
       const q = LessonQuery.safeParse(c.req.query());
       if (!q.success) return c.json({ error: q.error.flatten() }, 400);
       const projectKeys = keysFor(await view(), q.data.project);
       const { status, project, flag, source, pr, author } = q.data;
-      return c.json(await knowledge.listLessons({
+      return c.json(await withLoopChanges(await knowledge.listLessons({
         status, pr, author, projectKey: project, ...(projectKeys && { projectKeys }), ...(flag && { flag }), ...(source && { from: source }), ...runAsked(),
-      }));
+      })));
     });
 
     // Before /api/lessons/:id, which would take "quality" for a lesson id.
@@ -1631,7 +1748,8 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
       const p = QualityQuery.safeParse(c.req.query());
       if (!p.success) return c.json({ error: p.error.flatten() }, 400);
       const q = await lessonQualityFor(p.data.project);
-      return q ? c.json(q) : c.json({ error: 'this store cannot count lesson decisions' }, 404);
+      // Never null here: these routes exist only with a knowledge store.
+      return c.json(q!);
     });
     /** A project a lesson can be narrowed to: a folder under the roots or one the store knows, and selected. */
     const knownProject = async (key: string) => {
@@ -1650,7 +1768,7 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
 
     app.get('/api/lessons/:id', async (c) => {
       const d = await shownLesson(c.req.param('id'));
-      return d ? c.json(d) : c.json({ error: 'not found' }, 404);
+      return d ? c.json({ ...d, lesson: (await withLoopChanges([d.lesson]))[0] }) : c.json({ error: 'not found' }, 404);
     });
 
     app.patch('/api/lessons/:id', async (c) => {
@@ -1678,9 +1796,10 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
       }
       const by = currentActor();
       const { unscoped } = await knowledge.updateLesson(id, p, { reembed, by });
+      await overrideLoop([id]);
       if (unscoped) return c.json({ error: 'this lesson has no known project, so it cannot be narrowed without one; it was set back to proposed. Name the project (projectKey), make it global, or reject it.' }, 409);
       const changed = Object.fromEntries(
-        (['title', 'rule', 'appliesWhen', 'scope', 'paths', 'projectKey'] as const)
+        (['title', 'rule', 'appliesWhen', 'scope', 'paths', 'triggers', 'projectKey'] as const)
           .filter((k) => p[k] !== undefined && JSON.stringify(p[k]) !== JSON.stringify(current.lesson[k]))
           .map((k) => [k, { from: current.lesson[k], to: p[k] }]),
       );
@@ -1715,6 +1834,7 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
         }
         if (item.status === 'revoked' && current.lesson.status !== 'approved') { results.push({ id: item.id, ok: false, error: 'only a previously approved lesson can be revoked' }); continue; }
         await knowledge.updateLesson(item.id, { status: item.status }, { by, ...(item.note && { note: item.note }) });
+        await overrideLoop([item.id]);
         await activity?.record({
           kind: 'lesson_decided',
           actor: 'you',
@@ -1730,22 +1850,19 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
     });
 
     // Owner-only (the operator's `retry`): flags only, so not a decision. The worker re-checks them at its next round.
-    const requestRecheck = knowledge.requestLessonRecheck?.bind(knowledge);
-    if (requestRecheck) {
-      app.post('/api/lessons/recheck', async (c) => {
-        const queued = await requestRecheck();
-        await activity?.record({
-          kind: 'lessons_checked',
-          actor: 'you',
-          projectKey: null,
-          subject: `${queued} lesson${queued === 1 ? '' : 's'} queued for a re-check`,
-          why: 'you asked for it (the UI, or fg lessons recheck): the worker re-runs the lesson checks on every proposed and approved lesson at its next round',
-          details: { queued },
-          targets: [],
-        });
-        return c.json({ queued }, 202);
+    app.post('/api/lessons/recheck', async (c) => {
+      const queued = await knowledge.requestLessonRecheck();
+      await activity?.record({
+        kind: 'lessons_checked',
+        actor: 'you',
+        projectKey: null,
+        subject: `${queued} lesson${queued === 1 ? '' : 's'} queued for a re-check`,
+        why: 'you asked for it (the UI, or fg lessons recheck): the worker re-runs the lesson checks on every proposed and approved lesson at its next round',
+        details: { queued },
+        targets: [],
       });
-    }
+      return c.json({ queued }, 202);
+    });
 
     // A proposed lesson that states how the code is (the lesson check's looks-like-a-fact) becomes a project fact you
     // wrote: no scan replaces it, agents get it with the facts, and the lesson is rejected so it is not served twice.
@@ -1761,16 +1878,15 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
         if (!mayChange(d.lesson)) return notTheRuns(c, `the lesson ${id}`);
         const l = d.lesson;
         if (l.status === 'rejected' || l.status === 'superseded') return c.json({ error: `this lesson is already ${l.status}` }, 409);
-        const projectKey = l.projectKey ?? l.origin ?? null;
-        if (!projectKey) return c.json({ error: 'this lesson has no project, so there is no project to file the fact under' }, 409);
+        const draft = lessonToFact(l, d.miss?.missed ?? null, body.data);
+        if (!draft) return c.json({ error: 'this lesson has no project, so there is no project to file the fact under' }, 409);
+        const { projectKey, ...f } = draft;
+        const path = f.path;
         const by = currentActor();
-        const path = lessonFactPath(l.paths);
-        const why = `From the lesson "${l.title}"${d.miss ? `: ${d.miss.missed}` : ''}`;
         const [embedding] = await embed([`${path}: ${l.rule}`]);
-        const fact = await addOwnerFact(projectKey, {
-          kind: body.data.kind, statement: l.rule, path, lines: null, confidence: 1, why, relevance: body.data.relevance, origin: 'you', embedding,
-        }, by as RelevanceBy, ...(currentRun() ? [currentRun()] : []));
+        const fact = await addOwnerFact(projectKey, { ...f, confidence: 1, origin: 'you', embedding }, by as RelevanceBy, ...(currentRun() ? [currentRun()] : []));
         await knowledge.updateLesson(id, { status: 'rejected' }, { by, note: 'converted to a fact' });
+        await overrideLoop([id]);
         await activity?.record({
           kind: 'lesson_to_fact',
           actor: 'you',

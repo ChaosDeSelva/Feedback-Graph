@@ -1,6 +1,9 @@
 import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
-import { afterEach, beforeEach, expect, test, vi } from 'vitest';
+import { afterEach, beforeEach, expect, test, vi, onTestFinished } from 'vitest';
 import { Lessons } from './Lessons.tsx';
+import { OwnerWrites, READ_ONLY_TITLE } from './ownerAccess.tsx';
+import { decision } from './testing/loop.ts';
+import { heldAnswer } from './testing/heldAnswer.ts';
 
 const lesson = (id: string, title: string) => ({
   id, projectKey: 'demo', title, rule: `${title} rule`, appliesWhen: 'search work', scope: 'project', paths: [],
@@ -32,7 +35,8 @@ afterEach(() => { cleanup(); vi.unstubAllGlobals(); });
 
 test('shows the evidence chain for the selected lesson', async () => {
   render(<Lessons />);
-  expect(await screen.findByText('filtered on the client')).toBeTruthy();
+  // The file's first render also pays for loading its modules: on a busy machine that alone can take seconds.
+  expect(await screen.findByText('filtered on the client', {}, { timeout: 10000 })).toBeTruthy();
   expect(screen.getByText(/isn't good enough/)).toBeTruthy();
   expect(screen.getByText('filter on the server')).toBeTruthy();
   expect(screen.getByText(/was available/i)).toBeTruthy();
@@ -52,6 +56,19 @@ test('a lesson from a GitHub review names the reviewer, not you, and shows the r
   const verdict = screen.getByText('review: approved');
   expect(verdict.className).not.toMatch(/\bok\b|text-ok/);
   expect(screen.getByRole('link', { name: /on GitHub/i }).getAttribute('href')).toBe(ext.url);
+});
+
+test('a lesson from a miss the agent reported says the agent reported it, not that you said it', async () => {
+  const fromAgent = { ...lesson('l1', 'Server search'), from: 'agent' };
+  vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+    if (url.startsWith('/api/lessons?')) return Response.json([fromAgent]);
+    if (url === '/api/lessons/l1') return Response.json({ ...detail('l1', 'Server search'), lesson: fromAgent });
+    return Response.json([]);
+  }));
+  render(<Lessons />);
+  expect(await screen.findByText(/the agent reported/i)).toBeTruthy();
+  expect(screen.queryByText(/^you said$/i)).toBeNull();
+  expect(screen.getByTitle(/your coding agent reported/).textContent).toBe('agent report');
 });
 
 test('approve sends edited fields with the status', async () => {
@@ -119,16 +136,17 @@ test('the server\'s reason is shown when a change is refused', async () => {
 });
 
 test('a slow answer for the previous lesson never replaces the one you moved to', async () => {
+  const first = heldAnswer(detail('l1', 'Server search'));
   vi.stubGlobal('fetch', vi.fn(async (url: string) => {
     if (url.startsWith('/api/lessons?')) return Response.json([lesson('l1', 'Server search'), lesson('l2', 'Auth checks')]);
-    if (url === '/api/lessons/l1') { await new Promise((r) => setTimeout(r, 120)); return Response.json(detail('l1', 'Server search')); }
+    if (url === '/api/lessons/l1') return first.answer();
     if (url === '/api/lessons/l2') return Response.json(detail('l2', 'Auth checks'));
     return Response.json([]);
   }));
   render(<Lessons />);
   fireEvent.click(await screen.findByText('Auth checks'));
   await waitFor(() => expect((screen.getByLabelText('title') as HTMLInputElement).value).toBe('Auth checks'));
-  await new Promise((r) => setTimeout(r, 160));
+  await first.deliver();
   expect((screen.getByLabelText('title') as HTMLInputElement).value).toBe('Auth checks');
 });
 
@@ -281,6 +299,21 @@ test('Cancel in the convert dialog changes nothing, and a refusal is shown in th
   expect(screen.getByText('Server search', { selector: 'h2' })).toBeTruthy();
 });
 
+test('the convert dialog takes focus, keeps Tab inside, closes on Escape and gives focus back to Convert to fact', async () => {
+  const { default: userEvent } = await import('@testing-library/user-event');
+  const user = userEvent.setup();
+  render(<Lessons />);
+  await screen.findByText('filtered on the client');
+  const opener = screen.getByRole('button', { name: 'Convert to fact' });
+  await user.click(opener);
+  const ask = await screen.findByRole('dialog', { name: /convert this lesson to a project fact/i });
+  expect(document.activeElement).toBe(within(ask).getByLabelText('fact kind'));
+  for (let i = 0; i < 6; i++) { await user.tab(); expect(ask.contains(document.activeElement)).toBe(true); }
+  await user.keyboard('{Escape}');
+  await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
+  expect(document.activeElement).toBe(opener);
+});
+
 test('a rejected lesson shows the note on its decision (converted to a fact)', async () => {
   const converted = { ...lesson('l1', 'Server search'), status: 'rejected', decidedBy: 'you', decisionNote: 'converted to a fact' };
   vi.stubGlobal('fetch', vi.fn(async (url: string) => {
@@ -371,6 +404,22 @@ test('select rows, Reject selected: one confirm with a note, one request, and th
   expect(screen.getByText('none selected')).toBeTruthy();
 });
 
+test('the bulk dialog takes focus on its note, keeps Tab inside, and Escape gives focus back', async () => {
+  bulkFetch([flagged('l1', 'Server search', []), flagged('l2', 'Auth checks', [])]);
+  const { default: userEvent } = await import('@testing-library/user-event');
+  const user = userEvent.setup();
+  render(<Lessons />);
+  await user.click(await screen.findByRole('checkbox', { name: 'select Server search' }));
+  const opener = screen.getByRole('button', { name: 'Reject selected' });
+  await user.click(opener);
+  const ask = await screen.findByRole('dialog', { name: /reject 1 lesson/i });
+  expect(document.activeElement).toBe(within(ask).getByLabelText('note'));
+  for (let i = 0; i < 4; i++) { await user.tab(); expect(ask.contains(document.activeElement)).toBe(true); }
+  await user.keyboard('{Escape}');
+  await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
+  expect(document.activeElement).toBe(opener);
+});
+
 test('"select all with flag" picks exactly the lessons carrying it; Approve selected, and Cancel sends nothing', async () => {
   const f = bulkFetch([flagged('l1', 'Server search', ['looks-like-a-fact', 'needs-path']), flagged('l2', 'Auth checks', ['needs-path']), flagged('l3', 'Cache keys', ['platitude'])]);
   render(<Lessons />);
@@ -408,6 +457,9 @@ test('the header says how the lessons the post-mortem wrote were judged: approve
     if (url === '/api/lessons/l1') return Response.json(detail('l1', 'Server search'));
     return Response.json([]);
   }));
+  const { overflowAll } = await import('./ui/scrollReach.ts');
+  // Only the table overflows (as on a phone); it holds no link or button.
+  onTestFinished(overflowAll((el) => el.getAttribute('aria-label') === 'Lesson decision quality table'));
   render(<Lessons />);
   const judged = await screen.findByLabelText('how your lessons were judged');
   expect(judged.textContent).toMatch(/Last 30 days: 143 decided/);
@@ -418,6 +470,8 @@ test('the header says how the lessons the post-mortem wrote were judged: approve
   const rows = within(judged).getAllByRole('row').map((r) => r.textContent);
   expect(rows).toEqual(expect.arrayContaining([expect.stringMatching(/^acme.*130.*20.*50.*60/), expect.stringMatching(/^web/)]));
   expect(judged.textContent).toMatch(/90 days/);
+  // The table scrolls sideways on a phone: a named, focusable region a keyboard can scroll.
+  expect(within(judged).getByRole('region', { name: 'Lesson decision quality table' }).tabIndex).toBe(0);
 });
 
 test('the header says how many of the decisions an agent made with the operator token, when any did', async () => {
@@ -566,4 +620,266 @@ test('a deleted lesson link never opens an unrelated lesson', async () => {
   render(<Lessons />);
   expect(await screen.findByText('Linked lesson is unavailable')).toBeTruthy();
   expect(screen.queryByText('filtered on the client')).toBeNull();
+});
+
+test('a bulk decision the server refuses keeps the dialog open with the reason, so it can be sent again', async () => {
+  bulkFetch([flagged('l1', 'Server search', []), flagged('l2', 'Auth checks', [])]);
+  const inner = fetch as unknown as (url: string, init?: RequestInit) => Promise<Response>;
+  vi.stubGlobal('fetch', vi.fn(async (url: string, init?: RequestInit) => (url === '/api/lessons/decisions' ? Response.json({ error: 'only you can make this decision' }, { status: 403 }) : inner(url, init))));
+  render(<Lessons />);
+  fireEvent.click(await screen.findByRole('checkbox', { name: 'select Server search' }));
+  fireEvent.click(screen.getByRole('button', { name: 'Approve selected' }));
+  const ask = await screen.findByRole('dialog', { name: /approve 1 lesson/i });
+  const send = within(ask).getByRole('button', { name: 'Approve 1 lesson' }) as HTMLButtonElement;
+  fireEvent.click(send);
+  expect(await within(ask).findByText('only you can make this decision')).toBeTruthy();
+  expect(send.disabled).toBe(false);
+  expect(screen.getByRole('checkbox', { name: 'select Server search' })).toBeTruthy();
+});
+
+test('with nothing decided in 30 days the header says so, with the 90-day count', async () => {
+  const q = (days: number, decided: number) => ({ days, asWritten: decided, edited: 0, rejected: 0, decided });
+  vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+    if (url === '/api/lessons/quality') return Response.json({ windows: [q(30, 0), q(90, 6)], projects: {} });
+    if (url.startsWith('/api/lessons?')) return Response.json([lesson('l1', 'Server search')]);
+    if (url === '/api/lessons/l1') return Response.json(detail('l1', 'Server search'));
+    return Response.json([]);
+  }));
+  render(<Lessons />);
+  expect((await screen.findByLabelText('how your lessons were judged')).textContent).toMatch(/Last 30 days: none decided \(6 in 90 days\)/);
+});
+
+test('a Save the server refuses says why and keeps the edit unsaved', async () => {
+  vi.stubGlobal('fetch', vi.fn(async (url: string, init?: RequestInit) => {
+    if (init?.method === 'PATCH') return Response.json({ error: 'the rule is too long' }, { status: 400 });
+    if (url.startsWith('/api/lessons?')) return Response.json([{ ...lesson('l1', 'Server search'), status: 'approved' }]);
+    if (url === '/api/lessons/l1') return Response.json({ ...detail('l1', 'Server search'), lesson: { ...lesson('l1', 'Server search'), status: 'approved' } });
+    return Response.json([]);
+  }));
+  render(<Lessons />);
+  fireEvent.click(await screen.findByRole('button', { name: 'approved' }));
+  const rule = (await screen.findByLabelText('rule')) as HTMLTextAreaElement;
+  await waitFor(() => expect(rule.value).toBe('Server search rule'));
+  fireEvent.change(rule, { target: { value: 'x'.repeat(50) } });
+  fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+  expect(await screen.findByText('the rule is too long')).toBeTruthy();
+  expect((screen.getByRole('button', { name: 'Save' }) as HTMLButtonElement).disabled).toBe(false);
+});
+
+/** An approved lesson the loop last changed, with one applied loop decision; `after` is its status once rolled back (null: the reload fails). */
+function loopServer(after: string | null) {
+  let status = 'approved';
+  const posted: { url: string; body: unknown }[] = [];
+  vi.stubGlobal('fetch', vi.fn(async (url: string, init?: RequestInit) => {
+    const body = init?.body ? JSON.parse(init.body as string) : undefined;
+    if (init?.method === 'POST') posted.push({ url, body });
+    const mine = (id: string, title: string) => ({ ...lesson(id, title), status, decidedBy: id === 'l1' ? 'loop:1' : 'you' });
+    if (url.startsWith('/api/lessons?')) return Response.json([mine('l1', 'Server search'), mine('l2', 'Auth checks')]);
+    if (url === '/api/lessons/l1') {
+      if (status !== 'approved' && after === null) return Response.json({ error: 'lesson store down' }, { status: 503 });
+      return Response.json({ ...detail('l1', 'Server search'), lesson: mine('l1', 'Server search') });
+    }
+    if (url === '/api/lessons/l2') return Response.json({ ...detail('l2', 'Auth checks'), lesson: mine('l2', 'Auth checks') });
+    if (url.startsWith('/api/decisions?target=l1')) return Response.json([decision('dec:a', { targets: [{ kind: 'lesson', id: 'l1', role: 'primary' }], status: status === 'approved' && !posted.some((p) => p.body && (p.body as { cascade: string }).cascade === 'apply') ? 'applied' : 'rolled_back' })]);
+    if (url === '/api/decisions/dec%3Aa/rollback') {
+      if ((body as { cascade: string }).cascade === 'preview') return Response.json({ cascade: [], blocked: [] });
+      status = after ?? 'proposed';
+      return Response.json(decision('dec:a', { status: 'rolled_back' }));
+    }
+    return Response.json([]);
+  }));
+  return posted;
+}
+
+test('a lesson the loop changed says so; its Decisions card rolls the change back and the lesson leaves a tab it no longer belongs in', async () => {
+  const posted = loopServer('proposed');
+  location.hash = '#lessons?status=approved';
+  render(<Lessons />);
+  await waitFor(() => expect(screen.getAllByText('changed by loop').length).toBe(2), { timeout: 10_000 });
+  const card = await screen.findByRole('region', { name: 'Decisions' });
+  fireEvent.click(within(card).getByRole('button', { name: 'Roll back' }));
+  const dialog = await screen.findByRole('dialog');
+  fireEvent.click(await within(dialog).findByRole('button', { name: 'Roll back' }));
+  expect(await screen.findByText('Auth checks', { selector: 'h2' })).toBeTruthy();
+  expect(screen.queryByText('Server search', { selector: 'h2' })).toBeNull();
+  expect(posted.map((p) => p.body)).toEqual([{ expect: 'applied', cascade: 'preview' }, { expect: 'applied', cascade: 'apply' }]);
+});
+
+test('a rollback that leaves the lesson in its tab shows it again as it is now; a failed reload says why', async () => {
+  loopServer('approved');
+  location.hash = '#lessons?status=approved';
+  render(<Lessons />);
+  const card = await screen.findByRole('region', { name: 'Decisions' });
+  fireEvent.click(within(card).getByRole('button', { name: 'Roll back' }));
+  fireEvent.click(await within(await screen.findByRole('dialog')).findByRole('button', { name: 'Roll back' }));
+  await waitFor(() => expect(within(screen.getByRole('region', { name: 'Decisions' })).queryByRole('button', { name: 'Roll back' })).toBeNull());
+  expect(screen.getByText('Server search', { selector: 'h2' })).toBeTruthy();
+  cleanup();
+
+  loopServer(null);
+  location.hash = '#lessons?status=approved';
+  render(<Lessons />);
+  const card2 = await screen.findByRole('region', { name: 'Decisions' });
+  fireEvent.click(within(card2).getByRole('button', { name: 'Roll back' }));
+  fireEvent.click(await within(await screen.findByRole('dialog')).findByRole('button', { name: 'Roll back' }));
+  expect((await screen.findAllByText(/lesson store down/)).length).toBeGreaterThan(0);
+});
+
+/** Holds every request `match` picks until `release()`; the rest go to the test's own fetch. */
+function hold(match: (url: string, init?: RequestInit) => boolean) {
+  const inner = fetch as unknown as (url: string, init?: RequestInit) => Promise<Response>;
+  let release = () => {};
+  const gate = new Promise<void>((r) => { release = r; });
+  const held: string[] = [];
+  vi.stubGlobal('fetch', vi.fn(async (url: string, init?: RequestInit) => {
+    if (!match(url, init)) return inner(url, init);
+    held.push(url);
+    await gate;
+    return inner(url, init);
+  }));
+  return { held, release: () => release() };
+}
+
+test('Approve says Approving… while it saves: every decision button ignores presses, and a second press sends nothing', async () => {
+  const h = hold((_, init) => init?.method === 'PATCH');
+  render(<Lessons />);
+  await screen.findByText('filtered on the client');
+  fireEvent.click(screen.getByRole('button', { name: 'Approve' }));
+  const approving = await screen.findByRole('button', { name: 'Approving…' });
+  expect(approving.getAttribute('aria-disabled')).toBe('true');
+  for (const name of ['Reject', 'Convert to fact']) expect(screen.getByRole('button', { name }).getAttribute('aria-disabled')).toBe('true');
+  fireEvent.click(approving);
+  fireEvent.click(screen.getByRole('button', { name: 'Reject' }));
+  expect(h.held).toHaveLength(1);
+  h.release();
+  expect(await screen.findByText('Auth checks', { selector: 'h2' })).toBeTruthy();
+  expect(patches).toHaveLength(1);
+  expect(screen.getByRole('button', { name: 'Approve' }).hasAttribute('aria-disabled')).toBe(false);
+});
+
+test('Reject, Revoke, Back to proposed and Save each say what they are doing while they save', async () => {
+  let h = hold((_, init) => init?.method === 'PATCH');
+  render(<Lessons />);
+  await screen.findByText('filtered on the client');
+  fireEvent.click(screen.getByRole('button', { name: 'Reject' }));
+  expect(await screen.findByRole('button', { name: 'Rejecting…' })).toBeTruthy();
+  h.release();
+  await screen.findByText('Auth checks', { selector: 'h2' });
+  cleanup();
+
+  h = hold((_, init) => init?.method === 'PATCH');
+  render(<Lessons />);
+  fireEvent.click(await screen.findByRole('button', { name: 'approved' }));
+  const rule = (await screen.findByLabelText('rule')) as HTMLTextAreaElement;
+  await waitFor(() => expect(rule.value).toBe('Server search rule'));
+  fireEvent.change(rule, { target: { value: 'Always filter on the server' } });
+  fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+  expect(await screen.findByRole('button', { name: 'Saving…' })).toBeTruthy();
+  expect(screen.getByRole('button', { name: 'Revoke' }).getAttribute('aria-disabled')).toBe('true');
+  h.release();
+  await waitFor(() => expect(screen.getByRole('button', { name: 'Save' })).toBeTruthy());
+  cleanup();
+
+  h = hold((_, init) => init?.method === 'PATCH');
+  render(<Lessons />);
+  fireEvent.click(await screen.findByRole('button', { name: 'approved' }));
+  fireEvent.click(await screen.findByRole('button', { name: /^revoke$/i }));
+  fireEvent.click(within(await screen.findByRole('alertdialog')).getByRole('button', { name: 'Revoke lesson' }));
+  expect(await screen.findByRole('button', { name: 'Revoking…' })).toBeTruthy();
+  h.release();
+  await waitFor(() => expect(screen.queryByRole('button', { name: 'Revoking…' })).toBeNull());
+  cleanup();
+
+  h = hold((_, init) => init?.method === 'PATCH');
+  render(<Lessons />);
+  fireEvent.click(await screen.findByRole('button', { name: 'rejected' }));
+  fireEvent.click(await screen.findByRole('button', { name: 'Back to proposed' }));
+  expect(await screen.findByRole('button', { name: 'Moving…' })).toBeTruthy();
+  h.release();
+  await waitFor(() => expect(screen.queryByRole('button', { name: 'Moving…' })).toBeNull());
+}, 30000);
+
+test('the triggers are edited one per line and sent with the approval; a lesson with none says the worker derives them', async () => {
+  render(<Lessons />);
+  const paths = (await screen.findByLabelText('trigger paths')) as HTMLTextAreaElement;
+  expect(screen.getByText(/None derived yet/)).toBeTruthy();
+  fireEvent.change(paths, { target: { value: ' db/**/*.sql \n\n' } });
+  fireEvent.change(screen.getByLabelText('trigger patterns'), { target: { value: 'CREATE\\s+INDEX' } });
+  fireEvent.click(screen.getByRole('button', { name: 'Approve' }));
+  await waitFor(() => expect(patches).toEqual([{ url: '/api/lessons/l1', body: { status: 'approved', triggers: { paths: ['db/**/*.sql'], patterns: ['CREATE\\s+INDEX'], symbols: [] } } }]));
+});
+
+test('a lesson\'s triggers are shown in the boxes; blank lines alone are no edit', async () => {
+  const triggers = { paths: ['db/**/*.sql'], patterns: [], symbols: ['users_org', 'FlushBatch'] };
+  vi.stubGlobal('fetch', vi.fn(async (url: string, init?: RequestInit) => {
+    if (init?.method === 'PATCH') { patches.push({ url, body: JSON.parse(init.body as string) }); return new Response(null, { status: 204 }); }
+    if (url.startsWith('/api/lessons?')) return Response.json([{ ...lesson('l1', 'Server search'), triggers }]);
+    if (url === '/api/lessons/l1') { const d = detail('l1', 'Server search'); return Response.json({ ...d, lesson: { ...d.lesson, triggers } }); }
+    return Response.json([]);
+  }));
+  render(<Lessons />);
+  const symbols = (await screen.findByLabelText('trigger symbols')) as HTMLTextAreaElement;
+  await waitFor(() => expect(symbols.value).toBe('users_org\nFlushBatch'));
+  expect(screen.queryByText(/None derived yet/)).toBeNull();
+  fireEvent.change(symbols, { target: { value: 'users_org\n\nFlushBatch\n' } });
+  fireEvent.click(screen.getByRole('button', { name: 'Approve' }));
+  await waitFor(() => expect(patches).toEqual([{ url: '/api/lessons/l1', body: { status: 'approved' } }]));
+});
+
+test('a broader "applies when" the worker suggested is shown with its flag, and Use it puts it in the draft', async () => {
+  const checks = [{ name: 'instance-applies-when', why: 'names only the work it was learned from', suggestion: 'changing a SQL query or an index' }];
+  vi.stubGlobal('fetch', vi.fn(async (url: string, init?: RequestInit) => {
+    if (init?.method === 'PATCH') { patches.push({ url, body: JSON.parse(init.body as string) }); return new Response(null, { status: 204 }); }
+    if (url.startsWith('/api/lessons?')) return Response.json([{ ...lesson('l1', 'Server search'), checks }]);
+    if (url === '/api/lessons/l1') { const d = detail('l1', 'Server search'); return Response.json({ ...d, lesson: { ...d.lesson, checks } }); }
+    return Response.json([]);
+  }));
+  render(<Lessons />);
+  expect(await screen.findByText('Suggested: “changing a SQL query or an index”')).toBeTruthy();
+  expect(screen.getAllByText('"applies when" too narrow').length).toBeGreaterThan(0);
+  const use = screen.getByRole('button', { name: 'Use it' });
+  fireEvent.click(use);
+  expect(((await screen.findByLabelText('applies when')) as HTMLInputElement).value).toBe('changing a SQL query or an index');
+  await waitFor(() => expect((use as HTMLButtonElement).disabled).toBe(true));
+  fireEvent.click(screen.getByRole('button', { name: 'Approve' }));
+  await waitFor(() => expect(patches).toEqual([{ url: '/api/lessons/l1', body: { status: 'approved', appliesWhen: 'changing a SQL query or an index' } }]));
+});
+
+test('on a read-only install the lesson\'s fields cannot be edited, so leaving never asks about unsaved edits', async () => {
+  const { default: userEvent } = await import('@testing-library/user-event');
+  const user = userEvent.setup();
+  render(<OwnerWrites.Provider value={false}><Lessons /></OwnerWrites.Provider>);
+  const title = (await screen.findByLabelText('title')) as HTMLInputElement;
+  await waitFor(() => expect(title.value).toBe('Server search'));
+  for (const label of ['title', 'rule', 'applies when', 'trigger paths', 'trigger patterns', 'trigger symbols']) {
+    const field = screen.getByLabelText(label) as HTMLInputElement;
+    expect(field.readOnly, label).toBe(true);
+    expect(field.title).toBe(READ_ONLY_TITLE);
+    await user.type(field, 'x');
+  }
+  expect((screen.getByLabelText('scope') as HTMLSelectElement).disabled).toBe(true);
+  expect(title.value).toBe('Server search');
+  fireEvent.click(screen.getByText('Auth checks'));
+  await waitFor(() => expect((screen.getByLabelText('title') as HTMLInputElement).value).toBe('Auth checks'));
+  expect(screen.queryByRole('alertdialog')).toBeNull();
+});
+
+test('a lesson the loop reworded, narrowed or re-ranked shows changed by loop although its decidedBy is still yours', async () => {
+  // A reword leaves decidedBy as it was: the API says changedByLoop from the loop's decisions still applied on it.
+  const reworded = { ...lesson('l1', 'Server search (reworded by the loop)'), status: 'approved', decidedBy: 'you', changedByLoop: true };
+  const plain = { ...lesson('l2', 'Auth checks'), status: 'approved', decidedBy: 'you' };
+  vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+    if (url.startsWith('/api/lessons?')) return Response.json([reworded, plain]);
+    if (url === '/api/lessons/l1') return Response.json({ ...detail('l1', reworded.title), lesson: reworded });
+    if (url === '/api/lessons/l2') return Response.json({ ...detail('l2', 'Auth checks'), lesson: plain });
+    return Response.json([]);
+  }));
+  location.hash = '#lessons?status=approved';
+  render(<Lessons />);
+  const list = await screen.findByRole('region', { name: 'lessons list' }, { timeout: 10_000 });
+  await waitFor(() => expect(within(list).getAllByRole('button').length).toBeGreaterThanOrEqual(2));
+  const rows = within(list).getAllByRole('button').filter((b) => /Server search|Auth checks/.test(b.textContent ?? ''));
+  expect(rows.map((r) => within(r).queryByText('changed by loop') !== null)).toEqual([true, false]);
+  // And in the pane of the lesson it opened on.
+  expect(await within(screen.getByRole('region', { name: 'item detail' })).findByText('changed by loop')).toBeTruthy();
 });

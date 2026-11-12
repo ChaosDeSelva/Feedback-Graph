@@ -38,15 +38,22 @@ test('imports a bundle file and says what came in; lessons wait for approval unl
 });
 
 test('the message can be dismissed, and clears by itself after a while', async () => {
-  // Long enough that a loaded test run still sees the message before it clears.
-  render(<ImportBundle clearAfterMs={400} />);
+  // Dismissed by hand: the message would not clear by itself during this test.
+  const { unmount } = render(<ImportBundle clearAfterMs={600_000} />);
   pick('not json');
   await screen.findByRole('alert');
   fireEvent.click(screen.getByRole('button', { name: 'dismiss' }));
   expect(screen.queryByRole('alert')).toBeNull();
+  unmount();
+  // Cleared by itself: it may go before a slow run looks for it, so its showing is recorded as it happens.
+  let shown = false;
+  const watch = new MutationObserver(() => { shown ||= !!document.querySelector('[role="alert"]'); });
+  watch.observe(document.body, { childList: true, subtree: true });
+  render(<ImportBundle clearAfterMs={50} />);
   pick('not json');
-  await screen.findByRole('alert');
-  await waitFor(() => expect(screen.queryByRole('alert')).toBeNull(), { timeout: 3000 });
+  await waitFor(() => expect(shown).toBe(true));
+  await waitFor(() => expect(screen.queryByRole('alert')).toBeNull());
+  watch.disconnect();
 });
 
 test('a file that is not JSON, or a bundle the server refuses, shows why', async () => {
@@ -57,4 +64,29 @@ test('a file that is not JSON, or a bundle the server refuses, shows why', async
   reply = () => Response.json({ error: 'this bundle has schemaVersion 2' }, { status: 400 });
   pick(JSON.stringify(bundle));
   expect(await screen.findByText(/schemaVersion 2/)).toBeTruthy();
+});
+
+test('on a read-only install the file picker and "keep approved" are both off and say why', async () => {
+  const { OwnerWrites, READ_ONLY_TITLE } = await import('./ownerAccess.tsx');
+  render(<OwnerWrites.Provider value={false}><ImportBundle /></OwnerWrites.Provider>);
+  const keep = screen.getByLabelText('keep approved lessons approved') as HTMLInputElement;
+  expect(keep.disabled).toBe(true);
+  expect(keep.closest('label')!.title).toBe(READ_ONLY_TITLE);
+  const file = screen.getByLabelText('import bundle file') as HTMLInputElement;
+  expect(file.disabled).toBe(true);
+  expect(file.closest('label')!.getAttribute('aria-disabled')).toBe('true');
+});
+
+test('revoked lessons and projects whose facts were kept are named in the summary', async () => {
+  reply = () => Response.json({ ...result, lessons: { ...result.lessons, revoked: 2 }, facts: { ...result.facts, skippedProjects: ['shop', 'api'] } });
+  render(<ImportBundle />);
+  pick(JSON.stringify(bundle));
+  expect(await screen.findByText(/1 approved, 2 proposed, 2 revoked\).*Facts kept for shop, api \(already scanned\)\./)).toBeTruthy();
+});
+
+test('closing the file picker without a file imports nothing', () => {
+  render(<ImportBundle />);
+  fireEvent.change(screen.getByLabelText('import bundle file'), { target: { files: [] } });
+  expect(calls).toEqual([]);
+  expect(screen.queryByRole('status')).toBeNull();
 });

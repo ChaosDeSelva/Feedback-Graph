@@ -11,16 +11,15 @@ export const DECIDER_RULE_CURSOR = 'lesson-decider';
 const MAX_TARGETS = 200;
 
 export type DeciderRuleDeps = {
-  knowledge: Partial<Pick<KnowledgeStore, 'clearMachineOwnerMarks'>>;
+  knowledge: Pick<KnowledgeStore, 'clearMachineOwnerMarks'>;
   cursors: Pick<DocsStore, 'getCursor' | 'setCursor'>;
   activity?: Pick<ActivityStore, 'record'>;
   log?: (msg: string, extra?: object) => void;
 };
 
-/** At worker start. Null: it has run for this version, or the store cannot tell. */
+/** At worker start. Null: it has run for this version. */
 export async function migrateDeciderRule(d: DeciderRuleDeps): Promise<{ cleared: number } | null> {
   const stamp = `v${DECIDER_RULE_VERSION}`;
-  if (!d.knowledge.clearMachineOwnerMarks) return null;
   const last = await d.cursors.getCursor(DECIDER_RULE_CURSOR);
   if (last === stamp) return null;
   const ids = await d.knowledge.clearMachineOwnerMarks();

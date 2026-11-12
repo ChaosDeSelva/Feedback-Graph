@@ -1,3 +1,5 @@
+import { AsyncLocalStorage } from 'node:async_hooks';
+import type { ActivityRepo } from '../graph/activity.ts';
 import { GraphRepo } from '../graph/repo.ts';
 import { neo4jStore } from '../graph/neo4j-store.ts';
 import type { Store } from '../store.ts';
@@ -5,15 +7,54 @@ import type { EmbeddedSeed, PreDoneCheckRow, ProbeKind, StaleTextSeed, StoreProb
 
 const IDENTITY: Partial<Record<ProbeKind, string>> = { Project: 'key', Cause: 'key', SyncCursor: 'key', Turn: 'uuid', Commit: 'sha' };
 const label = (kind: ProbeKind) => `\`${kind}\``;
+/** The stale decision seedStaleText writes (both probes): its before-snapshot holds the text in a lesson's rule. */
+export const staleSnapshot = (text: string) => [{ kind: 'lesson', id: 'lesson:stale', fields: { rule: text }, fingerprint: 'f'.repeat(64) }];
+export const STALE_CONFIDENCE = { p: 0.5, lower: 0.1, n: 0, band: 2 };
 
 export class Neo4jProbe implements StoreProbe {
   readonly g: GraphRepo;
-  constructor(g: GraphRepo) {
+  /** The store's background work (the Activity target upgrade ensureSchema starts), settled before a wipe. */
+  readonly settle: () => Promise<unknown>;
+  constructor(g: GraphRepo, settle: () => Promise<unknown> = async () => {}) {
     this.g = g;
+    this.settle = settle;
   }
 
-  wipe() {
+  async wipe() {
+    // A wipe beside the upgrade's pages deadlocks on the nodes both touch.
+    await this.settle();
     return this.g.wipeForTests();
+  }
+
+  async work(fn: () => Promise<unknown>): Promise<number> {
+    const g = this.g;
+    const run = g.run;
+    let hits = 0;
+    const sum = (p: { dbHits: number; children: unknown[] }): number => p.dbHits + p.children.reduce<number>((n, c) => n + sum(c as typeof p), 0);
+    // Plans for the data as it is now. A plan cached while a label held a few nodes (an earlier test's) may scan it, as
+    // may one made from an index sample taken then: Neo4j resamples and replans only after a while of its own.
+    await g.run('CALL db.resampleOutdatedIndexes()');
+    await g.run('CALL db.awaitIndexes(300)');
+    await g.run('CALL db.clearQueryCaches()');
+    // Only fn's own queries: a background task of the store (the Activity target upgrade) runs outside its context.
+    const mine = new AsyncLocalStorage<true>();
+    g.run = async (cypher, params = {}) => {
+      if (!mine.getStore()) return run.call(g, cypher, params);
+      const session = g.driver.session();
+      try {
+        const r = await session.run(`PROFILE ${cypher}`, params);
+        hits += r.summary.profile ? sum(r.summary.profile as never) : 0;
+        return r.records;
+      } finally {
+        await session.close();
+      }
+    };
+    try {
+      await mine.run(true, fn);
+    } finally {
+      g.run = run;
+    }
+    return hits;
   }
 
   async count(kind: ProbeKind): Promise<number> {
@@ -99,6 +140,10 @@ export class Neo4jProbe implements StoreProbe {
     await this.g.run('MATCH (l:Lesson) WHERE l.id IN $ids SET l.createdAt = $at', { ids, at });
   }
 
+  async setDecisionCreatedAt(ids: string[], at: string) {
+    await this.g.run('MATCH (d:Decision) WHERE d.id IN $ids SET d.createdAt = $at', { ids, at });
+  }
+
   async seedOrphan(row: { kind: 'Lesson' | 'Doc'; id: string; projectKey: string }) {
     const extra = row.kind === 'Lesson' ? ", status: 'approved'" : '';
     await this.g.run(`CREATE (:${row.kind} {id: $id, projectKey: $projectKey${extra}})`, { id: row.id, projectKey: row.projectKey });
@@ -146,6 +191,15 @@ export class Neo4jProbe implements StoreProbe {
           { id: row.id, now, r: row, answer: JSON.stringify(row.answer), sources: JSON.stringify(row.sources) },
         );
         return;
+      case 'Decision':
+        await this.g.run(
+          `CREATE (d:Decision {id: $id, type: 'link_misses', status: 'proposed', tier: 'H', mode: 'propose', targets: '[]', targetIds: [],
+                               before: $before, after: '[]', evidence: '[]', features: '{}', score: 0.5, confidence: $confidence, band: 2,
+                               rationale: $text, model: 'deterministic', policyVersion: 1, dependsOn: [], createdAt: $now})
+           CREATE (:DecisionNote {id: $id + ':note', decisionId: $id, ts: $now, by: 'you', text: $note})-[:ON]->(d)`,
+          { id: row.id, now, text: row.text, note: row.note, before: JSON.stringify(staleSnapshot(row.text)), confidence: JSON.stringify(STALE_CONFIDENCE) },
+        );
+        return;
     }
   }
 }
@@ -156,5 +210,5 @@ export async function openNeo4jTestStore(): Promise<{ store: Store; probe: Store
   const g = await GraphRepo.connect(url, process.env.NEO4J_TEST_USER ?? 'neo4j', process.env.NEO4J_TEST_PASSWORD ?? 'testpassword');
   const store = neo4jStore(g);
   await store.ensureSchema();
-  return { store, probe: new Neo4jProbe(g) };
+  return { store, probe: new Neo4jProbe(g, () => (store.activity as ActivityRepo).targets!.settled()) };
 }

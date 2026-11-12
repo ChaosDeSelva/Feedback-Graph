@@ -1,11 +1,11 @@
-import type { ProviderHealth, WorkerStageName, WorkerStatus } from '@fb/core';
+import type { GraphRepo, ProviderHealth, WorkerStageName, WorkerStatus } from '@fb/core';
 
 /** Steps that count their items without a total (ingest reads only the transcripts that changed). */
 const COUNTED = new Set<WorkerStageName>(['ingest']);
 
 /**
  * What the worker is doing right now, kept in its heartbeat status (WorkerStatus.stage) so /api/status can say which
- * step runs, since when, and how far it got. `changed` is called on every change (main.ts beats soon after).
+ * step runs, since when, and how far it got. `changed` is called on every change (the worker beats soon after: heartbeat.ts).
  */
 export class StageTracker {
   private status: WorkerStatus;
@@ -47,7 +47,7 @@ export function healthSince(prev: ProviderHealth | undefined, next: ProviderHeal
     const { since: _, ...rest } = next;
     return rest;
   }
-  const since = prev && !prev.ok && prev.provider === next.provider ? (prev.since ?? prev.at) : next.at;
+  const since = prev && !prev.ok && prev.provider === next.provider ? prev.since : next.at;
   return { ...next, since };
 }
 
@@ -59,4 +59,27 @@ export function healthSince(prev: ProviderHealth | undefined, next: ProviderHeal
  */
 export function cycleProgressed(r: { turnsClassified: number; postmortems: number; docRead: boolean; scored: number }): boolean {
   return r.turnsClassified > 0 || r.postmortems > 0 || r.docRead;
+}
+
+/**
+ * The repo, with unclassifiedTurns also sizing the classify step: the turns waiting (as fetched, so capped at the
+ * limit asked) go to status.backlog, and the step's total is the model calls this cycle may make.
+ */
+export function withClassifyBacklog<R extends Pick<GraphRepo, 'unclassifiedTurns'>>(
+  repo: R, status: WorkerStatus, stage: Pick<StageTracker, 'enter'>, classifyBatch: number, now: () => Date = () => new Date(),
+): R {
+  return new Proxy(repo, {
+    get(target, key) {
+      if (key === 'unclassifiedTurns') {
+        return async (...args: Parameters<GraphRepo['unclassifiedTurns']>) => {
+          const turns = await target.unclassifiedTurns(...args);
+          status.backlog = { classify: turns.length, classifyCapped: turns.length >= args[0], at: now().toISOString(), oldestAt: turns.at(-1)?.ts ?? null };
+          stage.enter('classify', { total: Math.min(turns.length, classifyBatch) });
+          return turns;
+        };
+      }
+      const v = Reflect.get(target, key);
+      return typeof v === 'function' ? v.bind(target) : v;
+    },
+  });
 }

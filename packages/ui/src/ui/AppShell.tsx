@@ -1,18 +1,21 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react';
 import { CloseIcon, CollapseIcon, ExpandIcon, Mark, MenuIcon, MoonIcon, SunIcon } from './icons.tsx';
 import { loadPref, savePref, setTheme, useTheme } from './theme.ts';
+import { ScrollArea } from './ScrollArea.tsx';
 
-export type NavItem<K extends string> = { key: K; label: string; icon: ReactNode };
+/** `badge`: a count waiting on this page (proposals to review), shown beside its label; absent or 0 shows none. */
+export type NavItem<K extends string> = { key: K; label: string; icon: ReactNode; badge?: number };
 export type NavGroup<K extends string> = { label: string; items: NavItem<K>[] };
 
-export type Health = { ok: boolean; label: string; version: string; title: string };
+/** off: something is turned off on purpose (neutral, not an alarm), and href says where to change it. */
+export type Health = { ok: boolean; label: string; version: string; title: string; off?: boolean; href?: string };
 
 const COLLAPSED = 'fg:sidebar-collapsed';
 
 const FOCUSABLE = 'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
 /** What Tab can reach inside `root`, leaving out anything a breakpoint hides (checkVisibility where the browser has it). */
-const focusables = (root: HTMLElement | null) =>
-  [...(root?.querySelectorAll<HTMLElement>(FOCUSABLE) ?? [])].filter((el) => (typeof el.checkVisibility === 'function' ? el.checkVisibility() : true));
+const focusables = (root: HTMLElement) =>
+  [...root.querySelectorAll<HTMLElement>(FOCUSABLE)].filter((el) => (typeof el.checkVisibility === 'function' ? el.checkVisibility() : true));
 
 /**
  * The frame around every page: a sidebar with the product, grouped pages and the worker's health,
@@ -50,8 +53,8 @@ export function AppShell<K extends string>({ groups, current, onNavigate, health
     const onKey = (e: KeyboardEvent) => {
       if (e.key === 'Escape') setMenuOpen(false);
       if (e.key !== 'Tab') return;
-      const els = focusables(aside.current);
-      if (!els.length) return;
+      // The open drawer always holds its page buttons.
+      const els = focusables(aside.current!);
       const first = els[0], last = els[els.length - 1], at = document.activeElement;
       const wrapTo = !aside.current?.contains(at) ? first : e.shiftKey && at === first ? last : !e.shiftKey && at === last ? first : null;
       if (wrapTo) { e.preventDefault(); wrapTo.focus(); }
@@ -87,7 +90,7 @@ export function AppShell<K extends string>({ groups, current, onNavigate, health
         <div
           className={`${menuOpen ? 'flex' : 'hidden'} absolute inset-x-0 top-12 max-h-[calc(100dvh-3rem)] flex-col border-b border-line bg-canvas shadow-pop md:static md:flex md:max-h-none md:min-h-0 md:flex-1 md:border-b-0 md:shadow-none`}
         >
-          <nav aria-label="pages" className="min-h-0 flex-1 overflow-y-auto px-2 pt-1 pb-3">
+          <ScrollArea as="nav" aria-label="pages" className="min-h-0 flex-1 overflow-y-auto px-2 pt-1 pb-3">
             {groups.map((g) => (
               <div key={g.label} className="mt-3 first:mt-1">
                 <div className={`mb-1 px-2 text-[10.5px] font-semibold tracking-[0.07em] text-muted uppercase ${collapsed ? 'md:hidden' : ''}`}>{g.label}</div>
@@ -100,7 +103,7 @@ export function AppShell<K extends string>({ groups, current, onNavigate, health
                         <button
                           type="button"
                           aria-current={active ? 'page' : undefined}
-                          title={collapsed ? it.label : undefined}
+                          title={collapsed ? `${it.label}${it.badge ? ` (${it.badge} waiting)` : ''}` : undefined}
                           onClick={() => { onNavigate(it.key); setMenuOpen(false); }}
                           className={`group flex h-8 w-full items-center gap-2.5 rounded-sm px-2 text-left text-[13px] transition-colors ${collapsed ? 'md:justify-center md:px-0' : ''} ${
                             active
@@ -110,6 +113,11 @@ export function AppShell<K extends string>({ groups, current, onNavigate, health
                         >
                           <span className={`shrink-0 ${active ? 'text-accent-text' : 'text-faint group-hover:text-muted'}`}>{it.icon}</span>
                           <span className={`truncate ${hide}`}>{it.label}</span>
+                          {!!it.badge && (
+                            <span className={`ml-auto rounded-sm bg-info-soft px-1.5 text-[11px] leading-[18px] font-semibold text-info-text tabular-nums ${hide}`}>
+                              {it.badge}<span className="sr-only"> waiting</span>
+                            </span>
+                          )}
                         </button>
                       </li>
                     );
@@ -117,7 +125,7 @@ export function AppShell<K extends string>({ groups, current, onNavigate, health
                 </ul>
               </div>
             ))}
-          </nav>
+          </ScrollArea>
 
           <div className="grid shrink-0 gap-1 border-t border-line p-2">
             {connections?.(collapsed)}
@@ -134,6 +142,7 @@ export function AppShell<K extends string>({ groups, current, onNavigate, health
                 {theme === 'dark' ? <SunIcon /> : <MoonIcon />}
                 <span className={hide}>{theme === 'dark' ? 'Light theme' : 'Dark theme'}</span>
               </button>
+              {health && <span title={`Feedback Graph ${health.version}`} className={`shrink-0 self-center px-1 font-mono text-[10.5px] text-muted tabular-nums ${hide}`}>v{health.version}</span>}
               <button
                 type="button"
                 onClick={() => setCollapsed(!collapsed)}
@@ -153,16 +162,19 @@ export function AppShell<K extends string>({ groups, current, onNavigate, health
   );
 }
 
-/** Worker and graph health at a glance; the details are in the tooltip and at /api/status. */
+/**
+ * Worker and graph health at a glance; the details are in the tooltip and at /api/status. Red only for a failure; a
+ * job turned off on purpose is a neutral line linking to where to change it. The version sits beside the theme toggle,
+ * so a long label truncates instead of crowding it.
+ */
 function HealthBadge({ health, collapsed }: { health: Health; collapsed: boolean }) {
-  return (
-    <div
-      title={health.title}
-      className={`flex h-8 items-center gap-2 rounded-sm border px-2 text-xs ${health.ok ? 'border-line bg-surface text-muted' : 'border-bad/40 bg-bad-soft text-bad-text'} ${collapsed ? 'md:justify-center md:px-0' : ''}`}
-    >
-      <span aria-hidden="true" className={`size-2 shrink-0 rounded-full ${health.ok ? 'bg-ok shadow-[0_0_0_3px_var(--color-ok-soft)]' : 'bg-bad'}`} />
-      <span className={`min-w-0 flex-1 truncate font-medium ${collapsed ? 'md:sr-only' : ''}`}>{health.label}</span>
-      <span className={`font-mono text-[10.5px] text-muted tabular-nums ${collapsed ? 'md:hidden' : ''}`}>v{health.version}</span>
-    </div>
+  const cls = `flex min-h-8 min-w-0 items-center gap-2 rounded-sm border px-2 py-1 text-xs ${health.ok ? 'border-line bg-surface text-muted' : 'border-bad/40 bg-bad-soft text-bad-text'} ${health.href ? 'hover:bg-hover' : ''} ${collapsed ? 'md:justify-center md:px-0' : ''}`;
+  const body = (
+    <>
+      <span aria-hidden="true" className={`size-2 shrink-0 rounded-full ${!health.ok ? 'bg-bad' : health.off ? 'bg-faint' : 'bg-ok shadow-[0_0_0_3px_var(--color-ok-soft)]'}`} />
+      {/* Up to two lines, so "Codex runner off: scans paused" is read whole in a narrow sidebar. */}
+      <span className={`line-clamp-2 min-w-0 flex-1 font-medium leading-snug [overflow-wrap:anywhere] ${collapsed ? 'md:sr-only' : ''}`}>{health.label}</span>
+    </>
   );
+  return health.href ? <a href={health.href} title={health.title} className={cls}>{body}</a> : <div title={health.title} className={cls}>{body}</div>;
 }

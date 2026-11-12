@@ -10,10 +10,10 @@ function fixture() {
   const owners = new Map<string, RunOwner>(); const writes: string[] = []; let sessionClaims = 0;
   const repo = { listCandidates: async () => [], stats: async () => [], candidateDetail: async () => null, decide: async () => { writes.push('decision'); } } as unknown as ApiRepo;
   const context: ContextDeps = { roots: [{ host: '/Users/test', container: '/repo' }], embed: async texts => texts.map(() => [1]), judge: async () => [], k: {
-    searchLessons: async () => [], relatedMisses: async () => [], recordPreDoneCheck: async () => {},
+    searchLessons: async () => [], missesNaming: async () => [], relatedMisses: async () => [], recordPreDoneCheck: async () => {},
     createManualFeedback: async input => { writes.push(input.text); if (input.text === 'fail after write') throw new Error('database failure'); return 'manual:1'; },
   } };
-  const app = createApp(repo, { auth: { operator: { token: OP, allow: ['inbox_decide', 'lesson_decide'] } }, context, runs: {
+  const app = createApp(repo, { auth: { operator: { token: OP, allow: ['inbox_decide', 'lesson_decide'] } }, context, runs: { sandbox: async () => false,
     owner: async id => owners.get(id) ?? null, claim: async (run, principal, actor) => { await Promise.resolve(); if (!owners.has(run)) owners.set(run, { run, principal, actor: actor ?? null, firstSeen: 'now' }); return owners.get(run)!; },
     items: async () => [], remove: async () => ({} as never),
   }, sessions: { projects: () => [], inScope: () => true, store: { list: async () => ({ sessions: [], next: null }), detail: async () => null, requestRebuild: async () => false, claimRun: async () => { await authorizeStoreWrite(); sessionClaims++; return true; } } } });

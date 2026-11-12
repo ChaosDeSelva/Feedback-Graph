@@ -16,7 +16,6 @@ export async function repairGithubDocs(d: {
   const key = githubRepairCursor(d.projectKey);
   const prior = parse<Progress>(await d.docs.getCursor(key));
   const progress: Progress = prior?.after ? prior : { after: '', status: 'scanning', checked: 0, repaired: 0, literal: 0, protected: 0, pending: 0 };
-  if (!d.docs.githubRepairDocs || !d.docs.githubDocChunks) return { progress: { ...progress, status: 'waiting' }, repairedMasks: 0, fetchedDocs: 0, attemptedDocs: 0, rateLimited: false };
   const docs = await d.docs.githubRepairDocs(d.projectKey, progress.after, 5);
   let repairedMasks = 0;
   let fetchedDocs = 0;
@@ -26,8 +25,9 @@ export async function repairGithubDocs(d: {
     const itemKey = `${key}:doc:${createHash('sha256').update(doc.id).digest('hex')}`;
     const last = parse<Outcome>(await d.docs.getCursor(itemKey));
     if (progress.blockedDoc === doc.id) { progress.pending = Math.max(0, progress.pending - 1); delete progress.blockedDoc; }
+    // A repaired document holds no mask, so the store no longer returns it: what is seen again is literal or protected.
     if (last?.fingerprint === signature && last.status !== 'retry') {
-      progress[last.status === 'literal' ? 'literal' : last.status === 'protected' ? 'protected' : 'repaired']++;
+      progress[last.status === 'literal' ? 'literal' : 'protected']++;
     } else if (last?.nextRetryAt && Date.parse(last.nextRetryAt) > Date.parse(d.now)) {
       progress.pending++;
       progress.nextRetryAt = last.nextRetryAt;

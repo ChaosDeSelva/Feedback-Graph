@@ -26,7 +26,7 @@ test('link labels are escaped too', () => {
 });
 
 test('a file node is captioned with its base name: always when it had misses, else once zoomed in', () => {
-  const f = { kind: 'file', label: 'src/webapp/page.tsx', score: 1, misses: 0 };
+  const f = { kind: 'file', label: 'src/portal/page.tsx', score: 1, misses: 0 };
   expect(codeNodeCaption(f, 0.8)).toBeNull();
   expect(codeNodeCaption(f, 1.5)).toBe('page.tsx');
   expect(codeNodeCaption({ ...f, misses: 1 }, 0.5)).toBe('page.tsx');
@@ -56,8 +56,6 @@ test('LabelPlacer keeps the first label in a spot and refuses one that overlaps 
   expect(p.place(0, 0, 40, 10)).toBe(true);
   expect(p.place(20, 5, 40, 10)).toBe(false);
   expect(p.place(0, 12, 40, 10)).toBe(true);
-  p.reset();
-  expect(p.place(20, 5, 40, 10)).toBe(true);
 });
 
 test('LabelPlacer refuses a caption that would cover a node, never its own (drawn below it)', () => {
@@ -66,8 +64,6 @@ test('LabelPlacer refuses a caption that would cover a node, never its own (draw
   p.block(0, -10, 10, 10); // the captioned node itself, just above its caption
   expect(p.place(0, 2, 40, 10)).toBe(false);
   expect(p.place(0, 2, 25, 10)).toBe(true);
-  p.reset();
-  expect(p.place(0, 2, 40, 10)).toBe(true);
 });
 
 test('LabelPlacer caps captions per area, so the dense centre of a map does not fill with text', () => {
@@ -77,8 +73,6 @@ test('LabelPlacer caps captions per area, so the dense centre of a map does not 
   expect(p.place(0, 20, 20, 5)).toBe(false);
   // Another area has its own allowance.
   expect(p.place(150, 0, 20, 5)).toBe(true);
-  p.reset();
-  expect(p.place(0, 20, 20, 5)).toBe(true);
 });
 
 /** A zoomed-out map as the fit leaves it: 400 nodes 9 px apart on screen, captions 11 px type, wider than the gaps. */
@@ -117,6 +111,18 @@ test('a file with misses is always named, even where every spot around it is tak
   expect(placed.map((p) => p.text).sort()).toEqual(['a-long-hotspot-name.ts', 'missed.ts']);
 });
 
+test('when all four spots are taken a file with misses is still drawn below its node; a plain key file is left out', () => {
+  // Three rows of wide key captions, stacked edge to edge, cover every spot around the node at 0,0.
+  const rows = [-21, -8, 5].map((y, i) => ({ text: 'x'.repeat(100), x: 0, y, r: 0, rank: 10 - i, key: true }));
+  const placed = placeCaptions([
+    ...rows,
+    { text: 'missed.ts', x: 0, y: 0, r: 4, rank: 2, key: true, must: true },
+    { text: 'hot.ts', x: 0, y: 0, r: 4, rank: 1, key: true },
+  ], { nodes: [], width, height: 13, gap: 2 });
+  expect(placed).toHaveLength(4);
+  expect(placed.find((p) => p.text === 'missed.ts')).toEqual({ text: 'missed.ts', x: -27, y: 6, w: 54, h: 13, key: true });
+});
+
 test('importance: files with misses first, then by hotspot score, then by how many edges they have; tests and other kinds never', () => {
   const ranked = keyFiles([
     { id: 'file:a', kind: 'file', path: 'a', score: 3, misses: 0 },
@@ -128,4 +134,12 @@ test('importance: files with misses first, then by hotspot score, then by how ma
   expect(ranked).toEqual(['d', 'a', 'c']);
   // With nothing scored (a fresh map) the most connected files are still named.
   expect(keyFiles([{ id: 'file:x', kind: 'file', path: 'x', score: 0, misses: 0 }, { id: 'file:y', kind: 'file', path: 'y', score: 0, misses: 0 }], [{ source: 'file:y', target: 'file:x' }, { source: 'file:y', target: 'file:z' }], 1)).toEqual(['y']);
+});
+
+test('importance counts edges whose ends the simulation has turned into node objects, and breaks full ties by path', () => {
+  const file = (p: string) => ({ id: `file:${p}`, kind: 'file', path: p, score: 0, misses: 0 });
+  const a = file('a'), b = file('b'), c = file('c'), d = file('d');
+  // force-graph replaces a link's ids with the nodes themselves once it starts.
+  expect(keyFiles([d, c, b, a], [{ source: d, target: b }], 4)).toEqual(['b', 'd', 'a', 'c']);
+  expect(keyFiles([c, a, b], [], 3)).toEqual(['a', 'b', 'c']);
 });

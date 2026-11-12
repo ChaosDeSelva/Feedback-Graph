@@ -4,6 +4,8 @@
   "type": "module",
   "scripts": {
     "test": "vitest run --project unit --project ui",
+    "test:coverage": "vitest run --project unit --project ui --coverage",
+    "test:coverage:all": "./scripts/coverage-all.sh",
     "test:int": "vitest run --project integration --no-file-parallelism",
     "test:int:postgres": "TEST_STORES=postgres vitest run --project integration --no-file-parallelism",
     "typecheck": "pnpm -r typecheck",
@@ -17,10 +19,11 @@
     "@eslint/js": "10.0.1",
     "@types/node": "^24.0.0",
     "@typescript-eslint/parser": "8.72.1",
+    "@vitest/coverage-v8": "3.2.7",
     "eslint": "10.13.0",
     "typescript": "^5.8.0",
     "vitest": "^3.2.0"
   },
-  "version": "0.7.5",
+  "version": "0.8.0",
   "license": "Apache-2.0"
 }

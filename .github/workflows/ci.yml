@@ -7,12 +7,20 @@ permissions:
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     services:
       neo4j:
         image: neo4j:5.26-community@sha256:249a1ec6e3c52d82101a5ed33d6ed2b5ed5b0017b21a28c0bfebc335e87fb177
         env:
           NEO4J_AUTH: neo4j/testpassword
+          # The smallest transaction-memory limits the stack runs with (docker-compose.small.yml), so the large code-map
+          # tests can fail.
+          NEO4J_dbms_memory_transaction_total_max: 128M
+          NEO4J_db_memory_transaction_total_max: 128M
+          NEO4J_db_memory_transaction_max: 32M
+          NEO4J_server_memory_heap_initial__size: 512M
+          NEO4J_server_memory_heap_max__size: 1G
+          NEO4J_server_memory_pagecache_size: 512M
         ports: ["7688:7687"]
         options: >-
           --health-cmd "wget -qO- http://localhost:7474 >/dev/null || exit 1"
@@ -39,13 +47,16 @@ jobs:
       - run: ./scripts/check-public-history.sh HEAD
       - run: pnpm lint
       - run: pnpm typecheck
-      - run: pnpm test
       # Verify builds even when an integration environment cannot start its sandbox.
       - run: pnpm -F @fb/ui build
       - name: Docker images build
         run: docker build --target worker -t fg-worker . && docker build --target api -t fg-api .
       - name: Allow isolated runner user namespaces on Ubuntu
         run: sudo apparmor_parser -r scripts/apparmor/feedback-graph-codex-runner
-      # The contract suites, once per backend: both must pass the same tests.
-      - run: pnpm test:int
+      # Every test project with coverage: unit + ui, then the contract suites once per backend (both must pass the same
+      # tests), merged and held to the floor in vitest.config.ts.
+      - run: pnpm test:coverage:all
         env: { FG_TEST_RUNNER_UNMASK_SYSTEM_PATHS: '1', CODEX_RUNNER_APPARMOR: feedback-graph-codex-runner, TEST_STORES: 'neo4j,postgres', NEO4J_TEST_URL: bolt://127.0.0.1:7688, TEST_PG_URL: 'postgres://fg:fg@127.0.0.1:5433/fg_test' }
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: coverage, path: coverage/coverage-summary.json, if-no-files-found: ignore }

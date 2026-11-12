@@ -1,5 +1,6 @@
 import { expect, test } from 'vitest';
-import { asksForContext, checkUnanswered, compactContext, contextForPrompt, doneCheckPending, editedSince, lessonIds, mcpText, moduleWorthSaying, promptFiles, sessionBase, stopDecision, stopHook, taskContextArgs } from './lib.mjs';
+import { win32 } from 'node:path';
+import { QUEUED_ROUNDS, asksForContext, checkUnanswered, compactContext, contextForPrompt, doneCheckPending, editedSince, inRepo, lessonIds, mcpText, moduleWorthSaying, promptFiles, sessionBase, stopDecision, stopHook, taskContextArgs } from './lib.mjs';
 
 const line = (o) => JSON.stringify(o);
 let nextId = 0;
@@ -30,6 +31,26 @@ test('promptFiles picks the file paths a prompt names, for the file-scoped part 
   expect(promptFiles('Fix the race in src/db/pool.ts and update test/pool.test.ts, see README.md')).toEqual(['src/db/pool.ts', 'test/pool.test.ts', 'README.md']);
   expect(promptFiles('add a members page')).toEqual([]);
   expect(promptFiles('see https://example.com/a/b.html and v1.2.3')).toEqual([]);
+});
+
+test('promptFiles keeps paths with letters of any script, and Windows-style ones as repo paths', () => {
+  expect(promptFiles('fix src/café/menu.ts and src/routes/pedidos_ñ.ts')).toEqual(['src/café/menu.ts', 'src/routes/pedidos_ñ.ts']);
+  expect(promptFiles('fix src\\routes\\customers.ts')).toEqual(['src/routes/customers.ts']);
+  expect(promptFiles('修复 src/服务/订单.ts')).toEqual(['src/服务/订单.ts']);
+});
+
+test('inRepo follows Windows path rules: another drive folder or a sibling with the same prefix is outside', () => {
+  expect(inRepo('C:\\Users\\me\\.claude\\memory\\note.md', 'C:\\repo', 'C:\\repo', win32)).toBe(false);
+  expect(inRepo('C:\\repo2\\x.ts', 'C:\\repo', 'C:\\repo', win32)).toBe(false);
+  expect(inRepo('src\\x.ts', 'C:\\repo', 'C:\\repo', win32)).toBe(true);
+  expect(inRepo('D:\\repo\\x.ts', 'C:\\repo', 'C:\\repo', win32)).toBe(false);
+});
+
+test('an edit inside the repository but outside the session\'s cwd needs the check', () => {
+  const lines = [use('Edit', { file_path: '/repo/packages/core/x.ts' })];
+  expect(stopHook({ cwd: '/repo/packages/api' }, lines, 'demo', {}, '/repo').out).toMatchObject({ decision: 'block' });
+  expect(editedSince(lines, '/repo/packages/api', '/repo')).toEqual(['/repo/packages/core/x.ts']);
+  expect(stopHook({ cwd: '/repo/packages/api' }, [use('Edit', { file_path: '/elsewhere/x.ts' })], 'demo', {}, '/repo').out).toBeNull();
 });
 
 test('lessonIds reads the lesson citations out of get_task_context markdown', () => {
@@ -264,7 +285,7 @@ test('taskContextArgs: the prompt hook asks get_task_context with the session id
 test("stopDecision's advice on a big diff matches the judge's budget: pass it whole, the judge reads the related files first", () => {
   const r = stopDecision({ stop_hook_active: false }, true, 'demo', ['/r/a.ts']).reason;
   expect(r).not.toMatch(/200 KB/);
-  expect(r).toMatch(/Pass the whole diff: over about 30 KB the judge reads the files most related to the lessons first/);
+  expect(r).toMatch(/Pass the whole diff: over about 32 KB the judge reads the files most related to the lessons first/);
   expect(r).toMatch(/says which files it did not read/);
 });
 
@@ -316,11 +337,100 @@ test('stop checks ignore memory and plan edits outside the repository', () => {
 });
 
 
-test.each(['# Queued: pre-done check has not completed\nNothing was decided.', '# Not judged: judge busy'])('queued checks never clear the Stop hook: %s', (text) => {
+test.each(['# Queued: pre-done check has not completed\nNothing was decided.', '# Not judged: the judge did not answer within 50 s'])('a queued check does not clear the Stop hook: %s', (text) => {
   const lines = [use('Edit', { file_path: '/r/a.ts' }), use('mcp__fg__check_before_done', {}, 'queued-check'), result('queued-check', [{ type: 'text', text }])];
   expect(doneCheckPending(lines, '/r')).toBe(true);
   const blocked = stopHook({ cwd: '/r', stop_hook_active: true }, lines, 'demo', {});
   expect(blocked.out.decision).toBe('block');
   expect(blocked.out.reason).toContain('do not finish while it is queued');
+  expect(blocked.state.queuedRounds).toBe(1);
   expect(doneCheckPending([...lines, ...ran()], '/r')).toBe(false);
+});
+
+// Claude Code's own cap on Stop continuations resets on every tool call, and each round calls check_before_done.
+test('a judge that failed never loops the Stop hook: the agent is told once per edit set that the check did not run, then the stop goes through', () => {
+  const failed = (id) => [use('mcp__fg__check_before_done', {}, id), result(id, [{ type: 'text', text: '# Not judged: the judge failed (ollama 404 model "no-such-model" not found)\nNothing was decided about this work. Check it yourself against this lesson, or call check_before_done again in a minute:' }])];
+  const input = { cwd: '/r', stop_hook_active: true, session_id: 's' };
+  let lines = [use('Edit', { file_path: '/r/a.ts' }), ...failed('j1')];
+  const first = stopHook(input, lines, 'demo', {});
+  expect(first.out.decision).toBe('block');
+  expect(first.out.reason).toMatch(/did not run/);
+  expect(first.out.reason).toMatch(/Do not call it again/);
+  let state = first.state;
+  for (let round = 0; round < 6; round++) {
+    lines = [...lines, ...failed(`j${round + 2}`)];
+    const r = stopHook(input, lines, 'demo', state);
+    expect(r.out).toBeNull();
+    state = r.state;
+  }
+  // Once per edit set: more edits checked and failed again are said once more, then let through.
+  lines = [...lines, use('Edit', { file_path: '/r/b.ts' }), ...failed('j9')];
+  const again = stopHook({ ...input, stop_hook_active: false }, lines, 'demo', state);
+  expect(again.out.reason).toMatch(/did not run/);
+  expect(stopHook(input, [...lines, ...failed('j10')], 'demo', again.state).out).toBeNull();
+});
+
+test('after a "check did not run" notice, a later edit is unchecked work: the check is asked for again, and a recovered judge clears it', () => {
+  const failed = (id) => [use('mcp__fg__check_before_done', {}, id), result(id, [{ type: 'text', text: '# Not judged: the judge failed (ollama 404)\nNothing was decided about this work.' }])];
+  const input = { cwd: '/r', stop_hook_active: false, session_id: 's' };
+  const turn1 = [use('Write', { file_path: '/r/src/orders.ts' }), ...failed('f1')];
+  const said = stopHook(input, turn1, 'demo', {});
+  expect(said.out.reason).toMatch(/did not run/);
+  const allowed = stopHook({ ...input, stop_hook_active: true }, turn1, 'demo', said.state);
+  expect(allowed.out).toBeNull();
+  // Turn 2: a new edit, no check yet.
+  const turn2 = [...turn1, use('Write', { file_path: '/r/src/routes/customers.ts' })];
+  const asked = stopHook(input, turn2, 'demo', allowed.state);
+  expect(asked.out).toMatchObject({ decision: 'block' });
+  expect(asked.out.reason).toContain('/r/src/routes/customers.ts');
+  expect(asked.out.reason).toMatch(/Call check_before_done/);
+  // The judge has recovered: the check answers and the stop goes through.
+  expect(stopHook({ ...input, stop_hook_active: true }, [...turn2, ...ran()], 'demo', asked.state).out).toBeNull();
+});
+
+test('a queued check from before the last edit does not count toward QUEUED_ROUNDS or lift the continuation guard', () => {
+  const lines = [use('Edit', { file_path: '/r/a.ts' }), use('mcp__fg__check_before_done', {}, 'old-q'), result('old-q', [{ type: 'text', text: '# Queued: pre-done check has not completed' }]), use('Edit', { file_path: '/r/b.ts' })];
+  const r = stopHook({ cwd: '/r', stop_hook_active: true }, lines, 'demo', { queuedRounds: QUEUED_ROUNDS });
+  expect(r.out).toBeNull();
+  expect(r.state.queuedRounds).toBe(0);
+});
+
+test('a check still queued after QUEUED_ROUNDS blocks says once that it did not run, then lets the stop through', () => {
+  const queued = (id) => [use('mcp__fg__check_before_done', {}, id), result(id, [{ type: 'text', text: '# Queued: pre-done check has not completed' }])];
+  const input = { cwd: '/r', stop_hook_active: true };
+  let lines = [use('Edit', { file_path: '/r/a.ts' })];
+  let state = {};
+  const outs = [];
+  for (let round = 0; round < QUEUED_ROUNDS + 3; round++) {
+    lines = [...lines, ...queued(`q${round}`)];
+    const r = stopHook(input, lines, 'demo', state);
+    outs.push(r.out ? (r.out.reason.includes('Do not call it again') ? 'said' : 'retry') : null);
+    state = r.state;
+  }
+  expect(outs).toEqual([...Array(QUEUED_ROUNDS).fill('retry'), 'said', null, null]);
+  // An answered check resets the count.
+  expect(stopHook(input, [...lines, ...ran()], 'demo', state).state.queuedRounds).toBe(0);
+});
+
+test('contextForPrompt puts the AGENTS.md / CLAUDE.md files on the named files\' path in front of the request, once a session, with their note', () => {
+  const md = [
+    '# Feedback Graph context for "t" in demo', '',
+    'No approved lessons match this task yet.', '',
+    '## Code map for the files you named',
+    '- `src/db/pool.ts`: imported by 2 files',
+    '',
+    '## Agent instructions on the path of these files',
+    "Read them before you edit: the repo's own rules for this code, nearest first. An agent loads only some of them by itself.",
+    '- `src/db/AGENTS.md`',
+    '- `AGENTS.md`',
+  ].join('\n');
+  const first = contextForPrompt(md, { asked: false, shown: [] });
+  expect(first.text).toMatch(/## Agent instructions on the path of these files\nRead them before you edit[^\n]*\n- `src\/db\/AGENTS\.md`\n- `AGENTS\.md`/);
+  expect(first.text).not.toContain('Code map');
+  expect(first.state.shown).toEqual(['doc:`src/db/AGENTS.md`', 'doc:`AGENTS.md`']);
+  // Shown once: the next prompt naming the same files adds nothing, and a new folder's file adds only it, with its note.
+  expect(contextForPrompt(md, first.state).text).toBeNull();
+  const deeper = contextForPrompt(md.replace('- `src/db/AGENTS.md`', '- `src/db/pg/AGENTS.md`\n- `src/db/AGENTS.md`'), first.state);
+  expect(deeper.text).toMatch(/## Agent instructions on the path of these files\nRead them before you edit[^\n]*\n- `src\/db\/pg\/AGENTS\.md`\n\n/);
+  expect(deeper.text).not.toContain('- `AGENTS.md`');
 });

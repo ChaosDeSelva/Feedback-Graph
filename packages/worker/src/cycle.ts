@@ -19,7 +19,7 @@ export type CycleDeps = {
   listFiles(): Promise<FileInfo[]>;
   readFile(path: string): Promise<string>;
   /** Codex rollouts are streamed, never read whole. */
-  readLines?(path: string): AsyncIterable<string>;
+  readLines(path: string): AsyncIterable<string>;
   /**
    * The folder key a file's head says it belongs to (a Codex rollout that changed cwd: every folder it was in): null
    * when there is nothing in it to ingest (outside every root, an agent-only session), undefined when unknown (the
@@ -179,7 +179,6 @@ async function codexCopyOf(s: ParsedSession, fingerprint: string | null, project
 
 async function readSessions(path: string, source: SessionSource, deps: CycleDeps): Promise<ParsedSession[]> {
   if (source === 'claude') return parseTranscript(await deps.readFile(path), path);
-  if (!deps.readLines) throw new Error('no line reader for Codex sessions');
   const p = codexSessionParser(path);
   for await (const line of deps.readLines(path)) p.push(line);
   return p.finish();
@@ -313,11 +312,11 @@ export async function runCycle(deps: CycleDeps): Promise<CycleResult> {
     }
     // An agent reviewing its own PR under the author's account: kept, but labelled so the Inbox does not read it as a reviewer's pushback.
     if (turn.external && !skip && isSelfReview(turn.external) && !c.signals.includes('self-review')) c = { ...c, signals: [...c.signals, 'self-review'] };
-    const isCandidate = CANDIDATE_LABELS.has(c.label);
-    // The Inbox item the turn is filed under: its own id, or an agent report's it was merged into (dedupe.ts).
-    const itemId = await deps.repo.saveClassification(turn.uuid, c, isCandidate);
+    // The Inbox item the turn is filed under (its own id, or an agent report's it was merged into: dedupe.ts); null when
+    // it is no candidate.
+    const itemId = await deps.repo.saveClassification(turn.uuid, c, CANDIDATE_LABELS.has(c.label));
     turnsClassified++;
-    if (isCandidate) {
+    if (itemId) {
       candidates++;
       await deps.activity?.record({
         kind: 'candidate_flagged',
@@ -328,7 +327,7 @@ export async function runCycle(deps: CycleDeps): Promise<CycleResult> {
         subject: `flagged as ${c.label}: "${turn.text.slice(0, 80)}${turn.text.length > 80 ? '…' : ''}"`,
         why: c.summary,
         details: { label: c.label, confidence: c.confidence, signals: c.signals, sessionId: turn.sessionId, turnUuid: turn.uuid, prefilter: pre.signals.join(' | ') },
-        targets: [itemId ?? turn.uuid],
+        targets: [itemId],
       });
     }
   }

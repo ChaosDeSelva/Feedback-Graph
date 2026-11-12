@@ -2,6 +2,7 @@ import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { expect, test } from 'vitest';
+import type { ChatProvider } from '@fb/core';
 import { chatSpec, codexLoggedIn, defaultChatSpec } from './provider.ts';
 
 const local = 'ollama:gemma4';
@@ -45,4 +46,9 @@ test('a Codex login is a non-empty auth.json in CODEX_HOME (the compose placehol
   writeFileSync(join(home, 'auth.json'), '{"tokens":{}}');
   expect(codexLoggedIn({ CODEX_HOME: home })).toBe(true);
   expect(codexLoggedIn({})).toBe(false);
+});
+
+test('a stored chat whose provider this release no longer has is answered by the default', () => {
+  const o = { chatLlm: null, localModel: local, env: claudeToken, codexLogin: false };
+  expect(chatSpec('gemini' as ChatProvider, o)).toBe(defaultChatSpec(o));
 });

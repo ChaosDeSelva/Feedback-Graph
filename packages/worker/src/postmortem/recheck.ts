@@ -1,6 +1,6 @@
 import { readFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
-import { LESSON_CHECKS_VERSION, redactSecrets, type ActivityStore, type KnowledgeStore, type Lesson, type LessonCheck, type LessonCheckName, type LessonDetail, type SimilarLesson } from '@fb/core';
+import { LESSON_CHECKS_VERSION, redactSecrets, type ActivityStore, type Decision, type DecisionsStore, type KnowledgeStore, type Lesson, type LessonCheck, type LessonCheckName, type LessonDetail, type SimilarLesson } from '@fb/core';
 import { MODEL_FACT_WHY, recheckLesson, saysWrongSession } from './lessonCheck.ts';
 import { ambiguousFlag, junkPathReason, normalizeStoredPaths, repoFileList, repoHas, type Normalized } from './paths.ts';
 import { claimsNotLoaded, imports } from './standing.ts';
@@ -23,18 +23,19 @@ export const RECHECK_WRONG_SESSION_WHY = 'the post-mortem says the matched sessi
  * may-hold-secret (the redaction re-run's flag on an approved lesson) holds while a rule still reads a credential in
  * the lesson's text as it is now: once the owner edited the secret out (an edit resets checksVersion), it goes.
  */
-const mayHoldSecret = (l: Lesson) => [l.title, l.rule, l.appliesWhen ?? ''].some((t) => redactSecrets(t) !== t);
+const mayHoldSecret = (l: Lesson) => [l.title, l.rule, l.appliesWhen].some((t) => redactSecrets(t) !== t);
 
 /**
  * Flags a re-check cannot work out again, kept from the earlier checks: made from the comment's metadata (who wrote
  * it, the matched session: the post-mortem's own redo or the session re-match, not a re-check's reading of the miss) or
  * by the model, neither of which is stored with the lesson; or a repair already applied to the lesson (a dropped path);
- * or no-miss, which only a post-mortem's own words raise. broken-rule (the title used as the rule) only while the
- * lesson is the writer's, as the repair left it: once the owner edited or decided it, the rule is judged as it is now.
+ * or no-miss, which only a post-mortem's own words raise. broken-rule (the title used as the rule) and
+ * example-applies-when (the examples shown are not stored) only while the lesson is the writer's, as the post-mortem
+ * left it: once the owner edited or decided it, it is judged as it is now.
  */
 const kept = (l: Lesson) => (c: LessonCheck) =>
   (c.name === 'wrong-session' && c.why !== RECHECK_WRONG_SESSION_WHY) || c.name === 'self-review' || c.name === 'no-miss' || c.name === 'non-repo-path' ||
-  (c.name === 'broken-rule' && l.status === 'proposed' && !l.proposedAs) || c.name === 'contradicts-evidence' ||
+  ((c.name === 'broken-rule' || c.name === 'example-applies-when') && l.status === 'proposed' && !l.proposedAs) || c.name === 'contradicts-evidence' ||
   (c.name === 'may-hold-secret' && mayHoldSecret(l)) ||
   (c.name === 'looks-like-a-fact' && c.why === MODEL_FACT_WHY);
 
@@ -72,7 +73,9 @@ export function duplicateFlag(me: Pick<Lesson, 'id' | 'status' | 'createdAt'>, n
 }
 
 export type RecheckDeps = {
-  k: Pick<KnowledgeStore, 'listLessons' | 'lessonDetail' | 'setLessonChecks'> & Partial<Pick<KnowledgeStore, 'staleLessonChecks' | 'similarLessons' | 'setLessonPaths'>>;
+  k: Pick<KnowledgeStore, 'listLessons' | 'lessonDetail' | 'setLessonChecks'> & Pick<KnowledgeStore, 'staleLessonChecks' | 'similarLessons' | 'setLessonPaths'>;
+  /** The learning loop's decisions: a lesson one of them stands on keeps its paths (heldByLoop). */
+  decisions: Pick<DecisionsStore, 'forTarget'>;
   /** Each project's repository folder as the worker sees it; unset or missing a project: its paths are not looked up. */
   repoPaths?: () => Promise<Map<string, string>>;
   /** Whether the repository has the path (default repoHas: true when the repository is not mounted). */
@@ -137,6 +140,15 @@ async function contradiction(detail: LessonDetail | null, repo: string | undefin
   return null;
 }
 
+/** Loop decisions that stand on a target as it is: an observed or proposed call on it, or one applying or applied. */
+const STANDING: readonly Decision['status'][] = ['observed', 'proposed', 'applying', 'applied'];
+
+/**
+ * A loop decision stands on the lesson as it is: rewriting its paths would leave an applied one's rollback and sync
+ * hold reading a lesson someone else changed (and override a pending call), so they are only flagged.
+ */
+const heldByLoop = async (d: RecheckDeps, id: string) => (await d.decisions.forTarget(id)).some((x) => STANDING.includes(x.status));
+
 /**
  * The path flags of a stored lesson after normalizeStoredPaths. Its paths replaced (proposed): bad-path says what was
  * dropped. Kept as they are (approved): path-missing for what the repository does not have as written (bad-path for
@@ -155,13 +167,11 @@ function pathFlags(n: Normalized, replaced: boolean): LessonCheck[] {
  * never): the text checks, and the data checks only a stored lesson can have (its miss saying the session was the wrong
  * one, its paths against the mounted repository, a near-duplicate by stored embedding). A proposed lesson's paths are
  * normalized and stored (normalizeStoredPaths: bare names resolved, junk and missing files dropped) and the change
- * logged; otherwise flags only: an approved lesson's text and paths are left as the owner approved them. Each lesson is stamped with the version, so it runs once
+ * logged, unless a loop decision stands on it (heldByLoop); otherwise flags only: an approved lesson's text and paths are left as the owner approved them. Each lesson is stamped with the version, so it runs once
  * per version (and again after requestLessonRecheck); Activity says how many were checked and which flags came and went.
  */
 export async function recheckLessons(d: RecheckDeps): Promise<{ checked: number; flagged: number; changed: number }> {
-  const todo = d.k.staleLessonChecks
-    ? await d.k.staleLessonChecks(LESSON_CHECKS_VERSION, MAX_LESSONS)
-    : (await d.k.listLessons({ limit: MAX_LESSONS })).filter((l) => (l.status === 'proposed' || l.status === 'approved') && (l.checksVersion ?? 0) < LESSON_CHECKS_VERSION);
+  const todo = await d.k.staleLessonChecks(LESSON_CHECKS_VERSION, MAX_LESSONS);
   if (!todo.length) return { checked: 0, flagged: 0, changed: 0 };
   const repos = (await d.repoPaths?.().catch(() => null)) ?? new Map<string, string>();
   const exists = d.exists ?? repoHas;
@@ -180,7 +190,8 @@ export async function recheckLessons(d: RecheckDeps): Promise<{ checked: number;
     // A proposed lesson's paths are replaced by the normalized ones (only while it is proposed and the writer's alone:
     // the store refuses others). Paths the owner edited are the owner's (a file about to be created too): only flagged.
     let paths = l.paths;
-    if (l.status === 'proposed' && !l.proposedAs && d.k.setLessonPaths && JSON.stringify(norm.paths) !== JSON.stringify(l.paths) && (await d.k.setLessonPaths(l.id, norm.paths))) {
+    if (l.status === 'proposed' && !l.proposedAs && JSON.stringify(norm.paths) !== JSON.stringify(l.paths) && !(await heldByLoop(d, l.id))
+      && (await d.k.setLessonPaths(l.id, norm.paths))) {
       paths = norm.paths;
       normalized++;
       d.log?.('lesson paths normalized', { id: l.id, from: l.paths, to: norm.paths, dropped: norm.dropped, resolved: norm.resolved });
@@ -198,7 +209,7 @@ export async function recheckLessons(d: RecheckDeps): Promise<{ checked: number;
     if (isFiller(l.appliesWhen)) {
       data.push({ name: 'filler-applies-when', why: `its "applies when" is just "${l.appliesWhen.trim()}": it says nothing about when the rule applies; say the kind of task or the files` });
     }
-    const dup = d.k.similarLessons ? duplicateFlag(l, await d.k.similarLessons(l.id, NEIGHBOURS)) : null;
+    const dup = duplicateFlag(l, await d.k.similarLessons(l.id, NEIGHBOURS));
     if (dup) data.push(dup);
     const contradicted = await contradiction(detail, repo, d);
     if (contradicted) data.push(contradicted);
@@ -210,7 +221,10 @@ export async function recheckLessons(d: RecheckDeps): Promise<{ checked: number;
       ...fromPaths.filter((f) => f.name !== 'bad-path'), ...fresh.filter((f) => f.name !== 'bad-path'),
     ];
     const keep = (l.checks ?? []).filter(kept(l));
-    const flags = [...keep, ...computed.filter((c) => !keep.some((k) => k.name === c.name))];
+    // The broader "applies when" the worker suggested (triggers.ts) stays with the flag while the flag does.
+    const suggested = l.checks?.find((c) => c.name === 'instance-applies-when' && c.suggestion)?.suggestion;
+    const flags = [...keep, ...computed.filter((c) => !keep.some((k) => k.name === c.name))]
+      .map((c) => (c.name === 'instance-applies-when' && suggested ? { ...c, suggestion: suggested } : c));
     await d.k.setLessonChecks(l.id, flags, LESSON_CHECKS_VERSION);
     const before = new Set((l.checks ?? []).map((c) => c.name));
     const after = new Set<LessonCheckName>(flags.map((c) => c.name));

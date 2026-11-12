@@ -1,4 +1,4 @@
-import { gradeLessons, EXPORT_FORMAT, type ActivityInput, type ExportBundle, type Lesson, type LessonInput } from '@fb/core';
+import { rankLessons, EXPORT_FORMAT, type ActivityInput, type ExportBundle, type Lesson, type LessonInput } from '@fb/core';
 import { expect, test } from 'vitest';
 import { createApp, type ApiRepo } from './app.ts';
 import { MAX_IMPORT_BYTES, type ImportDeps } from './import.ts';
@@ -133,9 +133,22 @@ test('a JSON backup roundtrip preserves no-miss quarantine even when keeping app
   expect(upserted[0]).toMatchObject({ status: 'approved', checks });
   const { run: _run, ...fields } = upserted[0];
   const restored: Lesson = { ...lesson('lesson:quarantine'), ...fields };
-  expect(gradeLessons([{ lesson: restored, score: 1 }], 'orders', { projectKey: 'demo', files: ['src/orders.ts'] })).toEqual({ follow: [], related: [] });
+  expect(rankLessons([{ lesson: restored, score: 1 }], 'orders', { projectKey: 'demo', files: ['src/orders.ts'] })).toEqual([]);
 });
 
+
+test('a bundle carries a lesson\'s triggers and the suggestion on its checks; a malformed trigger refuses the bundle', async () => {
+  const triggers = { paths: ['db/**/*.sql'], patterns: ['CREATE\\s+INDEX'], symbols: [] };
+  const checks = [{ name: 'instance-applies-when' as const, why: 'only this feature', suggestion: 'changing a SQL query or an index' }];
+  const { app, upserted } = deps();
+  expect((await post(app, bundle({ lessons: [lesson('lesson:t', { triggers, checks })] }))).status).toBe(200);
+  expect(upserted[0]).toMatchObject({ triggers, checks });
+  // None in the bundle: none imported (the worker derives them).
+  const plain = deps();
+  await post(plain.app, bundle({ lessons: [lesson('lesson:u', { triggers: null })] }));
+  expect(plain.upserted[0]).not.toHaveProperty('triggers');
+  expect((await post(deps().app, bundle({ lessons: [lesson('lesson:v', { triggers: { paths: [], patterns: ['(['], symbols: [] } })] }))).status).toBe(400);
+});
 
 test('backup imports preserve revoked lessons as revoked, even with keepApproved', async () => {
   const { app, upserted } = deps();
@@ -153,4 +166,33 @@ test('backup import retains private-project provenance through the creation-only
   const response = await app.request('/api/import', { method: 'POST', body: JSON.stringify(b), headers: ui });
   expect(response.status).toBe(200);
   expect(restored).toEqual([{ key: 'private-demo', remote: null }]);
+});
+
+test('an importer that cannot restore private projects refuses a bundle with one before storing anything; an excluded one is not restored', async () => {
+  const { app, upserted } = deps();
+  const res = await post(app, bundle({ projects: [{ key: 'private-demo', remote: null, demoCreated: true }] }));
+  expect(res.status).toBe(500);
+  expect(upserted).toEqual([]);
+  const restored: string[] = [];
+  const excluded = deps({ excluded: ['private-demo'], portability: { restorePrivateProject: async (p) => { restored.push(p.key); } } });
+  expect((await post(excluded.app, bundle({ projects: [{ key: 'private-demo', remote: null, demoCreated: true }] }))).status).toBe(200);
+  expect(restored).toEqual([]);
+});
+
+test('a bundle of all projects without an export time: the same lesson twice is imported once, facts from several models are the import\'s, and Activity names the one project', async () => {
+  const calls: string[] = [];
+  const { app, upserted, recorded } = deps({ facts: { currentSources: async () => [], replaceProjectFacts: async (_k, _f, source) => { calls.push(source); } } });
+  const fact = (source: string) => ({ path: 'src/a.ts', lines: '1', kind: 'convention', statement: source, why: 'w', confidence: 0.9, source, createdAt: 't', projectKey: 'demo' });
+  const raw = { ...bundle({ lessons: [lesson('lesson:a'), lesson('lesson:a', { title: 'again' })], facts: [fact('ollama:a'), fact('ollama:b')] }), projectKey: undefined, exportedAt: undefined };
+  expect((await post(app, raw)).status).toBe(200);
+  expect(upserted.map((l) => [l.id, l.title])).toEqual([['lesson:a', 'T lesson:a']]);
+  expect(calls).toEqual(['import']);
+  expect(recorded[0]).toMatchObject({ projectKey: 'demo', subject: 'imported 1 lesson (0 approved, 1 proposed) and 2 facts from a bundle exported at an unknown time' });
+});
+
+test('a bundle of several projects is logged under none', async () => {
+  const { app, recorded } = deps();
+  const raw = { ...bundle({ lessons: [lesson('lesson:a'), lesson('lesson:b', { projectKey: 'other' })] }), projectKey: null };
+  expect((await post(app, raw)).status).toBe(200);
+  expect(recorded[0]).toMatchObject({ projectKey: null, targets: ['lesson:a', 'lesson:b'] });
 });

@@ -90,7 +90,7 @@ test('what an agent is served, and what it reports, name its session when it pas
   const app = createApp(repo, {
     context: {
       roots: [{ host: '/Users/j/Vibe', container: '/vibe' }], embed: async (t) => t.map(() => [1]), judge: async () => [],
-      k: { searchLessons: async () => [], relatedMisses: async () => [], recordPreDoneCheck: async () => {}, createManualFeedback: async () => 'manual:9' },
+      k: { searchLessons: async () => [], missesNaming: async () => [], relatedMisses: async () => [], recordPreDoneCheck: async () => {}, createManualFeedback: async () => 'manual:9' },
       activity: { record: async (e) => { logged.push(e); } },
     },
   });
@@ -116,7 +116,7 @@ test('check_before_done takes session_id: the check is recorded with it and its 
       roots: [{ host: '/Users/j/Vibe', container: '/vibe' }], embed: async (t) => t.map(() => [1]),
       judge: async (_w, ls) => ls.map((l) => ({ lessonId: l.lesson.id, status: 'addressed' as const, why: 'ok', applies: true })),
       k: {
-        searchLessons: async () => (lessons ? [lessonHit as never] : []), relatedMisses: async () => [miss as never],
+        searchLessons: async () => (lessons ? [lessonHit as never] : []), missesNaming: async () => [], relatedMisses: async () => [miss as never],
         recordPreDoneCheck: async (c) => { checks.push(c); }, createManualFeedback: async () => 'manual:9',
       },
       activity: { record: async (e) => { logged.push(e); } },

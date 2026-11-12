@@ -3,10 +3,22 @@ services:
     image: neo4j:5.26-community@sha256:249a1ec6e3c52d82101a5ed33d6ed2b5ed5b0017b21a28c0bfebc335e87fb177
     environment:
       NEO4J_AUTH: neo4j/testpassword
+      # The smallest transaction-memory limits the stack runs with (docker-compose.small.yml), so a test that exceeds
+      # them fails here too.
+      NEO4J_dbms_memory_transaction_total_max: 128M
+      NEO4J_db_memory_transaction_total_max: 128M
+      NEO4J_db_memory_transaction_max: 32M
+      # And its heap and page cache, rather than sizes taken from the whole Docker VM: on a VM shared with other
+      # stacks those let the kernel OOM-kill the test database part-way through a run.
+      NEO4J_server_memory_heap_initial__size: 512M
+      NEO4J_server_memory_heap_max__size: 1G
+      NEO4J_server_memory_pagecache_size: 512M
     ports:
       - "127.0.0.1:7688:7687"
+    # Both of the image's volumes, so the throwaway database leaves no anonymous volume behind.
     tmpfs:
       - /data
+      - /logs
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://localhost:7474 >/dev/null || exit 1"]
       interval: 3s

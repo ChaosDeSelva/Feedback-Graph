@@ -7,6 +7,8 @@ type Deadline = { signal: AbortSignal; expiresAt: number };
 const scope = new AsyncLocalStorage<Deadline>();
 export const withStoreDeadline = <T>(deadline: Deadline, fn: () => T): T => scope.run(deadline, fn);
 export const storeRequestSignal = (): AbortSignal | undefined => scope.getStore()?.signal;
+/** What a store call cancelled by its request reports: the deadline, not the error of the session closed under it. */
+export const deadlineOr = (error: unknown, signal: AbortSignal | undefined): unknown => (signal?.aborted ? new StoreDeadlineError() : error);
 export function storeTimeLeft(fallback = 30_000): number {
   const current = scope.getStore();
   if (!current) return fallback;

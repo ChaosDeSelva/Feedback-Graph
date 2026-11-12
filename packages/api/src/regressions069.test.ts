@@ -5,7 +5,7 @@ import { checkBeforeDone, getTaskContext, makeJudge, type ContextDeps } from './
 import { quotedCode, citeDiff, splitDiff } from './diff.ts';
 
 const lesson: Lesson = { id: 'prefix', projectKey: 'demo', title: 'Key prefix', rule: 'Do not use KeyPrefix 005.', appliesWhen: 'editing the schema', paths: ['src/schema.ts'], status: 'approved', scope: 'project', source: 'postmortem', cause: null, missId: null, createdAt: 't', decidedAt: 't' };
-const deps = (over: Partial<ContextDeps> = {}): ContextDeps => ({ roots: [{ host: '/projects', container: '/projects' }], exists: () => true, embed: async () => [[1]], k: { searchLessons: async () => [{ lesson, score: 1 }], relatedMisses: async () => [], recordPreDoneCheck: async () => {}, createManualFeedback: async () => 'f' }, judge: async () => [], ...over });
+const deps = (over: Partial<ContextDeps> = {}): ContextDeps => ({ roots: [{ host: '/projects', container: '/projects' }], exists: () => true, embed: async () => [[1]], k: { searchLessons: async () => [{ lesson, score: 1 }], missesNaming: async () => [], relatedMisses: async () => [], recordPreDoneCheck: async () => {}, createManualFeedback: async () => 'f' }, judge: async () => [], ...over });
 const diff = (old: string, next: string) => `--- a/src/schema.ts\n+++ b/src/schema.ts\n@@ -1 +1 @@\n-KeyPrefix = "${old}";\n+KeyPrefix = "${next}";\n`;
 
 test('single-quoted short literals in model reasons validate violations and clean changes, never the wrong side', async () => {
@@ -32,7 +32,7 @@ test('context applies weighted fact rank .80 and returns bounded explicit ranks 
   expect(context.misses[0]).toMatchObject({ score: 1, rankingScore: 1 });
   expect(context.docs[0]).toMatchObject({ score: 1, rankingScore: 1 });
   expect(context.facts.every(h => Number.isFinite(h.rankingScore))).toBe(true);
-  expect(context.markdown).toContain('rank≥0.80');
+  expect(context.markdown).not.toMatch(/rank≥|\d\/\d\.\d{3}/);
   expect(context.markdown).not.toContain('1.20');
 });
 
@@ -58,9 +58,9 @@ test('own-PR exclusion filters vector and file misses and tells the agent the ex
 });
 
 test('Ask includes the exact named file symbols even when their names do not match the question tokens', async () => {
-  const path = 'src/workos-invite-dialog.tsx';
+  const path = 'src/member-invite-dialog.tsx';
   const map = { files: [{ path, lang: 'tsx', isTest: false }], symbols: ['InviteDialog', 'sendInvite', 'validateAddress', 'resetForm'].map(name => ({ path, name, kind: 'function', lines: '1-3', exported: true })), imports: [], outside: [] };
-  const result = await buildChatContext('demo', 'What went wrong in workos-invite-dialog.tsx?', [], { context: deps(), codeMap: async () => map as never });
+  const result = await buildChatContext('demo', 'What went wrong in member-invite-dialog.tsx?', [], { context: deps(), codeMap: async () => map as never });
   for (const symbol of map.symbols) expect(result.context).toContain(symbol.name);
   expect(result.context).not.toContain('No code-map entry');
   expect(result.sources.filter(s => s.kind === 'code')).toHaveLength(4);

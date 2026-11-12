@@ -78,3 +78,25 @@ test('extract reads .gd files with the line reader (there is no tree-sitter gram
   expect((await extract('gdscript', 'extends Node\nfunc go():\n\tpass\n'))!.symbols).toEqual([{ name: 'go', kind: 'function', exported: true, lines: '2-3' }]);
   expect(extractGdscript('')).toEqual({ symbols: [], imports: [] });
 });
+
+test('a triple-quoted string closed on its own line and an escaped quote hide the names inside them', () => {
+  const src = [
+    'func greet():',
+    '\tvar doc = """Boss on one line""" + Hero.name',
+    '\tprint("say \\"Villain\\" twice", Sidekick)',
+  ].join('\n');
+  const out = extractGdscript(src);
+  expect(out.symbols).toEqual([{ name: 'greet', kind: 'function', exported: true, lines: '1-3' }]);
+  expect(out.imports.map((i) => i.spec).sort()).toEqual(['Hero', 'Sidekick']);
+});
+
+test('a file starting with a UTF-8 BOM keeps its class_name', () => {
+  const out = extractGdscript('﻿class_name Player extends CharacterBody2D\n');
+  expect(out.symbols).toEqual([{ name: 'Player', kind: 'class', exported: true, lines: '1-1' }]);
+  expect(out.imports.map((i) => i.spec)).toEqual(['CharacterBody2D']);
+});
+
+test('a preload or load in a comment is not a reference', () => {
+  const out = extractGdscript('extends Node\n# var Old = preload("res://old.gd")\nvar s = load("res://new.gd") # load("res://gone.gd")\n');
+  expect(out.imports.map((i) => i.spec).sort()).toEqual(['Node', 'res://new.gd']);
+});

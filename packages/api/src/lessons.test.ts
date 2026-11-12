@@ -10,9 +10,18 @@ const lesson: Lesson = {
   status: 'proposed', source: 'postmortem', cause: 'verification_gap', missId: 'miss:a', createdAt: 't', decidedAt: null,
 };
 
+/** The knowledge calls the app makes besides the lessons themselves, answering as an empty store. */
+const QUIET = {
+  decidedLessons: async () => [],
+  postmortemBacklog: async () => 0,
+  postmortemQueue: async () => ({ waiting: 0, oldestAt: null }),
+  requestLessonRecheck: async () => 0,
+};
+
 function setup() {
   const calls: unknown[][] = [];
   const knowledge = {
+    ...QUIET,
     listLessons: async (f: object) => { calls.push(['list', f]); return [lesson]; },
     lessonDetail: async (id: string) => (id === lesson.id ? { lesson, miss: null, feedback: null, contextItems: [], fixCommits: [], supersedes: [] } : null),
     updateLesson: async (...a: unknown[]) => { calls.push(['update', ...a]); return { unscoped: false }; },
@@ -39,7 +48,7 @@ test('GET /api/lessons/:id is 404 for unknown ids', async () => {
 
 test('a direct lesson URL cannot expose a sandbox lesson outside its run', async () => {
   const sandbox = { ...lesson, id: 'lesson:sandbox', run: 'probe-a', sandbox: true as const };
-  const app = createApp(repo, { knowledge: {
+  const app = createApp(repo, { knowledge: { decidedLessons: async () => [], postmortemBacklog: async () => 0, postmortemQueue: async () => ({ waiting: 0, oldestAt: null }), requestLessonRecheck: async () => 0,
     listLessons: async () => [sandbox],
     lessonDetail: async () => ({ lesson: sandbox, miss: null, feedback: null, contextItems: [], fixCommits: [], supersedes: [] }),
     updateLesson: async () => ({ unscoped: false }),
@@ -51,6 +60,7 @@ test('a direct lesson URL cannot expose a sandbox lesson outside its run', async
 test('GET /api/lessons/:id never shows a context item why that is only a field name (stored before the check)', async () => {
   const item = (why: string) => ({ kind: 'code' as const, ref: 'api/search.ts', excerpt: 'x', why, wasAvailable: true });
   const knowledge = {
+    ...QUIET,
     listLessons: async () => [lesson],
     lessonDetail: async () => ({ lesson, miss: null, feedback: null, contextItems: [item('wasAvailable'), item('It scoped by org')], fixCommits: [], supersedes: [] }),
     updateLesson: async () => ({ unscoped: false }),
@@ -75,11 +85,43 @@ test('PATCH editing the rule re-embeds the lesson text', async () => {
   expect(calls).toContainEqual(['update', 'lesson:a', { rule: 'New rule', scope: 'global' }, { reembed: [0.5], by: 'you' }]);
 });
 
+test('PATCH sets the owner\'s triggers (trimmed, without re-embedding); each must be well formed, and the change is logged', async () => {
+  const { app, calls, embedded } = setup();
+  const res = await app.request('/api/lessons/lesson%3Aa', patch({ triggers: { paths: [' db/**/*.sql '], patterns: ['CREATE\\s+INDEX'], symbols: [] } }));
+  expect(res.status).toBe(200);
+  expect(embedded).toEqual([]);
+  expect(calls).toContainEqual(['update', 'lesson:a', { triggers: { paths: ['db/**/*.sql'], patterns: ['CREATE\\s+INDEX'], symbols: [] } }, { reembed: undefined, by: 'you' }]);
+  // A list left out is empty.
+  await app.request('/api/lessons/lesson%3Aa', patch({ triggers: { symbols: ['asyncio.to_thread'] } }));
+  expect(calls).toContainEqual(['update', 'lesson:a', { triggers: { paths: [], patterns: [], symbols: ['asyncio.to_thread'] } }, { reembed: undefined, by: 'you' }]);
+  for (const bad of [{ patterns: ['(['] }, { patterns: ['x*'] }, { symbols: ['two words'] }, { paths: ['/etc/passwd'] }, { paths: Array(9).fill('a/b.ts') }, { other: [] }]) {
+    const r = await app.request('/api/lessons/lesson%3Aa', patch({ triggers: bad }));
+    expect(r.status).toBe(400);
+  }
+  const msg = JSON.stringify(await (await app.request('/api/lessons/lesson%3Aa', patch({ triggers: { patterns: ['(['] } }))).json());
+  expect(msg).toContain('not a valid regular expression');
+});
+
+test('a triggers edit is in the activity entry\'s changes', async () => {
+  const logged: ActivityInput[] = [];
+  const knowledge = {
+    ...QUIET,
+    listLessons: async () => [lesson],
+    lessonDetail: async () => ({ lesson: { ...lesson, triggers: null }, miss: null, feedback: null, contextItems: [], fixCommits: [], supersedes: [] }),
+    updateLesson: async () => ({ unscoped: false }),
+  };
+  const app = createApp(repo, { auth: { ownerToken: OWNER }, knowledge, activity: { removeRun: async () => 0, record: async (e) => { logged.push(e); }, list: async () => [] } });
+  const triggers = { paths: [], patterns: [], symbols: ['FlushBatch'] };
+  await app.request('/api/lessons/lesson%3Aa', patch({ triggers }));
+  expect(logged[0].details).toMatchObject({ changed: { triggers: { from: null, to: triggers } } });
+});
+
 describe('narrowing a global lesson to a project', () => {
   const global: Lesson = { ...lesson, id: 'lesson:g', projectKey: null, origin: null, scope: 'global', source: 'manual' };
   function narrowSetup(o: { shown?: string[] } = {}) {
     const calls: unknown[][] = [];
     const knowledge = {
+    ...QUIET,
       listLessons: async () => [global],
       lessonDetail: async (id: string) => (id === global.id ? { lesson: global, miss: null, feedback: null, contextItems: [], fixCommits: [], supersedes: [] } : null),
       // As both stores: a narrowed lesson with neither a project given nor one to trace it to is unscoped.
@@ -132,6 +174,7 @@ function factSetup(l: Lesson = lesson, o: { auth?: AppOpts['auth'] } = {}) {
   const logged: ActivityInput[] = [];
   const embedded: string[][] = [];
   const knowledge = {
+    ...QUIET,
     listLessons: async () => [l],
     lessonDetail: async (id: string) => (id === l.id ? { lesson: l, miss: { id: 'miss:a', missed: 'Read the mirror table', cause: 'verification_gap' as const, causeExplanation: '' }, feedback: null, contextItems: [], fixCommits: [], supersedes: [] } : null),
     updateLesson: async (...a: unknown[]) => { calls.push(['update', ...a]); return { unscoped: false }; },
@@ -143,7 +186,7 @@ function factSetup(l: Lesson = lesson, o: { auth?: AppOpts['auth'] } = {}) {
   const app = createApp(repo, {
     knowledge, facts: facts as never, auth: o.auth ?? { ownerToken: OWNER },
     embed: async (t) => { embedded.push(t); return t.map(() => [0.25]); },
-    activity: { record: async (e) => { logged.push(e); }, list: async () => [] },
+    activity: { removeRun: async () => 0, record: async (e) => { logged.push(e); }, list: async () => [] },
   });
   return { app, calls, logged, embedded };
 }
@@ -217,6 +260,7 @@ function bulkSetup(o: { auth?: AppOpts['auth'] } = {}) {
   const logged: ActivityInput[] = [];
   const lessons: Lesson[] = [lesson, { ...lesson, id: 'lesson:b', title: 'B' }, { ...lesson, id: 'lesson:hidden', projectKey: 'other' }];
   const knowledge = {
+    ...QUIET,
     listLessons: async () => lessons,
     lessonDetail: async (id: string) => {
       const l = lessons.find((x) => x.id === id);
@@ -227,7 +271,7 @@ function bulkSetup(o: { auth?: AppOpts['auth'] } = {}) {
   };
   const app = createApp(repo, {
     knowledge, auth: o.auth ?? { ownerToken: OWNER },
-    activity: { record: async (e) => { logged.push(e); }, list: async () => [] },
+    activity: { removeRun: async () => 0, record: async (e) => { logged.push(e); }, list: async () => [] },
     shown: async () => shownProjects({ tracked: ['demo'], initialized: true }, { excludeProjects: [] }),
   });
   return { app, calls, logged };

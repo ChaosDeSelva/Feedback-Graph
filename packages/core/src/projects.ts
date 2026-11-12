@@ -1,5 +1,5 @@
 import { lstat, readdir } from 'node:fs/promises';
-import { join } from 'node:path';
+import { join, posix } from 'node:path';
 import type { Project } from './types.ts';
 
 /**
@@ -34,8 +34,16 @@ function projectRel(rest: string, root: Root): string | null {
   return best;
 }
 
+/** cwd with its `.` and `..` segments resolved, so `<root>/demo/../other` is other; null for a relative one that has them. */
+function canonical(cwd: string): string | null {
+  if (!/(?:^|[\\/])\.\.?(?:[\\/]|$)/.test(cwd)) return cwd;
+  return cwd.startsWith('/') ? posix.normalize(cwd) : null;
+}
+
 /** The root a host cwd is under (the longest match) and the project folder in it, relative to that root. */
-function locate(cwd: string, roots: Root[]): { root: Root; rel: string } | null {
+function locate(raw: string, roots: Root[]): { root: Root; rel: string } | null {
+  const cwd = canonical(raw);
+  if (cwd === null) return null;
   for (const root of [...roots].sort((a, b) => b.host.length - a.host.length)) {
     const prefix = trim(root.host) + '/';
     if (!cwd.startsWith(prefix)) continue;

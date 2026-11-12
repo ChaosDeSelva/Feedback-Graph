@@ -80,7 +80,8 @@ function matchPattern(patterns: string[], spec: string): { pattern: string; star
 }
 
 /** configDir: the folder of the config itself (the leaf of an extends chain), what `${configDir}` in paths stands for. */
-type TsConfig = { baseUrl?: string; paths?: Record<string, string[]>; pathsDir?: string; configDir: string };
+/** pathsDir is set with paths: the folder of the config that declared them. */
+type TsConfig = { baseUrl?: string; paths?: Record<string, unknown>; pathsDir?: string; configDir: string };
 const CONFIG_FILE = /^[tj]sconfig[^/]*\.json$/;
 const NODE_BUILTINS = new Set(builtinModules.map((m) => m.replace(/^node:/, '').split('/')[0]));
 /** Python standard library modules a repo folder may share a name with (tools/logging/): never "unresolved". */
@@ -156,7 +157,7 @@ export function makeResolver(paths: string[], read: (path: string) => string | u
     const co = (json.compilerOptions ?? {}) as Record<string, unknown>;
     if (typeof co.baseUrl === 'string') cfg.baseUrl = join(dir, co.baseUrl) ?? undefined;
     if (co.paths && typeof co.paths === 'object') {
-      cfg.paths = co.paths as Record<string, string[]>;
+      cfg.paths = co.paths as Record<string, unknown>;
       cfg.pathsDir = dir;
     }
     tsconfigs.set(path, cfg);
@@ -188,8 +189,10 @@ export function makeResolver(paths: string[], read: (path: string) => string | u
   const viaPaths = (cfg: TsConfig, spec: string): string | null | undefined => {
     const m = matchPattern(Object.keys(cfg.paths!), spec);
     if (!m) return undefined;
-    const baseDir = cfg.baseUrl ?? cfg.pathsDir ?? '';
-    for (const t of cfg.paths![m.pattern] ?? []) {
+    const baseDir = cfg.baseUrl ?? cfg.pathsDir!;
+    // A hand-written tsconfig may map a pattern to a string or null instead of a list: no targets.
+    const targets: unknown = cfg.paths![m.pattern];
+    for (const t of Array.isArray(targets) ? targets : []) {
       if (typeof t !== 'string') continue;
       const target = t.replace('*', m.star);
       const f = target.includes('${configDir}') ? resolveFile(join(target.replace('${configDir}', cfg.configDir))) : resolveFile(join(baseDir, target));
@@ -333,7 +336,6 @@ export function makeResolver(paths: string[], read: (path: string) => string | u
       const sub = n === '*' ? undefined : pyModule(modPath ? `${modPath}/${n}` : n).file;
       add(sub ?? mod.file, n);
     }
-    if (!names.length) add(mod.file, '*');
     return [...out].map(([to, ns]) => ({ to, names: ns }));
   };
   /** Top-level names a Python import of this repo's own code may start with: folders holding .py files, and .py stems. */
@@ -352,8 +354,7 @@ export function makeResolver(paths: string[], read: (path: string) => string | u
       let d: string | null = dirOf(from);
       for (let i = 1; i < dots; i++) d = d ? dirOf(d) : null;
       if (d === null) return [];
-      const modPath = join(d, spec.slice(dots).replace(/\./g, '/'));
-      if (modPath === null) return [];
+      const modPath = join(d, spec.slice(dots).replace(/\./g, '/'))!;
       const mod = pyModule(modPath);
       // A relative import is always this repo's code: one that names nothing is counted.
       return mod.file || mod.isDir ? pyFrom(modPath, mod, names) : [{ to: null, names, unresolved: true }];

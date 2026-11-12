@@ -37,8 +37,8 @@ test('nothing to clear: the version is recorded, nothing is logged', async () =>
   expect(w.cursors.get(DECIDER_RULE_CURSOR)).toBe(`v${DECIDER_RULE_VERSION}`);
 });
 
-test('a store that cannot tell: nothing runs and no version is recorded', async () => {
-  const w = world([]);
-  expect(await migrateDeciderRule({ ...w.d, knowledge: {} })).toBeNull();
-  expect(w.cursors.size).toBe(0);
+test('one lesson cleared is told in the singular', async () => {
+  const w = world(['lesson:a']);
+  await migrateDeciderRule(w.d);
+  expect(w.activity[0].subject).toBe('1 lesson decided by a machine no longer count as yours');
 });

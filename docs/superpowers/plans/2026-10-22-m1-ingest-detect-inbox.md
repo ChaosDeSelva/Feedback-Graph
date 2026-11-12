@@ -1,5 +1,7 @@
 # M1: Ingest + Detect + Inbox Implementation Plan
 
+> **Historical design notes from 2026-10-22; superseded.** See [docs/](../../) for current behaviour.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** `docker compose up` ingests every Claude Code session in your project folder into Neo4j, flags likely pushback with a keyword prefilter plus local Ollama, and shows the flagged turns in a web inbox where the owner confirms or rejects them.
@@ -21,7 +23,7 @@ The worker re-parses any transcript whose size or mtime changed and upserts it i
 - Everything is local. The only network calls are to Ollama at `OLLAMA_URL` (default `http://host.docker.internal:11434`). No Claude calls in M1.
 - Transcript and repo mounts are **read-only**. The worker never writes outside its SQLite volume and Neo4j.
 - Nothing becomes `Feedback` without the owner's explicit confirm in the UI.
-- Env vars: `NEO4J_URL`, `NEO4J_USER`, `NEO4J_PASSWORD`, `TRANSCRIPTS_DIR` (container path of `~/.claude/projects`), `PROJECT_ROOTS` (comma-separated container paths, default `/vibe`), `HOST_PROJECT_ROOTS` (matching host paths, default `/Users/you/code`, needed because transcripts record host `cwd`), `OLLAMA_URL`, `OLLAMA_MODEL` (default `gemma4`), `STATE_DB` (default `/state/worker.sqlite`), `POLL_SECONDS` (default `30`).
+- Env vars: `NEO4J_URL`, `NEO4J_USER`, `NEO4J_PASSWORD`, `TRANSCRIPTS_DIR` (container path of `~/.claude/projects`), `PROJECT_ROOTS` (comma-separated container paths, default `/vibe`), `HOST_PROJECT_ROOTS` (matching host paths, for example `/path/to/code`, needed because transcripts record host `cwd`), `OLLAMA_URL`, `OLLAMA_MODEL` (default `gemma4`), `STATE_DB` (default `/state/worker.sqlite`), `POLL_SECONDS` (default `30`).
 - Git: commit messages end with `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`.
 
 ## Review Focus
@@ -41,7 +43,7 @@ The worker re-parses any transcript whose size or mtime changed and upserts it i
 - Create: `packages/{core,worker,api,ui}/package.json` + `tsconfig.json`
 - Test: `packages/core/src/smoke.test.ts`
 
-- [ ] **Step 1:** `git init -b main` in `~/code/feedback_tool`.
+- [ ] **Step 1:** `git init -b main` in `~/projects/feedback_tool`.
 - [ ] **Step 2:** Write the workspace files. Root scripts: `test` = `vitest run`, `test:int` = `vitest run --project integration`, `build` = `pnpm -r build`. Use ESM (`"type": "module"`) everywhere, `moduleResolution: "bundler"`, `strict: true`.
 - [ ] **Step 3:** Write the smoke test `expect(1 + 1).toBe(2)` and run `pnpm install && pnpm test`. Expected: 1 passed.
 - [ ] **Step 4:** Commit `chore: scaffold pnpm monorepo` (include `docs/`).
@@ -107,8 +109,8 @@ Types only, so there is no test step. Commit `feat(core): domain types`.
 - `commitsInWindow(repoPath: string, from: string, to: string): Promise<Commit[]>`
 
 - [ ] **Step 1: Write failing tests:**
-  - `/Users/you/code/GameX_1.2.0/source` → `{key:'GameX_1.2.0', repoPath:'/vibe/GameX_1.2.0'}`.
-  - The root itself (`/Users/you/code`) → `null`.
+  - `/path/to/code/GameX_1.2.0/source` → `{key:'GameX_1.2.0', repoPath:'/vibe/GameX_1.2.0'}`.
+  - The root itself (`/path/to/code`) → `null`.
   - `/private/tmp/x` → `null`.
   - git: in a temp repo created in the test with 2 commits at fixed `GIT_COMMITTER_DATE`s, a window that covers only the second commit returns exactly that commit. A non-repo path returns `[]` (does not throw).
 - [ ] **Step 2:** Run. Expected: FAIL.
@@ -243,7 +245,7 @@ Cycle rules:
 **Compose:**
 - `neo4j:5-community`: named volume, `7474`/`7687` on 127.0.0.1 only.
 - `worker`:
-  - mounts `~/.claude/projects:/transcripts:ro`, `~/code:/vibe:ro`, `./state:/state`
+  - mounts `~/.claude/projects:/transcripts:ro`, `~/projects:/vibe:ro`, `./state:/state`
   - `extra_hosts: host.docker.internal:host-gateway`
   - git `safe.directory='*'`, which is needed for the read-only bind mount
 - `api`: port `127.0.0.1:8787:8787`.

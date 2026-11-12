@@ -2,7 +2,7 @@ import { execFile } from 'node:child_process';
 import { lstat, readdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
-import { cleanLessonPath, pathMatches } from '@fb/core';
+import { cleanLessonPath, nfcPaths, pathMatches } from '@fb/core';
 import { GIT_SAFE } from '../ingest/git.ts';
 
 const run = promisify(execFile);
@@ -226,35 +226,35 @@ const listings = new Map<string, { at: number; files: Promise<string[] | null> }
 
 /**
  * The repository's files, repo-relative: what git tracks and the untracked files it does not ignore, else a walk of
- * the folder. Null when no repository is known or it is not here. Kept for LISTING_TTL_MS.
+ * the folder; at most `max` (MAX_LISTING). Null when no repository is known or it is not here. Kept for LISTING_TTL_MS.
  */
-export function repoFileList(repoPath: string | null | undefined): Promise<string[] | null> {
+export function repoFileList(repoPath: string | null | undefined, max = MAX_LISTING): Promise<string[] | null> {
   if (!repoPath) return Promise.resolve(null);
   const hit = listings.get(repoPath);
   if (hit && Date.now() - hit.at < LISTING_TTL_MS) return hit.files;
-  const files = listFiles(repoPath);
+  const files = listFiles(repoPath, max);
   listings.set(repoPath, { at: Date.now(), files });
   return files;
 }
 
-async function listFiles(repoPath: string): Promise<string[] | null> {
+async function listFiles(repoPath: string, max: number): Promise<string[] | null> {
   if (!(await lstat(repoPath).catch(() => null))) return null;
   try {
     const { stdout } = await run('git', [...GIT_SAFE, '-C', repoPath, 'ls-files', '-z', '--cached', '--others', '--exclude-standard'], { maxBuffer: 64 * 1024 * 1024, timeout: 60_000 });
-    const files = stdout.split('\0').filter(Boolean);
-    if (files.length) return files.slice(0, MAX_LISTING);
+    const files = await nfcPaths(repoPath, stdout.split('\0').filter(Boolean));
+    if (files.length) return files.slice(0, max);
   } catch {
     // Not a git repository (or git is not here): walk it.
   }
-  return walk(repoPath, '', []);
+  return nfcPaths(repoPath, await walk(repoPath, '', [], max));
 }
 
-async function walk(root: string, rel: string, out: string[]): Promise<string[]> {
+async function walk(root: string, rel: string, out: string[], max: number): Promise<string[]> {
   for (const e of await readdir(join(root, rel), { withFileTypes: true }).catch(() => [])) {
-    if (out.length >= MAX_LISTING) break;
+    if (out.length >= max) break;
     const p = rel ? `${rel}/${e.name}` : e.name;
     if (e.isDirectory()) {
-      if (!SKIP_DIRS.has(e.name)) await walk(root, p, out);
+      if (!SKIP_DIRS.has(e.name)) await walk(root, p, out, max);
     } else if (e.isFile()) out.push(p);
   }
   return out;

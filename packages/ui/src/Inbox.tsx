@@ -1,13 +1,13 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { api, type Candidate, type CandidateDetail as Detail, type CandidateStatus, type FeedbackSource } from './api.ts';
+import { api, type Candidate, type CandidateDetail as Detail, type CandidateStatus, type FeedbackSource, errorMessage } from './api.ts';
 import { isSelfReview } from '@fb/core/feedback-rules';
-import { SelfReviewBadge, SOURCE_LABEL, SourceBadge } from './CandidateDetail.tsx';
+import { AGENT_REPORT_TITLE, agentReportOnly, SelfReviewBadge, SOURCE_LABEL, SourceBadge } from './CandidateDetail.tsx';
 import { CandidateDetail } from './CandidateDetail.tsx';
 import { FirstRun } from './FirstRun.tsx';
 import { hashFocus, hashFilters, saveHashFilters } from './links.ts';
 import { PageHeader } from './ui/PageHeader.tsx';
 import { ListRow, SplitPane } from './ui/SplitPane.tsx';
-import { Button, buttonClass, Input, Select, Tabs } from './ui/controls.tsx';
+import { Button, buttonClass, Input, Select, Tabs, useFocusHandoff, usePending } from './ui/controls.tsx';
 import { Alert, Badge, Card, EmptyState, Kbd, plural, SkeletonDetail, SkeletonList } from './ui/display.tsx';
 import { InboxIcon } from './ui/icons.tsx';
 
@@ -19,7 +19,7 @@ const TABS: CandidateStatus[] = ['pending', 'confirmed', 'rejected'];
  * orders by the turn's own time, which a comment synced later can place anywhere in the list.
  */
 function stableOrder(status: CandidateStatus, c: Candidate[]): Candidate[] {
-  const byId = (a: Candidate, b: Candidate) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
+  const byId = (a: Candidate, b: Candidate) => (a.id < b.id ? -1 : 1);
   if (status === 'pending') return [...c].sort((a, b) => a.createdAt.localeCompare(b.createdAt) || byId(a, b));
   return [...c].sort((a, b) => (b.decidedAt ?? b.createdAt).localeCompare(a.decidedAt ?? a.createdAt) || byId(a, b));
 }
@@ -85,17 +85,17 @@ export function Inbox() {
       setSelected(focus && at < 0 ? -1 : Math.max(0, at));
       setOpen(at >= 0);
       setLoaded(true);
-    }, (e) => { if (!stale) { setError(String(e)); setLoaded(true); } });
+    }, (e) => { if (!stale) { setError(errorMessage(e)); setLoaded(true); } });
     return () => { stale = true; };
   }, [status, project, pr, author]);
 
   const current = items[selected];
   // The next page joins the list in the same stable order; the item you are on stays selected.
+  // Load more is shown only with a next page, and disabled while one loads.
   const loadMore = () => {
-    if (next === null || loadingMore) return;
     setLoadingMore(true);
     const at = { status, project: filterKey, id: current?.id };
-    api.candidates(status, project || undefined, next, { pr: pr || undefined, author: author || undefined }).then(({ items: page, next: more }) => {
+    api.candidates(status, project || undefined, next!, { pr: pr || undefined, author: author || undefined }).then(({ items: page, next: more }) => {
       if (at.status !== statusRef.current || at.project !== projectRef.current) return;
       setItems((xs) => {
         const seen = new Set(xs.map((x) => x.id));
@@ -105,7 +105,7 @@ export function Inbox() {
         return merged;
       });
       setNext(more);
-    }, (e) => setError(String(e))).finally(() => setLoadingMore(false));
+    }, (e) => setError(errorMessage(e))).finally(() => setLoadingMore(false));
   };
   useEffect(() => {
     setDetail(null);
@@ -114,7 +114,7 @@ export function Inbox() {
     if (!current) return;
     // A slow answer for an item you have moved past must not replace the one you are looking at.
     let stale = false;
-    api.candidate(current.id).then((d) => { if (!stale) setDetail(d); }, (e) => { if (!stale) setError(String(e)); });
+    api.candidate(current.id).then((d) => { if (!stale) setDetail(d); }, (e) => { if (!stale) setError(errorMessage(e)); });
     return () => { stale = true; };
   }, [current?.id]);
   // You decide on what you have read: only once the pane shows this very item.
@@ -133,7 +133,7 @@ export function Inbox() {
         setItems((xs) => xs.filter((x) => x.id !== current.id));
         setSelected((i) => Math.min(i, items.length - 2));
       } catch (e) {
-        setError(String(e));
+        setError(errorMessage(e));
       } finally {
         deciding.current = false;
         setBusy(false);
@@ -180,7 +180,7 @@ export function Inbox() {
           </>
         }
       />
-      {undo && <div role="status" className="flex items-center justify-between border-b border-line bg-sunken px-4 py-2 text-sm"><span>Decision saved.</span><Button size="sm" disabled={busy} onClick={async () => { setBusy(true); try { await api.undoDecision(undo.item.id, undo.decidedAt); setItems(xs => stableOrder('pending', [...xs.filter(x => x.id !== undo.item.id), undo.item])); setStatus('pending'); setUndo(null); } catch (e) { setError(String(e)); setUndo(null); } finally { setBusy(false); } }}>Undo decision</Button></div>}
+      {undo && <div role="status" className="flex items-center justify-between border-b border-line bg-sunken px-4 py-2 text-sm"><span>Decision saved.</span><Button size="sm" owner disabled={busy} onClick={async () => { setBusy(true); try { await api.undoDecision(undo.item.id, undo.decidedAt); setItems(xs => stableOrder('pending', [...xs.filter(x => x.id !== undo.item.id), undo.item])); setStatus('pending'); setUndo(null); } catch (e) { setError(errorMessage(e)); setUndo(null); } finally { setBusy(false); } }}>Undo decision</Button></div>}
       <SplitPane
         listLabel="feedback"
         listHeader={
@@ -204,7 +204,9 @@ export function Inbox() {
                   <ListRow selected={i === selected} onClick={() => { setSelected(i); setOpen(true); }}>
                     <div className="flex items-center justify-between gap-2 text-xs text-muted">
                       <span className="flex min-w-0 items-center gap-1.5"><SourceBadge source={c.source} />{c.external && isSelfReview(c.external) && <SelfReviewBadge />}<span className="truncate">{c.projectKey}</span></span>
-                      <span className="tabular-nums" title="how sure the classifier is that this is pushback">{Math.round(c.classification.confidence * 100)}% sure</span>
+                      {agentReportOnly(c)
+                        ? <span title={AGENT_REPORT_TITLE}>agent report</span>
+                        : <span className="tabular-nums" title="how sure the classifier is that this is pushback">{Math.round(c.classification.confidence * 100)}% sure</span>}
                     </div>
                     <div className="mt-0.5 line-clamp-2 text-[13px] leading-snug">{c.classification.summary || '(no summary)'}</div>
                   </ListRow>
@@ -248,16 +250,17 @@ export function Inbox() {
             <div className="sticky bottom-0 border-t border-line bg-surface/95 backdrop-blur">
               <div className="mx-auto flex w-full max-w-3xl flex-col gap-2 px-4 py-2.5 sm:flex-row sm:items-center md:px-6">
                 <Input
+                  aria-label="note"
                   value={note}
                   onChange={(e) => setNote(e.target.value)}
                   placeholder="Note (optional): what was actually missed?"
                   className="w-full sm:flex-1"
                 />
                 <div className="flex shrink-0 gap-2">
-                  <Button variant="primary" disabled={busy} onClick={() => decide('confirmed')} className="flex-1 sm:flex-none">
+                  <Button variant="primary" owner disabled={busy} onClick={() => decide('confirmed')} className="flex-1 sm:flex-none">
                     Confirm <Kbd>c</Kbd>
                   </Button>
-                  <Button disabled={busy} onClick={() => decide('rejected')} className="flex-1 sm:flex-none">
+                  <Button owner disabled={busy} onClick={() => decide('rejected')} className="flex-1 sm:flex-none">
                     Reject <Kbd>r</Kbd>
                   </Button>
                 </div>
@@ -287,13 +290,14 @@ function PendingEmpty() {
   useEffect(() => {
     api.status().then((s) => setSt({ tracked: s.selection?.tracked ?? null, roots: s.selection?.roots ?? null, givenUp: s.givenUpTurns ?? 0 }), () => setSt(null));
   }, []);
-  async function requeue() {
+  const [requeueing, runRequeue] = usePending<'requeue'>();
+  const requeue = () => runRequeue('requeue', async () => {
     try {
       setRequeued((await api.requeueTurns()).requeued);
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      setError(errorMessage(err));
     }
-  }
+  });
   if (st?.roots === 0) {
     return (
       <EmptyState compact icon={<InboxIcon />} title="No project folders yet" action={<a href="#settings" className={buttonClass('secondary', 'sm')}>Open Settings</a>}>
@@ -317,7 +321,7 @@ function PendingEmpty() {
       action={
         error ? <Alert>{error}</Alert>
           : requeued !== null ? <p className="text-muted">{plural(requeued, 'turn')} re-queued; the classifier tries them again on its next cycle.</p>
-          : given ? <Button size="sm" onClick={requeue}>Re-queue {plural(st!.givenUp, 'turn')} that {st!.givenUp === 1 ? 'was' : 'were'} given up</Button>
+          : given ? <Button size="sm" owner busy={!!requeueing} onClick={() => void requeue()}>{requeueing ? 'Re-queueing…' : <>Re-queue {plural(st!.givenUp, 'turn')} that {st!.givenUp === 1 ? 'was' : 'were'} given up</>}</Button>
           : undefined
       }
     />
@@ -345,15 +349,17 @@ function AgentReportNote({ candidate }: { candidate: Candidate }) {
 function PostmortemState({ detail, onError }: { detail: Detail; onError: (e: string) => void }) {
   const pm = detail.postmortem;
   const [retried, setRetried] = useState(false);
+  const retryHandoff = useFocusHandoff();
+  const [retrying, runRetry] = usePending<'retry'>();
   if (!pm) return null;
-  async function retry() {
+  const retry = () => runRetry('retry', async () => {
     try {
       await api.retryPostmortem(detail.candidate.id);
       setRetried(true);
     } catch (e) {
-      onError(e instanceof Error ? e.message : String(e));
+      onError(errorMessage(e));
     }
-  }
+  });
   const text = pm.done
     ? 'Post-mortem done: its lesson is waiting on the Lessons page.'
     : retried
@@ -370,7 +376,7 @@ function PostmortemState({ detail, onError }: { detail: Detail; onError: (e: str
       <div>{text}</div>
       {pm.lastError && !pm.done && !retried && <div className="rounded-sm bg-sunken px-2 py-1.5 font-mono text-xs [overflow-wrap:anywhere] text-muted">last error: {pm.lastError}</div>}
       {!pm.done && !retried && pm.attempts > 0 && (
-        <div><Button size="sm" onClick={retry}>Retry post-mortem now</Button></div>
+        <div><Button ref={retryHandoff} size="sm" owner busy={!!retrying} onClick={() => void retry()}>{retrying ? 'Retrying…' : 'Retry post-mortem now'}</Button></div>
       )}
     </Card>
   );

@@ -1,7 +1,15 @@
 import type { ActivityInput, Lesson, LessonDetail, PostMortem, PostMortemInput } from '@fb/core';
 import { expect, test } from 'vitest';
-import { runPostmortems, embedTexts, providerAnswers, UNAVAILABLE_CAP } from './step.ts';
+import { runPostmortems, embedTexts, providerAnswers, UNAVAILABLE_CAP, type PostmortemStepDeps } from './step.ts';
 import type { PostMortemTrace } from './postmortem.ts';
+
+/** The lesson calls a post-mortem may make, answering as for a store with nothing to say; a test overrides what it watches. */
+const LESSON_STORE = {
+  lessonDetail: async () => null,
+  updateLesson: async () => ({ unscoped: false }),
+  setLessonChecks: async () => true,
+  similarLessons: async () => [],
+} satisfies Partial<PostmortemStepDeps['k']>;
 
 const input = (id: string) => ({ feedbackId: id }) as PostMortemInput;
 const pm = { missed: 'm', causeExplanation: 'c', lesson: { title: 't', rule: 'r', appliesWhen: 'w' } } as PostMortem;
@@ -10,6 +18,7 @@ test('saves each post-mortem with miss and lesson embeddings', async () => {
   const saved: unknown[][] = [];
   const r = await runPostmortems({
     k: {
+      ...LESSON_STORE,
       feedbackNeedingPostmortem: async () => [input('a')],
       savePostmortem: async (...a) => { saved.push(a); },
       recordPostmortemFailure: async () => ({ attempts: 1, retryAt: null }),
@@ -31,6 +40,7 @@ test('a dropped lesson: only the miss is embedded, no duplicate check runs, and 
   let similar = 0;
   await runPostmortems({
     k: {
+      ...LESSON_STORE,
       feedbackNeedingPostmortem: async () => [input('a')],
       savePostmortem: async () => {},
       recordPostmortemFailure: async () => ({ attempts: 1, retryAt: null }),
@@ -52,6 +62,7 @@ test('a failure is recorded and does not stop the batch', async () => {
   const failures: string[] = [];
   const r = await runPostmortems({
     k: {
+      ...LESSON_STORE,
       feedbackNeedingPostmortem: async () => [input('bad'), input('good')],
       savePostmortem: async () => {},
       recordPostmortemFailure: async (id, err) => { failures.push(`${id}:${err}`); return { attempts: 1, retryAt: null }; },
@@ -68,6 +79,7 @@ test('a post-mortem that timed out is charged to that feedback (backoff, attempt
   const failures: string[] = [];
   const r = await runPostmortems({
     k: {
+      ...LESSON_STORE,
       feedbackNeedingPostmortem: async () => [input('slow'), input('good')],
       savePostmortem: async () => {},
       recordPostmortemFailure: async (id, err) => { failures.push(`${id}:${err}`); return { attempts: 1, retryAt: '2026-10-24T12:00:00Z' }; },
@@ -84,6 +96,7 @@ test('while a scan holds the model, a post-mortem that timed out charges nothing
   const failures: string[] = [];
   const r = await runPostmortems({
     k: {
+      ...LESSON_STORE,
       feedbackNeedingPostmortem: async () => [input('slow'), input('good')],
       savePostmortem: async () => {},
       recordPostmortemFailure: async (id) => { failures.push(id); return { attempts: 1, retryAt: null }; },
@@ -104,6 +117,7 @@ test('an unavailable model is not charged to the feedback: no failure recorded, 
   const down = Object.assign(new TypeError('fetch failed'), { cause: { code: 'ECONNREFUSED' } });
   const r = await runPostmortems({
     k: {
+      ...LESSON_STORE,
       feedbackNeedingPostmortem: async () => [input('a'), input('b')],
       savePostmortem: async () => {},
       recordPostmortemFailure: async (id) => { failures.push(id); return { attempts: 1, retryAt: null }; },
@@ -123,6 +137,7 @@ test('an embedding model that is down is not charged either', async () => {
   const failures: string[] = [];
   const r = await runPostmortems({
     k: {
+      ...LESSON_STORE,
       feedbackNeedingPostmortem: async () => [input('a')],
       savePostmortem: async () => {},
       recordPostmortemFailure: async (id) => { failures.push(id); return { attempts: 1, retryAt: null }; },
@@ -142,6 +157,7 @@ test('a failure that quotes a secret is redacted before it is stored, logged or 
   const activity: ActivityInput[] = [];
   await runPostmortems({
     k: {
+      ...LESSON_STORE,
       feedbackNeedingPostmortem: async () => [input('f3')],
       savePostmortem: async () => {},
       recordPostmortemFailure: async (_id, err) => { stored.push(err); return { attempts: 1, retryAt: null }; },
@@ -172,6 +188,7 @@ test('each post-mortem is logged with the model, the context it was given, and w
   } as PostMortem & { trace: PostMortemTrace };
   await runPostmortems({
     k: {
+      ...LESSON_STORE,
       feedbackNeedingPostmortem: async () => [{ ...input('f1'), projectKey: 'shop', feedback: { text: 'not good enough' } } as PostMortemInput],
       savePostmortem: async () => {}, recordPostmortemFailure: async () => ({ attempts: 1, retryAt: null }),
     },
@@ -200,7 +217,7 @@ test('a failed post-mortem is logged with when it will be retried, or that it ga
   const activity: ActivityInput[] = [];
   let next: { attempts: number; retryAt: string | null } = { attempts: 1, retryAt: '2026-10-22T10:05:00.000Z' };
   const run = () => runPostmortems({
-    k: { feedbackNeedingPostmortem: async () => [{ ...input('f2'), projectKey: 'shop' } as PostMortemInput], savePostmortem: async () => {}, recordPostmortemFailure: async () => next },
+    k: { ...LESSON_STORE, feedbackNeedingPostmortem: async () => [{ ...input('f2'), projectKey: 'shop' } as PostMortemInput], savePostmortem: async () => {}, recordPostmortemFailure: async () => next },
     postmortem: async () => { throw new Error('timeout'); },
     embed: async (t) => t.map(() => [1]), batch: 1, activity: { record: async (a) => { activity.push(a); } },
   });
@@ -218,6 +235,7 @@ test('one feedback that is "unavailable" cycle after cycle is charged after a fe
   const streak = { feedbackId: null as string | null, count: 0 };
   const run = (head = 'stuck') => runPostmortems({
     k: {
+      ...LESSON_STORE,
       feedbackNeedingPostmortem: async () => [input(head), input('next')],
       savePostmortem: async () => {},
       recordPostmortemFailure: async (id, err) => { failures.push(`${id}:${err}`); return { attempts: 1, retryAt: '2026-10-25T12:00:00Z' }; },
@@ -255,6 +273,7 @@ test('a provider-wide outage charges nothing: two hours down with ten queued ite
   for (let cycle = 0; cycle < 240; cycle++) {
     const r = await runPostmortems({
       k: {
+      ...LESSON_STORE,
         feedbackNeedingPostmortem: async () => queue,
         savePostmortem: async () => {},
         recordPostmortemFailure: async (id) => { failures.push(id); return { attempts: 1, retryAt: null }; },
@@ -280,6 +299,7 @@ test('"busy with a scan" never counts toward the cap, and the health ask is not 
   for (let cycle = 0; cycle < UNAVAILABLE_CAP * 4; cycle++) {
     await runPostmortems({
       k: {
+      ...LESSON_STORE,
         feedbackNeedingPostmortem: async () => [input('a'), input('b')],
         savePostmortem: async () => {},
         recordPostmortemFailure: async (id) => { failures.push(id); return { attempts: 1, retryAt: null }; },
@@ -305,6 +325,7 @@ test('one poisoned item while the provider answers everything else is charged on
   for (const ok of healthy) {
     results.push(await runPostmortems({
       k: {
+      ...LESSON_STORE,
         feedbackNeedingPostmortem: async () => (failures.length ? [input('next')] : [input('poisoned'), input('next')]),
         savePostmortem: async () => {},
         recordPostmortemFailure: async (id) => { failures.push(id); return { attempts: 1, retryAt: '2026-10-25T12:05:00Z' }; },
@@ -335,6 +356,7 @@ test('a new lesson that repeats one already in the project is flagged duplicate-
   const old = { id: 'lesson:old', status: 'approved' as const, createdAt: '2026-10-01T00:00:00Z' };
   await runPostmortems({
     k: {
+      ...LESSON_STORE,
       feedbackNeedingPostmortem: async () => [input('a'), input('b')],
       savePostmortem: async () => {},
       recordPostmortemFailure: async () => ({ attempts: 1, retryAt: null }),
@@ -354,6 +376,7 @@ test('a post-mortem that says there was no miss is saved with its lesson rejecte
   const none = { ...pm, missed: 'The agent did not miss any defects.', noMiss: 'The agent did not miss any defects.' };
   const r = await runPostmortems({
     k: {
+      ...LESSON_STORE,
       feedbackNeedingPostmortem: async () => [{ ...input('a'), projectKey: 'data-pipeline' }],
       savePostmortem: async () => {},
       recordPostmortemFailure: async () => ({ attempts: 1, retryAt: null }),
@@ -380,6 +403,7 @@ test.each([undefined, "empty rule"])("a re-saved no-miss post-mortem preserves o
   };
   await runPostmortems({
     k: {
+      ...LESSON_STORE,
       feedbackNeedingPostmortem: async () => [input('edited'), input('approved'), input('fresh')],
       savePostmortem: async () => {},
       recordPostmortemFailure: async () => ({ attempts: 1, retryAt: null }),
@@ -402,7 +426,7 @@ test.each([undefined, "empty rule"])("a re-saved no-miss post-mortem preserves o
 test('the session a comment was worked out against, and how it was matched, are kept in Activity', async () => {
   const activity: ActivityInput[] = [];
   await runPostmortems({
-    k: { feedbackNeedingPostmortem: async () => [input('a')], savePostmortem: async () => {}, recordPostmortemFailure: async () => ({ attempts: 1, retryAt: null }) },
+    k: { ...LESSON_STORE, feedbackNeedingPostmortem: async () => [input('a')], savePostmortem: async () => {}, recordPostmortemFailure: async () => ({ attempts: 1, retryAt: null }) },
     postmortem: async () => ({ ...pm, trace: { provider: 'fake', agentic: false, standing: [], facts: [], lessonFlags: [], workSession: { id: 's-loader', matchedBy: 'files' } } }),
     embed: async (texts) => texts.map(() => [1]),
     batch: 3,
@@ -415,7 +439,7 @@ test("the lessons shown to the writer as the owner's examples are kept in Activi
   const activity: ActivityInput[] = [];
   const traces = [['lesson:e1', 'lesson:r1', 'lesson:w1'], undefined];
   await runPostmortems({
-    k: { feedbackNeedingPostmortem: async () => [input('a'), input('b')], savePostmortem: async () => {}, recordPostmortemFailure: async () => ({ attempts: 1, retryAt: null }) },
+    k: { ...LESSON_STORE, feedbackNeedingPostmortem: async () => [input('a'), input('b')], savePostmortem: async () => {}, recordPostmortemFailure: async () => ({ attempts: 1, retryAt: null }) },
     postmortem: async () => ({ ...pm, trace: { provider: 'fake', agentic: false, standing: [], facts: [], lessonFlags: [], ...(traces[0] && { examples: traces.shift() }) } }),
     embed: async (texts) => texts.map(() => [1]),
     batch: 3,
@@ -429,7 +453,7 @@ test('post-mortem Activity inherits the feedback run on success and failure', as
   for (const fail of [false, true]) {
     const activity: ActivityInput[] = [];
     await runPostmortems({
-      k: { feedbackNeedingPostmortem: async () => [{ ...input('labelled'), run: 'source-run', sandbox: true }], savePostmortem: async () => {}, recordPostmortemFailure: async () => ({ attempts: 1, retryAt: null }) },
+      k: { ...LESSON_STORE, feedbackNeedingPostmortem: async () => [{ ...input('labelled'), run: 'source-run', sandbox: true }], savePostmortem: async () => {}, recordPostmortemFailure: async () => ({ attempts: 1, retryAt: null }) },
       postmortem: async () => { if (fail) throw new Error('failed'); return pm; },
       embed: async texts => texts.map(() => [1]), batch: 1,
       activity: { record: async a => { activity.push(a); } },
@@ -441,7 +465,7 @@ test('post-mortem Activity inherits the feedback run on success and failure', as
 
 test('an undone decision while the model runs emits no false completed Activity or lesson actions', async () => {
   const activity: ActivityInput[] = []; let checks = 0;
-  const result = await runPostmortems({ k: { feedbackNeedingPostmortem: async () => [input('undone')], savePostmortem: async () => false,
+  const result = await runPostmortems({ k: { ...LESSON_STORE, feedbackNeedingPostmortem: async () => [input('undone')], savePostmortem: async () => false,
     recordPostmortemFailure: async () => ({ attempts: 1, retryAt: null }), setLessonChecks: async () => { checks++; return true; } },
     postmortem: async () => pm, embed: async texts => texts.map(() => [1]), batch: 1, activity: { record: async a => { activity.push(a); } } });
   expect(result).toEqual({ done: 0, failed: 0 }); expect(activity).toEqual([]); expect(checks).toBe(0);

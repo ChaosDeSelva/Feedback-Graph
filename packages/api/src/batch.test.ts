@@ -17,7 +17,7 @@ function setup() {
   } as unknown as ApiRepo;
   const app = createApp(repo, {
     auth: { operator: { token: OP, allow: ['scan', 'inbox_decide'] } },
-    activity: { record: async (e: ActivityInput) => { logged.push(e); }, list: async () => [] },
+    activity: { removeRun: async () => 0, record: async (e: ActivityInput) => { logged.push(e); }, list: async () => [] },
     facts: {
       listProjects: async () => [], listFacts: async () => [], searchFacts: async () => [],
       requestScan: async (p: Project, provider: string | null) => { scans.push([p.key, provider]); return { id: `scan:${p.key}`, projectKey: p.key, status: 'queued' }; },

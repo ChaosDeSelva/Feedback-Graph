@@ -4,6 +4,7 @@ import { VERSION } from '../config.ts';
 import type { Cause, Lesson } from '../types.ts';
 import type { Hotspot } from '../codegraph.ts';
 import { DEMO_SOURCE, type PortabilityStore } from '../store.ts';
+import { heldIds, heldTargets, holdFacts, holdLessons, type HeldDecision } from '../loop/syncHold.ts';
 import { CodeGraphRepo } from './codegraph.ts';
 import type { GraphRepo } from './repo.ts';
 
@@ -46,6 +47,12 @@ const PROJECT_LABELS = ['Candidate', 'Feedback', 'Miss', 'Task', 'ContextItem', 
 
 const BATCH = 5000;
 
+/** Each id once, at its first place: the cloud refuses a bundle with an id twice. */
+const firstById = <T extends { id: string }>(xs: T[]): T[] => {
+  const seen = new Set<string>();
+  return xs.filter((x) => !seen.has(x.id) && !!seen.add(x.id));
+};
+
 export class PortabilityRepo implements PortabilityStore {
   readonly g: GraphRepo;
   constructor(g: GraphRepo) {
@@ -60,15 +67,29 @@ export class PortabilityRepo implements PortabilityStore {
     const key = o.projectKey ?? null;
     // null: no list to apply (one project by key, or everything).
     const keys = key === null && o.projectKeys ? o.projectKeys : null;
+    // The cloud sync hold (loop/syncHold.ts): targets of applied loop decisions not yet ratified, as they were before;
+    // and of one still applying (its hold recorded at markApplying), whose write may already have landed.
+    // Held lessons are read in any project: holdLessons files each under its project as it was. Only the decisions that
+    // can concern these projects are read, by the syncHoldUntil index: theirs, those of no project, and those on a lesson
+    // that was theirs or global before (narrow_scope moves a global one to another project, a merge may span two), found
+    // in the snapshots' JSON text as JSON.stringify writes them.
+    const scope = key === null ? keys : [key];
+    const held = heldTargets((await this.g.run(
+      `MATCH (d:Decision) WHERE d.syncHoldUntil > $now AND d.status IN ['applying', 'applied'] AND d.ratifiedAt IS NULL
+         AND ($scope IS NULL OR d.projectKey IS NULL OR d.projectKey IN $scope OR d.before CONTAINS '"projectKey":null'
+              OR any(k IN $needles WHERE d.before CONTAINS k))
+       RETURN coalesce(d.appliedAt, d.decidedAt) AS appliedAt, d.before AS before, d.after AS after`,
+      { now: new Date().toISOString(), scope, needles: (scope ?? []).map((k) => `"projectKey":${JSON.stringify(k)}`) },
+    )).map((r): HeldDecision => ({ appliedAt: r.get('appliedAt'), before: JSON.parse(r.get('before')), after: JSON.parse(r.get('after')) })));
     const [projects, lessons, misses, facts, docs] = await Promise.all([
       this.g.run(`MATCH (p:Project) WHERE ($key IS NULL OR p.key = $key) AND ($keys IS NULL OR p.key IN $keys) RETURN p.key AS key, p.remote AS remote, p.demoCreated AS demoCreated ORDER BY p.key`, { key, keys }),
       this.g.run(
         `MATCH (l:Lesson)
-         WHERE ($key IS NULL OR l.projectKey = $key OR (l.projectKey IS NULL AND l.originProjectKey = $key))
-           AND ($keys IS NULL OR coalesce(l.projectKey, l.originProjectKey) IS NULL OR coalesce(l.projectKey, l.originProjectKey) IN $keys)
-           AND (NOT $approvedOnly OR l.status = 'approved') AND NOT coalesce(l.sandbox, false) AND coalesce(l.source, '') <> $demo
+         WHERE (l.id IN $held OR (($key IS NULL OR l.projectKey = $key OR (l.projectKey IS NULL AND l.originProjectKey = $key))
+           AND ($keys IS NULL OR coalesce(l.projectKey, l.originProjectKey) IS NULL OR coalesce(l.projectKey, l.originProjectKey) IN $keys)))
+           AND (NOT $approvedOnly OR l.status = 'approved' OR l.id IN $held) AND NOT coalesce(l.sandbox, false) AND coalesce(l.source, '') <> $demo
          RETURN l ORDER BY l.createdAt, l.id`,
-        { key, keys, approvedOnly: !!o.approvedOnly, demo: DEMO_SOURCE },
+        { key, keys, approvedOnly: !!o.approvedOnly, demo: DEMO_SOURCE, held: heldIds(held, 'lesson') },
       ),
       this.g.run(
         `MATCH (m:Miss)-[:EXPLAINS]->(f:Feedback)
@@ -99,7 +120,7 @@ export class PortabilityRepo implements PortabilityStore {
       exportedAt: new Date().toISOString(),
       projectKey: key,
       projects: projects.map((r) => ({ key: r.get('key') as string, remote: (r.get('remote') as string) ?? null, ...(r.get('demoCreated') === true ? { demoCreated: true as const } : {}) })),
-      lessons: lessons.map((r) => {
+      lessons: holdLessons(lessons.map((r) => {
         const l = props(r, 'l');
         return {
           id: l.id as string,
@@ -116,9 +137,11 @@ export class PortabilityRepo implements PortabilityStore {
           createdAt: l.createdAt as string,
           decidedAt: (l.decidedAt as string) ?? null,
           ...(typeof l.checks === 'string' && { checks: JSON.parse(l.checks) as NonNullable<Lesson['checks']> }),
+          ...(typeof l.triggers === 'string' && { triggers: JSON.parse(l.triggers) as NonNullable<Lesson['triggers']> }),
         };
-      }),
-      misses: misses.map((r) => {
+      }), held, !!o.approvedOnly, { key, keys }, new Map(lessons.map((r) => [props(r, 'l').id as string, (props(r, 'l').originProjectKey as string) ?? null]))),
+      // A miss explaining more than one feedback comes back once per EXPLAINS edge: the first (earliest) row stands.
+      misses: firstById(misses.map((r) => {
         const m = props(r, 'm');
         return {
           id: m.id as string,
@@ -130,10 +153,11 @@ export class PortabilityRepo implements PortabilityStore {
           ts: (r.get('ts') as string) ?? '',
           contextItems: r.get('items') as ExportBundle['misses'][number]['contextItems'],
         };
-      }),
-      facts: facts.map((r) => {
+      })),
+      facts: holdFacts(facts.map((r) => {
         const f = props(r, 'x');
         return {
+          id: f.id as string,
           path: f.path as string,
           lines: (f.lines as string) ?? null,
           kind: f.kind as string,
@@ -144,11 +168,11 @@ export class PortabilityRepo implements PortabilityStore {
           createdAt: f.createdAt as string,
           projectKey: f.projectKey as string,
         };
-      }),
-      docs: docs.map((r) => {
+      }), held).map(({ id: _, ...f }) => f),
+      docs: firstById(docs.map((r) => {
         const d = props(r, 'd');
         return { id: d.id as string, projectKey: d.projectKey as string, source: d.source as string, ref: d.ref as string, title: d.title as string, url: (d.url as string) ?? null };
-      }),
+      })),
       codeFiles,
     };
   }

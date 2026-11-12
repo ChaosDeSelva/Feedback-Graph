@@ -72,7 +72,7 @@ test('an unusable first answer is asked again once, and a good second answer is 
   expect(await classifyTurn(turn, deps(chat))).toMatchObject({ label: 'approval' });
 });
 
-test('ollamaChatJson posts a non-streaming chat with the schema and parses content', async () => {
+test('ollamaChatJson posts a streamed chat with the schema and parses content', async () => {
   let body: any;
   const fetchImpl = (async (_url: string, init: RequestInit) => {
     body = JSON.parse(init.body as string);
@@ -80,7 +80,7 @@ test('ollamaChatJson posts a non-streaming chat with the schema and parses conte
   }) as typeof fetch;
   const out = await ollamaChatJson({ url: 'http://o', model: 'm', system: 'S', user: 'U', schema: { type: 'object' }, fetchImpl });
   expect(out).toEqual({ label: 'neutral' });
-  expect(body).toMatchObject({ model: 'm', stream: false, format: { type: 'object' } });
+  expect(body).toMatchObject({ model: 'm', stream: true, format: { type: 'object' } });
   expect(body.messages).toEqual([{ role: 'system', content: 'S' }, { role: 'user', content: 'U' }]);
 });
 
@@ -102,4 +102,15 @@ test('an agentic classifier (claude-cli, codex-cli) runs in a fresh empty folder
   expect(seen[0].cwd).not.toBe(process.cwd());
   expect(seen[0].files).toEqual([]);
   await expect(stat(seen[0].cwd!)).rejects.toThrow();
+});
+
+test('a model already reported unavailable is passed on as is; an unusable answer tells onFailure why, redacted', async () => {
+  const down = new ProviderUnavailableError('claude-cli is not logged in');
+  await expect(classifyTurn(turn, deps(async () => { throw down; }))).rejects.toBe(down);
+  const why: string[] = [];
+  const token = 'ghp_' + 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8';
+  expect(await classifyTurn(turn, deps(async () => { throw new SyntaxError(`Unexpected token near ${token}`); }), (e) => why.push(e))).toBeNull();
+  expect(why).toHaveLength(1);
+  expect(why[0]).toMatch(/Unexpected token/);
+  expect(why[0]).not.toContain(token);
 });

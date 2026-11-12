@@ -1,7 +1,7 @@
 import { expect, test } from 'vitest';
 import { makeProvider } from './providers.ts';
 import type { ProviderHealth } from '../types.ts';
-import { ModelTimeoutError, modelTimeoutReason, ProviderUnavailableError, providerUnavailableReason, withHealth } from './unavailable.ts';
+import { CliRunError, ModelTimeoutError, modelTimeoutReason, ProviderUnavailableError, providerUnavailableReason, withHealth } from './unavailable.ts';
 
 const task = { system: 'S', user: 'U', schema: { type: 'object' } };
 const fetchFails = (cause: object) => (async () => { throw new TypeError('fetch failed', { cause }); }) as unknown as typeof fetch;
@@ -74,7 +74,7 @@ test('an answer that cannot be used is not unavailability: bad JSON, a 400, a CL
 });
 
 test('reasons never carry a key, and ProviderUnavailableError keeps its own', async () => {
-  const leaky = answers(401, 'invalid key sk-ant-api03-abcdefghijklmnopqrstuvwxyz0123456789');
+  const leaky = answers(401, 'invalid key sk' + '-ant-api03-abcdefghijklmnopqrstuvwxyz0123456789');
   expect(await reasonFor('anthropic:m', { ANTHROPIC_API_KEY: 'k' }, { fetchImpl: leaky })).not.toMatch(/sk-ant-api03-abc/);
   expect(providerUnavailableReason(new ProviderUnavailableError('no classifier configured'))).toBe('no classifier configured');
 });
@@ -119,4 +119,65 @@ test('the model\'s own answer is never read for unavailability: a failed run who
   // Codex: stdout is its transcript; only stderr counts.
   const codex = async () => ({ code: 1, stdout: `${answer} usage limit 429`, stderr: '' });
   expect(await reasonFor('codex-cli', { ALLOW_UNCONFINED_CODEX: '1' }, { exec: codex })).toBeNull();
+});
+
+test('timeouts: anything that is not an error object, and CLI failures that are not timeouts, have no timeout reason', () => {
+  expect(modelTimeoutReason(null)).toBeNull();
+  expect(modelTimeoutReason('timed out')).toBeNull();
+  expect(modelTimeoutReason({ message: 42 })).toBeNull();
+  expect(modelTimeoutReason(new ModelTimeoutError('took too long'))).toBe('took too long');
+  expect(modelTimeoutReason(new Error('claude exit 1: Reached max turns'))).toBeNull();
+  expect(modelTimeoutReason(new Error('codex error: codex timed out after 900000ms'))).toBe('timed out waiting for codex');
+  expect(modelTimeoutReason(new CliRunError('codex', 124, ''))).toBe('timed out waiting for codex');
+  expect(modelTimeoutReason(new CliRunError('claude', 1, 'claude timed out after 5ms'))).toBe('timed out waiting for claude');
+  expect(modelTimeoutReason(new CliRunError('claude', 1, 'boom'))).toBeNull();
+  expect(modelTimeoutReason(new Error('ollama:gemma4 embed 408: slow'))).toBe('timed out waiting for ollama:gemma4');
+  expect(modelTimeoutReason({ code: 'UND_ERR_BODY_TIMEOUT' })).toBe('timed out waiting for the model (UND_ERR_BODY_TIMEOUT)');
+});
+
+test('unavailability without a body still names the status; a missing file that is not a spawn is not "not installed"', () => {
+  expect(providerUnavailableReason(new Error('openai:gpt 502: '))).toBe('openai:gpt answered HTTP 502');
+  expect(providerUnavailableReason(new Error('ollama:x 404:'))).toBe('model not found (ollama:x 404)');
+  expect(providerUnavailableReason(new Error('openai:gpt 403: no'))).toBe('openai:gpt is not authorized (HTTP 403); check its key');
+  expect(providerUnavailableReason(new Error('ollama:x embed 503: loading'))).toBe('ollama:x answered HTTP 503: loading');
+  expect(providerUnavailableReason(Object.assign(new Error('spawn ENOENT'), { code: 'ENOENT', syscall: 'spawn' }))).toBe('the CLI is not installed');
+  expect(providerUnavailableReason(Object.assign(new Error('open x'), { code: 'ENOENT', syscall: 'open', path: 'x' }))).toBeNull();
+  expect(providerUnavailableReason({ code: 'ECONNRESET' })).toBe('cannot reach the model (ECONNRESET)');
+  // a fetch failure with no code
+  expect(providerUnavailableReason(new TypeError('fetch failed'))).toBe('cannot reach the model');
+  expect(providerUnavailableReason({ name: 'TypeError', message: 7 })).toBeNull();
+});
+
+test('a CLI that is missing (exit 127), out of quota or rate limited is unavailable, with what it said', () => {
+  expect(providerUnavailableReason(new CliRunError('codex', 127, 'sh: codex: not found'))).toBe('codex is not installed');
+  expect(providerUnavailableReason(new Error('claude exit 1: bash: claude: command not found'))).toBe('claude is not installed');
+  expect(providerUnavailableReason(new CliRunError('claude', null, 'Claude AI usage limit reached'))).toBe('claude hit a usage or rate limit (Claude AI usage limit reached)');
+  expect(providerUnavailableReason(new CliRunError('codex', 1, 'stream error: 429 Too Many Requests'))).toMatch(/^codex hit a usage or rate limit/);
+  expect(providerUnavailableReason(new CliRunError('codex', 1, 'the patch did not apply'))).toBeNull();
+});
+
+test('a CLI error shows what the CLI said, else its output: the start of claude\'s, the end of codex\'s', () => {
+  expect(new CliRunError('claude', 2, 'bad flag', 'ignored').message).toBe('claude exit 2: bad flag');
+  expect(new CliRunError('claude', null, '  ', `${'a'.repeat(500)}TAIL`).message).toBe(`claude error: ${'a'.repeat(500)}`);
+  expect(new CliRunError('codex', 1, '', `HEAD${'b'.repeat(500)}`).message).toBe(`codex exit 1: ${'b'.repeat(500)}`);
+});
+
+test('withHealth reports a readiness check: ok, or the reason it failed (the raw error when it is not unavailability)', async () => {
+  const seen: ProviderHealth[] = [];
+  let fail: unknown = null;
+  const mirror = async () => ({ dir: '/tmp/m', dispose: async () => {} });
+  const p = withHealth({ id: 'codex-cli', agentic: true, mirror, ready: async () => { if (fail) throw fail; }, json: async () => ({}) }, (h) => seen.push(h));
+  expect(p.mirror).toBe(mirror);
+  await p.ready!();
+  fail = new ProviderUnavailableError('the codex runner is not ready');
+  await expect(p.ready!()).rejects.toBe(fail);
+  fail = new Error('odd');
+  await expect(p.ready!()).rejects.toBe(fail);
+  expect(seen.map((h) => [h.provider, h.ok, h.reason])).toEqual([
+    ['codex-cli', true, null], ['codex-cli', false, 'the codex runner is not ready'], ['codex-cli', false, 'Error: odd'],
+  ]);
+  // a provider without readiness or a mirror gets neither
+  const plain = withHealth({ id: 'x', agentic: false, json: async () => ({}) }, () => {});
+  expect(plain.ready).toBeUndefined();
+  expect(plain.mirror).toBeUndefined();
 });

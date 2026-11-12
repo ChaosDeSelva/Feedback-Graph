@@ -1,4 +1,4 @@
-import { isAbsolute, relative, resolve } from 'node:path';
+import * as nodePath from 'node:path';
 // The hooks' decisions, kept free of I/O so they can be tested. feedback-graph.mjs does the reading and the calls.
 
 const MAX_CONTEXT = 1_500;
@@ -19,7 +19,9 @@ export function asksForContext(prompt) {
 /** File paths a prompt names (src/db/pool.ts, README.md), at most 10, for the file-scoped part of the context. */
 export function promptFiles(prompt) {
   const out = [];
-  for (const [, p] of (prompt ?? '').matchAll(/(?<![\w/:.@-])((?:[\w@.-]+\/)*[\w@-][\w@.-]*\.[A-Za-z][A-Za-z0-9]{0,5})(?![\w/])/g)) {
+  // Letters and digits of any script, and a Windows-style `\` separator, which is sent as `/`.
+  for (const [, m] of (prompt ?? '').matchAll(/(?<![\p{L}\p{N}\p{M}_/\\:.@-])((?:[\p{L}\p{N}\p{M}_@.-]+[/\\])*[\p{L}\p{N}\p{M}_@-][\p{L}\p{N}\p{M}_@.-]*\.[A-Za-z][A-Za-z0-9]{0,5})(?![\p{L}\p{N}\p{M}_/\\])/gu)) {
+    const p = m.replaceAll('\\', '/');
     if (!out.includes(p)) out.push(p);
   }
   return out.slice(0, 10);
@@ -35,12 +37,13 @@ export function lessonIds(markdown) {
 }
 
 const CLIPPED = '(clipped: call get_task_context for the rest)';
-const KEEP = /^## (Approved lessons|Past misses on the files you named)\b/;
+const KEEP = /^## (Approved lessons|Past misses on the files you named|Agent instructions on the path of these files)\b/;
 const POINTER = 'Similar past misses, code facts and docs: call get_task_context (with the files you will touch). Before you say done: check_before_done.';
 
 /**
- * The kept part of get_task_context as blocks: an item ("- " and its indented lines) with its key (the lesson id, or
- * "miss:" and the miss's first line), or a heading or note (key null). Null when nothing worth injecting is there.
+ * The kept part of get_task_context as blocks: an item ("- " and its indented lines) with its key (the lesson id,
+ * "doc:" and an agent instructions file's line, or "miss:" and the miss's first line), or a heading (with the note
+ * line under it, so the two go together) or note (key null). Null when nothing worth injecting is there.
  */
 function compactBlocks(markdown) {
   const lines = markdown.split('\n');
@@ -55,6 +58,7 @@ function compactBlocks(markdown) {
     if (section) {
       const last = blocks[blocks.length - 1];
       if (/^\s+\S/.test(l) && last?.item) last.lines.push(l);
+      else if (l.trim() && !l.startsWith('- ') && last && !last.item && last.lines[0].startsWith('## ')) last.lines.push(l);
       else if (l.startsWith('- ')) blocks.push({ key: null, item: true, section, lines: [l] });
       else blocks.push({ key: null, lines: [l] });
     } else if (/^No lesson is (approved|proposed or approved) for |^Only approved lessons are rules/.test(l)) {
@@ -63,7 +67,8 @@ function compactBlocks(markdown) {
     }
   }
   for (const b of blocks.filter((x) => x.item)) {
-    b.key = b.section.startsWith('## Approved lessons') ? (lessonIds(b.lines.join('\n'))[0] ?? `item:${b.lines[0].slice(2, 82)}`) : `miss:${b.lines[0].slice(2, 82)}`;
+    b.key = b.section.startsWith('## Approved lessons') ? (lessonIds(b.lines.join('\n'))[0] ?? `item:${b.lines[0].slice(2, 82)}`)
+      : b.section.startsWith('## Agent instructions') ? `doc:${b.lines[0].slice(2, 202)}` : `miss:${b.lines[0].slice(2, 82)}`;
   }
   // The note alone is nothing worth injecting.
   if (!blocks.some((b) => b.item || b.notice)) return null;
@@ -73,7 +78,8 @@ function compactBlocks(markdown) {
 
 /**
  * The blocks `want` keeps (headings and notes always), within about MAX_CONTEXT characters, cut between items, never
- * through one; and the keys of the items shown in full. A heading left with none of its items is dropped.
+ * through one (the first is kept whatever its size); and the keys of the items shown in full. A heading left with none
+ * of its items is dropped.
  */
 function render({ head, blocks }, want = () => true) {
   const out = [];
@@ -83,7 +89,8 @@ function render({ head, blocks }, want = () => true) {
   for (const b of blocks) {
     if (b.item && !want(b.key)) continue;
     const text = b.lines.join('\n');
-    if (b.item && (clipped || size + text.length + 1 > MAX_CONTEXT)) {
+    // The first item goes whole even past the budget: clipping it would leave nothing, on every prompt.
+    if (b.item && (clipped || (shown.length && size + text.length + 1 > MAX_CONTEXT))) {
       clipped = true;
       continue;
     }
@@ -93,14 +100,13 @@ function render({ head, blocks }, want = () => true) {
   }
   // A heading whose items were all clipped or shown before goes with them.
   const kept = out.filter((b, i) => !b.lines[0].startsWith('## ') || out.slice(i + 1).find((x) => x.item || x.lines[0].startsWith('## '))?.item);
-  if (!shown.length && !kept.some((b) => b.notice)) return { text: null, shown };
   const body = [...head, ...kept.flatMap((b) => b.lines)].join('\n').trim();
   return { text: `${body}${clipped ? `\n${CLIPPED}` : ''}\n\n${POINTER}`, shown };
 }
 
 /**
  * The part of get_task_context worth putting in front of every request: the approved lessons, the past misses on the
- * files the prompt names, and the notice that no lesson is approved yet, about 1,500 characters at most, cut between
+ * files the prompt names, the AGENTS.md / CLAUDE.md files on their path, and the notice that no lesson is approved yet, about 1,500 characters at most, cut between
  * items. Null when it holds none of those: the rest (similar misses, facts, docs) stays one tool call away.
  */
 export function compactContext(markdown) {
@@ -132,6 +138,18 @@ export function taskContextArgs(input) {
   return { cwd: input.cwd, task: (input.prompt ?? '').slice(0, 1_000), ...(files.length ? { files } : {}), ...(session ? { session_id: session } : {}) };
 }
 
+// Claude Code swaps hook context over 10,000 characters for a file path and a short preview.
+const MAX_MODULE_CONTEXT = 9_000;
+
+/** get_module_context as the edit hook adds it: whole lines up to MAX_MODULE_CONTEXT characters, with a note when cut. */
+export function moduleContext(markdown) {
+  if (markdown.length <= MAX_MODULE_CONTEXT) return markdown;
+  const note = '\n(truncated: call get_module_context with this path for the rest)';
+  const cut = markdown.slice(0, MAX_MODULE_CONTEXT - note.length);
+  const end = cut.lastIndexOf('\n');
+  return `${end > 0 ? cut.slice(0, end) : cut}${note}`;
+}
+
 /** get_module_context is worth interrupting an edit for only when the file has lessons or past misses. */
 export function moduleWorthSaying(markdown) {
   return /^##\s.*\b(lessons?|miss(es)?)\b/im.test(markdown);
@@ -142,6 +160,11 @@ export function moduleWorthSaying(markdown) {
  * "has been denied", a call never granted, or the owner rejecting it at the prompt.
  */
 const PERMISSION_DENIED = /Permission to use \S+ has been denied|requested permissions? to use \S+, but you haven't granted it|doesn't want to proceed with this tool use|tool use was rejected/i;
+/**
+ * A Not judged answer that a retry would not change: the judge failed (an outage, a missing model) or the project is
+ * not selected. Unlike a Queued or busy answer, asking again only loops.
+ */
+const NOT_RUN = /(?:^|\n)# Not judged: (?:the judge failed\b|\S+ is not selected\b)/i;
 const resultText = (c) => (typeof c === 'string' ? c : Array.isArray(c) ? c.map((x) => (typeof x?.text === 'string' ? x.text : '')).join('\n') : '');
 
 /**
@@ -154,6 +177,7 @@ function toolUses(lines) {
   const answered = new Map();
   const denied = new Set();
   const queued = new Set();
+  const failed = new Set();
   for (const l of lines) {
     let entry;
     try {
@@ -167,49 +191,58 @@ function toolUses(lines) {
     if (entry?.type !== 'user') continue;
     for (const c of content) {
       if (c?.type !== 'tool_result' || !c.tool_use_id) continue;
-      const pending = /(?:^|\n)# (?:Queued:|Not judged:)/i.test(resultText(c.content));
+      const text = resultText(c.content);
+      const pending = /(?:^|\n)# (?:Queued:|Not judged:)/i.test(text);
       answered.set(c.tool_use_id, c.is_error !== true && !pending);
       if (pending) queued.add(c.tool_use_id);
+      if (pending && NOT_RUN.test(text)) failed.add(c.tool_use_id);
       if (c.is_error === true && PERMISSION_DENIED.test(resultText(c.content))) denied.add(c.tool_use_id);
     }
   }
-  return out.map((u) => ({ ...u, answered: answered.get(u.id) === true, denied: denied.has(u.id), queued: queued.has(u.id) }));
+  return out.map((u) => ({ ...u, answered: answered.get(u.id) === true, denied: denied.has(u.id), queued: queued.has(u.id), failed: failed.has(u.id) }));
 }
 
 const isCheck = (u) => typeof u.name === 'string' && u.name.endsWith('check_before_done');
-export const inRepo = (path, cwd) => typeof path === 'string' && (!cwd || (() => { const r = relative(resolve(cwd), resolve(cwd, path)); return r !== '..' && !r.startsWith('../') && !isAbsolute(r); })());
-const changes = (u, cwd) => (EDIT_TOOLS.has(u.name) && (!cwd || inRepo(u.input?.file_path ?? u.input?.notebook_path, cwd))) || (u.name === 'Bash' && /\bgit\s+commit\b/.test(u.input?.command ?? ''));
+/**
+ * Is `path` (absolute, or relative to cwd) inside `root`: the repository's top level, or cwd outside a repository.
+ * `paths` is node:path's platform flavour, given only by tests.
+ */
+export const inRepo = (path, cwd, root = cwd, paths = nodePath) => typeof path === 'string' && (!cwd || (() => {
+  const r = paths.relative(paths.resolve(root), paths.resolve(cwd, path));
+  return r !== '..' && !r.startsWith(`..${paths.sep}`) && !paths.isAbsolute(r);
+})());
+const changes = (u, cwd, root) => (EDIT_TOOLS.has(u.name) && (!cwd || inRepo(u.input?.file_path ?? u.input?.notebook_path, cwd, root))) || (u.name === 'Bash' && /\bgit\s+commit\b/.test(u.input?.command ?? ''));
 // Only a check_before_done that returned its answer: a denied or failed call checked nothing.
 const checks = (u) => isCheck(u) && u.answered;
 
 /** The transcript's lines: did the session change files (or commit) after its last check_before_done? */
-export function doneCheckPending(lines, cwd) {
+export function doneCheckPending(lines, cwd, root = cwd) {
   let pending = false;
   for (const u of toolUses(lines)) {
-    if (changes(u, cwd)) pending = true;
+    if (changes(u, cwd, root)) pending = true;
     else if (checks(u)) pending = false;
   }
   return pending;
 }
 
 /** Did the session call check_before_done after its last change, and get no answer (denied, failed)? */
-export function checkUnanswered(lines, cwd) {
+export function checkUnanswered(lines, cwd, root = cwd) {
   let unanswered = false;
   for (const u of toolUses(lines)) {
-    if (changes(u, cwd)) unanswered = false;
+    if (changes(u, cwd, root)) unanswered = false;
     else if (typeof u.name === 'string' && u.name.endsWith('check_before_done')) unanswered = !u.answered;
   }
   return unanswered;
 }
 
 /** The files the session edited after its last check_before_done, once each, in the order first edited. */
-export function editedSince(lines, cwd) {
+export function editedSince(lines, cwd, root = cwd) {
   let paths = [];
   for (const u of toolUses(lines)) {
     if (checks(u)) paths = [];
     else if (EDIT_TOOLS.has(u.name)) {
       const p = u.input?.file_path ?? u.input?.notebook_path;
-      if (inRepo(p, cwd) && !paths.includes(p)) paths.push(p);
+      if (inRepo(p, cwd, root) && !paths.includes(p)) paths.push(p);
     }
   }
   return paths;
@@ -256,22 +289,50 @@ export function stopDecision(input, pending, project, paths = [], unanswered = f
       `Feedback Graph: ${what} and ${unanswered ? 'called check_before_done but it has not completed (queued, denied or failed), so nothing was checked' : 'has not called check_before_done since'}. ` +
       `Call check_before_done with cwd, the task, a summary of what you built and how you verified it, files_changed${shown.length ? `: ${JSON.stringify(shown)}` : ''}, ` +
       (session ? `session_id: "${session}" (so the check is recorded as this session's), ` : '') +
-      `and ${diffAsk(base)}. Pass the whole diff: over about 30 KB the judge reads the files most related to the lessons first, then files_changed in order, and the answer says which files it did not read. ` +
-      'A Queued or Not judged response is not a completed check: retry check_before_done until it actually completes; do not finish while it is queued. Address each completed gap it lists, or tell the developer plainly why it does not apply, then finish.' +
+      `and ${diffAsk(base)}. Pass the whole diff: over about 32 KB the judge reads the files most related to the lessons first, then files_changed in order, and the answer says which files it did not read. ` +
+      'A Queued or Not judged response is not a completed check: retry check_before_done until it actually completes; do not finish while it is queued. ' +
+      'If it answers that the judge failed, do not retry: tell the developer plainly that the check did not run. Address each completed gap it lists, or tell the developer plainly why it does not apply, then finish.' +
       (unanswered ? ' If it cannot be allowed, tell the developer plainly that the check did not run.' : ''),
   };
 }
+
+/** Stop rounds a queued check_before_done is retried for before the stop goes through (Claude Code resets its own cap on every tool call). */
+export const QUEUED_ROUNDS = 3;
 
 /**
  * The Stop hook's whole answer from the transcript and the session's state: stopDecision, unless check_before_done
  * was refused by permission. Then it is not asked for again this session (state.checkDenied, kept even when the
  * transcript is compacted) and the agent is told once to say the check did not run; a later answered check lifts it.
  * A call that failed (an error, not a refusal) is no check and no refusal: the check is asked for as before.
+ * `root`: the repository's top level, so an edit inside the repository but outside cwd counts.
+ * A check that answered it was not run (the judge failed) or is still queued after QUEUED_ROUNDS blocks: the agent is
+ * told once (state.notRunSaid: the id of the last change that check covered) to say the check did not run, and the stop
+ * goes through until the session changes something again; that change is unchecked and is asked about as usual.
  */
-export function stopHook(input, lines, project, state) {
-  const last = toolUses(lines).filter(isCheck).at(-1);
+export function stopHook(input, lines, project, state, root = input?.cwd) {
+  const uses = toolUses(lines);
+  const last = uses.filter(isCheck).at(-1);
+  const lastChange = uses.findLast((u) => changes(u, input.cwd, root));
+  // The last check is about the latest work only when nothing changed after it.
+  const queued = !!last?.queued && (!lastChange || uses.indexOf(last) > uses.indexOf(lastChange));
   const checkDenied = last ? last.denied || (!!state.checkDenied && !last.answered) : !!state.checkDenied;
-  if (!checkDenied) return { out: stopDecision(last?.queued ? { ...input, stop_hook_active: false } : input, doneCheckPending(lines, input.cwd), project, editedSince(lines, input.cwd), checkUnanswered(lines, input.cwd), state.base ?? null), state: { ...state, checkDenied: false, deniedSaid: false } };
+  if (!checkDenied) {
+    const base = { ...state, checkDenied: false, deniedSaid: false, queuedRounds: queued ? (state.queuedRounds ?? 0) : 0 };
+    const pending = doneCheckPending(lines, input.cwd, root);
+    if (pending && queued && (last.failed || base.queuedRounds >= QUEUED_ROUNDS)) {
+      const covered = lastChange?.id ?? last.id;
+      if (state.notRunSaid === covered) return { out: null, state: base };
+      return {
+        out: {
+          decision: 'block',
+          reason: `Feedback Graph: check_before_done ${last.failed ? 'answered that it was not judged (the judge failed or the project is not selected)' : `was still queued after ${QUEUED_ROUNDS} tries`}, so the pre-done check did not run. Do not call it again for this: tell the developer plainly that the check did not run and why, then finish.`,
+        },
+        state: { ...base, notRunSaid: covered },
+      };
+    }
+    const out = stopDecision(queued ? { ...input, stop_hook_active: false } : input, pending, project, editedSince(lines, input.cwd, root), checkUnanswered(lines, input.cwd, root), state.base ?? null);
+    return { out, state: { ...base, queuedRounds: out && queued ? base.queuedRounds + 1 : base.queuedRounds } };
+  }
   const next = { ...state, checkDenied: true, deniedSaid: true };
   if (state.deniedSaid || input?.stop_hook_active) return { out: null, state: next };
   return {

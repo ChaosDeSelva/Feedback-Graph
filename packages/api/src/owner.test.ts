@@ -53,7 +53,7 @@ test('turns the classifier gave up on are re-queued from the UI only, and the re
 
 test('Undo validates and authorizes before mutation, audits success and refuses processed decisions', async () => {
   let writes = 0; let ok = false; const history: unknown[] = [];
-  const a = createApp({ ...repo, undoDecision: async () => { writes++; return ok; } }, { auth: { ownerToken: OWNER }, activity: { list: async () => [], record: async e => { history.push(e); } } });
+  const a = createApp({ ...repo, undoDecision: async () => { writes++; return ok; } }, { auth: { ownerToken: OWNER }, activity: { removeRun: async () => 0, list: async () => [], record: async e => { history.push(e); } } });
   const path = '/api/candidates/c1/undo'; const when = '2026-10-01T10:00:00.000Z';
   expect((await a.request(path, req('POST', { decidedAt: when }))).status).toBe(403);
   expect((await a.request(path, req('POST', { decidedAt: 'bad' }, 'http://localhost'))).status).toBe(400);

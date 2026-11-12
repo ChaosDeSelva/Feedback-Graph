@@ -74,3 +74,11 @@ test('a round counts as progress (the loop goes again without sleeping) for clas
   // Backfill scoring is last in line: a batch per wake, so it never keeps the loop spinning on its own.
   expect(cycleProgressed({ ...none, scored: 40 })).toBe(false);
 });
+
+test('an item taken up before any step has started changes nothing and announces nothing', () => {
+  const status = blank();
+  let changes = 0;
+  new StageTracker(status, () => changes++).step('s1.jsonl');
+  expect(status.stage).toBeUndefined();
+  expect(changes).toBe(0);
+});

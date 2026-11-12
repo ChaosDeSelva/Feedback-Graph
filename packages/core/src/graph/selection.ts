@@ -1,4 +1,4 @@
-import { storeTimeLeft, storeRequestSignal } from '../storeDeadline.ts';
+import { deadlineOr, storeTimeLeft, storeRequestSignal } from '../storeDeadline.ts';
 import { randomUUID } from 'node:crypto';
 import type { Config } from '../config.ts';
 import { EMPTY_SELECTION, ingestSeedsStored, initialSelection, projectScope, type ProjectScope, type ProjectSelection } from '../scope.ts';
@@ -217,7 +217,7 @@ export class SelectionRepo implements SelectionStore {
       return out;
     } catch (err) {
       await rollbackOnce();
-      throw err;
+      throw deadlineOr(err, signal);
     } finally {
       signal?.removeEventListener('abort', cancel);
       await session.close();

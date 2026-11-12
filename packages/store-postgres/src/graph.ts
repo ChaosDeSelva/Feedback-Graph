@@ -34,6 +34,7 @@ import {
   type Project,
   type StatsRow,
   type WorkerStatus,
+  type AgentSeen,
 } from '@fb/core';
 import { iso, toJson, tx, type Db } from './db.ts';
 import { refreshSessionStats } from './sessions.ts';
@@ -597,6 +598,16 @@ export class PgGraphStore implements GraphStore {
   async workerStatus(): Promise<WorkerStatus | null> {
     const { rows } = await this.q(`SELECT status FROM worker_status WHERE id = 'worker'`);
     return rows[0] ? (rows[0].status as WorkerStatus) : null;
+  }
+
+  // The first agent seen shares the heartbeat's table, as row 'agent' (an AgentSeen document); it is never overwritten.
+  async markAgentSeen(client: string, at: string): Promise<void> {
+    await this.q(`INSERT INTO worker_status (id, status, updated_at) VALUES ('agent', $1::jsonb, $2) ON CONFLICT (id) DO NOTHING`, [toJson({ client, at } satisfies AgentSeen), at]);
+  }
+
+  async agentSeen(): Promise<AgentSeen | null> {
+    const { rows } = await this.q(`SELECT status FROM worker_status WHERE id = 'agent'`);
+    return rows[0] ? (rows[0].status as AgentSeen) : null;
   }
 
   async stats(): Promise<StatsRow[]> {

@@ -27,7 +27,7 @@ const LESSONS = [lesson('lesson:shop', 'shop', 'shop'), lesson('lesson:old-globa
 function setup(shown = SELECTED, over: Partial<AppOpts> = {}) {
   const calls: unknown[][] = [];
   const cands = [cand('c-shop', 'shop'), cand('c-old', 'old')];
-  const repo: ApiRepo = {
+  const repo: ApiRepo = { undoDecision: async () => false,
     listCandidates: async (f) => { calls.push(['candidates', f]); return cands; },
     candidateDetail: async (id) => {
       const c = cands.find((x) => x.id === id);
@@ -57,7 +57,7 @@ function setup(shown = SELECTED, over: Partial<AppOpts> = {}) {
       upsertDoc: async () => 'doc:x',
       deleteDoc: async (id) => { calls.push(['deleteDoc', id]); return true; },
     },
-    knowledge: {
+    knowledge: { decidedLessons: async () => [], postmortemBacklog: async () => 0, postmortemQueue: async () => ({ waiting: 0, oldestAt: null }), requestLessonRecheck: async () => 0,
       listLessons: async (f) => { calls.push(['lessons', f]); return LESSONS; },
       lessonDetail: async (id) => {
         const l = LESSONS.find((x) => x.id === id);
@@ -66,7 +66,7 @@ function setup(shown = SELECTED, over: Partial<AppOpts> = {}) {
       updateLesson: async (...a) => { calls.push(['updateLesson', ...a]); return { unscoped: false }; },
       retryPostmortem: async (id) => { calls.push(['retry', id]); return true; },
     },
-    activity: { record: async () => {}, list: async (q) => { calls.push(['activity', q]); return []; } },
+    activity: { removeRun: async () => 0, record: async () => {}, list: async (q) => { calls.push(['activity', q]); return []; } },
     insights: {
       projectGraph: async (key) => { calls.push(['graph', key]); return { nodes: [], links: [] }; },
       patterns: async (q) => { calls.push(['patterns', q]); return {} as never; },

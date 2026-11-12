@@ -61,6 +61,17 @@ describe('rematchOnRuleChange', () => {
     expect(ok.checks).toEqual([]);
   });
 
+  test('a comment on a default branch: the old rule took the first session on it, the rule now the one that edited the file, and the flag names it', async () => {
+    // Both ran on develop; the first one's files are not known, the second edited the commented file.
+    const w = world({
+      sessions: [session('s-first', 'develop'), session('s-editor', 'develop')],
+      files: { 's-editor': [edit('src/loader.ts')] },
+      lessons: [lesson('github:acme/data-pipeline#12/review/79', review({ branch: 'develop', path: 'src/loader.ts' }))],
+    });
+    expect(await rematchOnRuleChange(w.d)).toMatchObject({ flagged: 1 });
+    expect(w.checks).toEqual([['lesson:github:acme/data-pipeline#12/review/79', [{ name: 'wrong-session', why: expect.stringMatching(/matched to session s-first by the old rule .* matches s-editor:/) }]]]);
+  });
+
   test('a lesson already flagged wrong-session is left as it is', async () => {
     const w = world({ sessions: [session('s-ui', 'main')], files: { 's-ui': [edit('src/settings/users/invite.ts')] }, lessons: [lesson('c1', review(), { checks: [{ name: 'wrong-session', why: 'earlier' }] })] });
     await rematchOnRuleChange(w.d);
@@ -121,5 +132,66 @@ describe('rematchOnRuleChange', () => {
     expect(await rematchOnRuleChange(w.d)).toEqual({ relinked: 0, flagged: 0, rejected: 0, held: 0 });
     expect(w.activity).toEqual([]);
     expect(w.cursors.get(SESSION_MATCH_CURSOR)).toBe(`v${SESSION_MATCH_VERSION}`);
+  });
+
+  test('more pending comments and proposed lessons than one page are all matched again', async () => {
+    const n = (i: number) => String(i).padStart(4, '0');
+    const w = world({
+      sessions: [session('s-ui', 'main')],
+      files: { 's-ui': [edit('src/settings/users/invite.ts')] },
+      // Each was linked (and each lesson built) on the session the old rule borrowed; the rule now matches none.
+      pending: Array.from({ length: 501 }, (_, i) => ({ id: `k${n(i)}`, turnUuid: `t${n(i)}`, projectKey: 'acme', text: 'stream rows', external: review({ linkedSessionIds: ['s-ui'] }) })),
+      lessons: Array.from({ length: 501 }, (_, i) => lesson(`c${n(i)}`, review())),
+    });
+    const r = await rematchOnRuleChange(w.d);
+    expect(r).toMatchObject({ relinked: 501, flagged: 501 });
+  });
+});
+
+describe('rematchOnRuleChange: the edges', () => {
+  test('after an older rule: the change is named and logged, and a lesson never checked gets wrong-session as its only check', async () => {
+    const w = world({
+      sessions: [session('s-ui', 'main')],
+      files: { 's-ui': [edit('src/settings/users/invite.ts')] },
+      lessons: [lesson('github:acme/data-pipeline#12/review/80', review(), { checks: null })],
+    });
+    w.cursors.set(SESSION_MATCH_CURSOR, 'v1');
+    const logs: [string, object | undefined][] = [];
+    await rematchOnRuleChange({ ...w.d, log: (m: string, x?: object) => void logs.push([m, x]) });
+    expect(w.activity[0].why).toMatch(/^the rule changed \(v1 to v\d+\)/);
+    expect(logs[0][0]).toBe('comments re-matched to sessions');
+    expect(w.checks).toEqual([['lesson:github:acme/data-pipeline#12/review/80', [{ name: 'wrong-session', why: expect.stringContaining('matches no session') }]]]);
+  });
+
+  test("an owner's no-miss lesson with no checks yet is flagged once and held, not rejected", async () => {
+    const w = world({ sessions: [], files: {}, lessons: [lesson('github:acme/data-pipeline#12/review/81', review(), { checks: null, ownerEdited: true, missed: 'Nothing was missed.' })] });
+    expect(await rematchOnRuleChange(w.d)).toMatchObject({ held: 1, rejected: 0 });
+    expect(w.checks).toEqual([['lesson:github:acme/data-pipeline#12/review/81', [{ name: 'no-miss', why: expect.stringContaining('Nothing was missed.') }]]]);
+  });
+
+  test('with no comment lessons the pending comments are still re-matched; without files a branch session is not ruled out', async () => {
+    const loader = session('s-loader', 'feat/batch-loader');
+    const w = world({ sessions: [loader], files: {}, pending: [{ id: 'p1', turnUuid: 'u1', projectKey: 'acme', text: 'x', external: review({ linkedSessionIds: [] }) }] });
+    const { files: _, ...rest } = w.d;
+    expect(await rematchOnRuleChange(rest)).toMatchObject({ relinked: 1, flagged: 0 });
+    expect(w.links).toEqual([['u1', ['s-loader']]]);
+  });
+});
+
+describe('the old rule, read back without the files each session touched', () => {
+  test('a branch session is not ruled out and a time match needs a file it edited: with no file record, neither lesson is flagged', async () => {
+    const onBranch = world({ sessions: [session('s-loader', 'feat/batch-loader')], files: {}, lessons: [lesson('github:acme/data-pipeline#12/review/90', review({ path: 'src/loader.ts' }))] });
+    const { files: _, ...noFiles } = onBranch.d;
+    expect(await rematchOnRuleChange(noFiles)).toMatchObject({ flagged: 0 });
+    const byTime = world({ sessions: [session('s-ui', 'main')], files: {}, lessons: [lesson('github:acme/data-pipeline#12/review/91', review({ path: 'src/settings/users/invite.ts' }))] });
+    const { files: __, ...timeNoFiles } = byTime.d;
+    expect(await rematchOnRuleChange(timeNoFiles)).toMatchObject({ flagged: 0 });
+  });
+
+  test('a time match that edited the file the comment is on, and a branch session that touched it, are what the new rule picks too', async () => {
+    const w = world({ sessions: [session('s-ui', 'main')], files: { 's-ui': [edit('src/settings/users/invite.ts')] }, lessons: [lesson('github:acme/data-pipeline#12/review/92', review({ path: 'src/settings/users/invite.ts' }))] });
+    expect(await rematchOnRuleChange(w.d)).toMatchObject({ flagged: 0 });
+    const b = world({ sessions: [session('s-loader', 'feat/batch-loader')], files: { 's-loader': [edit('src/loader.ts')] }, lessons: [lesson('github:acme/data-pipeline#12/review/93', review({ path: 'src/loader.ts' }))] });
+    expect(await rematchOnRuleChange(b.d)).toMatchObject({ flagged: 0 });
   });
 });

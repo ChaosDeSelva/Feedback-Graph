@@ -38,7 +38,8 @@ export function defaultChatSpec(o: ChatSpecOpts): string {
 
 /**
  * The provider spec for a conversation's choice: claude -> claude-cli, codex -> codex-cli, local -> the local Ollama
- * model, null -> the default. CHAT_LLM's own model is kept when it names that provider (claude-cli:opus for claude).
+ * model, null (or a provider a stored chat names that this release no longer has) -> the default. CHAT_LLM's own model
+ * is kept when it names that provider (claude-cli:opus for claude).
  */
 export function chatSpec(provider: ChatProvider | null, o: ChatSpecOpts): string {
   const llm = o.chatLlm ?? '';
@@ -51,5 +52,9 @@ export function chatSpec(provider: ChatProvider | null, o: ChatSpecOpts): string
       return /^codex-cli(:|$)/.test(llm) ? llm : 'codex-cli';
     case 'local':
       return /^ollama:/.test(llm) ? llm : o.localModel;
+    default:
+      // Every ChatProvider has its case above; a stored chat's provider this release no longer has gets the default.
+      provider satisfies never;
+      return defaultChatSpec(o);
   }
 }

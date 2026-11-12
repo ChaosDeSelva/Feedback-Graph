@@ -6,7 +6,7 @@ const beat = (o: Partial<WorkerStatus> = {}): WorkerStatus => ({
   version: 't', startedAt: 't', lastBeat: new Date().toISOString(), lastCycleAt: null, lastCycle: null, lastError: null, providers: {}, ...o,
 });
 const cand = (id: string, projectKey: string, status: Candidate['status']) => ({ id, projectKey, status }) as Candidate;
-const lesson = (id: string, projectKey: string | null, status: Lesson['status'], origin = projectKey) => ({ id, projectKey, origin, status }) as Lesson;
+const lesson = (id: string, projectKey: string | null, status: Lesson['status'], origin = projectKey, source: Lesson['source'] = 'postmortem') => ({ id, projectKey, origin, status, source }) as Lesson;
 const scan = (status: ScanJob['status']) => ({ status }) as ScanJob;
 const project = (key: string, sessions: number, lastScan: ScanJob | null): ProjectSummary =>
   ({ key, repoPath: `/r/${key}`, remote: null, aliases: [], sessions, feedback: 0, lessons: 0, facts: 0, lastScan, pinned: false });
@@ -14,10 +14,12 @@ const project = (key: string, sessions: number, lastScan: ScanJob | null): Proje
 /** The stores' queue reads (FactsStore.scanQueue, KnowledgeStore.postmortemQueue, ChatStore.chatQueue). */
 type Queues = { scanQueue?: () => Promise<ScanQueueEntry[]>; postmortemQueue?: () => Promise<{ waiting: number; oldestAt: string | null }>; chatQueue?: ChatStore['chatQueue'] };
 
+const unreadable = async (): Promise<never> => { throw new Error('store offline'); };
+
 function app(o: { shown?: string[]; backlog?: number | null; worker?: WorkerStatus | null; older?: Map<string, number>; queues?: Queues } = {}) {
   const candidates = [cand('a', 'shop', 'pending'), cand('b', 'shop', 'pending'), cand('c', 'api', 'confirmed'), cand('d', 'hidden', 'pending')];
-  // l4 is global (no project of its own), learned in shop; l5 global, learned in a project that is not shown.
-  const lessons = [lesson('l1', 'shop', 'proposed'), lesson('l2', 'api', 'approved'), lesson('l3', 'hidden', 'proposed'), lesson('l4', null, 'approved', 'shop'), lesson('l5', null, 'proposed', 'hidden')];
+  // l4 is global (no project of its own), learned in shop; l5 global, learned in a project that is not shown. l2 is fg demo seed's.
+  const lessons = [lesson('l1', 'shop', 'proposed'), lesson('l2', 'api', 'approved', 'api', 'demo'), lesson('l3', 'hidden', 'proposed'), lesson('l4', null, 'approved', 'shop'), lesson('l5', null, 'proposed', 'hidden')];
   const repo = {
     listCandidates: async (f: { status?: string; projectKeys?: string[] } = {}) =>
       candidates.filter((c) => (!f.status || c.status === f.status) && (!f.projectKeys || f.projectKeys.includes(c.projectKey))),
@@ -30,8 +32,11 @@ function app(o: { shown?: string[]; backlog?: number | null; worker?: WorkerStat
     knowledge: {
       listLessons: async (f: { status?: string; projectKeys?: string[] }) => lessons.filter((l) => (!f.status || l.status === f.status) && (!f.projectKeys || f.projectKeys.includes((l.projectKey ?? l.origin)!))),
       lessonDetail: async () => null, updateLesson: async () => ({ unscoped: false }),
-      ...(o.backlog === null ? {} : { postmortemBacklog: async () => o.backlog ?? 3 }),
-      ...(o.queues?.postmortemQueue && { postmortemQueue: o.queues.postmortemQueue }),
+      // backlog null: the count fails; no postmortemQueue given: the queue read fails (the backlog stands in).
+      postmortemBacklog: o.backlog === null ? unreadable : async () => o.backlog ?? 3,
+      postmortemQueue: o.queues?.postmortemQueue ?? unreadable,
+      requestLessonRecheck: async () => 0,
+      decidedLessons: async () => [],
     } as unknown as AppOpts['knowledge'],
     facts: { listProjects: async () => projects, requestScan: async () => ({}) as ScanJob, listFacts: async () => [], searchFacts: async () => [], ...(o.older && { olderScannerFiles: async () => o.older! }), ...(o.queues?.scanQueue && { scanQueue: o.queues.scanQueue }) },
     ...(o.queues?.chatQueue && { chat: { store: { chatQueue: o.queues.chatQueue } } as unknown as AppOpts['chat'] }),
@@ -50,8 +55,8 @@ test('GET /api/pipeline: where every stage stands, in the shown projects only', 
     classify: { backlog: 120, capped: false },
     inbox: { pending: 2, confirmed: 1 },
     postmortems: { queued: 3 },
-    // Global lessons count too, and say how many of them are global (no project row lists them).
-    lessons: { proposed: 1, approved: 2, global: 1 },
+    // Global lessons count too, and say how many of them are global (no project row lists them), and how many the demo seeded.
+    lessons: { proposed: 1, approved: 2, global: 1, demo: { proposed: 0, approved: 1 }, quality: [0, 0].map((_, i) => ({ days: i ? 90 : 30, asWritten: 0, edited: 0, rejected: 0, decided: 0, byOperator: 0 })) },
     scans: { done: 1, queued: 1, running: 0, failed: 0, never: 1 },
     // Without the stores' queue reads: the worker's classify backlog and stage, the post-mortem count.
     queues: {
@@ -63,7 +68,7 @@ test('GET /api/pipeline: where every stage stands, in the shown projects only', 
   });
 });
 
-test('what this server cannot tell is null, not zero', async () => {
+test('what this server cannot read is null, not zero', async () => {
   const p = await (await app({ backlog: null, worker: null }).request('/api/pipeline')).json();
   expect(p.postmortems).toBeNull();
   expect(p.classify).toBeNull();

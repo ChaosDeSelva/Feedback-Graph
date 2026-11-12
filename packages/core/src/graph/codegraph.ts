@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto';
 import neo4j from 'neo4j-driver';
 import {
   cmp,
+  CODE_MAP_LEASE_RENEW_MS,
   codeGraphViews,
   codeMapDiff,
   normalizeCodeMap,
@@ -20,14 +21,21 @@ import {
   type SymbolKind,
 } from '../codegraph.ts';
 import type { CodeGraphStore } from '../store.ts';
+import { redactSecrets } from '../redact.ts';
 import type { Cause } from '../types.ts';
 import { FactsRepo, PROJECT_PATH } from './facts.ts';
 import { KnowledgeRepo } from './knowledge.ts';
 import type { GraphRepo } from './repo.ts';
 import { VISIBLE_TO_RUN } from './runs.ts';
 
-/** Rows per UNWIND statement: big repos are written in slices, each its own transaction (replaceCodeMap). */
-const SLICE = 5000;
+/**
+ * Rows per UNWIND statement: big repos are written in slices, each its own transaction (replaceCodeMap). Sized for the
+ * small profile's 32 MiB per transaction (docker-compose.small.yml) with room to spare: on a 7,000-file monorepo
+ * 10,000 symbols overran it.
+ */
+const SLICE = 2000;
+/** Files per MERGE statement: a file row MERGEs its node and its project link, about 9 KiB each (4,000 overran 32 MiB). */
+const FILE_SLICE = 1000;
 /** Files per symbol-delete statement: a file can define many symbols, so fewer of them per transaction. */
 const PATH_SLICE = 500;
 /** Relationships/nodes per cleanup transaction; deletes retain more transaction memory than UNWIND writes. */
@@ -100,7 +108,7 @@ export class CodeGraphRepo implements CodeGraphStore {
     // `mappedAt` is user-visible build metadata, not a safe generation key: two small maps can be replaced in the
     // same millisecond. A per-write nonce makes stale-file detection exact even then.
     const generation = randomUUID();
-    const files = map.files.map((f) => ({ ...f, churnCommits: map.churn[f.path]?.commits ?? null, churnLastTs: map.churn[f.path]?.lastTs ?? null }));
+    const files = map.files.map((f) => ({ ...f, namespaces: f.namespaces ?? null, churnCommits: map.churn[f.path]?.commits ?? null, churnLastTs: map.churn[f.path]?.lastTs ?? null }));
     const [storedSymbols, storedImports] = await Promise.all([
       this.g.run('MATCH (s:Symbol {projectKey: $key}) RETURN s', { key }),
       this.g.run(
@@ -121,136 +129,148 @@ export class CodeGraphRepo implements CodeGraphStore {
     );
     const fileImports = diff.newImports.filter((i) => !i.to.startsWith('pkg:'));
     const pkgImports = diff.newImports.filter((i) => i.to.startsWith('pkg:'));
-    const drain = async (cypher: string): Promise<void> => {
+    /** Runs `cypher` (bounded by $limit, returning `removed`) until a run finds fewer than $limit rows. */
+    const drain = async (cypher: string, params: Props = {}): Promise<void> => {
       for (;;) {
-        const [row] = await this.g.run(cypher, { key, limit: neo4j.int(DELETE_SLICE) });
+        const [row] = await this.g.run(cypher, { ...params, key, limit: neo4j.int(DELETE_SLICE) });
         const removed = row ? neo4j.integer.toNumber(row.get('removed')) : 0;
         if (removed < DELETE_SLICE) return;
       }
     };
-    // Clear the generation marker before any destructive work. The two unbounded deletes below used to be single
-    // transactions and could exceed Neo4j's transaction-memory budget on large repositories.
-    await this.g.run('MATCH (m:CodeMap {projectKey: $key}) SET m.fingerprint = null', { key });
-    // Keep the last good TESTS graph visible until the replacement has been written. Mark old edges, revive the ones
-    // present in this generation below, and delete only the remainder after every slice succeeds. A failed rebuild
-    // therefore cannot empty test reachability.
-    await markTestsPending(this.g, key, now);
-    const statements: [string, Props][] = [
-      // The project exists even for a map with no files, as in Postgres (the file slices below MERGE it otherwise).
-      [`MERGE (:Project {key: $key})`, { key }],
-      ...slices(diff.staleImports).map((part): [string, Props] => [
-        `UNWIND $pairs AS e
-           MATCH (a:CodeFile {id: $key + ':' + e.from})-[r:IMPORTS]->(b)
-           WHERE coalesce(b.path, b.name) = e.to
-           DELETE r`,
-        { key, pairs: part },
-      ]),
-      ...slices(diff.symbolPaths, PATH_SLICE).map((part): [string, Props] => [
-        `MATCH (s:Symbol {projectKey: $key}) WHERE s.path IN $paths DETACH DELETE s`,
-        { key, paths: part },
-      ]),
-      ...slices(files).map((part): [string, Props] => [
-        `MERGE (p:Project {key: $key})
-         WITH p
-         UNWIND $files AS f
-           MERGE (cf:CodeFile {id: $key + ':' + f.path})
-             ON CREATE SET cf.projectKey = $key, cf.path = f.path, cf.removed = false
-           SET cf.inMap = true, cf.lang = f.lang, cf.codeHash = f.hash, cf.loc = f.loc, cf.isTest = f.isTest,
-               cf.churnCommits = f.churnCommits, cf.churnLastTs = f.churnLastTs, cf.mappedAt = $now,
-               cf.mapGeneration = $generation
-          REMOVE cf.mapUnselectedAt
-           REMOVE cf.inIndex
-           MERGE (cf)-[:IN]->(p)`,
-        { key, files: part, now, generation },
-      ]),
-      ...slices(map.outside).map((part): [string, Props] => [
-        `MERGE (p:Project {key: $key})
-         WITH p
-         UNWIND $files AS f
-           MERGE (cf:CodeFile {id: $key + ':' + f.path})
-             ON CREATE SET cf.projectKey = $key, cf.path = f.path, cf.removed = false
-           SET cf.inMap = false, cf.inIndex = true, cf.lang = f.lang, cf.codeHash = f.hash, cf.loc = f.loc, cf.isTest = f.isTest,
-               cf.mappedAt = $now, cf.mapGeneration = $generation
-          REMOVE cf.mapUnselectedAt
-           REMOVE cf.churnCommits, cf.churnLastTs
-           MERGE (cf)-[:IN]->(p)`,
-        { key, files: part, now, generation },
-      ]),
-      ...slices(diff.symbols).map((part): [string, Props] => [
-        `UNWIND $symbols AS s
-           MATCH (cf:CodeFile {id: $key + ':' + s.path})
-           CREATE (cf)-[:DEFINES]->(:Symbol {projectKey: $key, id: s.id, path: s.path, ord: s.ord, name: s.name, kind: s.kind,
-                                             exported: s.exported, lines: s.lines})`,
-        { key, symbols: part },
-      ]),
-      ...slices(fileImports).map((part): [string, Props] => [
-        `UNWIND $imports AS i
-           MATCH (a:CodeFile {id: $key + ':' + i.from})
-           MATCH (b:CodeFile {id: $key + ':' + i.to})
-           CREATE (a)-[:IMPORTS {names: i.names, spec: i.spec}]->(b)`,
-        { key, imports: part },
-      ]),
-      ...slices(pkgImports).map((part): [string, Props] => [
-        `UNWIND $imports AS i
-           MATCH (a:CodeFile {id: $key + ':' + i.from})
-           MERGE (m:Module {id: $key + ':' + i.to}) ON CREATE SET m.projectKey = $key, m.name = i.to
-           CREATE (a)-[:IMPORTS {names: i.names, spec: i.spec}]->(m)`,
-        { key, imports: part },
-      ]),
-      ...slices(map.tests).map((part): [string, Props] => [
-        `UNWIND $tests AS t
-           MATCH (a:CodeFile {id: $key + ':' + t.test})
-           MATCH (b:CodeFile {id: $key + ':' + t.target})
-           MERGE (a)-[r:TESTS]->(b)
-           REMOVE r.pendingRemoval`,
-        { key, tests: part },
-      ]),
+    // Clear the generation marker before any destructive work. Every statement below is bounded (slices, or drained in
+    // batches): one over the whole project exceeded Neo4j's transaction-memory budget on large repositories.
+    // writingAt tells a write in progress from one cut short (codeMapMeta, /api/status); writingBeat is its lease, renewed
+    // by a timer while this runs, so a write whose worker was killed reads as interrupted within CODE_MAP_LEASE_MS.
+    await this.g.run('MATCH (m:CodeMap {projectKey: $key}) SET m.fingerprint = null, m.writingAt = $now, m.writingBeat = $now', { key, now });
+    const lease = setInterval(() => {
+      this.g.run('MATCH (m:CodeMap {projectKey: $key}) WHERE m.fingerprint IS NULL SET m.writingBeat = $beat', { key, beat: new Date().toISOString() })
+        .catch(() => {});
+    }, CODE_MAP_LEASE_RENEW_MS);
+    lease.unref();
+    try {
+      // Keep the last good TESTS graph visible until the replacement has been written. Mark old edges, revive the ones
+      // present in this generation below, and delete only the remainder after every slice succeeds. A failed rebuild
+      // therefore cannot empty test reachability.
+      await markTestsPending(this.g, key, now);
+      const statements: [string, Props][] = [
+        // The project exists even for a map with no files, as in Postgres (the file slices below MERGE it otherwise).
+        [`MERGE (:Project {key: $key})`, { key }],
+        ...slices(diff.staleImports).map((part): [string, Props] => [
+          `UNWIND $pairs AS e
+             MATCH (a:CodeFile {id: $key + ':' + e.from})-[r:IMPORTS]->(b)
+             WHERE coalesce(b.path, b.name) = e.to
+             DELETE r`,
+          { key, pairs: part },
+        ]),
+        ...slices(diff.symbolPaths, PATH_SLICE).map((part): [string, Props] => [
+          `MATCH (s:Symbol {projectKey: $key}) WHERE s.path IN $paths DETACH DELETE s`,
+          { key, paths: part },
+        ]),
+        ...slices(files, FILE_SLICE).map((part): [string, Props] => [
+          `MERGE (p:Project {key: $key})
+           WITH p
+           UNWIND $files AS f
+             MERGE (cf:CodeFile {id: $key + ':' + f.path})
+               ON CREATE SET cf.projectKey = $key, cf.path = f.path, cf.removed = false
+             SET cf.inMap = true, cf.lang = f.lang, cf.codeHash = f.hash, cf.loc = f.loc, cf.isTest = f.isTest, cf.csNamespaces = f.namespaces,
+                 cf.churnCommits = f.churnCommits, cf.churnLastTs = f.churnLastTs, cf.mappedAt = $now,
+                 cf.mapGeneration = $generation
+            REMOVE cf.mapUnselectedAt
+             REMOVE cf.inIndex
+             MERGE (cf)-[:IN]->(p)`,
+          { key, files: part, now, generation },
+        ]),
+        ...slices(map.outside.map((f) => ({ ...f, namespaces: f.namespaces ?? null })), FILE_SLICE).map((part): [string, Props] => [
+          `MERGE (p:Project {key: $key})
+           WITH p
+           UNWIND $files AS f
+             MERGE (cf:CodeFile {id: $key + ':' + f.path})
+               ON CREATE SET cf.projectKey = $key, cf.path = f.path, cf.removed = false
+             SET cf.inMap = false, cf.inIndex = true, cf.lang = f.lang, cf.codeHash = f.hash, cf.loc = f.loc, cf.isTest = f.isTest,
+                 cf.csNamespaces = f.namespaces, cf.mappedAt = $now, cf.mapGeneration = $generation
+            REMOVE cf.mapUnselectedAt
+             REMOVE cf.churnCommits, cf.churnLastTs
+             MERGE (cf)-[:IN]->(p)`,
+          { key, files: part, now, generation },
+        ]),
+        ...slices(diff.symbols).map((part): [string, Props] => [
+          `UNWIND $symbols AS s
+             MATCH (cf:CodeFile {id: $key + ':' + s.path})
+             CREATE (cf)-[:DEFINES]->(:Symbol {projectKey: $key, id: s.id, path: s.path, ord: s.ord, name: s.name, kind: s.kind,
+                                               exported: s.exported, lines: s.lines})`,
+          { key, symbols: part },
+        ]),
+        ...slices(fileImports).map((part): [string, Props] => [
+          `UNWIND $imports AS i
+             MATCH (a:CodeFile {id: $key + ':' + i.from})
+             MATCH (b:CodeFile {id: $key + ':' + i.to})
+             CREATE (a)-[:IMPORTS {names: i.names, spec: i.spec}]->(b)`,
+          { key, imports: part },
+        ]),
+        ...slices(pkgImports).map((part): [string, Props] => [
+          `UNWIND $imports AS i
+             MATCH (a:CodeFile {id: $key + ':' + i.from})
+             MERGE (m:Module {id: $key + ':' + i.to}) ON CREATE SET m.projectKey = $key, m.name = i.to
+             CREATE (a)-[:IMPORTS {names: i.names, spec: i.spec}]->(m)`,
+          { key, imports: part },
+        ]),
+        ...slices(map.tests).map((part): [string, Props] => [
+          `UNWIND $tests AS t
+             MATCH (a:CodeFile {id: $key + ':' + t.test})
+             MATCH (b:CodeFile {id: $key + ':' + t.target})
+             MERGE (a)-[r:TESTS]->(b)
+             REMOVE r.pendingRemoval`,
+          { key, tests: part },
+        ]),
+        [
+          `MERGE (m:CodeMap {projectKey: $key})
+           SET m.fingerprint = $fingerprint, m.builtAt = $now, m.files = $stats.files, m.symbols = $stats.symbols,
+               m.imports = $stats.imports, m.tests = $stats.tests, m.candidates = $candidates, m.unresolved = $unresolved,
+               m.version = $version
+           REMOVE m.lastFailureAt, m.lastFailure, m.writingAt, m.writingBeat`,
+          { key, fingerprint: map.fingerprint, now, stats: map.stats, candidates: map.candidates, unresolved: map.unresolved ?? null, version: map.version },
+        ],
+      ];
+      // Publish metadata only after every bounded cleanup and write succeeds. A partial build therefore remains stale.
+      const publish = statements.pop()!;
+      for (const [cypher, params] of statements) await this.g.run(cypher, params);
       // Retire old files only after all fallible writes above have succeeded. Until this point a failed rebuild keeps
       // the previous files mapped, so its retained TESTS graph remains usable. The nonce, rather than mappedAt, avoids
       // treating two replacements in the same millisecond as one generation.
-      [
-        `MATCH (cf:CodeFile {projectKey: $key}) WHERE cf.inMap = true AND coalesce(cf.mapGeneration, '') <> $generation
-         SET cf.inMap = false
-         REMOVE cf.lang, cf.codeHash, cf.loc, cf.isTest, cf.churnCommits, cf.churnLastTs, cf.mappedAt`,
-        { key, generation },
-      ],
-      [
-        `MATCH (cf:CodeFile {projectKey: $key}) WHERE cf.inIndex = true AND coalesce(cf.mapGeneration, '') <> $generation
-         REMOVE cf.inIndex
-         WITH cf WHERE coalesce(cf.inMap, false) = false
-         REMOVE cf.lang, cf.codeHash, cf.loc, cf.isTest, cf.mappedAt`,
-        { key, generation },
-      ],
-      [
-        `MERGE (m:CodeMap {projectKey: $key})
-         SET m.fingerprint = $fingerprint, m.builtAt = $now, m.files = $stats.files, m.symbols = $stats.symbols,
-             m.imports = $stats.imports, m.tests = $stats.tests, m.candidates = $candidates, m.unresolved = $unresolved,
-             m.version = $version
-         REMOVE m.lastFailureAt, m.lastFailure`,
-        { key, fingerprint: map.fingerprint, now, stats: map.stats, candidates: map.candidates, unresolved: map.unresolved ?? null, version: map.version },
-      ],
-    ];
-    // Publish metadata only after every bounded cleanup and write succeeds. A partial build therefore remains stale.
-    const publish = statements.pop()!;
-    for (const [cypher, params] of statements) await this.g.run(cypher, params);
-    await drain(`MATCH (:CodeFile {projectKey: $key})-[r:TESTS]->() WHERE r.pendingRemoval IS NOT NULL
-      WITH r LIMIT $limit DELETE r RETURN count(*) AS removed`);
-    // TESTS edges deliberately protected the prior graph during the build. Once stale ones are gone, delete files
-    // that left the map and have no independent facts, scans or session references.
-    await drain(`MATCH (cf:CodeFile {projectKey: $key}) WHERE coalesce(cf.inMap, false) = false
-      AND coalesce(cf.inIndex, false) = false AND cf.hash IS NULL
-      AND COUNT { (cf)-[r]-() WHERE type(r) <> 'IN' } = 0
-      WITH cf LIMIT $limit DETACH DELETE cf RETURN count(*) AS removed`);
-    await drain(`MATCH (m:Module {projectKey: $key}) WHERE NOT EXISTS { ()-[:IMPORTS]->(m) }
-      WITH m LIMIT $limit DETACH DELETE m RETURN count(*) AS removed`);
-    await this.g.run('MATCH (cf:CodeFile {projectKey: $key}) REMOVE cf.mapGeneration', { key });
-    await this.g.run(publish[0], publish[1]);
-    return map.stats;
+      await drain(`MATCH (cf:CodeFile {projectKey: $key}) WHERE cf.inMap = true AND coalesce(cf.mapGeneration, '') <> $generation
+        WITH cf LIMIT $limit SET cf.inMap = false
+        REMOVE cf.lang, cf.codeHash, cf.loc, cf.isTest, cf.csNamespaces, cf.churnCommits, cf.churnLastTs, cf.mappedAt
+        RETURN count(*) AS removed`, { generation });
+      await drain(`MATCH (cf:CodeFile {projectKey: $key}) WHERE cf.inIndex = true AND coalesce(cf.mapGeneration, '') <> $generation
+        WITH cf LIMIT $limit REMOVE cf.inIndex
+        FOREACH (_ IN CASE WHEN coalesce(cf.inMap, false) THEN [] ELSE [1] END | REMOVE cf.lang, cf.codeHash, cf.loc, cf.isTest, cf.csNamespaces, cf.mappedAt)
+        RETURN count(*) AS removed`, { generation });
+      await drain(`MATCH (:CodeFile {projectKey: $key})-[r:TESTS]->() WHERE r.pendingRemoval IS NOT NULL
+        WITH r LIMIT $limit DELETE r RETURN count(*) AS removed`);
+      // TESTS edges deliberately protected the prior graph during the build. Once stale ones are gone, delete files
+      // that left the map and have no independent facts, scans or session references.
+      await drain(`MATCH (cf:CodeFile {projectKey: $key}) WHERE coalesce(cf.inMap, false) = false
+        AND coalesce(cf.inIndex, false) = false AND cf.hash IS NULL
+        AND COUNT { (cf)-[r]-() WHERE type(r) <> 'IN' } = 0
+        WITH cf LIMIT $limit DETACH DELETE cf RETURN count(*) AS removed`);
+      await drain(`MATCH (m:Module {projectKey: $key}) WHERE NOT EXISTS { ()-[:IMPORTS]->(m) }
+        WITH m LIMIT $limit DETACH DELETE m RETURN count(*) AS removed`);
+      await drain(`MATCH (cf:CodeFile {projectKey: $key}) WHERE cf.mapGeneration IS NOT NULL
+        WITH cf LIMIT $limit REMOVE cf.mapGeneration RETURN count(*) AS removed`);
+      await this.g.run(publish[0], publish[1]);
+      return map.stats;
+    } finally {
+      clearInterval(lease);
+    }
+  }
+
+  async markCodeMapChecked(projectKey: string, now = new Date()): Promise<void> {
+    await this.g.run('MATCH (m:CodeMap {projectKey: $key}) SET m.checkedAt = $now', { key: projectKey, now: now.toISOString() });
   }
 
   async recordCodeMapFailure(projectKey: string, error: string, now = new Date()): Promise<void> {
-    await this.g.run(`MERGE (m:CodeMap {projectKey: $key})
-      SET m.lastFailureAt = $now, m.lastFailure = $error`, { key: projectKey, now: now.toISOString(), error: error.slice(0, 500) });
+    await this.g.run(`MATCH (m:CodeMap {projectKey: $key})
+      SET m.lastFailureAt = $now, m.lastFailure = $error`, { key: projectKey, now: now.toISOString(), error: redactSecrets(error).slice(0, 500) });
   }
 
   async purgeOrphanCodeFiles(limit: number, now = new Date()): Promise<number> {
@@ -273,7 +293,7 @@ export class CodeGraphRepo implements CodeGraphStore {
         WHERE coalesce(cf.inMap, false) OR coalesce(cf.inIndex, false) OR cf.codeHash IS NOT NULL
         WITH cf, m LIMIT $batch SET cf.inMap = false, cf.inIndex = false,
           cf.mapUnselectedAt = coalesce(m.unselectedAt, $now)
-        REMOVE cf.lang, cf.codeHash, cf.loc, cf.isTest, cf.churnCommits, cf.churnLastTs, cf.mappedAt`, { cutoff, batch, now: now.toISOString() }],
+        REMOVE cf.lang, cf.codeHash, cf.loc, cf.isTest, cf.csNamespaces, cf.churnCommits, cf.churnLastTs, cf.mappedAt`, { cutoff, batch, now: now.toISOString() }],
       [`${selectedMap} MATCH (module:Module {projectKey: m.projectKey})
         WHERE NOT EXISTS { ()-[:IMPORTS]->(module) }
         WITH module LIMIT $batch DETACH DELETE module`, { cutoff, batch }],
@@ -311,7 +331,7 @@ export class CodeGraphRepo implements CodeGraphStore {
       'MATCH (f:CodeFile {projectKey: $key})-[x:IMPORTS|TESTS]->() WITH x LIMIT 250 DELETE x RETURN count(*) AS n',
       `MATCH (x:CodeFile {projectKey: $key}) WHERE coalesce(x.inMap, false) OR coalesce(x.inIndex, false) OR x.codeHash IS NOT NULL
        WITH x LIMIT 250 SET x.inMap = false, x.inIndex = false, x.mapUnselectedAt = $now
-       REMOVE x.lang, x.codeHash, x.loc, x.isTest, x.churnCommits, x.churnLastTs, x.mappedAt RETURN count(*) AS n`,
+       REMOVE x.lang, x.codeHash, x.loc, x.isTest, x.csNamespaces, x.churnCommits, x.churnLastTs, x.mappedAt RETURN count(*) AS n`,
       'MATCH (x:Module {projectKey: $key}) WITH x LIMIT 250 DETACH DELETE x RETURN count(*) AS n',
     ];
     const now = new Date().toISOString();
@@ -345,12 +365,16 @@ export class CodeGraphRepo implements CodeGraphStore {
     return {
       fingerprint: m.fingerprint ?? null,
       builtAt: m.builtAt,
+      // ISO strings of one format, so the later one is the greater.
+      checkedAt: m.checkedAt > m.builtAt ? m.checkedAt : m.builtAt,
       stats: { files: m.files ?? 0, symbols: m.symbols ?? 0, imports: m.imports ?? 0, tests: m.tests ?? 0 },
       candidates: m.candidates ?? null,
       unresolved: m.unresolved ?? null,
       version: m.version == null ? null : Number(m.version),
       lastFailureAt: m.lastFailureAt ?? null,
       lastFailure: m.lastFailure ?? null,
+      ...(m.writingAt ? { writingAt: m.writingAt as string } : {}),
+      ...(m.writingBeat ? { writingBeat: m.writingBeat as string } : {}),
     };
   }
 
@@ -437,10 +461,6 @@ export class CodeGraphRepo implements CodeGraphStore {
     return this.views.lessonsForPaths(projectKey, paths, run ?? null);
   }
 
-  outsideMap(projectKey: string, paths: string[]) {
-    return this.views.outsideMap(projectKey, paths);
-  }
-
   /** The export's per-file view of a project's map. */
   exportFiles(projectKey: string) {
     return this.views.exportFiles(projectKey);
@@ -468,6 +488,7 @@ export class CodeGraphRepo implements CodeGraphStore {
         hash: f.codeHash,
         loc: f.loc,
         isTest: f.isTest === true,
+        ...(f.csNamespaces != null && { namespaces: f.csNamespaces as string[] }),
         churn: f.churnCommits == null ? null : { commits: f.churnCommits, lastTs: f.churnLastTs },
       };
     });

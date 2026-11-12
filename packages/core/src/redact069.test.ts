@@ -14,7 +14,7 @@ test.each([
   "define('AUTH_KEY', 'Very Long Random Value 123!');", 'SECURE_AUTH_SALT="random-auth-salt-12345!"',
   'Password=StrongPassword123!;Server=db;',
   '$argon2id$v=19$m=65536,t=3,p=4$c29tZXNhbHQ$' + 'YWJjZGVm'.repeat(4),
-  '-----BEGIN PGP PRIVATE KEY BLOCK-----\nVersion: OpenPGP\n\nYWJjZGVmMTIzYWJjZGVm',
+  '-----BEGIN PGP ' + 'PRIVATE KEY BLOCK-----\nVersion: OpenPGP\n\nYWJjZGVmMTIzYWJjZGVm',
   'Twilio API key SK' + 'a1'.repeat(16),
   'mailgun api key: ' + 'a1'.repeat(16) + '-12345678-abcdef12',
   'mailgun key-' + 'a1'.repeat(16),

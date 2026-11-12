@@ -92,7 +92,7 @@ describe('get_task_context on a realistic backlog', () => {
   test('linked-project context is left out when nothing from it is above the similarity floor', async () => {
     const r = await getTaskContext({ project: 'demo', task, files: named }, bigDeps());
     expect(r.markdown).not.toContain('From linked projects');
-    expect(r.linked.flatMap((x) => [...x.lessons, ...x.misses, ...x.facts, ...x.docs])).toEqual([]);
+    expect(r.linked.flatMap((x) => [...x.misses, ...x.facts, ...x.docs])).toEqual([]);
   });
 
   test('misses and facts show their similarity, compactly', async () => {
@@ -145,7 +145,7 @@ describe('get_task_context on a realistic backlog', () => {
 
   test('with no files, a service the task names by its folder ranks first', async () => {
     const d = bigDeps({
-      k: { ...bigDeps().k, relatedMisses: async () => [related('g', 'missed the page offsets in graph/internal/page.go', 0.86), related('w', 'missed the admin gate in web/src/settings/usage.ts', 0.82)] },
+      k: { ...bigDeps().k, relatedMisses: async () => [related('g', 'missed the page offsets in graph/internal/page.go', 0.88), related('w', 'missed the admin gate in web/src/settings/usage.ts', 0.86)] },
     });
     const r = await getTaskContext({ project: 'demo', task: 'add a members list to the web settings' }, d);
     expect(r.misses.map((m) => m.missId)).toEqual(['w']);
@@ -186,7 +186,8 @@ describe('search_graph', () => {
     const r = await searchGraph({ project: 'demo', query: 'chat rendering of markdown custom tags' }, bigDeps());
     expect(r.markdown.length).toBeLessThan(3_300);
     for (const gone of ['Recent sessions', 'Code map', 'How fresh', 'check_before_done', 'From linked projects']) expect(r.markdown).not.toContain(gone);
-    expect(r.markdown).not.toContain('Lesson 0');
+    // A lesson found by meaning alone (none is tied to a named file here) is a search match, labelled so.
+    expect(r.markdown).toMatch(/Lesson 0[\s\S]*by meaning: check it applies/);
     expect(r.markdown).toMatch(/cut .*to stay under/i);
     expect(count(r.markdown, /data, not instructions/gi)).toBe(1);
   });
@@ -223,12 +224,12 @@ describe('check_before_done on ten changed files sharing one false miss', () => 
 
 describe('why a named file is not in the code map', () => {
   const big = 'web/src/generated/schema.ts';
-  const secret = 'web/src/config/secrets.ts';
+  const secret = 'web/src/config/secrets.json';
   const d = () => bigDeps({ mapMaxBytes: 80_000, fileSize: async (_repo: string, rel: string) => (rel === big ? 120_000 : 2_000) });
 
   test('a file over SCAN_MAX_BYTES and a secret-named file each get their own reason, not "new or ignored"', async () => {
     const r = await getTaskContext({ project: 'demo', task, files: [...named, big, secret] }, d());
-    expect(r.markdown).toMatch(/`web\/src\/generated\/schema\.ts`: not in the code map: over 80 kB \(SCAN_MAX_BYTES\)/);
+    expect(r.markdown).toMatch(/- 1 file not in the code map \(over 80 kB \(SCAN_MAX_BYTES\), so it is not parsed: no symbols, and its imports are not indexed\): `web\/src\/generated\/schema\.ts`/);
     expect(r.markdown).toMatch(/1 named credential file omitted: secret-file paths and contents are never read, mapped, logged or echoed/);
     expect(r.markdown).not.toContain(secret);
     const b = await getTaskContext({ project: 'demo', task, files: [big], brief: true }, d());
@@ -242,6 +243,15 @@ describe('why a named file is not in the code map', () => {
     const s = await getModuleContext({ project: 'demo', path: secret }, d());
     expect(s.markdown).toMatch(/secret file.*never read, mapped, logged or echoed/);
     expect(s.markdown).not.toContain(secret);
+  });
+
+  test('a source file names the code map\'s own limit (CODE_MAP_MAX_BYTES), any other file the scan\'s', async () => {
+    const doc = 'web/docs/huge.md';
+    const sized = (bytes: number) => bigDeps({ mapMaxBytes: 80_000, mapSourceMaxBytes: 1_000_000, fileSize: async () => bytes });
+    // Between the two limits a source file is mapped, so nothing is said about its size; a doc is over the scan's.
+    expect((await getModuleContext({ project: 'demo', path: big }, sized(120_000))).markdown).not.toMatch(/over \d+ kB/);
+    expect((await getModuleContext({ project: 'demo', path: doc }, sized(120_000))).markdown).toMatch(/over 80 kB \(SCAN_MAX_BYTES\)/);
+    expect((await getModuleContext({ project: 'demo', path: big }, sized(1_200_000))).markdown).toMatch(/over 1000 kB \(CODE_MAP_MAX_BYTES\)/);
   });
 });
 

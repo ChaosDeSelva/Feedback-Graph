@@ -9,26 +9,33 @@
 # Without a terminal (an agent, a script), flags answer the questions; see --help. Secrets come from files a person wrote,
 # never from arguments: ./scripts/setup.sh --yes --projects ~/code --github-token-file ~/gh.txt
 set -euo pipefail
+# The Compose project is this checkout's (FG_INSTANCE and COMPOSE_FILE from its .env): a shell's own value would point
+# docker compose at another install's containers.
+unset COMPOSE_PROJECT_NAME COMPOSE_FILE
 here="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$here"
 . scripts/lib/env.sh
 . scripts/lib/ollama.sh
 . scripts/lib/runner-apparmor.sh
+. scripts/lib/state-fs.sh
 
 usage() {
   cat <<'EOF'
-usage: ./scripts/setup.sh [--yes] [--pull-models] [--projects <dirs>] [--select <keys>] [--github-token-file <file>]
+usage: ./scripts/setup.sh [--yes] [--demo] [--pull-models] [--projects <dirs>] [--select <keys>] [--github-token-file <file>]
                           [--linear-key-file <file>] [--claude-token-file <file>] [--enable-auth] [--runner-procfs-compat] [--small]
 
 Write .env, mount the project folders, check Ollama (including structured output) and offer to start the stack.
 In a terminal it asks; these answer without one:
 
   --yes, -y                  yes to every question: pull missing models, start the stack, connect your agents
+  --demo                     a first run with no history of your own: adds this folder's examples/ to the project
+                             folders, selects demo-shop and, once started, seeds its demo lessons (fg demo seed), then
+                             prints the commands that show a lesson served and a violation caught
   --skip-agents              never register agents, including with --yes
   --no-transcripts           mount empty install-local transcript folders
   --pull-models              pull missing Ollama models (and nothing else unasked)
   --enable-auth              explicitly add missing API, owner and operator tokens to an existing tokenless install
-                             (combine with --yes for non-interactive upgrade, then reconnect agents)
+                             (asks in a terminal; elsewhere it needs --yes too, or it fails; then reconnect agents)
   --runner-procfs-compat     explicitly offer a runner-only Docker masked-path exception for nested procfs
                              (security tradeoff printed before confirmation; --yes alone never enables it)
   --small                    use the checked-in 1.5 GiB Neo4j profile before the first start
@@ -47,17 +54,19 @@ run (no .env yet) in a folder whose name another folder's install already runs u
 FG_INSTANCE=feedback-graph-<folder> and moves every port it publishes 10 or more apart: API_PORT (8787),
 NEO4J_HTTP_PORT (7476), NEO4J_BOLT_PORT (7689), POSTGRES_PORT (5434) and OLLAMA_PORT (11435, the bundled ollama
 profile). FG_INSTANCE=<name> ./scripts/setup.sh chooses the name. An existing .env is never renamed: setup says what to
-set, and does not start, or connect agents to, a folder whose name another folder's install runs under.
+set, and does not start, or connect agents to, a folder whose name another folder's install runs under. Once .env
+exists, it alone names the install: every script stops when FG_INSTANCE in the environment names another one.
 ./scripts/install-agent.sh registers a second install as its own MCP server, feedback-graph-<name>, and leaves the
 first install's skill links and Codex guidance as they are.
 EOF
 }
 
-yes=0 skip_agents=0 no_transcripts=0 pull_models=0 enable_auth=0 runner_procfs_compat=0 small=0 github_file="" linear_file="" claude_file="" select_raw="" select_given=0
+yes=0 demo=0 skip_agents=0 no_transcripts=0 pull_models=0 enable_auth=0 runner_procfs_compat=0 small=0 github_file="" linear_file="" claude_file="" select_raw="" select_given=0
 while [ $# -gt 0 ]; do
   case "$1" in
     -h | --help) usage; exit 0 ;;
     -y | --yes) yes=1 ;;
+    --demo) demo=1 ;;
     --pull-models) pull_models=1 ;;
     --enable-auth) enable_auth=1 ;;
     --skip-agents) skip_agents=1 ;;
@@ -80,29 +89,94 @@ while [ $# -gt 0 ]; do
 done
 env_existed=0
 [ -f .env ] && env_existed=1
-
-# Selecting a Compose name and free published ports is one machine-wide critical section. The lock cannot be scoped to
-# this checkout: two fresh installs in different folders would otherwise both observe the same ports as free.
-setup_lock="${TMPDIR:-/tmp}/feedback-graph-setup-ports-$(id -u).lock"
-take_setup_lock() {
-  if mkdir "$setup_lock" 2>/dev/null; then printf '%s\n' "$$" > "$setup_lock/pid"; return 0; fi
-  owner="$(cat "$setup_lock/pid" 2>/dev/null || true)"
-  case "$owner" in ''|*[!0-9]*) ;; *) kill -0 "$owner" 2>/dev/null && return 1 ;; esac
-  # A process killed without running its trap must not permanently block future setup attempts.
-  rm -f "$setup_lock/pid" 2>/dev/null || true
-  rmdir "$setup_lock" 2>/dev/null || return 1
-  mkdir "$setup_lock" 2>/dev/null || return 1
-  printf '%s\n' "$$" > "$setup_lock/pid"
-}
-if ! take_setup_lock; then
-  echo "another Feedback Graph setup is reserving ports on this machine ($setup_lock); wait for it to finish and retry" >&2
-  exit 1
-fi
-trap 'rm -f "$setup_lock/pid" 2>/dev/null || true; rmdir "$setup_lock" 2>/dev/null || true' EXIT INT TERM
+# Once .env exists it names the install; FG_INSTANCE in the environment names only a new one (see --help).
+check_instance_env
 
 need() { command -v "$1" >/dev/null 2>&1 || { echo "missing: $1 ($2)"; exit 1; }; }
 need docker "https://docs.docker.com/get-docker/"
+# Before anything is written: without the Compose plugin, setup would write .env and its tokens, then fail to start.
+docker compose version >/dev/null 2>&1 || { echo "missing: docker compose (the Compose plugin: https://docs.docker.com/compose/install/)"; exit 1; }
 need openssl "used to generate passwords"
+
+# Locks are directories whose file pid names the owner: its pid and start time, so a pid reused after a crash or a reboot
+# is not taken for the setup that wrote it. A lock is made whole beside its name, pid included, then renamed to it, so it
+# never exists without its owner's pid. Where the lock exists already, mv moves the new one into it instead (removed from
+# there): only the lock's own pid file says who holds it. take_lock waits while a live setup holds one, saying where the
+# lock is. A lock whose owner is gone is taken over in place: renaming its pid file away is the compare and swap (of
+# waiters that saw the same dead owner only one gets the file), and the new owner's file goes back with ln, which never
+# replaces one. So no waiter removes a lock another has just taken.
+held_locks=()
+proc_start() { LC_ALL=C TZ=UTC ps -o lstart= -p "$1" 2>/dev/null || true; }
+lock_owner_alive() { # lock_owner_alive "<pid> <start time>"
+  local pid="${1%% *}" start=""
+  case "$1" in *' '*) start="${1#* }" ;; esac
+  case "$pid" in '' | *[!0-9]*) return 1 ;; esac
+  kill -0 "$pid" 2>/dev/null && { [ -z "$start" ] || [ "$(proc_start "$pid")" = "$start" ]; }
+}
+take_lock() { # take_lock <dir> <what it guards, for the waiting message>
+  local lock="$1" me owner claim new ino orphan_ino="" waited=0 orphan=0
+  me="$$ $(proc_start $$)"
+  claim="$lock/claim.$$" new="$lock.new.$$"
+  until mkdir "$new" 2>/dev/null && printf '%s\n' "$me" >"$new/pid" && mv "$new" "$lock" 2>/dev/null && [ "$(cat "$lock/pid" 2>/dev/null)" = "$me" ]; do
+    rm -rf "$new" "$lock/${new##*/}"
+    owner="$(cat "$lock/pid" 2>/dev/null || true)"
+    if [ -z "$owner" ]; then
+      # Left by a setup from before locks were made whole (killed before it wrote its pid), or a live lock whose pid file
+      # a waiter is taking over this moment: the same directory (inode) without a pid for 30 s is claimed with an
+      # exclusive create. Counted afresh for any other one, so a live lock never inherits a count.
+      ino="$(ls -di "$lock" 2>/dev/null | awk '{ print $1 }' || true)"
+      [ -n "$ino" ] && [ "$ino" = "$orphan_ino" ] || orphan=0
+      orphan_ino="$ino"
+      orphan=$((orphan + 1))
+      if [ "$orphan" -ge 30 ] && (set -C && printf '%s\n' "$me" >"$lock/pid") 2>/dev/null; then held_locks+=("$lock"); return 0; fi
+    elif ! lock_owner_alive "$owner"; then
+      orphan=0
+      if mv "$lock/pid" "$claim" 2>/dev/null; then
+        if [ "$(cat "$claim" 2>/dev/null)" != "$owner" ]; then
+          ln "$claim" "$lock/pid" 2>/dev/null || true # another waiter took it over first: its owner gets the file back
+        elif printf '%s\n' "$me" 2>/dev/null >"$claim" && ln "$claim" "$lock/pid" 2>/dev/null; then
+          rm -f "$claim"; held_locks+=("$lock"); return 0
+        fi
+        rm -f "$claim"
+      fi
+      continue
+    else
+      orphan=0
+    fi
+    [ "$waited" = 1 ] || echo "waiting for another Feedback Graph setup ${owner:+(pid ${owner%% *}) }$2 (if no setup is running, remove $lock) ..." >&2
+    waited=1
+    sleep 1
+  done
+  held_locks+=("$lock")
+}
+drop_lock() {
+  # Renamed away first, so a waiter holding a claim inside it can no longer hand the old owner the lock back.
+  local lock="$1" kept=() l gone="$1.released.$$"
+  rm -rf "$gone"
+  if mv "$lock" "$gone" 2>/dev/null; then rm -rf "$gone"; fi
+  for l in "${held_locks[@]+"${held_locks[@]}"}"; do [ "$l" = "$lock" ] || kept+=("$l"); done
+  held_locks=("${kept[@]+"${kept[@]}"}")
+}
+trap 'for l in "${held_locks[@]+"${held_locks[@]}"}"; do drop_lock "$l"; done; true' EXIT
+trap 'exit 130' INT TERM
+# One setup at a time in this folder (it rewrites .env); setups of other installs run alongside. Released while models
+# are pulled and the stack is built, which can take many minutes. In .host/, which no container can write: under state/ a
+# container could plant a link for the lock's owner file to be written through.
+mkdir -p -m 700 .host
+install_lock="$here/.host/setup.lock"
+take_lock "$install_lock" "in this folder"
+# The lock was state/.setup.lock before 0.7.6: one a setup from before then still holds is waited for, then it goes.
+old_lock=state/.setup.lock
+while owner="$(state_read "$old_lock/pid" 200 2>/dev/null)" && lock_owner_alive "$owner"; do
+  [ "${old_waited:-}" = 1 ] || echo "waiting for another Feedback Graph setup (pid ${owner%% *}) in this folder ..." >&2
+  old_waited=1
+  sleep 1
+done
+[ ! -e "$old_lock" ] && [ ! -L "$old_lock" ] || in_state_dir state rm -rf -- .setup.lock
+# Every install registers its folder here, so a new install avoids the name and ports another install's .env reserves
+# even while that install is stopped. Choosing them is one short critical section across installs (ports.lock).
+registry="${XDG_STATE_HOME:-$HOME/.local/state}/feedback-graph"
+
 
 # Questions only in a terminal (FEEDBACK_SETUP_INTERACTIVE=1 asks them anyway, reading answers from stdin).
 interactive() { [ -t 0 ] || [ "${FEEDBACK_SETUP_INTERACTIVE:-}" = 1 ]; }
@@ -112,12 +186,33 @@ ask() { local a=""; read -r -p "$1 " a || true; a="${a:-$2}"; case "$a" in [Yy]*
 confirm() { [ "$yes" = 1 ] && return 0; interactive && ask "$@"; }
 # Questions whose answer is typed (folders, a token): only in a terminal, never with --yes.
 typing() { [ "$yes" = 0 ] && interactive; }
+# Without a terminal every token question would be answered no, so --enable-auth would add nothing.
+if [ "$enable_auth" = 1 ] && [ "$yes" = 0 ] && ! interactive; then
+  echo "--enable-auth adds tokens only when asked in a terminal or given --yes; there is no terminal here, so nothing was" >&2
+  echo "  changed. Run ./scripts/setup.sh --yes --enable-auth" >&2
+  exit 1
+fi
 
 expand() { local p="${1/#\~/$HOME}"; p="${p%/}"; printf '%s' "${p:-/}"; }
 
-if [ "$no_transcripts" = 1 ]; then
-  export CLAUDE_PROJECTS_DIR="$here/state/empty-claude"
-  export CODEX_SESSIONS_DIR="$here/state/empty-codex"
+# A bind-mount source under state/ is one the worker can replace with a link between two starts (Docker follows it), so
+# none is mounted unless the worker mounts it a second time, which it cannot then replace (state_dir checks those).
+canonical() { # $1 resolved: its nearest existing folder physically (no link, no missing folder hides where it is), then the rest
+  local d="$1" rest=""
+  case "$d" in /*) ;; *) d="$here/$d" ;; esac
+  while [ ! -d "$d" ]; do rest="/${d##*/}$rest" d="${d%/*}"; [ -n "$d" ] || d=/; done
+  printf '%s%s' "$(physical_dir "$d")" "$rest"
+}
+under_state() { case "$(canonical "$1")/" in "$(physical_dir "$here")/state/"*) return 0 ;; esac; return 1; }
+# --no-transcripts: empty folders in .host/, which no container can write (state/empty-* before 0.7.6, which the worker
+# could swap for a link to any host folder; an .env naming those is moved too).
+host_empty() { mkdir -p -m 700 "$here/.host/$1" && printf '%s' "$here/.host/$1"; }
+moved_claude="" moved_codex=""
+if [ "$no_transcripts" = 1 ] || [ "$(envval CLAUDE_PROJECTS_DIR)" = "$here/state/empty-claude" ]; then
+  CLAUDE_PROJECTS_DIR="$(host_empty empty-claude)" && export CLAUDE_PROJECTS_DIR && moved_claude=1
+fi
+if [ "$no_transcripts" = 1 ] || [ "$(envval CODEX_SESSIONS_DIR)" = "$here/state/empty-codex" ]; then
+  CODEX_SESSIONS_DIR="$(host_empty empty-codex)" && export CODEX_SESSIONS_DIR && moved_codex=1
 fi
 # Claude Code's transcripts (CLAUDE_PROJECTS_DIR, default ~/.claude/projects).
 claude_projects="$(expand "$(envval CLAUDE_PROJECTS_DIR)")"
@@ -134,29 +229,40 @@ suggest() {
         sort | uniq -c | sort -rn | awk '{ $1 = ""; sub(/^ /, ""); print }'
     fi
     for d in code Code projects Projects src dev Developer work git; do echo "$HOME/$d"; done
-  } | while IFS= read -r d; do [ -d "$d" ] && [ "$d" != "$HOME" ] && [ "$d" != / ] && echo "$d"; done | awk '!seen[$0]++' | head -n 5
+  } | while IFS= read -r d; do
+    # Spelled as on disk: on a case-insensitive disk ~/code finds ~/Code, which the pwd program (not the builtin) prints.
+    b="$(cd "$d" 2>/dev/null && basename "$(env pwd -P)")"
+    [ "$(printf '%s' "$b" | tr '[:upper:]' '[:lower:]')" = "$(printf '%s' "${d##*/}" | tr '[:upper:]' '[:lower:]')" ] && d="${d%/*}/$b"
+    # Keyed by inode: on a case-insensitive disk (macOS) ~/code and ~/Code are one folder, and so are a link and its target.
+    [ -d "$d" ] && [ "$d" != "$HOME" ] && [ "$d" != / ] && printf '%s\t%s\n' "$(ls -dLi "$d" | awk '{ print $1 }')" "$d"
+  done | awk -F '\t' '!seen[$1]++ { print $2 }' | head -n 5
 }
 
 # The project roots: the folders the containers may see, each read-only. There is no default and no guess: the folders
-# saved in Settings (state/settings/project-roots.json), else PROJECTS_DIRS (comma list, from .env; PROJECTS_DIR from
+# saved in Settings (state/api-settings/project-roots.json), else PROJECTS_DIRS (comma list, from .env; PROJECTS_DIR from
 # older versions), else asked in a terminal. PROJECTS_DIRS in the environment wins over all of them (and is saved).
 source scripts/lib/api-settings.sh
 prepare_api_settings .
 roots_file=state/api-settings/project-roots.json
+# The file the api writes, read only when it is a plain file (and at most 1 MiB of it), copied to .host/ so its time
+# can be compared with .env's.
+roots_copy="$(host_tmp)"
+trap 'rm -f "$roots_copy"; for l in "${held_locks[@]+"${held_locks[@]}"}"; do drop_lock "$l"; done; true' EXIT
+roots_grab="$(state_grab "$roots_file")" && { head -c 1048576 "$roots_grab" >"$roots_copy"; touch -r "$roots_grab" "$roots_copy"; rm -f "$roots_grab"; }
 # The roots in the file Settings writes, one per line. Paths there never hold " or \ (the api refuses them).
 saved_roots() {
-  tr -d '\n' <"$roots_file" | sed -n 's/.*"roots"[[:space:]]*:[[:space:]]*\[//p' | grep -oE '"[^"]*"|\]' |
+  tr -d '\n' <"$roots_copy" | sed -n 's/.*"roots"[[:space:]]*:[[:space:]]*\[//p' | grep -oE '"[^"]*"|\]' |
     awk '/^\]$/ { exit } { print substr($0, 2, length($0) - 2) }'
 }
 from=""
 dirs_raw="$(printenv PROJECTS_DIRS 2>/dev/null || true)"
 if [ -n "$dirs_raw" ]; then from="PROJECTS_DIRS"
-elif [ -f "$roots_file" ] && grep -q '"roots"' "$roots_file"; then
+elif [ -n "$roots_grab" ] && grep -q '"roots"' "$roots_copy"; then
   # A pipe stage that finds nothing (no roots saved) is not an error here.
   dirs_raw="$(set +o pipefail; saved_roots | paste -sd, - || true)" from="Settings"
   # Whichever changed last wins: PROJECTS_DIRS edited in .env after the roots were saved replaces them.
   env_dirs="$(envval PROJECTS_DIRS)"
-  if [ -f .env ] && [ .env -nt "$roots_file" ] && grep -qE '^PROJECTS_DIRS=' .env && [ "$env_dirs" != "$dirs_raw" ]; then
+  if [ -f .env ] && [ .env -nt "$roots_copy" ] && grep -qE '^PROJECTS_DIRS=' .env && [ "$env_dirs" != "$dirs_raw" ]; then
     dirs_raw="$env_dirs" from="PROJECTS_DIRS in .env, changed after Settings"
   fi
 elif [ -n "$(envval PROJECTS_DIRS)" ]; then dirs_raw="$(envval PROJECTS_DIRS)" from="PROJECTS_DIRS in .env"
@@ -182,9 +288,17 @@ for p in "${parts[@]+"${parts[@]}"}"; do
     echo "$d does not exist on this machine (from $from); create it, or remove it in Settings (or PROJECTS_DIRS in .env)"
     exit 1
   fi
+  if under_state "$d"; then
+    echo "$d is inside this install's state/ folder, which the worker can change (from $from); choose another folder" >&2
+    exit 1
+  fi
   case ",$(IFS=,; printf '%s' "${dirs[*]+"${dirs[*]}"}")," in *",$d,"*) continue ;; esac
   dirs+=("$d")
 done
+# --demo: the bundled examples folder is a project folder too, so demo-shop has a folder agents can work in.
+if [ "$demo" = 1 ]; then
+  case ",$(IFS=,; printf '%s' "${dirs[*]+"${dirs[*]}"}")," in *",$here/examples,"*) ;; *) dirs+=("$here/examples"); from="${from:+$from, plus }--demo" ;; esac
+fi
 joined="$(IFS=,; printf '%s' "${dirs[*]+"${dirs[*]}"}")"
 if [ ${#dirs[@]} -eq 0 ]; then
   echo "no project folders yet: nothing is mounted. Add one in Settings (Where folders come from) and run ./scripts/setup.sh"
@@ -233,20 +347,37 @@ found_projects() {
     while IFS= read -r p; do basename "$p"; done | sort -u
 }
 selected=""
+# --demo selects demo-shop along with what is already chosen (--select, or INGEST_PROJECTS from an earlier run).
+if [ "$demo" = 1 ]; then select_raw="$(envval INGEST_PROJECTS),${select_raw},demo-shop" select_given=1; fi
 if [ "$select_given" = 1 ]; then
   selected="$(select_keys "$select_raw")" || exit 1
   [ -n "$selected" ] || { echo "--select: no project named" >&2; exit 1; }
 fi
 
 # Bind-mount sources Docker would otherwise create, owned by root, on first start. (An empty ~/.codex/sessions does not
-# make install-agent.sh think Codex is installed: it looks for the CLI or Codex's own config or login.)
-mkdir -p state/settings state/runner-control "$claude_projects"
-chmod 700 state/runner-control
+# make install-agent.sh think Codex is installed: it looks for the CLI or Codex's own config or login.) Docker follows a
+# link at a mount source, so one under state/ (a container could have left it) is refused, never mounted.
 codex_sessions="$(expand "$(envval CODEX_SESSIONS_DIR)")"
 [ "$codex_sessions" = / ] && codex_sessions="$HOME/.codex/sessions"
-mkdir -p "$codex_sessions"
+for d in state/settings state/runner-control; do state_dir "$d" || exit 1; done
+for v in CLAUDE_PROJECTS_DIR:"$claude_projects" CODEX_SESSIONS_DIR:"$codex_sessions" CODEX_AUTH_FILE:"$(expand "$(envval CODEX_AUTH_FILE)")"; do
+  d="${v#*:}"
+  [ "$d" != / ] || continue
+  # The Codex login placeholder is the one file under state/ the worker mounts a second time.
+  [ "${v%%:*}" != CODEX_AUTH_FILE ] || [ "$(canonical "$d")" != "$(physical_dir "$here")/state/codex-auth.json" ] || continue
+  if under_state "$d"; then
+    echo "${v%%:*}=$d is inside this install's state/ folder, which the worker can change: choose a folder outside it" >&2
+    exit 1
+  fi
+  [ "${v%%:*}" = CODEX_AUTH_FILE ] || mkdir -p "$d"
+done
+in_state_dir state/runner-control chmod 700 .
 # Placeholder for the Codex login mount, so Docker never creates a directory in its place.
-[ -e state/codex-auth.json ] || : > state/codex-auth.json
+if [ -L state/codex-auth.json ] || { [ -e state/codex-auth.json ] && [ ! -f state/codex-auth.json ]; }; then
+  echo "state/codex-auth.json is a link or not a file (a container may have put it there): remove it, then run ./scripts/setup.sh again" >&2
+  exit 1
+fi
+[ -e state/codex-auth.json ] || state_write state/codex-auth.json </dev/null
 
 # Linux: the containers run as you (HOST_UID/HOST_GID; docker-compose.yml passes them as `user:`), so they can write
 # ./state and read transcripts only you may read. Elsewhere Docker Desktop maps file ownership: 1000 is fine.
@@ -256,16 +387,29 @@ if [ "$(uname -s)" = Linux ] && [ "$(id -u)" != 1000 ]; then run_uid="$(id -u)" 
 # One install per folder. Docker Compose names containers and volumes after the project name (FG_INSTANCE, default
 # feedback-graph), so a second checkout with the same name would take over the first one's running containers and its
 # data. A new .env in a folder whose name another folder's install already uses gets a name and ports of its own.
-instance_dir() { # the folder the install named $1 was started from (any of its containers, running or not)
-  docker ps -a --filter "label=com.docker.compose.project=$1" --format '{{.Label "com.docker.compose.project.working_dir"}}' 2>/dev/null | head -n 1
-}
-physical() { (cd "$1" 2>/dev/null && pwd -P) || printf '%s' "$1"; }
-here_p="$(physical "$here")"
-other_dir() { # the other folder using name $1, empty when none (or it is this one)
-  local d
-  d="$(instance_dir "$1")"
-  [ -n "$d" ] && [ "$(physical "$d")" != "$here_p" ] && printf '%s' "$d"
+here_p="$(physical_dir "$here")"
+other_dir() { foreign_install_dir "$1" "$here"; } # the other folder using name $1, empty when none (or it is this one)
+other_installs() { # every other install's folder that has a .env: registered, or started before installs registered
+  {
+    for f in "$registry"/installs/*; do [ -f "$f" ] && cat "$f"; done
+    docker ps -a --filter label=com.docker.compose.project.working_dir --format '{{.Label "com.docker.compose.project.working_dir"}}' 2>/dev/null || true
+  } | awk 'NF && !seen[$0]++' | while IFS= read -r d; do
+    [ -f "$d/.env" ] && [ "$(physical_dir "$d")" != "$here_p" ] && printf '%s\n' "$d"
+  done
   return 0
+}
+reserved() { # the names (FG_INSTANCE) and ports other installs' .env files set, one per line
+  local d
+  other_installs | while IFS= read -r d; do
+    grep -E '^(FG_INSTANCE|API_PORT|NEO4J_HTTP_PORT|NEO4J_BOLT_PORT|POSTGRES_PORT|OLLAMA_PORT)=' "$d/.env" 2>/dev/null |
+      cut -d= -f2- | tr -d "\"' " || true
+  done
+}
+register_install() {
+  mkdir -p "$registry/installs"
+  local entry
+  entry="$registry/installs/$(printf '%s' "$here_p" | cksum | cut -d' ' -f1)"
+  printf '%s\n' "$here_p" > "$entry.tmp.$$" && mv "$entry.tmp.$$" "$entry"
 }
 instance="$(printenv FG_INSTANCE 2>/dev/null || true)"
 if [ -n "$instance" ]; then
@@ -275,21 +419,27 @@ if [ -n "$instance" ]; then
   esac
   [ -z "$bad" ] || { echo "FG_INSTANCE=$instance: use lowercase letters, digits, - and _ (starting with a letter or digit)" >&2; exit 1; }
 fi
-if [ "$no_transcripts" = 1 ] && [ -f .env ]; then
-  setenv CLAUDE_PROJECTS_DIR "$CLAUDE_PROJECTS_DIR"
-  setenv CODEX_SESSIONS_DIR "$CODEX_SESSIONS_DIR"
+if [ -f .env ]; then
+  [ -z "$moved_claude" ] || setenv CLAUDE_PROJECTS_DIR "$CLAUDE_PROJECTS_DIR"
+  [ -z "$moved_codex" ] || setenv CODEX_SESSIONS_DIR "$CODEX_SESSIONS_DIR"
 fi
 current_name="${instance:-$(envval FG_INSTANCE)}"
 current_name="${current_name:-feedback-graph}"
 taken_by="$(other_dir "$current_name")"
 slug="$(basename "$here" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9_-' '-' | sed -e 's/^[^a-z0-9]*//' -e 's/-*$//')"
-new_instance="" port_offset=0
+new_instance="" port_offset=0 ports_locked=0
+if [ ! -f .env ]; then
+  mkdir -p "$registry"
+  take_lock "$registry/ports.lock" "choosing ports for another install"
+  ports_locked=1
+fi
 if [ ! -f .env ] && { [ -n "$instance" ] || [ -n "$taken_by" ]; }; then
+  taken="$(reserved)"
   new_instance="${instance:-feedback-graph-${slug:-2}}"
   n=2 base_name="$new_instance"
-  while [ -n "$(other_dir "$new_instance")" ]; do new_instance="$base_name-$n"; n=$((n + 1)); done
-  # Ports 10 apart from the defaults until none is published by another container.
-  used="$(docker ps --format '{{.Ports}}' 2>/dev/null | grep -oE ':[0-9]+->' | tr -d ':>-' | sort -u || true)"
+  while { [ -n "$(other_dir "$new_instance")" ] || printf '%s\n' "$taken" | grep -qx "$new_instance"; }; do new_instance="$base_name-$n"; n=$((n + 1)); done
+  # Ports 10 apart from the defaults until none is published by another container or set in another install's .env.
+  used="$({ docker ps --format '{{.Ports}}' 2>/dev/null | grep -oE ':[0-9]+->' | tr -d ':>-'; printf '%s\n' "$taken" | grep -E '^[0-9]+$'; } | sort -u || true)"
   for k in $(seq 1 20); do
     clash=""
     for p in $((8787 + 10 * k)) $((7476 + 10 * k)) $((7689 + 10 * k)) $((5434 + 10 * k)) $((11435 + 10 * k)); do
@@ -307,7 +457,7 @@ if [ -f .env ]; then
   fi
   # .env is kept as it is, except that PROJECTS_DIRS says which folders are mounted.
   env_dirs="$(grep -E '^PROJECTS_DIRS=' .env | tail -n 1 | cut -d= -f2- || true)"
-  if [ "$env_dirs" = "$joined" ] && grep -qE '^PROJECTS_DIRS=' .env; then echo ".env exists; leaving it alone."
+  if [ "$env_dirs" = "$joined" ] && grep -qE '^PROJECTS_DIRS=' .env; then echo ".env exists; its project folders are unchanged."
   else setenv PROJECTS_DIRS "$joined" && echo ".env exists; set PROJECTS_DIRS to the project folders"; fi
   if [ -n "$run_uid" ] && ! grep -qE '^HOST_UID=.' .env; then
     echo "Linux: you are uid $run_uid, and the containers run as uid 1000 unless .env says otherwise. Add these two lines to .env"
@@ -322,9 +472,7 @@ else
   codex_enabled=0
   case ",$(envval COMPOSE_PROFILES)," in *,codex,*) codex_enabled=1 ;; esac
   [ -z "$(envval CODEX_RUNNER_URL)" ] || codex_enabled=1
-  for job in CLASSIFY_LLM POSTMORTEM_LLM SCAN_LLM DOCS_LLM CHAT_LLM SUMMARY_LLM; do
-    case "$(envval "$job")" in codex-cli | codex-cli:*) codex_enabled=1 ;; esac
-  done
+  ! codex_job_configured || codex_enabled=1
   if [ "$codex_enabled" = 1 ]; then
     codex="$(envval CODEX_AUTH_FILE)"
     if [ -n "$codex" ] && [ ! -f "$codex" ]; then echo "CODEX_AUTH_FILE must name an existing login file; clear it if Codex is not used" >&2; exit 1; fi
@@ -364,16 +512,32 @@ else
     else
       echo "  (no free ports found 10 to 200 apart from the defaults: set API_PORT, NEO4J_HTTP_PORT, NEO4J_BOLT_PORT, POSTGRES_PORT and OLLAMA_PORT in .env)."
     fi
+    # install-agent.sh's name for it: FG_INSTANCE as it is when it starts feedback-graph-, else with that prefix.
+    case "$new_instance" in feedback-graph-*) mcp_name="$new_instance" ;; *) mcp_name="feedback-graph-$new_instance" ;; esac
     echo "  Both installs then run side by side, each with its own data. Agents connect to this one with ./scripts/install-agent.sh here,"
-    echo "  which registers it as the MCP server $new_instance (the first install keeps feedback-graph)."
+    echo "  which registers it as the MCP server $mcp_name (the first install keeps feedback-graph)."
   fi
 fi
 
+# A port exported in the shell wins over .env for this run's docker compose, but fg, doctor and install-agent read
+# .env: write it there, so every later command reaches the same port.
+for port_var in API_PORT NEO4J_HTTP_PORT NEO4J_BOLT_PORT POSTGRES_PORT OLLAMA_PORT; do
+  shell_port="$(printenv "$port_var" 2>/dev/null || true)"
+  [ -n "$shell_port" ] || continue
+  case "$shell_port" in *[!0-9]*) echo "$port_var=$shell_port in your shell is not a port number" >&2; exit 1 ;; esac
+  file_port="$(grep -E "^$port_var=" .env | tail -n 1 | cut -d= -f2- || true)"
+  [ "$file_port" = "$shell_port" ] && continue
+  setenv "$port_var" "$shell_port"
+  echo "$port_var=$shell_port from your shell written to .env${file_port:+ (it said $file_port)}"
+done
+
+# .env now holds this install's name and ports: register them before another install may choose its own.
+register_install
+[ "$ports_locked" = 0 ] || drop_lock "$registry/ports.lock"
+
 # Recheck the effective name after first-run auto-isolation wrote .env.
-if [ "$no_transcripts" = 1 ]; then
-  setenv CLAUDE_PROJECTS_DIR "$CLAUDE_PROJECTS_DIR"
-  setenv CODEX_SESSIONS_DIR "$CODEX_SESSIONS_DIR"
-fi
+[ -z "$moved_claude" ] || setenv CLAUDE_PROJECTS_DIR "$CLAUDE_PROJECTS_DIR"
+[ -z "$moved_codex" ] || setenv CODEX_SESSIONS_DIR "$CODEX_SESSIONS_DIR"
 
 current_name="${instance:-$(envval FG_INSTANCE)}"
 current_name="${current_name:-feedback-graph}"
@@ -429,7 +593,7 @@ if [ -n "$from" ] && [ "$from" != Settings ]; then
     for d in "${dirs[@]+"${dirs[@]}"}"; do printf '%s\n    "%s"' "$sep" "$d"; sep=","; done
     [ ${#dirs[@]} -eq 0 ] || printf '\n  '
     printf '],\n  "updatedAt": "%s"\n}\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-  } >"$roots_file.tmp" && mv "$roots_file.tmp" "$roots_file"
+  } | state_write "$roots_file" || exit 1
 fi
 
 # Exactly these folders are mounted, read-only, for the worker and the api, by a generated docker-compose.override.yml
@@ -519,8 +683,16 @@ EOF
     echo "Saved runner procfs opt-in in $compat; COMPOSE_FILE keeps the base, project mounts and existing custom files."
     # This opt-in addresses only the procfs mount failure. Never erase a fail-closed network/sandbox finding: changing
     # Docker system paths does not repair it.
+    # Only the procfs reason goes: a flag that also records another failure (doctor writes one line per reason) stays,
+    # with that reason.
     for flag in state/runner-control/codex-runner-disabled state/settings/codex-runner-disabled; do
-      [ ! -f "$flag" ] || if grep -q '^procfs:' "$flag"; then rm -f "$flag"; else echo "Kept $flag: procfs compatibility does not clear its non-procfs isolation failure."; fi
+      reasons="$(state_read "$flag" 4096 | tr -cd '[:print:]\n')" || continue
+      if rest="$(printf '%s\n' "$reasons" | grep -v '^procfs:')"; then
+        printf '%s\n' "$rest" | state_write "$flag" || exit 1
+        echo "Kept $flag: procfs compatibility does not clear its other isolation failure ($(printf '%s' "$rest" | paste -sd ';' - | sed 's/;/; /g'))."
+      else
+        state_rm "$flag"
+      fi
     done
   else
     echo 'Runner procfs compatibility was not enabled.'
@@ -545,7 +717,9 @@ elif tags="$(curl -fsS --max-time 5 "$ollama_url/api/tags" 2>/dev/null)"; then
   if [ ${#missing[@]} -gt 0 ] && command -v ollama >/dev/null 2>&1 &&
     { [ "$pull_models" = 1 ] || confirm "Pull ${missing[*]} now (gemma4 is about 10 GB)? [Y/n]" y; }; then
     still=()
+    drop_lock "$install_lock"
     for m in "${missing[@]}"; do OLLAMA_HOST="$ollama_url" ollama pull "$m" || still+=("$m"); done
+    take_lock "$install_lock" "in this folder"
     missing=("${still[@]+"${still[@]}"}")
   fi
   # Every request the classifier sends carries a JSON schema; listing the models says nothing about whether that works.
@@ -605,18 +779,26 @@ if [ -n "$(envval CLOUD_URL)" ] && [ -z "$(envval CLOUD_MACHINE)" ]; then
   [ -n "$machine" ] && setenv CLOUD_MACHINE "$machine" && echo "CLOUD_MACHINE set to $machine (the name the cloud shows for this machine's syncs)"
 fi
 
+# A token as the api reads it: one of only blanks is none (API_TOKEN="   " leaves the api tokenless), so it is added here.
+tokenval() { envval "$1" | tr -d '[:space:]'; }
+
 # Fetch Metadata is a browser/CSRF guard, not authentication against another local process. Make authenticated local
 # installs the normal path; agents receive this read/API token, never the separate headless owner credential.
-if [ -z "$(envval API_TOKEN)" ] && { [ "$env_existed" = 0 ] || [ "$yes" = 0 ] || [ "$enable_auth" = 1 ]; } &&
+if [ -z "$(tokenval API_TOKEN)" ] && { [ "$env_existed" = 0 ] || [ "$yes" = 0 ] || [ "$enable_auth" = 1 ]; } &&
   confirm "Create an API token (recommended: the only owner boundary against other local processes)? [Y/n]" y; then
   setenv API_TOKEN "$(openssl rand -hex 24)"
   echo "API_TOKEN saved to .env (not printed). Agents receive it for read/tool access; it cannot create a browser owner session or make owner decisions."
+  if [ "$env_existed" = 1 ]; then
+    echo "  Agents registered before this have no API token: once the api restarts they get 401 until ./scripts/install-agent.sh"
+    if [ "$skip_agents" = 1 ]; then echo "  runs again (--skip-agents: run it yourself after the restart)."
+    else echo "  runs again (setup offers it after starting the stack; otherwise run it yourself)."; fi
+  fi
 fi
 
 # Browser owner sessions are minted only from this separate credential. Agents receive API_TOKEN, never this value;
 # keeping them distinct makes the agent token safe for ordinary MCP/CLI reads without granting lesson decisions,
 # project selection, demo seeding or access to another run's sandbox records.
-if [ -z "$(envval FG_OWNER_TOKEN)" ] && { [ "$env_existed" = 0 ] || [ "$yes" = 0 ] || [ -n "$(envval API_TOKEN)" ] || [ "$enable_auth" = 1 ]; } &&
+if [ -z "$(tokenval FG_OWNER_TOKEN)" ] && { [ "$env_existed" = 0 ] || [ "$yes" = 0 ] || [ -n "$(tokenval API_TOKEN)" ] || [ "$enable_auth" = 1 ]; } &&
   confirm "Create a separate owner sign-in token for the browser UI? [Y/n]" y; then
   setenv FG_OWNER_TOKEN "$(openssl rand -hex 24)"
   echo "FG_OWNER_TOKEN saved to .env (not printed). Use this value to sign in to the UI; never give it to agents."
@@ -624,21 +806,27 @@ fi
 
 # The operator token lets an agent or ./scripts/fg make the owner decisions OPERATOR_ALLOW names (by default not
 # deciding lessons or deleting data). Made only when you say yes (or pass --yes), before the start so the api has it.
-if [ -z "$(envval FG_OPERATOR_TOKEN)" ] && { [ "$env_existed" = 0 ] || [ "$yes" = 0 ] || [ "$enable_auth" = 1 ]; } &&
+if [ -z "$(tokenval FG_OPERATOR_TOKEN)" ] && { [ "$env_existed" = 0 ] || [ "$yes" = 0 ] || [ "$enable_auth" = 1 ]; } &&
   confirm "Create an operator token, so agents and ./scripts/fg can scan, triage the Inbox and sync (lessons stay yours)? [Y/n]" y; then
   setenv FG_OPERATOR_TOKEN "$(openssl rand -hex 24)"
   echo "FG_OPERATOR_TOKEN saved to .env (not printed; ./scripts/fg reads it from there). It turns on the admin MCP at /mcp/admin"
   echo "  and the fg CLI for scans, Inbox triage and sync. By default it cannot decide lessons, choose which projects are read,"
-  echo "  delete data, change settings or"
-  echo "  ask in Ask (which spends your subscription); OPERATOR_ALLOW in .env widens or narrows that. Remove the line to turn it off."
+  echo "  delete data, change settings or ask in Ask (which spends your subscription); OPERATOR_ALLOW in .env widens or narrows"
+  echo "  that. Remove the line to turn it off."
 fi
 
-if [ "$env_existed" = 1 ] && [ "$yes" = 1 ] && [ "$enable_auth" = 0 ] && { [ -z "$(envval API_TOKEN)" ] || [ -z "$(envval FG_OWNER_TOKEN)" ] || [ -z "$(envval FG_OPERATOR_TOKEN)" ]; }; then
-  echo "existing .env kept: --yes adds a missing owner token to an authenticated install, but never opts a tokenless install into authentication."
-  echo "  Run ./scripts/setup.sh interactively, or ./scripts/setup.sh --yes --enable-auth, then rerun ./scripts/install-agent.sh so existing agents receive the new API token."
+if [ "$env_existed" = 1 ] && [ "$yes" = 1 ] && [ "$enable_auth" = 0 ]; then
+  if [ -z "$(tokenval API_TOKEN)" ]; then
+    echo "no tokens added: --yes never opts a tokenless install into authentication. Run ./scripts/setup.sh --yes --enable-auth"
+    echo "  (or ./scripts/setup.sh in a terminal), then rerun ./scripts/install-agent.sh so existing agents receive the new API token."
+  elif [ -z "$(tokenval FG_OPERATOR_TOKEN)" ]; then
+    echo "no operator token added: --yes adds only a missing owner token to an existing install. ./scripts/setup.sh --yes --enable-auth"
+    echo "  adds FG_OPERATOR_TOKEN (the API token agents use is unchanged)."
+  fi
 fi
 
-compose=(docker compose)
+# Named explicitly, as everywhere: the project checked above is the one started.
+compose=(docker compose -p "$(fg_instance)")
 profiles=""
 if [ "$(envval STORE)" = postgres ] && [ -z "$(envval DATABASE_URL)" ] && [ "$(envval COMPOSE_PROFILES)" != postgres ]; then
   profiles=" (STORE=postgres: add COMPOSE_PROFILES=postgres to .env so every docker compose command includes the database)"
@@ -646,6 +834,38 @@ if [ "$(envval STORE)" = postgres ] && [ -z "$(envval DATABASE_URL)" ] && [ "$(e
 fi
 api_port="$(envval API_PORT)"
 url="http://localhost:${api_port:-8787}"
+if [ -n "$(tokenval FG_OWNER_TOKEN)" ]; then sign_in="sign in: ./scripts/fg signin prints a one-time link, or paste FG_OWNER_TOKEN from $here/.env"
+else sign_in="no sign-in: tokenless, so read-only for owner actions and readable by any program or container on this machine; ./scripts/setup.sh --yes --enable-auth adds sign-in"; fi
+# --demo, once the stack answers: seed demo-shop's demo lessons (the operator token may, by default) and say how to see
+# them work without an agent session. Fails (after saying why) when the seed did not run, so setup.sh exits 1.
+demo_ready() {
+  # The seed embeds the demo lessons: on a fresh start that first call loads the embedding model, which can outlast the
+  # request's deadline (seen at 504 on a loaded machine), so a 5xx or an api not answering yet is asked once more. A
+  # refusal (403) is permanent: asking again gives the same answer.
+  local out
+  if ! out="$(./scripts/fg demo seed 2>&1)"; then
+    printf '%s\n' "$out"
+    case "$out" in
+      *"/api/demo/seed: 5"[0-9][0-9]* | *"cannot reach Feedback Graph"*)
+        if ! { echo "demo: asking again (the first call loads the embedding model)"; ./scripts/fg demo seed; }; then
+          echo "demo: the seed did not run (see above); once fixed, run ./scripts/fg demo seed"
+          return 1
+        fi ;;
+      *"no owner token"*)
+        echo "demo: this install has no tokens, so it is read-only and cannot seed the demo; run ./scripts/setup.sh --yes --enable-auth --demo"
+        return 1 ;;
+      *)
+        echo "demo: the seed did not run (see above); once fixed, run ./scripts/fg demo seed"
+        return 1 ;;
+    esac
+  else
+    printf '%s\n' "$out"
+  fi
+  echo "See it work, no agent needed:"
+  echo "  ./scripts/fg demo context     # the lessons an agent is given before it edits demo-shop's customers route"
+  echo "  ./scripts/fg demo check       # check_before_done catches a console.log a lesson forbids, citing the line"
+  echo "  ./scripts/fg activity --project demo-shop --limit 5   # what was served and checked, and why"
+}
 if [ -n "$taken_by" ]; then
   # docker compose here would recreate the other folder's containers from this folder's files (and its data with
   # them), and install-agent.sh would point its agents here: neither is done, even with --yes.
@@ -660,9 +880,11 @@ if confirm "Start Feedback Graph now (docker compose up -d --build; restarts it 
   case ",$(envval COMPOSE_PROFILES)," in
     *,codex,*) runner_apparmor_check /proc/sys/kernel/apparmor_restrict_unprivileged_userns /sys/kernel/security/apparmor/profiles "$(envval CODEX_RUNNER_APPARMOR)" || exit 1 ;;
   esac
+  # .env is settled: no lock is held through the minutes a build can take.
+  drop_lock "$install_lock"
   "${compose[@]}" up -d --build
   auth=()
-  api_token="$(envval API_TOKEN)"
+  api_token="$(tokenval API_TOKEN)"
   [ -n "$api_token" ] && auth=(-H "Authorization: Bearer $api_token")
   printf 'waiting for %s ' "$url"
   up=""
@@ -676,10 +898,24 @@ if confirm "Start Feedback Graph now (docker compose up -d --build; restarts it 
     echo "not answering after 3 minutes; see: docker compose logs api worker"
     exit 1
   fi
-  echo "running: $url (Settings: add project folders and choose the projects to read)"
+  # What is left to do in Settings: nothing when folders and projects were both chosen in this run.
+  if [ ${#dirs[@]} -eq 0 ]; then todo="; then Settings: add project folders and choose the projects to read"
+  elif [ -z "$selected" ]; then todo="; then Settings: choose the projects to read, if you have not"
+  else todo=""; fi
+  echo "running: $url ($sign_in$todo)"
+  more=""
+  demo_failed=""
+  if [ "$demo" = 1 ]; then demo_ready || demo_failed=1; more=1; fi
   if [ "$skip_agents" = 0 ] && confirm "Connect Claude Code and Codex to it (./scripts/install-agent.sh)? [Y/n]" y; then
     ./scripts/install-agent.sh || echo "install-agent.sh did not finish; fix what it says and re-run it"
+    more=1
   fi
+  # The demo and install-agent.sh print their own lines after "running:": the last line still says how to sign in.
+  if [ -n "$more" ]; then echo "open $url: $sign_in"; fi
+  # Everything else is done and said; a demo asked for and not seeded is still a failure to a script running setup.
+  if [ -n "$demo_failed" ]; then exit 1; fi
 else
   echo "next: docker compose up -d --build && open $url && ./scripts/install-agent.sh$profiles"
+  echo "  then $sign_in."
+  if [ "$demo" = 1 ]; then echo "  For the demo, after the start: ./scripts/fg demo seed, then ./scripts/fg demo context and ./scripts/fg demo check."; fi
 fi

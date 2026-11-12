@@ -1,6 +1,8 @@
 import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
-import { afterEach, beforeEach, expect, test, vi } from 'vitest';
+import userEvent from '@testing-library/user-event';
+import { afterEach, beforeEach, expect, test, vi, onTestFinished } from 'vitest';
 import { fillWeeks, Patterns } from './Patterns.tsx';
+import { heldAnswer } from './testing/heldAnswer.ts';
 
 const report = {
   causes: [{ cause: 'context_available_ignored', count: 5 }, { cause: 'verification_gap', count: 2 }],
@@ -82,6 +84,23 @@ test('where agents struggle, with no file missed yet, says so and links the hots
   expect(within(card).getByRole('link', { name: /hotspots/i }).getAttribute('href')).toBe('#projects');
 });
 
+test('where agents struggle, when the hotspots fail to load, shows the error (not "no files with misses") and retries', async () => {
+  const working = fetch;
+  let failing = true;
+  vi.stubGlobal('fetch', vi.fn(async (url: string, init?: RequestInit) => {
+    if (failing && url.startsWith('/api/codemap/hotspots')) return Response.json({ error: 'graph unavailable' }, { status: 503 });
+    return working(url, init);
+  }));
+  render(<Patterns />);
+  const card = await screen.findByRole('region', { name: /where agents struggle/i });
+  expect((await within(card).findByRole('alert')).textContent).toMatch(/graph unavailable/);
+  expect(within(card).queryByText(/no files with misses yet/i)).toBeNull();
+  failing = false;
+  fireEvent.click(within(card).getByRole('button', { name: 'Retry' }));
+  expect(await within(card).findByText('src/db/pool.ts')).toBeTruthy();
+  expect(within(card).queryByRole('alert')).toBeNull();
+});
+
 test('where agents struggle: test files are left out until "include tests" is ticked', async () => {
   render(<Patterns />);
   const card = await screen.findByRole('region', { name: /where agents struggle/i });
@@ -96,9 +115,10 @@ test('where agents struggle: test files are left out until "include tests" is ti
 
 test('a slow all-projects report never replaces the one for the project you picked', async () => {
   const shopOnly = { ...report, repeatGroups: [{ ...report.repeatGroups[0], examples: ['only in shop'] }] };
+  const all = heldAnswer(report);
   vi.stubGlobal('fetch', vi.fn(async (url: string) => {
     if (url === '/api/projects') return Response.json([{ key: 'shop', repoPath: '/x', sessions: 3, feedback: 2, lessons: 1, facts: 0, lastScan: null }]);
-    if (url === '/api/patterns') { await new Promise((r) => setTimeout(r, 80)); return Response.json(report); }
+    if (url === '/api/patterns') return all.answer();
     if (url === '/api/patterns?project=shop') return Response.json(shopOnly);
     return Response.json([]);
   }));
@@ -106,7 +126,107 @@ test('a slow all-projects report never replaces the one for the project you pick
   await waitFor(() => expect(screen.getByRole('option', { name: 'shop' })).toBeTruthy());
   fireEvent.change(screen.getByLabelText('project'), { target: { value: 'shop' } });
   expect(await screen.findByText('only in shop')).toBeTruthy();
-  await new Promise((r) => setTimeout(r, 120));
+  await all.deliver();
   expect(screen.getByText('only in shop')).toBeTruthy();
   expect(screen.queryByText('no tenant scoping')).toBeNull();
+});
+
+test('the hotspots table, which scrolls sideways at phone width, can be reached and scrolled by keyboard', async () => {
+  const { overflowAll, unreachableScrollers } = await import('./ui/scrollReach.ts');
+  onTestFinished(overflowAll());
+  const { container } = render(<Patterns />);
+  await screen.findByRole('region', { name: 'hotspots table' });
+  expect(unreachableScrollers(container).map((e) => e.outerHTML.slice(0, 80))).toEqual([]);
+});
+
+test('where agents struggle says it is loading until the hotspots arrive', async () => {
+  let answer: (r: Response) => void = () => {};
+  const inner = fetch as unknown as (url: string) => Promise<Response>;
+  vi.stubGlobal('fetch', vi.fn((url: string) => (url.startsWith('/api/codemap/hotspots') ? new Promise<Response>((r) => { answer = r; }) : inner(url))));
+  render(<Patterns />);
+  const card = await screen.findByRole('region', { name: /where agents struggle/i });
+  expect(within(card).getByText('Loading…')).toBeTruthy();
+  answer(Response.json([{ projectKey: 'shop', path: 'src/db/pool.ts', churn: 7, misses: 2, dependents: 3, score: 13 }]));
+  expect(await within(card).findByText('src/db/pool.ts')).toBeTruthy();
+});
+
+test('with nothing yet, causes, the weekly trend and repeats each say so; projects that cannot load say why', async () => {
+  vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+    if (url === '/api/projects') return Response.json({ error: 'the store is starting' }, { status: 503 });
+    if (url.startsWith('/api/patterns')) return Response.json({ causes: [], weekly: [], repeatGroups: [], preDone: { checks: 0, withGaps: 0, gapsFound: 0 } });
+    return Response.json([]);
+  }));
+  render(<Patterns />);
+  expect(await screen.findByText('the store is starting')).toBeTruthy();
+  expect(await screen.findByText(/No post-mortems yet/)).toBeTruthy();
+  expect(screen.getByText(/No confirmed feedback yet/)).toBeTruthy();
+  expect(screen.getByText(/No repeats found/)).toBeTruthy();
+  expect(fillWeeks([])).toEqual([]);
+});
+
+test('a long trend labels every few weeks and the last, not each one', async () => {
+  const weekly = Array.from({ length: 20 }, (_, i) => ({ week: `2026-W${String(i + 10).padStart(2, '0')}`, feedback: 1, repeats: 0 }));
+  vi.stubGlobal('fetch', vi.fn(async (url: string) => Response.json(url.startsWith('/api/patterns') ? { ...report, weekly } : [])));
+  const { container } = render(<Patterns />);
+  await screen.findByLabelText('2026-W29: 1 feedback, 0 repeats');
+  const labels = [...container.querySelectorAll('[aria-hidden="true"].font-mono > span')];
+  expect(labels.filter((l) => !l.className.includes('invisible')).map((l) => l.textContent)).toEqual(['W10', 'W13', 'W16', 'W19', 'W22', 'W25', 'W28', 'W29']);
+});
+
+test('a keyboard Retry of where agents struggle leaves focus on the card heading, not on the page body', async () => {
+  const working = fetch;
+  let failing = true;
+  vi.stubGlobal('fetch', vi.fn(async (url: string, init?: RequestInit) => {
+    if (failing && url.startsWith('/api/codemap/hotspots')) return Response.json({ error: 'graph unavailable' }, { status: 503 });
+    return working(url, init);
+  }));
+  render(<main tabIndex={-1}><Patterns /></main>);
+  const card = await screen.findByRole('region', { name: /where agents struggle/i });
+  const retry = await within(card).findByRole('button', { name: 'Retry' });
+  retry.focus();
+  failing = false;
+  await userEvent.setup().keyboard('{Enter}');
+  expect(await within(card).findByText('src/db/pool.ts')).toBeTruthy();
+  expect(document.activeElement).toBe(within(card).getByRole('heading', { name: /where agents struggle/i }));
+});
+
+test('a failed report says so with a Retry that loads it, clears the error and keeps focus on the page', async () => {
+  const working = fetch;
+  let failing = true;
+  vi.stubGlobal('fetch', vi.fn(async (url: string, init?: RequestInit) => {
+    if (failing && url.startsWith('/api/patterns')) return Response.json({ error: 'graph unavailable' }, { status: 503 });
+    return working(url, init);
+  }));
+  render(<main tabIndex={-1}><Patterns /></main>);
+  expect((await screen.findByRole('alert')).textContent).toMatch(/graph unavailable/);
+  failing = false;
+  screen.getByRole('button', { name: 'Retry' }).focus();
+  await userEvent.setup().keyboard('{Enter}');
+  expect(await screen.findByText('no tenant scoping')).toBeTruthy();
+  expect(screen.queryByRole('alert')).toBeNull();
+  expect(document.activeElement).toBe(screen.getByRole('main'));
+});
+
+test('a failed project list is retried with the report and its error clears once it loads', async () => {
+  const working = fetch;
+  let failing = true;
+  vi.stubGlobal('fetch', vi.fn(async (url: string, init?: RequestInit) => {
+    if (failing && url === '/api/projects') throw new Error('api unavailable');
+    return working(url, init);
+  }));
+  render(<Patterns />);
+  expect((await screen.findByRole('alert')).textContent).toMatch(/api unavailable/);
+  failing = false;
+  fireEvent.click(screen.getByRole('button', { name: 'Retry' }));
+  await waitFor(() => expect(screen.getByRole('option', { name: 'shop' })).toBeTruthy());
+  expect(screen.queryByRole('alert')).toBeNull();
+});
+
+test('headings never skip a level: each card is an h2 under the page h1', async () => {
+  const { container } = render(<Patterns />);
+  await screen.findByText('no tenant scoping');
+  await screen.findByText('src/db/pool.ts');
+  const levels = [...container.querySelectorAll('h1, h2, h3, h4, h5, h6')].map((h) => Number(h.tagName[1]));
+  expect(levels[0]).toBe(1);
+  expect(levels.filter((l, i) => i > 0 && l > levels[i - 1] + 1)).toEqual([]);
 });

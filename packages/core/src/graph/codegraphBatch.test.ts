@@ -9,10 +9,10 @@ test('large TESTS graphs are marked in bounded transactions', async () => {
     const marked = remaining.shift() ?? 0;
     return [{ get: (name: string) => name === 'marked' ? neo4j.int(marked) : null }] as never;
   });
-  await markTestsPending({ run } as never, 'cerebro', '2026-11-05T12:00:00.000Z');
+  await markTestsPending({ run } as never, 'shop', '2026-11-05T12:00:00.000Z');
   expect(run).toHaveBeenCalledTimes(3);
   for (const [query, params] of run.mock.calls) {
     expect(query).toMatch(/WHERE r\.pendingRemoval IS NULL[\s\S]*WITH r LIMIT \$limit/);
-    expect(params).toMatchObject({ key: 'cerebro', now: '2026-11-05T12:00:00.000Z' });
+    expect(params).toMatchObject({ key: 'shop', now: '2026-11-05T12:00:00.000Z' });
   }
 });

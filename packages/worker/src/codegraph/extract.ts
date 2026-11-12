@@ -74,7 +74,10 @@ function bindingNames(call: Node): string[] {
   if (name?.type === 'identifier') return ['*'];
   if (name?.type !== 'object_pattern') return [];
   return name.namedChildren.flatMap((c) =>
-    c.type === 'shorthand_property_identifier_pattern' ? [c.text] : c.type === 'pair_pattern' ? [field(c, 'key')!.text] : [],
+    c.type === 'shorthand_property_identifier_pattern' ? [c.text]
+      : c.type === 'pair_pattern' ? [field(c, 'key')!.text]
+        : c.type === 'object_assignment_pattern' ? [field(c, 'left')!.text]
+          : [],
   );
 }
 
@@ -84,7 +87,7 @@ function extractJs(root: Node): Extracted {
   const marks: string[] = [];
   const classes: { name: string; body: Node }[] = [];
 
-  const declaration = (node: Node, outer: Node, exported: boolean) => {
+  const declaration = (node: Node, outer: Node, exported: boolean): void => {
     const name = field(node, 'name')?.text;
     switch (node.type) {
       case 'function_declaration': case 'generator_function_declaration': case 'function_signature':
@@ -109,7 +112,11 @@ function extractJs(root: Node): Extracted {
         if (inner) declaration(inner, outer, exported);
         return;
       }
-      case 'expression_statement': return commonJsExport(node);
+      case 'expression_statement': {
+        // A top-level `namespace X {}` parses as an expression statement.
+        const inner = node.namedChildren[0];
+        return inner.type === 'internal_module' ? declaration(inner, outer, exported) : commonJsExport(node);
+      }
     }
   };
 
@@ -147,15 +154,16 @@ function extractJs(root: Node): Extracted {
       const decl = field(node, 'declaration');
       const value = field(node, 'value');
       const source = field(node, 'source');
-      const clause = node.namedChildren.find((c) => c.type === 'export_clause');
+      // Comments inside the braces are named children too.
+      const specs = node.namedChildren.find((c) => c.type === 'export_clause')?.namedChildren.filter((c) => c.type === 'export_specifier');
       if (decl) declaration(decl, node, true);
       else if (value?.type === 'identifier') marks.push(value.text);
       else if (value) syms.add('default', valueKind(value), true, node);
       if (source) {
-        const names = clause ? clause.namedChildren.map((s) => field(s, 'name')!.text) : ['*'];
+        const names = specs ? specs.map((s) => field(s, 'name')!.text) : ['*'];
         imports.push({ spec: str(source), names });
-      } else if (clause) {
-        for (const s of clause.namedChildren) marks.push(field(s, 'name')!.text);
+      } else if (specs) {
+        for (const s of specs) marks.push(field(s, 'name')!.text);
       }
     } else {
       declaration(node, node, false);
@@ -165,7 +173,7 @@ function extractJs(root: Node): Extracted {
   for (const call of root.descendantsOfType('call_expression')) {
     const fn = field(call, 'function');
     if (!(fn?.type === 'import' || (fn?.type === 'identifier' && fn.text === 'require'))) continue;
-    const args = field(call, 'arguments')?.namedChildren ?? [];
+    const args = field(call, 'arguments')!.namedChildren;
     if (args.length === 1 && args[0].type === 'string') imports.push({ spec: str(args[0]), names: bindingNames(call) });
   }
 
@@ -206,15 +214,14 @@ function extractPython(root: Node): Extracted {
   const all = pyAll(root);
   const isExported = (name: string) => (all ? all.has(name) : !name.startsWith('_'));
   for (const outer of root.namedChildren) {
-    const node = outer.type === 'decorated_definition' ? field(outer, 'definition') : outer;
-    if (!node) continue;
+    const node = outer.type === 'decorated_definition' ? field(outer, 'definition')! : outer;
     const name = field(node, 'name')?.text;
     if (node.type === 'function_definition' && name) syms.add(name, 'function', isExported(name), outer);
     else if (node.type === 'class_definition' && name) {
       const exported = isExported(name);
       syms.add(name, 'class', exported, outer);
       if (exported) {
-        for (const m of field(node, 'body')?.namedChildren ?? []) {
+        for (const m of field(node, 'body')!.namedChildren) {
           const fn = m.type === 'decorated_definition' ? field(m, 'definition') : m;
           const mName = fn?.type === 'function_definition' ? field(fn, 'name')?.text : undefined;
           if (mName) syms.add(`${name}.${mName}`, 'method', !mName.startsWith('_') || /^__.+__$/.test(mName), m);
@@ -308,8 +315,9 @@ function rustTypeName(t: Node | null): string | undefined {
   return t?.text;
 }
 
-function rustUse(node: Node | null, prefix: string, out: RawImport[]) {
-  if (!node) return;
+const RUST_COMMENT = new Set(['line_comment', 'block_comment']);
+
+function rustUse(node: Node, prefix: string, out: RawImport[]) {
   const join = (p: string) => (prefix ? `${prefix}::${p}` : p).replace(/\s+/g, '');
   const leaf = (path: string) => {
     const full = join(path);
@@ -321,11 +329,11 @@ function rustUse(node: Node | null, prefix: string, out: RawImport[]) {
     case 'scoped_use_list': {
       const path = field(node, 'path');
       const next = path ? join(path.text) : prefix;
-      for (const c of field(node, 'list')?.namedChildren ?? []) rustUse(c, next, out);
+      rustUse(field(node, 'list')!, next, out);
       return;
     }
     case 'use_list':
-      for (const c of node.namedChildren) rustUse(c, prefix, out);
+      for (const c of node.namedChildren) if (!RUST_COMMENT.has(c.type)) rustUse(c, prefix, out);
       return;
     case 'use_as_clause': return leaf(field(node, 'path')!.text);
     case 'use_wildcard': {
@@ -342,7 +350,7 @@ function extractRust(root: Node): Extracted {
   const imports: RawImport[] = [];
   const impls: Node[] = [];
   for (const node of root.namedChildren) {
-    if (node.type === 'use_declaration') rustUse(field(node, 'argument'), '', imports);
+    if (node.type === 'use_declaration') rustUse(field(node, 'argument')!, '', imports);
     else if (node.type === 'impl_item') impls.push(node);
     else if (RUST_KIND[node.type]) {
       const name = field(node, 'name')?.text;
@@ -378,7 +386,7 @@ function extractCsharp(root: Node): Extracted {
       if (node.type === 'using_directive') {
         const target = node.namedChildren.filter((c) => c.type === 'qualified_name' || c.type === 'identifier').at(-1);
         if (target) imports.push({ spec: target.text.replace(/\s+/g, ''), names: ['*'] });
-      } else if (node.type === 'namespace_declaration') visit(field(node, 'body')?.namedChildren ?? []);
+      } else if (node.type === 'namespace_declaration') visit(field(node, 'body')!.namedChildren);
       else if (node.type === 'file_scoped_namespace_declaration') visit(node.namedChildren);
       else if (CS_KIND[node.type]) {
         const name = field(node, 'name')?.text;
@@ -396,7 +404,41 @@ function extractCsharp(root: Node): Extracted {
     }
   };
   visit(root.namedChildren);
-  return { symbols: syms.list, imports };
+  return { symbols: syms.list, imports, namespaces: namespacesOf(root) };
+}
+
+/**
+ * C# comments, strings and character literals (regular, verbatim @"…", raw """…""", interpolated) with each character
+ * but a line break blanked, so a `namespace` line inside one is not read as a declaration.
+ */
+const CS_NOT_CODE = /\/\/[^\n]*|\/\*[^]*?(?:\*\/|$)|\$*("{3,})[^]*?(?:\1|$)|\$?@\$?"(?:[^"]|"")*(?:"|$)|\$?"(?:[^"\\\n]|\\.)*(?:"|$|(?=\n))|'(?:[^'\\\n]|\\.)*(?:'|$|(?=\n))/g;
+const CS_NAMESPACE = /^[ \t]*namespace[ \t]+([A-Za-z_][\w.]*)/gm;
+
+/**
+ * The namespaces a C# file declares, as written (a nested one by its own name), for the resolver's namespace index. Read
+ * from the tree, so a `namespace` line inside a string or a comment declares nothing. Where the parse has errors (an
+ * `#if` with two class headers, a file mid-edit missing a brace) tree-sitter can drop the declaration, so the lines are
+ * read instead, with comments and strings blanked.
+ */
+function namespacesOf(root: Node): string[] {
+  if (root.hasError) {
+    const code = root.text.replace(CS_NOT_CODE, (m) => m.replace(/[^\n]/g, ' '));
+    return [...new Set([...code.matchAll(CS_NAMESPACE)].map((m) => m[1]))];
+  }
+  return root.descendantsOfType(['namespace_declaration', 'file_scoped_namespace_declaration']).flatMap((n) => {
+    const name = field(n, 'name');
+    return name ? [name.text.replace(/\s+/g, '')] : [];
+  });
+}
+
+/** csharpNamespaces of a file that is not otherwise parsed (extract returns them for one that is). */
+export async function csharpNamespaces(source: string): Promise<string[]> {
+  const tree = (await loadParser('csharp'))!.parse(source)!;
+  try {
+    return namespacesOf(tree.rootNode);
+  } finally {
+    tree.delete();
+  }
 }
 
 // ---------- Swift ----------
@@ -423,7 +465,7 @@ function extractSwift(root: Node): Extracted {
         const visible = swiftVisible(node);
         if (declKind !== 'extension') syms.add(name, declKind === 'enum' ? 'type' : 'class', visible, node);
         if (!visible) break;
-        for (const m of flatErrors(field(node, 'body')?.namedChildren ?? [])) {
+        for (const m of flatErrors(field(node, 'body')!.namedChildren)) {
           if (m.type === 'function_declaration') syms.add(`${name}.${field(m, 'name')?.text}`, 'method', swiftVisible(m), m);
         }
         break;
@@ -451,8 +493,7 @@ export async function extract(lang: string, source: string): Promise<Extracted |
   const fn = Object.hasOwn(EXTRACTORS, lang) ? EXTRACTORS[lang] : undefined;
   const parser = fn ? await loadParser(lang) : null;
   if (!fn || !parser) return null;
-  const tree = parser.parse(source);
-  if (!tree) return null;
+  const tree = parser.parse(source)!;
   try {
     return fn(tree.rootNode);
   } finally {

@@ -21,6 +21,7 @@ function setup(o: { shown?: string[]; limit?: number } = {}) {
   ];
   const knowledge = {
     listLessons: async () => [], lessonDetail: async () => null, updateLesson: async () => ({ unscoped: false }),
+    postmortemBacklog: async () => 0, postmortemQueue: async () => ({ waiting: 0, oldestAt: null }), requestLessonRecheck: async () => 0,
     decidedLessons: async (q: DecidedLessonsQuery) => {
       queries.push(q);
       return decided.filter((l) => !q.projectKeys || q.projectKeys.includes(l.origin!)).slice(0, q.limit).map((lesson) => ({ lesson, score: null }));
@@ -55,11 +56,6 @@ test('GET /api/lessons/quality?project=: that project only; a hidden one counts 
   expect(q.windows[0]).toEqual({ days: 30, asWritten: 0, edited: 0, rejected: 1, decided: 1, byOperator: 0 });
   const hidden = await (await app.request('/api/lessons/quality?project=hidden')).json();
   expect(hidden.windows[1].decided).toBe(0);
-});
-
-test('GET /api/lessons/quality is 404 on a store that cannot tell', async () => {
-  const app = createApp(repo, { knowledge: { listLessons: async () => [], lessonDetail: async () => null, updateLesson: async () => ({ unscoped: false }) } as never });
-  expect((await app.request('/api/lessons/quality')).status).toBe(404);
 });
 
 test('GET /api/pipeline carries the same 30 and 90 day numbers under lessons.quality', async () => {

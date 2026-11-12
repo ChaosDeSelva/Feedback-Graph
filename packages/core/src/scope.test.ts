@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'vitest';
 import { selectionSeededActivity } from './graph/selection.ts';
-import { ingestSeedsStored, initialSelection, projectScope, selectionNote, shownProjects } from './scope.ts';
+import { folderSelectedNow, ingestSeedsStored, initialSelection, projectScope, selectionNote, shownProjects } from './scope.ts';
 
 const sel = (tracked: string[], initialized = true) => ({ tracked, initialized, updatedAt: null });
 
@@ -109,4 +109,16 @@ describe('a selection never made', () => {
     expect(a.why).toMatch(/no selection had been made yet.*INGEST_PROJECTS.*setup\.sh --select.*Settings/);
     expect(a.why).not.toMatch(/first start/);
   });
+});
+
+test('a scan of a project selected after the scope was read finds it selected; one never selected is re-read and still refused', async () => {
+  const held = projectScope(sel([]), { excludeProjects: [] });
+  let reads = 0;
+  const stored = async () => { reads++; return projectScope(sel(['vault-app']), { excludeProjects: [] }); };
+  expect(await folderSelectedNow(held, 'vault-app', stored)).toBe(true);
+  expect(await folderSelectedNow(held, 'other', stored)).toBe(false);
+  expect(reads).toBe(2);
+  // Already selected in the scope held: no store read.
+  expect(await folderSelectedNow(projectScope(sel(['vault-app']), { excludeProjects: [] }), 'vault-app', stored)).toBe(true);
+  expect(reads).toBe(2);
 });

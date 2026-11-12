@@ -1,11 +1,12 @@
 import { createHash } from 'node:crypto';
 import { lstat, readFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import { isSecretPath, redactSecrets } from '@fb/core';
+import { isSecretPath, redactSecretsMemo } from '@fb/core';
 import { rankCodePaths } from '../scan/rank.ts';
 import { listIndexPaths } from '../scan/scan.ts';
-import { extract } from './extract.ts';
-import { isTestPath, langOf } from './lang.ts';
+import { csharpNamespaces, extract } from './extract.ts';
+import { fileMaxBytes, isTestPath, langOf } from './lang.ts';
+import { parseSymbols } from './onDemand.ts';
 import { makeResolver } from './resolve.ts';
 import type { BuildOpts, CodeFile, CodeImport, CodeMap, CodeSymbol, RawImport } from './types.ts';
 
@@ -13,7 +14,6 @@ const DEFAULT_CONCURRENCY = 16;
 
 /** Files whose content the resolver reads: package manifests, tsconfigs, go.mod, Cargo.toml, Package.swift. */
 const RESOLVER_INPUT = /(^|\/)(package\.json|go\.mod|Cargo\.toml|Package\.swift|[tj]sconfig[^/]*\.json)$/;
-const CS_NAMESPACE = /^\s*namespace\s+[A-Za-z_][\w.]*/gm;
 const GD_CLASS_NAME = /^class_name\s+[A-Za-z_]\w*/gm;
 
 const countLines = (s: string) => (s ? s.split('\n').length - (s.endsWith('\n') ? 1 : 0) : 0);
@@ -45,6 +45,14 @@ function rawFromPrev(imports: CodeImport[]): RawImport[] | null {
   return [...bySpec].map(([spec, names]) => ({ spec, names }));
 }
 
+const PY_RELATIVE = /^[ \t]*from[ \t]+(\.[\w.]*)[ \t]+import\b/gm;
+
+/**
+ * Whether a Python file has a relative import the previous map kept no edge for: one naming no module makes none, so
+ * only a reparse can count it unresolved. A match inside a string only costs a reparse.
+ */
+const edgelessRelative = (content: string, raw: RawImport[]) => [...content.matchAll(PY_RELATIVE)].some(([, spec]) => !raw.some((r) => r.spec === spec));
+
 const groupBy = <T>(xs: T[] | undefined, key: (x: T) => string) => {
   const m = new Map<string, T[]>();
   for (const x of xs ?? []) {
@@ -64,16 +72,12 @@ type Parsed = { file: CodeFile; symbols: CodeSymbol[] | null; raw: RawImport[] }
  */
 export const MAX_INDEX_FILES = 50_000;
 
-const cmpPath = (a: string, b: string) => (a < b ? -1 : a > b ? 1 : 0);
+/** Paths are unique, so no two compare equal. */
+const cmpPath = (a: string, b: string) => (a < b ? -1 : 1);
 
-async function parseSymbols(repoPath: string, file: CodeFile): Promise<CodeSymbol[]> {
-  const content = await readFile(join(repoPath, file.path), 'utf8').catch(() => null);
-  if (content === null) return [];
-  const ex = await extract(file.lang, content).catch(() => null);
-  return (ex?.symbols ?? []).map((s) => {
-    const name = redactSecrets(s.name);
-    return { id: `${file.path}#${name}`, path: file.path, ...s, name };
-  });
+async function readSymbols(repoPath: string, file: CodeFile): Promise<CodeSymbol[]> {
+  // Deleted since the index read it: no symbols.
+  return parseSymbols(file.path, await readFile(join(repoPath, file.path), 'utf8').catch(() => ''));
 }
 
 /**
@@ -85,7 +89,7 @@ async function parseSymbols(repoPath: string, file: CodeFile): Promise<CodeSymbo
  * re-resolved against the current file set either way.
  */
 export async function buildCodeMap(repoPath: string, opts: BuildOpts, prev?: CodeMap): Promise<CodeMap> {
-  const { paths: listed, totalCandidates, cap } = await listIndexPaths(repoPath, { maxFiles: opts.maxFiles, maxBytes: opts.maxBytes, priority: opts.priority, limit: MAX_INDEX_FILES });
+  const { paths: listed, totalCandidates, cap } = await listIndexPaths(repoPath, { maxFiles: opts.maxFiles, maxBytes: opts.maxBytes, sourceMaxBytes: opts.sourceMaxBytes, priority: opts.priority, limit: MAX_INDEX_FILES });
   const prevFiles = new Map([...(prev?.files ?? []), ...(prev?.outside ?? [])].map((f) => [f.path, f]));
   const prevMapped = new Set(prev?.files.map((f) => f.path));
   const prevSymbols = groupBy(prev?.symbols, (s) => s.path);
@@ -93,6 +97,7 @@ export async function buildCodeMap(repoPath: string, opts: BuildOpts, prev?: Cod
   // A dangling import is not in the previous map, so an unchanged file that might name a new file is reparsed.
   const addedStems = prev ? [...new Set(listed.filter((p) => !prevFiles.has(p)).flatMap((p) => stemsOf(p)))] : [];
 
+  const redactSecrets = redactSecretsMemo();
   const resolverInput = new Map<string, string>();
   const parsed = new Map<string, Parsed>();
   await pool(listed, opts.concurrency ?? DEFAULT_CONCURRENCY, async (path) => {
@@ -100,24 +105,30 @@ export async function buildCodeMap(repoPath: string, opts: BuildOpts, prev?: Cod
     const abs = join(repoPath, path);
     // Re-checked here: the file may have been swapped for a symlink since it was listed.
     const st = await lstat(abs).catch(() => null);
-    if (!st?.isFile() || st.size > opts.maxBytes) return;
+    if (!st?.isFile() || st.size > fileMaxBytes(path, opts)) return;
     const buf = await readFile(abs).catch(() => null);
     if (!buf) return;
     const content = buf.toString('utf8');
     const lang = langOf(path);
     const file: CodeFile = { path, lang, hash: createHash('sha256').update(buf).digest('hex'), loc: countLines(content), isTest: isTestPath(path) };
     if (RESOLVER_INPUT.test(path)) resolverInput.set(path, content);
-    else if (lang === 'csharp') resolverInput.set(path, (content.match(CS_NAMESPACE) ?? []).join('\n'));
-    else if (lang === 'gdscript') resolverInput.set(path, (content.match(GD_CLASS_NAME) ?? []).join('\n'));
+    else if (lang === 'gdscript') resolverInput.set(path, (content.replace(/^\uFEFF/, '').match(GD_CLASS_NAME) ?? []).join('\n'));
+    const namespaces = (names: string[]) => {
+      file.namespaces = names;
+      resolverInput.set(path, names.map((n) => `namespace ${n}`).join('\n'));
+    };
 
     const old = prevFiles.get(path);
     // GDScript refers to classes by class_name, which no stem check can see coming; its line reader is cheap.
     const reused = old?.hash === file.hash && lang !== 'gdscript' ? rawFromPrev(prevImports.get(path) ?? []) : null;
-    if (reused && !addedStems.some((s) => content.includes(s))) {
+    if (reused && !addedStems.some((s) => content.includes(s)) && !(lang === 'python' && edgelessRelative(content, reused))) {
+      // An unchanged C# file's namespaces come with the map; one built before they were stored is parsed for them.
+      if (lang === 'csharp') namespaces(old!.namespaces ?? await csharpNamespaces(content).catch(() => []));
       parsed.set(path, { file, symbols: prevMapped.has(path) ? (prevSymbols.get(path) ?? []) : null, raw: reused });
       return;
     }
     const ex = await extract(lang, content).catch(() => null);
+    if (lang === 'csharp') namespaces(ex?.namespaces ?? []);
     const symbols = (ex?.symbols ?? []).map((s) => {
       const name = redactSecrets(s.name);
       return { id: `${path}#${name}`, path, ...s, name };
@@ -133,12 +144,17 @@ export async function buildCodeMap(repoPath: string, opts: BuildOpts, prev?: Cod
   let unresolved = 0;
   for (const { file, raw } of entries) {
     const byTarget = new Map<string, CodeImport>();
+    // Counted per edge, not per import: imports merged into one edge keep only its first spec, so an unchanged file
+    // reused from the previous map (rawFromPrev) has no more to count. One that makes no edge is counted on its own.
+    const unresolvedTo = new Set<string>();
     for (const r of raw) {
-      const found = resolve(file.path, file.lang, r);
-      if (found.some((x) => x.unresolved)) unresolved++;
-      for (const { to, names } of found) {
-        if (to === null) continue;
+      for (const { to, names, unresolved: missed } of resolve(file.path, file.lang, r)) {
+        if (to === null) {
+          if (missed) unresolved++;
+          continue;
+        }
         const target = to.startsWith('pkg:') ? redactSecrets(to) : to;
+        if (missed) unresolvedTo.add(target);
         const e = byTarget.get(target);
         const clean = names.map(redactSecrets);
         if (!e) byTarget.set(target, { from: file.path, to: target, names: [...new Set(clean)], spec: redactSecrets(r.spec) });
@@ -150,6 +166,7 @@ export async function buildCodeMap(repoPath: string, opts: BuildOpts, prev?: Cod
       }
     }
     imports.push(...byTarget.values());
+    unresolved += unresolvedTo.size;
   }
 
   // Which files the map keeps: tier first, then the most imported and most changed (log scale, as hotspots weigh them).
@@ -158,13 +175,13 @@ export async function buildCodeMap(repoPath: string, opts: BuildOpts, prev?: Cod
   const mapped = entries.filter((e) => kept.has(e.file.path));
   // Reused from the index, so its symbols were never kept: read them now that it is mapped.
   await pool(mapped.filter((e) => e.symbols === null), opts.concurrency ?? DEFAULT_CONCURRENCY, async (e) => {
-    if (!opts.signal?.aborted) e.symbols = await parseSymbols(repoPath, e.file);
+    if (!opts.signal?.aborted) e.symbols = await readSymbols(repoPath, e.file);
   });
   opts.signal?.throwIfAborted();
   return {
     files: mapped.map((e) => e.file),
     outside: entries.filter((e) => !kept.has(e.file.path)).map((e) => e.file),
-    symbols: mapped.flatMap((e) => e.symbols ?? []),
+    symbols: mapped.flatMap((e) => e.symbols!),
     imports,
     candidates: totalCandidates,
     unresolved,

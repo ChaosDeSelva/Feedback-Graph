@@ -1,5 +1,7 @@
 # Linked projects, pins, image and doc uploads that become facts, and fact relevance
 
+> **Historical design notes from 2026-10-24; superseded.** See [docs/](../../) for current behaviour.
+
 Requested 2026-10-24. The owner asked for four things and then to "do all of this":
 
 1. **Pin projects.**

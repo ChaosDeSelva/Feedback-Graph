@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { api, type LinkRelation, type ProjectLink } from './api.ts';
+import { api, errorMessage, type LinkRelation, type ProjectLink } from './api.ts';
 import { Button, Input, Select } from './ui/controls.tsx';
 import { Badge, Card } from './ui/display.tsx';
 
@@ -9,7 +9,7 @@ const RELATIONS: { value: LinkRelation; label: string }[] = [
   { value: 'shares_code', label: 'shares code' },
   { value: 'related', label: 'related' },
 ];
-const relationLabel = (r: LinkRelation) => RELATIONS.find((x) => x.value === r)?.label ?? r;
+const relationLabel = (r: LinkRelation) => RELATIONS.find((x) => x.value === r)!.label;
 const otherEnd = (l: ProjectLink, key: string) => (l.a === key ? l.b : l.a);
 
 /**
@@ -22,7 +22,6 @@ export function ProjectLinks({ projectKey, projects, onError, undoMs = 6000 }: {
   // not close up under the pointer and a slip can be taken back. Only then do they move to their list.
   const [decided, setDecided] = useState<Map<string, 'confirmed' | 'dismissed'>>(new Map());
   const timers = useRef(new Map<string, ReturnType<typeof setTimeout>>());
-  useEffect(() => () => { for (const t of timers.current.values()) clearTimeout(t); }, []);
   const settle = (id: string) => {
     clearTimeout(timers.current.get(id));
     timers.current.delete(id);
@@ -37,25 +36,22 @@ export function ProjectLinks({ projectKey, projects, onError, undoMs = 6000 }: {
     let stale = false;
     setLinks([]);
     for (const id of [...timers.current.keys()]) settle(id);
-    api.links(projectKey).then((l) => { if (!stale) setLinks(l); }, (e) => { if (!stale) onError(String(e)); });
+    api.links(projectKey).then((l) => { if (!stale) setLinks(l); }, (e) => { if (!stale) onError(errorMessage(e)); });
     return () => { stale = true; };
   }, [projectKey]);
 
-  async function act(fn: () => Promise<unknown>) {
+  /** Runs a change and reloads the links; false when it was refused (the error is reported). */
+  async function act(fn: () => Promise<unknown>): Promise<boolean> {
     setBusy(true);
-    try {
-      await fn();
-      setLinks(await api.links(projectKey));
-    } catch (e) {
-      onError(String(e));
-    } finally {
-      setBusy(false);
-    }
+    const ok = await fn().then(() => api.links(projectKey)).then((l) => { setLinks(l); return true; }, (e) => { onError(errorMessage(e)); return false; });
+    setBusy(false);
+    return ok;
   }
   const decide = (other: string, patch: { status?: ProjectLink['status']; relation?: LinkRelation; note?: string }) => act(() => api.setLink({ a: projectKey, b: other, ...patch }));
   async function decideSuggestion(l: ProjectLink, status: 'confirmed' | 'dismissed') {
     setDecided((d) => new Map(d).set(l.id, status));
-    await decide(otherEnd(l, projectKey), { status });
+    // A refused decision was not made: the row goes back to its buttons rather than offering to undo it.
+    if (!(await decide(otherEnd(l, projectKey), { status }))) return settle(l.id);
     timers.current.set(l.id, setTimeout(() => settle(l.id), undoMs));
   }
   async function undo(l: ProjectLink) {
@@ -83,13 +79,13 @@ export function ProjectLinks({ projectKey, projects, onError, undoMs = 6000 }: {
                 <Badge tone="accent">{relationLabel(l.relation)}</Badge>
                 {l.note && <span className="min-w-0 text-xs text-muted [overflow-wrap:anywhere]">{l.note}</span>}
               </span>
-              <Button size="sm" variant="ghost" aria-label={`unlink ${other}`} disabled={busy} onClick={() => act(() => api.deleteLink(l.id))} className="hover:text-bad-text">unlink</Button>
+              <Button size="sm" variant="ghost" owner aria-label={`unlink ${other}`} disabled={busy} onClick={() => act(() => api.deleteLink(l.id))} className="hover:text-bad-text">unlink</Button>
             </li>
           );
         })}
         {confirmed.length === 0 && (
           <li className="px-3 py-3 text-muted">
-            Not linked to any project yet. Agents working here get the best lessons, misses, facts and docs from linked projects too.
+            Not linked to any project yet. Agents working here get the best past misses, facts and docs from linked projects too (lessons stay with the project they were learned in).
           </li>
         )}
       </ul>
@@ -112,12 +108,12 @@ export function ProjectLinks({ projectKey, projects, onError, undoMs = 6000 }: {
                     {done ? (
                       <span role="status" className="flex items-center gap-2 text-xs text-muted">
                         {done === 'confirmed' ? 'confirmed' : 'dismissed'} the link to {other}
-                        <Button size="sm" variant="ghost" disabled={busy} onClick={() => void undo(l)}>Undo</Button>
+                        <Button size="sm" variant="ghost" owner disabled={busy} onClick={() => void undo(l)}>Undo</Button>
                       </span>
                     ) : (
                       <span className="flex gap-1">
-                        <Button size="sm" variant="primary" aria-label={`confirm link to ${other}`} disabled={busy} onClick={() => void decideSuggestion(l, 'confirmed')}>Confirm</Button>
-                        <Button size="sm" variant="ghost" aria-label={`dismiss link to ${other}`} disabled={busy} onClick={() => void decideSuggestion(l, 'dismissed')}>Dismiss</Button>
+                        <Button size="sm" variant="primary" owner aria-label={`confirm link to ${other}`} disabled={busy} onClick={() => void decideSuggestion(l, 'confirmed')}>Confirm</Button>
+                        <Button size="sm" variant="ghost" owner aria-label={`dismiss link to ${other}`} disabled={busy} onClick={() => void decideSuggestion(l, 'dismissed')}>Dismiss</Button>
                       </span>
                     )}
                   </div>
@@ -140,7 +136,6 @@ export function ProjectLinks({ projectKey, projects, onError, undoMs = 6000 }: {
         className="flex flex-wrap items-center gap-2 border-t border-line px-3 py-2"
         onSubmit={(e) => {
           e.preventDefault();
-          if (!pick) return;
           void decide(pick, { status: 'confirmed', relation, ...(note.trim() ? { note: note.trim() } : {}) }).then(() => { setPick(''); setNote(''); });
         }}
       >
@@ -152,7 +147,7 @@ export function ProjectLinks({ projectKey, projects, onError, undoMs = 6000 }: {
           {RELATIONS.map((r) => <option key={r.value} value={r.value}>{r.label}</option>)}
         </Select>
         <Input aria-label="note" size="sm" value={note} maxLength={500} onChange={(e) => setNote(e.target.value)} placeholder="how they fit together (optional)" className="min-w-40 flex-1" />
-        <Button size="sm" type="submit" disabled={!pick || busy}>Link</Button>
+        <Button size="sm" type="submit" owner disabled={!pick || busy}>Link</Button>
       </form>
 
       {dismissed.length > 0 && (
@@ -164,7 +159,7 @@ export function ProjectLinks({ projectKey, projects, onError, undoMs = 6000 }: {
               return (
                 <li key={l.id} className="flex items-center justify-between gap-2">
                   <span>{other}</span>
-                  <Button size="sm" variant="ghost" aria-label={`reconsider ${other}`} disabled={busy} onClick={() => decide(other, { status: 'suggested' })}>reconsider</Button>
+                  <Button size="sm" variant="ghost" owner aria-label={`reconsider ${other}`} disabled={busy} onClick={() => decide(other, { status: 'suggested' })}>reconsider</Button>
                 </li>
               );
             })}

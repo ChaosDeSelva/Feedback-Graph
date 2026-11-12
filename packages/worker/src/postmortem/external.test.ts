@@ -181,10 +181,10 @@ test("a session matched by the pull request's branch did that work: only the WRO
 
 test('lesson paths are checked against the repository and the comment: instruction files, PR refs and missing files go, flagged', async () => {
   const exists = async (_i: PostMortemInput, p: string) => ['api/search.ts', 'api/db.ts'].includes(p);
-  const r = await runPostMortem({ ...base, work: null }, { standing: async () => [], facts: async () => [], exists, llm: llm(['src/fido/AGENTS.md', 'acme/demo#9', 'api/gone.ts', 'api/search.ts']) });
+  const r = await runPostMortem({ ...base, work: null }, { standing: async () => [], facts: async () => [], exists, llm: llm(['src/mail/AGENTS.md', 'acme/demo#9', 'api/gone.ts', 'api/search.ts']) });
   expect(r.lesson.paths).toEqual(['api/search.ts']);
   expect(r.lessonChecks?.map((f) => f.name)).toEqual(['bad-path']);
-  expect(r.lessonChecks?.[0].why).toContain('src/fido/AGENTS.md');
+  expect(r.lessonChecks?.[0].why).toContain('src/mail/AGENTS.md');
 });
 
 test('a lesson left with no path is flagged as needing one; a global lesson is not', async () => {
@@ -248,4 +248,12 @@ test('a nit never becomes a project-wide lesson, even when its rule is not worde
   const r = await runPostMortem(nit, { standing: async () => [], facts: async () => [], llm: { id: 'fake', agentic: false, json: async () => ({ ...answer(['api/search.ts']), lesson: rule }) } });
   expect(r.lesson.scope).toBe('task');
   expect(r.lessonChecks?.filter((f) => f.name === 'universal-from-nit')).toHaveLength(1);
+});
+
+test('buildPrompt for a stored comment from a source this release no longer knows names the source as stored', () => {
+  const stored = { ...comment(1, 'filtering in memory will not scale', 'lead'), external: { ...ext(1, 'lead'), source: 'gitlab' } } as unknown as HumanTurn;
+  const p = buildPrompt({ ...base, feedback: stored, turns: [stored] }, [], { agentic: true, facts: [] });
+  expect(p).toContain('a reviewer commented on a gitlab thread about');
+  expect(p).toContain('(a comment on a gitlab thread;');
+  expect(p).not.toContain('undefined');
 });

@@ -26,7 +26,7 @@ export const CAPTION_ZOOM = 1.2;
 export function codeNodeCaption(n: { kind: string; label: string; misses: number }, scale: number, o: { top?: boolean; short?: string } = {}): string | null {
   if (n.kind !== 'file' && n.kind !== 'test') return null;
   if (!o.top && n.misses === 0 && scale < CAPTION_ZOOM) return null;
-  return o.short || n.label.split('/').pop() || n.label;
+  return o.short || n.label.split('/').pop()!;
 }
 
 /**
@@ -64,14 +64,6 @@ export class LabelPlacer {
   constructor(o: { cell?: number; perCell?: number } = {}) {
     this.cell = o.cell ?? 0;
     this.perCell = o.perCell ?? Infinity;
-  }
-  /** Starts a frame; `o` changes the area cap (its cell is in drawing units, so it follows the zoom). */
-  reset(o: { cell?: number; perCell?: number } = {}) {
-    this.boxes = [];
-    this.nodes = [];
-    this.cells.clear();
-    if (o.cell !== undefined) this.cell = o.cell;
-    if (o.perCell !== undefined) this.perCell = o.perCell;
   }
   /** A node's box (left, top, width, height): no caption may cover it. */
   block(x: number, y: number, w: number, h: number) {

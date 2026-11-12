@@ -14,7 +14,7 @@ const STOP = new Set(['the', 'and', 'you', 'this', 'that', 'for', 'with', 'are',
 const MIN_OVERLAP = 0.6;
 
 function words(text: string): Set<string> {
-  return new Set((text ?? '').toLowerCase().split(/[^\p{L}\p{N}']+/u).filter((w) => w.length >= 3 && !STOP.has(w)));
+  return new Set(text.toLowerCase().split(/[^\p{L}\p{N}']+/u).filter((w) => w.length >= 3 && !STOP.has(w)));
 }
 
 /** Whether two texts say mostly the same thing: at least two meaningful words each, and most of the shorter one's shared. */

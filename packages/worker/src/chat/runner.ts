@@ -80,8 +80,8 @@ export class ChatRunner {
   async start(): Promise<void> {
     const n = await this.d.store.requeueStaleTurns();
     if (n) this.d.log?.('chat: turns left answering went back to the queue', { turns: n });
+    // stop() clears the timer, so a loop that runs was scheduled while running.
     const loop = async () => {
-      if (this.stopped) return;
       await this.tick().catch((err) => this.d.log?.('chat: could not read the queue', { error: redactSecrets(String(err)) }));
       if (!this.stopped) this.timer = setTimeout(loop, this.d.intervalMs ?? INTERVAL_MS);
     };

@@ -1,11 +1,12 @@
-import { useEffect, useState, type ButtonHTMLAttributes, type InputHTMLAttributes, type ReactNode, type SelectHTMLAttributes, type TextareaHTMLAttributes } from 'react';
+import { forwardRef, useCallback, useEffect, useRef, useState, type ButtonHTMLAttributes, type InputHTMLAttributes, type ReactNode, type SelectHTMLAttributes, type TextareaHTMLAttributes } from 'react';
 import { ChevronIcon } from './icons.tsx';
+import { READ_ONLY_TITLE, useOwnerWrites } from '../ownerAccess.tsx';
 
 export type ButtonVariant = 'primary' | 'secondary' | 'ghost' | 'danger' | 'danger-outline';
 type Size = 'sm' | 'md';
 
 const BASE =
-  'inline-flex items-center justify-center gap-1.5 rounded-sm font-medium whitespace-nowrap select-none transition-[background-color,border-color,color,transform] duration-100 disabled:pointer-events-none disabled:opacity-45';
+  'inline-flex items-center justify-center gap-1.5 rounded-sm font-medium whitespace-nowrap select-none transition-[background-color,border-color,color,transform] duration-100 disabled:pointer-events-none disabled:opacity-45 aria-disabled:pointer-events-none aria-disabled:opacity-45';
 const SIZES: Record<Size, string> = { sm: 'h-7 px-2.5 text-xs', md: 'h-8 px-3 text-[13px]' };
 const VARIANTS: Record<ButtonVariant, string> = {
   // A pressable lip under the solid buttons: it sinks by a pixel on press.
@@ -22,8 +23,68 @@ const VARIANTS: Record<ButtonVariant, string> = {
 export const buttonClass = (variant: ButtonVariant = 'secondary', size: Size = 'md', extra = '') =>
   `${BASE} ${SIZES[size]} ${VARIANTS[variant]} ${extra}`;
 
-export function Button({ variant = 'secondary', size = 'md', className = '', type = 'button', ...rest }: { variant?: ButtonVariant; size?: Size } & ButtonHTMLAttributes<HTMLButtonElement>) {
-  return <button type={type} className={buttonClass(variant, size, className)} {...rest} />;
+/**
+ * `owner`: the button makes an owner decision, so it is disabled where this browser cannot make one (ownerAccess.tsx).
+ * `busy`: its request is in flight (`usePending`): it looks disabled and ignores presses, but keeps focus (a disabled
+ * button would drop it to <body>), and the caller's label says what is happening ("Approving…").
+ */
+export const Button = forwardRef<HTMLButtonElement, { variant?: ButtonVariant; size?: Size; owner?: boolean; busy?: boolean } & ButtonHTMLAttributes<HTMLButtonElement>>(function Button({ variant = 'secondary', size = 'md', className = '', type = 'button', owner = false, busy = false, onClick, ...rest }, ref) {
+  const writes = useOwnerWrites();
+  const readOnly = owner && !writes;
+  return (
+    <button
+      ref={ref}
+      type={type}
+      className={buttonClass(variant, size, className)}
+      {...rest}
+      onClick={busy ? (e) => e.preventDefault() : onClick}
+      {...(busy && { 'aria-disabled': true, 'aria-busy': true })}
+      {...(readOnly && { disabled: true, title: READ_ONLY_TITLE })}
+    />
+  );
+});
+
+/**
+ * Which of a page's owner actions is in flight, and a runner that starts one only when none is: a second press while a
+ * decision saves would send it twice. `run` resolves when the action settles; its errors are the action's to catch.
+ */
+export function usePending<K extends string>(): [K | null, (key: K, action: () => Promise<unknown>) => Promise<void>] {
+  const [pending, setPending] = useState<K | null>(null);
+  const inFlight = useRef(false);
+  const run = useCallback(async (key: K, action: () => Promise<unknown>) => {
+    if (inFlight.current) return;
+    inFlight.current = true;
+    setPending(key);
+    try {
+      await action();
+    } finally {
+      inFlight.current = false;
+      setPending(null);
+    }
+  }, []);
+  return [pending, run];
+}
+
+/**
+ * A ref for a button its own action removes (a Retry the reloaded content replaces): when it goes while focused, focus
+ * moves to what names the part of the page it was in (a card's heading, a tab panel's tab) or else to <main>, instead of
+ * dropping to <body> where the next Tab starts over.
+ */
+export function useFocusHandoff(): (el: HTMLElement | null) => void {
+  const last = useRef<HTMLElement | null>(null);
+  return useCallback((el: HTMLElement | null) => {
+    const gone = last.current;
+    last.current = el;
+    if (el || !gone || document.activeElement !== gone) return;
+    const named = gone.closest('[aria-labelledby]');
+    const target = (named && document.getElementById(named.getAttribute('aria-labelledby')!)) || gone.closest('main');
+    // React detaches the ref just before it removes the button; focus moves once the commit is done.
+    queueMicrotask(() => {
+      if (!target?.isConnected || (document.activeElement && document.activeElement !== document.body)) return;
+      if (!target.hasAttribute('tabindex')) target.tabIndex = -1;
+      target.focus();
+    });
+  }, []);
 }
 
 /**
@@ -70,7 +131,8 @@ export function Textarea({ className = '', ...rest }: TextareaHTMLAttributes<HTM
 
 export function Select({ className = '', size = 'md', children, ...rest }: { size?: Size; children: ReactNode } & Omit<SelectHTMLAttributes<HTMLSelectElement>, 'size'>) {
   return (
-    <span className={`relative inline-flex min-w-0 ${className}`}>
+    // At least 6rem wide, so a select in a table cell or a tight row never collapses to one letter.
+    <span className={`relative inline-flex min-w-24 ${className}`}>
       <select
         className={`${fieldClass} w-full min-w-0 cursor-pointer appearance-none truncate pr-7 ${size === 'sm' ? 'h-7 pl-2 text-xs' : 'h-8 pl-2.5 text-[13px]'}`}
         {...rest}
@@ -82,9 +144,23 @@ export function Select({ className = '', size = 'md', children, ...rest }: { siz
   );
 }
 
+/**
+ * A row of filters or actions above a list: its controls share an even grid (as many columns of at least `min` as fit),
+ * each as wide as its column, with one gap between all of them, so a narrow pane gets tidy rows instead of one ragged,
+ * full-width control per line. A child that should span the row takes `col-span-full`.
+ */
+export function FilterBar({ label, children, min = '9rem', className = '' }: { label: string; children: ReactNode; min?: string; className?: string }) {
+  return (
+    <div role="group" aria-label={label} style={{ gridTemplateColumns: `repeat(auto-fill, minmax(min(100%, ${min}), 1fr))` }} className={`grid w-full items-center gap-2 [&>*]:w-full [&>*]:min-w-0 ${className}`}>
+      {children}
+    </div>
+  );
+}
+
 /** A segmented switch between a few views of one list (statuses). Each option is a pressed/unpressed button. */
 export function Tabs<T extends string>({ value, options, onChange, label }: { value: T; options: readonly T[]; onChange: (v: T) => void; label: string }) {
   return (
+    // Options that wrap fill each row (flex-1), so a second row is as tidy as the first instead of one short tab.
     <div role="group" aria-label={label} className="inline-flex max-w-full flex-wrap gap-0.5 rounded-md border border-line bg-sunken p-0.5">
       {options.map((o) => (
         <button
@@ -92,7 +168,7 @@ export function Tabs<T extends string>({ value, options, onChange, label }: { va
           type="button"
           aria-pressed={o === value}
           onClick={() => onChange(o)}
-          className={`h-6 rounded-sm px-2.5 text-xs font-medium capitalize transition-colors ${
+          className={`h-6 flex-1 rounded-sm px-2.5 text-xs font-medium whitespace-nowrap capitalize transition-colors ${
             o === value ? 'bg-surface text-text shadow-[0_0_0_1px_var(--color-line),var(--shadow-card)]' : 'text-muted hover:text-text'
           }`}
         >

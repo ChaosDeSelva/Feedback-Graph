@@ -5,19 +5,24 @@ parser stores nothing; `stage.ts` (the worker's "map" stage) builds each selecte
 `CodeGraphStore.replaceCodeMap`, reading the stored map back for the next incremental build.
 
 ```ts
-import { buildCodeMap, churn, dependents, testsFor } from './codegraph/index.ts';
+import { buildCodeMap } from './codegraph/codemap.ts';
+import { churn } from './codegraph/churn.ts';
+import { dependents, testsFor } from './codegraph/queries.ts';
 
-const map = await buildCodeMap(repoPath, { maxFiles: 5000, maxBytes: 200_000 });
+const map = await buildCodeMap(repoPath, { maxFiles: 5000, maxBytes: 80_000, sourceMaxBytes: 1_000_000 });
 const next = await buildCodeMap(repoPath, opts, map); // unchanged files are not reparsed
 dependents(map, 'src/db.ts', 2); // [{ path, depth }], nearest first
-testsFor(map, 'src/db.ts'); // test files importing it directly or through one file
+testsFor(map, 'src/db.ts'); // its tests: beside it (Go same-package, db.test.ts), or importing it directly or through one file
 await churn(repoPath, 90); // Map<path, { commits, lastTs }>, renames followed to today's path
 ```
 
 ## What it reads
 
 The file list comes from `listCodeFiles` (scan/scan.ts): `.gitignore` respected, vendor and build dirs, lockfiles and
-secret files skipped, symlinks never followed. Each file is lstat'd again before it is read.
+secret files skipped, symlinks never followed. Paths are in Unicode NFC, each file once: git in a container lists a
+non-ASCII name a Mac wrote in NFD both as the index has it (NFC) and as it is on disk (`nfcPaths`, core git.ts). Each file is lstat'd again before it is read. A parsed source file
+(a language in the table below) may be up to `sourceMaxBytes` (CODE_MAP_MAX_BYTES, 1 MB); anything else up to `maxBytes`
+(SCAN_MAX_BYTES, 80 kB): a hub file such as a router or generated queries is often the largest and the most imported.
 
 Parsing uses tree-sitter through `web-tree-sitter` (WASM, no native build) with grammars from
 `@repomix/tree-sitter-wasms`, both pinned exactly in the worker's package.json.
@@ -44,14 +49,24 @@ Anything that does not resolve inside the repo becomes `pkg:<name>` (the npm pac
 crate, Go import path, C# namespace or Swift module). A relative import that points at nothing is dropped (counted as
 unresolved for Python). `unresolved` counts imports that look like the repo's own code but name no file.
 
+## Tests that cover a file
+
+`testsFor` links a file to the test files beside it that test it without an import (a Go file's same-package
+`_test.go` files; the test named for it, `foo.test.ts` or `test_foo.py`, which may only mock it) and the test files
+importing it directly or through one file. Answers (core `codeGraphViews`) follow importers up to three hops and add
+each one's own links, so a Go package's tests also cover the packages it imports; they list a file's tests nearest
+first: those in its own folder, then by import hops, then by path.
+
 ## The import index and the cap
 
 Every candidate file (up to `MAX_INDEX_FILES`, 50,000) is parsed and its imports resolved against all of them, so an
 alias or a Python package pointing past the cap still resolves. The map keeps symbols for the first `cap` files
 (`mapCap`), ranked by tier (`scan/rank.ts`) and, within a tier, by `log2(1 + importers) + log2(1 + commits)`: a
 capped map holds the most imported and most changed files, not the alphabetically first. The rest are `outside`: no
-symbols, but their files and every edge to and from them are stored, so importer counts are right and a file past
-the cap can still say who imports it (`CodeGraphStore.outsideMap`). Ask's code search matches their names too.
+symbols, but their files, every edge to and from them and their test links are stored, so importer counts are right and
+a file past the cap has a module context (`CodeGraphStore.moduleContext`, `outside: true`) with its importers, imports
+and tests; get_module_context parses its symbols from the file when asked (api `symbolsOnDemand`: source files within
+`sourceMaxBytes`, the 256 most recent kept by content hash). Ask's code search matches their names too.
 
 ## Versions
 

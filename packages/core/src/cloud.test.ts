@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { expect, test, vi } from 'vitest';
-import { bundleCounts, CloudSyncError, nextSyncDelayMs, PREVIEW_CONCURRENCY, previewCloudSync, pushBundle, runCloudSync, storedSyncMemory, syncBundle, syncMemoryCursor, syncProjects, type SyncResponse } from './cloud.ts';
+import { bundleCounts, CLOUD_LOCAL_ONLY_CURSOR, CLOUD_SHARED_DEMOS_CURSOR, cloudLocalOnlyProjects, cloudSharedDemoProjects, CloudSyncError, nextSyncDelayMs, PREVIEW_CONCURRENCY, previewCloudSync, pushBundle, retryAfterMs, runCloudSync, storedSyncMemory, syncBundle, syncMemoryCursor, syncProjects, type SyncResponse } from './cloud.ts';
 import type { CloudConfig } from './config.ts';
 import { EXPORT_FORMAT, type ExportBundle } from './graph/portability.ts';
 import type { ActivityInput } from './types.ts';
@@ -844,4 +844,235 @@ test('policy discovery explains admin approval even when an unchanged project ne
   expect(posts).toBe(0);
   expect(next.projects[0]).toMatchObject({ status: 'unchanged', teamLessons: gate });
   expect(memory.get('shop')).toMatchObject({ teamLessons: gate });
+});
+
+test('the local-only and shared-demo policies merge with config, dedupe, and fail closed when damaged', async () => {
+  const docs = cursors();
+  expect(await cloudLocalOnlyProjects(docs, ['env-only'])).toEqual(['env-only']);
+  expect(await cloudSharedDemoProjects(docs)).toEqual([]);
+  docs.m.set(CLOUD_LOCAL_ONLY_CURSOR, JSON.stringify(['saved', 'env-only']));
+  docs.m.set(CLOUD_SHARED_DEMOS_CURSOR, JSON.stringify(['demo', 'demo']));
+  expect(await cloudLocalOnlyProjects(docs, ['env-only'])).toEqual(['env-only', 'saved']);
+  expect(await cloudLocalOnlyProjects(docs)).toEqual(['saved', 'env-only']);
+  expect(await cloudSharedDemoProjects(docs)).toEqual(['demo']);
+  // A damaged policy must stop the sync rather than send a project the owner kept local.
+  for (const raw of ['{"shop":true}', '["ok", 3]']) {
+    docs.m.set(CLOUD_LOCAL_ONLY_CURSOR, raw);
+    docs.m.set(CLOUD_SHARED_DEMOS_CURSOR, raw);
+    await expect(cloudLocalOnlyProjects(docs)).rejects.toThrow(/invalid local-only cloud policy; repair it in Settings/);
+    await expect(cloudSharedDemoProjects(docs)).rejects.toThrow('invalid demo sharing policy');
+  }
+  docs.m.set(CLOUD_LOCAL_ONLY_CURSOR, 'not json');
+  await expect(cloudLocalOnlyProjects(docs)).rejects.toThrow(SyntaxError);
+});
+
+test('a damaged record kept the old way reads as none and is removed; a store failure while moving it is retried', async () => {
+  for (const damaged of ['not json', '["shop"]', '{"shop":{"no":"fingerprint"}}']) {
+    const docs = cursors();
+    docs.m.set(syncMemoryCursor(cloud), damaged);
+    const memory = storedSyncMemory(docs, cloud);
+    expect(await memory.get('shop')).toBeUndefined();
+    expect(docs.m.has(syncMemoryCursor(cloud))).toBe(false);
+  }
+  const docs = cursors();
+  const rec = { fingerprint: 'f', remote: null, lessons: [], misses: [], docs: [], files: [] };
+  docs.m.set(syncMemoryCursor(cloud), JSON.stringify({ shop: rec }));
+  const getCursor = docs.getCursor;
+  let fail = true;
+  docs.getCursor = async (k: string) => { if (fail) { fail = false; throw new Error('store unavailable'); } return getCursor(k); };
+  const memory = storedSyncMemory(docs, cloud);
+  await expect(memory.get('shop')).rejects.toThrow('store unavailable');
+  expect(await memory.get('shop')).toEqual(rec);
+});
+
+test('a project being backed off from is not withdrawn yet; one with no record left is skipped', async () => {
+  const memory = new Map();
+  await runCloudSync({ cloud, portability: store({ shop: bundle('shop') }), projects: async () => ['shop'], trigger: 'manual', fetch: fakeFetch([]).f, sleep: noSleep, memory });
+  const wait = fakeFetch([]);
+  const r = await runCloudSync({ cloud, portability: store({}), projects: async () => [], trigger: 'schedule', fetch: wait.f, sleep: noSleep, memory, waiting: () => '2026-11-11T00:00:00.000Z' });
+  expect(wait.calls).toHaveLength(0);
+  expect(r.projects).toEqual([{ key: 'shop', status: 'waiting', counts: null, until: '2026-11-11T00:00:00.000Z' }]);
+  expect([...memory.keys()]).toEqual(['shop']);
+  // a key listed with no record behind it (removed by the other service meanwhile) is nothing to withdraw
+  const gone = { get: async () => undefined, set: async () => {}, delete: async () => {}, keys: async () => ['shop'] };
+  const none = fakeFetch([]);
+  expect((await runCloudSync({ cloud, portability: store({}), projects: async () => [], trigger: 'schedule', fetch: none.f, sleep: noSleep, memory: gone })).projects).toEqual([]);
+  expect(none.calls).toHaveLength(0);
+});
+
+test('a revoked token while resending a cut code map stops the run with that error, not a size error', async () => {
+  const codeFiles = Array.from({ length: 50 }, (_, i) => codeFile(i, i));
+  const tooBig = Response.json({ error: 'bundle larger than 1000 bytes', features: ['codeFilesPartial'] }, { status: 413 });
+  const { f, calls } = fakeFetch([tooBig, new Response('{"error":"token revoked"}', { status: 401 })]);
+  const r = await runCloudSync({ cloud, portability: store({ shop: bundle('shop', { codeFiles }), blog: bundle('blog') }), projects: async () => ['shop', 'blog'], trigger: 'schedule', fetch: f, sleep: noSleep });
+  expect(calls).toHaveLength(2);
+  expect(r.ok).toBe(false);
+  expect(r.stopped).toBe(true);
+  expect(r.projects[0]).toMatchObject({ key: 'shop', status: 'failed' });
+  expect(r.error).toMatch(/^shop: .*401/);
+  expect(r.error).not.toMatch(/too large/);
+});
+
+test('a code map still too large once cut goes again cut to half the budget, then without any', async () => {
+  const codeFiles = Array.from({ length: 400 }, (_, i) => codeFile(i, i));
+  const full = bundle('shop', { codeFiles });
+  const fullBytes = Buffer.byteLength(JSON.stringify(await syncBundle(store({ shop: full }), 'shop')));
+  const limit = Math.floor(fullBytes / 2);
+  const tooBig = (n: number | null) => Response.json({ error: n === null ? 'too large' : `bundle larger than ${n} bytes`, features: ['codeFilesPartial'] }, { status: 413 });
+  // The cloud's limit, then a tighter one it names on the retry: the third try fits half the first budget.
+  const halved = fakeFetch([tooBig(limit), tooBig(Math.floor(limit / 3)), Response.json(ok)]);
+  const r = await runCloudSync({ cloud, portability: store({ shop: full }), projects: async () => ['shop'], trigger: 'schedule', fetch: halved.f, sleep: noSleep });
+  expect(halved.calls).toHaveLength(3);
+  const [first, second] = [sentBody(halved.calls[1]), sentBody(halved.calls[2])];
+  expect(second.codeFiles.length).toBeGreaterThan(0);
+  expect(second.codeFiles.length).toBeLessThan(first.codeFiles.length);
+  expect(Buffer.byteLength(halved.calls[2].init.body as string)).toBeLessThanOrEqual(Math.floor(limit * 0.95 / 2));
+  expect(r.projects[0]).toMatchObject({ status: 'sent', trimmed: { codeFiles: { sent: second.codeFiles.length, of: 400 } } });
+  // A cloud that names no limit: the first cut is half the body; then half that; then none at all, and that one goes.
+  const unnamed = fakeFetch([tooBig(null), tooBig(null), tooBig(null), Response.json(ok)]);
+  const r2 = await runCloudSync({ cloud, portability: store({ shop: full }), projects: async () => ['shop'], trigger: 'schedule', fetch: unnamed.f, sleep: noSleep });
+  expect(unnamed.calls).toHaveLength(4);
+  expect(Buffer.byteLength(unnamed.calls[1].init.body as string)).toBeLessThanOrEqual(Math.floor(fullBytes / 2));
+  expect(sentBody(unnamed.calls[3]).codeFiles).toEqual([]);
+  expect(r2.projects[0]).toMatchObject({ status: 'sent', trimmed: { codeFiles: { sent: 0, of: 400 } } });
+  // Too large every time: the limit the cloud named first is the one the advice gives, when a later answer names none.
+  const never = fakeFetch([tooBig(limit), tooBig(null), tooBig(null), tooBig(null)]);
+  const r3 = await runCloudSync({ cloud, portability: store({ shop: full }), projects: async () => ['shop'], trigger: 'schedule', fetch: never.f, sleep: noSleep });
+  expect(r3.error).toMatch(new RegExp(`even without its code map.*at most ${limit} bytes`));
+});
+
+test('a code map whose hottest file alone does not fit the cut fails at once with what to do', async () => {
+  const codeFiles = [codeFile(1, 5), codeFile(2, 5)];
+  const tooBig = () => Response.json({ error: 'bundle larger than 10 bytes', features: ['codeFilesPartial'] }, { status: 413 });
+  const { f, calls } = fakeFetch([tooBig(), tooBig()]);
+  const r = await runCloudSync({ cloud, portability: store({ shop: bundle('shop', { codeFiles }) }), projects: async () => ['shop'], trigger: 'schedule', fetch: f, sleep: noSleep });
+  expect(calls).toHaveLength(2);
+  expect(sentBody(calls[1]).codeFiles).toEqual([]);
+  expect(r.error).toMatch(/even without its code map/);
+});
+
+test('rows the store hands back twice still fingerprint as one form: the project is unchanged next time', async () => {
+  const b = bundle('shop');
+  const twice = bundle('shop', { facts: [b.facts[0], b.facts[0]] });
+  const memory = new Map();
+  await runCloudSync({ cloud, portability: store({ shop: twice }), projects: async () => ['shop'], trigger: 'schedule', fetch: fakeFetch([]).f, sleep: noSleep, memory });
+  const r = await runCloudSync({ cloud, portability: store({ shop: bundle('shop', { facts: [b.facts[0], b.facts[0]] }) }), projects: async () => ['shop'], trigger: 'schedule', fetch: fakeFetch([]).f, sleep: noSleep, memory });
+  expect(r.projects[0].status).toBe('unchanged');
+});
+
+test('a project whose project record is gone (lessons only) is sent and remembered with no remote', async () => {
+  const memory = new Map();
+  await runCloudSync({ cloud, portability: store({ shop: bundle('shop', { projects: [] }) }), projects: async () => ['shop'], trigger: 'schedule', fetch: fakeFetch([]).f, sleep: noSleep, memory });
+  expect(memory.get('shop')).toMatchObject({ remote: null });
+});
+
+test('Retry-After: seconds, an HTTP date, and what is not a wait', () => {
+  const now = Date.parse('2026-11-10T12:00:00Z');
+  expect(retryAfterMs('3', now)).toBe(3000);
+  expect(retryAfterMs('Tue, 10 Nov 2026 12:00:30 GMT', now)).toBe(30_000);
+  expect(retryAfterMs('Tue, 10 Nov 2026 11:00:00 GMT', now)).toBe(0);
+  expect(retryAfterMs('-5', now)).toBeNull();
+  expect(retryAfterMs('soon', now)).toBeNull();
+  expect(retryAfterMs(' ', now)).toBeNull();
+});
+
+test('pushBundle uses the global fetch and a real wait when given neither', async () => {
+  const answers = [new Response('', { status: 503 }), Response.json(ok)];
+  const seen: string[] = [];
+  vi.stubGlobal('fetch', async (url: string) => { seen.push(url); return answers.shift()!; });
+  try {
+    expect(await pushBundle({ cloud, bundle: bundle('shop'), baseDelayMs: 1 })).toEqual(ok);
+  } finally {
+    vi.unstubAllGlobals();
+  }
+  expect(seen).toEqual(['https://cloud.example.com/api/v1/sync', 'https://cloud.example.com/api/v1/sync']);
+});
+
+test('answers the cloud gives without what they should hold: a 200 that is not a sync result, an error that is not text', async () => {
+  for (const body of ['"accepted"', '42']) {
+    const { f } = fakeFetch([new Response(body, { status: 200 })]);
+    await expect(pushBundle({ cloud, bundle: bundle('shop'), fetch: f, sleep: noSleep })).rejects.toThrow(/without a sync result/);
+  }
+  const { f } = fakeFetch([Response.json({ error: { code: 'bad' } }, { status: 422 })]);
+  await expect(pushBundle({ cloud, bundle: bundle('shop'), fetch: f, sleep: noSleep })).rejects.toThrow(/^the cloud rejected the bundle \(422\)$/);
+});
+
+test('the sync policy is read with the global fetch by default, and a cloud that cannot answer it is still synced', async () => {
+  const seen: string[] = [];
+  vi.stubGlobal('fetch', async (url: string) => { seen.push(url); return url.endsWith('/sync-policy') ? new Response(null, { status: 404 }) : Response.json(ok); });
+  try {
+    expect((await runCloudSync({ cloud, portability: store({ shop: bundle('shop') }), projects: async () => ['shop'], trigger: 'schedule', sleep: noSleep })).ok).toBe(true);
+  } finally {
+    vi.unstubAllGlobals();
+  }
+  expect(seen).toEqual(['https://cloud.example.com/api/v1/sync-policy', 'https://cloud.example.com/api/v1/sync']);
+  // The policy request fails outright (an older or offline cloud): the sync itself still runs.
+  const f = (async (url: string) => {
+    if (url.endsWith('/sync-policy')) throw new TypeError('fetch failed');
+    return Response.json(ok);
+  }) as unknown as typeof fetch;
+  expect((await runCloudSync({ cloud, portability: store({ shop: bundle('shop') }), projects: async () => ['shop'], trigger: 'schedule', fetch: f, sleep: noSleep })).projects[0].status).toBe('sent');
+});
+
+test('a store that fails to keep the record fails that project (sent, or withdrawn) with its error, and the run goes on', async () => {
+  const rec = { fingerprint: 'x', remote: null, lessons: ['lesson:9'], misses: [], docs: [], files: [] };
+  const records = new Map<string, typeof rec>([['old', rec]]);
+  const memory = {
+    get: (k: string) => records.get(k),
+    set: async () => { throw new Error('store down'); },
+    delete: async () => { throw new Error('store down'); },
+    keys: () => records.keys(),
+  };
+  const r = await runCloudSync({ cloud, portability: store({ shop: bundle('shop') }), projects: async () => ['shop'], trigger: 'schedule', fetch: fakeFetch([]).f, sleep: noSleep, memory });
+  expect(r.projects).toEqual([
+    expect.objectContaining({ key: 'shop', status: 'failed', error: 'Error: store down' }),
+    expect.objectContaining({ key: 'old', status: 'failed', error: 'withdrawing it: Error: store down' }),
+  ]);
+  expect(r.stopped).toBe(false);
+});
+
+test('a revoked token stops the withdrawals too: one stopped by it, none after it', async () => {
+  const rec = { fingerprint: 'x', remote: null, lessons: ['lesson:9'], misses: [], docs: [], files: [] };
+  const revoked = () => new Response('{"error":"token revoked"}', { status: 401 });
+  // Revoked while sending a listed project: nothing is withdrawn.
+  const first = fakeFetch([revoked()]);
+  const memory = new Map([['a', rec], ['b', rec]]);
+  const r = await runCloudSync({ cloud, portability: store({ shop: bundle('shop') }), projects: async () => ['shop'], trigger: 'schedule', fetch: first.f, sleep: noSleep, memory });
+  expect(first.calls).toHaveLength(1);
+  expect(r.projects.map((p) => [p.key, p.status])).toEqual([['shop', 'failed']]);
+  // Revoked while withdrawing the first one: the second is not tried.
+  const second = fakeFetch([revoked()]);
+  const r2 = await runCloudSync({ cloud, portability: store({}), projects: async () => [], trigger: 'schedule', fetch: second.f, sleep: noSleep, memory });
+  expect(second.calls).toHaveLength(1);
+  expect(r2.projects.map((p) => [p.key, p.status])).toEqual([['a', 'failed']]);
+  expect(r2.stopped).toBe(true);
+});
+
+test('a run that only failed and withdrew says it sent nothing', async () => {
+  const activity = activityLog();
+  const memory = new Map([['old', { fingerprint: 'x', remote: null, lessons: ['lesson:9'], misses: [], docs: [], files: [] }]]);
+  const { f } = fakeFetch([Response.json({ error: 'bad bundle' }, { status: 422 })]);
+  await runCloudSync({ cloud, portability: store({ shop: bundle('shop') }), activity, projects: async () => ['shop'], trigger: 'schedule', fetch: f, sleep: noSleep, memory });
+  expect(activity.rows[0].subject).toMatch(/^1 of 2 projects failed to sync to cloud\.example\.com; sent nothing \(0 lessons, 0 misses, 0 facts, 0 docs\); took old back out/);
+});
+
+test('the last-run journal skips a damaged entry and keeps only the newest few per trigger', async () => {
+  const docs = cursors();
+  const memory = storedSyncMemory(docs, cloud);
+  const result = (minute: number) => ({ at: `2026-11-10T12:0${minute}:00.000Z`, trigger: 'schedule' as const, host: 'cloud.example.com', ok: true, sent: { projects: 0, lessons: 0, misses: 0, facts: 0, docs: 0, codeFiles: 0 }, projects: [], error: null, stopped: false });
+  for (const minute of [1, 2, 3, 4, 5, 6]) await memory.recordLast!(result(minute));
+  const journal = [...docs.m.keys()].filter((k) => k.startsWith(`${syncMemoryCursor(cloud)}:last/schedule/`));
+  expect(journal).toHaveLength(4);
+  expect((await memory.last!())?.at).toBe('2026-11-10T12:06:00.000Z');
+  docs.m.set(`${syncMemoryCursor(cloud)}:last/schedule/2026-11-10T13:00:00.000Z/0`, '{damaged');
+  expect((await memory.last!('schedule'))?.at).toBe('2026-11-10T12:06:00.000Z');
+});
+
+test("a lesson's triggers go with it, so the team's agents get it by the same files and code names; none, no key", async () => {
+  const triggers = { paths: ['src/checkout/*.ts'], patterns: ['CREATE\\s+INDEX'], symbols: ['CHECKOUT_TIMEOUT'] };
+  const b = bundle();
+  const withTriggers = { ...b, lessons: b.lessons.map((l) => (l.id === 'lesson:1' ? { ...l, triggers } : l)) };
+  const sent = await syncBundle(store({ shop: withTriggers }), 'shop');
+  expect(sent!.lessons.find((l) => l.id === 'lesson:1')).toMatchObject({ triggers });
+  expect((await syncBundle(store({ shop: bundle() }), 'shop'))!.lessons[0]).not.toHaveProperty('triggers');
 });

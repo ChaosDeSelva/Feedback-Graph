@@ -1,14 +1,16 @@
+import { asIs, labelOf } from './labels.ts';
 import { useEffect, useRef, useState, type FormEvent, type KeyboardEvent, type ReactNode } from 'react';
-import { api, type ProjectSummary } from './api.ts';
+import { api, type ProjectSummary, errorMessage } from './api.ts';
 import { CHAT_PROVIDERS, type ChatConversation, type ChatProvider, type ChatSource, type ChatThread, type ChatTurn } from '@fb/core/chat';
 import { chatHref, hashFocus, hashNewChat, moduleHref, sourceHref } from './links.ts';
 import { askConfirm } from './ui/ConfirmDialog.tsx';
 import { PageHeader } from './ui/PageHeader.tsx';
 import { ListRow, SplitPane } from './ui/SplitPane.tsx';
-import { Button, buttonClass, CopyButton, Select, Textarea } from './ui/controls.tsx';
+import { Button, buttonClass, CopyButton, Select, Textarea, useFocusHandoff, usePending } from './ui/controls.tsx';
 import { Alert, Badge, Card, EmptyState, Kbd, SectionLabel, plural, SkeletonDetail, SkeletonList, Time, type Tone } from './ui/display.tsx';
 import { AskIcon, TrashIcon } from './ui/icons.tsx';
 import { Markdown } from './ui/Markdown.tsx';
+import { ScrollArea } from './ui/ScrollArea.tsx';
 
 /** How often an open conversation is fetched again while its answer is being written. */
 const MAX_POLL_FAILURES = 5;
@@ -22,7 +24,6 @@ const TITLE_MAX = 60;
 const PROVIDER_LABEL: Record<ChatProvider, string> = { claude: 'Claude', codex: 'Codex', local: 'Local model' };
 const SOURCE_TONE: Record<ChatSource['kind'], Tone> = { lesson: 'ok', miss: 'bad', fact: 'accent', code: 'info', doc: 'neutral', session: 'neutral', linked: 'neutral' };
 
-const message = (e: unknown) => (e instanceof Error ? e.message : String(e));
 const isPending = (t: ChatTurn) => t.status === 'pending' || t.status === 'answering';
 const threadPending = (t: ChatThread | null) => !!t && (t.pending || t.turns.some(isPending));
 /** "Claude" for claude / claude-cli, "Codex" for codex / codex-cli; any other provider id as it is. */
@@ -35,7 +36,7 @@ function providerName(turnProvider: string | null, chosen: ChatProvider | null):
   return p;
 }
 /** Latest message first, as the server sorts them; the page re-sorts after its own sends without waiting for it. */
-const byRecent = (cs: ChatConversation[]) => [...cs].sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt) || (a.id < b.id ? 1 : a.id > b.id ? -1 : 0));
+const byRecent = (cs: ChatConversation[]) => [...cs].sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt) || (a.id < b.id ? 1 : -1));
 /** The conversation a link opened the page on (`#ask/<id>`), never the `#ask/new?…` form. */
 const linkedConversation = () => (hashNewChat() ? null : hashFocus('ask'));
 /** Writes the address without a history entry, so Back never re-runs a `#ask/new` link. */
@@ -69,7 +70,7 @@ export function Chat() {
   const holdOpen = useRef(!!hashNewChat());
 
   useEffect(() => {
-    api.projects().then((ps) => setProjects([...ps].sort((a, b) => Number(!!b.pinned) - Number(!!a.pinned))), (e) => { setError(message(e)); setProjects([]); });
+    api.projects().then((ps) => setProjects([...ps].sort((a, b) => Number(!!b.pinned) - Number(!!a.pinned))), (e) => { setError(errorMessage(e)); setProjects([]); });
   }, []);
 
   useEffect(() => {
@@ -79,7 +80,7 @@ export function Chat() {
       setConvs(byRecent(cs));
       // Wider screens open the newest conversation, unless a link or a new chat is on the way.
       setSelected((cur) => cur ?? (holdOpen.current ? null : cs[0]?.id ?? null));
-    }, (e) => { if (!stale) { setError(message(e)); setConvs([]); } });
+    }, (e) => { if (!stale) { setError(errorMessage(e)); setConvs([]); } });
     return () => { stale = true; };
   }, [project, listTick]);
 
@@ -97,7 +98,7 @@ export function Chat() {
     if (threadRef.current?.id === selected) return;
     setThread(null);
     let stale = false;
-    api.chat(selected).then((t) => { if (!stale) setThread(t); }, (e) => { if (!stale) setError(message(e)); });
+    api.chat(selected).then((t) => { if (!stale) setThread(t); }, (e) => { if (!stale) setError(errorMessage(e)); });
     return () => { stale = true; };
   }, [selected]);
 
@@ -117,7 +118,7 @@ export function Chat() {
       }, (e) => {
         if (threadRef.current?.id !== id) return;
         if (++pollFailures.current < MAX_POLL_FAILURES) return setPollTick((n) => n + 1);
-        setError(`Stopped checking for the answer: ${message(e)}. Reload the page to look again.`);
+        setError(`Stopped checking for the answer: ${errorMessage(e)}. Reload the page to look again.`);
       });
     }, POLL_MS);
     return () => clearTimeout(t);
@@ -157,7 +158,8 @@ export function Chat() {
   }
 
   function newChat() {
-    const p = project || projects?.[0]?.key || '';
+    // The button is enabled only once there is a project to ask about.
+    const p = project || projects![0].key;
     holdOpen.current = true;
     setDraft({ project: p, provider: '' });
     setSelected(null);
@@ -179,7 +181,7 @@ export function Chat() {
       setThread(t);
       setText('');
     } catch (e) {
-      setError(message(e));
+      setError(errorMessage(e));
       setText(question);
     } finally {
       setSending(false);
@@ -194,12 +196,12 @@ export function Chat() {
     }
   }
 
+  /** A follow-up in the open conversation (the form is shown only with one open). */
   async function send(question: string) {
-    if (!thread) return;
     setSending(true);
     setError(null);
     try {
-      const next = await api.sendChat(thread.id, question);
+      const next = await api.sendChat(thread!.id, question);
       setThread(next);
       setText('');
       // It has the newest message now: to the top at once, then the list as the server has it.
@@ -207,7 +209,7 @@ export function Chat() {
       setConvs((cs) => cs && byRecent(cs.map((c) => (c.id === next.id ? { ...c, updatedAt: at, pending: true } : c))));
       setListTick((n) => n + 1);
     } catch (e) {
-      setError(message(e));
+      setError(errorMessage(e));
     } finally {
       setSending(false);
     }
@@ -217,53 +219,52 @@ export function Chat() {
     e?.preventDefault();
     const q = text.trim();
     if (!q || sending) return;
-    if (draft) {
-      if (!draft.project) return setError('Pick the project to ask about.');
-      void start(draft.project, draft.provider || null, q);
-    } else void send(q);
+    if (draft) void start(draft.project, draft.provider || null, q);
+    else void send(q);
   }
 
-  async function retry(turn: ChatTurn) {
-    if (!thread) return;
+  // A retry or a delete in flight: its button says so and a second press sends nothing.
+  const [acting, runAction] = usePending<'retry' | 'delete'>();
+  const retry = (turn: ChatTurn) => runAction('retry', async () => {
     setError(null);
     try {
-      setThread(await api.retryChatTurn(thread.id, turn.id));
+      setThread(await api.retryChatTurn(thread!.id, turn.id));
     } catch (e) {
-      setError(message(e));
+      setError(errorMessage(e));
     }
-  }
+  });
 
   async function changeProvider(provider: ChatProvider | null) {
-    if (!thread) return;
     setError(null);
     try {
-      const c = await api.updateChat(thread.id, { provider });
+      const c = await api.updateChat(thread!.id, { provider });
       setThread((t) => (t && t.id === c.id ? { ...t, ...c } : t));
       setConvs((cs) => cs?.map((x) => (x.id === c.id ? c : x)) ?? cs);
     } catch (e) {
-      setError(message(e));
+      setError(errorMessage(e));
     }
   }
 
   async function remove() {
-    if (!thread) return;
+    const { id, title } = thread!;
     const ok = await askConfirm({
-      title: `Delete the conversation "${thread.title || 'New chat'}"?`,
+      title: `Delete the conversation "${title || 'New chat'}"?`,
       message: 'Its questions, answers and prompts are deleted. This cannot be undone.',
       confirmLabel: 'Delete conversation',
     });
     if (!ok) return;
-    try {
-      await api.deleteChat(thread.id);
-      const id = thread.id;
-      setConvs((cs) => cs?.filter((c) => c.id !== id) ?? cs);
-      setSelected(null);
-      setThread(null);
-      setOpen(false);
-      setAddress('#ask');
-    } catch (e) {
-      setError(message(e));
-    }
+    await runAction('delete', async () => {
+      try {
+        await api.deleteChat(id);
+        setConvs((cs) => cs?.filter((c) => c.id !== id) ?? cs);
+        setSelected(null);
+        setThread(null);
+        setOpen(false);
+        setAddress('#ask');
+      } catch (e) {
+        setError(errorMessage(e));
+      }
+    });
   }
 
   const noProjects = projects?.length === 0;
@@ -291,7 +292,7 @@ export function Chat() {
               <option value="">all projects</option>
               {projects?.map((p) => <option key={p.key} value={p.key}>{p.key}</option>)}
             </Select>
-            <Button variant="primary" onClick={newChat} disabled={!projects?.length}>New chat</Button>
+            <Button variant="primary" owner onClick={newChat} disabled={!projects?.length}>New chat</Button>
           </>
         }
       />
@@ -336,7 +337,6 @@ export function Chat() {
               <SectionLabel as="h2">New chat</SectionLabel>
               <div className="flex flex-wrap items-center gap-2">
                 <Select aria-label="chat project" value={draft.project} onChange={(e) => setDraft({ ...draft, project: e.target.value })} className="w-48">
-                  {!draft.project && <option value="">pick a project</option>}
                   {projects?.map((p) => <option key={p.key} value={p.key}>{p.key}</option>)}
                 </Select>
                 <ProviderSelect label="chat provider" value={draft.provider || null} onChange={(p) => setDraft({ ...draft, provider: p ?? '' })} />
@@ -359,14 +359,14 @@ export function Chat() {
                 <h2 className="min-w-0 flex-1 basis-48 truncate text-[15px] font-semibold">{thread.title || 'New chat'}</h2>
                 <Badge>{thread.projectKey}</Badge>
                 <ProviderSelect label="provider" value={thread.provider} onChange={changeProvider} />
-                <Button size="sm" variant="ghost" aria-label="delete conversation" title="Delete this conversation" onClick={remove}>
+                <Button size="sm" variant="ghost" owner busy={!!acting} aria-label={acting === 'delete' ? 'deleting conversation' : 'delete conversation'} title="Delete this conversation" onClick={() => void remove()}>
                   <TrashIcon size={13} />
                 </Button>
               </header>
               <ol aria-label="conversation" className="grid gap-4">
                 {thread.turns.map((t) => (
                   <li key={t.id}>
-                    {t.role === 'user' ? <UserTurn turn={t} /> : <AssistantTurn turn={t} thread={thread} onRetry={() => retry(t)} />}
+                    {t.role === 'user' ? <UserTurn turn={t} /> : <AssistantTurn turn={t} thread={thread} retrying={acting === 'retry'} onRetry={() => void retry(t)} />}
                   </li>
                 ))}
               </ol>
@@ -408,7 +408,7 @@ function Composer({ text, onText, onSubmit, busy, disabled, placeholder }: {
         onChange={(e) => onText(e.target.value)} onKeyDown={onKeyDown} className="w-full resize-y" />
       <div className="flex items-center justify-end gap-2">
         <span className="hidden text-xs text-muted sm:inline-flex sm:items-center sm:gap-1"><Kbd>⌘</Kbd>/<Kbd>Ctrl</Kbd>+<Kbd>Enter</Kbd> to send</span>
-        <Button type="submit" variant="primary" disabled={busy || disabled || !text.trim()}>{busy ? 'Sending…' : 'Send'}</Button>
+        <Button type="submit" variant="primary" owner disabled={busy || disabled || !text.trim()}>{busy ? 'Sending…' : 'Send'}</Button>
       </div>
     </div>
   );
@@ -423,17 +423,20 @@ function UserTurn({ turn }: { turn: ChatTurn }) {
   );
 }
 
-function AssistantTurn({ turn, thread, onRetry }: { turn: ChatTurn; thread: ChatThread; onRetry: () => void }) {
+function AssistantTurn({ turn, thread, retrying, onRetry }: { turn: ChatTurn; thread: ChatThread; retrying: boolean; onRetry: () => void }) {
   const who = providerName(turn.provider, thread.provider);
+  const retryHandoff = useFocusHandoff();
   if (isPending(turn)) {
     // The worker counts the questions ahead of a waiting one in its model's line (other models answer meanwhile).
     const ahead = turn.status === 'pending' ? (turn.queueAhead ?? 0) : 0;
     return (
-      <div role="status" className="flex items-center gap-2 rounded-md border border-line bg-surface px-3 py-2 text-muted">
+      // Only the words are a live region: the clock ticks every second and would be read out each time.
+      <div className="flex items-center gap-2 rounded-md border border-line bg-surface px-3 py-2 text-muted">
         <span aria-hidden="true" className="size-2 animate-pulse rounded-full bg-info" />
-        {ahead > 0
-          ? <span>Waiting for {who}: {ahead} {ahead === 1 ? 'question' : 'questions'} ahead of this one… <Elapsed since={turn.createdAt} /></span>
-          : <span>Answering with {who}… <Elapsed since={turn.startedAt ?? turn.createdAt} /></span>}
+        <span>
+          <span role="status">{ahead > 0 ? `Waiting for ${who}: ${ahead} ${ahead === 1 ? 'question' : 'questions'} ahead of this one…` : `Answering with ${who}…`}</span>{' '}
+          <Elapsed since={ahead > 0 ? turn.createdAt : turn.startedAt ?? turn.createdAt} />
+        </span>
       </div>
     );
   }
@@ -441,12 +444,12 @@ function AssistantTurn({ turn, thread, onRetry }: { turn: ChatTurn; thread: Chat
     return (
       <Alert className="flex flex-wrap items-center justify-between gap-2">
         <span className="min-w-0 flex-1 [overflow-wrap:anywhere]">{who} could not answer: {turn.error ?? 'unknown error'}</span>
-        <Button size="sm" onClick={onRetry}>Retry</Button>
+        <Button ref={retryHandoff} size="sm" owner busy={retrying} onClick={onRetry}>{retrying ? 'Retrying…' : 'Retry'}</Button>
       </Alert>
     );
   }
-  const a = turn.answer;
-  if (!a) return null;
+  // A done answer always carries its answer (the worker writes both together).
+  const a = turn.answer!;
   return (
     <div className="grid gap-3">
       <div className="rounded-md border border-line bg-surface px-3 py-2.5 shadow-card">
@@ -482,7 +485,7 @@ function AssistantTurn({ turn, thread, onRetry }: { turn: ChatTurn; thread: Chat
       {a.prompt && (
         <Card title="Prompt for your agent" actions={<CopyButton text={a.prompt} />} bodyClass="p-3">
           <p className="mb-2 text-xs text-muted">Paste it into Claude Code or Codex in this project.</p>
-          <pre className="max-h-80 overflow-auto rounded-sm border border-line bg-sunken px-2.5 py-2 font-mono text-xs leading-relaxed whitespace-pre-wrap [overflow-wrap:anywhere]">{a.prompt}</pre>
+          <ScrollArea as="pre" className="max-h-80 overflow-auto rounded-sm border border-line bg-sunken px-2.5 py-2 font-mono text-xs leading-relaxed whitespace-pre-wrap [overflow-wrap:anywhere]">{a.prompt}</ScrollArea>
         </Card>
       )}
     </div>
@@ -501,7 +504,7 @@ function Sources({ project, sources }: { project: string; sources: ChatSource[] 
         {sources.map((s) => (
           <li key={s.id} className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5">
             <span className="font-mono text-xs font-semibold">{s.id}</span>
-            <Badge tone={SOURCE_TONE[s.kind] ?? 'neutral'}>{s.kind}</Badge>
+            <Badge tone={labelOf(SOURCE_TONE, s.kind, () => 'neutral')}>{s.kind}</Badge>
             {(() => {
               const href = sourceHref(project, s);
               return href

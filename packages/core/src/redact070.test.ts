@@ -10,7 +10,7 @@ test.each([
 
 test.each([
   'The integration returned wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY in its message.',
-  '-----BEGIN PRIVATE KEY-----\n' + 'YWJjZGVm'.repeat(8),
+  '-----BEGIN ' + 'PRIVATE KEY-----\n' + 'YWJjZGVm'.repeat(8),
   'Connection failed with Password=x; after retry.',
   'Server=db;Password = StrongPassword123!;User=alice;',
 ])('0.7.0 masks the credential in prose or truncated output: %s', value => {

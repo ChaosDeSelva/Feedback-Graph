@@ -265,7 +265,7 @@ test('mapIncomplete: a map from older map rules, or one that never counted its u
   expect(mapIncomplete(null)).toBe(false);
 });
 
-test('outsideMap and impact: a file past the cap is in the import index, with its importers; impact starts from it', async () => {
+test('moduleContext and impact: a file past the cap is in the import index, with its importers and tests; impact starts from it', async () => {
   const outside = [{ ...mf('src/utils/logging.ts'), churn: null }, { ...mf('src/b.test.ts', true), churn: null }];
   const importers: Record<string, string[]> = { 'src/utils/logging.ts': ['src/a.ts', 'src/b.ts', 'src/b.test.ts'], 'src/a.ts': ['src/main.ts'] };
   const reads: CodeGraphReads = {
@@ -274,9 +274,11 @@ test('outsideMap and impact: a file past the cap is in the import index, with it
     importersOf: async (_k, paths) => new Map(paths.map((p) => [p, importers[p] ?? []])),
   };
   const v = codeGraphViews(reads);
-  expect(await v.outsideMap('demo', ['src/utils/logging.ts', 'src/a.ts', 'src/nowhere.ts'])).toEqual([
-    { path: 'src/utils/logging.ts', importers: ['src/a.ts', 'src/b.test.ts', 'src/b.ts'], tests: ['src/b.test.ts'] },
-  ]);
+  const m = (await v.moduleContext('demo', 'src/utils/logging.ts'))!;
+  expect(m).toMatchObject({ outside: true, symbols: [], importers: ['src/a.ts', 'src/b.test.ts', 'src/b.ts'], tests: ['src/b.test.ts'] });
+  expect(m.file.path).toBe('src/utils/logging.ts');
+  expect((await v.moduleContext('demo', 'src/a.ts'))!.outside).toBeUndefined();
+  expect(await v.moduleContext('demo', 'src/nowhere.ts')).toBeNull();
   const i = await v.impact('demo', ['src/utils/logging.ts', 'src/nowhere.ts'], 2);
   expect(i.paths).toEqual(['src/utils/logging.ts']);
   expect(i.dependents.map((d) => d.path)).toEqual(['src/a.ts', 'src/b.test.ts', 'src/b.ts', 'src/main.ts']);
@@ -309,4 +311,32 @@ test('impact and moduleContext give the tests nearest the change first, not in p
   expect((await v.moduleContext('demo', 'src/core.ts'))!.tests).toEqual(nearest);
   // a test file asked about is its own nearest test
   expect((await v.impact('demo', ['test/aa.test.ts', 'src/z.ts'], 1)).tests).toEqual(['test/aa.test.ts']);
+});
+
+test("a Go file's own package tests come first, before a hub's far tests that sort earlier by path; then exact import distance", async () => {
+  // orgs/org_1/population.go is in package org_1, which cmd/api imports; cmd/api/main_test.go tests that importer.
+  // The package's _test.go files import nothing of it (a package tests itself), so they reach it by TESTS edges only.
+  const target = 'orgs/org_1/population.go';
+  const files = [target, 'cmd/api/main.go', 'cmd/api/main_test.go', 'cmd/cli/run.go', 'cmd/cli/run_test.go', 'orgs/org_1/population_test.go', 'orgs/org_1/manifest_test.go'];
+  const importers: Record<string, string[]> = { [target]: ['cmd/api/main.go', 'cmd/api/main_test.go'], 'cmd/api/main.go': ['cmd/cli/run.go'] };
+  const covering: Record<string, string[]> = {
+    [target]: ['cmd/api/main_test.go', 'orgs/org_1/manifest_test.go', 'orgs/org_1/population_test.go'],
+    'cmd/api/main.go': ['cmd/api/main_test.go', 'cmd/cli/run_test.go'],
+    'cmd/cli/run.go': ['cmd/cli/run_test.go'],
+  };
+  const reads: CodeGraphReads = {
+    ...fakeReads([]),
+    mapFiles: async (_k, paths) => files.filter((p) => !paths || paths.includes(p)).map((p) => ({ ...mf(p, p.endsWith('_test.go')), churn: null })),
+    importersOf: async (_k, paths) => new Map(paths.map((p) => [p, importers[p] ?? []])),
+    testsOf: async (_k, paths) => [...new Set(paths.flatMap((p) => covering[p] ?? []))],
+  };
+  const v = codeGraphViews(reads);
+  const nearest = ['orgs/org_1/manifest_test.go', 'orgs/org_1/population_test.go', 'cmd/api/main_test.go', 'cmd/cli/run_test.go'];
+  expect((await v.moduleContext('demo', target))!.tests).toEqual(nearest);
+  expect((await v.impact('demo', [target], 3)).tests).toEqual(nearest);
+});
+
+test('repoRelative gives a path in NFC, as the code map stores it, for an NFD file or repo path', () => {
+  expect(repoRelative('/h/vibe/demo/src/café.ts'.normalize('NFD'), '/h/vibe/demo')).toBe('src/café.ts');
+  expect(repoRelative('src/menü.ts'.normalize('NFD'), '/h/vibe/demo')).toBe('src/menü.ts');
 });

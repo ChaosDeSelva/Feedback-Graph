@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { cloudUrlProblem, VERSION, type CloudConfig } from './config.ts';
 import { EXPORT_FORMAT, type ExportBundle } from './graph/portability.ts';
+import { shapedTriggers } from './lessonTriggers.ts';
 import { redactDeep, redactSecrets } from './redact.ts';
 import type { ActivityStore, DocsStore, PortabilityStore } from './store.ts';
 
@@ -11,7 +12,8 @@ import type { ActivityStore, DocsStore, PortabilityStore } from './store.ts';
  * current facts, doc titles and links, project remotes and code-map hotspot numbers. Never transcripts, source or
  * vectors.
  *
- * Nothing is shared without your approval: by default a bundle carries the lessons you approved, plus the current
+ * Nothing is shared until it is approved, by you or the learning loop (a loop change is held back first: syncHold.ts).
+ * By default a bundle carries the approved lessons, plus the current
  * status of any lesson the cloud already received (so a revoke, a supersede or a move back to proposed demotes the team
  * copy). A lesson you never approved is sent only with SYNC_SUGGESTIONS=true (proposed ones then arrive as suggestions
  * for an admin).
@@ -220,7 +222,7 @@ export const bundleCounts = (b: ExportBundle): SyncCounts => ({
   misses: b.misses.length,
   facts: b.facts.length,
   docs: b.docs.length,
-  codeFiles: b.codeFiles?.length ?? 0,
+  codeFiles: b.codeFiles.length,
 });
 
 /** Which lessons a bundle carries: `suggestions` is SYNC_SUGGESTIONS. */
@@ -236,7 +238,7 @@ export async function syncBundle(p: Pick<PortabilityStore, 'exportData'>, projec
   const b = await p.exportData({ projectKey, approvedOnly: false });
   const received = new Set(previous?.lessons ?? []);
   const shared = (l: { id: string; status: string }) => l.status === 'approved' || received.has(l.id) || !!o.suggestions;
-  if (!b.projects.length && !b.lessons.length && !b.misses.length && !b.facts.length && !b.docs.length && !b.codeFiles?.length) return null;
+  if (!b.projects.length && !b.lessons.length && !b.misses.length && !b.facts.length && !b.docs.length && !b.codeFiles.length) return null;
   const out: SyncBundle = {
     format: b.format,
     schemaVersion: b.schemaVersion,
@@ -250,6 +252,9 @@ export async function syncBundle(p: Pick<PortabilityStore, 'exportData'>, projec
       .filter((l) => LESSON_STATUSES.has(l.status) && shared(l) && !l.checks?.some((c) => c.name === 'no-miss'))
       .map((l) => ({
         id: l.id, projectKey: l.projectKey, title: l.title, rule: l.rule, appliesWhen: l.appliesWhen, scope: l.scope, paths: [...l.paths],
+        // What in a change shows it applies: path globs, added-line patterns and code names, no text of the miss.
+        // Only the ones a trigger may be (triggerShapeProblem): a teammate's install matches what it receives on every call.
+        ...(l.triggers ? { triggers: shapedTriggers(l.triggers) } : {}),
         status: l.status, source: l.source, ...(l.checks?.some(check => check.name === 'source-pr-unmerged') ? { checks: [{ name: 'source-pr-unmerged' as const, why: 'The source pull request was closed without merging.' }] } : {}), cause: l.cause, missId: l.missId, createdAt: l.createdAt, decidedAt: l.decidedAt,
       })),
     // The quoted feedback is transcript text and excerpts can be source or document text: both stay home.
@@ -261,7 +266,7 @@ export async function syncBundle(p: Pick<PortabilityStore, 'exportData'>, projec
       path: f.path, lines: f.lines, kind: f.kind, statement: f.statement, why: f.why, confidence: f.confidence, source: f.source, createdAt: f.createdAt, projectKey: f.projectKey,
     })),
     docs: b.docs.map((d) => ({ id: d.id, projectKey: d.projectKey, source: d.source, ref: d.ref, title: d.title, url: d.url })),
-    codeFiles: (b.codeFiles ?? []).map((c) => ({
+    codeFiles: b.codeFiles.map((c) => ({
       projectKey: c.projectKey, path: c.path, lang: c.lang, loc: c.loc, isTest: c.isTest, churn: c.churn, misses: c.misses, dependents: c.dependents, score: c.score,
     })),
     complete: b.projectKey === projectKey,
@@ -277,8 +282,8 @@ export async function syncBundle(p: Pick<PortabilityStore, 'exportData'>, projec
   // Export deliberately strips sandbox/demo records and unapproved suggestions. Metadata alone must not
   // create a personal/team cloud project for a corpus whose entire contents stayed local. A prior send is
   // handled by runCloudSync's tombstone path, including clearing a previously exported code map.
-  if (!out.lessons.length && !out.misses.length && !out.facts.length && !out.docs.length && !out.codeFiles?.length) return null;
-  out.withdrawn = previous ? withdrawnSince(previous, out) : [];
+  if (!out.lessons.length && !out.misses.length && !out.facts.length && !out.docs.length && !out.codeFiles.length) return null;
+  out.withdrawn = previous ? withdrawnSince(previous, out, projectKey) : [];
   // Stored text was redacted on the way in; this catches anything stored before a pattern existed.
   return redactDeep(out);
 }
@@ -288,7 +293,7 @@ const LESSON_STATUSES = new Set(['proposed', 'approved', 'rejected', 'revoked', 
 const factFiles = (b: ExportBundle) => [...new Set(b.facts.map((f) => f.path))];
 
 /** What the cloud last had and this bundle no longer names. */
-export function withdrawnSince(previous: SentRecord, b: Pick<SyncBundle, 'projectKey' | 'lessons' | 'misses' | 'docs' | 'facts'>): WithdrawnItem[] {
+export function withdrawnSince(previous: SentRecord, b: Pick<SyncBundle, 'lessons' | 'misses' | 'docs' | 'facts'>, projectKey: string): WithdrawnItem[] {
   const gone = (before: string[], now: string[]) => {
     const keep = new Set(now);
     return before.filter((x) => !keep.has(x));
@@ -297,7 +302,7 @@ export function withdrawnSince(previous: SentRecord, b: Pick<SyncBundle, 'projec
     ...gone(previous.lessons, b.lessons.map((l) => l.id)).map((id) => ({ kind: 'lesson' as const, id })),
     ...gone(previous.misses, b.misses.map((m) => m.id)).map((id) => ({ kind: 'miss' as const, id })),
     ...gone(previous.docs, b.docs.map((d) => d.id)).map((id) => ({ kind: 'doc' as const, id })),
-    ...gone(previous.files, factFiles(b as ExportBundle)).map((id) => ({ kind: 'file' as const, id, projectKey: b.projectKey ?? '' })),
+    ...gone(previous.files, factFiles(b as ExportBundle)).map((id) => ({ kind: 'file' as const, id, projectKey })),
   ];
 }
 
@@ -311,7 +316,7 @@ function tombstone(key: string, previous: SentRecord): SyncBundle {
     ...empty,
     codeFiles: [],
     complete: true,
-    withdrawn: withdrawnSince(previous, empty),
+    withdrawn: withdrawnSince(previous, empty, key),
   };
 }
 
@@ -430,8 +435,7 @@ export async function pushBundle(o: {
   const body = JSON.stringify(o.bundle);
   const bytes = Buffer.byteLength(body);
   const url = `${o.cloud.url.replace(/\/+$/, '')}/api/v1/sync`;
-  let last: CloudSyncError | null = null;
-  for (let attempt = 1; attempt <= attempts; attempt++) {
+  for (let attempt = 1; ; attempt++) {
     let res: Response;
     try {
       res = await doFetch(url, {
@@ -447,8 +451,8 @@ export async function pushBundle(o: {
         signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
       });
     } catch (err) {
-      last = new CloudSyncError(`could not reach the cloud: ${(err as Error).message ?? String(err)}`, 0, true);
-      if (attempt < attempts) await sleep(base * 2 ** (attempt - 1));
+      if (attempt === attempts) throw new CloudSyncError(`could not reach the cloud: ${(err as Error).message}`, 0, true);
+      await sleep(base * 2 ** (attempt - 1));
       continue;
     }
     if (res.ok) {
@@ -467,18 +471,14 @@ export async function pushBundle(o: {
       /* not JSON */
     }
     const retryable = res.status === 429 || res.status >= 500;
-    last = new CloudSyncError(explain(res.status, serverError, bytes), res.status, retryable, res.status === 413 ? limitOf(serverError) : null, features);
-    if (!retryable) throw last;
-    if (attempt < attempts) {
-      const after = retryAfterMs(res.headers.get('retry-after'));
-      // Never sooner than the cloud asked; a wait longer than we hold a run for fails this project until the next sync.
-      if (after !== null && after > RETRY_AFTER_CAP_MS) {
-        throw new CloudSyncError(`${explain(res.status, serverError, bytes)}; it asked to retry after ${Math.ceil(after / 1000)} s`, res.status, true);
-      }
-      await sleep(after ?? base * 2 ** (attempt - 1));
+    if (!retryable || attempt === attempts) throw new CloudSyncError(explain(res.status, serverError, bytes), res.status, retryable, res.status === 413 ? limitOf(serverError) : null, features);
+    const after = retryAfterMs(res.headers.get('retry-after'));
+    // Never sooner than the cloud asked; a wait longer than we hold a run for fails this project until the next sync.
+    if (after !== null && after > RETRY_AFTER_CAP_MS) {
+      throw new CloudSyncError(`${explain(res.status, serverError, bytes)}; it asked to retry after ${Math.ceil(after / 1000)} s`, res.status, true);
     }
+    await sleep(after ?? base * 2 ** (attempt - 1));
   }
-  throw last ?? new CloudSyncError('sync failed', 0);
 }
 
 /**
@@ -492,7 +492,9 @@ export function syncProjects(o: { configured: string[]; selected: string[]; excl
 }
 
 /** Rows in a fixed order (by their own JSON, compared by code unit): the same rows read in another order are one form. */
-const sorted = <T>(rows: T[]) => rows.map((r) => [JSON.stringify(r), r] as const).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)).map(([, r]) => r);
+/** Strings by code unit, not by locale: the same on every machine. */
+const byCodeUnit = (a: string, b: string) => (a < b ? -1 : a > b ? 1 : 0);
+const sorted = <T>(rows: T[]) => rows.map((r) => [JSON.stringify(r), r] as const).sort(([a], [b]) => byCodeUnit(a, b)).map(([, r]) => r);
 
 /**
  * What identifies a bundle's content, for the unchanged skip: hashed over a canonical form (every list sorted, the
@@ -509,7 +511,7 @@ const fingerprint = (b: SyncBundle, legacyVersion?: string) => createHash('sha25
   misses: sorted(b.misses.map((m) => ({ ...m, contextItems: sorted(m.contextItems) }))),
   facts: sorted(b.facts),
   docs: sorted(b.docs),
-  codeFiles: sorted(b.codeFiles ?? []),
+  codeFiles: sorted(b.codeFiles),
 })).digest('hex');
 const list = (keys: string[]) => keys.join(', ');
 const plural = (n: number, w: string, many = `${w}s`) => `${n} ${n === 1 ? w : many}`;
@@ -523,7 +525,7 @@ const bytesOf = (b: SyncBundle) => Buffer.byteLength(JSON.stringify(b));
 export function fitCodeFiles(b: SyncBundle, maxBytes: number): SyncBundle {
   let room = maxBytes - bytesOf({ ...b, codeFiles: [] });
   const keep = new Set<ExportBundle['codeFiles'][number]>();
-  const hottest = [...b.codeFiles].sort((x, y) => y.score - x.score || (x.path < y.path ? -1 : x.path > y.path ? 1 : 0));
+  const hottest = [...b.codeFiles].sort((x, y) => y.score - x.score || byCodeUnit(x.path, y.path));
   for (const c of hottest) {
     const size = Buffer.byteLength(JSON.stringify(c)) + 1;
     if (size > room) break;
@@ -560,20 +562,20 @@ async function pushFitting(bundle: SyncBundle, push: (b: SyncBundle) => Promise<
       );
     }
     const full = bytesOf(bundle);
-    let budget = Math.floor(err.limit !== null ? err.limit * 0.95 : full / 2);
-    let limit = err.limit;
-    for (let attempt = 0; attempt < 3; attempt++) {
-      const fit = { ...(attempt === 2 ? { ...bundle, codeFiles: [] } : fitCodeFiles(bundle, budget)), codeFilesPartial: true };
-      try {
-        return { r: await push(fit), trimmed: { codeFiles: { sent: fit.codeFiles.length, of: bundle.codeFiles.length } } };
-      } catch (again) {
-        if (!(again instanceof CloudSyncError) || again.status !== 413) throw again;
-        limit = again.limit ?? limit;
-        if (!fit.codeFiles.length) throw new CloudSyncError(tooLarge(bytesOf(fit), limit, 'the bundle, even without its code map,'), 413, false, limit);
-        budget = Math.floor(budget / 2);
-      }
-    }
-    throw err;
+    return pushCut(bundle, push, Math.floor(err.limit !== null ? err.limit * 0.95 : full / 2), err.limit);
+  }
+}
+
+/** pushFitting's cuts: to `budget`, then half that, then no code map; the third is sent or fails with what to do. */
+async function pushCut(bundle: SyncBundle, push: (b: SyncBundle) => Promise<SyncResponse>, budget: number, limit: number | null, attempt = 0): Promise<{ r: SyncResponse; trimmed: ProjectSyncResult['trimmed'] }> {
+  const fit = { ...(attempt === 2 ? { ...bundle, codeFiles: [] } : fitCodeFiles(bundle, budget)), codeFilesPartial: true };
+  try {
+    return { r: await push(fit), trimmed: { codeFiles: { sent: fit.codeFiles.length, of: bundle.codeFiles.length } } };
+  } catch (again) {
+    if (!(again instanceof CloudSyncError) || again.status !== 413) throw again;
+    const named = again.limit ?? limit;
+    if (!fit.codeFiles.length) throw new CloudSyncError(tooLarge(bytesOf(fit), named, 'the bundle, even without its code map,'), 413, false, named);
+    return pushCut(bundle, push, Math.floor(budget / 2), named, attempt + 1);
   }
 }
 

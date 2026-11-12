@@ -42,14 +42,21 @@ function toNode(n: { labels: string[]; properties: Record<string, unknown> }): G
   return evidenceNode(KIND[n.labels.find((l) => l in KIND)!], n.properties);
 }
 
-const cosine = (a: number[], b: number[]) => {
-  let dot = 0, na = 0, nb = 0;
-  for (let i = 0; i < a.length; i++) { dot += a[i] * b[i]; na += a[i] * a[i]; nb += b[i] * b[i]; }
-  return dot / (Math.sqrt(na) * Math.sqrt(nb) || 1);
+/** v scaled to length 1 (a zero vector stays zero: its cosine with anything is 0). */
+function unitVector(v: number[]): Float64Array {
+  let n = 0;
+  for (const x of v) n += x * x;
+  const len = Math.sqrt(n) || 1;
+  return Float64Array.from(v, (x) => x / len);
+}
+const dot = (a: Float64Array, b: Float64Array) => {
+  let s = 0;
+  for (let i = 0; i < a.length; i++) s += a[i] * b[i];
+  return s;
 };
 
 /** ISO week, e.g. 2026-W41, matching GraphRepo.stats(). */
-function isoWeek(ts: string): string {
+export function isoWeek(ts: string): string {
   const d = new Date(ts.slice(0, 10) + 'T00:00:00Z');
   const day = (d.getUTCDay() + 6) % 7;
   d.setUTCDate(d.getUTCDate() - day + 3); // Thursday of this week decides the year
@@ -74,12 +81,15 @@ export type PatternRows = {
 
 /** Repeat groups and the weekly series, from the rows any backend reads. */
 export function patternReport(rows: PatternRows, threshold = REPEAT_SIMILARITY): PatternReport {
-  // Misses arrive in time order, so each one is a repeat when it matches any earlier miss.
+  // Misses arrive in time order, so each one is a repeat when it matches any earlier miss. Each embedding is scaled to
+  // unit length once, so a pair's cosine is one dot product over typed arrays (the pairs grow with the square).
   const misses = rows.misses;
+  const unit = misses.map((m) => unitVector(m.embedding));
   const groupOf: number[] = [];
   const groups: (typeof misses)[] = [];
   misses.forEach((m, i) => {
-    const earlier = misses.slice(0, i).findIndex((e) => cosine(e.embedding, m.embedding) >= threshold);
+    let earlier = -1;
+    for (let j = 0; j < i && earlier < 0; j++) if (dot(unit[j], unit[i]) >= threshold) earlier = j;
     if (earlier < 0) {
       groupOf[i] = groups.push([m]) - 1;
     } else {

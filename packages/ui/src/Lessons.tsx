@@ -1,17 +1,24 @@
-import { useEffect, useId, useState, type ReactNode } from 'react';
+import { asIs, labelOf } from './labels.ts';
+import { useEffect, useId, useRef, useState, type ReactNode } from 'react';
 import { ActivityEntry } from './Activity.tsx';
+import { LessonDecisions } from './Decisions.tsx';
+import { isLoopActor } from './loop.ts';
+import { READ_ONLY_TITLE, useOwnerWrites } from './ownerAccess.tsx';
 import { hashFocus, hashFilters, saveHashFilters } from './links.ts';
-import type { FactKind, LessonCheck, LessonCheckName, LessonFrom } from '@fb/core';
+import type { FactKind, LessonCheck, LessonCheckName, LessonFrom, LessonTriggers } from '@fb/core';
 import { FACT_KINDS, LESSON_CHECKS, LESSON_FROM } from '@fb/core/types';
 import { EVERYDAY_FROM } from '@fb/core/relevance';
-import { api, type Activity, type Lesson, type LessonDetail, type LessonEdit, type LessonQuality, type LessonQualityReport, type LessonStatus } from './api.ts';
+import { api, type Activity, type Lesson, type LessonDetail, type LessonEdit, type LessonQuality, type LessonQualityReport, type LessonStatus, errorMessage } from './api.ts';
 import { afterDiscard, useUnsavedChanges } from './unsaved.ts';
 import { ConfirmDialog } from './ui/ConfirmDialog.tsx';
+import { Modal } from './ui/Modal.tsx';
 import { PageHeader } from './ui/PageHeader.tsx';
 import { ListRow, SplitPane } from './ui/SplitPane.tsx';
-import { Button, Input, Select, Tabs, Textarea } from './ui/controls.tsx';
+import { Button, FilterBar, Input, Select, Tabs, Textarea, usePending } from './ui/controls.tsx';
 import { Alert, Badge, Card, CauseBadge, causeLabel, causeTone, EmptyState, plural, SectionLabel, SkeletonDetail, SkeletonList, StatusBadge, tableClass, tdClass, TONE_FILL } from './ui/display.tsx';
 import { LessonIcon } from './ui/icons.tsx';
+import { ScrollArea } from './ui/ScrollArea.tsx';
+import { rendered } from './ui/focus.ts';
 
 const TABS: LessonStatus[] = ['proposed', 'approved', 'rejected', 'revoked', 'superseded'];
 
@@ -20,7 +27,16 @@ const genericOf = (l: Lesson) => l.checks?.find((c) => c.name === 'generic');
 /** Generic lessons last (the rest keep their order): the owner reaches the concrete ones first. */
 const genericLast = (ls: Lesson[]) => [...ls.filter((l) => !genericOf(l)), ...ls.filter((l) => genericOf(l))];
 
-type Draft = Pick<Lesson, 'title' | 'rule' | 'appliesWhen' | 'scope'>;
+/** A lesson's triggers as edited: one per line in each box. */
+type TriggerText = { paths: string; patterns: string; symbols: string };
+const TRIGGER_KINDS = ['paths', 'patterns', 'symbols'] as const;
+const triggerText = (t: LessonTriggers | null | undefined): TriggerText => ({ paths: (t?.paths ?? []).join('\n'), patterns: (t?.patterns ?? []).join('\n'), symbols: (t?.symbols ?? []).join('\n') });
+const lines = (s: string) => s.split('\n').map((x) => x.trim()).filter(Boolean);
+const triggersOf = (t: TriggerText): LessonTriggers => ({ paths: lines(t.paths), patterns: lines(t.patterns), symbols: lines(t.symbols) });
+/** Whether the boxes say what the lesson has (blank lines and spaces aside). */
+const sameTriggers = (t: TriggerText, l: Lesson) => TRIGGER_KINDS.every((k) => triggersOf(t)[k].join('\n') === (l.triggers?.[k] ?? []).join('\n'));
+
+type Draft = Pick<Lesson, 'title' | 'rule' | 'appliesWhen' | 'scope'> & { triggers: TriggerText };
 
 const EMPTY: Record<LessonStatus, { title: string; children: string }> = {
   proposed: { title: 'No lessons to review', children: 'Each feedback item you confirm in the Inbox gets a post-mortem, and its proposed lesson waits here.' },
@@ -53,20 +69,24 @@ const CHECK_LABEL: Record<LessonCheckName, string> = {
   'ambiguous-path': 'ambiguous path',
   'no-miss': 'no miss found',
   'filler-applies-when': 'vague "applies when"',
+  'instance-applies-when': '"applies when" too narrow',
+  'example-applies-when': '"applies when" copied from an example',
   'may-hold-secret': 'may hold a secret',
+  'risky-command': 'runs a risky command',
 };
 /** Where a lesson came from, in words; the tooltip says it in full. `from` (where its feedback came from) first. */
-const SOURCE_LABEL: Record<string, [label: string, title: string]> = {
+const SOURCE_LABEL: Record<LessonFrom | Lesson['source'], [label: string, title: string]> = {
   github: ['GitHub review', 'from a GitHub pull request comment or review, through a post-mortem'],
   linear: ['Linear comment', 'from a Linear issue comment, through a post-mortem'],
   session: ['session pushback', 'from your pushback in an agent session, through a post-mortem'],
+  agent: ['agent report', 'a miss your coding agent reported (report_feedback), through a post-mortem'],
   postmortem: ['post-mortem', 'from a post-mortem'],
   memory: ['memory file', 'imported from a Claude Code memory file'],
   manual: ['by you', 'written by you'],
   demo: ['demo', 'a demo lesson from fg demo seed; fg demo remove takes it back'],
 };
-function SourceLabel({ source }: { source: string }) {
-  const [label, title] = Object.hasOwn(SOURCE_LABEL, source) ? SOURCE_LABEL[source] : [source, source];
+function SourceLabel({ source }: { source: LessonFrom | Lesson['source'] }) {
+  const [label, title] = labelOf(SOURCE_LABEL, source, (raw) => [raw, raw]);
   return <span title={title}>{label}</span>;
 }
 
@@ -96,52 +116,41 @@ function BulkDialog({ action, lessons, onCancel, onDone }: {
       const { results } = await api.decideLessons(lessons.map((l) => ({ id: l.id, status: action, ...(note.trim() && { note: note.trim() }) })));
       onDone(results);
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setError(errorMessage(e));
       setBusy(false);
     }
   }
   return (
-    <div
-      onMouseDown={(e) => { if (e.target === e.currentTarget && !busy) onCancel(); }}
-      className="fixed inset-0 z-50 grid place-items-center overflow-y-auto bg-text/30 p-4"
-    >
-      <div
-        role="dialog"
-        aria-modal="true"
-        aria-labelledby={titleId}
-        onKeyDown={(e) => { e.stopPropagation(); if (e.key === 'Escape' && !busy) onCancel(); }}
-        className="w-full max-w-md rounded-md border border-line bg-surface text-[13px] shadow-pop"
-      >
-        <div className="grid gap-3 p-4">
-          <h2 id={titleId} className="font-semibold">{label}?</h2>
-          <p className="text-muted">
-            {action === 'approved'
-              ? 'Agents start getting each of them with their task context straight away. Each is recorded as approved by you. If cloud sync is enabled, they are eligible for the next scheduled sync. Approval does not trigger a sync; use Sync now to send them.'
-              : 'Agents never get them. They move to Rejected, where you can put any back up for review.'}
-          </p>
-          <ul aria-label="lessons" className="grid max-h-48 gap-1 overflow-y-auto">
-            {lessons.map((l) => <li key={l.id} className="rounded-sm border border-line bg-sunken px-2 py-1 [overflow-wrap:anywhere]">{l.title}</li>)}
-          </ul>
-          <label className="grid gap-1 text-xs font-medium text-muted">
-            Note (optional, kept on each lesson)
-            <Input aria-label="note" value={note} onChange={(e) => setNote(e.target.value)} placeholder={action === 'rejected' ? 'why, e.g. platitudes' : 'why'} maxLength={4000} />
-          </label>
-          {error && <Alert>{error}</Alert>}
-        </div>
-        <footer className="flex flex-wrap justify-end gap-2 rounded-b-md border-t border-line bg-sunken px-4 py-3">
-          <Button onClick={onCancel} disabled={busy}>Cancel</Button>
-          <Button variant={action === 'approved' ? 'primary' : 'danger'} onClick={() => void go()} disabled={busy}>{busy ? 'Saving…' : label}</Button>
-        </footer>
+    <Modal labelledBy={titleId} busy={busy} onCancel={onCancel}>
+      <div className="grid gap-3 p-4">
+        <h2 id={titleId} className="font-semibold">{label}?</h2>
+        <p className="text-muted">
+          {action === 'approved'
+            ? 'Agents start getting each of them with their task context straight away. Each is recorded as approved by you. If cloud sync is enabled, they are eligible for the next scheduled sync. Approval does not trigger a sync; use Sync now to send them.'
+            : 'Agents never get them. They move to Rejected, where you can put any back up for review.'}
+        </p>
+        <ScrollArea as="ul" aria-label="lessons" className="grid max-h-48 gap-1 overflow-y-auto">
+          {lessons.map((l) => <li key={l.id} className="rounded-sm border border-line bg-sunken px-2 py-1 [overflow-wrap:anywhere]">{l.title}</li>)}
+        </ScrollArea>
+        <label className="grid gap-1 text-xs font-medium text-muted">
+          Note (optional, kept on each lesson)
+          <Input data-autofocus aria-label="note" value={note} onChange={(e) => setNote(e.target.value)} placeholder={action === 'rejected' ? 'why, e.g. platitudes' : 'why'} maxLength={4000} />
+        </label>
+        {error && <Alert>{error}</Alert>}
       </div>
-    </div>
+      <footer className="flex flex-wrap justify-end gap-2 rounded-b-md border-t border-line bg-sunken px-4 py-3">
+        <Button onClick={onCancel} disabled={busy}>Cancel</Button>
+        <Button variant={action === 'approved' ? 'primary' : 'danger'} owner onClick={() => void go()} busy={busy}>{busy ? 'Saving…' : label}</Button>
+      </footer>
+    </Modal>
   );
 }
 
-const checkLabel = (name: string) => CHECK_LABEL[name as LessonCheckName] ?? name.replace(/-/g, ' ');
+const checkLabel = (name: LessonCheckName) => labelOf(CHECK_LABEL, name, (raw) => raw.replace(/-/g, ' '));
 
 /** The lesson check's findings as chips; the reason is the tooltip (and is listed on the lesson itself). */
-function CheckChips({ checks, max }: { checks: LessonCheck[]; max?: number }) {
-  const shown = max ? checks.slice(0, max) : checks;
+function CheckChips({ checks, max }: { checks: LessonCheck[]; max: number }) {
+  const shown = checks.slice(0, max);
   return (
     <span className="flex flex-wrap gap-1">
       {shown.map((c) => <Badge key={c.name} tone="bad" title={c.why}>{checkLabel(c.name)}</Badge>)}
@@ -174,50 +183,50 @@ function ToFactDialog({ lesson, onCancel, onDone }: { lesson: Lesson; onCancel: 
       await api.lessonToFact(lesson.id, { kind, relevance });
       onDone();
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setError(errorMessage(e));
       setBusy(false);
     }
   }
   return (
-    <div
-      onMouseDown={(e) => { if (e.target === e.currentTarget && !busy) onCancel(); }}
-      className="fixed inset-0 z-50 grid place-items-center overflow-y-auto bg-text/30 p-4"
-    >
-      <div
-        role="dialog"
-        aria-modal="true"
-        aria-labelledby={titleId}
-        onKeyDown={(e) => { e.stopPropagation(); if (e.key === 'Escape' && !busy) onCancel(); }}
-        className="w-full max-w-md rounded-md border border-line bg-surface text-[13px] shadow-pop"
-      >
-        <div className="grid gap-3 p-4">
-          <h2 id={titleId} className="font-semibold">Convert this lesson to a project fact?</h2>
-          <p className="text-muted">
-            Agents get the rule with the project facts, and no scan replaces it. The lesson moves to Rejected, noted
-            "converted to a fact".
-          </p>
-          <blockquote className="rounded-sm border border-line bg-sunken px-2.5 py-2 [overflow-wrap:anywhere]">{lesson.rule}</blockquote>
-          <label className="grid gap-1 text-xs font-medium text-muted">
-            Kind
-            <Select aria-label="fact kind" value={kind} onChange={(e) => setKind(e.target.value as FactKind)}>
-              {FACT_KINDS.map((k) => <option key={k} value={k}>{k.replace('_', ' ')}</option>)}
-            </Select>
-          </label>
-          <label className="grid gap-1 text-xs font-medium text-muted">
-            How often it is needed
-            <Select aria-label="fact relevance" value={String(relevance)} onChange={(e) => setRelevance(Number(e.target.value))}>
-              {FACT_RELEVANCE.map((r) => <option key={r.value} value={String(r.value)}>{r.label}</option>)}
-            </Select>
-          </label>
-          {error && <Alert>{error}</Alert>}
-        </div>
-        <footer className="flex flex-wrap justify-end gap-2 rounded-b-md border-t border-line bg-sunken px-4 py-3">
-          <Button onClick={onCancel} disabled={busy}>Cancel</Button>
-          <Button variant="primary" onClick={() => void convert()} disabled={busy}>{busy ? 'Converting…' : 'Convert'}</Button>
-        </footer>
+    <Modal labelledBy={titleId} busy={busy} onCancel={onCancel}>
+      <div className="grid gap-3 p-4">
+        <h2 id={titleId} className="font-semibold">Convert this lesson to a project fact?</h2>
+        <p className="text-muted">
+          Agents get the rule with the project facts, and no scan replaces it. The lesson moves to Rejected, noted
+          "converted to a fact".
+        </p>
+        <blockquote className="rounded-sm border border-line bg-sunken px-2.5 py-2 [overflow-wrap:anywhere]">{lesson.rule}</blockquote>
+        <label className="grid gap-1 text-xs font-medium text-muted">
+          Kind
+          <Select data-autofocus aria-label="fact kind" value={kind} onChange={(e) => setKind(e.target.value as FactKind)}>
+            {FACT_KINDS.map((k) => <option key={k} value={k}>{k.replace('_', ' ')}</option>)}
+          </Select>
+        </label>
+        <label className="grid gap-1 text-xs font-medium text-muted">
+          How often it is needed
+          <Select aria-label="fact relevance" value={String(relevance)} onChange={(e) => setRelevance(Number(e.target.value))}>
+            {FACT_RELEVANCE.map((r) => <option key={r.value} value={String(r.value)}>{r.label}</option>)}
+          </Select>
+        </label>
+        {error && <Alert>{error}</Alert>}
       </div>
-    </div>
+      <footer className="flex flex-wrap justify-end gap-2 rounded-b-md border-t border-line bg-sunken px-4 py-3">
+        <Button onClick={onCancel} disabled={busy}>Cancel</Button>
+        <Button variant="primary" owner onClick={() => void convert()} busy={busy}>{busy ? 'Converting…' : 'Convert'}</Button>
+      </footer>
+    </Modal>
   );
+}
+
+/**
+ * The learning loop changed the lesson and that change stands: a loop decision on it is still applied (changedByLoop: a
+ * reword, narrowing or re-ranking leaves decidedBy as it was), or the loop decided its status (decidedBy `loop:<v>`). Its
+ * Decisions card says what and can undo it.
+ */
+const changedByLoop = (l: Pick<Lesson, 'decidedBy' | 'changedByLoop'>) => !!l.changedByLoop || isLoopActor(l.decidedBy);
+function ChangedByLoop({ lesson }: { lesson: Pick<Lesson, 'decidedBy' | 'changedByLoop'> }) {
+  if (!changedByLoop(lesson)) return null;
+  return <Badge tone="accent" title="changed by the learning loop; its Decisions card says what and can roll it back">changed by loop</Badge>;
 }
 
 /** An agent holding the operator token (FG_OPERATOR_TOKEN, with lesson_decide in OPERATOR_ALLOW) decided it, not you. */
@@ -242,9 +251,9 @@ const said = (n: number, what: string, of: number) => `${n} ${what} (${percent(n
 function Judged({ report }: { report: LessonQualityReport | null }) {
   const [last30, last90] = report?.windows ?? [];
   if (!last30 || !last90?.decided) return null;
-  const projects = Object.entries(report!.projects ?? {}).sort(([a], [b]) => a.localeCompare(b));
-  const cells = (q: LessonQuality | undefined) =>
-    q ? [String(q.decided), share(q.asWritten, q.decided), share(q.edited, q.decided), share(q.rejected, q.decided), share(q.byOperator ?? 0, q.decided)] : ['', '', '', '', ''];
+  const projects = Object.entries(report!.projects).sort(([a], [b]) => a.localeCompare(b));
+  const cells = (q: LessonQuality) =>
+    [String(q.decided), share(q.asWritten, q.decided), share(q.edited, q.decided), share(q.rejected, q.decided), share(q.byOperator ?? 0, q.decided)];
   return (
     <details aria-label="how your lessons were judged" className="min-w-0 text-xs text-muted">
       <summary className="cursor-pointer tabular-nums" title="Of the post-mortem's lessons you decided. The ones you edited or rejected, and some you approved as written, are shown to the post-mortem as examples. Decisions an agent made with the operator token count as yours; how many is said apart.">
@@ -254,7 +263,7 @@ function Judged({ report }: { report: LessonQualityReport | null }) {
           : <>Last 30 days: none decided ({last90.decided} in 90 days)</>}
         {report!.capped && ' (capped)'}
       </summary>
-      <div className="mt-2 max-w-full overflow-x-auto" tabIndex={0} aria-label="Lesson decision quality table">
+      <ScrollArea role="region" className="mt-2 max-w-full overflow-x-auto" aria-label="Lesson decision quality table">
       <table className={`${tableClass} tabular-nums`}>
         <thead><tr>{['project', 'days', 'decided', 'as written', 'after edit', 'rejected', 'by operator'].map((h) => <th key={h} className={tdClass}>{h}</th>)}</tr></thead>
         <tbody>
@@ -263,12 +272,15 @@ function Judged({ report }: { report: LessonQualityReport | null }) {
           )))}
         </tbody>
       </table>
-      </div>
+      </ScrollArea>
     </details>
   );
 }
 
 export function Lessons() {
+  const writes = useOwnerWrites();
+  /** On a read-only install the lesson's words show as text to read: nothing could save an edit. */
+  const locked = writes ? {} : { readOnly: true, title: READ_ONLY_TITLE };
   const [judged, setJudged] = useState<LessonQualityReport | null>(null);
   useEffect(() => { api.lessonQuality().then(setJudged, () => setJudged(null)); }, []);
   const [status, setStatus] = useState<LessonStatus>(() => ['proposed', 'approved', 'rejected', 'revoked', 'superseded'].includes(hashFilters().get('status') ?? '') ? hashFilters().get('status') as LessonStatus : 'proposed');
@@ -316,7 +328,7 @@ export function Lessons() {
       setSelected(focus && at < 0 ? -1 : Math.max(0, at));
       setOpen(at >= 0);
       setLoaded(true);
-    }, (e) => { if (!stale) { setError(String(e)); setLoaded(true); } });
+    }, (e) => { if (!stale) { setError(errorMessage(e)); setLoaded(true); } });
     return () => { stale = true; };
   }, [status, flag, source, pr, author]);
 
@@ -334,26 +346,28 @@ export function Lessons() {
     api.lesson(current.id).then((d) => {
       if (stale) return;
       setDetail(d);
-      setDraft({ title: d.lesson.title, rule: d.lesson.rule, appliesWhen: d.lesson.appliesWhen, scope: d.lesson.scope });
-    }, (e) => { if (!stale) setError(String(e)); });
+      setDraft({ title: d.lesson.title, rule: d.lesson.rule, appliesWhen: d.lesson.appliesWhen, scope: d.lesson.scope, triggers: triggerText(d.lesson.triggers) });
+    }, (e) => { if (!stale) setError(errorMessage(e)); });
     return () => { stale = true; };
   }, [current?.id]);
 
   // Edits live only here until Approve (or Save, on an approved lesson): moving to another lesson, tab or page asks before dropping them.
   const edited = !!detail && !!draft && detail.lesson.id === current?.id &&
-    (['title', 'rule', 'appliesWhen', 'scope'] as const).some((k) => draft[k] !== detail.lesson[k]);
+    ((['title', 'rule', 'appliesWhen', 'scope'] as const).some((k) => draft[k] !== detail.lesson[k]) || !sameTriggers(draft.triggers, detail.lesson));
   useUnsavedChanges(edited, 'Your edits to this lesson are not saved.');
   const narrowing = !!detail && !!draft && detail.lesson.scope === 'global' && draft.scope !== 'global';
   useEffect(() => {
     if (narrowing && projectKeys === null) api.projects().then((ps) => setProjectKeys(ps.map((p) => p.key)), () => setProjectKeys([]));
   }, [narrowing, projectKeys]);
   /** The edited fields of the draft, with the project a narrowed global lesson serves; null (and why) when it has none. */
+  // These run from the open lesson's own buttons, which show only once its detail and draft are loaded (React runs
+  // the effect that clears them for another lesson before it handles the next click).
   function edits(): LessonEdit | null {
-    if (!detail || !draft) return null;
     const patch: LessonEdit = {};
     for (const k of ['title', 'rule', 'appliesWhen', 'scope'] as const) {
-      if (draft[k] !== detail.lesson[k]) (patch as Record<string, unknown>)[k] = draft[k];
+      if (draft![k] !== detail!.lesson[k]) (patch as Record<string, unknown>)[k] = draft![k];
     }
+    if (!sameTriggers(draft!.triggers, detail!.lesson)) patch.triggers = triggersOf(draft!.triggers);
     if (narrowing) {
       if (!narrowTo) {
         setError('Choose the project this lesson will serve: as a global lesson it has none to go back to.');
@@ -369,29 +383,43 @@ export function Lessons() {
 
   /** The lesson became a fact (and was rejected): it leaves this tab like any decision. */
   function converted() {
-    if (!current) return;
+    const { id } = current!;
     setConverting(false);
-    setItems((xs) => xs.filter((x) => x.id !== current.id));
+    setItems((xs) => xs.filter((x) => x.id !== id));
     setSelected((i) => Math.min(i, items.length - 2));
   }
 
   // Edits to an approved lesson are saved as they are: no status change, so agents keep getting it (now as edited).
   const [saving, setSaving] = useState(false);
   async function save() {
-    if (!current || !detail || !draft || detail.lesson.id !== current.id) return;
+    const lesson = detail!.lesson;
     setError(null);
     const patch = edits();
     if (!patch) return;
     setSaving(true);
     try {
-      await api.updateLesson(current.id, patch);
-      setDetail({ ...detail, lesson: { ...detail.lesson, ...patch } });
-      setItems((xs) => xs.map((x) => (x.id === current.id ? { ...x, ...patch } : x)));
+      await api.updateLesson(lesson.id, patch);
+      setDetail({ ...detail!, lesson: { ...lesson, ...patch } });
+      setItems((xs) => xs.map((x) => (x.id === lesson.id ? { ...x, ...patch } : x)));
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setError(errorMessage(e));
     } finally {
       setSaving(false);
     }
+  }
+
+  /** A loop decision on this lesson was rolled back: it may now belong in another tab. */
+  function reloadAfterRollback() {
+    if (!current) return;
+    api.lesson(current.id).then((d) => {
+      if (d.lesson.status !== status) {
+        setItems((xs) => xs.filter((x) => x.id !== current.id));
+        setSelected((i) => Math.min(i, items.length - 2));
+      } else {
+        setDetail(d);
+        setDraft({ title: d.lesson.title, rule: d.lesson.rule, appliesWhen: d.lesson.appliesWhen, scope: d.lesson.scope, triggers: triggerText(d.lesson.triggers) });
+      }
+    }, (e) => setError(errorMessage(e)));
   }
 
   /** The bulk decision went through: the decided lessons leave this tab; any that failed say why. */
@@ -416,26 +444,47 @@ export function Lessons() {
   // Deciding the lesson open with unsaved edits drops them: ask first, as moving away does.
   const openBulk = (action: 'approved' | 'rejected') => (current && picked.has(current.id) ? afterDiscard(() => setBulk(action)) : setBulk(action));
 
+  // One decision at a time: while it saves, every decision button says so and ignores presses.
+  const [deciding, runDecision] = usePending<'approved' | 'rejected' | 'revoked' | 'proposed'>();
+  // A decision made from the keyboard: its button leaves with the lesson, so focus goes to the next lesson's row (or, with
+  // none left, the list saying so; on a phone showing the next lesson, that lesson) instead of dropping to the page.
+  const page = useRef<HTMLDivElement>(null);
+  const bar = useRef<HTMLDivElement>(null);
+  const refocus = useRef(false);
+  useEffect(() => {
+    if (!refocus.current || !page.current) return;
+    refocus.current = false;
+    const at = page.current;
+    const target = [at.querySelector('aside [aria-current="true"]'), at.querySelector('aside [role="region"]'), at.querySelector('section[aria-label="item detail"]')]
+      .find((x): x is HTMLElement => x instanceof HTMLElement && rendered(x, at));
+    if (!target) return;
+    if (!target.matches('button') && !target.hasAttribute('tabindex')) target.tabIndex = -1;
+    target.focus();
+  }, [items]);
   async function decide(next: 'approved' | 'rejected' | 'revoked' | 'proposed') {
-    if (!current || !detail || !draft || detail.lesson.id !== current.id) return;
-    setError(null);
+    const { id } = detail!.lesson;
+    const fromBar = !!bar.current?.contains(document.activeElement);
     let patch: LessonEdit = { status: next };
     if (next === 'approved') {
       const changed = edits();
       if (!changed) return;
       patch = { ...patch, ...changed };
     }
-    try {
-      await api.updateLesson(current.id, patch);
-      setItems((xs) => xs.filter((x) => x.id !== current.id));
-      setSelected((i) => Math.min(i, items.length - 2));
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-    }
+    await runDecision(next, async () => {
+      setError(null);
+      try {
+        await api.updateLesson(id, patch);
+        refocus.current = fromBar && !!bar.current?.contains(document.activeElement);
+        setItems((xs) => xs.filter((x) => x.id !== id));
+        setSelected((i) => Math.min(i, items.length - 2));
+      } catch (e) {
+        setError(errorMessage(e));
+      }
+    });
   }
 
   return (
-    <div className="flex h-full min-h-0 flex-col">
+    <div ref={page} className="flex h-full min-h-0 flex-col">
       <PageHeader title="Lessons" description="Rules drawn from confirmed misses. Agents only ever see the ones you approve." actions={<Judged report={judged} />} />
       <SplitPane
         listLabel="lessons"
@@ -444,21 +493,21 @@ export function Lessons() {
           <>
             <Tabs label="status" value={status} options={TABS} onChange={(s) => { if (s !== status) afterDiscard(() => setStatus(s)); }} />
             {loaded && <span className="ml-auto text-xs text-muted tabular-nums">{plural(items.length, 'lesson')}</span>}
-            <div className="flex w-full flex-wrap gap-2">
-              <Input aria-label="PR number" placeholder="PR number" type="number" min="1" value={pr} onChange={(e) => { const value = e.target.value; afterDiscard(() => setPr(value)); }} />
-              <Input aria-label="feedback author" placeholder="Feedback author" value={author} onChange={(e) => { const value = e.target.value; afterDiscard(() => setAuthor(value)); }} />
-              {author && <span className="self-center text-[11px] text-muted">Exact match; use the full GitHub or Linear login.</span>}
+            <FilterBar label="filters">
+              <Input aria-label="PR number" size="sm" placeholder="PR number" type="number" min="1" value={pr} onChange={(e) => { const value = e.target.value; afterDiscard(() => setPr(value)); }} />
+              <Input aria-label="feedback author" size="sm" placeholder="Feedback author" value={author} onChange={(e) => { const value = e.target.value; afterDiscard(() => setAuthor(value)); }} />
+              {author && <span className="col-span-full text-[11px] text-muted">Exact match; use the full GitHub or Linear login.</span>}
               <Select aria-label="source" size="sm" value={source} onChange={(e) => { const v = e.target.value as LessonFrom | ''; afterDiscard(() => setSource(v)); }}>
                 <option value="">all sources</option>
-                {LESSON_FROM.map((f) => <option key={f} value={f}>{SOURCE_LABEL[f]?.[0] ?? f}</option>)}
+                {LESSON_FROM.map((f) => <option key={f} value={f}>{SOURCE_LABEL[f][0]}</option>)}
               </Select>
               <Select aria-label="flag" size="sm" value={flag} onChange={(e) => { const v = e.target.value as LessonCheckName | ''; afterDiscard(() => setFlag(v)); }}>
                 <option value="">any check</option>
                 {LESSON_CHECKS.map((n) => <option key={n} value={n}>{checkLabel(n)}</option>)}
               </Select>
-            </div>
+            </FilterBar>
             {bulkable && (
-              <div className="flex w-full flex-wrap items-center gap-2">
+              <FilterBar label="bulk decisions">
                 <Select
                   aria-label="select all with flag"
                   size="sm"
@@ -471,14 +520,14 @@ export function Lessons() {
                   <option value="">select all with flag…</option>
                   {flagCounts.map(([n, c]) => <option key={n} value={n}>{checkLabel(n)} ({c})</option>)}
                 </Select>
-                <Button size="sm" className="min-w-[5.5rem]" onClick={() => setPicked(picked.size === items.length ? new Set() : new Set(items.map((l) => l.id)))}>
+                <Button size="sm" onClick={() => setPicked(picked.size === items.length ? new Set() : new Set(items.map((l) => l.id)))}>
                   {picked.size === items.length ? 'Clear' : 'Select all'}
                 </Button>
                 {/* Always there, disabled until a row is ticked: the bar never grows, so the rows never move under the cursor. */}
-                <span className="min-w-[5.5rem] text-xs text-muted tabular-nums">{picked.size ? `${picked.size} selected` : 'none selected'}</span>
-                <Button size="sm" variant="primary" disabled={!picked.size} onClick={() => openBulk('approved')}>Approve selected</Button>
-                <Button size="sm" disabled={!picked.size} onClick={() => openBulk('rejected')}>Reject selected</Button>
-              </div>
+                <span className="text-xs text-muted tabular-nums">{picked.size ? `${picked.size} selected` : 'none selected'}</span>
+                <Button size="sm" variant="primary" owner disabled={!picked.size} onClick={() => openBulk('approved')}>Approve selected</Button>
+                <Button size="sm" owner disabled={!picked.size} onClick={() => openBulk('rejected')}>Reject selected</Button>
+              </FilterBar>
             )}
             {loaded && items.length >= LIST_CAP && <span className="w-full text-xs text-muted">Showing the newest {LIST_CAP}: narrow the list with the filters to reach the rest.</span>}
             {bulk && <BulkDialog action={bulk} lessons={pickedLessons} onCancel={() => setBulk(null)} onDone={bulkDone} />}
@@ -497,14 +546,12 @@ export function Lessons() {
           ) : (
             <ul>
               {items.map((l, i) => (
-                <li key={l.id} className="flex">
-                  {bulkable && (
-                    <label className="grid shrink-0 cursor-pointer place-items-start border-b border-line pt-3 pl-3">
-                      <input type="checkbox" aria-label={`select ${l.title}`} checked={picked.has(l.id)} onChange={() => toggle(l.id)} />
-                    </label>
-                  )}
-                  <div className="min-w-0 flex-1">
-                  <ListRow selected={i === selected} onClick={() => { const go = () => { setSelected(i); setOpen(true); }; if (i === selected) go(); else afterDiscard(go); }}>
+                <li key={l.id}>
+                  <ListRow
+                    selected={i === selected}
+                    lead={bulkable ? <input type="checkbox" aria-label={`select ${l.title}`} checked={picked.has(l.id)} onChange={() => toggle(l.id)} className="cursor-pointer" /> : undefined}
+                    onClick={() => { const go = () => { setSelected(i); setOpen(true); }; if (i === selected) go(); else afterDiscard(go); }}
+                  >
                     <div className="flex items-center justify-between gap-2 text-xs text-muted">
                       <span className="truncate">{l.projectKey ?? 'global'} · <SourceLabel source={l.from ?? l.source} /></span>
                       {l.cause && (
@@ -518,9 +565,9 @@ export function Lessons() {
                     {!!l.checks?.length && <div className="mt-1"><CheckChips checks={l.checks} max={3} /></div>}
                     {genericOf(l) && <div className="mt-1 text-xs text-muted">{genericOf(l)!.why}</div>}
                     {l.decidedBy?.startsWith('operator') && l.status !== 'proposed' && <div className="mt-1"><AgentDecided lesson={l} /></div>}
+                    {changedByLoop(l) && <div className="mt-1"><ChangedByLoop lesson={l} /></div>}
                     {l.decisionNote && l.status !== 'proposed' && <div className="mt-1 text-xs text-muted">{l.decisionNote}</div>}
                   </ListRow>
-                  </div>
                 </li>
               ))}
             </ul>
@@ -537,6 +584,7 @@ export function Lessons() {
                     <Badge>{detail.lesson.projectKey ?? 'global'}</Badge>
                     <StatusBadge status={detail.lesson.status} />
                     <AgentDecided lesson={detail.lesson} />
+                    <ChangedByLoop lesson={detail.lesson} />
                     {detail.lesson.decisionNote && detail.lesson.status !== 'proposed' && <Badge title="the note on its last decision">{detail.lesson.decisionNote}</Badge>}
                   </div>
                   <h2 className="text-[19px] leading-snug font-semibold tracking-[-0.01em] text-balance [overflow-wrap:anywhere]">{detail.lesson.title}</h2>
@@ -550,6 +598,13 @@ export function Lessons() {
                         <li key={c.name} className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5 text-[13px]">
                           <Badge tone="bad">{checkLabel(c.name)}</Badge>
                           <span className="min-w-0 text-muted [overflow-wrap:anywhere]">{c.why}</span>
+                          {c.suggestion && (
+                            // A broader "applies when" the worker proposed: yours to take into the draft, never applied for you.
+                            <span className="flex min-w-0 flex-wrap items-baseline gap-x-2 [overflow-wrap:anywhere]">
+                              <span>Suggested: “{c.suggestion}”</span>
+                              <Button size="sm" disabled={draft.appliesWhen === c.suggestion} onClick={() => setDraft({ ...draft, appliesWhen: c.suggestion! })}>Use it</Button>
+                            </span>
+                          )}
                         </li>
                       ))}
                     </ul>
@@ -561,7 +616,7 @@ export function Lessons() {
 
                 {detail.feedback && (
                   <section className="grid gap-1.5">
-                    <SectionLabel>{feedbackSpeaker(detail.feedback.external)}</SectionLabel>
+                    <SectionLabel>{feedbackSpeaker(detail.feedback.external, detail.lesson.from)}</SectionLabel>
                     <blockquote className="rounded-md border border-accent bg-accent-soft px-3.5 py-2.5 text-[13.5px] leading-relaxed whitespace-pre-wrap [overflow-wrap:anywhere] shadow-[inset_3px_0_0_var(--color-accent)]">
                       {detail.feedback.text}
                     </blockquote>
@@ -607,7 +662,7 @@ export function Lessons() {
                             <span className="min-w-0 font-mono [overflow-wrap:anywhere] text-accent-text">{c.kind} · {c.ref}</span>
                             <Badge tone={c.wasAvailable ? 'bad' : 'neutral'}>{c.wasAvailable ? 'was available to the agent' : 'not loaded in the session'}</Badge>
                           </div>
-                          <pre className="overflow-x-auto rounded-sm bg-sunken px-2.5 py-2 font-mono text-xs whitespace-pre-wrap">{c.excerpt}</pre>
+                          <ScrollArea as="pre" className="overflow-x-auto rounded-sm bg-sunken px-2.5 py-2 font-mono text-xs whitespace-pre-wrap">{c.excerpt}</ScrollArea>
                           <p className="text-xs text-muted">{c.why}</p>
                         </li>
                       ))}
@@ -632,17 +687,17 @@ export function Lessons() {
 
                 <Card title="Lesson for future agents" bodyClass="grid gap-3 p-3">
                   <Field label="Title">
-                    <Input aria-label="title" value={draft.title} onChange={(e) => setDraft({ ...draft, title: e.target.value })} className="w-full" />
+                    <Input aria-label="title" {...locked} value={draft.title} onChange={(e) => setDraft({ ...draft, title: e.target.value })} className="w-full" />
                   </Field>
                   <Field label="Rule">
-                    <Textarea aria-label="rule" value={draft.rule} onChange={(e) => setDraft({ ...draft, rule: e.target.value })} rows={3} className="w-full" />
+                    <Textarea aria-label="rule" {...locked} value={draft.rule} onChange={(e) => setDraft({ ...draft, rule: e.target.value })} rows={3} className="w-full" />
                   </Field>
                   <Field label="Applies when">
-                    <Input aria-label="applies when" value={draft.appliesWhen} onChange={(e) => setDraft({ ...draft, appliesWhen: e.target.value })} placeholder="applies when…" className="w-full" />
+                    <Input aria-label="applies when" {...locked} value={draft.appliesWhen} onChange={(e) => setDraft({ ...draft, appliesWhen: e.target.value })} placeholder="applies when…" className="w-full" />
                   </Field>
                   <div className="flex flex-wrap items-center gap-2">
                     <span className="text-xs font-medium text-muted">Scope</span>
-                    <Select aria-label="scope" size="sm" value={draft.scope} onChange={(e) => setDraft({ ...draft, scope: e.target.value as Draft['scope'] })}>
+                    <Select aria-label="scope" size="sm" disabled={!writes} title={writes ? undefined : READ_ONLY_TITLE} value={draft.scope} onChange={(e) => setDraft({ ...draft, scope: e.target.value as Draft['scope'] })}>
                       <option value="task">task</option>
                       <option value="project">project</option>
                       <option value="global">global</option>
@@ -661,7 +716,20 @@ export function Lessons() {
                       ? <ul className="flex flex-wrap gap-1">{detail.lesson.paths.map((p) => <li key={p}><code className="rounded-sm bg-sunken px-1.5 py-0.5 font-mono text-[11.5px] [overflow-wrap:anywhere]">{p}</code></li>)}</ul>
                       : <span className="text-xs text-muted">No paths: applies anywhere in its project{detail.lesson.scope === 'global' ? ' (or any project, as a global lesson)' : ''}.</span>}
                   </div>
+                  <div className="grid gap-1.5">
+                    <span className="text-xs font-medium text-muted">Triggers (agents also get it when a task or change matches one; one per line)</span>
+                    <div className="grid gap-2 sm:grid-cols-3">
+                      {([['paths', 'Path globs', '**/*.sql'], ['patterns', 'Added-line patterns', 'CREATE\\s+INDEX'], ['symbols', 'Symbols', 'asyncio.to_thread']] as const).map(([k, label, hint]) => (
+                        <Field key={k} label={label}>
+                          <Textarea aria-label={`trigger ${k}`} {...locked} value={draft.triggers[k]} onChange={(e) => setDraft({ ...draft, triggers: { ...draft.triggers, [k]: e.target.value } })} rows={3} placeholder={hint} className="w-full font-mono text-xs" />
+                        </Field>
+                      ))}
+                    </div>
+                    {detail.lesson.triggers == null && <span className="text-xs text-muted">None derived yet: the worker fills them in from the miss, or write your own.</span>}
+                  </div>
                 </Card>
+
+                <LessonDecisions lessonId={detail.lesson.id} onChanged={reloadAfterRollback} />
 
                 {history.length > 0 && (
                   <Card title="History">
@@ -674,13 +742,15 @@ export function Lessons() {
             ) : loaded && focus && selected < 0 ? <EmptyState icon={<LessonIcon />} title="Linked lesson is unavailable">It may have been deleted or excluded by the current filters. Select a lesson explicitly to continue.</EmptyState> : null}
           </div>
           {detail && draft && status !== 'superseded' && (
-            <div className="sticky bottom-0 border-t border-line bg-surface/95 backdrop-blur">
+            <div ref={bar} className="sticky bottom-0 border-t border-line bg-surface/95 backdrop-blur">
               <div className="mx-auto flex w-full max-w-3xl flex-wrap items-center gap-2 px-4 py-2.5 md:px-6">
                 {status === 'proposed' && (
                   <>
-                    <Button variant="primary" onClick={() => decide('approved')}>Approve</Button>
-                    <Button onClick={() => decide('rejected')}>Reject</Button>
+                    <Button variant="primary" owner busy={!!deciding} onClick={() => decide('approved')}>{deciding === 'approved' ? 'Approving…' : 'Approve'}</Button>
+                    <Button owner busy={!!deciding} onClick={() => decide('rejected')}>{deciding === 'rejected' ? 'Rejecting…' : 'Reject'}</Button>
                     <Button
+                      owner
+                      busy={!!deciding}
                       onClick={() => setConverting(true)}
                       disabled={edited}
                       title={edited ? 'save or undo your edits first: the fact takes the saved rule' : 'file the rule as a project fact you wrote, and reject the lesson'}
@@ -693,8 +763,8 @@ export function Lessons() {
                 )}
                 {status === 'approved' && (
                   <>
-                    <Button variant="primary" disabled={!edited || saving} onClick={() => void save()}>Save</Button>
-                    <Button variant="danger-outline" onClick={() => setRevoking(true)}>Revoke</Button>
+                    <Button variant="primary" owner disabled={!edited} busy={saving || !!deciding} onClick={() => void save()}>{saving ? 'Saving…' : 'Save'}</Button>
+                    <Button variant="danger-outline" owner busy={saving || !!deciding} onClick={() => setRevoking(true)}>{deciding === 'revoked' ? 'Revoking…' : 'Revoke'}</Button>
                     <ConfirmDialog
                       open={revoking}
                       title="Revoke this lesson?"
@@ -708,7 +778,7 @@ export function Lessons() {
                     <span className="text-xs text-muted">Save keeps it approved with your edits. Revoke and agents stop getting it straight away.</span>
                   </>
                 )}
-                {(status === 'rejected' || status === 'revoked') && <Button onClick={() => decide('proposed')}>Back to proposed</Button>}
+                {(status === 'rejected' || status === 'revoked') && <Button owner busy={!!deciding} onClick={() => decide('proposed')}>{deciding === 'proposed' ? 'Moving…' : 'Back to proposed'}</Button>}
               </div>
             </div>
           )}
@@ -727,8 +797,9 @@ function Field({ label, children }: { label: string; children: ReactNode }) {
   );
 }
 
-/** Whose words the feedback is: yours, or a reviewer's or commenter's on GitHub or Linear. */
-function feedbackSpeaker(ext: { source: string; author: string } | null | undefined): string {
+/** Whose words the feedback is: yours, your agent's report of a miss, or a reviewer's or commenter's on GitHub or Linear. */
+function feedbackSpeaker(ext: { source: string; author: string } | null | undefined, from?: LessonFrom): string {
+  if (from === 'agent') return 'The agent reported';
   if (!ext) return 'You said';
   const who = ext.author || (ext.source === 'github' ? 'The reviewer' : 'The commenter');
   return `${who} said`;

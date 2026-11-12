@@ -13,8 +13,8 @@ test('source (each file followed by its own test) before other tests before mani
 });
 
 test('within source, languages whose imports resolve come before the rest (shell, terraform, sql)', () => {
-  const paths = ['.claude/skills/run.sh', 'db/seeds/a.sql', 'deploy/terraform/main.tf', 'src/webapp/page.tsx', 'src/lib/util.go', 'src/legacy/Thing.java'];
-  expect(rankCodePaths(paths)).toEqual(['src/lib/util.go', 'src/webapp/page.tsx', 'src/legacy/Thing.java', 'db/seeds/a.sql', 'deploy/terraform/main.tf', '.claude/skills/run.sh']);
+  const paths = ['.claude/skills/run.sh', 'db/seeds/a.sql', 'deploy/terraform/main.tf', 'src/portal/page.tsx', 'src/lib/util.go', 'src/legacy/Thing.java'];
+  expect(rankCodePaths(paths)).toEqual(['src/lib/util.go', 'src/portal/page.tsx', 'src/legacy/Thing.java', 'db/seeds/a.sql', 'deploy/terraform/main.tf', '.claude/skills/run.sh']);
 });
 
 test('the manifests imports are resolved against come first: a capped map still resolves its imports', () => {
@@ -23,8 +23,8 @@ test('the manifests imports are resolved against come first: a capped map still 
 });
 
 test('files sessions edited (most recent first) come before everything else; ones not listed are ignored', () => {
-  const paths = ['a/x.ts', 'b/y.ts', 'docs/z.md', 'src/webapp/page.tsx'];
-  expect(rankCodePaths(paths, { priority: ['docs/z.md', 'gone.ts', 'src/webapp/page.tsx'] })).toEqual(['docs/z.md', 'src/webapp/page.tsx', 'a/x.ts', 'b/y.ts']);
+  const paths = ['a/x.ts', 'b/y.ts', 'docs/z.md', 'src/portal/page.tsx'];
+  expect(rankCodePaths(paths, { priority: ['docs/z.md', 'gone.ts', 'src/portal/page.tsx'] })).toEqual(['docs/z.md', 'src/portal/page.tsx', 'a/x.ts', 'b/y.ts']);
 });
 
 test('a test sits right after the file it tests, so a capped map that keeps a file keeps its tests', () => {

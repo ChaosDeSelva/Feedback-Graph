@@ -22,7 +22,7 @@ function setup() {
       requeueDocRead: async (id) => { reread.push(id); return id === 'doc:shop:upload:flow.png'; },
       docImage: async (id) => (id === 'doc:shop:upload:flow.png' ? { mediaType: 'image/png', data: Buffer.from('PNGDATA').toString('base64') } : null),
     },
-    activity: { record: async (a) => { recorded.push(a); }, list: async () => [] },
+    activity: { removeRun: async () => 0, record: async (a) => { recorded.push(a); }, list: async () => [] },
   });
   return { app, upserts, deleted, reread, recorded };
 }
@@ -70,7 +70,7 @@ test('the largest upload is accepted at once (202) and embedded in the backgroun
     embed: async (t) => { batches.push(t.length); await slow; return t.map(() => [1]); },
     projectDirs: async () => [{ key: 'shop', name: 'shop', repoPath: '/vibe/shop' }],
     docs: { upsertDoc: async (doc, chunks) => { upserts.push(chunks.length); return `doc:shop:upload:${doc.ref}`; }, listDocs: async () => [], deleteDoc: async () => false },
-    activity: { record: async (a) => { recorded.push(a); }, list: async () => [] },
+    activity: { removeRun: async () => 0, record: async (a) => { recorded.push(a); }, list: async () => [] },
   });
   const text = Array.from({ length: 2000 }, (_, i) => `Paragraph ${i}. ${'word '.repeat(198)}`).join('\n\n').slice(0, 2_000_000);
   const res = await app.request('/api/projects/shop/docs', post({ title: 'Big', name: 'big.md', text }));
@@ -79,7 +79,7 @@ test('the largest upload is accepted at once (202) and embedded in the backgroun
   expect(body).toMatchObject({ id: 'doc:shop:upload:big.md', pending: true });
   expect(body.chunks).toBeGreaterThan(1000);
   release();
-  for (let i = 0; i < 100 && !upserts.length; i++) await new Promise((r) => setTimeout(r, 10));
+  while (!upserts.length) await new Promise((r) => setTimeout(r, 10));
   expect(upserts).toEqual([body.chunks]);
   expect(Math.max(...batches)).toBeLessThanOrEqual(64);
   expect(batches.reduce((a, b) => a + b, 0)).toBe(body.chunks);
@@ -93,11 +93,11 @@ test('a background upload that fails is logged in Activity with why, never a cra
     embed: async () => { throw new Error('ollama embed 500: model not loaded'); },
     projectDirs: async () => [{ key: 'shop', name: 'shop', repoPath: '/vibe/shop' }],
     docs: { upsertDoc: async () => 'x', listDocs: async () => [], deleteDoc: async () => false },
-    activity: { record: async (a) => { recorded.push(a); }, list: async () => [] },
+    activity: { removeRun: async () => 0, record: async (a) => { recorded.push(a); }, list: async () => [] },
   });
   const res = await app.request('/api/projects/shop/docs', post({ title: 'Big', name: 'big.md', text: 'word '.repeat(200_000) }));
   expect(res.status).toBe(202);
-  for (let i = 0; i < 100 && !recorded.length; i++) await new Promise((r) => setTimeout(r, 10));
+  while (!recorded.length) await new Promise((r) => setTimeout(r, 10));
   expect(recorded[0]).toMatchObject({ kind: 'doc_added', subject: 'could not add "Big": ollama embed 500: model not loaded', details: { name: 'big.md', failed: true } });
 });
 
@@ -128,7 +128,7 @@ test('uploading a file with the name of an existing upload says it replaced it',
       listDocs: async () => [{ id: 'doc:shop:upload:spec.md', projectKey: 'shop', source: 'upload', ref: 'spec.md', title: 'Old spec', url: null, addedAt: 't', addedBy: 'you', chunks: 3, kind: 'text', mediaType: null, read: null }],
       deleteDoc: async () => true,
     },
-    activity: { record: async (a) => { recorded.push(a); }, list: async () => [] },
+    activity: { removeRun: async () => 0, record: async (a) => { recorded.push(a); }, list: async () => [] },
   });
   await replacing.request('/api/projects/shop/docs', post({ title: 'New spec', name: 'spec.md', text: 'v2' }));
   expect(recorded[0]).toMatchObject({ subject: 'replaced "Old spec" with "New spec" (1 chunk)' });
@@ -234,7 +234,7 @@ test('a background upload carries its embed status: pending, then failed with wh
     embed: () => new Promise((_, reject) => { fail = reject; }),
     projectDirs: async () => [{ key: 'shop', name: 'shop', repoPath: '/vibe/shop' }],
     docs: { upsertDoc: async () => 'x', listDocs: async () => [], deleteDoc: async () => false },
-    activity: { record: async () => {}, list: async () => [] },
+    activity: { removeRun: async () => 0, record: async () => {}, list: async () => [] },
   });
   const res = await app.request('/api/projects/shop/docs', post({ title: 'Big', name: 'big.md', text: 'word '.repeat(200_000) }));
   expect(res.status).toBe(202);
@@ -244,7 +244,7 @@ test('a background upload carries its embed status: pending, then failed with wh
   expect(await pending.json()).toMatchObject({ id, title: 'Big', embed: { status: 'pending', chunks } });
   fail(new Error('ollama embed 500: model not loaded'));
   let failed: { embed?: { status: string; error?: string } } = {};
-  for (let i = 0; i < 100 && failed.embed?.status !== 'failed'; i++) {
+  while (failed.embed?.status !== 'failed') {
     await new Promise((r) => setTimeout(r, 10));
     failed = await (await app.request(`/api/docs/${encodeURIComponent(id)}`)).json();
   }
@@ -268,7 +268,7 @@ test('re-uploading a large file of the same name marks the listed document pendi
       listDocs: async (_k, o = {}) => (!o.ref || o.ref === 'big.md' ? [stored ? { ...old, title: 'Big v2', chunks: 999 } : old] : []),
       deleteDoc: async () => false,
     },
-    activity: { record: async () => {}, list: async () => [] },
+    activity: { removeRun: async () => 0, record: async () => {}, list: async () => [] },
   });
   const res = await app.request('/api/projects/shop/docs', post({ title: 'Big v2', name: 'big.md', text: 'word '.repeat(200_000) }));
   expect(res.status).toBe(202);
@@ -276,7 +276,7 @@ test('re-uploading a large file of the same name marks the listed document pendi
   expect(listed[0]).toMatchObject({ id: old.id, title: 'Big v1', embed: { status: 'pending' } });
   expect(await (await app.request(`/api/docs/${encodeURIComponent(old.id)}`)).json()).toMatchObject({ title: 'Big v1', embed: { status: 'pending' } });
   release();
-  for (let i = 0; i < 100 && !stored; i++) await new Promise((r) => setTimeout(r, 10));
+  while (!stored) await new Promise((r) => setTimeout(r, 10));
   await new Promise((r) => setTimeout(r, 10));
   const done = (await (await app.request(`/api/docs/${encodeURIComponent(old.id)}`)).json()) as { title: string; embed?: object };
   expect(done.title).toBe('Big v2');

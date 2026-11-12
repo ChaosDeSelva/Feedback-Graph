@@ -1,10 +1,12 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
-import { api, type CodeMapMeta, type CodeMapReport, type Hotspot, type MapCapped, type ModuleContext } from './api.ts';
+import { api, type CodeMapMeta, type CodeMapReport, type Hotspot, type MapCapped, type ModuleContext, errorMessage } from './api.ts';
+import { codeMapState, type MapStatus } from './codeMapState.ts';
 import { inboxHref, lessonHref, moduleHref } from './links.ts';
 import { Button } from './ui/controls.tsx';
 import { scrollIntoPane } from './ui/scroll.ts';
-import { Alert, Badge, Card, CauseBadge, EmptyState, plural, SectionLabel, SkeletonDetail, SkeletonList, StatGrid, StatTile, tableClass, tdClass, thClass } from './ui/display.tsx';
+import { ago, Alert, Badge, Card, CauseBadge, EmptyState, plural, SectionLabel, SkeletonDetail, SkeletonList, StatGrid, StatTile, tableClass, tdClass, thClass } from './ui/display.tsx';
 import { ChevronIcon, CloseIcon } from './ui/icons.tsx';
+import { ScrollArea } from './ui/ScrollArea.tsx';
 
 type SortKey = 'path' | 'churn' | 'misses' | 'dependents' | 'score';
 type Sort = { key: SortKey; desc: boolean };
@@ -75,6 +77,9 @@ export function CodeMap({ projectKey, initialModule = null, focus = null, pollMs
   const [rebuild, setRebuild] = useState<{ busy: boolean; said: string | null; error: string | null }>({ busy: false, said: null, error: null });
   // After Rebuild map: the builtAt of the map it replaces; the card polls until a map with another one arrives.
   const [awaiting, setAwaiting] = useState<{ builtAt: string | null; since: number } | null>(null);
+  // This project's entry in /api/status codeMaps: whether a rebuild is running now or was cut short. null: none.
+  const [mapStatus, setMapStatus] = useState<MapStatus | null>(null);
+  const loadStatus = () => api.status().then((s) => setMapStatus(s.codeMaps?.find((m) => m.projectKey === projectKey) ?? null), () => {});
 
   useEffect(() => {
     setReport(null);
@@ -87,8 +92,10 @@ export function CodeMap({ projectKey, initialModule = null, focus = null, pollMs
     setShowZero(false);
     setRebuild({ busy: false, said: null, error: null });
     setAwaiting(null);
+    setMapStatus(null);
     let stale = false;
-    api.codeMap(projectKey, undefined, tests).then((r) => { if (!stale) setReport({ meta: r?.meta ?? null, hotspots: r?.hotspots ?? [], capped: r?.capped }); }, (e) => { if (!stale) setError(String(e)); });
+    void loadStatus();
+    api.codeMap(projectKey, undefined, tests).then((r) => { if (!stale) setReport({ meta: r?.meta ?? null, hotspots: r?.hotspots ?? [], capped: r?.capped }); }, (e) => { if (!stale) setError(errorMessage(e)); });
     return () => { stale = true; };
   }, [projectKey, tests]);
 
@@ -101,18 +108,21 @@ export function CodeMap({ projectKey, initialModule = null, focus = null, pollMs
         setRebuild({ busy: false, said: 'The worker has not rebuilt the map yet: it may be busy with a long job. Reload this page later to see it.', error: null });
         return;
       }
+      void loadStatus();
       api.codeMap(projectKey, undefined, tests).then((r) => {
-        if (stale || !r?.meta) return;
+        // No map for a moment: the rebuild has not written the new one yet.
+        if (stale || !r.meta) return;
+        // A failure since you asked: the card's state line says what failed and what to do.
         if (r.meta.lastFailureAt && Date.parse(r.meta.lastFailureAt) >= awaiting.since) {
-          setReport({ meta: r.meta, hotspots: r.hotspots ?? [], capped: r.capped });
+          setReport({ meta: r.meta, hotspots: r.hotspots, capped: r.capped });
           setAwaiting(null);
-          setRebuild({ busy: false, said: null, error: `The rebuild failed: ${r.meta.lastFailure ?? 'see Activity for details'}. The last good map is still available below.` });
+          setRebuild({ busy: false, said: null, error: null });
           return;
         }
         if (r.meta.builtAt === awaiting.builtAt) return;
-        setReport({ meta: r.meta, hotspots: r.hotspots ?? [], capped: r.capped });
+        setReport({ meta: r.meta, hotspots: r.hotspots, capped: r.capped });
         setAwaiting(null);
-        setRebuild({ busy: false, said: `Map rebuilt ${new Date(r.meta.builtAt).toLocaleString()}.`, error: null });
+        setRebuild({ busy: false, said: 'Map rebuilt just now.', error: null });
       }, () => {});
     }, pollMs);
     return () => { stale = true; clearInterval(t); };
@@ -126,16 +136,20 @@ export function CodeMap({ projectKey, initialModule = null, focus = null, pollMs
   const sortBy = (key: SortKey) => setSort((s) => (s.key === key ? { key, desc: !s.desc } : defaultSort(key)));
 
   const meta = report?.meta;
+  const state = meta ? codeMapState(meta, mapStatus) : null;
   const cap = mapCap(meta, report?.capped);
   const cappedAt = mapCapNote(meta, report?.capped);
+  // An unchanged repo keeps its old build; the worker confirms it current at each pass.
+  const checkedAt = meta?.checkedAt || meta?.builtAt || null;
   const askRebuild = () => {
     setRebuild({ busy: true, said: null, error: null });
     api.rebuildCodeMap(projectKey).then(
       () => {
         setRebuild({ busy: false, said: 'Rebuild queued: the worker remaps this project from scratch at its next pass (a minute or so). This card updates when the new map is in.', error: null });
-        setAwaiting({ builtAt: meta?.builtAt ?? null, since: Date.now() });
+        // Rebuild map is offered only with a map.
+        setAwaiting({ builtAt: meta!.builtAt, since: Date.now() });
       },
-      (e) => setRebuild({ busy: false, said: null, error: e instanceof Error ? e.message : String(e) }),
+      (e) => setRebuild({ busy: false, said: null, error: errorMessage(e) }),
     );
   };
   return (
@@ -143,16 +157,16 @@ export function CodeMap({ projectKey, initialModule = null, focus = null, pollMs
       title="Code map"
       bodyClass="grid gap-3 p-3"
       actions={meta ? (
-        <Button size="sm" onClick={askRebuild} disabled={rebuild.busy || !!awaiting} title="remap this project from scratch, whether or not the repo changed">
+        <Button size="sm" owner onClick={askRebuild} disabled={rebuild.busy || !!awaiting} title="remap this project from scratch, whether or not the repo changed">
           Rebuild map
         </Button>
       ) : undefined}
     >
       {error && <Alert>{error}</Alert>}
       {rebuild.error && <Alert>{rebuild.error}</Alert>}
-      {!rebuild.error && meta?.lastFailureAt && (
-        <Alert>Last rebuild failed {new Date(meta.lastFailureAt).toLocaleString()}: {meta.lastFailure ?? 'see Activity for details'}. The last good map remains available.</Alert>
-      )}
+      {state && (state.tone === 'bad'
+        ? <Alert>{state.line}{state.next && <> <span className="font-medium">Next:</span> {state.next}</>}</Alert>
+        : <p role="status" className="rounded-md border border-line bg-info-soft px-3 py-2 text-info-text">{state.line}</p>)}
       {rebuild.said && <p role="status" className="text-xs text-muted">{rebuild.said}</p>}
       {!report && !error ? (
         <SkeletonList rows={3} />
@@ -170,7 +184,13 @@ export function CodeMap({ projectKey, initialModule = null, focus = null, pollMs
             />
             <StatTile label="symbols" value={meta.stats.symbols} hint="functions, classes, types…" />
             <StatTile label="edges" value={meta.stats.imports + meta.stats.tests} hint={`${meta.stats.imports} imports · ${meta.stats.tests} test links`} />
-            <StatTile label="last built" value={<span className="text-[15px]">{new Date(meta.builtAt).toLocaleString()}</span>} hint="rebuilt when the repo changes" />
+            <StatTile
+              label="last checked"
+              value={checkedAt ? <time dateTime={checkedAt} title={new Date(checkedAt).toLocaleString()} className="text-[15px]">{ago(checkedAt)}</time> : <span className="text-[15px]">never</span>}
+              hint={meta.builtAt
+                ? <>built <time dateTime={meta.builtAt} title={new Date(meta.builtAt).toLocaleString()}>{ago(meta.builtAt)}</time>; rebuilt when the repo changes</>
+                : 'the first build has not finished'}
+            />
           </StatGrid>
           {cap && (
             <p role="note" className="rounded-md border border-line bg-sunken px-3 py-2 text-xs text-muted">
@@ -178,7 +198,7 @@ export function CodeMap({ projectKey, initialModule = null, focus = null, pollMs
                 ? `Showing ${cappedAt}: the map is capped`
                 : `The map is ${cappedAt}; it was built before the total was counted, so Rebuild map to see how many it leaves out`}
               , keeping source and the files your sessions edited first. Files past the cap have no
-              hotspot, module panel or impact. To map more, raise SCAN_MAX_FILES (unset, it is 40% of the files, between 400 and 4,000).
+              hotspot; their module panel reads their symbols from the file when you open it. To map more, raise SCAN_MAX_FILES (unset, it is 40% of the files, between 400 and 4,000).
             </p>
           )}
 
@@ -198,7 +218,7 @@ export function CodeMap({ projectKey, initialModule = null, focus = null, pollMs
                 <Button size="sm" variant="ghost" onClick={() => setShowZero(true)}>Show the files anyway</Button>
               </div>
             ) : (
-              <div className="overflow-x-auto rounded-sm border border-line">
+              <ScrollArea className="overflow-x-auto rounded-sm border border-line">
                 <table className={`${tableClass} text-[13px]`}>
                   <thead>
                     <tr>
@@ -223,7 +243,7 @@ export function CodeMap({ projectKey, initialModule = null, focus = null, pollMs
                     ))}
                   </tbody>
                 </table>
-              </div>
+              </ScrollArea>
             )}
             {rows.length > ROWS && (showZero || rows.some((h) => h.score > 0)) && (
               <Button size="sm" variant="ghost" className="justify-self-start" onClick={() => setAll(!all)}>{all ? `Show the top ${ROWS}` : `Show all ${rows.length}`}</Button>
@@ -271,7 +291,7 @@ export function ModulePanel({ projectKey, path, onOpen, onClose, narrow = false 
     setOutside(null);
     api.codeModule(projectKey, path).then((r) => { if (!stale) setM(r); }, (e) => {
       if (stale) return;
-      const msg = e instanceof Error ? e.message : String(e);
+      const msg = errorMessage(e);
       if (!NOT_MAPPED.test(msg)) return setError(msg);
       // Not in the map: say why, from whether the map is capped (the API's own words stay out of it).
       api.codeMap(projectKey, 1).then((r) => { if (!stale) setOutside({ cap: mapCapNote(r.meta, r.capped) }); }, () => { if (!stale) setOutside({ cap: null }); });
@@ -309,7 +329,7 @@ export function ModulePanel({ projectKey, path, onOpen, onClose, narrow = false 
       ) : outside ? (
         <p role="note" className="text-[13px] text-muted">
           {outside.cap
-            ? <>This file is past the code map's cap: the map {outside.cap.startsWith('capped') ? 'is' : 'keeps'} {outside.cap}, the ones it ranks first (files sessions edited, then source code over config and docs), so it has no symbols, importers or tests here. Raise <code className="font-mono">SCAN_MAX_FILES</code> and rebuild the map to include it.</>
+            ? <>This file is past the code map's cap: the map {outside.cap.startsWith('capped') ? 'is' : 'keeps'} {outside.cap}, the ones it ranks first (files sessions edited, then source code over config and docs), so it has no importers or tests here. Raise <code className="font-mono">SCAN_MAX_FILES</code> and rebuild the map to include it.</>
             : <>This file is not in the code map: the map does not read it (ignored by git, a lock file or secret, too large, in a skipped folder, or not a code, docs or config file), or it is newer than the map. Rebuild map to check again.</>}
         </p>
       ) : !m ? (
@@ -326,7 +346,7 @@ export function ModulePanel({ projectKey, path, onOpen, onClose, narrow = false 
             ))}
           </Part>
 
-          <Part title="Symbols" count={m.symbols.length} empty="No symbols found.">
+          <Part title="Symbols" count={m.symbols.length} empty={m.outside ? "Past the code map's cap, and none could be read from the file now (not a parsed language, over the size limit, or unreadable). Its importers, imports and tests below come from the map's import index." : 'No symbols found.'}>
             {m.symbols.map((s, i) => (
               <li key={`${s.id}:${i}`} className="flex flex-wrap items-baseline gap-x-2">
                 <span className="font-mono text-[12px] [overflow-wrap:anywhere]">{s.name}</span>
@@ -386,7 +406,7 @@ function Part({ title, count, empty, wide = false, children }: { title: string; 
   return (
     <div className={`grid content-start gap-1.5 ${wide ? 'md:col-span-2' : ''}`}>
       <SectionLabel as="div">{title} ({count})</SectionLabel>
-      {count ? <ul className="grid max-h-64 gap-1.5 overflow-y-auto">{children}</ul> : <p className="text-xs text-muted">{empty}</p>}
+      {count ? <ScrollArea as="ul" className="grid max-h-64 gap-1.5 overflow-y-auto">{children}</ScrollArea> : <p className="text-xs text-muted">{empty}</p>}
     </div>
   );
 }

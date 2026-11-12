@@ -10,6 +10,9 @@
 # folders shared from the host, so there it is a volume on the Docker VM's Linux filesystem instead.
 # Everything it creates (image tag, volumes, folders) is removed on exit, pass or fail.
 set -euo pipefail
+# The Compose project is this checkout's (FG_INSTANCE and COMPOSE_FILE from its .env): a shell's own value would point
+# docker compose at another install's containers.
+unset COMPOSE_PROJECT_NAME COMPOSE_FILE
 cd "$(dirname "$0")/.."
 TAG="fg-uid-check:$$"
 STATE_VOL="fg-uid-check-state-$$"

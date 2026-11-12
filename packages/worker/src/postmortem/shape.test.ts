@@ -107,3 +107,22 @@ test('shapeLesson replaces a filler appliesWhen', () => {
   expect(r.lesson.appliesWhen).toBe('When changing web/src/markdown/pipeline.ts');
   expect(r.repaired).toEqual(['appliesWhen']);
 });
+
+describe('shapeLesson: titles and appliesWhen at the edges', () => {
+  test('a long title that is the start of the rule is cut to its first clause', () => {
+    const rule = 'Rewrite self-closing chart tags to paired tags in the markdown pipeline before rehype parses them, so charts render';
+    const title = 'Rewrite self-closing chart tags to paired tags in the markdown pipeline';
+    const r = shapeLesson(lesson({ title, rule }), { taskTitle: 'Charts' });
+    expect(r.lesson.title).toBe('Rewrite self-closing chart tags to paired tags in the…');
+    expect(r.repaired).toContain('title');
+  });
+
+  test('an appliesWhen of only short words is kept: it shares nothing with the rule', () => {
+    expect(shapeLesson(lesson({ appliesWhen: 'UI' }), { taskTitle: 'x' }).lesson.appliesWhen).toBe('UI');
+  });
+
+  test('a filler appliesWhen with no paths names the task as written, or the project when there is none', () => {
+    expect(shapeLesson(lesson({ appliesWhen: 'always', paths: [] }), { taskTitle: 'API pagination' }).lesson.appliesWhen).toBe('When working on API pagination');
+    expect(shapeLesson(lesson({ appliesWhen: 'always', paths: [] }), { taskTitle: ' ' }).lesson.appliesWhen).toBe('When working on this project');
+  });
+});

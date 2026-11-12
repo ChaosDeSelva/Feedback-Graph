@@ -62,8 +62,8 @@ export type MemoryDeps = {
   /** MEMORY_AUTO_APPROVE: import as approved. Default: proposed, waiting for you in Lessons like a post-mortem's lesson. */
   autoApprove?: boolean;
   runForWrite?(projectKey: string, path: string): Promise<RunTag | null>;
-  /** True when the session wrote this memory after feedback already represented in the Inbox. */
-  writtenAfterFeedback?(projectKey: string, path: string): Promise<boolean | string | null>;
+  /** The Inbox item of the feedback the session wrote this memory after (feedbackForMemoryWrite), or null. */
+  writtenAfterFeedback?(projectKey: string, path: string): Promise<string | null>;
   withdrawDuplicate?(id: string, feedbackId: string | null): Promise<void>;
   beginCorrelation?(): void;
 };
@@ -89,16 +89,16 @@ export async function importMemories(d: MemoryDeps): Promise<number> {
       const changed = d.state.changed(path, s.size, s.mtimeMs);
       const note = parseMemoryFile(await readFile(path, 'utf8'));
       const run = await d.runForWrite?.(projectKey, path);
-      const duplicate = note?.type === 'feedback' ? await d.writtenAfterFeedback?.(projectKey, path) : false;
-      if (duplicate && (d.state.getSetting(`memory-duplicate:${path}`) !== String(duplicate) || d.state.getSetting(`memory-duplicate-notice:${path}`) !== String(duplicate))) {
-        await d.withdrawDuplicate?.(`memory:${dir}/${file}`, typeof duplicate === 'string' ? duplicate : null);
+      const duplicate = note?.type === 'feedback' ? ((await d.writtenAfterFeedback?.(projectKey, path)) ?? null) : null;
+      if (duplicate && (d.state.getSetting(`memory-duplicate:${path}`) !== duplicate || d.state.getSetting(`memory-duplicate-notice:${path}`) !== duplicate)) {
+        await d.withdrawDuplicate?.(`memory:${dir}/${file}`, duplicate);
         await d.activity?.record({ kind: 'memory_imported', actor: 'memory-deduplication', projectKey,
           subject: `skipped duplicate feedback memory: ${note?.name || file.replace(/\.md$/, '')}`,
           why: 'the agent wrote this memory after feedback already represented in the Inbox; no duplicate lesson was imported',
-          details: { duplicate: true, ...(typeof duplicate === 'string' && { feedbackId: duplicate }) },
-          targets: typeof duplicate === 'string' ? [duplicate] : [] });
-        d.state.setSetting(`memory-duplicate:${path}`, String(duplicate));
-        d.state.setSetting(`memory-duplicate-notice:${path}`, String(duplicate));
+          details: { duplicate: true, feedbackId: duplicate },
+          targets: [duplicate] });
+        d.state.setSetting(`memory-duplicate:${path}`, duplicate);
+        d.state.setSetting(`memory-duplicate-notice:${path}`, duplicate);
       }
       if (!duplicate && !changed && !recheck) continue;
       if (note?.type === 'feedback' && !duplicate) {

@@ -1,7 +1,8 @@
 import { useEffect, useRef, useState } from 'react';
-import { api, type DocSummary } from './api.ts';
+import { READ_ONLY_TITLE, useOwnerWrites } from './ownerAccess.tsx';
+import { api, type DocSummary, errorMessage } from './api.ts';
 import { ConfirmDialog } from './ui/ConfirmDialog.tsx';
-import { Button, buttonClass } from './ui/controls.tsx';
+import { Button, buttonClass, usePending } from './ui/controls.tsx';
 import { Badge, Card, plural } from './ui/display.tsx';
 import { UploadIcon } from './ui/icons.tsx';
 
@@ -14,7 +15,7 @@ const ACCEPT = `.md,.txt,.markdown,.rst,.json,.yaml,.yml,.csv,text/*,${IMAGE_TYP
 const readFile = (f: File, as: 'text' | 'dataUrl') =>
   new Promise<string>((resolve, reject) => {
     const r = new FileReader();
-    r.onload = () => resolve(String(r.result ?? ''));
+    r.onload = () => resolve(r.result as string);
     r.onerror = () => reject(r.error);
     if (as === 'text') r.readAsText(f);
     else r.readAsDataURL(f);
@@ -48,6 +49,7 @@ function ReadState({ d }: { d: DocSummary }) {
  * synced for this project.
  */
 export function ProjectDocs({ projectKey, onError, pollMs = 5000, maxEmbedPolls = EMBED_POLLS }: { projectKey: string; onError: (e: string) => void; pollMs?: number; maxEmbedPolls?: number }) {
+  const writes = useOwnerWrites();
   const [docs, setDocs] = useState<DocSummary[]>([]);
   // Where the next (older) page starts; null when every document is shown.
   const [next, setNext] = useState<string | null>(null);
@@ -59,17 +61,17 @@ export function ProjectDocs({ projectKey, onError, pollMs = 5000, maxEmbedPolls 
   const load = (stale = () => false) =>
     api.docs(projectKey, shown.current > DOCS_PAGE ? { limit: Math.min(shown.current, DOCS_MAX) } : {}).then(
       (p) => { if (!stale()) { setDocs(p.items); setNext(p.next); } },
-      (e) => { if (!stale()) onError(String(e)); },
+      (e) => { if (!stale()) onError(errorMessage(e)); },
     );
+  // Its button is shown only while there is an older page.
   async function loadMore() {
-    if (!next) return;
     setLoadingMore(true);
     try {
-      const p = await api.docs(projectKey, { cursor: next });
+      const p = await api.docs(projectKey, { cursor: next! });
       setDocs((ds) => [...ds, ...p.items.filter((d) => !ds.some((x) => x.id === d.id))]);
       setNext(p.next);
     } catch (e) {
-      onError(String(e));
+      onError(errorMessage(e));
     } finally {
       setLoadingMore(false);
     }
@@ -144,20 +146,21 @@ export function ProjectDocs({ projectKey, onError, pollMs = 5000, maxEmbedPolls 
       }
       await load();
     } catch (e) {
-      onError(String(e));
+      onError(errorMessage(e));
     } finally {
       setBusy(false);
     }
   }
 
-  async function reread(id: string) {
+  const [rereading, runReread] = usePending<string>();
+  const reread = (id: string) => runReread(id, async () => {
     try {
       await api.rereadDoc(id);
       await load();
     } catch (e) {
-      onError(String(e));
+      onError(errorMessage(e));
     }
-  }
+  });
 
   const [removing, setRemoving] = useState<DocSummary | null>(null);
   const [busyRemoving, setBusyRemoving] = useState(false);
@@ -169,7 +172,7 @@ export function ProjectDocs({ projectKey, onError, pollMs = 5000, maxEmbedPolls 
       await api.deleteDoc(id);
       setDocs((ds) => ds.filter((d) => d.id !== id));
     } catch (e) {
-      onError(String(e));
+      onError(errorMessage(e));
     } finally {
       setBusyRemoving(false);
       setRemoving(null);
@@ -180,10 +183,10 @@ export function ProjectDocs({ projectKey, onError, pollMs = 5000, maxEmbedPolls 
     <Card
       title={`Docs and discussions (${docs.length}${next ? '+' : ''})`}
       actions={
-        <label className={buttonClass('secondary', 'sm', `relative cursor-pointer focus-within:outline-2 focus-within:outline-focus ${busy ? 'opacity-60' : ''}`)}>
+        <label title={writes ? undefined : READ_ONLY_TITLE} className={buttonClass('secondary', 'sm', `relative focus-within:outline-2 focus-within:outline-focus ${busy || !writes ? 'opacity-60' : 'cursor-pointer'}`)}>
           <UploadIcon size={13} />
           {busy ? 'uploading…' : 'upload docs or images'}
-          <input aria-label="upload document" type="file" multiple accept={ACCEPT} className="sr-only" onChange={(e) => upload(e.target.files)} disabled={busy} />
+          <input aria-label="upload document" type="file" multiple accept={ACCEPT} className="sr-only" onChange={(e) => upload(e.target.files)} disabled={busy || !writes} />
         </label>
       }
     >
@@ -216,9 +219,9 @@ export function ProjectDocs({ projectKey, onError, pollMs = 5000, maxEmbedPolls 
             </span>
             <span className="flex shrink-0 items-center gap-1">
               {d.read?.status === 'failed' && (
-                <Button size="sm" variant="ghost" aria-label={`retry reading ${d.title}`} title="read it again now (after changing DOCS_LLM, say), without uploading it again" onClick={() => void reread(d.id)}>retry</Button>
+                <Button size="sm" variant="ghost" owner aria-label={`retry reading ${d.title}`} title="read it again now (after changing DOCS_LLM, say), without uploading it again" busy={!!rereading} onClick={() => void reread(d.id)}>{rereading === d.id ? 'retrying…' : 'retry'}</Button>
               )}
-              <Button size="sm" variant="ghost" aria-label={`remove ${d.title}`} onClick={() => setRemoving(d)} className="hover:text-bad-text">remove</Button>
+              <Button size="sm" variant="ghost" owner aria-label={`remove ${d.title}`} onClick={() => setRemoving(d)} className="hover:text-bad-text">remove</Button>
             </span>
           </li>
         ))}

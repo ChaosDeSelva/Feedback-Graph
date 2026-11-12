@@ -28,6 +28,7 @@ test('a polite review comment the keyword prefilter misses still goes to the mod
   await runCycle({
     listFiles: async () => [],
     readFile: async () => '',
+    readLines: async function* () {},
     state: new FileState(':memory:'),
     repo: {
       upsertSession: async () => {},
@@ -52,6 +53,7 @@ function cycleWith(turns: ClassifiableTurn[]) {
     activity: { record: async (a) => void activity.push(a) },
     listFiles: async () => [],
     readFile: async () => '',
+    readLines: async function* () {},
     state: new FileState(':memory:'),
     repo: {
       upsertSession: async () => {},

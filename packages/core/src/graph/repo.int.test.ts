@@ -240,6 +240,15 @@ describeStores('GraphStore', (h) => {
       expect(await h.store.ping()).toBe(true);
     });
 
+    test('the first agent seen is kept: a later agent does not replace it, and the heartbeat leaves it alone', async () => {
+      expect(await repo.agentSeen()).toBeNull();
+      await repo.markAgentSeen('claude-code 2.1.3 (MCP)', '2026-11-01T10:00:00.000Z');
+      await repo.markAgentSeen('codex-mcp-client 0.9 (MCP)', '2026-11-02T10:00:00.000Z');
+      await repo.heartbeat({ version: '0.2.0', startedAt: 'a', lastBeat: 'b', lastCycleAt: null, lastCycle: { turnsClassified: 0, scanned: false }, lastError: null, providers: { classify: 'x', postmortem: null } });
+      expect(await repo.agentSeen()).toEqual({ client: 'claude-code 2.1.3 (MCP)', at: '2026-11-01T10:00:00.000Z' });
+      expect((await repo.workerStatus())?.lastBeat).toBe('b');
+    });
+
     test('retention removes the text of old turns nobody flagged, and keeps whole sessions behind candidates', async () => {
       await repo.upsertSession(project, session(3), []);
       const s2 = session(3);

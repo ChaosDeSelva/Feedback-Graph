@@ -21,21 +21,24 @@ const EXTENDS_PATH = /^extends\s+(["'])([^"'\n]+)\1/;
 const INLINE_EXTENDS = /\bextends\s+(?:(["'])([^"'\n]+)\1|([A-Za-z_]\w*))/;
 const IDENT = /\b[A-Z]\w*/g;
 
-/** The line with strings and comments blanked; `inTriple` carries an open """ string across lines. */
-function codeOf(line: string, inTriple: boolean): { code: string; inTriple: boolean } {
+/**
+ * The line with strings and comments blanked (code), and with only its comment cut (uncommented, where load paths are
+ * read); `inTriple` carries an open """ string across lines.
+ */
+function codeOf(line: string, inTriple: boolean): { code: string; uncommented: string; inTriple: boolean } {
   let out = '';
   let i = 0;
   if (inTriple) {
     const end = line.indexOf('"""');
-    if (end < 0) return { code: '', inTriple: true };
+    if (end < 0) return { code: '', uncommented: line, inTriple: true };
     i = end + 3;
   }
   while (i < line.length) {
     const c = line[i];
-    if (c === '#') break;
+    if (c === '#') return { code: out, uncommented: line.slice(0, i), inTriple: false };
     if (line.startsWith('"""', i)) {
       const end = line.indexOf('"""', i + 3);
-      if (end < 0) return { code: out, inTriple: true };
+      if (end < 0) return { code: out, uncommented: line, inTriple: true };
       out += ' ';
       i = end + 3;
     } else if (c === '"' || c === "'") {
@@ -48,11 +51,11 @@ function codeOf(line: string, inTriple: boolean): { code: string; inTriple: bool
       i++;
     }
   }
-  return { code: out, inTriple: false };
+  return { code: out, uncommented: line, inTriple: false };
 }
 
 export function extractGdscript(source: string): Extracted {
-  const lines = source.split('\n');
+  const lines = source.replace(/^\uFEFF/, '').split('\n');
   const symbols: Extracted['symbols'] = [];
   const open: { sym: Extracted['symbols'][number]; start: number; end: number }[] = [];
   const specs = new Map<string, Set<string>>();
@@ -67,9 +70,9 @@ export function extractGdscript(source: string): Extracted {
   for (let n = 0; n < lines.length; n++) {
     const raw = lines[n].replace(/\r$/, '');
     const startsInTriple = inTriple;
-    const { code, inTriple: next } = codeOf(raw, inTriple);
+    const { code, uncommented, inTriple: next } = codeOf(raw, inTriple);
     inTriple = next;
-    for (const [, , path] of raw.matchAll(LOAD)) ref(path, '*');
+    for (const [, , path] of uncommented.matchAll(LOAD)) ref(path, '*');
     for (const [id] of code.matchAll(IDENT)) ref(id, id);
 
     // A line inside a multi-line string belongs to the statement it started in, whatever its indent.

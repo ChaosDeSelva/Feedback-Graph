@@ -182,10 +182,10 @@ test('a memory written after an existing feedback event is not imported as a dup
     transcriptsDir: transcripts, roots: async () => [{ host: '/Users/j/Vibe', keys: ['AcmeShop'] }], state: new FileState(':memory:'),
     embed: async () => { embedded = true; return [[1]]; }, upsertLesson: async () => { throw new Error('duplicate'); },
     activity: { record: async entry => { notices.push(entry); } },
-    writtenAfterFeedback: async (key, path) => key === 'AcmeShop' && path.endsWith('/memory/fix.md'),
+    writtenAfterFeedback: async (key, path) => (key === 'AcmeShop' && path.endsWith('/memory/fix.md') ? 'fb-1' : null),
   })).toBe(0);
   expect(embedded).toBe(false);
-  expect(notices).toContainEqual(expect.objectContaining({ kind: 'memory_imported', details: { duplicate: true } }));
+  expect(notices).toContainEqual(expect.objectContaining({ kind: 'memory_imported', details: { duplicate: true, feedbackId: 'fb-1' }, targets: ['fb-1'] }));
 });
 
 

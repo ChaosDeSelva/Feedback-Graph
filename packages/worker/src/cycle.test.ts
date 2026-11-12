@@ -24,6 +24,7 @@ function fakes(over: Partial<CycleDeps> = {}) {
   const deps: CycleDeps = {
     listFiles: async () => [{ path: '/t/demo/s1.jsonl', size: 100, mtimeMs: 1 }],
     readFile: async (p) => { reads.push(p); return transcript; },
+    readLines: async function* () {},
     state: new FileState(':memory:'),
     repo: {
       upsertSession: async (project, s) => { for (const t of s.turns) if (!turns.has(t.uuid)) turns.set(t.uuid, { ...t, projectKey: project.key }); },
@@ -573,7 +574,7 @@ describe('Codex sessions', () => {
   test('a large file that keeps growing is re-read at most every few minutes', async () => {
     let now = 1_000_000;
     let size = 100;
-    const f = codexFakes(rollout, { now: () => now, largeFileBytes: 50, largeFileMinIntervalMs: 600_000 });
+    const f = codexFakes(rollout, { now: () => now, largeFileBytes: 50 });
     f.deps.listFiles = async () => [{ ...codexFile, size, mtimeMs: size }];
     await runCycle(f.deps);
     size = 200;
@@ -739,4 +740,17 @@ describe('an instruction about git is not pushback until the agent does what it 
     expect(seen.map((t) => t.uuid)).toEqual(['u1']);
     expect(seen[0].followingToolCalls?.map((c) => c.command)).toEqual(['git push -u origin fix/chart-embeds']);
   });
+});
+
+test('a failing remote backfill (the store busy) is logged and the cycle still reads the transcripts', async () => {
+  const logs: { msg: string; extra?: object }[] = [];
+  const table = projectTable([]);
+  const f = fakes({
+    remote: async () => null,
+    projects: { ...table.repo, projectsMissingFolder: async () => { throw new Error('Neo.TransientError.Transaction.DeadlockDetected'); } },
+    log: (msg, extra) => { logs.push({ msg, extra }); },
+  });
+  const r = await runCycle(f.deps);
+  expect(r.filesIngested).toBe(1);
+  expect(logs).toContainEqual({ msg: 'remote backfill failed', extra: { error: 'Error: Neo.TransientError.Transaction.DeadlockDetected' } });
 });

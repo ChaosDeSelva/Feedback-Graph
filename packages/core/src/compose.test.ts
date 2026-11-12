@@ -1,5 +1,5 @@
-import { readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { readdirSync, readFileSync, statSync } from 'node:fs';
+import { join, sep } from 'node:path';
 import { expect, test } from 'vitest';
 
 // Every setting .env.example documents must reach docker compose: a key compose never interpolates is ignored
@@ -113,4 +113,17 @@ test('archive volume initialization creates its private directory before chown s
   expect(init.indexOf('mkdir -p /redaction-key/private')).toBeGreaterThan(0);
   expect(init.indexOf('mkdir -p /redaction-key/private')).toBeLessThan(init.indexOf('chown -hR'));
   expect(init).toContain('[ ! -L /redaction-key/private ] || exit 1');
+});
+
+test('every variable docker-compose.yml sets for a service is read by the code or by that service\'s own command', () => {
+  const compose = readFileSync(join(repo, 'docker-compose.yml'), 'utf8');
+  const keys = [...new Set([...compose.matchAll(/^ {6}([A-Z][A-Z0-9_]*):/gm)].map((m) => m[1]!))];
+  const sources = ['packages', 'scripts', 'plugin'].flatMap((dir) =>
+    readdirSync(join(repo, dir), { recursive: true, encoding: 'utf8' })
+      .filter((f) => !f.split(sep).includes('node_modules') && /\.(ts|tsx|mjs|js|sh)$/.test(f) && !/\.test\.tsx?$/.test(f))
+      .map((f) => join(repo, dir, f)))
+    .filter((f) => statSync(f).isFile())
+    .map((f) => readFileSync(f, 'utf8'));
+  const unread = keys.filter((k) => !compose.includes(`$$${k}`) && !sources.some((s) => new RegExp(`\\b${k}\\b`).test(s)));
+  expect(unread).toEqual([]);
 });

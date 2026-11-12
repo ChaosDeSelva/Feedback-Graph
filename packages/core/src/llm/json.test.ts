@@ -168,3 +168,16 @@ test('askJson passes the abort signal to the provider and does not ask again onc
   expect(seen).toHaveLength(1);
   expect(seen[0].signal).toBe(c.signal);
 });
+
+test('an empty answer says so, and a bracket closed by the wrong kind is skipped for the next object', () => {
+  expect(() => extractJsonAnswer('  \n ')).toThrow('the answer was empty; the answer ended: (empty)');
+  expect(extractJsonAnswer('first {"a": [1} then {"b": 2}')).toEqual({ b: 2 });
+});
+
+test('askJson shows any kind of answer in its error: text as it is, a value as JSON, an unprintable one as text', async () => {
+  const fails = (raw: unknown) => askJson(fake([raw, raw]).llm, task, () => { throw 'not an object'; }).catch((e: Error) => e.message);
+  expect(await fails('plain words')).toBe('the answer did not match the schema: not an object; the answer ended: plain words');
+  expect(await fails({ b: 1 })).toMatch(/the answer ended: \{"b":1\}$/);
+  expect(await fails(undefined)).toMatch(/the answer ended: undefined$/);
+  expect(await fails(10n)).toMatch(/the answer ended: 10$/);
+});

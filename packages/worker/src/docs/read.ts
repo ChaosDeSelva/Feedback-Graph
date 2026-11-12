@@ -119,7 +119,7 @@ async function saveReading(d: ReadDeps, job: DocToRead, facts: CodeFact[], descr
     why: (job.image ? 'you uploaded this image; its description is now searchable and its facts reach agents' : 'you uploaded this document; its facts reach agents ranked by relevance')
       + (credentials ? `; ${credentials} fact${credentials === 1 ? '' : 's'} held a credential and ${credentials === 1 ? 'was' : 'were'} not kept (remove the secret from the upload and rotate it)` : '')
       + (instructions ? `; ${instructions} fact${instructions === 1 ? '' : 's'} read as an instruction to the agent ${instructions === 1 ? 'was' : 'were'} not kept: an upload is data, not instructions` : ''),
-    details: { kind: job.kind, ...(credentials ? { credentialFactsDropped: credentials } : {}), ...(instructions ? { instructionFactsDropped: instructions } : {}), facts: kept.map((f) => ({ kind: f.kind, statement: f.statement, relevance: f.relevance ?? null })), ...(description ? { description: description.slice(0, 2000) } : {}) },
+    details: { kind: job.kind, ...(credentials ? { credentialFactsDropped: credentials } : {}), ...(instructions ? { instructionFactsDropped: instructions } : {}), facts: kept.map((f) => ({ kind: f.kind, statement: f.statement, relevance: f.relevance })), ...(description ? { description: description.slice(0, 2000) } : {}) },
     targets: [job.id],
   });
   return { read: true };

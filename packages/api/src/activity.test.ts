@@ -22,7 +22,7 @@ function setup() {
       lessonDetail: async (id: string) => (id === lesson.id ? { lesson, miss: null, feedback: null, contextItems: [], fixCommits: [], supersedes: [] } : null),
       updateLesson: async () => ({ unscoped: false }),
     } as never,
-    activity: {
+    activity: { removeRun: async () => 0,
       record: async (a) => { recorded.push(a); },
       list: async (q) => { listed.push(q); return []; },
       get: async (id) => (id === 'act:1' ? entry('shop') : id === 'act:hidden' ? entry('elsewhere') : null),

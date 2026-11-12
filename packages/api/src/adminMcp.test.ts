@@ -41,7 +41,7 @@ function setup(o: { allow?: OperatorVerb[]; token?: string | null; apiToken?: st
     folders: async () => [{ key: 'acme', path: '/Users/me/Vibe/acme' }, { key: 'demo-shop', path: '/Users/me/Vibe/demo-shop' }],
     excluded: [], roots: ['/Users/me/Vibe'],
   };
-  const activity = { record: async (e: ActivityInput) => { logged.push(e); }, list: async () => [] };
+  const activity = { record: async (e: ActivityInput) => { logged.push(e); }, list: async () => [], removeRun: async () => 0 };
   const cloud: CloudDeps = {
     cloud: null, portability: { exportData: async () => ({}) as never }, activity, projects: async () => [], worker: async () => null,
   };
@@ -54,6 +54,7 @@ function setup(o: { allow?: OperatorVerb[]; token?: string | null; apiToken?: st
       listLessons: async () => [lesson],
       lessonDetail: async () => ({ lesson, miss: null, feedback: null, contextItems: [], fixCommits: [], supersedes: [] }),
       updateLesson: async (...a: unknown[]) => { note('updateLesson', a); return { unscoped: false }; },
+      postmortemBacklog: async () => 0, postmortemQueue: async () => ({ waiting: 0, oldestAt: null }), requestLessonRecheck: async () => 0, decidedLessons: async () => [],
     } as never,
     facts: {
       listProjects: async () => [], listFacts: async () => [], searchFacts: async () => [],
@@ -119,12 +120,14 @@ test('the operator token lists every admin tool, each description naming its ver
   expect(res.status).toBe(200);
   const tools = ((await res.json()) as { result: { tools: { name: string; description: string }[] } }).result.tools;
   expect(tools.map((t) => t.name).sort()).toEqual([
-    'cloud_sync_now', 'demo_remove', 'demo_seed', 'inbox_decide', 'inbox_get', 'inbox_list', 'lesson_decide', 'lesson_get', 'lessons_list', 'link_decide', 'list_projects',
-    'pipeline_status', 'rebuild_code_map', 'run_cleanup', 'scan_projects', 'select_projects', 'session_evidence', 'set_fact_relevance',
+    'cloud_sync_now', 'decision_decide', 'decision_get', 'decision_note', 'decision_rollback', 'decisions_list', 'demo_remove', 'demo_seed', 'inbox_decide', 'inbox_get',
+    'inbox_list', 'lesson_decide', 'lesson_get', 'lessons_list', 'link_decide', 'list_projects', 'loop_pause', 'loop_status', 'pipeline_status', 'rebuild_code_map', 'run_cleanup', 'scan_projects', 'select_projects', 'session_evidence', 'set_fact_relevance',
   ]);
   expect(tools.find((t) => t.name === 'lesson_decide')!.description).toContain('lesson_decide');
   expect(tools.find((t) => t.name === 'rebuild_code_map')!.description).toContain('OPERATOR_ALLOW: scan');
-  expect(tools.find((t) => t.name === 'demo_seed')!.description).toContain('OPERATOR_ALLOW: lesson_decide');
+  expect(tools.find((t) => t.name === 'decision_rollback')!.description).toContain('OPERATOR_ALLOW: loop_decide');
+  expect(tools.find((t) => t.name === 'loop_pause')!.description).toContain('OPERATOR_ALLOW: loop_settings');
+  expect(tools.find((t) => t.name === 'demo_seed')!.description).toMatch(/OPERATOR_ALLOW: demo .*also needs lesson_decide/);
   expect(ADMIN_TOOLS.inbox_decide).toBe('inbox_decide');
   expect(ADMIN_TOOLS.inbox_list).toBeNull();
 });
@@ -313,7 +316,7 @@ test('demo_seed and demo_remove go through the demo routes as the agent; another
   const s = setup({ extra: { demo: demo as never } });
   const r = await tool(s.app, 'demo_seed', {});
   expect(r.isError).toBeFalsy();
-  expect(r.text).toMatch(/approved by you running fg demo seed/);
+  expect(r.text).toMatch(/approved by the operator token \(operator:codex\) running fg demo seed/);
   expect(s.logged.find((e) => e.kind === 'demo_seeded')?.actor).toBe('operator:codex');
   const other = await tool(s.app, 'demo_seed', { project: 'acme' });
   expect(other.isError).toBe(true);
@@ -326,13 +329,17 @@ test('read tools say they are read-only, so a client need not ask before each ca
   const res = await app.request('/mcp/admin', rpc({ method: 'tools/list', params: {} }, bearer(OP)));
   const tools = ((await res.json()) as { result: { tools: { name: string; annotations?: Record<string, boolean> }[] } }).result.tools;
   const reads = tools.filter((t) => t.annotations?.readOnlyHint).map((t) => t.name).sort();
-  expect(reads).toEqual(['inbox_get', 'inbox_list', 'lesson_get', 'lessons_list', 'list_projects', 'pipeline_status', 'session_evidence']);
+  expect(reads).toEqual(['decision_get', 'decisions_list', 'inbox_get', 'inbox_list', 'lesson_get', 'lessons_list', 'list_projects', 'loop_status', 'pipeline_status', 'session_evidence']);
   for (const t of tools) {
     expect(t.annotations, t.name).toBeDefined();
     expect(t.annotations!.readOnlyHint, t.name).toBe(!t.name.startsWith('demo_') && (!(t.name in ADMIN_TOOLS) || ADMIN_TOOLS[t.name as keyof typeof ADMIN_TOOLS] === null));
   }
   // Decisions agents learn from cannot be taken back by the tool that made them.
   expect(tools.find((t) => t.name === 'lesson_decide')!.annotations!.destructiveHint).toBe(true);
+  expect(tools.find((t) => t.name === 'decision_decide')!.annotations!.destructiveHint).toBe(true);
+  expect(tools.find((t) => t.name === 'decision_rollback')!.annotations!.destructiveHint).toBe(true);
+  expect(tools.find((t) => t.name === 'decision_note')!.annotations!).toMatchObject({ readOnlyHint: false, destructiveHint: false });
+  expect(tools.find((t) => t.name === 'loop_pause')!.annotations!).toMatchObject({ readOnlyHint: false, destructiveHint: false, idempotentHint: true });
   expect(tools.find((t) => t.name === 'scan_projects')!.annotations!.destructiveHint).toBe(false);
   // Sync now sends data to Feedback Graph Cloud: beyond this machine.
   expect(tools.find((t) => t.name === 'cloud_sync_now')!.annotations!.openWorldHint).toBe(true);
@@ -384,7 +391,7 @@ test('run_cleanup shows what a run would remove first, and removes it only when 
   const items = [{ kind: 'feedback' as const, id: 'manual:a', projectKey: 'demo-shop', sandbox: true, group: null, merged: false }];
   // The operator token opened run-1 (RunsStore.claim), so it may clean it up.
   const owner = { claim: async () => ({ run: 'run-1', principal: 'operator' as const, actor: runKey(KEY), firstSeen: 't' }), owner: async () => ({ run: 'run-1', principal: 'operator' as const, actor: runKey(KEY), firstSeen: 't' }) };
-  const s = setup({ extra: { runs: { ...owner, items: async () => items, remove: async (run, keep) => { removed.push([run, keep]); return { feedback: 1, lesson: 0, miss: 0, predone_check: 0, fact: 0, doc: 0, link: 0, chat: 0 }; } } } });
+  const s = setup({ extra: { runs: { sandbox: async () => false, ...owner, items: async () => items, remove: async (run, keep) => { removed.push([run, keep]); return { feedback: 1, lesson: 0, miss: 0, predone_check: 0, fact: 0, doc: 0, link: 0, chat: 0 }; } } } });
   const dry = JSON.parse((await tool(s.app, 'run_cleanup', { run: 'run-1' })).text);
   expect(dry).toMatchObject({ run: 'run-1', dryRun: true, remove: { feedback: 1 } });
   expect(removed).toEqual([]);
@@ -392,7 +399,7 @@ test('run_cleanup shows what a run would remove first, and removes it only when 
   expect(done).toMatchObject({ dryRun: false, removed: { feedback: 1 } });
   expect(removed).toEqual([['run-1', []]]);
   expect(s.logged.at(-1)).toMatchObject({ kind: 'run_cleaned', actor: 'operator:codex' });
-  const refused = await tool(setup({ allow: DEFAULT_ALLOW.filter((v) => v !== 'run_cleanup'), extra: { runs: { ...owner, items: async () => items, remove: async () => ({}) as never } } }).app, 'run_cleanup', { run: 'run-1' });
+  const refused = await tool(setup({ allow: DEFAULT_ALLOW.filter((v) => v !== 'run_cleanup'), extra: { runs: { sandbox: async () => false, ...owner, items: async () => items, remove: async () => ({}) as never } } }).app, 'run_cleanup', { run: 'run-1' });
   expect(refused.isError).toBe(true);
   expect(refused.text).toMatch(/403.*run_cleanup/);
 });

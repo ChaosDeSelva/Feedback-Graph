@@ -1,5 +1,5 @@
 import { authorizeStoreWrite, storeWriteAuthorizationCheckpoint, withRunClaimExecutor } from '../storeWrites.ts';
-import { storeRequestSignal, storeTimeLeft } from '../storeDeadline.ts';
+import { deadlineOr, storeRequestSignal, storeTimeLeft } from '../storeDeadline.ts';
 import { claimRunOwnerWith } from './runs.ts';
 import neo4j from 'neo4j-driver';
 import { REDACT_PAGE, redactDeep, redactSecrets, redactStoredRow } from '../redact.ts';
@@ -149,7 +149,7 @@ export class SessionsRepo implements SessionsStore {
       this.g.sandbox.wrote(run);
       return true;
     } catch (error) { await tx.rollback().catch(() => {}); reset(); throw error; }
-    } finally { signal?.removeEventListener('abort', cancel); await session.close(); }
+    } catch (error) { throw deadlineOr(error, signal); } finally { signal?.removeEventListener('abort', cancel); await session.close(); }
   }
 
   async runFor(sessionId: string): Promise<RunTag | null> {

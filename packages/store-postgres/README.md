@@ -5,7 +5,7 @@ hosted team product runs the same api and worker code on Postgres. Both backends
 `packages/core/src/store.ts`, and one set of contract suites proves they behave the same.
 
 **Status:** complete. Every repository class is implemented and passes the same contract suites as Neo4j
-(`TEST_STORES=neo4j,postgres pnpm test:int`, run by `scripts/check.sh` and CI). The api, the worker and `reembed` open
+(`TEST_STORES=neo4j,postgres pnpm test:int`; `scripts/check.sh` and CI run them with coverage, `pnpm test:coverage:all`). The api, the worker and `reembed` open
 the configured backend with `openStore(config)` (`src/open.ts`): `STORE=postgres` plus `DATABASE_URL`. The
 implementation groups below are kept as the map of which test covers which class.
 
@@ -25,8 +25,9 @@ implementation groups below are kept as the map of which test covers which class
 | `migrations/0010_scan_attempts.sql` | Scan attempts and backoff on scan jobs. | frozen once run |
 | `migrations/0011_session_final_reply.sql` | `final_reply_text` and `final_reply_ts` on `sessions`: the agent's last reply after the last human turn, for summaries. | frozen once run |
 | `migrations/0012_final_reply_summarized.sql` | `final_reply_summarized_ts` on `sessions`: the final reply the summary has taken in, so a reply stored after the summary reached the last turn is still summarized. | frozen once run |
+| `migrations/0013_roots_saved.sql` ... `0059_code_file_namespaces.sql` | One file per later schema change, each opening with a comment that says what it adds; the CHANGELOG names them under the release that added them. 0053 (0.7.6) holds lesson triggers; 0.8.0 adds 0054 (the learning loop's decisions), 0055 (lesson serving weights and per-project similarity floors), 0056 (facts the loop records), 0057 (the loop at scale), 0058 (decision note order) and 0059 (C# namespaces kept with the code map). | frozen once run |
 | `src/migrate.ts` | Migration runner: `schema_migrations`, one transaction per file, advisory lock so api and worker can start together. | seam |
-| `src/db.ts` | `openDb`, `tx()` (all-or-nothing, Neo4j's `runInTransaction`), `iso()`, `toVector()` / `fromVector()`, `toJson()`, `notImplemented()`. Every query's parameters lose their NUL characters in the pool's client class (`stripNul`). | seam |
+| `src/db.ts` | `openDb`, `tx()` (all-or-nothing, Neo4j's `runInTransaction`), `iso()`, `toVector()` / `fromVector()` and `toJson()`. Every query's parameters lose their NUL characters in the pool's client class (`stripNul`). | seam |
 | `src/vector.ts` | The four nearest-neighbour queries in the form the HNSW indexes serve, and `runSearch` (iterative scans). | seam |
 | `src/store.ts` | `openPostgresStore(config)` / `postgresStore(db)`: a `Store` with `ensureSchema()` (migrations), `ping()`, `close()`. | seam |
 | `src/testing/*` | Test harness (creates the database in `TEST_PG_URL`, migrates it) and `PostgresProbe`. | seam |
@@ -132,6 +133,7 @@ Every test also calls Graph.upsertSession, saveClassification and decide (same g
 - updateLesson approves, edits, and supersedes
 - searchLessons returns approved lessons for the project and global ones, nearest first
 - relatedMisses finds similar past misses in the project with their feedback
+- missesNaming finds the misses naming a key as a whole key, in their text or feedback, nearest first
 - createManualFeedback queues a pending candidate; only your confirmation starts a post-mortem
 - recordPreDoneCheck stores which lessons were checked and which were gaps
 - post-mortem output, memory lessons and manual feedback are redacted before storage
@@ -170,6 +172,8 @@ Every test also calls Graph.upsertSession, saveClassification and decide (same g
 
 ### ActivityStore (`src/activity.ts`, group 3): `packages/core/src/graph/activity.int.test.ts`
 
+- since reads the log in the order it was written, page by page from a cursor, by kind, unlabelled and settled
+  (the cursor is opaque: Postgres's `seq`, Neo4j's `order` and id)
 - records an activity and lists it back with details and targets
 - filters by project, kind and target, newest first, with a limit
 - defaults: no details, no targets, global project
@@ -269,6 +273,63 @@ inside its transaction); Neo4j does the same for sessions stored before summarie
 
 `packages/worker/src/summarize/stage.int.test.ts`: the summarize stage with a fake model on each backend (only the
 delta is sent, cursors advance exactly, idle, retention interplay). `src/migrate.int.test.ts` checks 0009's backfill.
+
+### DecisionsStore (`src/decisions.ts`): `packages/core/src/graph/decisions.int.test.ts`
+
+The learning loop's records (0.8.0, `migrations/0054_decisions.sql`): `decisions` with `decision_targets` and
+`decision_deps` in their order, `decision_notes`, `miss_links`, `lesson_signals` and `loop_calibration`. Ids,
+snapshots and redaction come from `@fb/core` (`prepareDecision`, `decisionId`, `lessonFingerprint`,
+`factFingerprint`, `redactStoredDecision`). Also calls Knowledge.upsertLesson.
+
+- propose stores the decision under its content-addressed id; proposing it again is a no-op that returns it
+- two rounds proposing the same decision at once store it once
+- an observed decision needs no project and no model, and keeps targets of every kind
+- markApplying and markApplied are compare-and-set; inFlight lists what a crash left applying
+- of racing markApplying calls exactly one wins
+- markStatus moves only from the given statuses, records who decided, and keeps the rollback; ratify needs applied
+- list filters by status, type, project, mode, band, target and age, newest first, and pages
+- count groups what list matches by status, mode, type, applied and week, with list's filters, and agrees with list
+- list after a decision (keyset) pages in created order as offset does; by any of several targets; applied before
+- markLabelled marks an applied decision, which list({ unlabelled }) then leaves out; signalsOf reads many lessons' signals at once
+- dependents are the decisions that depend on one, newest first
+- notes are kept oldest first with their verdict and reason, redacted; a note on no decision is refused
+- lesson signals are replaced whole per lesson; a lesson that is gone is skipped
+- listSignals lists every lesson's signals with the lesson's project, source and status, by lesson id
+- calibration buckets start from the prior, add labels, count concurrent bumps, and are kept per policy version
+- miss links: one per pair, never to itself or a missing miss, listed from either end, and removable
+- what a decision carries is redacted before it is stored, the original archived; ids and fingerprints stay
+- redactStoredDecisions applies the current rules to stored decisions and notes, once
+
+### Expect fingerprints (`src/knowledge.ts`, `src/facts.ts`): `packages/core/src/graph/expectFingerprint.int.test.ts`
+
+A decision's domain write passes its snapshot's fingerprint; the target is locked (`FOR UPDATE`) and compared in the
+transaction that writes it.
+
+- updateLesson with expect writes only while the lesson still has that fingerprint
+- setFactRelevance with expect writes none of its updates when one fact changed or is gone
+
+### Loop facts and split lessons (`src/facts.ts`, `src/knowledge.ts`): `packages/core/src/graph/loopLessons.int.test.ts`, `facts.int.test.ts`
+
+`migrations/0056_loop_facts_and_splits.sql`: facts with origin `loop` and relevance by `loop:<v>`, filed under their
+project like yours (`FACT_ORIGINS_KEPT`), and `lessons.split_from`.
+
+- addOwnerFact with origin loop keeps its planned id; no scan closes, replaces or re-checks it, and a model never rescores it
+- addLoopLesson writes the fields as given, from the same miss as the lesson it splits, once; redacted
+- removeLoopLesson deletes only a lesson the loop split off, only while its fingerprint is as expected, with its signals
+
+### The learning loop at scale (`src/decisions.ts`, `src/portability.ts`): `migrations/0057_loop_scale.sql`
+
+`decisions.labelled_at` (labels counted before it, as `loop-kept:<id>` cursors, are carried over) with the partial
+index `decisions_unlabelled`; `decisions_held`, a partial index of the applied, unratified decisions by
+`sync_hold_until`, which exportData reads (those held now, filtered to the projects it exports); `pg_trgm` indexes on `lower(decisions.rationale)` and
+`lower(decision_targets.target_id)` for list's `q`. `src/migrate.int.test.ts` checks the carry-over.
+
+`migrations/0058_decision_notes_seq.sql`: `decision_notes.seq`, numbered as inserted, so `notes` reads a decision's notes
+by `ts, seq` and two written in the same millisecond keep their order (`decisions.int.test.ts`; `src/migrate.int.test.ts`
+checks that notes written before it keep theirs).
+
+`migrations/0059_code_file_namespaces.sql`: `code_files.cs_namespaces`, a C# file's namespaces, so a code map rebuild reads an
+unchanged file's without parsing it again.
 
 ### Text with NUL characters: `packages/core/src/graph/nul.int.test.ts`
 

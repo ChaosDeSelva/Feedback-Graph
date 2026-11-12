@@ -168,6 +168,25 @@ export function relatedMissesQuery(db: Db, q: { embedding: number[]; projectKey:
   };
 }
 
+/**
+ * missesNaming: the misses whose text or feedback names a key (issueKeyPattern), nearest first by an exact distance (a
+ * text match, not an index scan), with the same chain and wrong-session mark as relatedMissesQuery.
+ */
+export function missesNamingQuery(q: { pattern: string; embedding: number[]; projectKey: string; k: number; run?: string | null }, o: SearchOpts = {}): SqlQuery {
+  const n = Math.trunc(q.embedding.length);
+  return {
+    sql: `SELECT m.id, m.missed, m.cause,
+                 CASE WHEN $3::vector IS NOT NULL AND m.embedding IS NOT NULL AND vector_dims(m.embedding) = ${n} THEN 1 - (m.embedding <=> $3::vector) / 2 ELSE 0 END AS score,
+                 t.text, t.session_id, t.ts_text,
+                 EXISTS (SELECT 1 FROM lessons l WHERE l.miss_id = m.id AND l.status = 'rejected'
+                           AND l.checks @> '[{"name": "wrong-session"}]'::jsonb) AS wrong_session
+          FROM misses m JOIN feedback f ON f.id = m.feedback_id JOIN turns t ON t.uuid = f.turn_uuid
+          WHERE m.project_key = $1 AND ${runFilter('m', '$5', o)} AND (m.missed ~* $2 OR t.text ~* $2)
+          ORDER BY score DESC, m.id LIMIT $4`,
+    params: [q.projectKey, q.pattern, vectorParam(q.embedding), q.k, q.run ?? null],
+  };
+}
+
 /** Run a search with iterative HNSW scans on (see the header), in its own transaction so the settings stay local. */
 export async function runSearch(db: Db, query: SqlQuery, k: number): Promise<pg.QueryResultRow[]> {
   return tx(db, async (c) => {

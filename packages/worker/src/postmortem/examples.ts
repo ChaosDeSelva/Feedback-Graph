@@ -93,6 +93,10 @@ or rejected. They are about other feedback: never copy their content into this l
 `;
 const TAIL = '\n--- end of examples ---\n';
 
+/** The "applies when"s the examples show the writer: an edited lesson's, as proposed and as the owner changed it. */
+export const exampleWhens = (examples: LessonExample[]): string[] =>
+  examples.flatMap((x) => (x.outcome === 'edited' ? [x.lesson.proposedAs!.appliesWhen, x.lesson.appliesWhen] : []));
+
 /** The examples section of the prompt, at most EXAMPLES_BYTES; '' when there are none (the prompt is then unchanged). */
 export function renderExamples(examples: LessonExample[]): string {
   const kept: string[] = [];

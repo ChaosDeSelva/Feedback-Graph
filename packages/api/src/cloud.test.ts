@@ -8,7 +8,7 @@ const OWNER = 'owner-test-token-01234567890123456789';
 const auth = { ownerToken: OWNER };
 const ownerHeaders = { authorization: `Bearer ${OWNER}`, 'x-fg-owner': 'true' };
 const cloud: CloudConfig = { url: 'https://cloud.example.com', token: TOKEN, intervalMinutes: 60, projects: [], suggestions: false, machine: null };
-const repo = { listCandidates: async () => [], candidateDetail: async () => null, decide: async () => {}, stats: async () => [] } as ApiRepo;
+const repo = { undoDecision: async () => false, listCandidates: async () => [], candidateDetail: async () => null, decide: async () => {}, stats: async () => [] } as ApiRepo;
 
 const bundle = (key: string): ExportBundle => ({
   format: EXPORT_FORMAT, schemaVersion: 1, toolVersion: '0.2.0', exportedAt: '2026-10-23T10:00:00Z', projectKey: key,

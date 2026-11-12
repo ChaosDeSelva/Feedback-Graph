@@ -48,26 +48,102 @@ export function ollamaTuning(env: Record<string, string | undefined>): OllamaTun
   };
 }
 
-/** A fetch to Ollama that names Ollama, its URL and the model when nothing answers, instead of a bare "fetch failed". */
-async function ollamaFetch(url: string, model: string, what: string, fix: string, init: RequestInit & { timeoutMs: number }, fetchImpl?: typeof fetch): Promise<Response> {
-  const { timeoutMs, signal, ...rest } = init;
-  const timeout = AbortSignal.timeout(timeoutMs);
-  try {
-    return await (fetchImpl ?? fetch)(`${base(url)}${what}`, { ...rest, signal: signal ? AbortSignal.any([timeout, signal]) : timeout });
-  } catch (err) {
-    // The caller gave up (JsonTask.signal): its reason, not a timeout or an outage.
-    if (signal?.aborted) throw signal.reason ?? err;
-    if (modelTimeoutReason(err)) {
-      // Asked, but no answer in time: this item's failure (it counts), not an outage.
-      throw new ModelTimeoutError(`Ollama (${model}) did not answer within ${timeoutMs / 1000} s; raise OLLAMA_TIMEOUT_SECONDS, or lower OLLAMA_NUM_PREDICT if it loops`);
-    }
-    const why = providerUnavailableReason(err);
-    if (why?.startsWith('cannot reach')) {
-      const code = why.match(/\((\w+)\)$/)?.[1];
-      throw new ProviderUnavailableError(`Ollama is not reachable at ${base(url)} (${model}${code ? `, ${code}` : ''}): ${fix}`);
-    }
-    throw err;
+type FetchInit = RequestInit & { timeoutMs: number; /** Cuts the request short (a runaway answer); not the caller giving up. */ cut?: AbortSignal };
+
+/** A failed call to Ollama as the error that says what happened: the caller gave up, no answer in time, or no Ollama. */
+function ollamaFailure(err: unknown, url: string, model: string, fix: string, init: FetchInit): unknown {
+  // The caller gave up (JsonTask.signal): its reason, not a timeout or an outage.
+  if (init.signal?.aborted) return init.signal.reason;
+  if (modelTimeoutReason(err)) {
+    // Asked, but no answer in time: this item's failure (it counts), not an outage.
+    return new ModelTimeoutError(`Ollama (${model}) did not answer within ${init.timeoutMs / 1000} s; raise OLLAMA_TIMEOUT_SECONDS, or lower OLLAMA_NUM_PREDICT if it loops`);
   }
+  const why = providerUnavailableReason(err);
+  if (why?.startsWith('cannot reach')) {
+    const code = why.match(/\((\w+)\)$/)?.[1];
+    return new ProviderUnavailableError(`Ollama is not reachable at ${base(url)} (${model}${code ? `, ${code}` : ''}): ${fix}`);
+  }
+  return err;
+}
+
+/** A fetch to Ollama that names Ollama, its URL and the model when nothing answers, instead of a bare "fetch failed". */
+async function ollamaFetch(url: string, model: string, what: string, fix: string, init: FetchInit, fetchImpl?: typeof fetch): Promise<Response> {
+  const { timeoutMs, signal, cut, ...rest } = init;
+  const signals = [AbortSignal.timeout(timeoutMs), ...(signal ? [signal] : []), ...(cut ? [cut] : [])];
+  try {
+    return await (fetchImpl ?? fetch)(`${base(url)}${what}`, { ...rest, signal: signals.length > 1 ? AbortSignal.any(signals) : signals[0] });
+  } catch (err) {
+    throw ollamaFailure(err, url, model, fix, init);
+  }
+}
+
+/**
+ * Whitespace in a row, outside a JSON string, past which a JSON answer has stopped saying anything: under a schema,
+ * gemma4 can fill the rest of its budget with blank lines inside an array. The longest indentation of a real answer is
+ * a few dozen characters.
+ */
+export const MAX_WHITESPACE_RUN = 200;
+/** The same inside a JSON string, where a verbatim quote of a wide table holds runs of a few hundred spaces. */
+export const MAX_STRING_WHITESPACE_RUN = 4000;
+
+type ChatChunk = { message?: { content?: string; thinking?: string }; error?: string };
+
+/**
+ * A streamed chat reply, read as it comes: its content and thinking. A reply that turns into MAX_WHITESPACE_RUN
+ * whitespace characters in a row (MAX_STRING_WHITESPACE_RUN within a JSON string) is cut there (`stop` ends the request, so Ollama stops decoding) and is a
+ * ModelOutputError, which askJson retries at once, rather than a decode to the end of num_predict. A non-streamed body
+ * (one object) reads the same.
+ */
+async function readChat(res: Response, model: string, stop: () => void, fail: (err: unknown) => unknown): Promise<{ content: string; thinking: string }> {
+  let content = '';
+  let thinking = '';
+  let run = 0;
+  let inString = false;
+  let escaped = false;
+  let rest = '';
+  const take = (line: string) => {
+    if (!line.trim()) return;
+    const chunk = JSON.parse(line) as ChatChunk;
+    // After the 200 that started the stream, Ollama reports a crashed runner in the body; unstreamed it answered 500,
+    // so the error reads as that outage did (a repetition abort still reads as this item's failure).
+    if (chunk.error) throw new Error(`ollama 500: ${chunk.error}`);
+    const piece = chunk.message?.content ?? '';
+    content += piece;
+    thinking += chunk.message?.thinking ?? '';
+    for (const ch of piece) {
+      if (/\s/.test(ch)) run++;
+      else run = 0;
+      if (escaped) escaped = false;
+      else if (ch === '\\' && inString) escaped = true;
+      else if (ch === '"') inString = !inString;
+      const limit = inString ? MAX_STRING_WHITESPACE_RUN : MAX_WHITESPACE_RUN;
+      if (run >= limit) {
+        stop();
+        throw new ModelOutputError(`${model} wrote ${limit} or more whitespace characters in a row, so the answer was cut there`, content);
+      }
+    }
+  };
+  if (!res.body) return { content, thinking };
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  try {
+    for (;;) {
+      let next: ReadableStreamReadResult<Uint8Array>;
+      try {
+        next = await reader.read();
+      } catch (err) {
+        throw fail(err);
+      }
+      if (next.done) break;
+      const lines = (rest + decoder.decode(next.value, { stream: true })).split('\n');
+      rest = lines.pop()!;
+      for (const line of lines) take(line);
+    }
+    take(rest + decoder.decode());
+  } finally {
+    reader.releaseLock();
+  }
+  return { content, thinking };
 }
 
 export type ChatJsonOpts = {
@@ -98,19 +174,20 @@ const noThinkField = new Set<string>();
 const refusesThink = (status: number, text: string) => status === 400 && /\bthink/i.test(text);
 
 /**
- * One non-streaming Ollama chat call constrained to a JSON schema. `think: false` keeps a thinking model (gemma4,
- * qwen3) from spending the answer budget on reasoning before the JSON; Ollama checks the field only when it is true,
- * so models without thinking accept it too.
+ * One Ollama chat call constrained to a JSON schema, streamed so a runaway answer is cut early (readChat).
+ * `think: false` keeps a thinking model (gemma4, qwen3) from spending the answer budget on reasoning before the JSON;
+ * Ollama checks the field only when it is true, so models without thinking accept it too.
  */
 export async function ollamaChatJson<T>(o: ChatJsonOpts): Promise<T> {
   const fix = `${START}, or choose another provider for this job (CLASSIFY_LLM, POSTMORTEM_LLM, SCAN_LLM, CHECK_LLM, SUMMARY_LLM)`;
   const server = `${base(o.url)} ${o.model}`;
-  const ask = (think: boolean) => ollamaFetch(o.url, o.model, '/api/chat', fix, {
+  const cut = new AbortController();
+  const init = (think: boolean): FetchInit => ({
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({
       model: o.model,
-      stream: false,
+      stream: true,
       ...(think ? { think: false } : {}),
       format: o.schema,
       options: {
@@ -126,7 +203,9 @@ export async function ollamaChatJson<T>(o: ChatJsonOpts): Promise<T> {
     }),
     timeoutMs: o.timeoutMs ?? DEFAULT_OLLAMA_TIMEOUT_MS,
     ...(o.signal && { signal: o.signal }),
-  }, o.fetchImpl);
+    cut: cut.signal,
+  });
+  const ask = (think: boolean) => ollamaFetch(o.url, o.model, '/api/chat', fix, init(think), o.fetchImpl);
   let res = await ask(!noThinkField.has(server));
   if (!res.ok) {
     const text = await res.text();
@@ -135,10 +214,9 @@ export async function ollamaChatJson<T>(o: ChatJsonOpts): Promise<T> {
     res = await ask(false);
     if (!res.ok) throw new Error(`ollama ${res.status}: ${await res.text()}`);
   }
-  const body = (await res.json()) as { message?: { content?: string; thinking?: string } };
-  const content = body.message?.content ?? '';
-  if (!content.trim() && body.message?.thinking?.trim()) {
-    throw new ModelOutputError(`${o.model} answered only in its thinking, with no content: use a model or tag that honours think:false, or raise OLLAMA_NUM_PREDICT`, body.message.thinking);
+  const { content, thinking } = await readChat(res, o.model, () => cut.abort(), (err) => ollamaFailure(err, o.url, o.model, fix, init(false)));
+  if (!content.trim() && thinking.trim()) {
+    throw new ModelOutputError(`${o.model} answered only in its thinking, with no content: use a model or tag that honours think:false, or raise OLLAMA_NUM_PREDICT`, thinking);
   }
   // The schema is applied at the end of decoding, so some models still write reasoning or a fence around the JSON.
   return extractJsonAnswer(content) as T;

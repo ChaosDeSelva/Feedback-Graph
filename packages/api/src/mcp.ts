@@ -11,6 +11,12 @@ import { checkBeforeDone, getImpact, getModuleContext, getRecentSessions, getTas
  * seen) is refused here instead of costing an embedding and a megabyte Activity row.
  */
 const MAX = { path: 1000, key: 200, task: 8000, query: 2000, prose: 20_000, diff: 900_000 } as const;
+/**
+ * The most a /mcp request body may be: a check_before_done at every limit, each character escaped as JSON's longest
+ * form (\u001f, 6 bytes), plus room for the envelope, so a call the schema allows is never refused (413) before its
+ * arguments are checked; one past a limit is a tool error naming it.
+ */
+export const MCP_BODY_LIMIT = 6 * (MAX.diff + MAX.prose + MAX.task + MAX.path + MAX.key + 50 * MAX.path + 200) + 64 * 1024;
 
 const where = {
   cwd: z.string().max(MAX.path).optional().describe('Absolute path of the directory you are working in (preferred)'),
@@ -21,6 +27,11 @@ const text = (markdown: string) => ({ content: [{ type: 'text' as const, text: m
 const retryableToolError = (error: unknown) => {
   const e = error instanceof Error ? error : new Error(String(error));
   const code = (e as Error & { code?: string }).code;
+  // The models first: an Ollama that cannot be reached in time (UND_ERR_CONNECT_TIMEOUT) or does not answer is no
+  // fault of the graph store, which a retry would not help.
+  if (e.name === 'ProviderUnavailableError' || e.name === 'ModelTimeoutError') {
+    return { ...text(`The graph store is fine; the model this tool needs ${e.name === 'ModelTimeoutError' ? 'did not answer in time' : 'is unavailable'} (${e.message}). Retry once it answers.`), isError: true };
+  }
   if (code === 'Neo.TransientError.General.MemoryPoolOutOfMemoryError' || /transaction(?:al)? memory|memory pool/i.test(e.message)) {
     return { ...text('The graph store is temporarily at its transaction-memory limit. Retry this tool call in about 2 seconds.'), isError: true };
   }
@@ -38,21 +49,29 @@ const safe = <A, R>(fn: (args: A) => Promise<R>) => async (args: A): Promise<R |
 };
 
 /**
- * MCP ToolAnnotations. Codex will not call a tool without them, so every tool says what it is: context tools can record provenance, request scans or resolve GitHub metadata, so they do not advertise read-only; report_feedback queues a new inbox item each
- * call, but never removes or overwrites anything. None reaches past this machine's graph.
+ * MCP ToolAnnotations. Codex will not call a tool without them, so every tool says what it is. The context tools change
+ * nothing the developer owns: they only log what they served (Activity) and may queue a scan of files the code map
+ * lacks, so they are read-only. report_feedback queues a new inbox item each call, but never removes or overwrites
+ * anything. None reaches past this machine's graph.
  */
-const read = (title: string) => ({ title, annotations: { title, readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false } });
+const read = (title: string) => ({ title, annotations: { title, readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false } });
 const write = (title: string) => ({ title, annotations: { title, readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false } });
 
+/** Sent once at initialize, for an agent with the tools but not the skill: which tool to call when. */
+export const MCP_INSTRUCTIONS =
+  'Feedback Graph holds lessons learned from the developer\'s past corrections of coding agents, and a map of the code. '
+  + 'Call get_task_context before non-trivial work, naming the files you expect to change; get_module_context or impact before changing a file you do not know or others depend on; '
+  + 'check_before_done with your git diff before saying a task is done. When your work missed something the developer did not type as pushback, report it with report_feedback.';
+
 function buildServer(ctx: ContextDeps, client: string | undefined) {
-  const server = new McpServer({ name: 'feedback-graph', version: VERSION });
+  const server = new McpServer({ name: 'feedback-graph', version: VERSION }, { instructions: MCP_INSTRUCTIONS });
 
   server.registerTool(
     'get_task_context',
     {
       ...read('Task context'),
       description:
-        'Before starting non-trivial work: returns approved lessons from past developer feedback and similar past misses in this project, with citations, the code and document facts that matter most for everyday work, and the best matches from projects the developer linked to this one. Name the files you expect to change: lessons tied to them come first, and a short code map shows their importers, tests and past misses. brief: true returns only the lessons, the misses on the named files, their importers and tests, and PR discussions, in about 1,500 characters.',
+        'Before starting non-trivial work: returns approved lessons from past developer feedback and similar past misses in this project, with citations, the code and document facts that matter most for everyday work, and the best matches from projects the developer linked to this one. Name the files you expect to change: lessons tied to them come first, a short code map shows their importers, tests and past misses, and the AGENTS.md / CLAUDE.md files on their path are listed for you to read. brief: true returns only the lessons, the misses on the named files, their importers and tests, and PR discussions, in about 1,500 characters.',
       inputSchema: {
         ...where,
         task: z.string().max(MAX.task).describe('What you are about to build or change, in a sentence or two'),
@@ -69,10 +88,10 @@ function buildServer(ctx: ContextDeps, client: string | undefined) {
     {
       ...read('Check before done'),
       description:
-        'Before telling the developer a task is done: checks your work against lessons from past feedback on similar work and lists likely gaps, each with the diff lines it rests on. Pass diff (your git diff) and files_changed; with no diff, the diff of files_changed is read from the repo. Also says which importers and tests of those files your change did not touch, and what past misses there were about.',
+        'Before telling the developer a task is done: checks your work against lessons from past feedback on similar work and lists likely gaps, each with the diff lines it rests on (or the file a lesson requires that the diff lacks). Pass diff (your git diff) and files_changed; with no diff, the diff of files_changed is read from the repo. Also says which importers and tests of those files your change did not touch, and what past misses there were about.',
       inputSchema: {
         ...where,
-        task: z.string().max(MAX.task),
+        task: z.string().max(MAX.task).describe('The task you were given, in a sentence or two'),
         summary: z.string().max(MAX.prose).describe('What you built and how you verified it'),
         diff: z
           .string()
@@ -153,8 +172,8 @@ function buildServer(ctx: ContextDeps, client: string | undefined) {
     'search_graph',
     {
       ...read('Search the graph'),
-      description: 'Search the feedback graph by meaning: approved lessons, past misses, code facts and docs closest to the query, in about 3,000 characters. Each section says when nothing is close enough.',
-      inputSchema: { ...where, query: z.string().max(MAX.query) },
+      description: 'Search the feedback graph by meaning: approved lessons (those tied to a file the query names first), past misses, code facts and docs closest to the query, in about 3,000 characters. Each section says when nothing is close enough. A lesson found by meaning alone is a search match: check it applies.',
+      inputSchema: { ...where, query: z.string().max(MAX.query).describe('What to look for, in plain words') },
     },
     safe(async (a) => text((await searchGraph({ ...a, client }, ctx)).markdown)),
   );
@@ -198,13 +217,22 @@ export async function initializeClientInfo(req: Request): Promise<{ found: boole
 
 const retryIdentitySalt = randomBytes(32);
 
+/** Whether a request calls a tool (alone or in a batch). */
+async function callsTool(req: Request): Promise<boolean> {
+  const body = (await req.clone().json().catch(() => null)) as unknown;
+  return (Array.isArray(body) ? body : [body]).some((m) => m && typeof m === 'object' && (m as { method?: unknown }).method === 'tools/call');
+}
+
 async function initializeClient(req: Request): Promise<string | undefined> {
   const init = await initializeClientInfo(req);
   return init.found ? mcpClientLabel(init.info) : undefined;
 }
 
-/** Stateless Streamable HTTP: a fresh server + transport per request. */
-export async function handleMcp(req: Request, ctx: ContextDeps, authenticatedIdentity?: string): Promise<Response> {
+/**
+ * Stateless Streamable HTTP: a fresh server + transport per request. onAgentCall: told the client's label when a client
+ * that named itself at initialize calls a tool and the call answers; the fg CLI and probes never initialize, so never.
+ */
+export async function handleMcp(req: Request, ctx: ContextDeps, authenticatedIdentity?: string, onAgentCall?: (client: string) => Promise<void>): Promise<Response> {
   // A client ending its session (Codex does on every exit). Stateless: there is nothing to end, so it simply succeeds.
   if (req.method === 'DELETE') return new Response(null, { status: 204 });
   // The stream a GET opens is for messages the server sends unasked, and this one never does: the stateless transport
@@ -214,8 +242,10 @@ export async function handleMcp(req: Request, ctx: ContextDeps, authenticatedIde
   const capability = currentCaller();
   // Only the embedding authenticated route can vouch for a credential; arbitrary headers are not identity.
   const identity = authenticatedIdentity ? createHmac('sha256', retryIdentitySalt).update(JSON.stringify([authenticatedIdentity, capability, req.headers.get('origin')])).digest('hex') : undefined;
-  const server = buildServer({ ...ctx, checkRetryIdentity: identity }, initialized ?? decodeClient(req.headers.get('mcp-session-id')));
-  const transport = new WebStandardStreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true });
+  const client = initialized ?? decodeClient(req.headers.get('mcp-session-id'));
+  const agentCall = !!client && !!onAgentCall && (await callsTool(req));
+  const server = buildServer({ ...ctx, checkRetryIdentity: identity }, client);
+  const transport = new WebStandardStreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true, maxRequestBodySize: MCP_BODY_LIMIT });
   await server.connect(transport);
   try {
     const streamed = await transport.handleRequest(req);
@@ -223,6 +253,7 @@ export async function handleMcp(req: Request, ctx: ContextDeps, authenticatedIde
     // request authorization and cleanup observe that callback's outcome; do not buffer event streams.
     const res = streamed.body && streamed.headers.get('content-type')?.includes('application/json')
       ? new Response(await streamed.text(), { status: streamed.status, statusText: streamed.statusText, headers: streamed.headers }) : streamed;
+    if (agentCall && res.ok) await onAgentCall!(client!);
     if (!initialized || !res.ok) return res;
     const headers = new Headers(res.headers);
     headers.set('mcp-session-id', encodeClient(initialized));

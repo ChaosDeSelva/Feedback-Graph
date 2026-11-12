@@ -111,3 +111,11 @@ test('a pure instruction about git (no miss in its words) is a process miss what
   // A correction about code said with git words is not an instruction.
   expect(isProcessMiss({ feedbackText: 'you pushed before the tests in api/search.ts passed', rule: null, commentPath: null, paths: ['api/search.ts'] })).toBe(false);
 });
+
+test('feedback that complains and forbids a git step, with a git lesson, is a process miss even when the session edited files', () => {
+  expect(isProcessMiss({ feedbackText: 'the login is still broken and don\'t push to main', rule: 'Never push directly to main', commentPath: null, paths: ['src/a.ts'] })).toBe(true);
+});
+
+test('without the calls after it, an instruction with nothing done before it stays an instruction', async () => {
+  expect(await gitEvidence({ uuid: 'u1', text: "keep it on its own branch, don't push yet" }, undefined, Date.parse('2026-10-25T13:00:00Z'))).toBe('instruction');
+});

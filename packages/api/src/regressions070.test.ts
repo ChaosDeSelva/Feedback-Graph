@@ -1,3 +1,4 @@
+import { setImmediate as nextTurn } from 'node:timers/promises';
 import { expect, test, vi } from 'vitest';
 import { type Lesson, rankFacts, rankMisses, rankDocs } from '@fb/core';
 import { buildChatContext } from './chat.ts';
@@ -7,7 +8,7 @@ import { taskPrNumbers } from './diff.ts';
 import { Admission } from './admission.ts';
 
 const lesson: Lesson = { id: 'prefix', projectKey: 'demo', title: 'Reference identifiers', rule: 'Use ReferenceID(...) instead of KeyPrefix 005.', appliesWhen: 'editing schema', paths: ['src/schema.ts'], status: 'approved', scope: 'project', source: 'postmortem', cause: null, missId: null, createdAt: 't', decidedAt: 't' };
-const deps = (over: Partial<ContextDeps> = {}): ContextDeps => ({ roots: [{ host: '/projects', container: '/projects' }], exists: () => true, embed: async () => [[1]], k: { searchLessons: async () => [{ lesson, score: 1 }], relatedMisses: async () => [], recordPreDoneCheck: async () => {}, createManualFeedback: async () => 'f' }, judge: async () => [{ lessonId: lesson.id, applies: true, status: 'not_addressed', why: 'Required identifier is missing' }], ...over });
+const deps = (over: Partial<ContextDeps> = {}): ContextDeps => ({ roots: [{ host: '/projects', container: '/projects' }], exists: () => true, embed: async () => [[1]], k: { searchLessons: async () => [{ lesson, score: 1 }], missesNaming: async () => [], relatedMisses: async () => [], recordPreDoneCheck: async () => {}, createManualFeedback: async () => 'f' }, judge: async () => [{ lessonId: lesson.id, applies: true, status: 'not_addressed', why: 'Required identifier is missing' }], ...over });
 const change = '--- a/src/schema.ts\n+++ b/src/schema.ts\n@@ -1 +1 @@\n-KeyPrefix = "005";\n+schema.ReferenceID("tenant");\n';
 
 test('real MCP structured result preserves gaps, cannotTell and clean verdicts instead of replacing them with queue data', async () => {
@@ -87,8 +88,16 @@ test('completed queue metadata contains measured wait and service totals rather 
 
 test('an unavailable outcome store cannot stretch the end-to-end check response indefinitely', async () => {
   const context = deps({ checkTimeoutMs: 30, k: { ...deps().k, recordPreDoneCheck: async () => new Promise(() => {}) } });
-  const started = Date.now();
-  const result = await checkBeforeDone({ project: 'demo', task: 'edit src/schema.ts', summary: 'done' }, context);
-  expect(Date.now() - started).toBeLessThan(200);
-  expect(result.recorded).toBe(false);
+  // The 30 ms budget runs on fake timers: the response must be out once it has passed, however busy the machine is.
+  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+  try {
+    let answered = false;
+    const pending = checkBeforeDone({ project: 'demo', task: 'edit src/schema.ts', summary: 'done' }, context).finally(() => { answered = true; });
+    await vi.advanceTimersByTimeAsync(30);
+    await nextTurn();
+    expect(answered).toBe(true);
+    expect((await pending).recorded).toBe(false);
+  } finally {
+    vi.useRealTimers();
+  }
 });

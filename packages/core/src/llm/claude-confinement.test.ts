@@ -1,22 +1,15 @@
-import { execFileSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, expect, test } from 'vitest';
+import { execResult } from '../testing/exec.ts';
 import { claudeArgs, execCommand } from './providers.ts';
 
 /**
  * The real claude CLI with the worker's exact flags: a file outside the cwd and a secret file inside it must stay
  * unread. Skipped when claude is not installed or not signed in (CI); it makes one small model call when it runs.
  */
-const installed = (() => {
-  try {
-    execFileSync('claude', ['--version'], { stdio: 'ignore', timeout: 20_000 });
-    return true;
-  } catch {
-    return false;
-  }
-})();
+const installed = await execResult('claude', ['--version'], { timeout: 20_000 }).then((r) => r.status === 0, () => false);
 
 const root = realpathSync(mkdtempSync(join(tmpdir(), 'fb-confine-')));
 afterAll(() => rmSync(root, { recursive: true, force: true }));

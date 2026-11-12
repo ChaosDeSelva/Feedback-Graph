@@ -2,6 +2,7 @@ import { z, type ZodTypeAny } from 'zod';
 import { appSchemas } from './app.ts';
 import { chatSchemas } from './chat.ts';
 import { cloudSchemas } from './cloud.ts';
+import { loopSchemas } from './decisions.ts';
 import { importSchemas } from './import.ts';
 import { integrationSchemas } from './integrations.ts';
 import { OWNER_ROUTES } from './operator.ts';
@@ -73,7 +74,7 @@ type Method = 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE';
  * schema: the 2xx body's JSON Schema. Unset: read from `response` when it starts with a type named in SCHEMAS
  * (`Lesson`, `Candidate[]`).
  */
-type Route = { summary: string; tag: string; body?: ZodTypeAny; query?: z.AnyZodObject; response: string; status?: number; type?: string; schema?: JsonSchema; description?: string };
+type Route = { summary: string; tag: string; body?: ZodTypeAny; query?: z.AnyZodObject; response: string; status?: number; type?: string; schema?: JsonSchema };
 
 // ── Response shapes (components.schemas) ───────────────────────────────
 // The main objects spelled out from the core types (types.ts, graph/*.ts); the bigger composites are objects with a
@@ -113,6 +114,7 @@ const SCHEMAS: Record<string, JsonSchema> = {
     cause: nullable(str), missId: nullable(str), createdAt: time, decidedAt: nullable(time), decidedBy: nullable(str),
     checks: nullable(arrayOf(ref('LessonCheck'))), decisionNote: nullable(str),
     proposedAs: nullable(obj({ title: str, rule: str, appliesWhen: str, scope: str, paths: arrayOf(str) }, ['title', 'rule', 'appliesWhen', 'scope', 'paths'], 'What the post-mortem proposed, kept when the owner first edited it')),
+    changedByLoop: { const: true, description: 'A learning-loop decision still applied changed this lesson (GET /api/lessons and /api/lessons/:id); absent otherwise' },
   }, ['id', 'projectKey', 'title', 'rule', 'appliesWhen', 'scope', 'paths', 'status', 'source', 'cause', 'missId', 'createdAt', 'decidedAt']),
   LessonQuality: obj({ days: int, asWritten: int, edited: int, rejected: int, decided: int, byOperator: int }),
   LessonQualityReport: obj({
@@ -155,13 +157,13 @@ const SCHEMAS: Record<string, JsonSchema> = {
     version: str, store: nullable({ type: 'string', enum: ['neo4j', 'postgres'] }), graph: bool, worker: nullable(loose('The worker heartbeat')), workerHealthy: bool,
     authRequired: bool, ownerSetupRequired: bool, selection: nullable(obj({ initialized: bool, tracked: int, roots: int, note: nullable(str) }, ['initialized', 'tracked', 'note'])),
     cloud: nullable(loose('Cloud sync: host, interval, last Sync now, progress (token always [REDACTED])')), models: nullable(loose('Each job\'s model and whether it answers')),
-    givenUpTurns: nullable(int), ollama: nullable(loose('Whether Ollama answers')), connections: nullable(loose('GitHub, Linear, Claude, Codex, Ollama and cloud')),
+    givenUpTurns: nullable(int), agent: nullable(obj({ client: str, at: time }, ['client', 'at'])), ollama: nullable(loose('Whether Ollama answers')), connections: nullable(loose('GitHub, Linear, Claude, Codex, Ollama and cloud')),
     stage: nullable(obj({ name: str, startedAt: time, current: nullable(str) })), progress: nullable(obj({ done: int, total: nullable(int) })),
   }, ['version', 'store', 'graph', 'worker', 'workerHealthy', 'authRequired', 'selection']),
   PipelineStatus: obj({
     stage: nullable(obj({ name: str, startedAt: time, current: nullable(str) })), progress: nullable(obj({ done: int, total: nullable(int) })), sessions: nullable(int),
     classify: nullable(obj({ backlog: int, capped: bool })), inbox: nullable(obj({ pending: int, confirmed: int })), postmortems: nullable(obj({ queued: int })),
-    lessons: nullable(obj({ proposed: int, approved: int, global: int, quality: arrayOf(ref('LessonQuality')) }, ['proposed', 'approved'])), scans: nullable(obj({ done: int, queued: int, running: int, failed: int, never: int })),
+    lessons: nullable(obj({ proposed: int, approved: int, global: int, demo: obj({ proposed: int, approved: int }, ['proposed', 'approved']), quality: arrayOf(ref('LessonQuality')) }, ['proposed', 'approved'])), scans: nullable(obj({ done: int, queued: int, running: int, failed: int, never: int })),
     queues: obj({ scans: nullable(ref('WorkQueue')), classify: nullable(ref('WorkQueue')), postmortems: nullable(ref('WorkQueue')), chats: nullable(ref('WorkQueue')) }),
   }),
   WorkQueue: obj({
@@ -187,6 +189,54 @@ const SCHEMAS: Record<string, JsonSchema> = {
   ProjectGraph: loose('A project\'s knowledge graph: nodes and edges'),
   Patterns: loose('Recurring patterns'),
   LinearTeam: obj({ id: str, key: str, name: str }),
+  // The learning loop (decisions.ts, docs/learning-loop-api.md). Optional Decision fields are absent rather than null.
+  TargetSnapshot: obj({ kind: { type: 'string', enum: ['lesson', 'fact', 'miss', 'candidate', 'project'] }, id: str, fields: { type: 'object', additionalProperties: true, description: 'The target\'s fields as stored (redacted)' }, fingerprint: str }),
+  EvidenceRef: obj({ kind: { type: 'string', enum: ['activity', 'miss', 'lesson', 'fact', 'candidate', 'check', 'session'] }, id: str, role: str, weight: num, observedAt: str }),
+  Decision: obj({
+    id: str, type: str, projectKey: nullable(str),
+    targets: arrayOf(obj({ kind: str, id: str, role: { type: 'string', enum: ['primary', 'keeper', 'merged', 'created'] } })),
+    before: arrayOf(ref('TargetSnapshot')), after: arrayOf(ref('TargetSnapshot')), evidence: arrayOf(ref('EvidenceRef')),
+    features: { type: 'object', additionalProperties: num }, score: num, confidence: obj({ p: num, lower: num, n: int, band: int }),
+    tier: { type: 'string', enum: ['H', 'A', 'P'] }, mode: { type: 'string', enum: ['observe', 'propose', 'auto'] }, rationale: str,
+    model: nullable(str), policyVersion: int,
+    status: { type: 'string', enum: ['observed', 'proposed', 'applying', 'applied', 'rejected', 'rolled_back', 'overridden', 'expired'] },
+    dependsOn: arrayOf(str), supersededBy: str, createdAt: time, appliedAt: time, decidedAt: time,
+    decidedBy: { type: 'string', description: "'loop:<v>', 'you' or 'operator:<name>'" },
+    rollback: obj({ at: time, by: str, reason: nullable(str), note: nullable(str), cascade: arrayOf(str) }), ratifiedAt: time, ratifiedBy: str, syncHoldUntil: time,
+  }, ['id', 'type', 'projectKey', 'targets', 'before', 'after', 'evidence', 'features', 'score', 'confidence', 'tier', 'mode', 'rationale', 'model', 'policyVersion', 'status', 'dependsOn', 'createdAt']),
+  DecisionNote: obj({ id: str, decisionId: str, ts: time, by: str, text: str, verdict: nullable({ type: 'string', enum: ['agree', 'disagree'] }), reason: str }, ['id', 'decisionId', 'ts', 'by', 'text']),
+  DecisionSummary: obj({ id: str, type: str, status: str, createdAt: time, projectKey: nullable(str), label: str }),
+  DecisionDetail: obj({
+    decision: ref('Decision'), current: arrayOf(ref('TargetSnapshot')),
+    evidence: arrayOf({ allOf: [ref('EvidenceRef'), obj({ label: str, projectKey: nullable(str), path: nullable(str), activity: nullable(ref('Activity')), missing: bool }, ['label'])] }),
+    dependsOn: arrayOf(ref('DecisionSummary')), dependents: arrayOf(ref('DecisionSummary')), notes: arrayOf(ref('DecisionNote')),
+  }),
+  RollbackPreview: obj({ cascade: arrayOf(ref('DecisionSummary')), blocked: arrayOf(obj({ id: str, reason: str })) }),
+  LoopState: obj({
+    mode: str, effectiveMode: str, disabled: bool, paused: nullable(obj({ at: time, by: str })), capped: nullable({ type: 'string', enum: ['tokenless', 'disabled', 'paused'] }),
+    policyVersion: int, types: arrayOf(loose('A decision type: tier, mode (null: the global one), effectiveMode, tau, tauDefault, calibration, bands, rollbackRate, breaker')),
+    budget: obj({ llmCallsToday: int, llmCallsPerDay: int, autoToday: int, autoPerDay: int, autoPerProject: int }),
+    counts: obj({ proposed: int, week: obj({ observed: int, proposed: int, applied: int, rolledBack: int }) }),
+    rollbackRate: obj({ rolledBack: int, of: int }), round: nullable(loose('The current round, or the last one: phase, counts, skipped reasons, model calls, error')),
+    holdout: nullable(loose('The holdout comparison: share, treated and control arms')),
+  }),
+  LoopMetrics: obj({
+    since: str, weeks: int,
+    repeatRate: loose('k of n feedback in the window that repeats an earlier miss, rate and 95% Wilson interval, and weekly { week, feedback, repeats }'),
+    checksCaughtGap: loose('Done-checks that found a gap: k, n, rate, ciLow, ciHigh'),
+    gapsFixedPerServed: loose('Gaps fixed per serving of an eligible lesson: k, n, rate, ciLow, ciHigh'),
+    notApplicableShare: loose('Verdicts that were not applicable or cannot tell: k, n, rate, ciLow, ciHigh'),
+    proposalsPerWeek: arrayOf(obj({ week: str, proposals: int })),
+    rollbackRate: arrayOf(obj({ type: str, rolledBack: int, of: int, rate: loose('k, n, rate, ciLow, ciHigh') })),
+  }),
+  LoopEventPage: obj({
+    events: arrayOf(obj({ seq: str, ts: time, kind: str, actor: str, subject: str, decisionId: nullable(str), decisionType: nullable(str), status: nullable(str), projectKey: nullable(str) })),
+    next: str, gap: bool,
+  }),
+  TrackRecord: obj({
+    lessonId: str, title: str, projectKey: nullable(str), signals: loose('Served, judged (addressed, not addressed, not applicable, cannot tell), gaps fixed, repeats, your pushback and edits, holdout'),
+    timeline: arrayOf(obj({ ts: time, kind: { type: 'string', enum: ['served', 'judged', 'gap_fixed', 'repeat', 'owner', 'decision'] }, label: str, sessionId: nullable(str), decisionId: nullable(str) })),
+  }),
   JsonRpc: obj({ jsonrpc: { const: '2.0' }, id: { anyOf: [str, int, { type: 'null' }] }, method: str, params: { type: 'object', additionalProperties: true } }, ['jsonrpc', 'method'], 'A JSON-RPC 2.0 message (MCP Streamable HTTP)'),
   JsonRpcResult: loose('A JSON-RPC 2.0 answer: result, or error { code, message }'),
 };
@@ -198,7 +248,6 @@ const CLEANUP_PLAN = obj({
   kept: arrayOf(obj({ kind: str, id: str, why: str })),
   changed: arrayOf(obj({ kind: str, subject: str, targets: arrayOf(str), ts: str })),
   entries: { type: 'integer', description: "The run's Activity entries: a real cleanup removes them (its run_cleaned entry is not the run's)" },
-  entriesCapped: { type: 'boolean', description: 'More entries than a plan reads: entries is a lower bound' },
 });
 const RESULTS = (item: JsonSchema) => obj({ results: arrayOf(item) });
 
@@ -222,8 +271,12 @@ const routes = (a = appSchemas): Record<string, Partial<Record<Method, Route>>> 
   '/api/openapi.json': { GET: { tag: 'system', summary: 'This document', response: 'OpenAPI 3.1 document' } },
   '/api/session': {
     GET: { tag: 'system', summary: 'Whether sign-in is needed and whether this request is signed in, including owner-browser authority', response: '{ authRequired, authenticated, ownerSession }' },
-    POST: { tag: 'system', summary: 'Sign in with API_TOKEN: sets the UI session cookie', body: SessionToken, response: 'no content; 401 on a wrong token', status: 204 },
+    POST: { tag: 'system', summary: 'Sign in with FG_OWNER_TOKEN: sets the UI session cookie', body: SessionToken, response: 'no content; 401 on a wrong token', status: 204 },
     DELETE: { tag: 'system', summary: 'Sign out: clears the session cookie', response: 'no content', status: 204 },
+  },
+  '/api/session/link': {
+    POST: { tag: 'system', summary: 'A one-time sign-in link for the browser on this machine (fg signin): FG_OWNER_TOKEN as the Bearer, at localhost only; it works once, for 60 s', response: '{ path, expiresInSeconds }; 401 without the owner token, 403 tokenless or not at localhost' },
+    GET: { tag: 'system', summary: 'Open a sign-in link: sets the owner session cookie and redirects to the Dashboard; at localhost only, once, within 60 s', query: z.object({ code: z.string() }), response: 'a redirect to /; 403 when expired, used or not at localhost', status: 303 },
   },
   '/api/agent/project': { GET: { tag: 'system', summary: 'Whether a folder (cwd) is a selected project (for the plugin hooks)', query: CwdQuery, response: 'the tracked project, or why not' } },
 
@@ -315,6 +368,27 @@ const routes = (a = appSchemas): Record<string, Partial<Record<Method, Route>>> 
   '/api/sessions/{id}/resummarize': { POST: { tag: 'sessions', summary: 'Rebuild a session summary from scratch', response: '{ queued: true }', status: 202 } },
   '/api/sessions/{id}/evidence': { GET: { tag: 'sessions', summary: 'What the tool saw in one session and decided: turns, the detector\'s call on each (and the skip rules), Inbox items with their post-mortem, miss and lesson, the context served (redacted)', response: 'SessionEvidence' } },
 
+  '/api/decisions': { GET: { tag: 'loop', summary: 'The learning loop\'s decisions, every status (the audit log), newest first, filtered; paged by offset (x-next-offset header)', query: loopSchemas.ListQuery, response: 'Decision[]' } },
+  '/api/decisions/{id}': { GET: { tag: 'loop', summary: 'One decision: its targets now, evidence resolved to lines with links, what it depends on and what depends on it, notes', response: 'DecisionDetail' } },
+  '/api/decisions/{id}/approve': { POST: { tag: 'loop', summary: 'Approve a proposed or observed decision: it is applied; 409 when it is no longer in the status expected', body: loopSchemas.ActionBody, response: 'Decision & { noteError? }' } },
+  '/api/decisions/{id}/reject': { POST: { tag: 'loop', summary: 'Reject a proposed or observed decision; 409 when it is no longer in the status expected', body: loopSchemas.ActionBody, response: 'Decision & { noteError? }' } },
+  '/api/decisions/{id}/keep': { POST: { tag: 'loop', summary: 'Keep (ratify) an applied decision; 409 when it is no longer applied', body: loopSchemas.ActionBody, response: 'Decision & { noteError? }' } },
+  '/api/decisions/{id}/rollback': {
+    POST: {
+      tag: 'loop', body: loopSchemas.ActionBody, response: 'Decision, or with cascade preview: RollbackPreview',
+      summary: 'Roll back an applied decision and the later ones that depend on it, all or nothing; cascade preview changes nothing (but its own target changed since is a 409 there too, and marks it overridden). 409 when its target changed since (it is then overridden; restoreAnyway writes what it was before over the change)',
+      schema: { anyOf: [ref('Decision'), ref('RollbackPreview')] },
+    },
+  },
+  '/api/decisions/{id}/notes': { POST: { tag: 'loop', summary: 'Add a note to a decision (agree or disagree, with a reason); the loop learns from them', body: loopSchemas.NoteBody, response: 'DecisionNote', status: 201 } },
+  '/api/loop': { GET: { tag: 'loop', summary: 'The learning loop: its mode as set and as it runs, each type\'s calibration, rollback rate and breaker, the budget, counts and the current round', response: 'LoopState' } },
+  '/api/loop/settings': { PUT: { tag: 'loop', summary: 'Set the mode, and per type a mode (null: the global one) and a tau (not below its default); setting a type\'s mode resets its breaker', body: loopSchemas.SettingsBody, response: 'LoopState' } },
+  '/api/loop/pause': { POST: { tag: 'loop', summary: 'Pause the learning loop at once; 409 while LOOP_DISABLED', response: 'LoopState' } },
+  '/api/loop/resume': { POST: { tag: 'loop', summary: 'Resume the learning loop; 409 while LOOP_DISABLED', response: 'LoopState' } },
+  '/api/loop/metrics': { GET: { tag: 'loop', summary: 'The learning loop\'s value over the last weeks (default 8): repeat rate, checks that caught a gap, gaps fixed per serving, not-applicable share, proposals per week and rollback rate per type; 404 without the loop', query: loopSchemas.MetricsQuery, response: 'LoopMetrics' } },
+  '/api/loop/events': { GET: { tag: 'loop', summary: 'The live stream: the loop\'s Activity entries and round records after a cursor (the latest without one), oldest first', query: loopSchemas.EventsQuery, response: 'LoopEventPage' } },
+  '/api/loop/lessons/{id}/track': { GET: { tag: 'loop', summary: 'Why the loop believes what it does about one lesson: its signals and a timeline (served, judged, gap fixed, repeat, your edits, decisions)', response: 'TrackRecord' } },
+
   '/api/runs/{id}': {
     GET: { tag: 'activity', summary: 'What cleaning up a labelled run (x-fg-run) would remove per kind, what stays and why, and what it changed that is not its own', response: 'CleanupPlan' },
     DELETE: { tag: 'activity', summary: 'Clean up a run: a dry run unless dryRun is false; removes only what the run wrote and nobody outside it touched since; logged in Activity', body: runSchemas.CleanupBody, response: 'CleanupPlan & { removed }' },
@@ -340,6 +414,7 @@ const SCHEMA_OF: Record<string, JsonSchema> = {
   'GET /api/events': { type: 'string', description: 'text/event-stream: events stage, pipeline, scan, chat, activity; data is JSON' },
   'GET /api/openapi.json': { type: 'object', description: 'An OpenAPI 3.1 document', additionalProperties: true },
   'GET /api/session': obj({ authRequired: bool, authenticated: bool, ownerSession: bool }),
+  'POST /api/session/link': obj({ path: str, expiresInSeconds: num }),
   'GET /api/agent/project': loose('The selected project the folder belongs to, or why it is not one'),
   'POST /api/lessons/decisions': RESULTS(obj({ id: str, ok: bool, status: str, error: str }, ['id', 'ok'])),
   'POST /api/lessons/recheck': obj({ queued: int }),
@@ -373,13 +448,15 @@ const SCHEMA_OF: Record<string, JsonSchema> = {
   'DELETE /api/runs/{id}': { allOf: [CLEANUP_PLAN, obj({ removed: loose('How many of each kind went (on a real run, not a dry run)'), entriesRemoved: int }, [])] },
 };
 
-/** The 2xx body's schema: the route's own, else the type `response` starts with (`Lesson`, `Candidate[]`). */
-function responseSchema(method: Method, path: string, r: Route): JsonSchema | undefined {
+/**
+ * The 2xx body's schema: the route's own, else the type `response` starts with (`Lesson`, `Candidate[]`). openapi.test.ts
+ * holds every route to a schema whose $refs resolve, so a route this cannot describe fails there.
+ */
+function responseSchema(method: Method, path: string, r: Route): JsonSchema {
   const own = r.schema ?? SCHEMA_OF[`${method} ${path}`];
   if (own) return own;
-  const m = /^(\w+)(\[\])?/.exec(r.response);
-  if (!m || !SCHEMAS[m[1]]) return undefined;
-  return m[2] ? arrayOf(ref(m[1])) : ref(m[1]);
+  const [, name, list] = /^(\w+)(\[\])?/.exec(r.response)!;
+  return list ? arrayOf(ref(name)) : ref(name);
 }
 
 const verbs = new Map(OWNER_ROUTES.map(([m, p, verb]) => [`${m} ${p.replace(/:(\w+)/g, '{$1}')}`, verb]));
@@ -390,13 +467,12 @@ function operation(method: Method, path: string, r: Route) {
   const shape = (r.query?.shape ?? {}) as Record<string, ZodTypeAny>;
   const query = Object.entries(shape).map(([name, s]) => ({ name, in: 'query', required: !s.isOptional(), schema: jsonSchema(s) }));
   const status = String(r.status ?? 200);
-  const noContent = r.status === 204;
+  // 303: a browser navigation (a sign-in link) that redirects, with nothing to read.
+  const noContent = r.status === 204 || r.status === 303;
   const schema = noContent ? undefined : responseSchema(method, path, r);
-  if (!noContent && !schema) throw new Error(`openapi: no response schema for ${method} ${path} (${r.response})`);
   return {
     summary: r.summary,
     tags: [r.tag],
-    ...(r.description && { description: r.description }),
     ...(params.length || query.length ? { parameters: [...params, ...query] } : {}),
     ...(r.body ? { requestBody: { required: true, content: { 'application/json': { schema: jsonSchema(r.body) } } } } : {}),
     responses: {

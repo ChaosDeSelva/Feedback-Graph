@@ -1,3 +1,5 @@
+import { readFile } from 'node:fs/promises';
+import { dirname, join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 
 type HeadRow = { size: number; cwd: string | null; human: number };
@@ -34,6 +36,19 @@ export const CODEX_COPY_RULE = 1;
  * The worker's own bookkeeping (never in the graph): which memory files and session transcripts were read
  * (by size + mtime), and each session file's head (its cwd), so candidates are counted without re-reading files.
  */
+/**
+ * What scripts/restore.sh left in state/ when it was cut short while replacing the store and this folder (its
+ * .restore-incomplete marker: the store may be the backup's while this state is the previous one), or null. The worker
+ * does not start on such a pair; finishing the restore puts a state/ without the marker in place.
+ */
+export async function unfinishedRestore(stateDb: string): Promise<string | null> {
+  const note = await readFile(join(dirname(stateDb), '.restore-incomplete'), 'utf8').catch((err: NodeJS.ErrnoException) => {
+    if (err.code === 'ENOENT') return null;
+    throw err;
+  });
+  return note === null ? null : note.trim() || 'a restore did not finish: run ./scripts/restore.sh again';
+}
+
 export class FileState {
   private db: DatabaseSync;
 

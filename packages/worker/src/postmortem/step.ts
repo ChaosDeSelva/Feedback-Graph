@@ -3,8 +3,7 @@ import type { PostMortemTrace } from './postmortem.ts';
 import { duplicateFlag } from './recheck.ts';
 
 export type PostmortemStepDeps = {
-  k: Pick<KnowledgeStore, 'feedbackNeedingPostmortem' | 'savePostmortem' | 'recordPostmortemFailure'> &
-    Partial<Pick<KnowledgeStore, 'similarLessons' | 'setLessonChecks' | 'updateLesson' | 'lessonDetail'>>;
+  k: Pick<KnowledgeStore, 'feedbackNeedingPostmortem' | 'savePostmortem' | 'recordPostmortemFailure' | 'similarLessons' | 'setLessonChecks' | 'updateLesson' | 'lessonDetail'>;
   postmortem(input: PostMortemInput): Promise<PostMortem & { trace?: PostMortemTrace }>;
   embed(texts: string[]): Promise<number[][]>;
   batch: number;
@@ -72,12 +71,11 @@ export const noMissWhy = (said: string) => `the post-mortem found no miss ("${sa
  * words (the stores), and nothing here may change it but a flag. Null: the writer's alone (or not known).
  */
 async function ownersLesson(deps: PostmortemStepDeps, id: string): Promise<Lesson | null> {
-  const l = (await deps.k.lessonDetail?.(id).catch(() => null))?.lesson;
+  const l = (await deps.k.lessonDetail(id).catch(() => null))?.lesson;
   return l && (l.proposedAs || l.status !== 'proposed') ? l : null;
 }
 
 async function duplicateOfSaved(deps: PostmortemStepDeps, id: string) {
-  if (!deps.k.similarLessons || !deps.k.setLessonChecks) return null;
   return duplicateFlag({ id, status: 'proposed', createdAt: new Date().toISOString() }, await deps.k.similarLessons(id, 5));
 }
 
@@ -109,9 +107,9 @@ export async function runPostmortems(deps: PostmortemStepDeps): Promise<{ done: 
       const owners = pm.lessonDropped && !pm.noMiss ? null : await ownersLesson(deps, lessonId);
       // Its own miss says there was none: the lesson it wrote is invented, so it is saved rejected, never proposed. One
       // the owner edited or decided is the owner's: it is flagged no-miss for them to decide, never decided here.
-      if (pm.noMiss && !owners) await deps.k.updateLesson?.(lessonId, { status: 'rejected' }, { by: NO_MISS_DECIDER, note: `no miss: the post-mortem said "${pm.noMiss.slice(0, 300)}", so no lesson` });
+      if (pm.noMiss && !owners) await deps.k.updateLesson(lessonId, { status: 'rejected' }, { by: NO_MISS_DECIDER, note: `no miss: the post-mortem said "${pm.noMiss.slice(0, 300)}", so no lesson` });
       if (pm.noMiss && owners && owners.status !== 'rejected' && owners.status !== 'superseded' && !(owners.checks ?? []).some((c) => c.name === 'no-miss')) {
-        await deps.k.setLessonChecks?.(lessonId, [...(owners.checks ?? []), { name: 'no-miss', why: noMissWhy(pm.noMiss) }]);
+        await deps.k.setLessonChecks(lessonId, [...(owners.checks ?? []), { name: 'no-miss', why: noMissWhy(pm.noMiss) }]);
       }
       if (streak) Object.assign(streak, { feedbackId: null, count: 0 });
       // Only a saved lesson has an embedding to compare: one that repeats a lesson of the project is flagged now (the
@@ -120,7 +118,7 @@ export async function runPostmortems(deps: PostmortemStepDeps): Promise<{ done: 
       if (dup) {
         pm.lessonChecks = [...(pm.lessonChecks ?? []), dup];
         if (trace) trace.lessonFlags = [...trace.lessonFlags, dup];
-        await deps.k.setLessonChecks!(lessonId, pm.lessonChecks);
+        await deps.k.setLessonChecks(lessonId, pm.lessonChecks);
       }
       await deps.activity?.record({
         kind: 'postmortem_done',

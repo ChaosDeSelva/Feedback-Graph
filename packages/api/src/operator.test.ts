@@ -26,7 +26,7 @@ function setup(o: { allow?: OperatorVerb[]; token?: string | null; apiToken?: st
   const token = o.token === undefined ? OP : o.token;
   const app = createApp(repo, {
     auth: { token: o.apiToken, ownerToken: OWNER, ...(token !== null && { operator: { token, allow: o.allow ?? DEFAULT_ALLOW } }) },
-    activity: { record: async (e: ActivityInput) => { logged.push(e); }, list: async () => [] },
+    activity: { removeRun: async () => 0, record: async (e: ActivityInput) => { logged.push(e); }, list: async () => [] },
     knowledge: {
       listLessons: async () => [lesson],
       lessonDetail: async () => ({ lesson, miss: null, feedback: null, contextItems: [], fixCommits: [], supersedes: [] }),

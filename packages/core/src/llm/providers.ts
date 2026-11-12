@@ -1,4 +1,4 @@
-import { PRIVATE_DIRS, SECRET_GLOBS } from '../secrets.ts';
+import { PRIVATE_DIRS, SECRET_DENY_GLOBS } from '../secrets.ts';
 import { mirrorForAgent } from './mirror.ts';
 import { purgeStaleRunnerMirrors, runnerReadiness, codexArgs, runOnRunner, RunnerUnavailableError } from './codexRunner.ts';
 import { CliRunError, ProviderUnavailableError } from './unavailable.ts';
@@ -135,8 +135,8 @@ function cliEnv(extra: Record<string, string | undefined>): NodeJS.ProcessEnv {
  * and the worker's private folders by their absolute paths.
  */
 const SECRET_READS = [
-  ...SECRET_GLOBS.map((g) => `Read(${g})`),
-  ...SECRET_GLOBS.map((g) => `Read(//${g})`),
+  ...SECRET_DENY_GLOBS.map((g) => `Read(${g})`),
+  ...SECRET_DENY_GLOBS.map((g) => `Read(//${g})`),
   ...PRIVATE_DIRS.map((d) => `Read(/${d})`),
 ].join(',');
 
@@ -167,6 +167,12 @@ function need(env: ProviderEnv, key: string): string {
   const v = env[key];
   if (!v) throw new Error(`${key} is not set`);
   return v;
+}
+
+/** The model a spec must name (`openrouter:<model>`): these providers have no default. */
+function needModel(kind: string, model: string | undefined): string {
+  if (!model) throw new Error(`${kind} needs a model: ${kind}:<model>`);
+  return model;
 }
 
 function cliPrompt(t: JsonTask): string {
@@ -349,7 +355,7 @@ function codexRunnerCli(id: string, model: string | undefined, url: string, scra
   const own = mirrors(scratch);
   const ready = async () => {
     const health = await runnerReadiness(url, o.fetchImpl);
-    if (!health.ok) throw new ProviderUnavailableError(health.reason ?? 'codex runner sandbox unavailable');
+    if (!health.ok) throw new ProviderUnavailableError(health.reason);
   };
   return {
     id,
@@ -436,9 +442,9 @@ export function makeProvider(spec: string, env: ProviderEnv, o: ProviderOpts = {
     case 'openai':
       return openaiCompatible(spec, model ?? 'gpt-5.1', env.OPENAI_BASE_URL ?? 'https://api.openai.com/v1', need(env, 'OPENAI_API_KEY'), o);
     case 'openrouter':
-      return openaiCompatible(spec, need({ m: model }, 'm'), 'https://openrouter.ai/api/v1', need(env, 'OPENROUTER_API_KEY'), o);
+      return openaiCompatible(spec, needModel(kind, model), 'https://openrouter.ai/api/v1', need(env, 'OPENROUTER_API_KEY'), o);
     case 'groq':
-      return openaiCompatible(spec, need({ m: model }, 'm'), 'https://api.groq.com/openai/v1', need(env, 'GROQ_API_KEY'), o);
+      return openaiCompatible(spec, needModel(kind, model), 'https://api.groq.com/openai/v1', need(env, 'GROQ_API_KEY'), o);
     case 'anthropic':
       return anthropic(spec, model ?? 'claude-sonnet-5-5', need(env, 'ANTHROPIC_API_KEY'), o);
     case 'claude-cli':
@@ -459,7 +465,7 @@ export function makeProviderOr(spec: string, fallback: string, env: ProviderEnv,
   try {
     return { provider: makeProvider(spec, env, o), fellBack: null };
   } catch (err) {
-    return { provider: makeProvider(fallback, env, o), fellBack: `${spec}: ${err instanceof Error ? err.message : String(err)}` };
+    return { provider: makeProvider(fallback, env, o), fellBack: `${spec}: ${(err as Error).message}` };
   }
 }
 

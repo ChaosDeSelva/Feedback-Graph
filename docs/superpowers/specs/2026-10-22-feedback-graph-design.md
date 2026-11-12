@@ -1,6 +1,8 @@
 # Feedback Graph: design + build plan
 
-Working name `feedback_tool` (dir `~/code/feedback_tool`, currently empty, not a git repo).
+> **Historical design notes from 2026-10-22; superseded.** See [docs/](../../) for current behaviour.
+
+Working name `feedback_tool` (dir `~/projects/feedback_tool`, currently empty, not a git repo).
 
 ## Context
 
@@ -22,7 +24,7 @@ It does not train or change models. It is evidence-grounded project memory.
 - `~/.claude/projects/` has **222 project dirs and 3,213 session transcripts** (JSONL). Each record carries `cwd`, `gitBranch`, `sessionId` and `timestamp`, plus `user` / `assistant` / tool_use / tool_result content. This is the primary source, and months of history give a backfill on day one.
 - **220 existing `memory/*.md` files**, many `type: feedback`. These are hand-curated lessons, used as seed data and as a format the agents already read.
 - `docker`, `ollama` (with `gemma4:latest` already pulled) and the `claude` CLI are installed.
-- Project repos are under `~/code/*`, so git history can be correlated by `cwd` plus the session time window.
+- Project repos are under `~/projects/*`, so git history can be correlated by `cwd` plus the session time window.
 
 ## Decisions
 
@@ -41,14 +43,14 @@ It does not train or change models. It is evidence-grounded project memory.
 - **Ollama runs on the host, not in Docker.** Docker on macOS can't use the Metal GPU, so containers reach `host.docker.internal:11434`. Model: `gemma4` for classification, `nomic-embed-text` for embeddings. ("jev" in your message read to me as this local-model slot. Tell me if you meant a specific tool.)
 - **Claude via headless CLI:** the worker image installs `@anthropic-ai/claude-code` and authenticates with `CLAUDE_CODE_OAUTH_TOKEN` (from `claude setup-token`, so it bills your subscription). Calls are `claude -p --output-format json` with a zod-validated JSON contract in the prompt, read-only tools only (`--allowedTools Read,Grep,Glob`), and cwd set to the mounted repo.
 - **Storage:** Neo4j 5 holds both the graph and the vectors (its native vector index), so there's no second vector DB. A SQLite file in a volume holds ingest cursors and the job queue. Raw transcripts stay where they are (mounted read-only) and act as the immutable evidence, referenced by `sessionId` and line number.
-- **Mounts (read-only):** `~/.claude/projects`, `~/code`, `~/.claude/projects/*/memory`.
+- **Mounts (read-only):** `~/.claude/projects`, `~/projects`, `~/.claude/projects/*/memory`.
 - Approved lessons are **not** written into CLAUDE.md automatically. An optional "export as memory file" button in the UI comes later.
 
 ## Architecture
 
 ```
 ~/.claude/projects (JSONL) ─┐
-~/code/* git history ───────┤
+~/projects/* git history ───┤
 GitHub PRs / Linear ────────┼─► worker: ingest → detect → post-mortem → context hunt
 uploaded docs ──────────────┘          (Ollama: classify/embed)  (claude -p: reason)
                                                  │
@@ -70,7 +72,7 @@ All nodes carry `validFrom` / `validTo` timestamps so history is kept and nothin
 
 ### Pipeline (worker)
 
-1. **Ingest.** Tail the JSONL files incrementally (cursor per file). Build `Session`s and turns. Extract tool calls (files read and edited, commands run), map `cwd` to a `Project`, and correlate git commits in `~/code/<project>` within the session window.
+1. **Ingest.** Tail the JSONL files incrementally (cursor per file). Build `Session`s and turns. Extract tool calls (files read and edited, commands run), map `cwd` to a `Project`, and correlate git commits in `~/projects/<project>` within the session window.
 2. **Detect** (Ollama). Run a cheap keyword prefilter, then classify each user turn that follows assistant work as `pushback | correction | approval | neutral`. Pushback becomes an **inbox candidate**. Approvals and later turns feed the resolution state.
 3. **Post-mortem** (Claude, after the owner confirms the candidate). Input: the feedback, the work before it (diffs and tool calls), the context Claude had loaded (CLAUDE.md, memory, files read), the fix turns and the outcome. Output (JSON):
    - what was missed
@@ -100,7 +102,7 @@ A skill (`~/.claude/skills/feedback-graph/SKILL.md`) tells agents to call `get_t
 
 ## Milestones (ordered by the success ranking)
 
-1. **Skeleton + ingest + detect + inbox.** Compose file (neo4j, api, worker, ui). Backfill ~/code sessions. Inbox lists candidates. Baseline: repeat-feedback rate across your history.
+1. **Skeleton + ingest + detect + inbox.** Compose file (neo4j, api, worker, ui). Backfill ~/projects sessions. Inbox lists candidates. Baseline: repeat-feedback rate across your history.
 2. **Post-mortem + context hunt + lessons + MCP `get_task_context` + skill.** Delivers success #1.
 3. **`check_before_done`** plus the skill hook-in. Delivers #2.
 4. **Graph explorer, patterns dashboard, uploads, GitHub and Linear.** Delivers #3. Seed lessons from the existing `memory/` feedback files.
@@ -127,7 +129,7 @@ Decisions for the owner to shape when we build them: the pushback/approval class
 
 - **Unit:** the JSONL parser against fixture transcripts (including tool_use and tool_result pairs), the status state machine, and zod contracts on Claude output.
 - **Detection quality:** after the backfill, hand-label about 30 inbox candidates and report precision. Tune the prefilter and prompt until precision is at least 0.7.
-- **End to end:** `docker compose up`, then confirm a real past miss from a ~/code project. Check that the post-mortem and context items appear in the graph explorer. Approve the lesson. In a fresh Claude Code session in that project, confirm `get_task_context` returns it with a citation, and that `check_before_done` flags the same gap on a deliberately repeated mistake.
+- **End to end:** `docker compose up`, then confirm a real past miss from a ~/projects project. Check that the post-mortem and context items appear in the graph explorer. Approve the lesson. In a fresh Claude Code session in that project, confirm `get_task_context` returns it with a citation, and that `check_before_done` flags the same gap on a deliberately repeated mistake.
 - **Metric:** the patterns dashboard shows the repeat-feedback baseline from milestone 1, to compare against over the following weeks.
 
 ## Addendum (2026-10-22, the owner's requests mid-build)

@@ -26,6 +26,15 @@ describeStores('FactsStore', (h) => {
     expect(await probe.factVersions('old rule')).toEqual([{ current: false, closed: true }]);
   });
 
+  test('two files whose names redaction would rewrite alike keep their own paths (the CodeFile id), not one shared one', async () => {
+    const a = 'src/keys/AKIA' + 'IOSFODNN7EXAMPLE.ts';
+    const b = 'src/keys/AKIA' + 'IOSFODNN7EXAMPLF.ts';
+    await f.saveFileFacts('demo', { path: a, hash: 'ha', summary: 'A' }, [fact('rule a', a)], 'ollama:gemma4');
+    await f.saveFileFacts('demo', { path: b, hash: 'hb', summary: 'B' }, [fact('rule b', b)], 'ollama:gemma4');
+    expect(await f.fileHashes('demo')).toEqual(new Map([[a, 'ha'], [b, 'hb']]));
+    expect((await f.listFacts({ projectKey: 'demo', path: a })).map((x) => x.statement)).toEqual(['rule a']);
+  });
+
   test('facts keep their provenance: why, scan job, file hash, and the file summary', async () => {
     await f.saveFileFacts('demo', { path: 'src/a.ts', hash: 'h1', summary: 'Data access layer' }, [fact('use scoped')], 'ollama:gemma4', 'scan:9');
     const [x] = await f.listFacts({ projectKey: 'demo' });
@@ -59,7 +68,7 @@ describeStores('FactsStore', (h) => {
     ], 'claude-cli', []);
     const p = (await f.listProjects()).find((x) => x.key === 'demo')!;
     expect(p.facts).toBe(4);
-    expect(p.factsByOrigin).toEqual({ model: 2, manifest: 2, document: 0, you: 0 });
+    expect(p.factsByOrigin).toEqual({ model: 2, manifest: 2, document: 0, you: 0, loop: 0 });
   });
 
   test('addOwnerFact saves your fact (origin you, your relevance); no scan closes or replaces it', async () => {
@@ -78,7 +87,25 @@ describeStores('FactsStore', (h) => {
     // The background scorer never sees it: it has your relevance already, and a model update leaves it alone.
     expect((await f.unscoredFacts({ projectKeys: ['demo'], limit: 10 })).map((x) => x.id)).not.toContain(mine.id);
     expect(await f.setFactRelevance([{ id: mine.id, relevance: 0.1, by: 'model' }])).toBe(0);
-    expect((await f.listProjects()).find((p) => p.key === 'demo')?.factsByOrigin).toEqual({ model: 1, manifest: 0, document: 0, you: 1 });
+    expect((await f.listProjects()).find((p) => p.key === 'demo')?.factsByOrigin).toEqual({ model: 1, manifest: 0, document: 0, you: 1, loop: 0 });
+  });
+
+  test("addOwnerFact with origin loop saves the learning loop's fact under its planned id; scans never close, replace or re-check it", async () => {
+    const id = 'fact:loop:0123456789abcdef';
+    const loop = await f.addOwnerFact('demo', { kind: 'convention', statement: 'Orders are stored in cents', path: 'src', lines: null, confidence: 1, why: 'From the lesson "Cents"', relevance: 0.7, embedding: vec(3) }, 'loop:1', null, { id, origin: 'loop' });
+    expect(loop).toMatchObject({ id, origin: 'loop', relevance: 0.7, relevanceBy: 'loop:1', source: 'loop:1', docId: null });
+    await f.saveFileFacts('demo', { path: 'src', hash: 'h1', summary: '' }, [fact('per-file', 'src')], 'ollama:gemma4');
+    await f.saveFileFacts('demo', { path: 'src', hash: 'h2', summary: '' }, [fact('per-file again', 'src')], 'ollama:gemma4');
+    await f.markFilesRemoved('demo', ['src']);
+    await f.replaceProjectFacts('demo', [fact('agentic', 'src/b.ts')], 'claude-cli', [{ path: 'src/b.ts', hash: 'hb' }]);
+    await f.replaceScopeFacts('demo', { prefixes: ['src'], except: [] }, [fact('sharded', 'src/c.ts')], 'claude-cli', [{ path: 'src/c.ts', hash: 'hc' }]);
+    expect((await f.listFacts({ projectKey: 'demo' })).map((x) => x.statement).sort()).toEqual(['Orders are stored in cents', 'sharded']);
+    expect((await f.listFacts({ projectKey: 'demo', origin: 'loop' })).map((x) => x.id)).toEqual([id]);
+    expect(await f.currentSources('demo')).toEqual(['claude-cli']);
+    expect((await f.factsToRecheck({ projectKey: 'demo', version: 'check-v9', limit: 10 })).map((x) => x.id)).not.toContain(id);
+    // A model update leaves the loop's relevance alone, like yours.
+    expect(await f.setFactRelevance([{ id, relevance: 0.1, by: 'model' }])).toBe(0);
+    expect((await f.listProjects()).find((p) => p.key === 'demo')?.factsByOrigin).toEqual({ model: 1, manifest: 0, document: 0, you: 0, loop: 1 });
   });
 
   test('facts keep the relevance the extractor gave; facts without one are unscored', async () => {
@@ -293,8 +320,8 @@ describeStores('FactsStore', (h) => {
   });
 
   test('stored facts and file summaries are redacted, whatever the model returned', async () => {
-    await f.saveFileFacts('demo', { path: 'src/a.ts', hash: 'h', summary: 'key sk-ant-api03-cccccccccccccccccccccccccccccccccccccccc' }, [{ ...fact('uses sk-ant-api03-cccccccccccccccccccccccccccccccccccccccc'), why: 'why sk-ant-api03-cccccccccccccccccccccccccccccccccccccccc' }], 'p');
-    await f.replaceProjectFacts('demo', [{ ...fact('agentic sk-ant-api03-cccccccccccccccccccccccccccccccccccccccc', 'src/b.ts'), why: 'sk-ant-api03-cccccccccccccccccccccccccccccccccccccccc' }], 'claude-cli', [{ path: 'src/b.ts', hash: 'hb' }]);
+    await f.saveFileFacts('demo', { path: 'src/a.ts', hash: 'h', summary: 'key sk' + '-ant-api03-cccccccccccccccccccccccccccccccccccccccc' }, [{ ...fact('uses sk' + '-ant-api03-cccccccccccccccccccccccccccccccccccccccc'), why: 'why sk' + '-ant-api03-cccccccccccccccccccccccccccccccccccccccc' }], 'p');
+    await f.replaceProjectFacts('demo', [{ ...fact('agentic sk' + '-ant-api03-cccccccccccccccccccccccccccccccccccccccc', 'src/b.ts'), why: 'sk' + '-ant-api03-cccccccccccccccccccccccccccccccccccccccc' }], 'claude-cli', [{ path: 'src/b.ts', hash: 'hb' }]);
     expect(JSON.stringify(await f.listFacts({ projectKey: 'demo' }))).not.toContain('sk-ant-api03');
   });
 

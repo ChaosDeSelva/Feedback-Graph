@@ -1,4 +1,4 @@
-export { RUNNER_READINESS_CURSOR, reportedRunnerReadiness } from './llm/runnerReadinessReport.ts';
+export { RUNNER_READINESS_CURSOR, reportedRunnerReadiness, type RunnerReadiness } from './llm/runnerReadinessReport.ts';
 export * from './types.ts';
 export * from './graph/repo.ts';
 export * from './ollama.ts';
@@ -19,6 +19,7 @@ export * from './graph/docs.ts';
 export * from './graph/links.ts';
 export * from './redact.ts';
 export * from './config.ts';
+export * from './authState.ts';
 export * from './graph/portability.ts';
 export * from './secrets.ts';
 export * from './graph/embeddings.ts';
@@ -28,12 +29,14 @@ export * from './graph/selection.ts';
 export * from './store.ts';
 export * from './scanner.ts';
 export * from './codegraph.ts';
+export * from './storedLabel.ts';
 export * from './dedupe.ts';
 export * from './graph/neo4j-store.ts';
 export * from './cloud.ts';
 export * from './sessions.ts';
 export * from './graph/sessions.ts';
 export * from './relevance.ts';
+export * from './lessonFact.ts';
 export * from './feedbackRules.ts';
 export * from './chat.ts';
 export * from './graph/chat.ts';
@@ -41,6 +44,7 @@ export * from './runs.ts';
 export * from './lessonOutcome.ts';
 export * from './git.ts';
 export * from './lessonRank.ts';
+export * from './lessonTriggers.ts';
 export * from './sandboxPresence.ts';
 
 export * from './reviewFilters.ts';
@@ -52,6 +56,24 @@ export { runnerReadiness } from './llm/codexRunner.ts';
 export * from './redactionArchive.ts';
 
 export * from './storeWrites.ts';
+
+export * from './decisions/record.ts';
+export * from './decisions/snapshot.ts';
+export * from './decisions/apply.ts';
+export * from './decisions/cascade.ts';
+export * from './decisions/rollback.ts';
+export * from './decisions/executor.ts';
+export * from './decisions/types/index.ts';
+export { genericHandler, moveTargets } from './decisions/types/generic.ts';
+export { linkMisses } from './decisions/types/link_misses.ts';
+export { tuneThreshold } from './decisions/types/tune_threshold.ts';
+export * from './loop/state.ts';
+export * from './loop/beta.ts';
+export * from './loop/snapshots.ts';
+export * from './loop/weights.ts';
+export * from './loop/syncHold.ts';
+export * from './loop/holdout.ts';
+export * from './loop/metrics.ts';
 
 export { encryptedRedactionArchive, publicRedactionArchive } from './encryptedArchive.ts';
 

@@ -42,6 +42,14 @@ export function projectScope(
 }
 
 /**
+ * Whether a folder is selected, for work someone asked for (a scan): the scope held, else the selection as stored now,
+ * since the owner may have selected it after the scope was last read.
+ */
+export async function folderSelectedNow(held: ProjectScope, key: string, reread: () => Promise<ProjectScope>): Promise<boolean> {
+  return held.folder(key) || (await reread()).folder(key);
+}
+
+/**
  * What a first start with no stored selection begins with: INGEST_PROJECTS when set. Otherwise, on an upgrade, the
  * projects you invested in (`invested`: approved lessons, confirmed feedback, docs, scans), so agents keep getting
  * what you approved; on a new install, nothing.

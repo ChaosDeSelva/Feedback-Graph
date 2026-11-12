@@ -10,20 +10,15 @@ export function requestDeadline(timeoutMs = 55_000): MiddlewareHandler {
     const expiresAt = Date.now() + timeoutMs;
     return withStoreDeadline({ signal, expiresAt }, async () => {
       let timer: ReturnType<typeof setTimeout> | undefined;
-      const expired = () => c.json({ error: 'request deadline exceeded; retry the request', retryable: true }, 504);
-      const cancelled = () => new Response(null, { status: 499, statusText: 'Client Closed Request' });
+      // A route's error never rejects next(): app.onError answers it (504 for a deadline, 499 for a closed client).
       try {
         return await Promise.race([
           next().then(() => c.res),
           new Promise<Response>(resolve => { timer = setTimeout(() => {
             controller.abort(new StoreDeadlineError());
-            resolve(expired());
+            resolve(c.json({ error: 'request deadline exceeded; retry the request', retryable: true }, 504));
           }, timeoutMs); }),
         ]);
-      } catch (error) {
-        if (c.req.raw.signal.aborted) return cancelled();
-        if (error instanceof StoreDeadlineError || signal.aborted) return expired();
-        throw error;
       } finally { if (timer) clearTimeout(timer); }
     });
   };

@@ -1,10 +1,10 @@
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { ModelTimeoutError, ProviderUnavailableError, STRICT_JSON, type ActivityInput, type CodeFact, type FactScope, type LlmProvider, type ScanJob } from '@fb/core';
 import { expect, test } from 'vitest';
-import { checkCitations, DEPENDENCY_FACT_MAX, deterministicFacts, extractFileFacts, summarizeDependencies, hasCodeFiles, listCodeFiles, listCodeFilesWithTotal, runScan, ScanPlans, FACT_CHECK_VERSION, SCAN_PROMPT_VERSION, SCANNER_VERSION, type ScanDeps } from './scan.ts';
+import { checkCitations, DEPENDENCY_FACT_MAX, deterministicFacts, extractFileFacts, extractShardFacts, summarizeDependencies, hasCodeFiles, listCodeFiles, listCodeFilesWithTotal, listIndexPaths, repoReader, runScan, ScanPlans, FACT_CHECK_VERSION, SCAN_PROMPT_VERSION, SCANNER_VERSION, type ScanDeps } from './scan.ts';
 
 function repo(git = false) {
   const dir = mkdtempSync(join(tmpdir(), 'fbscan-'));
@@ -509,17 +509,24 @@ test('one-file extraction sends only the file text: an agentic model gets a fres
   await expect(stat(seen[0].cwd!)).rejects.toThrow();
 });
 
+test('listCodeFiles in a git repo keeps a file with a non-ASCII name (git quotes it outside -z)', async () => {
+  const dir = repo(true);
+  writeFileSync(join(dir, 'src/café.ts'), 'export const c = 1;\n');
+  execFileSync('git', ['-C', dir, 'add', '-A']);
+  expect((await listCodeFiles(dir, { maxBytes: 80_000, maxFiles: 100 })).map((f) => f.path)).toContain('src/café.ts');
+});
+
 test('listCodeFilesWithTotal ranks before capping: source, not the alphabetically first config, fills a small cap', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'fbscan-'));
   const w = (p: string, c = 'x') => { mkdirSync(join(dir, p, '..'), { recursive: true }); writeFileSync(join(dir, p), c); };
   for (let i = 0; i < 5; i++) w(`.github/workflows/w${i}.yml`);
   for (let i = 0; i < 5; i++) w(`deploy/k8s/s${i}.yaml`);
   w('docs/guide.md');
-  w('src/webapp/page.tsx', 'export const p = 1;');
-  w('src/webapp/page.test.tsx', 'import "./page";');
+  w('src/portal/page.tsx', 'export const p = 1;');
+  w('src/portal/page.test.tsx', 'import "./page";');
   w('go.mod', 'module example.com/demo\n');
   const r = await listCodeFilesWithTotal(dir, { maxBytes: 80_000, maxFiles: 3 });
-  expect(r.files.map((f) => f.path)).toEqual(['go.mod', 'src/webapp/page.tsx', 'src/webapp/page.test.tsx']);
+  expect(r.files.map((f) => f.path)).toEqual(['go.mod', 'src/portal/page.tsx', 'src/portal/page.test.tsx']);
   expect(r.totalCandidates).toBe(14);
   expect(r.cap).toBe(3);
 });
@@ -1061,4 +1068,278 @@ test('a per-file scan reads requested files first, then files with long explanat
   };
   expect(await order([])).toEqual(['src/b.py', 'package.json']);
   expect(await order(['README.md'])).toEqual(['README.md', 'src/b.py']);
+});
+
+test('summarizeDependencies: a long statement with no list it can read is cut; a list that fits stays whole, one already counted is not counted again', () => {
+  const prose = `Dependencies: ${'a very long sentence about the dependencies '.repeat(10)}`;
+  const cut = summarizeDependencies(prose);
+  expect(cut.length).toBe(DEPENDENCY_FACT_MAX);
+  expect(cut.endsWith('...')).toBe(true);
+  const long = Array.from({ length: 60 }, (_, i) => `dep-${i} ^1.0.${i}`).join(', ');
+  const s = summarizeDependencies(`Dependencies: ${long}. Dev dependencies: vitest 3. Requires (2): a 1, b 2.`);
+  expect(s).toMatch(/^Dependencies \(60\): dep-0 \^1\.0\.0, .* and \d+ more\. Dev dependencies: vitest 3\. Requires \(2\): a 1, b 2\.$/);
+  expect(s.length).toBeLessThanOrEqual(DEPENDENCY_FACT_MAX);
+});
+
+test('deterministicFacts: manifests that say nothing give no fact, and partial ones give what they hold', () => {
+  const facts = (path: string, content: string) => deterministicFacts([{ path, content }]).map((f) => f.statement);
+  expect(facts('package.json', '{ not json')).toEqual([]);
+  expect(facts('go.mod', 'go 1.22\n')).toEqual([]);
+  expect(facts('go.mod', 'module example.com/x\n')).toEqual(['Go module example.com/x.']);
+  expect(facts('Cargo.toml', '[workspace]\nmembers = ["a"]\n')).toEqual([]);
+  expect(facts('Cargo.toml', '[package]\nname = "cli"\n\n[dev-dependencies]\nlocal = { path = "../local" }\n')).toEqual(['Crate cli. Dev dependencies: local.']);
+  expect(facts('Makefile', '# nothing to make\nVAR := 1\n')).toEqual([]);
+  expect(facts('compose.yaml', 'version: "3"\n')).toEqual([]);
+  expect(facts('compose.yaml', 'services:\nvolumes:\n  data: {}\n')).toEqual([]);
+  expect(facts('compose.yaml', 'services:\n\n  # the API\n  api:\n    image: x\n  db:\n    image: y\n')).toEqual(['Compose services: api, db.']);
+  expect(facts('.env.example', '# fill these in\n')).toEqual([]);
+  expect(facts('pyproject.toml', '[tool.poetry.scripts]\nserve = "app:main"\n\n[tool.poetry.dependencies]\npython = "^3.12"\nfastapi = "^0.110"\n')).toEqual([
+    '`serve` script runs: app:main', 'Python ^3.12. Dependencies: fastapi ^0.110.',
+  ]);
+  expect(facts('pyproject.toml', '[project]\nname = "x"\n')).toEqual([]);
+});
+
+test('checkCitations: a line range starting at 0 is no range, and a fact citing "./" is about the whole project', async () => {
+  const fact = (path: string, lines: string | null): CodeFact => ({ kind: 'api', statement: '`a` is exported', path, lines, confidence: 1, why: 'w', relevance: 0.5 });
+  const { kept } = await checkCitations([fact('src/a.ts', '0-3'), fact('./', null)], async () => 'export const a = 1;\n');
+  expect(kept.map((f) => [f.path, f.lines, f.evidence])).toEqual([['src/a.ts', null, 'file'], ['.', null, 'none']]);
+});
+
+test('repoReader: paths outside the repo are not there; folders, files over the size limit and secrets exist but are not read', async () => {
+  const dir = repo();
+  const read = repoReader(dir, 1000);
+  expect(await read('../etc/passwd')).toBeUndefined();
+  expect(await read('/etc/passwd')).toBeUndefined();
+  expect(await read('src/missing.ts')).toBeUndefined();
+  expect(await read('src')).toBeNull();
+  expect(await read('src/huge.ts')).toBeNull();
+  expect(await read('.env')).toBeNull();
+  expect(await read('src/a.ts')).toBe('export const a = 1;\n');
+});
+
+test('listIndexPaths stops at its limit, best files first', async () => {
+  const dir = repo();
+  const all = await listIndexPaths(dir, { maxBytes: 80_000, maxFiles: null, limit: 100 });
+  const { paths, totalCandidates } = await listIndexPaths(dir, { maxBytes: 80_000, maxFiles: null, limit: 2 });
+  expect(all.paths.length).toBeGreaterThan(2);
+  expect(paths).toEqual(all.paths.slice(0, 2));
+  expect(totalCandidates).toBe(all.totalCandidates);
+});
+
+test('a long file in a language with no parser is still read in parts', async () => {
+  const m = llm({ summary: 'S', facts: [] });
+  const text = Array.from({ length: 3000 }, (_, i) => `line ${i} of the guide`).join('\n');
+  await extractFileFacts(m, 'docs/guide.md', text);
+  expect(m.seen.length).toBeGreaterThan(1);
+  expect(m.seen[0].user).toMatch(/^FILE: docs\/guide\.md \(lines 1-\d+, part 1 of \d\)/);
+});
+
+test('ScanPlans.clear forgets every kept plan', () => {
+  const plans = new ScanPlans();
+  plans.keep('j', { head: 'h', repoPath: '/r', listed: [], churn: new Map(), planned: [] });
+  plans.clear();
+  expect(plans.take('j', '/r', 'h')).toBeNull();
+});
+
+test('a per-file scan with its signals wired: a provider named, the default file cap, progress every 10 files', async () => {
+  const dir = repo(true);
+  for (let i = 0; i < 10; i++) writeFileSync(join(dir, `src/m${i}.ts`), `export const m${i} = ${i};\n`);
+  execFileSync('git', ['-C', dir, 'add', '-A']);
+  const logs: string[] = [];
+  const touched: string[] = [];
+  const { deps, updates, activity } = fakeDeps({
+    maxFiles: null, log: (msg) => logs.push(msg),
+    touched: async (k) => { touched.push(k); return ['src/m3.ts']; },
+    prPaths: async () => ['src/m4.ts'],
+  });
+  const r = await runScan({ ...job(dir), provider: 'ollama:qwen3' }, deps);
+  expect(touched).toEqual(['demo']);
+  expect(activity[0].why).toMatch(/^you asked for a scan with ollama:qwen3/);
+  expect(r.remaining).toBe(0);
+  expect(updates.filter((u) => !('status' in u))).toEqual([{ filesScanned: 10, factsAdded: expect.any(Number) }]);
+  expect(logs.filter((x) => x === 'scanned file')).toHaveLength(r.filesScanned);
+});
+
+test('a scan says how many files an older scanner read and how many an agent asked for, one or more', async () => {
+  const dir = repo(true);
+  const files = await listCodeFiles(dir, { maxBytes: 80_000, maxFiles: 100 });
+  const { deps, activity } = fakeDeps();
+  deps.facts.fileHashes = async () => new Map(files.map((f) => [f.path, f.hash]));
+  deps.facts.fileScanVersions = async () => new Map(files.map((f) => [f.path, f.path === 'src/a.ts' ? 'scan-v4' : SCANNER_VERSION]));
+  deps.facts.scanRequests = async () => ['src/b.py'];
+  deps.facts.clearScanRequests = async () => {};
+  await runScan(job(dir), deps);
+  expect(activity[0].why).toContain(`1 file was read by an older scanner and is read again with ${SCANNER_VERSION}`);
+  expect(activity[0].why).toContain('1 file an agent asked for is read first');
+  deps.facts.scanRequests = async () => ['src/b.py', 'README.md'];
+  await runScan(job(dir), deps);
+  expect(activity.filter((a) => a.kind === 'scan_started')[1].why).toContain('2 files an agent asked for are read first');
+});
+
+test('a scan leaving out more than five data folders names five of them', async () => {
+  const dir = workspace();
+  for (const d of ['logs', 'dumps', 'transcripts', 'exports', 'recordings', 'a/logs']) {
+    mkdirSync(join(dir, d), { recursive: true });
+    for (let i = 0; i < 200; i++) writeFileSync(join(dir, `${d}/r${i}.json`), '{}');
+  }
+  execFileSync('git', ['-C', dir, 'add', '-A']);
+  const { deps, activity } = fakeDeps({ llm: shardAgent() });
+  deps.facts.fileHashes = async () => new Map();
+  await runScan(job(dir), deps);
+  const started = activity.find((a) => a.kind === 'scan_started')!;
+  expect(started.why).toContain('1200 files in data folders are left out: a/logs/ (200), dumps/ (200), exports/ (200), logs/ (200), recordings/ (200), ...');
+});
+
+test('a shard answer over its budget, about low-value files and with many places unreached is cut and logged with all of it', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'fbscan-cut-'));
+  const w = (p: string, c: string) => { mkdirSync(join(dir, p, '..'), { recursive: true }); writeFileSync(join(dir, p), c); };
+  for (let i = 0; i < 5; i++) w(`src/m${i}.ts`, `export const m${i} = ${i};\n`);
+  for (let i = 0; i < 5; i++) w(`test/m${i}.test.ts`, `import { m${i} } from '../src/m${i}';\n`);
+  const agent = llm(() => ({
+    facts: [
+      ...Array.from({ length: 40 }, (_, i) => ({ kind: 'api', statement: `source fact ${i}`, path: 'src/m0.ts', lines: null, confidence: 0.9, relevance: 0.5 })),
+      ...Array.from({ length: 10 }, (_, i) => ({ kind: 'convention', statement: `test fact ${i}`, path: 'test/m0.test.ts', lines: null, confidence: 0.9, relevance: 0.4 })),
+      { kind: 'architecture', statement: 'the whole', path: './', lines: null, confidence: 0.9, relevance: 0.9 },
+    ],
+    unreached: Array.from({ length: 12 }, (_, i) => `src/dir${i}`),
+  }), true);
+  const logs: [string, object | undefined][] = [];
+  const { deps, activity } = fakeDeps({ llm: agent, log: (m, e) => logs.push([m, e]) });
+  deps.facts.fileHashes = async () => new Map();
+  await runScan(job(dir), deps);
+  const shard = activity.find((a) => a.kind === 'facts_extracted')!;
+  expect(shard.why).toMatch(/did not reach 12: (src\/dir\d+, ){9}src\/dir9, \.\.\./);
+  expect(shard.why).toMatch(/facts? about tests, fixtures or archived files cut/);
+  expect(shard.why).toMatch(/facts? past the budget of this shard cut, least relevant first/);
+  expect(shard.details!.cut).toEqual({ lowValue: expect.any(Number), overBudget: expect.any(Number) });
+  expect((shard.details!.facts as { statement: string }[]).map((f) => f.statement)).toContain('the whole');
+  expect(logs).toContainEqual(['scanned shard', expect.objectContaining({ project: 'demo', shard: '.', unreached: 12 })]);
+});
+
+test('a sharded scan with no plans to keep and a repo with no commit yet lists afresh; one going on from an older job record says where it is', async () => {
+  const dir = workspace(); // git init, no commit: no HEAD to key a plan by
+  const files = await listCodeFiles(dir, { maxBytes: 80_000, maxFiles: 100 });
+  const agent = shardAgent();
+  const logs: [string, object | undefined][] = [];
+  const { deps } = fakeDeps({ llm: agent, plans: new ScanPlans(), log: (m, e) => logs.push([m, e]) });
+  deps.facts.fileHashes = async () => new Map(files.map((f) => [f.path, f.path.startsWith('packages/') ? f.hash : 'stale']));
+  // An older job record: shards processed, but no count of them.
+  const older = { ...job(dir), shards: { total: 3, rescanned: 0, failed: 0, processed: ['packages/api'] } } as ScanJob;
+  await runScan(older, deps);
+  expect(logs).toContainEqual(['scan resumed', { project: 'demo', shardsDone: 1, shards: 3, keptPlan: false }]);
+  expect(agent.seen.map((s) => shardOf(s.user))).toEqual(['.']);
+});
+
+test('a sharded scan asked to give way after a shard does not when the shards left are unchanged', async () => {
+  const dir = workspace();
+  const files = await listCodeFiles(dir, { maxBytes: 80_000, maxFiles: 100 });
+  let asked = 0;
+  const { deps, updates } = fakeDeps({ llm: shardAgent() });
+  deps.facts.fileHashes = async () => new Map(files.map((f) => [f.path, f.path.startsWith('packages/') ? f.hash : 'stale']));
+  deps.facts.requeueScanJob = async () => { throw new Error('must not requeue'); };
+  deps.yieldTurn = async () => { asked++; return true; };
+  const r = await runScan(job(dir), deps);
+  expect(asked).toBe(0);
+  expect(r.paused).toBeUndefined();
+  expect(updates.at(-1)).toMatchObject({ status: 'done', shards: { total: 3, rescanned: 1 } });
+});
+
+test('a sharded scan gives way and logs it, with what it did and what remains', async () => {
+  const dir = workspace();
+  const logs: [string, object | undefined][] = [];
+  const { deps } = fakeDeps({ llm: shardAgent(), log: (m, e) => logs.push([m, e]) });
+  deps.facts.fileHashes = async () => new Map();
+  storedJob(dir, deps);
+  deps.yieldTurn = async () => true;
+  expect(await runScan(job(dir), deps)).toMatchObject({ paused: true, remaining: 2 });
+  expect(logs).toContainEqual(['scan gave way to another scan', { project: 'demo', shardsDone: 1, shards: 3, remaining: 2 }]);
+});
+
+test('a resumed scan whose only shard tried failed in an earlier run, with nothing else to run, fails as an attempt', async () => {
+  const dir = workspace();
+  const files = await listCodeFiles(dir, { maxBytes: 80_000, maxFiles: 100 });
+  const { deps, updates } = fakeDeps({ llm: shardAgent() });
+  deps.facts.fileHashes = async () => new Map(files.map((f) => [f.path, f.hash]));
+  const resumed = { ...job(dir), shards: { total: 3, done: 1, rescanned: 1, failed: 1, processed: ['.'], failedKeys: ['.'] } } as ScanJob;
+  await expect(runScan(resumed, deps)).rejects.toThrow('all 1 shards failed (last: .): see the earlier runs');
+  expect(updates.at(-1)).toMatchObject({ status: 'queued', counted: true });
+});
+
+test('asked-for files read on their own: an instruction file needs no model, an unreadable one is noted, a stored fact keeps its fields', async () => {
+  const dir = workspace();
+  writeFileSync(join(dir, 'AGENTS.md'), '# rules\n');
+  writeFileSync(join(dir, 'notes.md'), '# notes\n');
+  execFileSync('git', ['-C', dir, 'add', '-A']);
+  const calls: string[] = [];
+  const shards = shardAgent();
+  const agent: LlmProvider = {
+    id: 'claude-cli', agentic: true,
+    json: async (t) => {
+      if (!t.user.startsWith('FILE: ')) return shards.json(t);
+      calls.push(t.user.split('\n')[0]);
+      return { summary: 'S', facts: [
+        { kind: 'api', statement: 'restated', path: 'README.md', lines: null, confidence: 0.9 },
+        { kind: 'api', statement: 'new', path: 'README.md', lines: null, confidence: 0.9 },
+      ] };
+    },
+  };
+  const { deps, saved, written, activity } = fakeDeps({ llm: agent });
+  deps.facts.fileHashes = async () => new Map();
+  // A fact stored before origins, evidence and check versions were kept.
+  deps.facts.listFacts = async (q) => (q.path === 'README.md'
+    ? [{ id: 'old', kind: 'api', statement: 'restated', path: 'README.md', lines: null, confidence: 1, why: 'w', relevance: null, relevanceBy: null, source: 'claude-cli', createdAt: 't', scanJobId: 'j0', fileHash: null, fileSummary: null, docId: null } as never]
+    : []);
+  deps.facts.scanRequests = async () => ['AGENTS.md', 'notes.md', 'README.md'];
+  deps.facts.clearScanRequests = async () => {};
+  // notes.md is gone after the listing (deleted while the scan ran).
+  deps.prPaths = async () => { rmSync(join(dir, 'notes.md')); return []; };
+  const resumed = { ...job(dir), shards: { total: 3, done: 1, rescanned: 1, failed: 0, processed: ['.'] } } as ScanJob;
+  await runScan(resumed, deps);
+  expect(calls).toEqual(['FILE: README.md']);
+  expect(saved.map((s) => s.path)).toEqual(['AGENTS.md', 'README.md']);
+  const readme = written.filter((f) => f.path === 'README.md' && !('scope' in f));
+  expect(readme.find((f) => f.statement === 'restated')).toMatchObject({ checkVersion: null });
+  expect(readme.find((f) => f.statement === 'restated')).not.toHaveProperty('origin');
+  expect(activity.find((a) => a.subject === 'could not read notes.md, which an agent asked for')).toBeTruthy();
+  expect(activity.find((a) => a.subject === '1 new fact from README.md')!.why).toMatch(/1 fact it gave again was kept once/);
+});
+
+test('an unavailable model while reading an asked-for file stops the scan and leaves it queued', async () => {
+  const dir = workspace();
+  const shards = shardAgent();
+  const agent: LlmProvider = {
+    id: 'claude-cli', agentic: true,
+    json: async (t) => { if (t.user.startsWith('FILE: ')) throw new ProviderUnavailableError('claude is not signed in'); return shards.json(t); },
+  };
+  const logs: string[] = [];
+  const { deps, updates } = fakeDeps({ llm: agent, log: (m) => logs.push(m) });
+  deps.facts.fileHashes = async () => new Map();
+  deps.facts.scanRequests = async () => ['README.md'];
+  const resumed = { ...job(dir), shards: { total: 3, done: 1, rescanned: 1, failed: 0, processed: ['.'] } } as ScanJob;
+  await expect(runScan(resumed, deps)).rejects.toBeInstanceOf(ProviderUnavailableError);
+  expect(updates.at(-1)).toMatchObject({ status: 'queued', counted: false });
+  expect(logs).toContain('scan waiting for its model');
+});
+
+test('a model that cannot be reached (a network error, not a ProviderUnavailableError) is reported as unavailable', async () => {
+  const down = llm(() => { throw Object.assign(new Error('connect ECONNREFUSED 127.0.0.1:11434'), { code: 'ECONNREFUSED' }); });
+  const { deps } = fakeDeps({ llm: down });
+  const err = await runScan(job(repo(true)), deps).catch((e: unknown) => e);
+  expect(err).toBeInstanceOf(ProviderUnavailableError);
+  expect((err as ProviderUnavailableError).reason).toMatch(/ECONNREFUSED/);
+});
+
+test('an asked-for file is read on its own also when the store cannot list the facts it already has', async () => {
+  const dir = workspace();
+  const shards = shardAgent();
+  const agent: LlmProvider = {
+    id: 'claude-cli', agentic: true,
+    json: async (t) => (t.user.startsWith('FILE: ') ? { summary: 'S', facts: [{ kind: 'api', statement: 'about the readme', path: 'README.md', lines: null, confidence: 0.9 }] } : shards.json(t)),
+  };
+  const { deps, saved } = fakeDeps({ llm: agent });
+  deps.facts.fileHashes = async () => new Map();
+  deps.facts.scanRequests = async () => ['README.md'];
+  const resumed = { ...job(dir), shards: { total: 3, done: 1, rescanned: 1, failed: 0, processed: ['.'] } } as ScanJob;
+  await runScan(resumed, deps);
+  expect(saved).toEqual([{ path: 'README.md', facts: 1, version: SCANNER_VERSION }]);
 });

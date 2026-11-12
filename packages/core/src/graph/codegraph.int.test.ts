@@ -89,9 +89,22 @@ describeStores('CodeGraphStore', (h) => {
     expect(m.imports.toSorted((a, b) => `${a.from} ${a.to}`.localeCompare(`${b.from} ${b.to}`))).toEqual(
       codeMap().imports.toSorted((a, b) => `${a.from} ${a.to}`.localeCompare(`${b.from} ${b.to}`)),
     );
-    expect(await store.codegraph.codeMapMeta('demo')).toEqual({ fingerprint: 'head:abc', builtAt: m.builtAt, stats, candidates: null, unresolved: null, version: null, lastFailure: null, lastFailureAt: null });
+    expect(await store.codegraph.codeMapMeta('demo')).toEqual({ fingerprint: 'head:abc', builtAt: m.builtAt, checkedAt: m.builtAt, stats, candidates: null, unresolved: null, version: null, lastFailure: null, lastFailureAt: null });
     expect(m.outside).toEqual([]);
     expect(await store.codegraph.codeMap('other')).toBeNull();
+  });
+
+  test('a map found current keeps when it was built and says when it was last checked; a rebuild checks it too', async () => {
+    await store.codegraph.replaceCodeMap('demo', codeMap());
+    const built = (await store.codegraph.codeMapMeta('demo'))!.builtAt;
+    const later = new Date(Date.parse(built) + 3_600_000);
+    await store.codegraph.markCodeMapChecked('demo', later);
+    expect(await store.codegraph.codeMapMeta('demo')).toMatchObject({ builtAt: built, checkedAt: later.toISOString() });
+    await store.codegraph.markCodeMapChecked('other', later);
+    expect(await store.codegraph.codeMapMeta('other')).toBeNull();
+    await store.codegraph.replaceCodeMap('demo', codeMap({ fingerprint: 'head:def' }));
+    const rebuilt = (await store.codegraph.codeMapMeta('demo'))!;
+    expect(rebuilt.checkedAt).toBe(rebuilt.builtAt > later.toISOString() ? rebuilt.builtAt : later.toISOString());
   });
 
   test('a map keeps the version of the map rules it was built by; one without (an older worker) reads back null', async () => {
@@ -100,6 +113,16 @@ describeStores('CodeGraphStore', (h) => {
     expect((await store.codegraph.codeMap('demo'))?.version).toBe(CODE_MAP_VERSION);
     await store.codegraph.replaceCodeMap('demo', codeMap());
     expect((await store.codegraph.codeMapMeta('demo'))?.version).toBeNull();
+  });
+
+  test('a C# file keeps its namespaces with the map, mapped or past the cap; other files have none, and a rebuild replaces them', async () => {
+    const cs = (path: string, namespaces: string[]) => ({ path, lang: 'csharp', hash: `h:${path}`, loc: 3, isTest: false, namespaces });
+    await store.codegraph.replaceCodeMap('demo', codeMap({ files: [cs('src/A.cs', ['Shop.A', 'Shop.A.Inner']), cs('src/Empty.cs', []), { path: 'src/x.ts', lang: 'typescript', hash: 'h', loc: 1, isTest: false }], outside: [cs('src/B.cs', ['Shop.B'])], symbols: [], imports: [], tests: [], churn: {} }));
+    const m = (await store.codegraph.codeMap('demo'))!;
+    expect(m.files).toEqual([cs('src/A.cs', ['Shop.A', 'Shop.A.Inner']), cs('src/Empty.cs', []), { path: 'src/x.ts', lang: 'typescript', hash: 'h', loc: 1, isTest: false }]);
+    expect(m.outside).toEqual([cs('src/B.cs', ['Shop.B'])]);
+    await store.codegraph.replaceCodeMap('demo', codeMap({ files: [cs('src/A.cs', ['Shop.C'])], outside: [], symbols: [], imports: [], tests: [], churn: {} }));
+    expect((await store.codegraph.codeMap('demo'))!.files).toEqual([cs('src/A.cs', ['Shop.C'])]);
   });
 
   test('the import index past the cap: outside files keep their edges, count as importers, and are never mapped files', async () => {
@@ -123,13 +146,14 @@ describeStores('CodeGraphStore', (h) => {
     // Importers past the cap count: db.ts has three importers, one of them outside the map.
     expect((await store.codegraph.moduleContext('demo', 'src/db.ts'))!.importers).toEqual(['src/api.ts', 'src/cli.ts', 'src/jobs/sync.ts', 'test/db.test.ts']);
     expect((await store.codegraph.hotspots('demo', 10)).find((h) => h.path === 'src/db.ts')?.dependents).toBe(4);
-    // A file past the cap has no module context, but the index says who imports it.
-    expect(await store.codegraph.moduleContext('demo', 'src/utils/log.ts')).toBeNull();
-    expect(await store.codegraph.outsideMap('demo', ['src/utils/log.ts', 'src/db.ts', 'src/nowhere.ts'])).toEqual([
-      // api.test.ts covers api.ts, which imports it
-      { path: 'src/utils/log.ts', importers: ['src/api.ts', 'src/jobs/sync.ts'], tests: ['test/api.test.ts'] },
-    ]);
-    expect(await store.codegraph.outsideMap('demo', ['src/jobs/sync.ts'])).toEqual([{ path: 'src/jobs/sync.ts', importers: ['test/sync.test.ts'], tests: ['test/sync.test.ts'] }]);
+    // A file past the cap has a module context from the index: who imports it, what it imports, its tests; no symbols.
+    const log = (await store.codegraph.moduleContext('demo', 'src/utils/log.ts'))!;
+    // api.test.ts and sync.test.ts cover api.ts and sync.ts, which import it
+    expect(log).toMatchObject({ outside: true, symbols: [], importers: ['src/api.ts', 'src/jobs/sync.ts'], tests: ['test/api.test.ts', 'test/sync.test.ts'] });
+    const sync = (await store.codegraph.moduleContext('demo', 'src/jobs/sync.ts'))!;
+    expect(sync).toMatchObject({ outside: true, importers: ['test/sync.test.ts'], tests: ['test/sync.test.ts'] });
+    expect(sync.imports.map((i) => i.to)).toEqual(['src/db.ts', 'src/utils/log.ts']);
+    expect((await store.codegraph.moduleContext('demo', 'src/db.ts'))!.outside).toBeUndefined();
     const impact = await store.codegraph.impact('demo', ['src/utils/log.ts'], 2);
     expect(impact.paths).toEqual(['src/utils/log.ts']);
     expect(impact.dependents.map((d) => d.path)).toEqual(['src/api.ts', 'src/jobs/sync.ts', 'src/main.ts', 'test/api.test.ts', 'test/sync.test.ts']);
@@ -145,7 +169,7 @@ describeStores('CodeGraphStore', (h) => {
     const plain = (await store.codegraph.codeMap('demo'))!;
     expect(plain.outside).toEqual([]);
     expect(plain.imports).toHaveLength(6);
-    expect(await store.codegraph.outsideMap('demo', ['src/jobs/sync.ts'])).toEqual([]);
+    expect(await store.codegraph.moduleContext('demo', 'src/jobs/sync.ts')).toBeNull();
     expect(await probe.ids('CodeFile')).not.toContain('demo:src/jobs/sync.ts');
   });
 
@@ -245,6 +269,14 @@ describeStores('CodeGraphStore', (h) => {
       expect(m.fingerprint).toBe('head:abc');
       expect(m.files).toHaveLength(6);
       expect(m.symbols).toHaveLength(3);
+    } else {
+      // A cut-short Neo4j write says when it began, so /api/status can tell it from one still running.
+      // Its lease, renewed only while the write runs, then ages out (CODE_MAP_LEASE_MS).
+      expect(Date.parse(meta.writingAt!)).toBeGreaterThan(0);
+      expect(Date.parse(meta.writingBeat!)).toBeGreaterThanOrEqual(Date.parse(meta.writingAt!));
+      await store.codegraph.replaceCodeMap('demo', codeMap());
+      expect((await store.codegraph.codeMapMeta('demo'))!.writingAt).toBeUndefined();
+      expect((await store.codegraph.codeMapMeta('demo'))!.writingBeat).toBeUndefined();
     }
   });
 
@@ -402,7 +434,7 @@ describeStores('CodeGraphStore', (h) => {
   });
 
   test('symbol names, import names and specifiers are redacted before they are stored', async () => {
-    const key = 'sk-ant-api03-abcdefghijklmnopqrstuvwxyz0123';
+    const key = 'sk' + '-ant-api03-abcdefghijklmnopqrstuvwxyz0123';
     await store.codegraph.replaceCodeMap('demo', codeMap({
       symbols: [{ id: `src/db.ts#${key}`, path: 'src/db.ts', name: key, kind: 'const', exported: false, lines: '1-1' }],
       imports: [{ from: 'src/db.ts', to: 'pkg:x', names: [key], spec: key }],

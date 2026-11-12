@@ -11,4 +11,6 @@ test('runtime, workspace packages and both plugin manifests agree on the release
   for (const name of ['core', 'api', 'worker', 'store-postgres', 'ui']) expect(json(`packages/${name}/package.json`).version).toBe(expected);
   expect(json('plugin/.claude-plugin/plugin.json').version).toBe(expected);
   expect(json('.claude-plugin/marketplace.json').plugins[0].version).toBe(expected);
+  // The newest CHANGELOG section, released or not, is the version the packages carry.
+  expect(readFileSync(resolve(root, 'CHANGELOG.md'), 'utf8').match(/^## (\S+)/m)?.[1]).toBe(expected);
 });

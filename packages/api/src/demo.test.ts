@@ -61,7 +61,7 @@ describe('seedDemo', () => {
   });
 
   test('never replaces facts a scan found: a file that has facts gets no demo facts', async () => {
-    const t = deps({ facts: { listFacts: async (q) => (q.path === DEMO_CORPUS.facts[0].path ? [{ id: 'f' } as never] : []), saveFileFacts: async (key, file, fx, source) => { t.facts.push({ key, path: file.path, source, statements: fx.map((f) => f.statement) }); } } });
+    const t = deps({ facts: { listFacts: async (q) => (q.path === DEMO_CORPUS.facts[0].path ? [{ id: 'f', statement: 'Routes read through db.scoped' } as never] : []), saveFileFacts: async (key, file, fx, source) => { t.facts.push({ key, path: file.path, source, statements: fx.map((f) => f.statement) }); } } });
     await seedDemo({}, t.d);
     expect(t.facts.map((f) => f.path)).not.toContain(DEMO_CORPUS.facts[0].path);
   });
@@ -119,9 +119,12 @@ describe('seedDemo', () => {
     expect(plain.misses[0].run).toBeUndefined();
   });
 
-  test('a store without the demo methods says so instead of half-seeding', async () => {
-    const t = deps({ knowledge: { upsertLesson: async () => {} } });
-    await expect(seedDemo({}, t.d)).rejects.toThrow(/demo/);
+  test('a seed in a run says it is the run\'s, and that fg cleanup --run takes it back, not "approved by you"', async () => {
+    const t = deps();
+    const r = await runIn({ id: 'probe-1', sandbox: true }, () => seedDemo({}, t.d));
+    expect(r.message).toMatch(/approved within run probe-1, a sandbox: only that run's agents working in demo-shop/);
+    expect(r.message).toMatch(/fg cleanup --run probe-1 --apply/);
+    expect(r.message).not.toMatch(/approved by you|fg demo remove/);
   });
 });
 
@@ -135,7 +138,7 @@ test('removeDemo removes what the seed wrote, says how much, and logs it', async
 });
 
 test('removeDemo says when the project node the seed created went with it', async () => {
-  const t = deps({ knowledge: { upsertLesson: async () => {}, removeDemo: async () => ({ lessons: 4, misses: 1, facts: 3, projectRemoved: true }) } });
+  const t = deps({ knowledge: { saveDemoMiss: async () => 'miss:demo', upsertLesson: async () => {}, removeDemo: async () => ({ lessons: 4, misses: 1, facts: 3, projectRemoved: true }) } });
   const r = await removeDemo({}, t.d);
   expect(r.message).toMatch(/The project demo-shop itself, which the seed created and nothing else uses, is gone too/);
   expect(t.activity[0].details).toMatchObject({ projectRemoved: true });

@@ -1,4 +1,5 @@
-import { LESSON_SHARING_NOTICE } from '@fb/core';
+import type { LESSON_SHARING_NOTICE } from '@fb/core';
+import { DEMO_PROBE, DEMO_PROJECT } from './demo.ts';
 /**
  * fg: drive Feedback Graph from a terminal or an agent, over its HTTP API. No dependencies beyond Node itself, so it
  * runs on the host (scripts/fg) and inside the api container (docker compose exec api node src/cli.ts ...).
@@ -18,15 +19,9 @@ export type CliIO = {
   sleep: (ms: number) => Promise<void>;
   /** For fg docs upload; default: the file system. */
   readFile?: (path: string) => Promise<Buffer>;
-  /** For fg integrations set --from-stdin; default: all of standard input. */
+  /** For fg integrations set --from-stdin: all of standard input (main reads the process's); without it there is none. */
   readStdin?: () => Promise<string>;
 };
-
-async function allOfStdin(): Promise<string> {
-  const parts: Buffer[] = [];
-  for await (const chunk of process.stdin) parts.push(chunk as Buffer);
-  return Buffer.concat(parts).toString('utf8');
-}
 
 const USAGE = `fg: drive Feedback Graph from a terminal or an agent
 
@@ -41,7 +36,7 @@ Usage:
   fg inbox list [--status pending|confirmed|rejected] [--source claude|codex|github|linear] [--project k] [--limit n] [--pr number] [--author login]
   fg inbox show <id>
   fg inbox confirm|reject <id> [<id> ...] [--reason "..."]
-  fg lessons list [--status proposed|approved|rejected|revoked|superseded] [--project k] [--flag <check>] [--source github|linear|session|memory|manual] [--pr number] [--author login]
+  fg lessons list [--status proposed|approved|rejected|revoked|superseded] [--project k] [--flag <check>] [--source github|linear|session|agent|memory|manual|demo] [--pr number] [--author login]
   fg lessons show <id>
   fg lessons approve|reject|revoke <id> [<id> ...] [--note "..."]   one batch; each lesson is recorded as decided on its own
   fg lessons quality [--project k]               of the lessons decided in the last 30 and 90 days: approved as written, after an edit, rejected
@@ -49,27 +44,46 @@ Usage:
   fg lessons to-fact <id> [--kind convention] [--relevance 0.8]   file a lesson that states how the code is as a project fact you wrote; rejects the lesson
   fg demo seed [--project k]                     a small corpus marked demo in demo-shop (approved lessons tied to files, a miss,
                                                  facts) so the lesson path fires; you approve its lessons by running it.
-                                                 --project: another project (the owner only: needs lesson_decide)
+                                                 --project: another project (operator token: needs lesson_decide as well as demo)
   fg demo remove [--project k]                   take back exactly what fg demo seed wrote
+  fg demo context [--project k]                  what an agent gets (get_task_context) before editing demo-shop's routes
+  fg demo check [--project k]                    check_before_done on a diff that breaks a seeded lesson: the gap, with its line
   fg map rebuild <key>                               remap a project's code from scratch at the worker's next pass (recorded in Activity)
+  fg map drop <key>                                  drop a project's code map (its facts and transcripts are kept)
   fg links list --project k
-  fg links confirm|dismiss <a> <b> [--relation depends_on|related] [--note "..."]
-  fg facts list --project k [--kind k] [--q "search"]
+  fg links confirm|dismiss <a> <b> [--relation depends_on|same_product|shares_code|related] [--note "..."]
+  fg facts list --project k [--kind k] [--q "search"] [--limit n]
   fg facts relevance <id> <0..1> --project k
   fg docs list --project k
   fg docs upload <file> --project k [--title "..."]   text, or a png/jpeg/webp/gif image
   fg activity [--project k] [--kind k] [--run id] [--limit n]
   fg sessions [--project k] [--limit n]
+  fg sessions register [session-id] --run <run>  open a labelled run for this session (Codex: CODEX_THREAD_ID by default)
   fg evidence <session-id>                       what the tool saw in one session and decided: turns, the detector's call
                                                  on each and the skip rules, Inbox items with their post-mortem and lesson, context served
-  fg cleanup --run <id> [--apply]                remove what a labelled run wrote: a dry run (counts per kind, what stays and
+  fg cleanup --run <id> [--apply|--dry-run]      remove what a labelled run wrote: a dry run (counts per kind, what stays and
                                                  why) unless --apply; never what anyone outside the run touched since
+  fg loop status                                 the learning loop: its mode as set and as it runs, each type's calibration and breaker,
+                                                 the budget, this week's counts and the current round
+  fg loop pause|resume                           stop the learning loop at once, or start it again
+  fg loop mode <off|observe|propose|auto> [--type t=m,t2=m]   the mode; per type a mode, or global to follow the mode
+  fg decisions list [--status s] [--type t] [--project k] [--since 24h|<ISO>] [--q "text"] [--limit n]
+                                                 the loop's decisions (the audit log), newest first; <id> below may be a
+                                                 unique prefix of a full id (with or without dec:)
+  fg decisions show <id>                         one decision: before and after, its targets now, evidence, dependencies, notes
+  fg decisions approve|reject|keep <id> [--note "..."] [--reason wrong_evidence|too_broad|wording|not_now|other]
+  fg decisions rollback <id> [--reason r] [--note "..."] [--apply] [--restore-anyway]
+                                                 a preview (what else it undoes, what blocks it) unless --apply
+  fg decisions rollback --since 24h [--type t] [--apply]   every decision applied since then, newest first: a preview unless --apply
+  fg decisions note <id> "text" [--verdict agree|disagree] [--reason r]
   fg cloud status
   fg cloud sync-now [--force]                    sends what changed since the last sync (--force: everything)
-  fg integrations project <key> --github-author <login|all>  sync PRs by this author (all clears the filter)
+  fg integrations project <key> --github-author <login|all>  sync PRs by this author (all clears the filter; needs integrations in OPERATOR_ALLOW)
   fg integrations status
   fg integrations set github|linear --from-stdin   the token from standard input (never an argument; needs integrations in OPERATOR_ALLOW)
   fg integrations test github|linear             re-check the saved token (a read: no OPERATOR_ALLOW verb needed)
+  fg signin                                      a one-time link that signs this machine's browser in as the owner: open it
+                                                 within a minute; it works once (needs FG_OWNER_TOKEN; scripts/fg reads it from .env)
   fg doctor                                      ./scripts/doctor.sh (run by scripts/fg on the host)
   fg setup [args]                                ./scripts/setup.sh with those arguments (run by scripts/fg on the host)
 
@@ -82,17 +96,18 @@ Options:
                    stage; --timeout s gives up (exit 1)
   --as <name>      the agent name Activity records (default: FG_OPERATOR_NAME, else fg)
   --run <id>       label every request with this run (x-fg-run; default: FG_RUN), so fg cleanup --run removes what it wrote;
-                   on cleanup and activity it names the run, and cleanup, activity and evidence are never labelled
+                   on cleanup and activity it names the run, and cleanup and activity requests are never labelled
   --owner          fg cleanup only: use the separate FG_OWNER_TOKEN to clean a legacy run (never an operator bypass)
   --sandbox        with --run: a sandbox run (x-fg-sandbox; default: FG_SANDBOX=1): what it writes is served only to its own agents
-  --url <url>      the API (default: FEEDBACK_GRAPH_URL, else http://localhost:8787)
+  --url <url>      the API (default: FEEDBACK_GRAPH_URL, else localhost on this checkout's API_PORT, 8787 unless .env moves it)
   --help           this text (fg help <command>: that command only)
 
 Environment:
-  FEEDBACK_GRAPH_URL   where the API answers (default http://localhost:8787)
+  FEEDBACK_GRAPH_URL   where the API answers (default: localhost on this checkout's API_PORT)
   FG_OPERATOR_TOKEN    lets fg make owner decisions; the API allows only the verbs in OPERATOR_ALLOW (by default
                        not lesson_decide, select_projects, delete_project, docs_delete, links_delete, settings, import,
-                       integrations, chat, chat_delete). Writes are logged in Activity as operator:<name>.
+                       integrations, chat, chat_delete, loop_decide, loop_settings). Writes are logged in Activity as
+                       operator:<name>.
   API_TOKEN            signs in for reading when FG_OPERATOR_TOKEN is not set
   FG_OPERATOR_NAME     the default for --as
   FG_RUN, FG_SANDBOX   the defaults for --run and --sandbox (FG_SANDBOX=1)`;
@@ -101,14 +116,14 @@ Environment:
 
 type Flags = {
   json?: true; watch?: true; all?: true; only?: true; help?: true; wait?: true; force?: true; 'from-stdin'?: true; 'with-sessions'?: true;
-  owner?: true; sandbox?: true; apply?: true; 'dry-run'?: true; run?: string;
+  owner?: true; sandbox?: true; apply?: true; 'dry-run'?: true; 'restore-anyway'?: true; run?: string; since?: string; type?: string; verdict?: string;
   key?: string[]; provider?: string; status?: string; project?: string; limit?: string; reason?: string; interval?: string; as?: string; url?: string;
   until?: string; timeout?: string; kind?: string; q?: string; title?: string; note?: string; relation?: string; source?: string; relevance?: string; flag?: string; pr?: string; author?: string; 'github-author'?: string;
 };
 export type Parsed = { words: string[]; flags: Flags };
 
-const BOOLEAN = new Set(['json', 'watch', 'all', 'only', 'help', 'wait', 'force', 'from-stdin', 'with-sessions', 'sandbox', 'apply', 'dry-run', 'owner']);
-const VALUED = new Set(['key', 'provider', 'status', 'project', 'limit', 'reason', 'interval', 'as', 'url', 'until', 'timeout', 'kind', 'q', 'title', 'note', 'relation', 'source', 'relevance', 'flag', 'run', 'pr', 'author', 'github-author']);
+const BOOLEAN = new Set(['json', 'watch', 'all', 'only', 'help', 'wait', 'force', 'from-stdin', 'with-sessions', 'sandbox', 'apply', 'dry-run', 'owner', 'restore-anyway']);
+const VALUED = new Set(['key', 'provider', 'status', 'project', 'limit', 'reason', 'interval', 'as', 'url', 'until', 'timeout', 'kind', 'q', 'title', 'note', 'relation', 'source', 'relevance', 'flag', 'run', 'pr', 'author', 'github-author', 'since', 'type', 'verdict']);
 
 export function parse(argv: string[]): Parsed {
   const words: string[] = [];
@@ -143,9 +158,12 @@ class ApiError extends Error {
 
 const PLAIN_HTTP_OK = new Set(['localhost', '127.0.0.1', '[::1]', 'host.docker.internal']);
 
-/** Server text (errors, summaries, model reasons) printed as text, never as terminal escapes. Keeps tabs and newlines. */
+/**
+ * Server text (errors, summaries, model reasons) printed as text, never as terminal escapes or bidi controls (which
+ * reorder what follows them on the line, so a cell could show another id or verb). Keeps tabs and newlines.
+ */
 // eslint-disable-next-line no-control-regex -- Deliberately reject or strip control bytes at this boundary.
-const printable = (s: string) => s.replace(/[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/g, '');
+const printable = (s: string) => s.replace(/[\u0000-\u0008\u000b-\u001f\u007f-\u009f\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/g, '');
 
 type Api = ReturnType<typeof client>;
 
@@ -154,8 +172,11 @@ const UNLABELLED = new Set(['cleanup', 'activity']);
 
 function client(io: CliIO, flags: Flags, labels = true) {
   const base = (flags.url ?? io.env.FEEDBACK_GRAPH_URL ?? 'http://localhost:8787').replace(/\/+$/, '');
-  if (flags.owner && !io.env.FG_OWNER_TOKEN?.trim()) throw new UsageError('--owner requires FG_OWNER_TOKEN; tokenless owner actions use the same-origin browser UI');
-  const token = flags.owner ? io.env.FG_OWNER_TOKEN?.trim() ?? '' : io.env.FG_OPERATOR_TOKEN?.trim() || io.env.API_TOKEN?.trim() || '';
+  const ownerToken = io.env.FG_OWNER_TOKEN?.trim();
+  if (flags.owner && !ownerToken) throw new UsageError('--owner requires FG_OWNER_TOKEN; a tokenless install is read-only for owner actions: run ./scripts/setup.sh --yes --enable-auth');
+  const token = flags.owner ? ownerToken : io.env.FG_OPERATOR_TOKEN?.trim() || io.env.API_TOKEN?.trim() || '';
+  /** Which credential the requests carry: FG_OPERATOR_TOKEN wins over API_TOKEN whenever both are set. */
+  const credential = !token ? null : flags.owner ? 'FG_OWNER_TOKEN' : io.env.FG_OPERATOR_TOKEN?.trim() ? 'FG_OPERATOR_TOKEN' : 'API_TOKEN';
   const name = flags.as ?? io.env.FG_OPERATOR_NAME ?? 'fg';
   if (token) {
     let u: URL;
@@ -171,7 +192,7 @@ function client(io: CliIO, flags: Flags, labels = true) {
     }
   }
   // A run label (fg cleanup --run removes what the run wrote); the API checks it and refuses a malformed one. Not on
-  // cleanup, activity or evidence: their --run names the run to clean or list, and labelling would claim it.
+  // cleanup or activity (UNLABELLED): their --run names the run to clean or list, and labelling would claim it.
   const runId = labels ? flags.run ?? io.env.FG_RUN?.trim() ?? '' : '';
   const sandbox = labels && (!!flags.sandbox || io.env.FG_SANDBOX?.trim() === '1');
   if (sandbox && !runId) throw new UsageError('--sandbox needs --run <id> (or FG_RUN): a sandbox run is cleaned up by its id');
@@ -187,8 +208,8 @@ function client(io: CliIO, flags: Flags, labels = true) {
     }
     return { events: readSse(res.body), close: () => ctl.abort() };
   };
-  const api = async <T = unknown>(method: string, path: string, body?: unknown): Promise<T> => {
-    const headers: Record<string, string> = { accept: 'application/json', ...authHeaders() };
+  const api = async <T = unknown>(method: string, path: string, body?: unknown, o: { accept?: string } = {}): Promise<T> => {
+    const headers: Record<string, string> = { accept: o.accept ?? 'application/json', ...authHeaders() };
     if (body !== undefined) headers['content-type'] = 'application/json';
     let res: Response;
     try {
@@ -203,13 +224,21 @@ function client(io: CliIO, flags: Flags, labels = true) {
       const e = (data as { error?: unknown } | null)?.error ?? data ?? res.statusText;
       const message = typeof e === 'string' ? e : JSON.stringify(e);
       const ownerPermission = /only you|owner credential|operator token|allowed verb|OPERATOR_ALLOW/i.test(message);
-      const hint = res.status === 401 ? ' (check FG_OPERATOR_TOKEN or API_TOKEN against this install)'
+      // A run is its opener's: name the credential fg sent, since FG_OPERATOR_TOKEN silently wins over API_TOKEN.
+      const otherCaller = (res.status === 403 || res.status === 409) && /belongs to another caller/.test(message);
+      // A run an API agent opened is refused to the operator token, but API_TOKEN with the same FG_RUN_KEY may clean it up.
+      const agentRun = res.status === 403 && /was opened by an API agent/.test(message);
+      const hint = res.status === 401 ? (/FG_OPERATOR_TOKEN|API_TOKEN|FG_OWNER_TOKEN/.test(message) ? '' : ' (check FG_OPERATOR_TOKEN or API_TOKEN against this install)')
+        // The run 409 names what was sent and what to change; fg adds only how to clear the token for one command.
+        : otherCaller && /this request sent/.test(message) ? (/clear FG_OPERATOR_TOKEN/.test(message) && io.env.API_TOKEN?.trim() ? ' (for one command: FG_OPERATOR_TOKEN= ./scripts/fg ...)' : '')
+        : (otherCaller || agentRun) && credential === 'FG_OPERATOR_TOKEN' && io.env.API_TOKEN?.trim() ? ' (fg sent FG_OPERATOR_TOKEN, which takes precedence over API_TOKEN: to act with API_TOKEN, clear it for this command: FG_OPERATOR_TOKEN= ./scripts/fg ...)'
+        : otherCaller && credential ? ` (fg sent ${credential})`
         : res.status === 403 && ownerPermission && !io.env.FG_OPERATOR_TOKEN?.trim() ? ' (set FG_OPERATOR_TOKEN in .env, restart, and run fg with it to let agents make this decision)' : '';
       throw new ApiError(`${method} ${path}: ${res.status} ${message}${hint}`, res.status);
     }
     return data as T;
   };
-  return Object.assign(api, { events });
+  return Object.assign(api, { events, credential });
 }
 
 type SseEvent = { event: string; data: string };
@@ -248,11 +277,14 @@ const qs = (o: Record<string, string | undefined>) => {
 
 // ── Output ─────────────────────────────────────────────────────────────
 
-/** Left-aligned columns, two spaces apart; long cells are cut so a row stays on one line. */
-export function table(head: string[], rows: (string | number | null | undefined)[][], max = 60): string {
-  const cells = [head, ...rows.map((r) => r.map((c) => {
+/**
+ * Left-aligned columns, two spaces apart; long cells are cut so a row stays on one line, except in the `whole` columns
+ * (ids a reader passes back to another command).
+ */
+export function table(head: string[], rows: (string | number | null | undefined)[][], max = 60, whole: number[] = []): string {
+  const cells = [head, ...rows.map((r) => r.map((c, i) => {
     const s = String(c ?? '').replace(/\s+/g, ' ');
-    return s.length > max ? `${s.slice(0, max - 1)}…` : s;
+    return s.length > max && !whole.includes(i) ? `${s.slice(0, max - 1)}…` : s;
   }))];
   const widths = head.map((_, i) => Math.max(...cells.map((r) => (r[i] ?? '').length)));
   return cells.map((r) => r.map((c, i) => (i === r.length - 1 ? c : c.padEnd(widths[i]))).join('  ').trimEnd()).join('\n');
@@ -262,7 +294,7 @@ export function table(head: string[], rows: (string | number | null | undefined)
 
 type Candidate = { key: string; path: string; exists: boolean; tracked: boolean; excluded: boolean; aliasOf: string | null; claudeSessions: number; codexSessions: number };
 /** A folder with Claude Code or Codex sessions on disk (what Settings counts for it). */
-const hasSessions = (c: Pick<Candidate, 'claudeSessions' | 'codexSessions'>) => (c.claudeSessions ?? 0) + (c.codexSessions ?? 0) > 0;
+const hasSessions = (c: Pick<Candidate, 'claudeSessions' | 'codexSessions'>) => c.claudeSessions + c.codexSessions > 0;
 type Settings = { tracked: string[]; candidates: Candidate[] };
 
 /** An ISO time as `2026-10-25 03:38:29` (UTC, as the API gives it). */
@@ -321,7 +353,7 @@ function queueLines(queues: Record<string, any> | undefined): string[] {
       `running ${r.shards ? `shard ${Math.min(r.shards.done + 1, r.shards.total)}/${r.shards.total} of ` : ''}${r.what} for ${waited(r.since)}`);
     lines.push(`queue     ${QUEUE_LABEL[name] ?? name}: ${[head, ...runs].join('; ')}`);
     if (name !== 'scans') continue;
-    const projects = (q.projects ?? []) as { project: string; status: string; since: string; shards: { done: number; total: number } | null }[];
+    const projects = q.projects as { project: string; status: string; since: string; shards: { done: number; total: number } | null }[];
     for (const j of projects.slice(0, QUEUE_PROJECTS)) {
       const shards = j.shards ? `, ${j.shards.done} of ${plural(j.shards.total, 'shard')} done` : '';
       lines.push(`          ${j.project.padEnd(20)} ${j.status} ${waited(j.since)}${shards}`);
@@ -331,31 +363,39 @@ function queueLines(queues: Record<string, any> | undefined): string[] {
   return lines;
 }
 
+/** The worker beats every 30 s (worker/src/heartbeat.ts): three missed beats and it is not ok, whatever /api/status allows. */
+const LATE_BEAT_S = 90;
+
 function statusLines(s: Record<string, any>, p: Pipeline | null): string[] {
   const w = s.worker;
+  const worker = !w ? 'not reported'
+    : s.workerHealthy && Date.now() - Date.parse(w.lastBeat) <= LATE_BEAT_S * 1000 ? 'ok'
+    : `stale: no heartbeat for ${waited(w.lastBeat)} (it beats every 30 s; is it running? ./scripts/doctor.sh)`;
   const lines = [
     `version   ${s.version ?? '?'}${s.store ? ` (${s.store})` : ''}`,
     `store     ${s.graph === false ? 'NOT answering' : 'ok'}`,
-    `worker    ${s.workerHealthy ? 'ok' : w ? 'stale (no heartbeat lately)' : 'not reported'}${w?.lastCycleAt ? `, last cycle ${w.lastCycleAt}` : ''}`,
+    `worker    ${worker}${w?.lastCycleAt ? `, last cycle ${w.lastCycleAt}` : ''}`,
   ];
-  if (s.ownerSetupRequired) lines.push('owner     SETUP REQUIRED: run ./scripts/setup.sh interactively to create FG_OWNER_TOKEN, then sign in and reinstall agent credentials');
+  if (s.ownerSetupRequired) lines.push('owner     SETUP REQUIRED: run ./scripts/setup.sh --yes to create FG_OWNER_TOKEN, restart the api (docker compose up -d), then sign in with it');
   if (s.databaseMemory) {
     const m = s.databaseMemory, mib = (n: number) => `${Math.round(n / 1048576)} MiB`;
-    lines.push(`neo4j     ${mib(m.usedBytes)} / ${mib(m.limitBytes)}, headroom ${mib(m.headroomBytes)}, swap ${mib(m.swapBytes)}${typeof m.swapHeadroomBytes === 'number' ? `, swap headroom ${mib(m.swapHeadroomBytes)}` : ' (swap limit unknown/unlimited)'} (host snapshot)${m.headroomBytes / m.limitBytes < 0.15 || m.swapBytes > 0 ? ' WARNING: memory pressure' : ''}`);
+    // A few KiB of swap is the kernel paging out idle memory, not pressure: swap counts from 1 MiB (shown in KiB below it).
+    const swap = m.swapBytes > 0 && m.swapBytes < 1048576 ? `${Math.round(m.swapBytes / 1024)} KiB` : mib(m.swapBytes);
+    lines.push(`neo4j     ${mib(m.usedBytes)} / ${mib(m.limitBytes)}, headroom ${mib(m.headroomBytes)}, swap ${swap}${typeof m.swapHeadroomBytes === 'number' ? `, swap headroom ${mib(m.swapHeadroomBytes)}` : ' (swap limit unknown/unlimited)'} (host snapshot)${m.headroomBytes / m.limitBytes < 0.15 || m.swapBytes >= 1048576 ? ' WARNING: memory pressure' : ''}`);
   }
   if (s.stage) {
     const pr = s.progress;
     const count = pr ? ` (${pr.total === null ? `${pr.done} done` : `${pr.done} of ${pr.total}`})` : '';
     lines.push(`stage     ${s.stage.name}${s.stage.current ? ` ${s.stage.current}` : ''}${count} since ${at(s.stage.startedAt)}`);
   }
-  for (const m of s.codeMaps ?? []) lines.push(`code map  ${m.projectKey} built ${m.builtAt} (${m.ageDays}d since rebuild; unchanged maps are not stale)${m.interrupted ? '; rebuild was interrupted and will be retried' : m.lastFailureAt ? `; last rebuild failed ${m.lastFailureAt}${m.lastFailure ? `: ${m.lastFailure}` : ''}` : ''}`);
+  for (const m of s.codeMaps ?? []) lines.push(`code map  ${m.projectKey} ${m.builtAt ? `built ${m.builtAt} (${m.ageDays}d since rebuild)` : 'never built'}${m.builtAt && m.checkedAt > m.builtAt ? `, last confirmed current ${m.checkedAt}` : ''}${m.rebuilding ? '; rebuilding now' : m.interrupted ? '; rebuild was interrupted and will be retried' : m.lastFailureAt ? `; last rebuild failed ${m.lastFailureAt}${m.lastFailure ? `: ${m.lastFailure}` : ''}` : ''}`);
   if (p) lines.push(`pipeline  ${pipelineLine(p)}`, ...queueLines(p.queues));
   const judged = (p?.lessons?.quality as Quality[] | undefined)?.[0];
   if (judged) lines.push(`lessons   ${qualityLine(judged)}`);
   const older = p?.scans?.olderScanner;
   if (older?.files) {
-    const where = Object.entries((older.projects ?? {}) as Record<string, number>).map(([k, n]) => `${k} ${n}`).join(', ');
-    lines.push(`scanner   ${plural(older.files, 'file')} ${older.files === 1 ? 'was' : 'were'} read by an older scanner${where ? ` (${where})` : ''}: press Scan on the Projects page (or fg scan <project>) to refresh ${older.files === 1 ? 'it' : 'them'}`);
+    const where = Object.entries(older.projects as Record<string, number>).map(([k, n]) => `${k} ${n}`).join(', ');
+    lines.push(`scanner   ${plural(older.files, 'file')} ${older.files === 1 ? 'was' : 'were'} read by an older scanner (${where}): press Scan on the Projects page (or fg scan <project>) to refresh ${older.files === 1 ? 'it' : 'them'}`);
   }
   if (w?.lastCycle) lines.push(`cycle     ${Object.entries(w.lastCycle).map(([k, v]) => `${k}=${v}`).join(' ')}`);
   if (w?.lastError) lines.push(`error     ${w.lastError}`);
@@ -741,7 +781,7 @@ async function lessons(api: Api, io: CliIO, words: string[], f: Flags): Promise<
   const status = verb === 'approve' ? 'approved' : verb === 'revoke' ? 'revoked' : 'rejected';
   const items = ids.map((lessonId) => ({ id: lessonId, status, ...(f.note !== undefined && { note: f.note }) }));
   const { results, sharing } = await api<{ results: { id: string; ok: boolean; status?: string; error?: string }[]; sharing?: typeof LESSON_SHARING_NOTICE }>('POST', '/api/lessons/decisions', { items });
-  if (f.json) io.out(JSON.stringify(results.map(result => result.ok ? { ...result, sharing: sharing ?? LESSON_SHARING_NOTICE } : result), null, 2));
+  if (f.json) io.out(JSON.stringify(results.map(result => result.ok ? { ...result, sharing } : result), null, 2));
   else io.out(table(['ID', 'RESULT'], results.map((r) => [r.id, r.ok ? r.status : r.error])));
   if (!f.json && verb === 'approve' && results.some(r => r.ok)) io.out('Approval does not trigger cloud sync. Eligible projects share on the next scheduled sync, or use fg cloud sync-now.');
   return results.every((r) => r.ok) ? 0 : 1;
@@ -801,9 +841,34 @@ async function map(api: ReturnType<typeof client>, io: CliIO, words: string[], f
   return 0;
 }
 
+/** An agent MCP tool's answer, as an agent would get it: its text, and whether the tool said it failed. */
+async function mcpTool(api: Api, name: string, args: Record<string, unknown>): Promise<{ text: string; isError: boolean; gaps?: unknown[] }> {
+  const r = await api<{ result?: { content?: { text?: string }[]; isError?: boolean; structuredContent?: { gaps?: unknown[] } }; error?: { message: string } }>('POST', '/mcp',
+    { jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name, arguments: args } }, { accept: 'application/json, text/event-stream' });
+  if (r.error) throw new ApiError(`${name}: ${r.error.message}`);
+  const gaps = r.result?.structuredContent?.gaps;
+  return { text: (r.result?.content ?? []).map((c) => c.text ?? '').join('\n'), isError: !!r.result?.isError, ...(gaps && { gaps }) };
+}
+
 async function demo(api: Api, io: CliIO, words: string[], f: Flags): Promise<number> {
   const [verb] = words;
-  if (verb !== 'seed' && verb !== 'remove') throw new UsageError('usage: fg demo seed|remove [--project k]');
+  // What an agent working in demo-shop gets, without an agent session: the context before an edit, and the check
+  // before "done" on a diff that breaks a seeded lesson (DEMO_PROBE).
+  if (verb === 'context' || verb === 'check') {
+    const project = f.project ?? DEMO_PROJECT;
+    const r = verb === 'context'
+      ? await mcpTool(api, 'get_task_context', { project, task: 'Add an orders list route next to the customers routes', files: ['src/routes/customers.ts', DEMO_PROBE.files[0]] })
+      : await mcpTool(api, 'check_before_done', { project, task: DEMO_PROBE.task, summary: 'Logged each request in the probe module', files_changed: DEMO_PROBE.files, diff: DEMO_PROBE.diff });
+    io.out(f.json ? JSON.stringify(r, null, 2) : r.text);
+    // The check exists to show the seeded lesson's gap: one that found none (not seeded, removed, an unknown project)
+    // showed nothing, which is no pass.
+    if (verb === 'check' && !r.isError && !r.gaps?.length) {
+      io.err(`fg demo check: no gap was found, so the demo showed nothing${f.project ? '' : ' (run fg demo seed first)'}`);
+      return 1;
+    }
+    return r.isError ? 1 : 0;
+  }
+  if (verb !== 'seed' && verb !== 'remove') throw new UsageError('usage: fg demo seed|remove|context|check [--project k]');
   const r = await api<{ message: string }>('POST', `/api/demo/${verb}`, f.project ? { project: f.project } : {});
   io.out(f.json ? JSON.stringify(r, null, 2) : r.message);
   return 0;
@@ -904,25 +969,29 @@ async function cleanupCmd(api: Api, io: CliIO, f: Flags): Promise<number> {
   if (f.apply && f['dry-run']) throw new UsageError('--apply and --dry-run: choose one');
   const r = await api<any>('DELETE', `/api/runs/${encodeURIComponent(f.run)}`, { dryRun: !f.apply });
   if (f.json) { io.out(JSON.stringify(r, null, 2)); return 0; }
-  const counts: Record<string, number> = r.dryRun ? r.remove : r.removed ?? r.remove;
+  // The API's CleanupPlan, with removed and entriesRemoved once applied.
+  const counts: Record<string, number> = r.dryRun ? r.remove : r.removed;
   const rows = Object.entries(counts).filter(([, n]) => n > 0);
+  const n: number = r.dryRun ? r.entries : r.entriesRemoved;
+  if (!rows.length && !r.kept.length && !r.changed.length && !n) {
+    io.out(`run ${r.run}${r.sandbox ? ' (sandbox)' : ''}: nothing to remove`);
+    return 0;
+  }
   io.out(`run ${r.run}${r.sandbox ? ' (sandbox)' : ''}: ${r.dryRun ? 'dry run, nothing removed yet' : 'removed'}`);
   io.out(rows.length ? table(['KIND', r.dryRun ? 'WOULD REMOVE' : 'REMOVED'], rows) : r.dryRun ? 'nothing to remove' : 'nothing removed');
-  if (r.kept?.length) {
+  if (r.kept.length) {
     io.out(`\nkept (${r.kept.length}): someone outside the run touched them, or they are a real session's now`);
     io.out(table(['KIND', 'ID', 'WHY'], r.kept.map((k: any) => [k.kind, k.id, k.why]), 100));
   }
-  if (r.changed?.length) {
+  if (r.changed.length) {
     io.out(`\nchanged by the run but not its own (never undone: put them back by hand if you need to)`);
     io.out(table(['KIND', 'TARGETS', 'SUBJECT'], r.changed.map((c: any) => [c.kind, c.targets.join(','), c.subject]), 80));
   }
   // Its Activity entries go with --apply; the run_cleaned entry (not the run's) records the cleanup and what it changed.
-  const n = r.dryRun ? r.entries ?? 0 : r.entriesRemoved ?? 0;
-  const entries = `${r.dryRun && r.entriesCapped ? 'at least ' : ''}${n} Activity ${n === 1 ? 'entry' : 'entries'}`;
-  // A cleanup removes only the entries its plan read and listed: a bigger run takes more than one.
+  const entries = `${n} Activity ${n === 1 ? 'entry' : 'entries'}`;
   io.out(r.dryRun
-    ? `\nits ${entries} ${n === 1 ? 'goes' : 'go'} too with --apply (a run_cleaned entry, not the run's, records the cleanup and what the run changed)${r.entriesCapped ? `; the ${n} newest go with --apply, the older ones stay until you run it again` : `; fg cleanup --run ${r.run} --apply removes all of it`}`
-    : `\nremoved its ${entries}; the run_cleaned entry in Activity records the cleanup and what the run changed${r.entriesCapped ? `; older entries may remain: run fg cleanup --run ${r.run} --apply again` : ''}`);
+    ? `\nits ${entries} ${n === 1 ? 'goes' : 'go'} too with --apply (a run_cleaned entry, not the run's, records the cleanup and what the run changed); fg cleanup --run ${r.run} --apply removes all of it`
+    : `\nremoved its ${entries}; the run_cleaned entry in Activity records the cleanup and what the run changed`);
   return 0;
 }
 
@@ -951,7 +1020,11 @@ async function sessionsCmd(api: Api, io: CliIO, words: string[], f: Flags): Prom
     if (!id || !/^[\w.:-]{1,200}$/.test(id)) throw new UsageError('fg sessions register [session-id]: pass the actual id or launch inside a Codex shell with CODEX_THREAD_ID');
     if (!(f.run ?? io.env.FG_RUN)) throw new UsageError('session registration requires --run or FG_RUN');
     await api('POST', `/api/sessions/${encodeURIComponent(id)}/run`, {});
-    io.out(f.json ? JSON.stringify({ id, registered: true }) : `registered session ${id} for this run`);
+    // Registration opens the run for this credential: only it (with the same FG_RUN_KEY) may write in or clean it up.
+    const by = api.credential === 'FG_OPERATOR_TOKEN' && io.env.API_TOKEN?.trim()
+      ? 'FG_OPERATOR_TOKEN (it takes precedence over API_TOKEN; FG_OPERATOR_TOKEN= ./scripts/fg ... uses API_TOKEN)'
+      : api.credential ?? 'no token';
+    io.out(f.json ? JSON.stringify({ id, registered: true, credential: api.credential }) : `registered session ${id} for run ${f.run ?? io.env.FG_RUN} with ${by}`);
     return 0;
   }
   if (words.length) throw new UsageError('fg sessions [register [session-id]]');
@@ -985,7 +1058,7 @@ async function integrationsCmd(api: Api, io: CliIO, words: string[], f: Flags): 
     }
     // A token on the command line ends up in shell history and the process list: only standard input.
     if (!f['from-stdin']) throw new UsageError(`fg integrations set ${kind} --from-stdin  (pipe the token in, e.g. from a file you then delete)`);
-    const token = (await (io.readStdin ?? allOfStdin)()).trim();
+    const token = (await io.readStdin?.())?.trim();
     if (!token) throw new UsageError('no token on standard input');
     const r = await api<{ ok: boolean; view?: Record<string, any> }>('PUT', `/api/settings/integrations/${kind}`, { token });
     const c = r.view?.[kind]?.connection;
@@ -999,20 +1072,243 @@ async function integrationsCmd(api: Api, io: CliIO, words: string[], f: Flags): 
   return 0;
 }
 
-const VERBS = new Set(['status', 'pipeline', 'projects', 'scan', 'inbox', 'lessons', 'demo', 'map', 'links', 'facts', 'docs', 'activity', 'sessions', 'evidence', 'cleanup', 'cloud', 'integrations', 'doctor', 'setup']);
+// ── The learning loop ──────────────────────────────────────────────────
 
-/** fg help <verb>: that verb's usage lines (with their continuation lines) and the options; the whole text otherwise. */
+const LOOP_MODE_NAMES = ['off', 'observe', 'propose', 'auto'];
+const REASONS = ['wrong_evidence', 'too_broad', 'wording', 'not_now', 'other'];
+const p2 = (n: number) => n.toFixed(2);
+const rateOf = (r: { rolledBack: number; of: number }) => (r.of ? `${r.rolledBack} of ${r.of}` : 'none yet');
+const words = (s: string) => s.replace(/_/g, ' ');
+
+/** --since: 24h, 7d, 90m before now, or an ISO time as it is. */
+function sinceTime(raw: string, now = Date.now()): string {
+  const m = /^(\d+)([mhd])$/.exec(raw.trim());
+  if (m) return new Date(now - Number(m[1]) * { m: 60_000, h: 3_600_000, d: 86_400_000 }[m[2] as 'm' | 'h' | 'd']).toISOString();
+  if (Number.isNaN(Date.parse(raw))) throw new UsageError(`--since needs a span like 24h, 7d or 90m, or an ISO time (got ${raw})`);
+  return new Date(raw).toISOString();
+}
+
+function loopLines(s: Record<string, any>): string[] {
+  const why = s.capped === 'disabled' ? ' (LOOP_DISABLED=1)' : s.capped === 'paused' ? ` (paused by ${s.paused.by} at ${at(s.paused.at)})` : s.capped === 'tokenless' ? ' (no owner token: observe at most)' : '';
+  const r = s.round;
+  return [
+    `mode: ${s.mode}, runs as ${s.effectiveMode}${why}; policy v${s.policyVersion}`,
+    `waiting for you: ${plural(s.counts.proposed, 'proposal')}; this week ${s.counts.week.observed} observed, ${s.counts.week.proposed} proposed, ${s.counts.week.applied} applied, ${s.counts.week.rolledBack} rolled back; rollbacks (30 days): ${rateOf(s.rollbackRate)}`,
+    `budget today: ${s.budget.llmCallsToday} of ${s.budget.llmCallsPerDay} model calls, ${s.budget.autoToday} of ${s.budget.autoPerDay} agent-facing changes applied on their own (${s.budget.autoPerProject} per project)`,
+    r ? `round ${r.id}: ${r.phase}${r.finishedAt ? ` at ${at(r.finishedAt)}` : ` since ${at(r.startedAt)}`}, ${r.targetsScored}${r.targetsTotal === null ? '' : ` of ${r.targetsTotal}`} scored, ${r.decisions.observed} observed, ${r.decisions.proposed} proposed, ${r.decisions.applied} applied, ${r.decisions.skipped} skipped${r.error ? ` (${r.error})` : ''}` : 'no round yet',
+    '',
+    table(['TYPE', 'TIER', 'MODE', 'RUNS AS', 'TAU', 'P', 'LOWER', 'REVIEWS', 'ROLLBACKS', 'BREAKER'], s.types.map((t: Record<string, any>) => [
+      t.type, t.tier, t.mode ?? 'global', t.effectiveMode, p2(t.tau), p2(t.calibration.p), p2(t.calibration.lower), t.calibration.n, rateOf(t.rollbackRate),
+      t.breaker.tripped ? `tripped${t.breaker.reason ? `: ${t.breaker.reason}` : ''}` : '',
+    ]), 60),
+  ];
+}
+
+async function loopCmd(api: Api, io: CliIO, args: string[], f: Flags): Promise<number> {
+  const [verb, mode] = args;
+  let s: Record<string, any>;
+  if (verb === 'status' || verb === undefined) s = await api('GET', '/api/loop');
+  else if (verb === 'pause' || verb === 'resume') s = await api('POST', `/api/loop/${verb}`, {});
+  else if (verb === 'mode') {
+    if (mode !== undefined && !LOOP_MODE_NAMES.includes(mode)) throw new UsageError(`fg loop mode takes ${LOOP_MODE_NAMES.join(', ')} (got ${mode})`);
+    const types: Record<string, { mode: string | null }> = {};
+    for (const pair of (f.type ?? '').split(',').map((x) => x.trim()).filter(Boolean)) {
+      const [t, m] = pair.split('=');
+      if (!t || !m || ![...LOOP_MODE_NAMES, 'global'].includes(m)) throw new UsageError(`--type takes type=mode pairs (mode: ${LOOP_MODE_NAMES.join(', ')} or global), got ${pair}`);
+      types[t] = { mode: m === 'global' ? null : m };
+    }
+    if (mode === undefined && !Object.keys(types).length) throw new UsageError('fg loop mode <off|observe|propose|auto> [--type t=m]');
+    s = await api('PUT', '/api/loop/settings', { ...(mode && { mode }), ...(Object.keys(types).length && { types }) });
+  } else throw new UsageError('usage: fg loop status | pause | resume | mode <m> [--type t=m]');
+  io.out(f.json ? JSON.stringify(s, null, 2) : loopLines(s).join('\n'));
+  return 0;
+}
+
+const decisionTarget = (d: Record<string, any>) => (d.targets.find((t: { role: string }) => t.role === 'primary') ?? d.targets[0])?.id ?? '';
+const decisionRows = (list: Record<string, any>[]) => table(['ID', 'TYPE', 'STATUS', 'MODE', 'PROJECT', 'TARGET', 'P', 'CREATED', 'RATIONALE'], list.map((d) => [
+  d.id, d.type, d.status, d.mode, d.projectKey ?? 'global', decisionTarget(d), p2(d.confidence.p), at(d.createdAt), d.rationale,
+]), 60, [0]);
+const reasonOf = (f: Flags) => {
+  if (f.reason !== undefined && !REASONS.includes(f.reason)) throw new UsageError(`--reason takes ${REASONS.join(', ')}`);
+  return f.reason;
+};
+const summaryRows = (xs: { id: string; type: string; status: string; label: string }[]) => table(['ID', 'TYPE', 'STATUS', 'WHAT'], xs.map((x) => [x.id, x.type, x.status, x.label]), 80, [0]);
+
+/** The decision an id names: the id itself, or the one decision whose id starts with it (with or without `dec:`). */
+async function decisionId(api: Api, id: string): Promise<string> {
+  try {
+    await api('GET', `/api/decisions/${encodeURIComponent(id)}`);
+    return id;
+  } catch (e) {
+    if ((e as ApiError).status !== 404) throw e;
+  }
+  // A few of each spelling's matches are enough to tell one from several: one indexed query each, however many decisions.
+  const prefixes = id.startsWith('dec:') ? [id] : [id, `dec:${id}`];
+  const found = [...new Set((await Promise.all(prefixes.map((p) => api<{ id: string }[]>('GET', `/api/decisions${qs({ idPrefix: p, limit: '4' })}`)))).flat().map((d) => d.id))];
+  if (found.length === 1) return found[0];
+  throw new ApiError(found.length ? `${id} starts ${found.length} decision ids (${found.slice(0, 3).join(', ')}${found.length > 3 ? ', …' : ''}): give more of it` : `no decision ${id}, and no decision id starts with it`, 404);
+}
+
+async function decisionsCmd(api: Api, io: CliIO, args: string[], f: Flags): Promise<number> {
+  const [verb, given, ...rest] = args;
+  // show, note and the verdicts take an id or a unique prefix of one; the full id is what they print.
+  const id = given && ['show', 'note', 'approve', 'reject', 'keep', 'rollback'].includes(verb) && !(verb === 'rollback' && f.since) ? await decisionId(api, given) : given;
+  const one = (usage: string) => {
+    if (!id) throw new UsageError(usage);
+    return encodeURIComponent(id);
+  };
+  if (verb === 'list' || verb === undefined) {
+    const list = await api<Record<string, any>[]>('GET', `/api/decisions${qs({ status: f.status, type: f.type, project: f.project, since: f.since && sinceTime(f.since), q: f.q, limit: f.limit })}`);
+    io.out(f.json ? JSON.stringify(list, null, 2) : list.length ? decisionRows(list) : 'no decisions');
+    return 0;
+  }
+  if (verb === 'show') {
+    const r = await api<Record<string, any>>('GET', `/api/decisions/${one('fg decisions show <id>')}`);
+    if (f.json) { io.out(JSON.stringify(r, null, 2)); return 0; }
+    const d = r.decision;
+    io.out(`${d.id}: ${words(d.type)} (tier ${d.tier}, ${d.mode}) is ${words(d.status)}${d.decidedBy ? `, decided by ${d.decidedBy}` : ''}`);
+    io.out(`project ${d.projectKey ?? 'global'}; targets ${d.targets.map((t: { id: string; role: string }) => `${t.id} (${t.role})`).join(', ') || 'none'}`);
+    io.out(`confidence p ${p2(d.confidence.p)} (lower ${p2(d.confidence.lower)}), from ${plural(d.confidence.n, 'of your review')}; model ${d.model ?? 'none'}, policy v${d.policyVersion}`);
+    io.out(`rationale: ${d.rationale}`);
+    if (d.rollback) io.out(`rolled back by ${d.rollback.by} at ${at(d.rollback.at)}${d.rollback.reason ? ` (${words(d.rollback.reason)})` : ''}${d.rollback.note ? `: ${d.rollback.note}` : ''}`);
+    const fields = (snaps: { id: string; fields: Record<string, unknown> }[], tid: string) => snaps.find((x) => x.id === tid)?.fields ?? {};
+    const diff = d.targets.flatMap((t: { id: string }) => {
+      const [b, a, n] = [fields(d.before, t.id), fields(d.after, t.id), fields(r.current, t.id)];
+      return [...new Set([...Object.keys(b), ...Object.keys(a)])].filter((k) => JSON.stringify(b[k]) !== JSON.stringify(a[k]) || JSON.stringify(a[k]) !== JSON.stringify(n[k]))
+        .map((k) => [t.id, k, JSON.stringify(b[k] ?? null), JSON.stringify(a[k] ?? null), JSON.stringify(n[k] ?? null)]);
+    });
+    if (diff.length) io.out(`\n${table(['TARGET', 'FIELD', 'BEFORE', 'AFTER', 'NOW'], diff, 50)}`);
+    if (r.evidence.length) io.out(`\n${table(['EVIDENCE', 'ID', 'ROLE', 'WEIGHT', 'WHAT'], r.evidence.map((e: Record<string, any>) => [e.kind, e.id, e.role, e.weight, `${e.label}${e.missing ? ' (gone)' : ''}`]), 70)}`);
+    if (r.dependsOn.length) io.out(`\ndepends on:\n${summaryRows(r.dependsOn)}`);
+    if (r.dependents.length) io.out(`\ndepended on by:\n${summaryRows(r.dependents)}`);
+    if (r.notes.length) io.out(`\n${table(['NOTE BY', 'AT', 'VERDICT', 'TEXT'], r.notes.map((n: Record<string, any>) => [n.by, at(n.ts), [n.verdict, n.reason && words(n.reason)].filter(Boolean).join(': '), n.text]), 90)}`);
+    return 0;
+  }
+  if (verb === 'note') {
+    const text = rest.join(' ').trim();
+    if (!id || !text) throw new UsageError('fg decisions note <id> "text" [--verdict agree|disagree] [--reason r]');
+    if (f.verdict !== undefined && !['agree', 'disagree'].includes(f.verdict)) throw new UsageError('--verdict takes agree or disagree');
+    const reason = reasonOf(f);
+    const n = await api<Record<string, any>>('POST', `/api/decisions/${encodeURIComponent(id)}/notes`, { text, ...(f.verdict && { verdict: f.verdict }), ...(reason && { reason }) });
+    io.out(f.json ? JSON.stringify(n, null, 2) : `noted on ${id}${n.verdict ? ` (${n.verdict})` : ''}`);
+    return 0;
+  }
+  if (verb === 'approve' || verb === 'reject' || verb === 'keep' || verb === 'rollback') {
+    const reason = reasonOf(f);
+    if (verb === 'rollback' && f.since) return bulkRollback(api, io, f, reason);
+    const path = `/api/decisions/${one(`fg decisions ${verb} <id>${verb === 'rollback' ? ' (or --since 24h)' : ''}`)}`;
+    // What the decision is now: the API refuses (409) a decision that moved since.
+    const { decision: d } = await api<{ decision: { status: string } }>('GET', path);
+    const body = { expect: d.status, ...(f.note && { note: f.note }), ...(reason && { reason }) };
+    if (verb !== 'rollback') {
+      const r = await api<Record<string, any>>('POST', `${path}/${verb}`, body);
+      io.out(f.json ? JSON.stringify(r, null, 2) : `${id}: ${words(r.status)}${verb === 'keep' ? ' (kept)' : ''}`);
+      return 0;
+    }
+    if (!f.apply) {
+      const p = await api<{ cascade: any[]; blocked: { id: string; reason: string }[] }>('POST', `${path}/rollback`, { ...body, cascade: 'preview', ...(f['restore-anyway'] && { restoreAnyway: true }) });
+      if (f.json) { io.out(JSON.stringify(p, null, 2)); return 0; }
+      io.out(`${id}: a preview, nothing rolled back yet${p.cascade.length ? `; it also rolls back (newest first):\n${summaryRows(p.cascade)}` : '; nothing else depends on it'}`);
+      if (p.blocked.length) {
+        io.out(`\nblocked:\n${table(['ID', 'WHY'], p.blocked.map((b) => [b.id, b.reason]), 100)}`);
+        return 1;
+      }
+      io.out(`\nfg decisions rollback ${id} --apply rolls it back`);
+      return 0;
+    }
+    const r = await api<Record<string, any>>('POST', `${path}/rollback`, { ...body, cascade: 'apply', ...(f['restore-anyway'] && { restoreAnyway: true }) });
+    const undone = r.rollback?.cascade ?? [];
+    io.out(f.json ? JSON.stringify(r, null, 2) : `${id}: ${words(r.status)}${undone.length ? ` with ${undone.join(', ')}` : ''}`);
+    return 0;
+  }
+  throw new UsageError('usage: fg decisions list | show <id> | approve|reject|keep|rollback <id> | rollback --since 24h | note <id> "text"');
+}
+
+/** fg decisions rollback --since 24h: every decision applied since then (by when it was applied), newest applied first; a preview unless --apply. */
+async function bulkRollback(api: Api, io: CliIO, f: Flags, reason: string | undefined): Promise<number> {
+  const since = sinceTime(f.since!);
+  const list: Record<string, any>[] = [];
+  for (let offset = 0; ; offset += 500) {
+    const page = await api<Record<string, any>[]>('GET', `/api/decisions${qs({ status: 'applied', type: f.type, appliedSince: since, limit: '500', offset: offset ? String(offset) : undefined })}`);
+    list.push(...page);
+    if (page.length < 500) break;
+  }
+  if (!list.length) {
+    io.out(f.json ? JSON.stringify({ since, apply: !!f.apply, results: [] }) : `no decision applied since ${at(since)}`);
+    return 0;
+  }
+  if (!f.apply) {
+    io.out(f.json ? JSON.stringify({ since, apply: false, decisions: list }, null, 2)
+      : `${plural(list.length, 'decision')} applied since ${at(since)} (a preview, nothing rolled back yet; each also rolls back what depends on it):\n${decisionRows(list)}\n\nfg decisions rollback --since ${f.since}${f.type ? ` --type ${f.type}` : ''} --apply rolls them back, newest first`);
+    return 0;
+  }
+  const results: { id: string; ok: boolean; status?: string; error?: string }[] = [];
+  for (const d of list) {
+    const path = `/api/decisions/${encodeURIComponent(d.id)}`;
+    try {
+      // An earlier rollback's cascade may have undone it already.
+      const { decision: now } = await api<{ decision: { status: string } }>('GET', path);
+      if (now.status !== 'applied') { results.push({ id: d.id, ok: true, status: now.status }); continue; }
+      const r = await api<{ status: string }>('POST', `${path}/rollback`, { expect: 'applied', cascade: 'apply', ...(reason && { reason }), ...(f.note && { note: f.note }) });
+      results.push({ id: d.id, ok: true, status: r.status });
+    } catch (e) {
+      results.push({ id: d.id, ok: false, error: (e as ApiError).message });
+    }
+  }
+  io.out(f.json ? JSON.stringify({ since, apply: true, results }, null, 2) : table(['ID', 'RESULT'], results.map((r) => [r.id, r.ok ? words(r.status!) : `FAILED: ${r.error}`]), 120));
+  return results.every((r) => r.ok) ? 0 : 1;
+}
+
+const VERBS = new Set(['signin', 'status', 'pipeline', 'projects', 'scan', 'inbox', 'lessons', 'demo', 'map', 'links', 'facts', 'docs', 'activity', 'sessions', 'evidence', 'cleanup', 'loop', 'decisions', 'cloud', 'integrations', 'doctor', 'setup']);
+
+/**
+ * fg help <verb>: that verb's usage lines (with their continuation lines), the options only it takes (those described
+ * as "fg <verb>: ..." or "fg <verb> only"), and the names of the options every command takes; the whole text otherwise.
+ */
 export function helpFor(verb: string | undefined): string {
   if (!verb || !VERBS.has(verb)) return USAGE;
   const [head, rest] = USAGE.split('\nOptions:\n');
-  const out: string[] = [];
+  const usage: string[] = [];
   let inVerb = false;
   for (const line of head.split('\n')) {
     if (line.startsWith('  fg ')) inVerb = line.startsWith(`  fg ${verb} `) || line === `  fg ${verb}`;
     else if (!line.startsWith('    ')) inVerb = false;
-    if (inVerb) out.push(line);
+    if (inVerb) usage.push(line);
   }
-  return `Usage:\n${out.join('\n')}\n\nOptions:\n${rest.split('\n\nEnvironment:')[0]}`;
+  // Each option: its first line ("  --name ...") and the lines continuing it.
+  const options: string[][] = [];
+  for (const line of rest.split('\n\nEnvironment:')[0].split('\n')) {
+    if (line.startsWith('  --')) options.push([line]); else options.at(-1)?.push(line);
+  }
+  const scope = (o: string[]) => /^\s+--\S+(?: <[^>]+>)?\s+fg (\w+)(?::| only)/.exec(o[0])?.[1];
+  const own = options.filter((o) => scope(o) === verb).flat();
+  const general = options.filter((o) => !scope(o)).map((o) => /--\S+/.exec(o[0])![0]);
+  return `Usage:\n${usage.join('\n')}\n\n${own.length ? `Options:\n${own.join('\n')}\n\n` : ''}Every command also takes ${general.join(', ')} (fg help).`;
+}
+
+/**
+ * fg signin: asks this machine's API, with FG_OWNER_TOKEN, for a one-time sign-in link and prints it. The link is for
+ * the browser here, so it names localhost on the published port (API_PORT; inside the api container the API's own
+ * port is not the browser's). The token itself is sent only to localhost and never printed.
+ */
+async function signin(io: CliIO, flags: Flags): Promise<number> {
+  const token = io.env.FG_OWNER_TOKEN?.trim();
+  if (!token) throw new UsageError('fg signin needs FG_OWNER_TOKEN (./scripts/fg reads it from .env); a tokenless install has no owner sign-in: run ./scripts/setup.sh --yes --enable-auth');
+  const base = new URL((flags.url ?? io.env.FEEDBACK_GRAPH_URL ?? 'http://localhost:8787').replace(/\/+$/, ''));
+  if (!['localhost', '127.0.0.1', '[::1]'].includes(base.hostname)) throw new UsageError(`fg signin only asks this machine's API (localhost), not ${base.host}`);
+  let res: Response;
+  try {
+    res = await io.fetch(`${base.origin}/api/session/link`, { method: 'POST', headers: { accept: 'application/json', 'content-type': 'application/json', authorization: `Bearer ${token}` }, body: '{}' });
+  } catch (e) {
+    throw new ApiError(`cannot reach Feedback Graph at ${base.origin} (${(e as Error).message}). Is it running?`);
+  }
+  const body = await res.json().catch(() => ({})) as { path?: string; expiresInSeconds?: number; error?: string };
+  if (!res.ok || !body.path) throw new ApiError(body.error ?? `HTTP ${res.status}`, res.status);
+  const url = `http://localhost:${io.env.API_PORT?.trim() || base.port || '80'}${body.path}`;
+  if (flags.json) { io.out(JSON.stringify({ url, expiresInSeconds: body.expiresInSeconds })); return 0; }
+  io.out(`Open this in your browser within ${body.expiresInSeconds} s to sign in (it works once, only on this machine):`);
+  io.out(url);
+  return 0;
 }
 
 /** Runs one fg command. Exit codes: 0 done, 1 the API refused or something failed, 2 a usage mistake. */
@@ -1021,8 +1317,9 @@ export async function run(argv: string[], raw: CliIO): Promise<number> {
   let p: Parsed;
   // --json: a failure is JSON on stdout too, so whatever parses the output gets { error } and not prose.
   const asJson = argv.includes('--json');
+  /** A usage mistake (2) names the help to read; the API refusing or failing (1) carries its HTTP status, if any. */
   const failed = (message: string, code: 1 | 2, extra: { status?: number; help?: string } = {}) => {
-    const hint = code === 2 ? ` (see ${extra.help ?? 'fg help'})` : '';
+    const hint = extra.help ? ` (see ${extra.help})` : '';
     if (asJson) io.out(JSON.stringify({ error: `${message}${hint}`, ...(extra.status !== undefined && { status: extra.status }) }));
     else io.err(`fg: ${message}${hint}`);
     return code;
@@ -1045,6 +1342,7 @@ export async function run(argv: string[], raw: CliIO): Promise<number> {
   if (flags.help || !words.length) { io.out(words.length ? helpFor(words[0]) : USAGE); return 0; }
   try {
     if (flags.owner && words[0] !== 'cleanup') throw new UsageError('--owner is only supported for cleanup');
+    if (words[0] === 'signin') return await signin(io, flags);
     const api = client(io, flags, !UNLABELLED.has(words[0]));
     switch (words[0]) {
       case 'status': return await status(api, io, flags);
@@ -1063,6 +1361,8 @@ export async function run(argv: string[], raw: CliIO): Promise<number> {
       case 'inbox': return await inbox(api, io, words.slice(1), flags);
       case 'lessons': return await lessons(api, io, words.slice(1), flags);
       case 'cloud': return await cloud(api, io, words[1], flags);
+      case 'loop': return await loopCmd(api, io, words.slice(1), flags);
+      case 'decisions': return await decisionsCmd(api, io, words.slice(1), flags);
       case 'map': return await map(api, io, words.slice(1), flags);
       case 'demo': return await demo(api, io, words.slice(1), flags);
       default: throw new UsageError(`unknown command: ${words[0]}`);
@@ -1074,13 +1374,23 @@ export async function run(argv: string[], raw: CliIO): Promise<number> {
   }
 }
 
-if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
-  const code = await run(process.argv.slice(2), {
-    env: process.env,
+/** What fg needs from the process it runs as. */
+export type CliProcess = Pick<NodeJS.Process, 'env' | 'stdout' | 'stderr'> & { stdin: AsyncIterable<string | Uint8Array> };
+
+/** fg as a program: runs `argv` with the process's environment, streams and standard input; resolves to the exit code. */
+export function main(argv: string[], proc: CliProcess): Promise<number> {
+  return run(argv, {
+    env: proc.env,
     fetch: globalThis.fetch,
-    out: (l) => process.stdout.write(`${l}\n`),
-    err: (l) => process.stderr.write(`${l}\n`),
+    out: (l) => proc.stdout.write(`${l}\n`),
+    err: (l) => proc.stderr.write(`${l}\n`),
     sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
+    readStdin: async () => {
+      const parts: Buffer[] = [];
+      for await (const chunk of proc.stdin) parts.push(Buffer.from(chunk));
+      return Buffer.concat(parts).toString('utf8');
+    },
   });
-  process.exitCode = code;
 }
+
+if (fileURLToPath(import.meta.url) === process.argv[1]) process.exitCode = await main(process.argv.slice(2), process);

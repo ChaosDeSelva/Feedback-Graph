@@ -115,13 +115,15 @@ export async function fileFingerprint(repoPath: string): Promise<string> {
 }
 
 export type MapStageDeps = {
-  store: Pick<CodeGraphStore, 'codeMap' | 'codeMapMeta' | 'replaceCodeMap'> & Partial<Pick<CodeGraphStore, 'codeMapRebuildsRequested' | 'purgeOrphanCodeFiles' | 'recordCodeMapFailure'>>;
+  store: Pick<CodeGraphStore, 'codeMap' | 'codeMapMeta' | 'replaceCodeMap' | 'markCodeMapChecked'> & Partial<Pick<CodeGraphStore, 'codeMapRebuildsRequested' | 'purgeOrphanCodeFiles' | 'recordCodeMapFailure'>>;
   activity?: Pick<ActivityStore, 'record'>;
   /** The selected projects (scope) and their folders, as the worker sees them. */
   projects(): Promise<{ key: string; repoPath: string }[]>;
   /** The scanner's bounds. maxFiles null: the map's cap scales with the repo (SCAN_MAX_FILES unset). */
   maxFiles: number | null;
   maxBytes: number;
+  /** CODE_MAP_MAX_BYTES: the limit for a parsed source file, above the scan's maxBytes. */
+  sourceMaxBytes?: number;
   minIntervalMs?: number;
   /** MAP_STALL_MS: how long one project may hold the background pass before kick() gives up on that pass. */
   stallMs?: number;
@@ -292,7 +294,10 @@ export class MapStage {
         force = true;
         why ??= `the map was built by older map rules (${meta.version == null ? 'unversioned' : `v${meta.version}`}, now v${CODE_MAP_VERSION})`;
       }
-      if (!force && meta && fingerprint !== null && meta.fingerprint === fingerprint) return null;
+      if (!force && meta && fingerprint !== null && meta.fingerprint === fingerprint) {
+        await d.store.markCodeMapChecked(p.key);
+        return null;
+      }
       // A stored map with no fingerprint is one whose write was cut short (the store clears it first, sets it last):
       // what it holds may be half old, half new, so it is not reused for the incremental parse.
       const prev = meta?.fingerprint && !force ? await d.store.codeMap(p.key) : null;
@@ -300,9 +305,10 @@ export class MapStage {
       const priority = d.editedPaths ? await d.editedPaths(p.key).catch(() => []) : [];
       // Read first: a capped map keeps the files most imported and most changed.
       const commits = await (d.churn ?? gitChurn)(p.repoPath, CHURN_DAYS, gitArgs);
-      const map = await (d.build ?? buildCodeMap)(p.repoPath, { maxFiles: d.maxFiles, maxBytes: d.maxBytes, signal, priority, churn: commits }, prev ?? undefined);
-      // TESTS edges for mapped files, from the whole import index (a test past the cap still covers them).
-      const tests = map.files.filter((f) => !f.isTest).flatMap((f) => testsFor(map, f.path).map((test) => ({ test, target: f.path })));
+      const map = await (d.build ?? buildCodeMap)(p.repoPath, { maxFiles: d.maxFiles, maxBytes: d.maxBytes, sourceMaxBytes: d.sourceMaxBytes, signal, priority, churn: commits }, prev ?? undefined);
+      // TESTS edges for every file of the import index, past the cap too (an agent asks about those as well), from the
+      // whole index (a test past the cap still covers a mapped file).
+      const tests = [...map.files, ...(map.outside ?? [])].filter((f) => !f.isTest).flatMap((f) => testsFor(map, f.path).map((test) => ({ test, target: f.path })));
       const exclusive = d.exclusive ?? (<T>(fn: () => Promise<T>) => fn());
       const stats = await exclusive(async () => {
         // Shutting down before the write began: the old map stays as it was, and the next start maps it again.
@@ -336,8 +342,9 @@ export class MapStage {
         const error = String(err);
         await d.store.recordCodeMapFailure?.(p.key, error).catch(() => {});
         await d.activity?.record({ kind: 'code_mapped', actor: 'deterministic', projectKey: p.key,
-          subject: 'code map rebuild failed; the previous map is stale',
-          why: 'the worker could not replace the code map; it retained the last good map and will retry',
+          // Worded like the Projects page's Code map card (ui codeMapState.ts).
+          subject: 'code map rebuild failed; the previous map stays in use until a rebuild succeeds',
+          why: 'the worker could not write the new map; it retries at its next pass, or now with Rebuild map',
           details: { failed: true, error: error.slice(0, 500) } }).catch(() => {});
         d.log?.('code map failed', { project: p.key, error });
       }

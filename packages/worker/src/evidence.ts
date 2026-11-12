@@ -18,8 +18,8 @@ export type EvidenceGateDeps = {
   cursors: Pick<DocsStore, 'getCursor' | 'setCursor'>;
   /** The instruction rule over the pending Inbox (detect/pendingInstructions.ts); its own cursor says when it reruns. */
   instructions: () => Promise<unknown>;
-  /** Mark every lesson for a re-check (KnowledgeStore.requestLessonRecheck); unset: the store cannot. */
-  requestLessonRecheck?: () => Promise<number>;
+  /** Mark every lesson for a re-check (KnowledgeStore.requestLessonRecheck). */
+  requestLessonRecheck: () => Promise<number>;
   /** The lesson re-check (postmortem/recheck.ts). */
   recheck: () => Promise<unknown>;
   /** The session re-match (postmortem/rematch.ts), after the re-check so its flags are kept. */
@@ -82,7 +82,7 @@ export class SessionEvidenceGate {
     if (first) await this.d.instructions().catch((err) => this.d.log('instruction rule after ingest failed', { error: String(err) }));
     if (!this.current) {
       try {
-        const requeued = (await this.d.requestLessonRecheck?.()) ?? 0;
+        const requeued = await this.d.requestLessonRecheck();
         await this.d.recheck();
         await this.d.cursors.setCursor(EVIDENCE_CURSOR, this.stamp);
         this.current = true;

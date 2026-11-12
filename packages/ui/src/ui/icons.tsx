@@ -72,6 +72,9 @@ export const ExpandIcon = (p: P) => (
 export const MenuIcon = (p: P) => (
   <Icon {...p}><path d="M2.5 4.5h11M2.5 8h11M2.5 11.5h11" /></Icon>
 );
+export const InfoIcon = (p: P) => (
+  <Icon {...p}><circle cx="8" cy="8" r="6" /><path d="M8 7.2v3.8M8 5h.01" /></Icon>
+);
 export const CloseIcon = (p: P) => (
   <Icon {...p}><path d="m4 4 8 8M12 4l-8 8" /></Icon>
 );
@@ -90,6 +93,14 @@ export const DownloadIcon = (p: P) => (
 /** A pushpin; `filled` when pinned. */
 export const PinIcon = ({ filled = false, ...p }: P & { filled?: boolean }) => (
   <Icon {...p}><path d="M6 2.5h4l-.5 4 2 2v1H4.5v-1l2-2Z" fill={filled ? 'currentColor' : 'none'} /><path d="M8 9.5V14" /></Icon>
+);
+/** A fork with one branch checked: a decision. */
+export const DecisionIcon = (p: P) => (
+  <Icon {...p}><path d="M8 14V9M8 9 4 5M8 9l4-4" /><path d="m2.5 3.5 1.5 1.5L6 3" /><circle cx="12" cy="4" r="1.5" /></Icon>
+);
+/** Two arrows chasing each other: the learning loop. */
+export const LoopIcon = (p: P) => (
+  <Icon {...p}><path d="M13 6.5A5 5 0 0 0 3.6 5" /><path d="M3 2.5V5h2.5" /><path d="M3 9.5A5 5 0 0 0 12.4 11" /><path d="M13 13.5V11h-2.5" /></Icon>
 );
 export const ChevronIcon = (p: P) => (
   <Icon {...p}><path d="m6 4 4 4-4 4" /></Icon>

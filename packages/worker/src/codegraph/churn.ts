@@ -32,7 +32,6 @@ export async function churn(repoPath: string, sinceDays: number, gitArgs: readon
   let sha = '';
   let ts = '';
   const touch = (path: string) => {
-    if (!sha) return;
     let seen = shas.get(path);
     if (!seen) shas.set(path, (seen = new Set()));
     if (seen.has(sha)) return;
@@ -42,29 +41,24 @@ export async function churn(repoPath: string, sinceDays: number, gitArgs: readon
     else out.set(path, { commits: 1, lastTs: ts });
   };
 
-  // -z: "<header>\n<added>\t<deleted>\t<path>\0" per file; a rename has an empty path then "\0<old>\0<new>\0".
+  // -z: "<header>\0\n<added>\t<deleted>\t<path>\0" per file; a rename has an empty path then "\0<old>\0<new>\0".
   const tokens = stdout.split('\0');
   for (let i = 0; i < tokens.length; i++) {
-    let t = tokens[i];
-    const h = t.indexOf(HEADER);
-    if (h >= 0) {
-      const line = t.slice(h + 1);
-      const nl = line.indexOf('\n');
-      const [s, iso] = (nl < 0 ? line : line.slice(0, nl)).split('\t');
-      const d = new Date(iso);
+    const t = tokens[i];
+    // -z ends each header with \0 too, so a header is a token of its own.
+    if (t.startsWith(HEADER)) {
+      const [s, iso] = t.slice(1).split('\t');
       sha = s;
-      ts = Number.isFinite(d.getTime()) ? d.toISOString() : iso;
-      t = nl < 0 ? '' : line.slice(nl + 1);
+      ts = new Date(iso).toISOString();
+      continue;
     }
-    t = t.replace(/^\n+/, '');
-    const m = /^(\d+|-)\t(\d+|-)\t([\s\S]*)$/.exec(t);
+    const m = /^\n*(\d+|-)\t(\d+|-)\t([\s\S]*)$/.exec(t);
     if (!m) continue;
     if (m[3]) {
       touch(current(m[3]));
     } else {
       const oldPath = tokens[++i];
       const newPath = tokens[++i];
-      if (oldPath === undefined || newPath === undefined) break;
       const now = current(newPath);
       currentName.set(oldPath, now);
       touch(now);

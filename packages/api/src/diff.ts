@@ -11,45 +11,100 @@ import { GIT_SAFE, isSecretPath, redactSecrets, tokenFingerprint } from '@fb/cor
  */
 
 export type DiffHunk = { header: string; lines: string[] };
-export type FileDiff = { path: string; text: string; hunks: DiffHunk[] };
+/**
+ * oldPath: the file's path before the change (path itself unless renamed, copied or deleted). secret: either path is a
+ * secret file (isSecretPath), so a rename to or from .env, or the delete of one, is as secret as an edit of it, or its
+ * git header could not be read (unread), so its paths are not known and it is never shown.
+ */
+export type FileDiff = { path: string; oldPath: string; secret: boolean; text: string; hunks: DiffHunk[]; unread?: boolean };
 /** Where a verdict's evidence is in the diff: the file, its hunk header, and the diff line as it is there. */
 export type DiffCite = { path: string; hunk: string; line: string };
 
-const GIT_HEADER = /^diff --git a\/(.+?) b\/(.+)$/;
+/** Either side of a git header may be C-quoted ("a/donn\303\251es/.env"): git quotes a path with non-ASCII, ", \ or control characters. */
+const GIT_HEADER = /^diff --git (?:"((?:[^"\\]|\\.)*)"|a\/(.+?)) (?:"((?:[^"\\]|\\.)*)"|b\/(.+))$/;
+const C_ESCAPES: Record<string, number> = { a: 7, b: 8, t: 9, n: 10, v: 11, f: 12, r: 13, '"': 34, '\\': 92 };
+
+/** A path as git wrote it, C-quoted or not, decoded: "a/donn\303\251es/.env" is a/données/.env. */
+function unquote(p: string): string {
+  if (!/^".*"$/.test(p)) return p;
+  const bytes: number[] = [];
+  for (const m of p.slice(1, -1).matchAll(/\\([0-7]{3}|.)|([^\\]+)/gs)) {
+    if (m[2] !== undefined) bytes.push(...Buffer.from(m[2], 'utf8'));
+    else if (/^[0-7]{3}$/.test(m[1])) bytes.push(parseInt(m[1], 8));
+    else bytes.push(C_ESCAPES[m[1]] ?? m[1].charCodeAt(0));
+  }
+  return Buffer.from(bytes).toString('utf8');
+}
 
 /** A unified diff (git diff, git log -p) as files and their hunks. Text before the first file is ignored. */
 export function splitDiff(text: string): FileDiff[] {
   const out: FileDiff[] = [];
   let cur: FileDiff | null = null;
   let hunk: DiffHunk | null = null;
+  // Lines the open hunk's @@ header still promises on its old and new side; null when it gives none (diff --cc).
+  let left: [number, number] | null = null;
   const lines = text.split('\n');
   // The last line's newline ends it; it starts no empty line.
   if (text.endsWith('\n')) lines.pop();
   for (const [i, l] of lines.entries()) {
-    const git = GIT_HEADER.exec(l);
-    // A bare diff (no git header) starts a file at its --- line, named by the +++ line after it.
-    const bare = !git && l.startsWith('--- ') && lines[i + 1]?.startsWith('+++ ') && (!cur || hunk);
-    if (git || bare) {
-      cur = { path: git ? git[2] : pathOf(lines[i + 1]), text: '', hunks: [] };
+    // A git header always starts a file, even one this cannot read, so a pure rename is not merged into the file
+    // before it; one it cannot read is taken for a secret file (its paths are not known).
+    const header = l.startsWith('diff --git ');
+    const git = header ? GIT_HEADER.exec(l) : null;
+    // A bare diff (no git header) starts a file at its --- line, named by the +++ line after it: after the last line its
+    // hunk promised, as a removed "-- x" and an added "++ y" inside one read the same. A secret path starts one anyway,
+    // so a miscounted hunk can hide a file but never show one.
+    const bare = !header && l.startsWith('--- ') && lines[i + 1]?.startsWith('+++ ')
+      && (!cur || (hunk && (!left || (left[0] <= 0 && left[1] <= 0) || isSecretPath(pathOf(l)) || isSecretPath(pathOf(lines[i + 1])))));
+    if (header || bare) {
+      const from = git ? (git[2] ?? stripSide(unquote(`"${git[1]}"`))) : header ? l.slice(11) : pathOf(l);
+      const to = git ? (git[4] ?? stripSide(unquote(`"${git[3]}"`))) : header ? from : pathOf(lines[i + 1]);
+      cur = { path: to, oldPath: from, secret: false, text: '', hunks: [], ...(header && !git ? { unread: true } : {}) };
+      // A bare delete names /dev/null as its new side.
+      if (cur.path === '/dev/null') cur.path = from;
       hunk = null;
       out.push(cur);
     }
     if (!cur) continue;
     cur.text += `${l}\n`;
-    if (l.startsWith('+++ ') && !hunk) {
+    const moved = hunk ? null : /^(?:rename|copy) (from|to) (.+)$/.exec(l);
+    if (moved) cur[moved[1] === 'from' ? 'oldPath' : 'path'] = unquote(moved[2]);
+    else if (l.startsWith('--- ') && !hunk) {
+      const p = pathOf(l);
+      if (p !== '/dev/null') cur.oldPath = p;
+    } else if (l.startsWith('+++ ') && !hunk) {
       const p = pathOf(l);
       if (p !== '/dev/null') cur.path = p;
     } else if (l.startsWith('@@')) {
       hunk = { header: l, lines: [] };
       cur.hunks.push(hunk);
-    } else if (hunk && /^[ +\\-]/.test(l)) hunk.lines.push(l);
+      const range = /^@@ -\d+(?:,(\d+))? \+\d+(?:,(\d+))? @@/.exec(l);
+      left = range ? [Number(range[1] ?? 1), Number(range[2] ?? 1)] : null;
+    } else if (hunk && /^[ +\\-]/.test(l)) {
+      hunk.lines.push(l);
+      if (left && l[0] !== '\\') {
+        if (l[0] !== '+') left[0]--;
+        if (l[0] !== '-') left[1]--;
+      }
+    }
   }
   // The split adds a newline the input may not have ended with.
   if (out.length && !text.endsWith('\n')) out[out.length - 1].text = out[out.length - 1].text.slice(0, -1);
+  for (const f of out) f.secret = !!f.unread || isSecretPath(f.path) || isSecretPath(f.oldPath);
   return out;
 }
 
-const pathOf = (l: string) => l.slice(4).trim().replace(/^[ab]\//, '');
+const stripSide = (p: string) => p.replace(/^[ab]\//, '');
+/**
+ * The path on a ---/+++ line, C-quoted or not, without its a/ or b/, and without what follows its last tab: diff -u puts
+ * the file's date there (git a lone tab after a name with a space), while a tab in the name itself comes before it.
+ */
+const pathOf = (l: string) => {
+  const rest = l.slice(4);
+  const quoted = /^"(?:[^"\\]|\\.)*"/.exec(rest);
+  const tab = rest.lastIndexOf('\t');
+  return stripSide(quoted ? unquote(quoted[0]) : (tab < 0 ? rest : rest.slice(0, tab)).trim());
+};
 
 export type CappedDiff = {
   text: string;
@@ -57,8 +112,8 @@ export type CappedDiff = {
   shown: string[];
   /** Files not shown (a file shown only in part is listed with " (partly)"). */
   omitted: string[];
-  /** Secret files (isSecretPath) left out whatever the budget. */
-  secret: string[];
+  /** How many secret files (FileDiff.secret) were left out whatever the budget; their paths are never echoed. */
+  secret: number;
   /** What the judge was not shown, in one line; null when it was shown everything. */
   note: string | null;
 };
@@ -79,15 +134,15 @@ export function capDiff(raw: string, maxChars: number, prefer: DiffPreference = 
   if (!files.length) {
     const text = redactSecrets(raw);
     const cut = text.length > maxChars;
-    return { text: text.slice(0, maxChars), shown: [], omitted: [], secret: [], note: cut ? `diff cut at ${kb(maxChars)} KB` : null };
+    return { text: text.slice(0, maxChars), shown: [], omitted: [], secret: 0, note: cut ? `diff cut at ${kb(maxChars)} KB` : null };
   }
-  const secret = files.filter((f) => isSecretPath(f.path)).map((f) => f.path);
+  const secret = files.filter((f) => f.secret).length;
   let text = '';
   const shown: string[] = [];
   const omitted: string[] = [];
   const changed = new Map((prefer.changed ?? []).map((p, i) => [p, i]));
   const rank = (f: FileDiff) => (prefer.related?.(f.path) ? -1 : changed.get(f.path) ?? changed.size);
-  const open = files.filter((x) => !isSecretPath(x.path));
+  const open = files.filter((x) => !x.secret);
   // Reordered only when something has to go (a stable sort: within a rank, the diff's own order); whole, it stays as is.
   const whole = open.reduce((n, f) => n + redactSecrets(f.text).length, 0) <= maxChars;
   const ordered = whole ? open : open.map((f) => ({ f, r: rank(f) })).sort((x, y) => x.r - y.r).map((x) => x.f);
@@ -111,7 +166,7 @@ export function capDiff(raw: string, maxChars: number, prefer: DiffPreference = 
   }
   // How much of it was shown, so a cut never reads as the whole change ("30.5 of 47.0 KB shown").
   const total = open.reduce((n, f) => n + redactSecrets(f.text).length, 0);
-  const notes = [omitted.length ? `diff cut to fit (${kb(text.length)} of ${kb(total)} KB shown), files not shown: ${omitted.join(', ')}` : '', secret.length ? `secret files left out: ${secret.join(', ')}` : ''].filter(Boolean);
+  const notes = [omitted.length ? `diff cut to fit (${kb(text.length)} of ${kb(total)} KB shown), files not shown: ${omitted.join(', ')}` : '', secret ? `${secret} secret ${secret === 1 ? 'file' : 'files'} left out (never shown or named)` : ''].filter(Boolean);
   return { text, shown, omitted, secret, note: notes.length ? notes.join('; ') : null };
 }
 
@@ -277,7 +332,7 @@ async function noIndexDiff(p: string, before: string, now: string, scratch: stri
     await writeFile(join(scratch, side, p), body);
   }
   // Exit code 1 means "they differ": the diff is on stdout either way.
-  return git(['diff', '--no-index', ...FLAGS, '--no-prefix', '--', `a/${p}`, `b/${p}`], scratch).catch((e: { code?: number; stdout?: string }) => (e.code === 1 ? (e.stdout ?? '') : ''));
+  return git(['diff', '--no-index', ...FLAGS, '--no-prefix', '--', `a/${p}`, `b/${p}`], scratch).catch((e: { code?: number; stdout: string }) => (e.code === 1 ? e.stdout : ''));
 }
 
 /** A repo-relative path that stays in the repo and is not a secret. */
@@ -306,7 +361,7 @@ export function taskPrNumbers(task: string): number[] {
     return ordinal > 0 && ordinal <= count && count <= 20 ? '' : all;
   };
   const text = task
-    .replace(/(?:\bStack:\s*)?\bPR\s*#?(\d+)\s*(?:\/|of)\s*(\d+)/gi, counter)
+    .replace(/(?:\bStack:\s*)?\b(?:PR|pull request)\s*#?(\d+)\s*(?:\/|of)\s*(\d+)/gi, counter)
     .replace(/[([]\s*(?:PR|pull request)?\s*#?(\d+)\s*(?:\/|of)\s*(\d+)\s*[)\]]/gi, counter)
     .replace(/#(\d+)\s*(?:\/|of)\s*(\d+)/gi, counter);
   const pairs = [...text.matchAll(/\b(?:PR|pull request)\s*#?(\d+)\s*\/\s*#?(\d+)\b/gi)]
@@ -361,11 +416,9 @@ export function githubCommitPrLookup(fetchImpl: typeof fetch = fetch, now: () =>
     })().catch(() => [] as number[]);
     // Empty/failed lookups can change when the PR is first opened; retry after a short grace period.
     cache.set(key, { until: now() + 30_000, value });
-    try {
-      const result = await value;
-      if (result.length) cache.set(key, { until: now() + 300_000, value: Promise.resolve(result) });
-      if (cache.size > 1000) cache.delete(cache.keys().next().value!);
-      return result;
-    } catch { return []; }
+    const result = await value;
+    if (result.length) cache.set(key, { until: now() + 300_000, value: Promise.resolve(result) });
+    if (cache.size > 1000) cache.delete(cache.keys().next().value!);
+    return result;
   };
 }

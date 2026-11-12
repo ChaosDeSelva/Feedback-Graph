@@ -1,5 +1,6 @@
 import { expect, test } from 'vitest';
 import { ConfigError, loadConfig, OPERATOR_VERBS, redactUrl } from './config.ts';
+import { MISS_CLOSE } from './relevance.ts';
 
 const base = { NEO4J_PASSWORD: 'pw', PROJECT_ROOTS: '/vibe,/examples', HOST_PROJECT_ROOTS: '/Users/a/Vibe,/Users/a/fb/examples' };
 
@@ -39,6 +40,13 @@ test('check_before_done takes CHECK_CONCURRENCY judge calls at once (default 2) 
   expect(loadConfig({ ...base, CHECK_CONCURRENCY: '4', CHECK_WAIT_SECONDS: '30' }).check).toEqual({ concurrency: 4, waitSeconds: 30 });
   expect(() => loadConfig({ ...base, CHECK_CONCURRENCY: '0' })).toThrow(/CHECK_CONCURRENCY/);
   expect(() => loadConfig({ ...base, CHECK_WAIT_SECONDS: '1' })).toThrow(/CHECK_WAIT_SECONDS must be a number of at least 5/);
+});
+
+test('MISS_MIN_SIMILARITY sets how close a past miss with no file in common must be to be served or judged (default MISS_CLOSE)', () => {
+  expect(loadConfig(base).missMinSimilarity).toBe(MISS_CLOSE);
+  expect(loadConfig({ ...base, MISS_MIN_SIMILARITY: '0.9' }).missMinSimilarity).toBe(0.9);
+  expect(loadConfig({ ...base, MISS_MIN_SIMILARITY: '0' }).missMinSimilarity).toBe(0);
+  for (const bad of ['1.2', '-0.1', 'close']) expect(() => loadConfig({ ...base, MISS_MIN_SIMILARITY: bad })).toThrow(/MISS_MIN_SIMILARITY must be a number from 0 to 1/);
 });
 
 test('CODEX_SESSIONS_DIR points the worker at another Codex sessions folder', () => {
@@ -265,7 +273,10 @@ test('an operator token lets agents make owner decisions; unset, there is none, 
   expect(op.token).toBe('o'.repeat(32));
   // By default not deciding lessons (what agents learn stays the owner's call), nor anything that deletes data, changes
   // what is mounted, imports lessons from a file, or touches integration keys.
-  const off = ['lesson_decide', 'delete_project', 'docs_delete', 'settings', 'import', 'integrations', 'chat', 'chat_delete', 'select_projects', 'links_delete'];
+  const off = ['lesson_decide', 'delete_project', 'docs_delete', 'settings', 'import', 'integrations', 'chat', 'chat_delete', 'select_projects', 'links_delete', 'loop_decide', 'loop_settings'];
+  // The learning loop's decisions and its mode are the owner's: an agent must not vote the loop into autonomy.
+  expect(op.allow).not.toContain('loop_decide');
+  expect(op.allow).not.toContain('loop_settings');
   // Which folders are read is the owner's opt-in; removing a link the owner decided is the owner's too.
   expect(op.allow).not.toContain('select_projects');
   expect(op.allow).not.toContain('links_delete');
@@ -342,4 +353,57 @@ test('STORE=postgres with the bundled service and an empty POSTGRES_PASSWORD is 
 test('CLOUD_LOCAL_ONLY_PROJECTS keeps chosen projects local without deselecting them', () => {
   const c = loadConfig({ ...base, CLOUD_URL: 'https://cloud.example.com', CLOUD_TOKEN: TOKEN, CLOUD_LOCAL_ONLY_PROJECTS: ' sandbox, private ' });
   expect(c.cloud?.localOnlyProjects).toEqual(['sandbox', 'private']);
+});
+
+test('a provider that needs a model is refused without one; HOST_HOME loses its trailing slashes', () => {
+  expect(() => loadConfig({ ...base, SCAN_LLM: 'openrouter:' })).toThrow(/SCAN_LLM: openrouter needs a model, e\.g\. openrouter:<model>/);
+  expect(() => loadConfig({ ...base, SCAN_LLM: 'groq' })).toThrow(/SCAN_LLM: groq needs a model/);
+  expect(loadConfig({ ...base, HOST_HOME: '/Users/a//' }).hostHome).toBe('/Users/a');
+  expect(loadConfig({ ...base, HOST_HOME: '  ' }).hostHome).toBeNull();
+});
+
+test('LOOP_* settings: defaults, values, and every bad value named', () => {
+  expect(loadConfig(base).loop).toEqual({ mode: null, disabled: false, llm: null, llmCallsPerDay: 40, autoPerDay: 5, autoPerProject: 2, syncHoldDays: 7, holdout: 0.2, types: null });
+  expect(loadConfig({
+    ...base, LOOP_MODE: 'Observe', LOOP_DISABLED: '1', LOOP_LLM: 'ollama:qwen3', LOOP_LLM_CALLS_PER_DAY: '0', LOOP_AUTO_PER_DAY: '3',
+    LOOP_AUTO_PER_PROJECT: '1', LOOP_SYNC_HOLD_DAYS: '0', LOOP_HOLDOUT: '0', LOOP_TYPES: 'link_misses, retire_lesson,link_misses',
+  }).loop).toEqual({ mode: 'observe', disabled: true, llm: 'ollama:qwen3', llmCallsPerDay: 0, autoPerDay: 3, autoPerProject: 1, syncHoldDays: 0, holdout: 0, types: ['link_misses', 'retire_lesson'] });
+  expect(loadConfig({ ...base, LOOP_DISABLED: 'true' }).loop.disabled).toBe(true);
+  expect(loadConfig({ ...base, LOOP_DISABLED: 'false' }).loop.disabled).toBe(false);
+  const problems = (() => {
+    try {
+      loadConfig({ ...base, LOOP_MODE: 'yolo', LOOP_DISABLED: 'maybe', LOOP_HOLDOUT: '0.6', LOOP_TYPES: 'link_misses,teleport', LOOP_LLM: 'nope', LOOP_AUTO_PER_DAY: '-1' });
+    } catch (e) {
+      return (e as ConfigError).problems;
+    }
+    return [];
+  })();
+  expect(problems).toEqual(expect.arrayContaining([
+    expect.stringMatching(/^LOOP_MODE must be one of off, observe, propose, auto/),
+    expect.stringMatching(/^LOOP_DISABLED must be 1 or 0/),
+    expect.stringMatching(/^LOOP_HOLDOUT must be a share from 0 to 0.5/),
+    'LOOP_TYPES names unknown decision types: teleport (known: link_misses, merge_duplicates, rank_weight, retire_lesson, reject_lesson, approve_lesson, reword_lesson, narrow_scope, record_fact, triage_inbox, tune_threshold)',
+    expect.stringMatching(/^LOOP_LLM: unknown provider/),
+    expect.stringMatching(/^LOOP_AUTO_PER_DAY must be a whole number of at least 0/),
+  ]));
+  expect(() => loadConfig({ ...base, LOOP_HOLDOUT: 'lots' })).toThrow(/LOOP_HOLDOUT/);
+  // Counts are whole numbers and the holdout a plain decimal: Number() alone takes 2.5, 1e1 and 0x0.
+  for (const k of ['LOOP_LLM_CALLS_PER_DAY', 'LOOP_AUTO_PER_DAY', 'LOOP_AUTO_PER_PROJECT', 'LOOP_SYNC_HOLD_DAYS']) {
+    for (const v of ['2.5', '0.5', '1e1', '0x10']) expect(() => loadConfig({ ...base, [k]: v })).toThrow(new RegExp(`${k} must be a whole number of at least 0 \\(got "${v.replace('.', '\\.')}"\\)`));
+  }
+  for (const v of ['0x0', '1e-1', '-0', '0.1.2']) expect(() => loadConfig({ ...base, LOOP_HOLDOUT: v })).toThrow(/LOOP_HOLDOUT must be a share from 0 to 0.5/);
+  expect(loadConfig({ ...base, LOOP_HOLDOUT: '.25' }).loop.holdout).toBe(0.25);
+  expect(loadConfig({ ...base, LOOP_HOLDOUT: '0.5' }).loop.holdout).toBe(0.5);
+  expect(() => loadConfig({ ...base, LOOP_LLM: 'codex-cli' })).toThrow(/LOOP_LLM: codex-cli inside the worker/);
+});
+
+test('authConfigured: the API has a token, or a worker run on its own is told so (FG_AUTH_CONFIGURED: 1, true or yes); else the loop only observes', () => {
+  expect(loadConfig(base).authConfigured).toBe(false);
+  expect(loadConfig({ ...base, API_TOKEN: 'a'.repeat(24) }).authConfigured).toBe(true);
+  expect(loadConfig({ ...base, FG_OWNER_TOKEN: 'o'.repeat(24) }).authConfigured).toBe(true);
+  expect(loadConfig({ ...base, API_TOKEN: '   ', FG_OWNER_TOKEN: '\t' }).authConfigured).toBe(false);
+  for (const yes of ['1', 'true', ' YES ']) expect(loadConfig({ ...base, FG_AUTH_CONFIGURED: yes }).authConfigured, yes).toBe(true);
+  for (const no of ['0', 'false', 'no', 'off', '11', ' ', '']) expect(loadConfig({ ...base, FG_AUTH_CONFIGURED: no }).authConfigured, no).toBe(false);
+  expect(loadConfig({ ...base, AUTH_STATE_FILE: ' /state/api-settings/auth-state.json ' }).authStateFile).toBe('/state/api-settings/auth-state.json');
+  expect(loadConfig(base).authStateFile).toBeNull();
 });

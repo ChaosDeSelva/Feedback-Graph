@@ -1,8 +1,8 @@
-import type { WorkerStatus } from '@fb/core';
+import { reportedRunnerReadiness, type WorkerStatus } from '@fb/core';
 import { expect, test } from 'vitest';
 import { createApp, type ApiRepo } from './app.ts';
 
-const repo = { listCandidates: async () => [], candidateDetail: async () => null, decide: async () => {}, stats: async () => [] } as ApiRepo;
+const repo = { undoDecision: async () => false, listCandidates: async () => [], candidateDetail: async () => null, decide: async () => {}, stats: async () => [] } as ApiRepo;
 const beat = (ago: number): WorkerStatus => ({
   version: '0.2.0', startedAt: 't', lastBeat: new Date(Date.now() - ago).toISOString(), lastCycleAt: null, lastCycle: null, lastError: null, providers: { classify: 'ollama:gemma4' },
 });
@@ -178,4 +178,53 @@ test('runner readiness overrides stale healthy reports for Codex docs, Ask and s
   const status = await (await app.request('/api/status')).json();
   for (const job of ['docs', 'chat', 'scan']) expect(status.models[job]).toMatchObject({ ok: false, reason: 'private proc cannot mount' });
   expect(status.models.classify.ok).toBe(true);
+});
+
+test('a Codex runner its safety flag turned off is reported as off on purpose: its jobs disabled, Codex not connected rather than in error', async () => {
+  const worker: WorkerStatus = { ...beat(10), providers: { classify: 'ollama:local', scan: 'codex-cli' } };
+  const flagged = createApp(repo, { system: { version: 'test', ping: async () => true, worker: async () => worker,
+    runner: async () => reportedRunnerReadiness(JSON.stringify({ ok: false, disabled: true, reason: 'sandbox: nested sandbox startup failed', at: Date.now() })) } });
+  const status = await (await flagged.request('/api/status')).json();
+  expect(status.models.scan).toEqual({ provider: 'codex-cli', ok: false, reason: 'sandbox: nested sandbox startup failed', disabled: true });
+  expect(status.connections.codex).toMatchObject({ state: 'not_connected', detail: expect.stringMatching(/^Codex runner off: scans paused \(sandbox: nested sandbox startup failed\)\. Its safety flag turned it off on this machine\. Choose another scan model/) });
+  // A runner that is meant to run and does not answer is still an error.
+  const broken = createApp(repo, { system: { version: 'test', ping: async () => true, worker: async () => worker, runner: async () => ({ ok: false, reason: 'fetch failed' }) } });
+  const down = await (await broken.request('/api/status')).json();
+  expect(down.models.scan.disabled).toBeUndefined();
+  expect(down.connections.codex.state).toBe('error');
+});
+
+test('a code-map write in progress is reported as rebuilding, not interrupted; one its worker did not survive is interrupted', async () => {
+  const startedAt = new Date(Date.now() - 600_000).toISOString();
+  const writingAt = new Date(Date.now() - 60_000).toISOString();
+  const meta = { fingerprint: null, builtAt: new Date(Date.now() - 86_400_000).toISOString(), stats: { files: 1, symbols: 0, imports: 0, tests: 0 }, candidates: null, lastFailureAt: null, lastFailure: null, writingAt, writingBeat: new Date(Date.now() - 5_000).toISOString() };
+  const status = async (worker: WorkerStatus | null, m: object = meta) => (await (await createApp(repo, {
+    system: { version: '0.2.0', ping: async () => true, worker: async () => worker },
+    facts: { listProjects: async () => [{ key: 'demo' }] } as never,
+    codegraph: { codeMapMeta: async () => m } as never,
+  }).request('/api/status')).json());
+  const running = await status({ ...beat(5_000), startedAt });
+  expect(running.codeMaps).toEqual([expect.objectContaining({ projectKey: 'demo', rebuilding: true })]);
+  expect(running.codeMaps[0].interrupted).toBeUndefined();
+  // The worker restarted after the write began (or is gone): the write was cut short.
+  expect((await status({ ...beat(5_000), startedAt: new Date().toISOString() })).codeMaps[0]).toMatchObject({ interrupted: true });
+  expect((await status(beat(4 * 60_000))).codeMaps[0]).toMatchObject({ interrupted: true });
+  // Its lease was not renewed in time: the worker writing it was killed, whatever its last heartbeat says.
+  expect((await status({ ...beat(5_000), startedAt }, { ...meta, writingBeat: new Date(Date.now() - 40_000).toISOString() })).codeMaps[0]).toMatchObject({ interrupted: true });
+  // A failure recorded after the write began: not running any more.
+  expect((await status({ ...beat(5_000), startedAt }, { ...meta, lastFailureAt: new Date().toISOString(), lastFailure: 'x' })).codeMaps[0].rebuilding).toBeUndefined();
+});
+
+test('status says when a map needing attention was last found current, apart from its build date', async () => {
+  const builtAt = '2026-10-01T00:00:00.000Z', checkedAt = '2026-10-20T00:00:00.000Z';
+  const meta = { fingerprint: 'abc', builtAt, checkedAt, stats: { files: 1, symbols: 0, imports: 0, tests: 0 }, candidates: null, lastFailureAt: '2026-10-21T00:00:00.000Z', lastFailure: 'x' };
+  const app = createApp(repo, { system: { version: '0.2.0', ping: async () => true, worker: async () => null }, facts: { listProjects: async () => [{ key: 'demo' }] } as never, codegraph: { codeMapMeta: async () => meta } as never });
+  expect((await (await app.request('/api/status')).json()).codeMaps).toEqual([expect.objectContaining({ projectKey: 'demo', builtAt, checkedAt })]);
+});
+
+test('a map whose first build never finished (a 0.7.5 failure record: no build time) has no build time or age, not NaN', async () => {
+  // As the Neo4j store reads that CodeMap node: no builtAt, so no checkedAt either.
+  const meta = { fingerprint: null, builtAt: undefined, checkedAt: undefined, stats: { files: 0, symbols: 0, imports: 0, tests: 0 }, candidates: null, lastFailureAt: '2026-10-21T00:00:00.000Z', lastFailure: 'x' };
+  const app = createApp(repo, { system: { version: '0.2.0', ping: async () => true, worker: async () => null }, facts: { listProjects: async () => [{ key: 'demo' }] } as never, codegraph: { codeMapMeta: async () => meta } as never });
+  expect((await (await app.request('/api/status')).json()).codeMaps).toEqual([expect.objectContaining({ projectKey: 'demo', builtAt: null, ageDays: null, checkedAt: null, lastFailureAt: '2026-10-21T00:00:00.000Z' })]);
 });

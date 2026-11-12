@@ -2,6 +2,7 @@
  * What both stores' RunsStore share: turning the records a run wrote into RunItems, and deciding which of them a
  * cleanup removes. The stores only find the rows and delete the ids this hands back.
  */
+import { cmp } from './codegraph.ts';
 import { NotTheRunsError, RUN_ITEM_KINDS, type RunItem, type RunItemKind, type RunTag } from './types.ts';
 
 /** A record a store found with the run's id. merged: on a report, RunItem.merged; ignored on the others. */
@@ -18,9 +19,9 @@ export function runItems(rows: RunRow[]): RunItem[] {
   return rows
     .map((r) => {
       const group = groupOf(r.kind, r.id);
-      return { kind: r.kind, id: r.id, projectKey: r.projectKey ?? null, sandbox: !!r.sandbox, group, merged: r.kind === 'feedback' ? !!r.merged : !!group && merged.has(group) };
+      return { kind: r.kind, id: r.id, projectKey: r.projectKey, sandbox: r.sandbox, group, merged: r.kind === 'feedback' ? r.merged : !!group && merged.has(group) };
     })
-    .sort((a, b) => order(a.kind) - order(b.kind) || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+    .sort((a, b) => order(a.kind) - order(b.kind) || cmp(a.id, b.id));
 }
 
 /**

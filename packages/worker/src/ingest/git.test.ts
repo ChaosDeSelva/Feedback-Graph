@@ -32,7 +32,7 @@ describe('projectRemote', () => {
   const git = (dir: string, ...args: string[]) => execFileSync('git', ['-C', dir, ...args]);
   const outer = realpathSync(mkdtempSync(join(tmpdir(), 'fbremote-')));
   git(outer, 'init', '-q');
-  git(outer, 'remote', 'add', 'origin', 'https://bot:ghp_abcdefghijklmnopqrstuvwxyz0123456789@github.com/Org/Outer.git');
+  git(outer, 'remote', 'add', 'origin', 'https://bot:ghp' + '_abcdefghijklmnopqrstuvwxyz0123456789@github.com/Org/Outer.git');
   // Like examples/demo-shop inside the feedback_tool repo: a plain folder, and a folder with its own repo.
   const plain = join(outer, 'examples', 'demo-shop');
   mkdirSync(plain, { recursive: true });

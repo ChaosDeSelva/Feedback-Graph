@@ -2,7 +2,7 @@ import { execFile } from 'node:child_process';
 import { readdir, readFile } from 'node:fs/promises';
 import { basename, dirname, join, resolve } from 'node:path';
 import { promisify } from 'node:util';
-import { isSecretPath, linkPair, MAX_EVIDENCE, NESTED_KEY_SEP, SECRET_GLOBS, SKIP_DIRS, type DetectedLink, type LinkEvidence, type LinkSignal } from '@fb/core';
+import { isSecretPath, linkPair, nfcPaths, MAX_EVIDENCE, NESTED_KEY_SEP, SECRET_GLOBS, SKIP_DIRS, type DetectedLink, type LinkEvidence, type LinkSignal } from '@fb/core';
 import { GIT_SAFE, gitSafeEnv } from '../ingest/git.ts';
 
 const run = promisify(execFile);
@@ -53,7 +53,7 @@ const LOCAL_SPEC = /^(file|link|portal):(.+)$/;
 
 /** Names a project publishes, what it depends on, and dependencies given as local paths (resolved to absolute). */
 export async function readManifests(repoPath: string): Promise<Manifests> {
-  const listed = (await trackedFiles(repoPath)) ?? (await walkManifests(repoPath));
+  const listed = await nfcPaths(repoPath, (await trackedFiles(repoPath)) ?? (await walkManifests(repoPath)));
   const paths = listed
     .filter((p) => MANIFESTS.has(basename(p)) && !p.split('/').some((s) => SKIP_DIRS.has(s)) && !isSecretPath(p))
     .slice(0, MAX_MANIFESTS);
@@ -84,7 +84,7 @@ export async function readManifests(repoPath: string): Promise<Manifests> {
     } else if (file === 'go.mod') {
       const mod = /^module\s+(\S+)/m.exec(text);
       if (mod) out.names.push(mod[1]);
-      for (const block of text.matchAll(/^require\s*\(([\s\S]*?)^\)/gm)) for (const line of block[1].split('\n')) dep(line.trim().split(/\s+/)[0] ?? '');
+      for (const block of text.matchAll(/^require\s*\(([\s\S]*?)^\)/gm)) for (const line of block[1].split('\n')) dep(line.trim().split(/\s+/)[0]);
       for (const m of text.matchAll(/^require\s+([^\s(]+)/gm)) dep(m[1]);
       for (const m of text.matchAll(/=>\s*(\.{1,2}\/\S*)/g)) local(m[0], m[1]);
     } else {
@@ -140,8 +140,9 @@ export async function grepMentions(repoPath: string, needles: string[]): Promise
   try {
     ({ stdout } = await run('git', [...GIT_SAFE, '-C', repoPath, 'grep', '--no-textconv', '-z', '-o', '-I', '-i', '-E', '-e', wanted.map(mentionNeedle).join('|'), '--', '.', ...EXCLUDES], { maxBuffer: 64 * 1024 * 1024, timeout: 60_000, env: gitSafeEnv() }));
   } catch (err) {
-    // Exit 1 is "no match"; a huge repo may still have printed what it found before a limit.
-    stdout = (err as { stdout?: string }).stdout ?? '';
+    // Exit 1 is "no match"; a huge repo may still have printed what it found before a limit. A promisified execFile
+    // error always carries the output.
+    stdout = (err as { stdout: string }).stdout;
   }
   for (const line of stdout.split('\n')) {
     const at = line.indexOf('\0');
@@ -156,7 +157,7 @@ export async function grepMentions(repoPath: string, needles: string[]): Promise
 }
 
 /** The name other projects would use for this one: its folder's last segment. */
-const shortName = (key: string) => key.split(NESTED_KEY_SEP).pop() ?? key;
+const shortName = (key: string) => key.split(NESTED_KEY_SEP).at(-1)!;
 const nameWorthSearching = (n: string) => n.length >= NAME_MIN_LENGTH && !GENERIC.has(n.toLowerCase());
 /** owner/name of a hosted remote; null for a local bare repo or a one-segment path. */
 const slugOf = (remote: string | null) => {
@@ -194,7 +195,6 @@ export async function detectLinks(projects: LinkProject[]): Promise<DetectedLink
   const repo = repoGroups(projects);
   const evidence = new Map<string, { a: string; b: string; items: LinkEvidence[] }>();
   const add = (x: string, y: string, e: LinkEvidence) => {
-    if (x === y) return;
     const [a, b] = linkPair(x, y);
     const k = `${a}\n${b}`;
     const cur = evidence.get(k) ?? { a, b, items: [] };

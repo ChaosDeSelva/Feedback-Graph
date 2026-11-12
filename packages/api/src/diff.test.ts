@@ -67,6 +67,17 @@ describe('splitDiff', () => {
     expect(files).toHaveLength(1);
     expect(files[0].path).toBe('x.ts');
   });
+
+  test('a removed "-- x" and an added "++ y" inside a hunk stay in it; a bare header after the hunk\'s last line starts a file', () => {
+    const env = '--- a/.env\n+++ b/.env\n@@ -1,3 +1,3 @@\n A=1\n--- x\n+++ y\n+K=Wq9Lm2Rx7Tp4Zc\n';
+    expect(splitDiff(env).map((f) => [f.path, f.secret])).toEqual([['.env', true]]);
+    expect(capDiff(env, 50_000).text).not.toContain('Wq9Lm2Rx7Tp4Zc');
+    const two = '--- a/x.ts\n+++ b/x.ts\n@@ -1,2 +1 @@\n a\n-b\n--- a/y.ts\n+++ b/y.ts\n@@ -1 +1 @@\n-c\n+d\n';
+    expect(splitDiff(two).map((f) => f.path)).toEqual(['x.ts', 'y.ts']);
+    // A miscounted hunk can hide the next file, never show one: a secret path starts a file wherever it is.
+    const short = '--- a/x.ts\n+++ b/x.ts\n@@ -1,5 +1,5 @@\n a\n--- a/.env\n+++ b/.env\n@@ -1 +1 @@\n-K=1\n+K=Wq9Lm2Rx7Tp4Zc\n';
+    expect(splitDiff(short).map((f) => [f.path, f.secret])).toEqual([['x.ts', false], ['.env', true]]);
+  });
 });
 
 describe('capDiff', () => {
@@ -91,11 +102,15 @@ describe('capDiff', () => {
     expect(c.note).toMatch(/files not shown: src\/routes\/orders\.ts \(partly\)/);
   });
 
-  test('a secret file is never shown, and the note says it was left out', () => {
+  test('a secret file is never shown, and the note counts it without naming it', () => {
     const c = capDiff(ENV + TEST, 50_000);
     expect(c.text).toBe(TEST);
     expect(c.text).not.toContain('API_TOKEN');
-    expect(c.note).toBe('secret files left out: .env');
+    expect(c.note).toBe('1 secret file left out (never shown or named)');
+    const fly = ENV.replaceAll('.env', '.fly/config.yml');
+    const both = capDiff(ENV + fly + TEST, 50_000);
+    expect(both.note).toBe('2 secret files left out (never shown or named)');
+    expect(both.note).not.toMatch(/\.env|\.fly/);
   });
 
   test('over the budget, the files related to what is judged go first, then files_changed in its order, then the rest; the note names what was cut', () => {
@@ -110,6 +125,63 @@ describe('capDiff', () => {
     // Without a preference, diff order as before; with everything fitting, nothing moves.
     expect(capDiff(a + b + c + e, budget).shown).toEqual(['src/a.ts', 'src/b.ts']);
     expect(capDiff(a + b + c, 50_000, { related: (p) => p === 'src/db/pool.ts' }).text).toBe(a + b + c);
+  });
+
+  test('a file renamed, copied or deleted to or from a secret path is left out like an edit of one', () => {
+    const body = '@@ -1 +1 @@\n-API_TOKEN=Zx81Kq0LmN7rT2vW\n+API_TOKEN=Gq7Lm2Xv9Rt4Kp1Z\n';
+    const cases = [
+      `diff --git a/config/prod.env b/config/prod.txt\nsimilarity index 90%\nrename from config/prod.env\nrename to config/prod.txt\n--- a/config/prod.env\n+++ b/config/prod.txt\n${body}`,
+      `diff --git a/notes.txt b/.env\nsimilarity index 90%\nrename from notes.txt\nrename to .env\n--- a/notes.txt\n+++ b/.env\n${body}`,
+      'diff --git a/.env b/env.bak\nsimilarity index 100%\nrename from .env\nrename to env.bak\n',
+      `diff --git a/deploy/secrets.sh b/deploy/vars.sh\ncopy from deploy/secrets.sh\ncopy to deploy/vars.sh\n--- a/deploy/secrets.sh\n+++ b/deploy/vars.sh\n${body}`,
+      `--- a/config/prod.env\n+++ /dev/null\n${body}`,
+      `diff --git a/config/prod.env b/config/prod.env\n--- a/config/prod.env\n+++ b/config/prod.env\n${body}`,
+    ];
+    for (const d of cases) {
+      expect(splitDiff(d).map((f) => f.secret)).toEqual([true]);
+      const c = capDiff(d + TEST, 50_000);
+      expect(c.text).toBe(TEST);
+      expect(c.note).toBe('1 secret file left out (never shown or named)');
+    }
+    expect(splitDiff('--- a/old.ts\n+++ /dev/null\n@@ -1 +0,0 @@\n-a\n')[0]).toMatchObject({ path: 'old.ts', oldPath: 'old.ts', secret: false });
+  });
+
+  test('a secret file under a path git C-quotes (non-ASCII, a quote, a backslash, a tab) is recognised by its decoded path', () => {
+    // `git diff --cached -M` in a repository with these files, with the default core.quotePath.
+    const quoted = [
+      'diff --git "a/back\\\\slash/.env" "b/back\\\\slash/.env"', 'index 162c541..51589e6 100644', '--- "a/back\\\\slash/.env"', '+++ "b/back\\\\slash/.env"',
+      '@@ -1 +1 @@', '-TOKEN=x1', '+TOKEN=Zq8Wm2Rx7Lp4',
+      'diff --git "a/cfg\\"x/.env" "b/cfg\\"x/.env"', 'deleted file mode 100644', 'index d0251ad..0000000', '--- "a/cfg\\"x/.env"', '+++ /dev/null',
+      '@@ -1 +0,0 @@', '-DB_PASS=Hunter2pass!',
+      'diff --git "a/donn\\303\\251es/.env" "b/donn\\303\\251es/notes.txt"', 'similarity index 100%', 'rename from "donn\\303\\251es/.env"',
+      'rename to "donn\\303\\251es/notes.txt"',
+      'diff --git "a/tab\\tdir/.env" "b/tab\\tdir/notes.md"', 'similarity index 75%', 'rename from "tab\\tdir/.env"', 'rename to "tab\\tdir/notes.md"',
+      'index 79e16ff..ab1f5df 100644', '--- "a/tab\\tdir/.env"', '+++ "b/tab\\tdir/notes.md"', '@@ -1,2 +1,2 @@', ' A=1', '-K=1', '+K=Wq9Lm2Rx7Tp4',
+      '',
+    ].join('\n');
+    const files = splitDiff(quoted);
+    expect(files.map((f) => [f.oldPath, f.path, f.secret])).toEqual([
+      ['back\\slash/.env', 'back\\slash/.env', true],
+      ['cfg"x/.env', 'cfg"x/.env', true],
+      ['données/.env', 'données/notes.txt', true],
+      ['tab\tdir/.env', 'tab\tdir/notes.md', true],
+    ]);
+    const c = capDiff(quoted + TEST, 50_000);
+    expect(c.text).toBe(TEST);
+    expect(c.note).toBe('4 secret files left out (never shown or named)');
+    expect(c.text).not.toContain('Hunter2pass');
+  });
+
+  test('a git header this cannot read starts a file of its own and is left out as secret', () => {
+    const files = splitDiff(`${TEST}diff --git odd header\nrename from x/.env\nrename to x/env.txt\n`);
+    expect(files.at(-1)).toMatchObject({ oldPath: 'x/.env', path: 'x/env.txt', secret: true });
+    expect(files[0].secret).toBe(false);
+    // Fail closed: a header it cannot read hides the file, whatever its lines name.
+    const odd = `diff --git "a/caf\\303\\251/.env b/notes.txt\n--- a/notes.txt\n+++ b/notes.txt\n@@ -0,0 +1 @@\n+DEPLOY_KEY=Zr4Wq8Ny2Xc6Vb0Mk3Jh\n`;
+    expect(splitDiff(odd)[0].secret).toBe(true);
+    const c = capDiff(odd + TEST, 50_000);
+    expect(c.text).toBe(TEST);
+    expect(c.note).toBe('1 secret file left out (never shown or named)');
   });
 
   test('secret values inside a shown file are redacted', () => {

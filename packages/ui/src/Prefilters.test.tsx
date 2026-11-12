@@ -51,3 +51,14 @@ test('a rule that also cleared items already pending in the Inbox says how many 
   expect(screen.queryAllByText(/of them from the Inbox/)).toHaveLength(1);
   expect(screen.getByText(/already pending in the Inbox/)).toBeTruthy();
 });
+
+test('before any comment is skipped it says so; a rule the worker has not counted shows no number', async () => {
+  answer = () => Response.json({
+    rules: FEEDBACK_SKIP_RULES.map((r) => ({ name: r.name, description: r.description, skipped: null, fromInbox: null })),
+    skippedSince: null,
+  });
+  render(<Prefilters />);
+  expect(await screen.findByText(/Nothing skipped yet\./)).toBeTruthy();
+  expect(screen.queryByText(/skipped$/)).toBeNull();
+  expect(screen.queryByText(/counted since/i)).toBeNull();
+});

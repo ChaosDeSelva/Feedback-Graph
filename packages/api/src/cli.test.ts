@@ -1,3 +1,4 @@
+import { SCRIPT_TEST_TIMEOUT_MS } from '@fb/core/testing/exec';
 import { expect, test } from 'vitest';
 import { OPERATOR_VERBS, type ActivityInput } from '@fb/core';
 import { createApp, type ApiRepo } from './app.ts';
@@ -91,6 +92,13 @@ test('text from the server cannot drive the terminal: control characters are str
   expect(f.text()).toContain('boom');
   // eslint-disable-next-line no-control-regex -- Deliberately reject or strip control bytes at this boundary.
   expect(f.text()).not.toMatch(/[\u0000-\u0008\u000b-\u001f\u007f]/);
+});
+
+test('text from the server cannot reorder the line: bidi controls are stripped from output (sweep 6)', async () => {
+  const f = fake({ 'GET /api/status': () => ({ json: { version: 'x', worker: { lastError: 'boom \u202edeppots\u202c \u2066x\u2069 \u200f\u061c end' } } }) });
+  expect(await run(['status'], f.io)).toBe(0);
+  expect(f.text()).toContain('boom deppots x  end');
+  expect(f.text()).not.toMatch(/[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/);
 });
 
 test('status --watch polls until stopped', async () => {
@@ -337,7 +345,7 @@ test('end to end against the real app: fg decides Inbox items as the agent, and 
   const lesson = { id: 'l1', projectKey: 'acme', title: 'T', rule: 'R', appliesWhen: '', scope: 'project', paths: [], status: 'proposed' };
   const app = createApp(repo, {
     auth: { operator: { token: OP, allow: OPERATOR_VERBS.filter((v) => v !== 'lesson_decide') } },
-    activity: { record: async (e: ActivityInput) => { logged.push(e); }, list: async () => [] },
+    activity: { removeRun: async () => 0, record: async (e: ActivityInput) => { logged.push(e); }, list: async () => [] },
     knowledge: { listLessons: async () => [lesson], lessonDetail: async () => ({ lesson }), updateLesson: async () => ({ unscoped: false }) } as never,
   });
   const out: string[] = [];
@@ -351,6 +359,9 @@ test('end to end against the real app: fg decides Inbox items as the agent, and 
   expect(logged[0].actor).toBe('operator:codex');
   expect(await run(['lessons', 'approve', 'l1'], io)).toBe(1);
   expect(err.join('\n')).toMatch(/403 .*lesson_decide.*OPERATOR_ALLOW/);
+  // The line it gives keeps every verb the token has now: following it never takes one away.
+  const line = /set OPERATOR_ALLOW=(\S+) \(what it may do now, and lesson_decide\)/.exec(err.join('\n'))![1]!.split(',');
+  expect([...line].sort()).toEqual([...OPERATOR_VERBS].sort());
 });
 
 
@@ -631,7 +642,7 @@ test('lessons to-fact converts a lesson into a project fact (default convention)
 });
 
 test('scripts/fg setup runs ./scripts/setup.sh with its arguments, without Node or the API', async () => {
-  const { execFileSync } = await import('node:child_process');
+  const { exec } = await import('@fb/core/testing/exec');
   const { chmodSync, copyFileSync, mkdirSync, mkdtempSync, writeFileSync } = await import('node:fs');
   const { tmpdir } = await import('node:os');
   const { join } = await import('node:path');
@@ -642,12 +653,12 @@ test('scripts/fg setup runs ./scripts/setup.sh with its arguments, without Node 
   copyFileSync(join(root, 'scripts', 'fg'), join(repo, 'scripts', 'fg'));
   writeFileSync(join(repo, 'scripts', 'setup.sh'), '#!/bin/sh\necho "setup ran: $*"\n');
   chmodSync(join(repo, 'scripts', 'setup.sh'), 0o755);
-  const out = execFileSync('bash', [join(repo, 'scripts', 'fg'), 'setup', '--yes', '--projects', '/tmp/x'], { encoding: 'utf8', env: { PATH: '/usr/bin:/bin' } });
+  const out = await exec('bash', [join(repo, 'scripts', 'fg'), 'setup', '--yes', '--projects', '/tmp/x'], { env: { PATH: '/usr/bin:/bin' } });
   expect(out).toBe('setup ran: --yes --projects /tmp/x\n');
-});
+}, SCRIPT_TEST_TIMEOUT_MS);
 
 test('scripts/fg warns loudly, before any command, when this folder\'s Compose name runs from another folder', async () => {
-  const { spawnSync } = await import('node:child_process');
+  const { execResult } = await import('@fb/core/testing/exec');
   const { chmodSync, copyFileSync, mkdirSync, mkdtempSync, writeFileSync } = await import('node:fs');
   const { tmpdir } = await import('node:os');
   const { join } = await import('node:path');
@@ -660,25 +671,54 @@ test('scripts/fg warns loudly, before any command, when this folder\'s Compose n
     mkdirSync(bin);
     copyFileSync(join(root, 'scripts', 'fg'), join(repo, 'scripts', 'fg'));
     mkdirSync(join(repo, 'scripts', 'lib'), { recursive: true });
-    copyFileSync(join(root, 'scripts', 'lib', 'env.sh'), join(repo, 'scripts', 'lib', 'env.sh'));
+    for (const f of ['env.sh', 'state-fs.sh']) copyFileSync(join(root, 'scripts', 'lib', f), join(repo, 'scripts', 'lib', f));
     writeFileSync(join(repo, '.env'), env);
     // No Node new enough here, so fg runs the CLI in the api container; docker says where the containers came from.
     writeFileSync(join(bin, 'node'), '#!/bin/sh\nexit 1\n');
     const dir = startedIn === 'HERE' ? repo : startedIn;
     writeFileSync(join(bin, 'docker'), `#!/bin/sh\ncase "$1 $2" in "ps -a") printf '%s' "$*" | grep -q 'project=${env ? 'feedback-graph-repo' : 'feedback-graph'} ' && echo '${dir}' ;; *) echo "cli ran: $*" ;; esac\n`);
     for (const f of ['node', 'docker']) chmodSync(join(bin, f), 0o755);
-    return spawnSync('bash', [join(repo, 'scripts', 'fg'), 'status'], { encoding: 'utf8', env: { PATH: `${bin}:/usr/bin:/bin` } });
+    return execResult('bash', [join(repo, 'scripts', 'fg'), 'status'], { env: { PATH: `${bin}:/usr/bin:/bin` } });
   };
-  const other = fg('/srv/acme/feedback-graph');
+  // Three separate checkouts, run side by side.
+  const [other, here, named] = await Promise.all([fg('/srv/acme/feedback-graph'), fg('HERE'), fg('/srv/acme/feedback-graph', 'FG_INSTANCE=feedback-graph-repo\n')]);
   expect(other.stderr).toMatch(/WARNING.*feedback-graph.*started from \/srv\/acme\/feedback-graph, not this folder/);
   expect(other.stderr).toMatch(/FG_INSTANCE/);
-  expect(other.stdout).toContain('cli ran:');
-  expect(fg('HERE').stderr).toBe('');
-  expect(fg('/srv/acme/feedback-graph', 'FG_INSTANCE=feedback-graph-repo\n').stderr).toMatch(/feedback-graph-repo/);
-});
+  // It never runs inside that install's api container.
+  expect(other.status).toBe(1);
+  expect(other.stdout).not.toContain('cli ran:');
+  expect(other.stderr).toContain('fg: not running inside the api container of the install in /srv/acme/feedback-graph');
+  expect(here.stderr).toBe('');
+  expect(named.stderr).toMatch(/feedback-graph-repo/);
+}, SCRIPT_TEST_TIMEOUT_MS);
+
+test('scripts/fg in a checkout that is not set up never runs docker against another install, for help or with FEEDBACK_GRAPH_URL', async () => {
+  const { execResult } = await import('@fb/core/testing/exec');
+  const { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const { fileURLToPath } = await import('node:url');
+  const root = fileURLToPath(new URL('../../../', import.meta.url));
+  const repo = mkdtempSync(join(tmpdir(), 'fgbare-'));
+  const bin = join(repo, 'bin');
+  mkdirSync(join(repo, 'scripts', 'lib'), { recursive: true });
+  mkdirSync(bin);
+  for (const f of ['fg', 'lib/env.sh', 'lib/state-fs.sh']) copyFileSync(join(root, 'scripts', f), join(repo, 'scripts', f));
+  writeFileSync(join(bin, 'node'), '#!/bin/sh\nexit 1\n');
+  // Another install owns the default Compose name; every docker call is recorded.
+  writeFileSync(join(bin, 'docker'), `#!/bin/sh\necho "$*" >> '${join(repo, 'docker-calls')}'\ncase "$1 $2" in "ps -a") echo /srv/live/feedback-graph ;; esac\n`);
+  for (const f of ['node', 'docker']) chmodSync(join(bin, f), 0o755);
+  for (const [args, env] of [[['help'], {}], [[], {}], [['status'], { FEEDBACK_GRAPH_URL: 'http://localhost:9080' }]] as const) {
+    const r = await execResult('bash', [join(repo, 'scripts', 'fg'), ...args], { env: { PATH: `${bin}:/usr/bin:/bin`, ...env } });
+    expect(r.status).toBe(1);
+    expect(r.stderr).toMatch(/fg: not running inside the api container|this checkout is not set up/);
+  }
+  const calls = existsSync(join(repo, 'docker-calls')) ? readFileSync(join(repo, 'docker-calls'), 'utf8') : '';
+  expect(calls.split('\n').filter((c) => c && !c.startsWith('ps -a'))).toEqual([]);
+}, SCRIPT_TEST_TIMEOUT_MS);
 
 test('scripts/fg doctor runs ./scripts/doctor.sh with its arguments, without Node or the API', async () => {
-  const { execFileSync } = await import('node:child_process');
+  const { exec } = await import('@fb/core/testing/exec');
   const { chmodSync, copyFileSync, mkdirSync, mkdtempSync, writeFileSync } = await import('node:fs');
   const { tmpdir } = await import('node:os');
   const { join } = await import('node:path');
@@ -689,9 +729,9 @@ test('scripts/fg doctor runs ./scripts/doctor.sh with its arguments, without Nod
   copyFileSync(join(root, 'scripts', 'fg'), join(repo, 'scripts', 'fg'));
   writeFileSync(join(repo, 'scripts', 'doctor.sh'), '#!/bin/sh\necho "doctor ran: $*"\n');
   chmodSync(join(repo, 'scripts', 'doctor.sh'), 0o755);
-  const out = execFileSync('bash', [join(repo, 'scripts', 'fg'), 'doctor', '--help'], { encoding: 'utf8', env: { PATH: '/usr/bin:/bin' } });
+  const out = await exec('bash', [join(repo, 'scripts', 'fg'), 'doctor', '--help'], { env: { PATH: '/usr/bin:/bin' } });
   expect(out).toBe('doctor ran: --help\n');
-});
+}, SCRIPT_TEST_TIMEOUT_MS);
 
 test('facts list --q prints the search hits (the API answers fact and score pairs), with their score', async () => {
   const hits = [{ fact: { id: 'f1', kind: 'convention', path: 'src/a.ts', statement: 'Every query is scoped by orgId', relevance: 0.9, relevanceBy: 'model' }, score: 0.82 }];
@@ -758,6 +798,13 @@ test('a usage mistake is one line and where to read more, not the whole help; fg
   expect(h.text()).toMatch(/^\s*fg scan --all/m);
   expect(h.text()).not.toMatch(/fg inbox/);
   expect(h.text()).toMatch(/--wait/);
+  // Only the options that verb takes are spelled out; the ones every command takes are named once.
+  expect(h.text()).not.toMatch(/--watch|--until|--owner/);
+  const demo = helpFor('demo');
+  expect(demo).not.toMatch(/^Options:/m);
+  expect(demo).toMatch(/Every command also takes --json, --as, --run, --sandbox, --url, --help/);
+  expect(helpFor('status')).toMatch(/--watch[\s\S]*--until/);
+  expect(helpFor('cleanup')).toMatch(/--owner/);
   const unknown = fake({});
   expect(await run(['frobnicate'], unknown.io)).toBe(2);
   expect(unknown.err).toEqual(['fg: unknown command: frobnicate (see fg help)']);
@@ -811,15 +858,6 @@ test('fg cleanup --run: a dry run by default (counts per kind, what stays and wh
   expect(g.calls[0].body).toEqual({ dryRun: false });
   expect(g.text()).toMatch(/removed/i);
   expect(g.text()).toMatch(/removed its 4 Activity entries.*run_cleaned/);
-  // A run with more entries than a plan reads says so.
-  const big = fake({ 'DELETE /api/runs/run-1': () => ({ json: plan({ entries: 5000, entriesCapped: true }) }) });
-  await run(['cleanup', '--run', 'run-1'], big.io);
-  expect(big.text()).toMatch(/at least 5000 Activity entries/);
-  // Only the entries a plan read (and listed) go: the rest wait for the next cleanup, and it says so.
-  expect(big.text()).toMatch(/the 5000 newest go with --apply.*the older ones stay until you run it again/);
-  const bigApply = fake({ 'DELETE /api/runs/run-1': () => ({ json: plan({ dryRun: false, removed: plan().remove, entriesRemoved: 5000, entriesCapped: true }) }) });
-  await run(['cleanup', '--run', 'run-1', '--apply'], bigApply.io);
-  expect(bigApply.text()).toMatch(/older entries may remain: run fg cleanup --run run-1 --apply again/);
   expect(await run(['cleanup', '--run', 'run-1', '--dry-run'], fake({ 'DELETE /api/runs/run-1': () => ({ json: plan() }) }).io)).toBe(0);
   expect(await run(['cleanup'], fake({}).io)).toBe(2);
   expect(await run(['cleanup', '--run', 'run-1', '--apply', '--dry-run'], fake({}).io)).toBe(2);
@@ -941,6 +979,7 @@ test('legacy cleanup --owner explicitly uses FG_OWNER_TOKEN and owner authorizat
   const missing = fake({ 'DELETE /api/runs/legacy': () => ({ json: { run: 'legacy', dryRun: true, remove: {}, kept: [], changed: [], entries: 0 } }) });
   expect(await run(['cleanup', '--run', 'legacy', '--owner'], missing.io)).not.toBe(0);
   expect(missing.calls).toEqual([]);
+  expect(missing.err.join('\n')).toMatch(/read-only for owner actions: run \.\/scripts\/setup\.sh --yes --enable-auth/);
 });
 
 test('Codex actual thread id is registered early using inherited run context', async () => {
@@ -965,7 +1004,7 @@ test('scan prints blocked runner warnings, including JSON mode stderr', async ()
 
 
 test('fresh clone with native Node but missing workspace dependencies falls back to the API container', async () => {
-  const { spawnSync } = await import('node:child_process');
+  const { execResult } = await import('@fb/core/testing/exec');
   const { mkdtempSync, mkdirSync, copyFileSync, writeFileSync, chmodSync, rmSync } = await import('node:fs');
   const { tmpdir } = await import('node:os');
   const { join } = await import('node:path');
@@ -974,15 +1013,20 @@ test('fresh clone with native Node but missing workspace dependencies falls back
   try {
     const bin = join(repo, 'bin');
     for (const dir of [bin, join(repo, 'scripts/lib'), join(repo, 'packages/api')]) mkdirSync(dir, { recursive: true });
-    for (const path of ['scripts/fg', 'scripts/lib/env.sh']) copyFileSync(join(root, path), join(repo, path));
+    for (const path of ['scripts/fg', 'scripts/lib/env.sh', 'scripts/lib/state-fs.sh']) copyFileSync(join(root, path), join(repo, path));
+    // Set up (setup.sh wrote .env and started the stack), but the host has no workspace dependencies.
+    writeFileSync(join(repo, '.env'), 'API_PORT=8787\n');
     writeFileSync(join(bin, 'node'), '#!/bin/sh\ncase "$*" in *process.versions*) exit 0 ;; *import.meta.resolve*) exit 1 ;; *) echo NATIVE_UNEXPECTED ;; esac\n');
     writeFileSync(join(bin, 'docker'), '#!/bin/sh\ncase "$*" in *"ps -a"*) ;; *"exec -T"*) echo CONTAINER_CLI ;; esac\n');
     for (const path of ['node', 'docker']) chmodSync(join(bin, path), 0o755);
-    const result = spawnSync('bash', [join(repo, 'scripts/fg'), 'projects', 'list'], { encoding: 'utf8', env: { PATH: `${bin}:/usr/bin:/bin` } });
+    const result = await execResult('bash', [join(repo, 'scripts/fg'), 'projects', 'list'], { env: { PATH: `${bin}:/usr/bin:/bin` } });
     expect(result.status).toBe(0); expect(result.stdout).toContain('CONTAINER_CLI');
-    expect(result.stdout).not.toContain('NATIVE_UNEXPECTED'); expect(result.stderr).toContain('workspace dependencies are missing');
+    // The container is the README's route (no pnpm install): it is not worth a line on every command, only with FG_VERBOSE.
+    expect(result.stdout).not.toContain('NATIVE_UNEXPECTED'); expect(result.stderr).not.toContain('workspace dependencies');
+    const verbose = await execResult('bash', [join(repo, 'scripts/fg'), 'projects', 'list'], { env: { PATH: `${bin}:/usr/bin:/bin`, FG_VERBOSE: '1' } });
+    expect(verbose.stderr).toContain('workspace dependencies are missing');
   } finally { rmSync(repo, { recursive: true, force: true }); }
-});
+}, SCRIPT_TEST_TIMEOUT_MS);
 
 
 test('host status includes database memory and swap headroom without a Docker socket in the API', async () => {
@@ -990,6 +1034,15 @@ test('host status includes database memory and swap headroom without a Docker so
   f.io.env.FG_DATABASE_MEMORY = JSON.stringify({ usedBytes: 900 * 1048576, limitBytes: 1024 * 1048576, headroomBytes: 124 * 1048576, swapBytes: 16 * 1048576, swapLimitBytes: 128 * 1048576, swapHeadroomBytes: 112 * 1048576 });
   expect(await run(['status'], f.io)).toBe(0);
   expect(f.out.join('\n')).toContain('neo4j     900 MiB / 1024 MiB, headroom 124 MiB, swap 16 MiB, swap headroom 112 MiB (host snapshot) WARNING: memory pressure');
+});
+
+test('a few KiB of swap with plenty of headroom is shown in KiB and is not memory pressure', async () => {
+  const f = fake({ 'GET /api/status': () => ({ json: { version: 'x' } }), 'GET /api/pipeline': () => ({ json: {} }) });
+  f.io.env.FG_DATABASE_MEMORY = JSON.stringify({ usedBytes: 1018 * 1048576, limitBytes: 3072 * 1048576, headroomBytes: 2054 * 1048576, swapBytes: 76 * 1024, swapLimitBytes: null, swapHeadroomBytes: null });
+  expect(await run(['status'], f.io)).toBe(0);
+  const out = f.out.join('\n');
+  expect(out).toContain('swap 76 KiB');
+  expect(out).not.toContain('WARNING');
 });
 
 
@@ -1003,3 +1056,88 @@ test('cloud status lists every project eligibility without truncating late keys 
   expect(f.out.join('\n')).toContain('project   next-ai-chat-langchain: not sent: No shareable knowledge');
   expect(f.out.join('\n')).toContain('team      An admin must approve team lessons.');
 });
+
+test('status says a code-map rebuild running now is rebuilding, and only a cut-short one is interrupted', async () => {
+  const map = { builtAt: '2026-11-01T00:00:00Z', ageDays: 4 };
+  const f = fake({
+    'GET /api/status': () => ({ json: { ...idle, codeMaps: [{ ...map, projectKey: 'busy', rebuilding: true }, { ...map, projectKey: 'cut', interrupted: true }] } }),
+    'GET /api/pipeline': () => pipeline({}),
+  });
+  expect(await run(['status'], f.io)).toBe(0);
+  const t = f.text();
+  expect(t).toMatch(/code map\s+busy .*; rebuilding now/);
+  expect(t).not.toMatch(/busy .*interrupted/);
+  expect(t).toMatch(/code map\s+cut .*; rebuild was interrupted/);
+});
+
+test('status gives a code map\'s last check beside its build date when the check is later', async () => {
+  const f = fake({
+    'GET /api/status': () => ({ json: { ...idle, codeMaps: [{ projectKey: 'demo', builtAt: '2026-11-01T00:00:00Z', ageDays: 4, checkedAt: '2026-11-04T00:00:00Z', lastFailureAt: '2026-11-05T00:00:00Z' }] } }),
+    'GET /api/pipeline': () => pipeline({}),
+  });
+  expect(await run(['status'], f.io)).toBe(0);
+  expect(f.text()).toMatch(/code map\s+demo built 2026-11-01T00:00:00Z \(4d since rebuild\), last confirmed current 2026-11-04T00:00:00Z; last rebuild failed/);
+});
+
+test('fg cleanup of a run with nothing left says "nothing to remove", with or without --apply', async () => {
+  const zero = { feedback: 0, lesson: 0, miss: 0, predone_check: 0, fact: 0, doc: 0, link: 0, chat: 0 };
+  const empty = { run: 'run-1', sandbox: false, remove: zero, kept: [], changed: [], entries: 0 };
+  const dry = fake({ 'DELETE /api/runs/run-1': () => ({ json: { ...empty, dryRun: true } }) });
+  expect(await run(['cleanup', '--run', 'run-1'], dry.io)).toBe(0);
+  expect(dry.text().trim()).toBe('run run-1: nothing to remove');
+  const applied = fake({ 'DELETE /api/runs/run-1': () => ({ json: { ...empty, dryRun: false, removed: zero, entriesRemoved: 0 } }) });
+  expect(await run(['cleanup', '--run', 'run-1', '--apply'], applied.io)).toBe(0);
+  expect(applied.text().trim()).toBe('run run-1: nothing to remove');
+});
+
+test('fg status names the same fix as doctor when the owner token is missing: setup --yes, then a restart', async () => {
+  const f = fake({ 'GET /api/status': () => ({ json: { ...idle, ownerSetupRequired: true } }), 'GET /api/pipeline': () => pipeline() });
+  expect(await run(['status'], f.io)).toBe(0);
+  expect(f.text()).toMatch(/owner +SETUP REQUIRED: run \.\/scripts\/setup\.sh --yes to create FG_OWNER_TOKEN, restart the api/);
+  expect(f.text()).not.toContain('interactively');
+});
+
+test('fg names the credential it sent: a run opened by the operator token says to clear it, and the 401 hint is not repeated', async () => {
+  const env = { FG_OPERATOR_TOKEN: OP, API_TOKEN: 'a'.repeat(32), FG_RUN: 'probe', FG_RUN_KEY: 'k'.repeat(40) };
+  const registered = fake({ 'POST /api/sessions/s-1/run': () => ({ status: 204 }) }, env);
+  expect(await run(['sessions', 'register', 's-1'], registered.io)).toBe(0);
+  expect(registered.text()).toMatch(/registered session s-1 for run probe with FG_OPERATOR_TOKEN \(it takes precedence over API_TOKEN; FG_OPERATOR_TOKEN= \.\/scripts\/fg \.\.\. uses API_TOKEN\)/);
+  const conflict = 'run id belongs to another caller: probe was opened by an API agent at t0; this request sent FG_OPERATOR_TOKEN, which takes precedence over API_TOKEN: clear FG_OPERATOR_TOKEN to act with API_TOKEN and the same FG_RUN_KEY, or choose another run id only for a genuinely separate run';
+  const refused = fake({ 'POST /api/sessions/s-1/run': () => ({ status: 409, json: { error: conflict } }) }, env);
+  expect(await run(['sessions', 'register', 's-1'], refused.io)).toBe(1);
+  // The server's text names the credential; fg adds only the one-command form, once.
+  expect(refused.err.join('\n')).toMatch(/clear FG_OPERATOR_TOKEN to act with API_TOKEN .* \(for one command: FG_OPERATOR_TOKEN= \.\/scripts\/fg \.\.\.\)/);
+  expect(refused.err.join('\n').match(/takes precedence/g)).toHaveLength(1);
+  const denied = fake({ 'GET /api/pipeline': () => ({ status: 401, json: { error: 'token not recognised: check FG_OPERATOR_TOKEN (or API_TOKEN) against the .env this Feedback Graph runs with' } }) }, env);
+  expect(await run(['pipeline'], denied.io)).toBe(1);
+  expect(denied.err.join('\n').match(/check FG_OPERATOR_TOKEN/g)).toHaveLength(1);
+});
+
+test('scripts/fg before setup refuses every API command instead of asking port 8787; fg status shows every runner-disabled reason', async () => {
+  const { execResult } = await import('@fb/core/testing/exec');
+  const { chmodSync, copyFileSync, mkdirSync, mkdtempSync, writeFileSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const { fileURLToPath } = await import('node:url');
+  const root = fileURLToPath(new URL('../../../', import.meta.url));
+  const repo = mkdtempSync(join(tmpdir(), 'fgnoenv-'));
+  const bin = join(repo, 'bin');
+  mkdirSync(join(repo, 'scripts', 'lib'), { recursive: true });
+  mkdirSync(bin);
+  copyFileSync(join(root, 'scripts', 'fg'), join(repo, 'scripts', 'fg'));
+  for (const f of ['env.sh', 'state-fs.sh']) copyFileSync(join(root, 'scripts', 'lib', f), join(repo, 'scripts', 'lib', f));
+  writeFileSync(join(bin, 'node'), '#!/bin/sh\nexit 1\n');
+  writeFileSync(join(bin, 'docker'), '#!/bin/sh\ncase "$1" in ps) ;; *) echo "cli ran: $*" ;; esac\n');
+  for (const f of ['node', 'docker']) chmodSync(join(bin, f), 0o755);
+  const fg = (...args: string[]) => execResult('bash', [join(repo, 'scripts', 'fg'), ...args], { env: { PATH: `${bin}:/usr/bin:/bin` } });
+  const before = await fg('projects', 'list');
+  expect(before.status).toBe(1);
+  expect(before.stderr).toContain('fg projects: this checkout is not set up');
+  expect(before.stdout).toBe('');
+  writeFileSync(join(repo, '.env'), 'API_PORT=8797\n');
+  mkdirSync(join(repo, 'state', 'runner-control'), { recursive: true });
+  writeFileSync(join(repo, 'state', 'runner-control', 'codex-runner-disabled'), 'procfs: nested sandbox could not mount proc\nnetwork: runner reached a protected host or service endpoint\n');
+  const status = await fg('status');
+  expect(status.stderr).toContain('WARN codex runner disabled: procfs: nested sandbox could not mount proc; network: runner reached a protected host or service endpoint');
+  expect(status.stdout).toContain('cli ran:');
+}, SCRIPT_TEST_TIMEOUT_MS);

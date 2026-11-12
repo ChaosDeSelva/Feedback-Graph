@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import ForceGraph2D, { type ForceGraphMethods } from 'react-force-graph-2d';
-import { api, type CodeMapMeta, type MapCapped, type MapGraph } from './api.ts';
+import { api, type CodeMapMeta, type MapCapped, type MapGraph, errorMessage } from './api.ts';
 import { mapCapNote } from './CodeMap.tsx';
 import { IncludeTests, ModulePanel } from './CodeMap.tsx';
 import { inboxHref, lessonHref } from './links.ts';
@@ -10,6 +10,7 @@ import { codeLinkLabel, codeNodeCaption, codeNodeLabel, keyFiles, placeCaptions,
 import { Input } from './ui/controls.tsx';
 import { GraphIcon } from './ui/icons.tsx';
 import { readToken, useTheme } from './ui/theme.ts';
+import { ScrollArea } from './ui/ScrollArea.tsx';
 
 type Kind = 'file' | 'test' | 'miss' | 'lesson';
 /** short: the shortest path suffix no other file in the drawing shares; top: one of the top hotspots, not a neighbour. */
@@ -105,7 +106,7 @@ export function CodeGraph({ projectKey }: { projectKey: string }) {
     setSelected(null);
     fitted.current = false;
     let stale = false;
-    api.codeGraph(projectKey, tests).then((g) => { if (!stale) setGraph(g); }, (e) => { if (!stale) setError(e instanceof Error ? e.message : String(e)); });
+    api.codeGraph(projectKey, tests).then((g) => { if (!stale) setGraph(g); }, (e) => { if (!stale) setError(errorMessage(e)); });
     return () => { stale = true; };
   }, [projectKey, tests]);
 
@@ -142,7 +143,7 @@ export function CodeGraph({ projectKey }: { projectKey: string }) {
   );
 
   return (
-    <div className="grid min-h-0 flex-1 grid-cols-1 grid-rows-[minmax(22rem,1fr)_auto] overflow-y-auto md:grid-cols-[minmax(0,1fr)_24rem] md:grid-rows-1 md:overflow-hidden">
+    <ScrollArea className="grid min-h-0 flex-1 grid-cols-1 grid-rows-[minmax(22rem,1fr)_auto] overflow-y-auto md:grid-cols-[minmax(0,1fr)_24rem] md:grid-rows-1 md:overflow-hidden">
       <div ref={box} className="relative min-h-0 overflow-hidden bg-surface">
         {error && <Alert className="absolute top-3 right-3 left-3 z-10">{error}</Alert>}
         <div ref={overlay} className="absolute top-3 left-3 z-10 flex max-w-[calc(100%-1.5rem)] flex-col items-start gap-1.5">
@@ -218,13 +219,12 @@ export function CodeGraph({ projectKey }: { projectKey: string }) {
             onEngineStop={() => {
               if (fitted.current) return;
               fitted.current = true;
-              const g = fg.current;
-              if (!g) return;
+              const g = fg.current!;
               g.zoomToFit(400, 48);
               setTimeout(() => {
                 if (g.zoom() > MAX_FIT_ZOOM) g.zoom(MAX_FIT_ZOOM, 250);
                 // Shrink into the height left under the overlay and move the drawing down by half of it.
-                const top = (overlay.current?.offsetHeight ?? 0) + 12;
+                const top = overlay.current!.offsetHeight + 12;
                 if (top >= area.height / 2) return;
                 const z = Math.min(g.zoom(), MAX_FIT_ZOOM) * ((area.height - top) / area.height);
                 const c = g.centerAt();
@@ -242,14 +242,15 @@ export function CodeGraph({ projectKey }: { projectKey: string }) {
             nodePointerAreaPaint={(n: CodeNode & { x?: number; y?: number }, color: string, ctx: CanvasRenderingContext2D, scale: number) => {
               ctx.fillStyle = color;
               ctx.beginPath();
-              ctx.arc(n.x ?? 0, n.y ?? 0, Math.max(radius(n), 5 / scale), 0, 2 * Math.PI);
+              ctx.arc(n.x!, n.y!, Math.max(radius(n), 5 / scale), 0, 2 * Math.PI);
               ctx.fill();
             }}
             nodeCanvasObject={(n: CodeNode & { x?: number; y?: number }, ctx: CanvasRenderingContext2D, scale: number) => {
               // Never smaller than a few screen pixels, so a big map zoomed out to fit stays readable and clickable.
               const r = Math.max(radius(n), (n.kind === 'file' || n.kind === 'test' ? 4.5 : 3.5) / scale);
-              const x = n.x ?? 0;
-              const y = n.y ?? 0;
+              // force-graph places every node before it draws one.
+              const x = n.x!;
+              const y = n.y!;
               ctx.beginPath();
               // Misses are diamonds and lessons squares, so a red file and a miss never look alike.
               if (n.kind === 'miss') { ctx.moveTo(x, y - r * 1.3); ctx.lineTo(x + r * 1.3, y); ctx.lineTo(x, y + r * 1.3); ctx.lineTo(x - r * 1.3, y); ctx.closePath(); }
@@ -306,7 +307,7 @@ export function CodeGraph({ projectKey }: { projectKey: string }) {
         )}
       </div>
 
-      <aside aria-label="node details" className="min-h-0 min-w-0 overflow-y-auto border-t border-line bg-canvas p-4 md:border-t-0 md:border-l">
+      <ScrollArea as="aside" aria-label="node details" className="min-h-0 min-w-0 overflow-y-auto border-t border-line bg-canvas p-4 md:border-t-0 md:border-l">
         {selected?.kind === 'file' ? (
           <ModulePanel narrow projectKey={projectKey} path={selected.path} onOpen={(p) => setSelected({ kind: 'file', path: p })} onClose={() => setSelected(null)} />
         ) : miss ? (
@@ -334,7 +335,7 @@ export function CodeGraph({ projectKey }: { projectKey: string }) {
             Click a file to open its module panel, or find one by path; hover one for its full path, or zoom in to see every file's name. Bigger files score higher as hotspots; red ones with a red ring had misses, and are always named with how many. The twelve key files (misses, then hotspot score, then most connections) are named at every zoom. Arrows are imports, dashed ones tests; diamonds are misses and squares the approved lessons on those files.
           </p>
         )}
-      </aside>
-    </div>
+      </ScrollArea>
+    </ScrollArea>
   );
 }

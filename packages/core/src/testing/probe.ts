@@ -25,7 +25,9 @@ export type ProbeKind =
   | 'Doc'
   | 'Chunk'
   | 'Activity'
-  | 'SyncCursor';
+  | 'SyncCursor'
+  | 'Decision'
+  | 'DecisionNote';
 
 /** An embedded record with just the fields its embedding text is built from, as an older store might hold it. */
 export type EmbeddedSeed =
@@ -49,7 +51,9 @@ export type StaleTextSeed =
    * An Ask conversation `id` with a user turn (question, pack context) and its assistant turn, left pending so
    * nextPendingTurn returns the stored context, holding an answer and sources.
    */
-  | { kind: 'ChatTurns'; id: string; question: string; context: string; answer: Record<string, unknown>; sources: Record<string, unknown>[] };
+  | { kind: 'ChatTurns'; id: string; question: string; context: string; answer: Record<string, unknown>; sources: Record<string, unknown>[] }
+  /** A decision whose rationale and a before-snapshot field hold `text`, with a note `note` on it. */
+  | { kind: 'Decision'; id: string; text: string; note: string };
 
 export type PreDoneCheckRow = {
   projectKey: string;
@@ -86,6 +90,8 @@ export interface StoreProbe {
   setProject(key: string, fields: { remote?: string | null; aliases?: string[] }): Promise<void>;
   /** Force a creation-time tie so pagination/order contracts never depend on sleeps or wall-clock speed. */
   setLessonCreatedAt(ids: string[], at: string): Promise<void>;
+  /** The same for decisions (DecisionsStore lists newest first). */
+  setDecisionCreatedAt(ids: string[], at: string): Promise<void>;
   /** A record filed under a project key that has no project of its own, as older stores hold them. */
   seedOrphan(row: { kind: 'Lesson' | 'Doc'; id: string; projectKey: string }): Promise<void>;
   /** An embedded record with only the fields its embedding text needs (a backend may add placeholder parents). */
@@ -94,4 +100,10 @@ export interface StoreProbe {
   seedStaleText(row: StaleTextSeed): Promise<void>;
   /** Mark a lesson decided by you, as the rule before 0.6.2 marked every decision, a machine's too. */
   seedOwnerMark(lessonId: string): Promise<void>;
+  /**
+   * The database work of the store reads fn makes, as a count that does not depend on the host's speed: on Neo4j the
+   * db hits of each query (PROFILE), on Postgres the rows each plan node read (EXPLAIN ANALYZE: rows out and rows
+   * filtered away, per loop). Reads only: a statement that writes is not measured.
+   */
+  work(fn: () => Promise<unknown>): Promise<number>;
 }

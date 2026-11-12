@@ -4,6 +4,7 @@ import type { HumanTurn, ParsedSession, ToolCall } from '@fb/core';
 import { redactSecrets } from '@fb/core';
 import type { FileInfo } from '../cycle.ts';
 import { addInstructionFiles, codexInstructionFiles } from './instructions.ts';
+import { storableTimestamp } from './timestamps.ts';
 
 /**
  * OpenAI Codex CLI / Codex Desktop session transcripts (~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl),
@@ -219,7 +220,8 @@ export function codexSessionParser(file: string): CodexSessionParser {
     if (!rec) return;
     const norm = normalise(rec, id === null);
     if (!norm) return;
-    const ts = norm.ts ?? lastTs;
+    // A time no store can hold (minute 60, 30 February) is the one before it, as a record with none is.
+    const ts = norm.ts && storableTimestamp(norm.ts) ? norm.ts : lastTs;
     if (norm.type === 'session_meta') {
       if (id === null) startSession(norm.payload, ts);
       return;
@@ -246,7 +248,7 @@ export function codexSessionParser(file: string): CodexSessionParser {
 
   return {
     push,
-    finish: () => (human ? segments.map((s) => ({ ...s, turns: [...s.turns], toolCalls: [...s.toolCalls], instructionFiles: [...(s.instructionFiles ?? [])], finalReply: s.finalReply ?? null })) : []),
+    finish: () => (human ? segments.map((s) => ({ ...s, turns: [...s.turns], toolCalls: [...s.toolCalls], instructionFiles: [...s.instructionFiles!], finalReply: s.finalReply ?? null })) : []),
   };
 }
 

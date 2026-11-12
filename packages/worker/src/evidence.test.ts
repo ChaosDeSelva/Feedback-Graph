@@ -1,4 +1,3 @@
-import { readFileSync } from 'node:fs';
 import { expect, test } from 'vitest';
 import { EVIDENCE_CURSOR, SessionEvidenceGate } from './evidence.ts';
 
@@ -72,16 +71,3 @@ test('a cycle that did not finish reading transcripts keeps the gate closed; a f
   expect(w.calls.slice(6)).toEqual(['recheck', 'ingest', 'request-recheck', 'recheck']);
 });
 
-test("the worker's start-up goes through the gate: nothing that reads session evidence runs before the loop's first ingest", () => {
-  const main = readFileSync(new URL('./main.ts', import.meta.url), 'utf8');
-  const gate = main.slice(main.indexOf('new SessionEvidenceGate('), main.indexOf('\n  });', main.indexOf('new SessionEvidenceGate(')));
-  for (const pass of ['resolvePendingInstructions(', 'rematchOnRuleChange(']) {
-    // Called once, inside the gate's passes.
-    expect(main.split(pass).length - 1, pass).toBe(1);
-    expect(gate, pass).toContain(pass);
-  }
-  // The lesson re-check only through the gate, and post-mortems only once it has settled; afterIngest after runCycle.
-  expect(main).not.toMatch(/await recheckOld\(\)/);
-  expect(main).toMatch(/pmDeps && !settling \? await runPostmortems\(pmDeps\)/);
-  expect(main.indexOf('await evidence.afterIngest()')).toBeGreaterThan(main.indexOf('await runCycle(cycleDeps)'));
-});

@@ -81,8 +81,6 @@ export function withoutDataDirs(paths: string[]): { paths: string[]; dataDirs: D
   return { paths: paths.filter((p) => !dirs.some((d) => p.startsWith(`${d.dir}/`))), dataDirs: dirs };
 }
 
-const plural = (n: number, w: string) => `${n} ${w}${n === 1 ? '' : 's'}`;
-
 export type ForgetDataDeps = {
   facts: Pick<FactsStore, 'fileHashes' | 'markFilesRemoved'>;
   projects: () => Promise<{ key: string; repoPath: string }[]>;
@@ -109,7 +107,8 @@ export async function forgetDataFiles(d: ForgetDataDeps): Promise<{ files: numbe
     total.projects++;
     await d.activity?.record({
       kind: 'facts_extracted', actor: 'deterministic', projectKey: p.key,
-      subject: `forgot ${plural(gone.length, 'file')} in data folders of ${p.key}: ${dirs.slice(0, 5).map((x) => `${x.dir}/ (${x.files})`).join(', ')}${dirs.length > 5 ? ', ...' : ''}`,
+      // A data folder holds at least DATA_NAMED_MIN files, so never one.
+      subject: `forgot ${gone.length} files in data folders of ${p.key}: ${dirs.slice(0, 5).map((x) => `${x.dir}/ (${x.files})`).join(', ')}${dirs.length > 5 ? ', ...' : ''}`,
       why: 'folders of data (transcripts, logs, exports, dumps, very large data sets) are no longer scanned: their files were read by an earlier scan, so they are forgotten and no longer count toward a rescan',
       details: { dataDirs: dirs.slice(0, 50), files: gone.length },
       targets: dirs.slice(0, 20).map((x) => `${p.key}:${x.dir}`),

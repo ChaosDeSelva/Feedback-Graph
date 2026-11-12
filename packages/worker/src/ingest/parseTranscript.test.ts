@@ -54,7 +54,7 @@ describe('parseTranscript', () => {
 
   test('interrupt markers are not human turns', () => {
     const lines = [
-      { type: 'user', uuid: 'i', sessionId: 's', timestamp: 't1', message: { content: [{ type: 'text', text: '[Request interrupted by user for tool use]' }] } },
+      { type: 'user', uuid: 'i', sessionId: 's', timestamp: '2026-10-01T10:00:01Z', message: { content: [{ type: 'text', text: '[Request interrupted by user for tool use]' }] } },
     ].map((r) => JSON.stringify(r)).join('\n');
     expect(parseTranscript(lines, 'i.jsonl')[0].turns).toEqual([]);
   });
@@ -67,8 +67,8 @@ describe('parseTranscript', () => {
 
   test('assistant text is trimmed to the last 2000 chars', () => {
     const lines = [
-      { type: 'assistant', uuid: 'a', sessionId: 's', timestamp: 't1', message: { content: [{ type: 'text', text: 'x'.repeat(2500) + 'END' }] } },
-      { type: 'user', uuid: 'b', sessionId: 's', timestamp: 't2', message: { content: 'ok' } },
+      { type: 'assistant', uuid: 'a', sessionId: 's', timestamp: '2026-10-01T10:00:01Z', message: { content: [{ type: 'text', text: 'x'.repeat(2500) + 'END' }] } },
+      { type: 'user', uuid: 'b', sessionId: 's', timestamp: '2026-10-01T10:00:02Z', message: { content: 'ok' } },
     ].map((r) => JSON.stringify(r)).join('\n');
     const [s] = parseTranscript(lines, 'y.jsonl');
     expect(s.turns[0].precedingAssistantText).toHaveLength(2000);
@@ -77,16 +77,16 @@ describe('parseTranscript', () => {
 
   test("the agent's reply after the last human turn is kept, redacted, as the session's final reply (not a turn)", () => {
     const lines = [
-      { type: 'user', uuid: 'u0', sessionId: 's', timestamp: 't1', message: { content: 'deploy it' } },
-      { type: 'assistant', uuid: 'a1', sessionId: 's', timestamp: 't2', message: { content: [{ type: 'text', text: 'working on it' }] } },
-      { type: 'assistant', uuid: 'a2', sessionId: 's', timestamp: 't3', message: { content: [{ type: 'text', text: 'Deployed.\nDB_PASSWORD=hunter2EXAMPLE' }] } },
+      { type: 'user', uuid: 'u0', sessionId: 's', timestamp: '2026-10-01T10:00:01Z', message: { content: 'deploy it' } },
+      { type: 'assistant', uuid: 'a1', sessionId: 's', timestamp: '2026-10-01T10:00:02Z', message: { content: [{ type: 'text', text: 'working on it' }] } },
+      { type: 'assistant', uuid: 'a2', sessionId: 's', timestamp: '2026-10-01T10:00:03Z', message: { content: [{ type: 'text', text: 'Deployed.\nDB_PASSWORD=hunter2EXAMPLE' }] } },
     ].map((r) => JSON.stringify(r)).join('\n');
     const [s] = parseTranscript(lines, 'f.jsonl');
     expect(s.turns).toHaveLength(1);
-    expect(s.finalReply).toEqual({ text: expect.stringContaining('Deployed.'), ts: 't3' });
+    expect(s.finalReply).toEqual({ text: expect.stringContaining('Deployed.'), ts: '2026-10-01T10:00:03Z' });
     expect(s.finalReply!.text).not.toContain('hunter2EXAMPLE');
     // A later human turn takes the reply in as its preceding text: there is no final reply then.
-    const more = lines + '\n' + JSON.stringify({ type: 'user', uuid: 'u1', sessionId: 's', timestamp: 't4', message: { content: 'thanks' } });
+    const more = lines + '\n' + JSON.stringify({ type: 'user', uuid: 'u1', sessionId: 's', timestamp: '2026-10-01T10:00:04Z', message: { content: 'thanks' } });
     const [s2] = parseTranscript(more, 'f.jsonl');
     expect(s2.turns[1].precedingAssistantText).toContain('Deployed.');
     expect(s2.finalReply).toBeNull();
@@ -96,7 +96,7 @@ describe('parseTranscript', () => {
 
   test('Read and NotebookEdit map file paths', () => {
     const lines = [
-      { type: 'assistant', uuid: 'a', sessionId: 's', timestamp: 't1', message: { content: [
+      { type: 'assistant', uuid: 'a', sessionId: 's', timestamp: '2026-10-01T10:00:01Z', message: { content: [
         { type: 'tool_use', name: 'Read', input: { file_path: '/r.ts' } },
         { type: 'tool_use', name: 'NotebookEdit', input: { notebook_path: '/n.ipynb' } },
       ] } },
@@ -109,11 +109,11 @@ describe('parseTranscript', () => {
 test('secrets are redacted from turn text, assistant text and commands', () => {
   const key = 'sk-proj-' + 'Z9'.repeat(20);
   const lines = [
-    { type: 'assistant', uuid: 'a', sessionId: 's', timestamp: 't1', message: { content: [
+    { type: 'assistant', uuid: 'a', sessionId: 's', timestamp: '2026-10-01T10:00:01Z', message: { content: [
       { type: 'text', text: `set OPENAI_API_KEY=${key}` },
       { type: 'tool_use', name: 'Bash', input: { command: `export K=${key}` } },
     ] } },
-    { type: 'user', uuid: 'b', sessionId: 's', timestamp: 't2', message: { content: `use this ${key}` } },
+    { type: 'user', uuid: 'b', sessionId: 's', timestamp: '2026-10-01T10:00:02Z', message: { content: `use this ${key}` } },
   ].map((r) => JSON.stringify(r)).join('\n');
   const out = JSON.stringify(parseTranscript(lines, 'k.jsonl'));
   expect(out).not.toContain(key);

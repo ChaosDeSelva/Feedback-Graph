@@ -16,6 +16,7 @@ import type {
   LessonFrom,
   LessonScope,
   LessonStatus,
+  LessonTriggers,
   Outcome,
   PostMortem,
   PostMortemInput,
@@ -24,12 +25,26 @@ import type {
 } from '../types.ts';
 import { REDACT_PAGE, redactDeep, redactSecrets, redactStoredLesson, redactStoredRow } from '../redact.ts';
 import { LESSON_CHECKS_VERSION } from '../types.ts';
-import { DEMO_SOURCE, demoPrefix, type CommentLesson, type DemoMiss, type DemoRemoved, type KnowledgeStore, type LessonFilter, type SimilarLesson, type DecidedLesson, type DecidedLessonsQuery } from '../store.ts';
+import { DEMO_SOURCE, demoPrefix, type CommentLesson, type DemoMiss, type DemoRemoved, type KnowledgeStore, type LessonFilter, type SimilarLesson, type DecidedLesson, type DecidedLessonsQuery, type LoopLessonInput } from '../store.ts';
 import { draftOf, editedDraft, ownerDecided } from '../lessonOutcome.ts';
-import type { GraphRepo } from './repo.ts';
+import { lessonFingerprint, TargetChangedError, type LessonSnapshotWrite, type SupersedeLink } from '../decisions/record.ts';
+import { retryDeadlock, type GraphRepo } from './repo.ts';
 import { matchReport, REPORT_MERGE_MINUTES } from '../dedupe.ts';
 import { nearest, visibleToRun } from './nearest.ts';
 import { VISIBLE_TO_RUN } from './runs.ts';
+
+/** An issue key: a prefix starting with a letter, a hyphen and a number (APP-123, ABC2-15, MY_PROJ-12). */
+export const ISSUE_KEY_SHAPE = /^[A-Za-z][A-Za-z0-9_]*-\d+$/;
+
+/**
+ * A regular expression, in the dialect Java (Cypher's =~) and Postgres (~*) share, that finds any of `keys` where it
+ * stands as a whole key: not inside a longer word or number, and not the start of a version ("HTTP-1.1"). Matching is
+ * case-insensitive by the caller's flag. Anything not shaped like a key is left out.
+ */
+export function issueKeyPattern(keys: string[]): string {
+  const valid = [...new Set(keys.filter((key) => ISSUE_KEY_SHAPE.test(key)).map((key) => key.toUpperCase()))];
+  return `(?<![A-Za-z0-9_])(?:${valid.join('|')})(?![A-Za-z0-9_]|\\.[0-9])`;
+}
 
 export const MAX_POSTMORTEM_ATTEMPTS = 5;
 /** Wait 5, 10, 20, 40 minutes between attempts, so a short outage does not use them all up. */
@@ -51,6 +66,12 @@ export function feedbackAuthorOf(ext: unknown): FeedbackAuthor | null {
   return e?.source ? { source: e.source, author: e.author ?? '', url: e.url ?? '', reviewState: e.reviewState ?? null, ...(e.threadState && { threadState: e.threadState }) } : null;
 }
 
+/** A feedback turn's evidence for LessonDetail: what was done before it, and a comment's file and diff lines. */
+export function evidenceOf(done: unknown, ext: unknown): { done: string | null; commentPath: string | null; diffHunk: string | null } {
+  const e = (typeof ext === 'string' ? JSON.parse(ext) : ext) as Partial<ExternalRef> | null | undefined;
+  return { done: typeof done === 'string' && done ? done : null, commentPath: e?.path ?? null, diffHunk: e?.diffHunk ?? null };
+}
+
 export type LessonDetail = {
   lesson: Lesson;
   miss: { id: string; missed: string; cause: Cause; causeExplanation: string } | null;
@@ -58,13 +79,19 @@ export type LessonDetail = {
    * external: set when the feedback is a GitHub or Linear comment: whose words they are (a reviewer, not you) and,
    * on GitHub, the verdict of the review it belongs to. Null for feedback you gave in a session.
    */
-  feedback: { id: string; text: string; status: FeedbackStatus; sessionId: string; ts: string; external?: FeedbackAuthor | null } | null;
+  feedback: {
+    id: string; text: string; status: FeedbackStatus; sessionId: string; ts: string; external?: FeedbackAuthor | null;
+    /** What the agent had done before it (an agent's report: what_was_done); the miss's evidence, with the comment's file and diff lines. */
+    done?: string | null; commentPath?: string | null; diffHunk?: string | null;
+  } | null;
   contextItems: ContextItem[];
   fixCommits: Commit[];
   supersedes: string[];
 };
 
 export type LessonPatch = Partial<Pick<Lesson, 'title' | 'rule' | 'appliesWhen' | 'scope' | 'paths'>> & {
+  /** The owner's triggers (LessonTriggers); not part of the writer's draft (proposedAs), so editing them is not an edit of its words. */
+  triggers?: LessonTriggers;
   status?: LessonStatus;
   supersedes?: string;
   /**
@@ -112,6 +139,8 @@ export type LessonInput = {
   embedding: number[];
   /** Review/quarantine flags preserved across backup imports. */
   checks?: LessonCheck[] | null;
+  /** Its triggers, carried by an export bundle; unset or null: the worker derives them. */
+  triggers?: LessonTriggers | null;
   /** The run it was written in (x-fg-run; fg demo seed): recorded when the lesson is first written, never moved. */
   run?: RunTag | null;
 };
@@ -246,6 +275,7 @@ export class KnowledgeRepo implements KnowledgeStore {
          FOREACH (_ IN CASE WHEN l.proposedAs IS NULL THEN [1] ELSE [] END |
            SET l.title = $pm.lesson.title, l.rule = $pm.lesson.rule, l.appliesWhen = $pm.lesson.appliesWhen,
                l.scope = $pm.lesson.scope, l.paths = $pm.lesson.paths,
+               l.triggers = CASE WHEN coalesce(l.triggersOwned, false) THEN l.triggers ELSE $triggers END,
                l.projectKey = CASE WHEN $pm.lesson.scope = 'global' THEN null ELSE p.key END,
                l.embedding = $lessonEmbedding, l.checks = $checks, l.checksVersion = CASE WHEN $checks IS NULL THEN null ELSE $checksVersion END)
          MERGE (l)-[:DERIVED_FROM]->(m)
@@ -276,6 +306,8 @@ export class KnowledgeRepo implements KnowledgeStore {
         lessonDropped: !!pm.lessonDropped,
         // A node property cannot hold a list of maps: the checks are kept as JSON (lessonOf parses them).
         checks: pm.lessonChecks ? JSON.stringify(pm.lessonChecks) : null,
+        // The triggers too (null: none derived, so the worker's backfill derives them).
+        triggers: pm.lesson.triggers ? JSON.stringify(pm.lesson.triggers) : null,
         checksVersion: neo4j.int(LESSON_CHECKS_VERSION),
         status: OUTCOME_STATUS[pm.outcome],
         now,
@@ -288,22 +320,25 @@ export class KnowledgeRepo implements KnowledgeStore {
   }
 
   async listLessons(f: LessonFilter): Promise<Lesson[]> {
+    // Paging by id with no filter on the feedback: the page is cut before its feedback is read.
+    const paging = f.afterId !== undefined && f.from === undefined && f.author === undefined && f.pr === undefined;
     const rows = await this.g.run(
-      `MATCH (l:Lesson)
+      `${f.ids ? 'MATCH (l:Lesson) WHERE l.id IN $ids WITH l' : f.afterId !== undefined ? 'MATCH (l:Lesson) WHERE l.id > $afterId WITH l' : 'MATCH (l:Lesson)'}
        WHERE ($status IS NULL OR l.status = $status)
          AND ($projectKey IS NULL OR l.projectKey = $projectKey OR l.projectKey IS NULL)
          AND ${LEARNED_IN('l')}
          // The checks are JSON text (lessonOf); a flag is its "name" key.
          AND ($flag IS NULL OR l.checks CONTAINS $flag)
          AND ${VISIBLE_TO_RUN('l')}
+       ${paging ? 'WITH l ORDER BY l.id LIMIT $limit' : ''}
        OPTIONAL MATCH (l)-[:DERIVED_FROM]->(:Miss)-[:EXPLAINS]->(:Feedback)-[:FROM_TURN]->(t:Turn)
        WITH l, t, ${FROM} AS fromKind
        WHERE ($from IS NULL OR fromKind = $from)
          AND ($author IS NULL OR toLower(t.external) CONTAINS $author)
          AND ($pr IS NULL OR t.external =~ $pr OR coalesce(t.text, '') + '\n' + coalesce(t.precedingAssistantText, '') + '\n' + coalesce(t.summary, '') + '\n' + l.title + '\n' + l.rule + '\n' + coalesce(l.appliesWhen, '') =~ $prText)
-       RETURN l, fromKind ORDER BY l.createdAt DESC, l.id LIMIT $limit`,
+       RETURN l, fromKind ORDER BY ${f.afterId === undefined ? 'l.createdAt DESC, ' : ''}l.id LIMIT $limit`,
       {
-        status: f.status ?? null, projectKey: f.projectKey ?? null, projectKeys: f.projectKeys ?? null, limit: neo4j.int(f.limit ?? 500),
+        ids: f.ids ?? null, afterId: f.afterId ?? null, status: f.status ?? null, projectKey: f.projectKey ?? null, projectKeys: f.projectKeys ?? null, limit: neo4j.int(f.limit ?? 500),
         flag: f.flag ? `"name":${JSON.stringify(f.flag)}` : null, from: f.from ?? null, run: f.run ?? null,
         prText: f.pr ? `(?is).*${reviewPatterns(f.pr).pr}.*` : null, authorText: f.author ? `(?is).*${reviewPatterns(undefined, f.author).author}.*` : null,
         author: f.author ? `"author":${JSON.stringify(f.author.toLowerCase())}` : null, pr: f.pr ? `(?s).*"thread":"[^"]*#${f.pr}".*` : null,
@@ -384,8 +419,8 @@ export class KnowledgeRepo implements KnowledgeStore {
     const t = r.get('t')?.properties;
     return {
       lesson: lessonOf(r.get('l').properties, r.get('fromKind')),
-      miss: m ? { id: m.id, missed: m.missed, cause: m.cause, causeExplanation: m.causeExplanation } : null,
-      feedback: f && t ? { id: f.id, text: t.text, status: f.status, sessionId: t.sessionId, ts: t.ts, external: feedbackAuthorOf(t.external) } : null,
+      miss: m ? { id: m.id, missed: m.missed, cause: m.cause, causeExplanation: m.causeExplanation ?? '' } : null,
+      feedback: f && t ? { id: f.id, text: t.text, status: f.status, sessionId: t.sessionId, ts: t.ts, external: feedbackAuthorOf(t.external), ...evidenceOf(t.precedingAssistantText, t.external) } : null,
       contextItems: (r.get('items') as { item: { properties: Record<string, string> } | null; why: string; available: boolean }[])
         .filter((i) => i.item)
         .map((i) => ({
@@ -405,12 +440,15 @@ export class KnowledgeRepo implements KnowledgeStore {
   }
 
   /** `unscoped`: you narrowed it but its project is unknown, so it went back to proposed instead of serving everywhere. */
-  async updateLesson(id: string, patch: LessonPatch, o: { reembed?: number[]; by?: string; note?: string }): Promise<{ unscoped: boolean }> {
+  async updateLesson(id: string, patch: LessonPatch, o: { reembed?: number[]; by?: string; note?: string; expect?: string }): Promise<{ unscoped: boolean }> {
     const safePatch = redactDeep(patch);
     await archiveRedactionInput('lesson-edit', id, patch, safePatch);
     patch = safePatch;
     const now = new Date().toISOString();
-    const { supersedes, status, projectKey, ...fields } = patch;
+    const { supersedes, status, projectKey, triggers, ...words } = patch;
+    // A node property cannot hold a map: the triggers are kept as JSON (lessonOf parses them).
+    // Triggers set here are the owner's (or an operator's): a re-saved post-mortem keeps them (triggersOwned).
+    const fields = { ...words, ...(triggers !== undefined && { triggers: JSON.stringify(triggers), triggersOwned: true }) };
     if (status === 'revoked') {
       const [current] = await this.g.run('MATCH (l:Lesson {id: $id}) RETURN l.status AS status', { id });
       if (current?.get('status') !== 'approved') throw new Error('only a previously approved lesson can be revoked');
@@ -421,8 +459,8 @@ export class KnowledgeRepo implements KnowledgeStore {
       if (!found) throw new Error(`no lesson ${supersedes} to supersede`);
     }
     // The writer's version, kept on the first edit of a proposed lesson (the guard in the query keeps it the first).
-    const draft = await this.writerDraft(id, fields);
-    const rows = await this.g.run(
+    const draft = await this.writerDraft(id, words);
+    const write = (query: GraphRepo['run']) => query(
       `MATCH (l:Lesson {id: $id})
        FOREACH (_ IN CASE WHEN $draft IS NULL OR l.proposedAs IS NOT NULL OR l.status <> 'proposed' THEN [] ELSE [1] END | SET l.proposedAs = $draft)
        // Only the owner's decision or edit makes it yours (a memory file's re-import then leaves it); a machine's does not.
@@ -451,9 +489,79 @@ export class KnowledgeRepo implements KnowledgeStore {
          SET old.status = 'superseded', old.decidedAt = $now, old.validTo = $now)
        RETURN unscoped`,
       { id, fields, status: status ?? null, now, by: o.by ?? 'you', owner: ownerDecided(o.by ?? 'you'), note: o.note ? redactSecrets(o.note) : null, embedding: o.reembed ?? null, supersedes: supersedes ?? null, draft, projectKey: projectKey ?? null,
-        words: Object.values(fields).some((v) => v !== undefined) },
+        words: Object.values(words).some((v) => v !== undefined) },
     );
+    const { expect } = o;
+    // With `expect`, the lesson is locked and compared in the transaction that writes it.
+    const rows = expect === undefined ? await write((c, p) => this.g.run(c, p)) : await conditionalWrite(this.g, async (query) => {
+      const [cur] = await query('MATCH (l:Lesson {id: $id}) SET l._lock = coalesce(l._lock, 0) + 1 REMOVE l._lock RETURN l', { id });
+      const actual = cur ? lessonFingerprint(lessonOf(cur.get('l').properties)) : null;
+      if (actual !== expect) throw new TargetChangedError(id, expect, actual);
+      return write(query);
+    }, () => true);
     return { unscoped: rows[0]?.get('unscoped') ?? false };
+  }
+
+  async writeLessonSnapshots(writes: LessonSnapshotWrite[], o: { supersede?: SupersedeLink[]; unsupersede?: SupersedeLink[] } = {}): Promise<void> {
+    if (!writes.length) return;
+    const safe = writes.map((w) => ({ id: w.id, expect: w.expect, f: redactDeep(w.fields), embedding: w.embedding ?? null }));
+    for (const [i, w] of writes.entries()) await archiveRedactionInput('lesson-snapshot', w.id, w.fields, safe[i].f);
+    // Two writes to one lesson at once (a double-clicked rollback) can be aborted as a deadlock by Neo4j: the aborted
+    // one wrote nothing and runs again, comparing afresh.
+    await retryDeadlock(() => conditionalWrite(this.g, async (query) => {
+      // Every lesson locked and compared before any is written: one that changed leaves them all as they were.
+      const rows = await query('UNWIND $ids AS id MATCH (l:Lesson {id: id}) SET l._lock = coalesce(l._lock, 0) + 1 REMOVE l._lock RETURN l', { ids: safe.map((w) => w.id) });
+      const now = new Map(rows.map((r) => { const l = lessonOf(r.get('l').properties); return [l.id, lessonFingerprint(l)]; }));
+      for (const w of safe) if (now.get(w.id) !== w.expect) throw new TargetChangedError(w.id, w.expect, now.get(w.id) ?? null);
+      await query(
+        `UNWIND $writes AS w MATCH (l:Lesson {id: w.id})
+         WITH l, w, [l.title, l.rule, coalesce(l.appliesWhen, ''), l.scope, coalesce(l.paths, [])] <> [w.f.title, w.f.rule, w.f.appliesWhen, w.f.scope, w.f.paths] AS words,
+           CASE WHEN w.f.status <> 'superseded' THEN null WHEN l.status = 'superseded' THEN l.validTo ELSE w.f.decidedAt END AS validTo
+         SET l.projectKey = w.f.projectKey, l.title = w.f.title, l.rule = w.f.rule, l.appliesWhen = w.f.appliesWhen, l.scope = w.f.scope,
+           l.paths = w.f.paths, l.status = w.f.status, l.decidedAt = w.f.decidedAt, l.decidedBy = w.f.decidedBy,
+           l.decisionNote = w.f.decisionNote, l.servingWeight = w.f.servingWeight, l.validTo = validTo, l.checksVersion = CASE WHEN words THEN 0 ELSE l.checksVersion END
+         FOREACH (_ IN CASE WHEN w.embedding IS NULL THEN [] ELSE [1] END | SET l.embedding = w.embedding)
+         FOREACH (_ IN CASE WHEN w.f.projectKey IS NULL THEN [] ELSE [1] END | MERGE (p:Project {key: w.f.projectKey}) MERGE (l)-[:APPLIES_TO]->(p))`,
+        { writes: safe },
+      );
+      await query('UNWIND $links AS s MATCH (k:Lesson {id: s.keeper}), (m:Lesson {id: s.merged}) MERGE (k)-[:SUPERSEDES]->(m)', { links: o.supersede ?? [] });
+      await query('UNWIND $links AS s MATCH (:Lesson {id: s.keeper})-[r:SUPERSEDES]->(:Lesson {id: s.merged}) DELETE r', { links: o.unsupersede ?? [] });
+      return true;
+    }, () => true));
+  }
+
+  async addLoopLesson(input: LoopLessonInput): Promise<boolean> {
+    const f = redactDeep(input.fields);
+    await archiveRedactionInput('lesson', input.id, input.fields, f);
+    return conditionalWrite(this.g, async (query) => {
+      const rows = await query(
+        `MATCH (src:Lesson {id: $from}) WHERE NOT EXISTS { MATCH (:Lesson {id: $id}) }
+         CREATE (l:Lesson {id: $id, createdAt: $now, source: src.source, cause: src.cause, missId: src.missId,
+                           originProjectKey: coalesce(src.originProjectKey, src.projectKey), run: src.run, sandbox: src.sandbox, splitFrom: src.id,
+                           projectKey: $f.projectKey, title: $f.title, rule: $f.rule, appliesWhen: $f.appliesWhen, scope: $f.scope, paths: $f.paths,
+                           status: $f.status, decidedAt: $f.decidedAt, decidedBy: $f.decidedBy, decisionNote: $f.decisionNote,
+                           servingWeight: $f.servingWeight, embedding: $embedding, checksVersion: 0})
+         WITH src, l
+         OPTIONAL MATCH (src)-[:DERIVED_FROM]->(m:Miss)
+         FOREACH (_ IN CASE WHEN m IS NULL THEN [] ELSE [1] END | MERGE (l)-[:DERIVED_FROM]->(m))
+         FOREACH (_ IN CASE WHEN $f.projectKey IS NULL THEN [] ELSE [1] END | MERGE (p:Project {key: $f.projectKey}) MERGE (l)-[:APPLIES_TO]->(p))
+         RETURN count(DISTINCT l) AS n`,
+        { id: input.id, from: input.from, f, embedding: input.embedding, now: new Date().toISOString() },
+      );
+      return Number(rows[0]?.get('n') ?? 0) > 0;
+    }, (made) => made);
+  }
+
+  async removeLoopLesson(id: string, expect: string): Promise<void> {
+    await conditionalWrite(this.g, async (query) => {
+      const [r] = await query('MATCH (l:Lesson {id: $id}) SET l._lock = coalesce(l._lock, 0) + 1 REMOVE l._lock RETURN l', { id });
+      const l = r ? lessonOf(r.get('l').properties) : null;
+      const actual = l ? lessonFingerprint(l) : null;
+      if (!l?.splitFrom || actual !== expect) throw new TargetChangedError(id, expect, actual);
+      // Its outcome counts go with it, as Postgres' lesson_signals rows do (ON DELETE CASCADE).
+      await query('MATCH (l:Lesson {id: $id}) OPTIONAL MATCH (l)-[:HAS_SIGNALS]->(s:LessonSignals) DETACH DELETE l, s', { id });
+      return true;
+    }, () => true);
   }
 
   async backfillProposedAs(id: string, draft: LessonDraft): Promise<boolean> {
@@ -496,6 +604,24 @@ export class KnowledgeRepo implements KnowledgeStore {
   async setLessonPaths(id: string, paths: string[]): Promise<boolean> {
     const [r] = await this.g.run(`MATCH (l:Lesson {id: $id}) WHERE l.status = 'proposed' AND l.proposedAs IS NULL SET l.paths = $paths RETURN count(l) AS n`, { id, paths });
     return Number(r?.get('n') ?? 0) > 0;
+  }
+
+  async setLessonTriggers(id: string, triggers: LessonTriggers): Promise<boolean> {
+    const [r] = await this.g.run(
+      `MATCH (l:Lesson {id: $id}) WHERE l.triggers IS NULL AND l.status IN ['proposed', 'approved'] SET l.triggers = $triggers RETURN count(l) AS n`,
+      { id, triggers: JSON.stringify(redactDeep(triggers)) },
+    );
+    return Number(r.get('n')) > 0;
+  }
+
+  async lessonsWithoutTriggers(limit: number): Promise<Lesson[]> {
+    const rows = await this.g.run(
+      `MATCH (l:Lesson) WHERE l.triggers IS NULL AND l.status IN ['proposed', 'approved'] AND NOT coalesce(l.sandbox, false)
+       OPTIONAL MATCH (l)-[:DERIVED_FROM]->(:Miss)-[:EXPLAINS]->(:Feedback)-[:FROM_TURN]->(t:Turn)
+       RETURN l, ${FROM} AS fromKind ORDER BY l.createdAt, l.id LIMIT $limit`,
+      { limit: neo4j.int(limit) },
+    );
+    return rows.map((r) => lessonOf(r.get('l').properties, r.get('fromKind')));
   }
 
   async clearMachineOwnerMarks(): Promise<string[]> {
@@ -570,6 +696,25 @@ export class KnowledgeRepo implements KnowledgeStore {
        ORDER BY score DESC`,
       params: { projectKey: q.projectKey, run: q.run ?? null },
     });
+    return rows.map((r) => {
+      const m = r.get('node').properties;
+      const t = r.get('t').properties;
+      return { missId: m.id, missed: m.missed, cause: m.cause, feedbackText: t.text, sessionId: t.sessionId, ts: t.ts, score: r.get('score'), rejectedWrongSession: r.get('wrongSession') === true };
+    });
+  }
+
+  async missesNaming(q: { keys: string[]; embedding: number[]; projectKey: string; k: number; run?: string | null }): Promise<RelatedMiss[]> {
+    if (!q.keys.some((key) => ISSUE_KEY_SHAPE.test(key)) || q.k <= 0) return [];
+    const rows = await this.g.run(
+      `MATCH (node:Miss {projectKey: $projectKey})-[:EXPLAINS]->(:Feedback)-[:FROM_TURN]->(t:Turn)
+       WHERE ${await visibleToRun(this.g, 'node')} AND (node.missed =~ $pattern OR t.text =~ $pattern)
+       WITH node, t, CASE WHEN node.embedding IS NOT NULL AND size(node.embedding) = size($embedding) AND size($embedding) > 0
+                          THEN vector.similarity.cosine(node.embedding, $embedding) ELSE 0.0 END AS score
+       ORDER BY score DESC, node.id LIMIT $k
+       RETURN node, t, score,
+              EXISTS { MATCH (l:Lesson {status: 'rejected'})-[:DERIVED_FROM]->(node) WHERE l.checks CONTAINS '"name":"wrong-session"' } AS wrongSession`,
+      { projectKey: q.projectKey, pattern: `(?is).*${issueKeyPattern(q.keys)}.*`, embedding: q.embedding, k: neo4j.int(q.k), run: q.run ?? null },
+    );
     return rows.map((r) => {
       const m = r.get('node').properties;
       const t = r.get('t').properties;
@@ -783,11 +928,12 @@ export class KnowledgeRepo implements KnowledgeStore {
        WITH l, coalesce(l.decidedByYou, false) AS yours
        FOREACH (_ IN CASE WHEN yours THEN [] ELSE [1] END |
          SET l.title = $l.title, l.rule = $l.rule, l.appliesWhen = $l.appliesWhen, l.scope = $l.scope, l.paths = $l.paths,
-             l.embedding = $l.embedding, l.checks = CASE WHEN $checks IS NULL THEN l.checks ELSE $checks END)
+             l.embedding = $l.embedding, l.checks = CASE WHEN $checks IS NULL THEN l.checks ELSE $checks END,
+             l.triggers = CASE WHEN $triggers IS NULL THEN l.triggers ELSE $triggers END)
        WITH l WHERE $l.projectKey IS NOT NULL
        MERGE (p:Project {key: $l.projectKey})
        MERGE (l)-[:APPLIES_TO]->(p)`,
-      { l, now, checks: l.checks == null ? null : JSON.stringify(l.checks), run: input.run?.id ?? null, sandbox: input.run?.sandbox ? true : null },
+      { l: { ...l, triggers: undefined }, now, checks: l.checks == null ? null : JSON.stringify(l.checks), triggers: l.triggers ? JSON.stringify(l.triggers) : null, run: input.run?.id ?? null, sandbox: input.run?.sandbox ? true : null },
     );
   }
 }
@@ -815,11 +961,11 @@ const LEARNED_IN = (v: string) => `($projectKeys IS NULL OR coalesce(${v}.projec
 
 /**
  * Lesson.from, for a lesson `l` and its feedback's turn `t` (null for memory and manual lessons). The turn's external
- * ref is JSON text: its source key says GitHub or Linear.
+ * ref is JSON text: its source key says GitHub or Linear. A report_feedback turn's uuid starts with `manual:`.
  */
 const FROM = `CASE WHEN l.source IN ['memory', 'manual', 'demo'] THEN l.source
   WHEN t.external IS NOT NULL AND t.external CONTAINS '"source":"linear"' THEN 'linear'
-  WHEN t.external IS NOT NULL THEN 'github' ELSE 'session' END`;
+  WHEN t.external IS NOT NULL THEN 'github' WHEN t.uuid STARTS WITH 'manual:' THEN 'agent' ELSE 'session' END`;
 
 function lessonOf(p: Record<string, unknown>, from?: LessonFrom | null): Lesson {
   return {
@@ -845,5 +991,8 @@ function lessonOf(p: Record<string, unknown>, from?: LessonFrom | null): Lesson 
     ...(typeof p.run === 'string' && { run: p.run }),
     ...(p.sandbox === true && { sandbox: true as const }),
     ...(typeof p.proposedAs === 'string' && { proposedAs: JSON.parse(p.proposedAs) as LessonDraft }),
+    ...(typeof p.triggers === 'string' && { triggers: JSON.parse(p.triggers) as LessonTriggers }),
+    ...(typeof p.servingWeight === 'number' && { servingWeight: p.servingWeight }),
+    ...(typeof p.splitFrom === 'string' && { splitFrom: p.splitFrom }),
   };
 }

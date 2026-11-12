@@ -1,6 +1,7 @@
 import type { HumanTurn, ParsedSession, ToolCall } from '@fb/core';
 import { isGitCommit, redactSecrets } from '@fb/core';
 import { addInstructionFiles, claudeInstructionFiles } from './instructions.ts';
+import { storableTimestamp } from './timestamps.ts';
 
 const MAX_ASSISTANT_CHARS = 2000;
 
@@ -55,6 +56,12 @@ export function parseTranscript(text: string, sourceFile: string): ParsedSession
   for (const line of text.split('\n')) {
     const rec = parseLine(line);
     if (!rec?.sessionId || !rec.timestamp) continue;
+    // A time no store can hold is the session's latest so far; a session's first record without one is skipped.
+    if (!storableTimestamp(rec.timestamp)) {
+      const latest = sessions.get(rec.sessionId)?.session.endedAt;
+      if (!latest) continue;
+      rec.timestamp = latest;
+    }
 
     const state = sessionFor(sessions, rec, sourceFile);
     const s = state.session;

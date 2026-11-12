@@ -1,7 +1,7 @@
 import { archiveRedactionInput } from '@fb/core';
 import type { Hono } from 'hono';
 import { z } from 'zod';
-import { EXPORT_FORMAT, FACT_KINDS, LESSON_CHECKS, redactDeep, type ActivityStore, type PortabilityStore, type EmbeddedFact, type FactsStore, type KnowledgeStore, type LessonInput, type LessonStatus } from '@fb/core';
+import { EXPORT_FORMAT, FACT_KINDS, LESSON_CHECKS, MAX_TRIGGERS, triggerShapeProblem, redactDeep, type ActivityStore, type PortabilityStore, type EmbeddedFact, type FactsStore, type KnowledgeStore, type LessonInput, type LessonStatus } from '@fb/core';
 
 /**
  * POST /api/import: an export bundle (GET /api/export) back into a store, on this or another machine, either backend.
@@ -33,6 +33,20 @@ const EMBED_BATCH = 64;
 
 const Key = z.string().min(1).max(200).regex(/^\w[\w.-]*$/, 'a project folder name').refine((k) => !k.includes('..'), 'a project folder name');
 
+/** A lesson's triggers as an owner may write them: each one checked by its shape (triggerShapeProblem). */
+export const Triggers = z.object({
+  paths: z.array(z.string()).max(MAX_TRIGGERS).default([]),
+  patterns: z.array(z.string()).max(MAX_TRIGGERS).default([]),
+  symbols: z.array(z.string()).max(MAX_TRIGGERS).default([]),
+}).strict().superRefine((t, ctx) => {
+  for (const [kind, key] of [['path', 'paths'], ['pattern', 'patterns'], ['symbol', 'symbols']] as const) {
+    t[key].forEach((v, i) => {
+      const why = triggerShapeProblem(kind, v);
+      if (why) ctx.addIssue({ code: z.ZodIssueCode.custom, path: [key, i], message: `${kind} ${JSON.stringify(v.slice(0, 80))}: ${why}` });
+    });
+  }
+}).transform((t) => ({ paths: t.paths.map((v) => v.trim()), patterns: t.patterns.map((v) => v.trim()), symbols: t.symbols.map((v) => v.trim()) }));
+
 // Unknown fields are dropped (zod's default): a newer export may add fields without bumping schemaVersion.
 const Lesson = z.object({
   id: z.string().min(1).max(300).regex(/^[\w:.@/-]+$/, 'a lesson id').refine((k) => !k.includes('..'), 'a lesson id'),
@@ -44,7 +58,8 @@ const Lesson = z.object({
   paths: z.array(z.string().max(300)).max(50).default([]),
   status: z.enum(['proposed', 'approved', 'rejected', 'revoked', 'superseded']),
   source: z.enum(['postmortem', 'memory', 'manual', 'demo']).default('postmortem'),
-  checks: z.array(z.object({ name: z.enum(LESSON_CHECKS), why: z.string().max(4000), of: z.string().max(300).optional() })).max(100).nullable().optional(),
+  checks: z.array(z.object({ name: z.enum(LESSON_CHECKS), why: z.string().max(4000), of: z.string().max(300).optional(), suggestion: z.string().max(1000).optional() })).max(100).nullable().optional(),
+  triggers: Triggers.nullable().optional(),
 });
 
 const Fact = z.object({
@@ -89,7 +104,9 @@ export async function importBundle(raw: ImportBundle, o: { keepApproved: boolean
   // Redact again: the bundle may come from an older version, another machine, or have been edited by hand.
   const b = redactDeep(raw);
   const never = new Set(d.excluded);
-  if (!d.portability?.restorePrivateProject && b.projects.some(p => p.demoCreated && !never.has(p.key))) throw new Error('this importer cannot preserve private-project provenance; upgrade before importing the bundle');
+  const privates = b.projects.filter((p) => p.demoCreated && !never.has(p.key));
+  const restore = d.portability?.restorePrivateProject?.bind(d.portability);
+  if (privates.length && !restore) throw new Error('this importer cannot preserve private-project provenance; upgrade before importing the bundle');
   await archiveRedactionInput('import', raw.projectKey ?? 'bundle', raw, b);
   const r: ImportResult = {
     lessons: { added: 0, approved: 0, proposed: 0, existing: 0, excluded: 0, skipped: 0 },
@@ -97,11 +114,7 @@ export async function importBundle(raw: ImportBundle, o: { keepApproved: boolean
     notImported: { misses: b.misses.length, docs: b.docs.length, codeFiles: b.codeFiles.length },
   };
 
-  for (const project of b.projects) {
-    if (!project.demoCreated || never.has(project.key)) continue;
-    if (!d.portability?.restorePrivateProject) throw new Error('this importer cannot preserve private-project provenance; upgrade before importing the bundle');
-    await d.portability.restorePrivateProject({ key: project.key, remote: project.remote });
-  }
+  for (const project of privates) await restore!({ key: project.key, remote: project.remote });
 
   const fresh: (z.infer<typeof Lesson> & { next: LessonStatus })[] = [];
   const seen = new Set<string>();
@@ -121,6 +134,7 @@ export async function importBundle(raw: ImportBundle, o: { keepApproved: boolean
       id: l.id, projectKey: l.scope === 'global' ? null : l.projectKey, title: l.title, rule: l.rule, appliesWhen: l.appliesWhen,
       scope: l.scope, paths: l.paths, status: l.next, source: l.source, embedding: lessonVectors[i],
       ...(l.checks != null && { checks: l.checks }),
+      ...(l.triggers != null && { triggers: l.triggers }),
     };
     await d.knowledge.upsertLesson(input);
     added.push(l.id);
@@ -154,7 +168,7 @@ export async function importBundle(raw: ImportBundle, o: { keepApproved: boolean
     subject: `imported ${n(r.lessons.added, 'lesson')} (${r.lessons.approved} approved, ${r.lessons.proposed} proposed${r.lessons.revoked ? `, ${r.lessons.revoked} revoked` : ''}) and ${n(r.facts.added, 'fact')} from a bundle exported ${b.exportedAt.slice(0, 10) || 'at an unknown time'}`,
     why: o.keepApproved
       ? 'you imported a bundle and kept its approved lessons approved, so agents are given them now'
-      : 'you imported a bundle; live lessons are proposed and reach agents only once you approve them; revoked lessons stay withdrawn',
+      : 'you imported a bundle; live lessons are proposed and reach agents only once approved; revoked lessons stay withdrawn',
     details: { ...r, keepApproved: o.keepApproved, toolVersion: b.toolVersion, exportedAt: b.exportedAt, bundleProject: b.projectKey },
     targets: added,
   });

@@ -142,7 +142,7 @@ describe('createEventHub', () => {
 
 // ── GET /api/events ──────────────────────────────────────────────────────
 
-const repo = { listCandidates: async () => [], candidateDetail: async () => null, decide: async () => {}, stats: async () => [] } as ApiRepo;
+const repo = { undoDecision: async () => false, listCandidates: async () => [], candidateDetail: async () => null, decide: async () => {}, stats: async () => [] } as ApiRepo;
 const beat = (name: string): WorkerStatus => ({
   version: 'x', startedAt: 't', lastBeat: new Date().toISOString(), lastCycleAt: null, lastCycle: null, lastError: null, providers: {},
   stage: { name, startedAt: 't', current: null, done: null, total: null },

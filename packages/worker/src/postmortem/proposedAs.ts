@@ -46,7 +46,7 @@ export function writerDraftFromActivity(current: Lesson, rows: Activity[]): Less
 }
 
 export type ProposedAsDeps = {
-  knowledge: Pick<KnowledgeStore, 'listLessons'> & Partial<Pick<KnowledgeStore, 'backfillProposedAs'>>;
+  knowledge: Pick<KnowledgeStore, 'listLessons'> & Pick<KnowledgeStore, 'backfillProposedAs'>;
   activity: Pick<ActivityStore, 'list' | 'record'>;
   cursors: Pick<DocsStore, 'getCursor' | 'setCursor'>;
   log?: (msg: string, extra?: object) => void;
@@ -54,10 +54,9 @@ export type ProposedAsDeps = {
 
 export type ProposedAsResult = { examined: number; filled: number; approved: number; rejected: number; proposed: number };
 
-/** At worker start. Null: done for this version already, or the store cannot keep a draft. A failure leaves the version. */
+/** At worker start. Null: done for this version already. A failure leaves the version. */
 export async function backfillProposedAs(d: ProposedAsDeps): Promise<ProposedAsResult | null> {
   const stamp = `v${PROPOSED_AS_BACKFILL_VERSION}`;
-  if (!d.knowledge.backfillProposedAs) return null;
   if ((await d.cursors.getCursor(PROPOSED_AS_CURSOR)) === stamp) return null;
   const todo = (await d.knowledge.listLessons({ limit: MAX_LESSONS })).filter((l) => l.source === 'postmortem' && !l.proposedAs && ['approved', 'rejected', 'proposed'].includes(l.status));
   const r: ProposedAsResult = { examined: todo.length, filled: 0, approved: 0, rejected: 0, proposed: 0 };

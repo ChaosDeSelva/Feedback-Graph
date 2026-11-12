@@ -200,7 +200,7 @@ export function linearThread(comments: LinearComment[], floorMs: number, linked:
   const ticket = {
     state: field(issue.state),
     priority: field(issue.priority),
-    labels: (issue.labels ?? []).slice(0, MAX_LABELS).map((l) => clip(redactSecrets(l), LABEL_CAP)),
+    labels: issue.labels.slice(0, MAX_LABELS).map((l) => clip(redactSecrets(l), LABEL_CAP)),
     assignee: field(issue.assignee),
   };
   return {

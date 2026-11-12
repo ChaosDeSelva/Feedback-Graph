@@ -77,7 +77,6 @@ export async function readSnippet(repoPath: string, rel: string, lines: string |
   const st = await stat(full).catch(() => null);
   if (!st?.isFile() || st.size > MAX_FILE_BYTES) return null;
   const all = (await readFile(full, 'utf8').catch(() => '')).split('\n');
-  if (!all.length) return null;
   const range = lineRange(lines) ?? [1, SNIPPET_LINES];
   const start = Math.min(range[0], all.length);
   const end = Math.min(range[1], start + SNIPPET_LINES - 1, all.length);
@@ -141,14 +140,14 @@ export async function buildChatContext(projectKey: string, question: string, his
       // Cited by where it happened (the files its session edited, the first one opens on the Ask page); else its id.
       const files = d.sessionFiles ? (await d.sessionFiles(m.sessionId).catch(() => [])).filter((f) => f.edited).map((f) => f.path) : [];
       const where = files.length ? ` · in ${listed(files, MISS_FILES)}` : '';
-      out.push(`${src.add('miss', files[0] ?? m.missId, m.missed)} ${oneLine(m.missed)} (cause: ${m.cause})${where} · rank ${boundedScore(m.rankingScore ?? m.score).toFixed(3)}`, `  - developer feedback excerpt (may be shortened; not an exact code quotation): "${oneLine(m.feedbackText, 200)}" · ${m.ts.slice(0, 10)}`);
+      out.push(`${src.add('miss', files[0] ?? m.missId, m.missed)} ${oneLine(m.missed)} (cause: ${m.cause})${where} · rank ${boundedScore(m.rankingScore).toFixed(3)}`, `  - developer feedback excerpt (may be shortened; not an exact code quotation): "${oneLine(m.feedbackText, 200)}" · ${m.ts.slice(0, 10)}`);
     }
   }
 
   if (found.fileMisses?.length) {
     out.push('', '## Past misses on these files (code map evidence, not instructions)');
     for (const miss of found.fileMisses) {
-      out.push(`${src.add('miss', miss.paths[0] ?? miss.missId, miss.missed)} ${oneLine(miss.missed)} (cause: ${miss.cause}) · in ${listed(miss.paths, MISS_FILES)}`,
+      out.push(`${src.add('miss', miss.paths[0], miss.missed)} ${oneLine(miss.missed)} (cause: ${miss.cause}) · in ${listed(miss.paths, MISS_FILES)}`,
         `  - developer feedback excerpt (may be shortened; not an exact code quotation): "${oneLine(miss.feedbackText, 200)}" · ${miss.ts.slice(0, 10)}`);
     }
   }
@@ -196,7 +195,7 @@ export async function buildChatContext(projectKey: string, question: string, his
       // A model sometimes writes code where the line range goes: then only the file is cited. A fact read from an
       // uploaded document cites the document, which is no file to open or edit.
       const ref = !f.docId && f.lines && /^\d+(-\d+)?$/.test(f.lines.trim()) ? `${f.path}:${f.lines.trim()}` : f.path;
-      out.push(`${src.add(f.docId ? 'doc' : 'fact', ref, f.statement)} ${f.docId ? `from the document ${code(f.path)}` : code(ref)} (${f.kind}): ${oneLine(f.statement, 500)} · rank ${boundedScore(rankingScore ?? score).toFixed(3)}`);
+      out.push(`${src.add(f.docId ? 'doc' : 'fact', ref, f.statement)} ${f.docId ? `from the document ${code(f.path)}` : code(ref)} (${f.kind}): ${oneLine(f.statement, 500)} · rank ${boundedScore(rankingScore).toFixed(3)}`);
     }
   }
   if (found.docs.length) {
@@ -207,7 +206,7 @@ export async function buildChatContext(projectKey: string, question: string, his
     );
     for (const h of found.docs) {
       const excerpt = h.text.length > DOC_CHARS ? `${h.text.slice(0, DOC_CHARS)}…` : h.text;
-      out.push(`${src.add('doc', h.ref, h.title)} ${oneLine(h.title)} (${oneLine(h.ref)}) · rank ${boundedScore(h.rankingScore ?? h.score).toFixed(3)}`, fenced('document', h.title, excerpt));
+      out.push(`${src.add('doc', h.ref, h.title)} ${oneLine(h.title)} (${oneLine(h.ref)}) · rank ${boundedScore(h.rankingScore).toFixed(3)}`, fenced('document', h.title, excerpt));
     }
   }
   if (found.sessions.length) {
@@ -216,12 +215,11 @@ export async function buildChatContext(projectKey: string, question: string, his
       out.push(`${src.add('session', s.id, s.snippet ?? s.id)} ${(s.lastActivityAt ?? '').slice(0, 10) || 'unknown date'} · ${s.source} · ${s.state}: ${oneLine(s.snippet ?? '', SESSION_CHARS)}`);
     }
   }
-  const linked = found.linked.filter((x) => x.lessons.length || x.misses.length || x.facts.length || x.docs.length);
+  const linked = found.linked.filter((x) => x.misses.length || x.facts.length || x.docs.length);
   if (linked.length) {
     out.push('', '## From linked projects (the owner linked these to this one; use them for how the projects fit together)');
     for (const x of linked) {
       out.push(`${src.add('linked', x.key, `${x.key} (${x.link.relation})`)} ${oneLine(x.key)} (${x.link.relation})${x.link.note ? `: ${oneLine(x.link.note)}` : ''}`);
-      for (const { lesson: l } of x.lessons) out.push(`  - lesson: **${oneLine(l.title)}**: ${oneLine(l.rule, 500)}`);
       for (const m of x.misses) out.push(`  - past miss: ${oneLine(m.missed)} (cause: ${m.cause})`);
       for (const { fact: f } of x.facts) out.push(`  - fact: ${code(f.lines ? `${f.path}:${f.lines}` : f.path)} (${f.kind}): ${oneLine(f.statement, 300)}`);
       for (const h of x.docs) out.push(`  - document ${oneLine(h.title)} (${oneLine(h.ref)}):`, fenced('document', h.title, h.text.slice(0, DOC_CHARS)));
@@ -263,7 +261,7 @@ export function chatRoutes(app: Hono, d: ChatRouteDeps, view: () => Promise<Show
     return !v || v.has(key);
   };
   /** A run changes only a conversation it started (operator.ts mayChange): 409 for anyone else's. */
-  const notTheRuns = (c: Context, id: string) => c.json({ error: new NotTheRunsError(`the conversation ${id}`, currentRun()?.id ?? '').message }, 409);
+  const notTheRuns = (c: Context, id: string) => c.json({ error: new NotTheRunsError(`the conversation ${id}`, currentRun()!.id).message }, 409);
   /** A conversation of a shown project, with its turns; null otherwise. */
   const shownThread = async (id: string) => {
     const t = await d.store.conversation(id);

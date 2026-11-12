@@ -1,5 +1,5 @@
 import { expect, test, vi } from 'vitest';
-import { Admission } from './admission.ts';
+import { Admission, type QueueInfo } from './admission.ts';
 
 /** A call that ends when released. */
 function gate<T>(value: T) {
@@ -33,14 +33,24 @@ test('runs up to `concurrency` calls at once; the rest wait their turn, first co
 
 test('a call still waiting at the deadline answers "timeout" at once and leaves the queue; nothing hangs', async () => {
   const a = new Admission({ concurrency: 1, timeoutMs: 30 });
-  const g = gate('slow');
-  const first = a.run(g.fn);
-  const t = Date.now();
-  expect(await a.run(async () => 'never')).toMatchObject({ ok: false, ahead: 1 });
-  expect(Date.now() - t).toBeLessThan(500);
-  expect(a.waiting).toBe(0);
-  g.release();
-  await first;
+  // The deadline runs on fake timers: the waiting call answers when it passes, however busy the machine is.
+  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+  try {
+    const g = gate('slow');
+    const first = a.run(g.fn);
+    let answered = false;
+    const waiting = a.run(async () => 'never').finally(() => { answered = true; });
+    await vi.advanceTimersByTimeAsync(29);
+    expect(answered).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(answered).toBe(true);
+    expect(await waiting).toMatchObject({ ok: false, ahead: 1 });
+    expect(a.waiting).toBe(0);
+    g.release();
+    await first;
+  } finally {
+    vi.useRealTimers();
+  }
 });
 
 test('a call running past the deadline answers "timeout"; its slot stays taken until it really ends', async () => {
@@ -382,7 +392,7 @@ test('one extreme outlier does not dominate ETA after a useful sample exists', a
       const call = admission.run(() => new Promise(resolve => setTimeout(resolve, duration)));
       await vi.advanceTimersByTimeAsync(duration); await call;
     }
-    expect(admission.snapshot().estimate.completionMs[1]).toBe(250);
+    expect(admission.snapshot().estimate.completionMs[1]).toBe(100);
   } finally { vi.useRealTimers(); }
 });
 
@@ -397,5 +407,111 @@ test('a timed-out join renews retry priority from the latest attempt', async () 
     await vi.advanceTimersByTimeAsync(95);
     expect(admission.snapshot().nextRetryPosition).toBe(1);
     held.release(); await original;
+  } finally { vi.useRealTimers(); }
+});
+
+test('a kept-alive call that fails after its caller got a queued reply is not replayed to retries', async () => {
+  vi.useFakeTimers(); vi.setSystemTime(0);
+  try {
+    const admission = new Admission({ concurrency: 1, timeoutMs: 1000 });
+    let calls = 0;
+    const first = admission.run(async () => { calls++; await new Promise(resolve => setTimeout(resolve, 40)); throw new Error('provider 503'); }, { retryKey: 'same', deadline: 10 });
+    await vi.advanceTimersByTimeAsync(10);
+    expect(await first).toMatchObject({ ok: false, ran: true });
+    await vi.advanceTimersByTimeAsync(40);
+    const retry = admission.run(async () => { calls++; return 'fresh verdict'; }, { retryKey: 'same', deadline: 500 });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(await retry).toMatchObject({ ok: true, value: 'fresh verdict' });
+    expect(calls).toBe(2);
+  } finally { vi.useRealTimers(); }
+});
+
+async function trained(admission: Admission, durations: number[]) {
+  for (const duration of durations) {
+    const call = admission.run(() => new Promise(resolve => setTimeout(resolve, duration)));
+    await vi.advanceTimersByTimeAsync(duration); await call;
+  }
+}
+
+test('Retry-After for a kept-alive call follows its remaining service, not a fresh place behind newer waiters', async () => {
+  vi.useFakeTimers(); vi.setSystemTime(0);
+  try {
+    const admission = new Admission({ concurrency: 1, timeoutMs: 10_000 });
+    await trained(admission, Array(10).fill(1000));
+    const states: QueueInfo[] = [];
+    // 600 ms of response budget cannot hold a 1 s median: the call starts, and the answer comes at once, not at 600 ms.
+    const kept = admission.run(() => new Promise(resolve => setTimeout(resolve, 1000, 'verdict')), { retryKey: 'same', deadline: Date.now() + 600, onState: s => states.push(s) });
+    const waiters = [1, 2, 3].map(() => admission.run(async () => 'other'));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(await kept).toMatchObject({ ok: false, ran: true });
+    const last = states.at(-1)!;
+    expect(last).toMatchObject({ state: 'retry_required', inFlight: { elapsedMs: 0 }, retryAfterMs: 1000, estimate: { startMs: [0, 0], completionMs: [1000, 1000] } });
+    await vi.advanceTimersByTimeAsync(1000);
+    const retryStates: QueueInfo[] = [];
+    expect(await admission.run(async () => 'duplicate', { retryKey: 'same', onState: s => retryStates.push(s) })).toMatchObject({ ok: true, value: 'verdict' });
+    expect(retryStates.at(-1)?.observed).toMatchObject({ shared: 'reused', waitedMs: 0, serviceMs: 0 });
+    await vi.advanceTimersByTimeAsync(3000); await Promise.all(waiters);
+  } finally { vi.useRealTimers(); }
+});
+
+test('Retry-After for a kept-alive call past its median stays within its own completion window', async () => {
+  vi.useFakeTimers(); vi.setSystemTime(0);
+  try {
+    const admission = new Admission({ concurrency: 1, timeoutMs: 10_000 });
+    await trained(admission, [3000, 3000, 3000, 4000, 4000, 4000, 4000, 5000, 5000, 5000]);
+    const states: QueueInfo[] = [];
+    const kept = admission.run(() => new Promise(resolve => setTimeout(resolve, 4800, 'verdict')), { retryKey: 'same', deadline: Date.now() + 4500, onState: s => states.push(s) });
+    await vi.advanceTimersByTimeAsync(4500);
+    expect(await kept).toMatchObject({ ok: false, ran: true });
+    // Every observed call that ran past 4.5 s took 5 s: 500 ms left, not "between 0 and 500".
+    expect(states.at(-1)).toMatchObject({ state: 'retry_required', inFlight: { elapsedMs: 4500 }, retryAfterMs: 1000, estimate: { completionMs: [500, 500] } });
+    await vi.advanceTimersByTimeAsync(300);
+  } finally { vi.useRealTimers(); }
+});
+
+test('a joiner is labelled as joined, and one timing out is told the call is still in flight', async () => {
+  vi.useFakeTimers(); vi.setSystemTime(0);
+  try {
+    const admission = new Admission({ concurrency: 1, timeoutMs: 10_000 });
+    await trained(admission, Array(10).fill(1000));
+    const original = admission.run(() => new Promise(resolve => setTimeout(resolve, 1000, 'verdict')), { retryKey: 'same' });
+    await vi.advanceTimersByTimeAsync(200);
+    const late: QueueInfo[] = [];
+    const timedOut = admission.run(async () => 'duplicate', { retryKey: 'same', deadline: Date.now() + 100, onState: s => late.push(s) });
+    const joined: QueueInfo[] = [];
+    const joiner = admission.run(async () => 'duplicate', { retryKey: 'same', onState: s => joined.push(s) });
+    await vi.advanceTimersByTimeAsync(100);
+    expect(await timedOut).toMatchObject({ ok: false, ran: true });
+    expect(late.at(-1)).toMatchObject({ state: 'retry_required', inFlight: { elapsedMs: 300 }, retryAfterMs: 1000 });
+    await vi.advanceTimersByTimeAsync(700);
+    expect(await joiner).toMatchObject({ ok: true, value: 'verdict' });
+    expect(joined.at(-1)?.observed).toEqual({ shared: 'joined', waitedMs: 0, serviceMs: 800 });
+    await original;
+  } finally { vi.useRealTimers(); }
+});
+
+test('a joiner released when its queued original expires reports its whole wait', async () => {
+  vi.useFakeTimers(); vi.setSystemTime(0);
+  try {
+    const admission = new Admission({ concurrency: 1, timeoutMs: 1000 });
+    const held = gate('held'); const active = admission.run(held.fn);
+    const original = admission.run(async () => 'old', { retryKey: 'same', deadline: 200 });
+    const joiner = admission.run(async () => 'replacement', { retryKey: 'same', deadline: 900 });
+    await vi.advanceTimersByTimeAsync(300);
+    held.release(); await active; await vi.advanceTimersByTimeAsync(0);
+    expect(await original).toMatchObject({ ok: false });
+    expect(await joiner).toMatchObject({ ok: true, value: 'replacement', waitedMs: 300 });
+  } finally { vi.useRealTimers(); }
+});
+
+test('a call slower than the observed tail still bounds the upper estimate by its own service deadline', async () => {
+  vi.useFakeTimers(); vi.setSystemTime(0);
+  try {
+    const admission = new Admission({ concurrency: 1, timeoutMs: 1000 });
+    await trained(admission, [100]);
+    const held = gate('slow'); const active = admission.run(held.fn);
+    await vi.advanceTimersByTimeAsync(300);
+    expect(admission.snapshot().estimate).toMatchObject({ overdue: false, startMs: [0, 700] });
+    held.release(); await active;
   } finally { vi.useRealTimers(); }
 });

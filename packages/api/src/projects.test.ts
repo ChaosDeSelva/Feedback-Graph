@@ -23,7 +23,7 @@ function setup(projects = [summary('alpha', 5)], dirs: { key: string; name: stri
     facts,
     embed: async (t) => t.map(() => [1]),
     projectDirs: async () => dirs,
-    activity: { record: async (a) => { activity.push(a); }, list: async () => [] },
+    activity: { removeRun: async () => 0, record: async (a) => { activity.push(a); }, list: async () => [] },
   });
   return { app, calls, activity };
 }
@@ -227,4 +227,22 @@ test('only a queued scan in the requested project can be cancelled', async () =>
   expect((await app.request('/api/projects/beta/scan/scan:1/cancel', json('POST', {}))).status).toBe(409);
   expect((await app.request('/api/projects/other/scan/scan:1/cancel', json('POST', {}))).status).toBe(404);
   expect(cancelled).toBe(1);
+});
+
+test('a scan of a folder that is under a root but not selected says to select it, not that there is no such folder', async () => {
+  const app = createApp(repo, {
+    auth: { ownerToken: OWNER },
+    facts: { listProjects: async () => [], requestScan: async () => ({ id: 'scan:1', status: 'queued' }) as never, listFacts: async () => [], searchFacts: async () => [] },
+    // projectDirs lists the selected folders only; Settings lists every folder under the roots, vault4 among them.
+    projectDirs: async () => [{ key: 'alpha', name: 'alpha', repoPath: '/vibe/alpha' }],
+    settings: { folders: async () => [{ key: 'alpha', path: '/h/alpha' }, { key: 'vault4', path: '/h/vault4' }], selection: {} as never, excluded: [], roots: ['/h'] },
+  });
+  const single = await app.request('/api/projects/vault4/scan', json('POST', {}));
+  expect(single.status).toBe(404);
+  expect(((await single.json()) as { error: string }).error).toBe('vault4 is not selected: choose it in Settings first (fg projects select --key vault4)');
+  const batch = (await (await app.request('/api/projects/scan', json('POST', { keys: ['vault4', 'gone'] }))).json()) as { results: { key: string; error: string }[] };
+  expect(batch.results.map((r) => [r.key, r.error])).toEqual([
+    ['vault4', 'vault4 is not selected: choose it in Settings first (fg projects select --key vault4)'],
+    ['gone', 'no such folder under the configured roots'],
+  ]);
 });

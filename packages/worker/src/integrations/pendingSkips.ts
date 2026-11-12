@@ -115,10 +115,10 @@ export async function skipMatchingPending(d: PendingSkipDeps & { why: string }):
  */
 export function describeStampChange(last: string | null, now: string): string {
   const parse = (s: string) => /^v(\d+) ([0-9a-f]+)$/.exec(s);
-  const b = parse(now);
-  if (!last) return `the skip rules (${b ? `version ${b[1]}` : now}) had not been run over the Inbox yet`;
+  const b = parse(now)!; // skipRulesStamp's
+  if (!last) return `the skip rules (version ${b[1]}) had not been run over the Inbox yet`;
   const a = parse(last);
-  if (!a || !b) return `the skip rules changed (${last} to ${now})`;
+  if (!a) return `the skip rules changed (${last} to ${now})`;
   const version = a[1] !== b[1] ? `the skip rules changed from version ${a[1]} to ${b[1]}` : null;
   const logins = a[2] !== b[2] ? `the bot or agent login lists changed (${a[2]} to ${b[2]}` : null;
   if (version && logins) return `${version} and ${logins})`;

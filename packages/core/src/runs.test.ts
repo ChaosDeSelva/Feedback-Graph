@@ -1,5 +1,5 @@
 import { expect, test } from 'vitest';
-import { runItems, runRemoval, runWriteOwner } from './runs.ts';
+import { removedCounts, runItems, runRemoval, runWriteOwner } from './runs.ts';
 import { docIdOf } from './graph/docs.ts';
 import { linkEnds, linkIdOf } from './graph/links.ts';
 import { NotTheRunsError } from './types.ts';
@@ -59,4 +59,8 @@ test("a sandbox run's document and link ids are its own, and still name the proj
   expect(linkEnds('link@sbx-1:shop|web')).toEqual(['shop', 'web']);
   expect(linkEnds(linkIdOf('web', 'shop'))).toEqual(['shop', 'web']);
   expect(linkEnds('doc:shop')).toBeNull();
+});
+
+test('removedCounts reports every kind, zero for those a delete did not mention', () => {
+  expect(removedCounts({ lesson: 2, chat: 1 })).toEqual({ feedback: 0, lesson: 2, miss: 0, predone_check: 0, fact: 0, doc: 0, link: 0, chat: 1 });
 });

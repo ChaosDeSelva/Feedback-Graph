@@ -73,7 +73,7 @@ test('standalone comments cannot create a runtime gap after both model attempts'
   const judge = makeJudge({ id: 'test', agentic: false, json: async () => ({ verdicts: [{ lessonId: 'L1', status: 'not_addressed', applies: true, why: 'The timestamp behavior is wrong.', evidence: ['+// UTC timestamps are equal'] }] }) });
   const result = await checkBeforeDone({ project: 'demo', task: 'edit src/routes.ts', summary: 'done', filesChanged: ['src/routes.ts'], diff: diff.replace('+db.raw().list();', '+// UTC timestamps are equal') }, {
     roots: [{ host: '/projects', container: '/projects' }], exists: () => true, embed: async () => [[1]],
-    k: { searchLessons: async () => policy, relatedMisses: async () => [], createManualFeedback: async () => 'f', recordPreDoneCheck: async () => {} }, judge,
+    k: { searchLessons: async () => policy, missesNaming: async () => [], relatedMisses: async () => [], createManualFeedback: async () => 'f', recordPreDoneCheck: async () => {} }, judge,
   });
   expect(result.gaps).toEqual([]);
   expect(result.cannotTell).toHaveLength(1);

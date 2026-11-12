@@ -71,3 +71,16 @@ test('a Linear ticket reaches a post-mortem only when linked to its project: its
   expect(blog.lines).toEqual([]);
   expect(blog.logged).toContainEqual(expect.objectContaining({ project: 'blog', count: 4 }));
 });
+
+test('without Linear, a long document excerpt is clipped to one line, and a failing source is logged', async () => {
+  const logs: [string, object | undefined][] = [];
+  const text = 'Orders\nare scoped. ' + 'x'.repeat(600);
+  const lines = await huntContext(input, {
+    embed: async (t) => t.map(() => [1]),
+    facts: { searchFacts: async () => { throw new Error('index missing'); } },
+    docs: { searchDocs: async () => [{ source: 'upload', ref: 'spec.md', title: 'Spec', text, score: 1 }] as never },
+    log: (m, x) => logs.push([m, x]),
+  });
+  expect(lines).toEqual([`upload spec.md (Spec): ${text.slice(0, 500).replace(/\s+/g, ' ')}…`]);
+  expect(logs).toEqual([['context hunt source failed', { source: 'facts', error: 'Error: index missing' }]]);
+});

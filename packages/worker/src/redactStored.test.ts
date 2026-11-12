@@ -12,6 +12,15 @@ const logged = (over: Partial<Activity>): Activity => ({
   subject: 's', why: 'w', details: {}, targets: [], ...over,
 });
 
+const ZERO = {
+  facts: { reopenInstructionFacts: async () => 0, redactStoredFacts: async () => ({ redacted: 0, closed: 0, owner: 0, instructions: 0 }) },
+  knowledge: { redactStoredLessons: async () => ({ redacted: 0, flagged: 0 }), redactStoredMisses: async () => 0 },
+  graph: { redactStoredCandidates: async () => 0 },
+  sessions: { redactStoredSummaries: async () => 0 },
+  chats: { redactStoredTurns: async () => 0 },
+  decisions: { redactStoredDecisions: async () => 0 },
+} satisfies Partial<RedactStoredDeps>;
+
 function deps(over: Partial<RedactStoredDeps> = {}, history: Activity[] = []) {
   const cursors = kv();
   const activity: ActivityInput[] = [];
@@ -31,6 +40,7 @@ function deps(over: Partial<RedactStoredDeps> = {}, history: Activity[] = []) {
     graph: { redactStoredCandidates: async () => { calls.push('candidates'); return 5; } },
     sessions: { redactStoredSummaries: async () => { calls.push('sessions'); return 1; } },
     chats: { redactStoredTurns: async () => { calls.push('chats'); return 3; } },
+    decisions: { redactStoredDecisions: async () => { calls.push('decisions'); return 2; } },
     activity: {
       record: async (a) => { activity.push(a); },
       list: async (q) => { calls.push(`list:${q.kind}`); return history; },
@@ -42,7 +52,7 @@ function deps(over: Partial<RedactStoredDeps> = {}, history: Activity[] = []) {
   return { d, cursors, activity, calls, logs };
 }
 
-const ALL = { facts: 3, closed: 2, ownerFacts: 1, instructionFacts: 1, reopenedFacts: 2, chunks: 4, lessons: 1, lessonsFlagged: 2, misses: 2, candidates: 5, sessions: 1, chatTurns: 3, activity: 6 };
+const ALL = { facts: 3, closed: 2, ownerFacts: 1, instructionFacts: 1, reopenedFacts: 2, chunks: 4, lessons: 1, lessonsFlagged: 2, misses: 2, candidates: 5, sessions: 1, chatTurns: 3, decisions: 2, activity: 6 };
 
 describe('redactStoredOnRuleChange', () => {
   test('runs the current rules once over every kind of stored text and says, per kind, what changed', async () => {
@@ -50,11 +60,11 @@ describe('redactStoredOnRuleChange', () => {
     expect(await redactStoredOnRuleChange(t.d)).toEqual(ALL);
     // The Activity log is redacted before the entry about it is written.
     // Facts an older rule closed as instructions are reopened before the current rule runs over them.
-    expect(t.calls).toEqual(['reopen', 'facts', 'docs', 'lessons', 'misses', 'candidates', 'sessions', 'chats', 'activity']);
+    expect(t.calls).toEqual(['reopen', 'facts', 'docs', 'lessons', 'misses', 'candidates', 'sessions', 'chats', 'decisions', 'activity']);
     expect(t.cursors.m.get(REDACTION_CURSOR)).toBe(`v${REDACTION_VERSION}`);
     expect(t.activity).toHaveLength(1);
     expect(t.activity[0]).toMatchObject({ kind: 'secrets_redacted', actor: 'deterministic', projectKey: null });
-    expect(t.activity[0].subject).toBe(`redaction rules v${REDACTION_VERSION} applied to stored data: 3 facts, 4 document texts, 1 lesson, 2 misses, 5 Inbox items, 1 session summary, 3 Ask messages, 6 Activity entries changed`);
+    expect(t.activity[0].subject).toBe(`redaction rules v${REDACTION_VERSION} applied to stored data: 3 facts, 4 document texts, 1 lesson, 2 misses, 5 Inbox items, 1 session summary, 3 Ask messages, 2 learning loop decisions and notes, 6 Activity entries changed`);
     expect(t.activity[0].why).toMatch(/2 facts that were credentials are no longer served/);
     expect(t.activity[0].why).toMatch(/1 fact you wrote kept, with only a known token shape redacted in it/);
     expect(t.activity[0].why).toMatch(/1 fact from an upload that was an instruction to the agent is no longer served/);
@@ -62,20 +72,20 @@ describe('redactStoredOnRuleChange', () => {
     // Approved lessons are the owner's: flagged, their text not changed.
     expect(t.activity[0].why).toMatch(/2 approved lessons may hold a secret: their text was not changed; they are flagged "may hold a secret" in Lessons for you to edit/);
     expect(t.activity[0].details).toEqual({
-      version: REDACTION_VERSION, previous: null, facts: 3, factsClosed: 2, ownerFacts: 1, instructionFacts: 1, reopenedFacts: 2, chunks: 4, lessons: 1, lessonsFlagged: 2, misses: 2, candidates: 5, sessions: 1, chatTurns: 3, activity: 6,
+      version: REDACTION_VERSION, previous: null, facts: 3, factsClosed: 2, ownerFacts: 1, instructionFacts: 1, reopenedFacts: 2, chunks: 4, lessons: 1, lessonsFlagged: 2, misses: 2, candidates: 5, sessions: 1, chatTurns: 3, decisions: 2, activity: 6,
     });
     expect(t.logs).toEqual([['redaction rules applied to stored data', { version: REDACTION_VERSION, previous: null, ...ALL }]]);
     // The next start: nothing to do.
     expect(await redactStoredOnRuleChange(t.d)).toBeNull();
-    expect(t.calls).toHaveLength(9);
+    expect(t.calls).toHaveLength(10);
   });
 
   test('only flagged lessons still get an Activity entry', async () => {
     const t = deps({
-      facts: { redactStoredFacts: async () => ({ redacted: 0, closed: 0, owner: 0, instructions: 0 }) },
+      facts: ZERO.facts,
       docs: { redactStoredDocs: async () => 0 },
-      knowledge: { redactStoredLessons: async () => ({ redacted: 0, flagged: 1 }) },
-      graph: {}, sessions: {}, chats: {},
+      knowledge: { ...ZERO.knowledge, redactStoredLessons: async () => ({ redacted: 0, flagged: 1 }) },
+      graph: ZERO.graph, sessions: ZERO.sessions, chats: ZERO.chats, decisions: ZERO.decisions,
     });
     t.d.activity!.redactStoredActivity = async () => 0;
     await redactStoredOnRuleChange(t.d);
@@ -85,9 +95,9 @@ describe('redactStoredOnRuleChange', () => {
 
   test('facts served again are reported even when no text changed', async () => {
     const t = deps({
-      facts: { reopenInstructionFacts: async () => 1, redactStoredFacts: async () => ({ redacted: 0, closed: 0, owner: 0, instructions: 0 }) },
+      facts: { ...ZERO.facts, reopenInstructionFacts: async () => 1 },
       docs: { redactStoredDocs: async () => 0 },
-      knowledge: {}, graph: {}, sessions: {}, chats: {},
+      knowledge: ZERO.knowledge, graph: ZERO.graph, sessions: ZERO.sessions, chats: ZERO.chats, decisions: ZERO.decisions,
     });
     t.d.activity!.redactStoredActivity = async () => 0;
     await redactStoredOnRuleChange(t.d);
@@ -97,21 +107,20 @@ describe('redactStoredOnRuleChange', () => {
 
   test('nothing changed is recorded as done without an Activity entry', async () => {
     const t = deps({
-      facts: { redactStoredFacts: async () => ({ redacted: 0, closed: 0, owner: 0, instructions: 0 }) },
+      facts: ZERO.facts,
       docs: { redactStoredDocs: async () => 0 },
-      knowledge: {},
-      graph: {},
-      sessions: {},
-      chats: {},
-      activity: { record: async () => { throw new Error('not expected'); } },
+      knowledge: ZERO.knowledge,
+      graph: ZERO.graph,
+      sessions: ZERO.sessions,
+      chats: ZERO.chats,
+      decisions: ZERO.decisions,
+      activity: { record: async () => { throw new Error('not expected'); }, list: async () => [], redactStoredActivity: async () => 0 },
     });
-    expect(await redactStoredOnRuleChange(t.d)).toEqual({ facts: 0, closed: 0, ownerFacts: 0, instructionFacts: 0, reopenedFacts: 0, chunks: 0, lessons: 0, lessonsFlagged: 0, misses: 0, candidates: 0, sessions: 0, chatTurns: 0, activity: 0 });
+    expect(await redactStoredOnRuleChange(t.d)).toEqual({ facts: 0, closed: 0, ownerFacts: 0, instructionFacts: 0, reopenedFacts: 0, chunks: 0, lessons: 0, lessonsFlagged: 0, misses: 0, candidates: 0, sessions: 0, chatTurns: 0, decisions: 0, activity: 0 });
     expect(t.cursors.m.get(REDACTION_CURSOR)).toBe(`v${REDACTION_VERSION}`);
   });
 
-  test('a store that cannot re-redact counts as nothing changed there; a failure leaves the version unrecorded', async () => {
-    const partial = deps({ knowledge: {}, graph: {}, sessions: {}, chats: {} });
-    expect(await redactStoredOnRuleChange(partial.d)).toMatchObject({ lessons: 0, lessonsFlagged: 0, misses: 0, candidates: 0, sessions: 0, chatTurns: 0 });
+  test('a failure leaves the version unrecorded', async () => {
     const failing = deps({ docs: { redactStoredDocs: async () => { throw new Error('db down'); } } });
     await expect(redactStoredOnRuleChange(failing.d)).rejects.toThrow('db down');
     expect(failing.cursors.m.has(REDACTION_CURSOR)).toBe(false);
@@ -131,9 +140,9 @@ describe('redactStoredOnRuleChange', () => {
   test('after v2 with nothing to change now, the entry is still written so the owner sees what v2 did', async () => {
     const v2 = logged({ details: { version: 2, previous: null, facts: 5, factsClosed: 5, chunks: 0, lessons: 0 } });
     const t = deps({
-      facts: { redactStoredFacts: async () => ({ redacted: 0, closed: 0, owner: 0, instructions: 0 }) },
+      facts: ZERO.facts,
       docs: { redactStoredDocs: async () => 0 },
-      knowledge: {}, graph: {}, sessions: {}, chats: {},
+      knowledge: ZERO.knowledge, graph: ZERO.graph, sessions: ZERO.sessions, chats: ZERO.chats, decisions: ZERO.decisions,
     }, [v2]);
     t.d.activity!.redactStoredActivity = async () => 0;
     t.cursors.m.set(REDACTION_CURSOR, 'v2');
@@ -148,6 +157,6 @@ describe('redactStoredOnRuleChange', () => {
     t.cursors.m.set(REDACTION_CURSOR, 'v1');
     await redactStoredOnRuleChange(t.d);
     expect(t.calls).not.toContain('list:secrets_redacted');
-    expect(t.activity[0].why).not.toMatch(/v2/);
+    expect(t.activity[0].why).not.toMatch(/\bv2\b/);
   });
 });

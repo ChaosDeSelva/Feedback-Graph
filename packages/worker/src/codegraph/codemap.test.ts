@@ -6,6 +6,7 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterEach, expect, test } from 'vitest';
 import { buildCodeMap } from './codemap.ts';
+import { parseSymbols } from './onDemand.ts';
 import { dependents, testsFor } from './queries.ts';
 import type { CodeMap } from './types.ts';
 
@@ -39,7 +40,7 @@ function fixture(git: boolean) {
   w('py/tests/test_cart.py', 'from shop.cart import Cart\n\ndef test_total():\n    assert Cart().total() == 1\n');
   // secret files: never listed, never parsed
   w('.env', 'TOKEN=abc123456789');
-  w('packages/app/src/secrets.ts', 'export const leaked = 1;\n');
+  w('packages/app/src/.env.ts', 'export const leaked = 1;\n');
   // symlinks: to a file inside, to a file outside, to a directory outside
   writeFileSync(join(outside, 'outside.ts'), 'export const outsideSymbol = 1;\n');
   symlinkSync(join(dir, 'packages/core/src/repo.ts'), join(dir, 'packages/app/src/alias.ts'));
@@ -158,8 +159,32 @@ test('maxFiles and maxBytes bound the map', async () => {
   expect(m.files).toHaveLength(3);
   expect(paths(m)).not.toContain('packages/app/src/huge.ts');
   // The cap is counted, so the map can say what it left out.
-  expect(m.candidates).toBe((await buildCodeMap(dir, OPTS)).candidates);
+  expect(m.candidates).toBe((await buildCodeMap(dir, { maxFiles: 5000, maxBytes: 4000 })).candidates);
   expect(m.candidates).toBeGreaterThan(3);
+});
+
+test('a hub source file over SCAN_MAX_BYTES is mapped up to CODE_MAP_MAX_BYTES; other files keep the scan limit', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'fbcodemap-hub-'));
+  dirs.push(dir);
+  const w = (p: string, c: string) => { mkdirSync(join(dir, p, '..'), { recursive: true }); writeFileSync(join(dir, p), c); };
+  // A 100 kB router that three files import, as a real repo's router.go or generated query file is.
+  w('src/router.ts', `export function route() {}\n${'// handler\n'.repeat(10_000)}`);
+  for (const f of ['a', 'b', 'c']) w(`src/${f}.ts`, "import { route } from './router';\nexport const x = route;\n");
+  w('docs/big.md', `# Big\n${'text\n'.repeat(20_000)}`);
+  w('src/giant.ts', `export const giant = 1;\n${'// x\n'.repeat(60_000)}`);
+  const limits = { maxFiles: 50, maxBytes: 80_000 };
+  // Before CODE_MAP_MAX_BYTES the router was over SCAN_MAX_BYTES: not mapped, and none of its importers counted.
+  const scanOnly = await buildCodeMap(dir, limits);
+  expect(paths(scanOnly)).not.toContain('src/router.ts');
+  const m = await buildCodeMap(dir, { ...limits, sourceMaxBytes: 200_000 });
+  expect(paths(m)).toContain('src/router.ts');
+  expect(m.symbols.map((s) => s.id)).toContain('src/router.ts#route');
+  expect(dependents(m, 'src/router.ts', 1).map((x) => x.path)).toEqual(['src/a.ts', 'src/b.ts', 'src/c.ts']);
+  // Still bounded: a source file over the map's own limit, and a non-source file over the scan's, stay out.
+  expect(paths(m)).not.toContain('src/giant.ts');
+  expect(paths(m)).not.toContain('docs/big.md');
+  // A source limit below the scan's never lowers it.
+  expect(paths(await buildCodeMap(dir, { ...limits, maxBytes: 200_000, sourceMaxBytes: 1000 }))).toContain('src/router.ts');
 });
 
 test('a capped map keeps source and the files sessions edited, not the alphabetically first config', async () => {
@@ -203,9 +228,10 @@ test('incremental: unchanged files reuse the previous entries without reparsing;
 
 test('smoke: maps this repo\'s packages/core with sane counts, and graph/repo.ts has importers', async () => {
   const core = resolve(dirname(fileURLToPath(import.meta.url)), '../../../core');
-  const t0 = Date.now();
+  // This thread's CPU time, so a busy host does not count against the budget; the test's own timeout is only a hang guard.
+  const t0 = process.threadCpuUsage();
   const m = await buildCodeMap(core, OPTS);
-  const ms = Date.now() - t0;
+  const used = process.threadCpuUsage(t0);
   expect(m.files.length).toBeGreaterThan(30);
   expect(m.files.length).toBeLessThan(500);
   expect(m.symbols.length).toBeGreaterThan(100);
@@ -216,8 +242,8 @@ test('smoke: maps this repo\'s packages/core with sane counts, and graph/repo.ts
   expect(m.imports.some((i) => i.to === 'pkg:neo4j-driver')).toBe(true);
   expect(m.symbols.find((s) => s.id === 'src/graph/repo.ts#GraphRepo')).toMatchObject({ kind: 'class', exported: true });
   expect(testsFor(m, 'src/graph/repo.ts').length).toBeGreaterThan(0);
-  expect(ms).toBeLessThan(20_000);
-});
+  expect((used.user + used.system) / 1000).toBeLessThan(20_000);
+}, 60_000);
 
 test('the map counts imports that look local but resolve to no file, so answers can say the import graph is incomplete', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'fbcodemap-'));
@@ -314,4 +340,113 @@ test('Python services: absolute, relative and src-layout imports become edges; a
   expect(edge(m, 'services/billing/billing/api.py', 'pkg:requests')).toBeTruthy();
   expect(m.unresolved).toBe(1);
   expect(testsFor(m, 'services/billing/billing/event_handlers.py')).toEqual(['services/billing/tests/test_handlers.py']);
+});
+
+test("a file's own tests beside it cover it without importing it: Go same-package _test.go files, and foo.test.ts that mocks foo", async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'fbcodemap-beside-'));
+  dirs.push(dir);
+  const w = (p: string, c: string) => { mkdirSync(join(dir, p, '..'), { recursive: true }); writeFileSync(join(dir, p), c); };
+  w('go.mod', 'module example.com/shop\n\ngo 1.22\n');
+  w('orgs/org_1/population.go', 'package org_1\n\nfunc Population() int { return 1 }\n');
+  w('orgs/org_1/manifest.go', 'package org_1\n\nfunc Manifest() int { return Population() }\n');
+  w('orgs/org_1/population_test.go', 'package org_1\n\nimport "testing"\n\nfunc TestPopulation(t *testing.T) { _ = Population() }\n');
+  w('orgs/org_1/manifest_test.go', 'package org_1\n\nimport "testing"\n\nfunc TestManifest(t *testing.T) { _ = Manifest() }\n');
+  w('cmd/api/main.go', 'package main\n\nimport "example.com/shop/orgs/org_1"\n\nfunc main() { _ = org_1.Manifest() }\n');
+  w('cmd/api/main_test.go', 'package main\n\nimport "testing"\n\nfunc TestMain(t *testing.T) { main() }\n');
+  w('cmd/other/other_test.go', 'package other\n\nimport "testing"\n\nfunc TestOther(t *testing.T) {}\n');
+  // A TS test that only mocks the module beside it, and an unrelated test in the same folder.
+  w('web/surface.ts', 'export const surface = () => 1;\n');
+  w('web/surface.test.ts', "import { vi } from 'vitest';\nvi.mock('./surface');\n");
+  w('web/other.test.ts', "import { vi } from 'vitest';\n");
+  const m = await buildCodeMap(dir, OPTS);
+  // The package's own tests. Before, none: a package tests itself without an import, so a package-internal file linked
+  // only far tests reaching it through two other files. main_test.go is main.go's (answers reach it through main.go).
+  for (const f of ['orgs/org_1/population.go', 'orgs/org_1/manifest.go']) {
+    expect(testsFor(m, f)).toEqual(['orgs/org_1/manifest_test.go', 'orgs/org_1/population_test.go']);
+  }
+  expect(testsFor(m, 'web/surface.ts')).toEqual(['web/surface.test.ts']);
+  expect(testsFor(m, 'cmd/api/main.go')).toEqual(['cmd/api/main_test.go']);
+});
+
+test('parseSymbols reads a file the map holds no symbols for as the map would; nothing for a language it does not parse', async () => {
+  expect((await parseSymbols('src/a.ts', 'export function shipIt() {}\n')).map((s) => [s.id, s.kind, s.exported])).toEqual([['src/a.ts#shipIt', 'function', true]]);
+  expect(await parseSymbols('docs/a.md', '# Title\n')).toEqual([]);
+});
+
+test('a C# namespace line inside a string declares nothing: a using of that namespace makes no edge to the file', async () => {
+  const dir = repo({
+    'src/Models/Order.cs': 'namespace Shop.Models;\npublic class Order {}\n',
+    'src/Web/Strings.cs': 'var s = @"\nnamespace Shop.Models\n";\n',
+    'src/Web/Ctl.cs': 'using Shop.Models;\nnamespace Shop.Web { public class Ctl { Order o; } }\n',
+  });
+  const m = await buildCodeMap(dir, OPTS);
+  expect(m.imports.filter((i) => i.from === 'src/Web/Ctl.cs').map((i) => i.to)).toEqual(['src/Models/Order.cs']);
+});
+
+test('a GDScript class_name in a file starting with a UTF-8 BOM is found by the files that name it', async () => {
+  const dir = repo({
+    'project.godot': '',
+    'player.gd': '\uFEFFclass_name Player extends CharacterBody2D\n',
+    'main.gd': 'extends Node\nvar p: Player\n',
+  });
+  expect(edge(await buildCodeMap(dir, OPTS), 'main.gd', 'player.gd')).toBeTruthy();
+});
+
+test('an incremental build counts as many unresolved imports as a full one, though two of them make one edge', async () => {
+  const dir = repo({
+    'tsconfig.json': JSON.stringify({ compilerOptions: { paths: { '~/*': ['src/*'] } } }),
+    'src/x.ts': "import { a } from '~/missing1';\nimport { b } from '~/missing2';\nexport const c = 1;\n",
+  });
+  const full = await buildCodeMap(dir, OPTS);
+  expect((await buildCodeMap(dir, OPTS, full)).unresolved).toBe(full.unresolved);
+  expect(full.unresolved).toBe(1);
+});
+
+test('an incremental build still counts an unchanged Python file\'s relative import of a missing module, which makes no edge', async () => {
+  const dir = repo({ 'pkg/__init__.py': '', 'pkg/a.py': 'from .missing import thing\nfrom .b import other\n', 'pkg/b.py': 'def other():\n    return 1\n' });
+  const full = await buildCodeMap(dir, OPTS);
+  expect(full.unresolved).toBe(1);
+  expect((await buildCodeMap(dir, OPTS, full)).unresolved).toBe(1);
+});
+
+test('a map that left out only files over the size limit is not capped: they are not counted as candidates', async () => {
+  const dir = repo({ 'src/a.ts': 'export const a = 1;\n', 'src/b.ts': 'export const b = 1;\n', 'src/huge.ts': `export const h = '${'x'.repeat(300)}';\n` });
+  const m = await buildCodeMap(dir, { maxFiles: 5000, maxBytes: 200 });
+  expect(paths(m)).toEqual(['src/a.ts', 'src/b.ts']);
+  expect(m.candidates).toBe(2);
+  expect((await buildCodeMap(dir, { maxFiles: 1, maxBytes: 200 })).candidates).toBe(2);
+});
+
+// A real NFD file name on APFS, listed twice as git in a Linux container lists it: the index entry (NFC, macOS git's
+// core.precomposeunicode) and the name on disk (NFD) as untracked, which git without that setting does not match.
+test.runIf(process.platform === 'darwin')('a file listed in its NFC and NFD spellings is mapped once, as NFC, with its importers', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'fbcodemap-nfd-'));
+  dirs.push(dir);
+  const cafe = 'src/café.ts';
+  mkdirSync(join(dir, 'src'));
+  writeFileSync(join(dir, cafe.normalize('NFD')), "import { m } from './menü';\nexport const c = m;\n");
+  writeFileSync(join(dir, 'src/menü.ts'), 'export const m = 1;\n');
+  writeFileSync(join(dir, 'src/main.ts'), "import { c } from './café';\nexport const x = c;\n");
+  const git = (...args: string[]) => execFileSync('git', ['-C', dir, '-c', 'user.email=t@example.com', '-c', 'user.name=t', ...args], { encoding: 'utf8' });
+  git('init', '-q');
+  git('-c', 'core.precomposeunicode=true', 'add', '-A');
+  git('commit', '-qm', 'start');
+  git('config', 'core.precomposeunicode', 'false');
+  const listed = git('ls-files', '-z', '--cached', '--others', '--exclude-standard').split('\0').filter(Boolean);
+  expect(listed.filter((p) => p.normalize('NFC') === cafe)).toHaveLength(2);
+  const m = await buildCodeMap(dir, OPTS);
+  expect(m.files.map((f) => f.path).sort()).toEqual(['src/café.ts', 'src/main.ts', 'src/menü.ts']);
+  expect(m.files.every((f) => f.path === f.path.normalize('NFC'))).toBe(true);
+  expect(dependents(m, cafe, 1)).toEqual([{ path: 'src/main.ts', depth: 1 }]);
+  expect(dependents(m, 'src/menü.ts', 1)).toEqual([{ path: cafe, depth: 1 }]);
+});
+
+test('a C# file tree-sitter cannot parse cleanly keeps its namespace: #if alternatives and a file mid-edit', async () => {
+  const dir = repo({
+    'src/Net/Client.cs': 'namespace Acme.Net\n{\n#if UNITY_EDITOR\n    public class Client : EditorClient\n    {\n#else\n    public class Client : RuntimeClient\n    {\n#endif\n        public void Send() { }\n    }\n}\n',
+    'src/Pay/Card.cs': 'namespace Acme.Pay\n{\n    public class Card\n    {\n        public void Charge() {\n    }\n',
+    'src/App/Program.cs': 'using Acme.Net;\nusing Acme.Pay;\nnamespace Acme.App\n{\n    public class Program { public static void Main() { new Client().Send(); } }\n}\n',
+  });
+  const m = await buildCodeMap(dir, OPTS);
+  expect(m.imports.filter((i) => i.from === 'src/App/Program.cs').map((i) => i.to).sort()).toEqual(['src/Net/Client.cs', 'src/Pay/Card.cs']);
 });

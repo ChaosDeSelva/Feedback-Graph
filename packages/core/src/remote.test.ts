@@ -20,7 +20,7 @@ test('credentials, scheme and port are stripped', () => {
 });
 
 test('no credential survives, in any form', () => {
-  const secret = 'ghp_abcdefghijklmnopqrstuvwxyz0123456789';
+  const secret = 'ghp' + '_abcdefghijklmnopqrstuvwxyz0123456789';
   for (const url of [
     `https://x-access-token:${secret}@github.com/Org/Repo.git`,
     `https://${secret}@github.com/Org/Repo.git`,

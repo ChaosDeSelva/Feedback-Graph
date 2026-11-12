@@ -206,7 +206,8 @@ export type PostMortem = {
   cause: Cause;
   causeExplanation: string;
   outcome: Outcome;
-  lesson: { title: string; rule: string; appliesWhen: string; scope: LessonScope; paths: string[] };
+  /** triggers: what in a later change shows the lesson applies, validated against this miss (lessonTriggers.ts). */
+  lesson: { title: string; rule: string; appliesWhen: string; scope: LessonScope; paths: string[]; triggers?: LessonTriggers | null };
   contextItems: ContextItem[];
   /** What the lesson check found (stored on the lesson as `checks`); unset: not checked. */
   lessonChecks?: LessonCheck[];
@@ -261,12 +262,32 @@ export const LESSON_CHECKS = [
   'ambiguous-path',
   'no-miss',
   'filler-applies-when',
+  // An appliesWhen that names only the one instance the miss was about ("this feature", one variable): flagged, with a
+  // broader one suggested by the worker (suggestion), never applied for the owner.
+  'instance-applies-when',
+  // An appliesWhen copied from an example the post-mortem was shown (another lesson's) that this miss is not about.
+  'example-applies-when',
   // An approved lesson the redaction rules read a credential in (redact.ts redactStoredLesson): its text is the owner's.
   'may-hold-secret',
+  // A lesson that tells agents to fetch a URL or run a command that downloads, installs, deletes or evaluates: what an
+  // injected comment asks for. The learning loop never targets it, and never writes such text into a lesson.
+  'risky-command',
 ] as const;
 export type LessonCheckName = (typeof LESSON_CHECKS)[number];
-/** `of`: for duplicate-of, the lesson this one repeats. */
-export type LessonCheck = { name: LessonCheckName; why: string; of?: string };
+/**
+ * `of`: for duplicate-of, the lesson this one repeats. `suggestion`: for instance-applies-when, a broader "applies when"
+ * the worker proposed; the owner may take it, nothing applies it.
+ */
+export type LessonCheck = { name: LessonCheckName; why: string; of?: string; suggestion?: string };
+
+/**
+ * What in a later change shows a lesson applies, beside its embedding: `paths`, repo-relative globs a named or changed
+ * file matches; `patterns`, regular expressions (case-insensitive) an added diff line or the task's words match;
+ * `symbols`, exact code names (a function, an env var, a flag, a key) an added line or the task names as a whole token.
+ * Derived by the post-mortem (or the worker's backfill) and kept only when they match the miss's own files or text
+ * (lessonTriggers.ts validateTriggers); the owner edits them like the rest of the lesson.
+ */
+export type LessonTriggers = { paths: string[]; patterns: string[]; symbols: string[] };
 
 /**
  * The version of the lesson checks, stored with them (Lesson.checksVersion). Raise it when a check changes: at start the
@@ -281,15 +302,24 @@ export type LessonCheck = { name: LessonCheckName; why: string; of?: string };
  * are only flagged. 5: broken-rule judged on the rule as it is now (one the owner fixed is no longer flagged),
  * looks-like-a-fact knows more imperative verbs ("Cap ...", "Refresh ...", "Coalesce ..."), wrong-session is no longer read
  * from the words of a post-mortem that had no session or one matched by branch or files, and filler-applies-when (an
- * appliesWhen of just "task" or "project", flagged only).
+ * appliesWhen of just "task" or "project", flagged only). 7: instance-applies-when (an appliesWhen that names only this
+ * feature or one variable), with a broader one suggested by the worker. 8: risky-command (a lesson telling agents to fetch
+ * a URL or download, install, delete or evaluate something). 9: instance-applies-when no longer flags the one name the
+ * rule names (`formatAmount must return two decimals`, "Always pass an idempotency key to chargeCard"; "changing" it),
+ * and example-applies-when (an appliesWhen copied from an example the post-mortem was shown, none of whose words the
+ * miss shares). 10: risky-command reads through lookalike, zero-width, %-escaped and defanged text, and knows package
+ * runners (npx, dlx, uvx), flags before an install's package, split rm flags, a bare domain to fetch and run, inline
+ * code (python -c, node -e, powershell -enc), commands spelled letter by letter, and telling agents to expose secrets
+ * (keys, .env, the environment, tokens) to the PR, a chat, a log or a URL; and it re-checks lessons checked at 9 by
+ * the narrower example- and instance-applies-when rules above, which came after 9 was stamped.
  */
-export const LESSON_CHECKS_VERSION = 6;
+export const LESSON_CHECKS_VERSION = 10;
 
 /**
- * Where a lesson's feedback came from: a GitHub or Linear comment, pushback in an agent session, an imported memory
- * file, or written by hand. Set by the stores.
+ * Where a lesson's feedback came from: a GitHub or Linear comment, pushback in an agent session, a miss an agent reported
+ * (report_feedback), an imported memory file, or written by hand. Set by the stores.
  */
-export const LESSON_FROM = ['github', 'linear', 'session', 'memory', 'manual', 'demo'] as const;
+export const LESSON_FROM = ['github', 'linear', 'session', 'agent', 'memory', 'manual', 'demo'] as const;
 export type LessonFrom = (typeof LESSON_FROM)[number];
 
 export type LessonStatus = 'proposed' | 'approved' | 'rejected' | 'revoked' | 'superseded';
@@ -306,6 +336,11 @@ export type Lesson = {
   appliesWhen: string;
   scope: LessonScope;
   paths: string[];
+  /**
+   * What in a later change shows it applies (LessonTriggers). Null or absent: never derived (the worker backfills it);
+   * empty lists: derived, and nothing in the miss's files or text was specific enough.
+   */
+  triggers?: LessonTriggers | null;
   status: LessonStatus;
   source: LessonSource;
   cause: Cause | null;
@@ -337,6 +372,13 @@ export type Lesson = {
    * scope while it was proposed. Null or absent: never edited while proposed (approved as written, if approved).
    */
   proposedAs?: LessonDraft | null;
+  /**
+   * The learning loop's serving weight (rank_weight, SERVING_WEIGHT_MIN..MAX): it reorders, and so moves across the cut,
+   * only lessons already tied to the task; it never admits one. Absent: 1, as written by no decision.
+   */
+  servingWeight?: number;
+  /** The lesson the learning loop split this one off (reword_lesson on a bundled rule); absent for every other lesson. */
+  splitFrom?: string;
 };
 
 /** What the lesson writer controls: the parts the owner edits before approving. */
@@ -423,11 +465,15 @@ export type CodeFact = {
 
 /**
  * model: a model read the code. manifest: read from package.json, go.mod, a Makefile... without a model. document: from
- * an upload. you: the owner (or an agent with the operator token) wrote it, e.g. a lesson converted to a fact; no scan
- * closes or replaces it.
+ * an upload. you: the owner (or an agent with the operator token) wrote it, e.g. a lesson converted to a fact. loop: the
+ * learning loop recorded it (record_fact: a lesson that states how the code is, or what you said more than once). No scan
+ * closes or replaces a fact of yours or the loop's (FACT_ORIGINS_KEPT).
  */
-export const FACT_ORIGINS = ['model', 'manifest', 'document', 'you'] as const;
+export const FACT_ORIGINS = ['model', 'manifest', 'document', 'you', 'loop'] as const;
 export type FactOrigin = (typeof FACT_ORIGINS)[number];
+/** The origins of facts filed under their project, not read from code: a scan never closes, replaces or re-checks them. */
+export const FACT_ORIGINS_KEPT = ['you', 'loop'] as const satisfies readonly FactOrigin[];
+export type OwnFactOrigin = (typeof FACT_ORIGINS_KEPT)[number];
 /**
  * line: the cited lines exist and hold what the statement names. file: the file exists, the lines were missing, wrong
  * or past its end (and were dropped). none: project-wide, nothing to check.
@@ -436,13 +482,20 @@ export const FACT_EVIDENCE = ['line', 'file', 'none'] as const;
 export type FactEvidence = (typeof FACT_EVIDENCE)[number];
 
 /**
- * Who set a fact's relevance: the extractor or the background scorer ('model'), you ('you'), or an agent holding
- * FG_OPERATOR_TOKEN ('operator:<name>'). Only 'model' is ever overwritten by a model.
+ * Who set a fact's relevance: the extractor or the background scorer ('model'), you ('you'), an agent holding
+ * FG_OPERATOR_TOKEN ('operator:<name>'), or the learning loop ('loop:<policy version>', a fact it recorded). Only 'model'
+ * is ever overwritten by a model.
  */
-export type RelevanceBy = 'model' | 'you' | `operator${string}`;
+export type RelevanceBy = 'model' | 'you' | `operator${string}` | `loop:${string}`;
 
 /** Relevance used for ranking when a fact has none yet. */
 export const UNSCORED_RELEVANCE = 0.5;
+
+/**
+ * A project's own similarity floors, set by an applied tune_threshold decision (within TUNE_MARGIN of the defaults,
+ * SIMILARITY_FLOOR and FACT_RANK_FLOOR); null: the default.
+ */
+export type ProjectThresholds = { similarityFloor: number | null; factRankFloor: number | null };
 
 export type ScanStatus = 'queued' | 'running' | 'done' | 'failed';
 export type ScanJob = {
@@ -556,6 +609,13 @@ export const ACTIVITY_KINDS = [
   'demo_seeded',
   'demo_removed',
   'sessions_rematched',
+  // The learning loop (0.8.0): a decision recorded, applied, rolled back or annotated, and its settings and pause.
+  'decision_made',
+  'decision_applied',
+  'decision_rolled_back',
+  'decision_noted',
+  'loop_settings_changed',
+  'loop_paused',
 ] as const;
 export type ActivityKind = (typeof ACTIVITY_KINDS)[number];
 
@@ -581,6 +641,122 @@ export type ActivityInput = {
  * the entry on its own (ActivityStore.get, GET /api/activity/:id) has them. `run` and `sandbox` are there only when set.
  */
 export type Activity = Required<Omit<ActivityInput, 'run' | 'sandbox'>> & Pick<ActivityInput, 'run' | 'sandbox'> & { id: string; ts: string; detailsOmitted?: boolean };
+
+// ── Learning loop ──────────────────────────────────────────────────────
+
+/**
+ * What the learning loop can decide (docs: the 0.8.0 loop design). Housekeeping (merge, link, rank, retire) applies on
+ * its own; changes to what agents are told apply on their own only once the owner's verdicts earned it; the rest waits.
+ */
+export const DECISION_TYPES = [
+  'link_misses',
+  'merge_duplicates',
+  'rank_weight',
+  'retire_lesson',
+  'reject_lesson',
+  'approve_lesson',
+  'reword_lesson',
+  'narrow_scope',
+  'record_fact',
+  'triage_inbox',
+  'tune_threshold',
+] as const;
+export type DecisionType = (typeof DECISION_TYPES)[number];
+
+/**
+ * observed: recorded only (observe mode). proposed: waits for the owner. applying: its target write is under way (a
+ * start-up pass settles one a crash left so). applied, rejected, rolled_back. overridden: the owner changed its target
+ * since. expired: no longer worth deciding.
+ */
+export const DECISION_STATUSES = ['observed', 'proposed', 'applying', 'applied', 'rejected', 'rolled_back', 'overridden', 'expired'] as const;
+export type DecisionStatus = (typeof DECISION_STATUSES)[number];
+/** H: housekeeping, applies on its own. A: agent-facing, applies on its own once earned. P: always a proposal. */
+export const DECISION_TIERS = ['H', 'A', 'P'] as const;
+export type DecisionTier = (typeof DECISION_TIERS)[number];
+export const DECISION_MODES = ['observe', 'propose', 'auto'] as const;
+export type DecisionMode = (typeof DECISION_MODES)[number];
+export const DECISION_TARGET_KINDS = ['lesson', 'fact', 'miss', 'candidate', 'project'] as const;
+export type DecisionTargetKind = (typeof DECISION_TARGET_KINDS)[number];
+/** primary: the record decided on. keeper / merged: a merge's survivor and the duplicate. created: what the decision made. */
+export const DECISION_TARGET_ROLES = ['primary', 'keeper', 'merged', 'created'] as const;
+export type DecisionTargetRole = (typeof DECISION_TARGET_ROLES)[number];
+export type DecisionTarget = { kind: DecisionTargetKind; id: string; role: DecisionTargetRole };
+
+/**
+ * A target's state before or after a decision: its fields as stored (redacted), and the fingerprint of the canonical
+ * ones (lessonFingerprint, factFingerprint) that a domain write compares (`expect`) to refuse a target changed since.
+ */
+export type TargetSnapshot = { kind: DecisionTargetKind; id: string; fields: Record<string, unknown>; fingerprint: string };
+
+/** What a decision rests on, by pointer: an Activity entry, a miss, a lesson, a lesson check... with its weight. */
+export const EVIDENCE_KINDS = ['activity', 'miss', 'lesson', 'fact', 'candidate', 'check', 'session'] as const;
+export type EvidenceKind = (typeof EVIDENCE_KINDS)[number];
+export type EvidenceRef = { kind: EvidenceKind; id: string; role: string; weight: number; observedAt: string };
+
+/** p: the calibrated chance the owner keeps it; lower: the bound the auto-apply rule reads; n: owner labels; band: 0-4. */
+export type DecisionConfidence = { p: number; lower: number; n: number; band: number };
+/** cascade: the later decisions rolled back with it, newest first. */
+export type DecisionRollback = { at: string; by: string; reason: DecisionNoteReason | null; note: string | null; cascade: string[] };
+
+/** What DecisionsStore.propose stores; the store adds the id (decisionId), createdAt and the status history. */
+export type DecisionInput = {
+  type: DecisionType;
+  projectKey: string | null;
+  targets: DecisionTarget[];
+  before: TargetSnapshot[];
+  after: TargetSnapshot[];
+  evidence: EvidenceRef[];
+  features: Record<string, number>;
+  score: number;
+  confidence: DecisionConfidence;
+  tier: DecisionTier;
+  mode: DecisionMode;
+  rationale: string;
+  /** The model's provider spec, or 'deterministic'; null: none recorded. */
+  model: string | null;
+  policyVersion: number;
+  /** How it starts: observed (observe mode) or proposed. */
+  status: 'observed' | 'proposed';
+  /** Earlier loop decisions whose `after` this one's `before` is: rolled back first when this one is. */
+  dependsOn?: string[];
+};
+
+export type Decision = Omit<DecisionInput, 'status' | 'dependsOn'> & {
+  /** `dec:<sha256>` of the type, targets, evidence and policy version (decisionId): proposing it again finds it. */
+  id: string;
+  status: DecisionStatus;
+  dependsOn: string[];
+  createdAt: string;
+  appliedAt: string | null;
+  /** The last status change made by someone (approve, reject, roll back...), and who: `loop:<v>`, you, `operator:<name>`. */
+  decidedAt: string | null;
+  decidedBy: string | null;
+  supersededBy: string | null;
+  rollback: DecisionRollback | null;
+  /** The owner kept an applied decision ("Keep"). */
+  ratifiedAt: string | null;
+  ratifiedBy: string | null;
+  /** Until then a cloud export sends its target as it was before (the loop's change is not shared yet). */
+  syncHoldUntil: string | null;
+};
+
+export const DECISION_NOTE_REASONS = ['wrong_evidence', 'too_broad', 'wording', 'not_now', 'other'] as const;
+export type DecisionNoteReason = (typeof DECISION_NOTE_REASONS)[number];
+export type DecisionNote = {
+  id: string; decisionId: string; ts: string; by: string; text: string;
+  verdict: 'agree' | 'disagree' | null; reason: DecisionNoteReason | null;
+};
+
+/** The outcome counts the loop folds from Activity per lesson (LessonSignals). */
+export const LESSON_SIGNAL_COUNTS = [
+  'served', 'sessionsServed', 'addressed', 'notAddressed', 'notApplicable', 'cannotTell', 'gapsFixed', 'repeatServed',
+  'repeatUnserved', 'ownerPushbackAfter', 'agentNotApplicable', 'agentWrong', 'ownerEdits', 'ownerRejects',
+] as const;
+export type LessonSignalCount = (typeof LESSON_SIGNAL_COUNTS)[number];
+export type LessonSignals = { lessonId: string; counts: Record<LessonSignalCount, number>; lastServed: string | null; lastOwnerTouch: string | null; updatedAt: string };
+
+/** One confidence band of a decision type under one policy version: a Beta(alpha, beta) posterior of "the owner kept it". */
+export type CalibrationBucket = { type: DecisionType; band: number; policyVersion: number; alpha: number; beta: number; n: number; updatedAt: string };
 
 // ── Runs ───────────────────────────────────────────────────────────────
 
@@ -639,6 +815,9 @@ export type TurnEvidence = {
 };
 
 /** What the worker reports about itself each heartbeat; shown in the UI header and at /api/status. */
+/** The first agent seen (GraphStore.agentSeen): the client's name from MCP initialize, and when it first called a tool. */
+export type AgentSeen = { client: string; at: string };
+
 export type WorkerStatus = {
   version: string;
   startedAt: string;
@@ -688,10 +867,20 @@ export type ModelHealth = {
   ok: boolean;
   reason: string | null;
   off?: true;
+  /** Unavailable on purpose, not a failure: its Codex runner is turned off on this machine by its safety flag. */
+  disabled?: true;
   /** While unavailable: since when (the first failure in a row), and when that was last seen. */
   since?: string;
   checkedAt?: string;
 };
+
+/** What to do about a Codex runner its safety flag turned off. */
+export const RUNNER_OFF_FIX = 'Its safety flag turned it off on this machine. Choose another scan model (SCAN_LLM, e.g. a local ollama: model) in .env, or fix the isolation failure and re-enable the runner: ./scripts/doctor.sh says how.';
+/** "Codex runner off: scans paused", naming the jobs that wait for it. */
+export function runnerOffLine(jobs: readonly string[]): string {
+  const named: Record<string, string> = { scan: 'scans', postmortem: 'post-mortems', docs: 'document reading', chat: 'Ask with Codex', classify: 'classifying', summary: 'summaries' };
+  return `Codex runner off: ${jobs.map((j) => named[j] ?? j).join(', ')} paused`;
+}
 
 /** Whether Ollama answers at `url` with the models it is asked for; `reason` says why not. */
 export type OllamaHealth = { url: string; ok: boolean; reason: string | null };
@@ -720,7 +909,9 @@ export type SystemStatus = {
   /** API auth is on but the separate browser-owner credential is missing. */
   ownerSetupRequired?: boolean;
   /** Stale or failed code maps that need attention; omitted when code maps are unavailable. */
-  codeMaps?: { projectKey: string; builtAt: string; ageDays: number; interrupted?: boolean; lastFailureAt?: string | null; lastFailure?: string | null }[];
+  /** Maps needing attention: a failed or interrupted rebuild, or (rebuilding) a rebuild running now, which is not a failure. */
+  /** builtAt, ageDays and checkedAt are null for a map whose first build never finished. */
+  codeMaps?: { projectKey: string; builtAt: string | null; ageDays: number | null; /** When the worker last found the map current (the repo unchanged since the build); builtAt when later. */ checkedAt: string | null; interrupted?: boolean; rebuilding?: boolean; lastFailureAt?: string | null; lastFailure?: string | null }[];
   /** The model that judges check_before_done (provider:model, e.g. ollama:gemma4); null when unknown or none. */
   judge?: string | null;
   /**
@@ -750,6 +941,8 @@ export type SystemStatus = {
   stage?: { name: WorkerStageName; startedAt: string; current: string | null } | null;
   /** That step's items done of total (total null when it has none); null when the step does not count items. */
   progress?: { done: number; total: number | null } | null;
+  /** The first agent that called an MCP tool (GraphStore.agentSeen); null: none yet, or the store cannot tell. */
+  agent?: AgentSeen | null;
 };
 
 /**
@@ -767,9 +960,9 @@ export type PipelineStatus = {
   postmortems: { queued: number } | null;
   /**
    * global: how many of them have no project of their own (they serve every project). quality: LessonQualityReport's
-   * windows, when the store can tell. Older APIs leave both out.
+   * windows, when the store can tell. demo: how many of them fg demo seed wrote (source 'demo'). Older APIs leave these out.
    */
-  lessons: { proposed: number; approved: number; global?: number; quality?: LessonQuality[] } | null;
+  lessons: { proposed: number; approved: number; global?: number; demo?: { proposed: number; approved: number }; quality?: LessonQuality[] } | null;
   /**
    * olderScanner: files an older scanner read, in all and by project (only those with some), which the next scan you
    * start reads again; absent when there are none or the store cannot count them.

@@ -69,6 +69,22 @@ describeStores('KnowledgeStore', (h) => {
       expect((await k.listLessons({ limit: 2 })).map(l => l.id)).toEqual(sorted.slice(0, 2));
     });
 
+    test('listLessons by ids, and by id after one (a sweep through every lesson, page by page)', async () => {
+      const ids: string[] = [];
+      for (const id of ['s-c', 's-a', 's-b']) {
+        const feedback = await confirmedFeedback(id);
+        await k.savePostmortem(feedback, pm(), { miss: vec(1), lesson: vec(1) });
+        ids.push(`lesson:${feedback}`);
+      }
+      const sorted = [...ids].sort();
+      expect((await k.listLessons({ ids: [ids[0], 'lesson:none'] })).map((l) => l.id)).toEqual([ids[0]]);
+      expect((await k.listLessons({ afterId: '', limit: 2 })).map((l) => l.id)).toEqual(sorted.slice(0, 2));
+      expect((await k.listLessons({ afterId: sorted[1], limit: 2 })).map((l) => l.id)).toEqual(sorted.slice(2));
+      expect((await k.listLessons({ afterId: sorted[2], limit: 2 }))).toEqual([]);
+      // The page carries each lesson whole, as the newest-first list does.
+      expect((await k.listLessons({ afterId: '', limit: 3 })).find((l) => l.id === ids[0])).toEqual((await k.listLessons({})).find((l) => l.id === ids[0]));
+    });
+
     test('PR filters match exact transcript references while author filters require source metadata', async () => {
       for (const [id, text] of [['right', 'Please fix PR #14194 from @Octo.'], ['wrong-number', 'Please fix #141940 from @Octo.'], ['wrong-author', 'Please fix #14194 from @Octo-more.']]) {
         const s = session(`mention-${id}`);
@@ -217,6 +233,13 @@ describeStores('KnowledgeStore', (h) => {
       expect(d?.fixCommits.map((c) => c.subject)).toEqual(['fix search']);
     });
 
+    test('a miss saved without a cause explanation reads back as an empty string on every backend', async () => {
+      const id = await confirmedFeedback('s1');
+      await k.savePostmortem(id, pm({ causeExplanation: null as never }), { miss: vec(1), lesson: vec(1) });
+      const [lesson] = await k.listLessons({ status: 'proposed' });
+      expect((await k.lessonDetail(lesson.id))?.miss?.causeExplanation).toBe('');
+    });
+
     test('fix commits are found by real time, whatever time zone the committer was in', async () => {
       const id = await confirmedFeedback('s1', [
         { sha: 'd'.repeat(40), ts: '2026-10-01T03:01:00-07:00', subject: 'before (10:01Z)' },
@@ -237,7 +260,7 @@ describeStores('KnowledgeStore', (h) => {
     });
 
     test('the task of a pre-done check is stored redacted', async () => {
-      await k.recordPreDoneCheck({ projectKey: 'demo', task: 'deploy with ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA', checkedLessonIds: [], gapLessonIds: [] });
+      await k.recordPreDoneCheck({ projectKey: 'demo', task: 'deploy with ghp' + '_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA', checkedLessonIds: [], gapLessonIds: [] });
       const [check] = await probe.preDoneChecks();
       expect(check.task).not.toContain('ghp_');
     });
@@ -566,6 +589,34 @@ describeStores('KnowledgeStore', (h) => {
       expect(m.sessionId).toBe('s1');
     });
 
+    test('missesNaming finds the misses naming a key as a whole key, in their text or feedback, nearest first', async () => {
+      const saved = async (sessionId: string, missed: string, axis: number, feedback?: string, projectKey = 'demo', noise = 0) => {
+        const base = session(sessionId);
+        const turns = base.turns.map((t) => (t.index === 2 && feedback ? { ...t, text: feedback } : t));
+        await repo.upsertSession({ ...project, key: projectKey, repoPath: `/vibe/${projectKey}` }, { ...base, cwd: `/Users/j/Vibe/${projectKey}`, turns }, []);
+        await repo.saveClassification(`${sessionId}-t2`, pushback, true);
+        await repo.decide(`${sessionId}-t2`, 'confirmed', 'x');
+        await k.savePostmortem(`${sessionId}-t2`, pm({ missed }), { miss: vec(axis, noise), lesson: vec(axis, noise) });
+        return `miss:${sessionId}-t2`;
+      };
+      const far = await saved('s1', 'ZED-77: the archive restore dropped file permissions', 9);
+      const near = await saved('s2', 'the restore lost modes', 3, 'this is zed-77 again, please fix');
+      const branch = await saved('s3', 'work on alex/zed-77-fix skipped the tests', 3, undefined, 'demo', 0.05);
+      // Not the key: a longer number, a longer prefix, a version and a key with an underscore prefix.
+      for (const [id, text] of [['s4', 'ZED-770 broke the export'], ['s5', 'XZED-77 broke the export'], ['s6', 'ZED-77.1 is a version'], ['s7', 'MY_ZED-77 elsewhere']]) await saved(id, text, 3);
+      await saved('s8', 'ZED-77 in another project', 3, undefined, 'other');
+      const found = await k.missesNaming({ keys: ['ZED-77'], embedding: vec(3), projectKey: 'demo', k: 10 });
+      expect(found.map((m) => m.missId)).toEqual([near, branch, far]);
+      expect(found[0]).toMatchObject({ missed: 'the restore lost modes', feedbackText: 'this is zed-77 again, please fix', sessionId: 's2', rejectedWrongSession: false });
+      expect(found[0].score).toBeCloseTo(1, 5);
+      expect(found[2].score).toBeCloseTo(0.5, 5);
+      expect((await k.missesNaming({ keys: ['zed-77', 'APP-1'], embedding: vec(3), projectKey: 'demo', k: 2 })).map((m) => m.missId)).toEqual([near, branch]);
+      expect(await k.missesNaming({ keys: ['ZED-7'], embedding: vec(3), projectKey: 'demo', k: 10 })).toEqual([]);
+      expect(await k.missesNaming({ keys: ['not a key'], embedding: vec(3), projectKey: 'demo', k: 10 })).toEqual([]);
+      // Another embedding size is not comparable: still found, scored 0.
+      expect((await k.missesNaming({ keys: ['ZED-77'], embedding: [1, 0, 0], projectKey: 'demo', k: 10 })).map((m) => m.score)).toEqual([0, 0, 0]);
+    });
+
     test('relatedMisses marks a miss whose lesson you rejected as worked out from the wrong session', async () => {
       const a = await confirmedFeedback('s1');
       await k.savePostmortem(a, pm({ lessonChecks: [{ name: 'wrong-session', why: 'the matched session did other work' }] }), { miss: vec(3), lesson: vec(3) });
@@ -621,6 +672,16 @@ describeStores('KnowledgeStore', (h) => {
         origins: ['agent'],
         agentReport: { text: 'you missed auth checks', whatWasDone: 'added /api/orders', sessionId: null },
       });
+    });
+
+    test('a lesson learned from an agent-reported miss is from the agent, not session pushback', async () => {
+      const id = await k.createManualFeedback({ project, cwd: '/Users/j/Vibe/demo', text: 'you missed auth checks', whatWasDone: 'added /api/orders' });
+      await repo.decide(id, 'confirmed', null);
+      await k.savePostmortem(id, pm(), { miss: vec(1), lesson: vec(1) });
+      const [l] = await k.listLessons({});
+      expect(l.from).toBe('agent');
+      expect((await k.listLessons({ from: 'agent' })).map((x) => x.id)).toEqual([l.id]);
+      expect(await k.listLessons({ from: 'session' })).toEqual([]);
     });
 
     test('recordPreDoneCheck durably distinguishes queued and no-rule attempts from lesson judgments', async () => {
@@ -728,7 +789,7 @@ describeStores('KnowledgeStore', (h) => {
 
   test('post-mortem output, memory lessons and manual feedback are redacted before storage', async () => {
     const id = await confirmedFeedback('sx');
-    const leak = 'sk-ant-api03-cccccccccccccccccccccccccccccccccccccccc';
+    const leak = 'sk' + '-ant-api03-cccccccccccccccccccccccccccccccccccccccc';
     await k.savePostmortem(id, pm({
       missed: `missed ${leak}`, causeExplanation: leak,
       lesson: { title: leak, rule: leak, appliesWhen: leak, scope: 'project', paths: [] },
@@ -829,6 +890,94 @@ describeStores('KnowledgeStore', (h) => {
     expect(await d('lesson:p')).toMatchObject({ paths: ['jobs/export/schedule.go'], status: 'proposed' });
     expect((await d('lesson:p')).decidedBy ?? null).toBeNull();
     expect(await d('lesson:a')).toMatchObject({ paths: ['schedule.go', 'AGENTS.md'], status: 'approved' });
+  });
+
+  describe('lesson triggers', () => {
+    const triggers = { paths: ['db/**/*.sql'], patterns: ['CREATE\\s+INDEX'], symbols: ['users_org'] };
+    const one = (id: string, status: 'proposed' | 'approved' | 'rejected', over: object = {}) => ({ id, projectKey: 'demo', title: id, rule: 'r', appliesWhen: 'w', scope: 'project' as const, paths: [], status, source: 'postmortem' as const, embedding: vec(9), ...over });
+    const lessonOf = (id: string) => k.lessonDetail(id).then((x) => x!.lesson);
+
+    test('a post-mortem stores its triggers; one with none leaves them unset, for the backfill', async () => {
+      const a = await confirmedFeedback('trig-a');
+      await k.savePostmortem(a, pm({ lesson: { ...pm().lesson, triggers } }), { miss: vec(1), lesson: vec(2) });
+      expect((await lessonOf(`lesson:${a}`)).triggers).toEqual(triggers);
+      const b = await confirmedFeedback('trig-b');
+      await k.savePostmortem(b, pm(), { miss: vec(1), lesson: vec(2) });
+      expect((await lessonOf(`lesson:${b}`)).triggers ?? null).toBeNull();
+      expect((await k.lessonsWithoutTriggers!(50)).map((l) => l.id)).toContain(`lesson:${b}`);
+      expect((await k.lessonsWithoutTriggers!(50)).map((l) => l.id)).not.toContain(`lesson:${a}`);
+    });
+
+    test('lessonDetail gives the miss\'s evidence: what was done, and a comment\'s file and diff lines', async () => {
+      const id = await k.createManualFeedback({ project, cwd: '/vibe/demo', text: 'no EXPLAIN for the changed query', whatWasDone: 'changed api/users.ts' });
+      await repo.decide(id, 'confirmed', null);
+      await k.savePostmortem(id, pm(), { miss: vec(1), lesson: vec(2) });
+      expect((await k.lessonDetail(`lesson:${id}`))!.feedback).toMatchObject({ text: 'no EXPLAIN for the changed query', done: 'changed api/users.ts', commentPath: null, diffHunk: null });
+    });
+
+    test('setLessonTriggers fills only triggers never derived, on a proposed or approved lesson, and nothing else', async () => {
+      await k.upsertLesson(one('lesson:tp', 'proposed'));
+      await k.upsertLesson(one('lesson:ta', 'approved'));
+      await k.upsertLesson(one('lesson:tr', 'rejected'));
+      await k.upsertLesson(one('lesson:tt', 'approved', { triggers }));
+      const empty = { paths: [], patterns: [], symbols: [] };
+      expect(await k.setLessonTriggers!('lesson:tp', triggers)).toBe(true);
+      expect(await k.setLessonTriggers!('lesson:tp', empty)).toBe(false);
+      expect(await k.setLessonTriggers!('lesson:ta', empty)).toBe(true);
+      expect(await k.setLessonTriggers!('lesson:tr', triggers)).toBe(false);
+      expect(await k.setLessonTriggers!('lesson:tt', empty)).toBe(false);
+      expect(await k.setLessonTriggers!('lesson:none', empty)).toBe(false);
+      expect(await lessonOf('lesson:tp')).toMatchObject({ triggers, status: 'proposed', rule: 'r' });
+      expect((await lessonOf('lesson:ta')).triggers).toEqual(empty);
+      expect((await lessonOf('lesson:tt')).triggers).toEqual(triggers);
+      const todo = (await k.lessonsWithoutTriggers!(100)).map((l) => l.id);
+      expect(todo).not.toContain('lesson:tr');
+      expect(todo).not.toContain('lesson:tp');
+    });
+
+    test('the owner edits them like the rest of the lesson, and that is not an edit of its words', async () => {
+      await k.upsertLesson(one('lesson:te', 'proposed'));
+      await k.updateLesson('lesson:te', { triggers }, { by: 'you' });
+      const l = await lessonOf('lesson:te');
+      expect(l.triggers).toEqual(triggers);
+      expect(l.proposedAs ?? null).toBeNull();
+      // An edit wins over a later backfill.
+      expect(await k.setLessonTriggers!('lesson:te', { paths: [], patterns: [], symbols: [] })).toBe(false);
+    });
+
+    test("the owner's triggers survive a re-saved post-mortem of a lesson whose words are still the writer's", async () => {
+      const a = await confirmedFeedback('trig-own');
+      await k.savePostmortem(a, pm({ lesson: { ...pm().lesson, triggers } }), { miss: vec(1), lesson: vec(2) });
+      const mine = { paths: [], patterns: [], symbols: ['MY_NAME'] };
+      await k.updateLesson(`lesson:${a}`, { triggers: mine }, { by: 'you' });
+      await k.savePostmortem(a, pm({ lesson: { ...pm().lesson, rule: 'Filter on the server, always', triggers } }), { miss: vec(1), lesson: vec(2) });
+      const l = await lessonOf(`lesson:${a}`);
+      expect(l.rule).toBe('Filter on the server, always');
+      expect(l.triggers).toEqual(mine);
+      // One the owner never touched takes the new post-mortem's.
+      const b = await confirmedFeedback('trig-new');
+      await k.savePostmortem(b, pm({ lesson: { ...pm().lesson, triggers: mine } }), { miss: vec(1), lesson: vec(2) });
+      await k.savePostmortem(b, pm({ lesson: { ...pm().lesson, triggers } }), { miss: vec(1), lesson: vec(2) });
+      expect((await lessonOf(`lesson:${b}`)).triggers).toEqual(triggers);
+    });
+
+    test('an export carries them, and an import puts them back', async () => {
+      await k.upsertLesson(one('lesson:ti', 'approved', { triggers }));
+      expect((await lessonOf('lesson:ti')).triggers).toEqual(triggers);
+      // A re-import without triggers keeps the ones there.
+      await k.upsertLesson(one('lesson:ti', 'approved'));
+      expect((await lessonOf('lesson:ti')).triggers).toEqual(triggers);
+      const bundle = await h.store.portability.exportData({ projectKey: 'demo' });
+      expect(bundle.lessons.find((l) => l.id === 'lesson:ti')?.triggers).toEqual(triggers);
+      expect(bundle.lessons.find((l) => l.id === 'lesson:tp')?.triggers).toBeUndefined();
+    });
+
+    test('a suggestion on a check is kept with the checks', async () => {
+      await k.upsertLesson(one('lesson:ts', 'approved'));
+      const checks = [{ name: 'instance-applies-when' as const, why: 'only this feature', suggestion: 'changing a SQL query or an index' }];
+      await k.setLessonChecks('lesson:ts', checks);
+      expect((await lessonOf('lesson:ts')).checks).toEqual(checks);
+    });
   });
 
   test('a global lesson with no project to trace is narrowed to the project the owner names, and served only there', async () => {

@@ -6,7 +6,8 @@
 import { posix } from 'node:path';
 import type { StoredFact } from './graph/facts.ts';
 import type { ExportCodeFile } from './graph/portability.ts';
-import { redactSecrets } from './redact.ts';
+import { compileGlob } from './linearMatch.ts';
+import { redactSecrets, redactSecretsMemo } from './redact.ts';
 import { isSecretPath } from './secrets.ts';
 import type { Cause, Lesson, ParsedSession, ToolCall } from './types.ts';
 
@@ -14,7 +15,8 @@ export const SYMBOL_KINDS = ['function', 'class', 'interface', 'type', 'const', 
 export type SymbolKind = (typeof SYMBOL_KINDS)[number];
 
 /** A file of the map. hash: sha256 of its content (the parser's), not the scanner's sha1. */
-export type MapFile = { path: string; lang: string; hash: string; loc: number; isTest: boolean };
+/** namespaces: a C# file's own, kept with the map so a build reads an unchanged file's without parsing it again. */
+export type MapFile = { path: string; lang: string; hash: string; loc: number; isTest: boolean; namespaces?: string[] };
 /** id: `<path>#<name>` as the parser makes it (not unique: two classes may both have a `save` method). */
 export type MapSymbol = { id: string; path: string; name: string; kind: SymbolKind; exported: boolean; lines: string };
 /** to: a repo-relative path of a mapped file, or `pkg:<name>` for anything outside the repo. */
@@ -25,9 +27,15 @@ export type FileChurn = { commits: number; lastTs: string };
  * The version of the rules a map is built by (what is resolved, which files are kept, what the index holds). Bump it
  * when they change: at start the worker rebuilds every map stamped with an older one (or none) from scratch, so a
  * new rule reaches maps built before it. 2: the import index past the cap, ranking by importers and churn, Python
- * imports counted when unresolved.
+ * imports counted when unresolved. 3: source files up to CODE_MAP_MAX_BYTES (not SCAN_MAX_BYTES), a file's own tests
+ * beside it (a Go package's _test.go files), and test links for files past the cap. 4: files with non-ASCII names, a
+ * barrel with a comment in its export braces, a GDScript class_name after a BOM, no edges from a C# namespace in a
+ * string, a commented-out preload or a comment in a Rust use list, and unresolved imports counted once per target.
+ * 5: paths in Unicode NFC, a file listed in its NFC and NFD spellings mapped once (nfcPaths). 6: a C# file
+ * tree-sitter cannot parse cleanly keeps its namespaces, which are stored with each C# file so an unchanged one is
+ * never parsed again.
  */
-export const CODE_MAP_VERSION = 2;
+export const CODE_MAP_VERSION = 6;
 
 /** What the worker writes for one project: the whole map, replacing the previous one. */
 export type CodeMapWrite = {
@@ -60,13 +68,22 @@ export type CodeMapStats = { files: number; symbols: number; imports: number; te
  * unresolved: imports the map could not follow to a file although they look local, so importer and test lists may be
  * short (null: not counted).
  */
-export type CodeMapMeta = { fingerprint: string | null; builtAt: string; stats: CodeMapStats; candidates: number | null; unresolved?: number | null; lastFailureAt?: string | null; lastFailure?: string | null; /** CODE_MAP_VERSION it was built by; null before maps were versioned. */ version?: number | null };
+/**
+ * checkedAt (both stores fill it): when the worker last found the map current (its repo unchanged since the build), or
+ * builtAt when that is later; an unchanged map keeps an old builtAt but a recent checkedAt.
+ */
+export type CodeMapMeta = { fingerprint: string | null; builtAt: string; checkedAt?: string; stats: CodeMapStats; candidates: number | null; unresolved?: number | null; lastFailureAt?: string | null; lastFailure?: string | null; /** When a write that clears the fingerprint started (Neo4j writes in slices); null once published. */ writingAt?: string | null; /** The write's lease: renewed every CODE_MAP_LEASE_RENEW_MS while it runs, so one whose worker died goes stale within CODE_MAP_LEASE_MS. */ writingBeat?: string | null; /** CODE_MAP_VERSION it was built by; null before maps were versioned. */ version?: number | null };
 
 /**
  * Whether what a map says about importers and tests may be short for a reason the map itself cannot count: it was
  * built by older map rules (the worker rebuilds it at start), or before unresolved imports were counted. Until it is
  * rebuilt, answers say the import graph is incomplete rather than that a file has no importers.
  */
+/** A Neo4j code-map write renews its lease this often while it runs. */
+export const CODE_MAP_LEASE_RENEW_MS = 10_000;
+/** A write whose lease is older than this was cut short: its worker died or was killed (/api/status says interrupted). */
+export const CODE_MAP_LEASE_MS = 35_000;
+
 export function mapIncomplete(meta: Pick<CodeMapMeta, 'unresolved' | 'version'> | null | undefined): boolean {
   if (!meta) return false;
   return meta.unresolved == null || (meta.version ?? 0) < CODE_MAP_VERSION;
@@ -134,10 +151,13 @@ export type ModuleContext = {
   misses: FileMiss[];
   /** Approved lessons: derived from those misses, or whose paths cover this file. */
   lessons: Lesson[];
+  /**
+   * Past the map's cap: in the import index, so its importers, imports and tests are known, but the map keeps no
+   * symbols for it (an answer may parse them from the file on demand).
+   */
+  outside?: true;
 };
 
-/** A file past the cap, in the import index: who imports it (sorted) and the tests among them (impact's one hop). */
-export type OutsideFile = { path: string; importers: string[]; tests: string[] };
 
 export type Impact = {
   /** The paths asked about that are in the map or its import index past the cap, sorted. */
@@ -185,9 +205,9 @@ export function repoRelative(file: string, repoRoot: string, cwd: string = repoR
   const root = posix.normalize(repoRoot).replace(/\/+$/, '');
   const abs = posix.isAbsolute(file) ? posix.normalize(file) : posix.join(cwd, file);
   if (!root || !abs.startsWith(`${root}/`)) return null;
-  const rel = abs.slice(root.length + 1).replace(/\/+$/, '');
-  if (!rel || rel.split('/').some((s) => s === '..' || s === '.' || s === '')) return null;
-  return rel;
+  const rel = abs.slice(root.length + 1).replace(/\/+$/, '').normalize('NFC');
+  // Normalized, so no `.`, `..` or empty segment is left in it; empty is the root itself. NFC, as the map's paths are.
+  return rel || null;
 }
 
 const EDIT_TOOLS = new Set(['Edit', 'Write', 'MultiEdit', 'NotebookEdit', 'Delete']);
@@ -234,7 +254,7 @@ export const MAX_TRAILING_TOOL_CALLS = 200;
 export function trailingToolCalls(s: Pick<ParsedSession, 'turns' | 'toolCalls'>): ToolCall[] {
   const last = s.turns.at(-1)?.ts;
   if (!last) return [];
-  return (s.toolCalls ?? []).filter((c) => c.ts > last).slice(-MAX_TRAILING_TOOL_CALLS);
+  return s.toolCalls.filter((c) => c.ts > last).slice(-MAX_TRAILING_TOOL_CALLS);
 }
 
 /**
@@ -273,42 +293,42 @@ export function cleanLessonPath(p: string): string | null {
   return t;
 }
 
-const globCache = new Map<string, RegExp>();
-
-function globRegex(glob: string): RegExp {
-  let re = globCache.get(glob);
-  if (re) return re;
-  let src = '';
-  for (let i = 0; i < glob.length; i++) {
-    const c = glob[i];
-    if (c === '*' && glob[i + 1] === '*') {
-      if (glob[i + 2] === '/') {
-        src += '(?:.*/)?';
-        i += 2;
-      } else {
-        src += '.*';
-        i += 1;
-      }
-    } else if (c === '*') src += '[^/]*';
-    else if (c === '?') src += '[^/]';
-    else src += c.replace(/[.+^${}()|[\]\\]/g, '\\$&');
-  }
-  re = new RegExp(`^${src}$`);
-  if (globCache.size > 2000) globCache.clear();
-  globCache.set(glob, re);
-  return re;
-}
-
 /**
  * Whether a lesson path covers a repo file. A plain path covers the file itself and everything under it as a folder;
  * `*` stays within one folder, `**` crosses folders, and a pattern without `/` matches the file name anywhere.
  */
 export function pathMatches(pattern: string, path: string): boolean {
+  return pathMatcher(pattern)(path);
+}
+
+/** pathMatches for one pattern, cleaned and compiled once, to test many paths. */
+export function pathMatcher(pattern: string): (path: string) => boolean {
+  const p = cleanLessonPath(pattern)?.replace(/\/+$/, '');
+  if (!p) return () => false;
+  if (!/[*?]/.test(p)) return (path) => path === p || path.startsWith(`${p}/`);
+  // Linear in the path whatever the glob (linearMatch.ts): a stored glob is matched on every context call.
+  const glob = compileGlob(p);
+  if (!p.includes('/')) return (path) => glob.test(path.split('/').pop()!);
+  return (path) => glob.test(path);
+}
+
+/**
+ * A code map's paths indexed for pathMatches: a plain lesson path (a file, or a folder of files) is two set lookups
+ * instead of a pass over every file; only a glob still tests each file.
+ */
+export type PathIndex = { files: readonly string[]; exact: ReadonlySet<string>; folders: ReadonlySet<string> };
+export function pathIndex(files: readonly string[]): PathIndex {
+  const folders = new Set<string>();
+  for (const f of files) for (let i = f.indexOf('/'); i > 0; i = f.indexOf('/', i + 1)) folders.add(f.slice(0, i));
+  return { files, exact: new Set(files), folders };
+}
+/** Whether a lesson path covers any file of the index (pathMatches over its files). */
+export function indexMatches(index: PathIndex, pattern: string): boolean {
   const p = cleanLessonPath(pattern)?.replace(/\/+$/, '');
   if (!p) return false;
-  if (!/[*?]/.test(p)) return path === p || path.startsWith(`${p}/`);
-  if (!p.includes('/')) return globRegex(p).test(path.split('/').pop()!);
-  return globRegex(p).test(path);
+  if (!/[*?]/.test(p)) return index.exact.has(p) || index.folders.has(p);
+  const match = pathMatcher(p);
+  return index.files.some(match);
 }
 
 /**
@@ -363,21 +383,22 @@ export function normalizeCodeMap(map: CodeMapWrite): Omit<CodeMapWrite, 'symbols
   const outside = [...new Map((map.outside ?? []).filter((f) => !mapped.has(f.path)).map((f) => [f.path, f])).values()].sort((a, b) => cmp(a.path, b.path));
   const paths = new Set([...mapped, ...outside.map((f) => f.path)]);
   const ord = new Map<string, number>();
+  const redact = redactSecretsMemo();
   const symbols = map.symbols
     .filter((x) => mapped.has(x.path))
     .map((x) => {
       const n = ord.get(x.path) ?? 0;
       ord.set(x.path, n + 1);
-      return { ...x, id: redactSecrets(x.id), name: redactSecrets(x.name), ord: n };
+      return { ...x, id: redact(x.id), name: redact(x.name), ord: n };
     });
   const imports = new Map<string, MapImport>();
   for (const i of map.imports) {
-    const to = i.to.startsWith('pkg:') ? redactSecrets(i.to) : i.to;
+    const to = i.to.startsWith('pkg:') ? redact(i.to) : i.to;
     if (!paths.has(i.from) || (!to.startsWith('pkg:') && !paths.has(to))) continue;
     const k = `${i.from}\0${to}`;
-    const names = i.names.map(redactSecrets);
+    const names = i.names.map(redact);
     const e = imports.get(k);
-    if (!e) imports.set(k, { from: i.from, to, names: [...new Set(names)], spec: redactSecrets(i.spec) });
+    if (!e) imports.set(k, { from: i.from, to, names: [...new Set(names)], spec: redact(i.spec) });
     else for (const n of names) if (!e.names.includes(n)) e.names.push(n);
   }
   const tests = [...new Map(map.tests.filter((t) => paths.has(t.test) && paths.has(t.target)).map((t) => [`${t.test}\0${t.target}`, t])).values()];
@@ -445,7 +466,10 @@ export function hotspotScore(p: { churn: number; misses: number; dependents: num
   return Math.round(s * 100) / 100;
 }
 
-/** Files importing `start`, breadth first up to `depth` hops, nearest first and sorted within a depth (codegraph dependents). */
+/**
+ * Files importing `start`, breadth first up to `depth` hops, nearest first and sorted within a depth (codegraph dependents).
+ * `importersOf` answers every path it is asked, as CodeGraphReads.importersOf does.
+ */
 export async function expandDependents(
   start: string[],
   depth: number,
@@ -458,7 +482,7 @@ export async function expandDependents(
     const found = await importersOf(frontier);
     const next: string[] = [];
     for (const p of frontier) {
-      for (const from of found.get(p) ?? []) {
+      for (const from of found.get(p)!) {
         if (seen.has(from)) continue;
         seen.add(from);
         next.push(from);
@@ -553,20 +577,27 @@ export const MODULE_TESTS_DEPTH = 3;
 
 export function codeGraphViews(r: CodeGraphReads) {
   /**
-   * Test files among the files, and the tests covering any of them, nearest first: `layers[d]` are the files d import
-   * hops from the change, so a test file there is d away and a test covering one of them (a TESTS edge) d + 1. Ties
-   * by path. A capped list then keeps the tests most likely to catch the change.
+   * Test files among the files, and the tests covering any of them, nearest first. First the tests in the folder of a
+   * changed file (its own tests: a Go package's `_test.go` files, foo.test.ts beside foo.ts), then by import distance:
+   * `layers[d]` are the files d import hops from the change, so a test file there is d away, and a test covering one of
+   * them (a TESTS edge, one or two hops) at least d + 1. Ties by path. A capped list then keeps the tests most likely
+   * to catch the change, not the alphabetically first of a hub's far importers.
    */
   const testsFor = async (projectKey: string, layers: string[][]) => {
     const files = layers.flat();
     const known = (await Promise.all([r.mapFiles(projectKey, files), r.outsideFiles(projectKey, files)])).flat();
     const isTest = new Set(known.filter((f) => f.isTest).map((f) => f.path));
     const covering = await Promise.all(layers.map((ps) => (ps.length ? r.testsOf(projectKey, ps) : Promise.resolve([]))));
-    const out = new Set<string>();
-    for (let d = 0; d <= layers.length; d++) {
-      for (const t of [...(layers[d] ?? []).filter((p) => isTest.has(p)), ...(covering[d - 1] ?? [])].sort(cmp)) out.add(t);
-    }
-    return [...out];
+    const distance = new Map<string, number>();
+    const reach = (t: string, d: number) => distance.set(t, Math.min(d, distance.get(t) ?? d));
+    layers.forEach((ps, d) => {
+      for (const p of ps) if (isTest.has(p)) reach(p, d);
+      for (const t of covering[d]) reach(t, d + 1);
+    });
+    const dirOf = (p: string) => p.slice(0, p.lastIndexOf('/') + 1);
+    const beside = new Set(layers[0].map(dirOf));
+    const rank = (t: string) => (beside.has(dirOf(t)) ? -1 : distance.get(t)!);
+    return [...distance.keys()].sort((a, b) => rank(a) - rank(b) || distance.get(a)! - distance.get(b)! || cmp(a, b));
   };
   /** Every mapped file with its hotspot numbers, highest score first (ties by path), and the miss rows they came from. */
   const scored = async (projectKey: string, run: string | null) => {
@@ -580,7 +611,7 @@ export function codeGraphViews(r: CodeGraphReads) {
     const ranked = files
       .map((f) => {
         const parts = { churn: f.churn?.commits ?? 0, misses: missCount.get(f.path)?.size ?? 0, dependents: counts.get(f.path) ?? 0 };
-        // Deploy manifests and docs churn constantly; they rank only once a miss touched them.
+        // Deployment manifests and docs churn constantly; they rank only once a miss touched them.
         const score = isCodeLang(f.lang) || parts.misses > 0 ? hotspotScore(parts) : 0;
         return { path: f.path, ...parts, score, lang: f.lang, loc: f.loc, isTest: f.isTest };
       })
@@ -589,7 +620,9 @@ export function codeGraphViews(r: CodeGraphReads) {
   };
   const views = {
     async moduleContext(projectKey: string, path: string, run: string | null = null): Promise<ModuleContext | null> {
-      const [file] = await r.mapFiles(projectKey, [path]);
+      const [mapped] = await r.mapFiles(projectKey, [path]);
+      // A file past the cap is in the import index: everything but its symbols is known.
+      const file = mapped ?? (await r.outsideFiles(projectKey, [path]))[0];
       if (!file) return null;
       const [symbols, imports, importers, tests, facts, rows, lessons] = await Promise.all([
         r.symbolsOf(projectKey, path),
@@ -605,12 +638,13 @@ export function codeGraphViews(r: CodeGraphReads) {
       return {
         file,
         symbols,
-        importers: [...(importers.get(path) ?? [])].sort(cmp),
+        importers: [...importers.get(path)!].sort(cmp),
         imports,
         tests,
         facts,
         misses,
         lessons: lessonsFor(lessons, [path], misses, projectKey).map((x) => x.lesson),
+        ...(mapped ? {} : { outside: true as const }),
       };
     },
 
@@ -629,20 +663,6 @@ export function codeGraphViews(r: CodeGraphReads) {
         misses,
         lessons: lessonsFor(lessons, all, misses, projectKey).map((x) => x.lesson),
       };
-    },
-
-    /**
-     * The asked paths that are past the cap (in the import index, not the map), with every file importing them and the
-     * tests among those importers and theirs: what get_module_context says instead of "not in the code map".
-     */
-    async outsideMap(projectKey: string, paths: string[]): Promise<OutsideFile[]> {
-      const files = await r.outsideFiles(projectKey, [...new Set(paths)]);
-      if (!files.length) return [];
-      const importers = await r.importersOf(projectKey, files.map((f) => f.path));
-      return Promise.all(files.map(async (f) => {
-        const direct = [...(importers.get(f.path) ?? [])].sort(cmp);
-        return { path: f.path, importers: direct, tests: await testsFor(projectKey, [direct]) };
-      }));
     },
 
     async hotspots(projectKey: string, limit: number, opts: HotspotOpts = {}): Promise<Hotspot[]> {
@@ -862,7 +882,7 @@ export function findInCodeMap(map: Pick<StoredCodeMap, 'files' | 'symbols' | 'im
       matched: exact.has(f.path) ? [f.path, ...matched.map(([t]) => t)] : matched.map(([t]) => t), score: (exact.has(f.path) ? 1000 : 0) + matched.reduce((n, [, x]) => n + x, 0), outside: past.has(f.path), ...around(f.path, null),
     });
   }
-  hits.sort((a, b) => b.score - a.score || Number(b.exported) - Number(a.exported) || b.dependents - a.dependents || cmp(a.path, b.path) || cmp(a.name ?? '', b.name ?? ''));
+  hits.sort((a, b) => b.score - a.score || Number(b.exported) - Number(a.exported) || b.dependents - a.dependents || cmp(a.path, b.path) || cmp(a.name!, b.name!)); // one path: both are symbols
   const perFile = new Map<string, number>();
   const out: CodeMapHit[] = [];
   for (const h of hits) {

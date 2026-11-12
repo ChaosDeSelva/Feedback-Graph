@@ -2,7 +2,7 @@ import type { ActivityInput, ExportBundle } from '@fb/core';
 import { expect, test } from 'vitest';
 import { createApp, type ApiRepo } from './app.ts';
 
-const repo = { listCandidates: async () => [], candidateDetail: async () => null, decide: async () => {}, stats: async () => [] } as ApiRepo;
+const repo = { undoDecision: async () => false, listCandidates: async () => [], candidateDetail: async () => null, decide: async () => {}, stats: async () => [] } as ApiRepo;
 const bundle = { format: 'feedback-graph-export', schemaVersion: 1, exportedAt: '2026-10-22T00:00:00Z', projectKey: 'demo', lessons: [], misses: [], facts: [], docs: [] } as unknown as ExportBundle;
 const OWNER = 'portability-owner-token-0123456789012345';
 
@@ -16,7 +16,7 @@ function app() {
       deleteProject: async (k) => { calls.push(['delete', k]); return 42; },
     },
     docs: { upsertDoc: async () => 'doc:demo:upload:upload:a.md', listDocs: async () => [], deleteDoc: async () => true },
-    activity: { record: async (x) => { log.push(x); }, list: async () => [] },
+    activity: { removeRun: async () => 0, record: async (x) => { log.push(x); }, list: async () => [] },
     embed: async (t) => t.map(() => [1]),
     projectDirs: async () => [{ key: 'demo', name: 'demo', repoPath: '/vibe/demo' }],
   });

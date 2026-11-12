@@ -1,4 +1,6 @@
+import { asIs, labelOf } from './labels.ts';
 import { useEffect, useRef, useState } from 'react';
+import { READ_ONLY_TITLE, useOwnerWrites } from './ownerAccess.tsx';
 import { hashModule, projectHref } from './links.ts';
 import { FACT_KINDS, UNSCORED_RELEVANCE, type FactEvidence, type FactKind } from '@fb/core/types';
 import { relevanceBand, type RelevanceBand } from '@fb/core/relevance';
@@ -7,11 +9,11 @@ import { CodeMap } from './CodeMap.tsx';
 import { ImportBundle } from './ImportBundle.tsx';
 import { ProjectDocs } from './ProjectDocs.tsx';
 import { ProjectLinks } from './ProjectLinks.tsx';
-import { api, type Activity, type ProjectSummary, type StoredFact } from './api.ts';
+import { api, errorMessage, isOutage, type Activity, type ProjectSummary, type StoredFact } from './api.ts';
 import { askConfirm, ConfirmDialog } from './ui/ConfirmDialog.tsx';
 import { PageHeader } from './ui/PageHeader.tsx';
-import { ListRow, SplitPane } from './ui/SplitPane.tsx';
-import { Button, buttonClass, Input, Select } from './ui/controls.tsx';
+import { ListRow, SplitPane, useNarrow } from './ui/SplitPane.tsx';
+import { Button, buttonClass, Input, Select, usePending } from './ui/controls.tsx';
 import { Alert, Badge, Card, EmptyState, plural, SkeletonDetail, SkeletonList, StatGrid, StatTile, StatusBadge } from './ui/display.tsx';
 import { ChevronIcon, DownloadIcon, FolderIcon, PinIcon, SearchIcon, UploadIcon } from './ui/icons.tsx';
 
@@ -23,7 +25,8 @@ const PROVIDERS = [
   { value: 'codex-cli', label: 'Codex (subscription)' },
 ];
 
-const ordinal = (n: number) => `${n}${n % 100 >= 11 && n % 100 <= 13 ? 'th' : ['th', 'st', 'nd', 'rd'][n % 10] ?? 'th'}`;
+/** 1st, 2nd, 3rd, 4th, ... 11th, 12th, 13th, ... 21st. */
+export const ordinal = (n: number) => `${n}${n % 100 >= 11 && n % 100 <= 13 ? 'th' : ['th', 'st', 'nd', 'rd'][n % 10] ?? 'th'}`;
 
 /**
  * Where a project's queued scan stands: 1 runs next. Scans waiting out a retry are not ahead of it (the worker passes
@@ -64,12 +67,21 @@ export function Projects({ pollMs = 5000 }: { pollMs?: number } = {}) {
   // On a phone the list and the project take turns; this is true while the project is showing.
   const [open, setOpen] = useState(!!link);
 
+  // The project list or the open project's facts could not be loaded because the API is down or restarting (no answer, or
+  // a 5xx): the page keeps asking for what failed until it answers. A refusal (a 404 for a project that is not selected)
+  // is an answer, shown once and not asked again.
+  const [down, setDown] = useState<'list' | 'facts' | null>(null);
+  const downRef = useRef(down);
+  downRef.current = down;
+  const [factsRetry, setFactsRetry] = useState(0);
   const load = () => api.projects().then((ps) => {
-    setError(null);
+    // The list answering clears only the list's own outage: a facts outage keeps its alert (mounted once, not once per
+    // poll) until the facts load, and a facts refusal that came back first (a deep link's 404) stays said.
+    if (downRef.current === 'list') { setError(null); setDown(null); }
     setProjects(ps);
     // A deep link must never silently substitute another project: keep its unknown key so the detail says not found.
     setSelected((s) => (s && ps.some((p) => p.key === s) ? s : s === link?.project ? s : ps.find((p) => p.facts > 0)?.key ?? ps[0]?.key ?? null));
-  }, (e) => { setError(String(e)); });
+  }, (e) => { setError(errorMessage(e)); setDown('list'); });
   useEffect(() => { load(); }, []);
   // A link followed while the page is open (Ask, the Dashboard, a module's "link") switches to the project it names, so
   // what the page shows, and what Rebuild or Scan acts on, is always what the address says.
@@ -93,6 +105,26 @@ export function Projects({ pollMs = 5000 }: { pollMs?: number } = {}) {
   };
 
   const current = projects?.find((p) => p.key === selected);
+  // Jump to scan controls: a project is opened first when none is on screen (a phone shows the list), then its controls
+  // are focused once rendered. The link's address is the project's, so a middle-click or a copied link opens Projects.
+  const [jumpAt, setJumpAt] = useState(0);
+  const jumpToScan = (event: React.MouseEvent) => {
+    if (event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+    event.preventDefault();
+    const key = current?.key ?? projects?.[0]?.key;
+    if (!key) return;
+    if (!current || !open) pick(key);
+    setJumpAt(Date.now());
+  };
+  // On a phone the list and the project take turns, and the error shows once, in whichever is on screen.
+  const narrow = useNarrow();
+  const detailOpen = open && !!current;
+  useEffect(() => {
+    if (!jumpAt) return;
+    const target = document.getElementById('project-scan-controls');
+    target?.scrollIntoView?.({ block: 'start' });
+    target?.focus();
+  }, [jumpAt, detailOpen]);
   const scanning = current?.lastScan && ['queued', 'running'].includes(current.lastScan.status);
   const canSwitchProvider = !!provider && provider !== parkedProvider(current?.lastScan ?? null);
 
@@ -101,89 +133,103 @@ export function Projects({ pollMs = 5000 }: { pollMs?: number } = {}) {
   // Only the latest facts request may fill the card: a slow one for a project or search you have left is dropped.
   const factsReq = useRef(0);
   useEffect(() => {
-    if (!selected) return;
+    if (!selected || down === 'list') return;
     setQuery('');
     const n = ++factsReq.current;
-    api.facts(selected, { kind: kind || undefined }).then((f) => { if (n === factsReq.current) setFacts(f); }, (e) => { if (n === factsReq.current) { setError(String(e)); setFacts([]); } });
-  }, [selected, kind, scanning ? '' : scanState]);
+    api.facts(selected, { kind: kind || undefined }).then((f) => {
+      if (n !== factsReq.current) return;
+      setFacts(f);
+      if (downRef.current === 'facts') { setError(null); setDown(null); }
+    }, (e) => {
+      if (n !== factsReq.current) return;
+      setError(errorMessage(e));
+      setFacts([]);
+      // A refusal after an outage is an answer too: stop retrying, or the poll would ask for the 404 forever.
+      if (isOutage(e)) setDown('facts');
+      else if (downRef.current === 'facts') setDown(null);
+    });
+  }, [selected, kind, scanning ? '' : scanState, down === 'list', factsRetry]);
   useEffect(() => { setFacts(null); }, [selected]);
 
-  // Poll while a scan is in flight so progress and new facts show up.
+  // Poll while a scan is in flight so progress and new facts show up, and after a failed load until the API answers.
   useEffect(() => {
-    if (!scanning) return;
-    const t = setInterval(load, pollMs);
+    if (!scanning && !down) return;
+    const t = setInterval(() => {
+      if (scanning || down === 'list') load();
+      if (down === 'facts') setFactsRetry((n) => n + 1);
+    }, pollMs);
     return () => clearInterval(t);
-  }, [scanning, pollMs]);
+  }, [scanning, down, pollMs]);
 
+  // Scan, Cancel, a fact's relevance and the search are controls of the open project, so there always is one.
+  // One owner action at a time on the open project: its button says so while the request is in flight.
+  const [pending, runPending] = usePending<'scan' | 'cancel' | 'switch' | 'pin'>();
   async function scan() {
-    if (!current) return;
+    const { key } = current!;
     try {
-      const job = await api.scan(current.key, provider || undefined);
+      const job = await api.scan(key, provider || undefined);
       setError(null);
       setScanWarning(job.warning ? { jobId: job.id, text: job.warning } : null);
-      setProjects((ps) => ps && ps.map((p) => (p.key === current.key ? { ...p, lastScan: job } : p)));
+      setProjects((ps) => ps && ps.map((p) => (p.key === key ? { ...p, lastScan: job } : p)));
     } catch (e) {
-      setError(String(e));
+      setError(errorMessage(e));
     }
   }
+  const startScan = () => runPending('scan', scan);
 
   async function cancelScan(replace = false) {
-    if (!current?.lastScan) return;
-    if (replace && (!provider || provider === current.lastScan.provider)) {
-      setError('Choose a different explicit provider before switching. “default” may resolve to the same provider that is parked.');
-      return;
-    }
+    const { key, lastScan } = current!;
     const confirmed = await askConfirm({
-      title: replace ? `Cancel this scan and switch ${current.key} to ${provider}?` : `Cancel the queued scan for ${current.key}?`,
+      title: replace ? `Cancel this scan and switch ${key} to ${provider}?` : `Cancel the queued scan for ${key}?`,
       message: replace ? 'The queued job is removed, then a new scan is queued on the provider you selected.' : 'The queued job is removed. No scan is started in its place.',
       confirmLabel: replace ? 'Cancel and switch provider' : 'Cancel queued scan',
       cancelLabel: 'Keep queued scan',
     });
     if (!confirmed) return;
-    try {
-      await api.cancelScan(current.key, current.lastScan.id);
-      if (replace) await scan();
-      else await load();
-      setError(null);
-    } catch (e) { setError(String(e)); }
+    await runPending(replace ? 'switch' : 'cancel', async () => {
+      try {
+        await api.cancelScan(key, lastScan!.id);
+        if (replace) await scan();
+        else await load();
+        setError(null);
+      } catch (e) { setError(errorMessage(e)); }
+    });
   }
 
-  async function pin(p: ProjectSummary) {
+  const pin = (p: ProjectSummary) => runPending('pin', async () => {
     try {
       await api.pinProject(p.key, !p.pinned);
       await load();
       setError(null);
     } catch (e) {
-      setError(String(e));
+      setError(errorMessage(e));
     }
-  }
+  });
 
   async function setRelevance(f: StoredFact, relevance: number) {
-    if (!selected) return;
     try {
-      await api.setFactRelevance(selected, f.id, relevance);
+      await api.setFactRelevance(selected!, f.id, relevance);
       setError(null);
       setFacts((fs) => fs && fs.map((x) => (x.id === f.id ? { ...x, relevance, relevanceBy: 'you' } : x)));
     } catch (e) {
-      setError(String(e));
+      setError(errorMessage(e));
     }
   }
 
   async function search(e: React.FormEvent) {
     e.preventDefault();
-    if (!selected) return;
     const n = ++factsReq.current;
-    api.facts(selected, query.trim() ? { q: query.trim() } : { kind: kind || undefined }).then((f) => { if (n === factsReq.current) { setError(null); setFacts(f); } }, (err) => { if (n === factsReq.current) setError(String(err)); });
+    api.facts(selected!, query.trim() ? { q: query.trim() } : { kind: kind || undefined }).then((f) => { if (n === factsReq.current) { setError(null); setFacts(f); } }, (err) => { if (n === factsReq.current) setError(errorMessage(err)); });
   }
 
   return (
     <div className="flex h-full min-h-0 flex-col">
-      <PageHeader title="Projects" description="The code map, code facts, docs and your data for each project folder the worker reads." actions={<><a href="#project-scan-controls" onClick={(event) => { event.preventDefault(); const target = document.getElementById('project-scan-controls'); target?.scrollIntoView?.({ block: 'start' }); target?.focus(); }} className={buttonClass('ghost', 'sm')}>Jump to scan controls</a><ImportBundle onImported={load} /></>} />
+      <PageHeader title="Projects" description="The code map, code facts, docs and your data for each project folder the worker reads." actions={<><a href={selected ? projectHref(selected) : '#projects'} onClick={jumpToScan} className={buttonClass('ghost', 'sm')}>Jump to scan controls</a><ImportBundle onImported={load} /></>} />
       <SplitPane
         listLabel="projects"
         listWidth="19rem"
         listHeader={<span className="text-xs text-muted tabular-nums">{projects ? plural(projects.length, 'project') : 'Projects'}</span>}
-        detailOpen={open && !!current}
+        detailOpen={detailOpen}
         onBack={() => setOpen(false)}
         notice={error && <Alert>{error}</Alert>}
         list={
@@ -210,7 +256,7 @@ export function Projects({ pollMs = 5000 }: { pollMs?: number } = {}) {
         }
       >
         <div className="mx-auto w-full max-w-4xl px-4 py-5 md:px-6">
-          {error && <Alert className="mb-4">{error}</Alert>}
+          {error && (!narrow || detailOpen) && <Alert className="mb-4">{error}</Alert>}
           {scanWarning && current?.lastScan?.id === scanWarning.jobId && current.lastScan.status === 'queued' && <Alert className="mb-4">{scanWarning.text}</Alert>}
           {!projects ? (
             <SkeletonDetail />
@@ -226,19 +272,19 @@ export function Projects({ pollMs = 5000 }: { pollMs?: number } = {}) {
                   <div className="font-mono text-[11.5px] [overflow-wrap:anywhere] text-muted">{current.repoPath}</div>
                   {current.aliases.length > 0 && <div className="text-xs text-muted">also cloned in {current.aliases.join(", ")}</div>}
                 </div>
-                <div id="project-scan-controls" className="flex flex-wrap items-center gap-2" tabIndex={-1}>
-                  <Button size="md" aria-pressed={current.pinned} onClick={() => pin(current)} title={current.pinned ? 'pinned: listed first everywhere' : 'pin to list it first everywhere'}>
+                <div id="project-scan-controls" className="flex scroll-mt-14 flex-wrap items-center gap-2 rounded-sm outline-offset-4 focus:outline-2 focus:outline-focus md:scroll-mt-0" tabIndex={-1}>
+                  <Button size="md" owner busy={!!pending} aria-pressed={current.pinned} onClick={() => void pin(current)} title={current.pinned ? 'pinned: listed first everywhere' : 'pin to list it first everywhere'}>
                     <PinIcon size={13} filled={current.pinned} />
-                    {current.pinned ? 'Pinned' : 'Pin'}
+                    {pending === 'pin' ? (current.pinned ? 'Unpinning…' : 'Pinning…') : current.pinned ? 'Pinned' : 'Pin'}
                   </Button>
                   <Select aria-label="provider" value={provider} onChange={(e) => { setProvider(e.target.value); setError(null); }} className="w-56">
                     {PROVIDERS.map((p) => <option key={p.value} value={p.value}>{p.label}</option>)}
                   </Select>
-                  <Button variant="primary" onClick={scan} disabled={!!scanning} aria-describedby={scanning ? 'scan-disabled-help' : undefined} title={scanning ? `Scan ${current.lastScan?.status}; see Last scan below for details, cancel a queued scan, or switch provider` : undefined}>Scan</Button>
+                  <Button variant="primary" owner onClick={() => void startScan()} busy={!!scanning || !!pending} aria-describedby={scanning ? 'scan-disabled-help' : undefined} title={scanning ? `Scan ${current.lastScan?.status}; see Last scan below for details, cancel a queued scan, or switch provider` : undefined}>{pending === 'scan' ? 'Starting scan…' : 'Scan'}</Button>
                   {scanning && <span id="scan-disabled-help" className="basis-full text-xs text-muted">{`Scan ${current.lastScan?.status}; see Last scan below for details, cancel a queued scan, or switch to a healthy provider.`}</span>}
                   {current.lastScan?.status === 'queued' && <>
-                    <Button onClick={() => cancelScan()}>Cancel queued scan</Button>
-                    <Button disabled={!canSwitchProvider} aria-describedby={!canSwitchProvider ? 'switch-provider-help' : undefined} onClick={() => cancelScan(true)}>Switch provider and scan</Button>
+                    <Button owner busy={!!pending} onClick={() => void cancelScan()}>{pending === 'cancel' ? 'Cancelling…' : 'Cancel queued scan'}</Button>
+                    <Button owner busy={!!pending} disabled={!canSwitchProvider} aria-describedby={!canSwitchProvider ? 'switch-provider-help' : undefined} onClick={() => void cancelScan(true)}>{pending === 'switch' ? 'Switching…' : 'Switch provider and scan'}</Button>
                     {!canSwitchProvider && <span id="switch-provider-help" className="basis-full text-xs text-muted">{!provider ? 'Choose an explicit provider first; the default may be the parked one.' : 'Choose a different provider from the parked scan.'}</span>}
                   </>}
                 </div>
@@ -249,7 +295,7 @@ export function Projects({ pollMs = 5000 }: { pollMs?: number } = {}) {
                 <StatTile label="feedback" value={current.feedback} hint="pushback flagged" />
                 <StatTile label="lessons" value={current.lessons} hint="drawn from confirmed misses" />
                 {current.factsByOrigin
-                  ? <StatTile label="facts" value={current.facts} hint={`${current.factsByOrigin.model} from code models; ${current.factsByOrigin.manifest} from manifests, ${current.factsByOrigin.document} from documents${current.factsByOrigin.you ? `, ${current.factsByOrigin.you} you wrote` : ''}`} />
+                  ? <StatTile label="facts" value={current.facts} hint={`${current.factsByOrigin.model} from code models; ${current.factsByOrigin.manifest} from manifests, ${current.factsByOrigin.document} from documents${current.factsByOrigin.you ? `, ${current.factsByOrigin.you} you wrote` : ''}${current.factsByOrigin.loop ? `, ${current.factsByOrigin.loop} the learning loop recorded` : ''}`} />
                   : <StatTile label="facts" value={current.facts} hint="extracted from the code" />}
               </StatGrid>
 
@@ -320,7 +366,7 @@ export function Projects({ pollMs = 5000 }: { pollMs?: number } = {}) {
                 {facts === null ? (
                   <SkeletonList rows={4} />
                 ) : facts.length === 0 ? (
-                  <EmptyState title="No facts yet" action={<Button onClick={scan} disabled={!!scanning}>Scan this project</Button>}>
+                  <EmptyState title="No facts yet" action={<Button owner onClick={() => void startScan()} busy={!!scanning || !!pending}>{pending === 'scan' ? 'Starting scan…' : 'Scan this project'}</Button>}>
                     Scan the code to extract conventions, invariants and gotchas agents should know.
                   </EmptyState>
                 ) : (
@@ -348,14 +394,16 @@ export function Projects({ pollMs = 5000 }: { pollMs?: number } = {}) {
 
 /** Pin or unpin from the list, beside the row (a button cannot sit inside the row's own button). */
 function PinButton({ project, onToggle, className = '' }: { project: ProjectSummary; onToggle: () => void; className?: string }) {
+  const writes = useOwnerWrites();
   return (
     <button
       type="button"
       aria-label={`${project.pinned ? 'unpin' : 'pin'} ${project.key}`}
       aria-pressed={project.pinned}
-      title={project.pinned ? 'pinned: listed first everywhere' : 'pin to list it first everywhere'}
+      title={!writes ? READ_ONLY_TITLE : project.pinned ? 'pinned: listed first everywhere' : 'pin to list it first everywhere'}
       onClick={onToggle}
-      className={`grid size-6 place-items-center rounded-sm hover:bg-sunken hover:text-text ${project.pinned ? 'text-accent-text' : 'text-faint'} ${className}`}
+      disabled={!writes}
+      className={`grid size-6 place-items-center rounded-sm enabled:hover:bg-sunken enabled:hover:text-text disabled:cursor-not-allowed disabled:opacity-50 ${project.pinned ? 'text-accent-text' : 'text-faint'} ${className}`}
     >
       <PinIcon size={13} filled={project.pinned} />
     </button>
@@ -442,8 +490,15 @@ function FactGroups({ facts, sort, render }: { facts: StoredFact[]; sort: 'file'
 /** A statement longer than this is cut short, with "show all". */
 const LONG_FACT = 280;
 
+/** Why a fact not read by a model has the origin it has (its badge's hover). */
+const ORIGIN_HINT: Record<string, string> = {
+  manifest: 'read from a manifest (package.json, go.mod, a Makefile...) without a model',
+  loop: 'learned by the loop from past feedback: no scan replaces it',
+};
+
 /** A fact plus, on demand, how it came to exist: the model, its reason, the scan and file version, and the scan log. */
-function FactCard({ f, projectKey, onRelevance, onOpenFile }: { f: StoredFact; projectKey: string; onRelevance: (relevance: number) => void; onOpenFile?: (path: string) => void }) {
+function FactCard({ f, projectKey, onRelevance, onOpenFile }: { f: StoredFact; projectKey: string; onRelevance: (relevance: number) => void; onOpenFile: (path: string) => void }) {
+  const writes = useOwnerWrites();
   const [full, setFull] = useState(false);
   const long = f.statement.length > LONG_FACT;
   const band = relevanceBand(f.relevance);
@@ -461,8 +516,8 @@ function FactCard({ f, projectKey, onRelevance, onOpenFile }: { f: StoredFact; p
   return (
     <li className="border-b border-line px-3 py-2.5 last:border-b-0">
       <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
-        {f.docId || !onOpenFile ? (
-          <span className="min-w-0 font-mono text-[11.5px] [overflow-wrap:anywhere] text-accent-text">{f.docId ? `from your document ${f.path}` : `${f.path}${f.lines ? `:${f.lines}` : ''}`}</span>
+        {f.docId ? (
+          <span className="min-w-0 font-mono text-[11.5px] [overflow-wrap:anywhere] text-accent-text">from your document {f.path}</span>
         ) : (
           <button type="button" aria-label={`open module ${f.path}`} title="open its module panel in the code map" onClick={() => onOpenFile(f.path)} className="min-w-0 text-left font-mono text-[11.5px] [overflow-wrap:anywhere] text-accent-text hover:underline">
             {f.path}{f.lines ? `:${f.lines}` : ''}
@@ -473,8 +528,8 @@ function FactCard({ f, projectKey, onRelevance, onOpenFile }: { f: StoredFact; p
           <Badge>{f.kind.replace('_', ' ')}</Badge>
           {yours
             ? <Badge tone="accent" title={`written by ${f.source === 'you' ? 'you' : f.source} (a lesson converted to a fact): no scan replaces it`}>yours</Badge>
-            : f.origin && f.origin !== 'model' && !f.docId && <Badge title="read from a manifest (package.json, go.mod, a Makefile...) without a model">{f.origin}</Badge>}
-          {f.evidence && <span title={EVIDENCE_HINT[f.evidence]}>{EVIDENCE_LABEL[f.evidence]}</span>}
+            : f.origin && f.origin !== 'model' && !f.docId && <Badge title={ORIGIN_HINT[f.origin]}>{f.origin}</Badge>}
+          {f.evidence && <span title={labelOf(EVIDENCE_HINT, f.evidence, () => '')}>{labelOf(EVIDENCE_LABEL, f.evidence, asIs)}</span>}
           <span className="font-mono text-[11px]">{f.source}</span>
         </span>
       </div>
@@ -499,7 +554,9 @@ function FactCard({ f, projectKey, onRelevance, onOpenFile }: { f: StoredFact; p
               aria-label={`mark ${m.band}`}
               aria-pressed={band === m.band && f.relevanceBy === 'you'}
               onClick={() => onRelevance(m.value)}
-              className="rounded-sm border border-line px-1.5 py-px hover:border-line-strong hover:text-text aria-pressed:border-accent aria-pressed:text-accent-text"
+              disabled={!writes}
+              title={writes ? undefined : READ_ONLY_TITLE}
+              className="rounded-sm border border-line px-1.5 py-px hover:border-line-strong hover:text-text aria-pressed:border-accent aria-pressed:text-accent-text disabled:opacity-45"
             >
               {m.band}
             </button>
@@ -539,7 +596,7 @@ function DataControls({ projectKey, onDeleted, onError }: { projectKey: string; 
       setOpen(false);
       onDeleted();
     } catch (e) {
-      const why = e instanceof Error ? e.message : String(e);
+      const why = errorMessage(e);
       setFailed(why);
       onError(why);
     } finally {
@@ -550,7 +607,7 @@ function DataControls({ projectKey, onDeleted, onError }: { projectKey: string; 
     <Card title="Your data" bodyClass="grid gap-3 p-3">
       <div className="flex flex-wrap items-center gap-2">
         <a href={api.exportUrl(projectKey)} className={buttonClass('secondary', 'sm')}><DownloadIcon size={13} />Export lessons, misses and facts (JSON)</a>
-        <Button size="sm" variant="danger-outline" aria-haspopup="dialog" onClick={() => { setFailed(null); setOpen(true); }}>Delete project data…</Button>
+        <Button size="sm" variant="danger-outline" owner aria-haspopup="dialog" onClick={() => { setFailed(null); setOpen(true); }}>Delete project data…</Button>
       </div>
       <ConfirmDialog
         open={open}

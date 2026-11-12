@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, test } from 'vitest';
 import { credentialFile, Integrations, tokenFingerprint } from './connections.ts';
+import { prBacklogKey } from './github.ts';
 
 function kv() {
   const m = new Map<string, string>();
@@ -62,4 +63,27 @@ describe('Integrations', () => {
   test('sync state starts empty', async () => {
     expect(await new Integrations(kv(), {}).sync('github')).toEqual({ lastSyncAt: null, lastError: null, errorKind: null, rateLimitedUntil: null, authFailedFor: null, projects: {} });
   });
+});
+
+test('damaged stored state reads as nothing saved; a capped GitHub sync\'s backlog reads back per project', async () => {
+  const store = kv();
+  const app = new Integrations(store, {});
+  store.m.set('integrations/github/check', '{not json');
+  store.m.set('integrations/links', '[');
+  expect(await app.check('github')).toBeNull();
+  expect(await app.links()).toEqual({});
+  expect(await app.prBacklog('shop')).toBeNull();
+  store.m.set(prBacklogKey('shop'), JSON.stringify({ since: '2026-10-01T00:00:00Z', until: '2026-10-21T00:00:00Z' }));
+  expect(await app.prBacklog('shop')).toEqual({ since: '2026-10-01T00:00:00Z', until: '2026-10-21T00:00:00Z' });
+  expect(await app.prBacklog('other')).toBeNull();
+});
+
+test('a tokens file that is not an object reads as no tokens', async () => {
+  const path = tmpFile();
+  const { mkdirSync, writeFileSync } = await import('node:fs');
+  const { dirname } = await import('node:path');
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(path, 'null');
+  expect(await credentialFile(path).read()).toEqual({});
+  expect(await new Integrations(kv(), {}, credentialFile(path)).credential('github')).toBeNull();
 });

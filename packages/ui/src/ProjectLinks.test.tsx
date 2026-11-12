@@ -93,3 +93,38 @@ test('suggestions list depends_on before related, then by strength', async () =>
   await screen.findByRole('button', { name: 'confirm link to api' });
   expect(screen.getAllByRole('button', { name: /^confirm link to/ }).map((b) => b.getAttribute('aria-label'))).toEqual(['confirm link to tools', 'confirm link to api', 'confirm link to web']);
 });
+
+test('a decision the server refuses is reported, and the suggestion stays undecided instead of claiming it was dismissed', async () => {
+  const inner = fetch as unknown as (url: string, init?: RequestInit) => Promise<Response>;
+  vi.stubGlobal('fetch', vi.fn(async (url: string, init?: RequestInit) => (url === '/api/links' ? Response.json({ error: 'read-only install' }, { status: 403 }) : inner(url, init))));
+  const onError = vi.fn();
+  render(<ProjectLinks projectKey="game" projects={['game', ...others]} onError={onError} undoMs={60_000} />);
+  fireEvent.click(await screen.findByRole('button', { name: 'dismiss link to api' }));
+  await waitFor(() => expect(onError).toHaveBeenCalledWith('read-only install'));
+  expect(screen.queryByText('dismissed the link to api')).toBeNull();
+  expect(screen.getByRole('button', { name: 'dismiss link to api' })).toBeTruthy();
+});
+
+test('a project linked by hand without a note sends no note', async () => {
+  render(<ProjectLinks projectKey="game" projects={['game', ...others]} onError={() => {}} />);
+  fireEvent.change(await screen.findByLabelText('project to link'), { target: { value: 'web' } });
+  fireEvent.change(screen.getByLabelText('note'), { target: { value: '   ' } });
+  fireEvent.click(screen.getByRole('button', { name: 'Link' }));
+  await waitFor(() => expect(calls.find((c) => c.url === '/api/links')?.body).toEqual({ a: 'game', b: 'web', status: 'confirmed', relation: 'related' }));
+});
+
+test('links that cannot be loaded are reported by the server reason', async () => {
+  vi.stubGlobal('fetch', vi.fn(async () => Response.json({ error: 'the store is starting' }, { status: 503 })));
+  const onError = vi.fn();
+  render(<ProjectLinks projectKey="game" projects={['game', ...others]} onError={onError} />);
+  await waitFor(() => expect(onError).toHaveBeenCalledWith('the store is starting'));
+});
+
+test('opening another project drops the undo offers of the one before', async () => {
+  const { rerender } = render(<ProjectLinks projectKey="game" projects={['game', ...others]} onError={() => {}} undoMs={60_000} />);
+  fireEvent.click(await screen.findByRole('button', { name: 'confirm link to api' }));
+  expect(await screen.findByText(/confirmed the link to api/)).toBeTruthy();
+  rerender(<ProjectLinks projectKey="site" projects={['game', ...others]} onError={() => {}} undoMs={60_000} />);
+  await waitFor(() => expect(screen.queryByText(/confirmed the link to api/)).toBeNull());
+  expect(screen.queryByRole('button', { name: 'Undo' })).toBeNull();
+});

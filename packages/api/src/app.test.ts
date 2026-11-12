@@ -17,7 +17,7 @@ const cand: Candidate = {
 
 function fakeRepo() {
   const calls: unknown[][] = [];
-  const repo: ApiRepo = {
+  const repo: ApiRepo = { undoDecision: async () => false,
     listCandidates: async (f) => { calls.push(['list', f]); return [cand]; },
     candidateDetail: async (id) => (id === 'c1' ? { candidate: cand, turn: {} as never, before: [], after: [], commits: [], postmortem: null } : null),
     decide: async (...a) => { calls.push(['decide', ...a]); },
@@ -157,7 +157,9 @@ test('tokenless loopback compatibility refuses forwarded requests', async () => 
   const local = () => createApp(fakeRepo().repo, { peerAddress: () => '127.0.0.1' });
   expect((await local().request('http://localhost:8787/api/candidates/c1/decision', post(base))).status).toBe(204);
   expect((await createApp(fakeRepo().repo, { peerAddress: () => '172.20.0.9' }).request('http://localhost:8787/api/candidates/c1/decision', post(base))).status).toBe(403);
-  expect((await createApp(fakeRepo().repo, { peerAddress: () => '::ffff:127.0.0.2' }).request('http://127.0.0.2:8787/api/candidates/c1/decision', post({ ...base, host: '127.0.0.2:8787', origin: 'http://127.0.0.2:8787' }))).status).toBe(204);
+  expect((await createApp(fakeRepo().repo, { peerAddress: () => '::ffff:127.0.0.2' }).request('http://localhost:8787/api/candidates/c1/decision', post(base))).status).toBe(204);
+  // Only localhost, 127.0.0.1 and [::1] are local host names; other 127.x names are refused like any unknown host.
+  expect((await createApp(fakeRepo().repo, { peerAddress: () => '::ffff:127.0.0.2' }).request('http://127.0.0.2:8787/api/candidates/c1/decision', post({ ...base, host: '127.0.0.2:8787', origin: 'http://127.0.0.2:8787' }))).status).toBe(403);
   for (const forwarded of [
     { forwarded: 'for=192.0.2.10;host=localhost:8787' },
     { 'x-forwarded-for': '192.0.2.10' },

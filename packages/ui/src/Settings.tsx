@@ -2,14 +2,17 @@ import { useEffect, useMemo, useState, type ReactNode } from 'react';
 import { CloudSync } from './CloudSync.tsx';
 import { Prefilters } from './Prefilters.tsx';
 import { Integrations } from './Integrations.tsx';
-import { api, CLEANUP_CONFIRM, type ProjectCandidate, type ProjectSettings } from './api.ts';
+import { LoopSettings } from './LoopSettings.tsx';
+import { api, CLEANUP_CONFIRM, errorMessage, type ProjectCandidate, type ProjectSettings } from './api.ts';
 import { hashFocus } from './links.ts';
+import { READ_ONLY_TITLE, useOwnerWrites } from './ownerAccess.tsx';
 import { useUnsavedChanges } from './unsaved.ts';
 import { ConfirmDialog } from './ui/ConfirmDialog.tsx';
 import { PageHeader } from './ui/PageHeader.tsx';
-import { Button, CopyButton, Input, Select } from './ui/controls.tsx';
+import { Button, CopyButton, Input, Select, useFocusHandoff } from './ui/controls.tsx';
 import { ago, Alert, Badge, EmptyState, plural, Skeleton, SkeletonList, tdClass, thClass } from './ui/display.tsx';
 import { ChevronIcon, FolderIcon, SearchIcon } from './ui/icons.tsx';
+import { ScrollArea } from './ui/ScrollArea.tsx';
 
 
 /** The page's tabs; `#settings/<tab>` opens one, and so does a link to a card inside it (#settings/integrations-github). */
@@ -17,6 +20,7 @@ const TABS = [
   { key: 'projects', label: 'Projects' },
   { key: 'integrations', label: 'Integrations' },
   { key: 'cloud', label: 'Cloud sync' },
+  { key: 'loop', label: 'Learning loop' },
   { key: 'cleanup', label: 'Clean up' },
 ] as const;
 type Tab = (typeof TABS)[number]['key'];
@@ -26,6 +30,7 @@ export function tabOf(focus: string | null): Tab {
   if (/^(integrations|connections|prefilters)/.test(focus)) return 'integrations';
   if (focus.startsWith('cloud')) return 'cloud';
   if (focus.startsWith('cleanup')) return 'cleanup';
+  if (focus.startsWith('loop')) return 'loop';
   return 'projects';
 }
 
@@ -43,7 +48,6 @@ const SORT_LABEL: Record<SortKey, string> = { activity: 'Last activity', name: '
 /** Names read A to Z; counts and dates read biggest or newest first. */
 const defaultSort = (key: SortKey): Sort => ({ key, desc: key !== 'name' });
 
-const message = (e: unknown) => (e instanceof Error ? e.message : String(e));
 
 /**
  * Why a saved folder is no longer read, or null. It was tracked, then became another clone (its first session linked it
@@ -76,6 +80,7 @@ export function Settings() {
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
+  const retryHandoff = useFocusHandoff();
   const [query, setQuery] = useState('');
   const [filter, setFilter] = useState<Filter>('all');
   const [sort, setSort] = useState<Sort>(defaultSort('activity'));
@@ -89,9 +94,9 @@ export function Settings() {
   const openTab = (t: Tab) => { setTab(t); history.replaceState(null, '', `#settings/${t}`); };
   const moveTab = (from: Tab, key: string) => {
     const i = TABS.findIndex((t) => t.key === from);
+    // key is one of the four the tab's onKeyDown passes on.
     const next = key === 'Home' ? 0 : key === 'End' ? TABS.length - 1
-      : key === 'ArrowRight' ? (i + 1) % TABS.length : key === 'ArrowLeft' ? (i + TABS.length - 1) % TABS.length : -1;
-    if (next < 0) return;
+      : key === 'ArrowRight' ? (i + 1) % TABS.length : (i + TABS.length - 1) % TABS.length;
     openTab(TABS[next].key);
     document.getElementById(`settings-tab-${TABS[next].key}`)?.focus();
   };
@@ -99,12 +104,10 @@ export function Settings() {
   const load = () =>
     api.projectSettings().then(
       (d) => {
-        // An older API (or a proxy page) answers with something else: say so instead of crashing.
-        if (!Array.isArray(d?.candidates)) return setError('The server did not return the folder list. Is the API up to date?');
         setData(d);
         setDraft(new Set(d.tracked));
       },
-      (e) => setError(message(e)),
+      (e) => setError(errorMessage(e)),
     );
   useEffect(() => { load(); }, []);
 
@@ -145,7 +148,7 @@ export function Settings() {
       setNotice(`Saved. Reading ${plural(d.tracked.length, 'project')}; added folders are read from the next cycle, and stopped ones keep their data.`);
       await load();
     } catch (e) {
-      setError(message(e));
+      setError(errorMessage(e));
     } finally {
       setSaving(false);
     }
@@ -187,8 +190,9 @@ export function Settings() {
 
   return (
     <div className="flex h-full min-h-0 flex-col">
-      <PageHeader title="Settings" description="Which project folders are read, the GitHub and Linear connections, cloud sync, and cleaning up old data." />
-      <div role="tablist" aria-label="settings sections" className="flex shrink-0 gap-1 overflow-x-auto border-b border-line px-3 md:px-5">
+      <PageHeader title="Settings" description="Which project folders are read, the GitHub and Linear connections, cloud sync, the learning loop, and cleaning up old data." />
+      {/* On a phone the tabs wrap onto a second line rather than hiding the last ones past the edge. */}
+      <ScrollArea role="tablist" aria-label="settings sections" className="flex shrink-0 gap-1 overflow-x-auto border-b border-line px-3 max-sm:flex-wrap md:px-5">
         {TABS.map((t) => (
           <button
             key={t.key}
@@ -207,13 +211,13 @@ export function Settings() {
             {t.label}
           </button>
         ))}
-      </div>
-      <div id="settings-panel" role="tabpanel" aria-labelledby={`settings-tab-${tab}`} className="min-h-0 flex-1 overflow-y-auto">
+      </ScrollArea>
+      <ScrollArea id="settings-panel" role="tabpanel" aria-labelledby={`settings-tab-${tab}`} className="min-h-0 flex-1 overflow-y-auto">
         <div className="mx-auto grid max-w-6xl gap-5 p-3 md:p-5">
           {error && (
             <Alert>
               {error}
-              {!data && <Button size="sm" className="ml-3" onClick={() => { setError(null); load(); }}>Try again</Button>}
+              {!data && <Button ref={retryHandoff} size="sm" className="ml-3" onClick={() => { setError(null); load(); }}>Try again</Button>}
             </Alert>
           )}
           {notice && (
@@ -270,12 +274,12 @@ export function Settings() {
               {data.candidates.length > 0 && (
                 <div role="group" aria-label="select folders" className="flex flex-wrap items-center gap-1.5 text-xs">
                   <span className="text-muted">Tick:</span>
-                  <Button size="sm" variant="ghost" onClick={() => selectMany(data.candidates)}>Select all</Button>
-                  <Button size="sm" variant="ghost" onClick={() => selectMany(null)}>Select none</Button>
-                  <Button size="sm" variant="ghost" onClick={() => selectMany(rows)} title="The folders the search and filter above show">
+                  <Button size="sm" variant="ghost" owner onClick={() => selectMany(data.candidates)}>Select all</Button>
+                  <Button size="sm" variant="ghost" owner onClick={() => selectMany(null)}>Select none</Button>
+                  <Button size="sm" variant="ghost" owner onClick={() => selectMany(rows)} title="The folders the search and filter above show">
                     Select shown ({tickable(rows).length})
                   </Button>
-                  <Button size="sm" variant="ghost" onClick={() => selectMany(data.candidates.filter((c) => c.claudeSessions + c.codexSessions > 0))}>
+                  <Button size="sm" variant="ghost" owner onClick={() => selectMany(data.candidates.filter((c) => c.claudeSessions + c.codexSessions > 0))}>
                     Select folders with sessions ({tickable(data.candidates.filter((c) => c.claudeSessions + c.codexSessions > 0)).length})
                   </Button>
                   <span className="text-muted">then Save selection.</span>
@@ -290,7 +294,7 @@ export function Settings() {
               )}
 
               {/* Its own scroll box, so the header stays put and the sections below are a short scroll away even with a hundred folders. */}
-              <div className="max-h-[70dvh] overflow-y-auto overscroll-contain rounded-md border border-line bg-surface shadow-card lg:max-h-[min(40rem,68vh)]">
+              <ScrollArea className="max-h-[70dvh] overflow-y-auto overscroll-contain rounded-md border border-line bg-surface shadow-card lg:max-h-[min(40rem,68vh)]">
                 {data.candidates.length === 0 && data.roots.length === 0 ? (
                   <EmptyState icon={<FolderIcon />} title="No project folders yet">
                     Add a project folder below (Where folders come from): the folder that holds your projects, one folder per project inside it.
@@ -309,11 +313,11 @@ export function Settings() {
                       <tr>
                         <th className={`${thClass} w-11`}><span className="sr-only">Read</span></th>
                         <SortHeader k="name" sort={sort} onSort={sortBy} />
-                        <th className={`${thClass} w-[22%]`}>Git remote</th>
+                        <th className={`${thClass} w-[16%] xl:w-[22%]`}>Git remote</th>
                         <SortHeader k="claude" sort={sort} onSort={sortBy} className="w-[7rem] text-right" />
                         <SortHeader k="codex" sort={sort} onSort={sortBy} className="w-[5rem] text-right" />
                         <SortHeader k="activity" sort={sort} onSort={sortBy} className="w-[7.5rem]" />
-                        <th className={`${thClass} w-[11rem]`}>Status</th>
+                        <th className={`${thClass} w-[9rem] xl:w-[11rem]`}>Status</th>
                       </tr>
                     </thead>
                     <tbody className="max-lg:block">
@@ -323,7 +327,7 @@ export function Settings() {
                     </tbody>
                   </table>
                 )}
-              </div>
+              </ScrollArea>
             </section>
           )}
 
@@ -332,9 +336,10 @@ export function Settings() {
           {/* Right under Integrations: the comments it syncs are what these rules skip. */}
           {tab === 'integrations' && data && <Prefilters />}
           {tab === 'cloud' && data && <CloudSync />}
+          {tab === 'loop' && data && <LoopSettings />}
           {tab === 'cleanup' && data && <Cleanup data={data} dirty={dirty} onDone={load} onError={setError} />}
         </div>
-      </div>
+      </ScrollArea>
 
       {data && dirty && (
         <div role="region" aria-label="unsaved selection" className="flex shrink-0 flex-wrap items-center gap-x-3 gap-y-2 border-t border-line bg-surface px-3 py-2.5 shadow-pop md:px-5">
@@ -348,7 +353,7 @@ export function Settings() {
           </span>
           <span className="ml-auto flex gap-2">
             <Button onClick={() => { setDraft(new Set(saved)); setError(null); }} disabled={saving}>Cancel</Button>
-            <Button variant="primary" onClick={save} disabled={saving}>{saving ? 'Saving' : 'Save selection'}</Button>
+            <Button variant="primary" owner onClick={save} disabled={saving}>{saving ? 'Saving' : 'Save selection'}</Button>
           </span>
         </div>
       )}
@@ -385,15 +390,18 @@ function FolderRow({ c, checked, locked, stale, change, onToggle }: {
   c: ProjectCandidate; checked: boolean; locked: string | null; stale: string | null; change: 'add' | 'stop' | null; onToggle: () => void;
 }) {
   const count = (n: number) => <span className={n ? 'text-text' : 'text-muted'}>{n}</span>;
+  // A read-only install cannot save a selection, so its boxes cannot be ticked either.
+  const writes = useOwnerWrites();
+  const off = locked ?? (writes ? null : READ_ONLY_TITLE);
   return (
     <tr aria-label={c.key} className={`max-lg:flex max-lg:flex-wrap max-lg:items-baseline max-lg:gap-y-1 max-lg:border-b max-lg:border-line max-lg:px-3 max-lg:py-2.5 ${checked ? 'bg-selected/60' : ''}`}>
       <td className={`${cell} max-lg:w-9`}>
-        <label title={locked ?? undefined} className={`-m-1 grid size-7 place-items-center rounded-sm ${locked ? 'cursor-not-allowed' : 'cursor-pointer hover:bg-hover'}`}>
+        <label title={off ?? undefined} className={`-m-1 grid size-7 place-items-center rounded-sm ${off ? 'cursor-not-allowed' : 'cursor-pointer hover:bg-hover'}`}>
           <input
             type="checkbox"
             aria-label={`read ${c.key}`}
             checked={checked}
-            disabled={!!locked}
+            disabled={!!off}
             onChange={onToggle}
             className="size-3.5 cursor-[inherit] accent-[var(--color-accent-edge)]"
           />
@@ -441,7 +449,7 @@ const sessionCounts = (claude: number, codex: number) => `${claude} Claude Code,
 /** The project roots: edited here, saved to a file, mounted by ./scripts/setup.sh. Plus the folders outside sessions ran in. */
 function Sources({ data, onSaved, onError }: { data: ProjectSettings; onSaved: (d: ProjectSettings) => void; onError: (e: string | null) => void }) {
   const { claudeSessions, codexSessions } = data.outsideRoots;
-  const suggestions = data.outsideRoots.folders ?? [];
+  const suggestions = data.outsideRoots.folders;
   const editable = !!data.rootsEditable;
   // What you are editing: the saved roots when they wait to be mounted, else the mounted ones.
   const roots = data.pendingRoots ?? data.roots;
@@ -458,7 +466,7 @@ function Sources({ data, onSaved, onError }: { data: ProjectSettings; onSaved: (
       setAdding('');
       setConfirming(null);
     } catch (e) {
-      onError(message(e));
+      onError(errorMessage(e));
     } finally {
       setBusy(false);
     }
@@ -488,7 +496,7 @@ function Sources({ data, onSaved, onError }: { data: ProjectSettings; onSaved: (
                     <span className="min-w-0 flex-1 font-mono text-xs [overflow-wrap:anywhere]">{r}</span>
                     {!data.roots.includes(r) && <Badge tone="accent">not mounted yet</Badge>}
                     {editable && (
-                      <Button size="sm" variant="ghost" aria-label={`remove ${r}`} disabled={busy} onClick={() => setConfirming(r)}>Remove</Button>
+                      <Button size="sm" variant="ghost" owner aria-label={`remove ${r}`} disabled={busy} onClick={() => setConfirming(r)}>Remove</Button>
                     )}
                   </div>
                 </li>
@@ -519,7 +527,7 @@ function Sources({ data, onSaved, onError }: { data: ProjectSettings; onSaved: (
               }}
             >
               <Input aria-label="folder to add" placeholder="/Users/you/code or ~/code" value={adding} onChange={(e) => setAdding(e.target.value)} className="min-w-0 flex-1 font-mono" />
-              <Button type="submit" disabled={busy || !adding.trim()}>Add folder</Button>
+              <Button type="submit" owner disabled={busy || !adding.trim()}>Add folder</Button>
             </form>
           ) : (
             <p className="mt-1 text-xs text-muted">
@@ -543,7 +551,7 @@ function Sources({ data, onSaved, onError }: { data: ProjectSettings; onSaved: (
                         <span className="text-xs text-muted">{sessionCounts(f.claudeSessions, f.codexSessions)} sessions</span>
                       </span>
                       {editable && (
-                        <Button size="sm" aria-label={`add ${f.path} as a root`} disabled={busy} onClick={() => save([...roots, f.path])}>Add as root</Button>
+                        <Button size="sm" owner aria-label={`add ${f.path} as a root`} disabled={busy} onClick={() => save([...roots, f.path])}>Add as root</Button>
                       )}
                     </li>
                   ))}
@@ -581,8 +589,8 @@ function Cleanup({ data, dirty, onDone, onError }: { data: ProjectSettings; dirt
       setConfirming(false);
       onDone();
     } catch (e) {
-      setFailed(message(e));
-      onError(message(e));
+      setFailed(errorMessage(e));
+      onError(errorMessage(e));
     } finally {
       setBusy(false);
     }
@@ -610,7 +618,7 @@ function Cleanup({ data, dirty, onDone, onError }: { data: ProjectSettings; dirt
         {result && <p role="status" className="text-ok-text">{result}</p>}
         {blocked && keys.length > 0 && <p className="text-xs text-muted">{blocked}</p>}
         <div>
-          <Button variant="danger-outline" aria-haspopup="dialog" disabled={!keys.length || !!blocked} onClick={() => { setResult(null); setFailed(null); setConfirming(true); }}>
+          <Button variant="danger-outline" owner aria-haspopup="dialog" disabled={!keys.length || !!blocked} onClick={() => { setResult(null); setFailed(null); setConfirming(true); }}>
             Remove data for {plural(keys.length, 'unselected project')}
           </Button>
         </div>

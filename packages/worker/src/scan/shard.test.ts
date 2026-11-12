@@ -38,9 +38,9 @@ test('package.json workspaces (array or object form), go.work and Cargo workspac
 });
 
 test('without a workspace, top-level directories under src/, services/, apps/, cmd/ and packages/ are the shards', () => {
-  const paths = ['README.md', 'Makefile', 'go.mod', ...pkg('src/webapp', 9), ...pkg('src/billing', 7), ...pkg('cmd/server', 5), ...pkg('deploy', 6), 'src/main.go'];
+  const paths = ['README.md', 'Makefile', 'go.mod', ...pkg('src/portal', 9), ...pkg('src/billing', 7), ...pkg('cmd/server', 5), ...pkg('deploy', 6), 'src/main.go'];
   const shards = planShards(paths, {});
-  expect(summary(shards)).toEqual([['.', 10], ['cmd/server', 5], ['src/billing', 7], ['src/webapp', 9]]);
+  expect(summary(shards)).toEqual([['.', 10], ['cmd/server', 5], ['src/billing', 7], ['src/portal', 9]]);
   expectPartition(paths, shards);
 });
 
@@ -150,14 +150,14 @@ function expectRelated(shards: Shard[]) {
 /** A realistic monorepo: a JS workspace nested in src/, Go services beside it, services/, an attic, end-to-end tests, fixtures. */
 const acme = () => [
   'package.json', 'README.md', 'Makefile', ...pkg('docs', 6),
-  ...pkg('src/webapp', 3, 'package.json'),
-  ...pkg('src/webapp/apps/api', 60, 'package.json'), ...pkg('src/webapp/apps/api/test', 20),
+  ...pkg('src/portal', 3, 'package.json'),
+  ...pkg('src/portal/apps/api', 60, 'package.json'), ...pkg('src/portal/apps/api/test', 20),
   // a fixture's manifest is test data, not a package
-  ...pkg('src/webapp/apps/api/test/fixtures/sample', 3, 'package.json'),
-  ...pkg('src/webapp/apps/spa', 80, 'package.json'),
-  ...pkg('src/webapp/packages/ui', 40, 'package.json'), ...pkg('src/webapp/packages/utils', 3, 'package.json'), ...pkg('src/webapp/packages/icons', 2, 'package.json'),
+  ...pkg('src/portal/apps/api/test/fixtures/sample', 3, 'package.json'),
+  ...pkg('src/portal/apps/spa', 80, 'package.json'),
+  ...pkg('src/portal/packages/ui', 40, 'package.json'), ...pkg('src/portal/packages/utils', 3, 'package.json'), ...pkg('src/portal/packages/icons', 2, 'package.json'),
   ...pkg('src/data-pipeline', 50, 'go.mod'), ...pkg('src/data-pipeline/cmd/ingest', 3), ...pkg('src/data-pipeline/cmd/export', 2),
-  ...pkg('src/context-graph', 45, 'go.mod'),
+  ...pkg('src/catalog-index', 45, 'go.mod'),
   ...pkg('services/billing', 30, 'package.json'), ...pkg('services/auth', 25, 'pyproject.toml'), ...pkg('services/mailer', 2, 'Cargo.toml'),
   ...pkg('attic/old-api', 40, 'package.json'), ...pkg('attic/legacy-ui', 30),
   ...pkg('tests/e2e', 25),
@@ -167,15 +167,15 @@ test('shards follow service boundaries in a realistic monorepo: nested apps at a
   const paths = acme();
   const shards = planShards(paths, { 'package.json': JSON.stringify({ name: 'acme', private: true }) });
   const keys = shards.map((s) => s.key);
-  // 0.6.2: src/webapp/apps/api was no shard of its own (only the top-level src/<x> were found).
-  for (const k of ['src/webapp/apps/api', 'src/webapp/apps/spa', 'src/webapp/packages/ui', 'src/data-pipeline', 'src/context-graph', 'services/billing', 'attic', 'tests']) expect(keys, k).toContain(k);
+  // 0.6.2: src/portal/apps/api was no shard of its own (only the top-level src/<x> were found).
+  for (const k of ['src/portal/apps/api', 'src/portal/apps/spa', 'src/portal/packages/ui', 'src/data-pipeline', 'src/catalog-index', 'services/billing', 'attic', 'tests']) expect(keys, k).toContain(k);
   // Two tiny Go commands under a service are its parts: merged with each other, in their cmd/ folder.
   expect(keys).toContain('src/data-pipeline/cmd/ingest+src/data-pipeline/cmd/export');
   // Tiny packages merge with a sibling in the same packages/ (or services/) folder, never with a service elsewhere.
-  expect(keys).toContain('src/webapp/packages/utils+src/webapp/packages/icons');
+  expect(keys).toContain('src/portal/packages/utils+src/portal/packages/icons');
   expect(keys).toContain('services/auth+services/mailer');
   // The workspace's own few files are no service's: they go with the rest of the repo, not with a Go service beside it.
-  expect(shards.find((s) => s.roots[0] === '')!.roots).toEqual(['', 'src/webapp']);
+  expect(shards.find((s) => s.roots[0] === '')!.roots).toEqual(['', 'src/portal']);
   expect(keys.some((k) => k.includes('fixtures'))).toBe(false);
   // The attic's own manifests make no shards: it is one archive.
   expect(keys.some((k) => k.startsWith('attic/'))).toBe(false);
@@ -187,7 +187,7 @@ test(`a monorepo of many services is capped at ${MAX_SHARDS} shards by merging s
   const paths = [
     'package.json',
     ...Array.from({ length: 30 }, (_, i) => pkg(`services/s${String(i).padStart(2, '0')}`, 20 + i, 'package.json')).flat(),
-    ...Array.from({ length: 12 }, (_, i) => pkg(`src/webapp/apps/a${String(i).padStart(2, '0')}`, 30 + i, 'package.json')).flat(),
+    ...Array.from({ length: 12 }, (_, i) => pkg(`src/portal/apps/a${String(i).padStart(2, '0')}`, 30 + i, 'package.json')).flat(),
     ...Array.from({ length: 8 }, (_, i) => pkg(`src/go-${i}`, 40 + i, 'go.mod')).flat(),
   ];
   const shards = planShards(paths, {});
@@ -242,4 +242,33 @@ test('the fact budget is enforced from the file mix:low-value files add a small 
   expect(lowValueBudget(0)).toBe(0);
   expect(lowValueBudget(100_000)).toBeLessThanOrEqual(10);
   expect(shardFactBudget(2000, 2000)).toBe(MAX_SHARD_BUDGET);
+});
+
+test('workspace files that declare no packages (no packages: list, not JSON, a Cargo workspace with only excludes) add no roots', () => {
+  const paths = [...pkg('libs/a', 6), ...pkg('libs/b', 6), ...pkg('crates/x', 6, 'Cargo.toml'), 'package.json', 'Cargo.toml'];
+  const shards = planShards(paths, {
+    'pnpm-workspace.yaml': 'catalog:\n  react: ^18\n',
+    'package.json': '{ not json',
+    'Cargo.toml': '[workspace]\nexclude = ["crates/x"]\n',
+  });
+  expect(shards).toEqual(planShards(paths, {}));
+  // crates/x is still a root: it holds its own manifest.
+  expect(shards.map((s) => s.key)).toContain('crates/x');
+});
+
+test('a tiny service with nothing related to merge with (no sibling, no rest of the repo) stays a shard of its own', () => {
+  const paths = [...pkg('services/api', 8, 'package.json'), ...pkg('lib', 2, 'package.json')];
+  expect(summary(planShards(paths, {}))).toEqual([['lib', 3], ['services/api', 9]]);
+});
+
+test('past MAX_SHARDS, top-level services that may not merge with each other fold into the rest of the repo, or stay when there is none', () => {
+  const services = Array.from({ length: MAX_SHARDS + 3 }, (_, i) => pkg(`svc${String(i).padStart(2, '0')}`, MIN_SHARD_FILES, 'go.mod'));
+  const withRest = [...services.flat(), 'README.md', ...pkg('docs', 5)];
+  const folded = planShards(withRest, {});
+  expect(folded).toHaveLength(MAX_SHARDS);
+  // 43 services and the rest of the repo: the rest took in four of them.
+  expect(folded.find((s) => s.key.startsWith('.'))!.roots).toHaveLength(5);
+  expectPartition(withRest, folded);
+  // No rest of the repo to fold into: every service stays its own shard, past the limit.
+  expect(planShards(services.flat(), {})).toHaveLength(MAX_SHARDS + 3);
 });

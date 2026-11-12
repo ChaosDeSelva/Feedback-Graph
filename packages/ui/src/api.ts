@@ -1,7 +1,10 @@
-import type { Activity, ActivityKind, Connection, ConnectionName, ExternalRef, FeedbackSource, CloudSyncResult, SyncCounts, SyncTrigger, Candidate, CodeMapMeta, Hotspot, MapGraph, ModuleContext, FolderCandidate, OutsideFolder, PipelineStatus, DocSummary, CandidateDetail, CandidateStatus, EvidenceGraph, FactHit, FactKind, Lesson, LessonCheckName, LessonDetail, LessonFrom, LessonQuality, LessonQualityReport, LessonStatus, PatternReport, ProjectSummary, ProjectLink, LinkRelation, LinkStatus, ScanJob, SessionDetail, SessionListItem, SessionState, StatsRow, StoredFact, SystemStatus } from '@fb/core';
+import type { Activity, ActivityKind, Connection, ConnectionName, ExternalRef, FeedbackSource, CloudSyncResult, SyncCounts, SyncTrigger, Candidate, CodeMapMeta as StoredCodeMapMeta, Hotspot, MapGraph, ModuleContext, FolderCandidate, OutsideFolder, PipelineStatus, DocSummary, CandidateDetail, CandidateStatus, EvidenceGraph, FactHit, FactKind, Lesson as StoredLesson, LessonCheckName, LessonDetail as StoredLessonDetail, LessonFrom, LessonQuality, LessonQualityReport, LessonStatus, LessonTriggers, PatternReport, ProjectSummary, ProjectLink, LinkRelation, LinkStatus, ScanJob, SessionDetail, SessionListItem, SessionState, StatsRow, StoredFact, SystemStatus } from '@fb/core';
 import type { ChatConversation, ChatProvider, ChatThread } from '@fb/core/chat';
 
-export type { Connection, ConnectionName, ExternalRef, FeedbackSource, CloudSyncResult, SyncCounts, Activity, Candidate, CodeMapMeta, Hotspot, MapGraph, ModuleContext, DocSummary, CandidateDetail, CandidateStatus, EvidenceGraph, Lesson, LessonDetail, LessonQuality, LessonQualityReport, LessonStatus, PatternReport, ProjectSummary, ProjectLink, LinkRelation, LinkStatus, ScanJob, PipelineStatus, SessionDetail, SessionListItem, SessionState, StatsRow, StoredFact, SystemStatus };
+export type { Connection, ConnectionName, ExternalRef, FeedbackSource, CloudSyncResult, SyncCounts, Activity, Candidate, Hotspot, MapGraph, ModuleContext, DocSummary, CandidateDetail, CandidateStatus, EvidenceGraph, LessonQuality, LessonQualityReport, LessonStatus, PatternReport, ProjectSummary, ProjectLink, LinkRelation, LinkStatus, ScanJob, PipelineStatus, SessionDetail, SessionListItem, SessionState, StatsRow, StoredFact, SystemStatus };
+/** A lesson as the API serves it: changedByLoop when a learning-loop decision still applied changed it. */
+export type Lesson = StoredLesson & { changedByLoop?: true };
+export type LessonDetail = Omit<StoredLessonDetail, 'lesson'> & { lesson: Lesson };
 
 /** One folder on the Settings page (GET /api/settings/projects). */
 export type ProjectCandidate = FolderCandidate & {
@@ -21,8 +24,8 @@ export type ProjectSettings = {
   initialized: boolean;
   tracked: string[];
   candidates: ProjectCandidate[];
-  /** Sessions outside every root, and the folders they ran in that could be added as roots. `folders`: unset from older APIs. */
-  outsideRoots: { claudeSessions: number; codexSessions: number; folders?: OutsideFolder[] };
+  /** Sessions outside every root, and the folders they ran in that could be added as roots. */
+  outsideRoots: { claudeSessions: number; codexSessions: number; folders: OutsideFolder[] };
   /** The mounted roots, as host paths. */
   roots: string[];
   /** Roots saved here that are not mounted yet (./scripts/setup.sh mounts them); null when nothing is waiting. */
@@ -41,6 +44,11 @@ export type ProjectSettings = {
  * were counted that holds as many files as the cap allows.
  */
 export type MapCapped = { files: number; of: number | null } | null;
+/**
+ * A code map's meta as the API sends it: builtAt and checkedAt are null for a map whose first build never finished (a
+ * 0.7.5 Neo4j record of the failure), which the store's type does not say.
+ */
+export type CodeMapMeta = Omit<StoredCodeMapMeta, 'builtAt' | 'checkedAt'> & { builtAt: string | null; checkedAt?: string | null };
 export type CodeMapReport = { meta: CodeMapMeta | null; hotspots: Hotspot[]; capped?: MapCapped };
 /** GET /api/codemap/hotspots: hotspots across the selected projects. */
 export type ProjectHotspot = Hotspot & { projectKey: string };
@@ -50,12 +58,14 @@ export type CloudInfo = {
   enabled: boolean;
   host: string | null;
   intervalMinutes: number | null;
-  /** SYNC_SUGGESTIONS: lessons you have not approved are sent too (proposed ones as suggestions). Older APIs leave it out. */
-  suggestions?: boolean;
-  localOnlyProjects?: string[];
-  localOnlyEditable?: boolean;
-  savedLocalOnlyProjects?: string[];
-  shareDemoProjects?: string[];
+  /** SYNC_SUGGESTIONS: lessons you have not approved are sent too (proposed ones as suggestions). */
+  suggestions: boolean;
+  /** Projects never sent: the saved list and CLOUD_LOCAL_ONLY_PROJECTS together. */
+  localOnlyProjects: string[];
+  /** The saved list can be changed here (the API has somewhere to keep it). */
+  localOnlyEditable: boolean;
+  savedLocalOnlyProjects: string[];
+  shareDemoProjects: string[];
   projects: string[];
   preview: { total: SyncCounts; projects: { key: string; counts: SyncCounts | null; reason?: string }[] } | null;
   previewError: string | null;
@@ -75,18 +85,31 @@ export type ImportResult = {
 export const CLEANUP_CONFIRM = 'remove-unselected';
 
 /** projectKey: with scope project or task, the project a global lesson is narrowed to (PATCH /api/lessons/:id). */
-export type LessonEdit = Partial<Pick<Lesson, 'title' | 'rule' | 'appliesWhen' | 'scope'>> & { status?: 'approved' | 'rejected' | 'revoked' | 'proposed'; projectKey?: string };
+export type LessonEdit = Partial<Pick<Lesson, 'title' | 'rule' | 'appliesWhen' | 'scope'>> & { triggers?: LessonTriggers; status?: 'approved' | 'rejected' | 'revoked' | 'proposed'; projectKey?: string };
 
 /** Fired when the API wants a sign-in (a token is configured and the session is missing or expired). */
 export const SIGN_IN_EVENT = 'fg:sign-in';
 
+/** What to show for a failure: an Error's message, or the thrown value itself. */
+export const errorMessage = (e: unknown) => (e instanceof Error ? e.message : String(e));
+/** An error the API answered with; anything else thrown by a request is the API not answering at all. */
+export class ApiError extends Error {
+  readonly status: number;
+  /** The refusal's JSON body, or null: some carry more than the message (a rollback's 409 names what blocks it). */
+  readonly body: unknown;
+  constructor(status: number, message: string, body: unknown = null) { super(message); this.status = status; this.body = body; }
+}
+/** The API is down or restarting (no answer, or a 5xx), as opposed to answering a request it refuses. */
+export const isOutage = (e: unknown) => !(e instanceof ApiError) || e.status >= 500;
+
 /** The server's own explanation ("cannot narrow…", validation errors) instead of a bare status code. */
-async function errorText(res: Response): Promise<string> {
+async function apiError(res: Response): Promise<ApiError> {
   const body = await res.json().catch(() => null);
   const e = body?.error;
-  if (typeof e === 'string') return e;
-  if (e?.fieldErrors) return Object.entries(e.fieldErrors as Record<string, string[]>).map(([k, v]) => `${k}: ${v.join(', ')}`).join('; ') || res.statusText;
-  return `${res.status} ${res.statusText}`;
+  const text = typeof e === 'string' ? e
+    : e?.fieldErrors ? Object.entries(e.fieldErrors as Record<string, string[]>).map(([k, v]) => `${k}: ${v.join(', ')}`).join('; ') || res.statusText
+    : `${res.status} ${res.statusText}`;
+  return new ApiError(res.status, text, body);
 }
 
 /**
@@ -131,7 +154,7 @@ async function request<T = void>(path: string, o: { method?: string; body?: unkn
     body: write && o.body !== undefined ? JSON.stringify(o.body) : undefined,
   }, { write, retry: o.retry !== false });
   if (res.status === 401) window.dispatchEvent(new Event(SIGN_IN_EVENT));
-  if (!res.ok) throw new Error(await errorText(res));
+  if (!res.ok) throw await apiError(res);
   if (res.status === 204) return undefined as T;
   return res.json() as Promise<T>;
 }
@@ -140,17 +163,17 @@ async function request<T = void>(path: string, o: { method?: string; body?: unkn
 async function requestPage<T>(path: string): Promise<{ items: T[]; next: number | null }> {
   const res = await send(path, { method: 'GET' }, { write: false, retry: true });
   if (res.status === 401) window.dispatchEvent(new Event(SIGN_IN_EVENT));
-  if (!res.ok) throw new Error(await errorText(res));
+  if (!res.ok) throw await apiError(res);
   const next = res.headers.get('x-next-offset');
   return { items: (await res.json()) as T[], next: next === null ? null : Number(next) };
 }
 
-/** A GET of one page of a list paged by cursor: the rows, and the cursor of the next page (x-next-cursor), or null. */
-async function requestCursorPage<T>(path: string): Promise<{ items: T[]; next: string | null }> {
+/** A GET of one page of a list paged by cursor: the rows, and the cursor of the next page (`header`), or null. */
+async function requestCursorPage<T>(path: string, header = 'x-next-cursor'): Promise<{ items: T[]; next: string | null }> {
   const res = await send(path, { method: 'GET' }, { write: false, retry: true });
   if (res.status === 401) window.dispatchEvent(new Event(SIGN_IN_EVENT));
-  if (!res.ok) throw new Error(await errorText(res));
-  return { items: (await res.json()) as T[], next: res.headers.get('x-next-cursor') };
+  if (!res.ok) throw await apiError(res);
+  return { items: (await res.json()) as T[], next: res.headers.get(header) };
 }
 
 const enc = encodeURIComponent;
@@ -166,7 +189,7 @@ export const ACTIVITY_WITH_RUNS = 'runs';
 export const CANDIDATE_PAGE = 200;
 
 export const api = {
-  session: () => request<{ authRequired: boolean; authenticated: boolean; ownerSession: boolean; ownerSetupRequired?: boolean }>('/api/session'),
+  session: () => request<{ authRequired: boolean; authenticated: boolean; ownerSession: boolean; ownerSetupRequired?: boolean; ownerWrites?: boolean }>('/api/session'),
   signIn: (token: string) => request('/api/session', { method: 'POST', body: { token } }),
   signOut: () => request('/api/session', { method: 'DELETE', body: {} }),
   status: () => request<SystemStatus>('/api/status'),
@@ -220,7 +243,7 @@ export const api = {
    * run: one labelled run's entries. withRuns: ask for labelled runs' entries too (ACTIVITY_WITH_RUNS), for an API
    * whose default feed leaves them out; the Activity page also hides them itself unless asked.
    */
-  activity: (o: { project?: string; kind?: ActivityKind; target?: string; run?: string; limit?: number; withRuns?: boolean }) =>
+  activity: (o: { project?: string; kind?: ActivityKind | LoopActivityKind; target?: string; run?: string; limit?: number; withRuns?: boolean }) =>
     request<Activity[]>(`/api/activity${qs({ target: o.target, project: o.project, kind: o.kind, run: o.run, limit: String(o.limit ?? 100), [ACTIVITY_WITH_RUNS]: o.withRuns ? '1' : undefined })}`),
   /** One activity entry with all its details (a list row with detailsOmitted has none). */
   activityEntry: (id: string) => request<Activity>(`/api/activity/${enc(id)}`),
@@ -246,7 +269,7 @@ export const api = {
   cleanupUnselected: () => request<{ removed: string[]; nodesRemoved: number }>('/api/settings/cleanup', { method: 'POST', body: { confirm: CLEANUP_CONFIRM }, retry: false }),
 
   cloud: () => request<CloudInfo>('/api/cloud'),
-  cloudLocalOnly: (projects: string[]) => request<{ projects: string[] }>('/api/cloud/local-only', { method: 'PUT', body: JSON.stringify({ projects }) }),
+  cloudLocalOnly: (projects: string[]) => request<{ projects: string[] }>('/api/cloud/local-only', { method: 'PUT', body: { projects } }),
   syncCloud: () => request<CloudSyncResult>('/api/cloud/sync', { method: 'POST', body: {}, retry: false }),
 
   /** A failed reading, queued again (no re-upload): after DOCS_LLM changed to a model with vision, say. */
@@ -255,7 +278,7 @@ export const api = {
     const res = await send(`/api/docs/${enc(id)}`, { method: 'GET' }, { write: false, retry: true });
     if (res.status === 401) window.dispatchEvent(new Event(SIGN_IN_EVENT));
     if (res.status === 404) return null;
-    if (!res.ok) throw new Error(await errorText(res));
+    if (!res.ok) throw await apiError(res);
     return (await res.json()) as DocSummary;
   },
   rereadDoc: (id: string) => request(`/api/docs/${enc(id)}/reread`, { method: 'POST', body: {} }),
@@ -304,11 +327,12 @@ export type ProjectIntegrations = {
 };
 
 /** A skip rule with how many comments it kept from the classifier (null: not counted). */
-export type SkipRuleView = { name: string; description: string; skipped: number | null; fromInbox?: number | null };
+export type SkipRuleView = { name: string; description: string; skipped: number | null; fromInbox: number | null };
 export type IntegrationsView = {
   canSave: boolean; syncMinutes: number; github: ServiceView; linear: ServiceView; projects: ProjectIntegrations[];
-  /** Absent from APIs older than 0.5.1. */
-  rules?: SkipRuleView[]; skippedSince?: string | null;
+  rules: SkipRuleView[];
+  /** The oldest skip counted; null when nothing has been skipped. */
+  skippedSince: string | null;
 };
 export type IntegrationKind = 'github' | 'linear';
 export type LinearTeam = { id: string; key: string; name: string };
@@ -325,3 +349,204 @@ export const integrationsApi = {
 
 /** GET /api/sessions: one page, newest first; `next` asks for the following one. */
 export type SessionPage = { sessions: SessionListItem[]; next: string | null };
+
+// ── Learning loop (0.8.0): the Decision record and the loop's state. Mirrors core's Decision types (core types.ts);
+// docs/learning-loop-api.md is the contract the API implements. Lookups keyed by these enums fall back at runtime
+// (loop.ts), because a newer server may send a value this build does not know.
+
+export const DECISION_TYPES = ['link_misses', 'merge_duplicates', 'rank_weight', 'retire_lesson', 'reject_lesson', 'approve_lesson', 'reword_lesson', 'narrow_scope', 'record_fact', 'triage_inbox', 'tune_threshold'] as const;
+export type DecisionType = (typeof DECISION_TYPES)[number];
+export const DECISION_STATUSES = ['observed', 'proposed', 'applying', 'applied', 'rejected', 'rolled_back', 'overridden', 'expired'] as const;
+export type DecisionStatus = (typeof DECISION_STATUSES)[number];
+export type DecisionTier = 'H' | 'A' | 'P';
+/** A decision's own mode: recorded only, waiting for you, or applied by the loop. */
+export type DecisionMode = 'observe' | 'propose' | 'auto';
+export const LOOP_MODES = ['off', 'observe', 'propose', 'auto'] as const;
+export type LoopMode = (typeof LOOP_MODES)[number];
+export type DecisionTargetKind = 'lesson' | 'fact' | 'miss' | 'candidate' | 'project';
+export type DecisionTarget = { kind: DecisionTargetKind; id: string; role: 'primary' | 'keeper' | 'merged' | 'created' };
+/** A target's redacted fields at one moment, and the sha256 of its canonical fields. */
+export type TargetSnapshot = { kind: DecisionTargetKind; id: string; fields: Record<string, unknown>; fingerprint: string };
+export type EvidenceKind = 'activity' | 'miss' | 'lesson' | 'fact' | 'check' | 'session' | 'candidate';
+export type EvidenceRef = { kind: EvidenceKind; id: string; role: string; weight: number; observedAt: string };
+export type DecisionConfidence = { p: number; lower: number; n: number; band: number };
+export type DecisionRollback = { at: string; by: string; reason: RollbackReason | null; note: string | null; cascade: string[] };
+export type Decision = {
+  id: string;
+  type: DecisionType;
+  projectKey: string | null;
+  targets: DecisionTarget[];
+  before: TargetSnapshot[];
+  after: TargetSnapshot[];
+  evidence: EvidenceRef[];
+  features: Record<string, number>;
+  score: number;
+  confidence: DecisionConfidence;
+  tier: DecisionTier;
+  mode: DecisionMode;
+  rationale: string;
+  /** A provider spec, or 'deterministic'. */
+  model: string | null;
+  policyVersion: number;
+  status: DecisionStatus;
+  dependsOn: string[];
+  supersededBy?: string;
+  createdAt: string;
+  appliedAt?: string;
+  decidedAt?: string;
+  /** `loop:<v>`, `you` or `operator:<name>`. */
+  decidedBy?: string;
+  rollback?: DecisionRollback;
+  ratifiedAt?: string;
+  ratifiedBy?: string;
+  syncHoldUntil?: string;
+};
+export const NOTE_REASONS = ['wrong_evidence', 'too_broad', 'wording', 'not_now', 'other'] as const;
+export type RollbackReason = (typeof NOTE_REASONS)[number];
+export type DecisionNote = { id: string; decisionId: string; ts: string; by: string; text: string; verdict?: 'agree' | 'disagree' | null; reason?: RollbackReason };
+
+/** An evidence pointer resolved to something to show and link: `missing` when it no longer exists. */
+export type ResolvedEvidence = EvidenceRef & { label: string; projectKey?: string | null; path?: string | null; activity?: Activity | null; missing?: boolean };
+/** Another decision, as a line in "depends on / depended on by" and in a rollback cascade. */
+export type DecisionSummary = Pick<Decision, 'id' | 'type' | 'status' | 'createdAt' | 'projectKey'> & { label: string };
+/** GET /api/decisions/:id. `current`: the targets now (empty for a target that is gone). */
+export type DecisionDetail = { decision: Decision; current: TargetSnapshot[]; evidence: ResolvedEvidence[]; dependsOn: DecisionSummary[]; dependents: DecisionSummary[]; notes: DecisionNote[] };
+export type DecisionFilter = {
+  status?: DecisionStatus; type?: DecisionType; project?: string; mode?: DecisionMode; band?: number; target?: string;
+  since?: string; until?: string; q?: string; limit?: number; offset?: number;
+  /** x-next-after of the page before: the next page by keyset, as fast however deep (instead of offset). */
+  after?: string;
+};
+/** POST …/rollback with cascade 'preview': what else would be undone, and what blocks it. */
+export type RollbackPreview = { cascade: DecisionSummary[]; blocked: { id: string; reason: string }[] };
+export type DecisionAction = 'approve' | 'reject' | 'keep' | 'rollback';
+export type DecisionActionBody = { expect: DecisionStatus; note?: string; reason?: RollbackReason; cascade?: 'preview' | 'apply'; restoreAnyway?: boolean };
+
+export type CalibrationBand = { band: number; alpha: number; beta: number; n: number; p: number; lower: number };
+export type LoopTypeState = {
+  type: DecisionType;
+  tier: DecisionTier;
+  /** The per-type override; null follows the global mode. */
+  mode: LoopMode | null;
+  effectiveMode: LoopMode;
+  tau: number;
+  tauDefault: number;
+  calibration: { p: number; lower: number; n: number };
+  bands: CalibrationBand[];
+  rollbackRate: { rolledBack: number; of: number };
+  breaker: { tripped: boolean; at: string | null; reason: string | null };
+};
+export const ROUND_PHASES = ['reading', 'scoring', 'writing', 'done', 'aborted'] as const;
+export type RoundPhase = (typeof ROUND_PHASES)[number];
+export type LoopRound = {
+  id: string; startedAt: string; finishedAt: string | null; phase: RoundPhase;
+  signalsIngested: number; targetsScored: number; targetsTotal: number | null;
+  decisions: { observed: number; proposed: number; applied: number; skipped: number };
+  skipped: { reason: string; count: number }[];
+  llmCalls: number; error: string | null;
+};
+export type HoldoutArm = { lessons: number; repeatRate: number; helpfulRate: number; ciLow: number; ciHigh: number };
+export type HoldoutReport = { share: number; treated: HoldoutArm; control: HoldoutArm };
+/** GET /api/loop. */
+export type LoopState = {
+  mode: LoopMode;
+  /** What runs after LOOP_DISABLED, a pause and the tokenless cap. */
+  effectiveMode: LoopMode;
+  disabled: boolean;
+  paused: { at: string; by: string } | null;
+  /** Why the mode is capped below `mode`, if it is. */
+  capped: 'tokenless' | 'disabled' | 'paused' | null;
+  policyVersion: number;
+  types: LoopTypeState[];
+  budget: { llmCallsToday: number; llmCallsPerDay: number; autoToday: number; autoPerDay: number; autoPerProject: number };
+  counts: { proposed: number; week: { observed: number; proposed: number; applied: number; rolledBack: number } };
+  rollbackRate: { rolledBack: number; of: number };
+  round: LoopRound | null;
+  holdout: HoldoutReport | null;
+};
+/** k of n, with the 95% Wilson interval: rate 0 and [0, 1] when n is 0. */
+export type Rate = { k: number; n: number; rate: number; ciLow: number; ciHigh: number };
+/** GET /api/loop/metrics: the learning loop's value over the last `weeks` ISO weeks from `since`. */
+export type LoopMetrics = {
+  since: string; weeks: number;
+  repeatRate: Rate & { weekly: { week: string; feedback: number; repeats: number }[] };
+  checksCaughtGap: Rate;
+  gapsFixedPerServed: Rate;
+  notApplicableShare: Rate;
+  proposalsPerWeek: { week: string; proposals: number }[];
+  rollbackRate: { type: DecisionType; rolledBack: number; of: number; rate: Rate }[];
+};
+export const LOOP_EVENT_KINDS = ['decision_made', 'decision_applied', 'decision_rolled_back', 'decision_noted', 'loop_settings_changed', 'loop_paused', 'loop_round'] as const;
+export type LoopEventKind = (typeof LOOP_EVENT_KINDS)[number];
+/** The Activity kinds the loop writes (every event kind but the round record). */
+export type LoopActivityKind = Exclude<LoopEventKind, 'loop_round'>;
+export const LOOP_ACTIVITY_KINDS = LOOP_EVENT_KINDS.filter((k): k is LoopActivityKind => k !== 'loop_round');
+export type LoopEvent = {
+  seq: string; ts: string; kind: LoopEventKind; actor: string; subject: string;
+  decisionId: string | null; decisionType: DecisionType | null; status: DecisionStatus | null; projectKey: string | null;
+};
+/** GET /api/loop/events. `gap`: events after `after` were dropped (it fell behind retention); reload the state. */
+export type LoopEventPage = { events: LoopEvent[]; next: string; gap: boolean };
+export type LoopSettingsPatch = { mode?: LoopMode; types?: Partial<Record<DecisionType, { mode?: LoopMode | null; tau?: number | null }>> };
+export type LessonSignals = {
+  served: number; lastServed: string | null; sessions: number;
+  addressed: number; notAddressed: number; notApplicable: number; cannotTell: number;
+  gapsFixed: number; repeatServed: number; repeatUnserved: number; ownerPushbackAfter: number;
+  ownerEdits: number; ownerRejects: number; holdout: boolean;
+};
+export const TRACK_KINDS = ['served', 'judged', 'gap_fixed', 'repeat', 'owner', 'decision'] as const;
+export type TrackKind = (typeof TRACK_KINDS)[number];
+export type TrackEntry = { ts: string; kind: TrackKind; label: string; sessionId: string | null; decisionId: string | null };
+/** GET /api/loop/lessons/:id/track: why the loop believes what it believes about one lesson. */
+export type TrackRecord = { lessonId: string; title: string; projectKey: string | null; signals: LessonSignals; timeline: TrackEntry[] };
+
+/** Fired after a decision changes here, so the sidebar's proposals badge counts again. */
+export const LOOP_CHANGED_EVENT = 'fg:loop-changed';
+
+/** Rows per page of GET /api/decisions. */
+export const DECISION_PAGE = 100;
+
+const filterQuery = (f: DecisionFilter) => qs({
+  status: f.status, type: f.type, project: f.project, mode: f.mode, band: f.band === undefined ? undefined : String(f.band), target: f.target,
+  since: f.since, until: f.until, q: f.q, limit: String(f.limit ?? DECISION_PAGE), offset: f.offset ? String(f.offset) : undefined, after: f.after,
+});
+
+/**
+ * One call of `f` at a time: a call made while one runs waits for it and then runs once for every caller that came
+ * meanwhile, so a slow answer never has several more stacked behind it (the Learning loop page reloads its state on a
+ * timer and on every event, the Dashboard card and the menu badge on theirs), and no caller gets an answer older than
+ * its call.
+ */
+export function coalesced<T>(f: () => Promise<T>): () => Promise<T> {
+  let running: Promise<T> | null = null;
+  let next: Promise<T> | null = null;
+  const call = (): Promise<T> => {
+    // finally clears it before its callers see the answer: whoever calls then starts the next one.
+    if (!running) return (running = f().finally(() => { running = null; }));
+    next ??= running.catch(() => undefined).then(() => { next = null; return call(); });
+    return next;
+  };
+  return call;
+}
+
+export const loopApi = {
+  decisions: (f: DecisionFilter = {}) => requestPage<Decision>(`/api/decisions${filterQuery(f)}`),
+  /** Like decisions, paged by keyset: next is the `after` of the next page (x-next-after), or null. */
+  decisionsAfter: (f: Omit<DecisionFilter, 'offset'> = {}) => requestCursorPage<Decision>(`/api/decisions${filterQuery(f)}`, 'x-next-after'),
+  decision: (id: string) => request<DecisionDetail>(`/api/decisions/${enc(id)}`),
+  /**
+   * Approve, reject, keep or roll back; `expect` makes a repeat answer 409, so these are retried like other decisions,
+   * except an applied rollback (it may undo a cascade). A rollback preview answers RollbackPreview, the rest the decision.
+   */
+  act: (id: string, action: DecisionAction, body: DecisionActionBody) =>
+    request<RollbackPreview | Decision>(`/api/decisions/${enc(id)}/${action}`, { method: 'POST', body, retry: action !== 'rollback' || body.cascade === 'preview' }),
+  addNote: (id: string, note: { text: string; verdict?: 'agree' | 'disagree' | null; reason?: RollbackReason }) =>
+    request<DecisionNote>(`/api/decisions/${enc(id)}/notes`, { method: 'POST', body: note, retry: false }),
+  state: coalesced(() => request<LoopState>('/api/loop')),
+  saveSettings: (patch: LoopSettingsPatch) => request<LoopState>('/api/loop/settings', { method: 'PUT', body: patch }),
+  pause: () => request<LoopState>('/api/loop/pause', { method: 'POST', body: {} }),
+  resume: () => request<LoopState>('/api/loop/resume', { method: 'POST', body: {} }),
+  events: (after?: string) => request<LoopEventPage>(`/api/loop/events${qs({ after })}`),
+  track: (lessonId: string) => request<TrackRecord>(`/api/loop/lessons/${enc(lessonId)}/track`),
+  metrics: () => request<LoopMetrics>('/api/loop/metrics'),
+};

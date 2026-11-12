@@ -1,6 +1,7 @@
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
-import { afterEach, beforeEach, expect, test, vi } from 'vitest';
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { afterEach, beforeEach, expect, test, vi, onTestFinished } from 'vitest';
 import { Inbox } from './Inbox.tsx';
+import { heldAnswer } from './testing/heldAnswer.ts';
 
 const cand = (id: string, summary: string) => ({
   id, turnUuid: id, sessionId: 's', projectKey: 'demo',
@@ -67,36 +68,41 @@ test('Cmd+C and Ctrl+R are left to the browser, never taken as decisions', async
   fireEvent.keyDown(window, { key: 'c', metaKey: true });
   fireEvent.keyDown(window, { key: 'r', ctrlKey: true });
   fireEvent.keyDown(window, { key: 'c', altKey: true });
-  await new Promise((r) => setTimeout(r, 20));
+  // A decision would be posted from the key handler: settle what it queued.
+  await act(async () => {});
   expect(posts).toEqual([]);
 });
 
-function slowDetails(delays: Record<string, number>) {
+/** Candidate details answer at once, except those held back here until the test delivers them. */
+function slowDetails(held: Record<string, ReturnType<typeof heldAnswer>>) {
   vi.stubGlobal('fetch', vi.fn(async (url: string, init?: RequestInit) => {
     if (init?.method === 'POST') { posts.push({ url, body: JSON.parse(init.body as string) }); return new Response(null, { status: 204 }); }
     if (url.startsWith('/api/candidates?')) return Response.json([cand('c1', 'first miss'), cand('c2', 'second miss')]);
     const m = url.match(/\/api\/candidates\/(\w+)$/);
-    if (m) { await new Promise((r) => setTimeout(r, delays[m[1]] ?? 0)); return Response.json(detail(m[1])); }
+    if (m) return held[m[1]] ? held[m[1]].answer() : Response.json(detail(m[1]));
     return Response.json([]);
   }));
 }
 
 test('a decision key does nothing until the item you are deciding on has loaded', async () => {
-  slowDetails({ c1: 80 });
+  const c1 = heldAnswer(detail('c1'));
+  slowDetails({ c1 });
   render(<Inbox />);
   await screen.findByText('first miss');
   fireEvent.keyDown(window, { key: 'c' });
+  await c1.deliver();
   await screen.findByText('turn text c1');
   expect(posts).toEqual([]);
 });
 
 test('a slow answer for the previous item never replaces the one you moved to', async () => {
-  slowDetails({ c1: 120, c2: 0 });
+  const c1 = heldAnswer(detail('c1'));
+  slowDetails({ c1 });
   render(<Inbox />);
   await screen.findByText('first miss');
   fireEvent.keyDown(window, { key: 'j' });
   expect(await screen.findByText('turn text c2')).toBeTruthy();
-  await new Promise((r) => setTimeout(r, 160));
+  await c1.deliver();
   expect(screen.queryByText('turn text c1')).toBeNull();
 });
 
@@ -214,7 +220,7 @@ test('pending filtered to a project with nothing waiting shows that project\'s p
   fireEvent.change(screen.getByLabelText('project'), { target: { value: 'other' } });
   const panel = await screen.findByRole('region', { name: 'pipeline' });
   expect(urls).toContain('/api/pipeline?project=other');
-  expect(panel.textContent).toMatch(/other: nothing to show here yet/);
+  expect(panel.textContent).toMatch(/other: Nothing in the Inbox yet\./);
 });
 
 test('the project filter lists every project, and keeps showing the one picked when its list is empty', async () => {
@@ -309,6 +315,15 @@ test('an item the agent reported says so, with its words, and whether the detect
   fireEvent.keyDown(window, { key: 'j' });
   await screen.findByText('turn text c2');
   expect(screen.getByText(/^reported by the agent$/i)).toBeTruthy();
+  // The list scores only what the classifier read: an agent's own report is labelled, not "100% sure".
+  expect(screen.getAllByText('agent report')).toHaveLength(2);
+  expect(screen.getAllByText(/% sure$/)).toHaveLength(1);
+  // The open detail says so too, and gives no confidence; the merged one (the detector read it) keeps its score.
+  expect(screen.queryByText(/% confident$/)).toBeNull();
+  fireEvent.keyDown(window, { key: 'k' });
+  await screen.findByText('turn text c1');
+  expect(screen.getByText('90% confident')).toBeTruthy();
+  expect(screen.getAllByText('agent report')).toHaveLength(1);
 });
 
 test('pending items are listed in the order they arrived, then by id, whatever order the API sends them in', async () => {
@@ -403,4 +418,172 @@ test('an Inbox decision offers audited Undo and reports a refusal after processi
   fireEvent.keyDown(window, { key: 'c' });
   fireEvent.click(await screen.findByRole('button', { name: 'Undo decision' }));
   expect(await screen.findByText(/post-mortem has started/)).toBeTruthy();
+});
+
+test('an empty Inbox list can still be reached by keyboard, so it can be scrolled', async () => {
+  const { overflowAll, unreachableScrollers } = await import('./ui/scrollReach.ts');
+  onTestFinished(overflowAll());
+  vi.stubGlobal('fetch', vi.fn(async () => Response.json([])));
+  const { container } = render(<Inbox />);
+  await waitFor(() => expect(screen.getAllByRole('region').length).toBeGreaterThan(0));
+  expect(unreachableScrollers(container).map((e) => e.outerHTML.slice(0, 80))).toEqual([]);
+});
+
+test('an empty confirmed tab says nothing is confirmed yet and leads back to pending', async () => {
+  emptyServer({ selection: { initialized: true, tracked: 2, note: null }, givenUpTurns: 0 });
+  render(<Inbox />);
+  await screen.findByText('No feedback waiting');
+  fireEvent.click(screen.getByRole('button', { name: 'confirmed' }));
+  expect(await screen.findByText('Nothing confirmed yet')).toBeTruthy();
+  fireEvent.click(screen.getByRole('button', { name: 'Show pending' }));
+  expect(await screen.findByText('No feedback waiting')).toBeTruthy();
+  fireEvent.click(screen.getByRole('button', { name: 'rejected' }));
+  expect(await screen.findByText('Nothing rejected')).toBeTruthy();
+});
+
+test('a re-queue the server refuses says why', async () => {
+  emptyServer({ selection: { initialized: true, tracked: 2, note: null }, givenUpTurns: 3 });
+  const inner = fetch as unknown as (url: string, init?: RequestInit) => Promise<Response>;
+  vi.stubGlobal('fetch', vi.fn(async (url: string, init?: RequestInit) => (url === '/api/turns/requeue' ? Response.json({ error: 'the worker is offline' }, { status: 409 }) : inner(url, init))));
+  render(<Inbox />);
+  fireEvent.click(await screen.findByRole('button', { name: /re-queue 3 turns/i }));
+  expect(await screen.findByText('the worker is offline')).toBeTruthy();
+});
+
+/** A confirmed item whose detail reports this post-mortem state; Retry answers with `retry`. */
+function confirmedWith(postmortem: object, retry: () => Response = () => new Response(null, { status: 204 })) {
+  vi.stubGlobal('fetch', vi.fn(async (url: string, init?: RequestInit) => {
+    if (init?.method === 'POST') { posts.push({ url, body: JSON.parse(init.body as string) }); return retry(); }
+    if (url.startsWith('/api/candidates?')) return Response.json([{ ...cand('c1', 'first miss'), status: 'confirmed' }]);
+    if (url === '/api/candidates/c1') return Response.json({ ...detail('c1'), postmortem });
+    return Response.json([]);
+  }));
+}
+
+test('a confirmed item says where its post-mortem is: waiting, retrying at a time, or done', async () => {
+  const retryAt = '2026-11-10T15:30:00Z';
+  for (const [pm, text] of [
+    [{ done: false, attempts: 0, lastError: null, retryAt: null, gaveUp: false }, 'Waiting for the worker to run the post-mortem.'],
+    [{ done: false, attempts: 1, lastError: 'timeout', retryAt, gaveUp: false }, `The post-mortem failed 1 time; next try ${new Date(retryAt).toLocaleTimeString()}.`],
+    [{ done: false, attempts: 2, lastError: 'timeout', retryAt: null, gaveUp: false }, 'The post-mortem failed 2 times; next try soon.'],
+    [{ done: true, attempts: 1, lastError: null, retryAt: null, gaveUp: false }, 'Post-mortem done: its lesson is waiting on the Lessons page.'],
+  ] as const) {
+    confirmedWith(pm);
+    render(<Inbox />);
+    fireEvent.click(await screen.findByRole('button', { name: 'confirmed' }));
+    expect(await screen.findByText(text)).toBeTruthy();
+    cleanup();
+  }
+});
+
+test('a post-mortem retry the server refuses says why and does not claim it was queued', async () => {
+  confirmedWith({ done: false, attempts: 5, lastError: 'ollama timed out', retryAt: null, gaveUp: true }, () => Response.json({ error: 'only you can retry this' }, { status: 403 }));
+  render(<Inbox />);
+  fireEvent.click(await screen.findByRole('button', { name: 'confirmed' }));
+  fireEvent.click(await screen.findByRole('button', { name: /retry post-mortem/i }));
+  expect(await screen.findByText('only you can retry this')).toBeTruthy();
+  expect(screen.queryByText(/Queued: the worker will run the post-mortem again/)).toBeNull();
+});
+
+test('k moves the selection up; a key typed in the note is text, not a decision', async () => {
+  render(<Inbox />);
+  await screen.findByText('turn text c1');
+  fireEvent.keyDown(window, { key: 'j' });
+  expect(await screen.findByText('turn text c2')).toBeTruthy();
+  fireEvent.keyDown(window, { key: 'k' });
+  expect(await screen.findByText('turn text c1')).toBeTruthy();
+  const note = screen.getByLabelText('note');
+  fireEvent.keyDown(note, { key: 'r' });
+  expect(posts).toEqual([]);
+});
+
+test('Undo puts the decided item back in the pending list', async () => {
+  let decided = false;
+  const original = vi.mocked(fetch).getMockImplementation()!;
+  vi.mocked(fetch).mockImplementation(async (url, init) => {
+    if (String(url).endsWith('/undo')) { decided = false; return new Response(null, { status: 204 }); }
+    if (String(url).endsWith('/decision')) decided = true;
+    if (url === '/api/candidates/c1' && decided) return Response.json({ ...detail('c1'), candidate: { ...cand('c1', 'first miss'), status: 'confirmed', decidedAt: '2026-10-01T10:01:00.000Z' } });
+    return original(url, init);
+  });
+  render(<Inbox />);
+  await screen.findByText('turn text c1');
+  fireEvent.keyDown(window, { key: 'c' });
+  fireEvent.click(await screen.findByRole('button', { name: 'Undo decision' }));
+  await waitFor(() => expect(screen.queryByRole('button', { name: 'Undo decision' })).toBeNull());
+  expect(screen.getByText('first miss')).toBeTruthy();
+});
+
+test('an item with no summary says so; the session filter keeps items stored before sources were recorded', async () => {
+  vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+    if (url.startsWith('/api/candidates?')) return Response.json([cand('c1', ''), { ...cand('c2', 'from github'), source: 'github' }]);
+    const m = url.match(/\/api\/candidates\/(\w+)$/);
+    return m ? Response.json(detail(m[1])) : Response.json([]);
+  }));
+  render(<Inbox />);
+  expect(await screen.findByText('(no summary)')).toBeTruthy();
+  fireEvent.change(screen.getByLabelText('source'), { target: { value: 'claude' } });
+  await waitFor(() => expect(screen.queryByText('from github')).toBeNull());
+  expect(screen.getByText('(no summary)')).toBeTruthy();  // Filtered by source to nothing, it shows where the pipeline stands overall.
+  fireEvent.change(screen.getByLabelText('source'), { target: { value: 'linear' } });
+  await waitFor(() => expect(vi.mocked(fetch).mock.calls.map(([u]) => String(u))).toContain('/api/pipeline'));
+});
+
+test('one turn given up is offered in the singular', async () => {
+  emptyServer({ selection: { initialized: true, tracked: 2, note: null }, givenUpTurns: 1 });
+  render(<Inbox />);
+  expect(await screen.findByRole('button', { name: 'Re-queue 1 turn that was given up' })).toBeTruthy();
+});
+
+test('a next page that arrives after you changed tab is dropped', async () => {
+  const late = heldAnswer([cand('c9', 'late page item')]);
+  vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+    if (url === '/api/candidates?status=pending&limit=200') return Response.json([cand('c1', 'first miss')], { headers: { 'x-next-offset': '200' } });
+    if (url === '/api/candidates?status=pending&limit=200&offset=200') return late.answer();
+    const m = url.match(/\/api\/candidates\/(\w+)$/);
+    return m ? Response.json(detail(m[1])) : Response.json([]);
+  }));
+  render(<Inbox />);
+  fireEvent.click(await screen.findByRole('button', { name: 'Load more' }));
+  fireEvent.click(screen.getByRole('button', { name: /^confirmed/ }));
+  await late.deliver();
+  expect(screen.queryByText('late page item')).toBeNull();
+});
+
+test('a keyboard post-mortem retry leaves focus on the Post-mortem card heading once the button goes', async () => {
+  confirmedWith({ done: false, attempts: 5, lastError: 'ollama timed out', retryAt: null, gaveUp: true });
+  render(<Inbox />);
+  fireEvent.click(await screen.findByRole('button', { name: 'confirmed' }));
+  (await screen.findByRole('button', { name: /retry post-mortem/i })).focus();
+  const { default: userEvent } = await import('@testing-library/user-event');
+  await userEvent.keyboard('{Enter}');
+  expect(await screen.findByText(/Queued: the worker will run the post-mortem again/)).toBeTruthy();
+  expect(document.activeElement).toBe(screen.getByRole('heading', { name: 'Post-mortem' }));
+});
+
+test('Re-queue and Retry post-mortem now say what they are doing while their request is in flight', async () => {
+  emptyServer({ selection: { initialized: true, tracked: 2, note: null }, givenUpTurns: 3 });
+  let inner = fetch as unknown as (url: string, init?: RequestInit) => Promise<Response>;
+  let release = () => {};
+  let gate = new Promise<void>((r) => { release = r; });
+  vi.stubGlobal('fetch', vi.fn(async (url: string, init?: RequestInit) => { if (init?.method === 'POST') await gate; return inner(url, init); }));
+  render(<Inbox />);
+  fireEvent.click(await screen.findByRole('button', { name: /re-queue 3 turns/i }));
+  expect((await screen.findByRole('button', { name: 'Re-queueing…' })).getAttribute('aria-disabled')).toBe('true');
+  release();
+  expect(await screen.findByText(/3 turns re-queued/i)).toBeTruthy();
+  cleanup();
+
+  confirmedWith({ done: false, attempts: 5, lastError: 'ollama timed out', retryAt: null, gaveUp: true });
+  inner = fetch as unknown as (url: string, init?: RequestInit) => Promise<Response>;
+  gate = new Promise<void>((r) => { release = r; });
+  vi.stubGlobal('fetch', vi.fn(async (url: string, init?: RequestInit) => { if (init?.method === 'POST') await gate; return inner(url, init); }));
+  render(<Inbox />);
+  fireEvent.click(await screen.findByRole('button', { name: 'confirmed' }));
+  fireEvent.click(await screen.findByRole('button', { name: /retry post-mortem now/i }));
+  const retrying = await screen.findByRole('button', { name: 'Retrying…' });
+  fireEvent.click(retrying);
+  release();
+  expect(await screen.findByText(/Queued: the worker will run the post-mortem again/)).toBeTruthy();
+  expect(posts.filter((p) => p.url !== '/api/turns/requeue')).toHaveLength(1);
 });

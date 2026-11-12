@@ -79,3 +79,17 @@ test('v3: an instruction about git ("don\'t push a PR yet") whose lesson carries
   expect(cursors.get(MISS_SUBJECT_CURSOR)).toBe('v3');
   expect(await sortOldMisses(deps)).toBeNull();
 });
+
+test('more process misses than a page are all restored, each project counted on its own, and the run is logged', async () => {
+  const code = (i: number, projectKey = 'demo') => miss(`miss:${String(i).padStart(4, '0')}`, "this isn't good enough, filter server-side", 'Filter search on the server in api/search.ts', null, projectKey);
+  const processed = [...Array.from({ length: 501 }, (_, i) => code(i)), code(9999, 'shop')];
+  const { set, activity, deps } = fakes([], processed);
+  const logs: [string, object | undefined][] = [];
+  expect(await sortOldMisses({ ...deps, log: (m, x) => logs.push([m, x]) })).toEqual({ marked: 0, restored: 502 });
+  expect(set).toHaveLength(502);
+  expect(activity.map((a) => a.subject)).toEqual([
+    '501 past misses marked as about the process are about the code: tied to their files again',
+    '1 past miss marked as about the process is about the code: tied to its files again',
+  ]);
+  expect(logs).toEqual([['process-miss rule applied to past misses', { marked: 0, restored: 502 }]]);
+});

@@ -11,7 +11,7 @@ import { openNeo4jTestStore } from './neo4j.ts';
 import type { StoreProbe } from './probe.ts';
 
 export type * from './probe.ts';
-export { Neo4jProbe } from './neo4j.ts';
+export { Neo4jProbe, staleSnapshot, STALE_CONFIDENCE } from './neo4j.ts';
 
 export type TestStore = { store: Store; probe: StoreProbe };
 export type TestStoreFactory = () => Promise<TestStore>;

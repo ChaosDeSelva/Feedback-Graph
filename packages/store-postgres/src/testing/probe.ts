@@ -1,4 +1,5 @@
-import type { EmbeddedSeed, PreDoneCheckRow, ProbeKind, StaleTextSeed, StoreProbe } from '@fb/core/testing';
+import { AsyncLocalStorage } from 'node:async_hooks';
+import { STALE_CONFIDENCE, staleSnapshot, type EmbeddedSeed, type PreDoneCheckRow, type ProbeKind, type StaleTextSeed, type StoreProbe } from '@fb/core/testing';
 import { fromVector, toJson, toVector, type Db } from '../db.ts';
 
 /** Where each record kind (Neo4j label) lives, and its identity column. */
@@ -23,6 +24,8 @@ export const TABLES: Record<ProbeKind, { table: string; id: string }> = {
   Chunk: { table: 'chunks', id: 'id' },
   Activity: { table: 'activity', id: 'id' },
   SyncCursor: { table: 'sync_cursors', id: 'key' },
+  Decision: { table: 'decisions', id: 'id' },
+  DecisionNote: { table: 'decision_notes', id: 'id' },
 };
 
 /** Placeholder parents for seeded records, filed under a project no test uses. */
@@ -37,6 +40,34 @@ export class PostgresProbe implements StoreProbe {
 
   private q(sql: string, params: unknown[] = []) {
     return this.db.pool.query(sql, params);
+  }
+
+  async work(fn: () => Promise<unknown>): Promise<number> {
+    const pool = this.db.pool;
+    const original = pool.query;
+    const query = original.bind(pool) as unknown as (sql: string, params?: unknown[]) => Promise<{ rows: Record<string, any>[] }>;
+    let rows = 0;
+    type Node = { 'Actual Rows': number; 'Actual Loops': number; 'Rows Removed by Filter'?: number; 'Rows Removed by Index Recheck'?: number; Plans?: Node[] };
+    const read = (n: Node): number => (n['Actual Rows'] + (n['Rows Removed by Filter'] ?? 0) + (n['Rows Removed by Index Recheck'] ?? 0)) * n['Actual Loops']
+      + (n.Plans ?? []).reduce((s, c) => s + read(c), 0);
+    // Plans for the data as it is now, as autovacuum leaves a table that grew: statistics refreshed, and a GIN index's
+    // pending entries merged (until then its cost makes the planner scan the table).
+    await query('VACUUM (ANALYZE)');
+    // Only fn's own queries, not those of anything else using the pool meanwhile.
+    const mine = new AsyncLocalStorage<true>();
+    pool.query = (async (sql: string, params?: unknown[]) => {
+      if (mine.getStore() && typeof sql === 'string' && /^\s*(?:SELECT|WITH)\b/i.test(sql)) {
+        const { rows: [plan] } = await query(`EXPLAIN (ANALYZE, FORMAT JSON) ${sql}`, params);
+        rows += read(plan["QUERY PLAN"][0].Plan);
+      }
+      return query(sql, params);
+    }) as never;
+    try {
+      await mine.run(true, fn);
+    } finally {
+      pool.query = original;
+    }
+    return rows;
   }
 
   async wipe() {
@@ -98,7 +129,7 @@ export class PostgresProbe implements StoreProbe {
 
   async filedUnder(key: string): Promise<ProbeKind[]> {
     const parts = (Object.entries(TABLES) as [ProbeKind, { table: string }][])
-      .filter(([kind]) => !['Project', 'Commit', 'Cause', 'SyncCursor', 'Lesson'].includes(kind))
+      .filter(([kind]) => !['Project', 'Commit', 'Cause', 'SyncCursor', 'Lesson', 'DecisionNote'].includes(kind))
       .map(([kind, t]) => `SELECT '${kind}' AS kind FROM ${t.table} WHERE project_key = $1`);
     parts.push(`SELECT 'Project' FROM projects WHERE key = $1`, `SELECT 'Lesson' FROM lessons WHERE project_key = $1 OR origin_project_key = $1`);
     const { rows } = await this.q(`SELECT DISTINCT kind FROM (${parts.join(' UNION ALL ')}) x ORDER BY kind`, [key]);
@@ -120,6 +151,10 @@ export class PostgresProbe implements StoreProbe {
 
   async setLessonCreatedAt(ids: string[], at: string) {
     await this.q('UPDATE lessons SET created_at = $2::timestamptz WHERE id = ANY($1::text[])', [ids, at]);
+  }
+
+  async setDecisionCreatedAt(ids: string[], at: string) {
+    await this.q('UPDATE decisions SET created_at = $2::timestamptz WHERE id = ANY($1::text[])', [ids, at]);
   }
 
   async seedOrphan(row: { kind: 'Lesson' | 'Doc'; id: string; projectKey: string }) {
@@ -218,6 +253,14 @@ export class PostgresProbe implements StoreProbe {
            VALUES ($1 || ':a', $1, $2, 2, 'assistant', '', 'pending', $3::jsonb, $4::jsonb, now())`,
           [row.id, PROBE_PROJECT, toJson(row.answer), toJson(row.sources)],
         );
+        return;
+      case 'Decision':
+        await this.q(
+          `INSERT INTO decisions (id, type, status, tier, mode, before, score, confidence, band, rationale, model, policy_version, created_at)
+           VALUES ($1, 'link_misses', 'proposed', 'H', 'propose', $2::jsonb, 0.5, $3::jsonb, 2, $4, 'deterministic', 1, now())`,
+          [row.id, toJson(staleSnapshot(row.text)), toJson(STALE_CONFIDENCE), row.text],
+        );
+        await this.q(`INSERT INTO decision_notes (id, decision_id, ts, by, text) VALUES ($1 || ':note', $1, now(), 'you', $2)`, [row.id, row.note]);
         return;
     }
   }

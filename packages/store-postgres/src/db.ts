@@ -113,8 +113,3 @@ export const toVector = (v: number[] | null | undefined): string | null => (v ? 
 
 /** A vector column read as text back into numbers. */
 export const fromVector = (s: string | null | undefined): number[] | null => (s == null ? null : (pgvector.fromSql(s) as number[]));
-
-export class NotImplementedError extends Error {}
-
-/** What every method throws until its implementation lands: 'not implemented: <Class>.<method>'. */
-export const notImplemented = (cls: string, method: string) => new NotImplementedError(`not implemented: ${cls}.${method}`);

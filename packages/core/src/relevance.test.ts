@@ -1,6 +1,6 @@
 import { expect, test } from 'vitest';
 import type { FactHit, StoredFact } from './graph/facts.ts';
-import { calibrateRelevance, EVERYDAY_SHARE, factOrigin, isNonMiss, pathAffinity, rankFacts, rankMisses, relevanceBand, serviceDirs, servicesInTask, SIMILARITY_FLOOR } from './relevance.ts';
+import { calibrateRelevance, EVERYDAY_SHARE, factOrigin, isNonMiss, mentionedPaths, MISS_CLOSE, missAdmitted, missTouches, pathAffinity, rankDocs, rankFacts, rankMisses, relevanceBand, serviceDirs, servicesInTask, SIMILARITY_FLOOR } from './relevance.ts';
 
 const hit = (statement: string, score: number, relevance: number | null): FactHit => ({
   fact: { id: statement, statement, relevance, relevanceBy: relevance === null ? null : 'model' } as StoredFact,
@@ -50,36 +50,36 @@ test('isNonMiss spots a post-mortem that concluded there was no miss', () => {
 });
 
 test('pathAffinity favours paths in the named files\' folders and service, and disfavours another service', () => {
-  const files = ['src/webapp/core/src/features/users/router.ts'];
-  expect(pathAffinity('src/webapp/AGENTS.md', files)).toBeGreaterThan(pathAffinity('src/webapp/apps/spa/main.ts', files));
-  expect(pathAffinity('src/webapp/apps/spa/main.ts', files)).toBeGreaterThan(1);
-  expect(pathAffinity('src/context-graph/service.go', files)).toBeLessThan(1);
+  const files = ['src/portal/main/src/segments/users/router.ts'];
+  expect(pathAffinity('src/portal/AGENTS.md', files)).toBeGreaterThan(pathAffinity('src/portal/apps/spa/main.ts', files));
+  expect(pathAffinity('src/portal/apps/spa/main.ts', files)).toBeGreaterThan(1);
+  expect(pathAffinity('src/catalog-index/service.go', files)).toBeLessThan(1);
   expect(pathAffinity('.', files)).toBe(1);
   expect(pathAffinity('README.md', files)).toBeGreaterThanOrEqual(1);
-  expect(pathAffinity('src/context-graph/service.go', [])).toBe(1);
+  expect(pathAffinity('src/catalog-index/service.go', [])).toBe(1);
 });
 
 test('rankFacts with named files puts the facts of their service first and drops what falls far below the best', () => {
   const at = (statement: string, path: string, score: number): FactHit => ({ fact: { id: statement, statement, path, relevance: 0.8, relevanceBy: 'model' } as StoredFact, score });
   const ranked = rankFacts([
-    at('ingest uses sqlc mutations', 'src/ingest/AGENTS.md', 0.86),
-    at('confirm the router is wired', 'src/webapp/AGENTS.md', 0.8),
-    at('unrelated gateway rule', 'src/llm-gateway/README.md', 0.3),
-  ], 5, ['src/webapp/core/src/features/users/router.ts']);
-  expect(ranked.map((h) => h.fact.statement)).toEqual(['confirm the router is wired', 'ingest uses sqlc mutations']);
+    at('import uses sqlc mutations', 'src/import/AGENTS.md', 0.86),
+    at('confirm the router is wired', 'src/portal/AGENTS.md', 0.8),
+    at('unrelated gateway rule', 'src/api-gateway/README.md', 0.3),
+  ], 5, ['src/portal/main/src/segments/users/router.ts']);
+  expect(ranked.map((h) => h.fact.statement)).toEqual(['confirm the router is wired', 'import uses sqlc mutations']);
 });
 
 test('rankMisses drops non-misses and weak matches, and favours misses that name the named files\' service', () => {
   const m = (missed: string, score: number, feedbackText = '') => ({ missId: missed, missed, feedbackText, score });
   const ranked = rankMisses([
     m('The agent did not miss the feedback, it was about another PR', 0.9),
-    m('Missed the exists=true filter in src/context-graph/internal/page.go', 0.86),
-    m('Missed the admin gate in src/webapp/core/src/features/settings/usage.ts', 0.8),
+    m('Missed the exists=true filter in src/catalog-index/internal/page.go', 0.86),
+    m('Missed the admin gate in src/portal/main/src/segments/settings/usage.ts', 0.8),
     m('Missed a Brotli CVE bump', 0.2),
-  ], 4, ['src/webapp/core/src/features/settings/users/router.ts']);
+  ], 4, ['src/portal/main/src/segments/settings/users/router.ts']);
   expect(ranked.map((x) => x.missId)).toEqual([
-    'Missed the admin gate in src/webapp/core/src/features/settings/usage.ts',
-    'Missed the exists=true filter in src/context-graph/internal/page.go',
+    'Missed the admin gate in src/portal/main/src/segments/settings/usage.ts',
+    'Missed the exists=true filter in src/catalog-index/internal/page.go',
   ]);
   expect(rankMisses([m('a', 0.8), m('b', 0.4)], 4, []).map((x) => x.missId)).toEqual(['a']);
 });
@@ -91,10 +91,10 @@ test('rankFacts applies the same similarity floor as misses: a nonsense task get
 });
 
 test('servicesInTask finds the services a task names by their folder, never a generic folder like src or packages', () => {
-  const dirs = serviceDirs(['src/webapp/core/a.ts', 'src/context-graph/internal/page.go', 'billing/api/charge.ts', 'packages/ui/x.tsx', 'README.md']);
-  expect(dirs).toEqual(['billing', 'billing/api', 'src/context-graph', 'src/webapp']);
-  expect(servicesInTask('add a members page to the webapp settings', dirs)).toEqual(['src/webapp']);
-  expect(servicesInTask('Fix the context-graph page offsets', dirs)).toEqual(['src/context-graph']);
+  const dirs = serviceDirs(['src/portal/main/a.ts', 'src/catalog-index/internal/page.go', 'billing/api/charge.ts', 'packages/ui/x.tsx', 'README.md']);
+  expect(dirs).toEqual(['billing', 'billing/api', 'src/catalog-index', 'src/portal']);
+  expect(servicesInTask('add a members page to the portal settings', dirs)).toEqual(['src/portal']);
+  expect(servicesInTask('Fix the catalog-index page offsets', dirs)).toEqual(['src/catalog-index']);
   expect(servicesInTask('refund flow in Billing', dirs)).toEqual(['billing']);
   // "src", "packages" and "ui" alone are no service: too short or too generic to name one.
   expect(servicesInTask('move the src helpers into packages', dirs)).toEqual([]);
@@ -102,14 +102,14 @@ test('servicesInTask finds the services a task names by their folder, never a ge
 
 test('with no files named, the services the task names rank their facts and misses up and other services\' down', () => {
   const at = (statement: string, path: string, score: number): FactHit => ({ fact: { id: statement, statement, path, relevance: 0.8, relevanceBy: 'model' } as StoredFact, score });
-  const facts = [at('graph pages are byte offsets', 'src/context-graph/AGENTS.md', 0.86), at('settings pages use SettingsState', 'src/webapp/core/settings.ts', 0.82)];
+  const facts = [at('graph pages are byte offsets', 'src/catalog-index/AGENTS.md', 0.86), at('settings pages use SettingsStore', 'src/portal/main/settings.ts', 0.82)];
   expect(rankFacts(facts, 5).map((h) => h.fact.id)[0]).toBe('graph pages are byte offsets');
-  expect(rankFacts(facts, 5, [], ['src/webapp']).map((h) => h.fact.id)[0]).toBe('settings pages use SettingsState');
+  expect(rankFacts(facts, 5, [], ['src/portal']).map((h) => h.fact.id)[0]).toBe('settings pages use SettingsStore');
   const m = (missed: string, score: number) => ({ missId: missed, missed, feedbackText: '', score });
-  const misses = [m('Missed the filter in src/context-graph/internal/page.go', 0.86), m('Missed the admin gate in src/webapp/core/usage.ts', 0.82)];
-  expect(rankMisses(misses, 4, [], ['src/webapp'])[0].missId).toMatch(/webapp/);
+  const misses = [m('Missed the filter in src/catalog-index/internal/page.go', 0.86), m('Missed the admin gate in src/portal/main/usage.ts', 0.82)];
+  expect(rankMisses(misses, 4, [], ['src/portal'])[0].missId).toMatch(/portal/);
   // Named files win over words: the services are only a guess.
-  expect(rankMisses(misses, 4, ['src/context-graph/internal/x.go'], ['src/webapp'])[0].missId).toMatch(/context-graph/);
+  expect(rankMisses(misses, 4, ['src/catalog-index/internal/x.go'], ['src/portal'])[0].missId).toMatch(/catalog-index/);
 });
 
 test('everyday is the minority of a realistic set: a generous model\'s scores are calibrated by kind and by share', () => {
@@ -177,4 +177,71 @@ test('serves raw similarity separately from the task-weighted score without muta
   const [miss] = rankMisses([{ missed: 'services/billing/src/b.ts omitted validation', feedbackText: '', score: .82 }], 1, ['services/auth/src/a.ts']);
   expect(miss.score).toBe(.82);
   expect(miss.rankingScore).toBeLessThan(.82);
+});
+
+test('0.7.6 slashed pieces of a key in a task are not file paths', () => {
+  expect(mentionedPaths('the key MIIEvQ/kL9mN2pQ+x7Ab/Zq9 and Ab3d/eF5g leaked, blob aB3cD4/eF5gH6=')).toEqual([]);
+  expect(mentionedPaths('deploy with https://admin:[REDACTED]@internal.example.com/x and fix src/a.ts')).toEqual(['src/a.ts']);
+  expect(mentionedPaths('fix src/api/orders.ts, src/Components/Button2, apps/web/OAuth2Client.tsx and v1/users/123'))
+    .toEqual(['src/api/orders.ts', 'src/Components/Button2', 'apps/web/OAuth2Client.tsx', 'v1/users/123']);
+});
+
+test('rankDocs: under the floor is never served; a chunk about a named file outranks a closer one elsewhere', () => {
+  const doc = (ref: string, score: number, text = 'notes') => ({ ref, title: ref, text, score });
+  expect(rankDocs([doc('guide', 0.779)], 5)).toEqual([]);
+  const ranked = rankDocs([doc('ops', 0.9, 'see services/billing/run.sh'), doc('api', 0.84, 'the handler in services/api/orders.ts')], 5, ['services/api/orders.ts']);
+  expect(ranked.map((d) => d.ref)).toEqual(['api', 'ops']);
+  // the reported score stays the similarity; rankingScore is the weighted one
+  expect(ranked[0].score).toBe(0.84);
+  expect(ranked[0].rankingScore).toBeGreaterThan(ranked[1].rankingScore);
+  // a doc naming no path is neutral
+  expect(rankDocs([doc('plain', 0.9)], 5)[0].rankingScore).toBe(0.9);
+});
+
+test('rankDocs: services named in the task weigh a chunk without named files; far below the best, n and the rank floor cut', () => {
+  const doc = (ref: string, score: number, text: string) => ({ ref, title: ref, text, score });
+  const docs = [doc('billing', 0.9, 'billing/src/charge.ts'), doc('web', 0.86, 'webapp/src/page.tsx')];
+  expect(rankDocs(docs, 5, [], ['webapp']).map((d) => d.ref)).toEqual(['web', 'billing']);
+  expect(rankDocs(docs, 1).map((d) => d.ref)).toEqual(['billing']);
+  expect(rankDocs([doc('a', 1, 'x'), doc('b', 0.5, 'y')], 5, [], [], 0.4).map((d) => d.ref)).toEqual(['a']);
+  expect(rankDocs([doc('a', 0.85, 'x')], 5, [], [], 0.78, 0.9)).toEqual([]);
+  // an out-of-range similarity is clamped
+  expect(rankDocs([doc('a', 1.7, 'x')], 5)[0]).toMatchObject({ score: 1, rankingScore: 1 });
+});
+
+test('pathAffinity: a named file at the top of the repo (or one folder down) does not count against a path elsewhere', () => {
+  expect(pathAffinity('services/api/x.ts', ['README.md'])).toBe(1);
+  expect(pathAffinity('services/api/x.ts', ['scripts/run.sh'])).toBe(1);
+  expect(pathAffinity('services/api/x.ts', ['web/app/y.ts'])).toBe(0.75);
+});
+
+test('factOrigin reads a fact with no reason recorded as the model\'s; a non-finite similarity scores 0', () => {
+  expect(factOrigin({})).toBe('model');
+  expect(factOrigin({ why: null })).toBe('model');
+  expect(rankFacts([hit('everyday', Number.NaN, 0.9)], 5, [], [], 0)[0]).toMatchObject({ score: 0, rankingScore: 0 });
+  // an unscored fact counts as middling, not as rare
+  expect(rankFacts([hit('unscored', 0.79, null)], 5)).toHaveLength(1);
+});
+
+test('missTouches: a miss shares a file with the named ones (the same file, from a subfolder too, or one in its folder)', () => {
+  expect(missTouches(['src/db/pool.ts'], ['src/db/pool.ts'])).toBe(true);
+  expect(missTouches(['db/pool.ts'], ['src/db/pool.ts'])).toBe(true);
+  expect(missTouches(['./src/db/pool.ts'], ['src/db/client.ts'])).toBe(true);
+  expect(missTouches(['src/catalog/internal/pricingrules'], ['src/catalog/internal/pricingrules/read.go'])).toBe(true);
+  expect(missTouches(['src\\db\\pool.ts'], ['src/db/other.ts'])).toBe(true);
+  expect(missTouches(['src/db/pool.ts'], ['src/api/users.ts'])).toBe(false);
+  // A folder holding the named file's folder is not the same folder.
+  expect(missTouches(['src/db'], ['src/db/sub/x.ts'])).toBe(false);
+  expect(missTouches([], ['src/db/pool.ts'])).toBe(false);
+});
+
+test(`missAdmitted: a past miss is served or judged when it shares a file with the work or is at least ${MISS_CLOSE} close to it`, () => {
+  const m = (missed: string, score: number) => ({ missed, feedbackText: '', score });
+  expect(missAdmitted(m('leaked a client in src/db/pool.ts', 0.5), ['src/db/pool.ts'])).toBe(true);
+  expect(missAdmitted(m('leaked a client in src/db/pool.ts', 0.84), ['src/api/users.ts'])).toBe(false);
+  expect(missAdmitted(m('leaked a client', 0.84), [])).toBe(false);
+  expect(missAdmitted(m('leaked a client', MISS_CLOSE), [])).toBe(true);
+  // The bar is the caller's to set (MISS_MIN_SIMILARITY).
+  expect(missAdmitted(m('leaked a client', 0.8), [], 0.78)).toBe(true);
+  expect(MISS_CLOSE).toBeGreaterThan(SIMILARITY_FLOOR);
 });

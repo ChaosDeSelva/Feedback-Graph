@@ -4,6 +4,7 @@ import type { GraphStore, KnowledgeStore, PortabilityStore, Store } from '../sto
 import { describeStores, type StoreProbe } from '../testing/index.ts';
 import type { Classification, FactKind, ParsedSession, PostMortem, Project } from '../types.ts';
 import { EXPORT_FORMAT } from './portability.ts';
+import type { GraphRepo } from './repo.ts';
 
 const vec = (axis: number) => Array.from({ length: 768 }, (_, i) => (i === axis ? 1 : 0));
 const pushback: Classification = { label: 'pushback', confidence: 0.9, summary: 's', signals: [] };
@@ -130,6 +131,22 @@ describeStores('PortabilityStore', (h) => {
     expect(await probe.ids('Commit')).not.toContain('s1'.padEnd(40, '0'));
     expect(await probe.ids('Commit')).toContain('s2'.padEnd(40, '0'));
     expect(await p.exportData({ projectKey: 'other' })).toEqual({ ...before, exportedAt: expect.any(String) });
+  });
+
+  test('a bundle lists every miss, doc and lesson once, even a miss that explains two feedbacks', async () => {
+    if (h.kind === 'neo4j') {
+      // Two EXPLAINS edges on one miss, as the cloud saw (it refuses a bundle with an id twice).
+      await (store.graph as unknown as GraphRepo).run(
+        `MATCH (m:Miss {projectKey: 'demo'}) CREATE (f:Feedback {id: 'fb-again', text: 'later again', createdAt: '2999-01-01T00:00:00Z', projectKey: 'demo'}) MERGE (m)-[:EXPLAINS]->(f)`,
+      );
+    }
+    await store.docs.upsertDoc({ projectKey: 'demo', source: 'upload', ref: 'upload:other.md', title: 'Other', url: null }, [{ text: 'other spec', embedding: vec(5) }]);
+    for (const x of [await p.exportData({ projectKey: 'demo' }), await p.exportData()]) {
+      for (const list of [x.misses, x.docs, x.lessons]) expect(new Set(list.map((e) => e.id)).size).toBe(list.length);
+    }
+    const demo = await p.exportData({ projectKey: 'demo' });
+    expect(demo.misses).toEqual([expect.objectContaining({ feedbackText: 'turn 2' })]);
+    expect(demo.docs.map((d) => d.title).sort()).toEqual(['Other', 'Spec']);
   });
 
   test('the export is deterministic: rows that tie on every sort column still come out in the same order', async () => {

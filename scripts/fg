@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# fg: drive Feedback Graph from a terminal or an agent (status, projects, scans, Inbox, lessons, links, facts, docs,
-# activity, sessions, cloud sync, integrations).
+# fg: drive Feedback Graph from a terminal or an agent (signin, status, projects, scans, Inbox, lessons, the demo, the
+# code map, links, facts, docs, activity, sessions, evidence, cleanup, the learning loop and its decisions, cloud sync,
+# integrations).
 #   ./scripts/fg --help
 #   ./scripts/fg status --until idle --timeout 600
 #   ./scripts/fg projects select --key acme,demo-shop
@@ -10,10 +11,15 @@
 #   ./scripts/fg setup --yes                 ./scripts/setup.sh with those arguments
 #
 # Owner decisions need FG_OPERATOR_TOKEN (from the environment, else .env); the API allows only the verbs OPERATOR_ALLOW
-# names (by default not deciding lessons, deleting data, importing or integration keys). The token is passed to the CLI in its environment, never printed.
+# names (by default not deciding lessons, choosing projects, deleting data, settings, importing, integration keys, asking or
+# deleting chats in Ask, or deciding on or configuring the learning loop: loop_decide, loop_settings). The token is passed to the CLI in its environment, never printed.
 # Runs packages/api/src/cli.ts with the host's Node (22.18+ or 23.6+, which run TypeScript natively); without one, inside
-# the api container (docker compose exec api node src/cli.ts ...), which has the same settings from .env.
+# the api container (docker compose exec api node src/cli.ts ...), which has the same settings from .env: only in a
+# checkout that is set up and whose Compose name is not another folder's.
 set -euo pipefail
+# The Compose project is this checkout's (FG_INSTANCE and COMPOSE_FILE from its .env): a shell's own value would point
+# docker compose at another install's containers.
+unset COMPOSE_PROJECT_NAME COMPOSE_FILE
 
 here="$(cd "$(dirname "$0")/.." && pwd)"
 # The host checks (Docker, ports, Ollama, mounts) are not an API call: they run here, with or without Node.
@@ -21,10 +27,14 @@ if [ "${1:-}" = doctor ]; then shift; exec "$here/scripts/doctor.sh" "$@"; fi
 # Setup (Docker, .env, models, the stack) is the host's job too: never inside the api container.
 if [ "${1:-}" = setup ]; then shift; exec "$here/scripts/setup.sh" "$@"; fi
 env_file="${FEEDBACK_GRAPH_ENV:-$here/.env}"
-if [ "${1:-}" = status ] && [ ! -f "$env_file" ] && [ -z "${FEEDBACK_GRAPH_URL:-}" ] && [ -z "${API_PORT:-}" ]; then
-  echo "fg status: this checkout is not set up (missing $env_file); run ./scripts/setup.sh first, or set FEEDBACK_GRAPH_URL for another install" >&2
-  exit 1
-fi
+# Before setup there is no install here to address: without this, every API command would ask the default port 8787,
+# which may be another checkout's install.
+case "${1:-}" in "" | -h | --help | help) ;; *)
+  if [ ! -f "$env_file" ] && [ -z "${FEEDBACK_GRAPH_URL:-}" ] && [ -z "${API_PORT:-}" ]; then
+    echo "fg $1: this checkout is not set up (missing $env_file); run ./scripts/setup.sh first, or set FEEDBACK_GRAPH_URL for another install" >&2
+    exit 1
+  fi ;;
+esac
 # KEY's value: the environment's when set, else the last KEY= line of the env file, surrounding quotes removed.
 setting() {
   local v
@@ -39,11 +49,24 @@ setting() {
 }
 
 # Containers under this folder's Compose name (FG_INSTANCE) that another folder started are that folder's install: the
-# API answering here (and docker compose exec) is that one, not this checkout. Said on stderr before every command.
+# API answering here (and docker compose exec) is that one, not this checkout. Said on stderr before every command, and
+# fg never runs inside those containers.
+foreign=""
+instance="$(setting FG_INSTANCE)"; instance="${instance:-feedback-graph}"
+# The env file decides the install once it exists: a different FG_INSTANCE in the environment would address another
+# install's containers.
+if [ -f "$env_file" ]; then
+  own="$(grep -E '^FG_INSTANCE=' "$env_file" | tail -n 1 | cut -d= -f2- | sed -e "s/^[\"']//" -e "s/[\"']\$//" || true)"
+  if [ "$instance" != "${own:-feedback-graph}" ]; then
+    echo "FG_INSTANCE=$instance in your environment is not this checkout's install (${own:-feedback-graph}, from $env_file): unset it, or set FG_INSTANCE in that file" >&2
+    exit 1
+  fi
+fi
 if command -v docker >/dev/null 2>&1; then
-  instance="$(setting FG_INSTANCE)"; instance="${instance:-feedback-graph}"
-  started_in="$(docker ps -a --filter "label=com.docker.compose.project=$instance" --format '{{.Label "com.docker.compose.project.working_dir"}}' 2>/dev/null | head -n 1 || true)"
-  if [ -n "$started_in" ] && [ "$(cd "$started_in" 2>/dev/null && pwd -P || printf '%s' "$started_in")" != "$(cd "$here" && pwd -P)" ]; then
+  . "$here/scripts/lib/env.sh"
+  started_in="$(foreign_install_dir "$instance" "$here")"
+  if [ -n "$started_in" ]; then
+    foreign="$started_in"
     {
       echo "WARNING: the containers named $instance were started from $started_in, not this folder ($here): the API answering"
       echo "  is that install's, and docker compose here would take it over. Give this folder its own FG_INSTANCE and ports"
@@ -52,7 +75,10 @@ if command -v docker >/dev/null 2>&1; then
   fi
 fi
 
-if [ -n "${FEEDBACK_GRAPH_URL:-}" ]; then
+help=""
+case "${1:-}" in "" | -h | --help | help) help=1 ;; esac
+# Help sends nothing, so it prints whatever FEEDBACK_GRAPH_URL says.
+if [ -n "${FEEDBACK_GRAPH_URL:-}" ] && [ -z "$help" ]; then
   local_port="$(setting API_PORT)"; expected_url="http://localhost:${local_port:-8787}"
   if [ "${FEEDBACK_GRAPH_URL%/}" != "$expected_url" ] && [ "${FEEDBACK_GRAPH_URL%/}" != "${expected_url/localhost/127.0.0.1}" ]; then
     if [ -f "$env_file" ] && grep -Eq '^(API_TOKEN|FG_OPERATOR_TOKEN|FG_OWNER_TOKEN)=' "$env_file"; then
@@ -62,12 +88,19 @@ if [ -n "${FEEDBACK_GRAPH_URL:-}" ]; then
     echo "WARNING: FEEDBACK_GRAPH_URL overrides this checkout's $expected_url; unset it to address this install." >&2
   fi
 fi
-if [ "${1:-}" = status ] && command -v docker >/dev/null 2>&1; then
-  if [ -f "$here/state/runner-control/codex-runner-disabled" ]; then
-    echo "WARN codex runner disabled: $(head -n 1 "$here/state/runner-control/codex-runner-disabled" 2>/dev/null || echo reason unavailable)" >&2
+# Docker commands below address this folder's Compose project: only one this checkout set up and started itself, named
+# and configured explicitly (the env file fg reads may not be the .env docker compose would read by itself).
+compose=(docker compose --project-directory "$here" -p "$instance" --env-file "$env_file")
+own_project=""
+[ -f "$env_file" ] && [ -z "$foreign" ] && own_project=1
+if [ "${1:-}" = status ] && command -v docker >/dev/null 2>&1 && [ -n "$own_project" ]; then
+  . "$here/scripts/lib/state-fs.sh"
+  # Read only as a plain file, and only so much of it: a container can write state/.
+  if reasons="$(cd "$here" && state_read state/runner-control/codex-runner-disabled 4096 | tr -cd '[:print:]\n')"; then
+    reasons="$(printf '%s\n' "$reasons" | grep -v '^$' | paste -sd ';' - | sed 's/;/; /g' || true)"
+    echo "WARN codex runner disabled: ${reasons:-reason unavailable}" >&2
   fi
-  . "$here/scripts/lib/env.sh"
-  export FG_DATABASE_MEMORY="$(database_memory docker compose --project-directory "$here")"
+  export FG_DATABASE_MEMORY="$(database_memory "${compose[@]}")"
 fi
 
 native_ts() {
@@ -80,12 +113,26 @@ if native_ts && (cd "$here/packages/api" && node --input-type=module -e 'import.
     port="$(setting API_PORT)"
     export FEEDBACK_GRAPH_URL="http://localhost:${port:-8787}"
   fi
+  # The owner token goes only to fg signin, which trades it at localhost for a one-time browser link.
+  owner_env=()
+  [ "${1:-}" = signin ] && owner_env=("FG_OWNER_TOKEN=$(setting FG_OWNER_TOKEN)")
   API_PORT="$(setting API_PORT)" FG_OPERATOR_TOKEN="$(setting FG_OPERATOR_TOKEN)" API_TOKEN="$(setting API_TOKEN)" \
-    exec node "$here/packages/api/src/cli.ts" "$@"
+    exec env ${owner_env[@]+"${owner_env[@]}"} node "$here/packages/api/src/cli.ts" "$@"
 fi
 
-if native_ts; then
+# The container is the normal route for an install that never ran pnpm install: say so only when asked.
+if native_ts && [ -n "${FG_VERBOSE:-}" ]; then
   echo 'fg: local workspace dependencies are missing; using the API container (or run pnpm install).' >&2
+fi
+if command -v docker >/dev/null 2>&1 && [ -z "$own_project" ]; then
+  if [ -n "$foreign" ]; then
+    echo "fg: not running inside the api container of the install in $foreign (another folder started the containers under this Compose name)." >&2
+  else
+    echo "fg: this checkout is not set up (missing $env_file), so it has no api container to run in, and docker compose here" >&2
+    echo "  would address another install's." >&2
+  fi
+  echo "  Run fg with Node 22.18+ (or 23.6+) after pnpm install in $here, or from the install's own folder." >&2
+  exit 1
 fi
 if command -v docker >/dev/null 2>&1; then
   # Inside the container the API is on localhost:8787 and FG_OPERATOR_TOKEN comes from compose (.env).
@@ -101,7 +148,7 @@ if command -v docker >/dev/null 2>&1; then
   token_env=()
   [ "${FG_OPERATOR_TOKEN+x}" = x ] && token_env+=(-e "FG_OPERATOR_TOKEN=${FG_OPERATOR_TOKEN}")
   [ "${API_TOKEN+x}" = x ] && token_env+=(-e "API_TOKEN=${API_TOKEN}")
-  exec docker compose --project-directory "$here" exec -T -e "FG_DATABASE_MEMORY=${FG_DATABASE_MEMORY:-}" -e "API_PORT=$(setting API_PORT)" "${container_url[@]+"${container_url[@]}"}" "${token_env[@]+"${token_env[@]}"}" ${FG_OPERATOR_NAME:+-e FG_OPERATOR_NAME="$FG_OPERATOR_NAME"} api node src/cli.ts "$@"
+  exec "${compose[@]}" exec -T -e "FG_DATABASE_MEMORY=${FG_DATABASE_MEMORY:-}" -e "API_PORT=$(setting API_PORT)" "${container_url[@]+"${container_url[@]}"}" "${token_env[@]+"${token_env[@]}"}" ${FG_OPERATOR_NAME:+-e FG_OPERATOR_NAME="$FG_OPERATOR_NAME"} api node src/cli.ts "$@"
 fi
 
 echo "fg needs Node 22.18+ (or 23.6+) on the host, or docker to run it inside the api container" >&2

@@ -6,3 +6,5 @@ state
 .env
 backups
 docker-compose.override.yml
+.host
+.restore

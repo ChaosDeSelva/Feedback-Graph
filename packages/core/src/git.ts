@@ -31,7 +31,7 @@ export function filterOverrides(configNames: string): string[] | null {
     if (!key) continue;
     if (!key.toLowerCase().startsWith('filter.')) continue;
     const name = key.slice('filter.'.length, key.lastIndexOf('.'));
-    if (!name || key.lastIndexOf('.') < 'filter.'.length) continue;
+    if (!name) continue;
     if (/[=\n\r]/.test(name)) return null;
     names.add(name);
   }
@@ -60,3 +60,20 @@ export async function worktreeGitArgs(repoPath: string, roots: readonly { host: 
   return [];
 }
 
+
+/**
+ * A listing's repo-relative paths (git ls-files, or a walk of `root`) in Unicode NFC, once each. One file can be listed
+ * in two spellings: macOS git keeps a non-ASCII name in the index as NFC (core.precomposeunicode), and git without that
+ * setting (in a Linux container) also lists the NFD name on disk as untracked. A path stays NFC when that spelling
+ * opens under `root` (APFS finds a file by either), else it keeps the spelling on disk, the only one that reads.
+ */
+export async function nfcPaths(root: string, paths: readonly string[]): Promise<string[]> {
+  const listed = new Set(paths);
+  const out = new Set<string>();
+  for (const p of paths) {
+    const nfc = p.normalize('NFC');
+    if (nfc === p || listed.has(nfc)) out.add(nfc);
+    else out.add(await lstat(join(root, nfc)).then(() => nfc, () => p));
+  }
+  return [...out];
+}

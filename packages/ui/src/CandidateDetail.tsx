@@ -1,3 +1,4 @@
+import { asIs, labelOf } from './labels.ts';
 import type { CandidateDetail as Detail, ExternalRef, FeedbackSource } from './api.ts';
 import type { HumanTurn } from '@fb/core';
 import { feedbackSkipRule, isSelfReview } from '@fb/core/feedback-rules';
@@ -5,6 +6,7 @@ import { Fragment, useState } from 'react';
 import { sessionHref } from './links.ts';
 import { Badge, Card, SectionLabel, StatusBadge, tableClass, tdClass, type Tone } from './ui/display.tsx';
 import { Markdown } from './ui/Markdown.tsx';
+import { ScrollArea } from './ui/ScrollArea.tsx';
 
 const when = (ts: string) => new Date(ts).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
 
@@ -15,7 +17,7 @@ export const SOURCE_TONE: Record<FeedbackSource, Tone> = { claude: 'accent', cod
 /** Where an Inbox item came from: the agent whose session it was flagged in, or GitHub / Linear for a comment. */
 export function SourceBadge({ source }: { source: FeedbackSource | undefined }) {
   const s = source ?? 'claude';
-  return <Badge tone={SOURCE_TONE[s]} className="shrink-0">{SOURCE_LABEL[s] ?? s}</Badge>;
+  return <Badge tone={labelOf(SOURCE_TONE, s, () => 'neutral')} className="shrink-0">{labelOf(SOURCE_LABEL, s, asIs)}</Badge>;
 }
 
 /** An AI agent reviewing its own pull request under the author's account (core isSelfReview): kept, but not a reviewer. */
@@ -87,9 +89,9 @@ function TurnBlock({ turn, flagged }: { turn: HumanTurn; flagged?: boolean }) {
   const [expanded, setExpanded] = useState(false);
   return (
     <div className={`min-w-0 rounded-md border px-3.5 py-2.5 ${flagged ? 'border-accent bg-accent-soft shadow-[inset_3px_0_0_var(--color-accent)]' : 'border-line bg-surface'}`}>
-      <Speaker who={ext ? ext.author : 'You'} meta={ext ? `${KIND_LABEL[ext.kind]}, ${when(turn.ts)}` : `turn ${turn.index}, ${when(turn.ts)}`}>
+      <Speaker who={ext ? ext.author : 'You'} meta={ext ? `${labelOf(KIND_LABEL, ext.kind, asIs)}, ${when(turn.ts)}` : `turn ${turn.index}, ${when(turn.ts)}`}>
         {ext?.authorKind && ext.authorKind !== 'human'
-          ? <Badge title={ext.authorVerified ? 'by its login' : 'by a marker in the comment'}>{AUTHOR_KIND_LABEL[ext.authorKind]}</Badge>
+          ? <Badge title={ext.authorVerified ? 'by its login' : 'by a marker in the comment'}>{labelOf(AUTHOR_KIND_LABEL, ext.authorKind, asIs)}</Badge>
           : role && <Badge tone="info">{role}</Badge>}
         {ext && isSelfReview(ext) ? <SelfReviewBadge /> : flagged && <Badge tone="accent">flagged as pushback</Badge>}
         {ext?.url && <a href={ext.url} target="_blank" rel="noreferrer noopener" className="text-accent-text underline underline-offset-2">open</a>}
@@ -129,7 +131,7 @@ function ExternalContext({ ext }: { ext: ExternalRef }) {
         </dd>
       </dl>
       {ext.description?.trim() && <Description text={ext.description} />}
-      {ext.diffHunk &&<pre className="max-h-48 overflow-auto rounded-sm bg-sunken px-2 py-1.5 font-mono text-[11.5px] leading-snug whitespace-pre">{ext.diffHunk}</pre>}
+      {ext.diffHunk &&<ScrollArea as="pre" className="max-h-48 overflow-auto rounded-sm bg-sunken px-2 py-1.5 font-mono text-[11.5px] leading-snug whitespace-pre">{ext.diffHunk}</ScrollArea>}
     </Card>
   );
 }
@@ -160,6 +162,10 @@ function Description({ text }: { text: string }) {
   );
 }
 
+/** Only the agent reported it (report_feedback): no classifier scored it, so it has no confidence to show. */
+export const agentReportOnly = (c: Pick<Detail['candidate'], 'origins'>) => !!c.origins?.includes('agent') && !c.origins.includes('detector');
+export const AGENT_REPORT_TITLE = 'your coding agent reported this miss (report_feedback); no classifier scored it';
+
 export function CandidateDetail({ detail }: { detail: Detail }) {
   const { turn, before, after, commits, candidate } = detail;
   const ext = turn.external ?? candidate.external ?? null;
@@ -171,7 +177,9 @@ export function CandidateDetail({ detail }: { detail: Detail }) {
           <Badge>{candidate.projectKey}</Badge>
           <StatusBadge status={candidate.status} />
           <Badge tone="accent">{candidate.classification.label}</Badge>
-          <span className="text-xs text-muted tabular-nums">{Math.round(candidate.classification.confidence * 100)}% confident</span>
+          {agentReportOnly(candidate)
+            ? <span className="text-xs text-muted" title={AGENT_REPORT_TITLE}>agent report</span>
+            : <span className="text-xs text-muted tabular-nums">{Math.round(candidate.classification.confidence * 100)}% confident</span>}
         </div>
         <h2 className="text-[19px] leading-snug font-semibold tracking-[-0.01em] text-balance [overflow-wrap:anywhere]">{candidate.classification.summary || '(no summary)'}</h2>
       </header>
@@ -189,13 +197,13 @@ export function CandidateDetail({ detail }: { detail: Detail }) {
             <Speaker who="Agent" meta="right before" />
             {turn.precedingAssistantText ? <Markdown text={turn.precedingAssistantText} className="text-[13.5px] leading-relaxed text-text/90" /> : <p className="text-muted">(no text)</p>}
             {turn.precedingToolCalls.length > 0 && (
-              <ul className="mt-2 grid max-h-40 gap-0.5 overflow-auto border-t border-line pt-2 font-mono text-[11.5px] text-muted">
+              <ScrollArea as="ul" className="mt-2 grid max-h-40 gap-0.5 overflow-auto border-t border-line pt-2 font-mono text-[11.5px] text-muted">
                 {turn.precedingToolCalls.map((c, i) => (
                   <li key={i} className="truncate">
                     <span className="font-semibold text-text">{c.name}</span> {c.filePath ?? c.command ?? ''}
                   </li>
                 ))}
-              </ul>
+              </ScrollArea>
             )}
           </div>
         )}

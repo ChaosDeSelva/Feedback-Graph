@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { REDACT_PAGE, redactDeep, redactStoredRow, type Activity, type ActivityInput, type ActivityKind, type ActivityQuery, type ActivityStore, prepareActivity } from '@fb/core';
+import { REDACT_PAGE, redactDeep, redactStoredRow, type Activity, type ActivityInput, type ActivityKind, type ActivityPage, type ActivityQuery, type ActivitySinceQuery, type ActivityStore, prepareActivity } from '@fb/core';
 import { iso, toJson, type Db } from './db.ts';
 
 type Row = {
@@ -81,6 +81,20 @@ export class PgActivityStore implements ActivityStore {
       [q.projectKey ?? null, q.kind ?? null, q.target ?? null, q.limit ?? 200, q.projectKeys ?? null, q.maxDetailBytes ?? null, q.run ?? null, !!q.unlabelled, !!q.noSandbox, q.before ?? null],
     );
     return rows.map((r) => ({ ...activityOf(r), ...(r.omitted && { detailsOmitted: true }) }));
+  }
+
+  /** The cursor is the last entry's `seq`. */
+  async since(q: ActivitySinceQuery): Promise<ActivityPage> {
+    if (q.after && !/^\d+$/.test(q.after)) throw new Error(`not an Activity cursor: ${q.after}`);
+    const { rows } = await this.db.pool.query<Row & { seq: number }>(
+      `SELECT * FROM (
+         SELECT seq, id, ts, kind, actor, project_key, subject, why, details, targets, run, sandbox FROM activity
+          WHERE seq > $1 AND ($2::text[] IS NULL OR kind = ANY($2)) AND (NOT $3 OR run IS NULL) AND ($4::timestamptz IS NULL OR ts < $4)
+          ORDER BY seq ${q.last ? 'DESC' : ''} LIMIT $5) x
+        ORDER BY seq`,
+      [q.after ?? 0, q.kinds ?? null, !!q.unlabelled, q.until ?? null, q.limit],
+    );
+    return { entries: rows.map(activityOf), next: rows.length ? String(rows[rows.length - 1].seq) : (q.after ?? null) };
   }
 
   async get(id: string): Promise<Activity | null> {

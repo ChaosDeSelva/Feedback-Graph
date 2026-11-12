@@ -93,3 +93,19 @@ test('files a scan read in data folders before this rule are forgotten at start 
   expect(await forgetDataFiles(d)).toEqual({ files: 0, projects: 0 });
   expect(activity).toHaveLength(1);
 });
+
+test('forgetting many data folders names the first five in path order, nested ones included, and logs the count', async () => {
+  const dirs = ['transcripts', 'logs', 'a/dumps', 'b/logs', 'c/logs', 'd/logs'];
+  const stored = new Map([...dirs.flatMap((d) => many(d, 200, '.json')), 'package.json'].map((p) => [p, 'h']));
+  const activity: ActivityInput[] = [];
+  const logged: [string, object | undefined][] = [];
+  const d = {
+    facts: { fileHashes: async () => new Map(stored), markFilesRemoved: async () => {} },
+    projects: async () => [{ key: 'demo', repoPath: '/repo' }],
+    activity: { record: async (a: ActivityInput) => { activity.push(a); } },
+    log: (m: string, e?: object) => logged.push([m, e]),
+  };
+  expect(await forgetDataFiles(d)).toEqual({ files: 1200, projects: 1 });
+  expect(activity[0].subject).toBe('forgot 1200 files in data folders of demo: a/dumps/ (200), b/logs/ (200), c/logs/ (200), d/logs/ (200), logs/ (200), ...');
+  expect(logged).toEqual([['data files forgotten', { project: 'demo', files: 1200, dirs: 6 }]]);
+});

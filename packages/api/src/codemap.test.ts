@@ -30,7 +30,7 @@ const pool: ModuleContext = {
 
 function codegraph(over: Partial<CodeGraphStore> = {}) {
   const asked: { fn: string; args: unknown[] }[] = [];
-  const cg: Pick<CodeGraphStore, 'lessonsForPaths' | 'moduleContext' | 'impact' | 'codeMapMeta'> & Partial<Pick<CodeGraphStore, 'outsideMap'>> = {
+  const cg: Pick<CodeGraphStore, 'lessonsForPaths' | 'moduleContext' | 'impact' | 'codeMapMeta'> = {
     lessonsForPaths: async () => [],
     moduleContext: async (k, p) => { asked.push({ fn: 'moduleContext', args: [k, p] }); return p === pool.file.path ? pool : null; },
     impact: async (k, paths, depth) => {
@@ -68,7 +68,7 @@ function deps(over: Partial<ContextDeps> = {}): ContextDeps & { recorded: Activi
 
 test('get_module_context describes a file: facts, exported symbols, importers, imports, tests, lessons and misses, with citations', async () => {
   const d = deps();
-  const r = await getModuleContext({ cwd: '/Users/j/Vibe/demo/src', path: 'db/pool.ts' }, d);
+  const r = await getModuleContext({ cwd: '/Users/j/Vibe/demo/src', path: 'src/db/pool.ts' }, d);
   const md = r.markdown;
   expect(r.module?.file.path).toBe('src/db/pool.ts');
   expect(md).toContain('src/db/pool.ts');
@@ -79,7 +79,7 @@ test('get_module_context describes a file: facts, exported symbols, importers, i
   expect(md).toContain('src/config.ts');
   expect(md).toContain('pkg:pg');
   expect(md).toContain('test/pool.test.ts');
-  expect(md).toMatch(/Code map rebuilt .*unchanged maps are not rewritten.*not a staleness signal/);
+  expect(md).toMatch(/Code map built \d+d ago; the worker rebuilds it when the repo changes/);
   expect(md).toMatch(/Release pool clients[\s\S]*lesson l1/);
   expect(md).toMatch(/leaked pool clients on error[\s\S]*session s1/);
   expect(md.indexOf('Every client is released')).toBeLessThan(md.indexOf('createPool'));
@@ -113,21 +113,34 @@ test('get_module_context says when the file is not in the map, when there is no 
   expect(out.module).toBeNull();
 });
 
-test('a file past the cap is in the import index: the answer says who imports it instead of "not in the code map"', async () => {
-  const outsideMap: CodeGraphStore['outsideMap'] = async (_k, paths) =>
-    paths.filter((p) => p === 'src/utils/logging.ts').map((path) => ({ path, importers: ['src/api/orders.ts', 'src/api/users.ts', 'test/orders.test.ts'], tests: ['test/orders.test.ts'] }));
+test('a file past the cap is in the import index: a full module context, its symbols parsed from the file when asked', async () => {
+  // The store's view of a file past the cap (codeGraphViews): importers, imports and tests from the index, no symbols.
+  const logging: ModuleContext = { ...pool, file: { ...pool.file, path: 'src/utils/logging.ts', churn: null }, symbols: [], importers: ['src/api/orders.ts', 'src/api/users.ts', 'test/orders.test.ts'], tests: ['test/orders.test.ts'], facts: [], misses: [], lessons: [], outside: true };
   const capped = async () => ({ fingerprint: 'abc', builtAt: '2026-10-22T12:00:00Z', stats: { files: 4000, symbols: 1, imports: 1, tests: 0 }, candidates: 10_290, unresolved: 0, version: CODE_MAP_VERSION });
-  const d = deps({ codegraph: codegraph({ codeMapMeta: capped, outsideMap }).cg });
+  const moduleContext = async (_k: string, p: string) => (p === pool.file.path ? pool : p === logging.file.path ? logging : null);
+  const parsed: string[] = [];
+  const parseSymbols = async (_repo: string, rel: string) => {
+    parsed.push(rel);
+    return [{ id: `${rel}#log`, path: rel, name: 'log', kind: 'function' as const, exported: true, lines: '1-9' }];
+  };
+  const d = deps({ codegraph: codegraph({ codeMapMeta: capped, moduleContext }).cg, parseSymbols });
   const md = (await getModuleContext({ project: 'demo', path: 'src/utils/logging.ts' }, d)).markdown;
-  expect(md).toMatch(/`src\/utils\/logging\.ts` is outside the code map of demo \(it holds 4000 of 10290 files/);
-  expect(md).toMatch(/3 files outside the map import this path|3 files import this path/);
-  expect(md).toContain('`src/api/orders.ts`');
+  expect(md).toMatch(/`src\/utils\/logging\.ts` is past the code map's cap \(it holds 4000 of 10290 files/);
+  expect(md).toMatch(/## Exported symbols \(1\)\n- `log` \(function, lines 1-9\)/);
+  expect(md).toMatch(/## Imported by \(3\)\n- `src\/api\/orders\.ts`/);
   expect(md).toContain('`test/orders.test.ts`');
   expect(md).not.toContain('not in the code map');
+  expect(parsed).toEqual(['src/utils/logging.ts']);
+  // A file the parser cannot read (gone since the map was built) lists none, as does a server with no parser.
+  expect((await getModuleContext({ project: 'demo', path: 'src/utils/logging.ts' }, deps({ codegraph: codegraph({ codeMapMeta: capped, moduleContext }).cg, parseSymbols: async () => null }))).markdown).toMatch(/## Exported symbols \(0\)\n- none/);
+  const bare = (await getModuleContext({ project: 'demo', path: 'src/utils/logging.ts' }, deps({ codegraph: codegraph({ codeMapMeta: capped, moduleContext }).cg }))).markdown;
+  expect(bare).toMatch(/## Exported symbols \(0\)\n- none/);
+  // Task context reads it like any mapped file: no "outside the map" line.
   const task = await getTaskContext({ project: 'demo', task: 'logging', files: ['src/db/pool.ts', 'src/utils/logging.ts', 'src/new.ts'] }, d);
   const section = task.markdown.slice(task.markdown.indexOf('## Code map'));
-  expect(section).toMatch(/`src\/utils\/logging\.ts`: outside the map \(capped\), so no symbols; 3 files import this path \(`src\/api\/orders\.ts`/);
-  expect(section).toMatch(/src\/new\.ts.*not in the code map/);
+  expect(section).toMatch(/`src\/utils\/logging\.ts`: imported by 3 files · tests: `test\/orders\.test\.ts`/);
+  expect(section).not.toMatch(/outside the map/);
+  expect(section).toMatch(/- 1 file not in the code map \(new, ignored, generated or not source\): `src\/new\.ts`/);
 });
 
 test('get_module_context for an untracked folder gives no context', async () => {
@@ -155,11 +168,11 @@ test('a stored non-miss on a file is never served by get_module_context, impact 
   expect(mod.markdown).not.toContain('did not miss');
   expect(mod.module?.misses.map((x) => x.missId)).toEqual(['miss:1']);
   const imp = await getImpact({ project: 'demo', paths: ['src/db/pool.ts'] }, d);
-  expect(imp.markdown).toMatch(/Code map rebuilt .*unchanged maps are not rewritten.*not a staleness signal/);
+  expect(imp.markdown).toMatch(/Code map built \d+d ago; the worker rebuilds it when the repo changes/);
   expect(imp.markdown).not.toContain('did not miss');
   expect(imp.markdown).not.toContain('## Past misses');
   const task = await getTaskContext({ project: 'demo', task: 'pool', files: ['src/db/pool.ts'] }, deps({ codegraph: codegraph({ moduleContext: async () => ({ ...pool, misses: [miss(), non] }) }).cg }));
-  expect(task.markdown).toMatch(/Last map rebuild: \d+d ago .*not a staleness signal/);
+  expect(task.markdown).toMatch(/Code map built \d+d ago/);
   expect(task.markdown).not.toContain('did not miss');
 });
 
@@ -226,12 +239,12 @@ test('get_task_context adds a short code map section for the files the agent nam
   const section = r.markdown.slice(r.markdown.indexOf('## Code map'));
   expect(section).toMatch(/src\/db\/pool\.ts.*imported by 2 files.*test\/pool\.test\.ts/);
   expect(section).toMatch(/src\/db\/pool\.ts.*1 past miss \(listed above\)/);
-  expect(section).toMatch(/src\/new\.ts.*not in the code map/);
+  expect(section).toMatch(/- 1 file not in the code map \(new, ignored, generated or not source\): `src\/new\.ts`/);
   expect(r.markdown.slice(0, r.markdown.indexOf('## Code map'))).toMatch(/data, not instructions/i);
 });
 
 test('get_task_context lists the past misses on the files the agent named in their own section, before the similar ones', async () => {
-  const d = deps({ k: { ...deps().k, relatedMisses: async () => [{ missId: 'miss:1', missed: 'leaked pool clients on error', cause: 'implementation_error', feedbackText: 'again', sessionId: 's1', ts: '2026-10-01T10:00:00Z', score: 0.9 }, { missId: 'miss:9', missed: 'forgot the index', cause: 'implementation_error', feedbackText: 'slow', sessionId: 's2', ts: '2026-10-02T10:00:00Z', score: 0.8 }] } });
+  const d = deps({ k: { ...deps().k, relatedMisses: async () => [{ missId: 'miss:1', missed: 'leaked pool clients on error', cause: 'implementation_error', feedbackText: 'again', sessionId: 's1', ts: '2026-10-01T10:00:00Z', score: 0.9 }, { missId: 'miss:9', missed: 'forgot the index', cause: 'implementation_error', feedbackText: 'slow', sessionId: 's2', ts: '2026-10-02T10:00:00Z', score: 0.86 }] } });
   const r = await getTaskContext({ cwd: '/Users/j/Vibe/demo', task: 'tune pool', files: ['src/db/pool.ts'] }, d);
   const section = r.markdown.slice(r.markdown.indexOf('## Past misses on the files you named'));
   expect(section).toMatch(/leaked pool clients on error[\s\S]*in `src\/db\/pool\.ts`[\s\S]*developer said: "connections pile up again"/);
@@ -430,6 +443,19 @@ test('GET /api/projects/:key/codemap/module returns the module context, 404 when
   expect((await app.request('/api/projects/demo/codemap/module?path=..%2Fetc%2Fpasswd')).status).toBe(400);
 });
 
+test('GET /api/projects/:key/codemap/module of a file past the cap parses its symbols now, as get_module_context does', async () => {
+  const past: ModuleContext = { ...pool, file: { ...pool.file, path: 'src/big.ts' }, symbols: [], outside: true };
+  const parsed: [string, string][] = [];
+  const parseSymbols = async (repoPath: string, rel: string) => { parsed.push([repoPath, rel]); return [{ id: 'src/big.ts#route', path: 'src/big.ts', name: 'route', kind: 'function' as const, exported: true, lines: '1-9' }]; };
+  const { app } = restApp({ moduleContext: async (_k: string, p: string) => (p === 'src/big.ts' ? past : p === 'src/db/pool.ts' ? pool : null) }, { context: { roots, embed: async () => [], k: { listLessons: async () => [], searchLessons: async () => [], missesNaming: async () => [], relatedMisses: async () => [] }, parseSymbols } as unknown as ContextDeps });
+  const res = (await (await app.request('/api/projects/demo/codemap/module?path=src%2Fbig.ts')).json()) as ModuleContext;
+  expect(res.symbols.map((x) => x.name)).toEqual(['route']);
+  expect(parsed).toEqual([['/vibe/demo', 'src/big.ts']]);
+  // A mapped file keeps the map's symbols and is not read again.
+  expect(((await (await app.request('/api/projects/demo/codemap/module?path=src%2Fdb%2Fpool.ts')).json()) as ModuleContext).symbols).toHaveLength(2);
+  expect(parsed).toHaveLength(1);
+});
+
 test('GET /api/projects/:key/codemap/impact takes one or more paths and a depth', async () => {
   const { app, asked } = restApp();
   const res = await app.request('/api/projects/demo/codemap/impact?path=src%2Fa.ts&path=src%2Fb.ts&depth=2');
@@ -563,11 +589,86 @@ describe('a shared util in a big repo: impact and get_module_context cap each li
   });
 
   test('a file past the cap lists its nearest tests and says how many more', async () => {
-    const outsideMap: CodeGraphStore['outsideMap'] = async (_k, paths) => paths.map((path) => ({ path, importers: ['src/a.ts'], tests }));
+    const moduleContext = async (_k: string, path: string): Promise<ModuleContext> => ({ ...pool, file: { ...pool.file, path }, symbols: [], importers: ['src/a.ts'], tests, facts: [], misses: [], lessons: [], outside: true });
     const capped = async () => ({ fingerprint: 'abc', builtAt: '2026-10-22T12:00:00Z', stats: { files: 4000, symbols: 1, imports: 1, tests: 0 }, candidates: 10_290, unresolved: 0, version: CODE_MAP_VERSION });
-    const md = (await getModuleContext({ project: 'demo', path: 'src/utils/logging.ts' }, deps({ codegraph: codegraph({ codeMapMeta: capped, outsideMap }).cg }))).markdown;
+    const md = (await getModuleContext({ project: 'demo', path: 'src/utils/logging.ts' }, deps({ codegraph: codegraph({ codeMapMeta: capped, moduleContext }).cg }))).markdown;
     expect(md).toContain('`test/t000.test.ts`');
     expect(md).not.toContain('`test/t119.test.ts`');
     expect(md).toMatch(/- and \d+ more tests?/);
   });
+});
+
+test('0.7.6 impact and brief context say named credential files were left out, without naming them', async () => {
+  const d = deps({ codegraph: codegraph({ impact: async () => ({ paths: ['src/db/pool.ts'], dependents: [], tests: [], misses: [], lessons: [] }) }).cg });
+  const only = await getImpact({ project: 'demo', paths: ['.fly/config.yml'] }, d);
+  expect(only.markdown).toMatch(/1 named credential file omitted: secret-file paths and contents are never read/);
+  expect(only.markdown).not.toMatch(/None of these paths is a file|\.fly/);
+  const mixed = await getImpact({ project: 'demo', paths: ['src/db/pool.ts', '.env'] }, d);
+  expect(mixed.markdown).toMatch(/1 named credential file omitted/);
+  expect(mixed.markdown).not.toContain('.env');
+  const brief = await getTaskContext({ project: 'demo', task: 'rotate the fly token', files: ['.fly/config.yml', 'src/db/pool.ts'], brief: true }, d);
+  expect(brief.markdown).toMatch(/1 named credential file omitted/);
+  expect(brief.markdown).not.toContain('.fly/config.yml');
+});
+
+test('an unchanged map is described by when it was last confirmed current, not by its old build date', async () => {
+  const day = 86_400_000;
+  const meta = { fingerprint: 'abc', builtAt: new Date(Date.now() - 12 * day).toISOString(), checkedAt: new Date(Date.now() - 3_600_000).toISOString(), stats: { files: 40, symbols: 200, imports: 90, tests: 12 }, candidates: null, unresolved: 0, version: CODE_MAP_VERSION };
+  const d = deps({ codegraph: codegraph({ codeMapMeta: async () => meta }).cg });
+  const current = /Code map last confirmed current today \(built 12d ago; the repo had not changed since\)/;
+  expect((await getModuleContext({ project: 'demo', path: 'src/db/pool.ts' }, d)).markdown).toMatch(current);
+  expect((await getImpact({ project: 'demo', paths: ['src/db/pool.ts'] }, d)).markdown).toMatch(current);
+  expect((await getTaskContext({ project: 'demo', task: 'pool', files: ['src/db/pool.ts'] }, d)).markdown).toMatch(current);
+  expect((await getModuleContext({ project: 'demo', path: 'src/new.ts' }, d)).markdown).toMatch(/not in the code map of demo \(built \S+ \S+ UTC, last confirmed current \S+ \S+ UTC, 40 files\)/);
+});
+
+describe('get_task_context with files: one line for the files the map does not hold, and facts on the named files first', () => {
+  const fact = (id: string, path: string, statement: string, relevance = 0.8) => ({ id, projectKey: 'demo', path, lines: '1-2', kind: 'convention', statement, why: 'w', confidence: 0.9, relevance, source: 'scan', createdAt: '2026-10-01T00:00:00Z', scanJobId: null, fileHash: null, fileSummary: null }) as never;
+
+  test('six files the map does not hold take one line, not six', async () => {
+    const named = ['src/db/pool.ts', ...['a', 'b', 'c', 'd', 'e', 'f'].map((x) => `gen/${x}.ts`)];
+    const r = await getTaskContext({ project: 'demo', task: 'pool work', files: named }, deps());
+    const section = r.markdown.slice(r.markdown.indexOf('## Code map'));
+    expect(section.match(/not in the code map/g)).toHaveLength(1);
+    expect(section).toMatch(/- 6 files not in the code map \(new, ignored, generated or not source\): `gen\/a\.ts`, `gen\/b\.ts`, `gen\/c\.ts`, `gen\/d\.ts`, `gen\/e\.ts`, `gen\/f\.ts`/);
+    const brief = await getTaskContext({ project: 'demo', task: 'pool work', files: named, brief: true }, deps());
+    expect(brief.markdown.match(/not in the code map/g)).toHaveLength(1);
+  });
+
+  test('the search\'s facts on the named files or their folder come first, then their own scan\'s, then at most 3 others', async () => {
+    const elsewhere = Array.from({ length: 8 }, (_, i) => ({ fact: fact(`far${i}`, `src/db/sub${i}/x.ts`, `far fact ${i}`), score: 0.9 - i * 0.001 }));
+    const near = { fact: fact('near', 'src/db/config.ts', 'pool config lives beside the pool'), score: 0.84 };
+    const d = deps({
+      facts: {
+        searchFacts: async () => [...elsewhere, near],
+        listFacts: async (q) => (q.path === 'src/db/pool.ts' ? [fact('own3', 'src/db/pool.ts', 'a third', 0.7), fact('own1', 'src/db/pool.ts', 'release every client', 0.9), fact('own2', 'src/db/pool.ts', 'max ten clients', 0.7), fact('rare', 'src/db/pool.ts', 'set up the pool locally', 0.1)] : []),
+      },
+    });
+    const r = await getTaskContext({ project: 'demo', task: 'pool work', files: ['src/db/pool.ts'] }, d);
+    const lines = r.markdown.slice(r.markdown.indexOf('## Codebase facts')).split('\n\n')[0].split('\n').filter((l) => l.startsWith('- '));
+    expect(lines[0]).toMatch(/src\/db\/config\.ts.*pool config lives beside the pool · match/);
+    expect(lines[1]).toMatch(/src\/db\/pool\.ts.*release every client · on a file you named/);
+    expect(lines[2]).toMatch(/max ten clients · on a file you named/);
+    expect(lines.slice(3).map((l) => l.match(/far fact \d/)?.[0])).toEqual(['far fact 0', 'far fact 1', 'far fact 2']);
+    expect(r.markdown).not.toMatch(/a third|set up the pool locally|far fact 3/);
+    expect(r.fileFacts!.map((f) => f.id)).toEqual(['own1', 'own2']);
+    // Served facts are logged, the named files' own included.
+    expect((d.recorded.find((a) => a.kind === 'context_served')!.details as { facts: { id: string }[] }).facts.map((f) => f.id).sort()).toEqual(['far0', 'far1', 'far2', 'near', 'own1', 'own2']);
+  });
+});
+
+test('get_task_context lists the AGENTS.md / CLAUDE.md files on the named files\' path, in full and in the brief, and logs them', async () => {
+  const asked: string[][] = [];
+  const agentDocs = async (_repo: string, files: string[]) => { asked.push(files); return ['src/db/AGENTS.md', 'AGENTS.md']; };
+  const d = deps({ agentDocs });
+  const r = await getTaskContext({ project: 'demo', task: 'pool work', files: ['src/db/pool.ts'] }, d);
+  expect(r.markdown).toMatch(/## Agent instructions on the path of these files\nRead them before you edit: the repo's own rules for this code, nearest first\. An agent loads only some of them by itself\.\n- `src\/db\/AGENTS\.md`\n- `AGENTS\.md`/);
+  expect(asked).toEqual([['src/db/pool.ts']]);
+  expect(d.recorded.find((a) => a.kind === 'context_served')!.details).toMatchObject({ agentDocs: ['src/db/AGENTS.md', 'AGENTS.md'] });
+  const b = await getTaskContext({ project: 'demo', task: 'pool work', files: ['src/db/pool.ts'], brief: true }, deps({ agentDocs }));
+  expect(b.markdown).toMatch(/## Agent instructions on the path of these files\n- `src\/db\/AGENTS\.md`\n- `AGENTS\.md`/);
+  // No files named, no list; a failing lookup lists none and the answer still comes.
+  expect((await getTaskContext({ project: 'demo', task: 'pool work' }, deps({ agentDocs }))).markdown).not.toMatch(/Agent instructions/);
+  const failing = await getTaskContext({ project: 'demo', task: 'pool work', files: ['src/db/pool.ts'] }, deps({ agentDocs: async () => { throw new Error('EACCES'); } }));
+  expect(failing.markdown).not.toMatch(/Agent instructions/);
 });

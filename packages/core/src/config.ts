@@ -1,7 +1,10 @@
 import { createRequire } from 'node:module';
+import { apiAuthConfigured } from './authState.ts';
 import { parseLogins } from './feedbackRules.ts';
 import { parseGithubRepos } from './integrations/github.ts';
 import type { Root } from './projects.ts';
+import { MISS_CLOSE } from './relevance.ts';
+import { DECISION_TYPES, type DecisionType } from './types.ts';
 import { DEFAULT_NUM_CTX, DEFAULT_NUM_PREDICT, DEFAULT_OLLAMA_TIMEOUT_MS, DEFAULT_REPEAT_PENALTY } from './ollama.ts';
 
 /** Bumped with each release; reported by /api/status and the worker heartbeat. */
@@ -84,6 +87,11 @@ export type Config = {
   classifyBatch: number;
   scanMaxBytes: number;
   /**
+   * CODE_MAP_MAX_BYTES: the code map's limit for a parsed source file (default 1 MB). Above SCAN_MAX_BYTES, which
+   * bounds what a scan sends to a model and every other file the map reads: a hub file is often the largest.
+   */
+  codeMapMaxBytes: number;
+  /**
    * SCAN_MAX_FILES: files per project the code map keeps and changed files a per-file scan reads per run. Null (unset):
    * the map keeps 40% of the candidates, between 400 and 4000, and a scan reads 400 per run.
    */
@@ -91,11 +99,17 @@ export type Config = {
   /** SCAN_CONCURRENCY: scans run at once, beside the worker cycle (default 2; agentic ones one at a time). */
   scanConcurrency: number;
   /**
-   * check_before_done's judge (api): CHECK_CONCURRENCY calls at once (default 2), the rest queued; a check the judge
-   * has not answered within CHECK_WAIT_SECONDS (default 300, waiting included) is answered "not judged" at once and
-   * its model call cancelled. The judge's attempts (an answer and its one retry) share that same budget.
+   * check_before_done's judge (api): CHECK_CONCURRENCY calls at once (default 2), the rest queued. One response waits
+   * at most 50 s (or CHECK_WAIT_SECONDS when lower) and then answers "queued"; the judge call it started keeps running
+   * for its retries for up to CHECK_WAIT_SECONDS (default 300), and one that has not answered by then is a failed
+   * check. The judge's attempts (an answer and its one retry) share that same budget.
    */
   check: { concurrency: number; waitSeconds: number };
+  /**
+   * MISS_MIN_SIMILARITY (0 to 1, default MISS_CLOSE 0.85): how close a past miss must be to the work to be served by
+   * get_task_context or judged by check_before_done when it shares no file with it.
+   */
+  missMinSimilarity: number;
   /** Seeds the project selection on its first start only; from then on the selection (Settings) decides. */
   ingestProjects: string[];
   /** Never ingested, scanned or served, even when INGEST_PROJECTS is empty. */
@@ -106,6 +120,8 @@ export type Config = {
   memoryAutoApprove: boolean;
   /** Session summaries (the worker's summarize stage). */
   summary: SummaryConfig;
+  /** The learning loop (LOOP_*). */
+  loop: LoopConfig;
   /**
    * GITHUB_REPOS (project=owner/repo), which overrides the repository a project's github.com remote names, and the
    * hours between PR-as-context syncs. The token is resolved per cycle (Integrations: .env, else Settings).
@@ -118,6 +134,14 @@ export type Config = {
   /** Minutes between rounds of looking for links between the selected projects (LINK_SCAN_MINUTES, default 30). */
   linkScanMinutes: number;
   apiToken: string | null;
+  /**
+   * Whether the API has API_TOKEN or FG_OWNER_TOKEN: the owner can review and roll back what the learning loop does,
+   * so it may do more than observe. The worker holds neither token: it reads the API's own answer from authStateFile
+   * (authState.ts), or, run on its own, is told by FG_AUTH_CONFIGURED (1, true or yes; anything else is no).
+   */
+  authConfigured: boolean;
+  /** AUTH_STATE_FILE: where the worker reads whether the API runs with a token (the API renews it while it runs). */
+  authStateFile: string | null;
   /** FG_OWNER_TOKEN: optional bearer used only for explicit headless owner writes; never given to agents. */
   ownerToken: string | null;
   /** FG_OPERATOR_TOKEN and OPERATOR_ALLOW; null (the default): no request can make owner decisions without the UI. */
@@ -145,6 +169,31 @@ export type SummaryConfig = {
   idleMinutes: number;
   /** Existing sessions summarized per cycle, newest first (SUMMARY_BACKFILL_PER_CYCLE, 3; 0 stops the backfill). */
   backfillPerCycle: number;
+};
+
+/** The learning loop's mode. off: nothing runs. observe: decisions recorded only. propose: each waits for you. auto: by tier. */
+export const LOOP_MODES = ['off', 'observe', 'propose', 'auto'] as const;
+export type LoopMode = (typeof LOOP_MODES)[number];
+
+/** config.loop: the LOOP_* settings (the loop's shared state, which reads them, is loop/state.ts). */
+export type LoopConfig = {
+  /** LOOP_MODE: the mode on first start only; null (unset): LOOP_DEFAULT_MODE. From then on Settings decides. */
+  mode: LoopMode | null;
+  /** LOOP_DISABLED=1: nothing runs, whatever Settings says. */
+  disabled: boolean;
+  /** LOOP_LLM: the provider for rewording and judging; null: the local Ollama model. */
+  llm: string | null;
+  /** LOOP_LLM_CALLS_PER_DAY (default 40; 0: no model calls). */
+  llmCallsPerDay: number;
+  /** LOOP_AUTO_PER_DAY / LOOP_AUTO_PER_PROJECT: agent-facing decisions applied on their own per day (5), and per project (2). */
+  autoPerDay: number;
+  autoPerProject: number;
+  /** LOOP_SYNC_HOLD_DAYS: a lesson the loop changed is shared with the cloud as it was before for this long (default 7). */
+  syncHoldDays: number;
+  /** LOOP_HOLDOUT: the share of eligible lessons the loop never changes, to compare against (0 to 0.5, default 0.2). */
+  holdout: number;
+  /** LOOP_TYPES: the decision types that run; null (unset): all of them. */
+  types: DecisionType[] | null;
 };
 
 export type CloudConfig = {
@@ -199,15 +248,20 @@ export const OPERATOR_VERBS = [
   'delete_project', 'retry', 'requeue', 'sync_now', 'import', 'resummarize', 'integrations', 'chat', 'chat_delete',
   // Removes what one labelled run (x-fg-run) wrote and nothing else, so it is on by default (DELETE /api/runs/:id).
   'run_cleanup', 'demo',
+  // The learning loop: approve, reject, keep or roll back its decisions and note on them; its mode, pause and resume.
+  'loop_decide', 'loop_settings',
 ] as const;
 export type OperatorVerb = (typeof OPERATOR_VERBS)[number];
 /**
  * Off unless OPERATOR_ALLOW names them: deciding lessons (what agents are taught), choosing which project folders are read
  * (projects are the owner's opt-in), and what deletes data (deleting a project, an uploaded document, a link between
  * projects or an Ask conversation; settings, whose cleanup deletes unselected projects' data), imports lessons from a
- * file, or sets integration keys; and `chat` (asking in Ask), which spends the owner's Claude or Codex subscription.
+ * file, or sets integration keys; `chat` (asking in Ask), which spends the owner's Claude or Codex subscription; and the
+ * learning loop's decisions and settings (an agent must not judge, or switch on, what the loop teaches agents).
  */
-const OPERATOR_DEFAULT_OFF: readonly OperatorVerb[] = ['lesson_decide', 'select_projects', 'delete_project', 'docs_delete', 'links_delete', 'settings', 'import', 'integrations', 'chat', 'chat_delete'];
+const OPERATOR_DEFAULT_OFF: readonly OperatorVerb[] = ['lesson_decide', 'select_projects', 'delete_project', 'docs_delete', 'links_delete', 'settings', 'import', 'integrations', 'chat', 'chat_delete', 'loop_decide', 'loop_settings'];
+/** What the operator token may do with OPERATOR_ALLOW empty. A list given there replaces these, not adds to them. */
+export const OPERATOR_DEFAULT_VERBS: readonly OperatorVerb[] = OPERATOR_VERBS.filter((v) => !OPERATOR_DEFAULT_OFF.includes(v));
 
 /** FG_OPERATOR_TOKEN: agents (the `fg` CLI) may make the owner decisions in `allow`. Never log `token`. */
 export type OperatorConfig = { token: string; allow: OperatorVerb[] };
@@ -233,6 +287,16 @@ export function loadConfig(env: Env): Config {
       return d;
     }
     return n;
+  };
+  /** A count: whole digits only (Number() would also take 2.5, 1e3 and 0x10). */
+  const count = (k: string, d: number, min = 0) => {
+    const raw = env[k]?.trim();
+    if (!raw) return d;
+    if (!/^\d+$/.test(raw) || Number(raw) < min) {
+      problems.push(`${k} must be a whole number of at least ${min} (got ${JSON.stringify(raw)})`);
+      return d;
+    }
+    return Number(raw);
   };
   const spec = (k: string, classifyOnly = false) => {
     const v = env[k]?.trim();
@@ -287,7 +351,7 @@ export function loadConfig(env: Env): Config {
     const unknown = asked.filter((v) => v !== 'all' && !isVerb(v));
     if (unknown.length) problems.push(`OPERATOR_ALLOW names unknown actions: ${unknown.join(', ')} (known: all, ${OPERATOR_VERBS.join(', ')})`);
     const allow = !asked.length
-      ? OPERATOR_VERBS.filter((v) => !OPERATOR_DEFAULT_OFF.includes(v))
+      ? [...OPERATOR_DEFAULT_VERBS]
       : asked.includes('all') ? [...OPERATOR_VERBS] : [...new Set(asked.filter(isVerb))];
     operator = { token: operatorToken, allow };
   }
@@ -302,7 +366,7 @@ export function loadConfig(env: Env): Config {
     if (u && u.protocol !== 'http:' && u.protocol !== 'https:') problems.push(`CODEX_RUNNER_URL must be http:// or https:// (got ${u.protocol})`);
     else if (u && (u.username || u.password)) problems.push('CODEX_RUNNER_URL must not carry a user name or password (the runner token is in the scratch volume)');
   }
-  for (const k of ['CLASSIFY_LLM', 'POSTMORTEM_LLM', 'SCAN_LLM', 'SUMMARY_LLM', 'DOCS_LLM', 'CHAT_LLM']) {
+  for (const k of ['CLASSIFY_LLM', 'POSTMORTEM_LLM', 'SCAN_LLM', 'SUMMARY_LLM', 'DOCS_LLM', 'CHAT_LLM', 'LOOP_LLM']) {
     if (/^codex-cli(:|$)/.test(env[k]?.trim() ?? '') && !runnerUrl && env.ALLOW_UNCONFINED_CODEX?.trim() !== '1') {
       problems.push(`${k}: codex-cli inside the worker can read every file the worker can (all transcripts, every project's .env, the worker's secrets); run it in the codex-runner sidecar (CODEX_RUNNER_URL with docker compose --profile codex), set ALLOW_UNCONFINED_CODEX=1 to accept that, or use claude-cli (SECURITY.md)`);
     }
@@ -364,6 +428,10 @@ export function loadConfig(env: Env): Config {
 
   const retention = env.TURN_RETENTION_DAYS?.trim() ? num('TURN_RETENTION_DAYS', 0) : null;
 
+  const missRaw = env.MISS_MIN_SIMILARITY?.trim();
+  const missMinSimilarity = missRaw ? Number(missRaw) : MISS_CLOSE;
+  if (!Number.isFinite(missMinSimilarity) || missMinSimilarity < 0 || missMinSimilarity > 1) problems.push(`MISS_MIN_SIMILARITY must be a number from 0 to 1 (got ${JSON.stringify(missRaw)})`);
+
   const summaryOff = env.SUMMARY_LLM?.trim().toLowerCase() === 'off';
   const summary: SummaryConfig = {
     enabled: !summaryOff,
@@ -377,11 +445,33 @@ export function loadConfig(env: Env): Config {
     problems.push(`SESSION_IDLE_MINUTES (${summary.idleMinutes}) must be at least SUMMARY_QUIET_MINUTES (${summary.quietMinutes}): a session is summarized before it is called idle`);
   }
 
+  const loopMode = env.LOOP_MODE?.trim().toLowerCase() || null;
+  if (loopMode !== null && !(LOOP_MODES as readonly string[]).includes(loopMode)) problems.push(`LOOP_MODE must be one of ${LOOP_MODES.join(', ')} (got ${JSON.stringify(env.LOOP_MODE)})`);
+  const loopDisabled = env.LOOP_DISABLED?.trim().toLowerCase() || '0';
+  if (!['0', '1', 'true', 'false'].includes(loopDisabled)) problems.push(`LOOP_DISABLED must be 1 or 0 (got ${JSON.stringify(env.LOOP_DISABLED)})`);
+  const holdoutRaw = env.LOOP_HOLDOUT?.trim();
+  const holdout = holdoutRaw ? Number(holdoutRaw) : 0.2;
+  if ((holdoutRaw && !/^(\d+(\.\d*)?|\.\d+)$/.test(holdoutRaw)) || !Number.isFinite(holdout) || holdout < 0 || holdout > 0.5) problems.push(`LOOP_HOLDOUT must be a share from 0 to 0.5 (got ${JSON.stringify(holdoutRaw)})`);
+  const loopTypes = list(env.LOOP_TYPES);
+  const unknownTypes = loopTypes.filter((t) => !(DECISION_TYPES as readonly string[]).includes(t));
+  if (unknownTypes.length) problems.push(`LOOP_TYPES names unknown decision types: ${unknownTypes.join(', ')} (known: ${DECISION_TYPES.join(', ')})`);
+  const loop: LoopConfig = {
+    mode: loopMode as LoopMode | null,
+    disabled: loopDisabled === '1' || loopDisabled === 'true',
+    llm: spec('LOOP_LLM'),
+    llmCallsPerDay: count('LOOP_LLM_CALLS_PER_DAY', 40),
+    autoPerDay: count('LOOP_AUTO_PER_DAY', 5),
+    autoPerProject: count('LOOP_AUTO_PER_PROJECT', 2),
+    syncHoldDays: count('LOOP_SYNC_HOLD_DAYS', 7),
+    holdout,
+    types: loopTypes.length ? [...new Set(loopTypes as DecisionType[])] : null,
+  };
+
   const config: Config = {
     store,
     neo4j: store === 'neo4j' ? { url: str('NEO4J_URL', 'bolt://neo4j:7687'), user: str('NEO4J_USER', 'neo4j'), password: str('NEO4J_PASSWORD') } : null,
     postgres,
-    roots: containers.map((container, i) => ({ container, host: hosts[i] ?? '' })),
+    roots: containers.map((container, i) => ({ container, host: hosts[i]! })),
     rootsFile: env.ROOTS_FILE?.trim() || null,
     integrationsFile: env.INTEGRATIONS_FILE?.trim() || null,
     hostHome: env.HOST_HOME?.trim().replace(/\/+$/, '') || null,
@@ -402,18 +492,23 @@ export function loadConfig(env: Env): Config {
     pollSeconds: num('POLL_SECONDS', 30),
     classifyBatch: num('CLASSIFY_BATCH', 50),
     scanMaxBytes: num('SCAN_MAX_BYTES', 80_000),
+    codeMapMaxBytes: num('CODE_MAP_MAX_BYTES', 1_000_000),
     scanMaxFiles: env.SCAN_MAX_FILES?.trim() ? num('SCAN_MAX_FILES', 400) : null,
     scanConcurrency: num('SCAN_CONCURRENCY', 2),
     check: { concurrency: num('CHECK_CONCURRENCY', 2), waitSeconds: num('CHECK_WAIT_SECONDS', 300, 5) },
+    missMinSimilarity,
     ingestProjects: list(env.INGEST_PROJECTS),
     excludeProjects: list(env.EXCLUDE_PROJECTS),
     turnRetentionDays: retention,
     memoryAutoApprove: autoApproveRaw === 'true',
     summary,
+    loop,
     github,
     integrationSyncMinutes: num('INTEGRATION_SYNC_MINUTES', 10),
     linkScanMinutes: num('LINK_SCAN_MINUTES', 30),
     apiToken,
+    authConfigured: apiAuthConfigured({ apiToken, ownerToken }) || /^(1|true|yes)$/i.test(env.FG_AUTH_CONFIGURED?.trim() ?? ''),
+    authStateFile: env.AUTH_STATE_FILE?.trim() || null,
     ownerToken,
     operator,
     publicHosts,

@@ -1,5 +1,5 @@
 import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
-import { afterEach, beforeEach, expect, test, vi } from 'vitest';
+import { afterEach, beforeEach, expect, onTestFinished, test, vi } from 'vitest';
 import { CandidateDetail } from './CandidateDetail.tsx';
 import { Inbox } from './Inbox.tsx';
 
@@ -165,4 +165,20 @@ test('a comment with no work session found links none, and says the post-mortem 
   expect(screen.getByText('Work session')).toBeTruthy();
   expect(screen.getByText(/none found yet/)).toBeTruthy();
   expect(screen.queryAllByRole('link').map((a) => a.getAttribute('href')).filter((h) => h?.startsWith('#sessions/'))).toEqual([]);
+});
+
+test('a long diff hunk and a long list of tool calls can be reached and scrolled by keyboard', async () => {
+  const { overflowAll, unreachableScrollers } = await import('./ui/scrollReach.ts');
+  onTestFinished(overflowAll());
+  const review = render(<CandidateDetail detail={detailOf(external)} />);
+  const hunk = review.container.querySelector('pre')!;
+  expect(hunk.textContent).toContain('total += price');
+  await waitFor(() => expect(hunk.tabIndex).toBe(0));
+  expect(unreachableScrollers(review.container).map((e) => e.outerHTML.slice(0, 80))).toEqual([]);
+  cleanup();
+  const session = { candidate: list[0], turn: { uuid: 'c1', sessionId: 's', ts: '2026-10-01T10:00:00Z', index: 2, text: 'session words', precedingAssistantText: 'done', precedingToolCalls: [{ name: 'Read', filePath: 'src/cart.ts' }, { name: 'Bash', command: 'pnpm test' }] }, before: [], after: [], commits: [], postmortem: null };
+  const { container } = render(<CandidateDetail detail={session as never} />);
+  const calls = screen.getByText('Bash').closest('ul')!;
+  await waitFor(() => expect(calls.tabIndex).toBe(0));
+  expect(unreachableScrollers(container).map((e) => e.outerHTML.slice(0, 80))).toEqual([]);
 });

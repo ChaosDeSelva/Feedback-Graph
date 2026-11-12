@@ -57,3 +57,24 @@ test('churn of a directory that is not a git repo is empty', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'fbchurn-nogit-'));
   expect((await churn(dir, 30)).size).toBe(0);
 });
+
+test('churn counts a commit once for a file whose old and renamed-in histories share it, and skips empty commits', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'fbchurn-merge-'));
+  const git = (...args: string[]) => execFileSync('git', ['-C', dir, '-c', 'user.email=t@t', '-c', 'user.name=t', '-c', 'commit.gpgsign=false', ...args]);
+  const body = (n: number) => Array.from({ length: 40 }, (_, i) => `export const v${i} = ${i === 0 ? n : i};`).join('\n');
+  try {
+    git('init', '-q');
+    writeFileSync(join(dir, 'a.ts'), body(0)); writeFileSync(join(dir, 'b.ts'), 'old b');
+    git('add', '-A'); git('commit', '-qm', 'add a and b');
+    writeFileSync(join(dir, 'a.ts'), body(1)); writeFileSync(join(dir, 'b.ts'), 'old b 2');
+    git('commit', '-qam', 'edit a and b');
+    git('rm', '-q', 'b.ts'); git('commit', '-qm', 'drop b');
+    git('mv', 'a.ts', 'b.ts'); git('commit', '-qm', 'rename a -> b');
+    git('commit', '-q', '--allow-empty', '-m', 'nothing');
+    const c = await churn(dir, 30);
+    // b.ts today is the old a.ts: its rename, the edit commit (old a and old b both count, once), the add, and old b's drop.
+    expect([...c.entries()].map(([p, v]) => [p, v.commits])).toEqual([['b.ts', 4]]);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

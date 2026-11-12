@@ -35,7 +35,8 @@ function tierOf(path: string): number {
 }
 
 const hidden = (path: string) => path.split('/').slice(0, -1).some((s) => s.startsWith('.'));
-const cmp = (a: string, b: string) => (a < b ? -1 : a > b ? 1 : 0);
+/** Paths are unique, so no two compare equal. */
+const cmp = (a: string, b: string) => (a < b ? -1 : 1);
 
 const TEST_DIR = new Set(['__tests__', 'tests', 'test']);
 const stemOf = (name: string) => name.replace(/(\.d)?\.[^.]+$/, '');

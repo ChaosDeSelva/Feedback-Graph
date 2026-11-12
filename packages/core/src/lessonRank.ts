@@ -1,6 +1,7 @@
 import { codeTerms, GENERIC, lessonsFor } from './codegraph.ts';
 import type { LessonHit } from './graph/knowledge.ts';
 import type { Lesson } from './types.ts';
+import { orderByServingWeight } from './loop/weights.ts';
 
 /**
  * How close a global lesson must be to a task to be served on similarity alone, with no word of the task in it. An
@@ -31,30 +32,15 @@ export function sharesTopic(task: string, l: Pick<Lesson, 'title' | 'rule' | 'ap
 
 /** Retrieve a bounded pool, then keep only lessons tied to the task's named files. */
 export const LESSON_POOL = 40;
-/** Kept for API compatibility; weak semantic pointers are no longer served. */
-export const RELATED_K = 0;
 export const PROJECT_CLOSE = 0.7;
 
-export type GradedLessons<T> = {
-  /** Served under "follow these": tied to a named file in the project where it was learned. */
-  follow: T[];
-  /** Served apart, as possibly related: on the task's topic but scored with the crowd, or standing out only a little. */
-  related: T[];
-};
-
-/** File ties alone establish rules. Untied semantic matches are dropped. */
-export function gradeLessons<T extends LessonHit>(hits: T[], task: string, opts: { files?: string[]; projectKey?: string | null } = {}): GradedLessons<T> {
-  const tied = new Set(opts.files?.length ? lessonsFor(hits.map((h) => h.lesson), opts.files, [], opts.projectKey ?? null).map((m) => m.lesson.id) : []);
-  const out: GradedLessons<T> = { follow: [], related: [] };
-  for (const h of hits) {
-    if (h.lesson.checks?.some((c) => c.name === 'no-miss')) continue;
-    if (tied.has(h.lesson.id) && (h.lesson.projectKey === opts.projectKey || h.lesson.origin === opts.projectKey)) out.follow.push(h);
-  }
-
-  return out;
-}
-
-/** The lessons to follow for `task` (gradeLessons), in the search's order: what is served as rules and judged at done. */
+/**
+ * The lessons to follow for `task`: what is served as rules and judged at done. File ties alone establish rules (a
+ * lesson tied to a named file, learned in this project); untied semantic matches are dropped. The tied ones are ordered
+ * by score times serving weight (orderByServingWeight; the search's order while no weight is set), which decides what a
+ * cut keeps.
+ */
 export function rankLessons<T extends LessonHit>(hits: T[], task: string, opts: { files?: string[]; projectKey?: string | null } = {}): T[] {
-  return gradeLessons(hits, task, opts).follow;
+  const tied = new Set(opts.files?.length ? lessonsFor(hits.map((h) => h.lesson), opts.files, [], opts.projectKey ?? null).map((m) => m.lesson.id) : []);
+  return orderByServingWeight(hits.filter((h) => !h.lesson.checks?.some((c) => c.name === 'no-miss') && tied.has(h.lesson.id) && (h.lesson.projectKey === opts.projectKey || h.lesson.origin === opts.projectKey)));
 }

@@ -64,7 +64,6 @@ export function useTheme(): Theme {
 
 /** Canvas drawing (the graph) cannot use CSS variables, so it reads the resolved token values. */
 export function readToken(name: string, fallback: string): string {
-  if (typeof getComputedStyle !== 'function') return fallback;
   const v = getComputedStyle(document.documentElement).getPropertyValue(`--color-${name}`).trim();
   return v || fallback;
 }

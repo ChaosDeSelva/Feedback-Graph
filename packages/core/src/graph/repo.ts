@@ -1,7 +1,7 @@
 import { conditionalWrite } from './conditionalWrite.ts';
 import { writesMemory } from '../memoryWrite.ts';
 import type { RunTag } from '../types.ts';
-import { storeTimeLeft, storeRequestSignal, StoreDeadlineError } from '../storeDeadline.ts';
+import { deadlineOr, storeTimeLeft, storeRequestSignal, StoreDeadlineError } from '../storeDeadline.ts';
 import { reviewPatterns } from '../reviewFilters.ts';
 import neo4j, { type Driver, type Record as NeoRecord } from 'neo4j-driver';
 import type {
@@ -16,6 +16,7 @@ import type {
   Project,
   ToolCall,
   WorkerStatus,
+  AgentSeen,
 } from '../types.ts';
 import type { ExternalThread, GraphStore, WorkSession } from '../store.ts';
 import { EXTERNAL_SOURCES, type ExternalRef, type FeedbackSource, type SessionSource } from '../types.ts';
@@ -62,6 +63,21 @@ export const MAX_CLASSIFY_ATTEMPTS = 3;
 /** The labels a sandbox run's records carry `sandbox: true` on (a document's chunks go with their Doc). */
 const SANDBOX_LABELS = ['Candidate', 'Lesson', 'Miss', 'Fact', 'Doc', 'ProjectLink'];
 
+/**
+ * fn again when Neo4j aborted it as a deadlock (a transient error: the aborted transaction changed nothing), after a
+ * short random wait so the two sides do not collide again; at most `attempts` runs.
+ */
+export async function retryDeadlock<T>(fn: () => Promise<T>, attempts = 8, wait = (ms: number) => new Promise((r) => setTimeout(r, ms))): Promise<T> {
+  for (let i = 1; ; i++) {
+    try {
+      return await fn();
+    } catch (err) {
+      if (i >= attempts || (err as { code?: string }).code !== 'Neo.TransientError.Transaction.DeadlockDetected') throw err;
+      await wait(Math.min(2000, 50 * 2 ** i) * (0.5 + Math.random()));
+    }
+  }
+}
+
 export class GraphRepo implements GraphStore {
   readonly driver: Driver;
   /** Whether any sandbox record exists: the searches skip the per-record run filter when none does (SandboxPresence). */
@@ -96,7 +112,7 @@ export class GraphRepo implements GraphStore {
       const result = await session.run(cypher, params, { timeout });
       if (signal?.aborted) throw new StoreDeadlineError();
       return result.records;
-    } finally { signal?.removeEventListener('abort', cancel); await session.close(); }
+    } catch (error) { throw deadlineOr(error, signal); } finally { signal?.removeEventListener('abort', cancel); await session.close(); }
   }
 
   /** Several statements as one transaction: all of them land, or none do. Returns each statement's records. */
@@ -117,15 +133,23 @@ export class GraphRepo implements GraphStore {
   async ensureSchema() {
     for (const stmt of SCHEMA) {
       try {
-        await this.run(stmt);
+        // The worker and the api start together, and on a new database each creates every rule: two creations on one
+        // label take its schema locks in opposite order, and Neo4j aborts one as a deadlock. That one is run again.
+        await retryDeadlock(() => this.run(stmt));
       } catch (err) {
-        // The worker and the api start together; Neo4j can refuse IF NOT EXISTS when the other just created the rule.
+        // Neo4j can refuse IF NOT EXISTS when the other just created the rule.
         if ((err as { code?: string }).code !== 'Neo.ClientError.Schema.EquivalentSchemaRuleAlreadyExists') throw err;
       }
     }
   }
 
   async wipeForTests() {
+    // Relationships first, in slices: a thousand densely linked nodes (a large code map's files) can carry enough edges
+    // to pass the stack's per-transaction memory limit, which the test databases enforce too.
+    for (;;) {
+      const [row] = await this.run('MATCH ()-[r]->() WITH r LIMIT 5000 DELETE r RETURN count(*) AS removed');
+      if (Number(row?.get('removed') ?? 0) < 5000) break;
+    }
     for (;;) {
       const [row] = await this.run('MATCH (n) WITH n LIMIT 1000 DETACH DELETE n RETURN count(*) AS removed');
       if (Number(row?.get('removed') ?? 0) < 1000) break;
@@ -673,6 +697,15 @@ export class GraphRepo implements GraphStore {
   async workerStatus(): Promise<WorkerStatus | null> {
     const [r] = await this.run(`MATCH (w:WorkerStatus {id: 'worker'}) RETURN w.json AS json`);
     return r ? (JSON.parse(r.get('json')) as WorkerStatus) : null;
+  }
+
+  async markAgentSeen(client: string, at: string) {
+    await this.run(`MERGE (a:AgentSeen {id: 'agent'}) ON CREATE SET a.client = $client, a.at = $at`, { client, at });
+  }
+
+  async agentSeen(): Promise<AgentSeen | null> {
+    const [r] = await this.run(`MATCH (a:AgentSeen {id: 'agent'}) RETURN a.client AS client, a.at AS at`);
+    return r ? { client: r.get('client'), at: r.get('at') } : null;
   }
 
   async stats(): Promise<StatsRow[]> {

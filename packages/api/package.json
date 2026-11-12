@@ -1,6 +1,6 @@
 {
   "name": "@fb/api",
-  "version": "0.7.5",
+  "version": "0.8.0",
   "private": true,
   "type": "module",
   "scripts": {
@@ -10,6 +10,7 @@
   "dependencies": {
     "@fb/core": "workspace:*",
     "@fb/store-postgres": "workspace:*",
+    "@fb/worker": "workspace:*",
     "@hono/node-server": "^1.14.0",
     "@modelcontextprotocol/sdk": "^1.32.1",
     "hono": "^4.7.0",

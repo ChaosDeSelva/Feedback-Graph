@@ -36,7 +36,7 @@ export function relativeTo(cwd: string | null, path: string): string {
 function tools(t: HumanTurn, cwd: string | null): string {
   const withPath: string[] = [];
   const counts = new Map<string, number>();
-  for (const c of t.precedingToolCalls ?? []) {
+  for (const c of t.precedingToolCalls) {
     if (c.filePath) withPath.push(`${c.name} ${relativeTo(cwd, c.filePath)}`);
     else counts.set(c.name, (counts.get(c.name) ?? 0) + 1);
   }
@@ -71,7 +71,7 @@ function renderFinalReply(through: number, finalReply: FinalReply): string {
 
 /** Files the delta's turns edited, relative to the session folder. */
 export function editedFiles(turns: HumanTurn[], cwd: string | null): string[] {
-  return [...new Set(turns.flatMap((t) => (t.precedingToolCalls ?? []).filter((c) => EDIT_TOOLS.has(c.name) && c.filePath).map((c) => relativeTo(cwd, c.filePath!))))];
+  return [...new Set(turns.flatMap((t) => t.precedingToolCalls.filter((c) => EDIT_TOOLS.has(c.name) && c.filePath).map((c) => relativeTo(cwd, c.filePath!))))];
 }
 
 /** Consecutive groups of at most maxTurns turns and (unless one turn alone is bigger) maxChars rendered characters. */

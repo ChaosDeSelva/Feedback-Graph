@@ -1,13 +1,16 @@
+import { asIs, labelOf } from './labels.ts';
 import { useEffect, useState } from 'react';
 import { ACTIVITY_KINDS, contextWhy, NO_CONTEXT_WHY, type Activity as Entry, type ActivityKind } from '@fb/core/types';
-import { api, type PipelineStatus, type ProjectSummary } from './api.ts';
+import { api, errorMessage, LOOP_ACTIVITY_KINDS, type LoopActivityKind, type PipelineStatus, type ProjectSummary } from './api.ts';
+import { isLoopActor } from './loop.ts';
 import { hashFocus } from './links.ts';
 import { PageHeader } from './ui/PageHeader.tsx';
 import { Button, Input, Select } from './ui/controls.tsx';
 import { Alert, Badge, Chip, EmptyState, longTime, plural, SkeletonList, statusTone, Time, type Tone } from './ui/display.tsx';
 import { ActivityIcon, ChevronIcon } from './ui/icons.tsx';
+import { ScrollArea } from './ui/ScrollArea.tsx';
 
-const KIND_LABEL: Record<ActivityKind, string> = {
+const KIND_LABEL: Record<ActivityKind | LoopActivityKind, string> = {
   scan_started: 'scan started',
   facts_extracted: 'facts extracted',
   scan_finished: 'scan finished',
@@ -50,9 +53,20 @@ const KIND_LABEL: Record<ActivityKind, string> = {
   demo_seeded: 'demo corpus added',
   demo_removed: 'demo corpus removed',
   sessions_rematched: 'comments re-matched',
+  decision_made: 'loop decision',
+  decision_applied: 'loop applied',
+  decision_rolled_back: 'loop rolled back',
+  decision_noted: 'decision note',
+  loop_settings_changed: 'loop settings',
+  loop_paused: 'loop paused',
 };
+/** Every kind the kind filter offers: the core ones, then the learning loop's. */
+const KINDS = [...ACTIVITY_KINDS, ...LOOP_ACTIVITY_KINDS.filter((k) => !(ACTIVITY_KINDS as readonly string[]).includes(k))] as (ActivityKind | LoopActivityKind)[];
 
-const KIND_TONE: Partial<Record<ActivityKind, Tone>> = {
+const KIND_TONE: Partial<Record<ActivityKind | LoopActivityKind, Tone>> = {
+  decision_applied: 'ok',
+  decision_rolled_back: 'bad',
+  loop_paused: 'accent',
   postmortem_failed: 'bad',
   project_deleted: 'bad',
   postmortem_done: 'ok',
@@ -66,7 +80,7 @@ function kindTone(a: Entry): Tone {
     return typeof status === 'string' ? statusTone(status) : 'neutral';
   }
   if (a.kind === 'cloud_synced') return (a.details as { ok?: unknown }).ok === false ? 'bad' : 'ok';
-  return KIND_TONE[a.kind] ?? 'neutral';
+  return KIND_TONE[a.kind as ActivityKind | LoopActivityKind] ?? 'neutral';
 }
 
 /** Model provider names, as in a provider spec (`ollama:gemma4`, `claude-cli`; core llm/providers.ts). */
@@ -74,10 +88,11 @@ const MODEL_PROVIDERS = ['ollama', 'openai', 'openrouter', 'groq', 'anthropic', 
 /** MCP clients that log as themselves, and the Ask page's chat. */
 const MCP_AGENTS = ['agent (MCP)', 'claude-code', 'codex', 'ui-chat'];
 
-export type ActorKind = 'person' | 'operator' | 'mcp' | 'model' | 'step';
+export type ActorKind = 'person' | 'operator' | 'loop' | 'mcp' | 'model' | 'step';
 const ACTOR_HINT: Record<ActorKind, string> = {
   person: 'person: you, from this app or the CLI',
   operator: 'agent with the operator token: an agent acting for you through the admin tools',
+  loop: 'learning loop: a decision the loop made on its own (its policy version after the colon); each can be rolled back on Decisions',
   mcp: 'agent over MCP: an agent asking for context or reporting a miss (or the Ask page)',
   model: 'model: a language model did this step',
   step: 'pipeline step: a fixed rule or step in the worker, no model involved',
@@ -85,13 +100,14 @@ const ACTOR_HINT: Record<ActorKind, string> = {
 
 /** The page's legend: an example of each kind of actor. */
 const LEGEND: [ActorKind, string][] = [
-  ['person', 'you'], ['operator', 'operator:<name>'], ['mcp', 'claude-code, agent (MCP)'], ['model', 'provider:model'], ['step', 'skip-rules, deterministic'],
+  ['person', 'you'], ['operator', 'operator:<name>'], ['loop', 'loop:<v>'], ['mcp', 'claude-code, agent (MCP)'], ['model', 'provider:model'], ['step', 'skip-rules, deterministic'],
 ];
 
 /** What kind of actor wrote an entry: you, an agent (operator token or MCP), a model, or a step of the pipeline. */
 export function actorKind(actor: string): ActorKind {
   if (actor === 'you') return 'person';
   if (actor.startsWith('operator')) return 'operator';
+  if (isLoopActor(actor)) return 'loop';
   if (MCP_AGENTS.includes(actor)) return 'mcp';
   if (MODEL_PROVIDERS.includes(actor.split(':')[0]) || actor.startsWith('fake:')) return 'model';
   return 'step';
@@ -125,7 +141,7 @@ function Value({ v }: { v: unknown }) {
       </ul>
     );
   }
-  if (v && typeof v === 'object') return <pre className="overflow-x-auto font-mono whitespace-pre-wrap">{JSON.stringify(v, null, 2)}</pre>;
+  if (v && typeof v === 'object') return <ScrollArea as="pre" className="overflow-x-auto font-mono whitespace-pre-wrap">{JSON.stringify(v, null, 2)}</ScrollArea>;
   const text = v === null || v === undefined ? '–' : String(v);
   return <span className={`[overflow-wrap:anywhere] ${typeof v === 'string' && isProse(v) ? '' : 'font-mono'}`}>{text}</span>;
 }
@@ -145,11 +161,11 @@ export function ActivityEntry({ a, open: initial = false }: { a: Entry; open?: b
   useEffect(() => {
     if (!open || !a.detailsOmitted || full) return;
     let stale = false;
-    api.activityEntry(a.id).then((x) => { if (!stale) setFull(x.details); }, (e) => { if (!stale) setFailed(e instanceof Error ? e.message : String(e)); });
+    api.activityEntry(a.id).then((x) => { if (!stale) setFull(x.details); }, (e) => { if (!stale) setFailed(errorMessage(e)); });
     return () => { stale = true; };
   }, [open, a.id, a.detailsOmitted, full]);
   const details = Object.entries(full ?? a.details);
-  const kind = KIND_LABEL[a.kind] ?? a.kind;
+  const kind = labelOf(KIND_LABEL, a.kind as ActivityKind | LoopActivityKind, asIs);
   const run = a.run ? `run ${a.run}${a.sandbox ? ' · sandbox' : ''}` : null;
   return (
     <li className="@container border-b border-line last:border-b-0">
@@ -157,14 +173,15 @@ export function ActivityEntry({ a, open: initial = false }: { a: Entry; open?: b
         <ChevronIcon size={12} className={`mt-1 shrink-0 text-faint transition-transform ${open ? 'rotate-90' : ''}`} />
         <span className="grid min-w-0 flex-1 gap-0.5">
           <span className="flex min-w-0 items-center gap-2">
-            <span title={a.subject} className="min-w-0 flex-1 truncate text-[13px]">{a.subject}</span>
+            <span title={a.subject} className="line-clamp-2 min-w-0 flex-1 text-[13px] [overflow-wrap:anywhere]">{a.subject}</span>
             <Badge tone={kindTone(a)} className="shrink-0">{kind}</Badge>
           </span>
-          <span className="flex min-w-0 items-center gap-1.5 text-xs text-muted">
+          {/* Wraps in a narrow pane: the actor, the run and the why each get a line rather than being cut. */}
+          <span className="flex min-w-0 flex-wrap items-center gap-x-1.5 gap-y-0.5 text-xs text-muted">
             <Time iso={a.ts} className="shrink-0" />
-            <Chip title={actorHint(a.actor)} className="max-w-[45%] shrink-0">{a.actor}</Chip>
-            {run && <Chip title={`${run}: ${RUN_HINT}`} className="max-w-[35%] shrink-0">{run}</Chip>}
-            {a.why && <span title={a.why} className="min-w-0 flex-1 truncate">{a.why}</span>}
+            <Chip title={actorHint(a.actor)} className="max-w-full">{a.actor}</Chip>
+            {run && <Chip title={`${run}: ${RUN_HINT}`} className="max-w-full">{run}</Chip>}
+            {a.why && <span title={a.why} className="line-clamp-2 min-w-[min(100%,12rem)] flex-1 [overflow-wrap:anywhere]">{a.why}</span>}
           </span>
         </span>
       </button>
@@ -190,9 +207,9 @@ export function Activity() {
   const [projects, setProjects] = useState<ProjectSummary[]>([]);
   const [project, setProject] = useState('');
   // A link to one kind (#activity/candidate_flagged, from the Dashboard) opens filtered to it.
-  const [kind, setKind] = useState<ActivityKind | ''>(() => {
+  const [kind, setKind] = useState<ActivityKind | LoopActivityKind | ''>(() => {
     const k = hashFocus('activity');
-    return ACTIVITY_KINDS.includes(k as ActivityKind) ? (k as ActivityKind) : '';
+    return KINDS.includes(k as ActivityKind) ? (k as ActivityKind) : '';
   });
   // One labelled run's entries (x-fg-run), typed or picked from the runs seen; and whether to hide every labelled run's
   // entries (a tester's runs would otherwise bury what you and the worker did). Picking a run shows that run, hidden or not.
@@ -204,7 +221,7 @@ export function Activity() {
   const [rows, setRows] = useState<Entry[] | null>(null);
   const [error, setError] = useState<string | null>(null);
 
-  useEffect(() => { api.projects().then(setProjects, (e) => setError(String(e))); }, []);
+  useEffect(() => { api.projects().then(setProjects, (e) => setError(errorMessage(e))); }, []);
   useEffect(() => {
     setRows(null);
     // A slow answer for filters you have left must not fill the list for the ones you picked.
@@ -215,7 +232,7 @@ export function Activity() {
         setRows(r);
         const ids = r.map((x) => x.run).filter((x): x is string => !!x);
         if (ids.length) setSeenRuns((s) => [...new Set([...s, ...ids])].sort());
-      }, (e) => { if (!stale) { setError(String(e)); setRows([]); } });
+      }, (e) => { if (!stale) { setError(errorMessage(e)); setRows([]); } });
     return () => { stale = true; };
   }, [project, kind, run, hideRuns]);
 
@@ -237,7 +254,7 @@ export function Activity() {
   useEffect(() => {
     if (kind !== 'candidate_flagged') return;
     let live = true;
-    api.pipeline().then((p) => { if (live) setClassify(p.classify ?? null); }, () => {});
+    api.pipeline().then((p) => { if (live) setClassify(p.classify); }, () => {});
     return () => { live = false; };
   }, [kind]);
 
@@ -252,9 +269,9 @@ export function Activity() {
               <option value="">all projects</option>
               {projects.map((p) => <option key={p.key} value={p.key}>{p.key}</option>)}
             </Select>
-            <Select aria-label="kind" value={kind} onChange={(e) => setKind(e.target.value as ActivityKind | '')} className="w-44">
+            <Select aria-label="kind" value={kind} onChange={(e) => setKind(e.target.value as ActivityKind | LoopActivityKind | '')} className="w-44">
               <option value="">everything</option>
-              {ACTIVITY_KINDS.map((k) => <option key={k} value={k}>{KIND_LABEL[k]}</option>)}
+              {KINDS.map((k) => <option key={k} value={k}>{KIND_LABEL[k]}</option>)}
             </Select>
             <form className="flex items-center" onSubmit={(e) => { e.preventDefault(); setRun(runDraft.trim()); }}>
               <Input
@@ -265,7 +282,7 @@ export function Activity() {
                 onBlur={() => setRun(runDraft.trim())}
                 placeholder="any run"
                 title="one labelled run's entries (x-fg-run): type its id and press Enter"
-                className="w-36 font-mono"
+                className="w-full font-mono md:w-36"
               />
               <datalist id="activity-runs">{seenRuns.map((r) => <option key={r} value={r} />)}</datalist>
             </form>
@@ -277,7 +294,7 @@ export function Activity() {
           </>
         }
       />
-      <div className="min-h-0 flex-1 overflow-y-auto p-3 md:p-5">
+      <ScrollArea className="min-h-0 flex-1 overflow-y-auto p-3 md:p-5">
         {error && <Alert className="mb-3">{error}</Alert>}
         {kind === 'candidate_flagged' && classify && (
           <p role="status" className="mb-3 rounded-md border border-line bg-sunken px-3 py-2 text-[13px]">
@@ -314,7 +331,7 @@ export function Activity() {
             <ul>{shown.map((a) => <ActivityEntry key={a.id} a={a} />)}</ul>
           )}
         </div>
-      </div>
+      </ScrollArea>
     </div>
   );
 }

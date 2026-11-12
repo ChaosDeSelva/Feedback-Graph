@@ -61,3 +61,15 @@ test('picking a page from the phone menu closes it and gives focus back to the m
   expect(onNavigate).toHaveBeenCalledWith('lessons');
   expect(document.activeElement).toBe(screen.getByRole('button', { name: 'Open menu' }));
 });
+
+test('a page with something waiting shows the count beside its label, and in the tooltip when the sidebar is collapsed', () => {
+  const withBadge: NavGroup<K>[] = [{ label: 'Review', items: [{ key: 'inbox', label: 'Inbox', icon: null, badge: 4 }, { key: 'lessons', label: 'Lessons', icon: null, badge: 0 }] }];
+  const { unmount } = render(<AppShell groups={withBadge} current="lessons" onNavigate={() => {}} health={null}><p>page</p></AppShell>);
+  expect(screen.getByRole('button', { name: 'Inbox 4 waiting' })).toBeTruthy();
+  expect(screen.getByRole('button', { name: 'Lessons' }).title).toBe('');
+  unmount();
+  localStorage.setItem('fg:sidebar-collapsed', '1');
+  render(<AppShell groups={withBadge} current="lessons" onNavigate={() => {}} health={null}><p>page</p></AppShell>);
+  expect(screen.getByRole('button', { name: 'Inbox 4 waiting' }).title).toBe('Inbox (4 waiting)');
+  expect(screen.getByRole('button', { name: 'Lessons' }).title).toBe('Lessons');
+});

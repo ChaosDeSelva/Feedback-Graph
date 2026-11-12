@@ -7,11 +7,11 @@ export type GithubSyncDeps = {
   authors?: Map<string, string>;
   token: string;
   fetchPrs(o: FetchPrOpts): Promise<PrContext[]>;
-  docs: Pick<DocsStore, 'upsertDoc' | 'getCursor' | 'setCursor'> & Partial<Pick<DocsStore, 'listDocs' | 'githubRepairDocs' | 'githubDocChunks'>>;
+  docs: Pick<DocsStore, 'upsertDoc' | 'getCursor' | 'setCursor' | 'githubRepairDocs' | 'githubDocChunks'> & Partial<Pick<DocsStore, 'listDocs'>>;
   embed(texts: string[]): Promise<number[][]>;
   activity?: Pick<ActivityStore, 'record'>;
   /** Skip a project synced less than this long ago. */
-  minIntervalMs?: number;
+  minIntervalMs: number;
   now?: () => string;
   log?: (msg: string, extra?: object) => void;
 };
@@ -32,7 +32,7 @@ export async function syncGithub(d: GithubSyncDeps): Promise<{ prs: number }> {
   for (const [projectKey, repo] of d.repos) {
     const key = `github:${projectKey}`;
     const cursor = (await d.docs.getCursor(key)) ?? undefined;
-    const due = !cursor || Date.parse(now()) - Date.parse(cursor) >= (d.minIntervalMs ?? 0);
+    const due = !cursor || Date.parse(now()) - Date.parse(cursor) >= d.minIntervalMs;
     const started = now();
     const ticketsKnown = !!(await d.docs.getCursor(ticketsCursor(projectKey)));
     const backfillFrom = new Date(Date.parse(started) - TICKETS_BACKFILL_DAYS * 86_400_000).toISOString();
@@ -43,7 +43,7 @@ export async function syncGithub(d: GithubSyncDeps): Promise<{ prs: number }> {
         for (const pr of list) {
           if (!repairing && d.authors?.get(projectKey) && pr.author.toLowerCase() !== d.authors.get(projectKey)!.toLowerCase()) continue;
           const chunks = prContextToChunks(pr).map((c) => redactSecrets(c.text));
-          const vectors = chunks.length ? await d.embed(chunks) : [];
+          const vectors = await d.embed(chunks); // a PR is at least its description
           await d.docs.upsertDoc(
             { projectKey, source: 'github', ref: `github:${repo}#${pr.number}`, title: `${repo}#${pr.number}: ${pr.title}`, url: pr.url },
             chunks.map((text, i) => ({ text, embedding: vectors[i] })),

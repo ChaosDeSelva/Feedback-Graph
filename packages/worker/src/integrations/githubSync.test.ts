@@ -21,10 +21,13 @@ function setup(over: Partial<GithubSyncDeps> = {}) {
       upsertDoc: async (doc, chunks) => { upserts.push({ doc, chunks }); return `doc:${doc.ref}`; },
       getCursor: async (k) => cursors.get(k) ?? null,
       setCursor: async (k, v) => { cursors.set(k, v); },
+      githubRepairDocs: async () => [],
+      githubDocChunks: async () => null,
     },
     embed: async (t) => t.map(() => [1]),
     activity: { record: async (a) => { activity.push(a); } },
     now: () => '2026-10-22T12:00:00Z',
+    minIntervalMs: 0,
     ...over,
   };
   return { deps, upserts, cursors, activity, sinces };

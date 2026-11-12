@@ -7,7 +7,8 @@ export type { SymbolKind };
  * lang is the grammar name for parsed languages ('typescript', 'tsx', 'javascript', 'python', 'go', 'rust', 'csharp', 'swift'),
  * 'gdscript', or else the bare extension ('json', 'md') or lowercased file name ('dockerfile').
  */
-export type CodeFile = { path: string; lang: string; hash: string; loc: number; isTest: boolean };
+/** namespaces: C# only, the namespaces it declares (stored with the map, so an unchanged file is not parsed again). */
+export type CodeFile = { path: string; lang: string; hash: string; loc: number; isTest: boolean; namespaces?: string[] };
 
 export type CodeSymbol = {
   id: string;
@@ -30,7 +31,8 @@ export type CodeImport = {
 
 /**
  * candidates: files worth mapping before the cap (absent on a map from before it was counted). unresolved: imports
- * that look like they name a repo file (an alias, a workspace package) but resolved to none, so edges are missing.
+ * that look like they name a repo file (an alias, a workspace package) but resolved to none, so edges are missing;
+ * counted once per importing file and target, as they are stored.
  */
 export type CodeMap = {
   files: CodeFile[];
@@ -51,6 +53,8 @@ export type CodeMap = {
 export type BuildOpts = {
   maxFiles: number | null;
   maxBytes: number;
+  /** CODE_MAP_MAX_BYTES: the limit for a parsed source file (lang.ts fileMaxBytes); maxBytes when unset. */
+  sourceMaxBytes?: number;
   concurrency?: number;
   signal?: AbortSignal;
   priority?: string[];
@@ -60,4 +64,5 @@ export type BuildOpts = {
 /** An import as the parser saw it, before resolution. names: '*' is the whole module, 'default' the default export. */
 export type RawImport = { spec: string; names: string[] };
 
-export type Extracted = { symbols: Omit<CodeSymbol, 'id' | 'path'>[]; imports: RawImport[] };
+/** namespaces: C# only, the namespaces the file declares (csharpNamespaces), read from the same parse. */
+export type Extracted = { symbols: Omit<CodeSymbol, 'id' | 'path'>[]; imports: RawImport[]; namespaces?: string[] };

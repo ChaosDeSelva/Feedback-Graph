@@ -1,9 +1,9 @@
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import { mkdtemp, readdir, readFile, realpath, rename, rm, stat, writeFile } from 'node:fs/promises';
-import type { IncomingMessage, ServerResponse } from 'node:http';
+import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { hostname, tmpdir } from 'node:os';
 import { isAbsolute, join, relative, resolve } from 'node:path';
-import { execCommand, type Exec } from './exec.ts';
+import { execCommand, killRunningCommands, type Exec } from './exec.ts';
 
 /*
  * The codex-runner sidecar (docker-compose.yml, profile "codex") and the worker's client for it.
@@ -18,22 +18,35 @@ import { execCommand, type Exec } from './exec.ts';
  */
 
 const PROCESS_NONCE = randomBytes(16).toString('hex');
-const START_HINT = 'start it with docker compose --profile codex up -d (docs/operations.md)';
-async function processStart(pid: number): Promise<string | null> {
+/**
+ * How to start the runner of this install: its Compose name (FG_INSTANCE) and files (COMPOSE_FILE), so a second
+ * install's hint does not start the first one's runner. Only for a runner that does not answer: one that answers
+ * but fails readiness is running, and starting it again changes nothing.
+ */
+export function runnerStartHint(env: NodeJS.ProcessEnv = process.env): string {
+  const files = (env.COMPOSE_FILE ?? '').split(':').filter(Boolean).map((f) => ` -f ${f}`).join('');
+  return `start it from the install folder: docker compose -p ${env.FG_INSTANCE || 'feedback-graph'}${files} --profile codex up -d codex-runner (docs/operations.md)`;
+}
+const START_HINT = runnerStartHint();
+const NOT_READY_HINT = 'the runner is running but not ready: run ./scripts/doctor.sh and read docker compose logs codex-runner (docs/operations.md)';
+async function processStart(pid: number, proc: string): Promise<string | null> {
   try {
-    const raw = await readFile(`/proc/${pid}/stat`, 'utf8');
+    const raw = await readFile(join(proc, String(pid), 'stat'), 'utf8');
     return raw.slice(raw.lastIndexOf(')') + 2).split(/\s+/)[19] ?? null;
   } catch { return null; }
 }
 /** PID alone is not identity: container workers commonly restart as PID6. */
-export async function mirrorLeaseOwner() {
-  return { pid: process.pid, host: hostname(), nonce: PROCESS_NONCE, started: await processStart(process.pid) };
+export async function mirrorLeaseOwner(proc = '/proc') {
+  return { pid: process.pid, host: hostname(), nonce: PROCESS_NONCE, started: await processStart(process.pid, proc) };
 }
 
 /** Lease metadata is beside the mirror, never exposed inside the repository mounted for a job. */
 export const mirrorLeasePath = (dir: string) => join(resolve(dir, '..'), `.${dir.split('/').at(-1)}.lease`);
-/** Sweep abandoned copies in both worker and runner; renewable leases protect live and queued mirrors. */
-export async function purgeStaleRunnerMirrors(scratch: string, keep?: string, now = Date.now(), worker = false): Promise<void> {
+/**
+ * Sweep abandoned copies in both worker and runner; renewable leases protect live and queued mirrors. `proc` is where a
+ * lease's process start time is read (Linux /proc; elsewhere a reused PID is caught only by the lease's age).
+ */
+export async function purgeStaleRunnerMirrors(scratch: string, keep?: string, now = Date.now(), worker = false, proc = '/proc'): Promise<void> {
   for (const name of await readdir(scratch).catch(() => [] as string[])) {
     if (!/^fb-mirror-[A-Za-z0-9]+$/.test(name)) continue;
     const path = join(scratch, name);
@@ -47,7 +60,7 @@ export async function purgeStaleRunnerMirrors(scratch: string, keep?: string, no
       else {
         try { process.kill(lease.pid, 0); } catch (e) { dead = (e as NodeJS.ErrnoException).code === 'ESRCH'; }
         if (!dead && lease.started) {
-          const current = await processStart(lease.pid);
+          const current = await processStart(lease.pid, proc);
           if (current && current !== lease.started) dead = true;
         }
       }
@@ -60,13 +73,13 @@ export async function purgeStaleRunnerMirrors(scratch: string, keep?: string, no
 }
 
 /** Check the real sandbox before preparing a repository copy. No token or model call is required. */
-export async function runnerReadiness(url: string, fetchImpl: typeof fetch = fetch): Promise<{ ok: boolean; reason: string | null }> {
+export async function runnerReadiness(url: string, fetchImpl: typeof fetch = fetch): Promise<{ ok: true; reason: null } | { ok: false; reason: string }> {
   try {
     const response = await fetchImpl(`${url.replace(/\/+$/, '')}/health`, { signal: AbortSignal.timeout(7_000) });
     const body = await response.json() as { ok?: boolean; error?: string };
     if (response.ok && body.ok === true) return { ok: true, reason: null };
     const reason = typeof body.error === 'string' ? body.error : `codex runner readiness failed (HTTP ${response.status})`;
-    return { ok: false, reason: `${reason}; ${START_HINT}` };
+    return { ok: false, reason: `${reason}; ${NOT_READY_HINT}` };
   } catch (err) {
     return { ok: false, reason: `cannot reach the codex runner at ${url}: ${err instanceof Error ? err.message : String(err)}; ${START_HINT}` };
   }
@@ -139,9 +152,9 @@ export async function resolveMirror(scratch: string, raw: unknown): Promise<stri
 
 const digest = (s: string) => createHash('sha256').update(s).digest();
 
-/** `Authorization: Bearer <token>`, compared in constant time. */
+/** `Authorization: Bearer <token>` (the scheme in any case, RFC 7235), compared in constant time. */
 export function runnerAuthorized(header: string | undefined, token: string): boolean {
-  const m = /^Bearer (\S+)$/.exec(header ?? '');
+  const m = /^bearer +(\S+)$/i.exec(header ?? '');
   return !!m && !!token && timingSafeEqual(digest(m[1]), digest(token));
 }
 
@@ -272,7 +285,7 @@ export function createCodexRunner(o: RunnerOpts) {
   }
 
   async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
-    const path = (req.url ?? '/').split('?')[0];
+    const path = (req.url as string).split('?')[0]; // always set on a request a server received
     if (path === '/health' && req.method === 'GET') { const h = await health(); return send(res, h.ok ? 200 : 503, { ...h, busy }); }
     if (path !== '/run') return send(res, 404, { error: 'not found' });
     if (req.method !== 'POST') return send(res, 405, { error: 'POST only' }, { allow: 'POST' });
@@ -291,7 +304,7 @@ export function createCodexRunner(o: RunnerOpts) {
         dir = await resolveMirror(o.scratch, job.mirror);
       } catch (err) {
         const status = err instanceof RunnerRequestError ? err.status : 500;
-        return send(res, status, { error: err instanceof Error ? err.message : String(err) });
+        return send(res, status, { error: (err as Error).message });
       }
       await purgeStaleRunnerMirrors(o.scratch, dir);
       // Accepted: headers now, whitespace while codex works, the result at the end (JSON ignores the whitespace).
@@ -300,7 +313,7 @@ export function createCodexRunner(o: RunnerOpts) {
       try {
         res.end(JSON.stringify(await run(job, dir)));
       } catch (err) {
-        res.end(JSON.stringify({ error: err instanceof Error ? err.message : String(err) }));
+        res.end(JSON.stringify({ error: (err as Error).message }));
       }
     } finally {
       clearInterval(keepalive);
@@ -309,6 +322,27 @@ export function createCodexRunner(o: RunnerOpts) {
   }
 
   return { handle, health, busy: () => busy };
+}
+
+/**
+ * The runner's HTTP server (codexRunnerMain.ts listens on it): logs every request but health checks, by method, path,
+ * status and time (never job content), and answers a handler that throws with 500, or ends a response already begun.
+ */
+export function createRunnerServer(runner: { handle(req: IncomingMessage, res: ServerResponse): Promise<void> }, log: (msg: string, extra?: object) => void): Server {
+  const server = createServer((req, res) => {
+    const started = Date.now();
+    res.on('finish', () => {
+      if (req.url !== '/health') log('request', { method: req.method, path: req.url, status: res.statusCode, ms: Date.now() - started });
+    });
+    runner.handle(req, res).catch((err) => {
+      log('error', { error: String(err) });
+      if (!res.headersSent) res.writeHead(500).end();
+      else res.end();
+    });
+  });
+  // A job can take as long as its timeout; only the request itself has to arrive promptly.
+  server.requestTimeout = 60_000;
+  return server;
 }
 
 /** The runner could not be asked at all (not started, unreachable, token missing, busy past the deadline). */
@@ -377,4 +411,39 @@ export async function runOnRunner(o: { url: string; scratch: string; job: Runner
     if (!res.ok || body.error !== undefined) throw new Error(`codex runner ${res.status}: ${body.error ?? text.slice(0, 300)}`);
     return { code: body.code ?? 1, stdout: body.stdout ?? '', stderr: body.stderr ?? '', output: body.output ?? null };
   }
+}
+
+/** The codex-runner service: sweeps mirrors left by a previous run, writes a fresh token, then listens. */
+export async function startCodexRunner(o: { scratch: string; port: number; host: string; log: (msg: string, extra?: object) => void; runner?: Partial<RunnerOpts> }): Promise<Server> {
+  await purgeStaleRunnerMirrors(o.scratch);
+  const token = await writeRunnerToken(o.scratch);
+  const server = createRunnerServer(createCodexRunner({ ...o.runner, scratch: o.scratch, token }), o.log);
+  await new Promise<void>((ok) => server.listen(o.port, o.host, ok));
+  o.log('codex runner listening', { port: o.port, scratch: o.scratch });
+  return server;
+}
+
+/**
+ * The codex-runner container's process (codexRunnerMain.ts): SIGTERM or SIGINT stops the running job and exits 0 once
+ * open requests end (at most 5 s later).
+ */
+export async function runCodexRunner(io: {
+  scratch: string;
+  port: number;
+  host: string;
+  log: (msg: string, extra?: object) => void;
+  /** Where SIGTERM, SIGINT and 'exit' arrive: the process. */
+  signals: { once(event: 'SIGTERM' | 'SIGINT' | 'exit', listener: () => void): unknown };
+  exit: (code: number) => void;
+}): Promise<Server> {
+  const server = await startCodexRunner(io);
+  const stop = () => {
+    killRunningCommands();
+    server.close(() => io.exit(0));
+    setTimeout(() => io.exit(0), 5000).unref();
+  };
+  io.signals.once('SIGTERM', stop);
+  io.signals.once('SIGINT', stop);
+  io.signals.once('exit', killRunningCommands);
+  return server;
 }

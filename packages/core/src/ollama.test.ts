@@ -74,9 +74,8 @@ test('the ollama provider sends the env limits and lets OLLAMA_TIMEOUT_SECONDS o
   const slow = (async (_u: string, init: RequestInit) => {
     await new Promise((_, reject) => init.signal!.addEventListener('abort', () => reject(init.signal!.reason)));
   }) as unknown as typeof fetch;
-  const started = Date.now();
+  // The stand-in only settles when aborted, and the job's own 60 s would outlast the test: the 0.05 s override ended it.
   const err = await makeProvider('ollama:m', { OLLAMA_TIMEOUT_SECONDS: '0.05' }, { fetchImpl: slow }).json({ system: 'S', user: 'U', schema: {}, timeoutMs: 60_000 }).catch((e: unknown) => e);
-  expect(Date.now() - started).toBeLessThan(5_000);
   expect(err).toBeInstanceOf(ModelTimeoutError);
   expect((err as Error).message).toMatch(/Ollama \(m\) did not answer within 0\.05 s/);
 });
@@ -165,4 +164,50 @@ test('ollamaEmbed forwards caller cancellation without relabeling it as a model 
   const result = ollamaEmbed({ url: 'http://o', model: 'm', input: ['x'], signal: controller.signal, fetchImpl });
   controller.abort(marker);
   await expect(result).rejects.toBe(marker);
+});
+
+const ask = (fetchImpl: typeof fetch, url = 'http://o') => ollamaChatJson({ url, model: 'm', system: 'S', user: 'U', schema: {}, fetchImpl });
+
+test('a server that refuses the think field and then fails anyway reports the second failure', async () => {
+  let calls = 0;
+  const fetchImpl = (async () => (++calls === 1
+    ? Response.json({ error: 'unknown field "think"' }, { status: 400 })
+    : new Response('model runner has unexpectedly stopped', { status: 500 }))) as unknown as typeof fetch;
+  await expect(ask(fetchImpl, 'http://old-and-broken')).rejects.toThrow('ollama 500: model runner has unexpectedly stopped');
+  expect(calls).toBe(2);
+});
+
+test('a 400 that is not about the think field is the request\'s failure, not retried', async () => {
+  let calls = 0;
+  const fetchImpl = (async () => { calls++; return new Response('context too long', { status: 400 }); }) as unknown as typeof fetch;
+  await expect(ask(fetchImpl, 'http://strict')).rejects.toThrow('ollama 400: context too long');
+  expect(calls).toBe(1);
+});
+
+test('a reply with no message is an empty answer', async () => {
+  await expect(ask((async () => Response.json({ done: true })) as unknown as typeof fetch)).rejects.toThrow(/the answer was empty/);
+});
+
+test('a fetch failure with no network code still names Ollama; any other error passes through untouched', async () => {
+  const bare = (async () => { throw new TypeError('fetch failed'); }) as unknown as typeof fetch;
+  const err = await ask(bare).catch((e: unknown) => e);
+  expect(err).toBeInstanceOf(ProviderUnavailableError);
+  expect((err as Error).message).toMatch(/Ollama is not reachable at http:\/\/o \(m\): /);
+  const odd = new Error('invalid header value');
+  await expect(ask((async () => { throw odd; }) as unknown as typeof fetch)).rejects.toBe(odd);
+});
+
+test('ollamaEmbed reports a refused request with its status and body', async () => {
+  const fetchImpl = (async () => new Response('model "x" not found', { status: 404 })) as unknown as typeof fetch;
+  await expect(ollamaEmbed({ url: 'http://o', model: 'x', input: ['a'], fetchImpl })).rejects.toThrow('ollama embed 404: model "x" not found');
+  const none = (async () => Response.json({})) as unknown as typeof fetch;
+  await expect(ollamaEmbed({ url: 'http://o', model: 'x', input: ['a'], fetchImpl: none })).rejects.toThrow('ollama embed: wrong embedding count');
+});
+
+test('ollamaPing: a server listing no models (or nameless ones) has none of them pulled', async () => {
+  const empty = (async () => Response.json({})) as unknown as typeof fetch;
+  expect(await ollamaPing({ url: 'http://o/', models: ['gemma4'], fetchImpl: empty })).toEqual({ url: 'http://o', ok: false, reason: 'gemma4 is not pulled (ollama pull gemma4)' });
+  const nameless = (async () => Response.json({ models: [{}, { name: 'gemma4:latest' }] })) as unknown as typeof fetch;
+  expect(await ollamaPing({ url: 'http://o', models: ['gemma4'], fetchImpl: nameless })).toEqual({ url: 'http://o', ok: true, reason: null });
+  expect(await ollamaPing({ url: 'http://o', models: [], fetchImpl: empty })).toMatchObject({ ok: true });
 });

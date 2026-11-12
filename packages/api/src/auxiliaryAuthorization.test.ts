@@ -4,7 +4,7 @@ import { createApp, type ApiRepo, type AppOpts } from './app.ts';
 
 const OP = 'o'.repeat(32);
 const KEY = 'c2ad856fb97403e18a2e7dc9015b6f438670dcaeb3219a845f0d7c8b6e109234';
-const repo = { listCandidates: async () => [], candidateDetail: async () => null, decide: async () => {}, stats: async () => [] } as ApiRepo;
+const repo = { undoDecision: async () => false, listCandidates: async () => [], candidateDetail: async () => null, decide: async () => {}, stats: async () => [] } as ApiRepo;
 class Ledger {
   owners = new Map<string, RunOwner>(); reads = 0;
   private unblock!: () => void;
@@ -18,6 +18,7 @@ class Ledger {
     if (this.race && read >= 3 && read <= 4) { if (read === 4) this.unblock(); await this.together; }
     return snapshot;
   }
+  async sandbox() { return false; }
   async claim(run: string, principal: RunPrincipal, actor: string | null) {
     let owner = this.owners.get(run);
     if (!owner) { owner = { run, principal, actor, firstSeen: 'now' }; this.owners.set(run, owner); }

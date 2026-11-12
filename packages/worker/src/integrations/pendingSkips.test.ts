@@ -57,8 +57,10 @@ describe('skipMatchingPending', () => {
 
   test('a decision made in the meantime stands and is not counted', async () => {
     const g = fakeGraph([item('a', 'Done.', own), item('b', 'Done.', own)], { decided: new Set(['a']) });
-    const r = await skipMatchingPending({ graph: g.graph, why: 'x' });
+    const logs: [string, object | undefined][] = [];
+    const r = await skipMatchingPending({ graph: g.graph, why: 'x', log: (m, x) => logs.push([m, x]) });
     expect(r.skipped).toBe(1);
+    expect(logs).toEqual([['pending Inbox items skipped by the skip rules', { skipped: 1, byProject: { shop: { 'status-note': 1 } } }]]);
   });
 
   test('the configured bot and agent logins apply to what was stored before they were set', async () => {

@@ -1,6 +1,6 @@
 import { expect, test } from 'vitest';
 import { lessonsFor } from './codegraph.ts';
-import { GLOBAL_CLOSE, gradeLessons, rankLessons, RELATED_K, sharesTopic } from './lessonRank.ts';
+import { GLOBAL_CLOSE, rankLessons, sharesTopic } from './lessonRank.ts';
 import { SIMILARITY_FLOOR } from './relevance.ts';
 import { ACME_LESSONS, ACME_TASKS, PATH_TASK, searchAcme } from './testing/lessonCorpus.ts';
 import type { Lesson } from './types.ts';
@@ -55,22 +55,33 @@ test('global file rules stay in their origin project even when paths or globs co
   }
 });
 
-test('a topical semantic match is a bounded pointer, never a rule', () => {
+test('a topical semantic match is never a rule', () => {
   const hits = Array.from({ length: 10 }, (_, i) => ({ lesson: { ...cursor, id: `cursor-${i}` }, score: 0.95 }));
-  const result = gradeLessons(hits, TASK, { projectKey: 'acme' });
-  expect(result.follow).toEqual([]);
-  expect(result.related).toHaveLength(RELATED_K);
+  expect(rankLessons(hits, TASK, { projectKey: 'acme' })).toEqual([]);
   expect(sharesTopic(TASK, cursor)).toBe(true);
 });
 
 test('nonsense tasks receive no lessons from the real corpus', () => {
   for (const { task } of ACME_TASKS.filter((t) => !t.applies.length)) {
-    expect(gradeLessons(searchAcme(task), task, { projectKey: 'acme' })).toEqual({ follow: [], related: [] });
+    expect(rankLessons(searchAcme(task), task, { projectKey: 'acme' })).toEqual([]);
   }
 });
 
 test('an approved no-miss lesson stays available for review but is never served, even on a named file', () => {
   const l = { ...own, paths: ['src/orders.ts'], checks: [{ name: 'no-miss' as const, why: 'false disputed claim; review required' }] };
-  expect(gradeLessons([{ lesson: l, score: 1 }], 'orders', { files: ['src/orders.ts'], projectKey: 'demo-shop' })).toEqual({ follow: [], related: [] });
+  expect(rankLessons([{ lesson: l, score: 1 }], 'orders', { files: ['src/orders.ts'], projectKey: 'demo-shop' })).toEqual([]);
   expect(l.status).toBe('approved');
+});
+
+test('a task with no topical word shares no topic with any lesson', () => {
+  expect(sharesTopic('the and of', cursor)).toBe(false);
+  expect(sharesTopic('', cursor)).toBe(false);
+});
+
+test('without named files, or for another project, no lesson is followed', () => {
+  const tied = lesson('tied', { paths: ['app/api/orders.ts'] });
+  const hits = [{ lesson: tied, score: 0.95 }];
+  expect(rankLessons(hits, 'change orders', { projectKey: 'acme' })).toEqual([]);
+  expect(rankLessons(hits, 'change orders', { files: ['app/api/orders.ts'] })).toEqual([]);
+  expect(rankLessons(hits, 'change orders', { files: ['app/api/orders.ts'], projectKey: 'acme' })).toEqual(hits);
 });

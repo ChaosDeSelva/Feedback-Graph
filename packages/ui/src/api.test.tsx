@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, test, vi } from 'vitest';
-import { api, integrationsApi, NETWORK_EVENT, WRITE_RETRY_DELAYS_MS, type NetworkState } from './api.ts';
+import { api, integrationsApi, loopApi, NETWORK_EVENT, WRITE_RETRY_DELAYS_MS, type NetworkState } from './api.ts';
 
 let states: NetworkState[];
 const onState = (e: Event) => states.push((e as CustomEvent<NetworkState>).detail);
@@ -71,4 +71,28 @@ test('a delete, a cleanup or a cloud sync is not retried either: the first try m
     await settled;
     expect(calls).toHaveLength(1);
   }
+});
+
+test('loop state: a call made while one is in flight waits for it, and the callers that came meanwhile share one more call', async () => {
+  vi.useRealTimers();
+  const answers: ((r: Response) => void)[] = [];
+  const fetch = vi.fn(() => new Promise<Response>((resolve) => { answers.push(resolve); }));
+  vi.stubGlobal('fetch', fetch);
+  const state = (n: number) => new Response(JSON.stringify({ counts: { proposed: n } }), { status: 200, headers: { 'content-type': 'application/json' } });
+  const first = loopApi.state();
+  const second = loopApi.state();
+  const third = loopApi.state();
+  await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(1));
+  answers[0](state(1));
+  expect((await first).counts.proposed).toBe(1);
+  // The two that came while the first ran: one more request, after it, not one each.
+  await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(2));
+  answers[1](state(2));
+  expect([(await second).counts.proposed, (await third).counts.proposed]).toEqual([2, 2]);
+  expect(fetch).toHaveBeenCalledTimes(2);
+  // Idle again: the next call goes at once.
+  const fourth = loopApi.state();
+  await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(3));
+  answers[2](state(3));
+  expect((await fourth).counts.proposed).toBe(3);
 });

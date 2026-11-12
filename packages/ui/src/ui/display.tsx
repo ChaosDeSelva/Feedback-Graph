@@ -1,14 +1,17 @@
 import { useId, type ReactNode } from 'react';
 
-/** A white panel on the canvas. `title` gives it a small header row with optional actions on the right. */
-export function Card({ title, actions, children, className = '', bodyClass = '', id }: { title?: ReactNode; actions?: ReactNode; children: ReactNode; className?: string; bodyClass?: string; id?: string }) {
+/**
+ * A white panel on the canvas. `title` gives it a small header row with optional actions on the right. Its heading is an
+ * h3 under a detail's h2; a card straight under the page's h1 passes `level="h2"`, so no heading level is skipped.
+ */
+export function Card({ title, actions, children, className = '', bodyClass = '', id, level }: { title?: ReactNode; actions?: ReactNode; children: ReactNode; className?: string; bodyClass?: string; id?: string; level?: 'h2' }) {
   // The title names the card, so assistive tech (and tests) can find it as a region.
   const titleId = useId();
   return (
     <section id={id} aria-labelledby={title ? titleId : undefined} className={`min-w-0 rounded-md border border-line bg-surface shadow-card ${className}`}>
       {(title || actions) && (
         <header className="flex min-h-9 flex-wrap items-center justify-between gap-2 border-b border-line px-3 py-1.5">
-          {title && <SectionLabel id={titleId}>{title}</SectionLabel>}
+          {title && <SectionLabel as={level} id={titleId}>{title}</SectionLabel>}
           {actions && <div className="flex flex-wrap items-center gap-2">{actions}</div>}
         </header>
       )}
@@ -85,12 +88,14 @@ export function StatGrid({ children, className = 'grid-cols-2 lg:grid-cols-4' }:
   return <section className={`grid gap-px overflow-hidden rounded-md border border-line bg-line shadow-card ${className}`}>{children}</section>;
 }
 
-export function StatTile({ label, value, hint }: { label: string; value: ReactNode; hint?: string }) {
+/** wrap: the hint is shown whole, however many lines it takes (one that carries numbers, such as an interval). */
+export function StatTile({ label, value, hint, wrap = false }: { label: string; value: ReactNode; hint?: ReactNode; wrap?: boolean }) {
   return (
-    <div aria-label={label} className="min-w-0 bg-surface px-4 py-3">
+    <div role="group" aria-label={label} className="min-w-0 bg-surface px-4 py-3">
       <div className="text-[11px] font-semibold tracking-[0.06em] text-muted uppercase">{label}</div>
       <div className="mt-0.5 text-[28px] leading-tight font-semibold tracking-[-0.01em] tabular-nums [font-stretch:82%]">{value}</div>
-      {hint && <div className="truncate text-xs text-muted">{hint}</div>}
+      {/* Two lines before it is cut: a one-line cut hid most hints ("drawn from confirmed m…"). */}
+      {hint && <div className={`${wrap ? '' : 'line-clamp-2 '}text-xs leading-snug text-muted`}>{hint}</div>}
     </div>
   );
 }
@@ -105,7 +110,8 @@ export function StatusBadge({ status }: { status: string }) {
 
 export function Kbd({ children }: { children: ReactNode }) {
   return (
-    <kbd className="inline-flex h-[18px] min-w-[18px] items-center justify-center rounded-[3px] border border-line-strong border-b-2 bg-surface px-1 font-mono text-[10px] leading-none font-medium text-muted">
+    // Sized in em, so a key reads in proportion to the text around it (a 12px footer, a 13px button, a 16px doc page).
+    <kbd className="inline-flex h-[1.9em] min-w-[1.9em] items-center justify-center rounded-[0.25em] border border-line-strong border-b-2 bg-surface px-[0.35em] font-mono text-[0.8em] leading-none font-medium text-muted">
       {children}
     </kbd>
   );
@@ -159,12 +165,19 @@ export function Alert({ children, className = '' }: { children: ReactNode; class
 }
 
 export const tableClass = 'w-full border-separate border-spacing-0 text-left';
-export const thClass = 'sticky top-0 z-[1] border-b border-line bg-sunken px-3 py-1.5 text-[11px] font-semibold tracking-[0.06em] text-muted uppercase';
+/**
+ * A table header cell: one line (a narrow table scrolls sideways rather than stacking a header's words), small caps.
+ * Uppercasing turns Greek symbols into Latin look-alikes (τ, α, β read as T, A, B): put a symbol in
+ * `<span className="normal-case">`.
+ */
+export const thClass = 'sticky top-0 z-[1] border-b border-line bg-sunken px-3 py-1.5 text-[11px] font-semibold tracking-[0.06em] whitespace-nowrap text-muted uppercase';
 export const tdClass = 'border-b border-line px-3 py-2 align-top';
 
-/** "just now", "5m ago", "3d ago". The exact time is in the cell's tooltip. */
+/** "just now", "5m ago", "3d ago"; '' for a time that does not parse. The exact time is in the cell's tooltip. */
 export function ago(iso: string, now = Date.now()): string {
   const s = Math.max(0, (now - Date.parse(iso)) / 1000);
+  // A time that does not parse (another release's value) says nothing rather than "NaNy ago".
+  if (Number.isNaN(s)) return '';
   if (s < 60) return 'just now';
   if (s < 3600) return `${Math.floor(s / 60)}m ago`;
   if (s < 86_400) return `${Math.floor(s / 3600)}h ago`;

@@ -3,17 +3,23 @@
 # failed. It never prints a secret. The sole fail-safe mutation is stopping codex-runner when its live sandbox/network
 # isolation check fails, so a warning cannot leave unsafe Codex jobs running.
 #   ./scripts/doctor.sh
-# Checks: Docker, that no other folder's install runs under this one's FG_INSTANCE, the ports the stack publishes, Ollama
+# Checks: Docker, that no other folder's install runs under this one's FG_INSTANCE, that the api and worker are not
+# crash-looping or dead and the worker's heartbeat is recent, the ports the stack publishes, Ollama
 # (answers, structured output with a real schema call, models pulled), from inside the containers (host.docker.internal,
 # Ollama, the transcripts and Codex login mounts), the Codex login here, and GitHub and Linear through the api's checks.
 set -uo pipefail
+# The Compose project is this checkout's (FG_INSTANCE and COMPOSE_FILE from its .env): a shell's own value would point
+# docker compose at another install's containers.
+unset COMPOSE_PROJECT_NAME COMPOSE_FILE
 here="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$here"
 . scripts/lib/env.sh
 . scripts/lib/ollama.sh
+. scripts/lib/restore-journal.sh
+. scripts/lib/state-fs.sh
 
 case "${1:-}" in
-  -h | --help) sed -n '2,7p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+  -h | --help) sed -n '2,9p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
   "") ;;
   *) echo "usage: ./scripts/doctor.sh" >&2; exit 1 ;;
 esac
@@ -49,24 +55,44 @@ else fail "docker: installed, but the daemon does not answer (start Docker Deskt
 # One install per folder: Docker Compose names containers and volumes after FG_INSTANCE (default feedback-graph), so
 # containers under this folder's name that another folder started are that folder's install, and docker compose here
 # would take it over (and its data). setup.sh refuses to start then; a hand-written .env can still get here.
+check_instance_env
+instance="$(fg_instance)"
+# Set when containers under this name are another folder's: no check below runs docker compose (or calls the api), so
+# doctor never inspects, execs in or stops that install's containers.
+foreign=""
 if [ "$docker_ok" = 1 ]; then
-  instance="$(envval FG_INSTANCE)"; instance="${instance:-feedback-graph}"
-  started_in="$(docker ps -a --filter "label=com.docker.compose.project=$instance" --format '{{.Label "com.docker.compose.project.working_dir"}}' 2>/dev/null | head -n 1)"
-  physical() { (cd "$1" 2>/dev/null && pwd -P) || printf '%s' "$1"; }
+  started_in="$(instance_dir "$instance")"
   if [ -z "$started_in" ]; then pass "install: no other folder runs as $instance"
-  elif [ "$(physical "$started_in")" = "$(physical "$here")" ]; then pass "install: $instance runs from this folder"
+  elif [ "$(physical_dir "$started_in")" = "$(physical_dir "$here")" ]; then pass "install: $instance runs from this folder"
   else
     fail "install: the containers named $instance were started from $started_in, not this folder: docker compose here would take over that install and its data"
     more "give this folder its own name and ports in .env: FG_INSTANCE=feedback-graph-$(basename "$here" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9_-\n' '-'),"
     more "API_PORT, NEO4J_HTTP_PORT, NEO4J_BOLT_PORT, POSTGRES_PORT and OLLAMA_PORT (see ./scripts/setup.sh --help)"
+    foreign="$started_in"
+    skip "containers, api and agent endpoint: not checked, since the ones answering are the install in $started_in"
   fi
 fi
 
-compose=(docker compose)
+# A restore killed part-way (scripts/lib/restore-journal.sh): the stack it stopped stays down, and while the store may be
+# the backup's but state/ is not the worker does not start. Not when the containers under this name are another folder's.
+[ -n "$foreign" ] || case "$(restore_status)" in
+  none) ;;
+  running) warn "restore: one is running now (pid $(journal_get pid), from $(journal_get src)); it stops the stack while it replaces the store" ;;
+  damaged) restore_note="$(restore_damaged)"; fail "restore: ${restore_note%%$'\n'*}"; more "${restore_note#*$'\n'  }" ;;
+  untouched) restore_note="$(restore_interrupted untouched)"; warn "restore: ${restore_note%%$'\n'*}"; more "${restore_note#*$'\n'  }" ;;
+  before) restore_note="$(restore_interrupted before)"; warn "restore: ${restore_note%%$'\n'*}"; more "${restore_note#*$'\n'  }" ;;
+  replacing) restore_note="$(restore_interrupted replacing)"; fail "restore: ${restore_note%%$'\n'*}"; more "${restore_note#*$'\n'  }" ;;
+esac
+
+# Pinned to this checkout's name, so docker compose addresses exactly the project checked above.
+compose=(docker compose -p "$instance")
 store="$(envval STORE)"
 if [ "$store" = postgres ] && [ -z "$(envval DATABASE_URL)" ]; then compose+=(--profile postgres); fi
+# docker compose may run: Docker answers and the containers under this name, if any, are this folder's.
+own=0
+[ "$docker_ok" = 1 ] && [ -z "$foreign" ] && own=1
 running=""
-[ "$docker_ok" = 1 ] && running="$("${compose[@]}" ps --status running --services 2>/dev/null || true)"
+[ "$own" = 1 ] && running="$("${compose[@]}" ps --status running --services 2>/dev/null || true)"
 is_running() { printf '%s\n' "$running" | grep -qx "$1"; }
 
 # ── Ports ───────────────────────────────────────────────────────────────────────────────────────────────────────────
@@ -79,7 +105,7 @@ port() {
   local svc="$1" host="$2" inner="$3" other=""
   if ! listening "$host"; then pass "port $host ($svc): free"; return; fi
   if [ "$docker_ok" = 1 ]; then
-    if "${compose[@]}" port "$svc" "$inner" 2>/dev/null | grep -qE ":$host\$"; then pass "port $host ($svc): used by this Feedback Graph"; return; fi
+    if [ "$own" = 1 ] && "${compose[@]}" port "$svc" "$inner" 2>/dev/null | grep -qE ":$host\$"; then pass "port $host ($svc): used by this Feedback Graph"; return; fi
     other="$(docker ps --filter "publish=$host" --format '{{.Names}}' 2>/dev/null | head -n 1)"
   fi
   if [ -n "$other" ]; then warn "port $host ($svc): used by the container $other, not this folder's stack (another checkout?); fine if that is the one you use"
@@ -89,17 +115,45 @@ api_port="$(envval API_PORT)"; api_port="${api_port:-8787}"
 api_bind="$(envval API_BIND)"; api_bind="${api_bind:-127.0.0.1}"
 api_token="$(envval API_TOKEN)"
 owner_token="$(envval FG_OWNER_TOKEN)"
-if printf '%s\n' "$api_bind" | grep -Eq '^(127(\.[0-9]{1,3}){3}|localhost|::1|\[::1\])$'; then
-  pass "API bind: loopback only ($api_bind)"
+# What the running containers actually publish, as "<service> <address:port>" for each binding beyond loopback: an extra
+# Compose file (or COMPOSE_FILE) can publish the api on 0.0.0.0 whatever API_BIND says.
+published=""
+[ "$own" = 1 ] && published="$("${compose[@]}" ps --format '{{.Service}} {{.Ports}}' 2>/dev/null || true)"
+exposed="$(printf '%s\n' "$published" | awk '{
+  svc = $1; $1 = ""; n = split($0, b, ",")
+  for (i = 1; i <= n; i++) {
+    x = b[i]; gsub(/^ +| +$/, "", x)
+    if (x !~ /->/) continue
+    split(x, hp, "->"); ip = hp[1]; sub(/:[0-9]+$/, "", ip)
+    if (ip ~ /^127\./ || ip == "::1" || ip == "[::1]" || ip == "localhost") continue
+    print svc " " hp[1]
+  }
+}' | awk '!seen[$0]++')"
+api_exposed="$(printf '%s\n' "$exposed" | awk '$1 == "api" { print $2 }' | paste -sd, - | sed 's/,/, /g')"
+if printf '%s\n' "$published" | grep -q '^api '; then
+  if [ -z "$api_exposed" ]; then pass "API bind: the running api is published on loopback only"
+  elif [ -z "$api_token" ]; then
+    fail "API bind: the running api is published on $api_exposed, beyond loopback, with no API token; publish it on 127.0.0.1 only (API_BIND, and any extra Compose file) or run ./scripts/setup.sh --yes --enable-auth"
+  else
+    warn "API bind: the running api is published on $api_exposed, beyond loopback; confirm the firewall/reverse proxy restricts it"
+  fi
+elif printf '%s\n' "$api_bind" | grep -Eq '^(127(\.[0-9]{1,3}){3}|localhost|::1|\[::1\])$'; then
+  # With another folder's containers under this name, the api running is that install's: only the address configured here
+  # is checked.
+  if [ -n "$foreign" ]; then pass "API bind: loopback only as configured here ($api_bind); the running api was not checked, since it is the install in $foreign"
+  else pass "API bind: loopback only ($api_bind; the api is not running, so this is the configured address)"; fi
 elif [ -z "$api_token" ]; then
-  fail "API bind: $api_bind exposes a tokenless owner-compatible API; set API_BIND=127.0.0.1 or create API_TOKEN and FG_OWNER_TOKEN"
+  fail "API bind: $api_bind would expose a tokenless API that anything reaching it can read; set API_BIND=127.0.0.1 or run ./scripts/setup.sh --yes --enable-auth"
 else
   warn "API bind: $api_bind is reachable beyond loopback; confirm the firewall/reverse proxy restricts it"
 fi
+printf '%s\n' "$exposed" | awk 'NF && $1 != "api"' | while read -r svc at; do
+  warn "port $at ($svc): published beyond loopback; anyone who can reach this machine can try its password"
+done
 if [ -n "$api_token" ] && [ -z "$owner_token" ]; then
   fail "Owner sign-in: FG_OWNER_TOKEN is missing; run ./scripts/setup.sh --yes to create it, then restart the api"
 elif [ -n "$owner_token" ]; then pass "Owner sign-in: configured"
-else warn "Owner sign-in: tokenless compatibility is enabled; another local process can act as owner"; fi
+else warn "Owner sign-in: no owner token, so the UI is read-only for owner actions (Inbox, lessons, scans, settings) and any program on this machine and any container on this Docker host (OrbStack and Docker Desktop route them through the gateway) can read the API; run ./scripts/setup.sh --yes --enable-auth to sign in as owner"; fi
 neo_http="$(envval NEO4J_HTTP_PORT)"; neo_bolt="$(envval NEO4J_BOLT_PORT)"
 port api "$api_port" 8787
 if [ "$store" != postgres ]; then
@@ -115,9 +169,18 @@ if [ -n "$(envval CODEX_RUNNER_URL)" ]; then
   runner_unsafe=0
   runner_reasons=""
   runner_flag="state/runner-control/codex-runner-disabled"
-  if [ -f "$runner_flag" ]; then
+  # Read only as a plain file, and only so much of it: a container can write state/.
+  if flag_reasons="$(state_read "$runner_flag" 4096 | tr -cd '[:print:]\n')"; then
     warn "Codex runner: disabled by its persisted isolation-safety flag"
-    more "Reason: $(cat "$runner_flag" 2>/dev/null || echo unknown). Clear it only by rerunning setup.sh --runner-procfs-compat after reviewing the isolation tradeoff."
+    while IFS= read -r reason; do [ -z "$reason" ] || more "Reason: $reason"; done <<<"$flag_reasons"
+    # setup.sh --runner-procfs-compat clears only the procfs reason; any other is cleared by hand once the probe passes.
+    if [ -n "$flag_reasons" ] && printf '%s\n' "$flag_reasons" | grep -qv '^procfs:'; then
+      more "Fix the isolation failure first (or choose claude-cli or an API scan provider), then delete $runner_flag and run ./scripts/doctor.sh again: its live probes must pass. --runner-procfs-compat does not clear this."
+    else
+      more "Clear it only by rerunning setup.sh --runner-procfs-compat after reviewing the isolation tradeoff."
+    fi
+  elif [ -n "$foreign" ]; then
+    :
   elif [ "$docker_ok" = 1 ] && ! is_running codex-runner; then
     warn "Codex runner: configured but stopped; doctor left it stopped and did not create a safety flag"
   elif [ "$docker_ok" = 1 ] && is_running worker; then
@@ -126,9 +189,15 @@ if [ -n "$(envval CODEX_RUNNER_URL)" ]; then
     else
       fail "Codex runner: sandbox cannot start or runner is unavailable"
       more "$runner_detail"
-      more "For procfs mount errors on Docker Desktop/OrbStack or Linux, review setup.sh --runner-procfs-compat (explicit opt-in removes Docker system-path protection); Claude/API avoids that exception. Rebuild codex-runner with scripts/seccomp/codex-runner.json. Check AppArmor and docs/operations.md."
       runner_unsafe=1
-      case "$runner_detail" in *proc*mount*|*mount*proc*) runner_reasons="${runner_reasons}procfs: nested sandbox could not mount proc\n";; *) runner_reasons="${runner_reasons}sandbox: nested sandbox startup failed\n";; esac
+      case "$runner_detail" in
+        *proc*mount*|*mount*proc*)
+          more "This is the procfs mount failure of Docker Desktop/OrbStack or Linux: review setup.sh --runner-procfs-compat (explicit opt-in removes Docker system-path protection); Claude/API avoids that exception. See docs/operations.md."
+          runner_reasons="${runner_reasons}procfs: nested sandbox could not mount proc\n" ;;
+        *)
+          more "Rebuild codex-runner with scripts/seccomp/codex-runner.json, check AppArmor and docs/operations.md; --runner-procfs-compat does not fix this failure."
+          runner_reasons="${runner_reasons}sandbox: nested sandbox startup failed\n" ;;
+      esac
     fi
     # Docker Desktop implementations do not all enforce bridge-network isolation alike. Probe the actual runner,
     # including an explicit Host header (fetch() silently discards it), rather than trusting the Compose topology.
@@ -142,6 +211,16 @@ if [ -n "$(envval CODEX_RUNNER_URL)" ]; then
       pg_probe="$(envval POSTGRES_PORT)"; targets="$targets,host.docker.internal:${pg_probe:-5434},host.docker.internal:5432,host.docker.internal:5442,host.docker.internal:6379"
       targets="$targets,host.docker.internal:${neo_http:-7476},host.docker.internal:${neo_bolt:-7689},host.docker.internal:8788"
       ollama_port="$(envval OLLAMA_PORT)"; targets="$targets,host.docker.internal:${ollama_port:-11435}"
+      # Every other install on this machine too, whatever this one's ports: the default install's, and those of each
+      # install setup.sh registered (their .env, running or not).
+      others="8787 7476 7689 5434 11435"
+      for f in "${XDG_STATE_HOME:-$HOME/.local/state}"/feedback-graph/installs/*; do
+        [ -f "$f" ] || continue
+        d="$(cat "$f")"
+        [ -f "$d/.env" ] && [ "$(cd "$d" 2>/dev/null && pwd -P)" != "$(pwd -P)" ] || continue
+        others="$others $(grep -E '^(API_PORT|NEO4J_HTTP_PORT|NEO4J_BOLT_PORT|POSTGRES_PORT|OLLAMA_PORT)=' "$d/.env" | cut -d= -f2- | tr -cd '0-9\n' | tr '\n' ' ')"
+      done
+      for p in $others; do case ",$targets," in *",host.docker.internal:$p,"*) ;; *) targets="$targets,host.docker.internal:$p" ;; esac; done
       if isolation_detail="$("${compose[@]}" exec -T -e FG_ISOLATION_TARGETS="$targets" codex-runner node -e '
         const http=require("node:http"), net=require("node:net");
         const targets=process.env.FG_ISOLATION_TARGETS.split(",").filter(Boolean);
@@ -162,19 +241,19 @@ if [ -n "$(envval CODEX_RUNNER_URL)" ]; then
     else fail "Codex runner: configured, but its container is not running for the live isolation probe"; runner_unsafe=1; fi
   else fail "Codex runner: configured but cannot be checked from a running worker"; runner_unsafe=1; fi
   if [ "$runner_unsafe" = 1 ]; then
-    mkdir -p state/runner-control
-    printf '%b' "${runner_reasons:-isolation: runner safety probe failed\n}" > "$runner_flag"
-    chmod 600 "$runner_flag"
+    printf '%b' "${runner_reasons:-isolation: runner safety probe failed\n}" | state_write "$runner_flag" ||
+      more "Could not write $runner_flag (said above); the runner is stopped now but would start again with the stack."
     if "${compose[@]}" stop codex-runner >/dev/null 2>&1; then more "Stopped codex-runner: queued codex-cli jobs will remain parked."
     else more "Could not stop codex-runner automatically; stop it before allowing more jobs."; fi
   fi
 fi
 
-if [ "$docker_ok" = 1 ] && is_running neo4j; then
+if [ "$own" = 1 ] && is_running neo4j; then
   memory="$(database_memory "${compose[@]}")"
   if [ -n "$memory" ]; then
-    report="$(printf '%s' "$memory" | awk -F'[:,}]' '{printf "Neo4j memory: %.0f MiB used / %.0f MiB limit; %.0f MiB headroom; %.0f MiB swap",$2/1048576,$4/1048576,$6/1048576,$8/1048576; if ($12 != "null") printf "; %.0f MiB swap headroom",$12/1048576}')"
-    if printf '%s' "$memory" | awk -F'[:,}]' '{exit !($6/$4 < 0.15 || $8 > 0)}'; then
+    # A few KiB of swap is the kernel paging out idle memory, not pressure: swap counts from 1 MiB (shown in KiB below it).
+    report="$(printf '%s' "$memory" | awk -F'[:,}]' '{printf "Neo4j memory: %.0f MiB used / %.0f MiB limit; %.0f MiB headroom; ",$2/1048576,$4/1048576,$6/1048576; if ($8 > 0 && $8 < 1048576) printf "%.0f KiB swap",$8/1024; else printf "%.0f MiB swap",$8/1048576; if ($12 != "null") printf "; %.0f MiB swap headroom",$12/1048576}')"
+    if printf '%s' "$memory" | awk -F'[:,}]' '{exit !($6/$4 < 0.15 || $8 >= 1048576)}'; then
       warn "$report"; more "Increase NEO4J_MEMORY_LIMIT or lower NEO4J_HEAP_INITIAL/NEO4J_HEAP and NEO4J_PAGECACHE together; leave Docker VM headroom. The small profile is for smaller hosts, not a remedy for a container already short on headroom."
     else pass "$report"; fi
   else skip "Neo4j memory: cgroup counters unavailable"; fi
@@ -218,10 +297,39 @@ else
   fail "ollama: does not answer at $ollama_url (install it from https://ollama.com and start it)"
 fi
 
+# ── The api and the worker: running, or crash-looping on a bad .env ─────────────────────────────────────────────────
+# A service Compose restarts after each crash, or one that died, reads as "not running" below and would only be skipped.
+# fatal_line <service>: the last fatal line it logged (a config error names the setting), as one line.
+fatal_line() {
+  "${compose[@]}" logs --no-log-prefix --tail 200 "$1" 2>/dev/null | grep '"msg":"fatal"' | tail -n 1 |
+    sed -E 's/^.*"error":"(([^"\\]|\\.)*)".*$/\1/; s/\\n/; /g; s/\\"/"/g' | cut -c 1-400
+}
+if [ "$own" = 1 ]; then
+  states="$("${compose[@]}" ps -a --format '{{.Service}} {{.State}} {{.ExitCode}}' 2>/dev/null || true)"
+  for svc in api worker; do
+    read -r _ st code <<<"$(printf '%s\n' "$states" | awk -v s="$svc" '$1 == s' | head -n 1)" || true
+    case "$st:${code:-0}" in
+      # Compose reports exit 0 for a container between restarts, whatever it exited with: no code is said.
+      restarting:*) why="restarting after each crash" ;;
+      # Paused or stopped on purpose: nothing it logged says why, but nothing runs (fg status calls it stale).
+      paused:*) fail "$svc: paused, so it does nothing"; more "docker compose unpause $svc"; continue ;;
+      exited:0) fail "$svc: stopped"; more "docker compose up -d $svc"; continue ;;
+      :*) continue ;;
+      exited:*) why="exited with code $code" ;;
+      *) continue ;;
+    esac
+    fatal="$(fatal_line "$svc")"
+    fail "$svc: $why${fatal:+: $fatal}"
+    more "docker compose logs $svc shows why; after fixing .env, docker compose up -d"
+  done
+fi
+
 # ── Inside the containers ───────────────────────────────────────────────────────────────────────────────────────────
 codex_login_reported=""
 if [ "$docker_ok" != 1 ]; then
   skip "containers: Docker does not answer"
+elif [ -n "$foreign" ]; then
+  :
 elif ! is_running worker; then
   skip "containers: the worker is not running (docker compose up -d), so host.docker.internal and the mounts were not checked"
 else
@@ -251,8 +359,12 @@ else
   claude_dir="$(expand "$(envval CLAUDE_PROJECTS_DIR)")"; claude_dir="${claude_dir:-$HOME/.claude/projects}"
   codex_dir="$(expand "$(envval CODEX_SESSIONS_DIR)")"; codex_dir="${codex_dir:-$HOME/.codex/sessions}"
   claude_empty=""; codex_empty=""
-  case "$claude_dir" in */state/empty-claude) claude_empty=intentional-empty ;; esac
-  case "$codex_dir" in */state/empty-codex) codex_empty=intentional-empty ;; esac
+  case "$claude_dir" in */.host/empty-claude) claude_empty=intentional-empty ;; esac
+  case "$codex_dir" in */.host/empty-codex) codex_empty=intentional-empty ;; esac
+  # Before 0.7.6 --no-transcripts mounted empty folders in state/, which the worker can swap for a link to a host folder.
+  for d in "$claude_dir" "$codex_dir"; do
+    case "$d" in */state/empty-claude | */state/empty-codex) fail "transcripts: $d is in state/, which the worker can change; run ./scripts/setup.sh to move it to .host/" ;; esac
+  done
   mount_check /transcripts "Claude Code transcripts" "$claude_dir" "$claude_empty"
   mount_check /codex-sessions "Codex sessions" "$codex_dir" "$codex_empty"
   if in_worker sh -c 'test -s /codex/auth.json' >/dev/null; then pass "Codex login: present in the worker"
@@ -263,7 +375,9 @@ fi
 # ── Codex login on this machine ─────────────────────────────────────────────────────────────────────────────────────
 codex_auth="$(expand "$(envval CODEX_AUTH_FILE)")"
 codex_home="${CODEX_HOME:-$HOME/.codex}"
-codex_configured="$(printf '%s,%s,%s,%s,%s' "$(envval SCAN_LLM)" "$(envval POSTMORTEM_LLM)" "$(envval DOCS_LLM)" "$(envval CHAT_LLM)" "$(envval COMPOSE_PROFILES)" | grep -o 'codex-cli\|codex' | head -n 1 || true)"
+codex_configured=""
+case ",$(envval COMPOSE_PROFILES)," in *,codex,*) codex_configured=1 ;; esac
+! codex_job_configured || codex_configured=1
 if [ -n "$codex_auth" ] && [ -s "$codex_auth" ]; then pass "Codex login: $codex_auth (CODEX_AUTH_FILE)"
 elif [ -n "$codex_auth" ]; then fail "Codex login: CODEX_AUTH_FILE is $codex_auth, which is missing or empty (codex login, then run this again)"
 elif [ -s "$codex_home/auth.json" ] && [ -n "$codex_configured" ]; then warn "Codex login: $codex_home/auth.json exists but is not mounted; set CODEX_AUTH_FILE=$codex_home/auth.json in .env to use codex-cli"
@@ -271,7 +385,7 @@ elif [ -z "$codex_login_reported" ]; then skip "Codex login: none (only needed f
 
 # ── GitHub and Linear, as the running api sees them ─────────────────────────────────────────────────────────────────
 status=""
-if command -v curl >/dev/null 2>&1; then
+if [ -z "$foreign" ] && command -v curl >/dev/null 2>&1; then
   auth=()
   api_token="$(envval API_TOKEN)"
   [ -n "$api_token" ] && auth=(-H "Authorization: Bearer $api_token")
@@ -290,23 +404,42 @@ connection() {
     *) skip "$label: the api did not report it" ;;
   esac
 }
-if [ -z "$status" ]; then
+if [ -n "$foreign" ]; then
+  :
+elif [ -z "$status" ]; then
   skip "GitHub, Linear: the api does not answer at http://localhost:$api_port (docker compose up -d), so their tokens were not checked"
 else
   pass "api: answers at http://localhost:$api_port"
-  count="$(printf '%s' "$status" | node -e 'let s="";process.stdin.on("data",c=>s+=c).on("end",()=>console.log(JSON.parse(s).codeMaps?.length ?? 0))' 2>/dev/null || echo '?')"
-  case "$count" in
-    0) pass "Code maps: no failed or interrupted rebuilds reported" ;;
-    '?') skip "Code maps: the api status response could not be read" ;;
-    *) fail "Code maps: $count project(s) have a failed or interrupted rebuild; open their Code map cards or run fg status for details" ;;
+  # A rebuild running now is listed with rebuilding:true; it is not a failure, unless the worker writing it is not
+  # running (the api tells within its lease, about half a minute): then that write was cut short.
+  worker_down=0 down_note=""
+  [ "$own" != 1 ] || is_running worker || { worker_down=1; down_note=" (the worker is not running)"; }
+  count="$(printf '%s' "$status" | WORKER_DOWN=$worker_down node -e 'let s="";process.stdin.on("data",c=>s+=c).on("end",()=>console.log((JSON.parse(s).codeMaps ?? []).filter(m=>!m.rebuilding||process.env.WORKER_DOWN==="1").length))' 2>/dev/null || echo '?')"
+  case "$count:$worker_down" in
+    0:0) pass "Code maps: no failed or interrupted rebuilds reported" ;;
+    0:1) skip "Code maps: none reported failed, but the worker is not running (docker compose up -d), so none is rebuilt or retried" ;;
+    '?':*) skip "Code maps: the api status response could not be read" ;;
+    *) fail "Code maps: $count project(s) have a failed or interrupted rebuild$down_note; open their Code map cards or run fg status for details" ;;
   esac
   connection github GitHub
   connection linear Linear
+  # The worker beats every 30 s; one running but silent for 90 s (three beats) is hung, or its store write fails.
+  if [ "$own" = 1 ] && is_running worker; then
+    beat="$(printf '%s' "$status" | node -e 'let s="";process.stdin.on("data",c=>s+=c).on("end",()=>{const b=JSON.parse(s).worker?.lastBeat;console.log(b?Math.round((Date.now()-Date.parse(b))/1000):"none")})' 2>/dev/null || echo '?')"
+    case "$beat" in
+      '?') skip "worker heartbeat: the api status response could not be read" ;;
+      none) warn "worker heartbeat: none reported yet (starting?); run this again in a minute, else docker compose logs worker" ;;
+      *) if [ "$beat" -le 90 ]; then pass "worker heartbeat: ${beat}s ago"
+         else fail "worker heartbeat: none for ${beat}s (it beats every 30s): the worker is hung or cannot write to the store; docker compose logs worker, then docker compose restart worker"; fi ;;
+    esac
+  fi
 fi
 
 # Exercise the same authenticated MCP initialization agents use. This catches a newly-added or rotated API_TOKEN that
 # was not propagated: status may answer while every installed agent gets 401. No response body or credential is shown.
-if [ -z "$status" ]; then
+if [ -n "$foreign" ]; then
+  :
+elif [ -z "$status" ]; then
   skip "MCP credential: the api is unavailable"
 elif [ -z "$api_token" ]; then
   skip "MCP credential: API_TOKEN is not set (tokenless local install)"

@@ -12,7 +12,7 @@ export function Prefilters() {
   const [counts, setCounts] = useState<{ rules: SkipRuleView[]; since: string | null } | null>(null);
   useEffect(() => {
     let stale = false;
-    integrationsApi.get().then((v) => { if (!stale && v.rules) setCounts({ rules: v.rules, since: v.skippedSince ?? null }); }, () => {});
+    integrationsApi.get().then((v) => { if (!stale) setCounts({ rules: v.rules, since: v.skippedSince }); }, () => {});
     return () => { stale = true; };
   }, []);
   const rule = (name: string) => counts?.rules.find((r) => r.name === name);

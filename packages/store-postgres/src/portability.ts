@@ -1,4 +1,7 @@
-import { purgeRedactionOriginals, EXPORT_FORMAT, VERSION, type Cause, type ExportBundle, type Lesson, type PortabilityStore } from '@fb/core';
+import {
+  heldIds, heldTargets, holdFacts, holdLessons, purgeRedactionOriginals, EXPORT_FORMAT, VERSION, type Cause, type ExportBundle, type HeldDecision, type Lesson,
+  type PortabilityStore, type TargetSnapshot,
+} from '@fb/core';
 import type pg from 'pg';
 import { PgCodeGraphStore } from './codegraph.ts';
 import { iso, tx, type Db } from './db.ts';
@@ -65,19 +68,33 @@ export class PgPortabilityStore implements PortabilityStore {
     const keys = key === null && o.projectKeys ? o.projectKeys : null;
     const approvedOnly = !!o.approvedOnly;
     // One snapshot for the whole bundle, so a write landing mid-export cannot leave it half old, half new.
-    const [projects, lessons, misses, facts, docs] = await tx(this.db, async (c: pg.PoolClient) => {
+    const [held, projects, lessons, misses, facts, docs] = await tx(this.db, async (c: pg.PoolClient) => {
       await c.query('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY');
       const q = async (sql: string, params: unknown[]) => (await c.query(sql, params)).rows;
+      // The cloud sync hold (core loop/syncHold.ts): targets of applied loop decisions not yet ratified, as they were before;
+      // and of one still applying (its hold recorded at markApplying), whose write may already have landed.
+      // Held lessons are read in any project: holdLessons files each under its project as it was. Only the decisions that
+      // can concern these projects are read (decisions_held; decisions_status for the few applying): theirs, those of no project, and those on a lesson that was
+      // theirs or global before (narrow_scope moves a global one to another project, a merge may span two).
+      const hold = heldTargets((await q(
+        `SELECT coalesce(applied_at, decided_at) AS applied_at, before, after FROM decisions d
+          WHERE ((status = 'applied' AND ratified_at IS NULL AND sync_hold_until > now()) OR (status = 'applying' AND sync_hold_until > now()))
+            AND ($1::text[] IS NULL OR project_key IS NULL OR project_key = ANY($1)
+                 OR EXISTS (SELECT 1 FROM jsonb_array_elements(d.before) b
+                             WHERE b->>'kind' = 'lesson' AND (b->'fields'->>'projectKey' IS NULL OR b->'fields'->>'projectKey' = ANY($1))))`,
+        [key === null ? keys : [key]],
+      )).map((r): HeldDecision => ({ appliedAt: iso(r.applied_at) as string, before: r.before as TargetSnapshot[], after: r.after as TargetSnapshot[] })));
       return [
+        hold,
         await q(`SELECT key, remote, demo_created FROM projects WHERE ($1::text IS NULL OR key = $1) AND ($2::text[] IS NULL OR key = ANY($2)) ORDER BY key COLLATE "C"`, [key, keys]),
         await q(
-          `SELECT id, project_key, title, rule, applies_when, scope, paths, status, source, cause, miss_id, created_at, decided_at, checks
+          `SELECT id, project_key, origin_project_key, title, rule, applies_when, scope, paths, status, source, cause, miss_id, created_at, decided_at, checks, triggers
            FROM lessons
-           WHERE ($1::text IS NULL OR project_key = $1 OR (project_key IS NULL AND origin_project_key = $1))
-             AND ($3::text[] IS NULL OR coalesce(project_key, origin_project_key) IS NULL OR coalesce(project_key, origin_project_key) = ANY($3))
-             AND (NOT $2 OR status = 'approved') AND NOT sandbox AND source <> 'demo'
+           WHERE (id = ANY($4) OR (($1::text IS NULL OR project_key = $1 OR (project_key IS NULL AND origin_project_key = $1))
+             AND ($3::text[] IS NULL OR coalesce(project_key, origin_project_key) IS NULL OR coalesce(project_key, origin_project_key) = ANY($3))))
+             AND (NOT $2 OR status = 'approved' OR id = ANY($4)) AND NOT sandbox AND source <> 'demo'
            ORDER BY created_at, id COLLATE "C"`,
-          [key, approvedOnly, keys],
+          [key, approvedOnly, keys, heldIds(hold, 'lesson')],
         ),
         await q(
           `SELECT m.id, m.project_key, m.missed, m.cause, m.cause_explanation, f.text AS feedback_text, f.created_at AS ts,
@@ -92,7 +109,7 @@ export class PgPortabilityStore implements PortabilityStore {
           [key, keys],
         ),
         await q(
-          `SELECT path, lines, kind, statement, why, confidence, source, created_at, project_key
+          `SELECT id, path, lines, kind, statement, why, confidence, source, created_at, project_key
            FROM facts WHERE current AND doc_id IS NULL AND ($1::text IS NULL OR project_key = $1) AND ($2::text[] IS NULL OR project_key = ANY($2)) AND NOT sandbox
              AND source IS DISTINCT FROM 'demo'
            ORDER BY project_key COLLATE "C", path COLLATE "C", statement COLLATE "C", id COLLATE "C"`,
@@ -114,7 +131,7 @@ export class PgPortabilityStore implements PortabilityStore {
       exportedAt: new Date().toISOString(),
       projectKey: key,
       projects: projects.map((r) => ({ key: r.key as string, remote: (r.remote as string) ?? null, ...(r.demo_created ? { demoCreated: true as const } : {}) })),
-      lessons: lessons.map(
+      lessons: holdLessons(lessons.map(
         (l): Lesson => ({
           id: l.id,
           projectKey: l.project_key ?? null,
@@ -130,8 +147,9 @@ export class PgPortabilityStore implements PortabilityStore {
           createdAt: iso(l.created_at) as string,
           decidedAt: iso(l.decided_at),
           ...(l.checks != null && { checks: l.checks }),
+          ...(l.triggers != null && { triggers: l.triggers }),
         }),
-      ),
+      ), held, approvedOnly, { key, keys }, new Map(lessons.map((l) => [l.id as string, (l.origin_project_key as string) ?? null]))),
       misses: misses.map((m) => ({
         id: m.id,
         projectKey: m.project_key,
@@ -142,7 +160,8 @@ export class PgPortabilityStore implements PortabilityStore {
         ts: iso(m.ts) ?? '',
         contextItems: m.items as ExportBundle['misses'][number]['contextItems'],
       })),
-      facts: facts.map((f) => ({
+      facts: holdFacts(facts.map((f) => ({
+        id: f.id as string,
         path: f.path,
         lines: f.lines ?? null,
         kind: f.kind,
@@ -152,7 +171,7 @@ export class PgPortabilityStore implements PortabilityStore {
         source: f.source,
         createdAt: iso(f.created_at) as string,
         projectKey: f.project_key,
-      })),
+      })), held).map(({ id: _, ...f }) => f),
       docs: docs.map((d) => ({ id: d.id, projectKey: d.project_key, source: d.source, ref: d.ref, title: d.title, url: d.url ?? null })),
       codeFiles,
     };

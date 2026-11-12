@@ -136,7 +136,7 @@ describeStores('DocsStore', (h) => {
   });
 
   test('upsertDoc redacts secrets in the title and every chunk, whoever the caller is', async () => {
-    await d.upsertDoc({ ...doc('PR 9', 'shop', 'github'), title: 'leaks ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA' }, [{ text: 'token ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA here', embedding: vec(1) }]);
+    await d.upsertDoc({ ...doc('PR 9', 'shop', 'github'), title: 'leaks ghp' + '_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA' }, [{ text: 'token ghp' + '_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA here', embedding: vec(1) }]);
     const [listed] = await d.listDocs('shop');
     expect(listed.title).not.toContain('ghp_');
     const [hit] = await d.searchDocs({ embedding: vec(1), projectKey: 'shop', k: 1 });

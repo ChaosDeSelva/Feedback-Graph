@@ -1,19 +1,19 @@
 import { useEffect, useState } from 'react';
-import { api, type PatternReport, type ProjectHotspot, type ProjectSummary } from './api.ts';
+import { api, type PatternReport, type ProjectHotspot, type ProjectSummary, errorMessage } from './api.ts';
 import { IncludeTests } from './CodeMap.tsx';
 import { PageHeader } from './ui/PageHeader.tsx';
-import { Select } from './ui/controls.tsx';
+import { Button, Select, useFocusHandoff } from './ui/controls.tsx';
 import { Alert, Card, causeLabel, causeTone, EmptyState, StatGrid, StatTile, StatTileSkeleton, tableClass, tdClass, thClass, TONE_FILL } from './ui/display.tsx';
+import { ScrollArea } from './ui/ScrollArea.tsx';
 
 export const pct = (n: number, d: number) => (d ? `${Math.round((n / d) * 100)}%` : '–');
 
 type Week = PatternReport['weekly'][number];
 const DAY = 86_400_000;
 
-/** Monday (UTC) of an ISO week label like "2026-W41", or null when the label is something else. */
-function mondayOf(label: string): number | null {
-  const m = label.match(/^(\d{4})-W(\d{2})$/);
-  if (!m) return null;
+/** Monday (UTC) of an ISO week label like "2026-W41" (the server's labels are always that). */
+function mondayOf(label: string): number {
+  const m = label.match(/^(\d{4})-W(\d{2})$/)!;
   const jan4 = Date.UTC(Number(m[1]), 0, 4);
   return jan4 - ((new Date(jan4).getUTCDay() + 6) % 7) * DAY + (Number(m[2]) - 1) * 7 * DAY;
 }
@@ -30,9 +30,9 @@ function isoWeek(t: number): string {
  * of them, so one busy week reads as a spike against quiet ones instead of a lone bar.
  */
 export function fillWeeks(weekly: Week[], min = 8): Week[] {
-  const last = weekly.length ? mondayOf(weekly[weekly.length - 1].week) : null;
-  const first = weekly.length ? mondayOf(weekly[0].week) : null;
-  if (last === null || first === null) return weekly;
+  if (!weekly.length) return weekly;
+  const last = mondayOf(weekly[weekly.length - 1].week);
+  const first = mondayOf(weekly[0].week);
   const byWeek = new Map(weekly.map((w) => [w.week, w]));
   const start = Math.min(first, last - (min - 1) * 7 * DAY);
   const out: Week[] = [];
@@ -89,23 +89,34 @@ export function Patterns() {
   const [projects, setProjects] = useState<ProjectSummary[]>([]);
   const [project, setProject] = useState('');
   const [report, setReport] = useState<PatternReport | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  // The project list and the report fail on their own; Retry asks again for both, and each clears its error once it loads.
+  const [listError, setListError] = useState<string | null>(null);
+  const [reportError, setReportError] = useState<string | null>(null);
+  const [reportTry, setReportTry] = useState(0);
+  const error = listError ?? reportError;
+  const retryHandoff = useFocusHandoff();
 
-  useEffect(() => { api.projects().then(setProjects, (e) => setError(String(e))); }, []);
+  useEffect(() => { api.projects().then((ps) => { setProjects(ps); setListError(null); }, (e) => setListError(errorMessage(e))); }, [reportTry]);
   useEffect(() => {
     // Clear the old report while the new one loads, and drop a slow answer for a filter you have left.
     setReport(null);
+    setReportError(null);
     let stale = false;
-    api.patterns(project || undefined).then((r) => { if (!stale) setReport(r); }, (e) => { if (!stale) setError(String(e)); });
+    api.patterns(project || undefined).then((r) => { if (!stale) setReport(r); }, (e) => { if (!stale) setReportError(errorMessage(e)); });
     return () => { stale = true; };
-  }, [project]);
+  }, [project, reportTry]);
   const [hot, setHot] = useState<ProjectHotspot[] | null>(null);
   const [tests, setTests] = useState(false);
+  // A failed load says so (with a retry) rather than reading as "no files with misses".
+  const [hotError, setHotError] = useState<string | null>(null);
+  const [hotTry, setHotTry] = useState(0);
   useEffect(() => {
     let stale = false;
-    api.topHotspots(project || undefined, 10, tests, true).then((h) => { if (!stale) setHot(h); }, () => { if (!stale) setHot([]); });
+    setHot(null);
+    setHotError(null);
+    api.topHotspots(project || undefined, 10, tests, true).then((h) => { if (!stale) setHot(h); }, (e) => { if (!stale) setHotError(errorMessage(e)); });
     return () => { stale = true; };
-  }, [project, tests]);
+  }, [project, tests, hotTry]);
 
   const feedback = report?.weekly.reduce((n, w) => n + w.feedback, 0) ?? 0;
   const repeats = report?.weekly.reduce((n, w) => n + w.repeats, 0) ?? 0;
@@ -124,9 +135,14 @@ export function Patterns() {
           </Select>
         }
       />
-      <div className="min-h-0 flex-1 overflow-y-auto">
+      <ScrollArea className="min-h-0 flex-1 overflow-y-auto">
         <div className="mx-auto flex max-w-6xl flex-col gap-4 p-3 md:p-5">
-          {error && <Alert>{error}</Alert>}
+          {error && (
+            <div className="flex flex-wrap items-center gap-2">
+              <Alert className="min-w-0 flex-1">{error}</Alert>
+              <Button ref={retryHandoff} size="sm" onClick={() => { setListError(null); setReportTry((n) => n + 1); }}>Retry</Button>
+            </div>
+          )}
           {projects.find((p) => p.key === project)?.feedback === 0 && (
             <Card>
               <EmptyState compact title={`No feedback in ${project} yet`}>
@@ -150,7 +166,7 @@ export function Patterns() {
 
           {report && (
             <>
-              <Card title="Why misses happen" bodyClass="p-3">
+              <Card level="h2" title="Why misses happen" bodyClass="p-3">
                 <ul className="grid gap-2.5">
                   {report.causes.map((c) => (
                     <li key={c.cause} className="group grid grid-cols-[minmax(0,13rem)_minmax(0,1fr)_2.5rem] items-center gap-3" title={`${causeLabel(c.cause)}: ${c.count}`}>
@@ -168,13 +184,13 @@ export function Patterns() {
                 </ul>
               </Card>
 
-              <Card title="Feedback per week">
+              <Card level="h2" title="Feedback per week">
                 {report.weekly.length > 0 ? <WeeklyChart weekly={report.weekly} /> : <p className="p-3 py-6 text-muted">No confirmed feedback yet. Confirm items in the Inbox to start the trend.</p>}
               </Card>
 
-              <Struggle hot={hot} tests={tests} onTests={setTests} />
+              <Struggle hot={hot} error={hotError} onRetry={() => setHotTry((n) => n + 1)} tests={tests} onTests={setTests} />
 
-              <Card title="Repeated misses: the same kind of miss more than once">
+              <Card level="h2" title="Repeated misses: the same kind of miss more than once">
                 <ul>
                   {report.repeatGroups.map((g, i) => (
                     <li key={i} className="grid gap-1 border-b border-line px-3 py-2.5 last:border-b-0">
@@ -188,7 +204,7 @@ export function Patterns() {
             </>
           )}
         </div>
-      </div>
+      </ScrollArea>
     </div>
   );
 }
@@ -197,9 +213,11 @@ export function Patterns() {
  * The files agents keep getting wrong: the files a confirmed miss touched, by hotspot score, across the selected
  * projects. A busy file no miss touched is a hotspot, not a struggle: those are on the Projects page.
  */
-function Struggle({ hot, tests, onTests }: { hot: ProjectHotspot[] | null; tests: boolean; onTests: (v: boolean) => void }) {
+function Struggle({ hot, error, onRetry, tests, onTests }: { hot: ProjectHotspot[] | null; error: string | null; onRetry: () => void; tests: boolean; onTests: (v: boolean) => void }) {
+  const retryHandoff = useFocusHandoff();
   return (
     <Card
+      level="h2"
       title="Where agents struggle"
       actions={
         <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
@@ -208,8 +226,13 @@ function Struggle({ hot, tests, onTests }: { hot: ProjectHotspot[] | null; tests
         </div>
       }
     >
-      {hot && hot.length > 0 ? (
-        <div className="overflow-x-auto">
+      {error ? (
+        <div className="flex flex-wrap items-center gap-2 p-3">
+          <Alert className="min-w-0 flex-1">Could not load where agents struggle: {error}</Alert>
+          <Button ref={retryHandoff} size="sm" onClick={onRetry}>Retry</Button>
+        </div>
+      ) : hot && hot.length > 0 ? (
+        <ScrollArea role="region" aria-label="hotspots table" className="overflow-x-auto">
           <table className={`${tableClass} text-[13px]`}>
             <thead>
               <tr>
@@ -223,7 +246,7 @@ function Struggle({ hot, tests, onTests }: { hot: ProjectHotspot[] | null; tests
                 <tr key={`${h.projectKey}:${h.path}`} className="last:[&>td]:border-b-0 hover:bg-sunken">
                   <td className={`${tdClass} whitespace-nowrap text-muted`}>{h.projectKey}</td>
                   <td className={`${tdClass} font-mono text-[12px] [overflow-wrap:anywhere]`}>{h.path}</td>
-                  <td className={`${tdClass} text-right tabular-nums ${h.misses ? 'font-semibold' : 'text-muted'}`}>{h.misses}</td>
+                  <td className={`${tdClass} text-right font-semibold tabular-nums`}>{h.misses}</td>
                   <td className={`${tdClass} text-right text-muted tabular-nums`}>{h.churn}</td>
                   <td className={`${tdClass} text-right text-muted tabular-nums`}>{h.dependents}</td>
                   <td className={`${tdClass} text-right font-semibold tabular-nums`}>{h.score.toFixed(2)}</td>
@@ -232,7 +255,7 @@ function Struggle({ hot, tests, onTests }: { hot: ProjectHotspot[] | null; tests
             </tbody>
           </table>
           <p className="border-t border-line px-3 py-2 text-xs text-muted">Open a file on the Projects page to see its symbols, importers, tests, lessons and misses.</p>
-        </div>
+        </ScrollArea>
       ) : (
         <p className="p-3 py-6 text-muted">
           {hot ? (

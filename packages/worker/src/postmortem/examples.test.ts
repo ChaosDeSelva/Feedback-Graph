@@ -99,3 +99,16 @@ describe('renderExamples', () => {
     expect(text).toContain('1. ');
   });
 });
+
+describe('renderExamples: the byte budget and long path lists', () => {
+  const long = (c: string) => c.repeat(300);
+  const many = Array.from({ length: 7 }, (_, i) => `src/area${i}/file.ts`);
+  test('more than five paths are cut with a count; an example past the budget is left out, and a smaller one after it still fits', () => {
+    const big = { outcome: 'edited' as const, score: null, lesson: lesson({ title: long('t'), rule: long('r'), appliesWhen: long('a'), paths: many, proposedAs: { ...writer, title: long('T'), rule: long('R'), appliesWhen: long('A'), paths: many } }) };
+    const small = { outcome: 'as_written' as const, score: null, lesson: lesson({ rule: 'Keep cents as integers', paths: many }) };
+    const out = renderExamples([big, big, small]);
+    expect(Buffer.byteLength(out)).toBeLessThanOrEqual(EXAMPLES_BYTES);
+    expect(out.match(/The writer proposed/g)).toHaveLength(1);
+    expect(out).toContain('2. Approved as written: "Keep cents as integers" (src/area0/file.ts, src/area1/file.ts, src/area2/file.ts, src/area3/file.ts, src/area4/file.ts (+2 more))');
+  });
+});

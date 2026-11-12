@@ -1,12 +1,14 @@
+import { asIs, labelOf } from './labels.ts';
 import { useEffect, useRef, useState, type ReactNode } from 'react';
-import { api, integrationsApi, type Connection, type ConnectionName, type IntegrationKind, type IntegrationsView, type LinearTeam, type ProjectIntegrations, type ServiceView } from './api.ts';
+import { useOwnerWrites } from './ownerAccess.tsx';
+import { api, integrationsApi, type Connection, type ConnectionName, type IntegrationKind, type IntegrationsView, type LinearTeam, type ProjectIntegrations, type ServiceView, errorMessage } from './api.ts';
 import { hashFocus } from './links.ts';
-import { Button, Input, Select } from './ui/controls.tsx';
+import { Button, Input, Select, useFocusHandoff } from './ui/controls.tsx';
 import { Alert, Badge, Card, EmptyState, plural, Skeleton, tdClass, thClass, Time, type Tone } from './ui/display.tsx';
 import { ConfirmDialog } from './ui/ConfirmDialog.tsx';
 import { FolderIcon } from './ui/icons.tsx';
+import { ScrollArea } from './ui/ScrollArea.tsx';
 
-const message = (e: unknown) => (e instanceof Error ? e.message : String(e));
 
 const NAME: Record<IntegrationKind, string> = { github: 'GitHub', linear: 'Linear' };
 export const CONNECTION_LABEL: Record<ConnectionName, string> = { github: 'GitHub', linear: 'Linear', claude: 'Claude', codex: 'Codex', ollama: 'Ollama', cloud: 'Cloud sync' };
@@ -42,15 +44,10 @@ const HELP: Record<IntegrationKind, ReactNode> = {
 export function Integrations() {
   const [view, setView] = useState<IntegrationsView | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [loaded, setLoaded] = useState(false);
   const scrolled = useRef(false);
+  const retryHandoff = useFocusHandoff();
 
-  const load = () =>
-    integrationsApi.get().then(
-      // An API from before integrations answers with something else: show nothing rather than a broken section.
-      (v) => { setView(v && typeof v === 'object' && 'github' in v && 'projects' in v ? v : null); setLoaded(true); },
-      (e) => { setError(message(e)); setLoaded(true); },
-    );
+  const load = () => integrationsApi.get().then(setView, (e) => setError(errorMessage(e)));
   useEffect(() => { load(); }, []);
 
   // A link from the connections list (#settings/integrations-github) lands on its card.
@@ -63,7 +60,6 @@ export function Integrations() {
     }
   }, [view]);
 
-  if (loaded && !view && !error) return null;
   return (
     <section aria-labelledby="settings-integrations" id="settings-integrations-section" className="grid gap-2.5">
       <div>
@@ -73,7 +69,8 @@ export function Integrations() {
           pushback in a session. Only selected projects are read. Tokens stay on this machine and are sent only to GitHub or Linear.
         </p>
       </div>
-      {error && <Alert>{error}{!view && <Button size="sm" className="ml-3" onClick={() => { setError(null); load(); }}>Try again</Button>}</Alert>}
+      {/* Only the first load can fail here; each card reports its own changes. */}
+      {error && <Alert>{error}<Button ref={retryHandoff} size="sm" className="ml-3" onClick={() => { setError(null); load(); }}>Try again</Button></Alert>}
       {!view && !error && <div className="grid gap-3 md:grid-cols-2"><Skeleton className="h-48" /><Skeleton className="h-48" /></div>}
       {view && (
         <>
@@ -117,14 +114,14 @@ function ServiceCard({ kind, view, onChange }: { kind: IntegrationKind; view: In
     try {
       await f();
     } catch (e) {
-      setError(message(e));
+      setError(errorMessage(e));
     } finally {
       setBusy(null);
     }
   }
   const connect = (e: React.FormEvent) => {
     e.preventDefault();
-    if (!token.trim()) return;
+    // Connect is disabled while the field is empty, which also stops Enter from submitting.
     void run('connect', async () => {
       const v = await integrationsApi.connect(kind, token.trim());
       setToken('');
@@ -152,7 +149,7 @@ function ServiceCard({ kind, view, onChange }: { kind: IntegrationKind; view: In
       actions={
         <>
           <SourceBadge s={s} />
-          <Badge tone={stateTone(c.state)} dot>{STATE_LABEL[c.state]}</Badge>
+          <Badge tone={stateTone(c.state)} dot>{labelOf(STATE_LABEL, c.state, asIs)}</Badge>
         </>
       }
       bodyClass="grid gap-3 p-4"
@@ -217,7 +214,7 @@ function ServiceCard({ kind, view, onChange }: { kind: IntegrationKind; view: In
               onChange={(e) => setToken(e.target.value)}
               className="min-w-0 flex-1 font-mono"
             />
-            <Button type="submit" variant="primary" disabled={!token.trim() || busy !== null}>{busy === 'connect' ? 'Checking' : rejected || replacing ? 'Replace token' : 'Connect'}</Button>
+            <Button type="submit" variant="primary" owner disabled={!token.trim() || busy !== null}>{busy === 'connect' ? 'Checking' : rejected || replacing ? 'Replace token' : 'Connect'}</Button>
             {replacing && <Button onClick={() => { setReplacing(false); setToken(''); }}>Cancel</Button>}
           </div>
           <p className="text-[11px] text-muted">
@@ -231,7 +228,7 @@ function ServiceCard({ kind, view, onChange }: { kind: IntegrationKind; view: In
         <div className="flex flex-wrap gap-2">
           <Button size="sm" onClick={test} disabled={busy !== null}>{busy === 'test' ? 'Testing' : 'Test connection'}</Button>
           {view.canSave && !replacing && !rejected && <Button size="sm" onClick={() => setReplacing(true)} disabled={busy !== null}>Replace token</Button>}
-          {s.savedInApp && <Button size="sm" variant="danger-outline" onClick={() => setConfirming(true)} disabled={busy !== null}>Disconnect</Button>}
+          {s.savedInApp && <Button size="sm" variant="danger-outline" owner onClick={() => setConfirming(true)} disabled={busy !== null}>Disconnect</Button>}
         </div>
       )}
 
@@ -272,6 +269,7 @@ function syncCell(x: { lastSyncAt: string | null; items: number; error: string |
 
 /** Each selected project: the repository its remote names (or GITHUB_REPOS), on or off, and its Linear team. */
 function ProjectLinks({ view, onChange }: { view: IntegrationsView; onChange: (v: IntegrationsView) => void }) {
+  const writes = useOwnerWrites();
   const [teams, setTeams] = useState<LinearTeam[] | null>(null);
   const [teamsError, setTeamsError] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -281,7 +279,7 @@ function ProjectLinks({ view, onChange }: { view: IntegrationsView; onChange: (v
 
   useEffect(() => {
     if (!linearOn) { setTeams(null); return; }
-    integrationsApi.linearTeams().then((t) => { setTeams(t); setTeamsError(null); }, (e) => setTeamsError(message(e)));
+    integrationsApi.linearTeams().then((t) => { setTeams(t); setTeamsError(null); }, (e) => setTeamsError(errorMessage(e)));
   }, [linearOn, view.linear.account]);
 
   async function save(p: ProjectIntegrations, patch: Parameters<typeof integrationsApi.setProject>[1]) {
@@ -290,7 +288,7 @@ function ProjectLinks({ view, onChange }: { view: IntegrationsView; onChange: (v
     try {
       onChange(await integrationsApi.setProject(p.key, patch));
     } catch (e) {
-      setError(message(e));
+      setError(errorMessage(e));
     } finally {
       setSaving(null);
     }
@@ -305,7 +303,7 @@ function ProjectLinks({ view, onChange }: { view: IntegrationsView; onChange: (v
           Select project folders above; each one with a GitHub remote is linked to its repository automatically.
         </EmptyState>
       ) : (
-        <div className="overflow-x-auto">
+        <ScrollArea className="overflow-x-auto">
           <table className="w-full border-separate border-spacing-0 text-left">
             <thead>
               <tr>
@@ -328,7 +326,7 @@ function ProjectLinks({ view, onChange }: { view: IntegrationsView; onChange: (v
                           type="checkbox"
                           aria-label={`read pull request comments of ${p.key}`}
                           checked={p.github.enabled}
-                          disabled={saving === p.key}
+                          disabled={saving === p.key || !writes}
                           onChange={(e) => save(p, { github: e.target.checked })}
                         />
                         <span className="font-mono text-[12px]">{p.github.repo}</span>
@@ -338,7 +336,7 @@ function ProjectLinks({ view, onChange }: { view: IntegrationsView; onChange: (v
                       <span className="text-muted">no github.com remote</span>
                     )}
                   </td>
-                  <td className={tdClass}><Input key={`${p.key}:${p.github.author ?? ""}`} aria-label={`PR author of ${p.key}`} placeholder="All authors" defaultValue={p.github.author ?? ""} disabled={saving === p.key} onBlur={(e) => { const author = e.target.value.trim() || null; if (author !== (p.github.author ?? null)) void save(p, { githubAuthor: author }); }} /></td>
+                  <td className={tdClass}><Input key={`${p.key}:${p.github.author ?? ""}`} aria-label={`PR author of ${p.key}`} placeholder="All authors" defaultValue={p.github.author ?? ""} disabled={saving === p.key || !writes} onBlur={(e) => { const author = e.target.value.trim() || null; if (author !== (p.github.author ?? null)) void save(p, { githubAuthor: author }); }} /></td>
                   <td className={`${tdClass} text-xs`}>{p.github.repo && githubOn ? syncCell(p.github, p.github.enabled) : <span className="text-muted">-</span>}</td>
                   <td className={tdClass}>
                     {linearOn ? (
@@ -346,7 +344,7 @@ function ProjectLinks({ view, onChange }: { view: IntegrationsView; onChange: (v
                         size="sm"
                         aria-label={`Linear team of ${p.key}`}
                         value={p.linear.teamId ?? ''}
-                        disabled={saving === p.key || !teams}
+                        disabled={saving === p.key || !teams || !writes}
                         onChange={(e) => {
                           const t = teams?.find((x) => x.id === e.target.value);
                           void save(p, { linearTeamId: t?.id ?? null, linearTeamName: t?.name ?? null });
@@ -366,7 +364,7 @@ function ProjectLinks({ view, onChange }: { view: IntegrationsView; onChange: (v
               ))}
             </tbody>
           </table>
-        </div>
+        </ScrollArea>
       )}
     </Card>
   );
@@ -389,7 +387,7 @@ function AllConnections() {
       {(Object.keys(CONNECTION_LABEL) as ConnectionName[]).filter((n) => conns[n]).map((n) => (
         <div key={n} className="flex flex-wrap items-start gap-x-3 gap-y-1 px-3 py-2">
           <span className="w-24 shrink-0 font-medium">{CONNECTION_LABEL[n]}</span>
-          <Badge tone={stateTone(conns[n].state)} dot>{STATE_LABEL[conns[n].state]}</Badge>
+          <Badge tone={stateTone(conns[n].state)} dot>{labelOf(STATE_LABEL, conns[n].state, asIs)}</Badge>
           <span className="min-w-0 flex-1 text-xs text-muted [overflow-wrap:anywhere]">
             {conns[n].detail} {HOW[n]}
           </span>

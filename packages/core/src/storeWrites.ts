@@ -1,5 +1,5 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
-import type { GraphStore, KnowledgeStore, FactsStore, DocsStore, LinksStore, ActivityStore, InsightsStore, PortabilityStore, EmbeddingsStore, SelectionStore, CodeGraphStore, SessionsStore, ChatStore, RunsStore, Store } from './store.ts';
+import type { GraphStore, KnowledgeStore, FactsStore, DocsStore, LinksStore, ActivityStore, InsightsStore, PortabilityStore, EmbeddingsStore, SelectionStore, CodeGraphStore, SessionsStore, ChatStore, RunsStore, DecisionsStore, Store } from './store.ts';
 import type { RunOwner, RunPrincipal } from './types.ts';
 
 type Mode = 'read' | 'write' | 'internal';
@@ -40,6 +40,9 @@ export const STORE_WRITE_POLICY = {
     workSessions: 'read',
     heartbeat: 'write',
     workerStatus: 'read',
+    // Bookkeeping like the heartbeat: made while an agent's read-only tool call runs, so never a run's or the caller's write.
+    markAgentSeen: 'internal',
+    agentSeen: 'read',
     stats: 'read',
   } satisfies Policy<GraphStore>,
   knowledge: {
@@ -55,10 +58,15 @@ export const STORE_WRITE_POLICY = {
     listLessons: 'read',
     lessonDetail: 'read',
     updateLesson: 'write',
+    writeLessonSnapshots: 'write',
+    addLoopLesson: 'write',
+    removeLoopLesson: 'write',
     decidedLessons: 'read',
     backfillProposedAs: 'write',
     setLessonChecks: 'write',
     setLessonPaths: 'write',
+    setLessonTriggers: 'write',
+    lessonsWithoutTriggers: 'read',
     staleLessonChecks: 'read',
     commentLessons: 'read',
     clearMachineOwnerMarks: 'write',
@@ -66,6 +74,7 @@ export const STORE_WRITE_POLICY = {
     similarLessons: 'read',
     searchLessons: 'read',
     relatedMisses: 'read',
+    missesNaming: 'read',
     createManualFeedback: 'write',
     recordPreDoneCheck: 'write',
     upsertLesson: 'write',
@@ -88,6 +97,8 @@ export const STORE_WRITE_POLICY = {
     scanRequests: 'read',
     clearScanRequests: 'write',
     addOwnerFact: 'write',
+    fact: 'read',
+    writeFactSnapshots: 'write',
     currentSources: 'read',
     listFacts: 'read',
     searchFacts: 'read',
@@ -105,6 +116,8 @@ export const STORE_WRITE_POLICY = {
     requeueStaleScans: 'write',
     listProjects: 'read',
     setPinned: 'write',
+    projectThresholds: 'read',
+    setProjectThresholds: 'write',
     redactStoredFacts: 'write',
     reopenInstructionFacts: 'write',
     redactionRepairCandidates: 'read',
@@ -140,6 +153,7 @@ export const STORE_WRITE_POLICY = {
   } satisfies Policy<LinksStore>,
   activity: {
     record: 'write',
+    since: 'read',
     list: 'read',
     get: 'read',
     removeRun: 'write',
@@ -175,7 +189,7 @@ export const STORE_WRITE_POLICY = {
   } satisfies Policy<SelectionStore>,
   codegraph: {
     replaceCodeMap: 'write',
-    recordCodeMapFailure: 'internal',
+    markCodeMapChecked: 'internal', recordCodeMapFailure: 'internal',
     requestCodeMapRebuild: 'internal',
     dropCodeMap: 'write',
     purgeOrphanCodeFiles: 'write',
@@ -190,7 +204,6 @@ export const STORE_WRITE_POLICY = {
     hotspots: 'read',
     mapGraph: 'read',
     lessonsForPaths: 'read',
-    outsideMap: 'read',
   } satisfies Policy<CodeGraphStore>,
   sessions: {
     claimRun: 'internal',
@@ -231,6 +244,34 @@ export const STORE_WRITE_POLICY = {
     claim: 'write',
     owner: 'read',
   } satisfies Policy<RunsStore>,
+  decisions: {
+    propose: 'write',
+    get: 'read',
+    list: 'read',
+    count: 'read',
+    forTarget: 'read',
+    loopChanged: 'read',
+    markApplying: 'write',
+    markApplied: 'write',
+    markStatus: 'write',
+    ratify: 'write',
+    markLabelled: 'write',
+    addNote: 'write',
+    notes: 'read',
+    dependents: 'read',
+    inFlight: 'read',
+    signals: 'read',
+    signalsOf: 'read',
+    listSignals: 'read',
+    upsertSignals: 'write',
+    calibration: 'read',
+    bumpCalibration: 'write',
+    linkMisses: 'write',
+    unlinkMisses: 'write',
+    missLinks: 'read',
+    loopMisses: 'read',
+    redactStoredDecisions: 'write',
+  } satisfies Policy<DecisionsStore>,
   store: {
     ensureSchema: 'write',
     ping: 'read',
@@ -280,7 +321,7 @@ export function guardStoreMethods<T extends object>(value: T, policy: object): T
 
 export function guardStore(store: Store): Store {
   const out = guardStoreMethods(store, STORE_WRITE_POLICY.store);
-  const groups = ['graph', 'knowledge', 'facts', 'docs', 'links', 'activity', 'insights', 'portability', 'embeddings', 'selection', 'codegraph', 'sessions', 'chats', 'runs'] as const;
+  const groups = ['graph', 'knowledge', 'facts', 'docs', 'links', 'activity', 'insights', 'portability', 'embeddings', 'selection', 'codegraph', 'sessions', 'chats', 'runs', 'decisions'] as const;
   const parts = Object.fromEntries(groups.filter(key => store[key] && typeof store[key] === 'object').map(key => [key, guardStoreMethods(store[key], STORE_WRITE_POLICY[key === 'chats' ? 'chat' : key])]));
   return new Proxy(out, { get(target, key) { return key in parts ? parts[key as string] : Reflect.get(target, key); } });
 }

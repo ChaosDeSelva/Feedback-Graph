@@ -37,13 +37,13 @@ test('scoped map deletion requires owner authorization and never deletes the pro
 
 test('cleanup previews removal of decisions and uploads that belong entirely to removed run records', async () => {
   const entries = ['feedback_decided', 'doc_added'].map((kind, i) => ({ id: `a${i}`, kind, actor: 'agent', projectKey: 'demo', ts: 't', subject: 's', why: 'w', details: { via: 'api' }, targets: [i ? 'doc:d' : 'f'], run: 'r' })) as Activity[];
-  const result = await planCleanup('r', { store: { items: async () => [{ kind: 'feedback', id: 'f', projectKey: 'demo', sandbox: true, merged: false, group: null }, { kind: 'doc', id: 'doc:d', projectKey: 'demo', sandbox: true, merged: false, group: null }], remove: async () => ({}) as never, owner: async () => ({ run: 'r', principal: 'agent', actor: null, firstSeen: 't' }) }, activity: { record: async () => {}, list: async query => query.target ? [] : entries } });
+  const result = await planCleanup('r', { store: { sandbox: async () => false, items: async () => [{ kind: 'feedback', id: 'f', projectKey: 'demo', sandbox: true, merged: false, group: null }, { kind: 'doc', id: 'doc:d', projectKey: 'demo', sandbox: true, merged: false, group: null }], remove: async () => ({}) as never, owner: async () => ({ run: 'r', principal: 'agent', actor: null, firstSeen: 't' }) }, activity: { removeRun: async () => 0, record: async () => {}, list: async query => query.target ? [] : entries } });
   expect(result.plan.entries).toBe(2);
 });
 
 const literal: Lesson = { id: 'l', projectKey: 'demo', title: 'No console', rule: 'Do not call console.log in src/a.ts.', appliesWhen: 'editing code', paths: ['src/a.ts'], scope: 'project', status: 'approved', source: 'manual', cause: null, missId: null, createdAt: 't', decidedAt: 't' };
 function context(over: Partial<ContextDeps> = {}): ContextDeps { return { roots: [{ host: '/projects', container: '/projects' }], exists: () => true,
-  embed: async () => [[1]], k: { searchLessons: async () => [{ lesson: literal, score: .9 }], relatedMisses: async () => [], recordPreDoneCheck: async () => {}, createManualFeedback: async () => 'f' },
+  embed: async () => [[1]], k: { searchLessons: async () => [{ lesson: literal, score: .9 }], missesNaming: async () => [], relatedMisses: async () => [], recordPreDoneCheck: async () => {}, createManualFeedback: async () => 'f' },
   judge: async () => { throw new Error('a literal violation must not ask a model'); }, ...over }; }
 
 test('a literal violation bypasses an occupied model queue and reports direct provenance', async () => {
@@ -59,14 +59,14 @@ test('a literal violation bypasses an occupied model queue and reports direct pr
 test('an explicit issue task does not judge unrelated pathless misses', async () => {
   const judged: string[][] = [];
   const misses = [
-    { missId: 'other', missed: 'END-14105 used the wrong cache', feedbackText: '', cause: 'requirement_unstated' as const, sessionId: 's', ts: 't', score: .9 },
-    { missId: 'same', missed: 'END-9697 forgot to validate the payload', feedbackText: '', cause: 'requirement_unstated' as const, sessionId: 's', ts: 't', score: .85 },
+    { missId: 'other', missed: 'APP-14105 used the wrong cache', feedbackText: '', cause: 'requirement_unstated' as const, sessionId: 's', ts: 't', score: .9 },
+    { missId: 'same', missed: 'APP-9697 forgot to validate the payload', feedbackText: '', cause: 'requirement_unstated' as const, sessionId: 's', ts: 't', score: .85 },
   ];
   const d = context({
-    k: { ...context().k, searchLessons: async () => [], relatedMisses: async () => misses },
+    k: { ...context().k, searchLessons: async () => [], relatedMisses: async () => misses, missesNaming: async ({ keys }) => misses.filter(m => keys.some(key => m.missed.includes(key))) },
     judge: async (_work, lessons) => { judged.push(lessons.map(hit => hit.lesson.id)); return lessons.map(hit => ({ lessonId: hit.lesson.id, status: 'not_applicable' as const, why: 'unrelated' })); },
   });
-  await checkBeforeDone({ project: 'demo', task: 'Finish END-9697', summary: 'implemented it' }, d);
+  await checkBeforeDone({ project: 'demo', task: 'Finish APP-9697', summary: 'implemented it' }, d);
   expect(judged).toEqual([['same']]);
 });
 

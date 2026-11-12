@@ -94,7 +94,7 @@ function folderOfCwd(cwd: string, roots: Root[]): { key: string; rel: string; ro
   return { key: p.key, rel: p.name, root };
 }
 
-const shown = (root: Root) => trim(root.host || root.container);
+const shown = (root: Root) => trim(root.host);
 
 /**
  * Every project folder under the roots (top-level folders, and the git repos nested in folders that are not repos,

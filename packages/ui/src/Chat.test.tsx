@@ -1,5 +1,5 @@
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
-import { afterEach, beforeEach, expect, test, vi } from 'vitest';
+import { afterEach, beforeEach, expect, onTestFinished, test, vi } from 'vitest';
 import { Chat } from './Chat.tsx';
 import type { ChatConversation, ChatThread, ChatTurn } from '@fb/core/chat';
 
@@ -48,7 +48,7 @@ beforeEach(() => {
     if (url.startsWith('/api/chats?') || url === '/api/chats') {
       if (method === 'POST') {
         const c = conv('c2', { projectKey: body.project, provider: body.provider ?? null, title: body.title ?? '' });
-        convs = [c, ...convs];
+        convs = [c, ...convs.filter((x) => x.id !== c.id)];
         threads.c2 = { ...c, turns: [] };
         return Response.json(c, { status: 201 });
       }
@@ -137,9 +137,25 @@ test('the agent prompt is copied with its Copy button', async () => {
   render(<Chat />);
   const card = await screen.findByRole('region', { name: 'Prompt for your agent' });
   expect(card.textContent).toContain('Goal: add a confirm modal.');
-  await act(async () => { fireEvent.click(within(card).getByRole('button', { name: 'Copy' })); });
+  // The click's write is awaited inside act (the button awaited it first, so it has said Copied by then): no polling
+  // for a label that turns back after 2 seconds, which a slow run could miss.
+  await act(async () => {
+    fireEvent.click(within(card).getByRole('button', { name: 'Copy' }));
+    await writeText.mock.results[0]!.value;
+  });
   expect(writeText).toHaveBeenCalledWith('Goal: add a confirm modal.\nRead first: src/ui/Modal.tsx');
   expect(within(card).getByRole('button', { name: 'Copied' })).toBeTruthy();
+});
+
+test('a prompt longer than its box can be reached and scrolled by keyboard', async () => {
+  const { overflowAll, unreachableScrollers } = await import('./ui/scrollReach.ts');
+  onTestFinished(overflowAll());
+  location.hash = '#ask/c1';
+  const { container } = render(<Chat />);
+  const card = await screen.findByRole('region', { name: 'Prompt for your agent' });
+  const prompt = card.querySelector('pre')!;
+  await waitFor(() => expect(prompt.tabIndex).toBe(0));
+  expect(unreachableScrollers(container).map((e) => e.outerHTML.slice(0, 80))).toEqual([]);
 });
 
 test('New chat: picks a project and a provider, sends with Cmd+Enter, then polls only while the answer is pending', async () => {
@@ -157,7 +173,9 @@ test('New chat: picks a project and a provider, sends with Cmd+Enter, then polls
   await waitFor(() => expect(calls.find((c) => c.url.endsWith('/messages'))?.body).toEqual({ text: 'where would feature X go?' }));
   expect(calls.find((c) => c.method === 'POST' && c.url === '/api/chats')?.body).toEqual({ project: 'blog', provider: 'codex', title: 'where would feature X go?' });
   const answering = (await screen.findByText(/Answering with Codex/)).closest('[role="status"]')!;
-  expect(answering.textContent).toMatch(/Answering with Codex… 0:2\d/);
+  // The clock is shown beside the live region, not in it: it ticks every second and would be read out each time.
+  expect(answering.textContent).toBe('Answering with Codex…');
+  expect(answering.parentElement!.textContent).toMatch(/Answering with Codex… 0:2\d/);
   expect(location.hash).toBe('#ask/c2');
 
   c2Next = (t) => ({ ...t, pending: false, turns: [...answered('c2', 'where would feature X go?').slice(0, 1).map((u) => ({ ...u, id: 'c2-u0' })), { ...answered('c2', '')[1], id: 'c2-a0', provider: 'codex-cli' }] });
@@ -311,4 +329,365 @@ test('#ask/new?…&provider=codex starts the conversation on the model the Dashb
   location.hash = `#ask/new?project=shop&q=hi&provider=nope`;
   render(<Chat />);
   await waitFor(() => expect(calls.filter((c) => c.method === 'POST' && c.url === '/api/chats').map((c) => c.body)).toEqual([{ project: 'shop', title: 'hi' }]));
+});
+
+/** Answers matching requests with a server error instead of the fake's own answer. */
+function failing(match: (url: string, method: string) => boolean, error = 'the store is down') {
+  const inner = fetch as unknown as (url: string, init?: RequestInit) => Promise<Response>;
+  vi.stubGlobal('fetch', vi.fn(async (url: string, init?: RequestInit) => {
+    if (match(url, init?.method ?? 'GET')) { calls.push({ url, method: init?.method ?? 'GET' }); return Response.json({ error }, { status: 500 }); }
+    return inner(url, init);
+  }));
+}
+
+test('a new conversation that cannot be created says why and keeps the question to send again', async () => {
+  failing((url, method) => url === '/api/chats' && method === 'POST');
+  render(<Chat />);
+  await screen.findByText('Add a modal');
+  fireEvent.click(screen.getByRole('button', { name: 'New chat' }));
+  const box = screen.getByRole('textbox', { name: 'question' });
+  fireEvent.change(box, { target: { value: 'where would feature X go?' } });
+  fireEvent.keyDown(box, { key: 'Enter', metaKey: true });
+  expect(await screen.findByText('the store is down')).toBeTruthy();
+  expect((screen.getByRole('textbox', { name: 'question' }) as HTMLTextAreaElement).value).toBe('where would feature X go?');
+  expect(screen.getByRole('form', { name: 'new chat' })).toBeTruthy();
+  expect(location.hash).not.toBe('#ask/c2');
+});
+
+test('a follow-up that fails says why, and the question stays in the box', async () => {
+  failing((url) => url === '/api/chats/c1/messages');
+  location.hash = '#ask/c1';
+  render(<Chat />);
+  await screen.findByText('2 modals');
+  const box = screen.getByRole('textbox', { name: 'question' });
+  fireEvent.change(box, { target: { value: 'and the cart page?' } });
+  fireEvent.keyDown(box, { key: 'Enter', metaKey: true });
+  expect(await screen.findByText('the store is down')).toBeTruthy();
+  expect((box as HTMLTextAreaElement).value).toBe('and the cart page?');
+});
+
+test('a Retry the server refuses says why and leaves the failed answer in place', async () => {
+  threads.c1 = { ...threads.c1, turns: [threads.c1.turns[0], { ...threads.c1.turns[1], status: 'failed', answer: null, error: 'claude-cli: not signed in' }] };
+  failing((url) => url.includes('/retry'), 'retry refused');
+  location.hash = '#ask/c1';
+  render(<Chat />);
+  fireEvent.click(await screen.findByRole('button', { name: 'Retry' }));
+  expect(await screen.findByText('retry refused')).toBeTruthy();
+  expect(screen.getByText(/not signed in/)).toBeTruthy();
+});
+
+test('changing a conversation\'s model saves it, names the new model on the next answer, and a refused change says why', async () => {
+  location.hash = '#ask/c1';
+  render(<Chat />);
+  await screen.findByText('2 modals');
+  fireEvent.change(screen.getByLabelText('provider'), { target: { value: 'local' } });
+  await waitFor(() => expect(calls.find((c) => c.method === 'PATCH')?.body).toEqual({ provider: 'local' }));
+  await waitFor(() => expect((screen.getByLabelText('provider') as HTMLSelectElement).value).toBe('local'));
+  const box = screen.getByRole('textbox', { name: 'question' });
+  fireEvent.change(box, { target: { value: 'and the cart page?' } });
+  fireEvent.keyDown(box, { key: 'Enter', metaKey: true });
+  expect(await screen.findByText(/Answering with the local model/)).toBeTruthy();
+  failing((_, method) => method === 'PATCH', 'cannot change the model');
+  fireEvent.change(screen.getByLabelText('provider'), { target: { value: '' } });
+  expect(await screen.findByText('cannot change the model')).toBeTruthy();
+});
+
+test('an answer by a provider the page does not know is named by its id', async () => {
+  threads.c1 = { ...threads.c1, pending: true, provider: null, turns: [threads.c1.turns[0], { ...threads.c1.turns[1], status: 'answering', answer: null, provider: 'openai:gpt-5' }] };
+  location.hash = '#ask/c1';
+  render(<Chat />);
+  expect(await screen.findByText(/Answering with openai:gpt-5/)).toBeTruthy();
+});
+
+test('a delete the server refuses says why and keeps the conversation', async () => {
+  failing((_, method) => method === 'DELETE', 'delete refused');
+  location.hash = '#ask/c1';
+  render(<Chat />);
+  await screen.findByText('2 modals');
+  fireEvent.click(screen.getByRole('button', { name: 'delete conversation' }));
+  fireEvent.click(within(await screen.findByRole('alertdialog')).getByRole('button', { name: 'Delete conversation' }));
+  expect(await screen.findByText('delete refused')).toBeTruthy();
+  expect(screen.getByText('2 modals')).toBeTruthy();
+  expect(location.hash).toBe('#ask/c1');
+});
+
+test('following a link to another conversation while the page is open switches to it', async () => {
+  convs = [conv('c1'), conv('c3', { title: 'Paginate members' })];
+  threads.c3 = { ...conv('c3', { title: 'Paginate members' }), turns: answered('c3', 'how do I paginate members?') };
+  location.hash = '#ask/c1';
+  render(<Chat />);
+  await screen.findByText('I want to add a modal', { selector: 'p, div' });
+  await act(async () => { location.hash = '#ask/c3'; window.dispatchEvent(new HashChangeEvent('hashchange')); });
+  expect(await screen.findByText('how do I paginate members?', { selector: 'p, div' })).toBeTruthy();
+  expect(screen.queryByText('I want to add a modal', { selector: 'p, div' })).toBeNull();
+});
+
+test('with no project selected the list points to Settings instead of offering conversations', async () => {
+  const inner = fetch as unknown as (url: string, init?: RequestInit) => Promise<Response>;
+  vi.stubGlobal('fetch', vi.fn(async (url: string, init?: RequestInit) => (url === '/api/projects' ? Response.json([]) : inner(url, init))));
+  render(<Chat />);
+  expect(await screen.findByText('No projects selected')).toBeTruthy();
+  expect(screen.getByRole('link', { name: 'Open Settings' }).getAttribute('href')).toBe('#settings');
+});
+
+test('a source with no page of its own is listed by title without a link', async () => {
+  threads.c1.turns[1] = { ...threads.c1.turns[1], sources: [{ id: 'S1', kind: 'note' as never, ref: 'n1', title: 'a loose note' }] };
+  location.hash = '#ask/c1';
+  render(<Chat />);
+  await screen.findByText('2 modals');
+  const sources = screen.getByText(/Sources \(1\)/).closest('details')!;
+  expect(within(sources).getByText('a loose note').tagName).toBe('SPAN');
+  expect(within(sources).queryByRole('link')).toBeNull();
+});
+
+/** A promise and the function that settles it, for an answer a test releases when it chooses. */
+function deferred<T>() {
+  let resolve!: (v: T) => void;
+  const promise = new Promise<T>((r) => { resolve = r; });
+  return { promise, resolve };
+}
+
+/** Holds back the answers to requests matching `match` until the test releases them. */
+function holding(match: (url: string, method: string) => boolean) {
+  const inner = fetch as unknown as (url: string, init?: RequestInit) => Promise<Response>;
+  const held: { release: () => void }[] = [];
+  vi.stubGlobal('fetch', vi.fn(async (url: string, init?: RequestInit) => {
+    if (!match(url, init?.method ?? 'GET')) return inner(url, init);
+    const d = deferred<void>();
+    held.push({ release: () => d.resolve() });
+    await d.promise;
+    return inner(url, init);
+  }));
+  return { release: async () => { await act(async () => { for (const h of held.splice(0)) h.release(); }); } };
+}
+
+test('conversations last written at the same moment keep a stable order, and an untitled one reads "New chat"', async () => {
+  convs = [conv('c3', { title: '' }), conv('c1')];
+  threads.c3 = { ...conv('c3', { title: '' }), turns: answered('c3', 'hello') };
+  location.hash = '#ask/c3';
+  render(<Chat />);
+  const list = await screen.findByRole('region', { name: 'conversations list' });
+  await waitFor(() => expect(within(list).getAllByRole('listitem').map((li) => li.textContent?.split('shop')[0])).toEqual(['New chat', 'Add a modal']));
+  expect(await screen.findByRole('heading', { name: 'New chat' })).toBeTruthy();
+  fireEvent.click(screen.getByRole('button', { name: 'delete conversation' }));
+  expect(await screen.findByRole('alertdialog', { name: 'Delete the conversation "New chat"?' })).toBeTruthy();
+});
+
+test('with no conversations yet nothing is opened', async () => {
+  convs = [];
+  render(<Chat />);
+  expect(await screen.findByText('No conversations yet')).toBeTruthy();
+  expect(screen.getByText('Pick one on the left, or start a New chat.')).toBeTruthy();
+  expect(calls.some((c) => c.url.startsWith('/api/chats/'))).toBe(false);
+});
+
+test('a list that answers after the filter changed is dropped for the newer one', async () => {
+  const lists = holding((url) => url === '/api/chats');
+  render(<Chat />);
+  await screen.findByRole('option', { name: 'blog' });
+  fireEvent.change(screen.getByLabelText('project'), { target: { value: 'blog' } });
+  expect(await screen.findByText('No conversations yet')).toBeTruthy();
+  await lists.release();
+  expect(screen.queryByText('Add a modal')).toBeNull();
+});
+
+test('a link with no project says so; one with no question opens a new chat on that project and model', async () => {
+  location.hash = '#ask/new?q=hi';
+  render(<Chat />);
+  expect((await screen.findAllByText('That link names no project to ask about.')).length).toBeGreaterThan(0);
+  expect(location.hash).toBe('#ask');
+  cleanup();
+  location.hash = '#ask/new?project=blog&provider=codex';
+  render(<Chat />);
+  const form = await screen.findByRole('form', { name: 'new chat' });
+  await waitFor(() => expect((within(form).getByLabelText('chat project') as HTMLSelectElement).value).toBe('blog'));
+  expect((within(form).getByLabelText('chat provider') as HTMLSelectElement).value).toBe('codex');
+  fireEvent.change(within(form).getByLabelText('chat provider'), { target: { value: '' } });
+  expect((within(form).getByLabelText('chat provider') as HTMLSelectElement).value).toBe('');
+  cleanup();
+  location.hash = '#ask/new?project=blog';
+  render(<Chat />);
+  expect((within(await screen.findByRole('form', { name: 'new chat' })).getByLabelText('chat provider') as HTMLSelectElement).value).toBe('');
+  expect(calls.some((c) => c.method === 'POST')).toBe(false);
+});
+
+test('a new-chat link followed while the page is open starts that conversation', async () => {
+  render(<Chat />);
+  await screen.findByText('Add a modal');
+  await act(async () => { location.hash = `#ask/new?project=blog&q=${encodeURIComponent('any routes?')}`; window.dispatchEvent(new HashChangeEvent('hashchange')); });
+  await waitFor(() => expect(calls.filter((c) => c.method === 'POST' && c.url === '/api/chats').map((c) => c.body)).toEqual([{ project: 'blog', title: 'any routes?' }]));
+});
+
+test('Ctrl+Enter sends too; an empty question, or one while the last is still sending, sends nothing', async () => {
+  const sends = holding((url, method) => method === 'POST' && url.endsWith('/messages'));
+  location.hash = '#ask/c1';
+  render(<Chat />);
+  await screen.findByText('2 modals');
+  const box = screen.getByRole('textbox', { name: 'question' });
+  fireEvent.keyDown(box, { key: 'Enter', ctrlKey: true });
+  fireEvent.change(box, { target: { value: 'and the tests?' } });
+  fireEvent.keyDown(box, { key: 'Enter' });
+  expect(calls.filter((c) => c.url.endsWith('/messages'))).toEqual([]);
+  fireEvent.keyDown(box, { key: 'Enter', ctrlKey: true });
+  await waitFor(() => expect(screen.getByRole('button', { name: 'Sending…' })).toBeTruthy());
+  fireEvent.keyDown(box, { key: 'Enter', ctrlKey: true });
+  await sends.release();
+  await waitFor(() => expect(calls.filter((c) => c.url.endsWith('/messages')).map((c) => c.body)).toEqual([{ text: 'and the tests?' }]));
+});
+
+test('a poll that answers after another conversation was opened leaves the open one alone', async () => {
+  vi.useFakeTimers({ shouldAdvanceTime: true });
+  threads.c1 = { ...threads.c1, pending: true, turns: [threads.c1.turns[0], { ...threads.c1.turns[1], status: 'pending', answer: null }] };
+  convs = [conv('c1'), conv('c3', { title: 'Paginate members' })];
+  threads.c3 = { ...conv('c3', { title: 'Paginate members' }), turns: answered('c3', 'how do I paginate members?') };
+  location.hash = '#ask/c1';
+  render(<Chat />);
+  await screen.findByText(/Answering with Claude/);
+  const polls = holding((url) => url === '/api/chats/c1');
+  await act(async () => { await vi.advanceTimersByTimeAsync(2100); });
+  fireEvent.click(screen.getByText('Paginate members'));
+  expect(await screen.findByText('how do I paginate members?', { selector: 'p, div' })).toBeTruthy();
+  threads.c1 = { ...threads.c1, pending: false, turns: answered('c1', 'I want to add a modal') };
+  await polls.release();
+  expect(screen.getByText('how do I paginate members?', { selector: 'p, div' })).toBeTruthy();
+  expect(screen.queryByText('I want to add a modal', { selector: 'p, div' })).toBeNull();
+});
+
+test('a failed poll that comes back after another conversation was opened neither retries nor reports', async () => {
+  vi.useFakeTimers({ shouldAdvanceTime: true });
+  threads.c1 = { ...threads.c1, pending: true, turns: [threads.c1.turns[0], { ...threads.c1.turns[1], status: 'pending', answer: null }] };
+  convs = [conv('c1'), conv('c3', { title: 'Paginate members' })];
+  threads.c3 = { ...conv('c3', { title: 'Paginate members' }), turns: answered('c3', 'how do I paginate members?') };
+  location.hash = '#ask/c1';
+  render(<Chat />);
+  await screen.findByText(/Answering with Claude/);
+  const polls = holding((url) => url === '/api/chats/c1');
+  await act(async () => { await vi.advanceTimersByTimeAsync(2100); });
+  fireEvent.click(screen.getByText('Paginate members'));
+  await screen.findByText('how do I paginate members?', { selector: 'p, div' });
+  delete threads.c1;
+  await polls.release();
+  const tries = gets('c1');
+  await act(async () => { await vi.advanceTimersByTimeAsync(10_000); });
+  expect(gets('c1')).toBe(tries);
+  expect(screen.queryByText(/stopped checking/i)).toBeNull();
+});
+
+test('a model change that lands after another conversation was opened, or before the list loaded, changes only its own conversation', async () => {
+  convs = [conv('c1'), conv('c3', { title: 'Paginate members' })];
+  threads.c3 = { ...conv('c3', { title: 'Paginate members' }), turns: answered('c3', 'how do I paginate members?') };
+  const lists = holding((url) => url === '/api/chats');
+  // The list is held back too, so the change lands before the page has one.
+  const patches = holding((_, method) => method === 'PATCH');
+  location.hash = '#ask/c1';
+  render(<Chat />);
+  await screen.findByText('2 modals');
+  fireEvent.change(screen.getByLabelText('provider'), { target: { value: 'codex' } });
+  await act(async () => { location.hash = '#ask/c3'; window.dispatchEvent(new HashChangeEvent('hashchange')); });
+  await screen.findByText('how do I paginate members?', { selector: 'p, div' });
+  await patches.release();
+  expect((screen.getByLabelText('provider') as HTMLSelectElement).value).toBe('claude');
+  await lists.release();
+  const list = screen.getByRole('region', { name: 'conversations list' });
+  expect(await within(list).findByText('Paginate members')).toBeTruthy();
+  fireEvent.change(screen.getByLabelText('provider'), { target: { value: 'local' } });
+  await patches.release();
+  await waitFor(() => expect((screen.getByLabelText('provider') as HTMLSelectElement).value).toBe('local'));
+  expect(within(list).getByText('Add a modal')).toBeTruthy();
+});
+
+test('a conversation deleted before the list loaded is gone once it does', async () => {
+  const lists = holding((url) => url === '/api/chats');
+  location.hash = '#ask/c1';
+  render(<Chat />);
+  await screen.findByText('2 modals');
+  fireEvent.click(screen.getByRole('button', { name: 'delete conversation' }));
+  fireEvent.click(within(await screen.findByRole('alertdialog')).getByRole('button', { name: 'Delete conversation' }));
+  await waitFor(() => expect(calls.some((c) => c.method === 'DELETE')).toBe(true));
+  await lists.release();
+  expect(await screen.findByText('No conversations yet')).toBeTruthy();
+});
+
+test('one question ahead says so in the singular; a failure with no reason says it is unknown', async () => {
+  threads.c1 = { ...threads.c1, pending: true, turns: [threads.c1.turns[0], { ...threads.c1.turns[1], status: 'pending', answer: null, provider: null, queueAhead: 1 }] };
+  location.hash = '#ask/c1';
+  render(<Chat />);
+  expect(await screen.findByText(/1 question ahead of this one/)).toBeTruthy();
+  cleanup();
+  threads.c1 = { ...threads.c1, pending: false, turns: [threads.c1.turns[0], { ...threads.c1.turns[1], status: 'failed', answer: null, provider: null }] };
+  render(<Chat />);
+  expect(await screen.findByText('Claude could not answer: unknown error')).toBeTruthy();
+});
+
+test('an answer with no model or pack named shows no byline; an example without lines and a web document are linked as they are', async () => {
+  const a = threads.c1.turns[1];
+  threads.c1.turns[1] = {
+    ...a, provider: null, pack: null,
+    answer: { ...a.answer!, answer: 'See [S1] and [S7].', examples: [{ path: 'src/ui/Modal.tsx', lines: null as never, why: 'the base modal', usages: [] }] },
+    sources: [{ id: 'S1', kind: 'doc', ref: 'https://docs.example.com/modals', title: 'Modal guide' }],
+  };
+  location.hash = '#ask/c1';
+  render(<Chat />);
+  await screen.findByText(/See/);
+  expect(screen.queryByText(/answered by|context pack/)).toBeNull();
+  expect(within(screen.getByRole('list', { name: 'examples' })).getByRole('link').textContent).toBe('src/ui/Modal.tsx');
+  const doc = within(screen.getByText(/Sources \(1\)/).closest('details')!).getByRole('link', { name: 'Modal guide' });
+  expect(doc.getAttribute('href')).toBe('https://docs.example.com/modals');
+  expect(doc.getAttribute('target')).toBe('_blank');
+  // A citation the answer has no source for stays plain text.
+  expect(screen.getByText(/and \[S7\]\./)).toBeTruthy();
+  expect(screen.queryByRole('link', { name: 'S7' })).toBeNull();
+});
+
+test('a source of a kind this release does not know is listed with its kind as stored, in a neutral badge', async () => {
+  threads.c1.turns[1] = { ...threads.c1.turns[1], sources: [{ id: 'S1', kind: 'video' as never, ref: 'clip.mp4', title: 'A recorded demo' }] };
+  location.hash = '#ask/c1';
+  render(<Chat />);
+  await screen.findByText('2 modals');
+  const sources = screen.getByText(/Sources \(1\)/).closest('details')!;
+  expect(within(sources).getByText('A recorded demo')).toBeTruthy();
+  expect(within(sources).getByText('video')).toBeTruthy();
+});
+
+test('a keyboard Retry of a failed answer leaves focus in the page, not on its body', async () => {
+  threads.c1 = { ...threads.c1, turns: [threads.c1.turns[0], { ...threads.c1.turns[1], status: 'failed', answer: null, error: 'claude-cli: not signed in' }] };
+  location.hash = '#ask/c1';
+  render(<main tabIndex={-1}><Chat /></main>);
+  (await screen.findByRole('button', { name: 'Retry' })).focus();
+  const { default: userEvent } = await import('@testing-library/user-event');
+  await userEvent.keyboard('{Enter}');
+  expect(await screen.findByText(/Answering with Claude/)).toBeTruthy();
+  expect(document.activeElement).toBe(screen.getByRole('main'));
+});
+
+test('Retry and delete say what they are doing while their request is in flight, and take no second press', async () => {
+  threads.c1 = { ...threads.c1, turns: [threads.c1.turns[0], { ...threads.c1.turns[1], status: 'failed', answer: null, error: 'claude-cli: not signed in' }] };
+  location.hash = '#ask/c1';
+  const inner = fetch as unknown as (url: string, init?: RequestInit) => Promise<Response>;
+  let release = () => {};
+  const gate = new Promise<void>((r) => { release = r; });
+  vi.stubGlobal('fetch', vi.fn(async (url: string, init?: RequestInit) => { if (init?.method === 'POST' || init?.method === 'DELETE') await gate; return inner(url, init); }));
+  render(<Chat />);
+  fireEvent.click(await screen.findByRole('button', { name: 'Retry' }));
+  const retrying = await screen.findByRole('button', { name: 'Retrying…' });
+  expect(screen.getByRole('button', { name: 'delete conversation' }).getAttribute('aria-disabled')).toBe('true');
+  fireEvent.click(retrying);
+  release();
+  expect(await screen.findByText(/Answering with Claude/)).toBeTruthy();
+  expect(calls.filter((c) => c.url === '/api/chats/c1/turns/c1-a/retry')).toHaveLength(1);
+});
+
+test('deleting a conversation says so on its button while the request is in flight', async () => {
+  location.hash = '#ask/c1';
+  const inner = fetch as unknown as (url: string, init?: RequestInit) => Promise<Response>;
+  let release = () => {};
+  const gate = new Promise<void>((r) => { release = r; });
+  vi.stubGlobal('fetch', vi.fn(async (url: string, init?: RequestInit) => { if (init?.method === 'DELETE') await gate; return inner(url, init); }));
+  render(<Chat />);
+  fireEvent.click(await screen.findByRole('button', { name: 'delete conversation' }));
+  fireEvent.click(within(await screen.findByRole('alertdialog')).getByRole('button', { name: 'Delete conversation' }));
+  const deleting = await screen.findByRole('button', { name: 'deleting conversation' });
+  expect(deleting.getAttribute('aria-disabled')).toBe('true');
+  release();
+  await waitFor(() => expect(location.hash).toBe('#ask'));
 });

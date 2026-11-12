@@ -57,10 +57,7 @@ const IssueNode = z.object({
     .optional(),
 });
 
-const Envelope = z.object({
-  data: z.object({ searchIssues: z.object({ nodes: z.array(IssueNode) }) }).nullable().optional(),
-  errors: z.array(z.object({ message: z.string() })).optional(),
-});
+const SearchData = z.object({ searchIssues: z.object({ nodes: z.array(IssueNode) }) });
 
 const GqlError = z.object({ message: z.string(), extensions: z.object({ code: z.string().optional(), type: z.string().optional() }).passthrough().optional() });
 
@@ -96,10 +93,8 @@ async function linearRequest(apiKey: string, query: string, variables: Record<st
 
 /** Full-text search over Linear issues. `apiKey` is a personal key, sent raw (no Bearer). */
 export async function searchLinearIssues(o: SearchLinearOpts): Promise<LinearIssue[]> {
-  const data = await linearRequest(o.apiKey, SEARCH, { term: o.query, first: o.first ?? 10 }, o.fetchImpl ?? fetch);
-  const body = Envelope.parse({ data });
-  if (!body.data) throw new Error('linear graphql: response had no data');
-  return body.data.searchIssues.nodes.map((n) => ({
+  const data = SearchData.parse(await linearRequest(o.apiKey, SEARCH, { term: o.query, first: o.first ?? 10 }, o.fetchImpl ?? fetch));
+  return data.searchIssues.nodes.map((n) => ({
     identifier: n.identifier,
     title: n.title,
     description: n.description ?? '',
@@ -108,9 +103,7 @@ export async function searchLinearIssues(o: SearchLinearOpts): Promise<LinearIss
     team: n.team?.key ?? '',
     teamId: n.team?.id ?? '',
     updatedAt: n.updatedAt,
-    comments: (n.comments?.nodes ?? [])
-      .filter((c) => c.body && c.body.trim() !== '')
-      .map((c) => ({ author: c.user?.name ?? 'unknown', body: c.body ?? '' })),
+    comments: (n.comments?.nodes ?? []).flatMap((c) => (c.body?.trim() ? [{ author: c.user?.name ?? 'unknown', body: c.body }] : [])),
   }));
 }
 

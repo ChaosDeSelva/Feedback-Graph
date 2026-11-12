@@ -1,6 +1,6 @@
 import type { Hono } from 'hono';
 import { z } from 'zod';
-import { RUN_ID, RUN_ITEM_KINDS, runRemoval, type Activity, type ActivityKind, type ActivityStore, type Lesson, type ProjectLink, type RunItem, type RunItemKind, type RunOwner, type RunPrincipal, type RunsStore } from '@fb/core';
+import { RUN_ID, RUN_ITEM_KINDS, runRemoval, storedLabel, type Activity, type ActivityKind, type ActivityStore, type Lesson, type ProjectLink, type RunItem, type RunItemKind, type RunOwner, type RunPrincipal, type RunsStore } from '@fb/core';
 import type { ContextDeps } from './context.ts';
 import { actingAsOperator, asActor, currentCaller, currentActor, currentRun } from './operator.ts';
 
@@ -49,6 +49,7 @@ export function runScoped(d: ContextDeps): ContextDeps {
     k: {
       searchLessons: (q) => k.searchLessons(asked(q)),
       relatedMisses: (q) => k.relatedMisses(asked(q)),
+      missesNaming: (q) => k.missesNaming(asked(q)),
       recordPreDoneCheck: (c) => k.recordPreDoneCheck(written(c)),
       createManualFeedback: (i) => k.createManualFeedback(written(i)),
       ...(k.listLessons && { listLessons: async (f) => (await k.listLessons!(asked(f))).filter(visible) }),
@@ -81,7 +82,6 @@ export function runScoped(d: ContextDeps): ContextDeps {
           },
         }),
         ...(codegraph.codeMapMeta && { codeMapMeta: codegraph.codeMapMeta.bind(codegraph) }),
-        ...(codegraph.outsideMap && { outsideMap: codegraph.outsideMap.bind(codegraph) }),
         // The agent's own session's edited files: which facts are its own change.
         ...(codegraph.sessionFiles && { sessionFiles: codegraph.sessionFiles.bind(codegraph) }),
       },
@@ -94,8 +94,24 @@ export function runScoped(d: ContextDeps): ContextDeps {
 export const RUN_OPENERS: Record<RunPrincipal, string> = {
   operator: 'the operator token', owner_token: "the owner's API token", browser: 'the browser', agent: 'an API agent',
 };
-/** The same, naming the operator when the run recorded one. */
-export const openerOf = (o: RunOwner): string => (o.principal === 'operator' && o.actor?.startsWith('run-key:') ? 'the operator token with a private run key' : o.principal === 'operator' && o.actor ? `the operator token as ${o.actor}` : RUN_OPENERS[o.principal]);
+/** The same, naming the operator when the run recorded one; a principal another release stored is named as stored. */
+export const openerOf = (o: RunOwner): string => (o.principal === 'operator' && o.actor?.startsWith('run-key:') ? 'the operator token with a private run key' : o.principal === 'operator' && o.actor ? `the operator token as ${o.actor}` : storedLabel(RUN_OPENERS, o.principal, (p) => `the ${p} credential`));
+
+/** The credential behind each principal, as the caller configured it. */
+const SENT: Record<RunPrincipal, string> = { operator: 'FG_OPERATOR_TOKEN', owner_token: 'FG_OWNER_TOKEN', browser: 'a browser sign-in', agent: 'API_TOKEN' };
+
+/**
+ * The 409 for a write under a run another caller opened: what this request sent and what to change, never the opener's
+ * run key or operator name beyond openerOf.
+ */
+export function runConflict(runId: string, o: RunOwner, principal: RunPrincipal): string {
+  const step = principal === o.principal
+    ? 'this request sent a different FG_RUN_KEY: use the FG_RUN_KEY that opened it'
+    : principal === 'operator' && o.principal === 'agent'
+      ? 'this request sent FG_OPERATOR_TOKEN, which takes precedence over API_TOKEN: clear FG_OPERATOR_TOKEN to act with API_TOKEN and the same FG_RUN_KEY'
+      : `this request sent ${SENT[principal]}, not the credential that opened it: use that credential and the same FG_RUN_KEY`;
+  return `run id belongs to another caller: ${runId} was opened by ${openerOf(o)} at ${o.firstSeen}; ${step}, or choose another run id only for a genuinely separate run`;
+}
 
 /**
  * Whether a request holds the credential that opened the run. Legacy operator display names cannot authenticate it.
@@ -115,7 +131,7 @@ const ownRequestEntry = (a: Activity, owner: RunOwner | null): boolean => {
   const via = owner?.principal === 'operator' ? 'operator' : owner?.principal === 'browser' ? 'browser' : owner ? 'api' : null;
   return via !== null && a.details?.via === via;
 };
-/** How many of a run's Activity entries a plan reads at most. */
+/** The page size a plan reads a run's Activity entries in (it reads every page). */
 const RUN_ENTRIES = 500;
 
 export type CleanupPlan = {
@@ -131,12 +147,10 @@ export type CleanupPlan = {
   changed: { kind: ActivityKind; subject: string; targets: string[]; ts: string }[];
   /** Its Activity entries: a real cleanup removes them (all but its own run_cleaned entry, which is not the run's). */
   entries: number;
-  /** More than a plan reads (RUN_ENTRIES): `entries` is that many, and `changed` lists only what is in them. */
-  entriesCapped: boolean;
 };
 
 /** activity: as createApp wraps it (asActor), so the cleanup is logged as whoever asked for it. */
-export type RunsDeps = { store: Pick<RunsStore, 'items' | 'remove' | 'owner' | 'sandbox'>; activity: Pick<ActivityStore, 'record' | 'list'> & Partial<Pick<ActivityStore, 'removeRun'>> };
+export type RunsDeps = { store: Pick<RunsStore, 'items' | 'remove' | 'owner' | 'sandbox'>; activity: Pick<ActivityStore, 'record' | 'list' | 'removeRun'> };
 
 /** What cleaning up `run` would do (see CleanupPlan), and the ids it keeps. */
 export async function planCleanup(run: string, d: RunsDeps): Promise<{ plan: Omit<CleanupPlan, 'dryRun'>; keep: string[]; keptIds: string[]; entries: Activity[]; items: RunItem[] }> {
@@ -187,9 +201,9 @@ export async function planCleanup(run: string, d: RunsDeps): Promise<{ plan: Omi
   const order = (k: RunItemKind) => RUN_ITEM_KINDS.indexOf(k);
   return {
     plan: {
-      run, sandbox: (await d.store.sandbox?.(run)) === true || items.some((i) => i.sandbox) || entries.some(a => a.sandbox), remove,
+      run, sandbox: (await d.store.sandbox(run)) || items.some((i) => i.sandbox) || entries.some(a => a.sandbox), remove,
       kept: [...kept.values()].sort((a, b) => order(a.kind) - order(b.kind) || (a.id < b.id ? -1 : 1)),
-      changed, entries: previewEntries.length, entriesCapped: false,
+      changed, entries: previewEntries.length,
     },
     keep,
     keptIds,
@@ -240,11 +254,14 @@ export function runRoutes(app: Hono, d: RunsDeps) {
     // Who opened the run (RunsStore.claim), not what its Activity says: a run opened with the API token, by an agent or
     // in the browser is the owner's to clean up, and so is one opened before owners were recorded (none stored).
     const owner = await d.store.owner(run.data);
-    if (!actingAsOperator() && currentCaller() && (owner?.principal !== 'agent' || owner.actor !== currentCaller())) {
+    // No owner and nothing to remove: a run already cleaned up (cleanup releases the owner) or never opened. Saying
+    // "nothing to remove" tells a caller no more than an unused run id would; a run someone owns, or legacy records
+    // without an owner, stay refused.
+    const empty = !owner && !Object.values(plan.remove).some(Boolean) && !plan.kept.length && !plan.entries;
+    if (!actingAsOperator() && currentCaller() && !empty && (owner?.principal !== 'agent' || owner.actor !== currentCaller())) {
       return c.json({ error: `run ${run.data} belongs to another caller; use the same FG_RUN_KEY that opened it, or the authenticated owner UI` }, 403);
     }
     if (actingAsOperator()) {
-      const empty = !owner && !Object.values(plan.remove).some(Boolean) && !plan.kept.length && !plan.entries;
       if (!operatorMayClean(owner) && !empty) {
         const by = owner ? `was opened by ${openerOf(owner)}` : 'was opened before run owners were recorded';
         const who = owner?.principal === 'operator' && owner.actor
@@ -254,22 +271,23 @@ export function runRoutes(app: Hono, d: RunsDeps) {
       }
     }
     if (body.data.dryRun !== false) return c.json({ ...plan, dryRun: true });
+    // Nothing to remove, and no run_cleaned entry for a cleanup that did nothing (a re-run would log one each time).
+    if (empty) return c.json({ ...plan, dryRun: false, removed: plan.remove, entriesRemoved: 0 });
     const removed = await d.store.remove(run.data, keep);
     // The run's own entries go too (a stress run's thousands would fill the log); what it changed outside its own
     // records is kept in the run_cleaned entry below, which is not the run's.
     // A decision the run made on a record it does not own stays in that record's history (TOUCHES): a cleanup never
     // erases the trace of a change it cannot undo.
-    // Only the entries the plan read, so every change removed is one listed below (a run with more than RUN_ENTRIES keeps
-    // the rest for the next cleanup); and never an entry about a record that stays (the one that created it included).
+    // Only the entries the plan read, so every change removed is one listed below; and never an entry about a record that
+    // stays (the one that created it included).
     const removedIds = new Set(items.filter(item => !keep.includes(item.id) && !keptIds.includes(item.id) && !item.merged).map(item => item.id));
     const removableEntries = entries.filter(a => ownRequestEntry(a, owner) && (!TOUCHES.has(a.kind) || (a.targets.length > 0 && a.targets.every(id => removedIds.has(id)))));
-    const entriesRemoved = activity.removeRun ? await activity.removeRun(run.data, [], { ids: removableEntries.map(a => a.id), targets: keptIds }) : 0;
+    const entriesRemoved = await activity.removeRun(run.data, [], { ids: removableEntries.map(a => a.id), targets: keptIds });
     await activity.record({
       // Not tagged with a run (null, not the asking request's): the entry is about the run, not made in it.
       kind: 'run_cleaned', actor: 'you', projectKey: null, run: null,
       subject: `cleaned up run ${run.data}: removed ${summary(removed)}${plan.kept.length ? `; kept ${plural(plan.kept.length, 'record')}` : ''}${entriesRemoved ? `; ${plural(entriesRemoved, 'Activity entry', 'Activity entries')}` : ''}`,
-      why: `you asked for it (fg cleanup): only what the run wrote is removed, and not what anyone outside the run touched since; ${activity.removeRun ? 'its Activity entries go too, except its decisions on records it does not own, which stay on those records, and the entries about records that stay (this entry lists what the run changed outside its own records)' : 'its Activity entries stay'}`
-        + (activity.removeRun && plan.entriesCapped ? `; the run has more Activity entries than one cleanup reads (${RUN_ENTRIES}): those not read stay, with what they changed; clean up again to list and remove them` : ''),
+      why: `you asked for it (fg cleanup): only what the run wrote is removed, and not what anyone outside the run touched since; its Activity entries go too, except its decisions on records it does not own, which stay on those records, and the entries about records that stay (this entry lists what the run changed outside its own records)`,
       details: {
         run: run.data, removed, kept: plan.kept.length, keptItems: plan.kept, changed: plan.changed.length, changedItems: plan.changed,
         entriesRemoved, openedBy: owner?.principal ?? null,

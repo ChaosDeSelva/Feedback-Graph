@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { CODE_MAP_VERSION, type ActivityInput, type CodeMapMeta, type CodeMapWrite, type StoredCodeMap } from '@fb/core';
 import { afterEach, expect, test } from 'vitest';
 import { worktreeGitArgs } from '../ingest/git.ts';
-import { fileFingerprint, gitStatusTimeoutMs, MapStage, repoFingerprint, type MapStageDeps } from './stage.ts';
+import { fileFingerprint, gitStatusTimeoutMs, MAP_STALL_MS, MapStage, repoFingerprint, type MapStageDeps } from './stage.ts';
 import type { BuildOpts, CodeMap } from './types.ts';
 
 const dirs: string[] = [];
@@ -99,17 +99,19 @@ function fakes(over: Partial<MapStageDeps> = {}) {
   const logs: string[] = [];
   let clock = 1_000_000;
   let fp: string | null = 'fp1';
+  const checked: string[] = [];
   const deps: MapStageDeps = {
     store: {
-      codeMapMeta: async (): Promise<CodeMapMeta | null> => stored && { fingerprint: stored.fingerprint, builtAt: stored.builtAt, stats: stored.stats, candidates: stored.write.candidates ?? null, unresolved: stored.write.unresolved ?? null, version: stored.write.version ?? null },
+      codeMapMeta: async (): Promise<CodeMapMeta | null> => stored && { fingerprint: stored.fingerprint, builtAt: stored.builtAt, checkedAt: stored.builtAt, stats: stored.stats, candidates: stored.write.candidates ?? null, unresolved: stored.write.unresolved ?? null, version: stored.write.version ?? null },
       codeMap: async () => stored,
       replaceCodeMap: async (_key, w) => {
         writes.push(w);
         const stats = { files: w.files.length, symbols: w.symbols.length, imports: w.imports.length, tests: w.tests.length };
-        stored = { fingerprint: w.fingerprint, builtAt: 't', stats, candidates: w.candidates ?? null, files: w.files, outside: w.outside ?? [], symbols: w.symbols, imports: w.imports, write: w };
+        stored = { fingerprint: w.fingerprint, builtAt: 't', checkedAt: 't', stats, candidates: w.candidates ?? null, files: w.files, outside: w.outside ?? [], symbols: w.symbols, imports: w.imports, write: w };
         return stats;
       },
       recordCodeMapFailure: async (key, error) => { failures.push({ key, error }); },
+      markCodeMapChecked: async (key) => { checked.push(key); },
     },
     activity: { record: async (a) => { activity.push(a); } },
     projects: async () => [{ key: 'demo', repoPath: '/vibe/demo' }],
@@ -124,7 +126,7 @@ function fakes(over: Partial<MapStageDeps> = {}) {
     ...over,
   };
   return {
-    deps, writes, builds, activity, logs, failures,
+    deps, writes, builds, activity, logs, failures, checked,
     tick: (ms: number) => { clock += ms; },
     setFingerprint: (v: string | null) => { fp = v; },
   };
@@ -153,12 +155,12 @@ test('a capped map says so: candidates are stored and logged, and files sessions
   const logged: [string, object | undefined][] = [];
   const f = fakes({
     build: async (_repo, o) => { opts.push(o); return { ...map, candidates: 10_290 }; },
-    editedPaths: async (key) => (key === 'demo' ? ['src/webapp/page.tsx'] : []),
+    editedPaths: async (key) => (key === 'demo' ? ['src/portal/page.tsx'] : []),
     maxFiles: null,
     log: (m, e) => logged.push([m, e]),
   });
   await new MapStage(f.deps).pass();
-  expect(opts[0]).toMatchObject({ maxFiles: null, priority: ['src/webapp/page.tsx'] });
+  expect(opts[0]).toMatchObject({ maxFiles: null, priority: ['src/portal/page.tsx'] });
   expect(f.writes[0].candidates).toBe(10_290);
   expect(logged).toContainEqual(['code map capped', { project: 'demo', mapped: 2, totalCandidates: 10_290 }]);
   expect(f.activity[0].subject).toBe('code map built: 2 of 10290 files (capped), 1 symbol, 1 import edge, 1 test link');
@@ -181,6 +183,7 @@ test('an unchanged repo is not rebuilt; a changed one is, incrementally, but not
   f.tick(120_000);
   await stage.pass();
   expect(f.builds).toHaveLength(1); // same fingerprint
+  expect(f.checked).toEqual(['demo']); // but checked: an unchanged map is current, not stale
   f.setFingerprint('fp2');
   await stage.pass();
   expect(f.builds).toHaveLength(1); // checked less than a minute ago
@@ -503,4 +506,143 @@ test('stop() during the write waits for it to finish, so the store is never clos
   await stop;
   expect(f.writes).toHaveLength(1);
   expect(f.activity.map((a) => a.kind)).toEqual(['code_mapped']);
+});
+
+test('test links cover files past the cap too, and the build is given the source files\' own size limit', async () => {
+  const opts: BuildOpts[] = [];
+  const capped: CodeMap = {
+    ...map,
+    outside: [{ path: 'src/jobs/sync.go', lang: 'go', hash: 'h3', loc: 3, isTest: false }, { path: 'src/jobs/sync_test.go', lang: 'go', hash: 'h4', loc: 3, isTest: true }],
+  };
+  const f = fakes({ build: async (_repo, o) => { opts.push(o); return capped; }, sourceMaxBytes: 1_000_000 });
+  await new MapStage(f.deps).pass();
+  // A file an agent names may be past the cap: its own tests are linked as a mapped file's are.
+  expect(f.writes[0].tests).toEqual([{ test: 'test/db.test.ts', target: 'src/db.ts' }, { test: 'src/jobs/sync_test.go', target: 'src/jobs/sync.go' }]);
+  expect(opts[0]).toMatchObject({ maxBytes: 1000, sourceMaxBytes: 1_000_000 });
+});
+
+test('repoFingerprint: a git status that fails without timing out gives no fingerprint, and says why', async () => {
+  const logged: [string, object | undefined][] = [];
+  const exec = async (args: string[]) => {
+    if (args.includes('--show-toplevel')) return '/repo\n';
+    // execFile rejects with an Error; anything else is logged as itself
+    if (args.includes('status')) throw 'fatal: not a git repository';
+    return 'abc\n';
+  };
+  expect(await repoFingerprint('/repo', 100, { exec, log: (m, e) => logged.push([m, e]) })).toBeNull();
+  expect(logged).toEqual([['git status failed', { repoPath: '/repo', error: 'fatal: not a git repository' }]]);
+});
+
+test('repoFingerprint: a rename is one dirty file, so the file after it is still within maxFiles', async () => {
+  const dir = tmp();
+  writeFileSync(join(dir, 'new.ts'), 'x');
+  writeFileSync(join(dir, 'a.ts'), 'a');
+  const exec = async (args: string[]) => {
+    if (args.includes('--show-toplevel')) return `${dir}\n`;
+    if (args.includes('status')) return 'R  new.ts\0old.ts\0 M a.ts\0';
+    return 'abc\n';
+  };
+  const before = await repoFingerprint(dir, 2, { exec });
+  writeFileSync(join(dir, 'a.ts'), 'a longer edit');
+  expect(await repoFingerprint(dir, 2, { exec })).not.toBe(before);
+});
+
+test('fileFingerprint counts a tracked file deleted from the folder as gone', async () => {
+  const dir = tmp();
+  git(dir, 'init', '-q');
+  writeFileSync(join(dir, 'a.ts'), 'export const a = 1;\n');
+  writeFileSync(join(dir, 'b.ts'), 'export const b = 1;\n');
+  git(dir, 'add', '.');
+  git(dir, 'commit', '-qm', 'a');
+  const before = await fileFingerprint(dir);
+  rmSync(join(dir, 'b.ts'));
+  const gone = await fileFingerprint(dir);
+  expect(gone).not.toBe(before);
+  expect(await fileFingerprint(dir)).toBe(gone);
+});
+
+test('with only its store and projects, the stage fingerprints, reads churn and builds for real, on the default interval', async () => {
+  const dir = tmp(); // not a git repo: the file fingerprint stands in
+  writeFileSync(join(dir, 'a.ts'), 'export const a = 1;\n');
+  const f = fakes();
+  const purged: number[] = [];
+  const { build: _b, churn: _c, fingerprint: _f, now: _n, minIntervalMs: _m, ...rest } = f.deps;
+  const stage = new MapStage({
+    ...rest,
+    store: { ...f.deps.store, purgeOrphanCodeFiles: async (limit) => { purged.push(limit); return 0; } },
+    projects: async () => [{ key: 'demo', repoPath: dir }],
+  });
+  stage.kick();
+  stage.kick(); // one pass at a time
+  await stage.idle();
+  expect(f.writes.map((w) => [w.files.map((x) => x.path), w.fingerprint?.startsWith('fs:'), w.churn])).toEqual([[['a.ts'], true, {}]]);
+  // Within the default interval: neither looked at again nor purged again.
+  writeFileSync(join(dir, 'b.ts'), 'export const b = 1;\n');
+  await stage.pass();
+  expect(f.writes).toHaveLength(1);
+  expect(purged).toHaveLength(1);
+});
+
+test('without a stall limit set, a busy pass is left alone for MAP_STALL_MS', async () => {
+  let release!: () => void;
+  const gate = new Promise<void>((r) => { release = r; });
+  const f = fakes({ build: async () => { await gate; return map; } });
+  const stage = new MapStage(f.deps);
+  stage.kick();
+  await new Promise((r) => setTimeout(r, 5));
+  f.tick(MAP_STALL_MS - 1);
+  stage.kick();
+  expect(f.logs).not.toContain('code map stage stalled');
+  release();
+  await stage.idle();
+  expect(f.writes).toHaveLength(1);
+});
+
+test('a scan that asks for a map while one is being built for the same project waits for it, then finds nothing changed', async () => {
+  let release!: () => void;
+  const gate = new Promise<void>((r) => { release = r; });
+  const f = fakes({ build: async () => { await gate; return map; } });
+  const stage = new MapStage(f.deps);
+  const p = { key: 'demo', repoPath: '/vibe/demo' };
+  const first = stage.mapProject(p, 'a scan was requested');
+  const second = stage.mapProject(p, 'a scan was requested');
+  release();
+  expect((await first)?.files).toBe(2);
+  expect(await second).toBeNull();
+  expect(f.writes).toHaveLength(1);
+  expect(f.checked).toEqual(['demo']);
+});
+
+test('stop() waits for a scan\'s map in flight; a map parsed by then is not written, and the pass stops before the next project', async () => {
+  const gates: (() => void)[] = [];
+  const entered: string[] = [];
+  const f = fakes({
+    projects: async () => [{ key: 'one', repoPath: '/vibe/one' }, { key: 'two', repoPath: '/vibe/two' }],
+    // A parse that does not watch the signal: it finishes after stop() was called.
+    build: async (repo) => { entered.push(repo); await new Promise<void>((r) => gates.push(r)); return map; },
+  });
+  const stage = new MapStage(f.deps);
+  const scan = stage.mapProject({ key: 'scanned', repoPath: '/vibe/scanned' }, 'a scan was requested');
+  stage.kick();
+  while (gates.length < 2) await new Promise((r) => setTimeout(r, 1));
+  let stopped = false;
+  const stop = stage.stop().then(() => { stopped = true; });
+  gates[1](); // the pass's first project
+  await new Promise((r) => setTimeout(r, 10));
+  expect(stopped).toBe(false); // the scan's build is still running
+  gates[0]();
+  await stop;
+  expect(await scan).toBeNull();
+  expect(entered.sort()).toEqual(['/vibe/one', '/vibe/scanned']);
+  expect(f.writes).toEqual([]);
+  expect(f.logs.filter((m) => m === 'code map skipped')).toHaveLength(2);
+});
+
+test('an orphan purge that fails is logged and the pass still ends', async () => {
+  const logged: [string, object | undefined][] = [];
+  const f = fakes({ log: (m, e) => logged.push([m, e]) });
+  f.deps.store.purgeOrphanCodeFiles = async () => { throw new Error('deadlock detected'); };
+  await new MapStage(f.deps).pass();
+  expect(logged).toContainEqual(['orphan code file purge failed', { error: 'Error: deadlock detected' }]);
+  expect(f.writes).toHaveLength(1);
 });

@@ -64,11 +64,11 @@ describe.skipIf(!testStores().includes('postgres'))('Postgres migrations', () =>
     const columns = Object.fromEntries(rows.map((r) => [r.table_name, r.columns as string[]]));
     expect(Object.keys(columns).sort()).toEqual([
       'activity', 'candidates', 'causes', 'chat_conversations', 'chat_turns', 'chunks', 'code_files', 'code_imports', 'code_maps', 'code_symbols', 'code_tests', 'commit_feedback', 'commits', 'context_item_misses',
-      'context_item_sessions', 'context_items', 'doc_blobs', 'docs', 'facts', 'feedback', 'graph_config', 'lesson_supersedes', 'lessons',
-      'misses', 'predone_check_lessons', 'predone_checks', 'project_candidates', 'project_links', 'project_selection', 'projects', 'read_resets', 'run_owners',
+      'context_item_sessions', 'context_items', 'decision_deps', 'decision_notes', 'decision_targets', 'decisions', 'doc_blobs', 'docs', 'facts', 'feedback', 'graph_config', 'lesson_signals', 'lesson_supersedes', 'lessons',
+      'loop_calibration', 'miss_links', 'misses', 'predone_check_lessons', 'predone_checks', 'project_candidates', 'project_links', 'project_selection', 'projects', 'read_resets', 'run_owners',
       'scan_jobs', 'schema_migrations', 'session_commits', 'session_files', 'session_run_tags', 'session_summary_updates', 'sessions', 'sync_cursors', 'tasks', 'turns', 'worker_status',
     ]);
-    for (const t of ['sessions', 'turns', 'candidates', 'feedback', 'tasks', 'misses', 'lessons', 'context_items', 'predone_checks', 'code_files', 'facts', 'scan_jobs', 'docs', 'chunks', 'activity', 'code_symbols', 'code_imports', 'code_tests', 'code_maps', 'session_files', 'session_summary_updates', 'chat_conversations', 'chat_turns']) {
+    for (const t of ['sessions', 'turns', 'candidates', 'feedback', 'tasks', 'misses', 'lessons', 'context_items', 'predone_checks', 'code_files', 'facts', 'scan_jobs', 'docs', 'chunks', 'activity', 'code_symbols', 'code_imports', 'code_tests', 'code_maps', 'session_files', 'session_summary_updates', 'chat_conversations', 'chat_turns', 'decisions']) {
       expect(columns[t], t).toContain('project_key');
     }
   });
@@ -94,6 +94,65 @@ describe.skipIf(!testStores().includes('postgres'))('Postgres migrations', () =>
       { id: 's1', turn_count: 2, last_turn_idx: 1, last_turn_ts_text: '2026-10-01T10:05:00+00:00', last_activity_at: new Date('2026-10-01T10:30:00Z'), summary_version: 0 },
       { id: 's2', turn_count: 1, last_turn_idx: 0, last_turn_ts_text: '2026-10-02T09:00:00Z', last_activity_at: new Date('2026-10-02T09:00:00Z'), summary_version: 0 },
     ]);
+  });
+
+  test('a 0.7.5 database (through 0051) upgrades to 0.8.0: 0052 to 0059 in order, its data kept, the loop\'s columns usable', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'fb-migrations-'));
+    const all = await migrationIds();
+    const upTo075 = all.slice(0, all.indexOf('0051_codemap_failures.sql') + 1);
+    for (const f of upTo075) writeFileSync(join(dir, f), readFileSync(new URL(f, MIGRATIONS), 'utf8'));
+    const p = pool();
+    await migrate(p, { dir });
+    await p.query(`INSERT INTO projects (key) VALUES ('demo')`);
+    await p.query(`INSERT INTO lessons (id, project_key, title, rule, applies_when, scope, status, source, created_at)
+                   VALUES ('lesson:1', 'demo', 't', 'r', 'a', 'project', 'approved', 'postmortem', now())`);
+    for (const f of all.slice(upTo075.length)) writeFileSync(join(dir, f), readFileSync(new URL(f, MIGRATIONS), 'utf8'));
+    expect(await migrate(p, { dir })).toEqual(['0052_codemap_checked.sql', '0053_lesson_triggers.sql', '0054_decisions.sql', '0055_loop_weights.sql', '0056_loop_facts_and_splits.sql', '0057_loop_scale.sql', '0058_decision_notes_seq.sql', '0059_code_file_namespaces.sql']);
+    expect(all.slice(upTo075.length)).toHaveLength(8);
+    // The lesson is kept, and the loop's columns take its writes (and refuse a weight out of range).
+    await p.query(`UPDATE lessons SET serving_weight = 1.2, split_from = 'lesson:0' WHERE id = 'lesson:1'`);
+    expect((await p.query(`SELECT title, serving_weight, split_from FROM lessons`)).rows).toEqual([{ title: 't', serving_weight: 1.2, split_from: 'lesson:0' }]);
+    await expect(p.query(`UPDATE lessons SET serving_weight = 2 WHERE id = 'lesson:1'`)).rejects.toThrow(/lessons_serving_weight_check/);
+    await p.query(`UPDATE projects SET similarity_floor = 0.75, fact_rank_floor = 0.8 WHERE key = 'demo'`);
+    // A loop fact, filed under its project like yours, with the loop's relevance.
+    await p.query(`INSERT INTO facts (id, project_key, kind, statement, path, source, current, created_at, valid_from, origin, relevance, relevance_by)
+                   VALUES ('fact:loop:1', 'demo', 'convention', 's', '.', 'loop', true, now(), now(), 'loop', 0.6, 'loop:1')`);
+    expect((await p.query(`SELECT count(*)::int AS n FROM decisions`)).rows).toEqual([{ n: 0 }]);
+    expect(await migrate(p, { dir })).toEqual([]);
+  });
+
+  test('0057: a label the loop counted before labelled_at existed (a loop-kept:<id> cursor) is carried over; the others wait', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'fb-migrations-'));
+    const all = await migrationIds();
+    const upTo = all.slice(0, all.indexOf('0056_loop_facts_and_splits.sql') + 1);
+    for (const f of upTo) writeFileSync(join(dir, f), readFileSync(new URL(f, MIGRATIONS), 'utf8'));
+    const p = pool();
+    await migrate(p, { dir });
+    for (const id of ['dec:kept', 'dec:waiting']) {
+      await p.query(`INSERT INTO decisions (id, type, project_key, status, tier, mode, score, confidence, band, rationale, policy_version, created_at, applied_at)
+                     VALUES ($1, 'link_misses', 'demo', 'applied', 'H', 'auto', 0.9, '{}', 4, 'r', 1, now(), now())`, [id]);
+    }
+    await p.query(`INSERT INTO sync_cursors (key, value) VALUES ('loop-kept:dec:kept', '2026-11-01T00:00:00.000Z')`);
+    writeFileSync(join(dir, '0057_loop_scale.sql'), readFileSync(new URL('0057_loop_scale.sql', MIGRATIONS), 'utf8'));
+    expect(await migrate(p, { dir })).toEqual(['0057_loop_scale.sql']);
+    const { rows } = await p.query('SELECT id, labelled_at IS NOT NULL AS labelled FROM decisions ORDER BY id');
+    expect(rows).toEqual([{ id: 'dec:kept', labelled: true }, { id: 'dec:waiting', labelled: false }]);
+  });
+
+  test('0058: notes written before it are numbered in their table order, and new ones after them', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'fb-migrations-'));
+    const all = await migrationIds();
+    const upTo = all.slice(0, all.indexOf('0057_loop_scale.sql') + 1);
+    for (const f of upTo) writeFileSync(join(dir, f), readFileSync(new URL(f, MIGRATIONS), 'utf8'));
+    const p = pool();
+    await migrate(p, { dir });
+    await p.query(`INSERT INTO decisions (id, type, project_key, status, tier, mode, score, confidence, band, rationale, policy_version, created_at)
+                   VALUES ('dec:1', 'link_misses', 'demo', 'proposed', 'H', 'propose', 0.9, '{}', 4, 'r', 1, now())`);
+    await p.query(`INSERT INTO decision_notes (id, decision_id, ts, by, text) VALUES ('dnote:b', 'dec:1', now(), 'you', 'first'), ('dnote:a', 'dec:1', now(), 'you', 'second')`);
+    writeFileSync(join(dir, '0058_decision_notes_seq.sql'), readFileSync(new URL('0058_decision_notes_seq.sql', MIGRATIONS), 'utf8'));
+    expect(await migrate(p, { dir })).toEqual(['0058_decision_notes_seq.sql']);
+    await p.query(`INSERT INTO decision_notes (id, decision_id, ts, by, text) VALUES ('dnote:0', 'dec:1', now(), 'you', 'third')`);
+    expect((await p.query('SELECT text FROM decision_notes ORDER BY seq')).rows.map((r) => r.text)).toEqual(['first', 'second', 'third']);
   });
 
   test('embeddings are pgvector columns with an HNSW cosine index over the configured dimension', async () => {

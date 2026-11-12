@@ -18,7 +18,7 @@ const NO_MISS = [
 
 /** The text that says there was no miss, or null. */
 export function saysNoMiss(pm: { missed: string; causeExplanation: string }): string | null {
-  for (const text of [pm.missed ?? '', pm.causeExplanation ?? '']) {
+  for (const text of [pm.missed, pm.causeExplanation]) {
     const m = NO_MISS.map((re) => re.exec(text)).find(Boolean);
     if (m) return text;
   }

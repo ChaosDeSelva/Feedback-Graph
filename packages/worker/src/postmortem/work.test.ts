@@ -28,6 +28,11 @@ test('a link stored before to a session that only read is not followed: no work 
   expect(out.sessionId).toBe('github:acme/demo#9');
 });
 
+test('a matched session with no folder recorded keeps the comment\'s', async () => {
+  const out = await attachWorkSession({ ...input, cwd: '/vibe/demo' }, { graph: { workSessions: async () => [{ ...ws('b'), cwd: null }] }, sessions: { turns: async () => [] } });
+  expect(out).toMatchObject({ sessionId: 'b', cwd: '/vibe/demo', work: { sessionId: 'b', cwd: '' } });
+});
+
 test('no session found: work is null', async () => {
   const out = await attachWorkSession(input, { graph: { workSessions: async () => [] }, sessions: { turns: async () => [] } });
   expect(out.work).toBeNull();

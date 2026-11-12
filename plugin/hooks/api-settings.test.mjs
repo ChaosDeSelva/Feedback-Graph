@@ -18,10 +18,13 @@ test('migration moves only API-owned files, preserves exact values, and is idemp
   expect((await stat(join(root, 'state/api-settings'))).mode & 0o777).toBe(0o700);
 }));
 
-test('migration refuses conflicting settings and retains both originals', async () => fixture(async root => {
+// The worker writes state/settings: once state/api-settings exists, a file there is never taken for a setting.
+test('migration runs only into a new api settings folder: later files in state/settings are left where they are', async () => fixture(async root => {
   await mkdir(join(root, 'state/api-settings')); await writeFile(join(root, 'state/settings/integrations.json'), 'old'); await writeFile(join(root, 'state/api-settings/integrations.json'), 'new');
-  expect(() => migrate(root)).toThrow();
+  await writeFile(join(root, 'state/settings/project-roots.json'), 'planted');
+  migrate(root);
   expect(await readFile(join(root, 'state/settings/integrations.json'), 'utf8')).toBe('old');
+  await expect(stat(join(root, 'state/api-settings/project-roots.json'))).rejects.toThrow();
   expect(await readFile(join(root, 'state/api-settings/integrations.json'), 'utf8')).toBe('new');
 }));
 

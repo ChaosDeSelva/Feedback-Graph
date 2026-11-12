@@ -1,11 +1,13 @@
 import { utimesSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
-import { createServer, type Server } from 'node:http';
+import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { hostname, tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterAll, afterEach, expect, test } from 'vitest';
-import { isolatedRunnerArgs, mirrorLeaseOwner, mirrorLeasePath, purgeStaleRunnerMirrors, createCodexRunner, resolveMirror, runnerReadiness, runOnRunner, RUNNER_TOKEN_FILE, RunnerUnavailableError, writeRunnerToken, type RunnerOpts } from './codexRunner.ts';
+import { setTimeout as sleep } from 'node:timers/promises';
+import { afterAll, afterEach, describe, expect, test, vi } from 'vitest';
+import { createRunnerServer, isolatedRunnerArgs, mirrorLeaseOwner, mirrorLeasePath, purgeStaleRunnerMirrors, createCodexRunner, resolveMirror, runnerReadiness, runnerStartHint, runOnRunner, RUNNER_TOKEN_FILE, RunnerUnavailableError, writeRunnerToken, type RunnerOpts } from './codexRunner.ts';
 import type { Exec } from './exec.ts';
+import { SCRIPT_TEST_TIMEOUT_MS } from '../testing/exec.ts';
 import { makeProvider } from './providers.ts';
 import { providerUnavailableReason } from './unavailable.ts';
 
@@ -20,6 +22,9 @@ const fresh = () => {
   writeFileSync(join(d, 'outside', 'canary.txt'), 'CANARY');
   return { scratch: join(d, 'scratch'), outside: join(d, 'outside') };
 };
+
+/** True while pid exists (a zombie included, until its parent reaps it). */
+const alive = (pid: number) => { try { process.kill(pid, 0); return true; } catch (error) { if ((error as NodeJS.ErrnoException).code === 'ESRCH') return false; throw error; } };
 
 const servers: Server[] = [];
 afterEach(() => {
@@ -57,6 +62,12 @@ test('a job needs the token: none, a wrong one and a non-Bearer header are all r
   expect(r.calls).toEqual([]);
   expect((await fetch(`${r.url}/health`)).status).toBe(200);
   expect((await fetch(`${r.url}/run`, { headers: { authorization: `Bearer ${r.token}` } })).status).toBe(405);
+});
+
+test('the Bearer scheme is matched in any case (RFC 7235): bearer and BEARER carry the token too', async () => {
+  const { scratch } = fresh();
+  const r = await start({ scratch });
+  for (const scheme of ['bearer', 'BEARER', 'BeArEr']) expect((await r.post(job, `${scheme} ${r.token}`)).status).toBe(200);
 });
 
 test('the token is written to the scratch volume atomically, readable by its owner only, and new on every start', async () => {
@@ -170,23 +181,31 @@ test('a job past its timeout is killed with its whole process group and reported
   const bin = join(root, `fake-codex-${n}`);
   const pidFile = join(root, `grandchild-${n}.pid`);
   const parentPidFile = join(root, `parent-${n}.pid`);
-  writeFileSync(bin, `#!/bin/sh\ntrap '' TERM\necho $$ > ${parentPidFile}\nsleep 30 &\necho $! > ${pidFile}\nwait\n`);
+  writeFileSync(bin, `#!/bin/sh\ntrap '' TERM\necho $$ > ${parentPidFile}.tmp && mv ${parentPidFile}.tmp ${parentPidFile}\nsleep 30 &\necho $! > ${pidFile}.tmp && mv ${pidFile}.tmp ${pidFile}\nwait\n`);
   chmodSync(bin, 0o755);
-  const r = await start({ scratch, bin, exec: undefined, killGraceMs: 100, maxTimeoutMs: 2_000 });
-  const t0 = Date.now();
-  const res = await r.post({ ...job, timeoutMs: 60_000 });
-  const body = (await res.json()) as { code: number; stderr: string };
-  expect(body.code).toBe(124);
-  expect(body.stderr).toMatch(/timed out after 2000ms/);
-  expect(Date.now() - t0).toBeLessThan(10_000);
-  // Both must have actually started: an absent PID file is a failure, never an optional assertion.
-  const pids = [parentPidFile, pidFile].map(file => Number(readFileSync(file, 'utf8')));
-  for (const pid of pids) expect(Number.isInteger(pid) && pid > 0).toBe(true);
-  const gone = (pid: number) => { try { process.kill(pid, 0); return false; } catch (error) { return (error as NodeJS.ErrnoException).code === 'ESRCH'; } };
-  const deadline = Date.now() + 3_000;
-  while (!pids.every(gone) && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 25));
-  for (const pid of pids) expect(gone(pid), `timed-out process ${pid} must be gone`).toBe(true);
-}, 20_000);
+  // The job's timeout and kill grace run on fake timers, so they fire only once both processes have started, however
+  // slowly a loaded machine starts them. Waits on real processes use node:timers, which stays real.
+  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+  try {
+    const r = await start({ scratch, bin, exec: undefined, killGraceMs: 100, maxTimeoutMs: 2_000 });
+    const res = r.post({ ...job, timeoutMs: 60_000 });
+    while (!existsSync(parentPidFile) || !existsSync(pidFile)) await sleep(10);
+    const pids = [parentPidFile, pidFile].map(file => Number(readFileSync(file, 'utf8')));
+    for (const pid of pids) expect(Number.isInteger(pid) && pid > 0).toBe(true);
+    // The runner caps the 60 s asked for at its 2 s maximum: nothing is killed a moment before it.
+    vi.advanceTimersByTime(1_999);
+    for (const pid of pids) expect(alive(pid)).toBe(true);
+    vi.advanceTimersByTime(1);
+    vi.advanceTimersByTime(100);
+    const body = (await (await res).json()) as { code: number; stderr: string };
+    expect(body.code).toBe(124);
+    expect(body.stderr).toMatch(/timed out after 2000ms/);
+    // Killed processes leave once the OS reaps them; the test's own timeout bounds this wait.
+    while (pids.some(alive)) await sleep(25);
+  } finally {
+    vi.useRealTimers();
+  }
+}, SCRIPT_TEST_TIMEOUT_MS);
 
 test('the client sends the job with the token, waits while the runner is busy, and re-reads a rotated token once', async () => {
   const { scratch } = fresh();
@@ -340,11 +359,15 @@ test('runner readiness rejects unavailable sandbox before any repository mirror 
   expect((await readdir(scratch)).filter(name => name.startsWith('fb-mirror-'))).toEqual(['fb-mirror-1']);
 });
 
-test('runner readiness failures say how to start the runner', async () => {
+test('a runner that answers but is not ready is not told to start; an unreachable one gets this install\'s start command', async () => {
   const down = await runnerReadiness('http://runner', (async () => new Response(JSON.stringify({ ok: false, error: 'sandbox unavailable' }), { status: 503 })) as typeof fetch);
-  expect(down.reason).toMatch(/sandbox unavailable.*docker compose --profile codex up -d/);
+  expect(down.reason).toMatch(/sandbox unavailable; the runner is running but not ready: run \.\/scripts\/doctor\.sh/);
+  expect(down.reason).not.toMatch(/up -d/);
   const unreachable = await runnerReadiness('http://runner', (async () => { throw new Error('connection refused'); }) as typeof fetch);
-  expect(unreachable.reason).toMatch(/connection refused.*docker compose --profile codex up -d/);
+  expect(unreachable.reason).toMatch(/connection refused.*docker compose -p .* --profile codex up -d codex-runner/);
+  expect(runnerStartHint({ FG_INSTANCE: 'feedback-graph-two', COMPOSE_FILE: 'docker-compose.yml:docker-compose.small.yml' }))
+    .toContain('docker compose -p feedback-graph-two -f docker-compose.yml -f docker-compose.small.yml --profile codex up -d codex-runner');
+  expect(runnerStartHint({})).toContain('docker compose -p feedback-graph --profile codex up -d codex-runner');
 });
 
 
@@ -358,4 +381,183 @@ test('a reused worker PID cannot keep an abandoned mirror alive with an old proc
   await purgeStaleRunnerMirrors(scratch, undefined, Date.now(), true);
   expect(existsSync(old)).toBe(false);
   expect(existsSync(live)).toBe(true);
+});
+
+test('the runner answers only GET /health and POST /run', async () => {
+  const { scratch } = fresh();
+  const r = await start({ scratch });
+  expect((await fetch(`${r.url}/other`)).status).toBe(404);
+  const get = await fetch(`${r.url}/run?x=1`);
+  expect(get.status).toBe(405);
+  expect(get.headers.get('allow')).toBe('POST');
+  expect(await (await fetch(`${r.url}/health`)).json()).toEqual({ ok: true, sandbox: false, busy: false });
+  expect(r.calls).toEqual([]);
+});
+
+test('a job that is not an object, or too large, is refused before codex starts', async () => {
+  const { scratch } = fresh();
+  const r = await start({ scratch });
+  expect(await (await r.post('null')).json()).toEqual({ error: 'job is not an object' });
+  const big = await r.post(JSON.stringify({ ...job, prompt: 'x'.repeat(17 * 1024 * 1024) })).catch((e: Error) => e);
+  // the runner answers 413 and drops the connection; either way the job never runs
+  if (big instanceof Response) expect(big.status).toBe(413);
+  expect(r.calls).toEqual([]);
+  expect(r.runner.busy()).toBe(false);
+});
+
+test('a scratch volume that went away is a server error, not a bad request', async () => {
+  const { scratch } = fresh();
+  const r = await start({ scratch });
+  rmSync(scratch, { recursive: true, force: true });
+  const res = await r.post(job);
+  expect(res.status).toBe(500);
+  expect((await res.json()).error).toMatch(/ENOENT/);
+});
+
+test('codex failing after the job was accepted is reported in the result body, and the runner takes the next job', async () => {
+  const { scratch } = fresh();
+  let fail = true;
+  const r = await start({ scratch, exec: async (_c, args) => {
+    if (fail) throw new Error('spawn codex ENOENT');
+    writeFileSync(args[args.indexOf('-o') + 1], '{}');
+    return { code: 0, stdout: 'o'.repeat(70_000), stderr: '' };
+  } });
+  const res = await r.post(job);
+  expect(res.status).toBe(200);
+  expect(await res.json()).toEqual({ error: 'spawn codex ENOENT' });
+  fail = false;
+  const next = await (await r.post(job)).json() as { stdout: string; output: string };
+  // only the tail of a long output comes back
+  expect(next.stdout).toHaveLength(64_000);
+  expect(next.output).toBe('{}');
+});
+
+test('an isolated runner probes its sandbox once, then runs codex inside it with only the login and the mirror', async () => {
+  const { scratch } = fresh();
+  const calls: { cmd: string; args: string[] }[] = [];
+  const r = await start({ scratch, isolate: true, bin: '/opt/codex', env: { PATH: '/usr/bin', CODEX_HOME: '/home/codex', SECRET: 'no' }, exec: async (cmd, args, o) => {
+    calls.push({ cmd, args });
+    expect(o.env).toEqual({ PATH: '/usr/bin', CODEX_HOME: '/home/codex' });
+    if (args.includes('--output-schema')) writeFileSync(args[args.indexOf('-o') + 1], '{"answer":"ok"}');
+    return { code: 0, stdout: '', stderr: '' };
+  } });
+  // two health checks at once share one probe, and a later one within 30 s reuses its answer
+  const [a, b] = await Promise.all([r.runner.health(), r.runner.health()]);
+  expect(a).toEqual({ ok: true, sandbox: true });
+  expect(b).toEqual(a);
+  expect(await (await fetch(`${r.url}/health`)).json()).toEqual({ ok: true, sandbox: true, busy: false });
+  const res = await (await r.post(job)).json();
+  expect(res).toMatchObject({ code: 0, output: '{"answer":"ok"}' });
+  expect(calls.map((c) => c.cmd)).toEqual(['bwrap', 'bwrap']);
+  const run = calls[1].args;
+  expect(run.slice(run.indexOf('--bind-try'), run.indexOf('--bind-try') + 3)).toEqual(['--bind-try', '/home/codex/auth.json', '/codex/auth.json']);
+  expect(run.slice(run.indexOf('--ro-bind', run.indexOf('--bind-try')), run.indexOf('--ro-bind', run.indexOf('--bind-try')) + 3)).toEqual(['--ro-bind', join(scratch, 'fb-mirror-1'), '/repo']);
+  const codex = run.slice(run.indexOf('--') + 1);
+  expect(codex[0]).toBe('/opt/codex');
+  expect(codex.slice(codex.indexOf('-C'), codex.indexOf('-C') + 2)).toEqual(['-C', '/repo']);
+});
+
+test('a sandbox probe that fails without a message, or throws a non-error, still explains itself', async () => {
+  for (const exec of [
+    (async () => ({ code: 7, stdout: '', stderr: '' })) as Exec,
+    (async () => { throw 'bwrap missing'; }) as Exec,
+  ]) {
+    const { scratch } = fresh();
+    const r = await start({ scratch, isolate: true, exec });
+    const h = await r.runner.health();
+    expect(h.ok).toBe(false);
+    expect(h.error).toMatch(/^Codex sandbox cannot start: (sandbox probe exit 7|bwrap missing)\. Select Claude Code/);
+  }
+});
+
+test.skipIf(process.platform !== 'linux')('a live worker PID that started at another time is a reused PID: its mirror is swept', async () => {
+  const { scratch } = fresh();
+  const old = join(scratch, 'fb-mirror-restarted');
+  mkdirSync(old);
+  writeFileSync(mirrorLeasePath(old), JSON.stringify({ pid: process.pid, host: hostname(), started: '1' }));
+  await purgeStaleRunnerMirrors(scratch, undefined, Date.now(), true);
+  expect(existsSync(old)).toBe(false);
+});
+
+test('readiness explains a failure the runner gives no reason for, and a thrown non-error', async () => {
+  const silent = await runnerReadiness('http://runner/', (async () => new Response('{}', { status: 500 })) as unknown as typeof fetch);
+  expect(silent).toEqual({ ok: false, reason: expect.stringMatching(/^codex runner readiness failed \(HTTP 500\); the runner is running but not ready/) });
+  const weird = await runnerReadiness('http://runner', (async () => { throw 'boom'; }) as unknown as typeof fetch);
+  expect(weird.reason).toMatch(/^cannot reach the codex runner at http:\/\/runner: boom;/);
+  expect(await runnerReadiness('http://runner', (async () => new Response('{"ok":true}')) as unknown as typeof fetch)).toEqual({ ok: true, reason: null });
+});
+
+test('the client reports what a runner said when it did not return a result', async () => {
+  const { scratch } = fresh();
+  await writeRunnerToken(scratch);
+  const answer = (status: number, body: string) => (async () => new Response(body, { status })) as unknown as typeof fetch;
+  await expect(runOnRunner({ url: 'http://x', scratch, job, fetchImpl: answer(502, '<html>bad gateway</html>') })).rejects.toThrow('codex runner 502: <html>bad gateway</html>');
+  await expect(runOnRunner({ url: 'http://x', scratch, job, fetchImpl: answer(400, '{"error":"prompt is required"}') })).rejects.toThrow('codex runner 400: prompt is required');
+  await expect(runOnRunner({ url: 'http://x', scratch, job, fetchImpl: answer(500, '{}') })).rejects.toThrow('codex runner 500: {}');
+  await expect(runOnRunner({ url: 'http://x', scratch, job, fetchImpl: answer(200, '{"error":"spawn codex ENOENT"}') })).rejects.toThrow('codex runner 200: spawn codex ENOENT');
+  // a sandbox that cannot start fails at once, without waiting out the job
+  await expect(runOnRunner({ url: 'http://x', scratch, job, fetchImpl: answer(503, '{"code":"sandbox_unavailable"}') })).rejects.toThrow(/^sandbox unavailable$/);
+  // fields a runner left out read as a failed run with no output
+  expect(await runOnRunner({ url: 'http://x', scratch, job, fetchImpl: answer(200, '{}') })).toEqual({ code: 1, stdout: '', stderr: '', output: null });
+});
+
+test('the client names the network cause when the runner cannot be reached', async () => {
+  const { scratch } = fresh();
+  await writeRunnerToken(scratch);
+  const refused = (async () => { throw new TypeError('fetch failed', { cause: new Error('connect ECONNREFUSED 10.0.0.2:8790') }); }) as unknown as typeof fetch;
+  await expect(runOnRunner({ url: 'http://x', scratch, job, fetchImpl: refused })).rejects.toThrow(/cannot reach the codex runner at http:\/\/x \(connect ECONNREFUSED 10\.0\.0\.2:8790\)/);
+  const odd = (async () => { throw 'down'; }) as unknown as typeof fetch;
+  await expect(runOnRunner({ url: 'http://x', scratch, job, fetchImpl: odd })).rejects.toThrow(/\(down\)/);
+});
+
+test('the client waits the default 2 s between busy answers', async () => {
+  const { scratch } = fresh();
+  await writeRunnerToken(scratch);
+  let calls = 0;
+  const busy = (async () => { calls++; return new Response('not json', { status: 503 }); }) as unknown as typeof fetch;
+  // The wait and the job's deadline run on a fake clock: the second ask comes exactly 2 s after the first.
+  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+  try {
+    const asked = expect(runOnRunner({ url: 'http://x', scratch, job: { ...job, timeoutMs: 2500 }, fetchImpl: busy })).rejects.toThrow(/stayed busy/);
+    // Reading the token is real I/O: wait for the first ask before moving the clock.
+    while (calls === 0) await sleep(5);
+    await vi.advanceTimersByTimeAsync(1999);
+    expect(calls).toBe(1);
+    await vi.advanceTimersByTimeAsync(1);
+    await asked;
+    expect(calls).toBe(2);
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+describe('createRunnerServer', () => {
+  async function serve(handle: (req: IncomingMessage, res: ServerResponse) => Promise<void>) {
+    const logs: { msg: string; extra?: object }[] = [];
+    const server = createRunnerServer({ handle }, (msg, extra) => logs.push({ msg, extra }));
+    servers.push(server);
+    await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
+    return { url: `http://127.0.0.1:${(server.address() as AddressInfo).port}`, logs, server };
+  }
+
+  test('logs each request but health checks, by method, path and status, and gives requests a minute to arrive', async () => {
+    const s = await serve(async (_req, res) => { res.writeHead(204).end(); });
+    expect(s.server.requestTimeout).toBe(60_000);
+    await fetch(`${s.url}/health`);
+    await fetch(`${s.url}/run`, { method: 'POST', body: '{"prompt":"secret plan"}' });
+    // Logged once the response has finished, which can be after the client has it.
+    await vi.waitFor(() => expect(s.logs.length).toBeGreaterThan(0));
+    expect(s.logs).toEqual([{ msg: 'request', extra: { method: 'POST', path: '/run', status: 204, ms: expect.any(Number) } }]);
+  });
+
+  test('a handler that throws before answering gets a 500; one that throws mid-answer has its response ended', async () => {
+    const before = await serve(async () => { throw new Error('disk full'); });
+    expect((await fetch(`${before.url}/run`)).status).toBe(500);
+    expect(before.logs.map((l) => l.msg)).toContain('error');
+    expect(before.logs.find((l) => l.msg === 'error')!.extra).toEqual({ error: 'Error: disk full' });
+    const during = await serve(async (_req, res) => { res.writeHead(200); res.write('partial'); throw new Error('lost'); });
+    const res = await fetch(`${during.url}/run`);
+    expect(res.status).toBe(200);
+    expect(await res.text()).toBe('partial');
+  });
 });

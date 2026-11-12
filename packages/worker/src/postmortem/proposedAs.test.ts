@@ -103,12 +103,28 @@ test('at start, once: lessons edited before the draft was kept get it from Activ
   expect(await backfillProposedAs(w.deps)).toBeNull();
 });
 
-test('nothing to backfill still stamps the version, with no Activity entry; a store that cannot keep a draft is skipped', async () => {
+test('nothing to backfill still stamps the version, with no Activity entry', async () => {
   const w = world([lesson('lesson:plain')], [decided('lesson:plain', 'approved', {})]);
   expect(await backfillProposedAs(w.deps)).toEqual({ examined: 1, filled: 0, approved: 0, rejected: 0, proposed: 0 });
   expect(w.recorded).toEqual([]);
   expect(w.cursors.get(PROPOSED_AS_CURSOR)).toBe('v1');
-  const none = world([lesson('lesson:plain')], []);
-  expect(await backfillProposedAs({ ...none.deps, knowledge: { listLessons: none.deps.knowledge.listLessons } })).toBeNull();
-  expect(none.cursors.size).toBe(0);
+});
+
+test('a from of the wrong shape is no draft; several approved and a proposed one are counted so, one alone in the singular, and logged', async () => {
+  const lessons = [lesson('lesson:a1'), lesson('lesson:a2'), lesson('lesson:p', { status: 'proposed' }), lesson('lesson:bad')];
+  const rows = [
+    decided('lesson:a1', 'approved', { rule: { from: 'Filter on the server', to: 'r' } }),
+    decided('lesson:a2', 'approved', { scope: { from: 'global', to: 'project' } }),
+    { ...decided('lesson:p', 'proposed', {}), details: { status: 'proposed' } },
+    decided('lesson:p', 'proposed', { title: { from: 'Search', to: 'Server-side search' } }),
+    decided('lesson:bad', 'approved', { scope: { from: 'everywhere', to: 'project' }, title: { from: 42, to: 't' } }),
+  ];
+  const w = world(lessons, rows);
+  const logs: [string, object | undefined][] = [];
+  expect(await backfillProposedAs({ ...w.deps, log: (m, x) => logs.push([m, x]) })).toEqual({ examined: 4, filled: 3, approved: 2, rejected: 0, proposed: 1 });
+  expect(w.recorded[0].subject).toBe("3 lessons got the writer's draft back from Activity: 2 approved now count as after an edit, 1 still proposed");
+  expect(logs).toEqual([["writer's drafts backfilled from Activity", { examined: 4, filled: 3, approved: 2, rejected: 0, proposed: 1 }]]);
+  const one = world([lesson('lesson:a1')], [rows[0]]);
+  await backfillProposedAs(one.deps);
+  expect(one.recorded[0].subject).toBe("1 lesson got the writer's draft back from Activity: 1 approved now counts as after an edit");
 });

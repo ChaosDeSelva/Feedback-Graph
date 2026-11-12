@@ -1,3 +1,6 @@
+import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { expect, test } from 'vitest';
 import type { ActivityInput, DetectedLink } from '@fb/core';
 import { runLinkDetection } from './stage.ts';
@@ -34,4 +37,18 @@ test('nothing new is not logged; fewer than two projects is not a round', async 
   one.d.projects = async () => [{ key: 'game', repoPath: '/r/game', remote: null }];
   expect(await runLinkDetection(one.d)).toEqual({ found: 0, fresh: 0 });
   expect(one.calls).toEqual([]);
+});
+
+test('with the real detector, two linked folders on disk are found and several new suggestions are told in the plural', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'fblinkstage-'));
+  for (const name of ['api', 'game']) mkdirSync(join(root, name));
+  writeFileSync(join(root, 'game', 'package.json'), JSON.stringify({ name: 'game', dependencies: { api: 'file:../api' } }));
+  const activity: ActivityInput[] = [];
+  const r = await runLinkDetection({
+    links: { replaceDetected: async () => 2 },
+    projects: async () => [{ key: 'game', repoPath: join(root, 'game'), remote: null }, { key: 'api', repoPath: join(root, 'api'), remote: null }],
+    activity: { record: async (a) => void activity.push(a) },
+  });
+  expect(r).toEqual({ found: 1, fresh: 2 });
+  expect(activity[0].subject).toBe('2 new link suggestions: api ↔ game');
 });

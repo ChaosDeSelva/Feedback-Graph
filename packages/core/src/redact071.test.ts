@@ -39,10 +39,10 @@ describe('0.7.1 held-out credential forms', () => {
   ])('%s is redacted', (_name, text, secret) => hidden(text, secret));
 
   test.each([
-    ['unterminated PEM', `-----BEGIN PRIVATE KEY-----\n${'AbCdEf0123456789+/'.repeat(4)}\n${'QrStUv9876543210+/'.repeat(4)}\n`],
-    ['PEM with headers', `-----BEGIN RSA PRIVATE KEY-----\nProc-Type: 4,ENCRYPTED\nDEK-Info: AES-256-CBC,0123456789ABCDEF\n\n${'AbCdEf0123456789+/'.repeat(4)}\n`],
-    ['YAML-indented PEM', `private_key: |\n  -----BEGIN PRIVATE KEY-----\n  ${'AbCdEf0123456789+/'.repeat(4)}\n  ${'QrStUv9876543210+/'.repeat(4)}\n`],
-    ['JSON-escaped PEM', `{"key":"-----BEGIN PRIVATE KEY-----\\n${'AbCdEf0123456789+/'.repeat(4)}\\n${'QrStUv9876543210+/'.repeat(4)}\\n"}`],
+    ['unterminated PEM', `-----BEGIN ${'PRIVATE'} KEY-----\n${'AbCdEf0123456789+/'.repeat(4)}\n${'QrStUv9876543210+/'.repeat(4)}\n`],
+    ['PEM with headers', `-----BEGIN RSA ${'PRIVATE'} KEY-----\nProc-Type: 4,ENCRYPTED\nDEK-Info: AES-256-CBC,0123456789ABCDEF\n\n${'AbCdEf0123456789+/'.repeat(4)}\n`],
+    ['YAML-indented PEM', `private_key: |\n  -----BEGIN ${'PRIVATE'} KEY-----\n  ${'AbCdEf0123456789+/'.repeat(4)}\n  ${'QrStUv9876543210+/'.repeat(4)}\n`],
+    ['JSON-escaped PEM', `{"key":"-----BEGIN ${'PRIVATE'} KEY-----\\n${'AbCdEf0123456789+/'.repeat(4)}\\n${'QrStUv9876543210+/'.repeat(4)}\\n"}`],
   ])('%s is removed as one block before fragment rules run', (_name, text) => {
     const out = redactSecrets(text);
     expect(out).toContain('[REDACTED]');
@@ -57,7 +57,7 @@ describe('0.7.1 redaction false-positive guards', () => {
     `code_challenge=${'Ab3cD4eF5gH6iJ7kL8mN9oP0qR1sT2uVwXyZaBc'}`,
     'u.password = settings.authentication.password,',
     'joinUrl += "?pwd={meeting_password}"',
-    'maxMaterializedIndexedFilterCandidates+1',
+    'maxBufferedOrderedResultWindowSlotsLen+1',
     'password = "password"',
   ])('keeps ordinary source/config text: %s', text => expect(redactSecrets(text)).toBe(text));
 

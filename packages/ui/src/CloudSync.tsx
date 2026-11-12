@@ -1,9 +1,8 @@
 import { useEffect, useState } from 'react';
-import { api, type CloudInfo, type SyncCounts } from './api.ts';
+import { api, type CloudInfo, type SyncCounts, errorMessage } from './api.ts';
 import { Input, Button } from './ui/controls.tsx';
 import { ago, Alert, Badge, Card, plural, SkeletonList, StatGrid, StatTile, type Tone } from './ui/display.tsx';
 
-const message = (e: unknown) => (e instanceof Error ? e.message : String(e));
 
 function state(i: CloudInfo): { label: string; tone: Tone } {
   if (!i.enabled) return { label: 'off', tone: 'neutral' };
@@ -16,10 +15,10 @@ const sentence = (host: string, s: SyncCounts) =>
 
 const Mono = ({ children }: { children: string }) => <code className="font-mono text-[12px]">{children}</code>;
 
-/** Settings: Feedback Graph Cloud sync. Off unless CLOUD_URL and CLOUD_TOKEN are set; Sync now is yours only. */
+/** Settings: Feedback Graph Cloud sync. Off unless CLOUD_URL and CLOUD_TOKEN are set; Sync now is an owner action (the operator token too, under sync_now). */
 export function CloudSync() {
   const [info, setInfo] = useState<CloudInfo | null>(null);
-  const [loaded, setLoaded] = useState(false);
+  const [loadError, setLoadError] = useState<string | null>(null);
   const [localOnly, setLocalOnly] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -27,12 +26,11 @@ export function CloudSync() {
 
   const load = () =>
     api.cloud().then(
-      // An API from before cloud sync answers with something else: show nothing rather than a broken card.
-      (d) => { setInfo(d && typeof d === 'object' && typeof (d as CloudInfo).enabled === 'boolean' ? d : null); setLoaded(true); },
-      () => { setInfo(null); setLoaded(true); },
+      (d) => { setInfo(d); setLoadError(null); },
+      (e) => { setInfo(null); setLoadError(errorMessage(e)); },
     );
   useEffect(() => { load(); }, []);
-  useEffect(() => { setLocalOnly(info?.savedLocalOnlyProjects?.join(', ') ?? ''); }, [info]);
+  useEffect(() => { setLocalOnly(info?.savedLocalOnlyProjects.join(', ') ?? ''); }, [info]);
 
   async function syncNow() {
     setBusy(true);
@@ -41,9 +39,9 @@ export function CloudSync() {
     try {
       const r = await api.syncCloud();
       // Nothing stored for any selected project: no request reached the cloud, so it records no sync either.
-      const nothing = r.ok && !r.sent.projects && !r.projects?.some((p) => p.status === 'withdrawn');
+      const nothing = r.ok && !r.sent.projects && !r.projects.some((p) => p.status === 'withdrawn');
       // Unchanged: the same bundle as the last send, so nothing went (a forced sync resends it).
-      const unchanged = r.projects?.filter((p) => p.status === 'unchanged').length ?? 0;
+      const unchanged = r.projects.filter((p) => p.status === 'unchanged').length;
       const same = unchanged ? `${plural(unchanged, 'project')} unchanged` : '';
       if (nothing && unchanged) setResult(`Nothing changed since the last sync (${same}).`);
       else if (nothing) setResult('Nothing to send yet: the selected projects have no lessons, misses, facts or docs stored. The cloud records a sync once something is sent.');
@@ -51,24 +49,25 @@ export function CloudSync() {
       else setError(r.error ?? 'The sync failed.');
       await load();
     } catch (e) {
-      setError(message(e));
+      setError(errorMessage(e));
     } finally {
       setBusy(false);
     }
   }
 
-  if (!info) return <Card title="Cloud sync">{loaded ? <p className="p-4 text-muted">Cloud sync is unavailable on this API.</p> : <SkeletonList rows={3} />}</Card>;
+  if (!info) return <Card level="h2" title="Cloud sync">{loadError ? <p className="p-4 text-muted">Could not load the cloud sync settings: {loadError}</p> : <SkeletonList rows={3} />}</Card>;
   const s = state(info);
   const total = info.preview?.total;
   const lastError = error ?? (info.last && !info.last.ok ? info.last.error : null);
 
   return (
     <Card
+      level="h2"
       title="Cloud sync"
       actions={
         <>
           <Badge tone={s.tone} dot>{s.label}</Badge>
-          {info.enabled && <Button variant="primary" size="sm" onClick={syncNow} disabled={busy}>{busy ? 'Syncing' : 'Sync now'}</Button>}
+          {info.enabled && <Button variant="primary" size="sm" owner onClick={syncNow} disabled={busy}>{busy ? 'Syncing' : 'Sync now'}</Button>}
         </>
       }
       bodyClass="grid gap-3 p-4"
@@ -116,8 +115,8 @@ export function CloudSync() {
           </dl>
           {info.preview && <ul aria-label="Cloud project eligibility" className="space-y-1 text-xs text-muted">{info.preview.projects.map(project => <li key={project.key}>{project.key}: {project.counts ? `eligible (${project.counts.lessons} lessons, ${project.counts.misses} misses, ${project.counts.facts} facts, ${project.counts.docs} docs, ${project.counts.codeFiles} code files)` : `not sent: ${project.reason ?? 'no shareable knowledge'}`}</li>)}</ul>}
           {[...new Set(info.last?.teamLessons?.map(t => t.message) ?? [])].map(message => <Alert key={message}>{message}</Alert>)}
-          {!!info.localOnlyProjects?.length && <p className="text-xs text-muted">Local only (never sends new content): {info.localOnlyProjects.join(', ')}. Environment-enforced projects remain local even if removed below.</p>}
-          {info.localOnlyEditable && <div className="grid gap-2"><label htmlFor="cloud-local-only">Keep these project keys local (comma separated)</label><Input id="cloud-local-only" value={localOnly} onChange={e => setLocalOnly(e.target.value)} /><Button disabled={busy} onClick={async () => { setBusy(true); setError(null); try { await api.cloudLocalOnly(localOnly.split(',').map(key => key.trim()).filter(Boolean)); await load(); } catch (e) { setError(message(e)); } finally { setBusy(false); } }}>Save local-only projects</Button><p className="text-xs text-muted">These projects stay selected locally. Forced sync never sends new content; previously shared copies are withdrawn on the next sync.</p></div>}
+          {info.localOnlyProjects.length > 0 && <p className="text-xs text-muted">Local only (never sends new content): {info.localOnlyProjects.join(', ')}. Environment-enforced projects remain local even if removed below.</p>}
+          {info.localOnlyEditable && <div className="grid gap-2"><label htmlFor="cloud-local-only">Keep these project keys local (comma separated)</label><Input id="cloud-local-only" value={localOnly} onChange={e => setLocalOnly(e.target.value)} /><Button owner disabled={busy} onClick={async () => { setBusy(true); setError(null); try { await api.cloudLocalOnly(localOnly.split(',').map(key => key.trim()).filter(Boolean)); await load(); } catch (e) { setError(errorMessage(e)); } finally { setBusy(false); } }}>Save local-only projects</Button><p className="text-xs text-muted">These projects stay selected locally. Forced sync never sends new content; previously shared copies are withdrawn on the next sync.</p></div>}
           {result && <p role="status" className="text-ok-text">{result}</p>}
           {lastError && <Alert>{lastError}</Alert>}
           <div className="grid gap-1.5">

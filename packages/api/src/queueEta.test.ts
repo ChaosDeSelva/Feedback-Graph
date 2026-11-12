@@ -9,7 +9,7 @@ const lesson: Lesson = { id: 'l', projectKey: 'demo', title: 'Tenant reads', rul
 function gate() { let release!: () => void; const promise = new Promise<void>(resolve => { release = resolve; }); return { promise, release }; }
 function appFor(queue: Admission, budget: number, secured = false) {
   const context: ContextDeps = { roots: [{ host: '/projects', container: '/projects' }], exists: () => true, checkTimeoutMs: budget, judgeQueue: queue, embed: async () => [[1]],
-    k: { searchLessons: async () => [{ lesson, score: .9 }], relatedMisses: async () => [], recordPreDoneCheck: async () => {}, createManualFeedback: async () => 'f' },
+    k: { searchLessons: async () => [{ lesson, score: .9 }], missesNaming: async () => [], relatedMisses: async () => [], recordPreDoneCheck: async () => {}, createManualFeedback: async () => 'f' },
     judge: async () => [{ lessonId: 'l', status: 'addressed', applies: true, why: 'Tenant read is handled.' }],
   };
   return createApp(repo, { context, ...(secured && { auth: { token: "owner-token-".repeat(4), operator: { token: "operator-token-".repeat(4), allow: [] } } }) });
@@ -32,9 +32,9 @@ test('real MCP queued response carries observed ETA, capacity and retry state; l
     const { result } = await response.json();
     expect(result.structuredContent).toMatchObject({ queued: true, queue: { state: 'retry_required', capacity: 1, running: 1, waiting: 0, position: null, nextRetryPosition: 1, arrivalAhead: 1, retained: false,
       estimate: { source: 'observed', samples: 1, startMs: [910, 2410], completionMs: [1910, 4910] } } });
-    expect(result.content[0].text).toContain('Estimated start:');
-    expect(result.content[0].text).toContain('1 recent completed judge calls');
-    expect(result.content[0].text).toContain('not retain a queue position');
+    // The agent reads one plain line; the numbers stay in the structured queue.
+    expect(result.content[0].text).toMatch(/Not finished: the judge is busy\. Call check_before_done again with the same arguments in about \d+ s\.$/);
+    expect(result.content[0].text).not.toMatch(/estimate|planning|position|capacity/i);
     held.release(); await active;
     const success = call(app); await vi.advanceTimersByTimeAsync(0);
     const completed = await (await success).json();
@@ -56,7 +56,7 @@ test('real MCP busy response exposes a still-occupied overdue slot and does not 
     const { result } = await (await pending).json();
     expect(result.content[0].text).toContain('Not judged:');
     expect(result.structuredContent).toMatchObject({ queued: true, queue: { state: 'retry_required', running: 1, waiting: 0, retained: false, estimate: { overdue: true, startMs: [0, null] } } });
-    expect(result.content[0].text).toContain('upper estimate unavailable');
+    expect(result.content[0].text).toMatch(/Call check_before_done again with the same arguments in about \d+ s\./);
     held.release(); await active; await vi.advanceTimersByTimeAsync(0);
     expect(queue.running).toBe(0);
   } finally { vi.useRealTimers(); }
@@ -81,7 +81,7 @@ test('real authenticated MCP retries restore priority without sharing it across 
     const retried = await (await retry).json(), unrelated = await (await other).json();
     expect(retried.result.structuredContent.queue).toMatchObject({ state: 'completed', arrivalAhead: 1, retryPriority: { restored: true } });
     expect(unrelated.result.structuredContent.queue.retryPriority.restored).toBe(false);
-    expect(retried.result.content[0].text).toContain('Earlier retry priority was restored');
+    expect(retried.result.content[0].text).toContain('Judge completed');
     expect(JSON.stringify([firstBody, retried, unrelated])).not.toContain(owner);
     expect(JSON.stringify([firstBody, retried, unrelated])).not.toContain(operator);
     expect(queue.running).toBe(0); expect(queue.waiting).toBe(0);

@@ -1,6 +1,7 @@
-import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, beforeEach, expect, test, vi } from 'vitest';
 import { Settings } from './Settings.tsx';
+import { loopState } from './testing/loop.ts';
 
 const row = (key: string, o: Record<string, unknown> = {}) => ({
   key, path: `/Users/me/Vibe/${key}`, exists: true, git: true, remote: null, claudeSessions: 0, codexSessions: 0, lastActivity: null,
@@ -34,6 +35,10 @@ let state: ReturnType<typeof body>;
 let failGet: { status: number; error: string } | null;
 let failPut: string | null;
 
+const notConnected = { connection: { state: 'not_connected', source: null, detail: 'Not connected.', href: '#settings/integrations-github' }, envSet: false, envVar: 'GITHUB_TOKEN', savedInApp: false, account: null, checkedAt: null, lastSyncAt: null, lastError: null, errorKind: null, rateLimitedUntil: null };
+const cloudOff = { enabled: false, host: null, intervalMinutes: null, suggestions: false, localOnlyProjects: [], localOnlyEditable: false, savedLocalOnlyProjects: [], shareDemoProjects: [], projects: [], preview: null, previewError: null, last: null, nextAt: null, neverSent: 'Never sent: session transcripts.' };
+const integrationsView = (svc = notConnected) => ({ canSave: true, syncMinutes: 10, github: svc, linear: { ...svc, envVar: 'LINEAR_API_KEY' }, projects: [], rules: [], skippedSince: null });
+
 beforeEach(() => {
   calls = [];
   state = body();
@@ -59,6 +64,9 @@ beforeEach(() => {
       return Response.json(state);
     }
     if (url === '/api/settings/cleanup') return Response.json({ removed: ['other'], nodesRemoved: 12 });
+    if (url === '/api/loop') return Response.json(loopState());
+    if (url === '/api/settings/integrations') return Response.json(integrationsView());
+    if (url === '/api/cloud') return Response.json(cloudOff);
     return Response.json([]);
   }));
 });
@@ -73,7 +81,7 @@ afterEach(() => { history.replaceState(null, '', '#'); });
 test('Settings is split into tabs: Projects first, each other tab one click away and kept in the address', async () => {
   render(<Settings />);
   const tabs = await screen.findByRole('tablist', { name: 'settings sections' });
-  expect(within(tabs).getAllByRole('tab').map((t) => t.textContent)).toEqual(['Projects', 'Integrations', 'Cloud sync', 'Clean up']);
+  expect(within(tabs).getAllByRole('tab').map((t) => t.textContent)).toEqual(['Projects', 'Integrations', 'Cloud sync', 'Learning loop', 'Clean up']);
   expect(screen.getByRole('tab', { name: 'Projects' }).getAttribute('aria-selected')).toBe('true');
   await screen.findByRole('row', { name: 'demo-shop' });
   await openTab('Clean up');
@@ -81,6 +89,14 @@ test('Settings is split into tabs: Projects first, each other tab one click away
   expect(screen.getByRole('region', { name: 'Clean up' })).toBeTruthy();
   expect(screen.queryByRole('row', { name: 'demo-shop' })).toBeNull();
   expect(location.hash).toBe('#settings/cleanup');
+});
+
+test('the Learning loop tab holds the loop settings, and a link opens it', async () => {
+  history.replaceState(null, '', '#settings/loop');
+  render(<Settings />);
+  expect((await screen.findByRole('tab', { name: 'Learning loop' })).getAttribute('aria-selected')).toBe('true');
+  expect(await screen.findByRole('heading', { name: 'Learning loop', level: 2 })).toBeTruthy();
+  expect(screen.getByLabelText('global mode')).toBeTruthy();
 });
 
 test('Settings tabs use arrow, Home and End keys with one tab in the keyboard order', async () => {
@@ -133,12 +149,6 @@ test('unsaved folder changes stay in the bar while another tab is open', async (
 });
 
 test('the comments skipped before the classifier are listed right under Integrations, where comments are set up', async () => {
-  const base = fetch as unknown as (url: string, init?: RequestInit) => Promise<Response>;
-  const svc = { connection: { state: 'not_connected', source: null, detail: 'Not connected.', href: '#settings/integrations-github' }, envSet: false, envVar: 'GITHUB_TOKEN', savedInApp: false, account: null, checkedAt: null, lastSyncAt: null, lastError: null, errorKind: null, rateLimitedUntil: null };
-  vi.stubGlobal('fetch', vi.fn(async (url: string, init?: RequestInit) =>
-    url === '/api/settings/integrations' ? Response.json({ canSave: true, syncMinutes: 10, github: svc, linear: { ...svc, envVar: 'LINEAR_API_KEY' }, projects: [] })
-      : url === '/api/cloud' ? Response.json({ enabled: false, host: null, intervalMinutes: 60, suggestions: false, projects: [], preview: null, previewError: null, last: null, nextAt: null, neverSent: 'x' })
-      : base(url, init)));
   render(<Settings />);
   await openTab('Integrations');
   const rules = await screen.findByRole('list', { name: 'comments skipped before the classifier' });
@@ -181,6 +191,24 @@ test('excluded, alias and missing folders cannot be ticked, and say why', async 
   expect(within(rowOf('shop-copy')).getByText(/follows demo-shop/)).toBeTruthy();
   expect(box('gone').disabled).toBe(true);
   expect(box('other').disabled).toBe(false);
+});
+
+test('on a read-only install no folder can be ticked and no bulk selection changes anything, and they say why', async () => {
+  const { OwnerWrites } = await import('./ownerAccess.tsx');
+  render(<OwnerWrites.Provider value={false}><Settings /></OwnerWrites.Provider>);
+  await screen.findByRole('row', { name: 'demo-shop' });
+  for (const key of ['demo-shop', 'other', 'empty']) {
+    expect(box(key).disabled).toBe(true);
+    expect(box(key).closest('[title]')?.getAttribute('title')).toMatch(/Read-only.*--enable-auth/);
+  }
+  // A locked folder keeps its own reason.
+  expect(box('secret').closest('[title]')?.getAttribute('title')).toMatch(/EXCLUDE_PROJECTS/);
+  for (const name of [/^Select all$/, /^Select none$/, /^Select shown/, /^Select folders with sessions/]) {
+    expect((screen.getByRole('button', { name }) as HTMLButtonElement).disabled).toBe(true);
+  }
+  const { default: userEvent } = await import('@testing-library/user-event');
+  await userEvent.click(box('other'));
+  expect(box('other').checked).toBe(false);
 });
 
 test('search and filters narrow the list', async () => {
@@ -439,4 +467,133 @@ test('lists the rules that skip GitHub and Linear comments before the classifier
   await openTab('Integrations');
   const rules = await screen.findByRole('list', { name: 'comments skipped before the classifier' });
   expect(within(rules).getByText('pr-author-reply')).toBeTruthy();
+});
+
+test('a link to anything else in Settings opens the Projects tab', async () => {
+  history.replaceState(null, '', '#settings/demo-shop');
+  render(<Settings />);
+  expect((await screen.findByRole('tab', { name: 'Projects' })).getAttribute('aria-selected')).toBe('true');
+});
+
+test('roots with no folders under them yet say the folders appear once they exist', async () => {
+  state = { ...body(), candidates: [] };
+  render(<Settings />);
+  expect(await screen.findByText('No project folders found')).toBeTruthy();
+});
+
+test('a search that matches no folder says so, and Clear brings the whole list back', async () => {
+  render(<Settings />);
+  await screen.findByRole('row', { name: 'demo-shop' });
+  fireEvent.click(screen.getByRole('button', { name: /^Selected/ }));
+  fireEvent.change(screen.getByLabelText('search folders'), { target: { value: 'no-such-folder' } });
+  expect(screen.getByText('No folders match')).toBeTruthy();
+  fireEvent.click(screen.getByRole('button', { name: 'Clear search and filters' }));
+  expect(shown()).toHaveLength(6);
+  expect((screen.getByLabelText('search folders') as HTMLInputElement).value).toBe('');
+});
+
+test('a clean up the server refuses says why and keeps the data listed', async () => {
+  const inner = fetch as unknown as (url: string, init?: RequestInit) => Promise<Response>;
+  vi.stubGlobal('fetch', vi.fn(async (url: string, init?: RequestInit) => (url === '/api/settings/cleanup' ? Response.json({ error: 'the worker is writing' }, { status: 409 }) : inner(url, init))));
+  render(<Settings />);
+  await screen.findByRole('row', { name: 'demo-shop' });
+  await openTab('Clean up');
+  const section = within(screen.getByRole('region', { name: 'Clean up' }));
+  fireEvent.click(section.getByRole('button', { name: 'Remove data for 1 unselected project' }));
+  const ask = within(await screen.findByRole('alertdialog'));
+  fireEvent.change(ask.getByLabelText(/type remove-unselected/), { target: { value: 'remove-unselected' } });
+  fireEvent.click(ask.getByRole('button', { name: 'Remove data' }));
+  expect((await screen.findAllByText(/the worker is writing/)).length).toBeGreaterThan(0);
+  expect(section.getByText('other')).toBeTruthy();
+});
+
+test('a long clean-up list shows the first 24 projects, the rest on request', async () => {
+  state = { ...body(), candidates: [...body().candidates, ...Array.from({ length: 30 }, (_, i) => row(`p${String(i).padStart(2, '0')}`, { hasData: true }))] };
+  render(<Settings />);
+  await screen.findByRole('row', { name: 'demo-shop' });
+  await openTab('Clean up');
+  const list = within(screen.getByRole('list', { name: 'unselected projects with data' }));
+  expect(list.getAllByRole('listitem')).toHaveLength(25);
+  fireEvent.click(list.getByRole('button', { name: 'and 7 more' }));
+  expect(list.getAllByRole('listitem')).toHaveLength(32);
+  fireEvent.click(list.getByRole('button', { name: 'Show fewer' }));
+  expect(list.getAllByRole('listitem')).toHaveLength(25);
+});
+
+test('a cloud link opens the Cloud sync tab, also when followed with the page open; a link elsewhere leaves the tab alone', async () => {
+  history.replaceState(null, '', '#settings/cloud');
+  render(<Settings />);
+  expect((await screen.findByRole('tab', { name: 'Cloud sync' })).getAttribute('aria-selected')).toBe('true');
+  await act(async () => { history.replaceState(null, '', '#settings/cleanup'); window.dispatchEvent(new HashChangeEvent('hashchange')); });
+  const cleanupTab = screen.getByRole('tab', { name: 'Clean up' });
+  expect(cleanupTab.getAttribute('aria-selected')).toBe('true');
+  await act(async () => { history.replaceState(null, '', '#lessons'); window.dispatchEvent(new HashChangeEvent('hashchange')); });
+  expect(cleanupTab.getAttribute('aria-selected')).toBe('true');
+  history.replaceState(null, '', '#');
+});
+
+test('a folder that no longer exists cannot be ticked and says so; without a Codex folder mounted, Codex counts say why they are 0', async () => {
+  state = { ...body(), codexSessionsFound: false, candidates: [...body().candidates, row('moved', { exists: false, claudeSessions: 1 })] };
+  render(<Settings />);
+  await screen.findByRole('row', { name: 'moved' });
+  expect(box('moved').disabled).toBe(true);
+  expect(box('moved').closest('[title]')?.getAttribute('title')).toBe('This folder no longer exists, so there is nothing new to read.');
+  expect(screen.getByText(/No Codex sessions folder is mounted/)).toBeTruthy();
+});
+
+test('sorting by Codex, and clicking a header twice turns its order round; folders with no activity stay last', async () => {
+  render(<Settings />);
+  await screen.findByRole('row', { name: 'demo-shop' });
+  fireEvent.click(screen.getByRole('button', { name: /^Codex/ }));
+  expect(shown()[0]).toBe('demo-shop');
+  fireEvent.click(screen.getByRole('button', { name: /^Last activity/ }));
+  fireEvent.click(screen.getByRole('button', { name: /^Last activity/ }));
+  expect(shown()).toEqual(['shop-copy', 'other', 'secret', 'demo-shop', 'empty', 'gone']);
+});
+
+test('clean up waits for a first saved selection, and for unsaved ticks to be saved or cancelled', async () => {
+  state = body({ initialized: false });
+  const { unmount } = render(<Settings />);
+  await screen.findByRole('row', { name: 'demo-shop' });
+  await openTab('Clean up');
+  expect(screen.getByText(/Choose and save your folders first/)).toBeTruthy();
+  unmount();
+  state = body();
+  render(<Settings />);
+  await openTab('Projects');
+  fireEvent.click(box('empty'));
+  await openTab('Clean up');
+  expect(screen.getByText(/Save or cancel your selection first/)).toBeTruthy();
+});
+
+test('a clean up that finds nothing left to remove says so', async () => {
+  const inner = fetch as unknown as (url: string, init?: RequestInit) => Promise<Response>;
+  vi.stubGlobal('fetch', vi.fn(async (url: string, init?: RequestInit) => (url === '/api/settings/cleanup' ? Response.json({ removed: [], nodesRemoved: 0 }) : inner(url, init))));
+  render(<Settings />);
+  await screen.findByRole('row', { name: 'demo-shop' });
+  await openTab('Clean up');
+  fireEvent.click(within(screen.getByRole('region', { name: 'Clean up' })).getByRole('button', { name: 'Remove data for 1 unselected project' }));
+  const ask = within(await screen.findByRole('alertdialog'));
+  fireEvent.change(ask.getByLabelText(/type remove-unselected/), { target: { value: 'remove-unselected' } });
+  fireEvent.click(ask.getByRole('button', { name: 'Remove data' }));
+  expect(await screen.findByText('Nothing to remove: every project with data is selected.')).toBeTruthy();
+});
+
+test('a folder with activity is listed above one without, wherever the server put it', async () => {
+  state = { ...body(), candidates: [row('idle'), row('busy', { claudeSessions: 1, lastActivity: '2026-10-22T10:00:00Z' })] };
+  render(<Settings />);
+  await screen.findByRole('row', { name: 'busy' });
+  expect(shown()).toEqual(['busy', 'idle']);
+});
+
+test('a keyboard Try again after a failed load leaves focus on the tab, not on the page body', async () => {
+  failGet = { status: 503, error: 'graph unreachable' };
+  render(<Settings />);
+  await screen.findByRole('alert');
+  failGet = null;
+  screen.getByRole('button', { name: 'Try again' }).focus();
+  const { default: userEvent } = await import('@testing-library/user-event');
+  await userEvent.keyboard('{Enter}');
+  await screen.findByRole('row', { name: 'demo-shop' });
+  expect(document.activeElement).toBe(screen.getByRole('tab', { name: /projects/i }));
 });

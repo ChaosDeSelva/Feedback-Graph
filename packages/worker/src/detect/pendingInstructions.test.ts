@@ -100,3 +100,11 @@ test('an instruction in a session still active is left pending, whatever came af
     expect(f.cursors.get(INSTRUCTION_RULES_CURSOR)).toBeUndefined();
   }
 });
+
+test('more items than one page are all read: every page of pending and of earlier rejected items', async () => {
+  const id = (p: string, n: number) => `${p}${String(n).padStart(4, '0')}`;
+  const pending = Array.from({ length: 501 }, (_, n) => item(id('p', n), ORDER));
+  const rejected = Array.from({ length: 501 }, (_, n) => item(id('r', n), COMPLAINTS[n % COMPLAINTS.length]));
+  const f = fakes(pending, {}, 'v1', rejected);
+  expect(await resolvePendingInstructions(f.deps)).toEqual({ resolved: 501, reopened: 501 });
+});

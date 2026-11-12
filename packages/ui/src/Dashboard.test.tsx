@@ -1,7 +1,8 @@
-import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
-import { afterEach, beforeEach, expect, test, vi } from 'vitest';
-import { Dashboard } from './Dashboard.tsx';
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { afterEach, beforeEach, expect, onTestFinished, test, vi } from 'vitest';
+import { Dashboard, PathLine, queueLine, waitedFor } from './Dashboard.tsx';
 import { chatHref, newChatHref } from './links.ts';
+import { loopMetrics, loopState } from './testing/loop.ts';
 
 const ok = (provider: string) => ({ provider, ok: true, reason: null });
 const status = {
@@ -32,6 +33,8 @@ const activity = [
 const routes: Record<string, unknown> = {
   '/api/status': status, '/api/pipeline': pipeline, '/api/patterns': report, '/api/projects': projects,
   '/api/codemap/hotspots?limit=8': hotspots, '/api/codemap/hotspots?limit=8&misses=1': hotspots.filter((h) => h.misses > 0), '/api/activity?limit=10': activity,
+  '/api/loop': loopState(),
+  '/api/loop/metrics': loopMetrics(),
   '/api/chats': [
     { id: 'c1', projectKey: 'acme', title: 'Where do modals live?', provider: 'claude', createdAt: '2026-10-24T10:00:00Z', updatedAt: new Date(Date.now() - 3_600_000).toISOString(), pending: false },
   ],
@@ -49,7 +52,7 @@ function serve(over: Record<string, unknown> = {}) {
   }));
 }
 beforeEach(() => { serve(); location.hash = '#dashboard'; });
-afterEach(() => { cleanup(); vi.unstubAllGlobals(); });
+afterEach(() => { vi.useRealTimers(); cleanup(); vi.unstubAllGlobals(); });
 
 const region = (name: RegExp | string) => screen.findByRole('region', { name });
 
@@ -278,3 +281,263 @@ test('ask: the model to answer with can be chosen here too, and goes with the qu
   expect(location.hash).toBe(newChatHref('demo-shop', 'where do routes go?', 'codex'));
   expect(location.hash).toContain('provider=codex');
 });
+
+test('ask: on a read-only install the box, starters, suggestions and Ask are off, so nothing reaches a 403', async () => {
+  const { OwnerWrites } = await import('./ownerAccess.tsx');
+  render(<OwnerWrites.Provider value={false}><Dashboard /></OwnerWrites.Provider>);
+  const ask = await region(/^ask$/i);
+  const box = within(ask).getByLabelText('question') as HTMLTextAreaElement;
+  expect(box.disabled).toBe(true);
+  expect((within(ask).getByRole('button', { name: 'Ask' }) as HTMLButtonElement).disabled).toBe(true);
+  expect((within(ask).getByRole('button', { name: /where should a new api endpoint go/i }) as HTMLButtonElement).disabled).toBe(true);
+  const suggested = within(await within(ask).findByRole('list', { name: 'suggested questions' }));
+  const hotspot = await suggested.findByRole('button', { name: /src\/db\/pool\.ts/ }) as HTMLButtonElement;
+  expect(hotspot.disabled).toBe(true);
+  fireEvent.click(hotspot);
+  fireEvent.keyDown(box, { key: 'Enter' });
+  expect(location.hash).toBe('#dashboard');
+});
+
+test('the tables that scroll sideways at phone width can be reached and scrolled by keyboard', async () => {
+  const { overflowAll, unreachableScrollers } = await import('./ui/scrollReach.ts');
+  onTestFinished(overflowAll());
+  const { container } = render(<Dashboard />);
+  await screen.findByRole('region', { name: 'projects table' });
+  await screen.findByRole('region', { name: 'files with misses table' });
+  expect(unreachableScrollers(container).map((e) => e.outerHTML.slice(0, 80))).toEqual([]);
+});
+
+test('a queue that only runs says none are waiting; a wait of days reads in days', () => {
+  const now = Date.parse('2026-11-10T12:00:00Z');
+  expect(waitedFor('2026-11-07T11:00:00Z', now)).toBe('3 d');
+  expect(waitedFor('2026-11-08T13:00:00Z', now)).toBe('47 h');
+  const since = new Date(Date.now() - 5 * 60_000).toISOString();
+  expect(queueLine('chats', { waiting: 0, oldestAt: null, running: [{ what: 'conversation c1', since }] })).toBe('Ask queue: none waiting; running conversation c1 for 5 min');
+});
+
+test('a pipeline that cannot load shows why in its own section', async () => {
+  serve({ '/api/pipeline': new Error('pipeline broke') });
+  render(<Dashboard />);
+  await waitFor(() => expect(screen.getAllByRole('alert').map((a) => a.textContent)).toContain('pipeline broke'));
+  expect(screen.queryByLabelText('inbox, waiting on you')).toBeNull();
+});
+
+test('ask: with no conversations yet it says questions are kept here', async () => {
+  serve({ '/api/chats': [] });
+  render(<Dashboard />);
+  const ask = await region(/^ask$/i);
+  expect(await within(ask).findByText(/No chats yet: your questions are kept here/)).toBeTruthy();
+});
+
+test('the Learning loop card shows this week, the rollback rate and Pause, and an older API without the loop shows none', async () => {
+  render(<Dashboard />);
+  const card = await screen.findByRole('region', { name: 'Learning loop' });
+  expect(await within(card).findByText(/9 applied, 5 proposed/)).toBeTruthy();
+  expect(within(card).getByRole('button', { name: 'Pause learning' })).toBeTruthy();
+  cleanup();
+  vi.stubGlobal('fetch', vi.fn(async (url: string) => (url === '/api/loop' ? Response.json({ error: 'not found' }, { status: 404 }) : Response.json((routes as Record<string, unknown>)[url] ?? []))));
+  render(<Dashboard />);
+  await screen.findByRole('region', { name: 'Now' });
+  await waitFor(() => expect(screen.queryByRole('region', { name: 'Learning loop' })).toBeNull());
+});
+
+test('a section that could not be shown is tried again with the next poll, and shows once the answer is whole', async () => {
+  vi.useFakeTimers({ shouldAdvanceTime: true });
+  try {
+    serve({ '/api/status': { ...status, models: { classify: null } } });
+    render(<Dashboard />);
+    const now = await region(/^now$/i);
+    expect((await within(now).findByRole('alert')).textContent).toMatch(/could not be shown/i);
+    serve();
+    await act(async () => { await vi.advanceTimersByTimeAsync(30_000); });
+    await waitFor(() => expect(within(now).queryByRole('alert')).toBeNull());
+    expect(within(now).getByText('classifier')).toBeTruthy();
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test('now: a model with no job label is named by its job, one down without a reason says unavailable since when; embeddings and the last worker error', async () => {
+  serve({
+    '/api/status': {
+      ...status,
+      models: { chat: { provider: 'codex-cli', ok: false, reason: null, since: '2026-10-24T10:00:00Z' } },
+      ollama: { ok: false, reason: null, url: 'http://ollama:11434' },
+      worker: { version: '0.7.6', lastBeat: new Date().toISOString(), lastError: 'scan parked' },
+    },
+  });
+  render(<Dashboard />);
+  const now = await region(/^now$/i);
+  expect(await within(now).findByText('chat')).toBeTruthy();
+  expect(within(now).getByText(/^unavailable \(since /)).toBeTruthy();
+  expect(within(now).getByText('not answering at http://ollama:11434')).toBeTruthy();
+  expect(within(now).getByText(/last error: scan parked/)).toBeTruthy();
+  cleanup();
+  serve({ '/api/status': { ...status, ollama: { ok: true, reason: null, url: 'http://ollama:11434' } } });
+  render(<Dashboard />);
+  const embeddings = await within(await region(/^now$/i)).findByText('embeddings');
+  expect(embeddings.className).toMatch(/\bok\b|text-ok/);
+});
+
+test('a wait under a minute reads in seconds; a queue with no oldest time says only how many wait', () => {
+  const now = Date.parse('2026-11-10T12:00:00Z');
+  expect(waitedFor('2026-11-10T11:59:20Z', now)).toBe('40 s');
+  expect(queueLine('scans', { waiting: 3, oldestAt: null, running: [] })).toBe('Scan queue: 3 waiting');
+});
+
+test('pipeline: a classify backlog the worker counted in full has no plus', async () => {
+  serve({ '/api/pipeline': { ...pipeline, classify: { backlog: 12, capped: false }, lessons: { proposed: 3, approved: 7, global: 1 } } });
+  render(<Dashboard />);
+  expect((await screen.findByLabelText('turns to classify')).textContent).toMatch(/^12$|12(?!\+)/);
+  expect(await screen.findByRole('link', { name: '1 global lesson' })).toBeTruthy();
+});
+
+test('projects: a scan still queued is dated by its request; a project from an API without link counts shows a dash', async () => {
+  const { links: _, ...noLinks } = projects[1];
+  serve({ '/api/projects': [{ ...noLinks, lastScan: { ...scan, status: 'queued', finishedAt: null } }] });
+  render(<Dashboard />);
+  const table = await region(/^projects$/i);
+  await waitFor(() => expect(within(table).getByLabelText('links').textContent).toBe('–'));
+  expect(within(table).getByText('queued')).toBeTruthy();
+});
+
+test('ask: a hotspot with one past miss says so in the singular; a chat still answering says so', async () => {
+  serve({
+    '/api/codemap/hotspots?limit=8': [{ ...hotspots[0], misses: 1 }],
+    '/api/chats': [{ id: 'c1', projectKey: 'acme', title: 'Where do modals live?', provider: 'claude', createdAt: '2026-10-24T10:00:00Z', updatedAt: new Date().toISOString(), pending: true }],
+  });
+  render(<Dashboard />);
+  expect(await screen.findByText(/a hotspot, 1 past miss$/)).toBeTruthy();
+  expect(await screen.findByText(/· answering$/)).toBeTruthy();
+});
+
+test('a model job this release does not know is listed by the name the worker sent', async () => {
+  serve({ '/api/status': { ...status, models: { rerank: ok('ollama:bge') } } });
+  render(<Dashboard />);
+  expect(await within(await region(/^now$/i)).findByText('rerank')).toBeTruthy();
+});
+
+test('with the API down the page shows one alert, not one per section, and every section loads once it answers', async () => {
+  // Retries run on fake timers that also follow the clock, so the check below can step well past several of them.
+  vi.useFakeTimers({ shouldAdvanceTime: true });
+  let down = true;
+  const working = fetch;
+  vi.stubGlobal('fetch', vi.fn(async (url: string, init?: RequestInit) => { if (down) throw new TypeError('Failed to fetch'); return working(url, init); }));
+  render(<Dashboard retryMs={20} />);
+  await waitFor(() => expect(screen.getAllByText('Not loaded yet: shown when the API answers.').length).toBeGreaterThan(4));
+  const alert = screen.getByRole('alert');
+  expect(alert.textContent).toMatch(/Could not reach the Feedback Graph API/);
+  await act(() => vi.advanceTimersByTimeAsync(200));
+  expect(screen.getAllByRole('alert')).toEqual([alert]);
+  down = false;
+  expect(await screen.findByText('approved "scope every query by tenant"', {}, { timeout: 5000 })).toBeTruthy();
+  await waitFor(() => expect(screen.queryByRole('alert')).toBeNull(), { timeout: 15000 });
+  expect(screen.getAllByText('demo-shop').length).toBeGreaterThan(0);
+}, 30000);
+
+test('ask: a suggested question keeps a long path on one line, cut in its folders, never mid file name, with the full path to hover', async () => {
+  const path = 'packages/portal/main/src/segments/api/rpc/tools/very/deep/folder/handlers/orderListing.ts';
+  render(<PathLine path={path} />);
+  const line = screen.getByTitle(path);
+  const [folders, file] = [...line.children] as HTMLElement[];
+  expect(folders.textContent).toBe(path.slice(0, path.lastIndexOf('/') + 1));
+  expect(folders.className).toMatch(/\btruncate\b/);
+  expect(file.textContent).toBe('orderListing.ts');
+  expect(file.className).toMatch(/\bshrink-0\b/);
+  cleanup();
+  render(<PathLine path="README.md" />);
+  expect(screen.getByTitle('README.md').children).toHaveLength(1);
+});
+
+test('now: a job whose Codex runner is off on purpose is neutral, with what to do, and a failing one stays red', async () => {
+  serve({ '/api/status': { ...status, models: { scan: { provider: 'codex-cli', ok: false, reason: 'sandbox: nested sandbox startup failed', disabled: true }, docs: { provider: 'codex-cli', ok: false, reason: 'login expired' } } } });
+  render(<Dashboard />);
+  const now = await region(/^now$/i);
+  const off = await within(now).findByText(/^Codex runner off on this machine \(sandbox: nested sandbox startup failed\): paused/);
+  expect(off.className).not.toMatch(/bad/);
+  expect(off.closest('li')!.innerHTML).not.toMatch(/bad/);
+  expect(within(now).getByText('login expired').className).toMatch(/text-bad-text/);
+});
+
+test('ask: the starter questions share one row as wide as the box, each cut to fit with its full text as its name and title', async () => {
+  render(<Dashboard />);
+  const ask = await region(/^ask$/i);
+  const row = within(ask).getByRole('group', { name: 'starter questions' });
+  expect(row.className).not.toMatch(/flex-wrap/);
+  expect(row.className).toMatch(/overflow-x-auto/);
+  const chips = within(row).getAllByRole('button');
+  expect(chips.length).toBeGreaterThan(1);
+  for (const c of chips) {
+    expect(c.className).toMatch(/\btruncate\b/);
+    expect(c.className).toMatch(/\bflex-1\b.*\bbasis-0\b/);
+    expect(c.getAttribute('title')).toBe(c.textContent);
+    expect(c.getAttribute('aria-label')).toBe(c.textContent);
+  }
+  // The box spans the page width like the cards below it: no narrower max width.
+  expect(within(ask).getByLabelText('question').closest('form')!.className).not.toMatch(/max-w-/);
+});
+
+test('the learning-loop metrics card shows each measure with its n and interval, per week, and rollbacks by type', async () => {
+  render(<Dashboard />);
+  const card = await region('Learning-loop metrics');
+  expect(await within(card).findByLabelText('Gaps fixed per serving')).toBeTruthy();
+  expect(within(card).getByLabelText('Gaps fixed per serving').textContent).toBe('Gaps fixed per serving3%1 of 40 servings · 95% 0%–13%');
+  expect(within(card).getByLabelText('Not applicable').textContent).toMatch(/40%12 of 30 verdicts/);
+  expect(within(card).getByText('last 8 weeks, from 2026-W39')).toBeTruthy();
+  expect(within(card).getByText('Proposals per week (6 in all)')).toBeTruthy();
+  expect(within(card).getByLabelText('2026-W46: 3 proposals')).toBeTruthy();
+  // Only types with something applied, each with its interval.
+  expect(within(card).getByText(/Rolled back, by type/).parentElement!.textContent).toBe('Rolled back, by type: retire lesson 1 of 10 (95% 2%–40%)');
+});
+
+test('the repeat rate and the checks that caught a gap show once on the Dashboard, in Quality, not again in the metrics card', async () => {
+  render(<Dashboard />);
+  const card = await region('Learning-loop metrics');
+  await within(card).findByLabelText('Not applicable');
+  expect(within(card).queryByLabelText(/repeat rate/i)).toBeNull();
+  expect(within(card).queryByLabelText(/caught a gap/i)).toBeNull();
+  expect(within(card).queryByText(/repeats of/)).toBeNull();
+  const quality = await region('Quality');
+  expect(await within(quality).findByLabelText('repeat rate')).toBeTruthy();
+  expect(screen.getAllByLabelText(/^repeat rate$/i)).toHaveLength(1);
+  expect(screen.getAllByLabelText(/^checks that caught a gap$/i)).toHaveLength(1);
+});
+
+test('a metrics tile says one check, not one checks, and never cuts its interval', async () => {
+  const one = { k: 0, n: 1, rate: 0, ciLow: 0, ciHigh: 0.95 };
+  serve({ '/api/loop/metrics': { ...loopMetrics(), gapsFixedPerServed: one, notApplicableShare: one } });
+  render(<Dashboard />);
+  const card = await region('Learning-loop metrics');
+  const tile = await within(card).findByLabelText('Not applicable');
+  expect(tile.textContent).toBe('Not applicable0%0 of 1 verdict · 95% 0%–95%');
+  expect(within(card).getByLabelText('Gaps fixed per serving').textContent).toMatch(/0 of 1 serving ·/);
+  // A half-width tile on a phone wraps the hint rather than cutting it at two lines ("95% 90%–…").
+  expect(within(tile).getByText(/0 of 1 verdict/).className).not.toMatch(/line-clamp/);
+});
+
+test('the metrics card is quiet before anything is measured, and absent on an API without metrics', async () => {
+  serve({ '/api/loop/metrics': loopMetrics(true) });
+  render(<Dashboard />);
+  const card = await region('Learning-loop metrics');
+  expect(await within(card).findByText(/Nothing measured yet/)).toBeTruthy();
+  expect(within(card).queryByLabelText('Not applicable')).toBeNull();
+  cleanup();
+  vi.stubGlobal('fetch', vi.fn(async (url: string) => (url === '/api/loop/metrics' ? Response.json({ error: 'no metrics' }, { status: 404 }) : Response.json(routes[url] ?? []))));
+  render(<Dashboard />);
+  await screen.findByRole('region', { name: 'Learning loop' });
+  await waitFor(() => expect(screen.queryByRole('region', { name: 'Learning-loop metrics' })).toBeNull());
+  expect(screen.queryByText(/could not be shown/)).toBeNull();
+});
+
+test('the metrics card waits through an API outage with the rest of the page, and fills in once it answers', async () => {
+  vi.useFakeTimers({ shouldAdvanceTime: true });
+  let down = true;
+  const working = fetch;
+  vi.stubGlobal('fetch', vi.fn(async (url: string, init?: RequestInit) => { if (down) throw new TypeError('Failed to fetch'); return working(url, init); }));
+  render(<Dashboard retryMs={20} />);
+  const card = await region('Learning-loop metrics');
+  expect(await within(card).findByText('Not loaded yet: shown when the API answers.')).toBeTruthy();
+  expect(within(card).queryByRole('alert')).toBeNull();
+  down = false;
+  expect(await within(card).findByLabelText('Not applicable', {}, { timeout: 5000 })).toBeTruthy();
+}, 30000);

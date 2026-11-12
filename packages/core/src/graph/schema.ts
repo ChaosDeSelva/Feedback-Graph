@@ -48,6 +48,12 @@ export const SCHEMA = [
   'CREATE CONSTRAINT activity_id IF NOT EXISTS FOR (n:Activity) REQUIRE n.id IS UNIQUE',
   'CREATE INDEX activity_order IF NOT EXISTS FOR (n:Activity) ON (n.order)',
   'CREATE INDEX activity_project IF NOT EXISTS FOR (n:Activity) ON (n.projectKey)',
+  // The log by kind in its order (the loop's fold, record_fact, tune_threshold), and by the records an entry names: a
+  // list property has no index, so each entry -[:ABOUT]-> an (:ActivityTarget {id}) key per target (graph/activity.ts).
+  'CREATE INDEX activity_kind_order IF NOT EXISTS FOR (n:Activity) ON (n.kind, n.order)',
+  'CREATE CONSTRAINT activity_target_id IF NOT EXISTS FOR (n:ActivityTarget) REQUIRE n.id IS UNIQUE',
+  // Start-up work the api and the worker must not both do, and one-off upgrades (graph/schemaTasks.ts).
+  'CREATE CONSTRAINT schema_task_id IF NOT EXISTS FOR (n:SchemaTask) REQUIRE n.id IS UNIQUE',
   'CREATE CONSTRAINT doc_id IF NOT EXISTS FOR (n:Doc) REQUIRE n.id IS UNIQUE',
   'CREATE CONSTRAINT chunk_id IF NOT EXISTS FOR (n:Chunk) REQUIRE n.id IS UNIQUE',
   'CREATE CONSTRAINT project_selection_id IF NOT EXISTS FOR (n:ProjectSelection) REQUIRE n.id IS UNIQUE',
@@ -73,6 +79,15 @@ export const SCHEMA = [
   ),
   // Who opened each run (RunsStore.claim): unique, so two first writes racing MERGE into one owner.
   'CREATE CONSTRAINT run_owner_run IF NOT EXISTS FOR (n:RunOwner) REQUIRE n.run IS UNIQUE',
+  // The learning loop (graph/decisions.ts). Decisions are listed by status, type, project, age and when applied, and
+  // the held ones (cloud sync hold) found by syncHoldUntil; notes by decision.
+  'CREATE CONSTRAINT decision_id IF NOT EXISTS FOR (n:Decision) REQUIRE n.id IS UNIQUE',
+  ...['status', 'type', 'projectKey', 'createdAt', 'appliedAt', 'syncHoldUntil'].map((p) => `CREATE INDEX decision_${p.toLowerCase()} IF NOT EXISTS FOR (n:Decision) ON (n.${p})`),
+  'CREATE CONSTRAINT decision_target_id IF NOT EXISTS FOR (n:DecisionTarget) REQUIRE n.id IS UNIQUE',
+  'CREATE CONSTRAINT decision_note_id IF NOT EXISTS FOR (n:DecisionNote) REQUIRE n.id IS UNIQUE',
+  'CREATE INDEX decision_note_decision IF NOT EXISTS FOR (n:DecisionNote) ON (n.decisionId)',
+  'CREATE CONSTRAINT lesson_signals_lesson IF NOT EXISTS FOR (n:LessonSignals) REQUIRE n.lessonId IS UNIQUE',
+  'CREATE CONSTRAINT loop_calibration_key IF NOT EXISTS FOR (n:LoopCalibration) REQUIRE n.key IS UNIQUE',
 ];
 
 export const EMBEDDING_DIMENSIONS = 768;

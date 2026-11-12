@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import ForceGraph2D, { type ForceGraphMethods } from 'react-force-graph-2d';
-import { api, type EvidenceGraph, type ProjectSummary } from './api.ts';
+import { api, type EvidenceGraph, type ProjectSummary, errorMessage } from './api.ts';
 import { CodeGraph } from './CodeGraph.tsx';
 import { FirstRun } from './FirstRun.tsx';
 import { PageHeader } from './ui/PageHeader.tsx';
@@ -10,6 +10,7 @@ import { MAX_FIT_ZOOM, useSize } from './ui/graphCanvas.ts';
 import { evidenceLinkLabel, evidenceNodeLabel } from './ui/graphLabels.ts';
 import { GraphIcon } from './ui/icons.tsx';
 import { readToken, useTheme } from './ui/theme.ts';
+import { ScrollArea } from './ui/ScrollArea.tsx';
 
 const MODES = ['evidence', 'code'] as const;
 type Mode = (typeof MODES)[number];
@@ -55,7 +56,7 @@ export function Graph() {
       setProjects(ps);
       setProject(ps.find((p) => p.feedback > 0)?.key ?? ps[0]?.key ?? null);
       setLoadedProjects(true);
-    }, (e) => { setError(String(e)); setLoadedProjects(true); });
+    }, (e) => { setError(errorMessage(e)); setLoadedProjects(true); });
   }, []);
 
   useEffect(() => {
@@ -65,7 +66,7 @@ export function Graph() {
     fitted.current = false;
     // A slow graph for the project you left must not be drawn under the one you picked.
     let stale = false;
-    api.graph(project).then((g) => { if (!stale) setGraphLabelled(g); }, (e) => { if (!stale) setError(String(e)); });
+    api.graph(project).then((g) => { if (!stale) setGraphLabelled(g); }, (e) => { if (!stale) setError(errorMessage(e)); });
     return () => { stale = true; };
   }, [project, mode]);
 
@@ -104,7 +105,7 @@ export function Graph() {
         <EmptyState icon={<GraphIcon />} title="No project yet" className="pt-24">Choose project folders in Settings; the worker maps their code.</EmptyState>
       ))}
       {/* Hidden rather than unmounted in Code mode, so its canvas keeps its size observer. */}
-      <div hidden={mode === 'code'} className="grid min-h-0 flex-1 grid-cols-1 grid-rows-[minmax(22rem,1fr)_auto] overflow-y-auto md:grid-cols-[minmax(0,1fr)_20rem] md:grid-rows-1 md:overflow-hidden">
+      <ScrollArea hidden={mode === 'code'} className="grid min-h-0 flex-1 grid-cols-1 grid-rows-[minmax(22rem,1fr)_auto] overflow-y-auto md:grid-cols-[minmax(0,1fr)_20rem] md:grid-rows-1 md:overflow-hidden">
         <div ref={box} className="relative min-h-0 overflow-hidden bg-surface">
           {error && <Alert className="absolute top-3 right-3 left-3 z-10">{error}</Alert>}
           <ul aria-label="legend" className="absolute top-3 left-3 z-10 flex max-w-[calc(100%-1.5rem)] flex-wrap gap-x-3 gap-y-1 rounded-md border border-line bg-surface/90 px-2.5 py-1.5 text-xs text-muted shadow-card backdrop-blur">
@@ -124,8 +125,7 @@ export function Graph() {
               onEngineStop={() => {
                 if (fitted.current) return;
                 fitted.current = true;
-                const g = fg.current;
-                if (!g) return;
+                const g = fg.current!;
                 g.zoomToFit(400, 48);
                 // A handful of nodes would otherwise be blown up to fill the canvas.
                 setTimeout(() => { if (g.zoom() > MAX_FIT_ZOOM) g.zoom(MAX_FIT_ZOOM, 250); }, 420);
@@ -141,7 +141,8 @@ export function Graph() {
                 const r = Math.sqrt(size(n)) * 4;
                 const on = selected?.id === n.id;
                 ctx.beginPath();
-                ctx.arc(n.x ?? 0, n.y ?? 0, r, 0, 2 * Math.PI);
+                // force-graph places every node before it draws one.
+                ctx.arc(n.x!, n.y!, r, 0, 2 * Math.PI);
                 ctx.fillStyle = palette.node[n.kind];
                 ctx.fill();
                 ctx.lineWidth = (on ? 3 : 1.5) / scale;
@@ -153,16 +154,16 @@ export function Graph() {
               linkLabel={evidenceLinkLabel}
               linkDirectionalArrowLength={3}
               linkDirectionalArrowRelPos={1}
-              onNodeClick={(n: Node) => setSelected(byId.get(n.id) ?? null)}
+              onNodeClick={(n: Node) => setSelected(byId.get(n.id)!)}
             />
           ) : data || (loadedProjects && !project) ? (
-            <div className="h-full overflow-y-auto">
+            <ScrollArea className="h-full overflow-y-auto">
               {/* Where the pipeline stands for the project picked, under the legend. */}
               {project && <div className="pt-12"><FirstRun key={project} view="graph" project={project} force /></div>}
               <EmptyState icon={<GraphIcon />} title="No evidence graph yet" className={project ? 'pt-10' : 'pt-24'}>
                 Confirm feedback in the Inbox. Once its post-mortem runs, the miss, its cause and the lesson appear here.
               </EmptyState>
-            </div>
+            </ScrollArea>
           ) : (
             <div role="status" aria-label="loading" className="grid h-full place-items-center">
               <div className="grid justify-items-center gap-3">
@@ -173,7 +174,7 @@ export function Graph() {
           )}
         </div>
 
-        <aside aria-label="node details" className="min-h-0 min-w-0 overflow-y-auto border-t border-line bg-canvas p-4 md:border-t-0 md:border-l">
+        <ScrollArea as="aside" aria-label="node details" className="min-h-0 min-w-0 overflow-y-auto border-t border-line bg-canvas p-4 md:border-t-0 md:border-l">
           {selected ? (
             <div className="flex flex-col gap-3">
               <div className="flex items-center gap-2">
@@ -207,8 +208,8 @@ export function Graph() {
               Click a node to see its evidence. Red misses link the feedback you gave to its cause, the lesson drawn from it, and the context that would have prevented it.
             </p>
           )}
-        </aside>
-      </div>
+        </ScrollArea>
+      </ScrollArea>
     </div>
   );
 }

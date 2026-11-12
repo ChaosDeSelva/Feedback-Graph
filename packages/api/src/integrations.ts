@@ -3,7 +3,7 @@ import { z } from 'zod';
 import {
   DEFAULT_LINK, ENV_VAR, FEEDBACK_SKIP_RULES, githubRepoOfRemote, githubViewer, integrationErrorKind, linearViewer, listLinearTeams, redactSecrets, tokenFingerprint,
   type ActivityStore, type CloudConfig, type Connection, type ConnectionName, type IntegrationCheck, type IntegrationKind, type Integrations,
-  type IntegrationSyncState, type LinearTeam, type ManualSync, type ModelHealth, type ModelJob, type OllamaHealth, type PrBacklog, type WorkerStatus,
+  type IntegrationSyncState, type LinearTeam, type ManualSync, type ModelHealth, type ModelJob, RUNNER_OFF_FIX, runnerOffLine, type OllamaHealth, type PrBacklog, type WorkerStatus,
 } from '@fb/core';
 
 /**
@@ -100,7 +100,7 @@ const LinkPatch = z
 /** For the OpenAPI document (openapi.ts). */
 export const integrationSchemas = { Token, LinkPatch };
 
-const when = (iso: string | null) => (iso ? new Date(iso).toISOString().replace('T', ' ').slice(0, 16) + ' UTC' : null);
+const when = (iso: string) => new Date(iso).toISOString().replace('T', ' ').slice(0, 16) + ' UTC';
 
 /**
  * A service's state from its token, the last check and the worker's last sync: not connected (no token), error (the
@@ -255,7 +255,7 @@ export function integrationRoutes(app: Hono, d: IntegrationsDeps) {
     const k = kind.data;
     if (!i.canSave) return c.json({ error: `tokens cannot be saved here (no INTEGRATIONS_FILE): set ${ENV_VAR[k]} in .env instead` }, 501);
     const body = Token.safeParse(await c.req.json().catch(() => null));
-    if (!body.success) return c.json({ error: body.error.issues[0]?.message ?? 'send { "token": "..." }' }, 400);
+    if (!body.success) return c.json({ error: body.error.issues[0].message }, 400);
     const check = await checkToken(d, k, body.data.token, 'app');
     if (!check.ok) return c.json({ error: `${NAME[k]} did not accept this token, so it was not saved: ${check.error}` }, 400);
     await i.saveCredential(k, body.data.token);
@@ -332,7 +332,11 @@ function agentConnection(name: 'claude' | 'codex', w: WorkerStatus | null, model
   }
   // /api/status applies live Ollama and codex-runner readiness on top of the worker's last report. Use that effective
   // state here too: a configured provider is not "connected" while its runner/sandbox is unavailable.
-  const down = jobs.map((j) => models?.[j as ModelJob] ?? w.health?.[j as keyof NonNullable<WorkerStatus['health']>]).find((h) => h && !h.ok);
+  const health = jobs.map((j) => [j, models?.[j as ModelJob] ?? w.health?.[j as keyof NonNullable<WorkerStatus['health']>]] as const);
+  const down = health.map(([, h]) => h).find((h) => h && !h.ok && !(h as ModelHealth).disabled);
+  // Turned off on purpose (the runner's safety flag): not a problem to fix in a hurry, so not shown as one.
+  const off = health.filter(([, h]) => (h as ModelHealth | undefined)?.disabled).map(([j]) => j);
+  if (!down && off.length) return { state: 'not_connected', source: 'env', detail: `${runnerOffLine(off)} (${(models?.[off[0] as ModelJob]?.reason) ?? 'no reason recorded'}). ${RUNNER_OFF_FIX}`, href };
   if (down) return { state: 'error', source: 'env', detail: `${label} did not answer: ${down.reason}`, href };
   return { state: 'connected', source: 'env', detail: `${label} runs: ${jobs.join(', ')}.`, href };
 }

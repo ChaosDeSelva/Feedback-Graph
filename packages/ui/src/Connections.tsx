@@ -1,3 +1,4 @@
+import { asIs, labelOf } from './labels.ts';
 import { useEffect, useRef, useState } from 'react';
 import type { Connection, ConnectionName } from './api.ts';
 import { CONNECTION_LABEL } from './Integrations.tsx';
@@ -12,6 +13,7 @@ const STATE: Record<Connection['state'], string> = { connected: 'connected', err
 export function ConnectionsBadge({ connections, collapsed = false }: { connections: Record<ConnectionName, Connection>; collapsed?: boolean }) {
   const [open, setOpen] = useState(false);
   const root = useRef<HTMLDivElement>(null);
+  const toggle = useRef<HTMLButtonElement>(null);
   const names = (Object.keys(CONNECTION_LABEL) as ConnectionName[]).filter((n) => connections[n]);
   const errors = names.filter((n) => connections[n].state === 'error');
   const connected = names.filter((n) => connections[n].state === 'connected');
@@ -28,7 +30,12 @@ export function ConnectionsBadge({ connections, collapsed = false }: { connectio
   useEffect(() => {
     if (!open) return;
     const onDown = (e: MouseEvent) => { if (!root.current?.contains(e.target as Node)) setOpen(false); };
-    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setOpen(false); };
+    // Escape from inside the list puts focus back on the button, not on the page body the closed list leaves behind.
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape') return;
+      if (root.current?.contains(document.activeElement)) toggle.current?.focus();
+      setOpen(false);
+    };
     document.addEventListener('mousedown', onDown);
     document.addEventListener('keydown', onKey);
     return () => { document.removeEventListener('mousedown', onDown); document.removeEventListener('keydown', onKey); };
@@ -37,6 +44,7 @@ export function ConnectionsBadge({ connections, collapsed = false }: { connectio
   return (
     <div ref={root} className="relative">
       <button
+        ref={toggle}
         type="button"
         aria-expanded={open}
         aria-label={`Connections: ${label}`}
@@ -45,7 +53,7 @@ export function ConnectionsBadge({ connections, collapsed = false }: { connectio
         className={`flex h-8 w-full items-center gap-2 rounded-sm border px-2 text-xs ${errors.length ? 'border-bad/40 bg-bad-soft text-bad-text' : 'border-line bg-surface text-muted'} hover:bg-hover ${collapsed ? 'md:justify-center md:px-0' : ''}`}
       >
         <span aria-hidden="true" className={`flex shrink-0 gap-0.5 ${collapsed ? 'md:flex-col' : ''}`}>
-          {names.map((n) => <span key={n} className={`size-1.5 rounded-full ${DOT[connections[n].state]}`} />)}
+          {names.map((n) => <span key={n} className={`size-1.5 rounded-full ${labelOf(DOT, connections[n].state, () => DOT.not_connected)}`} />)}
         </span>
         <span className={`min-w-0 flex-1 truncate text-left font-medium ${collapsed ? 'md:sr-only' : ''}`}>{label}</span>
       </button>
@@ -58,10 +66,10 @@ export function ConnectionsBadge({ connections, collapsed = false }: { connectio
                 <li key={n}>
                   <a href={c.href} onClick={() => setOpen(false)} className="grid gap-0.5 rounded-sm px-2 py-1.5 hover:bg-hover">
                     <span className="flex items-center gap-2 text-[13px]">
-                      <span aria-hidden="true" className={`size-2 rounded-full ${DOT[c.state]}`} />
+                      <span aria-hidden="true" className={`size-2 rounded-full ${labelOf(DOT, c.state, () => DOT.not_connected)}`} />
                       <span className="font-medium">{CONNECTION_LABEL[n]}</span>
                       <span className={`ml-auto text-[11px] ${c.state === 'error' ? 'text-bad-text' : 'text-muted'}`}>
-                        {STATE[c.state]}{c.source === 'env' ? ' · .env' : c.source === 'app' ? ' · app' : ''}
+                        {labelOf(STATE, c.state, asIs)}{c.source === 'env' ? ' · .env' : c.source === 'app' ? ' · app' : ''}
                       </span>
                     </span>
                     <span className="text-[11.5px] leading-snug text-muted [overflow-wrap:anywhere]">{c.detail}</span>

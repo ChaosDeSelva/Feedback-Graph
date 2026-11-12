@@ -6,7 +6,7 @@ import { describe, expect, test } from 'vitest';
 import { createApp, type ApiRepo } from './app.ts';
 import { connectionsStatus, serviceConnection, type IntegrationsDeps } from './integrations.ts';
 
-const repo = { listCandidates: async () => [], candidateDetail: async () => null, decide: async () => {}, stats: async () => [] } as ApiRepo;
+const repo = { undoDecision: async () => false, listCandidates: async () => [], candidateDetail: async () => null, decide: async () => {}, stats: async () => [] } as ApiRepo;
 // Built at runtime: push protection rejects token-shaped literals.
 const TOKEN = ['github', 'pat', '11AAAA', 'x'.repeat(40)].join('_');
 const OWNER = 'owner-test-token-01234567890123456789';

@@ -118,13 +118,15 @@ describe('search_graph', () => {
     });
     const md = (await searchGraph({ cwd: '/Users/j/Vibe/acme', query: 'fix the checkout total' }, d)).markdown;
     expect(md.length).toBeLessThan(3_300);
-    expect(md).not.toContain('Checkout lesson 0');
+    // Long lessons found by meaning are shown as search matches, without crowding out misses and facts.
+    expect(md).toMatch(/Checkout lesson 0[\s\S]*by meaning: check it applies/);
     expect(md).toContain('missed the checkout total rounding in case 0');
     expect(md).toContain('Checkout fact 0');
     // Each section that held items back says how many.
-    expect(md).not.toContain('Checkout lesson 0');
-    expect(md).toMatch(/match 0\.\d\d\/0\.\d\d\d/);
-    expect(md).toContain('Checkout fact 9');
+    expect(md).toMatch(/match 0\.\d\d(?![/\d])/);
+    expect(md).toContain('Checkout fact 3');
+    expect(md).toMatch(/and \d+ more approved lessons, cut to fit/);
+    expect(md).toMatch(/and \d+ more facts, cut to fit/);
     const details = d.recorded[0].details as { lessons: string[]; facts: string[]; cut?: string[] };
     // What was served is what was shown.
     expect(details.facts.every((id) => md.includes(`Checkout fact ${id.slice(1)}:`))).toBe(true);

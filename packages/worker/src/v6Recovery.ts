@@ -27,7 +27,7 @@ export async function repairV6Sources(d: Deps) {
   const paths = new Map<string, Set<string>>();
   const docs = new Map<string, number>();
   for (let after = ''; ;) {
-    const page = await d.facts.redactionRepairCandidates?.(after, 500) ?? [];
+    const page = await d.facts.redactionRepairCandidates(after, 500);
     if (!page.length) break;
     for (const fact of page) {
       result.suspectedFacts++;
@@ -53,7 +53,7 @@ export async function repairV6Sources(d: Deps) {
     result.filesQueued += files.size;
   }
   for (const [id, count] of docs) {
-    if (await d.docs.queueRedactionRepair?.(id)) result.uploadsQueued++;
+    if (await d.docs.queueRedactionRepair(id)) result.uploadsQueued++;
     else result.factsNeedOriginal += count;
   }
   for (const lesson of await d.knowledge.listLessons({ status: 'approved', limit: 2147483647 })) {
@@ -75,7 +75,8 @@ export async function repairV6Sources(d: Deps) {
       result.lessonsNeedOriginal++;
     }
   }
-  await d.activity?.record({ kind: 'secrets_redacted', actor: 'deterministic', projectKey: null,
+  // Nothing suspected (an install that never stored text under the v6 rules): no entry, which would only read as noise.
+  if (Object.values(result).some(Boolean)) await d.activity?.record({ kind: 'secrets_redacted', actor: 'deterministic', projectKey: null,
     subject: 'Redaction v6 source recovery scheduled',
     why: `File rescans and retained upload originals are queued, not restored yet. Masked facts stay closed. ${result.lessonsRestored ? `${result.lessonsRestored} exact safe retained lesson snapshots restored.` : 'No lesson originals were restored.'} Unavailable originals require re-upload, source review or a backup. Counts are suspected damage, not proof of a false positive.`,
     details: { version: 9, recovery: 'v6-source-repair', ...result } });

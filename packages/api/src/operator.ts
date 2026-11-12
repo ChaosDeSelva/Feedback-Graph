@@ -1,8 +1,8 @@
 import { createHmac, randomBytes } from 'node:crypto';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import type { Context } from 'hono';
-import { RUN_ID, type ActivityStore, type OperatorConfig, type OperatorVerb, type RunTag } from '@fb/core';
-import { tokenMatches } from './auth.ts';
+import { OPERATOR_VERBS, RUN_ID, type ActivityStore, type OperatorConfig, type OperatorVerb, type RunTag } from '@fb/core';
+import { bearerToken, tokenMatches } from './auth.ts';
 
 /**
  * The operator token (FG_OPERATOR_TOKEN): an agent or the `fg` CLI sends it as `Authorization: Bearer` to make the
@@ -55,6 +55,15 @@ export const OWNER_ROUTES: readonly (readonly ['POST' | 'PUT' | 'PATCH' | 'DELET
   ['DELETE', '/api/chats/:id', 'chat_delete'],
   // Removes only what one run wrote (runs.ts): on for the operator token by default.
   ['DELETE', '/api/runs/:id', 'run_cleanup'],
+  // The learning loop (decisions.ts): the owner's verdicts on its decisions, and its mode.
+  ['POST', '/api/decisions/:id/approve', 'loop_decide'],
+  ['POST', '/api/decisions/:id/reject', 'loop_decide'],
+  ['POST', '/api/decisions/:id/keep', 'loop_decide'],
+  ['POST', '/api/decisions/:id/rollback', 'loop_decide'],
+  ['POST', '/api/decisions/:id/notes', 'loop_decide'],
+  ['PUT', '/api/loop/settings', 'loop_settings'],
+  ['POST', '/api/loop/pause', 'loop_settings'],
+  ['POST', '/api/loop/resume', 'loop_settings'],
 ];
 
 const MAX_NAME = 40;
@@ -68,8 +77,8 @@ export function operatorName(header: string | undefined): string {
 /** The request carries the operator token (never true while FG_OPERATOR_TOKEN is unset or empty). */
 export function hasOperatorToken(c: Context, op: OperatorConfig | undefined): boolean {
   if (!op?.token) return false;
-  const auth = c.req.header('authorization');
-  return !!auth?.startsWith('Bearer ') && tokenMatches(auth.slice(7).trim(), op.token);
+  const given = bearerToken(c.req.header('authorization'));
+  return !!given && tokenMatches(given, op.token);
 }
 
 /** Who is making the current request's writes, while an operator-token request runs; unset: the owner. */
@@ -110,8 +119,21 @@ export const mayChangeAny = (): boolean => {
 /** Whether the request may change a record that carries `run` (absent or null: the owner's). */
 export const mayChange = (record: { run?: string | null }): boolean => mayChangeAny() || (!!record.run && record.run === currentRun()?.id);
 
+/**
+ * A header's value, or undefined when it is empty or a shell reference a client sent without expanding it: install-agent
+ * registers `X-FG-Run: ${FG_RUN:-}`, `X-FG-Sandbox: ${FG_SANDBOX:-0}` and `X-FG-Run-Key: ${FG_RUN_KEY:-}` with Claude
+ * Code, which may send them as written. Either means the variable was not set.
+ */
+const setValue = (v: string | undefined) => {
+  const t = v?.trim();
+  return !t || /^\$\{\w+(?::?[-=?+][^}]*)?\}$/.test(t) ? undefined : t;
+};
+
+/** The X-FG-Run-Key header as sent, or undefined when it is missing, empty or an unexpanded `${FG_RUN_KEY:-}`. */
+export const sentRunKey = (header: string | undefined): string | undefined => setValue(header);
+
 const YES = new Set(['1', 'true', 'yes', 'on']);
-const NO = new Set(['0', 'false', 'no', 'off', '']);
+const NO = new Set(['0', 'false', 'no', 'off']);
 
 /**
  * The run a request is labelled with: X-FG-Run (a run id like CLOUD_MACHINE: 1 to 64 letters, digits, dots, dashes or
@@ -119,8 +141,9 @@ const NO = new Set(['0', 'false', 'no', 'off', '']);
  * is configured with a URL only. Null: not labelled; an error: a label that is not usable, refused rather than ignored.
  */
 export function runLabel(header: (name: string) => string | undefined, query?: (name: string) => string | undefined): RunTag | null | { error: string } {
-  const id = (header('x-fg-run') ?? query?.('run'))?.trim() ?? '';
-  const flag = (header('x-fg-sandbox') ?? query?.('sandbox'))?.trim().toLowerCase();
+  const given = (name: string, key: string) => setValue(header(name)) ?? setValue(query?.(key));
+  const id = given('x-fg-run', 'run') ?? '';
+  const flag = given('x-fg-sandbox', 'sandbox')?.toLowerCase();
   if (flag !== undefined && !YES.has(flag) && !NO.has(flag)) return { error: 'x-fg-sandbox must be 1 or 0' };
   const sandbox = flag !== undefined && YES.has(flag);
   if (!id) return sandbox ? { error: 'x-fg-sandbox needs x-fg-run: name the run too, so what it writes can be cleaned up (fg cleanup --run <id>)' } : null;
@@ -163,10 +186,20 @@ export function asActor<T extends Pick<ActivityStore, 'record'>>(a: T | undefine
  * Choosing projects has one more way in, the owner's own on the host: `setup.sh --select` (INGEST_PROJECTS), which the
  * app takes while no selection has been made, so a first run without the UI is not stuck.
  */
-export const refusedVerb = (verb: OperatorVerb) => ({
-  error: `the operator token may not ${verb.replace(/_/g, ' ')} (${verb}): add ${verb} to OPERATOR_ALLOW in .env and restart, or do it in the Feedback Graph UI` +
+/**
+ * The OPERATOR_ALLOW line that lets the token do `verb` and keeps what it may do now (`allowed`): a list given there
+ * replaces the defaults, so a line naming `verb` alone would take every default verb away.
+ */
+export const allowLine = (allowed: readonly OperatorVerb[], verb: OperatorVerb) =>
+  `OPERATOR_ALLOW=${OPERATOR_VERBS.filter((v) => v === verb || allowed.includes(v)).join(',')}`;
+
+export const refusedVerb = (verb: OperatorVerb, allowed: readonly OperatorVerb[]) => ({
+  error: `the operator token may not ${verb.replace(/_/g, ' ')} (${verb}): in .env set ${allowLine(allowed, verb)} (what it may do now, and ${verb}) and restart, or do it in the Feedback Graph UI` +
     (verb === 'select_projects' ? '; before any selection is made, ./scripts/setup.sh --select k1,k2 on the host chooses the first one' : ''),
 });
+
+/** What runKey accepts, for the refusals that need one. */
+export const RUN_KEY_FORMAT = 'X-FG-Run-Key (FG_RUN_KEY): a private random secret of at least 32 characters with adequate diversity (generate: openssl rand -hex 32)';
 
 /** Run ownership uses a secret capability, never the self-reported operator display name. */
 const caller = new AsyncLocalStorage<string | null>();

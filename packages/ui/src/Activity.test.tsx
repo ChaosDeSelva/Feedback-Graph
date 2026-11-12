@@ -1,6 +1,7 @@
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, expect, test, vi } from 'vitest';
 import { Activity, ActivityEntry } from './Activity.tsx';
+import { heldAnswer } from './testing/heldAnswer.ts';
 
 const rows = [
   {
@@ -83,16 +84,17 @@ test('a second clone recognised by its git remote is labelled as a project alias
 });
 
 test('a slow answer for the filters you left never replaces the rows for the ones you picked', async () => {
+  const all = heldAnswer(rows);
   vi.stubGlobal('fetch', vi.fn(async (url: string) => {
     if (url === '/api/projects') return Response.json([{ key: 'demo-shop', repoPath: '/x', sessions: 0, feedback: 0, lessons: 0, facts: 2, lastScan: null }]);
-    if (url === '/api/activity?limit=300') { await new Promise((r) => setTimeout(r, 80)); return Response.json(rows); }
+    if (url === '/api/activity?limit=300') return all.answer();
     if (url.startsWith('/api/activity?kind=memory_imported')) return Response.json([rows[2]]);
     return Response.json([]);
   }));
   render(<Activity />);
   fireEvent.change(screen.getByLabelText('kind'), { target: { value: 'memory_imported' } });
   expect(await screen.findByText('lesson "no dashes" imported')).toBeTruthy();
-  await new Promise((r) => setTimeout(r, 120));
+  await all.deliver();
   expect(screen.getByText('lesson "no dashes" imported')).toBeTruthy();
   expect(screen.queryByText('2 facts from src/db.ts')).toBeNull();
 });
@@ -144,13 +146,14 @@ test('an entry made in a labelled run says which run, and whether it was a sandb
   expect(screen.getAllByText(/^run run-/)).toHaveLength(1);
 });
 
-test('one row per entry: the subject on one line (whole on hover), then the time, actor and run as chips; the kind badge on the right', async () => {
+test('one row per entry: the subject on up to two lines (whole on hover), then the time, actor and run as chips; the kind badge on the right', async () => {
   const long = 'v062-e2e-' + 'x'.repeat(50);
   const entry = { ...rows[2], id: 'a5', kind: 'feedback_decided', actor: 'operator:v062-e2e', subject: 'confirmed "the modal does not close on Escape"', run: long, ts: new Date(Date.now() - 3 * 3600_000).toISOString(), details: { status: 'confirmed' } };
   render(<ul><ActivityEntry a={entry as never} /></ul>);
   const subject = screen.getByText(entry.subject);
   expect(subject.getAttribute('title')).toBe(entry.subject);
-  expect(subject.className).toMatch(/truncate/);
+  // In a narrow pane it wraps to a second line before it is cut.
+  expect(subject.className).toMatch(/line-clamp-2/);
   const row = subject.closest('button')!;
   // The time: relative, with the exact one in words on hover (never the ISO string).
   const time = row.querySelector('time')!;
@@ -214,4 +217,35 @@ test('legacy “you asked for a scan” retry wording collapses too', async () =
   vi.stubGlobal('fetch', vi.fn(async (url: string) => Response.json(url.startsWith('/api/activity') ? [{ ...retry, id: 'old2' }, { ...retry, id: 'old1' }] : [])));
   render(<Activity />);
   expect(await screen.findByText(/1 repeated scan retry entries collapsed/)).toBeTruthy();
+});
+
+test('the classifier kind with nothing waiting says the classifier is idle', async () => {
+  location.hash = '#activity/candidate_flagged';
+  vi.stubGlobal('fetch', vi.fn(async (url: string) => (url === '/api/pipeline' ? Response.json({ classify: { backlog: 0, capped: false } }) : Response.json([]))));
+  try {
+    render(<Activity />);
+    expect(await screen.findByText('No turns are waiting for the classifier.')).toBeTruthy();
+  } finally { location.hash = ''; }
+});
+
+test('the learning loop’s entries have their own kinds and colors, and loop:<v> is its own kind of actor in the legend', async () => {
+  vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+    urls.push(url);
+    if (url.startsWith('/api/activity')) return Response.json([
+      { id: 'l1', ts: '2026-11-10T10:00:00Z', kind: 'decision_applied', actor: 'loop:1', projectKey: 'demo-shop', subject: 'retired a lesson', why: 'never helpful', details: {}, targets: [] },
+      { id: 'l2', ts: '2026-11-10T10:01:00Z', kind: 'decision_rolled_back', actor: 'you', projectKey: 'demo-shop', subject: 'rolled back', why: 'too broad', details: {}, targets: [] },
+    ]);
+    return Response.json([]);
+  }));
+  location.hash = '#activity/decision_applied';
+  render(<Activity />);
+  expect(await screen.findByText('retired a lesson')).toBeTruthy();
+  expect(urls).toContain('/api/activity?kind=decision_applied&limit=300');
+  expect((screen.getByLabelText('kind') as HTMLSelectElement).value).toBe('decision_applied');
+  expect(screen.getByText('loop applied', { selector: 'span' }).className).toMatch(/text-ok-text/);
+  expect(screen.getByText('loop rolled back', { selector: 'span' }).className).toMatch(/text-bad-text/);
+  expect(screen.getByText('loop:1').getAttribute('title')).toMatch(/^learning loop: a decision the loop made on its own/);
+  const legend = screen.getByRole('list', { name: 'who did it' });
+  expect(legend.textContent).toMatch(/loop:<v> learning loop/);
+  location.hash = '';
 });

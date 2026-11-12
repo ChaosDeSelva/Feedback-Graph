@@ -61,6 +61,16 @@ test('scoreFacts only reads the selected projects, and does nothing when there i
   const t = deps([fact('x', 'other', 'elsewhere')], () => { throw new Error('should not ask'); });
   expect(await scoreFacts(t.d)).toEqual({ scored: 0 });
   expect(t.set).toEqual([]);
+  // No project selected: the store is not asked at all.
+  t.d.facts.unscoredFacts = async () => { throw new Error('should not read'); };
+  expect(await scoreFacts({ ...t.d, projects: () => [] })).toEqual({ scored: 0 });
+});
+
+test('a scored batch is logged with how many were stored and asked', async () => {
+  const logs: [string, object | undefined][] = [];
+  const t = deps([fact('a', 'Run pnpm test before committing')], () => ({ scores: [{ n: 1, relevance: 0.9 }] }), { log: (m, x) => logs.push([m, x]) });
+  await scoreFacts(t.d);
+  expect(logs).toEqual([['facts scored', { scored: 1, asked: 1 }]]);
 });
 
 test('a fact the model skipped stays unscored for the next round; numbers it invents are ignored or clamped', async () => {
@@ -103,4 +113,10 @@ test('ScoringPacer waits a while after a round that scored nothing or could not 
   const failing = new ScoringPacer(async () => { calls++; throw new Error('boom'); }, 1000);
   expect(await failing.tick(t0)).toBe(0);
   expect(await failing.tick(t0 + 10)).toBe(0);
+});
+
+test('a scoring failure other than an unreachable model is thrown, for the caller to log and back off', async () => {
+  const t = deps([fact('f1', 'a')], () => { throw new Error('invalid API key'); });
+  await expect(scoreFacts(t.d)).rejects.toThrow('invalid API key');
+  expect(t.set).toEqual([]);
 });

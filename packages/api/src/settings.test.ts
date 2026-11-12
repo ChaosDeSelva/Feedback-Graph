@@ -3,7 +3,7 @@ import { expect, test } from 'vitest';
 import { createApp, type ApiRepo, type SettingsDeps } from './app.ts';
 import type { SavedRoots } from './roots.ts';
 
-const repo = { listCandidates: async () => [], candidateDetail: async () => null, decide: async () => {}, stats: async () => [] } as ApiRepo;
+const repo = { undoDecision: async () => false, listCandidates: async () => [], candidateDetail: async () => null, decide: async () => {}, stats: async () => [] } as ApiRepo;
 const OWNER = 'settings-owner-token-01234567890123456789';
 
 const snapshot: CandidateSnapshot = {
@@ -19,7 +19,7 @@ const snapshot: CandidateSnapshot = {
   codexSessionsFound: true,
 };
 
-function setup(o: { roots?: number; selection?: ProjectSelection; snapshot?: CandidateSnapshot | null; dataKeys?: string[]; aliases?: [string, string][]; saved?: SavedRoots | null; editable?: boolean } = {}) {
+function setup(o: { roots?: number; selection?: ProjectSelection; snapshot?: CandidateSnapshot | null; dataKeys?: string[]; aliases?: [string, string][]; saved?: SavedRoots | null; editable?: boolean; portability?: false } = {}) {
   let saved: SavedRoots | null = o.saved ?? null;
   let sel: ProjectSelection = o.selection ?? { tracked: ['demo-shop'], initialized: true, updatedAt: '2026-10-23T00:00:00Z' };
   const log: ActivityInput[] = [];
@@ -65,8 +65,8 @@ function setup(o: { roots?: number; selection?: ProjectSelection; snapshot?: Can
   const app = createApp(repo, {
     auth: { ownerToken: OWNER },
     settings,
-    activity: { record: async (a) => { log.push(a); }, list: async () => [] },
-    portability: { exportData: async () => { throw new Error('unused'); }, deleteProject: async (k) => { deleted.push(k); locked.push(inSection ? `delete ${k}` : `delete ${k} OUTSIDE`); return 10; } },
+    activity: { removeRun: async () => 0, record: async (a) => { log.push(a); }, list: async () => [] },
+    ...(o.portability === false ? {} : { portability: { exportData: async () => { throw new Error('unused'); }, deleteProject: async (k) => { deleted.push(k); locked.push(inSection ? `delete ${k}` : `delete ${k} OUTSIDE`); return 10; } } }),
     system: { version: '0.3.0', ping: async () => true, worker: async () => null, selection: async () => sel, ...(o.roots === undefined ? {} : { roots: o.roots }) },
   });
   return { app, log, deleted, locked, forgotten, sel: () => sel, saved: () => saved };
@@ -302,4 +302,37 @@ test('PUT /api/settings/roots without a roots file to write says how to change t
   const res = await setup({ editable: false }).app.request('/api/settings/roots', put({ roots: ['/a/b'] }));
   expect(res.status).toBe(501);
   expect((await res.json()).error).toContain('ROOTS_FILE');
+});
+
+test('a folder recorded as its own alias is not shown as a clone', async () => {
+  const { app } = setup({ aliases: [['demo-shop', 'demo-shop']] });
+  const body = await (await app.request('/api/settings/projects', { headers: owner })).json();
+  expect(body.candidates.find((c: { key: string }) => c.key === 'demo-shop')).toMatchObject({ aliasOf: null, tracked: true });
+});
+
+test('saving roots that drop one says which were removed', async () => {
+  const { app, log } = setup({ saved: { roots: ['/Users/me/Vibe', '/Users/me/old'], updatedAt: 't' } });
+  expect((await app.request('/api/settings/roots', put({ roots: ['/Users/me/Vibe'] }))).status).toBe(200);
+  expect(log[0]).toMatchObject({ subject: 'project roots saved: /Users/me/Vibe; removed /Users/me/old', details: { added: [], removed: ['/Users/me/old'] } });
+});
+
+test('cleanup without a store that can delete projects says it is not available', async () => {
+  const { app } = setup({ portability: false });
+  const res = await app.request('/api/settings/cleanup', { method: 'POST', headers: ui, body: JSON.stringify({ confirm: 'remove-unselected' }) });
+  expect(res.status).toBe(501);
+  expect(await res.json()).toEqual({ error: 'deleting data is not available' });
+});
+
+test('cleanup with every project with data selected deletes nothing and says so', async () => {
+  const { app, deleted, log } = setup({ dataKeys: ['demo-shop', 'demo-shop-2'] });
+  const res = await app.request('/api/settings/cleanup', { method: 'POST', headers: ui, body: JSON.stringify({ confirm: 'remove-unselected' }) });
+  expect(await res.json()).toEqual({ removed: [], nodesRemoved: 0 });
+  expect(deleted).toEqual([]);
+  expect(log[0]).toMatchObject({ subject: 'nothing to delete: every project with data is selected' });
+});
+
+test('cleanup of a single unselected project names it in the singular', async () => {
+  const { app, log } = setup({ dataKeys: ['demo-shop', 'old-one'] });
+  await app.request('/api/settings/cleanup', { method: 'POST', headers: ui, body: JSON.stringify({ confirm: 'remove-unselected' }) });
+  expect(log[0].subject).toBe('deleted everything learned from 1 unselected project: old-one');
 });

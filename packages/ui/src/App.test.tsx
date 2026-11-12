@@ -2,7 +2,9 @@ import { act, cleanup, render, screen, waitFor, within } from '@testing-library/
 import { afterEach, beforeEach, expect, test, vi } from 'vitest';
 import { App } from './App.tsx';
 
-beforeEach(() => { vi.stubGlobal('fetch', vi.fn(async () => Response.json([]))); location.hash = ''; });
+/** GET /api/settings/projects with no folders yet: what Settings loads when a test opens it. */
+const noFolders = { initialized: true, tracked: [], candidates: [], outsideRoots: { claudeSessions: 0, codexSessions: 0, folders: [] }, roots: [], pendingRoots: null, rootsEditable: false, builtAt: null, codexSessionsFound: true };
+beforeEach(() => { vi.stubGlobal('fetch', vi.fn(async (url: string) => Response.json(url === '/api/settings/projects' ? noFolders : []))); location.hash = ''; });
 afterEach(() => { cleanup(); vi.unstubAllGlobals(); });
 
 test('the Dashboard is the first page in the sidebar and the one the app opens on', async () => {
@@ -45,7 +47,26 @@ test('a link to one item (#lessons/<id>) opens its page and keeps the id in the 
   expect(location.hash).toBe('#lessons/l1');
 });
 
-function server(o: { authRequired?: boolean; ownerSetupRequired?: boolean; token?: string; signedIn?: boolean; signOutFails?: boolean; workerHealthy?: boolean; tracked?: number; roots?: number; models?: object; ollama?: object }) {
+test('a page that crashes shows why with the sidebar still there, and Reset this page opens it again without its address filters', async () => {
+  let broken = true;
+  vi.spyOn(console, 'error').mockImplementation(() => {});
+  // An answer of a shape the page cannot draw (a decision with no confidence).
+  vi.stubGlobal('fetch', vi.fn(async (url: string) => Response.json(url.startsWith('/api/decisions') && broken ? [{ id: 'dec:x', status: 'applied' }] : url === '/api/settings/projects' ? noFolders : [])));
+  location.hash = '#decisions?status=all&since=2026-11-01';
+  render(<App />);
+  expect(await screen.findByText(/^Decisions could not be shown: /)).toBeTruthy();
+  expect(screen.getByRole('button', { name: 'Dashboard' })).toBeTruthy();
+  // Still headed as its page.
+  expect(screen.getByRole('heading', { name: 'Decisions', level: 1 })).toBeTruthy();
+  broken = false;
+  await act(async () => { screen.getByRole('button', { name: 'Reset this page' }).click(); });
+  expect(location.hash).toBe('#decisions');
+  expect(await screen.findByText('Nothing waiting for you')).toBeTruthy();
+  expect(screen.queryByText(/could not be shown/)).toBeNull();
+  vi.mocked(console.error).mockRestore();
+});
+
+function server(o: { authRequired?: boolean; ownerSetupRequired?: boolean; ownerWrites?: boolean; token?: string; signedIn?: boolean; signOutFails?: boolean; workerHealthy?: boolean; tracked?: number; roots?: number; models?: object; ollama?: object }) {
   let signedIn = o.signedIn ?? !o.authRequired;
   const posts: unknown[] = [];
   vi.stubGlobal('fetch', vi.fn(async (url: string, init?: RequestInit) => {
@@ -60,8 +81,9 @@ function server(o: { authRequired?: boolean; ownerSetupRequired?: boolean; token
       if (o.signOutFails) return Response.json({ error: 'store unavailable' }, { status: 503 });
       signedIn = false; return new Response(null, { status: 204 });
     }
-    if (url === '/api/session') return Response.json({ authRequired: !!o.authRequired, authenticated: signedIn, ownerSession: !!o.authRequired && signedIn, ownerSetupRequired: !!o.ownerSetupRequired });
+    if (url === '/api/session') return Response.json({ authRequired: !!o.authRequired, authenticated: signedIn, ownerSession: !!o.authRequired && signedIn, ownerSetupRequired: !!o.ownerSetupRequired, ownerWrites: o.ownerWrites ?? true });
     if (!signedIn) return Response.json({ error: 'sign in required' }, { status: 401 });
+    if (url === '/api/settings/projects') return Response.json(noFolders);
     if (url === '/api/status') return Response.json({ version: '0.2.0', graph: true, worker: null, workerHealthy: o.workerHealthy ?? true, authRequired: !!o.authRequired, selection: o.tracked === undefined ? null : { initialized: true, tracked: o.tracked, roots: o.roots, note: o.roots === 0 ? 'No project folders yet: add a project folder in Settings first.' : o.tracked ? null : 'No projects are selected yet, so no sessions are being read.' }, models: o.models ?? null, ollama: o.ollama ?? null });
     return Response.json([]);
   }));
@@ -73,6 +95,10 @@ test('with a token configured, the UI asks you to sign in first', async () => {
   const s = server({ authRequired: true, token: 'secret-token' });
   render(<App />);
   const input = await screen.findByLabelText('owner token');
+  // The one-time link comes first; pasting the owner token is the fallback.
+  const card = input.closest('form')!;
+  expect(card.textContent).toMatch(/run \.\/scripts\/fg signin and open the link it prints/);
+  expect(card.textContent!.indexOf('./scripts/fg signin')).toBeLessThan(card.textContent!.indexOf('Or paste the owner sign-in token (FG_OWNER_TOKEN'));
   fireEvent.change(input, { target: { value: 'wrong' } });
   fireEvent.click(screen.getByRole('button', { name: 'Sign in' }));
   expect(await screen.findByText('wrong token')).toBeTruthy();
@@ -101,6 +127,15 @@ test('tokenless installs show no dead sign-out action; a failed protected sign-o
   fireEvent.click(signOut);
   expect(await screen.findByText(/Sign out failed: store unavailable.*still signed in/)).toBeTruthy();
   expect(screen.getByRole('button', { name: 'Inbox' })).toBeTruthy();
+});
+
+test('signing out of a protected install goes back to the sign-in screen', async () => {
+  const { fireEvent } = await import('@testing-library/react');
+  server({ authRequired: true, token: 'owner', signedIn: true });
+  render(<App />);
+  fireEvent.click(await screen.findByRole('button', { name: 'Sign out' }));
+  expect(await screen.findByLabelText('owner token')).toBeTruthy();
+  expect(screen.queryByRole('button', { name: 'Inbox' })).toBeNull();
 });
 
 test('the header warns when the worker has stopped reporting', async () => {
@@ -199,7 +234,7 @@ test('Settings has its own place in the sidebar and its own #settings address', 
 function settingsServer() {
   vi.stubGlobal('fetch', vi.fn(async (url: string) => {
     if (url === '/api/settings/projects') return Response.json({
-      initialized: true, tracked: [], outsideRoots: { claudeSessions: 0, codexSessions: 0 }, roots: ['/r'], builtAt: null, codexSessionsFound: true,
+      initialized: true, tracked: [], outsideRoots: { claudeSessions: 0, codexSessions: 0, folders: [] }, roots: ['/r'], builtAt: null, codexSessionsFound: true,
       candidates: [{ key: 'other', path: '/r/other', exists: true, git: true, remote: null, claudeSessions: 1, codexSessions: 0, lastActivity: null, tracked: false, excluded: false, aliasOf: null, hasData: false, inScope: false }],
     });
     return Response.json([]);
@@ -319,4 +354,130 @@ test('the application exposes one main landmark and a keyboard skip link', async
   render(<App />);
   expect(screen.getAllByRole('main')).toHaveLength(1);
   expect(screen.getByRole('link', { name: 'Skip to main content' }).getAttribute('href')).toBe('#main-content');
+});
+
+test('a tokenless install reached through Docker says it is read-only, how to fix it, and disables owner controls', async () => {
+  server({ ownerWrites: false });
+  const { Button } = await import('./ui/controls.tsx');
+  const { OwnerWrites } = await import('./ownerAccess.tsx');
+  render(<App />);
+  const banner = await screen.findByRole('status', { name: 'read-only' });
+  expect(banner.textContent).toMatch(/Read-only: this install has no owner token/);
+  expect(banner.textContent).toContain('./scripts/setup.sh --yes --enable-auth');
+  cleanup();
+  render(<OwnerWrites.Provider value={false}><Button owner>Approve</Button><Button>Clear filters</Button></OwnerWrites.Provider>);
+  const approve = screen.getByRole('button', { name: 'Approve' }) as HTMLButtonElement;
+  expect(approve.disabled).toBe(true);
+  expect(approve.title).toMatch(/--yes --enable-auth/);
+  expect((screen.getByRole('button', { name: 'Clear filters' }) as HTMLButtonElement).disabled).toBe(false);
+});
+
+test('an install with owner access shows no read-only banner', async () => {
+  server({});
+  render(<App />);
+  await act(async () => {});
+  expect(screen.queryByRole('status', { name: 'read-only' })).toBeNull();
+});
+
+test('signing in from a tab opened while the install was tokenless drops the read-only state without a reload', async () => {
+  const { fireEvent } = await import('@testing-library/react');
+  const { SIGN_IN_EVENT } = await import('./api.ts');
+  // The tab opens on a tokenless install; setup --enable-auth then adds tokens while it stays open.
+  let state = { authRequired: false, signedIn: false, ownerWrites: false };
+  vi.stubGlobal('fetch', vi.fn(async (url: string, init?: RequestInit) => {
+    if (url === '/api/session' && init?.method === 'POST') { state = { ...state, signedIn: true }; return new Response(null, { status: 204 }); }
+    if (url === '/api/session' && init?.method === 'DELETE') { state = { ...state, signedIn: false }; return new Response(null, { status: 204 }); }
+    if (url === '/api/session') return Response.json({ authRequired: state.authRequired, authenticated: state.signedIn, ownerSession: state.authRequired && state.signedIn, ownerSetupRequired: false, ownerWrites: state.authRequired ? state.signedIn : state.ownerWrites });
+    return Response.json([]);
+  }));
+  render(<App />);
+  expect(await screen.findByRole('status', { name: 'read-only' })).toBeTruthy();
+  state = { authRequired: true, signedIn: false, ownerWrites: false };
+  await act(async () => { window.dispatchEvent(new Event(SIGN_IN_EVENT)); });
+  fireEvent.change(await screen.findByLabelText('owner token'), { target: { value: 'owner' } });
+  fireEvent.click(screen.getByRole('button', { name: 'Sign in' }));
+  expect(await screen.findByRole('button', { name: 'Sign out' })).toBeTruthy();
+  await waitFor(() => expect(screen.queryByRole('status', { name: 'read-only' })).toBeNull());
+});
+
+/** An install whose tokens and this browser's session change while the tab stays open. */
+function changingServer(initial: { authRequired: boolean; signedIn: boolean; ownerWrites: boolean }) {
+  const state = { ...initial, sessionReply: null as Promise<void> | null };
+  vi.stubGlobal('fetch', vi.fn(async (url: string, init?: RequestInit) => {
+    if (url === '/api/session' && init?.method === 'POST') { state.signedIn = true; return new Response(null, { status: 204 }); }
+    if (url === '/api/session' && init?.method === 'DELETE') { state.signedIn = false; return new Response(null, { status: 204 }); }
+    if (url === '/api/session') {
+      if (state.sessionReply) await state.sessionReply;
+      return Response.json({ authRequired: state.authRequired, authenticated: state.signedIn, ownerSession: state.authRequired && state.signedIn, ownerSetupRequired: false, ownerWrites: state.authRequired ? state.signedIn : state.ownerWrites });
+    }
+    if (state.authRequired && !state.signedIn) return Response.json({ error: 'sign in required' }, { status: 401 });
+    if (url === '/api/status') return Response.json({ version: '0.2.0', graph: true, worker: null, workerHealthy: true, authRequired: state.authRequired, selection: null, models: null, ollama: null });
+    return Response.json([]);
+  }));
+  return state;
+}
+
+test('a read-only tab follows a sign-in made elsewhere at its next status poll, without ever getting a 401', async () => {
+  vi.useFakeTimers({ shouldAdvanceTime: true });
+  try {
+    const state = changingServer({ authRequired: false, signedIn: false, ownerWrites: false });
+    render(<App />);
+    expect(await screen.findByRole('status', { name: 'read-only' })).toBeTruthy();
+    // setup --enable-auth, then another tab signs this browser in: this tab's cookie is valid, so nothing answers it 401.
+    Object.assign(state, { authRequired: true, signedIn: true });
+    await act(async () => { await vi.advanceTimersByTimeAsync(30_000); });
+    await waitFor(() => expect(screen.queryByRole('status', { name: 'read-only' })).toBeNull());
+    expect(screen.getByRole('button', { name: 'Sign out' })).toBeTruthy();
+  } finally { vi.useRealTimers(); }
+});
+
+test('a tab shown again reads the session: an install that lost its tokens turns read-only, one that gained them asks to sign in', async () => {
+  const state = changingServer({ authRequired: true, signedIn: true, ownerWrites: true });
+  render(<App />);
+  expect(await screen.findByRole('button', { name: 'Sign out' })).toBeTruthy();
+  expect(screen.queryByRole('status', { name: 'read-only' })).toBeNull();
+  Object.assign(state, { authRequired: false, signedIn: false, ownerWrites: false });
+  await act(async () => { document.dispatchEvent(new Event('visibilitychange')); });
+  expect(await screen.findByRole('status', { name: 'read-only' })).toBeTruthy();
+  expect(screen.queryByRole('button', { name: 'Sign out' })).toBeNull();
+  Object.assign(state, { authRequired: true });
+  await act(async () => { document.dispatchEvent(new Event('visibilitychange')); });
+  expect(await screen.findByLabelText('owner token')).toBeTruthy();
+});
+
+test('signing in never shows the read-only banner, even before the session is read again', async () => {
+  const { fireEvent } = await import('@testing-library/react');
+  const { SIGN_IN_EVENT } = await import('./api.ts');
+  const state = changingServer({ authRequired: false, signedIn: false, ownerWrites: false });
+  render(<App />);
+  expect(await screen.findByRole('status', { name: 'read-only' })).toBeTruthy();
+  Object.assign(state, { authRequired: true });
+  await act(async () => { window.dispatchEvent(new Event(SIGN_IN_EVENT)); });
+  let answer!: () => void;
+  state.sessionReply = new Promise((r) => { answer = r; });
+  fireEvent.change(await screen.findByLabelText('owner token'), { target: { value: 'owner' } });
+  fireEvent.click(screen.getByRole('button', { name: 'Sign in' }));
+  expect(await screen.findByRole('button', { name: 'Sign out' })).toBeTruthy();
+  expect(screen.queryByRole('status', { name: 'read-only' })).toBeNull();
+  await act(async () => { answer(); });
+  expect(screen.queryByRole('status', { name: 'read-only' })).toBeNull();
+});
+
+test('Decisions sits under Review with the proposals waiting as a badge, Learning loop under Insights; a decision made here counts again', async () => {
+  const { LOOP_CHANGED_EVENT } = await import('./api.ts');
+  const { loopState } = await import('./testing/loop.ts');
+  let proposed = 3;
+  vi.stubGlobal('fetch', vi.fn(async (url: string) => (url === '/api/loop' ? Response.json(loopState({ counts: { proposed, week: { observed: 0, proposed: 0, applied: 0, rolledBack: 0 } } })) : Response.json([]))));
+  render(<App />);
+  const decisions = screen.getByRole('button', { name: /^Decisions/ });
+  await waitFor(() => expect(decisions.textContent).toBe('Decisions3 waiting'));
+  proposed = 0;
+  await act(async () => { window.dispatchEvent(new Event(LOOP_CHANGED_EVENT)); });
+  await waitFor(() => expect(decisions.textContent).toBe('Decisions'));
+  const labels = screen.getAllByRole('button').map((b) => b.textContent);
+  expect(labels.indexOf('Lessons')).toBeLessThan(labels.indexOf('Decisions'));
+  expect(labels.indexOf('Learning loop')).toBeLessThan(labels.indexOf('Graph'));
+  await act(async () => { screen.getByRole('button', { name: 'Learning loop' }).click(); });
+  expect(screen.getByRole('heading', { name: 'Learning loop', level: 1 })).toBeTruthy();
+  expect(location.hash).toBe('#loop');
 });

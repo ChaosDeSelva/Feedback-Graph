@@ -1,85 +1,134 @@
-import { Component, useEffect, useRef, useState, type ReactNode } from 'react';
+import { asIs, labelOf } from './labels.ts';
+import { Component, createContext, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import type { ModelHealth, ModelJob, WorkQueue, WorkQueues } from '@fb/core';
 import type { ChatProvider } from '@fb/core/chat';
 import { ActivityEntry } from './Activity.tsx';
 import { ProviderSelect } from './Chat.tsx';
-import { api, type Activity, type PatternReport, type PipelineStatus, type ProjectHotspot, type ProjectSummary, type SystemStatus } from './api.ts';
+import { api, errorMessage, isOutage, type Activity, type PatternReport, type PipelineStatus, type ProjectHotspot, type ProjectSummary, type SystemStatus } from './api.ts';
 import { activityKindHref, chatHref, inboxTabHref, moduleHref, newChatHref } from './links.ts';
 import { stageLine } from './FirstRun.tsx';
+import { GettingStarted } from './GettingStarted.tsx';
+import { LoopCard, LoopMetricsCard } from './LearningLoop.tsx';
 import { pct, WeeklyChart } from './Patterns.tsx';
+import { READ_ONLY_TITLE, useOwnerWrites } from './ownerAccess.tsx';
 import { PageHeader } from './ui/PageHeader.tsx';
 import { Button, Select } from './ui/controls.tsx';
 import { AskIcon, ChevronIcon, Mark } from './ui/icons.tsx';
 import { ago, Alert, Badge, Card, Skeleton, SkeletonList, StatGrid, StatTile, StatTileSkeleton, StatusBadge, tableClass, tdClass, thClass, Time } from './ui/display.tsx';
+import { ScrollArea } from './ui/ScrollArea.tsx';
+import { InfoTip } from './ui/InfoTip.tsx';
 
 const POLL_MS = 10_000;
 
-type Load<T> = { data: T | null; error: string | null };
+/** `outage`: the API did not answer or answered 5xx (see `shared` below). */
+type Load<T> = { data: T | null; error: string | null; outage: boolean };
 
 /**
- * One section's data. Each section loads on its own, so an endpoint that fails (or a store without that route) shows
- * its error in its own card and every other section still renders. `pollMs` reloads it while the page is open.
+ * One section's data. Each section loads on its own, so an endpoint that refuses (or a store without that route) shows
+ * its error in its own card and every other section still renders. `pollMs` reloads it while the page is open; a
+ * section that loads once is asked again every `retryMs` while the API is down, so the page recovers on its own.
  */
-function useLoad<T>(load: () => Promise<T>, pollMs?: number): Load<T> {
-  const [state, setState] = useState<Load<T>>({ data: null, error: null });
+function useLoad<T>(load: () => Promise<T>, pollMs?: number, retryMs = POLL_MS): Load<T> {
+  const [state, setState] = useState<Load<T>>({ data: null, error: null, outage: false });
   useEffect(() => {
     let live = true;
+    let retry: ReturnType<typeof setTimeout> | undefined;
     const run = () => load().then(
-      (data) => { if (live) setState({ data, error: null }); },
-      (e) => { if (live) setState((s) => ({ data: s.data, error: e instanceof Error ? e.message : String(e) })); },
+      (data) => { if (live) setState({ data, error: null, outage: false }); },
+      (e) => {
+        if (!live) return;
+        setState((s) => ({ data: s.data, error: errorMessage(e), outage: isOutage(e) }));
+        if (!pollMs && isOutage(e)) retry = setTimeout(run, retryMs);
+      },
     );
     run();
     const t = pollMs ? setInterval(run, pollMs) : undefined;
-    return () => { live = false; clearInterval(t); };
+    return () => { live = false; clearInterval(t); clearTimeout(retry); };
   }, []);
   return state;
 }
 
 /** The landing page: where everything stands, each part linked to the page that has the detail. */
-export function Dashboard() {
+export function Dashboard({ retryMs }: { retryMs?: number } = {}) {
   const status = useLoad(api.status, POLL_MS);
   const pipeline = useLoad(api.pipeline, POLL_MS);
-  const patterns = useLoad(() => api.patterns());
-  const projects = useLoad(api.projects);
-  const hotspots = useLoad(() => api.topHotspots(undefined, 8));
-  const struggles = useLoad(() => api.topHotspots(undefined, 8, false, true));
-  const activity = useLoad(() => api.activity({ limit: 10 }));
+  const patterns = useLoad(() => api.patterns(), undefined, retryMs);
+  const projects = useLoad(api.projects, undefined, retryMs);
+  const hotspots = useLoad(() => api.topHotspots(undefined, 8), undefined, retryMs);
+  const struggles = useLoad(() => api.topHotspots(undefined, 8, false, true), undefined, retryMs);
+  const activity = useLoad(() => api.activity({ limit: 10 }), undefined, retryMs);
+  // An API that is down fails every section with the same words: the page says it in one alert (keyed by its text, so
+  // a poll that fails again does not mount it anew and announce it again), and those sections only wait. A failure only
+  // one section has stays in that section.
+  const said = [status, pipeline, patterns, projects, hotspots, struggles, activity].filter((l) => l.outage && l.error).map((l) => l.error!);
+  const shared = new Set(said.filter((e, i) => said.indexOf(e) !== i));
+  // One function per page, so the boundary never mistakes a re-render for a fresh answer.
+  const loopCard = useMemo(() => () => <DashboardLoopCard retryMs={retryMs} />, [retryMs]);
+  const loopMetrics = useMemo(() => () => <DashboardLoopMetrics retryMs={retryMs} />, [retryMs]);
 
   return (
     <div className="flex h-full min-h-0 flex-col">
       <PageHeader title="Dashboard" description="Ask about a project, then where everything stands: the worker, the pipeline, quality, your projects, hotspots and recent activity." />
-      <div className="min-h-0 flex-1 overflow-y-auto">
+      <ScrollArea className="min-h-0 flex-1 overflow-y-auto">
         <div className="mx-auto flex max-w-6xl flex-col gap-4 p-3 md:p-5">
-          <Ask projects={projects.data} hotspots={hotspots.data} />
-          <Now load={status} />
-          <Pipeline load={pipeline} />
-          <Quality load={patterns} />
-          <Projects load={projects} globalLessons={pipeline.data?.lessons?.global ?? null} />
-          <Struggles load={struggles} />
-          <RecentActivity load={activity} />
+          {[...shared].map((e) => <Alert key={e}>{e}</Alert>)}
+          <SharedOutage.Provider value={shared}>
+            <GettingStarted status={status.data} pipeline={pipeline.data} />
+            <Ask projects={projects.data} hotspots={hotspots.data} />
+            <Now load={status} />
+            <Pipeline load={pipeline} />
+            <Contained render={loopCard} />
+            <Contained render={loopMetrics} />
+            <Quality load={patterns} />
+            <Projects load={projects} globalLessons={pipeline.data?.lessons?.global ?? null} />
+            <Struggles load={struggles} />
+            <RecentActivity load={activity} />
+          </SharedOutage.Provider>
         </div>
-      </div>
+      </ScrollArea>
     </div>
   );
 }
 
 /** The section's error, or a placeholder until it loads, or its content. */
 function Body<T>({ load, loading, children }: { load: Load<T>; loading: ReactNode; children: (data: T) => ReactNode }) {
-  if (load.error) return <div className="p-3"><Alert>{load.error}</Alert></div>;
+  if (load.error) return <SectionError load={load} />;
   if (load.data === null) return <>{loading}</>;
   const data = load.data;
   return <Contained render={() => children(data)} />;
 }
 
+const SharedOutage = createContext<Set<string>>(new Set());
+
+/** A section's own failure shows here; one the page's alert already says (an API outage) leaves the section waiting. */
+function SectionError({ load }: { load: Load<unknown> }) {
+  const shared = useContext(SharedOutage);
+  return load.outage && shared.has(load.error!)
+    ? <p className="p-3 text-[13px] text-muted">Not loaded yet: shown when the API answers.</p>
+    : <div className="p-3"><Alert>{load.error}</Alert></div>;
+}
+
 /** An answer of an unexpected shape (an older API) breaks only its own section, never the page. */
 class Contained extends Component<{ render: () => ReactNode }, { error: string | null }> {
   state = { error: null as string | null };
-  static getDerivedStateFromError(e: unknown) { return { error: e instanceof Error ? e.message : String(e) }; }
+  static getDerivedStateFromError(e: unknown) { return { error: errorMessage(e) }; }
   // A fresh answer (a poll) gets another try.
   componentDidUpdate(prev: { render: () => ReactNode }) { if (this.state.error && prev.render !== this.props.render) this.setState({ error: null }); }
   render() {
     return this.state.error ? <div className="p-3"><Alert>This section could not be shown: {this.state.error}</Alert></div> : <Run render={this.props.render} />;
   }
+}
+
+/** The Learning loop card, waiting quietly through an outage the page's alert already says. */
+function DashboardLoopCard({ retryMs }: { retryMs?: number }) {
+  const shared = useContext(SharedOutage);
+  return <LoopCard retryMs={retryMs} waiting={(e) => shared.has(e)} />;
+}
+
+/** The learning-loop metrics, waiting quietly through the same outage. */
+function DashboardLoopMetrics({ retryMs }: { retryMs?: number }) {
+  const shared = useContext(SharedOutage);
+  return <LoopMetricsCard retryMs={retryMs} waiting={(e) => shared.has(e)} />;
 }
 
 // A boundary catches only what its children throw, so the section renders one level down.
@@ -89,7 +138,7 @@ const LinkAction = ({ href, children }: { href: string; children: ReactNode }) =
   <a href={href} className="text-xs font-medium text-accent-text underline decoration-accent/40 underline-offset-2 hover:decoration-accent">{children}</a>
 );
 
-const JOB_LABEL: Partial<Record<ModelJob, string>> = { classify: 'classifier', postmortem: 'post-mortem', scan: 'scan', summary: 'summaries', docs: 'docs reader' };
+const JOB_LABEL: Record<ModelJob, string> = { classify: 'classifier', postmortem: 'post-mortem', scan: 'scan', summary: 'summaries', docs: 'docs reader', chat: 'chat' };
 
 function Now({ load }: { load: Load<SystemStatus> }) {
   return (
@@ -109,9 +158,10 @@ function Now({ load }: { load: Load<SystemStatus> }) {
                 <ul className="grid gap-1.5 text-[13px] sm:grid-cols-2">
                   {models.map(([job, m]) => (
                     <li key={job} className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-0.5">
-                      <Badge tone={m.ok ? 'ok' : 'bad'} dot>{JOB_LABEL[job] ?? job}</Badge>
+                      {/* A job turned off on purpose (its Codex runner's safety flag) is neutral: red is for failures. */}
+                      <Badge tone={m.ok ? 'ok' : m.disabled ? 'neutral' : 'bad'} dot>{labelOf(JOB_LABEL, job, asIs)}</Badge>
                       {m.provider && <span className="font-mono text-[12px] text-muted">{m.provider}</span>}
-                      {!m.ok && <span className="w-full text-xs text-bad-text [overflow-wrap:anywhere]">{m.reason ?? 'unavailable'}{m.since ? ` (since ${new Date(m.since).toLocaleTimeString()})` : ''}</span>}
+                      {!m.ok && <span className={`w-full text-xs [overflow-wrap:anywhere] ${m.disabled ? 'text-muted' : 'text-bad-text'}`}>{m.disabled ? `Codex runner off on this machine (${m.reason ?? 'no reason recorded'}): paused until it is re-enabled or another model is chosen` : m.reason ?? 'unavailable'}{m.since ? ` (since ${new Date(m.since).toLocaleTimeString()})` : ''}</span>}
                     </li>
                   ))}
                   {s.ollama && (
@@ -179,9 +229,10 @@ function Pipeline({ load }: { load: Load<PipelineStatus> }) {
     <div className="grid gap-1.5">
       <div className="text-[11px] font-semibold tracking-[0.06em] text-muted uppercase">Pipeline</div>
       {load.error ? (
-        <Alert>{load.error}</Alert>
+        <SectionError load={load} />
       ) : (
-        <StatGrid className="grid-cols-2 lg:grid-cols-5">
+        // Five across only where each tile has room for its label and hint (the main pane is the width less the sidebar).
+        <StatGrid className="grid-cols-2 sm:grid-cols-3 xl:grid-cols-5">
           {load.data ? (() => {
             const p = load.data;
             const s = p.scans;
@@ -246,7 +297,7 @@ function ProjectsTable({ list, globalLessons }: { list: ProjectSummary[]; global
   const [all, setAll] = useState(false);
   const sorted = [...list].sort((a, b) => Number(b.pinned) - Number(a.pinned));
   return (
-          <div className="overflow-x-auto">
+          <ScrollArea role="region" aria-label="projects table" className="overflow-x-auto">
             <table className={`${tableClass} text-[13px]`}>
               <thead>
                 <tr>
@@ -290,7 +341,7 @@ function ProjectsTable({ list, globalLessons }: { list: ProjectSummary[]; global
                 )}
               </div>
             )}
-          </div>
+          </ScrollArea>
   );
 }
 
@@ -306,7 +357,7 @@ function Struggles({ load }: { load: Load<ProjectHotspot[]> }) {
           </p>
         ) : (
           <div className="grid gap-3">
-            <div className="overflow-x-auto">
+            <ScrollArea role="region" aria-label="files with misses table" className="overflow-x-auto">
               <table className={`${tableClass} text-[13px]`}>
                 <thead>
                   <tr>
@@ -323,13 +374,13 @@ function Struggles({ load }: { load: Load<ProjectHotspot[]> }) {
                         {/* Opens the file's module panel on the Projects page. */}
                         <a href={moduleHref(h.projectKey, h.path)} className="font-mono text-[12px] [overflow-wrap:anywhere] text-accent-text hover:underline">{h.path}</a>
                       </td>
-                      <td className={`${tdClass} text-right tabular-nums ${h.misses ? 'font-semibold' : 'text-muted'}`}>{h.misses}</td>
+                      <td className={`${tdClass} text-right font-semibold tabular-nums`}>{h.misses}</td>
                       <td className={`${tdClass} text-right font-semibold tabular-nums`}>{h.score.toFixed(2)}</td>
                     </tr>
                   ))}
                 </tbody>
               </table>
-            </div>
+            </ScrollArea>
           </div>
         )}
       </Body>
@@ -350,6 +401,9 @@ function RecentActivity({ load }: { load: Load<Activity[]> }) {
 }
 
 /** Starter questions: a click puts one in the box to finish, it does not send it. */
+/** What Ask does, behind the info button beside its heading. */
+export const ASK_INTRO = 'Ask about a project. The answer cites what Feedback Graph knows and ends with a prompt to paste into your agent.';
+
 const STARTERS = [
   'I want to add a new page: what do we already have that I should reuse?',
   'Where should a new API endpoint go, and which patterns should it follow?',
@@ -358,6 +412,21 @@ const STARTERS = [
 ];
 const RECENT_CHATS = 5;
 const SUGGESTED = 3;
+
+/**
+ * A file path on one line that never breaks mid-name: the folders truncate (…) and the file name stays whole, so a long
+ * path reads `src/very/lo…/orders.ts` (a file name wider than the line truncates too). The full path is the tooltip;
+ * give the control holding it an aria-label, since a screen reader would read the two parts apart.
+ */
+export function PathLine({ path }: { path: string }) {
+  const cut = path.lastIndexOf('/') + 1;
+  return (
+    <span title={path} className="flex min-w-0 font-mono text-[12.5px]">
+      {cut > 0 && <span className="min-w-0 truncate">{path.slice(0, cut)}</span>}
+      <span className="max-w-full shrink-0 truncate">{path.slice(cut)}</span>
+    </span>
+  );
+}
 
 /**
  * The page's first thing: one question box. Pick a project, type, press Enter: it opens a new chat on the Ask page
@@ -371,7 +440,9 @@ function Ask({ projects, hotspots }: { projects: ProjectSummary[] | null; hotspo
   const box = useRef<HTMLTextAreaElement>(null);
   const chats = useLoad(() => api.chats());
   const chosen = project || projects?.[0]?.key || '';
-  const ready = !!chosen && !!text.trim();
+  // Asking starts a chat, an owner action: on a read-only install the box, starters and suggestions are off.
+  const writes = useOwnerWrites();
+  const ready = writes && !!chosen && !!text.trim();
   const go = () => {
     if (!ready) return;
     location.hash = newChatHref(chosen, text.trim(), provider ?? undefined);
@@ -381,14 +452,14 @@ function Ask({ projects, hotspots }: { projects: ProjectSummary[] | null; hotspo
   const recent = (Array.isArray(chats.data) ? chats.data : []).slice(0, RECENT_CHATS);
   const listLabel = 'flex items-center gap-1.5 text-[11px] font-semibold tracking-[0.06em] text-muted uppercase';
   return (
-    <section aria-label="Ask" className="grid justify-items-center gap-5 px-1 pt-6 pb-2 md:pt-10">
-      <div className="grid justify-items-center gap-3 text-center">
+    <section aria-label="Ask" className="grid justify-items-center gap-5 pt-6 pb-2 md:pt-10">
+      <div className="flex w-full items-center gap-3">
         <Mark size={40} />
-        <h2 className="text-[22px] font-semibold tracking-[-0.02em] [font-stretch:92%] md:text-[26px]">What do you want to build?</h2>
-        <p className="max-w-xl text-[13px] text-muted">Ask about a project. The answer cites what Feedback Graph knows and ends with a prompt to paste into your agent.</p>
+        <h2 className="min-w-0 text-[22px] font-semibold tracking-[-0.02em] [font-stretch:92%] md:text-[26px]">What do you want to build?</h2>
+        <InfoTip label="About Ask" text={ASK_INTRO} />
       </div>
       <form
-        className="grid w-full max-w-2xl gap-2 rounded-lg border border-field bg-surface p-2 shadow-card focus-within:border-focus focus-within:ring-2 focus-within:ring-focus/20"
+        className="grid w-full gap-2 rounded-lg border border-field bg-surface p-2 shadow-card focus-within:border-focus focus-within:ring-2 focus-within:ring-focus/20"
         onSubmit={(e) => { e.preventDefault(); go(); }}
       >
         <textarea
@@ -396,7 +467,9 @@ function Ask({ projects, hotspots }: { projects: ProjectSummary[] | null; hotspo
           aria-label="question"
           rows={2}
           value={text}
-          placeholder={projects?.length ? 'e.g. I want to add a modal: what do we already have?' : 'Choose the projects to read in Settings first'}
+          disabled={!writes}
+          title={writes ? undefined : READ_ONLY_TITLE}
+          placeholder={!writes ? 'Read-only: Ask needs an owner sign-in' : projects?.length ? 'e.g. I want to add a modal: what do we already have?' : 'Choose the projects to read in Settings first'}
           onChange={(e) => setText(e.target.value)}
           onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); go(); } }}
           className="min-w-0 resize-none bg-transparent px-2 py-1.5 text-[14px] leading-relaxed text-text placeholder:text-muted focus:outline-none"
@@ -408,25 +481,30 @@ function Ask({ projects, hotspots }: { projects: ProjectSummary[] | null; hotspo
           </Select>
           <ProviderSelect label="ask provider" value={provider} onChange={setProvider} />
           <span className="ml-auto hidden text-[11px] text-muted sm:inline">Enter to ask · Shift+Enter for a new line</span>
-          <Button type="submit" variant="primary" size="sm" aria-label="Ask" disabled={!ready}>
+          <Button type="submit" variant="primary" size="sm" aria-label="Ask" owner disabled={!ready}>
             Ask <ChevronIcon size={12} />
           </Button>
         </div>
       </form>
-      <div className="flex max-w-3xl flex-wrap justify-center gap-2">
+      {/* One row, as wide as the box: each starter truncates (its full text is the title and the name); a phone scrolls it. */}
+      <ScrollArea role="group" aria-label="starter questions" className="-m-1 flex w-[calc(100%+0.5rem)] gap-2 overflow-x-auto p-1">
         {STARTERS.map((q) => (
           <button
             key={q}
             type="button"
+            aria-label={q}
             onClick={() => { setText(q); box.current?.focus(); }}
-            className="rounded-md border border-line bg-surface px-2.5 py-1.5 text-left text-[12.5px] shadow-card transition-colors hover:border-line-strong hover:bg-hover"
+            disabled={!writes}
+            title={writes ? q : READ_ONLY_TITLE}
+            className="min-w-[12rem] flex-1 basis-0 truncate rounded-md border border-line bg-surface px-2.5 py-1.5 text-left text-[12.5px] shadow-card transition-colors enabled:hover:border-line-strong enabled:hover:bg-hover disabled:cursor-not-allowed disabled:opacity-60 sm:min-w-0"
           >
             {q}
           </button>
         ))}
-      </div>
+      </ScrollArea>
       {(suggested.length > 0 || recent.length > 0) && (
-        <div className="grid w-full max-w-4xl gap-6 pt-2 md:grid-cols-[minmax(0,3fr)_minmax(0,2fr)]">
+        // The page's full width, so its edges line up with the cards below it.
+        <div className="grid w-full gap-6 pt-2 md:grid-cols-[minmax(0,3fr)_minmax(0,2fr)]">
           <div className="grid content-start gap-2">
             <div className={listLabel}><AskIcon size={12} /> Suggested questions</div>
             {suggested.length ? (
@@ -435,8 +513,8 @@ function Ask({ projects, hotspots }: { projects: ProjectSummary[] | null; hotspo
                   const q = `Before I change ${h.path}, what should I know?`;
                   return (
                     <li key={`${h.projectKey}:${h.path}`}>
-                      <button type="button" onClick={() => { location.hash = newChatHref(h.projectKey, q); }} className="grid w-full gap-0.5 rounded-md px-2 py-1.5 text-left hover:bg-hover">
-                        <span className="text-[13.5px] font-medium [overflow-wrap:anywhere]">{q}</span>
+                      <button type="button" aria-label={`${q} ${h.projectKey}: a hotspot${h.misses ? `, ${h.misses} past ${h.misses === 1 ? 'miss' : 'misses'}` : ''}`} onClick={() => { location.hash = newChatHref(h.projectKey, q); }} disabled={!writes} title={writes ? undefined : READ_ONLY_TITLE} className="grid w-full gap-0.5 rounded-md px-2 py-1.5 text-left enabled:hover:bg-hover disabled:cursor-not-allowed disabled:opacity-60">
+                        <span className="flex min-w-0 items-baseline gap-1.5 text-[13.5px] font-medium"><span className="shrink-0">Before I change</span><PathLine path={h.path} /></span>
                         <span className="text-xs text-muted">{h.projectKey} · a hotspot{h.misses ? `, ${h.misses} past ${h.misses === 1 ? 'miss' : 'misses'}` : ''}</span>
                       </button>
                     </li>

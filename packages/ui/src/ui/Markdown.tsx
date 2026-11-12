@@ -1,4 +1,5 @@
 import type { ReactNode } from 'react';
+import { ScrollArea } from './ScrollArea.tsx';
 
 /**
  * Just enough markdown for an agent's reply: paragraphs, headings, bullet and numbered lists,
@@ -30,9 +31,9 @@ function blocks(text: string, cite?: Cite): ReactNode[] {
       while (i < lines.length && !lines[i].trimStart().startsWith(fence[1])) body.push(lines[i++]);
       i++; // the closing fence (or the end)
       out.push(
-        <pre key={out.length} className="overflow-x-auto rounded-sm border border-line bg-surface px-2.5 py-2 font-mono text-xs leading-relaxed whitespace-pre [overflow-wrap:normal]">
+        <ScrollArea as="pre" key={out.length} className="overflow-x-auto rounded-sm border border-line bg-surface px-2.5 py-2 font-mono text-xs leading-relaxed whitespace-pre [overflow-wrap:normal]">
           {body.join('\n')}
-        </pre>,
+        </ScrollArea>,
       );
       continue;
     }

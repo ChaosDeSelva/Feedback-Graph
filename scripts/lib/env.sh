@@ -11,6 +11,41 @@ envval() {
   printf '%s' "$v"
 }
 
+# This checkout's Compose project: FG_INSTANCE in .env, else feedback-graph. docker compose calls name it (-p), so the
+# project they address is always the one the scripts checked and printed. The environment's FG_INSTANCE names an install
+# only before it has a .env (setup.sh's first run writes it there); after that .env decides (check_instance_env).
+fg_instance() {
+  local v
+  if [ -f .env ]; then v="$(grep -E '^FG_INSTANCE=' .env | tail -n 1 | cut -d= -f2- | sed -e "s/^[\"']//" -e "s/[\"']\$//")"
+  else v="${FG_INSTANCE:-}"; fi
+  printf '%s' "${v:-feedback-graph}"
+}
+# Stops the script when the environment's FG_INSTANCE is not the install this checkout's .env names: it would point
+# docker compose at another install's containers and data.
+check_instance_env() {
+  local own
+  [ -n "${FG_INSTANCE:-}" ] && [ -f .env ] || return 0
+  own="$(fg_instance)"
+  [ "$FG_INSTANCE" = "$own" ] && return 0
+  echo "FG_INSTANCE=$FG_INSTANCE in your environment is not this checkout's install ($own, from $PWD/.env): unset it, or set FG_INSTANCE in that .env" >&2
+  exit 1
+}
+# The folder the install under Compose name $1 was started from: the working_dir label of its service containers, else
+# nothing. One-off containers (backup.sh's and restore.sh's) are left out, and so is an empty label: one a killed backup
+# or restore of an older version left carries none, and would hide the folder the install runs from.
+instance_dir() {
+  docker ps -a --filter "label=com.docker.compose.project=$1" --filter label=com.docker.compose.oneoff=False \
+    --format '{{.Label "com.docker.compose.project.working_dir"}}' 2>/dev/null | awk 'NF { print; exit }' || true
+}
+physical_dir() { (cd "$1" 2>/dev/null && pwd -P) || printf '%s' "$1"; }
+# The folder the install under Compose name $1 was started from when it is not $2 (default the current directory), else
+# nothing.
+foreign_install_dir() {
+  local d
+  d="$(instance_dir "$1")"
+  [ -z "$d" ] || [ "$(physical_dir "$d")" = "$(physical_dir "${2:-.}")" ] || printf '%s' "$d"
+}
+
 # Set KEY=VALUE in .env: its KEY= line replaced in place (later duplicates dropped), else appended. Every other line is
 # kept as it was, the value is never printed, and the file stays readable by you only.
 setenv() {
@@ -54,4 +89,16 @@ database_memory() {
         swaplimit=(swaplimit ~ /^[0-9]+$/ ? sprintf("%.0f",swaplimit) : "null")
         printf "{\"usedBytes\":%.0f,\"limitBytes\":%.0f,\"headroomBytes\":%.0f,\"swapBytes\":%.0f,\"swapLimitBytes\":%s,\"swapHeadroomBytes\":%s}", used,limit,limit-used,swap,swaplimit,swaphead
       }}'
+}
+
+# The settings that pick a model for a worker job; codex-cli in any of them uses the Codex login. (CHECK_LLM, the api's
+# judge, takes no CLI.)
+CODEX_JOB_SETTINGS='CLASSIFY_LLM POSTMORTEM_LLM SCAN_LLM DOCS_LLM CHAT_LLM SUMMARY_LLM LOOP_LLM'
+# Succeeds when one of those jobs is set to codex-cli.
+codex_job_configured() {
+  local job
+  for job in $CODEX_JOB_SETTINGS; do
+    case "$(envval "$job")" in codex-cli | codex-cli:*) return 0 ;; esac
+  done
+  return 1
 }

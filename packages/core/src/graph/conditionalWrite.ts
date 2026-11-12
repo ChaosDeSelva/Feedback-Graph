@@ -1,7 +1,7 @@
 import type { GraphRepo } from './repo.ts';
 import { claimRunOwnerWith } from './runs.ts';
 import { authorizeStoreWrite, storeWriteAuthorizationCheckpoint, withRunClaimExecutor } from '../storeWrites.ts';
-import { storeRequestSignal, storeTimeLeft } from '../storeDeadline.ts';
+import { deadlineOr, storeRequestSignal, storeTimeLeft } from '../storeDeadline.ts';
 
 /** Claim and conditional mutation commit together; a no-op rolls both back, without a release race. */
 export async function conditionalWrite<T>(g: GraphRepo, fn: (query: GraphRepo['run']) => Promise<T>, changed: (result: T) => boolean): Promise<T> {
@@ -21,7 +21,7 @@ export async function conditionalWrite<T>(g: GraphRepo, fn: (query: GraphRepo['r
       storeTimeLeft();
       await tx.commit();
       return result;
-    } catch (error) { await tx.rollback().catch(() => {}); reset(); throw error; }
+    } catch (error) { await tx.rollback().catch(() => {}); reset(); throw deadlineOr(error, signal); }
     finally { signal?.removeEventListener('abort', cancel); }
   } finally { await session.close(); }
 }

@@ -1,7 +1,7 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { WebStandardStreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js';
 import { z } from 'zod';
-import { FEEDBACK_SOURCES, LINK_RELATIONS, VERSION, type OperatorVerb } from '@fb/core';
+import { DECISION_NOTE_REASONS, DECISION_STATUSES, DECISION_TYPES, FEEDBACK_SOURCES, isoOffsetValid, LINK_RELATIONS, VERSION, type OperatorVerb } from '@fb/core';
 import { initializeClientInfo } from './mcp.ts';
 import { operatorName, OWNER_ROUTES } from './operator.ts';
 
@@ -48,6 +48,14 @@ const ROUTES = {
   rebuild_code_map: ['POST', '/api/projects/:key/codemap/rebuild'],
   run_cleanup: ['DELETE', '/api/runs/:id'],
   session_evidence: ['GET', '/api/sessions/:id/evidence'],
+  decisions_list: ['GET', '/api/decisions'],
+  decision_get: ['GET', '/api/decisions/:id'],
+  loop_status: ['GET', '/api/loop'],
+  // approve, reject and keep are three routes under one verb (loop_decide).
+  decision_decide: ['POST', '/api/decisions/:id/approve'],
+  decision_rollback: ['POST', '/api/decisions/:id/rollback'],
+  decision_note: ['POST', '/api/decisions/:id/notes'],
+  loop_pause: ['POST', '/api/loop/pause'],
 } as const satisfies Record<string, Route>;
 type ToolName = keyof typeof ROUTES;
 
@@ -130,6 +138,13 @@ const lessonRow = (l: Record<string, any>) => ({
   createdAt: l.createdAt, decidedBy: l.decidedBy ?? null,
 });
 
+/** A learning loop decision as a list row: what it does to what, how sure, and where it stands (decision_get has the rest). */
+const decisionRow = (d: Record<string, any>) => ({
+  id: d.id, type: d.type, status: d.status, tier: d.tier, mode: d.mode, projectKey: d.projectKey,
+  target: (d.targets?.find((t: { role: string }) => t.role === 'primary') ?? d.targets?.[0])?.id ?? null,
+  confidence: d.confidence, rationale: cut(d.rationale, 240), createdAt: d.createdAt, decidedBy: d.decidedBy ?? null,
+});
+
 /** What a client may assume about a tool (MCP ToolAnnotations): a read needs no approval; a write says how far it reaches. */
 const READ = { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false } as const;
 const write = (o: { destructive?: boolean; idempotent?: boolean; openWorld?: boolean } = {}) =>
@@ -138,6 +153,11 @@ type Annotations = typeof READ | ReturnType<typeof write>;
 
 function buildServer(call: Call, sleep: (ms: number) => Promise<void>) {
   const server = new McpServer({ name: 'feedback-graph-admin', version: VERSION });
+  /** A decision's status now, for a call that did not say what it expects; the failed read when there is none. */
+  const statusOf = async (id: string): Promise<string | Answer> => {
+    const r = await call('GET', `/api/decisions/${enc(id)}`);
+    return r.ok ? (r.data as { decision: { status: string } }).decision.status : r;
+  };
   const reg = <S extends z.ZodRawShape>(name: ToolName, description: string, inputSchema: S, annotations: Annotations, fn: (a: z.objectOutputType<S, z.ZodTypeAny>) => Promise<Result>) =>
     server.registerTool(name, { description: description + needs(name), inputSchema, annotations }, fn as never);
 
@@ -262,7 +282,7 @@ function buildServer(call: Call, sleep: (ms: number) => Promise<void>) {
     id: z.string().min(1).max(MAX.id),
   }, READ, async (a) => answer(await call('GET', `/api/lessons/${enc(a.id)}`)));
 
-  reg('lesson_decide', 'Approval updates local agents immediately. It does not trigger cloud sync: eligible projects share on the next schedule or cloud_sync_now. Approve a proposed lesson (agents are given it from then on) or reject it. Off by default: lessons are the owner\'s decision.', {
+  reg('lesson_decide', 'Approval updates local agents immediately. It does not trigger cloud sync: eligible projects share on the next schedule or cloud_sync_now. Approve a proposed lesson (agents are given it from then on), reject it, or revoke an approved one (agents stop getting it at once). Off by default: lessons are the owner\'s decision.', {
     id: z.string().min(1).max(MAX.id),
     decision: z.enum(['approve', 'reject', 'revoke']),
   }, write({ destructive: true, idempotent: true }), async (a) => {
@@ -303,13 +323,75 @@ function buildServer(call: Call, sleep: (ms: number) => Promise<void>) {
     id: z.string().min(1).max(MAX.id).describe('The session id'),
   }, READ, async (a) => answer(await call('GET', `/api/sessions/${enc(a.id)}/evidence`)));
 
+  reg('decisions_list', "The learning loop's decisions, newest first (the audit log: every status unless filtered), one compact row each: type, status, target, confidence, rationale. decision_get gives one in full. Paged.", {
+    status: z.enum(DECISION_STATUSES).optional(),
+    type: z.enum(DECISION_TYPES).optional(),
+    project: z.string().min(1).max(MAX.key).optional(),
+    target: z.string().min(1).max(MAX.id).optional().describe('Only decisions about this lesson, fact, miss or Inbox item id'),
+    since: z.string().datetime({ offset: true }).refine(isoOffsetValid, { message: 'the offset must be within ±14:00' }).optional().describe('Created at or after (ISO time)'),
+    q: z.string().trim().min(1).max(200).optional().describe('Text in the rationale or a target id'),
+    ...Paging,
+  }, READ, async (a) => {
+    const offset = a.offset ?? 0;
+    const limit = a.limit ?? PAGE_DEFAULT;
+    const r = await call('GET', `/api/decisions${qs({ status: a.status, type: a.type, project: a.project, target: a.target, since: a.since, q: a.q, limit: limit + 1, offset })}`);
+    if (!r.ok) return fail(r);
+    const rows = r.data as Record<string, any>[];
+    const more = rows.length > limit;
+    return json({ offset, items: rows.slice(0, limit).map(decisionRow), more, ...(more && { note: `more: pass offset: ${offset + limit} for the next page` }) });
+  });
+
+  reg('decision_get', 'One learning loop decision in full: before and after snapshots, its targets now, the evidence it rests on, rationale and confidence, what it depends on and what depends on it, and its notes.', {
+    id: z.string().min(1).max(MAX.id),
+  }, READ, async (a) => answer(await call('GET', `/api/decisions/${enc(a.id)}`)));
+
+  reg('loop_status', "The learning loop's state: its mode as set and as it runs (paused, LOOP_DISABLED, the tokenless cap), each decision type's mode, calibration and breaker, the budget, this week's counts and the current round.", {}, READ,
+    async () => answer(await call('GET', '/api/loop')));
+
+  reg('decision_decide', "Approve a proposed or observed decision (it is applied: approving one that changes a lesson changes what agents are told), reject it, or keep (ratify) an applied one. Your verdicts are recorded as the operator's and never count toward the loop earning auto-apply. Off by default.", {
+    id: z.string().min(1).max(MAX.id),
+    decision: z.enum(['approve', 'reject', 'keep']),
+    expect: z.enum(DECISION_STATUSES).optional().describe('The status you saw (decision_get); a decision that has moved since is refused. Default: its status now'),
+    note: z.string().trim().min(1).max(MAX.reason).optional(),
+    reason: z.enum(DECISION_NOTE_REASONS).optional().describe('With reject: why'),
+  }, write({ destructive: true }), async (a) => {
+    const expect = a.expect ?? await statusOf(a.id);
+    if (typeof expect !== 'string') return fail(expect);
+    return answer(await call('POST', `/api/decisions/${enc(a.id)}/${a.decision}`, { expect, ...(a.note && { note: a.note }), ...(a.reason && { reason: a.reason }) }));
+  });
+
+  reg('decision_rollback', 'Roll back an applied decision, and the later decisions that depend on it, all or nothing. A preview unless apply is true: it lists what else would be undone and what blocks it. Refused when its target was changed since (the decision is then overridden; restore_anyway writes what it was before over that change). Off by default.', {
+    id: z.string().min(1).max(MAX.id),
+    apply: z.boolean().optional().describe('Default false: only say what would be undone'),
+    reason: z.enum(DECISION_NOTE_REASONS).optional(),
+    note: z.string().trim().min(1).max(MAX.reason).optional(),
+    restore_anyway: z.literal(true).optional().describe('For an overridden decision: write what it was before over the later change'),
+    expect: z.enum(DECISION_STATUSES).optional().describe('The status you saw; default: its status now'),
+  }, write({ destructive: true }), async (a) => {
+    const expect = a.expect ?? await statusOf(a.id);
+    if (typeof expect !== 'string') return fail(expect);
+    return answer(await call('POST', `/api/decisions/${enc(a.id)}/rollback`, {
+      expect, cascade: a.apply ? 'apply' : 'preview', ...(a.reason && { reason: a.reason }), ...(a.note && { note: a.note }), ...(a.restore_anyway && { restoreAnyway: true }),
+    }));
+  });
+
+  reg('decision_note', 'Add a note to a learning loop decision: agree or disagree (with a reason). The note is kept in the decision\'s record; the loop reads only the owner\'s own notes, never an operator\'s, and a note\'s verdict never counts toward it earning auto-apply.', {
+    id: z.string().min(1).max(MAX.id),
+    text: z.string().trim().min(1).max(MAX.reason),
+    verdict: z.enum(['agree', 'disagree']).optional(),
+    reason: z.enum(DECISION_NOTE_REASONS).optional().describe('With verdict disagree: why'),
+  }, write(), async (a) => answer(await call('POST', `/api/decisions/${enc(a.id)}/notes`, { text: a.text, ...(a.verdict && { verdict: a.verdict }), ...(a.reason && { reason: a.reason }) })));
+
+  reg('loop_pause', 'Pause the learning loop at once: it records, proposes and applies nothing until the owner resumes it. Off by default: needs loop_settings in OPERATOR_ALLOW.', {}, write({ idempotent: true }),
+    async () => answer(await call('POST', '/api/loop/pause', {})));
+
   reg('rebuild_code_map', "Remap a project's code from scratch at the worker's next pass.", {
     project: z.string().min(1).max(MAX.key),
   }, write({ idempotent: true }), async (a) => answer(await call('POST', `/api/projects/${enc(a.project)}/codemap/rebuild`, {})));
 
-  // fg demo seed / remove (demo.ts): gated by the route itself, not by one OPERATOR_ALLOW verb (see DEMO_NEEDS).
-  const DEMO_NEEDS = ' The demo project needs only the operator token; another project (project) needs OPERATOR_ALLOW: lesson_decide.';
-  const demoArgs = { project: z.string().min(1).max(MAX.key).optional().describe('Another project than demo-shop (needs lesson_decide)') };
+  // fg demo seed / remove (demo.ts): the owner route needs `demo`; another project than demo-shop also needs lesson_decide.
+  const DEMO_NEEDS = ' Needs OPERATOR_ALLOW: demo (on by default); another project (project) also needs lesson_decide. An explicit OPERATOR_ALLOW replaces the defaults, so list both.';
+  const demoArgs = { project: z.string().min(1).max(MAX.key).optional().describe('Another project than demo-shop (needs lesson_decide as well as demo)') };
   const demoAnswer = (a: Answer) => (a.ok ? text((a.data as { message: string }).message) : fail(a));
   server.registerTool('demo_seed', {
     description: 'fg demo seed: a small corpus marked demo in demo-shop (approved lessons tied to files, a miss on a file, facts), so the lesson path fires on a project that has no approved lesson. The owner approves its lessons by having you run it: say so.' + DEMO_NEEDS,

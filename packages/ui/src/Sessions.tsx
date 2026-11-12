@@ -1,11 +1,13 @@
+import { asIs, labelOf } from './labels.ts';
 import { useEffect, useState, type ReactNode } from 'react';
-import { api, type ProjectSummary, type SessionDetail, type SessionListItem, type SessionState } from './api.ts';
+import { api, type ProjectSummary, type SessionDetail, type SessionListItem, type SessionState, errorMessage } from './api.ts';
 import { hashFocus, inboxHref, lessonHref } from './links.ts';
 import { PageHeader } from './ui/PageHeader.tsx';
 import { ListRow, SplitPane } from './ui/SplitPane.tsx';
-import { Button, Select } from './ui/controls.tsx';
+import { Button, Select, usePending } from './ui/controls.tsx';
 import { ago, Alert, Badge, Card, EmptyState, plural, SectionLabel, SkeletonDetail, SkeletonList, StatusBadge, tableClass, tdClass, thClass, type Tone } from './ui/display.tsx';
 import { SessionIcon } from './ui/icons.tsx';
+import { ScrollArea } from './ui/ScrollArea.tsx';
 
 const STATE_TONE: Record<SessionState, Tone> = { active: 'info', idle: 'neutral' };
 const STATE_TITLE: Record<SessionState, string> = {
@@ -16,7 +18,7 @@ const STATE_TITLE: Record<SessionState, string> = {
 const when = (ts: string | null) => (ts ? new Date(ts).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : 'unknown');
 
 function StateBadge({ state }: { state: SessionState }) {
-  return <Badge tone={STATE_TONE[state]} dot title={STATE_TITLE[state]}>{state}</Badge>;
+  return <Badge tone={labelOf(STATE_TONE, state, () => 'neutral')} dot title={labelOf(STATE_TITLE, state, () => '')}>{state}</Badge>;
 }
 
 export function Sessions() {
@@ -44,7 +46,7 @@ export function Sessions() {
       setItems(p.sessions);
       setNext(p.next);
       setSelected((cur) => cur ?? p.sessions[0]?.id ?? null);
-    }, (e) => { if (!stale) { setError(String(e)); setItems([]); } });
+    }, (e) => { if (!stale) { setError(errorMessage(e)); setItems([]); } });
     return () => { stale = true; };
   }, [project, state]);
 
@@ -53,35 +55,36 @@ export function Sessions() {
     setNotice(null);
     if (!selected) return;
     let stale = false;
-    api.sessionDetail(selected).then((d) => { if (!stale) setDetail(d); }, (e) => { if (!stale) setError(String(e)); });
+    api.sessionDetail(selected).then((d) => { if (!stale) setDetail(d); }, (e) => { if (!stale) setError(errorMessage(e)); });
     return () => { stale = true; };
   }, [selected]);
 
+  // Load more and Rebuild summary are shown only with a next page and a session open.
   async function more() {
-    if (!next) return;
     setLoadingMore(true);
     try {
-      const p = await api.sessions({ project: project || undefined, state: state || undefined, cursor: next });
-      setItems((xs) => [...(xs ?? []), ...p.sessions]);
+      const p = await api.sessions({ project: project || undefined, state: state || undefined, cursor: next! });
+      setItems((xs) => [...xs!, ...p.sessions]);
       setNext(p.next);
     } catch (e) {
-      setError(String(e));
+      setError(errorMessage(e));
     } finally {
       setLoadingMore(false);
     }
   }
 
-  async function resummarize() {
-    if (!detail) return;
+  const [rebuilding, runRebuild] = usePending<'rebuild'>();
+  const resummarize = () => runRebuild('rebuild', async () => {
+    const d = detail!;
     setError(null);
     try {
-      await api.resummarize(detail.id);
-      setDetail({ ...detail, rebuildRequested: true });
+      await api.resummarize(d.id);
+      setDetail({ ...d, rebuildRequested: true });
       setNotice('Queued: the worker rebuilds this summary from the first turn on its next pass. The current one stays until then.');
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setError(errorMessage(e));
     }
-  }
+  });
 
   const filtered = !!(project || state);
 
@@ -147,7 +150,7 @@ export function Sessions() {
       >
         <div className="mx-auto w-full max-w-3xl px-4 py-5 md:px-6">
           {error && <Alert className="mb-4">{error}</Alert>}
-          {detail ? <Detail s={detail} notice={notice} onResummarize={resummarize} /> : selected ? <SkeletonDetail /> : null}
+          {detail ? <Detail s={detail} notice={notice} rebuilding={!!rebuilding} onResummarize={() => void resummarize()} /> : selected ? <SkeletonDetail /> : null}
         </div>
       </SplitPane>
     </div>
@@ -170,7 +173,7 @@ function Meta({ label, children }: { label: string; children: ReactNode }) {
   return <div className="contents"><dt className="text-muted">{label}</dt><dd className="min-w-0 [overflow-wrap:anywhere]">{children}</dd></div>;
 }
 
-function Detail({ s, notice, onResummarize }: { s: SessionDetail; notice: string | null; onResummarize: () => void }) {
+function Detail({ s, notice, rebuilding, onResummarize }: { s: SessionDetail; notice: string | null; rebuilding: boolean; onResummarize: () => void }) {
   const sum = s.summary;
   return (
     <div className="flex min-w-0 flex-col gap-5">
@@ -241,7 +244,7 @@ function Detail({ s, notice, onResummarize }: { s: SessionDetail; notice: string
 
       {s.history.length > 0 && (
         <Card title="Update history">
-          <div className="overflow-x-auto">
+          <ScrollArea className="overflow-x-auto">
             <table className={tableClass}>
               <thead>
                 <tr><th className={thClass}>#</th><th className={thClass}>Turns</th><th className={thClass}>New</th><th className={thClass}>Model</th><th className={thClass}>When</th></tr>
@@ -258,12 +261,12 @@ function Detail({ s, notice, onResummarize }: { s: SessionDetail; notice: string
                 ))}
               </tbody>
             </table>
-          </div>
+          </ScrollArea>
         </Card>
       )}
 
       <div className="flex flex-wrap items-center gap-2">
-        <Button onClick={onResummarize} disabled={s.rebuildRequested || s.turnCount === 0}>Rebuild summary</Button>
+        <Button owner onClick={onResummarize} disabled={s.turnCount === 0} busy={rebuilding || s.rebuildRequested}>{rebuilding ? 'Requesting…' : 'Rebuild summary'}</Button>
         <span className="text-xs text-muted">Summarizes the whole session again from its first turn, replacing the merged one.</span>
       </div>
     </div>

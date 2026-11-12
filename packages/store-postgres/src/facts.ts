@@ -2,12 +2,16 @@ import { conditionalWrite } from './conditionalWrite.ts';
 import { archiveRunFileSelector, archiveBeforeRedaction, archiveRedactionInput } from '@fb/core';
 import { randomUUID } from 'node:crypto';
 import type pg from 'pg';
-import { clampRelevance, DEMO_SOURCE, FACT_EVIDENCE, factOrigin, requestTimes, scanRequestPaths, MANIFEST_WHY_RE, PROJECT_PATH, provenanceOf, holdsCredential, REDACT_PAGE, redactDeep, redactSecrets, relevanceOf, SCAN_UNAVAILABLE_WAIT_MS, scanRetryAt, redactStoredFact, reopensAsFact } from '@fb/core';
-import type { EmbeddedFact, FactCheck, FactHit, FactKind, FactOrigin, FactScope, FactsStore, Project, ScannedFile, ProjectSummary, RelevanceBy, ScanJob, ScanJobPatch, ScanQueueEntry, ScanStatus, StoredFact, RelevanceUpdate, UnscoredFact, RunTag } from '@fb/core';
+import { clampRelevance, DEMO_SOURCE, FACT_EVIDENCE, FACT_ORIGINS_KEPT, factOrigin, requestTimes, scanRequestPaths, MANIFEST_WHY_RE, PROJECT_PATH, provenanceOf, holdsCredential, REDACT_PAGE, redactDeep, redactSecrets, relevanceOf, SCAN_UNAVAILABLE_WAIT_MS, scanRetryAt, redactStoredFact, reopensAsFact } from '@fb/core';
+import { factFingerprint, factStateFingerprint, TargetChangedError, thresholdsSnapshot, type FactSnapshotWrite, type FingerprintedFact } from '@fb/core';
+import type { EmbeddedFact, FactCheck, FactHit, FactKind, FactOrigin, FactScope, FactsStore, OwnFactOrigin, Project, ScannedFile, ProjectSummary, RelevanceBy, ScanJob, ScanJobPatch, ScanQueueEntry, ScanStatus, StoredFact, RelevanceUpdate, UnscoredFact, RunTag, ProjectThresholds } from '@fb/core';
 import { iso, toJson, toVector, tx, type Db } from './db.ts';
 import { runSearch, sandboxPresence, searchFactsQuery, visibleToRun } from './vector.ts';
 
 type Exec = Pick<pg.PoolClient, 'query'>;
+
+/** A fact a scan may close or replace: not one filed under its project by you or the loop (FACT_ORIGINS_KEPT). */
+const scanned = (alias?: string) => `coalesce(${alias ? `${alias}.` : ''}origin, '') NOT IN (${FACT_ORIGINS_KEPT.map((o) => `'${o}'`).join(', ')})`;
 
 /** The CodeFile id Neo4j uses: '<projectKey>:<path>'. */
 const fileId = (projectKey: string, path: string) => `${projectKey}:${path}`;
@@ -58,9 +62,10 @@ export class PgFactsStore implements FactsStore {
 
   /** Replace the current facts of one file (old facts are closed, not deleted). */
   async saveFileFacts(projectKey: string, rawFile: ScannedFile & { summary: string }, rawFacts: EmbeddedFact[], source: string, scanJobId: string | null = null, run: RunTag | null = null): Promise<void> {
-    // Facts are model output about code that may contain credentials: redact at the door.
-    const file = redactDeep(rawFile);
-    const facts = redactDeep(rawFacts);
+    // Facts are model output about code that may contain credentials: redact at the door. The file's path is the
+    // repository's (as saveFileHashes stores it): redacted, two files would share one id.
+    const file = { ...redactDeep(rawFile), path: rawFile.path };
+    const facts = redactDeep(rawFacts).map((fx, i) => (rawFacts[i].path === rawFile.path ? { ...fx, path: rawFile.path } : fx));
     await archiveRedactionInput('facts', projectKey, { file: rawFile, facts: rawFacts }, { file, facts }, [{ kind: 'project', id: projectKey }, ...(run ? [{ kind: 'run', id: run.id }, archiveRunFileSelector(run.id, projectKey, file.path)] : [])]);
     sandboxPresence(this.db).wrote(run);
     const now = new Date();
@@ -76,7 +81,7 @@ export class PgFactsStore implements FactsStore {
            ${HASH_CHANGED}`}`,
         [cf, projectKey, file.path, file.hash, file.summary, now, file.version ?? null],
       );
-      await c.query(`UPDATE facts SET current = false, valid_to = $2 WHERE code_file_id = $1 AND current AND origin IS DISTINCT FROM 'you' AND run IS NOT DISTINCT FROM $3`, [cf, now, run?.id ?? null]);
+      await c.query(`UPDATE facts SET current = false, valid_to = $2 WHERE code_file_id = $1 AND current AND ${scanned()} AND run IS NOT DISTINCT FROM $3`, [cf, now, run?.id ?? null]);
       await insertFacts(c, projectKey, facts.map((fx) => ({ ...fx, codeFileId: cf })), source, scanJobId, now, file.hash, run);
     });
   }
@@ -90,7 +95,7 @@ export class PgFactsStore implements FactsStore {
         [projectKey, paths],
       );
       if (!rows.length) return;
-      await c.query(`UPDATE facts SET current = false, valid_to = $2 WHERE code_file_id = ANY($1::text[]) AND current AND origin IS DISTINCT FROM 'you' AND NOT coalesce(sandbox, false)`, [rows.map((r) => r.id), now]);
+      await c.query(`UPDATE facts SET current = false, valid_to = $2 WHERE code_file_id = ANY($1::text[]) AND current AND ${scanned()} AND NOT coalesce(sandbox, false)`, [rows.map((r) => r.id), now]);
     });
   }
 
@@ -112,7 +117,7 @@ export class PgFactsStore implements FactsStore {
     await tx(this.db, async (c) => {
       // Facts read from your documents, and facts you wrote, are not the code's: a scan never closes them.
       await c.query(
-        `UPDATE facts x SET current = false, valid_to = $2 WHERE x.project_key = $1 AND x.current AND x.doc_id IS NULL AND x.origin IS DISTINCT FROM 'you' AND NOT coalesce(x.sandbox, false)
+        `UPDATE facts x SET current = false, valid_to = $2 WHERE x.project_key = $1 AND x.current AND x.doc_id IS NULL AND ${scanned('x')} AND NOT coalesce(x.sandbox, false)
            AND EXISTS (SELECT 1 FROM unnest($3::text[]) AS p(pre) WHERE p.pre = '' OR x.path = p.pre OR left(x.path, length(p.pre) + 1) = p.pre || '/')
            AND NOT EXISTS (SELECT 1 FROM unnest($4::text[]) AS e(ex) WHERE x.path = e.ex OR left(x.path, length(e.ex) + 1) = e.ex || '/')`,
         [projectKey, now, scope.prefixes, scope.except],
@@ -140,8 +145,8 @@ export class PgFactsStore implements FactsStore {
     });
   }
 
-  /** Your fact: under the project, about no code file, so a scan has nothing of it to close. */
-  async addOwnerFact(projectKey: string, rawFact: EmbeddedFact, by: RelevanceBy, run?: RunTag | null): Promise<StoredFact> {
+  /** Your fact (or the loop's): under the project, about no code file, so a scan has nothing of it to close. */
+  async addOwnerFact(projectKey: string, rawFact: EmbeddedFact, by: RelevanceBy, run?: RunTag | null, o: { id?: string; origin?: OwnFactOrigin } = {}): Promise<StoredFact> {
     const fx = redactDeep(rawFact);
     await archiveRedactionInput('fact', projectKey, rawFact, fx);
     const relevance = relevanceOf(fx);
@@ -151,19 +156,45 @@ export class PgFactsStore implements FactsStore {
       const { rows } = await c.query(
         `INSERT INTO facts (id, project_key, kind, statement, path, lines, confidence, why, source, current, created_at, valid_from,
                             embedding, relevance, relevance_by, origin, run, sandbox)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::text, true, $10, $10, $11::vector, $12::float8, CASE WHEN $12::float8 IS NULL THEN NULL ELSE $9::text END, 'you', $13, $14)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::text, true, $10, $10, $11::vector, $12::float8, CASE WHEN $12::float8 IS NULL THEN NULL ELSE $9::text END, $15, $13, $14)
          RETURNING ${FACT_COLUMNS.replace(/x\./g, '')}`,
-        [randomUUID(), projectKey, fx.kind, fx.statement, fx.path || PROJECT_PATH, fx.lines ?? null, fx.confidence ?? null, fx.why ?? null, by,
-          new Date(), toVector(fx.embedding), relevance, run?.id ?? null, !!run?.sandbox],
+        [o.id ?? randomUUID(), projectKey, fx.kind, fx.statement, fx.path || PROJECT_PATH, fx.lines ?? null, fx.confidence ?? null, fx.why ?? null, by,
+          new Date(), toVector(fx.embedding), relevance, run?.id ?? null, !!run?.sandbox, o.origin ?? 'you'],
       );
       return factOf(rows[0]);
     });
   }
 
+  async fact(id: string): Promise<(StoredFact & FingerprintedFact & { projectKey: string }) | null> {
+    const { rows } = await this.db.pool.query(`SELECT ${FACT_COLUMNS}, x.project_key, x.current FROM facts x WHERE x.id = $1`, [id]);
+    return rows[0] ? { ...factOf(rows[0]), projectKey: rows[0].project_key, current: rows[0].current } : null;
+  }
+
+  async writeFactSnapshots(writes: FactSnapshotWrite[]): Promise<void> {
+    if (!writes.length) return;
+    await conditionalWrite(this.db, async (query) => {
+      // Every fact locked and compared before any is written: one that changed leaves them all as they were.
+      const { rows } = await query('SELECT id, kind, statement, path, lines, relevance, relevance_by, current FROM facts WHERE id = ANY($1::text[]) FOR UPDATE', [writes.map((w) => w.id)]);
+      const now = new Map(rows.map((f) => [f.id as string, factStateFingerprint({ ...f, relevanceBy: f.relevance_by })]));
+      for (const w of writes) {
+        const actual = now.get(w.id) ?? factStateFingerprint(null);
+        if (actual !== w.expect) throw new TargetChangedError(w.id, w.expect, now.has(w.id) ? actual : null);
+      }
+      await query(
+        `UPDATE facts x SET relevance = u.relevance, relevance_by = u.by, current = u.current,
+           valid_to = CASE WHEN u.current THEN NULL WHEN x.current THEN $5::timestamptz ELSE x.valid_to END
+         FROM unnest($1::text[], $2::float8[], $3::text[], $4::boolean[]) AS u(id, relevance, by, current)
+         WHERE x.id = u.id`,
+        [writes.map((w) => w.id), writes.map((w) => w.fields.relevance), writes.map((w) => w.fields.relevanceBy), writes.map((w) => w.fields.current), new Date()],
+      );
+      return true;
+    }, () => true);
+  }
+
   /** Which models wrote the project's current facts; a scan with a different one rescans every file. */
   async currentSources(projectKey: string): Promise<string[]> {
     const { rows } = await this.db.pool.query(
-      `SELECT DISTINCT source COLLATE "C" AS s FROM facts WHERE project_key = $1 AND current AND doc_id IS NULL AND origin IS DISTINCT FROM 'you' ORDER BY s`,
+      `SELECT DISTINCT source COLLATE "C" AS s FROM facts WHERE project_key = $1 AND current AND doc_id IS NULL AND ${scanned()} ORDER BY s`,
       [projectKey],
     );
     return rows.map((r) => r.s);
@@ -186,7 +217,7 @@ export class PgFactsStore implements FactsStore {
     const { rows } = await this.db.pool.query(
       `SELECT ${FACT_COLUMNS}, cf.summary AS file_summary, cf.hash_changed_at AS file_changed_at
        FROM facts x LEFT JOIN code_files cf ON cf.id = x.code_file_id
-       WHERE x.project_key = $1 AND x.current AND x.doc_id IS NULL AND x.origin IS DISTINCT FROM 'you' AND x.check_version IS DISTINCT FROM $2
+       WHERE x.project_key = $1 AND x.current AND x.doc_id IS NULL AND ${scanned('x')} AND x.check_version IS DISTINCT FROM $2
        ORDER BY x.path COLLATE "C", x.created_at, x.id
        LIMIT $3`,
       [q.projectKey, q.version, Math.max(0, Math.floor(q.limit))],
@@ -332,6 +363,15 @@ export class PgFactsStore implements FactsStore {
   async setFactRelevance(updates: RelevanceUpdate[]): Promise<number> {
     return conditionalWrite(this.db, async query => {
       if (!updates.length) return 0;
+      const expected = updates.filter((u) => u.expect !== undefined);
+      if (expected.length) {
+        const { rows } = await query(
+          'SELECT id, kind, statement, path, lines, relevance, relevance_by, current FROM facts WHERE id = ANY($1::text[]) FOR UPDATE',
+          [expected.map((u) => u.id)],
+        );
+        const actual = new Map(rows.map((f) => [f.id as string, factFingerprint({ ...f, relevanceBy: f.relevance_by })]));
+        for (const u of expected) if (actual.get(u.id) !== u.expect) throw new TargetChangedError(u.id, u.expect!, actual.get(u.id) ?? null);
+      }
       const { rowCount } = await query(
         `UPDATE facts x SET relevance = u.relevance, relevance_by = u.by,
            run = CASE WHEN u.owner THEN NULL ELSE x.run END, sandbox = CASE WHEN u.owner THEN false ELSE x.sandbox END
@@ -463,6 +503,7 @@ export class PgFactsStore implements FactsStore {
               (SELECT count(*) FROM facts x WHERE x.project_key = p.key AND x.current AND NOT x.sandbox AND x.doc_id IS NULL
                  AND (x.origin = 'manifest' OR (x.origin IS NULL AND x.why ~ $1))) AS manifest_facts,
               (SELECT count(*) FROM facts x WHERE x.project_key = p.key AND x.current AND NOT x.sandbox AND x.doc_id IS NULL AND x.origin = 'you') AS your_facts,
+              (SELECT count(*) FROM facts x WHERE x.project_key = p.key AND x.current AND NOT x.sandbox AND x.doc_id IS NULL AND x.origin = 'loop') AS loop_facts,
               to_jsonb(last) AS last
        FROM projects p
        LEFT JOIN LATERAL (SELECT * FROM scan_jobs j WHERE j.project_key = p.key ORDER BY j.requested_at DESC, j.id DESC LIMIT 1) last ON true
@@ -478,10 +519,24 @@ export class PgFactsStore implements FactsStore {
       feedback: r.feedback,
       lessons: r.lessons,
       facts: r.facts,
-      factsByOrigin: { model: r.facts - r.document_facts - r.manifest_facts - r.your_facts, manifest: r.manifest_facts, document: r.document_facts, you: r.your_facts },
+      factsByOrigin: { model: r.facts - r.document_facts - r.manifest_facts - r.your_facts - r.loop_facts, manifest: r.manifest_facts, document: r.document_facts, you: r.your_facts, loop: r.loop_facts },
       lastScan: r.last ? jobOf(r.last) : null,
       pinned: r.pinned === true,
     }));
+  }
+
+  async projectThresholds(projectKey: string): Promise<ProjectThresholds> {
+    const { rows } = await this.db.pool.query('SELECT similarity_floor, fact_rank_floor FROM projects WHERE key = $1', [projectKey]);
+    return { similarityFloor: rows[0]?.similarity_floor ?? null, factRankFloor: rows[0]?.fact_rank_floor ?? null };
+  }
+
+  async setProjectThresholds(projectKey: string, t: ProjectThresholds, o: { expect: string }): Promise<void> {
+    await tx(this.db, async (c) => {
+      const { rows } = await c.query('SELECT similarity_floor, fact_rank_floor FROM projects WHERE key = $1 FOR UPDATE', [projectKey]);
+      const actual = rows[0] ? thresholdsSnapshot(projectKey, { similarityFloor: rows[0].similarity_floor, factRankFloor: rows[0].fact_rank_floor }).fingerprint : null;
+      if (actual !== o.expect) throw new TargetChangedError(projectKey, o.expect, actual);
+      await c.query('UPDATE projects SET similarity_floor = $2, fact_rank_floor = $3 WHERE key = $1', [projectKey, t.similarityFloor, t.factRankFloor]);
+    });
   }
 
   async setPinned(project: Project, pinned: boolean): Promise<void> {

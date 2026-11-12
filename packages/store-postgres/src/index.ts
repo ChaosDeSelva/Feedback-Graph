@@ -1,5 +1,5 @@
 export { openPostgresStore, postgresStore, type PostgresStore } from './store.ts';
-export { openDb, tx, iso, toVector, fromVector, notImplemented, NotImplementedError, type Db, type PostgresConfig } from './db.ts';
+export { openDb, tx, iso, toVector, fromVector, type Db, type PostgresConfig } from './db.ts';
 export { migrate, migrationIds, renderMigration, MIGRATIONS_DIR, DEFAULT_EMBEDDING_DIMENSIONS, type MigrateOptions } from './migrate.ts';
 export { PgGraphStore } from './graph.ts';
 export { PgKnowledgeStore } from './knowledge.ts';

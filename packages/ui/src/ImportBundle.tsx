@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
-import { api, type ImportResult } from './api.ts';
+import { READ_ONLY_TITLE, useOwnerWrites } from './ownerAccess.tsx';
+import { api, type ImportResult, errorMessage } from './api.ts';
 import { buttonClass } from './ui/controls.tsx';
 import { plural } from './ui/display.tsx';
 import { CloseIcon, UploadIcon } from './ui/icons.tsx';
@@ -7,7 +8,7 @@ import { CloseIcon, UploadIcon } from './ui/icons.tsx';
 const readText = (f: File) =>
   new Promise<string>((resolve, reject) => {
     const r = new FileReader();
-    r.onload = () => resolve(String(r.result ?? ''));
+    r.onload = () => resolve(r.result as string);
     r.onerror = () => reject(r.error);
     r.readAsText(f);
   });
@@ -21,6 +22,7 @@ function summary(r: ImportResult): string {
 
 /** Projects page: bring an export bundle (from this or another machine) back in. Lessons wait for approval by default. */
 export function ImportBundle({ onImported, clearAfterMs = 20_000 }: { onImported?: () => void; clearAfterMs?: number }) {
+  const writes = useOwnerWrites();
   const [keepApproved, setKeepApproved] = useState(false);
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState<{ ok: boolean; text: string } | null>(null);
@@ -47,7 +49,7 @@ export function ImportBundle({ onImported, clearAfterMs = 20_000 }: { onImported
       setMessage({ ok: true, text: summary(await api.importBundle(bundle, keepApproved)) });
       onImported?.();
     } catch (e) {
-      setMessage({ ok: false, text: e instanceof Error ? e.message : String(e) });
+      setMessage({ ok: false, text: errorMessage(e) });
     } finally {
       setBusy(false);
     }
@@ -55,14 +57,14 @@ export function ImportBundle({ onImported, clearAfterMs = 20_000 }: { onImported
 
   return (
     <div className="flex flex-wrap items-center gap-2 text-xs">
-      <label className="flex items-center gap-1.5 text-muted">
-        <input type="checkbox" aria-label="keep approved lessons approved" checked={keepApproved} onChange={(e) => setKeepApproved(e.target.checked)} />
+      <label title={writes ? undefined : READ_ONLY_TITLE} className={`flex items-center gap-1.5 text-muted ${writes ? '' : 'cursor-not-allowed opacity-45'}`}>
+        <input type="checkbox" aria-label="keep approved lessons approved" checked={keepApproved} disabled={!writes} onChange={(e) => setKeepApproved(e.target.checked)} />
         keep approved
       </label>
-      <label className={buttonClass('secondary', 'sm', `relative cursor-pointer focus-within:outline-2 focus-within:outline-focus ${busy ? 'opacity-60' : ''}`)}>
+      <label title={writes ? undefined : READ_ONLY_TITLE} className={buttonClass('secondary', 'sm', `relative focus-within:outline-2 focus-within:outline-focus ${busy || !writes ? 'cursor-not-allowed opacity-45 hover:bg-surface active:translate-y-0' : 'cursor-pointer'}`)} aria-disabled={busy || !writes || undefined}>
         <UploadIcon size={13} />
         {busy ? 'importing…' : 'Import bundle'}
-        <input aria-label="import bundle file" type="file" accept=".json,application/json" className="sr-only" disabled={busy}
+        <input aria-label="import bundle file" type="file" accept=".json,application/json" className="sr-only" disabled={busy || !writes}
           onChange={(e) => { void pick(e.target.files); e.target.value = ''; }} />
       </label>
       {message && (

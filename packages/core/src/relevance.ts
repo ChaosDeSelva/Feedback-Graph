@@ -17,7 +17,7 @@ export const RARE_BELOW = 0.4;
 /** Where the rubric's "needed in most changes" starts (RELEVANCE_RUBRIC in the scan); 0.4 to 0.7 is "some changes". */
 export const EVERYDAY_FROM = 0.8;
 /** A rare fact (relevance < MIN_RELEVANCE) is served only when the task is at least this close to it. */
-const MIN_RELEVANCE = 0.3;
+export const MIN_RELEVANCE = 0.3;
 const CLOSE_ENOUGH = 0.8;
 /** Similarity below which a past miss or a fact is never served, whatever else ranks: a nonsense task gets nothing. */
 export const SIMILARITY_FLOOR = 0.78;
@@ -70,7 +70,10 @@ export function isNonMiss(missed: string): boolean {
   return NON_MISS.test(missed);
 }
 
-const dirSegs = (path: string) => path.replace(/^\.\//, '').split('/').slice(0, -1).filter(Boolean);
+/** A path with Windows separators written as forward slashes, so "src\routes\a.ts" splits like "src/routes/a.ts". */
+export const slashPath = (path: string) => path.replace(/\\/g, '/');
+
+const dirSegs = (path: string) => slashPath(path).replace(/^\.\//, '').split('/').slice(0, -1).filter(Boolean);
 
 /**
  * How much a fact or miss about `path` is worth to a task naming `files`, as a weight: above 1 when its folder holds
@@ -118,9 +121,9 @@ export function serviceDirs(paths: string[]): string[] {
 
 const escapeRe = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
-/** The service folders (from serviceDirs) whose name the task says as a word ("the webapp settings" names src/webapp). */
+/** The service folders (from serviceDirs) whose name the task says as a word ("the portal settings" names src/portal). */
 export function servicesInTask(task: string, dirs: string[]): string[] {
-  return dirs.filter((d) => new RegExp(`(?<![\\p{L}\\p{N}_])${escapeRe(d.split('/').at(-1)!)}(?![\\p{L}\\p{N}_])`, 'iu').test(task));
+  return dirs.filter((d) => new RegExp(`(?<![\\p{L}\\p{N}_])${escapeRe(slashPath(d).split('/').at(-1)!)}(?![\\p{L}\\p{N}_])`, 'iu').test(task));
 }
 
 /**
@@ -129,16 +132,26 @@ export function servicesInTask(task: string, dirs: string[]): string[] {
  */
 function serviceAffinity(path: string, services: string[]): number {
   if (!services.length || path === '.' || !dirSegs(path).length) return 1;
-  const p = path.replace(/^\.\//, '');
+  const p = slashPath(path).replace(/^\.\//, '');
   return services.some((s) => p.startsWith(`${s}/`)) ? 1.15 : 0.85;
 }
 
 /** Named files decide where a path sits; without them, the services the task names do. */
 const affinity = (path: string, files: string[], services: string[]) => (files.length ? pathAffinity(path, files) : serviceAffinity(path, services));
 
-/** Repo paths a model's text mentions ("in src/api/orders.ts"): a slash inside, no spaces, no URL. */
+/** A piece of a base64 run rather than a name: upper, lower and digits mixed with no word shape (kL9mN2pQ, not Button2). */
+const randomSegment = (seg: string) => /[A-Z]/.test(seg) && /[a-z]/.test(seg) && /\d/.test(seg) && !/^(?:[A-Z]{0,3}[a-z]+\d*)+$/.test(seg);
+
+/**
+ * Repo paths a model's text mentions ("in src/api/orders.ts"): a slash inside, no spaces, no URL. A slashed piece of a
+ * key (no extension, a random-looking segment, or a + or = against it) is not a path, and neither is the host part of
+ * a URL whose password was redacted (https://admin:[REDACTED]@host/x). A Windows path ("src\api\orders.ts") is found
+ * the same way and returned with forward slashes; with a backslash it needs a file extension, so an escape in quoted
+ * text ("line\nnext") is not a path.
+ */
 export function mentionedPaths(text: string): string[] {
-  return [...text.matchAll(/(?<![\w:/.-])((?:\.\/)?[\w@.-]+(?:\/[\w@.-]+)+)/g)].map((m) => m[1]);
+  return [...text.matchAll(/(?<![\w:/\\.+=@\]-])((?:\.[\\/])?[\w@.-]+(?:[\\/][\w@.-]+)+)(?![\w@.+=/\\-])/g)].map((m) => m[1])
+    .filter((p) => /\.[A-Za-z][\w-]*$/.test(p) || (!p.includes('\\') && !p.split('/').some(randomSegment))).map(slashPath);
 }
 
 const keepNearBest = <T extends { score: number }>(xs: T[]) => {
@@ -161,6 +174,36 @@ export function rankFacts<T extends FactHit>(hits: T[], n: number, files: string
       .filter(({ hit, score }) => score >= minimumRank || files.includes(hit.fact.path))
       .sort((a, b) => b.score - a.score),
   ).slice(0, n).map(({ hit, score }) => ({ ...hit, score: boundedScore(hit.score), rankingScore: boundedScore(score) }));
+}
+
+/**
+ * How close a past miss must be to the work to be served or judged when it shares no file with it (MISS_MIN_SIMILARITY):
+ * the bar a lesson learned elsewhere clears on similarity alone (lessonRank GLOBAL_CLOSE). Two sentences in the same
+ * register score well above SIMILARITY_FLOOR with no topic in common: misses of another feature scored 0.80-0.82 for
+ * unrelated tasks, and every one the judge was given came back not applicable.
+ */
+export const MISS_CLOSE = 0.85;
+
+const dirOf = (p: string) => p.split('/').slice(0, -1).join('/');
+/** A path named in a miss as a folder: its folder is itself; as a file (it has an extension): the folder it is in. */
+const folderOf = (p: string) => (/\.[A-Za-z][\w-]*$/.test(p.split('/').pop()!) ? dirOf(p) : p);
+
+/**
+ * Whether a miss's paths share a file with the named files: the same file (a miss may name it from a subfolder), or a
+ * file in the folder the miss names or names a file in.
+ */
+export function missTouches(paths: string[], files: string[]): boolean {
+  const clean = (p: string) => slashPath(p).replace(/^\.\//, '').replace(/\/+$/, '');
+  const fs = files.map(clean);
+  return paths.map(clean).some((p) => fs.some((f) => f === p || f.endsWith(`/${p}`) || (!!folderOf(p) && folderOf(p) === dirOf(f))));
+}
+
+/**
+ * Whether a past miss may be served or judged for work naming `files`: it shares a file with them (missTouches), or it
+ * is at least `close` (MISS_CLOSE) similar to the work. A miss that is merely in the same register is neither.
+ */
+export function missAdmitted(m: { missed: string; feedbackText: string; score: number }, files: string[], close = MISS_CLOSE): boolean {
+  return (files.length > 0 && missTouches(mentionedPaths(`${m.missed} ${m.feedbackText}`), files)) || boundedScore(m.score) >= close;
 }
 
 /**

@@ -19,7 +19,7 @@ import { pickWorkSession, type TouchedFile } from './work.ts';
 
 export type RematchDeps = {
   graph: Pick<GraphStore, 'pendingExternalItems' | 'setExternalLinks' | 'workSessions'>;
-  knowledge: Pick<KnowledgeStore, 'setLessonChecks' | 'updateLesson'> & Partial<Pick<KnowledgeStore, 'commentLessons'>>;
+  knowledge: Pick<KnowledgeStore, 'setLessonChecks' | 'updateLesson'> & Pick<KnowledgeStore, 'commentLessons'>;
   /** The repo files a session read or edited (CodeGraphStore.sessionFiles); unset: none known. */
   files?: (sessionId: string) => Promise<TouchedFile[]>;
   cursors: Pick<DocsStore, 'getCursor' | 'setCursor'>;
@@ -74,7 +74,7 @@ async function relinkPending(d: RematchDeps): Promise<string[]> {
   for (const i of items) {
     const pick = await pickWorkSession({ ...i.external, linkedSessionIds: [] }, i.projectKey, d);
     const ids = pick ? [pick.id] : [];
-    if (sameSet(ids, i.external.linkedSessionIds ?? [])) continue;
+    if (sameSet(ids, i.external.linkedSessionIds)) continue;
     if (await d.graph.setExternalLinks(i.turnUuid, ids)) changed.push(i.id);
   }
   return changed;
@@ -88,7 +88,6 @@ async function recheckProposed(d: RematchDeps): Promise<{ flagged: (CommentLesso
   const flagged: (CommentLesson & { oldSession: string })[] = [];
   const rejected: string[] = [];
   const held: string[] = [];
-  if (!d.knowledge.commentLessons) return { flagged, rejected, held };
   for (let after: string | null = null; ;) {
     const page = await d.knowledge.commentLessons({ status: 'proposed', limit: PAGE, afterId: after });
     for (const l of page) {

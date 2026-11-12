@@ -27,11 +27,11 @@ export const MIN_SHARD_FILES = 5;
  * directory holding more than this many files directly cannot be split (a scope is a set of directories).
  */
 export const MAX_SHARD_FILES = 400;
-/** Directories whose children are taken as shards when the repo declares no workspace (src/webapp, src/billing). */
+/** Directories whose children are taken as shards when the repo declares no workspace (src/portal, src/billing). */
 const SOURCE_ROOTS = ['src', 'packages', 'services', 'apps', 'cmd'];
 /**
  * Folders that hold services or apps, at any depth: each directory directly under one is a shard of its own
- * (src/webapp/apps/api, services/billing, cmd/server), and small ones merge only with a sibling in the same folder.
+ * (src/portal/apps/api, services/billing, cmd/server), and small ones merge only with a sibling in the same folder.
  */
 const CONTAINER_DIRS = new Set(['apps', 'services', 'packages', 'cmd', 'libs', 'crates', 'modules', 'plugins']);
 /** Files that make their directory a package or service of its own, whether or not a workspace file names it. */
@@ -173,7 +173,7 @@ function workspaceRoots(paths: string[], files: Record<string, string>): string[
   return [...roots];
 }
 
-/** The fallback: each directory directly under a common source root (src/webapp, services/billing, cmd/server). */
+/** The fallback: each directory directly under a common source root (src/portal, services/billing, cmd/server). */
 function sourceDirRoots(paths: string[], manifests: ReadonlySet<string>): string[] {
   const roots = new Set<string>();
   for (const p of paths) {
@@ -197,7 +197,7 @@ function manifestRoots(paths: string[], manifests: ReadonlySet<string>): string[
   return [...roots];
 }
 
-/** Every directory directly under a CONTAINER_DIRS folder, at any depth (src/webapp/apps/api), outside fixtures and archives. */
+/** Every directory directly under a CONTAINER_DIRS folder, at any depth (src/portal/apps/api), outside fixtures and archives. */
 function containerRoots(paths: string[], manifests: ReadonlySet<string>): string[] {
   const roots = new Set<string>();
   for (const p of paths) {
@@ -239,7 +239,8 @@ function split(root: string, files: string[]): [string, string[]][] {
   return [...(own.length ? [[root, own] as [string, string[]]] : []), ...big.flatMap(([child, fs]) => split(child, fs))];
 }
 
-const cmp = (a: string, b: string) => (a < b ? -1 : a > b ? 1 : 0);
+/** Shard keys are unique, so no two compare equal. */
+const cmp = (a: string, b: string) => (a < b ? -1 : 1);
 const keyOf = (roots: string[]) => roots.map((r) => r || '.').join('+');
 
 const parentOf = (root: string) => (root.includes('/') ? root.slice(0, root.lastIndexOf('/')) : '');
@@ -248,7 +249,7 @@ const parentOf = (root: string) => (root.includes('/') ? root.slice(0, root.last
  * Split repo-relative `paths` into shards along service boundaries. The roots: the workspace packages the repo declares
  * (`files` holds the root's WORKSPACE_FILES), every directory holding its own package manifest (a Go or Python service
  * in a JS workspace is no workspace member), every directory directly under an apps/, services/, packages/ or cmd/
- * folder at any depth (CONTAINER_DIRS: src/webapp/apps/api), and each top-level low-value folder (attic/, tests/);
+ * folder at any depth (CONTAINER_DIRS: src/portal/apps/api), and each top-level low-value folder (attic/, tests/);
  * without a declared or manifest root, also the directories under SOURCE_ROOTS. Nothing under a fixture or low-value
  * folder is a root of its own. A shard over MAX_SHARD_FILES is split by its subdirectories.
  *

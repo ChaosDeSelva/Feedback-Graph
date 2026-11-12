@@ -2,6 +2,7 @@ import { execFileSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { SCRIPT_TEST_TIMEOUT_MS } from './testing/exec.ts';
 import { expect, test } from 'vitest';
 import { discoverNested, hostRepoPath, keyOfRel, projectFolders, projectFromCwd, refreshLayout, relOfKey, type Root } from './projects.ts';
 
@@ -24,6 +25,15 @@ test('paths outside every root are skipped', () => {
   expect(projectFromCwd('/private/tmp/x', roots)).toBeNull();
   expect(projectFromCwd('/Users/you/codeOther/x', roots)).toBeNull();
   expect(projectFromCwd('', roots)).toBeNull();
+});
+
+test('a cwd with . or .. segments is resolved first: above the root is no project, a sibling is the sibling', () => {
+  expect(projectFromCwd('/Users/you/code/demo-shop/../../..', roots)).toBeNull();
+  expect(projectFromCwd('/Users/you/code/demo-shop/..', roots)).toBeNull();
+  expect(projectFromCwd('/Users/you/code/demo-shop/../other/src', roots)?.key).toBe('other');
+  expect(projectFromCwd('/Users/you/code/./demo-shop/./src', roots)?.key).toBe('demo-shop');
+  expect(hostRepoPath('/Users/you/code/demo-shop/../other', roots)).toBe('/Users/you/code/other');
+  expect(projectFromCwd('demo-shop/../other', roots)).toBeNull();
 });
 
 test('rootsFromEnv pairs container and host roots, rejecting mismatched lists', async () => {
@@ -84,7 +94,7 @@ test('discoverNested finds repos one or two levels inside folders that are not r
   // A folder kept whole (already selected or excluded as one project) is not split.
   expect(await discoverNested(base, { keepWhole: (k) => k === 'kept' })).not.toContain('kept/one');
   // It makes real git repos: a few seconds alone, more on a loaded machine.
-}, 20_000);
+}, SCRIPT_TEST_TIMEOUT_MS);
 
 test('a nested key is its path with a safe separator, and maps back to its folder', () => {
   expect(keyOfRel('github.com/org/repo')).toBe('github.com__org__repo');
@@ -126,4 +136,24 @@ test('projectFolders lists plain top-level folders and nested repos, not the fol
   ]);
   expect(folders.find((f) => f.key === 'client__app')?.container).toBe(`${base}/client/app`);
   expect(projectFromCwd('/Users/you/src/github.com/org/repo/src', roots)?.repoPath).toBe(`${base}/github.com/org/repo`);
+});
+
+test('projectFolders: a root never laid out lists its top folders; with no host the container path is used; the first root wins a key', async () => {
+  const a = mkdtempSync(join(tmpdir(), 'fg-roots-a-'));
+  const b = mkdtempSync(join(tmpdir(), 'fg-roots-b-'));
+  for (const d of ['shop', 'blog']) mkdirSync(join(a, d));
+  for (const d of ['shop', 'extra']) mkdirSync(join(b, d));
+  const folders = await projectFolders([{ host: '', container: `${a}/` }, { host: '/Users/me/b', container: b }]);
+  expect(folders.map((f) => [f.key, f.host, f.container])).toEqual([
+    ['blog', `${a}/blog`, `${a}/blog`], ['shop', `${a}/shop`, `${a}/shop`], ['extra', '/Users/me/b/extra', `${b}/extra`],
+  ]);
+  expect(await projectFolders([{ host: '/h', container: join(a, 'missing') }])).toEqual([]);
+});
+
+test('a folder with more than 500 subfolders is not searched for nested repos: it stays one project', async () => {
+  const base = mkdtempSync(join(tmpdir(), 'fg-wide-'));
+  const wide = join(base, 'monorepo');
+  for (let i = 0; i <= 500; i++) mkdirSync(join(wide, `pkg${i}`), { recursive: true });
+  mkdirSync(join(wide, 'pkg0', '.git'));
+  expect(await discoverNested(base)).toEqual([]);
 });

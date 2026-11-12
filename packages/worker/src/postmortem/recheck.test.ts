@@ -1,9 +1,12 @@
 import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { LESSON_CHECKS_VERSION, type Activity, type ActivityInput, type Lesson, type LessonCheck, type LessonDetail, type SimilarLesson } from '@fb/core';
+import { LESSON_CHECKS_VERSION, type Activity, type Decision, type ActivityInput, type Lesson, type LessonCheck, type LessonDetail, type SimilarLesson } from '@fb/core';
 import { expect, test } from 'vitest';
 import { duplicateFlag, recheckLessons, recordedWorkSession } from './recheck.ts';
+
+/** No learning-loop decision on any lesson. */
+const noDecisions = { forTarget: async () => [] };
 
 test('a stored miss blaming an AGENTS.md the session had is flagged contradicts-evidence; one the evidence does not contradict is not', async () => {
   const web = mkdtempSync(join(tmpdir(), 'fbre-'));
@@ -17,7 +20,7 @@ test('a stored miss blaming an AGENTS.md the session had is flagged contradicts-
   const k = { ...f.k, lessonDetail: async (id: string) => ({ ...(await f.k.lessonDetail(id)), feedback: { id, text: 'use pnpm', status: 'open', sessionId: `session-${id}`, ts: 't' } }) as LessonDetail };
   const recorded: Record<string, string[]> = { 'session-lesson:attached': ['/Users/you/Vibe/shop/AGENTS.md'], 'session-lesson:true': [] };
   const activity: ActivityInput[] = [];
-  await recheckLessons({
+  await recheckLessons({ decisions: noDecisions,
     k, activity: { record: async (a) => void activity.push(a) },
     instructionFiles: async (id) => recorded[id] ?? null,
     repoPaths: async () => new Map([['web', web]]),
@@ -36,7 +39,7 @@ test('a lesson whose post-mortem cited Linear tickets of another project is flag
   const k = { ...f.k, lessonDetail: async (id: string) => ({ ...(await f.k.lessonDetail(id)), contextItems: items[id] }) as LessonDetail };
   // shop: its own tickets (SHOP-*) and OPS-9, which one of its pull requests names; web has none.
   const linked: Record<string, string[]> = { shop: ['SHOP-1', 'OPS-9'], web: [] };
-  await recheckLessons({ k, linkedTickets: async (key, ids) => ids.filter((id) => linked[key]?.includes(id)), exists: async () => true });
+  await recheckLessons({ decisions: noDecisions, k, linkedTickets: async (key, ids) => ids.filter((id) => linked[key]?.includes(id)), exists: async () => true });
   expect(f.saved.get('lesson:leak')?.checks).toEqual([{ name: 'unlinked-ticket', why: 'its post-mortem cited Linear tickets not linked to shop (OPS-5, OPS-11): what it took from them is likely another project\'s' }]);
   expect(f.saved.get('lesson:own')?.checks).toEqual([]);
   expect(f.saved.get('lesson:web')?.checks).toEqual([{ name: 'unlinked-ticket', why: 'its post-mortem cited Linear tickets not linked to web (SHOP-1): what it took from them is likely another project\'s' }]);
@@ -45,7 +48,7 @@ test('a lesson whose post-mortem cited Linear tickets of another project is flag
 test('a failed ticket lookup leaves the lesson unchecked, to be checked again, rather than calling its tickets linked', async () => {
   const f = fake([lesson('lesson:leak', 'Lock the order row in orders/claim.sql')]);
   const k = { ...f.k, lessonDetail: async (id: string) => ({ ...(await f.k.lessonDetail(id)), contextItems: [{ kind: 'ticket' as const, ref: 'linear:OPS-5', excerpt: '', why: 'w', wasAvailable: false }] }) as LessonDetail };
-  await expect(recheckLessons({ k, linkedTickets: async () => { throw new Error('graph down'); }, exists: async () => true })).rejects.toThrow('graph down');
+  await expect(recheckLessons({ decisions: noDecisions, k, linkedTickets: async () => { throw new Error('graph down'); }, exists: async () => true })).rejects.toThrow('graph down');
   expect(f.saved.get('lesson:leak')).toBeUndefined();
 });
 
@@ -54,7 +57,8 @@ const lesson = (id: string, rule: string, extra: Partial<Lesson> = {}): Lesson =
   cause: 'context_missing', missId: null, createdAt: '2026-10-24T00:00:00Z', decidedAt: null, checks: null, checksVersion: null, from: 'session', ...extra,
 });
 
-type Miss = { missed: string; causeExplanation: string };
+/** A stored miss: the Postgres store gives one recorded without an explanation none. */
+type Miss = { missed: string; causeExplanation?: string };
 
 function fake(lessons: Lesson[], o: { feedback?: Record<string, string>; miss?: Record<string, Miss>; near?: Record<string, SimilarLesson[]> } = {}) {
   const saved = new Map<string, { checks: LessonCheck[]; version?: number }>();
@@ -69,6 +73,7 @@ function fake(lessons: Lesson[], o: { feedback?: Record<string, string>; miss?: 
     }) as LessonDetail,
     setLessonChecks: async (id: string, checks: LessonCheck[], version?: number) => { saved.set(id, { checks, version }); return true; },
     similarLessons: async (id: string) => o.near?.[id] ?? [],
+    setLessonPaths: async () => true,
   };
   return { k, saved };
 }
@@ -78,7 +83,7 @@ const names = (s: { checks: LessonCheck[] } | undefined) => s?.checks.map((c) =>
 test('lessons whose checks are older than the current version are re-checked, stamped, and the change is logged', async () => {
   const f = fake(
     [
-      lesson('lesson:a', 'Verify that feedback is relevant to the current task', { paths: ['src/webapp/AGENTS.md'] }),
+      lesson('lesson:a', 'Verify that feedback is relevant to the current task', { paths: ['src/portal/AGENTS.md'] }),
       lesson('lesson:b', 'Lock the order row in orders/claim.sql before the status insert'),
       lesson('lesson:c', 'Always verify state.', { checks: [], checksVersion: LESSON_CHECKS_VERSION }),
       lesson('lesson:d', 'Always verify state.', { status: 'rejected' }),
@@ -87,7 +92,7 @@ test('lessons whose checks are older than the current version are re-checked, st
     { feedback: { 'lesson:a': 'this is wrong', 'lesson:b': 'the insert races the status check' } },
   );
   const activity: ActivityInput[] = [];
-  const r = await recheckLessons({ k: f.k, activity: { record: async (a) => void activity.push(a) } });
+  const r = await recheckLessons({ decisions: noDecisions, k: f.k, activity: { record: async (a) => void activity.push(a) } });
   expect(r).toEqual({ checked: 3, flagged: 1, changed: 2 });
   expect(names(f.saved.get('lesson:a'))).toEqual(['bad-path', 'needs-path', 'meta-lesson', 'generic']);
   expect(f.saved.get('lesson:b')).toEqual({ checks: [], version: LESSON_CHECKS_VERSION });
@@ -95,9 +100,9 @@ test('lessons whose checks are older than the current version are re-checked, st
   expect(f.saved.get('lesson:e')).toEqual({ checks: [], version: LESSON_CHECKS_VERSION });
   expect([...f.saved.keys()].sort()).toEqual(['lesson:a', 'lesson:b', 'lesson:e']);
   expect(activity).toEqual([expect.objectContaining({
-    kind: 'lessons_checked', actor: 'lesson-check', subject: `3 lessons re-checked (checks v${LESSON_CHECKS_VERSION}): 1 flagged, 2 changed`,
+    kind: 'lessons_checked', actor: 'lesson-check', subject: `3 lessons re-checked (checks v${LESSON_CHECKS_VERSION}): 1 flagged, 2 changed, 1 proposed with paths normalized`,
     details: expect.objectContaining({
-      checked: 3, flagged: 1, changed: 2, version: LESSON_CHECKS_VERSION,
+      checked: 3, flagged: 1, changed: 2, normalized: 1, version: LESSON_CHECKS_VERSION,
       flags: { 'bad-path': 1, 'needs-path': 1, 'meta-lesson': 1, generic: 1 },
       added: { 'bad-path': 1, 'needs-path': 1, 'meta-lesson': 1, generic: 1 }, removed: { platitude: 1 },
     }),
@@ -110,7 +115,7 @@ test('the stored miss saying the session did other work flags a comment lesson w
     [lesson('lesson:gh', 'Add the index in db/schema.sql', { from: 'github' }), lesson('lesson:s', 'Add the index in db/schema.sql', { from: 'session' })],
     { miss: { 'lesson:gh': miss, 'lesson:s': miss } },
   );
-  await recheckLessons({ k: f.k });
+  await recheckLessons({ decisions: noDecisions, k: f.k });
   expect(names(f.saved.get('lesson:gh'))).toEqual(['wrong-session']);
   expect(names(f.saved.get('lesson:s'))).toEqual([]);
 });
@@ -121,7 +126,7 @@ test('cited paths are checked against the mounted repo: a missing one is flagged
     lesson('lesson:b', 'Lock the row in src/orders.ts', { projectKey: 'elsewhere', paths: ['src/gone.ts'] }),
   ]);
   const present = new Set(['/repos/shop/src/orders.ts']);
-  await recheckLessons({
+  await recheckLessons({ decisions: noDecisions,
     k: f.k,
     repoPaths: async () => new Map([['shop', '/repos/shop']]),
     exists: async (repo, p) => present.has(`${repo}/${p}`),
@@ -141,7 +146,7 @@ test('a proposed lesson gets its paths normalized and stored; an approved one ke
   const k = { ...f.k, setLessonPaths: async (id: string, p: string[]) => { stored.set(id, p); return true; } };
   const activity: ActivityInput[] = [];
   const logs: [string, object | undefined][] = [];
-  await recheckLessons({
+  await recheckLessons({ decisions: noDecisions,
     k, activity: { record: async (a) => void activity.push(a) }, log: (m, x) => logs.push([m, x]),
     repoPaths: async () => new Map([['data-pipeline', '/repos/data-pipeline']]),
     exists: async (_repo, p) => files.includes(p) || files.some((x) => x.startsWith(`${p}/`)),
@@ -161,13 +166,34 @@ test('a proposed lesson gets its paths normalized and stored; an approved one ke
   expect(logs).toContainEqual(['lesson paths normalized', expect.objectContaining({ id: 'lesson:p', from: paths, to: ['jobs/export/schedule.go', 'csv.ts'] })]);
 });
 
+test('a proposed lesson a learning-loop decision stands on keeps its paths (only flagged); one whose decision was rolled back is normalized', async () => {
+  const files = ['jobs/export/csv.ts'];
+  const f = fake([
+    lesson('lesson:held', 'Escape the CSV header row before the export job writes it', { projectKey: 'data-pipeline', paths: ['csv.ts', 'jobs/export/gone.ts'] }),
+    lesson('lesson:free', 'Escape the CSV header row before the export job writes it', { projectKey: 'data-pipeline', paths: ['csv.ts', 'jobs/export/gone.ts'] }),
+  ]);
+  const stored = new Map<string, string[]>();
+  const k = { ...f.k, setLessonPaths: async (id: string, p: string[]) => { stored.set(id, p); return true; } };
+  const on: Record<string, Decision['status']> = { 'lesson:held': 'applied', 'lesson:free': 'rolled_back' };
+  for (const status of ['observed', 'proposed', 'applying', 'applied'] as const) {
+    stored.clear();
+    on['lesson:held'] = status;
+    await recheckLessons({
+      decisions: { forTarget: async (id: string) => (on[id] ? [{ id: `dec:${id}`, status: on[id] } as Decision] : []) },
+      k, repoPaths: async () => new Map([['data-pipeline', '/repos/data-pipeline']]), exists: async (_repo, p) => files.includes(p), repoFiles: async () => files,
+    });
+    expect(stored).toEqual(new Map([['lesson:free', ['jobs/export/csv.ts']]]));
+    expect(f.saved.get('lesson:held')!.checks.map((c) => c.name)).toContain('path-missing');
+  }
+});
+
 test("a proposed lesson the owner edited keeps the owner's paths (a file about to be created too): it is only flagged", async () => {
   const files = ['jobs/export/csv.ts'];
   const owner = { title: 'T', rule: 'r', appliesWhen: '', scope: 'project' as const, paths: ['csv.ts'] };
   const f = fake([lesson('lesson:e', 'Escape the CSV header row before the export job writes it', { projectKey: 'data-pipeline', paths: ['jobs/export/header.ts', 'AGENTS.md'], proposedAs: owner })]);
   const stored = new Map<string, string[]>();
   const k = { ...f.k, setLessonPaths: async (id: string, p: string[]) => { stored.set(id, p); return true; } };
-  await recheckLessons({
+  await recheckLessons({ decisions: noDecisions,
     k, repoPaths: async () => new Map([['data-pipeline', '/repos/data-pipeline']]),
     exists: async (_repo, p) => files.includes(p), repoFiles: async () => files,
   });
@@ -183,7 +209,7 @@ test('flags a re-check cannot work out again (made from the comment metadata or 
     { name: 'no-miss', why: 'the post-mortem found no miss ("Nothing was missed."): this lesson may be invented; it is yours to decide' },
   ];
   const f = fake([lesson('lesson:a', 'Lock the order row in orders/claim.sql', { checks: [...kept, { name: 'universal-from-nit', why: 'from an APPROVED review' }], checksVersion: 1 })]);
-  await recheckLessons({ k: f.k });
+  await recheckLessons({ decisions: noDecisions, k: f.k });
   expect(f.saved.get('lesson:a')?.checks).toEqual(kept);
 });
 
@@ -200,7 +226,7 @@ test('a near-identical lesson in the same project flags the newer (or the unappr
       },
     },
   );
-  await recheckLessons({ k: f.k });
+  await recheckLessons({ decisions: noDecisions, k: f.k });
   expect(f.saved.get('lesson:new')?.checks).toEqual([{ name: 'duplicate-of', of: 'lesson:old', why: 'repeats lesson:old (cosine 0.95): merge them or reject one' }]);
   expect(names(f.saved.get('lesson:old'))).toEqual([]);
 });
@@ -218,7 +244,7 @@ test('duplicateFlag: an approved neighbour wins, rejected ones and those under t
 test('nothing to check: no activity', async () => {
   const f = fake([lesson('lesson:c', 'x', { checks: [], checksVersion: LESSON_CHECKS_VERSION })]);
   const activity: ActivityInput[] = [];
-  expect(await recheckLessons({ k: f.k, activity: { record: async (a) => void activity.push(a) } })).toEqual({ checked: 0, flagged: 0, changed: 0 });
+  expect(await recheckLessons({ decisions: noDecisions, k: f.k, activity: { record: async (a) => void activity.push(a) } })).toEqual({ checked: 0, flagged: 0, changed: 0 });
   expect(activity).toEqual([]);
 });
 
@@ -234,7 +260,7 @@ test('broken-rule is judged on the current rule: kept on a proposed lesson still
     // Still a scope word in the rule field now: flagged on what it holds today.
     lesson('lesson:s', 'task', { status: 'approved', appliesWhen: 'changing order claims', title: 'Lock the order row', checks: [], checksVersion: 4 }),
   ]);
-  await recheckLessons({ k: f.k, exists: async () => true });
+  await recheckLessons({ decisions: noDecisions, k: f.k, exists: async () => true });
   expect(f.saved.get('lesson:p')?.checks).toEqual([repaired]);
   expect(names(f.saved.get('lesson:a'))).toEqual([]);
   expect(f.saved.get('lesson:s')?.checks).toContainEqual({ name: 'broken-rule', why: 'the rule field holds "task"; the title reads like the rule' });
@@ -248,7 +274,7 @@ test('an approved lesson whose appliesWhen is a filler ("task", "project") is fl
   ]);
   const paths = new Map<string, string[]>();
   const k = { ...f.k, setLessonPaths: async (id: string, p: string[]) => { paths.set(id, p); return true; } };
-  await recheckLessons({ k, exists: async () => true });
+  await recheckLessons({ decisions: noDecisions, k, exists: async () => true });
   expect(f.saved.get('lesson:t')?.checks).toEqual([{ name: 'filler-applies-when', why: 'its "applies when" is just "task": it says nothing about when the rule applies; say the kind of task or the files' }]);
   expect(names(f.saved.get('lesson:p'))).toEqual(['filler-applies-when']);
   expect(names(f.saved.get('lesson:ok'))).toEqual([]);
@@ -265,7 +291,7 @@ test('wrong-session is not read from the miss of a post-mortem that had no sessi
   const work: Record<string, { id: string; matchedBy: 'branch' | 'files' | null } | null | undefined> = {
     'fb-lesson:alone': null, 'fb-lesson:branch': { id: 's1', matchedBy: 'branch' }, 'fb-lesson:files': { id: 's2', matchedBy: 'files' }, 'fb-lesson:old': undefined,
   };
-  await recheckLessons({ k, workSession: async (fid) => work[fid], exists: async () => true });
+  await recheckLessons({ decisions: noDecisions, k, workSession: async (fid) => work[fid], exists: async () => true });
   expect(names(f.saved.get('lesson:alone'))).toEqual([]);
   expect(names(f.saved.get('lesson:branch'))).toEqual([]);
   expect(names(f.saved.get('lesson:files'))).toEqual([]);
@@ -296,7 +322,7 @@ test("a wrong-session flag an earlier re-check read from the miss is worked out 
     lesson('lesson:redone', 'Add the index in db/schema.sql', { from: 'github', status: 'approved', appliesWhen: 'adding a query', checks: [redone], checksVersion: 4 }),
   ], { miss: { 'lesson:stale': miss, 'lesson:redone': miss } });
   const k = { ...f.k, lessonDetail: async (id: string) => ({ ...(await f.k.lessonDetail(id)), feedback: { id: `fb-${id}`, text: 'x', status: 'open', sessionId: 'pr', ts: 't' } }) as LessonDetail };
-  await recheckLessons({ k, workSession: async () => null, exists: async () => true });
+  await recheckLessons({ decisions: noDecisions, k, workSession: async () => null, exists: async () => true });
   expect(names(f.saved.get('lesson:stale'))).toEqual([]);
   expect(f.saved.get('lesson:redone')?.checks).toEqual([redone]);
 });
@@ -311,8 +337,58 @@ test('may-hold-secret is judged on the text as it is now: kept while a rule stil
     lesson('lesson:held', `Run with -e API_TOKEN=${V} against staging`, { status: 'approved', checks: [flag], checksVersion: null }),
     lesson('lesson:when', 'Run the release from CI', { status: 'approved', appliesWhen: `releasing with --password=${V}`, checks: [flag], checksVersion: null }),
   ]);
-  await recheckLessons({ k: f.k, exists: async () => true });
+  await recheckLessons({ decisions: noDecisions, k: f.k, exists: async () => true });
   expect(names(f.saved.get('lesson:clean'))).not.toContain('may-hold-secret');
   expect(names(f.saved.get('lesson:held'))).toContain('may-hold-secret');
   expect(names(f.saved.get('lesson:when'))).toContain('may-hold-secret');
+});
+
+test('a stored miss with no explanation is read for wrong-session by what it says was missed', async () => {
+  const f = fake(
+    [lesson('lesson:other', 'Add the index in db/schema.sql', { from: 'github' }), lesson('lesson:plain', 'Add the index in db/schema.sql', { from: 'github' })],
+    { miss: { 'lesson:other': { missed: 'This relates to a different PR than the session.' }, 'lesson:plain': { missed: 'the agent did not add the index' } } },
+  );
+  await recheckLessons({ decisions: noDecisions, k: f.k });
+  expect(names(f.saved.get('lesson:other'))).toEqual(['wrong-session']);
+  expect(names(f.saved.get('lesson:plain'))).toEqual([]);
+});
+
+test('of two near-identical lessons made at the same moment, the one with the later id is the duplicate', () => {
+  const at = '2026-10-24T00:00:00Z';
+  expect(duplicateFlag({ id: 'lesson:b', status: 'proposed', createdAt: at }, [{ id: 'lesson:a', status: 'proposed', createdAt: at, cosine: 0.97 } as SimilarLesson])).toMatchObject({ name: 'duplicate-of', of: 'lesson:a' });
+  expect(duplicateFlag({ id: 'lesson:a', status: 'proposed', createdAt: at }, [{ id: 'lesson:b', status: 'proposed', createdAt: at, cosine: 0.97 } as SimilarLesson])).toBeNull();
+});
+
+test('one global lesson with no project or origin is re-checked without a repository or neighbours, in the singular', async () => {
+  const f = fake([lesson('lesson:g', 'Lock the order row in orders/claim.sql', { projectKey: null, origin: null, scope: 'global' })]);
+  const activity: ActivityInput[] = [];
+  await recheckLessons({ decisions: noDecisions, k: f.k, activity: { record: async (a) => void activity.push(a) }, repoPaths: async () => new Map([['shop', '/repos/shop']]) });
+  expect(activity[0].subject).toBe(`1 lesson re-checked (checks v${LESSON_CHECKS_VERSION}): 0 flagged, 0 changed`);
+});
+
+test("a global lesson's tickets are checked against the project it came from; a cited ref that is no ticket is not counted", async () => {
+  const item = (ref: string) => ({ kind: 'ticket' as const, ref, excerpt: '', why: 'w', wasAvailable: false });
+  const f = fake([
+    lesson('lesson:g', 'Lock the order row in orders/claim.sql', { projectKey: null, origin: 'shop', scope: 'global' }),
+    lesson('lesson:n', 'Lock the order row in orders/claim.sql'),
+  ]);
+  const items: Record<string, ReturnType<typeof item>[]> = { 'lesson:g': [item('linear:OPS-5'), item('a note')], 'lesson:n': [item('see the doc')] };
+  const k = { ...f.k, lessonDetail: async (id: string) => ({ ...(await f.k.lessonDetail(id)), contextItems: items[id] }) as LessonDetail };
+  await recheckLessons({ decisions: noDecisions, k, linkedTickets: async () => [], exists: async () => true });
+  expect(f.saved.get('lesson:g')?.checks).toEqual([expect.objectContaining({ name: 'unlinked-ticket', why: expect.stringContaining('not linked to shop (OPS-5)') })]);
+  expect(names(f.saved.get('lesson:n'))).toEqual([]);
+});
+
+test('a miss blaming an AGENTS.md its own post-mortem marked available is flagged, with no feedback to look up', async () => {
+  const f = fake([lesson('lesson:a', 'Run pnpm in package.json scripts', { paths: [], scope: 'global' })], { miss: { 'lesson:a': { missed: 'ran npm', causeExplanation: 'The agent does not load AGENTS.md.' } } });
+  const k = { ...f.k, lessonDetail: async (id: string) => ({ ...(await f.k.lessonDetail(id)), contextItems: [{ kind: 'agents_md' as const, ref: 'AGENTS.md', excerpt: '', why: 'w', wasAvailable: true }] }) as LessonDetail };
+  await recheckLessons({ decisions: noDecisions, k, instructionFiles: async () => { throw new Error('not asked'); } });
+  expect(f.saved.get('lesson:a')?.checks).toEqual([expect.objectContaining({ name: 'contradicts-evidence', why: expect.stringContaining('the post-mortem itself marked it available (AGENTS.md)') })]);
+});
+
+test('a proposed lesson whose bare file name resolves is stored with the full path and flagged for nothing', async () => {
+  const f = fake([lesson('lesson:p', 'Escape the CSV header row in csv.ts before the export writes it', { paths: ['csv.ts'] })]);
+  const k = { ...f.k, setLessonPaths: async () => true };
+  await recheckLessons({ decisions: noDecisions, k, repoPaths: async () => new Map([['shop', '/repos/shop']]), exists: async (_r, p) => p === 'jobs/export/csv.ts', repoFiles: async () => ['jobs/export/csv.ts'] });
+  expect(f.saved.get('lesson:p')?.checks).toEqual([]);
 });

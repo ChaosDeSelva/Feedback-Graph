@@ -1,5 +1,5 @@
 import { expect, test } from 'vitest';
-import { extract } from './extract.ts';
+import { csharpNamespaces, extract } from './extract.ts';
 
 const sym = (r: Awaited<ReturnType<typeof extract>>, name: string) => r?.symbols.find((s) => s.name === name);
 const names = (r: Awaited<ReturnType<typeof extract>>) => r!.symbols.map((s) => s.name).sort();
@@ -281,4 +281,17 @@ test('a language without a grammar yields null; duplicate names (overloads) merg
   expect(await extract('ruby', 'class A; end\n')).toBeNull();
   const r = await extract('typescript', 'export function o(a: string): void;\nexport function o(a: number): void;\nexport function o(a: any) {\n}\n');
   expect(r!.symbols).toEqual([{ name: 'o', kind: 'function', exported: true, lines: '1-4' }]);
+});
+
+test('C# namespaces come from the same parse as the symbols; with parse errors, from the lines, comments and strings left out', async () => {
+  expect((await extract('csharp', 'namespace App.Core { namespace Inner { class A {} } }\n'))!.namespaces).toEqual(['App.Core', 'Inner']);
+  // A missing brace mid-file and #if alternatives with two class headers: tree-sitter drops the declaration.
+  expect(await csharpNamespaces('namespace Acme.Pay\n{\n    public class Card\n    {\n        public void Charge() {\n    }\n}\n')).toEqual(['Acme.Pay']);
+  expect((await extract('csharp', 'namespace Acme.Net\n{\n#if X\n  public class C : A\n  {\n#else\n  public class C : B\n  {\n#endif\n  }\n}\n'))!.namespaces).toEqual(['Acme.Net']);
+  // In an erroring file a namespace line in a comment or a verbatim, raw or regular string still declares nothing.
+  const broken = [
+    'namespace Real.One', '{', '/*', 'namespace Fake.Block', '*/', '// namespace Fake.Line', 'var a = @"', 'namespace Fake.Verbatim', '";',
+    'var b = """', 'namespace Fake.Raw', '""";', 'var c = "namespace Fake.Regular";', 'class D {',
+  ].join('\n');
+  expect(await csharpNamespaces(broken)).toEqual(['Real.One']);
 });

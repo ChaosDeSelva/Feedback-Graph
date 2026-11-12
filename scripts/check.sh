@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
-# Everything CI runs, locally: typecheck, unit + UI tests, the integration suites on both backends (Neo4j and
-# Postgres, throwaway containers from docker-compose.test.yml), the worker image as another uid, the UI build.
+# CI's checks, locally: lint, typecheck, unit + UI tests and the integration suites on both backends (Neo4j and
+# Postgres, throwaway containers from docker-compose.test.yml) with the coverage floor, and the UI build; plus the worker
+# image as another uid, which CI skips. CI also builds both Docker images and always checks the pushed history; here
+# the history check runs only on a `public` branch.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 pnpm install --frozen-lockfile >/dev/null
 pnpm lint
 pnpm typecheck
-pnpm test
 docker compose -f docker-compose.test.yml up -d --wait neo4j-test postgres-test >/dev/null
-TEST_STORES=neo4j,postgres pnpm test:int
+TEST_STORES=neo4j,postgres pnpm test:coverage:all
 # The images run as a host uid other than 1000 (Linux, HOST_UID), checked in Docker.
 ./scripts/check-uid.sh >/dev/null
 pnpm -F @fb/ui build >/dev/null

@@ -14,7 +14,7 @@ function fullApp() {
     activity: anything, docs: anything, links: anything, portability: anything, auth: { operator: { token: 'o'.repeat(32), allow: [] } }, log: () => {},
     system: { version: '9.9.9', ping: async () => true, worker: async () => null },
     classifyQueue: anything, settings: anything, codegraph: anything, mapMaxFiles: null, cloud: anything, inScope: () => true,
-    importer: anything, sessions: anything, shown: undefined, integrations: anything, chat: anything, runs: anything, evidence: anything,
+    importer: anything, sessions: anything, shown: undefined, integrations: anything, chat: anything, runs: anything, evidence: anything, loop: anything,
   });
 }
 
@@ -75,9 +75,9 @@ describe('GET /api/openapi.json', () => {
 
   test('every operation has a 2xx response with a schema (but no content), and every $ref resolves', () => {
     const doc = openApiDocument('dev') as any;
-    // GET on an MCP endpoint is refused (405: no server-sent stream), so it has no 2xx.
+    // GET on an MCP endpoint is refused (405: no server-sent stream), so it has no 2xx; a sign-in link redirects (303).
     const ops = Object.entries(doc.paths as Record<string, Record<string, any>>).flatMap(([p, o]) => Object.entries(o).map(([m, op]) => [`${m} ${p}`, op] as const))
-      .filter(([name]) => !name.startsWith('get /mcp'));
+      .filter(([name, op]) => !name.startsWith('get /mcp') && !op.responses['303']);
     expect(ops.length).toBeGreaterThan(70);
     const refs: string[] = [];
     const walk = (x: unknown) => {
@@ -158,5 +158,13 @@ describe('jsonSchema', () => {
   test('a refinement or transform is described by the schema it wraps', () => {
     expect(jsonSchema(z.string().refine((s) => s !== 'x', 'not x'))).toEqual({ type: 'string' });
     expect(jsonSchema(z.enum(['0', '1']).optional().transform((v) => v === '1'))).toEqual({ type: 'string', enum: ['0', '1'] });
+  });
+
+  test('exact lengths, exclusive bounds, unions and records', () => {
+    expect(jsonSchema(z.string().length(64))).toEqual({ type: 'string', minLength: 64, maxLength: 64 });
+    expect(jsonSchema(z.number().gt(0).lt(1))).toEqual({ type: 'number', exclusiveMinimum: 0, exclusiveMaximum: 1 });
+    expect(jsonSchema(z.union([z.string(), z.number()]))).toEqual({ anyOf: [{ type: 'string' }, { type: 'number' }] });
+    expect(jsonSchema(z.record(z.boolean()))).toEqual({ type: 'object', additionalProperties: { type: 'boolean' } });
+    expect(jsonSchema(z.unknown())).toEqual({});
   });
 });

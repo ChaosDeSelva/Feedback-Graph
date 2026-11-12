@@ -49,7 +49,7 @@ function setup(o: { allow?: OperatorVerb[]; items?: RunItem[]; entries?: Activit
     embed: async (t) => t.map(() => [1]),
     k: {
       searchLessons: async (q) => { searched.push(q); return []; },
-      relatedMisses: async (q) => { searched.push(q); return []; },
+      missesNaming: async () => [], relatedMisses: async (q) => { searched.push(q); return []; },
       recordPreDoneCheck: async (c) => { checks.push(c); },
       createManualFeedback: async (i) => { reports.push(i); return 'manual:9'; },
     },
@@ -73,7 +73,7 @@ function setup(o: { allow?: OperatorVerb[]; items?: RunItem[]; entries?: Activit
     },
     context: ctx,
     runs: {
-      ...(o.sandbox !== undefined && { sandbox: async () => o.sandbox! }),
+      sandbox: async () => o.sandbox ?? false,
       items: async (run) => (run === 'run-1' ? o.items ?? [] : []),
       remove: async (run, keep) => {
         removed.push([run, keep]);
@@ -150,7 +150,7 @@ test("every store read an MCP agent's answer comes from is asked for its run: th
   const { app } = setup({
     ctx: {
       k: {
-        searchLessons: async () => [], relatedMisses: async () => [], recordPreDoneCheck: async () => {}, createManualFeedback: async () => 'manual:9',
+        searchLessons: async () => [], missesNaming: async () => [], relatedMisses: async () => [], recordPreDoneCheck: async () => {}, createManualFeedback: async () => 'manual:9',
         listLessons: async (f) => { asked.push(['listLessons', f.run]); return []; },
       },
       codegraph: {
@@ -179,7 +179,7 @@ test("the owner's lists and code-map views are asked for the request's run: none
   const asked: [string, unknown][] = [];
   const { app } = setup({
     extra: {
-      knowledge: {
+      knowledge: { decidedLessons: async () => [], postmortemBacklog: async () => 0, postmortemQueue: async () => ({ waiting: 0, oldestAt: null }), requestLessonRecheck: async () => 0,
         listLessons: async (f) => { asked.push(['listLessons', f.run]); return []; }, updateLesson: async () => ({ unscoped: false }), lessonDetail: async () => null,
       },
       codegraph: {
@@ -222,7 +222,7 @@ test("an upload, a link and a lesson's fact made in a run record it", async () =
         listProjects: async () => [], requestScan: async () => ({}) as never, listFacts: async () => [], searchFacts: async () => [],
         addOwnerFact: async (...a: unknown[]) => { facts.push(a); return { id: 'f1' } as never; },
       },
-      knowledge: {
+      knowledge: { decidedLessons: async () => [], postmortemBacklog: async () => 0, postmortemQueue: async () => ({ waiting: 0, oldestAt: null }), requestLessonRecheck: async () => 0,
         listLessons: async () => [], updateLesson: async () => ({ unscoped: false }),
         lessonDetail: async () => ({ lesson: lesson('l1', { status: 'proposed', run: 'run-1', sandbox: true }), miss: null, feedback: null, contextItems: [], fixCommits: [], supersedes: [] }),
       },
@@ -324,6 +324,19 @@ test('a run id belongs to whoever opened it: a write under it by anyone else is 
   expect((await mine.app.request('/api/candidates/r:run-1/decision', json('POST', { status: 'confirmed' }, op('run-1')))).status).toBe(204);
 });
 
+test("a run's 409 says what the caller sent and what to change, without the opener's run key", async () => {
+  const error = async (res: Response) => { const b = (await res.json()) as { error: string | { message: string } }; return typeof b.error === 'string' ? b.error : b.error.message; };
+  const byAgent = await error(await setup({ owners: { 'run-1': 'agent' } }).app.request('/api/candidates/c1/decision', json('POST', { status: 'confirmed' }, op('run-1'))));
+  expect(byAgent).toMatch(/this request sent FG_OPERATOR_TOKEN, which takes precedence over API_TOKEN: clear FG_OPERATOR_TOKEN to act with API_TOKEN/);
+  const OTHER = runKey([...KEY].reverse().join(''))!;
+  const byKey = await error(await setup({ owners: { 'run-1': ['operator', OTHER] } }).app.request('/api/candidates/c1/decision', json('POST', { status: 'confirmed' }, op('run-1'))));
+  expect(byKey).toMatch(/this request sent a different FG_RUN_KEY/);
+  expect(byKey).not.toContain(OTHER.slice('run-key:'.length));
+  const tok = setup({ token: API, owners: { 'run-1': ['operator', CALLER] } });
+  const byToken = await error(await tok.app.request('/mcp?run=run-1', { ...rpc('report_feedback', { cwd: '/Users/j/Vibe/demo', feedback: 'x', what_was_done: 'y' }), headers: { ...rpc('x', {}).headers, authorization: `Bearer ${API}` } }));
+  expect(byToken).toMatch(/this request sent API_TOKEN, not the credential that opened it/);
+});
+
 test("the operator token cleans up its own run, and is refused (403) on an owner-token, browser or legacy run; the owner may clean any", async () => {
   const own = setup({ items });
   expect((await own.app.request('/api/candidates/r:run-1/decision', json('POST', { status: 'confirmed' }, op('run-1')))).status).toBe(204);
@@ -379,7 +392,7 @@ test('an operator cannot clean another agent run; the owner can', async () => {
 test("cleanup with --apply also removes the run's Activity entries, all but the run_cleaned entry, which keeps what the run changed; the dry run says so", async () => {
   const { app, removedEntries, logged } = setup({ items, entries: runEntries, owners: { 'run-1': ['operator', CALLER] } });
   const dry = (await (await app.request('/api/runs/run-1', json('DELETE', {}, op()))).json()) as Record<string, any>;
-  expect(dry).toMatchObject({ dryRun: true, entries: 3, entriesCapped: false });
+  expect(dry).toMatchObject({ dryRun: true, entries: 3 });
   expect(removedEntries).toEqual([]);
   const res = (await (await app.request('/api/runs/run-1', json('DELETE', { dryRun: false }, op()))).json()) as Record<string, any>;
   expect(res).toMatchObject({ dryRun: false, entriesRemoved: 3 });
@@ -400,7 +413,7 @@ test('cleanup keeps the history of every record it keeps: the entry that created
   expect(res.entriesRemoved).toBe(3);
 });
 
-test('a run with more entries than a cleanup reads: only the entries it read (and listed) go; every change among them is listed; the rest stay for the next cleanup', async () => {
+test('a run with more entries than one page of Activity: every page is read, every entry goes and every change is listed', async () => {
   const many = Array.from({ length: 5100 }, (_, i) => entry({
     id: `act:${String(i).padStart(5, '0')}`, actor: 'operator:tester', run: 'run-1', ...(i % 20 === 0
       ? { kind: 'project_pinned' as const, details: { via: 'operator' }, subject: `pinned ${i}` }
@@ -408,7 +421,8 @@ test('a run with more entries than a cleanup reads: only the entries it read (an
   }));
   const { app, removeArgs, logged } = setup({ items: [], entries: many, owners: { 'run-1': ['operator', CALLER] } });
   const res = (await (await app.request('/api/runs/run-1', json('DELETE', { dryRun: false }, op()))).json()) as Record<string, any>;
-  expect(res).toMatchObject({ entriesCapped: false, entriesRemoved: 5100 });
+  expect(res).toMatchObject({ entriesRemoved: 5100 });
+  expect(res).not.toHaveProperty('entriesCapped');
   expect(removeArgs[0].ids).toHaveLength(5100);
   expect(removeArgs[0].ids).toContain('act:05099');
   const cleaned = logged.at(-1)!;
@@ -495,7 +509,7 @@ function owned(o: { owners?: Record<string, RunPrincipal>; refuse?: boolean } = 
         setPinned: async (p, pinned) => { got.pins.push([p.key, pinned]); },
         addOwnerFact: async () => ({ id: 'f1' }) as never,
       },
-      knowledge: {
+      knowledge: { decidedLessons: async () => [], postmortemBacklog: async () => 0, postmortemQueue: async () => ({ waiting: 0, oldestAt: null }), requestLessonRecheck: async () => 0,
         listLessons: async () => [],
         updateLesson: async (id) => { got.updated.push(id); return { unscoped: false }; },
         lessonDetail: async (id: string) => ({ lesson: lesson(id, { status: 'proposed', ...(id === 'mine' && { run: 'run-1' }) }), miss: null, feedback: null, contextItems: [], fixCommits: [], supersedes: [] }),
@@ -743,6 +757,9 @@ test('tokenless cleanup is refused even with forged same-origin browser headers'
   expect((await s.app.request('/api/runs/legacy', json('DELETE', { dryRun: true }, { ...marker, origin: 'https://evil.example' }))).status).toBe(403);
   expect((await s.app.request('/api/runs/legacy', json('DELETE', { dryRun: true }, { ...marker, 'sec-fetch-site': 'same-origin', origin: 'http://localhost' }))).status).toBe(403);
   expect(s.removed).toEqual([]);
+  const refused = await setup({ ownerToken: null }).app.request('/api/runs/legacy', json('DELETE', { dryRun: true }, marker));
+  expect(refused.status).toBe(403);
+  expect(((await refused.json()) as { error: string }).error).toMatch(/tokenless install is read-only for owner actions: run \.\/scripts\/setup\.sh --yes --enable-auth/);
 });
 
 
@@ -763,4 +780,120 @@ test('knowing a sandbox run name cannot read its records without the private cap
   expect((await s.app.request('/api/runs/run-1')).status).toBe(403);
   const wrong = await s.app.request('/api/lessons', { headers: op('run-1', { 'x-fg-run-key': 'different-high-entropy-operator-key-123456' }) });
   expect(wrong.status).toBe(403);
+});
+
+test('cleaning up again after a cleanup, or a run never opened, is "nothing to remove" for any authenticated caller; owned or legacy runs stay refused', async () => {
+  const api = { authorization: `Bearer ${API}`, 'x-fg-run-key': KEY };
+  // run-2: no owner (cleanup released it, or it was never opened) and no records.
+  const s = setup({ token: API, owners: { 'run-3': ['agent', runKey('a-different-private-run-key-0123456789abcdef')!] } });
+  for (const headers of [api, op()]) {
+    for (const dryRun of [true, false]) {
+      const res = await s.app.request('/api/runs/run-2', json('DELETE', { dryRun }, headers));
+      expect(res.status).toBe(200);
+      const body = await res.json() as { removed?: Record<string, number>; remove: Record<string, number>; kept: unknown[] };
+      expect(Object.values(body.removed ?? body.remove).every(n => n === 0)).toBe(true);
+      expect(body.kept).toEqual([]);
+    }
+  }
+  expect(s.removed).toEqual([]);
+  expect(s.logged.filter(e => e.kind === 'run_cleaned')).toEqual([]);
+  // Another caller's run is still refused with the same 403, and so is an unowned run that still has records.
+  expect((await s.app.request('/api/runs/run-3', json('DELETE', { dryRun: true }, api))).status).toBe(403);
+  const legacy = setup({ token: API, items: [{ kind: 'lesson', id: 'l1', projectKey: 'demo', sandbox: false, merged: false } as RunItem] });
+  expect((await legacy.app.request('/api/runs/run-1', json('DELETE', { dryRun: true }, api))).status).toBe(403);
+  expect((await legacy.app.request('/api/runs/run-1', json('DELETE', { dryRun: true }, op()))).status).toBe(403);
+});
+
+test('an Activity store whose pages do not advance fails the plan instead of reading forever', async () => {
+  const page = Array.from({ length: 500 }, (_, i) => entry({ id: `act:${i}`, run: 'run-1' }));
+  let reads = 0;
+  const { app } = setup({ extra: { activity: { removeRun: async () => 0, record: async () => {}, list: async () => { reads++; return page; } } } });
+  const res = await app.request('/api/runs/run-1', { headers: browser });
+  expect(res.status).toBe(500);
+  expect(reads).toBe(2);
+});
+
+test('the cleanup request is checked: a malformed run id or body is a 400, and no body at all is a dry run', async () => {
+  const { app, removed } = setup({ items });
+  expect((await app.request('/api/runs/not%20a%20run', json('DELETE', {}, browser))).status).toBe(400);
+  expect((await app.request('/api/runs/run-1', json('DELETE', { dryRun: 'no' }, browser))).status).toBe(400);
+  const bare = await app.request('/api/runs/run-1', { method: 'DELETE', headers: { ...browser, 'content-type': 'application/json' } });
+  expect(await bare.json()).toMatchObject({ dryRun: true, remove: { feedback: 2 } });
+  expect(removed).toEqual([]);
+});
+
+test('a run opened with an API credential: its own entries that arrived over the API go with it', async () => {
+  const entries = [entry({ id: 'act:mine', kind: 'project_pinned', actor: 'api client', run: 'run-1', details: { via: 'api' }, subject: 'pinned demo' })];
+  const { app } = setup({ items: [], entries, owners: { 'run-1': 'owner_token' } });
+  const res = (await (await app.request('/api/runs/run-1', json('DELETE', { dryRun: false }, browser))).json()) as Record<string, any>;
+  expect(res).toMatchObject({ entries: 1, entriesRemoved: 1 });
+});
+
+test('kept records: a merged lesson under an already kept report adds nothing, a touched fact is kept as a fact, and each kind is listed by id', async () => {
+  const kept: RunItem[] = [
+    { kind: 'feedback', id: 'manual:z', projectKey: 'demo', sandbox: false, group: null, merged: true },
+    { kind: 'lesson', id: 'lesson:manual:z', projectKey: 'demo', sandbox: false, group: 'manual:z', merged: true },
+    { kind: 'feedback', id: 'manual:x', projectKey: 'demo', sandbox: false, group: null, merged: true },
+    { kind: 'feedback', id: 'manual:y', projectKey: 'demo', sandbox: false, group: null, merged: true },
+    { kind: 'fact', id: 'fact:1', projectKey: 'demo', sandbox: false, group: null, merged: false },
+  ];
+  const touched = entry({ kind: 'fact_relevance_set', actor: 'you', targets: ['fact:1'], details: { via: 'browser' }, subject: 'marked relevant' });
+  const { app } = setup({ items: kept, entries: [touched] });
+  const plan = (await (await app.request('/api/runs/run-1', { headers: browser })).json()) as Record<string, any>;
+  expect(plan.kept).toEqual([
+    { kind: 'feedback', id: 'manual:x', why: expect.stringMatching(/detector/) },
+    { kind: 'feedback', id: 'manual:y', why: expect.stringMatching(/detector/) },
+    { kind: 'feedback', id: 'manual:z', why: expect.stringMatching(/detector/) },
+    { kind: 'fact', id: 'fact:1', why: expect.stringMatching(/^you touched it outside the run \(marked relevant, /) },
+  ]);
+});
+
+test('a cleanup whose store removed nothing says so', async () => {
+  const zero = { feedback: 0, lesson: 0, miss: 0, predone_check: 0, fact: 0, doc: 0, link: 0, chat: 0 } as Record<RunItemKind, number>;
+  const { app, logged } = setup({ items, owners: { 'run-1': 'owner_token' }, extra: { runs: { sandbox: async () => false, items: async () => items, remove: async () => zero, claim: async (run, principal) => ({ run, principal, actor: null, firstSeen: 't' }), owner: async (run) => ({ run, principal: 'owner_token', actor: null, firstSeen: 't' }) } } });
+  expect((await app.request('/api/runs/run-1', json('DELETE', { dryRun: false }, browser))).status).toBe(200);
+  expect(logged.at(-1)!.subject).toMatch(/^cleaned up run run-1: removed nothing; kept 1 record$/);
+});
+
+test('MCP: a session the list showed but that is gone by the time it is read is left out', async () => {
+  const { app } = setup({ ctx: { sessions: {
+    list: async () => ({ sessions: [{ id: 'gone', projectKey: 'demo' } as never], next: null }),
+    detail: async () => null,
+  } } });
+  expect(await textOf(await app.request('/mcp?run=mine', rpc('get_recent_sessions', { cwd: '/Users/j/Vibe/demo' })))).not.toContain('gone');
+});
+
+test('MCP: the run\'s document searches and linked documents are asked for the run', async () => {
+  const asked: unknown[] = [];
+  const { app } = setup({ ctx: { docs: { searchDocs: async (q) => { asked.push(q); return []; }, linkedDocs: async (q) => { asked.push(q); return []; } } } });
+  await app.request('/mcp?run=mine', rpc('get_task_context', { cwd: '/Users/j/Vibe/demo', task: 'search' }));
+  expect(asked.length).toBeGreaterThan(0);
+  expect(asked.every((q) => (q as { run: string }).run === 'mine')).toBe(true);
+});
+
+test('a run opened before owners were recorded: entries a request made in it are not counted as its own', async () => {
+  const entries = [entry({ id: 'act:legacy', kind: 'project_pinned', actor: 'api client', run: 'run-1', details: { via: 'api' }, subject: 'pinned demo' })];
+  const { app } = setup({ items: [], entries });
+  expect(await (await app.request('/api/runs/run-1', { headers: browser })).json()).toMatchObject({ entries: 0, changed: [expect.objectContaining({ subject: 'pinned demo' })] });
+});
+
+test('MCP: a session whose details turn out to be another run\'s sandbox is left out; an ordinary one is served', async () => {
+  const listed = { id: 's1', projectKey: 'demo', source: 'claude', cwd: '/vibe/demo', gitBranch: 'main', startedAt: 't', lastActivityAt: 't', turnCount: 2, state: 'idle', snippet: 'g', summarizedThrough: { index: 1, ts: 't' }, summaryUpdatedAt: 't', summaryVersion: 1, pendingTurns: 0 };
+  const summary = { goal: 'ship the search box', done: [], decisions: [], openThreads: [], filesTouched: [], pushback: [], outcome: '', markdown: '**Goal:** ship the search box' };
+  const serve = (detail: object) => setup({ ctx: { sessions: { list: async () => ({ sessions: [listed as never], next: null }), detail: async () => ({ ...listed, summary, history: [], inbox: [], ...detail }) as never } } });
+  const hidden = await textOf(await serve({ sandbox: true, run: 'other' }).app.request('/mcp?run=mine', rpc('get_recent_sessions', { cwd: '/Users/j/Vibe/demo' })));
+  expect(hidden).not.toContain('ship the search box');
+  const shown = await textOf(await serve({}).app.request('/mcp?run=mine', rpc('get_recent_sessions', { cwd: '/Users/j/Vibe/demo' })));
+  expect(shown).toContain('ship the search box');
+});
+
+test('the API token with a malformed run key is told what a run key must be, not that the token cannot decide', async () => {
+  const s = setup({ token: API });
+  const res = await s.app.request('/api/runs/run-2', json('DELETE', { dryRun: false }, { authorization: `Bearer ${API}`, 'x-fg-run-key': 'wrongkey0000' }));
+  expect(res.status).toBe(403);
+  const { error } = await res.json() as { error: string };
+  expect(error).toContain('(12 characters)');
+  expect(error).toContain('at least 32 characters');
+  expect(error).not.toContain('wrongkey0000');
+  expect(error).not.toMatch(/not an owner credential/);
 });
