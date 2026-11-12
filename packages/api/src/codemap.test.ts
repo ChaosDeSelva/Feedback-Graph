@@ -672,3 +672,45 @@ test('get_task_context lists the AGENTS.md / CLAUDE.md files on the named files\
   const failing = await getTaskContext({ project: 'demo', task: 'pool work', files: ['src/db/pool.ts'] }, deps({ agentDocs: async () => { throw new Error('EACCES'); } }));
   expect(failing.markdown).not.toMatch(/Agent instructions/);
 });
+
+describe('a file not in the code map (a new one) still gets its lessons: by path or trigger, then by meaning to check', () => {
+  const onFolder = lesson('l:folder', 'Bill in cents', { paths: ['src/billing/**'] });
+  const fired = lesson('l:trigger', 'Retry idempotently', { paths: [], triggers: { paths: ['src/billing/*.ts'], patterns: [], symbols: [] } });
+  const close = lesson('l:close', 'Charge through the gateway', { paths: [] });
+  const far = lesson('l:far', 'Unrelated', { paths: [] });
+  const judged: string[][] = [];
+  const d = () => deps({
+    codegraph: codegraph({ lessonsForPaths: async (_k, ps) => (ps.includes('src/billing/new.ts') ? [{ lesson: onFolder, paths: ['src/billing/new.ts'] }] : []) }).cg,
+    k: {
+      ...deps().k,
+      searchLessons: async () => [{ lesson: close, score: 0.9 }, { lesson: far, score: 0.4 }],
+      listLessons: async () => [fired],
+    },
+    judge: async (_w, ls) => { judged.push(ls.map((h) => h.lesson.id)); return []; },
+  });
+
+  test('get_module_context lists the path and trigger matches, then the close ones marked to check', async () => {
+    const r = await getModuleContext({ project: 'demo', path: 'src/billing/new.ts' }, d());
+    expect(r.markdown).toMatch(/not in the code map/);
+    const onPath = r.markdown.slice(r.markdown.indexOf('## Approved lessons on this path'), r.markdown.indexOf('## Approved lessons close to it by meaning'));
+    expect(onPath).toContain('**Bill in cents**');
+    expect(onPath).toMatch(/\*\*Retry idempotently\*\*[\s\S]*trigger path `src\/billing\/\*\.ts`/);
+    expect(r.markdown.slice(r.markdown.indexOf('by meaning (check each applies)'))).toMatch(/\*\*Charge through the gateway\*\*[\s\S]*by meaning: check it applies/);
+    expect(r.markdown).not.toContain('Unrelated');
+  });
+
+  test('get_task_context serves the close ones for an unmapped file, marked to check; not for a mapped one', async () => {
+    const r = await getTaskContext({ project: 'demo', task: 'add the refund flow', files: ['src/billing/new.ts'] }, d());
+    expect(r.markdown).toMatch(/\*\*Charge through the gateway\*\*[\s\S]*by meaning: check it applies/);
+    expect(r.markdown).toContain('**Bill in cents**');
+    const mapped = await getTaskContext({ project: 'demo', task: 'add the refund flow', files: ['src/db/pool.ts'] }, d());
+    expect(mapped.markdown).not.toContain('Charge through the gateway');
+  });
+
+  test('check_before_done judges them for an unmapped changed file', async () => {
+    judged.length = 0;
+    await checkBeforeDone({ project: 'demo', task: 'refunds', summary: 's', filesChanged: ['src/billing/new.ts'] }, d());
+    expect(judged[0]).toEqual(expect.arrayContaining(['l:folder', 'l:trigger', 'l:close']));
+    expect(judged[0]).not.toContain('l:far');
+  });
+});

@@ -9,7 +9,8 @@ import {
   ModelOutputError,
   redactSecrets,
   SESSION_SUMMARY_JSON_SCHEMA,
-  SessionSummarySchema,
+  INVALID_SUMMARY,
+  SessionSummaryAnswerSchema,
   withMarkdown,
   type FinalReply,
   type HumanTurn,
@@ -155,9 +156,9 @@ export async function askSummary(llm: LlmProvider, user: string): Promise<Summar
   try {
     // A summary needs nothing but the prompt: an agentic model gets an empty folder, not the worker's.
     return await askJson(llm, { system: SYSTEM, user: redactSecrets(user), schema: SESSION_SUMMARY_JSON_SCHEMA, timeoutMs: TIMEOUT_MS },
-      (raw) => SessionSummarySchema.parse(raw), { promptOnly: true });
+      (raw) => SessionSummaryAnswerSchema.parse(raw), { promptOnly: true });
   } catch (err) {
-    if (err instanceof ModelOutputError) throw new InvalidSummaryError(`the model did not return a valid summary: ${err.message.slice(0, 800)}`);
+    if (err instanceof ModelOutputError) throw new InvalidSummaryError(`${INVALID_SUMMARY}: ${err.message.slice(0, 800)}`);
     throw err;
   }
 }

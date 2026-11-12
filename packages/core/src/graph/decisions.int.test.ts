@@ -376,6 +376,19 @@ describeStores('DecisionsStore', (h) => {
     expect(await d.calibration('reject_lesson', 1)).toEqual([]);
   });
 
+  test('never-merge pairs: one record per pair either way round, the first kept, listed from either id, lifted only by liftDistinct', async () => {
+    expect(await d.markDistinct({ a: 'lesson:b', b: 'lesson:a', by: 'you', reason: 'you rolled back the merge', decisionId: 'dec:9' })).toBe(true);
+    expect(await d.markDistinct({ a: 'lesson:a', b: 'lesson:b', by: 'operator:fg', reason: 'again', decisionId: null })).toBe(false);
+    await d.markDistinct({ a: 'lesson:a', b: 'lesson:c', by: 'you', reason: 'not the same', decisionId: null });
+    const [first] = await d.distinctPairs(['lesson:b']);
+    expect(first).toEqual({ a: 'lesson:a', b: 'lesson:b', by: 'you', at: expect.any(String), reason: 'you rolled back the merge', decisionId: 'dec:9' });
+    expect((await d.distinctPairs(['lesson:a'])).map((p) => p.b)).toEqual(['lesson:b', 'lesson:c']);
+    expect(await d.distinctPairs([])).toEqual([]);
+    expect(await d.liftDistinct('lesson:b', 'lesson:a')).toBe(true);
+    expect(await d.liftDistinct('lesson:b', 'lesson:a')).toBe(false);
+    expect((await d.distinctPairs(['lesson:a', 'lesson:b'])).map((p) => p.b)).toEqual(['lesson:c']);
+  });
+
   test('miss links: one per pair, never to itself or a missing miss, listed from either end, and removable', async () => {
     await misses('miss:a', 'miss:b', 'miss:c');
     expect(await d.linkMisses({ from: 'miss:a', to: 'miss:b', decisionId: 'dec:1' })).toBe(true);

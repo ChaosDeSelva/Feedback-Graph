@@ -365,7 +365,7 @@ describeStores('RunsStore and run attribution', (h) => {
     expect(g.nodes.filter((n) => n.kind === 'lesson').map((n) => n.label)).toEqual(['real lesson']);
     // The Dashboard's weekly pushback and the Projects page count the owner's records only.
     expect((await s.graph.stats()).filter((r) => r.projectKey === 'shop').reduce((n, r) => n + r.pushback, 0)).toBe(1);
-    expect((await s.facts.listProjects()).find((x) => x.key === 'shop')).toMatchObject({ feedback: 1, lessons: 1, facts: 1 });
+    expect((await s.facts.listProjects()).find((x) => x.key === 'shop')).toMatchObject({ feedback: 1, lessons: 1, lessonsByStatus: { approved: 1 }, globalLessons: 0, facts: 1 });
   });
 
   test("a pre-done check records the agent's session when it gives one", async () => {

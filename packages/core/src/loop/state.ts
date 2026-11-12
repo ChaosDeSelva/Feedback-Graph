@@ -1,6 +1,6 @@
 import { LOOP_MODES, type LoopConfig, type LoopMode } from '../config.ts';
 import type { DocsStore } from '../store.ts';
-import { LOOP_DECISION_TYPES, type DecisionTarget, type DecisionTier, type DecisionType } from '../types.ts';
+import { LOOP_DECISION_TYPES, type Decision, type DecisionTarget, type DecisionTier, type DecisionType } from '../types.ts';
 
 /**
  * The learning loop's state shared by the worker (which runs it) and the api (which shows and sets it), kept in the
@@ -35,8 +35,28 @@ const P: LoopTypeInfo = { tier: 'P', tauDefault: 1, prior: { alpha: 1, beta: 4 }
 export const LOOP_TYPE_INFO: Record<DecisionType, LoopTypeInfo> = {
   link_misses: H, merge_duplicates: H, rank_weight: H, retire_lesson: H,
   reject_lesson: A(0.85), approve_lesson: A(0.9), reword_lesson: A(0.88), narrow_scope: A(0.85), record_fact: A(0.88),
-  triage_inbox: P, tune_threshold: P, resolve_conflict: P, remove_source: P,
+  // Triage applies on its own once earned (0.9.1): at τ 0.9 and from 30 of your reviews in its band, never for an agent's
+  // report, your own sessions' items, or a risky or injected one (types/triage_inbox.ts). Its labels from when it was
+  // tier P count: the prior and the policy version are unchanged.
+  triage_inbox: { ...A(0.9), minLabels: 30 },
+  tune_threshold: P, resolve_conflict: P, remove_source: P,
+  merge_claims: H, link_claims: H, accept_claim: A(0.92), propose_resolution: P, assign_question: P, close_question: P,
+  update_paths: H,
 };
+
+/**
+ * Why a proposed decision waits for you, in one line (the Decisions page's "needs you"): the reason the loop gave for
+ * proposing it rather than applying it, else its tier or what it has not yet earned (by the type's default τ).
+ */
+export function needsYouReason(d: Pick<Decision, 'type' | 'tier' | 'rationale' | 'confidence'>): string {
+  const said = /Proposed (?:rather than applied|only): (.+?)\.?$/s.exec(d.rationale)?.[1];
+  if (said) return said.trim();
+  const info = LOOP_TYPE_INFO[d.type];
+  if (d.tier === 'P' || info?.tier === 'P') return 'always your call: the loop only proposes this kind of change';
+  if (info && d.confidence.n < info.minLabels) return `not earned yet: ${d.confidence.n} of the ${info.minLabels} reviews of yours it needs in this confidence band`;
+  if (info && d.confidence.lower < info.tauDefault) return `not sure enough to apply: confidence ${d.confidence.lower.toFixed(2)} under its bar ${info.tauDefault}`;
+  return 'the loop is set to propose this type, not apply it';
+}
 
 /** Scores fall in 5 calibration bands: [0, .2) is 0 ... [.8, 1] is 4. */
 export const LOOP_BANDS = 5;

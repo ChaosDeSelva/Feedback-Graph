@@ -258,6 +258,15 @@ export class PgSessionsStore implements SessionsStore {
     return { attempts, retryAt };
   }
 
+  async retryFailedSummaries(errorPrefix: string): Promise<string[]> {
+    const { rows } = await this.q(
+      `UPDATE sessions SET summary_retry_at = NULL, summary_attempts = 0
+       WHERE starts_with(summary_error, $1) AND summary_retry_at IS NOT NULL RETURNING id`,
+      [errorPrefix],
+    );
+    return rows.map((r) => r.id as string).sort();
+  }
+
   async setState(sessionId: string, state: SessionState) {
     await this.q('UPDATE sessions SET state = $2 WHERE id = $1', [sessionId, state]);
   }

@@ -27,6 +27,8 @@ export const conflictIdOf = (a: IntakeRef, b: IntakeRef) => `conflict:${sha256([
 
 /** What a forgotten Person is shown as. */
 export const FORGOTTEN_NAME = 'former participant';
+/** What a claim_decided Activity entry says once its claim is deleted: its statement leaves with it. */
+export const REMOVED_CLAIM = 'a claim since removed';
 
 /**
  * A name as aliases are matched: case, diacritics, punctuation and spacing ignored, "Last, First" read as "First Last".
@@ -43,9 +45,13 @@ export function aliasNorm(name: string): string {
 export const CLAIM_FINGERPRINT_FIELDS = ['status', 'statement', 'type', 'scope', 'factId'] as const;
 /** The conflict fields the same way. */
 export const CONFLICT_FINGERPRINT_FIELDS = ['status', 'resolution'] as const;
+/** The question fields a decision changes (assign_question, close_question) and a rollback restores. */
+export const QUESTION_FINGERPRINT_FIELDS = ['status', 'assignee', 'answerClaimId'] as const;
 const pick = (o: Record<string, unknown>, keys: readonly string[]) => Object.fromEntries(keys.map((k) => [k, o[k] ?? null]));
 export const claimFingerprint = (c: Pick<Claim, 'id' | (typeof CLAIM_FINGERPRINT_FIELDS)[number]>): string =>
   sha256(canonicalJson(['claim', c.id, pick(c, CLAIM_FINGERPRINT_FIELDS)]));
+export const questionFingerprint = (q: Pick<Question, 'id' | (typeof QUESTION_FINGERPRINT_FIELDS)[number]>): string =>
+  sha256(canonicalJson(['question', q.id, pick(q, QUESTION_FINGERPRINT_FIELDS)]));
 export const conflictFingerprint = (c: Pick<Conflict, 'id' | (typeof CONFLICT_FINGERPRINT_FIELDS)[number]>): string =>
   sha256(canonicalJson(['conflict', c.id, pick(c, CONFLICT_FINGERPRINT_FIELDS)]));
 
@@ -60,10 +66,17 @@ export type IntakeSnapshotWrite =
 
 /** IntakeStore.decideClaim's change: only the keys given. A status change records who decided and when. */
 export type ClaimPatch = Partial<Pick<Claim, 'status' | 'statement' | 'type' | 'scope' | 'about' | 'factId'>> & { embedding?: number[] | null };
-/** IntakeStore.updateQuestion's change: only the keys given (assignee null unassigns). */
-export type QuestionPatch = Partial<Pick<Question, 'status' | 'assignee'>>;
+/** IntakeStore.updateQuestion's change: only the keys given (assignee null unassigns; answerClaimId: the claim answering it). */
+export type QuestionPatch = Partial<Pick<Question, 'status' | 'assignee' | 'answerClaimId'>>;
 /** IntakeStore.updatePerson's change. */
 export type PersonPatch = { displayName?: string; status?: 'proposed' | 'confirmed'; addAliases?: string[]; removeAliases?: string[] };
+
+/**
+ * A claim from an export bundle (IntakeStore.importClaims): kept under its id, with its status, its source's id (the
+ * source itself is never exported, so it is not there) and who decided it.
+ */
+export type ImportedClaim = Pick<Claim, 'id' | 'projectKey' | 'docId' | 'type' | 'statement' | 'quote' | 'speakerId' | 'assertedAt' | 'confidence' | 'scope' | 'about' | 'due' | 'status' | 'decidedAt' | 'factId'>
+  & { embedding: number[] | null; decidedBy: string };
 
 /** The owner's answer to a question, stored as an accepted claim. */
 export type AnswerInput = Pick<Claim, 'statement' | 'type' | 'speakerId' | 'scope' | 'about'> & { embedding: number[] | null };

@@ -137,7 +137,7 @@ The MCP tools only read and report. Decisions (choosing projects, scanning, conf
 7. **Agents** use MCP. Only `report_feedback` writes; the other tools are marked read-only.
    - `get_task_context` serves approved lessons, past misses, code facts and doc excerpts. Given the files the agent will touch, it puts the lessons tied to those files first, adds a short code map of them (importers, tests, last miss) and lists the AGENTS.md and CLAUDE.md files on their path, nearest first. A lesson whose triggers match the files or the task's words is served too, saying which trigger fired.
    - A past miss is served or judged only when it shares a file with the work or is at least `MISS_MIN_SIMILARITY` (0.85) similar to it.
-   - `get_module_context` describes one file (facts, exported symbols, importers, imports, tests, and the lessons and misses tied to it); `impact` lists what depends on a set of files, the tests to run, and the lessons and misses there. A file past the code map's cap (`SCAN_MAX_FILES`) is answered in full too, its symbols parsed on demand.
+   - `get_module_context` describes one file (facts, exported symbols, importers, imports, tests, and the lessons and misses tied to it); `impact` lists what depends on a set of files, the tests to run, and the lessons and misses there. A file past the code map's cap (`SCAN_MAX_FILES`) is answered in full too, its symbols parsed on demand; a file the map does not hold at all (a new one) gets the lessons its path or a trigger names, then those close to it by meaning, marked to check.
    - `check_before_done` has the judge (`CHECK_LLM`) check finished work against those lessons and against lessons whose triggers fire on the diff's added lines or changed files. A lesson with no verdict counts as a gap. When a lesson requires a change to a file it names (a test, a doc) and the change leaves that file out, the gap says so ("you forgot X"). Given `files_changed`, it also names the importers and tests of those files the change did not touch, and what the last misses there were about.
    - `search_graph` finds lessons, misses, facts and docs by meaning; `get_recent_sessions` returns session summaries (step 8); `report_feedback` records a miss (step 4).
 8. **Session summaries:** each session of the selected projects gets a running summary (goal, what was done and decided, open threads, pushback, files touched, outcome). The worker keeps a cursor per session, the last turn the summary covers: once a session has been quiet for `SUMMARY_QUIET_MINUTES` (or `SUMMARY_MAX_DELTA_TURNS` turns are waiting), only the turns after the cursor are sent, with the previous summary, and the model returns the merged one (a big delta is summarized in parts, then merged). Quiet for `SESSION_IDLE_MINUTES` and summarized to its last turn, a session is **idle** ("complete for now"); a new turn makes it active again and the summary is extended. Sessions from before this are summarized a few per cycle, newest first. Agents get them through `get_recent_sessions`, and `get_task_context` lists the three most recent; post-mortems read the summary of the session they look at. Summaries are redacted, and never exported or synced.
@@ -165,6 +165,14 @@ then appears in the sidebar's Review group. Add a source with **Add a source** o
 Privacy: credentials and contact details are redacted before anything is stored or sent to a model, and speakers reach
 the model only as S1, S2, ... (names spoken inside the text do reach it). Transcript text, quotes, questions and
 sources are never served to agents, exported or synced, and claim facts leave for the cloud only with `SYNC_CLAIMS=true`.
+
+From a terminal: `fg ingest call.vtt --project k --wait` (a pdf or docx is converted on your machine with pdftotext
+or pandoc, when installed).
+
+Ask "what do we know about X": the Ask starter *What do we know about …?*, `fg know "<topic>"`, `GET /api/knowledge`
+or, for agents, the MCP tool `what_do_we_know` (accepted knowledge only) answer with the claims, facts and approved
+lessons on it, who said each and when, its open questions, and what is disputed. `fg conflicts --open` lists the
+conflicts waiting for you.
 
 How to use the page: [docs/guide.md](docs/guide.md#intake). Settings, privacy, deleting and cost:
 [docs/operations.md](docs/operations.md#knowledge-intake).

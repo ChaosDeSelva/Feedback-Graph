@@ -6,7 +6,28 @@ import type { GraphRepo } from './repo.ts';
 export type GraphNodeKind = 'feedback' | 'miss' | 'cause' | 'lesson' | 'context' | 'task' | 'commit';
 export type GraphNode = { id: string; kind: GraphNodeKind; label: string; status: string | null };
 export type GraphLink = { source: string; target: string; type: string };
-export type EvidenceGraph = { nodes: GraphNode[]; links: GraphLink[] };
+/** commitsHidden: fix commits capFixCommits left out (the API's graph only). */
+export type EvidenceGraph = { nodes: GraphNode[]; links: GraphLink[]; commitsHidden?: number };
+
+/** Fix commits drawn per feedback item: one project's 2,216 commits made the evidence graph one unreadable cluster. */
+export const FIX_COMMITS_SHOWN = 3;
+
+/**
+ * The evidence graph with at most `per` fix commits on each feedback item (the first ones listed), the rest and the
+ * commits left linking nothing removed, and how many commits went (commitsHidden).
+ */
+export function capFixCommits(g: EvidenceGraph, per = FIX_COMMITS_SHOWN): EvidenceGraph {
+  const seen = new Map<string, number>();
+  const links = g.links.filter((l) => {
+    if (l.type !== 'ADDRESSES') return true;
+    const n = (seen.get(l.target) ?? 0) + 1;
+    seen.set(l.target, n);
+    return n <= per;
+  });
+  const linked = new Set(links.flatMap((l) => [l.source, l.target]));
+  const nodes = g.nodes.filter((n) => n.kind !== 'commit' || linked.has(n.id));
+  return { nodes, links, commitsHidden: g.nodes.length - nodes.length };
+}
 
 export type RepeatGroup = { cause: Cause; count: number; projects: string[]; examples: string[]; lastSeen: string };
 export type PatternReport = {

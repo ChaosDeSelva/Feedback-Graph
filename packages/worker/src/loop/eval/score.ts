@@ -98,6 +98,15 @@ const AGREES: Record<DecisionType, (d: Decision, as: OwnerAction[]) => Verdict> 
   // The owner's own decision: nothing of the loop's to score.
   resolve_conflict: () => 'unlabelled',
   remove_source: () => 'unlabelled',
+  // Knowledge intake's types: the owner's actions on claims, questions and conflicts are not replayed as labels yet.
+  merge_claims: () => 'unlabelled',
+  link_claims: () => 'unlabelled',
+  accept_claim: () => 'unlabelled',
+  propose_resolution: () => 'unlabelled',
+  assign_question: () => 'unlabelled',
+  close_question: () => 'unlabelled',
+  // Housekeeping the owner never does by hand.
+  update_paths: () => 'unlabelled',
 };
 
 /** The owner's verdict on a would-be decision: his verdict on the loop's real decision for the same call, else the type's rule. */

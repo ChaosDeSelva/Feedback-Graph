@@ -179,6 +179,52 @@ describeStores('learning loop api', (h) => {
     expect((await store.activity.list({ target: decision.id, limit: 5 }))[0]).toMatchObject({ kind: 'decision_made', details: { status: 'expired' } });
   });
 
+  test('deciding lessons by hand expires the proposals waiting on them, said in one Activity line with how many', async () => {
+    const a = createApp(store.graph, { auth: { ownerToken: OWNER }, knowledge: store.knowledge, activity: store.activity, loop: {
+      decisions: store.decisions, cursors: store.docs, activity: store.activity, lessonDetail: (id) => store.knowledge.lessonDetail(id),
+      config: { mode: null, disabled: false, llm: null, llmCallsPerDay: 40, autoPerDay: 5, autoPerProject: 2, syncHoldDays: 7, holdout: 0.2, types: null },
+      exec: decisionExecutor(store, { embed: async (t) => t.map(() => vec(3)) }),
+    } });
+    const ls = await Promise.all(['lesson:exp1', 'lesson:exp2'].map(lesson));
+    const ds = [];
+    for (const l of ls) ds.push(await approveDecision(l));
+    const r = await post(a, '/api/lessons/decisions', { items: ls.map((l) => ({ id: l.id, status: 'rejected' })) });
+    expect(r.status).toBe(200);
+    for (const d of ds) expect((await store.decisions.get(d.id))!.status).toBe('expired');
+    const lines = (await store.activity.list({ kind: 'decision_made', limit: 20 })).filter((x) => x.details.action === 'expired_by_you');
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toMatchObject({ subject: '2 waiting loop proposals expired: you changed their targets yourself', details: { expired: 2 } });
+    expect(lines[0].targets).toEqual(expect.arrayContaining(ds.map((d) => d.id)));
+  });
+
+  test('superseding a lesson by hand is an owner merge decision: applied by the executor, audited, never calibrated, rolled back like a loop merge', async () => {
+    const exec = decisionExecutor(store, { embed: async (t) => t.map(() => vec(3)) });
+    const a = createApp(store.graph, { auth: { ownerToken: OWNER }, knowledge: store.knowledge, activity: store.activity, loop: {
+      decisions: store.decisions, cursors: store.docs, activity: store.activity, lessonDetail: (id) => store.knowledge.lessonDetail(id),
+      config: { mode: null, disabled: false, llm: null, llmCallsPerDay: 40, autoPerDay: 5, autoPerProject: 2, syncHoldDays: 7, holdout: 0.2, types: null }, exec,
+    } });
+    const keeper = await lesson('lesson:keep1');
+    const dup = await lesson('lesson:dup1');
+    await store.knowledge.updateLesson(dup.id, { status: 'approved' }, { by: 'you' });
+    const dupBefore = (await store.knowledge.lessonDetail(dup.id))!.lesson;
+    const loopMerges = async () => (await store.decisions.count({ author: 'loop' }, ['type'])).find((row) => row.type === 'merge_duplicates')?.n ?? 0;
+    const loopBefore = await loopMerges();
+    const r = await a.request(`/api/lessons/${encodeURIComponent(keeper.id)}`, { method: 'PATCH', headers: owner, body: JSON.stringify({ supersedes: dup.id, note: 'says the same' }) });
+    expect(r.status).toBe(200);
+    const [dec] = (await store.decisions.forTarget(dup.id)).filter((x) => x.type === 'merge_duplicates');
+    expect(dec).toMatchObject({ author: 'owner', status: 'applied', targets: [{ id: keeper.id, role: 'keeper' }, { id: dup.id, role: 'merged' }] });
+    expect((await store.knowledge.lessonDetail(dup.id))!.lesson.status).toBe('superseded');
+    expect((await store.knowledge.lessonDetail(keeper.id))!.supersedes).toEqual([dup.id]);
+    expect((await store.activity.list({ kind: 'lesson_decided', limit: 1 }))[0].details).toMatchObject({ supersedes: dup.id, decisionId: dec.id });
+    // Not the loop's: its own counts leave it out.
+    expect(await loopMerges()).toBe(loopBefore);
+
+    const back = await post(a, `/api/decisions/${encodeURIComponent(dec.id)}/rollback`, { expect: 'applied' });
+    expect(back.status).toBe(200);
+    expect((await store.knowledge.lessonDetail(dup.id))!.lesson).toMatchObject({ status: 'approved', decidedBy: dupBefore.decidedBy });
+    expect((await store.knowledge.lessonDetail(keeper.id))!.supersedes).toEqual([]);
+  });
+
   test('reject and notes against the store (redacted), the loop state, pause and resume', async () => {
     const a = app();
     const l = await lesson('lesson:int3');

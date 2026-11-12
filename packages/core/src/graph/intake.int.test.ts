@@ -338,13 +338,47 @@ describeStores('IntakeStore', (h) => {
     ].sort((x, y) => x.from.localeCompare(y.from)));
   });
 
+  test('removeSource everything: every claim whatever its status, the people only it named, and the claims\' text in Activity', async () => {
+    const ana = (await s.resolveAlias('Test Person A', { create: true }))!.person;
+    const bo = (await s.resolveAlias('Test Person B', { create: true }))!.person;
+    const cy = (await s.resolveAlias('Test Person C', { create: true }))!.person;
+    const one = await source('one.vtt', { participants: [ana.id, bo.id, cy.id] });
+    const other = await source('other.vtt', { participants: [cy.id] });
+    await s.saveWindow(one.docId, { window: 0, version: one.version, claims: [draft('kept', { speakerId: ana.id }), draft('turned down', { speakerId: bo.id }), draft('open')], questions: [] });
+    await s.saveWindow(other.docId, { window: 0, version: other.version, claims: [draft('elsewhere', { speakerId: cy.id })], questions: [] });
+    const claims = await s.listClaims({ docId: one.docId });
+    const kept = claims.find((c) => c.statement === 'kept')!;
+    await s.decideClaim(kept.id, { status: 'accepted' }, { by: 'you' });
+    await s.decideClaim(claims.find((c) => c.statement === 'turned down')!.id, { status: 'rejected' }, { by: 'you' });
+    await h.store.activity.record({ kind: 'claim_decided', actor: 'you', projectKey: 'shop', subject: 'accepted decision claim "kept"', why: 'w', details: {}, targets: [kept.id] });
+    expect(await s.removeSource(one.docId, { everything: true })).toEqual({ claim: 3, question: 0, people: 2 });
+    expect(await s.listClaims({ docId: one.docId })).toEqual([]);
+    expect(await s.person(ana.id)).toBeNull();
+    expect(await s.person(bo.id)).toBeNull();
+    // Named by another source too: stays.
+    expect((await s.person(cy.id))?.displayName).toBe('Test Person C');
+    expect(await s.resolveAlias('Test Person A')).toBeNull();
+    expect((await h.store.activity.list({ kind: 'claim_decided', limit: 10 })).find((a) => a.targets.includes(kept.id))?.subject).toBe('a claim since removed');
+    expect((await s.listClaims({ docId: other.docId })).map((c) => c.statement)).toEqual(['elsewhere']);
+  });
+
+  test('deleteClaims removes a claim whatever its status, and the conflicts it is a side of', async () => {
+    const { a, b, conflict } = await disputed();
+    await s.decideClaim(a.id, { status: 'accepted' }, { by: 'you' });
+    expect(await s.deleteClaims([a.id])).toBe(1);
+    expect(await s.claim(a.id)).toBeNull();
+    expect(await s.conflict(conflict.id)).toBeNull();
+    expect(await s.claim(b.id)).not.toBeNull();
+    expect(await s.deleteClaims([a.id])).toBe(0);
+  });
+
   test('removeSource drops the undecided claims, the questions and the details; accepted claims stay', async () => {
     const { docId, version } = await source();
     await s.saveWindow(docId, { window: 0, version, claims: [draft('keep'), draft('drop'), draft('rejected')], questions: [ask('q')] });
     const claims = await s.listClaims({ docId });
     await s.decideClaim(claims.find((c) => c.statement === 'keep')!.id, { status: 'accepted' }, { by: 'you' });
     await s.decideClaim(claims.find((c) => c.statement === 'rejected')!.id, { status: 'rejected' }, { by: 'you' });
-    expect(await s.removeSource(docId)).toEqual({ claim: 2, question: 1 });
+    expect(await s.removeSource(docId)).toEqual({ claim: 2, question: 1, people: 0 });
     expect((await s.listClaims({ docId })).map((c) => c.statement)).toEqual(['keep']);
     expect(await s.metas([docId])).toEqual([]);
     expect(await s.nextWindow(docId)).toBeNull();

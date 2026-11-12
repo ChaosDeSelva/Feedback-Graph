@@ -73,6 +73,10 @@ export function sourceHref(project: string, s: { kind: string; ref: string }): s
     case 'miss': return s.ref.startsWith('miss:') ? inboxHref(s.ref.slice(5)) : moduleHref(project, file);
     case 'linked': return projectHref(s.ref);
     case 'doc': return /^https?:\/\//.test(s.ref) ? s.ref : projectHref(project);
+    // What people said (knowledge intake): the Intake page's tab for it.
+    case 'claim': return '#intake/claims?status=accepted';
+    case 'question': return '#intake/questions';
+    case 'conflict': return '#intake/conflicts';
     default: return null;
   }
 }

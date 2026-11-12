@@ -31,7 +31,8 @@ import type { SessionCursor, SummaryWork, SummaryWorkQuery, SummaryWrite } from 
 import type { ChatAnswer, ChatConversation, ChatJob, ChatPack, ChatProvider, ChatThread, PendingChatTurn } from './chat.ts';
 import type { Decision, DecisionInput, DecisionNote, CalibrationBucket, DecisionType, LessonSignals, ProjectThresholds, TargetSnapshot } from './types.ts';
 import type { Claim, ClaimLink, Conflict, ConflictInput, IntakeMeta, IntakeMetaInput, Person, Question, QuestionDraft, Supersession } from './types.ts';
-import type { AnswerInput, ClaimFilter, ClaimHit, ClaimPatch, ClaimSearch, ConflictFilter, IntakeRedacted, IntakeRemoved, IntakeRunItem, IntakeSnapshotWrite, PersonPatch, QuestionFilter, QuestionPatch, WindowSave } from './intake/records.ts';
+import type { DistinctPair } from './types.ts';
+import type { AnswerInput, ImportedClaim, ClaimFilter, ClaimHit, ClaimPatch, ClaimSearch, ConflictFilter, IntakeRedacted, IntakeRemoved, IntakeRunItem, IntakeSnapshotWrite, PersonPatch, QuestionFilter, QuestionPatch, WindowSave } from './intake/records.ts';
 import type { CalibrationBump, DecisionCount, DecisionCountFilter, DecisionCountKey, DecisionFilter, DecisionNoteInput, DecisionStatusPatch, FactSnapshotWrite, FingerprintedFact, LessonSnapshotFields, LessonSnapshotWrite, MissLink, SupersedeLink } from './decisions/record.ts';
 
 /** The paths a scope replace covers (FactsStore.replaceScopeFacts): under one of `prefixes`, under none of `except`. */
@@ -115,7 +116,8 @@ export interface GraphStore {
    * Returns the id of the Inbox item the turn is filed under (the turn's own id, or the merged report's), null without
    * makeCandidate.
    */
-  saveClassification(turnUuid: string, c: Classification, makeCandidate: boolean): Promise<string | null>;
+  /** embedding: the flagged turn's text embedded (0.9.1), so a reworded or later report of the same miss joins its item (dedupe.ts). */
+  saveClassification(turnUuid: string, c: Classification, makeCandidate: boolean, o?: { embedding?: number[] | null }): Promise<string | null>;
   listCandidates(f?: CandidateFilter): Promise<Candidate[]>;
   candidateDetail(id: string): Promise<CandidateDetail | null>;
   /**
@@ -380,7 +382,7 @@ export interface KnowledgeStore {
    * for the same miss that it was merged into (REPORT_MERGE_MINUTES, dedupe.ts). The detector merges the other way in
    * GraphStore.saveClassification. run: the run the report was made in (a merged report keeps the item's own: none).
    */
-  createManualFeedback(input: { project: Project; cwd: string; text: string; whatWasDone: string; sessionId?: string | null; run?: RunTag | null }): Promise<string>;
+  createManualFeedback(input: { project: Project; cwd: string; text: string; whatWasDone: string; sessionId?: string | null; run?: RunTag | null; embedding?: number[] | null }): Promise<string>;
   /** sessionId: the agent's session (check_before_done's session_id), so the session's evidence can list the check. */
   recordPreDoneCheck(c: { projectKey: string; task: string; checkedLessonIds: string[]; gapLessonIds: string[]; status?: string; run?: RunTag | null; sessionId?: string | null }): Promise<void>;
   upsertLesson(input: LessonInput): Promise<void>;
@@ -848,6 +850,8 @@ export interface SessionsStore {
   save(sessionId: string, w: SummaryWrite): Promise<boolean>;
   /** A failed update: the summary and cursor stay, and the session waits (summaryRetryAt) before it is tried again. */
   recordFailure(sessionId: string, error: string, now?: Date): Promise<{ attempts: number; retryAt: string }>;
+  /** Sessions whose last update failed with an error starting `errorPrefix` are due at once, their backoff reset. Returns their ids. */
+  retryFailedSummaries(errorPrefix: string): Promise<string[]>;
   setState(sessionId: string, state: SessionState): Promise<void>;
   /** The next update rebuilds the summary from the first turn. The current one is served until then. False: no such session. */
   requestRebuild(sessionId: string): Promise<boolean>;
@@ -1007,6 +1011,15 @@ export interface DecisionsStore {
   unlinkMisses(link: Pick<MissLink, 'from' | 'to'>): Promise<boolean>;
   /** Links with this miss at either end, oldest first. */
   missLinks(missId: string): Promise<MissLink[]>;
+  /**
+   * Record that two records (lessons, claims) are not the same: the learning loop never proposes merging them again,
+   * whatever evidence grows (0.9.1). Idempotent: the first record stands. True when it is new.
+   */
+  markDistinct(p: Omit<DistinctPair, 'at'>): Promise<boolean>;
+  /** Lift a distinct record (the owner only, at the API). True when there was one. */
+  liftDistinct(a: string, b: string): Promise<boolean>;
+  /** The distinct records naming any of these ids, either way round, oldest first. */
+  distinctPairs(ids: string[]): Promise<DistinctPair[]>;
   /** These misses (those that exist, by id) as the loop compares them: link_misses reads embeddings and edited files. */
   loopMisses(ids: string[]): Promise<LoopMiss[]>;
   /**
@@ -1041,12 +1054,25 @@ export interface IntakeStore {
   saveWindow(docId: string, w: WindowSave): Promise<boolean>;
   /**
    * A source's text is going away (delete, keeping accepted facts): its undecided claims (proposed, rejected), all of
-   * its questions and its details go. Accepted and superseded claims stay. keep: claims that stay whatever their status (the ones a remove_source decision rejected, which its rollback restores). Returns how many claims and questions went.
+   * its questions and its details go. Accepted and superseded claims stay. everything (keep=none): every claim goes
+   * whatever its status (deleteClaims), and so do the proposed people only this source named (attended, or said one
+   * of its claims), with no "former participant" left; people: its participants read before its Doc was deleted (the
+   * attendance goes with the Doc). Returns how many claims, questions and people went.
    */
-  removeSource(docId: string, o?: { keep?: string[] }): Promise<{ claim: number; question: number }>;
+  removeSource(docId: string, o?: { everything?: boolean; people?: string[] }): Promise<{ claim: number; question: number; people: number }>;
+  /**
+   * Delete these claims whatever their status, with the conflicts they are a side of, their links and supersessions;
+   * the claim_decided Activity entries about them keep only REMOVED_CLAIM as their subject. Returns how many went.
+   */
+  deleteClaims(ids: string[]): Promise<number>;
 
   /** Newest first, then by id. Default limit 100. */
   listClaims(f?: ClaimFilter): Promise<Claim[]>;
+  /**
+   * Claims from an export bundle, each under its own id with its status, redacted as every claim is. A claim already
+   * stored is left as it is (an import never overwrites), so importing twice adds nothing. Returns the ids added.
+   */
+  importClaims(claims: ImportedClaim[]): Promise<string[]>;
   claim(id: string): Promise<Claim | null>;
   /**
    * The owner's review: only the patch's keys change; a status change records `by` and the time. With `expect`, only
@@ -1057,6 +1083,8 @@ export interface IntakeStore {
   searchClaims(q: ClaimSearch): Promise<ClaimHit[]>;
   /** Record REFINES / CORROBORATES links from claims; existing ones and those whose ends are missing are skipped. Returns how many are new. */
   addLinks(links: ClaimLink[]): Promise<number>;
+  /** Remove these links (a link_claims decision rolled back); those not there are skipped. Returns how many went. */
+  removeLinks(links: ClaimLink[]): Promise<number>;
   /** Links with any of these records at either end. */
   links(ids: string[]): Promise<ClaimLink[]>;
 

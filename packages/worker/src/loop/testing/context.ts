@@ -26,6 +26,7 @@ export function fakeContext(o: {
     decisions: {
       loopMisses: async (ids: string[]) => misses.filter((m) => ids.includes(m.id)).toSorted((a, b) => a.id.localeCompare(b.id)),
       missLinks: async (id: string) => (o.links ?? []).filter((l) => l.from === id || l.to === id),
+      distinctPairs: async () => [],
       list: async (f: DecisionFilter = {}) => (o.decisions ?? []).filter((d) => (!f.type || d.type === f.type) && (!f.status || f.status.includes(d.status))),
       ...o.store?.decisions,
     },

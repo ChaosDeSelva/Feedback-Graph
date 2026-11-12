@@ -4,6 +4,7 @@ import {
   type IntegrationKind, type Integrations, type IntegrationSyncState, type LinearComment, type LinearTeamIssue, type PrContext, type Project, type WorkSession,
   linearCommentsOf, linearDocRef, linearIssueDocChunks,
 } from '@fb/core';
+import { refreshPrDocState } from './githubSync.ts';
 import { skipMatchingPending } from './pendingSkips.ts';
 
 /**
@@ -36,7 +37,7 @@ export type FeedbackSyncDeps = {
    * With embed: each issue is also stored as a document (source linear, ref linear:<identifier>), project context like
    * a PR's discussion, found by docs search and linked to the PRs that name it (DocsStore.linkedDocs). Unset: comments only.
    */
-  docs?: Pick<DocsStore, 'upsertDoc'>;
+  docs?: Pick<DocsStore, 'upsertDoc'> & Partial<Pick<DocsStore, 'listDocs' | 'docText'>>;
   embed?: (texts: string[]) => Promise<number[][]>;
   activity?: Pick<ActivityStore, 'record'>;
   minIntervalMs: number;
@@ -346,6 +347,7 @@ async function syncRepo(p: SyncProject, repo: string, token: string, since: stri
     const latest = (fresh.length ? fresh : pr.comments).map((c) => c.createdAt).sort().at(-1) ?? pr.updatedAt;
     const linked = await linkWorkSessions(d.graph, p.key, pr.headBranch, latest);
     const n = await d.graph.upsertExternalThread(p, prThread(pr, pr.state === 'open' ? floorMs : 0, linked, d));
+    if (d.docs?.listDocs && d.docs.docText && d.embed) await refreshPrDocState(p.key, pr, { docs: { upsertDoc: d.docs.upsertDoc.bind(d.docs), listDocs: d.docs.listDocs.bind(d.docs), docText: d.docs.docText.bind(d.docs) }, embed: d.embed });
     added += n;
     if (n) threads++;
   }

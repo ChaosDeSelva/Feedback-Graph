@@ -1,7 +1,7 @@
 import { cleanup, fireEvent, render, screen } from '@testing-library/react';
 import { useState } from 'react';
 import { afterEach, expect, test, vi } from 'vitest';
-import { Button, FilterBar, useFocusHandoff, usePending } from './controls.tsx';
+import { Button, FilterBar, Tabs, useFocusHandoff, usePending } from './controls.tsx';
 
 afterEach(cleanup);
 
@@ -114,4 +114,11 @@ test('FilterBar lays its controls in an even grid of columns at least min wide, 
   expect(bar.className).toMatch(/\bgrid\b/);
   expect(bar.className).toMatch(/\[&>\*\]:w-full/);
   expect(bar.className).not.toMatch(/flex-wrap/);
+});
+
+test('a segmented tab shows its option as written, so its accessible name is the text on it', () => {
+  render(<Tabs label="status" value="needs review" options={['needs review', 'done'] as const} onChange={() => {}} />);
+  const tab = screen.getByRole('button', { name: 'needs review', pressed: true });
+  expect(tab.textContent).toBe('needs review');
+  expect(tab.className).not.toMatch(/\b(capitalize|uppercase)\b/);
 });

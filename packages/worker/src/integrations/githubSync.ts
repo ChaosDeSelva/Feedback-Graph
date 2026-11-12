@@ -25,6 +25,33 @@ const TICKETS_BACKFILL_DAYS = 14;
 
 const day = (iso: string) => iso.slice(0, 10);
 
+/** One PR as its document: its description (with its state) and each comment a chunk, and the Linear tickets it names. */
+export async function storePrDoc(projectKey: string, pr: PrContext, d: { docs: Pick<DocsStore, 'upsertDoc'>; embed(texts: string[]): Promise<number[][]> }): Promise<void> {
+  const chunks = prContextToChunks(pr).map((c) => redactSecrets(c.text));
+  const vectors = await d.embed(chunks); // a PR is at least its description
+  await d.docs.upsertDoc(
+    { projectKey, source: 'github', ref: `github:${pr.repo}#${pr.number}`, title: `${pr.repo}#${pr.number}: ${pr.title}`, url: pr.url },
+    chunks.map((text, i) => ({ text, embedding: vectors[i] })),
+    // The Linear tickets it names (ENG-123 in its title, body or branch): linked to their documents (linkedDocs).
+    { tickets: ticketIdsIn(pr.title, pr.body, pr.headBranch) },
+  );
+}
+
+/**
+ * The PR's document stored again when it says another state than the PR has now (merged since): the comment sync reads
+ * a PR every INTEGRATION_SYNC_MINUTES, the document sync only every GITHUB_SYNC_HOURS, so search_graph called a PR
+ * merged hours ago "(open)". A PR with no document is left alone (the document sync decides what is stored).
+ */
+export async function refreshPrDocState(projectKey: string, pr: PrContext, d: { docs: Pick<DocsStore, 'upsertDoc' | 'listDocs' | 'docText'>; embed(texts: string[]): Promise<number[][]> }): Promise<boolean> {
+  const ref = `github:${pr.repo}#${pr.number}`;
+  const doc = (await d.docs.listDocs(projectKey, { source: 'github', ref, limit: 1 })).find((x) => x.ref === ref);
+  if (!doc) return false;
+  const text = await d.docs.docText(doc.id);
+  if (text === null || text.startsWith(`PR ${pr.repo}#${pr.number} (${pr.state})`)) return false;
+  await storePrDoc(projectKey, pr, d);
+  return true;
+}
+
 /** Pull PR descriptions, reviews and comments into the docs store, one doc per PR, with the Linear tickets it names. */
 export async function syncGithub(d: GithubSyncDeps): Promise<{ prs: number }> {
   const now = d.now ?? (() => new Date().toISOString());
@@ -42,14 +69,7 @@ export async function syncGithub(d: GithubSyncDeps): Promise<{ prs: number }> {
       const store = async (list: PrContext[], repairing = false) => {
         for (const pr of list) {
           if (!repairing && d.authors?.get(projectKey) && pr.author.toLowerCase() !== d.authors.get(projectKey)!.toLowerCase()) continue;
-          const chunks = prContextToChunks(pr).map((c) => redactSecrets(c.text));
-          const vectors = await d.embed(chunks); // a PR is at least its description
-          await d.docs.upsertDoc(
-            { projectKey, source: 'github', ref: `github:${repo}#${pr.number}`, title: `${repo}#${pr.number}: ${pr.title}`, url: pr.url },
-            chunks.map((text, i) => ({ text, embedding: vectors[i] })),
-            // The Linear tickets it names (ENG-123 in its title, body or branch): linked to their documents (linkedDocs).
-            { tickets: ticketIdsIn(pr.title, pr.body, pr.headBranch) },
-          );
+          await storePrDoc(projectKey, pr, d);
         }
       };
       const repair = await repairGithubDocs({ projectKey, repo, token: d.token, docs: d.docs, fetchPrs: d.fetchPrs, store: pr => store([pr], true), now: started });

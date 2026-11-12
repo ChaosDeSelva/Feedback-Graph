@@ -83,7 +83,7 @@ export type LoopTypeContext = {
   log: (msg: string, extra?: object) => void;
 };
 
-export type LoopReads = Pick<Store, 'knowledge' | 'facts' | 'graph' | 'codegraph' | 'insights' | 'decisions' | 'activity'>;
+export type LoopReads = Pick<Store, 'knowledge' | 'facts' | 'graph' | 'codegraph' | 'insights' | 'decisions' | 'activity' | 'intake' | 'links' | 'docs'>;
 
 /** One call a type would make. */
 export type LoopCandidate = {
@@ -133,6 +133,8 @@ export const SKIP = {
   paused: 'paused',
   /** A target lesson is in the control group (LOOP_HOLDOUT): the loop never changes it. */
   holdout: 'holdout',
+  /** You said the two records are not the same (a merge rolled back, or marked distinct): never merged again. */
+  distinct: 'distinct',
   /** An observed call measured again (recheck) that is now below a floor: it is expired. */
   noLongerHolds: 'no_longer_holds',
 } as const;
@@ -161,3 +163,7 @@ export const holdsStill = (r: LoopCandidate | string | null): LoopCandidate | st
 
 /** Count one skip. */
 export const skip = (skipped: Record<string, number>, reason: string) => { skipped[reason] = (skipped[reason] ?? 0) + 1; };
+
+/** Whether you said these two records are not the same (DecisionsStore.distinctPairs): a merge of them is never made. */
+export const markedDistinct = async (store: Pick<LoopReads, 'decisions'>, x: string, y: string) =>
+  (await store.decisions.distinctPairs([x])).some((p) => (p.a === x && p.b === y) || (p.a === y && p.b === x));

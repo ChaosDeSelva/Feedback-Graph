@@ -30,7 +30,7 @@ import { DEMO_SOURCE, demoPrefix, type CommentLesson, type DemoMiss, type DemoRe
 import { draftOf, editedDraft, ownerDecided } from '../lessonOutcome.ts';
 import { lessonFingerprint, TargetChangedError, type LessonSnapshotWrite, type SupersedeLink } from '../decisions/record.ts';
 import { retryDeadlock, type GraphRepo } from './repo.ts';
-import { matchReport, REPORT_MERGE_MINUTES } from '../dedupe.ts';
+import { matchReport, reportWindowMs } from '../dedupe.ts';
 import { nearest, visibleToRun } from './nearest.ts';
 import { VISIBLE_TO_RUN } from './runs.ts';
 
@@ -509,7 +509,7 @@ export class KnowledgeRepo implements KnowledgeStore {
 
   async writeLessonSnapshots(writes: LessonSnapshotWrite[], o: { supersede?: SupersedeLink[]; unsupersede?: SupersedeLink[] } = {}): Promise<void> {
     if (!writes.length) return;
-    const safe = writes.map((w) => ({ id: w.id, expect: w.expect, f: redactDeep(w.fields), embedding: w.embedding ?? null }));
+    const safe = writes.map((w) => ({ id: w.id, expect: w.expect, f: redactDeep(w.fields), embedding: w.embedding ?? null, setTriggers: w.fields.triggers !== undefined, triggers: w.fields.triggers ? JSON.stringify(w.fields.triggers) : null }));
     for (const [i, w] of writes.entries()) await archiveRedactionInput('lesson-snapshot', w.id, w.fields, safe[i].f);
     // Two writes to one lesson at once (a double-clicked rollback) can be aborted as a deadlock by Neo4j: the aborted
     // one wrote nothing and runs again, comparing afresh.
@@ -526,6 +526,7 @@ export class KnowledgeRepo implements KnowledgeStore {
            l.paths = w.f.paths, l.status = w.f.status, l.decidedAt = w.f.decidedAt, l.decidedBy = w.f.decidedBy,
            l.decisionNote = w.f.decisionNote, l.servingWeight = w.f.servingWeight, l.validTo = validTo, l.checksVersion = CASE WHEN words THEN 0 ELSE l.checksVersion END
          FOREACH (_ IN CASE WHEN w.embedding IS NULL THEN [] ELSE [1] END | SET l.embedding = w.embedding)
+         FOREACH (_ IN CASE WHEN w.setTriggers THEN [1] ELSE [] END | SET l.triggers = w.triggers)
          FOREACH (_ IN CASE WHEN w.f.projectKey IS NULL THEN [] ELSE [1] END | MERGE (p:Project {key: w.f.projectKey}) MERGE (l)-[:APPLIES_TO]->(p))`,
         { writes: safe },
       );
@@ -765,7 +766,8 @@ export class KnowledgeRepo implements KnowledgeStore {
   }
 
   /** The manual /postmortem path: queued for your decision, or added to the detector's item for the same miss. */
-  async createManualFeedback(input: { project: Project; cwd: string; text: string; whatWasDone: string; sessionId?: string | null; run?: RunTag | null }): Promise<string> {
+  async createManualFeedback(input: { project: Project; cwd: string; text: string; whatWasDone: string; sessionId?: string | null; run?: RunTag | null; embedding?: number[] | null }): Promise<string> {
+    const embedding = input.embedding?.length ? input.embedding : null;
     const o = { ...input, text: redactDeep(input.text), whatWasDone: redactDeep(input.whatWasDone) };
     const now = new Date().toISOString();
     const report = JSON.stringify({ text: o.text, whatWasDone: o.whatWasDone, reportedAt: now, sessionId: o.sessionId ?? null });
@@ -774,16 +776,16 @@ export class KnowledgeRepo implements KnowledgeStore {
        WHERE NOT coalesce(k.manual, false) AND k.agentReport IS NULL AND k.status <> 'rejected' AND t.ts IS NOT NULL
          AND t.external IS NULL
          AND datetime(t.ts) >= datetime($from) AND datetime(t.ts) <= datetime($to)
-       RETURN k.id AS id, k.sessionId AS sessionId, t.ts AS ts, t.text AS text`,
+       RETURN k.id AS id, k.sessionId AS sessionId, t.ts AS ts, t.text AS text, k.dedupeEmbedding AS embedding`,
       {
         key: o.project.key,
-        from: new Date(Date.parse(now) - REPORT_MERGE_MINUTES * 60_000).toISOString(),
-        to: new Date(Date.parse(now) + REPORT_MERGE_MINUTES * 60_000).toISOString(),
+        from: new Date(Date.parse(now) - reportWindowMs({ embedding })).toISOString(),
+        to: new Date(Date.parse(now) + reportWindowMs({ embedding })).toISOString(),
       },
     );
     const hit = matchReport(
-      { ts: now, text: o.text, sessionId: o.sessionId },
-      flagged.map((r) => ({ id: r.get('id') as string, sessionId: r.get('sessionId') as string, ts: r.get('ts') as string, text: (r.get('text') as string) ?? '' })),
+      { ts: now, text: o.text, sessionId: o.sessionId, embedding },
+      flagged.map((r) => ({ id: r.get('id') as string, sessionId: r.get('sessionId') as string, ts: r.get('ts') as string, text: (r.get('text') as string) ?? '', embedding: (r.get('embedding') as number[] | null) ?? null })),
     );
     if (hit) {
       await this.g.run('MATCH (k:Candidate {id: $id}) SET k.agentReport = $report', { id: hit.id, report });
@@ -798,8 +800,8 @@ export class KnowledgeRepo implements KnowledgeStore {
               precedingAssistantText: $done, toolCalls: '[]', label: 'pushback', confidence: 1.0, summary: $text, signals: ['manual']})
        CREATE (k:Candidate {id: $id, turnUuid: $id, sessionId: $id, projectKey: p.key, ts: $now,
               status: 'pending', createdAt: $now, decidedAt: null, note: null, manual: true, agentReport: $report,
-              run: $run, sandbox: $sandbox})-[:FLAGS]->(t)`,
-      { id, now, project: o.project, cwd: o.cwd, text: o.text, done: o.whatWasDone, report, run: o.run?.id ?? null, sandbox: !!o.run?.sandbox },
+              run: $run, sandbox: $sandbox, dedupeEmbedding: $embedding})-[:FLAGS]->(t)`,
+      { id, now, project: o.project, cwd: o.cwd, text: o.text, done: o.whatWasDone, report, run: o.run?.id ?? null, sandbox: !!o.run?.sandbox, embedding },
     );
     return id;
   }

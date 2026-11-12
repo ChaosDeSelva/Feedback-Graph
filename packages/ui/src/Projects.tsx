@@ -46,6 +46,15 @@ export const scanErrorText = (error: string) => error
   .replace(/operations\.md\.\s*;/g, 'operations.md;')
   .replace(/;\s*checking readiness with backoff before copying the repository\.?$/i, '. Readiness will be checked again with backoff before the repository is copied.');
 
+const LESSON_ORDER = ['approved', 'proposed', 'rejected', 'revoked', 'superseded'] as const;
+/** The lessons tile's hint: its count by status (they add up to it), and the global lessons the Lessons page also lists. */
+export function lessonsHint(p: Pick<ProjectSummary, 'lessonsByStatus' | 'globalLessons'>): string {
+  const by = p.lessonsByStatus ?? {};
+  const parts = LESSON_ORDER.filter((s) => by[s]).map((s) => `${by[s]} ${s}`);
+  const own = parts.length ? `learned here: ${parts.join(', ')}` : 'drawn from confirmed misses';
+  return p.globalLessons ? `${own}; ${plural(p.globalLessons, 'global lesson')} not counted (the Lessons page lists them under every project)` : own;
+}
+
 const parkedProvider = (scan: ProjectSummary['lastScan']) => scan?.provider?.trim()
   || scan?.error?.match(/^scan parked on ([^:]+):/i)?.[1]?.trim()
   || null;
@@ -293,7 +302,7 @@ export function Projects({ pollMs = 5000 }: { pollMs?: number } = {}) {
               <StatGrid className="grid-cols-2 sm:grid-cols-4">
                 <StatTile label="sessions" value={current.sessions} hint="all stored session records, including synced comment threads and manual reports; Sessions lists agent work sessions" />
                 <StatTile label="feedback" value={current.feedback} hint="pushback flagged" />
-                <StatTile label="lessons" value={current.lessons} hint="drawn from confirmed misses" />
+                <StatTile label="lessons" value={current.lessons} hint={lessonsHint(current)} />
                 {current.factsByOrigin
                   ? <StatTile label="facts" value={current.facts} hint={`${current.factsByOrigin.model} from code models; ${current.factsByOrigin.manifest} from manifests, ${current.factsByOrigin.document} from documents${current.factsByOrigin.you ? `, ${current.factsByOrigin.you} you wrote` : ''}${current.factsByOrigin.loop ? `, ${current.factsByOrigin.loop} the learning loop recorded` : ''}`} />
                   : <StatTile label="facts" value={current.facts} hint="extracted from the code" />}

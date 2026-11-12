@@ -129,3 +129,13 @@ test('suppression: 30 days unless the evidence grows by half', async () => {
   expect(isSuppressed(null, 1, now)).toBe(false);
   expect(parseSuppression('[]')).toBeNull();
 });
+
+test('needsYouReason: the loop\'s own reason first, else the tier, the reviews it lacks, or its bar', async () => {
+  const { needsYouReason } = await import('./state.ts');
+  const d = (o: object) => ({ type: 'approve_lesson' as const, tier: 'A' as const, rationale: 'Approve it.', confidence: { p: 0.9, lower: 0.95, n: 40, band: 4 }, ...o });
+  expect(needsYouReason(d({ rationale: 'Approve it. Proposed rather than applied: you changed lesson:1 in the last 14 days.' }))).toBe('you changed lesson:1 in the last 14 days');
+  expect(needsYouReason(d({ type: 'assign_question', tier: 'P' }))).toBe('always your call: the loop only proposes this kind of change');
+  expect(needsYouReason(d({ confidence: { p: 0.9, lower: 0.95, n: 3, band: 4 } }))).toBe('not earned yet: 3 of the 20 reviews of yours it needs in this confidence band');
+  expect(needsYouReason(d({ confidence: { p: 0.8, lower: 0.7, n: 40, band: 3 } }))).toBe('not sure enough to apply: confidence 0.70 under its bar 0.9');
+  expect(needsYouReason(d({}))).toBe('the loop is set to propose this type, not apply it');
+});

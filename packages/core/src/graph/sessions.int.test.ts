@@ -232,6 +232,17 @@ describeStores('SessionsStore', (h) => {
     expect((await s.detail('q'))!).toMatchObject({ summaryError: null, summaryRetryAt: null });
   });
 
+  test('retryFailedSummaries: a session whose update failed with that error is due at once; others keep backing off', async () => {
+    await repo.upsertSession(demo, session('shape', 3, 15 * MIN), []);
+    await repo.upsertSession(demo, session('down', 3, 15 * MIN), []);
+    await s.recordFailure('shape', 'the model did not return a valid summary: Expected object, received array');
+    await s.recordFailure('down', 'the provider refused the request');
+    expect(await ids()).toEqual([]);
+    expect(await s.retryFailedSummaries('the model did not return a valid summary')).toEqual(['shape']);
+    expect(await ids()).toEqual(['shape']);
+    expect(await s.retryFailedSummaries('the model did not return a valid summary')).toEqual([]);
+  });
+
   test('a rebuild is due at once, refuses an update planned before it, and is cleared by the rebuild', async () => {
     await repo.upsertSession(demo, session('r', 3, 1 * MIN), []);
     await s.save('r', write({ to: { index: 2, ts: 'x' } }));

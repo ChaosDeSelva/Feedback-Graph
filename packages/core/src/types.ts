@@ -577,7 +577,12 @@ export type ProjectSummary = {
   aliases: string[];
   sessions: number;
   feedback: number;
+  /** Lessons learned for this project (projectKey), every status, sandbox runs' left out. */
   lessons: number;
+  /** `lessons` by status: they add up to it. */
+  lessonsByStatus?: Partial<Record<LessonStatus, number>>;
+  /** Global lessons (no project), counted apart: the Lessons page lists them under every project. */
+  globalLessons?: number;
   facts: number;
   /** The current facts split by where they came from (factOrigin): the model's are the ones to headline. */
   factsByOrigin?: Record<FactOrigin, number>;
@@ -656,6 +661,8 @@ export const ACTIVITY_KINDS = [
   'conflict_found',
   'conflict_resolved',
   'person_changed',
+  // Settings' Cloud sync card changed what is synced (claim facts, who said them).
+  'cloud_settings_changed',
 ] as const;
 export type ActivityKind = (typeof ACTIVITY_KINDS)[number];
 
@@ -700,6 +707,16 @@ export const DECISION_TYPES = [
   'record_fact',
   'triage_inbox',
   'tune_threshold',
+  // Knowledge intake's housekeeping and proposals (0.9.1): claims joined and linked, accepted (tier A, never an opinion
+  // or an agent's), a conflict's resolution suggested, a question assigned or closed. Settling a conflict stays the owner's.
+  'merge_claims',
+  'link_claims',
+  'accept_claim',
+  'propose_resolution',
+  'assign_question',
+  'close_question',
+  // A lesson's paths and trigger paths moved to the name git renamed the file to (0.9.1): housekeeping.
+  'update_paths',
   // The owner settling a conflict (0.9.0 §6): never the loop's (author owner), recorded so it rolls back like any other.
   'resolve_conflict',
   // The owner removing a source with everything drawn from it: its accepted claims rejected, their facts closed.
@@ -727,7 +744,7 @@ export const DECISION_TIERS = ['H', 'A', 'P'] as const;
 export type DecisionTier = (typeof DECISION_TIERS)[number];
 export const DECISION_MODES = ['observe', 'propose', 'auto'] as const;
 export type DecisionMode = (typeof DECISION_MODES)[number];
-export const DECISION_TARGET_KINDS = ['lesson', 'fact', 'miss', 'candidate', 'project', 'claim', 'conflict'] as const;
+export const DECISION_TARGET_KINDS = ['lesson', 'fact', 'miss', 'candidate', 'project', 'claim', 'conflict', 'question'] as const;
 export type DecisionTargetKind = (typeof DECISION_TARGET_KINDS)[number];
 /**
  * primary: the record decided on. keeper / merged: a merge's survivor and the duplicate, or a conflict's winner and
@@ -744,7 +761,7 @@ export type DecisionTarget = { kind: DecisionTargetKind; id: string; role: Decis
 export type TargetSnapshot = { kind: DecisionTargetKind; id: string; fields: Record<string, unknown>; fingerprint: string };
 
 /** What a decision rests on, by pointer: an Activity entry, a miss, a lesson, a lesson check... with its weight. */
-export const EVIDENCE_KINDS = ['activity', 'miss', 'lesson', 'fact', 'candidate', 'check', 'session', 'claim', 'conflict'] as const;
+export const EVIDENCE_KINDS = ['activity', 'miss', 'lesson', 'fact', 'candidate', 'check', 'session', 'claim', 'conflict', 'question'] as const;
 export type EvidenceKind = (typeof EVIDENCE_KINDS)[number];
 export type EvidenceRef = { kind: EvidenceKind; id: string; role: string; weight: number; observedAt: string };
 
@@ -799,6 +816,13 @@ export type Decision = Omit<DecisionInput, 'status' | 'dependsOn'> & {
 
 export const DECISION_NOTE_REASONS = ['wrong_evidence', 'too_broad', 'wording', 'not_now', 'other'] as const;
 export type DecisionNoteReason = (typeof DECISION_NOTE_REASONS)[number];
+/**
+ * Two records the owner said are not the same (a merge rolled back, or marked distinct): a, b in id order. by: who;
+ * reason: why, in words; decisionId: the merge rolled back, if one was.
+ */
+export type DistinctPair = { a: string; b: string; by: string; at: string; reason: string; decisionId: string | null };
+/** A pair as stored: its two ids in order, so either way round is one record. */
+export const distinctKey = (x: string, y: string): [string, string] => (x < y ? [x, y] : [y, x]);
 export type DecisionNote = {
   id: string; decisionId: string; ts: string; by: string; text: string;
   verdict: 'agree' | 'disagree' | null; reason: DecisionNoteReason | null;

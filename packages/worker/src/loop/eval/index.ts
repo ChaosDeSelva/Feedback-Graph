@@ -14,7 +14,7 @@ export * from './timeTravel.ts';
  * did after T0 (score.ts). The restored store is only read.
  */
 
-export type ReplayStore = Pick<Store, 'knowledge' | 'facts' | 'graph' | 'codegraph' | 'insights' | 'decisions' | 'activity'>;
+export type ReplayStore = Pick<Store, 'knowledge' | 'facts' | 'graph' | 'codegraph' | 'insights' | 'decisions' | 'activity' | 'intake' | 'links' | 'docs'>;
 export type ReplayDeps = {
   store: ReplayStore;
   /** The types to replay; default every registered type. */

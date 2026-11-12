@@ -157,7 +157,10 @@ export function FilterBar({ label, children, min = '9rem', className = '' }: { l
   );
 }
 
-/** A segmented switch between a few views of one list (statuses). Each option is a pressed/unpressed button. */
+/**
+ * A segmented switch between a few views of one list (statuses). Each option is a pressed/unpressed button showing the
+ * option as written, never re-cased by CSS, so its accessible name is the text it shows.
+ */
 export function Tabs<T extends string>({ value, options, onChange, label }: { value: T; options: readonly T[]; onChange: (v: T) => void; label: string }) {
   return (
     // Options that wrap fill each row (flex-1), so a second row is as tidy as the first instead of one short tab.
@@ -168,7 +171,7 @@ export function Tabs<T extends string>({ value, options, onChange, label }: { va
           type="button"
           aria-pressed={o === value}
           onClick={() => onChange(o)}
-          className={`h-6 flex-1 rounded-sm px-2.5 text-xs font-medium whitespace-nowrap capitalize transition-colors ${
+          className={`h-6 flex-1 rounded-sm px-2.5 text-xs font-medium whitespace-nowrap transition-colors ${
             o === value ? 'bg-surface text-text shadow-[0_0_0_1px_var(--color-line),var(--shadow-card)]' : 'text-muted hover:text-text'
           }`}
         >

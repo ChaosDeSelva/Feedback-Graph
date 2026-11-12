@@ -89,6 +89,45 @@ test('reject sends only the status', async () => {
   await waitFor(() => expect(patches).toEqual([{ url: '/api/lessons/l1', body: { status: 'rejected' } }]));
 });
 
+test('Approve and Reject on one lesson carry an optional note; edit then Approve sends the edits and the note together', async () => {
+  render(<Lessons />);
+  const rule = (await screen.findByLabelText('rule')) as HTMLTextAreaElement;
+  await waitFor(() => expect(rule.value).toBe('Server search rule'));
+  fireEvent.change(rule, { target: { value: 'Always filter on the server' } });
+  fireEvent.change(screen.getByLabelText('Note'), { target: { value: 'reworded to the general rule' } });
+  fireEvent.click(screen.getByRole('button', { name: 'Approve' }));
+  await waitFor(() => expect(patches).toEqual([{ url: '/api/lessons/l1', body: { status: 'approved', note: 'reworded to the general rule', rule: 'Always filter on the server' } }]));
+  // The next lesson starts with an empty note.
+  expect(await screen.findByText('Auth checks', { selector: 'h2' })).toBeTruthy();
+  expect((screen.getByLabelText('Note') as HTMLInputElement).value).toBe('');
+  fireEvent.change(screen.getByLabelText('Note'), { target: { value: 'a platitude' } });
+  fireEvent.click(screen.getByRole('button', { name: 'Reject' }));
+  await waitFor(() => expect(patches.at(-1)).toEqual({ url: '/api/lessons/l2', body: { status: 'rejected', note: 'a platitude' } }));
+});
+
+test('the editor\'s Paths field sends the paths with the decision, and a path the code map refuses says why', async () => {
+  const flagged = { ...lesson('l1', 'Server search'), checks: [{ name: 'needs-path', why: 'no file the evidence supports' }] };
+  let refuse = true;
+  vi.stubGlobal('fetch', vi.fn(async (url: string, init?: RequestInit) => {
+    if (init?.method === 'PATCH') {
+      patches.push({ url, body: JSON.parse(init.body as string) });
+      return refuse ? Response.json({ error: 'not in the code map of demo: api/nope.ts' }, { status: 400 }) : new Response(null, { status: 204 });
+    }
+    if (url.startsWith('/api/lessons?')) return Response.json([flagged]);
+    if (url === '/api/lessons/l1') return Response.json({ ...detail('l1', 'Server search'), lesson: flagged });
+    return Response.json([]);
+  }));
+  render(<Lessons />);
+  const paths = (await screen.findByLabelText(/^Paths/)) as HTMLTextAreaElement;
+  fireEvent.change(paths, { target: { value: 'api/nope.ts' } });
+  fireEvent.click(screen.getByRole('button', { name: 'Approve' }));
+  expect(await screen.findByText(/not in the code map of demo: api\/nope\.ts/)).toBeTruthy();
+  refuse = false;
+  fireEvent.change(paths, { target: { value: ' api/search.ts \n\n api/ ' } });
+  fireEvent.click(screen.getByRole('button', { name: 'Approve' }));
+  await waitFor(() => expect(patches.at(-1)).toEqual({ url: '/api/lessons/l1', body: { status: 'approved', paths: ['api/search.ts', 'api/'] } }));
+});
+
 test('lesson history shows how the lesson was produced', async () => {
   render(<Lessons />);
   expect(await screen.findByText('the CLAUDE.md rule was never read')).toBeTruthy();
@@ -249,7 +288,7 @@ test("what the lesson check found shows as chips in the list and, with the reaso
   const found = screen.getByRole('region', { name: 'what the lesson check found' });
   expect(within(found).getByText(/redone from the comment alone/)).toBeTruthy();
   expect(within(found).getByText(/not about the work/)).toBeTruthy();
-  expect(screen.getByText('api/search.ts')).toBeTruthy();
+  expect((screen.getByLabelText(/^Paths/) as HTMLTextAreaElement).value).toBe('api/search.ts');
 });
 
 test('a proposed lesson can be converted to a project fact: the dialog picks the kind and relevance, and the lesson leaves the list', async () => {

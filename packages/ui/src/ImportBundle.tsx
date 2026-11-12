@@ -17,6 +17,8 @@ function summary(r: ImportResult): string {
   const parts = [`Imported ${plural(r.lessons.added, 'lesson')} (${r.lessons.approved} approved, ${r.lessons.proposed} proposed${r.lessons.revoked ? `, ${r.lessons.revoked} revoked` : ''}), ${plural(r.facts.added, 'fact')}.`];
   if (r.lessons.existing) parts.push(`${plural(r.lessons.existing, 'lesson')} already here, left alone.`);
   if (r.facts.skippedProjects.length) parts.push(`Facts kept for ${r.facts.skippedProjects.join(', ')} (already scanned).`);
+  if (r.claims?.added || r.conflicts?.added) parts.push(`${plural(r.claims?.added ?? 0, 'claim')} (${r.claims?.facts ?? 0} given to agents as facts) and ${plural(r.conflicts?.added ?? 0, 'settled conflict')} from knowledge intake.`);
+  if (r.claims?.existing) parts.push(`${plural(r.claims.existing, 'claim')} already here, left alone.`);
   return parts.join(' ');
 }
 

@@ -73,9 +73,13 @@ export type CloudInfo = {
   projects: string[];
   preview: { total: SyncCounts; projects: { key: string; counts: SyncCounts | null; reason?: string }[] } | null;
   previewError: string | null;
+  /** The preview was not counted (asked with preview=0). */
+  previewSkipped?: true;
   last: { at: string; ok: boolean; trigger: SyncTrigger; error: string | null; sent: SyncCounts | null; projects: string[]; failed: string[]; teamLessons?: { message: string }[] } | null;
   nextAt: string | null;
   neverSent: string;
+  /** With knowledge intake on: SYNC_CLAIMS and SYNC_PEOPLE as in effect (saved: set here, over .env). */
+  intakeSharing?: { claims: boolean; people: boolean; saved: boolean; editable: boolean };
 };
 
 /** POST /api/import: what an export bundle brought in. */
@@ -83,13 +87,17 @@ export type ImportResult = {
   lessons: { added: number; approved: number; proposed: number; revoked?: number; existing: number; excluded: number; skipped: number };
   facts: { added: number; projects: string[]; skippedProjects: string[] };
   notImported: { misses: number; docs: number; codeFiles: number };
+  /** Knowledge intake (0.9.1); an older API sends none. */
+  claims?: { added: number; facts: number; existing: number; skipped: number };
+  conflicts?: { added: number; existing: number; skipped: number };
+  people?: { added: number; matched: number };
 };
 
 /** The phrase POST /api/settings/cleanup wants before it deletes anything. */
 export const CLEANUP_CONFIRM = 'remove-unselected';
 
 /** projectKey: with scope project or task, the project a global lesson is narrowed to (PATCH /api/lessons/:id). */
-export type LessonEdit = Partial<Pick<Lesson, 'title' | 'rule' | 'appliesWhen' | 'scope'>> & { triggers?: LessonTriggers; status?: 'approved' | 'rejected' | 'revoked' | 'proposed'; projectKey?: string };
+export type LessonEdit = Partial<Pick<Lesson, 'title' | 'rule' | 'appliesWhen' | 'scope' | 'paths'>> & { triggers?: LessonTriggers; status?: 'approved' | 'rejected' | 'revoked' | 'proposed'; projectKey?: string; note?: string };
 
 /** Fired when the API wants a sign-in (a token is configured and the session is missing or expired). */
 export const SIGN_IN_EVENT = 'fg:sign-in';
@@ -272,7 +280,9 @@ export const api = {
   saveProjectRoots: (roots: string[]) => request<ProjectSettings>('/api/settings/roots', { method: 'PUT', body: { roots } }),
   cleanupUnselected: () => request<{ removed: string[]; nodesRemoved: number }>('/api/settings/cleanup', { method: 'POST', body: { confirm: CLEANUP_CONFIRM }, retry: false }),
 
-  cloud: () => request<CloudInfo>('/api/cloud'),
+  /** preview false: the settings without the counts of what a sync sends, which take seconds to count. */
+  cloud: (o: { preview?: boolean } = {}) => request<CloudInfo>(o.preview === false ? '/api/cloud?preview=0' : '/api/cloud'),
+  cloudIntakeSharing: (s: { claims: boolean; people: boolean }) => request<{ claims: boolean; people: boolean; saved: boolean }>('/api/cloud/intake-sharing', { method: 'PUT', body: s }),
   cloudLocalOnly: (projects: string[]) => request<{ projects: string[] }>('/api/cloud/local-only', { method: 'PUT', body: { projects } }),
   syncCloud: () => request<CloudSyncResult>('/api/cloud/sync', { method: 'POST', body: {}, retry: false }),
 
@@ -358,7 +368,7 @@ export type SessionPage = { sessions: SessionListItem[]; next: string | null };
 // docs/learning-loop-api.md is the contract the API implements. Lookups keyed by these enums fall back at runtime
 // (loop.ts), because a newer server may send a value this build does not know.
 
-export const DECISION_TYPES = ['link_misses', 'merge_duplicates', 'rank_weight', 'retire_lesson', 'reject_lesson', 'approve_lesson', 'reword_lesson', 'narrow_scope', 'record_fact', 'triage_inbox', 'tune_threshold', 'resolve_conflict', 'remove_source'] as const;
+export const DECISION_TYPES = ['link_misses', 'merge_duplicates', 'rank_weight', 'retire_lesson', 'reject_lesson', 'approve_lesson', 'reword_lesson', 'narrow_scope', 'record_fact', 'triage_inbox', 'tune_threshold', 'merge_claims', 'link_claims', 'accept_claim', 'propose_resolution', 'assign_question', 'close_question', 'update_paths', 'resolve_conflict', 'remove_source'] as const;
 export type DecisionType = (typeof DECISION_TYPES)[number];
 export const DECISION_STATUSES = ['observed', 'proposed', 'applying', 'applied', 'rejected', 'rolled_back', 'overridden', 'expired'] as const;
 export type DecisionStatus = (typeof DECISION_STATUSES)[number];
@@ -367,17 +377,21 @@ export type DecisionTier = 'H' | 'A' | 'P';
 export type DecisionMode = 'observe' | 'propose' | 'auto';
 export const LOOP_MODES = ['off', 'observe', 'propose', 'auto'] as const;
 export type LoopMode = (typeof LOOP_MODES)[number];
-export type DecisionTargetKind = 'lesson' | 'fact' | 'miss' | 'candidate' | 'project' | 'claim' | 'conflict';
+export type DecisionTargetKind = 'lesson' | 'fact' | 'miss' | 'candidate' | 'project' | 'claim' | 'conflict' | 'question';
 export type DecisionTarget = { kind: DecisionTargetKind; id: string; role: 'primary' | 'keeper' | 'merged' | 'created' };
 /** A target's redacted fields at one moment, and the sha256 of its canonical fields. */
 export type TargetSnapshot = { kind: DecisionTargetKind; id: string; fields: Record<string, unknown>; fingerprint: string };
-export type EvidenceKind = 'activity' | 'miss' | 'lesson' | 'fact' | 'check' | 'session' | 'candidate' | 'claim' | 'conflict';
+export type EvidenceKind = 'activity' | 'miss' | 'lesson' | 'fact' | 'check' | 'session' | 'candidate' | 'claim' | 'conflict' | 'question';
 export type EvidenceRef = { kind: EvidenceKind; id: string; role: string; weight: number; observedAt: string };
 export type DecisionConfidence = { p: number; lower: number; n: number; band: number };
 export type DecisionRollback = { at: string; by: string; reason: RollbackReason | null; note: string | null; cascade: string[] };
+/** Two records you said are not the same (core DistinctPair): the loop never proposes merging them. a < b. */
+export type DistinctPair = { a: string; b: string; by: string; at: string; reason: string; decisionId: string | null };
 export type Decision = {
   id: string;
   type: DecisionType;
+  /** A proposed decision: why the loop could not decide it on its own, in one line (0.9.1). */
+  needsYou?: string;
   projectKey: string | null;
   targets: DecisionTarget[];
   before: TargetSnapshot[];
@@ -548,6 +562,13 @@ export const loopApi = {
     request<RollbackPreview | Decision>(`/api/decisions/${enc(id)}/${action}`, { method: 'POST', body, retry: action !== 'rollback' || body.cascade === 'preview' }),
   addNote: (id: string, note: { text: string; verdict?: 'agree' | 'disagree' | null; reason?: RollbackReason }) =>
     request<DecisionNote>(`/api/decisions/${enc(id)}/notes`, { method: 'POST', body: note, retry: false }),
+  /** The never-merge records naming any of these ids, either way round (GET /api/distinct-pairs). */
+  distinctPairs: (ids: string[]) => request<DistinctPair[]>(`/api/distinct-pairs?ids=${ids.map(enc).join(',')}`),
+  /** Never merge these two: the loop does not propose merging them again (an owner action). */
+  markDistinct: (b: { a: string; b: string; reason?: string }) =>
+    request<{ created: boolean; pairs: DistinctPair[] }>('/api/distinct-pairs', { method: 'POST', body: b, retry: false }),
+  /** Lift a never-merge record: yours alone, refused to the operator token. */
+  liftDistinct: (a: string, b: string) => request<void>('/api/distinct-pairs', { method: 'DELETE', body: { a, b }, retry: false }),
   state: coalesced(() => request<LoopState>('/api/loop')),
   saveSettings: (patch: LoopSettingsPatch) => request<LoopState>('/api/loop/settings', { method: 'PUT', body: patch }),
   pause: () => request<LoopState>('/api/loop/pause', { method: 'POST', body: {} }),

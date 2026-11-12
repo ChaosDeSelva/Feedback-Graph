@@ -4,7 +4,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { WebStandardStreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js';
 import { z } from 'zod';
 import { VERSION } from '@fb/core';
-import { findContradictions, NOTES_MAX_BYTES, submitNotes } from './agentIntake.ts';
+import { findContradictions, NOTES_MAX_BYTES, submitNotes, whatDoWeKnow } from './agentIntake.ts';
 import { checkBeforeDone, getImpact, getModuleContext, getRecentSessions, getTaskContext, MAX_DEPTH, RECENT_MAX, reportFeedback, searchGraph, type ContextDeps } from './context.ts';
 
 /**
@@ -196,6 +196,18 @@ function buildServer(ctx: ContextDeps, client: string | undefined) {
       },
       safe(async (a) => text((await findContradictions({ ...a, client }, ctx)).markdown)),
     );
+    if (ctx.intake.knowledge) {
+      server.registerTool(
+        'what_do_we_know',
+        {
+          ...read('What do we know'),
+          description:
+            'What the developer has accepted about a topic: decisions, plans and facts people stated (who said it and when), the code facts and approved lessons agents are told, and the open conflicts on them, which are not settled: present a disputed point as disputed. Read-only; no model is asked.',
+          inputSchema: { ...where, topic: z.string().min(1).max(MAX.query).describe('What you want to know about, in plain words') },
+        },
+        safe(async (a) => text((await whatDoWeKnow({ ...a, client }, ctx)).markdown)),
+      );
+    }
     server.registerTool(
       'submit_notes',
       {

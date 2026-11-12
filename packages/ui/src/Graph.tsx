@@ -5,7 +5,7 @@ import { CodeGraph } from './CodeGraph.tsx';
 import { FirstRun } from './FirstRun.tsx';
 import { PageHeader } from './ui/PageHeader.tsx';
 import { Select, Tabs } from './ui/controls.tsx';
-import { Alert, CauseBadge, causeLabel, EmptyState, SectionLabel, Skeleton } from './ui/display.tsx';
+import { Alert, CauseBadge, causeLabel, EmptyState, plural, SectionLabel, Skeleton } from './ui/display.tsx';
 import { MAX_FIT_ZOOM, useSize } from './ui/graphCanvas.ts';
 import { evidenceLinkLabel, evidenceNodeLabel } from './ui/graphLabels.ts';
 import { GraphIcon } from './ui/icons.tsx';
@@ -206,6 +206,7 @@ export function Graph() {
           ) : (
             <p className="text-muted">
               Click a node to see its evidence. Red misses link the feedback you gave to its cause, the lesson drawn from it, and the context that would have prevented it.
+              {!!graph?.commitsHidden && ` ${plural(graph.commitsHidden, 'more fix commit')} not drawn: only the first three per feedback item are.`}
             </p>
           )}
         </ScrollArea>

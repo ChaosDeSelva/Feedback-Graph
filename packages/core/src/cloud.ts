@@ -798,6 +798,20 @@ export async function cloudSharedDemoProjects(docs: Pick<DocsStore, 'getCursor'>
   return [...new Set(saved)];
 }
 
+/**
+ * SYNC_CLAIMS and SYNC_PEOPLE as set on Settings' Cloud sync card (stored), over .env's (`configured`): the same record
+ * the api and the worker read before a sync. People are never named without claims. Malformed storage fails closed.
+ */
+export const CLOUD_INTAKE_SHARING_CURSOR = 'cloud-intake-sharing';
+export type IntakeSharing = { claims: boolean; people: boolean };
+export async function cloudIntakeSharing(docs: Pick<DocsStore, 'getCursor'>, configured: Partial<IntakeSharing> = {}): Promise<IntakeSharing & { saved: boolean }> {
+  const raw = await docs.getCursor(CLOUD_INTAKE_SHARING_CURSOR);
+  if (raw === null) return { claims: !!configured.claims, people: !!configured.claims && !!configured.people, saved: false };
+  const saved = JSON.parse(raw) as Partial<IntakeSharing> | null;
+  if (!saved || typeof saved.claims !== 'boolean' || typeof saved.people !== 'boolean') throw new Error('invalid claim sharing setting; set it again in Settings before syncing');
+  return { claims: saved.claims, people: saved.claims && saved.people, saved: true };
+}
+
 /** A local lesson decision never dispatches cloud work itself. */
 export const LESSON_SHARING_NOTICE = {
   mode: 'next_sync_if_enabled',

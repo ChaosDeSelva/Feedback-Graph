@@ -1,4 +1,6 @@
 import {
+  distinctKey,
+  type DistinctPair,
   prepareDecision,
   prepareNote,
   prepareRollback,
@@ -297,6 +299,30 @@ export class PgDecisionsStore implements DecisionsStore {
   async unlinkMisses(link: Pick<MissLink, 'from' | 'to'>): Promise<boolean> {
     const { rowCount } = await this.q('DELETE FROM miss_links WHERE from_miss_id = $1 AND to_miss_id = $2', [link.from, link.to]);
     return rowCount! > 0;
+  }
+
+  async markDistinct(p: Omit<DistinctPair, 'at'>): Promise<boolean> {
+    const [a, b] = distinctKey(p.a, p.b);
+    const { rowCount } = await this.q(
+      'INSERT INTO distinct_pairs (a, b, by, at, reason, decision_id) VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT DO NOTHING',
+      [a, b, p.by, new Date(), p.reason, p.decisionId],
+    );
+    return rowCount! > 0;
+  }
+
+  async liftDistinct(x: string, y: string): Promise<boolean> {
+    const [a, b] = distinctKey(x, y);
+    const { rowCount } = await this.q('DELETE FROM distinct_pairs WHERE a = $1 AND b = $2', [a, b]);
+    return rowCount! > 0;
+  }
+
+  async distinctPairs(ids: string[]): Promise<DistinctPair[]> {
+    if (!ids.length) return [];
+    const { rows } = await this.q(
+      'SELECT * FROM distinct_pairs WHERE a = ANY($1::text[]) OR b = ANY($1::text[]) ORDER BY at, a COLLATE "C", b COLLATE "C"',
+      [[...new Set(ids)]],
+    );
+    return rows.map((r: Row) => ({ a: r.a, b: r.b, by: r.by, at: iso(r.at)!, reason: r.reason, decisionId: r.decision_id ?? null }));
   }
 
   async missLinks(missId: string): Promise<MissLink[]> {

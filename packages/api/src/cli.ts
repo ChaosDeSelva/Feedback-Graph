@@ -7,6 +7,7 @@ import { DEMO_PROBE, DEMO_PROJECT } from './demo.ts';
  * Owner decisions (selecting projects, scans, Inbox decisions, lessons, Sync now) need FG_OPERATOR_TOKEN, and the API
  * allows only the verbs OPERATOR_ALLOW names. Without it, API_TOKEN (when set) signs in for reading.
  */
+import { execFile } from 'node:child_process';
 import { readFile } from 'node:fs/promises';
 import { basename, extname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -21,6 +22,11 @@ export type CliIO = {
   readFile?: (path: string) => Promise<Buffer>;
   /** For fg integrations set --from-stdin: all of standard input (main reads the process's); without it there is none. */
   readStdin?: () => Promise<string>;
+  /**
+   * For fg ingest: run a converter (pdftotext, pandoc) on the host and return its standard output; default: execFile.
+   * A converter that is not installed rejects with code ENOENT.
+   */
+  runTool?: (cmd: string, args: string[]) => Promise<string>;
 };
 
 const USAGE = `fg: drive Feedback Graph from a terminal or an agent
@@ -76,6 +82,18 @@ Usage:
                                                  a preview (what else it undoes, what blocks it) unless --apply
   fg decisions rollback --since 24h [--type t] [--apply]   every decision applied since then, newest first: a preview unless --apply
   fg decisions note <id> "text" [--verdict agree|disagree] [--reason r]
+  fg know "<question>" [--project k] [--kind decisions,plans,facts,opinions,lessons,questions] [--limit n]
+                                                 what is known about it: claims people made (who said it and when), facts,
+                                                 approved lessons, open questions and the conflicts on them (needs INTAKE_ENABLED)
+  fg conflicts [list] [--open] [--project k] [--limit n]   conflicts between what agents are told, newest first (--open: only
+                                                 those you have not settled); settle one on the Intake page's Conflicts tab
+  fg conflicts show <id>                         both sides: what each says, who said it and when, whether agents see it
+  fg ingest <file|-> --project k [--kind transcript|notes|doc] [--date 2026-11-10] [--participants "Ana,Bo"] [--title "..."]
+          [--origin "Zoom weekly sync"] [--private|--shared] [--wait [--timeout s]]
+                                                 add what people said to knowledge intake (needs INTAKE_ENABLED): txt, md, vtt
+                                                 and srt are sent as they are; pdf goes through pdftotext and docx, odt, rtf,
+                                                 html or epub through pandoc, on this machine, when installed. --wait follows
+                                                 its reading and lists the claims and questions drawn from it
   fg cloud status
   fg cloud sync-now [--force]                    sends what changed since the last sync (--force: everything)
   fg integrations project <key> --github-author <login|all>  sync PRs by this author (all clears the filter; needs integrations in OPERATOR_ALLOW)
@@ -91,6 +109,8 @@ Options:
   --json           print the API's JSON instead of a table; a failure is { "error": "...", "status"? } on stdout
   --wait           fg scan: follow each job until it is done or failed (exit 1 if any failed); progress (shard n of m,
                    facts so far) goes to stderr when it changes and at least every 30 s
+  --open           fg conflicts: only the conflicts still open
+  --private        fg ingest: never synced, even with SYNC_CLAIMS (the default for a transcript); --shared: not private
   --watch          fg status: the whole status once, then only the lines that changed
   --until <what>   fg status: poll until idle (nothing queued; the GitHub and Linear sync does not hold it up) or that
                    stage; --timeout s gives up (exit 1)
@@ -115,15 +135,15 @@ Environment:
 // ── Arguments ──────────────────────────────────────────────────────────
 
 type Flags = {
-  json?: true; watch?: true; all?: true; only?: true; help?: true; wait?: true; force?: true; 'from-stdin'?: true; 'with-sessions'?: true;
+  json?: true; open?: true; private?: true; shared?: true; watch?: true; all?: true; only?: true; help?: true; wait?: true; force?: true; 'from-stdin'?: true; 'with-sessions'?: true;
   owner?: true; sandbox?: true; apply?: true; 'dry-run'?: true; 'restore-anyway'?: true; run?: string; since?: string; type?: string; verdict?: string;
   key?: string[]; provider?: string; status?: string; project?: string; limit?: string; reason?: string; interval?: string; as?: string; url?: string;
-  until?: string; timeout?: string; kind?: string; q?: string; title?: string; note?: string; relation?: string; source?: string; relevance?: string; flag?: string; pr?: string; author?: string; 'github-author'?: string;
+  until?: string; timeout?: string; kind?: string; date?: string; participants?: string; origin?: string; q?: string; title?: string; note?: string; relation?: string; source?: string; relevance?: string; flag?: string; pr?: string; author?: string; 'github-author'?: string;
 };
 export type Parsed = { words: string[]; flags: Flags };
 
-const BOOLEAN = new Set(['json', 'watch', 'all', 'only', 'help', 'wait', 'force', 'from-stdin', 'with-sessions', 'sandbox', 'apply', 'dry-run', 'owner', 'restore-anyway']);
-const VALUED = new Set(['key', 'provider', 'status', 'project', 'limit', 'reason', 'interval', 'as', 'url', 'until', 'timeout', 'kind', 'q', 'title', 'note', 'relation', 'source', 'relevance', 'flag', 'run', 'pr', 'author', 'github-author', 'since', 'type', 'verdict']);
+const BOOLEAN = new Set(['json', 'open', 'private', 'shared', 'watch', 'all', 'only', 'help', 'wait', 'force', 'from-stdin', 'with-sessions', 'sandbox', 'apply', 'dry-run', 'owner', 'restore-anyway']);
+const VALUED = new Set(['key', 'provider', 'status', 'project', 'limit', 'reason', 'interval', 'as', 'url', 'until', 'timeout', 'kind', 'date', 'participants', 'origin', 'q', 'title', 'note', 'relation', 'source', 'relevance', 'flag', 'run', 'pr', 'author', 'github-author', 'since', 'type', 'verdict']);
 
 export function parse(argv: string[]): Parsed {
   const words: string[] = [];
@@ -958,6 +978,186 @@ async function docs(api: Api, io: CliIO, words: string[], f: Flags): Promise<num
   return 0;
 }
 
+/** The formats POST /api/intake reads, by file extension. */
+const INTAKE_TEXT: Record<string, 'txt' | 'md' | 'vtt' | 'srt'> = { '.txt': 'txt', '.text': 'txt', '.log': 'txt', '.md': 'md', '.markdown': 'md', '.vtt': 'vtt', '.srt': 'srt' };
+/** Files converted to text on this machine first, and what converts them (never a dependency of Feedback Graph itself). */
+const PDFTOTEXT = { tool: 'pdftotext', args: (f: string) => ['-layout', '-enc', 'UTF-8', f, '-'], install: 'poppler: brew install poppler (macOS) or apt install poppler-utils (Debian, Ubuntu)' };
+const PANDOC = { tool: 'pandoc', args: (f: string) => ['-t', 'plain', '--wrap=none', f], install: 'pandoc: brew install pandoc (macOS) or apt install pandoc (Debian, Ubuntu), or see pandoc.org/installing' };
+const INTAKE_CONVERT: Record<string, typeof PDFTOTEXT> = { '.pdf': PDFTOTEXT, '.docx': PANDOC, '.odt': PANDOC, '.rtf': PANDOC, '.html': PANDOC, '.htm': PANDOC, '.epub': PANDOC };
+const INTAKE_MAX_CHARS = 2_000_000;
+const INTAKE_KINDS = ['transcript', 'notes', 'doc'];
+
+/**
+ * What a file is, by its extension and then its first bytes: text to send as it is (with the format, when its
+ * extension says), a document to convert first, or neither (null).
+ */
+export function ingestFormat(name: string, head: Buffer): { text: 'txt' | 'md' | 'vtt' | 'srt' | null } | { convert: typeof PDFTOTEXT } | null {
+  const ext = extname(name).toLowerCase();
+  if (INTAKE_TEXT[ext]) return { text: INTAKE_TEXT[ext] };
+  if (INTAKE_CONVERT[ext]) return { convert: INTAKE_CONVERT[ext] };
+  if (head.subarray(0, 5).toString('latin1') === '%PDF-') return { convert: PDFTOTEXT };
+  // A zip (docx, odt, epub) or any file with a NUL byte is not text.
+  if (head.subarray(0, 4).toString('latin1') === 'PK\u0003\u0004' || head.includes(0)) return null;
+  return { text: null };
+}
+
+type IntakeAdded = { id: string; chunks: number; format: string; utterances: number; pending?: true };
+type SourceView = { id: string; title: string; embed?: { status: string; error?: string }; read: { status: string; error: string | null } | null; intake: { windowsDone: number; windowsTotal: number | null } | null };
+
+/**
+ * fg ingest <file|->: POST /api/intake with the file's text. A pdf, docx (odt, rtf, html, epub) is converted to plain text
+ * here first with pdftotext or pandoc, when installed; a binary file is refused. --wait follows the source until it is
+ * read (GET /api/intake/sources/:id), then lists what was drawn from it.
+ */
+async function ingestCmd(api: Api, io: CliIO, words: string[], f: Flags): Promise<number> {
+  const [file] = words;
+  const usage = 'fg ingest <file|-> --project k [--kind transcript|notes|doc] [--date YYYY-MM-DD] [--participants "Ana,Bo"] [--private|--shared] [--wait]';
+  if (!file || !f.project) throw new UsageError(usage);
+  if (f.private && f.shared) throw new UsageError('--private and --shared: choose one');
+  if (f.kind && !INTAKE_KINDS.includes(f.kind)) throw new UsageError(`--kind must be one of ${INTAKE_KINDS.join(', ')}`);
+  if (f.date && (!/^\d{4}-\d{2}-\d{2}(T[\d:.]+(Z|[+-]\d{2}:?\d{2})?)?$/.test(f.date) || Number.isNaN(Date.parse(f.date)))) throw new UsageError('--date must be a date (YYYY-MM-DD) or an ISO time');
+  let text: string;
+  let format: 'txt' | 'md' | 'vtt' | 'srt' | null = null;
+  let name: string | undefined;
+  if (file === '-') {
+    if (!io.readStdin) throw new UsageError('fg ingest -: no standard input here');
+    text = await io.readStdin();
+  } else {
+    let bytes: Buffer;
+    try {
+      bytes = await (io.readFile ?? readFile)(file);
+    } catch (e) {
+      throw new ApiError(`cannot read ${file}: ${(e as Error).message}`);
+    }
+    // The API takes a plain file name: it names the source, so sending the same file again replaces it.
+    name = basename(file).replace(/[^\w .()-]/g, '_').replace(/^[^\w]+/, '').slice(0, 200) || undefined;
+    const kind = ingestFormat(file, bytes.subarray(0, 512));
+    if (!kind) throw new UsageError(`${file} is not text, and fg cannot convert it: send a .txt, .md, .vtt or .srt file, or a .pdf, .docx, .odt, .rtf, .html or .epub`);
+    if ('convert' in kind) {
+      const run = io.runTool ?? (() => Promise.reject(Object.assign(new Error('no converter'), { code: 'ENOENT' })));
+      try {
+        text = await run(kind.convert.tool, kind.convert.args(file));
+      } catch (e) {
+        if ((e as { code?: unknown }).code === 'ENOENT') throw new ApiError(`${file} needs ${kind.convert.tool} to be turned into text, and it is not installed. Install ${kind.convert.install}, or save it as text and send that.`);
+        throw new ApiError(`${kind.convert.tool} could not read ${file}: ${String((e as Error).message).split('\n')[0].slice(0, 300)}`);
+      }
+      format = 'txt';
+    } else {
+      text = bytes.toString('utf8');
+      format = kind.text;
+    }
+  }
+  if (!text.trim()) throw new ApiError(`${file === '-' ? 'standard input' : file} has no text to read`);
+  if (text.length > INTAKE_MAX_CHARS) throw new ApiError(`${file === '-' ? 'standard input' : file} is ${text.length.toLocaleString('en-US')} characters: a source takes at most ${INTAKE_MAX_CHARS.toLocaleString('en-US')}. Split it.`);
+  const title = (f.title ?? (name ? name.replace(/\.[^.]+$/, '') : `Pasted ${f.kind ?? 'transcript'}${f.date ? ` ${f.date}` : ''}`)).slice(0, 300) || 'source';
+  const participants = f.participants?.split(',').map((p) => p.trim()).filter(Boolean);
+  const body = {
+    projectKey: f.project, title, text, ...(name && { name }), ...(format && { format }), ...(f.kind && { kind: f.kind }), ...(f.date && { occurredAt: f.date }),
+    ...(participants?.length && { participants }), ...(f.origin && { origin: f.origin }), ...(f.private ? { private: true } : f.shared ? { private: false } : {}),
+  };
+  const added = await api<IntakeAdded>('POST', '/api/intake', body).catch(intakeOff('fg ingest'));
+  if (!f.wait) {
+    io.out(f.json ? JSON.stringify(added, null, 2)
+      : `added ${added.id} to ${f.project}: ${added.format}, ${plural(added.utterances, 'part')}${added.pending ? ', stored in the background' : ''}. The worker reads it into claims for your review (the Intake page, or fg ingest --wait next time).`);
+    return 0;
+  }
+  return waitForSource(api, io, f, added);
+}
+
+/** Poll the source until it is read (or failed, or --timeout), then list the claims and questions drawn from it. */
+async function waitForSource(api: Api, io: CliIO, f: Flags, added: IntakeAdded): Promise<number> {
+  const interval = Math.max(1, Number(f.interval ?? 5)) * 1000;
+  const timeout = seconds(f.timeout, 3600, '--timeout') * 1000;
+  const path = `/api/intake/sources/${encodeURIComponent(added.id)}`;
+  let waited = 0;
+  let last = { line: '', at: -Infinity };
+  let s: SourceView;
+  for (;;) {
+    s = await api<SourceView>('GET', path);
+    const state = s.embed ? (s.embed.status === 'failed' ? 'failed' : 'storing') : s.read?.status === 'done' ? 'done' : s.read?.status === 'failed' ? 'failed'
+      : s.intake?.windowsDone ? `reading window ${Math.min(s.intake.windowsDone + 1, s.intake.windowsTotal ?? Infinity)}/${s.intake.windowsTotal ?? '?'}` : 'queued';
+    if (state === 'done' || state === 'failed' || waited + interval > timeout) break;
+    if (state !== last.line || waited - last.at >= PROGRESS_EVERY_MS) {
+      io.err(`${added.id}: ${state} (${elapsed(waited)})`);
+      last = { line: state, at: waited };
+    }
+    await io.sleep(interval);
+    waited += interval;
+  }
+  const failed = s.embed?.status === 'failed' ? s.embed.error ?? 'storing it failed' : s.read?.status === 'failed' ? s.read.error ?? 'reading it failed' : null;
+  const done = s.read?.status === 'done' && !s.embed;
+  type ClaimRow = { id: string; type: string; statement: string; status: string; conflicts: { id: string }[] };
+  type QuestionRow = { id: string; kind: string; text: string };
+  const [claims, questions] = done
+    ? await Promise.all([
+      api<ClaimRow[]>('GET', `/api/claims${qs({ source: added.id, limit: '500' })}`),
+      api<QuestionRow[]>('GET', `/api/questions${qs({ source: added.id, limit: '500' })}`),
+    ])
+    : [[], []];
+  if (f.json) {
+    io.out(JSON.stringify({ source: s, claims, questions }, null, 2));
+  } else if (failed) {
+    io.out(`${added.id}: failed: ${failed}`);
+  } else if (!done) {
+    io.out(`${added.id}: still being read after ${elapsed(waited)}; follow it on the Intake page`);
+  } else {
+    const conflicts = claims.reduce((n, c) => n + c.conflicts.length, 0);
+    io.out(`${added.id}: read: ${plural(claims.length, 'claim')}, ${plural(questions.length, 'open question')}, ${plural(conflicts, 'conflict')} with what is already known`);
+    if (claims.length) io.out(table(['TYPE', 'CONFLICTS', 'CLAIM', 'ID'], claims.map((c) => [c.type, c.conflicts.length || '', c.statement, c.id]), 90, [3]));
+    if (questions.length) io.out(`\n${table(['KIND', 'QUESTION'], questions.map((q) => [q.kind, q.text]), 110)}`);
+    io.out('\nReview them on the Intake page: nothing reaches agents until you accept it.');
+  }
+  return failed || !done ? 1 : 0;
+}
+
+/** fg know "<question>": the owner's look-up (GET /api/knowledge), as the API words it, or its JSON. */
+async function knowCmd(api: Api, io: CliIO, words: string[], f: Flags): Promise<number> {
+  const q = words.join(' ').trim();
+  if (!q) throw new UsageError('fg know "<question>" [--project k] [--kind decisions,plans,...] [--limit n]');
+  const query = qs({ q, project: f.project, kinds: f.kind, limit: f.limit, ...(!f.json && { format: 'md' }) });
+  const r = await api<unknown>('GET', `/api/knowledge${query}`, undefined, f.json ? {} : { accept: 'text/plain' }).catch(intakeOff('fg know'));
+  io.out(f.json ? JSON.stringify(r, null, 2) : String(r));
+  return 0;
+}
+
+/** A 404 on an intake route: the routes are not there while INTAKE_ENABLED is off. */
+const intakeOff = (cmd: string) => (e: unknown): never => {
+  if (e instanceof ApiError && e.status === 404 && !/not selected/.test(e.message)) {
+    throw new ApiError(`${cmd}: knowledge intake is off on this install (set INTAKE_ENABLED=1 in .env and run docker compose up -d)`, 404);
+  }
+  throw e;
+};
+
+type ConflictSideRow = { kind: string; id: string; text: string; status: string | null; speaker: { displayName: string; isOwner: boolean } | null; agentsSee: boolean; gone: boolean; assertedAt: string | null };
+type ConflictRow = { id: string; kind: string; status: string; projectKey: string | null; createdAt: string; judge: { explanation: string } | null; resolution: { choice: string; note: string | null } | null; sides: { a: ConflictSideRow; b: ConflictSideRow } };
+const sideCell = (s: ConflictSideRow) => (s.gone ? `${s.kind} ${s.id} (gone)` : `${s.speaker ? `${s.speaker.isOwner ? 'you' : s.speaker.displayName}: ` : ''}${s.text}`);
+
+/** fg conflicts [list] [--open] | show <id>: GET /api/conflicts, read only (settling one is the Intake page's). */
+async function conflictsCmd(api: Api, io: CliIO, words: string[], f: Flags): Promise<number> {
+  const [verb = 'list', id] = words;
+  if (verb === 'show') {
+    if (!id) throw new UsageError('fg conflicts show <id>');
+    const k = await api<ConflictRow>('GET', `/api/conflicts/${encodeURIComponent(id)}`);
+    if (f.json) { io.out(JSON.stringify(k, null, 2)); return 0; }
+    io.out(`${k.id}: ${k.kind}, ${k.status}${k.projectKey ? ` in ${k.projectKey}` : ''}, found ${at(k.createdAt)}`);
+    for (const [name, s] of [['A', k.sides.a], ['B', k.sides.b]] as const) {
+      io.out(`${name}: ${sideCell(s)}`);
+      io.out(`   ${s.kind} ${s.id}${s.status ? `, ${s.status}` : ''}${s.assertedAt ? `, said ${s.assertedAt.slice(0, 10)}` : ''}; agents see it: ${s.agentsSee ? 'yes' : 'no'}`);
+    }
+    if (k.judge?.explanation) io.out(`why: ${k.judge.explanation}`);
+    if (k.resolution) io.out(`settled: ${k.resolution.choice}${k.resolution.note ? ` (${k.resolution.note})` : ''}`);
+    else io.out('settle it on the Intake page\'s Conflicts tab (A is true, B is true, both partly, not a conflict)');
+    return 0;
+  }
+  if (verb !== 'list') throw new UsageError(`unknown conflicts command: ${verb}`);
+  const list = await api<ConflictRow[]>('GET', `/api/conflicts${qs({ status: f.open ? 'open' : f.status, project: f.project, limit: f.limit })}`).catch(intakeOff('fg conflicts'));
+  if (f.json) { io.out(JSON.stringify(list, null, 2)); return 0; }
+  io.out(list.length
+    ? table(['ID', 'KIND', 'STATUS', 'PROJECT', 'A', 'B'], list.map((k) => [k.id, k.kind, k.status, k.projectKey ?? 'global', sideCell(k.sides.a), sideCell(k.sides.b)]), 50, [0])
+    : f.open ? 'no open conflicts' : 'no conflicts');
+  return 0;
+}
+
 async function activityCmd(api: Api, io: CliIO, f: Flags): Promise<number> {
   // --json is the whole record: the list leaves big details out unless asked.
   const list = await api<any[]>('GET', `/api/activity${qs({ project: f.project, kind: f.kind, run: f.run, limit: f.limit ?? '50', details: f.json ? '1' : undefined })}`);
@@ -1265,7 +1465,7 @@ async function bulkRollback(api: Api, io: CliIO, f: Flags, reason: string | unde
   return results.every((r) => r.ok) ? 0 : 1;
 }
 
-const VERBS = new Set(['signin', 'status', 'pipeline', 'projects', 'scan', 'inbox', 'lessons', 'demo', 'map', 'links', 'facts', 'docs', 'activity', 'sessions', 'evidence', 'cleanup', 'loop', 'decisions', 'cloud', 'integrations', 'doctor', 'setup']);
+const VERBS = new Set(['signin', 'status', 'pipeline', 'projects', 'scan', 'inbox', 'lessons', 'demo', 'map', 'links', 'facts', 'docs', 'activity', 'sessions', 'evidence', 'cleanup', 'loop', 'decisions', 'know', 'conflicts', 'ingest', 'cloud', 'integrations', 'doctor', 'setup']);
 
 /**
  * fg help <verb>: that verb's usage lines (with their continuation lines), the options only it takes (those described
@@ -1370,6 +1570,9 @@ export async function run(argv: string[], raw: CliIO): Promise<number> {
       case 'loop': return await loopCmd(api, io, words.slice(1), flags);
       case 'decisions': return await decisionsCmd(api, io, words.slice(1), flags);
       case 'map': return await map(api, io, words.slice(1), flags);
+      case 'know': return await knowCmd(api, io, words.slice(1), flags);
+      case 'ingest': return await ingestCmd(api, io, words.slice(1), flags);
+      case 'conflicts': return await conflictsCmd(api, io, words.slice(1), flags);
       case 'demo': return await demo(api, io, words.slice(1), flags);
       default: throw new UsageError(`unknown command: ${words[0]}`);
     }
@@ -1391,6 +1594,9 @@ export function main(argv: string[], proc: CliProcess): Promise<number> {
     out: (l) => proc.stdout.write(`${l}\n`),
     err: (l) => proc.stderr.write(`${l}\n`),
     sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
+    runTool: (cmd, args) => new Promise((resolve, reject) => {
+      execFile(cmd, args, { maxBuffer: 64 * 1024 * 1024, encoding: 'utf8' }, (err, stdout) => (err ? reject(err) : resolve(stdout)));
+    }),
     readStdin: async () => {
       const parts: Buffer[] = [];
       for await (const chunk of proc.stdin) parts.push(Buffer.from(chunk));

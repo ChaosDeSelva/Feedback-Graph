@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { canonicalJson } from '../decisions/record.ts';
-import type { ProjectThresholds, TargetSnapshot } from '../types.ts';
+import type { ClaimLink, ProjectThresholds, TargetSnapshot } from '../types.ts';
 
 /**
  * A link_misses target: the (:Miss)-[:REPEATS]->(:Miss) link from the repeat to the miss it repeats, present or not.
@@ -10,6 +10,15 @@ import type { ProjectThresholds, TargetSnapshot } from '../types.ts';
 export function missLinkSnapshot(from: string, to: string, linked: boolean): TargetSnapshot {
   const fields = { from, to, linked };
   return { kind: 'miss', id: from, fields, fingerprint: createHash('sha256').update(canonicalJson(['miss-link', fields])).digest('hex') };
+}
+
+/**
+ * A link_claims target: the (:Claim)-[:REFINES|CORROBORATES]->(claim, fact or lesson) link, present or not. Its id is
+ * the claim the link is from (the decision's primary target); the fingerprint covers both ends, the relation and the state.
+ */
+export function claimLinkSnapshot(l: ClaimLink, linked: boolean): TargetSnapshot {
+  const fields = { from: l.from, to: l.to, rel: l.rel, linked };
+  return { kind: 'claim', id: l.from, fields, fingerprint: createHash('sha256').update(canonicalJson(['claim-link', fields])).digest('hex') };
 }
 
 /**

@@ -541,3 +541,18 @@ test('the metrics card waits through an API outage with the rest of the page, an
   down = false;
   expect(await within(card).findByLabelText('Not applicable', {}, { timeout: 5000 })).toBeTruthy();
 }, 30000);
+
+test('ask: with knowledge intake on, "What do we know about …?" leads the starters and leaves the topic to type', async () => {
+  serve({ '/api/status': { ...status, intake: { enabled: true } } });
+  render(<Dashboard />);
+  const ask = await region(/^ask$/i);
+  const box = within(ask).getByLabelText('question') as HTMLTextAreaElement;
+  fireEvent.click(await within(ask).findByRole('button', { name: 'What do we know about …?' }));
+  expect(box.value).toBe('What do we know about ');
+  cleanup();
+  serve();
+  render(<Dashboard />);
+  const off = await region(/^ask$/i);
+  await within(off).findByRole('button', { name: /where should a new api endpoint go/i });
+  expect(within(off).queryByRole('button', { name: 'What do we know about …?' })).toBeNull();
+});

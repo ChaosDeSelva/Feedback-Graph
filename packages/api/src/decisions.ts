@@ -3,13 +3,13 @@ import { z } from 'zod';
 import {
   ABSENT, betaSummary, DECISION_MODES, redactSecrets, type DecisionNoteInput, IsoInstant, DECISION_NOTE_REASONS, DECISION_STATUSES, DECISION_TYPES, LOOP_DECISION_TYPES, type LoopDecisionType, effectiveLoopMode, effectiveTypeMode, LOOP_ACTOR,
   LOOP_BANDS, LOOP_MODES, LOOP_POLICY_VERSION, LOOP_ROUNDS_KEPT, LOOP_TYPE_INFO, readLoopBreaker, readLoopBudget, readLoopRound, readLoopRounds,
-  readLoopSettings, loopHoldout, lessonHeldOut, readLoopMetrics, REPEAT_SIMILARITY, resetLoopBreaker, TargetChangedError, typeTau, writeLoopSettings, CascadeBlockedError, DecisionStateError, UnsupportedTargetError,
+  readLoopSettings, needsYouReason, loopHoldout, lessonHeldOut, readLoopMetrics, REPEAT_SIMILARITY, resetLoopBreaker, TargetChangedError, typeTau, writeLoopSettings, CascadeBlockedError, DecisionStateError, UnsupportedTargetError,
   type CascadePlan, type DecisionExecutor, type RollbackOptions,
   type Activity, type ActivityKind, type ActivityStore, type Decision, type DecisionCount, type DecisionKey, type DecisionNote, type DecisionsStore,
   type DecisionStatus, type DecisionType, type DocsStore, type EvidenceRef, type InsightsStore, type KnowledgeStore, type LoopConfig,
   type LoopRound, type LoopSettings, type PatternReport, type SessionsStore, type ShownProjects, type TargetSnapshot,
 } from '@fb/core';
-import { currentActor } from './operator.ts';
+import { actingAsOperator, currentActor } from './operator.ts';
 
 /**
  * The learning loop's REST routes (docs/learning-loop-api.md): its decisions as the audit log, the owner's verdicts on
@@ -20,7 +20,7 @@ import { currentActor } from './operator.ts';
  */
 
 export type LoopDeps = {
-  decisions: Pick<DecisionsStore, 'get' | 'list' | 'count' | 'forTarget' | 'loopChanged' | 'markStatus' | 'ratify' | 'addNote' | 'notes' | 'dependents' | 'signals' | 'calibration' | 'listSignals'>;
+  decisions: Pick<DecisionsStore, 'get' | 'list' | 'count' | 'forTarget' | 'loopChanged' | 'markStatus' | 'ratify' | 'addNote' | 'notes' | 'dependents' | 'signals' | 'calibration' | 'listSignals' | 'markDistinct' | 'liftDistinct' | 'distinctPairs'> & Partial<Pick<DecisionsStore, 'propose'>>;
   /** The feedback patterns GET /api/loop/metrics reads its repeat rate from. Unset: that route answers 404. */
   insights?: Pick<InsightsStore, 'patterns'>;
   /** Where the loop's settings, budget, breakers and rounds are kept (loop/state.ts). */
@@ -74,6 +74,7 @@ export function ownerOverrides(d: Pick<LoopDeps, 'decisions' | 'activity' | 'exe
     if (!d.exec) return;
     const by = currentActor();
     const seen = new Set<string>();
+    const expired: Decision[] = [];
     for (const id of targetIds) {
       for (const dec of await d.decisions.forTarget(id)) {
         if (seen.has(dec.id)) continue;
@@ -81,12 +82,7 @@ export function ownerOverrides(d: Pick<LoopDeps, 'decisions' | 'activity' | 'exe
         if (dec.status === 'observed' || dec.status === 'proposed') {
           const now = await d.exec.current(dec);
           const stale = dec.before.some((b) => (now.find((n) => n.kind === b.kind && n.id === b.id)?.fingerprint ?? ABSENT) !== b.fingerprint);
-          if (!stale || !(await d.decisions.markStatus(dec.id, { status: 'expired', from: [dec.status], by }))) continue;
-          await d.activity.record({
-            kind: 'decision_made', actor: 'you', projectKey: dec.projectKey, subject: `${dec.type.replace('_', ' ')} expired: you changed its target yourself`.slice(0, 300),
-            why: 'you changed its target before deciding it', details: { decisionId: dec.id, decisionType: dec.type, status: 'expired', action: 'expired' },
-            targets: [dec.id, ...dec.targets.map((t) => t.id)],
-          });
+          if (stale && (await d.decisions.markStatus(dec.id, { status: 'expired', from: [dec.status], by }))) expired.push(dec);
           continue;
         }
         if (dec.status !== 'applied') continue;
@@ -99,8 +95,28 @@ export function ownerOverrides(d: Pick<LoopDeps, 'decisions' | 'activity' | 'exe
         });
       }
     }
+    if (!expired.length) return;
+    // One line for what one change of yours expired, however many proposals waited on it (deciding lessons by hand
+    // expired 22 at once with no notice): the Decisions page counts these lines (action expired_by_you).
+    const n = expired.length;
+    const projects = [...new Set(expired.map((x) => x.projectKey))];
+    await d.activity.record({
+      kind: 'decision_made', actor: 'you', projectKey: projects.length === 1 ? projects[0] : null,
+      subject: n === 1
+        ? `${expired[0].type.replace('_', ' ')} expired: you changed its target yourself`
+        : `${n} waiting loop proposals expired: you changed their targets yourself`,
+      why: 'you decided what they would have changed before deciding them, so they no longer apply',
+      details: {
+        status: 'expired', action: 'expired_by_you', expired: n, decisions: expired.slice(0, EXPIRED_LISTED).map((x) => ({ id: x.id, type: x.type })),
+        ...(n === 1 && { decisionId: expired[0].id, decisionType: expired[0].type }),
+      },
+      targets: expired.slice(0, EXPIRED_LISTED).flatMap((x) => [x.id, ...x.targets.map((t) => t.id)]),
+    });
   };
 }
+
+/** The expired decisions an expired_by_you Activity line names (and targets): the count is always whole. */
+const EXPIRED_LISTED = 25;
 
 /**
  * createApp's part: whether owner actions are read-only (no API_TOKEN, no FG_OWNER_TOKEN), and which projects are
@@ -161,9 +177,19 @@ const SettingsBody = z.object({
   mode: Mode.optional(),
   types: z.record(z.enum(LOOP_DECISION_TYPES as [LoopDecisionType, ...LoopDecisionType[]]), z.object({ mode: Mode.nullable().optional(), tau: z.number().nullable().optional() }).strict()).optional(),
 }).strict();
+const DistinctBody = z.object({
+  a: z.string().min(1).max(500), b: z.string().min(1).max(500), reason: z.string().trim().min(1).max(500).optional(),
+}).strict().refine((x) => x.a !== x.b, 'two different records');
+/** The two records a merge (merge_duplicates, merge_claims) joins: its keeper and the one merged into it. */
+export function mergedPair(d: Pick<Decision, 'type' | 'targets'>): { a: string; b: string } | null {
+  if (d.type !== 'merge_duplicates' && d.type !== 'merge_claims') return null;
+  const keeper = d.targets.find((t) => t.role === 'keeper');
+  const merged = d.targets.find((t) => t.role === 'merged');
+  return keeper && merged ? { a: keeper.id, b: merged.id } : null;
+}
 const EventsQuery = z.object({ after: z.string().min(1).max(1000).optional() });
 
-export const loopSchemas = { ListQuery, ActionBody, NoteBody, SettingsBody, EventsQuery, MetricsQuery };
+export const loopSchemas = { ListQuery, ActionBody, NoteBody, SettingsBody, EventsQuery, MetricsQuery, DistinctBody };
 
 // ── Wire shapes (docs/learning-loop-api.md; the UI's api.ts types) ─────
 
@@ -172,6 +198,8 @@ const OPTIONAL = ['appliedAt', 'decidedAt', 'decidedBy', 'supersededBy', 'rollba
 export function decisionWire(d: Decision): Record<string, unknown> {
   const out: Record<string, unknown> = { ...d };
   for (const k of OPTIONAL) if (out[k] === null) delete out[k];
+  // What the loop could not decide on its own, and why, in one line (the Decisions page's "needs you").
+  if (d.status === 'proposed') out.needsYou = needsYouReason(d);
   return out;
 }
 export const noteWire = ({ reason, ...n }: DecisionNote) => (reason === null ? n : { ...n, reason });
@@ -542,6 +570,11 @@ export function loopRoutes(app: Hono, d: LoopDeps, ctx: LoopRouteContext) {
         await record('decision_rolled_back', rolled, `rolled back${undone.length ? ` with ${undone.length} later decision${undone.length === 1 ? '' : 's'}` : ''}`, 'you rolled it back',
           { status: 'rolled_back', action, cascade: undone, ...(reason && { reason }), ...(note && { note }) });
       }
+      // A merge you rolled back (or one undone with it) is two records you said are not the same: never proposed again.
+      for (const x of [rolled, ...(await Promise.all(undone.map((id) => store.get(id))))]) {
+        const pair = x && mergedPair(x);
+        if (pair) await store.markDistinct({ ...pair, by, reason: `you rolled back the merge${note ? `: ${note}` : ''}`.slice(0, 500), decisionId: x.id });
+      }
       // In the decision's notes too, with its reason, as a reject's note is: what the page and the loop read back.
       const lost = await actionNote(dec.id, note && { by, text: note, verdict: 'disagree', reason: reason ?? null });
       return c.json({ ...decisionWire(rolled), ...lost });
@@ -559,13 +592,42 @@ export function loopRoutes(app: Hono, d: LoopDeps, ctx: LoopRouteContext) {
     return c.json(noteWire(note), 201);
   }));
 
+  // Pairs you said are not the same (0.9.1): the loop never proposes merging them, whatever the evidence. Marking one
+  // is an owner route (loop_decide); lifting one is yours alone, never the operator token's.
+  app.get('/api/distinct-pairs', guarded(async (c) => {
+    const ids = (c.req.query('ids') ?? '').split(',').map((x) => x.trim()).filter(Boolean).slice(0, 200);
+    if (!ids.length) return c.json({ error: 'ids: one or more record ids, comma separated' }, 400);
+    return c.json(await store.distinctPairs(ids));
+  }));
+  app.post('/api/distinct-pairs', guarded(async (c) => {
+    const body = DistinctBody.safeParse(await c.req.json().catch(() => null));
+    if (!body.success) return c.json({ error: body.error.flatten() }, 400);
+    const { a, b, reason } = body.data;
+    const created = await store.markDistinct({ a, b, by: currentActor(), reason: reason ?? 'you marked them as not the same', decisionId: null });
+    if (created) {
+      await d.activity.record({ kind: 'decision_noted', actor: currentActor(), projectKey: null, subject: `never merge ${a} and ${b}`, why: reason ?? 'you marked them as not the same', details: { distinct: [a, b] }, targets: [a, b] });
+    }
+    return c.json({ created, pairs: await store.distinctPairs([a]) }, created ? 201 : 200);
+  }));
+  app.delete('/api/distinct-pairs', guarded(async (c) => {
+    if (actingAsOperator()) return c.json({ error: 'only you lift a never-merge record (the browser or FG_OWNER_TOKEN), never the operator token' }, 403);
+    const body = DistinctBody.safeParse(await c.req.json().catch(() => null));
+    if (!body.success) return c.json({ error: body.error.flatten() }, 400);
+    if (!(await store.liftDistinct(body.data.a, body.data.b))) return c.json({ error: 'no such record' }, 404);
+    await d.activity.record({ kind: 'decision_noted', actor: 'you', projectKey: null, subject: `may merge ${body.data.a} and ${body.data.b} again`, why: 'you lifted the never-merge record', details: { distinctLifted: [body.data.a, body.data.b] }, targets: [body.data.a, body.data.b] });
+    return c.body(null, 204);
+  }));
+
   app.get('/api/loop', guarded(async (c) => c.json(await loopState(c))));
 
   app.put('/api/loop/settings', guarded(async (c) => {
     const body = SettingsBody.safeParse(await c.req.json().catch(() => null));
     if (!body.success) return c.json({ error: body.error.flatten() }, 400);
     const patch = body.data;
-    for (const [type, p] of Object.entries(patch.types ?? {}) as [DecisionType, { tau?: number | null }][]) {
+    for (const [type, p] of Object.entries(patch.types ?? {}) as [DecisionType, { mode?: string | null; tau?: number | null }][]) {
+      // A tier P type is always a proposal (choosing which side of a conflict is true, assigning or closing a question):
+      // auto is refused rather than stored and silently capped.
+      if (p.mode === 'auto' && LOOP_TYPE_INFO[type].tier === 'P') return c.json({ error: `${type} is always a proposal (tier P): it cannot apply on its own; set observe, propose or off` }, 400);
       const floor = LOOP_TYPE_INFO[type].tauDefault;
       if (p.tau != null && (p.tau < floor || p.tau > 1)) return c.json({ error: `${type}: tau must be from ${floor} (its default) to 1` }, 400);
     }

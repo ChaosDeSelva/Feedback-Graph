@@ -18,7 +18,7 @@ const newestFirst = (a: Decision, b: Decision) => `${b.appliedAt}|${b.id}`.local
  * The earlier applied decisions a new one builds on: those whose `after` is, for one of its targets, exactly that
  * target's `before`. What Decision.dependsOn records when the engine proposes it.
  */
-export async function dependenciesOf(s: Pick<DecisionExecStore, 'decisions'>, before: TargetSnapshot[]): Promise<string[]> {
+export async function dependenciesOf(s: { decisions: Pick<DecisionExecStore['decisions'], 'forTarget'> }, before: TargetSnapshot[]): Promise<string[]> {
   const ids = new Set<string>();
   for (const b of before) {
     if (b.fingerprint === ABSENT) continue;

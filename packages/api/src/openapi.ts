@@ -8,6 +8,7 @@ import { importSchemas } from './import.ts';
 import { intakeSchemas } from './intake.ts';
 import { intakeReviewSchemas as ir } from './intakeReview.ts';
 import { conflictSchemas } from './conflicts.ts';
+import { knowledgeSchemas } from './knowledge.ts';
 import { integrationSchemas } from './integrations.ts';
 import { OWNER_ROUTES } from './operator.ts';
 import { runSchemas } from './runs.ts';
@@ -135,7 +136,7 @@ const SCHEMAS: Record<string, JsonSchema> = {
   }, ['id', 'projectKey', 'status', 'requestedAt', 'filesScanned', 'factsAdded', 'error']),
   ProjectSummary: obj({
     key: str, repoPath: str, remote: nullable(str), aliases: arrayOf(str), sessions: int, feedback: int, lessons: int, facts: int,
-    factsByOrigin: { type: 'object', additionalProperties: int }, lastScan: nullable(ref('ScanJob')), pinned: bool, links: int,
+    lessonsByStatus: { type: 'object', additionalProperties: int }, globalLessons: int, factsByOrigin: { type: 'object', additionalProperties: int }, lastScan: nullable(ref('ScanJob')), pinned: bool, links: int,
   }, ['key', 'repoPath', 'remote', 'sessions', 'feedback', 'lessons', 'facts', 'lastScan', 'pinned']),
   StoredFact: obj({
     id: str, kind: str, statement: str, path: str, lines: nullable(str), why: str, confidence: num, relevance: nullable(num), relevanceBy: nullable(str),
@@ -202,6 +203,10 @@ const SCHEMAS: Record<string, JsonSchema> = {
   ImportResult: loose('What an import added and skipped'),
   ChatConversation: loose('An Ask conversation: id, projectKey, title, provider, timestamps'),
   ChatThread: loose('An Ask conversation with its turns'),
+  IntakeSharing: loose('Claim sharing in effect: claims (SYNC_CLAIMS), people (SYNC_PEOPLE), saved (set in Settings), editable'),
+  DistinctMarked: loose('created (false: already recorded), and the pairs naming the first record'),
+  DistinctPair: loose('Two records you said are not the same: a, b (id order), by, at, reason, decisionId (the merge rolled back)'),
+  KnowledgeAnswer: loose('What is known about a question (knowledge.ts KnowledgeAnswer): query, projects, items (kind, group, id, text, score, status, type, who, at, source, quote, unreviewed, disputed, note), conflicts (both sides), people, timeline'),
   ModuleContext: loose('A file in the code map: its module, imports, importers, symbols, lessons and misses'),
   Impact: loose('What changing the files touches: dependents by depth'),
   MapGraph: loose('The Graph page\'s code mode: nodes, edges, lessons'),
@@ -418,6 +423,7 @@ const routes = (a = appSchemas): Record<string, Partial<Record<Method, Route>>> 
 
   '/api/cloud': { GET: { tag: 'cloud', summary: 'Cloud sync: settings, preview and last run (optional project query also explains excluded/unselected projects)', response: 'CloudInfo' } },
   '/api/cloud/progress': { GET: { tag: 'cloud', summary: 'Sync now\'s progress', response: '{ running, lastManual }' } },
+  '/api/cloud/intake-sharing': { PUT: { tag: 'cloud', summary: 'Knowledge intake: sync the facts accepted claims became (SYNC_CLAIMS) and name who said them (SYNC_PEOPLE), over .env; a private source\'s and quotes never go; 409 with cloud sync or intake off', body: cloudSchemas.IntakeSharingBody, response: 'IntakeSharing' } },
   '/api/cloud/local-only': { PUT: { tag: 'cloud', summary: 'Keep selected project keys local; never send their new content to Cloud', body: cloudSchemas.LocalOnly, response: 'LocalOnlyProjects' } },
   '/api/cloud/sync': { POST: { tag: 'cloud', summary: 'Sync now', body: cloudSchemas.SyncRequest, response: 'CloudSyncResult' } },
 
@@ -458,6 +464,7 @@ const routes = (a = appSchemas): Record<string, Partial<Record<Method, Route>>> 
   '/api/claims/{id}': {
     GET: { tag: 'intake', summary: 'One claim: its fingerprint (for expect), who said it and its source\'s details', response: '{ claim, fingerprint, speaker, source }' },
     PATCH: { tag: 'intake', summary: 'Edit, re-type, accept or reject a claim; accepting one that is not an opinion files it as a project fact (origin claim); 409 when it changed since (expect) or is already a fact', body: ir.ClaimPatchBody, response: '{ claim, fact }' },
+    DELETE: { tag: 'intake', summary: 'Delete one claim that is not accepted or superseded (409 otherwise), with the conflicts it is a side of; Activity names it without its text', response: 'no content', status: 204 },
   },
   '/api/claims/decisions': { POST: { tag: 'intake', summary: 'Accept or reject many claims, or every proposed claim of one source, each recorded on its own; one refused does not stop the rest', body: ir.ClaimDecisions, response: '{ results: [{ id, ok, status?, factId? | error? }] }' } },
   '/api/questions': { GET: { tag: 'intake', summary: 'Questions a source left open, newest first, filtered; paged by offset (x-next-offset header)', query: ir.QuestionsQuery, response: 'Question[]' } },
@@ -474,6 +481,12 @@ const routes = (a = appSchemas): Record<string, Partial<Record<Method, Route>>> 
   '/api/conflicts': { GET: { tag: 'intake', summary: 'Conflicts between things agents may be told, newest first, filtered; each with both sides, who said them, when, and whether agents see them; paged by offset (x-next-offset header)', query: conflictSchemas.ConflictsQuery, response: 'Conflict[]' } },
   '/api/conflicts/{id}': { GET: { tag: 'intake', summary: 'One conflict with both sides and the resolve_conflict decision that settled it (roll that back to undo)', response: 'Conflict & { decision }' } },
   '/api/conflicts/{id}/resolve': { POST: { tag: 'intake', summary: 'Settle a conflict: A or B is true (the other superseded, never deleted), both partly (a note; optionally a reconciled statement filed as your fact), or not a conflict; recorded as a resolve_conflict decision by you, undone by rolling it back; 409 when it changed since (expect)', body: conflictSchemas.ResolveBody, response: '{ conflict, decision }' } },
+  '/api/knowledge': { GET: { tag: 'intake', summary: 'What do we know about q: accepted and unreviewed claims (who said them, when, the quote), facts, approved lessons and open questions, ranked by closeness, with the open conflicts on them ([disputed]); format=md for text', query: knowledgeSchemas.KnowledgeQuery, response: 'KnowledgeAnswer' } },
+  '/api/distinct-pairs': {
+    GET: { tag: 'loop', summary: 'The never-merge records naming any of these ids (ids=a,b): pairs you said are not the same', response: 'DistinctPair[]' },
+    POST: { tag: 'loop', summary: 'Never merge these two records (lessons or claims): the learning loop never proposes it again, whatever the evidence', body: loopSchemas.DistinctBody, response: 'DistinctMarked', status: 201 },
+    DELETE: { tag: 'loop', summary: 'Lift a never-merge record: yours alone, refused to the operator token', body: loopSchemas.DistinctBody, response: 'no content', status: 204 },
+  },
   '/api/chats': {
     GET: { tag: 'ask', summary: 'Ask conversations of the shown projects', query: chatSchemas.ListChats, response: 'ChatConversation[]' },
     POST: { tag: 'ask', summary: 'Start a conversation', body: chatSchemas.CreateChat, response: 'ChatConversation', status: 201 },
@@ -517,7 +530,7 @@ const SCHEMA_OF: Record<string, JsonSchema> = {
   'POST /api/projects/{key}/docs': obj({ id: str, chunks: int }),
   'GET /api/docs/{id}/image': { type: 'string', format: 'binary' },
   'POST /api/intake': obj({ id: str, chunks: int, format: { type: 'string', enum: ['txt', 'md', 'vtt', 'srt'] }, utterances: int, pending: bool }, ['id', 'chunks', 'format', 'utterances']),
-  'DELETE /api/intake/sources/{id}': obj({ removed: obj({ claim: int, question: int, facts: int, keep: { type: 'string', enum: ['facts', 'none'] } }, ['claim', 'question', 'facts', 'keep']), decision: nullable({ type: 'object' }) }, ['removed', 'decision']),
+  'DELETE /api/intake/sources/{id}': obj({ removed: obj({ claim: int, question: int, people: int, facts: int, keep: { type: 'string', enum: ['facts', 'none'] } }, ['claim', 'question', 'people', 'facts', 'keep']), decision: nullable({ type: 'object' }) }, ['removed', 'decision']),
   'GET /api/projects/{key}/codemap/hotspots': obj({ meta: nullable(loose('The map: files, symbols, imports, built at')), capped: bool, hotspots: arrayOf(ref('Hotspot')) }),
   'POST /api/projects/{key}/codemap/rebuild': QUEUED,
   'POST /api/settings/cleanup': obj({ removed: arrayOf(str), nodesRemoved: int }),

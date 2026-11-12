@@ -15,6 +15,37 @@ const sentence = (host: string, s: SyncCounts) =>
 
 const Mono = ({ children }: { children: string }) => <code className="font-mono text-[12px]">{children}</code>;
 
+/**
+ * With knowledge intake on: whether the facts your accepted claims became are synced (SYNC_CLAIMS), and whether they
+ * name who said them (SYNC_PEOPLE). Saved here over .env's values; a private source's never go, nor quotes.
+ */
+function ClaimSharing({ value, busy, onSave }: { value: NonNullable<CloudInfo['intakeSharing']>; busy: boolean; onSave: (v: { claims: boolean; people: boolean }) => void }) {
+  const [claims, setClaims] = useState(value.claims);
+  const [people, setPeople] = useState(value.people);
+  useEffect(() => { setClaims(value.claims); setPeople(value.people); }, [value.claims, value.people]);
+  const changed = claims !== value.claims || people !== value.people;
+  const box = 'size-3.5 accent-[var(--color-accent-edge)]';
+  return (
+    <fieldset aria-label="claim sharing" className="grid gap-1.5">
+      <legend className="text-[11px] font-semibold tracking-[0.06em] text-muted uppercase">What people said</legend>
+      <label className="flex items-center gap-2 text-[13px]">
+        <input type="checkbox" aria-label="sync claims" className={box} checked={claims} disabled={!value.editable || busy} onChange={(e) => { setClaims(e.target.checked); if (!e.target.checked) setPeople(false); }} />
+        Sync the facts your accepted claims became (<Mono>SYNC_CLAIMS</Mono>)
+      </label>
+      <label className="flex items-center gap-2 pl-5 text-[13px]">
+        <input type="checkbox" aria-label="sync people" className={box} checked={people} disabled={!value.editable || busy || !claims} onChange={(e) => setPeople(e.target.checked)} />
+        Name who said each (<Mono>SYNC_PEOPLE</Mono>); otherwise "a participant"
+      </label>
+      <p className="text-xs text-muted">
+        Off by default. Even on, a claim's quote never goes, a fact from a private source (a transcript, an agent's notes) never goes, and open
+        conflicts, questions and sources never go. Turning it off withdraws what was sent on the next sync.
+        {value.saved ? ' Set here; it overrides .env.' : ' As set in .env until you save it here.'}
+      </p>
+      {value.editable && <Button owner size="sm" className="justify-self-start" disabled={busy || !changed} onClick={() => onSave({ claims, people: claims && people })}>Save claim sharing</Button>}
+    </fieldset>
+  );
+}
+
 /** Settings: Feedback Graph Cloud sync. Off unless CLOUD_URL and CLOUD_TOKEN are set; Sync now is an owner action (the operator token too, under sync_now). */
 export function CloudSync() {
   const [info, setInfo] = useState<CloudInfo | null>(null);
@@ -24,9 +55,16 @@ export function CloudSync() {
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<string | null>(null);
 
+  // The settings first, without the counts (they read every selected project's export and take seconds), then the
+  // counts: the page shows at once and only "What a sync sends" waits.
   const load = () =>
-    api.cloud().then(
-      (d) => { setInfo(d); setLoadError(null); },
+    api.cloud({ preview: false }).then(
+      (d) => {
+        // A reload (after a save) shows the new settings at once and keeps the last counts until the new ones come.
+        setInfo((cur) => cur ? { ...d, preview: cur.preview, previewSkipped: cur.previewSkipped, previewError: cur.previewError } : d);
+        setLoadError(null);
+        return api.cloud().then((full) => setInfo(full), (e) => setInfo((cur) => cur && { ...cur, previewSkipped: undefined, previewError: errorMessage(e) }));
+      },
       (e) => { setInfo(null); setLoadError(errorMessage(e)); },
     );
   useEffect(() => { load(); }, []);
@@ -117,6 +155,7 @@ export function CloudSync() {
           {[...new Set(info.last?.teamLessons?.map(t => t.message) ?? [])].map(message => <Alert key={message}>{message}</Alert>)}
           {info.localOnlyProjects.length > 0 && <p className="text-xs text-muted">Local only (never sends new content): {info.localOnlyProjects.join(', ')}. Environment-enforced projects remain local even if removed below.</p>}
           {info.localOnlyEditable && <div className="grid gap-2"><label htmlFor="cloud-local-only">Keep these project keys local (comma separated)</label><Input id="cloud-local-only" value={localOnly} onChange={e => setLocalOnly(e.target.value)} /><Button owner disabled={busy} onClick={async () => { setBusy(true); setError(null); try { await api.cloudLocalOnly(localOnly.split(',').map(key => key.trim()).filter(Boolean)); await load(); } catch (e) { setError(errorMessage(e)); } finally { setBusy(false); } }}>Save local-only projects</Button><p className="text-xs text-muted">These projects stay selected locally. Forced sync never sends new content; previously shared copies are withdrawn on the next sync.</p></div>}
+          {info.intakeSharing && <ClaimSharing value={info.intakeSharing} busy={busy} onSave={async (v) => { setBusy(true); setError(null); try { await api.cloudIntakeSharing(v); await load(); } catch (e) { setError(errorMessage(e)); } finally { setBusy(false); } }} />}
           {result && <p role="status" className="text-ok-text">{result}</p>}
           {lastError && <Alert>{lastError}</Alert>}
           <div className="grid gap-1.5">
@@ -131,7 +170,7 @@ export function CloudSync() {
                 <StatTile label="code files" value={total.codeFiles} hint="paths and hotspot numbers" />
               </StatGrid>
             ) : (
-              <p className="text-xs text-muted">{info.previewError ? `Could not count: ${info.previewError}` : 'Nothing to count yet.'}</p>
+              <p className="text-xs text-muted">{info.previewSkipped ? 'Counting…' : info.previewError ? `Could not count: ${info.previewError}` : 'Nothing to count yet.'}</p>
             )}
           </div>
         </>

@@ -1,6 +1,6 @@
 import type { ActivityInput, ExternalRef, InboxText } from '@fb/core';
 import { expect, test } from 'vitest';
-import { DUPLICATE_DECIDER, duplicateItems, rejectDuplicateItems, retitleThreadTasks, THREAD_TASKS_CURSOR, type RepairDeps } from './repairs.ts';
+import { DUPLICATE_DECIDER, duplicateItems, INVALID_SUMMARIES_CURSOR, rejectDuplicateItems, retitleThreadTasks, retryInvalidSummaries, THREAD_TASKS_CURSOR, type RepairDeps } from './repairs.ts';
 
 function deps(over: Partial<RepairDeps['knowledge']> = {}, items: InboxText[] = []) {
   const cursors = new Map<string, string>();
@@ -80,4 +80,16 @@ test('a pending item flagged on a compaction summary is rejected too', () => {
   expect(duplicateItems([item('cc-x', { sessionId: 'cc-9', source: 'claude', text: summary }), item('cc-y', { sessionId: 'cc-9', source: 'claude', status: 'confirmed', text: summary })])).toEqual([
     { id: 'cc-x', of: 'cc-9', why: 'a compaction summary Claude Code wrote, stored as a human turn' },
   ]);
+});
+
+test('session summaries that failed on the answer\'s shape are tried again at once, once', async () => {
+  const f = deps();
+  const prefixes: string[] = [];
+  f.d.sessions = { retryFailedSummaries: async (prefix) => { prefixes.push(prefix); return ['c3186fe8']; } };
+  expect(await retryInvalidSummaries(f.d)).toEqual({ retried: 1 });
+  expect(prefixes).toEqual(['the model did not return a valid summary']);
+  expect(f.activity[0]).toMatchObject({ kind: 'session_summarized', actor: 'repair', targets: ['session:c3186fe8'] });
+  expect(f.cursors.get(INVALID_SUMMARIES_CURSOR)).toBe('v1');
+  expect(await retryInvalidSummaries(f.d)).toBeNull();
+  expect(prefixes).toHaveLength(1);
 });

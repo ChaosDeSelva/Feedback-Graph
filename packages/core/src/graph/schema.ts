@@ -11,6 +11,7 @@ export const SCHEMA = [
   'CREATE INDEX candidate_status IF NOT EXISTS FOR (n:Candidate) ON (n.status)',
   'CREATE CONSTRAINT miss_id IF NOT EXISTS FOR (n:Miss) REQUIRE n.id IS UNIQUE',
   'CREATE CONSTRAINT lesson_id IF NOT EXISTS FOR (n:Lesson) REQUIRE n.id IS UNIQUE',
+  'CREATE CONSTRAINT distinct_pair_key IF NOT EXISTS FOR (n:DistinctPair) REQUIRE n.key IS UNIQUE',
   'CREATE CONSTRAINT task_id IF NOT EXISTS FOR (n:Task) REQUIRE n.id IS UNIQUE',
   'CREATE CONSTRAINT context_id IF NOT EXISTS FOR (n:ContextItem) REQUIRE n.id IS UNIQUE',
   'CREATE CONSTRAINT cause_key IF NOT EXISTS FOR (n:Cause) REQUIRE n.key IS UNIQUE',

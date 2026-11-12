@@ -16,6 +16,7 @@ function fullApp() {
     classifyQueue: anything, settings: anything, codegraph: anything, mapMaxFiles: null, cloud: anything, inScope: () => true,
     importer: anything, sessions: anything, shown: undefined, integrations: anything, chat: anything, runs: anything, evidence: anything, loop: anything,
     intake: { store: anything, archive: false, decide: anything }, intakeReview: { intake: anything, facts: anything, embed: async () => [], activity: anything, conflicts: anything },
+    lookUp: { intake: anything, facts: anything, lessons: anything, embed: async () => [] },
   });
 }
 

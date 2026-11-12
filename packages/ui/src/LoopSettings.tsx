@@ -96,7 +96,8 @@ export function LoopSettings() {
                 <Select aria-label={`${typeLabel(t.type)} mode`} size="sm" value={draft.types[t.type].mode} disabled={lock} title={lockTitle} onChange={(e) => setType(t.type, { mode: e.target.value as LoopMode | '' })}>
                   <option value="">global ({modeUnderGlobal(draft.mode, state, t)})</option>
                   {draft.types[t.type].mode && !knownMode(draft.types[t.type].mode) && <option value={draft.types[t.type].mode} disabled>{modeLabel(draft.types[t.type].mode)}</option>}
-                  {LOOP_MODES.map((m) => <option key={m} value={m}>{m}</option>)}
+                  {/* A tier P type is always a proposal: auto is not offered (the API refuses it), unless an older setting holds it. */}
+                  {LOOP_MODES.filter((m) => m !== 'auto' || t.tier !== 'P' || draft.types[t.type].mode === 'auto').map((m) => <option key={m} value={m}>{m}</option>)}
                 </Select>
                 {t.breaker.tripped && <span className="text-[11px] whitespace-normal text-bad-text">The breaker set it to propose; choose auto to turn it back on.</span>}
               </div>

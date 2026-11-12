@@ -1,4 +1,4 @@
-import { CascadeBlockedError, DecisionStateError, LESSON_SIGNAL_COUNTS, LOOP_SETTINGS_CURSOR, TargetChangedError, UnsupportedTargetError, writeLoopRound, type Decision, type LoopRound, type OperatorVerb } from '@fb/core';
+import { CascadeBlockedError, DecisionStateError, LESSON_SIGNAL_COUNTS, LOOP_DECISION_TYPES, LOOP_SETTINGS_CURSOR, TargetChangedError, UnsupportedTargetError, writeLoopRound, type Decision, type LoopRound, type OperatorVerb } from '@fb/core';
 import { describe, expect, test } from 'vitest';
 import { createApp, type ApiRepo, type AppOpts } from './app.ts';
 import { decisionWire, lessonRepeats, noteWire, summaryOf } from './decisions.ts';
@@ -571,7 +571,7 @@ describe('GET /api/loop', () => {
       rollbackRate: { rolledBack: 1, of: 1 },
       round, holdout: null,
     });
-    expect(s.types.map((t: { type: string }) => t.type)).toHaveLength(11);
+    expect(s.types.map((t: { type: string }) => t.type)).toEqual([...LOOP_DECISION_TYPES]);
     const retire = s.types.find((t: { type: string }) => t.type === 'retire_lesson');
     expect(retire).toMatchObject({ tier: 'H', mode: null, effectiveMode: 'auto', tau: 0.5, tauDefault: 0.5, rollbackRate: { rolledBack: 1, of: 2 }, breaker: { tripped: false, at: null, reason: null } });
     expect(retire.bands).toHaveLength(5);
@@ -617,8 +617,8 @@ describe('GET /api/loop', () => {
     expect(small.views).toBe(1);
     expect(big.views).toBe(1);
     expect(big.calls).toBe(small.calls);
-    // A type's last few applied (11 lists), never a page of the log.
-    expect(big.listed).toBe(11);
+    // A type's last few applied (one list a type), never a page of the log.
+    expect(big.listed).toBe(LOOP_DECISION_TYPES.length);
     // Half of each status is in the hidden project.
     expect(big.counts).toEqual({ proposed: 500, week: { observed: 500, proposed: 1500, applied: 1000, rolledBack: 500 } });
     expect(big.rate).toEqual({ rolledBack: 500, of: 1000 });
@@ -654,6 +654,21 @@ describe('PUT /api/loop/settings, POST /api/loop/pause | resume', () => {
     }
     expect(await (await post(app, '/api/loop/settings', { types: { approve_lesson: { tau: 0.5 } } }, owner, 'PUT')).json()).toEqual({ error: 'approve_lesson: tau must be from 0.9 (its default) to 1' });
     expect((await app.request('/api/loop/settings', { method: 'PUT', headers: { 'content-type': 'application/json', ...owner }, body: 'x' })).status).toBe(400);
+  });
+
+  test('a tier P type (always a proposal: a conflict\'s resolution, a question assigned or closed) refuses auto; observe and propose are kept', async () => {
+    const { app, entries } = setup();
+    for (const type of ['propose_resolution', 'assign_question', 'close_question', 'tune_threshold']) {
+      const res = await post(app, '/api/loop/settings', { types: { [type]: { mode: 'auto' } } }, owner, 'PUT');
+      expect(res.status, type).toBe(400);
+      expect((await res.json()).error).toBe(`${type} is always a proposal (tier P): it cannot apply on its own; set observe, propose or off`);
+    }
+    expect(entries).toEqual([]);
+    const ok = await (await post(app, '/api/loop/settings', { types: { propose_resolution: { mode: 'propose' }, accept_claim: { mode: 'auto', tau: 0.95 } } }, owner, 'PUT')).json();
+    expect(ok.types.find((t: { type: string }) => t.type === 'propose_resolution')).toMatchObject({ mode: 'propose', tier: 'P' });
+    expect(ok.types.find((t: { type: string }) => t.type === 'accept_claim')).toMatchObject({ mode: 'auto', tau: 0.95, tier: 'A' });
+    // accept_claim's bar is 0.92: it cannot be lowered.
+    expect((await post(app, '/api/loop/settings', { types: { accept_claim: { tau: 0.9 } } }, owner, 'PUT')).status).toBe(400);
   });
 
   test('pause stops it at once (logged loop_paused), resume starts it again; a repeat changes nothing; refused while LOOP_DISABLED', async () => {
@@ -904,4 +919,46 @@ describe('GET /api/lessons with the loop', () => {
     const plain = await (await createApp(repo, { knowledge: knowledge as never }).request('/api/lessons?status=approved')).json() as object[];
     expect(plain.some((l) => 'changedByLoop' in l)).toBe(false);
   });
+});
+
+describe('never merge: /api/distinct-pairs and a merge rolled back', () => {
+  const merge = decision('dec:m', {
+    type: 'merge_duplicates', status: 'applied',
+    targets: [{ kind: 'lesson', id: 'lesson:keep', role: 'keeper' }, { kind: 'lesson', id: 'lesson:dup', role: 'merged' }],
+  });
+  const op = { authorization: `Bearer ${OP}`, 'x-fg-operator': 'agent' };
+
+  test('rolling back a merge records the pair as never to be merged, with the decision and your note', async () => {
+    const { app } = setup({ decisions: [merge] });
+    expect((await post(app, '/api/decisions/dec:m/rollback', { expect: 'applied', note: 'two different gateways' })).status).toBe(200);
+    expect(await (await get(app, '/api/distinct-pairs?ids=lesson:dup')).json()).toEqual([
+      expect.objectContaining({ a: 'lesson:dup', b: 'lesson:keep', by: 'you', decisionId: 'dec:m', reason: 'you rolled back the merge: two different gateways' }),
+    ]);
+  });
+
+  test('marking a pair is an owner route (loop_decide for the operator token); lifting one is yours alone', async () => {
+    const { app } = setup();
+    expect((await post(app, '/api/distinct-pairs', { a: 'lesson:a', b: 'lesson:a' })).status).toBe(400);
+    expect((await post(app, '/api/distinct-pairs', { a: 'lesson:a', b: 'lesson:b' }, reader)).status).toBe(403);
+    expect((await post(app, '/api/distinct-pairs', { a: 'lesson:a', b: 'lesson:b' }, op)).status).toBe(201);
+    expect(await (await post(app, '/api/distinct-pairs', { a: 'lesson:b', b: 'lesson:a', reason: 'again' })).json()).toMatchObject({ created: false });
+    expect((await post(app, '/api/distinct-pairs', { a: 'lesson:a', b: 'lesson:b' }, op, 'DELETE')).status).toBe(403);
+    expect((await post(app, '/api/distinct-pairs', { a: 'lesson:a', b: 'lesson:b' }, owner, 'DELETE')).status).toBe(204);
+    expect((await post(app, '/api/distinct-pairs', { a: 'lesson:a', b: 'lesson:b' }, owner, 'DELETE')).status).toBe(404);
+    expect(await (await get(app, '/api/distinct-pairs?ids=lesson:a')).json()).toEqual([]);
+    expect((await get(app, '/api/distinct-pairs')).status).toBe(400);
+  });
+});
+
+test('a proposed decision says why it needs you, in one line; a decided one does not', async () => {
+  const { app } = setup({ decisions: [
+    decision('dec:p', { status: 'proposed', tier: 'P', type: 'triage_inbox' }),
+    decision('dec:q', { status: 'proposed', rationale: 'Retire it. Proposed rather than applied: you changed lesson:1 in the last 14 days.' }),
+    decision('dec:a', { status: 'applied' }),
+  ] });
+  const rows = await (await get(app, '/api/decisions?status=proposed')).json();
+  expect(Object.fromEntries(rows.map((r: { id: string; needsYou?: string }) => [r.id, r.needsYou]))).toEqual({
+    'dec:p': 'always your call: the loop only proposes this kind of change', 'dec:q': 'you changed lesson:1 in the last 14 days',
+  });
+  expect((await (await get(app, '/api/decisions/dec:a')).json()).decision?.needsYou ?? (await (await get(app, '/api/decisions/dec:a')).json()).needsYou).toBeUndefined();
 });

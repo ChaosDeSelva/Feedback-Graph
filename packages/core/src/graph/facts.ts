@@ -2,7 +2,7 @@ import { conditionalWrite } from './conditionalWrite.ts';
 import { archiveRunFileSelector, archiveBeforeRedaction, archiveRedactionInput } from '../redactionArchive.ts';
 import { randomUUID } from 'node:crypto';
 import neo4j from 'neo4j-driver';
-import { FACT_EVIDENCE, FACT_ORIGINS, FACT_ORIGINS_KEPT, type CodeFact, type FactEvidence, type FactKind, type FactOrigin, type OwnFactOrigin, type Project, type ProjectSummary, type RelevanceBy, type ScanJob, type ScanQueueEntry, type ScanShards, type ScanStatus, type RunTag, type ProjectThresholds } from '../types.ts';
+import { FACT_EVIDENCE, FACT_ORIGINS, FACT_ORIGINS_KEPT, type CodeFact, type FactEvidence, type FactKind, type FactOrigin, type LessonStatus, type OwnFactOrigin, type Project, type ProjectSummary, type RelevanceBy, type ScanJob, type ScanQueueEntry, type ScanShards, type ScanStatus, type RunTag, type ProjectThresholds } from '../types.ts';
 import { factOrigin } from '../relevance.ts';
 import { factFingerprint, factStateFingerprint, TargetChangedError, type FactSnapshotWrite, type FingerprintedFact } from '../decisions/record.ts';
 import { thresholdsSnapshot } from '../loop/snapshots.ts';
@@ -594,6 +594,9 @@ export class FactsRepo implements FactsStore {
   }
 
   async listProjects(): Promise<ProjectSummary[]> {
+    const byStatus = (xs: LessonStatus[]) => xs.reduce<Partial<Record<LessonStatus, number>>>((m, x) => ({ ...m, [x]: (m[x] ?? 0) + 1 }), {});
+    const [g] = await this.g.run('MATCH (l:Lesson) WHERE l.projectKey IS NULL AND NOT coalesce(l.sandbox, false) RETURN count(l) AS n');
+    const globalLessons = Number(g.get('n'));
     const rows = await this.g.run(
       `MATCH (p:Project)
        OPTIONAL MATCH (p)<-[:IN]-(s:Session)
@@ -602,7 +605,7 @@ export class FactsRepo implements FactsStore {
        OPTIONAL MATCH (f:Feedback {projectKey: p.key}) WHERE NOT EXISTS { MATCH (k:Candidate {id: f.id}) WHERE k.sandbox = true }
        WITH p, sessions, count(f) AS feedback
        OPTIONAL MATCH (l:Lesson {projectKey: p.key}) WHERE NOT coalesce(l.sandbox, false)
-       WITH p, sessions, feedback, count(l) AS lessons
+       WITH p, sessions, feedback, collect(l.status) AS lessons
        OPTIONAL MATCH (x:Fact {projectKey: p.key, current: true}) WHERE NOT coalesce(x.sandbox, false)
        WITH p, sessions, feedback, lessons, count(x) AS facts,
             count(CASE WHEN x.docId IS NOT NULL THEN 1 END) AS documentFacts,
@@ -624,7 +627,9 @@ export class FactsRepo implements FactsStore {
       aliases: r.get('p').properties.aliases ?? [],
       sessions: r.get('sessions'),
       feedback: r.get('feedback'),
-      lessons: r.get('lessons'),
+      lessons: (r.get('lessons') as string[]).length,
+      lessonsByStatus: byStatus(r.get('lessons') as LessonStatus[]),
+      globalLessons,
       facts: r.get('facts'),
       factsByOrigin: {
         model: r.get('facts') - r.get('documentFacts') - r.get('manifestFacts') - r.get('yourFacts') - r.get('loopFacts') - r.get('claimFacts'),

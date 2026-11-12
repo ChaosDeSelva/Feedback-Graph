@@ -1,6 +1,6 @@
 import { expect, test } from 'vitest';
 import type { Lesson, LessonSignals } from '@fb/core';
-import { lessonNeverTarget, missNeverTarget, ownerTouchedRecently } from './guards.ts';
+import { applyTimeVeto, claimNeverTarget, lessonNeverTarget, missNeverTarget, ownerTouchedRecently } from './guards.ts';
 import { loopMiss } from '../testing/context.ts';
 
 const lesson = (o: Partial<Lesson> = {}): Lesson => ({
@@ -33,4 +33,18 @@ test('owner touched within 14 days', () => {
   expect(ownerTouchedRecently(s(null), now)).toBe(false);
   expect(ownerTouchedRecently(s('2026-11-02T00:00:00Z'), now)).toBe(true);
   expect(ownerTouchedRecently(s('2026-11-01T00:00:00Z'), now)).toBe(false);
+});
+
+test('claims the loop never changes: a run\'s, your answer, an agent\'s notes, a loose quote, a statement that adds to its quote', async () => {
+  const c = { run: null, sandbox: false, docId: 'doc:shop:intake:call', flags: [] as ('quote-fuzzy' | 'statement-adds')[] };
+  expect(claimNeverTarget(c, { origin: 'weekly sync' })).toBeNull();
+  expect(claimNeverTarget(c, null)).toBeNull();
+  expect(claimNeverTarget({ ...c, run: 'r1' }, null)).toBe('made in a run');
+  expect(claimNeverTarget({ ...c, docId: 'answer:question:1' }, null)).toBe('your answer to a question');
+  expect(claimNeverTarget(c, { origin: 'agent:codex' })).toBe('from notes an agent submitted');
+  expect(claimNeverTarget({ ...c, flags: ['quote-fuzzy'] }, null)).toBe('its quote matched the source only loosely');
+  expect(claimNeverTarget({ ...c, flags: ['statement-adds'] }, null)).toBe('its statement adds to what was said');
+  // At apply time too: a claim from an agent's notes is vetoed, so the call is only proposed.
+  const store = { intake: { claim: async () => ({ ...c, id: 'claim:1' }), metas: async () => [{ origin: 'agent:codex' }] } } as never;
+  expect(await applyTimeVeto(store, [{ kind: 'claim', id: 'claim:1', role: 'primary' }], 0)).toBe('claim:1: from notes an agent submitted');
 });

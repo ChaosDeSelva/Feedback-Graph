@@ -3,7 +3,7 @@ import neo4j from 'neo4j-driver';
 import { instantText, prepareDecision, prepareNote, prepareRollback, prepareSnapshots, redactStoredDecision, type CalibrationBump, type DecisionCount, type DecisionCountFilter, type DecisionCountKey, type DecisionFilter, type DecisionNoteInput, type DecisionStatusPatch, type MissLink } from '../decisions/record.ts';
 import { REDACT_PAGE, redactSecrets } from '../redact.ts';
 import type { DecisionsStore, LoopMiss } from '../store.ts';
-import type { CalibrationBucket, Decision, DecisionInput, DecisionNote, DecisionType, LessonSignals, TargetSnapshot } from '../types.ts';
+import { distinctKey, type CalibrationBucket, type Decision, type DecisionInput, type DecisionNote, type DecisionType, type DistinctPair, type LessonSignals, type TargetSnapshot } from '../types.ts';
 import { retryDeadlock, type GraphRepo } from './repo.ts';
 
 /**
@@ -307,6 +307,34 @@ export class DecisionsRepo implements DecisionsStore {
   async unlinkMisses(link: Pick<MissLink, 'from' | 'to'>): Promise<boolean> {
     const [r] = await this.g.run('MATCH (:Miss {id: $from})-[r:REPEATS]->(:Miss {id: $to}) DELETE r RETURN count(r) AS n', link);
     return r.get('n') > 0;
+  }
+
+  async markDistinct(p: Omit<DistinctPair, 'at'>): Promise<boolean> {
+    const [a, b] = distinctKey(p.a, p.b);
+    const [r] = await this.g.run(
+      `MERGE (d:DistinctPair {key: $key}) ON CREATE SET d.a = $a, d.b = $b, d.by = $by, d.at = $now, d.reason = $reason, d.decisionId = $decisionId, d._fresh = true
+       WITH d, d._fresh IS NOT NULL AS created REMOVE d._fresh RETURN created`,
+      { key: `${a}|${b}`, a, b, by: p.by, reason: p.reason, decisionId: p.decisionId, now: new Date().toISOString() },
+    );
+    return r?.get('created') === true;
+  }
+
+  async liftDistinct(x: string, y: string): Promise<boolean> {
+    const [a, b] = distinctKey(x, y);
+    const [r] = await this.g.run('MATCH (d:DistinctPair {key: $key}) DELETE d RETURN count(*) AS n', { key: `${a}|${b}` });
+    return Number(r?.get('n') ?? 0) > 0;
+  }
+
+  async distinctPairs(ids: string[]): Promise<DistinctPair[]> {
+    if (!ids.length) return [];
+    const rows = await this.g.run(
+      'MATCH (d:DistinctPair) WHERE d.a IN $ids OR d.b IN $ids RETURN d ORDER BY d.at, d.key',
+      { ids: [...new Set(ids)] },
+    );
+    return rows.map((r) => {
+      const d = r.get('d').properties;
+      return { a: d.a, b: d.b, by: d.by, at: d.at, reason: d.reason, decisionId: d.decisionId ?? null };
+    });
   }
 
   async missLinks(missId: string): Promise<MissLink[]> {

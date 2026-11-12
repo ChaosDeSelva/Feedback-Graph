@@ -7,6 +7,7 @@ import {
   type ChatPack, type ChatSource, type ChatStore, type ChatTurn, type CodeGraphStore, type CodeMapHit, type ShownProjects,
 } from '@fb/core';
 import { getTaskContext, resolveProject, taskFiles, type ContextDeps, type TaskContext } from './context.ts';
+import { knowledgePackLines, type KnowledgeDeps } from './knowledge.ts';
 import { currentRun, mayChange } from './operator.ts';
 import { runScoped } from './runs.ts';
 
@@ -27,6 +28,8 @@ const DOC_CHARS = 600;
 const SESSION_CHARS = 300;
 /** Files a miss's session edited named in the pack. */
 const MISS_FILES = 3;
+/** Mapped files of a named folder its lessons' path triggers are tried on. */
+const FOLDER_FILES = 200;
 
 export type ChatContextDeps = {
   /** The same deps the MCP tools use: the search runs as get_task_context with client 'ui-chat'. */
@@ -35,6 +38,8 @@ export type ChatContextDeps = {
   codeMap?: CodeGraphStore['codeMap'];
   /** The files a session touched (CodeGraphStore.sessionFiles): a miss is cited by the files its session edited. */
   sessionFiles?: CodeGraphStore['sessionFiles'];
+  /** Knowledge intake's look-up (INTAKE_ENABLED): what people said on the question, its open questions and conflicts. */
+  knowledge?: KnowledgeDeps;
 };
 
 /**
@@ -111,7 +116,11 @@ export async function buildChatContext(projectKey: string, question: string, his
   const hits = map ? findInCodeMap(map, codeTerms(task), { limit: CODE_HITS, maxUsages: HIT_USAGES, paths: exact }) : [];
   // Only mapped files are evidence of a real repo path; arbitrary prompt fragments must not enter Activity.
   const namedFiles = map ? [...new Set(exact)] : [];
-  const found = await getTaskContext({ project: projectKey, task, files: namedFiles, trustedFilesOnly: true, client: 'ui-chat' }, d.context).catch((err) => {
+  // A folder the question names (deploy/terraform) fires the path triggers its mapped files would.
+  const folders = map ? named.filter((p) => p.includes('/') && !exact.includes(p)).map((p) => `${p.replace(/\/+$/, '')}/`) : [];
+  const triggerFiles = folders.length ? map!.files.filter((f) => folders.some((p) => f.path.startsWith(p))).slice(0, FOLDER_FILES).map((f) => f.path) : [];
+  // Ask answers questions, not changes: the lessons closest by meaning join the tied and triggered ones, as search_graph serves them.
+  const found = await getTaskContext({ project: projectKey, task, files: namedFiles, trustedFilesOnly: true, byMeaning: true, triggerFiles, client: 'ui-chat' }, d.context).catch((err) => {
     searchFailed = redactSecrets(err instanceof Error ? err.message : String(err)).slice(0, 200);
     return EMPTY;
   });
@@ -224,6 +233,9 @@ export async function buildChatContext(projectKey: string, question: string, his
       for (const { fact: f } of x.facts) out.push(`  - fact: ${code(f.lines ? `${f.path}:${f.lines}` : f.path)} (${f.kind}): ${oneLine(f.statement, 300)}`);
       for (const h of x.docs) out.push(`  - document ${oneLine(h.title)} (${oneLine(h.ref)}):`, fenced('document', h.title, h.text.slice(0, DOC_CHARS)));
     }
+  }
+  if (d.knowledge && !searchFailed && found.project) {
+    out.push(...await knowledgePackLines(projectKey, task, d.knowledge, (kind, ref, title) => src.add(kind, ref, title)).catch(() => ['', 'Note: what people said (claims, open questions, conflicts) could not be searched.']));
   }
   if (!src.list.length) out.push('', 'Nothing in Feedback Graph matched this question: say so, and say what would help (a scan of the project, documents, approved lessons).');
   return { context: out.join('\n'), sources: src.list };

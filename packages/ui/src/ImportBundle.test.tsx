@@ -84,6 +84,13 @@ test('revoked lessons and projects whose facts were kept are named in the summar
   expect(await screen.findByText(/1 approved, 2 proposed, 2 revoked\).*Facts kept for shop, api \(already scanned\)\./)).toBeTruthy();
 });
 
+test('claims and settled conflicts from knowledge intake are counted in the summary', async () => {
+  reply = () => Response.json({ ...result, claims: { added: 3, facts: 1, existing: 2, skipped: 0 }, conflicts: { added: 1, existing: 0, skipped: 0 }, people: { added: 1, matched: 1 } });
+  render(<ImportBundle />);
+  pick(JSON.stringify(bundle));
+  expect(await screen.findByText(/3 claims \(1 given to agents as facts\) and 1 settled conflict from knowledge intake\. 2 claims already here, left alone\./)).toBeTruthy();
+});
+
 test('closing the file picker without a file imports nothing', () => {
   render(<ImportBundle />);
   fireEvent.change(screen.getByLabelText('import bundle file'), { target: { files: [] } });

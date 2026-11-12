@@ -74,7 +74,7 @@ export function Dashboard({ retryMs }: { retryMs?: number } = {}) {
           {[...shared].map((e) => <Alert key={e}>{e}</Alert>)}
           <SharedOutage.Provider value={shared}>
             <GettingStarted status={status.data} pipeline={pipeline.data} />
-            <Ask projects={projects.data} hotspots={hotspots.data} />
+            <Ask projects={projects.data} hotspots={hotspots.data} intake={!!status.data?.intake?.enabled} />
             <Now load={status} />
             <Pipeline load={pipeline} />
             <Contained render={loopCard} />
@@ -410,6 +410,8 @@ const STARTERS = [
   'What do agents keep getting wrong in this project?',
   'Which files are riskiest to change, and why?',
 ];
+/** With knowledge intake on: the look-up starter, finished by you (what it is about). */
+export const KNOW_STARTER = 'What do we know about …?';
 const RECENT_CHATS = 5;
 const SUGGESTED = 3;
 
@@ -432,7 +434,7 @@ export function PathLine({ path }: { path: string }) {
  * The page's first thing: one question box. Pick a project, type, press Enter: it opens a new chat on the Ask page
  * (`#ask/new?project=…&q=…`), which starts it. Under it, questions suggested by the hotspots and the latest chats.
  */
-function Ask({ projects, hotspots }: { projects: ProjectSummary[] | null; hotspots: ProjectHotspot[] | null }) {
+function Ask({ projects, hotspots, intake = false }: { projects: ProjectSummary[] | null; hotspots: ProjectHotspot[] | null; intake?: boolean }) {
   const [project, setProject] = useState('');
   const [text, setText] = useState('');
   // The model to answer with, as on the Ask page; null: the default model.
@@ -488,12 +490,17 @@ function Ask({ projects, hotspots }: { projects: ProjectSummary[] | null; hotspo
       </form>
       {/* One row, as wide as the box: each starter truncates (its full text is the title and the name); a phone scrolls it. */}
       <ScrollArea role="group" aria-label="starter questions" className="-m-1 flex w-[calc(100%+0.5rem)] gap-2 overflow-x-auto p-1">
-        {STARTERS.map((q) => (
+        {(intake ? [KNOW_STARTER, ...STARTERS] : STARTERS).map((q) => (
           <button
             key={q}
             type="button"
             aria-label={q}
-            onClick={() => { setText(q); box.current?.focus(); }}
+            onClick={() => {
+              // The look-up starter leaves the caret where the topic goes.
+              const t = q === KNOW_STARTER ? 'What do we know about ' : q;
+              setText(t);
+              box.current?.focus();
+            }}
             disabled={!writes}
             title={writes ? q : READ_ONLY_TITLE}
             className="min-w-[12rem] flex-1 basis-0 truncate rounded-md border border-line bg-surface px-2.5 py-1.5 text-left text-[12.5px] shadow-card transition-colors enabled:hover:border-line-strong enabled:hover:bg-hover disabled:cursor-not-allowed disabled:opacity-60 sm:min-w-0"

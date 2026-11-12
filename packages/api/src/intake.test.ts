@@ -49,7 +49,7 @@ function setup(o: { intake?: boolean; archive?: boolean; claims?: Partial<Claim>
         store: {
           upsertMeta: async (m) => { metas.set(m.docId, m); return docs.has(m.docId); },
           metas: async (ids) => ids.flatMap((id): IntakeMeta[] => (metas.has(id) ? [{ ...metas.get(id)!, windowsDone: 0, windowsTotal: null }] : [])),
-          removeSource: async (id) => { calls.push(`removeSource ${id}`); metas.delete(id); return { claim: 2, question: 1 }; },
+          removeSource: async (id) => { calls.push(`removeSource ${id}`); metas.delete(id); return { claim: 2, question: 1, people: 0 }; },
           resolveAlias: async (name, opt) => {
             const created = !people.has(name);
             if (created && !opt?.create) return null;
@@ -190,7 +190,7 @@ test('removing a source keeps accepted facts by default, and is not a plain docu
   expect((await withFact.app.request(`/api/docs/${encodeURIComponent(id)}`, send('DELETE'))).status).toBe(409);
   const res = await withFact.app.request(path, send('DELETE'));
   expect(res.status).toBe(200);
-  expect(await res.json()).toEqual({ removed: { claim: 2, question: 1, facts: 0, keep: 'facts' }, decision: null });
+  expect(await res.json()).toEqual({ removed: { claim: 2, question: 1, people: 0, facts: 0, keep: 'facts' }, decision: null });
   expect(withFact.calls).toEqual([`deleteDoc ${id}`, `removeSource ${id}`]);
   expect(withFact.recorded.at(-1)).toMatchObject({ kind: 'doc_removed', targets: [id] });
   expect((await withFact.app.request(path, send('DELETE'))).status).toBe(404);

@@ -3,8 +3,8 @@ import neo4j from 'neo4j-driver';
 import { TargetChangedError } from '../decisions/record.ts';
 import {
   AliasTakenError, aliasNorm, answerClaimIdOf, answerSourceOf, addedQuestionIdOf, claimFingerprint, claimIdOf, cleanClaimDraft, cleanConflictInput,
-  cleanQuestionDraft, cleanResolution, conflictFingerprint, conflictIdOf, FORGOTTEN_NAME, questionIdOf,
-  type AnswerInput, type ClaimFilter, type ClaimHit, type ClaimPatch, type ClaimSearch, type ConflictFilter, type IntakeRedacted, type IntakeRemoved, type IntakeRunItem,
+  cleanQuestionDraft, cleanResolution, conflictFingerprint, conflictIdOf, FORGOTTEN_NAME, questionIdOf, REMOVED_CLAIM,
+  type AnswerInput, type ImportedClaim, type ClaimFilter, type ClaimHit, type ClaimPatch, type ClaimSearch, type ConflictFilter, type IntakeRedacted, type IntakeRemoved, type IntakeRunItem,
   type IntakeSnapshotWrite, type PersonPatch, type QuestionFilter, type QuestionPatch, type WindowSave,
 } from '../intake/records.ts';
 import { archiveBeforeRedaction } from '../redactionArchive.ts';
@@ -121,6 +121,18 @@ async function relinkConflict(query: Query, c: ConflictInput, id: string) {
   }
 }
 
+/**
+ * Delete these claims whatever their status, with what names them: their links, supersessions and the conflicts they
+ * are a side of (the judge quoted them), and their text in Activity (a claim_decided subject quotes the statement).
+ */
+async function deleteClaimsIn(query: Query, ids: string[]): Promise<number> {
+  if (!ids.length) return 0;
+  await query('MATCH (c:Conflict)-[:SIDE]->(x:Claim) WHERE x.id IN $ids DETACH DELETE c', { ids });
+  await query(`MATCH (x:Activity {kind: 'claim_decided'}) WHERE any(t IN coalesce(x.targets, []) WHERE t IN $ids) SET x.subject = $removed`, { ids, removed: REMOVED_CLAIM });
+  const [r] = await query('MATCH (x:Claim) WHERE x.id IN $ids DETACH DELETE x RETURN count(*) AS n', { ids });
+  return Number(r.get('n'));
+}
+
 const PERSON_RETURN = `OPTIONAL MATCH (p)-[:ALIAS]->(a:PersonAlias)
   WITH p, collect(a.norm) AS aliases
   RETURN p, aliases, COUNT { (p)-[:SAID]->(:Claim) } AS claims`;
@@ -235,17 +247,36 @@ export class IntakeRepo implements IntakeStore {
     }, (ok) => ok);
   }
 
-  async removeSource(docId: string, o: { keep?: string[] } = {}): Promise<{ claim: number; question: number }> {
+  async removeSource(docId: string, o: { everything?: boolean; people?: string[] } = {}): Promise<{ claim: number; question: number; people: number }> {
     return this.write(async (query) => {
-      const [c] = await query(`MATCH (x:Claim {docId: $docId}) WHERE x.status IN $undecided AND NOT x.id IN $keep DETACH DELETE x RETURN count(*) AS n`, { docId, undecided: UNDECIDED, keep: o.keep ?? [] });
+      // Everything: every claim whatever its status, and the proposed people nothing else names, found before their ties go.
+      const [p] = o.everything
+        ? await query(`OPTIONAL MATCH (p:Person) WHERE (p)-[:ATTENDED]->(:Doc {id: $docId}) OR (p)-[:SAID]->(:Claim {docId: $docId}) RETURN collect(DISTINCT p.id) AS ids`, { docId })
+        : [];
+      const [ids] = await query('MATCH (x:Claim {docId: $docId}) WHERE $everything OR x.status IN $undecided RETURN collect(x.id) AS ids', { docId, everything: !!o.everything, undecided: UNDECIDED });
+      const claim = await deleteClaimsIn(query, ids.get('ids') as string[]);
       const [q] = await query(`MATCH (x:Question {docId: $docId}) DETACH DELETE x RETURN count(*) AS n`, { docId });
       await query(
         `MATCH (d:Doc {id: $docId}) OPTIONAL MATCH (:Person)-[r:ATTENDED]->(d) DELETE r
          WITH DISTINCT d REMOVE d.intakeKind, d.intakeFormat, d.occurredAt, d.origin, d.private, d.windowsDone, d.windowsTotal, d.windowsVersion`,
         { docId },
       );
-      return { claim: Number(c.get('n')), question: Number(q.get('n')) };
+      const [gone] = p
+        ? await query(
+          `UNWIND $ids AS id MATCH (p:Person {id: id})
+           WHERE p.status = 'proposed' AND coalesce(p.isOwner, false) = false
+             AND NOT (p)-[:ATTENDED]->() AND NOT (p)-[:SAID]->() AND NOT ()-[:ASKED_BY|ASSIGNED_TO]->(p)
+           OPTIONAL MATCH (p)-[:ALIAS]->(a:PersonAlias) DETACH DELETE a
+           WITH DISTINCT p DETACH DELETE p RETURN count(*) AS n`,
+          { ids: [...new Set([...(p.get('ids') as string[]), ...(o.people ?? [])])] },
+        )
+        : [];
+      return { claim, question: Number(q.get('n')), people: gone ? Number(gone.get('n')) : 0 };
     });
+  }
+
+  async deleteClaims(ids: string[]): Promise<number> {
+    return this.write((query) => deleteClaimsIn(query, ids), (n) => n > 0);
   }
 
   async listClaims(f: ClaimFilter = {}): Promise<Claim[]> {
@@ -313,6 +344,39 @@ export class IntakeRepo implements IntakeStore {
         if (r?.get('fresh')) added++;
       }
       return added;
+    }, (n) => n > 0);
+  }
+
+  async importClaims(claims: ImportedClaim[]): Promise<string[]> {
+    if (!claims.length) return [];
+    return this.write(async (query) => {
+      const added: string[] = [];
+      for (const c of claims) {
+        const draft = cleanClaimDraft({ ...c, span: null, flags: [] });
+        const props = { ...claimProps(draft), projectKey: c.projectKey, docId: c.docId, window: null, status: c.status, decidedBy: c.decidedBy, decidedAt: c.decidedAt, factId: c.factId, run: null, sandbox: false };
+        const [r] = await query(
+          'MERGE (c:Claim {id: $id}) ON CREATE SET c += $props, c.createdAt = $now, c._fresh = true WITH c, c._fresh IS NOT NULL AS fresh REMOVE c._fresh RETURN fresh',
+          { id: c.id, props, now: new Date().toISOString() },
+        );
+        if (r?.get('fresh')) added.push(c.id);
+      }
+      await relinkClaims(query, added);
+      return added;
+    }, (ids) => ids.length > 0);
+  }
+
+  async removeLinks(links: ClaimLink[]): Promise<number> {
+    if (!links.length) return 0;
+    return this.write(async (query) => {
+      let removed = 0;
+      for (const l of links) {
+        const [r] = await query(
+          `MATCH (a:Claim {id: $from})-[r:${REL[l.rel]}]->(b:${LABEL[l.to.kind]} {id: $to}) DELETE r RETURN count(*) AS n`,
+          { from: l.from, to: l.to.id },
+        );
+        removed += Number(r?.get('n') ?? 0);
+      }
+      return removed;
     }, (n) => n > 0);
   }
 
@@ -481,6 +545,7 @@ export class IntakeRepo implements IntakeStore {
       const set: Props = { decidedBy: by, decidedAt: new Date().toISOString() };
       if (patch.status !== undefined) set.status = patch.status;
       if (patch.assignee !== undefined) set.assignee = patch.assignee;
+      if (patch.answerClaimId !== undefined) set.answerClaimId = patch.answerClaimId;
       const [r] = await query('MATCH (x:Question {id: $id}) SET x += $set RETURN x.id AS id', { id, set });
       if (!r) return false;
       await relinkQuestions(query, [id]);

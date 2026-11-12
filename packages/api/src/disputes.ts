@@ -19,6 +19,8 @@ export type IntakeContext = {
   lesson: (id: string) => Promise<Pick<Lesson, 'id' | 'rule' | 'status'> | null>;
   /** submit_notes: store the notes as an intake source of the project (storeIntakeSource). Unset: the tool says intake is off. */
   submit?: (project: Project, notes: AgentNotes) => Promise<{ id: string; utterances: number }>;
+  /** what_do_we_know: the look-up's stores (knowledge.ts). Unset: the tool is not offered. */
+  knowledge?: import('./knowledge.ts').KnowledgeDeps;
 };
 
 /** The conflicts naming each record, open ones and those resolved as both partly. */

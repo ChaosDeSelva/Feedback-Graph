@@ -1,4 +1,4 @@
-import { isoWeek, type DecisionNoteReason, type RollbackOptions, type Activity, type ActivityInput, type CalibrationBucket, type Decision, type DecisionCount, type DecisionFilter, type DecisionNote, type LessonDetail, type LessonSignals, type LoopConfig, type TargetSnapshot } from '@fb/core';
+import { distinctKey, isoWeek, type DistinctPair, type DecisionNoteReason, type RollbackOptions, type Activity, type ActivityInput, type CalibrationBucket, type Decision, type DecisionCount, type DecisionFilter, type DecisionNote, type LessonDetail, type LessonSignals, type LoopConfig, type TargetSnapshot } from '@fb/core';
 import type { LoopDeps } from '../decisions.ts';
 
 /** In-memory learning loop stores for the API's tests: decisions, notes, cursors, Activity and an executor. */
@@ -27,6 +27,7 @@ export function decision(id: string, o: Partial<Decision> = {}): Decision {
 
 export function fakeLoop(o: { decisions?: Decision[]; config?: Partial<LoopConfig>; now?: number; exec?: boolean; lessons?: Record<string, LessonDetail['lesson']> } = {}) {
   const decisions = new Map((o.decisions ?? []).map((d) => [d.id, structuredClone(d)]));
+  const distinct: DistinctPair[] = [];
   const notes: DecisionNote[] = [];
   const cursors = new Map<string, string>();
   const entries: (Activity & { seq: number })[] = [];
@@ -126,6 +127,20 @@ export function fakeLoop(o: { decisions?: Decision[]; config?: Partial<LoopConfi
       },
     },
     decisions: {
+      markDistinct: async (p) => {
+        const [a, b] = distinctKey(p.a, p.b);
+        if (distinct.some((x) => x.a === a && x.b === b)) return false;
+        distinct.push({ ...p, a, b, at: new Date().toISOString() });
+        return true;
+      },
+      liftDistinct: async (x, y) => {
+        const [a, b] = distinctKey(x, y);
+        const i = distinct.findIndex((p) => p.a === a && p.b === b);
+        if (i < 0) return false;
+        distinct.splice(i, 1);
+        return true;
+      },
+      distinctPairs: async (ids) => distinct.filter((p) => ids.includes(p.a) || ids.includes(p.b)),
       get: async (id) => { check(); const d = decisions.get(id); return d ? structuredClone(d) : null; },
       list: (f) => list(f),
       count: async (f, by) => {

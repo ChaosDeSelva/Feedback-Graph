@@ -1,4 +1,4 @@
-import { archiveRedactionInput, authorizeStoreWrite } from '@fb/core';
+import { archiveRedactionInput, authorizeStoreWrite, intakeExport, type IntakeStore } from '@fb/core';
 import { LESSON_SHARING_NOTICE } from '@fb/core';
 import { CODE_MAP_LEASE_MS, OPERATOR_DEFAULT_VERBS, SCAN_PARK_GAVE_UP } from '@fb/core';
 import { guardApiStoreWrites, mcpDiscoveryOnly } from './storeWriteGuard.ts';
@@ -10,7 +10,7 @@ import { bodyLimit } from 'hono/body-limit';
 import { streamSSE } from 'hono/streaming';
 import { serveStatic } from '@hono/node-server/serve-static';
 import { z } from 'zod';
-import { ACTIVITY_KINDS, EVERYDAY_FROM, chunkText, mapCapped, MAX_AUTO_MAP_FILES, MODEL_JOBS, cleanLessonPath, lessonToFact, cmp, FACT_KINDS, LESSON_CHECKS, LESSON_FROM, redactSecrets, relevanceBand, selectionNote, type ActivityStore, type CodeGraphStore, type DocsStore, type FactsStore, type GraphStore, type InsightsStore, type ModelHealth, type ModelJob, type OllamaHealth, type PipelineStatus, type ProviderHealth, type KnowledgeStore, type Lesson, type LinksStore, IMAGE_MEDIA_TYPES, MAX_IMAGE_BYTES, LINK_RELATIONS, LINK_STATUSES, linkPair, linkEnds, docIdOf, NotTheRunsError, type PortabilityStore, type Project, type ProjectSelection, type RelevanceBy, type ProjectSummary, type ScanQueueEntry, type ShownProjects, type WorkQueue, type WorkQueues, type StoreKind, type SystemStatus, type WorkerStatus, type AgentSeen, type RunnerReadiness, DEMO_SOURCE, contextWhy, FACT_ORIGINS, SCANNER_VERSION, RUN_ID, type RunPrincipal, type RunsStore, LESSON_QUALITY_DAYS, lessonQualityReport, type LessonQualityReport, type Candidate } from '@fb/core';
+import { ACTIVITY_KINDS, capFixCommits, dependenciesOf, lessonSnapshot, LOOP_POLICY_VERSION, TargetChangedError, type Decision as LoopDecision, EVERYDAY_FROM, chunkText, mapCapped, MAX_AUTO_MAP_FILES, MODEL_JOBS, cleanLessonPath, pathMatches, lessonToFact, cmp, FACT_KINDS, LESSON_CHECKS, LESSON_FROM, redactSecrets, relevanceBand, selectionNote, type ActivityStore, type CodeGraphStore, type DocsStore, type FactsStore, type GraphStore, type InsightsStore, type ModelHealth, type ModelJob, type OllamaHealth, type PipelineStatus, type ProviderHealth, type KnowledgeStore, type Lesson, type LinksStore, IMAGE_MEDIA_TYPES, MAX_IMAGE_BYTES, LINK_RELATIONS, LINK_STATUSES, linkPair, linkEnds, docIdOf, NotTheRunsError, type PortabilityStore, type Project, type ProjectSelection, type RelevanceBy, type ProjectSummary, type ScanQueueEntry, type ShownProjects, type WorkQueue, type WorkQueues, type StoreKind, type SystemStatus, type WorkerStatus, type AgentSeen, type RunnerReadiness, DEMO_SOURCE, contextWhy, FACT_ORIGINS, SCANNER_VERSION, RUN_ID, type RunPrincipal, type RunsStore, LESSON_QUALITY_DAYS, lessonQualityReport, type LessonQualityReport, type Candidate } from '@fb/core';
 import { chatRoutes, type ChatRouteDeps } from './chat.ts';
 import { trackedProject, type ContextDeps } from './context.ts';
 import { authenticated, bearerToken, needsAuth, ownerSession, OwnerSessions, sessionValue, SECURITY_HEADERS, sessionCookie, SignInLinks, SIGNIN_LINK_TTL_MS, tokenMatches, type AuthOpts } from './auth.ts';
@@ -30,6 +30,7 @@ import { connectionsStatus, integrationRoutes, type IntegrationsDeps } from './i
 import { loopRoutes, ownerOverrides, type LoopDeps } from './decisions.ts';
 import { intakeRoutes, type IntakeRouteDeps } from './intake.ts';
 import { intakeReviewRoutes, type IntakeReviewDeps } from './intakeReview.ts';
+import { knowledgeRoutes, type KnowledgeDeps } from './knowledge.ts';
 
 export type { SettingsDeps } from './settings.ts';
 
@@ -125,7 +126,7 @@ export type AppOpts = {
   localPeer?: (address: string | undefined) => boolean;
   staticDir?: string;
   context?: ContextDeps;
-  knowledge?: Pick<KnowledgeStore, 'listLessons' | 'lessonDetail' | 'updateLesson' | 'postmortemBacklog' | 'postmortemQueue' | 'requestLessonRecheck' | 'decidedLessons'> & Partial<Pick<KnowledgeStore, 'retryPostmortem'>>;
+  knowledge?: Pick<KnowledgeStore, 'listLessons' | 'lessonDetail' | 'updateLesson' | 'postmortemBacklog' | 'postmortemQueue' | 'requestLessonRecheck' | 'decidedLessons'> & Partial<Pick<KnowledgeStore, 'retryPostmortem' | 'setLessonChecks'>>;
   embed?: (texts: string[]) => Promise<number[][]>;
   facts?: Pick<FactsStore, 'listProjects' | 'requestScan' | 'listFacts' | 'searchFacts'> & Partial<Pick<FactsStore, 'setFactRelevance' | 'setPinned' | 'cancelQueuedScan' | 'scanJob' | 'addOwnerFact' | 'olderScannerFiles' | 'scanQueue'>>;
   /** Folders under the configured roots that can be scanned. */
@@ -156,7 +157,7 @@ export type AppOpts = {
   /** The Settings page: which project folders are read. */
   settings?: SettingsDeps;
   /** The code map, for the Projects page (stats, hotspots, a file's module panel) and the Patterns page. */
-  codegraph?: Pick<CodeGraphStore, 'hotspots' | 'moduleContext' | 'impact' | 'codeMapMeta'> & Partial<Pick<CodeGraphStore, 'mapGraph' | 'requestCodeMapRebuild' | 'dropCodeMap'>>;
+  codegraph?: Pick<CodeGraphStore, 'hotspots' | 'moduleContext' | 'impact' | 'codeMapMeta'> & Partial<Pick<CodeGraphStore, 'mapGraph' | 'requestCodeMapRebuild' | 'dropCodeMap' | 'codeMap'>>;
   /** SCAN_MAX_FILES (null: the cap scales with the repo): how many hotspots one page may list, and whether a map is capped. */
   mapMaxFiles?: number | null;
   /** Feedback Graph Cloud sync: the Settings card and Sync now. */
@@ -193,6 +194,10 @@ export type AppOpts = {
    * unset, those routes are not there (404) and /api/status says intake is off.
    */
   intakeReview?: IntakeReviewDeps;
+  /** Knowledge intake in GET /api/export (intake/portable.ts) and POST /api/import. Set only while INTAKE_ENABLED is on. */
+  portableIntake?: Pick<IntakeStore, 'listClaims' | 'listConflicts' | 'person'>;
+  /** GET /api/knowledge (knowledge.ts), the owner's look-up. Set only while INTAKE_ENABLED is on. */
+  lookUp?: KnowledgeDeps;
 };
 
 /**
@@ -361,6 +366,9 @@ const LessonDecisions = z.object({
   }).strict()).min(1).max(500),
 }).strict();
 
+/** The lesson flags about its paths, which paths checked against the code map settle (needs a path, bad path dropped, ...). */
+const PATH_FLAGS = new Set<string>(['needs-path', 'bad-path', 'non-repo-path', 'path-missing', 'ambiguous-path']);
+
 const LessonPatch = z
   .object({
     status: z.enum(['approved', 'rejected', 'revoked', 'proposed']).optional(),
@@ -380,7 +388,11 @@ const LessonPatch = z
   .strict()
   .refine((p) => p.note === undefined || Object.keys(p).length > 1, { message: 'a note goes with a change: send it with the status or the edit it explains' });
 
-const ExportQuery = z.object({ project: z.string().min(1).max(200).optional(), approved: z.enum(['1', 'true']).optional() });
+const ExportQuery = z.object({
+  project: z.string().min(1).max(200).optional(), approved: z.enum(['1', 'true']).optional(),
+  /** With knowledge intake: each exported claim's quote too (never a source's text). */
+  quotes: z.enum(['1', 'true']).optional(),
+});
 
 /** For the OpenAPI document (openapi.ts). */
 export const appSchemas = {
@@ -623,9 +635,10 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
       if (origin !== undefined && !originAllowed(origin, c.req.header('host') ?? new URL(c.req.url).host)) {
         return c.json({ error: 'cross-origin write' }, 403);
       }
-      // A Streamable HTTP client ending its MCP session sends DELETE with no body; handleMcp answers it.
-      const mcpEnd = c.req.method === 'DELETE' && (c.req.path === '/mcp' || c.req.path === ADMIN_MCP);
-      if (!mcpEnd && !c.req.header('content-type')?.startsWith('application/json')) return c.json({ error: 'json required' }, 415);
+      // A Streamable HTTP client ending its MCP session sends DELETE with no body; handleMcp answers it. Signing out
+      // (DELETE /api/session) reads no body either, so a client need not send one or say it is JSON.
+      const bodiless = c.req.method === 'DELETE' && (c.req.path === '/mcp' || c.req.path === ADMIN_MCP || c.req.path === '/api/session');
+      if (!bodiless && !c.req.header('content-type')?.startsWith('application/json')) return c.json({ error: 'json required' }, 415);
     }
     // A run label (x-fg-run, and on the MCP endpoints ?run=): what the request writes records it (runs.ts).
     const mcp = c.req.path === '/mcp' || c.req.path === ADMIN_MCP;
@@ -1664,6 +1677,10 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
         const v = await view();
         bundle = await portability.exportData(v ? { projectKeys: v.keys, approvedOnly } : { approvedOnly });
       }
+      if (opts.portableIntake) {
+        const keys = q.data.project ? [q.data.project] : (await view())?.keys ?? null;
+        bundle = { ...bundle, ...(await intakeExport(opts.portableIntake, { projectKeys: keys, quotes: !!q.data.quotes })) };
+      }
       const name = `feedback-graph-${(q.data.project ?? 'all').replace(/[^\w.-]/g, '_')}-${bundle.exportedAt.slice(0, 10)}.json`;
       c.header('content-disposition', `attachment; filename="${name}"`);
       return c.json(bundle);
@@ -1704,6 +1721,9 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
       agentCaller: (c) => !!auth.token && tokenMatches(bearerOf(c), auth.token) && !hasOperatorToken(c, auth.operator),
     });
   }
+  if (opts.lookUp) {
+    knowledgeRoutes(app, opts.lookUp, { view, agentCaller: (c) => !!auth.token && tokenMatches(bearerOf(c), auth.token) && !hasOperatorToken(c, auth.operator) });
+  }
   if (opts.loop) loopRoutes(app, { ...opts.loop, activity: asActor(opts.loop.activity) }, { tokenless: !auth.token && !auth.ownerToken, view });
   /** The owner's own write to these lessons or facts overrides the loop decisions it changed (decisions.ts ownerOverrides). */
   const overrideLoop = opts.loop ? ownerOverrides({ ...opts.loop, activity: asActor(opts.loop.activity) }) : async () => {};
@@ -1733,7 +1753,7 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
       const q = ProjectParam.safeParse(c.req.query());
       if (!q.success) return c.json({ error: 'project is required' }, 400);
       if (!(await shows(q.data.project))) return c.json(NOT_SHOWN, 404);
-      return c.json(await insights.projectGraph(q.data.project));
+      return c.json(capFixCommits(await insights.projectGraph(q.data.project)));
     });
     app.get('/api/patterns', async (c) => {
       const project = ProjectParam.safeParse(c.req.query());
@@ -1824,6 +1844,26 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
       return d ? c.json({ ...d, lesson: (await withLoopChanges([d.lesson]))[0] }) : c.json({ error: 'not found' }, 404);
     });
 
+    /** `merged` superseded into `keeper` by you: an owner merge_duplicates decision, proposed and applied at once. */
+    const ownerMerge = async (keeper: string, merged: string, by: string, note: string | null): Promise<LoopDecision> => {
+      const loop = opts.loop!;
+      const [k, m] = await Promise.all([knowledge.lessonDetail(keeper), knowledge.lessonDetail(merged)]);
+      if (!k || !m) throw new TargetChangedError(k ? merged : keeper, 'present', null);
+      const now = new Date().toISOString();
+      const before = [lessonSnapshot(k.lesson), lessonSnapshot(m.lesson)];
+      const after = [before[0], lessonSnapshot({ ...m.lesson, status: 'superseded', decidedAt: now, decidedBy: by, decisionNote: note ?? `superseded by ${keeper}` })];
+      const { decision } = await loop.decisions.propose!({
+        type: 'merge_duplicates', author: 'owner', projectKey: k.lesson.projectKey ?? m.lesson.projectKey,
+        targets: [{ kind: 'lesson', id: keeper, role: 'keeper' }, { kind: 'lesson', id: merged, role: 'merged' }], before, after,
+        // The time makes superseding it again after a rollback a new decision.
+        evidence: [{ kind: 'lesson', id: merged, role: `superseded by ${keeper} ${now}`, weight: 1, observedAt: now }], features: {}, score: 1,
+        confidence: { p: 1, lower: 1, n: 0, band: 4 }, tier: 'P', mode: 'propose', model: null, policyVersion: LOOP_POLICY_VERSION, status: 'proposed',
+        rationale: `You marked ${merged} as superseded by ${keeper}${note ? `: ${note}` : ''}`.slice(0, 500),
+        dependsOn: await dependenciesOf({ decisions: loop.decisions }, before),
+      });
+      return loop.exec!.apply(decision, { by });
+    };
+
     app.patch('/api/lessons/:id', async (c) => {
       const body = LessonPatch.safeParse(await c.req.json().catch(() => null));
       if (!body.success) return c.json({ error: body.error.flatten() }, 400);
@@ -1838,6 +1878,20 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
         if (!narrowing) return c.json({ error: 'projectKey only narrows a global lesson: send it with scope project or task' }, 400);
         if (!(await knownProject(p.projectKey))) return c.json({ error: `no project ${p.projectKey} (or it is not selected): choose one from Settings` }, 400);
       }
+      let pathsMapped = false;
+      if (p.paths !== undefined) {
+        // Paths you give are checked against the project's code map: each must name a mapped file or a folder of them.
+        const cleaned = p.paths.map((x) => cleanLessonPath(x));
+        const bad = p.paths.filter((_, i) => !cleaned[i]);
+        if (bad.length) return c.json({ error: `not a repository path: ${bad.join(', ')}` }, 400);
+        p.paths = [...new Set(cleaned as string[])];
+        const key = p.projectKey ?? current.lesson.projectKey ?? current.lesson.origin;
+        // With no code map yet they are kept as given, and the worker's lesson check judges them against the repository.
+        const map = key && codegraph?.codeMap ? await codegraph.codeMap(key).catch(() => null) : null;
+        const missing = map ? p.paths.filter((x) => !map.files.some((f) => pathMatches(x, f.path))) : [];
+        if (missing.length) return c.json({ error: `not in the code map of ${key}: ${missing.join(', ')}`, missing }, 400);
+        pathsMapped = !!map && p.paths.length > 0;
+      }
       if (p.supersedes === id) return c.json({ error: 'a lesson cannot supersede itself' }, 400);
       if (p.supersedes !== undefined && !(await shownLesson(p.supersedes))) return c.json({ error: `no lesson ${p.supersedes} to supersede` }, 400);
       const scope = p.scope ?? current.lesson.scope;
@@ -1848,8 +1902,27 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
         [reembed] = await embed([redactSecrets(`${l.title}\n${l.rule}\nApplies when: ${l.appliesWhen}`)]);
       }
       const by = currentActor();
-      const { unscoped } = await knowledge.updateLesson(id, p, { reembed, by, ...(note && { note }) });
-      await overrideLoop([id]);
+      const loopDeps = opts.loop;
+      if (p.supersedes !== undefined && !(loopDeps?.exec && loopDeps.decisions.propose)) return c.json({ error: 'this API cannot record a supersede as a decision (no executor)' }, 501);
+      const { supersedes, ...edit } = p;
+      const { unscoped } = await knowledge.updateLesson(id, edit, { reembed, by, ...(note && { note }) });
+      // Superseding another lesson is a merge by you: a merge_duplicates decision authored by the owner, applied by the
+      // executor as a loop merge is, so it is audited on the Decisions page and rolls back the same way; an owner's
+      // decision is never calibrated or counted as the loop's.
+      let merge: LoopDecision | null = null;
+      if (supersedes !== undefined && !unscoped) {
+        try {
+          merge = await ownerMerge(id, supersedes, by, note ?? null);
+        } catch (e) {
+          if (e instanceof TargetChangedError) return c.json({ error: `${e.targetId} changed meanwhile, so it was not superseded: reload and try again` }, 409);
+          throw e;
+        }
+      }
+      await overrideLoop(supersedes ? [id, supersedes] : [id]);
+      // Paths that name mapped files settle the path flags at once; the worker checks the lesson again at its next round.
+      if (pathsMapped && knowledge.setLessonChecks && current.lesson.checks?.some((x) => PATH_FLAGS.has(x.name))) {
+        await knowledge.setLessonChecks(id, current.lesson.checks.filter((x) => !PATH_FLAGS.has(x.name)), 0);
+      }
       if (unscoped) return c.json({ error: 'this lesson has no known project, so it cannot be narrowed without one; it was set back to proposed. Name the project (projectKey), make it global, or reject it.' }, 409);
       const changed = Object.fromEntries(
         (['title', 'rule', 'appliesWhen', 'scope', 'paths', 'triggers', 'projectKey'] as const)
@@ -1862,8 +1935,8 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
         projectKey: p.projectKey ?? current.lesson.projectKey,
         subject: `${p.status ?? 'edited'} lesson "${p.title ?? current.lesson.title}"`,
         why: `${decidedWhy(by, p.status)}. ${LESSON_SHARING_NOTICE.message}`,
-        details: { sharing: LESSON_SHARING_NOTICE, status: p.status ?? current.lesson.status, changed, supersedes: p.supersedes ?? null, ...(note && { note: redactSecrets(note) }) },
-        targets: [id],
+        details: { sharing: LESSON_SHARING_NOTICE, status: p.status ?? current.lesson.status, changed, supersedes: p.supersedes ?? null, ...(merge && { decisionId: merge.id }), ...(note && { note: redactSecrets(note) }) },
+        targets: [id, ...(merge ? [merge.id, merge.targets[1].id] : [])],
       });
       return c.json({ id, status: p.status ?? current.lesson.status, sharing: LESSON_SHARING_NOTICE });
     });
@@ -1875,6 +1948,8 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
       if (!body.success) return c.json({ error: body.error.flatten() }, 400);
       const by = currentActor();
       const results = [];
+      // Deciding many lessons by hand expires the loop proposals waiting on them: once, after all, in one Activity line.
+      const decided: string[] = [];
       for (const item of body.data.items) {
         const current = await shownLesson(item.id);
         if (!current) {
@@ -1887,7 +1962,7 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
         }
         if (item.status === 'revoked' && current.lesson.status !== 'approved') { results.push({ id: item.id, ok: false, error: 'only a previously approved lesson can be revoked' }); continue; }
         await knowledge.updateLesson(item.id, { status: item.status }, { by, ...(item.note && { note: item.note }) });
-        await overrideLoop([item.id]);
+        decided.push(item.id);
         await activity?.record({
           kind: 'lesson_decided',
           actor: 'you',
@@ -1899,6 +1974,7 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
         });
         results.push({ id: item.id, ok: true, status: item.status });
       }
+      await overrideLoop(decided);
       return c.json({ results, ...(results.some(r => r.ok) ? { sharing: LESSON_SHARING_NOTICE } : {}) });
     });
 

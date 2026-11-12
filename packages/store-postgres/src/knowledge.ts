@@ -4,7 +4,7 @@ import { reviewPatterns } from '@fb/core';
 import { randomUUID } from 'node:crypto';
 import {
   matchReport,
-  REPORT_MERGE_MINUTES,
+  reportWindowMs,
   ISSUE_KEY_SHAPE,
   issueKeyPattern,
   MAX_POSTMORTEM_ATTEMPTS,
@@ -61,7 +61,7 @@ import {
   type SupersedeLink,
 } from '@fb/core';
 import type pg from 'pg';
-import { iso, toJson, toVector, tx, type Db } from './db.ts';
+import { fromVector, iso, toJson, toVector, tx, type Db } from './db.ts';
 import { commitOf, turnOf } from './graph.ts';
 import { learnedIn, missesNamingQuery, relatedMissesQuery, runSearch, sandboxPresence, searchLessonsQuery, visibleToRun } from './vector.ts';
 
@@ -544,9 +544,11 @@ export class PgKnowledgeStore implements KnowledgeStore {
              project_key = $2, title = $3, rule = $4, applies_when = $5, scope = $6, paths = $7::text[], status = $8,
              decided_at = $9::timestamptz, decided_by = $10, decision_note = $11,
              embedding = CASE WHEN $12::vector IS NULL THEN embedding ELSE $12::vector END,
-             serving_weight = $13
+             serving_weight = $13,
+             triggers = CASE WHEN $14 THEN $15::jsonb ELSE triggers END
            WHERE id = $1`,
-          [id, f.projectKey, f.title, f.rule, f.appliesWhen, f.scope, f.paths, f.status, f.decidedAt, f.decidedBy, f.decisionNote, embedding ? vectorOf(embedding) : null, f.servingWeight],
+          [id, f.projectKey, f.title, f.rule, f.appliesWhen, f.scope, f.paths, f.status, f.decidedAt, f.decidedBy, f.decisionNote, embedding ? vectorOf(embedding) : null, f.servingWeight,
+            f.triggers !== undefined, f.triggers ? toJson(f.triggers) : null],
         );
       }
       for (const l of o.supersede ?? []) {
@@ -708,19 +710,20 @@ export class PgKnowledgeStore implements KnowledgeStore {
   }
 
   /** The manual /postmortem path: queued for your decision, or added to the detector's item for the same miss. */
-  async createManualFeedback(input: { project: Project; cwd: string; text: string; whatWasDone: string; sessionId?: string | null; run?: RunTag | null }): Promise<string> {
+  async createManualFeedback(input: { project: Project; cwd: string; text: string; whatWasDone: string; sessionId?: string | null; run?: RunTag | null; embedding?: number[] | null }): Promise<string> {
+    const embedding = input.embedding?.length ? input.embedding : null;
     const o = { ...input, text: redactDeep(input.text), whatWasDone: redactDeep(input.whatWasDone) };
     const now = new Date();
     const report = toJson({ text: o.text, whatWasDone: o.whatWasDone, reportedAt: now.toISOString(), sessionId: o.sessionId ?? null });
     const { rows: flagged } = await this.q(
-      `SELECT k.id, k.session_id, t.ts, t.text FROM candidates k JOIN turns t ON t.uuid = k.turn_uuid
+      `SELECT k.id, k.session_id, t.ts, t.text, k.dedupe_embedding::text AS embedding FROM candidates k JOIN turns t ON t.uuid = k.turn_uuid
        WHERE k.project_key = $1 AND NOT k.manual AND k.agent_report IS NULL AND k.status <> 'rejected' AND t.external IS NULL
-         AND t.ts BETWEEN $2::timestamptz - make_interval(mins => $3) AND $2::timestamptz + make_interval(mins => $3)`,
-      [o.project.key, now, REPORT_MERGE_MINUTES],
+         AND t.ts BETWEEN $2::timestamptz - make_interval(secs => $3) AND $2::timestamptz + make_interval(secs => $3)`,
+      [o.project.key, now, reportWindowMs({ embedding }) / 1000],
     );
     const hit = matchReport(
-      { ts: now.toISOString(), text: o.text, sessionId: o.sessionId },
-      flagged.map((r) => ({ id: r.id as string, sessionId: r.session_id as string, ts: (r.ts as Date).toISOString(), text: r.text ?? '' })),
+      { ts: now.toISOString(), text: o.text, sessionId: o.sessionId, embedding },
+      flagged.map((r) => ({ id: r.id as string, sessionId: r.session_id as string, ts: (r.ts as Date).toISOString(), text: r.text ?? '', embedding: fromVector(r.embedding) })),
     );
     if (hit) {
       await this.q('UPDATE candidates SET agent_report = $2::jsonb WHERE id = $1', [hit.id, report]);
@@ -745,9 +748,9 @@ export class PgKnowledgeStore implements KnowledgeStore {
         [id, o.project.key, now, now.toISOString(), o.text, o.whatWasDone],
       );
       await c.query(
-        `INSERT INTO candidates (id, turn_uuid, session_id, project_key, ts, status, created_at, manual, agent_report, run, sandbox)
-         VALUES ($1, $1, $1, $2, $3, 'pending', $3, true, $4::jsonb, $5, $6)`,
-        [id, o.project.key, now, report, o.run?.id ?? null, !!o.run?.sandbox],
+        `INSERT INTO candidates (id, turn_uuid, session_id, project_key, ts, status, created_at, manual, agent_report, run, sandbox, dedupe_embedding)
+         VALUES ($1, $1, $1, $2, $3, 'pending', $3, true, $4::jsonb, $5, $6, $7::vector)`,
+        [id, o.project.key, now, report, o.run?.id ?? null, !!o.run?.sandbox, vectorOf(embedding)],
       );
     });
     return id;

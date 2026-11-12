@@ -319,6 +319,15 @@ export class SessionsRepo implements SessionsStore {
     return { attempts, retryAt };
   }
 
+  async retryFailedSummaries(errorPrefix: string): Promise<string[]> {
+    const rows = await this.g.run(
+      `MATCH (s:Session) WHERE s.summaryError STARTS WITH $prefix AND s.summaryRetryAt IS NOT NULL
+       SET s.summaryRetryAt = null, s.summaryAttempts = 0 RETURN s.id AS id ORDER BY id`,
+      { prefix: errorPrefix },
+    );
+    return rows.map((r) => r.get('id') as string);
+  }
+
   async setState(sessionId: string, state: SessionState) {
     await this.g.run('MATCH (s:Session {id: $id}) SET s.state = $state', { id: sessionId, state });
   }

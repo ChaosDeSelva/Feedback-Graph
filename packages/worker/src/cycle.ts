@@ -32,6 +32,11 @@ export type CycleDeps = {
   roots: Root[];
   commits: typeof commitsInWindow;
   classify(turn: HumanTurn): Promise<Classification | null>;
+  /**
+   * The embedding model: an Inbox item's text is embedded when it is flagged, so a reworded or later report of the same
+   * miss joins it (core dedupe.ts). Unset, or failing: matched by words and session only.
+   */
+  embed?: (texts: string[]) => Promise<number[][]>;
   classifyBatch: number;
   /** True while a scan is using a model: a classify timeout then means a queue behind it, not this turn's fault. */
   modelBusy?: () => boolean;
@@ -375,7 +380,10 @@ export async function runCycle(deps: CycleDeps): Promise<CycleResult> {
     if (turn.external && !skip && isSelfReview(turn.external) && !c.signals.includes('self-review')) c = { ...c, signals: [...c.signals, 'self-review'] };
     // The Inbox item the turn is filed under (its own id, or an agent report's it was merged into: dedupe.ts); null when
     // it is no candidate.
-    const itemId = await deps.repo.saveClassification(turn.uuid, c, CANDIDATE_LABELS.has(c.label));
+    const flagged = CANDIDATE_LABELS.has(c.label);
+    // Embedding is only for matching it with a report of the same miss: an embedder down never holds the item back.
+    const embedding = flagged && deps.embed && turn.text ? (await deps.embed([turn.text]).catch((err) => { log('flagged turn not embedded', { turn: turn.uuid, error: redactSecrets(String(err)).slice(0, 200) }); return [null]; }))[0] : null;
+    const itemId = await deps.repo.saveClassification(turn.uuid, c, flagged, { embedding });
     turnsClassified++;
     if (itemId) {
       candidates++;

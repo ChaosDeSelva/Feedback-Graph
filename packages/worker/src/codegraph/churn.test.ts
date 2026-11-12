@@ -40,6 +40,8 @@ test('churn counts commits per file within the window and follows renames to the
     const last = Date.parse(c.get('src/b.ts')!.lastTs);
     expect(Math.abs(last - (Date.now() - DAY))).toBeLessThan(60_000);
     expect(c.get('src/b.ts')!.lastTs).toMatch(/Z$/);
+    // The renames it followed, old name to the name the file has now.
+    expect(c.renames).toMatchObject({ 'a.ts': 'src/b.ts' });
 
     const all = await churn(dir, 365);
     expect(all.get('src/b.ts')?.commits).toBe(4);

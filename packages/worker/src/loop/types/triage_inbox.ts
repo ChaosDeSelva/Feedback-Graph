@@ -1,4 +1,5 @@
-import { candidateSnapshot, feedbackSkipRule, isSelfReview, prNeverMerged, type Candidate } from '@fb/core';
+import { candidateSnapshot, feedbackSkipRule, instructsAgent, isSelfReview, prNeverMerged, type Candidate } from '@fb/core';
+import { riskyInstructions } from '../../postmortem/lessonCheck.ts';
 import { SKIP, skip, type LoopCandidate, type LoopType, type LoopTypeContext, type LoopTypeResult } from '../plugin.ts';
 
 /** Pending Inbox items looked at each round. */
@@ -37,8 +38,28 @@ async function callFor(ctx: LoopTypeContext, c: Candidate): Promise<Call | null>
   return null;
 }
 
+/** Sources that are your own sessions (not a reviewer's comment synced from GitHub or Linear). */
+const OWN_SESSIONS = new Set(['claude', 'codex']);
+
 /**
- * triage_inbox (tier P: always a proposal): confirm or reject a pending Inbox item. Reject: a skip rule matches the
+ * Why this call may only be proposed, never applied on its own, or null (0.9.1, tier A): never confirming an agent's
+ * report or an item from your own sessions, and never anything whose words read as a risky command or as instructions
+ * to an agent (injection), whichever way the call goes.
+ */
+export async function triageProposeOnly(ctx: LoopTypeContext, c: Candidate, call: Call): Promise<string | null> {
+  const turn = (await ctx.store.graph.candidateDetail(c.id))?.turn;
+  const words = [turn?.text ?? '', c.agentReport?.text ?? ''].join('\n');
+  if (riskyInstructions(words).length || instructsAgent(words)) return 'its words read as a risky command or instructions to an agent: you read those';
+  if (call.status !== 'confirmed') return null;
+  if (c.origins!.includes('agent')) return 'an agent reported it: you confirm those';
+  if (OWN_SESSIONS.has(c.source)) return 'it is from your own session: you confirm those';
+  return null;
+}
+
+/**
+ * triage_inbox (tier A since 0.9.1, τ 0.9, from 30 of your reviews in its band; before, always a proposal): confirm or
+ * reject a pending Inbox item. It applies on its own only once earned, within the daily caps and the breaker, and
+ * triageProposeOnly keeps some calls proposals always. Reject: a skip rule matches the
  * synced comment now, an agent reviewing its own pull request, a comment CLOSED_PR_DAYS or more old on a pull request
  * closed without merging, or the classifier under REJECT_BELOW with no agent
  * report. Confirm: pushback or a correction at CONFIRM_FROM or more. Confirming spends a post-mortem; nothing reaches an
@@ -58,7 +79,8 @@ export const triageInbox: LoopType = {
       if (!ctx.inScope(c.projectKey)) { skip(skipped, SKIP.outOfScope); continue; }
       const call = await callFor(ctx, c);
       if (!call) { skip(skipped, SKIP.belowFloor); continue; }
-      candidates.push(triageCandidate(c, call));
+      const proposeOnly = await triageProposeOnly(ctx, c, call);
+      candidates.push({ ...triageCandidate(c, call), ...(proposeOnly && { proposeOnly }) });
     }
     return { candidates, scanned: pending.length, skipped };
   },

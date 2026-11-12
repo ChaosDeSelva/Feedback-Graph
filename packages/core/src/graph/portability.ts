@@ -43,6 +43,13 @@ export type ExportBundle = {
   docs: { id: string; projectKey: string; source: string; ref: string; title: string; url: string | null }[];
   /** The code map's files with their hotspot numbers: paths and stats only, never source, symbols or edges. */
   codeFiles: ExportCodeFile[];
+  /**
+   * Knowledge intake (0.9.1, GET /api/export with INTAKE_ENABLED): decided claims, settled conflicts and the people who
+   * said them (intake/portable.ts). The stores never add these, and a sync never sends them.
+   */
+  claims?: import('../intake/portable.ts').ExportedClaim[];
+  conflicts?: import('../intake/portable.ts').ExportedConflict[];
+  people?: import('../intake/portable.ts').ExportedPerson[];
 };
 
 export type ExportCodeFile = { projectKey: string; path: string; lang: string; loc: number; isTest: boolean } & Omit<Hotspot, 'path'>;

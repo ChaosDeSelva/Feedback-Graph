@@ -304,3 +304,32 @@ test('with INTAKE_ENABLED, find_contradictions (read-only) and submit_notes (a w
   expect(without).not.toContain('find_contradictions');
   expect(without).not.toContain('submit_notes');
 });
+
+test('with the look-up, what_do_we_know (read-only) answers accepted knowledge only, in words', async () => {
+  const claim = {
+    id: 'claim:1', projectKey: 'demo', docId: 'doc:demo:intake:call', window: 0, span: null, type: 'decision', statement: 'Retries wait 30 seconds',
+    quote: 'thirty seconds it is', speakerId: 'person:ana', assertedAt: '2026-11-10T10:00:00.000Z', confidence: 0.9, scope: { area: null, files: [] }, about: 'retries',
+    due: null, flags: [], status: 'accepted', decidedBy: 'you', decidedAt: null, factId: null, createdAt: '2026-11-10T10:00:00.000Z', run: null, sandbox: false,
+  };
+  const asked: object[] = [];
+  const knowledge = {
+    intake: {
+      searchClaims: async (q: object) => { asked.push(q); return [{ claim, score: 0.95 }]; }, listQuestions: async () => [], conflictsFor: async () => [], claim: async () => claim,
+      person: async () => ({ id: 'person:ana', displayName: 'Ana Example', isOwner: false }), people: async () => [], metas: async () => [],
+    },
+    facts: { searchFacts: async () => [], fact: async () => null }, lessons: { searchLessons: async () => [], lessonDetail: async () => null }, embed: async (t: string[]) => t.map(() => [1]),
+  } as unknown as NonNullable<ContextDeps['intake']>['knowledge'];
+  const intake = { store: { conflictsFor: async () => [], claim: async () => null, person: async () => null, metas: async () => [] }, fact: async () => null, lesson: async () => null, knowledge } as ContextDeps['intake'];
+  const app = createApp(repo, { context: { ...ctx, intake } });
+  const tools = ((await (await app.request('/mcp', rpc({ method: 'tools/list', params: {} }))).json()) as { result: { tools: { name: string; annotations: Record<string, boolean> }[] } }).result.tools;
+  expect(tools.find((t) => t.name === 'what_do_we_know')!.annotations).toMatchObject({ readOnlyHint: true, destructiveHint: false });
+  const res = (await (await app.request('/mcp', rpc({ method: 'tools/call', params: { name: 'what_do_we_know', arguments: { cwd: '/Users/j/Vibe/demo', topic: 'retries' } } }))).json()) as { result: { content: { text: string }[] } };
+  const md = res.result.content[0].text;
+  expect(md).toContain('## Decisions');
+  expect(md).toContain('Retries wait 30 seconds · Ana Example');
+  expect(md).not.toContain('thirty seconds it is');
+  // Accepted claims only were asked for: an agent never reads an unreviewed one.
+  expect(asked).toEqual([expect.objectContaining({ status: ['accepted'], projectKeys: ['demo'] })]);
+  const without = ((await (await createApp(repo, { context: { ...ctx, intake: { ...intake!, knowledge: undefined } } }).request('/mcp', rpc({ method: 'tools/list', params: {} }))).json()) as { result: { tools: { name: string }[] } }).result.tools.map((t) => t.name);
+  expect(without).not.toContain('what_do_we_know');
+});

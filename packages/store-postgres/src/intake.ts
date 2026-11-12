@@ -2,11 +2,11 @@ import { randomUUID } from 'node:crypto';
 import type pg from 'pg';
 import {
   AliasTakenError, aliasNorm, answerClaimIdOf, answerSourceOf, addedQuestionIdOf, archiveBeforeRedaction, claimFingerprint, claimIdOf, cleanClaimDraft,
-  cleanConflictInput, cleanQuestionDraft, cleanResolution, conflictFingerprint, conflictIdOf, FORGOTTEN_NAME, questionIdOf, REDACT_PAGE, redactIntakeText, redactSecrets, redactStoredIntake as redactStoredRow,
+  cleanConflictInput, cleanQuestionDraft, cleanResolution, conflictFingerprint, conflictIdOf, FORGOTTEN_NAME, questionIdOf, REMOVED_CLAIM, REDACT_PAGE, redactIntakeText, redactSecrets, redactStoredIntake as redactStoredRow,
   TargetChangedError,
 } from '@fb/core';
 import type {
-  AnswerInput, Claim, ClaimDraft, ClaimFilter, ClaimHit, ClaimLink, ClaimPatch, ClaimSearch, Conflict, ConflictFilter, ConflictInput, ConflictSide,
+  AnswerInput, ImportedClaim, Claim, ClaimDraft, ClaimFilter, ClaimHit, ClaimLink, ClaimPatch, ClaimSearch, Conflict, ConflictFilter, ConflictInput, ConflictSide,
   IntakeMeta, IntakeMetaInput, IntakeRedacted, IntakeRemoved, IntakeRunItem, IntakeSnapshotWrite, IntakeStore, Person, PersonPatch, Question, QuestionDraft,
   QuestionFilter, QuestionPatch, RunTag, Supersession, WindowSave,
 } from '@fb/core';
@@ -71,6 +71,20 @@ const META_SELECT = `SELECT s.*, d.added_at,
   FROM intake_sources s JOIN docs d ON d.id = s.doc_id`;
 
 /** Knowledge intake on Postgres (0062_intake.sql). */
+/**
+ * Delete these claims whatever their status, with what names them: their links, supersessions and the conflicts they
+ * are a side of (the judge quoted them), and their text in Activity (a claim_decided subject quotes the statement).
+ */
+async function deleteClaimsIn(query: Query, ids: string[]): Promise<number> {
+  if (!ids.length) return 0;
+  await query('DELETE FROM conflicts WHERE id IN (SELECT conflict_id FROM conflict_sides WHERE kind = \'claim\' AND ref_id = ANY($1::text[]))', [ids]);
+  await query('DELETE FROM supersessions WHERE from_id = ANY($1::text[]) OR to_id = ANY($1::text[])', [ids]);
+  await query('DELETE FROM claim_links WHERE to_id = ANY($1::text[])', [ids]);
+  await query(`UPDATE activity SET subject = $2 WHERE kind = 'claim_decided' AND targets && $1::text[]`, [ids, REMOVED_CLAIM]);
+  const r = await query('DELETE FROM claims WHERE id = ANY($1::text[])', [ids]);
+  return r.rowCount ?? 0;
+}
+
 export class PgIntakeStore implements IntakeStore {
   readonly db: Db;
   constructor(db: Db) {
@@ -173,13 +187,31 @@ export class PgIntakeStore implements IntakeStore {
     }, (ok) => ok);
   }
 
-  async removeSource(docId: string, o: { keep?: string[] } = {}): Promise<{ claim: number; question: number }> {
+  async removeSource(docId: string, o: { everything?: boolean; people?: string[] } = {}): Promise<{ claim: number; question: number; people: number }> {
     return this.write(async (query) => {
-      const c = await query('DELETE FROM claims WHERE doc_id = $1 AND status = ANY($2::text[]) AND NOT id = ANY($3::text[])', [docId, UNDECIDED, o.keep ?? []]);
+      // Everything: every claim whatever its status, and the proposed people nothing else names, found before their ties go.
+      const { rows: people } = o.everything
+        ? await query('SELECT person_id AS id FROM source_people WHERE doc_id = $1 UNION SELECT speaker_id FROM claims WHERE doc_id = $1 AND speaker_id IS NOT NULL', [docId])
+        : { rows: [] };
+      const { rows: ids } = await query('SELECT id FROM claims WHERE doc_id = $1 AND ($2 OR status = ANY($3::text[]))', [docId, !!o.everything, UNDECIDED]);
+      const claim = await deleteClaimsIn(query, ids.map((r) => r.id as string));
       const q = await query('DELETE FROM questions WHERE doc_id = $1', [docId]);
       await query('DELETE FROM intake_sources WHERE doc_id = $1', [docId]);
-      return { claim: c.rowCount ?? 0, question: q.rowCount ?? 0 };
+      const named = [...new Set([...people.map((r) => r.id as string), ...(o.people ?? [])])];
+      const gone = named.length
+        ? await query(
+          `DELETE FROM people p WHERE p.id = ANY($1::text[]) AND p.status = 'proposed' AND NOT p.is_owner
+             AND NOT EXISTS (SELECT 1 FROM source_people s WHERE s.person_id = p.id) AND NOT EXISTS (SELECT 1 FROM claims c WHERE c.speaker_id = p.id)
+             AND NOT EXISTS (SELECT 1 FROM questions x WHERE x.asked_by = p.id OR x.assignee = p.id)`,
+          [named],
+        )
+        : null;
+      return { claim, question: q.rowCount ?? 0, people: gone?.rowCount ?? 0 };
     });
+  }
+
+  async deleteClaims(ids: string[]): Promise<number> {
+    return this.write((query) => deleteClaimsIn(query, ids), (n) => n > 0);
   }
 
   async listClaims(f: ClaimFilter = {}): Promise<Claim[]> {
@@ -246,6 +278,37 @@ export class PgIntakeStore implements IntakeStore {
          WHERE EXISTS (SELECT 1 FROM claims WHERE id = l.from_id) AND ${exists('l.to_kind', 'l.to_id')}
          ON CONFLICT DO NOTHING`,
         [links.map((l) => l.from), links.map((l) => l.to.kind), links.map((l) => l.to.id), links.map((l) => l.rel), new Date()],
+      );
+      return rowCount ?? 0;
+    }, (n) => n > 0);
+  }
+
+  async importClaims(claims: ImportedClaim[]): Promise<string[]> {
+    if (!claims.length) return [];
+    return this.write(async (query) => {
+      const added: string[] = [];
+      const now = new Date();
+      for (const c of claims) {
+        const draft = cleanClaimDraft({ ...c, span: null, flags: [] });
+        const { rowCount } = await query(
+          `INSERT INTO claims (id, ${CLAIM_DRAFT_COLUMNS}, project_key, doc_id, "window", version, status, decided_by, decided_at, fact_id, created_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, $12, $13, $14::text[], $15::vector, $16, $17, NULL, NULL, $18, $19, $20, $21, $22)
+           ON CONFLICT (id) DO NOTHING`,
+          [c.id, ...draftValues(draft), c.projectKey, c.docId, c.status, c.decidedBy, c.decidedAt === null ? null : new Date(c.decidedAt), c.factId, now],
+        );
+        if (rowCount) added.push(c.id);
+      }
+      return added;
+    }, (ids) => ids.length > 0);
+  }
+
+  async removeLinks(links: ClaimLink[]): Promise<number> {
+    if (!links.length) return 0;
+    return this.write(async (query) => {
+      const { rowCount } = await query(
+        `DELETE FROM claim_links c USING unnest($1::text[], $2::text[], $3::text[], $4::text[]) AS l(from_id, to_kind, to_id, rel)
+         WHERE c.from_id = l.from_id AND c.to_kind = l.to_kind AND c.to_id = l.to_id AND c.rel = l.rel`,
+        [links.map((l) => l.from), links.map((l) => l.to.kind), links.map((l) => l.to.id), links.map((l) => l.rel)],
       );
       return rowCount ?? 0;
     }, (n) => n > 0);
@@ -399,8 +462,8 @@ export class PgIntakeStore implements IntakeStore {
     const ok = await this.write(async (query) => {
       const { rowCount } = await query(
         `UPDATE questions SET status = CASE WHEN $2 THEN $3 ELSE status END, assignee = CASE WHEN $4 THEN $5 ELSE assignee END,
-           decided_by = $6, decided_at = $7 WHERE id = $1`,
-        [id, patch.status !== undefined, patch.status ?? null, patch.assignee !== undefined, patch.assignee ?? null, by, new Date()],
+           answer_claim_id = CASE WHEN $8 THEN $9 ELSE answer_claim_id END, decided_by = $6, decided_at = $7 WHERE id = $1`,
+        [id, patch.status !== undefined, patch.status ?? null, patch.assignee !== undefined, patch.assignee ?? null, by, new Date(), patch.answerClaimId !== undefined, patch.answerClaimId ?? null],
       );
       return (rowCount ?? 0) > 0;
     }, (done) => done);

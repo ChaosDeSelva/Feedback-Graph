@@ -97,6 +97,29 @@ test('PATCH takes an optional note: on the lesson (its decided note) and on its 
   expect((await app.request('/api/lessons/lesson%3Aa', patch({ status: 'approved', note: '  ' }))).status).toBe(400);
 });
 
+test('PATCH paths: each must name a file or folder in the code map; mapped ones settle the path flags at once', async () => {
+  const flagged: Lesson = { ...lesson, checks: [{ name: 'needs-path', why: 'no file' }, { name: 'platitude', why: 'p' }] };
+  const calls: unknown[][] = [];
+  const knowledge = {
+    ...QUIET,
+    listLessons: async () => [flagged],
+    lessonDetail: async (id: string) => (id === flagged.id ? { lesson: flagged, miss: null, feedback: null, contextItems: [], fixCommits: [], supersedes: [] } : null),
+    updateLesson: async (...a: unknown[]) => { calls.push(['update', ...a]); return { unscoped: false }; },
+    setLessonChecks: async (...a: unknown[]) => { calls.push(['checks', ...a]); return true; },
+  };
+  const map = { files: [{ path: 'src/billing/retry.ts' }, { path: 'src/billing/charge.ts' }] };
+  const app = createApp(repo, { auth: { ownerToken: OWNER }, knowledge, codegraph: { codeMap: async (k: string) => (k === 'demo' ? map : null) } as never });
+  const refused = await app.request('/api/lessons/lesson%3Aa', patch({ paths: ['src/billing/retry.ts', 'src/nope.ts'], status: 'approved' }));
+  expect(refused.status).toBe(400);
+  expect((await refused.json()).error).toBe('not in the code map of demo: src/nope.ts');
+  expect((await app.request('/api/lessons/lesson%3Aa', patch({ paths: ['../etc/passwd'] }))).status).toBe(400);
+  expect(calls).toEqual([]);
+  const ok = await app.request('/api/lessons/lesson%3Aa', patch({ paths: ['./src/billing/retry.ts', 'src/billing/'], status: 'approved' }));
+  expect(ok.status).toBe(200);
+  expect(calls[0]).toEqual(['update', 'lesson:a', { paths: ['src/billing/retry.ts', 'src/billing/'], status: 'approved' }, expect.anything()]);
+  expect(calls[1]).toEqual(['checks', 'lesson:a', [{ name: 'platitude', why: 'p' }], 0]);
+});
+
 test('PATCH editing the rule re-embeds the lesson text', async () => {
   const { app, calls, embedded } = setup();
   await app.request('/api/lessons/lesson%3Aa', patch({ rule: 'New rule', scope: 'global' }));

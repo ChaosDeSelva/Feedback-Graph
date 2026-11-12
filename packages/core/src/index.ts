@@ -36,6 +36,8 @@ export * from './scanner.ts';
 export * from './codegraph.ts';
 export * from './storedLabel.ts';
 export * from './dedupe.ts';
+export * from './thresholds.ts';
+export * from './loop/renames.ts';
 export * from './graph/neo4j-store.ts';
 export * from './cloud.ts';
 export * from './sessions.ts';
@@ -69,6 +71,7 @@ export * from './decisions/cascade.ts';
 export * from './decisions/rollback.ts';
 export * from './decisions/executor.ts';
 export * from './decisions/types/index.ts';
+export { lessonPathsFingerprint, lessonPathsSnapshot } from './decisions/types/update_paths.ts';
 export { genericHandler, moveTargets } from './decisions/types/generic.ts';
 export { linkMisses } from './decisions/types/link_misses.ts';
 export { tuneThreshold } from './decisions/types/tune_threshold.ts';
@@ -84,6 +87,7 @@ export { encryptedRedactionArchive, publicRedactionArchive } from './encryptedAr
 
 export { writesMemory } from './memoryWrite.ts';
 export * from './intake/records.ts';
+export * from './intake/portable.ts';
 export * from './intake/enabled.ts';
 export * from './conflicts/prefilter.ts';
 export * from './conflicts/sides.ts';

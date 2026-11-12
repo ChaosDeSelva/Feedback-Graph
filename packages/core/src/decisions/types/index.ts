@@ -9,6 +9,10 @@ import { tuneThreshold } from './tune_threshold.ts';
 import { recordFact } from './record_fact.ts';
 import { rewordLesson } from './reword_lesson.ts';
 import { resolveConflict } from './resolve_conflict.ts';
+import { linkClaims } from './link_claims.ts';
+import { proposeResolution } from './propose_resolution.ts';
+import { questionHandler } from './question.ts';
+import { updatePaths } from './update_paths.ts';
 
 export type * from './handler.ts';
 
@@ -28,6 +32,15 @@ export const DECISION_HANDLERS: Partial<Record<DecisionType, DecisionTypeHandler
   resolve_conflict: resolveConflict,
   // A removed source's claims rejected and their facts closed: the same claim and fact moves, with no conflict.
   remove_source: resolveConflict,
+  // Knowledge intake's loop types (0.9.1): a claim accepted (its fact made) or merged moves claims and facts as a
+  // resolution does; a suggested resolution is the owner's resolution once approved.
+  accept_claim: resolveConflict,
+  merge_claims: resolveConflict,
+  propose_resolution: proposeResolution,
+  link_claims: linkClaims,
+  assign_question: questionHandler,
+  close_question: questionHandler,
+  update_paths: updatePaths,
 };
 
 export const handlerFor = (type: DecisionType): DecisionTypeHandler => DECISION_HANDLERS[type] ?? genericHandler;

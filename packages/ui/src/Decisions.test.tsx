@@ -100,6 +100,35 @@ test('approve sends the status it saw, the decision leaves the proposals, and th
   window.removeEventListener(LOOP_CHANGED_EVENT, changed);
 });
 
+test('Approve and Reject take a note, and Reject a reason, in the same step; both are cleared for the next decision', async () => {
+  list = [...list, { ...list[0], id: 'dec:proposed2' }];
+  details['dec:proposed2'] = detail({ ...list[0], id: 'dec:proposed2' });
+  render(<Decisions />);
+  await within(pane()).findByRole('heading', { name: /approve lesson/ });
+  fireEvent.change(screen.getByLabelText('Note'), { target: { value: 'the evidence holds' } });
+  fireEvent.change(screen.getByLabelText('Reason to reject'), { target: { value: 'too_broad' } });
+  fireEvent.click(screen.getByRole('button', { name: /Reject/ }));
+  await waitFor(() => expect(posts('/api/decisions/dec%3Aproposed/reject')[0]?.body).toEqual({ expect: 'proposed', note: 'the evidence holds', reason: 'too_broad' }));
+  await waitFor(() => expect((screen.getByLabelText('Note') as HTMLInputElement).value).toBe(''));
+  fireEvent.change(screen.getByLabelText('Note'), { target: { value: 'right call' } });
+  fireEvent.change(screen.getByLabelText('Reason to reject'), { target: { value: 'wording' } });
+  fireEvent.click(screen.getByRole('button', { name: /Approve/ }));
+  // A reason goes with a reject only.
+  await waitFor(() => expect(posts('/api/decisions/dec%3Aproposed2/approve')[0]?.body).toEqual({ expect: 'proposed', note: 'right call' }));
+});
+
+test('proposals your own changes expired lately are announced above the list, with a way to show them', async () => {
+  const recent = new Date(Date.now() - 3_600_000).toISOString();
+  routes['/api/activity'] = () => Response.json([
+    { id: 'a1', ts: recent, kind: 'decision_made', actor: 'you', projectKey: 'demo', subject: 's', why: 'w', details: { action: 'expired_by_you', expired: 22 }, targets: [] },
+    { id: 'a2', ts: '2020-01-01T00:00:00Z', kind: 'decision_made', actor: 'you', projectKey: 'demo', subject: 's', why: 'w', details: { action: 'expired_by_you', expired: 5 }, targets: [] },
+  ]);
+  render(<Decisions />);
+  expect(await screen.findByText(/22 waiting proposals expired in the last 7 days: you decided their targets yourself/)).toBeTruthy();
+  fireEvent.click(screen.getByRole('button', { name: 'Show expired' }));
+  await waitFor(() => expect(calls.some((c) => c.url.startsWith('/api/decisions?') && c.url.includes('status=expired'))).toBe(true));
+});
+
 test('every status is listed on request; an applied decision is kept or rolled back, an observed one approved or rejected', async () => {
   location.hash = '#decisions?status=all';
   render(<Decisions />);
@@ -269,7 +298,7 @@ test('a note says agree or disagree, with a reason for disagreeing, and shows in
   fireEvent.submit(screen.getByLabelText('note').closest('form')!);
   await waitFor(() => expect(posts('/api/decisions/dec%3Aproposed/notes').map((c) => c.body)).toEqual([{ text: 'Too broad: only checkout needs it', verdict: 'disagree', reason: 'too_broad' }]));
   expect(await screen.findByText('Too broad: only checkout needs it')).toBeTruthy();
-  expect(screen.getByText('too broad')).toBeTruthy();
+  expect(screen.getByText('too broad', { ignore: 'option' })).toBeTruthy();
   expect((screen.getByLabelText('note') as HTMLTextAreaElement).value).toBe('');
 
   routes['POST /api/decisions/dec%3Aproposed/notes'] = () => Response.json({ error: 'note too long' }, { status: 400 });
@@ -715,4 +744,78 @@ test('a cascade and a dependency name the type as the page does, not as the API 
   fireEvent.click(within(pane()).getByRole('button', { name: /Roll back/ }));
   const cascade = await within(await screen.findByRole('dialog')).findByRole('list', { name: 'also rolled back' });
   expect(cascade.textContent).toBe('ranking weight · lesson:demo-shop:2');
+});
+
+/** A proposed merge of two lessons, opened, with a never-merge store behind /api/distinct-pairs. */
+const openMerge = async (pairs: { a: string; b: string }[] = [], o: { writes?: boolean } = {}) => {
+  const merge = decision('dec:merge', {
+    type: 'merge_duplicates', status: 'proposed', mode: 'propose', decidedBy: undefined, decidedAt: undefined, appliedAt: undefined,
+    targets: [{ kind: 'lesson', id: 'lesson:demo-shop:3', role: 'keeper' }, { kind: 'lesson', id: 'lesson:demo-shop:1', role: 'merged' }],
+  });
+  list = [merge];
+  details = { [merge.id]: detail(merge) };
+  let stored = pairs.map((p) => ({ ...p, by: 'you', at: '2026-11-10T10:00:00Z', reason: 'you marked them as not the same', decisionId: null }));
+  routes['GET /api/distinct-pairs'] = (_b, url) => {
+    const ids = decodeURIComponent(new URLSearchParams(url.split('?')[1]).get('ids') ?? '').split(',');
+    return Response.json(stored.filter((p) => ids.includes(p.a) || ids.includes(p.b)));
+  };
+  routes['POST /api/distinct-pairs'] = (b) => {
+    const { a, b: other, reason } = b as { a: string; b: string; reason: string };
+    const [x, y] = a < other ? [a, other] : [other, a];
+    stored = [...stored, { a: x, b: y, by: 'you', at: '2026-11-12T10:00:00Z', reason, decisionId: null }];
+    return Response.json({ created: true, pairs: stored }, { status: 201 });
+  };
+  routes['DELETE /api/distinct-pairs'] = (b) => {
+    const { a, b: other } = b as { a: string; b: string };
+    stored = stored.filter((p) => !(p.a === a && p.b === other));
+    return new Response(null, { status: 204 });
+  };
+  render(<OwnerWrites.Provider value={o.writes ?? true}><Decisions /></OwnerWrites.Provider>);
+  return within(await screen.findByRole('region', { name: 'Never merge' }));
+};
+
+test('a merge decision: "Never merge these two" records the pair, and the record is listed', async () => {
+  const card = await openMerge();
+  fireEvent.click(await card.findByRole('button', { name: 'Never merge these two' }));
+  await card.findByText(/You said these two are not the same/);
+  const post = posts('/api/distinct-pairs')[0];
+  expect(post.body).toMatchObject({ a: 'lesson:demo-shop:3', b: 'lesson:demo-shop:1' });
+  expect(card.queryByRole('button', { name: 'Never merge these two' })).toBeNull();
+  const records = within(card.getByRole('list', { name: 'never-merge records' }));
+  expect(records.getByText('lesson:demo-shop:1 ≠ lesson:demo-shop:3')).toBeTruthy();
+});
+
+test('a merge decision lists never-merge records naming either record, and Lift removes one', async () => {
+  const card = await openMerge([{ a: 'lesson:demo-shop:1', b: 'lesson:demo-shop:3' }, { a: 'lesson:demo-shop:3', b: 'lesson:demo-shop:9' }]);
+  const records = within(await card.findByRole('list', { name: 'never-merge records' }));
+  expect(records.getAllByRole('listitem')).toHaveLength(2);
+  expect(card.getByText(/You said these two are not the same/)).toBeTruthy();
+  fireEvent.click(records.getByRole('button', { name: 'lift never merge lesson:demo-shop:1 and lesson:demo-shop:3' }));
+  await card.findByRole('button', { name: 'Never merge these two' });
+  expect(calls.find((c) => c.method === 'DELETE')?.body).toEqual({ a: 'lesson:demo-shop:1', b: 'lesson:demo-shop:3' });
+  expect(within(card.getByRole('list', { name: 'never-merge records' })).getAllByRole('listitem')).toHaveLength(1);
+});
+
+test('a refused lift (the operator token) says why and keeps the record', async () => {
+  const card = await openMerge([{ a: 'lesson:demo-shop:1', b: 'lesson:demo-shop:3' }]);
+  routes['DELETE /api/distinct-pairs'] = () => Response.json({ error: 'only you lift a never-merge record (the browser or FG_OWNER_TOKEN), never the operator token' }, { status: 403 });
+  fireEvent.click(await card.findByRole('button', { name: /lift never merge/ }));
+  expect((await card.findByRole('alert')).textContent).toMatch(/only you lift a never-merge record/);
+  expect(card.getAllByRole('listitem')).toHaveLength(1);
+});
+
+test('read-only installs see the never-merge records and can neither mark nor lift one', async () => {
+  const card = await openMerge([{ a: 'lesson:demo-shop:3', b: 'lesson:demo-shop:9' }], { writes: false });
+  for (const name of ['Never merge these two', /lift never merge/]) {
+    const b = await card.findByRole('button', { name }) as HTMLButtonElement;
+    expect(b.disabled).toBe(true);
+    expect(b.title).toBe(READ_ONLY_TITLE);
+  }
+});
+
+test('only merge decisions offer never merge', async () => {
+  render(<Decisions />);
+  await within(pane()).findByRole('heading', { name: /approve lesson/ });
+  expect(screen.queryByRole('region', { name: 'Never merge' })).toBeNull();
+  expect(calls.some((c) => c.url.startsWith('/api/distinct-pairs'))).toBe(false);
 });

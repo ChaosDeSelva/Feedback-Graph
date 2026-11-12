@@ -2,8 +2,8 @@ import { createHash } from 'node:crypto';
 import { redactDeep } from '../redact.ts';
 import type { StoredFact } from '../graph/facts.ts';
 import type { Store } from '../store.ts';
-import type { Candidate, Claim, Conflict, DecisionTarget, Lesson, TargetSnapshot } from '../types.ts';
-import { claimFingerprint, conflictFingerprint, type ClaimSnapshotFields, type ConflictSnapshotFields } from '../intake/records.ts';
+import type { Candidate, Claim, Conflict, DecisionTarget, Lesson, Question, TargetSnapshot } from '../types.ts';
+import { claimFingerprint, conflictFingerprint, questionFingerprint, type ClaimSnapshotFields, type ConflictSnapshotFields } from '../intake/records.ts';
 import { ABSENT, canonicalJson, factStateFingerprint, lessonFingerprint, type FingerprintedFact, type LessonSnapshotFields, type MissLink } from './record.ts';
 import { thresholdsSnapshot } from '../loop/snapshots.ts';
 
@@ -63,6 +63,12 @@ export function conflictSnapshot(c: Conflict): TargetSnapshot {
   return { kind: 'conflict', id: c.id, fields, fingerprint: conflictFingerprint(c) };
 }
 
+/** A question as assign_question and close_question change it (IntakeStore.updateQuestion), and its project. */
+export function questionSnapshot(q: Pick<Question, 'id' | 'projectKey' | 'status' | 'assignee' | 'answerClaimId'>): TargetSnapshot {
+  const fields = { projectKey: q.projectKey, status: q.status, assignee: q.assignee, answerClaimId: q.answerClaimId };
+  return { kind: 'question', id: q.id, fields, fingerprint: questionFingerprint(q) };
+}
+
 /** A target as it is now. A project's state is its own floors (tune_threshold). */
 export async function snapshotTarget(s: DecisionExecStore, t: Pick<DecisionTarget, 'kind' | 'id'>): Promise<TargetSnapshot> {
   switch (t.kind) {
@@ -89,6 +95,10 @@ export async function snapshotTarget(s: DecisionExecStore, t: Pick<DecisionTarge
     case 'conflict': {
       const c = await s.intake.conflict(t.id);
       return c ? conflictSnapshot(c) : absentSnapshot(t);
+    }
+    case 'question': {
+      const q = await s.intake.question(t.id);
+      return q ? questionSnapshot(q) : absentSnapshot(t);
     }
   }
 }

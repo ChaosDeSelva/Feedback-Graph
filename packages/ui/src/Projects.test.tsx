@@ -1,6 +1,6 @@
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, beforeEach, expect, test, vi } from 'vitest';
-import { Projects } from './Projects.tsx';
+import { lessonsHint, Projects } from './Projects.tsx';
 import { heldAnswer } from './testing/heldAnswer.ts';
 
 const job = (status: string) => ({
@@ -1001,4 +1001,10 @@ test('a slow facts failure for the project you left never shows its error under 
   await failure.deliver();
   expect(screen.getByText('Other project fact')).toBeTruthy();
   expect(screen.queryByText(/graph unreachable/)).toBeNull();
+});
+
+test('the lessons tile says its count by status, adding up to it, and the global lessons counted apart', () => {
+  expect(lessonsHint({ lessonsByStatus: { approved: 138, proposed: 2, rejected: 144, revoked: 36, superseded: 1 }, globalLessons: 21 }))
+    .toBe('learned here: 138 approved, 2 proposed, 144 rejected, 36 revoked, 1 superseded; 21 global lessons not counted (the Lessons page lists them under every project)');
+  expect(lessonsHint({ lessonsByStatus: {}, globalLessons: 0 })).toBe('drawn from confirmed misses');
 });

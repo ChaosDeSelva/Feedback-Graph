@@ -197,7 +197,7 @@ describe('buildChatContext', () => {
     const pack = await buildChatContext('demo-shop', 'how do I add a modal in src/ui/Modal.tsx?', [], { ...d, sessionFiles });
     const miss = pack.sources.find((s) => s.kind === 'miss')!;
     expect(miss.ref).toBe('src/ui/Dialog.tsx');
-    expect(pack.context).toMatch(/\[S1\] built a second modal from scratch \(cause: context_available_ignored\) · in `src\/ui\/Dialog\.tsx`/);
+    expect(pack.context).toMatch(/\[S\d+\] built a second modal from scratch \(cause: context_available_ignored\) · in `src\/ui\/Dialog\.tsx`/);
     // A failing lookup leaves the id.
     const failed = await buildChatContext('demo-shop', 'how do I add a modal in src/ui/Modal.tsx?', [], { ...d, sessionFiles: async () => { throw new Error('db down'); } });
     expect(failed.sources.find((s) => s.kind === 'miss')!.ref).toBe('miss:1');

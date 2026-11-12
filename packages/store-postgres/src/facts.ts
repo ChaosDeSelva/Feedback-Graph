@@ -4,7 +4,7 @@ import { randomUUID } from 'node:crypto';
 import type pg from 'pg';
 import { clampRelevance, DEMO_SOURCE, FACT_EVIDENCE, FACT_ORIGINS_KEPT, factOrigin, requestTimes, scanRequestPaths, MANIFEST_WHY_RE, PROJECT_PATH, provenanceOf, holdsCredential, REDACT_PAGE, redactDeep, redactSecrets, relevanceOf, SCAN_UNAVAILABLE_WAIT_MS, scanRetryAt, redactStoredFact, reopensAsFact } from '@fb/core';
 import { factFingerprint, factStateFingerprint, TargetChangedError, thresholdsSnapshot, type FactSnapshotWrite, type FingerprintedFact } from '@fb/core';
-import type { EmbeddedFact, FactCheck, FactHit, FactKind, FactOrigin, FactScope, FactsStore, OlderScanFiles, OwnFactOrigin, Project, ScannedFile, ProjectSummary, RelevanceBy, ScanJob, ScanJobPatch, ScanQueueEntry, ScanStatus, StoredFact, RelevanceUpdate, UnscoredFact, RunTag, ProjectThresholds } from '@fb/core';
+import type { EmbeddedFact, FactCheck, FactHit, FactKind, FactOrigin, LessonStatus, FactScope, FactsStore, OlderScanFiles, OwnFactOrigin, Project, ScannedFile, ProjectSummary, RelevanceBy, ScanJob, ScanJobPatch, ScanQueueEntry, ScanStatus, StoredFact, RelevanceUpdate, UnscoredFact, RunTag, ProjectThresholds } from '@fb/core';
 import { iso, toJson, toVector, tx, type Db } from './db.ts';
 import { runSearch, sandboxPresence, searchFactsQuery, visibleToRun } from './vector.ts';
 
@@ -498,7 +498,8 @@ export class PgFactsStore implements FactsStore {
               (SELECT count(*) FROM sessions s WHERE s.project_key = p.key) AS sessions,
               -- A sandbox run's feedback, lessons and facts are counted for no one (they are served only to that run).
               (SELECT count(*) FROM feedback f WHERE f.project_key = p.key AND NOT EXISTS (SELECT 1 FROM candidates k WHERE k.id = f.id AND k.sandbox)) AS feedback,
-              (SELECT count(*) FROM lessons l WHERE l.project_key = p.key AND NOT l.sandbox) AS lessons,
+              (SELECT coalesce(jsonb_object_agg(status, n), '{}') FROM (SELECT l.status, count(*)::int AS n FROM lessons l WHERE l.project_key = p.key AND NOT l.sandbox GROUP BY l.status) s) AS lessons,
+              (SELECT count(*)::int FROM lessons l WHERE l.project_key IS NULL AND NOT l.sandbox) AS global_lessons,
               (SELECT count(*) FROM facts x WHERE x.project_key = p.key AND x.current AND NOT x.sandbox) AS facts,
               (SELECT count(*) FROM facts x WHERE x.project_key = p.key AND x.current AND NOT x.sandbox AND x.doc_id IS NOT NULL) AS document_facts,
               (SELECT count(*) FROM facts x WHERE x.project_key = p.key AND x.current AND NOT x.sandbox AND x.doc_id IS NULL
@@ -519,7 +520,9 @@ export class PgFactsStore implements FactsStore {
       aliases: r.aliases ?? [],
       sessions: r.sessions,
       feedback: r.feedback,
-      lessons: r.lessons,
+      lessons: Object.values(r.lessons as Record<string, number>).reduce((a, b) => a + b, 0),
+      lessonsByStatus: r.lessons as Partial<Record<LessonStatus, number>>,
+      globalLessons: r.global_lessons,
       facts: r.facts,
       factsByOrigin: { model: r.facts - r.document_facts - r.manifest_facts - r.your_facts - r.loop_facts - r.claim_facts, manifest: r.manifest_facts, document: r.document_facts, you: r.your_facts, loop: r.loop_facts, claim: r.claim_facts },
       lastScan: r.last ? jobOf(r.last) : null,

@@ -21,7 +21,7 @@ import type {
 import type { ExternalThread, GraphStore, InboxText, WorkSession } from '../store.ts';
 import { EXTERNAL_SOURCES, type ExternalRef, type FeedbackSource, type SessionSource } from '../types.ts';
 import { redactDeep } from '../redact.ts';
-import { candidateProvenance, matchReport, REPORT_MERGE_MINUTES } from '../dedupe.ts';
+import { candidateProvenance, matchReport, reportWindowMs } from '../dedupe.ts';
 import { MAX_POSTMORTEM_ATTEMPTS } from './knowledge.ts';
 import { VISIBLE_TO_RUN } from './runs.ts';
 import { SCHEMA } from './schema.ts';
@@ -338,14 +338,15 @@ export class GraphRepo implements GraphStore {
     return Number(r.get('n'));
   }
 
-  async saveClassification(turnUuid: string, c: Classification, makeCandidate: boolean): Promise<string | null> {
+  async saveClassification(turnUuid: string, c: Classification, makeCandidate: boolean, o: { embedding?: number[] | null } = {}): Promise<string | null> {
+    const embedding = o.embedding?.length ? o.embedding : null;
     await this.run(
       `MATCH (t:Turn {uuid: $uuid}) SET t.label = $c.label, t.confidence = $c.confidence, t.summary = $c.summary, t.signals = $c.signals`,
       { uuid: turnUuid, c },
     );
     if (!makeCandidate) return null;
     this.sandbox.mark(); // A transcript-derived candidate may inherit a sandbox binding from another process.
-    const merged = await this.mergeIntoReport(turnUuid);
+    const merged = await this.mergeIntoReport(turnUuid, embedding);
     if (merged) return merged;
     // The same words again in the same session or PR thread while the first is still pending: one Inbox item.
     const [same] = await this.run(
@@ -356,15 +357,36 @@ export class GraphRepo implements GraphStore {
       { uuid: turnUuid },
     );
     if (same) return same.get('id') as string;
+    // A reworded complaint, or the same one days later: one Inbox item with the pending one it means (dedupe.ts).
+    if (embedding) {
+      const [t] = await this.run(
+        `MATCH (p:Project)<-[:IN]-(s:Session)-[:HAS_TURN]->(t:Turn {uuid: $uuid}) WHERE NOT EXISTS { MATCH (:Candidate {id: t.uuid}) }
+         RETURN t.ts AS ts, t.text AS text, s.id AS sessionId, p.key AS key, s.run AS run`,
+        { uuid: turnUuid },
+      );
+      if (t && !Number.isNaN(Date.parse(t.get('ts')))) {
+        const t0 = Date.parse(t.get('ts'));
+        const rows = await this.run(
+          `MATCH (k:Candidate {projectKey: $key, status: 'pending'})-[:FLAGS]->(o:Turn) WHERE k.dedupeEmbedding IS NOT NULL AND coalesce(k.run, '') = coalesce($run, '')
+             AND datetime(k.createdAt) >= datetime($from) AND datetime(k.createdAt) <= datetime($to)
+           RETURN k.id AS id, k.sessionId AS sessionId, o.ts AS ts, o.text AS text, k.dedupeEmbedding AS embedding`,
+          { key: t.get('key'), run: t.get('run') ?? null, from: new Date(t0 - reportWindowMs({ embedding })).toISOString(), to: new Date(t0 + reportWindowMs({ embedding })).toISOString() },
+        );
+        const hit = matchReport({ ts: t.get('ts'), text: '', sessionId: null, embedding },
+          rows.map((r) => ({ id: r.get('id') as string, ts: r.get('ts') as string, text: '', sessionId: null, embedding: r.get('embedding') as number[] })));
+        if (hit) return hit.id;
+      }
+    }
     await this.run(
       `MATCH (t:Turn {uuid: $uuid})
        WITH t WHERE $makeCandidate
        MATCH (p:Project)<-[:IN]-(s:Session)-[:HAS_TURN]->(t)
        MERGE (k:Candidate {id: t.uuid})
          ON CREATE SET k.status = 'pending', k.createdAt = $now, k.decidedAt = null, k.note = null
-       SET k.turnUuid = t.uuid, k.sessionId = s.id, k.projectKey = p.key, k.ts = t.ts, k.source = coalesce(s.source, 'claude'), k.run = s.run, k.sandbox = coalesce(s.sandbox, false)
+       SET k.turnUuid = t.uuid, k.sessionId = s.id, k.projectKey = p.key, k.ts = t.ts, k.source = coalesce(s.source, 'claude'), k.run = s.run, k.sandbox = coalesce(s.sandbox, false),
+           k.dedupeEmbedding = coalesce($embedding, k.dedupeEmbedding)
        MERGE (k)-[:FLAGS]->(t)`,
-      { uuid: turnUuid, makeCandidate, now: new Date().toISOString() },
+      { uuid: turnUuid, makeCandidate, now: new Date().toISOString(), embedding },
     );
     return turnUuid;
   }
@@ -374,7 +396,7 @@ export class GraphRepo implements GraphStore {
    * sees the real session) and its manual stand-in session goes; a decided one only records the detector. Returns the
    * report's Inbox id if merged, else null.
    */
-  private async mergeIntoReport(turnUuid: string): Promise<string | null> {
+  private async mergeIntoReport(turnUuid: string, embedding: number[] | null): Promise<string | null> {
     const [turn] = await this.run(
       `MATCH (p:Project)<-[:IN]-(s:Session)-[:HAS_TURN]->(t:Turn {uuid: $uuid})
        WHERE NOT EXISTS { MATCH (:Candidate {id: t.uuid}) } AND t.ts IS NOT NULL AND NOT coalesce(s.source, 'claude') IN $external
@@ -391,8 +413,8 @@ export class GraphRepo implements GraphStore {
        RETURN k, mt`,
       {
         key: turn.get('projectKey'), run: turn.get('run') ?? null,
-        from: new Date(t0 - REPORT_MERGE_MINUTES * 60_000).toISOString(),
-        to: new Date(t0 + REPORT_MERGE_MINUTES * 60_000).toISOString(),
+        from: new Date(t0 - reportWindowMs({ embedding })).toISOString(),
+        to: new Date(t0 + reportWindowMs({ embedding })).toISOString(),
       },
     );
     const reports = rows.map((r) => {
@@ -401,9 +423,9 @@ export class GraphRepo implements GraphStore {
         manual: true, detected: false, agentReport: k.agentReport ? JSON.parse(k.agentReport) : null,
         turnText: r.get('mt').properties.text, turnWhatWasDone: r.get('mt').properties.precedingAssistantText, createdAt: k.createdAt,
       });
-      return { id: k.id as string, status: k.status as CandidateStatus, report: agentReport!, ts: k.createdAt as string, text: agentReport!.text, sessionId: agentReport!.sessionId };
+      return { id: k.id as string, status: k.status as CandidateStatus, report: agentReport!, ts: k.createdAt as string, text: agentReport!.text, sessionId: agentReport!.sessionId, embedding: (k.dedupeEmbedding as number[] | undefined) ?? null };
     });
-    const hit = matchReport({ ts: turn.get('ts'), text: turn.get('text') ?? '', sessionId: turn.get('sessionId') }, reports);
+    const hit = matchReport({ ts: turn.get('ts'), text: turn.get('text') ?? '', sessionId: turn.get('sessionId'), embedding }, reports);
     if (!hit) return null;
     if (hit.status !== 'pending') {
       await this.run(`MATCH (k:Candidate {id: $id}) SET k.detected = true, k.detectedTurnUuid = $uuid`, { id: hit.id, uuid: turnUuid });

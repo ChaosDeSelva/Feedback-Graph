@@ -39,7 +39,7 @@ const Decision = z.object({
   tier: z.enum(['H', 'A', 'P']), mode: z.enum(['observe', 'propose', 'auto']), rationale: str, model: nullable(str), policyVersion: int,
   status: Status, dependsOn: z.array(str), supersededBy: str.optional(), createdAt: str, appliedAt: str.optional(), decidedAt: str.optional(),
   decidedBy: str.optional(), rollback: z.object({ at: str, by: str, reason: nullable(Reason), note: nullable(str), cascade: z.array(str) }).strict().optional(),
-  ratifiedAt: str.optional(), ratifiedBy: str.optional(), syncHoldUntil: str.optional(),
+  ratifiedAt: str.optional(), ratifiedBy: str.optional(), syncHoldUntil: str.optional(), needsYou: str.optional(),
 }).strict();
 const DecisionNote = z.object({ id: str, decisionId: str, ts: str, by: str, text: str, verdict: z.enum(['agree', 'disagree']).nullable().optional(), reason: Reason.optional() }).strict();
 const Activity = z.object({ id: str, ts: str, kind: str, actor: str, projectKey: nullable(str), subject: str, why: str, details: z.record(z.unknown()), targets: z.array(str) }).passthrough();

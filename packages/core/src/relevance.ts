@@ -1,4 +1,5 @@
-// Browser-safe (the UI imports @fb/core/relevance): type imports and types.ts only.
+// Browser-safe (the UI imports @fb/core/relevance): type imports, types.ts and thresholds.ts (constants) only.
+import { SERVE_BY_MEANING } from './thresholds.ts';
 import type { FactHit } from './graph/facts.ts';
 import { UNSCORED_RELEVANCE, type FactOrigin } from './types.ts';
 
@@ -19,8 +20,8 @@ export const EVERYDAY_FROM = 0.8;
 /** A rare fact (relevance < MIN_RELEVANCE) is served only when the task is at least this close to it. */
 export const MIN_RELEVANCE = 0.3;
 const CLOSE_ENOUGH = 0.8;
-/** Similarity below which a past miss or a fact is never served, whatever else ranks: a nonsense task gets nothing. */
-export const SIMILARITY_FLOOR = 0.78;
+/** Similarity below which a past miss or a fact is never served, whatever else ranks: a nonsense task gets nothing (thresholds.ts). */
+export const SIMILARITY_FLOOR = SERVE_BY_MEANING;
 /** Field-calibrated weighted fact rank threshold; custom low-scale embedders keep their explicit calibration. */
 export const FACT_RANK_FLOOR = 0.80;
 /**

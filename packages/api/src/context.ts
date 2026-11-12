@@ -180,7 +180,8 @@ const sessionTarget = (q: { sessionId?: string | null }) => (q.sessionId ? [q.se
  * A lesson served as context. files: the files the agent named that it bears on (by its paths or its misses). trigger:
  * the trigger of the lesson that fired on the task or change (lessonTriggers.ts), when one did.
  */
-export type TaskLesson = LessonHit & { files?: string[]; trigger?: TriggerHit };
+/** meaning: served for being close by meaning alone (search_graph's second tier), so the agent checks it applies. */
+export type TaskLesson = LessonHit & { files?: string[]; trigger?: TriggerHit; meaning?: true };
 
 /** `client`: who is asking (an MCP client name), for the provenance log. */
 export type ProjectRef = { project?: string; cwd?: string; client?: string };
@@ -389,6 +390,18 @@ const whyServed = (t: TriggerHit) => `why served: ${triggerWhy(t).replace(/[\r\n
  * The approved lessons learned in this project that have triggers (the newest TRIGGER_POOL): what a task's files and
  * words, or a change's diff, are matched against. None without listLessons.
  */
+/** The project's approved lessons at or above the similarity floor, by meaning, other than those already chosen (search_graph's second tier). */
+function closeLessons(found: Pick<Awaited<ReturnType<typeof searchProject>>, 'pool' | 'floors'>, project: Project, own: boolean, chosen: LessonHit[]): TaskLesson[] {
+  if (!own) return [];
+  const have = new Set(chosen.map((h) => h.lesson.id));
+  return found.pool
+    .filter((h) => (h.lesson.projectKey === project.key || h.lesson.origin === project.key) && !h.lesson.checks?.some((c) => c.name === 'no-miss') && h.score >= found.floors.similarity && !have.has(h.lesson.id))
+    .map((h) => ({ ...h, meaning: true as const }));
+}
+
+/** Whether a named file is not in the code map (mods: namedModules; null when there is no code map to ask). */
+const anyUnmapped = (files: string[], mods: (ModuleContext | null)[] | null) => !!mods && files.slice(0, CODE_FILES_K).some((_, i) => !mods[i]);
+
 async function triggerPool(project: Project, d: ContextDeps): Promise<Lesson[]> {
   if (!d.k.listLessons) return [];
   const projectKeys = await shownKeys(d);
@@ -739,7 +752,13 @@ async function ticketSection(projectKey: string, docs: DocHit[], d: ContextDeps,
 }
 
 export async function getTaskContext(
-  q: ProjectRef & { task: string; files?: string[]; brief?: boolean; trustedFilesOnly?: boolean; sessionId?: string; sessionStartedAt?: string | null },
+  q: ProjectRef & {
+    task: string; files?: string[]; brief?: boolean; trustedFilesOnly?: boolean; sessionId?: string; sessionStartedAt?: string | null;
+    /** Ask: also the approved lessons closest to the task by meaning (as search_graph serves them), after the tied and triggered ones. */
+    byMeaning?: boolean;
+    /** Ask: files a lesson's path triggers are matched on but nothing is tied to (the mapped files of a folder the question names). */
+    triggerFiles?: string[];
+  },
   d: ContextDeps,
 ): Promise<TaskContext> {
   d = { ...d, excludedPrNumbers: new Set() };
@@ -765,7 +784,11 @@ export async function getTaskContext(
   const { facts, fileFacts } = factsForFiles(found.facts, files, held);
   const docs = await withoutOwnPr(found.docs, q, project, d);
   // Lessons tied to a named file, then those whose triggers fire on the named files or the task's words.
-  const lessons = await withoutOwnPrLessons(withTriggered(rankByFiles(hits, byFile, project.key), pool, { files, text: q.task }), q, project, d);
+  const ranked = withTriggered(rankByFiles(hits, byFile, project.key), pool, { files: [...files, ...(q.triggerFiles ?? [])], text: q.task });
+  // A file not in the code map (a new one, most often) has no ties of its own: the lessons closest to the task by
+  // meaning join the path and trigger matches, marked for the agent to check, as Ask's do.
+  const meaning = q.byMeaning || anyUnmapped(files, mods);
+  const lessons = await withoutOwnPrLessons(meaning ? [...ranked, ...closeLessons(found, project, own, ranked).slice(0, LESSON_K)] : ranked, q, project, d);
   // Misses on the named files come first and are not repeated among the similar ones.
   const fileMisses = await withoutOwnPrMisses(latestMisses(mods), q, project, d);
   // A similar miss is served only when it shares a file with the task or is close to it (missAdmitted): one merely in
@@ -779,9 +802,9 @@ export async function getTaskContext(
   if (fileMisses.length || misses.length || facts.length || fileFacts.length || docs.length || recent.length || mods || linked.length) lines.push(DATA_NOTE, '');
   if (lessons.length) {
     lines.push('## Approved lessons (follow these)');
-    for (const { lesson: l, score, files: on, trigger } of lessons) {
+    for (const { lesson: l, score, files: on, trigger, meaning: byMeaning } of lessons) {
       const tied = on ? `touches ${on.map((f) => oneLine(f)).join(', ')}${found.hits.some((h) => h.lesson.id === l.id) ? ` · relevance ${score.toFixed(2)}` : ''}` : null;
-      const why = [tied, trigger ? whyServed(trigger) : null].filter(Boolean).join(' · ') || `relevance ${score.toFixed(2)}`;
+      const why = [tied, trigger ? whyServed(trigger) : null].filter(Boolean).join(' · ') || (byMeaning ? `${rankMatch(score)}, by meaning: check it applies` : `relevance ${score.toFixed(2)}`);
       lines.push(`- **${l.title}**: ${l.rule}${disputeMark(l.id, disputes)}`);
       lines.push(`  - applies when: ${l.appliesWhen || 'n/a'} · scope: ${l.scope} · lesson ${l.id} · ${why}`);
     }
@@ -971,8 +994,7 @@ export async function searchGraph(q: ProjectRef & { query: string }, d: ContextD
   // Search is by meaning: after the lessons tied to a file the query names (the rules get_task_context serves), the
   // project's approved lessons closest to the query, at or above the similarity floor.
   const tied = new Set(found.hits.map((h) => h.lesson.id));
-  const close = own ? found.pool.filter((h) => (h.lesson.projectKey === project.key || h.lesson.origin === project.key) && !h.lesson.checks?.some((c) => c.name === 'no-miss') && h.score >= found.floors.similarity && !tied.has(h.lesson.id)) : [];
-  const hits = await withoutOwnPrLessons([...found.hits, ...close], { task: q.query }, project, d);
+  const hits = await withoutOwnPrLessons([...found.hits, ...closeLessons(found, project, own, found.hits)], { task: q.query }, project, d);
   const docs = await withoutOwnPr(found.docs, { task: q.query }, project, d);
   const lessons = hits.slice(0, LESSON_K).map((h) => ({ ...h, tied: tied.has(h.lesson.id) }));
   const disputes = await disputesOf([...lessons.map((h) => h.lesson.id), ...(own ? facts.map((h) => h.fact.id) : [])], d.intake);
@@ -1228,11 +1250,12 @@ async function checkBeforeDoneWork(
   const changed = taskFiles({ ...q, files: q.filesChanged }, d.roots);
   const work = `${q.task}\n${q.summary}`;
   const [embedding] = await d.embed([work]);
-  const [searched, byFile, codeGaps, pool] = await Promise.all([
+  const [searched, byFile, codeGaps, pool, mods] = await Promise.all([
     d.k.searchLessons({ embedding, projectKey: project.key, k: LESSON_POOL, ...(await shownKeys(d).then((projectKeys) => projectKeys && { projectKeys })) }),
     changed.length && d.codegraph ? d.codegraph.lessonsForPaths(project.key, changed).then((x) => shownLessons(d, x, (y) => y.lesson)) : Promise.resolve([]),
     codeGapsFor(project.key, changed, d),
     triggerPool(project, d),
+    namedModules(project.key, changed, d),
   ]);
   // The repository's diff is read at most once per check: for the triggers' added lines here, and for the judge below.
   let repoRead: ReturnType<NonNullable<ContextDeps['repoDiff']>> | undefined;
@@ -1250,7 +1273,10 @@ async function checkBeforeDoneWork(
   const found = rankLessons(searched, work, { files: changed, projectKey: project.key }).slice(0, LESSON_K);
   // Approved lessons tied to a changed file come first, even when the search ranked them below its top hits or under
   // the floor; the search's own hits all stay.
-  const own = byFile.length ? [...rankByFiles(found, byFile, project.key).filter((h) => h.files), ...found.filter((h) => !byFile.some((m) => m.lesson.id === h.lesson.id))] : found;
+  const tiedFirst = byFile.length ? [...rankByFiles(found, byFile, project.key).filter((h) => h.files), ...found.filter((h) => !byFile.some((m) => m.lesson.id === h.lesson.id))] : found;
+  // A changed file not in the code map has no ties of its own: the lessons closest to the work by meaning are judged
+  // too (get_task_context served them for such a file, marked "check it applies").
+  const own = anyUnmapped(changed, mods) ? [...tiedFirst, ...closeLessons({ pool: searched, floors: await floorsFor(project.key, d) }, project, true, tiedFirst).slice(0, LESSON_K)] : tiedFirst;
   // Then the lessons whose triggers fire on the change, however far the embedding ranked them.
   const lessons = await withoutOwnPrLessons(withTriggered(own, pool, change), q, project, d);
   // Tied to a changed file by its own paths or its miss's files (byFile), wherever it ranked: a lesson past the LESSON_K
@@ -2144,15 +2170,18 @@ export async function getModuleContext(q: ProjectRef & { path: string }, d: Cont
   const found = indexed?.outside && d.parseSymbols ? { ...indexed, symbols: (await d.parseSymbols(project.repoPath, path).catch(() => null)) ?? [] } : indexed;
   const m = found && { ...found, misses: await withoutOwnPrMisses(realMisses(found.misses), { task: q.path }, project, d), lessons: (await withoutOwnPrLessons((await shownLessons(d, found.lessons, (l) => l)).map((lesson) => ({ lesson, score: 1 })), { task: q.path }, project, d)).map((hit) => hit.lesson) };
   const answer = m ? moduleMarkdown(project.key, m, graphGaps(project.key, meta), mapBuildNote(meta), meta) : null;
-  const markdown = answer ? answer.markdown : await notMapped(project, [path], d);
-  const served = answer?.served ?? { lessons: [], misses: [] };
+  // Not in the map (a new file, most often, where lessons matter most): the lessons its path or a folder trigger
+  // names, then those closest to it by meaning, marked to check, as search_graph serves them.
+  const fallback = m ? null : await unmappedLessons(project, path, d);
+  const markdown = answer ? answer.markdown : [await notMapped(project, [path], d), ...unmappedLessonLines(fallback!)].join('\n');
+  const served = answer?.served ?? { lessons: fallback!.map((h) => h.lesson.id), misses: [] };
   await d.activity?.record({
     kind: 'context_served',
     actor: q.client ?? 'agent (MCP)',
     projectKey: project.key,
     subject: m
       ? `module context for ${path}: ${n(m.importers.length, 'importer')}, ${n(m.tests.length, 'test')}, ${n(m.lessons.length, 'lesson')}, ${n(m.misses.length, 'past miss', 'past misses')}`
-      : `module context for ${path}: not in the code map`,
+      : `module context for ${path}: not in the code map, ${n(served.lessons.length, 'lesson')} by path, trigger or meaning`,
     why: 'an agent called get_module_context',
     // Counts, and the ids of what the answer showed: a shared file's misses and their quotes are not copied per call.
     details: {
@@ -2170,6 +2199,33 @@ export async function getModuleContext(q: ProjectRef & { path: string }, d: Cont
     targets: [...served.lessons, ...served.misses],
   });
   return { markdown, module: m };
+}
+
+/**
+ * The approved lessons for a file the code map does not hold: those whose paths cover it (a folder or a glob) or whose
+ * path triggers fire on it, then up to LESSON_K closest to its path by meaning, at or above the similarity floor.
+ */
+async function unmappedLessons(project: Project, path: string, d: ContextDeps): Promise<TaskLesson[]> {
+  const projectKeys = await shownKeys(d);
+  const [embedding] = await d.embed([path.replace(/[/._-]+/g, ' ')]);
+  const [byFile, pool, searched, floors] = await Promise.all([
+    d.codegraph ? d.codegraph.lessonsForPaths(project.key, [path]).then((x) => shownLessons(d, x, (y) => y.lesson)) : Promise.resolve([]),
+    triggerPool(project, d),
+    d.k.searchLessons({ embedding, projectKey: project.key, k: LESSON_POOL, ...(projectKeys && { projectKeys }) }),
+    floorsFor(project.key, d),
+  ]);
+  const onPath = withTriggered(byFile.map((m) => ({ lesson: m.lesson, score: 1, files: m.paths })), pool, { files: [path] });
+  return withoutOwnPrLessons([...onPath, ...closeLessons({ pool: searched, floors }, project, true, onPath).slice(0, LESSON_K)], { task: path }, project, d);
+}
+
+function unmappedLessonLines(lessons: TaskLesson[]): string[] {
+  const onPath = lessons.filter((h) => !h.meaning);
+  const close = lessons.filter((h) => h.meaning);
+  if (!lessons.length) return ['', 'No approved lesson names this path, has a trigger that fires on it, or is close to it by meaning.'];
+  return [
+    ...(onPath.length ? ['', '## Approved lessons on this path (follow these)', ...onPath.flatMap(({ lesson: l, trigger }) => [`- **${l.title}**: ${l.rule}`, `  - applies when: ${l.appliesWhen || 'n/a'} · lesson ${l.id} · ${trigger ? whyServed(trigger) : `its paths cover ${code(l.paths.join(', '))}`}`])] : []),
+    ...(close.length ? ['', '## Approved lessons close to it by meaning (check each applies)', ...close.flatMap(({ lesson: l, score }) => [`- **${l.title}**: ${l.rule}`, `  - applies when: ${l.appliesWhen || 'n/a'} · lesson ${l.id} · ${rankMatch(score)}, by meaning: check it applies`])] : []),
+  ];
 }
 
 const moreTests = (from: 'file' | 'change') => (k: number) => `and ${n(k, 'more test', 'more tests')}, farther from the ${from} (nearest first above): run the suites of the folders above if you need more`;
@@ -2361,7 +2417,10 @@ export async function reportFeedback(
 ): Promise<{ id: string | null; markdown: string }> {
   const project = await resolveIn(q, d);
   if (!project) return { id: null, markdown: UNKNOWN_PROJECT(q) };
-  const id = await d.k.createManualFeedback({ project, cwd: q.cwd ?? project.repoPath, text: q.feedback, whatWasDone: q.whatWasDone, sessionId: q.sessionId ?? null });
+  // Embedded so a reworded or next-day report of the same miss joins its item (core dedupe.ts); the embedder down only
+  // means it is matched by words and session.
+  const [embedding] = await d.embed([q.feedback]).catch(() => [null]);
+  const id = await d.k.createManualFeedback({ project, cwd: q.cwd ?? project.repoPath, text: q.feedback, whatWasDone: q.whatWasDone, sessionId: q.sessionId ?? null, embedding });
   // A new report gets a manual: id; any other id is the detector's item for the same miss, which the report joined.
   const merged = !id.startsWith('manual:');
   await d.activity?.record({

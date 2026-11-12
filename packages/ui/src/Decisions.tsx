@@ -1,8 +1,8 @@
 import { Fragment, useEffect, useId, useRef, useState, type FormEvent } from 'react';
 import { ActivityEntry } from './Activity.tsx';
 import {
-  ApiError, DECISION_STATUSES, DECISION_TYPES, LOOP_CHANGED_EVENT, loopApi, NOTE_REASONS,
-  type Decision, type DecisionAction, type DecisionDetail, type DecisionFilter, type DecisionMode, type DecisionStatus, type DecisionSummary, type DecisionType,
+  api, ApiError, DECISION_STATUSES, DECISION_TYPES, LOOP_CHANGED_EVENT, loopApi, NOTE_REASONS,
+  type Decision, type DecisionAction, type DecisionDetail, type DecisionFilter, type DecisionMode, type DecisionStatus, type DecisionSummary, type DecisionType, type DistinctPair,
   type ResolvedEvidence, type RollbackPreview, type RollbackReason,
 } from './api.ts';
 import { hashFilters, hashFocus, inboxHref, lessonHref, moduleHref, projectHref, saveHashFilters, sessionHref } from './links.ts';
@@ -18,6 +18,13 @@ import { ScrollArea } from './ui/ScrollArea.tsx';
 
 /** Every request fails with an Error (api.ts): the API's own words, or that it did not answer. */
 const message = (e: unknown) => (e as Error).message;
+/** How far back the Decisions page counts the proposals your own changes expired. */
+const EXPIRED_NOTICE_DAYS = 7;
+/** How many waiting proposals the owner's own changes expired in the last EXPIRED_NOTICE_DAYS (their Activity lines). */
+export function expiredLately(xs: { ts: string; details: Record<string, unknown> }[], now = Date.now()): number {
+  return xs.filter((a) => a.details.action === 'expired_by_you' && now - Date.parse(a.ts) <= EXPIRED_NOTICE_DAYS * 86_400_000)
+    .reduce((n, a) => n + (typeof a.details.expired === 'number' ? a.details.expired : 0), 0);
+}
 const STATUS_OPTIONS = ['proposed', 'all', ...DECISION_STATUSES.filter((s) => s !== 'proposed')] as const;
 type StatusOption = (typeof STATUS_OPTIONS)[number];
 const MODES: DecisionMode[] = ['auto', 'propose', 'observe'];
@@ -461,6 +468,64 @@ const toQuery = (f: Filters): DecisionFilter => ({
 const canDecide = (s: string) => s === 'proposed' || s === 'observed';
 
 /** The audit log: every decision the loop made, with what it changed, why, and a way to undo it. */
+/** The two records a merge decision joins (its keeper and the one merged into it), or null for any other decision. */
+export function mergePair(d: Pick<Decision, 'type' | 'targets'>): { a: string; b: string } | null {
+  if (d.type !== 'merge_duplicates' && d.type !== 'merge_claims') return null;
+  const keeper = d.targets.find((t) => t.role === 'keeper');
+  const merged = d.targets.find((t) => t.role === 'merged');
+  return keeper && merged ? { a: keeper.id, b: merged.id } : null;
+}
+
+/**
+ * On a merge decision: "Never merge these two" records the pair so the loop never proposes merging it again, and the
+ * never-merge records naming either record are listed, each of which you can lift.
+ */
+function NeverMerge({ pair }: { pair: { a: string; b: string } }) {
+  const [pairs, setPairs] = useState<DistinctPair[] | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const load = () => loopApi.distinctPairs([pair.a, pair.b]).then(setPairs, (e) => setError(message(e)));
+  useEffect(() => { setPairs(null); setError(null); void load(); }, [pair.a, pair.b]);
+  const run = async (f: () => Promise<unknown>) => {
+    setBusy(true);
+    setError(null);
+    try { await f(); await load(); } catch (e) { setError(message(e)); } finally { setBusy(false); }
+  };
+  const [x, y] = distinctOrder(pair.a, pair.b);
+  const marked = pairs?.some((p) => p.a === x && p.b === y) ?? false;
+  return (
+    <Card title="Never merge" bodyClass="grid gap-2 p-3">
+      {error && <Alert>{error}</Alert>}
+      {pairs === null ? <p className="text-xs text-muted">Loading…</p> : (
+        <>
+          {marked
+            ? <p className="text-[13px]">You said these two are not the same: the loop never proposes merging them again.</p>
+            : (
+              <div className="flex flex-wrap items-center gap-2">
+                <Button size="sm" owner disabled={busy} onClick={() => void run(() => loopApi.markDistinct({ a: pair.a, b: pair.b, reason: 'you marked them as not the same on the Decisions page' }))}>Never merge these two</Button>
+                <span className="text-xs text-muted">The loop never proposes merging them again, whatever the evidence; reject this one to close it.</span>
+              </div>
+            )}
+          {pairs.length > 0 && (
+            <ul aria-label="never-merge records" className="grid gap-1">
+              {pairs.map((p) => (
+                <li key={`${p.a}|${p.b}`} className="flex flex-wrap items-center gap-2 text-xs">
+                  <span className="min-w-0 flex-1 font-mono [overflow-wrap:anywhere]">{p.a} ≠ {p.b}</span>
+                  <span className="text-muted">{p.reason} · {p.by} · {longTime(p.at)}</span>
+                  <Button size="sm" variant="ghost" owner disabled={busy} aria-label={`lift never merge ${p.a} and ${p.b}`} onClick={() => void run(() => loopApi.liftDistinct(p.a, p.b))}>Lift</Button>
+                </li>
+              ))}
+            </ul>
+          )}
+        </>
+      )}
+    </Card>
+  );
+}
+
+/** Mirrors core distinctKey: a pair is stored with its ids in order. */
+const distinctOrder = (x: string, y: string): [string, string] => (x < y ? [x, y] : [y, x]);
+
 export function Decisions() {
   const writes = useOwnerWrites();
   const [filters, setFilters] = useState<Filters>(filtersFromHash);
@@ -486,6 +551,20 @@ export function Decisions() {
   const [busy, setBusy] = useState(false);
   const [dialog, setDialog] = useState<'rollback' | 'restore' | null>(null);
   const [exporting, setExporting] = useState(false);
+  // Why you approve or reject: the note joins the decision's notes (agree or disagree), a reject's reason with it.
+  // Proposals your own changes expired lately (the Activity lines that say so): a notice, so none vanish unannounced.
+  const [expiredByYou, setExpiredByYou] = useState(0);
+  const [listedOnce, setListedOnce] = useState(false);
+  useEffect(() => { if (loaded) setListedOnce(true); }, [loaded]);
+  useEffect(() => {
+    if (!listedOnce) return;
+    const load = () => api.activity({ kind: 'decision_made', limit: 200 }).then((xs) => setExpiredByYou(expiredLately(xs)), () => {});
+    load();
+    window.addEventListener(LOOP_CHANGED_EVENT, load);
+    return () => window.removeEventListener(LOOP_CHANGED_EVENT, load);
+  }, [listedOnce]);
+  const [actNote, setActNote] = useState('');
+  const [actReason, setActReason] = useState<RollbackReason | ''>('');
   const noteId = useId();
   const moreId = useId();
   // Open when a link or the address already sets one of the folded filters, so none is applied out of sight.
@@ -538,6 +617,8 @@ export function Decisions() {
     setDetail(null);
     setError(null);
     setDialog(null);
+    setActNote('');
+    setActReason('');
     if (current) return loadDetail(current.id);
   }, [current?.id]);
 
@@ -588,7 +669,10 @@ export function Decisions() {
     setError(null);
     setRefusal(null);
     try {
-      await loopApi.act(d.id, action, { expect: d.status });
+      const note = actNote.trim();
+      await loopApi.act(d.id, action, { expect: d.status, ...(note && { note }), ...(action === 'reject' && actReason && { reason: actReason }) });
+      setActNote('');
+      setActReason('');
       await refresh(d.id);
     } catch (e) {
       if (!(e instanceof ApiError && e.status === 409)) setError(message(e));
@@ -639,6 +723,7 @@ export function Decisions() {
   const filtered = filters.type || filters.project || filters.mode || filters.band || filters.since || filters.until || filters.target || filters.q;
   const clear = () => { setQDraft(''); setTargetDraft(''); set({ type: '', project: '', mode: '', band: '', since: '', until: '', target: '', q: '' }); };
   const d = detail?.decision;
+  const pair = d ? mergePair(d) : null;
 
   return (
     <div className="flex h-full min-h-0 flex-col">
@@ -657,9 +742,15 @@ export function Decisions() {
         listWidth="26rem"
         listHeader={
           <>
+            {expiredByYou > 0 && filters.status !== 'expired' && (
+              <p role="status" className="flex w-full flex-wrap items-center gap-2 rounded-md border border-accent-edge/50 bg-accent-soft px-2.5 py-1.5 text-xs text-accent-text">
+                {plural(expiredByYou, 'waiting proposal')} expired in the last {EXPIRED_NOTICE_DAYS} days: you decided their targets yourself.
+                <Button size="sm" variant="ghost" onClick={() => set({ status: 'expired' })}>Show expired</Button>
+              </p>
+            )}
             <div className="grid w-full grid-cols-2 gap-2">
               <Select aria-label="status" size="sm" value={filters.status} onChange={(e) => set({ status: e.target.value as StatusOption })}>
-                {STATUS_OPTIONS.map((s) => <option key={s} value={s}>{s === 'all' ? 'every status' : statusLabel(s)}</option>)}
+                {STATUS_OPTIONS.map((s) => <option key={s} value={s}>{s === 'all' ? 'every status' : s === 'proposed' ? 'needs you' : statusLabel(s)}</option>)}
               </Select>
               <Select aria-label="type" size="sm" value={filters.type} onChange={(e) => set({ type: e.target.value as DecisionType | '' })}>
                 <option value="">every type</option>
@@ -715,6 +806,7 @@ export function Decisions() {
                       <Time iso={x.createdAt} className="shrink-0" />
                     </div>
                     <div className="mt-0.5 line-clamp-2 text-[13px] leading-snug">{x.rationale}</div>
+                    {x.needsYou && <div className="mt-0.5 truncate text-xs text-accent-text" title={x.needsYou}>Needs you: {x.needsYou}</div>}
                     <div className="mt-1 flex flex-wrap items-center gap-1">
                       <Badge tone={decisionTone(x.status)} dot>{statusLabel(x.status)}</Badge>
                       <span className="text-xs text-muted tabular-nums">p {p2(x.confidence.p)}</span>
@@ -775,6 +867,7 @@ export function Decisions() {
                 <Card title="What changed"><DiffTable detail={detail} /></Card>
 
                 <Card title="Why" bodyClass="grid gap-2 p-3">
+                  {d.needsYou && <p className="rounded-md bg-accent-soft px-2 py-1 text-[13px] text-accent-text">Needs you: {d.needsYou}</p>}
                   <p className="whitespace-pre-wrap [overflow-wrap:anywhere]">{d.rationale}</p>
                   <p className="text-xs text-muted">Model <span className="font-mono">{d.model ?? 'deterministic'}</span> · policy v{d.policyVersion} · score {p2(d.score)}</p>
                   {Object.keys(d.features).length > 0 && (
@@ -796,6 +889,8 @@ export function Decisions() {
                   <div className="grid content-start gap-1.5"><SectionLabel as="div">Depended on by</SectionLabel><SummaryList items={detail.dependents} empty="No later decision builds on it." /></div>
                 </Card>
 
+                {pair && <NeverMerge pair={pair} />}
+
                 <Notes detail={detail} noteId={noteId} onAdded={() => void refresh(d.id).catch((e) => setError(message(e)))} />
               </div>
             ) : current ? <SkeletonDetail /> : null}
@@ -805,6 +900,17 @@ export function Decisions() {
               <div className="mx-auto flex w-full max-w-3xl flex-wrap items-center gap-2 px-4 py-2.5 md:px-6">
                 {canDecide(d.status) && (
                   <>
+                    <label className="flex min-w-48 flex-1 items-center gap-2 text-xs text-muted">
+                      <span className="shrink-0">Note</span>
+                      <Input size="sm" value={actNote} onChange={(e) => setActNote(e.target.value)} maxLength={4000} placeholder="optional: why, kept in its notes" className="w-full" disabled={!writes} />
+                    </label>
+                    <label className="flex items-center gap-2 text-xs text-muted">
+                      <span className="shrink-0">Reason to reject</span>
+                      <Select size="sm" value={actReason} onChange={(e) => setActReason(e.target.value as RollbackReason | '')} disabled={!writes}>
+                        <option value="">none given</option>
+                        {NOTE_REASONS.map((r) => <option key={r} value={r}>{reasonLabel(r)}</option>)}
+                      </Select>
+                    </label>
                     <Button variant="primary" owner disabled={busy} onClick={() => void act('approve')}>Approve <Kbd>a</Kbd></Button>
                     <Button owner disabled={busy} onClick={() => void act('reject')}>Reject <Kbd>x</Kbd></Button>
                   </>

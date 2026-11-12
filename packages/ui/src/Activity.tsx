@@ -66,6 +66,7 @@ const KIND_LABEL: Record<ActivityKind | LoopActivityKind, string> = {
   conflict_found: 'conflict found',
   conflict_resolved: 'conflict resolved',
   person_changed: 'person changed',
+  cloud_settings_changed: 'cloud sync setting changed',
 };
 /** Every kind the kind filter offers: the core ones, then the learning loop's. */
 const KINDS = [...ACTIVITY_KINDS, ...LOOP_ACTIVITY_KINDS.filter((k) => !(ACTIVITY_KINDS as readonly string[]).includes(k))] as (ActivityKind | LoopActivityKind)[];

@@ -35,10 +35,14 @@ they were, it is observed again and moves on. The export buttons page through th
 `Decision` is core's type (`packages/core/src/types.ts`), with `before`, `after` as `TargetSnapshot[]`:
 
 ```ts
-TargetSnapshot = { kind: 'lesson'|'fact'|'miss'|'candidate'|'project', id: string, fields: Record<string, unknown>, fingerprint: string }
-EvidenceRef    = { kind: 'activity'|'miss'|'lesson'|'fact'|'check'|'session'|'candidate', id, role: string, weight: number, observedAt }
+TargetSnapshot = { kind: 'lesson'|'fact'|'miss'|'candidate'|'project'|'claim'|'conflict'|'question', id: string, fields: Record<string, unknown>, fingerprint: string }
+EvidenceRef    = { kind: 'activity'|'miss'|'lesson'|'fact'|'check'|'session'|'candidate'|'claim'|'conflict'|'question', id, role: string, weight: number, observedAt }
 confidence     = { p, lower, n, band }   // n: the owner's own labels for this type and band
+needsYou?      : string                  // a proposed decision only (0.9.1): why the loop could not decide it, in one line
 ```
+
+`GET /api/distinct-pairs?ids=a,b`, `POST /api/distinct-pairs {a, b, reason?}` and `DELETE /api/distinct-pairs {a, b}`
+(yours only) read, record and lift the pairs the loop never merges (0.9.1, [types](learning-loop-types.md)).
 
 ### `GET /api/decisions/:id`
 

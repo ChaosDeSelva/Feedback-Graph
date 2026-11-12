@@ -14,19 +14,28 @@ const info = (o: Record<string, unknown> = {}) => ({
 let state: ReturnType<typeof info>;
 let calls: { url: string; method: string; headers?: HeadersInit }[];
 let syncAnswer: () => Response;
+/** While set, the full answer (with the counts) waits for it. */
+let held: Promise<void> | null;
 
 beforeEach(() => {
   state = info();
   calls = [];
+  held = null;
   syncAnswer = () => Response.json({ ok: true, host: 'cloud.example.com', sent: counts, projects: [], error: null });
   vi.stubGlobal('fetch', vi.fn(async (url: string, init?: RequestInit) => {
     const method = init?.method ?? 'GET';
     calls.push({ url, method, headers: init?.headers });
-    if (url === '/api/cloud' && method === 'GET') return Response.json(state);
+    if (url === '/api/cloud?preview=0' && method === 'GET') return Response.json({ ...state, preview: null, previewSkipped: true });
+    if (url === '/api/cloud' && method === 'GET') return held ? held.then(() => Response.json(state)) : Response.json(state);
     if (url === '/api/cloud/local-only') {
       const { projects } = JSON.parse(init!.body as string) as { projects: string[] };
       state = info({ localOnlyEditable: true, savedLocalOnlyProjects: projects, localOnlyProjects: projects, projects: state.projects.filter((p) => !projects.includes(p)) });
       return Response.json({ projects, shareDemoProjects: [] });
+    }
+    if (url === '/api/cloud/intake-sharing') {
+      const body = JSON.parse(init!.body as string) as { claims: boolean; people: boolean };
+      state = info({ intakeSharing: { ...body, saved: true, editable: true } });
+      return Response.json({ ...body, saved: true });
     }
     if (url === '/api/cloud/sync') {
       const r = syncAnswer();
@@ -226,4 +235,41 @@ test('the card is a section of the Settings page, so its heading is an h2 under 
   expect(screen.getByRole('heading', { name: 'Cloud sync', level: 2 })).toBeTruthy();
   await screen.findByText(/Approved ones only/);
   expect(screen.getByRole('heading', { name: 'Cloud sync', level: 2 })).toBeTruthy();
+});
+
+test('with knowledge intake on: claim sharing as in effect, people only with claims, saved through the owner route', async () => {
+  state = info({ intakeSharing: { claims: false, people: false, saved: false, editable: true } });
+  render(<CloudSync />);
+  const claims = await screen.findByRole('checkbox', { name: 'sync claims' }) as HTMLInputElement;
+  const people = screen.getByRole('checkbox', { name: 'sync people' }) as HTMLInputElement;
+  expect(claims.checked).toBe(false);
+  expect(people.disabled).toBe(true);
+  expect(screen.getByText(/As set in .env until you save it here/)).toBeTruthy();
+  expect((screen.getByRole('button', { name: 'Save claim sharing' }) as HTMLButtonElement).disabled).toBe(true);
+  fireEvent.click(claims);
+  fireEvent.click(people);
+  fireEvent.click(screen.getByRole('button', { name: 'Save claim sharing' }));
+  await waitFor(() => expect(calls.some((c) => c.url === '/api/cloud/intake-sharing' && c.method === 'PUT')).toBe(true));
+  expect(await screen.findByText(/Set here; it overrides .env/)).toBeTruthy();
+  expect((screen.getByRole('checkbox', { name: 'sync people' }) as HTMLInputElement).checked).toBe(true);
+  // Unticking claims unticks people: a name never goes without its claim.
+  fireEvent.click(screen.getByRole('checkbox', { name: 'sync claims' }));
+  expect((screen.getByRole('checkbox', { name: 'sync people' }) as HTMLInputElement).checked).toBe(false);
+});
+
+test('without knowledge intake there is no claim sharing setting', async () => {
+  render(<CloudSync />);
+  await screen.findByText('cloud.example.com');
+  expect(screen.queryByRole('group', { name: 'claim sharing' })).toBeNull();
+});
+
+test('the settings show at once; only what a sync sends waits for its counts', async () => {
+  let release!: () => void;
+  held = new Promise((r) => { release = r; });
+  render(<CloudSync />);
+  expect(await screen.findByText(/cloud\.example\.com/)).toBeTruthy();
+  expect(screen.getByText('Counting…')).toBeTruthy();
+  release();
+  await waitFor(() => expect(screen.queryByText('Counting…')).toBeNull());
+  expect(screen.getByText('120')).toBeTruthy();
 });

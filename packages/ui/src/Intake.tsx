@@ -4,6 +4,7 @@ import { api, errorMessage, intakeApi, type IntakeUpload, type ClaimDetail, type
 import { hashFilters, hashFocus } from './links.ts';
 import { READ_ONLY_TITLE, useOwnerWrites } from './ownerAccess.tsx';
 import { askConfirm, ConfirmDialog } from './ui/ConfirmDialog.tsx';
+import { Dialog } from './ui/Dialog.tsx';
 import { PageHeader } from './ui/PageHeader.tsx';
 import { BulkBar, bulkFailures, ReviewList } from './ui/ReviewList.tsx';
 import { Button, Input, Select, Tabs, Textarea, usePending } from './ui/controls.tsx';
@@ -22,7 +23,10 @@ export const INTAKE_SECTIONS = ['sources', 'claims', 'questions', 'conflicts', '
 type Section = (typeof INTAKE_SECTIONS)[number];
 const CLAIM_TABS: ClaimStatus[] = ['proposed', 'accepted', 'rejected', 'superseded'];
 const QUESTION_TABS: QuestionStatus[] = ['open', 'assigned', 'answered', 'dismissed'];
-const PEOPLE_TABS: PersonStatus[] = ['confirmed', 'proposed', 'forgotten'];
+/** Proposed first, as Claims opens on proposed: the people a source just made are the ones to review. */
+const PEOPLE_TABS: PersonStatus[] = ['proposed', 'confirmed', 'forgotten'];
+/** How often the Sources tab reads its sources again while one is being read. */
+export const SOURCE_POLL_MS = 5000;
 
 export const TYPE_TONE: Record<ClaimType, Tone> = { fact: 'info', decision: 'accent', opinion: 'neutral', plan: 'violet', commitment: 'ok' };
 export const FLAG_LABEL: Record<string, [string, string]> = {
@@ -58,6 +62,15 @@ export function Intake() {
   const reloadPeople = useCallback(() => { intakeApi.people().then(setPeople, () => {}); }, []);
   useEffect(() => { if (enabled) reloadPeople(); }, [enabled, reloadPeople]);
   const names = useMemo(() => new Map(people.map((p) => [p.id, p.displayName])), [people]);
+  // A source read in the background makes people after this page loaded them: a speaker not yet known reloads them
+  // (once per id), so their claims are not shown as an unknown speaker's.
+  const askedFor = useRef(new Set<string>());
+  const ensureNames = useCallback((ids: (string | null)[]) => {
+    const missing = ids.filter((id): id is string => !!id && !names.has(id) && !askedFor.current.has(id));
+    if (!missing.length) return;
+    for (const id of missing) askedFor.current.add(id);
+    reloadPeople();
+  }, [names, reloadPeople]);
 
   if (enabled === null) return <><PageHeader title="Intake" /><div className="p-4 md:p-6"><SkeletonDetail /></div></>;
   if (!enabled) {
@@ -87,7 +100,7 @@ export function Intake() {
         <Tabs label="intake section" value={section} options={INTAKE_SECTIONS} onChange={setSection} />
       </div>
       {section === 'sources' && <SourcesTab key={project} project={project} projects={projects} names={names} onPeopleChanged={reloadPeople} onShowClaims={showClaimsOf} />}
-      {section === 'claims' && <ClaimsTab key={`${project}:${source}`} project={project} projects={projects} source={source} onClearSource={() => setSource('')} names={names} people={people} />}
+      {section === 'claims' && <ClaimsTab key={`${project}:${source}`} project={project} projects={projects} source={source} onClearSource={() => setSource('')} names={names} people={people} ensureNames={ensureNames} />}
       {section === 'questions' && <QuestionsTab key={project} project={project} projects={projects} names={names} people={people} />}
       {section === 'conflicts' && <ConflictsTab key={project} project={project} />}
       {section === 'people' && <PeopleTab people={people} onChanged={reloadPeople} />}
@@ -109,8 +122,8 @@ type ClaimDraft = { statement: string; type: ClaimType; about: string; area: str
 const draftOf = (c: ListedClaim): ClaimDraft => ({ statement: c.statement, type: c.type, about: c.about, area: c.scope.area ?? '', files: c.scope.files.join(', '), kind: '', fileUnder: '' });
 const filesOf = (s: string) => s.split(/[,\n]/).map((f) => f.trim()).filter(Boolean);
 
-function ClaimsTab({ project, projects, source, onClearSource, names, people }: {
-  project: string; projects: string[]; source: string; onClearSource: () => void; names: Map<string, string>; people: Person[];
+function ClaimsTab({ project, projects, source, onClearSource, names, people, ensureNames }: {
+  project: string; projects: string[]; source: string; onClearSource: () => void; names: Map<string, string>; people: Person[]; ensureNames: (ids: (string | null)[]) => void;
 }) {
   const writes = useOwnerWrites();
   const locked = writes ? {} : { readOnly: true, title: READ_ONLY_TITLE };
@@ -122,6 +135,7 @@ function ClaimsTab({ project, projects, source, onClearSource, names, people }: 
     (c) => c.id, [status, type, speaker, project, source],
   );
   const { items, setItems } = list;
+  useEffect(() => ensureNames(items.map((c) => c.speakerId)), [items, ensureNames]);
   const [selected, setSelected] = useState(0);
   useEffect(() => setSelected(0), [status, type, speaker]);
   const { picked, setPicked, toggle } = usePicked([status, type, speaker, list.loaded]);
@@ -601,7 +615,7 @@ function QuestionsTab({ project, projects, names, people }: { project: string; p
 function PeopleTab({ people, onChanged }: { people: Person[]; onChanged: () => void }) {
   const writes = useOwnerWrites();
   const locked = writes ? {} : { readOnly: true, title: READ_ONLY_TITLE };
-  const [status, setStatus] = useState<PersonStatus>('confirmed');
+  const [status, setStatus] = useState<PersonStatus>('proposed');
   const items = people.filter((p) => p.status === status);
   const [selected, setSelected] = useState(0);
   useEffect(() => setSelected(0), [status]);
@@ -748,7 +762,10 @@ function SourceText({ text, spans = [] }: { text: string; spans?: { start: numbe
   return <pre className="max-h-[32rem] overflow-auto rounded-md border border-line bg-sunken px-3 py-2.5 font-sans text-[13px] leading-relaxed whitespace-pre-wrap [overflow-wrap:anywhere]">{parts}</pre>;
 }
 
-/** Add a source: paste it, or pick a .txt, .md, .vtt or .srt file. A transcript is private (never synced) unless unticked. */
+/**
+ * Add a source: paste it, or pick a .txt, .md, .vtt or .srt file. Private (never synced) is its own choice, ticked when
+ * the dialog opens: changing the kind never changes it.
+ */
 function AddSource({ open, projects, project, onClose, onAdded }: { open: boolean; projects: string[]; project: string; onClose: () => void; onAdded: () => void }) {
   const blank = (): IntakeUpload & { people: string } => ({ projectKey: project || projects[0] || '', kind: 'transcript', title: '', text: '', occurredAt: null, people: '', private: true });
   const [f, setF] = useState(blank);
@@ -769,41 +786,47 @@ function AddSource({ open, projects, project, onClose, onAdded }: { open: boolea
       onAdded();
     } catch (e) { setError(errorMessage(e)); }
   });
+  if (!open) return null;
+  const busy = pending === 'add';
+  // Each field is named by its visible label, so what you see is what a screen reader or a test finds.
   return (
-    <ConfirmDialog
-      open={open}
+    <Dialog
       title="Add a source"
-      message="Its text is read into claims and questions for you to review. Credentials and contact details are removed before it is stored; agents never see the text."
-      confirmLabel="Add"
-      busyLabel="Adding…"
-      busy={pending === 'add'}
-      error={error}
+      busy={busy}
       onCancel={onClose}
-      onConfirm={() => void add()}
+      footer={<>
+        <Button onClick={onClose} disabled={busy}>Cancel</Button>
+        <Button variant="primary" onClick={() => void add()} busy={busy}>{busy ? 'Adding…' : 'Add'}</Button>
+      </>}
     >
+      <p className="text-muted">Its text is read into claims and questions for you to review. Credentials and contact details are removed before it is stored; agents never see the text.</p>
       <div className="grid gap-2 text-[13px]">
         <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
           <label className="grid gap-1"><span className="text-xs text-muted">Project</span>
-            <Select aria-label="source project" value={f.projectKey} onChange={(e) => setF({ ...f, projectKey: e.target.value })}>
+            <Select value={f.projectKey} onChange={(e) => setF({ ...f, projectKey: e.target.value })}>
               {projects.map((p) => <option key={p}>{p}</option>)}
             </Select>
           </label>
           <label className="grid gap-1"><span className="text-xs text-muted">Kind</span>
-            <Select aria-label="source kind" value={f.kind} onChange={(e) => { const kind = e.target.value as IntakeKind; setF({ ...f, kind, private: kind === 'transcript' }); }}>
+            <Select value={f.kind} onChange={(e) => setF({ ...f, kind: e.target.value as IntakeKind })}>
               {INTAKE_KINDS.map((k) => <option key={k} value={k}>{k}</option>)}
             </Select>
           </label>
-          <label className="grid gap-1"><span className="text-xs text-muted">Title</span><Input aria-label="source title" value={f.title} maxLength={300} onChange={(e) => setF({ ...f, title: e.target.value })} /></label>
-          <label className="grid gap-1"><span className="text-xs text-muted">When it was said</span><Input aria-label="source date" type="date" value={f.occurredAt ?? ''} onChange={(e) => setF({ ...f, occurredAt: e.target.value || null })} /></label>
+          <label className="grid gap-1"><span className="text-xs text-muted">Title</span><Input value={f.title} maxLength={300} onChange={(e) => setF({ ...f, title: e.target.value })} /></label>
+          <label className="grid gap-1"><span className="text-xs text-muted">When it was said</span><Input type="date" value={f.occurredAt ?? ''} onChange={(e) => setF({ ...f, occurredAt: e.target.value || null })} /></label>
         </div>
-        <label className="grid gap-1"><span className="text-xs text-muted">Who was there (comma-separated)</span><Input aria-label="participants" value={f.people} onChange={(e) => setF({ ...f, people: e.target.value })} /></label>
-        <label className="grid gap-1"><span className="text-xs text-muted">Text</span><Textarea aria-label="text to read" rows={8} value={f.text} onChange={(e) => setF({ ...f, text: e.target.value, name: undefined })} className="font-mono text-xs" /></label>
-        <div className="flex flex-wrap items-center justify-between gap-2">
-          <input aria-label="source file" type="file" accept=".txt,.md,.vtt,.srt,text/plain,text/markdown,text/vtt" onChange={(e) => void pick(e.target.files?.[0])} className="max-w-full text-xs" />
-          <label className="flex items-center gap-2"><input type="checkbox" checked={!!f.private} onChange={(e) => setF({ ...f, private: e.target.checked })} /> Private (never synced)</label>
-        </div>
+        <label className="grid gap-1"><span className="text-xs text-muted">Who was there (comma-separated)</span><Input value={f.people} onChange={(e) => setF({ ...f, people: e.target.value })} /></label>
+        <label className="grid gap-1"><span className="text-xs text-muted">Text</span><Textarea rows={8} value={f.text} onChange={(e) => setF({ ...f, text: e.target.value, name: undefined })} className="font-mono text-xs" /></label>
+        <label className="grid gap-1"><span className="text-xs text-muted">Or a file (.txt, .md, .vtt, .srt)</span>
+          <input type="file" accept=".txt,.md,.vtt,.srt,text/plain,text/markdown,text/vtt" onChange={(e) => void pick(e.target.files?.[0])} className="max-w-full text-xs" />
+        </label>
+        <label className="flex items-start gap-2">
+          <input type="checkbox" checked={!!f.private} onChange={(e) => setF({ ...f, private: e.target.checked })} className="mt-0.5" />
+          <span>Private (never synced)<span className="block text-xs text-muted">Its accepted claims never leave this install, even with SYNC_CLAIMS. Your choice, whatever its kind.</span></span>
+        </label>
       </div>
-    </ConfirmDialog>
+      {error && <Alert>{error}</Alert>}
+    </Dialog>
   );
 }
 
@@ -826,13 +849,21 @@ function SourcesTab({ project, projects, names, onShowClaims, onPeopleChanged }:
     return () => { stale = true; };
   }, [project, reloads]);
   const current = items[selected];
+  // While a source is queued or being read, the list and the open source are read again every few seconds, so its
+  // state and its claims count follow the background reading without a page reload.
+  const reading = items.some((x) => sourceState(x).state === 'queued' || sourceState(x).state === 'reading');
   useEffect(() => {
-    setDetail(null);
+    if (!reading) return;
+    const t = setTimeout(() => setReloads((n) => n + 1), SOURCE_POLL_MS);
+    return () => clearTimeout(t);
+  }, [reading, items]);
+  useEffect(() => {
+    setDetail((d) => (d && d.id === current?.id ? d : null));
     if (!current) return;
     let stale = false;
     intakeApi.source(current.id).then((d) => { if (!stale) setDetail(d); }, () => {});
     return () => { stale = true; };
-  }, [current?.id]);
+  }, [current?.id, reloads]);
   const s = detail && detail.id === current?.id ? detail : current;
   const meta = s?.intake ?? null;
   const stateOf = s ? sourceState(s) : null;
@@ -935,7 +966,7 @@ function SourcesTab({ project, projects, names, onShowClaims, onPeopleChanged }:
             <fieldset className="grid gap-1.5 text-[13px]">
               <legend className="mb-1 text-xs font-medium text-muted">What it told agents</legend>
               <label className="flex items-start gap-2"><input type="radio" name="keep" checked={keep === 'facts'} onChange={() => setKeep('facts')} className="mt-1" /> Keep the facts from claims you accepted</label>
-              <label className="flex items-start gap-2"><input type="radio" name="keep" checked={keep === 'none'} onChange={() => setKeep('none')} className="mt-1" /> Remove everything from it, its facts too (can be rolled back)</label>
+              <label className="flex items-start gap-2"><input type="radio" name="keep" checked={keep === 'none'} onChange={() => setKeep('none')} className="mt-1" /> Remove everything from it: every claim, its facts and the proposed people only it named (Undo on Decisions re-opens the facts)</label>
             </fieldset>
           </ConfirmDialog>
         </div>

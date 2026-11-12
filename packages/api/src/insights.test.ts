@@ -31,3 +31,16 @@ test('GET /api/patterns is global by default and scoped with ?project', async ()
   expect((await app.request('/api/patterns?project=shop')).status).toBe(200);
   expect(calls).toEqual([['patterns', {}], ['patterns', { projectKey: 'shop' }]]);
 });
+
+test('GET /api/graph draws at most three fix commits per feedback item and says how many it left out', async () => {
+  const commits = Array.from({ length: 5 }, (_, i) => ({ id: `commit:${i}`, kind: 'commit', label: `c${i}`, status: null }));
+  const graph = {
+    nodes: [{ id: 'feedback:f', kind: 'feedback', label: 'f', status: null }, { id: 'miss:m', kind: 'miss', label: 'm', status: null }, ...commits],
+    links: [{ source: 'miss:m', target: 'feedback:f', type: 'EXPLAINS' }, ...commits.map((c) => ({ source: c.id, target: 'feedback:f', type: 'ADDRESSES' }))],
+  };
+  const app = createApp(repo, { insights: { projectGraph: async () => graph as never, patterns: async () => ({}) as never } });
+  const g = await (await app.request('/api/graph?project=shop')).json() as { nodes: { id: string }[]; links: { type: string }[]; commitsHidden: number };
+  expect(g.nodes.map((n) => n.id)).toEqual(['feedback:f', 'miss:m', 'commit:0', 'commit:1', 'commit:2']);
+  expect(g.links.filter((l) => l.type === 'ADDRESSES')).toHaveLength(3);
+  expect(g.commitsHidden).toBe(2);
+});

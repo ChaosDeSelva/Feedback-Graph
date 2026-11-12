@@ -39,6 +39,7 @@ export const OWNER_ROUTES: readonly (readonly ['GET' | 'POST' | 'PUT' | 'PATCH' 
   ['POST', '/api/settings/cleanup', 'settings'],
   ['POST', '/api/cloud/sync', 'sync_now'],
   ['PUT', '/api/cloud/local-only', 'settings'],
+  ['PUT', '/api/cloud/intake-sharing', 'settings'],
   ['POST', '/api/turns/requeue', 'requeue'],
   ['POST', '/api/import', 'import'],
   ['POST', '/api/demo/seed', 'demo'],
@@ -62,6 +63,9 @@ export const OWNER_ROUTES: readonly (readonly ['GET' | 'POST' | 'PUT' | 'PATCH' 
   ['POST', '/api/decisions/:id/rollback', 'loop_decide'],
   ['POST', '/api/decisions/:id/notes', 'loop_decide'],
   ['PUT', '/api/loop/settings', 'loop_settings'],
+  // Never merge two records (0.9.1); lifting one is refused to the operator token in the route itself.
+  ['POST', '/api/distinct-pairs', 'loop_decide'],
+  ['DELETE', '/api/distinct-pairs', 'loop_decide'],
   ['POST', '/api/loop/pause', 'loop_settings'],
   ['POST', '/api/loop/resume', 'loop_settings'],
   // Knowledge intake (intake.ts): reads too, since a source is what people said and never reaches an agent. Removing
@@ -71,8 +75,11 @@ export const OWNER_ROUTES: readonly (readonly ['GET' | 'POST' | 'PUT' | 'PATCH' 
   ['GET', '/api/intake/sources/:id', 'intake'],
   ['POST', '/api/intake/sources/:id/reread', 'intake'],
   ['DELETE', '/api/intake/sources/:id', 'docs_delete'],
+  // The look-up (knowledge.ts) reads claims with their quotes, unreviewed ones and open questions: the owner's, as sources are.
+  ['GET', '/api/knowledge', 'intake'],
   // Knowledge intake's review (intakeReview.ts): what is accepted reaches agents, so off for the operator token by default.
   ['PATCH', '/api/claims/:id', 'claims_decide'],
+  ['DELETE', '/api/claims/:id', 'claims_decide'],
   ['POST', '/api/claims/decisions', 'claims_decide'],
   ['PATCH', '/api/questions/:id', 'claims_decide'],
   ['POST', '/api/questions/:id/answer', 'claims_decide'],

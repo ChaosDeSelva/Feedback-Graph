@@ -1,6 +1,6 @@
 import { redactSecrets } from '../../redact.ts';
 import { factEmbeddingText } from '../../relevance.ts';
-import type { DecisionTarget, FactKind, RelevanceBy, TargetSnapshot } from '../../types.ts';
+import type { DecisionTarget, FactKind, OwnFactOrigin, RelevanceBy, TargetSnapshot } from '../../types.ts';
 import { ABSENT, changedError, TargetChangedError, UnsupportedTargetError, type FactSnapshotWrite, type LessonSnapshotFields, type LessonSnapshotWrite, type SupersedeLink } from '../record.ts';
 import { snapshotKeys, snapshotOf, snapshotTarget, type DecisionExecStore } from '../snapshot.ts';
 import type { DecisionTypeHandler, ExecDeps } from './handler.ts';
@@ -38,12 +38,14 @@ async function writeFacts(s: DecisionExecStore, moves: Move[], o: { by: string }
     const f = m.to.fields;
     if (m.to.fingerprint !== ABSENT && m.from.fingerprint === ABSENT && !(await s.facts.fact(m.target.id))) {
       if (!deps.embed) throw new UnsupportedTargetError(m.target, 'create without an embedder');
-      const [embedding] = await deps.embed([factEmbeddingText({ path: f.path as string, statement: f.statement as string })]);
+      // origin: a claim accept_claim files is origin claim (embedded from its statement alone); otherwise yours.
+      const origin = f.origin as OwnFactOrigin | undefined;
+      const [embedding] = await deps.embed([factEmbeddingText({ path: f.path as string, statement: f.statement as string, ...(origin && { origin }) })]);
       const by = (f.relevanceBy ?? o.by) as RelevanceBy;
       await s.facts.addOwnerFact(f.projectKey as string, {
         kind: f.kind as FactKind, statement: f.statement as string, path: f.path as string, lines: (f.lines as string | null) ?? null,
         confidence: 1, why: f.why as string, relevance: f.relevance as number | null, embedding,
-      }, by, null, { id: m.target.id });
+      }, by, null, { id: m.target.id, ...(origin && { origin }) });
       continue;
     }
     // Closing keeps the fact's scores as they are; opening or rescoring sets them from the snapshot.

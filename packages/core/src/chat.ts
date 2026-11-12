@@ -11,7 +11,7 @@ export const CHAT_PROVIDERS = ['claude', 'codex', 'local'] as const;
 export type ChatProvider = (typeof CHAT_PROVIDERS)[number];
 export const CHAT_TURN_STATUSES = ['pending', 'answering', 'done', 'failed'] as const;
 export type ChatTurnStatus = (typeof CHAT_TURN_STATUSES)[number];
-export const CHAT_SOURCE_KINDS = ['lesson', 'miss', 'fact', 'doc', 'code', 'session', 'linked'] as const;
+export const CHAT_SOURCE_KINDS = ['lesson', 'miss', 'fact', 'doc', 'code', 'session', 'linked', 'claim', 'question', 'conflict'] as const;
 /** One numbered source of a pack: id "S1", "S2"...; ref a path:lines, a lesson id, a doc name... */
 export type ChatSource = { id: string; kind: (typeof CHAT_SOURCE_KINDS)[number]; ref: string; title: string };
 export type ChatExample = { path: string; lines: string | null; why: string; usages: string[] };

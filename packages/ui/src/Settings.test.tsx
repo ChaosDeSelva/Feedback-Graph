@@ -66,7 +66,7 @@ beforeEach(() => {
     if (url === '/api/settings/cleanup') return Response.json({ removed: ['other'], nodesRemoved: 12 });
     if (url === '/api/loop') return Response.json(loopState());
     if (url === '/api/settings/integrations') return Response.json(integrationsView());
-    if (url === '/api/cloud') return Response.json(cloudOff);
+    if (url === '/api/cloud' || url === '/api/cloud?preview=0') return Response.json(cloudOff);
     return Response.json([]);
   }));
 });

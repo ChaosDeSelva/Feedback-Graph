@@ -68,6 +68,24 @@ describe('buildChatContext', () => {
     expect(pack.context).not.toContain('## Source snippets');
   });
 
+  test('with knowledge intake, what people said on the question joins the pack, cited as claims; a failed look-up says so', async () => {
+    const { root } = project({});
+    const claim = {
+      id: 'claim:1', projectKey: 'demo-shop', docId: 'doc:x', window: 0, span: null, type: 'decision', statement: 'Modals close on Escape', quote: 'q', speakerId: null,
+      assertedAt: '2026-11-10T10:00:00.000Z', confidence: 0.9, scope: { area: null, files: [] }, about: 'modals', due: null, flags: [], status: 'accepted', decidedBy: 'you',
+      decidedAt: null, factId: null, createdAt: 't', run: null, sandbox: false,
+    };
+    const knowledge = {
+      intake: { searchClaims: async () => [{ claim, score: 0.95 }], listQuestions: async () => [], conflictsFor: async () => [], claim: async () => claim, person: async () => null, people: async () => [], metas: async () => [] },
+      facts: { searchFacts: async () => [], fact: async () => null }, lessons: { searchLessons: async () => [], lessonDetail: async () => null }, embed: async (t: string[]) => t.map(() => [1]),
+    } as unknown as NonNullable<ChatContextDeps['knowledge']>;
+    const pack = await buildChatContext('demo-shop', 'what do we know about modals', [], { ...deps(root, null), knowledge });
+    expect(pack.context).toMatch(/## What people said[^]*\[S\d+\] decision · 2026-11-10: Modals close on Escape/);
+    expect(pack.sources).toEqual(expect.arrayContaining([expect.objectContaining({ kind: 'claim', ref: 'claim:1' })]));
+    const failed = await buildChatContext('demo-shop', 'modals', [], { ...deps(root, null), knowledge: { ...knowledge, intake: { ...knowledge.intake, searchClaims: async () => { throw new Error('down'); } } } });
+    expect(failed.context).toContain('what people said (claims, open questions, conflicts) could not be searched');
+  });
+
   test('a search that fails with something other than an Error still says why', async () => {
     const { root } = project({});
     const pack = await buildChatContext('demo-shop', 'modal', [], deps(root, null, { embed: async () => { throw 'ollama is down'; } }));
@@ -120,6 +138,26 @@ describe('buildChatContext', () => {
     // A linked project with only a document still has its section.
     expect(pack.context).toMatch(/\] web \(related\)\n {2}- document Modal guide \(web\.md\):/);
   });
+});
+
+test('Ask serves the approved lessons search_graph finds by meaning and those a named folder triggers, as get_task_context would on its files', async () => {
+  const { root } = project({ 'deploy/terraform/iam.tf': 'resource "x" {}', 'src/a.ts': 'a' });
+  const close = lesson({ id: 'lesson:close', title: 'Grant roles on the project', rule: 'Bind roles to groups, never to users' });
+  const far = lesson({ id: 'lesson:far', title: 'Unrelated', rule: 'Something else' });
+  const fired = lesson({ id: 'lesson:fired', title: 'Plan before apply', rule: 'Run a plan first', triggers: { paths: ['deploy/terraform/**'], patterns: [], symbols: [] } });
+  const d = deps(root, { files: [file('deploy/terraform/iam.tf'), file('src/a.ts')] }, {
+    k: {
+      searchLessons: async () => [{ lesson: close, score: 0.86 }, { lesson: far, score: 0.5 }],
+      listLessons: async () => [fired],
+      relatedMisses: async () => [], missesNaming: async () => [], recordPreDoneCheck: async () => {}, createManualFeedback: async () => 'manual:1',
+    },
+    inScope: () => true,
+  });
+  const pack = await buildChatContext('demo-shop', 'Which approved lessons apply when changing deploy/terraform IAM bindings?', [], d);
+  expect(pack.context).toContain('**Grant roles on the project**');
+  expect(pack.context).toContain('**Plan before apply**');
+  expect(pack.context).not.toContain('**Unrelated**');
+  expect(pack.sources.filter((s) => s.kind === 'lesson').map((s) => s.ref).sort()).toEqual(['lesson:close', 'lesson:fired']);
 });
 
 test('a snippet that fills the whole budget leaves no room: later matches are cited without a snippet', async () => {

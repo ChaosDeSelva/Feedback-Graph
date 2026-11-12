@@ -1,4 +1,4 @@
-import { threadTaskTitle, type ActivityStore, type DocsStore, type GraphStore, type InboxText, type KnowledgeStore } from '@fb/core';
+import { INVALID_SUMMARY, threadTaskTitle, type ActivityStore, type DocsStore, type GraphStore, type InboxText, type KnowledgeStore, type SessionsStore } from '@fb/core';
 import { turnHash } from './ingest/fingerprint.ts';
 import { COMPACTION_SUMMARY } from './ingest/parseTranscript.ts';
 
@@ -11,6 +11,7 @@ export type RepairDeps = {
   graph: Pick<GraphStore, 'inboxTexts' | 'skipPendingItem'>;
   activity: Pick<ActivityStore, 'record'>;
   cursors: Pick<DocsStore, 'getCursor' | 'setCursor'>;
+  sessions?: Pick<SessionsStore, 'retryFailedSummaries'>;
   log?: (msg: string, extra?: object) => void;
 };
 
@@ -150,8 +151,35 @@ export async function rejectDuplicateItems(d: RepairDeps): Promise<{ examined: n
 }
 
 /** Every repair, in order; each one's failure is logged and leaves it to run again at the next start. */
+export const INVALID_SUMMARIES_CURSOR = 'repair-invalid-summaries';
+
+/**
+ * Up to 0.9.0 a summary answer was refused unless it was exactly the schema's object, and a local model often wraps
+ * it in a list (`[{...}]`), so a session's summary failed on every try and waited out a backoff of up to six hours
+ * between them. The answer is now read tolerantly (tolerantSummary): those sessions are tried again at once.
+ */
+export async function retryInvalidSummaries(d: RepairDeps): Promise<{ retried: number } | null> {
+  const sessions = d.sessions;
+  if (!sessions) return null;
+  return once(d, INVALID_SUMMARIES_CURSOR, 1, async () => {
+    const ids = await sessions.retryFailedSummaries(INVALID_SUMMARY);
+    if (ids.length) {
+      await d.activity.record({
+        kind: 'session_summarized', actor: 'repair', projectKey: null,
+        subject: `${ids.length} session summar${ids.length === 1 ? 'y' : 'ies'} that failed on the model's answer tried again`,
+        why: 'the summary model\'s answers were refused for their shape (a list around the summary, say), which is now read',
+        details: { repair: INVALID_SUMMARIES_CURSOR, version: 1, sessions: ids.slice(0, MAX_TARGETS) },
+        targets: ids.slice(0, MAX_TARGETS).map((id) => `session:${id}`),
+      });
+      d.log?.('session summaries that failed on the answer\'s shape tried again', { sessions: ids.length });
+    }
+    return { retried: ids.length };
+  });
+}
+
 export async function runRepairs(d: RepairDeps): Promise<void> {
   const failed = (what: string) => (err: unknown) => d.log?.(`${what} failed`, { error: String(err) });
+  await retryInvalidSummaries(d).catch(failed('retrying failed session summaries'));
   await retitleThreadTasks(d).catch(failed('retitling PR and issue tasks'));
   await rejectDuplicateItems(d).catch(failed('rejecting duplicate Inbox items'));
 }

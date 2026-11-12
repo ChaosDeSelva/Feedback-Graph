@@ -4,7 +4,8 @@ import { GIT_SAFE, gitSafeEnv } from '../ingest/git.ts';
 
 const run = promisify(execFile);
 
-export type Churn = Map<string, { commits: number; lastTs: string }>;
+/** renames: each path a file had before a rename in the window, to the name it has now (git -M), when one was seen. */
+export type Churn = Map<string, { commits: number; lastTs: string }> & { renames?: Record<string, string> };
 
 const HEADER = '\x01';
 
@@ -64,5 +65,6 @@ export async function churn(repoPath: string, sinceDays: number, gitArgs: readon
       touch(now);
     }
   }
+  out.renames = Object.fromEntries([...currentName].filter(([from, to]) => from !== to));
   return out;
 }

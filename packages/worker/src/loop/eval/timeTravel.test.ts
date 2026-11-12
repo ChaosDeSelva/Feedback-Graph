@@ -76,7 +76,7 @@ test('overlay replaces some members and binds the rest to the target', () => {
 test('MemoryDecisions keeps the loop\'s records in memory, reads misses and links as of the cut, and never writes the store', async () => {
   const links: MissLink[] = [{ from: 'miss:b', to: 'miss:a', decisionId: 'dec:x', createdAt: BEFORE }, { from: 'miss:b', to: 'miss:c', decisionId: 'dec:y', createdAt: AFTER }];
   const misses = [{ id: 'miss:a', createdAt: BEFORE }, { id: 'miss:late', createdAt: AFTER }] as LoopMiss[];
-  const m = new MemoryDecisions({ missLinks: async () => links, loopMisses: async () => misses }, T0);
+  const m = new MemoryDecisions({ missLinks: async () => links, loopMisses: async () => misses, distinctPairs: async () => [] }, T0);
   const input = {
     type: 'link_misses' as const, projectKey: 'p', targets: [{ kind: 'miss' as const, id: 'miss:b', role: 'primary' as const }], before: [], after: [],
     evidence: [], features: {}, score: 0.5, confidence: { p: 0.5, lower: 0.4, n: 0, band: 2 }, tier: 'H' as const, mode: 'observe' as const,

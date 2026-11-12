@@ -55,6 +55,8 @@ export const factStateFingerprint = (f: FingerprintedFact | null): string => (f?
 /** The lesson fields a decision snapshot holds and a snapshot write sets (LESSON_FINGERPRINT_FIELDS). */
 export type LessonSnapshotFields = Pick<Lesson, 'projectKey' | 'title' | 'rule' | 'appliesWhen' | 'scope' | 'paths' | 'status' | 'decidedAt'> & {
   decidedBy: string | null; decisionNote: string | null; servingWeight: number | null;
+  /** Only update_paths' snapshots carry them: set, the write sets the lesson's triggers too (not fingerprinted). */
+  triggers?: Lesson['triggers'];
 };
 /** One lesson set to `fields` (KnowledgeStore.writeLessonSnapshots) while it still has the fingerprint `expect`. */
 export type LessonSnapshotWrite = { id: string; fields: LessonSnapshotFields; expect: string; embedding?: number[] };

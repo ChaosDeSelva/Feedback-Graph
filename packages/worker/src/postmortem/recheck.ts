@@ -1,6 +1,6 @@
 import { readFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
-import { LESSON_CHECKS_VERSION, redactSecrets, type ActivityStore, type Decision, type DecisionsStore, type KnowledgeStore, type Lesson, type LessonCheck, type LessonCheckName, type LessonDetail, type SimilarLesson } from '@fb/core';
+import { DUPLICATE_FLAG, LESSON_CHECKS_VERSION, redactSecrets, type ActivityStore, type Decision, type DecisionsStore, type KnowledgeStore, type Lesson, type LessonCheck, type LessonCheckName, type LessonDetail, type SimilarLesson } from '@fb/core';
 import { MODEL_FACT_WHY, recheckLesson, saysWrongSession } from './lessonCheck.ts';
 import { ambiguousFlag, junkPathReason, normalizeStoredPaths, repoFileList, repoHas, type Normalized } from './paths.ts';
 import { claimsNotLoaded, imports } from './standing.ts';
@@ -9,8 +9,8 @@ import { isFiller } from './shape.ts';
 /** More lessons than any instance holds; one pass, so a store that cannot save never loops. */
 const MAX_LESSONS = 10_000;
 
-/** Lessons this close (cosine of their stored embeddings, same project) say the same thing. */
-export const DUPLICATE_COSINE = 0.92;
+/** Lessons this close (cosine of their stored embeddings, same project) say the same thing (core thresholds.ts). */
+export const DUPLICATE_COSINE = DUPLICATE_FLAG;
 /** Neighbours looked at per lesson: the nearest that counts is enough. */
 const NEIGHBOURS = 5;
 

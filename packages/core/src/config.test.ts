@@ -1,6 +1,7 @@
 import { expect, test } from 'vitest';
 import { ConfigError, loadConfig, OPERATOR_VERBS, redactUrl } from './config.ts';
 import { MISS_CLOSE } from './relevance.ts';
+import { LOOP_DECISION_TYPES } from './types.ts';
 
 const base = { NEO4J_PASSWORD: 'pw', PROJECT_ROOTS: '/vibe,/examples', HOST_PROJECT_ROOTS: '/Users/a/Vibe,/Users/a/fb/examples' };
 
@@ -388,7 +389,7 @@ test('LOOP_* settings: defaults, values, and every bad value named', () => {
     expect.stringMatching(/^LOOP_MODE must be one of off, observe, propose, auto/),
     expect.stringMatching(/^LOOP_DISABLED must be 1 or 0/),
     expect.stringMatching(/^LOOP_HOLDOUT must be a share from 0 to 0.5/),
-    'LOOP_TYPES names unknown decision types: teleport (known: link_misses, merge_duplicates, rank_weight, retire_lesson, reject_lesson, approve_lesson, reword_lesson, narrow_scope, record_fact, triage_inbox, tune_threshold)',
+    `LOOP_TYPES names unknown decision types: teleport (known: ${LOOP_DECISION_TYPES.join(', ')})`,
     expect.stringMatching(/^LOOP_LLM: unknown provider/),
     expect.stringMatching(/^LOOP_AUTO_PER_DAY must be a whole number of at least 0/),
   ]));

@@ -287,8 +287,8 @@ export function intakeRoutes(app: Hono, d: Deps) {
     if (!s) return c.json({ error: 'not found' }, 404);
     let decision: Decision | null = null;
     if (keep === 'none') {
-      // The claims you accepted from it are rejected and their facts closed as one decision by you, before anything is
-      // deleted, so a refusal changes nothing and a rollback brings them back (the text stays gone).
+      // The facts the claims you accepted from it became are closed as one decision by you, before anything is deleted,
+      // so a refusal changes nothing and a rollback re-opens them (the source and its claims stay gone).
       const kept = (await d.store.listClaims({ docId: id, status: ['accepted'], run: askingRun(), limit: 1000 })).filter((x) => x.factId);
       if (kept.length) {
         if (!mayChangeAny()) return c.json({ error: 'a labelled run removes a source with keep=facts: closing facts is your decision' }, 409);
@@ -306,15 +306,15 @@ export function intakeRoutes(app: Hono, d: Deps) {
     if (!(await d.docs.deleteDoc(id, mayChangeAny() ? {} : { run: currentRun()!.id }))) {
       return c.json({ error: currentRun() ? 'not found among the sources this run added' : 'not found' }, 404);
     }
-    // The claims the decision rejected stay, so rolling it back can restore them.
-    const removed = await d.store.removeSource(id, decision ? { keep: decision.targets.filter((t) => t.kind === 'claim').map((t) => t.id) } : {});
+    // Its participants are read before the document goes, since their attendance goes with it.
+    const removed = await d.store.removeSource(id, keep === 'none' ? { everything: true, people: s.intake?.participants ?? [] } : {});
     await d.activity?.record({
       kind: 'doc_removed', actor: 'you', projectKey: s.projectKey,
-      subject: `removed the source "${s.title}" (${removed.claim} unaccepted claim${removed.claim === 1 ? '' : 's'}, ${removed.question} question${removed.question === 1 ? '' : 's'})`,
+      subject: `removed the source "${s.title}" (${removed.claim} ${keep === 'none' ? '' : 'unaccepted '}claim${removed.claim === 1 ? '' : 's'}, ${removed.question} question${removed.question === 1 ? '' : 's'}${removed.people ? `, ${removed.people} ${removed.people === 1 ? 'person' : 'people'} only it named` : ''})`,
       why: keep === 'facts' ? 'you removed it; claims you accepted stay, as the facts they became' : 'you removed it and everything drawn from it',
-      details: { keep, ...removed, ...(decision && { decisionId: decision.id, factsClosed: decision.targets.filter((t) => t.kind === 'fact').length }) },
+      details: { keep, ...removed, ...(decision && { decisionId: decision.id, factsClosed: decision.targets.length }) },
       targets: [id, ...(decision ? [decision.id] : [])],
     });
-    return c.json({ removed: { ...removed, keep, facts: decision ? decision.targets.filter((t) => t.kind === 'fact').length : 0 }, decision });
+    return c.json({ removed: { ...removed, keep, facts: decision ? decision.targets.length : 0 }, decision });
   });
 }

@@ -790,6 +790,38 @@ describeStores('KnowledgeStore', (h) => {
       expect(all.find((c) => c.id === 'd5-t2')).toMatchObject({ origins: ['detector'], agentReport: null });
     });
 
+    // 0.9.1: by meaning, within days. Embeddings here are unit vectors: cosine is their dot product.
+    const unit = (x: number) => Array.from({ length: 768 }, (_, i) => (i === 0 ? x : i === 1 ? Math.sqrt(1 - x * x) : 0));
+    /** A session of `daysAgo` days ago whose turn 2 says `words`. */
+    async function earlier(id: string, words: string, daysAgo: number) {
+      const at = (i: number) => new Date(Date.now() - daysAgo * 86_400_000 - (10 - i) * 60_000).toISOString();
+      const turns = [0, 1, 2, 3].map((i) => ({ uuid: `${id}-t${i}`, sessionId: id, ts: at(i), index: i, text: i === 2 ? words : `turn ${i}`, precedingAssistantText: i ? `reply ${i}` : '', precedingToolCalls: [] }));
+      await repo.upsertSession(project, { sessionId: id, sourceFile: 'f', cwd: '/Users/j/Vibe/demo', gitBranch: 'main', startedAt: turns[0].ts, endedAt: turns[3].ts, turns, toolCalls: [] }, []);
+    }
+
+    test('a reworded report a day after the flagged turn, close in meaning, joins its item; a far one or one too late does not', async () => {
+      await liveSession('e1', 'the totals on the invoice page are wrong again');
+      await repo.saveClassification('e1-t2', pushback, true, { embedding: unit(1) });
+      // Meaning too far (cosine 0.6): its own item.
+      expect(await k.createManualFeedback({ project, cwd: '/Users/j/Vibe/demo', text: 'the sidebar flickers', whatWasDone: 'x', embedding: unit(0.6) })).toMatch(/^manual:/);
+      // Different words, the same meaning (cosine 0.9): one item.
+      const same = await k.createManualFeedback({ project, cwd: '/Users/j/Vibe/demo', text: 'agent miscalculated invoice sums', whatWasDone: 'x', embedding: unit(0.9) });
+      expect(same).toBe('e1-t2');
+    });
+
+    test('the detector flags a reworded complaint the next day: it joins the pending item; four days on it is its own', async () => {
+      await earlier('e2', 'you broke the CSV export', 1);
+      await repo.saveClassification('e2-t2', pushback, true, { embedding: unit(1) });
+      await liveSession('e3', 'exporting to csv fails since yesterday');
+      expect(await repo.saveClassification('e3-t2', pushback, true, { embedding: unit(0.92) })).toBe('e2-t2');
+      await earlier('e4', 'the csv export is broken', 4);
+      await repo.saveClassification('e4-t2', pushback, true, { embedding: unit(1) });
+      expect(await repo.listCandidates({ status: 'pending' })).toHaveLength(2);
+      // Without an embedding, only the word and session rules apply, in the hour.
+      await liveSession('e5', 'csv export broken, again');
+      expect(await repo.saveClassification('e5-t2', pushback, true)).toBe('e5-t2');
+    });
+
   });
 
   test('post-mortem output, memory lessons and manual feedback are redacted before storage', async () => {

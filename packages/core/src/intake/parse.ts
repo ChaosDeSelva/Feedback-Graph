@@ -131,17 +131,36 @@ function turnOf(line: string): Turn | null {
 // ---------------------------------------------------------------------------------------------------------------------
 // txt and md
 
+/** "Participants: Ana Lopez, Bo and Cy" (or Attendees, Present, Who): the names a note says were there, folded. */
+const LISTED = /^[ \t]*(?:[-*+>][ \t]+)?(?:\*\*|__)?(?:participants|attendees|present|who)(?:\*\*|__)?[ \t]*:(?:\*\*|__)?[ \t]*(.+)$/i;
+const fold = (name: string) => name.normalize('NFKD').replace(/\p{M}/gu, '').replace(/[*_]/g, '').replace(/\s+/g, ' ').trim().toLowerCase();
+function listedNames(lines: Line[]): Set<string> {
+  const out = new Set<string>();
+  for (const l of lines) {
+    const m = LISTED.exec(l.text);
+    if (m) for (const n of m[1].split(/[,;]|\band\b|&/)) if (fold(n)) out.add(fold(n));
+  }
+  return out;
+}
+
 /**
  * A transcript when at least two lines, and three in ten of the non-blank ones, open a turn: each turn runs to the
- * next turn or blank line, and text outside any turn is a paragraph with no speaker. Otherwise one utterance per
- * paragraph. Utterance text is the source verbatim, so offset + a char index is a place in the source.
+ * next turn or blank line, and text outside any turn is a paragraph with no speaker. Notes with fewer such lines keep
+ * as turns those whose speaker is named on two or more of them or in a "Participants:" line, so "Ana: ..." lines among
+ * bullets are still Ana's; the rest of the text is paragraphs with no speaker. Utterance text is the source verbatim,
+ * so offset + a char index is a place in the source.
  */
 function parseText(text: string): Part[] {
   const lines = linesOf(text);
   const nonBlank = lines.filter((l) => !blank(l)).length;
   const turns = lines.map((l) => (blank(l) ? null : turnOf(l.text)));
   const turnCount = turns.filter(Boolean).length;
-  return turnCount >= 2 && turnCount * 10 >= nonBlank * 3 ? transcriptOf(text, lines, turns) : paragraphsOf(text, lines);
+  if (turnCount >= 2 && turnCount * 10 >= nonBlank * 3) return transcriptOf(text, lines, turns);
+  const listed = listedNames(lines);
+  const said = new Map<string, number>();
+  for (const t of turns) if (t?.speaker) said.set(fold(t.speaker), (said.get(fold(t.speaker)) ?? 0) + 1);
+  const named = turns.map((t) => (t?.speaker && t.textAt !== null && ((said.get(fold(t.speaker)) ?? 0) >= 2 || listed.has(fold(t.speaker))) ? t : null));
+  return named.some(Boolean) ? transcriptOf(text, lines, named) : paragraphsOf(text, lines);
 }
 
 /** The source between start and end, trimmed, with the offset of its first character. */

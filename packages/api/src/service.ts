@@ -178,6 +178,8 @@ export async function createApiService(config: Config, store: Store, env: NodeJS
         store: store.intake,
         fact: (id: string) => store.facts.fact(id),
         lesson: async (id: string) => (await knowledge.lessonDetail(id))?.lesson ?? null,
+        // what_do_we_know: the look-up, accepted knowledge only.
+        knowledge: { intake: store.intake, facts: store.facts, lessons: knowledge, embed },
         // submit_notes: the agent's notes as a notes source, private (never synced), read into claims for the owner.
         submit: async (project: Project, n: AgentNotes) => {
           const prepared = prepareIntakeSource(project, { projectKey: project.key, kind: 'notes', format: 'md', title: n.title, text: n.text, occurredAt: n.occurredAt, origin: n.origin, private: true });
@@ -215,6 +217,7 @@ export async function createApiService(config: Config, store: Store, env: NodeJS
     cloud: {
       cloud: config.cloud,
       localOnlyStore: store.docs,
+      intake: intakeEnabled(env),
       memory: config.cloud ? storedSyncMemory(store.docs, config.cloud) : undefined,
       portability: store.portability,
       activity,
@@ -223,7 +226,10 @@ export async function createApiService(config: Config, store: Store, env: NodeJS
     },
     inScope: async (key: string) => (await scope()).project(key),
     shown,
-    importer: { knowledge, facts, embed, activity, portability: store.portability, excluded: config.excludeProjects },
+    importer: {
+      knowledge, facts, embed, activity, portability: store.portability, excluded: config.excludeProjects,
+      ...(intakeEnabled(env) && { intake: { store: store.intake, facts: store.facts, lesson: async (id: string) => (await knowledge.lessonDetail(id))?.lesson ?? null } }),
+    },
     demo: {
       knowledge,
       facts,
@@ -282,11 +288,15 @@ export async function createApiService(config: Config, store: Store, env: NodeJS
       hostHome: config.hostHome,
     },
     context: contextDeps,
+    ...(intakeEnabled(env) && { lookUp: { intake: store.intake, facts, lessons: knowledge, embed }, portableIntake: store.intake }),
     ...(intakeEnabled(env) && { intakeReview: { intake: store.intake, facts, embed, activity, conflicts: { store, exec: decisionExecutor(store, { embed }) } } }),
     chat: {
       store: store.chats,
       // As the asking request sees the stores (runScoped): a sandbox run's records reach only its own turns.
-      build: chatPackBuilder({ context: contextDeps, codeMap: (k) => store.codegraph.codeMap(k), sessionFiles: (id) => store.codegraph.sessionFiles(id) }),
+      build: chatPackBuilder({
+        context: contextDeps, codeMap: (k) => store.codegraph.codeMap(k), sessionFiles: (id) => store.codegraph.sessionFiles(id),
+        ...(intakeEnabled(env) && { knowledge: { intake: store.intake, facts: store.facts, lessons: knowledge, embed } }),
+      }),
     },
     // Knowledge intake: dark until INTAKE_ENABLED. INTAKE_ARCHIVE=off keeps no original transcript anywhere.
     ...(intakeEnabled(env) ? { intake: { store: store.intake, archive: intakeArchive(env), decide: { store, exec: decisionExecutor(store, { embed }) } } } : {}),

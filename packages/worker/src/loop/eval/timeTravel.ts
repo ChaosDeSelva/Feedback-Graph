@@ -2,7 +2,7 @@ import {
   decisionId, type Activity, type ActivityInput, type ActivityQuery, type ActivitySinceQuery, type CalibrationBucket, type CalibrationBump,
   type Candidate, type Decision, type DecisionCount, type DecisionFilter, type DecisionInput, type DecisionNote, type DecisionNoteInput, type DecisionsStore,
   type DecisionStatusPatch, type DecidedLessonsQuery, type Lesson, type LessonFilter, type LessonSignals, type LessonSignalsRow,
-  type MissLink, type Store, type TargetSnapshot,
+  type DistinctPair, type MissLink, type Store, type TargetSnapshot,
 } from '@fb/core';
 import type { LoopEngineDeps } from '../engine.ts';
 
@@ -113,11 +113,11 @@ export class MemoryDecisions implements DecisionsStore {
   private readonly buckets = new Map<string, CalibrationBucket>();
   private readonly noteRows: DecisionNote[] = [];
   private readonly labelled = new Set<string>();
-  private readonly base: Pick<DecisionsStore, 'loopMisses' | 'missLinks'>;
+  private readonly base: Pick<DecisionsStore, 'loopMisses' | 'missLinks' | 'distinctPairs'>;
   private readonly now: () => string;
   private readonly t0: string;
 
-  constructor(base: Pick<DecisionsStore, 'loopMisses' | 'missLinks'>, t0: number) {
+  constructor(base: Pick<DecisionsStore, 'loopMisses' | 'missLinks' | 'distinctPairs'>, t0: number) {
     this.base = base;
     this.t0 = iso(t0);
     this.now = () => this.t0;
@@ -251,6 +251,19 @@ export class MemoryDecisions implements DecisionsStore {
     throw new ReplayReadOnly('unlinkMisses');
   }
 
+  async markDistinct(): Promise<boolean> {
+    throw new ReplayReadOnly('markDistinct');
+  }
+
+  async liftDistinct(): Promise<boolean> {
+    throw new ReplayReadOnly('liftDistinct');
+  }
+
+  /** The pairs marked distinct before the replay's time. */
+  async distinctPairs(ids: string[]): Promise<DistinctPair[]> {
+    return (await this.base.distinctPairs(ids)).filter((p) => p.at < this.t0);
+  }
+
   async missLinks(missId: string): Promise<MissLink[]> {
     return (await this.base.missLinks(missId)).filter((l) => l.createdAt < this.t0);
   }
@@ -278,7 +291,7 @@ export type TimeTravel = {
 };
 
 /** The restored store as the loop reads it at T0. `history`: what changed its lessons (LessonHistory). */
-export function timeTravel(store: Pick<Store, 'knowledge' | 'facts' | 'graph' | 'codegraph' | 'insights' | 'decisions' | 'activity'>, t0: number, history: LessonHistory): TimeTravel {
+export function timeTravel(store: Pick<Store, 'knowledge' | 'facts' | 'graph' | 'codegraph' | 'insights' | 'decisions' | 'activity' | 'intake' | 'links' | 'docs'>, t0: number, history: LessonHistory): TimeTravel {
   const at = iso(t0);
   const earlier = (ts: string | undefined) => (ts && ts < at ? ts : at);
   const recorded: ActivityInput[] = [];
@@ -351,5 +364,6 @@ export function timeTravel(store: Pick<Store, 'knowledge' | 'facts' | 'graph' | 
     },
   });
 
-  return { store: { knowledge, graph, facts, codegraph: store.codegraph, insights: store.insights, decisions, activity }, decisions, recorded };
+  // Knowledge intake is read as it is now, not as it was: its loop types are not replayed with labels (score.ts).
+  return { store: { knowledge, graph, facts, codegraph: store.codegraph, insights: store.insights, decisions, activity, intake: store.intake, links: store.links, docs: store.docs }, decisions, recorded };
 }

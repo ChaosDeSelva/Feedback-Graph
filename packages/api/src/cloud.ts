@@ -3,6 +3,7 @@ import type { Hono } from 'hono';
 import { z } from 'zod';
 import {
   previewCloudSync, redactSecrets, cloudUrlProblem, runCloudSync, cloudLocalOnlyProjects, CLOUD_LOCAL_ONLY_CURSOR, cloudSharedDemoProjects, CLOUD_SHARED_DEMOS_CURSOR,
+  cloudIntakeSharing, CLOUD_INTAKE_SHARING_CURSOR,
   type ActivityStore, type DocsStore, type CloudConfig, type CloudSyncResult, type ManualSync, type PortabilityStore, type SyncCounts, type SyncMemory,
   type SyncProgress, type SyncTrigger, type SyncResponse, type WorkerStatus,
 } from '@fb/core';
@@ -18,6 +19,8 @@ export type CloudDeps = {
   /** What the cloud last accepted (storedSyncMemory: the same record the worker's schedule uses). Default: in memory. */
   memory?: SyncMemory;
   localOnlyStore?: Pick<DocsStore, 'getCursor' | 'setCursor'>;
+  /** Knowledge intake is on (INTAKE_ENABLED): the card shows and sets whether claims and who said them are synced. */
+  intake?: boolean;
   fetch?: typeof fetch;
 };
 
@@ -39,11 +42,18 @@ export type CloudInfo = {
   projects: string[];
   preview: { total: SyncCounts; projects: { key: string; counts: SyncCounts | null; reason?: string }[] } | null;
   previewError: string | null;
+  /** Asked with preview=0: the preview was not counted (counting reads every selected project's export, which takes seconds). */
+  previewSkipped?: true;
   last: { at: string; ok: boolean; trigger: SyncTrigger; error: string | null; sent: SyncCounts | null; projects: string[]; failed: string[]; teamLessons?: NonNullable<SyncResponse['teamLessons']>[] } | null;
   nextAt: string | null;
   neverSent: string;
   teamLessons?: SyncResponse['teamLessons'];
   policyError?: string;
+  /**
+   * With knowledge intake on: whether facts from accepted claims are synced (SYNC_CLAIMS) and name who said them
+   * (SYNC_PEOPLE), as in effect (Settings over .env); saved: set in Settings; editable: it can be set there.
+   */
+  intakeSharing?: { claims: boolean; people: boolean; saved: boolean; editable: boolean };
 };
 
 /** A Sync now in progress (GET /api/cloud/progress, /api/status). */
@@ -69,8 +79,10 @@ const manualOf = (r: CloudSyncResult): ManualSync => ({
 const SyncRequest = z.object({ force: z.boolean().optional() }).strict();
 const ProjectKeys = z.array(z.string().min(1).max(200)).max(2000);
 const LocalOnly = z.object({ projects: ProjectKeys, shareDemoProjects: ProjectKeys.optional() }).strict();
+/** PUT /api/cloud/intake-sharing: people only with claims. */
+const IntakeSharingBody = z.object({ claims: z.boolean(), people: z.boolean() }).strict().refine((b) => b.claims || !b.people, 'people are named only when claims are synced: set claims true too');
 /** For the OpenAPI document (openapi.ts). */
-export const cloudSchemas = { SyncRequest, LocalOnly };
+export const cloudSchemas = { SyncRequest, LocalOnly, IntakeSharingBody };
 
 /**
  * The card and Sync now. POST /api/cloud/sync is owner-only (guarded in createApp); it sends what changed since the
@@ -89,6 +101,8 @@ export function cloudRoutes(app: Hono, d: CloudDeps): CloudState {
       .then(async response => { if (!response.ok) return undefined; const body = await response.json() as { teamLessons?: SyncResponse['teamLessons'] }; const team = body.teamLessons; return team && typeof team.message === 'string' && typeof team.adminApprovalRequired === 'boolean' ? { ...team, message: redactSecrets(team.message).slice(0, 1000) } : undefined; }).catch(() => undefined);
     policyCache = { until: Date.now() + 60_000, value }; return value;
   };
+  /** SYNC_CLAIMS and SYNC_PEOPLE in effect: Settings over .env. */
+  const sharing = async () => (d.localOnlyStore ? cloudIntakeSharing(d.localOnlyStore, d.cloud ?? {}) : { claims: !!d.cloud?.claims, people: !!d.cloud?.claims && !!d.cloud?.people, saved: false });
   // What the cloud last accepted per project, for `withdrawn` on the next Sync now; shared with the worker's schedule.
   const memory: SyncMemory = d.memory ?? new Map();
   const restore = async () => {
@@ -116,10 +130,14 @@ export function cloudRoutes(app: Hono, d: CloudDeps): CloudState {
       nextAt: null,
       neverSent: NEVER_SENT,
     };
+    const shares = d.intake ? await sharing() : null;
+    if (shares) info.intakeSharing = { ...shares, editable: !!d.localOnlyStore && !!cloud };
     if (!cloud) return c.json(info);
     info.projects = (await d.projects()).filter(key => !info.localOnlyProjects?.includes(key));
-    try {
-      info.preview = await previewCloudSync(d.portability, info.projects, { suggestions: cloud.suggestions, claims: cloud.claims, people: cloud.people, memory, shareDemoProjects: info.shareDemoProjects });
+    // preview=0: the settings at once; the page asks again for the counts.
+    if (c.req.query('preview') === '0') info.previewSkipped = true;
+    else try {
+      info.preview = await previewCloudSync(d.portability, info.projects, { suggestions: cloud.suggestions, claims: shares?.claims ?? cloud.claims, people: shares?.people ?? cloud.people, memory, shareDemoProjects: info.shareDemoProjects });
     } catch (err) {
       info.previewError = redactSecrets(String(err)).slice(0, 300);
     }
@@ -153,6 +171,27 @@ export function cloudRoutes(app: Hono, d: CloudDeps): CloudState {
     return c.json({ projects: await cloudLocalOnlyProjects(d.localOnlyStore, d.cloud?.localOnlyProjects), shareDemoProjects: await cloudSharedDemoProjects(d.localOnlyStore) });
   });
 
+  // Settings' Cloud sync card: whether facts from accepted claims are synced, and with who said them. A fact from a
+  // private source never goes, whatever this says (syncBundle). Logged in Activity.
+  app.put('/api/cloud/intake-sharing', async (c) => {
+    if (!d.localOnlyStore || !d.cloud) return c.json({ error: 'cloud sync is off: set CLOUD_URL and CLOUD_TOKEN in .env and restart' }, 409);
+    if (!d.intake) return c.json({ error: 'knowledge intake is off (INTAKE_ENABLED), so there are no claims to sync' }, 409);
+    const body = IntakeSharingBody.safeParse(await c.req.json().catch(() => null));
+    if (!body.success) return c.json({ error: body.error.flatten() }, 400);
+    const before = await sharing();
+    await d.localOnlyStore.setCursor(CLOUD_INTAKE_SHARING_CURSOR, JSON.stringify(body.data));
+    const after = await sharing();
+    if (before.claims !== after.claims || before.people !== after.people) {
+      await d.activity.record({
+        kind: 'cloud_settings_changed', actor: 'you', projectKey: null,
+        subject: `cloud sync of claims: ${after.claims ? `on${after.people ? ', naming who said them' : ', without names'}` : 'off'}`,
+        why: after.claims ? 'you chose to sync the facts your accepted claims became (never a private source\'s, never a quote)' : 'you chose to keep the facts your accepted claims became on this machine; synced ones are withdrawn on the next sync',
+        details: { claims: after.claims, people: after.people, before: { claims: before.claims, people: before.people } }, targets: [],
+      });
+    }
+    return c.json({ ...after, editable: true });
+  });
+
   app.post('/api/cloud/sync', async (c) => {
     const cloud = d.cloud;
     if (!cloud) return c.json({ error: 'cloud sync is off: set CLOUD_URL and CLOUD_TOKEN in .env and restart' }, 409);
@@ -162,7 +201,7 @@ export function cloudRoutes(app: Hono, d: CloudDeps): CloudState {
     await authorizeStoreWrite();
     const startedAt = new Date().toISOString();
     const run = runCloudSync({
-      cloud: { ...cloud, shareDemoProjects: d.localOnlyStore ? await cloudSharedDemoProjects(d.localOnlyStore) : [], localOnlyProjects: d.localOnlyStore ? await cloudLocalOnlyProjects(d.localOnlyStore, cloud.localOnlyProjects) : cloud.localOnlyProjects }, portability: d.portability, activity: d.activity, projects: d.projects, trigger: 'manual', fetch: d.fetch, memory,
+      cloud: { ...cloud, ...(await sharing()), shareDemoProjects: d.localOnlyStore ? await cloudSharedDemoProjects(d.localOnlyStore) : [], localOnlyProjects: d.localOnlyStore ? await cloudLocalOnlyProjects(d.localOnlyStore, cloud.localOnlyProjects) : cloud.localOnlyProjects }, portability: d.portability, activity: d.activity, projects: d.projects, trigger: 'manual', fetch: d.fetch, memory,
       force: body.data.force ?? false,
       onProgress: (p) => { progress = { ...p, startedAt }; },
     });

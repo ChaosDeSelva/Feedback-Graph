@@ -7,7 +7,7 @@ import {
   matchReport,
   redactDeep,
   MAX_CLASSIFY_ATTEMPTS,
-  REPORT_MERGE_MINUTES,
+  reportWindowMs,
   postmortemState,
   redactSecrets,
   redactStoredRow,
@@ -37,7 +37,7 @@ import {
   type WorkerStatus,
   type AgentSeen,
 } from '@fb/core';
-import { iso, toJson, tx, type Db } from './db.ts';
+import { fromVector, iso, toJson, toVector, tx, type Db } from './db.ts';
 import { refreshSessionStats } from './sessions.ts';
 import { sandboxPresence, visibleToRun } from './vector.ts';
 
@@ -270,7 +270,8 @@ export class PgGraphStore implements GraphStore {
     return rowCount ?? 0;
   }
 
-  async saveClassification(turnUuid: string, c: Classification, makeCandidate: boolean): Promise<string | null> {
+  async saveClassification(turnUuid: string, c: Classification, makeCandidate: boolean, o: { embedding?: number[] | null } = {}): Promise<string | null> {
+    const embedding = o.embedding?.length ? o.embedding : null;
     return tx(this.db, async (x) => {
       await x.query('UPDATE turns SET label = $2, confidence = $3, summary = $4, signals = $5 WHERE uuid = $1', [
         turnUuid,
@@ -281,7 +282,7 @@ export class PgGraphStore implements GraphStore {
       ]);
       if (!makeCandidate) return null;
       sandboxPresence(this.db).mark(); // The session binding may have been claimed by the API process.
-      const merged = await mergeIntoReport(x, turnUuid);
+      const merged = await mergeIntoReport(x, turnUuid, embedding);
       if (merged) return merged;
       // The same words again in the same session or PR thread while the first is still pending: one Inbox item.
       const { rows: [same] } = await x.query(
@@ -293,15 +294,35 @@ export class PgGraphStore implements GraphStore {
         [turnUuid],
       );
       if (same) return same.id as string;
+      // A reworded complaint, or the same one days later: one Inbox item with the pending one it means (dedupe.ts).
+      if (embedding) {
+        const { rows: [t] } = await x.query(
+          `SELECT t.ts, s.project_key, s.run FROM turns t JOIN sessions s ON s.id = t.session_id
+           WHERE t.uuid = $1 AND NOT EXISTS (SELECT 1 FROM candidates c WHERE c.id = t.uuid)`,
+          [turnUuid],
+        );
+        if (t) {
+          const { rows } = await x.query(
+            `SELECT k.id, o.ts, k.dedupe_embedding::text AS embedding FROM candidates k JOIN turns o ON o.uuid = k.turn_uuid
+             WHERE k.project_key = $1 AND k.status = 'pending' AND k.dedupe_embedding IS NOT NULL AND k.run IS NOT DISTINCT FROM $4::text
+               AND k.created_at BETWEEN $2::timestamptz - make_interval(secs => $3) AND $2::timestamptz + make_interval(secs => $3)`,
+            [t.project_key, t.ts, reportWindowMs({ embedding }) / 1000, t.run],
+          );
+          const hit = matchReport({ ts: (t.ts as Date).toISOString(), text: '', sessionId: null, embedding },
+            rows.map((r) => ({ id: r.id as string, ts: (r.ts as Date).toISOString(), text: '', sessionId: null, embedding: fromVector(r.embedding) })));
+          if (hit) return hit.id;
+        }
+      }
       // A decided candidate keeps its status, note and decision time when the turn is flagged again.
       await x.query(
-        `INSERT INTO candidates (id, turn_uuid, session_id, project_key, ts, source, status, created_at, run, sandbox)
-         SELECT t.uuid, t.uuid, s.id, p.key, t.ts, coalesce(s.source, 'claude'), 'pending', $2, s.run, s.sandbox
+        `INSERT INTO candidates (id, turn_uuid, session_id, project_key, ts, source, status, created_at, run, sandbox, dedupe_embedding)
+         SELECT t.uuid, t.uuid, s.id, p.key, t.ts, coalesce(s.source, 'claude'), 'pending', $2, s.run, s.sandbox, $3::vector
          FROM turns t JOIN sessions s ON s.id = t.session_id JOIN projects p ON p.key = s.project_key
          WHERE t.uuid = $1
          ON CONFLICT (id) DO UPDATE SET turn_uuid = EXCLUDED.turn_uuid, session_id = EXCLUDED.session_id,
-           project_key = EXCLUDED.project_key, ts = EXCLUDED.ts, source = EXCLUDED.source, run = EXCLUDED.run, sandbox = EXCLUDED.sandbox`,
-        [turnUuid, new Date()],
+           project_key = EXCLUDED.project_key, ts = EXCLUDED.ts, source = EXCLUDED.source, run = EXCLUDED.run, sandbox = EXCLUDED.sandbox,
+           dedupe_embedding = coalesce(EXCLUDED.dedupe_embedding, candidates.dedupe_embedding)`,
+        [turnUuid, new Date(), toVector(embedding)],
       );
       return turnUuid;
     });
@@ -652,7 +673,7 @@ export class PgGraphStore implements GraphStore {
  * post-mortem then sees the real session) and its manual stand-in session goes; a decided one only records the detector.
  * Returns the report's Inbox id if merged, else null.
  */
-async function mergeIntoReport(x: { query: (sql: string, params?: unknown[]) => Promise<{ rows: Row[] }> }, turnUuid: string): Promise<string | null> {
+async function mergeIntoReport(x: { query: (sql: string, params?: unknown[]) => Promise<{ rows: Row[] }> }, turnUuid: string, embedding: number[] | null): Promise<string | null> {
   const { rows: [turn] } = await x.query(
     `SELECT t.ts, t.ts_text, t.text, s.id AS session_id, s.project_key, s.run, coalesce(s.source, 'claude') AS source
      FROM turns t JOIN sessions s ON s.id = t.session_id
@@ -661,20 +682,20 @@ async function mergeIntoReport(x: { query: (sql: string, params?: unknown[]) => 
   );
   if (!turn) return null;
   const { rows } = await x.query(
-    `SELECT k.id, k.status, k.created_at, k.agent_report, mt.text, mt.preceding_assistant_text
+    `SELECT k.id, k.status, k.created_at, k.agent_report, k.dedupe_embedding::text AS embedding, mt.text, mt.preceding_assistant_text
      FROM candidates k JOIN turns mt ON mt.uuid = k.turn_uuid
      WHERE k.project_key = $1 AND k.manual AND NOT k.detected AND k.status <> 'rejected' AND k.run IS NOT DISTINCT FROM $4::text
-       AND k.created_at BETWEEN $2::timestamptz - make_interval(mins => $3) AND $2::timestamptz + make_interval(mins => $3)`,
-    [turn.project_key, turn.ts, REPORT_MERGE_MINUTES, turn.run],
+       AND k.created_at BETWEEN $2::timestamptz - make_interval(secs => $3) AND $2::timestamptz + make_interval(secs => $3)`,
+    [turn.project_key, turn.ts, reportWindowMs({ embedding }) / 1000, turn.run],
   );
   const reports = rows.map((r) => {
     const { agentReport } = candidateProvenance({
       manual: true, detected: false, agentReport: r.agent_report ?? null,
       turnText: r.text, turnWhatWasDone: r.preceding_assistant_text, createdAt: iso(r.created_at) as string,
     });
-    return { id: r.id as string, status: r.status as CandidateStatus, report: agentReport!, ts: iso(r.created_at) as string, text: agentReport!.text, sessionId: agentReport!.sessionId };
+    return { id: r.id as string, status: r.status as CandidateStatus, report: agentReport!, ts: iso(r.created_at) as string, text: agentReport!.text, sessionId: agentReport!.sessionId, embedding: fromVector(r.embedding) };
   });
-  const hit = matchReport({ ts: (turn.ts as Date).toISOString(), text: turn.text ?? '', sessionId: turn.session_id }, reports);
+  const hit = matchReport({ ts: (turn.ts as Date).toISOString(), text: turn.text ?? '', sessionId: turn.session_id, embedding }, reports);
   if (!hit) return null;
   if (hit.status !== 'pending') {
     await x.query('UPDATE candidates SET detected = true, detected_turn_uuid = $2 WHERE id = $1', [hit.id, turnUuid]);

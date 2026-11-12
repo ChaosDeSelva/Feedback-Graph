@@ -115,6 +115,22 @@ describe('txt and md transcripts', () => {
     expect(parseIntake(src, 'txt').every((u) => u.speaker === null)).toBe(true);
   });
 
+  test('notes with a few speaker lines among bullets: a speaker named twice, or in a Participants line, keeps their lines', () => {
+    const src = [
+      '# Weekly sync', 'Participants: Test Person A, Test Person B', '', '- billing', '- retries', '- alerts', '- the runbook', '- on-call',
+      '', 'Test Person A: We will move the retry wait to 30 seconds.', '', '- more bullets', '- and more', '- and more still',
+      '', 'Test Person B: That is risky for billing.', '', 'Test Person A: Then billing keeps 60 seconds.', '', 'Note: unrelated label',
+    ].join('\n');
+    const us = parseIntake(src, 'md');
+    expect(us.filter((u) => u.speaker).map((u) => [u.speaker, u.text])).toEqual([
+      ['Test Person A', 'We will move the retry wait to 30 seconds.'],
+      ['Test Person B', 'That is risky for billing.'],
+      ['Test Person A', 'Then billing keeps 60 seconds.'],
+    ]);
+    expect(us.find((u) => u.text.startsWith('- billing'))?.speaker).toBeNull();
+    expectVerbatim(src, us);
+  });
+
   test('a preamble before the first turn is a paragraph with no speaker', () => {
     const src = 'Weekly sync, 10 November\n\nAna: Hello.\nBo: Hi.';
     expect(brief(parseIntake(src, 'txt'))).toEqual([[null, null, 'Weekly sync, 10 November'], ['Ana', null, 'Hello.'], ['Bo', null, 'Hi.']]);

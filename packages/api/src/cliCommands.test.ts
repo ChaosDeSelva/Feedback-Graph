@@ -1,7 +1,7 @@
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterAll, expect, test } from 'vitest';
+import { afterAll, describe, expect, test } from 'vitest';
 import { run, table, type CliIO } from './cli.ts';
 
 /** What a route answers: JSON (200), a Response as is, or a function of the request body and URL. */
@@ -842,4 +842,115 @@ test('integrations: the GitHub author filter, test and set results, --json, the 
     expect(await e.cmd('integrations', ...args)).toBe(2);
     expect(e.errors()).toMatch(message);
   }
+});
+
+test('fg know asks the look-up for its words (or its JSON) and says when intake is off', async () => {
+  const f = fg({ 'GET /api/knowledge': (_b: unknown, u: URL) => new Response(`# What we know about "${u.searchParams.get('q')}" (${u.searchParams.get('kinds')})`, { headers: { 'content-type': 'text/plain' } }) });
+  expect(await f.cmd('know', 'retry', 'timeouts', '--project', 'shop', '--kind', 'decisions,plans')).toBe(0);
+  expect(f.calls[0].path).toBe('/api/knowledge?q=retry+timeouts&project=shop&kinds=decisions%2Cplans&format=md');
+  expect(f.text()).toBe('# What we know about "retry timeouts" (decisions,plans)');
+  const j = fg({ 'GET /api/knowledge': { query: 'x', items: [] } });
+  expect(await j.cmd('know', 'x', '--json')).toBe(0);
+  expect(JSON.parse(j.text())).toEqual({ query: 'x', items: [] });
+  const off = fg({});
+  expect(await off.cmd('know', 'x')).toBe(1);
+  expect(off.errors()).toMatch(/knowledge intake is off on this install \(set INTAKE_ENABLED=1/);
+  expect(await fg({}).cmd('know')).toBe(2);
+});
+
+test('fg conflicts lists conflicts (--open: open ones) with both sides, and shows one', async () => {
+  const side = (id: string, text: string, who: string | null) => ({ kind: 'claim', id, text, status: 'accepted', speaker: who && { displayName: who, isOwner: false }, agentsSee: true, gone: false, assertedAt: '2026-11-10T10:00:00.000Z' });
+  const k = { id: 'conflict:1', kind: 'disagreement', status: 'open', projectKey: 'shop', createdAt: '2026-11-11T09:00:00.000Z', judge: { explanation: 'the waits differ' }, resolution: null, sides: { a: side('claim:a', 'Retries wait 30 s', 'Ana'), b: side('claim:b', 'Retries wait 60 s', null) } };
+  const f = fg({ 'GET /api/conflicts': [k], 'GET /api/conflicts/conflict%3A1': k });
+  expect(await f.cmd('conflicts', '--open', '--project', 'shop')).toBe(0);
+  expect(f.calls[0].path).toBe('/api/conflicts?status=open&project=shop');
+  expect(f.text()).toContain('conflict:1  disagreement  open    shop     Ana: Retries wait 30 s  Retries wait 60 s');
+  expect(await f.cmd('conflicts', 'show', 'conflict:1')).toBe(0);
+  expect(f.text()).toContain('A: Ana: Retries wait 30 s');
+  expect(f.text()).toContain('why: the waits differ');
+  expect(f.text()).toContain("settle it on the Intake page's Conflicts tab");
+  expect(await fg({ 'GET /api/conflicts': [] }).cmd('conflicts', 'resolve', 'x')).toBe(2);
+});
+
+describe('fg ingest', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'fg-ingest-'));
+  temps.push(dir);
+  const file = (name: string, content: string | Buffer) => { const p = join(dir, name); writeFileSync(p, content); return p; };
+  const added = { id: 'doc:shop:intake:sync.vtt', chunks: 1, format: 'vtt', utterances: 2 };
+
+  test('sends a caption file as it is, with its name, format, kind, date, who was there and privacy', async () => {
+    const f = fg({ 'POST /api/intake': added });
+    const vtt = file('sync.vtt', 'WEBVTT\n\n00:00.000 --> 00:01.000\n<v Ana>Retries wait 30 seconds\n');
+    expect(await f.cmd('ingest', vtt, '--project', 'shop', '--kind', 'transcript', '--date', '2026-11-10', '--participants', 'Ana, Bo', '--origin', 'Zoom weekly sync', '--shared')).toBe(0);
+    expect(f.calls[0].body).toEqual({
+      projectKey: 'shop', title: 'sync', name: 'sync.vtt', format: 'vtt', kind: 'transcript', occurredAt: '2026-11-10', participants: ['Ana', 'Bo'], origin: 'Zoom weekly sync',
+      private: false, text: 'WEBVTT\n\n00:00.000 --> 00:01.000\n<v Ana>Retries wait 30 seconds\n',
+    });
+    expect(f.text()).toContain('added doc:shop:intake:sync.vtt to shop: vtt, 2 parts');
+  });
+
+  test('a pdf or docx is turned into text here, with pdftotext or pandoc; a missing converter says what to install', async () => {
+    const ran: string[][] = [];
+    const runTool = async (cmd: string, args: string[]) => { ran.push([cmd, ...args]); return `text from ${cmd}`; };
+    const f = fg({ 'POST /api/intake': added }, {}, { runTool });
+    const pdf = file('notes.pdf', '%PDF-1.7 binary');
+    const docx = file('plan.docx', Buffer.from([0x50, 0x4b, 3, 4, 0]));
+    expect(await f.cmd('ingest', pdf, '--project', 'shop', '--private')).toBe(0);
+    expect(await f.cmd('ingest', docx, '--project', 'shop', '--title', 'The plan')).toBe(0);
+    expect(ran).toEqual([['pdftotext', '-layout', '-enc', 'UTF-8', pdf, '-'], ['pandoc', '-t', 'plain', '--wrap=none', docx]]);
+    expect(f.calls.map((c) => [c.body.text, c.body.format, c.body.title, c.body.private])).toEqual([['text from pdftotext', 'txt', 'notes', true], ['text from pandoc', 'txt', 'The plan', undefined]]);
+    // A pdf by its first bytes, whatever its name says.
+    expect(await f.cmd('ingest', file('scan', '%PDF-1.4 ...'), '--project', 'shop')).toBe(0);
+    expect(ran.at(-1)![0]).toBe('pdftotext');
+
+    const missing = fg({ 'POST /api/intake': added }, {}, { runTool: async () => { throw Object.assign(new Error('spawn pandoc ENOENT'), { code: 'ENOENT' }); } });
+    expect(await missing.cmd('ingest', docx, '--project', 'shop')).toBe(1);
+    expect(missing.errors()).toMatch(/needs pandoc to be turned into text, and it is not installed\. Install pandoc: brew install pandoc/);
+    expect(missing.calls).toEqual([]);
+    const broken = fg({}, {}, { runTool: async () => { throw new Error('Syntax Warning: May not be a PDF file\nmore'); } });
+    expect(await broken.cmd('ingest', pdf, '--project', 'shop')).toBe(1);
+    expect(broken.errors()).toContain('pdftotext could not read');
+  });
+
+  test('refuses a binary file, an empty one, both --private and --shared, a bad kind or date, and no project; reads standard input with -', async () => {
+    const f = fg({ 'POST /api/intake': added }, {}, { readStdin: async () => 'Ana: ship it Friday\nBo: agreed' });
+    expect(await f.cmd('ingest', file('photo.png', Buffer.from([0x89, 0x50, 0x4e, 0x47, 0, 0])), '--project', 'shop')).toBe(2);
+    expect(f.errors()).toContain('is not text, and fg cannot convert it');
+    expect(await f.cmd('ingest', file('empty.txt', '  \n'), '--project', 'shop')).toBe(1);
+    expect(await f.cmd('ingest', file('a.txt', 'x'), '--project', 'shop', '--private', '--shared')).toBe(2);
+    expect(await f.cmd('ingest', file('b.txt', 'x'), '--project', 'shop', '--kind', 'email')).toBe(2);
+    expect(await f.cmd('ingest', file('c.txt', 'x'), '--project', 'shop', '--date', 'last tuesday')).toBe(2);
+    expect(await f.cmd('ingest', file('d.txt', 'x'))).toBe(2);
+    expect(f.calls).toEqual([]);
+    expect(await f.cmd('ingest', '-', '--project', 'shop', '--kind', 'notes', '--date', '2026-11-10')).toBe(0);
+    expect(f.calls[0].body).toEqual({ projectKey: 'shop', title: 'Pasted notes 2026-11-10', text: 'Ana: ship it Friday\nBo: agreed', kind: 'notes', occurredAt: '2026-11-10' });
+    const off = fg({});
+    expect(await off.cmd('ingest', file('e.txt', 'x'), '--project', 'shop')).toBe(1);
+    expect(off.errors()).toMatch(/knowledge intake is off/);
+  });
+
+  test('--wait follows the reading on stderr, then lists the claims (with their conflicts) and questions drawn from it', async () => {
+    const states = [
+      { id: added.id, title: 'sync', read: { status: 'pending', error: null }, intake: { windowsDone: 0, windowsTotal: null } },
+      { id: added.id, title: 'sync', read: { status: 'pending', error: null }, intake: { windowsDone: 1, windowsTotal: 2 } },
+      { id: added.id, title: 'sync', read: { status: 'done', error: null }, intake: { windowsDone: 2, windowsTotal: 2 } },
+    ];
+    let n = 0;
+    const f = fg({
+      'POST /api/intake': added,
+      [`GET /api/intake/sources/${encodeURIComponent(added.id)}`]: () => states[Math.min(n++, 2)],
+      'GET /api/claims': [{ id: 'claim:1', type: 'decision', statement: 'Retries wait 30 seconds', status: 'proposed', conflicts: [{ id: 'conflict:1' }] }],
+      'GET /api/questions': [{ id: 'question:1', kind: 'needs_owner', text: 'Who owns retries?' }],
+    });
+    expect(await f.cmd('ingest', file('sync.vtt', 'WEBVTT\n'), '--project', 'shop', '--wait')).toBe(0);
+    expect(f.errors()).toContain(`${added.id}: queued`);
+    expect(f.errors()).toContain(`${added.id}: reading window 2/2`);
+    expect(f.text()).toContain(`${added.id}: read: 1 claim, 1 open question, 1 conflict with what is already known`);
+    expect(f.text()).toMatch(/decision\s+1\s+Retries wait 30 seconds\s+claim:1/);
+    expect(f.text()).toContain('Who owns retries?');
+    expect(f.calls.find((c) => c.path.startsWith('/api/claims'))!.path).toBe(`/api/claims?source=${encodeURIComponent(added.id)}&limit=500`);
+    const failed = fg({ 'POST /api/intake': added, [`GET /api/intake/sources/${encodeURIComponent(added.id)}`]: { ...states[0], read: { status: 'failed', error: 'the intake model is not allowed' } } });
+    expect(await failed.cmd('ingest', file('sync2.vtt', 'WEBVTT\n'), '--project', 'shop', '--wait')).toBe(1);
+    expect(failed.text()).toContain('failed: the intake model is not allowed');
+  });
 });

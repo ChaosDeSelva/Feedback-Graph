@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { expect, test, vi } from 'vitest';
-import { bundleCounts, CLOUD_LOCAL_ONLY_CURSOR, CLOUD_SHARED_DEMOS_CURSOR, cloudLocalOnlyProjects, cloudSharedDemoProjects, CloudSyncError, nextSyncDelayMs, PREVIEW_CONCURRENCY, previewCloudSync, pushBundle, retryAfterMs, runCloudSync, storedSyncMemory, syncBundle, syncMemoryCursor, syncProjects, type SyncResponse } from './cloud.ts';
+import { bundleCounts, CLOUD_LOCAL_ONLY_CURSOR, CLOUD_SHARED_DEMOS_CURSOR, cloudIntakeSharing, cloudLocalOnlyProjects, cloudSharedDemoProjects, CloudSyncError, nextSyncDelayMs, PREVIEW_CONCURRENCY, previewCloudSync, pushBundle, retryAfterMs, runCloudSync, storedSyncMemory, syncBundle, syncMemoryCursor, syncProjects, type SyncResponse } from './cloud.ts';
 import type { CloudConfig } from './config.ts';
 import { EXPORT_FORMAT, type ExportBundle } from './graph/portability.ts';
 import type { ActivityInput } from './types.ts';
@@ -1075,4 +1075,14 @@ test("a lesson's triggers go with it, so the team's agents get it by the same fi
   const sent = await syncBundle(store({ shop: withTriggers }), 'shop');
   expect(sent!.lessons.find((l) => l.id === 'lesson:1')).toMatchObject({ triggers });
   expect((await syncBundle(store({ shop: bundle() }), 'shop'))!.lessons[0]).not.toHaveProperty('triggers');
+});
+
+test('claim sharing: Settings over .env, people never named without claims, malformed storage refused', async () => {
+  const at = (raw: string | null) => ({ getCursor: async () => raw });
+  expect(await cloudIntakeSharing(at(null), { claims: true, people: true })).toEqual({ claims: true, people: true, saved: false });
+  expect(await cloudIntakeSharing(at(null), { claims: false, people: true })).toEqual({ claims: false, people: false, saved: false });
+  expect(await cloudIntakeSharing(at(null))).toEqual({ claims: false, people: false, saved: false });
+  expect(await cloudIntakeSharing(at('{"claims":false,"people":false}'), { claims: true, people: true })).toEqual({ claims: false, people: false, saved: true });
+  expect(await cloudIntakeSharing(at('{"claims":false,"people":true}'))).toEqual({ claims: false, people: false, saved: true });
+  await expect(cloudIntakeSharing(at('{"claims":"yes"}'))).rejects.toThrow(/invalid claim sharing setting/);
 });

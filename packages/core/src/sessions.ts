@@ -32,6 +32,38 @@ export const SessionSummarySchema = z.object({
 });
 export type SummaryFields = Omit<SessionSummary, 'markdown'>;
 
+const LIST_FIELDS = ['done', 'decisions', 'openThreads', 'filesTouched', 'pushback'] as const;
+const isObject = (v: unknown): v is Record<string, unknown> => !!v && typeof v === 'object' && !Array.isArray(v);
+/** A value as text: a string as is, a list or an object as its texts joined. */
+const asText = (v: unknown): string =>
+  typeof v === 'string' ? v : typeof v === 'number' || typeof v === 'boolean' ? String(v) : Array.isArray(v) ? v.map(asText).filter(Boolean).join('; ') : isObject(v) ? Object.values(v).map(asText).filter(Boolean).join(': ') : '';
+/** A value as a list of texts: a lone string is one item. */
+const asList = (v: unknown): string[] => (v === undefined || v === null ? [] : (Array.isArray(v) ? v : [v]).map(asText).filter(Boolean));
+
+/**
+ * A summary answer in the shapes local models return instead of the schema's object: wrapped in a list (`[{...}]`, or
+ * one object per part, merged in order), with snake_case keys (`open_threads`), a list where a sentence goes, a
+ * sentence or objects where a list of strings goes. Anything else is left for SessionSummarySchema to refuse.
+ */
+export function tolerantSummary(raw: unknown): unknown {
+  const parts = Array.isArray(raw) ? raw.filter(isObject) : [raw];
+  if (!parts.length || !parts.every(isObject)) return raw;
+  const out: Record<string, unknown> = {};
+  for (const part of parts) {
+    const p = Object.fromEntries(Object.entries(part).map(([k, v]) => [k.replace(/_([a-z])/g, (_, c: string) => c.toUpperCase()), v]));
+    if (p.goal !== undefined && !out.goal) out.goal = asText(p.goal);
+    if (p.outcome !== undefined) out.outcome = asText(p.outcome);
+    for (const f of LIST_FIELDS) if (p[f] !== undefined) out[f] = [...((out[f] as string[] | undefined) ?? []), ...asList(p[f])];
+  }
+  return out;
+}
+
+/** How a failed update whose answer was not a summary starts its stored error (SessionsStore.retryFailedSummaries). */
+export const INVALID_SUMMARY = 'the model did not return a valid summary';
+
+/** SessionSummarySchema over tolerantSummary: what a summary model's answer is parsed with. */
+export const SessionSummaryAnswerSchema = z.preprocess(tolerantSummary, SessionSummarySchema);
+
 /** The JSON schema handed to providers for structured output (the same fields as SessionSummarySchema). */
 export const SESSION_SUMMARY_JSON_SCHEMA = {
   type: 'object',

@@ -1,7 +1,8 @@
 import { githubBudgetFetch } from './integrations/githubBudget.ts';
 import { loopExecutor, readAuthState, reconcileInFlight, setRedactionArchive, setRedactionArchivePurger } from '@fb/core';
 import { encryptedRedactionArchive } from './redactionArchive.ts';
-import { cloudLocalOnlyProjects, cloudSharedDemoProjects, folderSelectedNow } from '@fb/core';
+import { writeRenames } from '@fb/core';
+import { cloudIntakeSharing, cloudLocalOnlyProjects, cloudSharedDemoProjects, folderSelectedNow } from '@fb/core';
 import { lstat, readFile, writeFile } from 'node:fs/promises';
 import { basename, dirname, join } from 'node:path';
 import {
@@ -224,6 +225,7 @@ export async function runWorker(io: WorkerIo): Promise<void> {
   const stagedRepo = withClassifyBacklog(repo, status, stage, config.classifyBatch);
 
   const cycleDeps = {
+    embed,
     listFiles: async () => {
       stage.enter('ingest');
       return [...(await claudeTranscriptFiles(transcripts)), ...(await codexSessionFiles(config.codexSessionsDir)).map((f) => ({ ...f, source: 'codex' as const }))];
@@ -384,6 +386,8 @@ export async function runWorker(io: WorkerIo): Promise<void> {
     exclusive: <T>(fn: () => Promise<T>) => selection.exclusive(fn),
     inScope: async (key: string) => (await selection.scope(config)).project(key),
     // Approved lessons about code the rebuild changed or removed are flagged for you (never revoked).
+    // The renames git saw, for the learning loop's update_paths (core loop/renames.ts).
+    saveRenames: (key, renames) => writeRenames(store.docs, key, renames),
     onMapped: async (p, before, after) => { await checkLessonsAgainstMap({ k: knowledge, repoFiles: repoFileList, activity, log }, p, before, after); },
   });
   // Abandons a map being parsed now; the loop waits for one being written before the store closes.
@@ -598,7 +602,8 @@ export async function runWorker(io: WorkerIo): Promise<void> {
         // A project that failed waits alone (its own backoff); the others keep the interval.
         run: async (waiting) =>
           runCloudSync({
-            cloud: { ...cloud, shareDemoProjects: await cloudSharedDemoProjects(store.docs) },
+            // SYNC_CLAIMS and SYNC_PEOPLE as set in Settings, over .env's.
+            cloud: { ...cloud, ...(await cloudIntakeSharing(store.docs, cloud)), shareDemoProjects: await cloudSharedDemoProjects(store.docs) },
             waiting,
             portability: store.portability,
             activity,
@@ -633,7 +638,7 @@ export async function runWorker(io: WorkerIo): Promise<void> {
     sortOldMisses: () => sortOldMisses({ knowledge, cursors: docs, activity, log }),
     migrateDeciders: () => migrateDeciderRule({ knowledge, cursors: docs, activity, log }),
     backfillProposedAs: () => backfillProposedAs({ knowledge, activity, cursors: docs, log }),
-    repairs: () => runRepairs({ knowledge, graph: repo, activity, cursors: docs, log }),
+    repairs: () => runRepairs({ knowledge, graph: repo, activity, cursors: docs, sessions: store.sessions, log }),
     evidence,
     reconcileDecisions: () => reconcileInFlight(store, { embed }),
   });

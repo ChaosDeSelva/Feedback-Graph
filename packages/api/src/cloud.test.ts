@@ -164,6 +164,14 @@ test('preview errors do not break the card', async () => {
 });
 
 
+test('preview=0 answers the settings without reading any project\'s export, saying the preview was skipped', async () => {
+  const exportData = vi.fn(async () => bundle('shop'));
+  const { d } = deps({ portability: { exportData } });
+  const res = await createApp(repo, { auth, cloud: d }).request('/api/cloud?preview=0');
+  expect(await res.json()).toMatchObject({ enabled: true, projects: ['shop'], preview: null, previewSkipped: true });
+  expect(exportData).not.toHaveBeenCalled();
+});
+
 test('local-only settings are owner protected, durable, and prevent forced manual export', async () => {
   const saved = new Map<string, string>();
   const localOnlyStore = { getCursor: async (key: string) => saved.get(key) ?? null, setCursor: async (key: string, value: string) => { saved.set(key, value); } };
@@ -225,4 +233,33 @@ test('API restart restores last sync and manual status after Activity retention 
   expect((await (await restarted.request('/api/cloud')).json()).last).toMatchObject({ ok: true, trigger: 'manual', sent: { lessons: 1 } });
   expect((await (await restarted.request('/api/cloud/progress')).json()).lastManual).toMatchObject({ ok: true, sent: { lessons: 1 } });
   expect((await (await restarted.request('/api/status')).json()).cloud.lastManual).toMatchObject({ ok: true, sent: { lessons: 1 } });
+});
+
+test('with knowledge intake on, the card shows claim sharing as in effect; the owner turns it on in Settings, and Sync now sends claim facts (never a private one) by it', async () => {
+  const saved = new Map<string, string>();
+  const localOnlyStore = { getCursor: async (key: string) => saved.get(key) ?? null, setCursor: async (key: string, value: string) => { saved.set(key, value); } };
+  const claimFact = (statement: string, priv: boolean) => ({ path: 'source:doc:shop:intake:x', lines: null, kind: 'decision', statement, why: 'Ana Example, 2026-11-10 call', confidence: 1, source: 'claim', createdAt: 't', projectKey: 'shop', claim: { private: priv, speaker: 'Ana Example' } });
+  const sent: { facts: { statement: string; why: string }[] }[] = [];
+  const { d, log } = deps({
+    localOnlyStore, intake: true,
+    portability: { exportData: async (q) => ({ ...bundle(q?.projectKey ?? ''), facts: [claimFact('Retries wait 30 seconds', false), claimFact('Invoices go out at nine', true)] }) },
+    fetch: (async (url: string, init?: RequestInit) => { if (url.endsWith('/sync-policy')) return new Response(null, { status: 404 }); sent.push(JSON.parse(String(init?.body)).bundles?.[0] ?? JSON.parse(String(init?.body))); return Response.json(syncOk); }) as unknown as typeof fetch,
+  });
+  const app = createApp(repo, { auth, cloud: d });
+  const put = (body: object, headers: Record<string, string> = ownerHeaders) => app.request('/api/cloud/intake-sharing', { method: 'PUT', body: JSON.stringify(body), headers: { 'content-type': 'application/json', ...headers } });
+  expect((await (await app.request('/api/cloud')).json()).intakeSharing).toEqual({ claims: false, people: false, saved: false, editable: true });
+  expect((await put({ claims: true, people: false }, {})).status).toBe(403);
+  expect((await put({ claims: false, people: true })).status).toBe(400);
+  expect(await (await put({ claims: true, people: false })).json()).toEqual({ claims: true, people: false, saved: true, editable: true });
+  expect(log.map((a) => [a.kind, a.subject])).toEqual([['cloud_settings_changed', 'cloud sync of claims: on, without names']]);
+  expect((await (await app.request('/api/cloud')).json()).intakeSharing).toMatchObject({ claims: true, people: false, saved: true });
+  await app.request('/api/cloud/sync', post('http://localhost'));
+  const facts = JSON.stringify(sent);
+  expect(facts).toContain('Retries wait 30 seconds');
+  expect(facts).not.toContain('Invoices go out at nine');
+  expect(facts).not.toContain('Ana Example');
+  // Without knowledge intake the card has no such setting, and it cannot be set.
+  const off = createApp(repo, { auth, cloud: deps({ localOnlyStore }).d });
+  expect((await (await off.request('/api/cloud')).json()).intakeSharing).toBeUndefined();
+  expect((await off.request('/api/cloud/intake-sharing', { method: 'PUT', body: JSON.stringify({ claims: true, people: true }), headers: { 'content-type': 'application/json', ...ownerHeaders } })).status).toBe(409);
 });

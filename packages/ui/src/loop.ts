@@ -20,6 +20,13 @@ const TYPE_LABEL: Record<DecisionType, string> = {
   record_fact: 'record fact',
   triage_inbox: 'triage Inbox',
   tune_threshold: 'tune threshold',
+  merge_claims: 'merge claims',
+  link_claims: 'link claims',
+  accept_claim: 'accept claim',
+  propose_resolution: 'suggest a resolution',
+  assign_question: 'assign question',
+  close_question: 'close question',
+  update_paths: 'update renamed paths',
   resolve_conflict: 'conflict resolved',
   remove_source: 'source removed',
 };

@@ -64,7 +64,7 @@ describe.skipIf(!testStores().includes('postgres'))('Postgres migrations', () =>
     const columns = Object.fromEntries(rows.map((r) => [r.table_name, r.columns as string[]]));
     expect(Object.keys(columns).sort()).toEqual([
       'activity', 'candidates', 'causes', 'chat_conversations', 'chat_turns', 'chunks', 'claim_links', 'claims', 'code_files', 'code_imports', 'code_maps', 'code_symbols', 'code_tests', 'commit_feedback', 'commits', 'conflict_sides', 'conflicts', 'context_item_misses',
-      'context_item_sessions', 'context_items', 'decision_deps', 'decision_notes', 'decision_targets', 'decisions', 'doc_blobs', 'docs', 'facts', 'feedback', 'graph_config', 'intake_sources', 'lesson_signals', 'lesson_supersedes', 'lessons',
+      'context_item_sessions', 'context_items', 'decision_deps', 'decision_notes', 'decision_targets', 'decisions', 'distinct_pairs', 'doc_blobs', 'docs', 'facts', 'feedback', 'graph_config', 'intake_sources', 'lesson_signals', 'lesson_supersedes', 'lessons',
       'loop_calibration', 'miss_links', 'misses', 'people', 'person_aliases', 'predone_check_lessons', 'predone_checks', 'project_candidates', 'project_links', 'project_selection', 'projects', 'questions', 'read_resets', 'run_owners',
       'scan_jobs', 'schema_migrations', 'session_commits', 'session_files', 'session_run_tags', 'session_summary_updates', 'sessions', 'source_people', 'supersessions', 'sync_cursors', 'tasks', 'turns', 'worker_status',
     ]);
@@ -153,7 +153,7 @@ describe.skipIf(!testStores().includes('postgres'))('Postgres migrations', () =>
                    VALUES ('lesson:1', 'demo', 't', 'r', 'a', 'project', 'approved', 'postmortem', now(), 3)`);
     await p.query(`INSERT INTO decisions (id, type, project_key, status, tier, mode, score, confidence, band, rationale, policy_version, created_at)
                    VALUES ('dec:1', 'approve_lesson', 'demo', 'applied', 'A', 'auto', 0.9, '{}', 4, 'r', 1, now())`);
-    const to090 = all.slice(upTo083.length);
+    const to090 = all.slice(upTo083.length, all.indexOf('0062_intake.sql') + 1);
     expect(to090).toEqual(['0062_intake.sql']);
     for (const f of to090) writeFileSync(join(dir, f), readFileSync(new URL(f, MIGRATIONS), 'utf8'));
     expect(await migrate(p, { dir })).toEqual(to090);
@@ -166,6 +166,27 @@ describe.skipIf(!testStores().includes('postgres'))('Postgres migrations', () =>
     // The widened activity check takes intake's kinds.
     await p.query(`INSERT INTO activity (id, ts, kind, actor, subject, why) VALUES ('a1', now(), 'conflict_resolved', 'you', 'conflict:1', 's')`);
     expect((await p.query(`SELECT count(*)::int AS n FROM claims`)).rows).toEqual([{ n: 0 }]);
+    expect(await migrate(p, { dir })).toEqual([]);
+  });
+
+  test('a 0.9.0 database (through 0062) upgrades to 0.9.1: 0063 takes the claim loop types and questions as targets, its decisions kept', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'fb-migrations-'));
+    const all = await migrationIds();
+    const upTo090 = all.slice(0, all.indexOf('0062_intake.sql') + 1);
+    for (const f of upTo090) writeFileSync(join(dir, f), readFileSync(new URL(f, MIGRATIONS), 'utf8'));
+    const p = pool();
+    await migrate(p, { dir });
+    await p.query(`INSERT INTO decisions (id, type, project_key, status, tier, mode, score, confidence, band, rationale, policy_version, created_at, author)
+                   VALUES ('dec:1', 'resolve_conflict', null, 'applied', 'P', 'propose', 1, '{}', 4, 'r', 1, now(), 'owner')`);
+    writeFileSync(join(dir, '0063_claim_loop_types.sql'), readFileSync(new URL('0063_claim_loop_types.sql', MIGRATIONS), 'utf8'));
+    expect(await migrate(p, { dir })).toEqual(['0063_claim_loop_types.sql']);
+    expect((await p.query(`SELECT id, type FROM decisions`)).rows).toEqual([{ id: 'dec:1', type: 'resolve_conflict' }]);
+    await p.query(`INSERT INTO decisions (id, type, project_key, status, tier, mode, score, confidence, band, rationale, policy_version, created_at)
+                   VALUES ('dec:2', 'close_question', null, 'proposed', 'P', 'propose', 0.7, '{}', 3, 'r', 1, now())`);
+    await p.query(`INSERT INTO decision_targets (decision_id, idx, kind, target_id, role) VALUES ('dec:2', 0, 'question', 'question:1', 'primary')`);
+    await p.query(`INSERT INTO loop_calibration (type, band, policy_version, alpha, beta, n, updated_at) VALUES ('accept_claim', 4, 1, 1, 1, 0, now())`);
+    // The owner's own types are still never calibrated.
+    await expect(p.query(`INSERT INTO loop_calibration (type, band, policy_version, alpha, beta, n, updated_at) VALUES ('resolve_conflict', 4, 1, 1, 1, 0, now())`)).rejects.toThrow(/loop_calibration_type_check/);
     expect(await migrate(p, { dir })).toEqual([]);
   });
 

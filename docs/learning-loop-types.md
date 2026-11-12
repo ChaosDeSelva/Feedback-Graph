@@ -11,7 +11,7 @@ A type only **finds calls**. Each round the engine (`loop/engine.ts`) hands it a
 | Field | What it is |
 |---|---|
 | `now` | The round's clock in ms. Use it instead of `Date.now()`. |
-| `store` | The store, read only: `knowledge`, `facts`, `graph`, `codegraph`, `insights`, `decisions`, `activity`. |
+| `store` | The store, read only: `knowledge`, `facts`, `graph`, `codegraph`, `insights`, `decisions`, `activity`, `intake`, `links`, `docs`. |
 | `entries` | The Activity entries new since the last round, oldest first. Sandbox, run-labelled and demo entries, and entries of projects out of scope, are already gone. Use them to work incrementally: `link_misses` looks only at the misses `postmortem_done` entries name. |
 | `mode` | This type's mode this round (`observe`, `propose` or `auto`). Outside `observe` the engine also asks `recheck` (below) about the calls the type only observed. |
 | `lessons()` | The lessons to judge on their record this round, of every status, read once and shared by the types: those the round's entries name or whose signals it folded, and the next page (`LOOP_SWEEP`, 500) of a slow sweep through every lesson by id, which reaches what changes without an entry (a lesson's age, a check added later). Their signals are read with them. `retire_lesson`, `reject_lesson` and `reword_lesson` read these instead of listing every lesson, so a round costs what changed, not the store's size. |
@@ -94,6 +94,57 @@ proposal. `observe` records `observed` decisions only; `propose` makes every cal
 round that a later round makes again under `propose` or `auto` moves on from it, recorded with the mode, score and
 confidence it is made with then: `mode` always says what the loop did (applied it, proposed it, only observed it).
 
+## The near-duplicate band (0.9.1)
+
+`merge_duplicates` works on two kinds of pair. A lesson the re-check flagged `duplicate-of` (cosine ≥ `DUPLICATE_FLAG`,
+0.92) is merged by the rules above. A pair of the round's live lessons of one project with a cosine from
+`NEAR_DUPLICATE_FROM` (0.85) up to 0.92 is the middle band: exact and structural rules first (the same title and rule,
+case, punctuation and spacing ignored, need no model); otherwise the loop's model (`LOOP_LLM`, metered by
+`LOOP_LLM_CALLS_PER_DAY`, at most 5 a round, `loop/nearDuplicate.ts`) answers yes, no or unsure to "do these two say the
+same thing?", fenced as data. Yes and unsure are a merge proposed for you (`proposeOnly`: never applied on its own),
+no is dropped (`judged_different`); each answer is remembered against both lessons' fingerprints, so an unchanged pair
+is never asked twice. The values are in `packages/core/src/thresholds.ts`.
+
+## Renamed files: `update_paths` (0.9.1)
+
+Tier H. After each code map build the worker keeps the renames git saw in the churn window (`git log -M`: old path to
+the name the file has now; core `loop/renames.ts`). A proposed or approved lesson whose paths or trigger paths name an
+old path gets the new name, exactly that path, only when the old name is gone from the code map and the new one is in
+it; globs and folders are left alone. Its handler (`decisions/types/update_paths.ts`) compares paths and triggers
+(`lessonPathsFingerprint`, since triggers are not part of the lesson fingerprint) just before writing, so an edit of
+yours since is never overwritten, and a rollback restores the old names. A lesson you touched in the last 14 days is
+proposed instead (the apply-time veto).
+
+## Knowledge intake's types (0.9.1)
+
+Six types work on what knowledge intake drew from calls and notes. They read claims, questions and conflicts from
+`store.intake` (newest first, a page a round; a run's or a sandbox's never), and every one is refused for a claim
+`claimNeverTarget` (`types/guards.ts`) names: made in a run, your own answer to a question, from notes an agent
+submitted (`origin: agent:<client>`), or flagged `quote-fuzzy` or `statement-adds`. The engine checks that again at
+apply time (`applyTimeVeto`). **Choosing which side of a conflict is true is never automatic**: the only type that
+touches a conflict is tier P, and `PUT /api/loop/settings` refuses `auto` for every tier P type.
+
+| Type | Tier | What it does | Floors | Handler and rollback |
+|---|---|---|---|---|
+| `link_claims` | H | Records `(:Claim)-[:CORROBORATES]->(:Claim)` from the newer of two claims from different sources that say the same thing to the older. Detection links the pairs it compares; this finds proposed ones it never compares (a claim waiting for review is compared only within its source). | Same project and type, the same statement once case, punctuation and spacing are ignored (`normalizeStatement`, at least 16 characters), not linked yet. | `link_claims`: the link compared just before it is added (`claimLinkSnapshot`); rollback removes it (`IntakeStore.removeLinks`). |
+| `merge_claims` | H | Folds a proposed claim into the claim it corroborates, so you review one: the duplicate becomes `superseded` and keeps its link. | Both live (proposed or accepted), same type and project; the duplicate proposed, never a fact, in no open conflict. The keeper is the accepted one, else the older. | The claims' snapshots in one intake transaction (the `resolve_conflict` handler with no conflict); rollback makes the duplicate proposed again. |
+| `accept_claim` | A, τ 0.92 | Accepts a proposed `fact` or `decision` claim and files its fact (origin `claim`, kind `decision` or `convention`, relevance 0.8, embedded from its statement), as the review route does. | No flag; not from an agent's notes; a speaker you confirmed; confidence ≥ 0.8; no open conflict; a project to file it under; your as-written accept rate on claims of its type ≥ 70% over ≥ 20 of your own `claim_decided` decisions (accepted with only the status changed, out of accepted or rejected; an operator's or the loop's are left out). Never an opinion, a plan or a commitment. | The fact first (a created target under a planned id, `addOwnerFact(..., { origin: 'claim' })`), then the claim accepted with its `factId`; rollback makes the claim proposed and closes the fact, and a redo reopens it. |
+| `propose_resolution` | P | Suggests how to settle an open conflict: a probable supersession as **B is true**; one whose sides no longer share a scope (a claim re-scoped, a lesson narrowed, a project link removed) as **not a conflict: different scope**. | Both sides still there (an accepted or proposed claim, a current fact, an approved or proposed lesson). | Built by `resolutionDecision`, so approving it is exactly your `resolve_conflict` (the loser superseded, never deleted), with the conflict recording this decision and you as who settled it; rollback reopens the conflict. |
+| `assign_question` | P | Suggests who should answer an open, unassigned question: the person who said the most accepted claims on its subject (a shared subject word, `subjectTokens`). | At least 2 such claims and strictly more than anyone else; a person you confirmed. | `updateQuestion` (status `assigned`, the assignee), compared just before; rollback reopens it unassigned. |
+| `close_question` | P | Proposes an open or assigned question answered by a later accepted claim, which it cites. | A claim (not an opinion) accepted after the question was asked, sharing at least 2 of the question's subject words and half of them. | `updateQuestion` (status `answered`, `answerClaimId`), compared just before; rollback reopens it. |
+
+Questions are decision targets (kind `question`, `questionSnapshot`: status, assignee, the claim answering it). The
+replay (`loop/eval/score.ts`) leaves these types unlabelled for now: your actions on claims are not replayed as labels.
+
+## Triage earned, and what needs you (0.9.1)
+
+A type's `minLabels` can be raised above its tier's: `triage_inbox` is tier A since 0.9.1, with τ 0.9 and 30 labels
+(`LOOP_TYPE_INFO`). Its labels from when it was tier P stay: calibration is keyed by type, band and policy version, and
+neither its prior nor the policy version changed. Its own floors keep some calls proposals (`triageProposeOnly`): a
+confirm of an agent's report or of an item from your own sessions, and any call on words that read as a risky command
+or instructions to an agent. Every proposed decision carries `needsYou` on the wire (`needsYouReason`, core
+`loop/state.ts`): the reason the loop gave for proposing it, else its tier, the reviews it lacks or its bar.
+
 ## Decisions only you make: `resolve_conflict`, `remove_source`
 
 Two decision types are the owner's, never the loop's (`OWNER_DECISION_TYPES` in core `types.ts`, `author: 'owner'`).
@@ -104,6 +155,12 @@ proposed: no loop type returns them, and they have no file in `worker/src/loop/t
 |---|---|---|
 | `resolve_conflict` | Your choice on a knowledge-intake conflict (A is true, B is true, both partly, not a conflict). The API builds the decision with the conflict, the losing side (both, for both partly) and any reconciled fact as targets, and applies it at once (`apply(id, { by: 'you' })`). The loser is superseded, never deleted: a claim marked superseded and the fact it became closed, a fact closed, a lesson superseded, with a `SUPERSEDED_BY` link to the winner. | Reopens the conflict and restores the loser exactly, removing the links; rolling back a loop decision it built on (a reworded lesson) undoes it first. |
 | `remove_source` | Deleting an intake source with `keep=none`: the facts its accepted claims became are closed. | Re-opens those facts. |
+
+A lesson you mark as superseding another (`PATCH /api/lessons/:id` with `supersedes`) is a `merge_duplicates` decision
+with `author: 'owner'`: the API builds it (the edited lesson the keeper, the other the merged duplicate, set
+superseded with your note) and applies it at once through the executor, as a loop merge is applied. It is on the
+Decisions page, rolls back the same way (both lessons restored, the SUPERSEDES edge removed), and, as an owner's
+decision, is never calibrated, budgeted or counted as the loop's.
 
 Both are tier P in `LOOP_TYPE_INFO`, so they never apply on their own under any mode, and they are left out of
 `LOOP_DECISION_TYPES`: never in `LOOP_TYPES`, the loop's settings, its engine, its budgets or its metrics. The
@@ -131,6 +188,12 @@ the type's write it owns what is the same for every type:
   The executor writes no Activity and no calibration: the caller records the rollback in Activity, and the loop's next
   fold of that entry (`loop/calibrate.ts`) turns the owner's own rollback into a negative calibration label and its
   reason into a penalty (`loop-penalty:<type>`).
+- **never merge** (0.9.1): rolling back a merge (`merge_duplicates`, `merge_claims`, also when a cascade undoes it)
+  records its keeper and merged record as a pair you said are not the same (`DecisionsStore.markDistinct`, the decision
+  and your note with it); `POST /api/distinct-pairs {a, b, reason?}` records one directly. Unlike the suppression, which
+  lifts after 30 days or 1.5 times the evidence, it is permanent: `merge_duplicates` and `merge_claims` skip the pair
+  (`distinct`) whatever the evidence, and the near-duplicate judge never asks about it. Only you lift it
+  (`DELETE /api/distinct-pairs`), never the operator token.
 - **redo**: a `rolled_back` decision applied again, only while its targets are still `before`; its suppression is lifted.
 - **reconcile**: at worker start and before each loop round, a decision left `applying` whose lease was not renewed
   for two minutes (`RECONCILE_AFTER_MS`; an apply still running, in any process, renews it every 30 seconds however
@@ -187,5 +250,7 @@ Types with their own handler:
 | `reword_lesson` | the new words are the generic lesson write; a split also creates the lesson it splits off (role `created`, ABSENT before) with `addLoopLesson`, from the same miss and marked `splitFrom`. Rollback removes it first (`removeLoopLesson`, only a lesson the loop split off, only as `from` has it) and then restores the original; each step moves back what it wrote when the next fails |
 | `record_fact` | a fact the decision creates is added as the loop's (`addOwnerFact(..., { id, origin: 'loop' })`: no scan closes, replaces or re-checks it), then the generic write rejects the lesson; the fact is closed again when that fails. Rollback is the generic one (the fact closed, the lesson restored); a redo reopens the fact |
 | `resolve_conflict` | the fact and lesson targets through the generic write (a created reconciled fact under its planned id), then the claims and the conflict with the `SUPERSEDED_BY` links in one intake transaction (`IntakeStore.writeSnapshots`); the facts and lessons are moved back when that fails. Rollback is the reverse |
+
+`accept_claim` and `merge_claims` use `resolve_conflict`'s handler, `propose_resolution` wraps it (the conflict records the decision that settled it and who approved it), `link_claims` has its own (the CORROBORATES link, like `link_misses`), and `assign_question` and `close_question` share `question.ts`.
 
 `rank_weight`, `approve_lesson`, `narrow_scope` and `triage_inbox` have no handler of their own: `genericHandler`.

@@ -79,6 +79,31 @@ describe('syncExternalFeedback', () => {
     expect(s.fetchCalls.map((c) => c.repo)).toEqual(['me/notes']);
   });
 
+  test('a PR merged since its document was stored: the comment sync stores the document again with its state', async () => {
+    const merged = { ...pr(7, [{ id: '1', createdAt: '2026-10-22T10:00:00Z' }]), state: 'merged' as const };
+    const stored = new Map([
+      ['github:acme/shop#7', 'PR acme/shop#7 (open) by dev: PR 7\n\n'],
+      ['github:acme/shop#8', 'PR acme/shop#8 (merged) by dev: PR 8\n\n'],
+    ]);
+    const upserts: { ref: string; first: string }[] = [];
+    const run = async (prs: PrContext[]) => {
+      const s = setup({ prs: async () => prs });
+      s.deps.embed = async (t) => t.map(() => [1]);
+      s.deps.docs = {
+        listDocs: async (_k, o) => (stored.has(o!.ref!) ? [{ id: o!.ref!, ref: o!.ref! } as never] : []),
+        docText: async (id) => stored.get(id) ?? null,
+        upsertDoc: async (doc, chunks) => { upserts.push({ ref: doc.ref, first: chunks[0].text }); return doc.ref; },
+      };
+      await syncExternalFeedback(s.deps);
+    };
+    await run([merged]);
+    expect(upserts).toEqual([{ ref: 'github:acme/shop#7', first: expect.stringMatching(/^PR acme\/shop#7 \(merged\) by dev: PR 7/) }]);
+    // Already saying its state, or never stored as a document: left alone.
+    upserts.length = 0;
+    await run([{ ...pr(8, [{ id: '2', createdAt: '2026-10-22T10:00:00Z' }]), state: 'merged' }, { ...pr(9, [{ id: '3', createdAt: '2026-10-22T10:00:00Z' }]), state: 'merged' }]);
+    expect(upserts).toEqual([]);
+  });
+
   test('waits the interval between syncs, then passes the cursor', async () => {
     const s = setup();
     s.store.m.set(authorsCursor('shop'), '2026-10-21T00:00:00Z');

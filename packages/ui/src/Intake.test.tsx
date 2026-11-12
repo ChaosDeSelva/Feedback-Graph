@@ -1,6 +1,6 @@
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, expect, test, vi } from 'vitest';
-import { Intake, sourceState } from './Intake.tsx';
+import { Intake, SOURCE_POLL_MS, sourceState } from './Intake.tsx';
 import { OwnerWrites } from './ownerAccess.tsx';
 import type { IntakeSource } from './api.ts';
 
@@ -19,10 +19,12 @@ const source: IntakeSource & { read: NonNullable<IntakeSource['read']>; intake: 
 
 let writes: { url: string; method: string; body: unknown }[];
 let enabled: boolean;
+let peopleAnswers: (typeof people)[];
 beforeEach(() => {
   location.hash = '#intake/claims';
   writes = [];
   enabled = true;
+  peopleAnswers = [];
   vi.stubGlobal('fetch', vi.fn(async (url: string, init?: RequestInit) => {
     if (init?.method && init.method !== 'GET') {
       writes.push({ url, method: init.method, body: JSON.parse(init.body as string) });
@@ -31,7 +33,7 @@ beforeEach(() => {
     }
     if (url === '/api/status') return Response.json({ intake: { enabled } });
     if (url === '/api/projects') return Response.json([{ key: 'shop' }]);
-    if (url.startsWith('/api/people')) return Response.json(people);
+    if (url.startsWith('/api/people')) return Response.json(peopleAnswers.shift() ?? people);
     if (url.startsWith('/api/claims?')) return Response.json([claim('claim:1', { flags: ['statement-adds'], conflicts: [{ id: 'conflict:1', with: { kind: 'fact', id: 'fact:9' } }] }), claim('claim:2', { type: 'opinion' })]);
     const m = url.match(/^\/api\/claims\/([^?]+)$/);
     if (m) return Response.json({ claim: claim(decodeURIComponent(m[1]), decodeURIComponent(m[1]) === 'claim:1' ? { conflicts: [{ id: 'conflict:1', with: { kind: 'fact', id: 'fact:9' } }] } : { type: 'opinion' }), fingerprint: 'fp1', speaker: people[0], source: { kind: 'transcript', occurredAt: '2026-11-10', origin: 'Zoom' } });
@@ -56,6 +58,14 @@ test('claims list with speaker, flags and conflicts; the detail says whether age
   expect(await screen.findByText('quote claim:1')).toBeTruthy();
   expect(screen.getByText(/Agents see this: no, not until you accept it/)).toBeTruthy();
   expect(screen.getByRole('region', { name: 'conflicts' }).textContent).toMatch(/fact:9/);
+});
+
+test('a speaker made after the page loaded its people (a source read in the background) is named, not an unknown speaker', async () => {
+  peopleAnswers = [[]];
+  render(<Intake />);
+  expect(await screen.findByText('statement claim:2')).toBeTruthy();
+  await waitFor(() => expect(screen.getAllByText(/^Ana · retries$/).length).toBe(2));
+  expect(screen.queryByText(/unknown speaker/)).toBeNull();
 });
 
 test('a accepts the open claim as a fact with the fingerprint it showed; r rejects and offers undo', async () => {
@@ -99,26 +109,35 @@ test('the Sources tab shows reading progress and the text with quoted spans mark
   await waitFor(() => expect(location.hash).toBe('#intake/claims?source=doc%3Ashop%3Aintake%3Acall'));
 });
 
-test('Add a source posts the pasted text; a transcript is private unless unticked, and the list reloads', async () => {
+test('Add a source posts the pasted text; it is private unless unticked, whatever its kind, and the list reloads', async () => {
   location.hash = '#intake/sources';
   render(<Intake />);
   fireEvent.click(await screen.findByRole('button', { name: 'Add a source' }));
-  fireEvent.change(screen.getByLabelText('source title'), { target: { value: 'Planning call' } });
-  fireEvent.change(screen.getByLabelText('source date'), { target: { value: '2026-11-10' } });
-  fireEvent.change(screen.getByLabelText('participants'), { target: { value: 'Ana, Bo ' } });
-  fireEvent.change(screen.getByLabelText('text to read'), { target: { value: 'Ana: retries wait 30 seconds' } });
+  // A form, not a removal: no alert dialog, and Add is not the red button.
+  expect(screen.queryByRole('alertdialog')).toBeNull();
+  expect(screen.getByRole('button', { name: 'Add' }).className).not.toMatch(/bg-bad/);
+  // Every field is found by the label it shows.
+  fireEvent.change(screen.getByLabelText('Title'), { target: { value: 'Planning call' } });
+  fireEvent.change(screen.getByLabelText('When it was said'), { target: { value: '2026-11-10' } });
+  fireEvent.change(screen.getByLabelText('Who was there (comma-separated)'), { target: { value: 'Ana, Bo ' } });
+  fireEvent.change(screen.getByLabelText('Text'), { target: { value: 'Ana: retries wait 30 seconds' } });
+  expect(screen.getByLabelText('Or a file (.txt, .md, .vtt, .srt)')).toBeTruthy();
+  // Switching the kind leaves Private as it was.
+  fireEvent.change(screen.getByLabelText('Kind'), { target: { value: 'notes' } });
+  expect((screen.getByRole('checkbox', { name: /Private/ }) as HTMLInputElement).checked).toBe(true);
   const listed = vi.mocked(fetch).mock.calls.filter(([u]) => String(u).startsWith('/api/intake/sources?') || u === '/api/intake/sources').length;
   await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Add' })); });
   expect(writes.find((w) => w.url === '/api/intake')).toEqual({ url: '/api/intake', method: 'POST', body: {
-    projectKey: 'shop', kind: 'transcript', title: 'Planning call', text: 'Ana: retries wait 30 seconds', occurredAt: '2026-11-10', participants: ['Ana', 'Bo'], private: true,
+    projectKey: 'shop', kind: 'notes', title: 'Planning call', text: 'Ana: retries wait 30 seconds', occurredAt: '2026-11-10', participants: ['Ana', 'Bo'], private: true,
   } });
   await waitFor(() => expect(vi.mocked(fetch).mock.calls.filter(([u]) => String(u).startsWith('/api/intake/sources?') || u === '/api/intake/sources').length).toBeGreaterThan(listed));
-  expect(screen.queryByLabelText('text to read')).toBeNull();
+  expect(screen.queryByLabelText('Text')).toBeNull();
   // Who was there may be new people: their names are read again.
   expect(vi.mocked(fetch).mock.calls.filter(([u]) => String(u).startsWith('/api/people')).length).toBeGreaterThan(1);
 
   fireEvent.click(screen.getByRole('button', { name: 'Add a source' }));
-  fireEvent.change(screen.getByLabelText('source kind'), { target: { value: 'notes' } });
+  fireEvent.click(screen.getByRole('checkbox', { name: /Private/ }));
+  fireEvent.change(screen.getByLabelText('Kind'), { target: { value: 'transcript' } });
   expect((screen.getByRole('checkbox', { name: /Private/ }) as HTMLInputElement).checked).toBe(false);
 });
 
@@ -132,4 +151,25 @@ test('a source state comes from its background embedding, then its read queue an
   expect(sourceState({ ...source, read: read('done') }).state).toBe('done');
   expect(sourceState({ ...source, read: read('failed', 'gave up') })).toEqual({ state: 'failed', error: 'gave up' });
   expect(sourceState({ ...source, read: null, intake: null }).state).toBe('queued');
+});
+
+test('People opens on the proposed people a source made, not on an empty confirmed tab', async () => {
+  location.hash = '#intake/people';
+  peopleAnswers = [[{ ...people[0], id: 'person:tp', displayName: 'Test Person A', status: 'proposed' }, people[0]]];
+  render(<Intake />);
+  expect((await screen.findAllByText('Test Person A')).length).toBeGreaterThan(0);
+  expect(screen.getByRole('button', { name: 'proposed', pressed: true })).toBeTruthy();
+});
+
+test('while a source is being read, the list and its claims count are read again until it is done', async () => {
+  vi.useFakeTimers({ shouldAdvanceTime: true });
+  try {
+    location.hash = '#intake/sources';
+    const sourceCalls = () => vi.mocked(fetch).mock.calls.filter(([u]) => String(u).startsWith('/api/intake/sources/')).length;
+    render(<Intake />);
+    expect((await screen.findAllByText('reading window 3/8')).length).toBeGreaterThan(0);
+    const before = sourceCalls();
+    await act(async () => { await vi.advanceTimersByTimeAsync(SOURCE_POLL_MS + 100); });
+    await waitFor(() => expect(sourceCalls()).toBeGreaterThan(before));
+  } finally { vi.useRealTimers(); }
 });

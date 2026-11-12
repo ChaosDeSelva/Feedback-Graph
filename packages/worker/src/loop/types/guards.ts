@@ -1,4 +1,4 @@
-import { DEMO_SOURCE, type DecisionTarget, type Lesson, type LessonSignals, type LoopMiss, type StoredFact } from '@fb/core';
+import { DEMO_SOURCE, type Claim, type DecisionTarget, type IntakeMeta, type Lesson, type LessonSignals, type LoopMiss, type StoredFact } from '@fb/core';
 import type { LoopReads } from '../plugin.ts';
 
 /** The owner touched it within this many days: the loop proposes at most. */
@@ -31,6 +31,23 @@ export function missNeverTarget(m: LoopMiss): string | null {
   return null;
 }
 
+/** A source an agent submitted (submit_notes): its claims are never the loop's to accept (0.9.0 §9). */
+export const agentSubmitted = (m: Pick<IntakeMeta, 'origin'> | null | undefined) => !!m?.origin?.startsWith('agent:');
+
+/**
+ * Why the loop must never change this claim, or null: a run's or a sandbox's, one from a source an agent submitted,
+ * the owner's own answer to a question, or one whose quote matched loosely or whose statement adds to its quote (the
+ * owner reads those first). `meta`: its source's details (null when it has none).
+ */
+export function claimNeverTarget(c: Pick<Claim, 'run' | 'sandbox' | 'docId' | 'flags'>, meta: Pick<IntakeMeta, 'origin'> | null): string | null {
+  if (c.sandbox || c.run) return 'made in a run';
+  if (c.docId.startsWith('answer:')) return 'your answer to a question';
+  if (agentSubmitted(meta)) return 'from notes an agent submitted';
+  if (c.flags.includes('quote-fuzzy')) return 'its quote matched the source only loosely';
+  if (c.flags.includes('statement-adds')) return 'its statement adds to what was said';
+  return null;
+}
+
 /** The owner decided or edited the lesson within OWNER_TOUCH_DAYS of `now`. */
 export const ownerTouchedRecently = (s: LessonSignals | null, now: number) =>
   !!s?.lastOwnerTouch && now - Date.parse(s.lastOwnerTouch) < OWNER_TOUCH_DAYS * 86_400_000;
@@ -55,7 +72,7 @@ const ownerDecidedRecently = (l: Lesson, now: number) =>
  * it found the call; the owner may have acted since): why the call may only be proposed, or null. A target that does
  * not exist (yet: one the decision creates) has nothing to check.
  */
-export async function applyTimeVeto(store: Pick<LoopReads, 'knowledge' | 'facts' | 'decisions'>, targets: readonly DecisionTarget[], now: number): Promise<string | null> {
+export async function applyTimeVeto(store: Pick<LoopReads, 'knowledge' | 'facts' | 'decisions' | 'intake'>, targets: readonly DecisionTarget[], now: number): Promise<string | null> {
   for (const t of targets) {
     if (t.kind === 'lesson') {
       const l = (await store.knowledge.lessonDetail(t.id))?.lesson;
@@ -69,6 +86,12 @@ export async function applyTimeVeto(store: Pick<LoopReads, 'knowledge' | 'facts'
       if (never) return `${t.id}: ${never}`;
     } else if (t.kind === 'miss' && DEMO_MISS.test(t.id)) {
       return `${t.id}: demo`;
+    } else if (t.kind === 'claim') {
+      const c = await store.intake.claim(t.id);
+      if (!c) continue;
+      const [meta] = c.docId.startsWith('answer:') ? [] : await store.intake.metas([c.docId]);
+      const never = claimNeverTarget(c, meta ?? null);
+      if (never) return `${t.id}: ${never}`;
     }
   }
   return null;

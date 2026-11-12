@@ -22,7 +22,7 @@ const MAX_QUESTION = 4000;
 const TITLE_MAX = 60;
 
 const PROVIDER_LABEL: Record<ChatProvider, string> = { claude: 'Claude', codex: 'Codex', local: 'Local model' };
-const SOURCE_TONE: Record<ChatSource['kind'], Tone> = { lesson: 'ok', miss: 'bad', fact: 'accent', code: 'info', doc: 'neutral', session: 'neutral', linked: 'neutral' };
+const SOURCE_TONE: Record<ChatSource['kind'], Tone> = { lesson: 'ok', miss: 'bad', fact: 'accent', code: 'info', doc: 'neutral', session: 'neutral', linked: 'neutral', claim: 'accent', question: 'neutral', conflict: 'violet' };
 
 const isPending = (t: ChatTurn) => t.status === 'pending' || t.status === 'answering';
 const threadPending = (t: ChatThread | null) => !!t && (t.pending || t.turns.some(isPending));
@@ -66,12 +66,21 @@ export function Chat() {
   threadRef.current = thread;
   // A `#ask/new` link starts its conversation once, even when StrictMode runs the effect twice.
   const linkDone = useRef(false);
-  // While a new chat is being written or created, a list refresh must not open another conversation instead.
-  const holdOpen = useRef(!!hashNewChat());
+  // While a new chat is being written or created, a list refresh must not open another conversation instead. The page
+  // opens on a new chat unless a link names a conversation: an old one open with the composer ready would take the
+  // next question as a follow-up to it.
+  const holdOpen = useRef(!linkedConversation());
 
   useEffect(() => {
     api.projects().then((ps) => setProjects([...ps].sort((a, b) => Number(!!b.pinned) - Number(!!a.pinned))), (e) => { setError(errorMessage(e)); setProjects([]); });
   }, []);
+  // With its projects known, a page not opened on a conversation starts a new chat (a #ask/new link starts its own).
+  const startedNew = useRef(false);
+  useEffect(() => {
+    if (startedNew.current || !projects?.length || linkedConversation() || hashNewChat()) return;
+    startedNew.current = true;
+    setDraft((d) => d ?? { project: project || projects[0].key, provider: '' });
+  }, [projects]);
 
   useEffect(() => {
     let stale = false;
@@ -245,6 +254,29 @@ export function Chat() {
     }
   }
 
+  // Several conversations deleted at once (test chats, say): ticked in the list, one confirm for all.
+  const [picked, setPicked] = useState<Set<string>>(new Set());
+  const togglePick = (id: string) => setPicked((p) => { const n = new Set(p); if (n.has(id)) n.delete(id); else n.add(id); return n; });
+  async function removePicked() {
+    const ids = [...picked];
+    const ok = await askConfirm({
+      title: `Delete ${plural(ids.length, 'conversation')}?`,
+      message: 'Their questions, answers and prompts are deleted. This cannot be undone.',
+      items: ids.map((id) => convs?.find((c) => c.id === id)?.title || 'New chat'),
+      confirmLabel: `Delete ${plural(ids.length, 'conversation')}`,
+    });
+    if (!ok) return;
+    await runAction('delete', async () => {
+      const failed: string[] = [];
+      for (const id of ids) await api.deleteChat(id).catch((e) => { failed.push(`${id}: ${errorMessage(e)}`); });
+      const gone = new Set(ids.filter((id) => !failed.some((f) => f.startsWith(`${id}:`))));
+      setConvs((cs) => cs?.filter((c) => !gone.has(c.id)) ?? cs);
+      setPicked(new Set(ids.filter((id) => !gone.has(id))));
+      if (selected && gone.has(selected)) { setSelected(null); setThread(null); setOpen(false); setAddress('#ask'); }
+      setError(failed.length ? `${plural(failed.length, 'conversation')} could not be deleted (still ticked): ${failed.slice(0, 3).join('; ')}` : null);
+    });
+  }
+
   async function remove() {
     const { id, title } = thread!;
     const ok = await askConfirm({
@@ -302,6 +334,12 @@ export function Chat() {
         detailOpen={open && (!!selected || !!draft)}
         onBack={() => setOpen(false)}
         notice={error && <Alert>{error}</Alert>}
+        listHeader={convs?.length ? (
+          <>
+            <span className="text-xs text-muted tabular-nums">{picked.size ? `${picked.size} ticked` : 'Tick conversations to delete several'}</span>
+            <Button size="sm" variant="danger-outline" owner className="ml-auto" disabled={!picked.size} busy={acting === 'delete'} onClick={() => void removePicked()}>Delete ticked</Button>
+          </>
+        ) : undefined}
         list={
           convs === null ? <SkeletonList /> : noProjects ? (
             <EmptyState compact icon={<AskIcon />} title="No projects selected" action={<a href="#settings" className={buttonClass('secondary', 'sm')}>Open Settings</a>}>
@@ -314,7 +352,8 @@ export function Chat() {
           ) : (
             <ul>
               {convs.map((c) => (
-                <li key={c.id}>
+                <li key={c.id} className="relative">
+                  <input type="checkbox" aria-label={`tick ${c.title || 'New chat'}`} checked={picked.has(c.id)} onChange={() => togglePick(c.id)} className="absolute top-3 right-3 z-10" />
                   <ListRow selected={c.id === selected} onClick={() => select(c.id)}>
                     <div className="truncate text-[13px] font-medium">{c.title || 'New chat'}</div>
                     <div className="flex items-center gap-1.5 truncate text-xs text-muted">

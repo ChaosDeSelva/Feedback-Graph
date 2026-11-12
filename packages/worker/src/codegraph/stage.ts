@@ -149,6 +149,11 @@ export type MapStageDeps = {
    * After a map is written: the map before it (null for the first) and the new one, so what lessons name can be checked
    * against what changed (postmortem/codeChanged.ts). A failure is logged, never the build's.
    */
+  /**
+   * After a map is written: the renames git saw in the churn window (old path to the name it has now), kept for the
+   * learning loop's update_paths. A failure is logged, never the build's.
+   */
+  saveRenames?: (projectKey: string, renames: Record<string, string>) => Promise<void>;
   onMapped?: (p: { key: string; repoPath: string }, before: Pick<StoredCodeMap, 'symbols'> | null, after: Pick<CodeMap, 'files' | 'symbols'> & { outside?: CodeMap['outside'] }) => Promise<void>;
 };
 
@@ -328,6 +333,7 @@ export class MapStage {
         d.log?.('code map skipped', { project: p.key, reason: stats ? 'the worker is shutting down' : 'no longer selected' });
         return null;
       }
+      if (d.saveRenames && commits.renames) await d.saveRenames(p.key, commits.renames).catch((err) => d.log?.('renames not kept', { project: p.key, error: String(err) }));
       const durationMs = Date.now() - t0;
       const candidates = map.candidates ?? null;
       const capped = candidates !== null && candidates > stats.files;

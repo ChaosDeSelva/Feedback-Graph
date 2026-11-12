@@ -36,7 +36,12 @@ const triggersOf = (t: TriggerText): LessonTriggers => ({ paths: lines(t.paths),
 /** Whether the boxes say what the lesson has (blank lines and spaces aside). */
 const sameTriggers = (t: TriggerText, l: Lesson) => TRIGGER_KINDS.every((k) => triggersOf(t)[k].join('\n') === (l.triggers?.[k] ?? []).join('\n'));
 
-type Draft = Pick<Lesson, 'title' | 'rule' | 'appliesWhen' | 'scope'> & { triggers: TriggerText };
+type Draft = Pick<Lesson, 'title' | 'rule' | 'appliesWhen' | 'scope'> & { triggers: TriggerText; paths: string };
+const draftOf = (l: Lesson): Draft => ({ title: l.title, rule: l.rule, appliesWhen: l.appliesWhen, scope: l.scope, triggers: triggerText(l.triggers), paths: l.paths.join('\n') });
+/** Whether the paths box says what the lesson has (blank lines and spaces aside). */
+const samePaths = (d: Draft, l: Lesson) => lines(d.paths).join('\n') === l.paths.join('\n');
+/** The flags about a lesson's paths: paths the server checked against the code map settle them. */
+const PATH_FLAGS: readonly string[] = ['needs-path', 'bad-path', 'non-repo-path', 'path-missing', 'ambiguous-path'];
 
 const EMPTY: Record<LessonStatus, { title: string; children: string }> = {
   proposed: { title: 'No lessons to review', children: 'Each feedback item you confirm in the Inbox gets a post-mortem, and its proposed lesson waits here.' },
@@ -349,14 +354,14 @@ export function Lessons() {
     api.lesson(current.id).then((d) => {
       if (stale) return;
       setDetail(d);
-      setDraft({ title: d.lesson.title, rule: d.lesson.rule, appliesWhen: d.lesson.appliesWhen, scope: d.lesson.scope, triggers: triggerText(d.lesson.triggers) });
+      setDraft(draftOf(d.lesson));
     }, (e) => { if (!stale) setError(errorMessage(e)); });
     return () => { stale = true; };
   }, [current?.id]);
 
   // Edits live only here until Approve (or Save, on an approved lesson): moving to another lesson, tab or page asks before dropping them.
   const edited = !!detail && !!draft && detail.lesson.id === current?.id &&
-    ((['title', 'rule', 'appliesWhen', 'scope'] as const).some((k) => draft[k] !== detail.lesson[k]) || !sameTriggers(draft.triggers, detail.lesson));
+    ((['title', 'rule', 'appliesWhen', 'scope'] as const).some((k) => draft[k] !== detail.lesson[k]) || !sameTriggers(draft.triggers, detail.lesson) || !samePaths(draft, detail.lesson));
   useUnsavedChanges(edited, 'Your edits to this lesson are not saved.');
   const narrowing = !!detail && !!draft && detail.lesson.scope === 'global' && draft.scope !== 'global';
   useEffect(() => {
@@ -371,6 +376,7 @@ export function Lessons() {
       if (draft![k] !== detail!.lesson[k]) (patch as Record<string, unknown>)[k] = draft![k];
     }
     if (!sameTriggers(draft!.triggers, detail!.lesson)) patch.triggers = triggersOf(draft!.triggers);
+    if (!samePaths(draft!, detail!.lesson)) patch.paths = lines(draft!.paths);
     if (narrowing) {
       if (!narrowTo) {
         setError('Choose the project this lesson will serve: as a global lesson it has none to go back to.');
@@ -382,7 +388,9 @@ export function Lessons() {
   }
   const [revoking, setRevoking] = useState(false);
   const [converting, setConverting] = useState(false);
-  useEffect(() => { setRevoking(false); setConverting(false); }, [current?.id]);
+  // Why you decide: kept as the lesson's decision note with Approve, Reject, Save, Revoke or Back to proposed.
+  const [note, setNote] = useState('');
+  useEffect(() => { setRevoking(false); setConverting(false); setNote(''); }, [current?.id]);
 
   /** The lesson became a fact (and was rejected): it leaves this tab like any decision. */
   function converted() {
@@ -401,9 +409,11 @@ export function Lessons() {
     if (!patch) return;
     setSaving(true);
     try {
-      await api.updateLesson(lesson.id, patch);
-      setDetail({ ...detail!, lesson: { ...lesson, ...patch } });
-      setItems((xs) => xs.map((x) => (x.id === lesson.id ? { ...x, ...patch } : x)));
+      await api.updateLesson(lesson.id, { ...patch, ...(note.trim() && { note: note.trim() }) });
+      const saved = { ...lesson, ...patch, ...(patch.paths?.length && { checks: lesson.checks?.filter((c) => !PATH_FLAGS.includes(c.name)) ?? null }) };
+      setDetail({ ...detail!, lesson: saved });
+      setItems((xs) => xs.map((x) => (x.id === lesson.id ? saved : x)));
+      setNote('');
     } catch (e) {
       setError(errorMessage(e));
     } finally {
@@ -420,7 +430,7 @@ export function Lessons() {
         setSelected((i) => Math.min(i, items.length - 2));
       } else {
         setDetail(d);
-        setDraft({ title: d.lesson.title, rule: d.lesson.rule, appliesWhen: d.lesson.appliesWhen, scope: d.lesson.scope, triggers: triggerText(d.lesson.triggers) });
+        setDraft(draftOf(d.lesson));
       }
     }, (e) => setError(errorMessage(e)));
   }
@@ -467,7 +477,7 @@ export function Lessons() {
   async function decide(next: 'approved' | 'rejected' | 'revoked' | 'proposed') {
     const { id } = detail!.lesson;
     const fromBar = !!bar.current?.contains(document.activeElement);
-    let patch: LessonEdit = { status: next };
+    let patch: LessonEdit = { status: next, ...(note.trim() && { note: note.trim() }) };
     if (next === 'approved') {
       const changed = edits();
       if (!changed) return;
@@ -713,12 +723,11 @@ export function Lessons() {
                     )}
                     <span className="text-xs text-muted">{narrowing ? 'a global lesson has no project of its own: choose the one it serves' : 'prefer the narrowest scope the evidence supports'}</span>
                   </div>
-                  <div className="grid gap-1">
-                    <span className="text-xs font-medium text-muted">Paths (agents get it when they edit these)</span>
-                    {detail.lesson.paths.length
-                      ? <ul className="flex flex-wrap gap-1">{detail.lesson.paths.map((p) => <li key={p}><code className="rounded-sm bg-sunken px-1.5 py-0.5 font-mono text-[11.5px] [overflow-wrap:anywhere]">{p}</code></li>)}</ul>
-                      : <span className="text-xs text-muted">No paths: applies anywhere in its project{detail.lesson.scope === 'global' ? ' (or any project, as a global lesson)' : ''}.</span>}
-                  </div>
+                  <label className="grid gap-1">
+                    <span className="text-xs font-medium text-muted">Paths (agents get it when they edit these; one per line, a file or folder in the code map)</span>
+                    <Textarea {...locked} value={draft.paths} onChange={(e) => setDraft({ ...draft, paths: e.target.value })} rows={2} placeholder="src/billing/retry.ts" className="w-full font-mono text-xs" />
+                    {!lines(draft.paths).length && <span className="text-xs text-muted">No paths: applies anywhere in its project{draft.scope === 'global' ? ' (or any project, as a global lesson)' : ''}.</span>}
+                  </label>
                   <div className="grid gap-1.5">
                     <span className="text-xs font-medium text-muted">Triggers (agents also get it when a task or change matches one; one per line)</span>
                     <div className="grid gap-2 sm:grid-cols-3">
@@ -747,6 +756,10 @@ export function Lessons() {
           {detail && draft && status !== 'superseded' && (
             <div ref={bar} className="sticky bottom-0 border-t border-line bg-surface/95 backdrop-blur">
               <div className="mx-auto flex w-full max-w-3xl flex-wrap items-center gap-2 px-4 py-2.5 md:px-6">
+                <label className="flex w-full items-center gap-2 text-xs text-muted">
+                  <span className="shrink-0">Note</span>
+                  <Input {...locked} size="sm" value={note} onChange={(e) => setNote(e.target.value)} maxLength={4000} placeholder="optional: why, kept with your decision" className="w-full" />
+                </label>
                 {status === 'proposed' && (
                   <>
                     <Button variant="primary" owner busy={!!deciding} onClick={() => decide('approved')}>{deciding === 'approved' ? 'Approving…' : 'Approve'}</Button>

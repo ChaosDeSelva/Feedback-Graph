@@ -91,6 +91,8 @@ beforeEach(() => {
 });
 afterEach(() => { cleanup(); vi.unstubAllGlobals(); vi.useRealTimers(); location.hash = ''; });
 
+/** The conversation rows of the list (its other buttons, Delete ticked, left out). */
+const rows = () => within(screen.getByRole('complementary', { name: 'conversations' })).getAllByRole('button').filter((b) => b.textContent !== 'Delete ticked');
 const gets = (id: string) => calls.filter((c) => c.method === 'GET' && c.url === `/api/chats/${id}`).length;
 
 test('opens the linked conversation: the answer, its examples linked to their module panels, sources folded away', async () => {
@@ -290,7 +292,7 @@ test('the conversation list re-sorts when a chat gets a new message: the one you
   location.hash = '#ask/c3';
   render(<Chat />);
   await screen.findByText('older question', { selector: 'p, div' });
-  const titles = () => within(screen.getByRole('complementary', { name: 'conversations' })).getAllByRole('button').map((b) => b.querySelector('div')?.textContent);
+  const titles = () => rows().map((b) => b.querySelector('div')?.textContent);
   expect(titles()).toEqual(['Newest chat', 'Older chat']);
   fireEvent.change(screen.getByRole('textbox', { name: 'question' }), { target: { value: 'and the footer?' } });
   fireEvent.click(screen.getByRole('button', { name: 'Send' }));
@@ -310,7 +312,7 @@ test('a conversation answering in the background is checked again until it is do
   await act(async () => { await vi.advanceTimersByTimeAsync(5100); });
   expect(lists()).toBeGreaterThan(before);
   const list = screen.getByRole('complementary', { name: 'conversations' });
-  await waitFor(() => expect(within(list).getAllByRole('button')[0].textContent).toMatch(/Older chat/));
+  await waitFor(() => expect(rows()[0].textContent).toMatch(/Older chat/));
   expect(within(list).queryByText('answering')).toBeNull();
   // Nothing pending any more: the list is not asked for again.
   const after = lists();
@@ -473,12 +475,40 @@ test('conversations last written at the same moment keep a stable order, and an 
   expect(await screen.findByRole('alertdialog', { name: 'Delete the conversation "New chat"?' })).toBeTruthy();
 });
 
-test('with no conversations yet nothing is opened', async () => {
+test('with no conversations yet a new chat is open, and nothing else is fetched', async () => {
   convs = [];
   render(<Chat />);
   expect(await screen.findByText('No conversations yet')).toBeTruthy();
-  expect(screen.getByText('Pick one on the left, or start a New chat.')).toBeTruthy();
+  expect(await screen.findByRole('form', { name: 'new chat' })).toBeTruthy();
   expect(calls.some((c) => c.url.startsWith('/api/chats/'))).toBe(false);
+});
+
+test('Ask opens on a new chat with its model line, not on the newest old conversation', async () => {
+  convs = [conv('c1', { title: 'Two weeks old', updatedAt: '2026-10-10T12:00:00Z' })];
+  render(<Chat />);
+  const form = await screen.findByRole('form', { name: 'new chat' });
+  expect(within(form).getByLabelText('chat provider')).toBeTruthy();
+  expect(within(form).getByText(/runs on your own Claude or Codex subscription/)).toBeTruthy();
+  expect(gets('c1')).toBe(0);
+  fireEvent.change(screen.getByRole('textbox', { name: 'question' }), { target: { value: 'a new topic' } });
+  fireEvent.click(screen.getByRole('button', { name: 'Send' }));
+  await waitFor(() => expect(calls.filter((c) => c.method === 'POST' && c.url === '/api/chats')).toHaveLength(1));
+  expect(calls.some((c) => c.url === '/api/chats/c1/messages')).toBe(false);
+});
+
+test('ticked conversations are deleted together after one confirm', async () => {
+  convs = [conv('c1', { title: 'stress-1' }), conv('c3', { title: 'probe-2' }), conv('c4', { title: 'keep me' })];
+  render(<Chat />);
+  await screen.findByText('keep me');
+  fireEvent.click(screen.getByRole('checkbox', { name: 'tick stress-1' }));
+  fireEvent.click(screen.getByRole('checkbox', { name: 'tick probe-2' }));
+  fireEvent.click(screen.getByRole('button', { name: 'Delete ticked' }));
+  const dialog = await screen.findByRole('alertdialog');
+  expect(within(dialog).getByText('stress-1')).toBeTruthy();
+  fireEvent.click(within(dialog).getByRole('button', { name: 'Delete 2 conversations' }));
+  await waitFor(() => expect(calls.filter((c) => c.method === 'DELETE').map((c) => c.url).sort()).toEqual(['/api/chats/c1', '/api/chats/c3']));
+  await waitFor(() => expect(screen.queryByText('stress-1')).toBeNull());
+  expect(screen.getByText('keep me')).toBeTruthy();
 });
 
 test('a list that answers after the filter changed is dropped for the newer one', async () => {

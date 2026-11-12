@@ -4,6 +4,7 @@ import {
 } from '@fb/core';
 import { resolveIn, UNKNOWN_PROJECT, type ContextDeps, type ProjectRef } from './context.ts';
 import { DISPUTED_HEAD, disputedItems, disputesOf, openConflicts } from './disputes.ts';
+import { knowledgeMarkdown, lookUp } from './knowledge.ts';
 
 /**
  * The agent tools of knowledge intake (0.9.0 §8): find_contradictions checks a statement against what agents are told
@@ -62,6 +63,28 @@ export async function findContradictions(q: ProjectRef & { statement?: string; t
   if (!open.length && !differ.length && !close.length && !same.length) lines.push('', 'Nothing agents are told on this scope is close enough to compare. That is not a confirmation: it only means nothing recorded disagrees.');
   else if (differ.length || open.length) lines.push('', 'Do not state your statement as settled where something above disagrees: say what each says, or ask the developer.');
   return { markdown: lines.join('\n') };
+}
+
+/**
+ * what_do_we_know: the look-up (knowledge.ts) on the project, accepted knowledge only: claims the developer accepted
+ * (never an opinion), the facts and approved lessons agents are told, and the open conflicts on them with both sides.
+ * No quote, no unreviewed claim, no open question: what people said reaches an agent only once the developer accepted it.
+ */
+export async function whatDoWeKnow(q: ProjectRef & { topic: string }, d: ContextDeps): Promise<{ markdown: string }> {
+  if (!d.intake?.knowledge) return { markdown: OFF };
+  const project = await resolveIn(q, d);
+  if (!project) return { markdown: UNKNOWN_PROJECT(q) };
+  const topic = q.topic.trim();
+  if (!topic) return { markdown: 'Send a topic: what you want to know about.' };
+  const answer = await lookUp({ q: topic, projectKeys: [project.key], owner: false }, d.intake.knowledge);
+  await d.activity?.record({
+    kind: 'context_served', actor: q.client ?? 'agent (MCP)', projectKey: project.key,
+    subject: `what do we know about "${one(redactSecrets(topic))}": ${answer.items.length} item${answer.items.length === 1 ? '' : 's'}, ${answer.conflicts.length} open conflict${answer.conflicts.length === 1 ? '' : 's'}`,
+    why: 'an agent called what_do_we_know',
+    details: { tool: 'what_do_we_know', query: redactSecrets(topic), items: answer.items.map((i) => i.id), conflicts: answer.conflicts.map((k) => k.id) },
+    targets: answer.items.filter((i) => i.kind === 'lesson').map((i) => i.id),
+  });
+  return { markdown: knowledgeMarkdown(answer, { agent: true }) };
 }
 
 export async function submitNotes(q: ProjectRef & { notes: string; title?: string; occurredAt?: string | null }, d: ContextDeps): Promise<{ markdown: string; isError?: boolean }> {

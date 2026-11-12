@@ -48,6 +48,7 @@ function fakeIntake(o: { claims?: Claim[]; questions?: Question[]; people?: Pers
       claims.set(id, next);
       return next;
     },
+    async deleteClaims(ids) { let n = 0; for (const id of ids) if (claims.delete(id)) n++; return n; },
     async metas(ids) { return ids.includes(meta.docId) ? [meta] : []; },
     async conflictsFor(ids) { return conflicts.filter((k) => k.status === 'open' && (ids.includes(k.a.id) || ids.includes(k.b.id))); },
     async people() { return [...people.values()].sort((a, b) => Number(b.isOwner) - Number(a.isOwner) || a.displayName.localeCompare(b.displayName)); },
@@ -290,6 +291,23 @@ describe('PATCH /api/claims/:id', () => {
     expect(res.status).toBe(409);
     expect((await res.json()).error).toMatch(/is not run probe's/);
     expect(claims.get('claim:1')!.status).toBe('proposed');
+  });
+});
+
+describe('DELETE /api/claims/:id', () => {
+  test('removes one leftover claim, owner only, audited without its text; an accepted or superseded one is refused', async () => {
+    const t = setup({ claims: [claim('claim:left', { status: 'rejected', statement: 'Retries wait 30 seconds' }), claim('claim:live', { status: 'accepted' }), claim('claim:lost', { status: 'superseded' })] });
+    const del = (id: string, headers: Record<string, string> = owner) => t.app.request(`/api/claims/${encodeURIComponent(id)}`, { method: 'DELETE', headers: { 'content-type': 'application/json', ...headers } });
+    expect((await del('claim:left', agent)).status).toBe(403);
+    expect(t.claims.has('claim:left')).toBe(true);
+    expect((await del('claim:left')).status).toBe(204);
+    expect(t.claims.has('claim:left')).toBe(false);
+    expect(t.recorded.at(-1)).toMatchObject({ kind: 'claim_decided', actor: 'you', subject: 'deleted a rejected fact claim', details: { status: 'deleted', was: 'rejected' }, targets: ['claim:left'] });
+    expect(JSON.stringify(t.recorded)).not.toContain('Retries wait 30 seconds');
+    expect((await del('claim:left')).status).toBe(404);
+    expect((await del('claim:live')).status).toBe(409);
+    expect((await del('claim:lost')).status).toBe(409);
+    expect(t.claims.has('claim:live') && t.claims.has('claim:lost')).toBe(true);
   });
 });
 

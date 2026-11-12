@@ -18,8 +18,10 @@ function ctx(lessons: Lesson[], near: Record<string, SimilarLesson[]>, o: Parame
   const filters: LessonFilter[] = [];
   const c = fakeContext({
     now: NOW,
+    lessons: [],
     ...o,
     store: {
+      ...o.store,
       knowledge: {
         listLessons: async (f: LessonFilter) => { filters.push(f); return lessons.filter((l) => (l.checks ?? []).some((k) => k.name === f.flag)); },
         lessonDetail: async (id: string) => { const l = lessons.find((x) => x.id === id); return l ? { lesson: l, miss: null, feedback: null, contextItems: [] } as never : null; },
@@ -135,5 +137,70 @@ describe('mergeDuplicates.candidates', () => {
   });
   test('nothing flagged: nothing read further', async () => {
     expect(await mergeDuplicates.candidates(ctx([lesson('lesson:a')], {}).c)).toEqual({ candidates: [], scanned: 0, skipped: {} });
+  });
+});
+
+describe('never merge and the near-duplicate band (0.9.1)', () => {
+  const judge = (answer: unknown) => {
+    const p = { id: 'ollama:gemma4', agentic: false, calls: 0, json: async () => { p.calls++; return answer; } };
+    return p as unknown as import('@fb/core').LlmProvider & { calls: number };
+  };
+  /** Two live lessons of one project whose cosine is `cos`, as the round's lessons. */
+  function band(cos: number, o: { a?: Partial<Lesson>; b?: Partial<Lesson>; llm?: unknown; memo?: Record<string, string>; distinct?: boolean } = {}) {
+    const a = lesson('lesson:a', { status: 'approved', createdAt: '2026-09-01T00:00:00.000Z', ...o.a });
+    const b = lesson('lesson:b', o.b);
+    const { c } = ctx([a, b], { 'lesson:a': [sim('lesson:b', cos, 'proposed')], 'lesson:b': [sim('lesson:a', cos)] }, {
+      lessons: [a, b], memo: o.memo,
+      store: { decisions: { distinctPairs: async () => (o.distinct ? [{ a: 'lesson:a', b: 'lesson:b', by: 'you', at: 't', reason: 'r', decisionId: null }] : []), forTarget: async () => [] } },
+    });
+    const llm = o.llm === undefined ? null : judge(o.llm);
+    return { c: { ...c, llm }, llm, a, b };
+  }
+
+  test('a flagged duplicate you said is not the same is never merged again', async () => {
+    const keeper = lesson('lesson:k', { status: 'approved' });
+    const dup = lesson('lesson:d', dupOf('lesson:k'));
+    const { c } = ctx([keeper, dup], { 'lesson:d': [sim('lesson:k', 0.97)] }, {
+      store: { decisions: { distinctPairs: async () => [{ a: 'lesson:d', b: 'lesson:k', by: 'you', at: 't', reason: 'r', decisionId: 'dec:1' }], forTarget: async () => [] } },
+    });
+    const r = await mergeDuplicates.candidates(c);
+    expect(r.candidates).toEqual([]);
+    expect(r.skipped).toMatchObject({ distinct: 1 });
+  });
+
+  test('the judge says yes: a merge proposed for you, never applied on its own, with the model named and its answer remembered', async () => {
+    const { c, llm } = band(0.88, { llm: { same: 'yes', why: 'both say use the gateway' } });
+    const r = await mergeDuplicates.candidates(c);
+    expect(llm!.calls).toBe(1);
+    expect(r.candidates).toHaveLength(1);
+    const call = r.candidates[0];
+    expect(call.targets).toEqual([{ kind: 'lesson', id: 'lesson:a', role: 'keeper' }, { kind: 'lesson', id: 'lesson:b', role: 'merged' }]);
+    expect(call.proposeOnly).toMatch(/a near duplicate \(cosine 0\.88/);
+    expect(call.model).toBe('ollama:gemma4');
+    expect(call.rationale).toContain('both say use the gateway');
+    expect(JSON.parse(r.remember!['near:lesson:a|lesson:b'])).toMatchObject({ same: true });
+  });
+
+  test('no is dropped; unsure is proposed; an answer remembered for the same lessons is not asked again; under the band nothing is looked at', async () => {
+    const no = band(0.88, { llm: { same: 'no', why: 'different services' } });
+    expect((await mergeDuplicates.candidates(no.c)).skipped).toMatchObject({ judged_different: 1 });
+    const unsure = band(0.88, { llm: { same: 'unsure', why: '' } });
+    expect((await mergeDuplicates.candidates(unsure.c)).candidates[0].proposeOnly).toContain('the judge was unsure');
+    const first = await mergeDuplicates.candidates(band(0.88, { llm: { same: 'no', why: 'x' } }).c);
+    const again = band(0.88, { llm: { same: 'yes', why: 'y' }, memo: first.remember });
+    expect((await mergeDuplicates.candidates(again.c)).candidates).toEqual([]);
+    expect(again.llm!.calls).toBe(0);
+    const low = band(0.84, { llm: { same: 'yes', why: 'y' } });
+    expect((await mergeDuplicates.candidates(low.c)).candidates).toEqual([]);
+    expect(low.llm!.calls).toBe(0);
+  });
+
+  test('the same words need no model; without a model the band waits; a pair marked distinct is never judged', async () => {
+    const same = band(0.9, { b: { title: 'title lesson:a', rule: 'Rule lesson:a.' } });
+    expect((await mergeDuplicates.candidates(same.c)).candidates[0].rationale).toContain('they say the same in the same words');
+    expect((await mergeDuplicates.candidates(band(0.9).c)).skipped).toMatchObject({ no_judge: 1 });
+    const distinct = band(0.9, { llm: { same: 'yes', why: 'y' }, distinct: true });
+    expect((await mergeDuplicates.candidates(distinct.c)).skipped).toMatchObject({ distinct: 1 });
+    expect(distinct.llm!.calls).toBe(0);
   });
 });

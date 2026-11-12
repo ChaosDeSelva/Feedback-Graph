@@ -68,6 +68,19 @@ test('signing in from the UI sets an HttpOnly session cookie that authenticates 
   expect((await app.request('/api/candidates', { headers: { cookie: session } })).status).toBe(401);
 });
 
+test('sign-out needs no body or content type (the UI\'s JSON one still works), and stays refused cross-site', async () => {
+  const app = createApp(repo, { auth: { token: TOKEN, ownerToken: OWNER } });
+  const login = async () => (await app.request('/api/session', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ token: OWNER }) })).headers.get('set-cookie')!.split(';')[0];
+  const bare = await login();
+  const out = await app.request('/api/session', { method: 'DELETE', headers: { cookie: bare } });
+  expect(out.status).toBe(204);
+  expect(out.headers.get('set-cookie')).toMatch(/Max-Age=0|Expires=/i);
+  expect((await app.request('/api/candidates', { headers: { cookie: bare } })).status).toBe(401);
+  const ui = await login();
+  expect((await app.request('/api/session', { method: 'DELETE', headers: { cookie: ui, 'content-type': 'application/json' }, body: '{}' })).status).toBe(204);
+  expect((await app.request('/api/session', { method: 'DELETE', headers: { cookie: await login(), 'sec-fetch-site': 'cross-site' } })).status).toBe(403);
+});
+
 test('sign-out revocation survives an API restart and anonymous sign-out stores nothing', async () => {
   const stateFile = join(mkdtempSync(join(tmpdir(), 'fg-session-')), 'revoked.json');
   const opts = { auth: { token: TOKEN, ownerToken: OWNER, sessionStateFile: stateFile } };

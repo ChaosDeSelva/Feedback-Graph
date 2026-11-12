@@ -1,7 +1,7 @@
 import type { Context, Hono } from 'hono';
 import { z } from 'zod';
 import {
-  AliasTakenError, CLAIM_STATUSES, CLAIM_TYPES, claimFingerprint, FACT_KINDS, factEmbeddingText, NotTheRunsError, PERSON_STATUSES, QUESTION_KINDS, QUESTION_STATUSES,
+  AliasTakenError, CLAIM_FACT_RELEVANCE, CLAIM_STATUSES, CLAIM_TYPES, claimFingerprint, FACT_KINDS, factEmbeddingText, NotTheRunsError, PERSON_STATUSES, QUESTION_KINDS, QUESTION_STATUSES,
   TargetChangedError,
   type ActivityStore, type Claim, type ClaimPatch, type ClaimScope, type ClaimType, type Conflict, type FactKind, type FactsStore, type IntakeMeta,
   type IntakeRef, type IntakeStore, type Person, type Question, type RelevanceBy, type ShownProjects, type StoredFact,
@@ -20,7 +20,7 @@ import { conflictRoutes, type ConflictDeps } from './conflicts.ts';
 
 export type IntakeReviewDeps = {
   intake: Pick<IntakeStore,
-    'listClaims' | 'claim' | 'decideClaim' | 'metas' | 'conflictsFor' | 'people' | 'person' | 'ensureOwner' | 'updatePerson' | 'mergePeople'
+    'listClaims' | 'claim' | 'decideClaim' | 'deleteClaims' | 'metas' | 'conflictsFor' | 'people' | 'person' | 'ensureOwner' | 'updatePerson' | 'mergePeople'
     | 'forgetPerson' | 'listQuestions' | 'question' | 'updateQuestion' | 'answerQuestion'>;
   facts: Pick<FactsStore, 'addOwnerFact'>;
   embed: (texts: string[]) => Promise<number[][]>;
@@ -36,11 +36,6 @@ export type IntakeReviewContext = { view: () => Promise<Pick<ShownProjects, 'has
 
 const PAGE = 100;
 const MAX_PAGE = 500;
-/**
- * An accepted claim's fact, until you or the loop score it: everyday, the lowest relevance a fact with no file in the
- * task is served at (rankFacts' FACT_RANK_FLOOR); the design's "sometimes" (0.55) kept every one from agents.
- */
-export const CLAIM_FACT_RELEVANCE = 0.8;
 const OWNER_NAME = 'You';
 
 const Id = z.string().min(1).max(500);
@@ -257,6 +252,25 @@ export function intakeReviewRoutes(app: Hono, d: IntakeReviewDeps, ctx: IntakeRe
     } catch (e) {
       return refused(c, e);
     }
+  });
+
+  // One leftover claim removed for good (its source gone, say). A claim agents are given (accepted) or one a conflict
+  // superseded is refused: reject it, or roll that resolution back, first. The Activity entry, and the earlier entries
+  // about the claim (deleteClaims), name it without its text.
+  app.delete('/api/claims/:id', async (c) => {
+    const id = c.req.param('id');
+    const claim = await shownClaim(id);
+    if (!claim) return c.json({ error: 'not found' }, 404);
+    if (!mayChange(claim)) return c.json({ error: new NotTheRunsError(`the claim ${id}`, currentRun()!.id).message }, 409);
+    if (claim.status === 'accepted') return c.json({ error: 'this claim is accepted: reject it first, so agents stop being given it, then delete it' }, 409);
+    if (claim.status === 'superseded') return c.json({ error: 'this claim lost a conflict: roll that resolution back first' }, 409);
+    if (!(await intake.deleteClaims([id]))) return c.json({ error: 'not found' }, 404);
+    await d.activity.record({
+      kind: 'claim_decided', actor: 'you', projectKey: claim.projectKey, subject: `deleted a ${claim.status} ${claim.type} claim`,
+      why: 'you deleted it: its statement and quote are gone, and earlier entries about it no longer quote it',
+      details: { status: 'deleted', was: claim.status, type: claim.type, docId: claim.docId }, targets: [id],
+    });
+    return c.body(null, 204);
   });
 
   // Each claim is decided and recorded on its own, as if one at a time; one refused does not stop the rest. With

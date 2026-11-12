@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'vitest';
-import { candidateProvenance, matchReport, REPORT_MERGE_MINUTES, similarReports } from './dedupe.ts';
+import { candidateProvenance, embeddingCosine, matchReport, REPORT_MERGE_MINUTES, similarReports } from './dedupe.ts';
 
 const at = (min: number) => new Date(Date.UTC(2026, 9, 23, 10, 0) + min * 60_000).toISOString();
 
@@ -54,4 +54,17 @@ describe('candidateProvenance', () => {
     });
     expect(candidateProvenance({ ...base, manual: true, turnText: null, turnWhatWasDone: undefined }).agentReport).toMatchObject({ text: '', whatWasDone: '' });
   });
+});
+
+test('by meaning (0.9.1): a reworded or next-day report close in meaning matches within days; far, too late, or not comparable does not', () => {
+  const at = (h: number) => new Date(Date.parse('2026-11-10T09:00:00Z') + h * 3_600_000).toISOString();
+  const unit = (x: number) => [x, Math.sqrt(1 - x * x), 0];
+  const item = { id: 'k1', ts: at(0), text: 'you broke the CSV export', sessionId: 's1', embedding: unit(1) };
+  expect(matchReport({ ts: at(26), text: 'exporting to csv fails since yesterday', embedding: unit(0.9) }, [item])).toBe(item);
+  expect(matchReport({ ts: at(26), text: 'exporting to csv fails', embedding: unit(0.7) }, [item])).toBeNull();
+  expect(matchReport({ ts: at(80), text: 'exporting to csv fails', embedding: unit(0.95) }, [item])).toBeNull();
+  expect(matchReport({ ts: at(26), text: 'exporting to csv fails', embedding: [1, 0] }, [item])).toBeNull();
+  expect(matchReport({ ts: at(26), text: 'exporting to csv fails' }, [item])).toBeNull();
+  expect(embeddingCosine([1, 0], [0, 1])).toBe(0);
+  expect(embeddingCosine(null, [1])).toBeNull();
 });
