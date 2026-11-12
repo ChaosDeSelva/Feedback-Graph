@@ -18,7 +18,7 @@ import type {
   WorkerStatus,
   AgentSeen,
 } from '../types.ts';
-import type { ExternalThread, GraphStore, WorkSession } from '../store.ts';
+import type { ExternalThread, GraphStore, InboxText, WorkSession } from '../store.ts';
 import { EXTERNAL_SOURCES, type ExternalRef, type FeedbackSource, type SessionSource } from '../types.ts';
 import { redactDeep } from '../redact.ts';
 import { candidateProvenance, matchReport, REPORT_MERGE_MINUTES } from '../dedupe.ts';
@@ -180,7 +180,12 @@ export class GraphRepo implements GraphStore {
          MERGE (turn:Turn {uuid: t.uuid})
            SET turn.sessionId = t.sessionId, turn.ts = t.ts, turn.index = t.index, turn.text = t.text,
                turn.precedingAssistantText = t.precedingAssistantText, turn.toolCalls = t.toolCalls, turn.run = s.run, turn.sandbox = s.sandbox
-         MERGE (s)-[:HAS_TURN]->(turn)`,
+         MERGE (s)-[:HAS_TURN]->(turn)
+         // A turn is one session's: one read before as part of another (a session now split where it changed project)
+         // moves, as on Postgres.
+         WITH s, turn
+         OPTIONAL MATCH (other:Session)-[moved:HAS_TURN]->(turn) WHERE other <> s
+         DELETE moved`,
       {
         project: { ...project, remote: project.remote ?? null },
         s: { ...s, turns: undefined, toolCalls: undefined, finalReply: undefined, instructionFiles: undefined },
@@ -342,6 +347,15 @@ export class GraphRepo implements GraphStore {
     this.sandbox.mark(); // A transcript-derived candidate may inherit a sandbox binding from another process.
     const merged = await this.mergeIntoReport(turnUuid);
     if (merged) return merged;
+    // The same words again in the same session or PR thread while the first is still pending: one Inbox item.
+    const [same] = await this.run(
+      `MATCH (s:Session)-[:HAS_TURN]->(t:Turn {uuid: $uuid}) WHERE NOT EXISTS { MATCH (:Candidate {id: t.uuid}) }
+       MATCH (s)-[:HAS_TURN]->(o:Turn)<-[:FLAGS]-(k:Candidate {status: 'pending'})
+       WHERE o.uuid <> t.uuid AND trim(o.text) = trim(t.text)
+       RETURN k.id AS id ORDER BY k.createdAt, k.id LIMIT 1`,
+      { uuid: turnUuid },
+    );
+    if (same) return same.get('id') as string;
     await this.run(
       `MATCH (t:Turn {uuid: $uuid})
        WITH t WHERE $makeCandidate
@@ -514,6 +528,17 @@ export class GraphRepo implements GraphStore {
       { limit: neo4j.int(q.limit), afterId: q.afterId ?? null },
     );
     return rows.map((r) => ({ id: r.get('id'), turnUuid: r.get('turnUuid'), projectKey: r.get('projectKey'), text: r.get('text'), precedingToolCalls: JSON.parse(r.get('toolCalls') ?? '[]') as ToolCall[] }));
+  }
+
+  async inboxTexts(q: { limit: number; afterId?: string | null }): Promise<InboxText[]> {
+    const rows = await this.run(
+      `MATCH (k:Candidate)-[:FLAGS]->(t:Turn) WHERE t.text IS NOT NULL AND ($afterId IS NULL OR k.id > $afterId)
+       RETURN k.id AS id, k.sessionId AS sessionId, k.projectKey AS projectKey, coalesce(k.source, 'claude') AS source, k.status AS status,
+              k.createdAt AS createdAt, t.text AS text
+       ORDER BY k.id LIMIT $limit`,
+      { limit: neo4j.int(q.limit), afterId: q.afterId ?? null },
+    );
+    return rows.map((r) => ({ id: r.get('id'), sessionId: r.get('sessionId'), projectKey: r.get('projectKey'), source: r.get('source'), status: r.get('status'), createdAt: r.get('createdAt'), text: r.get('text') }));
   }
 
   async skipPendingItem(id: string, s: { rule: string; note: string; by: string }): Promise<boolean> {

@@ -1,4 +1,4 @@
-import { modelTimeoutReason, providerUnavailableReason, redactSecrets, type ActivityStore, type KnowledgeStore, type Lesson, type LlmProvider, type PostMortem, type PostMortemInput } from '@fb/core';
+import { modelTimeoutReason, providerUnavailableReason, redactSecrets, threadTaskTitle, type ActivityStore, type KnowledgeStore, type Lesson, type LlmProvider, type PostMortem, type PostMortemInput } from '@fb/core';
 import type { PostMortemTrace } from './postmortem.ts';
 import { duplicateFlag } from './recheck.ts';
 
@@ -95,6 +95,8 @@ export async function runPostmortems(deps: PostmortemStepDeps): Promise<{ done: 
     let charged: string | null = null;
     try {
       const { trace, ...pm } = await deps.postmortem(input);
+      // A comment's task is its PR or issue, whatever work session the post-mortem was matched to.
+      if (input.feedback?.external) pm.taskTitle = threadTaskTitle(input.feedback.external);
       const t = embedTexts(pm);
       // A dropped lesson (no rule even after the retry, postmortem.ts) is not saved, so it needs no embedding.
       const [miss, lesson = []] = await deps.embed(pm.lessonDropped ? [t.miss] : [t.miss, t.lesson]);

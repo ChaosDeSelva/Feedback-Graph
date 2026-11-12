@@ -1,4 +1,4 @@
-import { askJson, deriveTriggers, LESSON_CHECKS_VERSION, mergeTriggers, MAX_TRIGGERS, mentionedPaths, pathMatches, redactSecrets, validateTriggers, type ActivityStore, type KnowledgeStore, type Lesson, type LessonCheck, type LessonDetail, type LlmProvider } from '@fb/core';
+import { askJson, broadTriggerPaths, deriveTriggers, LESSON_CHECKS_VERSION, mergeTriggers, MAX_TRIGGERS, mentionedPaths, pathMatches, redactSecrets, TRIGGER_DERIVATION_VERSION, validateTriggers, type ActivityStore, type KnowledgeStore, type Lesson, type LessonCheck, type LessonDetail, type LessonTriggers, type LlmProvider } from '@fb/core';
 import { z } from 'zod';
 import { instanceAppliesWhen } from './lessonCheck.ts';
 import { junkPathReason, repoFileList } from './paths.ts';
@@ -13,15 +13,15 @@ import { junkPathReason, repoFileList } from './paths.ts';
 const list = z.array(z.string().max(500)).max(MAX_TRIGGERS * 2).optional().catch(undefined);
 
 const TRIGGER_KIND_SCHEMA = {
-  paths: { type: 'array', items: { type: 'string' }, description: 'Globs of the kind of file it is about (**/*.sql, deploy/**/*.yaml)' },
+  paths: { type: 'array', items: { type: 'string' }, description: 'Globs of the folder and kind of file it is about (db/migrations/*.sql, deploy/**/*.yaml)' },
   patterns: { type: 'array', items: { type: 'string' }, description: 'Regular expressions a line the change adds would match (CREATE\\s+INDEX)' },
   symbols: { type: 'array', items: { type: 'string' }, description: 'Exact names the change would use: a function, constant, env var, flag or key' },
 };
 
 /** What the backfill asks for, naming the fields. */
 const triggersPrompt = (paths: string, patterns: string, symbols: string) => `Set ${paths}, ${patterns} and ${symbols} to what a later change would show when the lesson applies, so it reaches
-that change without anyone searching for it. ${paths}: globs of the kind of file it is about (\`**/*.sql\`,
-\`deploy/**/*.yaml\`, a folder's \`**/*.py\`). ${patterns}: regular expressions a line the change ADDS would match
+that change without anyone searching for it. ${paths}: globs of the folder and kind of file it is about
+(\`db/migrations/*.sql\`, \`deploy/**/*.yaml\`), never a kind of file anywhere (\`**/*.sql\`, \`*.py\`). ${patterns}: regular expressions a line the change ADDS would match
 (\`CREATE\\s+(UNIQUE\\s+)?INDEX\`, \`time\\.sleep\\(\`). ${symbols}: exact names the change would use (a function,
 constant, env var, flag or key the feedback names). Take them from the rule's own words and the code the feedback
 quotes. Each must match this miss (a file it names or a line of the code quoted above); never an everyday word (query,
@@ -50,28 +50,50 @@ export function quotedRepoPaths(text: string, files: string[] | null | undefined
   return out;
 }
 
-/** A context item's file, without :line or ./ */
-const fileOf = (ref: string) => ref.replace(/:\d+(-\d+)?$/, '').replace(/^\.\//, '');
 const GLOB = /[*?[\]{}]/;
 /** Files a glob in a lesson's paths stands for, at most this many (enough for a path trigger to match one). */
 const MAX_GLOB_FILES = 500;
 
 /**
- * The miss a stored lesson was learned from, as its triggers are checked against it: its feedback, what was done, the
- * comment's file and diff lines, what was missed and the excerpts cited; its files are the comment's, the lesson's paths
- * (a glob by the repository files it covers) and the repository files that text names. A lesson with no miss (written by
- * hand, from a memory file, imported) is checked against its own words.
+ * The miss a stored lesson was learned from, as the model's triggers are checked against it: its feedback, what was
+ * done, the comment's diff lines and what was missed (never the context items the post-mortem cited); its files are the
+ * lesson's own (storedTriggerFiles) and the lesson's glob paths by the repository files they cover. A lesson with no
+ * miss (written by hand, from a memory file, imported) is checked against its own words.
  */
 export function storedEvidence(detail: LessonDetail, listing: string[] | null): { text: string; files: string[] } {
   const l = detail.lesson;
   const own = `${l.title}\n${l.rule}\n${l.appliesWhen}`;
   const text = detail.miss && detail.feedback
-    ? missEvidence({ feedback: detail.feedback.text ?? '', done: detail.feedback.done, diffHunk: detail.feedback.diffHunk, missed: detail.miss.missed, excerpts: detail.contextItems.map((i) => i.excerpt) })
+    ? missEvidence({ feedback: detail.feedback.text ?? '', done: detail.feedback.done, diffHunk: detail.feedback.diffHunk, missed: detail.miss.missed })
     : own;
-  const named = [...l.paths.filter((p) => !GLOB.test(p)), ...(listing ?? []).filter((f) => l.paths.some((p) => GLOB.test(p) && pathMatches(p, f))).slice(0, MAX_GLOB_FILES)];
-  const cited = detail.contextItems.filter((i) => i.kind === 'code').map((i) => fileOf(i.ref)).filter((f) => listing?.includes(f));
-  const comment = detail.feedback?.commentPath ? [detail.feedback.commentPath] : [];
-  return { text, files: [...new Set([...comment, ...named, ...cited, ...quotedRepoPaths(text, listing)])] };
+  const globbed = (listing ?? []).filter((f) => l.paths.some((p) => GLOB.test(p) && pathMatches(p, f))).slice(0, MAX_GLOB_FILES);
+  return { text, files: [...new Set([...storedTriggerFiles(detail), ...globbed])] };
+}
+
+/**
+ * A stored lesson's own files, as its triggers are derived from them (deriveTriggers): its paths that are files or
+ * folders and the file its comment was on. A review comment on no file is about the PR, not its other files: of the
+ * lesson's paths, only those the comment names.
+ */
+export function storedTriggerFiles(detail: LessonDetail): string[] {
+  const own = detail.lesson.paths.filter((p) => !GLOB.test(p));
+  const f = detail.feedback;
+  if (f?.external && !f.commentPath) return own.filter((p) => `${f.text}\n${f.diffHunk ?? ''}`.includes(p));
+  return [...new Set([...(f?.commentPath ? [f.commentPath] : []), ...own])];
+}
+
+/** broad-trigger: the trigger paths that are a kind of file anywhere, kept because the rule says it of every such file. */
+export const broadTriggerFlag = (paths: string[]): LessonCheck => ({
+  name: 'broad-trigger',
+  why: `its trigger ${paths.join(', ')} fires on every such file in the repository: keep it only if the rule is about every one of them, else narrow it to a folder`,
+});
+
+/** The lesson's checks with broad-trigger as its triggers now call for it; null when that changes nothing. */
+function withBroadFlag(l: Lesson, t: LessonTriggers): LessonCheck[] | null {
+  const broad = broadTriggerPaths(t);
+  const had = (l.checks ?? []).some((c) => c.name === 'broad-trigger');
+  if (!broad.length && !had) return null;
+  return [...(l.checks ?? []).filter((c) => c.name !== 'broad-trigger'), ...(broad.length ? [broadTriggerFlag(broad)] : [])];
 }
 
 /** Lessons looked at per round: each costs one model call. */
@@ -154,12 +176,14 @@ export async function backfillLessonTriggers(d: TriggerBackfillDeps): Promise<{ 
       d.log?.('lesson triggers: the model did not answer; derived ones only', { id: l.id, error: redactSecrets(String(err)).slice(0, 300) });
     }
     if (detail.lesson.triggers == null) {
-      const derived = deriveTriggers({ rule: detail.lesson.rule, appliesWhen: detail.lesson.appliesWhen, evidence: ev.text, files: ev.files, repoFiles: listing });
+      const derived = deriveTriggers({ rule: detail.lesson.rule, appliesWhen: detail.lesson.appliesWhen, files: storedTriggerFiles(detail), repoFiles: listing });
       const { triggers: model, dropped } = validateTriggers(answer, { ...ev, repoFiles: listing });
       const triggers = mergeTriggers(derived, model);
       if (await d.k.setLessonTriggers(l.id, triggers)) {
         out.derived++;
         d.log?.('lesson triggers derived', { id: l.id, triggers, dropped });
+        const checks = withBroadFlag(detail.lesson, triggers);
+        if (checks) await d.k.setLessonChecks(l.id, checks, detail.lesson.checksVersion ?? 0);
       }
     }
     if (!answer) continue;
@@ -180,6 +204,61 @@ export async function backfillLessonTriggers(d: TriggerBackfillDeps): Promise<{ 
       why: 'triggers (paths, added-line patterns, symbols) let a lesson reach the change it applies to; only those matching the lesson\'s own miss were kept, and nothing else about the lesson changed',
       details: { derived: out.derived, suggested: out.suggested, failed: out.failed },
       targets: todo.map((l) => l.id),
+    });
+  }
+  return out;
+}
+
+/** Lessons derived again per round (no model: the lesson's words and files only). */
+export const REDERIVE_BATCH = 200;
+
+export type RederiveDeps = {
+  k: Pick<KnowledgeStore, 'lessonsWithOldTriggers' | 'lessonDetail' | 'rederiveLessonTriggers' | 'setLessonChecks'>;
+  repoPaths?: () => Promise<Map<string, string>>;
+  repoFiles?: (repoPath: string) => Promise<string[] | null>;
+  activity?: Pick<ActivityStore, 'record'>;
+  log?: (msg: string, extra?: object) => void;
+  batch?: number;
+};
+
+const count = (t: LessonTriggers | null | undefined) => (t ? t.paths.length + t.patterns.length + t.symbols.length : 0);
+
+/**
+ * Once per TRIGGER_DERIVATION_VERSION: the triggers of lessons derived by older rules are derived again by today's
+ * (deriveTriggers, no model), up to `batch` a round, oldest first. Triggers the owner set are never touched (the store
+ * refuses them). What a model added under the old rules goes too: it was checked against evidence the rules no longer
+ * trust. broad-trigger follows the new triggers. Activity says how many lessons and triggers, before and after.
+ */
+export async function rederiveLessonTriggers(d: RederiveDeps): Promise<{ lessons: number; before: number; after: number; flagged: number }> {
+  const out = { lessons: 0, before: 0, after: 0, flagged: 0 };
+  const todo = await d.k.lessonsWithOldTriggers(TRIGGER_DERIVATION_VERSION, d.batch ?? REDERIVE_BATCH);
+  if (!todo.length) return out;
+  const repos = (await d.repoPaths?.().catch(() => null)) ?? new Map<string, string>();
+  const listFiles = d.repoFiles ?? repoFileList;
+  const ids: string[] = [];
+  for (const l of todo) {
+    const detail = await d.k.lessonDetail(l.id);
+    if (!detail) continue;
+    const repo = repos.get(l.projectKey ?? l.origin ?? '');
+    const listing = repo ? await listFiles(repo).catch(() => null) : null;
+    const triggers = deriveTriggers({ rule: detail.lesson.rule, appliesWhen: detail.lesson.appliesWhen, files: storedTriggerFiles(detail), repoFiles: listing });
+    if (!(await d.k.rederiveLessonTriggers(l.id, triggers, TRIGGER_DERIVATION_VERSION))) continue;
+    out.lessons++;
+    out.before += count(detail.lesson.triggers);
+    out.after += count(triggers);
+    ids.push(l.id);
+    const checks = withBroadFlag(detail.lesson, triggers);
+    if (checks) await d.k.setLessonChecks(l.id, checks, detail.lesson.checksVersion ?? 0);
+    if (broadTriggerPaths(triggers).length) out.flagged++;
+    d.log?.('lesson triggers derived again', { id: l.id, from: detail.lesson.triggers, to: triggers });
+  }
+  if (out.lessons) {
+    await d.activity?.record({
+      kind: 'lessons_checked', actor: 'lesson-check', projectKey: null,
+      subject: `${out.lessons} lesson${out.lessons === 1 ? '\'s' : 's\''} triggers derived again: ${out.before} → ${out.after} triggers`,
+      why: `the rules triggers are derived by changed (v${TRIGGER_DERIVATION_VERSION}): only the lesson's own paths, the files its fix edited and the names its rule uses, and no glob for a kind of file anywhere unless the rule says it of every such file; triggers you set were left as they are`,
+      details: { ...out, version: TRIGGER_DERIVATION_VERSION },
+      targets: ids.slice(0, 500),
     });
   }
   return out;

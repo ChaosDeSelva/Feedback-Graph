@@ -88,6 +88,12 @@ export const SCHEMA = [
   'CREATE INDEX decision_note_decision IF NOT EXISTS FOR (n:DecisionNote) ON (n.decisionId)',
   'CREATE CONSTRAINT lesson_signals_lesson IF NOT EXISTS FOR (n:LessonSignals) REQUIRE n.lessonId IS UNIQUE',
   'CREATE CONSTRAINT loop_calibration_key IF NOT EXISTS FOR (n:LoopCalibration) REQUIRE n.key IS UNIQUE',
+  // One GraphConfig per id. Two services MERGEing one at once before this constraint could make two: the newest
+  // (updatedAt) is kept, so the constraint can be created on a store that has them.
+  `MATCH (c:GraphConfig) WITH c ORDER BY coalesce(c.updatedAt, '') DESC, elementId(c)
+   WITH c.id AS id, collect(c) AS nodes WHERE size(nodes) > 1
+   UNWIND tail(nodes) AS extra DETACH DELETE extra`,
+  'CREATE CONSTRAINT graph_config_id IF NOT EXISTS FOR (n:GraphConfig) REQUIRE n.id IS UNIQUE',
 ];
 
 export const EMBEDDING_DIMENSIONS = 768;

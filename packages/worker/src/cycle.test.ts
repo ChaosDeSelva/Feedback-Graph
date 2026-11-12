@@ -287,6 +287,16 @@ function projectTable(rows: Project[]) {
   return { projects, repo };
 }
 
+test("a session's commits are asked for on its branch, or with none recorded, in the worktree it ran in", async () => {
+  const asked: unknown[] = [];
+  const rec = (o: object) => line({ type: 'user', uuid: 'u1', timestamp: '2026-10-01T10:00:00Z', message: { content: 'fix the totals' }, ...o });
+  const onBranch = fakes({ readFile: async () => rec({ gitBranch: 'feat/cart' }), commits: async (...a) => { asked.push(a.slice(3)); return []; } });
+  await runCycle(onBranch.deps);
+  const inTree = fakes({ readFile: async () => rec({ cwd: '/H/Vibe/demo/.worktrees/cart' }), commits: async (...a) => { asked.push(a.slice(3)); return []; } });
+  await runCycle(inTree.deps);
+  expect(asked).toEqual([[{ branch: 'feat/cart', worktree: null }], [{ branch: null, worktree: '/vibe/demo/.worktrees/cart' }]]);
+});
+
 describe('projects identified by git remote', () => {
   const main: Project = { key: 'demo-main', name: 'demo-main', repoPath: '/vibe/demo-main', remote: 'github.com/org/demo' };
 
@@ -397,6 +407,9 @@ describe('projects identified by git remote', () => {
   });
 });
 
+/** A Codex user message record typed by the developer. */
+const codexUser = (ordinal: number, timestamp: string, text: string) => JSON.stringify({ timestamp, type: 'response_item', ordinal, payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text }] } });
+
 describe('Codex sessions', () => {
   const rollout = readFileSync(join(import.meta.dirname, '../../../fixtures/codex/normal.jsonl'), 'utf8');
   const codexFile = { path: '/codex-sessions/2026/10/01/rollout-a.jsonl', size: rollout.length, mtimeMs: 1, source: 'codex' as const };
@@ -461,7 +474,7 @@ describe('Codex sessions', () => {
     return { full, early, claude, claudeFile };
   }
 
-  test('a live Codex session first read at one turn keeps being read as it grows, though its opening matches a Claude Code conversation', async () => {
+  test('a live Codex session first read at one turn keeps being read as it grows: the turns it typed, not those it copied', async () => {
     const { full, early, claude, claudeFile } = await liveCodexSession();
     expect(full.turns.length).toBeGreaterThanOrEqual(2);
     let text = early;
@@ -470,13 +483,41 @@ describe('Codex sessions', () => {
       readFile: async () => claude,
       readLines: async function* () { yield* text.split('\n'); },
     });
-    const stored = () => [...f.turns.values()].filter((t) => t.sessionId === full.sessionId).length;
+    const stored = () => [...f.turns.values()].filter((t) => t.sessionId === full.sessionId).map((t) => t.text);
     await runCycle(f.deps);
-    expect(stored()).toBe(1); // one turn: too short to tell apart, so it is Codex's own
-    // The developer goes on in Codex; the file grows and now opens like the Claude Code conversation.
-    text = rollout;
+    expect(stored()).toHaveLength(1); // one turn: too short to tell apart, so it is Codex's own
+    // The file grows with the rest of the Claude Code conversation it copied, and a turn typed in Codex.
+    text = `${rollout.trimEnd()}\n${codexUser(40, '2026-10-01T10:05:00.000Z', 'Also add a test for the server-side filter')}`;
     await runCycle(f.deps);
-    expect(stored()).toBe(full.turns.length);
+    expect(stored()).toEqual([full.turns[0].text, 'Also add a test for the server-side filter']);
+  });
+
+  test('a Codex import with turns of its own before and after the copied ones is a copy: only its own turns are read', async () => {
+    const { full, claude, claudeFile } = await liveCodexSession();
+    const lines = rollout.trimEnd().split('\n');
+    // Codex asked something first, then took in the Claude Code conversation, then went on.
+    const text = [lines[0], codexUser(2.5, '2026-10-01T09:59:00.000Z', 'Before we start, summarise the repository layout'), ...lines.slice(1), codexUser(40, '2026-10-01T10:05:00.000Z', 'Now add pagination to the server filter')].join('\n');
+    const logs: { msg: string; extra?: object }[] = [];
+    const f = codexFakes(text, { listFiles: async () => [claudeFile, codexFile], readFile: async () => claude, log: (msg, extra) => void logs.push({ msg, extra }) });
+    await runCycle(f.deps);
+    expect(f.state.codexVerdict(full.sessionId)).toBe('s1');
+    const codex = f.sessions.find((s) => s.source === 'codex')!;
+    expect(codex.turns.map((t) => t.text)).toEqual(['Before we start, summarise the repository layout', 'Now add pagination to the server filter']);
+    expect(logs.find((l) => l.msg.startsWith('codex session read without'))?.extra).toEqual({ session: full.sessionId, original: 's1', copied: full.turns.length });
+  });
+
+  test('a Codex turn read once with its ordinal and once without keeps the id it was stored under', async () => {
+    const { full } = await liveCodexSession();
+    const stored = full.turns.map((t) => ({ uuid: t.uuid, ts: t.ts, text: t.text }));
+    expect(stored.every((t) => /:\d+$/.test(t.uuid))).toBe(true);
+    // The same rollout with its ordinals gone gives line-numbered ids (…:L20 for …:19).
+    const bare = rollout.split('\n').map((l) => l.replace(/"ordinal":\d+,/, '')).join('\n');
+    const f = codexFakes(bare, { storedTurnIds: async (id) => (id === full.sessionId ? stored : []) });
+    await runCycle(f.deps);
+    expect(f.sessions[0].turns.map((t) => t.uuid)).toEqual(stored.map((t) => t.uuid));
+    const g = codexFakes(bare);
+    await runCycle(g.deps);
+    expect(g.sessions[0].turns.map((t) => t.uuid).every((u) => /:L\d+$/.test(u))).toBe(true);
   });
 
   test('the copy rule change re-reads Codex files once at start and resumes a session the old rule froze, logged in Activity', async () => {

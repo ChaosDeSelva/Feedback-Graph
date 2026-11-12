@@ -10,28 +10,41 @@ export const sameDraft = (a: LessonDraft, b: LessonDraft) =>
   [...a.paths].sort().join('\n') === [...b.paths].sort().join('\n');
 
 /**
- * Whether a decision recorded as made `by` is the owner's: 'you' (the UI), an agent with the operator token (it acts
- * on the owner's authority: the owner gave it the verb; lessonQuality counts these apart too), or not recorded
- * (decided before decidedBy was, when only the owner decided). Anything else is a machine's: the post-mortem's
- * "no miss" rejection, the session re-match, a detector.
+ * Whether a decision recorded as made `by` is on the owner's authority: 'you' (the UI), an agent with the operator token
+ * (the owner gave it the verb), or not recorded (decided before decidedBy was, when only the owner decided). Such a
+ * decision marks the lesson as the owner's (decidedByYou), so a memory re-import never overrides it. Anything else is a
+ * machine's: the post-mortem's "no miss" rejection, the session re-match, a detector. What the owner's decisions say
+ * about the writer (lessonOutcome: quality numbers, the post-mortem's examples) counts only ownDecision.
  */
 export function ownerDecided(by: string | null | undefined): boolean {
   return by == null || by === 'you' || by === 'operator' || by.startsWith('operator:');
 }
 
+/** An agent holding the operator token decided it: on the owner's authority, but not the owner's judgement. */
+export const operatorDecided = (by: string | null | undefined): boolean => by === 'operator' || !!by?.startsWith('operator:');
+
+/** The owner's own decision: the UI's, or one recorded before decidedBy was (only the owner decided then). */
+export const ownDecision = (by: string | null | undefined): boolean => by == null || by === 'you';
+
 /** SQL for ownerDecided over a decided_by column (store-postgres). */
 export const OWNER_DECIDED_SQL = (col: string) => `(${col} IS NULL OR ${col} = 'you' OR ${col} = 'operator' OR ${col} LIKE 'operator:%')`;
 
-/**
- * How the owner decided this lesson, or null when it is not an owner decision on a post-mortem lesson: undecided,
- * superseded, withdrawn with its feedback (no decision time), decided by a machine (ownerDecided), from a memory file,
- * by hand, the demo corpus, or a sandbox run (a tester's run must not teach the writer).
- */
-export function lessonOutcome(l: Lesson): LessonOutcome | null {
-  if (l.source !== 'postmortem' || l.sandbox || !l.decidedAt || !ownerDecided(l.decidedBy)) return null;
+/** How a post-mortem lesson was decided, whoever decided it: null when undecided, superseded or not the writer's. */
+function decidedAs(l: Lesson): LessonOutcome | null {
+  if (l.source !== 'postmortem' || l.sandbox || !l.decidedAt) return null;
   if (l.status === 'rejected') return 'rejected';
   if (l.status !== 'approved') return null;
   return l.proposedAs && !sameDraft(l.proposedAs, l) ? 'edited' : 'as_written';
+}
+
+/**
+ * How the owner decided this lesson, or null when it is not the owner's own decision on a post-mortem lesson: undecided,
+ * superseded, withdrawn with its feedback (no decision time), decided by an agent with the operator token or by a
+ * machine (ownDecision), from a memory file, by hand, the demo corpus, or a sandbox run (a tester's run must not teach
+ * the writer).
+ */
+export function lessonOutcome(l: Lesson): LessonOutcome | null {
+  return ownDecision(l.decidedBy) ? decidedAs(l) : null;
 }
 
 /**
@@ -45,16 +58,21 @@ export function editedDraft(current: Lesson, patch: Partial<LessonDraft> & { sta
   return sameDraft(next, current) ? null : draftOf(current);
 }
 
-/** Of these lessons, those decided within the last `days` days by outcome. */
+/**
+ * Of these lessons, those the owner decided within the last `days` days, by outcome; those an agent with the operator
+ * token decided are counted apart (byOperator), never as the owner's.
+ */
 export function lessonQuality(lessons: Lesson[], days: number, now = new Date()): LessonQuality {
   const since = now.getTime() - days * 86_400_000;
   const q: LessonQuality = { days, asWritten: 0, edited: 0, rejected: 0, decided: 0, byOperator: 0 };
   for (const l of lessons) {
-    const o = lessonOutcome(l);
+    const o = decidedAs(l);
     if (!o || Date.parse(l.decidedAt!) < since) continue;
-    q[o === 'as_written' ? 'asWritten' : o]++;
-    q.decided++;
-    if (l.decidedBy?.startsWith('operator')) q.byOperator++;
+    if (operatorDecided(l.decidedBy)) q.byOperator++;
+    else if (ownDecision(l.decidedBy)) {
+      q[o === 'as_written' ? 'asWritten' : o]++;
+      q.decided++;
+    }
   }
   return q;
 }
@@ -68,7 +86,7 @@ export function lessonQualityReport(lessons: Lesson[], o: { capped?: boolean; no
   const by = new Map<string, Lesson[]>();
   for (const l of lessons) {
     const key = l.projectKey ?? l.origin;
-    if (key && lessonOutcome(l)) by.set(key, [...(by.get(key) ?? []), l]);
+    if (key && decidedAs(l) && (ownDecision(l.decidedBy) || operatorDecided(l.decidedBy))) by.set(key, [...(by.get(key) ?? []), l]);
   }
   return { windows: windows(lessons), projects: Object.fromEntries([...by].map(([k, ls]) => [k, windows(ls)])), ...(o.capped && { capped: true as const }) };
 }

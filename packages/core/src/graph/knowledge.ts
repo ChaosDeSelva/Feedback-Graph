@@ -25,6 +25,7 @@ import type {
 } from '../types.ts';
 import { REDACT_PAGE, redactDeep, redactSecrets, redactStoredLesson, redactStoredRow } from '../redact.ts';
 import { LESSON_CHECKS_VERSION } from '../types.ts';
+import { TRIGGER_DERIVATION_VERSION } from '../lessonTriggers.ts';
 import { DEMO_SOURCE, demoPrefix, type CommentLesson, type DemoMiss, type DemoRemoved, type KnowledgeStore, type LessonFilter, type SimilarLesson, type DecidedLesson, type DecidedLessonsQuery, type LoopLessonInput } from '../store.ts';
 import { draftOf, editedDraft, ownerDecided } from '../lessonOutcome.ts';
 import { lessonFingerprint, TargetChangedError, type LessonSnapshotWrite, type SupersedeLink } from '../decisions/record.ts';
@@ -276,6 +277,7 @@ export class KnowledgeRepo implements KnowledgeStore {
            SET l.title = $pm.lesson.title, l.rule = $pm.lesson.rule, l.appliesWhen = $pm.lesson.appliesWhen,
                l.scope = $pm.lesson.scope, l.paths = $pm.lesson.paths,
                l.triggers = CASE WHEN coalesce(l.triggersOwned, false) THEN l.triggers ELSE $triggers END,
+               l.triggersVersion = CASE WHEN coalesce(l.triggersOwned, false) THEN l.triggersVersion WHEN $triggers IS NULL THEN null ELSE $triggersVersion END,
                l.projectKey = CASE WHEN $pm.lesson.scope = 'global' THEN null ELSE p.key END,
                l.embedding = $lessonEmbedding, l.checks = $checks, l.checksVersion = CASE WHEN $checks IS NULL THEN null ELSE $checksVersion END)
          MERGE (l)-[:DERIVED_FROM]->(m)
@@ -309,6 +311,7 @@ export class KnowledgeRepo implements KnowledgeStore {
         // The triggers too (null: none derived, so the worker's backfill derives them).
         triggers: pm.lesson.triggers ? JSON.stringify(pm.lesson.triggers) : null,
         checksVersion: neo4j.int(LESSON_CHECKS_VERSION),
+        triggersVersion: neo4j.int(TRIGGER_DERIVATION_VERSION),
         status: OUTCOME_STATUS[pm.outcome],
         now,
         missEmbedding: embeddings.miss,
@@ -468,6 +471,8 @@ export class KnowledgeRepo implements KnowledgeStore {
        // New words are checked again at the worker's next round: a flag on the old words (broken-rule) must not stay.
        FOREACH (_ IN CASE WHEN $words THEN [1] ELSE [] END | SET l.checksVersion = 0)
        FOREACH (_ IN CASE WHEN $status IS NULL THEN [] ELSE [1] END | SET l.status = $status, l.decidedAt = $now, l.decidedBy = $by, l.decisionNote = $note)
+       // An edit given a note says why; one without leaves the last decision's note.
+       FOREACH (_ IN CASE WHEN $status IS NULL AND $note IS NOT NULL THEN [1] ELSE [] END | SET l.decisionNote = $note)
        FOREACH (_ IN CASE WHEN $embedding IS NULL THEN [] ELSE [1] END | SET l.embedding = $embedding)
        WITH l
        // Scope decides who sees it: global has no project; project/task go back to the project it came from.
@@ -564,6 +569,22 @@ export class KnowledgeRepo implements KnowledgeStore {
     }, () => true);
   }
 
+  async threadTasks(): Promise<{ id: string; title: string | null; external: ExternalRef }[]> {
+    const rows = await this.g.run(
+      `MATCH (s:Session)-[:WORKED_ON]->(task:Task) WHERE s.manual AND (s.id STARTS WITH 'github:' OR s.id STARTS WITH 'linear:')
+       MATCH (s)-[:HAS_TURN]->(t:Turn) WHERE t.external IS NOT NULL
+       WITH task, min(t.uuid) AS first
+       MATCH (t:Turn {uuid: first})
+       RETURN task.id AS id, task.title AS title, t.external AS external ORDER BY id`,
+    );
+    return rows.map((r) => ({ id: r.get('id'), title: r.get('title') ?? null, external: JSON.parse(r.get('external')) as ExternalRef }));
+  }
+
+  async setTaskTitle(id: string, title: string): Promise<boolean> {
+    const [r] = await this.g.run('MATCH (task:Task {id: $id}) SET task.title = $title RETURN count(task) AS n', { id, title: redactSecrets(title) });
+    return Number(r?.get('n') ?? 0) > 0;
+  }
+
   async backfillProposedAs(id: string, draft: LessonDraft): Promise<boolean> {
     await archiveRedactionInput('lesson-draft', id, draftOf(draft), redactDeep(draftOf(draft)));
     const [r] = await this.g.run(
@@ -608,8 +629,29 @@ export class KnowledgeRepo implements KnowledgeStore {
 
   async setLessonTriggers(id: string, triggers: LessonTriggers): Promise<boolean> {
     const [r] = await this.g.run(
-      `MATCH (l:Lesson {id: $id}) WHERE l.triggers IS NULL AND l.status IN ['proposed', 'approved'] SET l.triggers = $triggers RETURN count(l) AS n`,
-      { id, triggers: JSON.stringify(redactDeep(triggers)) },
+      `MATCH (l:Lesson {id: $id}) WHERE l.triggers IS NULL AND l.status IN ['proposed', 'approved'] SET l.triggers = $triggers, l.triggersVersion = $version RETURN count(l) AS n`,
+      { id, triggers: JSON.stringify(redactDeep(triggers)), version: neo4j.int(TRIGGER_DERIVATION_VERSION) },
+    );
+    return Number(r.get('n')) > 0;
+  }
+
+  async lessonsWithOldTriggers(version: number, limit: number): Promise<Lesson[]> {
+    const rows = await this.g.run(
+      `MATCH (l:Lesson) WHERE l.triggers IS NOT NULL AND NOT coalesce(l.triggersOwned, false) AND coalesce(l.triggersVersion, 1) < $version
+         AND l.status IN ['proposed', 'approved'] AND NOT coalesce(l.sandbox, false)
+       OPTIONAL MATCH (l)-[:DERIVED_FROM]->(:Miss)-[:EXPLAINS]->(:Feedback)-[:FROM_TURN]->(t:Turn)
+       RETURN l, ${FROM} AS fromKind ORDER BY l.createdAt, l.id LIMIT $limit`,
+      { version: neo4j.int(version), limit: neo4j.int(limit) },
+    );
+    return rows.map((r) => lessonOf(r.get('l').properties, r.get('fromKind')));
+  }
+
+  async rederiveLessonTriggers(id: string, triggers: LessonTriggers, version: number): Promise<boolean> {
+    const [r] = await this.g.run(
+      `MATCH (l:Lesson {id: $id}) WHERE l.triggers IS NOT NULL AND NOT coalesce(l.triggersOwned, false) AND coalesce(l.triggersVersion, 1) < $version
+         AND l.status IN ['proposed', 'approved']
+       SET l.triggers = $triggers, l.triggersVersion = $version RETURN count(l) AS n`,
+      { id, triggers: JSON.stringify(redactDeep(triggers)), version: neo4j.int(version) },
     );
     return Number(r.get('n')) > 0;
   }

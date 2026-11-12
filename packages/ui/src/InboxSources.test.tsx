@@ -128,6 +128,24 @@ test('a card without a description shows no description section', () => {
   expect(screen.queryByText('Description')).toBeNull();
 });
 
+test('a comment on a pull request closed without merging carries the never-merged chip, in the detail and in the list; a merged one does not', async () => {
+  const closed = { ...external, threadState: 'closed' };
+  render(<CandidateDetail detail={detailOf(closed)} />);
+  expect(screen.getByText('PR never merged').closest('[title]')?.getAttribute('title')).toMatch(/closed without merging/);
+  cleanup();
+  render(<CandidateDetail detail={detailOf({ ...external, threadState: 'merged' })} />);
+  expect(screen.queryByText('PR never merged')).toBeNull();
+  cleanup();
+  list[1] = cand('g1', 'from the review', 'github', closed);
+  try {
+    render(<Inbox />);
+    const items = await screen.findByRole('list');
+    expect(await within(items).findByText('PR never merged')).toBeTruthy();
+  } finally {
+    list[1] = cand('g1', 'from the review', 'github', external);
+  }
+});
+
 test("an agent reviewing its own pull request is labelled self-review, in the detail and in the list", async () => {
   const self = { ...external, author: 'dev', threadAuthor: 'dev', authorKind: 'agent' };
   render(<CandidateDetail detail={detailOf(self)} />);

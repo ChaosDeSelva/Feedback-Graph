@@ -79,6 +79,7 @@ describe('runStartupPasses', () => {
       sortOldMisses: async () => { calls.push('misses'); return null; },
       migrateDeciders: async () => { calls.push('deciders'); },
       backfillProposedAs: async () => { calls.push('proposedAs'); },
+      repairs: async () => { calls.push('repairs'); },
       evidence: { load: async () => { calls.push('evidence load'); }, atStart: async () => { calls.push('evidence atStart'); } },
       reconcileDecisions: async () => { calls.push('decisions'); return { applied: 0, proposed: 0, overridden: 0 }; },
       ...over,
@@ -89,7 +90,7 @@ describe('runStartupPasses', () => {
   test('run in order: the redaction pass before Ask answers start, the evidence gate last', async () => {
     const f = passes();
     await runStartupPasses(f.d);
-    expect(f.calls).toEqual(['decisions', 'redact', 'chats', 'skips', 'misses', 'deciders', 'proposedAs', 'evidence load', 'evidence atStart']);
+    expect(f.calls).toEqual(['decisions', 'redact', 'chats', 'skips', 'misses', 'deciders', 'proposedAs', 'repairs', 'evidence load', 'evidence atStart']);
     expect(f.logs).toEqual([]);
   });
 
@@ -105,7 +106,7 @@ describe('runStartupPasses', () => {
 
   test('each failing pass is logged without secrets and the rest still run (it is tried again next start)', async () => {
     const boom = (what: string) => async () => { throw new Error(`${what} failed: Authorization: Bearer sk-ant-abcdefghijklmnopqrstuvwxyz0123456789`); };
-    const f = passes({ reconcileDecisions: boom('decisions'), redactStored: boom('redact'), skipPending: boom('skip'), sortOldMisses: boom('miss'), migrateDeciders: boom('decider'), backfillProposedAs: boom('draft') });
+    const f = passes({ reconcileDecisions: boom('decisions'), redactStored: boom('redact'), skipPending: boom('skip'), sortOldMisses: boom('miss'), migrateDeciders: boom('decider'), backfillProposedAs: boom('draft'), repairs: boom('repairs') });
     await runStartupPasses(f.d);
     expect(f.calls).toEqual(['chats', 'evidence load', 'evidence atStart']);
     expect(f.logs.map((l) => l.msg)).toEqual([
@@ -115,6 +116,7 @@ describe('runStartupPasses', () => {
       'process-miss rule over past misses failed',
       'lesson decider rule failed',
       "writer's draft backfill failed",
+      'one-off repairs failed',
     ]);
     for (const l of f.logs) expect(JSON.stringify(l)).not.toContain('sk-ant-abcdefghijklmnopqrstuvwxyz0123456789');
   });

@@ -388,3 +388,13 @@ test("a running worker whose heartbeat is older than three beats fails; one that
   expect(late.out).toMatch(/^FAIL {2}worker heartbeat: none for 3\d\ds \(it beats every 30s\)/m);
   expect((await doctor({ status: { worker: null } })).out).toContain('WARN  worker heartbeat: none reported yet');
 });
+
+test('a scan failed after a day parked on its model fails the check with the reason; one parked now is a warning', async () => {
+  const gaveUp = { projectKey: 'tiny-app', at: '2026-11-12T00:00:00Z', error: 'gave up after more than 24 hours parked on codex-cli (since 2026-11-11T00:00:00Z): cannot reach the codex runner.' };
+  const parked = { projectKey: 'side-tool', provider: 'codex-cli', since: '2026-11-12T08:00:00Z', error: 'scan parked on codex-cli: cannot reach the codex runner.' };
+  const failed = await doctor({ status: { scans: { parked: [parked], gaveUp: [gaveUp] } } });
+  expect(failed.out).toContain(`FAIL  Scan: tiny-app: ${gaveUp.error}`);
+  expect(failed.out).toContain('WARN  Scan: side-tool parked on codex-cli since 2026-11-12T08:00:00Z: a scan parked for 24 hours is failed');
+  expect(failed.code).toBe(1);
+  expect((await doctor({ status: { scans: { parked: [], gaveUp: [] } } })).out).toContain('PASS  Scans: none parked on an unavailable model');
+});

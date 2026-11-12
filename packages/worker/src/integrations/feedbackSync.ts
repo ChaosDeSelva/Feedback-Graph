@@ -168,7 +168,7 @@ export function prThread(pr: PrContext, floorMs: number, linked: string[], login
         source: 'github', kind: c.kind, author: c.author, url: c.url, thread: `${pr.repo}#${pr.number}`, title: pr.title, threadUrl: pr.url,
         path: c.path, line: c.line, diffHunk: c.diffHunk, branch: pr.headBranch, createdAt: c.createdAt, linkedSessionIds: linked,
         description: body, threadState: pr.state,
-        ...author('github', c.author, c.body, logins), threadAuthor: pr.author, isReply: !!c.inReplyTo, repliesTo: c.inReplyTo ? authorOf.get(c.inReplyTo) ?? null : null, reviewState: c.reviewState ?? null,
+        ...author('github', c.author, c.body, logins), threadAuthor: pr.author, isReply: !!c.inReplyTo, repliesTo: c.inReplyTo ? c.repliesTo ?? authorOf.get(c.inReplyTo) ?? null : null, reviewState: c.reviewState ?? null,
         ...(folded && { foldedInto: uuidOf(folded) }),
         ...(files && { prFiles: files }),
       };

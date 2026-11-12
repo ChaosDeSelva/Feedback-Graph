@@ -4,6 +4,7 @@ import { describeStores, type StoreProbe } from '../testing/index.ts';
 import type { Classification, ParsedSession, PostMortem, Project } from '../types.ts';
 import { MAX_POSTMORTEM_ATTEMPTS } from './knowledge.ts';
 import { LESSON_CHECKS_VERSION } from '../types.ts';
+import { TRIGGER_DERIVATION_VERSION } from '../lessonTriggers.ts';
 
 const project: Project = { key: 'demo', name: 'demo', repoPath: '/vibe/demo' };
 const pushback: Classification = { label: 'pushback', confidence: 0.9, summary: 's', signals: [] };
@@ -370,6 +371,10 @@ describeStores('KnowledgeStore', (h) => {
       expect((await k.lessonDetail(l.id))?.lesson.decisionNote).toBe('converted to a fact');
       await k.updateLesson(l.id, { status: 'proposed' }, {});
       expect((await k.lessonDetail(l.id))?.lesson.decisionNote ?? null).toBeNull();
+      // An edit given a note says why: it is the lesson's note, its status and decider left as they were.
+      const before = (await k.lessonDetail(l.id))!.lesson;
+      await k.updateLesson(l.id, { appliesWhen: 'editing the checkout' }, { by: 'you', note: 'narrowed: only the checkout reads it' });
+      expect((await k.lessonDetail(l.id))?.lesson).toMatchObject({ status: 'proposed', decidedBy: before.decidedBy ?? null, decisionNote: 'narrowed: only the checkout reads it' });
     });
 
     test('updateLesson records who decided: an agent with the operator token, until you decide again', async () => {
@@ -933,6 +938,29 @@ describeStores('KnowledgeStore', (h) => {
       const todo = (await k.lessonsWithoutTriggers!(100)).map((l) => l.id);
       expect(todo).not.toContain('lesson:tr');
       expect(todo).not.toContain('lesson:tp');
+    });
+
+    test('triggers derived by an older version are listed and derived again once; new ones, the owner\'s and other statuses never', async () => {
+      // Stored before the version was (upsertLesson, as an import does): read as version 1.
+      await k.upsertLesson(one('lesson:old', 'approved', { triggers }));
+      await k.upsertLesson(one('lesson:oldp', 'proposed', { triggers }));
+      await k.upsertLesson(one('lesson:oldr', 'rejected', { triggers }));
+      await k.upsertLesson(one('lesson:mine', 'approved', { triggers }));
+      await k.updateLesson('lesson:mine', { triggers }, { by: 'you' });
+      await k.upsertLesson(one('lesson:new', 'approved'));
+      await k.setLessonTriggers!('lesson:new', triggers);
+      const a = await confirmedFeedback('trig-v');
+      await k.savePostmortem(a, pm({ lesson: { ...pm().lesson, triggers } }), { miss: vec(1), lesson: vec(2) });
+      const old = async () => (await k.lessonsWithOldTriggers!(TRIGGER_DERIVATION_VERSION, 100)).map((l) => l.id).sort();
+      expect(await old()).toEqual(['lesson:old', 'lesson:oldp']);
+      const narrow = { paths: ['db/migrations/*.sql'], patterns: [], symbols: [] };
+      expect(await k.rederiveLessonTriggers!('lesson:old', narrow, TRIGGER_DERIVATION_VERSION)).toBe(true);
+      expect(await k.rederiveLessonTriggers!('lesson:old', narrow, TRIGGER_DERIVATION_VERSION)).toBe(false);
+      expect(await k.rederiveLessonTriggers!('lesson:mine', narrow, TRIGGER_DERIVATION_VERSION)).toBe(false);
+      expect(await k.rederiveLessonTriggers!('lesson:oldr', narrow, TRIGGER_DERIVATION_VERSION)).toBe(false);
+      expect(await lessonOf('lesson:old')).toMatchObject({ triggers: narrow, status: 'approved', rule: 'r' });
+      expect((await lessonOf('lesson:mine')).triggers).toEqual(triggers);
+      expect(await old()).toEqual(['lesson:oldp']);
     });
 
     test('the owner edits them like the rest of the lesson, and that is not an edit of its words', async () => {

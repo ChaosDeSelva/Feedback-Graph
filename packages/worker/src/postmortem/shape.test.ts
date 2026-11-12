@@ -16,6 +16,12 @@ test('stripRefs takes pull request and issue numbers out of a rule, leaving a se
   expect(stripRefs('Use #fff in theme.ts and link to README.md#setup')).toBe('Use #fff in theme.ts and link to README.md#setup');
 });
 
+test('stripRefs keeps the space before a dot-path or a dotted name it tidies around', () => {
+  expect(stripRefs('In .agents/skills keep one skill per folder (PR #12)')).toBe('In .agents/skills keep one skill per folder');
+  expect(stripRefs('Read the token from .env.local , not the shell, as PR #4 does')).toBe('Read the token from .env.local, not the shell');
+  expect(stripRefs('Load it with .loadConfig() per PR #3 :')).toBe('Load it with .loadConfig():');
+});
+
 test('a title that repeats the rule becomes a short name; one that names the rule stays', () => {
   const same = shapeLesson(lesson({ title: 'Rewrite self-closing <chart /> tags to paired tags in pipeline.ts before rehype-raw parses them' }), { taskTitle: 'Chart embeds' });
   expect(same.lesson.title).toBe('Rewrite self-closing <chart /> tags to paired tags in…');

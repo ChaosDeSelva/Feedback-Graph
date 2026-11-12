@@ -102,6 +102,13 @@ test('before the worker has built the list, the folders on disk are still offere
   expect(body.builtAt).toBeNull();
   expect(body.candidates.map((c: { key: string }) => c.key)).toEqual(['brand-new', 'client', 'demo-shop', 'old-one']);
   expect(body.outsideRoots).toEqual({ claudeSessions: 0, codexSessions: 0, folders: [] });
+  expect(body.atRoots).toEqual([]);
+});
+
+test('GET passes on the sessions that only ran in a folder holding the projects', async () => {
+  const atRoots = [{ path: '/Users/me/Vibe', claudeSessions: 3, codexSessions: 0 }];
+  const { app } = setup({ snapshot: { ...snapshot, atRoots } });
+  expect((await (await app.request('/api/settings/projects')).json()).atRoots).toEqual(atRoots);
 });
 
 test('PUT is yours alone: from the UI, as JSON', async () => {

@@ -45,8 +45,14 @@ export function overlap(a: Set<string>, b: Set<string>): number {
 export type OwnerStatement = { text: string; projectKey: string; source: string; entry: Activity; role: 'owner note' | 'owner edit'; words: Set<string> };
 
 const sentences = (text: string) => text.split(/(?<=[.!?;])\s+|\n+/).map((s) => s.trim()).filter((s) => s.length >= SENTENCE.min && s.length <= SENTENCE.max);
+/**
+ * A note's sentences are each judged; a rule or "applies when" the owner edited only as a whole: a rule that says what
+ * to do ("Use the money helpers. Orders are stored in cents.") is a rule, though one of its sentences states a fact.
+ */
 const statements = (text: string, o: Omit<OwnerStatement, 'text' | 'words'>): OwnerStatement[] =>
-  sentences(text).filter(statesAFact).map((t) => ({ ...o, text: t, words: words(t) })).filter((s) => s.words.size >= MIN_WORDS);
+  o.role === 'owner edit' && !statesAFact(text)
+    ? []
+    : sentences(text).filter(statesAFact).map((t) => ({ ...o, text: t, words: words(t) })).filter((s) => s.words.size >= MIN_WORDS);
 
 /** An Activity entry the owner made (not an operator, not the loop). */
 const byOwner = (e: Activity) => e.actor === 'you';

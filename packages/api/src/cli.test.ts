@@ -418,9 +418,10 @@ test('status prints every queue: how many wait, the oldest wait, what runs now a
 });
 
 test('status says how many files an older scanner read, and that a scan you start refreshes them', async () => {
-  const f = fake({ 'GET /api/status': () => ({ json: idle }), 'GET /api/pipeline': () => pipeline({ scans: { done: 3, queued: 0, running: 0, failed: 0, never: 0, olderScanner: { files: 15, projects: { acme: 12, web: 3 } } } }) });
+  const f = fake({ 'GET /api/status': () => ({ json: idle }), 'GET /api/pipeline': () => pipeline({ scans: { done: 3, queued: 0, running: 0, failed: 0, never: 0, olderScanner: { files: 15, projects: { acme: 12, web: 3 } }, neverScanned: { files: 1, projects: { web: 1 } } } }) });
   expect(await run(['status'], f.io)).toBe(0);
   expect(f.text()).toMatch(/scanner\s+15 files were read by an older scanner \(acme 12, web 3\): press Scan on the Projects page \(or fg scan <project>\) to refresh them/);
+  expect(f.text()).toMatch(/scanner\s+1 file has no scanner version recorded \(web 1\): press Scan on the Projects page \(or fg scan <project>\) to read it with this scanner/);
   const none = fake({ 'GET /api/status': () => ({ json: idle }), 'GET /api/pipeline': () => pipeline() });
   await run(['status'], none.io);
   expect(none.text()).not.toMatch(/older scanner/);
@@ -934,9 +935,9 @@ test('lessons quality and status say how many of the decisions an agent made wit
   });
   expect(await run(['lessons', 'quality'], f.io)).toBe(0);
   expect(f.text()).toMatch(/PROJECT\s+DAYS\s+DECIDED\s+AS WRITTEN\s+AFTER EDIT\s+REJECTED\s+BY OPERATOR/);
-  expect(f.text()).toMatch(/all\s+30\s+142\s+81 \(57%\)\s+0 \(0%\)\s+61 \(43%\)\s+40 \(28%\)/);
+  expect(f.text()).toMatch(/all\s+30\s+142\s+81 \(57%\)\s+0 \(0%\)\s+61 \(43%\)\s+40\b/);
   expect(await run(['status'], f.io)).toBe(0);
-  expect(f.text()).toMatch(/61 rejected \(43%\); 40 of them by an agent with the operator token/);
+  expect(f.text()).toMatch(/61 rejected \(43%\); 40 more by an agent with the operator token, not counted/);
   // None by an operator: not mentioned in status.
   const mine = fake({ 'GET /api/status': () => ({ json: idle }), 'GET /api/pipeline': () => pipeline({ lessons: { proposed: 0, approved: 0, quality: [op(quality(30, 1, 0, 0), 0)] } }) });
   expect(await run(['status'], mine.io)).toBe(0);

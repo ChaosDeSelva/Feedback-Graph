@@ -39,6 +39,8 @@ export type ProjectSettings = {
   candidates: ProjectCandidate[];
   /** Sessions outside every root, and the folders they ran in that could be added as roots (none already chosen). */
   outsideRoots: { claudeSessions: number; codexSessions: number; folders: OutsideFolder[] };
+  /** Sessions that only ever ran in a root itself or a folder above one, by that folder: none of their turns is read. */
+  atRoots: OutsideFolder[];
   roots: string[];
   /** Roots saved in Settings that differ from the mounted ones: they take effect once ./scripts/setup.sh is run. */
   pendingRoots: string[] | null;
@@ -103,6 +105,7 @@ async function settingsBody(d: SettingsDeps): Promise<ProjectSettings> {
       codexSessions: out?.codexSessions ?? 0,
       folders: (out?.folders ?? []).filter((f) => !chosen.some((r) => within(f.path, r))),
     },
+    atRoots: snap?.atRoots ?? [],
     roots: snap?.roots ?? d.roots,
     pendingRoots: saved && !sameSet(saved.roots, d.roots) ? saved.roots : null,
     rootsEditable: !!d.savedRoots,

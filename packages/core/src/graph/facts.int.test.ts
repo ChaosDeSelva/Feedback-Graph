@@ -371,6 +371,16 @@ describeStores('FactsStore', (h) => {
     expect((await f.nextScanJob(new Date('2026-10-29T10:01:59Z')))?.id).toBe(job.id);
   });
 
+  test('a parked scan keeps when it was first parked until cleared', async () => {
+    const job = await f.requestScan({ key: 'demo', name: 'demo', repoPath: '/vibe/demo' }, null);
+    expect((await f.scanJob(job.id))?.parkedAt).toBeNull();
+    await f.updateScanJob(job.id, { error: 'scan parked on codex-cli: down.', retryAt: '2026-10-29T10:02:00.000Z', parkedAt: '2026-10-29T10:00:00.000Z' });
+    expect(await f.scanJob(job.id)).toMatchObject({ parkedAt: '2026-10-29T10:00:00.000Z', attempts: 0, status: 'queued' });
+    expect((await f.scanQueue())[0].parkedAt).toBe('2026-10-29T10:00:00.000Z');
+    await f.updateScanJob(job.id, { error: null, retryAt: null, parkedAt: null });
+    expect(await f.scanJob(job.id)).toMatchObject({ parkedAt: null, error: null, retryAt: null });
+  });
+
   test('queued cancellation and worker claiming are atomic and cannot revive each other', async () => {
     const project = { key: 'demo', name: 'demo', repoPath: '/vibe/demo' };
     const first = await f.requestScan(project, 'codex-cli');
@@ -417,15 +427,15 @@ describeStores('FactsStore', (h) => {
     expect((await f.fileScanVersions('demo')).get('lib/c.ts')).toBe('scan-v6');
   });
 
-  test('olderScannerFiles counts, per project, the scanned files another scanner read (null included), not removed ones', async () => {
+  test('olderScannerFiles counts, per project, the scanned files another scanner read apart from those no scanner version was recorded for, not removed ones', async () => {
     await f.saveFileFacts('demo', { path: 'src/a.ts', hash: 'h', summary: '', version: 'scan-v6' }, [fact('x')], 'p');
     await f.saveFileFacts('demo', { path: 'src/old.ts', hash: 'h', summary: '' }, [fact('y', 'src/old.ts')], 'p');
     await f.saveFileFacts('demo', { path: 'src/v5.ts', hash: 'h', summary: '', version: 'scan-v5' }, [fact('z', 'src/v5.ts')], 'p');
     await f.saveFileFacts('demo', { path: 'src/gone.ts', hash: 'h', summary: '', version: 'scan-v5' }, [fact('g', 'src/gone.ts')], 'p');
     await f.markFilesRemoved('demo', ['src/gone.ts']);
     await f.saveFileFacts('web', { path: 'a.ts', hash: 'h', summary: '', version: 'scan-v6' }, [fact('w', 'a.ts')], 'p');
-    expect(await f.olderScannerFiles('scan-v6')).toEqual(new Map([['demo', 2]]));
-    expect(await f.olderScannerFiles('scan-v5')).toEqual(new Map([['demo', 2], ['web', 1]]));
+    expect(await f.olderScannerFiles('scan-v6')).toEqual(new Map([['demo', { older: 1, never: 1 }]]));
+    expect(await f.olderScannerFiles('scan-v5')).toEqual(new Map([['demo', { older: 1, never: 1 }], ['web', { older: 1, never: 0 }]]));
   });
 
   test('a fact carries when its file last changed: a rescan of the same content keeps the time, new content moves it', async () => {

@@ -35,7 +35,8 @@ export type DocSummary = DocInput & { id: string; addedAt: string; addedBy: stri
  * `version`: which upload of the document this is (its addedAt). The reader passes it back, so a reading of a version
  * replaced in the meantime (the same file uploaded again) is dropped instead of overwriting the new one.
  */
-export type DocToRead = { id: string; projectKey: string; ref: string; title: string; kind: DocKind; text: string; image: TaskImage | null; attempts: number; version: string };
+/** run, sandbox: the run it was uploaded in (UpsertDocOpts.run), so what reading it records is that run's too; absent when none. */
+export type DocToRead = { id: string; projectKey: string; ref: string; title: string; kind: DocKind; text: string; image: TaskImage | null; attempts: number; version: string; run?: string; sandbox?: true };
 /**
  * read: queue it to be read into facts (uploads). image: the upload is this image (stored for the reader and the
  * thumbnail). tickets: the Linear identifiers a pull request names (ticketIdsIn), linking it to those tickets' documents
@@ -133,7 +134,7 @@ export class DocsRepo implements DocsStore {
     const p = r.get('d').properties;
     const b = r.get('b')?.properties;
     const image = b ? { mediaType: b.mediaType, data: b.data } : null;
-    return { id: p.id, projectKey: p.projectKey, ref: p.ref, title: p.title, kind: p.kind ?? 'text', text: image ? '' : r.get('texts').join('\n\n'), image, attempts: Number(p.readAttempts ?? 0), version: p.addedAt };
+    return { id: p.id, projectKey: p.projectKey, ref: p.ref, title: p.title, kind: p.kind ?? 'text', text: image ? '' : r.get('texts').join('\n\n'), image, attempts: Number(p.readAttempts ?? 0), version: p.addedAt, ...(p.run && { run: p.run }), ...(p.sandbox === true && { sandbox: true as const }) };
   }
 
   async markDocReading(id: string, version?: string): Promise<boolean> {

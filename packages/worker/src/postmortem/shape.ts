@@ -28,7 +28,8 @@ const REFS: [RegExp, string][] = [
 export function stripRefs(text: string): string {
   let s = text;
   for (const [re, by] of REFS) s = s.replace(re, by);
-  s = s.replace(/\s{2,}/g, ' ').replace(/\s+([,.;:])/g, '$1').replace(/,(?=[.;:]|$)/g, '').replace(/^[\s,;:]+/, '').trim();
+  // Only punctuation that ends a clause loses the space before it: "In .agents/skills" keeps its dot-path.
+  s = s.replace(/\s{2,}/g, ' ').replace(/\s+([,.;:])(?=\s|$)/g, '$1').replace(/,(?=[.;:]|$)/g, '').replace(/^[\s,;:]+/, '').trim();
   return s && s !== text ? s[0].toUpperCase() + s.slice(1) : s;
 }
 

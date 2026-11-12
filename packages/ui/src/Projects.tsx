@@ -328,6 +328,9 @@ export function Projects({ pollMs = 5000 }: { pollMs?: number } = {}) {
                       {current.lastScan.attempts ? ` (attempt ${current.lastScan.attempts + 1})` : ''}
                     </span>
                   )}
+                  {current.lastScan.status === 'queued' && current.lastScan.parkedAt && (
+                    <span className="text-muted">parked since {new Date(current.lastScan.parkedAt).toLocaleString()}; failed after 24 hours if its model still does not answer</span>
+                  )}
                   {current.lastScan.error && <div className="w-full text-bad-text">{scanErrorText(current.lastScan.error)}</div>}
                 </div>
               )}
@@ -337,6 +340,12 @@ export function Projects({ pollMs = 5000 }: { pollMs?: number } = {}) {
                 <div className="rounded-md border border-line bg-surface px-3 py-2 text-xs text-muted shadow-card" title="The scanner's prompt or reader changed since these files were read; their facts stay served until a scan reads them again">
                   {current.olderScanner === 1 ? '1 file was' : `${current.olderScanner} files were`} read by an older scanner:{' '}
                   {scanning ? `the scan under way refreshes ${current.olderScanner === 1 ? 'it' : 'them'}.` : `press Scan to refresh ${current.olderScanner === 1 ? 'it' : 'them'}.`}
+                </div>
+              )}
+              {!!current.neverScanned && (
+                <div className="rounded-md border border-line bg-surface px-3 py-2 text-xs text-muted shadow-card" title="No scanner version is recorded for these files: a scan before versions were kept read them, or none did; their facts stay served until a scan reads them">
+                  {current.neverScanned === 1 ? '1 file has' : `${current.neverScanned} files have`} no scanner version recorded (read before versions were kept, or never by a scan):{' '}
+                  {scanning ? `the scan under way reads ${current.neverScanned === 1 ? 'it' : 'them'}.` : `press Scan to read ${current.neverScanned === 1 ? 'it' : 'them'} with this scanner.`}
                 </div>
               )}
 

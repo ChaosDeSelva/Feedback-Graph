@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { api, type Candidate, type CandidateDetail as Detail, type CandidateStatus, type FeedbackSource, errorMessage } from './api.ts';
-import { isSelfReview } from '@fb/core/feedback-rules';
-import { AGENT_REPORT_TITLE, agentReportOnly, SelfReviewBadge, SOURCE_LABEL, SourceBadge } from './CandidateDetail.tsx';
+import { isSelfReview, prNeverMerged } from '@fb/core/feedback-rules';
+import { AGENT_REPORT_TITLE, agentReportOnly, NeverMergedBadge, SelfReviewBadge, SOURCE_LABEL, SourceBadge } from './CandidateDetail.tsx';
 import { CandidateDetail } from './CandidateDetail.tsx';
 import { FirstRun } from './FirstRun.tsx';
 import { hashFocus, hashFilters, saveHashFilters } from './links.ts';
@@ -203,7 +203,7 @@ export function Inbox() {
                 <li key={c.id}>
                   <ListRow selected={i === selected} onClick={() => { setSelected(i); setOpen(true); }}>
                     <div className="flex items-center justify-between gap-2 text-xs text-muted">
-                      <span className="flex min-w-0 items-center gap-1.5"><SourceBadge source={c.source} />{c.external && isSelfReview(c.external) && <SelfReviewBadge />}<span className="truncate">{c.projectKey}</span></span>
+                      <span className="flex min-w-0 items-center gap-1.5"><SourceBadge source={c.source} />{c.external && isSelfReview(c.external) && <SelfReviewBadge />}{c.external && prNeverMerged(c.external) && <NeverMergedBadge />}<span className="truncate">{c.projectKey}</span></span>
                       {agentReportOnly(c)
                         ? <span title={AGENT_REPORT_TITLE}>agent report</span>
                         : <span className="tabular-nums" title="how sure the classifier is that this is pushback">{Math.round(c.classification.confidence * 100)}% sure</span>}

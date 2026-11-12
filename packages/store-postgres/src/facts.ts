@@ -4,7 +4,7 @@ import { randomUUID } from 'node:crypto';
 import type pg from 'pg';
 import { clampRelevance, DEMO_SOURCE, FACT_EVIDENCE, FACT_ORIGINS_KEPT, factOrigin, requestTimes, scanRequestPaths, MANIFEST_WHY_RE, PROJECT_PATH, provenanceOf, holdsCredential, REDACT_PAGE, redactDeep, redactSecrets, relevanceOf, SCAN_UNAVAILABLE_WAIT_MS, scanRetryAt, redactStoredFact, reopensAsFact } from '@fb/core';
 import { factFingerprint, factStateFingerprint, TargetChangedError, thresholdsSnapshot, type FactSnapshotWrite, type FingerprintedFact } from '@fb/core';
-import type { EmbeddedFact, FactCheck, FactHit, FactKind, FactOrigin, FactScope, FactsStore, OwnFactOrigin, Project, ScannedFile, ProjectSummary, RelevanceBy, ScanJob, ScanJobPatch, ScanQueueEntry, ScanStatus, StoredFact, RelevanceUpdate, UnscoredFact, RunTag, ProjectThresholds } from '@fb/core';
+import type { EmbeddedFact, FactCheck, FactHit, FactKind, FactOrigin, FactScope, FactsStore, OlderScanFiles, OwnFactOrigin, Project, ScannedFile, ProjectSummary, RelevanceBy, ScanJob, ScanJobPatch, ScanQueueEntry, ScanStatus, StoredFact, RelevanceUpdate, UnscoredFact, RunTag, ProjectThresholds } from '@fb/core';
 import { iso, toJson, toVector, tx, type Db } from './db.ts';
 import { runSearch, sandboxPresence, searchFactsQuery, visibleToRun } from './vector.ts';
 
@@ -50,14 +50,14 @@ export class PgFactsStore implements FactsStore {
     return new Map(rows.map((r) => [r.path, r.scan_version ?? null]));
   }
 
-  async olderScannerFiles(version: string): Promise<Map<string, number>> {
+  async olderScannerFiles(version: string): Promise<Map<string, OlderScanFiles>> {
     const { rows } = await this.db.pool.query(
-      `SELECT project_key, count(*)::int AS n FROM code_files
+      `SELECT project_key, count(scan_version)::int AS older, (count(*) - count(scan_version))::int AS never FROM code_files
        WHERE NOT removed AND path <> $2 AND hash IS NOT NULL AND scan_version IS DISTINCT FROM $1
        GROUP BY project_key`,
       [version, PROJECT_PATH],
     );
-    return new Map(rows.map((r) => [r.project_key, r.n]));
+    return new Map(rows.map((r) => [r.project_key, { older: r.older, never: r.never }]));
   }
 
   /** Replace the current facts of one file (old facts are closed, not deleted). */
@@ -479,10 +479,11 @@ export class PgFactsStore implements FactsStore {
          started_at = CASE WHEN $2::text = 'running' THEN $9 ELSE started_at END,
          finished_at = CASE WHEN $2::text IN ('done', 'failed') THEN $9 ELSE finished_at END,
          shards = CASE WHEN $10::boolean THEN $11::jsonb ELSE shards END,
-         retry_at = CASE WHEN $12::boolean THEN $13::timestamptz ELSE retry_at END
+         retry_at = CASE WHEN $12::boolean THEN $13::timestamptz ELSE retry_at END,
+         parked_at = CASE WHEN $14::boolean THEN $15::timestamptz ELSE parked_at END
        WHERE id = $1`,
       [id, status, has('filesScanned'), patch.filesScanned ?? null, has('factsAdded'), patch.factsAdded ?? null, has('error'), patch.error == null ? null : redactSecrets(patch.error), new Date(),
-        has('shards') && patch.shards !== undefined, patch.shards ? toJson(patch.shards) : null, has('retryAt'), patch.retryAt ?? null],
+        has('shards') && patch.shards !== undefined, patch.shards ? toJson(patch.shards) : null, has('retryAt'), patch.retryAt ?? null, has('parkedAt'), patch.parkedAt ?? null],
     );
   }
 
@@ -638,5 +639,6 @@ function jobOf(r: Record<string, any>): ScanJob {
     retryAt: t(r.retry_at),
     shards: r.shards ?? null,
     servedAt: t(r.served_at),
+    parkedAt: t(r.parked_at),
   };
 }

@@ -126,6 +126,25 @@ describe('health and status', () => {
     expect(s.ownerSetupRequired).toBe(true);
   });
 
+  test('status lists the selected projects whose last scan is parked on its model or was failed after a day of it', async () => {
+    const scan = (o: object) => ({ id: 's', provider: null, status: 'queued', requestedAt: 't', startedAt: null, finishedAt: null, filesScanned: 0, factsAdded: 0, error: null, attempts: 0, retryAt: null, ...o });
+    const projects = [
+      { key: 'a', lastScan: scan({ error: 'scan parked on codex-cli: cannot reach the codex runner.', parkedAt: '2026-11-12T08:00:00.000Z' }) },
+      { key: 'b', lastScan: scan({ status: 'failed', finishedAt: '2026-11-12T09:00:00.000Z', error: 'gave up after more than 24 hours parked on codex-cli (since x): down.' }) },
+      { key: 'c', lastScan: scan({ status: 'failed', error: 'Error: boom' }) },
+      { key: 'hidden', lastScan: scan({ error: 'scan parked on codex-cli: down.' }) },
+    ];
+    const app = createApp(repo(), {
+      system: { version: 'v', ping: async () => true, worker: async () => worker(), selection: async () => ({ initialized: true, tracked: ['a', 'b', 'c'] }) } as never,
+      facts: { listProjects: async () => projects, requestScan: async () => {}, listFacts: async () => [], searchFacts: async () => [] } as never,
+    });
+    const s = await (await app.request('/api/status')).json();
+    expect(s.scans).toEqual({
+      parked: [{ projectKey: 'a', provider: 'codex-cli', since: '2026-11-12T08:00:00.000Z', error: 'scan parked on codex-cli: cannot reach the codex runner.' }],
+      gaveUp: [{ projectKey: 'b', at: '2026-11-12T09:00:00.000Z', error: 'gave up after more than 24 hours parked on codex-cli (since x): down.' }],
+    });
+  });
+
   test('pipeline for a project with no selection to narrow it, a stage with no current item, and an unanswered inbox', async () => {
     const app = createApp(repo({ listCandidates: async () => { throw new Error('down'); } }), {
       system: { version: 'v', ping: async () => true, worker: async () => worker({ stage: { name: 'classify', current: null, startedAt: 't' }, backlog: { classify: 3, classifyCapped: false, oldestAt: null } } as never) } as never,

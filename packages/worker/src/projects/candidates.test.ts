@@ -229,3 +229,21 @@ test('at most eight suggested folders', async () => {
   const snap = await buildCandidates({ roots: [], files, state: new FileState(':memory:'), codexSessionsFound: true });
   expect(snap.outsideRoots.folders?.map((f) => f.path)).toEqual(Array.from({ length: 8 }, (_, i) => `/srv/area${String(i).padStart(2, '0')}`));
 });
+
+test('a Claude Code session started in the root that moved into a project is that project\'s; one that never left the root is said apart', async () => {
+  const base = mkdtempSync(join(tmpdir(), 'fb-cand-root-'));
+  const vibe = join(base, 'vibe');
+  mkdirSync(join(vibe, 'demo-shop'), { recursive: true });
+  const line = (cwd: string, text: string) => JSON.stringify({ type: 'user', sessionId: 's', cwd, timestamp: '2026-10-01T10:00:00Z', message: { content: text } }) + '\n';
+  const moved = join(base, 'moved.jsonl');
+  writeFileSync(moved, line(vibe, 'which folder has the cart?') + line(join(vibe, 'demo-shop'), 'fix the cart total'));
+  const stayed = join(base, 'stayed.jsonl');
+  writeFileSync(stayed, line(vibe, 'list my projects'));
+  const files = [moved, stayed].map((path) => ({ path, size: statSync(path).size, mtimeMs: 1, source: 'claude' as const }));
+  const snap = await buildCandidates({ roots: [{ host: vibe, container: vibe }], files, state: new FileState(':memory:'), codexSessionsFound: false });
+  expect(snap.folderOf.get(moved)).toBe('demo-shop');
+  expect(snap.candidates.find((c) => c.key === 'demo-shop')?.claudeSessions).toBe(1);
+  expect(snap.folderOf.get(stayed)).toBeNull();
+  expect(snap.atRoots).toEqual([{ path: vibe, claudeSessions: 1, codexSessions: 0 }]);
+  expect(snap.outsideRoots).toMatchObject({ claudeSessions: 0, codexSessions: 0 });
+});

@@ -421,6 +421,18 @@ else
     '?':*) skip "Code maps: the api status response could not be read" ;;
     *) fail "Code maps: $count project(s) have a failed or interrupted rebuild$down_note; open their Code map cards or run fg status for details" ;;
   esac
+  # A scan parked for more than a day on a model that fails its readiness probe is failed with the reason (scan/runner.ts).
+  scans="$(printf '%s' "$status" | node -e 'let s="";process.stdin.on("data",c=>s+=c).on("end",()=>{const x=JSON.parse(s).scans;if(!x){console.log("?");return}for(const j of x.gaveUp)console.log(`F ${j.projectKey}: ${j.error}`);for(const j of x.parked)console.log(`W ${j.projectKey} parked on ${j.provider}${j.since?` since ${j.since}`:""}`)})' 2>/dev/null || echo '?')"
+  if [ "$scans" = '?' ]; then skip "Scans: the api status response does not list parked scans"
+  elif [ -z "$scans" ]; then pass "Scans: none parked on an unavailable model"
+  else
+    while IFS= read -r line; do
+      case "$line" in
+        F\ *) fail "Scan: ${line#F }" ;;
+        W\ *) warn "Scan: ${line#W }: a scan parked for 24 hours is failed, so fix the model or choose another one (SCAN_LLM)" ;;
+      esac
+    done <<<"$scans"
+  fi
   connection github GitHub
   connection linear Linear
   # The worker beats every 30 s; one running but silent for 90 s (three beats) is hung, or its store write fails.

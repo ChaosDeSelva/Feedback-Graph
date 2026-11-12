@@ -150,6 +150,18 @@ test('a first pass maps each selected project, with test links and churn, and lo
   })]);
 });
 
+test('each build hands the map it replaced and the new one to what checks the approved lessons; a failure there is only logged', async () => {
+  const seen: [string, number | null, number][] = [];
+  const f = fakes({ onMapped: async (p, before, after) => { seen.push([p.key, before ? before.symbols.length : null, after.symbols.length]); throw new Error('boom'); } });
+  const stage = new MapStage(f.deps);
+  await stage.pass();
+  // A rebuild from scratch (forced) still compares with the map it replaces.
+  await stage.mapProject({ key: 'demo', repoPath: '/vibe/demo' }, 'you asked', { force: true });
+  expect(seen).toEqual([['demo', null, 1], ['demo', 1, 1]]);
+  expect(f.logs).toContain('lessons not checked against the new code map');
+  expect(f.writes).toHaveLength(2);
+});
+
 test('a capped map says so: candidates are stored and logged, and files sessions edited are kept first', async () => {
   const opts: BuildOpts[] = [];
   const logged: [string, object | undefined][] = [];

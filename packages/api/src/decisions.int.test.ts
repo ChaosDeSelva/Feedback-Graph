@@ -67,6 +67,17 @@ describeStores('learning loop api', (h) => {
     expect(after).toEqual({ events: [], next: events.next, gap: false });
   });
 
+  test('a rollback\'s note is kept on the decision: in its rollback and as a note with the reason, like a reject\'s', async () => {
+    const a = app();
+    const d = await approveDecision(await lesson('lesson:int-note'));
+    await post(a, `/api/decisions/${encodeURIComponent(d.id)}/approve`, { expect: 'proposed' });
+    const back = await post(a, `/api/decisions/${encodeURIComponent(d.id)}/rollback`, { expect: 'applied', reason: 'too_broad', note: 'it applies to the billing folder only' });
+    expect(await back.json()).toMatchObject({ status: 'rolled_back', rollback: { reason: 'too_broad', note: 'it applies to the billing folder only' } });
+    const detail = await (await a.request(`/api/decisions/${encodeURIComponent(d.id)}`)).json();
+    expect(detail.decision.rollback).toMatchObject({ note: 'it applies to the billing folder only' });
+    expect(detail.notes).toEqual([expect.objectContaining({ by: 'you', text: 'it applies to the billing folder only', verdict: 'disagree', reason: 'too_broad' })]);
+  });
+
   test('a rollback after the owner changed the target is refused and the decision overridden; Restore anyway writes before over the change', async () => {
     const a = app();
     const l = await lesson('lesson:int2');

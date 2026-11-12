@@ -30,13 +30,15 @@ const mayHoldSecret = (l: Lesson) => [l.title, l.rule, l.appliesWhen].some((t) =
  * it, the matched session: the post-mortem's own redo or the session re-match, not a re-check's reading of the miss) or
  * by the model, neither of which is stored with the lesson; or a repair already applied to the lesson (a dropped path);
  * or no-miss, which only a post-mortem's own words raise. broken-rule (the title used as the rule) and
- * example-applies-when (the examples shown are not stored) only while the lesson is the writer's, as the post-mortem
- * left it: once the owner edited or decided it, it is judged as it is now.
+ * example-applies-when (the examples shown are not stored) and off-turn (the model's answer is not stored) only while the
+ * lesson is the writer's, as the post-mortem left it: once the owner edited or decided it, it is judged as it is now.
  */
 const kept = (l: Lesson) => (c: LessonCheck) =>
   (c.name === 'wrong-session' && c.why !== RECHECK_WRONG_SESSION_WHY) || c.name === 'self-review' || c.name === 'no-miss' || c.name === 'non-repo-path' ||
-  ((c.name === 'broken-rule' || c.name === 'example-applies-when') && l.status === 'proposed' && !l.proposedAs) || c.name === 'contradicts-evidence' ||
+  ((c.name === 'broken-rule' || c.name === 'example-applies-when' || c.name === 'off-turn') && l.status === 'proposed' && !l.proposedAs) || c.name === 'contradicts-evidence' ||
   (c.name === 'may-hold-secret' && mayHoldSecret(l)) ||
+  // Raised by the trigger derivation and the code map's re-check, which keep them current themselves.
+  c.name === 'broad-trigger' || c.name === 'code-changed' ||
   (c.name === 'looks-like-a-fact' && c.why === MODEL_FACT_WHY);
 
 /**

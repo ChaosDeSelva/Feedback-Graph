@@ -2,7 +2,7 @@ import { feedbackSkipRule, hostRepoPath, isSelfReview, modelTimeoutReason, provi
 import { gitEvidence } from './detect/instruction.ts';
 import { prefilterPushback } from './detect/prefilter.ts';
 import { codexSessionParser } from './ingest/codex.ts';
-import { conversationFingerprint } from './ingest/fingerprint.ts';
+import { conversationFingerprint, turnHash } from './ingest/fingerprint.ts';
 import type { commitsInWindow } from './ingest/git.ts';
 import { parseTranscript } from './ingest/parseTranscript.ts';
 import { projectFromCwd, type Project, type Root } from '@fb/core';
@@ -54,6 +54,8 @@ export type CycleDeps = {
   activity?: Pick<ActivityStore, 'record'>;
   /** How many turns the graph holds for a session, null when it has none (SessionsStore.detail): see codexCopyOf. */
   storedTurns?: (sessionId: string) => Promise<number | null>;
+  /** The turns the graph holds for a session (id, time, text): a re-read Codex turn keeps its stored id (stableIds). */
+  storedTurnIds?: (sessionId: string) => Promise<{ uuid: string; ts: string; text: string }[]>;
   /** A folder's canonical git remote (projectRemote). Without it and `projects`, projects are folders only. */
   remote?: (repoPath: string) => Promise<string | null>;
   projects?: Pick<GraphStore, 'canonicalProject' | 'projectsMissingFolder' | 'fillProjectFolder'>;
@@ -153,10 +155,47 @@ async function recordTouchedFiles(s: ParsedSession, deps: CycleDeps, log: (msg: 
  * dropped such a session once it matched, frozen at the turns already stored. A session with no verdict yet that the
  * graph already holds was read as Codex's own under that rule: it stays so, and is logged as resumed.
  */
-async function codexCopyOf(s: ParsedSession, fingerprint: string | null, projectKey: string, deps: CycleDeps): Promise<string | null> {
+/** Matched turns at least: one shared prompt (the same task given to both agents) is two conversations, not a copy. */
+const MIN_COPIED_TURNS = 2;
+
+/**
+ * A Codex session's turns that are a Claude Code session's (by content hash, turnHash), and the Claude Code session it
+ * holds most of when that is at least MIN_COPIED_TURNS: an import, even with turns of its own before or after them.
+ */
+function copiedTurns(s: ParsedSession, state: Pick<FileState, 'turnOrigins'>): { original: string | null; from: Map<string, string> } {
+  const hashes = new Map(s.turns.map((t) => [t.uuid, turnHash(t.text)] as const));
+  const origins = state.turnOrigins([...hashes.values()].filter((h): h is string => !!h));
+  const from = new Map<string, string>();
+  const counts = new Map<string, number>();
+  for (const [uuid, h] of hashes) {
+    const o = h ? origins.get(h) : undefined;
+    if (!o) continue;
+    from.set(uuid, o);
+    counts.set(o, (counts.get(o) ?? 0) + 1);
+  }
+  const [best] = [...counts].sort((a, b) => b[1] - a[1]);
+  return { original: best && best[1] >= MIN_COPIED_TURNS ? best[0] : null, from };
+}
+
+/**
+ * The ids the store already holds for these turns (same time and text): a Codex record read once with its ordinal and
+ * once without (`…:2311`, `…:L2312`) is one turn, so a re-read never files it again under a new id.
+ */
+function stableIds(turns: HumanTurn[], stored: { uuid: string; ts: string; text: string }[]): HumanTurn[] {
+  if (!stored.length) return turns;
+  const have = new Set(stored.map((t) => t.uuid));
+  const byContent = new Map(stored.map((t) => [`${t.ts}\n${t.text}`, t.uuid]));
+  return turns.map((t) => {
+    if (have.has(t.uuid)) return t;
+    const uuid = byContent.get(`${t.ts}\n${t.text}`);
+    return uuid ? { ...t, uuid } : t;
+  });
+}
+
+async function codexCopyOf(s: ParsedSession, fingerprint: string | null, byTurns: string | null, projectKey: string, deps: CycleDeps): Promise<string | null> {
   const verdict = deps.state.codexVerdict(s.sessionId);
   if (verdict !== undefined) return verdict;
-  const original = fingerprint ? deps.state.conversation(fingerprint) : null;
+  const original = (fingerprint ? deps.state.conversation(fingerprint) : null) ?? byTurns;
   const stored = original && deps.storedTurns ? await deps.storedTurns(s.sessionId) : null;
   if (original && stored === null) {
     deps.state.judgeCodexSession(s.sessionId, original);
@@ -177,8 +216,19 @@ async function codexCopyOf(s: ParsedSession, fingerprint: string | null, project
   return null;
 }
 
+/**
+ * The container path of the folder a session ran in, when it is inside its project's repository but not the repository
+ * itself (a worktree under it, or a subfolder): its HEAD is the session's line of work. Null otherwise.
+ */
+function worktreeOf(cwd: string, repoPath: string, roots: Root[]): string | null {
+  const root = [...roots].sort((a, b) => b.host.length - a.host.length).find((r) => cwd.startsWith(`${r.host.replace(/\/+$/, '')}/`));
+  if (!root) return null;
+  const inContainer = `${root.container.replace(/\/+$/, '')}${cwd.slice(root.host.replace(/\/+$/, '').length)}`;
+  return inContainer !== repoPath && inContainer.startsWith(`${repoPath}/`) ? inContainer : null;
+}
+
 async function readSessions(path: string, source: SessionSource, deps: CycleDeps): Promise<ParsedSession[]> {
-  if (source === 'claude') return parseTranscript(await deps.readFile(path), path);
+  if (source === 'claude') return parseTranscript(await deps.readFile(path), path, { projectOf: (cwd) => projectFromCwd(cwd, deps.roots)?.key ?? null });
   const p = codexSessionParser(path);
   for await (const line of deps.readLines(path)) p.push(line);
   return p.finish();
@@ -224,7 +274,10 @@ export async function runCycle(deps: CycleDeps): Promise<CycleResult> {
           if (!folder || !s.turns.length) continue;
           // Codex can import Claude Code conversations; Claude Code files are listed first, so the original is known.
           const fingerprint = conversationFingerprint(s);
-          if (fingerprint && source === 'claude') deps.state.rememberConversation(fingerprint, s.sessionId);
+          if (source === 'claude') {
+            if (fingerprint) deps.state.rememberConversation(fingerprint, s.sessionId);
+            deps.state.rememberTurns(s.sessionId, s.turns.map((t) => turnHash(t.text)).filter((h): h is string => !!h));
+          }
           keys.add(folder.key);
           // Out of scope: skipped, and remembered as such so selecting it later reads this file again. Before the copy
           // verdict, so a project not selected is neither judged nor named in Activity.
@@ -232,11 +285,17 @@ export async function runCycle(deps: CycleDeps): Promise<CycleResult> {
             skipped.add(folder.key);
             continue;
           }
-          const original = source === 'codex' ? await codexCopyOf(s, fingerprint, folder.key, deps) : null;
-          if (original) {
+          const copied = source === 'codex' ? copiedTurns(s, deps.state) : null;
+          const original = copied ? await codexCopyOf(s, fingerprint ?? null, copied.original, folder.key, deps) : null;
+          // The turns copied from the Claude Code session are that session's: only those typed in Codex are read.
+          const from = original ?? copied?.original ?? null;
+          // A copy judged by its opening before turn hashes were kept (none matches yet) stays dropped whole.
+          const own = !from ? s.turns : original && ![...copied!.from.values()].includes(from) ? [] : s.turns.filter((t) => copied!.from.get(t.uuid) !== from);
+          if (original && !own.length) {
             log('codex session skipped: a copy of a Claude Code conversation', { session: s.sessionId, original });
             continue;
           }
+          if (own.length < s.turns.length) log('codex session read without the turns it copied from a Claude Code conversation', { session: s.sessionId, original: from, copied: s.turns.length - own.length });
           const target = await projectFor(folder, deps, scope);
           if ('skipped' in target) {
             keys.add(target.skipped);
@@ -244,8 +303,10 @@ export async function runCycle(deps: CycleDeps): Promise<CycleResult> {
             continue;
           }
           keys.add(target.project.key);
-          const commits = await deps.commits(folder.repoPath, s.startedAt, s.endedAt);
-          await deps.repo.upsertSession(target.project, s, commits);
+          // Only its own branch's commits (or its worktree's, with no branch recorded) were made during it by it.
+          const commits = await deps.commits(folder.repoPath, s.startedAt, s.endedAt, { branch: s.gitBranch, worktree: s.gitBranch ? null : worktreeOf(s.cwd, folder.repoPath, deps.roots) });
+          const turns = source === 'codex' && deps.storedTurnIds ? stableIds(own, await deps.storedTurnIds(s.sessionId)) : own;
+          await deps.repo.upsertSession(target.project, turns === s.turns ? s : { ...s, turns }, commits);
           wrote = true;
           await recordTouchedFiles(s, deps, log);
         }

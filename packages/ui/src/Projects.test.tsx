@@ -214,6 +214,13 @@ test('files an older scanner read are counted, with what to do: no scan starts o
   expect(await screen.findByText('1 file was read by an older scanner: the scan under way refreshes it.')).toBeTruthy();
 });
 
+test('files no scanner version was recorded for are said apart from those an older scanner read', async () => {
+  projectList = [{ ...projects[0], olderScanner: 2, neverScanned: 5 }, projects[1]];
+  render(<Projects />);
+  expect(await screen.findByText('2 files were read by an older scanner: press Scan to refresh them.')).toBeTruthy();
+  expect(screen.getByText('5 files have no scanner version recorded (read before versions were kept, or never by a scan): press Scan to read them with this scanner.')).toBeTruthy();
+});
+
 test('a project with no file from an older scanner says nothing about it', async () => {
   render(<Projects />);
   await screen.findByText('Use sendError for all errors');
@@ -769,6 +776,18 @@ test('parked queued scans show the reason and allow cancellation or changing pro
   fireEvent.click(await screen.findByRole('button', { name: 'Cancel and switch provider' }));
   await waitFor(() => expect(calls.some(c => c.url.endsWith('/cancel'))).toBe(true));
   await waitFor(() => expect(calls.find(c => c.url.endsWith('/scan'))?.body).toEqual({ provider: 'claude-cli' }));
+});
+
+test('a parked scan says since when, and one failed after a day parked shows as failed with the reason', async () => {
+  projectList = [{ ...projects[0], lastScan: { ...job('queued'), provider: null, parkedAt: '2026-11-12T08:00:00.000Z', error: 'scan parked on codex-cli: cannot reach the codex runner. Readiness will be checked again with backoff before the repository is copied.' } }];
+  const first = render(<Projects />);
+  expect(await screen.findByText(/^parked since .*; failed after 24 hours if its model still does not answer$/)).toBeTruthy();
+  first.unmount();
+  const reason = 'gave up after more than 24 hours parked on codex-cli (since 2026-11-11T08:00:00.000Z): cannot reach the codex runner. Fix it, or choose another scan model (SCAN_LLM, or the project\'s scan model), then scan again.';
+  projectList = [{ ...projects[0], lastScan: { ...job('failed'), provider: null, error: reason } }];
+  render(<Projects />);
+  expect(await screen.findByText(reason)).toBeTruthy();
+  expect(screen.getByText('failed')).toBeTruthy();
 });
 
 test('a scan action error clears when a valid provider is picked', async () => {

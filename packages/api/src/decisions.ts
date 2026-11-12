@@ -437,7 +437,7 @@ export function loopRoutes(app: Hono, d: LoopDeps, ctx: LoopRouteContext) {
   };
 
   /**
-   * The note an approve, reject or keep came with, written after the action: the action is done by then, so a note
+   * The note an approve, reject, keep or rollback came with, written after the action: the action is done by then, so a note
    * that cannot be saved is said in the answer (noteError), never answered as the action failing.
    */
   const actionNote = async (id: string, note: DecisionNoteInput | undefined | '') => {
@@ -541,7 +541,9 @@ export function loopRoutes(app: Hono, d: LoopDeps, ctx: LoopRouteContext) {
         await record('decision_rolled_back', rolled, `rolled back${undone.length ? ` with ${undone.length} later decision${undone.length === 1 ? '' : 's'}` : ''}`, 'you rolled it back',
           { status: 'rolled_back', action, cascade: undone, ...(reason && { reason }), ...(note && { note }) });
       }
-      return c.json(decisionWire(rolled));
+      // In the decision's notes too, with its reason, as a reject's note is: what the page and the loop read back.
+      const lost = await actionNote(dec.id, note && { by, text: note, verdict: 'disagree', reason: reason ?? null });
+      return c.json({ ...decisionWire(rolled), ...lost });
     }));
   }
 

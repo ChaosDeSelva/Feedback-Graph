@@ -59,7 +59,7 @@ const STATUS_NOTE = new RegExp(
  * Bumped whenever a skip rule changes what it matches: the worker then runs the rules once over the items already
  * pending in the Inbox (worker integrations/pendingSkips.ts), so a better rule also clears what the old one let through.
  */
-export const SKIP_RULES_VERSION = 3;
+export const SKIP_RULES_VERSION = 4;
 /** "@claude review", "@codex please re-review this", "/review": a request for a review, nothing more. */
 const REVIEW_TRIGGER = /^(?:(?:@[\w-]+[\s,]+)+(?:please\s+)?(?:re-?)?review(?:\s+(?:this|again|it))?(?:\s+please)?|\/(?:re-?)?review)[.!]*$/i;
 
@@ -149,12 +149,13 @@ export const FEEDBACK_SKIP_RULES: readonly FeedbackSkipRule[] = [
   },
   {
     name: 'pr-author-reply',
-    description: "The pull request author's replies to another reviewer's comment, such as \"Fixed in <sha>\": an answer to the reviewer, not feedback on the work. Replies in a thread the author opened are classified.",
+    description: "The pull request author's replies to another reviewer's comment (a person's or a review bot's), such as \"Fixed in <sha>\" or \"Done\": an answer to the reviewer, not feedback on the work. Replies in a thread the author opened are classified.",
     // Only an answer to someone else: a solo developer reviewing their agent's PR under their own account replies in
-    // threads they opened, and that is feedback.
+    // threads they opened, and that is feedback. A thread whose opener is unknown was opened by a comment the sync
+    // leaves out (a bot's, or one with no text): never the author's own.
     skips: (_text, ext) => {
       const me = ext.author.toLowerCase();
-      return ext.source === 'github' && !!ext.isReply && !!ext.threadAuthor && me === ext.threadAuthor.toLowerCase() && !!ext.repliesTo && ext.repliesTo.toLowerCase() !== me;
+      return ext.source === 'github' && !!ext.isReply && !!ext.threadAuthor && me === ext.threadAuthor.toLowerCase() && ext.repliesTo?.toLowerCase() !== me;
     },
   },
   {
@@ -204,6 +205,11 @@ export const FEEDBACK_SKIP_RULES: readonly FeedbackSkipRule[] = [
  */
 export function isSelfReview(ext: ExternalRef): boolean {
   return ext.source === 'github' && ext.authorKind === 'agent' && !!ext.threadAuthor && ext.author.toLowerCase() === ext.threadAuthor.toLowerCase();
+}
+
+/** A comment on a pull request closed without merging: the work it criticized was never accepted (Inbox chip, triage). */
+export function prNeverMerged(ext: Pick<ExternalRef, 'source' | 'threadState'>): boolean {
+  return ext.source === 'github' && ext.threadState === 'closed';
 }
 
 /** The first rule that skips this comment, or null when it goes to the model. */

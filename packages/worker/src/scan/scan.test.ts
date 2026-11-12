@@ -274,7 +274,8 @@ test('runScan (per-file) skips unchanged files, scans changed ones, and closes r
   expect(removed).toEqual([['src/deleted.ts']]);
   expect(r).toEqual({ filesScanned: 5, factsAdded: 8, failed: 0, remaining: 0 });
   expect(updates.at(0)).toEqual({ status: 'running' });
-  expect(updates.at(-1)).toEqual({ status: 'done', filesScanned: 5, factsAdded: 8 });
+  // Done clean: whatever it waited with (a park, a model that did not answer at first) is cleared.
+  expect(updates.at(-1)).toEqual({ status: 'done', filesScanned: 5, factsAdded: 8, error: null, parkedAt: null });
 
   const again = fakeDeps({ facts: { ...deps.facts, fileHashes: async () => new Map(saved.map((s) => [s.path, 'x'])) } });
   // simulate stored hashes equal to the real ones by re-reading

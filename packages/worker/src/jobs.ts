@@ -2,7 +2,7 @@ import { providerUnavailableReason, redactSecrets, RUNNER_READINESS_CURSOR, type
 import { readFile } from 'node:fs/promises';
 import { githubTarget, type SyncProject } from './integrations/feedbackSync.ts';
 import type { ScanResult } from './scan/scan.ts';
-import type { ScanTurn } from './scan/runner.ts';
+import { parkedOn, type ScanTurn } from './scan/runner.ts';
 
 type Log = (msg: string, extra?: object) => void;
 
@@ -83,6 +83,8 @@ export async function runScanJob(job: ScanJob, d: ScanJobDeps, turn?: ScanTurn):
     await d.facts.updateScanJob(job.id, { status: 'failed', error: `provider unavailable: ${spec}${reason ? `: ${reason}` : ''}` });
     return true;
   }
+  // It runs now, on this model: a park reason from waiting on another (or this one, before it answered) no longer holds.
+  if (job.parkedAt || parkedOn(job)) await d.facts.updateScanJob(job.id, { parkedAt: null, ...(parkedOn(job) && { error: null, retryAt: null }) });
   // The map first, so the scan's project has a current one. A scan going on after giving way had its map made when it started.
   if (!job.shards?.processed) await d.mapProject({ key: job.projectKey, repoPath: job.repoPath });
   d.log('scan started', { project: job.projectKey, provider: llm.id });

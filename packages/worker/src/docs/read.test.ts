@@ -43,6 +43,15 @@ test('a text upload is read into facts with relevance, filed under the document,
   expect(t.activity[0]).toMatchObject({ kind: 'doc_read', actor: 'ollama:gemma4', projectKey: 'shop', subject: 'read "Spec": 2 facts', targets: [textDoc.id] });
 });
 
+test('reading an upload made in a run is logged as that run\'s, like the upload itself', async () => {
+  const t = deps({ ...textDoc, run: 'r-docs', sandbox: true }, () => ({ summary: 's', facts: [fact('Orders are scoped to the tenant', 0.9)] }));
+  await readOneDoc(t.d);
+  expect(t.activity[0]).toMatchObject({ kind: 'doc_read', run: 'r-docs', sandbox: true });
+  const plain = deps(textDoc, () => ({ summary: 's', facts: [] }));
+  await readOneDoc(plain.d);
+  expect(plain.activity[0].run).toBeUndefined();
+});
+
 test('an image is sent to the model, and its description becomes the document\'s searchable text', async () => {
   const t = deps(imageDoc, () => ({ description: 'A checkout flow: cart, then address, then payment. Button text: "Pay now".', facts: [fact('Checkout asks for the address before payment', 0.8)] }));
   await readOneDoc(t.d);

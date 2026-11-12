@@ -1,7 +1,7 @@
 import { asIs, labelOf } from './labels.ts';
 import type { CandidateDetail as Detail, ExternalRef, FeedbackSource } from './api.ts';
 import type { HumanTurn } from '@fb/core';
-import { feedbackSkipRule, isSelfReview } from '@fb/core/feedback-rules';
+import { feedbackSkipRule, isSelfReview, prNeverMerged } from '@fb/core/feedback-rules';
 import { Fragment, useState } from 'react';
 import { sessionHref } from './links.ts';
 import { Badge, Card, SectionLabel, StatusBadge, tableClass, tdClass, type Tone } from './ui/display.tsx';
@@ -23,6 +23,11 @@ export function SourceBadge({ source }: { source: FeedbackSource | undefined }) 
 /** An AI agent reviewing its own pull request under the author's account (core isSelfReview): kept, but not a reviewer. */
 export function SelfReviewBadge() {
   return <Badge tone="neutral" className="shrink-0" title="An AI agent reviewing its own pull request under the author's account: kept and classified, but not a reviewer's pushback">self-review</Badge>;
+}
+
+/** A comment on a pull request closed without merging (core prNeverMerged): the work it is about was never accepted. */
+export function NeverMergedBadge() {
+  return <Badge tone="neutral" className="shrink-0" title="The pull request was closed without merging: the work this comment criticizes was never accepted, so it may not be worth a lesson">PR never merged</Badge>;
 }
 
 const AUTHOR_KIND_LABEL = { agent: 'AI agent', bot: 'bot' } as const;
@@ -94,6 +99,7 @@ function TurnBlock({ turn, flagged }: { turn: HumanTurn; flagged?: boolean }) {
           ? <Badge title={ext.authorVerified ? 'by its login' : 'by a marker in the comment'}>{labelOf(AUTHOR_KIND_LABEL, ext.authorKind, asIs)}</Badge>
           : role && <Badge tone="info">{role}</Badge>}
         {ext && isSelfReview(ext) ? <SelfReviewBadge /> : flagged && <Badge tone="accent">flagged as pushback</Badge>}
+        {ext && prNeverMerged(ext) && <NeverMergedBadge />}
         {ext?.url && <a href={ext.url} target="_blank" rel="noreferrer noopener" className="text-accent-text underline underline-offset-2">open</a>}
       </Speaker>
       {ext?.path && <p className="mb-1 font-mono text-[11.5px] text-muted [overflow-wrap:anywhere]">{ext.path}{ext.line != null ? `:${ext.line}` : ''}</p>}

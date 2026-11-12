@@ -1,4 +1,4 @@
-import { candidateSnapshot, feedbackSkipRule, isSelfReview, type Candidate } from '@fb/core';
+import { candidateSnapshot, feedbackSkipRule, isSelfReview, prNeverMerged, type Candidate } from '@fb/core';
 import { SKIP, skip, type LoopCandidate, type LoopType, type LoopTypeContext, type LoopTypeResult } from '../plugin.ts';
 
 /** Pending Inbox items looked at each round. */
@@ -8,6 +8,8 @@ export const CONFIRM_FROM = 0.85;
 /** The classifier is this unsure, and no agent reported the miss: reject. */
 export const REJECT_BELOW = 0.35;
 const DEMO_ITEM = /^demo:/;
+/** A comment on a pull request closed without merging, this many days old: the work was dropped, not worth a lesson. */
+export const CLOSED_PR_DAYS = 14;
 
 /** Why the loop must never triage this item, or null: the demo's, or a run's or a sandbox's. */
 export function candidateNeverTarget(c: Candidate): string | null {
@@ -25,6 +27,8 @@ async function callFor(ctx: LoopTypeContext, c: Candidate): Promise<Call | null>
     const rule = turn ? feedbackSkipRule(turn.text, c.external) : null;
     if (rule) return { status: 'rejected', why: `a skip rule matches it now (${rule.name}: ${rule.description})`, skipRule: rule.name };
     if (isSelfReview(c.external) || c.classification.signals.includes('self-review')) return { status: 'rejected', why: 'an agent reviewing its own pull request', skipRule: null };
+    const days = Math.floor((ctx.now - Date.parse(c.external.createdAt)) / 86_400_000);
+    if (prNeverMerged(c.external) && days >= CLOSED_PR_DAYS) return { status: 'rejected', why: `a comment on a pull request closed without merging, ${days} days ago: the work it criticizes was never accepted`, skipRule: null };
   }
   const agent = c.origins!.includes('agent'); // set by the stores on every item
   const { label, confidence } = c.classification;
@@ -35,7 +39,8 @@ async function callFor(ctx: LoopTypeContext, c: Candidate): Promise<Call | null>
 
 /**
  * triage_inbox (tier P: always a proposal): confirm or reject a pending Inbox item. Reject: a skip rule matches the
- * synced comment now, an agent reviewing its own pull request, or the classifier under REJECT_BELOW with no agent
+ * synced comment now, an agent reviewing its own pull request, a comment CLOSED_PR_DAYS or more old on a pull request
+ * closed without merging, or the classifier under REJECT_BELOW with no agent
  * report. Confirm: pushback or a correction at CONFIRM_FROM or more. Confirming spends a post-mortem; nothing reaches an
  * agent until a lesson exists. The item is decided by whoever approves the proposal (`decidedBy` left to the executor).
  */

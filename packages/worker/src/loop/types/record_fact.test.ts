@@ -107,6 +107,17 @@ describe('recordFact: a lesson that states a fact', () => {
     expect((await recordFact.candidates(ctxOf({ lessons: [l], decided: [on('older'), on(lessonFingerprint(l), 'reword_lesson')] }))).candidates).toHaveLength(1);
   });
 
+  test('an approved rule written as an imperative is never turned into a fact, whoever flagged it', async () => {
+    const flagged = [{ name: 'looks-like-a-fact' as const, why: MODEL_FACT_WHY }];
+    const r = await recordFact.candidates(ctxOf({ lessons: [
+      lesson('lesson:a', { status: 'approved', checks: flagged, rule: 'Amounts are stored in integer cents in src/money.ts. Don\u2019t use floats for them.' }),
+      lesson('lesson:b', { status: 'approved', checks: flagged, rule: 'Amounts are stored in cents, so you must never divide them before display.' }),
+      lesson('lesson:c', { status: 'approved', checks: flagged, rule: 'Always remember that amounts in src/money.ts are integer cents.' }),
+    ] }));
+    expect(r.candidates.map((c) => c.targets[0].id)).toEqual(['lesson:c']);
+    expect(r.skipped).toEqual({ below_floor: 2 });
+  });
+
   test('the owner touched it in the last 14 days: proposed at most', async () => {
     const [c] = (await recordFact.candidates(ctxOf({ lessons: [lesson('lesson:a')], sig: { 'lesson:a': signals('lesson:a', {}, '2026-11-08T00:00:00Z') } }))).candidates;
     expect(c.proposeOnly).toMatch(/last 14 days/);
@@ -120,7 +131,7 @@ describe('recordFact: a standing fact from what the owner said more than once', 
 
   test('a new note saying what an earlier edit said: one proposal, the loop\'s fact under the project, the evidence both entries', async () => {
     const now = noted('dec:1');
-    const before = edited('lesson:x', `Use the money helpers. ${SAID}`);
+    const before = edited('lesson:x', SAID);
     const ctx = ctxOf({ entries: [now], history: [before, now], notes: { 'dec:1': [{ text: `Wrong evidence. ${SAID.replace('Orders', 'All orders')}` }] } });
     const r = await recordFact.candidates(ctx);
     expect(r.skipped).toEqual({});
@@ -148,6 +159,16 @@ describe('recordFact: a standing fact from what the owner said more than once', 
     const other = edited('lesson:z', SAID, { projectKey: 'other' });
     expect((await recordFact.candidates(ctxOf({ entries: [other], history: [once, other] }))).skipped).toEqual({ below_floor: 1 });
     expect((await recordFact.candidates(ctxOf({ entries: [other], history: [once, other, edited('lesson:w', SAID, { projectKey: 'other' })], inScope: (k) => k !== 'other' }))).skipped).toEqual({ out_of_scope: 1 });
+  });
+
+  test('a rule the owner edited that says what to do is not a statement, though a sentence of it states a fact', async () => {
+    const now = noted('dec:1');
+    const rules = [`Use the money helpers. ${SAID}`, `${SAID} Never write floats there.`, `${SAID.slice(0, -1)}, so callers must round first.`];
+    for (const rule of rules) {
+      const before = edited('lesson:x', rule);
+      const r = await recordFact.candidates(ctxOf({ entries: [now], history: [before, now], notes: { 'dec:1': [{ text: SAID }] } }));
+      expect(r.candidates, rule).toEqual([]);
+    }
   });
 
   test('instructions, short or wordless sentences, and notes by someone else are not statements', async () => {

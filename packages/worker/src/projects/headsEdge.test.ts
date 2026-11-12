@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { expect, test } from 'vitest';
 import { FileState } from '../state.ts';
-import { codexCwds, readSessionHead } from './heads.ts';
+import { sessionCwds, readSessionHead } from './heads.ts';
 
 const tmp = () => mkdtempSync(join(tmpdir(), 'fb-heads-edge-'));
 const BIG = 'x'.repeat(1100 * 1024); // past the 1 MiB head cap
@@ -54,23 +54,36 @@ test('a Codex meta line past the cap is read by pattern: its thread source, else
   expect(await readSessionHead(write('plain.jsonl', ''), 'codex')).toEqual({ cwd: '/H/Vibe/c', human: true });
 });
 
-test('codexCwds reads only what was appended, skips broken turn_context lines, and starts over on a file that shrank', async () => {
+test('sessionCwds reads only what was appended, skips broken turn_context lines, and starts over on a file that shrank', async () => {
   const dir = tmp();
   const p = join(dir, 'r.jsonl');
   const state = new FileState(':memory:');
   const tc = (cwd: string) => JSON.stringify({ type: 'turn_context', payload: { cwd } }) + '\n';
   const at = () => ({ path: p, size: statSync(p).size, mtimeMs: 1, source: 'codex' as const });
   writeFileSync(p, tc('/H/a') + '{"type":"turn_context", broken\n');
-  expect(await codexCwds(state, at())).toEqual(['/H/a']);
+  expect(await sessionCwds(state, at())).toEqual(['/H/a']);
   appendFileSync(p, tc('/H/b'));
-  expect(await codexCwds(state, at())).toEqual(['/H/a', '/H/b']);
+  expect(await sessionCwds(state, at())).toEqual(['/H/a', '/H/b']);
   // Unchanged: nothing is read again.
-  expect(await codexCwds(state, at())).toEqual(['/H/a', '/H/b']);
+  expect(await sessionCwds(state, at())).toEqual(['/H/a', '/H/b']);
   writeFileSync(p, tc('/H/c'));
-  expect(await codexCwds(state, at())).toEqual(['/H/c']);
+  expect(await sessionCwds(state, at())).toEqual(['/H/c']);
 });
 
-test('codexCwds of a file that cannot be opened gives what was known', async () => {
+test('sessionCwds of a file that cannot be opened gives what was known', async () => {
   const state = new FileState(':memory:');
-  expect(await codexCwds(state, { path: join(tmp(), 'missing.jsonl'), size: 10, mtimeMs: 1, source: 'codex' })).toEqual([]);
+  expect(await sessionCwds(state, { path: join(tmp(), 'missing.jsonl'), size: 10, mtimeMs: 1, source: 'codex' })).toEqual([]);
+});
+
+test('sessionCwds of a Claude Code transcript: every record\'s own cwd, not one its message quotes', async () => {
+  const p = join(tmp(), 's.jsonl');
+  const state = new FileState(':memory:');
+  const line = (o: object) => JSON.stringify(o) + '\n';
+  writeFileSync(p, line({ type: 'user', cwd: '/H/Code', message: { content: 'start' } })
+    + line({ type: 'summary', message: { content: '{"cwd":"/H/quoted"}' } })
+    + line({ type: 'assistant', cwd: '/H/Code/demo-shop', message: { content: 'the config says "cwd": "/H/elsewhere"' } }));
+  const at = () => ({ path: p, size: statSync(p).size, mtimeMs: 1, source: 'claude' as const });
+  expect(await sessionCwds(state, at())).toEqual(['/H/Code', '/H/Code/demo-shop']);
+  appendFileSync(p, line({ type: 'user', cwd: '/H/Code/side-tool', message: { content: 'next' } }));
+  expect(await sessionCwds(state, at())).toEqual(['/H/Code', '/H/Code/demo-shop', '/H/Code/side-tool']);
 });

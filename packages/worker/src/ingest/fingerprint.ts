@@ -16,6 +16,15 @@ const PER_TURN = 500;
 
 const normalise = (text: string) => text.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, '').slice(0, PER_TURN);
 
+/** Below this much normalised text a turn ("yes", "run the tests") is said in many conversations: it proves no copy. */
+const MIN_TURN_CHARS = 20;
+
+/** One turn's content hash, the same in a Claude Code transcript and Codex's import of it; null for a turn too short. */
+export function turnHash(text: string): string | null {
+  const n = normalise(text);
+  return n.length < MIN_TURN_CHARS ? null : createHash('sha256').update(n).digest('hex').slice(0, 32);
+}
+
 /** The conversation's fingerprint, or null when its opening is too short (or a single turn) to tell it apart from another. */
 export function conversationFingerprint(s: Pick<ParsedSession, 'turns'>): string | null {
   const opening = s.turns.slice(0, OPENING_TURNS).map((t) => normalise(t.text));

@@ -7,7 +7,7 @@ import { factOrigin } from '../relevance.ts';
 import { factFingerprint, factStateFingerprint, TargetChangedError, type FactSnapshotWrite, type FingerprintedFact } from '../decisions/record.ts';
 import { thresholdsSnapshot } from '../loop/snapshots.ts';
 import { holdsCredential, REDACT_PAGE, redactDeep, redactSecrets, redactStoredFact, reopensAsFact } from '../redact.ts';
-import { DEMO_SOURCE, type FactCheck, type FactScope, type FactsStore, type ScanJobPatch, type ScannedFile } from '../store.ts';
+import { DEMO_SOURCE, type FactCheck, type FactScope, type FactsStore, type OlderScanFiles, type ScanJobPatch, type ScannedFile } from '../store.ts';
 import { retryDeadlock, type GraphRepo } from './repo.ts';
 import { nearest, visibleToRun } from './nearest.ts';
 import { VISIBLE_TO_RUN } from './runs.ts';
@@ -126,13 +126,13 @@ export class FactsRepo implements FactsStore {
     return new Map(rows.map((r) => [r.get('path'), r.get('version') ?? null]));
   }
 
-  async olderScannerFiles(version: string): Promise<Map<string, number>> {
+  async olderScannerFiles(version: string): Promise<Map<string, OlderScanFiles>> {
     const rows = await this.g.run(
       `MATCH (f:CodeFile) WHERE coalesce(f.removed, false) = false AND f.path <> $root AND f.hash IS NOT NULL AND coalesce(f.scanVersion, '') <> $version
-       RETURN f.projectKey AS projectKey, count(f) AS n`,
+       RETURN f.projectKey AS projectKey, count(f.scanVersion) AS older, count(f) - count(f.scanVersion) AS never`,
       { version, root: PROJECT_PATH },
     );
-    return new Map(rows.map((r) => [r.get('projectKey'), Number(r.get('n'))]));
+    return new Map(rows.map((r) => [r.get('projectKey'), { older: Number(r.get('older')), never: Number(r.get('never')) }]));
   }
 
   /** Replace the current facts of one file (old facts are closed, not deleted). */
@@ -704,5 +704,6 @@ function jobOf(p: Record<string, unknown>): ScanJob {
     retryAt: (p.retryAt as string) ?? null,
     shards: typeof p.shards === 'string' ? (JSON.parse(p.shards) as ScanShards) : null,
     servedAt: (p.servedAt as string) ?? null,
+    parkedAt: (p.parkedAt as string) ?? null,
   };
 }

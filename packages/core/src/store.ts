@@ -14,7 +14,7 @@
  * - Vectors of a different length than the query are skipped by searches, never an error.
  */
 import type { Config } from './config.ts';
-import type { ActivityInput, Activity, AgentSeen, ActivityKind, Candidate, Classification, Commit, FactKind, LessonCheck, LessonCheckName, LessonFrom, LessonStatus, Lesson, ParsedSession, PendingExternalItem, PendingSessionItem, PostMortem, PostMortemInput, Project, ProjectSummary, RelevanceBy, ScanJob, ScanQueueEntry, ScanStatus, WorkerStatus, FactEvidence, FactOrigin, OwnFactOrigin, RunItem, RunItemKind, RunOwner, RunPrincipal, RunTag, TurnEvidence, Cause, LessonDraft, LessonTriggers } from './types.ts';
+import type { ActivityInput, Activity, AgentSeen, ActivityKind, Candidate, CandidateStatus, Classification, Commit, FactKind, LessonCheck, LessonCheckName, LessonFrom, LessonStatus, Lesson, ParsedSession, PendingExternalItem, PendingSessionItem, PostMortem, PostMortemInput, Project, ProjectSummary, RelevanceBy, ScanJob, ScanQueueEntry, ScanStatus, WorkerStatus, FactEvidence, FactOrigin, OwnFactOrigin, RunItem, RunItemKind, RunOwner, RunPrincipal, RunTag, TurnEvidence, Cause, LessonDraft, LessonTriggers } from './types.ts';
 import type { ProjectScope, ProjectSelection } from './scope.ts';
 import type { CallsAfter, CandidateDetail, CandidateFilter, ClassifiableTurn, StatsRow } from './graph/repo.ts';
 import type { LessonDetail, LessonHit, LessonInput, LessonPatch, RelatedMiss, UnsortedMiss } from './graph/knowledge.ts';
@@ -35,6 +35,8 @@ import type { CalibrationBump, DecisionCount, DecisionCountFilter, DecisionCount
 /** The paths a scope replace covers (FactsStore.replaceScopeFacts): under one of `prefixes`, under none of `except`. */
 export type FactScope = { prefixes: string[]; except: string[] };
 /** A file a scan read: its hash, and the scanner version that read it (absent: not recorded, read as an old scanner). */
+/** FactsStore.olderScannerFiles of one project. */
+export type OlderScanFiles = { older: number; never: number };
 export type ScannedFile = { path: string; hash: string; version?: string | null };
 /**
  * One fact checked again (FactsStore.applyFactChecks): kept with these lines and evidence, or closed. A kept fact may
@@ -42,8 +44,11 @@ export type ScannedFile = { path: string; hash: string; version?: string | null 
  * embedding; unset or null: the statement (and embedding) stay.
  */
 export type FactCheck = { id: string; keep: boolean; lines: string | null; evidence: FactEvidence | null; statement?: string | null; embedding?: number[] | null };
+/** An Inbox item as the duplicate repair reads it (GraphStore.inboxTexts). */
+export type InboxText = { id: string; sessionId: string; projectKey: string; source: string; status: CandidateStatus; createdAt: string; text: string };
+
 /** What updateScanJob changes: only the keys given (a key set to null clears it). */
-export type ScanJobPatch = Partial<Pick<ScanJob, 'filesScanned' | 'factsAdded' | 'error' | 'shards' | 'retryAt'>> & { status?: ScanStatus };
+export type ScanJobPatch = Partial<Pick<ScanJob, 'filesScanned' | 'factsAdded' | 'error' | 'shards' | 'retryAt' | 'parkedAt'>> & { status?: ScanStatus };
 
 /**
  * A pull request's or Linear issue's comments as one stand-in session (`id`, e.g. `github:acme/shop#12`): never
@@ -122,6 +127,8 @@ export interface GraphStore {
    * what the detect rules look at again when they change (worker detect/pendingInstructions.ts). Pruned words: left out.
    */
   pendingSessionItems(q: { limit: number; afterId?: string | null }): Promise<PendingSessionItem[]>;
+  /** Every Inbox item (any status) with its turn's text, a page at a time by id: the duplicate repair reads them. */
+  inboxTexts(q: { limit: number; afterId?: string | null }): Promise<InboxText[]>;
   /**
    * The current redaction rules over every Inbox item's text: its turn's words, the agent's text before them and the
    * classifier's summary, and the item's note and agent report, in place. Run once per REDACTION_VERSION at worker
@@ -257,7 +264,7 @@ export interface KnowledgeStore {
   lessonDetail(id: string): Promise<LessonDetail | null>;
   /**
    * `by`: who decides, when the patch sets a status ('you' when unset; `operator:<name>` for the operator token).
-   * `note`: why (kept as decisionNote); a status set without one clears the old note.
+   * `note`: why (kept as decisionNote), with a status or an edit; a status set without one clears the old note, an edit without one keeps it.
    * The first edit of a proposed lesson's words, paths or scope keeps what the writer proposed (Lesson.proposedAs,
    * redacted), so the owner's edit can teach the post-mortem (editedDraft).
    * Only the owner's decisions and edits (ownerDecided: you, an operator) mark the lesson as yours, which a memory
@@ -296,6 +303,10 @@ export interface KnowledgeStore {
    * such post-mortem lesson, or one is kept already.
    */
   backfillProposedAs(id: string, draft: LessonDraft): Promise<boolean>;
+  /** The tasks of PR and issue threads (a stand-in session's), with one of their comments' ExternalRef, for retitling. */
+  threadTasks(): Promise<{ id: string; title: string | null; external: ExternalRef }[]>;
+  /** Set a task's title (redacted); false when there is no such task. */
+  setTaskTitle(id: string, title: string): Promise<boolean>;
   /**
    * Store what the lesson check found (redacted), replacing earlier checks, with the checks' version (default
    * LESSON_CHECKS_VERSION); nothing else changes. False: no such lesson. savePostmortem stamps the current version too.
@@ -308,13 +319,24 @@ export interface KnowledgeStore {
    */
   setLessonPaths(id: string, paths: string[]): Promise<boolean>;
   /**
-   * Store the triggers the worker derived (redacted) on a proposed or approved lesson that has none yet (triggers
-   * null); nothing else changes and it is not a decision. False: no such lesson, another status, or it has triggers
+   * Store the triggers the worker derived (redacted), stamped TRIGGER_DERIVATION_VERSION, on a proposed or approved
+   * lesson that has none yet (triggers null); nothing else changes and it is not a decision. False: no such lesson, another status, or it has triggers
    * already (the post-mortem's, an earlier backfill's, or the owner's).
    */
   setLessonTriggers(id: string, triggers: LessonTriggers): Promise<boolean>;
   /** Proposed and approved lessons with no triggers yet (never a sandbox run's), oldest first: the backfill's work. */
   lessonsWithoutTriggers(limit: number): Promise<Lesson[]>;
+  /**
+   * Proposed and approved lessons (never a sandbox run's) whose triggers were derived by a TRIGGER_DERIVATION_VERSION
+   * older than `version` (setLessonTriggers and savePostmortem stamp the current one; none stamped reads as 1), oldest
+   * first; never one whose triggers the owner set (they are the owner's).
+   */
+  lessonsWithOldTriggers(version: number, limit: number): Promise<Lesson[]>;
+  /**
+   * Replace such a lesson's derived triggers (redacted) with ones derived again, stamped with `version`. False: no
+   * such lesson, another status, the owner set its triggers meanwhile, or it was derived again already.
+   */
+  rederiveLessonTriggers(id: string, triggers: LessonTriggers, version: number): Promise<boolean>;
   /**
    * Proposed and approved lessons whose checks are older than `version` (or were never made), oldest first: what the
    * worker re-checks.
@@ -420,10 +442,11 @@ export interface FactsStore {
    */
   fileScanVersions(projectKey: string): Promise<Map<string, string | null>>;
   /**
-   * Per project, the scanned files (as fileScanVersions lists them) last read by a scanner other than `version`, null
-   * included: the next scan you start reads them again. Projects with none are left out.
+   * Per project, the scanned files (as fileScanVersions lists them) not last read by `version`: `older`, read by
+   * another scanner version; `never`, no scanner version recorded (read before versions were kept, or recorded by no
+   * scan). The next scan you start reads both again. Projects with none are left out.
    */
-  olderScannerFiles(version: string): Promise<Map<string, number>>;
+  olderScannerFiles(version: string): Promise<Map<string, OlderScanFiles>>;
   /**
    * A file's facts replaced. `version`: the scanner version that read it (fileScanVersions). The file's hashChangedAt
    * moves only when its hash differs from the stored one. Source DEMO_SOURCE (fg demo seed) never touches a file that

@@ -92,7 +92,7 @@ export class PgDocsStore implements DocsStore {
     );
     if (!d) return null;
     const image = d.blob_data ? { mediaType: d.blob_type, data: d.blob_data.replace(/\n/g, '') } : null;
-    return { id: d.id, projectKey: d.project_key, ref: d.ref, title: d.title, kind: d.kind, text: image ? '' : d.text ?? '', image, attempts: d.read_attempts, version: iso(d.added_at)! };
+    return { id: d.id, projectKey: d.project_key, ref: d.ref, title: d.title, kind: d.kind, text: image ? '' : d.text ?? '', image, attempts: d.read_attempts, version: iso(d.added_at)!, ...(d.run && { run: d.run }), ...(d.sandbox === true && { sandbox: true as const }) };
   }
 
   async markDocReading(id: string, version?: string): Promise<boolean> {

@@ -48,8 +48,11 @@ const DO = 'do|don\'?t|use|avoid|prefer|keep|make|check|ensure|add|remove|read|w
   'require|enforce|default|fall back|lower|raise|increase|decrease|shorten|lengthen|reorder|group by|serialize|' +
   'deserialize|quote|unquote|lock|unlock|commit|stage|rebase|squash|tag|pull|push|open|reopen|re-run|rerun|regenerate|' +
   'rebuild|recompute|re-check|recheck|re-read|reread|re-embed|reembed|backfill|seed|stamp|version|namespace|isolate';
-/** At the start of the rule or of a clause, after an adverb ("Only cap ...") or a place with no comma ("In a.ts cap ..."). */
-const IMPERATIVE_LEAD = new RegExp(`(^|[,;:]|\\bthen|\\bso)\\s*(?:(?:in|for|inside|within|on)\\s+\\S+\\s+)?(?:(?:only|also|first|explicitly|still|just)\\s+)?(${DO})\\b`, 'i');
+/**
+ * At the start of the rule, of a sentence or of a clause, after an adverb ("Only cap ...") or a place with no comma
+ * ("In a.ts cap ..."). A sentence starts after . ! ? or a dash and a space, so a dotted name (`config.load`) does not.
+ */
+const IMPERATIVE_LEAD = new RegExp(`(^|[,;:]|[.!?\u2013\u2014]\\s|\\bthen|\\bso)\\s*(?:(?:in|for|inside|within|on)\\s+\\S+\\s+)?(?:(?:only|also|first|explicitly|still|just)\\s+)?(${DO})\\b`, 'i');
 /**
  * A modal or a rule word anywhere. "never" and "always" only before a verb in its base form: "the web app never sees
  * it" describes the code. ("before", "until", "not in" are not rule words: "migrations run before the server starts".)
@@ -60,14 +63,26 @@ const AWARE = /^\s*(?:(?:always|when [^,]{1,80},|if [^,]{1,80},)\s*)?(?:remember
 /** A declarative sentence about the codebase: "<subject> is / defaults to / lives under / uses ...". */
 const DECLARATIVE = /\b(is|are|was|were|defaults? to|lags?|uses|reads|returns|carries|holds|stores|runs|has|have|pins?|caps?|counts?|lives?|resides?|sits|shares?|relies on|depends on|expects|contains|exposes|requires|owns|wraps|calls|sends|emits|loads|writes|located|configured|defined|declared|registered|handled|implemented|built with)\b/i;
 
-export const imperative = (s: string) => IMPERATIVE_LEAD.test(s) || IMPERATIVE_WORD.test(s);
+/** Typographic apostrophes as typed ones: "Don’t" is "Don't". */
+const plainQuotes = (s: string) => s.replace(/[\u2018\u2019\u02bc]/g, "'");
 
-/** The rule says how the code is rather than what to do (it may belong in the project facts). */
+export const imperative = (raw: string) => {
+  const s = plainQuotes(raw);
+  return IMPERATIVE_LEAD.test(s) || IMPERATIVE_WORD.test(s);
+};
+
+/**
+ * The rule says how the code is rather than what to do (it may belong in the project facts): a declarative statement,
+ * with no imperative in any of its sentences ("Retries are capped at 3. Don't raise the cap." is a rule).
+ */
 export function statesAFact(rule: string): boolean {
-  const aware = AWARE.exec(rule);
-  const core = aware ? aware[1] : rule;
+  const plain = plainQuotes(rule);
+  const aware = AWARE.exec(plain);
+  const core = aware ? aware[1] : plain;
   if (imperative(core)) return false;
-  return !!aware || DECLARATIVE.test(core);
+  // "Be aware that <clause>" says the clause is so; "Remember the billing team" says nothing about the code.
+  const thatClause = !!aware && /\bthat$/i.test(plain.slice(0, plain.length - core.length).trim());
+  return thatClause || DECLARATIVE.test(core);
 }
 /**
  * The words of a rule that name nothing in particular: process verbs ("check", "verify", "follow", "consult"), their

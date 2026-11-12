@@ -86,6 +86,13 @@ describe('get_task_context serves the lessons whose triggers fire', () => {
     expect(r.markdown).toContain('lesson lt · touches src/sync/storage.py · why served: trigger symbol `FlushBatch` is in the task');
   });
 
+  test('a lesson whose triggers match none of the files is not served on a word it shares with the task', async () => {
+    const ledger = lesson('lg', { ...none, paths: ['services/ledger/**'], patterns: ['retry\\s+budget'], symbols: ['Exporter', 'RETRIES'] });
+    const { d } = deps({ lessons: [ledger] });
+    const r = await getTaskContext({ project: 'demo', task: 'add a retry budget to the Exporter and raise RETRIES', files: ['web/src/exporter.ts'] }, d);
+    expect(r.lessons).toEqual([]);
+  });
+
   test('brief mode serves them too, with the trigger', async () => {
     const { d, recorded } = deps({ lessons: [loop] });
     const r = await getTaskContext({ project: 'demo', task: 'use asyncio.to_thread for the batch', brief: true, files: ['src/sync/storage.py'] }, d);

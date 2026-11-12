@@ -106,9 +106,10 @@ describe.skipIf(!testStores().includes('postgres'))('Postgres migrations', () =>
     await p.query(`INSERT INTO projects (key) VALUES ('demo')`);
     await p.query(`INSERT INTO lessons (id, project_key, title, rule, applies_when, scope, status, source, created_at)
                    VALUES ('lesson:1', 'demo', 't', 'r', 'a', 'project', 'approved', 'postmortem', now())`);
-    for (const f of all.slice(upTo075.length)) writeFileSync(join(dir, f), readFileSync(new URL(f, MIGRATIONS), 'utf8'));
+    const to080 = all.slice(upTo075.length, all.indexOf('0059_code_file_namespaces.sql') + 1);
+    for (const f of to080) writeFileSync(join(dir, f), readFileSync(new URL(f, MIGRATIONS), 'utf8'));
     expect(await migrate(p, { dir })).toEqual(['0052_codemap_checked.sql', '0053_lesson_triggers.sql', '0054_decisions.sql', '0055_loop_weights.sql', '0056_loop_facts_and_splits.sql', '0057_loop_scale.sql', '0058_decision_notes_seq.sql', '0059_code_file_namespaces.sql']);
-    expect(all.slice(upTo075.length)).toHaveLength(8);
+    expect(to080).toHaveLength(8);
     // The lesson is kept, and the loop's columns take its writes (and refuse a weight out of range).
     await p.query(`UPDATE lessons SET serving_weight = 1.2, split_from = 'lesson:0' WHERE id = 'lesson:1'`);
     expect((await p.query(`SELECT title, serving_weight, split_from FROM lessons`)).rows).toEqual([{ title: 't', serving_weight: 1.2, split_from: 'lesson:0' }]);
@@ -118,6 +119,25 @@ describe.skipIf(!testStores().includes('postgres'))('Postgres migrations', () =>
     await p.query(`INSERT INTO facts (id, project_key, kind, statement, path, source, current, created_at, valid_from, origin, relevance, relevance_by)
                    VALUES ('fact:loop:1', 'demo', 'convention', 's', '.', 'loop', true, now(), now(), 'loop', 0.6, 'loop:1')`);
     expect((await p.query(`SELECT count(*)::int AS n FROM decisions`)).rows).toEqual([{ n: 0 }]);
+    expect(await migrate(p, { dir })).toEqual([]);
+  });
+
+  test('a 0.8.2 database (through 0059) upgrades to 0.8.3: 0060 then 0061; 0060 stamps no trigger version, so every derived trigger is derived again', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'fb-migrations-'));
+    const all = await migrationIds();
+    const upTo082 = all.slice(0, all.indexOf('0059_code_file_namespaces.sql') + 1);
+    for (const f of upTo082) writeFileSync(join(dir, f), readFileSync(new URL(f, MIGRATIONS), 'utf8'));
+    const p = pool();
+    await migrate(p, { dir });
+    await p.query(`INSERT INTO lessons (id, title, rule, applies_when, scope, status, source, created_at, triggers)
+                   VALUES ('lesson:1', 't', 'r', 'a', 'project', 'approved', 'postmortem', now(), '{"paths":["**/*.sql"],"patterns":[],"symbols":[]}')`);
+    const to083 = all.slice(upTo082.length);
+    expect(to083).toEqual(['0060_trigger_version.sql', '0061_scan_parked_at.sql']);
+    for (const f of to083) writeFileSync(join(dir, f), readFileSync(new URL(f, MIGRATIONS), 'utf8'));
+    expect(await migrate(p, { dir })).toEqual(to083);
+    expect((await p.query(`SELECT title, triggers, triggers_version FROM lessons`)).rows).toEqual([{ title: 't', triggers: { paths: ['**/*.sql'], patterns: [], symbols: [] }, triggers_version: null }]);
+    expect((await p.query(`SELECT data_type FROM information_schema.columns WHERE table_name = 'scan_jobs' AND column_name = 'parked_at'`)).rows)
+      .toEqual([{ data_type: 'timestamp with time zone' }]);
     expect(await migrate(p, { dir })).toEqual([]);
   });
 

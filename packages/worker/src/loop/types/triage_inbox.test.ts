@@ -2,7 +2,7 @@ import { describe, expect, test } from 'vitest';
 import { candidateSnapshot, type Candidate, type ExternalRef } from '@fb/core';
 import { fakeContext } from '../testing/context.ts';
 import { score } from '../policy.ts';
-import { candidateNeverTarget, CONFIRM_FROM, REJECT_BELOW, triageInbox } from './triage_inbox.ts';
+import { candidateNeverTarget, CLOSED_PR_DAYS, CONFIRM_FROM, REJECT_BELOW, triageInbox } from './triage_inbox.ts';
 
 const item = (id: string, o: Partial<Candidate> = {}, c: Partial<Candidate['classification']> = {}): Candidate => ({
   id, turnUuid: id, sessionId: 's', projectKey: 'demo', source: 'claude', status: 'pending', createdAt: '2026-11-01T00:00:00.000Z', decidedAt: null, note: null,
@@ -13,10 +13,11 @@ const ext = (o: Partial<ExternalRef> = {}): ExternalRef => ({
   branch: null, createdAt: '2026-11-01T00:00:00Z', linkedSessionIds: [], authorKind: 'human', threadAuthor: 'author', ...o,
 } as ExternalRef);
 
-function ctxOf(items: Candidate[], o: { texts?: Record<string, string>; inScope?: (k: string | null) => boolean } = {}) {
+function ctxOf(items: Candidate[], o: { texts?: Record<string, string>; inScope?: (k: string | null) => boolean; now?: number } = {}) {
   const asked: unknown[] = [];
   const ctx = fakeContext({
     inScope: o.inScope,
+    ...(o.now !== undefined && { now: o.now }),
     store: {
       graph: {
         listCandidates: async (f: unknown) => { asked.push(f); return items; },
@@ -89,9 +90,33 @@ describe('triageInbox', () => {
     expect(by.bot.rationale).not.toContain('post-mortem');
   });
 
+  test("the PR author's own reply to a reviewer (\"Fixed in <sha>\", \"Done\"): reject, also when its parent's author was never synced", async () => {
+    const own = (id: string, repliesTo?: string | null) => item(id, { external: ext({ author: 'author', isReply: true, ...(repliesTo !== undefined && { repliesTo }) }) });
+    const r = await triageInbox.candidates(ctxOf([own('fixed', 'reviewer'), own('done'), own('mine', 'author')], { texts: { fixed: 'Fixed in 3f2a9c1', done: 'Done', mine: 'and the migration is still missing' } }).ctx);
+    const by = Object.fromEntries(r.candidates.map((d) => [d.targets[0].id, d.after[0].fields]));
+    expect(by.fixed).toMatchObject({ status: 'rejected', note: expect.stringContaining('pr-author-reply') });
+    expect(by.done).toMatchObject({ status: 'rejected', note: expect.stringContaining('pr-author-reply') });
+    // In a thread the author opened: their own feedback, judged on its classification.
+    expect(by.mine.status).toBe('confirmed');
+  });
+
   test('never: the demo, a run or sandbox item; nor out of scope', async () => {
     const r = await triageInbox.candidates(ctxOf([item('demo:shop:1'), item('r', { run: 'r1' }), item('sb', { sandbox: true }), item('o', { projectKey: 'other' })], { inScope: (k) => k !== 'other' }).ctx);
     expect(r).toEqual({ candidates: [], scanned: 4, skipped: { never_target: 3, out_of_scope: 1 } });
     expect(candidateNeverTarget(item('x'))).toBeNull();
+  });
+
+  test(`a comment on a pull request closed without merging, ${CLOSED_PR_DAYS} days old or more: reject; a newer one or a merged one: judged as usual`, async () => {
+    const at = (state: 'closed' | 'merged' | 'open', createdAt: string) => ext({ threadState: state, createdAt });
+    const now = Date.parse('2026-11-20T00:00:00Z');
+    const r = await triageInbox.candidates(ctxOf([
+      item('old', { external: at('closed', '2026-11-01T00:00:00Z') }),
+      item('recent', { external: at('closed', '2026-11-15T00:00:00Z') }),
+      item('merged', { external: at('merged', '2026-11-01T00:00:00Z') }),
+    ], { texts: { old: 'the migration is missing', recent: 'the migration is missing', merged: 'the migration is missing' }, now }).ctx);
+    const by = Object.fromEntries(r.candidates.map((d) => [d.targets[0].id, d.after[0].fields]));
+    expect(by.old).toMatchObject({ status: 'rejected', note: 'triage: a comment on a pull request closed without merging, 19 days ago: the work it criticizes was never accepted' });
+    expect(by.recent.status).toBe('confirmed');
+    expect(by.merged.status).toBe('confirmed');
   });
 });

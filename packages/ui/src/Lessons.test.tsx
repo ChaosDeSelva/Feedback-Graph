@@ -484,9 +484,9 @@ test('the header says how many of the decisions an agent made with the operator 
   }));
   render(<Lessons />);
   const judged = await screen.findByLabelText('how your lessons were judged');
-  expect(judged.textContent).toMatch(/40 by an agent with the operator token \(28%\)/);
+  expect(judged.textContent).toMatch(/and 40 more by an agent with the operator token, not counted/);
   expect(within(judged).getAllByRole('columnheader').map((h) => h.textContent)).toContain('by operator');
-  expect(within(judged).getAllByRole('row').map((r) => r.textContent)).toEqual(expect.arrayContaining([expect.stringMatching(/^acme.*142.*40 \(28%\)$/)]));
+  expect(within(judged).getAllByRole('row').map((r) => r.textContent)).toEqual(expect.arrayContaining([expect.stringMatching(/^acme.*142.*%\)40$/)]));
 });
 
 test('no decided lessons yet, or a server that cannot tell: the header says nothing about it', async () => {
@@ -596,11 +596,11 @@ test('the judged header counts the decisions an agent made with the operator tok
   }));
   render(<Lessons />);
   const judged = await screen.findByLabelText('how your lessons were judged');
-  expect(judged.textContent).toMatch(/4 by an agent/);
+  expect(judged.textContent).toMatch(/4 more by an agent/);
   // Said once, with its share: 0.6.3 printed it a second time after the ternary.
   const summary = judged.querySelector('summary')!.textContent!;
   expect(summary.match(/by an agent with the operator token/g)).toHaveLength(1);
-  expect(summary).toMatch(/4 by an agent with the operator token \(40%\)/);
+  expect(summary).toMatch(/and 4 more by an agent with the operator token, not counted/);
 });
 
 

@@ -54,10 +54,12 @@ describe('feedbackSkipRule', () => {
 
   test("the PR author's reply in a review thread is skipped; a comment of theirs that starts a thread is not", () => {
     expect(feedbackSkipRule('good catch, see the next commit', ext({ author: 'jo', threadAuthor: 'jo', isReply: true, repliesTo: 'lead' }))?.name).toBe('pr-author-reply');
-    // The PR author replying in a thread they opened themselves (a solo developer reviewing their agent's PR), or to a
-    // comment whose author is unknown, is not answering a reviewer: it is classified.
+    // The PR author replying in a thread they opened themselves (a solo developer reviewing their agent's PR) is not
+    // answering a reviewer: it is classified.
     expect(feedbackSkipRule('and the test is missing, again', ext({ author: 'jo', threadAuthor: 'jo', isReply: true, repliesTo: 'jo' }))).toBeNull();
-    expect(feedbackSkipRule('and the test is missing, again', ext({ author: 'jo', threadAuthor: 'jo', isReply: true }))).toBeNull();
+    // A reply to a comment the sync left out (a review bot's): its opener is unknown, and it is answering, not feedback.
+    expect(feedbackSkipRule('Done', ext({ author: 'jo', threadAuthor: 'jo', isReply: true }))?.name).toBe('pr-author-reply');
+    expect(feedbackSkipRule('Fixed in 3f2a9c1, thanks', ext({ author: 'jo', threadAuthor: 'jo', isReply: true, repliesTo: null }))?.name).toBe('pr-author-reply');
     expect(feedbackSkipRule('the agent broke the totals here', ext({ author: 'jo', threadAuthor: 'jo', isReply: false }))).toBeNull();
     expect(feedbackSkipRule('good catch', ext({ author: 'lead', threadAuthor: 'jo', isReply: true }))).toBeNull();
   });

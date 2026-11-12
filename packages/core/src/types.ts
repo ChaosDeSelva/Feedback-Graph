@@ -22,6 +22,13 @@ export type HumanTurn = {
   external?: ExternalRef;
 };
 
+/**
+ * The task a PR's or issue's comments criticize: the thread itself (`PR owner/repo#12: <title>`, `ENG-42: <title>`), never
+ * the model's name for whatever work session it was matched to, which one session matched to many PRs gives them all.
+ */
+export const threadTaskTitle = (ext: Pick<ExternalRef, 'source' | 'thread' | 'title'>): string =>
+  `${ext.source === 'github' ? 'PR ' : ''}${ext.thread}: ${ext.title}`.slice(0, 200);
+
 /** Where a piece of feedback came from outside the agent's transcript. */
 export type ExternalSource = 'github' | 'linear';
 export const EXTERNAL_SOURCES: readonly ExternalSource[] = ['github', 'linear'];
@@ -267,11 +274,20 @@ export const LESSON_CHECKS = [
   'instance-applies-when',
   // An appliesWhen copied from an example the post-mortem was shown (another lesson's) that this miss is not about.
   'example-applies-when',
+  // The post-mortem's miss is not about the flagged turn (it described the agent's reply beside it) even after a retry:
+  // the owner reads the turn before deciding.
+  'off-turn',
   // An approved lesson the redaction rules read a credential in (redact.ts redactStoredLesson): its text is the owner's.
   'may-hold-secret',
   // A lesson that tells agents to fetch a URL or run a command that downloads, installs, deletes or evaluates: what an
   // injected comment asks for. The learning loop never targets it, and never writes such text into a lesson.
   'risky-command',
+  // A trigger that is a glob for a kind of file anywhere (**/*.sql), kept because the rule says it of every such file:
+  // it reaches every such change, so the owner looks at it.
+  'broad-trigger',
+  // An approved lesson whose paths, trigger paths or named symbols changed or vanished in the code map since: it may
+  // be about code that is no longer there. Flagged only: the owner decides (the worker never revokes it).
+  'code-changed',
 ] as const;
 export type LessonCheckName = (typeof LESSON_CHECKS)[number];
 /**
@@ -311,9 +327,12 @@ export type LessonTriggers = { paths: string[]; patterns: string[]; symbols: str
  * runners (npx, dlx, uvx), flags before an install's package, split rm flags, a bare domain to fetch and run, inline
  * code (python -c, node -e, powershell -enc), commands spelled letter by letter, and telling agents to expose secrets
  * (keys, .env, the environment, tokens) to the PR, a chat, a log or a URL; and it re-checks lessons checked at 9 by
- * the narrower example- and instance-applies-when rules above, which came after 9 was stamped.
+ * the narrower example- and instance-applies-when rules above, which came after 9 was stamped. 11: looks-like-a-fact
+ * needs a declarative statement and no imperative in any sentence ("Retries are capped at 3. Don't raise the cap." is a
+ * rule; typographic apostrophes read as typed ones). 12: broad-trigger and code-changed (raised by the trigger derivation
+ * and the code map's re-check) and off-turn (raised by the post-mortem) are kept by the re-check, which runs once more.
  */
-export const LESSON_CHECKS_VERSION = 10;
+export const LESSON_CHECKS_VERSION = 12;
 
 /**
  * Where a lesson's feedback came from: a GitHub or Linear comment, pushback in an agent session, a miss an agent reported
@@ -391,7 +410,7 @@ export type LessonDraft = Pick<Lesson, 'title' | 'rule' | 'appliesWhen' | 'scope
 export type LessonOutcome = 'as_written' | 'edited' | 'rejected';
 
 /** Of the post-mortem lessons decided in the last `days` days: how many of each outcome (decided is their sum). */
-/** byOperator: of `decided`, those an agent with the operator token made (counted as the owner's, said apart). */
+/** decided: the owner's own decisions. byOperator: those an agent with the operator token made, counted apart, not in `decided`. */
 export type LessonQuality = { days: number; asWritten: number; edited: number; rejected: number; decided: number; byOperator: number };
 /**
  * GET /api/lessons/quality: LessonQuality over the last 30 and 90 days, in all (the shown projects, or ?project=) and by
@@ -521,6 +540,11 @@ export type ScanJob = {
    * waits in the queue from then, not from requestedAt. Null: it never has.
    */
   servedAt?: string | null;
+  /**
+   * When its model first failed the readiness probe in this wait (scan/runner.ts parkScanProvider); null once the
+   * model answers. A job parked longer than SCAN_PARK_LIMIT_MS is failed with the reason.
+   */
+  parkedAt?: string | null;
 };
 
 /**
@@ -557,10 +581,11 @@ export type ProjectSummary = {
   /** Confirmed links to other shown projects. Counted by the API from the links store; absent when it has none. */
   links?: number;
   /**
-   * Scanned files an older scanner read (FactsStore.olderScannerFiles): the next scan you start reads them again.
-   * Counted by the API; absent when there are none.
+   * Scanned files an older scanner read (FactsStore.olderScannerFiles `older`), and apart those no scanner version was
+   * recorded for (`never`): the next scan you start reads them again. Counted by the API; each absent when none.
    */
   olderScanner?: number;
+  neverScanned?: number;
 };
 
 // ── Provenance ─────────────────────────────────────────────────────────
@@ -874,6 +899,9 @@ export type ModelHealth = {
   checkedAt?: string;
 };
 
+/** How a scan failed for being parked too long begins its error (worker scan/runner.ts); /api/status and doctor list these. */
+export const SCAN_PARK_GAVE_UP = 'gave up after more than 24 hours parked on ';
+
 /** What to do about a Codex runner its safety flag turned off. */
 export const RUNNER_OFF_FIX = 'Its safety flag turned it off on this machine. Choose another scan model (SCAN_LLM, e.g. a local ollama: model) in .env, or fix the isolation failure and re-enable the runner: ./scripts/doctor.sh says how.';
 /** "Codex runner off: scans paused", naming the jobs that wait for it. */
@@ -912,6 +940,11 @@ export type SystemStatus = {
   /** Maps needing attention: a failed or interrupted rebuild, or (rebuilding) a rebuild running now, which is not a failure. */
   /** builtAt, ageDays and checkedAt are null for a map whose first build never finished. */
   codeMaps?: { projectKey: string; builtAt: string | null; ageDays: number | null; /** When the worker last found the map current (the repo unchanged since the build); builtAt when later. */ checkedAt: string | null; interrupted?: boolean; rebuilding?: boolean; lastFailureAt?: string | null; lastFailure?: string | null }[];
+  /**
+   * Selected projects whose last scan waits on a model that fails its readiness probe (parked, with since when), or
+   * was failed after more than a day of that (gaveUp, with the reason). Omitted when no facts store is wired.
+   */
+  scans?: { parked: { projectKey: string; provider: string; since: string | null; error: string }[]; gaveUp: { projectKey: string; at: string | null; error: string }[] };
   /** The model that judges check_before_done (provider:model, e.g. ollama:gemma4); null when unknown or none. */
   judge?: string | null;
   /**
@@ -965,9 +998,10 @@ export type PipelineStatus = {
   lessons: { proposed: number; approved: number; global?: number; demo?: { proposed: number; approved: number }; quality?: LessonQuality[] } | null;
   /**
    * olderScanner: files an older scanner read, in all and by project (only those with some), which the next scan you
-   * start reads again; absent when there are none or the store cannot count them.
+   * start reads again; neverScanned: the same for files no scanner version was recorded for. Each absent when there
+   * are none or the store cannot count them.
    */
-  scans: { done: number; queued: number; running: number; failed: number; never: number; olderScanner?: { files: number; projects: Record<string, number> } } | null;
+  scans: { done: number; queued: number; running: number; failed: number; never: number; olderScanner?: { files: number; projects: Record<string, number> }; neverScanned?: { files: number; projects: Record<string, number> } } | null;
   /** Back-pressure: each queue's waiting work and what runs now. Older APIs leave it out. */
   queues?: WorkQueues;
 };

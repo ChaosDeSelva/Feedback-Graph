@@ -561,6 +561,20 @@ function Sources({ data, onSaved, onError }: { data: ProjectSettings; onSaved: (
           ) : (
             <p className="mt-1 text-muted">No sessions ran outside your project folders.</p>
           )}
+          {!!data.atRoots?.length && (
+            <div className="mt-3">
+              <p className="font-medium">Some sessions ran only in a folder that holds your projects, never in one project's folder.</p>
+              <p className="mt-0.5 text-xs text-muted">Their turns are not read: no project is theirs. Start the agent in the project's folder (a session that moves into one is read from there).</p>
+              <ul aria-label="sessions above a project folder" className="mt-2 grid gap-1">
+                {data.atRoots.map((f) => (
+                  <li key={f.path}>
+                    <span className="block font-mono text-xs [overflow-wrap:anywhere]">{f.path}</span>
+                    <span className="text-xs text-muted">{sessionCounts(f.claudeSessions, f.codexSessions)} sessions</span>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
         </div>
       </div>
     </section>

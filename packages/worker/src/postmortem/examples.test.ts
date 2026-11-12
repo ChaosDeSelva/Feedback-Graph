@@ -60,7 +60,7 @@ describe('pickExamples', () => {
     expect(pickExamples([edited({ sandbox: true }), asWritten(null, { source: 'memory' }), asWritten(null, { status: 'proposed' })])).toEqual([]);
   });
   test("never a machine's decision shown as the owner's: a no-miss rejection teaches nothing", () => {
-    expect(pickExamples([rejected('no miss', null, { decidedBy: 'postmortem' }), rejected('meta rule', null, { decidedBy: 'operator:codex' })]).map((g) => g.lesson.decisionNote)).toEqual(['meta rule']);
+    expect(pickExamples([rejected('no miss', null, { decidedBy: 'postmortem' }), rejected('meta rule', null, { decidedBy: 'operator:codex' }), rejected('yours', null, { decidedBy: 'you' })]).map((g) => g.lesson.decisionNote)).toEqual(['yours']);
   });
 });
 

@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto';
 import { lstat } from 'node:fs/promises';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
-import { CODE_MAP_VERSION, filterOverrides, gitSafeEnv, type ActivityStore, type CodeGraphStore, type CodeMapStats } from '@fb/core';
+import { CODE_MAP_VERSION, filterOverrides, gitSafeEnv, type ActivityStore, type CodeGraphStore, type CodeMapStats, type StoredCodeMap } from '@fb/core';
 import { GIT_SAFE } from '../ingest/git.ts';
 import { MAX_AUTO_MAP_FILES } from '../scan/rank.ts';
 import { candidatePaths } from '../scan/scan.ts';
@@ -145,6 +145,11 @@ export type MapStageDeps = {
   exclusive?: <T>(fn: () => Promise<T>) => Promise<T>;
   /** Read inside the section: whether the project is still selected (the selection as stored right now). */
   inScope?: (key: string) => Promise<boolean>;
+  /**
+   * After a map is written: the map before it (null for the first) and the new one, so what lessons name can be checked
+   * against what changed (postmortem/codeChanged.ts). A failure is logged, never the build's.
+   */
+  onMapped?: (p: { key: string; repoPath: string }, before: Pick<StoredCodeMap, 'symbols'> | null, after: Pick<CodeMap, 'files' | 'symbols'> & { outside?: CodeMap['outside'] }) => Promise<void>;
 };
 
 export type MapResult = CodeMapStats & { durationMs: number };
@@ -309,6 +314,8 @@ export class MapStage {
       // TESTS edges for every file of the import index, past the cap too (an agent asks about those as well), from the
       // whole index (a test past the cap still covers a mapped file).
       const tests = [...map.files, ...(map.outside ?? [])].filter((f) => !f.isTest).flatMap((f) => testsFor(map, f.path).map((test) => ({ test, target: f.path })));
+      // The map being replaced, when something will compare the two (prev, when the build reused it).
+      const before = d.onMapped && meta ? (prev ?? (await d.store.codeMap(p.key).catch(() => null))) : null;
       const exclusive = d.exclusive ?? (<T>(fn: () => Promise<T>) => fn());
       const stats = await exclusive(async () => {
         // Shutting down before the write began: the old map stays as it was, and the next start maps it again.
@@ -335,6 +342,7 @@ export class MapStage {
         details: { ...stats, candidates, durationMs, incremental: !!prev, fingerprint, churnDays: CHURN_DAYS },
       });
       d.log?.('code map built', { project: p.key, ...stats, durationMs });
+      await d.onMapped?.(p, before, map).catch((err) => d.log?.('lessons not checked against the new code map', { project: p.key, error: String(err) }));
       return { ...stats, durationMs };
     } catch (err) {
       if (this.stopping.signal.aborted) d.log?.('code map skipped', { project: p.key, reason: 'the worker is shutting down' });

@@ -418,3 +418,50 @@ test("runPostMortem shows the writer this project's own lesson decisions as exam
   expect(new Set(prompts.slice(1)).size).toBe(1);
   expect(prompts[1]).not.toContain('HOW THE OWNER JUDGED');
 });
+
+// ── anchored on the flagged turn ───────────────────────────────────────
+
+/** A deterministic model: answers in order, keeping every prompt it was given. */
+function scripted(...answers: object[]) {
+  const prompts: { system: string; user: string }[] = [];
+  return { prompts, llm: { id: 'fake', agentic: false, json: async (t: { system: string; user: string }) => { prompts.push(t); return answers.shift(); } } };
+}
+const pmAnswer = (o: object) => ({
+  taskTitle: 'Customer search', cause: 'requirement_unstated', causeExplanation: 'x', outcome: 'approved', contextItems: [],
+  lesson: { title: 'Server-side search filter', rule: 'Filter customer search in api/search.ts on the server', appliesWhen: 'search endpoints', scope: 'project', paths: ['api/search.ts'] },
+  ...o,
+});
+// The agent's reply beside the flagged turn talks about pagination; the turn itself about where filtering runs.
+const anchored: PostMortemInput = { ...input, feedback: turn(2, "this isn't good enough, filter server-side", { precedingAssistantText: 'Added pagination with 50 rows per page.' }) };
+
+test('the prompt quotes the flagged turn verbatim, apart from the replies around it, and asks for words from it', async () => {
+  const m = scripted(pmAnswer({ feedbackQuote: 'filter server-side', missed: 'filtering ran in the browser instead of server-side' }));
+  const r = await runPostMortem(anchored, { llm: m.llm as never, standing: async () => [], facts: async () => [] });
+  const user = m.prompts[0].user;
+  expect(user).toContain("=== THE FLAGGED TURN (quoted verbatim) ===");
+  expect(user).toContain("--- begin flagged turn ---\nthis isn't good enough, filter server-side\n--- end of flagged turn ---");
+  expect(user.indexOf('THE FLAGGED TURN')).toBeLessThan(user.indexOf('Added pagination'));
+  expect(m.prompts).toHaveLength(1);
+  expect(r.lessonChecks!.map((c) => c.name)).not.toContain('off-turn');
+  expect(r).not.toHaveProperty('feedbackQuote');
+});
+
+test('an answer about the neighbouring reply is asked once more, told why; the second, about the turn, is taken', async () => {
+  const m = scripted(
+    pmAnswer({ feedbackQuote: 'Added pagination', missed: 'pagination used 50 rows per page' }),
+    pmAnswer({ feedbackQuote: 'filter server-side', missed: 'filtering ran in the browser instead of server-side' }),
+  );
+  const r = await runPostMortem(anchored, { llm: m.llm as never, standing: async () => [], facts: async () => [] });
+  expect(m.prompts).toHaveLength(2);
+  expect(m.prompts[1].system).toContain('must be about THE FLAGGED TURN: feedbackQuote "Added pagination" is not in the flagged turn');
+  expect(r.missed).toBe('filtering ran in the browser instead of server-side');
+  expect(r.lessonChecks!.map((c) => c.name)).not.toContain('off-turn');
+});
+
+test('still not about the flagged turn after the retry: kept, but flagged for review', async () => {
+  const off = pmAnswer({ missed: 'pagination used 50 rows per page' });
+  const m = scripted(off, off);
+  const r = await runPostMortem(anchored, { llm: m.llm as never, standing: async () => [], facts: async () => [] });
+  expect(m.prompts).toHaveLength(2);
+  expect(r.lessonChecks!.find((c) => c.name === 'off-turn')?.why).toBe('needs review: after a retry the post-mortem is still not about the flagged turn ("missed" ("pagination used 50 rows per page") says nothing the flagged turn says)');
+});

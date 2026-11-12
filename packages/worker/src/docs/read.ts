@@ -115,6 +115,8 @@ async function saveReading(d: ReadDeps, job: DocToRead, facts: CodeFact[], descr
   if (!saved) return { read: false };
   await d.activity?.record({
     kind: 'doc_read', actor: d.llm.id, projectKey: job.projectKey,
+    // The upload's run, as its facts carry it: cleaning the run up takes this entry with them.
+    ...(job.run && { run: job.run, ...(job.sandbox && { sandbox: true }) }),
     subject: `read "${job.title}": ${kept.length} fact${kept.length === 1 ? '' : 's'}`,
     why: (job.image ? 'you uploaded this image; its description is now searchable and its facts reach agents' : 'you uploaded this document; its facts reach agents ranked by relevance')
       + (credentials ? `; ${credentials} fact${credentials === 1 ? '' : 's'} held a credential and ${credentials === 1 ? 'was' : 'were'} not kept (remove the secret from the upload and rotate it)` : '')

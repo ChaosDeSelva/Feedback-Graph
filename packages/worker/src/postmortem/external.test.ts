@@ -113,7 +113,7 @@ test('the prompt without a work session says not to borrow paths or scope from a
 });
 
 test('the lesson check runs on every post-mortem: a universal rule from an approving nit is narrowed and flagged in the trace', async () => {
-  const nit = { ...base, work: null, feedback: { ...base.feedback, text: 'nit: rename this', external: { ...ext(1, 'lead'), reviewState: 'APPROVED' as const } } };
+  const nit = { ...base, work: null, feedback: { ...base.feedback, text: 'nit: rename the in-memory filters helper', external: { ...ext(1, 'lead'), reviewState: 'APPROVED' as const } } };
   const r = await runPostMortem(nit, {
     standing: async () => [], facts: async () => [],
     llm: { id: 'fake', agentic: false, json: async () => ({ ...answer([]), lesson: { ...answer([]).lesson, rule: 'Always rename variables reviewers mention', scope: 'global' } }) },
@@ -188,7 +188,7 @@ test('lesson paths are checked against the repository and the comment: instructi
 });
 
 test('a lesson left with no path is flagged as needing one; a global lesson is not', async () => {
-  const noFile = { ...base, work: null, feedback: { ...base.feedback, text: 'this races', external: { ...ext(1, 'lead'), path: null, diffHunk: null } } };
+  const noFile = { ...base, work: null, feedback: { ...base.feedback, text: 'this races when filtering in memory', external: { ...ext(1, 'lead'), path: null, diffHunk: null } } };
   const r = await runPostMortem(noFile, { standing: async () => [], facts: async () => [], llm: llm([]) });
   expect(r.lessonChecks?.map((f) => f.name)).toEqual(['needs-path']);
   const g = await runPostMortem(noFile, { standing: async () => [], facts: async () => [], llm: { id: 'fake', agentic: false, json: async () => ({ ...answer([]), lesson: { ...answer([]).lesson, scope: 'global' } }) } });

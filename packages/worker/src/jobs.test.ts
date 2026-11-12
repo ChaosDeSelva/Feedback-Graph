@@ -110,6 +110,15 @@ describe('runScanJob', () => {
     expect(f.calls.at(-1)).toBe('scan ollama:qwen');
   });
 
+  test('a scan that runs on a model clears the park reason it waited with, before it scans; one never parked is left alone', async () => {
+    const f = deps();
+    const parked = 'scan parked on codex-cli: cannot reach the codex runner. Readiness will be checked again with backoff before the repository is copied.';
+    expect(await runScanJob(job({ provider: 'claude-cli', error: parked, parkedAt: '2026-11-12T00:00:00.000Z', retryAt: '2026-11-12T00:30:00.000Z' }), f.d)).toBe(true);
+    expect(f.updates).toEqual([['j1', { parkedAt: null, error: null, retryAt: null }]]);
+    await runScanJob(job({ error: null }), f.d);
+    expect(f.updates).toHaveLength(1);
+  });
+
   test('a sharded scan going on after giving way is not mapped again, and its turn is passed on', async () => {
     let gotTurn: unknown;
     const f = deps({ scan: async (_j, _m, turn) => { gotTurn = turn; return { ...done, paused: true }; } });

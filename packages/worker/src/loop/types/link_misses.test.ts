@@ -37,6 +37,13 @@ describe('linkCandidate: the floors', () => {
     expect(linkCandidate(m, older('miss:old', { embedding: axis(0, 1.5) }))).toBeNull();
     expect(linkCandidate(m, older('miss:old', { embedding: null }))).toBeNull();
   });
+  test('two misses flagged in one PR thread or one session (its segments too) are never a repeat; other threads are', () => {
+    const pr = (id: string, thread: string) => loopMiss(id, { embedding: axis(0, 0.2), sessionId: thread });
+    expect(linkCandidate(pr('miss:b', 'github:acme/shop#7'), older('miss:a', { sessionId: 'github:acme/shop#7' }))).toBeNull();
+    expect(linkCandidate(pr('miss:b', 'github:acme/shop#8'), older('miss:a', { sessionId: 'github:acme/shop#7' }))).not.toBeNull();
+    expect(linkCandidate(pr('miss:b', 's1#2'), older('miss:a', { sessionId: 's1' }))).toBeNull();
+    expect(linkCandidate(pr('miss:b', 's2'), older('miss:a', { sessionId: 's1' }))).not.toBeNull();
+  });
   test('many shared files: the feature caps at 3 and the rationale names three', () => {
     const files = ['a', 'b', 'c', 'd', 'e'];
     const c = linkCandidate(loopMiss('miss:n', { editedFiles: files }), older('miss:o', { editedFiles: files }))!;

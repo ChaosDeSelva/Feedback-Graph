@@ -26,6 +26,8 @@ export type ProjectSettings = {
   candidates: ProjectCandidate[];
   /** Sessions outside every root, and the folders they ran in that could be added as roots. */
   outsideRoots: { claudeSessions: number; codexSessions: number; folders: OutsideFolder[] };
+  /** Sessions that only ran in a root itself or a folder above one (none of their turns is read); unset from older APIs. */
+  atRoots?: OutsideFolder[];
   /** The mounted roots, as host paths. */
   roots: string[];
   /** Roots saved here that are not mounted yet (./scripts/setup.sh mounts them); null when nothing is waiting. */

@@ -78,6 +78,25 @@ test('PATCH approving without text changes does not re-embed', async () => {
   expect(calls).toContainEqual(['update', 'lesson:a', { status: 'approved' }, { reembed: undefined, by: 'you' }]);
 });
 
+test('PATCH takes an optional note: on the lesson (its decided note) and on its Activity entry, so an edit can say why', async () => {
+  const recorded: ActivityInput[] = [];
+  const { calls } = setup();
+  const knowledge = {
+    ...QUIET,
+    listLessons: async () => [lesson],
+    lessonDetail: async () => ({ lesson, miss: null, feedback: null, contextItems: [], fixCommits: [], supersedes: [] }),
+    updateLesson: async (...a: unknown[]) => { calls.push(['update', ...a]); return { unscoped: false }; },
+  };
+  const app = createApp(repo, { auth: { ownerToken: OWNER }, knowledge, activity: { record: async (e: ActivityInput) => { recorded.push(e); } } as unknown as AppOpts['activity'] });
+  const res = await app.request('/api/lessons/lesson%3Aa', patch({ paths: ['src/checkout.ts'], note: '  only the checkout reads it ' }));
+  expect(res.status).toBe(200);
+  expect(calls).toContainEqual(['update', 'lesson:a', { paths: ['src/checkout.ts'] }, { reembed: undefined, by: 'you', note: 'only the checkout reads it' }]);
+  expect(recorded[0].details).toMatchObject({ note: 'only the checkout reads it', changed: { paths: { from: [], to: ['src/checkout.ts'] } } });
+  // A note alone is no change; an empty one is refused.
+  expect((await app.request('/api/lessons/lesson%3Aa', patch({ note: 'why' }))).status).toBe(400);
+  expect((await app.request('/api/lessons/lesson%3Aa', patch({ status: 'approved', note: '  ' }))).status).toBe(400);
+});
+
 test('PATCH editing the rule re-embeds the lesson text', async () => {
   const { app, calls, embedded } = setup();
   await app.request('/api/lessons/lesson%3Aa', patch({ rule: 'New rule', scope: 'global' }));

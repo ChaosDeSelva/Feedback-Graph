@@ -11,6 +11,7 @@ import {
   OUTCOME_STATUS,
   contextItemId,
   LESSON_CHECKS_VERSION,
+  TRIGGER_DERIVATION_VERSION,
   feedbackAuthorOf,
   evidenceOf,
   type LessonTriggers,
@@ -202,9 +203,9 @@ export class PgKnowledgeStore implements KnowledgeStore {
       // after the retry) is not written: the miss is.
       if (!pm.lessonDropped) await c.query(
         `INSERT INTO lessons (id, status, created_at, source, title, rule, applies_when, scope, paths, cause, miss_id,
-                              project_key, origin_project_key, embedding, checks, checks_version, run, sandbox, triggers)
+                              project_key, origin_project_key, embedding, checks, checks_version, run, sandbox, triggers, triggers_version)
          VALUES ($1, 'proposed', $2, 'postmortem', $3, $4, $5, $6, $7, $8, $9, CASE WHEN $6 = 'global' THEN NULL ELSE $10 END, $10, $11::vector, $12::jsonb,
-                 CASE WHEN $12::jsonb IS NULL THEN NULL ELSE $13::integer END, $14, $15, $16::jsonb)
+                 CASE WHEN $12::jsonb IS NULL THEN NULL ELSE $13::integer END, $14, $15, $16::jsonb, CASE WHEN $16::jsonb IS NULL THEN NULL ELSE $17::integer END)
          ON CONFLICT (id) DO UPDATE SET
            title = CASE WHEN lessons.proposed_as IS NULL THEN EXCLUDED.title ELSE lessons.title END,
            rule = CASE WHEN lessons.proposed_as IS NULL THEN EXCLUDED.rule ELSE lessons.rule END,
@@ -212,6 +213,7 @@ export class PgKnowledgeStore implements KnowledgeStore {
            scope = CASE WHEN lessons.proposed_as IS NULL THEN EXCLUDED.scope ELSE lessons.scope END,
            paths = CASE WHEN lessons.proposed_as IS NULL THEN EXCLUDED.paths ELSE lessons.paths END,
            triggers = CASE WHEN lessons.proposed_as IS NULL AND NOT lessons.triggers_owned THEN EXCLUDED.triggers ELSE lessons.triggers END,
+           triggers_version = CASE WHEN lessons.proposed_as IS NULL AND NOT lessons.triggers_owned THEN EXCLUDED.triggers_version ELSE lessons.triggers_version END,
            project_key = CASE WHEN lessons.proposed_as IS NULL THEN EXCLUDED.project_key ELSE lessons.project_key END,
            embedding = CASE WHEN lessons.proposed_as IS NULL THEN EXCLUDED.embedding ELSE lessons.embedding END,
            checks = CASE WHEN lessons.proposed_as IS NULL THEN EXCLUDED.checks ELSE lessons.checks END,
@@ -236,6 +238,7 @@ export class PgKnowledgeStore implements KnowledgeStore {
           r.sandbox === true,
           // Null: none derived, so the worker's backfill derives them.
           pm.lesson.triggers ? toJson(pm.lesson.triggers) : null,
+          TRIGGER_DERIVATION_VERSION,
         ],
       );
       // Fix commits: the session's commits made after the feedback, by real time (committers' offsets differ).
@@ -331,6 +334,20 @@ export class PgKnowledgeStore implements KnowledgeStore {
       [id, k],
     );
     return rows.map((r) => ({ id: r.id, cosine: Number(r.cosine), status: r.status as LessonStatus, createdAt: iso(r.created_at) as string }));
+  }
+
+  async threadTasks(): Promise<{ id: string; title: string | null; external: ExternalRef }[]> {
+    const { rows } = await this.q(
+      `SELECT DISTINCT ON (k.id) k.id, k.title, t.external FROM tasks k JOIN sessions s ON s.id = k.session_id
+         JOIN turns t ON t.session_id = s.id AND t.external IS NOT NULL
+       WHERE s.manual AND (s.id LIKE 'github:%' OR s.id LIKE 'linear:%') ORDER BY k.id, t.uuid`,
+    );
+    return rows.map((r) => ({ id: r.id, title: r.title ?? null, external: r.external as ExternalRef }));
+  }
+
+  async setTaskTitle(id: string, title: string): Promise<boolean> {
+    const { rowCount } = await this.q('UPDATE tasks SET title = $2 WHERE id = $1', [id, redactSecrets(title)]);
+    return (rowCount ?? 0) > 0;
   }
 
   async backfillProposedAs(id: string, draft: LessonDraft): Promise<boolean> {
@@ -452,7 +469,7 @@ export class PgKnowledgeStore implements KnowledgeStore {
            status = coalesce($12, status),
            decided_at = CASE WHEN $12::text IS NULL THEN decided_at ELSE $13 END,
            decided_by = CASE WHEN $12::text IS NULL THEN decided_by ELSE $15 END,
-           decision_note = CASE WHEN $12::text IS NULL THEN decision_note ELSE $16::text END,
+           decision_note = CASE WHEN $12::text IS NULL THEN coalesce($16::text, decision_note) ELSE $16::text END,
            embedding = CASE WHEN $14::vector IS NULL THEN embedding ELSE $14::vector END,
            -- New words are checked again at the worker's next round: a flag on the old words (broken-rule) must not stay.
            checks_version = CASE WHEN $2 OR $4 OR $6 OR $8 OR $10 THEN 0 ELSE checks_version END
@@ -576,8 +593,28 @@ export class PgKnowledgeStore implements KnowledgeStore {
 
   async setLessonTriggers(id: string, triggers: LessonTriggers): Promise<boolean> {
     const { rowCount } = await this.q(
-      `UPDATE lessons SET triggers = $2::jsonb WHERE id = $1 AND triggers IS NULL AND status IN ('proposed', 'approved')`,
-      [id, toJson(redactDeep(triggers))],
+      `UPDATE lessons SET triggers = $2::jsonb, triggers_version = $3 WHERE id = $1 AND triggers IS NULL AND status IN ('proposed', 'approved')`,
+      [id, toJson(redactDeep(triggers)), TRIGGER_DERIVATION_VERSION],
+    );
+    return !!rowCount;
+  }
+
+  async lessonsWithOldTriggers(version: number, limit: number): Promise<Lesson[]> {
+    const { rows } = await this.q(
+      `SELECT l.*, ${FROM} AS from_kind FROM lessons l ${FEEDBACK_TURN}
+       WHERE l.triggers IS NOT NULL AND NOT l.triggers_owned AND coalesce(l.triggers_version, 1) < $1
+         AND l.status IN ('proposed', 'approved') AND NOT l.sandbox
+       ORDER BY l.created_at, l.id LIMIT $2`,
+      [version, limit],
+    );
+    return rows.map(lessonOf);
+  }
+
+  async rederiveLessonTriggers(id: string, triggers: LessonTriggers, version: number): Promise<boolean> {
+    const { rowCount } = await this.q(
+      `UPDATE lessons SET triggers = $2::jsonb, triggers_version = $3
+       WHERE id = $1 AND triggers IS NOT NULL AND NOT triggers_owned AND coalesce(triggers_version, 1) < $3 AND status IN ('proposed', 'approved')`,
+      [id, toJson(redactDeep(triggers)), version],
     );
     return !!rowCount;
   }

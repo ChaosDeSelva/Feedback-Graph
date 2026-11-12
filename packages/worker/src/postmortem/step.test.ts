@@ -34,6 +34,23 @@ test('saves each post-mortem with miss and lesson embeddings', async () => {
   expect(emb.lesson).toEqual([embedTexts(pm).lesson.length]);
 });
 
+test("a comment's task is named after its PR, not the model's name for the work session it was matched to", async () => {
+  const saved: PostMortem[] = [];
+  const external = { source: 'github', thread: 'acme/shop#12', title: 'Round cart totals' };
+  await runPostmortems({
+    k: {
+      ...LESSON_STORE,
+      feedbackNeedingPostmortem: async () => [{ feedbackId: 'c1', feedback: { external } } as unknown as PostMortemInput, input('t1')],
+      savePostmortem: async (_id, p) => { saved.push(structuredClone(p)); },
+      recordPostmortemFailure: async () => ({ attempts: 1, retryAt: null }),
+    },
+    postmortem: async () => ({ ...pm, taskTitle: 'Refactor the settings page' }),
+    embed: async (texts) => texts.map(() => [1]),
+    batch: 2,
+  });
+  expect(saved.map((p) => p.taskTitle)).toEqual(['PR acme/shop#12: Round cart totals', 'Refactor the settings page']);
+});
+
 test('a dropped lesson: only the miss is embedded, no duplicate check runs, and Activity says why there is no lesson', async () => {
   const embedded: string[][] = [];
   const activity: ActivityInput[] = [];

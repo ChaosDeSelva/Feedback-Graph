@@ -145,12 +145,35 @@ export async function cachedHead(state: FileState, f: HeadFile, read: (path: str
 
 const SCAN_CHUNK = 1024 * 1024;
 
+/** A Claude Code record's own cwd: the first "cwd" key, when it comes before the message (whose content may quote one). */
+function claudeRecordCwd(line: Buffer): string | undefined {
+  const at = line.indexOf('"cwd"');
+  if (at < 0) return undefined;
+  const message = line.indexOf('"message"');
+  if (message >= 0 && message < at) return undefined;
+  return rawString(line.subarray(at, at + 8192).toString('utf8'), 'cwd');
+}
+
+/** A Codex turn_context record's cwd. */
+function codexRecordCwd(line: Buffer): string | undefined {
+  if (!line.includes('"turn_context"')) return undefined;
+  try {
+    return str(obj(obj(JSON.parse(line.toString('utf8')))?.payload)?.cwd);
+  } catch {
+    // not a whole record: skipped, as the parser skips it
+    return undefined;
+  }
+}
+
 /**
- * Every cwd a Codex rollout switched to after its head (turn_context records), so a session that moved into a selected
- * folder is read. Incremental: only bytes past the last scan are read, a line at a time, and only turn_context lines
- * are parsed; nothing else of the session is kept. A file that shrank (replaced) is scanned again from the start.
+ * Every cwd a session moved to after its head, so a session that moved into a selected folder is read: a Codex
+ * rollout's turn_context records, a Claude Code transcript's records (each carries the cwd it ran in; a session started
+ * in a folder holding projects often works in one of them). Incremental: only bytes past the last scan are read, a line
+ * at a time, and only the cwd is taken from each; nothing else of the session is kept. A file that shrank (replaced) is
+ * scanned again from the start.
  */
-export async function codexCwds(state: FileState, f: HeadFile): Promise<string[]> {
+export async function sessionCwds(state: FileState, f: HeadFile): Promise<string[]> {
+  const cwdOf = f.source === 'codex' ? codexRecordCwd : claudeRecordCwd;
   const known = state.getCwds(f.path);
   let from = known && known.scanned <= f.size ? known.scanned : 0;
   const cwds = new Set(from ? known!.cwds : []);
@@ -175,14 +198,8 @@ export async function codexCwds(state: FileState, f: HeadFile): Promise<string[]
         const line = data.subarray(0, nl);
         data = data.subarray(nl + 1);
         from += line.length + 1;
-        if (line.includes('"turn_context"')) {
-          try {
-            const cwd = str(obj(obj(JSON.parse(line.toString('utf8')))?.payload)?.cwd);
-            if (cwd) cwds.add(cwd);
-          } catch {
-            // not a whole record: skipped, as the parser skips it
-          }
-        }
+        const cwd = cwdOf(line);
+        if (cwd) cwds.add(cwd);
       }
       // A line longer than the buffer keeps growing here; a partial last line waits for the next scan.
       carry = Buffer.from(data);

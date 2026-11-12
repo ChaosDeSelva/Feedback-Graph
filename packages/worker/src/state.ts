@@ -21,9 +21,11 @@ function list(json: string | null | undefined): string[] {
  * fingerprints (ingest/fingerprint.ts), so a Codex import of one is recognised. 4: the branch the files were changed on
  * (not the one the session started on), and the tool calls after the last human turn (trailingToolCalls), the
  * evidence an instruction about git was broken. 5: the instruction files the transcript shows the agent had
- * (ingest/instructions.ts), the evidence a post-mortem judges "did not load AGENTS.md" against.
+ * (ingest/instructions.ts), the evidence a post-mortem judges "did not load AGENTS.md" against. 6: each Claude Code
+ * turn's content hash (ingest/fingerprint.ts turnHash), so a Codex import with turns of its own is still recognised; a
+ * Claude Code transcript split where it moved into another project's folder; compaction summaries left out.
  */
-export const INGEST_VERSION = 5;
+export const INGEST_VERSION = 6;
 
 /**
  * Bump when the rule that drops a Codex session as a copy of a Claude Code conversation changes, so Codex rollouts are
@@ -73,6 +75,8 @@ export class FileState {
     this.db.exec('CREATE TABLE IF NOT EXISTS conversations (fingerprint TEXT PRIMARY KEY, session_id TEXT NOT NULL)');
     // Codex sessions, judged once: a copy of this Claude Code session (copy_of), or Codex's own (null).
     this.db.exec('CREATE TABLE IF NOT EXISTS codex_sessions (session_id TEXT PRIMARY KEY, copy_of TEXT)');
+    // Claude Code turns by content hash: a Codex session holding several of one session's turns is an import of it.
+    this.db.exec('CREATE TABLE IF NOT EXISTS claude_turns (hash TEXT PRIMARY KEY, session_id TEXT NOT NULL)');
   }
 
   private addColumn(table: string, column: string, type: string) {
@@ -170,6 +174,23 @@ export class FileState {
   /** Remember a Claude Code conversation's fingerprint (the first session to have it keeps it). */
   rememberConversation(fingerprint: string, sessionId: string) {
     this.db.prepare('INSERT INTO conversations (fingerprint, session_id) VALUES (?, ?) ON CONFLICT(fingerprint) DO NOTHING').run(fingerprint, sessionId);
+  }
+
+  /** Remember a Claude Code session's turn hashes (the first session to have one keeps it). */
+  rememberTurns(sessionId: string, hashes: string[]) {
+    const put = this.db.prepare('INSERT INTO claude_turns (hash, session_id) VALUES (?, ?) ON CONFLICT(hash) DO NOTHING');
+    for (const h of hashes) put.run(h, sessionId);
+  }
+
+  /** The Claude Code session each of these turn hashes was first seen in (hashes never seen are left out). */
+  turnOrigins(hashes: string[]): Map<string, string> {
+    const get = this.db.prepare('SELECT session_id FROM claude_turns WHERE hash = ?');
+    const out = new Map<string, string>();
+    for (const h of hashes) {
+      const row = get.get(h) as { session_id: string } | undefined;
+      if (row) out.set(h, row.session_id);
+    }
+    return out;
   }
 
   /** The Claude Code session with this fingerprint, or null. */

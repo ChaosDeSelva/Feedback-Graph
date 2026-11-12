@@ -43,6 +43,11 @@ export type CandidateSnapshot = {
   candidates: FolderCandidate[];
   /** Sessions whose cwd is outside every root: add a root to make them selectable. */
   outsideRoots: OutsideRoots;
+  /**
+   * Sessions that only ever ran in a root itself or a folder above one (started in ~/Code and never moved into one
+   * project's folder), by that folder, most first: no turn of theirs is read. Unset in snapshots from older workers.
+   */
+  atRoots?: OutsideFolder[];
   /** Whether the Codex sessions folder was there to read. */
   codexSessionsFound: boolean;
 };

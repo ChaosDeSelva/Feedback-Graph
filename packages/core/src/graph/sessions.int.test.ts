@@ -177,6 +177,17 @@ describeStores('SessionsStore', (h) => {
     expect((await s.turns('s1', -1, 2)).map((t) => t.text)).toEqual(['s1 turn 0', 's1 turn 1']);
   });
 
+  test('a turn read again as part of another session (a transcript now split where it changed project) is only that one\'s', async () => {
+    const whole = session('s9', 3, 20 * MIN);
+    await repo.upsertSession(demo, whole, []);
+    // Read again: the last two turns were typed in the other project's folder.
+    await repo.upsertSession(demo, { ...whole, turns: whole.turns.slice(0, 1) }, []);
+    const moved = whole.turns.slice(1).map((t) => ({ ...t, sessionId: 's9#2' }));
+    await repo.upsertSession(other, { ...whole, sessionId: 's9#2', cwd: '/vibe/other', turns: moved }, []);
+    expect((await s.turns('s9', -1, 10)).map((t) => t.index)).toEqual([0]);
+    expect((await s.turns('s9#2', -1, 10)).map((t) => t.index)).toEqual([1, 2]);
+  });
+
   test('work: a quiet delta or a big one is due; an active one is not; never-summarized history is backfill', async () => {
     await repo.upsertSession(demo, session('busy', 3, 1 * MIN), []); // new, still active, small delta
     await repo.upsertSession(demo, session('quiet', 3, 15 * MIN), []); // went quiet

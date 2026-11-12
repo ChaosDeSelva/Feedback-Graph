@@ -1,14 +1,48 @@
-import { providerUnavailableReason, type FactsStore, type ScanJob } from '@fb/core';
+import { providerUnavailableReason, SCAN_PARK_GAVE_UP, type FactsStore, type ScanJob } from '@fb/core';
 
-/** Refresh even old/future parked jobs so every project explains the same provider outage. */
-export async function parkScanProvider(facts: Pick<FactsStore, 'scanQueue' | 'updateScanJob'>, provider: string, fallback: string, reason: string, retryAt: string): Promise<void> {
+/** A scan whose model has failed every readiness probe for this long is failed with the reason, not parked again. */
+export const SCAN_PARK_LIMIT_MS = 24 * 3600_000;
+const PARKED = /^scan parked on ([^:]+):/;
+
+/** The provider a queued job's park message names, or null when it is not parked. */
+export const parkedOn = (job: Pick<ScanJob, 'error'>): string | null => job.error?.match(PARKED)?.[1]?.trim() ?? null;
+
+/**
+ * Refresh even old/future parked jobs so every project explains the same provider outage. A job parked for more than
+ * SCAN_PARK_LIMIT_MS (from when its first probe failed, across restarts) is failed with the reason instead: a provider
+ * down for a day needs the owner, and a queued job never counts an attempt, so it would otherwise wait for good.
+ */
+export async function parkScanProvider(facts: Pick<FactsStore, 'scanQueue' | 'updateScanJob'>, provider: string, fallback: string, reason: string, retryAt: string, now = Date.now()): Promise<void> {
   const clean = reason.trim().replace(/[.;:\s]+$/, '');
   const error = `scan parked on ${provider}: ${clean}. Readiness will be checked again with backoff before the repository is copied.`;
   for (const job of await facts.scanQueue()) {
-    if (job.status === 'queued' && (job.provider?.trim() || fallback) === provider)
-      // The error names the resolved default even when the immutable request field is null, so the UI can avoid it.
-      await facts.updateScanJob(job.id, { error, retryAt });
+    if (job.status !== 'queued' || (job.provider?.trim() || fallback) !== provider) continue;
+    const since = job.parkedAt ?? new Date(now).toISOString();
+    if (now - Date.parse(since) > SCAN_PARK_LIMIT_MS) {
+      await facts.updateScanJob(job.id, {
+        status: 'failed', retryAt: null, parkedAt: null,
+        error: `${SCAN_PARK_GAVE_UP}${provider} (since ${since}): ${clean}. Fix it, or choose another scan model (SCAN_LLM, or the project's scan model), then scan again.`,
+      });
+      continue;
+    }
+    // The error names the resolved default even when the immutable request field is null, so the UI can avoid it.
+    await facts.updateScanJob(job.id, { error, retryAt, parkedAt: since });
   }
+}
+
+/**
+ * Queued jobs parked on a provider they no longer resolve to (SCAN_LLM changed since): the old park reason, its
+ * backoff and its park time are cleared, so each runs now on the current model and no page shows the old outage.
+ */
+export async function clearStaleParks(facts: Pick<FactsStore, 'scanQueue' | 'updateScanJob'>, resolve: (job: ScanJob) => string): Promise<number> {
+  let n = 0;
+  for (const job of await facts.scanQueue()) {
+    const on = parkedOn(job);
+    if (job.status !== 'queued' || !on || on === resolve(job)) continue;
+    await facts.updateScanJob(job.id, { error: null, retryAt: null, parkedAt: null });
+    n++;
+  }
+  return n;
 }
 
 /** What a running scan can ask the runner. */
@@ -39,6 +73,8 @@ export type ScanRunnerDeps = {
   ready?(job: ScanJob): Promise<void>;
   providerKey?(job: ScanJob): string;
   parkProvider?(provider: string, error: string, retryAt: string): Promise<void>;
+  /** The job's model answered its readiness probe: a park reason or park time it still carries is cleared. */
+  unpark?(job: ScanJob): Promise<void>;
   now?(): number;
   log?: (msg: string, extra?: object) => void;
 };
@@ -166,6 +202,8 @@ export class ScanRunner {
           if (passedOver.length >= MAX_PASSED_OVER) return;
           continue;
         }
+        // It answers now (or the job resolves to another model since): the old outage no longer explains this job.
+        if (job.parkedAt || parkedOn(job)) await this.d.unpark?.(job);
       }
       const agentic = this.d.agentic(job);
       const full = this.active.size >= Math.max(1, this.d.concurrency);

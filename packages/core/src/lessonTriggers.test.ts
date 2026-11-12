@@ -84,7 +84,11 @@ describe('the shape of a trigger', () => {
     expect(genericTrigger('path', '**/*.ts', repo)).toMatch(/80% of the repository's files/);
     expect(genericTrigger('path', 'db/**', repo)).toBeNull();
     // Too few files to judge breadth by share.
-    expect(genericTrigger('path', '**/*.ts', repo.slice(0, 10))).toBeNull();
+    expect(genericTrigger('path', '**/*.ts', repo.slice(0, 10), { broad: true })).toBeNull();
+    // A kind of file anywhere, or with no folder, names no place, however few files it matches.
+    for (const glob of ['**/*.sql', '**/migrations/**', '*.sql', '**/Dockerfile*']) expect(genericTrigger('path', glob, repo.slice(0, 10)), glob).toMatch(/anywhere in the repository/);
+    expect(genericTrigger('path', 'db/migrations/*.sql')).toBeNull();
+    expect(genericTrigger('path', 'Makefile')).toBeNull();
     expect(PATH_SHARE_MAX).toBeLessThan(1);
   });
 });
@@ -173,6 +177,14 @@ describe('matchTriggers', () => {
     expect(matchTriggers(t, { files: [], added: [{ path: '', text: 'create index x' }] })).toEqual({ kind: 'pattern', trigger: 'CREATE\\s+INDEX', on: '(a file the diff does not name)' });
   });
 
+  test('on the task\'s words only a name shaped like code fires: a pattern or a word-like name is a word the task shares with the lesson', () => {
+    const loose = { paths: ['services/billing/*.go'], patterns: ['retry\\s+budget', 'TIMEOUT'], symbols: ['Invoice', 'RETRIES'] };
+    expect(matchTriggers(loose, { files: ['web/app.ts'], text: 'raise the retry budget and the TIMEOUT for Invoice RETRIES' })).toBeNull();
+    // The same words on a line the change adds still fire, as does a code-shaped name in the task.
+    expect(matchTriggers(loose, { files: [], added: [{ path: 'a.go', text: 'const TIMEOUT = 5' }] })?.trigger).toBe('TIMEOUT');
+    expect(matchTriggers({ ...loose, symbols: ['retry_budget'] }, { files: [], text: 'raise retry_budget' })).toEqual({ kind: 'symbol', trigger: 'retry_budget', on: null });
+  });
+
   test('a symbol fires only as a whole name; a pattern that does not compile never fires', () => {
     expect(matchTriggers({ paths: [], patterns: ['(['], symbols: ['to_thread'] }, { files: [], added: [{ path: 'a.py', text: 'run_to_threads()' }], text: 'to_threadx' })).toBeNull();
   });
@@ -190,64 +202,57 @@ describe('matchTriggers', () => {
 });
 
 describe('deriveTriggers: no model', () => {
-  const repo = [...Array.from({ length: 60 }, (_, i) => `src/app/m${i}.ts`), 'db/migrations/0040_users.sql', 'deploy/k8s/api.yaml', 'docs/search.md'];
+  const repo = [...Array.from({ length: 60 }, (_, i) => `src/app/m${i}.ts`), 'db/migrations/0040_users.sql', 'deploy/k8s/api.yaml', 'docs/search.md', 'src/sync/agent/run.py', 'deploy/charts/x.yaml', 'deploy/docker/Dockerfile'];
+  const derive = (o: Partial<Parameters<typeof deriveTriggers>[0]>) => deriveTriggers({ rule: 'r', appliesWhen: 'w', files: [], repoFiles: repo, ...o });
 
-  test("the miss's files widened to their folder and extension; a deep folder to everything under it, a shallow one not at all", () => {
-    expect(deriveTriggers({ rule: 'r', appliesWhen: 'w', evidence: '', files: ['db/migrations/0040_users.sql', 'src/sync/agent', 'deploy/charts', 'Makefile', '/abs/x.ts'], repoFiles: repo }).paths)
+  test("the lesson's files widened to their folder and extension; a deep folder the repository has to everything under it, a shallow one not at all", () => {
+    expect(derive({ files: ['db/migrations/0040_users.sql', 'src/sync/agent', 'deploy/charts', 'Makefile', '/abs/x.ts'] }).paths)
       .toEqual(['db/migrations/*.sql', 'src/sync/agent/**']);
   });
 
-  test('a kind of file the lesson\'s own words name, never one the feedback mentions in passing or inside a path', () => {
-    const kinds = (rule: string, evidence = '') => deriveTriggers({ rule, appliesWhen: '', evidence, files: [], repoFiles: repo }).paths;
+  test('a file with no extension is that file, never a folder glob; without the repository no folder is widened', () => {
+    expect(derive({ files: ['deploy/docker/Dockerfile'] }).paths).toEqual(['deploy/docker/Dockerfile']);
+    expect(derive({ files: ['deploy/docker/Dockerfile', 'src/sync/agent'], repoFiles: null }).paths).toEqual([]);
+  });
+
+  test('a kind of file anywhere only when the rule says it of every such file; never from "applies when" or in passing', () => {
+    const kinds = (rule: string, appliesWhen = '') => derive({ rule, appliesWhen }).paths;
     expect(kinds('Every SQL query change needs EXPLAIN evidence')).toEqual(['**/*.sql']);
     expect(kinds('Keep each Kubernetes manifest in one place')).toEqual(['**/*.yaml', '**/*.yml']);
-    expect(kinds('State the gate in the docs exactly')).toEqual(['**/*.md']);
-    expect(kinds('Write migrations that run twice')).toEqual(['**/migrations/**']);
     expect(kinds('Pin the base image in each Dockerfile; never `latest`')).toEqual(['**/Dockerfile*']);
-    expect(kinds('Reference IPs from gke.tf in Terraform')).toEqual(['**/*.tf']);
-    expect(kinds('Paginate gh pr list in GitHub Actions workflows')).toEqual(['.github/workflows/**']);
     expect(kinds('Version every protobuf message')).toEqual(['**/*.proto']);
-    expect(kinds('Quote variables in shell scripts')).toEqual(['**/*.sh']);
-    expect(kinds('Give each test binary its own database in *_test.go files')).toEqual(['**/*_test.go']);
-    // In passing, in a path, or "documentation" (docstrings as often as files): none.
-    expect(kinds('Keep QA captures local', 'Committed docs/qa/capture-manifest.json with SQL')).toEqual([]);
-    expect(kinds('Name tools in prose when documenting them')).toEqual([]);
-    // A kind matching most of the repository is no trigger.
-    expect(deriveTriggers({ rule: 'Every SQL change', appliesWhen: '', evidence: '', files: [], repoFiles: repo.map((f) => f.replace(/\.ts$/, '.sql')) }).paths).toEqual([]);
+    expect(kinds('Give each _test.go file its own database')).toEqual(['**/*_test.go']);
+    // Named, but not of every such file: a lesson about one query or one migration.
+    expect(kinds('Run EXPLAIN on the SQL of the user lookup')).toEqual([]);
+    expect(kinds('Write migrations that run twice')).toEqual([]);
+    expect(kinds('Quote variables in shell scripts')).toEqual([]);
+    expect(kinds('Pass cents to chargeCard from the /checkout route', 'changing a SQL query or an index')).toEqual([]);
+    // A kind matching most of the repository is no trigger, however it is said.
+    expect(derive({ rule: 'Every SQL change', repoFiles: repo.map((f) => f.replace(/\.ts$/, '.sql')) }).paths).toEqual([]);
   });
 
-  test('a kind of file named only in the "applies when" needs a file of that kind in the miss', () => {
-    const when = (appliesWhen: string, files: string[]) => deriveTriggers({ rule: 'Pass cents to chargeCard from the /checkout route', appliesWhen, evidence: '', files, repoFiles: repo }).paths;
-    // A "when" the writer copied from an example, on a lesson about a route: no `**/*.sql`.
-    expect(when('changing a SQL query or an index', ['src/web/routes.ts'])).toEqual(['src/web/*.ts']);
-    expect(when('changing a SQL query or an index', ['db/migrations/0040_users.sql'])).toEqual(['db/migrations/*.sql', '**/*.sql']);
-    expect(when('editing migrations', ['db/migrations/0040_users.sql'])).toEqual(['db/migrations/*.sql', '**/migrations/**']);
-  });
-
-  test('names shaped like code, from the words and the quoted code; a backticked phrase as a literal pattern; never a file, a word or an acronym', () => {
-    const t = deriveTriggers({
-      rule: 'Wrap each `FlushBatch` commit in asyncio.to_thread', appliesWhen: 'writing to the object store from async code',
-      evidence: 'Set `safe-to-evict: "false"` with --dry-run=false; bind DRY_RUN; call parse_payload(x) in api/handler.py; `README.md`; `ok`; JSON and YAML; see https://x.test/a',
-      files: [],
+  test("names shaped like code from the rule alone: not from the feedback, the cited code or the rule's examples, and no pattern", () => {
+    const t = derive({
+      rule: 'Wrap each `FlushBatch` commit in asyncio.to_thread and bind DRY_RUN (e.g. `run_batch(dry_run=True)` or parse_payload(x)); `README.md`; `ok`; JSON',
+      appliesWhen: 'writing to the object store from async code with write_object',
     });
-    expect(t.symbols).toEqual(['FlushBatch', 'asyncio.to_thread', '--dry-run', 'DRY_RUN', 'parse_payload']);
-    expect(t.patterns).toEqual(['safe-to-evict: "false"']);
+    expect(t.symbols).toEqual(['FlushBatch', 'asyncio.to_thread', 'DRY_RUN']);
+    expect(t.patterns).toEqual([]);
+    expect(derive({ rule: 'Escape the header row.\n```\nwriter.writerow(escape_row(header))\n```' }).symbols).toEqual([]);
   });
 
   test('no symbol from a product or proper name or a word in capitals: those fire on any line that mentions them', () => {
-    const symbols = (rule: string, evidence = '') => deriveTriggers({ rule, appliesWhen: '', evidence, files: [] }).symbols;
+    const symbols = (rule: string) => derive({ rule }).symbols;
     expect(symbols('Pin GitHub Actions to a commit SHA')).toEqual([]);
     expect(symbols('Never use any in TypeScript code')).toEqual([]);
     expect(symbols('Run EXPLAIN on PostgreSQL queries')).toEqual([]);
-    expect(symbols('Resolve the TODO before merging', 'FIXME: this is still wrong, see the FIXME in JavaScript and macOS builds')).toEqual([]);
-    // Code-shaped names stay: camelCase, snake_case and CONSTANTS, dotted members, calls.
-    expect(symbols('Pass cents to chargeCard; pin STRIPE_API_VERSION; call stripe.refunds.create', 'Check the result of getUser() for null'))
+    expect(symbols('Pass cents to chargeCard; pin STRIPE_API_VERSION; call stripe.refunds.create and check getUser() for null'))
       .toEqual(['chargeCard', 'STRIPE_API_VERSION', 'stripe.refunds.create', 'getUser']);
   });
 
   test('at most eight of a kind', () => {
     const names = Array.from({ length: 12 }, (_, i) => `NAME_${i}`).join(' ');
-    expect(deriveTriggers({ rule: names, appliesWhen: '', evidence: '', files: [] }).symbols).toHaveLength(MAX_TRIGGERS);
+    expect(deriveTriggers({ rule: names, appliesWhen: '', files: [] }).symbols).toHaveLength(MAX_TRIGGERS);
   });
 
   test('mergeTriggers: the derived first, then the model\'s, once each, at most eight', () => {
@@ -377,9 +382,8 @@ describe('no trigger can stall the api (sweep 4 S1): matching is linear in the t
 describe('secrets never become triggers (sweep 4 NEW-3, NEW-8)', () => {
   test('deriveTriggers widens no secret file and takes no [REDACTED] for a name', () => {
     const t = deriveTriggers({
-      rule: 'Load the Stripe key from the environment, never hardcode it in src/pay.ts.', appliesWhen: 'changing payment code',
-      evidence: 'Agent wrote STRIPE_KEY=[REDACTED] in config/prod.env and `[REDACTED]` in src/pay.ts',
-      files: ['config/prod.env', 'certs/server.key', 'deploy/k8s/secrets', 'src/pay.ts'],
+      rule: 'Load STRIPE_KEY from the environment, never `[REDACTED]` in src/pay.ts.', appliesWhen: 'changing payment code',
+      files: ['config/prod.env', 'certs/server.key', 'deploy/k8s/secrets', 'src/pay.ts'], repoFiles: ['deploy/k8s/secrets/a.yaml', 'src/pay.ts'],
     });
     expect(t.paths).toEqual(['src/*.ts']);
     expect([...t.symbols, ...t.patterns].filter((v) => v.includes('REDACTED'))).toEqual([]);

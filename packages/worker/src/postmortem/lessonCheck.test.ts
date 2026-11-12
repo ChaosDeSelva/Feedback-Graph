@@ -157,6 +157,27 @@ test("a rule that starts with an imperative is a rule, not a fact (the team's ki
   }
 });
 
+test('a rule with an imperative anywhere is never a fact; a fact needs a declarative statement about the code', () => {
+  const factLike = (rule: string) => checkLesson(lesson(rule), feedback('this is wrong')).flags.some((f) => f.name === 'looks-like-a-fact');
+  for (const rule of [
+    'Retries are capped at 3 in jobs/retry.ts. Don\u2019t raise the cap.',
+    'The config loader is strict: unknown keys are errors. Keep the schema in config/schema.ts in sync.',
+    'Webhook payloads are signed. Verify the signature in hooks/verify.ts before parsing!',
+    'Uploads are streamed by api/upload.ts \u2014 never buffer them in memory.',
+    'The ledger table is append-only, so callers must insert a reversal instead of an update.',
+    'Exports are paged in api/export.ts and you should always pass the cursor.',
+    'The cache in lib/cache.ts is per process. Use the shared one in tests.',
+  ]) expect(factLike(rule), rule).toBe(false);
+  // "Remember ..." with nothing declarative after it is no statement about the code.
+  expect(factLike('Remember the billing team')).toBe(false);
+  for (const rule of [
+    'Keep in mind that the queue retries each job three times.',
+    'The poller caps each batch at 500 rows.',
+    'Every new endpoint is registered in api/routes.ts.',
+    'The web app never sees the raw token; the gateway holds it.',
+  ]) expect(factLike(rule), rule).toBe(true);
+});
+
 test('a rule field holding the scope word takes the title as the rule and is flagged', () => {
   const r = checkLesson(lesson('task', { title: 'Assert the timezone offset, not its name, in session tests' }), feedback('this fails in CI'));
   expect(r.lesson.rule).toBe('Assert the timezone offset, not its name, in session tests');

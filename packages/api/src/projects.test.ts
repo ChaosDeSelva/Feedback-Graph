@@ -173,14 +173,14 @@ test('GET /api/projects leaves the link count out when there is no links store',
   expect(list[0].links).toBeUndefined();
 });
 
-test('GET /api/projects counts the files an older scanner read (the next scan you start reads them again); none: absent', async () => {
+test('GET /api/projects counts the files an older scanner read and those no scanner version was recorded for, apart (the next scan you start reads them again); none: absent', async () => {
   const asked: string[] = [];
   const withOlder = createApp(repo, {
-    facts: { ...plainFacts(), olderScannerFiles: async (v: string) => { asked.push(v); return new Map([['alpha', 12], ['hidden', 3]]); } },
+    facts: { ...plainFacts(), olderScannerFiles: async (v: string) => { asked.push(v); return new Map([['alpha', { older: 12, never: 0 }], ['beta', { older: 0, never: 4 }], ['hidden', { older: 3, never: 1 }]]); } },
     projectDirs: async () => [{ key: 'alpha', name: 'alpha', repoPath: '/vibe/alpha' }, { key: 'beta', name: 'beta', repoPath: '/vibe/beta' }],
   });
   const list = (await (await withOlder.request('/api/projects')).json()) as ProjectSummary[];
-  expect(list.map((p) => [p.key, p.olderScanner])).toEqual([['alpha', 12], ['beta', undefined]]);
+  expect(list.map((p) => [p.key, p.olderScanner, p.neverScanned])).toEqual([['alpha', 12, undefined], ['beta', undefined, 4]]);
   expect(asked).toEqual([SCANNER_VERSION]);
   // A store without the count: nothing is said.
   const { app } = setup();

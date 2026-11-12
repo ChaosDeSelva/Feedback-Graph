@@ -1,5 +1,5 @@
 import { execFile } from 'node:child_process';
-import { lstat, readdir } from 'node:fs/promises';
+import { lstat, readdir, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
 import { cleanLessonPath, nfcPaths, pathMatches } from '@fb/core';
@@ -15,7 +15,8 @@ const run = promisify(execFile);
 export async function repoHas(repoPath: string | null | undefined, path: string): Promise<boolean> {
   if (!repoPath) return true;
   if (!cleanLessonPath(path)) return false;
-  if (await lstat(join(repoPath, path)).catch(() => null)) return true;
+  // stat follows a symlink: a path through a linked folder is there, a link whose target is gone is not.
+  if (await stat(join(repoPath, path)).catch(() => null)) return true;
   // The repository itself is not here (not mounted, or a path from another machine): nothing to check against.
   return !(await lstat(repoPath).catch(() => null));
 }
@@ -174,6 +175,13 @@ function resolveIn(p: string, files: string[]): { path: string; drop?: string; a
   return { path: p, drop: NO_SUCH_FILE };
 }
 
+/** A path under an entry git lists as a file (a symlinked folder) that the disk has, following the link. */
+async function throughLink(p: string, listing: string[], exists: ((path: string) => Promise<boolean>) | undefined): Promise<boolean> {
+  const parts = p.split('/');
+  const linked = parts.slice(1).some((_, i) => listing.includes(parts.slice(0, i + 1).join('/')));
+  return linked && !!exists && (await exists(p).catch(() => false));
+}
+
 const listOnce = async (repoFiles: PathEvidence['repoFiles']) => (repoFiles ? await repoFiles().catch(() => null) : null);
 
 /** What normalizeStoredPaths did to a stored lesson's paths. */
@@ -200,6 +208,8 @@ export async function normalizeStoredPaths(stored: string[], o: { exists?: (path
         out.dropped.push({ path: raw, why: NO_GLOB_MATCH });
         continue;
       }
+    } else if (listing && (await throughLink(p, listing, o.exists))) {
+      // As written: git lists a symlinked folder as one file, not what is under it, and the disk has the path through it.
     } else if (listing) {
       const found = resolveIn(p, listing);
       if (found.drop) {

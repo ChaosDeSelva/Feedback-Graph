@@ -40,8 +40,9 @@ describe('lessonOutcome', () => {
     expect(lessonOutcome(lesson({ status: 'rejected', decidedBy: 'you' }))).toBe('rejected');
     // Recorded before decidedBy was: the owner (only the UI decided then).
     expect(lessonOutcome(lesson({ status: 'rejected', decidedBy: null }))).toBe('rejected');
-    // An operator acts on the owner's authority (the owner gave it the token): counted, and labelled in lessonQuality.
-    expect(lessonOutcome(lesson({ status: 'rejected', decidedBy: 'operator:codex' }))).toBe('rejected');
+    // An operator acts on the owner's authority, but its decision is not the owner's judgement: none (counted apart).
+    expect(lessonOutcome(lesson({ status: 'rejected', decidedBy: 'operator:codex' }))).toBeNull();
+    expect(lessonOutcome(lesson({ status: 'approved', decidedBy: 'operator' }))).toBeNull();
   });
 });
 
@@ -85,8 +86,9 @@ describe('lessonQuality', () => {
       lesson({ decidedAt: ago(4), status: 'rejected', decidedBy: 'postmortem' }),
       lesson({ decidedAt: ago(5), status: 'rejected', decidedBy: 'operator:codex' }),
     ];
-    expect(lessonQuality(ls, 30, now)).toEqual({ days: 30, asWritten: 1, edited: 1, rejected: 1, decided: 3, byOperator: 1 });
-    expect(lessonQuality(ls, 90, now)).toEqual({ days: 90, asWritten: 1, edited: 1, rejected: 2, decided: 4, byOperator: 1 });
+    // The operator's decision is counted apart, never in decided.
+    expect(lessonQuality(ls, 30, now)).toEqual({ days: 30, asWritten: 1, edited: 1, rejected: 0, decided: 2, byOperator: 1 });
+    expect(lessonQuality(ls, 90, now)).toEqual({ days: 90, asWritten: 1, edited: 1, rejected: 1, decided: 3, byOperator: 1 });
   });
 });
 
@@ -103,9 +105,10 @@ describe('lessonQualityReport', () => {
     ], { now });
     const w = (days: number, asWritten: number, edited: number, rejected: number, byOperator = 0) =>
       ({ days, asWritten, edited, rejected, decided: asWritten + edited + rejected, byOperator });
+    // lesson:2, the operator's rejection, is counted apart: not in rejected or decided.
     expect(report).toEqual({
-      windows: [w(30, 1, 1, 0), w(90, 1, 1, 1, 1)],
-      projects: { acme: [w(30, 1, 0, 0), w(90, 1, 0, 1, 1)], 'github.com/acme/web': [w(30, 0, 1, 0), w(90, 0, 1, 0)] },
+      windows: [w(30, 1, 1, 0), w(90, 1, 1, 0, 1)],
+      projects: { acme: [w(30, 1, 0, 0), w(90, 1, 0, 0, 1)], 'github.com/acme/web': [w(30, 0, 1, 0), w(90, 0, 1, 0)] },
     });
     expect(lessonQualityReport([], { now, capped: true })).toEqual({ windows: [w(30, 0, 0, 0), w(90, 0, 0, 0)], projects: {}, capped: true });
   });

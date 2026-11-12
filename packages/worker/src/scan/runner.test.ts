@@ -1,6 +1,6 @@
 import type { ScanJob } from '@fb/core';
 import { describe, expect, test, vi } from 'vitest';
-import { parkScanProvider, ScanRunner, type ScanRunnerDeps } from './runner.ts';
+import { clearStaleParks, parkScanProvider, ScanRunner, type ScanRunnerDeps } from './runner.ts';
 
 const job = (id: string, provider: string | null = null): ScanJob => ({
   id, projectKey: id, repoPath: `/vibe/${id}`, provider, status: 'queued', requestedAt: 't', startedAt: null, finishedAt: null,
@@ -288,9 +288,51 @@ test('provider outage refreshes all queued peers, preserving attempts and exclud
   await parkScanProvider({
     scanQueue: async () => queue.map(j => ({ ...j, waitingSince: j.requestedAt })),
     updateScanJob: async (id, patch) => { updates.push({ id, patch }); },
-  }, 'codex-cli', 'codex-cli', 'new sandbox error', '2030-01-01T00:02:00Z');
+  }, 'codex-cli', 'codex-cli', 'new sandbox error', '2030-01-01T00:02:00Z', Date.parse('2030-01-01T00:00:00Z'));
   expect(updates).toEqual(['blank', 'explicit'].map(id => ({ id, patch: {
     error: 'scan parked on codex-cli: new sandbox error. Readiness will be checked again with backoff before the repository is copied.', retryAt: '2030-01-01T00:02:00Z',
+    parkedAt: '2030-01-01T00:00:00.000Z',
   } })));
   expect(queue[0].attempts).toBe(3);
+});
+
+const PARK = 'scan parked on codex-cli: cannot reach the codex runner. Readiness will be checked again with backoff before the repository is copied.';
+const queueOf = (jobs: ScanJob[], updates: { id: string; patch: object }[]) => ({
+  scanQueue: async () => jobs.map((j) => ({ ...j, waitingSince: j.requestedAt })),
+  updateScanJob: async (id: string, patch: object) => { updates.push({ id, patch }); },
+});
+
+test('a scan parked for more than a day is failed with the reason; one parked since less keeps its first park time', async () => {
+  const now = Date.parse('2026-11-12T12:00:00Z');
+  const old = { ...job('old'), error: PARK, parkedAt: '2026-11-11T11:59:00.000Z' };
+  const recent = { ...job('recent'), error: PARK, parkedAt: '2026-11-12T00:00:00.000Z' };
+  const updates: { id: string; patch: object }[] = [];
+  await parkScanProvider(queueOf([old, recent], updates), 'codex-cli', 'codex-cli', 'cannot reach the codex runner', '2026-11-12T12:30:00.000Z', now);
+  expect(updates).toEqual([
+    { id: 'old', patch: { status: 'failed', retryAt: null, parkedAt: null, error: 'gave up after more than 24 hours parked on codex-cli (since 2026-11-11T11:59:00.000Z): cannot reach the codex runner. Fix it, or choose another scan model (SCAN_LLM, or the project\'s scan model), then scan again.' } },
+    { id: 'recent', patch: { error: PARK, retryAt: '2026-11-12T12:30:00.000Z', parkedAt: '2026-11-12T00:00:00.000Z' } },
+  ]);
+});
+
+test('a scan parked on a model SCAN_LLM no longer names is cleared to run now on the current one', async () => {
+  // Requested with the default when it was codex-cli; SCAN_LLM is claude-cli now.
+  const stale = { ...job('stale'), error: PARK, retryAt: '2026-11-12T12:30:00.000Z', parkedAt: '2026-10-29T00:00:00.000Z' };
+  const pinned = { ...job('pinned', 'codex-cli'), error: PARK, retryAt: '2026-11-12T12:30:00.000Z', parkedAt: '2026-11-12T00:00:00.000Z' };
+  const updates: { id: string; patch: object }[] = [];
+  expect(await clearStaleParks(queueOf([stale, pinned, job('fresh')], updates), (j) => j.provider?.trim() || 'claude-cli')).toBe(1);
+  expect(updates).toEqual([{ id: 'stale', patch: { error: null, retryAt: null, parkedAt: null } }]);
+});
+
+test('a parked job whose model answers again has its park cleared before it runs', async () => {
+  const order: string[] = [];
+  const f = fakes([{ ...job('a'), error: PARK, parkedAt: '2026-11-12T00:00:00.000Z' }, job('b')], {
+    ready: async () => {},
+    unpark: async (j) => { order.push(`unpark ${j.id}`); },
+  });
+  const run = f.deps.run;
+  f.deps.run = (j, t) => { order.push(`run ${j.id}`); return run(j, t); };
+  const r = new ScanRunner(f.deps);
+  r.kick(); await f.settle(); await f.settle();
+  expect(order).toEqual(['unpark a', 'run a', 'run b']);
+  await f.release('a'); await f.release('b'); await r.idle();
 });

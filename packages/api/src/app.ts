@@ -1,6 +1,6 @@
 import { archiveRedactionInput, authorizeStoreWrite } from '@fb/core';
 import { LESSON_SHARING_NOTICE } from '@fb/core';
-import { CODE_MAP_LEASE_MS, OPERATOR_DEFAULT_VERBS } from '@fb/core';
+import { CODE_MAP_LEASE_MS, OPERATOR_DEFAULT_VERBS, SCAN_PARK_GAVE_UP } from '@fb/core';
 import { guardApiStoreWrites, mcpDiscoveryOnly } from './storeWriteGuard.ts';
 import { LegacyRunClaimError, withoutStoreWriteAuthorizer, withStoreWriteAuthorizer } from '@fb/core';
 import { requestDeadline } from './requestDeadline.ts';
@@ -363,8 +363,11 @@ const LessonPatch = z
     supersedes: z.string().optional(),
     // Narrowing a global lesson (scope project or task): the project it now serves. Only for a lesson that is global.
     projectKey: z.string().min(1).max(200).optional(),
+    // Why: kept as the lesson's decision note and on its Activity entry. Only with a change.
+    note: z.string().trim().min(1).max(4000).optional(),
   })
-  .strict();
+  .strict()
+  .refine((p) => p.note === undefined || Object.keys(p).length > 1, { message: 'a note goes with a change: send it with the status or the edit it explains' });
 
 const ExportQuery = z.object({ project: z.string().min(1).max(200).optional(), approved: z.enum(['1', 'true']).optional() });
 
@@ -437,6 +440,18 @@ export function scanQueueOf(entries: ScanQueueEntry[]): NonNullable<WorkQueues['
     running: running.map((j) => ({ what: j.projectKey, since: since(j), shards: shards(j) })),
     projects: entries.map((j) => ({ project: j.projectKey, status: j.status as 'queued' | 'running', since: since(j), shards: shards(j) })),
   };
+}
+
+/** Last scans waiting on a model that fails its readiness probe, and those failed after a day of it (SystemStatus.scans). */
+function parkedScans(projects: ProjectSummary[]): NonNullable<SystemStatus['scans']> {
+  const parked: NonNullable<SystemStatus['scans']>['parked'] = [];
+  const gaveUp: NonNullable<SystemStatus['scans']>['gaveUp'] = [];
+  for (const { key, lastScan: j } of projects) {
+    const on = j?.status === 'queued' ? j.error?.match(/^scan parked on ([^:]+):/)?.[1]?.trim() : null;
+    if (j && on) parked.push({ projectKey: key, provider: on, since: j.parkedAt ?? null, error: j.error! });
+    else if (j?.status === 'failed' && j.error?.startsWith(SCAN_PARK_GAVE_UP)) gaveUp.push({ projectKey: key, at: j.finishedAt, error: j.error });
+  }
+  return { parked, gaveUp };
 }
 
 /** /api/status stage and progress from a live worker's heartbeat (both null when it is offline or does not say). */
@@ -785,7 +800,8 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
     const runner = system?.runner ? await system.runner().catch(() => ({ ok: false, reason: 'codex runner health check failed' })) : null;
     const workerHealthy = !!worker && Date.now() - Date.parse(worker.lastBeat) < WORKER_STALE_MS;
     const models = worker ? modelHealth(worker, ollama, runner) : null;
-    const staleCodeMaps = graph && facts && codegraph ? await Promise.all((await facts.listProjects()).filter((p) => !sel || sel.tracked.includes(p.key)).map(async p => {
+    const selectedProjects = graph && facts ? (await facts.listProjects().catch(() => null))?.filter((p) => !sel || sel.tracked.includes(p.key)) ?? null : null;
+    const staleCodeMaps = selectedProjects && codegraph ? await Promise.all(selectedProjects.map(async p => {
       const meta = await codegraph.codeMapMeta(p.key).catch(() => null);
       if (!meta) return null;
       // No build time: a CodeMap node 0.7.5 made to record the failure of a first build that never finished (Neo4j).
@@ -810,6 +826,7 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
       authRequired: !!auth.token,
       ownerSetupRequired: !!auth.token && !auth.ownerToken,
       ...(staleCodeMaps && { codeMaps: staleCodeMaps }),
+      ...(selectedProjects && { scans: parkedScans(selectedProjects) }),
       judge: context?.judgeId ?? null,
       selection: sel && { initialized: sel.initialized, tracked: sel.tracked.length, ...(system?.roots === undefined ? {} : { roots: system.roots }), note: selectionNote(sel, system?.roots) },
       cloud: cloudStatus(cloud?.cloud ?? null, cloudState),
@@ -850,8 +867,13 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
     for (const p of projects ?? []) scans![p.lastScan?.status ?? 'never']++;
     // Files an older scanner read: never rescanned on their own (a scan spends your model budget), so it is said.
     const older = projects && facts?.olderScannerFiles ? await count(() => facts.olderScannerFiles!(SCANNER_VERSION)) : null;
-    const olderIn = (projects ?? []).filter((p) => (older?.get(p.key) ?? 0) > 0).map((p) => [p.key, older!.get(p.key)!] as const);
-    if (scans && olderIn.length) scans.olderScanner = { files: olderIn.reduce((n, [, c]) => n + c, 0), projects: Object.fromEntries(olderIn) };
+    const stale = (kind: 'older' | 'never') => {
+      const by = (projects ?? []).map((p) => [p.key, older?.get(p.key)?.[kind] ?? 0] as const).filter(([, c]) => c > 0);
+      return by.length ? { files: by.reduce((n, [, c]) => n + c, 0), projects: Object.fromEntries(by) } : null;
+    };
+    const [olderScanner, neverScanned] = [stale('older'), stale('never')];
+    if (scans && olderScanner) scans.olderScanner = olderScanner;
+    if (scans && neverScanned) scans.neverScanned = neverScanned;
     const [inboxPending, inboxConfirmed, proposed, approved, queued, scanQueue, pmQueue, chatQueue, quality] = await Promise.all([
       count(() => pending('pending')),
       count(() => pending('confirmed')),
@@ -1152,7 +1174,10 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
       const linked = links ? [...known, ...fresh].map((p) => ({ ...p, links: linkCount.get(p.key) ?? 0 })) : [...known, ...fresh];
       // Files an older scanner read: the next scan you start reads them again (none starts on its own).
       const older = facts.olderScannerFiles ? await facts.olderScannerFiles(SCANNER_VERSION).catch(() => null) : null;
-      const all = older ? linked.map((p) => (older.get(p.key) ? { ...p, olderScanner: older.get(p.key) } : p)) : linked;
+      const all = linked.map((p) => {
+        const o = older?.get(p.key);
+        return { ...p, ...(o?.older && { olderScanner: o.older }), ...(o?.never && { neverScanned: o.never }) };
+      });
       // Pinned first: every page lists projects in this order.
       return c.json(all.sort((a, b) => Number(b.pinned) - Number(a.pinned) || a.key.localeCompare(b.key)));
     });
@@ -1778,7 +1803,7 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
       const current = await shownLesson(id);
       if (!current) return c.json({ error: 'not found' }, 404);
       if (!mayChange(current.lesson)) return notTheRuns(c, `the lesson ${id}`);
-      const p = body.data;
+      const { note, ...p } = body.data;
       if (p.status === 'revoked' && current.lesson.status !== 'approved') return c.json({ error: 'only a previously approved lesson can be revoked; reject a proposal instead' }, 409);
       if (p.projectKey !== undefined) {
         const narrowing = current.lesson.scope === 'global' && (p.scope === 'project' || p.scope === 'task');
@@ -1795,7 +1820,7 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
         [reembed] = await embed([redactSecrets(`${l.title}\n${l.rule}\nApplies when: ${l.appliesWhen}`)]);
       }
       const by = currentActor();
-      const { unscoped } = await knowledge.updateLesson(id, p, { reembed, by });
+      const { unscoped } = await knowledge.updateLesson(id, p, { reembed, by, ...(note && { note }) });
       await overrideLoop([id]);
       if (unscoped) return c.json({ error: 'this lesson has no known project, so it cannot be narrowed without one; it was set back to proposed. Name the project (projectKey), make it global, or reject it.' }, 409);
       const changed = Object.fromEntries(
@@ -1809,7 +1834,7 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
         projectKey: p.projectKey ?? current.lesson.projectKey,
         subject: `${p.status ?? 'edited'} lesson "${p.title ?? current.lesson.title}"`,
         why: `${decidedWhy(by, p.status)}. ${LESSON_SHARING_NOTICE.message}`,
-        details: { sharing: LESSON_SHARING_NOTICE, status: p.status ?? current.lesson.status, changed, supersedes: p.supersedes ?? null },
+        details: { sharing: LESSON_SHARING_NOTICE, status: p.status ?? current.lesson.status, changed, supersedes: p.supersedes ?? null, ...(note && { note: redactSecrets(note) }) },
         targets: [id],
       });
       return c.json({ id, status: p.status ?? current.lesson.status, sharing: LESSON_SHARING_NOTICE });

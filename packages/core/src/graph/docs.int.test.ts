@@ -175,6 +175,16 @@ describeStores('DocsStore: reading uploads into facts', (h) => {
     expect(next).toMatchObject({ id, projectKey: 'shop', ref: 'spec.md', kind: 'text', text: 'part one\n\npart two', image: null, attempts: 0 });
   });
 
+  test('a document to read carries the run it was uploaded in, so what reading it records is the run\'s too', async () => {
+    await d.upsertDoc(doc('notes.md'), [{ text: 'x', embedding: vec(1) }], { read: true, run: { id: 'r-docs', sandbox: true } });
+    expect(await d.nextDocToRead()).toMatchObject({ ref: 'notes.md', run: 'r-docs', sandbox: true });
+    await h.probe.wipe();
+    await d.upsertDoc(doc('plain.md'), [{ text: 'x', embedding: vec(1) }], { read: true });
+    const plain = (await d.nextDocToRead())!;
+    expect(plain.run).toBeUndefined();
+    expect(plain.sandbox).toBeUndefined();
+  });
+
   test('an image upload keeps its bytes for the reader and the thumbnail; deleting the doc removes them', async () => {
     const id = await d.upsertDoc(doc('flow.png'), [{ text: 'image, not read yet', embedding: vec(1) }], { read: true, image: png });
     expect((await d.listDocs('shop'))[0]).toMatchObject({ kind: 'image', mediaType: 'image/png' });

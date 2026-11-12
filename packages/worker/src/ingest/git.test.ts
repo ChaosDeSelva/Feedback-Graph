@@ -78,3 +78,40 @@ test('cachedRemote asks git once per folder until the entry expires, including f
   await remote('/a');
   expect(calls).toEqual(['/a', '/b', '/a']);
 });
+
+describe('the commits a session made: its branch, else its worktree', () => {
+  function repo() {
+    const dir = mkdtempSync(join(tmpdir(), 'fbgitb-'));
+    execFileSync('git', ['-C', dir, 'init', '-q', '-b', 'main']);
+    execFileSync('git', ['-C', dir, 'config', 'user.email', 't@t']);
+    execFileSync('git', ['-C', dir, 'config', 'user.name', 't']);
+    commitAt(dir, '2026-10-01T09:00:00Z', 'base');
+    execFileSync('git', ['-C', dir, 'branch', 'feat/cart']);
+    execFileSync('git', ['-C', dir, 'branch', 'feat/other']);
+    execFileSync('git', ['-C', dir, 'checkout', '-q', 'feat/cart']);
+    commitAt(dir, '2026-10-02T10:00:00Z', 'cart total');
+    execFileSync('git', ['-C', dir, 'checkout', '-q', 'feat/other']);
+    commitAt(dir, '2026-10-02T11:00:00Z', 'someone else');
+    execFileSync('git', ['-C', dir, 'checkout', '-q', 'main']);
+    return dir;
+  }
+  const from = '2026-10-02T00:00:00Z';
+  const to = '2026-10-03T00:00:00Z';
+  const subjects = (c: { subject: string }[]) => c.map((x) => x.subject).sort();
+
+  test("a session's branch: only that branch's commits; an unknown branch or none: every branch's", async () => {
+    const dir = repo();
+    expect(subjects(await commitsInWindow(dir, from, to, { branch: 'feat/cart' }))).toEqual(['cart total']);
+    expect(subjects(await commitsInWindow(dir, from, to))).toEqual(['cart total', 'someone else']);
+    expect(subjects(await commitsInWindow(dir, from, to, { branch: 'gone/branch' }))).toEqual(['cart total', 'someone else']);
+  });
+
+  test("no branch known, a worktree of its own: that worktree's commits; a mere subfolder is no worktree", async () => {
+    const dir = repo();
+    const wt = join(dir, '.worktrees', 'cart');
+    execFileSync('git', ['-C', dir, 'worktree', 'add', '-q', wt, 'feat/cart']);
+    expect(subjects(await commitsInWindow(dir, from, to, { worktree: wt }))).toEqual(['cart total']);
+    mkdirSync(join(dir, 'src'));
+    expect(subjects(await commitsInWindow(dir, from, to, { worktree: join(dir, 'src') }))).toEqual(['cart total', 'someone else']);
+  });
+});

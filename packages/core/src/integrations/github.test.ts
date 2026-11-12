@@ -131,6 +131,19 @@ describe('fetchPullRequestContext', () => {
       ['2', '1', 'COMMENTED'],
       ['60', null, 'APPROVED'],
     ]);
+    expect(p.comments.find((c) => c.id === '2')?.repliesTo).toBe('bob');
+  });
+
+  test("a reply to a review bot's comment knows whom it answers, though the bot's comment is left out", async () => {
+    const { fetchImpl } = mockFetch({
+      '/repos/acme/demo/pulls': [pr(7, '2026-10-20T00:00:00Z')],
+      '/repos/acme/demo/pulls/7/comments': [
+        { id: 1, user: { login: 'review-helper[bot]', type: 'Bot' }, body: 'Consider a guard clause here', path: 'a.ts', line: 1, html_url: 'u1', created_at: '2026-10-19T00:00:00Z' },
+        { id: 2, in_reply_to_id: 1, user: human('alice'), body: 'Done', path: 'a.ts', line: 1, html_url: 'u2', created_at: '2026-10-19T01:00:00Z' },
+      ],
+    });
+    const [p] = await fetchPullRequestContext({ repo: 'acme/demo', token: 't', fetchImpl });
+    expect(p.comments.map((c) => [c.id, c.author, c.inReplyTo ?? null, c.repliesTo ?? null])).toEqual([['2', 'alice', '1', 'review-helper[bot]']]);
   });
 
   test('skips PRs authored by bots', async () => {

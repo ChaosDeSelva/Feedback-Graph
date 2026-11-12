@@ -25,6 +25,11 @@ export type PrComment = {
   diffHunk: string | null;
   /** A review comment that replies in a thread: the id of the comment it answers. Unset otherwise. */
   inReplyTo?: string;
+  /**
+   * For a reply, who wrote the comment it answers, also when that comment is left out (a bot's, or one with no text):
+   * the PR author answering a review bot is answering, not giving feedback. Unset otherwise.
+   */
+  repliesTo?: string;
   /** The verdict of the review this is (kind review) or belongs to (a review comment). Unset when GitHub did not say. */
   reviewState?: ReviewVerdict;
 };
@@ -225,8 +230,11 @@ async function commentsFor(repo: string, n: number, token: string, fetchImpl: ty
   ]);
   const out: PrComment[] = [];
   const verdicts = new Map(reviews.map((r) => [String(r.id), verdict(r.state)]));
+  // Every review comment's author, the ones left out below included, so a reply to a bot's comment knows whom it answers.
+  const authors = new Map(review.flatMap((c) => (c.id === undefined ? [] : [[String(c.id), c.user?.login ?? 'ghost'] as const])));
   const optional = (inReplyTo: string | number | null | undefined, state: ReviewVerdict | undefined) => ({
     ...(inReplyTo != null ? { inReplyTo: String(inReplyTo) } : {}),
+    ...(inReplyTo != null && authors.has(String(inReplyTo)) ? { repliesTo: authors.get(String(inReplyTo))! } : {}),
     ...(state ? { reviewState: state } : {}),
   });
   const idOf = (id: string | number | undefined, url: string) => (id === undefined ? commentId(url, out.length) : String(id));

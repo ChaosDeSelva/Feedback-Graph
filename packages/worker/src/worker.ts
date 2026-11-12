@@ -43,12 +43,14 @@ import { sortOldMisses } from './postmortem/subjects.ts';
 import { attachWorkSession } from './postmortem/work.ts';
 import { repoFileList, repoHas } from './postmortem/paths.ts';
 import { recheckLessons, recordedWorkSession } from './postmortem/recheck.ts';
-import { backfillLessonTriggers } from './postmortem/triggers.ts';
+import { backfillLessonTriggers, rederiveLessonTriggers } from './postmortem/triggers.ts';
+import { checkLessonsAgainstMap } from './postmortem/codeChanged.ts';
 import { rematchOnRuleChange } from './postmortem/rematch.ts';
 import { sessionEvidence } from './postmortem/standing.ts';
 import { providerAnswers, runPostmortems } from './postmortem/step.ts';
 import { migrateDeciderRule } from './postmortem/deciders.ts';
-import { parkScanProvider, ScanRunner, type ScanTurn } from './scan/runner.ts';
+import { runRepairs } from './repairs.ts';
+import { clearStaleParks, parkedOn, parkScanProvider, ScanRunner, type ScanTurn } from './scan/runner.ts';
 import { recheckFacts } from './scan/recheck.ts';
 import { forgetDataFiles } from './scan/data.ts';
 import { hasCodeFiles, runScan, ScanPlans } from './scan/scan.ts';
@@ -241,6 +243,7 @@ export async function runWorker(io: WorkerIo): Promise<void> {
     excludeProjects: config.excludeProjects.length ? config.excludeProjects : undefined,
     activity,
     storedTurns: async (id: string) => (await store.sessions.detail(id))?.turnCount ?? null,
+    storedTurnIds: async (id: string) => (await store.sessions.turns(id, -1, 100_000)).map((t) => ({ uuid: t.uuid, ts: t.ts, text: t.text })),
     remote: cachedRemote(projectRemote, REMOTE_TTL_MS),
     projects: repo,
     // Records a scan or a code map made have no folder: the backfill reads it (and its remote) from the selection.
@@ -363,6 +366,8 @@ export async function runWorker(io: WorkerIo): Promise<void> {
     log,
     exclusive: <T>(fn: () => Promise<T>) => selection.exclusive(fn),
     inScope: async (key: string) => (await selection.scope(config)).project(key),
+    // Approved lessons about code the rebuild changed or removed are flagged for you (never revoked).
+    onMapped: async (p, before, after) => { await checkLessonsAgainstMap({ k: knowledge, repoFiles: repoFileList, activity, log }, p, before, after); },
   });
   // Abandons a map being parsed now; the loop waits for one being written before the store closes.
   shutdown.onStop(() => mapStage.stop());
@@ -451,6 +456,7 @@ export async function runWorker(io: WorkerIo): Promise<void> {
       await llm?.ready?.();
     },
     parkProvider: (key, reason, retryAt) => parkScanProvider(facts, key, defaultScan, reason, retryAt),
+    unpark: (job) => facts.updateScanJob(job.id, { parkedAt: null, ...(parkedOn(job) && { error: null, retryAt: null }) }),
     empty: async (job) => !(await hasCodeFiles(job.repoPath)),
     run: async (job, turn) => await facts.claimQueuedScan(job.id) ? runScanJob(job, scanJobDeps, turn) : true,
     concurrency: config.scanConcurrency,
@@ -573,6 +579,7 @@ export async function runWorker(io: WorkerIo): Promise<void> {
     sortOldMisses: () => sortOldMisses({ knowledge, cursors: docs, activity, log }),
     migrateDeciders: () => migrateDeciderRule({ knowledge, cursors: docs, activity, log }),
     backfillProposedAs: () => backfillProposedAs({ knowledge, activity, cursors: docs, log }),
+    repairs: () => runRepairs({ knowledge, graph: repo, activity, cursors: docs, log }),
     evidence,
     reconcileDecisions: () => reconcileInFlight(store, { embed }),
   });
@@ -597,6 +604,9 @@ export async function runWorker(io: WorkerIo): Promise<void> {
     },
   });
 
+  // A scan parked on the model SCAN_LLM named before this start runs now on the current one, without the old reason.
+  const unparked = await clearStaleParks(facts, (job) => job.provider?.trim() || defaultScan).catch((err) => { log('stale scan parks not cleared', { error: String(err) }); return 0; });
+  if (unparked) log('scans parked on an earlier scan model queued again on the current one', { scans: unparked, provider: defaultScan });
   scanRunner.startPolling();
   await runWorkerLoop({
     status, stage, log,
@@ -618,8 +628,10 @@ export async function runWorker(io: WorkerIo): Promise<void> {
     readDocOne,
     postmortems: () => runPostmortems(pmDeps),
     lessonTriggers: async () => {
+      // Triggers derived by older rules first (no model, once per version), then those never derived.
+      const again = await rederiveLessonTriggers({ k: knowledge, repoPaths, activity, log });
       const r = await backfillLessonTriggers({ k: knowledge, llm: postmortemLlm, repoPaths, tries: triggerTries, activity, log });
-      return r.derived + r.suggested;
+      return again.lessons + r.derived + r.suggested;
     },
     cycle: () => runCycle(cycleDeps),
     kickSummaries: () => summarizeStage?.kick(),

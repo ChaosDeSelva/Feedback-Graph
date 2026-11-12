@@ -31,6 +31,7 @@ import {
   type ParsedSession,
   type PendingExternalItem,
   type PendingSessionItem,
+  type InboxText,
   type Project,
   type StatsRow,
   type WorkerStatus,
@@ -282,6 +283,16 @@ export class PgGraphStore implements GraphStore {
       sandboxPresence(this.db).mark(); // The session binding may have been claimed by the API process.
       const merged = await mergeIntoReport(x, turnUuid);
       if (merged) return merged;
+      // The same words again in the same session or PR thread while the first is still pending: one Inbox item.
+      const { rows: [same] } = await x.query(
+        `SELECT k.id FROM turns t
+           JOIN turns o ON o.session_id = t.session_id AND o.uuid <> t.uuid AND btrim(o.text) = btrim(t.text)
+           JOIN candidates k ON k.turn_uuid = o.uuid AND k.status = 'pending'
+         WHERE t.uuid = $1 AND NOT EXISTS (SELECT 1 FROM candidates c WHERE c.id = t.uuid)
+         ORDER BY k.created_at, k.id LIMIT 1`,
+        [turnUuid],
+      );
+      if (same) return same.id as string;
       // A decided candidate keeps its status, note and decision time when the turn is flagged again.
       await x.query(
         `INSERT INTO candidates (id, turn_uuid, session_id, project_key, ts, source, status, created_at, run, sandbox)
@@ -407,6 +418,17 @@ export class PgGraphStore implements GraphStore {
       [q.limit, q.afterId ?? null],
     );
     return rows.map((r) => ({ id: r.id, turnUuid: r.turn_uuid, projectKey: r.project_key, text: r.text, precedingToolCalls: r.tool_calls ?? [] }));
+  }
+
+  async inboxTexts(q: { limit: number; afterId?: string | null }): Promise<InboxText[]> {
+    const { rows } = await this.q(
+      `SELECT k.id, k.session_id, k.project_key, coalesce(k.source, 'claude') AS source, k.status, k.created_at, t.text
+       FROM candidates k JOIN turns t ON t.uuid = k.turn_uuid
+       WHERE t.text IS NOT NULL AND ($2::text IS NULL OR k.id COLLATE "C" > $2)
+       ORDER BY k.id COLLATE "C" LIMIT $1`,
+      [q.limit, q.afterId ?? null],
+    );
+    return rows.map((r) => ({ id: r.id, sessionId: r.session_id, projectKey: r.project_key, source: r.source, status: r.status, createdAt: iso(r.created_at)!, text: r.text }));
   }
 
   async skipPendingItem(id: string, s: { rule: string; note: string; by: string }): Promise<boolean> {

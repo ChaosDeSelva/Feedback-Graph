@@ -163,6 +163,56 @@ describeStores('external feedback threads', (h) => {
     expect(d?.feedback?.external).toEqual({ source: 'github', author: 'reviewer', url: ref(1).url, reviewState: 'APPROVED' });
   });
 
+  test('the same words flagged again in one PR thread while the first is pending are one Inbox item; another thread\'s are not', async () => {
+    const t = thread(3);
+    for (const i of [0, 1]) t.items[i].text = 'Please keep the null check on the cart total';
+    await store.graph.upsertExternalThread(project, t);
+    const other: ExternalThread = { ...thread(1), id: 'github:acme/shop#8', items: [{ ...thread(1).items[0], uuid: 'github:acme/shop#8/c1', text: 'Please keep the null check on the cart total', external: ref(1, { thread: 'acme/shop#8' }) }] };
+    await store.graph.upsertExternalThread(project, other);
+    expect(await store.graph.saveClassification('github:acme/shop#7/c1', pushback, true)).toBe('github:acme/shop#7/c1');
+    expect(await store.graph.saveClassification('github:acme/shop#7/c2', pushback, true)).toBe('github:acme/shop#7/c1');
+    expect(await store.graph.saveClassification('github:acme/shop#8/c1', pushback, true)).toBe('github:acme/shop#8/c1');
+    expect((await store.graph.listCandidates({ status: 'pending' })).map((c) => c.id).sort()).toEqual(['github:acme/shop#7/c1', 'github:acme/shop#8/c1']);
+    // Once the first is decided, the same words again are an item of their own.
+    await store.graph.decide('github:acme/shop#7/c1', 'rejected', null);
+    t.items[2].text = 'Please keep the null check on the cart total';
+    await store.graph.upsertExternalThread(project, t);
+    expect(await store.graph.saveClassification('github:acme/shop#7/c3', pushback, true)).toBe('github:acme/shop#7/c3');
+  });
+
+  test('inboxTexts pages every Inbox item, any status, with its turn\'s text', async () => {
+    await store.graph.upsertExternalThread(project, thread(3));
+    for (const n of [1, 2, 3]) await store.graph.saveClassification(`github:acme/shop#7/c${n}`, pushback, true);
+    await store.graph.decide('github:acme/shop#7/c2', 'rejected', null);
+    const first = await store.graph.inboxTexts({ limit: 2 });
+    expect(first.map((i) => [i.id, i.status, i.sessionId, i.source, i.projectKey])).toEqual([
+      ['github:acme/shop#7/c1', 'pending', 'github:acme/shop#7', 'github', 'shop'],
+      ['github:acme/shop#7/c2', 'rejected', 'github:acme/shop#7', 'github', 'shop'],
+    ]);
+    expect(first[1].text).toBe('comment 2');
+    expect(Date.parse(first[0].createdAt)).not.toBeNaN();
+    expect((await store.graph.inboxTexts({ limit: 2, afterId: first[1].id })).map((i) => i.id)).toEqual(['github:acme/shop#7/c3']);
+  });
+
+  test('a PR thread\'s task is listed with one of its comments, for retitling; a transcript\'s is not', async () => {
+    const unit = Array.from({ length: 768 }, (_, i) => (i === 0 ? 1 : 0));
+    await store.graph.upsertExternalThread(project, thread(2));
+    await store.graph.upsertSession(project, work('s1', 'feat/checkout', '2026-10-01T09:00:00Z', '2026-10-01T09:00:00Z'), []);
+    for (const id of ['github:acme/shop#7/c1', 'github:acme/shop#7/c2', 's1-t1']) {
+      await store.graph.saveClassification(id, pushback, true);
+      await store.graph.decide(id, 'confirmed', null);
+      await store.knowledge.savePostmortem(id, {
+        taskTitle: 'Rework the loader', missed: 'm', cause: 'implementation_error', causeExplanation: 'c', outcome: 'addressed',
+        lesson: { title: 't', rule: 'r', appliesWhen: 'w', scope: 'project', paths: [] }, contextItems: [],
+      }, { miss: unit, lesson: unit });
+    }
+    const tasks = await store.knowledge.threadTasks();
+    expect(tasks.map((t) => [t.id, t.title, t.external.thread, t.external.title])).toEqual([['task:github:acme/shop#7', 'Rework the loader', 'acme/shop#7', 'Add checkout']]);
+    expect(await store.knowledge.setTaskTitle('task:github:acme/shop#7', 'PR acme/shop#7: Add checkout')).toBe(true);
+    expect(await store.knowledge.setTaskTitle('task:nope', 'x')).toBe(false);
+    expect((await store.knowledge.threadTasks())[0].title).toBe('PR acme/shop#7: Add checkout');
+  });
+
   test("a synced comment's work-session links can be set again (a re-match under a new rule); other turns are left alone", async () => {
     await store.graph.upsertExternalThread(project, thread(2));
     expect(await store.graph.setExternalLinks('github:acme/shop#7/c1', ['s-loader'])).toBe(true);

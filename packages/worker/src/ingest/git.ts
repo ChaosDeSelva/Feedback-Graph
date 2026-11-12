@@ -8,10 +8,36 @@ const run = promisify(execFile);
 // Moved to core so the API reads diffs the same way; kept exported here for the worker's imports.
 export { GIT_SAFE, gitSafeEnv, worktreeGitArgs } from '@fb/core';
 
-export async function commitsInWindow(repoPath: string, from: string, to: string): Promise<Commit[]> {
+/** The first of these refs the repository has, or null (a branch deleted since, or never fetched here). */
+async function firstRef(repoPath: string, refs: string[]): Promise<string | null> {
+  for (const ref of refs) {
+    const ok = await run('git', [...GIT_SAFE, '-C', repoPath, 'rev-parse', '--verify', '--quiet', `${ref}^{commit}`], { timeout: 10_000, env: gitSafeEnv() }).then(() => true, () => false);
+    if (ok) return ref;
+  }
+  return null;
+}
+
+const toplevel = (dir: string) => run('git', [...GIT_SAFE, '-C', dir, 'rev-parse', '--show-toplevel'], { timeout: 10_000, env: gitSafeEnv() }).then((r) => r.stdout.trim(), () => null);
+
+/** `dir` when it is a worktree of its own (its top is not the repository's): a subfolder's HEAD is the checkout's now. */
+async function ownWorktree(repoPath: string, dir: string): Promise<string | null> {
+  const [top, main] = await Promise.all([toplevel(dir), toplevel(repoPath)]);
+  return top && main && top !== main ? dir : null;
+}
+
+/**
+ * The commits made in the window that the session can have made: those on its branch (a local branch, else the
+ * remote's) or, with no branch known, on the HEAD of the worktree it ran in (`worktree`, a folder inside the repo or a
+ * worktree of it). Neither known: every branch's (`--all`), as before. Other branches' commits in the same hours are
+ * someone else's work, and DURING them tied a session to every PR merged while it ran.
+ */
+export async function commitsInWindow(repoPath: string, from: string, to: string, o: { branch?: string | null; worktree?: string | null } = {}): Promise<Commit[]> {
   try {
+    const branch = o.branch?.trim() && !o.branch.includes('..') ? await firstRef(repoPath, [`refs/heads/${o.branch.trim()}`, `refs/remotes/origin/${o.branch.trim()}`]) : null;
+    const tree = !branch && o.worktree ? await ownWorktree(repoPath, o.worktree) : null;
+    const where = branch ? ['-C', repoPath, 'log', branch] : tree ? ['-C', tree, 'log', 'HEAD'] : ['-C', repoPath, 'log', '--all'];
     const { stdout } = await run('git', [
-      ...GIT_SAFE, '-C', repoPath, 'log', '--all', '--since', from, '--until', to, '--format=%H%x09%cI%x09%s',
+      ...GIT_SAFE, ...where, '--since', from, '--until', to, '--format=%H%x09%cI%x09%s', '--',
     ], { timeout: 30_000, maxBuffer: 16 * 1024 * 1024, env: gitSafeEnv() });
     return stdout
       .split('\n')

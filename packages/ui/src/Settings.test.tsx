@@ -385,6 +385,15 @@ test('the folders outside sessions ran in are suggested with their counts, each 
   await waitFor(() => expect(rootsPut()).toEqual([{ roots: ['/Users/me/Vibe', '/Users/me/games'] }]));
 });
 
+test('sessions that only ran in the folder holding the projects are said apart, with what to do', async () => {
+  state = { ...body(), atRoots: [{ path: '/Users/me/Vibe', claudeSessions: 4, codexSessions: 1 }] } as ReturnType<typeof body>;
+  render(<Settings />);
+  const list = within(await screen.findByRole('list', { name: 'sessions above a project folder' }));
+  expect(list.getByText('/Users/me/Vibe')).toBeTruthy();
+  expect(list.getByText(/4 Claude Code, 1 Codex/)).toBeTruthy();
+  expect(screen.getByText(/Start the agent in the project's folder/)).toBeTruthy();
+});
+
 test('a refused root shows the server reason', async () => {
   failPut = 'code: give an absolute path';
   render(<Settings />);

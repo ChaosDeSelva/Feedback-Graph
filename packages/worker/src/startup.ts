@@ -42,6 +42,8 @@ export type StartupPassDeps = {
   migrateDeciders: () => Promise<unknown>;
   /** The writer's draft for lessons edited before it was kept (postmortem/proposedAs.ts). */
   backfillProposedAs: () => Promise<unknown>;
+  /** One-off repairs of data earlier versions stored wrong (repairs.ts). */
+  repairs: () => Promise<void>;
   evidence: { load: () => Promise<void>; atStart: () => Promise<void> };
   /** Settle learning-loop decisions a crash left applying (decisions/apply.ts reconcileInFlight). */
   reconcileDecisions: () => Promise<{ applied: number; proposed: number; overridden: number }>;
@@ -68,6 +70,7 @@ export async function runStartupPasses(d: StartupPassDeps): Promise<void> {
     .catch(failed('process-miss rule over past misses failed'));
   await d.migrateDeciders().catch(failed('lesson decider rule failed'));
   await d.backfillProposedAs().catch(failed("writer's draft backfill failed"));
+  await d.repairs().catch(failed('one-off repairs failed'));
   await d.evidence.load();
   await d.evidence.atStart();
 }

@@ -307,13 +307,13 @@ type Pipeline = Record<string, any>;
 /** LessonQuality (GET /api/lessons/quality, /api/pipeline lessons.quality). */
 type Quality = { days: number; asWritten: number; edited: number; rejected: number; decided: number; byOperator?: number };
 const pct = (n: number, of: number) => `${n} (${of ? Math.round((100 * n) / of) : 0}%)`;
-/** How the owner judged the lessons the post-mortem wrote, in one window, and how many an operator-token agent decided. */
+/** How the owner judged the lessons the post-mortem wrote, in one window, and apart from them how many an operator-token agent decided. */
 function qualityLine(q: Quality): string {
   const share = (n: number) => `${Math.round((100 * n) / q.decided)}%`;
-  const op = q.byOperator ? `; ${q.byOperator} of them by an agent with the operator token (${share(q.byOperator)})` : '';
+  const op = q.byOperator ? `; ${q.byOperator} more by an agent with the operator token, not counted` : '';
   return q.decided
     ? `last ${q.days} d: ${q.decided} decided: ${q.asWritten} approved as written (${share(q.asWritten)}), ${q.edited} after an edit (${share(q.edited)}), ${q.rejected} rejected (${share(q.rejected)})${op}`
-    : `last ${q.days} d: no lessons decided`;
+    : `last ${q.days} d: no lessons decided${op}`;
 }
 
 /** One line of every stage's backlog, for status. */
@@ -389,13 +389,19 @@ function statusLines(s: Record<string, any>, p: Pipeline | null): string[] {
     lines.push(`stage     ${s.stage.name}${s.stage.current ? ` ${s.stage.current}` : ''}${count} since ${at(s.stage.startedAt)}`);
   }
   for (const m of s.codeMaps ?? []) lines.push(`code map  ${m.projectKey} ${m.builtAt ? `built ${m.builtAt} (${m.ageDays}d since rebuild)` : 'never built'}${m.builtAt && m.checkedAt > m.builtAt ? `, last confirmed current ${m.checkedAt}` : ''}${m.rebuilding ? '; rebuilding now' : m.interrupted ? '; rebuild was interrupted and will be retried' : m.lastFailureAt ? `; last rebuild failed ${m.lastFailureAt}${m.lastFailure ? `: ${m.lastFailure}` : ''}` : ''}`);
+  for (const j of s.scans?.parked ?? []) lines.push(`scan      ${j.projectKey} parked on ${j.provider}${j.since ? ` since ${j.since}` : ''}: ${j.error.replace(/^scan parked on [^:]+:\s*/, '')}`);
+  for (const j of s.scans?.gaveUp ?? []) lines.push(`scan      ${j.projectKey} FAILED: ${j.error}`);
   if (p) lines.push(`pipeline  ${pipelineLine(p)}`, ...queueLines(p.queues));
   const judged = (p?.lessons?.quality as Quality[] | undefined)?.[0];
   if (judged) lines.push(`lessons   ${qualityLine(judged)}`);
+  const where = (s: { projects: Record<string, number> }) => Object.entries(s.projects).map(([k, n]) => `${k} ${n}`).join(', ');
   const older = p?.scans?.olderScanner;
   if (older?.files) {
-    const where = Object.entries(older.projects as Record<string, number>).map(([k, n]) => `${k} ${n}`).join(', ');
-    lines.push(`scanner   ${plural(older.files, 'file')} ${older.files === 1 ? 'was' : 'were'} read by an older scanner (${where}): press Scan on the Projects page (or fg scan <project>) to refresh ${older.files === 1 ? 'it' : 'them'}`);
+    lines.push(`scanner   ${plural(older.files, 'file')} ${older.files === 1 ? 'was' : 'were'} read by an older scanner (${where(older)}): press Scan on the Projects page (or fg scan <project>) to refresh ${older.files === 1 ? 'it' : 'them'}`);
+  }
+  const never = p?.scans?.neverScanned;
+  if (never?.files) {
+    lines.push(`scanner   ${plural(never.files, 'file')} ${never.files === 1 ? 'has' : 'have'} no scanner version recorded (${where(never)}): press Scan on the Projects page (or fg scan <project>) to read ${never.files === 1 ? 'it' : 'them'} with this scanner`);
   }
   if (w?.lastCycle) lines.push(`cycle     ${Object.entries(w.lastCycle).map(([k, v]) => `${k}=${v}`).join(' ')}`);
   if (w?.lastError) lines.push(`error     ${w.lastError}`);
@@ -743,7 +749,7 @@ async function lessons(api: Api, io: CliIO, words: string[], f: Flags): Promise<
     const r = await api<{ windows: Quality[]; projects: Record<string, Quality[]>; capped?: true }>('GET', `/api/lessons/quality${qs({ project: f.project })}`);
     if (f.json) { io.out(JSON.stringify(r, null, 2)); return 0; }
     const rows = [['all', r.windows] as const, ...Object.entries(r.projects).sort(([a], [b]) => a.localeCompare(b))].flatMap(([k, ws]) =>
-      ws.map((q) => [k, String(q.days), String(q.decided), pct(q.asWritten, q.decided), pct(q.edited, q.decided), pct(q.rejected, q.decided), pct(q.byOperator ?? 0, q.decided)]));
+      ws.map((q) => [k, String(q.days), String(q.decided), pct(q.asWritten, q.decided), pct(q.edited, q.decided), pct(q.rejected, q.decided), String(q.byOperator ?? 0)]));
     io.out(table(['PROJECT', 'DAYS', 'DECIDED', 'AS WRITTEN', 'AFTER EDIT', 'REJECTED', 'BY OPERATOR'], rows, 40));
     if (r.capped) io.out('(capped: more decisions than were counted; the oldest are left out)');
     return 0;

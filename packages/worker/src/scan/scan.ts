@@ -1113,7 +1113,8 @@ async function scanJob(job: ScanJob, d: ScanDeps, mirror: { current: AgentMirror
     const unit = d.llm.agentic ? 'shard' : 'file';
     await d.facts.updateScanJob(job.id, {
       status: 'done', filesScanned: result.filesScanned, factsAdded,
-      ...(failed.length ? { error: `${plural(failed.length, unit)} failed: ${failed.slice(0, 10).join(', ')}` } : {}),
+      // Done clean: an error left from waiting (a park, a model that did not answer at first) is no longer true.
+      error: failed.length ? `${plural(failed.length, unit)} failed: ${failed.slice(0, 10).join(', ')}` : null, parkedAt: null,
       ...(shards ? { shards } : {}),
     });
     const left = result.remaining ? `; ${plural(result.remaining, 'changed file')} left for the next scan (SCAN_MAX_FILES)` : '';

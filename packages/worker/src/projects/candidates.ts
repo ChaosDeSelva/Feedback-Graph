@@ -3,7 +3,7 @@ import { posix } from 'node:path';
 import { isGitDir, projectFolders, projectFromCwd, type CandidateSnapshot, type FolderCandidate, type OutsideFolder, type Root } from '@fb/core';
 import { projectRemote } from '../ingest/git.ts';
 import type { FileState } from '../state.ts';
-import { cachedHead, codexCwds, readSessionHead, type HeadFile, type SessionHead } from './heads.ts';
+import { cachedHead, readSessionHead, sessionCwds, type HeadFile, type SessionHead } from './heads.ts';
 
 export type CandidateOpts = {
   roots: Root[];
@@ -85,6 +85,8 @@ function groupSiblings(folders: OutsideFolder[], hostHome = ''): OutsideFolder[]
 export type CandidateBuild = CandidateSnapshot & { folderOf: Map<string, string | string[] | null> };
 
 const trim = (p: string) => p.replace(/\/+$/, '');
+/** `path` is `folder` or inside it (both trimmed). */
+const within = (path: string, folder: string) => path === folder || path.startsWith(`${folder}/`);
 
 /** The project folder a cwd is in, by projectFromCwd (nested repos included), and the root it is under. */
 function folderOfCwd(cwd: string, roots: Root[]): { key: string; rel: string; root: Root } | null {
@@ -113,14 +115,16 @@ export async function buildCandidates(o: CandidateOpts): Promise<CandidateBuild>
   const outsideRoots = { claudeSessions: 0, codexSessions: 0 };
   const outside = new Map<string, OutsideFolder>();
   const folderOf = new Map<string, string | string[] | null>();
+  const atRoots = new Map<string, OutsideFolder>();
   for (const f of o.files) {
     const head = await cachedHead(o.state, f, readHead);
     if (!head.human || !head.cwd) {
       folderOf.set(f.path, null);
       continue;
     }
-    // A Codex session can move between folders (turn_context): it belongs to each folder it was in.
-    const cwds = f.source === 'codex' ? [head.cwd, ...(await codexCwds(o.state, f))] : [head.cwd];
+    // A session can move between folders (Codex turn_context, a Claude Code record's cwd): it belongs to each folder it
+    // was in, and the turns typed in each are that folder's (ingest splits it there).
+    const cwds = [head.cwd, ...(await sessionCwds(o.state, f))];
     const at = new Map<string, NonNullable<ReturnType<typeof folderOfCwd>>>();
     for (const cwd of cwds) {
       const hit = folderOfCwd(cwd, o.roots);
@@ -130,6 +134,15 @@ export async function buildCandidates(o: CandidateOpts): Promise<CandidateBuild>
     folderOf.set(f.path, keys.length === 0 ? null : keys.length === 1 ? keys[0] : keys);
     const count = f.source === 'codex' ? 'codexSessions' : 'claudeSessions';
     if (!keys.length) {
+      // Only ever in a root itself or a folder above one (started in ~/Code and never in one project's folder): not
+      // outside the roots, and no root to add. Said apart, so the owner can start the agent in the project instead.
+      const above = cwds.filter((c): c is string => !!c).find((c) => o.roots.some((r) => within(trim(r.host), trim(c))));
+      if (above) {
+        const row = atRoots.get(trim(above)) ?? { path: trim(above), claudeSessions: 0, codexSessions: 0 };
+        row[count]++;
+        atRoots.set(row.path, row);
+        continue;
+      }
       outsideRoots[count]++;
       const parent = suggestedRoot(head.cwd, o.hostHome);
       if (parent) {
@@ -177,6 +190,7 @@ export async function buildCandidates(o: CandidateOpts): Promise<CandidateBuild>
         .sort((a, b) => b.claudeSessions + b.codexSessions - (a.claudeSessions + a.codexSessions) || a.path.localeCompare(b.path))
         .slice(0, MAX_SUGGESTED_ROOTS),
     },
+    atRoots: [...atRoots.values()].sort((a, b) => b.claudeSessions + b.codexSessions - (a.claudeSessions + a.codexSessions) || a.path.localeCompare(b.path)),
     codexSessionsFound: o.codexSessionsFound,
     folderOf,
   };

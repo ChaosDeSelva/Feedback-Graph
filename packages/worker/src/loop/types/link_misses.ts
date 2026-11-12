@@ -76,9 +76,20 @@ export const linkMisses: LoopType = {
   },
 };
 
-/** The call for `m` repeating the earlier `e`, or null below the floors. */
+/**
+ * The session or PR thread a miss was flagged in: a transcript's segments (`<id>#2`) are one session, a PR thread's
+ * own id (`github:acme/shop#7`) is kept whole.
+ */
+const flaggedIn = (m: LoopMiss) => (m.sessionId && !/^(github|linear):/.test(m.sessionId) ? m.sessionId.replace(/#\d+$/, '') : m.sessionId);
+
+/**
+ * The call for `m` repeating the earlier `e`, or null below the floors. Two misses flagged in one session or PR thread
+ * are never a repeat: a reviewer saying it twice on one PR, or a developer pushing back twice on one task, is one miss
+ * still being fixed, not the lesson failing to stick.
+ */
 export function linkCandidate(m: LoopMiss, e: LoopMiss): LoopCandidate | null {
   if (!m.embedding || !e.embedding) return null;
+  if (m.sessionId && flaggedIn(m) === flaggedIn(e)) return null;
   const cos = cosine(m.embedding, e.embedding);
   const shared = m.editedFiles.filter((f) => e.editedFiles.includes(f));
   const sameCause = m.cause === e.cause;

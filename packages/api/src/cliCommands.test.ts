@@ -124,6 +124,18 @@ test('table: empty cells, long cells cut with an ellipsis, and rows shorter than
 
 // ── status ─────────────────────────────────────────────────────────────
 
+test('status names a scan parked on its model and one failed after a day of it', async () => {
+  const status = { version: '0.8.3', graph: true, workerHealthy: true, worker: { lastBeat: new Date().toISOString() },
+    scans: {
+      parked: [{ projectKey: 'side-tool', provider: 'codex-cli', since: '2026-11-12T08:00:00Z', error: 'scan parked on codex-cli: cannot reach the codex runner.' }],
+      gaveUp: [{ projectKey: 'tiny-app', at: '2026-11-12T00:00:00Z', error: 'gave up after more than 24 hours parked on codex-cli (since 2026-11-11T00:00:00Z): cannot reach the codex runner.' }],
+    } };
+  const f = fg({ 'GET /api/status': status, 'GET /api/pipeline': null });
+  expect(await f.cmd('status')).toBe(0);
+  expect(f.text()).toContain('scan      side-tool parked on codex-cli since 2026-11-12T08:00:00Z: cannot reach the codex runner.');
+  expect(f.text()).toContain('scan      tiny-app FAILED: gave up after more than 24 hours parked on codex-cli');
+});
+
 const STAGE = { name: 'scan', current: 'alpha', startedAt: '2026-11-10T10:00:00.000Z' };
 
 test('status prints every part of the API status it is given', async () => {
@@ -495,7 +507,7 @@ test('lessons quality, recheck and to-fact with --json; quality says when it was
   const q = { windows: [{ days: 30, asWritten: 0, edited: 0, rejected: 0, decided: 0 }], projects: {}, capped: true as const };
   const f = fg({ 'GET /api/lessons/quality': q });
   await f.cmd('lessons', 'quality');
-  expect(f.out[0]).toMatch(/all\s+30\s+0\s+0 \(0%\)\s+0 \(0%\)\s+0 \(0%\)\s+0 \(0%\)/);
+  expect(f.out[0]).toMatch(/all\s+30\s+0\s+0 \(0%\)\s+0 \(0%\)\s+0 \(0%\)\s+0\b/);
   expect(f.out[1]).toBe('(capped: more decisions than were counted; the oldest are left out)');
   const qj = fg({ 'GET /api/lessons/quality': q });
   await qj.cmd('lessons', 'quality', '--json');

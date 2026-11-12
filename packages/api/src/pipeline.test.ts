@@ -16,7 +16,7 @@ type Queues = { scanQueue?: () => Promise<ScanQueueEntry[]>; postmortemQueue?: (
 
 const unreadable = async (): Promise<never> => { throw new Error('store offline'); };
 
-function app(o: { shown?: string[]; backlog?: number | null; worker?: WorkerStatus | null; older?: Map<string, number>; queues?: Queues } = {}) {
+function app(o: { shown?: string[]; backlog?: number | null; worker?: WorkerStatus | null; older?: Map<string, { older: number; never: number }>; queues?: Queues } = {}) {
   const candidates = [cand('a', 'shop', 'pending'), cand('b', 'shop', 'pending'), cand('c', 'api', 'confirmed'), cand('d', 'hidden', 'pending')];
   // l4 is global (no project of its own), learned in shop; l5 global, learned in a project that is not shown. l2 is fg demo seed's.
   const lessons = [lesson('l1', 'shop', 'proposed'), lesson('l2', 'api', 'approved', 'api', 'demo'), lesson('l3', 'hidden', 'proposed'), lesson('l4', null, 'approved', 'shop'), lesson('l5', null, 'proposed', 'hidden')];
@@ -84,9 +84,9 @@ test('GET /api/pipeline?project=: the counts of one shown project (the worker-wi
   expect(hidden).toMatchObject({ sessions: 0, inbox: { pending: 0, confirmed: 0 }, lessons: { proposed: 0, approved: 0 } });
 });
 
-test('the pipeline counts files an older scanner read, in the shown projects only, by project', async () => {
-  const p = await (await app({ older: new Map([['shop', 12], ['api', 3], ['hidden', 40]]) }).request('/api/pipeline')).json();
-  expect(p.scans).toEqual({ done: 1, queued: 1, running: 0, failed: 0, never: 1, olderScanner: { files: 15, projects: { shop: 12, api: 3 } } });
+test('the pipeline counts files an older scanner read, and apart those no scanner version was recorded for, in the shown projects only, by project', async () => {
+  const p = await (await app({ older: new Map([['shop', { older: 12, never: 2 }], ['api', { older: 3, never: 0 }], ['hidden', { older: 40, never: 9 }]]) }).request('/api/pipeline')).json();
+  expect(p.scans).toEqual({ done: 1, queued: 1, running: 0, failed: 0, never: 1, olderScanner: { files: 15, projects: { shop: 12, api: 3 } }, neverScanned: { files: 2, projects: { shop: 2 } } });
   // None, or a store that cannot count them: not said.
   expect((await (await app({ older: new Map() }).request('/api/pipeline')).json()).scans.olderScanner).toBeUndefined();
   expect((await (await app().request('/api/pipeline')).json()).scans.olderScanner).toBeUndefined();

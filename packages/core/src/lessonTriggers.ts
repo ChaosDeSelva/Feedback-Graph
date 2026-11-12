@@ -29,6 +29,16 @@ const MAX_LINE_CHARS = 2000;
 export const MAX_ADDED_LINES = 50_000;
 const MIN_SYMBOL_CHARS = 4;
 
+/**
+ * The version of the rules deriveTriggers follows, stored with the triggers it derived. Raise it when they change: the
+ * worker derives the triggers of every lesson derived by an older version again (never the owner's).
+ * 1: before it was stored. 2: only the lesson's own paths, the files its fix edited and the code-shaped names of its rule
+ * (never the post-mortem's context items, the feedback's quotes or the files of a review it was not on); no glob for a
+ * kind of file anywhere (broadGlob) unless the rule says it of every such file; `/**` only on a folder the repository
+ * has; no pattern from an example snippet.
+ */
+export const TRIGGER_DERIVATION_VERSION = 2;
+
 export const emptyTriggers = (): LessonTriggers => ({ paths: [], patterns: [], symbols: [] });
 export const hasTriggers = (t: LessonTriggers | null | undefined): t is LessonTriggers => !!t && t.paths.length + t.patterns.length + t.symbols.length > 0;
 
@@ -129,8 +139,23 @@ const CODE_TOKEN = /[A-Za-z0-9]_[A-Za-z0-9]|[A-Za-z0-9]\.[A-Za-z_$]|[a-z][A-Z]|\
 /** A pattern's literal text: its character classes and repetitions taken out, its escapes undone. */
 const literalOf = (pattern: string) => pattern.replace(/\\[sSdDwWbB]/g, ' ').replace(/\\(.)/g, '$1').replace(/\.[*+?]|[*+?]/g, ' ');
 
-/** Why a trigger names nothing specific (an everyday word, a glob for every file, ordinary code), or null. */
-export function genericTrigger(kind: TriggerKind, raw: string, repoFiles?: string[] | null): string | null {
+/**
+ * A glob for a kind of file anywhere rather than a place: repo-wide (`**\/*.sql`, `**\/migrations/**`) or with no
+ * folder (`*.sql`). It fires on every such change in the repository (an audit found one on 17 of 65 lessons).
+ */
+export const broadGlob = (raw: string) => {
+  const v = raw.trim();
+  return v.startsWith('**/') || (!v.includes('/') && /[*?[{]/.test(v));
+};
+
+/** The path triggers that are broad globs (broadGlob): flagged for the owner (broad-trigger). */
+export const broadTriggerPaths = (t: LessonTriggers | null | undefined) => (t?.paths ?? []).filter(broadGlob);
+
+/**
+ * Why a trigger names nothing specific (an everyday word, a glob for every file or for a kind of file anywhere,
+ * ordinary code), or null. broad: a broad glob (broadGlob) is allowed, because the lesson says it of every such file.
+ */
+export function genericTrigger(kind: TriggerKind, raw: string, repoFiles?: string[] | null, o: { broad?: boolean } = {}): string | null {
   const v = raw.trim();
   const shape = triggerShapeProblem(kind, v);
   if (shape) return shape;
@@ -152,6 +177,7 @@ export function genericTrigger(kind: TriggerKind, raw: string, repoFiles?: strin
     const share = repoFiles.filter((f) => pathMatches(v, f)).length / repoFiles.length;
     if (share > PATH_SHARE_MAX) return `it matches ${Math.round(share * 100)}% of the repository's files`;
   }
+  if (!o.broad && broadGlob(v)) return 'a kind of file anywhere in the repository, not a place: anchor it in a folder';
   return null;
 }
 
@@ -237,49 +263,57 @@ export type DeriveInput = {
   /** The lesson's own words: its rule and when it applies. */
   rule: string;
   appliesWhen: string;
-  /** The miss's text (the feedback with the code it quotes, what was done) and its repository files. */
-  evidence: string;
+  /**
+   * The lesson's own files: its paths, the file of the comment it came from and the files its fix edited. Never the
+   * post-mortem's context items, nor the files of a review the comment was not on.
+   */
   files: string[];
-  /** The repository's files: a glob matching more than PATH_SHARE_MAX of them is no trigger. Null: not judged. */
+  /** The repository's files: a glob matching more than PATH_SHARE_MAX of them is no trigger, and a folder is one of them. Null: not judged, and no folder is widened. */
   repoFiles?: string[] | null;
 };
 
+/** An example in a rule ("(e.g. ...)", a fenced block, a backticked phrase): what a change might look like, not a name it will use. */
+const withoutExamples = (rule: string) => rule
+  .replace(/```[\s\S]*?```/g, ' ')
+  .replace(/`([^`\n]*)`/g, (span, inner: string) => (/\s/.test(inner.trim()) ? ' ' : span))
+  .replace(/\((?:e\.g\.|i\.e\.|for example|for instance|such as|like)(?:[^()]|\([^()]*\))*\)/gi, ' ');
+
+/** The kinds of file the rule says it of every such file of ("every SQL change", "each Dockerfile"): their globs may be broad. */
+const everyOf = (k: (typeof FILE_KINDS)[number], rule: string) =>
+  new RegExp(`\\b(?:[Ee]very|[Aa]ll|[Aa]ny|[Ee]ach)\\s+(?:[\\w./-]+\\s+){0,3}?${asWord(k.says).source}`, k.says.flags).test(rule);
+
 /**
- * Triggers worked out with no model, from the lesson's words and its miss: the miss's files widened to their folder and
- * extension (`api/orders.ts` gives `api/*.ts`; a folder gives `folder/**`); the kinds of file the words name
- * (FILE_KINDS); and the names shaped like code they quote (backticked spans; outside them CODE_SHAPED names and
- * calls). Each is held to genericTrigger; the model's proposals only add to these (mergeTriggers).
+ * Triggers worked out with no model, from the lesson alone: its files widened to their folder and extension
+ * (`api/orders.ts` gives `api/*.ts`; a file with no extension is itself; a folder the repository has gives `folder/**`);
+ * the kinds of file the rule says it of every such file of (FILE_KINDS: broad globs, flagged for the owner as
+ * broad-trigger); and the names shaped like code the rule uses outside its examples (a backticked name; else CODE_SHAPED
+ * names and calls). Each is held to genericTrigger; the model's proposals only add to these (mergeTriggers).
  */
 export function deriveTriggers(o: DeriveInput): LessonTriggers {
   const out = emptyTriggers();
-  const add = (kind: TriggerKind, key: keyof LessonTriggers, v: string) => {
-    // `[REDACTED]` is where redaction took a value out of the miss, not a name the next change will use.
+  const add = (kind: TriggerKind, key: keyof LessonTriggers, v: string, broad = false) => {
+    // `[REDACTED]` is where redaction took a value out, not a name the next change will use.
     if (kind !== 'path' && v.includes('REDACTED')) return;
-    if (out[key].length < MAX_TRIGGERS && !out[key].includes(v) && !genericTrigger(kind, v, o.repoFiles)) out[key].push(v);
+    if (out[key].length < MAX_TRIGGERS && !out[key].includes(v) && !genericTrigger(kind, v, o.repoFiles, { broad })) out[key].push(v);
   };
   for (const f of o.files) {
     const clean = cleanLessonPath(f)?.replace(/\/+$/, '');
     // A secret file's folder and extension (`config/*.env`) would only ever fire on secret files.
     if (!clean || isSecretPath(clean)) continue;
-    const dir = clean.split('/').slice(0, -1).join('/');
+    const parts = clean.split('/');
+    const dir = parts.slice(0, -1).join('/');
     const ext = /\.([A-Za-z0-9]{1,6})$/.exec(clean)?.[1];
+    const folder = !!o.repoFiles?.some((x) => x.startsWith(`${clean}/`));
     if (ext && dir) add('path', 'paths', `${dir}/*.${ext}`);
     // A folder of one or two parts is a service's root in a monorepo, not the area the miss was in.
-    else if (!ext && clean.split('/').length >= 3) add('path', 'paths', `${clean}/**`);
+    else if (folder) { if (parts.length >= 3) add('path', 'paths', `${clean}/**`); }
+    // A file with no extension (a Dockerfile, a Makefile) in a folder: that file.
+    else if (!ext && dir && o.repoFiles?.includes(clean)) add('path', 'paths', clean);
   }
-  // A kind of file only from the lesson's own words: the feedback mentions kinds in passing ("capture manifests"). One
-  // named only in its "applies when" also needs a file of that kind in the miss: a writer can copy a "when" that is
-  // not this miss's (a `**/*.sql` trigger on a lesson about a route).
-  for (const k of FILE_KINDS) {
-    const said = asWord(k.says).test(o.rule) || (asWord(k.says).test(o.appliesWhen) && o.files.some((f) => k.globs.some((g) => pathMatches(g, f))));
-    if (said) for (const g of k.globs) add('path', 'paths', g);
-  }
-  const words = `${o.rule}\n${o.appliesWhen}\n${o.evidence}`;
-  for (const [, span] of words.matchAll(/`([^`\n]{3,80})`/g)) {
-    if (/\s/.test(span.trim())) add('pattern', 'patterns', escapeRe(span.trim()));
-    else if (!FILE_LIKE.test(span)) add('symbol', 'symbols', span.trim());
-  }
-  for (const [, name, call] of words.matchAll(NAME)) {
+  for (const k of FILE_KINDS) if (everyOf(k, o.rule)) for (const g of k.globs) add('path', 'paths', g, true);
+  const rule = withoutExamples(o.rule);
+  for (const [, span] of rule.matchAll(/`([^`\s]{3,80})`/g)) if (!FILE_LIKE.test(span)) add('symbol', 'symbols', span);
+  for (const [, name, call] of rule.matchAll(NAME)) {
     const v = name.replace(/[.:/-]+$/, '');
     if (v.includes('/') || FILE_LIKE.test(v) || !(call || CODE_SHAPED.test(v))) continue;
     add('symbol', 'symbols', v);
@@ -349,8 +383,11 @@ export function matchTriggers(t: LessonTriggers | null | undefined, c: ChangeVie
     const line = re && c.added?.find((l) => re.test(l.text, budget));
     if (line) return { kind, trigger, on: line.path || '(a file the diff does not name)' };
   }
+  // The task's words are prose: a pattern (case-insensitive) or a word-like name there is a word they share with the
+  // lesson, not the change using it. Only a name shaped like code (CODE_SHAPED, or with a camelCase hump: FlushBatch) fires on them.
   const words = c.text ?? '';
-  for (const [kind, trigger, re] of tests) if (re && words && re.test(words, budget)) return { kind, trigger, on: null };
+  const codeName = (s: string) => CODE_SHAPED.test(s) || /[a-z][A-Z]/.test(s);
+  for (const [kind, trigger, re] of tests) if (kind === 'symbol' && codeName(trigger) && re && words && re.test(words, budget)) return { kind, trigger, on: null };
   return null;
 }
 
