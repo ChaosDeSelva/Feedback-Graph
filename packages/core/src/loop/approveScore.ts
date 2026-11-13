@@ -1,16 +1,18 @@
-// Browser-safe (the UI reads the bands): type imports only, besides beta.ts and state.ts.
+// Browser-safe (the UI reads the bands): type imports only, besides beta.ts, state.ts, itemScore.ts and the thresholds.
+import type { VerdictKind, VerdictNeighbour } from '../store.ts';
 import type { CalibrationBucket, Candidate, Claim, Decision, DecisionType, Lesson, LessonCheckName, Question } from '../types.ts';
 import { betaQuantile, CALIBRATION_LOWER_QUANTILE } from './beta.ts';
+import type { ScoreModel } from '../thresholds.ts';
+import { candidateFeatures, claimFeatures, itemChance, lessonFeatures, type Feature } from './itemScore.ts';
 import { LOOP_POLICY_VERSION, LOOP_TYPE_INFO } from './state.ts';
 
 /**
- * The approve score (0.9.4): for a reviewable item, the chance (0-10, one decimal) that your verdict is approve
- * (confirm, accept, approve the proposal). It is read off what the loop already calibrates, not a new model: the
- * newest proposed loop call on the item and the Beta posterior of that call's type in its band (10 x p when the call
- * approves, 10 x (1 - p) when it rejects). An item no call names falls back to its own uncalibrated signal (the
- * classifier's confidence, the lesson checks, the claim's confidence), counted as SIGNAL_LABELS labels. Either way the
- * chance is shrunk toward 5 by the posterior's width, so little evidence reads as a judgement call; a blocking flag
- * caps it at BLOCKING_SCORE_CAP.
+ * The approve score (0.9.4; per item since 0.9.5): for a reviewable item, the chance (0-10, one decimal) that your
+ * verdict is approve (confirm, accept, approve the proposal). Inbox items, lessons and claims are scored from your own
+ * past verdicts on the items most like them and a few of their features (loop/itemScore.ts); open questions and the
+ * loop calls that act on no single reviewed item from the loop's calibration of their type in their band. Either way
+ * the chance is shrunk toward 5 by how little evidence it rests on, and a blocking flag caps it at BLOCKING_SCORE_CAP.
+ * It ranks and explains; it never gates anything: the loop acts on its own only by its calibration (loop/state.ts).
  */
 export type Scored = { score: number | null; scoreWhy: string | null };
 export const UNSCORED: Scored = { score: null, scoreWhy: null };
@@ -24,18 +26,8 @@ export const scoreBand = (score: number): ScoreBand => (score >= SCORE_HIGH ? 'h
 /** Flags that say a person must read the item first: they hold the score at or under BLOCKING_SCORE_CAP. */
 export const SCORE_BLOCKING_FLAGS = ['risky-command', 'may-hold-secret', 'off-turn', 'example-applies-when'] as const satisfies readonly LessonCheckName[];
 export const BLOCKING_SCORE_CAP = 2;
-/**
- * The lesson checks that block a lesson: reject_lesson proposes rejecting one carrying any (its floor). Read here as a
- * reason to reject when no call names the lesson yet.
- */
-export const LESSON_BLOCKING_CHECKS: readonly LessonCheckName[] = ['platitude', 'generic', 'meta-lesson', 'not-pushback', 'no-miss', 'self-review', 'wrong-session'];
 /** A claim flag or an open conflict: accept_claim's floors refuse it, so it is never above a judgement call. */
 export const CLAIM_FLAG_CAP = 5;
-/**
- * An uncalibrated signal (a confidence nobody has checked against your verdicts) weighs as this many labels on a flat
- * Beta(1, 1): a 95% classifier alone scores 6.7, under the green band, until your reviews calibrate a call.
- */
-export const SIGNAL_LABELS = 4;
 /** The 80% interval of Beta(1, 1): no evidence at all, so no weight off 5. */
 const NO_EVIDENCE_WIDTH = 1 - 2 * CALIBRATION_LOWER_QUANTILE;
 
@@ -77,16 +69,10 @@ export function fromCall(call: ScoreCall, post: PosteriorOf): { q: number; why: 
   return { q: shrink(call.approves ? p : 1 - p, b), why: `loop proposes ${call.type}: ${record}` };
 }
 
-/** The chance of approve from an uncalibrated signal (p: its own chance of approve), and why. */
-export function fromSignal(p: number, why: string): { q: number; why: string } {
-  const post = { alpha: 1 + SIGNAL_LABELS * clamp01(p), beta: 1 + SIGNAL_LABELS * (1 - clamp01(p)) };
-  return { q: shrink(post.alpha / (post.alpha + post.beta), post), why };
-}
-
-/** One score from the evidence, then the caps in order (lowest wins), each cap's reason first. */
-function finish(base: { q: number; why: string }, caps: { at: number; why: string }[]): Scored {
+/** One score from the evidence (its reasons, strongest first), then the caps in order (lowest wins), each cap's reason first. */
+function finish(base: { q: number; why: string | string[] }, caps: { at: number; why: string }[]): Scored {
   let score = toScore(base.q);
-  const reasons = [base.why];
+  const reasons = typeof base.why === 'string' ? [base.why] : [...base.why];
   for (const c of [...caps].sort((a, b) => b.at - a.at)) {
     if (score > c.at) { score = c.at; reasons.unshift(c.why); }
   }
@@ -97,42 +83,43 @@ function finish(base: { q: number; why: string }, caps: { at: number; why: strin
 export function callOn(id: string, decisions: readonly Decision[], types: readonly DecisionType[]): Decision | null {
   return decisions.find((d) => d.status === 'proposed' && (d.author ?? 'loop') === 'loop' && types.includes(d.type) && d.targets.some((t) => t.id === id && t.role === 'primary')) ?? null;
 }
-const afterStatus = (d: Decision, id: string) => d.after.find((a) => a.id === id)?.fields.status;
 
-/** A pending Inbox item: approve is confirm (a triage_inbox call, else the classifier). */
-export function scoreCandidate(c: Pick<Candidate, 'id' | 'status' | 'classification'>, decisions: readonly Decision[], post: PosteriorOf): Scored {
-  if (c.status !== 'pending') return UNSCORED;
-  const call = callOn(c.id, decisions, ['triage_inbox']);
-  if (call) return finish(fromCall({ type: call.type, band: call.confidence.band, approves: afterStatus(call, c.id) === 'confirmed' }, post), []);
-  const { label, confidence } = c.classification;
-  const pushback = label === 'pushback' || label === 'correction';
-  return finish(fromSignal(pushback ? confidence : 1 - confidence, `classifier ${Math.round(confidence * 100)}% sure it is ${label}`), []);
+/**
+ * The per-item chance (loop/itemScore.ts) as a score's evidence: shrunk toward one half as a Beta of `labels` labels
+ * would be (your similar verdicts' weight plus what the features are worth), so an item like nothing you decided
+ * reads near 5.
+ */
+export function fromItem(kind: VerdictKind, features: Feature[], near: readonly VerdictNeighbour[] | undefined, model?: ScoreModel): { q: number; why: string[] } {
+  const { p, labels, reasons } = itemChance(kind, features, near, model);
+  return { q: shrink(p, { alpha: 1 + labels * p, beta: 1 + labels * (1 - p) }), why: reasons };
 }
 
-/** A proposed lesson: approve is approving it (an approve_lesson or reject_lesson call, else its checks). */
-export function scoreLesson(l: Pick<Lesson, 'id' | 'status' | 'checks'>, decisions: readonly Decision[], post: PosteriorOf): Scored {
+/**
+ * A pending Inbox item: approve is confirm. 0.9.5: scored from your verdicts on the items nearest it and its own
+ * features (classifier, who wrote it, its PR's state), not from the triage call (loop calibration still decides when the
+ * loop triages on its own). `near`: VerdictsStore.neighbours for it; unset or [] when it has no embedding or no close verdicts.
+ */
+export function scoreCandidate(c: Pick<Candidate, 'status' | 'classification' | 'source' | 'external'>, near?: readonly VerdictNeighbour[]): Scored {
+  if (c.status !== 'pending') return UNSCORED;
+  return finish(fromItem('candidate', candidateFeatures(c), near), []);
+}
+
+/** A proposed lesson: approve is approving it. Its checks and your verdicts on similar lessons; a blocking flag caps it. */
+export function scoreLesson(l: Pick<Lesson, 'status' | 'checks'>, near?: readonly VerdictNeighbour[]): Scored {
   if (l.status !== 'proposed') return UNSCORED;
   const names = [...new Set((l.checks ?? []).map((c) => c.name))];
   const caps = names.filter((n) => (SCORE_BLOCKING_FLAGS as readonly string[]).includes(n)).map((n) => ({ at: BLOCKING_SCORE_CAP, why: `flagged ${n}` }));
-  const call = callOn(l.id, decisions, ['approve_lesson', 'reject_lesson']);
-  if (call) return finish(fromCall({ type: call.type, band: call.confidence.band, approves: call.type === 'approve_lesson' }, post), caps);
-  const blocking = names.filter((n) => LESSON_BLOCKING_CHECKS.includes(n));
-  const base = l.checks == null ? { q: 0.5, why: 'not checked yet' }
-    : blocking.length ? fromSignal(0.2, `fails check ${blocking.slice(0, 2).join(', ')}`)
-      : names.length ? fromSignal(0.5, `flagged ${names.slice(0, 2).join(', ')}`)
-        : fromSignal(0.8, 'no lesson check flags it');
-  return finish(base, caps);
+  return finish(fromItem('lesson', lessonFeatures(l), near), caps);
 }
 
-/** A proposed claim: approve is accepting it (an accept_claim call, else its confidence); a flag or open conflict caps it. */
-export function scoreClaim(c: Pick<Claim, 'id' | 'status' | 'confidence' | 'flags'> & { conflicts?: unknown[] }, decisions: readonly Decision[], post: PosteriorOf): Scored {
+/** A proposed claim: approve is accepting it; a flag or open conflict caps it. */
+export function scoreClaim(c: Pick<Claim, 'status' | 'confidence' | 'flags' | 'type'> & { conflicts?: unknown[] }, near?: readonly VerdictNeighbour[]): Scored {
   if (c.status !== 'proposed') return UNSCORED;
   const caps = [
     ...(c.flags.length ? [{ at: CLAIM_FLAG_CAP, why: `flagged ${c.flags.join(', ')}` }] : []),
     ...(c.conflicts?.length ? [{ at: CLAIM_FLAG_CAP, why: 'an open conflict names it' }] : []),
   ];
-  const call = callOn(c.id, decisions, ['accept_claim']);
-  return finish(call ? fromCall({ type: call.type, band: call.confidence.band, approves: true }, post) : fromSignal(c.confidence, `extraction ${Math.round(c.confidence * 100)}% sure`), caps);
+  return finish(fromItem('claim', claimFeatures(c), near), caps);
 }
 
 /** An open question: scored only when the loop proposes assigning or closing it (approve is doing that). */
@@ -142,9 +129,28 @@ export function scoreQuestion(q: Pick<Question, 'id' | 'status'>, decisions: rea
   return call ? finish(fromCall({ type: call.type, band: call.confidence.band, approves: true }, post), []) : UNSCORED;
 }
 
-/** A proposed loop decision: approve is applying it, at its type's calibrated p in its band. */
-export function scoreDecision(d: Pick<Decision, 'type' | 'status' | 'confidence' | 'author'>, post: PosteriorOf): Scored {
+/** The loop types that act on one reviewed item: their approve score is the item's (reversed when the call rejects it). */
+export const ITEM_CALL_KIND: Partial<Record<DecisionType, VerdictKind>> = { triage_inbox: 'candidate', approve_lesson: 'lesson', reject_lesson: 'lesson', accept_claim: 'claim' };
+
+/** Whether applying an item call is your approve of its item (confirm, approve, accept) rather than your reject. */
+export function callApproves(d: Pick<Decision, 'type' | 'after' | 'targets'>): boolean {
+  if (d.type === 'reject_lesson') return false;
+  if (d.type !== 'triage_inbox') return true;
+  const id = d.targets.find((t) => t.role === 'primary')?.id;
+  return d.after.find((a) => a.id === id)?.fields.status === 'confirmed';
+}
+
+/**
+ * A proposed loop decision: approve is applying it. One that acts on a reviewed item (ITEM_CALL_KIND) scores as that
+ * item does (`item`: its Scored), 10 minus it when applying the call rejects the item; the rest at its type's
+ * calibrated p in its band.
+ */
+export function scoreDecision(d: Pick<Decision, 'type' | 'status' | 'confidence' | 'author' | 'after' | 'targets'>, post: PosteriorOf, item?: Scored): Scored {
   if (d.status !== 'proposed' || (d.author ?? 'loop') !== 'loop') return UNSCORED;
+  if (ITEM_CALL_KIND[d.type] && item?.score != null) {
+    const score = callApproves(d) ? item.score : Math.round((10 - item.score) * 10) / 10;
+    return { score, scoreWhy: `${score.toFixed(1)} · ${item.scoreWhy!.replace(/^\S+ · /, '')}` };
+  }
   return finish(fromCall({ type: d.type, band: d.confidence.band, approves: true }, post), []);
 }
 

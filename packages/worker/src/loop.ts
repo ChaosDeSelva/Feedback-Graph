@@ -29,6 +29,8 @@ export type WorkerLoopDeps = {
   /** Contradiction detection (knowledge intake), beside the loop (never awaited); unset while intake is off. */
   detectConflicts?: () => void;
   retention: () => Promise<void>;
+  /** Embed Inbox items stored without an embedding, so the approve score finds your verdicts on them (inboxEmbed.ts). */
+  embedInbox?: () => Promise<number>;
   evidence: Pick<SessionEvidenceGate, 'ready' | 'recheck' | 'settled' | 'afterIngest'>;
   // Each round.
   /** Cloud sync, beside the loop: a slow or retrying cloud never holds up ingest. */
@@ -107,6 +109,8 @@ export async function runWake(d: WorkerLoopDeps): Promise<void> {
   d.detectLinks();
   d.detectConflicts?.();
   await d.retention();
+  const embedded = await d.embedInbox?.().catch((err) => { d.log('inbox embedding failed', { error: redactSecrets(String(err)) }); return 0; });
+  if (embedded) d.log('inbox items embedded', { embedded });
   if (d.evidence.ready()) await d.evidence.recheck();
   // Keep going without sleeping while there is still work: backfill, post-mortems, scans. The learning loop is
   // offered a round between them (it starts one only when it is due and idle), so a long backlog, such as an

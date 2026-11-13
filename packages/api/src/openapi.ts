@@ -99,7 +99,7 @@ const obj = (properties: Record<string, JsonSchema>, required: string[] = Object
 const loose = (description: string): JsonSchema => ({ type: 'object', description, additionalProperties: true });
 
 /** The approve score on every reviewable item (core loop/approveScore.ts); null when the item is not up for review. */
-const SCORE = { anyOf: [num, { type: 'null' }], description: 'Approve score 0-10 (one decimal): the calibrated chance your verdict is approve, shrunk toward 5 with little evidence; null when not up for review' };
+const SCORE = { anyOf: [num, { type: 'null' }], description: 'Approve score 0-10 (one decimal): the chance your verdict is approve, from your verdicts on the most similar items you decided and the item\'s own features (questions: the loop\'s calibration), shrunk toward 5 with little evidence; for ranking, never for auto-apply; null when not up for review' };
 const SCORE_WHY = { anyOf: [str, { type: 'null' }], description: 'The score and its top one or two reasons, in one line ("8.6 · ...")' };
 
 const SCHEMAS: Record<string, JsonSchema> = {
@@ -235,7 +235,7 @@ const SCHEMAS: Record<string, JsonSchema> = {
     decidedBy: { type: 'string', description: "'loop:<v>', 'you' or 'operator:<name>'" },
     rollback: obj({ at: time, by: str, reason: nullable(str), note: nullable(str), cascade: arrayOf(str) }), ratifiedAt: time, ratifiedBy: str, syncHoldUntil: time,
     author: { type: 'string', enum: [...DECISION_AUTHORS], description: 'loop, or owner: a change you made through a decision (a conflict resolved), never calibrated or counted as the loop\'s' },
-    approveScore: { ...SCORE, description: 'Approve score 0-10 of a proposed loop decision (score is the loop\'s raw score): its type\'s calibrated p in its band, shrunk toward 5 with few labels; null unless proposed by the loop' },
+    approveScore: { ...SCORE, description: 'Approve score 0-10 of a proposed loop decision (score is the loop\'s raw score): a call on one Inbox item, lesson or claim scores as that item (10 minus it when the call rejects it), any other its type\'s calibrated p in its band, shrunk toward 5 with few labels; null unless proposed by the loop' },
     scoreWhy: SCORE_WHY,
   }, ['id', 'type', 'projectKey', 'targets', 'before', 'after', 'evidence', 'features', 'score', 'confidence', 'tier', 'mode', 'rationale', 'model', 'policyVersion', 'status', 'dependsOn', 'createdAt']),
   DecisionNote: obj({ id: str, decisionId: str, ts: time, by: str, text: str, verdict: nullable({ type: 'string', enum: ['agree', 'disagree'] }), reason: str }, ['id', 'decisionId', 'ts', 'by', 'text']),

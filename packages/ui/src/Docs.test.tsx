@@ -285,6 +285,6 @@ test('the learning loop section says how to read the approve score and how it di
   const section = within(screen.getByRole('region', { name: 'The learning loop' }));
   expect(section.getByText('The approve score.')).toBeTruthy();
   for (const flag of ['risky-command', 'may-hold-secret', 'off-turn', 'example-applies-when']) expect(section.getByText(flag)).toBeTruthy();
-  expect(section.getByText(/10 × \(1 − p\) for one that rejects/)).toBeTruthy();
-  expect(section.getByText(/The score is not the auto-apply bar/)).toBeTruthy();
+  expect(section.getByText(/scored from the 10 items most like it that you decided yourself/)).toBeTruthy();
+  expect(section.getByText(/The score ranks; it is not the auto-apply bar/)).toBeTruthy();
 });

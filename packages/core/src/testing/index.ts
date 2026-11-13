@@ -72,3 +72,4 @@ export function describeStores(name: string, body: (h: StoreHarness) => void, o:
     });
   }
 }
+export { seedScoreFixture, fixtureVector, SCORE_FIXTURE_TOPICS, type ScoreFixtureItem } from './scoreFixture.ts';

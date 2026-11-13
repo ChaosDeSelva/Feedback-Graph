@@ -62,3 +62,34 @@ export const INBOX_SEMANTIC_DAYS = 3;
  * "sometimes" (0.55) kept every one from agents. The review route, import and the loop's accept_claim all file it so.
  */
 export const CLAIM_FACT_RELEVANCE = 0.8;
+
+/** How many of your verdicts nearest an item the approve score reads (loop/itemScore.ts, 0.9.5). */
+export const VERDICT_NEIGHBOURS = 10;
+/** A verdict made in another project counts this much of one in the item's own project. Not fitted: a stated choice. */
+export const VERDICT_CROSS_PROJECT_WEIGHT = 0.5;
+/** The neighbours' approve rate is a Beta posterior with this many labels of prior at your approve rate for the kind. */
+export const VERDICT_PRIOR_LABELS = 2;
+
+/**
+ * One kind's approve-score model (loop/itemScore.ts): logit P(approve) = intercept + verdicts x (logit(neighbour rate) -
+ * logit(base)) + sum(features[name] x value). floor (cosine): your verdicts on items at least this close are read,
+ * each weighing (cosine - floor) / (1 - floor). base: your approve rate for the kind. featureLabels: how many labels
+ * the features are worth when the score is shrunk toward 5 (added to the neighbours' weight); a stated choice, not
+ * fitted (0.9.4's SIGNAL_LABELS).
+ */
+export type ScoreModel = { floor: number; base: number; intercept: number; verdicts: number; features: Record<string, number>; featureLabels: number };
+
+/**
+ * Fitted offline by scripts/score-eval.ts on the owner's own verdicts (decidedBy 'you') in a copy of the author's
+ * install, 2026-11-13: 287 Inbox verdicts (179 confirmed) and 240 lesson verdicts (153 approved). Floor and L2 penalty
+ * chosen on the older 70% alone; on the newer 30% (each item scored only from verdicts made before it) the score's AUC
+ * was 0.80 for Inbox items (0.9.4: one score per band; its no-call signal 0.62) and 0.76 for lessons (0.49). The
+ * coefficients are the refit on every verdict at that floor and penalty. docs/operations.md#measuring-the-approve-score
+ * has the decile tables and how to rerun it on your own store. Claims had one verdict: their model is stated, not
+ * fitted (confidence and flags as 0.9.4 read them), and its neighbours term is the same as the others'.
+ */
+export const APPROVE_SCORE_MODEL: Record<'candidate' | 'lesson' | 'claim', ScoreModel> = {
+  candidate: { floor: 0.4, base: 0.62, intercept: 0.08, verdicts: 0.47, features: { classifier: 0.07, synced: 0.03, prAuthor: -0.61, reply: -0.23, merged: 0.44, closedUnmerged: -0.17, bot: 0 }, featureLabels: 4 },
+  lesson: { floor: 0.5, base: 0.64, intercept: 0.95, verdicts: 0.92, features: { failsCheck: 0.29, badPath: 0.29, flagged: -1.76, unchecked: 0 }, featureLabels: 4 },
+  claim: { floor: 0.5, base: 0.5, intercept: 0, verdicts: 1, features: { confidence: 0.7, flagged: -0.8, opinion: -0.3 }, featureLabels: 4 },
+};

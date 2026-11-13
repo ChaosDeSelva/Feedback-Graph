@@ -282,6 +282,7 @@ the vector searches return, (1 + cos) / 2; a **cosine** is the plain cosine of t
 | `NEAR_DUPLICATE_FROM` | cosine | 0.85 | From here up to `DUPLICATE_FLAG`, two lessons of one project in the same words, or that the loop's model says (yes or unsure) say the same thing, are proposed for a merge, never merged on their own; a no is remembered until either lesson changes. |
 | `INBOX_WORD_OVERLAP`, `INBOX_MERGE_MINUTES` | share, minutes | 0.6, 60 | An agent's report and a flagged turn are one Inbox item: the same session, or this share of words within this time. |
 | `INBOX_SEMANTIC_COSINE`, `INBOX_SEMANTIC_DAYS` | cosine, days | 0.85, 3 | The same, by meaning: a reworded or next-day report joins the item. |
+| `APPROVE_SCORE_MODEL[kind].floor` | cosine | 0.4 Inbox, 0.5 lessons and claims | The approve score reads your verdicts on items at least this close (each weighing by how far above it); chosen by `scripts/score-eval.ts` ([Measuring the approve score](#measuring-the-approve-score)). |
 | `CLAIM_FACT_RELEVANCE` | relevance | 0.8 | Not a similarity: the relevance an accepted claim's fact is filed at until it is scored (everyday, so it is served on a task about it). |
 
 Other bars live beside their code: `MISS_MIN_SIMILARITY` (default 0.85, a score; [The judge](#the-judge)), the score a
@@ -806,6 +807,53 @@ docker rm -f fg-replay-neo4j && docker volume rm fg-replay-neo4j
 ```
 
 A backup holds your own feedback, so keep the report and `--json` output on your machine.
+
+### Measuring the approve score
+
+The approve score (the guide's **Approve score**) is fitted, not hand-set, so it comes with a backtest:
+`node scripts/score-eval.ts --store neo4j --url bolt://127.0.0.1:<port> --password <pw>` (or `--store postgres --url
+postgres://…`). For Inbox items, lessons and claims it takes the items you decided (decidedBy `you`), oldest verdict
+first, fits the model on the older 70% (`--train-share`) and scores the newer 30%, each from only the verdicts you made
+before it. The cosine floor and the fit's L2 penalty are chosen on the older share alone. It prints the AUC of the
+score and of its parts alone (similar verdicts only, item facts only, and 0.9.4's no-proposal signal), the approve rate
+per score decile of the newer share, and the coefficients refitted on every verdict: what `APPROVE_SCORE_MODEL` in
+`packages/core/src/thresholds.ts` holds. It prints numbers and feature names only, never an item's text, id or project.
+
+It only reads the store. Two options write, and only to a throwaway copy (a Neo4j on none of an install's bolt ports, a
+Postgres database whose name contains `test`): `--embed-inbox <ollama url>` first embeds Inbox items stored without an
+embedding, as the worker does, and `--fixture` seeds the integration tests' synthetic history into an empty store. To
+measure your own install, load its newest backup into a throwaway Neo4j (`neo4j-admin database load` in a container
+with its data on tmpfs, on another port), run with `--embed-inbox`, then remove the container.
+
+The run behind 0.9.5's coefficients, on a copy of the author's install (2026-11-13, `nomic-embed-text`):
+
+| | Inbox items | Lessons |
+|---|---|---|
+| Your verdicts (approve) | 287 (179) | 240 (153) |
+| Fit on / scored | older 200 / newer 87 | older 168 / newer 72 |
+| Floor, L2 (chosen on the older share) | 0.4, 30 | 0.5, 1 |
+| AUC, the score | **0.80** | **0.76** |
+| AUC, similar verdicts only | 0.78 | 0.63 |
+| AUC, item facts only | 0.67 | 0.71 |
+| AUC, 0.9.4's no-proposal signal | 0.62 | 0.49 |
+
+0.9.4 with a proposal gave every item in a confidence band the same score, so it could not rank them at all (all 15
+pending Inbox items scored 3.3). Approve rate per decile of the newer share, lowest score first:
+
+| Decile | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| Inbox: mean score | 4.8 | 5.4 | 5.6 | 5.7 | 5.9 | 6.1 | 6.2 | 6.4 | 6.5 | 6.7 |
+| Inbox: approve rate | 0.00 | 0.22 | 0.44 | 0.38 | 0.67 | 0.67 | 0.88 | 0.78 | 0.89 | 0.78 |
+| Lessons: mean score | 2.6 | 3.4 | 3.7 | 4.6 | 5.0 | 5.4 | 5.6 | 5.9 | 6.3 | 6.9 |
+| Lessons: approve rate | 0.29 | 0.00 | 0.43 | 0.71 | 0.50 | 0.86 | 0.71 | 0.86 | 0.71 | 0.88 |
+
+Each decile holds 7 to 9 items, so single bins are noisy; the trend is the result. The scores sit close to 5 because
+they are shrunk by how little each rests on (a few labels of similar verdicts plus 4 for the item's facts): the order
+is what the score is for. Claims had one verdict, so their weights are stated, not fitted. Caveats: an item's facts are
+read as they are now (a PR that merged after you decided counts as merged), and the decided Inbox items' embeddings
+were made for this run from their words, as the worker's backfill makes them. On the synthetic fixture (`--fixture`,
+90 verdicts per kind on three topics) the score's AUC on the newer share is 0.83 on Neo4j and 0.81 on Postgres
+(Inbox) and 0.83 on both (lessons).
 
 ## Troubleshooting
 

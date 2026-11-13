@@ -41,11 +41,13 @@ EvidenceRef    = { kind: 'activity'|'miss'|'lesson'|'fact'|'check'|'session'|'ca
 confidence     = { p, lower, n, band }   // n: the owner's own labels for this type and band
 needsYou?      : string                  // a proposed decision only (0.9.1): why the loop could not decide it, in one line
 approveScore   : number | null           // 0.9.4: 0-10, the chance you approve it (proposed by the loop only; else null)
-scoreWhy       : string | null           // the score and its top reasons in one line: "8.6 · loop proposes ..."
+scoreWhy       : string | null           // the score and its top reasons in one line: "6.4 · you confirmed 9 of 10 ..."
 ```
 
-`approveScore` is core's `scoreDecision` (`packages/core/src/loop/approveScore.ts`): the type's current calibrated *p* in the
-decision's band, pulled toward 5 by the posterior's width. It is not `score`, which stays the loop's raw score. See the
+`approveScore` is core's `scoreDecision` (`packages/core/src/loop/approveScore.ts`). A call on one reviewed item
+(`triage_inbox`, `approve_lesson`, `reject_lesson`, `accept_claim`) scores as its item does since 0.9.5 (your verdicts on
+similar items and the item's facts; 10 minus that when the call rejects it); any other call reads the type's current
+calibrated *p* in the decision's band, pulled toward 5 by the posterior's width. It ranks; it never gates auto-apply. It is not `score`, which stays the loop's raw score. See the
 guide's **Approve score**.
 
 `needsYou` is core's `needsYouReason`: the reason the loop gave for proposing rather than applying it (its rationale's

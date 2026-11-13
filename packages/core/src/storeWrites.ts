@@ -1,5 +1,5 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
-import type { GraphStore, KnowledgeStore, FactsStore, DocsStore, LinksStore, ActivityStore, InsightsStore, PortabilityStore, EmbeddingsStore, SelectionStore, CodeGraphStore, SessionsStore, ChatStore, RunsStore, DecisionsStore, IntakeStore, Store } from './store.ts';
+import type { GraphStore, KnowledgeStore, FactsStore, DocsStore, LinksStore, ActivityStore, InsightsStore, PortabilityStore, EmbeddingsStore, SelectionStore, CodeGraphStore, SessionsStore, ChatStore, RunsStore, DecisionsStore, IntakeStore, Store, VerdictsStore } from './store.ts';
 import type { RunOwner, RunPrincipal } from './types.ts';
 
 type Mode = 'read' | 'write' | 'internal';
@@ -321,6 +321,12 @@ export const STORE_WRITE_POLICY = {
     runItems: 'read',
     removeRun: 'write',
   } satisfies Policy<IntakeStore>,
+  verdicts: {
+    neighbours: 'read',
+    ownerVerdicts: 'read',
+    inboxToEmbed: 'read',
+    setInboxEmbeddings: 'write',
+  } satisfies Policy<VerdictsStore>,
   store: {
     ensureSchema: 'write',
     ping: 'read',
@@ -370,7 +376,7 @@ export function guardStoreMethods<T extends object>(value: T, policy: object): T
 
 export function guardStore(store: Store): Store {
   const out = guardStoreMethods(store, STORE_WRITE_POLICY.store);
-  const groups = ['graph', 'knowledge', 'facts', 'docs', 'links', 'activity', 'insights', 'portability', 'embeddings', 'selection', 'codegraph', 'sessions', 'chats', 'runs', 'decisions', 'intake'] as const;
+  const groups = ['graph', 'knowledge', 'facts', 'docs', 'links', 'activity', 'insights', 'portability', 'embeddings', 'selection', 'codegraph', 'sessions', 'chats', 'runs', 'decisions', 'intake', 'verdicts'] as const;
   const parts = Object.fromEntries(groups.filter(key => store[key] && typeof store[key] === 'object').map(key => [key, guardStoreMethods(store[key], STORE_WRITE_POLICY[key === 'chats' ? 'chat' : key])]));
   return new Proxy(out, { get(target, key) { return key in parts ? parts[key as string] : Reflect.get(target, key); } });
 }

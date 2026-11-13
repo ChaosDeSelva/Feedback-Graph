@@ -252,6 +252,12 @@ export async function createApiService(config: Config, store: Store, env: NodeJS
       inScope: async (key: string) => (await shown()).has(key),
     },
     runs: store.runs,
+    verdicts: {
+      verdicts: store.verdicts,
+      candidates: (ids) => store.graph.listCandidates({ ids, limit: ids.length }),
+      lessons: (ids) => knowledge.listLessons({ ids, limit: ids.length }),
+      claims: (ids) => store.intake.listClaims({ ids, limit: ids.length }),
+    },
     evidence: {
       sessions: store.sessions,
       inScope: async (key: string) => (await shown()).has(key),

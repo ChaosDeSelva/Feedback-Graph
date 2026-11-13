@@ -3,7 +3,7 @@ import { describeStores } from '@fb/core/testing';
 import { beforeAll, expect, test } from 'vitest';
 import { createApp } from './app.ts';
 
-/** The approve score over a real store, on each backend: the calls and calibration it reads, and sort=score. */
+/** The approve score over a real store, on each backend: your verdicts by meaning, the calls on items, and sort=score. */
 const OWNER = 'score-int-owner-token-0123456789abcdef';
 const T0 = '2026-11-01T00:00:00.000Z';
 const vec = (axis: number) => Array.from({ length: 768 }, (_, i) => (i === axis ? 1 : 0));
@@ -21,20 +21,26 @@ describeStores('approve score api', (h) => {
       config: { mode: null, disabled: false, llm: null, llmCallsPerDay: 40, autoPerDay: 5, autoPerProject: 2, syncHoldDays: 7, holdout: 0.2, types: null },
     },
     intakeReview: { intake: store.intake, facts: store.facts, embed: async (t) => t.map(() => vec(2)), activity: store.activity },
+    verdicts: { verdicts: store.verdicts, lessons: (ids) => store.knowledge.listLessons({ ids, limit: ids.length }), claims: (ids) => store.intake.listClaims({ ids }) },
   });
   const owner = { authorization: `Bearer ${OWNER}`, 'x-fg-owner': 'true' };
   const get = async (a: ReturnType<typeof app>, path: string) => (await a.request(path, { headers: owner })).json();
 
-  test('lessons and decisions: a calibrated approve call scores high, sort=score orders by it, detail carries it', async () => {
-    const add = async (id: string, checks: { name: 'risky-command' | 'bad-path'; why: string }[] = []) => {
+  test('lessons and decisions: your approved lessons like it rank it first; an approve call scores as its lesson; sort=score orders by it', async () => {
+    const add = async (id: string, axis: number, checks: { name: 'risky-command' | 'bad-path'; why: string }[] = []) => {
       await store.knowledge.upsertLesson({
         id, projectKey: 'demo', title: `title ${id}`, rule: `rule ${id}`, appliesWhen: 'editing the API', scope: 'project',
-        paths: ['src/api.ts'], status: 'proposed', source: 'memory', embedding: vec(1), checks,
+        paths: ['src/api.ts'], status: 'proposed', source: 'memory', embedding: vec(axis), checks,
       });
       return (await store.knowledge.lessonDetail(id))!.lesson;
     };
-    const [called, risky] = [await add('lesson:score-call'), await add('lesson:score-risky', [{ name: 'risky-command', why: 'curl | sh' }])];
-    await add('lesson:score-plain', [{ name: 'bad-path', why: 'no such file' }]);
+    // Three lessons on the same topic that you approved.
+    for (const id of ['lesson:past-1', 'lesson:past-2', 'lesson:past-3']) {
+      await add(id, 1);
+      await store.knowledge.updateLesson(id, { status: 'approved' }, { by: 'you' });
+    }
+    const [called, risky] = [await add('lesson:score-call', 1), await add('lesson:score-risky', 1, [{ name: 'risky-command', why: 'curl | sh' }])];
+    await add('lesson:score-plain', 7, [{ name: 'bad-path', why: 'no such file' }]);
     for (const l of [called, risky]) {
       await store.decisions.propose({
         type: 'approve_lesson', projectKey: 'demo', targets: [{ kind: 'lesson', id: l.id, role: 'primary' }],
@@ -43,19 +49,18 @@ describeStores('approve score api', (h) => {
         confidence: { p: 0.9, lower: 0.8, n: 30, band: 4 }, tier: 'A', mode: 'propose', rationale: 'repeats', model: 'deterministic', policyVersion: LOOP_POLICY_VERSION, status: 'proposed',
       });
     }
-    await store.decisions.bumpCalibration({ type: 'approve_lesson', band: 4, policyVersion: LOOP_POLICY_VERSION, prior: LOOP_TYPE_INFO.approve_lesson.prior, alpha: 60, beta: 2, n: 62 });
+    // The band's calibration says reject; the score reads your verdicts instead.
+    await store.decisions.bumpCalibration({ type: 'approve_lesson', band: 4, policyVersion: LOOP_POLICY_VERSION, prior: LOOP_TYPE_INFO.approve_lesson.prior, alpha: 2, beta: 60, n: 62 });
     const a = app();
     const rows = (await get(a, '/api/lessons?status=proposed&project=demo&sort=score')) as { id: string; score: number; scoreWhy: string }[];
     const mine = rows.filter((r) => r.id.startsWith('lesson:score-'));
     expect(mine.map((r) => r.id)).toEqual(['lesson:score-call', 'lesson:score-plain', 'lesson:score-risky']);
-    expect(mine[0].score).toBeGreaterThanOrEqual(7);
-    expect(mine[0].scoreWhy).toContain('loop proposes approve_lesson: you kept 60 of 62 in its band (p .91)');
+    expect(mine[0].scoreWhy).toMatch(/^\d\.\d · you approved 3 of 3 similar lessons in demo/);
     expect(mine[2]).toMatchObject({ score: 2 });
     expect(mine[2].scoreWhy).toMatch(/^2\.0 · flagged risky-command; /);
     expect((await get(a, `/api/lessons/${encodeURIComponent(called.id)}`)).lesson.score).toBe(mine[0].score);
-    const decisions = (await get(a, '/api/decisions?status=proposed&type=approve_lesson&sort=score')) as { approveScore: number; score: number }[];
-    expect(decisions.length).toBeGreaterThanOrEqual(2);
-    expect(decisions.every((d) => d.approveScore >= 7 && d.score === 0.9)).toBe(true);
+    const decisions = (await get(a, '/api/decisions?status=proposed&type=approve_lesson&sort=score')) as { targets: { id: string }[]; approveScore: number; score: number }[];
+    expect(decisions.map((d) => [d.targets[0].id, d.approveScore, d.score])).toEqual([[called.id, mine[0].score, 0.9], [risky.id, 2, 0.9]]);
   });
 
   test('claims and questions: scored from extraction confidence and flags; sort=score orders the page', async () => {

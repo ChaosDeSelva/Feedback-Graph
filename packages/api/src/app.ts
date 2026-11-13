@@ -30,7 +30,7 @@ import { connectionsStatus, integrationRoutes, type IntegrationsDeps } from './i
 import { loopRoutes, ownerOverrides, type LoopDeps } from './decisions.ts';
 import { intakeRoutes, type IntakeRouteDeps } from './intake.ts';
 import { intakeReviewRoutes, type IntakeReviewDeps } from './intakeReview.ts';
-import { pageByScore, scorer, SortQuery } from './scores.ts';
+import { pageByScore, scorer, SortQuery, type ItemSource } from './scores.ts';
 import { knowledgeRoutes, type KnowledgeDeps } from './knowledge.ts';
 
 export type { SettingsDeps } from './settings.ts';
@@ -187,6 +187,8 @@ export type AppOpts = {
   evidence?: EvidenceDeps;
   /** The learning loop: its decisions, state, settings and live events (decisions.ts). Unset: those routes are not there (404). */
   loop?: LoopDeps;
+  /** Your past verdicts and the items loop calls act on, for the per-item approve score (scores.ts). Unset: items score from their own features. */
+  verdicts?: ItemSource;
   /** Aborted when the server shuts down: every open event stream ends at once, and no new one opens. */
   closing?: AbortSignal;
   /** Knowledge intake (intake.ts), set only with INTAKE_ENABLED: unset, its routes are not there (404). Needs docs with docText, embed and projectDirs. */
@@ -499,7 +501,7 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
   const { staticDir, context: sourceContext, knowledge, embed, facts, projectDirs, insights, docs, links, auth = {}, system, portability, settings, log, codegraph, classifyQueue, inScope, sessions, shown } = opts;
   // Writes made with the operator token are logged as the agent that made them, wherever the route lives.
   const context = sourceContext ? { ...sourceContext } : undefined;
-  const scores = scorer(opts.loop?.decisions);
+  const scores = scorer(opts.loop?.decisions, opts.verdicts);
   if (context && sessions?.store.claimRun) {
     context.registerSession = async id => {
       const run = currentRun();
@@ -1735,7 +1737,7 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
   if (opts.lookUp) {
     knowledgeRoutes(app, opts.lookUp, { view, agentCaller: (c) => !!auth.token && tokenMatches(bearerOf(c), auth.token) && !hasOperatorToken(c, auth.operator) });
   }
-  if (opts.loop) loopRoutes(app, { ...opts.loop, activity: asActor(opts.loop.activity) }, { tokenless: !auth.token && !auth.ownerToken, view });
+  if (opts.loop) loopRoutes(app, { ...opts.loop, activity: asActor(opts.loop.activity) }, { tokenless: !auth.token && !auth.ownerToken, view, scores });
   /** The owner's own write to these lessons or facts overrides the loop decisions it changed (decisions.ts ownerOverrides). */
   const overrideLoop = opts.loop ? ownerOverrides({ ...opts.loop, activity: asActor(opts.loop.activity) }) : async () => {};
 

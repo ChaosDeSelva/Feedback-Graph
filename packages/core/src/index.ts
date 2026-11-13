@@ -83,6 +83,7 @@ export * from './loop/syncHold.ts';
 export * from './loop/holdout.ts';
 export * from './loop/metrics.ts';
 export * from './loop/approveScore.ts';
+export * from './loop/itemScore.ts';
 
 export { encryptedRedactionArchive, publicRedactionArchive } from './encryptedArchive.ts';
 

@@ -16,6 +16,7 @@ import { RunsRepo } from './runs.ts';
 import { underLease } from './schemaTasks.ts';
 import { SelectionRepo } from './selection.ts';
 import { backfillSessionStats, SessionsRepo } from './sessions.ts';
+import { VerdictsRepo } from './verdicts.ts';
 
 export type Neo4jConfig = { url: string; user: string; password: string };
 
@@ -40,6 +41,7 @@ export function neo4jStore(g: GraphRepo): Store {
     runs: new RunsRepo(g),
     decisions: new DecisionsRepo(g),
     intake: new IntakeRepo(g),
+    verdicts: new VerdictsRepo(g),
     ensureSchema: async (o) => {
       await g.ensureSchema();
       // The api and the worker start together: one of them runs these while the other waits, rather than both

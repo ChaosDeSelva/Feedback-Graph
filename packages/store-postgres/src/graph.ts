@@ -337,8 +337,9 @@ export class PgGraphStore implements GraphStore {
          AND ($11::boolean OR ${visibleToRun('k', '$7')})
          AND ($8::text IS NULL OR t.external->>'thread' ~ ('#' || $8 || '$') OR concat_ws(E'\n', t.text, t.preceding_assistant_text, t.summary, k.note, k.agent_report::text) ~* $10)
          AND ($9::text IS NULL OR lower(t.external->>'author') = lower($9))
+         AND ($12::text[] IS NULL OR k.id = ANY($12))
        ORDER BY t.ts DESC, k.id LIMIT $3 OFFSET $6`,
-      [f.status ?? null, f.projectKey ?? null, f.limit ?? 200, f.projectKeys ?? null, f.source ?? null, Math.max(0, Math.floor(f.offset ?? 0)), f.run ?? null, f.pr ? String(f.pr) : null, f.author ?? null, reviewPatterns(f.pr).pr, !!f.includeSandbox],
+      [f.status ?? null, f.projectKey ?? null, f.limit ?? 200, f.projectKeys ?? null, f.source ?? null, Math.max(0, Math.floor(f.offset ?? 0)), f.run ?? null, f.pr ? String(f.pr) : null, f.author ?? null, reviewPatterns(f.pr).pr, !!f.includeSandbox, f.ids ?? null],
     );
     return rows.map(candidateOf);
   }

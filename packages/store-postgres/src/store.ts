@@ -17,6 +17,7 @@ import { PgPortabilityStore } from './portability.ts';
 import { PgRunsStore } from './runs.ts';
 import { PgSelectionStore } from './selection.ts';
 import { PgSessionsStore } from './sessions.ts';
+import { PgVerdictsStore } from './verdicts.ts';
 import { checkPgvector } from './vector.ts';
 
 export type PostgresStore = Store & { readonly kind: 'postgres'; readonly db: Db };
@@ -42,6 +43,7 @@ export function postgresStore(db: Db): PostgresStore {
     runs: new PgRunsStore(db),
     decisions: new PgDecisionsStore(db),
     intake: new PgIntakeStore(db),
+    verdicts: new PgVerdictsStore(db),
     ensureSchema: async () => {
       await migrate(db.pool, { embeddingDimensions: db.dims });
       await checkPgvector(db);

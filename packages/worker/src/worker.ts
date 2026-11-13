@@ -1,3 +1,4 @@
+import { embedInboxBacklog } from './inboxEmbed.ts';
 import { githubBudgetFetch } from './integrations/githubBudget.ts';
 import { loopExecutor, readAuthState, reconcileInFlight, setRedactionArchive, setRedactionArchivePurger } from '@fb/core';
 import { encryptedRedactionArchive } from './redactionArchive.ts';
@@ -684,6 +685,7 @@ export async function runWorker(io: WorkerIo): Promise<void> {
     detectLinks: () => { void links.tick(); },
     detectConflicts: () => { void conflicts?.tick(); },
     retention: () => retention.tick(),
+    embedInbox: () => embedInboxBacklog({ verdicts: store.verdicts, embed, log }),
     evidence,
     cloudTick: () => { void cloudSchedule?.tick(); },
     kickScans: () => scanRunner.kick(),

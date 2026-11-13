@@ -749,6 +749,38 @@ export interface PortabilityStore {
   deleteProject(key: string): Promise<number>;
 }
 
+/** The kinds of reviewed item the approve score looks up your past verdicts for (loop/itemScore.ts). */
+export type VerdictKind = 'candidate' | 'lesson' | 'claim';
+/**
+ * One of your past verdicts near an item: approved is confirm (Inbox), approve (lesson) or accept (claim). cosine: the
+ * true cosine of the two stored embeddings. sameProject: learned in the item's project.
+ */
+export type VerdictNeighbour = { id: string; projectKey: string | null; approved: boolean; cosine: number; sameProject: boolean; decidedAt: string };
+/** An item with its verdict when you decided it (approved null while undecided or decided by anyone else). */
+export type VerdictItem = { id: string; approved: boolean | null; decidedAt: string | null };
+
+/**
+ * Your past verdicts by meaning (0.9.5): what the approve score ranks an item by. A verdict is yours when its decidedBy
+ * is 'you': never an operator's, the loop's, a skip rule's or one decided before decidedBy was recorded. Sandbox
+ * records are never read. Exact scans over your decided items (hundreds, not the whole graph), so no vector index.
+ */
+export interface VerdictsStore {
+  /**
+   * Per item (by id; one without an embedding is left out): up to k of your verdicts nearest it at cosine >= minCosine,
+   * those learned in its project first, then the other projects', each group nearest first; never the item itself.
+   * priorOnly (the backtest): only verdicts made before the item's own decidedAt.
+   */
+  neighbours(q: { kind: VerdictKind; ids: string[]; k: number; minCosine: number; priorOnly?: boolean }): Promise<Record<string, VerdictNeighbour[]>>;
+  /** Every item of the kind you decided, oldest verdict first (scripts/score-eval.ts). */
+  ownerVerdicts(kind: VerdictKind): Promise<VerdictItem[]>;
+  /**
+   * Inbox items with no embedding of their flagged words (decided before 0.9.1 embedded them, or the embedder was down),
+   * a page at a time: the worker embeds them so your past verdicts can be found by meaning.
+   */
+  inboxToEmbed(limit: number): Promise<{ id: string; text: string }[]>;
+  setInboxEmbeddings(rows: { id: string; embedding: number[] }[]): Promise<void>;
+}
+
 /** Which embedding model the stored vectors came from, and re-embedding everything with another. */
 export interface EmbeddingsStore {
   stored(): Promise<string | null>;
@@ -1195,6 +1227,7 @@ export interface Store {
   readonly runs: RunsStore;
   readonly decisions: DecisionsStore;
   readonly intake: IntakeStore;
+  readonly verdicts: VerdictsStore;
   /**
    * Create or upgrade the schema (Neo4j constraints and indexes; Postgres migrations). Safe from two services at once.
    * `log`: where a Neo4j upgrade left to run in the background reports progress and failures.

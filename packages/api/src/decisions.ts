@@ -10,7 +10,7 @@ import {
   type LoopRound, type LoopSettings, type PatternReport, type SessionsStore, type ShownProjects, type TargetSnapshot,
 } from '@fb/core';
 import { actingAsOperator, currentActor } from './operator.ts';
-import { pageByScore, scorer, SortQuery } from './scores.ts';
+import { pageByScore, scorer, SortQuery, type Scorer } from './scores.ts';
 
 /**
  * The learning loop's REST routes (docs/learning-loop-api.md): its decisions as the audit log, the owner's verdicts on
@@ -123,7 +123,8 @@ const EXPIRED_LISTED = 25;
  * createApp's part: whether owner actions are read-only (no API_TOKEN, no FG_OWNER_TOKEN), and which projects are
  * shown (null: everything). The routes read `view` once per request.
  */
-export type LoopRouteContext = { tokenless: boolean; view: () => Promise<Pick<ShownProjects, 'has' | 'keys'> | null> };
+/** scores: the app's scorer (with your verdicts); unset, one over the decisions store alone. */
+export type LoopRouteContext = { tokenless: boolean; view: () => Promise<Pick<ShownProjects, 'has' | 'keys'> | null>; scores?: Scorer };
 
 /** What one request may see: a project's records (and those of none), and the store's projectKeys filter (undefined: all). */
 type Seen = { visible: (key: string | null) => boolean; keys: string[] | undefined };
@@ -275,7 +276,7 @@ const guarded = (h: Handler): Handler => async (c) => {
 export function loopRoutes(app: Hono, d: LoopDeps, ctx: LoopRouteContext) {
   const now = d.now ?? Date.now;
   const store = d.decisions;
-  const scores = scorer(store);
+  const scores = ctx.scores ?? scorer(store);
   /** The shown projects, read once per request however many records it checks (each read is a few store queries). */
   const seenBy = new WeakMap<Request, Promise<Seen>>();
   const seen = (c: Context): Promise<Seen> => {
