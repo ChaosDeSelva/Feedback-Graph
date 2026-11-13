@@ -524,4 +524,19 @@ describeStores('FactsStore', (h) => {
     // A file only asked for has no hash: it is not mistaken for a scanned one.
     expect([...(await f.fileHashes('demo')).keys()]).toEqual(['src/d.ts']);
   });
+
+  test('rekindScannedFacts re-kinds scanned facts of the given kinds, current or not; yours and a claim\'s keep theirs', async () => {
+    await f.saveFileFacts('rk', { path: 'src/a.ts', hash: 'h1', summary: '' }, [{ ...fact('old decided'), kind: 'decision' }], 'p');
+    await f.saveFileFacts('rk', { path: 'src/a.ts', hash: 'h2', summary: '' }, [{ ...fact('scan decided'), kind: 'decision' }, { ...fact('scan planned'), kind: 'plan' }, fact('a convention')], 'p');
+    const claim = await f.addOwnerFact('rk', { ...fact('people decided'), kind: 'decision' }, 'you', null, { origin: 'claim' });
+    const mine = await f.addOwnerFact('rk', { ...fact('I decided'), kind: 'commitment' }, 'you');
+    const ids = await f.rekindScannedFacts(['decision', 'plan', 'commitment'], 'architecture');
+    expect(ids).toHaveLength(3);
+    expect(ids).not.toContain(claim.id);
+    expect(ids).not.toContain(mine.id);
+    const kinds = Object.fromEntries((await f.listFacts({ projectKey: 'rk' })).map((x) => [x.statement, x.kind]));
+    expect(kinds).toEqual({ 'scan decided': 'architecture', 'scan planned': 'architecture', 'a convention': 'convention', 'people decided': 'decision', 'I decided': 'commitment' });
+    expect(await f.rekindScannedFacts(['decision', 'plan', 'commitment'], 'architecture')).toEqual([]);
+  });
 });
+

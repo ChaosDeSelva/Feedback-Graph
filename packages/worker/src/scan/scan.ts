@@ -12,7 +12,7 @@ import { mapCap, rankCodePaths } from './rank.ts';
 import { withoutDataDirs, type DataDir } from './data.ts';
 import { gitChurn, hotScore, longCommentLines, scanOrder, type ScanSignals } from './priority.ts';
 import { inScope, lowValueBudget, lowValueRule, shardBudget, shardFactBudget, shardRepo, shardScope, type Shard } from './shard.ts';
-import { askJson, calibrateRelevance, nfcPaths, clampRelevance, FACT_KINDS, holdsCredential, SCAN_PROMPT_VERSION, SCANNER_VERSION, type AgentMirror, isSecretPath, modelTimeoutReason, ProviderUnavailableError, providerUnavailableReason, redactSecrets, type ActivityStore, type CodeFact, type FactScope, type FactsStore, type LlmProvider, type ScanJob, type ScanShards } from '@fb/core';
+import { askJson, calibrateRelevance, nfcPaths, clampRelevance, CODE_FACT_KINDS, codeFactKind, holdsCredential, SCAN_PROMPT_VERSION, SCANNER_VERSION, type AgentMirror, isSecretPath, modelTimeoutReason, ProviderUnavailableError, providerUnavailableReason, redactSecrets, type ActivityStore, type CodeFact, type FactScope, type FactsStore, type LlmProvider, type ScanJob, type ScanShards } from '@fb/core';
 
 const run = promisify(execFile);
 
@@ -398,7 +398,8 @@ export function repoReader(repoPath: string, maxBytes: number) {
 }
 
 export const FactSchema = z.object({
-  kind: z.enum(FACT_KINDS),
+  // Code kinds only: a model that still answers a claim kind (decision, plan, commitment) gets the nearest code kind.
+  kind: z.preprocess((k) => (typeof k === 'string' ? codeFactKind(k) ?? k : k), z.enum(CODE_FACT_KINDS)),
   statement: z.string().min(1),
   path: z.string(),
   lines: z.string().nullable(),
@@ -413,7 +414,7 @@ export const FACT_JSON = {
   type: 'object',
   required: ['kind', 'statement', 'path', 'lines', 'why', 'relevance'],
   properties: {
-    kind: { type: 'string', enum: [...FACT_KINDS] },
+    kind: { type: 'string', enum: [...CODE_FACT_KINDS] },
     statement: { type: 'string', description: 'One self-contained sentence a coding agent can act on' },
     path: { type: 'string', description: "Repo-relative file path, or '.' for the whole project" },
     lines: { type: ['string', 'null'], description: 'e.g. "12-30", or null' },

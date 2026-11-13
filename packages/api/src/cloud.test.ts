@@ -254,7 +254,7 @@ test('with knowledge intake on, the card shows claim sharing as in effect; the o
   const { d, log } = deps({
     localOnlyStore, intake: true,
     portability: { exportData: async (q) => ({ ...bundle(q?.projectKey ?? ''), facts: [claimFact('Retries wait 30 seconds', false), claimFact('Invoices go out at nine', true)] }) },
-    fetch: (async (url: string, init?: RequestInit) => { if (url.endsWith('/sync-policy')) return new Response(null, { status: 404 }); sent.push(JSON.parse(String(init?.body)).bundles?.[0] ?? JSON.parse(String(init?.body))); return Response.json(syncOk); }) as unknown as typeof fetch,
+    fetch: (async (url: string, init?: RequestInit) => { if (url.endsWith('/sync-policy')) return Response.json({ features: ['claimFactKinds'] }); sent.push(JSON.parse(String(init?.body)).bundles?.[0] ?? JSON.parse(String(init?.body))); return Response.json(syncOk); }) as unknown as typeof fetch,
   });
   const app = createApp(repo, { auth, cloud: d });
   const put = (body: object, headers: Record<string, string> = ownerHeaders) => app.request('/api/cloud/intake-sharing', { method: 'PUT', body: JSON.stringify(body), headers: { 'content-type': 'application/json', ...headers } });

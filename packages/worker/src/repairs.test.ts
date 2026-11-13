@@ -1,6 +1,6 @@
 import type { ActivityInput, ExternalRef, InboxText } from '@fb/core';
 import { expect, test } from 'vitest';
-import { DUPLICATE_DECIDER, duplicateItems, INVALID_SUMMARIES_CURSOR, rejectDuplicateItems, retitleThreadTasks, retryInvalidSummaries, THREAD_TASKS_CURSOR, type RepairDeps } from './repairs.ts';
+import { DUPLICATE_DECIDER, duplicateItems, INVALID_SUMMARIES_CURSOR, rejectDuplicateItems, rekindScanFacts, retitleThreadTasks, SCAN_FACT_KINDS_CURSOR, retryInvalidSummaries, THREAD_TASKS_CURSOR, type RepairDeps } from './repairs.ts';
 
 function deps(over: Partial<RepairDeps['knowledge']> = {}, items: InboxText[] = []) {
   const cursors = new Map<string, string>();
@@ -92,4 +92,16 @@ test('session summaries that failed on the answer\'s shape are tried again at on
   expect(f.cursors.get(INVALID_SUMMARIES_CURSOR)).toBe('v1');
   expect(await retryInvalidSummaries(f.d)).toBeNull();
   expect(prefixes).toHaveLength(1);
+});
+
+test('scanned facts stored with a claim kind become architecture once, logged; without a facts store nothing runs', async () => {
+  const f = deps();
+  const asked: { from: readonly string[]; to: string }[] = [];
+  f.d.facts = { rekindScannedFacts: async (from, to) => { asked.push({ from, to }); return asked.length === 1 ? ['fact:1', 'fact:2'] : []; } };
+  expect(await rekindScanFacts(f.d)).toEqual({ rekinded: 2 });
+  expect(asked).toEqual([{ from: ['decision', 'plan', 'commitment'], to: 'architecture' }]);
+  expect(f.activity[0]).toMatchObject({ actor: 'repair', targets: ['fact:1', 'fact:2'], details: { repair: SCAN_FACT_KINDS_CURSOR, version: 1 } });
+  expect(await rekindScanFacts(f.d)).toBeNull();
+  expect(asked).toHaveLength(1);
+  expect(await rekindScanFacts(deps().d)).toBeNull();
 });

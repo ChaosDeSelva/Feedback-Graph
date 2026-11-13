@@ -62,39 +62,44 @@ describeStores('intake export, cloud sync and forgetting', (h) => {
     const plain = await syncBundle(h.store.portability, 'shop');
     expect(statements(plain)).toEqual(['Retries use exponential backoff']);
 
-    const claims = await syncBundle(h.store.portability, 'shop', undefined, { claims: true });
+    const claims = await syncBundle(h.store.portability, 'shop', undefined, { claims: true, claimFactKinds: true });
     expect(statements(claims)).toEqual(['Retries use exponential backoff', 'We ship on 12 December']);
+    // A cloud without the claim kinds: the claim's decision stays home, counted, and the rest still goes.
+    const skipped: number[] = [];
+    const older = await syncBundle(h.store.portability, 'shop', undefined, { claims: true, onSkippedFacts: (n) => skipped.push(n) });
+    expect(statements(older)).toEqual(['Retries use exponential backoff']);
+    expect(skipped).toEqual([1]);
     const shipped = claims!.facts.find((f) => f.statement === 'We ship on 12 December')!;
     expect(shipped.why).toBe('a participant, 2026-11-10 notes');
     // Filed under its source: the doc id names the file ("Bo Quinn 1-1.md"), so it goes as a hash.
     expect(shipped.path).toMatch(/^source:[0-9a-f]{16}$/);
     for (const leak of ['Bo Quinn', 'Ana Lima', notes.docId, TRANSCRIPT, 'Who owns']) expect(JSON.stringify(claims)).not.toContain(leak);
 
-    const people = await syncBundle(h.store.portability, 'shop', undefined, { claims: true, people: true });
+    const people = await syncBundle(h.store.portability, 'shop', undefined, { claims: true, claimFactKinds: true, people: true });
     expect(people!.facts.find((f) => f.statement === 'We ship on 12 December')!.why).toBe('Bo Quinn, 2026-11-10 notes');
     expect(JSON.stringify(people)).not.toContain('Ana Lima');
   });
 
   test('sync: a claim\'s fact superseded, or its source removed, goes out as withdrawn', async () => {
     const { notes } = await setup();
-    const first = (await syncBundle(h.store.portability, 'shop', undefined, { claims: true }))!;
+    const first = (await syncBundle(h.store.portability, 'shop', undefined, { claims: true, claimFactKinds: true }))!;
     const sent: SentRecord = { fingerprint: 'f', remote: null, lessons: [], misses: [], docs: first.docs.map((d) => d.id), files: [...new Set(first.facts.map((f) => f.path))] };
     const path = first.facts.find((f) => f.statement === 'We ship on 12 December')!.path;
 
     // Its source deleted (keep facts): with no source left to say it was not private, it stays home from now on.
     await h.store.docs.deleteDoc(notes.docId);
     await s.removeSource(notes.docId);
-    const gone = (await syncBundle(h.store.portability, 'shop', sent, { claims: true }))!;
+    const gone = (await syncBundle(h.store.portability, 'shop', sent, { claims: true, claimFactKinds: true }))!;
     expect(gone.facts.map((f) => f.statement)).not.toContain('We ship on 12 December');
     expect(gone.withdrawn).toEqual([{ kind: 'file', id: path, projectKey: 'shop' }]);
 
     // Superseded (closed by a resolution): no longer current, so taken back too.
     const other = await accepted('later.md', { private: false, speaker: 'Bo Quinn', files: ['src/ship.ts'], statement: 'We ship in January', quote: 'we ship in January' });
-    const again = (await syncBundle(h.store.portability, 'shop', undefined, { claims: true }))!;
+    const again = (await syncBundle(h.store.portability, 'shop', undefined, { claims: true, claimFactKinds: true }))!;
     expect(again.facts.map((f) => f.path)).toContain('src/ship.ts');
     const now = (await h.store.facts.fact(other.fact.id))!;
     await h.store.facts.writeFactSnapshots([{ id: now.id, expect: factFingerprint(now), fields: { relevance: null, relevanceBy: null, current: false } }]);
-    const after = (await syncBundle(h.store.portability, 'shop', { ...sent, files: [...new Set(again.facts.map((f) => f.path))] }, { claims: true }))!;
+    const after = (await syncBundle(h.store.portability, 'shop', { ...sent, files: [...new Set(again.facts.map((f) => f.path))] }, { claims: true, claimFactKinds: true }))!;
     expect(after.withdrawn).toContainEqual({ kind: 'file', id: 'src/ship.ts', projectKey: 'shop' });
   });
 
@@ -107,7 +112,7 @@ describeStores('intake export, cloud sync and forgetting', (h) => {
     await s.decideClaim(claim.id, { factId: fact.id }, { by: 'you' });
     const b = await h.store.portability.exportData({ projectKey: 'shop' });
     expect(b.facts.find((f) => f.statement === 'Ana owns the vendor contract')?.claim).toEqual({ private: true, speaker: 'Robin Vale' });
-    expect((await syncBundle(h.store.portability, 'shop', undefined, { claims: true }))!.facts.map((f) => f.statement)).not.toContain('Ana owns the vendor contract');
+    expect((await syncBundle(h.store.portability, 'shop', undefined, { claims: true, claimFactKinds: true }))!.facts.map((f) => f.statement)).not.toContain('Ana owns the vendor contract');
   });
 
   test('forgetting a person takes their name out of the facts their claims became and the Activity about them', async () => {

@@ -171,6 +171,14 @@ export class FactsRepo implements FactsStore {
     );
   }
 
+  async rekindScannedFacts(from: readonly string[], to: FactKind): Promise<string[]> {
+    const r = await this.g.run(
+      `MATCH (x:Fact) WHERE x.kind IN $from AND ${scanned('x')} SET x.kind = $to RETURN x.id AS id ORDER BY id`,
+      { from: [...from], to },
+    );
+    return r.map((rec) => rec.get('id') as string);
+  }
+
   async markFilesRemoved(projectKey: string, paths: string[]) {
     if (!paths.length) return;
     await this.g.run(

@@ -611,6 +611,7 @@ export async function runWorker(io: WorkerIo): Promise<void> {
             projects: async () => syncProjects({ configured: cloud.projects, selected: ws.scope.projects, excluded: [...config.excludeProjects, ...await cloudLocalOnlyProjects(store.docs, config.cloud?.localOnlyProjects)] }),
             trigger: 'schedule',
             memory,
+            log,
           }),
       })
     : null;
@@ -639,7 +640,7 @@ export async function runWorker(io: WorkerIo): Promise<void> {
     sortOldMisses: () => sortOldMisses({ knowledge, cursors: docs, activity, log }),
     migrateDeciders: () => migrateDeciderRule({ knowledge, cursors: docs, activity, log }),
     backfillProposedAs: () => backfillProposedAs({ knowledge, activity, cursors: docs, log }),
-    repairs: () => runRepairs({ knowledge, graph: repo, activity, cursors: docs, sessions: store.sessions, log }),
+    repairs: () => runRepairs({ knowledge, graph: repo, activity, cursors: docs, sessions: store.sessions, facts, log }),
     requeueGivenUp: () => requeueGivenUpOnClassifierChange({ classifierId: classifier?.id, version: VERSION, queue: repo, cursors: docs, activity, log }),
     evidence,
     reconcileDecisions: () => reconcileInFlight(store, { embed }),

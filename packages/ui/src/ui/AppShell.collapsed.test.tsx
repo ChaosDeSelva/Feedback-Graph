@@ -76,3 +76,19 @@ test('Tab in the phone menu wraps past controls the breakpoint hides', async () 
     delete (HTMLElement.prototype as { checkVisibility?: unknown }).checkVisibility;
   }
 });
+
+test('a long status note stays inside the sidebar, expanded or collapsed, with the whole of it in the tooltip', () => {
+  const note = `Cloud sync failed: ${'x'.repeat(300)}`;
+  const long = { ok: false, label: 'no projects selected', version: '0.9.3', title: note };
+  for (const collapsed of ['0', '1']) {
+    localStorage.setItem('fg:sidebar-collapsed', collapsed);
+    render(<AppShell groups={groups} current="inbox" onNavigate={() => {}} health={long} connections={() => <span>dots</span>}><p>page</p></AppShell>);
+    const badge = screen.getByText('no projects selected').closest('[title]')!;
+    expect(badge.getAttribute('title')).toBe(`no projects selected: ${note}`);
+    expect(badge.className).toMatch(/\bw-full\b.*\bmin-w-0\b.*\boverflow-hidden\b/);
+    expect(screen.getByText('no projects selected').className).toMatch(/\bline-clamp-2\b.*\[overflow-wrap:anywhere\]/);
+    // The footer's one column is no wider than the sidebar, so neither status can widen it.
+    expect(badge.parentElement!.className).toContain('grid-cols-[minmax(0,1fr)]');
+    cleanup();
+  }
+});

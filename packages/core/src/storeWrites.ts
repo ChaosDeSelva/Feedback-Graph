@@ -94,6 +94,7 @@ export const STORE_WRITE_POLICY = {
     olderScannerFiles: 'read',
     saveFileFacts: 'write',
     markFilesRemoved: 'write',
+    rekindScannedFacts: 'write',
     replaceProjectFacts: 'write',
     replaceScopeFacts: 'write',
     factsToRecheck: 'read',

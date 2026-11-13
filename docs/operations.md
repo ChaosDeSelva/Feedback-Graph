@@ -386,6 +386,10 @@ push project knowledge to a Feedback Graph Cloud org.
   the way out. No transcripts, no source, no excerpts, no vectors.
   Facts from accepted intake claims go only with `SYNC_CLAIMS=true`, and never their quotes or a private source's
   ([Knowledge intake](#knowledge-intake)).
+  A fact goes only under a kind the cloud takes: unless the cloud's `/api/v1/sync-policy` lists `claimFactKinds` in
+  `features`, a scanned fact of kind `decision`, `plan` or `commitment` goes as `architecture`, and a claim's fact of
+  those kinds (or a fact of an unknown kind) stays home. The rest of the project is still sent; the count left out is
+  `skippedFacts` on the project's result and in the run's Activity line.
 - **Which lessons.** Nothing is shared until it is approved, by you or by the learning loop (`approve_lesson`). A lesson
   or fact the loop changed on its own is sent as it was before until you **Keep** that decision or
   `LOOP_SYNC_HOLD_DAYS` (7) pass without a rollback; after that the loop's change is sent like yours. By default a

@@ -127,7 +127,8 @@ export function AppShell<K extends string>({ groups, current, onNavigate, health
             ))}
           </ScrollArea>
 
-          <div className="grid shrink-0 gap-1 border-t border-line p-2">
+          {/* One column no wider than the sidebar: a long status truncates or wraps inside it instead of widening it. */}
+          <div className="grid shrink-0 grid-cols-[minmax(0,1fr)] gap-1 border-t border-line p-2">
             {connections?.(collapsed)}
             {health && <HealthBadge health={health} collapsed={collapsed} />}
             {onSignOut && <button type="button" onClick={onSignOut} title="Sign out" className={`flex h-8 items-center rounded-sm px-2 text-xs text-muted hover:bg-hover hover:text-text ${collapsed ? 'md:justify-center md:px-0' : ''}`}><span className={hide}>Sign out</span><span className={collapsed ? 'hidden md:inline' : 'hidden'} aria-hidden="true">↪</span></button>}
@@ -168,7 +169,9 @@ export function AppShell<K extends string>({ groups, current, onNavigate, health
  * so a long label truncates instead of crowding it.
  */
 function HealthBadge({ health, collapsed }: { health: Health; collapsed: boolean }) {
-  const cls = `flex min-h-8 min-w-0 items-center gap-2 rounded-sm border px-2 py-1 text-xs ${health.ok ? 'border-line bg-surface text-muted' : 'border-bad/40 bg-bad-soft text-bad-text'} ${health.href ? 'hover:bg-hover' : ''} ${collapsed ? 'md:justify-center md:px-0' : ''}`;
+  // The whole status on hover, the label too: the badge shows at most two lines of it, and none when collapsed.
+  const title = health.title.startsWith(health.label) ? health.title : `${health.label}: ${health.title}`;
+  const cls = `flex min-h-8 w-full min-w-0 items-center overflow-hidden gap-2 rounded-sm border px-2 py-1 text-xs ${health.ok ? 'border-line bg-surface text-muted' : 'border-bad/40 bg-bad-soft text-bad-text'} ${health.href ? 'hover:bg-hover' : ''} ${collapsed ? 'md:justify-center md:px-0' : ''}`;
   const body = (
     <>
       <span aria-hidden="true" className={`size-2 shrink-0 rounded-full ${!health.ok ? 'bg-bad' : health.off ? 'bg-faint' : 'bg-ok shadow-[0_0_0_3px_var(--color-ok-soft)]'}`} />
@@ -176,5 +179,5 @@ function HealthBadge({ health, collapsed }: { health: Health; collapsed: boolean
       <span className={`line-clamp-2 min-w-0 flex-1 font-medium leading-snug [overflow-wrap:anywhere] ${collapsed ? 'md:sr-only' : ''}`}>{health.label}</span>
     </>
   );
-  return health.href ? <a href={health.href} title={health.title} className={cls}>{body}</a> : <div title={health.title} className={cls}>{body}</div>;
+  return health.href ? <a href={health.href} title={title} className={cls}>{body}</a> : <div title={title} className={cls}>{body}</div>;
 }

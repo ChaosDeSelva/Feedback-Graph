@@ -458,6 +458,11 @@ export interface FactsStore {
    */
   saveFileFacts(projectKey: string, rawFile: ScannedFile & { summary: string }, rawFacts: EmbeddedFact[], source: string, scanJobId?: string | null, run?: RunTag | null): Promise<void>;
   markFilesRemoved(projectKey: string, paths: string[]): Promise<void>;
+  /**
+   * One-off repair: every scanned fact (any but yours, the loop's or a claim's, current or not) of a kind in `from`
+   * gets kind `to`. Returns the ids changed.
+   */
+  rekindScannedFacts(from: readonly string[], to: FactKind): Promise<string[]>;
   /** All or nothing: a failure part way leaves the old facts current and the old hashes in place. */
   replaceProjectFacts(projectKey: string, rawFacts: EmbeddedFact[], source: string, files: ScannedFile[], scanJobId?: string | null): Promise<void>;
   /**

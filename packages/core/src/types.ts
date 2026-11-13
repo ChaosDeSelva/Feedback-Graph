@@ -452,7 +452,8 @@ export type PostMortemInput = {
 
 // ── Code scanning ──────────────────────────────────────────────────────
 
-export const FACT_KINDS = [
+/** What code scans and documents yield, and all a cloud before the claim kinds accepts (CLAIM_FACT_KINDS_FEATURE). */
+export const CODE_FACT_KINDS = [
   'architecture',
   'convention',
   'api',
@@ -463,12 +464,22 @@ export const FACT_KINDS = [
   'command',
   'data_model',
   'security',
-  // What people decided, planned or committed to (0.9.0: an accepted claim of that type, origin 'claim').
-  'decision',
-  'plan',
-  'commitment',
 ] as const;
+export type CodeFactKind = (typeof CODE_FACT_KINDS)[number];
+
+/** What people decided, planned or committed to (0.9.0: an accepted claim of that type, origin 'claim'). */
+export const CLAIM_FACT_KINDS = ['decision', 'plan', 'commitment'] as const;
+
+export const FACT_KINDS = [...CODE_FACT_KINDS, ...CLAIM_FACT_KINDS] as const;
 export type FactKind = (typeof FACT_KINDS)[number];
+
+const CODE_KIND_SET: ReadonlySet<string> = new Set(CODE_FACT_KINDS);
+
+/** The code kind nearest a kind: itself when it is one, `architecture` for the claim kinds; null for anything else. */
+export function codeFactKind(kind: string): CodeFactKind | null {
+  if (CODE_KIND_SET.has(kind)) return kind as CodeFactKind;
+  return (CLAIM_FACT_KINDS as readonly string[]).includes(kind) ? 'architecture' : null;
+}
 
 /**
  * `why`: the extractor's reason a coding agent needs this fact. `relevance` (0..1): how often an agent doing everyday

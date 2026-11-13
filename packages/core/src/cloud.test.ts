@@ -1086,3 +1086,53 @@ test('claim sharing: Settings over .env, people never named without claims, malf
   expect(await cloudIntakeSharing(at('{"claims":false,"people":true}'))).toEqual({ claims: false, people: false, saved: true });
   await expect(cloudIntakeSharing(at('{"claims":"yes"}'))).rejects.toThrow(/invalid claim sharing setting/);
 });
+
+const kindFact = (statement: string, kind: string, claim?: { private: boolean; speaker: string | null }) =>
+  ({ path: 'src/checkout.ts', lines: null, kind, statement, why: 'w', confidence: 1, source: 'scan', createdAt: '2026-11-02T08:00:00Z', projectKey: 'shop', ...(claim ? { claim } : {}) });
+const kindMix = () => bundle('shop', { facts: [
+  kindFact('scan decided', 'decision'), kindFact('scan planned', 'plan'), kindFact('a convention', 'convention'), kindFact('garbled', 'vibes'),
+  kindFact('people decided', 'decision', { private: false, speaker: null }), kindFact('people said', 'convention', { private: false, speaker: null }),
+] });
+
+test('a cloud without the claim kinds gets a scanned fact\'s nearest code kind; a claim\'s decision and an unknown kind stay home, counted', async () => {
+  const skipped: number[] = [];
+  const b = await syncBundle(store({ shop: kindMix() }), 'shop', undefined, { claims: true, onSkippedFacts: (n) => skipped.push(n) });
+  expect(b!.facts.map((f) => [f.statement, f.kind])).toEqual([['scan decided', 'architecture'], ['scan planned', 'architecture'], ['a convention', 'convention'], ['people said', 'convention']]);
+  expect(skipped).toEqual([2]);
+});
+
+test('a cloud that lists the claim kinds gets every known kind as stored', async () => {
+  const skipped: number[] = [];
+  const b = await syncBundle(store({ shop: kindMix() }), 'shop', undefined, { claims: true, claimFactKinds: true, onSkippedFacts: (n) => skipped.push(n) });
+  expect(b!.facts.map((f) => f.kind)).toEqual(['decision', 'plan', 'convention', 'decision', 'convention']);
+  expect(skipped).toEqual([1]);
+});
+
+test('sync sends the rest of a project with a fact the cloud cannot take, reports the count, and hears the claim kinds from the sync policy', async () => {
+  const sentKinds = (calls: Call[]) => calls.map((c) => (JSON.parse(String(c.init.body)) as ExportBundle).facts.map((f) => f.kind));
+  const log = vi.fn();
+  const activity: ActivityInput[] = [];
+  const { f, calls } = fakeFetch([]);
+  const old = await runCloudSync({ cloud: { ...cloud, claims: true }, portability: store({ shop: kindMix() }), projects: async () => ['shop'], trigger: 'manual', fetch: f, sleep: noSleep, log, activity: { record: async (a) => { activity.push(a); } } });
+  expect(old.projects[0]).toMatchObject({ status: 'sent', skippedFacts: 2 });
+  expect(old.ok).toBe(true);
+  expect(sentKinds(calls)).toEqual([['architecture', 'architecture', 'convention', 'convention']]);
+  expect(log).toHaveBeenCalledWith(expect.stringContaining('left out facts'), { project: 'shop', skippedFacts: 2 });
+  expect(activity[0].subject).toContain('left out 2 facts of a kind cloud.example.com does not take');
+
+  const { f: g, calls: newCalls } = fakeFetch([]);
+  const fetcher: typeof fetch = async (url, init) => String(url).endsWith('/sync-policy') ? Response.json({ features: ['claimFactKinds'] }) : g(url, init);
+  const now = await runCloudSync({ cloud: { ...cloud, claims: true }, portability: store({ shop: kindMix() }), projects: async () => ['shop'], trigger: 'manual', fetch: fetcher, sleep: noSleep, log: vi.fn() });
+  expect(now.projects[0]).toMatchObject({ status: 'sent', skippedFacts: 1 });
+  expect(sentKinds(newCalls)).toEqual([['decision', 'plan', 'convention', 'decision', 'convention']]);
+});
+
+test('a cloud that lists the claim kinds and still refuses one gets the project again with the kinds mapped', async () => {
+  const refusal = Response.json({ error: "facts.0.kind: Invalid enum value. received 'decision'" }, { status: 422 });
+  const { f, calls } = fakeFetch([refusal]);
+  const fetcher: typeof fetch = async (url, init) => String(url).endsWith('/sync-policy') ? Response.json({ features: ['claimFactKinds'] }) : f(url, init);
+  const r = await runCloudSync({ cloud: { ...cloud, claims: true }, portability: store({ shop: kindMix() }), projects: async () => ['shop'], trigger: 'schedule', fetch: fetcher, sleep: noSleep, log: vi.fn() });
+  expect(r.projects[0]).toMatchObject({ status: 'sent', skippedFacts: 2 });
+  expect(calls).toHaveLength(2);
+  expect((JSON.parse(String(calls[1].init.body)) as ExportBundle).facts.map((x) => x.kind)).toEqual(['architecture', 'architecture', 'convention', 'convention']);
+});

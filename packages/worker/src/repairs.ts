@@ -1,4 +1,4 @@
-import { INVALID_SUMMARY, threadTaskTitle, type ActivityStore, type DocsStore, type GraphStore, type InboxText, type KnowledgeStore, type SessionsStore } from '@fb/core';
+import { CLAIM_FACT_KINDS, INVALID_SUMMARY, threadTaskTitle, type ActivityStore, type DocsStore, type FactsStore, type GraphStore, type InboxText, type KnowledgeStore, type SessionsStore } from '@fb/core';
 import { turnHash } from './ingest/fingerprint.ts';
 import { COMPACTION_SUMMARY } from './ingest/parseTranscript.ts';
 
@@ -12,6 +12,7 @@ export type RepairDeps = {
   activity: Pick<ActivityStore, 'record'>;
   cursors: Pick<DocsStore, 'getCursor' | 'setCursor'>;
   sessions?: Pick<SessionsStore, 'retryFailedSummaries'>;
+  facts?: Pick<FactsStore, 'rekindScannedFacts'>;
   log?: (msg: string, extra?: object) => void;
 };
 
@@ -177,9 +178,36 @@ export async function retryInvalidSummaries(d: RepairDeps): Promise<{ retried: n
   });
 }
 
+export const SCAN_FACT_KINDS_CURSOR = 'repair-scan-fact-kinds';
+
+/**
+ * 0.9.0 to 0.9.2 offered scans and the docs reader the claim kinds (decision, plan, commitment) too, so scans stored
+ * facts of a kind a cloud before those kinds refuses (a 422 for the whole project). Those facts become `architecture`;
+ * a claim's facts keep their kinds.
+ */
+export async function rekindScanFacts(d: RepairDeps): Promise<{ rekinded: number } | null> {
+  const facts = d.facts;
+  if (!facts) return null;
+  return once(d, SCAN_FACT_KINDS_CURSOR, 1, async () => {
+    const ids = await facts.rekindScannedFacts(CLAIM_FACT_KINDS, 'architecture');
+    if (ids.length) {
+      await d.activity.record({
+        kind: 'facts_extracted', actor: 'repair', projectKey: null,
+        subject: `${ids.length} scanned fact${ids.length === 1 ? '' : 's'} of a decision, plan or commitment kind now architecture`,
+        why: 'scans from 0.9.0 to 0.9.2 could use the kinds meant for what people said, which the cloud refuses for code facts',
+        details: { repair: SCAN_FACT_KINDS_CURSOR, version: 1, facts: ids.slice(0, MAX_TARGETS) },
+        targets: ids.slice(0, MAX_TARGETS),
+      });
+      d.log?.('scanned facts of a claim kind re-kinded as architecture', { rekinded: ids.length });
+    }
+    return { rekinded: ids.length };
+  });
+}
+
 export async function runRepairs(d: RepairDeps): Promise<void> {
   const failed = (what: string) => (err: unknown) => d.log?.(`${what} failed`, { error: String(err) });
   await retryInvalidSummaries(d).catch(failed('retrying failed session summaries'));
   await retitleThreadTasks(d).catch(failed('retitling PR and issue tasks'));
+  await rekindScanFacts(d).catch(failed('re-kinding scanned facts'));
   await rejectDuplicateItems(d).catch(failed('rejecting duplicate Inbox items'));
 }

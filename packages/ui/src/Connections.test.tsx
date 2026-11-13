@@ -50,3 +50,19 @@ test('a connection in a state this release does not know shows the state as stor
   expect(github.textContent).toContain('paused');
   expect(github.querySelector('[aria-hidden="true"]')!.className).toContain('bg-faint');
 });
+
+test('a cloud sync problem stays inside the sidebar: the label truncates with the whole of it as the tooltip, and collapsed the six dots go two to a row', () => {
+  const long = 'the cloud rejected the bundle (422): ' + 'facts.39.kind: Invalid enum value; '.repeat(12).trim();
+  const broken = { ...all, github: c('connected', 'env', 'ok'), linear: c('connected', 'app', 'ok'), cloud: c('error', 'env', long) };
+  const { rerender } = render(<ConnectionsBadge connections={broken} />);
+  const badge = screen.getByRole('button', { name: 'Connections: Cloud sync has a problem' });
+  expect(badge.getAttribute('title')).toBe('Cloud sync has a problem');
+  expect(badge.className).toMatch(/\bmin-w-0\b.*\boverflow-hidden\b/);
+  expect(within(badge).getByText('Cloud sync has a problem').className).toMatch(/\btruncate\b/);
+  fireEvent.click(badge);
+  expect(within(screen.getByRole('dialog', { name: 'Connections' })).getByText(long).className).toContain('[overflow-wrap:anywhere]');
+  rerender(<ConnectionsBadge connections={broken} collapsed />);
+  const dots = badge.querySelector('[aria-hidden="true"]')!;
+  expect(dots.children).toHaveLength(6);
+  expect(dots.className).toContain('md:grid-cols-2');
+});

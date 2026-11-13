@@ -50,9 +50,10 @@ export function ConnectionsBadge({ connections, collapsed = false }: { connectio
         aria-label={`Connections: ${label}`}
         title={label}
         onClick={() => setOpen(!open)}
-        className={`flex h-8 w-full items-center gap-2 rounded-sm border px-2 text-xs ${errors.length ? 'border-bad/40 bg-bad-soft text-bad-text' : 'border-line bg-surface text-muted'} hover:bg-hover ${collapsed ? 'md:justify-center md:px-0' : ''}`}
+        className={`flex h-8 w-full min-w-0 items-center gap-2 overflow-hidden rounded-sm border px-2 text-xs ${errors.length ? 'border-bad/40 bg-bad-soft text-bad-text' : 'border-line bg-surface text-muted'} hover:bg-hover ${collapsed ? 'md:justify-center md:px-0' : ''}`}
       >
-        <span aria-hidden="true" className={`flex shrink-0 gap-0.5 ${collapsed ? 'md:flex-col' : ''}`}>
+        {/* Collapsed, the dots go two to a row, so all six fit the button's height. */}
+        <span aria-hidden="true" className={`flex shrink-0 gap-0.5 ${collapsed ? 'md:grid md:grid-cols-2' : ''}`}>
           {names.map((n) => <span key={n} className={`size-1.5 rounded-full ${labelOf(DOT, connections[n].state, () => DOT.not_connected)}`} />)}
         </span>
         <span className={`min-w-0 flex-1 truncate text-left font-medium ${collapsed ? 'md:sr-only' : ''}`}>{label}</span>

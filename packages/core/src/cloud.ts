@@ -4,6 +4,7 @@ import { EXPORT_FORMAT, type ExportBundle } from './graph/portability.ts';
 import { shapedTriggers } from './lessonTriggers.ts';
 import { redactDeep, redactSecrets } from './redact.ts';
 import type { ActivityStore, DocsStore, PortabilityStore } from './store.ts';
+import { codeFactKind, CODE_FACT_KINDS, FACT_KINDS } from './types.ts';
 
 /*
  * Feedback Graph Cloud sync: push your project knowledge to a team org. Off unless CLOUD_URL and CLOUD_TOKEN are set
@@ -179,6 +180,8 @@ export type ProjectSyncResult = {
   trimmed?: { codeFiles: { sent: number; of: number } };
   /** waiting: when the schedule tries this project again. */
   until?: string;
+  /** Facts left out: a kind this cloud does not take (a claim's decision, plan or commitment before CLAIM_FACT_KINDS_FEATURE). */
+  skippedFacts?: number;
   error?: string;
 };
 
@@ -229,7 +232,29 @@ export const bundleCounts = (b: ExportBundle): SyncCounts => ({
  * Which lessons a bundle carries: `suggestions` is SYNC_SUGGESTIONS. `claims` (SYNC_CLAIMS): facts accepted claims
  * became go too, never one from a private source; `people` (SYNC_PEOPLE): with the speaker's name, else "a participant".
  */
-export type SyncOptions = { suggestions?: boolean; claims?: boolean; people?: boolean; shareDemoCreated?: boolean; onLocalOnly?: (reason: string) => void };
+export type SyncOptions = {
+  suggestions?: boolean; claims?: boolean; people?: boolean; shareDemoCreated?: boolean; onLocalOnly?: (reason: string) => void;
+  /** The cloud takes the claim kinds (its sync policy lists CLAIM_FACT_KINDS_FEATURE): every kind goes as stored. */
+  claimFactKinds?: boolean;
+  /** How many facts were left out for a kind the cloud does not take; heard only when some were and a bundle is returned. */
+  onSkippedFacts?: (n: number) => void;
+};
+
+/** What a cloud lists in its sync policy's `features` when it takes the claim fact kinds (decision, plan, commitment). */
+export const CLAIM_FACT_KINDS_FEATURE = 'claimFactKinds';
+
+const ALL_KINDS: ReadonlySet<string> = new Set(FACT_KINDS);
+const CODE_KINDS: ReadonlySet<string> = new Set(CODE_FACT_KINDS);
+
+/**
+ * A fact's kind as this cloud may take it, or null to leave the fact out. A cloud without the claim kinds gets a
+ * scanned fact's nearest code kind (codeFactKind); a claim's fact keeps its kind or stays home, never relabelled as code.
+ */
+function cloudKind(f: ExportBundle['facts'][number], claimKinds: boolean): string | null {
+  if (claimKinds && ALL_KINDS.has(f.kind)) return f.kind;
+  if (f.claim) return CODE_KINDS.has(f.kind) ? f.kind : null;
+  return codeFactKind(f.kind);
+}
 
 /**
  * A claim's fact as it may leave: its `why` ("Ana, 2026-11-10 call") names the speaker only with SYNC_PEOPLE, and a
@@ -253,6 +278,7 @@ export async function syncBundle(p: Pick<PortabilityStore, 'exportData'>, projec
   const received = new Set(previous?.lessons ?? []);
   const shared = (l: { id: string; status: string }) => l.status === 'approved' || received.has(l.id) || !!o.suggestions;
   if (!b.projects.length && !b.lessons.length && !b.misses.length && !b.facts.length && !b.docs.length && !b.codeFiles.length) return null;
+  let skipped = 0;
   const out: SyncBundle = {
     format: b.format,
     schemaVersion: b.schemaVersion,
@@ -278,10 +304,17 @@ export async function syncBundle(p: Pick<PortabilityStore, 'exportData'>, projec
     })),
     // What people said stays home unless SYNC_CLAIMS, and a private source's (a transcript's, by default) always does.
     // A claim's fact superseded or closed is no longer current, so it drops out here and `withdrawn` takes it back.
-    facts: b.facts.filter((f) => !f.claim || (o.claims && !f.claim.private)).map((f) => ({
-      path: f.path, lines: f.lines, kind: f.kind, statement: f.statement, why: f.why, confidence: f.confidence, source: f.source, createdAt: f.createdAt, projectKey: f.projectKey,
-      ...(f.claim && claimFactOut(f, !!o.people)),
-    })),
+    facts: b.facts.filter((f) => !f.claim || (o.claims && !f.claim.private)).flatMap((f) => {
+      const kind = cloudKind(f, !!o.claimFactKinds);
+      if (!kind) {
+        skipped++;
+        return [];
+      }
+      return [{
+        path: f.path, lines: f.lines, kind: kind as typeof f.kind, statement: f.statement, why: f.why, confidence: f.confidence, source: f.source, createdAt: f.createdAt, projectKey: f.projectKey,
+        ...(f.claim && claimFactOut(f, !!o.people)),
+      }];
+    }),
     docs: b.docs.map((d) => ({ id: d.id, projectKey: d.projectKey, source: d.source, ref: d.ref, title: d.title, url: d.url })),
     codeFiles: b.codeFiles.map((c) => ({
       projectKey: c.projectKey, path: c.path, lang: c.lang, loc: c.loc, isTest: c.isTest, churn: c.churn, misses: c.misses, dependents: c.dependents, score: c.score,
@@ -301,6 +334,7 @@ export async function syncBundle(p: Pick<PortabilityStore, 'exportData'>, projec
   // handled by runCloudSync's tombstone path, including clearing a previously exported code map.
   if (!out.lessons.length && !out.misses.length && !out.facts.length && !out.docs.length && !out.codeFiles.length) return null;
   out.withdrawn = previous ? withdrawnSince(previous, out, projectKey) : [];
+  if (skipped) o.onSkippedFacts?.(skipped);
   // Stored text was redacted on the way in; this catches anything stored before a pattern existed.
   return redactDeep(out);
 }
@@ -628,7 +662,10 @@ export async function runCloudSync(d: {
    */
   waiting?: (key: string) => string | null;
   onProgress?: (p: SyncProgress) => void;
+  /** Where a project's left-out facts are logged (console.warn when absent). */
+  log?: (msg: string, extra?: object) => void;
 }): Promise<CloudSyncResult> {
+  const log = d.log ?? ((msg: string, extra?: object) => console.warn(msg, extra ?? ''));
   const localOnly = new Set(d.cloud.localOnlyProjects ?? []);
   const keys = [...new Set(await d.projects())].filter(key => !localOnly.has(key));
   d.onProgress?.({ done: 0, total: keys.length, current: keys[0] ?? null });
@@ -636,6 +673,7 @@ export async function runCloudSync(d: {
   let policyRevision: string | undefined;
   let policyTeamLessons: SyncResponse['teamLessons'];
   let policyFailure: CloudSyncError | null = null;
+  let claimFactKinds = false;
   if (!cloudUrlProblem(d.cloud.url)) {
     try {
       const response = await (d.fetch ?? fetch)(`${d.cloud.url.replace(/\/+$/, '')}/api/v1/sync-policy`, {
@@ -643,7 +681,8 @@ export async function runCloudSync(d: {
       });
       if (response.status === 401 || response.status === 403) policyFailure = new CloudSyncError(explain(response.status, null, 0), response.status);
       if (response.ok) {
-        const policy = await response.json() as { revision?: unknown; teamLessons?: SyncResponse['teamLessons'] };
+        const policy = await response.json() as { revision?: unknown; teamLessons?: SyncResponse['teamLessons']; features?: unknown };
+        claimFactKinds = Array.isArray(policy.features) && policy.features.includes(CLAIM_FACT_KINDS_FEATURE);
         const team = policy.teamLessons;
         if (team && typeof team.adminApprovalRequired === 'boolean' && typeof team.blocked === 'boolean' && typeof team.message === 'string'
           && Number.isFinite(team.approved) && Number.isFinite(team.suggested)) policyTeamLessons = { ...team, message: redactSecrets(team.message).slice(0, 1000) };
@@ -668,34 +707,57 @@ export async function runCloudSync(d: {
       continue;
     }
     const previous = await d.memory?.get(key);
-    const stored = await syncBundle(d.portability, key, previous, { suggestions: d.cloud.suggestions, claims: d.cloud.claims, people: d.cloud.people, shareDemoCreated: d.cloud.shareDemoProjects?.includes(key) });
+    let skippedFacts = 0;
+    const build = (kinds: boolean) => {
+      skippedFacts = 0;
+      return syncBundle(d.portability, key, previous, {
+        suggestions: d.cloud.suggestions, claims: d.cloud.claims, people: d.cloud.people, shareDemoCreated: d.cloud.shareDemoProjects?.includes(key),
+        claimFactKinds: kinds, onSkippedFacts: (n) => { skippedFacts = n; },
+      });
+    };
+    let stored = await build(claimFactKinds);
     if (!stored && !previous) {
       results.push({ key, status: 'empty', counts: null });
       continue;
     }
-    const bundle = stored ?? tombstone(key, previous!);
-    const counts = bundleCounts(bundle);
-    const print = fingerprint(bundle);
+    let bundle = stored ?? tombstone(key, previous!);
+    let counts = bundleCounts(bundle);
+    let print = fingerprint(bundle);
+    const skipped = () => (skippedFacts ? { skippedFacts } : {});
     const sameContent = previous?.fingerprint === print || !!previous && previous.fingerprintVersion !== 2 &&
       [...new Set(['0.6.9', previous.toolVersion].filter((v): v is string => !!v))].some(version => previous.fingerprint === fingerprint(bundle, version));
     if (!d.force && sameContent && (!policyRevision || previous?.policyRevision === policyRevision) && !bundle.withdrawn.length) {
       if (previous && (previous.fingerprint !== print || policyTeamLessons)) await d.memory?.set(key, { ...previous, fingerprint: print, fingerprintVersion: 2, toolVersion: bundle.toolVersion, ...(policyTeamLessons ? { teamLessons: policyTeamLessons } : {}) });
       const teamLessons = policyTeamLessons ?? previous?.teamLessons;
-      results.push({ key, status: 'unchanged', counts, ...(teamLessons ? { teamLessons } : {}) });
+      results.push({ key, status: 'unchanged', counts, ...(teamLessons ? { teamLessons } : {}), ...skipped() });
       continue;
     }
     try {
-      const { r, trimmed } = await pushFitting(bundle, (b) => pushBundle({ cloud: d.cloud, bundle: b, fetch: d.fetch, sleep: d.sleep, baseDelayMs: d.baseDelayMs }));
+      const push = (b: SyncBundle) => pushFitting(b, (x) => pushBundle({ cloud: d.cloud, bundle: x, fetch: d.fetch, sleep: d.sleep, baseDelayMs: d.baseDelayMs }));
+      let sentNow: Awaited<ReturnType<typeof push>>;
+      try {
+        sentNow = await push(bundle);
+      } catch (err) {
+        // A cloud that listed the claim kinds and still refuses a fact's kind: send it again with the kinds mapped.
+        if (!(stored && claimFactKinds && err instanceof CloudSyncError && err.status === 422 && /facts\.\d+\.kind/.test(err.message))) throw err;
+        stored = (await build(false))!;
+        bundle = stored;
+        counts = bundleCounts(bundle);
+        print = fingerprint(bundle);
+        sentNow = await push(bundle);
+      }
+      const { r, trimmed } = sentNow;
+      if (skippedFacts) log('cloud sync left out facts of a kind the cloud does not take', { project: key, skippedFacts });
       // The whole bundle's fingerprint even when its code map was cut: an unchanged project is not cut and resent each run.
       if (stored) await d.memory?.set(key, { ...record(key, bundle, print), ...(r.teamLessons ? { teamLessons: r.teamLessons } : {}), ...(policyRevision ? { policyRevision } : {}) });
       else await d.memory?.delete(key);
       const went = trimmed ? { ...counts, codeFiles: trimmed.codeFiles.sent } : counts;
       for (const k of Object.keys(sent) as (keyof SyncCounts)[]) sent[k] += went[k];
       const filed = r.projects?.find((p) => p.localKey === key) ?? r.projects?.[0];
-      results.push({ key, status: 'sent', counts: went, cloudKey: filed?.key, namespace: filed?.namespace, lessons: r.lessons, ...(r.teamLessons ? { teamLessons: r.teamLessons } : {}), syncId: r.syncId, withdrawn: bundle.withdrawn.length, ...(trimmed ? { trimmed } : {}) });
+      results.push({ key, status: 'sent', counts: went, cloudKey: filed?.key, namespace: filed?.namespace, lessons: r.lessons, ...(r.teamLessons ? { teamLessons: r.teamLessons } : {}), syncId: r.syncId, withdrawn: bundle.withdrawn.length, ...(trimmed ? { trimmed } : {}), ...skipped() });
     } catch (err) {
       const e = err instanceof CloudSyncError ? err : new CloudSyncError(String(err), 0);
-      results.push({ key, status: 'failed', counts, error: e.message });
+      results.push({ key, status: 'failed', counts, error: e.message, ...skipped() });
       error ??= `${key}: ${e.message}`;
       if (e.fatal) stopped = true;
     }
@@ -737,7 +799,9 @@ export async function runCloudSync(d: {
     const what = `${plural(sent.lessons, 'lesson')}, ${plural(sent.misses, 'miss', 'misses')}, ${plural(sent.facts, 'fact')}, ${plural(sent.docs, 'doc')}`;
     const attempted = sentKeys.length + failedKeys.length + withdrawnKeys.length;
     const cut = results.filter((r) => r.trimmed).map((r) => `; ${r.key}'s code map cut to ${r.trimmed!.codeFiles.sent} of ${r.trimmed!.codeFiles.of} files (too large for the cloud)`).join('');
-    const took = `${withdrawnKeys.length ? `; took ${list(withdrawnKeys)} back out (no longer synced)` : ''}${cut}`;
+    const left = results.reduce((n, r) => n + (r.status === 'sent' ? r.skippedFacts ?? 0 : 0), 0);
+    const skippedNote = left ? `; left out ${plural(left, 'fact')} of a kind ${host} does not take` : '';
+    const took = `${withdrawnKeys.length ? `; took ${list(withdrawnKeys)} back out (no longer synced)` : ''}${cut}${skippedNote}`;
     const subject = !sentKeys.length && !failedKeys.length && !withdrawnKeys.length
       ? `nothing to send to ${host}: ${plural(unchanged, 'project')} unchanged since the last sync`
       : !failedKeys.length
@@ -761,7 +825,7 @@ export async function runCloudSync(d: {
         failed: failedKeys,
         withdrawnProjects: withdrawnKeys,
         sent,
-        results: results.map(({ key, status, counts, cloudKey, namespace, lessons, syncId, withdrawn, trimmed, until, error: e }) => ({ key, status, counts, cloudKey, namespace, lessons, syncId, withdrawn, trimmed, until, error: e })),
+        results: results.map(({ key, status, counts, cloudKey, namespace, lessons, syncId, withdrawn, trimmed, until, skippedFacts, error: e }) => ({ key, status, counts, cloudKey, namespace, lessons, syncId, withdrawn, trimmed, until, skippedFacts, error: e })),
         error,
       },
       targets: [],

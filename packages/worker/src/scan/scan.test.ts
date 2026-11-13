@@ -223,6 +223,18 @@ test('the extraction prompt asks for relevance to everyday coding, with setup of
   expect(JSON.stringify(seen[0].schema)).not.toContain('confidence');
 });
 
+test('a scan offers only the code kinds and reads a claim kind the model still answers as architecture', async () => {
+  const seen: object[] = [];
+  const m: LlmProvider = { id: 'ollama:gemma4', agentic: false, json: async (t) => { seen.push(t.schema); return { summary: 'S', facts: [
+    { kind: 'decision', statement: 'x', path: 'a', lines: null, why: 'w', relevance: 0.5 },
+    { kind: 'commitment', statement: 'y', path: 'a', lines: null, why: 'w', relevance: 0.5 },
+  ] }; } };
+  const r = await extractFileFacts(m, 'a', 'code');
+  expect(r.facts.map((f) => f.kind)).toEqual(['architecture', 'architecture']);
+  const schema = JSON.stringify(seen[0]);
+  for (const k of ['decision', 'plan', 'commitment']) expect(schema).not.toContain(`"${k}"`);
+});
+
 test('a fact the model gave no confidence is kept', async () => {
   const r = await extractFileFacts(llm({ summary: 'S', facts: [{ kind: 'api', statement: 'x', path: 'a', lines: null, why: 'w', relevance: 0.5 }] }), 'a', 'code');
   expect(r.facts.map((f) => f.statement)).toEqual(['x']);

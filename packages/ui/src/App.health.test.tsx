@@ -41,7 +41,7 @@ test('Ollama without its model, or not answering with no reason, is named in the
   expect(await titleOf(/Ollama model missing/)).toMatch(/not pulled; search, get_task_context and check_before_done need it/);
   cleanup();
   withStatus({ ollama: { ok: false, url: 'http://ollama:11434', reason: null } });
-  expect(await titleOf(/Ollama unreachable/)).toMatch(/^Ollama at http:\/\/ollama:11434 is not answering;/);
+  expect(await titleOf(/Ollama unreachable/)).toMatch(/^Ollama unreachable: Ollama at http:\/\/ollama:11434 is not answering;/);
 });
 
 test('an unreachable graph is the label; the worker line carries its last error', async () => {

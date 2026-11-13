@@ -86,6 +86,11 @@ export class PgFactsStore implements FactsStore {
     });
   }
 
+  async rekindScannedFacts(from: readonly string[], to: FactKind): Promise<string[]> {
+    const { rows } = await this.db.pool.query(`UPDATE facts SET kind = $2 WHERE kind = ANY($1::text[]) AND ${scanned()} RETURNING id`, [[...from], to]);
+    return rows.map((r: { id: string }) => r.id).sort();
+  }
+
   async markFilesRemoved(projectKey: string, paths: string[]): Promise<void> {
     if (!paths.length) return;
     const now = new Date();
