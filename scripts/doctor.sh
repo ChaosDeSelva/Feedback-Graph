@@ -170,7 +170,15 @@ if [ -n "$(envval CODEX_RUNNER_URL)" ]; then
   runner_reasons=""
   runner_flag="state/runner-control/codex-runner-disabled"
   # Read only as a plain file, and only so much of it: a container can write state/.
-  if flag_reasons="$(state_read "$runner_flag" 4096 | tr -cd '[:print:]\n')"; then
+  # No job set to codex-cli: nothing waits for the runner, so it being off or stopped is no problem.
+  scan_model="$(envval SCAN_LLM)"; local_model="$(envval OLLAMA_MODEL)"
+  runner_unused="Codex runner: not used (scans use ${scan_model:-ollama:${local_model:-gemma4}})"
+  if ! codex_job_configured && flag_reasons="$(state_read "$runner_flag" 4096 | tr -cd '[:print:]\n')"; then
+    skip "$runner_unused; its isolation-safety flag keeps it off"
+    while IFS= read -r reason; do [ -z "$reason" ] || more "Reason: $reason"; done <<<"$flag_reasons"
+  elif ! codex_job_configured && [ "$docker_ok" = 1 ] && ! is_running codex-runner; then
+    skip "$runner_unused"
+  elif flag_reasons="$(state_read "$runner_flag" 4096 | tr -cd '[:print:]\n')"; then
     warn "Codex runner: disabled by its persisted isolation-safety flag"
     while IFS= read -r reason; do [ -z "$reason" ] || more "Reason: $reason"; done <<<"$flag_reasons"
     # setup.sh --runner-procfs-compat clears only the procfs reason; any other is cleared by hand once the probe passes.

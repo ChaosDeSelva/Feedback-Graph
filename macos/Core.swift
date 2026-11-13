@@ -7,7 +7,9 @@ import Foundation
 /// The few .env settings the app needs. Only these keys are read: a token or password line is never kept, whatever
 /// its name, because no secret key is in the list.
 struct InstallSettings: Equatable {
-    static let keys: Set<String> = ["FG_INSTANCE", "API_PORT", "OLLAMA_URL", "OLLAMA_PORT", "OLLAMA_MODEL", "OLLAMA_EMBED_MODEL"]
+    /// The model settings of the worker's jobs, as CODEX_JOB_SETTINGS in scripts/lib/env.sh: provider specs, not secrets.
+    static let jobModelKeys = ["CLASSIFY_LLM", "POSTMORTEM_LLM", "SCAN_LLM", "DOCS_LLM", "CHAT_LLM", "SUMMARY_LLM", "LOOP_LLM", "INTAKE_LLM", "CONFLICT_LLM"]
+    static let keys: Set<String> = Set(["FG_INSTANCE", "API_PORT", "OLLAMA_URL", "OLLAMA_PORT", "OLLAMA_MODEL", "OLLAMA_EMBED_MODEL"] + jobModelKeys)
 
     var values: [String: String] = [:]
 
@@ -37,6 +39,10 @@ struct InstallSettings: Equatable {
     var dashboardURL: URL { URL(string: "http://localhost:\(apiPort)/")! }
     var chatModel: String { value("OLLAMA_MODEL") ?? "gemma4" }
     var embedModel: String { value("OLLAMA_EMBED_MODEL") ?? "nomic-embed-text" }
+    /// Whether a job is set to codex-cli, the only thing the Codex runner runs.
+    var codexUsed: Bool { Self.jobModelKeys.contains { k in value(k).map { $0 == "codex-cli" || $0.hasPrefix("codex-cli:") } ?? false } }
+    /// The scan model: SCAN_LLM, else the local Ollama model (as the worker picks it).
+    var scanModel: String { value("SCAN_LLM") ?? "ollama:\(chatModel)" }
     /// The containers' Ollama as seen from this Mac, as ollama_host_url in scripts/lib/ollama.sh.
     var ollamaURL: String {
         let url = value("OLLAMA_URL") ?? ""
@@ -101,7 +107,7 @@ struct StackReport: Equatable {
 /// Everything one poll learned, reduced to running / starting / stopped / problem.
 /// - foreignDir: set when containers under this install's name were started from another folder.
 func classifyStack(engineRunning: Bool, engineName: String, rows allRows: [ContainerRow], installDir: String,
-                   apiReady: Bool, ollamaProblem: String?, actionInFlight: String?) -> StackReport {
+                   apiReady: Bool, ollamaProblem: String?, actionInFlight: String?, settings: InstallSettings = InstallSettings()) -> StackReport {
     guard engineRunning else {
         return StackReport(status: .problem, headline: "\(engineName) is not running: start it, then Feedback Graph")
     }
@@ -122,7 +128,10 @@ func classifyStack(engineRunning: Bool, engineName: String, rows allRows: [Conta
         return StackReport(status: .starting, headline: "Starting…")
     }
     if let ollamaProblem { return StackReport(status: .problem, headline: "Running, but \(ollamaProblem)") }
-    if rows.contains(where: \.runnerOff) { return StackReport(status: .running, headline: "Running · Codex runner off: scans paused") }
+    // No job set to codex-cli: nothing waits for the runner, so it is named neutrally rather than as paused work.
+    if rows.contains(where: \.runnerOff) {
+        return StackReport(status: .running, headline: settings.codexUsed ? "Running · Codex runner off: scans paused" : "Running · Codex runner: not used (scans use \(settings.scanModel))")
+    }
     return StackReport(status: .running, headline: "Running")
 }
 

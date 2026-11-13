@@ -271,6 +271,16 @@ test('All connections lists each connection the server reports, with its state a
   expect(rows[1]).toMatch(/error.*Ollama does not answer\. Runs on your machine; OLLAMA_URL in \.env\./);
 });
 
+test('All connections shows a Codex runner no job uses as not used, without the how-to that would read as a fault', async () => {
+  answering((url) => (url === '/api/status' ? Response.json({ connections: {
+    codex: { state: 'not_connected', source: null, unused: true, detail: 'Codex runner: not used (scans use claude-cli).', href: '' },
+  } }) : null));
+  render(<Integrations />);
+  const all = await card('All connections');
+  const row = all.querySelector('div.flex')!.textContent!;
+  expect(row).toBe('Codex runnernot usedCodex runner: not used (scans use claude-cli). ');
+});
+
 test('settings that cannot be loaded say why, and Try again loads them', async () => {
   answering((url) => (url === '/api/settings/integrations' && !calls.some((c) => c.url === url) ? (calls.push({ url, method: 'GET' }), Response.json({ error: 'the store is starting' }, { status: 503 })) : null));
   render(<Integrations />);

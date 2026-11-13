@@ -67,8 +67,8 @@ do {
 
     let healthy = [row("api", "running", "Up 2 minutes (healthy)"), row("worker", "running", "Up 2 minutes (healthy)"),
                    row("neo4j", "running", "Up 3 minutes (healthy)"), row("archive-key-init", "exited", "Exited (0) 3 minutes ago")]
-    func classify(_ rows: [ContainerRow], engine: Bool = true, api: Bool = true, ollama: String? = nil, action: String? = nil, install: String = "/tmp/fg") -> StackReport {
-        classifyStack(engineRunning: engine, engineName: "OrbStack", rows: rows, installDir: install, apiReady: api, ollamaProblem: ollama, actionInFlight: action)
+    func classify(_ rows: [ContainerRow], engine: Bool = true, api: Bool = true, ollama: String? = nil, action: String? = nil, install: String = "/tmp/fg", env: String = "SCAN_LLM=codex-cli") -> StackReport {
+        classifyStack(engineRunning: engine, engineName: "OrbStack", rows: rows, installDir: install, apiReady: api, ollamaProblem: ollama, actionInFlight: action, settings: InstallSettings.parse(env))
     }
     eq(classify(healthy).status, .running, "healthy services and a finished init container are running (/tmp is /private/tmp)")
     eq(classify(healthy, engine: false).status, .problem, "no engine is a problem")
@@ -84,6 +84,12 @@ do {
     let runnerOff = classify(healthy + [row("codex-runner", "exited", "Exited (78) 48 minutes ago")])
     eq(runnerOff.status, .running, "a codex runner its safety flag turned off is not a problem")
     expect(runnerOff.headline.contains("Codex runner off"), "says the codex runner is off")
+    // No job set to codex-cli: the runner is named as not used, with the scan model, not as paused scans.
+    let unused = classify(healthy + [row("codex-runner", "exited", "Exited (78) 48 minutes ago")], env: "SCAN_LLM=claude-cli\nCHAT_LLM=codex\n")
+    eq(unused.status, .running, "an unused codex runner is not a problem")
+    eq(unused.headline, "Running · Codex runner: not used (scans use claude-cli)", "names the runner as not used, with the scan model")
+    expect(InstallSettings.parse("CHAT_LLM=codex-cli:gpt-5").codexUsed, "a codex-cli job uses the runner")
+    eq(InstallSettings.parse("").scanModel, "ollama:gemma4", "scans default to the local model")
     eq(classify(healthy + [row("codex-runner", "exited", "Exited (1) 1 minute ago")]).status, .problem, "a codex runner that crashed is a problem")
     eq(classify(healthy + [row("codex-runner", "exited", "Exited (78) 1 minute ago")], api: false).status, .starting, "starting wins over the runner note")
     // As the 0.8.0 doctor fails them: "worker: stopped" and "worker: paused, so it does nothing".

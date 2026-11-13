@@ -355,12 +355,15 @@ export function Chat() {
                 <li key={c.id} className="relative">
                   <input type="checkbox" aria-label={`tick ${c.title || 'New chat'}`} checked={picked.has(c.id)} onChange={() => togglePick(c.id)} className="absolute top-3 right-3 z-10" />
                   <ListRow selected={c.id === selected} onClick={() => select(c.id)}>
-                    <div className="truncate text-[13px] font-medium">{c.title || 'New chat'}</div>
-                    <div className="flex items-center gap-1.5 truncate text-xs text-muted">
-                      <span className="truncate">{c.projectKey}</span>
-                      <span aria-hidden="true">·</span>
-                      <Time iso={c.updatedAt} />
-                      {c.pending && <Badge tone="info" dot>answering</Badge>}
+                    {/* pr-6 keeps the text clear of the tick box over the row's right edge: a long title ends in an ellipsis before it. */}
+                    <div data-testid="chat-row-text" className="min-w-0 pr-6">
+                      <div className="truncate text-[13px] font-medium" title={c.title || 'New chat'}>{c.title || 'New chat'}</div>
+                      <div className="flex items-center gap-1.5 truncate text-xs text-muted">
+                        <span className="truncate">{c.projectKey}</span>
+                        <span aria-hidden="true">·</span>
+                        <Time iso={c.updatedAt} />
+                        {c.pending && <Badge tone="info" dot>answering</Badge>}
+                      </div>
                     </div>
                   </ListRow>
                 </li>

@@ -132,7 +132,7 @@ test('doctor writes the runner flag in place of a link, never through it, and ne
 
 test('fg status never prints a file a linked runner flag names', async () => {
   const w = world();
-  writeFileSync(join(w.repo, '.env'), 'API_PORT=8787\n');
+  writeFileSync(join(w.repo, '.env'), 'API_PORT=8787\nSCAN_LLM=codex-cli\n');
   const secret = w.hostFile('secret', 'SECRET-CANARY-7f3a\n');
   w.plant('state/runner-control/codex-runner-disabled', secret);
   w.stub('node', 'exit 1');
@@ -141,7 +141,7 @@ test('fg status never prints a file a linked runner flag names', async () => {
   expect(r.out).not.toContain('codex runner disabled');
   // A plain flag is still said.
   const plain = world();
-  writeFileSync(join(plain.repo, '.env'), 'API_PORT=8787\n');
+  writeFileSync(join(plain.repo, '.env'), 'API_PORT=8787\nSCAN_LLM=codex-cli\n');
   mkdirSync(join(plain.repo, 'state', 'runner-control'), { recursive: true });
   writeFileSync(join(plain.repo, 'state', 'runner-control', 'codex-runner-disabled'), 'network: reached the api\n');
   plain.stub('node', 'exit 1');

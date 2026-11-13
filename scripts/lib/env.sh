@@ -93,7 +93,7 @@ database_memory() {
 
 # The settings that pick a model for a worker job; codex-cli in any of them uses the Codex login. (CHECK_LLM, the api's
 # judge, takes no CLI.)
-CODEX_JOB_SETTINGS='CLASSIFY_LLM POSTMORTEM_LLM SCAN_LLM DOCS_LLM CHAT_LLM SUMMARY_LLM LOOP_LLM'
+CODEX_JOB_SETTINGS='CLASSIFY_LLM POSTMORTEM_LLM SCAN_LLM DOCS_LLM CHAT_LLM SUMMARY_LLM LOOP_LLM INTAKE_LLM CONFLICT_LLM'
 # Succeeds when one of those jobs is set to codex-cli.
 codex_job_configured() {
   local job

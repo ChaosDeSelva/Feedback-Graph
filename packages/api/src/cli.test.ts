@@ -86,6 +86,13 @@ test('the token is never sent over plain http to another machine; https, this ma
   expect(anon.calls[0].headers.authorization).toBeUndefined();
 });
 
+test('fg status shows a Codex runner no job uses as not used, not as a connection that is missing', async () => {
+  const f = fake({ 'GET /api/status': () => ({ json: { version: 'x', connections: { codex: { state: 'not_connected', source: null, unused: true, detail: 'Codex runner: not used (scans use claude-cli).', href: '' } } } }) });
+  expect(await run(['status'], f.io)).toBe(0);
+  expect(f.text()).toContain('codex     not used: Codex runner: not used (scans use claude-cli).');
+  expect(f.text()).not.toContain('not_connected');
+});
+
 test('text from the server cannot drive the terminal: control characters are stripped from output', async () => {
   const f = fake({ 'GET /api/status': () => ({ json: { version: 'x', worker: { lastError: 'boom\u001b[2J\u001b]0;pwned\u0007 end' } } }) });
   expect(await run(['status'], f.io)).toBe(0);
@@ -1114,7 +1121,7 @@ test('fg names the credential it sent: a run opened by the operator token says t
   expect(denied.err.join('\n').match(/check FG_OPERATOR_TOKEN/g)).toHaveLength(1);
 });
 
-test('scripts/fg before setup refuses every API command instead of asking port 8787; fg status shows every runner-disabled reason', async () => {
+test('scripts/fg before setup refuses every API command instead of asking port 8787; fg status shows every runner-disabled reason while a job uses the runner', async () => {
   const { execResult } = await import('@fb/core/testing/exec');
   const { chmodSync, copyFileSync, mkdirSync, mkdtempSync, writeFileSync } = await import('node:fs');
   const { tmpdir } = await import('node:os');
@@ -1138,6 +1145,11 @@ test('scripts/fg before setup refuses every API command instead of asking port 8
   writeFileSync(join(repo, '.env'), 'API_PORT=8797\n');
   mkdirSync(join(repo, 'state', 'runner-control'), { recursive: true });
   writeFileSync(join(repo, 'state', 'runner-control', 'codex-runner-disabled'), 'procfs: nested sandbox could not mount proc\nnetwork: runner reached a protected host or service endpoint\n');
+  // No job set to codex-cli: the runner is not used, so its flag is no warning.
+  const unused = await fg('status');
+  expect(unused.stderr).not.toContain('WARN codex runner');
+  expect(unused.stdout).toContain('cli ran:');
+  writeFileSync(join(repo, '.env'), 'API_PORT=8797\nSCAN_LLM=codex-cli:gpt-5\n');
   const status = await fg('status');
   expect(status.stderr).toContain('WARN codex runner disabled: procfs: nested sandbox could not mount proc; network: runner reached a protected host or service endpoint');
   expect(status.stdout).toContain('cli ran:');

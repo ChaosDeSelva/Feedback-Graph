@@ -66,3 +66,16 @@ test('a cloud sync problem stays inside the sidebar: the label truncates with th
   expect(dots.children).toHaveLength(6);
   expect(dots.className).toContain('md:grid-cols-2');
 });
+
+test('a Codex runner no job uses is listed as not used, naming the scan model, and is not counted as missing', () => {
+  const unused: Connection = { state: 'not_connected', source: null, unused: true, detail: 'Codex runner: not used (scans use claude-cli).', href: '#settings/connections' };
+  const ok = { ...all, github: c('connected', 'env', 'ok'), linear: c('connected', 'app', 'ok'), cloud: c('connected', 'env', 'ok'), codex: unused };
+  render(<ConnectionsBadge connections={ok} />);
+  const badge = screen.getByRole('button', { name: 'Connections: 5 of 5 connected' });
+  expect(badge.className).not.toContain('bg-bad-soft');
+  fireEvent.click(badge);
+  const runner = within(screen.getByRole('dialog', { name: 'Connections' })).getByRole('link', { name: /Codex runner/ });
+  expect(runner.textContent).toContain('not used');
+  expect(runner.textContent).toContain('Codex runner: not used (scans use claude-cli).');
+  expect(runner.textContent).not.toMatch(/not connected/);
+});

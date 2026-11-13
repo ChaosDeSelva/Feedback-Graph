@@ -292,7 +292,7 @@ test('the conversation list re-sorts when a chat gets a new message: the one you
   location.hash = '#ask/c3';
   render(<Chat />);
   await screen.findByText('older question', { selector: 'p, div' });
-  const titles = () => rows().map((b) => b.querySelector('div')?.textContent);
+  const titles = () => rows().map((b) => b.querySelector('[title]')?.textContent);
   expect(titles()).toEqual(['Newest chat', 'Older chat']);
   fireEvent.change(screen.getByRole('textbox', { name: 'question' }), { target: { value: 'and the footer?' } });
   fireEvent.click(screen.getByRole('button', { name: 'Send' }));
@@ -720,4 +720,17 @@ test('deleting a conversation says so on its button while the request is in flig
   expect(deleting.getAttribute('aria-disabled')).toBe('true');
   release();
   await waitFor(() => expect(location.hash).toBe('#ask'));
+});
+
+test('a long conversation title stops in an ellipsis before the tick box, and its whole text is the tooltip', async () => {
+  const long = 'Which recently approved lessons apply when deploying the worker behind a proxy that rewrites hosts?';
+  convs = [conv('c1', { title: long })];
+  render(<Chat />);
+  const title = await screen.findByText(long);
+  expect(title.getAttribute('title')).toBe(long);
+  expect(title.className).toMatch(/\btruncate\b/);
+  // The row's text leaves room on the right for the tick box laid over the row's right edge.
+  const text = title.closest('[data-testid="chat-row-text"]')!;
+  expect(text.className).toMatch(/\bmin-w-0\b.*\bpr-6\b/);
+  expect(screen.getByRole('checkbox', { name: `tick ${long}` }).className).toMatch(/\babsolute\b.*\bright-3\b/);
 });

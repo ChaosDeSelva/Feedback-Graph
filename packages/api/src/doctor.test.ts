@@ -312,8 +312,19 @@ test('a tokenless install is reported as read-only for owner actions, with the c
   expect(out).toMatch(/any container on this Docker host \(OrbStack and Docker Desktop route them through the gateway\) can read the API/);
 });
 
+test('a Codex runner no job uses is not a problem: its safety flag or a stopped runner is one neutral line naming the scan model', async () => {
+  const env = 'API_PORT=8787\nCODEX_RUNNER_URL=http://codex-runner:8790\nSCAN_LLM=claude-cli\n';
+  const flagged = await doctor({ env, runnerFlag: 'sandbox: nested sandbox startup failed\n' });
+  expect(flagged.out).toContain('SKIP  Codex runner: not used (scans use claude-cli); its isolation-safety flag keeps it off');
+  expect(flagged.out).toContain('Reason: sandbox: nested sandbox startup failed');
+  expect(flagged.out).not.toMatch(/(WARN|FAIL) +Codex runner/);
+  const stopped = await doctor({ env, running: ['neo4j', 'worker', 'api'] });
+  expect(stopped.out).toContain('SKIP  Codex runner: not used (scans use claude-cli)');
+  expect(stopped.out).not.toMatch(/(WARN|FAIL) +Codex runner/);
+});
+
 test('a persisted network flag lists every reason and never points at --runner-procfs-compat as the way to clear it', async () => {
-  const env = 'API_PORT=8787\nCODEX_RUNNER_URL=http://codex-runner:8790\n';
+  const env = 'API_PORT=8787\nCODEX_RUNNER_URL=http://codex-runner:8790\nSCAN_LLM=codex-cli\n';
   const both = await doctor({ env, runnerFlag: 'procfs: nested sandbox could not mount proc\nnetwork: runner reached a protected host or service endpoint\n' });
   expect(both.out).toContain('Reason: procfs: nested sandbox could not mount proc');
   expect(both.out).toContain('Reason: network: runner reached a protected host or service endpoint');

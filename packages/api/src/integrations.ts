@@ -3,7 +3,7 @@ import { z } from 'zod';
 import {
   DEFAULT_LINK, ENV_VAR, FEEDBACK_SKIP_RULES, githubRepoOfRemote, githubViewer, integrationErrorKind, linearViewer, listLinearTeams, redactSecrets, tokenFingerprint,
   type ActivityStore, type CloudConfig, type Connection, type ConnectionName, type IntegrationCheck, type IntegrationKind, type Integrations,
-  type IntegrationSyncState, type LinearTeam, type ManualSync, type ModelHealth, type ModelJob, RUNNER_OFF_FIX, runnerOffLine, type OllamaHealth, type PrBacklog, type WorkerStatus,
+  type IntegrationSyncState, type LinearTeam, type ManualSync, type ModelHealth, type ModelJob, RUNNER_OFF_FIX, runnerNotUsedLine, runnerOffLine, type OllamaHealth, type PrBacklog, type WorkerStatus,
 } from '@fb/core';
 
 /**
@@ -326,10 +326,9 @@ function agentConnection(name: 'claude' | 'codex', w: WorkerStatus | null, model
   if (!w) return { state: 'not_connected', source: null, detail: 'The worker has not reported yet.', href };
   const match = (p: string | null | undefined) => !!p && (name === 'claude' ? p.startsWith('claude-cli') || p.startsWith('anthropic:') : p.startsWith('codex-cli'));
   const jobs = Object.entries(w.providers).filter(([, p]) => match(p)).map(([job]) => job);
-  if (!jobs.length) {
-    const how = name === 'claude' ? 'set CLAUDE_CODE_OAUTH_TOKEN (./scripts/setup.sh) or ANTHROPIC_API_KEY, or POSTMORTEM_LLM=claude-cli' : 'set POSTMORTEM_LLM or SCAN_LLM to codex-cli';
-    return { state: 'not_connected', source: null, detail: `No job uses ${label}: ${how}.`, href };
-  }
+  // The Codex runner with no job set to codex-cli: not used, so neither connected nor a problem, whatever its state.
+  if (!jobs.length && name === 'codex') return { state: 'not_connected', source: null, unused: true, detail: `${runnerNotUsedLine(w.providers.scan ?? null)}.`, href };
+  if (!jobs.length) return { state: 'not_connected', source: null, detail: `No job uses ${label}: set CLAUDE_CODE_OAUTH_TOKEN (./scripts/setup.sh) or ANTHROPIC_API_KEY, or POSTMORTEM_LLM=claude-cli.`, href };
   // /api/status applies live Ollama and codex-runner readiness on top of the worker's last report. Use that effective
   // state here too: a configured provider is not "connected" while its runner/sandbox is unavailable.
   const health = jobs.map((j) => [j, models?.[j as ModelJob] ?? w.health?.[j as keyof NonNullable<WorkerStatus['health']>]] as const);

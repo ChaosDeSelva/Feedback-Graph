@@ -432,7 +432,7 @@ function statusLines(s: Record<string, any>, p: Pipeline | null): string[] {
     lines.push(`model     ${job.padEnd(10)} ${m.off ? 'off' : `${m.provider ?? 'none'} ${m.ok ? 'ok' : down}`}`);
   }
   if (s.givenUpTurns) lines.push(`given up  ${s.givenUpTurns} turns (re-queue them in the UI)`);
-  for (const [name, c] of Object.entries((s.connections ?? {}) as Record<string, any>)) lines.push(`${name.padEnd(9)} ${c.state}: ${c.detail}`);
+  for (const [name, c] of Object.entries((s.connections ?? {}) as Record<string, any>)) lines.push(`${name.padEnd(9)} ${c.unused ? 'not used' : c.state}: ${c.detail}`);
   const sync = s.cloud?.syncing;
   if (sync) lines.push(`syncing   ${sync.done} of ${sync.total} projects${sync.current ? ` (${sync.current})` : ''} since ${at(sync.startedAt)}`);
   const m = s.cloud?.lastManual;

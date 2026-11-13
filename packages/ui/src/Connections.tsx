@@ -7,7 +7,7 @@ const DOT: Record<Connection['state'], string> = { connected: 'bg-ok', error: 'b
 const STATE: Record<Connection['state'], string> = { connected: 'connected', error: 'error', not_connected: 'not connected' };
 
 /**
- * The sidebar's connections indicator: one dot per connection (GitHub, Linear, Claude, Codex, Ollama, cloud sync).
+ * The sidebar's connections indicator: one dot per connection (GitHub, Linear, Claude, the Codex runner, Ollama, cloud sync).
  * Click it for the list: each one's state, the reason, and the Settings section that manages it.
  */
 export function ConnectionsBadge({ connections, collapsed = false }: { connections: Record<ConnectionName, Connection>; collapsed?: boolean }) {
@@ -17,7 +17,9 @@ export function ConnectionsBadge({ connections, collapsed = false }: { connectio
   const names = (Object.keys(CONNECTION_LABEL) as ConnectionName[]).filter((n) => connections[n]);
   const errors = names.filter((n) => connections[n].state === 'error');
   const connected = names.filter((n) => connections[n].state === 'connected');
-  const label = errors.length ? `${errors.map((n) => CONNECTION_LABEL[n]).join(', ')} ${errors.length === 1 ? 'has' : 'have'} a problem` : `${connected.length} of ${names.length} connected`;
+  // One nothing uses (the Codex runner with no job on codex-cli) is listed, but not counted as missing.
+  const used = names.filter((n) => !connections[n].unused);
+  const label = errors.length ? `${errors.map((n) => CONNECTION_LABEL[n]).join(', ')} ${errors.length === 1 ? 'has' : 'have'} a problem` : `${connected.length} of ${used.length} connected`;
 
   // Going to another page (a nav click, a link, back) closes it, rather than leaving it over the next page.
   useEffect(() => {
@@ -70,7 +72,7 @@ export function ConnectionsBadge({ connections, collapsed = false }: { connectio
                       <span aria-hidden="true" className={`size-2 rounded-full ${labelOf(DOT, c.state, () => DOT.not_connected)}`} />
                       <span className="font-medium">{CONNECTION_LABEL[n]}</span>
                       <span className={`ml-auto text-[11px] ${c.state === 'error' ? 'text-bad-text' : 'text-muted'}`}>
-                        {labelOf(STATE, c.state, asIs)}{c.source === 'env' ? ' · .env' : c.source === 'app' ? ' · app' : ''}
+                        {c.unused ? 'not used' : labelOf(STATE, c.state, asIs)}{c.source === 'env' ? ' · .env' : c.source === 'app' ? ' · app' : ''}
                       </span>
                     </span>
                     <span className="text-[11.5px] leading-snug text-muted [overflow-wrap:anywhere]">{c.detail}</span>

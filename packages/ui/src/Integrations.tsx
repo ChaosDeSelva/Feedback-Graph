@@ -11,7 +11,7 @@ import { ScrollArea } from './ui/ScrollArea.tsx';
 
 
 const NAME: Record<IntegrationKind, string> = { github: 'GitHub', linear: 'Linear' };
-export const CONNECTION_LABEL: Record<ConnectionName, string> = { github: 'GitHub', linear: 'Linear', claude: 'Claude', codex: 'Codex', ollama: 'Ollama', cloud: 'Cloud sync' };
+export const CONNECTION_LABEL: Record<ConnectionName, string> = { github: 'GitHub', linear: 'Linear', claude: 'Claude', codex: 'Codex runner', ollama: 'Ollama', cloud: 'Cloud sync' };
 const STATE_LABEL: Record<Connection['state'], string> = { connected: 'connected', not_connected: 'not connected', error: 'error' };
 export const stateTone = (s: Connection['state']): Tone => (s === 'connected' ? 'ok' : s === 'error' ? 'bad' : 'neutral');
 
@@ -387,9 +387,9 @@ function AllConnections() {
       {(Object.keys(CONNECTION_LABEL) as ConnectionName[]).filter((n) => conns[n]).map((n) => (
         <div key={n} className="flex flex-wrap items-start gap-x-3 gap-y-1 px-3 py-2">
           <span className="w-24 shrink-0 font-medium">{CONNECTION_LABEL[n]}</span>
-          <Badge tone={stateTone(conns[n].state)} dot>{labelOf(STATE_LABEL, conns[n].state, asIs)}</Badge>
+          <Badge tone={stateTone(conns[n].state)} dot>{conns[n].unused ? 'not used' : labelOf(STATE_LABEL, conns[n].state, asIs)}</Badge>
           <span className="min-w-0 flex-1 text-xs text-muted [overflow-wrap:anywhere]">
-            {conns[n].detail} {HOW[n]}
+            {conns[n].detail} {!conns[n].unused && HOW[n]}
           </span>
         </div>
       ))}

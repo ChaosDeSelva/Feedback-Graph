@@ -460,7 +460,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 }
             }
             s.report = classifyStack(engineRunning: s.engineRunning, engineName: s.engineName, rows: s.rows, installDir: dir ?? "",
-                                     apiReady: s.apiReady, ollamaProblem: s.ollamaProblem, actionInFlight: inFlight)
+                                     apiReady: s.apiReady, ollamaProblem: s.ollamaProblem, actionInFlight: inFlight, settings: s.settings)
             // The loop answers through fg (it holds the token); asked once a minute while running.
             var loopFetched = false
             if let dir, s.apiReady, !s.foreign {

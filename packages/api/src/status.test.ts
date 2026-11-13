@@ -196,6 +196,19 @@ test('a Codex runner its safety flag turned off is reported as off on purpose: i
   expect(down.connections.codex.state).toBe('error');
 });
 
+test('a Codex runner no job uses is reported as not used, naming the scan model, whether its safety flag is set or not', async () => {
+  const worker: WorkerStatus = { ...beat(10), providers: { classify: 'ollama:local', postmortem: 'claude-cli', scan: 'claude-cli', chat: 'claude-cli' } };
+  for (const runner of [
+    async () => reportedRunnerReadiness(JSON.stringify({ ok: false, disabled: true, reason: 'sandbox: nested sandbox startup failed', at: Date.now() })),
+    async () => ({ ok: false, reason: 'fetch failed' }),
+  ]) {
+    const app = createApp(repo, { system: { version: 'test', ping: async () => true, worker: async () => worker, runner } });
+    const status = await (await app.request('/api/status')).json();
+    expect(status.connections.codex).toEqual({ state: 'not_connected', source: null, unused: true, detail: 'Codex runner: not used (scans use claude-cli).', href: '#settings/connections' });
+    expect(Object.values(status.models).every((m) => (m as { ok: boolean }).ok)).toBe(true);
+  }
+});
+
 test('a code-map write in progress is reported as rebuilding, not interrupted; one its worker did not survive is interrupted', async () => {
   const startedAt = new Date(Date.now() - 600_000).toISOString();
   const writingAt = new Date(Date.now() - 60_000).toISOString();

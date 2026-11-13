@@ -977,6 +977,15 @@ export function runnerOffLine(jobs: readonly string[]): string {
   return `Codex runner off: ${jobs.map((j) => named[j] ?? j).join(', ')} paused`;
 }
 
+/** The jobs whose model is codex-cli, which the Codex runner runs. */
+export function codexJobs(providers: Partial<Record<string, string | null>>): ModelJob[] {
+  return MODEL_JOBS.filter((j) => /^codex-cli(:|$)/.test(providers[j] ?? ''));
+}
+/** The Codex runner while no job uses it: neutral, whatever its state, since nothing waits for it. */
+export function runnerNotUsedLine(scanModel: string | null): string {
+  return `Codex runner: not used (scans use ${scanModel ?? 'no model'})`;
+}
+
 /** Whether Ollama answers at `url` with the models it is asked for; `reason` says why not. */
 export type OllamaHealth = { url: string; ok: boolean; reason: string | null };
 
@@ -989,7 +998,11 @@ export type ConnectionState = 'connected' | 'not_connected' | 'error';
  * applicable), one plain sentence (the account, the last sync, or what is wrong and how to fix it) and the Settings
  * link that manages it. Never a token.
  */
-export type Connection = { state: ConnectionState; source: 'env' | 'app' | null; detail: string; href: string };
+export type Connection = {
+  state: ConnectionState; source: 'env' | 'app' | null; detail: string; href: string;
+  /** Nothing uses it (the Codex runner while no job is set to codex-cli): shown neutrally and left out of the counts. */
+  unused?: true;
+};
 
 export type SystemStatus = {
   version: string;

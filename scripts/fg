@@ -98,7 +98,12 @@ own_project=""
 if [ "${1:-}" = status ] && command -v docker >/dev/null 2>&1 && [ -n "$own_project" ]; then
   . "$here/scripts/lib/state-fs.sh"
   # Read only as a plain file, and only so much of it: a container can write state/.
-  if reasons="$(cd "$here" && state_read state/runner-control/codex-runner-disabled 4096 | tr -cd '[:print:]\n')"; then
+  # A runner no job uses (none of the model settings is codex-cli) is not a problem: the connections line says "not used".
+  codex_used=""
+  for job in CLASSIFY_LLM POSTMORTEM_LLM SCAN_LLM DOCS_LLM CHAT_LLM SUMMARY_LLM LOOP_LLM INTAKE_LLM CONFLICT_LLM; do
+    case "$(setting "$job")" in codex-cli | codex-cli:*) codex_used=1 ;; esac
+  done
+  if [ -n "$codex_used" ] && reasons="$(cd "$here" && state_read state/runner-control/codex-runner-disabled 4096 | tr -cd '[:print:]\n')"; then
     reasons="$(printf '%s\n' "$reasons" | grep -v '^$' | paste -sd ';' - | sed 's/;/; /g' || true)"
     echo "WARN codex runner disabled: ${reasons:-reason unavailable}" >&2
   fi
