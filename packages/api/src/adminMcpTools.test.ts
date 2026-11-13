@@ -117,7 +117,7 @@ test('inbox_list: a full store page says the total is at least that; rows carry 
   const items = Array.from({ length: 1000 }, (_, i) => ({ id: `c${i}`, projectKey: 'a', source: 'github', status: 'pending', ...(i === 0 && { external: { title: 7 } }) }));
   const { data } = await tool({ 'GET /api/candidates?limit=1000': { body: items } }, 'inbox_list', { limit: 1 });
   expect(data).toMatchObject({ total: 1000, totalIsAtLeast: true, more: 999, note: '999+ more: pass offset: 1 for the next page' });
-  expect(data!.items[0]).toEqual({ id: 'c0', projectKey: 'a', source: 'github', status: 'pending', label: null, confidence: null, summary: null, author: null, authorKind: null, title: null, url: null, createdAt: null, decidedBy: null });
+  expect(data!.items[0]).toEqual({ id: 'c0', projectKey: 'a', source: 'github', status: 'pending', label: null, confidence: null, summary: null, author: null, authorKind: null, title: null, url: null, createdAt: null, decidedBy: null, score: null, scoreWhy: null });
   expect((await tool({ 'GET /api/candidates?limit=1000': { status: 500, body: { error: 'down' } } }, 'inbox_list')).text).toBe('500: down');
 });
 

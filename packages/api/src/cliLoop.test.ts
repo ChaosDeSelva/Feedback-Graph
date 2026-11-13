@@ -132,7 +132,9 @@ describe('fg decisions', () => {
   test('list: newest first, filtered, --since as a span or an ISO time', async () => {
     const s = setup();
     expect(await s.fg('decisions', 'list')).toBe(0);
-    expect(s.out[0]).toMatch(/^ID +TYPE +STATUS +MODE +PROJECT +TARGET +P +CREATED +RATIONALE$/m);
+    expect(s.out[0]).toMatch(/^ID +SCORE +TYPE +STATUS +MODE +PROJECT +TARGET +P +CREATED +RATIONALE$/m);
+    // Only the proposed one has an approve score; the applied ones leave the column blank.
+    expect(s.text()).toMatch(/^dec:p +\d\.\d +approve_lesson +proposed/m);
     expect(s.text().split('\n').slice(1).map((l) => l.split(/\s+/)[0])).toEqual(['dec:p', 'dec:later', 'dec:a', 'dec:old']);
     expect(s.text()).toMatch(/^dec:later +rank_weight +applied +auto +global +0\.93/m);
     s.out.length = 0;

@@ -7,6 +7,7 @@ import { sessionHref } from './links.ts';
 import { Badge, Card, SectionLabel, StatusBadge, tableClass, tdClass, type Tone } from './ui/display.tsx';
 import { Markdown } from './ui/Markdown.tsx';
 import { ScrollArea } from './ui/ScrollArea.tsx';
+import { ScoreChip } from './ui/ScoreChip.tsx';
 
 const when = (ts: string) => new Date(ts).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
 
@@ -186,6 +187,7 @@ export function CandidateDetail({ detail }: { detail: Detail }) {
           {agentReportOnly(candidate)
             ? <span className="text-xs text-muted" title={AGENT_REPORT_TITLE}>agent report</span>
             : <span className="text-xs text-muted tabular-nums">{Math.round(candidate.classification.confidence * 100)}% confident</span>}
+          <ScoreChip score={candidate.score} why={candidate.scoreWhy} />
         </div>
         <h2 className="text-[19px] leading-snug font-semibold tracking-[-0.01em] text-balance [overflow-wrap:anywhere]">{candidate.classification.summary || '(no summary)'}</h2>
       </header>

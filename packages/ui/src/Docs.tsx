@@ -426,6 +426,19 @@ export function Docs() {
                 <li><b>Everything is audited.</b> Each decision on the <b>Decisions</b> page shows what changed field by field, why, the evidence and its confidence. <b>Roll back</b> restores exactly what was there, with any later decisions that built on it. Approving, <b>Keep</b> and rollbacks teach it (your notes are kept with the decision but do not change its confidence); an operator token&apos;s never count.</li>
                 <li><b>Guard rails.</b> It never changes on its own a lesson you changed in the last 14 days (it only proposes), and never touches lessons you wrote, demo lessons or your own facts. Daily caps, a circuit breaker per type (two rollbacks in a week drop it back to proposals) and <b>Pause learning</b> bound it. A changed lesson is not synced to a team until you keep it or 7 days pass.</li>
                 <li><b>Duplicates.</b> Two approved lessons at least 0.95 similar may be merged on its own; from 0.92 a merge is proposed. Between 0.85 and 0.92 the loop compares their words, or asks its model, and only ever proposes a merge. Rolling back a merge, or <b>Never merge these two</b> on a merge decision, records the pair as not the same: it is never proposed again until you <b>Lift</b> it.</li>
+                <li>
+                  <b>The approve score.</b> Every item waiting for you (Inbox items, proposed lessons, claims, questions the loop would assign or close, and
+                  proposed decisions) shows a chip from 0 to 10: the chance your verdict is approve (confirm, accept, apply). Green at 7 and above says approve,
+                  red at 3 and below says reject, and grey in between is a judgement call; hover it for the one or two reasons. It is read off what the loop already
+                  calibrates, not a new model: the loop&apos;s call on the item and the Beta posterior of your reviews of that type in the call&apos;s confidence band,
+                  10 × p for a call that approves, 10 × (1 − p) for one that rejects. An item no call names falls back to its own signal (the classifier&apos;s
+                  confidence, the lesson checks, the claim&apos;s confidence), weighed as only a few reviews. With little evidence the score shrinks toward 5 by the
+                  posterior&apos;s width, so it never looks surer than it is. A lesson flagged <Code>risky-command</Code>, <Code>may-hold-secret</Code>,{' '}
+                  <Code>off-turn</Code> or <Code>example-applies-when</Code> is capped at 2, and a flagged or disputed claim at 5. Sort any of these lists by it;
+                  <i> needs you</i> on the Decisions page lists the judgement calls first. The score is not the auto-apply bar: auto-apply reads the band&apos;s
+                  10th-percentile lower bound against τ (0.9 for approving a lesson) and needs its minimum reviews, while the score reads the band&apos;s mean,
+                  shrunk, so a 9 can still wait for you as a proposal.
+                </li>
                 <li><b>Is it helping?</b> A fixed share of lessons (<Code>LOOP_HOLDOUT</Code>, 20%) is never changed, and the <b>Learning loop</b> page compares their repeat rate with the rest.</li>
                 <li><b>Modes.</b> <i>off</i>, <i>observe</i> (records what it would do), <i>propose</i> (asks first) and <i>auto</i>, globally or per type, on the Learning loop page or with <Code>fg loop mode</Code>. An install with neither <Code>API_TOKEN</Code> nor <Code>FG_OWNER_TOKEN</Code> runs it in <i>observe</i> only. Upgrading with tokens set, the first start seeds <i>auto</i>; put <Code>LOOP_MODE=observe</Code> or <Code>propose</Code> in <Code>.env</Code> before it to start cautiously.</li>
               </ul>

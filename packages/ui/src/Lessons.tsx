@@ -14,6 +14,7 @@ import { ConfirmDialog } from './ui/ConfirmDialog.tsx';
 import { Modal } from './ui/Modal.tsx';
 import { PageHeader } from './ui/PageHeader.tsx';
 import { ListRow, SplitPane } from './ui/SplitPane.tsx';
+import { byScore, ScoreChip } from './ui/ScoreChip.tsx';
 import { Button, FilterBar, Input, Select, Tabs, Textarea, usePending } from './ui/controls.tsx';
 import { Alert, Badge, Card, CauseBadge, causeLabel, causeTone, EmptyState, plural, SectionLabel, SkeletonDetail, SkeletonList, StatusBadge, tableClass, tdClass, TONE_FILL } from './ui/display.tsx';
 import { LessonIcon } from './ui/icons.tsx';
@@ -297,8 +298,9 @@ export function Lessons() {
   const [pr, setPr] = useState(() => (hashFilters().get('pr') ?? '') as string);
   const [author, setAuthor] = useState(() => (hashFilters().get('author') ?? '') as string);
   const [flag, setFlag] = useState<LessonCheckName | ''>(() => (hashFilters().get('flag') ?? '') as LessonCheckName | '');
+  const [sortBy, setSortBy] = useState<'' | 'score'>(() => (hashFilters().get('sort') === 'score' ? 'score' : ''));
 
-  useEffect(() => saveHashFilters('lessons', { status, pr, author, source, flag }), [status, pr, author, source, flag]);
+  useEffect(() => saveHashFilters('lessons', { status, pr, author, source, flag, sort: sortBy }), [status, pr, author, source, flag, sortBy]);
   const [items, setItems] = useState<Lesson[]>([]);
   // The rows ticked for a bulk decision (proposed lessons only), and the decision being confirmed.
   const [picked, setPicked] = useState<Set<string>>(new Set());
@@ -330,7 +332,8 @@ export function Lessons() {
     let stale = false;
     api.lessons(status, { pr: pr || undefined, author: author || undefined, ...(flag && { flag }), ...(source && { source }) }).then((l) => {
       if (stale) return;
-      const sorted = genericLast(l);
+      // By approve score (highest first), else the concrete lessons before the generic ones.
+      const sorted = sortBy === 'score' ? [...l].sort(byScore) : genericLast(l);
       const at = focus ? sorted.findIndex((x) => x.id === focus) : -1;
       setItems(sorted);
       setSelected(focus && at < 0 ? -1 : Math.max(0, at));
@@ -338,7 +341,7 @@ export function Lessons() {
       setLoaded(true);
     }, (e) => { if (!stale) { setError(errorMessage(e)); setLoaded(true); } });
     return () => { stale = true; };
-  }, [status, flag, source, pr, author]);
+  }, [status, flag, source, pr, author, sortBy]);
 
   const current = items[selected];
   useEffect(() => {
@@ -518,6 +521,10 @@ export function Lessons() {
                 <option value="">any check</option>
                 {LESSON_CHECKS.map((n) => <option key={n} value={n}>{checkLabel(n)}</option>)}
               </Select>
+              <Select aria-label="order" size="sm" value={sortBy} onChange={(e) => { const v = e.target.value as '' | 'score'; afterDiscard(() => setSortBy(v)); }}>
+                <option value="">newest first</option>
+                <option value="score">approve score</option>
+              </Select>
             </FilterBar>
             {bulkable && (
               <FilterBar label="bulk decisions">
@@ -567,12 +574,15 @@ export function Lessons() {
                   >
                     <div className="flex items-center justify-between gap-2 text-xs text-muted">
                       <span className="truncate">{l.projectKey ?? 'global'} · <SourceLabel source={l.from ?? l.source} /></span>
-                      {l.cause && (
-                        <span className="flex min-w-0 shrink-0 items-center gap-1.5">
-                          <span aria-hidden="true" className={`size-1.5 shrink-0 rounded-full ${TONE_FILL[causeTone(l.cause)]}`} />
-                          <span className="truncate">{causeLabel(l.cause)}</span>
-                        </span>
-                      )}
+                      <span className="flex min-w-0 shrink-0 items-center gap-1.5">
+                        {l.cause && (
+                          <>
+                            <span aria-hidden="true" className={`size-1.5 shrink-0 rounded-full ${TONE_FILL[causeTone(l.cause)]}`} />
+                            <span className="truncate">{causeLabel(l.cause)}</span>
+                          </>
+                        )}
+                        <ScoreChip score={l.score} why={l.scoreWhy} />
+                      </span>
                     </div>
                     <div className="mt-0.5 line-clamp-2 text-[13px] leading-snug">{l.title}</div>
                     {!!l.checks?.length && <div className="mt-1"><CheckChips checks={l.checks} max={3} /></div>}
@@ -598,6 +608,7 @@ export function Lessons() {
                     <StatusBadge status={detail.lesson.status} />
                     <AgentDecided lesson={detail.lesson} />
                     <ChangedByLoop lesson={detail.lesson} />
+                    <ScoreChip score={detail.lesson.score} why={detail.lesson.scoreWhy} />
                     {detail.lesson.decisionNote && detail.lesson.status !== 'proposed' && <Badge title="the note on its last decision">{detail.lesson.decisionNote}</Badge>}
                   </div>
                   <h2 className="text-[19px] leading-snug font-semibold tracking-[-0.01em] text-balance [overflow-wrap:anywhere]">{detail.lesson.title}</h2>

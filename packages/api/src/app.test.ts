@@ -30,7 +30,8 @@ test('GET /api/candidates passes filters through', async () => {
   const { repo, calls } = fakeRepo();
   const res = await createApp(repo).request('/api/candidates?status=pending&project=demo&limit=5');
   expect(res.status).toBe(200);
-  expect(await res.json()).toEqual([cand]);
+  // A pending item carries its approve score (core loop/approveScore.test.ts has the arithmetic).
+  expect(await res.json()).toEqual([{ ...cand, score: expect.any(Number), scoreWhy: expect.stringMatching(/ · classifier /) }]);
   // One more than the page, to know whether another page follows.
   expect(calls[0]).toEqual(['list', { status: 'pending', projectKey: 'demo', limit: 6, offset: 0 }]);
   expect(res.headers.get('x-next-offset')).toBeNull();

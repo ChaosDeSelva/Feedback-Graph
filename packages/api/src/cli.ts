@@ -39,10 +39,10 @@ Usage:
                                                  --with-sessions: only folders with Claude or Codex sessions)
   fg projects unselect --key k1,k2
   fg scan --all | --key k1,k2 [--provider codex-cli] [--wait [--timeout s]]
-  fg inbox list [--status pending|confirmed|rejected] [--source claude|codex|github|linear] [--project k] [--limit n] [--pr number] [--author login]
+  fg inbox list [--status pending|confirmed|rejected] [--source claude|codex|github|linear] [--project k] [--limit n] [--pr number] [--author login] [--sort score]
   fg inbox show <id>
   fg inbox confirm|reject <id> [<id> ...] [--reason "..."]
-  fg lessons list [--status proposed|approved|rejected|revoked|superseded] [--project k] [--flag <check>] [--source github|linear|session|agent|memory|manual|demo] [--pr number] [--author login]
+  fg lessons list [--status proposed|approved|rejected|revoked|superseded] [--project k] [--flag <check>] [--source github|linear|session|agent|memory|manual|demo] [--pr number] [--author login] [--sort score]
   fg lessons show <id>
   fg lessons approve|reject|revoke <id> [<id> ...] [--note "..."]   one batch; each lesson is recorded as decided on its own
   fg lessons quality [--project k]               of the lessons decided in the last 30 and 90 days: approved as written, after an edit, rejected
@@ -73,7 +73,7 @@ Usage:
                                                  the budget, this week's counts and the current round
   fg loop pause|resume                           stop the learning loop at once, or start it again
   fg loop mode <off|observe|propose|auto> [--type t=m,t2=m]   the mode; per type a mode, or global to follow the mode
-  fg decisions list [--status s] [--type t] [--project k] [--since 24h|<ISO>] [--q "text"] [--limit n]
+  fg decisions list [--status s] [--type t] [--project k] [--since 24h|<ISO>] [--q "text"] [--limit n] [--sort score]
                                                  the loop's decisions (the audit log), newest first; <id> below may be a
                                                  unique prefix of a full id (with or without dec:)
   fg decisions show <id>                         one decision: before and after, its targets now, evidence, dependencies, notes
@@ -139,12 +139,12 @@ type Flags = {
   json?: true; open?: true; private?: true; shared?: true; watch?: true; all?: true; only?: true; help?: true; wait?: true; force?: true; 'from-stdin'?: true; 'with-sessions'?: true;
   owner?: true; sandbox?: true; apply?: true; 'dry-run'?: true; 'restore-anyway'?: true; run?: string; since?: string; type?: string; verdict?: string;
   key?: string[]; provider?: string; status?: string; project?: string; limit?: string; reason?: string; interval?: string; as?: string; url?: string;
-  until?: string; timeout?: string; kind?: string; date?: string; participants?: string; origin?: string; q?: string; title?: string; note?: string; relation?: string; source?: string; relevance?: string; flag?: string; pr?: string; author?: string; 'github-author'?: string;
+  until?: string; timeout?: string; kind?: string; date?: string; participants?: string; origin?: string; q?: string; title?: string; note?: string; relation?: string; source?: string; relevance?: string; flag?: string; pr?: string; author?: string; 'github-author'?: string; sort?: string;
 };
 export type Parsed = { words: string[]; flags: Flags };
 
 const BOOLEAN = new Set(['json', 'open', 'private', 'shared', 'watch', 'all', 'only', 'help', 'wait', 'force', 'from-stdin', 'with-sessions', 'sandbox', 'apply', 'dry-run', 'owner', 'restore-anyway']);
-const VALUED = new Set(['key', 'provider', 'status', 'project', 'limit', 'reason', 'interval', 'as', 'url', 'until', 'timeout', 'kind', 'date', 'participants', 'origin', 'q', 'title', 'note', 'relation', 'source', 'relevance', 'flag', 'run', 'pr', 'author', 'github-author', 'since', 'type', 'verdict']);
+const VALUED = new Set(['key', 'provider', 'status', 'project', 'limit', 'reason', 'interval', 'as', 'url', 'until', 'timeout', 'kind', 'date', 'participants', 'origin', 'q', 'title', 'note', 'relation', 'source', 'relevance', 'flag', 'run', 'pr', 'author', 'github-author', 'since', 'type', 'verdict', 'sort']);
 
 export function parse(argv: string[]): Parsed {
   const words: string[] = [];
@@ -716,14 +716,22 @@ async function waitForScans(api: Api, io: CliIO, f: Flags, results: ScanResult[]
 /** Where an Inbox item came from (FeedbackSource). */
 const SOURCES = ['claude', 'codex', 'github', 'linear'];
 
+/** The approve score as a column: one decimal, blank when the item is not up for review. */
+const scoreCell = (s: unknown) => (typeof s === 'number' ? s.toFixed(1) : '');
+/** --sort score (highest approve score first), or nothing. */
+const sortOf = (f: Flags) => {
+  if (f.sort !== undefined && f.sort !== 'score') throw new UsageError('--sort takes score');
+  return f.sort;
+};
+
 async function inbox(api: Api, io: CliIO, words: string[], f: Flags): Promise<number> {
   const [verb, ...ids] = words;
   if (verb === 'list' || verb === undefined) {
     if (f.source !== undefined && !SOURCES.includes(f.source)) throw new UsageError(`--source takes one of ${SOURCES.join(', ')}`);
-    const items = await api<any[]>('GET', `/api/candidates${qs({ status: f.status, source: f.source, project: f.project, limit: f.limit, pr: f.pr, author: f.author })}`);
+    const items = await api<any[]>('GET', `/api/candidates${qs({ status: f.status, source: f.source, project: f.project, limit: f.limit, pr: f.pr, author: f.author, sort: sortOf(f) })}`);
     if (f.json) { io.out(JSON.stringify(items, null, 2)); return 0; }
     io.out(items.length
-      ? table(['ID', 'PROJECT', 'SOURCE', 'LABEL', 'CONF', 'SUMMARY'], items.map((c) => [c.id, c.projectKey, c.source, c.classification?.label, c.classification?.confidence?.toFixed(2), c.classification?.summary]))
+      ? table(['ID', 'SCORE', 'PROJECT', 'SOURCE', 'LABEL', 'CONF', 'SUMMARY'], items.map((c) => [c.id, scoreCell(c.score), c.projectKey, c.source, c.classification?.label, c.classification?.confidence?.toFixed(2), c.classification?.summary]))
       : `no ${f.status ? `${f.status} ` : ''}items${f.source ? ` from ${f.source}` : ''}`);
     return 0;
   }
@@ -737,6 +745,7 @@ async function inbox(api: Api, io: CliIO, words: string[], f: Flags): Promise<nu
       ['id', c.id], ['project', c.projectKey], ['source', c.source],
       ['status', `${c.status}${c.decidedBy ? ` by ${c.decidedBy}` : ''}${c.decidedAt ? ` at ${at(c.decidedAt)}` : ''}`],
       ['label', `${c.classification?.label ?? ''} (${c.classification?.confidence ?? ''}): ${c.classification?.summary ?? ''}`],
+      ...(c.scoreWhy ? [['score', c.scoreWhy]] : []),
       ...(ext ? [['author', `${ext.author ?? ''}${ext.authorKind ? ` (${ext.authorKind})` : ''}`], ['url', ext.url ?? '']] : []),
       ['comment', d.turn?.text ?? ''],
       ...(c.note ? [['note', c.note]] : []),
@@ -757,11 +766,11 @@ async function inbox(api: Api, io: CliIO, words: string[], f: Flags): Promise<nu
 async function lessons(api: Api, io: CliIO, words: string[], f: Flags): Promise<number> {
   const [verb, id] = words;
   if (verb === 'list' || verb === undefined) {
-    const list = await api<any[]>('GET', `/api/lessons${qs({ status: f.status, project: f.project, flag: f.flag, source: f.source, pr: f.pr, author: f.author })}`);
+    const list = await api<any[]>('GET', `/api/lessons${qs({ status: f.status, project: f.project, flag: f.flag, source: f.source, pr: f.pr, author: f.author, sort: sortOf(f) })}`);
     if (f.json) { io.out(JSON.stringify(list, null, 2)); return 0; }
     io.out(list.length
-      ? table(['ID', 'STATUS', 'PROJECT', 'FROM', 'FLAGS', 'TITLE', 'DECIDED BY'], list.map((l) => [
-        l.id, l.status, l.projectKey ?? 'global', l.from ?? '', (l.checks ?? []).map((c: { name: string }) => c.name).join(','), l.title, l.decidedBy ?? '',
+      ? table(['ID', 'SCORE', 'STATUS', 'PROJECT', 'FROM', 'FLAGS', 'TITLE', 'DECIDED BY'], list.map((l) => [
+        l.id, scoreCell(l.score), l.status, l.projectKey ?? 'global', l.from ?? '', (l.checks ?? []).map((c: { name: string }) => c.name).join(','), l.title, l.decidedBy ?? '',
       ]), 70)
       : `no ${f.status ? `${f.status} ` : ''}lessons`);
     return 0;
@@ -1332,8 +1341,8 @@ async function loopCmd(api: Api, io: CliIO, args: string[], f: Flags): Promise<n
 }
 
 const decisionTarget = (d: Record<string, any>) => (d.targets.find((t: { role: string }) => t.role === 'primary') ?? d.targets[0])?.id ?? '';
-const decisionRows = (list: Record<string, any>[]) => table(['ID', 'TYPE', 'STATUS', 'MODE', 'PROJECT', 'TARGET', 'P', 'CREATED', 'RATIONALE'], list.map((d) => [
-  d.id, d.type, d.status, d.mode, d.projectKey ?? 'global', decisionTarget(d), p2(d.confidence.p), at(d.createdAt), d.rationale,
+const decisionRows = (list: Record<string, any>[]) => table(['ID', 'SCORE', 'TYPE', 'STATUS', 'MODE', 'PROJECT', 'TARGET', 'P', 'CREATED', 'RATIONALE'], list.map((d) => [
+  d.id, scoreCell(d.approveScore), d.type, d.status, d.mode, d.projectKey ?? 'global', decisionTarget(d), p2(d.confidence.p), at(d.createdAt), d.rationale,
 ]), 60, [0]);
 const reasonOf = (f: Flags) => {
   if (f.reason !== undefined && !REASONS.includes(f.reason)) throw new UsageError(`--reason takes ${REASONS.join(', ')}`);
@@ -1365,7 +1374,7 @@ async function decisionsCmd(api: Api, io: CliIO, args: string[], f: Flags): Prom
     return encodeURIComponent(id);
   };
   if (verb === 'list' || verb === undefined) {
-    const list = await api<Record<string, any>[]>('GET', `/api/decisions${qs({ status: f.status, type: f.type, project: f.project, since: f.since && sinceTime(f.since), q: f.q, limit: f.limit })}`);
+    const list = await api<Record<string, any>[]>('GET', `/api/decisions${qs({ status: f.status, type: f.type, project: f.project, since: f.since && sinceTime(f.since), q: f.q, limit: f.limit, sort: sortOf(f) })}`);
     io.out(f.json ? JSON.stringify(list, null, 2) : list.length ? decisionRows(list) : 'no decisions');
     return 0;
   }
@@ -1376,6 +1385,7 @@ async function decisionsCmd(api: Api, io: CliIO, args: string[], f: Flags): Prom
     io.out(`${d.id}: ${words(d.type)} (tier ${d.tier}, ${d.mode}) is ${words(d.status)}${d.decidedBy ? `, decided by ${d.decidedBy}` : ''}`);
     io.out(`project ${d.projectKey ?? 'global'}; targets ${d.targets.map((t: { id: string; role: string }) => `${t.id} (${t.role})`).join(', ') || 'none'}`);
     io.out(`confidence p ${p2(d.confidence.p)} (lower ${p2(d.confidence.lower)}), from ${plural(d.confidence.n, 'of your review')}; model ${d.model ?? 'none'}, policy v${d.policyVersion}`);
+    if (d.scoreWhy) io.out(`approve score ${d.scoreWhy}`);
     io.out(`rationale: ${d.rationale}`);
     if (d.rollback) io.out(`rolled back by ${d.rollback.by} at ${at(d.rollback.at)}${d.rollback.reason ? ` (${words(d.rollback.reason)})` : ''}${d.rollback.note ? `: ${d.rollback.note}` : ''}`);
     const fields = (snaps: { id: string; fields: Record<string, unknown> }[], tid: string) => snaps.find((x) => x.id === tid)?.fields ?? {};

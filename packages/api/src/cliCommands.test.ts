@@ -471,10 +471,10 @@ test('inbox: an unknown verb is a usage error; decisions print as JSON with --js
 });
 
 test('lessons list and show: global lessons, flags, origin and who decided; --json; empty lists say what was filtered', async () => {
-  const list = [{ id: 'l1', status: 'approved', projectKey: null, title: 't1', checks: [{ name: 'stale' }, { name: 'dup' }], from: 'pm', decidedBy: 'owner' }, { id: 'l2', status: 'proposed', projectKey: 'a', title: 't2' }];
+  const list = [{ id: 'l1', status: 'approved', projectKey: null, title: 't1', checks: [{ name: 'stale' }, { name: 'dup' }], from: 'pm', decidedBy: 'owner', score: null }, { id: 'l2', status: 'proposed', projectKey: 'a', title: 't2', score: 7.25 }];
   const f = fg({ 'GET /api/lessons': list });
   await f.cmd('lessons');
-  expect(f.out[0].split('\n').map((l) => l.replace(/\s+/g, ' '))).toEqual(['ID STATUS PROJECT FROM FLAGS TITLE DECIDED BY', 'l1 approved global pm stale,dup t1 owner', 'l2 proposed a t2']);
+  expect(f.out[0].split('\n').map((l) => l.replace(/\s+/g, ' '))).toEqual(['ID SCORE STATUS PROJECT FROM FLAGS TITLE DECIDED BY', 'l1 approved global pm stale,dup t1 owner', 'l2 7.3 proposed a t2']);
   const json = fg({ 'GET /api/lessons': list });
   await json.cmd('lessons', 'list', '--json');
   expect(JSON.parse(json.text())).toEqual(list);

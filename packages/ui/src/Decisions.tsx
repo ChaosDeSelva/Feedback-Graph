@@ -15,6 +15,7 @@ import { Button, buttonClass, Input, Select, Textarea } from './ui/controls.tsx'
 import { Alert, Badge, Card, Chip, EmptyState, Kbd, longTime, plural, SectionLabel, SkeletonDetail, SkeletonList, tableClass, tdClass, thClass, Time } from './ui/display.tsx';
 import { DecisionIcon, DownloadIcon } from './ui/icons.tsx';
 import { ScrollArea } from './ui/ScrollArea.tsx';
+import { judgementFirst, ScoreChip } from './ui/ScoreChip.tsx';
 
 /** Every request fails with an Error (api.ts): the API's own words, or that it did not answer. */
 const message = (e: unknown) => (e as Error).message;
@@ -423,7 +424,7 @@ function download(name: string, type: string, text: string) {
   URL.revokeObjectURL(url);
 }
 
-type Filters = { status: StatusOption; type: DecisionType | ''; project: string; mode: DecisionMode | ''; band: string; since: string; until: string; target: string; q: string };
+type Filters = { status: StatusOption; type: DecisionType | ''; project: string; mode: DecisionMode | ''; band: string; since: string; until: string; target: string; q: string; sort: '' | 'score' };
 
 /**
  * A day as the date fields write it (2026-11-09) that is a real date; anything else from an address is dropped. Year 0000
@@ -448,8 +449,16 @@ function filtersFromHash(): Filters {
     until: day(h.get('until')),
     target: h.get('target') ?? '',
     q: h.get('q') ?? '',
+    sort: h.get('sort') === 'score' ? 'score' : '',
   };
 }
+
+/**
+ * The order rows are shown in: the API's (newest first, or by approve score with sort=score), except that "needs you"
+ * in its default order puts the judgement calls (the grey middle band, nearest 5 first) before the clear ones (0.9.4).
+ */
+const ordered = (f: Filters, rows: Decision[]) =>
+  f.status === 'proposed' && !f.sort ? [...rows].sort((a, b) => judgementFirst({ score: a.approveScore }, { score: b.approveScore })) : rows;
 
 const toQuery = (f: Filters): DecisionFilter => ({
   status: f.status === 'all' ? undefined : f.status,
@@ -462,6 +471,7 @@ const toQuery = (f: Filters): DecisionFilter => ({
   until: f.until ? new Date(new Date(`${f.until}T00:00:00`).getTime() + 86_400_000).toISOString() : undefined,
   target: f.target || undefined,
   q: f.q || undefined,
+  sort: f.sort || undefined,
 });
 
 /** The actions a decision in this status takes. */
@@ -588,7 +598,7 @@ export function Decisions() {
     loopApi.decisions(query).then(({ items: rows, next: n }) => {
       if (stale) return;
       const at = pinned.current ? rows.findIndex((x) => x.id === pinned.current) : -1;
-      setItems(rows);
+      setItems(ordered(filters, rows));
       setNext(n);
       setSelected(Math.max(0, at));
       setOpen(at >= 0);
@@ -600,7 +610,7 @@ export function Decisions() {
   async function loadMore() {
     try {
       const page = await loopApi.decisions({ ...query, offset: next! });
-      setItems((xs) => [...xs, ...page.items]);
+      setItems((xs) => ordered(filters, [...xs, ...page.items]));
       setNext(page.next);
     } catch (e) {
       setError(message(e));
@@ -721,7 +731,7 @@ export function Decisions() {
 
   const moreCount = [filters.mode, filters.band, filters.project, filters.target, filters.since, filters.until].filter(Boolean).length;
   const filtered = filters.type || filters.project || filters.mode || filters.band || filters.since || filters.until || filters.target || filters.q;
-  const clear = () => { setQDraft(''); setTargetDraft(''); set({ type: '', project: '', mode: '', band: '', since: '', until: '', target: '', q: '' }); };
+  const clear = () => { setQDraft(''); setTargetDraft(''); set({ type: '', project: '', mode: '', band: '', since: '', until: '', target: '', q: '', sort: '' }); };
   const d = detail?.decision;
   const pair = d ? mergePair(d) : null;
 
@@ -755,6 +765,10 @@ export function Decisions() {
               <Select aria-label="type" size="sm" value={filters.type} onChange={(e) => set({ type: e.target.value as DecisionType | '' })}>
                 <option value="">every type</option>
                 {DECISION_TYPES.map((t) => <option key={t} value={t}>{typeLabel(t)}</option>)}
+              </Select>
+              <Select aria-label="order" size="sm" className="col-span-2" value={filters.sort} onChange={(e) => set({ sort: e.target.value as '' | 'score' })}>
+                <option value="">{filters.status === 'proposed' ? 'judgement calls first' : 'newest first'}</option>
+                <option value="score">approve score</option>
               </Select>
               <Input size="sm" type="search" aria-label="search rationale and targets" placeholder="search (Enter)" className="col-span-2" value={qDraft} onChange={(e) => setQDraft(e.target.value)} onKeyDown={(e) => { if (e.key === 'Enter') set({ q: qDraft.trim() }); }} onBlur={() => set({ q: qDraft.trim() })} />
               {/* The rarer filters fold away so the list keeps its room, most of all in a phone's single column. */}
@@ -810,6 +824,7 @@ export function Decisions() {
                     <div className="mt-1 flex flex-wrap items-center gap-1">
                       <Badge tone={decisionTone(x.status)} dot>{statusLabel(x.status)}</Badge>
                       <span className="text-xs text-muted tabular-nums">p {p2(x.confidence.p)}</span>
+                      <ScoreChip score={x.approveScore} why={x.scoreWhy} />
                     </div>
                   </ListRow>
                 </li>
@@ -840,6 +855,7 @@ export function Decisions() {
                     <DecisionBadges d={d} />
                     <Badge title={`tier ${d.tier}`}>{tierLabel(d.tier)}</Badge>
                     <Badge>{d.projectKey ?? 'global'}</Badge>
+                    <ScoreChip score={d.approveScore} why={d.scoreWhy} />
                   </div>
                   <h2 className="text-[19px] leading-snug font-semibold tracking-[-0.01em] [overflow-wrap:anywhere]">{decisionTitle(d)}</h2>
                   <ul aria-label="about this decision" className="flex flex-wrap gap-x-4 gap-y-0.5 text-xs text-muted">

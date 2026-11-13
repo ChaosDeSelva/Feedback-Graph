@@ -37,7 +37,7 @@ test('decisions_list: compact rows newest first, filtered and paged; decision_ge
   const list = await tool(app, 'decisions_list', { limit: 1 });
   expect(list.data).toEqual({
     offset: 0, more: true, note: 'more: pass offset: 1 for the next page',
-    items: [{ id: 'dec:p', type: 'approve_lesson', status: 'proposed', tier: 'A', mode: 'propose', projectKey: 'shop', target: 'lesson:1', confidence: proposed.confidence, rationale: `${'x'.repeat(239)}…`, createdAt: proposed.createdAt, decidedBy: null }],
+    items: [{ id: 'dec:p', type: 'approve_lesson', status: 'proposed', tier: 'A', mode: 'propose', projectKey: 'shop', target: 'lesson:1', confidence: proposed.confidence, rationale: `${'x'.repeat(239)}…`, createdAt: proposed.createdAt, decidedBy: null, score: expect.any(Number), scoreWhy: expect.stringContaining('approve_lesson') }],
   });
   const rest = await tool(app, 'decisions_list', { offset: 1 });
   expect(rest.data).toMatchObject({ offset: 1, more: false });

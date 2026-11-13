@@ -10,7 +10,7 @@ import { bodyLimit } from 'hono/body-limit';
 import { streamSSE } from 'hono/streaming';
 import { serveStatic } from '@hono/node-server/serve-static';
 import { z } from 'zod';
-import { ACTIVITY_KINDS, capFixCommits, dependenciesOf, lessonSnapshot, LOOP_POLICY_VERSION, TargetChangedError, type Decision as LoopDecision, EVERYDAY_FROM, chunkText, mapCapped, MAX_AUTO_MAP_FILES, MODEL_JOBS, cleanLessonPath, pathMatches, lessonToFact, cmp, FACT_KINDS, LESSON_CHECKS, LESSON_FROM, redactSecrets, relevanceBand, selectionNote, type ActivityStore, type CodeGraphStore, type DocsStore, type FactsStore, type GraphStore, type InsightsStore, type ModelHealth, type ModelJob, type OllamaHealth, type PipelineStatus, type ProviderHealth, type KnowledgeStore, type Lesson, type LinksStore, IMAGE_MEDIA_TYPES, MAX_IMAGE_BYTES, LINK_RELATIONS, LINK_STATUSES, linkPair, linkEnds, docIdOf, NotTheRunsError, type PortabilityStore, type Project, type ProjectSelection, type RelevanceBy, type ProjectSummary, type ScanQueueEntry, type ShownProjects, type WorkQueue, type WorkQueues, type StoreKind, type SystemStatus, type WorkerStatus, type AgentSeen, type RunnerReadiness, DEMO_SOURCE, contextWhy, FACT_ORIGINS, SCANNER_VERSION, RUN_ID, type RunPrincipal, type RunsStore, LESSON_QUALITY_DAYS, lessonQualityReport, type LessonQualityReport, type Candidate } from '@fb/core';
+import { ACTIVITY_KINDS, capFixCommits, dependenciesOf, lessonSnapshot, LOOP_POLICY_VERSION, TargetChangedError, type Decision as LoopDecision, EVERYDAY_FROM, chunkText, mapCapped, MAX_AUTO_MAP_FILES, MODEL_JOBS, cleanLessonPath, pathMatches, lessonToFact, cmp, FACT_KINDS, LESSON_CHECKS, LESSON_FROM, redactSecrets, relevanceBand, selectionNote, type ActivityStore, type CodeGraphStore, type DocsStore, type FactsStore, type GraphStore, type InsightsStore, type ModelHealth, type ModelJob, type OllamaHealth, type PipelineStatus, type ProviderHealth, type KnowledgeStore, type Lesson, type LinksStore, IMAGE_MEDIA_TYPES, MAX_IMAGE_BYTES, LINK_RELATIONS, LINK_STATUSES, linkPair, linkEnds, docIdOf, NotTheRunsError, type PortabilityStore, type Project, type ProjectSelection, type RelevanceBy, type ProjectSummary, type ScanQueueEntry, type ShownProjects, type WorkQueue, type WorkQueues, type StoreKind, type SystemStatus, type WorkerStatus, type AgentSeen, type RunnerReadiness, DEMO_SOURCE, contextWhy, FACT_ORIGINS, SCANNER_VERSION, RUN_ID, type RunPrincipal, type RunsStore, LESSON_QUALITY_DAYS, lessonQualityReport, type LessonQualityReport, type Candidate, byScore } from '@fb/core';
 import { chatRoutes, type ChatRouteDeps } from './chat.ts';
 import { trackedProject, type ContextDeps } from './context.ts';
 import { authenticated, bearerToken, needsAuth, ownerSession, OwnerSessions, sessionValue, SECURITY_HEADERS, sessionCookie, SignInLinks, SIGNIN_LINK_TTL_MS, tokenMatches, type AuthOpts } from './auth.ts';
@@ -30,6 +30,7 @@ import { connectionsStatus, integrationRoutes, type IntegrationsDeps } from './i
 import { loopRoutes, ownerOverrides, type LoopDeps } from './decisions.ts';
 import { intakeRoutes, type IntakeRouteDeps } from './intake.ts';
 import { intakeReviewRoutes, type IntakeReviewDeps } from './intakeReview.ts';
+import { pageByScore, scorer, SortQuery } from './scores.ts';
 import { knowledgeRoutes, type KnowledgeDeps } from './knowledge.ts';
 
 export type { SettingsDeps } from './settings.ts';
@@ -45,6 +46,7 @@ const ListQuery = z.object({
   limit: z.coerce.number().int().min(1).max(1000).optional(),
   /** Skip this many (newest first): the next page starts where the x-next-offset header of the last one says. */
   offset: z.coerce.number().int().min(0).max(1_000_000).optional(),
+  ...SortQuery,
 });
 /** An Inbox page when the request names no limit. */
 const CANDIDATE_PAGE = 200;
@@ -355,6 +357,7 @@ const LessonQuery = z.object({
   flag: z.enum(LESSON_CHECKS).optional(),
   /** Only lessons whose feedback came from there: a GitHub or Linear comment, session pushback, memory, by hand. */
   source: z.enum(LESSON_FROM).optional(),
+  ...SortQuery,
 });
 
 /** Many lesson decisions at once (the Lessons page's selection, `fg lessons approve|reject <id>...`). */
@@ -496,6 +499,7 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
   const { staticDir, context: sourceContext, knowledge, embed, facts, projectDirs, insights, docs, links, auth = {}, system, portability, settings, log, codegraph, classifyQueue, inScope, sessions, shown } = opts;
   // Writes made with the operator token are logged as the agent that made them, wherever the route lives.
   const context = sourceContext ? { ...sourceContext } : undefined;
+  const scores = scorer(opts.loop?.decisions);
   if (context && sessions?.store.claimRun) {
     context.registerSession = async id => {
       const run = currentRun();
@@ -1068,9 +1072,15 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
     // One more than the page tells whether another follows: the x-next-offset header says where it starts.
     const limit = q.data.limit ?? CANDIDATE_PAGE;
     const offset = q.data.offset ?? 0;
-    const rows = await repo.listCandidates({ status: q.data.status, projectKey: q.data.project, source: q.data.source, pr: q.data.pr, author: q.data.author, limit: limit + 1, offset, ...(projectKeys && { projectKeys }), ...runAsked() });
+    const read = (n: number, from: number) => repo.listCandidates({ status: q.data.status, projectKey: q.data.project, source: q.data.source, pr: q.data.pr, author: q.data.author, limit: n, offset: from, ...(projectKeys && { projectKeys }), ...runAsked() });
+    if (q.data.sort === 'score') {
+      const { page, next } = await pageByScore(async (n) => scores.candidates((await read(n, 0)).map(listedCandidate)), limit, offset);
+      if (next !== null) c.header('x-next-offset', String(next));
+      return c.json(page);
+    }
+    const rows = await read(limit + 1, offset);
     if (rows.length > limit) c.header('x-next-offset', String(offset + limit));
-    return c.json(rows.slice(0, limit).map(listedCandidate));
+    return c.json(await scores.candidates(rows.slice(0, limit).map(listedCandidate)));
   });
 
   /** An Inbox item, if it belongs to a shown project. */
@@ -1084,7 +1094,7 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
 
   app.get('/api/candidates/:id', async (c) => {
     const d = await shownCandidate(c.req.param('id'));
-    return d ? c.json(d) : c.json({ error: 'not found' }, 404);
+    return d ? c.json({ ...d, candidate: (await scores.candidates([d.candidate]))[0] }) : c.json({ error: 'not found' }, 404);
   });
 
   /** Confirm or reject an Inbox item of a shown project, and log it. False: no such item (or not shown). */
@@ -1719,6 +1729,7 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
       view,
       // The agent credential, not also the owner's or operator's: what an agent holding API_TOKEN sends.
       agentCaller: (c) => !!auth.token && tokenMatches(bearerOf(c), auth.token) && !hasOperatorToken(c, auth.operator),
+      scores,
     });
   }
   if (opts.lookUp) {
@@ -1811,9 +1822,10 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
       if (!q.success) return c.json({ error: q.error.flatten() }, 400);
       const projectKeys = keysFor(await view(), q.data.project);
       const { status, project, flag, source, pr, author } = q.data;
-      return c.json(await withLoopChanges(await knowledge.listLessons({
+      const rows = await scores.lessons(await withLoopChanges(await knowledge.listLessons({
         status, pr, author, projectKey: project, ...(projectKeys && { projectKeys }), ...(flag && { flag }), ...(source && { from: source }), ...runAsked(),
       })));
+      return c.json(q.data.sort === 'score' ? rows.sort(byScore) : rows);
     });
 
     // Before /api/lessons/:id, which would take "quality" for a lesson id.
@@ -1841,7 +1853,7 @@ export function createApp(repo: ApiRepo, opts: AppOpts = {}) {
 
     app.get('/api/lessons/:id', async (c) => {
       const d = await shownLesson(c.req.param('id'));
-      return d ? c.json({ ...d, lesson: (await withLoopChanges([d.lesson]))[0] }) : c.json({ error: 'not found' }, 404);
+      return d ? c.json({ ...d, lesson: (await scores.lessons(await withLoopChanges([d.lesson])))[0] }) : c.json({ error: 'not found' }, 404);
     });
 
     /** `merged` superseded into `keeper` by you: an owner merge_duplicates decision, proposed and applied at once. */

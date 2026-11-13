@@ -280,3 +280,11 @@ test('a page guide\'s summary goes under its name on a phone, not into a narrow 
   expect(summary.className.split(' ')).toEqual(expect.arrayContaining(['basis-full', 'sm:basis-auto']));
   expect(summary.previousElementSibling!.className).not.toMatch(/(^| )w-24/);
 });
+test('the learning loop section says how to read the approve score and how it differs from the auto-apply bar', () => {
+  render(<Docs />);
+  const section = within(screen.getByRole('region', { name: 'The learning loop' }));
+  expect(section.getByText('The approve score.')).toBeTruthy();
+  for (const flag of ['risky-command', 'may-hold-secret', 'off-turn', 'example-applies-when']) expect(section.getByText(flag)).toBeTruthy();
+  expect(section.getByText(/10 × \(1 − p\) for one that rejects/)).toBeTruthy();
+  expect(section.getByText(/The score is not the auto-apply bar/)).toBeTruthy();
+});

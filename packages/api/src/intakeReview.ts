@@ -1,5 +1,6 @@
 import type { Context, Hono } from 'hono';
 import { z } from 'zod';
+import { pageByScore, SortQuery, type Scorer } from './scores.ts';
 import {
   AliasTakenError, CLAIM_FACT_RELEVANCE, CLAIM_STATUSES, CLAIM_TYPES, claimFingerprint, FACT_KINDS, factEmbeddingText, NotTheRunsError, PERSON_STATUSES, QUESTION_KINDS, QUESTION_STATUSES,
   TargetChangedError,
@@ -32,7 +33,7 @@ export type IntakeReviewDeps = {
 };
 
 /** createApp's part: which projects are shown (null: all), and whether the request carries the agent credential. */
-export type IntakeReviewContext = { view: () => Promise<Pick<ShownProjects, 'has' | 'keys'> | null>; agentCaller: (c: Context) => boolean };
+export type IntakeReviewContext = { view: () => Promise<Pick<ShownProjects, 'has' | 'keys'> | null>; agentCaller: (c: Context) => boolean; scores: Scorer };
 
 const PAGE = 100;
 const MAX_PAGE = 500;
@@ -45,7 +46,7 @@ const ClaimsQuery = z.object({
   status: z.enum(CLAIM_STATUSES).optional(), type: z.enum(CLAIM_TYPES).optional(), project: ProjectKey.optional(),
   /** A Person id: what they said. */ person: Id.optional(),
   /** A source (its Doc id). */ source: Id.optional(),
-  ...Page,
+  ...Page, ...SortQuery,
 });
 const Scope = z.object({ area: z.string().max(200).nullable(), files: z.array(z.string().min(1).max(300)).max(20) }).strict();
 /** How accepting files the fact: its kind (a plain fact's; default convention), relevance, and the project a global claim's fact goes under. */
@@ -72,7 +73,7 @@ const ClaimDecisions = z.object({
 
 const QuestionsQuery = z.object({
   status: z.enum(QUESTION_STATUSES).optional(), kind: z.enum(QUESTION_KINDS).optional(), project: ProjectKey.optional(),
-  source: Id.optional(), assignee: Id.optional(), ...Page,
+  source: Id.optional(), assignee: Id.optional(), ...Page, ...SortQuery,
 });
 const QuestionPatchBody = z.object({ assignee: Id.nullable().optional(), status: z.enum(['open', 'dismissed']).optional() }).strict()
   .refine((b) => b.assignee !== undefined || b.status !== undefined, 'send an assignee or a status');
@@ -164,12 +165,18 @@ export function intakeReviewRoutes(app: Hono, d: IntakeReviewDeps, ctx: IntakeRe
     if (q.data.project && projectKeys?.length === 0) return c.json([]);
     const limit = q.data.limit ?? PAGE;
     const offset = q.data.offset ?? 0;
-    const rows = await intake.listClaims({
+    const read = (n: number, from: number) => intake.listClaims({
       ...(q.data.status && { status: [q.data.status] }), ...(q.data.type && { type: [q.data.type] }), ...(projectKeys && { projectKeys }),
-      ...(q.data.person && { speakerId: q.data.person }), ...(q.data.source && { docId: q.data.source }), limit: limit + 1, offset, run: runAsked().run ?? null,
+      ...(q.data.person && { speakerId: q.data.person }), ...(q.data.source && { docId: q.data.source }), limit: n, offset: from, run: runAsked().run ?? null,
     });
+    if (q.data.sort === 'score') {
+      const { page, next } = await pageByScore(async (n) => ctx.scores.claims(await withConflicts(await read(n, 0))), limit, offset);
+      if (next !== null) c.header('x-next-offset', String(next));
+      return c.json(page);
+    }
+    const rows = await read(limit + 1, offset);
     if (rows.length > limit) c.header('x-next-offset', String(offset + limit));
-    return c.json(await withConflicts(rows.slice(0, limit)));
+    return c.json(await ctx.scores.claims(await withConflicts(rows.slice(0, limit))));
   });
 
   app.get('/api/claims/:id', async (c) => {
@@ -177,7 +184,7 @@ export function intakeReviewRoutes(app: Hono, d: IntakeReviewDeps, ctx: IntakeRe
     if (!claim) return c.json({ error: 'not found' }, 404);
     const [listed] = await withConflicts([claim]);
     const [source] = await intake.metas([claim.docId]);
-    return c.json({ claim: listed, fingerprint: claimFingerprint(claim), speaker: await person(claim.speakerId), source: source ?? null });
+    return c.json({ claim: (await ctx.scores.claims([listed]))[0], fingerprint: claimFingerprint(claim), speaker: await person(claim.speakerId), source: source ?? null });
   });
 
   type Decision = z.infer<typeof ClaimPatchBody>;
@@ -304,19 +311,25 @@ export function intakeReviewRoutes(app: Hono, d: IntakeReviewDeps, ctx: IntakeRe
     if (q.data.project && projectKeys?.length === 0) return c.json([]);
     const limit = q.data.limit ?? PAGE;
     const offset = q.data.offset ?? 0;
-    const rows = await intake.listQuestions({
+    const read = (n: number, from: number) => intake.listQuestions({
       ...(q.data.status && { status: [q.data.status] }), ...(q.data.kind && { kind: [q.data.kind] }), ...(projectKeys && { projectKeys }),
-      ...(q.data.source && { docId: q.data.source }), ...(q.data.assignee && { assignee: q.data.assignee }), limit: limit + 1, offset, run: runAsked().run ?? null,
+      ...(q.data.source && { docId: q.data.source }), ...(q.data.assignee && { assignee: q.data.assignee }), limit: n, offset: from, run: runAsked().run ?? null,
     });
+    if (q.data.sort === 'score') {
+      const { page, next } = await pageByScore(async (n) => ctx.scores.questions(await read(n, 0)), limit, offset);
+      if (next !== null) c.header('x-next-offset', String(next));
+      return c.json(page);
+    }
+    const rows = await read(limit + 1, offset);
     if (rows.length > limit) c.header('x-next-offset', String(offset + limit));
-    return c.json(rows.slice(0, limit));
+    return c.json(await ctx.scores.questions(rows.slice(0, limit)));
   });
 
   app.get('/api/questions/:id', async (c) => {
     const q = await shownQuestion(c.req.param('id'));
     if (!q) return c.json({ error: 'not found' }, 404);
     const [source] = await intake.metas([q.docId]);
-    return c.json({ question: q, askedBy: await person(q.askedBy), assignee: await person(q.assignee), answer: q.answerClaimId ? await intake.claim(q.answerClaimId) : null, source: source ?? null });
+    return c.json({ question: (await ctx.scores.questions([q]))[0], askedBy: await person(q.askedBy), assignee: await person(q.assignee), answer: q.answerClaimId ? await intake.claim(q.answerClaimId) : null, source: source ?? null });
   });
 
   const questionActivity = (q: Question, subject: string, why: string, details: Record<string, unknown>, targets: string[] = []) =>

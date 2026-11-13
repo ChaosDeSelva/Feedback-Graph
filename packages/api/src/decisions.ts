@@ -10,6 +10,7 @@ import {
   type LoopRound, type LoopSettings, type PatternReport, type SessionsStore, type ShownProjects, type TargetSnapshot,
 } from '@fb/core';
 import { actingAsOperator, currentActor } from './operator.ts';
+import { pageByScore, scorer, SortQuery } from './scores.ts';
 
 /**
  * The learning loop's REST routes (docs/learning-loop-api.md): its decisions as the audit log, the owner's verdicts on
@@ -159,6 +160,7 @@ const ListQuery = z.object({
   offset: z.coerce.number().int().min(0).max(1_000_000).optional(),
   /** x-next-after of the page before: the next page in created order, read by keyset instead of offset. */
   after: z.string().min(1).max(1000).optional(),
+  ...SortQuery,
 });
 const ActionBody = z.object({
   expect: z.enum(DECISION_STATUSES),
@@ -273,6 +275,7 @@ const guarded = (h: Handler): Handler => async (c) => {
 export function loopRoutes(app: Hono, d: LoopDeps, ctx: LoopRouteContext) {
   const now = d.now ?? Date.now;
   const store = d.decisions;
+  const scores = scorer(store);
   /** The shown projects, read once per request however many records it checks (each read is a few store queries). */
   const seenBy = new WeakMap<Request, Promise<Seen>>();
   const seen = (c: Context): Promise<Seen> => {
@@ -378,8 +381,9 @@ export function loopRoutes(app: Hono, d: LoopDeps, ctx: LoopRouteContext) {
   app.get('/api/decisions', guarded(async (c) => {
     const q = ListQuery.safeParse(c.req.query());
     if (!q.success) return c.json({ error: q.error.flatten() }, 400);
-    const { status, project, limit = DECISION_PAGE, offset = 0, after, ...f } = q.data;
+    const { status, project, limit = DECISION_PAGE, offset = 0, after, sort, ...f } = q.data;
     if (after && (f.appliedSince || q.data.offset !== undefined)) return c.json({ error: 'after pages in created order: it goes with neither appliedSince nor offset' }, 400);
+    if (after && sort) return c.json({ error: 'after pages in created order: sort=score pages by offset' }, 400);
     const key = after === undefined ? undefined : decodeKey(after);
     if (after !== undefined && !key) return c.json({ error: 'after: not a cursor this API gave' }, 400);
     const s = await seen(c);
@@ -387,16 +391,22 @@ export function loopRoutes(app: Hono, d: LoopDeps, ctx: LoopRouteContext) {
     // One more than the page tells whether another follows (x-next-offset, as GET /api/candidates; x-next-after, the
     // keyset cursor, reads a deep page as fast as the first). The store pages only shown projects' decisions: a hidden
     // one counted toward the page would say a hidden match exists.
-    const rows = await store.list({
+    const filter = {
       ...f, ...(status && { status: [status] }), ...(project && { projectKey: project }), ...(s.keys && { projectKeys: s.keys }),
-      ...(f.appliedSince && { order: 'applied' as const }), ...(key ? { after: key } : { offset }), limit: limit + 1,
-    });
+      ...(f.appliedSince && { order: 'applied' as const }),
+    };
+    if (sort === 'score') {
+      const scored = await pageByScore(async (n) => scores.decisions(await store.list({ ...filter, offset: 0, limit: n })), limit, offset, (r) => r.approveScore);
+      if (scored.next !== null) c.header('x-next-offset', String(scored.next));
+      return c.json(scored.page.map(decisionWire));
+    }
+    const rows = await store.list({ ...filter, ...(key ? { after: key } : { offset }), limit: limit + 1 });
     const page = rows.slice(0, limit);
     if (rows.length > limit) {
       if (!key) c.header('x-next-offset', String(offset + limit));
       if (!f.appliedSince) c.header('x-next-after', encodeKey(page.at(-1)!));
     }
-    return c.json(page.map(decisionWire));
+    return c.json((await scores.decisions(page)).map(decisionWire));
   }));
 
   app.get('/api/decisions/:id', guarded(async (c) => {
@@ -411,7 +421,7 @@ export function loopRoutes(app: Hono, d: LoopDeps, ctx: LoopRouteContext) {
       store.notes(dec.id),
     ]);
     return c.json({
-      decision: decisionWire(dec),
+      decision: decisionWire((await scores.decisions([dec]))[0]),
       current,
       evidence,
       dependsOn: shownOnly(s, deps.filter((x): x is Decision => x !== null)).map(summaryOf),

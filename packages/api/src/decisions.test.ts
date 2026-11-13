@@ -167,7 +167,8 @@ describe('GET /api/decisions/:id', () => {
     const res = await get(app, '/api/decisions/dec:a');
     expect(res.status).toBe(200);
     const body = await res.json();
-    expect(body.decision).toEqual(decisionWire(d));
+    // Applied: nothing to approve, so no approve score.
+    expect(body.decision).toEqual({ ...decisionWire(d), approveScore: null, scoreWhy: null });
     expect(body.current).toEqual([snapshots.get('lesson:lesson:1')]);
     expect(body.evidence).toEqual([
       expect.objectContaining({ kind: 'activity', id: 'act:1', label: 'checked 3 lessons', projectKey: 'shop', activity: expect.objectContaining({ id: 'act:1', kind: 'predone_check' }) }),

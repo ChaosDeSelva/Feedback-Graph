@@ -1,10 +1,10 @@
-import { LOOP_ACTOR, lessonSnapshot, type Lesson, type LessonCheckName } from '@fb/core';
+import { LESSON_BLOCKING_CHECKS, LOOP_ACTOR, lessonSnapshot, type Lesson, type LessonCheckName } from '@fb/core';
 import { SKIP, skip, type LoopCandidate, type LoopType, type LoopTypeContext, type LoopTypeResult } from '../plugin.ts';
 import { lessonNeverTarget, ownerTouchedRecently } from './guards.ts';
 import { daysSince, lessonAfter, loopDecided, round3 } from './lessonSnapshots.ts';
 
-/** The lesson checks that block a lesson (its floor): a proposal carrying one is rejected. */
-export const BLOCKING_CHECKS: readonly LessonCheckName[] = ['platitude', 'generic', 'meta-lesson', 'not-pushback', 'no-miss', 'self-review', 'wrong-session'];
+/** The lesson checks that block a lesson (its floor): a proposal carrying one is rejected. Kept in core, where the approve score reads them too. */
+export const BLOCKING_CHECKS = LESSON_BLOCKING_CHECKS;
 /** The checks that say the lesson rests on nothing (no miss, the wrong session, the agent's own review): stronger. */
 const STRONG: readonly LessonCheckName[] = ['no-miss', 'self-review', 'wrong-session'];
 

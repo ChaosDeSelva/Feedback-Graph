@@ -1,11 +1,20 @@
-import type { Activity, ActivityKind, Connection, ConnectionName, ExternalRef, FeedbackSource, CloudSyncResult, SyncCounts, SyncTrigger, Candidate, CodeMapMeta as StoredCodeMapMeta, Hotspot, MapGraph, ModuleContext, FolderCandidate, OutsideFolder, PipelineStatus, DocSummary, CandidateDetail, CandidateStatus, EvidenceGraph, FactHit, FactKind, Lesson as StoredLesson, LessonCheckName, LessonDetail as StoredLessonDetail, LessonFrom, LessonQuality, LessonQualityReport, LessonStatus, LessonTriggers, PatternReport, ProjectSummary, ProjectLink, LinkRelation, LinkStatus, ScanJob, SessionDetail, SessionListItem, SessionState, StatsRow, StoredFact, SystemStatus } from '@fb/core';
+import type { Activity, ActivityKind, Connection, ConnectionName, ExternalRef, FeedbackSource, CloudSyncResult, SyncCounts, SyncTrigger, Candidate as StoredCandidate, CodeMapMeta as StoredCodeMapMeta, Hotspot, MapGraph, ModuleContext, FolderCandidate, OutsideFolder, PipelineStatus, DocSummary, CandidateDetail as StoredCandidateDetail, CandidateStatus, EvidenceGraph, FactHit, FactKind, Lesson as StoredLesson, LessonCheckName, LessonDetail as StoredLessonDetail, LessonFrom, LessonQuality, LessonQualityReport, LessonStatus, LessonTriggers, PatternReport, ProjectSummary, ProjectLink, LinkRelation, LinkStatus, ScanJob, SessionDetail, SessionListItem, SessionState, StatsRow, StoredFact, SystemStatus } from '@fb/core';
 import type { ChatConversation, ChatProvider, ChatThread } from '@fb/core/chat';
 import type { Utterance } from '@fb/core';
-import type { Claim, ClaimScope, ClaimSpan, ClaimStatus, ClaimType, Conflict, ConflictChoice, ConflictDismissReason, ConflictStatus, IntakeKind, IntakeMeta, IntakeRef, Person, PersonStatus, Question, QuestionStatus } from '@fb/core/types';
+import type { Claim as StoredClaim, ClaimScope, ClaimSpan, ClaimStatus, ClaimType, Conflict, ConflictChoice, ConflictDismissReason, ConflictStatus, IntakeKind, IntakeMeta, IntakeRef, Person, PersonStatus, Question as StoredQuestion, QuestionStatus } from '@fb/core/types';
+import type { Scored } from './ui/ScoreChip.tsx';
 
-export type { Connection, ConnectionName, ExternalRef, FeedbackSource, CloudSyncResult, SyncCounts, Activity, Candidate, Hotspot, MapGraph, ModuleContext, DocSummary, CandidateDetail, CandidateStatus, EvidenceGraph, LessonQuality, LessonQualityReport, LessonStatus, PatternReport, ProjectSummary, ProjectLink, LinkRelation, LinkStatus, ScanJob, PipelineStatus, SessionDetail, SessionListItem, SessionState, StatsRow, StoredFact, SystemStatus };
+export type { Connection, ConnectionName, ExternalRef, FeedbackSource, CloudSyncResult, SyncCounts, Activity, Hotspot, MapGraph, ModuleContext, DocSummary, CandidateStatus, EvidenceGraph, LessonQuality, LessonQualityReport, LessonStatus, PatternReport, ProjectSummary, ProjectLink, LinkRelation, LinkStatus, ScanJob, PipelineStatus, SessionDetail, SessionListItem, SessionState, StatsRow, StoredFact, SystemStatus };
 /** A lesson as the API serves it: changedByLoop when a learning-loop decision still applied changed it. */
-export type Lesson = StoredLesson & { changedByLoop?: true };
+export type { Scored };
+/** Review items carry their approve score (0.9.4): null or absent when not up for review. */
+export type Candidate = StoredCandidate & Scored;
+export type CandidateDetail = Omit<StoredCandidateDetail, 'candidate'> & { candidate: Candidate };
+export type Claim = StoredClaim & Scored;
+export type Question = StoredQuestion & Scored;
+/** ?sort=score: highest approve score first (the API orders the first 500 matches). */
+export type ScoreSort = 'score';
+export type Lesson = StoredLesson & { changedByLoop?: true } & Scored;
 export type LessonDetail = Omit<StoredLessonDetail, 'lesson'> & { lesson: Lesson };
 
 /** One folder on the Settings page (GET /api/settings/projects). */
@@ -208,7 +217,7 @@ export const api = {
   pipeline: (project?: string) => request<PipelineStatus>(`/api/pipeline${qs({ project })}`),
 
   /** One page of the Inbox (CANDIDATE_PAGE items from `offset`), and where the next starts. */
-  candidates: (status: CandidateStatus, project?: string, offset = 0, filters: { pr?: string; author?: string } = {}) =>
+  candidates: (status: CandidateStatus, project?: string, offset = 0, filters: { pr?: string; author?: string; sort?: ScoreSort } = {}) =>
     requestPage<Candidate>(`/api/candidates${qs({ status, ...filters, limit: String(CANDIDATE_PAGE), project, offset: offset ? String(offset) : undefined })}`),
   candidate: (id: string) => request<CandidateDetail>(`/api/candidates/${enc(id)}`),
   undoDecision: (id: string, decidedAt: string) => request<void>(`/api/candidates/${encodeURIComponent(id)}/undo`, { method: 'POST', body: { decidedAt } }),
@@ -420,6 +429,9 @@ export type Decision = {
   syncHoldUntil?: string;
   /** loop, or owner: a change you made through a decision (a conflict resolved). Absent on older answers: the loop's. */
   author?: 'loop' | 'owner';
+  /** The approve score (0.9.4) of a proposed loop decision; `score` above is the loop's raw score. */
+  approveScore?: number | null;
+  scoreWhy?: string | null;
 };
 export const NOTE_REASONS = ['wrong_evidence', 'too_broad', 'wording', 'not_now', 'other'] as const;
 export type RollbackReason = (typeof NOTE_REASONS)[number];
@@ -433,7 +445,7 @@ export type DecisionSummary = Pick<Decision, 'id' | 'type' | 'status' | 'created
 export type DecisionDetail = { decision: Decision; current: TargetSnapshot[]; evidence: ResolvedEvidence[]; dependsOn: DecisionSummary[]; dependents: DecisionSummary[]; notes: DecisionNote[] };
 export type DecisionFilter = {
   status?: DecisionStatus; type?: DecisionType; project?: string; mode?: DecisionMode; band?: number; target?: string;
-  since?: string; until?: string; q?: string; limit?: number; offset?: number;
+  since?: string; until?: string; q?: string; limit?: number; offset?: number; sort?: ScoreSort;
   /** x-next-after of the page before: the next page by keyset, as fast however deep (instead of offset). */
   after?: string;
 };
@@ -528,7 +540,7 @@ export const DECISION_PAGE = 100;
 
 const filterQuery = (f: DecisionFilter) => qs({
   status: f.status, type: f.type, project: f.project, mode: f.mode, band: f.band === undefined ? undefined : String(f.band), target: f.target,
-  since: f.since, until: f.until, q: f.q, limit: String(f.limit ?? DECISION_PAGE), offset: f.offset ? String(f.offset) : undefined, after: f.after,
+  since: f.since, until: f.until, q: f.q, limit: String(f.limit ?? DECISION_PAGE), offset: f.offset ? String(f.offset) : undefined, after: f.after, sort: f.sort,
 });
 
 /**
@@ -629,16 +641,16 @@ export const intakeApi = {
   /** keep facts: the text, chunks, unaccepted claims and questions go; none: its facts are closed too. */
   deleteSource: (id: string, keep: 'facts' | 'none') => request(`/api/intake/sources/${enc(id)}${qs({ keep })}`, { method: 'DELETE', body: {}, retry: false }),
 
-  claims: (f: { status: ClaimStatus; type?: ClaimType; project?: string; person?: string; source?: string; offset?: number }) =>
-    requestPage<ListedClaim>(`/api/claims${qs({ status: f.status, type: f.type, project: f.project, person: f.person, source: f.source, limit: String(INTAKE_PAGE), offset: f.offset ? String(f.offset) : undefined })}`),
+  claims: (f: { status: ClaimStatus; type?: ClaimType; project?: string; person?: string; source?: string; offset?: number; sort?: ScoreSort }) =>
+    requestPage<ListedClaim>(`/api/claims${qs({ status: f.status, type: f.type, project: f.project, person: f.person, source: f.source, sort: f.sort, limit: String(INTAKE_PAGE), offset: f.offset ? String(f.offset) : undefined })}`),
   claim: (id: string) => request<ClaimDetail>(`/api/claims/${enc(id)}`),
   editClaim: (id: string, edit: ClaimEdit) => request<{ claim: Claim; fact: StoredFact | null }>(`/api/claims/${enc(id)}`, { method: 'PATCH', body: edit }),
   /** Many claims, or every proposed claim of one source; each is decided on its own. */
   decideClaims: (body: { items: { id: string; status: 'accepted' | 'rejected' }[] } | { source: string; status: 'accepted' | 'rejected' }) =>
     request<BulkResults>('/api/claims/decisions', { method: 'POST', body }),
 
-  questions: (f: { status: QuestionStatus; project?: string; source?: string; offset?: number }) =>
-    requestPage<Question>(`/api/questions${qs({ status: f.status, project: f.project, source: f.source, limit: String(INTAKE_PAGE), offset: f.offset ? String(f.offset) : undefined })}`),
+  questions: (f: { status: QuestionStatus; project?: string; source?: string; offset?: number; sort?: ScoreSort }) =>
+    requestPage<Question>(`/api/questions${qs({ status: f.status, project: f.project, source: f.source, sort: f.sort, limit: String(INTAKE_PAGE), offset: f.offset ? String(f.offset) : undefined })}`),
   question: (id: string) => request<QuestionDetail>(`/api/questions/${enc(id)}`),
   updateQuestion: (id: string, patch: { assignee?: string | null; status?: 'open' | 'dismissed' }) => request<Question>(`/api/questions/${enc(id)}`, { method: 'PATCH', body: patch }),
   answerQuestion: (id: string, body: { text: string; type: ClaimType; projectKey?: string }) =>

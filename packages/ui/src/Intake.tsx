@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
-import { CLAIM_TYPES, FACT_KINDS, INTAKE_KINDS, type IntakeKind, type ClaimStatus, type ClaimType, type FactKind, type Person, type PersonStatus, type Question, type QuestionStatus } from '@fb/core/types';
-import { api, errorMessage, intakeApi, type IntakeUpload, type ClaimDetail, type ClaimEdit, type IntakeSource, type IntakeSourceDetail, type ListedClaim, type QuestionDetail } from './api.ts';
+import { CLAIM_TYPES, FACT_KINDS, INTAKE_KINDS, type IntakeKind, type ClaimStatus, type ClaimType, type FactKind, type Person, type PersonStatus, type QuestionStatus } from '@fb/core/types';
+import { api, errorMessage, intakeApi, type IntakeUpload, type ClaimDetail, type ClaimEdit, type IntakeSource, type IntakeSourceDetail, type ListedClaim, type Question, type QuestionDetail } from './api.ts';
+import { ScoreChip } from './ui/ScoreChip.tsx';
 import { hashFilters, hashFocus } from './links.ts';
 import { READ_ONLY_TITLE, useOwnerWrites } from './ownerAccess.tsx';
 import { askConfirm, ConfirmDialog } from './ui/ConfirmDialog.tsx';
@@ -130,14 +131,15 @@ function ClaimsTab({ project, projects, source, onClearSource, names, people, en
   const [status, setStatus] = useState<ClaimStatus>(() => (CLAIM_TABS.includes(hashFilters().get('status') as ClaimStatus) ? hashFilters().get('status') as ClaimStatus : 'proposed'));
   const [type, setType] = useState<ClaimType | ''>('');
   const [speaker, setSpeaker] = useState('');
+  const [sortBy, setSortBy] = useState<'' | 'score'>('');
   const list = usePaged<ListedClaim>(
-    (offset) => intakeApi.claims({ status, ...(type && { type }), ...(project && { project }), ...(speaker && { person: speaker }), ...(source && { source }), offset }),
-    (c) => c.id, [status, type, speaker, project, source],
+    (offset) => intakeApi.claims({ status, ...(type && { type }), ...(project && { project }), ...(speaker && { person: speaker }), ...(source && { source }), ...(sortBy && { sort: sortBy }), offset }),
+    (c) => c.id, [status, type, speaker, project, source, sortBy],
   );
   const { items, setItems } = list;
   useEffect(() => ensureNames(items.map((c) => c.speakerId)), [items, ensureNames]);
   const [selected, setSelected] = useState(0);
-  useEffect(() => setSelected(0), [status, type, speaker]);
+  useEffect(() => setSelected(0), [status, type, speaker, sortBy]);
   const { picked, setPicked, toggle } = usePicked([status, type, speaker, list.loaded]);
   const current = items[selected];
   const [detail, setDetail] = useState<ClaimDetail | null>(null);
@@ -290,6 +292,10 @@ function ClaimsTab({ project, projects, source, onClearSource, names, people, en
               <option value="">anyone</option>
               {speakers.map((p) => <option key={p.id} value={p.id}>{p.displayName}</option>)}
             </Select>
+            <Select aria-label="order" size="sm" value={sortBy} onChange={(e) => setSortBy(e.target.value as '' | 'score')}>
+              <option value="">newest first</option>
+              <option value="score">approve score</option>
+            </Select>
           </div>
           {source && (
             <div className="flex w-full flex-wrap items-center gap-2 text-xs text-muted">
@@ -318,7 +324,7 @@ function ClaimsTab({ project, projects, source, onClearSource, names, people, en
               <TypeBadge type={c.type} />
               <span className="truncate">{(c.speakerId && names.get(c.speakerId)) ?? 'unknown speaker'} · {c.about}</span>
             </span>
-            <span className="shrink-0 tabular-nums" title="how sure the extraction was">{Math.round(c.confidence * 100)}%</span>
+            <span className="flex shrink-0 items-center gap-1.5"><span className="tabular-nums" title="how sure the extraction was">{Math.round(c.confidence * 100)}%</span><ScoreChip score={c.score} why={c.scoreWhy} /></span>
           </div>
           <div className="mt-0.5 line-clamp-2 text-[13px] leading-snug">{c.statement}</div>
           {(c.flags.length > 0 || c.conflicts.length > 0) && (
@@ -352,6 +358,7 @@ function ClaimsTab({ project, projects, source, onClearSource, names, people, en
               <StatusBadge status={claim.status} />
               <TypeBadge type={claim.type} />
               {claim.flags.map((f) => <Badge key={f} tone="accent" title={FLAG_LABEL[f]?.[1]}>{FLAG_LABEL[f]?.[0] ?? f}</Badge>)}
+              <ScoreChip score={claim.score} why={claim.scoreWhy} />
             </div>
             <h2 className="text-[19px] leading-snug font-semibold tracking-[-0.01em] text-balance [overflow-wrap:anywhere]">{claim.statement}</h2>
             <p className="text-xs text-muted">{servedLine(claim)}</p>
@@ -461,7 +468,8 @@ function QuestionsTab({ project, projects, names, people }: { project: string; p
   const writes = useOwnerWrites();
   const locked = writes ? {} : { readOnly: true, title: READ_ONLY_TITLE };
   const [status, setStatus] = useState<QuestionStatus>('open');
-  const list = usePaged<Question>((offset) => intakeApi.questions({ status, ...(project && { project }), offset }), (q) => q.id, [status, project]);
+  const [sortBy, setSortBy] = useState<'' | 'score'>('');
+  const list = usePaged<Question>((offset) => intakeApi.questions({ status, ...(project && { project }), ...(sortBy && { sort: sortBy }), offset }), (q) => q.id, [status, project, sortBy]);
   const { items, setItems } = list;
   const [selected, setSelected] = useState(0);
   useEffect(() => setSelected(0), [status]);
@@ -528,6 +536,10 @@ function QuestionsTab({ project, projects, names, people }: { project: string; p
         <>
           <Tabs label="status" value={status} options={QUESTION_TABS} onChange={setStatus} />
           {list.loaded && <span className="ml-auto text-xs text-muted tabular-nums">{plural(items.length, 'question')}{list.next !== null ? ', more waiting' : ''}</span>}
+          <Select aria-label="order" size="sm" value={sortBy} onChange={(e) => setSortBy(e.target.value as '' | 'score')} className="w-full">
+            <option value="">newest first</option>
+            <option value="score">approve score</option>
+          </Select>
         </>
       }
       empty={<EmptyState compact icon={<IntakeIcon />} title={status === 'open' ? 'No open questions' : `No ${status} questions`}>{status === 'open' ? 'Questions a call left unanswered, contradicted or without an owner land here.' : undefined}</EmptyState>}
@@ -535,7 +547,7 @@ function QuestionsTab({ project, projects, names, people }: { project: string; p
         <>
           <div className="flex items-center justify-between gap-2 text-xs text-muted">
             <span className="flex min-w-0 items-center gap-1.5"><Badge tone={x.kind === 'contradictory' ? 'bad' : 'info'}>{KIND_LABEL[x.kind]}</Badge><span className="truncate">{x.projectKey ?? 'global'}</span></span>
-            {x.assignee && <span className="truncate">to {names.get(x.assignee) ?? 'someone'}</span>}
+            <span className="flex min-w-0 shrink-0 items-center gap-1.5">{x.assignee && <span className="truncate">to {names.get(x.assignee) ?? 'someone'}</span>}<ScoreChip score={x.score} why={x.scoreWhy} /></span>
           </div>
           <div className="mt-0.5 line-clamp-2 text-[13px] leading-snug">{x.text}</div>
         </>
@@ -553,6 +565,7 @@ function QuestionsTab({ project, projects, names, people }: { project: string; p
               <Badge>{q.projectKey ?? 'global'}</Badge>
               <StatusBadge status={q.status} />
               <Badge tone={q.kind === 'contradictory' ? 'bad' : 'info'}>{KIND_LABEL[q.kind]}</Badge>
+              <ScoreChip score={q.score} why={q.scoreWhy} />
             </div>
             <h2 className="text-[19px] leading-snug font-semibold tracking-[-0.01em] text-balance [overflow-wrap:anywhere]">{q.text}</h2>
             {detail.askedBy && <p className="text-xs text-muted">Asked by {detail.askedBy.displayName}{detail.source?.occurredAt && <>, {detail.source.occurredAt.slice(0, 10)}</>}</p>}

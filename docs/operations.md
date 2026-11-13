@@ -592,6 +592,8 @@ learning loop.
 - **Lists are paged.** `list_projects`, `inbox_list` and `lessons_list` return 20 compact rows by default (`limit` up to
   200) with `total`, `more` and a note naming the `offset` of the next page. A row leaves out PR descriptions, diffs and
   long rules; `inbox_get` and `lesson_get` give one item in full. Every tool's answer is also in `structuredContent`.
+  Rows of the list tools carry the approve score (`score`, 0-10, null when nothing waits on it) and `scoreWhy`, and
+  `sort: "score"` orders by it (see the guide's **Approve score**).
 - **Attribution.** Writes made with the token are recorded as `operator:<name>` (the `X-FG-Operator` header, else the
   MCP client's name) on the item itself (Inbox decisions, lessons, fact relevance, links, uploads) and in Activity,
   whose entries also say how the write arrived: `details.via` is `operator`, `browser` or `api`.

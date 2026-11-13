@@ -21,7 +21,7 @@ Query (all optional): `status`, `type`, `project`, `mode` (`auto` | `propose` | 
 `band` (0-4), `target` (any target id), `since` and `until` (ISO times, compared as instants on both stores: any offset
 names the same time, and one beyond ±14:00 is a 400; `createdAt >= since` and `< until`), `appliedSince` (an ISO time,
 likewise; `appliedAt >= appliedSince`, and the list is then newest applied first), `q` (text search over the rationale
-and target ids), `idPrefix` (decisions whose id starts with it; `fg decisions show <prefix>` asks with it), `limit` (default 100, at most 500), `offset`, `after` (the `x-next-after` of the page before).
+and target ids), `idPrefix` (decisions whose id starts with it; `fg decisions show <prefix>` asks with it), `limit` (default 100, at most 500), `offset`, `after` (the `x-next-after` of the page before). `sort=score` (0.9.4) orders the first 500 matches by approve score, highest first, unscored last, and pages them by `offset`; it does not go with `after` (a 400).
 
 Answers `Decision[]`, newest first, with an `x-next-offset` header when there is another page (the same paging as
 `GET /api/candidates`; a page fetched with `after` gets none) and, in created order (no `appliedSince`), an `x-next-after` cursor: the next page by keyset,
@@ -40,7 +40,13 @@ TargetSnapshot = { kind: 'lesson'|'fact'|'miss'|'candidate'|'project'|'claim'|'c
 EvidenceRef    = { kind: 'activity'|'miss'|'lesson'|'fact'|'check'|'session'|'candidate'|'claim'|'conflict'|'question', id, role: string, weight: number, observedAt }
 confidence     = { p, lower, n, band }   // n: the owner's own labels for this type and band
 needsYou?      : string                  // a proposed decision only (0.9.1): why the loop could not decide it, in one line
+approveScore   : number | null           // 0.9.4: 0-10, the chance you approve it (proposed by the loop only; else null)
+scoreWhy       : string | null           // the score and its top reasons in one line: "8.6 · loop proposes ..."
 ```
+
+`approveScore` is core's `scoreDecision` (`packages/core/src/loop/approveScore.ts`): the type's current calibrated *p* in the
+decision's band, pulled toward 5 by the posterior's width. It is not `score`, which stays the loop's raw score. See the
+guide's **Approve score**.
 
 `needsYou` is core's `needsYouReason`: the reason the loop gave for proposing rather than applying it (its rationale's
 "Proposed rather than applied: …" or "Proposed only: …"), else "always your call" for a tier P type, "not earned yet"

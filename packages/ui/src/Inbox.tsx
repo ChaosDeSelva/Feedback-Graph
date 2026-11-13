@@ -10,6 +10,7 @@ import { ListRow, SplitPane } from './ui/SplitPane.tsx';
 import { Button, buttonClass, Input, Select, Tabs, useFocusHandoff, usePending } from './ui/controls.tsx';
 import { Alert, Badge, Card, EmptyState, Kbd, plural, SkeletonDetail, SkeletonList } from './ui/display.tsx';
 import { InboxIcon } from './ui/icons.tsx';
+import { byScore, ScoreChip } from './ui/ScoreChip.tsx';
 
 const TABS: CandidateStatus[] = ['pending', 'confirmed', 'rejected'];
 
@@ -18,8 +19,10 @@ const TABS: CandidateStatus[] = ['pending', 'confirmed', 'rejected'];
  * first, so new arrivals join the end), decided ones by when you decided (latest first); the id breaks ties. The API
  * orders by the turn's own time, which a comment synced later can place anywhere in the list.
  */
-function stableOrder(status: CandidateStatus, c: Candidate[]): Candidate[] {
+function stableOrder(status: CandidateStatus, sort: '' | 'score', c: Candidate[]): Candidate[] {
   const byId = (a: Candidate, b: Candidate) => (a.id < b.id ? -1 : 1);
+  // By approve score (sort=score): highest first, the stable order breaking ties.
+  if (sort === 'score') return stableOrder(status, '', c).sort(byScore);
   if (status === 'pending') return [...c].sort((a, b) => a.createdAt.localeCompare(b.createdAt) || byId(a, b));
   return [...c].sort((a, b) => (b.decidedAt ?? b.createdAt).localeCompare(a.decidedAt ?? a.createdAt) || byId(a, b));
 }
@@ -34,7 +37,8 @@ export function Inbox() {
   const [project, setProject] = useState(() => (hashFilters().get('project') ?? '') as string);
   const [pr, setPr] = useState(() => (hashFilters().get('pr') ?? '') as string);
   const [author, setAuthor] = useState(() => (hashFilters().get('author') ?? '') as string);
-  const filterKey = `${project}:${pr}:${author}`;
+  const [sortBy, setSortBy] = useState<'' | 'score'>(() => (hashFilters().get('sort') === 'score' ? 'score' : ''));
+  const filterKey = `${project}:${pr}:${author}:${sortBy}`;
   // The tab and project a page was asked for: a page that arrives after you moved on is dropped.
   const statusRef = useRef(status);
   const projectRef = useRef(project);
@@ -47,7 +51,7 @@ export function Inbox() {
   // Where the feedback came from: a Claude Code or Codex session, or a comment on GitHub or Linear. Filtered here.
   const [source, setSource] = useState<FeedbackSource | ''>(() => (hashFilters().get('source') ?? '') as FeedbackSource | '');
 
-  useEffect(() => saveHashFilters('inbox', { status, pr, author, source, project }), [status, pr, author, source, project]);
+  useEffect(() => saveHashFilters('inbox', { status, pr, author, source, project, sort: sortBy }), [status, pr, author, source, project, sortBy]);
   const items = source ? all.filter((c) => (c.source ?? 'claude') === source) : all;
   useEffect(() => { setSelected(0); setOpen(false); }, [source]);
   const [selected, setSelected] = useState(0);
@@ -76,9 +80,9 @@ export function Inbox() {
     // The answer for a tab or project you have left must not fill the one you are on.
     let stale = false;
     setNext(null);
-    api.candidates(status, project || undefined, 0, { pr: pr || undefined, author: author || undefined }).then(({ items: page, next: more }) => {
+    api.candidates(status, project || undefined, 0, { pr: pr || undefined, author: author || undefined, sort: sortBy || undefined }).then(({ items: page, next: more }) => {
       if (stale) return;
-      const c = stableOrder(status, page);
+      const c = stableOrder(status, sortBy, page);
       setNext(more);
       const at = focus ? c.findIndex((x) => x.id === focus) : -1;
       setItems(c);
@@ -87,7 +91,7 @@ export function Inbox() {
       setLoaded(true);
     }, (e) => { if (!stale) { setError(errorMessage(e)); setLoaded(true); } });
     return () => { stale = true; };
-  }, [status, project, pr, author]);
+  }, [status, project, pr, author, sortBy]);
 
   const current = items[selected];
   // The next page joins the list in the same stable order; the item you are on stays selected.
@@ -95,11 +99,11 @@ export function Inbox() {
   const loadMore = () => {
     setLoadingMore(true);
     const at = { status, project: filterKey, id: current?.id };
-    api.candidates(status, project || undefined, next!, { pr: pr || undefined, author: author || undefined }).then(({ items: page, next: more }) => {
+    api.candidates(status, project || undefined, next!, { pr: pr || undefined, author: author || undefined, sort: sortBy || undefined }).then(({ items: page, next: more }) => {
       if (at.status !== statusRef.current || at.project !== projectRef.current) return;
       setItems((xs) => {
         const seen = new Set(xs.map((x) => x.id));
-        const merged = stableOrder(status, [...xs, ...page.filter((x) => !seen.has(x.id))]);
+        const merged = stableOrder(status, sortBy, [...xs, ...page.filter((x) => !seen.has(x.id))]);
         const i = merged.findIndex((x) => x.id === at.id);
         if (i >= 0) setSelected(i);
         return merged;
@@ -177,10 +181,14 @@ export function Inbox() {
               <option value="">all projects</option>
               {projects.map((p) => <option key={p}>{p}</option>)}
             </Select>
+            <Select aria-label="order" value={sortBy} onChange={(e) => setSortBy(e.target.value as '' | 'score')} className="w-40">
+              <option value="">arrival order</option>
+              <option value="score">approve score</option>
+            </Select>
           </>
         }
       />
-      {undo && <div role="status" className="flex items-center justify-between border-b border-line bg-sunken px-4 py-2 text-sm"><span>Decision saved.</span><Button size="sm" owner disabled={busy} onClick={async () => { setBusy(true); try { await api.undoDecision(undo.item.id, undo.decidedAt); setItems(xs => stableOrder('pending', [...xs.filter(x => x.id !== undo.item.id), undo.item])); setStatus('pending'); setUndo(null); } catch (e) { setError(errorMessage(e)); setUndo(null); } finally { setBusy(false); } }}>Undo decision</Button></div>}
+      {undo && <div role="status" className="flex items-center justify-between border-b border-line bg-sunken px-4 py-2 text-sm"><span>Decision saved.</span><Button size="sm" owner disabled={busy} onClick={async () => { setBusy(true); try { await api.undoDecision(undo.item.id, undo.decidedAt); setItems(xs => stableOrder('pending', sortBy, [...xs.filter(x => x.id !== undo.item.id), undo.item])); setStatus('pending'); setUndo(null); } catch (e) { setError(errorMessage(e)); setUndo(null); } finally { setBusy(false); } }}>Undo decision</Button></div>}
       <SplitPane
         listLabel="feedback"
         listHeader={
@@ -204,9 +212,12 @@ export function Inbox() {
                   <ListRow selected={i === selected} onClick={() => { setSelected(i); setOpen(true); }}>
                     <div className="flex items-center justify-between gap-2 text-xs text-muted">
                       <span className="flex min-w-0 items-center gap-1.5"><SourceBadge source={c.source} />{c.external && isSelfReview(c.external) && <SelfReviewBadge />}{c.external && prNeverMerged(c.external) && <NeverMergedBadge />}<span className="truncate">{c.projectKey}</span></span>
-                      {agentReportOnly(c)
-                        ? <span title={AGENT_REPORT_TITLE}>agent report</span>
-                        : <span className="tabular-nums" title="how sure the classifier is that this is pushback">{Math.round(c.classification.confidence * 100)}% sure</span>}
+                      <span className="flex shrink-0 items-center gap-1.5">
+                        {agentReportOnly(c)
+                          ? <span title={AGENT_REPORT_TITLE}>agent report</span>
+                          : <span className="tabular-nums" title="how sure the classifier is that this is pushback">{Math.round(c.classification.confidence * 100)}% sure</span>}
+                        <ScoreChip score={c.score} why={c.scoreWhy} />
+                      </span>
                     </div>
                     <div className="mt-0.5 line-clamp-2 text-[13px] leading-snug">{c.classification.summary || '(no summary)'}</div>
                   </ListRow>

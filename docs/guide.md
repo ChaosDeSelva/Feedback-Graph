@@ -277,6 +277,18 @@ Rules drawn from confirmed misses. **This is where you decide what agents learn*
 
 Edits are kept only until you leave: moving to another lesson, tab or page asks before dropping them.
 
+## Approve score
+
+Every item waiting for you (a pending Inbox item, a proposed lesson, a proposed claim, a question the loop proposes to assign or close, and a proposed loop decision) carries a score from 0 to 10, shown as a chip on its row and in its detail, with why in the tooltip: *8.6 · loop proposes approve_lesson: you kept 60 of 62 in its band (p .91)*, *2.0 · flagged risky-command; …*. It is the chance, in tenths, that your verdict would be approve (confirm, approve, accept, or approve the proposal): 10 says approve, 0 says reject, around 5 is a genuine judgement call.
+
+- **Where it comes from.** Nothing new is learned for it. When the learning loop has a proposal on the item (*triage Inbox*, *approve lesson*, *reject lesson*, *accept claim*, *assign* or *close question*), the score is that type's calibrated estimate *p* for the proposal's confidence band, the same Beta posterior of your reviews the Learning loop page shows: 10 × *p* when the proposal approves, 10 × (1 − *p*) when it rejects. With no proposal, the item's own signal stands in, counted as only 4 reviews because nothing has calibrated it: the classifier's confidence for an Inbox item, the lesson checks for a lesson (no flag above 5, a blocking check such as *generic* below, not yet checked exactly 5), the extraction confidence for a claim. A question with no proposal has no score.
+- **Little evidence reads as a judgement call.** The estimate is pulled toward 5 by the width of its posterior: with no reviews it is 5, and it moves out only as your reviews in that band narrow it. A 95% classifier on its own scores about 6.7, never green.
+- **Flags cap it.** A lesson flagged *risky-command*, *may-hold-secret*, *off-turn* or *example-applies-when* scores at most 2, and the flag leads the why. A claim with a flag (*quote-fuzzy*, *statement-adds*) or an open conflict scores at most 5.
+- **Colours.** 7 and up is green, 3 and under red, between grey; the number is always written, so the colour is never the only cue.
+- **Sorting.** Inbox, Lessons, Intake (Claims and Questions) and Decisions offer **Sort: score**, highest first (`?sort=score` on their list routes; a paged list orders its first 500 matches). On Decisions, *needs you* lists the judgement calls (the grey band, nearest 5 first) before the rest.
+- **The score and the auto-apply bar.** They read the same posterior differently. A call applies on its own only when its band's *lower bound* (the 10th percentile) clears the type's bar τ (0.9 for *approve lesson*, 0.92 for *accept claim*) and the band holds enough of your reviews (20, or 30 for *triage Inbox*). The score is the *estimate*, shrunk toward 5, so a 9 can still wait for you: it says how you are likely to decide, not that the loop has earned the right to decide for you. For a decision, the API keeps its raw loop `score` and sends the approve score as `approveScore`.
+- `fg inbox list`, `fg lessons list` and `fg decisions list` show a SCORE column (`--sort score` orders by it), and the admin MCP list tools carry `score` and `scoreWhy` on every row (`sort: "score"`).
+
 ## Decisions
 
 The learning loop's audit log: every decision it made, whatever happened to it, with what it changed, why, and a way to undo it. Owner decisions here teach the loop: approving and **Keep** raise its confidence for that type; rejecting and rolling back lower it. A note's verdict (*agree*, *disagree*) is kept in the log but does not change its confidence. Only your own decisions count, never an operator token's.

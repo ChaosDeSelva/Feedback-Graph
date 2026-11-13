@@ -98,6 +98,10 @@ const obj = (properties: Record<string, JsonSchema>, required: string[] = Object
 /** An object this document does not spell out field by field. */
 const loose = (description: string): JsonSchema => ({ type: 'object', description, additionalProperties: true });
 
+/** The approve score on every reviewable item (core loop/approveScore.ts); null when the item is not up for review. */
+const SCORE = { anyOf: [num, { type: 'null' }], description: 'Approve score 0-10 (one decimal): the calibrated chance your verdict is approve, shrunk toward 5 with little evidence; null when not up for review' };
+const SCORE_WHY = { anyOf: [str, { type: 'null' }], description: 'The score and its top one or two reasons, in one line ("8.6 · ...")' };
+
 const SCHEMAS: Record<string, JsonSchema> = {
   Error: obj({ error: { anyOf: [str, { type: 'object', description: 'zod flatten(): formErrors and fieldErrors' }] } }, ['error'], 'Every refusal: 4xx or 5xx'),
   Classification: obj({ label: str, confidence: num, summary: str, signals: arrayOf(str) }),
@@ -107,6 +111,7 @@ const SCHEMAS: Record<string, JsonSchema> = {
     classification: ref('Classification'), status: { type: 'string', enum: ['pending', 'confirmed', 'rejected'] },
     createdAt: time, decidedAt: nullable(time), note: nullable(str), decidedBy: nullable(str),
     origins: arrayOf({ type: 'string', enum: ['detector', 'agent'] }), agentReport: nullable(loose('What the agent reported through report_feedback')),
+    score: SCORE, scoreWhy: SCORE_WHY,
   }, ['id', 'turnUuid', 'sessionId', 'projectKey', 'source', 'classification', 'status', 'createdAt', 'decidedAt', 'note']),
   CandidateDetail: obj({ candidate: ref('Candidate'), turn: loose('The flagged turn (text, role, ts)'), before: arrayOf(loose('A turn')), after: arrayOf(loose('A turn')), commits: arrayOf(loose('A commit')), postmortem: nullable(loose('Post-mortem progress')) }, ['candidate', 'turn']),
   ProjectStats: obj({ projectKey: str, week: str, humanTurns: int, pushback: int }),
@@ -120,6 +125,7 @@ const SCHEMAS: Record<string, JsonSchema> = {
     checks: nullable(arrayOf(ref('LessonCheck'))), decisionNote: nullable(str),
     proposedAs: nullable(obj({ title: str, rule: str, appliesWhen: str, scope: str, paths: arrayOf(str) }, ['title', 'rule', 'appliesWhen', 'scope', 'paths'], 'What the post-mortem proposed, kept when the owner first edited it')),
     changedByLoop: { const: true, description: 'A learning-loop decision still applied changed this lesson (GET /api/lessons and /api/lessons/:id); absent otherwise' },
+    score: SCORE, scoreWhy: SCORE_WHY,
   }, ['id', 'projectKey', 'title', 'rule', 'appliesWhen', 'scope', 'paths', 'status', 'source', 'cause', 'missId', 'createdAt', 'decidedAt']),
   LessonQuality: obj({ days: int, asWritten: int, edited: int, rejected: int, decided: int, byOperator: int }),
   LessonQualityReport: obj({
@@ -229,6 +235,8 @@ const SCHEMAS: Record<string, JsonSchema> = {
     decidedBy: { type: 'string', description: "'loop:<v>', 'you' or 'operator:<name>'" },
     rollback: obj({ at: time, by: str, reason: nullable(str), note: nullable(str), cascade: arrayOf(str) }), ratifiedAt: time, ratifiedBy: str, syncHoldUntil: time,
     author: { type: 'string', enum: [...DECISION_AUTHORS], description: 'loop, or owner: a change you made through a decision (a conflict resolved), never calibrated or counted as the loop\'s' },
+    approveScore: { ...SCORE, description: 'Approve score 0-10 of a proposed loop decision (score is the loop\'s raw score): its type\'s calibrated p in its band, shrunk toward 5 with few labels; null unless proposed by the loop' },
+    scoreWhy: SCORE_WHY,
   }, ['id', 'type', 'projectKey', 'targets', 'before', 'after', 'evidence', 'features', 'score', 'confidence', 'tier', 'mode', 'rationale', 'model', 'policyVersion', 'status', 'dependsOn', 'createdAt']),
   DecisionNote: obj({ id: str, decisionId: str, ts: time, by: str, text: str, verdict: nullable({ type: 'string', enum: ['agree', 'disagree'] }), reason: str }, ['id', 'decisionId', 'ts', 'by', 'text']),
   DecisionSummary: obj({ id: str, type: str, status: str, createdAt: time, projectKey: nullable(str), label: str }),
@@ -273,11 +281,13 @@ const SCHEMAS: Record<string, JsonSchema> = {
     status: { type: 'string', enum: ['proposed', 'accepted', 'rejected', 'superseded'] }, decidedBy: nullable(str), decidedAt: nullable(str), factId: nullable(str),
     createdAt: time, run: nullable(str), sandbox: bool,
     conflicts: arrayOf(obj({ id: str, with: obj({ kind: str, id: str }) })),
+    score: SCORE, scoreWhy: SCORE_WHY,
   }, ['id', 'projectKey', 'docId', 'type', 'statement', 'quote', 'speakerId', 'status', 'factId', 'createdAt']),
   Question: obj({
     id: str, projectKey: nullable(str), docId: str, window: nullable(int), text: str, kind: { type: 'string', enum: ['unanswered', 'contradictory', 'needs_owner'] },
     quote: nullable(str), askedBy: nullable(str), assignee: nullable(str), status: { type: 'string', enum: ['open', 'assigned', 'answered', 'dismissed'] },
     answerClaimId: nullable(str), decidedBy: nullable(str), decidedAt: nullable(str), createdAt: time, run: nullable(str), sandbox: bool,
+    score: SCORE, scoreWhy: SCORE_WHY,
   }, ['id', 'projectKey', 'docId', 'text', 'kind', 'status', 'createdAt']),
   ConflictSide: obj({
     kind: { type: 'string', enum: ['claim', 'fact', 'lesson'] }, id: str, fingerprint: str, assertedAt: nullable(str), text: str, quote: nullable(str),
@@ -334,7 +344,7 @@ const routes = (a = appSchemas): Record<string, Partial<Record<Method, Route>>> 
   },
   '/api/agent/project': { GET: { tag: 'system', summary: 'Whether a folder (cwd) is a selected project (for the plugin hooks)', query: CwdQuery, response: 'the tracked project, or why not' } },
 
-  '/api/candidates': { GET: { tag: 'inbox', summary: 'Inbox items of the shown projects, a page at a time (X-Next-Offset); long texts cut to 500 characters and no diff hunk (the item itself has them)', query: a.ListQuery, response: 'Candidate[]' } },
+  '/api/candidates': { GET: { tag: 'inbox', summary: 'Inbox items of the shown projects, a page at a time (X-Next-Offset); long texts cut to 500 characters and no diff hunk (the item itself has them); each with its approve score; sort=score orders the first 500 matches by it', query: a.ListQuery, response: 'Candidate[]' } },
   '/api/candidates/{id}': { GET: { tag: 'inbox', summary: 'One Inbox item with its turn and surrounding conversation', response: 'CandidateDetail; 404 when missing or not shown' } },
   '/api/candidates/{id}/decision': { POST: { tag: 'inbox', summary: 'Confirm or reject one Inbox item', body: a.Decision, response: 'no content', status: 204 } },
   '/api/candidates/{id}/undo': { POST: { tag: 'inbox', summary: 'Undo an unchanged Inbox decision before post-mortem processing starts', body: z.object({ decidedAt: z.string().datetime() }), response: 'no content', status: 204 } },
@@ -343,7 +353,7 @@ const routes = (a = appSchemas): Record<string, Partial<Record<Method, Route>>> 
   '/api/feedback/{id}/retry': { POST: { tag: 'inbox', summary: 'Retry a given-up post-mortem', response: '{ queued: true }', status: 202 } },
   '/api/turns/requeue': { POST: { tag: 'inbox', summary: 'Re-queue the turns the classifier gave up on', response: '{ requeued: number }' } },
 
-  '/api/lessons': { GET: { tag: 'lessons', summary: 'Lessons of the shown projects (and global ones)', query: a.LessonQuery, response: 'Lesson[]' } },
+  '/api/lessons': { GET: { tag: 'lessons', summary: 'Lessons of the shown projects (and global ones), each with its approve score; sort=score orders them by it', query: a.LessonQuery, response: 'Lesson[]' } },
   '/api/lessons/{id}': {
     GET: { tag: 'lessons', summary: 'One lesson with its evidence', response: 'LessonDetail' },
     PATCH: { tag: 'lessons', summary: 'Approve, reject or edit a lesson', body: a.LessonPatch, response: 'LessonMutation' },
@@ -433,7 +443,7 @@ const routes = (a = appSchemas): Record<string, Partial<Record<Method, Route>>> 
   '/api/sessions/{id}/resummarize': { POST: { tag: 'sessions', summary: 'Rebuild a session summary from scratch', response: '{ queued: true }', status: 202 } },
   '/api/sessions/{id}/evidence': { GET: { tag: 'sessions', summary: 'What the tool saw in one session and decided: turns, the detector\'s call on each (and the skip rules), Inbox items with their post-mortem, miss and lesson, the context served (redacted)', response: 'SessionEvidence' } },
 
-  '/api/decisions': { GET: { tag: 'loop', summary: 'The learning loop\'s decisions, every status (the audit log), newest first, filtered; paged by offset (x-next-offset header)', query: loopSchemas.ListQuery, response: 'Decision[]' } },
+  '/api/decisions': { GET: { tag: 'loop', summary: 'The learning loop\'s decisions, every status (the audit log), newest first, filtered; paged by offset (x-next-offset header); a proposed one with its approve score (approveScore), and sort=score orders the first 500 matches by it', query: loopSchemas.ListQuery, response: 'Decision[]' } },
   '/api/decisions/{id}': { GET: { tag: 'loop', summary: 'One decision: its targets now, evidence resolved to lines with links, what it depends on and what depends on it, notes', response: 'DecisionDetail' } },
   '/api/decisions/{id}/approve': { POST: { tag: 'loop', summary: 'Approve a proposed or observed decision: it is applied; 409 when it is no longer in the status expected', body: loopSchemas.ActionBody, response: 'Decision & { noteError? }' } },
   '/api/decisions/{id}/reject': { POST: { tag: 'loop', summary: 'Reject a proposed or observed decision; 409 when it is no longer in the status expected', body: loopSchemas.ActionBody, response: 'Decision & { noteError? }' } },
@@ -460,14 +470,14 @@ const routes = (a = appSchemas): Record<string, Partial<Record<Method, Route>>> 
   },
 
   // Knowledge intake's review (intakeReview.ts): only while INTAKE_ENABLED; reads refuse the agent credential (API_TOKEN).
-  '/api/claims': { GET: { tag: 'intake', summary: 'Claims drawn from what people said, newest first, filtered; with the open conflicts naming each; paged by offset (x-next-offset header)', query: ir.ClaimsQuery, response: 'Claim[]' } },
+  '/api/claims': { GET: { tag: 'intake', summary: 'Claims drawn from what people said, newest first, filtered; with the open conflicts naming each and its approve score; paged by offset (x-next-offset header); sort=score orders the first 500 matches by it', query: ir.ClaimsQuery, response: 'Claim[]' } },
   '/api/claims/{id}': {
     GET: { tag: 'intake', summary: 'One claim: its fingerprint (for expect), who said it and its source\'s details', response: '{ claim, fingerprint, speaker, source }' },
     PATCH: { tag: 'intake', summary: 'Edit, re-type, accept or reject a claim; accepting one that is not an opinion files it as a project fact (origin claim); 409 when it changed since (expect) or is already a fact', body: ir.ClaimPatchBody, response: '{ claim, fact }' },
     DELETE: { tag: 'intake', summary: 'Delete one claim that is not accepted or superseded (409 otherwise), with the conflicts it is a side of; Activity names it without its text', response: 'no content', status: 204 },
   },
   '/api/claims/decisions': { POST: { tag: 'intake', summary: 'Accept or reject many claims, or every proposed claim of one source, each recorded on its own; one refused does not stop the rest', body: ir.ClaimDecisions, response: '{ results: [{ id, ok, status?, factId? | error? }] }' } },
-  '/api/questions': { GET: { tag: 'intake', summary: 'Questions a source left open, newest first, filtered; paged by offset (x-next-offset header)', query: ir.QuestionsQuery, response: 'Question[]' } },
+  '/api/questions': { GET: { tag: 'intake', summary: 'Questions a source left open, newest first, filtered; paged by offset (x-next-offset header); a question the loop proposes to assign or close carries an approve score, and sort=score orders the first 500 matches by it', query: ir.QuestionsQuery, response: 'Question[]' } },
   '/api/questions/{id}': {
     GET: { tag: 'intake', summary: 'One question with who asked it, who it is assigned to, its answer and its source\'s details', response: '{ question, askedBy, assignee, answer, source }' },
     PATCH: { tag: 'intake', summary: 'Assign a question to a person (null: unassign), reopen or dismiss it', body: ir.QuestionPatchBody, response: 'Question' },

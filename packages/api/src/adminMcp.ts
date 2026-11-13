@@ -133,19 +133,24 @@ export function page<T>(all: T[], a: { limit?: number; offset?: number }, row: (
 /** Cut a server string for a list row; the get tools give the whole thing. */
 const cut = (s: unknown, n: number) => (typeof s === 'string' ? (s.length > n ? `${s.slice(0, n - 1)}…` : s) : null);
 
+/** The approve score (0-10, null when not up for review) and its one-line why, as every list row carries it. */
+const scoreOf = (x: Record<string, any>, score: unknown = x.score) => ({ score: score ?? null, scoreWhy: x.scoreWhy ?? null });
+/** sort: score, the list tools' option (highest approve score first). */
+const Sort = { sort: z.enum(['score']).optional().describe('score: highest approve score first (the chance the owner approves, 0-10)') };
+
 /** An Inbox item as a list row: what to decide on, not the PR's description, diff or thread (inbox_get has those). */
 const inboxRow = (c: Record<string, any>) => ({
   id: c.id, projectKey: c.projectKey, source: c.source, status: c.status,
   label: c.classification?.label ?? null, confidence: c.classification?.confidence ?? null, summary: cut(c.classification?.summary, 240),
   ...(c.external && { author: c.external.author ?? null, authorKind: c.external.authorKind ?? null, title: cut(c.external.title, 120), url: c.external.url ?? null }),
-  createdAt: c.createdAt ?? null, decidedBy: c.decidedBy ?? null,
+  createdAt: c.createdAt ?? null, decidedBy: c.decidedBy ?? null, ...scoreOf(c),
 });
 
 /** A lesson as a list row: the rule cut short and its check flags by name (lesson_get has the evidence). */
 const lessonRow = (l: Record<string, any>) => ({
   id: l.id, status: l.status, projectKey: l.projectKey ?? null, scope: l.scope, title: cut(l.title, 160), rule: cut(l.rule, 300),
   cause: l.cause ?? null, paths: (l.paths ?? []).slice(0, 5), checks: l.checks ? l.checks.map((c: { name: string }) => c.name) : null,
-  createdAt: l.createdAt, decidedBy: l.decidedBy ?? null,
+  createdAt: l.createdAt, decidedBy: l.decidedBy ?? null, ...scoreOf(l),
 });
 
 /** A learning loop decision as a list row: what it does to what, how sure, and where it stands (decision_get has the rest). */
@@ -153,12 +158,14 @@ const decisionRow = (d: Record<string, any>) => ({
   id: d.id, type: d.type, status: d.status, tier: d.tier, mode: d.mode, projectKey: d.projectKey,
   target: (d.targets?.find((t: { role: string }) => t.role === 'primary') ?? d.targets?.[0])?.id ?? null,
   confidence: d.confidence, rationale: cut(d.rationale, 240), createdAt: d.createdAt, decidedBy: d.decidedBy ?? null,
+  // A decision's own `score` is the loop's raw score: its approve score comes as approveScore.
+  ...scoreOf(d, d.approveScore),
 });
 
 /** A claim as a list row: what was said, by whom (a Person id), and where it stands (claims_list). */
 const claimRow = (c: Record<string, any>) => ({
   id: c.id, projectKey: c.projectKey, type: c.type, status: c.status, statement: cut(c.statement, 300), quote: cut(c.quote, 200), speakerId: c.speakerId,
-  assertedAt: c.assertedAt, flags: c.flags, factId: c.factId, conflicts: (c.conflicts ?? []).map((k: { id: string }) => k.id),
+  assertedAt: c.assertedAt, flags: c.flags, factId: c.factId, conflicts: (c.conflicts ?? []).map((k: { id: string }) => k.id), ...scoreOf(c),
 });
 /** A conflict as a list row: both sides in a line each, and whether agents see them. */
 const conflictRow = (k: Record<string, any>) => ({
@@ -274,15 +281,16 @@ function buildServer(call: Call, sleep: (ms: number) => Promise<void>, intake: b
     return json({ jobs: [...jobs.values()], refused: results.filter((x) => !x.queued) });
   });
 
-  reg('inbox_list', 'Inbox items (flagged developer pushback; all statuses unless filtered), newest first, one compact row each: id, project, source, label, summary, author and link. inbox_get gives one item in full. Paged.', {
+  reg('inbox_list', 'Inbox items (flagged developer pushback; all statuses unless filtered), newest first, one compact row each: id, project, source, label, summary, author and link, and its approve score (0-10: the chance the owner confirms it) with why. inbox_get gives one item in full. Paged.', {
     status: z.enum(['pending', 'confirmed', 'rejected']).optional().describe('Omit for all statuses'),
     source: z.enum(FEEDBACK_SOURCES as [string, ...string[]]).optional().describe('Only items from this source'),
     project: z.string().min(1).max(MAX.key).optional(),
     pr: z.number().int().positive().optional(),
     author: z.string().trim().min(1).max(200).optional(),
+    ...Sort,
     ...Paging,
   }, READ, async (a) => {
-    const r = await call('GET', `/api/candidates${qs({ status: a.status, project: a.project, source: a.source, pr: a.pr, author: a.author, limit: LIST_MAX })}`);
+    const r = await call('GET', `/api/candidates${qs({ status: a.status, project: a.project, source: a.source, pr: a.pr, author: a.author, sort: a.sort, limit: LIST_MAX })}`);
     if (!r.ok) return fail(r);
     const all = r.data as Record<string, any>[];
     return json(page(all.filter((c) => !a.source || c.source === a.source), a, inboxRow, all.length >= LIST_MAX));
@@ -300,14 +308,15 @@ function buildServer(call: Call, sleep: (ms: number) => Promise<void>, intake: b
     }).strict()).min(1).max(500),
   }, write({ destructive: true }), async (a) => answer(await call('POST', '/api/candidates/decisions', { items: a.items })));
 
-  reg('lessons_list', 'Lessons learned from post-mortems, one compact row each (the rule cut short, check flags by name): proposed ones wait for the owner; approved ones reach agents. lesson_get gives one in full. Paged.', {
+  reg('lessons_list', 'Lessons learned from post-mortems, one compact row each (the rule cut short, check flags by name, approve score 0-10 with why): proposed ones wait for the owner; approved ones reach agents. lesson_get gives one in full. Paged.', {
     status: z.enum(['proposed', 'approved', 'rejected', 'revoked', 'superseded']).optional(),
     project: z.string().min(1).max(MAX.key).optional(),
     pr: z.number().int().positive().optional(),
     author: z.string().trim().min(1).max(200).optional(),
+    ...Sort,
     ...Paging,
   }, READ, async (a) => {
-    const r = await call('GET', `/api/lessons${qs({ status: a.status, project: a.project, pr: a.pr, author: a.author })}`);
+    const r = await call('GET', `/api/lessons${qs({ status: a.status, project: a.project, pr: a.pr, author: a.author, sort: a.sort })}`);
     return r.ok ? json(page(r.data as Record<string, any>[], a, lessonRow)) : fail(r);
   });
 
@@ -357,18 +366,19 @@ function buildServer(call: Call, sleep: (ms: number) => Promise<void>, intake: b
     id: z.string().min(1).max(MAX.id).describe('The session id'),
   }, READ, async (a) => answer(await call('GET', `/api/sessions/${enc(a.id)}/evidence`)));
 
-  reg('decisions_list', "The learning loop's decisions, newest first (the audit log: every status unless filtered), one compact row each: type, status, target, confidence, rationale. decision_get gives one in full. Paged.", {
+  reg('decisions_list', "The learning loop's decisions, newest first (the audit log: every status unless filtered), one compact row each: type, status, target, confidence, rationale, and a proposed one's approve score (0-10) with why. decision_get gives one in full. Paged.", {
     status: z.enum(DECISION_STATUSES).optional(),
     type: z.enum(DECISION_TYPES).optional(),
     project: z.string().min(1).max(MAX.key).optional(),
     target: z.string().min(1).max(MAX.id).optional().describe('Only decisions about this lesson, fact, miss or Inbox item id'),
     since: z.string().datetime({ offset: true }).refine(isoOffsetValid, { message: 'the offset must be within ±14:00' }).optional().describe('Created at or after (ISO time)'),
     q: z.string().trim().min(1).max(200).optional().describe('Text in the rationale or a target id'),
+    ...Sort,
     ...Paging,
   }, READ, async (a) => {
     const offset = a.offset ?? 0;
     const limit = a.limit ?? PAGE_DEFAULT;
-    const r = await call('GET', `/api/decisions${qs({ status: a.status, type: a.type, project: a.project, target: a.target, since: a.since, q: a.q, limit: limit + 1, offset })}`);
+    const r = await call('GET', `/api/decisions${qs({ status: a.status, type: a.type, project: a.project, target: a.target, since: a.since, q: a.q, sort: a.sort, limit: limit + 1, offset })}`);
     if (!r.ok) return fail(r);
     const rows = r.data as Record<string, any>[];
     const more = rows.length > limit;
@@ -434,13 +444,14 @@ function buildServer(call: Call, sleep: (ms: number) => Promise<void>, intake: b
       ...(a.participants && { participants: a.participants }), ...(a.origin && { origin: a.origin }),
     })));
 
-    reg('claims_list', 'Claims drawn from what people said, newest first, one compact row each (statement, quote, type, status, speaker, open conflicts). Paged.', {
+    reg('claims_list', 'Claims drawn from what people said, newest first, one compact row each (statement, quote, type, status, speaker, open conflicts, approve score 0-10 with why). Paged.', {
       status: z.enum(CLAIM_STATUSES).optional().describe('Default proposed'),
       type: z.enum(CLAIM_TYPES).optional(),
       project: z.string().min(1).max(MAX.key).optional(),
       source: z.string().min(1).max(MAX.id).optional().describe('One source (its doc id)'),
+      ...Sort,
       ...Paging,
-    }, READ, (a) => pagedList(call, '/api/claims', { status: a.status ?? 'proposed', type: a.type, project: a.project, source: a.source }, a, claimRow));
+    }, READ, (a) => pagedList(call, '/api/claims', { status: a.status ?? 'proposed', type: a.type, project: a.project, source: a.source, sort: a.sort }, a, claimRow));
 
     reg('claim_decide', "Accept, reject or edit a claim. Accepting one that is not an opinion files it as a project fact agents are given; as_fact false keeps it as an opinion (never given to agents). Off by default.", {
       id: z.string().min(1).max(MAX.id),
@@ -455,9 +466,10 @@ function buildServer(call: Call, sleep: (ms: number) => Promise<void>, intake: b
     reg('questions_list', 'Questions a source left open (unanswered, contradictory, needing an owner), newest first. Paged.', {
       status: z.enum(QUESTION_STATUSES).optional().describe('Default open'),
       project: z.string().min(1).max(MAX.key).optional(),
+      ...Sort,
       ...Paging,
-    }, READ, (a) => pagedList(call, '/api/questions', { status: a.status ?? 'open', project: a.project }, a, (q) => ({
-      id: q.id, projectKey: q.projectKey, kind: q.kind, status: q.status, text: cut(q.text, 300), quote: cut(q.quote, 200), askedBy: q.askedBy, assignee: q.assignee,
+    }, READ, (a) => pagedList(call, '/api/questions', { status: a.status ?? 'open', project: a.project, sort: a.sort }, a, (q) => ({
+      id: q.id, projectKey: q.projectKey, kind: q.kind, status: q.status, text: cut(q.text, 300), quote: cut(q.quote, 200), askedBy: q.askedBy, assignee: q.assignee, ...scoreOf(q),
     })));
 
     reg('question_answer', "Answer a question as the owner: the answer is an accepted claim, and one that is not an opinion is filed as a project fact agents are given. Off by default.", {
