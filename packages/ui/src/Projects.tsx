@@ -2,7 +2,7 @@ import { asIs, labelOf } from './labels.ts';
 import { useEffect, useRef, useState } from 'react';
 import { READ_ONLY_TITLE, useOwnerWrites } from './ownerAccess.tsx';
 import { hashModule, projectHref } from './links.ts';
-import { FACT_KINDS, UNSCORED_RELEVANCE, type FactEvidence, type FactKind } from '@fb/core/types';
+import { FACT_KINDS, FACT_ORIGINS_KEPT, UNSCORED_RELEVANCE, type FactEvidence, type FactKind, type FactOrigin, type OwnFactOrigin } from '@fb/core/types';
 import { relevanceBand, type RelevanceBand } from '@fb/core/relevance';
 import { ActivityEntry } from './Activity.tsx';
 import { CodeMap } from './CodeMap.tsx';
@@ -48,6 +48,13 @@ export const scanErrorText = (error: string) => error
 
 const LESSON_ORDER = ['approved', 'proposed', 'rejected', 'revoked', 'superseded'] as const;
 /** The lessons tile's hint: its count by status (they add up to it), and the global lessons the Lessons page also lists. */
+/** The facts tile's hint: every origin's count, so the parts add up to the tile; the kept origins only when there are some. */
+export function factsHint(by: Partial<Record<FactOrigin, number>>): string {
+  const kept: Record<OwnFactOrigin, string> = { you: 'you wrote', loop: 'the learning loop recorded', claim: 'from accepted claims' };
+  const extra = FACT_ORIGINS_KEPT.flatMap((o) => (by[o] ? [`, ${by[o]} ${kept[o]}`] : [])).join('');
+  return `${by.model ?? 0} from code models; ${by.manifest ?? 0} from manifests, ${by.document ?? 0} from documents${extra}`;
+}
+
 export function lessonsHint(p: Pick<ProjectSummary, 'lessonsByStatus' | 'globalLessons'>): string {
   const by = p.lessonsByStatus ?? {};
   const parts = LESSON_ORDER.filter((s) => by[s]).map((s) => `${by[s]} ${s}`);
@@ -304,7 +311,7 @@ export function Projects({ pollMs = 5000 }: { pollMs?: number } = {}) {
                 <StatTile label="feedback" value={current.feedback} hint="pushback flagged" />
                 <StatTile label="lessons" value={current.lessons} hint={lessonsHint(current)} />
                 {current.factsByOrigin
-                  ? <StatTile label="facts" value={current.facts} hint={`${current.factsByOrigin.model} from code models; ${current.factsByOrigin.manifest} from manifests, ${current.factsByOrigin.document} from documents${current.factsByOrigin.you ? `, ${current.factsByOrigin.you} you wrote` : ''}${current.factsByOrigin.loop ? `, ${current.factsByOrigin.loop} the learning loop recorded` : ''}`} />
+                  ? <StatTile label="facts" value={current.facts} hint={factsHint(current.factsByOrigin)} />
                   : <StatTile label="facts" value={current.facts} hint="extracted from the code" />}
               </StatGrid>
 

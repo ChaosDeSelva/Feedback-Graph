@@ -65,8 +65,8 @@ A **read-only install** has no tokens (one upgraded from before tokens existed, 
 |---|---|
 | `GET /api/health` | The API process is up (no dependencies). Open without `API_TOKEN`. |
 | `GET /api/ready` | The API can reach its store (Neo4j or Postgres). 503 otherwise. The body names the store: `{"ok": true, "store": "neo4j"}`. Used by the container health check, so it is open without `API_TOKEN` (it says nothing else). |
-| `GET /api/status` | Version, `store` (`neo4j` or `postgres`), whether it answers (`graph`), the worker's last heartbeat, last cycle, last error and models. `models` gives each job's model (`classify`, `postmortem`, `scan`, `summary`, `docs`, `chat`) with `ok` and, when it could not be asked, the `reason` (`SUMMARY_LLM=off` is reported as `off: true`, not as a problem); `givenUpTurns` counts turns the classifier gave up on. `ollama` says whether Ollama answers at `OLLAMA_URL` with the embedding model pulled (`url`, `ok`, `reason`); every embedding needs it, and while it does not answer each `ollama:` model is reported unavailable. `codeMaps` lists maps that are rebuilding, interrupted or failed, with `builtAt` and `checkedAt`. The UI header shows the same as a badge. |
-| `POST /api/turns/requeue` | Gives the turns the classifier gave up on another try (`{"requeued": n}`). Yours only, from the UI (Inbox, when it is empty); logged in Activity as **turns re-queued**. |
+| `GET /api/status` | Version, `store` (`neo4j` or `postgres`), whether it answers (`graph`), the worker's last heartbeat, last cycle, last error and models. `models` gives each job's model (`classify`, `postmortem`, `scan`, `summary`, `docs`, `chat`, `intake`) with `ok` and, when it could not be asked, the `reason` (`SUMMARY_LLM=off` is reported as `off: true`, not as a problem); `givenUpTurns` counts turns the classifier gave up on. `ollama` says whether Ollama answers at `OLLAMA_URL` with the embedding model pulled (`url`, `ok`, `reason`); every embedding needs it, and while it does not answer each `ollama:` model is reported unavailable. `codeMaps` lists maps that are rebuilding, interrupted or failed, with `builtAt` and `checkedAt`. `scans` lists the scans parked on a model that fails its readiness check (`parked`, with `since`) and those failed after 24 hours of it (`gaveUp`). `intake.enabled` says whether [knowledge intake](#knowledge-intake) is on. The UI header shows the same as a badge. |
+| `POST /api/turns/requeue` | Gives the turns the classifier gave up on another try (`{"requeued": n}`). Yours only, from the UI (Inbox, when it is empty); logged in Activity as **turns re-queued**. The worker does the same once at start when the classifier's model (its provider id, such as `ollama:gemma4`) or the version differs from the last start's, logged the same way. |
 | `docker compose ps` | Worker health comes from a heartbeat file the worker writes every 30 s (a timer, so long post-mortems do not look like a hang). |
 | `./scripts/doctor.sh` | One PASS / WARN / FAIL / SKIP line per check, exit 1 on any FAIL (`fg doctor` runs it too). See below. |
 
@@ -82,6 +82,7 @@ Logs are one JSON object per line (`docker compose logs -f worker api`). The API
 - **Ollama:** it answers, the models are pulled and structured output works with a real schema call.
 - **Inside the containers:** `host.docker.internal`, Ollama, the transcripts and Codex login mounts.
 - **Connections and code maps:** GitHub and Linear tokens as the api checks them; any code map with a failed or interrupted rebuild (a rebuild still writing is not a failure, unless the worker is not running).
+- **Scans:** a scan parked on a model that fails its readiness check is a WARN with since when; one failed after 24 hours parked is a FAIL with the reason.
 - **Agents:** an authenticated MCP initialization, as agents make it, so an `API_TOKEN` added or rotated without rerunning `install-agent.sh` shows up here instead of as 401s in every agent.
 
 ## Running it for more than one machine
@@ -253,6 +254,7 @@ The schema is created idempotently at startup. Read `CHANGELOG.md` for anything 
 - **Installs made with `--no-transcripts`:** before 0.7.6 their empty transcript folders were in `state/`, which the worker can change. After upgrading to 0.7.6 or later (0.8.0 included), run `./scripts/setup.sh --yes` once to move them to `.host/`; until then `./scripts/doctor.sh` fails with *transcripts: … is in state/* and names that command.
 - **Neo4j logs volume:** Neo4j's `/logs` is the named volume `neo4j-logs`. The first `up` after upgrading from an earlier version leaves the old anonymous logs volume behind once; `docker volume prune` removes unused anonymous volumes.
 - **Learning loop (0.8.0):** the first start of 0.8.0 seeds the loop's mode from `LOOP_MODE`, else `auto`. On an install with `API_TOKEN` or `FG_OWNER_TOKEN`, `auto` means housekeeping (linking repeated misses, merging duplicate lessons, re-ranking and retiring lessons) starts applying on its own, and agent-facing changes, approving lessons included, apply on their own once your verdicts on that type earn it ([The learning loop](#the-learning-loop)). To start cautiously, set `LOOP_MODE=observe` (record only) or `LOOP_MODE=propose` (ask you about everything) in `.env` before the first `up`; after that, Settings > Learning loop or `fg loop mode` decides, and `LOOP_DISABLED=1` stops it.
+- **0.8.3:** the first start re-reads every transcript once (to record each turn's hash and where a Claude Code session moved between folders), works out again the triggers the older rules derived (yours are never touched; expect most lessons to lose some) and rejects, as `repair:duplicate`, the pending Inbox items earlier versions filed twice. Activity lists each.
 - **Code map:** after an upgrade that changes the map rules, each selected project's map is rebuilt once. The first upgrade to a version with the code map also re-reads the selected projects' transcripts (to record which files each session touched; re-reading is idempotent). Both run beside ingest; expect the first cycle to take longer.
 
 ## Changing the embedding model
@@ -269,7 +271,7 @@ It is resumable: if it stops part way (a crash, Ollama going away), run it again
 
 ## Similarity thresholds
 
-Every similarity bar is in `packages/core/src/thresholds.ts`, with why it has its value. Two units: a **score** is what
+The bars below are in `packages/core/src/thresholds.ts`, each with why it has its value. Two units: a **score** is what
 the vector searches return, (1 + cos) / 2; a **cosine** is the plain cosine of two stored embeddings.
 
 | Bar | Unit | Value | What it gates |
@@ -277,11 +279,16 @@ the vector searches return, (1 + cos) / 2; a **cosine** is the plain cosine of t
 | `SERVE_BY_MEANING` | score | 0.78 | A miss, fact, doc or lesson found by meaning alone is served only at or above it. |
 | `DUPLICATE_FLAG` | cosine | 0.92 | Two lessons of one project are flagged `duplicate-of`. |
 | `AUTO_MERGE` | cosine | 0.95 | The learning loop merges two approved lessons on its own only at or above it. |
-| `NEAR_DUPLICATE_FROM` | cosine | 0.85 | From here up to `DUPLICATE_FLAG`, the loop asks its model whether two lessons say the same thing; a yes is a proposal. |
+| `NEAR_DUPLICATE_FROM` | cosine | 0.85 | From here up to `DUPLICATE_FLAG`, two lessons of one project in the same words, or that the loop's model says (yes or unsure) say the same thing, are proposed for a merge, never merged on their own; a no is remembered until either lesson changes. |
 | `INBOX_WORD_OVERLAP`, `INBOX_MERGE_MINUTES` | share, minutes | 0.6, 60 | An agent's report and a flagged turn are one Inbox item: the same session, or this share of words within this time. |
 | `INBOX_SEMANTIC_COSINE`, `INBOX_SEMANTIC_DAYS` | cosine, days | 0.85, 3 | The same, by meaning: a reworded or next-day report joins the item. |
+| `CLAIM_FACT_RELEVANCE` | relevance | 0.8 | Not a similarity: the relevance an accepted claim's fact is filed at until it is scored (everyday, so it is served on a task about it). |
 
-**Retrieval eval.** `node scripts/retrieval-eval.ts` (local Ollama only; `--model`, `--floor`, `--json`) runs the
+Other bars live beside their code: `MISS_MIN_SIMILARITY` (default 0.85, a score; [The judge](#the-judge)), the score a
+global lesson needs to be served on meaning alone (0.85, `lessonRank.ts`), and contradiction detection's candidate and
+judge bars ([Knowledge intake](#knowledge-intake)).
+
+**Retrieval eval.** `node scripts/retrieval-eval.ts` (local Ollama only; `--model`, `--url`, `--floor`, `--json`) runs the
 labelled acme corpus (`packages/core/src/testing/lessonCorpus.ts`: 30 lessons, 10 tasks, 2 of them nonsense) through
 the embedding model and the serving path, and prints precision and recall per task and overall, and how each floor
 separates the lessons that apply from the rest. Its run on 2026-11-12 with `nomic-embed-text`:
@@ -299,6 +306,13 @@ and 32 others. So 0.78 stays. `get_task_context` serves no lesson by meaning alo
 through its triggers or a named file), so its recall here is 0 by design; `search_graph` is where meaning matters. The
 duplicate, merge and Inbox bars are not measured by this corpus and keep their values.
 
+**Intake eval.** `node scripts/intake-eval.ts --llm ollama:gemma4` (repeat `--llm` to compare; only `ollama:<model>`
+and `claude-cli` are taken) runs knowledge intake and contradiction detection over the fictional fixture
+(`fixtures/intake`: eight sources, seeded knowledge and `expected.json`) on this machine, with no store, and prints
+claim and question precision and recall, planted-conflict recall, false conflicts per source, supersession accuracy,
+the judge's uncited rate, and the calls and seconds each phase took. `--score run.json` scores saved runs without a
+model, `--fixtures` names another fixture folder and `--json` writes the runs and their scores.
+
 ## Data controls
 
 - **Project selection:** you choose which project folders are read; nothing is read until you do. The choice is stored in the graph (`ProjectSelection`), so it survives restarts and both services see it. The worker lists every project folder under the roots each cycle (`GET /api/settings/projects`): each top-level folder, except that a folder which is not a git repo itself but holds git repos one or two levels down (`~/src/github.com/org/repo`, `~/code/client/app`) offers those repos instead, each a project of its own keyed by its path with `__` between the parts (`github.com__org__repo`). A session belongs to the deepest repo its cwd is in; one that ran in such a folder outside all of its repos belongs to the folder itself, which is then listed too. A top-level folder you already selected (or excluded) as a whole stays one project: unselect it to have its repos listed one by one. For each: whether it exists, is a git repo, its remote, how many Claude Code and Codex sessions ran in it and when it was last active. A session counts in every folder it was in: a Claude Code session from each record's cwd, a Codex session from its first lines and each later cwd switch (only the cwd is read from each line, and only the bytes added since the last pass are scanned). A session that ran only in a root itself or a folder above one (started in `~/Code`, never in one project's folder) is listed apart under **Outside the roots**: none of its turns is read, so start the agent in the project's folder. Folders that sessions ran in but that are gone are listed as missing; sessions outside every root are only counted (add a root to make them selectable). Selecting a folder reads its sessions from the next cycle; unselecting stops reading it and keeps its data. The selection gates ingest (Claude Code and Codex, per session, so a session that moved into a selected folder is read from there: the turns typed after it moved to another project's folder are stored as a session of that project, `<id>#2`), memory import, scans, GitHub sync and MCP context. A second clone of a project (an alias folder, or a folder whose remote an existing project already has) follows that project: it is read when that project is selected, ticking it selects that project, and it is never made an alias of a project you have not selected. A folder saved in your selection that has since become a clone, or been excluded, is dropped from the list when you next save (Activity says so) instead of blocking the save.
@@ -311,8 +325,8 @@ duplicate, merge and Inbox bars are not measured by this corpus and keep their v
   - **State:** each map records when it was built (`builtAt`) and when the worker last found it current (`checkedAt`); the Code map card shows the latter as **last checked**, as do `/api/status`, `fg status`, `get_task_context`, `get_module_context` and `impact`. A rebuild still writing is reported as rebuilding, and the old map stays in use meanwhile. A write whose worker was killed reads as interrupted within about 35 s (the write renews a lease while it runs) and is redone at the next pass. A failed rebuild keeps the old map and says why, with a next step.
   - **Rebuild by hand:** **Rebuild map** on the Code map card, `./scripts/fg map rebuild <key>`, or `POST /api/projects/<key>/codemap/rebuild` remaps the project from scratch at the worker's next pass.
 - **Reading the code map:** the Projects page shows each project's map (files, symbols, edges, last checked) and its hotspots, scored `4 × misses + log2(1 + churn) + log2(1 + dependents)` (misses: confirmed misses whose session edited the file; churn: commits in 90 days; dependents: files importing it). Patterns lists the top hotspots across the selected projects. The same data over HTTP, read-only: `GET /api/projects/<key>/codemap/hotspots?limit=50` (`{meta, capped, hotspots}`; `meta` is null before the first build; test files are left out unless `tests=1`), `GET /api/projects/<key>/codemap/graph?limit=60` (the Graph page's Code mode: the top files by score, their neighbours, edges, misses and lessons; `tests=1` too), `GET /api/projects/<key>/codemap/module?path=<repo path>` (404 when the file is in neither the map nor its import index; a file past the cap answers from the index with `outside: true` and no symbols), `GET /api/projects/<key>/codemap/impact?path=<a>&path=<b>&depth=3` (depth 1 to 5) and `GET /api/codemap/hotspots?limit=10[&project=<key>][&tests=1]`. All of them answer for selected projects only: any other key, or one in `EXCLUDE_PROJECTS`, is a 404 that says to choose it in Settings. Agents get it through MCP: `get_module_context` (for a file past the cap it parses the file's symbols on demand), `impact`, the code map section of `get_task_context` when they pass `files` (files the map does not hold on one line per reason; that call also serves the facts on the named files and their folders first, then at most three from elsewhere, and lists the AGENTS.md / CLAUDE.md files on the named files' path, nearest first, a named folder's own included and none that links to a secret file; a file name may have spaces, named in `files` or quoted in the task), and the `files_changed` check of `check_before_done`. A file the map does not hold (a new one, most often) still gets its lessons: `get_module_context` lists the approved lessons whose paths or path triggers cover it, then those closest to it by meaning at or above the similarity floor, marked *check it applies*; `get_task_context` and `check_before_done` add the lessons closest to the task by meaning, marked the same, when a named or changed file is not in the map. Each of those calls is logged in Activity as **context served** (or **pre-done check**) with the tool and paths.
-- **Lesson triggers:** each lesson can carry triggers (path globs, patterns for added lines, symbols) that bring it to a task or change that matches; edit them on the Lessons page (**Triggers**). Lessons whose triggers were worked out by older rules get them worked out again once, with no model, leaving those you set (Activity says how many triggers there were before and after). Lessons stored without triggers get them from the worker's backfill, a few per round once the post-mortems have nothing to do (it needs a post-mortem model), changing nothing else. The same pass suggests a broader "applies when" for a lesson flagged *"applies when" too narrow*; it is shown on the lesson with **Use it**, and never applied for you.
-- **Agent reports and the detector:** an agent's `report_feedback` (from `/postmortem`, or a miss the developer did not put in words) and the detector can flag the same miss. A report within 60 minutes of a flagged turn in the same project, whose words mostly match that turn's or that comes from the same session (`session_id`, optional), is merged into one Inbox item: reported after the detector, it is added to the detector's item; reported before, the detector moves the report's item onto the real turn (so the post-mortem sees the whole session) and drops the report's stand-in session. Since 0.9.1 both are also matched **by meaning**: each flagged turn and each report is embedded when it arrives, and one within cosine 0.85 of an item's (`INBOX_SEMANTIC_COSINE`) within 3 days (`INBOX_SEMANTIC_DAYS`) joins it, so a reworded complaint or the same one the next day is one item; a flagged turn close in meaning to a pending item of the same project joins it too. With the embedding model down, matching falls back to words and session. Items flagged before 0.9.1 have no embedding and match by words only. A report you already confirmed or rejected stays as it is, and the detector is recorded as a second source; a detector item you rejected is never merged into. Each Inbox item carries `origins` (`detector`, `agent`, or both) and the agent's `agentReport` (its words, what it had done, when, and its session id). The Inbox and Lessons label such items *agent report*.
+- **Lesson triggers:** each lesson can carry triggers (path globs, patterns for added lines, symbols) that bring it to a task or change that matches; edit them on the Lessons page (**Triggers**). Since 0.8.3 they come only from the lesson itself: its own paths, the file its comment was on, the files its fix edited and the code-shaped names its rule uses, never the files and code its post-mortem cited. A glob for a kind of file anywhere (`**/*.sql`) is kept only when the rule says it of every such file, and flagged *trigger fires repo-wide* (`broad-trigger`); on a task's words only a code-shaped symbol fires. Each code map rebuild checks approved lessons again: one whose path, glob or named function no longer matches the code is flagged *its code changed* (`code-changed`), never revoked for you. Lessons whose triggers were worked out by older rules get them worked out again once, with no model, leaving those you set (Activity says how many triggers there were before and after). Lessons stored without triggers get them from the worker's backfill, a few per round once the post-mortems have nothing to do (it needs a post-mortem model), changing nothing else. The same pass suggests a broader "applies when" for a lesson flagged *"applies when" too narrow*; it is shown on the lesson with **Use it**, and never applied for you.
+- **Agent reports and the detector:** an agent's `report_feedback` (from `/postmortem`, or a miss the developer did not put in words) and the detector can flag the same miss. A report within 60 minutes of a flagged turn in the same project, whose words mostly match that turn's or that comes from the same session (`session_id`, optional), is merged into one Inbox item: reported after the detector, it is added to the detector's item; reported before, the detector moves the report's item onto the real turn (so the post-mortem sees the whole session) and drops the report's stand-in session. Since 0.9.1 both are also matched **by meaning**: each flagged turn and each report is embedded when it arrives, and one within cosine 0.85 of an item's (`INBOX_SEMANTIC_COSINE`) within 3 days (`INBOX_SEMANTIC_DAYS`) joins it, so a reworded complaint or the same one the next day is one item; a flagged turn close in meaning to a pending item of the same project joins it too. With the embedding model down, matching falls back to words and session. Items flagged before 0.9.1 have no embedding and match by words only. The same words flagged twice in one session or PR thread while the first is still pending are one item too. A report you already confirmed or rejected stays as it is, and the detector is recorded as a second source; a detector item you rejected is never merged into. Each Inbox item carries `origins` (`detector`, `agent`, or both) and the agent's `agentReport` (its words, what it had done, when, and its session id). The Inbox and Lessons label such items *agent report*.
 - **Memory import:** Claude Code feedback memories (`type: feedback` notes in a selected project's memory folder) become project lessons with source `memory`. By default they are **proposed**: they wait in Lessons for your approval and are not served to agents until you approve them. `MEMORY_AUTO_APPROVE=true` approves them on import. A file that changes is imported again and updates its lesson until you edit, approve or reject that lesson; from then on the lesson is yours and a new version of the file never changes it. Each import is logged in Activity as **memory imported**.
 - **Instruction files in post-mortems:** a post-mortem reads `CLAUDE.md` and `AGENTS.md` in the project folder and in each parent folder up to the project root it is mounted under (folders above the mount are not visible to the worker), plus the session's Claude Code memory notes. Each is labelled by kind and by whether the session's agent loads it: Claude Code sessions load CLAUDE.md and memory, Codex sessions load AGENTS.md, and that agent's files are listed first. Only a loaded file counts as context the agent had (`context_available_ignored`). Codex's personal `~/.codex/AGENTS.md` is not mounted into the worker, so post-mortems do not see it. AGENTS.md is cited with its own kind (`agents_md`).
 - **Files touched by sessions:** ingest records which repo files each session read and edited (from Read, Edit, Write, MultiEdit, NotebookEdit and Codex patch calls), as paths relative to the project folder; paths outside it and secret files are dropped. A miss is linked to the files its session edited, and to where the fix landed (files edited after the feedback). That is what ranks a project's hotspots and scopes a post-mortem's lesson to files.
@@ -326,7 +340,7 @@ duplicate, merge and Inbox bars are not measured by this corpus and keep their v
   - **Not imported:** misses (their evidence is the transcript, which a bundle never holds; they come back when the project's sessions are read), document metadata (the bundle has no text; upload the doc again) and the code map (rebuilt from the code). The response counts them.
   - Projects in `EXCLUDE_PROJECTS` are never imported. Each import is logged in Activity as **bundle imported**, with what came in and what was skipped.
 - **Projects by git remote:** each project records its `origin` remote, normalized (`github.com/org/repo`, or `local/<name>` for a bare repo on disk; credentials, scheme, port and `.git` dropped). Only a folder that is itself the root of a git repo has one: a folder inside another repo does not inherit it. Existing projects get theirs on the next worker cycle, without re-reading transcripts. A folder that is not yet a project and has the same remote as an existing one is recorded as that project's alias: its sessions, and MCP calls from it, go to the existing project, and Activity logs a **project alias** entry. Projects that already existed separately are never merged. A folder with no remote works as before.
-- **Delete:** Projects page → **Delete project data…** (type the name). Removes every session, flag, decision, post-mortem, lesson, fact, code map, document and log entry for the project. Unselect it in Settings (or add it to `EXCLUDE_PROJECTS`) so new sessions are not read again.
+- **Delete:** Projects page → **Delete project data…** (type the name). Removes every session, flag, decision, post-mortem, lesson, fact, code map, document and log entry for the project, and its intake sources, claims, questions and the conflicts they or its facts and lessons are a side of (people are not per project: forget one on the Intake page's People tab). Unselect it in Settings (or add it to `EXCLUDE_PROJECTS`) so new sessions are not read again.
 
 ## Encrypted redaction archive
 
@@ -439,7 +453,8 @@ other for conflicts you settle. Agents only ever see the claims you accept.
   `find_contradictions`, `what_do_we_know` and `submit_notes` are not offered, and the worker's intake stages do not run. Turning it off
   again keeps what was stored; claims already accepted stay facts.
 - **Adding a source.** **Add a source** on the Intake page's Sources tab, or `POST /api/intake` with `projectKey`, `title` and `text` (txt, md, vtt or srt; up to 2,000,000
-  characters), and optionally `kind` (`transcript`, the default, `notes` or `doc`), `occurredAt`, `participants`,
+  characters), and optionally `kind` (`transcript`, the default, `notes` or `doc`), `format` (else read from the text
+  and `name`), `name` (the file it came from: sending the same file again replaces it), `occurredAt`, `participants`,
   `origin` and `private`. Over 64 chunks it answers 202 and is stored in the background. It is an owner route, reads
   included; the operator token may add sources under the `intake` verb (on by default), which is also how the admin
   MCP tool `intake_submit` reaches it. An agent hands you its notes with `submit_notes` (below).
@@ -459,8 +474,9 @@ other for conflicts you settle. Agents only ever see the claims you accept.
   | `SYNC_PEOPLE` | `false` | `true`: a synced claim fact names who said it; otherwise it says "a participant". Needs `SYNC_CLAIMS=true`. |
 
   `SYNC_CLAIMS` and `SYNC_PEOPLE` can also be set on Settings' Cloud sync tab (or `PUT /api/cloud/intake-sharing` with
-  `{claims, people}`, operator verb `settings`): that choice is stored and overrides `.env`'s, for both the api's Sync
-  now and the worker's schedule, and is logged in Activity (`cloud_settings_changed`). In `.env` they take only `true` or `false`; a value that breaks a rule above stops the services at
+  `{claims, people}`, operator verb `settings`; 409 while cloud sync or intake is off): that choice is stored and
+  overrides `.env`'s, for both the api's Sync now and the worker's schedule, and is logged in Activity
+  (`cloud_settings_changed`, by `you` or `operator:<name>`). In `.env` they take only `true` or `false`; a value that breaks a rule above stops the services at
   startup with a configuration error. The candidate threshold (cosine 0.72 to a neighbour, 0.85 to go to the judge
   with no differing value) is fixed, not a setting.
 - **Privacy.**
@@ -481,7 +497,8 @@ other for conflicts you settle. Agents only ever see the claims you accept.
 - **Deleting a source.** On the Sources tab, or `DELETE /api/intake/sources/:id?keep=facts|none` (the operator token
   needs `docs_delete`).
   - `keep=facts` (the default) removes the text, its chunks, the claims you have not accepted and its questions, and
-    its archived original in the redaction archive. Claims you accepted stay, as the facts they became.
+    its archived original in the redaction archive. Claims you accepted stay, as the facts they became, and so do
+    claims a settled conflict superseded.
   - `keep=none` also closes the facts its claims became. That is recorded as a `remove_source` decision by you on the
     Decisions page, and rolling it back re-opens them. Every claim from it goes whatever its status (with the
     conflicts it is a side of), the Activity entries about those claims lose their text, and the proposed people only
@@ -510,6 +527,8 @@ other for conflicts you settle. Agents only ever see the claims you accept.
   credential (`API_TOKEN`); the operator token reads it under the `intake` verb. `what_do_we_know` (read-only) gives an
   agent accepted knowledge only: no opinion, no unreviewed claim, no quote, no question, and an unaccepted side of a
   conflict is named, not quoted. `fg conflicts [--open]` lists conflicts with both sides, `fg conflicts show <id>` one.
+  Before stating something as settled, an agent can call `find_contradictions` (read-only, no model) with a statement
+  or topic: it lists the facts and approved lessons on that scope that may contradict it, and the open conflicts there.
 - **Agent notes.** `submit_notes` (MCP, not read-only) takes up to 200 KB and stores it as a private notes source marked
   `agent:<client>`. Its claims are only ever proposed and never accepted for you. It is untrusted input: its text is fenced
   as data like any source, a statement drawn from it that instructs an agent or holds a credential is dropped, and
@@ -544,7 +563,8 @@ With `FG_OPERATOR_TOKEN` set in `.env`, `http://localhost:8787/mcp/admin` gives 
 `OPERATOR_ALLOW` names as MCP tools, and the `fg` CLI makes the same calls from a shell. Both send the token as the
 Bearer; a bearer that matches neither `FG_OPERATOR_TOKEN` nor `API_TOKEN` is answered 401 on every route, reads included,
 and logged as `auth refused` (the token itself is never logged). By default the operator token cannot decide lessons,
-choose which projects are read, delete data, change settings or use Ask.
+claims or conflicts, choose which projects are read, delete data, change settings, import, use Ask or steer the
+learning loop.
 
 - **The token must be in the agent's own environment.** The agent reads it from the shell it was started in, not from
   Feedback Graph's `.env`. Export it there first, for example `export FG_OPERATOR_TOKEN="$(grep '^FG_OPERATOR_TOKEN=' .env | cut -d= -f2-)"`
@@ -561,9 +581,10 @@ choose which projects are read, delete data, change settings or use Ask.
   tools are missing. `codex exec` needs the same export.
 - **Claude Code.** `claude mcp add --transport http --scope user feedback-graph-admin http://localhost:8787/mcp/admin --header "Authorization: Bearer $FG_OPERATOR_TOKEN"`.
 - **Approvals.** The read tools (`pipeline_status`, `list_projects`, `inbox_list`, `inbox_get`, `lessons_list`,
-  `lesson_get`, `session_evidence`, `decisions_list`, `decision_get`, `loop_status`) say `readOnlyHint: true`, so a
-  client may run them without asking. The others do not, and `inbox_decide`, `lesson_decide`, `run_cleanup`,
-  `demo_remove`, `decision_decide` and `decision_rollback` also say `destructiveHint: true`.
+  `lesson_get`, `session_evidence`, `decisions_list`, `decision_get`, `loop_status`, and with intake `claims_list`,
+  `questions_list` and `conflicts_list`) say `readOnlyHint: true`, so a client may run them without asking. The others
+  do not, and `inbox_decide`, `lesson_decide`, `run_cleanup`, `demo_remove`, `decision_decide`, `decision_rollback` and
+  `conflict_resolve` also say `destructiveHint: true`.
 - **Lists are paged.** `list_projects`, `inbox_list` and `lessons_list` return 20 compact rows by default (`limit` up to
   200) with `total`, `more` and a note naming the `offset` of the next page. A row leaves out PR descriptions, diffs and
   long rules; `inbox_get` and `lesson_get` give one item in full. Every tool's answer is also in `structuredContent`.
@@ -582,8 +603,8 @@ Inbox decisions offer **Undo** while the decision is unchanged and no post-morte
 ## The learning loop
 
 The worker's learning loop decides on housekeeping (linking repeated misses, merging duplicate lessons, ranking,
-retiring lessons that never help) and proposes changes to what agents are told, which it may later make on its own;
-Decisions in the UI is its audit log.
+retiring lessons that never help, moving a lesson's paths from a renamed file to its new name) and proposes changes to
+what agents are told, which it may later make on its own; Decisions in the UI is its audit log.
 
 - **Mode.** `auto` by default: housekeeping applies on its own; an agent-facing change (approving, rejecting,
   rewording or narrowing a lesson, turning one into a fact) applies on its own only once your own reviews of that type
@@ -593,7 +614,9 @@ Decisions in the UI is its audit log.
   Since 0.9.1 Inbox triage (`triage_inbox`) is earned the same way, at τ 0.9 and from 30 of your reviews in the band;
   your reviews of its proposals from before count. It never confirms on its own an agent's report or an item from your
   own sessions, nor decides one whose words read as a risky command or instructions to an agent: those stay
-  proposals. The Decisions page's **needs you** view lists what waits, each with why. `fg loop mode propose` keeps every such
+  proposals. The Decisions page's **needs you** view lists what waits, each with why (`needsYou` on every proposed
+  decision). A proposal whose target you then change yourself expires: Activity has one line per change of yours
+  saying how many, and Decisions counts those of the last 7 days with **Show expired**. `fg loop mode propose` keeps every such
   change yours. `LOOP_MODE` seeds the mode on the first start;
   then Settings > Learning loop, `fg loop mode <off|observe|propose|auto> [--type t=m]` or the API decides. An install
   with no `API_TOKEN` and no `FG_OWNER_TOKEN` (or only blank ones) runs it at most in `observe`, since nobody could
@@ -610,7 +633,11 @@ Decisions in the UI is its audit log.
   `fg decisions rollback --since 24h` lists every decision applied in the last 24 hours (by when it was applied, so a
   call it observed earlier and applied today is in), and `--apply` rolls them back, newest applied first. A rollback refused because you changed the target since marks the decision *overridden*; `--restore-anyway`
   writes what it was before over your change.
-- **The operator token.** `loop_decide` (approve, reject, keep, roll back, notes) and `loop_settings` (mode, pause,
+- **Never merge.** Rolling back a merge of two lessons or two claims records the pair as not the same, and
+  `POST /api/distinct-pairs` (`{a, b, reason?}`, the Decisions page's **Never merge these two**) records one directly:
+  the loop never proposes merging that pair again, whatever the evidence. Only you lift one (`DELETE /api/distinct-pairs`,
+  **Lift**), never the operator token. `GET /api/distinct-pairs?ids=a,b` lists the records naming those ids.
+- **The operator token.** `loop_decide` (approve, reject, keep, roll back, notes, never-merge records) and `loop_settings` (mode, pause,
   resume) are off unless `OPERATOR_ALLOW` names them. A list there replaces the default verbs, so name them too
   (the 403 for a missing verb prints the whole line: what the token may do now, plus that verb). The operator's verdicts are kept on the decision but never count
   toward the loop earning auto-apply: only yours do.
@@ -781,8 +808,8 @@ A backup holds your own feedback, so keep the report and `--json` output on your
 | Badge says "worker offline" | `docker compose logs worker`: a config error is printed with every problem named. |
 | Post-mortems never finish | Inbox → Confirmed: each item says whether it is waiting, failed (with the error) or gave up, with a Retry button. |
 | "No approved lessons" for every task | `/api/status` and the logs: an embedding model mismatch stops the services with instructions. |
-| Ingest seems stuck on history | It classifies newest first; selecting fewer projects narrows it. Turns the model answers but cannot label are given up after 3 tries; the empty Inbox offers to re-queue them. |
-| Badge says "classifier unavailable" | The classifier's model could not be asked (not running, not pulled, unreachable, signed out, rate limited, timed out); the tooltip and `/api/status` give the reason. Classification pauses until it answers again, and no turn is charged a try for it. Fix the model (for Ollama: `ollama pull <model>`); the next cycle carries on. "post-mortem model unavailable" and "scan model unavailable" mean the same for those jobs: a post-mortem is not charged an attempt (and the rest of the batch waits), and a scan goes back in the queue (its error says why) instead of failing, is asked again every two minutes without being charged an attempt, and runs once the model answers. A scan that really fails is retried after 5, then 10 minutes and failed after its third attempt (Projects shows when it retries; asking for the scan again runs it at the next poll). An embedding model that is down counts the same way. "summaries paused" means the summary model (`SUMMARY_LLM`) could not be asked or built: no cursor moves and nothing is charged, and summaries carry on once it answers. |
+| Ingest seems stuck on history | It classifies newest first; selecting fewer projects narrows it. Turns the model answers but cannot label are given up after 3 tries (each a strict retry, then a short prompt); the empty Inbox offers to re-queue them, and the worker re-queues them itself at the next start after the classifier model or the version changes. |
+| Badge says "classifier unavailable" | The classifier's model could not be asked (not running, not pulled, unreachable, signed out, rate limited, timed out); the tooltip and `/api/status` give the reason. Classification pauses until it answers again, and no turn is charged a try for it. Fix the model (for Ollama: `ollama pull <model>`); the next cycle carries on. "post-mortem model unavailable" and "scan model unavailable" mean the same for those jobs: a post-mortem is not charged an attempt (and the rest of the batch waits), and a scan goes back in the queue (its error says why) instead of failing, is asked again every two minutes without being charged an attempt, and runs once the model answers. Before copying the repository a scan checks that its model is ready; when it is not, the scan is parked (Projects says since when) and checked again after 2 minutes, doubling up to 30. A scan parked for more than 24 hours is failed with the reason (Projects, `fg status`, doctor): fix the model or choose another, then scan again. One parked on the `SCAN_LLM` named before a restart runs on the new model at once. A scan that really fails is retried after 5, then 10 minutes and failed after its third attempt (Projects shows when it retries; asking for the scan again runs it at the next poll). An embedding model that is down counts the same way. "summaries paused" means the summary model (`SUMMARY_LLM`) could not be asked or built: no cursor moves and nothing is charged, and summaries carry on once it answers. |
 | Badge says "Ollama unreachable" or "Ollama model missing" | Every embedding needs Ollama: start it, or `ollama pull` the `OLLAMA_EMBED_MODEL`. On Linux, see [Linux](#linux). |
 | An agent hears "not in the code map" | The file is new, ignored, generated, not source, or over its size limit (`CODE_MAP_MAX_BYTES` for source, `SCAN_MAX_BYTES` otherwise); the map is rebuilt within five minutes of a repo change. The Code map card shows when it was last checked; **Rebuild map** remaps it now. |
 | Code map card says the last rebuild stopped part way or failed | The worker stopped while writing it, or the store refused it; the card gives the next step (for Neo4j transaction memory, see [Neo4j memory](#neo4j-memory)). **Rebuild map** or `fg map rebuild <key>` retries it. |

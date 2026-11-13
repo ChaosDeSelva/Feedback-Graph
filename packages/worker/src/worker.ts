@@ -16,6 +16,7 @@ import { CloudSyncSchedule } from './cloud/schedule.ts';
 import { EDITED_PATHS_LIMIT, MapStage } from './codegraph/stage.ts';
 import { runCycle } from './cycle.ts';
 import { classifyTurn } from './detect/classify.ts';
+import { requeueGivenUpOnClassifierChange } from './detect/requeueGivenUp.ts';
 import { codexSessionFiles } from './ingest/codex.ts';
 import { cachedRemote, commitsInWindow, projectRemote, worktreeGitArgs } from './ingest/git.ts';
 import { readLines } from './ingest/lines.ts';
@@ -639,6 +640,7 @@ export async function runWorker(io: WorkerIo): Promise<void> {
     migrateDeciders: () => migrateDeciderRule({ knowledge, cursors: docs, activity, log }),
     backfillProposedAs: () => backfillProposedAs({ knowledge, activity, cursors: docs, log }),
     repairs: () => runRepairs({ knowledge, graph: repo, activity, cursors: docs, sessions: store.sessions, log }),
+    requeueGivenUp: () => requeueGivenUpOnClassifierChange({ classifierId: classifier?.id, version: VERSION, queue: repo, cursors: docs, activity, log }),
     evidence,
     reconcileDecisions: () => reconcileInFlight(store, { embed }),
   });

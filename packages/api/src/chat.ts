@@ -28,6 +28,8 @@ const DOC_CHARS = 600;
 const SESSION_CHARS = 300;
 /** Files a miss's session edited named in the pack. */
 const MISS_FILES = 3;
+/** The symbols of a file past the map's cap the pack names, parsed on demand. */
+const OUTSIDE_SYMBOLS = 8;
 /** Mapped files of a named folder its lessons' path triggers are tried on. */
 const FOLDER_FILES = 200;
 
@@ -161,6 +163,12 @@ export async function buildChatContext(projectKey: string, question: string, his
     }
   }
 
+  // A file past the map's cap has no stored symbols, so they are parsed from it now, as file_context does.
+  const outsideSymbols = async (path: string): Promise<string> => {
+    const parsed = repoPath && d.context.parseSymbols ? await d.context.parseSymbols(repoPath, path).catch(() => null) : null;
+    if (!parsed) return '';
+    return parsed.length ? `; symbols read now: ${listed(parsed.map((x) => oneLine(x.name, 60)), OUTSIDE_SYMBOLS)}` : '; no symbols in it';
+  };
   const tags = new Map<CodeMapHit, string>();
   if (hits.length) {
     out.push('', '## Code map matches (symbols and files the question names, with where they are used and their tests)');
@@ -168,7 +176,7 @@ export async function buildChatContext(projectKey: string, question: string, his
       const ref = h.lines ? `${h.path}:${h.lines}` : h.path;
       const tag = src.add('code', ref, h.name ?? h.path);
       tags.set(h, tag);
-      const what = h.name ? `${h.symbolKind ?? 'symbol'} ${oneLine(h.name, 120)}${h.exported ? ' (exported)' : ''}` : h.outside ? 'file (outside the code map: no symbols)' : 'file';
+      const what = h.name ? `${h.symbolKind ?? 'symbol'} ${oneLine(h.name, 120)}${h.exported ? ' (exported)' : ''}` : h.outside ? `file (past the code map's cap${await outsideSymbols(h.path)})` : 'file';
       out.push(`${tag} ${code(ref)} ${what} · ${h.usages.length ? `used by: ${listed(h.usages)}${h.dependents > h.usages.length ? ` (${h.dependents} files import it)` : ''}` : 'no file imports it'} · ${h.tests.length ? `tests: ${listed(h.tests, 6)}` : 'no tests found'}`);
     }
   }

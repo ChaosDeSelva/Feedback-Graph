@@ -4,6 +4,31 @@ Each decision type is one file, `packages/worker/src/loop/types/<type>.ts`, expo
 `packages/worker/src/loop/plugin.ts`), listed in `packages/worker/src/loop/types/index.ts`. `link_misses.ts` is the
 reference implementation.
 
+## The types
+
+The engine runs them in this order (`LOOP_TYPES`). Tier, τ (the bar the 10th percentile of a type's calibrated Beta
+must clear to apply on its own) and labels needed are core's `LOOP_TYPE_INFO`.
+
+| Type | Tier, τ | What it does |
+|---|---|---|
+| `link_misses` | H, 0.5 | Records that a new miss repeats an earlier one of its project (`REPEATS`): the Patterns view only. |
+| `merge_duplicates` | H, 0.5 | Supersedes a lesson flagged `duplicate-of` into the lesson it repeats; near duplicates are proposed (below). |
+| `retire_lesson` | H, 0.5 | Revokes an approved lesson agents keep judging not applicable and that never caught a gap. |
+| `reject_lesson` | A, 0.85 | Rejects a proposed lesson a blocking check flags. |
+| `rank_weight` | H, 0.5 | Moves an approved lesson's serving weight one step (±0.1, within 0.5-1.5) toward its verdicts. |
+| `tune_threshold` | P | Proposes a project's own similarity and fact-rank floors from a replay of what was served. |
+| `narrow_scope` | A, 0.85 | Makes a global lesson its project's, or gives a lesson with no paths its fix's files. |
+| `approve_lesson` | A, 0.9 | Approves a proposed lesson. |
+| `reword_lesson` | A, 0.88 | Rewrites a lesson whose wording fails agents, or splits one that holds two lessons (τ +0.05 on an approved lesson). |
+| `record_fact` | A, 0.88 | Turns a lesson that states a fact into a project fact; proposes a fact you keep stating. |
+| `triage_inbox` | A, 0.9, 30 labels | Confirms or rejects a pending Inbox item ([below](#triage-earned-and-what-needs-you-091)). |
+| `link_claims`, `merge_claims` | H, 0.5 | Knowledge intake's housekeeping ([below](#knowledge-intakes-types-091)). |
+| `accept_claim` | A, 0.92 | Accepts a proposed fact or decision claim. |
+| `propose_resolution`, `assign_question`, `close_question` | P | Suggest how to settle a conflict, who should answer a question, and that a question is answered. |
+| `update_paths` | H, 0.5 | Moves a lesson's paths from a renamed file's old name to its new one ([below](#renamed-files-update_paths-091)). |
+
+`resolve_conflict` and `remove_source` are decision types too, but yours, never the loop's ([below](#decisions-only-you-make-resolve_conflict-remove_source)).
+
 ## What a type does, and what it does not
 
 A type only **finds calls**. Each round the engine (`loop/engine.ts`) hands it a read-only `LoopTypeContext`:
@@ -20,6 +45,7 @@ A type only **finds calls**. Each round the engine (`loop/engine.ts`) hands it a
 | `holdout` | `LOOP_HOLDOUT`. The engine drops a call on a lesson where `inHoldout(id, holdout)`; a type that asks the model checks it first, so no call is spent on a lesson the loop may never change. |
 | `recall(key)` | What this type returned under `key` in `remember` in an earlier round, or `null`. `reword_lesson` remembers a refused rewrite against the lesson's words, so it does not ask the model about the same text every round. |
 | `llm` | The loop's model (`LOOP_LLM`), metered by `LOOP_LLM_CALLS_PER_DAY`, or `null`. A call over budget throws `LoopBudgetSpent`: let it propagate. Fence anything you send it as data. |
+| `log(msg, extra?)` | The worker's log, for what the owner never sees (a model answer that could not be used). |
 
 It returns `{ candidates, scanned, skipped }`, and optionally `remember` (key → value, which the engine stores for `recall`). Everything after that is the engine's, the same for every type:
 suppression after a rollback, the holdout (a call on a lesson in `LOOP_HOLDOUT`'s control group is never made), the
@@ -60,7 +86,9 @@ pair that no longer repeats as `no_longer_a_repeat` (a neighbour that is not a r
    you or an operator set); count them as `SKIP.neverTarget`. Check `ctx.inScope(projectKey)` (`SKIP.outOfScope`).
 3. **Propose-only.** A call that passes the floors but must not apply on its own sets `proposeOnly` to the reason:
    `ownerTouchedRecently(await ctx.signals(id), ctx.now)` (14 days), or a type's own auto-only rule (merge_duplicates:
-   "both approved needs cosine ≥ .95 and paths ⊆ keeper's"). The engine then proposes it at most.
+   "both approved needs cosine ≥ .95 and paths ⊆ keeper's"). The engine then proposes it at most, and appends the reason
+   to the rationale ("Proposed rather than applied: …"), which is what the Decisions page shows as **Needs you**. A call
+   that may apply but only on a higher bar sets `tauRaise` instead (`reword_lesson` on an approved lesson: +0.05).
 4. **Snapshots.** `before` is each target as it is now, `after` as the decision leaves it, each with its fingerprint:
    `lessonFingerprint` / `factFingerprint` from `@fb/core` (fields in `LESSON_FINGERPRINT_FIELDS`), or `missLinkSnapshot`
    for a miss link. The executor writes `after` with `expect: before.fingerprint`, and a rollback restores `before`.
@@ -88,22 +116,25 @@ work the owner pushed back on, prompt-only, its data fenced, a call counted only
 ## Tiers and modes
 
 The tier, τ and prior are per type in `LOOP_TYPE_INFO`. Under `auto`, tier H applies when the 10th percentile of its
-calibrated Beta is at least τ (housekeeping starts trusted, at Beta(4,1)); tier A also needs 20 of the owner's own
-labels in that confidence band and stays within `LOOP_AUTO_PER_DAY` / `LOOP_AUTO_PER_PROJECT`; tier P is always a
-proposal. `observe` records `observed` decisions only; `propose` makes every call a proposal. A call observed in an earlier
+calibrated Beta is at least τ (housekeeping starts trusted, at Beta(4,1)); tier A starts at Beta(1,4), also needs 20 of
+the owner's own labels in that confidence band (a type's `minLabels`: 30 for `triage_inbox`) and stays within
+`LOOP_AUTO_PER_DAY` (5) / `LOOP_AUTO_PER_PROJECT` (2); tier P is always a proposal, and `PUT /api/loop/settings`
+refuses `auto` for it. `observe` records `observed` decisions only; `propose` makes every call a proposal. A call observed in an earlier
 round that a later round makes again under `propose` or `auto` moves on from it, recorded with the mode, score and
 confidence it is made with then: `mode` always says what the loop did (applied it, proposed it, only observed it).
 
 ## The near-duplicate band (0.9.1)
 
 `merge_duplicates` works on two kinds of pair. A lesson the re-check flagged `duplicate-of` (cosine ≥ `DUPLICATE_FLAG`,
-0.92) is merged by the rules above. A pair of the round's live lessons of one project with a cosine from
-`NEAR_DUPLICATE_FROM` (0.85) up to 0.92 is the middle band: exact and structural rules first (the same title and rule,
-case, punctuation and spacing ignored, need no model); otherwise the loop's model (`LOOP_LLM`, metered by
+0.92) is merged by the rules above. A pair of the round's live (proposed or approved) lessons of one project with a
+cosine from `NEAR_DUPLICATE_FROM` (0.85) up to 0.92 is the middle band. Two that say the same in the same words (title
+and rule, case, punctuation and spacing ignored) need no model; otherwise the loop's model (`LOOP_LLM`, metered by
 `LOOP_LLM_CALLS_PER_DAY`, at most 5 a round, `loop/nearDuplicate.ts`) answers yes, no or unsure to "do these two say the
-same thing?", fenced as data. Yes and unsure are a merge proposed for you (`proposeOnly`: never applied on its own),
-no is dropped (`judged_different`); each answer is remembered against both lessons' fingerprints, so an unchanged pair
-is never asked twice. The values are in `packages/core/src/thresholds.ts`.
+same thing?", fenced as data. Yes and unsure are a merge proposed for you (`proposeOnly`: never applied on its own; the
+approved lesson is kept, else the older), no is dropped (`judged_different`); each answer is remembered against both
+lessons' fingerprints, so an unchanged pair is never asked twice. With no `LOOP_LLM` the pair is skipped (`no_judge`).
+A never-merge pair (`distinct`) and a lesson in the holdout are never asked about. The values are in
+`packages/core/src/thresholds.ts`.
 
 ## Renamed files: `update_paths` (0.9.1)
 
@@ -118,10 +149,11 @@ proposed instead (the apply-time veto).
 ## Knowledge intake's types (0.9.1)
 
 Six types work on what knowledge intake drew from calls and notes. They read claims, questions and conflicts from
-`store.intake` (newest first, a page a round; a run's or a sandbox's never), and every one is refused for a claim
-`claimNeverTarget` (`types/guards.ts`) names: made in a run, your own answer to a question, from notes an agent
-submitted (`origin: agent:<client>`), or flagged `quote-fuzzy` or `statement-adds`. The engine checks that again at
-apply time (`applyTimeVeto`). **Choosing which side of a conflict is true is never automatic**: the only type that
+`store.intake` (newest first, a page a round; a run's or a sandbox's never). `link_claims`, `merge_claims` and
+`accept_claim` skip a claim `claimNeverTarget` (`types/guards.ts`) names: made in a run, your own answer to a question,
+from notes an agent submitted (`origin: agent:<client>`), or flagged `quote-fuzzy` or `statement-adds`; the engine checks
+every claim target again before it applies a call on its own (`applyTimeVeto`). The other three are tier P, so you see
+each call before it changes anything. **Choosing which side of a conflict is true is never automatic**: the only type that
 touches a conflict is tier P, and `PUT /api/loop/settings` refuses `auto` for every tier P type.
 
 | Type | Tier | What it does | Floors | Handler and rollback |
@@ -251,6 +283,6 @@ Types with their own handler:
 | `record_fact` | a fact the decision creates is added as the loop's (`addOwnerFact(..., { id, origin: 'loop' })`: no scan closes, replaces or re-checks it), then the generic write rejects the lesson; the fact is closed again when that fails. Rollback is the generic one (the fact closed, the lesson restored); a redo reopens the fact |
 | `resolve_conflict` | the fact and lesson targets through the generic write (a created reconciled fact under its planned id), then the claims and the conflict with the `SUPERSEDED_BY` links in one intake transaction (`IntakeStore.writeSnapshots`); the facts and lessons are moved back when that fails. Rollback is the reverse |
 
-`accept_claim` and `merge_claims` use `resolve_conflict`'s handler, `propose_resolution` wraps it (the conflict records the decision that settled it and who approved it), `link_claims` has its own (the CORROBORATES link, like `link_misses`), and `assign_question` and `close_question` share `question.ts`.
+`accept_claim`, `merge_claims` and `remove_source` use `resolve_conflict`'s handler, `propose_resolution` wraps it (the conflict records the decision that settled it and who approved it), `link_claims` has its own (the CORROBORATES link, like `link_misses`), and `assign_question` and `close_question` share `question.ts`. `update_paths` has its own: the lesson's fields written with its triggers, compared with `lessonPathsFingerprint` just before each write.
 
 `rank_weight`, `approve_lesson`, `narrow_scope` and `triage_inbox` have no handler of their own: `genericHandler`.

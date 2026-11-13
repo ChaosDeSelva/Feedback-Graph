@@ -40,6 +40,10 @@ For a local-only trial without your real transcripts or agent registration:
 
 Setup does not find or mount your Codex login. Keep `CODEX_AUTH_FILE` empty for Ollama and Claude providers. To use `codex-cli`, set `CODEX_AUTH_FILE=/absolute/path/to/.codex/auth.json` and `CODEX_RUNNER_URL=http://codex-runner:8790`, and add `codex` to `COMPOSE_PROFILES`. The login is mounted read-only: refresh it with Codex on the host, then recreate the runner if needed. Never set `ALLOW_UNCONFINED_CODEX` to get past onboarding. See [runner compatibility and its security trade-off](operations.md#docker-masked-system-paths-procfs-compatibility).
 
+## Knowledge intake
+
+Knowledge intake (call transcripts and notes read into claims) is off until you set `INTAKE_ENABLED=1` in `.env` and run `docker compose up -d`. It reads on the local model by default and sends what people said only to the providers in `INTAKE_PROVIDER_ALLOW` (`ollama,claude-cli` unless you widen it). `fg ingest` sends txt, md, vtt and srt as they are; for a pdf it needs `pdftotext` (poppler) and for a docx, odt, rtf, html or epub `pandoc` on the host, and says what to install when one is missing. See [operations](operations.md#knowledge-intake).
+
 ## Mac app
 
 `Feedback Graph.app` is a menu bar companion for one install. It runs that install folder's own commands, so it does what you would in a terminal there, and nothing else:

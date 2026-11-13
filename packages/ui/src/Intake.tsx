@@ -873,7 +873,8 @@ function SourcesTab({ project, projects, names, onShowClaims, onPeopleChanged }:
     setError(null);
     try {
       await intakeApi.rereadSource(s.id);
-      const queued = (x: IntakeSource): IntakeSource => ({ ...x, read: x.read && { ...x.read, status: 'pending', error: null }, intake: x.intake && { ...x.intake, windowsDone: 0 } });
+      // Only a full re-read (of a done source) starts from the first window; a retry goes on from where it stopped.
+      const queued = (x: IntakeSource): IntakeSource => ({ ...x, read: x.read && { ...x.read, status: 'pending', error: null }, intake: x.intake && (x.read?.status === 'done' ? { ...x.intake, windowsDone: 0 } : x.intake) });
       setItems((xs) => xs.map((x) => (x.id === s.id ? queued(x) : x)));
       setDetail((d) => (d && d.id === s.id ? { ...d, ...queued(d) } : d));
     } catch (e) { setError(errorMessage(e)); }
@@ -922,7 +923,10 @@ function SourcesTab({ project, projects, names, onShowClaims, onPeopleChanged }:
       actions={s && (
         <>
           <Button variant="primary" onClick={() => onShowClaims(s.id)}>Review its claims</Button>
-          <Button owner busy={pending === 'reread'} disabled={stateOf?.state === 'queued' || stateOf?.state === 'reading'} onClick={() => void reread()}>Read again</Button>
+          <Button owner busy={pending === 'reread'} disabled={stateOf?.state === 'queued' || stateOf?.state === 'reading'} onClick={() => void reread()}
+            title={stateOf?.state === 'done' ? 'A full re-read from the start: claims you accepted or rejected stay, undecided ones are replaced by what it finds now' : undefined}>
+            {stateOf?.state === 'done' ? 'Read again in full' : 'Read again'}
+          </Button>
           <Button variant="danger-outline" owner className="ml-auto" onClick={() => setDeleting(true)}>Delete</Button>
         </>
       )}

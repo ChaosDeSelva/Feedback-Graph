@@ -464,7 +464,7 @@ export function LearningLoop({ pollMs = 3000, statePollMs = 15_000 }: { pollMs?:
           <Card title="Holdout comparison">
             {state ? <Holdout state={state} /> : pending(2)}
           </Card>
-          {state && <p className="text-xs text-muted">Policy v{state.policyVersion}. Rollbacks and your notes lower the loop's confidence for their type; Keep and approvals raise it.</p>}
+          {state && <p className="text-xs text-muted">Policy v{state.policyVersion}. Rollbacks and edits lower the loop's confidence for their type; Keep and approvals raise it.</p>}
         </div>
       </ScrollArea>
     </div>

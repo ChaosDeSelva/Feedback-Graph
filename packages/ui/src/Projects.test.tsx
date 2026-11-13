@@ -1,6 +1,6 @@
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, beforeEach, expect, test, vi } from 'vitest';
-import { lessonsHint, Projects } from './Projects.tsx';
+import { factsHint, lessonsHint, Projects } from './Projects.tsx';
 import { heldAnswer } from './testing/heldAnswer.ts';
 
 const job = (status: string) => ({
@@ -1007,4 +1007,11 @@ test('the lessons tile says its count by status, adding up to it, and the global
   expect(lessonsHint({ lessonsByStatus: { approved: 138, proposed: 2, rejected: 144, revoked: 36, superseded: 1 }, globalLessons: 21 }))
     .toBe('learned here: 138 approved, 2 proposed, 144 rejected, 36 revoked, 1 superseded; 21 global lessons not counted (the Lessons page lists them under every project)');
   expect(lessonsHint({ lessonsByStatus: {}, globalLessons: 0 })).toBe('drawn from confirmed misses');
+});
+
+test('the facts hint counts every origin, claim facts included, so its parts add up to the tile', () => {
+  const by = { model: 3, manifest: 1, document: 0, you: 1, loop: 0, claim: 2 };
+  const hint = factsHint(by);
+  expect(hint).toBe('3 from code models; 1 from manifests, 0 from documents, 1 you wrote, 2 from accepted claims');
+  expect([...hint.matchAll(/(\d+) /g)].reduce((n, m) => n + Number(m[1]), 0)).toBe(Object.values(by).reduce((a, b) => a + b, 0));
 });

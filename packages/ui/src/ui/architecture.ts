@@ -30,12 +30,14 @@ const TEXT = {
   postmortem: ['Post-mortem', 'the miss, its cause, a lesson'],
   code: ['Your code', 'the project folders you choose'],
   codeMap: ['Code map', 'files, imports, tests, hotspots'],
-  facts: ['Facts and docs', 'uploads, linked projects, READMEs'],
+  facts: ['Facts and docs', 'accepted claims, uploads, READMEs'],
+  sources: ['Calls and notes', 'intake, opt-in: read into claims, questions and people'],
+  claims: ['Claims', 'you accept who said what, when', 'you'],
+  conflicts: ['Conflicts', 'you settle; disputed until then', 'you'],
   lessons: ['Lessons', 'you approve, or the loop once earned', 'you'],
   loop: ['Learning loop', 'reads outcomes, decides, applies', 'loop'],
-  graph: ['The graph: Neo4j or Postgres', 'feedback · misses · causes · lessons · facts · code map · decisions · activity', 'graph'],
+  graph: ['The graph: Neo4j or Postgres, read by every page', 'feedback · misses · causes · lessons · facts · claims · conflicts · code map · decisions · activity', 'graph'],
   decisions: ['Decisions', 'you keep, roll back or add a note', 'you'],
-  dashboard: ['Dashboard', 'every page reads the same graph'],
   work: ['Before work', 'get_task_context: lessons and code', 'agent'],
   done: ['Before “done”', 'check_before_done judges the diff', 'agent'],
 } satisfies Record<string, [string, string] | [string, string, Tone]>;
@@ -58,22 +60,24 @@ const arcPath = (x: number, y: number, arcX: number, arcY: number, toX: number, 
 /** Four columns, 1240 wide: docs/architecture.svg, and the Docs page where its column is 976px or wider. */
 function wideLayout(): Layout {
   const W = 1240;
-  const H = 690;
+  const H = 830;
   const GAP = 40;
   const BW = 264;
   const COL = [24, 24 + BW + GAP, 24 + 2 * (BW + GAP), 24 + 3 * (BW + GAP)];
   const BH = 72;
   const TALL = 84;
-  const ROW = [104, 244, 384, 536];
+  const ROW = [104, 244, 384, 524, 676];
+  // Row 3 is the graph's, taller than the rest.
+  const GRAPH = 3;
   const box = (c: number, r: number, name: Name, span = 1): Box => {
     const [title, sub, tone = 'plain'] = text(name);
-    const h = r === 2 ? TALL : BH;
+    const h = r === GRAPH ? TALL : BH;
     return { x: COL[c]!, y: ROW[r]!, w: BW * span + GAP * (span - 1), h, title: [title], sub: [sub], tone, titleY: ROW[r]! + h / 2 - 6 };
   };
   const mid = (c: number) => COL[c]! + BW / 2;
   const rowTop = (r: number) => ROW[r]!;
-  const rowBottom = (r: number) => ROW[r]! + (r === 2 ? TALL : BH);
-  const rowMid = (r: number) => ROW[r]! + (r === 2 ? TALL / 2 : BH / 2);
+  const rowBottom = (r: number) => ROW[r]! + (r === GRAPH ? TALL : BH);
+  const rowMid = (r: number) => ROW[r]! + (r === GRAPH ? TALL / 2 : BH / 2);
   const right = (c: number) => COL[c]! + BW;
   const ARC_Y = 50;
   let lx = COL[0]!;
@@ -88,32 +92,37 @@ function wideLayout(): Layout {
     font: { title: 19, sub: 14, label: 15 },
     boxes: [
       box(0, 0, 'sessions'), box(1, 0, 'flag'), box(2, 0, 'inbox'), box(3, 0, 'postmortem'),
-      box(0, 1, 'code'), box(1, 1, 'codeMap'), box(2, 1, 'facts'), box(3, 1, 'lessons'),
-      box(0, 2, 'loop'), box(1, 2, 'graph', 3),
-      box(0, 3, 'decisions'), box(1, 3, 'dashboard'), box(2, 3, 'work'), box(3, 3, 'done'),
+      box(0, 1, 'sources', 2), box(2, 1, 'claims'), box(3, 1, 'lessons'),
+      box(0, 2, 'code'), box(1, 2, 'codeMap'), box(2, 2, 'facts'),
+      box(0, 3, 'loop'), box(1, 3, 'graph', 3),
+      box(0, 4, 'decisions'), box(1, 4, 'conflicts'), box(2, 4, 'work'), box(3, 4, 'done'),
     ],
     arrows: [
       [right(0), rowMid(0), COL[1]!, rowMid(0)],
       [right(1), rowMid(0), COL[2]!, rowMid(0)],
       [right(2), rowMid(0), COL[3]!, rowMid(0)],
       [mid(3), rowBottom(0), mid(3), rowTop(1)],
-      [right(0), rowMid(1), COL[1]!, rowMid(1)],
-      [mid(1), rowBottom(1), mid(1), rowTop(2)],
+      [right(1), rowMid(1), COL[2]!, rowMid(1)],
       [mid(2), rowBottom(1), mid(2), rowTop(2)],
-      [mid(3), rowBottom(1), mid(3), rowTop(2)],
-      [right(0), rowMid(2) - 12, COL[1]!, rowMid(2) - 12],
-      [COL[1]!, rowMid(2) + 12, right(0), rowMid(2) + 12],
-      [mid(0) - 40, rowBottom(2), mid(0) - 40, rowTop(3)],
-      [mid(0) + 40, rowTop(3), mid(0) + 40, rowBottom(2)],
+      [right(0), rowMid(2), COL[1]!, rowMid(2)],
       [mid(1), rowBottom(2), mid(1), rowTop(3)],
       [mid(2), rowBottom(2), mid(2), rowTop(3)],
-      [mid(3), rowBottom(2), mid(3), rowTop(3)],
+      // Lessons pass the code row's empty fourth column on their way into the graph.
+      [mid(3), rowBottom(1), mid(3), rowTop(3)],
+      [right(0), rowMid(3) - 12, COL[1]!, rowMid(3) - 12],
+      [COL[1]!, rowMid(3) + 12, right(0), rowMid(3) + 12],
+      [mid(0) - 40, rowBottom(3), mid(0) - 40, rowTop(4)],
+      [mid(0) + 40, rowTop(4), mid(0) + 40, rowBottom(3)],
+      [mid(1), rowBottom(3), mid(1), rowTop(4)],
+      [COL[1]!, rowMid(4), right(0), rowMid(4)],
+      [mid(2), rowBottom(3), mid(2), rowTop(4)],
+      [mid(3), rowBottom(3), mid(3), rowTop(4)],
     ],
-    arc: arcPath(right(3), rowMid(3), W - 14, ARC_Y, mid(0), rowTop(0)),
+    arc: arcPath(right(3), rowMid(4), W - 14, ARC_Y, mid(0), rowTop(0)),
     labels: [
       { x: W / 2, y: ARC_Y - 12, text: ARC_LABEL },
-      { x: mid(0) - 48, y: rowBottom(2) + 39, text: 'records', anchor: 'end' },
-      { x: mid(0) + 48, y: rowBottom(2) + 39, text: 'your calls tune it', anchor: 'start' },
+      { x: mid(0) - 48, y: rowBottom(3) + 39, text: 'records', anchor: 'end' },
+      { x: mid(0) + 48, y: rowBottom(3) + 39, text: 'your calls tune it', anchor: 'start' },
     ],
     legend,
   };
@@ -149,11 +158,12 @@ function narrowLayout(): Layout {
   const subChars = (w: number) => Math.floor((w - 16) / 7);
   const place: [Name, number, number, number?][] = [
     ['sessions', 0, 0], ['flag', 1, 0], ['inbox', 2, 0],
-    ['code', 0, 1], ['postmortem', 2, 1],
-    ['codeMap', 0, 2], ['facts', 1, 2], ['lessons', 2, 2],
-    ['graph', 0, 3, 3],
-    ['loop', 0, 4], ['dashboard', 1, 4], ['work', 2, 4],
-    ['decisions', 0, 5], ['done', 2, 5],
+    ['code', 0, 1], ['sources', 1, 1], ['postmortem', 2, 1],
+    ['codeMap', 0, 2], ['claims', 1, 2], ['lessons', 2, 2],
+    ['facts', 1, 3],
+    ['graph', 0, 4, 3],
+    ['loop', 0, 5], ['work', 2, 5],
+    ['decisions', 0, 6], ['conflicts', 1, 6], ['done', 2, 6],
   ];
   const sized = place.map(([name, c, r, span = 1]) => {
     const [title, sub, tone = 'plain'] = text(name);
@@ -163,14 +173,14 @@ function narrowLayout(): Layout {
     // Title baselines 31 below the top and 22 apart; the subtitle's 24 below the title's and 18 apart; 14 under the last.
     return { c, r, w, title: t, sub: s, tone, h: 31 + (t.length - 1) * 22 + 24 + (s.length - 1) * 18 + 14 };
   });
-  // The arc's label wraps to two lines above the arc; the loop's two labels sit in the taller gap under row 4.
+  // The arc's label wraps to two lines above the arc; the loop's two labels sit in the taller gap under row 5.
   const ARC_Y = 62;
   const ROW: number[] = [];
   const rowH: number[] = [];
-  for (let r = 0, y = ARC_Y + 54; r < 6; r++) {
+  for (let r = 0, y = ARC_Y + 54; r < 7; r++) {
     ROW.push(y);
     rowH.push(Math.max(...sized.filter((b) => b.r === r).map((b) => b.h)));
-    y += rowH[r]! + (r === 4 ? 64 : 36);
+    y += rowH[r]! + (r === 5 ? 64 : 36);
   }
   // A box shorter than its row is as tall as the row, its words centred.
   const boxes: Box[] = sized.map((b) => ({ x: COL[b.c]!, y: ROW[b.r]!, w: b.w, h: rowH[b.r]!, title: b.title, sub: b.sub, tone: b.tone, titleY: ROW[b.r]! + (rowH[b.r]! - b.h) / 2 + 31 }));
@@ -179,7 +189,7 @@ function narrowLayout(): Layout {
   const rowBottom = (r: number) => ROW[r]! + rowH[r]!;
   const rowMid = (r: number) => ROW[r]! + rowH[r]! / 2;
   const right = (c: number) => COL[c]! + BW;
-  const legendY = rowBottom(5) + 44;
+  const legendY = rowBottom(6) + 44;
   const arcLines = wrapWords(ARC_LABEL, 50);
   return {
     w: W,
@@ -191,23 +201,27 @@ function narrowLayout(): Layout {
       [right(1), rowMid(0), COL[2]!, rowMid(0)],
       [mid(2), rowBottom(0), mid(2), rowTop(1)],
       [mid(0), rowBottom(1), mid(0), rowTop(2)],
+      [mid(1), rowBottom(1), mid(1), rowTop(2)],
       [mid(2), rowBottom(1), mid(2), rowTop(2)],
-      [mid(0), rowBottom(2), mid(0), rowTop(3)],
       [mid(1), rowBottom(2), mid(1), rowTop(3)],
-      [mid(2), rowBottom(2), mid(2), rowTop(3)],
-      [mid(0) - 28, rowBottom(3), mid(0) - 28, rowTop(4)],
-      [mid(0) + 28, rowTop(4), mid(0) + 28, rowBottom(3)],
+      // The code map and lessons pass the facts row's empty side columns on their way into the graph.
+      [mid(0), rowBottom(2), mid(0), rowTop(4)],
       [mid(1), rowBottom(3), mid(1), rowTop(4)],
-      [mid(2), rowBottom(3), mid(2), rowTop(4)],
+      [mid(2), rowBottom(2), mid(2), rowTop(4)],
       [mid(0) - 28, rowBottom(4), mid(0) - 28, rowTop(5)],
       [mid(0) + 28, rowTop(5), mid(0) + 28, rowBottom(4)],
+      [mid(1), rowBottom(4), mid(1), rowTop(6)],
       [mid(2), rowBottom(4), mid(2), rowTop(5)],
+      [mid(0) - 28, rowBottom(5), mid(0) - 28, rowTop(6)],
+      [mid(0) + 28, rowTop(6), mid(0) + 28, rowBottom(5)],
+      [COL[1]!, rowMid(6), right(0), rowMid(6)],
+      [mid(2), rowBottom(5), mid(2), rowTop(6)],
     ],
-    arc: arcPath(right(2), rowMid(5), W - 14, ARC_Y, mid(0), rowTop(0)),
+    arc: arcPath(right(2), rowMid(6), W - 14, ARC_Y, mid(0), rowTop(0)),
     labels: [
       ...arcLines.map((line, i) => ({ x: W / 2, y: ARC_Y - 12 - (arcLines.length - 1 - i) * 20, text: line })),
-      { x: mid(0) - 34, y: rowBottom(4) + 37, text: 'records', anchor: 'end' },
-      { x: mid(0) + 34, y: rowBottom(4) + 37, text: 'your calls tune it', anchor: 'start' },
+      { x: mid(0) - 34, y: rowBottom(5) + 37, text: 'records', anchor: 'end' },
+      { x: mid(0) + 34, y: rowBottom(5) + 37, text: 'your calls tune it', anchor: 'start' },
     ],
     // Two rows, the longest entry first, so the second column clears it.
     legend: [
@@ -275,7 +289,9 @@ const rules = (p: Palette) =>
 
 const DESCRIPTION =
   'Sessions and reviews flow through pushback flagging, your Inbox and a post-mortem into lessons that you approve (or the learning loop, once your reviews have earned it), alongside the code map and facts, all stored in one graph. ' +
-  'Agents get approved lessons before work and a check before done. The learning loop reads outcomes from the graph, records each decision for you to keep or roll back, and your calls tune it.';
+  'With knowledge intake on, calls and notes are read into claims; those you accept become facts. ' +
+  'Agents get approved lessons before work and a check before done. The learning loop reads outcomes from the graph, records each decision for you to keep or roll back, and your calls tune it. ' +
+  'Conflicts between what agents are told wait for you to settle, each choice a decision you can undo.';
 
 /**
  * The diagram as SVG markup. `tokens` uses the app's CSS variables (the Docs page); `static` carries light and dark colours

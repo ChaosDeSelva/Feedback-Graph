@@ -1,25 +1,28 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1240 690" role="img" aria-labelledby="fga-title fga-desc" style="font-family:ui-sans-serif,system-ui,-apple-system,'Segoe UI',sans-serif">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1240 830" role="img" aria-labelledby="fga-title fga-desc" style="font-family:ui-sans-serif,system-ui,-apple-system,'Segoe UI',sans-serif">
 <title id="fga-title">How Feedback Graph works</title>
-<desc id="fga-desc">Sessions and reviews flow through pushback flagging, your Inbox and a post-mortem into lessons that you approve (or the learning loop, once your reviews have earned it), alongside the code map and facts, all stored in one graph. Agents get approved lessons before work and a check before done. The learning loop reads outcomes from the graph, records each decision for you to keep or roll back, and your calls tune it.</desc>
+<desc id="fga-desc">Sessions and reviews flow through pushback flagging, your Inbox and a post-mortem into lessons that you approve (or the learning loop, once your reviews have earned it), alongside the code map and facts, all stored in one graph. With knowledge intake on, calls and notes are read into claims; those you accept become facts. Agents get approved lessons before work and a check before done. The learning loop reads outcomes from the graph, records each decision for you to keep or roll back, and your calls tune it. Conflicts between what agents are told wait for you to settle, each choice a decision you can undo.</desc>
 <style>.fga-bg{fill:#f2f1ec}.fga-t{fill:#1d1e20}.fga-s{fill:#66675f}.fga-a{stroke:#8a897f;fill:none}.fga-h{fill:#8a897f}.fga-plain{fill:#ffffff;stroke:#cbc8bd}.fga-you{fill:#fdf2d3;stroke:#c58a00}.fga-graph{fill:#e3ecfb;stroke:#2f6bd8}.fga-loop{fill:#eee7fb;stroke:#7c4ddb}.fga-agent{fill:#e2f3e8;stroke:#1f9d55}@media (prefers-color-scheme: dark){.fga-bg{fill:#161615}.fga-t{fill:#ecebe5}.fga-s{fill:#a3a299}.fga-a{stroke:#77766f;fill:none}.fga-h{fill:#77766f}.fga-plain{fill:#1e1e1c;stroke:#43433f}.fga-you{fill:#2f2814;stroke:#a87400}.fga-graph{fill:#172642;stroke:#4f84e6}.fga-loop{fill:#2a2140;stroke:#9b7cf0}.fga-agent{fill:#16301f;stroke:#34ad69}}</style>
 <defs><marker id="fga-head" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="fga-h"/></marker></defs>
-<rect class="fga-bg" width="1240" height="690" rx="12"/>
-<path d="M 1200 572 H 1214 Q 1226 572 1226 560 V 62 Q 1226 50 1214 50 H 168 Q 156 50 156 62 V 104" class="fga-a" stroke-width="2" stroke-dasharray="6 5" marker-end="url(#fga-head)"/>
+<rect class="fga-bg" width="1240" height="830" rx="12"/>
+<path d="M 1200 712 H 1214 Q 1226 712 1226 700 V 62 Q 1226 50 1214 50 H 168 Q 156 50 156 62 V 104" class="fga-a" stroke-width="2" stroke-dasharray="6 5" marker-end="url(#fga-head)"/>
 <line x1="288" y1="140" x2="328" y2="140" class="fga-a" stroke-width="1.6" marker-end="url(#fga-head)"/>
 <line x1="592" y1="140" x2="632" y2="140" class="fga-a" stroke-width="1.6" marker-end="url(#fga-head)"/>
 <line x1="896" y1="140" x2="936" y2="140" class="fga-a" stroke-width="1.6" marker-end="url(#fga-head)"/>
 <line x1="1068" y1="176" x2="1068" y2="244" class="fga-a" stroke-width="1.6" marker-end="url(#fga-head)"/>
-<line x1="288" y1="280" x2="328" y2="280" class="fga-a" stroke-width="1.6" marker-end="url(#fga-head)"/>
-<line x1="460" y1="316" x2="460" y2="384" class="fga-a" stroke-width="1.6" marker-end="url(#fga-head)"/>
+<line x1="592" y1="280" x2="632" y2="280" class="fga-a" stroke-width="1.6" marker-end="url(#fga-head)"/>
 <line x1="764" y1="316" x2="764" y2="384" class="fga-a" stroke-width="1.6" marker-end="url(#fga-head)"/>
-<line x1="1068" y1="316" x2="1068" y2="384" class="fga-a" stroke-width="1.6" marker-end="url(#fga-head)"/>
-<line x1="288" y1="414" x2="328" y2="414" class="fga-a" stroke-width="1.6" marker-end="url(#fga-head)"/>
-<line x1="328" y1="438" x2="288" y2="438" class="fga-a" stroke-width="1.6" marker-end="url(#fga-head)"/>
-<line x1="116" y1="468" x2="116" y2="536" class="fga-a" stroke-width="1.6" marker-end="url(#fga-head)"/>
-<line x1="196" y1="536" x2="196" y2="468" class="fga-a" stroke-width="1.6" marker-end="url(#fga-head)"/>
-<line x1="460" y1="468" x2="460" y2="536" class="fga-a" stroke-width="1.6" marker-end="url(#fga-head)"/>
-<line x1="764" y1="468" x2="764" y2="536" class="fga-a" stroke-width="1.6" marker-end="url(#fga-head)"/>
-<line x1="1068" y1="468" x2="1068" y2="536" class="fga-a" stroke-width="1.6" marker-end="url(#fga-head)"/>
+<line x1="288" y1="420" x2="328" y2="420" class="fga-a" stroke-width="1.6" marker-end="url(#fga-head)"/>
+<line x1="460" y1="456" x2="460" y2="524" class="fga-a" stroke-width="1.6" marker-end="url(#fga-head)"/>
+<line x1="764" y1="456" x2="764" y2="524" class="fga-a" stroke-width="1.6" marker-end="url(#fga-head)"/>
+<line x1="1068" y1="316" x2="1068" y2="524" class="fga-a" stroke-width="1.6" marker-end="url(#fga-head)"/>
+<line x1="288" y1="554" x2="328" y2="554" class="fga-a" stroke-width="1.6" marker-end="url(#fga-head)"/>
+<line x1="328" y1="578" x2="288" y2="578" class="fga-a" stroke-width="1.6" marker-end="url(#fga-head)"/>
+<line x1="116" y1="608" x2="116" y2="676" class="fga-a" stroke-width="1.6" marker-end="url(#fga-head)"/>
+<line x1="196" y1="676" x2="196" y2="608" class="fga-a" stroke-width="1.6" marker-end="url(#fga-head)"/>
+<line x1="460" y1="608" x2="460" y2="676" class="fga-a" stroke-width="1.6" marker-end="url(#fga-head)"/>
+<line x1="328" y1="712" x2="288" y2="712" class="fga-a" stroke-width="1.6" marker-end="url(#fga-head)"/>
+<line x1="764" y1="608" x2="764" y2="676" class="fga-a" stroke-width="1.6" marker-end="url(#fga-head)"/>
+<line x1="1068" y1="608" x2="1068" y2="676" class="fga-a" stroke-width="1.6" marker-end="url(#fga-head)"/>
 <g><rect x="24" y="104" width="264" height="72" rx="10" class="fga-plain" stroke-width="1.5"/>
 <text x="156" y="134" text-anchor="middle" class="fga-t" font-size="19" font-weight="600">Sessions and reviews</text>
 <text x="156" y="158" text-anchor="middle" class="fga-s" font-size="14">Claude Code, Codex, GitHub, Linear</text></g>
@@ -32,45 +35,51 @@
 <g><rect x="936" y="104" width="264" height="72" rx="10" class="fga-plain" stroke-width="1.5"/>
 <text x="1068" y="134" text-anchor="middle" class="fga-t" font-size="19" font-weight="600">Post-mortem</text>
 <text x="1068" y="158" text-anchor="middle" class="fga-s" font-size="14">the miss, its cause, a lesson</text></g>
-<g><rect x="24" y="244" width="264" height="72" rx="10" class="fga-plain" stroke-width="1.5"/>
-<text x="156" y="274" text-anchor="middle" class="fga-t" font-size="19" font-weight="600">Your code</text>
-<text x="156" y="298" text-anchor="middle" class="fga-s" font-size="14">the project folders you choose</text></g>
-<g><rect x="328" y="244" width="264" height="72" rx="10" class="fga-plain" stroke-width="1.5"/>
-<text x="460" y="274" text-anchor="middle" class="fga-t" font-size="19" font-weight="600">Code map</text>
-<text x="460" y="298" text-anchor="middle" class="fga-s" font-size="14">files, imports, tests, hotspots</text></g>
-<g><rect x="632" y="244" width="264" height="72" rx="10" class="fga-plain" stroke-width="1.5"/>
-<text x="764" y="274" text-anchor="middle" class="fga-t" font-size="19" font-weight="600">Facts and docs</text>
-<text x="764" y="298" text-anchor="middle" class="fga-s" font-size="14">uploads, linked projects, READMEs</text></g>
+<g><rect x="24" y="244" width="568" height="72" rx="10" class="fga-plain" stroke-width="1.5"/>
+<text x="308" y="274" text-anchor="middle" class="fga-t" font-size="19" font-weight="600">Calls and notes</text>
+<text x="308" y="298" text-anchor="middle" class="fga-s" font-size="14">intake, opt-in: read into claims, questions and people</text></g>
+<g><rect x="632" y="244" width="264" height="72" rx="10" class="fga-you" stroke-width="1.5"/>
+<text x="764" y="274" text-anchor="middle" class="fga-t" font-size="19" font-weight="600">Claims</text>
+<text x="764" y="298" text-anchor="middle" class="fga-s" font-size="14">you accept who said what, when</text></g>
 <g><rect x="936" y="244" width="264" height="72" rx="10" class="fga-you" stroke-width="1.5"/>
 <text x="1068" y="274" text-anchor="middle" class="fga-t" font-size="19" font-weight="600">Lessons</text>
 <text x="1068" y="298" text-anchor="middle" class="fga-s" font-size="14">you approve, or the loop once earned</text></g>
-<g><rect x="24" y="384" width="264" height="84" rx="10" class="fga-loop" stroke-width="1.5"/>
-<text x="156" y="420" text-anchor="middle" class="fga-t" font-size="19" font-weight="600">Learning loop</text>
-<text x="156" y="444" text-anchor="middle" class="fga-s" font-size="14">reads outcomes, decides, applies</text></g>
-<g><rect x="328" y="384" width="872" height="84" rx="10" class="fga-graph" stroke-width="1.5"/>
-<text x="764" y="420" text-anchor="middle" class="fga-t" font-size="19" font-weight="600">The graph: Neo4j or Postgres</text>
-<text x="764" y="444" text-anchor="middle" class="fga-s" font-size="14">feedback · misses · causes · lessons · facts · code map · decisions · activity</text></g>
-<g><rect x="24" y="536" width="264" height="72" rx="10" class="fga-you" stroke-width="1.5"/>
-<text x="156" y="566" text-anchor="middle" class="fga-t" font-size="19" font-weight="600">Decisions</text>
-<text x="156" y="590" text-anchor="middle" class="fga-s" font-size="14">you keep, roll back or add a note</text></g>
-<g><rect x="328" y="536" width="264" height="72" rx="10" class="fga-plain" stroke-width="1.5"/>
-<text x="460" y="566" text-anchor="middle" class="fga-t" font-size="19" font-weight="600">Dashboard</text>
-<text x="460" y="590" text-anchor="middle" class="fga-s" font-size="14">every page reads the same graph</text></g>
-<g><rect x="632" y="536" width="264" height="72" rx="10" class="fga-agent" stroke-width="1.5"/>
-<text x="764" y="566" text-anchor="middle" class="fga-t" font-size="19" font-weight="600">Before work</text>
-<text x="764" y="590" text-anchor="middle" class="fga-s" font-size="14">get_task_context: lessons and code</text></g>
-<g><rect x="936" y="536" width="264" height="72" rx="10" class="fga-agent" stroke-width="1.5"/>
-<text x="1068" y="566" text-anchor="middle" class="fga-t" font-size="19" font-weight="600">Before “done”</text>
-<text x="1068" y="590" text-anchor="middle" class="fga-s" font-size="14">check_before_done judges the diff</text></g>
+<g><rect x="24" y="384" width="264" height="72" rx="10" class="fga-plain" stroke-width="1.5"/>
+<text x="156" y="414" text-anchor="middle" class="fga-t" font-size="19" font-weight="600">Your code</text>
+<text x="156" y="438" text-anchor="middle" class="fga-s" font-size="14">the project folders you choose</text></g>
+<g><rect x="328" y="384" width="264" height="72" rx="10" class="fga-plain" stroke-width="1.5"/>
+<text x="460" y="414" text-anchor="middle" class="fga-t" font-size="19" font-weight="600">Code map</text>
+<text x="460" y="438" text-anchor="middle" class="fga-s" font-size="14">files, imports, tests, hotspots</text></g>
+<g><rect x="632" y="384" width="264" height="72" rx="10" class="fga-plain" stroke-width="1.5"/>
+<text x="764" y="414" text-anchor="middle" class="fga-t" font-size="19" font-weight="600">Facts and docs</text>
+<text x="764" y="438" text-anchor="middle" class="fga-s" font-size="14">accepted claims, uploads, READMEs</text></g>
+<g><rect x="24" y="524" width="264" height="84" rx="10" class="fga-loop" stroke-width="1.5"/>
+<text x="156" y="560" text-anchor="middle" class="fga-t" font-size="19" font-weight="600">Learning loop</text>
+<text x="156" y="584" text-anchor="middle" class="fga-s" font-size="14">reads outcomes, decides, applies</text></g>
+<g><rect x="328" y="524" width="872" height="84" rx="10" class="fga-graph" stroke-width="1.5"/>
+<text x="764" y="560" text-anchor="middle" class="fga-t" font-size="19" font-weight="600">The graph: Neo4j or Postgres, read by every page</text>
+<text x="764" y="584" text-anchor="middle" class="fga-s" font-size="14">feedback · misses · causes · lessons · facts · claims · conflicts · code map · decisions · activity</text></g>
+<g><rect x="24" y="676" width="264" height="72" rx="10" class="fga-you" stroke-width="1.5"/>
+<text x="156" y="706" text-anchor="middle" class="fga-t" font-size="19" font-weight="600">Decisions</text>
+<text x="156" y="730" text-anchor="middle" class="fga-s" font-size="14">you keep, roll back or add a note</text></g>
+<g><rect x="328" y="676" width="264" height="72" rx="10" class="fga-you" stroke-width="1.5"/>
+<text x="460" y="706" text-anchor="middle" class="fga-t" font-size="19" font-weight="600">Conflicts</text>
+<text x="460" y="730" text-anchor="middle" class="fga-s" font-size="14">you settle; disputed until then</text></g>
+<g><rect x="632" y="676" width="264" height="72" rx="10" class="fga-agent" stroke-width="1.5"/>
+<text x="764" y="706" text-anchor="middle" class="fga-t" font-size="19" font-weight="600">Before work</text>
+<text x="764" y="730" text-anchor="middle" class="fga-s" font-size="14">get_task_context: lessons and code</text></g>
+<g><rect x="936" y="676" width="264" height="72" rx="10" class="fga-agent" stroke-width="1.5"/>
+<text x="1068" y="706" text-anchor="middle" class="fga-t" font-size="19" font-weight="600">Before “done”</text>
+<text x="1068" y="730" text-anchor="middle" class="fga-s" font-size="14">check_before_done judges the diff</text></g>
 <text x="620" y="38" text-anchor="middle" class="fga-s" font-size="15" font-style="italic">Agents read approved lessons before they start, and check against them before they say “done”</text>
-<text x="108" y="507" text-anchor="end" class="fga-s" font-size="15" font-style="italic">records</text>
-<text x="204" y="507" text-anchor="start" class="fga-s" font-size="15" font-style="italic">your calls tune it</text>
-<rect x="24" y="645" width="16" height="16" rx="3" class="fga-you" stroke-width="1.5"/>
-<text x="48" y="658" class="fga-s" font-size="15">you decide</text>
-<rect x="164" y="645" width="16" height="16" rx="3" class="fga-graph" stroke-width="1.5"/>
-<text x="188" y="658" class="fga-s" font-size="15">stored</text>
-<rect x="273.6" y="645" width="16" height="16" rx="3" class="fga-loop" stroke-width="1.5"/>
-<text x="297.6" y="658" class="fga-s" font-size="15">learns on its own, every change audited</text>
-<rect x="634" y="645" width="16" height="16" rx="3" class="fga-agent" stroke-width="1.5"/>
-<text x="658" y="658" class="fga-s" font-size="15">what agents get (MCP)</text>
+<text x="108" y="647" text-anchor="end" class="fga-s" font-size="15" font-style="italic">records</text>
+<text x="204" y="647" text-anchor="start" class="fga-s" font-size="15" font-style="italic">your calls tune it</text>
+<rect x="24" y="785" width="16" height="16" rx="3" class="fga-you" stroke-width="1.5"/>
+<text x="48" y="798" class="fga-s" font-size="15">you decide</text>
+<rect x="164" y="785" width="16" height="16" rx="3" class="fga-graph" stroke-width="1.5"/>
+<text x="188" y="798" class="fga-s" font-size="15">stored</text>
+<rect x="273.6" y="785" width="16" height="16" rx="3" class="fga-loop" stroke-width="1.5"/>
+<text x="297.6" y="798" class="fga-s" font-size="15">learns on its own, every change audited</text>
+<rect x="634" y="785" width="16" height="16" rx="3" class="fga-agent" stroke-width="1.5"/>
+<text x="658" y="798" class="fga-s" font-size="15">what agents get (MCP)</text>
 </svg>

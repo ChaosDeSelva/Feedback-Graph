@@ -265,7 +265,7 @@ describe('deriveTriggers: no model', () => {
 describe('serving the fired lessons', () => {
   const hit = (kind: 'path' | 'pattern' | 'symbol', trigger: string) => ({ kind, trigger, on: 'x' });
   test('the most specific hit first: a name or line, then a glob in a folder, then a kind of file anywhere', () => {
-    expect([hitRank(hit('symbol', 'X_Y')), hitRank(hit('pattern', 'a\\(')), hitRank(hit('path', 'db/*.sql')), hitRank(hit('path', '**/*.sql'))]).toEqual([0, 0, 1, 2]);
+    expect([hitRank(hit('symbol', 'X_Y')), hitRank(hit('pattern', 'a\\(')), hitRank(hit('path', 'db/*.sql')), hitRank(hit('path', '**/*.sql')), hitRank(hit('path', '*.sql'))]).toEqual([0, 0, 1, 2, 2]);
   });
 
   test(`at most k, and at most ${KIND_ONLY_K} served by a kind of file alone`, () => {
@@ -276,6 +276,9 @@ describe('serving the fired lessons', () => {
     ];
     expect(servedTriggered(fired, 6).map((x) => x.id)).toEqual(['name', 'dir', 'k0', 'k1', 'k2']);
     expect(servedTriggered(fired, 2).map((x) => x.id)).toEqual(['name', 'dir']);
+    // A glob with no folder (`*.yaml`) is a kind of file too: it shares the cap rather than ranking as a place.
+    const slashless = [...Array.from({ length: 4 }, (_, i) => ({ id: `s${i}`, trigger: hit('path', '*.yaml') })), { id: 'dir', trigger: hit('path', 'deploy/*.yaml') }];
+    expect(servedTriggered(slashless, 6).map((x) => x.id)).toEqual(['dir', 's0', 's1', 's2']);
   });
 });
 

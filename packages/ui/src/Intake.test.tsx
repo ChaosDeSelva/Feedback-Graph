@@ -109,6 +109,24 @@ test('the Sources tab shows reading progress and the text with quoted spans mark
   await waitFor(() => expect(location.hash).toBe('#intake/claims?source=doc%3Ashop%3Aintake%3Acall'));
 });
 
+test('a source already read offers Read again in full, which posts the re-read and shows it queued', async () => {
+  location.hash = '#intake/sources';
+  const done = { ...source, read: { ...source.read, status: 'done' as const }, intake: { ...source.intake, windowsDone: 8 } };
+  const base = (fetch as unknown as { getMockImplementation: () => (url: string, init?: RequestInit) => Promise<Response> }).getMockImplementation();
+  vi.stubGlobal('fetch', vi.fn(async (url: string, init?: RequestInit) => {
+    if (url.endsWith('/reread')) { writes.push({ url, method: init!.method!, body: null }); return new Response(null, { status: 204 }); }
+    if (url.startsWith('/api/intake/sources/')) return Response.json({ ...done, text: 'Ana: hi', utterances: [], claims: [] });
+    if (url.startsWith('/api/intake/sources')) return Response.json([done]);
+    return base(url, init);
+  }));
+  render(<Intake />);
+  const button = await screen.findByRole('button', { name: 'Read again in full' });
+  expect(button.getAttribute('title')).toContain('accepted or rejected stay');
+  fireEvent.click(button);
+  await waitFor(() => expect(writes.map((w) => w.url)).toEqual(['/api/intake/sources/doc%3Ashop%3Aintake%3Acall/reread']));
+  expect((await screen.findAllByText('queued')).length).toBeGreaterThan(0);
+});
+
 test('Add a source posts the pasted text; it is private unless unticked, whatever its kind, and the list reloads', async () => {
   location.hash = '#intake/sources';
   render(<Intake />);

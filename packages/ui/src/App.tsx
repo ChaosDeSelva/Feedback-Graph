@@ -6,7 +6,7 @@ import { Dashboard } from './Dashboard.tsx';
 import { Decisions } from './Decisions.tsx';
 import { Docs } from './Docs.tsx';
 import { api, errorMessage, LOOP_CHANGED_EVENT, loopApi, NETWORK_EVENT, SIGN_IN_EVENT, type NetworkState, type SystemStatus } from './api.ts';
-import type { ModelHealth } from '@fb/core';
+import type { ModelHealth, ModelJob } from '@fb/core';
 import { RUNNER_OFF_FIX, runnerOffLine } from '@fb/core/types';
 import { FirstRun, stageLine } from './FirstRun.tsx';
 import { Graph } from './Graph.tsx';
@@ -183,7 +183,8 @@ class ViewBoundary extends Component<{ label: string; onReset: () => void; child
   }
 }
 
-const MODEL_NAME = { classify: 'classifier', postmortem: 'post-mortem model', scan: 'scan model', summary: 'summary model', docs: 'docs reader', chat: 'Ask model' } as const;
+// Every job named (satisfies): a job missing here would show its raw key, e.g. "intake unavailable".
+const MODEL_NAME = { classify: 'classifier', postmortem: 'post-mortem model', scan: 'scan model', summary: 'summary model', docs: 'docs reader', chat: 'Ask model', intake: 'intake reader' } as const satisfies Record<ModelJob, string>;
 
 function health(status: SystemStatus | null): Health | null {
   if (!status || !('workerHealthy' in status)) return null;

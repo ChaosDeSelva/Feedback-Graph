@@ -269,10 +269,14 @@ export function intakeRoutes(app: Hono, d: Deps) {
     app.post('/api/intake/sources/:id/reread', async (c) => {
       const id = c.req.param('id');
       const s = await find(id);
-      if (!s || !(await requeue(id))) return c.json({ error: 'not found, or not waiting to be read again' }, 404);
+      // A source already read is read again in full: its undecided claims and open questions are replaced, decided ones stay.
+      const full = s?.read?.status === 'done';
+      if (!s || !(await requeue(id, { again: true }))) return c.json({ error: 'not found, or being read now' }, 404);
       await d.activity?.record({
-        kind: 'source_read', actor: 'you', projectKey: s.projectKey,
-        subject: `asked for "${s.title}" to be read again`, why: 'its reading failed; the worker reads it again on its next cycle', details: {}, targets: [id],
+        kind: 'source_read', actor: currentActor(), projectKey: s.projectKey,
+        subject: `asked for "${s.title}" to be read again`,
+        why: full ? 'a full re-read: the worker reads it from the start on its next cycle; claims already accepted or rejected stay, the undecided ones are replaced' : 'its reading failed or is waiting to retry; the worker reads it again on its next cycle',
+        details: { full }, targets: [id],
       });
       return c.body(null, 204);
     });

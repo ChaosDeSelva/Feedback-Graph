@@ -97,7 +97,13 @@ describe('buildChatContext', () => {
     });
     const pack = await buildChatContext('demo-shop', 'do we have a modal component already?', [], d);
     expect(pack.sources.find((s) => s.kind === 'code')).toMatchObject({ ref: 'src/ui/ConfirmDialog.tsx' });
-    expect(pack.context).toMatch(/`src\/ui\/ConfirmDialog\.tsx` file \(outside the code map: no symbols\) · used by: `src\/App\.tsx`/);
+    expect(pack.context).toMatch(/`src\/ui\/ConfirmDialog\.tsx` file \(past the code map's cap\) · used by: `src\/App\.tsx`/);
+    // With the on-demand parser the pack lists the symbols read from the file now, never "no symbols".
+    const parsed = await buildChatContext('demo-shop', 'do we have a modal component already?', [], {
+      ...d, context: { ...d.context, parseSymbols: async (_root, rel) => [{ id: 's1', path: rel, name: 'ConfirmDialog', kind: 'function', exported: true, lines: '1-5' }] },
+    });
+    expect(parsed.context).toMatch(/`src\/ui\/ConfirmDialog\.tsx` file \(past the code map's cap; symbols read now: `ConfirmDialog`\) · used by/);
+    expect(parsed.context).not.toMatch(/no symbols/);
   });
 
   test('a fact from an uploaded document is a doc source; a fact whose lines are not a line range cites only its file', async () => {

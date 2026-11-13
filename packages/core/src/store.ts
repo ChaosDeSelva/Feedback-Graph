@@ -608,9 +608,10 @@ export interface DocsStore {
   requeueStaleDocs(): Promise<void>;
   /**
    * Your retry: a reading that failed (or is waiting out a retry) goes back to pending now, its attempts and error
-   * cleared. False when the doc is gone, is not an upload to read, or is being read or already read.
+   * cleared. False when the doc is gone, is not an upload to read, or is being read or already read. again: an
+   * intake source already read is read again from its first window (decided claims stay; undecided ones are replaced).
    */
-  requeueDocRead(id: string): Promise<boolean>;
+  requeueDocRead(id: string, o?: { again?: boolean }): Promise<boolean>;
   /** Queue an upload only if its retained original text or image is available, never masked text. */
   queueRedactionRepair(id: string): Promise<boolean>;
   githubDocChunks(id: string): Promise<string[] | null>;

@@ -38,7 +38,7 @@ function setup(o: { intake?: boolean; archive?: boolean; claims?: Partial<Claim>
       listDocs: async (key, f = {}) => [...docs.values()].map((x) => x.summary).filter((x) => x.projectKey === key && (!f.source || x.source === f.source) && (!f.ref || x.ref === f.ref)),
       deleteDoc: async (id) => { calls.push(`deleteDoc ${id}`); return docs.delete(id); },
       docText: async (id) => docs.get(id)?.chunks.join('\n\n') ?? null,
-      requeueDocRead: async (id) => docs.has(id),
+      requeueDocRead: async (id, opt) => { calls.push(`requeueDocRead ${id} ${JSON.stringify(opt ?? {})}`); return docs.has(id); },
     },
     activity: { removeRun: async () => 0, record: async (a) => { recorded.push(a); }, list: async () => [] },
     ...(o.intake !== false && {
@@ -167,6 +167,20 @@ test('a source reads back with its details, text, utterances and claim spans', a
   expect(one.utterances.map((u: { speaker: string }) => u.speaker)).toEqual(['Ana Lima', 'Bo']);
   expect(one.claims).toEqual([{ id: 'claim:1', type: 'decision', status: 'proposed', span: { utt: 0, start: 0, end: 10 } }]);
   expect((await app.request(`/api/intake/sources/${encodeURIComponent('doc:shop:upload:a.md')}`, send('GET'))).status).toBe(404);
+});
+
+test('Read again on a source already read queues a full re-read and says so; on a failed one, a retry', async () => {
+  const { app, docs, calls, recorded } = setup();
+  await app.request('/api/intake', send('POST', source()));
+  const id = 'doc:shop:intake:sync.vtt';
+  const reread = () => app.request(`/api/intake/sources/${encodeURIComponent(id)}/reread`, send('POST'));
+  docs.get(id)!.summary.read = { status: 'done' } as never;
+  expect((await reread()).status).toBe(204);
+  expect(calls).toContain(`requeueDocRead ${id} {"again":true}`);
+  expect(recorded.at(-1)).toMatchObject({ kind: 'source_read', actor: 'you', details: { full: true }, why: expect.stringContaining('full re-read') });
+  docs.get(id)!.summary.read = { status: 'failed' } as never;
+  expect((await reread()).status).toBe(204);
+  expect(recorded.at(-1)).toMatchObject({ details: { full: false }, why: expect.stringContaining('failed') });
 });
 
 test('only the owner, or the operator token with its verb, reaches intake: reads included', async () => {

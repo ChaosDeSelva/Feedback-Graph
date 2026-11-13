@@ -408,9 +408,9 @@ export function triggered<T extends { lesson: Pick<Lesson, 'triggers'> }>(items:
 
 /**
  * How specific a hit is: 0, a name or line the change uses; 1, a glob anchored in a folder; 2, a kind of file anywhere
- * (`**\/*.sql`), which fires on every change of that kind.
+ * (`**\/*.sql`, or `*.sql` with no folder: broadGlob), which fires on every change of that kind.
  */
-export const hitRank = (h: TriggerHit) => (h.kind !== 'path' ? 0 : h.trigger.startsWith('**/') ? 2 : 1);
+export const hitRank = (h: TriggerHit) => (h.kind !== 'path' ? 0 : broadGlob(h.trigger) ? 2 : 1);
 /** Of the lessons served by a kind of file alone, at most this many: on the dev set they were right one time in four. */
 export const KIND_ONLY_K = 3;
 

@@ -364,6 +364,9 @@ test('lesson_decide approves when OPERATOR_ALLOW names lesson_decide, attributed
   expect(r.isError).toBeFalsy();
   expect(s.calls.updateLesson[0]).toEqual(['l1', { status: 'approved' }, expect.objectContaining({ by: 'operator:codex' })]);
   expect(s.logged.at(-1)).toEqual(expect.objectContaining({ kind: 'lesson_decided', actor: 'operator:codex' }));
+  // An optional note goes with the decision, as the owner's PATCH takes it.
+  await tool(s.app, 'lesson_decide', { id: 'l1', decision: 'reject', note: 'duplicates the retry lesson' });
+  expect(s.calls.updateLesson[1]).toEqual(['l1', { status: 'rejected' }, expect.objectContaining({ by: 'operator:codex', note: 'duplicates the retry lesson' })]);
 });
 
 test('link_decide confirms a link', async () => {

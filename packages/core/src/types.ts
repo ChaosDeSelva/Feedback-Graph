@@ -962,7 +962,7 @@ export const SCAN_PARK_GAVE_UP = 'gave up after more than 24 hours parked on ';
 export const RUNNER_OFF_FIX = 'Its safety flag turned it off on this machine. Choose another scan model (SCAN_LLM, e.g. a local ollama: model) in .env, or fix the isolation failure and re-enable the runner: ./scripts/doctor.sh says how.';
 /** "Codex runner off: scans paused", naming the jobs that wait for it. */
 export function runnerOffLine(jobs: readonly string[]): string {
-  const named: Record<string, string> = { scan: 'scans', postmortem: 'post-mortems', docs: 'document reading', chat: 'Ask with Codex', classify: 'classifying', summary: 'summaries' };
+  const named: Record<string, string> = { scan: 'scans', postmortem: 'post-mortems', docs: 'document reading', chat: 'Ask with Codex', classify: 'classifying', summary: 'summaries', intake: 'intake reading' } satisfies Record<ModelJob, string>;
   return `Codex runner off: ${jobs.map((j) => named[j] ?? j).join(', ')} paused`;
 }
 

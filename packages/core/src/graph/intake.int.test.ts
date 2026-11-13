@@ -441,4 +441,27 @@ describeStores('IntakeStore', (h) => {
     expect((await h.store.docs.listDocs('shop', { source: 'upload' }))[0].title).toBe('ana@example.test');
     expect(await s.redactStoredIntake()).toEqual({ sources: 0, claims: 0, questions: 0 });
   });
+
+  test('a source already read is read again in full only when asked: from its first window, decided claims kept, undecided ones replaced', async () => {
+    const docId = await h.store.docs.upsertDoc({ projectKey: 'shop', source: 'intake', ref: 'again.vtt', title: 'again', url: null }, [{ text: 'Ana: retries wait 30 seconds', embedding: vec(9) }], { read: true });
+    await s.upsertMeta({ docId, kind: 'transcript', format: 'vtt', occurredAt: null, origin: null, private: false, participants: [] });
+    const { version } = (await s.nextWindow(docId))!;
+    await s.saveWindow(docId, { window: 0, version, total: 2, claims: [draft('Retries wait 30 seconds'), draft('Invoices go out at nine', { embedding: vec(4) })], questions: [] });
+    await s.saveWindow(docId, { window: 1, version, total: 2, claims: [], questions: [] });
+    expect(await h.store.docs.recordDocProgress(docId, version, { done: true })).toBe(true);
+    const [kept] = (await s.listClaims({ docId })).sort((a, b) => a.id.localeCompare(b.id));
+    await s.decideClaim(kept.id, { status: 'accepted' }, { by: 'you' });
+    // A retry leaves a done source alone; a full re-read queues it from window 0.
+    expect(await h.store.docs.requeueDocRead(docId)).toBe(false);
+    expect(await h.store.docs.requeueDocRead(docId, { again: true })).toBe(true);
+    expect(await s.nextWindow(docId)).toEqual({ window: 0, version });
+    expect((await h.store.docs.listDocs('shop', { source: 'intake' })).find((x) => x.id === docId)?.read).toMatchObject({ status: 'pending', attempts: 0, error: null });
+    // Window 0 read again finds only the first claim: the accepted one stays, the undecided one the reading no longer finds goes.
+    await s.saveWindow(docId, { window: 0, version, total: 2, claims: [draft('Retries wait 30 seconds')], questions: [] });
+    expect((await s.listClaims({ docId })).map((c) => [c.statement, c.status])).toEqual([['Retries wait 30 seconds', 'accepted']]);
+    // An upload that is not an intake source is never read again in full.
+    const upload = await h.store.docs.upsertDoc({ projectKey: 'shop', source: 'upload', ref: 'done.md', title: 'done', url: null }, [{ text: 'y', embedding: vec(1) }], { read: true });
+    await h.store.docs.saveDocReading(upload, { facts: [], source: 'p' });
+    expect(await h.store.docs.requeueDocRead(upload, { again: true })).toBe(false);
+  });
 });

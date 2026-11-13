@@ -14,6 +14,7 @@ Call `get_task_context` with your current working directory (`cwd`), a one or tw
 - Treat **approved lessons** as project rules for this task. They come from real corrections.
 - Read **similar past misses** as "this is what went wrong last time". Avoid repeating them.
 - **Recent sessions** say what earlier sessions in this project did and left open. When you are picking up or continuing earlier work, call `get_recent_sessions` with `cwd` for their full summaries. They are summaries a model wrote: check anything that matters against the code.
+- A lesson or fact marked `[disputed: <id>]` is one side of a conflict the developer has not settled, and the **Disputed** section says what each side holds: do not treat either side as settled; ask the developer when it matters.
 - If the tool says the directory is not a tracked project, carry on normally.
 
 ## When the developer pastes a prompt from Ask
@@ -24,8 +25,16 @@ lists (they are the same as the steps below).
 
 ## Before you change a file
 
-- A file you do not know well: call `get_module_context` with `cwd` and its `path`. It says what the file is, its exported symbols, who imports it, what it imports, the tests that cover it, and the lessons and past misses tied to it.
+- A file you do not know well: call `get_module_context` with `cwd` and its `path`. It says what the file is, its exported symbols, who imports it, what it imports, the tests that cover it, and the lessons and past misses tied to it. For a file the code map does not hold yet (a new one), it lists the lessons whose paths cover it and those close to it by meaning, marked "by meaning: check it applies": check each one does.
 - A file other code depends on (an exported function, a shared module, a type): call `impact` with `cwd` and the `paths` you will change. It lists every file that depends on them, the tests to run, and lessons and misses on all of them. Check those dependents and run those tests.
+
+## Knowledge intake tools
+
+When the developer has knowledge intake on, three more tools are offered:
+
+- `what_do_we_know` with `cwd` and a `topic`: what the developer accepted about it (decisions, plans and facts people stated, who said them and when, plus code facts and approved lessons), with open conflicts on them. Present a disputed point as disputed.
+- `find_contradictions` with `cwd` and a `statement` (or a `topic`, and `files` when it concerns some): before stating something as settled (a timeout, a version, a choice made), lists what may contradict it and the open conflicts there. No model is asked.
+- `submit_notes` with `cwd`, `notes` (up to 200 KB; lines like `Name: what they said` keep who said it), and optionally `title` and `occurred_at`: hands the developer notes worth keeping as a source to review. Nothing from it reaches agents until the developer accepts it.
 
 ## When you write tests or do QA
 
@@ -63,7 +72,7 @@ claude -p "..." \
 ```
 
 - The plugin's MCP server is named `fg`, so its tools are `mcp__plugin_feedback-graph_fg__<tool>` (for example `mcp__plugin_feedback-graph_fg__check_before_done`); the bare server name `mcp__plugin_feedback-graph_fg` allows all of them. Installed with `scripts/install-agent.sh claude` instead of the plugin, the server is `feedback-graph` (a second install's is `feedback-graph-<name>`): allow `mcp__feedback-graph` (or `mcp__feedback-graph-<name>`).
-- The tools are read-only (they are marked so) except `report_feedback`, which only queues an Inbox item for the developer. To allow less, list them one by one: `get_task_context`, `check_before_done`, `get_module_context`, `impact`, `search_graph`, `get_recent_sessions`, `report_feedback`.
+- The tools are read-only (they are marked so) except `report_feedback`, which only queues an Inbox item for the developer, and `submit_notes`, which only queues a source for the developer's review. To allow less, list them one by one: `get_task_context`, `check_before_done`, `get_module_context`, `impact`, `search_graph`, `get_recent_sessions`, `report_feedback`, and with knowledge intake on `what_do_we_know`, `find_contradictions`, `submit_notes`.
 - The hooks need no permission (they are not tool calls), but they need `node` on the PATH, `FEEDBACK_GRAPH_URL` (default `http://localhost:8787`) and, when the API has a token, `FEEDBACK_GRAPH_TOKEN` in the environment; the MCP server reads the same two. They also read `git rev-parse HEAD` once per session to know where the session started. `--bare` skips plugin hooks, so nothing asks for the check: call `check_before_done` yourself.
 - A plugin that is not installed can be loaded for one run with `--plugin-dir <path to this plugin folder>`.
 

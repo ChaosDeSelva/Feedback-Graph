@@ -60,7 +60,7 @@ x-env: &env
   LOOP_SYNC_HOLD_DAYS: ${LOOP_SYNC_HOLD_DAYS:-}
   LOOP_HOLDOUT: ${LOOP_HOLDOUT:-}
   LOOP_TYPES: ${LOOP_TYPES:-}
-  # Knowledge intake (0.9.0, off until it ships): INTAKE_ENABLED=1 turns it on. INTAKE_LLM reads what people said
+  # Knowledge intake (0.9.0, opt-in, off by default): INTAKE_ENABLED=1 turns it on. INTAKE_LLM reads what people said
   # (empty: DOCS_LLM, SCAN_LLM, then the local model); INTAKE_PROVIDER_ALLOW the providers it may go to (empty: ollama,
   # claude-cli, so no company API key); INTAKE_LLM_CALLS_PER_DAY its daily model calls (empty: 200); INTAKE_ARCHIVE=off
   # keeps no source's original text in the redaction archive.

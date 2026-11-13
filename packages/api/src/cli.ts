@@ -83,8 +83,9 @@ Usage:
   fg decisions rollback --since 24h [--type t] [--apply]   every decision applied since then, newest first: a preview unless --apply
   fg decisions note <id> "text" [--verdict agree|disagree] [--reason r]
   fg know "<question>" [--project k] [--kind decisions,plans,facts,opinions,lessons,questions] [--limit n]
-                                                 what is known about it: claims people made (who said it and when), facts,
-                                                 approved lessons, open questions and the conflicts on them (needs INTAKE_ENABLED)
+                                                 what is known about it: claims people made, accepted or not yet reviewed (who
+                                                 said it and when), facts, approved lessons, open questions and the open
+                                                 conflicts on them, closest first (default 30, at most 100; needs INTAKE_ENABLED)
   fg conflicts [list] [--open] [--project k] [--limit n]   conflicts between what agents are told, newest first (--open: only
                                                  those you have not settled); settle one on the Intake page's Conflicts tab
   fg conflicts show <id>                         both sides: what each says, who said it and when, whether agents see it
@@ -107,7 +108,7 @@ Usage:
 
 Options:
   --json           print the API's JSON instead of a table; a failure is { "error": "...", "status"? } on stdout
-  --wait           fg scan: follow each job until it is done or failed (exit 1 if any failed); progress (shard n of m,
+  --wait           fg scan: follow each job until it is done or failed (exit 1 unless all are done); progress (shard n of m,
                    facts so far) goes to stderr when it changes and at least every 30 s
   --open           fg conflicts: only the conflicts still open
   --private        fg ingest: never synced, even with SYNC_CLAIMS (the default for a transcript); --shared: not private
@@ -126,8 +127,8 @@ Environment:
   FEEDBACK_GRAPH_URL   where the API answers (default: localhost on this checkout's API_PORT)
   FG_OPERATOR_TOKEN    lets fg make owner decisions; the API allows only the verbs in OPERATOR_ALLOW (by default
                        not lesson_decide, select_projects, delete_project, docs_delete, links_delete, settings, import,
-                       integrations, chat, chat_delete, loop_decide, loop_settings). Writes are logged in Activity as
-                       operator:<name>.
+                       integrations, chat, chat_delete, loop_decide, loop_settings, claims_decide, conflict_decide). Writes
+                       are logged in Activity as operator:<name>.
   API_TOKEN            signs in for reading when FG_OPERATOR_TOKEN is not set
   FG_OPERATOR_NAME     the default for --as
   FG_RUN, FG_SANDBOX   the defaults for --run and --sandbox (FG_SANDBOX=1)`;
@@ -860,7 +861,7 @@ async function cloud(api: Api, io: CliIO, verb: string | undefined, f: Flags): P
 async function map(api: ReturnType<typeof client>, io: CliIO, words: string[], f: Flags): Promise<number> {
   const [verb, key] = words;
   if (verb !== 'rebuild' && verb !== 'drop') throw new UsageError('usage: fg map rebuild|drop <key>');
-  if (!key) throw new UsageError('fg map rebuild needs a project key (see fg projects list)');
+  if (!key) throw new UsageError(`fg map ${verb} needs a project key (see fg projects list)`);
   if (verb === 'drop') { const result = await api('DELETE', `/api/projects/${encodeURIComponent(key)}/codemap`, {}); io.out(f.json ? JSON.stringify(result) : `${key}: code map dropped; facts and transcripts retained`); return 0; }
   const r = await api<{ queued: boolean }>('POST', `/api/projects/${encodeURIComponent(key)}/codemap/rebuild`, {});
   io.out(f.json ? JSON.stringify({ key, ...r }) : `${key}: rebuild queued; the worker remaps it at its next pass (watch Activity for code_mapped)`);
@@ -1011,7 +1012,7 @@ type SourceView = { id: string; title: string; embed?: { status: string; error?:
  */
 async function ingestCmd(api: Api, io: CliIO, words: string[], f: Flags): Promise<number> {
   const [file] = words;
-  const usage = 'fg ingest <file|-> --project k [--kind transcript|notes|doc] [--date YYYY-MM-DD] [--participants "Ana,Bo"] [--private|--shared] [--wait]';
+  const usage = 'fg ingest <file|-> --project k [--kind transcript|notes|doc] [--date YYYY-MM-DD] [--participants "Ana,Bo"] [--title "..."] [--origin "..."] [--private|--shared] [--wait [--timeout s]]';
   if (!file || !f.project) throw new UsageError(usage);
   if (f.private && f.shared) throw new UsageError('--private and --shared: choose one');
   if (f.kind && !INTAKE_KINDS.includes(f.kind)) throw new UsageError(`--kind must be one of ${INTAKE_KINDS.join(', ')}`);

@@ -29,7 +29,7 @@ test('the Each page section says how to read the badges and numbers, one collaps
   render(<Docs />);
   const section = screen.getByRole('region', { name: 'Each page' });
   const pages = within(section);
-  expect(section.querySelectorAll('details')).toHaveLength(12);
+  expect(section.querySelectorAll('details')).toHaveLength(13);
   expect(pages.getByText(/confidence %/)).toBeTruthy();
   expect(pages.getByText(/approved by agent/)).toBeTruthy();
   expect(pages.getByText(/operator:<name>/)).toBeTruthy();
@@ -63,7 +63,7 @@ test('the Docs say the learning loop runs in auto by default and may approve les
 test('the page guides name the learning-loop metrics card and say Patterns lists only files a confirmed miss touched', () => {
   render(<Docs />);
   const pages = within(screen.getByRole('region', { name: 'Each page' }));
-  expect(pages.getByText('Learning-loop metrics').closest('li')!.textContent).toMatch(/gaps fixed per serving.*95% interval/);
+  expect(pages.getByText('Learning-loop metrics').closest('li')!.textContent).toMatch(/Gaps fixed per serving.*95% interval/);
   expect(pages.getByText(/files a confirmed miss touched, by hotspot score/)).toBeTruthy();
 });
 
@@ -252,7 +252,7 @@ test('the diagram is chosen by the column: four columns from 976px, three below,
   expect(narrow.className.split(' ')).toEqual(expect.arrayContaining(['min-w-[460px]', '@min-[976px]:hidden']));
   expect(wide.className.split(' ')).toEqual(expect.arrayContaining(['hidden', '@min-[976px]:block']));
   expect(narrow.querySelector('svg')!.getAttribute('viewBox')).toMatch(/^0 0 580 /);
-  expect(wide.querySelector('svg')!.getAttribute('viewBox')).toBe('0 0 1240 690');
+  expect(wide.querySelector('svg')!.getAttribute('viewBox')).toBe('0 0 1240 830');
   const cue = within(figure).getByText(/Scroll sideways/);
   expect(cue.className.split(' ')).toContain('@min-[460px]:hidden');
   // Both are in the page, so no id may repeat (the label, description and arrowhead each have one).

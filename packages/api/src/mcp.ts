@@ -115,7 +115,7 @@ function buildServer(ctx: ContextDeps, client: string | undefined) {
     {
       ...read('Module context'),
       description:
-        'Before changing a file you do not know well: what it is (code facts), its exported symbols, who imports it, what it imports, the tests that cover it, and approved lessons and past misses tied to it, with citations.',
+        'Before changing a file you do not know well: what it is (code facts), its exported symbols, who imports it, what it imports, the tests that cover it, and approved lessons and past misses tied to it, with citations. Not in the code map: lessons on its path, then the closest by meaning.',
       inputSchema: {
         ...where,
         path: z.string().max(1000).describe('The file (repo-relative, relative to cwd, or absolute inside the project)'),
@@ -144,7 +144,7 @@ function buildServer(ctx: ContextDeps, client: string | undefined) {
     {
       ...write('Report feedback'),
       description:
-        'When the developer runs /postmortem, or your work missed something the developer did not say in words (pushback they typed is picked up from the session on its own): queues it in the Feedback Graph inbox for the developer; once they confirm it, a post-mortem learns from it. A report of pushback already flagged from the session joins that inbox item.',
+        'When the developer runs /postmortem, or your work missed something the developer did not say in words (pushback they typed is picked up from the session on its own): queues it in the Feedback Graph inbox for the developer; once they confirm it, a post-mortem learns from it. A report of a miss already in the inbox, even reworded, joins that item.',
       inputSchema: {
         ...where,
         feedback: z.string().max(MAX.prose).describe("The developer's feedback, in their words"),
@@ -186,7 +186,7 @@ function buildServer(ctx: ContextDeps, client: string | undefined) {
       {
         ...read('Find contradictions'),
         description:
-          'Before stating something as settled (a timeout, a version, a choice made): checks it against the facts and approved lessons agents are told on that scope, with no model, and lists what may contradict it (numbers, dates, versions, negations or named choices that differ) and the open conflicts there, which the developer has not settled. Send statement (what you are about to say is true) or topic.',
+          'Before stating something as settled (a timeout, a version, a choice made): checks it against the facts and approved lessons agents are told on that scope, with no judge model (only an embedding), and lists what may contradict it (numbers, dates, versions, negations or named choices that differ) and the open conflicts there, which the developer has not settled. Send statement (what you are about to say is true) or topic.',
         inputSchema: {
           ...where,
           statement: z.string().max(MAX.query).optional().describe('What you are about to state as true, in one sentence'),
@@ -202,7 +202,7 @@ function buildServer(ctx: ContextDeps, client: string | undefined) {
         {
           ...read('What do we know'),
           description:
-            'What the developer has accepted about a topic: decisions, plans and facts people stated (who said it and when), the code facts and approved lessons agents are told, and the open conflicts on them, which are not settled: present a disputed point as disputed. Read-only; no model is asked.',
+            'What the developer has accepted about a topic: decisions, plans and facts people stated (who said it and when), the code facts and approved lessons agents are told, and the open conflicts on them, which are not settled: present a disputed point as disputed. No opinion, quote, unreviewed claim or open question; the 30 closest items. Read-only; no judge model is asked.',
           inputSchema: { ...where, topic: z.string().min(1).max(MAX.query).describe('What you want to know about, in plain words') },
         },
         safe(async (a) => text((await whatDoWeKnow({ ...a, client }, ctx)).markdown)),
@@ -213,7 +213,7 @@ function buildServer(ctx: ContextDeps, client: string | undefined) {
       {
         ...write('Submit notes'),
         description:
-          `Hand the developer notes worth keeping (what was decided, who said what, open questions) as a source to review: it is read into proposed claims, marked as submitted by an agent, and nothing from it reaches agents until the developer accepts it. Up to ${NOTES_MAX_BYTES / 1024} KB.`,
+          `Hand the developer notes worth keeping (what was decided, who said what, open questions) as a source to review: it is read into proposed claims, marked as submitted by an agent and kept private (never synced), and nothing from it reaches agents until the developer accepts it. Up to ${NOTES_MAX_BYTES / 1024} KB.`,
         inputSchema: {
           ...where,
           notes: z.string().min(1).max(NOTES_MAX_BYTES).describe('The notes, as text or markdown (lines like "Name: what they said" keep who said it)'),

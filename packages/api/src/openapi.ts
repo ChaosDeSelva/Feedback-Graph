@@ -385,7 +385,7 @@ const routes = (a = appSchemas): Record<string, Partial<Record<Method, Route>>> 
     GET: { tag: 'intake', summary: 'One source: its details, its text as the worker reads it, its utterances, and the span of each claim drawn from it', response: 'IntakeSourceDetail' },
     DELETE: { tag: 'intake', summary: 'Remove a source: its text, chunks, details, unaccepted claims and questions. keep=facts (default) keeps accepted claims and their facts; keep=none is refused (409) while any accepted claim is a fact', query: intakeSchemas.DeleteQuery, response: '{ removed }' },
   },
-  '/api/intake/sources/{id}/reread': { POST: { tag: 'intake', summary: 'Read a source whose reading failed again', response: 'no content', status: 204 } },
+  '/api/intake/sources/{id}/reread': { POST: { tag: 'intake', summary: 'Read a source again: a failed one is retried, one already read is read again in full (decided claims stay)', response: 'no content', status: 204 } },
   '/api/projects/{key}/links': { GET: { tag: 'links', summary: 'A project\'s links to other shown projects', response: 'ProjectLink[]' } },
   '/api/links': { PUT: { tag: 'links', summary: 'Confirm, dismiss or edit a link between two projects', body: a.LinkRequest, response: 'ProjectLink' } },
   '/api/links/{id}': { DELETE: { tag: 'links', summary: 'Remove a link', response: 'no content', status: 204 } },

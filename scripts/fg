@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# fg: drive Feedback Graph from a terminal or an agent (signin, status, projects, scans, Inbox, lessons, the demo, the
-# code map, links, facts, docs, activity, sessions, evidence, cleanup, the learning loop and its decisions, cloud sync,
-# integrations).
+# fg: drive Feedback Graph from a terminal or an agent (signin, status, the pipeline, projects, scans, Inbox, lessons,
+# the demo, the code map, links, facts, docs, activity, sessions, evidence, cleanup, the learning loop and its decisions,
+# knowledge intake (ingest, know, conflicts), cloud sync, integrations).
 #   ./scripts/fg --help
 #   ./scripts/fg status --until idle --timeout 600
 #   ./scripts/fg projects select --key acme,demo-shop
@@ -12,7 +12,9 @@
 #
 # Owner decisions need FG_OPERATOR_TOKEN (from the environment, else .env); the API allows only the verbs OPERATOR_ALLOW
 # names (by default not deciding lessons, choosing projects, deleting data, settings, importing, integration keys, asking or
-# deleting chats in Ask, or deciding on or configuring the learning loop: loop_decide, loop_settings). The token is passed to the CLI in its environment, never printed.
+# deleting chats in Ask, deciding on or configuring the learning loop: loop_decide, loop_settings, or deciding claims and
+# conflicts in knowledge intake: claims_decide, conflict_decide). The token is passed to the CLI in its environment, never
+# printed.
 # Runs packages/api/src/cli.ts with the host's Node (22.18+ or 23.6+, which run TypeScript natively); without one, inside
 # the api container (docker compose exec api node src/cli.ts ...), which has the same settings from .env: only in a
 # checkout that is set up and whose Compose name is not another folder's.

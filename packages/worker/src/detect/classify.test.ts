@@ -62,8 +62,29 @@ test('returns null on an invalid label, after asking once more with a stricter i
   const systems: string[] = [];
   const chat = async (o: { system: string }) => { systems.push(o.system); return { label: 'banana', confidence: 1, summary: '' }; };
   expect(await classifyTurn(turn, deps(chat as never))).toBeNull();
-  expect(systems).toHaveLength(2);
+  expect(systems).toHaveLength(3);
   expect(systems[1]).toContain(STRICT_JSON);
+  expect(systems[2].length).toBeLessThan(systems[0].length / 2);
+});
+
+test('a model that answers in prose gets its JSON read out, and after two prose answers a short prompt is tried', async () => {
+  const prose = 'Looking at this message, the developer is clearly unhappy with the client-side approach, so I would call it pushback.';
+  const asked: { system: string; user: string }[] = [];
+  const answers: unknown[] = [prose, `${prose} Final:`, 'Sure.\n```json\n{"label":"pushback","confidence":0.9,"summary":"wants server-side"}\n```'];
+  const chat = async (o: { system: string; user: string }) => { asked.push(o); return answers.shift(); };
+  expect(await classifyTurn(turn, deps(chat as never))).toMatchObject({ label: 'pushback', summary: 'wants server-side' });
+  expect(asked).toHaveLength(3);
+  expect(asked[2].user).toContain(turn.text);
+  expect(asked[2].user).not.toContain("AGENT'S TOOL CALLS");
+
+  const inline = async () => `I think: {"label":"approval","confidence":0.7,"summary":""} is right.`;
+  expect(await classifyTurn(turn, deps(inline))).toMatchObject({ label: 'approval' });
+});
+
+test('three prose answers fail the turn with the end of the last one', async () => {
+  const why: string[] = [];
+  expect(await classifyTurn(turn, deps(async () => 'I cannot decide.'), (e) => why.push(e))).toBeNull();
+  expect(why[0]).toMatch(/short prompt.*I cannot decide/);
 });
 
 test('an unusable first answer is asked again once, and a good second answer is used', async () => {

@@ -249,13 +249,15 @@ export class DocsRepo implements DocsStore {
     return Number(r?.get('n') ?? 0) > 0;
   }
 
-  async requeueDocRead(id: string): Promise<boolean> {
+  async requeueDocRead(id: string, o: { again?: boolean } = {}): Promise<boolean> {
     return conditionalWrite(this.g, async query => {
+      // windowsDone first: SET runs in order, and a done source read again starts from its first window.
       const [r] = await query(
-        `MATCH (d:Doc {id: $id}) WHERE d.readStatus IN ['failed', 'pending']
-         SET d.readStatus = 'pending', d.readAttempts = 0, d.readError = null, d.readRetryAt = null
+        `MATCH (d:Doc {id: $id}) WHERE d.readStatus IN ['failed', 'pending'] OR ($again AND d.readStatus = 'done' AND d.intakeKind IS NOT NULL)
+         SET d.windowsDone = CASE WHEN d.readStatus = 'done' THEN 0 ELSE d.windowsDone END,
+             d.readStatus = 'pending', d.readAttempts = 0, d.readError = null, d.readRetryAt = null
          RETURN count(d) AS n`,
-        { id },
+        { id, again: o.again === true },
       );
       return Number(r?.get('n') ?? 0) > 0;
     }, Boolean);

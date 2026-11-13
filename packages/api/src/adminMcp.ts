@@ -318,8 +318,9 @@ function buildServer(call: Call, sleep: (ms: number) => Promise<void>, intake: b
   reg('lesson_decide', 'Approval updates local agents immediately. It does not trigger cloud sync: eligible projects share on the next schedule or cloud_sync_now. Approve a proposed lesson (agents are given it from then on), reject it, or revoke an approved one (agents stop getting it at once). Off by default: lessons are the owner\'s decision.', {
     id: z.string().min(1).max(MAX.id),
     decision: z.enum(['approve', 'reject', 'revoke']),
+    note: z.string().trim().min(1).max(MAX.reason).optional().describe('Why: kept as the lesson\'s decision note and on its Activity entry'),
   }, write({ destructive: true, idempotent: true }), async (a) => {
-    const r = await call('PATCH', `/api/lessons/${enc(a.id)}`, { status: a.decision === 'approve' ? 'approved' : a.decision === 'revoke' ? 'revoked' : 'rejected' });
+    const r = await call('PATCH', `/api/lessons/${enc(a.id)}`, { status: a.decision === 'approve' ? 'approved' : a.decision === 'revoke' ? 'revoked' : 'rejected', ...(a.note && { note: a.note }) });
     return r.ok ? json({ id: a.id, sharing: 'Local decision saved. Cloud sharing, if enabled for this project, waits for the next scheduled sync or cloud_sync_now.', status: a.decision === 'approve' ? 'approved' : a.decision === 'revoke' ? 'revoked' : 'rejected' }) : fail(r);
   });
 
@@ -415,12 +416,12 @@ function buildServer(call: Call, sleep: (ms: number) => Promise<void>, intake: b
     reason: z.enum(DECISION_NOTE_REASONS).optional().describe('With verdict disagree: why'),
   }, write(), async (a) => answer(await call('POST', `/api/decisions/${enc(a.id)}/notes`, { text: a.text, ...(a.verdict && { verdict: a.verdict }), ...(a.reason && { reason: a.reason }) })));
 
-  reg('loop_pause', 'Pause the learning loop at once: it records, proposes and applies nothing until the owner resumes it. Off by default: needs loop_settings in OPERATOR_ALLOW.', {}, write({ idempotent: true }),
+  reg('loop_pause', 'Pause the learning loop at once: it records, proposes and applies nothing until the owner resumes it. Off by default.', {}, write({ idempotent: true }),
     async () => answer(await call('POST', '/api/loop/pause', {})));
 
   // Knowledge intake's tools exist only while INTAKE_ENABLED is on, as its routes do.
   if (intake) {
-    reg('intake_submit', 'Add a transcript, notes or a doc (pasted text: txt, md, vtt or srt) to knowledge intake: it is redacted, stored and read into proposed claims and questions for the owner to review; agents see none of it until a claim is accepted.', {
+    reg('intake_submit', 'Add a transcript, notes or a doc (pasted text: txt, md, vtt or srt) to knowledge intake: it is redacted, stored and read into proposed claims and questions for the owner to review; agents see none of it until a claim is accepted. A transcript is private (never synced); notes and docs follow SYNC_CLAIMS.', {
       project: z.string().min(1).max(MAX.key),
       title: z.string().min(1).max(300),
       text: z.string().min(1).max(2_000_000),

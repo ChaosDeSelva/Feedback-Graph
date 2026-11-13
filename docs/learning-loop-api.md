@@ -6,8 +6,8 @@ read and write the learning loop through these routes. The UI's types are in `pa
 ISO 8601 strings.
 
 Reads follow the existing auth (browser session or API token; tokenless installs read only). Every write is an owner
-route (`OWNER_ROUTES`): approve, reject, keep, rollback and notes under the operator verb `loop_decide`, settings, pause
-and resume under `loop_settings`. A store outage answers 503 (`withStoreDeadline`); the UI treats any 5xx or no answer as
+route (`OWNER_ROUTES`): approve, reject, keep, rollback, notes and the never-merge pairs under the operator verb
+`loop_decide`, settings, pause and resume under `loop_settings` (both off by default in `OPERATOR_ALLOW`). A store outage answers 503 (`withStoreDeadline`); the UI treats any 5xx or no answer as
 an outage and keeps retrying reads.
 
 Values the UI does not know (a newer type, status, event kind, reason or phase) are shown as their own text, so the API
@@ -30,7 +30,8 @@ cursor this API did not give is a 400. Only shown projects' decisions (and those
 fills a page or sets the header. Every status is listed, including `observed`, `rolled_back`, `overridden` and `expired`: this
 is the audit log. `expired` is a call the loop only observed, measured again once its type proposes or applies and
 found no longer to hold (`decidedBy` the loop; the round's skip reason says why); made again later, on its targets as
-they were, it is observed again and moves on. The export buttons page through this route with `limit=500`.
+they were, it is observed again and moves on. The export buttons page through this route with `limit=500`. The
+Decisions page's default view, **needs you**, is `status=proposed`.
 
 `Decision` is core's type (`packages/core/src/types.ts`), with `before`, `after` as `TargetSnapshot[]`:
 
@@ -41,8 +42,10 @@ confidence     = { p, lower, n, band }   // n: the owner's own labels for this t
 needsYou?      : string                  // a proposed decision only (0.9.1): why the loop could not decide it, in one line
 ```
 
-`GET /api/distinct-pairs?ids=a,b`, `POST /api/distinct-pairs {a, b, reason?}` and `DELETE /api/distinct-pairs {a, b}`
-(yours only) read, record and lift the pairs the loop never merges (0.9.1, [types](learning-loop-types.md)).
+`needsYou` is core's `needsYouReason`: the reason the loop gave for proposing rather than applying it (its rationale's
+"Proposed rather than applied: …" or "Proposed only: …"), else "always your call" for a tier P type, "not earned yet"
+with the reviews of yours it has and needs in its confidence band, "not sure enough to apply" with its confidence and
+bar, or that the loop is set to propose this type.
 
 ### `GET /api/decisions/:id`
 
@@ -78,13 +81,18 @@ Body:
   note?: string,
   reason?: 'wrong_evidence'|'too_broad'|'wording'|'not_now'|'other',
   cascade?: 'preview'|'apply',        // rollback only; default 'apply'
-  restoreAnyway?: true,               // rollback of an `overridden` decision that was applied (a 409 otherwise): write `before` over the target as an owner edit
+  restoreAnyway?: boolean,            // rollback of an `overridden` decision only (a 400 otherwise): write `before` over the target as an owner edit
 }
 ```
 
-- `approve` and `reject` take `proposed` or `observed` decisions; `keep` (ratify) takes `applied` ones. Each answers the
-  updated `Decision`. Their `note` is written after the action: when it cannot be saved, the action still stands and
-  the answer adds `noteError` saying so.
+`cascade` or `restoreAnyway` with any action but `rollback` is a 400. Rolling back an `overridden` decision without
+`restoreAnyway: true` is a 409.
+
+- `approve` and `reject` take `proposed` or `observed` decisions; `keep` (ratify) takes `applied` ones; `rollback`
+  takes `applied` ones, and `overridden` ones with `restoreAnyway`. Each answers the updated `Decision`. The `note` is
+  kept among the decision's notes, written after the action: as `agree` for approve and keep, as `disagree` with the
+  `reason` for reject and rollback. When it cannot be saved, the action still stands and the answer adds `noteError`
+  saying so. A reject's or rollback's `reason` is also on its Activity entry.
 - `rollback` with `cascade: 'preview'` changes nothing and answers `{ cascade: DecisionSummary[], blocked: { id, reason }[] }`:
   the dependents it would also undo (newest first) and anything that blocks it (a dependent whose target the owner
   changed). The UI disables the confirm button while `blocked` is not empty. When the decision's own target changed
@@ -108,10 +116,31 @@ Body:
   and a decision marked overridden by a refused action `decision_made` with `action: 'overridden'`. `details` always
   carries `decisionId`, `decisionType`, `status` and `action`.
 
+- Rolling back a merge (`merge_duplicates`, `merge_claims`), also one a cascade undoes, records its keeper and merged
+  record as a never-merge pair (below), with your note in its reason.
+
 ### `POST /api/decisions/:id/notes`
 
-Body `{ text: string, verdict?: 'agree'|'disagree'|null, reason?: <reason> }` (reason only with `disagree`). Answers the
-new `DecisionNote` (`{ id, decisionId, ts, by, text, verdict?, reason? }`) with 201. Not retried by the UI.
+Body `{ text: string, verdict?: 'agree'|'disagree'|null, reason?: <reason> }` (reason only with `disagree`, a 400
+otherwise). Answers the new `DecisionNote` (`{ id, decisionId, ts, by, text, verdict?, reason? }`) with 201 and logs
+`decision_noted`. Not retried by the UI.
+
+### Never-merge pairs (0.9.1)
+
+Two records you said are not the same: `merge_duplicates` and `merge_claims` never merge them, whatever the evidence,
+and the near-duplicate judge never asks about them ([types](learning-loop-types.md#applying-and-rolling-back)). A
+pair is stored once, its ids in order (`a < b`).
+
+- `GET /api/distinct-pairs?ids=a,b` (up to 200 ids, at least one: a 400 otherwise): the pairs naming any of them, either
+  way round, as `{ a, b, by, reason, decisionId, at }[]` (`decisionId`: the rolled-back merge that recorded it, or null).
+- `POST /api/distinct-pairs {a, b, reason?}` (two different ids): records one. Answers `{ created, pairs }` (the pairs
+  naming `a`), 201 when it is new and 200 when it was there already; a new one logs `decision_noted` with
+  `details.distinct: [a, b]`.
+- `DELETE /api/distinct-pairs {a, b}`: lifts one, 204 (404 when there is none). Yours alone: the operator token is
+  refused with 403. Logs `decision_noted` with `details.distinctLifted: [a, b]`.
+
+The Decisions page shows these on a merge decision's **Never merge** card: **Never merge these two** posts the pair,
+and each record listed has **Lift**.
 
 ## The loop
 
@@ -136,8 +165,8 @@ new `DecisionNote` (`{ id, decisionId, ts, by, text, verdict?, reason? }`) with 
     breaker: { tripped: boolean, at: string|null, reason: string|null },   // at: when it tripped, or when you last reset it by setting its mode (it counts from then)
   }[],
   budget: { llmCallsToday, llmCallsPerDay, autoToday, autoPerDay, autoPerProject },
-  counts: { proposed, week: { observed, proposed, applied, rolledBack } },   // proposed: waiting now (the sidebar badge); counted in the store, all of them
-  rollbackRate: { rolledBack, of },                // all types, last 30 days
+  counts: { proposed, week: { observed, proposed, applied, rolledBack } },   // proposed: waiting now (the sidebar badge); counted in the store, all of them; week: made in the last 7 days
+  rollbackRate: { rolledBack, of },                // all types, decisions made in the last 30 days and applied
   round: {
     id, startedAt, finishedAt: string|null,
     phase: 'reading'|'scoring'|'writing'|'done'|'aborted',
@@ -150,8 +179,9 @@ new `DecisionNote` (`{ id, decisionId, ts, by, text, verdict?, reason? }`) with 
 }
 ```
 
-The counts and the rollback rate are counted in the store (`DecisionsStore.count`), for the shown projects (read once
-a request), so the route reads the same few queries however many decisions there are. `holdout` is core's
+The counts and the rollback rates are counted in the store (`DecisionsStore.count`), for the shown projects (read once
+a request), and only of the loop's own decisions: yours (`resolve_conflict`, `remove_source`, a supersede you set) are
+never its proposals or rollbacks. So the route reads the same few queries however many decisions there are. `holdout` is core's
 `loopHoldout(store.decisions, LOOP_HOLDOUT, { projectKeys })`. It is intention-to-treat: `treated`
 is every eligible lesson outside the holdout, changed or not. Both arms count only lessons served at least once.
 `repeatRate` is the share whose miss happened again. `helpfulRate` is addressed and not-addressed verdicts out of
@@ -183,7 +213,8 @@ An API without the loop answers 404: the UI then shows no badge and no Dashboard
 ### `PUT /api/loop/settings`
 
 Body `{ mode?, types?: { [type]: { mode?: <mode>|null, tau?: number|null } } }`; only what changed is sent. `tau` below
-the type's `tauDefault` or above 1 is a 400. Setting a tripped type's mode resets its breaker. Answers the new
+the type's `tauDefault` or above 1 is a 400, and so is `mode: 'auto'` for a tier P type (always a proposal: set
+`observe`, `propose` or `off`). Setting a tripped type's mode resets its breaker. Answers the new
 `GET /api/loop` body and logs `loop_settings_changed`.
 
 ### `POST /api/loop/pause`, `POST /api/loop/resume`
@@ -231,3 +262,11 @@ lists only the shown projects' entries and decisions.
 
 The loop's entries use the Activity kinds above and the actor `loop:<policy version>` (`loop:breaker` for the circuit
 breaker). `GET /api/activity?kind=<loop kind>` filters to them like any other kind.
+
+Your own change to a lesson, fact or Inbox item (an edit, a decision, a relevance) expires the loop's calls still
+observed or proposed on it whose targets it changed, so none waits for an approve that could only fail. Each such change
+writes one `decision_made` entry by you, however many it expired (0.9.1): `details.action: 'expired_by_you'`,
+`details.expired` the count, and up to 25 of them in `details.decisions`. The Decisions page adds up these entries'
+counts over the last 7 days ("N waiting proposals expired in the last 7 days: you decided their targets yourself") with
+**Show expired**, which filters the list to `expired`. An applied decision whose target you changed is marked
+`overridden` instead, with one entry each (`action: 'overridden'`).

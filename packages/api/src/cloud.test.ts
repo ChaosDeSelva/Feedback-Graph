@@ -235,6 +235,17 @@ test('API restart restores last sync and manual status after Activity retention 
   expect((await (await restarted.request('/api/status')).json()).cloud.lastManual).toMatchObject({ ok: true, sent: { lessons: 1 } });
 });
 
+test('a claim-sharing change made with the operator token is logged as that agent, not as you', async () => {
+  const saved = new Map<string, string>();
+  const localOnlyStore = { getCursor: async (key: string) => saved.get(key) ?? null, setCursor: async (key: string, value: string) => { saved.set(key, value); } };
+  const { d, log } = deps({ localOnlyStore, intake: true });
+  const OP = 'o'.repeat(32);
+  const app = createApp(repo, { auth: { ...auth, operator: { token: OP, allow: ['settings'] } }, cloud: d });
+  const res = await app.request('/api/cloud/intake-sharing', { method: 'PUT', body: JSON.stringify({ claims: true, people: false }), headers: { 'content-type': 'application/json', authorization: `Bearer ${OP}`, 'x-fg-operator': 'codex' } });
+  expect(res.status).toBe(200);
+  expect(log.map((a) => [a.kind, a.actor])).toEqual([['cloud_settings_changed', 'operator:codex']]);
+});
+
 test('with knowledge intake on, the card shows claim sharing as in effect; the owner turns it on in Settings, and Sync now sends claim facts (never a private one) by it', async () => {
   const saved = new Map<string, string>();
   const localOnlyStore = { getCursor: async (key: string) => saved.get(key) ?? null, setCursor: async (key: string, value: string) => { saved.set(key, value); } };

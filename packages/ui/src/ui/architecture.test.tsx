@@ -37,7 +37,7 @@ test('each layout keeps its smallest text at 11px or more in the narrowest colum
 test('the narrow layout says what the wide one does, its lines wrapped to fit its boxes', () => {
   const words = (doc: Document) => [...doc.querySelectorAll('g')].map((g) => [...g.querySelectorAll('text')].map((t) => t.textContent).join(' '));
   expect(words(parse('narrow'))).toEqual(expect.arrayContaining(words(parse('wide'))));
-  expect(words(parse('narrow'))).toHaveLength(14);
+  expect(words(parse('narrow'))).toHaveLength(16);
   // Every text line stays inside its box at the font's average character width.
   for (const g of parse('narrow').querySelectorAll('g')) {
     const box = Number(g.querySelector('rect')!.getAttribute('width'));

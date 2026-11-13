@@ -1,4 +1,5 @@
 import { authorizeStoreWrite } from '@fb/core';
+import { actingAsOperator, currentActor } from './operator.ts';
 import type { Hono } from 'hono';
 import { z } from 'zod';
 import {
@@ -183,9 +184,9 @@ export function cloudRoutes(app: Hono, d: CloudDeps): CloudState {
     const after = await sharing();
     if (before.claims !== after.claims || before.people !== after.people) {
       await d.activity.record({
-        kind: 'cloud_settings_changed', actor: 'you', projectKey: null,
+        kind: 'cloud_settings_changed', actor: currentActor(), projectKey: null,
         subject: `cloud sync of claims: ${after.claims ? `on${after.people ? ', naming who said them' : ', without names'}` : 'off'}`,
-        why: after.claims ? 'you chose to sync the facts your accepted claims became (never a private source\'s, never a quote)' : 'you chose to keep the facts your accepted claims became on this machine; synced ones are withdrawn on the next sync',
+        why: `${actingAsOperator() ? `an agent (${currentActor()})` : 'you'} chose ${after.claims ? 'to sync the facts accepted claims became (never a private source\'s, never a quote)' : 'to keep the facts accepted claims became on this machine; synced ones are withdrawn on the next sync'}`,
         details: { claims: after.claims, people: after.people, before: { claims: before.claims, people: before.people } }, targets: [],
       });
     }

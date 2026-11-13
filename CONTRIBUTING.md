@@ -30,6 +30,7 @@ TEST_STORES=neo4j,postgres pnpm test:coverage:all              # everything with
 - **TypeScript runs natively**, so only erasable syntax: no enums, no parameter properties, no namespaces. Import with the `.ts` extension.
 - **Anything that reaches a model or the graph goes through redaction** (`redactSecrets` / `redactDeep`). Anything shown to an agent that came from outside (docs, PRs, tickets, model output) is fenced as data.
 - **Provenance.** If your change creates or changes knowledge (facts, lessons, decisions), record an Activity entry saying who or what did it and why.
+- **Similarity thresholds live in `packages/core/src/thresholds.ts`**, each with its unit (a search score or a plain cosine) and why it has its value. Before moving the serving floor, run `node scripts/retrieval-eval.ts` (local Ollama) and compare; `node scripts/intake-eval.ts` scores knowledge intake and contradiction detection on its fictional fixture.
 - Keep comments for the why, not the what.
 
 ## Publishing history

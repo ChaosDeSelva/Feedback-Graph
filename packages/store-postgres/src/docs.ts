@@ -203,12 +203,14 @@ export class PgDocsStore implements DocsStore {
     return (result.rowCount ?? 0) > 0;
   }
 
-  async requeueDocRead(id: string): Promise<boolean> {
+  async requeueDocRead(id: string, o: { again?: boolean } = {}): Promise<boolean> {
     return conditionalWrite(this.db, async query => {
+      // A done intake source read again starts from its first window.
+      if (o.again) await query(`UPDATE intake_sources s SET windows_done = 0 FROM docs d WHERE s.doc_id = $1 AND d.id = s.doc_id AND d.read_status = 'done'`, [id]);
       const { rowCount } = await query(
         `UPDATE docs SET read_status = 'pending', read_attempts = 0, read_error = NULL, read_retry_at = NULL
-         WHERE id = $1 AND read_status IN ('failed', 'pending')`,
-        [id],
+         WHERE id = $1 AND (read_status IN ('failed', 'pending') OR ($2 AND read_status = 'done' AND EXISTS (SELECT 1 FROM intake_sources s WHERE s.doc_id = $1)))`,
+        [id, o.again === true],
       );
       return (rowCount ?? 0) > 0;
     }, Boolean);

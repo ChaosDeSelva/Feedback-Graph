@@ -24,6 +24,18 @@ test('a model down for no stated reason says so, with when it was last tried', a
   expect(await titleOf(/docs reader unavailable/)).toMatch(/^docs reader unavailable: ollama:llava: no vision \(since [^,]*\)/);
 });
 
+test('an intake model that is down is named as the intake reader, with its model or the reason it could not be built', async () => {
+  withStatus({ models: { intake: { provider: 'claude-cli', ok: false, reason: 'claude is not signed in' } } });
+  expect(await titleOf(/intake reader unavailable/)).toMatch(/^intake reader unavailable: claude-cli: claude is not signed in/);
+  expect(screen.queryByText(/^intake unavailable/)).toBeNull();
+  cleanup();
+  withStatus({ models: { intake: { provider: null, ok: false, reason: 'no intake model could be built (INTAKE_LLM, INTAKE_PROVIDER_ALLOW; see the worker log): intake sources wait' } } });
+  expect(await titleOf(/intake reader unavailable/)).toMatch(/^intake reader unavailable: no intake model could be built \(INTAKE_LLM/);
+  cleanup();
+  withStatus({ models: { intake: { provider: 'codex-cli', ok: false, reason: 'sandbox failed', disabled: true } } });
+  expect(await screen.findByText('Codex runner off: intake reading paused')).toBeTruthy();
+});
+
 test('Ollama without its model, or not answering with no reason, is named in the label with what needs it', async () => {
   withStatus({ ollama: { ok: false, url: 'http://ollama:11434', reason: 'model nomic-embed-text is not pulled' } });
   expect(await titleOf(/Ollama model missing/)).toMatch(/not pulled; search, get_task_context and check_before_done need it/);
