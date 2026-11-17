@@ -24,7 +24,6 @@ The worker re-parses any transcript whose size or mtime changed and upserts it i
 - Transcript and repo mounts are **read-only**. The worker never writes outside its SQLite volume and Neo4j.
 - Nothing becomes `Feedback` without the owner's explicit confirm in the UI.
 - Env vars: `NEO4J_URL`, `NEO4J_USER`, `NEO4J_PASSWORD`, `TRANSCRIPTS_DIR` (container path of `~/.claude/projects`), `PROJECT_ROOTS` (comma-separated container paths, default `/vibe`), `HOST_PROJECT_ROOTS` (matching host paths, for example `/path/to/code`, needed because transcripts record host `cwd`), `OLLAMA_URL`, `OLLAMA_MODEL` (default `gemma4`), `STATE_DB` (default `/state/worker.sqlite`), `POLL_SECONDS` (default `30`).
-- Git: commit messages end with `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`.
 
 ## Review Focus
 
